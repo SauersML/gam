@@ -36484,3 +36484,541 @@ exec
    849	            out[j] += matrix[[i, j]] * scaled;
    850	        }
 
+exec
+/bin/zsh -lc "nl -ba src/linalg/matrix.rs | sed -n '1488,1520p'" in /Users/user/gam
+ succeeded in 0ms:
+  1488	                if matrix.is_standard_layout()
+  1489	                    && xc.is_standard_layout()
+  1490	                    && let (Some(m_all), Some(xc_all), Some(out_slice)) =
+  1491	                        (matrix.as_slice(), xc.as_slice(), out.as_slice_mut())
+  1492	                {
+  1493	                    // Parallel per-row clamped quadratic-form diagonal with
+  1494	                    // stride-1 reads from both row-major operands. Avoids the
+  1495	                    // per-row `Array1::dot` call's overhead at biobank shapes
+  1496	                    // (n ≈ 2e5, p ≈ 33).
+  1497	                    use rayon::iter::{IndexedParallelIterator, ParallelIterator};
+  1498	                    use rayon::slice::ParallelSliceMut;
+  1499	                    out_slice
+  1500	                        .par_chunks_mut(1)
+  1501	                        .enumerate()
+  1502	                        .for_each(|(i, slot)| {
+  1503	                            let off = i * p;
+  1504	                            let m_row = &m_all[off..off + p];
+  1505	                            let xc_row = &xc_all[off..off + p];
+  1506	                            let mut acc = 0.0_f64;
+  1507	                            for j in 0..p {
+  1508	                                acc += m_row[j] * xc_row[j];
+  1509	                            }
+  1510	                            slot[0] = acc.max(0.0);
+  1511	                        });
+  1512	                } else {
+  1513	                    for i in 0..n {
+  1514	                        out[i] = matrix.row(i).dot(&xc.row(i)).max(0.0);
+  1515	                    }
+  1516	                }
+  1517	                Ok(out)
+  1518	            }
+  1519	            Self::Lazy(op) => op.quadratic_form_diag(middle),
+  1520	        }
+
+exec
+/bin/zsh -lc "nl -ba src/linalg/matrix.rs | sed -n '6680,6710p'" in /Users/user/gam
+ succeeded in 0ms:
+  6680	                output
+  6681	            }
+  6682	        }
+  6683	    }
+  6684	
+  6685	    fn compute_xtwx_view(&self, weights: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
+  6686	        if weights.len() != self.nrows() {
+  6687	            return Err(format!(
+  6688	                "compute_xtwx dimension mismatch: weights length {} != nrows {}",
+  6689	                weights.len(),
+  6690	                self.nrows()
+  6691	            ));
+  6692	        }
+  6693	        match self {
+  6694	            Self::Dense(DenseDesignMatrix::Materialized(matrix)) => {
+  6695	                Ok(dense_xtwx_view(matrix, weights))
+  6696	            }
+  6697	            Self::Dense(DenseDesignMatrix::Lazy(op)) => op.diag_xtw_x(&weights.to_owned()),
+  6698	            Self::Sparse(xs) => {
+  6699	                let p = xs.ncols();
+  6700	                let csr = xs
+  6701	                    .to_csr_arc()
+  6702	                    .ok_or_else(|| "failed to obtain CSR view in compute_xtwx".to_string())?;
+  6703	                let sym = csr.symbolic();
+  6704	                Ok(sparse_csr_weighted_xtwx(
+  6705	                    sym.row_ptr(),
+  6706	                    sym.col_idx(),
+  6707	                    csr.val(),
+  6708	                    xs.nrows(),
+  6709	                    p,
+  6710	                    weights,
+
+exec
+/bin/zsh -lc "rg -n \"quadratic_form_diag|diag_gram\\(|dense_diag_gram|compute_diag_gram|diag\\(X|diag_xtw_x\\(weights\\)\" src/linalg/matrix.rs src/terms" in /Users/user/gam
+ succeeded in 0ms:
+src/linalg/matrix.rs:394:        let mut diag = self.operator.diag_gram(self.weights)?;
+src/linalg/matrix.rs:512:fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array1<f64> {
+src/linalg/matrix.rs:709:fn sparse_csr_diag_gram(
+src/linalg/matrix.rs:982:    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:983:        // Default: diag(X M X') computed in chunks via row_chunk — avoids
+src/linalg/matrix.rs:987:                "DenseDesignOperator::quadratic_form_diag dimension mismatch: {}x{} vs expected {}x{}",
+src/linalg/matrix.rs:1328:            Self::Lazy(op) => op.diag_xtw_x(weights),
+src/linalg/matrix.rs:1332:    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:1375:            Self::Lazy(op) => op.diag_gram(weights),
+src/linalg/matrix.rs:1472:    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:1477:                        "quadratic_form_diag dimension mismatch: matrix is {}x{}, expected {}x{}",
+src/linalg/matrix.rs:1519:            Self::Lazy(op) => op.quadratic_form_diag(middle),
+src/linalg/matrix.rs:1630:        let xtwx = self.x_original.diag_xtw_x(weights)?;
+src/linalg/matrix.rs:1668:    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:1669:        // diag(X Qs M Qs^T X^T) = diag(X · (Qs M Qs^T) · X^T)
+src/linalg/matrix.rs:1673:        self.x_original.quadratic_form_diag(&m_orig)
+src/linalg/matrix.rs:1887:    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:1946:    /// diag(X M X') for one-hot X: out[i] = M[group[i], group[i]].
+src/linalg/matrix.rs:1947:    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:2053:            Self::Dense(d) => d.diag_xtw_x(weights),
+src/linalg/matrix.rs:2054:            Self::Sparse(s) => DesignMatrix::Sparse(s.clone()).diag_xtw_x(weights),
+src/linalg/matrix.rs:2055:            Self::RandomEffect(op) => op.diag_xtw_x(weights),
+src/linalg/matrix.rs:2063:    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:2065:            Self::Dense(d) => d.diag_gram(weights),
+src/linalg/matrix.rs:2066:            Self::Sparse(s) => DesignMatrix::Sparse(s.clone()).diag_gram(weights),
+src/linalg/matrix.rs:2067:            Self::RandomEffect(op) => op.diag_gram(weights),
+src/linalg/matrix.rs:2161:    fn quadratic_form_diag_cross_chunked(
+src/linalg/matrix.rs:2251:    /// Diagonal contribution diag(X_k M X_k') for a single block.
+src/linalg/matrix.rs:2252:    fn quadratic_form_diag_block(
+src/linalg/matrix.rs:2268:                    d.quadratic_form_diag(m_kk)
+src/linalg/matrix.rs:2273:                sparse.quadratic_form_diag(m_kk)
+src/linalg/matrix.rs:2291:    /// Cross-block contribution diag(X_a M_ab X_b') for two distinct blocks.
+src/linalg/matrix.rs:2292:    fn quadratic_form_diag_cross(
+src/linalg/matrix.rs:2309:                    self.quadratic_form_diag_cross_chunked(block_a, block_b, m_ab)
+src/linalg/matrix.rs:2317:                self.quadratic_form_diag_cross_chunked(block_a, block_b, m_ab)
+src/linalg/matrix.rs:2438:            let block_xtwx = block.diag_xtw_x(weights)?;
+src/linalg/matrix.rs:2460:    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:2465:            let block_diag = block.diag_gram(weights)?;
+src/linalg/matrix.rs:2512:    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:2513:        // diag(X M X'): for each observation i, compute row_i(X) · M · row_i(X)'.
+src/linalg/matrix.rs:2518:        // Diagonal contributions: diag(X_k M_kk X_k')
+src/linalg/matrix.rs:2523:            let block_diag = self.quadratic_form_diag_block(&self.blocks[k], &m_kk)?;
+src/linalg/matrix.rs:2527:        // Cross-block contributions: 2·diag(X_a M_ab X_b')
+src/linalg/matrix.rs:2536:                let cross_diag = self.quadratic_form_diag_cross(
+src/linalg/matrix.rs:2683:    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:2726:    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:2730:            let ch_diag = ch.quadratic_form_diag(middle)?;
+src/linalg/matrix.rs:2847:    /// Only used by fallback paths (quadratic_form_diag, row_chunk);
+src/linalg/matrix.rs:3131:    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:3139:        // diag(X'WX)[j] = Σ_i w[i] · x_{ij}²
+src/linalg/matrix.rs:3187:    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:3190:                "TensorProductDesignOperator::quadratic_form_diag dimension mismatch: {}x{} vs expected {}x{}",
+src/linalg/matrix.rs:3726:        let inner_xtwx = self.inner.diag_xtw_x(weights)?;
+src/linalg/matrix.rs:3920:    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:3932:        // diag(X'WX)[j*pt+t] = Σᵢ w[i] * cov[i,j]² * time[i,t]²
+src/linalg/matrix.rs:3933:        // Use cov.diag_gram(w ⊙ time[:,t]²) which stays sparse-native.
+src/linalg/matrix.rs:3942:            let cov_diag = <DesignMatrix as LinearOperator>::diag_gram(&self.cov, &gamma)?;
+src/linalg/matrix.rs:3956:    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:3960:                "RowwiseKroneckerOperator::quadratic_form_diag dimension mismatch: {}x{} vs expected {}x{}",
+src/linalg/matrix.rs:4085:        let mut base = self.inner.diag_xtw_x(weights)?;
+src/linalg/matrix.rs:4115:    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:4116:        let mut result = self.inner.diag_gram(weights)?;
+src/linalg/matrix.rs:4157:    /// diag(X_c M X_c') = diag(X(D_a M D_a)X') - 2·X(D_a M d) + d'Md
+src/linalg/matrix.rs:4158:    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:4160:            return self.inner.quadratic_form_diag(middle);
+src/linalg/matrix.rs:4186:        let mut result = self.inner.quadratic_form_diag(&ama)?;
+src/linalg/matrix.rs:4922:    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:4923:        let xtwx = self.diag_xtw_x(weights)?;
+src/linalg/matrix.rs:5021:        let mut system = self.diag_xtw_x(weights)?;
+src/linalg/matrix.rs:5082:        let mut system = self.diag_xtw_x(weights)?;
+src/linalg/matrix.rs:5108:        self.diag_xtw_x(weights)
+src/linalg/matrix.rs:5275:            Self::Dense(x) => x.diag_xtw_x(weights),
+src/linalg/matrix.rs:5341:    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:5351:            Self::Dense(x) => x.diag_gram(weights),
+src/linalg/matrix.rs:5357:                Ok(sparse_csr_diag_gram(
+src/linalg/matrix.rs:5429:    fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:5432:                "quadratic_form_diag dimension mismatch: matrix is {}x{}, expected {}x{}",
+src/linalg/matrix.rs:5441:            Self::Dense(xd) => xd.quadratic_form_diag(middle),
+src/linalg/matrix.rs:5445:                    .ok_or_else(|| "quadratic_form_diag: failed to obtain CSR view".to_string())?;
+src/linalg/matrix.rs:5569:    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:5570:        Ok(self.diag_xtw_x(weights)?.diag().to_owned())
+src/linalg/matrix.rs:5599:    pub fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:5601:        DesignMatrix::Dense(DenseDesignMatrix::from(dense)).quadratic_form_diag(middle)
+src/linalg/matrix.rs:5648:    fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:5651:            DesignMatrix::Dense(DenseDesignMatrix::from(self.local.clone())).diag_gram(weights)?;
+src/linalg/matrix.rs:5679:    pub fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:5687:            .quadratic_form_diag(&middle_local)
+src/linalg/matrix.rs:5780:        let mut system = self.diag_xtw_x(weights)?;
+src/linalg/matrix.rs:6726:                Ok(dense_diag_gram_view(matrix, weights))
+src/linalg/matrix.rs:6728:            Self::Dense(DenseDesignMatrix::Lazy(op)) => op.diag_gram(&weights.to_owned()),
+src/linalg/matrix.rs:6735:                Ok(sparse_csr_diag_gram(
+src/linalg/matrix.rs:6815:    pub fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:6816:        <Self as LinearOperator>::diag_gram(self, weights)
+src/linalg/matrix.rs:6819:    pub fn quadratic_form_diag(&self, middle: &Array2<f64>) -> Result<Array1<f64>, String> {
+src/linalg/matrix.rs:6820:        <Self as DenseDesignOperator>::quadratic_form_diag(self, middle)
+src/linalg/matrix.rs:7249:        let got_diag = op.diag_gram(&weights).expect("multi-channel diag gram");
+src/linalg/matrix.rs:7958:        let got_diag = design.diag_gram(&weights).unwrap();
+src/terms/smooth.rs:11068:fn dense_diag_gram_chunkrows(p: usize) -> usize {
+src/terms/smooth.rs:11098:    let chunkrows = dense_diag_gram_chunkrows(p).min(n);
+
+exec
+/bin/zsh -lc 'rg -n "sparse_tensor|Khatri|tensor_product_design_from_sparse|rowwise" src/terms/smooth.rs src/terms/basis.rs' in /Users/user/gam
+exec
+/bin/zsh -lc "nl -ba src/terms/smooth.rs | sed -n '4550,4845p'" in /Users/user/gam
+ succeeded in 0ms:
+src/terms/smooth.rs:4438:    // a `DesignMatrix::Sparse`. Used to assemble the Khatri-Rao tensor product
+src/terms/smooth.rs:4442:    // existing dense Khatri-Rao path.
+src/terms/smooth.rs:4476:        // builder below can take a sparse Khatri-Rao path when all marginals
+src/terms/smooth.rs:4612:        // Sparse Khatri-Rao path: assemble the (n, ∏ q_j) tensor product
+src/terms/smooth.rs:4621:        let sparse_design = tensor_product_design_from_sparse_marginals(&sparse_marginals)?;
+src/terms/smooth.rs:4660:/// Build the Khatri-Rao tensor product of sparse 1D B-spline marginals as a
+src/terms/smooth.rs:4670:fn tensor_product_design_from_sparse_marginals(
+src/terms/smooth.rs:4807:    // Tensor-product Khatri-Rao: design[i, j] = Π_d marginal_d[i, j_d]
+src/terms/basis.rs:3040:    /// Optional factored rowwise-Kronecker representation for tensor-product
+src/terms/basis.rs:5719:    /// for survival rowwise exact-Hessian paths, which previously applied a
+
+ succeeded in 0ms:
+  4550	                ));
+  4551	            }
+  4552	            let dense_design_ref = dense_design.as_ref().ok_or_else(|| {
+  4553	                BasisError::InvalidInput(
+  4554	                    "tensor sum-to-zero identifiability requires a realized basis".to_string(),
+  4555	                )
+  4556	            })?;
+  4557	            let (_, z) = apply_sum_to_zero_constraint(dense_design_ref.view(), None)?;
+  4558	            Some(z)
+  4559	        }
+  4560	        TensorBSplineIdentifiability::FrozenTransform { transform } => {
+  4561	            if transform.nrows() != total_cols {
+  4562	                return Err(BasisError::DimensionMismatch(format!(
+  4563	                    "frozen tensor identifiability transform mismatch: design has {} columns but transform has {} rows",
+  4564	                    total_cols,
+  4565	                    transform.nrows()
+  4566	                )));
+  4567	            }
+  4568	            Some(transform.clone())
+  4569	        }
+  4570	    };
+  4571	
+  4572	    if let Some(z) = z_opt.as_ref() {
+  4573	        let dense = dense_design.as_mut().ok_or_else(|| {
+  4574	            BasisError::InvalidInput(
+  4575	                "tensor identifiability transform requires a realized basis".to_string(),
+  4576	            )
+  4577	        })?;
+  4578	        *dense = dense.dot(z);
+  4579	        candidates = candidates
+  4580	            .into_iter()
+  4581	            .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
+  4582	                let zt_s = fast_atb(z, &candidate.matrix);
+  4583	                let matrix = fast_ab(&zt_s, z);
+  4584	                let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
+  4585	                Ok(PenaltyCandidate {
+  4586	                    nullspace_dim_hint: candidate.nullspace_dim_hint,
+  4587	                    matrix,
+  4588	                    source: candidate.source,
+  4589	                    normalization_scale: candidate.normalization_scale * c_new,
+  4590	                    kronecker_factors: candidate.kronecker_factors.clone(),
+  4591	                    op: candidate.op.clone(),
+  4592	                })
+  4593	            })
+  4594	            .collect::<Result<Vec<_>, _>>()?;
+  4595	    }
+  4596	
+  4597	    let (penalties, nullspace_dims, penaltyinfo, ops) =
+  4598	        filter_active_penalty_candidates_with_ops(candidates)?;
+  4599	    let identifiability_is_none =
+  4600	        matches!(spec.identifiability, TensorBSplineIdentifiability::None);
+  4601	    // All marginals expose a sparse representation iff each `marginal_sparse`
+  4602	    // slot is `Some(...)`. Currently this is true when every marginal is a
+  4603	    // free-boundary, non-periodic 1D B-spline returned as
+  4604	    // `DesignMatrix::Sparse` from `build_bspline_basis_1d`. Periodic B-splines
+  4605	    // and other dense-only marginals leave a `None` and trigger the fall-back
+  4606	    // path. Identifiability transforms (`SumToZero`, `FrozenTransform`) make
+  4607	    // the tensor design dense in general, so we also gate on that.
+  4608	    let all_marginals_sparse = marginal_sparse.iter().all(Option::is_some);
+  4609	    let design = if let Some(dense_design) = dense_design {
+  4610	        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(dense_design))
+  4611	    } else if identifiability_is_none && all_marginals_sparse {
+  4612	        // Sparse Khatri-Rao path: assemble the (n, ∏ q_j) tensor product
+  4613	        // directly as a SparseColMat, preserving the ∏(degree_j+1) nonzero
+  4614	        // structure per row instead of densifying to ∏ q_j columns. This is
+  4615	        // mathematically identical to `tensor_product_design_from_marginals`
+  4616	        // applied to the corresponding dense marginals.
+  4617	        let sparse_marginals: Vec<&SparseColMat<usize, f64>> = marginal_sparse
+  4618	            .iter()
+  4619	            .map(|m| m.as_ref().expect("all_marginals_sparse just verified"))
+  4620	            .collect();
+  4621	        let sparse_design = tensor_product_design_from_sparse_marginals(&sparse_marginals)?;
+  4622	        DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse_design))
+  4623	    } else {
+  4624	        let marginals: Vec<Arc<Array2<f64>>> = marginal_designs
+  4625	            .iter()
+  4626	            .map(|m| Arc::new(m.clone()))
+  4627	            .collect();
+  4628	        let op = TensorProductDesignOperator::new(marginals).map_err(|e| {
+  4629	            BasisError::InvalidInput(format!("TensorProductDesignOperator build failed: {e}"))
+  4630	        })?;
+  4631	        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op)))
+  4632	    };
+  4633	
+  4634	    Ok(BasisBuildResult {
+  4635	        design,
+  4636	        penalties,
+  4637	        nullspace_dims,
+  4638	        penaltyinfo,
+  4639	        ops,
+  4640	        metadata: BasisMetadata::TensorBSpline {
+  4641	            feature_cols: feature_cols.to_vec(),
+  4642	            knots: marginal_knots,
+  4643	            degrees: marginal_degrees,
+  4644	            periodic: marginal_periodic,
+  4645	            identifiability_transform: z_opt,
+  4646	        },
+  4647	        kronecker_factored: if matches!(spec.identifiability, TensorBSplineIdentifiability::None) {
+  4648	            Some(KroneckerFactoredBasis {
+  4649	                marginal_designs,
+  4650	                marginal_penalties,
+  4651	                marginal_dims: marginalnum_basis.clone(),
+  4652	                has_double_penalty: spec.double_penalty,
+  4653	            })
+  4654	        } else {
+  4655	            None
+  4656	        },
+  4657	    })
+  4658	}
+  4659	
+  4660	/// Build the Khatri-Rao tensor product of sparse 1D B-spline marginals as a
+  4661	/// single `SparseColMat`, exploiting the per-row sparsity of B-spline bases
+  4662	/// (each row of marginal `d` has at most `degree_d + 1` nonzeros).
+  4663	///
+  4664	/// Column ordering matches `tensor_product_design_from_marginals`: marginal 0
+  4665	/// varies slowest, the last marginal varies fastest. For a multi-index
+  4666	/// `(j_0, ..., j_{D-1})` the flat column is `j_0 * (q_1 * ... * q_{D-1}) +
+  4667	/// j_1 * (q_2 * ... * q_{D-1}) + ... + j_{D-1}`.
+  4668	///
+  4669	/// Mathematically: `out[i, flat(j_0, ..., j_{D-1})] = ∏_d marginal_d[i, j_d]`.
+  4670	fn tensor_product_design_from_sparse_marginals(
+  4671	    marginal_sparse: &[&SparseColMat<usize, f64>],
+  4672	) -> Result<SparseColMat<usize, f64>, BasisError> {
+  4673	    if marginal_sparse.is_empty() {
+  4674	        return Err(BasisError::InvalidInput(
+  4675	            "TensorBSpline requires at least one marginal basis".to_string(),
+  4676	        ));
+  4677	    }
+  4678	    let n = marginal_sparse[0].nrows();
+  4679	    for (i, m) in marginal_sparse.iter().enumerate().skip(1) {
+  4680	        if m.nrows() != n {
+  4681	            return Err(BasisError::DimensionMismatch(format!(
+  4682	                "tensor sparse marginal row mismatch at dim {i}: expected {n}, got {}",
+  4683	                m.nrows()
+  4684	            )));
+  4685	        }
+  4686	    }
+  4687	    let dims: Vec<usize> = marginal_sparse.iter().map(|m| m.ncols()).collect();
+  4688	    let total_cols = dims.iter().try_fold(1usize, |acc, &q| {
+  4689	        acc.checked_mul(q)
+  4690	            .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))
+  4691	    })?;
+  4692	    // Strides such that strides[d] = ∏_{e > d} q_e; first marginal slowest.
+  4693	    let mut strides = vec![1usize; dims.len()];
+  4694	    for d in (0..dims.len().saturating_sub(1)).rev() {
+  4695	        strides[d] = strides[d + 1]
+  4696	            .checked_mul(dims[d + 1])
+  4697	            .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))?;
+  4698	    }
+  4699	
+  4700	    // Convert each marginal to CSR for O(1) row access (CSC stores by column,
+  4701	    // so iterating "all nonzeros in row i" requires a column-major scan; the
+  4702	    // CSR conversion is a one-time, linear cost in nnz).
+  4703	    use faer::sparse::SparseRowMat;
+  4704	    let csrs: Vec<SparseRowMat<usize, f64>> = marginal_sparse
+  4705	        .iter()
+  4706	        .enumerate()
+  4707	        .map(|(d, m)| {
+  4708	            m.as_ref().to_row_major().map_err(|e| {
+  4709	                BasisError::SparseCreation(format!(
+  4710	                    "tensor sparse marginal {d} CSR conversion failed: {e:?}"
+  4711	                ))
+  4712	            })
+  4713	        })
+  4714	        .collect::<Result<Vec<_>, _>>()?;
+  4715	    let row_ptrs: Vec<&[usize]> = csrs.iter().map(|c| c.symbolic().row_ptr()).collect();
+  4716	    let col_idxs: Vec<&[usize]> = csrs.iter().map(|c| c.symbolic().col_idx()).collect();
+  4717	    let vals: Vec<&[f64]> = csrs.iter().map(|c| c.val()).collect();
+  4718	
+  4719	    // Per-row Cartesian product of marginal nonzero column lists. Parallelize
+  4720	    // across row chunks; each chunk produces a Vec<Triplet> appended together.
+  4721	    use rayon::prelude::*;
+  4722	    const CHUNK: usize = 1024;
+  4723	    let num_chunks = n.div_ceil(CHUNK);
+  4724	    let per_chunk: Vec<Vec<Triplet<usize, usize, f64>>> = (0..num_chunks)
+  4725	        .into_par_iter()
+  4726	        .map(|chunk_idx| {
+  4727	            let row_start = chunk_idx * CHUNK;
+  4728	            let row_end = (row_start + CHUNK).min(n);
+  4729	            let mut chunk_triplets = Vec::<Triplet<usize, usize, f64>>::new();
+  4730	            // Reusable accumulators across rows in this chunk.
+  4731	            let mut cur_cols = Vec::<usize>::with_capacity(64);
+  4732	            let mut cur_vals = Vec::<f64>::with_capacity(64);
+  4733	            let mut next_cols = Vec::<usize>::with_capacity(64);
+  4734	            let mut next_vals = Vec::<f64>::with_capacity(64);
+  4735	            for i in row_start..row_end {
+  4736	                cur_cols.clear();
+  4737	                cur_vals.clear();
+  4738	                cur_cols.push(0);
+  4739	                cur_vals.push(1.0);
+  4740	                let mut row_is_zero = false;
+  4741	                for d in 0..dims.len() {
+  4742	                    let row_start_d = row_ptrs[d][i];
+  4743	                    let row_end_d = row_ptrs[d][i + 1];
+  4744	                    if row_start_d == row_end_d {
+  4745	                        row_is_zero = true;
+  4746	                        break;
+  4747	                    }
+  4748	                    let stride = strides[d];
+  4749	                    next_cols.clear();
+  4750	                    next_vals.clear();
+  4751	                    next_cols.reserve(cur_cols.len() * (row_end_d - row_start_d));
+  4752	                    next_vals.reserve(cur_vals.len() * (row_end_d - row_start_d));
+  4753	                    for (&prev_col, &prev_val) in cur_cols.iter().zip(cur_vals.iter()) {
+  4754	                        for ptr in row_start_d..row_end_d {
+  4755	                            let cj = col_idxs[d][ptr];
+  4756	                            let vj = vals[d][ptr];
+  4757	                            next_cols.push(prev_col + cj * stride);
+  4758	                            next_vals.push(prev_val * vj);
+  4759	                        }
+  4760	                    }
+  4761	                    std::mem::swap(&mut cur_cols, &mut next_cols);
+  4762	                    std::mem::swap(&mut cur_vals, &mut next_vals);
+  4763	                }
+  4764	                if row_is_zero {
+  4765	                    continue;
+  4766	                }
+  4767	                for (&col, &val) in cur_cols.iter().zip(cur_vals.iter()) {
+  4768	                    chunk_triplets.push(Triplet::new(i, col, val));
+  4769	                }
+  4770	            }
+  4771	            chunk_triplets
+  4772	        })
+  4773	        .collect();
+  4774	    let total_nnz: usize = per_chunk.iter().map(Vec::len).sum();
+  4775	    let mut triplets = Vec::<Triplet<usize, usize, f64>>::with_capacity(total_nnz);
+  4776	    for chunk in per_chunk {
+  4777	        triplets.extend(chunk);
+  4778	    }
+  4779	    SparseColMat::try_new_from_triplets(n, total_cols, &triplets).map_err(|e| {
+  4780	        BasisError::SparseCreation(format!(
+  4781	            "failed to assemble sparse tensor product design: {e:?}"
+  4782	        ))
+  4783	    })
+  4784	}
+  4785	
+  4786	fn tensor_product_design_from_marginals(
+  4787	    marginal_designs: &[Array2<f64>],
+  4788	) -> Result<Array2<f64>, BasisError> {
+  4789	    if marginal_designs.is_empty() {
+  4790	        return Err(BasisError::InvalidInput(
+  4791	            "TensorBSpline requires at least one marginal basis".to_string(),
+  4792	        ));
+  4793	    }
+  4794	    let n = marginal_designs[0].nrows();
+  4795	    for (i, b) in marginal_designs.iter().enumerate().skip(1) {
+  4796	        if b.nrows() != n {
+  4797	            return Err(BasisError::DimensionMismatch(format!(
+  4798	                "tensor marginal row mismatch at dim {i}: expected {n}, got {}",
+  4799	                b.nrows()
+  4800	            )));
+  4801	        }
+  4802	    }
+  4803	    let total_cols = marginal_designs.iter().try_fold(1usize, |acc, b| {
+  4804	        acc.checked_mul(b.ncols())
+  4805	            .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))
+  4806	    })?;
+  4807	    // Tensor-product Khatri-Rao: design[i, j] = Π_d marginal_d[i, j_d]
+  4808	    // where j is the multi-index (j_1, ..., j_D) flattened. Independent
+  4809	    // across rows; parallelize row chunks and fill the pre-allocated
+  4810	    // contiguous Array2 in place (no Vec-flatten-collect intermediate,
+  4811	    // which doubled the peak memory at biobank N).
+  4812	    use ndarray::parallel::prelude::*;
+  4813	    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+  4814	    let mut design = Array2::<f64>::zeros((n, total_cols));
+  4815	    design
+  4816	        .axis_chunks_iter_mut(ndarray::Axis(0), 1024)
+  4817	        .into_par_iter()
+  4818	        .enumerate()
+  4819	        .for_each(|(chunk_idx, mut block)| {
+  4820	            let row_offset = chunk_idx * 1024;
+  4821	            // Scratch buffers reused across rows in this chunk.
+  4822	            let mut cur = Vec::<f64>::with_capacity(total_cols);
+  4823	            let mut next = Vec::<f64>::with_capacity(total_cols);
+  4824	            for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
+  4825	                let i = row_offset + local_i;
+  4826	                cur.clear();
+  4827	                cur.push(1.0);
+  4828	                for b in marginal_designs {
+  4829	                    let q = b.ncols();
+  4830	                    next.clear();
+  4831	                    next.resize(cur.len() * q, 0.0);
+  4832	                    for (a_idx, &aval) in cur.iter().enumerate() {
+  4833	                        let off = a_idx * q;
+  4834	                        for col in 0..q {
+  4835	                            next[off + col] = aval * b[[i, col]];
+  4836	                        }
+  4837	                    }
+  4838	                    std::mem::swap(&mut cur, &mut next);
+  4839	                }
+  4840	                for (j, &v) in cur.iter().enumerate() {
+  4841	                    out_row[j] = v;
+  4842	                }
+  4843	            }
+  4844	        });
+  4845	    Ok(design)
+
+codex
+FINDINGS
+
+1. `src/linalg/matrix.rs:230`, `src/linalg/matrix.rs:251`, `src/linalg/matrix.rs:628`
+
+Wrong expression:
+```rust
+let wi = w[i].max(0.0);
+let wi = weights[i].max(0.0);
+```
+
+Correct expression:
+```rust
+let wi = w[i];
+let wi = weights[i];
+```
+
+Derivation: weighted Gram entries must be
+```text
+(X^T diag(w) X)_{ab} = Σ_i X_{ia} * w_i * X_{ib}
+```
+Clipping computes `X^T diag(max(w, 0)) X`, which drops negative row-curvature contributions. This is definitively wrong for signed weights, and the same file has a signed-weight CSC path/test expecting raw signed weights (`streaming_sparse_csc_xt_diag_x_matches_dense_signed_weights`). The sparse CSR fallback and dense view helper therefore produce different math from the signed weighted Gram definition.
+
+Severity: definitive. No other definitive math errors found in `src/terms/` within the static audit scope.
+tokens used
+370,023
+FINDINGS
+
+1. `src/linalg/matrix.rs:230`, `src/linalg/matrix.rs:251`, `src/linalg/matrix.rs:628`
+
+Wrong expression:
+```rust
+let wi = w[i].max(0.0);
+let wi = weights[i].max(0.0);
+```
+
+Correct expression:
+```rust
+let wi = w[i];
+let wi = weights[i];
+```
+
+Derivation: weighted Gram entries must be
+```text
+(X^T diag(w) X)_{ab} = Σ_i X_{ia} * w_i * X_{ib}
+```
+Clipping computes `X^T diag(max(w, 0)) X`, which drops negative row-curvature contributions. This is definitively wrong for signed weights, and the same file has a signed-weight CSC path/test expecting raw signed weights (`streaming_sparse_csc_xt_diag_x_matches_dense_signed_weights`). The sparse CSR fallback and dense view helper therefore produce different math from the signed weighted Gram definition.
+
+Severity: definitive. No other definitive math errors found in `src/terms/` within the static audit scope.

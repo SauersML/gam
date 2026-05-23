@@ -38549,3 +38549,2906 @@ exec
 1737:pub fn cell_polynomial_integral_from_moments(
 1739:    moments: &[f64],
 
+exec
+/bin/zsh -lc "nl -ba src/families/royston_parmar.rs | sed -n '1,260p'" in /Users/user/gam
+ succeeded in 0ms:
+     1	use crate::survival::{
+     2	    MonotonicityPenalty, PenaltyBlocks, SurvivalBaselineOffsets, SurvivalEngineInputs,
+     3	    SurvivalSpec, SurvivalTimeCovarInputs, WorkingModelSurvival,
+     4	};
+     5	use ndarray::{ArrayView1, ArrayView2};
+     6	
+     7	/// Flattened engine inputs for Royston-Parmar likelihood evaluation.
+     8	pub struct RoystonParmarInputs<'a> {
+     9	    pub age_entry: ArrayView1<'a, f64>,
+    10	    pub age_exit: ArrayView1<'a, f64>,
+    11	    pub event_target: ArrayView1<'a, u8>,
+    12	    pub event_competing: ArrayView1<'a, u8>,
+    13	    pub weights: ArrayView1<'a, f64>,
+    14	    pub x_entry: ArrayView2<'a, f64>,
+    15	    pub x_exit: ArrayView2<'a, f64>,
+    16	    pub x_derivative: ArrayView2<'a, f64>,
+    17	    pub monotonicity_constraint_rows: Option<ArrayView2<'a, f64>>,
+    18	    pub monotonicity_constraint_offsets: Option<ArrayView1<'a, f64>>,
+    19	    pub eta_offset_entry: Option<ArrayView1<'a, f64>>,
+    20	    pub eta_offset_exit: Option<ArrayView1<'a, f64>>,
+    21	    pub derivative_offset_exit: Option<ArrayView1<'a, f64>>,
+    22	}
+    23	
+    24	pub struct RoystonParmarSharedTimeCovariateInputs<'a> {
+    25	    pub age_entry: ArrayView1<'a, f64>,
+    26	    pub age_exit: ArrayView1<'a, f64>,
+    27	    pub event_target: ArrayView1<'a, u8>,
+    28	    pub event_competing: ArrayView1<'a, u8>,
+    29	    pub weights: ArrayView1<'a, f64>,
+    30	    pub time_entry: ArrayView2<'a, f64>,
+    31	    pub time_exit: ArrayView2<'a, f64>,
+    32	    pub time_derivative: ArrayView2<'a, f64>,
+    33	    pub covariates: ArrayView2<'a, f64>,
+    34	    pub monotonicity_constraint_rows: Option<ArrayView2<'a, f64>>,
+    35	    pub monotonicity_constraint_offsets: Option<ArrayView1<'a, f64>>,
+    36	    pub eta_offset_entry: Option<ArrayView1<'a, f64>>,
+    37	    pub eta_offset_exit: Option<ArrayView1<'a, f64>>,
+    38	    pub derivative_offset_exit: Option<ArrayView1<'a, f64>>,
+    39	}
+    40	
+    41	fn survival_baseline_offsets<'a>(
+    42	    eta_offset_entry: Option<ArrayView1<'a, f64>>,
+    43	    eta_offset_exit: Option<ArrayView1<'a, f64>>,
+    44	    derivative_offset_exit: Option<ArrayView1<'a, f64>>,
+    45	) -> Result<Option<SurvivalBaselineOffsets<'a>>, crate::survival::SurvivalError> {
+    46	    match (eta_offset_entry, eta_offset_exit, derivative_offset_exit) {
+    47	        (Some(eta_entry), Some(eta_exit), Some(derivative_exit)) => {
+    48	            Ok(Some(SurvivalBaselineOffsets {
+    49	                eta_entry,
+    50	                eta_exit,
+    51	                derivative_exit,
+    52	            }))
+    53	        }
+    54	        (None, None, None) => Ok(None),
+    55	        _ => Err(crate::survival::SurvivalError::DimensionMismatch),
+    56	    }
+    57	}
+    58	
+    59	/// Build an engine survival working model from flattened arrays.
+    60	pub fn working_model_from_flattened(
+    61	    penalties: PenaltyBlocks,
+    62	    monotonicity: MonotonicityPenalty,
+    63	    spec: SurvivalSpec,
+    64	    inputs: RoystonParmarInputs<'_>,
+    65	) -> Result<WorkingModelSurvival, crate::survival::SurvivalError> {
+    66	    let offsets = survival_baseline_offsets(
+    67	        inputs.eta_offset_entry,
+    68	        inputs.eta_offset_exit,
+    69	        inputs.derivative_offset_exit,
+    70	    )?;
+    71	
+    72	    WorkingModelSurvival::from_engine_inputswith_offsets(
+    73	        SurvivalEngineInputs {
+    74	            age_entry: inputs.age_entry,
+    75	            age_exit: inputs.age_exit,
+    76	            event_target: inputs.event_target,
+    77	            event_competing: inputs.event_competing,
+    78	            sampleweight: inputs.weights,
+    79	            x_entry: inputs.x_entry,
+    80	            x_exit: inputs.x_exit,
+    81	            x_derivative: inputs.x_derivative,
+    82	            monotonicity_constraint_rows: inputs.monotonicity_constraint_rows,
+    83	            monotonicity_constraint_offsets: inputs.monotonicity_constraint_offsets,
+    84	        },
+    85	        offsets,
+    86	        penalties,
+    87	        monotonicity,
+    88	        spec,
+    89	    )
+    90	}
+    91	
+    92	pub fn working_model_from_time_covariateshared(
+    93	    penalties: PenaltyBlocks,
+    94	    monotonicity: MonotonicityPenalty,
+    95	    spec: SurvivalSpec,
+    96	    inputs: RoystonParmarSharedTimeCovariateInputs<'_>,
+    97	) -> Result<WorkingModelSurvival, crate::survival::SurvivalError> {
+    98	    let offsets = survival_baseline_offsets(
+    99	        inputs.eta_offset_entry,
+   100	        inputs.eta_offset_exit,
+   101	        inputs.derivative_offset_exit,
+   102	    )?;
+   103	    WorkingModelSurvival::from_time_covariate_inputswith_offsets(
+   104	        SurvivalTimeCovarInputs {
+   105	            age_entry: inputs.age_entry,
+   106	            age_exit: inputs.age_exit,
+   107	            event_target: inputs.event_target,
+   108	            event_competing: inputs.event_competing,
+   109	            sampleweight: inputs.weights,
+   110	            time_entry: inputs.time_entry,
+   111	            time_exit: inputs.time_exit,
+   112	            time_derivative: inputs.time_derivative,
+   113	            covariates: inputs.covariates,
+   114	            monotonicity_constraint_rows: inputs.monotonicity_constraint_rows,
+   115	            monotonicity_constraint_offsets: inputs.monotonicity_constraint_offsets,
+   116	        },
+   117	        offsets,
+   118	        penalties,
+   119	        monotonicity,
+   120	        spec,
+   121	    )
+   122	}
+
+exec
+/bin/zsh -lc 'rg -n "log_lik|likelihood|hazard|survival|deriv|pdf|cdf|hessian|deviance|link|qdot|eta" src/families/royston_parmar.rs src/families/survival_location_scale.rs src/families/transformation_normal.rs | head -n 220' in /Users/user/gam
+ succeeded in 0ms:
+src/families/royston_parmar.rs:1:use crate::survival::{
+src/families/royston_parmar.rs:7:/// Flattened engine inputs for Royston-Parmar likelihood evaluation.
+src/families/royston_parmar.rs:16:    pub x_derivative: ArrayView2<'a, f64>,
+src/families/royston_parmar.rs:19:    pub eta_offset_entry: Option<ArrayView1<'a, f64>>,
+src/families/royston_parmar.rs:20:    pub eta_offset_exit: Option<ArrayView1<'a, f64>>,
+src/families/royston_parmar.rs:21:    pub derivative_offset_exit: Option<ArrayView1<'a, f64>>,
+src/families/royston_parmar.rs:32:    pub time_derivative: ArrayView2<'a, f64>,
+src/families/royston_parmar.rs:36:    pub eta_offset_entry: Option<ArrayView1<'a, f64>>,
+src/families/royston_parmar.rs:37:    pub eta_offset_exit: Option<ArrayView1<'a, f64>>,
+src/families/royston_parmar.rs:38:    pub derivative_offset_exit: Option<ArrayView1<'a, f64>>,
+src/families/royston_parmar.rs:41:fn survival_baseline_offsets<'a>(
+src/families/royston_parmar.rs:42:    eta_offset_entry: Option<ArrayView1<'a, f64>>,
+src/families/royston_parmar.rs:43:    eta_offset_exit: Option<ArrayView1<'a, f64>>,
+src/families/royston_parmar.rs:44:    derivative_offset_exit: Option<ArrayView1<'a, f64>>,
+src/families/royston_parmar.rs:45:) -> Result<Option<SurvivalBaselineOffsets<'a>>, crate::survival::SurvivalError> {
+src/families/royston_parmar.rs:46:    match (eta_offset_entry, eta_offset_exit, derivative_offset_exit) {
+src/families/royston_parmar.rs:47:        (Some(eta_entry), Some(eta_exit), Some(derivative_exit)) => {
+src/families/royston_parmar.rs:49:                eta_entry,
+src/families/royston_parmar.rs:50:                eta_exit,
+src/families/royston_parmar.rs:51:                derivative_exit,
+src/families/royston_parmar.rs:55:        _ => Err(crate::survival::SurvivalError::DimensionMismatch),
+src/families/royston_parmar.rs:59:/// Build an engine survival working model from flattened arrays.
+src/families/royston_parmar.rs:65:) -> Result<WorkingModelSurvival, crate::survival::SurvivalError> {
+src/families/royston_parmar.rs:66:    let offsets = survival_baseline_offsets(
+src/families/royston_parmar.rs:67:        inputs.eta_offset_entry,
+src/families/royston_parmar.rs:68:        inputs.eta_offset_exit,
+src/families/royston_parmar.rs:69:        inputs.derivative_offset_exit,
+src/families/royston_parmar.rs:81:            x_derivative: inputs.x_derivative,
+src/families/royston_parmar.rs:97:) -> Result<WorkingModelSurvival, crate::survival::SurvivalError> {
+src/families/royston_parmar.rs:98:    let offsets = survival_baseline_offsets(
+src/families/royston_parmar.rs:99:        inputs.eta_offset_entry,
+src/families/royston_parmar.rs:100:        inputs.eta_offset_exit,
+src/families/royston_parmar.rs:101:        inputs.derivative_offset_exit,
+src/families/royston_parmar.rs:112:            time_derivative: inputs.time_derivative,
+src/families/transformation_normal.rs:13://! the fixed derivative floor `ε` keeps the change-of-variables log-density
+src/families/transformation_normal.rs:17://! The log-likelihood per observation is the finite-support normalized
+src/families/transformation_normal.rs:29:    create_ispline_derivative_dense,
+src/families/transformation_normal.rs:38:    build_block_spatial_psi_derivatives, evaluate_custom_family_joint_hyper,
+src/families/transformation_normal.rs:49:use crate::probability::{log1mexp_positive, normal_logcdf, standard_normal_quantile};
+src/families/transformation_normal.rs:84:#[derive(Debug, Clone)]
+src/families/transformation_normal.rs:87:    /// (e.g. response/covariate row mismatch, beta length mismatch,
+src/families/transformation_normal.rs:94:    /// A numeric intermediate (response transform, derivative,
+src/families/transformation_normal.rs:95:    /// log-likelihood, weight, offset, gradient component, calibration
+src/families/transformation_normal.rs:99:    /// The fitted monotone transform's derivative dropped to or below
+src/families/transformation_normal.rs:104:    /// (endpoint mass, log-difference, PIT probability, derivative
+src/families/transformation_normal.rs:139:#[derive(Clone, Debug)]
+src/families/transformation_normal.rs:185:/// scale. The CTN likelihood targets `h(Y|x) ~ N(0,1)`; accepting exact-Newton
+src/families/transformation_normal.rs:190:/// moves them back into the likelihood's high-density region.
+src/families/transformation_normal.rs:221:fn beta_bits_match(cached: &Array1<f64>, candidate: &Array1<f64>) -> bool {
+src/families/transformation_normal.rs:231:#[derive(Clone, Debug)]
+src/families/transformation_normal.rs:246:/// on β by exact f64 bits, so a `(beta_hash, row_quantities_version)` pair
+src/families/transformation_normal.rs:249:#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+src/families/transformation_normal.rs:251:    pub beta_hash: u64,
+src/families/transformation_normal.rs:262:        beta: &Array1<f64>,
+src/families/transformation_normal.rs:267:        beta.len().hash(&mut hasher);
+src/families/transformation_normal.rs:268:        for value in beta.iter() {
+src/families/transformation_normal.rs:271:        let beta_hash = hasher.finish();
+src/families/transformation_normal.rs:273:            beta_hash,
+src/families/transformation_normal.rs:289:/// outer evaluator calls `exact_newton_joint_hessian_workspace`, and its
+src/families/transformation_normal.rs:293:#[derive(Default)]
+src/families/transformation_normal.rs:313:    fn install(&self, key: CtnDenseHessianKey, hessian: Arc<Array2<f64>>) {
+src/families/transformation_normal.rs:318:        *slot = Some((key, hessian));
+src/families/transformation_normal.rs:329:/// response value basis × covariate design). The family internally holds `x_deriv`
+src/families/transformation_normal.rs:330:/// (tensor product of response derivative basis × covariate design) for the
+src/families/transformation_normal.rs:331:/// Jacobian term in the likelihood.
+src/families/transformation_normal.rs:332:#[derive(Clone)]
+src/families/transformation_normal.rs:339:    x_deriv_kron: KroneckerDesign,
+src/families/transformation_normal.rs:347:    /// Response derivative basis: n × p_resp. Columns: [0, M_1(y), ..., M_k(y)].
+src/families/transformation_normal.rs:348:    response_deriv_basis: Array2<f64>,
+src/families/transformation_normal.rs:360:    /// Optional non-negative row weights folded directly into the likelihood.
+src/families/transformation_normal.rs:368:    initial_beta: Array1<f64>,
+src/families/transformation_normal.rs:374:    // --- Response basis metadata (for reconstruction at predict time) ---
+src/families/transformation_normal.rs:383:    /// Last row-space transformation quantities for an exact beta vector.
+src/families/transformation_normal.rs:386:    /// for likelihood, gradient, and Hessian row factors at the same candidate
+src/families/transformation_normal.rs:389:    /// recomputing `h`, `h'`, `1/h'`, and derivative powers per call.
+src/families/transformation_normal.rs:395:    /// `(beta_bits, row_quantities_version)` without re-hashing every row
+src/families/transformation_normal.rs:404:    persistent_dense_hessian: Arc<CtnPersistentDenseHessianCache>,
+src/families/transformation_normal.rs:414:    /// — i.e. an unbiased estimator across log-likelihood, gradient, joint
+src/families/transformation_normal.rs:428:#[derive(Clone)]
+src/families/transformation_normal.rs:430:    beta: Arc<Array1<f64>>,
+src/families/transformation_normal.rs:437:    log_likelihood: f64,
+src/families/transformation_normal.rs:443:#[derive(Debug)]
+src/families/transformation_normal.rs:445:    log_likelihood: f64,
+src/families/transformation_normal.rs:450:    fn matches_beta(&self, beta: &Array1<f64>) -> bool {
+src/families/transformation_normal.rs:451:        beta_bits_match(&self.beta, beta)
+src/families/transformation_normal.rs:455:fn build_transformation_row_derived(
+src/families/transformation_normal.rs:496:    // `log_normal_cdf_diff_derivatives` (two `normal_logcdf` calls, three
+src/families/transformation_normal.rs:497:    // 5x5 truncated polynomial multiplies, 32 `signed_normal_pdf_ratio`
+src/families/transformation_normal.rs:501:    // The fast finiteness check rolls all eight derived quantities into
+src/families/transformation_normal.rs:518:            let q = log_normal_cdf_diff_derivatives(h_upper[i], h_lower[i]).map_err(|e| {
+src/families/transformation_normal.rs:535:                let derived_values = [
+src/families/transformation_normal.rs:545:                for (name, value) in derived_values {
+src/families/transformation_normal.rs:548:                            "TransformationNormalFamily row_quantities: {name} at row {i} is not finite ({value}); h'={hp} is outside the finite exact-derivative range",
+src/families/transformation_normal.rs:563:    let mut log_likelihood = 0.0;
+src/families/transformation_normal.rs:566:        log_likelihood += row_ll;
+src/families/transformation_normal.rs:569:    if !log_likelihood.is_finite() {
+src/families/transformation_normal.rs:571:            "TransformationNormalFamily row_quantities: log-likelihood is not finite ({log_likelihood})"
+src/families/transformation_normal.rs:576:        log_likelihood,
+src/families/transformation_normal.rs:581:fn log_normal_cdf_diff(upper: f64, lower: f64) -> Result<f64, String> {
+src/families/transformation_normal.rs:594:        return log_normal_cdf_diff(-lower, -upper);
+src/families/transformation_normal.rs:596:    let log_upper = normal_logcdf(upper);
+src/families/transformation_normal.rs:597:    let log_lower = normal_logcdf(lower);
+src/families/transformation_normal.rs:668:        let log_num = log_normal_cdf_diff(h_inside, lower)?;
+src/families/transformation_normal.rs:669:        let log_den = log_normal_cdf_diff(upper, lower)?;
+src/families/transformation_normal.rs:682:fn signed_normal_pdf_ratio(
+src/families/transformation_normal.rs:697:#[derive(Clone, Copy, Debug)]
+src/families/transformation_normal.rs:799:        _ => unreachable!("CTN normalizer derivatives only need order <= 4"),
+src/families/transformation_normal.rs:824:fn log_normal_cdf_diff_derivatives(
+src/families/transformation_normal.rs:828:    let log_z = log_normal_cdf_diff(upper, lower)?;
+src/families/transformation_normal.rs:856:        r[order][0] = signed_normal_pdf_ratio(upper, s_u[order], log_z, factor);
+src/families/transformation_normal.rs:857:        r[0][order] = signed_normal_pdf_ratio(lower, s_l[order], log_z, factor);
+src/families/transformation_normal.rs:861:                    "normal CDF endpoint derivative ratio is not representable at order {order}, \
+src/families/transformation_normal.rs:1006:        let (resp_val, resp_deriv, resp_penalties, resp_knots, resp_transform) =
+src/families/transformation_normal.rs:1014:        let x_deriv_kron = KroneckerDesign::new_khatri_rao(&resp_deriv, covariate_design.clone())?;
+src/families/transformation_normal.rs:1017:        debug_assert_eq!(x_deriv_kron.ncols(), p_total);
+src/families/transformation_normal.rs:1020:        let initial_beta = compute_warm_start(
+src/families/transformation_normal.rs:1025:            &x_deriv_kron,
+src/families/transformation_normal.rs:1044:        // ----- 5. CTN-specific smoothing seed from likelihood/penalty scales -----
+src/families/transformation_normal.rs:1061:            x_deriv_kron,
+src/families/transformation_normal.rs:1065:            response_deriv_basis: resp_deriv,
+src/families/transformation_normal.rs:1070:            initial_beta,
+src/families/transformation_normal.rs:1083:            persistent_dense_hessian: Arc::new(CtnPersistentDenseHessianCache::default()),
+src/families/transformation_normal.rs:1096:        response_deriv_basis: Array2<f64>,
+src/families/transformation_normal.rs:1206:        let x_deriv_kron =
+src/families/transformation_normal.rs:1207:            KroneckerDesign::new_khatri_rao(&response_deriv_basis, covariate_design.clone())?;
+src/families/transformation_normal.rs:1210:        debug_assert_eq!(x_deriv_kron.ncols(), p_total);
+src/families/transformation_normal.rs:1212:        let initial_beta = compute_warm_start(
+src/families/transformation_normal.rs:1217:            &x_deriv_kron,
+src/families/transformation_normal.rs:1252:            x_deriv_kron,
+src/families/transformation_normal.rs:1256:            response_deriv_basis,
+src/families/transformation_normal.rs:1261:            initial_beta,
+src/families/transformation_normal.rs:1274:            persistent_dense_hessian: Arc::new(CtnPersistentDenseHessianCache::default()),
+src/families/transformation_normal.rs:1280:    /// Response basis metadata for serialization/prediction.
+src/families/transformation_normal.rs:1304:            initial_beta: Some(self.initial_beta.clone()),
+src/families/transformation_normal.rs:1324:    /// negative-Hessian, ψ-term, ψ-ψ-term, and log-likelihood is **linear**
+src/families/transformation_normal.rs:1351:    /// family's `log_likelihood` and Hessian differ from the full-data
+src/families/transformation_normal.rs:1387:            x_deriv_kron: self.x_deriv_kron.clone(),
+src/families/transformation_normal.rs:1391:            response_deriv_basis: self.response_deriv_basis.clone(),
+src/families/transformation_normal.rs:1397:            initial_beta: self.initial_beta.clone(),
+src/families/transformation_normal.rs:1412:            persistent_dense_hessian: Arc::new(CtnPersistentDenseHessianCache::default()),
+src/families/transformation_normal.rs:1459:        beta: &Array1<f64>,
+src/families/transformation_normal.rs:1460:        beta_mat: ArrayView2<'_, f64>,
+src/families/transformation_normal.rs:1465:        if beta.len() != p_resp * self.covariate_design.ncols() {
+src/families/transformation_normal.rs:1468:                    "SCOP endpoint beta length {} != p_resp({p_resp}) * p_cov({})",
+src/families/transformation_normal.rs:1469:                    beta.len(),
+src/families/transformation_normal.rs:1481:                gamma[k] = beta_mat.row(k).dot(&cov_row);
+src/families/transformation_normal.rs:1501:        beta: &Array1<f64>,
+src/families/transformation_normal.rs:1508:            if let Some(cached) = cache.as_ref().filter(|cached| cached.matches_beta(beta)) {
+src/families/transformation_normal.rs:1515:        let beta_mat = beta
+src/families/transformation_normal.rs:1518:            .map_err(|e| format!("SCOP endpoint beta reshape failed: {e}"))?;
+src/families/transformation_normal.rs:1526:        // The observed value, derivative value, and finite-support endpoints
+src/families/transformation_normal.rs:1530:        let gamma = fast_ab(cov.as_ref(), &beta_mat.t().to_owned());
+src/families/transformation_normal.rs:1547:                let deriv_row = self.response_deriv_basis.row(i);
+src/families/transformation_normal.rs:1551:                let mut hp_acc = deriv_row[0] * g0 + TRANSFORMATION_MONOTONICITY_EPS;
+src/families/transformation_normal.rs:1559:                    hp_acc += deriv_row[k] * g_sq;
+src/families/transformation_normal.rs:1587:        // vectors (`v_*_deriv * weights`) to yield NaN entries throughout the
+src/families/transformation_normal.rs:1588:        // dense psi-psi block (`hessian_psi_psi`). The likelihood gate in
+src/families/transformation_normal.rs:1620:        // Compute exact f64 row derivatives. If any required reciprocal power
+src/families/transformation_normal.rs:1624:        let derived = build_transformation_row_derived(
+src/families/transformation_normal.rs:1641:            beta: Arc::new(beta.clone()),
+src/families/transformation_normal.rs:1647:            endpoint_q: Arc::new(derived.endpoint_q),
+src/families/transformation_normal.rs:1648:            log_likelihood: derived.log_likelihood,
+src/families/transformation_normal.rs:1660:    fn scop_gradient_and_negative_hessian(
+src/families/transformation_normal.rs:1662:        beta: &Array1<f64>,
+src/families/transformation_normal.rs:1669:        if beta.len() != p_total {
+src/families/transformation_normal.rs:1672:                    "SCOP gradient beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
+src/families/transformation_normal.rs:1673:                    beta.len()
+src/families/transformation_normal.rs:1678:        if !row_quantities.matches_beta(beta) {
+src/families/transformation_normal.rs:1680:                "SCOP gradient/Hessian received row quantities for a different beta".to_string(),
+src/families/transformation_normal.rs:1704:        let response_deriv_basis = &self.response_deriv_basis;
+src/families/transformation_normal.rs:1710:            hessian: Array2<f64>,
+src/families/transformation_normal.rs:1717:                    hessian: Array2::<f64>::zeros((p_total, p_total)),
+src/families/transformation_normal.rs:1756:                    let rd = response_deriv_basis.row(i);
+src/families/transformation_normal.rs:1823:                                    acc.hessian[[row_idx, l * p_cov + d]] += left * cov_row[d];
+src/families/transformation_normal.rs:1835:        let mut hessian = Array2::<f64>::zeros((p_total, p_total));
+src/families/transformation_normal.rs:1838:            hessian.scaled_add(1.0, &partial.hessian);
+src/families/transformation_normal.rs:1841:        Ok((gradient, hessian))
+src/families/transformation_normal.rs:1846:        beta: &Array1<f64>,
+src/families/transformation_normal.rs:1853:        if beta.len() != p_total {
+src/families/transformation_normal.rs:1856:                    "SCOP gradient beta length {} != p_resp({p_resp}) * p_cov({p_cov})",
+src/families/transformation_normal.rs:1857:                    beta.len()
+src/families/transformation_normal.rs:1862:        if !row_quantities.matches_beta(beta) {
+src/families/transformation_normal.rs:1864:                reason: "SCOP gradient received row quantities for a different beta".to_string(),
+src/families/transformation_normal.rs:1894:            let rd = self.response_deriv_basis.row(i);
+src/families/transformation_normal.rs:1927:    /// Directional derivative of the SCOP negative Hessian.
+src/families/transformation_normal.rs:1930:    /// derivative row `m`, define `g_k = beta_k·c`, `u_k = direction_k·c`,
+src/families/transformation_normal.rs:1950:    /// both second derivatives are zero. Differentiating this expression in
+src/families/transformation_normal.rs:1956:    fn scop_hessian_directional_derivative(
+src/families/transformation_normal.rs:1958:        beta: &Array1<f64>,
+src/families/transformation_normal.rs:1966:        if beta.len() != p_total || direction.len() != p_total {
+src/families/transformation_normal.rs:1968:                "SCOP Hessian directional derivative length mismatch: beta={}, direction={}, expected={p_total}",
+src/families/transformation_normal.rs:1969:                beta.len(),
+src/families/transformation_normal.rs:1973:        if !row_quantities.matches_beta(beta) {
+src/families/transformation_normal.rs:1975:                "SCOP Hessian directional derivative received row quantities for a different beta"
+src/families/transformation_normal.rs:1984:            format!("SCOP Hessian directional derivative requires cached covariate design: {e}")
+src/families/transformation_normal.rs:1991:                "SCOP Hessian directional derivative gamma cache shape mismatch: got {}x{}, expected {}x{}",
+src/families/transformation_normal.rs:2028:                    let rd = self.response_deriv_basis.row(i);
+src/families/transformation_normal.rs:2156:    /// Second directional derivative of the SCOP negative Hessian.
+src/families/transformation_normal.rs:2158:    /// Reuse the notation from `scop_hessian_directional_derivative`, with
+src/families/transformation_normal.rs:2159:    /// two beta-space directions `u` and `v`. Since each shape component is
+src/families/transformation_normal.rs:2160:    /// quadratic in `g_k`, all third beta derivatives of `h` and `hp` are zero,
+src/families/transformation_normal.rs:2161:    /// while the mixed second directional derivatives are
+src/families/transformation_normal.rs:2181:    fn scop_hessian_second_directional_derivative(
+src/families/transformation_normal.rs:2183:        beta: &Array1<f64>,
+src/families/transformation_normal.rs:2192:        if beta.len() != p_total || direction_u.len() != p_total || direction_v.len() != p_total {
+src/families/transformation_normal.rs:2194:                "SCOP Hessian second directional derivative length mismatch: beta={}, u={}, v={}, expected={p_total}",
+src/families/transformation_normal.rs:2195:                beta.len(),
+src/families/transformation_normal.rs:2200:        if !row_quantities.matches_beta(beta) {
+src/families/transformation_normal.rs:2202:                "SCOP Hessian second directional derivative received row quantities for a different beta"
+src/families/transformation_normal.rs:2216:                "SCOP Hessian second directional derivative requires cached covariate design: {e}"
+src/families/transformation_normal.rs:2224:                "SCOP Hessian second directional derivative gamma cache shape mismatch: got {}x{}, expected {}x{}",
+src/families/transformation_normal.rs:2266:                    let rd = self.response_deriv_basis.row(i);
+src/families/transformation_normal.rs:2450:    fn scop_hessian_matvec_into(
+src/families/transformation_normal.rs:2452:        beta: &Array1<f64>,
+src/families/transformation_normal.rs:2462:        if beta.len() != p_total || probe.len() != p_total || out.len() != p_total {
+src/families/transformation_normal.rs:2464:                "SCOP Hessian matvec length mismatch: beta={}, probe={}, out={}, expected={p_total}",
+src/families/transformation_normal.rs:2465:                beta.len(),
+src/families/transformation_normal.rs:2470:        if !row_quantities.matches_beta(beta) {
+src/families/transformation_normal.rs:2472:                "SCOP Hessian matvec received row quantities for a different beta".to_string(),
+src/families/transformation_normal.rs:2510:            let rd = self.response_deriv_basis.row(i);
+
+exec
+/bin/zsh -lc "nl -ba src/families/survival_location_scale.rs | sed -n '1,260p'" in /Users/user/gam
+ succeeded in 0ms:
+     1	use crate::basis::BasisOptions;
+     2	use crate::custom_family::{
+     3	    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
+     4	    CustomFamilyJointDesignChannel, CustomFamilyJointDesignPairContribution,
+     5	    CustomFamilyJointPsiOperator, CustomFamilyPsiDesignAction, CustomFamilyPsiLinearMapRef,
+     6	    CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
+     7	    ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
+     8	    ExactNewtonOuterCurvature, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
+     9	    PenaltyMatrix, PsiDesignMap, build_embedded_dense_psi_operator,
+    10	    build_rowwise_kronecker_psi_operator, evaluate_custom_family_joint_hyper,
+    11	    evaluate_custom_family_joint_hyper_efs, first_psi_linear_map, fit_custom_family,
+    12	    resolve_custom_family_x_psi_map, shared_dense_arc, weighted_crossprod_psi_maps,
+    13	    wrap_spatial_implicit_psi_operator,
+    14	};
+    15	use crate::solver::estimate::reml::unified::{DenseMatrixHyperOperator, HyperOperator};
+    16	
+    17	use crate::faer_ndarray::{
+    18	    FaerEigh, fast_atb_with_parallelism, fast_atv, fast_av, fast_xt_diag_x,
+    19	    fast_xt_diag_x_with_parallelism,
+    20	};
+    21	use crate::families::gamlss::{
+    22	    SelectedWiggleBasis, WiggleBlockConfig, monotone_wiggle_basis_with_derivative_order,
+    23	    monotone_wiggle_nonnegative_constraints, select_wiggle_basis_from_seed,
+    24	    validate_monotone_wiggle_beta_nonnegative,
+    25	};
+    26	use crate::families::scale_design::{
+    27	    build_scale_deviation_operator, build_scale_deviation_transform_design,
+    28	    infer_non_intercept_start_design,
+    29	};
+    30	use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
+    31	use crate::matrix::{
+    32	    BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
+    33	    EmbeddedSquareBlock, MultiChannelOperator, RowwiseKroneckerOperator, SymmetricMatrix,
+    34	};
+    35	use crate::mixture_link::{
+    36	    component_inverse_link_jet, inverse_link_jet_for_inverse_link,
+    37	    inverse_link_pdffourth_derivative_for_inverse_link,
+    38	    inverse_link_pdfthird_derivative_for_inverse_link,
+    39	};
+    40	use crate::pirls::LinearInequalityConstraints;
+    41	use crate::probability::erfcx_nonnegative;
+    42	use crate::probability::{normal_cdf, normal_pdf};
+    43	use crate::smooth::{
+    44	    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+    45	    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
+    46	    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
+    47	    spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
+    48	};
+    49	use crate::solver::estimate::UnifiedFitResult;
+    50	use crate::solver::estimate::{
+    51	    FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
+    52	};
+    53	use crate::terms::construction::kronecker_product;
+    54	use crate::types::{InverseLink, LinkFunction};
+    55	use ndarray::{Array1, Array2, ArrayView1, Axis, s};
+    56	use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+    57	use rayon::slice::ParallelSliceMut;
+    58	use statrs::function::erf::erfc;
+    59	use std::collections::HashMap;
+    60	use std::sync::Arc;
+    61	
+    62	const SURVIVAL_ROW_PARALLEL_THRESHOLD: usize = 256;
+    63	const SURVIVAL_ROW_PARALLEL_CHUNK: usize = 64;
+    64	
+    65	/// Typed errors emitted by the survival location-scale family pipeline.
+    66	///
+    67	/// Each variant carries a pre-formatted `reason` string so `Display` is
+    68	/// byte-equivalent to the original `format!(...)` outputs the module used
+    69	/// before the typed-error migration. The category split lets callers
+    70	/// pattern-match on the failure kind without dragging the string apart.
+    71	#[derive(Debug, Clone)]
+    72	pub enum SurvivalLocationScaleError {
+    73	    /// Row/column/length disagreement between vectors, matrices, designs,
+    74	    /// penalty blocks, or coefficient/parameter dimensions.
+    75	    DimensionMismatch { reason: String },
+    76	    /// Spec-level validation: tolerances, iteration caps, knot-vector
+    77	    /// lengths, time intervals, weight values, or missing/contradictory
+    78	    /// configuration fields the user supplied.
+    79	    InvalidConfiguration { reason: String },
+    80	    /// Structural constraint violated at runtime: monotonicity guards,
+    81	    /// lower bounds on coefficients, nonnegativity, derivative-basis
+    82	    /// sign, or values outside an allowed semantic range.
+    83	    ConstraintViolation { reason: String },
+    84	    /// A numerical step produced a non-finite or out-of-domain value
+    85	    /// downstream code cannot consume (NaN products, invalid pdf,
+    86	    /// survival probability out of (0,1], etc.).
+    87	    NumericalFailure { reason: String },
+    88	    /// Internal invariant about pipeline state (empty block markers,
+    89	    /// unexpected ranks, schema/state inconsistencies surfaced from
+    90	    /// inner helpers).
+    91	    InternalInvariant { reason: String },
+    92	}
+    93	
+    94	impl std::fmt::Display for SurvivalLocationScaleError {
+    95	    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    96	        match self {
+    97	            SurvivalLocationScaleError::DimensionMismatch { reason }
+    98	            | SurvivalLocationScaleError::InvalidConfiguration { reason }
+    99	            | SurvivalLocationScaleError::ConstraintViolation { reason }
+   100	            | SurvivalLocationScaleError::NumericalFailure { reason }
+   101	            | SurvivalLocationScaleError::InternalInvariant { reason } => f.write_str(reason),
+   102	        }
+   103	    }
+   104	}
+   105	
+   106	impl std::error::Error for SurvivalLocationScaleError {}
+   107	
+   108	impl From<SurvivalLocationScaleError> for String {
+   109	    fn from(err: SurvivalLocationScaleError) -> String {
+   110	        err.to_string()
+   111	    }
+   112	}
+   113	
+   114	impl From<String> for SurvivalLocationScaleError {
+   115	    /// Inbound conversion from the many `Result<_, String>` helpers this
+   116	    /// module still calls into. The text is preserved verbatim; we only
+   117	    /// pick a generic category so external messages flow through `?`
+   118	    /// without per-callsite `.map_err`.
+   119	    fn from(reason: String) -> SurvivalLocationScaleError {
+   120	        SurvivalLocationScaleError::InternalInvariant { reason }
+   121	    }
+   122	}
+   123	
+   124	#[inline]
+   125	fn softplus(x: f64) -> f64 {
+   126	    if x.is_nan() {
+   127	        f64::NAN
+   128	    } else if x == f64::INFINITY {
+   129	        f64::INFINITY
+   130	    } else if x == f64::NEG_INFINITY {
+   131	        0.0
+   132	    } else if x >= 0.0 {
+   133	        x + (-x).exp().ln_1p()
+   134	    } else {
+   135	        x.exp().ln_1p()
+   136	    }
+   137	}
+   138	
+   139	// ---------------------------------------------------------------------------
+   140	// Overflow-safe arithmetic for the survival exact-Newton chain
+   141	// ---------------------------------------------------------------------------
+   142	//
+   143	// The survival location-scale model computes inv_sigma = exp(-eta_ls) and
+   144	// multiplies it through many intermediate quantities (q0, qdot, g, ...).
+   145	// When eta_ls is very negative (sigma → 0, distribution very concentrated),
+   146	// exp(-eta_ls) can overflow to inf, poisoning downstream sums with NaN via
+   147	// inf * 0 or inf - inf patterns.
+   148	//
+   149	// The protection strategy is layered:
+   150	//
+   151	//   Layer 1 – `exp_neg_stable`: cap the exp argument at +500 (one-sided)
+   152	//     so inv_sigma ≤ exp(500) ≈ 1.4e217, preventing overflow at the
+   153	//     source.  Underflow (exp(-x) → 0 for large positive x) is allowed
+   154	//     because it is the mathematically correct limit.  Products like
+   155	//     inv_sigma * eta_t stay finite for any eta_t below ~1e91.
+   156	//
+   157	//   Layer 2 – `survival_q0_from_eta`: uses log-space arithmetic to detect
+   158	//     when |eta_t * inv_sigma| would exceed the clamp ceiling and saturates
+   159	//     to ±MAX instead of overflowing.
+   160	//
+   161	//   Layer 3 – factorized time-derivative algebra and compensated subtraction:
+   162	//     the base dq/dt chain is evaluated as exp(-eta_ls) * (eta_t*eta_ls' - eta_t')
+   163	//     so the shared exp(-eta_ls) factor is applied only once, and
+   164	//     d_eta/dt = d_raw + qdot is formed with a compensated sum that
+   165	//     carries an explicit roundoff bound into the monotonicity gate.
+   166	//
+   167	//   Layer 4 – `safe_product` / `safe_sum2` plus `exact_row_kernel`: the generic
+   168	//     arithmetic guards still clamp inf products to MAX/MIN and map
+   169	//     inf + (-inf) → 0 as defense in depth, and the row kernel splits the old
+   170	//     `!g.is_finite()` hard error
+   171	//     into NaN (hard error for genuinely bad data) and ±inf (clamped to MAX
+   172	//     so the monotonicity guard can apply).
+   173	//
+   174	// The invariant: no NaN ever reaches the solver; all overflow paths saturate
+   175	// to large finite values that the monotonicity floor and penalty then control.
+   176	// ---------------------------------------------------------------------------
+   177	
+   178	/// Maximum exponent argument for overflow-safe exp in the survival chain.
+   179	/// exp(500) ≈ 1.4e217 leaves ~91 orders of magnitude of headroom before
+   180	/// reaching MAX ≈ 1.8e308, sufficient for any reasonable multiplicative chain.
+   181	const EXP_NEG_STABLE_MAX_ARG: f64 = 500.0;
+   182	
+   183	/// Overflow-safe exp(-x): guards against overflow when x is very negative
+   184	/// (i.e. exp(-x) very large) by capping the exponent at +500, but allows
+   185	/// natural IEEE 754 underflow to 0.0 when x is very positive.
+   186	///
+   187	/// The one-sided guard is critical: for x = 701 the correct value is
+   188	/// exp(-701) ≈ 5e-305 (essentially zero), NOT exp(-500) ≈ 7e-218.
+   189	/// A two-sided clamp would return the latter, which is ~1e87× too large
+   190	/// and destroys far-tail exact derivatives.
+   191	#[inline]
+   192	fn exp_neg_stable(x: f64) -> f64 {
+   193	    (-x).min(EXP_NEG_STABLE_MAX_ARG).exp()
+   194	}
+   195	
+   196	#[inline]
+   197	fn exp_sigma_inverse_from_eta_scalar(eta: f64) -> f64 {
+   198	    exp_neg_stable(eta)
+   199	}
+   200	
+   201	/// Layer 3 defense: clamp products that overflow to ±inf back to ±MAX.
+   202	/// With layer 1 (exp_neg_stable) active this should not trigger in normal
+   203	/// operation; it guards against edge cases where two independently large
+   204	/// (but sub-overflow) factors multiply to exceed MAX.
+   205	#[inline]
+   206	fn safe_product(lhs: f64, rhs: f64) -> f64 {
+   207	    if lhs == 0.0 || rhs == 0.0 {
+   208	        0.0
+   209	    } else {
+   210	        let v = lhs * rhs;
+   211	        if v == f64::INFINITY {
+   212	            f64::MAX
+   213	        } else if v == f64::NEG_INFINITY {
+   214	            f64::MIN
+   215	        } else {
+   216	            v
+   217	        }
+   218	    }
+   219	}
+   220	
+   221	/// Layer 3 defense: when a + b produces NaN from inf + (-inf), return 0.
+   222	///
+   223	/// In the survival chain, g = d_raw + qdot1 where both terms scale as
+   224	/// inv_sigma × (something).  When inv_sigma is very large, both terms
+   225	/// overflow independently even though their sum is finite.  Mapping
+   226	/// the cancellation to 0 is conservative: it says "the correction is
+   227	/// negligible", and the monotonicity guard in exact_row_kernel will floor
+   228	/// g upward if needed.
+   229	#[inline]
+   230	fn safe_sum2(a: f64, b: f64) -> f64 {
+   231	    let sum = a + b;
+   232	    if sum.is_nan() {
+   233	        if a == 0.0 {
+   234	            return b;
+   235	        } else if b == 0.0 {
+   236	            return a;
+   237	        }
+   238	        if (a == f64::INFINITY && b == f64::NEG_INFINITY)
+   239	            || (a == f64::NEG_INFINITY && b == f64::INFINITY)
+   240	        {
+   241	            return 0.0;
+   242	        }
+   243	        sum
+   244	    } else {
+   245	        sum
+   246	    }
+   247	}
+   248	
+   249	#[inline]
+   250	fn safe_sum3(a: f64, b: f64, c: f64) -> f64 {
+   251	    safe_sum2(safe_sum2(a, b), c)
+   252	}
+   253	
+   254	#[inline]
+   255	fn safe_product3(a: f64, b: f64, c: f64) -> f64 {
+   256	    let mut factors = [a, b, c];
+   257	    factors.sort_by(|lhs, rhs| lhs.abs().total_cmp(&rhs.abs()));
+   258	    safe_product(safe_product(factors[0], factors[1]), factors[2])
+   259	}
+   260	
+
+exec
+/bin/zsh -lc "nl -ba src/families/transformation_normal.rs | sed -n '1,160p'" in /Users/user/gam
+ succeeded in 0ms:
+     1	//! Conditional transformation model: estimate h(y|x) such that h(Y|x) ~ N(0,1).
+     2	//!
+     3	//! Given a response variable y and covariates x with a pre-built covariate design
+     4	//! operator, this family estimates a smooth monotone transformation h(y | x) mapping
+     5	//! the conditional distribution of Y|x onto a standard normal.
+     6	//!
+     7	//! The response-direction basis is `[1, I_1(y), ..., I_K(y)]`, tensored with an
+     8	//! arbitrary covariate design operator. Column 0 is an unconstrained location
+     9	//! component `b(x)`. The I-spline columns are shape components with squared
+    10	//! covariate-side coefficients, giving the SCOP representation
+    11	//! `h(y, x) = b(x) + ε·(y−median_y) + Σ_k I_k(y) γ_k(x)^2` and
+    12	//! `h'(y, x) = ε + Σ_k M_k(y) γ_k(x)^2`. Monotonicity is structural:
+    13	//! the fixed derivative floor `ε` keeps the change-of-variables log-density
+    14	//! away from the `log(0)` singularity, while the non-negative M-spline basis
+    15	//! and squared covariate-side coefficients supply the learned shape.
+    16	//!
+    17	//! The log-likelihood per observation is the finite-support normalized
+    18	//! change-of-variables density for a standard normal target:
+    19	//!
+    20	//!   ℓ_i = -½ h_i² + log(h'_i) - log(Φ(h_U(x_i)) - Φ(h_L(x_i)))
+    21	//!
+    22	//! where `h_i = b(x_i) + ε·(y_i−median_y) + Σ_k I_k(y_i) γ_k(x_i)^2`
+    23	//! and `h'_i = ε + Σ_k M_k(y_i) γ_k(x_i)^2`. The endpoint normalizer is
+    24	//! required because the I-spline response basis saturates at finite support
+    25	//! values rather than mapping onto the full real line.
+    26	
+    27	use crate::basis::{
+    28	    BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
+    29	    create_ispline_derivative_dense,
+    30	};
+    31	use crate::faer_ndarray::{fast_ab, fast_atb};
+    32	use crate::families::custom_family::{
+    33	    BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
+    34	    CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
+    35	    ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
+    36	    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
+    37	    MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
+    38	    build_block_spatial_psi_derivatives, evaluate_custom_family_joint_hyper,
+    39	    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
+    40	};
+    41	use crate::families::gamlss::{
+    42	    initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
+    43	};
+    44	use crate::inference::model::{TRANSFORMATION_SCORE_PIT_CLIP_EPS, TransformationScoreCalibration};
+    45	use crate::matrix::{
+    46	    DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,
+    47	};
+    48	use crate::pirls::LinearInequalityConstraints;
+    49	use crate::probability::{log1mexp_positive, normal_logcdf, standard_normal_quantile};
+    50	use crate::resource::{MatrixMaterializationError, ResourcePolicy};
+    51	use crate::smooth::{
+    52	    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+    53	    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
+    54	    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
+    55	    spatial_length_scale_term_indices,
+    56	};
+    57	use crate::solver::estimate::UnifiedFitResult;
+    58	use crate::solver::estimate::reml::unified::{
+    59	    DriftDerivResult, HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
+    60	};
+    61	use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
+    62	use std::cell::RefCell;
+    63	use std::collections::hash_map::DefaultHasher;
+    64	use std::hash::{Hash, Hasher};
+    65	use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+    66	use std::sync::{Arc, Mutex, OnceLock};
+    67	
+    68	// ---------------------------------------------------------------------------
+    69	// Typed errors
+    70	// ---------------------------------------------------------------------------
+    71	
+    72	/// Typed errors emitted by the transformation-normal family pipeline.
+    73	///
+    74	/// Each variant carries a pre-formatted `reason` so `Display` is
+    75	/// byte-equivalent to the original `format!(...)` strings the module used
+    76	/// before the typed-error migration. The category split lets callers
+    77	/// pattern-match on the failure kind (e.g. distinguish a degenerate
+    78	/// covariate design from a non-finite intermediate) without parsing text.
+    79	///
+    80	/// Public/trait boundaries (e.g. `CustomFamily::evaluate`) still return
+    81	/// `Result<_, String>`; the `From<TransformationNormalError> for String`
+    82	/// impl below provides the shim so every typed error flushes through `?`
+    83	/// or `.into()` at the boundary without per-callsite `.map_err`.
+    84	#[derive(Debug, Clone)]
+    85	pub enum TransformationNormalError {
+    86	    /// Shape/length/dimension/contract violations on inputs to a routine
+    87	    /// (e.g. response/covariate row mismatch, beta length mismatch,
+    88	    /// wrong number of blocks, malformed configuration parameters).
+    89	    InvalidInput { reason: String },
+    90	    /// A required covariate design or weight configuration cannot support
+    91	    /// the routine — empty design, zero total weight, residual variance
+    92	    /// not representable, warm-start coefficients all non-finite.
+    93	    DesignDegenerate { reason: String },
+    94	    /// A numeric intermediate (response transform, derivative,
+    95	    /// log-likelihood, weight, offset, gradient component, calibration
+    96	    /// quantity) came out non-finite or non-positive where positive
+    97	    /// finite is required.
+    98	    NonFinite { reason: String },
+    99	    /// The fitted monotone transform's derivative dropped to or below
+   100	    /// zero, or the response endpoint ordering required by the latent
+   101	    /// score (lower < h < upper) was not satisfied at evaluation time.
+   102	    MonotonicityViolated { reason: String },
+   103	    /// A numerical step that maps through the standard-normal CDF
+   104	    /// (endpoint mass, log-difference, PIT probability, derivative
+   105	    /// ratio) underflowed or became non-representable at the requested
+   106	    /// arguments.
+   107	    NumericalFailure { reason: String },
+   108	}
+   109	
+   110	impl std::fmt::Display for TransformationNormalError {
+   111	    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+   112	        match self {
+   113	            TransformationNormalError::InvalidInput { reason }
+   114	            | TransformationNormalError::DesignDegenerate { reason }
+   115	            | TransformationNormalError::NonFinite { reason }
+   116	            | TransformationNormalError::MonotonicityViolated { reason }
+   117	            | TransformationNormalError::NumericalFailure { reason } => f.write_str(reason),
+   118	        }
+   119	    }
+   120	}
+   121	
+   122	impl std::error::Error for TransformationNormalError {}
+   123	
+   124	impl From<TransformationNormalError> for String {
+   125	    /// Shim for the many `Result<_, String>` signatures the module exposes
+   126	    /// (notably the `CustomFamily` and joint-Hessian / psi-workspace
+   127	    /// trait surfaces). Lets a typed `Err(TransformationNormalError::…)`
+   128	    /// flow through `?` or `.into()` without per-callsite stringification.
+   129	    fn from(err: TransformationNormalError) -> String {
+   130	        err.to_string()
+   131	    }
+   132	}
+   133	
+   134	// ---------------------------------------------------------------------------
+   135	// Configuration
+   136	// ---------------------------------------------------------------------------
+   137	
+   138	/// Configuration for the response-direction basis in the transformation model.
+   139	#[derive(Clone, Debug)]
+   140	pub struct TransformationNormalConfig {
+   141	    /// B-spline degree for the response-direction deviation basis (default 3).
+   142	    pub response_degree: usize,
+   143	    /// Number of interior knots for the response-direction deviation basis (default 10).
+   144	    pub response_num_internal_knots: usize,
+   145	    /// Difference penalty order for the response-direction roughness penalty (default 2).
+   146	    pub response_penalty_order: usize,
+   147	    /// Additional penalty orders for the response-direction (default [1]).
+   148	    pub response_extra_penalty_orders: Vec<usize>,
+   149	    /// Whether to add a global identity (ridge) penalty (default true).
+   150	    pub double_penalty: bool,
+   151	}
+   152	
+   153	impl Default for TransformationNormalConfig {
+   154	    fn default() -> Self {
+   155	        Self {
+   156	            response_degree: 3,
+   157	            response_num_internal_knots: 10,
+   158	            response_penalty_order: 2,
+   159	            response_extra_penalty_orders: vec![1],
+   160	            double_penalty: true,
+
+exec
+/bin/zsh -lc 'rg -n "safe_sum2|safe_sum3|safe_product" src/families/survival_location_scale.rs' in /Users/user/gam
+ succeeded in 0ms:
+167://   Layer 4 – `safe_product` / `safe_sum2` plus `exact_row_kernel`: the generic
+206:fn safe_product(lhs: f64, rhs: f64) -> f64 {
+230:fn safe_sum2(a: f64, b: f64) -> f64 {
+250:fn safe_sum3(a: f64, b: f64, c: f64) -> f64 {
+251:    safe_sum2(safe_sum2(a, b), c)
+255:fn safe_product3(a: f64, b: f64, c: f64) -> f64 {
+258:    safe_product(safe_product(factors[0], factors[1]), factors[2])
+275:    let out = Array1::from_shape_fn(lhs.len(), |i| safe_product(lhs[i], rhs[i]));
+304:        safe_sum2(safe_product(a[i], b[i]), safe_product(c[i], d[i]))
+450:        // inf − inf via safe_sum2), the true value could be anywhere, so
+453:        let diff = safe_sum2(lhs, -rhs);
+480:    // pass through ~45 chained safe_product / safe_sum operations, giving
+2942:    let q = -safe_product(eta_t, inv_sigma);
+2993:    let q = -safe_product(eta_t, inv_sigma);
+5090:                let contrib = safe_product3(wi, lij, rijk);
+5091:                out[[j, k]] = safe_sum2(out[[j, k]], contrib);
+5184:                *dst = safe_sum2(*dst, *src);
+5357:                    row.mapv_inplace(|value| safe_product(value, coeff));
+5364:                .mapv_inplace(|value| safe_product(value, coeff));
+5903:    safe_product(base.inv_sigma, local_derivative)
+5925:    let r_t = safe_product(c, eta_ls_deriv);
+5926:    let r_ls = safe_sum2(safe_product(c, eta_t_deriv), safe_product(d, eta_ls_deriv));
+5927:    let r_ll = safe_sum2(safe_product(e, eta_t_deriv), safe_product(f, eta_ls_deriv));
+5928:    let q_t = safe_product(m1, a);
+5929:    let q_ls = safe_product(m1, b);
+5930:    let q_tl = safe_sum2(safe_product(m2, safe_product(a, b)), safe_product(m1, c));
+5931:    let q_ll = safe_sum2(safe_product(m2, safe_product(b, b)), safe_product(m1, d));
+5932:    let q_tl_ls = safe_sum3(
+5933:        safe_product(m3, safe_product(a, safe_product(b, b))),
+5934:        safe_product(m2, safe_sum2(safe_product(a, d), 2.0 * safe_product(b, c))),
+5935:        safe_product(m1, e),
+5937:    let q_ll_ls = safe_sum3(
+5938:        safe_product(m3, safe_product(b, safe_product(b, b))),
+5939:        safe_product(m2, 3.0 * safe_product(b, d)),
+5940:        safe_product(m1, f),
+5951:        qdot: safe_product(m1, r),
+5952:        qdot_t: safe_sum2(safe_product(m2, safe_product(a, r)), safe_product(m1, r_t)),
+5953:        qdot_ls: safe_sum2(safe_product(m2, safe_product(b, r)), safe_product(m1, r_ls)),
+5956:        qdot_tt: safe_sum2(
+5957:            safe_product(m3, safe_product(safe_product(a, a), r)),
+5958:            2.0 * safe_product(m2, safe_product(a, r_t)),
+5960:        qdot_tls: safe_sum3(
+5961:            safe_product(m3, safe_product(safe_product(a, b), r)),
+5962:            safe_product(
+5964:                safe_sum3(
+5965:                    safe_product(c, r),
+5966:                    safe_product(a, r_ls),
+5967:                    safe_product(b, r_t),
+5970:            safe_product(m1, safe_product(e, eta_ls_deriv)),
+5972:        qdot_ttd: safe_product(m2, safe_product(a, a)),
+5973:        qdot_tlsd: safe_sum2(safe_product(m2, safe_product(a, b)), safe_product(m1, c)),
+5974:        qdot_ll: safe_sum3(
+5975:            safe_product(m3, safe_product(safe_product(b, b), r)),
+5976:            safe_product(
+5978:                safe_sum2(safe_product(d, r), 2.0 * safe_product(b, r_ls)),
+5980:            safe_product(m1, r_ll),
+5982:        qdot_lstd: safe_sum2(safe_product(m2, safe_product(a, b)), safe_product(m1, c)),
+5983:        qdot_llsd: safe_sum2(safe_product(m2, safe_product(b, b)), safe_product(m1, d)),
+7161:                let h_exit = -(&q.d2_q1 * &q.dq_t.mapv(|v| safe_product(v, v))
+7162:                    + &q.d2_qdot1 * &q.dqdot_t.mapv(|v| safe_product(v, v))
+7165:                    -(&q.d2_q0 * &q.dq_t_entry.as_ref().unwrap().mapv(|v| safe_product(v, v)));
+7166:                let h_deriv = -(&q.d2_qdot1 * &q.dqdot_td.mapv(|v| safe_product(v, v)));
+7195:                let h_t = -(&q.d2_q1 * &q.dq_t.mapv(|v| safe_product(v, v))
+7196:                    + &q.d2_q0 * &q.dq_t_entry.as_ref().unwrap().mapv(|v| safe_product(v, v))
+7197:                    + &q.d2_qdot1 * &q.dqdot_t.mapv(|v| safe_product(v, v))
+7213:                let h_exit = -(&q.d2_q1 * &q.dq_ls.mapv(|v| safe_product(v, v))
+7215:                    + &q.d2_qdot1 * &q.dqdot_ls.mapv(|v| safe_product(v, v))
+7217:                let h_entry = -(&q.d2_q0 * &dq_ls_entry.mapv(|v| safe_product(v, v))
+7219:                let h_deriv = -(&q.d2_qdot1 * &q.dqdot_lsd.mapv(|v| safe_product(v, v)));
+7248:                let h_ls = -(&q.d2_q1 * &q.dq_ls.mapv(|v| safe_product(v, v))
+7250:                    + &q.d2_q0 * &q.dq_ls_entry.as_ref().unwrap().mapv(|v| safe_product(v, v))
+7252:                    + &q.d2_qdot1 * &q.dqdot_ls.mapv(|v| safe_product(v, v))
+7400:            let h_exit = -(&q.d2_q1 * &q.dq_t.mapv(|v| safe_product(v, v))
+7401:                + &q.d2_qdot1 * &q.dqdot_t.mapv(|v| safe_product(v, v))
+7404:                -(&q.d2_q0 * &q.dq_t_entry.as_ref().unwrap().mapv(|v| safe_product(v, v)));
+7405:            let h_deriv = -(&q.d2_qdot1 * &q.dqdot_td.mapv(|v| safe_product(v, v)));
+7416:            let h_t = -(&q.d2_q1 * &q.dq_t.mapv(|v| safe_product(v, v))
+7417:                + &q.d2_q0 * &q.dq_t_entry.as_ref().unwrap().mapv(|v| safe_product(v, v))
+7418:                + &q.d2_qdot1 * &q.dqdot_t.mapv(|v| safe_product(v, v))
+7427:            let h_exit = -(&q.d2_q1 * &q.dq_ls.mapv(|v| safe_product(v, v))
+7429:                + &q.d2_qdot1 * &q.dqdot_ls.mapv(|v| safe_product(v, v))
+7431:            let h_entry = -(&q.d2_q0 * &dq_ls_entry.mapv(|v| safe_product(v, v))
+7433:            let h_deriv = -(&q.d2_qdot1 * &q.dqdot_lsd.mapv(|v| safe_product(v, v)));
+7444:            let h_ls = -(&q.d2_q1 * &q.dq_ls.mapv(|v| safe_product(v, v))
+7446:                + &q.d2_q0 * &q.dq_ls_entry.as_ref().unwrap().mapv(|v| safe_product(v, v))
+7448:                + &q.d2_qdot1 * &q.dqdot_ls.mapv(|v| safe_product(v, v))
+7571:                safe_product(
+7579:                safe_sum2(
+7580:                    safe_product(q_tl, eta_t_deriv_exit[i]),
+7581:                    safe_product(q_ll, eta_ls_deriv_exit[i]),
+7937:            let d_h_exit = -(&d_d2_q_exit * &q.dq_t.mapv(|v| safe_product(v, v))
+7939:            let d_h_entry = -(&entry_deltas.d_d2_q * &dq_t_en.mapv(|v| safe_product(v, v))
+7946:            let d_h_t = -(&d_d2_q_ti * &q.dq_t.mapv(|v| safe_product(v, v))
+7996:            let d_h_exit = -(&d_d2_q_exit * &q.dq_ls.mapv(|v| safe_product(v, v))
+8000:            let d_h_entry = -(&entry_deltas.d_d2_q * &dq_ls_en.mapv(|v| safe_product(v, v))
+8011:            let d_h_l = -(&d_d2_q * &q.dq_ls.mapv(|v| safe_product(v, v))
+9076:        let h_tt_entry = -(&q.d2_q0 * &dq_t_entry.mapv(|v| safe_product(v, v)));
+9077:        let h_tt_exit = -(&q.d2_q1 * &q.dq_t.mapv(|v| safe_product(v, v)));
+9078:        let dh_tt_entry = -(&q.d3_q0 * &q0_psi * &dq_t_entry.mapv(|v| safe_product(v, v))
+9080:        let dh_tt_exit = -(&q.d3_q1 * &q1_psi * &q.dq_t.mapv(|v| safe_product(v, v))
+9084:            -(&q.d2_q0 * &dq_ls_entry.mapv(|v| safe_product(v, v)) + &(&q.d1_q0 * d2q_ls_entry));
+9086:            -(&q.d2_q1 * &q.dq_ls.mapv(|v| safe_product(v, v)) + &(&q.d1_q1 * &q.d2q_ls));
+9087:        let dh_ll_entry = -(&q.d3_q0 * &q0_psi * &dq_ls_entry.mapv(|v| safe_product(v, v))
+9091:        let dh_ll_exit = -(&q.d3_q1 * &q1_psi * &q.dq_ls.mapv(|v| safe_product(v, v))
+10998:        let r = safe_sum2(safe_product(a, eta_t_deriv), safe_product(b, eta_ls_deriv));
+10999:        let r_ls = safe_sum2(
+11000:            safe_product(base.q_tl, eta_t_deriv),
+11001:            safe_product(d, eta_ls_deriv),
+11003:        let r_ll = safe_sum2(safe_product(e, eta_t_deriv), safe_product(f, eta_ls_deriv));
+11004:        let expected = safe_sum3(
+11005:            safe_product(d3q_dq03, safe_product(safe_product(b, b), r)),
+11006:            safe_product(
+11008:                safe_sum2(safe_product(d, r), 2.0 * safe_product(b, r_ls)),
+11010:            safe_product(dq_dq0, r_ll),
+13743:        let expected = safe_product(
+13747:        let expanded = safe_sum2(
+13748:            safe_product(base.q_t, eta_t_deriv),
+13749:            safe_product(base.q_ls, eta_ls_deriv),
+
+exec
+/bin/zsh -lc "nl -ba src/families/survival_location_scale.rs | sed -n '5860,5990p'" in /Users/user/gam
+ succeeded in 0ms:
+  5860	    }
+  5861	}
+  5862	
+  5863	fn survival_wiggle_basis_with_options(
+  5864	    q0: ndarray::ArrayView1<'_, f64>,
+  5865	    knots: &Array1<f64>,
+  5866	    degree: usize,
+  5867	    options: BasisOptions,
+  5868	) -> Result<Array2<f64>, String> {
+  5869	    monotone_wiggle_basis_with_derivative_order(q0, knots, degree, options.derivative_order)
+  5870	}
+  5871	
+  5872	fn survival_wiggle_third_basis(
+  5873	    q0: ndarray::ArrayView1<'_, f64>,
+  5874	    knots: &Array1<f64>,
+  5875	    degree: usize,
+  5876	) -> Result<Array2<f64>, String> {
+  5877	    monotone_wiggle_basis_with_derivative_order(q0, knots, degree, 3)
+  5878	}
+  5879	
+  5880	fn survival_base_q_scalars(eta_t: f64, eta_ls: f64) -> SurvivalBaseQScalars {
+  5881	    let (q_t, q_ls, q_tl, q_ll, q_tl_ls, q_ll_ls) = q_chain_derivs_scalar(eta_t, eta_ls);
+  5882	    let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls);
+  5883	    SurvivalBaseQScalars {
+  5884	        eta_t,
+  5885	        inv_sigma,
+  5886	        q: survival_q0_from_eta(eta_t, eta_ls),
+  5887	        q_t,
+  5888	        q_ls,
+  5889	        q_tl,
+  5890	        q_ll,
+  5891	        q_tl_ls,
+  5892	        q_ll_ls,
+  5893	    }
+  5894	}
+  5895	
+  5896	#[inline]
+  5897	fn survival_q0dot_from_base(
+  5898	    base: SurvivalBaseQScalars,
+  5899	    eta_t_deriv: f64,
+  5900	    eta_ls_deriv: f64,
+  5901	) -> f64 {
+  5902	    let local_derivative = base.eta_t.mul_add(eta_ls_deriv, -eta_t_deriv);
+  5903	    safe_product(base.inv_sigma, local_derivative)
+  5904	}
+  5905	
+  5906	fn compose_survival_dynamic_q(
+  5907	    base: SurvivalBaseQScalars,
+  5908	    eta_t_deriv: f64,
+  5909	    eta_ls_deriv: f64,
+  5910	    wiggle_value: f64,
+  5911	    dq_dq0: f64,
+  5912	    d2q_dq02: f64,
+  5913	    d3q_dq03: f64,
+  5914	) -> SurvivalDynamicQScalars {
+  5915	    let a = base.q_t;
+  5916	    let b = base.q_ls;
+  5917	    let c = base.q_tl;
+  5918	    let d = base.q_ll;
+  5919	    let e = base.q_tl_ls;
+  5920	    let f = base.q_ll_ls;
+  5921	    let m1 = dq_dq0;
+  5922	    let m2 = d2q_dq02;
+  5923	    let m3 = d3q_dq03;
+  5924	    let r = survival_q0dot_from_base(base, eta_t_deriv, eta_ls_deriv);
+  5925	    let r_t = safe_product(c, eta_ls_deriv);
+  5926	    let r_ls = safe_sum2(safe_product(c, eta_t_deriv), safe_product(d, eta_ls_deriv));
+  5927	    let r_ll = safe_sum2(safe_product(e, eta_t_deriv), safe_product(f, eta_ls_deriv));
+  5928	    let q_t = safe_product(m1, a);
+  5929	    let q_ls = safe_product(m1, b);
+  5930	    let q_tl = safe_sum2(safe_product(m2, safe_product(a, b)), safe_product(m1, c));
+  5931	    let q_ll = safe_sum2(safe_product(m2, safe_product(b, b)), safe_product(m1, d));
+  5932	    let q_tl_ls = safe_sum3(
+  5933	        safe_product(m3, safe_product(a, safe_product(b, b))),
+  5934	        safe_product(m2, safe_sum2(safe_product(a, d), 2.0 * safe_product(b, c))),
+  5935	        safe_product(m1, e),
+  5936	    );
+  5937	    let q_ll_ls = safe_sum3(
+  5938	        safe_product(m3, safe_product(b, safe_product(b, b))),
+  5939	        safe_product(m2, 3.0 * safe_product(b, d)),
+  5940	        safe_product(m1, f),
+  5941	    );
+  5942	
+  5943	    SurvivalDynamicQScalars {
+  5944	        q: base.q + wiggle_value,
+  5945	        q_t,
+  5946	        q_ls,
+  5947	        q_tl,
+  5948	        q_ll,
+  5949	        q_tl_ls,
+  5950	        q_ll_ls,
+  5951	        qdot: safe_product(m1, r),
+  5952	        qdot_t: safe_sum2(safe_product(m2, safe_product(a, r)), safe_product(m1, r_t)),
+  5953	        qdot_ls: safe_sum2(safe_product(m2, safe_product(b, r)), safe_product(m1, r_ls)),
+  5954	        qdot_td: q_t,
+  5955	        qdot_lsd: q_ls,
+  5956	        qdot_tt: safe_sum2(
+  5957	            safe_product(m3, safe_product(safe_product(a, a), r)),
+  5958	            2.0 * safe_product(m2, safe_product(a, r_t)),
+  5959	        ),
+  5960	        qdot_tls: safe_sum3(
+  5961	            safe_product(m3, safe_product(safe_product(a, b), r)),
+  5962	            safe_product(
+  5963	                m2,
+  5964	                safe_sum3(
+  5965	                    safe_product(c, r),
+  5966	                    safe_product(a, r_ls),
+  5967	                    safe_product(b, r_t),
+  5968	                ),
+  5969	            ),
+  5970	            safe_product(m1, safe_product(e, eta_ls_deriv)),
+  5971	        ),
+  5972	        qdot_ttd: safe_product(m2, safe_product(a, a)),
+  5973	        qdot_tlsd: safe_sum2(safe_product(m2, safe_product(a, b)), safe_product(m1, c)),
+  5974	        qdot_ll: safe_sum3(
+  5975	            safe_product(m3, safe_product(safe_product(b, b), r)),
+  5976	            safe_product(
+  5977	                m2,
+  5978	                safe_sum2(safe_product(d, r), 2.0 * safe_product(b, r_ls)),
+  5979	            ),
+  5980	            safe_product(m1, r_ll),
+  5981	        ),
+  5982	        qdot_lstd: safe_sum2(safe_product(m2, safe_product(a, b)), safe_product(m1, c)),
+  5983	        qdot_llsd: safe_sum2(safe_product(m2, safe_product(b, b)), safe_product(m1, d)),
+  5984	    }
+  5985	}
+  5986	
+  5987	impl SurvivalLocationScaleFamily {
+  5988	    fn build_dynamic_geometry(
+  5989	        &self,
+  5990	        block_states: &[ParameterBlockState],
+
+exec
+/bin/zsh -lc "nl -ba src/families/family_meta.rs | sed -n '1,240p'" in /Users/user/gam
+ succeeded in 0ms:
+     1	use crate::types::{InverseLink, LikelihoodFamily, LikelihoodSpec, LinkFunction, ResponseFamily};
+     2	
+     3	/// Build a `LikelihoodSpec` directly from `(response, link)` without going
+     4	/// through the legacy `LikelihoodFamily` enum. Equivalent to
+     5	/// `LikelihoodSpec::new(response, link)`, exposed here so leaf modules that
+     6	/// migrate first can call this constructor without depending on
+     7	/// `inverse_link_to_binomial_family` + `From<LikelihoodFamily>`.
+     8	#[inline]
+     9	pub fn likelihood_spec(response: ResponseFamily, link: InverseLink) -> LikelihoodSpec {
+    10	    LikelihoodSpec::new(response, link)
+    11	}
+    12	
+    13	/// Resolve a binomial-flavoured `LikelihoodSpec` from an `InverseLink`.
+    14	/// Equivalent to `LikelihoodSpec { response: Binomial, link }` for the
+    15	/// link variants that map to a binomial family. The "Identity falls back
+    16	/// to logit" historical fallback used by `inverse_link_to_binomial_family`
+    17	/// is preserved here for behavioral parity, but expressed as an explicit
+    18	/// substitution of the link rather than a different family variant.
+    19	#[inline]
+    20	pub fn inverse_link_to_binomial_spec(link: &InverseLink) -> LikelihoodSpec {
+    21	    let normalized = match link {
+    22	        InverseLink::Standard(LinkFunction::Identity) => InverseLink::Standard(LinkFunction::Logit),
+    23	        // Standard SAS / BetaLogistic without parameterized state historically
+    24	        // mapped to the parameterized family variant; preserve that here by
+    25	        // upgrading to a default-state parameterized link.
+    26	        other => other.clone(),
+    27	    };
+    28	    LikelihoodSpec::new(ResponseFamily::Binomial, normalized)
+    29	}
+    30	
+    31	/// Resolve the binomial-flavoured `LikelihoodFamily` implied by an
+    32	/// `InverseLink`. Identity falls back to logit so historic callers that
+    33	/// stored a raw link without family discriminator still round-trip.
+    34	#[inline]
+    35	pub fn inverse_link_to_binomial_family(link: &InverseLink) -> LikelihoodFamily {
+    36	    match link {
+    37	        InverseLink::Standard(LinkFunction::Log) => LikelihoodFamily::PoissonLog,
+    38	        InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
+    39	        InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
+    40	        InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
+    41	        InverseLink::Standard(LinkFunction::Sas) | InverseLink::Sas(_) => {
+    42	            LikelihoodFamily::BinomialSas
+    43	        }
+    44	        InverseLink::Standard(LinkFunction::BetaLogistic) | InverseLink::BetaLogistic(_) => {
+    45	            LikelihoodFamily::BinomialBetaLogistic
+    46	        }
+    47	        InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
+    48	        InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
+    49	        InverseLink::Standard(LinkFunction::Identity) => LikelihoodFamily::BinomialLogit,
+    50	    }
+    51	}
+
+exec
+/bin/zsh -lc 'rg -n "Binomial|Poisson|Gamma|Gaussian|variance|deviance|dmu|working_response|log_lik_increment|row_kernel" src/families/gamlss.rs src/families/family_meta.rs src/families/mod.rs | head -n 240' in /Users/user/gam
+ succeeded in 0ms:
+src/families/mod.rs:11:pub mod row_kernel;
+src/families/family_meta.rs:14:/// Equivalent to `LikelihoodSpec { response: Binomial, link }` for the
+src/families/family_meta.rs:28:    LikelihoodSpec::new(ResponseFamily::Binomial, normalized)
+src/families/family_meta.rs:37:        InverseLink::Standard(LinkFunction::Log) => LikelihoodFamily::PoissonLog,
+src/families/family_meta.rs:38:        InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
+src/families/family_meta.rs:39:        InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
+src/families/family_meta.rs:40:        InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
+src/families/family_meta.rs:42:            LikelihoodFamily::BinomialSas
+src/families/family_meta.rs:45:            LikelihoodFamily::BinomialBetaLogistic
+src/families/family_meta.rs:47:        InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
+src/families/family_meta.rs:48:        InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
+src/families/family_meta.rs:49:        InverseLink::Standard(LinkFunction::Identity) => LikelihoodFamily::BinomialLogit,
+src/families/gamlss.rs:136:/// Hard symmetric clamp on η used by the Poisson / Gaussian / Gamma working-
+src/families/gamlss.rs:146:/// propagates to all three families (Poisson / Gaussian / Gamma) without
+src/families/gamlss.rs:283:/// the family-specific "mean" axis (μ for Gaussian, latent t for Binomial);
+src/families/gamlss.rs:284:/// the `short_family_name` ("GaussianLocationScale", "BinomialLocationScale",
+src/families/gamlss.rs:506:struct GaussianDiagonalRowKernel {
+src/families/gamlss.rs:511:    log_sigma_working_response: f64,
+src/families/gamlss.rs:515:fn gaussian_diagonal_row_kernel(
+src/families/gamlss.rs:521:) -> GaussianDiagonalRowKernel {
+src/families/gamlss.rs:523:        return GaussianDiagonalRowKernel {
+src/families/gamlss.rs:528:            log_sigma_working_response: eta_log_sigma,
+src/families/gamlss.rs:533:    // Gaussian location-scale objective ½Σ(y−μ)²/σ² + Σlog σ is bounded below
+src/families/gamlss.rs:555:    let log_sigma_working_response = if log_sigma_working_weight == 0.0 {
+src/families/gamlss.rs:561:    GaussianDiagonalRowKernel {
+src/families/gamlss.rs:567:        log_sigma_working_response,
+src/families/gamlss.rs:1183:    spec: &GaussianLocationScaleTermSpec,
+src/families/gamlss.rs:1193:    spec: &GaussianLocationScaleWiggleTermSpec,
+src/families/gamlss.rs:1227:    spec: &BinomialLocationScaleTermSpec,
+src/families/gamlss.rs:1239:    spec: &BinomialLocationScaleWiggleTermSpec,
+src/families/gamlss.rs:1541:    // Gaussian location-scale remains identifiable even when μ and log σ use
+src/families/gamlss.rs:1705:struct BinomialMeanWiggleSpec {
+src/families/gamlss.rs:1716:pub struct GaussianLocationScaleTermSpec {
+src/families/gamlss.rs:1726:pub struct GaussianLocationScaleWiggleTermSpec {
+src/families/gamlss.rs:1739:pub struct BinomialLocationScaleTermSpec {
+src/families/gamlss.rs:1750:pub struct BinomialLocationScaleWiggleTermSpec {
+src/families/gamlss.rs:1786:pub struct BinomialMeanWiggleTermFitResult {
+src/families/gamlss.rs:2045:pub struct BinomialLocationScaleFitResult {
+src/families/gamlss.rs:2052:pub struct GaussianLocationScaleFitResult {
+src/families/gamlss.rs:2060:    spec: BinomialMeanWiggleSpec,
+src/families/gamlss.rs:2101:    let family = BinomialMeanWiggleFamily {
+src/families/gamlss.rs:2443:                 row_set: &crate::families::row_kernel::RowSet| {
+src/families/gamlss.rs:2480:                    // and final covariance still run on full data (the per-row
+src/families/gamlss.rs:2485:                        crate::families::row_kernel::RowSet::All => {
+src/families/gamlss.rs:2488:                        crate::families::row_kernel::RowSet::Subsample {
+src/families/gamlss.rs:2600:struct GaussianLocationScaleTermBuilder {
+src/families/gamlss.rs:2609:impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
+src/families/gamlss.rs:2610:    type Family = GaussianLocationScaleFamily;
+src/families/gamlss.rs:2625:        crate::seeding::SeedRiskProfile::Gaussian
+src/families/gamlss.rs:2688:                .expect("prepared Gaussian log-sigma design should match block construction");
+src/families/gamlss.rs:2689:        GaussianLocationScaleFamily {
+src/families/gamlss.rs:2705:            .get(GaussianLocationScaleFamily::BLOCK_MU)
+src/families/gamlss.rs:2706:            .ok_or_else(|| "missing Gaussian mu block state".to_string())?
+src/families/gamlss.rs:2711:            .get(GaussianLocationScaleFamily::BLOCK_LOG_SIGMA)
+src/families/gamlss.rs:2712:            .ok_or_else(|| "missing Gaussian log_sigma block state".to_string())?
+src/families/gamlss.rs:2728:                .ok_or_else(|| "missing Gaussian mean spatial psi derivatives".to_string())?;
+src/families/gamlss.rs:2731:                .ok_or_else(|| "missing Gaussian log-sigma spatial psi derivatives".to_string())?;
+src/families/gamlss.rs:2736:struct GaussianLocationScaleWiggleTermBuilder {
+src/families/gamlss.rs:2748:impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
+src/families/gamlss.rs:2749:    type Family = GaussianLocationScaleWiggleFamily;
+src/families/gamlss.rs:2764:        crate::seeding::SeedRiskProfile::Gaussian
+src/families/gamlss.rs:2868:                "prepared Gaussian log-sigma design should match wiggle block construction",
+src/families/gamlss.rs:2870:        GaussianLocationScaleWiggleFamily {
+src/families/gamlss.rs:2888:            .get(GaussianLocationScaleWiggleFamily::BLOCK_MU)
+src/families/gamlss.rs:2889:            .ok_or_else(|| "missing Gaussian wiggle mu block state".to_string())?
+src/families/gamlss.rs:2894:            .get(GaussianLocationScaleWiggleFamily::BLOCK_LOG_SIGMA)
+src/families/gamlss.rs:2895:            .ok_or_else(|| "missing Gaussian wiggle log_sigma block state".to_string())?
+src/families/gamlss.rs:2911:                || "missing Gaussian wiggle mean spatial psi derivatives".to_string(),
+src/families/gamlss.rs:2916:                    "missing Gaussian wiggle log-sigma spatial psi derivatives".to_string()
+src/families/gamlss.rs:2922:struct BinomialLocationScaleTermBuilder {
+src/families/gamlss.rs:2932:impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
+src/families/gamlss.rs:2933:    type Family = BinomialLocationScaleFamily;
+src/families/gamlss.rs:3028:        BinomialLocationScaleFamily {
+src/families/gamlss.rs:3044:            .get(BinomialLocationScaleFamily::BLOCK_T)
+src/families/gamlss.rs:3045:            .ok_or_else(|| "missing Binomial threshold block state".to_string())?
+src/families/gamlss.rs:3050:            .get(BinomialLocationScaleFamily::BLOCK_LOG_SIGMA)
+src/families/gamlss.rs:3051:            .ok_or_else(|| "missing Binomial log_sigma block state".to_string())?
+src/families/gamlss.rs:3075:struct BinomialLocationScaleWiggleTermBuilder {
+src/families/gamlss.rs:3088:impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
+src/families/gamlss.rs:3089:    type Family = BinomialLocationScaleWiggleFamily;
+src/families/gamlss.rs:3223:        BinomialLocationScaleWiggleFamily {
+src/families/gamlss.rs:3241:            .get(BinomialLocationScaleWiggleFamily::BLOCK_T)
+src/families/gamlss.rs:3242:            .ok_or_else(|| "missing Binomial wiggle threshold block state".to_string())?
+src/families/gamlss.rs:3247:            .get(BinomialLocationScaleWiggleFamily::BLOCK_LOG_SIGMA)
+src/families/gamlss.rs:3248:            .ok_or_else(|| "missing Binomial wiggle log_sigma block state".to_string())?
+src/families/gamlss.rs:3282:    spec: GaussianLocationScaleTermSpec,
+src/families/gamlss.rs:3289:        GaussianLocationScaleTermBuilder {
+src/families/gamlss.rs:3304:    spec: GaussianLocationScaleWiggleTermSpec,
+src/families/gamlss.rs:3315:        GaussianLocationScaleWiggleTermBuilder {
+src/families/gamlss.rs:3340:        .ok_or_else(|| "pilot Gaussian wiggle fit is missing mean block".to_string())?
+src/families/gamlss.rs:3348:    spec: GaussianLocationScaleTermSpec,
+src/families/gamlss.rs:3361:        GaussianLocationScaleWiggleTermSpec {
+src/families/gamlss.rs:3385:    spec: BinomialLocationScaleTermSpec,
+src/families/gamlss.rs:3392:        BinomialLocationScaleTermBuilder {
+src/families/gamlss.rs:3408:    spec: BinomialLocationScaleWiggleTermSpec,
+src/families/gamlss.rs:3419:        BinomialLocationScaleWiggleTermBuilder {
+src/families/gamlss.rs:3462:    spec: BinomialLocationScaleTermSpec,
+src/families/gamlss.rs:3475:        BinomialLocationScaleWiggleTermSpec {
+src/families/gamlss.rs:3519:) -> Result<BinomialMeanWiggleTermFitResult, String> {
+src/families/gamlss.rs:3545:            BinomialMeanWiggleSpec {
+src/families/gamlss.rs:3567:        return Ok(BinomialMeanWiggleTermFitResult {
+src/families/gamlss.rs:3606:        BinomialMeanWiggleSpec {
+src/families/gamlss.rs:3640:        .get(BinomialMeanWiggleFamily::BLOCK_ETA)
+src/families/gamlss.rs:3647:            .get(BinomialMeanWiggleFamily::BLOCK_WIGGLE)
+src/families/gamlss.rs:3680:    let outer_family = BinomialMeanWiggleFamily {
+src/families/gamlss.rs:3980:        BinomialMeanWiggleSpec {
+src/families/gamlss.rs:4012:    Ok(BinomialMeanWiggleTermFitResult {
+src/families/gamlss.rs:4047:    // Binomial derivatives wrt q via mu:
+src/families/gamlss.rs:4631:struct BinomialLocationScaleCore {
+src/families/gamlss.rs:4636:    dmu_dq: Array1<f64>,
+src/families/gamlss.rs:4670:struct BinomialLocationScaleRow {
+src/families/gamlss.rs:4953:) -> Result<BinomialLocationScaleRow, String> {
+src/families/gamlss.rs:4973:    Ok(BinomialLocationScaleRow {
+src/families/gamlss.rs:5031:) -> Result<BinomialLocationScaleCore, String> {
+src/families/gamlss.rs:5059:    // alongside. The previous path collected a `Vec<BinomialLocationScaleRow>`
+src/families/gamlss.rs:5067:    let mut dmu_dq = vec![0.0_f64; n];
+src/families/gamlss.rs:5089:    let dmu_p = SendPtr(dmu_dq.as_mut_ptr());
+src/families/gamlss.rs:5111:                dmu_p.write(i, row.inverse_link.d1);
+src/families/gamlss.rs:5119:    Ok(BinomialLocationScaleCore {
+src/families/gamlss.rs:5124:        dmu_dq: Array1::from_vec(dmu_dq),
+src/families/gamlss.rs:5143:    core: &BinomialLocationScaleCore,
+src/families/gamlss.rs:5161:    let dmu_slice = core.dmu_dq.as_slice().expect("dmu_dq must be contiguous");
+src/families/gamlss.rs:5186:                dmu_slice[i],
+src/families/gamlss.rs:5214:    core: &BinomialLocationScaleCore,
+src/families/gamlss.rs:5235:                core.dmu_dq[i],
+src/families/gamlss.rs:5245:                core.dmu_dq[i],
+src/families/gamlss.rs:5287:/// Built-in Gaussian location-scale family:
+src/families/gamlss.rs:5290:pub struct GaussianLocationScaleFamily {
+src/families/gamlss.rs:5304:        std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
+src/families/gamlss.rs:5307:impl Clone for GaussianLocationScaleFamily {
+src/families/gamlss.rs:5325:struct GaussianLocationScaleJointPsiDirection {
+src/families/gamlss.rs:5334:struct GaussianLocationScaleJointPsiSecondDrifts {
+src/families/gamlss.rs:5343:/// Shared interface that `GaussianLocationScaleFamily` and
+src/families/gamlss.rs:5344:/// `GaussianLocationScaleWiggleFamily` expose to the joint ψ workspace.
+src/families/gamlss.rs:5346:/// Mirror of `BinomialLocationScaleJointPsiFamily`. Both Gaussian families
+src/families/gamlss.rs:5347:/// already share `GaussianLocationScaleJointPsiDirection` and
+src/families/gamlss.rs:5348:/// `GaussianLocationScaleJointPsiSecondDrifts`, so the workspace logic is
+src/families/gamlss.rs:5352:trait GaussianLocationScaleJointPsiFamily: Clone + Send + Sync + 'static {
+src/families/gamlss.rs:5354:    /// message, so "GaussianLocationScaleFamily" /
+src/families/gamlss.rs:5355:    /// "GaussianLocationScaleWiggleFamily" stays visible after the workspace
+src/families/gamlss.rs:5374:    ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String>;
+src/families/gamlss.rs:5380:        psi_a: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5381:        psi_b: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5390:        psi_dir: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5398:impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleFamily {
+src/families/gamlss.rs:5399:    const LABEL: &'static str = "GaussianLocationScaleFamily";
+src/families/gamlss.rs:5420:    ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
+src/families/gamlss.rs:5435:        psi_a: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5436:        psi_b: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5455:        psi_dir: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5472:impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
+src/families/gamlss.rs:5473:    const LABEL: &'static str = "GaussianLocationScaleWiggleFamily";
+src/families/gamlss.rs:5494:    ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
+src/families/gamlss.rs:5509:        psi_a: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5510:        psi_b: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5521:        // non-wiggle GLS path's `GaussianJointPsi{First,Second}Weights`.
+src/families/gamlss.rs:5532:        // `GaussianJointPsi{First,Second}Weights` so a single
+src/families/gamlss.rs:5547:        psi_dir: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5567:/// Joint exact-Newton ψ workspace shared by `GaussianLocationScaleFamily` and
+src/families/gamlss.rs:5568:/// `GaussianLocationScaleWiggleFamily`. Mirror of
+src/families/gamlss.rs:5569:/// `BinomialLocationScaleJointPsiWorkspace`; the only structural difference
+src/families/gamlss.rs:5570:/// is that the Gaussian dense block designs are owned `Array2<f64>` instead
+src/families/gamlss.rs:5572:struct GaussianLocationScaleJointPsiWorkspace<F: GaussianLocationScaleJointPsiFamily> {
+src/families/gamlss.rs:5578:    psi_directions: ExactNewtonJointPsiDirectCache<GaussianLocationScaleJointPsiDirection>,
+src/families/gamlss.rs:5593:impl<F: GaussianLocationScaleJointPsiFamily> GaussianLocationScaleJointPsiWorkspace<F> {
+src/families/gamlss.rs:5638:    ) -> Result<Option<Arc<GaussianLocationScaleJointPsiDirection>>, String> {
+src/families/gamlss.rs:5652:impl<F> ExactNewtonJointPsiWorkspace for GaussianLocationScaleJointPsiWorkspace<F>
+src/families/gamlss.rs:5654:    F: GaussianLocationScaleJointPsiFamily,
+src/families/gamlss.rs:5709:type GaussianLocationScaleExactNewtonJointPsiWorkspace =
+src/families/gamlss.rs:5710:    GaussianLocationScaleJointPsiWorkspace<GaussianLocationScaleFamily>;
+src/families/gamlss.rs:5711:type GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace =
+src/families/gamlss.rs:5712:    GaussianLocationScaleJointPsiWorkspace<GaussianLocationScaleWiggleFamily>;
+src/families/gamlss.rs:5715:struct GaussianJointRowScalars {
+src/families/gamlss.rs:5733:struct GaussianJointPsiFirstWeights {
+src/families/gamlss.rs:5747:struct GaussianJointPsiSecondWeights {
+src/families/gamlss.rs:5756:struct GaussianJointPsiMixedDriftWeights {
+src/families/gamlss.rs:5766:/// of a `GaussianJointPsiFirstWeights` in place: each sampled row's
+src/families/gamlss.rs:5775:    weights: &mut GaussianJointPsiFirstWeights,
+src/families/gamlss.rs:5818:/// HT mask for `GaussianJointPsiSecondWeights`. Same semantics as
+src/families/gamlss.rs:5824:    weights: &mut GaussianJointPsiSecondWeights,
+src/families/gamlss.rs:5852:/// HT mask for `GaussianJointPsiMixedDriftWeights`. Same semantics as the
+src/families/gamlss.rs:5856:    weights: &mut GaussianJointPsiMixedDriftWeights,
+src/families/gamlss.rs:5889:) -> Result<GaussianJointRowScalars, String> {
+src/families/gamlss.rs:5893:            reason: "Gaussian joint row scalar input size mismatch".to_string(),
+src/families/gamlss.rs:5932:    Ok(GaussianJointRowScalars {
+src/families/gamlss.rs:5944:    scalars: &GaussianJointRowScalars,
+src/families/gamlss.rs:5981:    scalars: &GaussianJointRowScalars,
+src/families/gamlss.rs:6003:        let dmu = dotmu_u[i];
+src/families/gamlss.rs:6010:        let de_sym = dmu * dev + dmv * deu;
+src/families/gamlss.rs:6016:            ki * (4.0 * wi * (dmu * sdev + dmv * sdeu) + 8.0 * mi * sdeu * sdev)
+src/families/gamlss.rs:6024:                * (4.0 * wi * dmu * dmv
+src/families/gamlss.rs:6025:                    + 8.0 * mi * (dmu * sdev + dmv * sdeu)
+src/families/gamlss.rs:6027:                - 2.0 * kpi * wi * dmu * dmv
+src/families/gamlss.rs:6042:    scalars: &GaussianJointRowScalars,
+src/families/gamlss.rs:6045:) -> GaussianJointPsiFirstWeights {
+src/families/gamlss.rs:6094:        GaussianJointPsiFirstWeights {
+src/families/gamlss.rs:6111:    scalars: &GaussianJointRowScalars,
+src/families/gamlss.rs:6118:) -> GaussianJointPsiSecondWeights {
+src/families/gamlss.rs:6206:        GaussianJointPsiSecondWeights {
+src/families/gamlss.rs:6218:    scalars: &GaussianJointRowScalars,
+src/families/gamlss.rs:6225:) -> GaussianJointPsiMixedDriftWeights {
+src/families/gamlss.rs:6297:        GaussianJointPsiMixedDriftWeights {
+src/families/gamlss.rs:6380:    weights: &GaussianJointPsiFirstWeights,
+src/families/gamlss.rs:6480:    weights_i: &GaussianJointPsiFirstWeights,
+src/families/gamlss.rs:6481:    weights_j: &GaussianJointPsiFirstWeights,
+src/families/gamlss.rs:6482:    secondweights: &GaussianJointPsiSecondWeights,
+src/families/gamlss.rs:6579:    mixedweights: &GaussianJointPsiMixedDriftWeights,
+src/families/gamlss.rs:6638:impl GaussianLocationScaleFamily {
+src/families/gamlss.rs:6646:    ) -> Result<Arc<GaussianJointRowScalars>, String> {
+src/families/gamlss.rs:6677:            "GaussianLocationScaleFamily exact path is missing mu design".to_string()
+src/families/gamlss.rs:6680:            "GaussianLocationScaleFamily exact path is missing log-sigma design".to_string()
+src/families/gamlss.rs:6707:                    "GaussianLocationScaleFamily spec-aware exact path expects 2 specs, got {}",
+src/families/gamlss.rs:6758:                    "GaussianLocationScaleFamily exact psi path requires chunked operator support for oversized designs"
+src/families/gamlss.rs:6768:                    "GaussianLocationScaleFamily exact psi path requires chunked operator support for oversized designs"
+src/families/gamlss.rs:6894:                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+src/families/gamlss.rs:6905:                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:6931:                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+src/families/gamlss.rs:6942:                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:6953:                    "GaussianLocationScaleFamily joint d_beta length mismatch: got {}, expected {}",
+src/families/gamlss.rs:6982:                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+src/families/gamlss.rs:6993:                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:7003:                "GaussianLocationScaleFamily joint second directional derivative length mismatch: got {} and {}, expected {}",
+src/families/gamlss.rs:7030:    ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
+src/families/gamlss.rs:7033:                "GaussianLocationScaleFamily joint psi direction expects 2 blocks and 2 derivative block lists, got {} and {}",
+src/families/gamlss.rs:7059:                                "GaussianLocationScaleFamily mu",
+src/families/gamlss.rs:7063:                                format!("GaussianLocationScaleFamily mu forward_mul: {e}")
+src/families/gamlss.rs:7077:                                "GaussianLocationScaleFamily log-sigma",
+src/families/gamlss.rs:7081:                                format!("GaussianLocationScaleFamily log-sigma forward_mul: {e}")
+src/families/gamlss.rs:7091:                    return Ok(Some(GaussianLocationScaleJointPsiDirection {
+src/families/gamlss.rs:7110:        psi_a: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:7111:        psi_b: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:7114:    ) -> Result<GaussianLocationScaleJointPsiSecondDrifts, String> {
+src/families/gamlss.rs:7135:                        "GaussianLocationScaleFamily mu",
+src/families/gamlss.rs:7148:                        "GaussianLocationScaleFamily log-sigma",
+src/families/gamlss.rs:7161:        Ok(GaussianLocationScaleJointPsiSecondDrifts {
+src/families/gamlss.rs:7183:                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+src/families/gamlss.rs:7191:                "GaussianLocationScaleFamily joint psi terms expect 2 specs and 2 derivative blocks, got {} and {}",
+src/families/gamlss.rs:7207:        // Gaussian 2-block location-scale family in the unified flattened
+src/families/gamlss.rs:7326:        dir_i: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:7327:        dir_j: &GaussianLocationScaleJointPsiDirection,
+
+exec
+/bin/zsh -lc 'rg -n "trait .*Family|fn inverse|fn dmu|variance|deviance|BinomialLogit|PoissonLog|GammaLog|Gaussian" src/families/gamlss.rs src/families/mod.rs src/families/family_meta.rs' in /Users/user/gam
+exec
+/bin/zsh -lc "nl -ba src/families/gamlss.rs | sed -n '13680,14140p'" in /Users/user/gam
+ succeeded in 0ms:
+ 13680	
+ 13681	impl BinomialMeanWiggleHessianWorkspace {
+ 13682	    fn new(
+ 13683	        family: BinomialMeanWiggleFamily,
+ 13684	        block_states: Vec<ParameterBlockState>,
+ 13685	        x_eta: Array2<f64>,
+ 13686	    ) -> Result<Self, String> {
+ 13687	        let x_eta = Arc::new(x_eta);
+ 13688	        let hessian_operator = family.bmw_static_hessian_operator(&block_states, x_eta.clone())?;
+ 13689	        Ok(Self {
+ 13690	            family,
+ 13691	            block_states,
+ 13692	            x_eta,
+ 13693	            hessian_operator,
+ 13694	        })
+ 13695	    }
+ 13696	}
+ 13697	
+ 13698	impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
+ 13699	    fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+ 13700	        Ok(Some(
+ 13701	            crate::solver::estimate::reml::unified::HyperOperator::mul_vec(
+ 13702	                self.hessian_operator.as_ref(),
+ 13703	                v,
+ 13704	            ),
+ 13705	        ))
+ 13706	    }
+ 13707	
+ 13708	    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+ 13709	        Ok(None)
+ 13710	    }
+ 13711	
+ 13712	    fn directional_derivative(
+ 13713	        &self,
+ 13714	        _d_beta_flat: &Array1<f64>,
+ 13715	    ) -> Result<Option<Array2<f64>>, String> {
+ 13716	        Ok(None)
+ 13717	    }
+ 13718	
+ 13719	    fn directional_derivative_operator(
+ 13720	        &self,
+ 13721	        d_beta_flat: &Array1<f64>,
+ 13722	    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+ 13723	    {
+ 13724	        self.family
+ 13725	            .bmw_directional_operator(&self.block_states, self.x_eta.clone(), d_beta_flat)
+ 13726	    }
+ 13727	
+ 13728	    fn second_directional_derivative(
+ 13729	        &self,
+ 13730	        _d_beta_u_flat: &Array1<f64>,
+ 13731	        _d_beta_v_flat: &Array1<f64>,
+ 13732	    ) -> Result<Option<Array2<f64>>, String> {
+ 13733	        Ok(None)
+ 13734	    }
+ 13735	
+ 13736	    fn second_directional_derivative_operator(
+ 13737	        &self,
+ 13738	        d_beta_u: &Array1<f64>,
+ 13739	        d_beta_v: &Array1<f64>,
+ 13740	    ) -> Result<Option<Arc<dyn crate::solver::estimate::reml::unified::HyperOperator>>, String>
+ 13741	    {
+ 13742	        self.family.bmw_second_directional_operator(
+ 13743	            &self.block_states,
+ 13744	            self.x_eta.clone(),
+ 13745	            d_beta_u,
+ 13746	            d_beta_v,
+ 13747	        )
+ 13748	    }
+ 13749	}
+ 13750	
+ 13751	impl CustomFamilyGenerative for BinomialMeanWiggleFamily {
+ 13752	    fn generativespec(
+ 13753	        &self,
+ 13754	        block_states: &[ParameterBlockState],
+ 13755	    ) -> Result<GenerativeSpec, String> {
+ 13756	        if block_states.len() != 2 {
+ 13757	            return Err(GamlssError::DimensionMismatch {
+ 13758	                reason: format!(
+ 13759	                    "BinomialMeanWiggleFamily expects 2 blocks, got {}",
+ 13760	                    block_states.len()
+ 13761	                ),
+ 13762	            }
+ 13763	            .into());
+ 13764	        }
+ 13765	        let eta = &block_states[Self::BLOCK_ETA].eta;
+ 13766	        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+ 13767	        if eta.len() != self.y.len() || etaw.len() != self.y.len() {
+ 13768	            return Err(GamlssError::DimensionMismatch {
+ 13769	                reason: "BinomialMeanWiggleFamily generative size mismatch".to_string(),
+ 13770	            }
+ 13771	            .into());
+ 13772	        }
+ 13773	        let mean = gamlss_rowwise_map_result(self.y.len(), |i| {
+ 13774	            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, eta[i] + etaw[i])
+ 13775	                .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
+ 13776	            Ok(jet.mu)
+ 13777	        })?;
+ 13778	        Ok(GenerativeSpec {
+ 13779	            mean,
+ 13780	            noise: NoiseModel::Bernoulli,
+ 13781	        })
+ 13782	    }
+ 13783	}
+ 13784	
+ 13785	/// Built-in Poisson log-link family (single parameter block).
+ 13786	#[derive(Clone)]
+ 13787	pub struct PoissonLogFamily {
+ 13788	    pub y: Array1<f64>,
+ 13789	    pub weights: Array1<f64>,
+ 13790	}
+ 13791	
+ 13792	impl PoissonLogFamily {
+ 13793	    pub const BLOCK_ETA: usize = 0;
+ 13794	
+ 13795	    pub fn parameternames() -> &'static [&'static str] {
+ 13796	        &["eta"]
+ 13797	    }
+ 13798	
+ 13799	    pub fn parameter_links() -> &'static [ParameterLink] {
+ 13800	        &[ParameterLink::Log]
+ 13801	    }
+ 13802	
+ 13803	    pub fn metadata() -> FamilyMetadata {
+ 13804	        FamilyMetadata {
+ 13805	            name: "poisson_log",
+ 13806	            parameternames: Self::parameternames(),
+ 13807	            parameter_links: Self::parameter_links(),
+ 13808	        }
+ 13809	    }
+ 13810	}
+ 13811	
+ 13812	/// Per-row IRLS contribution that a single-parameter log-link family must
+ 13813	/// produce. The shared driver `evaluate_log_link_diagonal_irls` consumes
+ 13814	/// these and assembles the full `FamilyEvaluation` so the three pieces of
+ 13815	/// code that previously lived inside each family — size validation, per-row
+ 13816	/// y validation + η clamping + saturated `exp`, the active-clamp w/z guard,
+ 13817	/// and the final return — exist in exactly one place.
+ 13818	struct DiagonalIrlsRow {
+ 13819	    /// Weighted contribution to ℓ at this row.
+ 13820	    log_lik_increment: f64,
+ 13821	    /// Unfloored observed Hessian weight (the driver applies `MIN_WEIGHT`).
+ 13822	    observed_weight: f64,
+ 13823	    /// Per-row Newton step on the working response: `z = e + working_step`.
+ 13824	    /// Each family computes this with its own (score, denominator); the
+ 13825	    /// driver only handles the active-clamp / zero-weight guard.
+ 13826	    working_step: f64,
+ 13827	}
+ 13828	
+ 13829	/// Trait implemented by single-block log-link families that share the
+ 13830	/// diagonal IRLS structure (Poisson, Gamma). Each impl is responsible only
+ 13831	/// for the family-specific math: validating `y[i]` and producing the
+ 13832	/// per-row triple `(ℓ_increment, observed_weight, working_step)`.
+ 13833	trait LogLinkDiagonalIrlsFamily {
+ 13834	    /// Short, human-readable name used in size-mismatch errors.
+ 13835	    fn family_label(&self) -> &'static str;
+ 13836	
+ 13837	    /// Read access to the shared (y, prior weights) buffers.
+ 13838	    fn y(&self) -> &Array1<f64>;
+ 13839	    fn prior_weights(&self) -> &Array1<f64>;
+ 13840	
+ 13841	    /// Optional pre-loop validation hook for parameters outside the
+ 13842	    /// (y, weights, eta) triple (e.g. Gamma shape > 0).
+ 13843	    fn validate_self(&self) -> Result<(), String> {
+ 13844	        Ok(())
+ 13845	    }
+ 13846	
+ 13847	    /// Validate `y[i]` and return an error message if rejected. Default
+ 13848	    /// implementation enforces only finiteness; concrete families override
+ 13849	    /// to add domain constraints.
+ 13850	    fn validate_yi(&self, yi: f64, idx: usize) -> Result<(), String>;
+ 13851	
+ 13852	    /// Family-specific per-row math; `m = saturated_exp_eta(eta_clamped)`
+ 13853	    /// is computed by the driver and handed in.
+ 13854	    fn row_kernel(&self, yi: f64, e_clamped: f64, m: f64, prior_w: f64) -> DiagonalIrlsRow;
+ 13855	}
+ 13856	
+ 13857	/// Shared IRLS driver for [`LogLinkDiagonalIrlsFamily`]. Centralises the
+ 13858	/// size-check, η-clamp, saturated-exp, active-clamp guard, ll accumulation,
+ 13859	/// and `FamilyEvaluation` assembly so all log-link families with the diagonal
+ 13860	/// structure (Poisson, Gamma) cannot drift apart numerically.
+ 13861	fn evaluate_log_link_diagonal_irls<F: LogLinkDiagonalIrlsFamily + ?Sized>(
+ 13862	    family: &F,
+ 13863	    block_states: &[ParameterBlockState],
+ 13864	) -> Result<FamilyEvaluation, String> {
+ 13865	    let label = family.family_label();
+ 13866	    let eta = &expect_single_block(block_states, label)?.eta;
+ 13867	    let y = family.y();
+ 13868	    let prior_weights = family.prior_weights();
+ 13869	    let n = y.len();
+ 13870	    if eta.len() != n || prior_weights.len() != n {
+ 13871	        return Err(GamlssError::DimensionMismatch {
+ 13872	            reason: format!("{label} input size mismatch"),
+ 13873	        }
+ 13874	        .into());
+ 13875	    }
+ 13876	    family.validate_self()?;
+ 13877	
+ 13878	    let mut ll = 0.0;
+ 13879	    let mut z = Array1::<f64>::zeros(n);
+ 13880	    let mut w = Array1::<f64>::zeros(n);
+ 13881	
+ 13882	    for i in 0..n {
+ 13883	        let yi = y[i];
+ 13884	        family.validate_yi(yi, i)?;
+ 13885	        let e_raw = eta[i];
+ 13886	        let e = e_raw.clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP);
+ 13887	        let active_clamp = e != e_raw;
+ 13888	        let m = saturated_exp_eta(e_raw);
+ 13889	        let prior_w = prior_weights[i];
+ 13890	        let row = family.row_kernel(yi, e, m, prior_w);
+ 13891	        ll += row.log_lik_increment;
+ 13892	        if prior_w == 0.0 || active_clamp {
+ 13893	            w[i] = 0.0;
+ 13894	            z[i] = e_raw;
+ 13895	        } else {
+ 13896	            w[i] = floor_positiveweight(row.observed_weight, MIN_WEIGHT);
+ 13897	            z[i] = e + row.working_step;
+ 13898	        }
+ 13899	    }
+ 13900	
+ 13901	    Ok(FamilyEvaluation {
+ 13902	        log_likelihood: ll,
+ 13903	        blockworking_sets: vec![BlockWorkingSet::diagonal_checked(z, w)?],
+ 13904	    })
+ 13905	}
+ 13906	
+ 13907	impl LogLinkDiagonalIrlsFamily for PoissonLogFamily {
+ 13908	    fn family_label(&self) -> &'static str {
+ 13909	        "PoissonLogFamily"
+ 13910	    }
+ 13911	    fn y(&self) -> &Array1<f64> {
+ 13912	        &self.y
+ 13913	    }
+ 13914	    fn prior_weights(&self) -> &Array1<f64> {
+ 13915	        &self.weights
+ 13916	    }
+ 13917	    fn validate_yi(&self, yi: f64, idx: usize) -> Result<(), String> {
+ 13918	        if !yi.is_finite() || yi < 0.0 {
+ 13919	            return Err(GamlssError::InvalidInput {
+ 13920	                reason: format!(
+ 13921	                    "PoissonLogFamily requires non-negative finite y; found y[{idx}]={yi}"
+ 13922	                ),
+ 13923	            }
+ 13924	            .into());
+ 13925	        }
+ 13926	        Ok(())
+ 13927	    }
+ 13928	    #[inline]
+ 13929	    fn row_kernel(&self, yi: f64, e_clamped: f64, m: f64, prior_w: f64) -> DiagonalIrlsRow {
+ 13930	        // Drop log(y!) constant in objective.
+ 13931	        let log_lik_increment = prior_w * (yi * e_clamped - m);
+ 13932	        let dmu = m.max(MIN_DERIV);
+ 13933	        let var = m.max(MIN_PROB);
+ 13934	        DiagonalIrlsRow {
+ 13935	            log_lik_increment,
+ 13936	            observed_weight: prior_w * (dmu * dmu / var),
+ 13937	            // (yi - m)/dmu, identical to the previous direct expression.
+ 13938	            working_step: (yi - m) / signedwith_floor(dmu, MIN_DERIV),
+ 13939	        }
+ 13940	    }
+ 13941	}
+ 13942	
+ 13943	impl CustomFamily for PoissonLogFamily {
+ 13944	    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+ 13945	        evaluate_log_link_diagonal_irls(self, block_states)
+ 13946	    }
+ 13947	}
+ 13948	
+ 13949	impl CustomFamilyGenerative for PoissonLogFamily {
+ 13950	    fn generativespec(
+ 13951	        &self,
+ 13952	        block_states: &[ParameterBlockState],
+ 13953	    ) -> Result<GenerativeSpec, String> {
+ 13954	        let eta = &expect_single_block(block_states, "PoissonLogFamily")?.eta;
+ 13955	        let mean = gamlss_rowwise_map(eta.len(), |i| saturated_exp_eta(eta[i]));
+ 13956	        Ok(GenerativeSpec {
+ 13957	            mean,
+ 13958	            noise: NoiseModel::Poisson,
+ 13959	        })
+ 13960	    }
+ 13961	}
+ 13962	
+ 13963	/// Built-in Gamma log-link family (single parameter block, fixed shape).
+ 13964	#[derive(Clone)]
+ 13965	pub struct GammaLogFamily {
+ 13966	    pub y: Array1<f64>,
+ 13967	    pub weights: Array1<f64>,
+ 13968	    pub shape: f64,
+ 13969	}
+ 13970	
+ 13971	impl GammaLogFamily {
+ 13972	    pub const BLOCK_ETA: usize = 0;
+ 13973	
+ 13974	    pub fn parameternames() -> &'static [&'static str] {
+ 13975	        &["eta"]
+ 13976	    }
+ 13977	
+ 13978	    pub fn parameter_links() -> &'static [ParameterLink] {
+ 13979	        &[ParameterLink::Log]
+ 13980	    }
+ 13981	
+ 13982	    pub fn metadata() -> FamilyMetadata {
+ 13983	        FamilyMetadata {
+ 13984	            name: "gamma_log",
+ 13985	            parameternames: Self::parameternames(),
+ 13986	            parameter_links: Self::parameter_links(),
+ 13987	        }
+ 13988	    }
+ 13989	}
+ 13990	
+ 13991	impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
+ 13992	    fn family_label(&self) -> &'static str {
+ 13993	        "GammaLogFamily"
+ 13994	    }
+ 13995	    fn y(&self) -> &Array1<f64> {
+ 13996	        &self.y
+ 13997	    }
+ 13998	    fn prior_weights(&self) -> &Array1<f64> {
+ 13999	        &self.weights
+ 14000	    }
+ 14001	    fn validate_self(&self) -> Result<(), String> {
+ 14002	        if !self.shape.is_finite() || self.shape <= 0.0 {
+ 14003	            return Err(GamlssError::NonFinite {
+ 14004	                reason: "GammaLogFamily shape must be finite and > 0".to_string(),
+ 14005	            }
+ 14006	            .into());
+ 14007	        }
+ 14008	        Ok(())
+ 14009	    }
+ 14010	    fn validate_yi(&self, yi: f64, idx: usize) -> Result<(), String> {
+ 14011	        if !yi.is_finite() || yi <= 0.0 {
+ 14012	            return Err(GamlssError::InvalidInput {
+ 14013	                reason: format!("GammaLogFamily requires positive finite y; found y[{idx}]={yi}"),
+ 14014	            }
+ 14015	            .into());
+ 14016	        }
+ 14017	        Ok(())
+ 14018	    }
+ 14019	    #[inline]
+ 14020	    fn row_kernel(&self, yi: f64, _e_clamped: f64, m: f64, prior_w: f64) -> DiagonalIrlsRow {
+ 14021	        // Gamma(shape=k, scale=mu/k), dropping eta-independent constants.
+ 14022	        let log_lik_increment = prior_w * (-self.shape * (yi / m + m.ln()));
+ 14023	        // Gamma with log mean is non-canonical. Use the exact observed
+ 14024	        // η-space curvature -d²ℓ/dη² = prior_w * shape * y / μ, not the
+ 14025	        // Fisher weight prior_w * shape, so diagonal REML/LAML Hessians
+ 14026	        // use the true Laplace curvature instead of a PQL/Fisher surrogate.
+ 14027	        let observed_weight = prior_w * self.shape * yi / m;
+ 14028	        let score = prior_w * self.shape * (yi / m - 1.0);
+ 14029	        // Mirror the pre-extraction formula z = e + score / w_floored exactly;
+ 14030	        // the driver applies MIN_WEIGHT *before* writing w[i], but the old
+ 14031	        // code divided by the already-floored w[i] for non-degenerate rows,
+ 14032	        // and the floor only activates on the degenerate `observed_weight <=
+ 14033	        // MIN_WEIGHT` tail. Reproduce that branch here to preserve bitwise
+ 14034	        // step shape on every row that used to hit the floor.
+ 14035	        let w_floored = observed_weight.max(MIN_WEIGHT);
+ 14036	        DiagonalIrlsRow {
+ 14037	            log_lik_increment,
+ 14038	            observed_weight,
+ 14039	            working_step: score / w_floored,
+ 14040	        }
+ 14041	    }
+ 14042	}
+ 14043	
+ 14044	impl CustomFamily for GammaLogFamily {
+ 14045	    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+ 14046	        evaluate_log_link_diagonal_irls(self, block_states)
+ 14047	    }
+ 14048	
+ 14049	    fn diagonalworking_weights_directional_derivative(
+ 14050	        &self,
+ 14051	        block_states: &[ParameterBlockState],
+ 14052	        block_idx: usize,
+ 14053	        d_eta: &Array1<f64>,
+ 14054	    ) -> Result<Option<Array1<f64>>, String> {
+ 14055	        if block_idx != Self::BLOCK_ETA {
+ 14056	            return Ok(None);
+ 14057	        }
+ 14058	        let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
+ 14059	        let n = self.y.len();
+ 14060	        if eta.len() != n || self.weights.len() != n || d_eta.len() != n {
+ 14061	            return Err(GamlssError::DimensionMismatch {
+ 14062	                reason: "GammaLogFamily input size mismatch".to_string(),
+ 14063	            }
+ 14064	            .into());
+ 14065	        }
+ 14066	        if !self.shape.is_finite() || self.shape <= 0.0 {
+ 14067	            return Err(GamlssError::NonFinite {
+ 14068	                reason: "GammaLogFamily shape must be finite and > 0".to_string(),
+ 14069	            }
+ 14070	            .into());
+ 14071	        }
+ 14072	
+ 14073	        let mut dw = Array1::<f64>::zeros(n);
+ 14074	        for i in 0..n {
+ 14075	            let yi = self.y[i];
+ 14076	            if !yi.is_finite() || yi <= 0.0 {
+ 14077	                return Err(GamlssError::InvalidInput {
+ 14078	                    reason: format!("GammaLogFamily requires positive finite y; found y[{i}]={yi}"),
+ 14079	                }
+ 14080	                .into());
+ 14081	            }
+ 14082	            let e_raw = eta[i];
+ 14083	            let e = e_raw.clamp(-ETA_HARD_CLAMP, ETA_HARD_CLAMP);
+ 14084	            if self.weights[i] == 0.0 || e != e_raw {
+ 14085	                dw[i] = 0.0;
+ 14086	                continue;
+ 14087	            }
+ 14088	            let m = safe_exp(e).max(MIN_WEIGHT);
+ 14089	            let observed_weight = self.weights[i] * self.shape * yi / m;
+ 14090	            // d/dη [prior_weight * shape * y / exp(η)] = -W_obs.
+ 14091	            // If the positive floor is active, match the evaluated local piece.
+ 14092	            if observed_weight <= MIN_WEIGHT {
+ 14093	                dw[i] = 0.0;
+ 14094	            } else {
+ 14095	                dw[i] = -observed_weight * d_eta[i];
+ 14096	            }
+ 14097	        }
+ 14098	        Ok(Some(dw))
+ 14099	    }
+ 14100	}
+ 14101	
+ 14102	impl CustomFamilyGenerative for GammaLogFamily {
+ 14103	    fn generativespec(
+ 14104	        &self,
+ 14105	        block_states: &[ParameterBlockState],
+ 14106	    ) -> Result<GenerativeSpec, String> {
+ 14107	        let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
+ 14108	        let mean = gamlss_rowwise_map(eta.len(), |i| saturated_exp_eta(eta[i]));
+ 14109	        Ok(GenerativeSpec {
+ 14110	            mean,
+ 14111	            noise: NoiseModel::Gamma { shape: self.shape },
+ 14112	        })
+ 14113	    }
+ 14114	}
+ 14115	
+ 14116	/// Built-in binomial location-scale family with a configurable inverse link.
+ 14117	///
+ 14118	/// Parameters:
+ 14119	/// - Block 0: threshold/location T(covariates)
+ 14120	/// - Block 1: log-scale log σ(covariates)
+ 14121	#[derive(Clone)]
+ 14122	pub struct BinomialLocationScaleFamily {
+ 14123	    pub y: Array1<f64>,
+ 14124	    pub weights: Array1<f64>,
+ 14125	    pub link_kind: InverseLink,
+ 14126	    pub threshold_design: Option<DesignMatrix>,
+ 14127	    pub log_sigma_design: Option<DesignMatrix>,
+ 14128	    /// Resource policy threaded into PsiDesignMap construction (and any other
+ 14129	    /// per-call materialization decision) made during exact-Newton joint psi
+ 14130	    /// derivative evaluation. Defaults to `ResourcePolicy::default_library()`
+ 14131	    /// when the family is built without an explicit policy.
+ 14132	    pub policy: crate::resource::ResourcePolicy,
+ 14133	}
+ 14134	
+ 14135	struct BinomialLocationScaleJointPsiDirection {
+ 14136	    block_idx: usize,
+ 14137	    local_idx: usize,
+ 14138	    x_t_psi: PsiDesignMap,
+ 14139	    x_ls_psi: PsiDesignMap,
+ 14140	    z_t_psi: Array1<f64>,
+
+ succeeded in 0ms:
+src/families/family_meta.rs:20:pub fn inverse_link_to_binomial_spec(link: &InverseLink) -> LikelihoodSpec {
+src/families/family_meta.rs:35:pub fn inverse_link_to_binomial_family(link: &InverseLink) -> LikelihoodFamily {
+src/families/family_meta.rs:37:        InverseLink::Standard(LinkFunction::Log) => LikelihoodFamily::PoissonLog,
+src/families/family_meta.rs:38:        InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
+src/families/family_meta.rs:49:        InverseLink::Standard(LinkFunction::Identity) => LikelihoodFamily::BinomialLogit,
+src/families/gamlss.rs:136:/// Hard symmetric clamp on η used by the Poisson / Gaussian / Gamma working-
+src/families/gamlss.rs:146:/// propagates to all three families (Poisson / Gaussian / Gamma) without
+src/families/gamlss.rs:283:/// the family-specific "mean" axis (μ for Gaussian, latent t for Binomial);
+src/families/gamlss.rs:284:/// the `short_family_name` ("GaussianLocationScale", "BinomialLocationScale",
+src/families/gamlss.rs:506:struct GaussianDiagonalRowKernel {
+src/families/gamlss.rs:521:) -> GaussianDiagonalRowKernel {
+src/families/gamlss.rs:523:        return GaussianDiagonalRowKernel {
+src/families/gamlss.rs:533:    // Gaussian location-scale objective ½Σ(y−μ)²/σ² + Σlog σ is bounded below
+src/families/gamlss.rs:561:    GaussianDiagonalRowKernel {
+src/families/gamlss.rs:1183:    spec: &GaussianLocationScaleTermSpec,
+src/families/gamlss.rs:1193:    spec: &GaussianLocationScaleWiggleTermSpec,
+src/families/gamlss.rs:1541:    // Gaussian location-scale remains identifiable even when μ and log σ use
+src/families/gamlss.rs:1716:pub struct GaussianLocationScaleTermSpec {
+src/families/gamlss.rs:1726:pub struct GaussianLocationScaleWiggleTermSpec {
+src/families/gamlss.rs:2052:pub struct GaussianLocationScaleFitResult {
+src/families/gamlss.rs:2116:trait LocationScaleFamilyBuilder {
+src/families/gamlss.rs:2480:                    // and final covariance still run on full data (the per-row
+src/families/gamlss.rs:2600:struct GaussianLocationScaleTermBuilder {
+src/families/gamlss.rs:2609:impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
+src/families/gamlss.rs:2610:    type Family = GaussianLocationScaleFamily;
+src/families/gamlss.rs:2625:        crate::seeding::SeedRiskProfile::Gaussian
+src/families/gamlss.rs:2688:                .expect("prepared Gaussian log-sigma design should match block construction");
+src/families/gamlss.rs:2689:        GaussianLocationScaleFamily {
+src/families/gamlss.rs:2705:            .get(GaussianLocationScaleFamily::BLOCK_MU)
+src/families/gamlss.rs:2706:            .ok_or_else(|| "missing Gaussian mu block state".to_string())?
+src/families/gamlss.rs:2711:            .get(GaussianLocationScaleFamily::BLOCK_LOG_SIGMA)
+src/families/gamlss.rs:2712:            .ok_or_else(|| "missing Gaussian log_sigma block state".to_string())?
+src/families/gamlss.rs:2728:                .ok_or_else(|| "missing Gaussian mean spatial psi derivatives".to_string())?;
+src/families/gamlss.rs:2731:                .ok_or_else(|| "missing Gaussian log-sigma spatial psi derivatives".to_string())?;
+src/families/gamlss.rs:2736:struct GaussianLocationScaleWiggleTermBuilder {
+src/families/gamlss.rs:2748:impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
+src/families/gamlss.rs:2749:    type Family = GaussianLocationScaleWiggleFamily;
+src/families/gamlss.rs:2764:        crate::seeding::SeedRiskProfile::Gaussian
+src/families/gamlss.rs:2868:                "prepared Gaussian log-sigma design should match wiggle block construction",
+src/families/gamlss.rs:2870:        GaussianLocationScaleWiggleFamily {
+src/families/gamlss.rs:2888:            .get(GaussianLocationScaleWiggleFamily::BLOCK_MU)
+src/families/gamlss.rs:2889:            .ok_or_else(|| "missing Gaussian wiggle mu block state".to_string())?
+src/families/gamlss.rs:2894:            .get(GaussianLocationScaleWiggleFamily::BLOCK_LOG_SIGMA)
+src/families/gamlss.rs:2895:            .ok_or_else(|| "missing Gaussian wiggle log_sigma block state".to_string())?
+src/families/gamlss.rs:2911:                || "missing Gaussian wiggle mean spatial psi derivatives".to_string(),
+src/families/gamlss.rs:2916:                    "missing Gaussian wiggle log-sigma spatial psi derivatives".to_string()
+src/families/gamlss.rs:3282:    spec: GaussianLocationScaleTermSpec,
+src/families/gamlss.rs:3289:        GaussianLocationScaleTermBuilder {
+src/families/gamlss.rs:3304:    spec: GaussianLocationScaleWiggleTermSpec,
+src/families/gamlss.rs:3315:        GaussianLocationScaleWiggleTermBuilder {
+src/families/gamlss.rs:3340:        .ok_or_else(|| "pilot Gaussian wiggle fit is missing mean block".to_string())?
+src/families/gamlss.rs:3348:    spec: GaussianLocationScaleTermSpec,
+src/families/gamlss.rs:3361:        GaussianLocationScaleWiggleTermSpec {
+src/families/gamlss.rs:4825:fn inverse_linkrow(jet: crate::mixture_link::InverseLinkJet) -> InverseLinkRow {
+src/families/gamlss.rs:5287:/// Built-in Gaussian location-scale family:
+src/families/gamlss.rs:5290:pub struct GaussianLocationScaleFamily {
+src/families/gamlss.rs:5304:        std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
+src/families/gamlss.rs:5307:impl Clone for GaussianLocationScaleFamily {
+src/families/gamlss.rs:5325:struct GaussianLocationScaleJointPsiDirection {
+src/families/gamlss.rs:5334:struct GaussianLocationScaleJointPsiSecondDrifts {
+src/families/gamlss.rs:5343:/// Shared interface that `GaussianLocationScaleFamily` and
+src/families/gamlss.rs:5344:/// `GaussianLocationScaleWiggleFamily` expose to the joint ψ workspace.
+src/families/gamlss.rs:5346:/// Mirror of `BinomialLocationScaleJointPsiFamily`. Both Gaussian families
+src/families/gamlss.rs:5347:/// already share `GaussianLocationScaleJointPsiDirection` and
+src/families/gamlss.rs:5348:/// `GaussianLocationScaleJointPsiSecondDrifts`, so the workspace logic is
+src/families/gamlss.rs:5352:trait GaussianLocationScaleJointPsiFamily: Clone + Send + Sync + 'static {
+src/families/gamlss.rs:5354:    /// message, so "GaussianLocationScaleFamily" /
+src/families/gamlss.rs:5355:    /// "GaussianLocationScaleWiggleFamily" stays visible after the workspace
+src/families/gamlss.rs:5374:    ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String>;
+src/families/gamlss.rs:5380:        psi_a: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5381:        psi_b: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5390:        psi_dir: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5398:impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleFamily {
+src/families/gamlss.rs:5399:    const LABEL: &'static str = "GaussianLocationScaleFamily";
+src/families/gamlss.rs:5420:    ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
+src/families/gamlss.rs:5435:        psi_a: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5436:        psi_b: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5455:        psi_dir: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5472:impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
+src/families/gamlss.rs:5473:    const LABEL: &'static str = "GaussianLocationScaleWiggleFamily";
+src/families/gamlss.rs:5494:    ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
+src/families/gamlss.rs:5509:        psi_a: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5510:        psi_b: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5521:        // non-wiggle GLS path's `GaussianJointPsi{First,Second}Weights`.
+src/families/gamlss.rs:5532:        // `GaussianJointPsi{First,Second}Weights` so a single
+src/families/gamlss.rs:5547:        psi_dir: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:5567:/// Joint exact-Newton ψ workspace shared by `GaussianLocationScaleFamily` and
+src/families/gamlss.rs:5568:/// `GaussianLocationScaleWiggleFamily`. Mirror of
+src/families/gamlss.rs:5570:/// is that the Gaussian dense block designs are owned `Array2<f64>` instead
+src/families/gamlss.rs:5572:struct GaussianLocationScaleJointPsiWorkspace<F: GaussianLocationScaleJointPsiFamily> {
+src/families/gamlss.rs:5578:    psi_directions: ExactNewtonJointPsiDirectCache<GaussianLocationScaleJointPsiDirection>,
+src/families/gamlss.rs:5593:impl<F: GaussianLocationScaleJointPsiFamily> GaussianLocationScaleJointPsiWorkspace<F> {
+src/families/gamlss.rs:5638:    ) -> Result<Option<Arc<GaussianLocationScaleJointPsiDirection>>, String> {
+src/families/gamlss.rs:5652:impl<F> ExactNewtonJointPsiWorkspace for GaussianLocationScaleJointPsiWorkspace<F>
+src/families/gamlss.rs:5654:    F: GaussianLocationScaleJointPsiFamily,
+src/families/gamlss.rs:5709:type GaussianLocationScaleExactNewtonJointPsiWorkspace =
+src/families/gamlss.rs:5710:    GaussianLocationScaleJointPsiWorkspace<GaussianLocationScaleFamily>;
+src/families/gamlss.rs:5711:type GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace =
+src/families/gamlss.rs:5712:    GaussianLocationScaleJointPsiWorkspace<GaussianLocationScaleWiggleFamily>;
+src/families/gamlss.rs:5715:struct GaussianJointRowScalars {
+src/families/gamlss.rs:5733:struct GaussianJointPsiFirstWeights {
+src/families/gamlss.rs:5747:struct GaussianJointPsiSecondWeights {
+src/families/gamlss.rs:5756:struct GaussianJointPsiMixedDriftWeights {
+src/families/gamlss.rs:5766:/// of a `GaussianJointPsiFirstWeights` in place: each sampled row's
+src/families/gamlss.rs:5775:    weights: &mut GaussianJointPsiFirstWeights,
+src/families/gamlss.rs:5818:/// HT mask for `GaussianJointPsiSecondWeights`. Same semantics as
+src/families/gamlss.rs:5824:    weights: &mut GaussianJointPsiSecondWeights,
+src/families/gamlss.rs:5852:/// HT mask for `GaussianJointPsiMixedDriftWeights`. Same semantics as the
+src/families/gamlss.rs:5856:    weights: &mut GaussianJointPsiMixedDriftWeights,
+src/families/gamlss.rs:5889:) -> Result<GaussianJointRowScalars, String> {
+src/families/gamlss.rs:5893:            reason: "Gaussian joint row scalar input size mismatch".to_string(),
+src/families/gamlss.rs:5932:    Ok(GaussianJointRowScalars {
+src/families/gamlss.rs:5944:    scalars: &GaussianJointRowScalars,
+src/families/gamlss.rs:5981:    scalars: &GaussianJointRowScalars,
+src/families/gamlss.rs:6042:    scalars: &GaussianJointRowScalars,
+src/families/gamlss.rs:6045:) -> GaussianJointPsiFirstWeights {
+src/families/gamlss.rs:6094:        GaussianJointPsiFirstWeights {
+src/families/gamlss.rs:6111:    scalars: &GaussianJointRowScalars,
+src/families/gamlss.rs:6118:) -> GaussianJointPsiSecondWeights {
+src/families/gamlss.rs:6206:        GaussianJointPsiSecondWeights {
+src/families/gamlss.rs:6218:    scalars: &GaussianJointRowScalars,
+src/families/gamlss.rs:6225:) -> GaussianJointPsiMixedDriftWeights {
+src/families/gamlss.rs:6297:        GaussianJointPsiMixedDriftWeights {
+src/families/gamlss.rs:6380:    weights: &GaussianJointPsiFirstWeights,
+src/families/gamlss.rs:6480:    weights_i: &GaussianJointPsiFirstWeights,
+src/families/gamlss.rs:6481:    weights_j: &GaussianJointPsiFirstWeights,
+src/families/gamlss.rs:6482:    secondweights: &GaussianJointPsiSecondWeights,
+src/families/gamlss.rs:6579:    mixedweights: &GaussianJointPsiMixedDriftWeights,
+src/families/gamlss.rs:6638:impl GaussianLocationScaleFamily {
+src/families/gamlss.rs:6646:    ) -> Result<Arc<GaussianJointRowScalars>, String> {
+src/families/gamlss.rs:6677:            "GaussianLocationScaleFamily exact path is missing mu design".to_string()
+src/families/gamlss.rs:6680:            "GaussianLocationScaleFamily exact path is missing log-sigma design".to_string()
+src/families/gamlss.rs:6707:                    "GaussianLocationScaleFamily spec-aware exact path expects 2 specs, got {}",
+src/families/gamlss.rs:6758:                    "GaussianLocationScaleFamily exact psi path requires chunked operator support for oversized designs"
+src/families/gamlss.rs:6768:                    "GaussianLocationScaleFamily exact psi path requires chunked operator support for oversized designs"
+src/families/gamlss.rs:6894:                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+src/families/gamlss.rs:6905:                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:6931:                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+src/families/gamlss.rs:6942:                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:6953:                    "GaussianLocationScaleFamily joint d_beta length mismatch: got {}, expected {}",
+src/families/gamlss.rs:6982:                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+src/families/gamlss.rs:6993:                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:7003:                "GaussianLocationScaleFamily joint second directional derivative length mismatch: got {} and {}, expected {}",
+src/families/gamlss.rs:7030:    ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
+src/families/gamlss.rs:7033:                "GaussianLocationScaleFamily joint psi direction expects 2 blocks and 2 derivative block lists, got {} and {}",
+src/families/gamlss.rs:7059:                                "GaussianLocationScaleFamily mu",
+src/families/gamlss.rs:7063:                                format!("GaussianLocationScaleFamily mu forward_mul: {e}")
+src/families/gamlss.rs:7077:                                "GaussianLocationScaleFamily log-sigma",
+src/families/gamlss.rs:7081:                                format!("GaussianLocationScaleFamily log-sigma forward_mul: {e}")
+src/families/gamlss.rs:7091:                    return Ok(Some(GaussianLocationScaleJointPsiDirection {
+src/families/gamlss.rs:7110:        psi_a: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:7111:        psi_b: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:7114:    ) -> Result<GaussianLocationScaleJointPsiSecondDrifts, String> {
+src/families/gamlss.rs:7135:                        "GaussianLocationScaleFamily mu",
+src/families/gamlss.rs:7148:                        "GaussianLocationScaleFamily log-sigma",
+src/families/gamlss.rs:7161:        Ok(GaussianLocationScaleJointPsiSecondDrifts {
+src/families/gamlss.rs:7183:                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+src/families/gamlss.rs:7191:                "GaussianLocationScaleFamily joint psi terms expect 2 specs and 2 derivative blocks, got {} and {}",
+src/families/gamlss.rs:7207:        // Gaussian 2-block location-scale family in the unified flattened
+src/families/gamlss.rs:7326:        dir_i: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:7327:        dir_j: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:7357:        // Second fixed-beta psi objects for the same Gaussian location-scale
+src/families/gamlss.rs:7473:        dir_a: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:7488:                "GaussianLocationScaleFamily joint psi hessian directional derivative length mismatch: got {}, expected {}",
+src/families/gamlss.rs:7499:        // Mixed drift T_a[u] = D_beta H_a^{(D)}[u] for the Gaussian family.
+src/families/gamlss.rs:7502:        // The first beta-directional drifts of the Gaussian row scalars are
+src/families/gamlss.rs:7568:impl CustomFamily for GaussianLocationScaleFamily {
+src/families/gamlss.rs:7569:    /// The Gaussian location-scale joint Hessian depends on β because the
+src/families/gamlss.rs:7603:                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+src/families/gamlss.rs:7614:                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:7657:            // Per-row Gaussian LS kernel writes 4 working arrays directly into
+src/families/gamlss.rs:7739:                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+src/families/gamlss.rs:7750:                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:7819:                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+src/families/gamlss.rs:7830:                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:7900:                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+src/families/gamlss.rs:7911:                reason: "GaussianLocationScaleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:7920:                // Gaussian location block:
+src/families/gamlss.rs:7930:                // Gaussian log-sigma block:
+src/families/gamlss.rs:8067:                "GaussianLocationScaleFamily joint psi workspace expects 2 states, 2 specs, and 2 derivative block lists, got {} / {} / {}",
+src/families/gamlss.rs:8074:            GaussianLocationScaleExactNewtonJointPsiWorkspace::new(
+src/families/gamlss.rs:8099:    /// Inner-PIRLS and final-covariance paths never install the option.
+src/families/gamlss.rs:8109:                "GaussianLocationScaleFamily joint psi workspace expects 2 states, 2 specs, and 2 derivative block lists, got {} / {} / {}",
+src/families/gamlss.rs:8116:            GaussianLocationScaleExactNewtonJointPsiWorkspace::new_with_subsample(
+src/families/gamlss.rs:8134:        let workspace = GaussianLocationScaleHessianWorkspace::new(
+src/families/gamlss.rs:8165:        let mut workspace = GaussianLocationScaleHessianWorkspace::new(
+src/families/gamlss.rs:8178:        // The Gaussian location-scale workspace is returned by
+src/families/gamlss.rs:8188:    /// GaussianLocationScaleFamily overrides
+src/families/gamlss.rs:8199:    /// `apply_ht_mask_mixed` on the `GaussianJointPsi{First,Second,
+src/families/gamlss.rs:8205:    /// covariance paths never install the option, so they continue to
+src/families/gamlss.rs:8229:impl CustomFamilyGenerative for GaussianLocationScaleFamily {
+src/families/gamlss.rs:8237:                    "GaussianLocationScaleFamily expects 2 blocks, got {}",
+src/families/gamlss.rs:8250:            noise: NoiseModel::Gaussian { sigma },
+src/families/gamlss.rs:8839:/// Matrix-free joint-Hessian operator for the two-block Gaussian
+src/families/gamlss.rs:8849:struct GaussianLocationScaleHessianWorkspace {
+src/families/gamlss.rs:8850:    family: GaussianLocationScaleFamily,
+src/families/gamlss.rs:8859:impl GaussianLocationScaleHessianWorkspace {
+src/families/gamlss.rs:8861:        family: GaussianLocationScaleFamily,
+src/families/gamlss.rs:8866:        let etamu = &block_states[GaussianLocationScaleFamily::BLOCK_MU].eta;
+src/families/gamlss.rs:8867:        let eta_ls = &block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
+src/families/gamlss.rs:8914:impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace {
+src/families/gamlss.rs:8943:                    "GaussianLocationScale matvec dimension mismatch: got {}, expected {}",
+src/families/gamlss.rs:9023:                    "GaussianLocationScale dH operator: d_beta length {} != {}",
+src/families/gamlss.rs:9030:        let etamu = &self.block_states[GaussianLocationScaleFamily::BLOCK_MU].eta;
+src/families/gamlss.rs:9031:        let eta_ls = &self.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
+src/families/gamlss.rs:9074:                    "GaussianLocationScale d2H operator: d_beta_{{u,v}} length {}/{} != {}",
+src/families/gamlss.rs:9082:        let etamu = &self.block_states[GaussianLocationScaleFamily::BLOCK_MU].eta;
+src/families/gamlss.rs:9083:        let eta_ls = &self.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
+src/families/gamlss.rs:9106:/// assembly emitted by `gaussian_joint_hessian_from_designs` (Gaussian path)
+src/families/gamlss.rs:9158:struct GaussianLocationScaleWiggleGeometry {
+src/families/gamlss.rs:9169:/// Per-row pieces of the 3-block Gaussian location-scale-wiggle joint
+src/families/gamlss.rs:9172:struct GaussianLocationScaleWiggleHessianRowPieces {
+src/families/gamlss.rs:9184:impl GaussianLocationScaleWiggleHessianRowPieces {
+src/families/gamlss.rs:9257:pub struct GaussianLocationScaleWiggleFamily {
+src/families/gamlss.rs:9270:        std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
+src/families/gamlss.rs:9273:impl Clone for GaussianLocationScaleWiggleFamily {
+src/families/gamlss.rs:9293:impl GaussianLocationScaleWiggleFamily {
+src/families/gamlss.rs:9416:    ) -> Result<GaussianLocationScaleWiggleGeometry, String> {
+src/families/gamlss.rs:9425:        Ok(GaussianLocationScaleWiggleGeometry {
+src/families/gamlss.rs:9441:    ) -> Result<Arc<GaussianJointRowScalars>, String> {
+src/families/gamlss.rs:9452:            "GaussianLocationScaleWiggleFamily exact path is missing mu design".to_string()
+src/families/gamlss.rs:9455:            "GaussianLocationScaleWiggleFamily exact path is missing log-sigma design".to_string()
+src/families/gamlss.rs:9463:                        "GaussianLocationScaleWiggle dense_block_designs mu",
+src/families/gamlss.rs:9476:                        "GaussianLocationScaleWiggle dense_block_designs log_sigma",
+src/families/gamlss.rs:9492:            "GaussianLocationScaleWiggleFamily",
+src/families/gamlss.rs:9493:            "GaussianLocationScaleWiggle",
+src/families/gamlss.rs:9515:impl GaussianLocationScaleWiggleFamily {
+src/families/gamlss.rs:9571:    ) -> Result<Option<GaussianLocationScaleJointPsiDirection>, String> {
+src/families/gamlss.rs:9574:                "GaussianLocationScaleWiggleFamily joint psi direction expects 3 blocks and 3 derivative block lists, got {} and {}",
+src/families/gamlss.rs:9600:                                "GaussianLocationScaleWiggleFamily mu",
+src/families/gamlss.rs:9604:                                format!("GaussianLocationScaleWiggleFamily mu forward_mul: {e}")
+src/families/gamlss.rs:9618:                                "GaussianLocationScaleWiggleFamily log-sigma",
+src/families/gamlss.rs:9623:                                    "GaussianLocationScaleWiggleFamily log-sigma forward_mul: {e}"
+src/families/gamlss.rs:9635:                    return Ok(Some(GaussianLocationScaleJointPsiDirection {
+src/families/gamlss.rs:9654:        psi_a: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:9655:        psi_b: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:9658:    ) -> Result<GaussianLocationScaleJointPsiSecondDrifts, String> {
+src/families/gamlss.rs:9679:                        "GaussianLocationScaleWiggleFamily mu",
+src/families/gamlss.rs:9692:                        "GaussianLocationScaleWiggleFamily log-sigma",
+src/families/gamlss.rs:9705:        Ok(GaussianLocationScaleJointPsiSecondDrifts {
+src/families/gamlss.rs:9721:    ) -> Result<GaussianLocationScaleWiggleHessianRowPieces, String> {
+src/families/gamlss.rs:9725:                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+src/families/gamlss.rs:9738:                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:9746:                "GaussianLocationScaleWiggleFamily wiggle basis/beta mismatch: basis has {} columns but beta has {} entries",
+src/families/gamlss.rs:9764:        Ok(GaussianLocationScaleWiggleHessianRowPieces {
+src/families/gamlss.rs:9797:                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+src/families/gamlss.rs:9813:            "GaussianLocationScaleWiggleFamily exact joint directional Hessian",
+src/families/gamlss.rs:9817:                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:9892:                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+src/families/gamlss.rs:9910:                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:10018:                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+src/families/gamlss.rs:10036:                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:10223:                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+src/families/gamlss.rs:10239:            "GaussianLocationScaleWiggleFamily exact joint second directional Hessian (u)",
+src/families/gamlss.rs:10243:            "GaussianLocationScaleWiggleFamily exact joint second directional Hessian (v)",
+src/families/gamlss.rs:10247:                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:10575:        dir_a: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:10576:        dir_b: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:11005:        dir_a: &GaussianLocationScaleJointPsiDirection,
+src/families/gamlss.rs:11021:            "GaussianLocationScaleWiggleFamily joint psi hessian directional derivative",
+src/families/gamlss.rs:11279:impl CustomFamily for GaussianLocationScaleWiggleFamily {
+src/families/gamlss.rs:11285:        // Operator-aware (see GaussianLocationScaleFamily for derivation): when
+src/families/gamlss.rs:11330:                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+src/families/gamlss.rs:11342:                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:11430:                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+src/families/gamlss.rs:11445:                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:11482:                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+src/families/gamlss.rs:11494:                reason: "GaussianLocationScaleWiggleFamily input size mismatch".to_string(),
+src/families/gamlss.rs:11531:                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+src/families/gamlss.rs:11541:                "GaussianLocationScaleWiggleFamily exact path is missing mu design".to_string()
+src/families/gamlss.rs:11548:                "GaussianLocationScaleWiggleFamily exact path is missing log-sigma design"
+src/families/gamlss.rs:11562:                "GaussianLocationScaleWiggleFamily block {block_idx} d_beta length mismatch: got {}, expected {}",
+src/families/gamlss.rs:11577:            .ok_or_else(|| "missing Gaussian wiggle exact joint directional Hessian".to_string())?;
+src/families/gamlss.rs:11713:            GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace::new(
+src/families/gamlss.rs:11724:    /// The wiggle ψ workspace shares `GaussianLocationScaleJointPsiWorkspace`
+src/families/gamlss.rs:11749:            GaussianLocationScaleWiggleExactNewtonJointPsiWorkspace::new_with_subsample(
+src/families/gamlss.rs:11769:                reason: "Gaussian wiggle geometry requires mean block".to_string(),
+src/families/gamlss.rs:11776:                reason: "Gaussian wiggle geometry input size mismatch".to_string(),
+src/families/gamlss.rs:11784:                    "Gaussian dynamic wiggle design col mismatch: got {}, expected {}",
+src/families/gamlss.rs:11810:        let workspace = GaussianLocationScaleWiggleHessianWorkspace::new(
+src/families/gamlss.rs:11832:    /// row-weight-independent and remain unchanged. Note that the Gaussian
+src/families/gamlss.rs:11834:    /// (no `coeff_lw_d`) because the wiggle enters the Gaussian likelihood
+src/families/gamlss.rs:11848:        let mut workspace = GaussianLocationScaleWiggleHessianWorkspace::new(
+src/families/gamlss.rs:11863:    /// GaussianLocationScaleWiggleFamily overrides
+src/families/gamlss.rs:11874:    /// covariance paths never install the option, so they continue to
+src/families/gamlss.rs:11908:/// Matrix-free joint-Hessian operator for the 3-block Gaussian
+src/families/gamlss.rs:11909:/// location-scale wiggle family. See `GaussianLocationScaleWiggleHessianRowPieces`
+src/families/gamlss.rs:11918:/// no B' contribution because the wiggle enters the Gaussian likelihood only
+src/families/gamlss.rs:11919:/// through `q = η_μ + η_w` (no σ-chain), so the Gaussian wiggle has one
+src/families/gamlss.rs:11921:struct GaussianLocationScaleWiggleHessianWorkspace {
+src/families/gamlss.rs:11922:    family: GaussianLocationScaleWiggleFamily,
+src/families/gamlss.rs:11926:    pieces: GaussianLocationScaleWiggleHessianRowPieces,
+src/families/gamlss.rs:11929:impl GaussianLocationScaleWiggleHessianWorkspace {
+src/families/gamlss.rs:11931:        family: GaussianLocationScaleWiggleFamily,
+src/families/gamlss.rs:11958:    /// The Gaussian wiggle has 7 coefficient arrays (no `coeff_lw_d`, unlike
+src/families/gamlss.rs:11959:    /// the binomial wiggle's 8) because the wiggle enters the Gaussian
+src/families/gamlss.rs:11994:impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWorkspace {
+src/families/gamlss.rs:12016:                    "GaussianLocationScaleWiggle matvec dimension mismatch: got {}, expected {}",
+src/families/gamlss.rs:12162:impl CustomFamilyGenerative for GaussianLocationScaleWiggleFamily {
+src/families/gamlss.rs:12170:                    "GaussianLocationScaleWiggleFamily expects 3 blocks, got {}",
+src/families/gamlss.rs:12184:            noise: NoiseModel::Gaussian { sigma },
+src/families/gamlss.rs:13259:        // blocks (same pattern as GaussianLocationScaleWiggleFamily).
+src/families/gamlss.rs:13323:        // Following the Gaussian LS wiggle pattern, we express this via:
+src/families/gamlss.rs:13418:        // Following the Gaussian LS wiggle pattern (lines 6351-6363), the w-w
+src/families/gamlss.rs:13787:pub struct PoissonLogFamily {
+src/families/gamlss.rs:13792:impl PoissonLogFamily {
+src/families/gamlss.rs:13833:trait LogLinkDiagonalIrlsFamily {
+src/families/gamlss.rs:13907:impl LogLinkDiagonalIrlsFamily for PoissonLogFamily {
+src/families/gamlss.rs:13909:        "PoissonLogFamily"
+src/families/gamlss.rs:13921:                    "PoissonLogFamily requires non-negative finite y; found y[{idx}]={yi}"
+src/families/gamlss.rs:13943:impl CustomFamily for PoissonLogFamily {
+src/families/gamlss.rs:13949:impl CustomFamilyGenerative for PoissonLogFamily {
+src/families/gamlss.rs:13954:        let eta = &expect_single_block(block_states, "PoissonLogFamily")?.eta;
+src/families/gamlss.rs:13965:pub struct GammaLogFamily {
+src/families/gamlss.rs:13971:impl GammaLogFamily {
+src/families/gamlss.rs:13991:impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
+src/families/gamlss.rs:13993:        "GammaLogFamily"
+src/families/gamlss.rs:14004:                reason: "GammaLogFamily shape must be finite and > 0".to_string(),
+src/families/gamlss.rs:14013:                reason: format!("GammaLogFamily requires positive finite y; found y[{idx}]={yi}"),
+src/families/gamlss.rs:14044:impl CustomFamily for GammaLogFamily {
+src/families/gamlss.rs:14058:        let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
+src/families/gamlss.rs:14062:                reason: "GammaLogFamily input size mismatch".to_string(),
+src/families/gamlss.rs:14068:                reason: "GammaLogFamily shape must be finite and > 0".to_string(),
+src/families/gamlss.rs:14078:                    reason: format!("GammaLogFamily requires positive finite y; found y[{i}]={yi}"),
+src/families/gamlss.rs:14102:impl CustomFamilyGenerative for GammaLogFamily {
+src/families/gamlss.rs:14107:        let eta = &expect_single_block(block_states, "GammaLogFamily")?.eta;
+src/families/gamlss.rs:14163:trait BinomialLocationScaleJointPsiFamily: Clone + Send + Sync + 'static {
+src/families/gamlss.rs:16982:    /// the full-data outer score. Inner-PIRLS and final-covariance paths
+src/families/gamlss.rs:21548:    /// the full-data outer score. Inner-PIRLS and final-covariance paths
+src/families/gamlss.rs:22642:    // Source-of-truth Gaussian logb negloglik. Analytic helpers MUST autodiff-match this.
+src/families/gamlss.rs:22663:            // (see `GaussianLocationScaleFamily::loglik`); using the bare-exp link
+src/families/gamlss.rs:22946:            "With only eta_psi_psi=1 active, the Gaussian second psi objective contribution from the linear η_ls term carries the logb chain-rule factor κ = 1 - b/σ, so it must equal κ*(weight - n_i). The helper coded {} but the κ-corrected expectation is {}.",
+src/families/gamlss.rs:22957:        // for the simplest representative (GaussianLocationScale); the other
+src/families/gamlss.rs:22962:        let family = GaussianLocationScaleFamily {
+src/families/gamlss.rs:23010:        let family = GaussianLocationScaleFamily {
+src/families/gamlss.rs:23080:    /// Helper: build a small Gaussian location-scale family + state + specs
+src/families/gamlss.rs:23083:        GaussianLocationScaleFamily,
+src/families/gamlss.rs:23105:        let family = GaussianLocationScaleFamily {
+src/families/gamlss.rs:23218:        // (`coeff_ml` in GaussianLocationScaleHessianWorkspace) against any
+src/families/gamlss.rs:23275:    /// HVP path" tests across the LocationScale {Gaussian, Binomial} × {non-
+src/families/gamlss.rs:23337:    /// hook. Same structure as the Gaussian non-wiggle test.
+src/families/gamlss.rs:23351:    /// Bit-equivalence guard for the Gaussian location-scale-wiggle dense
+src/families/gamlss.rs:24511:        let family = GaussianLocationScaleWiggleFamily {
+src/families/gamlss.rs:24605:        GaussianLocationScaleWiggleFamily,
+src/families/gamlss.rs:24641:        let family = GaussianLocationScaleWiggleFamily {
+src/families/gamlss.rs:24928:        let gaussian = GaussianLocationScaleFamily {
+src/families/gamlss.rs:24948:        match &gaussian_eval.blockworking_sets[GaussianLocationScaleFamily::BLOCK_MU] {
+src/families/gamlss.rs:24957:            BlockWorkingSet::ExactNewton { .. } => panic!("expected diagonal Gaussian mu block"),
+src/families/gamlss.rs:24959:        match &gaussian_eval.blockworking_sets[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA] {
+src/families/gamlss.rs:24969:                panic!("expected diagonal Gaussian log-sigma block")
+src/families/gamlss.rs:24973:        let poisson = PoissonLogFamily {
+src/families/gamlss.rs:24983:        match &poisson_eval.blockworking_sets[PoissonLogFamily::BLOCK_ETA] {
+src/families/gamlss.rs:24995:        let gamma = GammaLogFamily {
+src/families/gamlss.rs:25006:        match &gamma_eval.blockworking_sets[GammaLogFamily::BLOCK_ETA] {
+src/families/gamlss.rs:25021:        let poisson = PoissonLogFamily {
+src/families/gamlss.rs:25032:        match &poisson_eval.blockworking_sets[PoissonLogFamily::BLOCK_ETA] {
+src/families/gamlss.rs:25046:        let gamma = GammaLogFamily {
+src/families/gamlss.rs:25058:        match &gamma_eval.blockworking_sets[GammaLogFamily::BLOCK_ETA] {
+src/families/gamlss.rs:25075:        let family = PoissonLogFamily {
+src/families/gamlss.rs:25087:        match &eval.blockworking_sets[PoissonLogFamily::BLOCK_ETA] {
+src/families/gamlss.rs:25108:        let family = GammaLogFamily {
+src/families/gamlss.rs:25120:        match &eval.blockworking_sets[GammaLogFamily::BLOCK_ETA] {
+src/families/gamlss.rs:25159:                GammaLogFamily::BLOCK_ETA,
+src/families/gamlss.rs:25178:        let family = GaussianLocationScaleFamily {
+src/families/gamlss.rs:25201:                GaussianLocationScaleFamily::BLOCK_LOG_SIGMA,
+src/families/gamlss.rs:25211:        let family = GaussianLocationScaleFamily {
+src/families/gamlss.rs:25236:                GaussianLocationScaleFamily::BLOCK_LOG_SIGMA,
+src/families/gamlss.rs:25244:        states_plus[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta[0] += eps;
+src/families/gamlss.rs:25247:            match &eval_plus.blockworking_sets[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA] {
+src/families/gamlss.rs:25253:                    panic!("expected diagonal Gaussian log-sigma block")
+src/families/gamlss.rs:25258:        states_minus[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta[0] -= eps;
+src/families/gamlss.rs:25261:            match &eval_minus.blockworking_sets[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA] {
+src/families/gamlss.rs:25267:                    panic!("expected diagonal Gaussian log-sigma block")
+src/families/gamlss.rs:25283:            "Gaussian sigma helper should evaluate the exact exp sigma link at eta={eta0}; got {} vs {}",
+src/families/gamlss.rs:25289:            "Gaussian sigma helper first derivative should equal exp(eta) at eta={eta0}; got {} vs {}",
+src/families/gamlss.rs:25295:            "Gaussian sigma helper second derivative should equal exp(eta) at eta={eta0}; got {} vs {}",
+src/families/gamlss.rs:25301:            "Gaussian sigma helper third derivative should equal exp(eta) at eta={eta0}; got {} vs {}",
+src/families/gamlss.rs:25307:            "Gaussian sigma helper fourth derivative should equal exp(eta) at eta={eta0}; got {} vs {}",
+src/families/gamlss.rs:25336:        let family = GaussianLocationScaleFamily {
+src/families/gamlss.rs:25360:        match &eval.blockworking_sets[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA] {
+src/families/gamlss.rs:25387:                panic!("expected diagonal Gaussian log-sigma block")
+src/families/gamlss.rs:25404:            "far-tail Gaussian log-sigma block should have near-zero observed curvature"
+src/families/gamlss.rs:25413:        let family = GaussianLocationScaleFamily {
+src/families/gamlss.rs:25437:            .expect("expected Gaussian exact joint hessian");
+src/families/gamlss.rs:25440:            "far-tail Gaussian exact Hessian should stay finite; got {hessian:?}"
+src/families/gamlss.rs:25447:            .expect("expected Gaussian exact joint hessian directional derivative");
+src/families/gamlss.rs:25450:            "far-tail Gaussian exact Hessian directional derivative should stay finite; got {dh:?}"
+src/families/gamlss.rs:26050:        let builder = GaussianLocationScaleTermBuilder {
+src/families/gamlss.rs:26265:        let builder = GaussianLocationScaleTermBuilder {
+src/families/gamlss.rs:26373:        let spec = GaussianLocationScaleTermSpec {
+src/families/gamlss.rs:26465:        let spec = GaussianLocationScaleTermSpec {
+src/families/gamlss.rs:26849:        let family = GaussianLocationScaleFamily {
+src/families/gamlss.rs:27001:            "Gaussian log-sigma psi objective derivative mismatch: analytic={} autodiff={}",
+src/families/gamlss.rs:27007:            "Gaussian log-sigma psi score_mu mismatch: analytic={} autodiff={}",
+src/families/gamlss.rs:27013:            "Gaussian log-sigma psi score_ls mismatch: analytic={} autodiff={}",
+src/families/gamlss.rs:27019:            "Gaussian log-sigma psi hessian(mu,mu) mismatch: analytic={} autodiff={}",
+src/families/gamlss.rs:27025:            "Gaussian log-sigma psi hessian(mu,ls) mismatch: analytic={} autodiff={}",
+src/families/gamlss.rs:27031:            "Gaussian log-sigma psi hessian(ls,ls) mismatch: analytic={} autodiff={}",
+src/families/gamlss.rs:27050:        let family = GaussianLocationScaleFamily {
+src/families/gamlss.rs:27153:            "Gaussian log-sigma psi second objective mismatch: analytic={} autodiff={}",
+src/families/gamlss.rs:27159:            "Gaussian log-sigma psi second score_mu mismatch: analytic={} autodiff={}",
+src/families/gamlss.rs:27165:            "Gaussian log-sigma psi second score_ls mismatch: analytic={} autodiff={}",
+src/families/gamlss.rs:27357:                    "Gaussian static joint H[{i},{j}] mismatch (κ < 1 case): analytic={} ad={} diff={}",
+src/families/gamlss.rs:27370:            "Gaussian static joint Hessian skew exceeds noise floor: {skew}"
+src/families/gamlss.rs:27444:                    "Gaussian dH (first-directional) [{i},{j}] mismatch: analytic={} ad={} diff={}",
+src/families/gamlss.rs:27456:            "Gaussian first-directional dH skew exceeds noise floor: {skew}"
+src/families/gamlss.rs:27561:                    "Gaussian d2H (second-directional) [{i},{j}] mismatch: analytic={} ad={} diff={}",
+src/families/gamlss.rs:27573:            "Gaussian second-directional d2H skew exceeds noise floor: {skew}"
+src/families/gamlss.rs:27637:            "Gaussian joint ψ-ψ objective mismatch (κ < 1, μ and σ both ψ-dependent): analytic={} ad={} diff={}",
+src/families/gamlss.rs:28893:        let poisson = PoissonLogFamily {
+
+exec
+/bin/zsh -lc "rg -n \"inverse_link_to_binomial_family|inverse_link_to_binomial_spec|LikelihoodFamily::PoissonLog|Standard\\(LinkFunction::Log\\)\" src | head -n 120" in /Users/user/gam
+ succeeded in 0ms:
+src/families/family_meta.rs:7:/// `inverse_link_to_binomial_family` + `From<LikelihoodFamily>`.
+src/families/family_meta.rs:16:/// to logit" historical fallback used by `inverse_link_to_binomial_family`
+src/families/family_meta.rs:20:pub fn inverse_link_to_binomial_spec(link: &InverseLink) -> LikelihoodSpec {
+src/families/family_meta.rs:35:pub fn inverse_link_to_binomial_family(link: &InverseLink) -> LikelihoodFamily {
+src/families/family_meta.rs:37:        InverseLink::Standard(LinkFunction::Log) => LikelihoodFamily::PoissonLog,
+src/types.rs:391:            LikelihoodFamily::PoissonLog => ResponseFamily::Poisson,
+src/types.rs:411:            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+src/types.rs:412:                InverseLink::Standard(LinkFunction::Log)
+src/types.rs:448:            (ResponseFamily::Poisson, InverseLink::Standard(LinkFunction::Log)) => {
+src/types.rs:451:            (ResponseFamily::Gamma, InverseLink::Standard(LinkFunction::Log)) => Ok(Self::GammaLog),
+src/types.rs:767:            LikelihoodFamily::PoissonLog => Ok(Self::PoissonLog),
+src/types.rs:786:            GlmLikelihoodFamily::PoissonLog => Self::PoissonLog,
+src/families/survival_location_scale.rs:5422:        InverseLink::Standard(LinkFunction::Log) => Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "prediction does not support Standard(Log) for survival models".to_string(), }.into()),
+src/families/survival_location_scale.rs:5455:        InverseLink::Standard(LinkFunction::Log) => {
+src/families/strategy.rs:241:            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+src/families/strategy.rs:314:            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+src/families/strategy.rs:347:            LikelihoodFamily::PoissonLog => Ok(NoiseModel::Poisson),
+src/inference/predict.rs:790:            crate::types::LikelihoodFamily::PoissonLog
+src/inference/sample.rs:637:        LikelihoodFamily::PoissonLog => NutsFamily::PoissonLog,
+src/solver/pirls.rs:740:            (GlmLikelihoodFamily::PoissonLog, _) => {
+src/solver/pirls.rs:8461:        | GlmLikelihoodFamily::PoissonLog
+src/solver/pirls.rs:8772:        GlmLikelihoodFamily::PoissonLog => {
+src/solver/pirls.rs:9100:        GlmLikelihoodFamily::PoissonLog => WeightFamily::Poisson,
+src/solver/pirls.rs:9115:        InverseLink::Standard(LinkFunction::Log) => WeightLink::Log,
+src/solver/pirls.rs:9736:        GlmLikelihoodFamily::PoissonLog => {
+src/solver/pirls.rs:9800:        GlmLikelihoodFamily::PoissonLog => (0..n)
+src/solver/pirls.rs:10892:            &InverseLink::Standard(LinkFunction::Log),
+src/solver/pirls.rs:10934:            link_kind: InverseLink::Standard(LinkFunction::Log),
+src/solver/pirls.rs:11007:            likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::PoissonLog),
+src/solver/pirls.rs:11008:            link_kind: InverseLink::Standard(LinkFunction::Log),
+src/solver/pirls.rs:11047:                &InverseLink::Standard(LinkFunction::Log),
+src/inference/quadrature.rs:2942:        LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+src/inference/quadrature.rs:2954:                LikelihoodFamily::PoissonLog => mean,
+src/inference/hmc.rs:467:            Self::PoissonLog => LikelihoodFamily::PoissonLog,
+src/inference/hmc.rs:881:        LikelihoodFamily::PoissonLog => Ok(poisson_log_logp_and_grad(data, eta)),
+src/inference/hmc.rs:1644:            LikelihoodFamily::PoissonLog,
+src/inference/hmc.rs:1724:            likelihood_family: LikelihoodFamily::PoissonLog,
+src/inference/hmc.rs:1725:            inverse_link: InverseLink::Standard(LinkFunction::Log),
+src/inference/hmc.rs:2051:                LikelihoodFamily::PoissonLog,
+src/inference/hmc.rs:2052:                InverseLink::Standard(LinkFunction::Log),
+src/inference/hmc.rs:2056:                InverseLink::Standard(LinkFunction::Log),
+src/inference/hmc.rs:3398:        (LikelihoodFamily::PoissonLog, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
+src/inference/hmc.rs:4372:            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+src/inference/hmc.rs:4373:                if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Log)) {
+src/solver/estimate.rs:707:        | GlmLikelihoodFamily::PoissonLog => Dispersion::Known(1.0),
+src/solver/estimate.rs:3605:        | GlmLikelihoodFamily::PoissonLog => 1.0,
+src/solver/estimate.rs:5174:            crate::types::LikelihoodFamily::PoissonLog
+src/solver/estimate.rs:6571:        let err = resolve_external_family(LikelihoodFamily::PoissonLog, Some(true))
+src/inference/formula_dsl.rs:790:            | InverseLink::Standard(LinkFunction::Log)
+src/main.rs:20:use gam::families::family_meta::inverse_link_to_binomial_family;
+src/main.rs:2305:            likelihood: inverse_link_to_binomial_family(&location_scale_link_kind),
+src/main.rs:7108:            likelihood: inverse_link_to_binomial_family(&base_link),
+src/main.rs:7997:                        LikelihoodFamily::PoissonLog
+src/main.rs:8027:        FamilyArg::PoissonLog => LikelihoodFamily::PoissonLog,
+src/main.rs:8049:        FamilyArg::PoissonLog => Some(LikelihoodFamily::PoissonLog),
+src/main.rs:8389:        LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+src/main.rs:8397:            let baseline = if family == LikelihoodFamily::PoissonLog {
+src/main.rs:9833:            family: LikelihoodFamily::PoissonLog,
+src/solver/workflow.rs:2585:        "poisson" => Some(LikelihoodFamily::PoissonLog),
+src/solver/workflow.rs:2600:                        LikelihoodFamily::PoissonLog
+src/terms/smooth.rs:9337:            LikelihoodFamily::PoissonLog => {
+src/terms/smooth.rs:15501:        | LikelihoodFamily::PoissonLog
+src/solver/mixture_link.rs:1060:        InverseLink::Standard(LinkFunction::Log) => Ok(eta.clamp(-700.0, 700.0).exp()),
+src/solver/mixture_link.rs:1239:        LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+
+exec
+/bin/zsh -lc "rg -n \"enum LinkFunction|enum InverseLink|enum LikelihoodFamily|enum ResponseFamily|struct LikelihoodSpec\" src/types.rs src -g '*.rs' | head -n 180" in /Users/user/gam
+ succeeded in 0ms:
+src/types.rs:33:pub enum LinkFunction {
+src/types.rs:138:pub enum InverseLink {
+src/types.rs:230://   pub struct LikelihoodSpec { response: ResponseFamily, link: InverseLink }
+src/types.rs:287:pub enum ResponseFamily {
+src/types.rs:316:pub struct LikelihoodSpec {
+src/types.rs:480:pub enum LikelihoodFamily {
+src/types.rs:33:pub enum LinkFunction {
+src/types.rs:138:pub enum InverseLink {
+src/types.rs:230://   pub struct LikelihoodSpec { response: ResponseFamily, link: InverseLink }
+src/types.rs:287:pub enum ResponseFamily {
+src/types.rs:316:pub struct LikelihoodSpec {
+src/types.rs:480:pub enum LikelihoodFamily {
+
+exec
+/bin/zsh -lc "nl -ba src/main.rs | sed -n '2288,2315p'" in /Users/user/gam
+ succeeded in 0ms:
+  2288	            FAMILY_BINOMIAL_LOCATION_SCALE.to_string(),
+  2289	            Some(location_scale_link_kind.clone()),
+  2290	            ds.schema.clone(),
+  2291	            noise_formula,
+  2292	            ds.headers.clone(),
+  2293	            ds.feature_ranges(),
+  2294	            frozen_meanspec,
+  2295	            frozen_noisespec,
+  2296	            fit_result,
+  2297	            fit.block_by_role(BlockRole::Scale)
+  2298	                .map(|block| block.beta.to_vec()),
+  2299	            Some(&binomial_noise_transform),
+  2300	            None,
+  2301	        );
+  2302	        model.offset_column = args.offset_column.clone();
+  2303	        model.noise_offset_column = args.noise_offset_column.clone();
+  2304	        model.family_state = FittedFamily::LocationScale {
+  2305	            likelihood: inverse_link_to_binomial_family(&location_scale_link_kind),
+  2306	            base_link: Some(location_scale_link_kind.clone()),
+  2307	        };
+  2308	        if let Some((knots, degree, beta_link_wiggle)) = wiggle_meta {
+  2309	            model.linkwiggle_knots = Some(knots.to_vec());
+  2310	            model.linkwiggle_degree = Some(degree);
+  2311	            model.beta_link_wiggle = Some(beta_link_wiggle);
+  2312	        }
+  2313	        write_model_json(out, &model)?;
+  2314	        progress.advance_workflow(fit_total_steps);
+  2315	    }
+
+exec
+/bin/zsh -lc "nl -ba src/main.rs | sed -n '7090,7120p'" in /Users/user/gam
+exec
+/bin/zsh -lc "nl -ba src/types.rs | sed -n '287,465p'" in /Users/user/gam
+ succeeded in 0ms:
+  7090	    fit_result: UnifiedFitResult,
+  7091	    baseline_marginal: f64,
+  7092	    baseline_logslope: f64,
+  7093	    latent_z_normalization: SavedLatentZNormalization,
+  7094	    latent_measure: LatentMeasureKind,
+  7095	    latent_z_rank_int_calibration: Option<
+  7096	        gam::families::bernoulli_marginal_slope::LatentZRankIntCalibration,
+  7097	    >,
+  7098	    score_warp_runtime: Option<&DeviationRuntime>,
+  7099	    link_dev_runtime: Option<&DeviationRuntime>,
+  7100	    base_link: InverseLink,
+  7101	    frailty: gam::families::lognormal_kernel::FrailtySpec,
+  7102	) -> SavedModel {
+  7103	    let mut payload = FittedModelPayload::new(
+  7104	        MODEL_VERSION,
+  7105	        formula,
+  7106	        ModelKind::MarginalSlope,
+  7107	        FittedFamily::MarginalSlope {
+  7108	            likelihood: inverse_link_to_binomial_family(&base_link),
+  7109	            base_link: Some(base_link.clone()),
+  7110	            frailty,
+  7111	        },
+  7112	        FAMILY_BERNOULLI_MARGINAL_SLOPE.to_string(),
+  7113	    );
+  7114	    payload.unified = Some(fit_result.clone());
+  7115	    payload.fit_result = Some(fit_result);
+  7116	    payload.data_schema = Some(data_schema);
+  7117	    payload.formula_logslope = Some(logslope_formula);
+  7118	    payload.z_column = Some(z_column);
+  7119	    payload.formula_logslopes = Some(vec![
+  7120	        payload
+
+ succeeded in 0ms:
+   287	pub enum ResponseFamily {
+   288	    Gaussian,
+   289	    Binomial,
+   290	    Poisson,
+   291	    Gamma,
+   292	    RoystonParmar,
+   293	}
+   294	
+   295	impl ResponseFamily {
+   296	    #[inline]
+   297	    pub fn name(self) -> &'static str {
+   298	        match self {
+   299	            Self::Gaussian => "gaussian",
+   300	            Self::Binomial => "binomial",
+   301	            Self::Poisson => "poisson",
+   302	            Self::Gamma => "gamma",
+   303	            Self::RoystonParmar => "royston-parmar",
+   304	        }
+   305	    }
+   306	}
+   307	
+   308	/// Unified likelihood specification: response distribution + parameterized link.
+   309	///
+   310	/// This is the target replacement for `LikelihoodFamily`. During migration both
+   311	/// types coexist; `From<LikelihoodFamily> for LikelihoodSpec` decomposes a
+   312	/// legacy variant into the (response, link) pair, and
+   313	/// `TryFrom<LikelihoodSpec> for LikelihoodFamily` reconstructs a legacy variant
+   314	/// when one exists.
+   315	#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+   316	pub struct LikelihoodSpec {
+   317	    pub response: ResponseFamily,
+   318	    pub link: InverseLink,
+   319	}
+   320	
+   321	impl LikelihoodSpec {
+   322	    #[inline]
+   323	    pub fn new(response: ResponseFamily, link: InverseLink) -> Self {
+   324	        Self { response, link }
+   325	    }
+   326	
+   327	    #[inline]
+   328	    pub fn link_function(&self) -> LinkFunction {
+   329	        self.link.link_function()
+   330	    }
+   331	
+   332	    #[inline]
+   333	    pub fn is_binomial(&self) -> bool {
+   334	        matches!(self.response, ResponseFamily::Binomial)
+   335	    }
+   336	
+   337	    #[inline]
+   338	    pub fn is_gaussian_identity(&self) -> bool {
+   339	        matches!(self.response, ResponseFamily::Gaussian)
+   340	            && matches!(self.link, InverseLink::Standard(LinkFunction::Identity))
+   341	    }
+   342	
+   343	    #[inline]
+   344	    pub fn is_royston_parmar(&self) -> bool {
+   345	        matches!(self.response, ResponseFamily::RoystonParmar)
+   346	    }
+   347	
+   348	    #[inline]
+   349	    pub fn is_latent_cloglog(&self) -> bool {
+   350	        matches!(self.response, ResponseFamily::Binomial)
+   351	            && matches!(self.link, InverseLink::LatentCLogLog(_))
+   352	    }
+   353	
+   354	    #[inline]
+   355	    pub fn is_binomial_mixture(&self) -> bool {
+   356	        matches!(self.response, ResponseFamily::Binomial)
+   357	            && matches!(self.link, InverseLink::Mixture(_))
+   358	    }
+   359	
+   360	    #[inline]
+   361	    pub fn is_binomial_sas(&self) -> bool {
+   362	        matches!(self.response, ResponseFamily::Binomial)
+   363	            && matches!(self.link, InverseLink::Sas(_))
+   364	    }
+   365	
+   366	    #[inline]
+   367	    pub fn is_binomial_beta_logistic(&self) -> bool {
+   368	        matches!(self.response, ResponseFamily::Binomial)
+   369	            && matches!(self.link, InverseLink::BetaLogistic(_))
+   370	    }
+   371	
+   372	    /// Default scale metadata for this (response, link). Mirrors
+   373	    /// `LikelihoodFamily::default_scale_metadata` for the response.
+   374	    #[inline]
+   375	    pub fn default_scale_metadata(&self) -> LikelihoodScaleMetadata {
+   376	        match self.response {
+   377	            ResponseFamily::Gaussian => LikelihoodScaleMetadata::ProfiledGaussian,
+   378	            ResponseFamily::Gamma => LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 },
+   379	            ResponseFamily::Binomial | ResponseFamily::Poisson => {
+   380	                LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 }
+   381	            }
+   382	            ResponseFamily::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
+   383	        }
+   384	    }
+   385	}
+   386	
+   387	impl From<LikelihoodFamily> for LikelihoodSpec {
+   388	    fn from(value: LikelihoodFamily) -> Self {
+   389	        let response = match value {
+   390	            LikelihoodFamily::GaussianIdentity => ResponseFamily::Gaussian,
+   391	            LikelihoodFamily::PoissonLog => ResponseFamily::Poisson,
+   392	            LikelihoodFamily::GammaLog => ResponseFamily::Gamma,
+   393	            LikelihoodFamily::RoystonParmar => ResponseFamily::RoystonParmar,
+   394	            LikelihoodFamily::BinomialLogit
+   395	            | LikelihoodFamily::BinomialProbit
+   396	            | LikelihoodFamily::BinomialCLogLog
+   397	            | LikelihoodFamily::BinomialLatentCLogLog
+   398	            | LikelihoodFamily::BinomialSas
+   399	            | LikelihoodFamily::BinomialBetaLogistic
+   400	            | LikelihoodFamily::BinomialMixture => ResponseFamily::Binomial,
+   401	        };
+   402	        // For the standard scalar-link variants we can build a Standard(link)
+   403	        // directly. For the parameterized variants we synthesize a default
+   404	        // state, since the legacy `LikelihoodFamily` does not carry one. Call
+   405	        // sites that need the real parameterized state must build
+   406	        // `LikelihoodSpec` directly with the live `InverseLink`.
+   407	        let link = match value {
+   408	            LikelihoodFamily::GaussianIdentity | LikelihoodFamily::RoystonParmar => {
+   409	                InverseLink::Standard(LinkFunction::Identity)
+   410	            }
+   411	            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+   412	                InverseLink::Standard(LinkFunction::Log)
+   413	            }
+   414	            LikelihoodFamily::BinomialLogit => InverseLink::Standard(LinkFunction::Logit),
+   415	            LikelihoodFamily::BinomialProbit => InverseLink::Standard(LinkFunction::Probit),
+   416	            LikelihoodFamily::BinomialCLogLog => InverseLink::Standard(LinkFunction::CLogLog),
+   417	            LikelihoodFamily::BinomialLatentCLogLog => {
+   418	                InverseLink::LatentCLogLog(LatentCLogLogState { latent_sd: 0.0 })
+   419	            }
+   420	            LikelihoodFamily::BinomialSas => InverseLink::Sas(SasLinkState {
+   421	                epsilon: 0.0,
+   422	                log_delta: 0.0,
+   423	                delta: 1.0,
+   424	            }),
+   425	            LikelihoodFamily::BinomialBetaLogistic => InverseLink::BetaLogistic(SasLinkState {
+   426	                epsilon: 0.0,
+   427	                log_delta: 0.0,
+   428	                delta: 1.0,
+   429	            }),
+   430	            LikelihoodFamily::BinomialMixture => InverseLink::Mixture(MixtureLinkState {
+   431	                components: Vec::new(),
+   432	                rho: Array1::zeros(0),
+   433	                pi: Array1::zeros(0),
+   434	            }),
+   435	        };
+   436	        Self { response, link }
+   437	    }
+   438	}
+   439	
+   440	impl TryFrom<LikelihoodSpec> for LikelihoodFamily {
+   441	    type Error = &'static str;
+   442	
+   443	    fn try_from(value: LikelihoodSpec) -> Result<Self, Self::Error> {
+   444	        match (value.response, &value.link) {
+   445	            (ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)) => {
+   446	                Ok(Self::GaussianIdentity)
+   447	            }
+   448	            (ResponseFamily::Poisson, InverseLink::Standard(LinkFunction::Log)) => {
+   449	                Ok(Self::PoissonLog)
+   450	            }
+   451	            (ResponseFamily::Gamma, InverseLink::Standard(LinkFunction::Log)) => Ok(Self::GammaLog),
+   452	            (ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)) => {
+   453	                Ok(Self::RoystonParmar)
+   454	            }
+   455	            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+   456	                Ok(Self::BinomialLogit)
+   457	            }
+   458	            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+   459	                Ok(Self::BinomialProbit)
+   460	            }
+   461	            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+   462	                Ok(Self::BinomialCLogLog)
+   463	            }
+   464	            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
+   465	                Ok(Self::BinomialLatentCLogLog)
+
+exec
+/bin/zsh -lc "rg -n \"require_.*link|link_kind|InverseLink::Standard\\(LinkFunction::Log\\)|BinomialLocationScale.*link|Unsupported.*link|link_function\\(\\)\" src/families/gamlss.rs | head -n 220" in /Users/user/gam
+ succeeded in 0ms:
+1248:    crate::inference::formula_dsl::require_binomial_inverse_link_supports_joint_wiggle(
+1249:        &spec.link_kind,
+1608:    link_kind: &InverseLink,
+1612:    match link_kind {
+1679:    link_kind: &InverseLink,
+1693:            let eta = binomial_location_scale_link_eta_from_probability(link_kind, prevalence)?;
+1708:    pub link_kind: InverseLink,
+1742:    pub link_kind: InverseLink,
+1753:    pub link_kind: InverseLink,
+2070:        spec.link_kind,
+2078:    crate::inference::formula_dsl::require_binomial_inverse_link_supports_joint_wiggle(
+2079:        &spec.link_kind,
+2104:        link_kind: spec.link_kind,
+2925:    link_kind: InverseLink,
+3004:                &self.link_kind,
+3031:            link_kind: self.link_kind.clone(),
+3078:    link_kind: InverseLink,
+3165:                &self.link_kind,
+3226:            link_kind: self.link_kind.clone(),
+3395:            link_kind: spec.link_kind,
+3422:            link_kind: spec.link_kind,
+3478:            link_kind: spec.link_kind,
+3515:    link_kind: InverseLink,
+3548:                link_kind,
+3609:            link_kind: link_kind.clone(),
+3679:    let link_kind_cloned = link_kind.clone();
+3683:        link_kind: link_kind_cloned.clone(),
+3983:            link_kind: link_kind_cloned,
+4434:    link_kind: &InverseLink,
+4436:    if binomial_link_has_closed_form(link_kind) {
+4437:        return binomial_neglog_q_derivatives_closed_form_dispatch(y, weight, q, mu, link_kind);
+4451:    link_kind: &InverseLink,
+4453:    if binomial_link_has_closed_form(link_kind) {
+4455:            y, weight, q, mu, link_kind,
+4458:    let d4 = inverse_link_pdffourth_derivative_for_inverse_link(link_kind, q)
+4471:    link_kind: &InverseLink,
+4473:    match link_kind {
+4497:    link_kind: &InverseLink,
+4499:    match link_kind {
+4516:fn binomial_link_has_closed_form(link_kind: &InverseLink) -> bool {
+4518:        link_kind,
+4910:    link_kind: &InverseLink,
+4916:    match link_kind {
+4952:    link_kind: &InverseLink,
+4960:    let mut jet = inverse_link_jet_for_inverse_link(link_kind, q)
+4972:    let ll = binomial_location_scale_log_likelihood(y, weight, q, link_kind, raw_mu)?;
+4991:    link_kind: &InverseLink,
+5007:                if matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+5010:                            y_slice[i], w_slice[i], q, link_kind, 0.5,
+5013:                let jet = inverse_link_jet_for_inverse_link(link_kind, q)
+5017:                        y_slice[i], w_slice[i], q, link_kind, jet.mu,
+5030:    link_kind: &InverseLink,
+5102:                link_kind,
+5146:    link_kind: &InverseLink,
+5189:                link_kind,
+5219:    link_kind: &InverseLink,
+5238:                link_kind,
+5248:                link_kind,
+12206:    pub link_kind: InverseLink,
+12380:        let mut jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
+12395:            &self.link_kind,
+12400:        let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
+12411:            &self.link_kind,
+12898:            let (mu_q, d1_q) = inverse_link_mu_d1_for_inverse_link(&self.link_kind, q)
+12902:            ll += binomial_location_scale_log_likelihood(yi, wi, q, &self.link_kind, mu_q)?;
+13774:            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, eta[i] + etaw[i])
+14125:    pub link_kind: InverseLink,
+14636:            &self.link_kind,
+14655:        let link_kind = &self.link_kind;
+14669:                    link_kind,
+14829:            &self.link_kind,
+14852:        let link_kind = &self.link_kind;
+14870:                    link_kind,
+15094:            &self.link_kind,
+15102:            &self.link_kind,
+15215:            &self.link_kind,
+15226:                &self.link_kind,
+15532:            &self.link_kind,
+15587:        let link_kind_p = &self.link_kind;
+15604:                    link_kind_p,
+15789:            &self.link_kind,
+16006:        let link_kind_p = &self.link_kind;
+16025:                    link_kind_p,
+16035:                    link_kind_p,
+16279:            &self.link_kind,
+16369:                &self.link_kind,
+16379:                &self.link_kind,
+16504:            &self.link_kind,
+16541:        let link_kind_e = &self.link_kind;
+16555:                    link_kind_e,
+16616:            &self.link_kind,
+16657:        let link_kind = &self.link_kind;
+16671:                    let mu = if matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+16674:                        let jet = inverse_link_jet_for_inverse_link(link_kind, q).map_err(|e| {
+16680:                        binomial_location_scale_log_likelihood(self.y[i], wi, q, link_kind, mu)?;
+17302:            &self.link_kind,
+17325:                    &self.link_kind,
+17479:            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
+17561:            &family.link_kind,
+17632:            &self.family.link_kind,
+17669:            &self.family.link_kind,
+17869:    pub link_kind: InverseLink,
+18094:            link_kind: self.link_kind.clone(),
+18353:            &self.link_kind,
+18361:            &self.link_kind,
+18495:                &self.link_kind,
+18862:            &self.link_kind,
+18870:            &self.link_kind,
+19104:                &self.link_kind,
+19114:                &self.link_kind,
+19621:            &self.link_kind,
+19629:            &self.link_kind,
+19687:                &self.link_kind,
+19697:                &self.link_kind,
+20206:            &self.link_kind,
+20246:                &self.link_kind,
+20440:            &self.link_kind,
+20474:                &self.link_kind,
+20539:            &self.link_kind,
+20581:        let link_kind = &self.link_kind;
+20596:                    let mu = if matches!(link_kind, InverseLink::Standard(LinkFunction::Probit)) {
+20599:                        let jet = inverse_link_jet_for_inverse_link(link_kind, q).map_err(|e| {
+20605:                        binomial_location_scale_log_likelihood(self.y[i], wi, q, link_kind, mu)?;
+20643:            &self.link_kind,
+20821:            &self.link_kind,
+20873:                &self.link_kind,
+21008:            &self.link_kind,
+21061:                    &self.link_kind,
+21071:                    &self.link_kind,
+21623:            &self.link_kind,
+21686:                &self.link_kind,
+21833:            &self.link_kind,
+21916:                &self.link_kind,
+21926:                &self.link_kind,
+22461:            let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q0 + etaw[i])
+22877:            link_kind: InverseLink::Standard(LinkFunction::Logit),
+22900:            link_kind: InverseLink::Standard(LinkFunction::CLogLog),
+23175:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+23504:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+24041:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+24186:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+25617:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+25681:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+25712:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+25749:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+25791:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+25839:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+25883:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+25970:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+26142:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+26405:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+26431:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+26498:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+26538:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+26579:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+26590:            binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, &family.link_kind)
+26669:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+26682:            binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, &family.link_kind)
+26740:                &family.link_kind,
+26781:            link_kind: InverseLink::Standard(LinkFunction::Logit),
+26796:            binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, &family.link_kind)
+27665:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+27678:            binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, &family.link_kind)
+27763:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+27783:                &family.link_kind,
+27899:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+27919:                &family.link_kind,
+28038:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+28051:            binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, &family.link_kind)
+28117:            &family.link_kind,
+28154:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+28174:                &family.link_kind,
+28268:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+28288:                &family.link_kind,
+28432:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+28503:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+28577:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+28762:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+28779:            binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, &family.link_kind)
+28812:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+28821:            binomial_location_scale_core(&y, &weights, &eta_t, &eta_ls, None, &family.link_kind)
+28877:            &family.link_kind,
+28948:            link_kind: InverseLink::Standard(LinkFunction::Probit),
+29044:            link_kind: InverseLink::Standard(LinkFunction::Logit),
+29169:            link_kind: InverseLink::Standard(LinkFunction::Logit),
+
+exec
+/bin/zsh -lc "nl -ba src/families/gamlss.rs | sed -n '1600,1625p'; nl -ba src/families/gamlss.rs | sed -n '4470,4525p'; nl -ba src/inference/formula_dsl.rs | sed -n '770,805p'" in /Users/user/gam
+ succeeded in 0ms:
+  1600	            nullspace_dim_hint: 0,
+  1601	            normalization_scale: 1.0,
+  1602	            kronecker_factors: None,
+  1603	        },
+  1604	    });
+  1605	}
+  1606	
+  1607	fn binomial_location_scale_link_eta_from_probability(
+  1608	    link_kind: &InverseLink,
+  1609	    probability: f64,
+  1610	) -> Result<f64, String> {
+  1611	    let target = probability.clamp(1e-6, 1.0 - 1e-6);
+  1612	    match link_kind {
+  1613	        InverseLink::Standard(LinkFunction::Logit) => Ok((target / (1.0 - target)).ln()),
+  1614	        InverseLink::Standard(LinkFunction::Probit) => standard_normal_quantile(target)
+  1615	            .map_err(|err| format!("failed to invert probit warm-start probability: {err}")),
+  1616	        InverseLink::Standard(LinkFunction::CLogLog) => Ok((-((1.0 - target).ln())).ln()),
+  1617	        other => Err(GamlssError::UnsupportedConfiguration { reason: format!(
+  1618	            "binomial location-scale warm start requires logit, probit, or cloglog link, got {other:?}"
+  1619	        ) }.into()),
+  1620	    }
+  1621	}
+  1622	
+  1623	fn weighted_binomial_prevalence(y: &Array1<f64>, weights: &Array1<f64>) -> Result<f64, String> {
+  1624	    if y.len() != weights.len() {
+  1625	        return Err(GamlssError::DimensionMismatch { reason: format!(
+  4470	    mu: f64,
+  4471	    link_kind: &InverseLink,
+  4472	) -> (f64, f64, f64) {
+  4473	    match link_kind {
+  4474	        InverseLink::Standard(LinkFunction::Probit) => {
+  4475	            binomial_neglog_q_derivatives_probit_closed_form(y, weight, q, mu)
+  4476	        }
+  4477	        InverseLink::Standard(LinkFunction::Logit) => {
+  4478	            binomial_neglog_q_derivatives_logit_closed_form(y, weight, q)
+  4479	        }
+  4480	        InverseLink::Standard(LinkFunction::CLogLog) => {
+  4481	            binomial_neglog_q_derivatives_cloglog_closed_form(y, weight, q)
+  4482	        }
+  4483	        _ => {
+  4484	            // Should not be called for unsupported links; caller should use jet path.
+  4485	            // This is a safety fallback.
+  4486	            (0.0, 0.0, 0.0)
+  4487	        }
+  4488	    }
+  4489	}
+  4490	
+  4491	#[inline]
+  4492	fn binomial_neglog_q_fourth_derivative_closed_form_dispatch(
+  4493	    y: f64,
+  4494	    weight: f64,
+  4495	    q: f64,
+  4496	    mu: f64,
+  4497	    link_kind: &InverseLink,
+  4498	) -> f64 {
+  4499	    match link_kind {
+  4500	        InverseLink::Standard(LinkFunction::Probit) => {
+  4501	            binomial_neglog_q_fourth_derivative_probit_closed_form(y, weight, q, mu)
+  4502	        }
+  4503	        InverseLink::Standard(LinkFunction::Logit) => {
+  4504	            binomial_neglog_q_fourth_derivative_logit_closed_form(y, weight, q)
+  4505	        }
+  4506	        InverseLink::Standard(LinkFunction::CLogLog) => {
+  4507	            binomial_neglog_q_fourth_derivative_cloglog_closed_form(y, weight, q)
+  4508	        }
+  4509	        _ => 0.0,
+  4510	    }
+  4511	}
+  4512	
+  4513	/// Returns true if the given link supports closed-form m1–m4 derivatives for
+  4514	/// the binomial location-scale family, enabling the exact joint Newton path.
+  4515	#[inline]
+  4516	fn binomial_link_has_closed_form(link_kind: &InverseLink) -> bool {
+  4517	    matches!(
+  4518	        link_kind,
+  4519	        InverseLink::Standard(LinkFunction::Probit)
+  4520	            | InverseLink::Standard(LinkFunction::Logit)
+  4521	            | InverseLink::Standard(LinkFunction::CLogLog)
+  4522	    )
+  4523	}
+  4524	
+  4525	fn xt_diag_x_dense(design: &Array2<f64>, diag: &Array1<f64>) -> Result<Array2<f64>, String> {
+   770	        || spec.is_binomial_sas()
+   771	        || spec.is_binomial_beta_logistic()
+   772	        || spec.is_binomial_mixture())
+   773	}
+   774	
+   775	pub fn require_likelihood_family_supports_joint_wiggle(
+   776	    family: LikelihoodFamily,
+   777	    context: &str,
+   778	) -> Result<(), String> {
+   779	    if likelihood_family_supports_joint_wiggle(family) {
+   780	        Ok(())
+   781	    } else {
+   782	        Err(joint_wiggle_unsupported_link_message(context))
+   783	    }
+   784	}
+   785	
+   786	pub fn inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
+   787	    matches!(
+   788	        link,
+   789	        InverseLink::Standard(LinkFunction::Identity)
+   790	            | InverseLink::Standard(LinkFunction::Log)
+   791	            | InverseLink::Standard(LinkFunction::Logit)
+   792	            | InverseLink::Standard(LinkFunction::Probit)
+   793	            | InverseLink::Standard(LinkFunction::CLogLog)
+   794	    )
+   795	}
+   796	
+   797	pub fn require_inverse_link_supports_joint_wiggle(
+   798	    link: &InverseLink,
+   799	    context: &str,
+   800	) -> Result<(), String> {
+   801	    if inverse_link_supports_joint_wiggle(link) {
+   802	        Ok(())
+   803	    } else {
+   804	        Err(joint_wiggle_unsupported_link_message(context))
+   805	    }
+
+codex
+Static-only review completed. I did not compile, run, or test anything.
+
+**FINDINGS**
+
+1. [src/families/latent_survival.rs](/Users/user/gam/src/families/latent_survival.rs:2638)  
+   Wrong expression: `neg_hess_scale: survival / event_prob,`  
+   Correct expression: `neg_hess_scale: -survival / event_prob,` or reuse `grad_scale`.  
+   Derivation: for event `1`, with `t = log S`, `ℓ(t)=log(1-exp(t))`, so `ℓ' = -S/(1-S)` and `ℓ'' = -S/(1-S)^2`. If `survival_jet.neg_hessian = -t''`, then `-∇²ℓ = ℓ'(-t'') - ℓ'' t't'`, so the coefficient on `survival_jet.neg_hessian` is `ℓ' = -S/(1-S)`, not `+S/(1-S)`. The wrong positive factor is consumed at [line 3570](/Users/user/gam/src/families/latent_survival.rs:3570), [line 3585](/Users/user/gam/src/families/latent_survival.rs:3585), and [line 3590](/Users/user/gam/src/families/latent_survival.rs:3590).  
+   Severity: definitive.
+
+2. [src/families/family_meta.rs](/Users/user/gam/src/families/family_meta.rs:37)  
+   Wrong expression: `InverseLink::Standard(LinkFunction::Log) => LikelihoodFamily::PoissonLog,`  
+   Correct expression: this binomial resolver must not return a Poisson family. The correct model is a binomial response with log inverse link, e.g. `LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Log))`, or an unsupported-link error if legacy `LikelihoodFamily` cannot represent it.  
+   Derivation: Bernoulli/binomial log-link likelihood is `y log μ + (1-y) log(1-μ)` with `μ=exp(η)`. Poisson log-link likelihood is `yη - exp(η) - log(y!)`. These are not the same distribution or likelihood.  
+   Severity: definitive.
+
+3. [src/families/family_meta.rs](/Users/user/gam/src/families/family_meta.rs:22) and [src/families/family_meta.rs](/Users/user/gam/src/families/family_meta.rs:49)  
+   Wrong expressions: `InverseLink::Standard(LinkFunction::Identity) => InverseLink::Standard(LinkFunction::Logit),` and `InverseLink::Standard(LinkFunction::Identity) => LikelihoodFamily::BinomialLogit,`  
+   Correct expression: preserve the identity link as `InverseLink::Standard(LinkFunction::Identity)` if supported, or reject it. It must not be silently changed to logit.  
+   Derivation: identity inverse link is `μ=η`; logit inverse link is `μ=1/(1+exp(-η))`. Substituting logit changes the likelihood surface, derivatives, fitted probabilities, and any downstream deviance/REML geometry.  
+   Severity: definitive.
+tokens used
+460,408
+Static-only review completed. I did not compile, run, or test anything.
+
+**FINDINGS**
+
+1. [src/families/latent_survival.rs](/Users/user/gam/src/families/latent_survival.rs:2638)  
+   Wrong expression: `neg_hess_scale: survival / event_prob,`  
+   Correct expression: `neg_hess_scale: -survival / event_prob,` or reuse `grad_scale`.  
+   Derivation: for event `1`, with `t = log S`, `ℓ(t)=log(1-exp(t))`, so `ℓ' = -S/(1-S)` and `ℓ'' = -S/(1-S)^2`. If `survival_jet.neg_hessian = -t''`, then `-∇²ℓ = ℓ'(-t'') - ℓ'' t't'`, so the coefficient on `survival_jet.neg_hessian` is `ℓ' = -S/(1-S)`, not `+S/(1-S)`. The wrong positive factor is consumed at [line 3570](/Users/user/gam/src/families/latent_survival.rs:3570), [line 3585](/Users/user/gam/src/families/latent_survival.rs:3585), and [line 3590](/Users/user/gam/src/families/latent_survival.rs:3590).  
+   Severity: definitive.
+
+2. [src/families/family_meta.rs](/Users/user/gam/src/families/family_meta.rs:37)  
+   Wrong expression: `InverseLink::Standard(LinkFunction::Log) => LikelihoodFamily::PoissonLog,`  
+   Correct expression: this binomial resolver must not return a Poisson family. The correct model is a binomial response with log inverse link, e.g. `LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Log))`, or an unsupported-link error if legacy `LikelihoodFamily` cannot represent it.  
+   Derivation: Bernoulli/binomial log-link likelihood is `y log μ + (1-y) log(1-μ)` with `μ=exp(η)`. Poisson log-link likelihood is `yη - exp(η) - log(y!)`. These are not the same distribution or likelihood.  
+   Severity: definitive.
+
+3. [src/families/family_meta.rs](/Users/user/gam/src/families/family_meta.rs:22) and [src/families/family_meta.rs](/Users/user/gam/src/families/family_meta.rs:49)  
+   Wrong expressions: `InverseLink::Standard(LinkFunction::Identity) => InverseLink::Standard(LinkFunction::Logit),` and `InverseLink::Standard(LinkFunction::Identity) => LikelihoodFamily::BinomialLogit,`  
+   Correct expression: preserve the identity link as `InverseLink::Standard(LinkFunction::Identity)` if supported, or reject it. It must not be silently changed to logit.  
+   Derivation: identity inverse link is `μ=η`; logit inverse link is `μ=1/(1+exp(-η))`. Substituting logit changes the likelihood surface, derivatives, fitted probabilities, and any downstream deviance/REML geometry.  
+   Severity: definitive.
