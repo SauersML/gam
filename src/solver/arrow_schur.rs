@@ -509,18 +509,18 @@ impl ArrowSchurSystem {
     /// sparsity kernels) are injected directly. Dense penalties fall back to
     /// `hvp` probes against the canonical basis vectors restricted to the
     /// per-row `d`-block (when `tier == Psi`) or against `β` (when `tier ==
-    /// Beta`). The Psi-tier contributions land on the per-row `H_tt^(i)`
+    /// Beta`). The extension-coordinate contributions land on the per-row `H_tt^(i)`
     /// **only** — we rely on the analytic-penalty contract that Psi-tier
     /// penalties are row-block-diagonal in their Hessian.
     ///
-    /// `target_psi` is the full flat ψ vector (row-major, `N·d` entries)
+    /// `target_t` is the full flat latent-coordinate vector (row-major, `N·d` entries)
     /// at the current iterate; `target_beta` is the current `β`. `rho`
     /// is the global ρ vector restricted to each penalty's local slice
     /// by [`AnalyticPenaltyRegistry::rho_layout`].
     pub fn add_analytic_penalty_contributions(
         &mut self,
         registry: &AnalyticPenaltyRegistry,
-        target_psi: ArrayView1<'_, f64>,
+        target_t: ArrayView1<'_, f64>,
         target_beta: ArrayView1<'_, f64>,
         rho_global: ArrayView1<'_, f64>,
     ) {
@@ -529,7 +529,7 @@ impl ArrowSchurSystem {
             let rho_local = rho_global.slice(ndarray::s![rho_slice.clone()]);
             match tier {
                 PenaltyTier::Psi => {
-                    self.add_psi_penalty(penalty, target_psi, rho_local);
+                    self.add_ext_coord_penalty(penalty, target_t, rho_local);
                 }
                 PenaltyTier::Beta => {
                     self.add_beta_penalty(penalty, target_beta, rho_local);
@@ -537,7 +537,7 @@ impl ArrowSchurSystem {
                 PenaltyTier::Rho => {
                     // Rho-tier hyperpriors do not contribute to the inner
                     // (t, β) Newton step; they enter only at the REML
-                    // outer level (see RemlState::evaluate_unified_with_psi_ext).
+                    // outer level.
                 }
             }
         }
@@ -569,17 +569,17 @@ impl ArrowSchurSystem {
         }
     }
 
-    fn add_psi_penalty(
+    fn add_ext_coord_penalty(
         &mut self,
         penalty: &AnalyticPenaltyKind,
-        target_psi: ArrayView1<'_, f64>,
+        target_t: ArrayView1<'_, f64>,
         rho_local: ArrayView1<'_, f64>,
     ) {
         let d = self.d;
         let n = self.rows.len();
-        debug_assert_eq!(target_psi.len(), n * d);
+        debug_assert_eq!(target_t.len(), n * d);
         // Gradient: per-row `d`-slice added to `g_t^(i)`.
-        let grad = penalty.grad_target(target_psi, rho_local);
+        let grad = penalty.grad_target(target_t, rho_local);
         for i in 0..n {
             for a in 0..d {
                 self.rows[i].gt[a] += grad[i * d + a];
@@ -587,7 +587,7 @@ impl ArrowSchurSystem {
         }
         // Hessian: inject diagonal penalties directly. This avoids O(d)
         // full-length HVP probes for ARD/sparsity on the Psi tier.
-        if let Some(diag) = penalty.hessian_diag(target_psi, rho_local) {
+        if let Some(diag) = penalty.hessian_diag(target_t, rho_local) {
             debug_assert_eq!(diag.len(), n * d);
             for i in 0..n {
                 for a in 0..d {
@@ -602,7 +602,7 @@ impl ArrowSchurSystem {
         // operator) this yields the per-row `d × d` block. For penalties that
         // would couple rows the off-row entries are silently dropped — a
         // design choice consistent with the arrow-shape precondition. The
-        // analytic-penalty contract documents that Psi-tier penalties
+        // analytic-penalty contract documents that extension-coordinate penalties
         // *must* be row-block-diagonal in their Hessian.
         let mut probe = Array1::<f64>::zeros(n * d);
         for a in 0..d {
@@ -613,7 +613,7 @@ impl ArrowSchurSystem {
             for i in 0..n {
                 probe[i * d + a] = 1.0;
             }
-            let hv = penalty.hvp(target_psi, rho_local, probe.view());
+            let hv = penalty.hvp(target_t, rho_local, probe.view());
             for i in 0..n {
                 for b in 0..d {
                     self.rows[i].htt[[b, a]] += hv[i * d + b];
@@ -1620,15 +1620,14 @@ fn lower_triangular_solve_matrix(l: &Array2<f64>, b: &Array2<f64>) -> Array2<f64
 
 // ---------------------------------------------------------------------------
 // Convenience: in-place writeback of the arrow-Schur Newton step into the
-// global PIRLS direction buffer. The driver owns the layout (β occupies
-// `[0, K)`; flat ψ occupies `[K, K + N·d)` by convention used by the
-// existing `SpatialLogKappaCoords` extension to the outer ρ vector).
+// global PIRLS direction buffer. The driver owns the layout: β occupies
+// `[0, K)` and flat `t` occupies `[K, K + N·d)`.
 // ---------------------------------------------------------------------------
 
-/// Layout convention for the joint (β, ψ) direction buffer.
+/// Layout convention for the joint `(β, t)` direction buffer.
 ///
-/// The β block occupies entries `[0, K)`; the flat ψ block (per-row `t`
-/// row-major) occupies `[K, K + N·d)`. This matches the convention used
+/// The β block occupies entries `[0, K)`; the flat per-row `t`
+/// block occupies `[K, K + N·d)`. This matches the convention used
 /// by [`crate::terms::analytic_penalties::PsiSlice`] and by the existing
 /// `SpatialLogKappaCoords` extension to the outer ρ vector. BA analogue:
 /// export the reduced-camera-system shared step followed by point
