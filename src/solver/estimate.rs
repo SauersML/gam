@@ -780,6 +780,8 @@ pub(crate) struct RemlConfig {
     max_iterations: usize,
     reml_convergence_tolerance: f64,
     firth_bias_reduction: bool,
+    /// Forwarded to `pirls::PirlsConfig::geodesic_acceleration`. Off by default.
+    geodesic_acceleration: bool,
 }
 
 impl RemlConfig {
@@ -799,6 +801,7 @@ impl RemlConfig {
             max_iterations: 0,
             reml_convergence_tolerance: reml_tol,
             firth_bias_reduction,
+            geodesic_acceleration: false,
         }
         .with_max_iterations(300)
     }
@@ -823,7 +826,16 @@ impl RemlConfig {
             // each `execute_pirls_if_needed` call from the cached final
             // λ of the previous successful PIRLS solve.
             initial_lm_lambda: None,
+            geodesic_acceleration: self.geodesic_acceleration,
         }
+    }
+
+    /// Enable / disable Transtrum-Sethna geodesic acceleration on the
+    /// inner PIRLS Newton step. See
+    /// `pirls::WorkingModelPirlsOptions::geodesic_acceleration` for the
+    /// full semantics. Default `false`.
+    pub(crate) fn set_geodesic_acceleration(&mut self, value: bool) {
+        self.geodesic_acceleration = value;
     }
 }
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;

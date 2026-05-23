@@ -1271,6 +1271,21 @@ pub struct WorkingModelPirlsOptions {
     /// have to rediscover problem-specific damping at every accepted
     /// outer iterate.
     pub initial_lm_lambda: Option<f64>,
+    /// Enable the Transtrum-Sethna geodesic-acceleration second-order
+    /// correction on each accepted Levenberg-Marquardt step. When true,
+    /// after the standard LM direction `δp = −(H + λ_lm·diag(H))⁻¹ g`
+    /// is computed and accepted by the LM gain test, the solver computes
+    /// a finite-difference estimate of the directional second derivative
+    /// of the gradient along `δp`, solves a *second* linear system with
+    /// the same (already-factored) Hessian, and adds the correction
+    /// `δp₂` to the step only if `‖δp₂‖ ≤ α‖δp‖` (the Transtrum-Sethna
+    /// 2011 acceptance criterion, α = 0.75 here). The correction costs
+    /// two extra full `WorkingModel::update` calls per accepted step
+    /// (for the FD evaluations); it is most useful for fits whose
+    /// penalized Hessian is near-singular (latent-coordinate fits,
+    /// near-collinear bases). Default `false`; opt-in until validated
+    /// across the broader family of likelihoods and penalties.
+    pub geodesic_acceleration: bool,
 }
 
 #[inline]
@@ -7217,6 +7232,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         coefficient_lower_bounds: None,
         linear_constraints: linear_constraints.clone(),
         initial_lm_lambda: config.initial_lm_lambda,
+        geodesic_acceleration: config.geodesic_acceleration,
     };
 
     let mut iteration_logger = |info: &WorkingModelIterationInfo| {
@@ -7361,6 +7377,12 @@ pub struct PirlsConfig {
     /// internal options. See the field doc on `WorkingModelPirlsOptions`
     /// for the seeding semantics.
     pub initial_lm_lambda: Option<f64>,
+    /// Enable the Transtrum-Sethna geodesic-acceleration second-order
+    /// correction on each accepted LM step. Forwarded to
+    /// `WorkingModelPirlsOptions::geodesic_acceleration`; see that
+    /// field's doc for the full semantics and cost model. Default
+    /// `false`; opt-in until validated.
+    pub geodesic_acceleration: bool,
 }
 
 impl PirlsConfig {
