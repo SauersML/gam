@@ -2943,57 +2943,6 @@ pub(crate) fn q_chain_derivs_scalar(eta_t: f64, eta_ls: f64) -> (f64, f64, f64, 
     (-inv_sigma, -q, inv_sigma, q, -inv_sigma, -q)
 }
 
-/// Extended scalar chain-rule derivatives of
-/// q(eta_t, eta_ls) = -eta_t * exp(-eta_ls)
-/// through **4th order**.
-///
-/// Returns the same 6 values as `q_chain_derivs_scalar` plus two 4th-order terms:
-///
-///   u_ϑsss = ∂⁴q / ∂η_ϑ ∂η_s³
-///   u_ssss = ∂⁴q / ∂η_s⁴
-///
-/// # Alternating-sign pattern for exp-link chain derivatives
-///
-/// With σ = exp(η_s), all derivatives of σ w.r.t. η_s equal σ itself:
-/// σ' = σ'' = σ''' = σ'''' = σ. The chain-rule derivatives of
-/// q = -η_ϑ/σ then exhibit a clean alternating-sign pattern:
-///
-/// ```text
-///   u_ϑ    = -σ⁻¹       u_s    =  ϑ/σ
-///   u_ϑs   =  σ⁻¹       u_ss   = -ϑ/σ
-///   u_ϑss  = -σ⁻¹       u_sss  =  ϑ/σ
-///   u_ϑsss =  σ⁻¹       u_ssss = -ϑ/σ
-/// ```
-///
-/// Each additional η_s derivative multiplies by d/d(η_s)[σ⁻¹] = -σ⁻¹,
-/// producing the sign flip.
-///
-/// # Why 4th order is needed (see response.md Section 6)
-///
-/// The outer REML Hessian's Q[v_k, v_l] term requires the 4th derivative
-/// of the composed likelihood via the Arbogast formula:
-///
-/// ```text
-///   F_αβγδ = m4·u_α·u_β·u_γ·u_δ
-///          + m3·Σ(6 perms) u_αβ·u_γ·u_δ
-///          + m2·Σ(3 perms) u_αβ·u_γδ
-///          + m2·Σ(4 perms) u_αβγ·u_δ
-///          + m1·u_αβγδ          ← requires u_ϑsss and u_ssss
-/// ```
-///
-/// The last term m1·u_αβγδ is nonzero only for (ϑ,s,s,s) and (s,s,s,s).
-/// Without these terms the outer Hessian drift is incomplete.
-#[allow(dead_code)] // Kept for WS4a outer-Hessian consumers that need fourth-order q chain terms.
-#[inline]
-pub(crate) fn q_chain_derivs_fourth_scalar(
-    eta_t: f64,
-    eta_ls: f64,
-) -> (f64, f64, f64, f64, f64, f64, f64, f64) {
-    let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls);
-    let q = -safe_product(eta_t, inv_sigma);
-    (-inv_sigma, -q, inv_sigma, q, -inv_sigma, -q, inv_sigma, q)
-}
-
 fn validate_cov_block(
     name: &str,
     n: usize,
