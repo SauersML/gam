@@ -4860,7 +4860,7 @@ fn gumbel_temperature_schedule_from_pydict(
     let Some(schedule) = schedule else {
         return Ok(None);
     };
-    let kind = get(schedule, "kind")?
+    let decay_name = get(schedule, "decay")?
         .extract::<String>()
         .map_err(|err| err.to_string())?
         .to_ascii_lowercase()
@@ -4871,7 +4871,7 @@ fn gumbel_temperature_schedule_from_pydict(
     let tau_min = get(schedule, "tau_min")?
         .extract::<f64>()
         .map_err(|err| err.to_string())?;
-    let decay = match kind.as_str() {
+    let decay = match decay_name.as_str() {
         "geometric" => {
             let rate = get(schedule, "rate")?
                 .extract::<f64>()
@@ -4884,14 +4884,24 @@ fn gumbel_temperature_schedule_from_pydict(
                 .map_err(|err| err.to_string())?;
             ScheduleKind::Linear { steps }
         }
-        "reciprocal_iter" | "reciprocal" => ScheduleKind::ReciprocalIter,
+        "reciprocal_iter" => ScheduleKind::ReciprocalIter,
         other => {
             return Err(format!(
-                "gumbel_schedule kind must be 'geometric', 'linear', or 'reciprocal_iter'; got {other:?}"
+                "gumbel_schedule decay must be 'geometric', 'linear', or 'reciprocal_iter'; got {other:?}"
             ));
         }
     };
-    GumbelTemperatureSchedule::new(tau_start, tau_min, decay).map(Some)
+    let mut schedule_out = GumbelTemperatureSchedule::new(tau_start, tau_min, decay)?;
+    if let Some(iter_count) = schedule
+        .get_item("iter_count")
+        .map_err(|err| err.to_string())?
+    {
+        schedule_out.iter_count = iter_count
+            .extract::<usize>()
+            .map_err(|err| err.to_string())?;
+        schedule_out.validate()?;
+    }
+    Ok(Some(schedule_out))
 }
 
 #[pyfunction(signature = (

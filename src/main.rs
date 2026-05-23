@@ -7352,6 +7352,7 @@ fn core_saved_fit_result(
 
 fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodFamily) -> Option<f64> {
     match family {
+        LikelihoodFamily::Tweedie { p } => Some(p),
         LikelihoodFamily::NegativeBinomial { theta } => Some(theta),
         LikelihoodFamily::GammaLog => fit
             .likelihood_scale
@@ -8434,6 +8435,7 @@ fn build_model_summary(
         }
         LikelihoodFamily::RoystonParmar => Array1::from_elem(y.len(), 0.0),
         LikelihoodFamily::PoissonLog
+        | LikelihoodFamily::Tweedie { .. }
         | LikelihoodFamily::NegativeBinomial { .. }
         | LikelihoodFamily::GammaLog => {
             let wsum = weights.iter().copied().sum::<f64>().max(1e-12);
