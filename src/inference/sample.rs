@@ -226,6 +226,9 @@ fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodFamily) -> O
     if let LikelihoodFamily::Tweedie { p } = family {
         return Some(p);
     }
+    if let LikelihoodFamily::BetaLogit { phi } = family {
+        return Some(phi);
+    }
     let spec: crate::types::LikelihoodSpec = family.into();
     if matches!(spec.response, crate::types::ResponseFamily::Gamma) {
         fit.likelihood_scale

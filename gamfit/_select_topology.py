@@ -6,7 +6,7 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 
 from . import topology
 from ._api import fit
@@ -33,8 +33,9 @@ class _TopologyTerm:
     required_dim: int | None
 
 
-BasisSpec = Smooth
-ScoreKind = Literal["reml", "laml", "bic"]
+BasisSpec: TypeAlias = Smooth
+ScoreKind: TypeAlias = Literal["reml", "laml", "bic"]
+ScoreScale: TypeAlias = Literal["per_observation", "per_effective_dim", "raw"]
 
 
 @dataclass(frozen=True)
@@ -46,7 +47,10 @@ class SelectTopologyResult:
     scores: dict[str, float]
     rankings: list[tuple[str, float]]
     score_kind: str
+    score_scale: str
     basis_sizes: dict[str, int]
+    effective_dim: dict[str, float]
+    n_obs: dict[str, int]
     warnings: list[str]
     fits: dict[str, Any] | None = None
 
@@ -57,11 +61,13 @@ def select_topology(
     candidates: Sequence[tuple[str, BasisSpec] | Mapping[str, Any]] | None = None,
     *,
     score: ScoreKind = "reml",
+    score_scale: ScoreScale = "per_observation",
     return_fits: bool = False,
     **fit_kwargs: Any,
 ) -> SelectTopologyResult:
     """Select a topology by fitting candidates and ranking model evidence."""
     score_kind = _normalize_score_kind(score)
+    score_scale_kind = _normalize_score_scale(score_scale)
     formula, feature_dim, n_obs = _formula_from_response(data, response)
     normalized = _normalize_candidates(candidates, feature_dim=feature_dim)
     auto = _find_auto_smooth_call(formula)
@@ -91,9 +97,18 @@ def select_topology(
         fit_list.append(model)
 
     basis_sizes = {name: _basis_size(fit_obj) for name, fit_obj in fits.items()}
-    selected_scores = {
+    effective_dim = {
+        name: _effective_dim(fit_obj)
+        for name, fit_obj in fits.items()
+    }
+    n_obs_by_candidate = {name: n_obs for name in fits}
+    raw_scores = {
         name: _score_for_kind(fit_obj, score_kind, n_obs, basis_sizes[name])
         for name, fit_obj in fits.items()
+    }
+    selected_scores = {
+        name: _scale_score(raw_scores[name], score_scale_kind, n_obs, effective_dim[name])
+        for name in fits
     }
     comparison_scores = {
         name: _comparison_score(value, score_kind)
@@ -109,7 +124,13 @@ def select_topology(
         for name, *_ in compared["ranking"]
     ]
     winner_name = compared["winner"]
-    warnings_out = _score_disagreement_warnings(fits, n_obs, basis_sizes)
+    warnings_out = _score_disagreement_warnings(
+        fits,
+        n_obs,
+        basis_sizes,
+        effective_dim,
+        score_scale_kind,
+    )
 
     return SelectTopologyResult(
         winner_name=winner_name,
@@ -117,7 +138,10 @@ def select_topology(
         scores=selected_scores,
         rankings=rankings,
         score_kind=score_kind,
+        score_scale=score_scale_kind,
         basis_sizes=basis_sizes,
+        effective_dim=effective_dim,
+        n_obs=n_obs_by_candidate,
         warnings=warnings_out,
         fits=fits if return_fits else None,
     )
@@ -416,6 +440,16 @@ def _normalize_score_kind(score: str) -> ScoreKind:
     return normalized  # type: ignore[return-value]
 
 
+def _normalize_score_scale(score_scale: str) -> ScoreScale:
+    normalized = str(score_scale).strip().lower()
+    if normalized not in {"per_observation", "per_effective_dim", "raw"}:
+        raise ValueError(
+            "score_scale must be one of: 'per_observation', "
+            "'per_effective_dim', 'raw'"
+        )
+    return normalized  # type: ignore[return-value]
+
+
 def _score_for_kind(
     fit_obj: Any,
     score_kind: ScoreKind,
@@ -431,6 +465,26 @@ def _score_for_kind(
 
 def _comparison_score(score: float, score_kind: ScoreKind) -> float:
     return -float(score) if score_kind == "bic" else float(score)
+
+
+def _scale_score(
+    score: float,
+    score_scale: ScoreScale,
+    n_obs: int,
+    effective_dim: float,
+) -> float:
+    if score_scale == "raw":
+        return float(score)
+    if score_scale == "per_observation":
+        if n_obs <= 0:
+            raise ValueError("per_observation topology scoring requires n_obs > 0")
+        return float(score) / float(n_obs)
+    if not (math.isfinite(effective_dim) and effective_dim > 0.0):
+        raise ValueError(
+            "per_effective_dim topology scoring requires finite positive "
+            f"effective_dim; got {effective_dim!r}"
+        )
+    return float(score) / effective_dim
 
 
 def _extract_laml_score(fit_obj: Any) -> float:
@@ -481,6 +535,47 @@ def _basis_size(fit_obj: Any) -> int:
     raise ValueError("select_topology could not determine fitted basis size")
 
 
+def _effective_dim(fit_obj: Any) -> float:
+    payload = _summary_payload(fit_obj)
+    if payload is not None:
+        value = _first_mapping_value(
+            payload,
+            ("effective_dim", "effective_dimension", "edf_total", "edf", "effective_dof"),
+        )
+        if value is not None:
+            return _effective_dim_value(value)
+    if isinstance(fit_obj, Mapping):
+        value = _first_mapping_value(
+            fit_obj,
+            ("effective_dim", "effective_dimension", "edf_total", "edf", "effective_dof"),
+        )
+        if value is not None:
+            return _effective_dim_value(value)
+    for key in ("effective_dim", "effective_dimension", "edf_total", "edf", "effective_dof"):
+        value = getattr(fit_obj, key, None)
+        if value is not None:
+            return _effective_dim_value(value)
+    raise ValueError("select_topology could not determine fitted effective_dim")
+
+
+def _first_mapping_value(mapping: Mapping[str, Any], keys: tuple[str, ...]) -> Any | None:
+    for key in keys:
+        value = mapping.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _effective_dim_value(value: Any) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        out = float(sum(value))
+    if not math.isfinite(out):
+        raise ValueError(f"select_topology effective_dim must be finite; got {out!r}")
+    return out
+
+
 def _extract_float_field(fit_obj: Any, keys: tuple[str, ...]) -> float | None:
     payload = _summary_payload(fit_obj)
     if payload is not None:
@@ -514,11 +609,18 @@ def _score_disagreement_warnings(
     fits: Mapping[str, Any],
     n_obs: int,
     basis_sizes: Mapping[str, int],
+    effective_dim: Mapping[str, float],
+    score_scale: ScoreScale,
 ) -> list[str]:
     orders: dict[str, tuple[str, ...]] = {}
     for kind in ("reml", "laml", "bic"):
         scores = {
-            name: _score_for_kind(fit_obj, kind, n_obs, basis_sizes[name])
+            name: _scale_score(
+                _score_for_kind(fit_obj, kind, n_obs, basis_sizes[name]),
+                score_scale,
+                n_obs,
+                effective_dim[name],
+            )
             for name, fit_obj in fits.items()
         }
         comparison = compare_models(
@@ -532,6 +634,13 @@ def _score_disagreement_warnings(
     detail = "; ".join(
         f"{kind}: {', '.join(order)}" for kind, order in orders.items()
     )
+    if score_scale != "raw":
+        return [
+            "Scaled topology score rankings still differ across score kinds "
+            f"under score_scale={score_scale!r} ({detail}). Treat BIC as a "
+            "secondary diagnostic; the Tierney-Kadane Laplace normalizer "
+            "handles the known cross-basis evidence scale issue."
+        ]
     return [
         "Topology score rankings differ across score kinds "
         f"({detail}). See memory "
@@ -540,4 +649,10 @@ def _score_disagreement_warnings(
     ]
 
 
-__all__ = ["BasisSpec", "ScoreKind", "SelectTopologyResult", "select_topology"]
+__all__ = [
+    "BasisSpec",
+    "ScoreKind",
+    "ScoreScale",
+    "SelectTopologyResult",
+    "select_topology",
+]
