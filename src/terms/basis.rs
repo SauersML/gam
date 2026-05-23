@@ -15,7 +15,7 @@ use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::parallel::prelude::*;
 use ndarray::{
-    Array, Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s,
+    Array, Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -19034,6 +19034,374 @@ fn fill_duchon_1d_polynomial_derivative(
             };
         }
     }
+}
+
+/// N-D Duchon polynomial-nullspace first derivative `∂P/∂t` per row.
+///
+/// Generalises [`fill_duchon_1d_polynomial_derivative`] to arbitrary spatial
+/// dimension `d` and arbitrary nullspace degree. For the monomial
+/// `m_α(t) = ∏_a t_a^{α_a}`, the partial derivative w.r.t. `t_axis` is
+///
+/// ```text
+///     ∂ m_α / ∂ t_axis = α_axis · t_axis^{α_axis − 1} · ∏_{a ≠ axis} t_a^{α_a}
+/// ```
+///
+/// (and is zero if `α_axis == 0`).
+///
+/// Returned tensor shape: `(n_rows, n_poly_cols, d)`, ordered with the same
+/// `monomial_exponents(d, max_total_degree)` enumeration that
+/// `monomial_basis_block` uses to build the polynomial-tail columns of the
+/// Duchon design, so the column index `k` aligns directly with the design.
+pub fn duchon_polynomial_first_derivative_nd(
+    t: ArrayView2<'_, f64>,
+    nullspace_order: DuchonNullspaceOrder,
+) -> Array3<f64> {
+    let n_rows = t.nrows();
+    let dim = t.ncols();
+    let max_degree = match nullspace_order {
+        DuchonNullspaceOrder::Zero => 0usize,
+        DuchonNullspaceOrder::Linear => 1usize,
+        DuchonNullspaceOrder::Degree(k) => k,
+    };
+    let exponents = monomial_exponents(dim, max_degree);
+    let n_poly = exponents.len();
+    let mut out = Array3::<f64>::zeros((n_rows, n_poly, dim));
+    if dim == 0 || n_poly == 0 {
+        return out;
+    }
+    for (col, alpha) in exponents.iter().enumerate() {
+        for axis in 0..dim {
+            let a_axis = alpha[axis];
+            if a_axis == 0 {
+                continue;
+            }
+            for row in 0..n_rows {
+                let mut value = a_axis as f64;
+                for a in 0..dim {
+                    let exp_a = if a == axis { a_axis - 1 } else { alpha[a] };
+                    if exp_a != 0 {
+                        value *= t[[row, a]].powi(exp_a as i32);
+                    }
+                }
+                out[[row, col, axis]] = value;
+            }
+        }
+    }
+    out
+}
+
+/// N-D Matérn radial first-derivative `φ'(r)` evaluated for every
+/// `(row, center)` pair.
+///
+/// Returns an `(n_rows, n_centers)` matrix whose `(n, k)` entry is the
+/// scalar radial derivative `φ'(r_{nk})` of the Matérn kernel,
+/// where `r_{nk} = ‖t_n − c_k‖_2`.
+///
+/// This is the Matérn analogue of [`duchon_radial_first_derivative_nd`].
+/// The full per-row gradient is reconstructed at the call site as
+/// `∂Φ_{n,k}/∂t_n = φ'(r_{n,k}) · (t_n − c_k) / r_{n,k}` (chain rule of the
+/// radial kernel w.r.t. its first argument), reusing
+/// [`crate::terms::latent_coord::LatentCoordValues::design_gradient_wrt_t`].
+///
+/// All radial derivatives are obtained in closed form from the half-integer
+/// Matérn polynomial-times-exponential representation; the underlying scalar
+/// arithmetic is [`matern_kernel_radial_tripletwith_safe_ratio`].
+pub fn matern_radial_first_derivative_nd(
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: f64,
+    nu: MaternNu,
+) -> Result<Array2<f64>, BasisError> {
+    let n_rows = t.nrows();
+    let n_centers = centers.nrows();
+    let dim = centers.ncols();
+    if dim == 0 {
+        return Err(BasisError::InvalidInput(
+            "matern_radial_first_derivative_nd: centers must have at least one column".into(),
+        ));
+    }
+    if t.ncols() != dim {
+        return Err(BasisError::InvalidInput(format!(
+            "matern_radial_first_derivative_nd: t has {} cols but centers have {}",
+            t.ncols(),
+            dim
+        )));
+    }
+    let mut out = Array2::<f64>::zeros((n_rows, n_centers));
+    for n in 0..n_rows {
+        for k in 0..n_centers {
+            let mut r2 = 0.0_f64;
+            for a in 0..dim {
+                let dv = t[[n, a]] - centers[[k, a]];
+                r2 += dv * dv;
+            }
+            let r = r2.sqrt();
+            let (_phi, phi_r, _phi_rr, _ratio) =
+                matern_kernel_radial_tripletwith_safe_ratio(r, length_scale, nu)?;
+            out[[n, k]] = phi_r;
+        }
+    }
+    Ok(out)
+}
+
+/// Spectral derivative of the Sobolev sphere kernel w.r.t. `cos γ`.
+///
+/// `dK_m/d(cos γ) = (1/4π) Σ_{l ≥ 1} (2l+1) · [l(l+1)]^{−m} · P_l'(cos γ)`,
+/// truncated to a series long enough for the requested `m`. Uses the
+/// standard `(1−x²) P_l'(x) = l (P_{l−1}(x) − x P_l(x))` identity to evaluate
+/// `P_l'` from a `P_l` recurrence without dividing through near the poles.
+///
+/// `x` should lie in `[−1, 1]`; values outside are clamped.
+fn wahba_sphere_kernel_sobolev_derivative_dcos(x: f64, m: usize) -> f64 {
+    let l_max = match m {
+        1 => 4096_usize,
+        2 => 256,
+        3 => 128,
+        _ => 96,
+    };
+    let x = x.clamp(-1.0, 1.0);
+    let m_i = m as i32;
+    let four_pi = 4.0 * std::f64::consts::PI;
+    // P_l recurrence: P_0 = 1, P_1 = x, P_{l+1} = ((2l+1) x P_l − l P_{l−1}) / (l+1).
+    // P_l'(x) recovered from (1−x²) P_l' = l (P_{l−1} − x P_l), with l ≥ 1.
+    let one_minus_x2 = (1.0 - x * x).max(f64::EPSILON);
+    let mut p_lm1 = 1.0_f64; // P_{l-1}
+    let mut p_l = x; // P_l   (l starts at 1)
+    let mut l = 1_usize;
+    let mut sum = 0.0_f64;
+    loop {
+        // P_l' for current l ≥ 1.
+        let p_l_prime = (l as f64) * (p_lm1 - x * p_l) / one_minus_x2;
+        let ell = l as f64;
+        let eigen = (ell * (ell + 1.0)).powi(m_i);
+        let weight = (2.0 * ell + 1.0) / four_pi;
+        sum += weight * p_l_prime / eigen;
+        if l >= l_max {
+            break;
+        }
+        // advance recurrence
+        let p_lp1 = ((2 * l + 1) as f64 * x * p_l - (l as f64) * p_lm1) / ((l + 1) as f64);
+        p_lm1 = p_l;
+        p_l = p_lp1;
+        l += 1;
+    }
+    sum
+}
+
+/// N-D Sobolev-sphere first-derivative jet `∂Φ/∂t` per row, on the unit
+/// sphere `S^{dim−1}`.
+///
+/// `points` is `(n_rows, dim)` ambient unit vectors `t_n ∈ ℝ^dim`,
+/// `centers` is `(n_centers, dim)` ambient unit vectors `c_k`. The kernel
+/// is `K(cos γ)` with `cos γ = t · c`, and the chain rule gives
+///
+/// ```text
+///     ∂Φ_{n,k} / ∂t_n = K'(cos γ_{n,k}) · c_k,
+/// ```
+///
+/// where `K'` is `dK/d(cos γ)` from
+/// [`wahba_sphere_kernel_sobolev_derivative_dcos`]. The result is the
+/// *ambient* gradient; if the caller wants the gradient *intrinsic to the
+/// tangent plane at* `t_n`, they should project out the radial component
+/// via `g − (g · t_n) t_n`. This helper returns the un-projected ambient
+/// jet so the caller can pick its parameterisation (Stiefel update,
+/// extrinsic Riemannian step, exponential map, ...).
+///
+/// Returned tensor shape: `(n_rows, n_centers, dim)`.
+pub fn sphere_first_derivative_nd(
+    points: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    penalty_order: usize,
+) -> Result<Array3<f64>, BasisError> {
+    let n_rows = points.nrows();
+    let n_centers = centers.nrows();
+    let dim = points.ncols();
+    if !(1..=4).contains(&penalty_order) {
+        return Err(BasisError::InvalidInput(format!(
+            "sphere_first_derivative_nd: penalty_order must be in 1..=4; got {penalty_order}"
+        )));
+    }
+    if dim == 0 {
+        return Err(BasisError::InvalidInput(
+            "sphere_first_derivative_nd: points must have at least one column".into(),
+        ));
+    }
+    if centers.ncols() != dim {
+        return Err(BasisError::InvalidInput(format!(
+            "sphere_first_derivative_nd: points have dim {} but centers have dim {}",
+            dim,
+            centers.ncols()
+        )));
+    }
+    let mut out = Array3::<f64>::zeros((n_rows, n_centers, dim));
+    for n in 0..n_rows {
+        for k in 0..n_centers {
+            let mut cos_g = 0.0_f64;
+            for a in 0..dim {
+                cos_g += points[[n, a]] * centers[[k, a]];
+            }
+            let dk = wahba_sphere_kernel_sobolev_derivative_dcos(cos_g, penalty_order);
+            for a in 0..dim {
+                out[[n, k, a]] = dk * centers[[k, a]];
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// N-D periodic-cyclic-B-spline first-derivative jet `∂Φ/∂t` per row.
+///
+/// One-dimensional periodic B-spline basis (one latent axis). `t` is the
+/// `(n_rows, 1)` latent matrix; each row evaluates a length-`num_basis`
+/// derivative stencil w.r.t. the scalar latent coordinate. The result is
+/// `(n_rows, num_basis, 1)`. This is the analytic uniform-cardinal
+/// derivative used by [`create_periodic_bspline_derivative_dense`]; the
+/// derivative formula `B'_i(x) = (B_{i,k−1}(x) − B_{i+1,k−1}(x)) / h` is
+/// exact at every `x` (closed-form by the standard `cardinal_bspline`
+/// recurrence). Periodic wraparound is handled by `rem_euclid` on the
+/// integer index — derivative values do **not** suffer the jump that the
+/// pointwise basis values do at knot collisions because the cardinal
+/// derivative is itself a continuous function (degree − 1).
+pub fn periodic_bspline_first_derivative_nd(
+    t: ArrayView2<'_, f64>,
+    data_range: (f64, f64),
+    degree: usize,
+    num_basis: usize,
+) -> Result<Array3<f64>, BasisError> {
+    if t.ncols() != 1 {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic_bspline_first_derivative_nd: t must have exactly 1 column; got {}",
+            t.ncols()
+        )));
+    }
+    let n_rows = t.nrows();
+    let t_col = t.column(0).to_owned();
+    let deriv = create_periodic_bspline_derivative_dense(
+        t_col.view(),
+        data_range,
+        degree,
+        num_basis,
+    )?;
+    let mut out = Array3::<f64>::zeros((n_rows, num_basis, 1));
+    for n in 0..n_rows {
+        for k in 0..num_basis {
+            out[[n, k, 0]] = deriv[[n, k]];
+        }
+    }
+    Ok(out)
+}
+
+/// Tensor-product 1-D-B-spline first-derivative jet `∂Φ/∂t` per row.
+///
+/// `t` is the `(n_rows, n_axes)` latent matrix and each axis carries its
+/// own `(knots, degree)` univariate B-spline. The tensor-product basis is
+///
+/// ```text
+///     Φ_{n, k}(t_n) = ∏_a B^{(a)}_{j_a(k)}(t_{n,a}),
+/// ```
+///
+/// where `k` enumerates the row-major tensor product
+/// `j_0 ∈ [0, K_0) × … × j_{n_axes−1} ∈ [0, K_{n_axes−1})`. The product
+/// rule then gives, for the partial w.r.t. axis `axis`:
+///
+/// ```text
+///     ∂Φ_{n,k} / ∂t_{n, axis}
+///         = (B^{(axis)}_{j_axis})'(t_{n, axis})
+///           · ∏_{a ≠ axis} B^{(a)}_{j_a}(t_{n,a}).
+/// ```
+///
+/// Returned tensor shape: `(n_rows, K_total, n_axes)` where
+/// `K_total = ∏_a K_a` and `K_a = knots[a].len() − degree[a] − 1`.
+pub fn bspline_tensor_first_derivative(
+    t: ArrayView2<'_, f64>,
+    knots_per_axis: &[ArrayView1<'_, f64>],
+    degrees: &[usize],
+) -> Result<Array3<f64>, BasisError> {
+    let n_axes = t.ncols();
+    if knots_per_axis.len() != n_axes || degrees.len() != n_axes {
+        return Err(BasisError::InvalidInput(format!(
+            "bspline_tensor_first_derivative: t has {n_axes} axes but received \
+             {} knot vectors and {} degrees",
+            knots_per_axis.len(),
+            degrees.len(),
+        )));
+    }
+    if n_axes == 0 {
+        return Err(BasisError::InvalidInput(
+            "bspline_tensor_first_derivative: t must have at least one axis".into(),
+        ));
+    }
+    let n_rows = t.nrows();
+    // Per-axis basis sizes and total tensor size.
+    let mut k_per_axis = Vec::<usize>::with_capacity(n_axes);
+    let mut total = 1usize;
+    for a in 0..n_axes {
+        let k = knots_per_axis[a]
+            .len()
+            .checked_sub(degrees[a] + 1)
+            .ok_or_else(|| {
+                BasisError::InvalidInput(format!(
+                    "bspline_tensor_first_derivative: axis {a} knot vector too short \
+                     for degree {}",
+                    degrees[a]
+                ))
+            })?;
+        k_per_axis.push(k);
+        total = total.checked_mul(k).ok_or_else(|| {
+            BasisError::InvalidInput(
+                "bspline_tensor_first_derivative: tensor-product basis size overflow".into(),
+            )
+        })?;
+    }
+    let mut out = Array3::<f64>::zeros((n_rows, total, n_axes));
+    // Scratch per row: per-axis value vector and derivative vector.
+    let mut values_per_axis: Vec<Vec<f64>> =
+        k_per_axis.iter().map(|&k| vec![0.0; k]).collect();
+    let mut derivs_per_axis: Vec<Vec<f64>> =
+        k_per_axis.iter().map(|&k| vec![0.0; k]).collect();
+    for n in 0..n_rows {
+        // Evaluate B^{(a)} and (B^{(a)})' at t_{n, a} for each axis.
+        for a in 0..n_axes {
+            let mut scratch = internal::BsplineScratch::new(degrees[a]);
+            internal::evaluate_splines_at_point_into(
+                t[[n, a]],
+                degrees[a],
+                knots_per_axis[a],
+                &mut values_per_axis[a],
+                &mut scratch,
+            );
+            evaluate_bspline_derivative_scalar(
+                t[[n, a]],
+                knots_per_axis[a],
+                degrees[a],
+                &mut derivs_per_axis[a],
+            )?;
+        }
+        // Enumerate tensor product in row-major order matching
+        // `j = j_0 * (K_1 K_2 … K_{n_axes-1}) + j_1 * (K_2 … K_{n_axes-1}) + … + j_{n_axes-1}`.
+        let mut idx = vec![0usize; n_axes];
+        for k in 0..total {
+            // Reconstruct multi-index `idx` from flat `k`.
+            let mut rem = k;
+            for a in (0..n_axes).rev() {
+                idx[a] = rem % k_per_axis[a];
+                rem /= k_per_axis[a];
+            }
+            // For each output axis, derivative of axis-`axis` factor times
+            // values of the others.
+            for axis in 0..n_axes {
+                let mut prod = derivs_per_axis[axis][idx[axis]];
+                for a in 0..n_axes {
+                    if a == axis {
+                        continue;
+                    }
+                    prod *= values_per_axis[a][idx[a]];
+                }
+                out[[n, k, axis]] = prod;
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[inline]

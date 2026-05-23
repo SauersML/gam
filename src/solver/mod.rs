@@ -10,3 +10,4 @@ pub mod protocol;
 pub mod seeding;
 pub mod visualizer;
 pub(crate) mod workflow;
+pub mod latent_inner;
