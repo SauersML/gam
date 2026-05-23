@@ -7,7 +7,7 @@ materializes the penalty's value / gradient / Hessian-vector product
 analytically inside the inner loop.
 
 See `proposals/composition_engine.md` §3-§4 and
-`proposals/latent_coord.md` §2.3 for the motivation. These three
+`proposals/latent_coord.md` §2.3 for the motivation. These structured
 penalties span the identifiability tools the impossibility theorem
 says a principal-manifold / SAE / SAE-manifold engine needs:
 
@@ -26,7 +26,7 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
   penalizing latent-axis correlations; pair it with ARD so pruned axes
   are identifiable.
 
-All three compose with the existing smoothness penalty (`S(ρ)`),
+All four compose with the existing smoothness penalty (`S(ρ)`),
 they slot into the same REML outer loop, and their strengths are
 "just another hyperparameter" to that loop. Pass `strength="auto"`
 (the default) to let REML choose; pass an explicit float to pin.

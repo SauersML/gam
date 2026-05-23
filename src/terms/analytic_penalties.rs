@@ -1,7 +1,7 @@
 //! Analytic penalty primitives for the three-tier (beta / ext-coord / rho) engine.
 //!
 //! See `proposals/composition_engine.md` §3-§4 and `proposals/latent_coord.md`
-//! §2.3 for the motivation. This module implements the three structured
+//! §2.3 for the motivation. This module implements the structured
 //! penalties identified as the minimal identifiability tools needed by an
 //! SAE / principal-manifold / latent-coordinate workflow:
 //!
@@ -26,7 +26,7 @@
 //!     block by penalizing cross-axis correlations. Pair with ARD when
 //!     intrinsic dimension should be identifiable.
 //!
-//! All three are **analytic**: no autograd, no finite differencing. Each
+//! All shipped primitives are **analytic**: no autograd, no finite differencing. Each
 //! exposes:
 //!
 //!   * `value(target, rho) -> f64`
@@ -38,7 +38,7 @@
 //! The signatures are deliberately uniform with the existing smoothness path:
 //! the quadratic ARD penalty produces a [`crate::terms::smooth::BlockwisePenalty`]
 //! that slots directly into the canonical-penalty pipeline, while the
-//! non-quadratic Sparsity and Isometry penalties produce
+//! non-quadratic Sparsity, Orthogonality, and Isometry penalties produce
 //! [`AnalyticPenaltyOp`] handles that downstream PIRLS / REML consumers query
 //! through the same `value / gradient / hvp` interface they already use for
 //! smoothness.
@@ -50,7 +50,8 @@
 //! these onto the existing per-smooth `ρ`s, exactly the way anisotropic
 //! kernel-shape paths append ext-coords. The IsometryPenalty owns one `ρ`; the
 //! SparsityPenalty owns either zero (`ε` fixed) or one (`ε` REML-selected) plus
-//! one strength; the ARDPenalty owns `d` (one per latent axis).
+//! one strength; the ARDPenalty owns `d` (one per latent axis);
+//! Orthogonality owns one strength only when its weight is learnable.
 //!
 //! ## Three-tier landings
 //!
@@ -2555,8 +2556,8 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
     fn diag(&self) -> Array1<f64> {
         // Each diagonal penalty exposes `hessian_diag` directly (ARD,
         // smoothed-L¹, Log; Hoyer currently exposes its preconditioner
-        // diagonal). Dense penalties such as Isometry fall back to probing
-        // matvec on each standard basis vector (O(n²)).
+        // diagonal). Dense penalties such as Isometry and Orthogonality fall
+        // back to probing matvec on each standard basis vector (O(n²)).
         match &self.penalty {
             AnalyticPenaltyKind::Ard(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
@@ -2586,8 +2587,8 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             ));
         }
         // For the diagonal-Hessian penalties (ARD, smoothed-L¹ and Log) the
-        // closed form is `Σ_i log(d_i + λ)`. For the dense Isometry GN form
-        // we fall back to the materialize-and-eigh path on `as_dense`.
+        // closed form is `Σ_i log(d_i + λ)`. For dense analytic forms we
+        // fall back to the materialize-and-eigh path on `as_dense`.
         match &self.penalty {
             AnalyticPenaltyKind::Ard(_)
             | AnalyticPenaltyKind::Sparsity(_)
