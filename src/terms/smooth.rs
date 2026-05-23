@@ -12620,7 +12620,218 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
         .not_penalty_like();
         hyper_dirs.push(dir);
     }
+    let direct_dim = latent_coord_direct_hyper_count(latent.id_mode(), latent.latent_dim());
+    if direct_dim > 0 {
+        let zero_x =
+            crate::estimate::reml::HyperDesignDerivative::from(Array2::<f64>::zeros((
+                design.design.nrows(),
+                p_total,
+            )));
+        for _ in 0..direct_dim {
+            hyper_dirs.push(
+                DirectionalHyperParam::new_compact(zero_x.clone(), Vec::new(), None, None)?
+                    .not_penalty_like(),
+            );
+        }
+    }
     Ok(Some(hyper_dirs))
+}
+
+fn latent_coord_direct_hyper_count(
+    id_mode: &crate::terms::latent_coord::LatentIdMode,
+    latent_dim: usize,
+) -> usize {
+    use crate::terms::latent_coord::{AuxPriorStrength, LatentIdMode};
+    match id_mode {
+        LatentIdMode::AuxPrior { strength, .. } => match strength {
+            AuxPriorStrength::Auto => 1,
+            AuxPriorStrength::Fixed(_) => 0,
+        },
+        LatentIdMode::AuxPriorDimSelection { strength, .. } => {
+            latent_dim
+                + match strength {
+                    AuxPriorStrength::Auto => 1,
+                    AuxPriorStrength::Fixed(_) => 0,
+                }
+        }
+        LatentIdMode::DimSelection { .. } => latent_dim,
+        LatentIdMode::None => 0,
+    }
+}
+
+fn latent_coord_initial_direct_hypers(
+    id_mode: &crate::terms::latent_coord::LatentIdMode,
+    latent_dim: usize,
+) -> Result<Array1<f64>, EstimationError> {
+    use crate::terms::latent_coord::{AuxPriorStrength, LatentIdMode};
+    let mut values = Vec::with_capacity(latent_coord_direct_hyper_count(id_mode, latent_dim));
+    match id_mode {
+        LatentIdMode::AuxPrior { strength, .. } => {
+            if matches!(strength, AuxPriorStrength::Auto) {
+                values.push(0.0);
+            }
+        }
+        LatentIdMode::AuxPriorDimSelection {
+            strength,
+            init_log_precision,
+            ..
+        } => {
+            if matches!(strength, AuxPriorStrength::Auto) {
+                values.push(0.0);
+            }
+            append_latent_ard_seed(&mut values, init_log_precision.as_ref(), latent_dim)?;
+        }
+        LatentIdMode::DimSelection { init_log_precision } => {
+            append_latent_ard_seed(&mut values, init_log_precision.as_ref(), latent_dim)?;
+        }
+        LatentIdMode::None => {}
+    }
+    Ok(Array1::from_vec(values))
+}
+
+fn append_latent_ard_seed(
+    values: &mut Vec<f64>,
+    init: Option<&Array1<f64>>,
+    latent_dim: usize,
+) -> Result<(), EstimationError> {
+    if let Some(init) = init {
+        if init.len() != latent_dim {
+            return Err(EstimationError::InvalidInput(format!(
+                "latent dim_selection init_log_precision length mismatch: got {}, expected {}",
+                init.len(),
+                latent_dim
+            )));
+        }
+        values.extend(init.iter().copied());
+    } else {
+        values.extend(std::iter::repeat(0.0).take(latent_dim));
+    }
+    Ok(())
+}
+
+struct LatentIdObjectiveContribution {
+    cost: f64,
+    gradient: Array1<f64>,
+}
+
+fn latent_id_objective_contribution(
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    latent: &crate::terms::latent_coord::LatentCoordValues,
+) -> Result<LatentIdObjectiveContribution, EstimationError> {
+    use crate::terms::latent_coord::{AuxPriorStrength, LatentIdMode, aux_prior_targets};
+    let n_obs = latent.n_obs();
+    let latent_dim = latent.latent_dim();
+    let flat_len = latent.len();
+    let mut gradient = Array1::<f64>::zeros(theta.len());
+    let t_start = rho_dim;
+    let direct_start = t_start + flat_len;
+    if theta.len() < direct_start {
+        return Err(EstimationError::InvalidInput(format!(
+            "latent-coordinate theta too short for id objective: got {}, need at least {}",
+            theta.len(),
+            direct_start
+        )));
+    }
+    let t = latent.as_matrix();
+    let mut cost = 0.0;
+    let mut cursor = direct_start;
+
+    match latent.id_mode() {
+        LatentIdMode::AuxPrior {
+            u,
+            family,
+            strength,
+        }
+        | LatentIdMode::AuxPriorDimSelection {
+            u,
+            family,
+            strength,
+            ..
+        } => {
+            let (log_mu, mu) = match strength {
+                AuxPriorStrength::Fixed(mu) => (mu.ln(), *mu),
+                AuxPriorStrength::Auto => {
+                    let log_mu = theta[cursor];
+                    cursor += 1;
+                    (log_mu, log_mu.exp())
+                }
+            };
+            let targets = aux_prior_targets(t.view(), u.view(), *family)
+                .map_err(EstimationError::InvalidInput)?;
+            let residual = &t - &targets;
+            let q = residual.iter().map(|v| v * v).sum::<f64>();
+            cost += 0.5 * mu * q - 0.5 * n_obs as f64 * log_mu;
+
+            let projected_residual = aux_prior_targets(residual.view(), u.view(), *family)
+                .map_err(EstimationError::InvalidInput)?;
+            let grad_base = residual - projected_residual;
+            for n in 0..n_obs {
+                for axis in 0..latent_dim {
+                    gradient[t_start + n * latent_dim + axis] += mu * grad_base[[n, axis]];
+                }
+            }
+            if matches!(strength, AuxPriorStrength::Auto) {
+                gradient[direct_start] += 0.5 * mu * q - 0.5 * n_obs as f64;
+            }
+        }
+        LatentIdMode::DimSelection { .. } | LatentIdMode::None => {}
+    }
+
+    match latent.id_mode() {
+        LatentIdMode::AuxPriorDimSelection { .. } | LatentIdMode::DimSelection { .. } => {
+            for axis in 0..latent_dim {
+                let log_alpha = theta[cursor + axis];
+                let alpha = log_alpha.exp();
+                let mut q_axis = 0.0;
+                for n in 0..n_obs {
+                    let flat_idx = n * latent_dim + axis;
+                    let value = latent.as_flat()[flat_idx];
+                    q_axis += value * value;
+                    gradient[t_start + flat_idx] += alpha * value;
+                }
+                cost += 0.5 * alpha * q_axis - 0.5 * n_obs as f64 * log_alpha;
+                gradient[cursor + axis] += 0.5 * alpha * q_axis - 0.5 * n_obs as f64;
+            }
+            cursor += latent_dim;
+        }
+        LatentIdMode::AuxPrior { .. } | LatentIdMode::None => {}
+    }
+
+    if cursor != theta.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "latent-coordinate direct hyperparameter length mismatch: consumed {}, theta len {}",
+            cursor,
+            theta.len()
+        )));
+    }
+    Ok(LatentIdObjectiveContribution { cost, gradient })
+}
+
+fn add_latent_id_objective_to_eval(
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    latent: &crate::terms::latent_coord::LatentCoordValues,
+    eval: &mut (
+        f64,
+        Array1<f64>,
+        crate::solver::outer_strategy::HessianResult,
+    ),
+) -> Result<(), EstimationError> {
+    let contribution = latent_id_objective_contribution(theta, rho_dim, latent)?;
+    eval.0 += contribution.cost;
+    if eval.1.len() != contribution.gradient.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "latent-coordinate REML gradient length mismatch: base={}, id={}",
+            eval.1.len(),
+            contribution.gradient.len()
+        )));
+    }
+    eval.1 += &contribution.gradient;
+    if eval.2.is_analytic() {
+        eval.2 = crate::solver::outer_strategy::HessianResult::Unavailable;
+    }
+    Ok(())
 }
 
 fn spatial_log_kappa_hyper_dirs_frominfo_list(
@@ -13096,19 +13307,25 @@ impl SingleBlockLatentCoordDesignCache {
         {
             return Ok(());
         }
-        let expected = self.rho_dim + self.n_obs * self.latent_dim;
+        let latent_flat_len = self.n_obs * self.latent_dim;
+        let direct_hyper_count =
+            latent_coord_direct_hyper_count(&self.id_mode, self.latent_dim);
+        let expected = self.rho_dim + latent_flat_len + direct_hyper_count;
         if theta.len() != expected {
             return Err(SmoothError::dimension_mismatch(format!(
-                "latent-coordinate theta length mismatch: got {}, expected {} (rho_dim={}, n={}, d={})",
+                "latent-coordinate theta length mismatch: got {}, expected {} (rho_dim={}, n={}, d={}, direct_hypers={})",
                 theta.len(),
                 expected,
                 self.rho_dim,
                 self.n_obs,
-                self.latent_dim
+                self.latent_dim,
+                direct_hyper_count
             ))
             .into());
         }
-        let flat = theta.slice(s![self.rho_dim..]).to_owned();
+        let flat = theta
+            .slice(s![self.rho_dim..self.rho_dim + latent_flat_len])
+            .to_owned();
         let latent = std::sync::Arc::new(
             crate::terms::latent_coord::LatentCoordValues::from_flat_with_manifold(
                 flat,
@@ -16548,20 +16765,28 @@ fn try_exact_joint_latent_coord_optimization(
     };
 
     let rho_dim = best.fit.lambdas.len();
-    let latent_dim = latent.values.len();
-    if latent_dim == 0 {
+    let latent_flat_dim = latent.values.len();
+    if latent_flat_dim == 0 {
         return Err(EstimationError::InvalidInput(
             "latent-coordinate optimization requires a non-empty latent block".to_string(),
         ));
     }
+    let direct_hypers =
+        latent_coord_initial_direct_hypers(latent.values.id_mode(), latent.values.latent_dim())?;
+    let psi_dim = latent_flat_dim + direct_hypers.len();
 
-    let mut theta0 = Array1::<f64>::zeros(rho_dim + latent_dim);
+    let mut theta0 = Array1::<f64>::zeros(rho_dim + psi_dim);
     theta0
         .slice_mut(s![..rho_dim])
         .assign(&best.fit.lambdas.mapv(f64::ln));
     theta0
-        .slice_mut(s![rho_dim..])
+        .slice_mut(s![rho_dim..rho_dim + latent_flat_dim])
         .assign(latent.values.as_flat());
+    if !direct_hypers.is_empty() {
+        theta0
+            .slice_mut(s![rho_dim + latent_flat_dim..])
+            .assign(&direct_hypers);
+    }
 
     let mut lower = Array1::<f64>::from_elem(theta0.len(), -12.0);
     let mut upper = Array1::<f64>::from_elem(theta0.len(), 12.0);
@@ -16571,7 +16796,7 @@ fn try_exact_joint_latent_coord_optimization(
         .iter()
         .fold(1.0_f64, |acc, &v| acc.max(v.abs()))
         + 10.0;
-    for axis in rho_dim..theta0.len() {
+    for axis in rho_dim..rho_dim + latent_flat_dim {
         lower[axis] = -latent_bound;
         upper[axis] = latent_bound;
     }
@@ -16613,7 +16838,7 @@ fn try_exact_joint_latent_coord_optimization(
                 )
             })?;
             let design_revision = Some(self.cache.design_revision());
-            let eval = evaluate_joint_reml_outer_eval_at_theta(
+            let mut eval = evaluate_joint_reml_outer_eval_at_theta(
                 &mut self.evaluator,
                 self.cache.design(),
                 theta,
@@ -16622,11 +16847,11 @@ fn try_exact_joint_latent_coord_optimization(
                 None,
                 order,
                 design_revision,
-            );
-            if let Ok(ref value) = eval {
-                self.cache.store_eval(value.clone());
-            }
-            eval
+            )?;
+            let latent = self.cache.latent().map_err(EstimationError::InvalidInput)?;
+            add_latent_id_objective_to_eval(theta, self.rho_dim, latent.as_ref(), &mut eval)?;
+            self.cache.store_eval(eval.clone());
+            Ok(eval)
         }
 
         fn eval_efs(
@@ -16682,6 +16907,17 @@ fn try_exact_joint_latent_coord_optimization(
             };
             match result {
                 Ok(cost) => {
+                    let latent = match self.cache.latent() {
+                        Ok(latent) => latent,
+                        Err(_) => return f64::INFINITY,
+                    };
+                    let contribution =
+                        match latent_id_objective_contribution(theta, self.rho_dim, latent.as_ref())
+                        {
+                            Ok(contribution) => contribution,
+                            Err(_) => return f64::INFINITY,
+                        };
+                    let cost = cost + contribution.cost;
                     self.cache.store_cost(cost);
                     cost
                 }
@@ -16716,7 +16952,7 @@ fn try_exact_joint_latent_coord_optimization(
         &lower,
         &upper,
         rho_dim,
-        latent_dim,
+        psi_dim,
         theta0.len(),
         Derivative::Analytic,
         DeclaredHessianForm::Unavailable,
@@ -16777,7 +17013,9 @@ fn try_exact_joint_latent_coord_optimization(
     let theta_star = result.rho;
     let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
     let mut final_data = data.to_owned();
-    let flat_t = theta_star.slice(s![rho_dim..]).to_owned();
+    let flat_t = theta_star
+        .slice(s![rho_dim..rho_dim + latent_flat_dim])
+        .to_owned();
     for n in 0..latent.values.n_obs() {
         for axis in 0..latent.values.latent_dim() {
             final_data[[n, latent.feature_cols[axis]]] =
