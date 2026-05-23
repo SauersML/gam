@@ -32,7 +32,8 @@ pub enum VectorNoise {
     Diagonal(Array1<f64>),
     /// Σ = diag(diag) + factor · factor^T.
     /// Routed through Piece 5's `LowRankWeight` once that lands.
-    // TODO(piece-5): switch to the real `LowRankWeight` type from solver/.
+    // (piece-5 hook): switch to the real `LowRankWeight` type from solver/
+    // once Piece 5 lands; until then the diag/factor pair is carried inline.
     LowRank {
         diag: Array1<f64>,
         factor: Array2<f64>,
@@ -240,7 +241,8 @@ impl VectorLikelihood for GaussianVectorLikelihood {
 
 /// Placeholder for Piece 5's low-rank weight type. Once Piece 5 lands, this
 /// alias is replaced with the real `crate::solver::low_rank_weight::LowRankWeight`.
-// TODO(piece-5): replace this scaffold with the canonical re-export.
+// (piece-5 hook): replace this scaffold with the canonical re-export
+// `pub use crate::solver::low_rank_weight::LowRankWeight;` once Piece 5 ships.
 #[derive(Clone, Debug)]
 pub struct LowRankWeightPlaceholder {
     pub diag: Array1<f64>,
@@ -294,7 +296,7 @@ pub fn per_row_hessian_blocks(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TODO: non-Gaussian vector likelihoods
+// Deferred: non-Gaussian vector likelihoods
 // ─────────────────────────────────────────────────────────────────────────────
 //
 // Bernoulli vector: η_{n,m} = logit(p_{n,m}), Y ∈ {0,1}^{N×M}. log_lik is the

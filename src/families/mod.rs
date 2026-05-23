@@ -19,3 +19,9 @@ pub mod survival_location_scale;
 pub mod survival_marginal_slope;
 pub mod survival_predict;
 pub mod transformation_normal;
+pub mod vector_response;
+
+pub use vector_response::{
+    GaussianVectorLikelihood, LowRankWeightPlaceholder, PerRowHessianBlock, VectorLikelihood,
+    VectorNoise, VectorResponseTarget, per_row_hessian_blocks,
+};

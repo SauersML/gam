@@ -1,8 +1,11 @@
 pub mod analytic_penalties;
+pub mod atom_codes;
+pub mod atom_selection;
 pub mod basis;
 pub mod closed_form_operator;
 pub mod construction;
 pub mod hull;
+pub mod input_loc_derivatives;
 pub mod latent_coord;
 pub mod layout;
 pub mod penalty_op;

@@ -10279,6 +10279,220 @@ where
     (p as f64 - tr).clamp(mp, p as f64)
 }
 
+// ---------------------------------------------------------------------------
+// Latent-field hooks. New functions only; existing weighted-LS / Gram
+// code paths are intentionally untouched here (those belong to other
+// pieces). Names are `latent_*`-prefixed per the shared-file convention.
+// ---------------------------------------------------------------------------
+
+/// Apply an IFT-predicted latent shift `Δt` to a
+/// [`crate::terms::latent_coord::LatentCoordValues`] block.
+///
+/// This is the integration point between
+/// [`crate::solver::persistent_warm_start::ift_warm_start_latent`] (which
+/// produces `Δt`) and the latent inner solver (which reads the updated
+/// values on its next assemble call). Lives in `pirls.rs` so it can be
+/// invoked from the existing inner-loop dispatch without a separate
+/// module dependency arrow.
+///
+/// The function clamps the per-row shift magnitude to
+/// `max_row_delta` to guard against IFT extrapolation outside the local
+/// quadratic basin — same role as the
+/// [`crate::solver::reml::runtime::predict_warm_start_beta_ift_with_outcome`]
+/// adaptive Δρ cap, restricted to per-row magnitudes here because the
+/// per-row Hessian condition number can vary across rows even when the
+/// joint condition number is benign.
+///
+/// Returns the number of rows whose shift was clamped (caller can log).
+pub fn latent_apply_ift_warm_start(
+    latent: &mut crate::terms::latent_coord::LatentCoordValues,
+    delta_t: &ndarray::Array1<f64>,
+    max_row_delta: f64,
+) -> usize {
+    let n = latent.n_obs();
+    let d = latent.latent_dim();
+    debug_assert_eq!(delta_t.len(), n * d);
+    let mut clamped_rows = 0_usize;
+    let mut new_flat = latent.as_flat().clone();
+    for i in 0..n {
+        let mut row_norm_sq = 0.0_f64;
+        for a in 0..d {
+            let dv = delta_t[i * d + a];
+            row_norm_sq += dv * dv;
+        }
+        let row_norm = row_norm_sq.sqrt();
+        let scale = if row_norm > max_row_delta && row_norm > 0.0 {
+            clamped_rows += 1;
+            max_row_delta / row_norm
+        } else {
+            1.0
+        };
+        for a in 0..d {
+            new_flat[i * d + a] += scale * delta_t[i * d + a];
+        }
+    }
+    latent.set_flat(new_flat.view());
+    clamped_rows
+}
+
+// ---------------------------------------------------------------------------
+// Piece 5: structured low-rank weight in the inner solve.
+//
+// External Fisher-Rao / behavioral metrics arrive shaped as `W = D + U Vᵀ`
+// with `U, V` tall-skinny (rank r ≪ n). These siblings to the diagonal-W
+// PIRLS kernels add the rank-r correction without touching the existing
+// `compute_xtwx_blas` / `penalized_hessian` call sites used by Piece 1's
+// Newton-direction hooks. The metric is supplied by the caller; this
+// module never estimates a covariance internally.
+//
+// Composition with the existing signed-Gram API:
+// - The diagonal part flows through `xt_diag_x_signed` / `xt_diag_x_psd`
+//   exactly as before. When `LowRankWeight::is_rank_zero()` the path is
+//   bit-identical to the legacy diagonal flow.
+// - The low-rank correction is `(XᵀU)(VᵀX)`, a `p × p` outer product of
+//   tall-skinny projections — dimension `p × p`, never `n × n`.
+// - Cholesky-friendly factorisation uses the parameter-space Woodbury
+//   identity: factor `A = XᵀDX + S` once (the existing dense / sparse
+//   path), then solve the small `r × r` capacitance system.
+// ---------------------------------------------------------------------------
+
+use crate::linalg::low_rank_weight::LowRankWeight;
+
+/// `Xᵀ W X` for a low-rank-corrected weight, where the diagonal part is
+/// assembled by the **existing** signed-Gram kernels and the rank-r
+/// correction is added in place via [`LowRankWeight::add_low_rank_xtwx_correction`].
+///
+/// This is the new sibling of `GamWorkingModel::compute_xtwx_blas`; it is
+/// a free function (not a method on `GamWorkingModel`) so it can be reused
+/// for backward passes through downstream models without holding a borrow
+/// on a working-model instance.
+///
+/// Rank-0 fast path: returns the legacy diagonal-W Gram unchanged.
+pub fn compute_xtwx_low_rank(
+    workspace: &mut PirlsWorkspace,
+    design: &DesignMatrix,
+    weight: &LowRankWeight<'_>,
+) -> Result<Array2<f64>, EstimationError> {
+    // Diagonal part: reuse the diagonal-W BLAS / sparse path verbatim.
+    let diag_owned = weight.diag.to_owned();
+    let mut xtwx = GamWorkingModel::compute_xtwx_blas(workspace, design, &diag_owned)?;
+    if weight.is_rank_zero() {
+        return Ok(xtwx);
+    }
+    weight
+        .add_low_rank_xtwx_correction(design, &mut xtwx)
+        .map_err(EstimationError::InvalidInput)?;
+    Ok(xtwx)
+}
+
+/// `Xᵀ W y` for a low-rank-corrected weight. Used in the right-hand side
+/// of the weighted-LS normal equation `(XᵀWX + S) β = XᵀWz`. Rank-0 fast
+/// path coincides with `design.compute_xtwy(&d, &y)`.
+pub fn compute_xtwy_low_rank(
+    design: &DesignMatrix,
+    weight: &LowRankWeight<'_>,
+    y: &Array1<f64>,
+) -> Result<Array1<f64>, EstimationError> {
+    weight
+        .xtw_y(design, y.view())
+        .map_err(EstimationError::InvalidInput)
+}
+
+/// Build the small `r × r` capacitance for the parameter-space Woodbury
+/// solve `(A + Û V̂ᵀ)⁻¹ b`, where `A = XᵀDX + S` has already been factored
+/// by the caller and `a_inv_uhat = A⁻¹ Û` came out of `r` back-solves
+/// against that factor. The returned matrix is `I_r + V̂ᵀ A⁻¹ Û`, the
+/// system the caller inverts (Cholesky for symmetric metrics, dense LU
+/// otherwise) to apply the low-rank correction to the Newton direction.
+pub fn woodbury_gram_capacitance(
+    a_inv_uhat: &Array2<f64>,
+    vhat: &Array2<f64>,
+) -> Result<Array2<f64>, EstimationError> {
+    LowRankWeight::gram_capacitance(a_inv_uhat, vhat).map_err(EstimationError::InvalidInput)
+}
+
+#[cfg(test)]
+mod low_rank_weight_pirls_tests {
+    use super::{
+        DesignMatrix, LowRankWeight, PirlsWorkspace, compute_xtwx_low_rank, compute_xtwy_low_rank,
+        woodbury_gram_capacitance,
+    };
+    use ndarray::{Array1, Array2, array};
+
+    fn tiny_design() -> DesignMatrix {
+        let x = array![
+            [1.0, 0.5, -0.2],
+            [0.3, 1.2, 0.4],
+            [-0.1, 0.7, 1.0],
+            [0.6, -0.3, 0.8],
+            [0.2, 0.9, -0.5],
+        ];
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x))
+    }
+
+    #[test]
+    fn xtwx_low_rank_matches_diagonal_when_rank_zero() {
+        let design = tiny_design();
+        let d = array![1.0, 2.0, 0.5, 1.5, 0.8];
+        let u = Array2::<f64>::zeros((5, 0));
+        let v = Array2::<f64>::zeros((5, 0));
+        let weight = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
+        let mut ws = PirlsWorkspace::new(5, 3, 0, 0);
+        let got = compute_xtwx_low_rank(&mut ws, &design, &weight).unwrap();
+        let want = design.compute_xtwx(&d).unwrap();
+        let diff = (&got - &want).mapv(f64::abs).sum();
+        assert!(diff < 1e-12, "rank-0 path diverged from diagonal: {}", diff);
+    }
+
+    #[test]
+    fn xtwy_low_rank_matches_dense_reference() {
+        let design = tiny_design();
+        let d = array![1.0, 2.0, 0.5, 1.5, 0.8];
+        let u = array![[0.1, -0.2], [0.4, 0.3], [-0.1, 0.5], [0.2, 0.1], [0.0, -0.3]];
+        let v = array![[0.2, 0.1], [0.0, 0.4], [0.3, -0.2], [-0.1, 0.6], [0.5, 0.0]];
+        let weight = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
+        let y = array![0.7, -1.2, 0.3, 0.9, -0.4];
+        let got = compute_xtwy_low_rank(&design, &weight, &y).unwrap();
+
+        let xdense = design.as_dense().unwrap().to_owned();
+        let mut w = Array2::<f64>::zeros((5, 5));
+        for i in 0..5 {
+            w[[i, i]] = d[i];
+        }
+        w = w + &u.dot(&v.t());
+        let want = xdense.t().dot(&w.dot(&y));
+        let diff: f64 = got
+            .iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(diff < 1e-10, "xtwy_low_rank diverged: {}", diff);
+    }
+
+    #[test]
+    fn woodbury_capacitance_is_well_formed() {
+        let uhat = array![[0.5, 0.1], [-0.2, 0.7], [0.3, -0.4]];
+        let vhat = array![[0.1, 0.2], [0.6, -0.1], [-0.3, 0.4]];
+        let cap = woodbury_gram_capacitance(&uhat, &vhat).unwrap();
+        let want = {
+            let mut m = vhat.t().dot(&uhat);
+            for k in 0..2 {
+                m[[k, k]] += 1.0;
+            }
+            m
+        };
+        let diff: f64 = cap
+            .iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(diff < 1e-12);
+    }
+
+    #[allow(dead_code)]
+    fn _shape_only(_: &Array1<f64>, _: &Array2<f64>) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
