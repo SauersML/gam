@@ -36,6 +36,103 @@ use crate::terms::analytic_penalties::{
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode};
 
+/// Decay law for deterministic Gumbel/concrete assignment temperature.
+#[derive(Debug, Clone)]
+pub enum ScheduleKind {
+    Geometric { rate: f64 },
+    Linear { steps: usize },
+    ReciprocalIter,
+}
+
+/// Outer-state temperature annealing for SAE assignment relaxations.
+///
+/// Annealing drives the continuous concrete/softmax assignment toward the
+/// discrete argmax or IBP active-set solution while PIRLS keeps solving smooth
+/// subproblems at each positive temperature. Once `tau` reaches its floor, the
+/// remaining iterations optimize the corresponding near-discrete MAP problem.
+#[derive(Debug, Clone)]
+pub struct GumbelTemperatureSchedule {
+    pub tau_start: f64,
+    pub tau_min: f64,
+    pub decay: ScheduleKind,
+    pub iter_count: usize,
+}
+
+impl GumbelTemperatureSchedule {
+    #[must_use = "build error must be handled"]
+    pub fn new(tau_start: f64, tau_min: f64, decay: ScheduleKind) -> Result<Self, String> {
+        let sched = Self {
+            tau_start,
+            tau_min,
+            decay,
+            iter_count: 0,
+        };
+        sched.validate()?;
+        Ok(sched)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.tau_start.is_finite() && self.tau_start > 0.0) {
+            return Err(format!(
+                "GumbelTemperatureSchedule: tau_start must be finite and positive; got {}",
+                self.tau_start
+            ));
+        }
+        if !(self.tau_min.is_finite() && self.tau_min > 0.0) {
+            return Err(format!(
+                "GumbelTemperatureSchedule: tau_min must be finite and positive; got {}",
+                self.tau_min
+            ));
+        }
+        if self.tau_min > self.tau_start {
+            return Err(format!(
+                "GumbelTemperatureSchedule: tau_min ({}) cannot exceed tau_start ({})",
+                self.tau_min, self.tau_start
+            ));
+        }
+        match self.decay {
+            ScheduleKind::Geometric { rate } => {
+                if !(rate.is_finite() && rate > 0.0 && rate < 1.0) {
+                    return Err(format!(
+                        "GumbelTemperatureSchedule::Geometric: rate must be in (0, 1); got {rate}"
+                    ));
+                }
+            }
+            ScheduleKind::Linear { steps } => {
+                if steps == 0 {
+                    return Err(
+                        "GumbelTemperatureSchedule::Linear: steps must be positive".into(),
+                    );
+                }
+            }
+            ScheduleKind::ReciprocalIter => {}
+        }
+        Ok(())
+    }
+
+    pub fn current_tau(&self, iter: usize) -> f64 {
+        let raw = match self.decay {
+            ScheduleKind::Geometric { rate } => self.tau_start * rate.powf(iter as f64),
+            ScheduleKind::Linear { steps } => {
+                if iter >= steps {
+                    self.tau_min
+                } else {
+                    let frac = iter as f64 / steps as f64;
+                    self.tau_start + frac * (self.tau_min - self.tau_start)
+                }
+            }
+            ScheduleKind::ReciprocalIter => self.tau_start / (1.0 + iter as f64),
+        };
+        raw.max(self.tau_min)
+    }
+
+    pub fn step(&mut self) -> f64 {
+        let tau = self.current_tau(self.iter_count);
+        self.iter_count += 1;
+        tau
+    }
+}
+
 /// Basis/topology tag for one SAE manifold atom.
 ///
 /// The evaluated basis and input-location jet live on [`SaeManifoldAtom`].
@@ -198,6 +295,21 @@ impl AssignmentMode {
             AssignmentMode::Softmax { temperature, .. }
             | AssignmentMode::IBPMap { temperature, .. } => temperature,
         }
+    }
+
+    fn set_temperature(&mut self, new_temperature: f64) -> Result<(), String> {
+        if !(new_temperature.is_finite() && new_temperature > 0.0) {
+            return Err(format!(
+                "AssignmentMode: temperature must be finite and positive; got {new_temperature}"
+            ));
+        }
+        match self {
+            AssignmentMode::Softmax { temperature, .. }
+            | AssignmentMode::IBPMap { temperature, .. } => {
+                *temperature = new_temperature;
+            }
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -434,6 +546,7 @@ impl SaeManifoldLoss {
 pub struct SaeManifoldTerm {
     pub atoms: Vec<SaeManifoldAtom>,
     pub assignment: SaeAssignment,
+    temperature_schedule: Option<GumbelTemperatureSchedule>,
 }
 
 impl SaeManifoldTerm {
@@ -473,7 +586,37 @@ impl SaeManifoldTerm {
                 ));
             }
         }
-        Ok(Self { atoms, assignment })
+        Ok(Self {
+            atoms,
+            assignment,
+            temperature_schedule: None,
+        })
+    }
+
+    pub fn set_temperature_schedule(
+        &mut self,
+        sched: GumbelTemperatureSchedule,
+    ) -> Result<(), String> {
+        sched.validate()?;
+        self.assignment
+            .mode
+            .set_temperature(sched.current_tau(sched.iter_count))?;
+        self.temperature_schedule = Some(sched);
+        Ok(())
+    }
+
+    pub fn clear_temperature_schedule(&mut self) {
+        self.temperature_schedule = None;
+    }
+
+    pub fn advance_temperature_schedule(&mut self) -> Result<Option<f64>, String> {
+        let Some(schedule) = self.temperature_schedule.as_mut() else {
+            return Ok(None);
+        };
+        schedule.validate()?;
+        let tau = schedule.step();
+        self.assignment.mode.set_temperature(tau)?;
+        Ok(Some(tau))
     }
 
     pub fn n_obs(&self) -> usize {
@@ -676,7 +819,7 @@ impl SaeManifoldTerm {
         let beta_offsets = self.beta_offsets();
         let coord_offsets = self.assignment.coord_offsets();
         let lambda_smooth = rho.lambda_smooth();
-        let (assignment_grad, assignment_hdiag) = assignment_prior_grad_hdiag(&self.assignment, rho);
+        let (assignment_grad, assignment_hdiag) = assignment_prior_grad_hdiag(&self.assignment, rho)?;
         let mut sys = ArrowSchurSystem::new(n, q, beta_dim);
 
         // Decoder smoothness penalty in the beta block.
@@ -926,6 +1069,7 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
     ) -> Result<SaeManifoldLoss, String> {
         for _ in 0..max_iter {
+            self.advance_temperature_schedule()?;
             let (delta_ext_coord, delta_beta) = self
                 .solve_newton_step(target, rho, ridge_ext_coord, ridge_beta)
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
@@ -1047,7 +1191,7 @@ fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f
 fn assignment_prior_grad_hdiag(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
-) -> (Array1<f64>, Array1<f64>) {
+) -> Result<(Array1<f64>, Array1<f64>), String> {
     let target = flat_logits(assignment.logits.view());
     match assignment.mode {
         AssignmentMode::Softmax {
@@ -1059,8 +1203,8 @@ fn assignment_prior_grad_hdiag(
             let grad = penalty.grad_target(target.view(), rho_view.view());
             let diag = penalty
                 .hessian_diag(target.view(), rho_view.view())
-                .expect("softmax assignment hessian diag");
-            (grad, diag)
+                .ok_or_else(|| "softmax assignment hessian diag unavailable".to_string())?;
+            Ok((grad, diag))
         }
         AssignmentMode::IBPMap {
             temperature,
@@ -1077,8 +1221,8 @@ fn assignment_prior_grad_hdiag(
             let grad = penalty.grad_target(target.view(), rho_view.view());
             let diag = penalty
                 .hessian_diag(target.view(), rho_view.view())
-                .expect("IBP assignment hessian diag");
-            (grad, diag)
+                .ok_or_else(|| "IBP assignment hessian diag unavailable".to_string())?;
+            Ok((grad, diag))
         }
     }
 }
