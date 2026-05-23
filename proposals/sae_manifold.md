@@ -23,7 +23,8 @@ The three-tier reading of gamfit is laid out in `composition_engine.md`:
   Newton inner solver (`src/solver/pirls.rs`).
 - **ψ / ext-coords** — kernel-shape `ψ` plus any design-moving external
   coordinates transported through the inner solution by the implicit
-  function theorem (`HyperDesignDerivative`, `src/solver/reml/mod.rs:2653`).
+  function theorem (`HyperDesignDerivative`, `src/solver/reml/mod.rs:2687`;
+  `from_implicit`, `src/solver/reml/mod.rs:2706`).
   Per-row latents are written `t`, not `ψ`.
 - **ρ** — penalty / hyperparameter scalings, selected by the marginal
   likelihood in the REML outer loop (`src/solver/reml/runtime.rs`).
@@ -44,8 +45,8 @@ shard count — see §5.3 and the math-audit caveats).
 
 | Method | β | ψ | ρ | Identifiability priors |
 |---|---|---|---|---|
-| GAM | smooth coefficients | (none) | smoothness | Duchon `S(ρ)` penalty (`gamfit/smooth.py:79`) |
-| Anisotropic-Matern fit | smooth coefficients | log length-scales (`SpatialLogKappaCoords`, `src/terms/smooth.rs:1765`) | smoothness + per-axis length | smoothness + Matern hyperprior |
+| GAM | smooth coefficients | (none) | smoothness | Duchon `S(ρ)` penalty (`gamfit/smooth.py:80`) |
+| Anisotropic-Matern fit | smooth coefficients | log length-scales (`SpatialLogKappaCoords`, `src/terms/smooth.rs:1774`) | smoothness + per-axis length | smoothness + Matern hyperprior |
 | Manifold / GP-LVM | decoder coefficients | per-row latent `t_i` (`LatentCoord`, `latent_coord.md` §3) | smoothness + ARD + topology | isometry / ARD / smoothness / topology-via-basis |
 | **Linear SAE** | dictionary `D` + codes `a_i` | (none) | sparsity strength `λ_sp` + dict size `K` | L¹-like on `a_i` (active-set, `src/solver/active_set.rs`); Occam on `K` via REML / `compare_models` |
 | **SAE-manifold** | per-atom decoder coeffs `B_k` | soft assignment `a_i` + on-atom coord `t_ik` (`LatentCoord` × K atoms) | sparsity + per-atom dim + smoothness | sparsity on `a_i`; ARD per `t_ik` axis; smoothness on each `B_k` |
@@ -123,7 +124,7 @@ The full penalised-likelihood objective is
 `Pen_sparse` is the existing active-set L¹ (`src/solver/active_set.rs`)
 on the non-negative orthant; `P_k` is the same Duchon-style
 function-norm penalty already used by every smooth (`Duchon` doc at
-`gamfit/smooth.py:79`); the ARD term is the `dim_selection=True`
+`gamfit/smooth.py:80`); the ARD term is the `dim_selection=True`
 construction from `latent_coord.md` §2.3(c) replicated per atom.
 
 ### 3.3 Tier assignment of the gradient
@@ -136,8 +137,10 @@ All gradients are analytic and reuse existing machinery:
   atom `k`'s decoded value at `t_ik`. This is row-local in `i`,
   exactly the `LatentCoord` row-local structure.
 - `∂ℒ/∂t_ik` = `−a_ik · (Z_i − Ẑ_i)' (∂Φ_k/∂t · B_k)`; the
-  `∂Φ_k/∂t` factor is the radial-kernel chain rule already supplied
-  by `ImplicitDesignPsiDerivative` (`src/terms/basis.rs:3948`).
+  `∂Φ_k/∂t` factor is the radial-kernel chain rule now supplied
+  by `LatentCoordDesignDerivative` (`src/terms/basis.rs:4118`) via
+  `LatentCoordValues::design_gradient_wrt_t_dispatch`
+  (`src/terms/latent_coord.rs:825`).
 - `∂ℒ/∂ρ` is the standard REML gradient with the additional
   ARD-per-axis terms; the implicit-function-theorem propagation
   through the inner solution is the existing
@@ -229,7 +232,7 @@ The composition is mechanical:
 - **β extends penalised-LS.** A multi-atom decoder is a multi-output
   smooth on a block-diagonal design `diag(Φ_1, …, Φ_K)` weighted
   per-row by `a_ik`. The `by`-multiplier path on `Smooth`
-  (`gamfit/smooth.py:73`) already accepts per-row multipliers on a
+  (`gamfit/smooth.py:74`) already accepts per-row multipliers on a
   smooth's contribution. The new content is making `by` be one of the
   design-moving ext-coordinate blocks rather than a frozen observed column.
 
@@ -240,7 +243,9 @@ The composition is mechanical:
   has two named sub-blocks (`a` of shape `(N, K)`, `t` of shape
   `(N, K, d_k)`), both flowing through the same
   `HyperDesignDerivative` plumbing. The `is_penalty_like = false`
-  semantics (`src/solver/reml/mod.rs:2704`) already isolate the
+  semantics (`src/solver/reml/mod.rs:3277-3284`, backed by
+  `HyperDesignDerivative::any_nonzero` at `src/solver/reml/mod.rs:2780`)
+  already isolate the
   design-moving case correctly.
 
 - **ρ is the existing REML outer loop plus discrete K.** Continuous
@@ -344,8 +349,8 @@ manual Curve-SAE benchmark left to grid search.
 
 The user-facing entry point is a thin wrapper that constructs the
 right `LatentCoord` blocks and pipes them into `gamfit.fit`. Style
-matches the existing `gamfit.fit` (`gamfit/_api.py:604`) and the
-`Smooth` hierarchy at `gamfit/smooth.py:33`.
+matches the existing `gamfit.fit` (`gamfit/_api.py:652`) and the
+`Smooth` hierarchy at `gamfit/smooth.py:34`.
 
 ```python
 import gamfit
@@ -419,19 +424,24 @@ Already in flight or shipping:
   enforces non-negativity and sparsity on `a`.
 - **`HyperDesignDerivative` / `evaluate_unified_with_psi_ext`** —
   propagates IFT through design-moving ext-coordinates.
-- **`by`-multiplier on `Smooth`** (`gamfit/smooth.py:73`) — the
+- **`by`-multiplier on `Smooth`** (`gamfit/smooth.py:74`) — the
   multiplicative gate for `a` × decoder.
 - **Topology wrappers** — `Duchon`, `Sphere`,
-  `PeriodicSplineCurve`, `TensorBSpline` (`gamfit/smooth.py:79+`).
+  `PeriodicSplineCurve`, `TensorBSpline` (`gamfit/smooth.py:80`,
+  `gamfit/smooth.py:186`, `gamfit/smooth.py:210`, `gamfit/smooth.py:149`).
 - **`LatentCoord` proposal** (`latent_coord.md`) — the per-row
   latent field; the spec used here.
-- **Penalty library (in flight by parallel agent)** — isometry,
-  sparsity, ARD-per-axis. The SAE-manifold work consumes these as
-  black-box primitives, no implementation work duplicated here.
+- **Penalty library** — isometry, sparsity, ARD-per-axis now live in
+  `src/terms/analytic_penalties.rs` (`IsometryPenalty` at
+  `src/terms/analytic_penalties.rs:353`, `SparsityPenalty` at
+  `src/terms/analytic_penalties.rs:1141`, `ARDPenalty` at
+  `src/terms/analytic_penalties.rs:1844`). The SAE-manifold work consumes
+  these as black-box primitives, no implementation work duplicated here.
 - **Geodesic-acceleration Newton patch** (`composition_engine.md`
-  §4(e)) — the nonlinear-residual problem of SAE-manifold is
-  exactly the regime where this matters; default it on for this
-  configuration.
+  §4(e)) — implemented behind `WorkingModelPirlsOptions::geodesic_acceleration`
+  (`src/solver/pirls.rs:1289`) with the dense correction block at
+  `src/solver/pirls.rs:5086-5153`; the nonlinear-residual problem of
+  SAE-manifold is exactly the regime where this matters.
 
 What remains, specific to SAE-manifold:
 
