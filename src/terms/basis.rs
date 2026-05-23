@@ -20197,6 +20197,9 @@ pub fn bspline_tensor_first_derivative(
         k_per_axis.iter().map(|&k| vec![0.0; k]).collect();
     let mut derivs_per_axis: Vec<Vec<f64>> =
         k_per_axis.iter().map(|&k| vec![0.0; k]).collect();
+    let mut idx = vec![0usize; n_axes];
+    let mut prefix = vec![1.0; n_axes + 1];
+    let mut suffix = vec![1.0; n_axes + 1];
     for n in 0..n_rows {
         // Evaluate B^{(a)} and (B^{(a)})' at t_{n, a} for each axis.
         for a in 0..n_axes {
@@ -20217,7 +20220,6 @@ pub fn bspline_tensor_first_derivative(
         }
         // Enumerate tensor product in row-major order matching
         // `j = j_0 * (K_1 K_2 … K_{n_axes-1}) + j_1 * (K_2 … K_{n_axes-1}) + … + j_{n_axes-1}`.
-        let mut idx = vec![0usize; n_axes];
         for k in 0..total {
             // Reconstruct multi-index `idx` from flat `k`.
             let mut rem = k;
@@ -20225,17 +20227,21 @@ pub fn bspline_tensor_first_derivative(
                 idx[a] = rem % k_per_axis[a];
                 rem /= k_per_axis[a];
             }
+
+            prefix[0] = 1.0;
+            for a in 0..n_axes {
+                prefix[a + 1] = prefix[a] * values_per_axis[a][idx[a]];
+            }
+            suffix[n_axes] = 1.0;
+            for a in (0..n_axes).rev() {
+                suffix[a] = suffix[a + 1] * values_per_axis[a][idx[a]];
+            }
+
             // For each output axis, derivative of axis-`axis` factor times
             // values of the others.
             for axis in 0..n_axes {
-                let mut prod = derivs_per_axis[axis][idx[axis]];
-                for a in 0..n_axes {
-                    if a == axis {
-                        continue;
-                    }
-                    prod *= values_per_axis[a][idx[a]];
-                }
-                out[[n, k, axis]] = prod;
+                let leave_one_out = prefix[axis] * suffix[axis + 1];
+                out[[n, k, axis]] = derivs_per_axis[axis][idx[axis]] * leave_one_out;
             }
         }
     }

@@ -31,6 +31,19 @@ Related design notes:
 
 - [`proposals/latent_coord.md`](https://github.com/SauersML/gam/blob/main/proposals/latent_coord.md)
 - [`proposals/sae_manifold.md`](https://github.com/SauersML/gam/blob/main/proposals/sae_manifold.md)
+- [`proposals/per_point_hessian.md`](https://github.com/SauersML/gam/blob/main/proposals/per_point_hessian.md)
+- [`proposals/arrow_schur_evidence.md`](https://github.com/SauersML/gam/blob/main/proposals/arrow_schur_evidence.md)
+- [`proposals/riemannian_per_point.md`](https://github.com/SauersML/gam/blob/main/proposals/riemannian_per_point.md)
+
+## Analytic Primitives
+
+| Name | Target | Math form | Role | One-line motivation |
+| --- | --- | --- | --- | --- |
+| `IsometryPenalty` | Decoder pullback metric over latent `t` | `½ w ‖g(t) - g_ref(t)‖²_F` | Gauge fix | Pins the latent chart to a reference geometry so IFT sees an isolated optimum. |
+| `ARDPenalty` | Latent axes `t_{.,k}` | `½ Σ_k α_k ‖t_{.,k}‖²` plus REML normalizers | Dimension selection | Prunes axes only after another prior fixes the coordinate gauge. |
+| `SparsityPenalty` | Code, assignment, or decoder block | `λ Σ_j sqrt(x_j² + ε²)` | Mechanism sparsity | Encourages small active sets for SAE-style codes and block mechanisms. |
+| `OrthogonalityPenalty` | Latent coordinate matrix `T` | `½ w ‖T^T T - I‖²_F` | Gauge fix paired with ARD | Fixes rotation and scale so ARD can make axis-wise pruning identifiable. |
+| `TotalVariationPenalty` | `ForwardDiff1D` or `GraphEdges` differences of a latent block | `λ Σ_e sqrt(‖D_e x‖² + ε²)` | Piecewise structure | Promotes piecewise-constant atom maps over sequences or arbitrary adjacency graphs. |
 
 ## Minimal Configurations
 
@@ -98,6 +111,14 @@ penalties = [
 `src/terms/sae_manifold.rs` now names the first-class Rust term shape for the
 joint Arrow-Schur row-block assembly.
 
+## Sparsity / Piecewise Structure
+
+`SparsityPenalty` handles sparse amplitudes and assignment blocks.
+`TotalVariationPenalty` adds smoothed-L1 structure on atom maps: use
+`ForwardDiff1D` for ordered sequences and `GraphEdges` for arbitrary adjacency.
+Both variants expose analytic HVPs; large graph log-determinants use the shared
+Hutchinson / SLQ helper through the analytic-penalty operator path.
+
 ## Identifiability Rules
 
 Bare `LatentCoord` is gauge-unfixed: a smooth reparameterization of `t` can be
@@ -109,6 +130,11 @@ absorbed by refitting β. Use at least one gauge-breaking prior:
 
 `ARDPenalty` / `dim_selection=True` is a companion, not a gauge fix. It prunes
 axes only after an aux prior or isometry has pinned the coordinate system.
+The `auto_exp_21` finding showed the failure mode directly: ARD alone stayed
+rotation-invariant and kept all tested auxiliary dimensions. The established
+axis-selection composition is `OrthogonalityPenalty` plus `ARDPenalty`, as in
+`examples/orthogonality_plus_ard_demo.py`, because orthogonality fixes the
+rotation/scale gauge before ARD applies axis-wise evidence pressure.
 
 The arrow-Schur latent Hessian is cheap at the cost level, not because every
 REML derivative is independent. The outer Occam gradient uses one shared
