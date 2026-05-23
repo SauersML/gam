@@ -5811,3 +5811,80 @@ exec
 4204
     }
 
+exec
+/bin/zsh -lc "sed -n '281,287{=;p;}' src/terms/input_loc_derivatives.rs" in /Users/user/gam
+ succeeded in 0ms:
+281
+            let (_, q, s) = kind.eval_design_triplet(r)?;
+282
+            for a in 0..d {
+283
+                for b in 0..d {
+284
+                    let kron = if a == b { 1.0 } else { 0.0 };
+285
+                    out[[n, k, a * d + b]] = q * kron + s * delta[a] * delta[b];
+286
+                }
+287
+            }
+
+codex
+Source-only audit completed. I found no definitive issue in `src/terms/closed_form_operator.rs` for the requested radial input-derivative scope.
+
+**FINDINGS**
+
+1. `src/terms/basis.rs:8543`  
+   Wrong expression: `return Ok((phi, 0.0, 0.0, 0.0, 0.0));` for Matérn `ν=1/2` at `r=0`.  
+   Correct: this derivative is undefined, not zero. For `φ(r)=exp(-s r)`, `∇_t φ = -s exp(-s r) (t-c)/r`, whose limit depends on approach direction as `r -> 0`; `q=φ'/r=-s exp(-sr)/r` diverges. Callers at `src/terms/input_loc_derivatives.rs:207`, `:281`, `:495`, and `:566` therefore silently emit zero gradients/Hessians for an actually non-differentiable collision.  
+   Severity: definitive.
+
+2. `src/terms/basis.rs:3681`  
+   Wrong expression: `return Ok((phi, 0.0, 0.0));` for `RadialScalarKind::PureDuchon` at collision.  
+   Correct: use the analytic polyharmonic radial scalars when finite, and error when not finite. For `φ(r)=c r^α log r` with `α=2m-d` in the log case, `q=φ'/r=c r^{α-2}(α log r+1)`. Example: `m=2,d=2` gives `φ=c r² log r`, so `q=c(2 log r+1) -> -∞`; the Hessian formula at `src/terms/input_loc_derivatives.rs:285` includes `q δ_ab`, so zero is mathematically wrong. For odd cases such as `m=2,d=3`, `φ=c r`, and the first derivative is direction-dependent at `r=0`.  
+   Severity: definitive.
+
+3. `src/terms/basis.rs:3691-3693`  
+   Wrong expression: `return Ok((phi, 0.0, 0.0));` for `RadialScalarKind::ThinPlate` at collision.  
+   Correct: only the 1-D `φ=(r/ℓ)^3` case has zero Hessian limit. In 2-D, `φ=(r/ℓ)^2 log(r/ℓ)`, so `q=(2 log(r/ℓ)+1)/ℓ² -> -∞` and the Hessian diverges through the `q δ_ab` term. In 3-D, `φ=-r/ℓ`, so `∇φ=-(t-c)/(ℓ r)` has no unique collision limit. Returning zero masks non-existent derivatives.  
+   Severity: definitive.
+
+4. `src/terms/basis.rs:4200`  
+   Wrong expression: `return Ok(0.0);` in `kernel_axis_scalar` for `r == 0`.  
+   Correct: `∂Φ/∂t_axis = q(r)(t-c)_axis` may be zero only when the radial gradient has a finite zero collision limit. For cusp kernels such as Matérn `ν=1/2`, thin-plate `d=3`, or pure polyharmonic `φ=c r`, the directional derivative at the center is undefined, so this path should not return a finite zero.  
+   Severity: definitive.
+
+5. `src/terms/input_loc_derivatives.rs:493-496`  
+   Wrong expression: `let signed = wrap_signed_displacement(raw, period); ... out[[n, k]] = q * signed;` with no branch-cut guard.  
+   Correct: at `raw = (m + 1/2) period`, the principal wrapped displacement jumps between `+period/2` and `-period/2`; the wrap map is discontinuous there, so `∂φ(|wrap(t-c)|)/∂t` is not defined unless a deliberate subgradient convention is specified. Away from that seam, `q * signed` is correct.  
+   Severity: definitive.
+tokens used
+113,565
+Source-only audit completed. I found no definitive issue in `src/terms/closed_form_operator.rs` for the requested radial input-derivative scope.
+
+**FINDINGS**
+
+1. `src/terms/basis.rs:8543`  
+   Wrong expression: `return Ok((phi, 0.0, 0.0, 0.0, 0.0));` for Matérn `ν=1/2` at `r=0`.  
+   Correct: this derivative is undefined, not zero. For `φ(r)=exp(-s r)`, `∇_t φ = -s exp(-s r) (t-c)/r`, whose limit depends on approach direction as `r -> 0`; `q=φ'/r=-s exp(-sr)/r` diverges. Callers at `src/terms/input_loc_derivatives.rs:207`, `:281`, `:495`, and `:566` therefore silently emit zero gradients/Hessians for an actually non-differentiable collision.  
+   Severity: definitive.
+
+2. `src/terms/basis.rs:3681`  
+   Wrong expression: `return Ok((phi, 0.0, 0.0));` for `RadialScalarKind::PureDuchon` at collision.  
+   Correct: use the analytic polyharmonic radial scalars when finite, and error when not finite. For `φ(r)=c r^α log r` with `α=2m-d` in the log case, `q=φ'/r=c r^{α-2}(α log r+1)`. Example: `m=2,d=2` gives `φ=c r² log r`, so `q=c(2 log r+1) -> -∞`; the Hessian formula at `src/terms/input_loc_derivatives.rs:285` includes `q δ_ab`, so zero is mathematically wrong. For odd cases such as `m=2,d=3`, `φ=c r`, and the first derivative is direction-dependent at `r=0`.  
+   Severity: definitive.
+
+3. `src/terms/basis.rs:3691-3693`  
+   Wrong expression: `return Ok((phi, 0.0, 0.0));` for `RadialScalarKind::ThinPlate` at collision.  
+   Correct: only the 1-D `φ=(r/ℓ)^3` case has zero Hessian limit. In 2-D, `φ=(r/ℓ)^2 log(r/ℓ)`, so `q=(2 log(r/ℓ)+1)/ℓ² -> -∞` and the Hessian diverges through the `q δ_ab` term. In 3-D, `φ=-r/ℓ`, so `∇φ=-(t-c)/(ℓ r)` has no unique collision limit. Returning zero masks non-existent derivatives.  
+   Severity: definitive.
+
+4. `src/terms/basis.rs:4200`  
+   Wrong expression: `return Ok(0.0);` in `kernel_axis_scalar` for `r == 0`.  
+   Correct: `∂Φ/∂t_axis = q(r)(t-c)_axis` may be zero only when the radial gradient has a finite zero collision limit. For cusp kernels such as Matérn `ν=1/2`, thin-plate `d=3`, or pure polyharmonic `φ=c r`, the directional derivative at the center is undefined, so this path should not return a finite zero.  
+   Severity: definitive.
+
+5. `src/terms/input_loc_derivatives.rs:493-496`  
+   Wrong expression: `let signed = wrap_signed_displacement(raw, period); ... out[[n, k]] = q * signed;` with no branch-cut guard.  
+   Correct: at `raw = (m + 1/2) period`, the principal wrapped displacement jumps between `+period/2` and `-period/2`; the wrap map is discontinuous there, so `∂φ(|wrap(t-c)|)/∂t` is not defined unless a deliberate subgradient convention is specified. Away from that seam, `q * signed` is correct.  
+   Severity: definitive.
