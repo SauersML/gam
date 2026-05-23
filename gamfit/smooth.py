@@ -258,9 +258,10 @@ class LatentCoord:
     The bare data-fit ``½ ‖y − Φ(t) β‖²`` is invariant under any
     diffeomorphism ``t ↦ φ(t)`` (any reparameterization can be absorbed
     into a re-fit of β). This makes the inner Hessian *rank-deficient*
-    along the gauge orbit and IFT breaks. At least one of ``aux_prior`` /
-    ``dim_selection`` must be supplied; pass ``"none"`` to ``gauge`` only
-    if you have a custom penalty separately pinning ``t``.
+    along the gauge orbit and IFT breaks. Supply ``aux_prior`` or pair this
+    block with an :class:`gamfit.IsometryPenalty` before fitting. ARD via
+    ``dim_selection=True`` is useful for pruning axes after the gauge is
+    pinned, but it is rotation-symmetric and is not itself a gauge fix.
 
     Parameters
     ----------
@@ -284,12 +285,16 @@ class LatentCoord:
           ``R_id = ½ μ ‖t − ĥ(u)‖²``. Pass ``"auto"`` to let REML choose
           it as one extra outer ``ρ``-axis.
 
-        This is the principled identifiability fix (Khemakhem et al. 2020).
+        This is the principled identifiability fix (Khemakhem et al. 2020)
+        when the marginal likelihood includes the log-``μ`` normalizer,
+        ``ĥ`` is at least C¹, and the conditional precision is positive
+        definite on the subspace anchored by ``u``.
     dim_selection : bool, default False
         Enable ARD on each latent axis. One ridge penalty per axis with
         its own log-precision; REML drives unused axes' precision to ∞.
-        Combines cleanly with ``aux_prior``: the auxiliary pins which
-        axes are *interpretable*, ARD prunes which axes are *needed*.
+        Combines cleanly with ``aux_prior`` or ``IsometryPenalty``: the
+        gauge fix pins which axes are interpretable, ARD prunes which axes
+        are needed. ARD alone does not identify a coordinate system.
 
     Examples
     --------

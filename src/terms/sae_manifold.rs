@@ -27,7 +27,7 @@
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s};
 
 use crate::solver::arrow_schur::{ArrowRowBlock, ArrowSchurError, ArrowSchurSystem};
-use crate::terms::analytic_penalties::{ARDPenalty, PenaltyTier, PsiSlice, SparsityPenalty};
+use crate::terms::analytic_penalties::{ARDPenalty, PsiSlice, SoftmaxAssignmentSparsityPenalty};
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode};
 
 /// Basis/topology tag for one SAE manifold atom.
@@ -726,8 +726,11 @@ impl SaeManifoldTerm {
     /// Build the analytic-penalty descriptors that correspond to the current
     /// SAE term. This is the bridge into `analytic_penalties.rs` for callers
     /// that want to register the same ρ axes with a REML driver.
-    pub fn analytic_penalty_descriptors(&self) -> (SparsityPenalty, Vec<ARDPenalty>) {
-        let sparsity = SparsityPenalty::smoothed_l1(PenaltyTier::Psi, 1e-6);
+    pub fn analytic_penalty_descriptors(&self) -> (SoftmaxAssignmentSparsityPenalty, Vec<ARDPenalty>) {
+        let sparsity = SoftmaxAssignmentSparsityPenalty::new(
+            self.k_atoms(),
+            self.assignment.temperature,
+        );
         let mut ard = Vec::with_capacity(self.k_atoms());
         for coord in &self.assignment.coords {
             ard.push(ARDPenalty::new(
