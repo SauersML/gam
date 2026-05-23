@@ -63,8 +63,7 @@ candidates = [
     ("torus", topology.Torus(centers=torus_grid, name="theta_phi")),
     ("patch", topology.EuclideanPatch(d=2, centers=patch_grid, name="uv")),
 ]
-fits = [fit_topology(name, basis) for name, basis in candidates]
-gamfit.compare_models(fits, names=[name for name, _ in candidates])
+gamfit.select_topology(df, "y", candidates=candidates, score="reml")
 ```
 
 LatentCoord / GP-LVM shape:
