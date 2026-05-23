@@ -223,6 +223,9 @@ fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodFamily) -> O
     if let LikelihoodFamily::NegativeBinomial { theta } = family {
         return Some(theta);
     }
+    if let LikelihoodFamily::Tweedie { p } = family {
+        return Some(p);
+    }
     let spec: crate::types::LikelihoodSpec = family.into();
     if matches!(spec.response, crate::types::ResponseFamily::Gamma) {
         fit.likelihood_scale
@@ -654,6 +657,7 @@ fn sample_standard_link_wiggle(
         LikelihoodFamily::BinomialCLogLog => NutsFamily::BinomialCLogLog,
         LikelihoodFamily::GaussianIdentity => NutsFamily::Gaussian,
         LikelihoodFamily::PoissonLog => NutsFamily::PoissonLog,
+        LikelihoodFamily::Tweedie { .. } => NutsFamily::TweedieLog,
         LikelihoodFamily::NegativeBinomial { .. } => NutsFamily::NegativeBinomialLog,
         LikelihoodFamily::GammaLog => NutsFamily::GammaLog,
         _ => {

@@ -1237,6 +1237,7 @@ pub fn inverse_link_jet_for_family(
             )
         }
         LikelihoodFamily::PoissonLog
+        | LikelihoodFamily::Tweedie { .. }
         | LikelihoodFamily::NegativeBinomial { .. }
         | LikelihoodFamily::GammaLog => {
             inverse_link_jet_for_link_function(
