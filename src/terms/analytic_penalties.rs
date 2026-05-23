@@ -1471,36 +1471,38 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
 }
 
 impl SparsityPenalty {
-    #[must_use]
-    pub fn smoothed_l1(target_tier: PenaltyTier, eps: f64) -> Self {
-        assert!(
-            eps.is_finite() && eps > 0.0,
-            "SparsityPenalty::smoothed_l1 requires eps > 0 \
-             (Hessian / gradient have a `1/sqrt(x² + eps²)` factor that needs eps > 0 \
-             for differentiability at x = 0); got eps = {eps}"
-        );
-        Self {
+    #[must_use = "build error must be handled"]
+    pub fn smoothed_l1(target_tier: PenaltyTier, eps: f64) -> Result<Self, String> {
+        if !(eps.is_finite() && eps > 0.0) {
+            return Err(format!(
+                "SparsityPenalty::smoothed_l1 requires eps > 0 \
+                 (Hessian / gradient have a `1/sqrt(x² + eps²)` factor that needs eps > 0 \
+                 for differentiability at x = 0); got eps = {eps}"
+            ));
+        }
+        Ok(Self {
             target_tier,
             kind: SparsityKind::SmoothedL1 { eps },
             strength_rho_index: 0,
             eps_rho_index: None,
-        }
+        })
     }
 
-    #[must_use]
-    pub fn log(target_tier: PenaltyTier, delta: f64) -> Self {
-        assert!(
-            delta.is_finite() && delta > 0.0,
-            "SparsityPenalty::log requires delta > 0 \
-             (the log-sparsifier is log(1 + x²/δ²), undefined at δ = 0); \
-             got delta = {delta}"
-        );
-        Self {
+    #[must_use = "build error must be handled"]
+    pub fn log(target_tier: PenaltyTier, delta: f64) -> Result<Self, String> {
+        if !(delta.is_finite() && delta > 0.0) {
+            return Err(format!(
+                "SparsityPenalty::log requires delta > 0 \
+                 (the log-sparsifier is log(1 + x²/δ²), undefined at δ = 0); \
+                 got delta = {delta}"
+            ));
+        }
+        Ok(Self {
             target_tier,
             kind: SparsityKind::Log { delta },
             strength_rho_index: 0,
             eps_rho_index: None,
-        }
+        })
     }
 
     /// Hoyer scale-invariant sparsifier. Requires a target of length > 1
@@ -1875,14 +1877,15 @@ impl ARDPenalty {
     /// term (default: `target.len() / latent_dim`). Pass the number of
     /// latent rows that actually contribute to axis `j` (uniform across
     /// axes for the current implementation).
-    #[must_use]
-    pub fn with_n_eff(mut self, n_eff: f64) -> Self {
-        assert!(
-            n_eff.is_finite() && n_eff >= 0.0,
-            "ARDPenalty::with_n_eff requires a finite non-negative value, got {n_eff}"
-        );
+    #[must_use = "build error must be handled"]
+    pub fn with_n_eff(mut self, n_eff: f64) -> Result<Self, String> {
+        if !(n_eff.is_finite() && n_eff >= 0.0) {
+            return Err(format!(
+                "ARDPenalty::with_n_eff requires a finite non-negative value, got {n_eff}"
+            ));
+        }
         self.n_eff = n_eff;
-        self
+        Ok(self)
     }
 
     /// Build scalar [`BlockwisePenalty`] entries for each latent-axis row.
@@ -2261,7 +2264,11 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
     }
 
     fn log_det_plus_lambda_i(&self, lambda: f64) -> Result<f64, String> {
-        assert!(lambda > 0.0, "log_det_plus_lambda_i requires λ > 0");
+        if !(lambda.is_finite() && lambda > 0.0) {
+            return Err(format!(
+                "FrozenAnalyticPenaltyOp::log_det_plus_lambda_i requires finite λ > 0; got {lambda}"
+            ));
+        }
         // For the diagonal-Hessian penalties (ARD, smoothed-L¹ and Log) the
         // closed form is `Σ_i log(d_i + λ)`. For the dense Isometry GN form
         // we fall back to the materialize-and-eigh path on `as_dense`.
@@ -2359,7 +2366,8 @@ mod tests {
 
     #[test]
     fn smoothed_l1_grad_smoothes_signum_at_zero() {
-        let p = SparsityPenalty::smoothed_l1(PenaltyTier::Beta, 1e-3);
+        let p = SparsityPenalty::smoothed_l1(PenaltyTier::Beta, 1e-3)
+            .expect("positive eps builds smoothed L1 penalty");
         let t = array![0.0_f64, 1.0, -2.0];
         let rho = array![0.0_f64];
         let g = p.grad_target(t.view(), rho.view());
