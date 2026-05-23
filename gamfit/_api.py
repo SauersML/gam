@@ -2363,6 +2363,7 @@ def glm_reml_fit_latent(
     family: str,
     *,
     tweedie_p: float = 1.5,
+    negbin_theta: float | None = None,
     m: int = 2,
     weights: Any | None = None,
     fisher_w: Any | None = None,
@@ -2376,13 +2377,23 @@ def glm_reml_fit_latent(
 
     ``family`` accepts ``"binomial-logit"``, ``"binomial-probit"``,
     ``"binomial-cloglog"``, ``"poisson-log"``, ``"tweedie-log"``,
-    ``"gamma-log"``, and ``"gaussian-identity"``. ``tweedie_p`` defaults to
-    ``1.5``. ``fisher_w`` is an advanced internal hook; this scalar-response
-    entry point currently accepts blocks with shape ``(N,1,1)``.
+    ``"negbin-log"``, ``"gamma-log"``, and ``"gaussian-identity"``.
+    ``tweedie_p`` defaults to ``1.5``. ``fisher_w`` is an advanced internal
+    hook; this scalar-response entry point currently accepts blocks with shape
+    ``(N,1,1)``.
     """
     import numpy as np
 
     rust = rust_module()
+    family_normalized = str(family).lower().replace("_", "-")
+    theta = 1.0 if negbin_theta is None else float(negbin_theta)
+    if family_normalized in {
+        "negbin",
+        "negbin-log",
+        "negative-binomial",
+        "negative-binomial-log",
+    } and not (np.isfinite(theta) and theta > 0.0):
+        raise ValueError(f"negbin_theta must be finite and > 0; got {theta!r}")
     try:
         out = rust.glm_reml_fit_latent(
             _numeric_vector(t, "t"),
@@ -2393,6 +2404,7 @@ def glm_reml_fit_latent(
             _numeric_matrix(penalty, "penalty"),
             str(family),
             float(tweedie_p),
+            theta,
             int(m),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if fisher_w is None else np.asarray(fisher_w, dtype=float),
