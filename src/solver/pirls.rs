@@ -10452,6 +10452,11 @@ fn safe_mu_for_binomial(mu: f64) -> f64 {
 }
 
 #[inline]
+fn xlogy(x: f64, y: f64) -> f64 {
+    if x == 0.0 { 0.0 } else { x * y.ln() }
+}
+
+#[inline]
 pub fn calculate_deviance(
     y: ArrayView1<f64>,
     mu: &Array1<f64>,
@@ -10506,7 +10511,7 @@ pub fn calculate_deviance(
                     let yi = y[i];
                     let mui_c = mu[i].max(EPS);
                     let term = if yi > EPS {
-                        yi * (yi / mui_c).ln() - (yi - mui_c)
+                        xlogy(yi, yi / mui_c) - (yi - mui_c)
                     } else {
                         mui_c
                     };
@@ -10525,7 +10530,7 @@ pub fn calculate_deviance(
                         let yi = y[i];
                         let mui_c = mu[i].max(EPS);
                         let term = if yi > EPS {
-                            yi * (yi / mui_c).ln() - (yi - mui_c)
+                            xlogy(yi, yi / mui_c) - (yi - mui_c)
                         } else {
                             mui_c
                         };
@@ -10580,7 +10585,7 @@ pub fn calculate_deviance(
                     }
                     let mui_c = mu[i].max(EPS);
                     let y_term = if yi > EPS {
-                        yi * ((yi * (theta + mui_c)) / (mui_c * (theta + yi))).ln()
+                        xlogy(yi, (yi * (theta + mui_c)) / (mui_c * (theta + yi)))
                     } else {
                         0.0
                     };
