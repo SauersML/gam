@@ -2095,6 +2095,143 @@ def gaussian_reml_fit_positions_batched_backward(
     return result
 
 
+def gaussian_reml_fit_latent(
+    t: Any,
+    y: Any,
+    n_obs: int,
+    latent_dim: int,
+    centers: Any,
+    penalty: Any,
+    *,
+    m: int = 2,
+    weights: Any | None = None,
+    init_lambda: float | None = None,
+    aux_u: Any | None = None,
+    aux_family: str = "ridge",
+    aux_strength: float | None = None,
+    dim_selection_log_precision: Any | None = None,
+) -> dict[str, Any]:
+    """N-D generalization of :func:`gaussian_reml_fit_positions`.
+
+    Per-row latent coordinates ``t ∈ ℝ^{N × d}`` enter a Duchon m-spline
+    design ``Φ(t)``; the inner Gaussian REML problem is solved against
+    ``Y``. ``t`` is a flat row-major ``(N · d,)`` array; ``n_obs`` and
+    ``latent_dim`` carry the shape because the flat vector cannot.
+
+    Identifiability fixes (see :class:`gamfit.LatentCoord` for the math):
+
+    * ``aux_u`` + ``aux_family`` + ``aux_strength`` — iVAE-style
+      conditional prior; pulls ``t`` toward ``ĥ(u)`` (ridge / linear).
+    * ``dim_selection_log_precision`` — length-``d`` log-precisions
+      enabling ARD on each latent axis.
+
+    Both are optional from the Rust call's perspective; passing neither
+    produces a forward fit but the corresponding ``_backward`` call will
+    return a ``grad_t`` whose null-space directions are ill-defined.
+    """
+    import numpy as np
+
+    rust = rust_module()
+    try:
+        out = rust.gaussian_reml_fit_latent(
+            _numeric_vector(t, "t"),
+            _numeric_matrix(y, "y"),
+            int(n_obs),
+            int(latent_dim),
+            _numeric_matrix(centers, "centers"),
+            _numeric_matrix(penalty, "penalty"),
+            int(m),
+            None if weights is None else _numeric_vector(weights, "weights"),
+            None if init_lambda is None else float(init_lambda),
+            None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
+            str(aux_family),
+            None if aux_strength is None else float(aux_strength),
+            None
+            if dim_selection_log_precision is None
+            else _numeric_vector(dim_selection_log_precision, "dim_selection_log_precision"),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    result = dict(out)
+    for key in (
+        "coefficients",
+        "fitted",
+        "sigma2",
+        "cache_penalty_eigenvalues",
+        "cache_eigenvectors",
+    ):
+        if result.get(key) is not None:
+            result[key] = np.asarray(result[key], dtype=float)
+    return result
+
+
+def gaussian_reml_fit_latent_backward(
+    t: Any,
+    y: Any,
+    n_obs: int,
+    latent_dim: int,
+    centers: Any,
+    penalty: Any,
+    *,
+    grad_lambda: float = 0.0,
+    grad_coefficients: Any | None = None,
+    grad_fitted: Any | None = None,
+    grad_reml_score: float = 0.0,
+    grad_edf: float = 0.0,
+    m: int = 2,
+    weights: Any | None = None,
+    init_lambda: float | None = None,
+    aux_u: Any | None = None,
+    aux_family: str = "ridge",
+    aux_strength: float | None = None,
+    dim_selection_log_precision: Any | None = None,
+) -> dict[str, Any]:
+    """Backward / adjoint companion to :func:`gaussian_reml_fit_latent`.
+
+    Returns the standard REML adjoint gradients (``grad_y``,
+    ``grad_penalty``, ``grad_weights``) plus the flat latent gradient
+    ``grad_t`` of length ``n_obs * latent_dim``.
+
+    ``grad_t`` includes the additive identifiability-mode contributions
+    (auxiliary-prior pullback and/or ARD per-axis ridge); the outer
+    driver may walk ``t`` directly under this combined gradient without
+    re-applying the gauge fix.
+    """
+    import numpy as np
+
+    rust = rust_module()
+    try:
+        out = rust.gaussian_reml_fit_latent_backward(
+            _numeric_vector(t, "t"),
+            _numeric_matrix(y, "y"),
+            int(n_obs),
+            int(latent_dim),
+            _numeric_matrix(centers, "centers"),
+            _numeric_matrix(penalty, "penalty"),
+            float(grad_lambda),
+            None if grad_coefficients is None else _numeric_matrix(grad_coefficients, "grad_coefficients"),
+            None if grad_fitted is None else _numeric_matrix(grad_fitted, "grad_fitted"),
+            float(grad_reml_score),
+            float(grad_edf),
+            int(m),
+            None if weights is None else _numeric_vector(weights, "weights"),
+            None if init_lambda is None else float(init_lambda),
+            None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
+            str(aux_family),
+            None if aux_strength is None else float(aux_strength),
+            None
+            if dim_selection_log_precision is None
+            else _numeric_vector(dim_selection_log_precision, "dim_selection_log_precision"),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    result = dict(out)
+    for key in ("grad_t", "grad_y", "grad_penalty", "grad_weights"):
+        if result.get(key) is not None:
+            result[key] = np.asarray(result[key], dtype=float)
+    return result
+
+
 def gaussian_reml_fit_formula(
     data: Any,
     formula: str,
