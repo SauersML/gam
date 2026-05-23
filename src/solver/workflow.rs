@@ -2931,6 +2931,7 @@ struct LatentSpec {
     init: LatentInitSpec,
     aux_prior: Option<LatentAuxPriorSpec>,
     dim_selection: Option<LatentDimSelectionSpec>,
+    explicit_none_mode: bool,
 }
 
 fn json_array2(value: &JsonValue, context: &str) -> Result<Array2<f64>, String> {
@@ -3108,6 +3109,16 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
                 "latents['{key}'] uses dim_selection without aux_prior; ARD alone is not an identifiable latent-coordinate gauge"
             ));
         }
+        let explicit_none_mode = obj
+            .get("id_mode")
+            .or_else(|| obj.get("mode"))
+            .and_then(JsonValue::as_str)
+            .is_some_and(|s| s.eq_ignore_ascii_case("none"));
+        if aux_prior.is_none() && dim_selection.is_none() && !explicit_none_mode {
+            return Err(format!(
+                "latents['{key}'] requires aux_prior for identifiable joint REML; pass id_mode='none' only when a separate gauge fix is supplied"
+            ));
+        }
         specs.push(LatentSpec {
             target,
             n,
@@ -3115,6 +3126,7 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
             init,
             aux_prior,
             dim_selection,
+            explicit_none_mode,
         });
     }
     Ok(specs)
@@ -3204,7 +3216,11 @@ fn latent_id_mode(spec: &LatentSpec) -> Result<LatentIdMode, String> {
             family: aux.family,
             strength: aux.strength,
         }),
-        (None, None) => Ok(LatentIdMode::None),
+        (None, None) if spec.explicit_none_mode => Ok(LatentIdMode::None),
+        (None, None) => Err(format!(
+            "latent '{}' requires aux_prior for identifiable joint REML; pass id_mode='none' only when a separate gauge fix is supplied",
+            spec.target
+        )),
         (None, Some(_)) => Err(format!(
             "latent '{}' dim_selection requires aux_prior for identifiability",
             spec.target
