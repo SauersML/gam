@@ -835,13 +835,6 @@ impl RemlConfig {
         }
     }
 
-    /// Enable / disable Transtrum-Sethna geodesic acceleration on the
-    /// inner PIRLS Newton step. See
-    /// `pirls::WorkingModelPirlsOptions::geodesic_acceleration` for the
-    /// full semantics. Default `false`.
-    pub(crate) fn set_geodesic_acceleration(&mut self, value: bool) {
-        self.geodesic_acceleration = value;
-    }
 }
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
 use std::collections::HashMap;
