@@ -461,6 +461,7 @@ pub enum NutsFamily {
     BinomialProbit,
     BinomialCLogLog,
     PoissonLog,
+    NegativeBinomialLog,
     GammaLog,
 }
 
@@ -473,6 +474,7 @@ impl NutsFamily {
             Self::BinomialProbit => LikelihoodFamily::BinomialProbit,
             Self::BinomialCLogLog => LikelihoodFamily::BinomialCLogLog,
             Self::PoissonLog => LikelihoodFamily::PoissonLog,
+            Self::NegativeBinomialLog => LikelihoodFamily::NegativeBinomial { theta: 1.0 },
             Self::GammaLog => LikelihoodFamily::GammaLog,
         }
     }
@@ -853,6 +855,9 @@ fn nuts_family_logp_and_grad(
         NutsFamily::BinomialCLogLog => cloglog_logp_and_grad(data, eta),
         NutsFamily::Gaussian => gaussian_logp_and_grad(data, eta),
         NutsFamily::PoissonLog => poisson_log_logp_and_grad(data, eta),
+        NutsFamily::NegativeBinomialLog => {
+            negative_binomial_log_logp_and_grad(data, eta, data.gamma_shape)
+        }
         NutsFamily::GammaLog => gamma_log_logp_and_grad(data, eta),
     }
 }
@@ -921,6 +926,9 @@ fn joint_family_logp_and_grad(
         }
         LikelihoodFamily::GaussianIdentity => Ok(gaussian_logp_and_grad(data, eta)),
         LikelihoodFamily::PoissonLog => Ok(poisson_log_logp_and_grad(data, eta)),
+        LikelihoodFamily::NegativeBinomial { theta } => {
+            Ok(negative_binomial_log_logp_and_grad(data, eta, theta))
+        }
         LikelihoodFamily::GammaLog => Ok(gamma_log_logp_and_grad(data, eta)),
         LikelihoodFamily::RoystonParmar => Err(HmcError::UnsupportedFamily {
             reason: "Joint HMC fallback is not implemented for RoystonParmar".to_string(),
@@ -1091,6 +1099,43 @@ fn poisson_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Arra
             let w_i = data.weights[i];
             *slot = w_i * (y_i - mu_i);
             w_i * (y_i * eta_i - mu_i)
+        })
+        .sum();
+
+    let grad_ll = fast_atv(&data.x, &residual);
+    (ll, grad_ll)
+}
+
+fn negative_binomial_log_logp_and_grad(
+    data: &SharedData,
+    eta: &Array1<f64>,
+    theta: f64,
+) -> (f64, Array1<f64>) {
+    use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
+    let n = data.n_samples;
+    let mut residual = Array1::<f64>::zeros(n);
+    let ll: f64 = residual
+        .as_slice_mut()
+        .unwrap()
+        .par_iter_mut()
+        .enumerate()
+        .map(|(i, slot)| {
+            if !(theta.is_finite() && theta > 0.0) {
+                *slot = f64::NAN;
+                return f64::NAN;
+            }
+            let eta_i = eta[i].clamp(-700.0, 700.0);
+            let mu_i = eta_i.exp().max(1e-12);
+            let y_i = data.y[i];
+            let w_i = data.weights[i];
+            let log_mu_term = if y_i > 0.0 { y_i * mu_i.ln() } else { 0.0 };
+            *slot = w_i * theta * (y_i - mu_i) / (theta + mu_i);
+            w_i * (statrs::function::gamma::ln_gamma(y_i + theta)
+                - statrs::function::gamma::ln_gamma(theta)
+                - statrs::function::gamma::ln_gamma(y_i + 1.0)
+                + theta * (theta.ln() - (theta + mu_i).ln())
+                + log_mu_term
+                - y_i * (theta + mu_i).ln())
         })
         .sum();
 
@@ -3494,6 +3539,21 @@ pub fn run_nuts_sampling_flattened_family(
             glm.firth_bias_reduction,
             config,
         ),
+        (LikelihoodFamily::NegativeBinomial { theta }, FamilyNutsInputs::Glm(glm)) => {
+            run_nuts_sampling(
+                glm.x,
+                glm.y,
+                glm.weights,
+                glm.penalty_matrix,
+                glm.mode,
+                glm.hessian,
+                NutsFamily::NegativeBinomialLog,
+                theta,
+                glm.dispersion,
+                glm.firth_bias_reduction,
+                config,
+            )
+        }
         (LikelihoodFamily::GammaLog, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
             glm.x,
             glm.y,
@@ -3809,6 +3869,25 @@ impl LinkWigglePosterior {
                     let mu = eta_i.exp();
                     ll_acc += w_i * (y_i * eta_i - mu);
                     residual[i] = w_i * (y_i - mu);
+                }
+                ll = ll_acc;
+            }
+            NutsFamily::NegativeBinomialLog => {
+                let mut ll_acc = 0.0;
+                let theta = self.scale.max(1e-10);
+                for i in 0..self.n_samples {
+                    let eta_i = eta[i].clamp(-30.0, 30.0);
+                    let (y_i, w_i) = (self.y[i], self.weights[i]);
+                    let mu = eta_i.exp().max(1e-12);
+                    let log_mu_term = if y_i > 0.0 { y_i * mu.ln() } else { 0.0 };
+                    ll_acc += w_i
+                        * (statrs::function::gamma::ln_gamma(y_i + theta)
+                            - statrs::function::gamma::ln_gamma(theta)
+                            - statrs::function::gamma::ln_gamma(y_i + 1.0)
+                            + theta * (theta.ln() - (theta + mu).ln())
+                            + log_mu_term
+                            - y_i * (theta + mu).ln());
+                    residual[i] = w_i * theta * (y_i - mu) / (theta + mu);
                 }
                 ll = ll_acc;
             }
@@ -4503,7 +4582,9 @@ impl JointBetaRhoPosterior {
                     .into());
                 }
             }
-            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+            LikelihoodFamily::PoissonLog
+            | LikelihoodFamily::NegativeBinomial { .. }
+            | LikelihoodFamily::GammaLog => {
                 if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Log)) {
                     return Err(HmcError::LinkMismatch {
                         reason: "Joint HMC log-link family requires a log inverse link".to_string(),
