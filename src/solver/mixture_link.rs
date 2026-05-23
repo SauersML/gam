@@ -1353,6 +1353,191 @@ fn logistic_uwith_derivatives(eta: f64) -> (f64, f64) {
     (u, du)
 }
 
+#[derive(Clone, Copy)]
+struct ShapeDual {
+    v: f64,
+    da: f64,
+    db: f64,
+}
+
+impl ShapeDual {
+    #[inline]
+    fn constant(v: f64) -> Self {
+        Self {
+            v,
+            da: 0.0,
+            db: 0.0,
+        }
+    }
+
+    #[inline]
+    fn from_value_partials(v: f64, da: f64, db: f64) -> Self {
+        Self { v, da, db }
+    }
+
+    #[inline]
+    fn clamp_small(self, floor: f64) -> Self {
+        if self.v.abs() < floor {
+            Self::constant(floor)
+        } else {
+            self
+        }
+    }
+}
+
+impl std::ops::Add for ShapeDual {
+    type Output = Self;
+
+    #[inline]
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            v: self.v + rhs.v,
+            da: self.da + rhs.da,
+            db: self.db + rhs.db,
+        }
+    }
+}
+
+impl std::ops::Sub for ShapeDual {
+    type Output = Self;
+
+    #[inline]
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            v: self.v - rhs.v,
+            da: self.da - rhs.da,
+            db: self.db - rhs.db,
+        }
+    }
+}
+
+impl std::ops::Mul for ShapeDual {
+    type Output = Self;
+
+    #[inline]
+    fn mul(self, rhs: Self) -> Self {
+        Self {
+            v: self.v * rhs.v,
+            da: self.da * rhs.v + self.v * rhs.da,
+            db: self.db * rhs.v + self.v * rhs.db,
+        }
+    }
+}
+
+impl std::ops::Div for ShapeDual {
+    type Output = Self;
+
+    #[inline]
+    fn div(self, rhs: Self) -> Self {
+        let inv = 1.0 / rhs.v;
+        let inv2 = inv * inv;
+        Self {
+            v: self.v * inv,
+            da: (self.da * rhs.v - self.v * rhs.da) * inv2,
+            db: (self.db * rhs.v - self.v * rhs.db) * inv2,
+        }
+    }
+}
+
+impl std::ops::Neg for ShapeDual {
+    type Output = Self;
+
+    #[inline]
+    fn neg(self) -> Self {
+        Self {
+            v: -self.v,
+            da: -self.da,
+            db: -self.db,
+        }
+    }
+}
+
+#[inline]
+fn shape_dual(v: f64) -> ShapeDual {
+    ShapeDual::constant(v)
+}
+
+fn beta_reg_with_shape_partials(a0: f64, b0: f64, x0: f64) -> (f64, f64, f64) {
+    if x0 <= 0.0 {
+        return (0.0, 0.0, 0.0);
+    }
+    if x0 >= 1.0 {
+        return (1.0, 0.0, 0.0);
+    }
+
+    let symm_transform = x0 >= (a0 + 1.0) / (a0 + b0 + 2.0);
+    let (a, b, x) = if symm_transform {
+        (
+            ShapeDual::from_value_partials(b0, 0.0, 1.0),
+            ShapeDual::from_value_partials(a0, 1.0, 0.0),
+            1.0 - x0,
+        )
+    } else {
+        (
+            ShapeDual::from_value_partials(a0, 1.0, 0.0),
+            ShapeDual::from_value_partials(b0, 0.0, 1.0),
+            x0,
+        )
+    };
+
+    let ln_x = x.ln();
+    let ln_1mx = (1.0 - x).ln();
+    let psi_ab = digamma(a.v + b.v);
+    let log_bt = statrs::function::gamma::ln_gamma(a.v + b.v)
+        - statrs::function::gamma::ln_gamma(a.v)
+        - statrs::function::gamma::ln_gamma(b.v)
+        + a.v * ln_x
+        + b.v * ln_1mx;
+    let bt_v = log_bt.exp();
+    let log_bt_a = psi_ab - digamma(a.v) + ln_x;
+    let log_bt_b = psi_ab - digamma(b.v) + ln_1mx;
+    let bt = ShapeDual {
+        v: bt_v,
+        da: bt_v * (log_bt_a * a.da + log_bt_b * b.da),
+        db: bt_v * (log_bt_a * a.db + log_bt_b * b.db),
+    };
+
+    let eps = 0.00000000000000011102230246251565;
+    let fpmin = f64::MIN_POSITIVE / eps;
+    let one = shape_dual(1.0);
+    let qab = a + b;
+    let qap = a + one;
+    let qam = a - one;
+    let mut c = one;
+    let mut d = (one - qab * shape_dual(x) / qap).clamp_small(fpmin);
+    d = one / d;
+    let mut h = d;
+
+    for m in 1..141 {
+        let mf = f64::from(m);
+        let m2 = mf * 2.0;
+        let md = shape_dual(mf);
+        let m2d = shape_dual(m2);
+        let mut aa = md * (b - md) * shape_dual(x) / ((qam + m2d) * (a + m2d));
+        d = (one + aa * d).clamp_small(fpmin);
+        c = (one + aa / c).clamp_small(fpmin);
+        d = one / d;
+        h = h * d * c;
+
+        aa = -(a + md) * (qab + md) * shape_dual(x) / ((a + m2d) * (qap + m2d));
+        d = (one + aa * d).clamp_small(fpmin);
+        c = (one + aa / c).clamp_small(fpmin);
+        d = one / d;
+        let del = d * c;
+        h = h * del;
+
+        if (del.v - 1.0).abs() <= eps {
+            let reg = bt * h / a;
+            return if symm_transform {
+                (1.0 - reg.v, -reg.da, -reg.db)
+            } else {
+                (reg.v, reg.da, reg.db)
+            };
+        }
+    }
+    (f64::NAN, f64::NAN, f64::NAN)
+}
+
 /// Beta-Logistic inverse-link jet for:
 ///   u = logistic(eta)
 ///   a = exp(delta - epsilon), b = exp(delta + epsilon)
@@ -1447,18 +1632,9 @@ pub fn beta_logistic_inverse_link_jetwith_param_partials(
     let (u, du) = logistic_uwith_derivatives(eta);
     let a = (delta - epsilon).exp();
     let b = (delta + epsilon).exp();
-    let mu = beta_reg(a, b, u);
-    let mu_only = |d: f64, e: f64| -> f64 {
-        let aa = (d - e).exp();
-        let bb = (d + e).exp();
-        beta_reg(aa, bb, u)
-    };
-    let h_delta = 1e-6 * (1.0 + delta.abs());
-    let h_epsilon = 1e-6 * (1.0 + epsilon.abs());
-    let dmu_ddelta =
-        (mu_only(delta + h_delta, epsilon) - mu_only(delta - h_delta, epsilon)) / (2.0 * h_delta);
-    let dmu_depsilon = (mu_only(delta, epsilon + h_epsilon) - mu_only(delta, epsilon - h_epsilon))
-        / (2.0 * h_epsilon);
+    let (mu, dmu_da, dmu_db) = beta_reg_with_shape_partials(a, b, u);
+    let dmu_ddelta = a * dmu_da + b * dmu_db;
+    let dmu_depsilon = -a * dmu_da + b * dmu_db;
     if du == 0.0 {
         let zero = InverseLinkJet {
             mu,
