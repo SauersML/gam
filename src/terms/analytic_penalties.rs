@@ -2920,6 +2920,7 @@ pub struct FrozenAnalyticPenaltyOp {
 }
 
 const ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD: usize = 1024;
+const HUTCHINSON_DIAG_SAMPLES: usize = 32;
 const ORTHOGONALITY_LOGDET_SLQ_PROBES: usize = 16;
 const ORTHOGONALITY_LOGDET_LANCZOS_STEPS: usize = 32;
 
@@ -2955,14 +2956,26 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
     fn diag(&self) -> Array1<f64> {
         // Each diagonal penalty exposes `hessian_diag` directly (ARD,
         // smoothed-L¹, Log; Hoyer currently exposes its preconditioner
-        // diagonal). Dense penalties such as Isometry and Orthogonality fall
-        // back to probing matvec on each standard basis vector (O(n²)).
+        // diagonal). Dense HVP-only penalties keep exact probing only below
+        // the small-block threshold.
         match &self.penalty {
             AnalyticPenaltyKind::Ard(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
                 .expect("ARD diag"),
-            AnalyticPenaltyKind::TotalVariation(p) => {
-                p.diag_target(self.target.view(), self.rho.view())
+            AnalyticPenaltyKind::TotalVariation(p) => match &p.difference_op {
+                DifferenceOpKind::GraphEdges(_)
+                    if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+                {
+                    self.stochastic_diag_via_matvec()
+                }
+                DifferenceOpKind::GraphEdges(_) | DifferenceOpKind::ForwardDiff1D => {
+                    p.diag_target(self.target.view(), self.rho.view())
+                }
+            },
+            AnalyticPenaltyKind::Orthogonality(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_diag_via_matvec()
             }
             AnalyticPenaltyKind::Orthogonality(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::IBPAssignment(p) => p
@@ -2977,6 +2990,11 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 } else {
                     self.diag_via_matvec()
                 }
+            }
+            AnalyticPenaltyKind::Isometry(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_diag_via_matvec()
             }
             AnalyticPenaltyKind::Isometry(_) => self.diag_via_matvec(),
         }
@@ -3075,6 +3093,30 @@ impl FrozenAnalyticPenaltyOp {
             e[i] = 0.0;
         }
         d
+    }
+
+    fn stochastic_diag_via_matvec(&self) -> Array1<f64> {
+        let n = self.target.len();
+        let samples = HUTCHINSON_DIAG_SAMPLES.max(1);
+        let mut diag = Array1::<f64>::zeros(n);
+        let mut z = Array1::<f64>::zeros(n);
+        let mut hz = Array1::<f64>::zeros(n);
+        // Hutchinson-Hadamard diagonal estimator (Bekas et al., 2007):
+        // Var[(z ⊙ Hz)_i] = Σ_{j≠i} H_ij², so averaging m probes leaves
+        // variance equal to the off-diagonal row mass divided by m.
+        // With m=32, diagonally dominant Frobenius/TV Hessians have ~16% relative SD.
+        for probe in 0..samples {
+            rademacher_unit_probe_into(z.view_mut(), probe as u64, 1.0);
+            self.matvec(z.view(), hz.view_mut());
+            for i in 0..n {
+                diag[i] += z[i] * hz[i];
+            }
+        }
+        let inv_samples = 1.0 / samples as f64;
+        for i in 0..n {
+            diag[i] *= inv_samples;
+        }
+        diag
     }
 
     fn stochastic_log_det_plus_lambda_i(&self, lambda: f64) -> Result<f64, String> {
