@@ -10,7 +10,13 @@ from typing import Any, Literal, TypeAlias
 
 from . import topology
 from ._api import fit
-from ._compare import _extract_edf, _extract_reml_score, compare_models
+from ._compare import (
+    _extract_edf,
+    _extract_reml_score,
+    _extract_reml_score_raw,
+    _tierney_kadane_normalizer_from_null_dim,
+    compare_models,
+)
 from ._tables import table_columns
 from .smooth import Duchon, PeriodicSplineCurve, Smooth, Sphere
 
@@ -102,8 +108,19 @@ def select_topology(
         for name, fit_obj in fits.items()
     }
     n_obs_by_candidate = {name: n_obs for name in fits}
+    null_dims = {
+        candidate.name: _candidate_null_dim(candidate, basis_sizes[candidate.name])
+        for candidate in normalized
+        if candidate.name in fits
+    }
     raw_scores = {
-        name: _score_for_kind(fit_obj, score_kind, n_obs, basis_sizes[name])
+        name: _score_for_kind(
+            fit_obj,
+            score_kind,
+            n_obs,
+            basis_sizes[name],
+            null_dims[name],
+        )
         for name, fit_obj in fits.items()
     }
     selected_scores = {
@@ -129,6 +146,7 @@ def select_topology(
         n_obs,
         basis_sizes,
         effective_dim,
+        null_dims,
         score_scale_kind,
     )
 
@@ -403,6 +421,29 @@ def _candidate_required_dim(topo: Smooth) -> int | None:
     return None
 
 
+def _candidate_null_dim(candidate: _Candidate, basis_size: int) -> float:
+    topo = candidate.topology
+    if getattr(topo, "double_penalty", False):
+        return 0.0
+    if isinstance(topo, PeriodicSplineCurve):
+        return 1.0
+    if isinstance(topo, Sphere):
+        return 1.0
+    if isinstance(topo, Duchon):
+        periodic = tuple(bool(v) for v in topo.periodic_per_axis or ())
+        if periodic and all(periodic):
+            return 1.0
+        dim = _candidate_required_dim(topo)
+        if dim is None:
+            dim = _centers_dim(topo.centers)
+        if dim is None:
+            dim = 1
+        nonperiodic_dim = sum(1 for value in periodic if not value) if periodic else dim
+        null_dim = math.comb(nonperiodic_dim + int(topo.m) - 1, nonperiodic_dim)
+        return float(min(max(null_dim, 0), basis_size))
+    return 0.0
+
+
 def _centers_dim(centers: Any) -> int | None:
     shape = getattr(centers, "shape", None)
     if shape is not None:
@@ -455,11 +496,12 @@ def _score_for_kind(
     score_kind: ScoreKind,
     n_obs: int,
     basis_size: int,
+    null_dim: float = 0.0,
 ) -> float:
     if score_kind == "reml":
-        return _extract_reml_score(fit_obj)
+        return _extract_reml_score_raw(fit_obj) + _tierney_kadane_normalizer_from_null_dim(null_dim)
     if score_kind == "laml":
-        return _extract_laml_score(fit_obj)
+        return _extract_laml_score(fit_obj) + _tierney_kadane_normalizer_from_null_dim(null_dim)
     return _bic_value(fit_obj, n_obs, basis_size)
 
 
@@ -497,7 +539,7 @@ def _extract_laml_score(fit_obj: Any) -> float:
         value = fit_obj.get("laml")
         if value is not None:
             return float(value)
-    return _extract_reml_score(fit_obj)
+    return _extract_reml_score_raw(fit_obj)
 
 
 def _bic_value(fit_obj: Any, n_obs: int, basis_size: int) -> float:
@@ -610,13 +652,20 @@ def _score_disagreement_warnings(
     n_obs: int,
     basis_sizes: Mapping[str, int],
     effective_dim: Mapping[str, float],
+    null_dims: Mapping[str, float],
     score_scale: ScoreScale,
 ) -> list[str]:
     orders: dict[str, tuple[str, ...]] = {}
     for kind in ("reml", "laml", "bic"):
         scores = {
             name: _scale_score(
-                _score_for_kind(fit_obj, kind, n_obs, basis_sizes[name]),
+                _score_for_kind(
+                    fit_obj,
+                    kind,
+                    n_obs,
+                    basis_sizes[name],
+                    null_dims[name],
+                ),
                 score_scale,
                 n_obs,
                 effective_dim[name],
