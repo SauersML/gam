@@ -12994,7 +12994,6 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
     }
 }
 
-#[derive(Debug)]
 struct SingleBlockLatentCoordDesignCache {
     data: Array2<f64>,
     spec: TermCollectionSpec,
