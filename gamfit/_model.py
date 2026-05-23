@@ -1607,6 +1607,19 @@ class Model:
         rng = np.random.default_rng(seed)
         rows_out: list[dict[str, Any]] = []
         random_ranges = [(int(a), int(b)) for a, b in state.get("random_column_ranges", [])]
+        # Column ranges of the grouping factor's parametric main effect.
+        # In this package an unordered categorical given as a bare term is
+        # auto-encoded as a random-effect block (one column per level); an
+        # explicitly numeric coding lands in linear_terms as a single column.
+        # Both are "parametric main effects" of the factor and are what
+        # `group_means=False` should remove from the contrast — independent
+        # of `marginalise_random`, which targets *all* random effects.
+        group_main_ranges = [
+            (int(tb["start"]), int(tb["end"]))
+            for tb in (state.get("term_blocks") or [])
+            if str(tb.get("name", "")) == str(group)
+            and str(tb.get("kind", "")) in ("linear", "random_effect")
+        ]
 
         for a, b in pairs:
             left_level = str(a)
@@ -1629,12 +1642,17 @@ class Model:
                 for start, stop in random_ranges:
                     xd[:, start:stop] = 0.0
             if not group_means:
-                # Drop parametric main-effect columns from the contrast while
-                # retaining smooth blocks. The global layout is intercept,
-                # linear terms, random effects, smooths; categorical offsets in
-                # this package are represented as random-effect blocks, so this
-                # also removes those offsets under the population contrast.
-                for start, stop in random_ranges:
+                # Drop the parametric main-effect columns of the grouping
+                # factor only, keeping any per-group smooth columns intact.
+                # Targeting `group_main_ranges` (not every random_effect block)
+                # is what makes this independent of `marginalise_random`: if
+                # there are other random effects (e.g. subject IDs), they are
+                # left untouched here so the caller's `marginalise_random`
+                # decision governs them, while `group_means=False` continues
+                # to do exactly what it advertises even under the default
+                # `marginalise_random=True` (zeroing the same group columns
+                # twice is a no-op rather than a silent contradiction).
+                for start, stop in group_main_ranges:
                     xd[:, start:stop] = 0.0
             diff = xd @ beta
             var = np.einsum("ij,jk,ik->i", xd, cov, xd)

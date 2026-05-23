@@ -82,12 +82,13 @@ random deviation.
 
 ## Group means
 
-`group_means=True` (default) includes the full fitted trajectory
-difference. `group_means=False` is intended to zero the parametric
-main-effect columns for the grouping factor in addition to the random
-columns. Under the default `marginalise_random=True` it is currently a
-no-op (the random columns are already zeroed and no further parametric
-columns are dropped). See issue tracker for the fix.
+difference. `group_means=False` zeroes the parametric main-effect
+columns of the *grouping* factor — its random-effect block when it is
+auto-encoded as a categorical, or its linear column when it is
+explicitly numeric — so the contrast retains only the shape difference
+encoded by the per-group smooth blocks. This is orthogonal to
+`marginalise_random`, which targets *every* random effect; you can
+combine them or drop just the group-level offset on its own.
 
 ## References
 
