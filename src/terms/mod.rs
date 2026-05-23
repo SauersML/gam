@@ -16,8 +16,8 @@ pub mod term_builder;
 pub use analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyOp,
     AnalyticPenaltyRegistry, FrozenAnalyticPenaltyOp, IBPAssignmentPenalty, IsometryPenalty,
-    IsometryDuchonRadialSource, IsometryReference, PenaltyTier, PsiSlice,
-    SoftmaxAssignmentSparsityPenalty, SparsityKind, SparsityPenalty, WeightField,
+    IsometryDuchonRadialSource, IsometryReference, OrthogonalityPenalty, PenaltyTier,
+    PsiSlice, SoftmaxAssignmentSparsityPenalty, SparsityKind, SparsityPenalty, WeightField,
 };
 pub use atom_selection::{
     AssignmentSparsityCoupling, AtomLibrary, AtomRecord, AtomSelectionStrategy, EntropicSoftmax,
