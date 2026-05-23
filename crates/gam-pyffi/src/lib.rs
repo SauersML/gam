@@ -50,18 +50,11 @@ use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
     SpatialIdentifiability, SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec,
     auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile, build_duchon_basis,
-<<<<<<< HEAD
     build_duchon_basis_mixed_periodicity_auto, build_duchon_operator_penalty_matrices,
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
     create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
     create_periodic_bspline_basis_dense, create_periodic_bspline_derivative_dense,
-=======
-    build_duchon_basis_mixed_periodicity_auto,
-    build_duchon_operator_penalty_matrices, build_spherical_spline_basis,
-    build_thin_plate_penalty_matrix, create_basis, create_difference_penalty_matrix,
-    create_cyclic_difference_penalty_matrix, create_periodic_bspline_basis_dense,
-    create_periodic_bspline_derivative_dense, resolve_duchon_orders,
->>>>>>> 76caaafa (gam-pyffi: add Duchon hybrid kwargs to Python bindings)
+    resolve_duchon_orders,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction};
