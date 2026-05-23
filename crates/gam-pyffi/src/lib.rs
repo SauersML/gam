@@ -10531,7 +10531,7 @@ fn build_analytic_penalty_registry_from_json(
                     ),
                 ));
             }
-            "block_sparsity" | "group_lasso" => {
+            "block_sparsity" => {
                 let raw_groups = descriptor
                     .get("groups")
                     .and_then(serde_json::Value::as_array)
