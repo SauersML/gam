@@ -11620,8 +11620,6 @@ mod low_rank_weight_pirls_tests {
         assert!(diff < 1e-12);
     }
 
-    #[allow(dead_code)]
-    fn _shape_only(_: &Array1<f64>, _: &Array2<f64>) {}
 }
 
 #[cfg(test)]

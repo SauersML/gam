@@ -20,6 +20,7 @@ use ndarray::{Array1, Array2};
 use crate::basis::{DuchonNullspaceOrder, MaternNu, RadialScalarKind};
 use crate::estimate::EstimationError;
 use crate::estimate::reml::DirectionalHyperParam;
+use crate::solver::persistent_warm_start::StableHasher;
 use crate::terms::latent_coord::LatentCoordValues;
 use crate::terms::smooth::TermCollectionDesign;
 
@@ -59,11 +60,14 @@ pub(crate) enum LatentBasisKind {
         centers: Array2<f64>,
         length_scale: f64,
         nu: MaternNu,
+        aniso_log_scales: Vec<f64>,
     },
     Duchon {
         centers: Array2<f64>,
         length_scale: Option<f64>,
+        power: usize,
         nullspace_order: DuchonNullspaceOrder,
+        aniso_log_scales: Vec<f64>,
     },
     Sphere {
         centers: Array2<f64>,
@@ -92,40 +96,46 @@ impl LatentBasisKind {
     }
 
     fn signature(&self) -> u64 {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = StableHasher::new();
         match self {
             Self::Matern {
                 centers,
                 length_scale,
                 nu,
+                aniso_log_scales,
             } => {
-                0_u8.hash(&mut hasher);
-                centers.nrows().hash(&mut hasher);
-                centers.ncols().hash(&mut hasher);
-                length_scale.to_bits().hash(&mut hasher);
-                std::mem::discriminant(nu).hash(&mut hasher);
+                hasher.write_usize(0);
+                hasher.write_usize(centers.nrows());
+                hasher.write_usize(centers.ncols());
+                hasher.write_f64(*length_scale);
+                hasher.write_usize(matern_nu_signature(*nu));
+                hash_f64_slice(aniso_log_scales, &mut hasher);
                 hash_matrix(centers, &mut hasher);
             }
             Self::Duchon {
                 centers,
                 length_scale,
+                power,
                 nullspace_order,
+                aniso_log_scales,
             } => {
-                1_u8.hash(&mut hasher);
-                centers.nrows().hash(&mut hasher);
-                centers.ncols().hash(&mut hasher);
-                length_scale.map(f64::to_bits).hash(&mut hasher);
-                nullspace_order.hash(&mut hasher);
+                hasher.write_usize(1);
+                hasher.write_usize(centers.nrows());
+                hasher.write_usize(centers.ncols());
+                hash_optional_f64(*length_scale, &mut hasher);
+                hasher.write_usize(*power);
+                hash_duchon_nullspace_order(*nullspace_order, &mut hasher);
+                hash_f64_slice(aniso_log_scales, &mut hasher);
                 hash_matrix(centers, &mut hasher);
             }
             Self::Sphere {
                 centers,
                 penalty_order,
             } => {
-                2_u8.hash(&mut hasher);
-                centers.nrows().hash(&mut hasher);
-                centers.ncols().hash(&mut hasher);
-                penalty_order.hash(&mut hasher);
+                hasher.write_usize(2);
+                hasher.write_usize(centers.nrows());
+                hasher.write_usize(centers.ncols());
+                hasher.write_usize(*penalty_order);
                 hash_matrix(centers, &mut hasher);
             }
             Self::PeriodicBspline {
@@ -134,37 +144,82 @@ impl LatentBasisKind {
                 degree,
                 num_basis,
             } => {
-                3_u8.hash(&mut hasher);
-                domain_start.to_bits().hash(&mut hasher);
-                period.to_bits().hash(&mut hasher);
-                degree.hash(&mut hasher);
-                num_basis.hash(&mut hasher);
+                hasher.write_usize(3);
+                hasher.write_f64(*domain_start);
+                hasher.write_f64(*period);
+                hasher.write_usize(*degree);
+                hasher.write_usize(*num_basis);
             }
             Self::TensorBspline { knots, degrees } => {
-                4_u8.hash(&mut hasher);
-                degrees.hash(&mut hasher);
-                knots.len().hash(&mut hasher);
+                hasher.write_usize(4);
+                hasher.write_usize(degrees.len());
+                for &degree in degrees {
+                    hasher.write_usize(degree);
+                }
+                hasher.write_usize(knots.len());
                 for axis_knots in knots {
                     hash_vector(axis_knots, &mut hasher);
                 }
             }
         }
-        hasher.finish()
+        hasher.finish_u64()
     }
 }
 
-fn hash_matrix(matrix: &Array2<f64>, hasher: &mut DefaultHasher) {
+fn matern_nu_signature(nu: MaternNu) -> usize {
+    match nu {
+        MaternNu::Half => 0,
+        MaternNu::ThreeHalves => 1,
+        MaternNu::FiveHalves => 2,
+        MaternNu::SevenHalves => 3,
+        MaternNu::NineHalves => 4,
+    }
+}
+
+fn hash_duchon_nullspace_order(order: DuchonNullspaceOrder, hasher: &mut StableHasher) {
+    match order {
+        DuchonNullspaceOrder::Zero => {
+            hasher.write_usize(0);
+        }
+        DuchonNullspaceOrder::Linear => {
+            hasher.write_usize(1);
+        }
+        DuchonNullspaceOrder::Degree(degree) => {
+            hasher.write_usize(2);
+            hasher.write_usize(degree);
+        }
+    }
+}
+
+fn hash_optional_f64(value: Option<f64>, hasher: &mut StableHasher) {
+    match value {
+        Some(value) => {
+            hasher.write_bool(true);
+            hasher.write_f64(value);
+        }
+        None => {
+            hasher.write_bool(false);
+        }
+    }
+}
+
+fn hash_f64_slice(values: &[f64], hasher: &mut StableHasher) {
+    hasher.write_usize(values.len());
+    for &value in values {
+        hasher.write_f64(value);
+    }
+}
+
+fn hash_matrix(matrix: &Array2<f64>, hasher: &mut StableHasher) {
     for &value in matrix.iter() {
-        let normalized = if value == 0.0 { 0.0 } else { value };
-        normalized.to_bits().hash(hasher);
+        hasher.write_f64(value);
     }
 }
 
-fn hash_vector(vector: &Array1<f64>, hasher: &mut DefaultHasher) {
-    vector.len().hash(hasher);
+fn hash_vector(vector: &Array1<f64>, hasher: &mut StableHasher) {
+    hasher.write_usize(vector.len());
     for &value in vector.iter() {
-        let normalized = if value == 0.0 { 0.0 } else { value };
-        normalized.to_bits().hash(hasher);
+        hasher.write_f64(value);
     }
 }
 

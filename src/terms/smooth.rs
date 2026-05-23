@@ -12948,7 +12948,9 @@ fn analytic_penalty_objective_contribution(
                         flat_len
                     )));
                 }
-                gradient.slice_mut(s![t_start..t_end]).scaled_add(1.0, &grad);
+                for i in 0..flat_len {
+                    gradient[t_start + i] += grad[i];
+                }
             }
             crate::terms::PenaltyTier::Beta => {
                 return Err(EstimationError::InvalidInput(format!(
@@ -13564,26 +13566,44 @@ impl SingleBlockLatentCoordDesignCache {
                     centers,
                     length_scale,
                     nu,
+                    aniso_log_scales,
                     ..
                 },
             ) => Ok(crate::solver::latent_cache::LatentBasisKind::Matern {
                 centers: centers.clone(),
                 length_scale: *length_scale,
                 nu: *nu,
+                aniso_log_scales: aniso_log_scales
+                    .clone()
+                    .unwrap_or_else(|| vec![0.0; centers.ncols()]),
             }),
             (
                 SmoothBasisSpec::Duchon { .. },
                 BasisMetadata::Duchon {
                     centers,
                     length_scale,
+                    power,
                     nullspace_order,
+                    aniso_log_scales,
                     ..
                 },
-            ) => Ok(crate::solver::latent_cache::LatentBasisKind::Duchon {
-                centers: centers.clone(),
-                length_scale: *length_scale,
-                nullspace_order: *nullspace_order,
-            }),
+            ) => {
+                if !power.is_finite() || *power < 0.0 || power.fract() != 0.0 {
+                    return Err(SmoothError::invalid_config(format!(
+                        "latent-coordinate Duchon cache key requires whole nonnegative power; got {power}"
+                    ))
+                    .into());
+                }
+                Ok(crate::solver::latent_cache::LatentBasisKind::Duchon {
+                    centers: centers.clone(),
+                    length_scale: *length_scale,
+                    power: *power as usize,
+                    nullspace_order: *nullspace_order,
+                    aniso_log_scales: aniso_log_scales
+                        .clone()
+                        .unwrap_or_else(|| vec![0.0; centers.ncols()]),
+                })
+            }
             (
                 SmoothBasisSpec::Sphere { .. },
                 BasisMetadata::Sphere {
@@ -17261,7 +17281,7 @@ fn try_exact_joint_latent_coord_optimization(
                 .cache
                 .hyper_dirs()
                 .map_err(EstimationError::InvalidInput)?;
-            evaluate_joint_reml_efs_at_theta(
+            let mut efs = evaluate_joint_reml_efs_at_theta(
                 &mut self.evaluator,
                 self.cache.design(),
                 theta,
@@ -17269,7 +17289,32 @@ fn try_exact_joint_latent_coord_optimization(
                 hyper_dirs,
                 None,
                 Some(self.cache.design_revision()),
-            )
+            )?;
+            if let Some(registry) = self.cache.analytic_penalties() {
+                let latent = self.cache.latent().map_err(EstimationError::InvalidInput)?;
+                let contribution = analytic_penalty_objective_contribution(
+                    theta,
+                    self.rho_dim,
+                    latent.as_ref(),
+                    registry.as_ref(),
+                )?;
+                efs.cost += contribution.cost;
+                if let (Some(psi_gradient), Some(psi_indices)) =
+                    (efs.psi_gradient.as_mut(), efs.psi_indices.as_ref())
+                {
+                    if psi_gradient.len() != psi_indices.len() {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "latent-coordinate analytic penalty EFS psi gradient length mismatch: gradient={}, indices={}",
+                            psi_gradient.len(),
+                            psi_indices.len()
+                        )));
+                    }
+                    for (local_idx, &theta_idx) in psi_indices.iter().enumerate() {
+                        psi_gradient[local_idx] += contribution.gradient[theta_idx];
+                    }
+                }
+            }
+            Ok(efs)
         }
 
         fn eval_cost(&mut self, theta: &Array1<f64>) -> f64 {
@@ -17436,6 +17481,7 @@ fn try_exact_joint_latent_coord_optimization(
     )?;
     let mut fit = optimized.fit;
     fit.reml_score = result.final_value;
+    fit.penalized_objective = result.final_value;
     Ok(FittedTermCollectionWithSpec {
         fit,
         design: optimized.design,

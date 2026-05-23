@@ -3418,8 +3418,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
         }
         // For the diagonal-Hessian penalties (ARD, smoothed-L¹ and Log) the
         // closed form is `Σ_i log(d_i + λ)`. Forward-difference TV uses the
-        // tridiagonal path-graph structure. Graph TV and Orthogonality keep
-        // the exact dense eigensolve only below the small-block threshold;
+        // tridiagonal path-graph structure. Graph TV, NuclearNorm, and
+        // Orthogonality keep the exact dense eigensolve only below the
+        // small-block threshold;
         // large blocks use Hutchinson/SLQ against the analytic HVP.
         match &self.penalty {
             AnalyticPenaltyKind::Ard(_)
