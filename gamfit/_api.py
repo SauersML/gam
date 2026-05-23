@@ -376,6 +376,7 @@ def _normalize_latents(latents: Mapping[str, Any] | None) -> dict[str, Any] | No
             "n": int(getattr(latent, "n")),
             "d": int(getattr(latent, "d")),
             "init": _jsonable_array(getattr(latent, "init", "pca")),
+            "manifold": _jsonable_array(getattr(latent, "manifold", "auto")),
             "aux_prior": _jsonable_array(getattr(latent, "aux_prior", None)),
             "dim_selection": bool(getattr(latent, "dim_selection", False)),
         }

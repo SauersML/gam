@@ -563,8 +563,9 @@ impl ArrowSchurSystem {
             let t_i = ArrayView1::from(latent.row(i));
             let gt_e = row.gt.clone();
             let htt_e = row.htt.clone();
-            row.gt = manifold.project_to_tangent(t_i, gt_e.view());
-            row.htt = manifold.riemannian_hessian_matrix(t_i, gt_e.view(), htt_e.view());
+            row.gt = manifold.project_to_tangent(t_i.clone(), gt_e.view());
+            row.htt =
+                manifold.riemannian_hessian_matrix(t_i.clone(), gt_e.view(), htt_e.view());
             row.htbeta = manifold.project_matrix_columns_to_tangent(t_i, row.htbeta.view());
         }
     }

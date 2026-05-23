@@ -274,7 +274,7 @@ impl LatentManifold {
             Self::Euclidean | Self::Circle => v.to_owned(),
             Self::Sphere { dim } => {
                 debug_assert_eq!(t.len(), *dim);
-                let tv = dot_views(t, v);
+                let tv = dot_views(t.clone(), v.clone());
                 let mut out = v.to_owned();
                 for a in 0..*dim {
                     out[a] -= tv * t[a];
@@ -333,11 +333,11 @@ impl LatentManifold {
             }
             Self::Sphere { dim } => {
                 debug_assert_eq!(t.len(), *dim);
-                let grad_r = self.project_to_tangent(t, eg);
-                let eh_xi = matvec(eh, xi);
-                let mut ambient = self.project_to_tangent(t, eh_xi.view());
-                let eg_normal = dot_views(eg, t);
-                let normal_curve = dot_views(grad_r.view(), xi);
+                let grad_r = self.project_to_tangent(t.clone(), eg.clone());
+                let eh_xi = matvec(eh, xi.clone());
+                let mut ambient = self.project_to_tangent(t.clone(), eh_xi.view());
+                let eg_normal = dot_views(eg, t.clone());
+                let normal_curve = dot_views(grad_r.view(), xi.clone());
                 for a in 0..*dim {
                     ambient[a] -= eg_normal * xi[a];
                     ambient[a] -= normal_curve * t[a];
@@ -384,8 +384,13 @@ impl LatentManifold {
         for a in 0..d {
             xi.fill(0.0);
             xi[a] = 1.0;
-            let tangent_xi = self.project_to_tangent(t, xi.view());
-            let col = self.euclidean_to_riemannian_hessian(t, eg, eh, tangent_xi.view());
+            let tangent_xi = self.project_to_tangent(t.clone(), xi.view());
+            let col = self.euclidean_to_riemannian_hessian(
+                t.clone(),
+                eg.clone(),
+                eh.clone(),
+                tangent_xi.view(),
+            );
             for b in 0..d {
                 out[[b, a]] = col[b];
             }
@@ -403,7 +408,7 @@ impl LatentManifold {
     ) -> Array2<f64> {
         let mut out = Array2::<f64>::zeros(matrix.dim());
         for col_idx in 0..matrix.ncols() {
-            let col = self.project_to_tangent(t, matrix.column(col_idx));
+            let col = self.project_to_tangent(t.clone(), matrix.column(col_idx));
             for row_idx in 0..matrix.nrows() {
                 out[[row_idx, col_idx]] = col[row_idx];
             }
