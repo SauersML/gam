@@ -24413,3 +24413,140 @@ exec
   4747	///
   4748	/// For nonlinear links, returns E[g^{-1}(eta_tilde)] where eta_tilde ~ N(eta_hat, se_eta^2).
 
+exec
+/bin/zsh -lc 'rg -n "fn parse_paired_cif_options|paired_cif_eval_times|times" crates/gam-pyffi/src/lib.rs | head -40' in /Users/user/gam
+ succeeded in 0ms:
+192:    times: Vec<f64>,
+288:    times: Vec<f64>,
+312:    times: Vec<f64>,
+334:    times: Vec<f64>,
+337:    n_times: usize,
+517:    times: PyReadonlyArray1<'py, f64>,
+521:        competing_risks_cif_impl(times.as_array(), &cumulative_hazards).map_err(py_value_error)?;
+529:    times: ArrayView1<'_, f64>,
+538:    let result = gam::survival::assemble_competing_risks_cif(times, cumulative_hazard.view())
+7452:fn parse_paired_cif_options(options_json: Option<&str>) -> Result<PyPairedCifOptions, String> {
+7458:    if options.times.is_empty() {
+7461:    for (idx, time) in options.times.iter().enumerate() {
+7464:                "paired cumulative incidence times must be finite and non-negative; index {idx} got {time}"
+7467:        if idx > 0 && *time <= options.times[idx - 1] {
+7469:                "paired cumulative incidence times must be strictly increasing".to_string(),
+9835:        times: result.times.clone(),
+9886:        times: result.times,
+9949:    let eval_times = paired_cif_eval_times(&target_model, &target_dataset, &options.times)?;
+9952:        time_grid: Some(eval_times.clone()),
+9955:    let requested_indices = requested_time_indices(&eval_times, &options.times)?;
+9958:    let n_requested = options.times.len();
+9973:        let n_eval_times = target_result.cumulative_hazard.ncols();
+9974:        if competing_result.cumulative_hazard.dim() != (n_rows, n_eval_times) {
+9995:        let eval_times_array = Array1::from_vec(eval_times.clone());
+10003:            eval_times_array.view(),
+10021:        times: options.times,
+10024:        n_times: n_requested,
+10034:fn paired_cif_eval_times(
+10037:    requested_times: &[f64],
+10039:    let mut eval_times = requested_times.to_vec();
+10048:    let max_time = *requested_times
+10054:            eval_times.push(entry);
+10057:    eval_times.sort_by(|a, b| a.total_cmp(b));
+10058:    eval_times.dedup_by(|a, b| *a == *b);
+10059:    Ok(eval_times)
+10063:    eval_times: &[f64],
+10064:    requested_times: &[f64],
+10066:    requested_times
+10069:            eval_times
+10084:    n_times: usize,
+
+exec
+/bin/zsh -lc "nl -ba crates/gam-pyffi/src/lib.rs | sed -n '7448,7475p'" in /Users/user/gam
+ succeeded in 0ms:
+  7448	    }
+  7449	    Ok(options)
+  7450	}
+  7451	
+  7452	fn parse_paired_cif_options(options_json: Option<&str>) -> Result<PyPairedCifOptions, String> {
+  7453	    let options = match options_json {
+  7454	        Some(raw) if !raw.trim().is_empty() => serde_json::from_str::<PyPairedCifOptions>(raw)
+  7455	            .map_err(|err| format!("invalid paired CIF options json: {err}"))?,
+  7456	        _ => PyPairedCifOptions::default(),
+  7457	    };
+  7458	    if options.times.is_empty() {
+  7459	        return Err("paired cumulative incidence requires at least one time".to_string());
+  7460	    }
+  7461	    for (idx, time) in options.times.iter().enumerate() {
+  7462	        if !time.is_finite() || *time < 0.0 {
+  7463	            return Err(format!(
+  7464	                "paired cumulative incidence times must be finite and non-negative; index {idx} got {time}"
+  7465	            ));
+  7466	        }
+  7467	        if idx > 0 && *time <= options.times[idx - 1] {
+  7468	            return Err(
+  7469	                "paired cumulative incidence times must be strictly increasing".to_string(),
+  7470	            );
+  7471	        }
+  7472	    }
+  7473	    let level = options.level.unwrap_or(0.95);
+  7474	    if !(0.0 < level && level < 1.0) {
+  7475	        return Err(format!(
+
+codex
+FINDINGS
+
+1. `src/main.rs:6392`
+
+Wrong expression:
+```rust
+let offset = Array1::<f64>::zeros(ds.values.nrows());
+```
+
+Correct expression:
+```rust
+let (report_offset, report_noise_offset) = resolve_predict_offsets(
+    &model,
+    &ds,
+    &col_map,
+    saved_offset_column,
+    saved_noise_offset_column,
+)?;
+let pred = predict_gam(
+    design.design.clone(),
+    fit.beta.view(),
+    report_offset.view(),
+    family,
+)?;
+```
+
+Derivation: `predict_gam` computes `eta = Xβ + offset` before applying the inverse link (`src/inference/predict.rs:4738-4741`). The report path for standard/binomial-location-scale models always passes a zero offset, so any model fit with an offset column gets wrong fitted values, residuals, Gaussian R², binary calibration, and downstream report diagnostics.
+
+Severity: definitive.
+tokens used
+239,999
+FINDINGS
+
+1. `src/main.rs:6392`
+
+Wrong expression:
+```rust
+let offset = Array1::<f64>::zeros(ds.values.nrows());
+```
+
+Correct expression:
+```rust
+let (report_offset, report_noise_offset) = resolve_predict_offsets(
+    &model,
+    &ds,
+    &col_map,
+    saved_offset_column,
+    saved_noise_offset_column,
+)?;
+let pred = predict_gam(
+    design.design.clone(),
+    fit.beta.view(),
+    report_offset.view(),
+    family,
+)?;
+```
+
+Derivation: `predict_gam` computes `eta = Xβ + offset` before applying the inverse link (`src/inference/predict.rs:4738-4741`). The report path for standard/binomial-location-scale models always passes a zero offset, so any model fit with an offset column gets wrong fitted values, residuals, Gaussian R², binary calibration, and downstream report diagnostics.
+
+Severity: definitive.

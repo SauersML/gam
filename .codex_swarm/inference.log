@@ -17843,3 +17843,551 @@ pub(crate) fn cloglog_point_jet5(t: f64) -> (f64, f64, f64, f64, f64, f64) {
 ///
 /// All derivatives share the common factor `h(t) = exp(t - exp(t))`:
 
+exec
+/bin/zsh -lc "rg -n \"enum RhoPrior|GammaPrecision|RhoPrior\" src/types.rs src -g '*.rs'" in /Users/user/gam
+ succeeded in 0ms:
+src/types.rs:185:pub enum RhoPrior {
+src/types.rs:201:    GammaPrecision {
+src/types.rs:207:    Independent(Vec<RhoPrior>),
+src/types.rs:210:impl Default for RhoPrior {
+src/terms/smooth.rs:1045:        base_prior: &crate::types::RhoPrior,
+src/terms/smooth.rs:1106:    GammaPrecision { shape: f64, rate: f64 },
+src/terms/smooth.rs:1110:    fn to_rho_prior(&self) -> crate::types::RhoPrior {
+src/terms/smooth.rs:1112:            Self::Flat => crate::types::RhoPrior::Flat,
+src/terms/smooth.rs:1113:            Self::NormalLogPrecision { mean, sd } => crate::types::RhoPrior::Normal { mean, sd },
+src/terms/smooth.rs:1114:            Self::GammaPrecision { shape, rate } => {
+src/terms/smooth.rs:1115:                crate::types::RhoPrior::GammaPrecision { shape, rate }
+src/terms/smooth.rs:1136:            Self::GammaPrecision { shape, rate } => {
+src/terms/smooth.rs:1157:    pub rho_prior: crate::types::RhoPrior,
+src/terms/smooth.rs:1219:) -> Result<crate::types::RhoPrior, BasisError>
+src/terms/smooth.rs:1223:    let mut priors = Vec::<crate::types::RhoPrior>::with_capacity(design.penaltyinfo.len());
+src/terms/smooth.rs:1228:            priors.push(crate::types::RhoPrior::GammaPrecision { shape, rate });
+src/terms/smooth.rs:1230:            priors.push(crate::types::RhoPrior::Flat);
+src/terms/smooth.rs:1233:    Ok(crate::types::RhoPrior::Independent(priors))
+src/terms/smooth.rs:1239:) -> Result<crate::types::RhoPrior, BasisError> {
+src/terms/smooth.rs:1286:    prior: &crate::types::RhoPrior,
+src/terms/smooth.rs:1290:        crate::types::RhoPrior::Flat => Ok(()),
+src/terms/smooth.rs:1291:        crate::types::RhoPrior::Normal { mean, sd } => {
+src/terms/smooth.rs:1304:        crate::types::RhoPrior::GammaPrecision { shape, rate } => {
+src/terms/smooth.rs:1307:        crate::types::RhoPrior::Independent(_) => Err(BasisError::InvalidInput(format!(
+src/terms/smooth.rs:1314:    base_prior: &crate::types::RhoPrior,
+src/terms/smooth.rs:1317:) -> Result<Vec<crate::types::RhoPrior>, BasisError> {
+src/terms/smooth.rs:1319:        crate::types::RhoPrior::Independent(priors) => {
+src/terms/smooth.rs:1339:    base_prior: &crate::types::RhoPrior,
+src/terms/smooth.rs:1342:) -> Result<crate::types::RhoPrior, BasisError> {
+src/terms/smooth.rs:1363:    Ok(crate::types::RhoPrior::Independent(priors))
+src/terms/smooth.rs:1515:    base_prior: &crate::types::RhoPrior,
+src/families/survival.rs:2411:            rho_prior: crate::types::RhoPrior::Flat,
+src/inference/hmc.rs:35:use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
+src/inference/hmc.rs:1102:        LogLikelihoodNormalization, RhoPrior,
+src/inference/hmc.rs:1734:            rho_prior: RhoPrior::default(),
+src/inference/hmc.rs:1774:            RhoPrior::Flat,
+src/inference/hmc.rs:1801:        let prior = RhoPrior::Normal {
+src/inference/hmc.rs:1975:            RhoPrior::Flat,
+src/inference/hmc.rs:4255:    rho_prior: RhoPrior,
+src/inference/hmc.rs:4283:        rho_prior: RhoPrior,
+src/inference/hmc.rs:4602:            RhoPrior::Flat => {}
+src/inference/hmc.rs:4603:            RhoPrior::Normal { mean, sd } => {
+src/inference/hmc.rs:4611:            RhoPrior::GammaPrecision { shape, rate } => {
+src/inference/hmc.rs:4618:            RhoPrior::Independent(priors) => {
+src/inference/hmc.rs:4624:                        RhoPrior::Flat => {}
+src/inference/hmc.rs:4625:                        RhoPrior::Normal { mean, sd } => {
+src/inference/hmc.rs:4631:                        RhoPrior::GammaPrecision { shape, rate } => {
+src/inference/hmc.rs:4636:                        RhoPrior::Independent(_) => {
+src/inference/hmc.rs:4682:    pub rho_prior: RhoPrior,
+src/terms/basis.rs:13:use crate::types::RhoPrior;
+src/terms/basis.rs:2839:        prior: Option<RhoPrior>,
+src/solver/estimate.rs:1822:    pub rho_prior: crate::types::RhoPrior,
+src/solver/estimate.rs:3823:    pub rho_prior: crate::types::RhoPrior,
+src/families/custom_family.rs:351:    GammaPrecision { shape: f64, rate: f64 },
+src/families/custom_family.rs:355:    pub fn to_rho_prior(&self) -> crate::types::RhoPrior {
+src/families/custom_family.rs:357:            Self::Flat => crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:358:            Self::NormalLogPrecision { mean, sd } => crate::types::RhoPrior::Normal { mean, sd },
+src/families/custom_family.rs:359:            Self::GammaPrecision { shape, rate } => {
+src/families/custom_family.rs:360:                crate::types::RhoPrior::GammaPrecision { shape, rate }
+src/families/custom_family.rs:381:            Self::GammaPrecision { shape, rate } => {
+src/families/custom_family.rs:451:    pub rho_prior: crate::types::RhoPrior,
+src/families/custom_family.rs:478:    prior: &crate::types::RhoPrior,
+src/families/custom_family.rs:482:        crate::types::RhoPrior::Flat => Ok(()),
+src/families/custom_family.rs:483:        crate::types::RhoPrior::Normal { mean, sd } => {
+src/families/custom_family.rs:496:        crate::types::RhoPrior::GammaPrecision { shape, rate } => {
+src/families/custom_family.rs:512:        crate::types::RhoPrior::Independent(_) => Err(CustomFamilyError::ConstraintViolation {
+src/families/custom_family.rs:520:    base_prior: &crate::types::RhoPrior,
+src/families/custom_family.rs:523:) -> Result<Vec<crate::types::RhoPrior>, String> {
+src/families/custom_family.rs:525:        crate::types::RhoPrior::Independent(priors) => {
+src/families/custom_family.rs:571:    base_prior: crate::types::RhoPrior,
+src/families/custom_family.rs:726:                crate::types::RhoPrior::Independent(_) => {
+src/families/custom_family.rs:802:        rho_prior: crate::types::RhoPrior::Independent(priors),
+src/families/custom_family.rs:6248:    rho_prior: &crate::types::RhoPrior,
+src/families/custom_family.rs:6274:    if !matches!(rho_prior, crate::types::RhoPrior::Flat) {
+src/families/custom_family.rs:6735:    prior: &crate::types::RhoPrior,
+src/families/custom_family.rs:6739:        prior: &crate::types::RhoPrior,
+src/families/custom_family.rs:6744:            crate::types::RhoPrior::Flat => Ok((0.0, 0.0, 0.0)),
+src/families/custom_family.rs:6745:            crate::types::RhoPrior::Normal { mean, sd } => {
+src/families/custom_family.rs:6755:            crate::types::RhoPrior::GammaPrecision { shape, rate } => {
+src/families/custom_family.rs:6771:            crate::types::RhoPrior::Independent(_) => Err(CustomFamilyError::ConstraintViolation {
+src/families/custom_family.rs:6781:        crate::types::RhoPrior::Flat => Ok((0.0, Array1::zeros(rho.len()), None)),
+src/families/custom_family.rs:6782:        crate::types::RhoPrior::Normal { .. } | crate::types::RhoPrior::GammaPrecision { .. } => {
+src/families/custom_family.rs:6796:        crate::types::RhoPrior::Independent(priors) => {
+src/families/custom_family.rs:6826:    rho_prior: &crate::types::RhoPrior,
+src/families/custom_family.rs:6841:    if matches!(rho_prior, crate::types::RhoPrior::Flat) {
+src/families/custom_family.rs:14677:    rho_prior: crate::types::RhoPrior,
+src/families/custom_family.rs:15061:    rho_prior: crate::types::RhoPrior,
+src/families/custom_family.rs:15134:    rho_prior: crate::types::RhoPrior,
+src/families/custom_family.rs:15346:    rho_prior: crate::types::RhoPrior,
+src/families/custom_family.rs:15678:    rho_prior: crate::types::RhoPrior,
+src/families/custom_family.rs:15878:    rho_prior: crate::types::RhoPrior,
+src/families/custom_family.rs:15903:    rho_prior: &crate::types::RhoPrior,
+src/families/custom_family.rs:15932:        crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:15963:        crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:16008:    rho_prior: crate::types::RhoPrior,
+src/families/custom_family.rs:17143:    rho_prior: crate::types::RhoPrior,
+src/families/custom_family.rs:17167:    rho_prior: crate::types::RhoPrior,
+src/families/custom_family.rs:17581:    let has_configured_rho_prior = !matches!(rho_prior, crate::types::RhoPrior::Flat);
+src/families/custom_family.rs:17664:                            crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:18144:        crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:18176:        crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:18602:        crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:18660:            crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:18711:            crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:19899:    fit_custom_family_with_rho_prior(family, specs, options, crate::types::RhoPrior::Flat)
+src/families/custom_family.rs:19906:    rho_prior: crate::types::RhoPrior,
+src/families/custom_family.rs:20864:            crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:20900:            crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:21038:                crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:21075:                crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:21413:            crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:22224:            &crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:22429:            crate::types::RhoPrior::Flat,
+src/families/custom_family.rs:22445:            crate::types::RhoPrior::Flat,
+src/solver/workflow.rs:1185:    let mut fit = if matches!(rho_prior, crate::types::RhoPrior::Flat) {
+src/solver/workflow.rs:1210:) -> Result<crate::types::RhoPrior, String> {
+src/solver/workflow.rs:1212:        return Ok(crate::types::RhoPrior::Flat);
+src/solver/workflow.rs:1242:    let mut priors = Vec::<crate::types::RhoPrior>::with_capacity(penalty_count);
+src/solver/workflow.rs:1247:            priors.push(crate::types::RhoPrior::GammaPrecision {
+src/solver/workflow.rs:1252:            priors.push(crate::types::RhoPrior::Flat);
+src/solver/workflow.rs:1273:    Ok(crate::types::RhoPrior::Independent(priors))
+src/solver/reml/assembly.rs:227:    pub rho_prior: crate::types::RhoPrior,
+src/types.rs:185:pub enum RhoPrior {
+src/types.rs:201:    GammaPrecision {
+src/types.rs:207:    Independent(Vec<RhoPrior>),
+src/types.rs:210:impl Default for RhoPrior {
+src/solver/reml/runtime.rs:15:use crate::types::{InverseLink, LinkFunction, RhoPrior, SasLinkState};
+src/solver/reml/runtime.rs:3311:            RhoPrior::Flat => 0.0,
+src/solver/reml/runtime.rs:3312:            RhoPrior::Normal { mean, sd } => {
+src/solver/reml/runtime.rs:3326:            RhoPrior::GammaPrecision { shape, rate } => {
+src/solver/reml/runtime.rs:3334:            RhoPrior::Independent(priors) => {
+src/solver/reml/runtime.rs:3342:                        RhoPrior::Flat => 0.0,
+src/solver/reml/runtime.rs:3343:                        RhoPrior::Normal { mean, sd } => {
+src/solver/reml/runtime.rs:3351:                        RhoPrior::GammaPrecision { shape, rate } => {
+src/solver/reml/runtime.rs:3362:                        RhoPrior::Independent(_) => f64::INFINITY,
+src/solver/reml/runtime.rs:3371:            RhoPrior::Flat => Array1::zeros(rho.len()),
+src/solver/reml/runtime.rs:3372:            RhoPrior::Normal { mean, sd } => {
+src/solver/reml/runtime.rs:3379:            RhoPrior::GammaPrecision { shape, rate } => {
+src/solver/reml/runtime.rs:3385:            RhoPrior::Independent(priors) => {
+src/solver/reml/runtime.rs:3392:                        RhoPrior::Flat => 0.0,
+src/solver/reml/runtime.rs:3393:                        RhoPrior::Normal { mean, sd } => {
+src/solver/reml/runtime.rs:3400:                        RhoPrior::GammaPrecision { shape, rate } => {
+src/solver/reml/runtime.rs:3411:                        RhoPrior::Independent(_) => f64::NAN,
+src/solver/reml/runtime.rs:3421:            RhoPrior::Flat => None,
+src/solver/reml/runtime.rs:3422:            RhoPrior::Normal { mean, sd } => {
+src/solver/reml/runtime.rs:3433:            RhoPrior::GammaPrecision { shape, rate } => {
+src/solver/reml/runtime.rs:3443:            RhoPrior::Independent(priors) => {
+src/solver/reml/runtime.rs:3451:                        RhoPrior::Flat => 0.0,
+src/solver/reml/runtime.rs:3452:                        RhoPrior::Normal { mean, sd } => {
+src/solver/reml/runtime.rs:3459:                        RhoPrior::GammaPrecision { shape, rate } => {
+src/solver/reml/runtime.rs:3470:                        RhoPrior::Independent(_) => f64::NAN,
+src/solver/reml/runtime.rs:3612:            rho_prior: RhoPrior::Flat,
+src/solver/reml/runtime.rs:3730:    pub(crate) fn set_rho_prior(&mut self, prior: RhoPrior) {
+src/solver/reml/unified.rs:5574:    pub rho_prior: crate::types::RhoPrior,
+src/solver/reml/unified.rs:5670:    rho_prior: crate::types::RhoPrior,
+src/solver/reml/unified.rs:5710:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:5757:    pub fn rho_prior(mut self, prior: crate::types::RhoPrior) -> Self {
+src/solver/reml/unified.rs:6180:fn gamma_precision_rate_for_rho(prior: &crate::types::RhoPrior, idx: usize) -> Option<f64> {
+src/solver/reml/unified.rs:6182:        crate::types::RhoPrior::GammaPrecision { rate, .. } => Some(*rate),
+src/solver/reml/unified.rs:6183:        crate::types::RhoPrior::Independent(priors) => {
+src/solver/reml/unified.rs:6185:                crate::types::RhoPrior::GammaPrecision { rate, .. } => Some(*rate),
+src/solver/reml/unified.rs:6197:    prior: &crate::types::RhoPrior,
+src/solver/reml/unified.rs:17730:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:17865:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:18027:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:18085:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:18399:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:18716:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:18834:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:19001:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:19181:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:19274:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:19446:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:19503:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:19610:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:19689:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:19896:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:19950:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:21669:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/unified.rs:21996:            rho_prior: crate::types::RhoPrior::Flat,
+src/solver/reml/mod.rs:3789:    rho_prior: crate::types::RhoPrior,
+
+exec
+/bin/zsh -lc "sed -n '180,214p' src/types.rs" in /Users/user/gam
+ succeeded in 0ms:
+    }
+}
+
+/// Fixed prior family for smoothing parameters in joint HMC refinement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum RhoPrior {
+    Flat,
+    Normal {
+        mean: f64,
+        sd: f64,
+    },
+    /// Gamma(shape, rate) conjugate hyperprior on the precision lambda = exp(rho).
+    ///
+    /// The REML/LAML objective is minimized, so this contributes
+    /// `rate * exp(rho) - (shape - 1) * rho` up to an additive constant. For a
+    /// block with effective dimension n_p and centered quadratic
+    /// `(beta - mu)'S_p(beta - mu)`, the conditional posterior is
+    /// `Gamma(shape + n_p/2, rate + quadratic/2)` and the closed-form MAP
+    /// precision is `(shape + n_p/2 - 1) / (rate + quadratic/2)`.
+    /// `Gamma(1, 0)` is the explicit flat/default case and reproduces the
+    /// current MacKay/Tipping fixed point.
+    GammaPrecision {
+        shape: f64,
+        rate: f64,
+    },
+    /// Coordinate-specific priors for models whose smoothing parameters do
+    /// not share one prior family, such as nested coefficient groups.
+    Independent(Vec<RhoPrior>),
+}
+
+impl Default for RhoPrior {
+    fn default() -> Self {
+        Self::Normal { mean: 0.0, sd: 3.0 }
+    }
+}
+
+exec
+/bin/zsh -lc "sed -n '3300,3390p' src/solver/reml/runtime.rs" in /Users/user/gam
+ succeeded in 0ms:
+    // penalty coordinates. Adding the term below gives the conditional MAP
+    // score
+    //
+    //     d/dlambda: (a - 1 + nu_p/2)/lambda
+    //         - (b + (beta-mu_p)' S_p (beta-mu_p)/2) = 0,
+    //
+    // hence lambda* = (a - 1 + nu_p/2)
+    //     / (b + (beta-mu_p)' S_p (beta-mu_p)/2), reducing to the existing
+    // MacKay/Tipping fixed point when (a, b) = (1, 0).
+    fn compute_configured_rho_prior_cost(&self, rho: &Array1<f64>) -> f64 {
+        match &self.rho_prior {
+            RhoPrior::Flat => 0.0,
+            RhoPrior::Normal { mean, sd } => {
+                if *sd <= 0.0 || !sd.is_finite() || !mean.is_finite() {
+                    return f64::INFINITY;
+                }
+                let inv_var = 1.0 / (*sd * *sd);
+                0.5 * inv_var
+                    * rho
+                        .iter()
+                        .map(|&r| {
+                            let d = r - *mean;
+                            d * d
+                        })
+                        .sum::<f64>()
+            }
+            RhoPrior::GammaPrecision { shape, rate } => {
+                if *shape <= 0.0 || *rate < 0.0 || !shape.is_finite() || !rate.is_finite() {
+                    return f64::INFINITY;
+                }
+                rho.iter()
+                    .map(|&r| *rate * r.exp() - (*shape - 1.0) * r)
+                    .sum()
+            }
+            RhoPrior::Independent(priors) => {
+                if priors.len() != rho.len() {
+                    return f64::INFINITY;
+                }
+                priors
+                    .iter()
+                    .zip(rho.iter())
+                    .map(|(prior, &r)| match prior {
+                        RhoPrior::Flat => 0.0,
+                        RhoPrior::Normal { mean, sd } => {
+                            if *sd <= 0.0 || !sd.is_finite() || !mean.is_finite() {
+                                f64::INFINITY
+                            } else {
+                                let d = r - *mean;
+                                0.5 * d * d / (*sd * *sd)
+                            }
+                        }
+                        RhoPrior::GammaPrecision { shape, rate } => {
+                            if *shape <= 0.0
+                                || *rate < 0.0
+                                || !shape.is_finite()
+                                || !rate.is_finite()
+                            {
+                                f64::INFINITY
+                            } else {
+                                *rate * r.exp() - (*shape - 1.0) * r
+                            }
+                        }
+                        RhoPrior::Independent(_) => f64::INFINITY,
+                    })
+                    .sum()
+            }
+        }
+    }
+
+    fn compute_configured_rho_prior_grad(&self, rho: &Array1<f64>) -> Array1<f64> {
+        match &self.rho_prior {
+            RhoPrior::Flat => Array1::zeros(rho.len()),
+            RhoPrior::Normal { mean, sd } => {
+                if *sd <= 0.0 || !sd.is_finite() || !mean.is_finite() {
+                    return Array1::from_elem(rho.len(), f64::NAN);
+                }
+                let inv_var = 1.0 / (*sd * *sd);
+                rho.mapv(|r| (r - *mean) * inv_var)
+            }
+            RhoPrior::GammaPrecision { shape, rate } => {
+                if *shape <= 0.0 || *rate < 0.0 || !shape.is_finite() || !rate.is_finite() {
+                    return Array1::from_elem(rho.len(), f64::NAN);
+                }
+                rho.mapv(|r| *rate * r.exp() - (*shape - 1.0))
+            }
+            RhoPrior::Independent(priors) => {
+                if priors.len() != rho.len() {
+                    return Array1::from_elem(rho.len(), f64::NAN);
+                }
+                let mut grad = Array1::<f64>::zeros(rho.len());
+                for (i, (prior, &r)) in priors.iter().zip(rho.iter()).enumerate() {
+
+exec
+/bin/zsh -lc "sed -n '6740,6770p' src/families/custom_family.rs" in /Users/user/gam
+ succeeded in 0ms:
+        r: f64,
+        context: &str,
+    ) -> Result<(f64, f64, f64), String> {
+        match prior {
+            crate::types::RhoPrior::Flat => Ok((0.0, 0.0, 0.0)),
+            crate::types::RhoPrior::Normal { mean, sd } => {
+                if !mean.is_finite() || !sd.is_finite() || *sd <= 0.0 {
+                    return Err(format!(
+                        "{context} Normal log-precision prior requires finite mean and sd > 0"
+                    ));
+                }
+                let inv_var = 1.0 / (*sd * *sd);
+                let delta = r - *mean;
+                Ok((0.5 * delta * delta * inv_var, delta * inv_var, inv_var))
+            }
+            crate::types::RhoPrior::GammaPrecision { shape, rate } => {
+                if !shape.is_finite() || *shape <= 0.0 || !rate.is_finite() || *rate < 0.0 {
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "{context} Gamma precision prior requires shape > 0 and rate >= 0"
+                        ),
+                    }
+                    .into());
+                }
+                let lambda = r.exp();
+                Ok((
+                    *rate * lambda - (*shape - 1.0) * r,
+                    *rate * lambda - (*shape - 1.0),
+                    *rate * lambda,
+                ))
+            }
+
+exec
+/bin/zsh -lc "nl -ba src/inference/hmc.rs | sed -n '4596,4640p'" in /Users/user/gam
+ succeeded in 0ms:
+  4596	            grad_rho[k] += 0.5 * logdet_grad[k];
+  4597	        }
+  4598	
+  4599	        // ---- Prior on ρ ----
+  4600	        let mut rho_prior = 0.0;
+  4601	        match &self.rho_prior {
+  4602	            RhoPrior::Flat => {}
+  4603	            RhoPrior::Normal { mean, sd } => {
+  4604	                let inv_var = 1.0 / (*sd * *sd);
+  4605	                for k in 0..n_rho {
+  4606	                    let d = rho[k] - *mean;
+  4607	                    rho_prior -= 0.5 * inv_var * d * d;
+  4608	                    grad_rho[k] -= inv_var * d;
+  4609	                }
+  4610	            }
+  4611	            RhoPrior::GammaPrecision { shape, rate } => {
+  4612	                for k in 0..n_rho {
+  4613	                    let lambda = rho[k].exp();
+  4614	                    rho_prior += (*shape - 1.0) * rho[k] - *rate * lambda;
+  4615	                    grad_rho[k] += (*shape - 1.0) - *rate * lambda;
+  4616	                }
+  4617	            }
+  4618	            RhoPrior::Independent(priors) => {
+  4619	                if priors.len() != n_rho {
+  4620	                    return (f64::NEG_INFINITY, Array1::zeros(n_beta + n_rho));
+  4621	                }
+  4622	                for k in 0..n_rho {
+  4623	                    match &priors[k] {
+  4624	                        RhoPrior::Flat => {}
+  4625	                        RhoPrior::Normal { mean, sd } => {
+  4626	                            let inv_var = 1.0 / (*sd * *sd);
+  4627	                            let d = rho[k] - *mean;
+  4628	                            rho_prior -= 0.5 * inv_var * d * d;
+  4629	                            grad_rho[k] -= inv_var * d;
+  4630	                        }
+  4631	                        RhoPrior::GammaPrecision { shape, rate } => {
+  4632	                            let lambda = rho[k].exp();
+  4633	                            rho_prior += (*shape - 1.0) * rho[k] - *rate * lambda;
+  4634	                            grad_rho[k] += (*shape - 1.0) - *rate * lambda;
+  4635	                        }
+  4636	                        RhoPrior::Independent(_) => {
+  4637	                            return (f64::NEG_INFINITY, Array1::zeros(n_beta + n_rho));
+  4638	                        }
+  4639	                    }
+  4640	                }
+
+exec
+/bin/zsh -lc "nl -ba src/inference/hmc.rs | sed -n '650,685p'" in /Users/user/gam
+ succeeded in 0ms:
+   650	                        err
+   651	                    );
+   652	                    return (f64::NEG_INFINITY, Array1::zeros(z.len()));
+   653	                }
+   654	            }
+   655	        }
+   656	
+   657	        // === Step 4: Penalty in z-coordinates (precomputed; see `new`) ===
+   658	        //   −0.5 βᵀ S β  =  −[c0 + lᵀ z + 0.5 zᵀ M z]
+   659	        //   ∇_z (−0.5 βᵀ S β) = −(l + M z)
+   660	        // where l = L^T S μ, M = L^T S L, c0 = 0.5 μᵀ S μ.
+   661	        // This single dim×dim symmetric matvec replaces both the per-step
+   662	        // S·β multiply and the L^T·∇_β penalty chain-rule multiply, and lets
+   663	        // the penalty value, β-gradient and chain rule fuse into one pass.
+   664	        let mz = self.penalty_z_quad.dot(z);
+   665	        let lin_term = self.penalty_z_lin.dot(z);
+   666	        let quad_term = 0.5 * z.dot(&mz);
+   667	        let penalty = self.penalty_z_const + lin_term + quad_term;
+   668	
+   669	        // === Step 5: z-space gradient ===
+   670	        // ∇z log p = L^T ∇_β ℓ  −  (l + M z)
+   671	        let mut gradz = self.chol_t.dot(&grad_ll_beta);
+   672	        // gradz -= (penalty_z_lin + M z); fused parallel per-element update.
+   673	        let lin_view = self.penalty_z_lin.view();
+   674	        ndarray::Zip::from(&mut gradz)
+   675	            .and(&lin_view)
+   676	            .and(&mz)
+   677	            .par_for_each(|g, &l, &m| {
+   678	                *g -= l + m;
+   679	            });
+   680	
+   681	        let logp = ll + firth_logdet - penalty;
+   682	
+   683	        (logp, gradz)
+   684	    }
+   685	
+
+codex
+FINDINGS
+
+1. [src/inference/hmc.rs](/Users/user/gam/src/inference/hmc.rs:1013) and [src/inference/hmc.rs](/Users/user/gam/src/inference/hmc.rs:1014)  
+Severity: definitive.  
+Wrong expressions:
+```rust
+*slot = w_i * residual;
+-0.5 * w_i * residual * residual
+```
+For Gaussian fits with estimated dispersion `phi = sigma^2`, the log likelihood is
+`-0.5 * w_i * residual^2 / phi`, with gradient contribution `w_i * residual / phi`. The crate’s own inference contract says coefficient covariance is `Vb = H^{-1} * phi`, so sampling the Gaussian posterior without `phi` targets covariance `H^{-1}`, not `phi H^{-1}`. The Gaussian penalty term in the same target is also unscaled at [src/inference/hmc.rs](/Users/user/gam/src/inference/hmc.rs:667) / [src/inference/hmc.rs](/Users/user/gam/src/inference/hmc.rs:681); for the same covariance contract, the Gaussian quadratic target must scale both residual and penalty quadratics by `1 / phi`.
+
+2. [src/inference/hmc.rs](/Users/user/gam/src/inference/hmc.rs:3736)  
+Severity: definitive.  
+Wrong expression:
+```rust
+let penalty = 0.5 * beta.dot(&self.penalty_base.dot(&beta))
+    + 0.5 * theta.dot(&self.penalty_link.dot(&theta));
+```
+In the link-wiggle Gaussian branch, the likelihood is scaled by `inv_scale_sq = 1 / sigma^2` at lines 3651-3657, but the smoothing prior quadratic is not. Under the same Gaussian GAM posterior/covariance contract, the correct Gaussian target is proportional to:
+```rust
+let penalty = inv_scale_sq * (
+    0.5 * beta.dot(&self.penalty_base.dot(&beta))
+        + 0.5 * theta.dot(&self.penalty_link.dot(&theta))
+);
+```
+and the penalty gradients must be scaled by `inv_scale_sq` as well.
+
+3. [src/inference/sample.rs](/Users/user/gam/src/inference/sample.rs:367)  
+Severity: definitive.  
+Wrong expression:
+```rust
+samples[(k, i)] = mode[i] + delta[i];
+```
+`delta` is drawn as `L^{-T} eps`, so `Var(delta) = H^{-1}`. For fits with estimated dispersion, the saved inference contract is `Var(beta) = phi * H^{-1}`. Correct sampling must use:
+```rust
+samples[(k, i)] = mode[i] + phi.sqrt() * delta[i];
+```
+or draw directly from the stored scaled covariance.
+
+4. [src/inference/smooth_test.rs](/Users/user/gam/src/inference/smooth_test.rs:142)  
+Severity: definitive.  
+Wrong expression:
+```rust
+1.0 - dist.cdf(stat / ref_df / input.dispersion.phi())
+```
+`stat` is already computed using `covariance`, and stored covariance matrices are scaled by `phi`. Therefore `stat = beta' (phi H^{-1})^+ beta` already contains the dispersion normalization. The F statistic for estimated dispersion should be:
+```rust
+stat / ref_df
+```
+not `stat / ref_df / phi`, which divides by dispersion a second time.
+tokens used
+228,823
+FINDINGS
+
+1. [src/inference/hmc.rs](/Users/user/gam/src/inference/hmc.rs:1013) and [src/inference/hmc.rs](/Users/user/gam/src/inference/hmc.rs:1014)  
+Severity: definitive.  
+Wrong expressions:
+```rust
+*slot = w_i * residual;
+-0.5 * w_i * residual * residual
+```
+For Gaussian fits with estimated dispersion `phi = sigma^2`, the log likelihood is
+`-0.5 * w_i * residual^2 / phi`, with gradient contribution `w_i * residual / phi`. The crate’s own inference contract says coefficient covariance is `Vb = H^{-1} * phi`, so sampling the Gaussian posterior without `phi` targets covariance `H^{-1}`, not `phi H^{-1}`. The Gaussian penalty term in the same target is also unscaled at [src/inference/hmc.rs](/Users/user/gam/src/inference/hmc.rs:667) / [src/inference/hmc.rs](/Users/user/gam/src/inference/hmc.rs:681); for the same covariance contract, the Gaussian quadratic target must scale both residual and penalty quadratics by `1 / phi`.
+
+2. [src/inference/hmc.rs](/Users/user/gam/src/inference/hmc.rs:3736)  
+Severity: definitive.  
+Wrong expression:
+```rust
+let penalty = 0.5 * beta.dot(&self.penalty_base.dot(&beta))
+    + 0.5 * theta.dot(&self.penalty_link.dot(&theta));
+```
+In the link-wiggle Gaussian branch, the likelihood is scaled by `inv_scale_sq = 1 / sigma^2` at lines 3651-3657, but the smoothing prior quadratic is not. Under the same Gaussian GAM posterior/covariance contract, the correct Gaussian target is proportional to:
+```rust
+let penalty = inv_scale_sq * (
+    0.5 * beta.dot(&self.penalty_base.dot(&beta))
+        + 0.5 * theta.dot(&self.penalty_link.dot(&theta))
+);
+```
+and the penalty gradients must be scaled by `inv_scale_sq` as well.
+
+3. [src/inference/sample.rs](/Users/user/gam/src/inference/sample.rs:367)  
+Severity: definitive.  
+Wrong expression:
+```rust
+samples[(k, i)] = mode[i] + delta[i];
+```
+`delta` is drawn as `L^{-T} eps`, so `Var(delta) = H^{-1}`. For fits with estimated dispersion, the saved inference contract is `Var(beta) = phi * H^{-1}`. Correct sampling must use:
+```rust
+samples[(k, i)] = mode[i] + phi.sqrt() * delta[i];
+```
+or draw directly from the stored scaled covariance.
+
+4. [src/inference/smooth_test.rs](/Users/user/gam/src/inference/smooth_test.rs:142)  
+Severity: definitive.  
+Wrong expression:
+```rust
+1.0 - dist.cdf(stat / ref_df / input.dispersion.phi())
+```
+`stat` is already computed using `covariance`, and stored covariance matrices are scaled by `phi`. Therefore `stat = beta' (phi H^{-1})^+ beta` already contains the dispersion normalization. The F statistic for estimated dispersion should be:
+```rust
+stat / ref_df
+```
+not `stat / ref_df / phi`, which divides by dispersion a second time.
