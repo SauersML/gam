@@ -28,6 +28,6 @@ pub use latent_coord::{
     LatentManifold,
 };
 pub use sae_manifold::{
-    AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldLoss,
-    SaeManifoldRho, SaeManifoldTerm,
+    AssignmentMode, GumbelTemperatureSchedule, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom,
+    SaeManifoldLoss, SaeManifoldRho, SaeManifoldTerm, ScheduleKind,
 };
