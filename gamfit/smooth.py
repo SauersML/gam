@@ -295,6 +295,14 @@ class LatentCoord:
         Combines cleanly with ``aux_prior`` or ``IsometryPenalty``: the
         gauge fix pins which axes are interpretable, ARD prunes which axes
         are needed. ARD alone does not identify a coordinate system.
+    manifold : str | dict, default ``"auto"``
+        Per-row update manifold. ``"auto"`` infers from the consuming basis:
+        periodic/cyclic smooths use ``"circle"``, spherical smooths use
+        ``"sphere"``, tensor periodic margins form a torus/cylinder product,
+        and ordinary Duchon/Matérn/TPS smooths stay Euclidean. Explicit
+        values include ``"euclidean"``, ``"circle"``, ``"sphere"``,
+        ``"torus"``, ``"cylinder"``, or ``{"type": "interval", "lo": ...,
+        "hi": ...}``.
 
     Examples
     --------
@@ -310,6 +318,7 @@ class LatentCoord:
     init: Any = "pca"
     aux_prior: Mapping[str, Any] | None = None
     dim_selection: bool = False
+    manifold: Any = "auto"
     name: str | None = None
 
 
