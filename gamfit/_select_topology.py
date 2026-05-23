@@ -499,9 +499,13 @@ def _score_for_kind(
     null_dim: float = 0.0,
 ) -> float:
     if score_kind == "reml":
-        return _extract_reml_score_raw(fit_obj) + _tierney_kadane_normalizer_from_null_dim(null_dim)
+        return _extract_reml_score_raw(
+            fit_obj
+        ) + _tierney_kadane_normalizer_from_null_dim(null_dim)
     if score_kind == "laml":
-        return _extract_laml_score(fit_obj) + _tierney_kadane_normalizer_from_null_dim(null_dim)
+        return _extract_laml_score(
+            fit_obj
+        ) + _tierney_kadane_normalizer_from_null_dim(null_dim)
     return _bic_value(fit_obj, n_obs, basis_size)
 
 
