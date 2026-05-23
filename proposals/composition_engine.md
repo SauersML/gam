@@ -21,17 +21,17 @@ The pitch is not to widen the API surface. It is to recognize that the existing 
 
 | Cross-domain idea | gamfit primitive | Owner in source |
 |---|---|---|
-| Smooth decoder `M → ℝ^p` (GP-LVM, principal manifolds, kernel PCA) | multi-output smooth on existing bases | `Smooth` (`gamfit/smooth.py:33`), `Duchon`/`Sphere`/`PeriodicSplineCurve` subclasses, `SmoothTerm` (`src/terms/smooth.rs:320`), `BasisFamily` (`src/terms/basis.rs:216`) |
-| Smoothness / wiggliness selection | `S(ρ)` penalty + REML / LAML | `RemlState::evaluate_unified` (`src/solver/reml/runtime.rs:8051`), `laml_*` proof scaffolding (`src/solver/reml.lean:164-200`) |
-| Latent coordinate estimation (GP-LVM, autoencoder bottleneck) | new ext-coordinate block whose design derivatives reuse the existing kernel-shape derivative machinery | needs new — see §4(a); pattern is `SpatialLogKappaCoords` (`src/terms/smooth.rs:1765`) |
+| Smooth decoder `M → ℝ^p` (GP-LVM, principal manifolds, kernel PCA) | multi-output smooth on existing bases | `Smooth` (`gamfit/smooth.py:34`), `Duchon`/`Sphere`/`PeriodicSplineCurve` subclasses, `SmoothTerm` (`src/terms/smooth.rs:320`), `BasisFamily` (`src/terms/basis.rs:238`) |
+| Smoothness / wiggliness selection | `S(ρ)` penalty + REML / LAML | `RemlState::evaluate_unified` (`src/solver/reml/runtime.rs:8069`), `laml_*` proof scaffolding (`src/solver/reml.lean:164-230`) |
+| Latent coordinate estimation (GP-LVM, autoencoder bottleneck) | ext-coordinate block whose design derivatives reuse the existing kernel-shape derivative machinery | landed in the standard path; see §4(a); pattern is `SpatialLogKappaCoords` (`src/terms/smooth.rs:1774`) and `LatentCoordValues` (`src/terms/latent_coord.rs:561`) |
 | Intrinsic-dimension selection (auto-discovery of latent dim) | ARD: one penalty per latent axis, REML drives unused axes to ∞ *given a paired gauge fix* (aux-conditional prior or isometry) | composition of (a) + per-axis `S(ρ)` + paired gauge-fix from (b) or (c) + existing REML; no new primitive |
-| Topology choice (S¹, S², torus, Euclidean patch) | basis family + tensor product | `PeriodicSpline1D` (`src/terms/basis.rs:1401`), `SphericalSplineBasisSpec` (2635), `DuchonBasisSpec` (2764), `TensorBSplineSpec` (`src/terms/smooth.rs:295`); TDA persistent cohomology suggests which |
+| Topology choice (S¹, S², torus, Euclidean patch) | basis family + tensor product | `PeriodicSpline1D` (`src/terms/basis.rs:1423`), `SphericalSplineBasisSpec` (`src/terms/basis.rs:2657`), `DuchonBasisSpec` (`src/terms/basis.rs:2786`), `TensorBSplineSpec` (`src/terms/smooth.rs:295`); TDA persistent cohomology suggests which |
 | Gauge / canonical coordinate (Riemannian isometry to a reference) | structured penalty pinning the pullback metric toward a reference | needs new — see §4(b) |
 | Identifiability via auxiliary variable (iVAE) | conditional prior on the latent block; mechanism sparsity = L¹-like on a sub-block | needs new — see §4(c); reuses `BlockwisePenalty` (`src/terms/smooth.rs:707`) |
-| Behavioral vs geometric inner product (Fisher-Rao) | the working weight matrix `W` in PIRLS | already there — `WorkingModel::update`/`update_with_curvature` (`src/solver/pirls.rs:525-562`); `W` is computed inside the working model, so a custom working model that returns Fisher information *is* Fisher-Rao fitting |
-| Geodesic-acceleration Newton (Transtrum) | second-order Newton correction in the inner solver | one-line addition at `solve_newton_direction_dense` call site (`src/solver/pirls.rs:4859`); see §4(e) |
-| Mechanism / sparse-coding amplitude gating | `by` multiplier on a smooth | `Smooth.by` (`gamfit/smooth.py:73`); already supported |
-| Closed-form linear operator penalties (PDE constraints, divergence-free, …) | `OperatorPenaltySpec` | `OperatorPenaltySpec` (`src/terms/basis.rs:2836`), `closed_form_operator.rs` |
+| Behavioral vs geometric inner product (Fisher-Rao) | the working weight matrix `W` in PIRLS | already there — `WorkingModel::update`/`update_with_curvature` (`src/solver/pirls.rs:526-529`); `W` is computed inside the working model, so a custom working model that returns Fisher information *is* Fisher-Rao fitting |
+| Geodesic-acceleration Newton (Transtrum) | second-order Newton correction in the inner solver | landed behind `WorkingModelPirlsOptions::geodesic_acceleration` (`src/solver/pirls.rs:1289`) with the dense-factor correction block at `src/solver/pirls.rs:5086-5153`; see §4(e) |
+| Mechanism / sparse-coding amplitude gating | `by` multiplier on a smooth | `Smooth.by` (`gamfit/smooth.py:74`); already supported |
+| Closed-form linear operator penalties (PDE constraints, divergence-free, …) | `OperatorPenaltySpec` | `OperatorPenaltySpec` (`src/terms/basis.rs:2858`), `ClosedFormPenaltyOperator` (`src/terms/closed_form_operator.rs:26`) |
 
 The right column is mostly existing code. The "needs new" rows are §4.
 
@@ -56,7 +56,7 @@ The new code is small. Each addition reuses an existing pattern; none requires i
 
 **Problem.** A GP-LVM, principal manifold, or autoencoder bottleneck needs the inner solver to estimate not only the decoder coefficients `β` but also a per-observation latent coordinate `t_n ∈ ℝ^d`. The design matrix `X` is then a function of `t`: each row is the evaluation of the basis at the row's latent coordinate. This is the ext-coordinate dependence pattern, just shifted from a few global length-scale knobs to one (small) vector per observation. Reserve `ψ` for the existing kernel-shape machinery (`SpatialLogKappaCoords`); the per-row latent is always `t`.
 
-**Existing analogue.** `SpatialLogKappaCoords` (`src/terms/smooth.rs:1765-1900`) is exactly the data structure pattern: a flattened `Array1<f64>` of "extra hyper-coordinates" whose layout is given by a `Vec<usize> dims_per_term`. The downstream machinery — `HyperDesignDerivative::from_implicit` (`src/solver/reml/mod.rs:2653-2668`), `DirectionalHyperParam::new_compact` (`src/solver/reml/mod.rs:3127`), the `is_penalty_like = false` flag set via `.not_penalty_like()` (`src/terms/smooth.rs:12717`), and the final entry into `RemlState::evaluate_unified_with_psi_ext` (`src/solver/reml/runtime.rs:8104`) — is already designed to accept *non-penalty-like, design-moving* ext-coordinates. Kernel-shape `ψ` and latent coordinates `t` are the same kind of object as far as the IFT plumbing is concerned. Both move the design `X`, both leave `S(ρ)` untouched (in the bare case), and both ship first- and second-derivative blocks through `HyperDesignDerivative`.
+**Existing analogue.** `SpatialLogKappaCoords` (`src/terms/smooth.rs:1774-1891`) is exactly the data structure pattern: a flattened `Array1<f64>` of "extra hyper-coordinates" whose layout is given by a `Vec<usize> dims_per_term`. The downstream machinery — `HyperDesignDerivative::from_implicit` (`src/solver/reml/mod.rs:2706-2721`), `DirectionalHyperParam::new_compact` (`src/solver/reml/mod.rs:3277`), the `is_penalty_like = false` flag set via `.not_penalty_like()` (`src/solver/reml/mod.rs:3314`; spatial call at `src/terms/smooth.rs:13105`), and the final entry into `RemlState::evaluate_unified_with_psi_ext` (`src/solver/reml/runtime.rs:8122`) — is already designed to accept *non-penalty-like, design-moving* ext-coordinates. Kernel-shape `ψ` and latent coordinates `t` are the same kind of object as far as the IFT plumbing is concerned. Both move the design `X`, both leave `S(ρ)` untouched (in the bare case), and both ship first- and second-derivative blocks through `HyperDesignDerivative`.
 
 **Proposed Rust shape.** A sibling of `SpatialLogKappaCoords`:
 
@@ -73,7 +73,7 @@ pub(crate) struct LatentCoordValues {
 }
 ```
 
-with a `LatentCoordValues::build_x_ext_derivatives(&self) -> Vec<HyperDesignDerivative>` that produces one `HyperDesignDerivative` per latent column. For Duchon, Matern, and sphere bases the existing `ImplicitDesignPsiDerivative` (`src/terms/basis.rs:3948`) already knows how to compute the radial part of `∂X/∂t_n` because the kernel is a function of distance and the chain rule from `length_scale` to `t` reuses the same radial derivative already used for `ψ`. The work is plumbing, not new math.
+with a `LatentCoordValues::build_x_ext_derivatives(&self) -> Vec<HyperDesignDerivative>` that produces one `HyperDesignDerivative` per latent column. For Duchon, Matern, sphere, periodic, and tensor bases, the landed `LatentCoordDesignDerivative` (`src/terms/basis.rs:4118`) routes through `LatentCoordValues::design_gradient_wrt_t_dispatch` (`src/terms/latent_coord.rs:825`): radial bases reuse the same radial derivative as `ψ`, while non-radial bases provide analytic jets. The remaining work is integration breadth, not new IFT math.
 
 **Proposed Python shape.** Add a smooth-spec subclass that flags "the input to this smooth is a free latent vector, not a column of the data table":
 
@@ -88,7 +88,7 @@ class LatentCoord:
 
 `fit(..., latents={"t": LatentCoord(n=N, d=2, init="pca", aux_prior={...})}, smooths=[Duchon(centers=..., m=2, name="decoder")])` should construct the `LatentCoordValues` block, wire it into the same `DirectionalHyperParam` pipeline used for anisotropic `ψ`, and let REML run unchanged. Formula-side syntax can then bind `s(t, ...)` to that latent block.
 
-**What's load-bearing.** The `is_penalty_like = false` branch in `HyperDesignDerivative::any_nonzero` (`src/solver/reml/mod.rs:2704-2709`) and downstream `validate_tk_ext_coords` (`src/solver/reml/runtime.rs:2521`) is what makes an ext-coordinate "design-moving" rather than "penalty-scaling". `LatentCoordValues` is design-moving. Roughly 70–90% of the code path is shared with anisotropic `ψ`; the new code is the per-observation indexing and the basis-side derivatives `∂X/∂t_n`, both of which are radial-kernel chain-rule applications of existing primitives.
+**What's load-bearing.** The `is_penalty_like = false` derivation in `DirectionalHyperParam::new_compact` (`src/solver/reml/mod.rs:3277-3284`), backed by `HyperDesignDerivative::any_nonzero` (`src/solver/reml/mod.rs:2780-2786`), and downstream `validate_tk_ext_coords` (`src/solver/reml/runtime.rs:2521`) is what makes an ext-coordinate "design-moving" rather than "penalty-scaling". `LatentCoordValues` is design-moving. Roughly 70–90% of the code path is shared with anisotropic `ψ`; the new code is the per-observation indexing and the basis-side derivatives `∂X/∂t_n`, both of which are radial-kernel chain-rule applications of existing primitives.
 
 ### 4(b). Isometry-to-reference penalty
 
@@ -102,7 +102,7 @@ P_iso(β, t; ρ_iso) = e^{ρ_iso} · ∫_M ‖g(t) − g^ref(t)‖_F^2 dt
 
 approximated as a sum over either observation locations or a quadrature grid. `e^{ρ_iso}` is a standard penalty scaling and is selected by REML alongside the smoothness penalties.
 
-**Interface.** A new `PenaltyKind::IsometryToReference { reference: Arc<dyn MetricField>, quadrature: QuadratureSpec }` slotted into the `BlockwisePenalty` machinery (`src/terms/smooth.rs:707`). The penalty Gram block is a function of `(β, t)` and therefore contributes a non-trivial `∂S/∂t` to the existing `PenaltyDerivativeComponent` (`src/solver/reml/mod.rs:3072-3088`) — this is the same code path used for `HyperPenaltyDerivative`.
+**Interface.** The current analytic-penalty layer carries `IsometryPenalty` (`src/terms/analytic_penalties.rs:353`) alongside the older `BlockwisePenalty` machinery (`src/terms/smooth.rs:707`). The penalty Gram block is a function of `(β, t)` and therefore contributes a non-trivial `∂S/∂t` through `PenaltyDerivativeComponent` (`src/solver/reml/mod.rs:3188-3190`) and `HyperPenaltyDerivative` (`src/solver/reml/mod.rs:3027`) — the same derivative-carrier layer used by other hyper-penalty derivatives.
 
 **When to use.** Whenever `LatentCoordValues` is in play and there is no auxiliary variable to break the gauge (§4(c)). Default to identity reference and let REML choose the strength.
 
@@ -112,7 +112,7 @@ approximated as a sum over either observation locations or a quadrature grid. `e
 
 **Recasting in gamfit terms.** A conditional prior `p(t | u; η(u))` is, by Bayes, a penalty on the latent block whose Gram matrix is a function of `u`. Concretely, for a Gaussian conditional prior with `u`-dependent precision `Λ(u)`, the penalty contribution is `½ t_n^T Λ(u_n) t_n`, summed over `n`. This is a *blockwise diagonal penalty whose block is data-dependent*. The existing `BlockwisePenalty` infrastructure is the right home, with a new constructor `BlockwisePenalty::auxiliary_conditional_gaussian(u, precision_fn)`.
 
-**Mechanism sparsity.** iVAE-style identifiability additionally benefits from sparsity of the Jacobian `∂T/∂t` (each latent affects only a few outputs). This is an L¹-on-a-block penalty over rows of the decoder coefficient matrix — exactly the kind of structured penalty the existing `OperatorPenaltySpec` machinery (`src/terms/basis.rs:2836`) handles when paired with the active-set inner solver (`src/solver/active_set.rs`).
+**Mechanism sparsity.** iVAE-style identifiability additionally benefits from sparsity of the Jacobian `∂T/∂t` (each latent affects only a few outputs). This is an L¹-on-a-block penalty over rows of the decoder coefficient matrix — exactly the kind of structured penalty the existing `OperatorPenaltySpec` machinery (`src/terms/basis.rs:2858`) handles when paired with the active-set inner solver (`src/solver/active_set.rs`).
 
 **Interface.** One new smooth-spec field on `Latent`: `aux: Any | None = None` (column name or array), plus a `prior: Literal["gaussian", "gaussian-mixture", ...]` choice. Internals route to the new `BlockwisePenalty` constructor.
 
@@ -138,9 +138,9 @@ No new code. Recipe-level recommendation: `manifold_fit(..., latent_dim=d_max, d
 
 **Problem.** On problems with strongly nonlinear residuals — and `LatentCoordValues` is one — the standard Gauss-Newton / PIRLS step systematically over-shoots along curved valleys. Transtrum's geodesic-acceleration correction adds a second-order term `δ_2 = −½ H^{-1} A(δ_1, δ_1)`, where `A` is the directional second derivative of the residual along the first-order step `δ_1`. Empirically this can reduce inner iterations substantially on curved latent fits. (auto_71 used the LM variant of this trick and observed exactly this behavior.)
 
-**Patch site.** `src/solver/pirls.rs:4859` (`solve_newton_direction_dense(dense_reg, &state.gradient, &mut newton_direction)`). The new path: solve the standard Newton system to produce `δ_1`, then on a *second* RHS — the directional second derivative of the residual along `δ_1` — solve a second system with the *same* factorization to produce the acceleration term. This is one extra forward/back-solve per accepted step against the already-factored Hessian. The factor object is in scope.
+**Implemented site.** The dense unconstrained path now factors through `solve_newton_direction_dense_with_factor` (`src/solver/pirls.rs:5040-5044`), then the geodesic block reuses that dense factor to solve the second RHS (`src/solver/pirls.rs:5086-5153`). It computes a central-difference estimate of the directional second derivative of the gradient along `δ_1`, solves a second system with the *same* factorization, and accepts the correction only when the Transtrum-Sethna norm criterion holds. Sparse, constrained, and arrow-Schur paths intentionally skip this correction.
 
-**Gating.** Default off; opt in via `WorkingModelPirlsOptions::geodesic_acceleration: bool` (`src/solver/pirls.rs:1247`). Cost: ~1.3× per accepted step, big speedup on the problems that need it, no effect on the problems that don't.
+**Gating.** Default off; opt in via `WorkingModelPirlsOptions::geodesic_acceleration: bool` (`src/solver/pirls.rs:1289`). Cost: two extra `WorkingModel::update` calls per accepted dense step for the finite-difference evaluations; no effect on paths where the gate or eligibility checks are false.
 
 ### 4(f). Riemannian latent updates for topology-matched `LatentCoord`
 
@@ -220,7 +220,7 @@ model = gamfit.fit(
 )
 ```
 
-The Fisher inner product is *just* the choice of `W` inside `WorkingModel::update`. Nothing about REML, IFT, or basis evaluation changes — the standard machinery already differentiates through arbitrary `W` because PIRLS is written for it (`src/solver/pirls.rs:525-562`).
+The Fisher inner product is *just* the choice of `W` inside `WorkingModel::update`. Nothing about REML, IFT, or basis evaluation changes — the standard machinery already differentiates through arbitrary `W` because PIRLS is written for it (`src/solver/pirls.rs:526-529`).
 
 ### Principal-curve fitting (Hastie–Stuetzle)
 
@@ -256,22 +256,22 @@ This section is for the maintainers; it cites the precise sites that new work wo
 
 **The ext-coordinate machinery.** The end-to-end pipeline for design-moving hyperparameters is:
 
-1. `SpatialLogKappaCoords::from_length_scales_aniso` (`src/terms/smooth.rs:1835-1880`) constructs the flat ψ vector with a `dims_per_term` layout.
-2. `ImplicitDesignPsiDerivative` (`src/terms/basis.rs:3948`) provides `∂X/∂ψ` without materializing the dense matrix.
-3. `HyperDesignDerivative::from_implicit` (`src/solver/reml/mod.rs:2653-2668`) wraps the implicit operator into the storage type the REML machinery expects.
-4. `DirectionalHyperParam::new_compact(...)` + `.not_penalty_like()` (`src/terms/smooth.rs:12711-12717`) packages the per-direction first/second derivatives and tags the coordinate as design-moving.
-5. `RemlState::build_tau_unified_objects_from_bundle` (`src/solver/reml/runtime.rs:8115-8120`) builds the `HyperCoord` list, ext-pair functions, and fixed drift derivatives.
-6. `RemlState::evaluate_unified_with_psi_ext` (`src/solver/reml/runtime.rs:8104`) evaluates the unified REML/LAML score and its gradient with the ψ ext-coords folded in.
+1. `SpatialLogKappaCoords::from_length_scales_aniso` (`src/terms/smooth.rs:1844-1891`) constructs the flat ψ vector with a `dims_per_term` layout.
+2. `ImplicitDesignPsiDerivative` (`src/terms/basis.rs:4054`) provides `∂X/∂ψ` without materializing the dense matrix; `LatentCoordDesignDerivative` (`src/terms/basis.rs:4118`) does the analogous `∂X/∂t` work for latent coordinates.
+3. `HyperDesignDerivative::from_implicit` (`src/solver/reml/mod.rs:2706-2721`) wraps the implicit operator into the storage type the REML machinery expects.
+4. `DirectionalHyperParam::new_compact(...)` + `.not_penalty_like()` (`src/solver/reml/mod.rs:3277`, `src/solver/reml/mod.rs:3314`) packages the per-direction first/second derivatives and tags the coordinate as design-moving.
+5. `RemlState::build_tau_unified_objects_from_bundle` call site (`src/solver/reml/runtime.rs:8137-8143`) builds the `HyperCoord` list, ext-pair functions, and fixed drift derivatives.
+6. `RemlState::evaluate_unified_with_psi_ext` (`src/solver/reml/runtime.rs:8122`) evaluates the unified REML/LAML score and its gradient with the ψ/ext-coords folded in.
 
 A `LatentCoordValues` block uses every step of this pipeline. Step 1 becomes per-observation rather than per-term, but the storage shape is the same. Step 2 is the same operator with a different chain rule. Steps 3–6 are unchanged. The `is_penalty_like = false` semantics already isolate the design-moving case correctly.
 
-**The inner Newton solver.** `src/solver/pirls.rs:4493-4900` is the LM-damped Newton outer loop. The Newton direction is computed at one of three sites depending on backend: `solve_newton_directionwith_linear_constraints` (4841), `solve_newton_directionwith_lower_bounds` (4850), `solve_newton_direction_dense` (4859), with the sparse path at 4826-4828. Geodesic acceleration is a *post-processing* of the returned `direction`: with the factorization still in scope, evaluate the residual's second directional derivative along `δ_1`, then re-solve the same system for `δ_2`. The patch is local to this block and gated by a new field on `WorkingModelPirlsOptions`.
+**The inner Newton solver.** `src/solver/pirls.rs:4565-5165` is the LM-damped Newton outer loop. The Newton direction is computed at one of several sites depending on backend: sparse-native factor/solve (`src/solver/pirls.rs:4930-4949`), `solve_newton_directionwith_linear_constraints` (`src/solver/pirls.rs:4962`), `solve_newton_directionwith_lower_bounds` (`src/solver/pirls.rs:4971`), arrow-Schur (`src/solver/pirls.rs:4979-5038`), and dense-factor solve (`src/solver/pirls.rs:5040-5044`). Geodesic acceleration is a dense-path post-processing step (`src/solver/pirls.rs:5086-5153`): with the factorization still in scope, estimate the gradient's second directional derivative along `δ_1`, then re-solve the same system for `δ_2`. The path is gated by `WorkingModelPirlsOptions::geodesic_acceleration`.
 
-**REML outer loop.** `src/solver/outer_strategy.rs::OuterProblem` (referenced at `src/solver/workflow.rs:1938-1980`) drives the BFGS / compass-search loop in ρ. Adding ext-coords (`ψ`, latent `t`) lengthens the optimization vector but does not change the loop structure; this is already exercised for anisotropic `ψ`.
+**REML outer loop.** `src/solver/outer_strategy.rs::OuterProblem` (struct at `src/solver/outer_strategy.rs:4307`, workflow construction at `src/solver/workflow.rs:1968-1974`) drives the BFGS / compass-search loop in ρ. Adding ext-coords (`ψ`, latent `t`) lengthens the optimization vector but does not change the loop structure; this is already exercised for anisotropic `ψ`.
 
-**Penalty blocks.** `BlockwisePenalty` (`src/terms/smooth.rs:707`) and `KroneckerPenaltySystem` (`src/terms/smooth.rs:855`) already accept arbitrary user-constructed Gram blocks. The new isometry and auxiliary-conditional penalties slot in at this layer, with `PenaltyDerivativeComponent` (`src/solver/reml/mod.rs:3083`) carrying the `∂S/∂t` and `∂S/∂ρ` blocks.
+**Penalty blocks.** `BlockwisePenalty` (`src/terms/smooth.rs:707`) and `KroneckerPenaltySystem` (`src/terms/smooth.rs:855`) already accept arbitrary user-constructed Gram blocks. The analytic penalty layer now carries isometry, sparsity, and ARD penalties (`src/terms/analytic_penalties.rs:353`, `src/terms/analytic_penalties.rs:1141`, `src/terms/analytic_penalties.rs:1844`), with `PenaltyDerivativeComponent` (`src/solver/reml/mod.rs:3188`) carrying the `∂S/∂t` and `∂S/∂ρ` blocks.
 
-**What is new vs. extended.** New modules: a `latent_coord` module under `src/terms/` and a small `penalty/isometry.rs` + `penalty/aux_prior.rs`. Extended (not modified) traits: `BasisOutput` (`src/terms/basis.rs:248`) gains a small per-observation derivative method that most existing implementors can default to "go through `ImplicitDesignPsiDerivative`". No `WorkingModel` change is required for the Fisher-Rao use case; the trait is already general enough.
+**What is new vs. extended.** Landed modules now include `src/terms/latent_coord.rs` (`LatentCoordValues` at `src/terms/latent_coord.rs:561`) and `src/terms/analytic_penalties.rs` (`IsometryPenalty` at `src/terms/analytic_penalties.rs:353`). The derivative extension lives beside the basis machinery as `LatentCoordDesignDerivative` (`src/terms/basis.rs:4118`), rather than as a `BasisOutput` trait method. No `WorkingModel` change is required for the Fisher-Rao use case; the trait is already general enough.
 
 ## 7. Open questions and risks
 
@@ -286,10 +286,10 @@ A `LatentCoordValues` block uses every step of this pipeline. Step 1 becomes per
 **The Python `manifold_fit` ergonomic.** Composing `Latent`, `IsometryToReference`, ARD, and a Fisher working model in one `fit()` call is verbose. A thin `gamfit.manifold_fit(...)` wrapper that constructs the right combination from a handful of high-level knobs (`latent_dim`, `topology`, `auxiliary`, `metric`) is justified once §4(a)-(d) are implemented and the defaults are settled. This is a documentation and ergonomics task, not an architectural one.
 
 **Maintainers' clarifications wanted.**
-- Is the `BasisOutput` trait (`src/terms/basis.rs:248`) the right place to add a per-observation `∂X/∂t_n` method, or should that live on `ImplicitDesignPsiDerivative`? The latter is already where the radial-kernel chain rule lives.
+- The per-observation `∂X/∂t_n` method now lives in `LatentCoordDesignDerivative` (`src/terms/basis.rs:4118`) plus `LatentCoordValues::design_gradient_wrt_t_dispatch` (`src/terms/latent_coord.rs:825`), not on `BasisOutput` (`src/terms/basis.rs:270`). Is that the intended long-term ownership boundary?
 - Does `KroneckerPenaltySystem` support penalty blocks whose Gram is *not* a Kronecker product but depends on data (auxiliary-conditional precision)? If not, the auxiliary-conditional penalty needs to route through `BlockwisePenalty` only.
 - The `outer_ift_residual_energy_cache` (`src/solver/reml/runtime.rs:54`) keys on hashes of ρ. With ext-coords (`ψ`, `t`) in scope, the cache key should include them; is there an existing convention for extending the key in the anisotropic `ψ` path that `LatentCoordValues` should follow?
-- The `final_lm_lambda` warm-start (`src/solver/pirls.rs:1273, 1320`) suggests an existing inner-solver warm-start strategy. For `LatentCoordValues` whose values change between REML outer iterations, is warm-starting `t` from the previous outer iterate the intended behavior, and is there a hook for that?
+- The LM warm-start fields (`initial_lm_lambda` at `src/solver/pirls.rs:1274`, `final_lm_lambda` at `src/solver/pirls.rs:1414`) suggest an existing inner-solver warm-start strategy. For `LatentCoordValues` whose values change between REML outer iterations, is warm-starting `t` from the previous outer iterate the intended behavior, and is there a hook for that?
 
 A short reply to these from the maintainers would unblock a prototype `LatentCoord` patch that demonstrates the GP-LVM and principal-curve examples end-to-end on the existing test data. The remaining items (isometry, auxiliary prior, geodesic acceleration) are independent and can land in any order.
 
