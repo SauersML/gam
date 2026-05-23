@@ -32,7 +32,10 @@ Pass one of the following via `survival_likelihood=`:
 | `"location-scale"` | Joint location and log-scale survival model; requires a `noise_formula`. See [location-scale.md](location-scale.md). |
 | `"marginal-slope"` | Separates a calibrated risk-score effect from the baseline. See [marginal-slope.md](marginal-slope.md). |
 | `"latent"` | Parametric baseline with latent-Gaussian frailty integration. |
-| `"latent-binary"` | Binary response under the same latent-Gaussian framework as `"latent"`. Incompatible with `--predict-noise`. |
+| `"latent-binary"` | Binary response under the same latent-Gaussian framework as `"latent"`. |
+
+`--predict-noise` requires `survival_likelihood="location-scale"`; it
+is rejected for every other survival mode.
 
 ```python
 gamfit.fit(df,
@@ -49,10 +52,10 @@ For modes that support a parametric baseline (`"weibull"`,
 
 | `baseline_target` | Required extra parameters | Notes |
 | --- | --- | --- |
-| `"linear"` | none | I-spline monotone log-cumulative-hazard baseline. |
+| `"linear"` | none | Linear-in-log-time baseline `[1, log(age)]`. Pair with `timewiggle(...)` for flexible departures. |
 | `"weibull"` | `baseline_scale > 0`, `baseline_shape > 0` | Monotone hazard. |
-| `"gompertz"` | `baseline_rate > 0` | Exponentially-rising hazard. |
-| `"gompertz-makeham"` | `baseline_rate > 0`, `baseline_makeham > 0` | Gompertz hazard plus a constant additive floor. |
+| `"gompertz"` | `baseline_rate > 0`; `baseline_shape` optional (default 0.01, must be finite) | Exponentially-rising hazard. |
+| `"gompertz-makeham"` | `baseline_rate > 0`, `baseline_makeham > 0`; `baseline_shape` optional (default 0.01, must be finite) | Gompertz hazard plus a constant additive floor. |
 
 ```python
 gamfit.fit(df,
