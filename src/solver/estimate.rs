@@ -616,12 +616,17 @@ impl ParametricColumnConditioning {
         }
         result.beta = self.backtransform_beta(&result.beta);
         if let Some(inf) = result.inference.as_mut() {
-            inf.penalized_hessian = self.backtransform_penalized_hessian(&inf.penalized_hessian);
+            inf.penalized_hessian = self
+                .backtransform_penalized_hessian(inf.penalized_hessian.as_array())
+                .into();
             inf.beta_covariance = inf
                 .beta_covariance
                 .take()
-                .map(|cov| self.backtransform_covariance(&cov));
-            inf.beta_standard_errors = inf.beta_covariance.as_ref().map(se_from_covariance);
+                .map(|cov| self.backtransform_covariance(cov.as_array()).into());
+            inf.beta_standard_errors = inf
+                .beta_covariance
+                .as_ref()
+                .map(|c| se_from_covariance(c.as_array()));
             inf.beta_covariance_corrected = inf
                 .beta_covariance_corrected
                 .take()
@@ -5044,11 +5049,53 @@ impl UnifiedFitResult {
     }
 
     /// Get the penalized Hessian if available.
+    ///
+    /// Boundary accessor: returns `&Array2<f64>` so out-of-scope consumers
+    /// (CLI, GPU, families) keep their pre-newtype call shape. Use
+    /// [`Self::penalized_hessian_unscaled`] when the caller wants the
+    /// [`UnscaledPrecision`] newtype to enforce the dispersion-ownership
+    /// invariant.
     pub fn penalized_hessian(&self) -> Option<&Array2<f64>> {
+        self.inference
+            .as_ref()
+            .map(|inf| inf.penalized_hessian.as_array())
+            .or_else(|| {
+                self.geometry
+                    .as_ref()
+                    .map(|geom| geom.penalized_hessian.as_array())
+            })
+    }
+
+    /// Get the penalized Hessian as the [`UnscaledPrecision`] newtype if
+    /// available. Use this when constructing newtype-aware APIs (HMC
+    /// whitening, sampling) so the dispersion convention is enforced at
+    /// the type level.
+    pub fn penalized_hessian_unscaled(
+        &self,
+    ) -> Option<&crate::inference::dispersion_cov::UnscaledPrecision> {
         self.inference
             .as_ref()
             .map(|inf| &inf.penalized_hessian)
             .or_else(|| self.geometry.as_ref().map(|geom| &geom.penalized_hessian))
+    }
+
+    /// Get the φ-scaled posterior covariance as the [`PhiScaledCovariance`]
+    /// newtype if available, sourced from `FitInference::beta_covariance`.
+    ///
+    /// Prefer this over [`Self::beta_covariance`] in inference-internal
+    /// code so the φ-scaled invariant is type-enforced.
+    pub fn beta_covariance_phi_scaled(
+        &self,
+    ) -> Option<&crate::inference::dispersion_cov::PhiScaledCovariance> {
+        self.inference
+            .as_ref()
+            .and_then(|inf| inf.beta_covariance.as_ref())
+    }
+
+    /// Boundary accessor returning the raw covariance array for out-of-scope
+    /// consumers (CLI, GPU, families) that don't need the newtype.
+    pub fn beta_covariance_array(&self) -> Option<&Array2<f64>> {
+        self.beta_covariance_phi_scaled().map(|c| c.as_array())
     }
 
     /// Get working weights if available.
@@ -5959,7 +6006,7 @@ where
     let covariance_conditional = result
         .inference
         .as_ref()
-        .and_then(|inf| inf.beta_covariance.clone());
+        .and_then(|inf| inf.beta_covariance.as_ref().map(|c| c.as_array().clone()));
     let covariance_corrected = result
         .inference
         .as_ref()
@@ -6575,12 +6622,12 @@ mod estimate_policy_tests {
                 edf_by_block: vec![0.6, 0.9],
                 edf_total: 1.5,
                 smoothing_correction: Some(array![[0.2, 0.0], [0.0, 0.2]]),
-                penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]],
+                penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]].into(),
                 working_weights: array![1.0, 0.5, 0.75],
                 working_response: array![0.1, 0.2, 0.3],
                 reparam_qs: Some(array![[1.0, 0.0], [0.0, 1.0]]),
                 dispersion: Dispersion::Known(1.0),
-                beta_covariance: Some(array![[1.0, 0.1], [0.1, 2.0]]),
+                beta_covariance: Some(array![[1.0, 0.1], [0.1, 2.0]].into()),
                 beta_standard_errors: Some(array![1.0, 2.0_f64.sqrt()]),
                 beta_covariance_corrected: Some(array![[1.2, 0.1], [0.1, 2.2]]),
                 beta_standard_errors_corrected: Some(array![1.2_f64.sqrt(), 2.2_f64.sqrt()]),
@@ -6591,7 +6638,7 @@ mod estimate_policy_tests {
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: Some(FitGeometry {
-                penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]],
+                penalized_hessian: array![[2.0, 0.1], [0.1, 3.0]].into(),
                 working_weights: array![1.0, 0.5, 0.75],
                 working_response: array![0.1, 0.2, 0.3],
             }),
