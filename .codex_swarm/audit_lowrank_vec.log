@@ -1,0 +1,1863 @@
+Reading additional input from stdin...
+OpenAI Codex v0.128.0-alpha.1 (research preview)
+--------
+workdir: /Users/user/gam
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019e5650-9681-77b1-8c39-9c08a70c4da7
+--------
+user
+You are one agent in a parallel math-audit swarm for /Users/user/gam (Rust generalized additive model + latent-variable engine).
+
+HARD RULES:
+- DO NOT compile. DO NOT run cargo, rustc, python, tests, or anything executable.
+- Read source only via rg / cat / sed.
+- Report ONLY definitive math errors: wrong formula, wrong sign, wrong index, wrong constant, wrong derivative / Jacobian / Hessian / Weingarten, wrong likelihood, missing Jacobian for change of variable, wrong penalty matrix, wrong REML / LAML / Laplace evidence expression, wrong retraction or vector transport, wrong contraction order causing materialization of large matrices, missing numerical guards (ln(0), div by 0, sqrt of negative) that can actually trigger, wrong gauge term.
+- Do NOT report style / naming / performance / "could be clearer".
+- Each finding: file:line, wrong expression verbatim, correct expression with derivation/citation, severity (definitive vs likely).
+- If nothing definitive in your scope, say so explicitly. Do not invent issues.
+
+End your output with a FINDINGS section, numbered items.
+
+YOUR SCOPE: src/linalg/low_rank_weight.rs, src/linalg/matrix.rs (xt_diag_x_signed / _psd / _symmetric), src/families/vector_response.rs. Focus: low-rank weight W = D + U Vᵀ; Woodbury identity for inversion (W⁻¹ = D⁻¹ - D⁻¹U(I + Vᵀ D⁻¹ U)⁻¹ Vᵀ D⁻¹); X^T W X = X^T D X + (X^T U)(X^T V)ᵀ (verify never p' × p'); X^T W y = X^T D y + X^T U (Vᵀ y); capacitance matrix I_r + Vᵀ D⁻¹ U or its Gram-side analogue; row-vs-parameter Woodbury; for symmetric case U==V. Vector Gaussian likelihood derivatives ∂/∂η, ∂²/∂η².
+2026-05-23T19:29:42.828278Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when AuthRequired(AuthRequiredError { www_authenticate_header: "Bearer realm=\"OAuth\", resource_metadata=\"https://mcp.linear.app/.well-known/oauth-protected-resource/mcp\", error=\"invalid_token\", error_description=\"Missing or invalid access token\"" })
+codex
+I’ll read only the requested source files and nearby definitions needed to check formulas. I’ll avoid any executable commands beyond `rg`, `sed`, and `cat`.
+exec
+/bin/zsh -lc "sed -n '1,260p' src/linalg/low_rank_weight.rs" in /Users/user/gam
+exec
+/bin/zsh -lc "sed -n '1,260p' src/families/vector_response.rs" in /Users/user/gam
+exec
+/bin/zsh -lc "sed -n '1,280p' src/linalg/matrix.rs" in /Users/user/gam
+ succeeded in 0ms:
+//! Structured low-rank working weight: `W = D + U Vᵀ`.
+//!
+//! The PIRLS inner solve assembles a working weight `W ∈ ℝ^{n×n}` and forms
+//! the normal equations `(XᵀWX + S) β = XᵀWz`. Most working models supply a
+//! diagonal `W` (one scalar per observation), but Fisher-Rao / behavioral
+//! metrics that come from an *external* backward pass through a downstream
+//! model are not diagonal — they are diagonal **plus a structured low-rank
+//! correction** `U Vᵀ`, where `U, V ∈ ℝ^{n×r}` are tall-skinny and the rank
+//! `r ≪ n`. For symmetric metrics (the usual case) `U == V`, but the API
+//! does not assume it so we can support nonsymmetric weighting in IRLS
+//! corrections too.
+//!
+//! Crucially: the metric is supplied by the caller. This module never
+//! estimates a covariance internally.
+//!
+//! ## Composition with the existing signed-Gram API
+//!
+//! The diagonal part `D` flows through the existing `xt_diag_x_signed` /
+//! `xt_diag_x_psd` kernels exactly as before, so the rank-0 specialisation
+//! coincides with the legacy diagonal path. The low-rank correction adds
+//! `(XᵀU)(VᵀX)` — a `p × p` outer product of two tall-skinny matrices —
+//! computed in `O(n · p · r)` and *never* materialising an `n × n` weight.
+//!
+//! ## Woodbury / matrix-determinant lemma
+//!
+//! Solving with `W` directly:
+//!   (D + U Vᵀ)⁻¹ = D⁻¹ − D⁻¹U (I_r + Vᵀ D⁻¹ U)⁻¹ VᵀD⁻¹
+//!
+//! Solving with the *Gram* `A + Û V̂ᵀ` where `Â = XᵀDX + S`, `Û = XᵀU`,
+//! `V̂ = XᵀV`:
+//!   (A + Û V̂ᵀ)⁻¹ b = A⁻¹ b − A⁻¹ Û (I_r + V̂ᵀ A⁻¹ Û)⁻¹ V̂ᵀ A⁻¹ b
+//!
+//! The latter is the form PIRLS uses: one factorisation of the diagonal-W
+//! penalised system `A` (Cholesky, as today), then a rank-r capacitance
+//! solve of size `r × r`. The dimensionality of the corrected normal
+//! equation is `p × p`; nothing blows up to `n`.
+
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+
+use crate::faer_ndarray::{fast_ab, fast_atb, fast_atv};
+use crate::matrix::DesignMatrix;
+
+/// `W = diag(diag) + u · vᵀ`. Rows: `n`. Rank of correction: `u.ncols()`.
+///
+/// For a symmetric metric (the default in Fisher-Rao fits) the caller
+/// supplies `u == v` (use [`LowRankWeight::symmetric`]). Asymmetric
+/// weights are supported because observed-information IRLS can produce
+/// signed off-diagonal contributions.
+#[derive(Clone, Copy, Debug)]
+pub struct LowRankWeight<'a> {
+    pub diag: ArrayView1<'a, f64>,
+    pub u: ArrayView2<'a, f64>,
+    pub v: ArrayView2<'a, f64>,
+}
+
+impl<'a> LowRankWeight<'a> {
+    /// Construct a low-rank weight, validating shapes.
+    pub fn new(
+        diag: ArrayView1<'a, f64>,
+        u: ArrayView2<'a, f64>,
+        v: ArrayView2<'a, f64>,
+    ) -> Result<Self, String> {
+        let n = diag.len();
+        if u.nrows() != n {
+            return Err(format!(
+                "LowRankWeight: u has {} rows but diag has {} entries",
+                u.nrows(),
+                n
+            ));
+        }
+        if v.nrows() != n {
+            return Err(format!(
+                "LowRankWeight: v has {} rows but diag has {} entries",
+                v.nrows(),
+                n
+            ));
+        }
+        if u.ncols() != v.ncols() {
+            return Err(format!(
+                "LowRankWeight: u has rank {} but v has rank {}",
+                u.ncols(),
+                v.ncols()
+            ));
+        }
+        Ok(LowRankWeight { diag, u, v })
+    }
+
+    /// Symmetric metric: `W = D + U Uᵀ`.
+    pub fn symmetric(
+        diag: ArrayView1<'a, f64>,
+        u: ArrayView2<'a, f64>,
+    ) -> Result<Self, String> {
+        Self::new(diag, u, u)
+    }
+
+    #[inline]
+    pub fn nrows(&self) -> usize {
+        self.diag.len()
+    }
+
+    #[inline]
+    pub fn rank(&self) -> usize {
+        self.u.ncols()
+    }
+
+    #[inline]
+    pub fn is_rank_zero(&self) -> bool {
+        self.rank() == 0
+    }
+
+    /// `W · x` without materialising the `n × n` weight.
+    ///
+    /// Cost: `O(n) + O(n · r)`.
+    pub fn apply(&self, x: ArrayView1<'_, f64>) -> Array1<f64> {
+        let n = self.nrows();
+        assert_eq!(
+            x.len(),
+            n,
+            "LowRankWeight::apply: x has {} entries but W has {} rows",
+            x.len(),
+            n
+        );
+        // diag(D) · x
+        let mut out = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            out[i] = self.diag[i] * x[i];
+        }
+        if self.is_rank_zero() {
+            return out;
+        }
+        // U (Vᵀ x): Vᵀ x is r-dim, then U times r-vector.
+        let vtx = fast_atv(&self.v.to_owned(), &x.to_owned());
+        let uvtx = self.u.dot(&vtx);
+        out += &uvtx;
+        out
+    }
+
+    /// `Xᵀ W X = XᵀDX + (XᵀU)(VᵀX)`. The diagonal part is delegated to the
+    /// caller (so it can reuse the existing `xt_diag_x_signed` / `_psd`
+    /// kernels and any BLAS / sparse fast paths). This function adds the
+    /// rank-r correction in place into `xtwx`.
+    ///
+    /// Cost (correction only): `O(n · p · r) + O(p · p · r)` — the second
+    /// term is the final `p × p` outer-product accumulation and is the
+    /// dominant cost only when `n ≈ p`.
+    pub fn add_low_rank_xtwx_correction(
+        &self,
+        design: &DesignMatrix,
+        xtwx: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        if self.is_rank_zero() {
+            return Ok(());
+        }
+        let n = self.nrows();
+        if design.nrows() != n {
+            return Err(format!(
+                "add_low_rank_xtwx_correction: design has {} rows but weight has {}",
+                design.nrows(),
+                n
+            ));
+        }
+        let p = design.ncols();
+        if xtwx.nrows() != p || xtwx.ncols() != p {
+            return Err(format!(
+                "add_low_rank_xtwx_correction: xtwx is {}×{} but design has p={}",
+                xtwx.nrows(),
+                xtwx.ncols(),
+                p
+            ));
+        }
+
+        let xtu = transpose_design_times_dense(design, &self.u)?; // p × r
+        let xtv = if std::ptr::eq(self.u.as_ptr(), self.v.as_ptr())
+            && self.u.shape() == self.v.shape()
+        {
+            xtu.clone()
+        } else {
+            transpose_design_times_dense(design, &self.v)?
+        };
+
+        // xtwx += XᵀU · (XᵀV)ᵀ
+        let correction = fast_ab(&xtu, &xtv.t().to_owned());
+        *xtwx += &correction;
+        Ok(())
+    }
+
+    /// `Xᵀ W y = Xᵀ D y + (XᵀU)(Vᵀ y)`. Returns a fresh `p`-vector.
+    pub fn xtw_y(
+        &self,
+        design: &DesignMatrix,
+        y: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        let n = self.nrows();
+        if y.len() != n {
+            return Err(format!(
+                "xtw_y: y has {} entries but W has {} rows",
+                y.len(),
+                n
+            ));
+        }
+        // Xᵀ (D y)
+        let mut dy = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            dy[i] = self.diag[i] * y[i];
+        }
+        let mut out = design.transpose_vector_multiply(&dy);
+
+        if !self.is_rank_zero() {
+            // Vᵀ y, then (XᵀU) · (Vᵀ y)
+            let vty = fast_atv(&self.v.to_owned(), &y.to_owned());
+            let xtu = transpose_design_times_dense(design, &self.u)?; // p × r
+            let correction = xtu.dot(&vty);
+            out += &correction;
+        }
+        Ok(out)
+    }
+
+    /// Capacitance matrix `C = I_r + Vᵀ D⁻¹ U` for the row-space Woodbury.
+    ///
+    /// `(D + UVᵀ)⁻¹ = D⁻¹ − D⁻¹U C⁻¹ VᵀD⁻¹`. The caller is responsible for
+    /// ensuring `diag` has no zeros (the row-space Woodbury is rarely the
+    /// right path in PIRLS; see [`LowRankWeight::gram_capacitance`] for the
+    /// `p × p` form actually used by the penalised solve).
+    pub fn row_capacitance(&self) -> Array2<f64> {
+        let r = self.rank();
+        let n = self.nrows();
+        let mut cap = Array2::<f64>::eye(r);
+        if r == 0 {
+            return cap;
+        }
+        // D⁻¹ U: scale rows of U by 1/diag.
+        let mut dinv_u = self.u.to_owned();
+        for i in 0..n {
+            let inv = 1.0 / self.diag[i];
+            for k in 0..r {
+                dinv_u[[i, k]] *= inv;
+            }
+        }
+        // Vᵀ (D⁻¹ U)
+        let vtdinv_u = fast_atb(&self.v.to_owned(), &dinv_u);
+        cap += &vtdinv_u;
+        cap
+    }
+
+    /// Capacitance matrix in the *parameter-space* Woodbury used by the
+    /// penalised normal equations:
+    ///
+    ///   (A + Û V̂ᵀ)⁻¹ b = A⁻¹ b − A⁻¹ Û (I_r + V̂ᵀ A⁻¹ Û)⁻¹ V̂ᵀ A⁻¹ b
+    ///
+    /// Inputs: `a_inv_uhat = A⁻¹ Û` (size `p × r`, computed by the caller
+    /// against its Cholesky / sparse-SPD factor of `A = XᵀDX + S`) and
+    /// `vhat = V̂ = XᵀV` (size `p × r`).
+    ///
+    /// Output: `I_r + V̂ᵀ (A⁻¹ Û)`, the small `r × r` matrix the caller
+    /// inverts (Cholesky for symmetric metrics, LU otherwise).
+    pub fn gram_capacitance(
+        a_inv_uhat: &Array2<f64>,
+        vhat: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let r = a_inv_uhat.ncols();
+
+ succeeded in 0ms:
+//! Vector-valued response support.
+//!
+//! Many smooths sharing one latent: the shape function in the latent-variable
+//! engine maps to a reduced activation vector (tens-to-hundreds of dimensions,
+//! after a random-matrix noise cut). This module defines the response-side
+//! types, the Gaussian vector likelihood, and the connector trait the inner
+//! solver consumes.
+//!
+//! Conventions:
+//! - `Y` is shape `(N, M)`: `N` rows, `M` output dimensions.
+//! - `eta` is shape `(N, M)`: the linear predictor with one column per output.
+//! - For Gaussian identity-link, mean(η) = η, so the likelihood depends only
+//!   on `eta` and `Y`.
+//!
+//! The Hessian is block-structured: per-row (N independent blocks for the
+//! Gaussian case), each of size `(M, M)`. For a Gaussian likelihood with
+//! Diagonal/Isotropic noise this per-row block is itself diagonal — exactly
+//! what the arrow Schur elimination in `solver/arrow_schur.rs` consumes.
+
+use crate::estimate::EstimationError;
+use crate::linalg::low_rank_weight::LowRankWeight;
+use ndarray::{Array1, Array2, ArrayView2};
+
+/// Per-output noise model for a vector response.
+///
+/// `LowRank` hands off to Piece 5's [`LowRankWeight`] machinery; the inner
+/// `factor` is the `U` in the symmetric structured form `W = diag(diag) + U Uᵀ`.
+/// Storage here is owned (`Array1` / `Array2`); the caller acquires the
+/// borrowed `LowRankWeight<'_>` view through [`VectorNoise::as_low_rank_weight`].
+#[derive(Clone, Debug)]
+pub enum VectorNoise {
+    /// Shared σ across all M outputs: Σ = σ² I_M.
+    Isotropic(f64),
+    /// Per-output σ_m: Σ = diag(σ_m²).
+    Diagonal(Array1<f64>),
+    /// Symmetric structured form `W = diag(diag) + factor · factorᵀ`.
+    ///
+    /// Borrowed as a [`LowRankWeight`] via [`VectorNoise::as_low_rank_weight`].
+    LowRank {
+        diag: Array1<f64>,
+        factor: Array2<f64>,
+    },
+}
+
+impl VectorNoise {
+    /// Borrow a `LowRank` variant as Piece 5's [`LowRankWeight`] (symmetric:
+    /// `U == V`). Returns `None` for the diagonal / isotropic variants. The
+    /// returned view borrows the owned arrays inside `self`, so the caller
+    /// must keep `self` alive for the lifetime of the borrow.
+    ///
+    /// INTEGRATION-HOOK(piece-5): this is the canonical wire from
+    /// `VectorResponseTarget` into the structured weight kernel used by
+    /// `add_low_rank_xtwx_correction` / `xtw_y`.
+    pub fn as_low_rank_weight(&self) -> Option<Result<LowRankWeight<'_>, EstimationError>> {
+        match self {
+            Self::LowRank { diag, factor } => Some(
+                LowRankWeight::symmetric(diag.view(), factor.view())
+                    .map_err(EstimationError::InvalidInput),
+            ),
+            _ => None,
+        }
+    }
+}
+
+impl VectorNoise {
+    /// Per-output precision vector (1/σ_m²) for the Isotropic / Diagonal cases.
+    /// LowRank returns the diagonal piece only; the low-rank correction is
+    /// applied separately by the Piece 5 weight code.
+    pub fn diag_precision(&self, m: usize) -> Result<Array1<f64>, EstimationError> {
+        match self {
+            Self::Isotropic(sigma) => {
+                if !sigma.is_finite() || *sigma <= 0.0 {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "VectorNoise::Isotropic: σ must be > 0 and finite (got {sigma})",
+                    )));
+                }
+                let p = 1.0 / (sigma * sigma);
+                Ok(Array1::from_elem(m, p))
+            }
+            Self::Diagonal(sigma) => {
+                if sigma.len() != m {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "VectorNoise::Diagonal: σ length {} ≠ M={m}",
+                        sigma.len()
+                    )));
+                }
+                let mut out = Array1::<f64>::zeros(m);
+                for j in 0..m {
+                    let s = sigma[j];
+                    if !s.is_finite() || s <= 0.0 {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "VectorNoise::Diagonal: σ[{j}] must be > 0 and finite (got {s})",
+                        )));
+                    }
+                    out[j] = 1.0 / (s * s);
+                }
+                Ok(out)
+            }
+            Self::LowRank { diag, .. } => {
+                if diag.len() != m {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "VectorNoise::LowRank: diag length {} ≠ M={m}",
+                        diag.len()
+                    )));
+                }
+                let mut out = Array1::<f64>::zeros(m);
+                for j in 0..m {
+                    let d = diag[j];
+                    if !d.is_finite() || d <= 0.0 {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "VectorNoise::LowRank: diag[{j}] must be > 0 (got {d})",
+                        )));
+                    }
+                    out[j] = 1.0 / d;
+                }
+                Ok(out)
+            }
+        }
+    }
+}
+
+/// Vector-valued response target.
+///
+/// `y` is `(N, M)`; `row_weights` (if present) is length `N` and scales the
+/// per-row contribution to the likelihood (e.g. observation weights from a
+/// re-sampling or inverse-probability scheme).
+#[derive(Clone, Debug)]
+pub struct VectorResponseTarget {
+    /// shape (N, M) — N rows × M output dimensions.
+    pub y: Array2<f64>,
+    /// per-output noise (or shared scalar).
+    pub noise: VectorNoise,
+    /// optional row weights (N,).
+    pub row_weights: Option<Array1<f64>>,
+}
+
+impl VectorResponseTarget {
+    pub fn new(y: Array2<f64>, noise: VectorNoise) -> Self {
+        Self {
+            y,
+            noise,
+            row_weights: None,
+        }
+    }
+
+    pub fn with_row_weights(mut self, w: Array1<f64>) -> Result<Self, EstimationError> {
+        if w.len() != self.y.nrows() {
+            return Err(EstimationError::InvalidInput(format!(
+                "row_weights length {} ≠ N={}",
+                w.len(),
+                self.y.nrows()
+            )));
+        }
+        self.row_weights = Some(w);
+        Ok(self)
+    }
+
+    pub fn n(&self) -> usize {
+        self.y.nrows()
+    }
+    pub fn m(&self) -> usize {
+        self.y.ncols()
+    }
+}
+
+/// Connector trait the inner solver (Piece 1) plugs into.
+///
+/// `eta` is the `(N, M)` linear predictor; `y` is the `(N, M)` target. The
+/// implementation is responsible for any link inversion. The `hess_diag`
+/// return is the per-element diagonal of the per-row Hessian block; for a
+/// Diagonal-noise Gaussian this is exactly `(N, M)` of per-output precisions.
+pub trait VectorLikelihood {
+    /// log p(Y | η).
+    fn log_lik(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> f64;
+
+    /// ∂ log p(Y | η) / ∂ η, shape (N, M).
+    fn grad_eta(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64>;
+
+    /// Diagonal of the per-row Hessian −∂² log p / ∂ η ∂ η, shape (N, M).
+    /// This is the per-row block consumed by `solver/arrow_schur.rs`.
+    fn hess_diag(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64>;
+}
+
+/// Gaussian vector likelihood with identity link.
+///
+/// `log p(Y|η) = −½ Σ_n Σ_m w_n · prec_m · (Y_{n,m} − η_{n,m})²` (up to the
+/// constant log-determinant of the noise covariance, dropped here because it
+/// does not depend on β or the latent t; the determinant is accounted for in
+/// the REML score, not the inner likelihood).
+#[derive(Clone, Debug)]
+pub struct GaussianVectorLikelihood {
+    /// Per-output diagonal precision (length M). For Isotropic/Diagonal/LowRank
+    /// this is `1/σ_m²` (LowRank's off-diagonal correction is applied through
+    /// Piece 5's `LowRankWeight` outside this struct).
+    pub precision: Array1<f64>,
+    /// Optional row weights (length N), or None for uniform.
+    pub row_weights: Option<Array1<f64>>,
+}
+
+impl GaussianVectorLikelihood {
+    pub fn from_target(target: &VectorResponseTarget) -> Result<Self, EstimationError> {
+        let precision = target.noise.diag_precision(target.m())?;
+        Ok(Self {
+            precision,
+            row_weights: target.row_weights.clone(),
+        })
+    }
+
+    #[inline]
+    fn row_weight(&self, n: usize) -> f64 {
+        self.row_weights.as_ref().map_or(1.0, |w| w[n])
+    }
+}
+
+impl VectorLikelihood for GaussianVectorLikelihood {
+    fn log_lik(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> f64 {
+        debug_assert_eq!(eta.dim(), y.dim());
+        debug_assert_eq!(eta.ncols(), self.precision.len());
+        let mut acc = 0.0;
+        for n in 0..eta.nrows() {
+            let w = self.row_weight(n);
+            let mut row_acc = 0.0;
+            for m in 0..eta.ncols() {
+                let r = y[[n, m]] - eta[[n, m]];
+                row_acc += self.precision[m] * r * r;
+            }
+            acc += w * row_acc;
+        }
+        -0.5 * acc
+    }
+
+    fn grad_eta(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64> {
+        debug_assert_eq!(eta.dim(), y.dim());
+        let (n_rows, n_cols) = eta.dim();
+        let mut out = Array2::<f64>::zeros((n_rows, n_cols));
+        for n in 0..n_rows {
+            let w = self.row_weight(n);
+            for m in 0..n_cols {
+                // ∂/∂η_{n,m} of −½ w · prec_m · (y − η)² = w · prec_m · (y − η)
+                out[[n, m]] = w * self.precision[m] * (y[[n, m]] - eta[[n, m]]);
+            }
+        }
+        out
+    }
+
+    fn hess_diag(&self, eta: ArrayView2<f64>, _y: ArrayView2<f64>) -> Array2<f64> {
+        // −∂² log p / ∂η² = w · prec_m, independent of η for Gaussian-identity.
+        let (n_rows, n_cols) = eta.dim();
+        let mut out = Array2::<f64>::zeros((n_rows, n_cols));
+        for n in 0..n_rows {
+            let w = self.row_weight(n);
+            for m in 0..n_cols {
+                out[[n, m]] = w * self.precision[m];
+            }
+        }
+        out
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+ succeeded in 0ms:
+use crate::faer_ndarray::{
+    FaerArrayView, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_atv_into, fast_av,
+    fast_av_into, fast_xt_diag_x,
+};
+use crate::resource::{
+    MaterializationPolicy, MatrixMaterializationError, ResourcePolicy, rows_for_target_bytes,
+};
+use crate::types::RidgePolicy;
+use faer::Accum;
+use faer::Par;
+use faer::linalg::matmul::matmul;
+use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
+use ndarray::{
+    Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, ShapeBuilder, s,
+};
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use rayon::slice::ParallelSliceMut;
+use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::ops::Deref;
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
+
+const MATRIX_FREE_PCG_MIN_P: usize = 2048;
+const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
+const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
+const MAX_SINGLE_DENSE_MATERIALIZATION_BYTES: usize = 256 * 1024 * 1024;
+const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_SPARSE_TO_DENSE_BYTES: usize = MAX_SINGLE_DENSE_MATERIALIZATION_BYTES;
+const CHUNKED_DENSE_MATERIALIZATION_BYTES: usize = 8 * 1024 * 1024;
+const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
+const KERNEL_OPERATOR_ROW_CHUNK_SIZE: usize = 2048;
+/// Minimum n*p product for the dense-row parallel fold/reduce paths
+/// (`diag_gram`, `apply_weighted_normal`, `dense_transpose_matvec_view`).
+/// Below this, the sequential row loop wins on overhead.
+const DENSE_ROW_PARALLEL_MIN_NP: u64 = 200_000;
+const WEIGHTED_CROSSPROD_PARALLEL_MIN_FLOPS: u64 = 500_000;
+const SPARSE_ROW_PARALLEL_MIN_FLOPS: u64 = 100_000;
+/// Maximum bytes for the (n, tail_total) intermediate in GEMM-batched tensor
+/// product matvecs.  Beyond this threshold, fall back to per-column GEMV.
+const TENSOR_GEMM_MAX_INTERMEDIATE_BYTES: usize = 128 * 1024 * 1024; // 128 MB
+
+pub use crate::linalg::utils::PcgSolveInfo;
+
+/// Typed error for `src/linalg/matrix.rs` operations.  All error sites in this
+/// module construct a `MatrixError` variant; trait method bodies that still
+/// return `Result<_, String>` convert via `From<MatrixError> for String` (which
+/// is byte-equivalent to the prior `format!` / `to_string` payloads).
+#[derive(Debug, Clone)]
+pub enum MatrixError {
+    /// Operand shapes (rows, columns, lengths) do not satisfy the operation's
+    /// dimension contract.  Also covers integer-overflow in dimension products.
+    DimensionMismatch { reason: String },
+    /// Refused to materialize an operator-backed or sparse design to a dense
+    /// `Array2<f64>` because the active `ResourcePolicy` (size cap or strict
+    /// operator-only mode) forbids it.
+    DensificationRefused { reason: String },
+    /// A constructor that requires at least one block / channel / marginal was
+    /// called with an empty vector.
+    EmptyInput { reason: String },
+    /// A value that must be finite (e.g. a fully-materialized symmetric matrix
+    /// entry) was `NaN` or `±inf`.
+    NonFiniteEntry { reason: String },
+    /// The requested operation is not supported for the given operator kind
+    /// (e.g. matrix-free PCG only runs for eligible operators).
+    Unsupported { reason: String },
+    /// A numerical procedure failed to produce a usable answer (e.g. PCG
+    /// exhausted its ridge-retry budget).
+    NumericalFailure { reason: String },
+}
+
+impl std::fmt::Display for MatrixError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MatrixError::DimensionMismatch { reason }
+            | MatrixError::DensificationRefused { reason }
+            | MatrixError::EmptyInput { reason }
+            | MatrixError::NonFiniteEntry { reason }
+            | MatrixError::Unsupported { reason }
+            | MatrixError::NumericalFailure { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for MatrixError {}
+
+impl From<MatrixError> for String {
+    #[inline]
+    fn from(err: MatrixError) -> String {
+        err.to_string()
+    }
+}
+
+#[inline]
+fn dense_materialization_chunk_rows(nrows: usize, ncols: usize) -> usize {
+    rows_for_target_bytes(CHUNKED_DENSE_MATERIALIZATION_BYTES, ncols)
+        .max(1)
+        .min(nrows.max(1))
+}
+
+fn dense_operator_to_dense_by_chunks<O: DenseDesignOperator + ?Sized>(
+    op: &O,
+) -> Result<Array2<f64>, MatrixMaterializationError> {
+    let n = op.nrows();
+    let p = op.ncols();
+    let chunk_rows = dense_materialization_chunk_rows(n, p);
+    let mut out = Array2::<f64>::zeros((n, p));
+    for start in (0..n).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(n);
+        let slice = out.slice_mut(s![start..end, ..]);
+        op.row_chunk_into(start..end, slice)?;
+    }
+    Ok(out)
+}
+
+fn checked_dense_nbytes(nrows: usize, ncols: usize, context: &str) -> Result<usize, String> {
+    nrows
+        .checked_mul(ncols)
+        .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
+        .ok_or_else(|| {
+            MatrixError::DimensionMismatch {
+                reason: format!("{context}: dense size overflow for {nrows}x{ncols}"),
+            }
+            .into()
+        })
+}
+
+pub fn panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
+    context: &str,
+    n: usize,
+    p: usize,
+    policy: &ResourcePolicy,
+) -> Result<(), String> {
+    // Strict-operator mode: refuse any dense materialization, regardless of
+    // size.  Callers in this mode have committed to operator-only math; any
+    // dense fallback (cache or otherwise) violates that contract and would
+    // silently turn an analytic-operator path into a hidden dense path at
+    // biobank scale.
+    if matches!(
+        policy.derivative_storage_mode,
+        crate::resource::DerivativeStorageMode::AnalyticOperatorRequired
+    ) {
+        return Err(MatrixError::DensificationRefused {
+            reason: format!(
+                "{context}: refusing to densify operator-backed design {n}x{p} under \
+             AnalyticOperatorRequired policy; provide an operator-form path"
+            ),
+        }
+        .into());
+    }
+    let dense_bytes = checked_dense_nbytes(n, p, context)?;
+    let limit = policy.max_single_materialization_bytes;
+    if dense_bytes > limit {
+        let gib = dense_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        return Err(MatrixError::DensificationRefused {
+            reason: format!(
+                "{context}: refusing to densify operator-backed design {n}x{p} (~{gib:.2} GiB); use matrix-free or chunked code"
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn weighted_crossprod_dense(
+    left: &Array2<f64>,
+    weights: &Array1<f64>,
+    right: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    if left.nrows() != weights.len() || right.nrows() != weights.len() {
+        return Err(MatrixError::DimensionMismatch {
+            reason: format!(
+                "weighted_crossprod_dense row mismatch: left={}, weights={}, right={}",
+                left.nrows(),
+                weights.len(),
+                right.nrows()
+            ),
+        }
+        .into());
+    }
+    Ok(weighted_crossprod_dense_view(left, weights.view(), right))
+}
+
+fn weighted_crossprod_dense_view(
+    left: &Array2<f64>,
+    weights: ArrayView1<'_, f64>,
+    right: &Array2<f64>,
+) -> Array2<f64> {
+    let n = weights.len();
+    let p_left = left.ncols();
+    let p_right = right.ncols();
+    let work = (n as u64)
+        .saturating_mul(p_left as u64)
+        .saturating_mul(p_right as u64);
+    if rayon::current_num_threads() <= 1 || work < WEIGHTED_CROSSPROD_PARALLEL_MIN_FLOPS {
+        return weighted_crossprod_dense_rows(left, weights, right, 0..n);
+    }
+
+    let n_threads = rayon::current_num_threads();
+    let chunk_rows = n.div_ceil(n_threads * 4).max(1);
+    let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
+    let partials: Vec<Array2<f64>> = starts
+        .into_par_iter()
+        .map(|start| {
+            weighted_crossprod_dense_rows(left, weights, right, start..(start + chunk_rows).min(n))
+        })
+        .collect();
+    let mut out = Array2::<f64>::zeros((p_left, p_right));
+    for partial in &partials {
+        out += partial;
+    }
+    out
+}
+
+fn weighted_crossprod_dense_rows(
+    left: &Array2<f64>,
+    weights: ArrayView1<'_, f64>,
+    right: &Array2<f64>,
+    rows: Range<usize>,
+) -> Array2<f64> {
+    // PSD precondition: callers (Fisher-scoring weighted crossprod) must supply
+    // nonneg weights. The prior `.max(0.0)` clip silently discarded
+    // negative-curvature contributions and masked sign bugs upstream; the debug
+    // assertion turns that into a loud failure in tests instead.
+    debug_assert!(
+        weights.iter().all(|&w| w >= 0.0),
+        "weighted_crossprod_dense_rows requires nonneg weights; use the signed Gram routine for observed-Hessian assembly"
+    );
+    let p_left = left.ncols();
+    let p_right = right.ncols();
+    let mut out = Array2::<f64>::zeros((p_left, p_right));
+    if left.is_standard_layout() && right.is_standard_layout() {
+        if let (Some(lx), Some(rx), Some(w)) =
+            (left.as_slice(), right.as_slice(), weights.as_slice())
+        {
+            let out_slice = out.as_slice_mut().expect("zeros are contiguous");
+            for i in rows {
+                let wi = w[i];
+                if wi == 0.0 {
+                    continue;
+                }
+                let l_row = &lx[i * p_left..i * p_left + p_left];
+                let r_row = &rx[i * p_right..i * p_right + p_right];
+                for a in 0..p_left {
+                    let scaled = wi * l_row[a];
+                    if scaled == 0.0 {
+                        continue;
+                    }
+                    let out_row = &mut out_slice[a * p_right..a * p_right + p_right];
+                    for b in 0..p_right {
+                        out_row[b] += scaled * r_row[b];
+                    }
+                }
+            }
+            return out;
+        }
+    }
+    for i in rows {
+        let wi = weights[i];
+        if wi == 0.0 {
+            continue;
+        }
+        for a in 0..p_left {
+            let scaled = wi * left[[i, a]];
+            if scaled == 0.0 {
+                continue;
+            }
+            for b in 0..p_right {
+                out[[a, b]] += scaled * right[[i, b]];
+            }
+        }
+    }
+    out
+}
+
+pub struct DenseRightProductView<'a> {
+    base: &'a Array2<f64>,
+    first: Option<&'a Array2<f64>>,
+    second: Option<&'a Array2<f64>>,
+}
+
+codex
+I have the top-level formulas now. Next I’m narrowing to the exact implementations and line numbers for the scoped Gram kernels and the remaining low-rank helper methods.
+exec
+/bin/zsh -lc "sed -n '260,560p' src/linalg/low_rank_weight.rs" in /Users/user/gam
+ succeeded in 0ms:
+        let r = a_inv_uhat.ncols();
+        if vhat.ncols() != r {
+            return Err(format!(
+                "gram_capacitance: vhat rank {} != a_inv_uhat rank {}",
+                vhat.ncols(),
+                r
+            ));
+        }
+        if a_inv_uhat.nrows() != vhat.nrows() {
+            return Err(format!(
+                "gram_capacitance: a_inv_uhat has {} rows but vhat has {}",
+                a_inv_uhat.nrows(),
+                vhat.nrows()
+            ));
+        }
+        let mut cap = fast_atb(vhat, a_inv_uhat);
+        for k in 0..r {
+            cap[[k, k]] += 1.0;
+        }
+        Ok(cap)
+    }
+
+    /// Convenience: project `(XᵀU)` for the penalised-Gram Woodbury. This
+    /// is `Û = XᵀU` (size `p × r`).
+    pub fn project_u(&self, design: &DesignMatrix) -> Result<Array2<f64>, String> {
+        transpose_design_times_dense(design, &self.u)
+    }
+
+    /// Convenience: project `V̂ = XᵀV` (size `p × r`).
+    pub fn project_v(&self, design: &DesignMatrix) -> Result<Array2<f64>, String> {
+        transpose_design_times_dense(design, &self.v)
+    }
+}
+
+/// `Xᵀ · M` where `M` is a tall-skinny dense matrix (`n × r`). Routes
+/// through `DesignMatrix::transpose_vector_multiply` column by column,
+/// which preserves the sparse / operator-backed fast paths. Returns a
+/// dense `p × r` matrix.
+fn transpose_design_times_dense(
+    design: &DesignMatrix,
+    m: &ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    let n = design.nrows();
+    let p = design.ncols();
+    let r = m.ncols();
+    if m.nrows() != n {
+        return Err(format!(
+            "transpose_design_times_dense: design has {} rows but M has {}",
+            n,
+            m.nrows()
+        ));
+    }
+    let mut out = Array2::<f64>::zeros((p, r));
+    if r == 0 {
+        return Ok(out);
+    }
+    // Dense fast path: a single GEMM `Xᵀ M` if X is materialised dense.
+    if let Some(dense) = design.as_dense() {
+        // Xᵀ · M  ≡  fast_atb(X, M)
+        let xt_m = fast_atb(&dense.to_owned(), &m.to_owned());
+        return Ok(xt_m);
+    }
+    // Generic path: column-by-column applies — preserves whatever
+    // operator-backed apply_transpose the design supplies.
+    for (k, col) in m.axis_iter(Axis(1)).enumerate() {
+        let col_owned = col.to_owned();
+        let xt_col = design.transpose_vector_multiply(&col_owned);
+        out.column_mut(k).assign(&xt_col);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::matrix::DesignMatrix;
+    use ndarray::array;
+
+    /// Build a tiny dense design and a corresponding `DesignMatrix::Dense`.
+    fn small_design() -> DesignMatrix {
+        let x = array![
+            [1.0, 0.5, -0.2],
+            [0.3, 1.2, 0.4],
+            [-0.1, 0.7, 1.0],
+            [0.6, -0.3, 0.8],
+            [0.2, 0.9, -0.5],
+        ];
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x))
+    }
+
+    /// Reference dense weight `W = diag(d) + u vᵀ`.
+    fn dense_w(d: &Array1<f64>, u: &Array2<f64>, v: &Array2<f64>) -> Array2<f64> {
+        let n = d.len();
+        let mut w = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            w[[i, i]] = d[i];
+        }
+        let uvt = fast_ab(u, &v.t().to_owned());
+        w + &uvt
+    }
+
+    #[test]
+    fn apply_matches_dense() {
+        let d = array![1.0, 2.0, 0.5, 1.5, 0.8];
+        let u = array![[0.1, -0.2], [0.4, 0.3], [-0.1, 0.5], [0.2, 0.1], [0.0, -0.3]];
+        let v = array![[0.2, 0.1], [0.0, 0.4], [0.3, -0.2], [-0.1, 0.6], [0.5, 0.0]];
+        let lr = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
+        let x = array![1.0, -2.0, 0.5, 0.3, -1.0];
+        let got = lr.apply(x.view());
+        let w = dense_w(&d, &u, &v);
+        let want = w.dot(&x);
+        for i in 0..got.len() {
+            assert!((got[i] - want[i]).abs() < 1e-12, "row {}: {} vs {}", i, got[i], want[i]);
+        }
+    }
+
+    #[test]
+    fn xtwx_correction_matches_dense() {
+        let design = small_design();
+        let d = array![1.0, 2.0, 0.5, 1.5, 0.8];
+        let u = array![[0.1, -0.2], [0.4, 0.3], [-0.1, 0.5], [0.2, 0.1], [0.0, -0.3]];
+        let v = array![[0.2, 0.1], [0.0, 0.4], [0.3, -0.2], [-0.1, 0.6], [0.5, 0.0]];
+        let lr = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
+
+        let mut xtwx = design.compute_xtwx(&d).unwrap();
+        lr.add_low_rank_xtwx_correction(&design, &mut xtwx).unwrap();
+
+        // Reference: Xᵀ W X with the full dense W.
+        let xdense = design.as_dense().unwrap().to_owned();
+        let w = dense_w(&d, &u, &v);
+        let want = xdense.t().dot(&w).dot(&xdense);
+
+        for i in 0..xtwx.nrows() {
+            for j in 0..xtwx.ncols() {
+                assert!(
+                    (xtwx[[i, j]] - want[[i, j]]).abs() < 1e-10,
+                    "({},{}): {} vs {}",
+                    i,
+                    j,
+                    xtwx[[i, j]],
+                    want[[i, j]]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn xtwy_matches_dense() {
+        let design = small_design();
+        let d = array![1.0, 2.0, 0.5, 1.5, 0.8];
+        let u = array![[0.1, -0.2], [0.4, 0.3], [-0.1, 0.5], [0.2, 0.1], [0.0, -0.3]];
+        let v = array![[0.2, 0.1], [0.0, 0.4], [0.3, -0.2], [-0.1, 0.6], [0.5, 0.0]];
+        let lr = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
+        let y = array![0.7, -1.2, 0.3, 0.9, -0.4];
+        let got = lr.xtw_y(&design, y.view()).unwrap();
+
+        let xdense = design.as_dense().unwrap().to_owned();
+        let w = dense_w(&d, &u, &v);
+        let want = xdense.t().dot(&w.dot(&y));
+        for i in 0..got.len() {
+            assert!(
+                (got[i] - want[i]).abs() < 1e-10,
+                "i={}: {} vs {}",
+                i,
+                got[i],
+                want[i]
+            );
+        }
+    }
+
+    #[test]
+    fn rank_zero_reduces_to_diagonal() {
+        let design = small_design();
+        let d = array![1.0, 2.0, 0.5, 1.5, 0.8];
+        let u = Array2::<f64>::zeros((5, 0));
+        let v = Array2::<f64>::zeros((5, 0));
+        let lr = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
+        assert!(lr.is_rank_zero());
+
+        let mut xtwx = design.compute_xtwx(&d).unwrap();
+        let baseline = xtwx.clone();
+        lr.add_low_rank_xtwx_correction(&design, &mut xtwx).unwrap();
+        // Correction must be the zero matrix when r=0.
+        let diff = (&xtwx - &baseline).mapv(f64::abs).sum();
+        assert!(diff < 1e-14, "rank-0 correction left {}", diff);
+
+        // xtw_y should equal Xᵀ (D y) exactly.
+        let y = array![0.7, -1.2, 0.3, 0.9, -0.4];
+        let got = lr.xtw_y(&design, y.view()).unwrap();
+        let dy: Array1<f64> = (&d) * (&y);
+        let want = design.transpose_vector_multiply(&dy);
+        let diff = (&got - &want).mapv(f64::abs).sum();
+        assert!(diff < 1e-14);
+    }
+
+    #[test]
+    fn woodbury_row_capacitance_inverts_w() {
+        // (D + UVᵀ)⁻¹ from row-space Woodbury must match dense inverse.
+        let d = array![1.0, 2.0, 0.5, 1.5, 0.8];
+        let u = array![[0.1, -0.2], [0.4, 0.3], [-0.1, 0.5], [0.2, 0.1], [0.0, -0.3]];
+        let v = array![[0.2, 0.1], [0.0, 0.4], [0.3, -0.2], [-0.1, 0.6], [0.5, 0.0]];
+        let lr = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
+
+        let cap = lr.row_capacitance();
+        // Invert cap by a small LU via solving against I.
+        let cap_inv = small_inverse(&cap);
+
+        // Compute Woodbury inverse acting on a probe vector b:
+        //   W⁻¹ b = D⁻¹ b − D⁻¹ U cap⁻¹ Vᵀ D⁻¹ b
+        let b = array![1.0, -2.0, 0.5, 0.3, -1.0];
+        let dinv_b: Array1<f64> = (&b) / (&d);
+        let vt_dinvb = fast_atv(&v, &dinv_b);
+        let cap_inv_vt = cap_inv.dot(&vt_dinvb);
+        let u_correction = u.dot(&cap_inv_vt);
+        let dinv_u_correction: Array1<f64> = (&u_correction) / (&d);
+        let w_inv_b = &dinv_b - &dinv_u_correction;
+
+        // Reference: dense (D + UVᵀ) solved against b.
+        let w = dense_w(&d, &u, &v);
+        let w_inv = small_inverse(&w);
+        let want = w_inv.dot(&b);
+
+        for i in 0..w_inv_b.len() {
+            assert!(
+                (w_inv_b[i] - want[i]).abs() < 1e-9,
+                "i={}: woodbury {} vs dense {}",
+                i,
+                w_inv_b[i],
+                want[i]
+            );
+        }
+    }
+
+    #[test]
+    fn woodbury_gram_capacitance_consistency() {
+        // The penalised-Gram Woodbury at p × p: with A = XᵀDX + S (S=0
+        // here for simplicity) and Û=XᵀU, V̂=XᵀV, the corrected solve
+        //   (A + Û V̂ᵀ)⁻¹ b = A⁻¹ b − A⁻¹ Û cap⁻¹ V̂ᵀ A⁻¹ b
+        // must match the dense `(XᵀWX)⁻¹ b`.
+        let design = small_design();
+        let xdense = design.as_dense().unwrap().to_owned();
+        let d = array![1.0, 2.0, 0.5, 1.5, 0.8];
+        let u = array![[0.1, -0.2], [0.4, 0.3], [-0.1, 0.5], [0.2, 0.1], [0.0, -0.3]];
+        let v = array![[0.2, 0.1], [0.0, 0.4], [0.3, -0.2], [-0.1, 0.6], [0.5, 0.0]];
+        let lr = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
+
+        let a = design.compute_xtwx(&d).unwrap(); // p × p
+        let a_inv = small_inverse(&a);
+        let uhat = lr.project_u(&design).unwrap(); // p × r
+        let vhat = lr.project_v(&design).unwrap(); // p × r
+        let a_inv_uhat = a_inv.dot(&uhat);
+        let cap = LowRankWeight::gram_capacitance(&a_inv_uhat, &vhat).unwrap();
+        let cap_inv = small_inverse(&cap);
+
+        let b = array![0.5, -1.0, 0.4];
+        let a_inv_b = a_inv.dot(&b);
+        let vt_ainv_b = vhat.t().dot(&a_inv_b);
+        let cap_inv_v = cap_inv.dot(&vt_ainv_b);
+        let correction = a_inv_uhat.dot(&cap_inv_v);
+        let got = &a_inv_b - &correction;
+
+        // Reference: dense (XᵀWX)⁻¹ b.
+        let w = dense_w(&d, &u, &v);
+        let xtwx_full = xdense.t().dot(&w).dot(&xdense);
+        let want = small_inverse(&xtwx_full).dot(&b);
+
+        for i in 0..got.len() {
+            assert!(
+                (got[i] - want[i]).abs() < 1e-8,
+                "i={}: gram-woodbury {} vs dense {}",
+                i,
+                got[i],
+                want[i]
+            );
+        }
+    }
+
+    /// Tiny Gauss-Jordan inverse, used only by these unit tests.
+    fn small_inverse(a: &Array2<f64>) -> Array2<f64> {
+        let n = a.nrows();
+        assert_eq!(a.ncols(), n);
+        let mut aug = Array2::<f64>::zeros((n, 2 * n));
+        for i in 0..n {
+            for j in 0..n {
+                aug[[i, j]] = a[[i, j]];
+            }
+            aug[[i, n + i]] = 1.0;
+        }
+        for i in 0..n {
+            // pivot
+            let mut piv = i;
+            let mut best = aug[[i, i]].abs();
+            for k in (i + 1)..n {
+                if aug[[k, i]].abs() > best {
+                    best = aug[[k, i]].abs();
+                    piv = k;
+                }
+            }
+            if piv != i {
+                for j in 0..(2 * n) {
+                    let tmp = aug[[i, j]];
+
+exec
+/bin/zsh -lc "sed -n '260,620p' src/families/vector_response.rs" in /Users/user/gam
+exec
+/bin/zsh -lc 'rg -n "xt_diag_x_(signed|psd|symmetric)|fn xt_diag_x|diag_x" src/linalg/matrix.rs' in /Users/user/gam
+ succeeded in 0ms:
+// ─────────────────────────────────────────────────────────────────────────────
+// Piece 5 / Piece 1 integration hooks
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Re-export of Piece 5's structured weight type. Callers driving the
+/// behavioral-metric weighted Gauss-Newton step (`XᵀWr`, `XᵀWX`) consume
+/// `VectorNoise::as_low_rank_weight(&noise)` to acquire a borrowed view of
+/// this type backed by the owned arrays inside `VectorResponseTarget`.
+///
+/// INTEGRATION-HOOK(piece-5): the canonical wire is
+/// `vector_noise.as_low_rank_weight()` → `LowRankWeight::add_low_rank_xtwx_correction`
+/// / `LowRankWeight::xtw_y`, which together assemble
+/// `XᵀWX = XᵀDX + (XᵀU)(XᵀU)ᵀ` and `Xᵀ W r = XᵀDr + (XᵀU)(Uᵀ r)` without ever
+/// materialising the N×N weight.
+pub use crate::linalg::low_rank_weight::LowRankWeight as VectorWeight;
+
+/// Per-row Hessian block consumed by the arrow Schur elimination in
+/// `solver/arrow_schur.rs`.
+///
+/// For the Gaussian-identity case the block is diagonal, so we expose just the
+/// `(M,)` diagonal here. When non-Gaussian likelihoods land (Bernoulli vector,
+/// Poisson vector) this will grow a dense-block variant.
+// per-row block consumed by solver/arrow_schur.rs
+#[derive(Clone, Debug)]
+pub enum PerRowHessianBlock {
+    /// Diagonal block of length M.
+    Diagonal(Array1<f64>),
+    /// Dense (M, M) block (reserved for non-Gaussian vector likelihoods).
+    Dense(Array2<f64>),
+}
+
+/// Build the per-row Hessian blocks for the arrow solver.
+///
+/// Returns a `Vec<PerRowHessianBlock>` of length N. For Gaussian likelihoods
+/// each block is `Diagonal(M)`; the arrow Schur path can read these directly
+/// without ever materialising an `(N·M, N·M)` Hessian.
+pub fn per_row_hessian_blocks(
+    likelihood: &dyn VectorLikelihood,
+    eta: ArrayView2<f64>,
+    y: ArrayView2<f64>,
+) -> Vec<PerRowHessianBlock> {
+    let diag = likelihood.hess_diag(eta, y);
+    let n = diag.nrows();
+    let mut out = Vec::with_capacity(n);
+    for row in diag.outer_iter() {
+        out.push(PerRowHessianBlock::Diagonal(row.to_owned()));
+    }
+    out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Deferred: non-Gaussian vector likelihoods
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Bernoulli vector: η_{n,m} = logit(p_{n,m}), Y ∈ {0,1}^{N×M}. log_lik is the
+// usual logistic sum across (n, m); grad_eta = (y − sigmoid(η)); hess_diag =
+// sigmoid(η)·(1−sigmoid(η)). Per-row block is diagonal (independence across
+// outputs at fixed η, with the latent coupling handled by the arrow form).
+//
+// Poisson vector: η_{n,m} = log(λ_{n,m}). grad = y − exp(η);
+// hess_diag = exp(η).
+//
+// These are deferred; the trait is already general enough — only the impl
+// blocks need writing when the upstream link-inversion / quadrature plumbing
+// is exposed to vector targets.
+
+ succeeded in 0ms:
+3:    fast_av_into, fast_xt_diag_x,
+642:    // PSD precondition. The CSC counterpart (`streaming_sparse_csc_xt_diag_x`)
+675:fn streaming_sparse_csc_xt_diag_x(
+779:    // (xt_diag_x_signed → streaming kernels).
+1363:    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+1367:                streaming_blas_xt_diag_x(matrix, weights, &mut xtwx);
+1370:            Self::Lazy(op) => op.diag_xtw_x(weights),
+1436:        // assembly routes through xt_diag_x_signed instead.
+1625:///   diag_xtw_x(w)      → Qs^T · (X^T W X) · Qs
+1686:    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+1689:        let xtwx = self.x_original.diag_xtw_x(weights)?;
+1940:    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+2116:    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+2118:            Self::Dense(d) => d.diag_xtw_x(weights),
+2119:            Self::Sparse(s) => DesignMatrix::Sparse(s.clone()).diag_xtw_x(weights),
+2120:            Self::RandomEffect(op) => op.diag_xtw_x(weights),
+2495:    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+2503:            let block_xtwx = block.diag_xtw_x(weights)?;
+2731:    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+2735:                "MultiChannelOperator::diag_xtw_x: weights length {} != nrows {}",
+3102:    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+3105:                "TensorProductDesignOperator::diag_xtw_x: weights length {} != n {}",
+3172:                streaming_blas_xt_diag_x(b0.as_ref(), &gamma, &mut block);
+3536:    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+3544:            streaming_blas_xt_diag_x(combined, weights, &mut xtwx);
+3663:///   diag_xtw_x(w) = T^T * (X_inner^T W X_inner) * T
+3785:    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+3788:            streaming_blas_xt_diag_x(combined, weights, &mut xtwx);
+3791:        let inner_xtwx = self.inner.diag_xtw_x(weights)?;
+3934:    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+3941:                "RowwiseKroneckerOperator::diag_xtw_x: weights length {} != n {}",
+4149:    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+4150:        let mut base = self.inner.diag_xtw_x(weights)?;
+4595:/// — `streaming_blas_xt_diag_x`, `streaming_sparse_csc_xt_diag_x`, and the
+4604:pub fn xt_diag_x_signed(
+4608:    xt_diag_x_symmetric(design, diag)
+4616:/// numeric path is identical to `xt_diag_x_signed`.
+4617:pub fn xt_diag_x_psd(
+4623:        "xt_diag_x_psd requires nonneg weights; use xt_diag_x_signed for observed-Hessian assembly"
+4625:    xt_diag_x_symmetric(design, diag)
+4628:pub fn xt_diag_x_symmetric(
+4634:            "xt_diag_x_symmetric row mismatch: design has {} rows but diag has {} entries",
+4640:        DesignMatrix::Dense(x) => Ok(SymmetricMatrix::Dense(x.diag_xtw_x(diag)?)),
+4672:                    checked_dense_nbytes(n, p, "xt_diag_x_symmetric dense sparse route")?;
+4674:                    let xd = xs.try_to_dense_arc("xt_diag_x_symmetric dense sparse route")?;
+4675:                    streaming_blas_xt_diag_x(xd.as_ref(), diag, &mut xtwx);
+4678:                    streaming_sparse_csc_xt_diag_x(
+4696:                .ok_or_else(|| "xt_diag_x_symmetric: failed to obtain CSR view".to_string())?;
+5025:    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String>;
+5027:        let xtwx = self.diag_xtw_x(weights)?;
+5125:        let mut system = self.diag_xtw_x(weights)?;
+5186:        let mut system = self.diag_xtw_x(weights)?;
+5212:        self.diag_xtw_x(weights)
+5369:    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+5379:            Self::Dense(x) => x.diag_xtw_x(weights),
+5410:                        checked_dense_nbytes(n, p, "DesignMatrix::diag_xtw_x dense sparse route")?;
+5413:                            xs.try_to_dense_arc("DesignMatrix::diag_xtw_x dense sparse route")?;
+5414:                        streaming_blas_xt_diag_x(xd.as_ref(), weights, &mut xtwx);
+5417:                        streaming_sparse_csc_xt_diag_x(
+5655:    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+5663:        let mut gram = fast_xt_diag_x(self.base, weights);
+5674:        Ok(self.diag_xtw_x(weights)?.diag().to_owned())
+5734:    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+5743:        let local = fast_xt_diag_x(self.local, weights);
+5804:fn streaming_blas_xt_diag_x(x: &Array2<f64>, weights: &Array1<f64>, out: &mut Array2<f64>) {
+5884:        let mut system = self.diag_xtw_x(weights)?;
+6801:            Self::Dense(DenseDesignMatrix::Lazy(op)) => op.diag_xtw_x(&weights.to_owned()),
+6908:        <Self as LinearOperator>::diag_xtw_x(self, weights)
+7083:        dense_transpose_weighted_response, dense_xtwx_view, streaming_sparse_csc_xt_diag_x,
+7139:        fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+7253:    fn streaming_sparse_csc_xt_diag_x_matches_dense_signed_weights() {
+7275:        streaming_sparse_csc_xt_diag_x(
+7345:        let got_xtwx = op.diag_xtw_x(&weights).expect("multi-channel xtwx");
+7930:        // Test diag_xtw_x.
+7943:        let op_xtwx = op.diag_xtw_x(&w).unwrap();
+7948:        assert!(max_diff < 1e-10, "diag_xtw_x mismatch: max_diff={max_diff}");
+8103:        let got = op.diag_xtw_x(&weights).unwrap();
+
+exec
+/bin/zsh -lc "sed -n '620,820p' src/linalg/matrix.rs" in /Users/user/gam
+ succeeded in 0ms:
+                vals,
+                p,
+                weights,
+                start..(start + chunk_rows).min(n),
+            )
+        })
+        .collect();
+    let mut xtwx = Array2::<f64>::zeros((p, p));
+    for partial in &partials {
+        xtwx += partial;
+    }
+    xtwx
+}
+
+fn sparse_csr_weighted_xtwx_rows(
+    row_ptr: &[usize],
+    col_idx: &[usize],
+    vals: &[f64],
+    p: usize,
+    weights: ArrayView1<'_, f64>,
+    rows: Range<usize>,
+) -> Array2<f64> {
+    // PSD precondition. The CSC counterpart (`streaming_sparse_csc_xt_diag_x`)
+    // accepts signed weights and is the right path for observed-Hessian
+    // assembly; this CSR-row kernel is reserved for Fisher-scoring Gram builds
+    // where the working weights are guaranteed nonneg. Clipping silently here
+    // would drop negative-curvature mass and produce a wrong Newton step.
+    debug_assert!(
+        weights.iter().all(|&w| w >= 0.0),
+        "sparse_csr_weighted_xtwx_rows requires nonneg weights; route signed-weight Gram through the CSC kernel"
+    );
+    let mut xtwx = Array2::<f64>::zeros((p, p));
+    for i in rows {
+        let wi = weights[i];
+        if wi == 0.0 {
+            continue;
+        }
+        let start = row_ptr[i];
+        let end = row_ptr[i + 1];
+        for a_ptr in start..end {
+            let a = col_idx[a_ptr];
+            let wxa = wi * vals[a_ptr];
+            for b_ptr in a_ptr..end {
+                let b = col_idx[b_ptr];
+                let v = wxa * vals[b_ptr];
+                xtwx[[a, b]] += v;
+                if a != b {
+                    xtwx[[b, a]] += v;
+                }
+            }
+        }
+    }
+    xtwx
+}
+
+fn streaming_sparse_csc_xt_diag_x(
+    col_ptr: &[usize],
+    row_idx: &[usize],
+    vals: &[f64],
+    n: usize,
+    p: usize,
+    weights: ArrayView1<'_, f64>,
+    out: &mut Array2<f64>,
+) {
+    if n == 0 || p == 0 {
+        return;
+    }
+
+    let chunk_rows = dense_materialization_chunk_rows(n, p);
+    let par = faer::get_global_parallelism();
+    let mut x_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
+    let mut wx_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
+    let mut out_view = array2_to_matmut(out);
+
+    for start in (0..n).step_by(chunk_rows) {
+        let rows = (n - start).min(chunk_rows);
+        {
+            let mut x_slice = x_chunk.slice_mut(s![0..rows, ..]);
+            let mut wx_slice = wx_chunk.slice_mut(s![0..rows, ..]);
+            x_slice.fill(0.0);
+            wx_slice.fill(0.0);
+            let end = start + rows;
+            for col in 0..p {
+                let col_start = col_ptr[col];
+                let col_end = col_ptr[col + 1];
+                let rows_for_col = &row_idx[col_start..col_end];
+                let local_start = rows_for_col.partition_point(|&row| row < start);
+                let local_end = rows_for_col.partition_point(|&row| row < end);
+                for local_ptr in local_start..local_end {
+                    let ptr = col_start + local_ptr;
+                    let row = row_idx[ptr];
+                    let local = row - start;
+                    let wi = weights[row];
+                    let value = vals[ptr];
+                    x_slice[[local, col]] += value;
+                    wx_slice[[local, col]] += wi * value;
+                }
+            }
+        }
+        let x_slice = x_chunk.slice(s![0..rows, ..]);
+        let wx_slice = wx_chunk.slice(s![0..rows, ..]);
+        let x_view = FaerArrayView::new(&x_slice);
+        let wx_view = FaerArrayView::new(&wx_slice);
+        matmul(
+            out_view.as_mut(),
+            Accum::Add,
+            x_view.as_ref().transpose(),
+            wx_view.as_ref(),
+            1.0,
+            par,
+        );
+    }
+}
+
+fn sparse_csr_diag_gram(
+    row_ptr: &[usize],
+    col_idx: &[usize],
+    vals: &[f64],
+    n: usize,
+    p: usize,
+    weights: ArrayView1<'_, f64>,
+) -> Array1<f64> {
+    let work = vals.len() as u64;
+    if rayon::current_num_threads() <= 1 || work < SPARSE_ROW_PARALLEL_MIN_FLOPS {
+        return sparse_csr_diag_gram_rows(row_ptr, col_idx, vals, p, weights, 0..n);
+    }
+    let n_threads = rayon::current_num_threads();
+    let chunk_rows = n.div_ceil(n_threads * 8).max(1);
+    let starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
+    let partials: Vec<Array1<f64>> = starts
+        .into_par_iter()
+        .map(|start| {
+            sparse_csr_diag_gram_rows(
+                row_ptr,
+                col_idx,
+                vals,
+                p,
+                weights,
+                start..(start + chunk_rows).min(n),
+            )
+        })
+        .collect();
+    let mut diag = Array1::<f64>::zeros(p);
+    for partial in &partials {
+        diag += partial;
+    }
+    diag
+}
+
+fn sparse_csr_diag_gram_rows(
+    row_ptr: &[usize],
+    col_idx: &[usize],
+    vals: &[f64],
+    p: usize,
+    weights: ArrayView1<'_, f64>,
+    rows: Range<usize>,
+) -> Array1<f64> {
+    // PSD precondition: callers (Fisher-scoring diag(XᵀWX)) must supply nonneg
+    // weights. Signed observed-Hessian assembly must use the signed Gram path
+    // (xt_diag_x_signed → streaming kernels).
+    debug_assert!(
+        weights.iter().all(|&w| w >= 0.0),
+        "sparse_csr_diag_gram_rows requires nonneg weights; use the signed Gram routine for observed-Hessian assembly"
+    );
+    let mut diag = Array1::<f64>::zeros(p);
+    for i in rows {
+        let wi = weights[i];
+        if wi == 0.0 {
+            continue;
+        }
+        for idx in row_ptr[i]..row_ptr[i + 1] {
+            let j = col_idx[idx];
+            let xij = vals[idx];
+            diag[j] += wi * xij * xij;
+        }
+    }
+    diag
+}
+
+#[inline]
+fn dense_transpose_weighted_response(
+    matrix: &Array2<f64>,
+    weights: &Array1<f64>,
+    y: &Array1<f64>,
+    row_scale: Option<&Array1<f64>>,
+) -> Array1<f64> {
+    // Signed-safe: XᵀWy is linear in W, so observed-Hessian / non-canonical-link
+    // IRLS sites that drive signed working weights through this kernel must be
+    // preserved end-to-end. Clipping negative weights here silently biases the
+    // pseudo-response and was the source of the Gram-cleanup mismatch.
+    let p = matrix.ncols();
+    let n = matrix.nrows();
+    let mut out = Array1::<f64>::zeros(p);
+    if matrix.is_standard_layout() {
+        if let (Some(x), Some(w), Some(yslice)) =
+            (matrix.as_slice(), weights.as_slice(), y.as_slice())
+        {
+            let scale_slice = row_scale.and_then(|s| s.as_slice());
+            let out_slice = out.as_slice_mut().expect("zeros are contiguous");
+            for i in 0..n {
+                let mut scaled = yslice[i] * w[i];
+
+exec
+/bin/zsh -lc "sed -n '4580,4715p' src/linalg/matrix.rs" in /Users/user/gam
+ succeeded in 0ms:
+    pub fn left_dot_matrix(&self, lhs: &Array2<f64>) -> Array2<f64> {
+        // (lhs * S)^T = S^T * lhs^T = S * lhs^T  (S is symmetric)
+        // So lhs * S = (S * lhs^T)^T
+        let lhs_t = lhs.t().to_owned();
+        let result_t = self.dot_matrix(&lhs_t);
+        result_t.t().to_owned()
+    }
+}
+
+/// Build `XᵀWX` from a design + signed weights, returning a symmetric matrix.
+///
+/// This is the observed-Hessian / non-canonical-link route: the input `diag`
+/// may contain negative entries when the working curvature is not guaranteed
+/// PSD (e.g. binomial + cloglog, Gamma + identity, any IRLS step that uses
+/// the true Hessian rather than the Fisher information). All internal kernels
+/// — `streaming_blas_xt_diag_x`, `streaming_sparse_csc_xt_diag_x`, and the
+/// sparse-row accumulator — preserve the sign of the weights; only the
+/// PSD-precondition kernels in this module (`sparse_csr_weighted_xtwx_rows`,
+/// `weighted_crossprod_dense_rows`, `dense_diag_gram_view`) clip / assert
+/// nonneg, and none of them is reachable from this entry.
+///
+/// Callers in PIRLS should select `_signed` for observed-Hessian / Newton
+/// curvature assembly and `_psd` for Fisher-scoring updates where the working
+/// weights are guaranteed nonneg.
+pub fn xt_diag_x_signed(
+    design: &DesignMatrix,
+    diag: &Array1<f64>,
+) -> Result<SymmetricMatrix, String> {
+    xt_diag_x_symmetric(design, diag)
+}
+
+/// PSD-precondition Gram: `XᵀWX` with `w ≥ 0`.
+///
+/// Use for Fisher-scoring / canonical-link IRLS, where the working weights are
+/// guaranteed nonneg by construction. The precondition is checked under
+/// `debug_assertions` and silently inherited in release builds; the underlying
+/// numeric path is identical to `xt_diag_x_signed`.
+pub fn xt_diag_x_psd(
+    design: &DesignMatrix,
+    diag: &Array1<f64>,
+) -> Result<SymmetricMatrix, String> {
+    debug_assert!(
+        diag.iter().all(|&w| w >= 0.0),
+        "xt_diag_x_psd requires nonneg weights; use xt_diag_x_signed for observed-Hessian assembly"
+    );
+    xt_diag_x_symmetric(design, diag)
+}
+
+pub fn xt_diag_x_symmetric(
+    design: &DesignMatrix,
+    diag: &Array1<f64>,
+) -> Result<SymmetricMatrix, String> {
+    if design.nrows() != diag.len() {
+        return Err(format!(
+            "xt_diag_x_symmetric row mismatch: design has {} rows but diag has {} entries",
+            design.nrows(),
+            diag.len()
+        ));
+    }
+    match design {
+        DesignMatrix::Dense(x) => Ok(SymmetricMatrix::Dense(x.diag_xtw_x(diag)?)),
+        DesignMatrix::Sparse(xs) => {
+            // The macOS sample profile of matern60 fingered this function as
+            // 58% of main-thread cycles, all in
+            // `SparseHessianAccumulator::from_multi_csr → BTreeSet::insert`:
+            // every PIRLS Newton iteration was rebuilding the symbolic upper
+            // pattern from scratch via O(nnz²·log) BTreeSet insertions, even
+            // though the symbolic pattern depends only on X (not on the
+            // weights). For a Matern radial design at n=10K it dominates over
+            // the actual numeric assembly.
+            //
+            // Two regimes:
+            //   (A) Numerically dense — Matern / Duchon: every column has a
+            //       nonzero, so XᵀWX fills in completely. Use the BLAS path
+            //       when policy permits materializing the dense design, or a
+            //       bounded CSC-to-dense-row-chunk BLAS path when it does not.
+            //       Both avoid the symbolic sparse-Hessian build and scalar
+            //       accumulation.
+            //   (B) Genuinely sparse — B-spline / banded: per-row work is
+            //       O(nnz_row²) at small constant factor; the sparse
+            //       row-parallel accumulator is the right tool.
+            // Heuristic: avg_nnz_per_row · 4 ≥ p picks (A). The sparse-native
+            // PIRLS path upstream already routes truly-sparse Hessians around
+            // this function, so (A) is the dominant call site we have today.
+            let n = xs.nrows();
+            let p = xs.ncols();
+            let nnz_x = xs.val().len();
+            let avg_nnz_row = if n > 0 { nnz_x / n } else { p };
+            let dense_regime = 4 * avg_nnz_row >= p;
+            if dense_regime {
+                let mut xtwx = Array2::<f64>::zeros((p, p));
+                let dense_bytes =
+                    checked_dense_nbytes(n, p, "xt_diag_x_symmetric dense sparse route")?;
+                if dense_bytes <= MAX_SPARSE_TO_DENSE_BYTES {
+                    let xd = xs.try_to_dense_arc("xt_diag_x_symmetric dense sparse route")?;
+                    streaming_blas_xt_diag_x(xd.as_ref(), diag, &mut xtwx);
+                } else {
+                    let (symbolic, values) = xs.parts();
+                    streaming_sparse_csc_xt_diag_x(
+                        symbolic.col_ptr(),
+                        symbolic.row_idx(),
+                        values,
+                        n,
+                        p,
+                        diag.view(),
+                        &mut xtwx,
+                    );
+                }
+                return Ok(SymmetricMatrix::Dense(xtwx));
+            }
+            // Genuinely-sparse fallback: row-parallel accumulator that
+            // shares the symbolic pattern via Arc, so the BTreeSet build
+            // happens once and the values buffers are zero-init per chunk.
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let csr = xs
+                .to_csr_arc()
+                .ok_or_else(|| "xt_diag_x_symmetric: failed to obtain CSR view".to_string())?;
+            let sym = csr.symbolic();
+            let row_ptr = sym.row_ptr();
+            let col_idx = sym.col_idx();
+            let vals = csr.val();
+            let acc_template = SparseHessianAccumulator::from_single_csr(&*csr, p);
+            let n_threads = rayon::current_num_threads().max(1);
+            let target_chunks = (n_threads * 16).max(n_threads);
+            let chunk_rows = (n / target_chunks).max(256).min(n.max(1));
+            let chunk_starts: Vec<usize> = (0..n).step_by(chunk_rows).collect();
+            let mut local_accs: Vec<SparseHessianAccumulator> = chunk_starts
+                .into_par_iter()
+                .map(|start| {
+                    let end = (start + chunk_rows).min(n);
+                    let mut local = acc_template.empty_clone();
+                    for i in start..end {
+                        let wi = diag[i];
+                        if wi == 0.0 {
+                            continue;
+                        }
+
+exec
+/bin/zsh -lc "sed -n '5790,5855p' src/linalg/matrix.rs" in /Users/user/gam
+ succeeded in 0ms:
+        DesignMatrix::Dense(DenseDesignMatrix::from(self.local.clone()))
+            .quadratic_form_diag(&middle_local)
+    }
+}
+
+/// Streaming chunked BLAS computation of X^T * diag(W) * X.
+///
+/// Processes rows in cache-friendly chunks, scaling each row of X by w
+/// and accumulating Xᵀ·(W·X) via BLAS matmul. Peak intermediate allocation
+/// is chunk_size × p × 8 bytes (~8 MB) instead of n × p × 8 bytes.
+///
+/// Uses signed weights directly; the prior sqrt(max(0, w))-then-Gram form
+/// clipped negative weights to zero and corrupted observed-Hessian assembly
+/// whenever the diagonal block had any negative entries.
+fn streaming_blas_xt_diag_x(x: &Array2<f64>, weights: &Array1<f64>, out: &mut Array2<f64>) {
+    let n = x.nrows();
+    let p = x.ncols();
+    if n == 0 || p == 0 {
+        return;
+    }
+
+    // Target ~8MB working set per chunk (matches faer_ndarray streaming path).
+    const TARGET_BYTES: usize = 8 * 1024 * 1024;
+    const MIN_ROWS: usize = 512;
+    const MAX_ROWS: usize = 131_072;
+    let chunk_rows = (TARGET_BYTES / (p * 8)).max(MIN_ROWS).min(MAX_ROWS).min(n);
+
+    let par = faer::get_global_parallelism();
+    // Row-major (C-order) so per-row writes are stride-1 alongside the
+    // stride-1 reads from a row-major X. The previous F-order layout
+    // forced the inner write loop to skip by `chunk_rows` between
+    // columns, defeating cache + vectorization.
+    let mut wx_chunk = Array2::<f64>::zeros((chunk_rows, p));
+    let mut out_view = array2_to_matmut(out);
+
+    let x_is_row_major = x.is_standard_layout();
+    let weights_slice_opt = weights.as_slice();
+
+    for start in (0..n).step_by(chunk_rows) {
+        let rows = (n - start).min(chunk_rows);
+        {
+            let chunk_slice = wx_chunk
+                .as_slice_mut()
+                .expect("row-major chunk is contiguous");
+            if x_is_row_major
+                && let Some(x_slice_all) = x.as_slice()
+                && let Some(w_slice) = weights_slice_opt
+            {
+                // Fast path: scale row-major X directly via raw slices.
+                for local in 0..rows {
+                    let src = start + local;
+                    let wi = w_slice[src];
+                    let src_off = src * p;
+                    let dst_off = local * p;
+                    let src_row = &x_slice_all[src_off..src_off + p];
+                    let dst_row = &mut chunk_slice[dst_off..dst_off + p];
+                    for col in 0..p {
+                        dst_row[col] = src_row[col] * wi;
+                    }
+                }
+            } else {
+                for local in 0..rows {
+                    let src = start + local;
+                    let wi = weights[src];
+                    let xrow = x.row(src);
+                    let dst_off = local * p;
+
+exec
+/bin/zsh -lc "sed -n '4715,4775p' src/linalg/matrix.rs" in /Users/user/gam
+ succeeded in 0ms:
+                        }
+                        let r_start = row_ptr[i];
+                        let r_end = row_ptr[i + 1];
+                        for a_ptr in r_start..r_end {
+                            let a = col_idx[a_ptr];
+                            let wxa = wi * vals[a_ptr];
+                            local.add_upper(a, a, wxa * vals[a_ptr]);
+                            for b_ptr in (a_ptr + 1)..r_end {
+                                let b = col_idx[b_ptr];
+                                local.add_upper(a, b, wxa * vals[b_ptr]);
+                            }
+                        }
+                    }
+                    local
+                })
+                .collect();
+            let mut acc = if let Some(first) = local_accs.pop() {
+                first
+            } else {
+                acc_template.empty_clone()
+            };
+            for other in local_accs.into_iter() {
+                acc.add_values(&other.values);
+            }
+            Ok(SymmetricMatrix::Sparse(acc.into_sparse_col_mat()))
+        }
+    }
+}
+
+fn add_sparse_symmetric_upper(
+    lhs: &SparseColMat<usize, f64>,
+    rhs: &SparseColMat<usize, f64>,
+) -> Result<SparseColMat<usize, f64>, String> {
+    if lhs.nrows() != rhs.nrows() || lhs.ncols() != rhs.ncols() {
+        return Err(format!(
+            "add_sparse_symmetric_upper shape mismatch: lhs {}x{}, rhs {}x{}",
+            lhs.nrows(),
+            lhs.ncols(),
+            rhs.nrows(),
+            rhs.ncols()
+        ));
+    }
+    let mut upper = BTreeMap::<(usize, usize), f64>::new();
+    for matrix in [lhs, rhs] {
+        let (symbolic, values) = matrix.parts();
+        let col_ptr = symbolic.col_ptr();
+        let row_idx = symbolic.row_idx();
+        for col in 0..matrix.ncols() {
+            for idx in col_ptr[col]..col_ptr[col + 1] {
+                let row = row_idx[idx];
+                let key = if row <= col { (row, col) } else { (col, row) };
+                *upper.entry(key).or_insert(0.0) += values[idx];
+            }
+        }
+    }
+    let triplets: Vec<_> = upper
+        .into_iter()
+        .filter_map(|((row, col), value)| (value != 0.0).then_some(Triplet::new(row, col, value)))
+        .collect();
+    SparseColMat::try_new_from_triplets(lhs.nrows(), lhs.ncols(), &triplets)
+        .map_err(|_| "add_sparse_symmetric_upper failed to assemble CSC".to_string())
+
+exec
+/bin/zsh -lc "sed -n '5855,5835p' src/linalg/matrix.rs" in /Users/user/gam
+ succeeded in 0ms:
+                    let dst_off = local * p;
+
+exec
+/bin/zsh -lc "sed -n '5828,5858p' src/linalg/matrix.rs" in /Users/user/gam
+ succeeded in 0ms:
+    for start in (0..n).step_by(chunk_rows) {
+        let rows = (n - start).min(chunk_rows);
+        {
+            let chunk_slice = wx_chunk
+                .as_slice_mut()
+                .expect("row-major chunk is contiguous");
+            if x_is_row_major
+                && let Some(x_slice_all) = x.as_slice()
+                && let Some(w_slice) = weights_slice_opt
+            {
+                // Fast path: scale row-major X directly via raw slices.
+                for local in 0..rows {
+                    let src = start + local;
+                    let wi = w_slice[src];
+                    let src_off = src * p;
+                    let dst_off = local * p;
+                    let src_row = &x_slice_all[src_off..src_off + p];
+                    let dst_row = &mut chunk_slice[dst_off..dst_off + p];
+                    for col in 0..p {
+                        dst_row[col] = src_row[col] * wi;
+                    }
+                }
+            } else {
+                for local in 0..rows {
+                    let src = start + local;
+                    let wi = weights[src];
+                    let xrow = x.row(src);
+                    let dst_off = local * p;
+                    let dst_row = &mut chunk_slice[dst_off..dst_off + p];
+                    for (col, xij) in xrow.iter().enumerate() {
+                        dst_row[col] = xij * wi;
+
+exec
+/bin/zsh -lc "sed -n '5858,5898p' src/linalg/matrix.rs" in /Users/user/gam
+ succeeded in 0ms:
+                        dst_row[col] = xij * wi;
+                    }
+                }
+            }
+        }
+        let x_slice = x.slice(s![start..start + rows, ..]);
+        let wx_slice = wx_chunk.slice(s![0..rows, ..]);
+        let x_view = FaerArrayView::new(&x_slice);
+        let wx_view = FaerArrayView::new(&wx_slice);
+        matmul(
+            out_view.as_mut(),
+            Accum::Add,
+            x_view.as_ref().transpose(),
+            wx_view.as_ref(),
+            1.0,
+            par,
+        );
+    }
+}
+
+impl DesignMatrix {
+    fn factorize_system_dense(
+        &self,
+        weights: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+    ) -> Result<Box<dyn FactorizedSystem>, String> {
+        let mut system = self.diag_xtw_x(weights)?;
+        if let Some(pen) = penalty {
+            if pen.nrows() != system.nrows() || pen.ncols() != system.ncols() {
+                return Err(format!(
+                    "factorize_system penalty shape mismatch: got {}x{}, expected {}x{}",
+                    pen.nrows(),
+                    pen.ncols(),
+                    system.nrows(),
+                    system.ncols()
+                ));
+            }
+            system += pen;
+        }
+        let factor = crate::linalg::utils::StableSolver::new("linear operator system")
+            .factorize(&system)
+
