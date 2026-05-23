@@ -7691,8 +7691,12 @@ fn solve_penalized_least_squares_implicit(
                     std::mem::take(&mut workspace.hessian_buf)
                 }
             }
-            _ => x_original
-                .diag_xtw_x(&weights_owned)
+            // Observed-Hessian assembly for non-materialized (sparse / lazy)
+            // designs: route through the signed-Gram API so the CSC / sparse-
+            // accumulator paths preserve sign instead of silently clipping
+            // negative-curvature mass. Matches the dense `_signed` branch above.
+            _ => crate::matrix::xt_diag_x_signed(x_original, &weights_owned)
+                .map(|h| h.to_dense())
                 .map_err(EstimationError::InvalidInput)?,
         }
     };

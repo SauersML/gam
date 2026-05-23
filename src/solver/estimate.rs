@@ -3685,21 +3685,16 @@ where
             }
         }
         // INVARIANT: the value stored in `beta_covariance` below is the
-        // φ-scaled posterior covariance `Vb = φ·H⁻¹`. The newtype wrapper
-        // `crate::inference::dispersion_cov::PhiScaledCovariance` exists to
-        // make this explicit at API boundaries; we run the data through
-        // `wrap` and immediately unwrap here so the `FitInference` field
-        // stays `Array2<f64>` (which keeps `pirls`, `families`, GPU and
-        // CLI consumers — all outside the dispersion-ownership refactor
-        // scope — compiling unchanged) while documenting the convention
-        // in code. The unscaled `H` that lives in `FitInference::
-        // penalized_hessian` plays the role of `UnscaledPrecision`.
+        // φ-scaled posterior covariance `Vb = φ·H⁻¹`. Storage is now
+        // [`PhiScaledCovariance`] so the convention is enforced at the
+        // type level — `Vb` and the unscaled precision `H` (stored as
+        // [`UnscaledPrecision`] in `FitInference::penalized_hessian`)
+        // cannot be confused at API boundaries.
         beta_covariance = beta_covariance_unscaled.as_ref().map(|cov| {
             crate::inference::dispersion_cov::PhiScaledCovariance::wrap(scaled_covariance(
                 cov.clone(),
                 dispersion_phi,
             ))
-            .into_array()
         });
         smoothing_correction = reml_state
             .compute_smoothing_correction_auto(
@@ -3710,18 +3705,20 @@ where
             )
             .map(|corr| {
                 // Smoothing correction is added to `Vb`; it must live on
-                // the same φ-scaled scale, hence the same wrap/unwrap
-                // documentation pattern.
+                // the same φ-scaled scale. We unwrap to a bare array here
+                // because `smoothing_correction` is still stored as
+                // `Option<Array2<f64>>`; wrapping/unwrapping documents the
+                // convention without cascading a third newtype.
                 crate::inference::dispersion_cov::PhiScaledCovariance::wrap(scaled_covariance(
                     corr,
                     dispersion_phi,
                 ))
                 .into_array()
             });
-        beta_standard_errors = beta_covariance.as_ref().map(se_from_covariance);
+        beta_standard_errors = beta_covariance.as_ref().map(|c| se_from_covariance(c.as_array()));
         beta_covariance_corrected = match (&beta_covariance, &smoothing_correction) {
             (Some(base_cov), Some(corr)) if base_cov.dim() == corr.dim() => {
-                let mut corrected = base_cov.clone();
+                let mut corrected = base_cov.as_array().clone();
                 corrected += corr;
                 enforce_symmetry(&mut corrected);
                 Some(corrected)
@@ -3729,7 +3726,7 @@ where
             (Some(_), Some(corr)) => {
                 log::warn!(
                     "Skipping corrected covariance: dimension mismatch (base {:?}, corr {:?})",
-                    beta_covariance.as_ref().map(Array2::dim),
+                    beta_covariance.as_ref().map(|c| c.as_array().dim()),
                     Some(corr.dim())
                 );
                 None
@@ -3742,7 +3739,7 @@ where
         edf_by_block,
         edf_total,
         smoothing_correction,
-        penalized_hessian,
+        penalized_hessian: penalized_hessian.into(),
         working_weights: pirls_res.solveweights.clone(),
         working_response: pirls_res.solveworking_response.clone(),
         reparam_qs: Some(pirls_res.reparam_result.qs.clone()),
@@ -3960,7 +3957,12 @@ pub struct FitInference {
     pub edf_by_block: Vec<f64>,
     pub edf_total: f64,
     pub smoothing_correction: Option<Array2<f64>>,
-    pub penalized_hessian: Array2<f64>,
+    /// Raw penalised Hessian `H = X'W_HX + S(λ)` with NO dispersion scaling.
+    /// Stored as [`UnscaledPrecision`] so callers that need the φ-scaled
+    /// covariance `Vb` know they must pair this with [`Self::dispersion`].
+    /// `#[serde(transparent)]` on the newtype keeps the on-disk encoding
+    /// identical to the pre-newtype `Array2<f64>` storage.
+    pub penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision,
     pub working_weights: Array1<f64>,
     pub working_response: Array1<f64>,
     pub reparam_qs: Option<Array2<f64>>,
@@ -3971,7 +3973,7 @@ pub struct FitInference {
     /// `Vb`): `Vb = H^{-1} * phi`, where `H = X'W_HX + S(lambda)` and `phi`
     /// is [`dispersion`](Self::dispersion). Do not use an unscaled `H^{-1}`
     /// for standard errors when scale is estimated.
-    pub beta_covariance: Option<Array2<f64>>,
+    pub beta_covariance: Option<crate::inference::dispersion_cov::PhiScaledCovariance>,
     /// Marginal SEs from `beta_covariance`.
     pub beta_standard_errors: Option<Array1<f64>>,
     /// Optional smoothing-parameter-corrected Bayesian covariance (mgcv `Vp`):
@@ -4141,8 +4143,10 @@ pub struct FittedBlock {
 /// diagnostics. Only populated when the inner solver provides the data.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FitGeometry {
-    /// Joint penalized Hessian H = X'W_HX + S(λ) at convergence.
-    pub penalized_hessian: Array2<f64>,
+    /// Joint penalized Hessian `H = X'W_HX + S(λ)` at convergence.
+    /// Stored as [`UnscaledPrecision`] so the dispersion-ownership invariant
+    /// (this matrix is *not* φ-scaled) is enforced at the type level.
+    pub penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision,
     /// Score-side Fisher IRLS weights paired with `working_response`.
     pub working_weights: Array1<f64>,
     /// IRLS working response at convergence.

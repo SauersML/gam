@@ -35,13 +35,22 @@
 //! `is_estimated()`.
 
 use ndarray::Array2;
+use serde::{Deserialize, Serialize};
+use std::ops::{Deref, DerefMut};
 
 pub use crate::solver::estimate::Dispersion;
 
 /// Posterior coefficient covariance `Vb = phi * H^{-1}` — the matrix users
 /// see as `Cov(beta_hat)`. This newtype documents that `phi` has already
 /// been multiplied in.
-#[derive(Clone, Debug)]
+///
+/// `#[serde(transparent)]` keeps the on-disk wire format identical to the
+/// pre-newtype `Array2<f64>` storage so saved models round-trip cleanly.
+/// `Deref<Target = Array2<f64>>` lets out-of-scope read sites continue
+/// calling `Array2` methods (`.iter()`, `.nrows()`, `.dim()`, …) on the
+/// wrapper without modification.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(transparent)]
 pub struct PhiScaledCovariance(pub Array2<f64>);
 
 impl PhiScaledCovariance {
@@ -58,8 +67,42 @@ impl PhiScaledCovariance {
     }
 
     #[inline]
+    pub fn as_array_mut(&mut self) -> &mut Array2<f64> {
+        &mut self.0
+    }
+
+    #[inline]
     pub fn into_array(self) -> Array2<f64> {
         self.0
+    }
+}
+
+impl From<Array2<f64>> for PhiScaledCovariance {
+    #[inline]
+    fn from(cov: Array2<f64>) -> Self {
+        Self(cov)
+    }
+}
+
+impl From<PhiScaledCovariance> for Array2<f64> {
+    #[inline]
+    fn from(cov: PhiScaledCovariance) -> Self {
+        cov.0
+    }
+}
+
+impl Deref for PhiScaledCovariance {
+    type Target = Array2<f64>;
+    #[inline]
+    fn deref(&self) -> &Array2<f64> {
+        &self.0
+    }
+}
+
+impl DerefMut for PhiScaledCovariance {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Array2<f64> {
+        &mut self.0
     }
 }
 
@@ -67,7 +110,8 @@ impl PhiScaledCovariance {
 /// scaling. Equivalent to `phi * Vb^{-1}` only when `phi == 1`. Use this
 /// for whitening / precision-matrix paths, and pair it with a
 /// [`Dispersion`] at the boundary if the consumer cares about `phi`.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(transparent)]
 pub struct UnscaledPrecision(pub Array2<f64>);
 
 impl UnscaledPrecision {
@@ -82,8 +126,42 @@ impl UnscaledPrecision {
     }
 
     #[inline]
+    pub fn as_array_mut(&mut self) -> &mut Array2<f64> {
+        &mut self.0
+    }
+
+    #[inline]
     pub fn into_array(self) -> Array2<f64> {
         self.0
+    }
+}
+
+impl From<Array2<f64>> for UnscaledPrecision {
+    #[inline]
+    fn from(h: Array2<f64>) -> Self {
+        Self(h)
+    }
+}
+
+impl From<UnscaledPrecision> for Array2<f64> {
+    #[inline]
+    fn from(h: UnscaledPrecision) -> Self {
+        h.0
+    }
+}
+
+impl Deref for UnscaledPrecision {
+    type Target = Array2<f64>;
+    #[inline]
+    fn deref(&self) -> &Array2<f64> {
+        &self.0
+    }
+}
+
+impl DerefMut for UnscaledPrecision {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Array2<f64> {
+        &mut self.0
     }
 }
 
