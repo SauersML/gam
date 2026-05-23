@@ -1142,8 +1142,10 @@ pub fn survival_fit_from_parts(
         .map_err(|e| e.to_string())?;
     ensure_finite_scalar_estimation("survival_fit.penalized_objective", penalized_objective)
         .map_err(|e| e.to_string())?;
-    ensure_finite_scalar_estimation("survival_fit.outer_gradient_norm", outer_gradient_norm)
-        .map_err(|e| e.to_string())?;
+    if let Some(g) = outer_gradient_norm {
+        ensure_finite_scalar_estimation("survival_fit.outer_gradient_norm", g)
+            .map_err(|e| e.to_string())?;
+    }
 
     let total_p = beta_time.len()
         + beta_threshold.len()
@@ -10604,7 +10606,7 @@ mod tests {
             stable_penalty_term: 0.0,
             penalized_objective: 0.0,
             outer_iterations: 0,
-            outer_gradient_norm: 0.0,
+            outer_gradient_norm: None,
             outer_converged: true,
             covariance_conditional: None,
             geometry: None,

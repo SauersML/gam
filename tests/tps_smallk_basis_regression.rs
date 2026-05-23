@@ -460,7 +460,7 @@ fn tps_reml_fit_must_not_oversmooth_seed118_style_additive_signal() {
         r2 >= oracle_r2 - 0.10,
         "REML over-smoothed a seed-118-style additive signal relative to the basis envelope: \
          fit R² = {:.4}, basis-oracle R² = {:.4}, gap = {:.4}, log_lambdas={:?}, \
-         reml_score={:.6e}, outer_gradient_norm={:.3e}.",
+         reml_score={:.6e}, outer_gradient_norm={:?}.",
         r2,
         oracle_r2,
         oracle_r2 - r2,
