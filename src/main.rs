@@ -5662,6 +5662,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     coefficient_lower_bounds: None,
                     linear_constraints: None,
                     initial_lm_lambda: None,
+                    geodesic_acceleration: false,
                 };
                 let state = if likelihood_mode == SurvivalLikelihoodMode::Weibull {
                     let summary = gam::pirls::runworking_model_pirls(
@@ -5714,6 +5715,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         coefficient_lower_bounds: None,
         linear_constraints: None,
         initial_lm_lambda: None,
+        geodesic_acceleration: false,
     };
     let pirls_start = std::time::Instant::now();
     let pirls_callback = |info: &gam::pirls::WorkingModelIterationInfo| {
@@ -14764,6 +14766,7 @@ mod tests {
                         linear_constraints: None,
                         initial_lm_lambda: None,
                         adaptive_kkt_tolerance: None,
+                        geodesic_acceleration: false,
                     },
                     |_| {},
                 )

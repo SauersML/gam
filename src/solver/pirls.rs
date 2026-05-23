@@ -10561,6 +10561,7 @@ mod tests {
             convergence_tolerance: 1e-12,
             firth_bias_reduction: false,
             initial_lm_lambda: None,
+            geodesic_acceleration: false,
         };
         let problem = PirlsProblem {
             x,
@@ -10774,6 +10775,7 @@ mod tests {
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
             initial_lm_lambda: None,
+            geodesic_acceleration: false,
         };
 
         let (fit, _) = fit_model_for_fixed_rho(
@@ -10984,6 +10986,7 @@ mod tests {
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
             initial_lm_lambda: None,
+            geodesic_acceleration: false,
         };
 
         let (result, _) = fit_model_for_fixed_rho(
@@ -11058,6 +11061,7 @@ mod tests {
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
             initial_lm_lambda: None,
+            geodesic_acceleration: false,
         };
 
         let (fit, _) = fit_model_for_fixed_rho(
@@ -11687,6 +11691,7 @@ mod root_cause_tests {
                 b: array![0.0],
             }),
             initial_lm_lambda: None,
+            geodesic_acceleration: false,
         };
 
         let summary =
@@ -11939,6 +11944,7 @@ mod root_cause_tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
+            geodesic_acceleration: false,
         };
 
         let err = match runworking_model_pirls(
@@ -11999,6 +12005,7 @@ mod root_cause_tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
+            geodesic_acceleration: false,
         };
 
         let err = match runworking_model_pirls(
@@ -12040,6 +12047,7 @@ mod root_cause_tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
+            geodesic_acceleration: false,
         };
 
         let err = match runworking_model_pirls(
@@ -12091,6 +12099,7 @@ mod root_cause_tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
+            geodesic_acceleration: false,
         };
 
         let result =
@@ -12128,6 +12137,7 @@ mod root_cause_tests {
                 b: array![-100.0],
             }),
             initial_lm_lambda: None,
+            geodesic_acceleration: false,
         };
 
         let result =
@@ -12162,6 +12172,7 @@ mod root_cause_tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
+            geodesic_acceleration: false,
         };
 
         let result =
@@ -12253,6 +12264,7 @@ mod root_cause_tests {
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
             initial_lm_lambda: None,
+            geodesic_acceleration: false,
         };
 
         let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
@@ -12333,6 +12345,7 @@ mod root_cause_tests {
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
             initial_lm_lambda: None,
+            geodesic_acceleration: false,
         };
 
         let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
@@ -12433,6 +12446,7 @@ mod root_cause_tests {
                 convergence_tolerance: 1e-8,
                 firth_bias_reduction: false,
                 initial_lm_lambda: None,
+                geodesic_acceleration: false,
             };
 
             let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
@@ -12637,6 +12651,7 @@ mod root_cause_tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
+            geodesic_acceleration: false,
         };
         let summary =
             runworking_model_pirls(&mut model, Coefficients::new(array![0.0]), &options, |_| {})
@@ -12696,6 +12711,7 @@ mod root_cause_tests {
             coefficient_lower_bounds: None,
             linear_constraints: None,
             initial_lm_lambda: None,
+            geodesic_acceleration: false,
         };
         let summary =
             runworking_model_pirls(&mut model, Coefficients::new(array![0.0]), &options, |_| {})
