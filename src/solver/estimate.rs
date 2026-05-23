@@ -832,6 +832,12 @@ impl RemlConfig {
             // λ of the previous successful PIRLS solve.
             initial_lm_lambda: None,
             geodesic_acceleration: self.geodesic_acceleration,
+            // Arrow-Schur structured-inner-solve descriptor. Not used by
+            // the standard REML→PIRLS path (β-only); set by the latent
+            // driver (`crate::solver::latent_inner::LatentInnerSolver`)
+            // which assembles the per-row (t, β) bordered system
+            // externally. Default `None` preserves back-compat.
+            arrow_schur: None,
         }
     }
 

@@ -202,12 +202,194 @@ impl std::fmt::Debug for IsometryReference {
     }
 }
 
-/// Isometry-to-reference penalty.
+/// Per-observation behavioral-metric field `W_n ∈ ℝ^{p × p}`, stored in
+/// **low-rank factored form** `W_n = U_n U_n^T` with `U_n ∈ ℝ^{p × r_n}`.
 ///
-/// Penalizes `½ μ Σ_n ‖g_n(t) − g^ref(t_n)‖²_F`, where `g_n(t) = J_n^T J_n`
-/// is the pullback metric at row `n`, induced by the per-row Jacobian
-/// `J_n = ∂(Φ_n β)/∂t_n ∈ ℝ^{p × d}`. The reference metric is either the
-/// identity (Euclidean) or user-supplied per row.
+/// The canonical coordinate is the one where one unit of motion in `t` is one
+/// unit of behavioral change in the output space, so the `W_n` weighting is
+/// load-bearing: the pullback metric is `g_n = J_n^T W_n J_n`. Storing as
+/// `U_n` lets every contraction in this module run in
+/// `(J^T U_n)(U_n^T J)` order, which is `O(p · r · d + r · d²)` per row — we
+/// **never** materialize the `p × p` `W_n`, which is essential when `p`
+/// (number of observation channels) is large but rank is small (e.g. one or
+/// two behavioral dimensions per latent observation).
+///
+/// `Identity` is the gauge-fix default and corresponds to `U_n = I_p` so the
+/// pullback reduces to the standard `J_n^T J_n`. `Factored` stores the
+/// per-row `U_n` blocks contiguously: every row's factor is `p × rank`, and
+/// rows may share the same rank (uniform-rank case) or vary if the field is
+/// data-driven. For the uniform-rank case the storage is
+/// `(n_obs, p * rank)` row-major.
+#[derive(Clone)]
+pub enum WeightField {
+    /// `W_n = I_p` for every `n`. Reduces to the bare pullback `J^T J`.
+    Identity,
+    /// Per-row low-rank factor `U_n ∈ ℝ^{p × rank}`. Storage layout: a
+    /// `(n_obs, p * rank)` row-major matrix where row `n` packs `U_n` in
+    /// column-major-within-row order `U_n[i, k] = u[n, i * rank + k]`.
+    Factored {
+        u: Arc<Array2<f64>>,
+        rank: usize,
+        p_out: usize,
+    },
+}
+
+impl std::fmt::Debug for WeightField {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WeightField::Identity => f.write_str("Identity"),
+            WeightField::Factored { u, rank, p_out } => f
+                .debug_struct("Factored")
+                .field("shape", &format_args!("{}×{}", u.nrows(), u.ncols()))
+                .field("rank", rank)
+                .field("p_out", p_out)
+                .finish(),
+        }
+    }
+}
+
+impl WeightField {
+    /// Apply `U_n^T J_n` for row `n`, returning the `(rank × d)` matrix
+    /// flattened row-major. `jac_row` is `J_n` in flat row-major
+    /// `(p * d)` layout. Result for the `Identity` case is just `J_n`
+    /// itself (rank = p).
+    ///
+    /// This is the *one* contraction site in the module: every value/grad/hvp
+    /// path funnels its `W_n`-aware pullback through here, so the
+    /// `(J^T U)(U^T J)` ordering invariant is enforced by construction.
+    fn project_jac_row(
+        &self,
+        jac_row: &[f64],
+        d: usize,
+    ) -> (Array2<f64>, usize) {
+        match self {
+            WeightField::Identity => {
+                let p = jac_row.len() / d;
+                let mut m = Array2::<f64>::zeros((p, d));
+                for i in 0..p {
+                    for a in 0..d {
+                        m[[i, a]] = jac_row[i * d + a];
+                    }
+                }
+                (m, p)
+            }
+            WeightField::Factored { u, rank, p_out } => {
+                let p = *p_out;
+                let r = *rank;
+                debug_assert_eq!(jac_row.len(), p * d);
+                debug_assert_eq!(u.ncols(), p * r);
+                // We need the row of u that matches the row of jac. The caller
+                // passes `jac_row` for row n; we receive U_n as the n-th row of
+                // u — but project_jac_row doesn't know n. We require the
+                // caller to pass U_n directly via `project_jac_row_with_u`.
+                // Default Identity-like fallback (unused — see direct path).
+                let _ = (p, r);
+                unreachable!(
+                    "WeightField::Factored::project_jac_row must be called via project_jac_row_with_u"
+                );
+            }
+        }
+    }
+
+    /// Apply `U_n^T J_n` for a specific row, given both the row's `J_n` flat
+    /// `(p * d)` slice and the row's `U_n` flat `(p * rank)` slice. Returns
+    /// the `(rank × d)` matrix and its row count.
+    fn project_jac_row_with_u(
+        u_row: &[f64],
+        jac_row: &[f64],
+        p: usize,
+        rank: usize,
+        d: usize,
+    ) -> Array2<f64> {
+        // M[k, a] = Σ_i U[i, k] · J[i, a].
+        let mut m = Array2::<f64>::zeros((rank, d));
+        for k in 0..rank {
+            for a in 0..d {
+                let mut s = 0.0;
+                for i in 0..p {
+                    s += u_row[i * rank + k] * jac_row[i * d + a];
+                }
+                m[[k, a]] = s;
+            }
+        }
+        m
+    }
+
+    /// Apply `W_n J_n v_n = U_n (U_n^T J_n v_n)` for row `n`, returning a
+    /// length-`p` vector. Used by `hvp` to avoid materializing `J^T W J`
+    /// as a `d × d` block when the path through `U` is cheaper. Not used by
+    /// the current implementation (kept for future low-rank HVP).
+    #[allow(dead_code)]
+    fn apply_w_jacobian_vec(
+        u_row: Option<&[f64]>,
+        jac_row: &[f64],
+        v_row: &[f64],
+        p: usize,
+        d: usize,
+        rank: usize,
+    ) -> Array1<f64> {
+        match u_row {
+            None => {
+                // W = I: out_i = Σ_a J[i, a] · v_a.
+                let mut out = Array1::<f64>::zeros(p);
+                for i in 0..p {
+                    let mut s = 0.0;
+                    for a in 0..d {
+                        s += jac_row[i * d + a] * v_row[a];
+                    }
+                    out[i] = s;
+                }
+                out
+            }
+            Some(u) => {
+                // m_k = Σ_{i,a} U[i, k] J[i, a] v_a    (length rank)
+                // out_i = Σ_k U[i, k] · m_k             (length p)
+                let mut m = Array1::<f64>::zeros(rank);
+                for k in 0..rank {
+                    let mut s = 0.0;
+                    for i in 0..p {
+                        for a in 0..d {
+                            s += u[i * rank + k] * jac_row[i * d + a] * v_row[a];
+                        }
+                    }
+                    m[k] = s;
+                }
+                let mut out = Array1::<f64>::zeros(p);
+                for i in 0..p {
+                    let mut s = 0.0;
+                    for k in 0..rank {
+                        s += u[i * rank + k] * m[k];
+                    }
+                    out[i] = s;
+                }
+                out
+            }
+        }
+    }
+}
+
+/// Isometry-to-reference penalty (canonical-coordinate gauge term).
+///
+/// Lives on `ψ`: the target slice is a row of the `LatentCoordValues` flat
+/// vector (row-major `n_obs × d`). Owns one ρ-axis (`log μ_iso`).
+///
+/// Penalizes `½ μ Σ_n ‖g_n(t) − g^ref(t_n)‖²_F`, where the pullback metric
+/// at row `n` is
+///
+/// ```text
+///   g_n = J_n^T W_n J_n,    J_n ∈ ℝ^{p × d}
+/// ```
+///
+/// and `W_n` is a per-row low-rank PSD behavioral metric stored as
+/// `W_n = U_n U_n^T` with `U_n ∈ ℝ^{p × r}`. The canonical-coordinate
+/// statement is "one unit of motion in `t` ↦ one unit of behavioral change",
+/// so the `W_n` weighting is load-bearing.
+///
+/// **Contraction order invariant.** Every place this struct touches `W_n`,
+/// the contraction is `(J^T U_n)(U_n^T J)` — never `J^T W_n J` with `W_n`
+/// materialized as `p × p`. Concretely we form `M_n = U_n^T J_n ∈ ℝ^{r × d}`
+/// once and then `g_n = M_n^T M_n` (`d × d`). Cost per row:
+/// `O(p · r · d + r · d²)`, independent of `p²`.
 ///
 /// **When to use.** Whenever a `LatentCoord` block is in play without an
 /// auxiliary variable (`AuxPrior`) or active ARD to break the diffeomorphism
@@ -253,6 +435,12 @@ pub struct IsometryPenalty {
     pub jacobian_second_cache: Option<Arc<Array2<f64>>>,
     /// Output dimensionality `p` (column count of each per-row Jacobian).
     pub p_out: usize,
+    /// Per-row behavioral metric in low-rank factored form. Defaults to
+    /// `Identity` (the unweighted `J^T J` pullback). When `Factored`, all
+    /// `g_n` contractions are done via `M_n = U_n^T J_n` (`r × d`), keeping
+    /// memory and FLOPs scaling at `O(p · r · d)` per row instead of
+    /// `O(p²)` per row.
+    pub weight: WeightField,
 }
 
 impl IsometryPenalty {
@@ -264,6 +452,7 @@ impl IsometryPenalty {
             jacobian_cache: None,
             jacobian_second_cache: None,
             p_out,
+            weight: WeightField::Identity,
         }
     }
 
@@ -282,8 +471,57 @@ impl IsometryPenalty {
         self
     }
 
-    /// Per-row pullback metric `g_n = J_n^T J_n`. Returns `(n_obs, d, d)`
-    /// flattened row-major as `(n_obs, d*d)`.
+    /// Attach a per-row behavioral metric in low-rank factored form
+    /// (`W_n = U_n U_n^T`). The contraction-order invariant is enforced by
+    /// the per-row builder `M_n = U_n^T J_n`; see [`WeightField`].
+    pub fn with_weight(mut self, weight: WeightField) -> Self {
+        self.weight = weight;
+        self
+    }
+
+    /// Build `M_n = U_n^T J_n ∈ ℝ^{r_n × d}` for row `n`. For
+    /// `WeightField::Identity`, `r_n = p` and `M_n = J_n`.
+    ///
+    /// This is the single contraction site where `W_n` (or its `U_n` factor)
+    /// is consumed. Every value/grad/hvp path funnels through here, so the
+    /// `(J^T U)(U^T J)` ordering invariant cannot be violated by accident.
+    fn projected_jacobian_row(&self, n: usize, d: usize) -> Array2<f64> {
+        let jac = self
+            .jacobian_cache
+            .as_ref()
+            .expect("isometry penalty requires a live jacobian cache");
+        let jac_row = jac.row(n);
+        let jac_slice = jac_row
+            .as_slice()
+            .expect("jacobian cache must be in standard row-major layout");
+        match &self.weight {
+            WeightField::Identity => {
+                let p = self.p_out;
+                let mut m = Array2::<f64>::zeros((p, d));
+                for i in 0..p {
+                    for a in 0..d {
+                        m[[i, a]] = jac_slice[i * d + a];
+                    }
+                }
+                m
+            }
+            WeightField::Factored { u, rank, p_out } => {
+                let u_row = u.row(n);
+                let u_slice = u_row
+                    .as_slice()
+                    .expect("weight factor U must be in standard row-major layout");
+                WeightField::project_jac_row_with_u(u_slice, jac_slice, *p_out, *rank, d)
+            }
+        }
+    }
+
+    /// Per-row pullback metric `g_n = J_n^T W_n J_n = M_n^T M_n` with
+    /// `M_n = U_n^T J_n ∈ ℝ^{r_n × d}`. Returns `(n_obs, d, d)` flattened
+    /// row-major as `(n_obs, d*d)`.
+    ///
+    /// Cost per row: `O(p · r · d)` for the `M_n` build (single pass over
+    /// `U_n` and `J_n`) plus `O(r · d²)` for `M_n^T M_n`. The `p × p` weight
+    /// `W_n` is never materialized.
     fn pullback_metric(&self, latent_dim: usize) -> Array2<f64> {
         let jac = self
             .jacobian_cache
@@ -294,11 +532,15 @@ impl IsometryPenalty {
         debug_assert_eq!(jac.ncols(), p * latent_dim);
         let mut g_all = Array2::<f64>::zeros((n_obs, latent_dim * latent_dim));
         for n in 0..n_obs {
+            // M_n = U_n^T J_n  (or J_n itself when W = I).
+            let m = self.projected_jacobian_row(n, latent_dim);
+            let r = m.nrows();
+            // g_n = M_n^T M_n: (d × d) result, contracting r.
             for a in 0..latent_dim {
                 for b in 0..latent_dim {
                     let mut s = 0.0;
-                    for i in 0..p {
-                        s += jac[[n, i * latent_dim + a]] * jac[[n, i * latent_dim + b]];
+                    for k in 0..r {
+                        s += m[[k, a]] * m[[k, b]];
                     }
                     g_all[[n, a * latent_dim + b]] = s;
                 }

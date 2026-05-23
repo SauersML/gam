@@ -34,6 +34,51 @@
 //! the shared `Schur⁻¹` factor in the REML `log|H|` gradient applies
 //! unchanged.
 //!
+//! ### Per-row local-block size
+//!
+//! The single-atom case from Piece 1 (`latent_coord.rs`) carries a per-row
+//! local block of size `d × d` (just `t_n ∈ ℝ^d`). For the multi-atom case
+//! the per-row local block stacks the assignment row and the on-atom
+//! coordinates of every atom:
+//!
+//! ```text
+//!   ψ_n  =  ( a_{n, 1..K}  ;  t_{n, 1, ·}  ;  …  ;  t_{n, K, ·} )
+//!         ∈  ℝ^{K + Σ_k d_k}.
+//! ```
+//!
+//! So the local-block dimension is
+//!
+//! ```text
+//!   dim(ψ_n)  =  K  +  Σ_{k=1..K} d_k,
+//! ```
+//!
+//! and the local Hessian block is `(K + Σ_k d_k) × (K + Σ_k d_k)`,
+//! block-diagonal across `n`. Piece 1's `solve_arrow_newton_step` Schur
+//! elimination generalises by:
+//!
+//! 1. Eliminating shared β = `(B_1, …, B_K)` first (the existing inner
+//!    factorisation), restricted on each row to the *active subset* `S_n`
+//!    — atoms with `a_{n,k} = 0` contribute neither to the border nor to
+//!    the row's `(t_{n,k}, ·)` block at first order.
+//! 2. Solving each row's `(K + Σ_k d_k) × (K + Σ_k d_k)` local block. In
+//!    the typical sparse regime `|S_n| ≪ K`, so the *effective* local
+//!    block collapses to `(|S_n| + Σ_{k ∈ S_n} d_k) × (·)` after dropping
+//!    the inactive coordinates from the active-set.
+//!
+//! When the companion proposals `proposals/per_point_hessian.md` (single-atom
+//! Hessian) and `proposals/arrow_schur_evidence.md` (Schur + evidence) land,
+//! the stacking recipe extends mechanically: the `(K, K)` assignment block
+//! (from this module — see [`AtomSelectionStrategy::row_hessian_block`])
+//! sits on the diagonal corner of `ψ_n`; the `K` per-atom `(d_k, d_k)`
+//! coordinate blocks tile the rest of the diagonal; and the off-diagonal
+//! `(a_{n,k}, t_{n,k,·})` couplings are populated from Piece 1's
+//! basis-derivative jet `∂Φ_k/∂t` evaluated against `B_k` (the chain rule
+//! on the reconstruction `a_{n,k} · Φ_k(t_{n,k}) · B_k`).
+//! [`AtomLibrary::row_block_residual`] is the entry point Piece 1's row
+//! Newton solver calls into; this module owns the assignment-side diagonal
+//! and leaves the cross block to the call site that has access to `B_k`
+//! and `∂Φ_k/∂t`.
+//!
 //! ## Relaxation choices for the assignment
 //!
 //! The assignment `a_n` is intrinsically combinatorial: in the ideal sparse
