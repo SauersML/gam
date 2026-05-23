@@ -2992,6 +2992,110 @@ fn json_array1(value: &JsonValue, context: &str) -> Result<Array1<f64>, String> 
     Ok(out)
 }
 
+fn parse_latent_manifold(
+    value: Option<&JsonValue>,
+    d: usize,
+    context: &str,
+) -> Result<LatentManifoldSpec, String> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(LatentManifoldSpec {
+            manifold: LatentManifold::Euclidean,
+            auto: true,
+        });
+    };
+    if value
+        .as_str()
+        .is_some_and(|s| s.eq_ignore_ascii_case("auto"))
+    {
+        return Ok(LatentManifoldSpec {
+            manifold: LatentManifold::Euclidean,
+            auto: true,
+        });
+    }
+    let parse_named = |name: &str| -> Result<LatentManifold, String> {
+        match name.to_ascii_lowercase().as_str() {
+            "euclidean" | "r" | "real" => Ok(LatentManifold::Euclidean),
+            "circle" | "s1" | "periodic" => {
+                if d == 1 {
+                    Ok(LatentManifold::Circle)
+                } else {
+                    Ok(LatentManifold::Product(
+                        (0..d).map(|_| LatentManifold::Circle).collect(),
+                    ))
+                }
+            }
+            "sphere" | "sn" => Ok(LatentManifold::Sphere { dim: d }),
+            "torus" => Ok(LatentManifold::Product(
+                (0..d).map(|_| LatentManifold::Circle).collect(),
+            )),
+            "cylinder" => {
+                if d < 2 {
+                    return Err(format!("{context}='cylinder' requires d >= 2"));
+                }
+                let mut parts = Vec::with_capacity(d);
+                parts.push(LatentManifold::Circle);
+                for _ in 1..d {
+                    parts.push(LatentManifold::Euclidean);
+                }
+                Ok(LatentManifold::Product(parts))
+            }
+            other => Err(format!(
+                "{context} must be 'auto', 'euclidean', 'circle', 'sphere', 'torus', or 'cylinder'; got '{other}'"
+            )),
+        }
+    };
+    let manifold = if let Some(name) = value.as_str() {
+        parse_named(name)?
+    } else if let Some(obj) = value.as_object() {
+        let kind = obj
+            .get("type")
+            .or_else(|| obj.get("kind"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or("euclidean");
+        match kind.to_ascii_lowercase().as_str() {
+            "interval" => {
+                let lo = obj
+                    .get("lo")
+                    .or_else(|| obj.get("min"))
+                    .and_then(JsonValue::as_f64)
+                    .ok_or_else(|| format!("{context}.lo is required for interval"))?;
+                let hi = obj
+                    .get("hi")
+                    .or_else(|| obj.get("max"))
+                    .and_then(JsonValue::as_f64)
+                    .ok_or_else(|| format!("{context}.hi is required for interval"))?;
+                if !(lo.is_finite() && hi.is_finite() && lo < hi) {
+                    return Err(format!("{context} interval requires finite lo < hi"));
+                }
+                LatentManifold::Interval { lo, hi }
+            }
+            other => parse_named(other)?,
+        }
+    } else if let Some(items) = value.as_array() {
+        let mut parts = Vec::with_capacity(items.len());
+        for (idx, item) in items.iter().enumerate() {
+            parts.push(parse_latent_manifold(
+                Some(item),
+                1,
+                &format!("{context}[{idx}]"),
+            )?.manifold);
+        }
+        LatentManifold::Product(parts)
+    } else {
+        return Err(format!("{context} must be a string, object, or product array"));
+    };
+    if manifold.ambient_dim(d) != d {
+        return Err(format!(
+            "{context} ambient dimension {} does not match latent d={d}",
+            manifold.ambient_dim(d)
+        ));
+    }
+    Ok(LatentManifoldSpec {
+        manifold,
+        auto: false,
+    })
+}
+
 fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, String> {
     let Some(payload) = payload.filter(|value| !value.is_null()) else {
         return Ok(Vec::new());
@@ -3020,6 +3124,11 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
         if n == 0 || d == 0 {
             return Err(format!("latents['{key}'] requires positive n and d"));
         }
+        let manifold = parse_latent_manifold(
+            obj.get("manifold"),
+            d,
+            &format!("latents['{key}'].manifold"),
+        )?;
         let init = match obj.get("init") {
             None => LatentInitSpec::Pca,
             Some(value) if value.as_str().is_some_and(|s| s.eq_ignore_ascii_case("pca")) => {
@@ -3131,6 +3240,7 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
             n,
             d,
             init,
+            manifold,
             aux_prior,
             dim_selection,
             explicit_none_mode,
@@ -3273,7 +3383,11 @@ fn prepare_standard_latent_coord(
 
     let matrix = initial_latent_matrix(&spec, y)?;
     let id_mode = latent_id_mode(&spec)?;
-    let latent_values = Arc::new(LatentCoordValues::from_matrix(matrix.view(), id_mode));
+    let latent_values = Arc::new(LatentCoordValues::from_matrix_with_manifold(
+        matrix.view(),
+        id_mode,
+        spec.manifold.manifold.clone(),
+    ));
 
     let base_cols = data.values.ncols();
     let mut values = Array2::<f64>::zeros((data.values.nrows(), base_cols + spec.d));
@@ -3328,6 +3442,8 @@ fn prepare_standard_latent_coord(
             values: latent_values,
             term_index: usize::MAX,
             feature_cols,
+            manifold: spec.manifold.manifold,
+            manifold_auto: spec.manifold.auto,
         },
     )))
 }
@@ -3348,6 +3464,56 @@ fn smooth_basis_feature_cols_for_latent(
             smooth_basis_feature_cols_for_latent(smooth)
         }
         crate::smooth::SmoothBasisSpec::FactorSmooth { .. } => None,
+    }
+}
+
+fn natural_latent_manifold_for_basis(
+    basis: &crate::smooth::SmoothBasisSpec,
+    d: usize,
+) -> LatentManifold {
+    match basis {
+        crate::smooth::SmoothBasisSpec::BSpline1D { spec, .. } => {
+            if matches!(
+                &spec.knotspec,
+                crate::basis::BSplineKnotSpec::PeriodicUniform { .. }
+            ) {
+                LatentManifold::Circle
+            } else {
+                LatentManifold::Euclidean
+            }
+        }
+        crate::smooth::SmoothBasisSpec::Sphere { .. } => LatentManifold::Sphere { dim: d },
+        crate::smooth::SmoothBasisSpec::Duchon { spec, .. } if spec.periodic && d == 1 => {
+            LatentManifold::Circle
+        }
+        crate::smooth::SmoothBasisSpec::TensorBSpline { spec, .. } => {
+            let parts: Vec<LatentManifold> = spec
+                .marginalspecs
+                .iter()
+                .map(|margin| {
+                    if matches!(
+                        &margin.knotspec,
+                        crate::basis::BSplineKnotSpec::PeriodicUniform { .. }
+                    ) {
+                        LatentManifold::Circle
+                    } else {
+                        LatentManifold::Euclidean
+                    }
+                })
+                .collect();
+            if parts.iter().all(|part| part.is_euclidean()) {
+                LatentManifold::Euclidean
+            } else {
+                LatentManifold::Product(parts)
+            }
+        }
+        crate::smooth::SmoothBasisSpec::BySmooth { smooth, .. } => {
+            natural_latent_manifold_for_basis(smooth, d)
+        }
+        crate::smooth::SmoothBasisSpec::ThinPlate { .. }
+        | crate::smooth::SmoothBasisSpec::Matern { .. }
+        | crate::smooth::SmoothBasisSpec::Duchon { .. }
+        | crate::smooth::SmoothBasisSpec::FactorSmooth { .. } => LatentManifold::Euclidean,
     }
 }
 
@@ -3402,6 +3568,12 @@ fn materialize_standard<'a>(
                 "latent-coordinate smooth term disappeared during formula materialization"
                     .to_string()
             })?;
+        if coord.manifold_auto {
+            let inferred =
+                natural_latent_manifold_for_basis(&spec.smooth_terms[coord.term_index].basis, coord.feature_cols.len());
+            coord.manifold = inferred.clone();
+            coord.values = Arc::new(coord.values.with_manifold(inferred));
+        }
     }
 
     let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;

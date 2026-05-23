@@ -13014,6 +13014,7 @@ struct SingleBlockLatentCoordDesignCache {
     n_obs: usize,
     latent_dim: usize,
     id_mode: crate::terms::latent_coord::LatentIdMode,
+    manifold: crate::terms::latent_coord::LatentManifold,
     design_revision: u64,
 }
 
@@ -13063,6 +13064,7 @@ impl SingleBlockLatentCoordDesignCache {
             n_obs: latent.values.n_obs(),
             latent_dim: latent.values.latent_dim(),
             id_mode: latent.values.id_mode().clone(),
+            manifold: latent.values.manifold().clone(),
             design_revision: 0,
         })
     }
@@ -13107,12 +13109,15 @@ impl SingleBlockLatentCoordDesignCache {
             .into());
         }
         let flat = theta.slice(s![self.rho_dim..]).to_owned();
-        let latent = std::sync::Arc::new(crate::terms::latent_coord::LatentCoordValues::from_flat(
-            flat,
-            self.n_obs,
-            self.latent_dim,
-            self.id_mode.clone(),
-        ));
+        let latent = std::sync::Arc::new(
+            crate::terms::latent_coord::LatentCoordValues::from_flat_with_manifold(
+                flat,
+                self.n_obs,
+                self.latent_dim,
+                self.id_mode.clone(),
+                self.manifold.clone(),
+            ),
+        );
         for n in 0..self.n_obs {
             for axis in 0..self.latent_dim {
                 let col = self.feature_cols[axis];
