@@ -17024,3 +17024,657 @@ impl TransformationScoreCalibration {
 #[serde(rename_all = "kebab-case")]
 pub enum ColumnKindTag {
 
+exec
+/bin/zsh -lc "nl -ba src/inference/hmc.rs | sed -n '1010,1060p'" in /Users/user/gam
+ succeeded in 0ms:
+  1010	        .map(|(i, slot)| {
+  1011	            let residual = data.y[i] - eta[i];
+  1012	            let w_i = data.weights[i];
+  1013	            *slot = w_i * residual;
+  1014	            -0.5 * w_i * residual * residual
+  1015	        })
+  1016	        .sum();
+  1017	
+  1018	    let grad_ll = fast_atv(&data.x, &weighted_residual);
+  1019	    (ll, grad_ll)
+  1020	}
+  1021	
+  1022	/// Poisson(log) log-likelihood and gradient.
+  1023	///
+  1024	/// log p(y|η) = y·η − exp(η), gradient = X'(w ⊙ (y − μ))
+  1025	fn poisson_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+  1026	    use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
+  1027	    let n = data.n_samples;
+  1028	    let mut residual = Array1::<f64>::zeros(n);
+  1029	    let ll: f64 = residual
+  1030	        .as_slice_mut()
+  1031	        .unwrap()
+  1032	        .par_iter_mut()
+  1033	        .enumerate()
+  1034	        .map(|(i, slot)| {
+  1035	            let eta_i = eta[i].clamp(-700.0, 700.0);
+  1036	            let mu_i = eta_i.exp();
+  1037	            let y_i = data.y[i];
+  1038	            let w_i = data.weights[i];
+  1039	            *slot = w_i * (y_i - mu_i);
+  1040	            w_i * (y_i * eta_i - mu_i)
+  1041	        })
+  1042	        .sum();
+  1043	
+  1044	    let grad_ll = fast_atv(&data.x, &residual);
+  1045	    (ll, grad_ll)
+  1046	}
+  1047	
+  1048	fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+  1049	    use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
+  1050	    let n = data.n_samples;
+  1051	    let shape = data.gamma_shape.max(1e-10);
+  1052	    // Hoist shape-only constants out of the per-sample loop: ln Γ(shape) and
+  1053	    // shape · ln(shape) are independent of i, so previously each sample paid
+  1054	    // an extra `ln_gamma` and `ln` plus a multiply. n is typically biobank-
+  1055	    // scale, so this collapses Θ(n) gamma-function evaluations to one.
+  1056	    let shape_ln_shape = shape * shape.ln();
+  1057	    let log_gamma_shape = statrs::function::gamma::ln_gamma(shape);
+  1058	    let shape_minus_one = shape - 1.0;
+  1059	    let mut residual = Array1::<f64>::zeros(n);
+  1060	    let ll: f64 = residual
+
+exec
+/bin/zsh -lc "nl -ba src/inference/hmc.rs | sed -n '3440,3535p'" in /Users/user/gam
+ succeeded in 0ms:
+  3440	// Whitening uses the Cholesky of the joint Hessian at the mode, exactly as for
+  3441	// the standard NutsPosterior. C^1 linear extension outside the training knot
+  3442	// range prevents basis evaluation discontinuities.
+  3443	
+  3444	/// Fixed spline artifacts for link-wiggle posterior sampling.
+  3445	#[derive(Clone)]
+  3446	pub struct LinkWiggleSplineArtifacts {
+  3447	    /// Knot range (min, max) from training (in standardized [0,1] space of q₀)
+  3448	    pub knot_range: (f64, f64),
+  3449	    /// Full knot vector for the shared monotone I-spline basis
+  3450	    pub knot_vector: Array1<f64>,
+  3451	    /// I-spline degree
+  3452	    pub degree: usize,
+  3453	}
+  3454	
+  3455	/// Whitened log-posterior target for joint (β_eta, β_wiggle) with analytical gradients.
+  3456	#[derive(Clone)]
+  3457	pub struct LinkWigglePosterior {
+  3458	    /// Main design matrix X (n × p_main)
+  3459	    x: Arc<Array2<f64>>,
+  3460	    y: Arc<Array1<f64>>,
+  3461	    weights: Arc<Array1<f64>>,
+  3462	    /// Penalty for main coefficients (p_main × p_main)
+  3463	    penalty_base: Arc<Array2<f64>>,
+  3464	    /// Penalty for wiggle coefficients (p_wiggle × p_wiggle)
+  3465	    penalty_link: Arc<Array2<f64>>,
+  3466	    mode_beta: Arc<Array1<f64>>,
+  3467	    mode_theta: Arc<Array1<f64>>,
+  3468	    spline: LinkWiggleSplineArtifacts,
+  3469	    /// L where LL^T = H^{-1} (joint Hessian)
+  3470	    chol: Array2<f64>,
+  3471	    /// L^T for gradient chain rule
+  3472	    chol_t: Array2<f64>,
+  3473	    p_base: usize,
+  3474	    p_link: usize,
+  3475	    n_samples: usize,
+  3476	    nuts_family: NutsFamily,
+  3477	    /// Family-specific noise parameter: Gaussian sigma or Gamma shape.
+  3478	    scale: f64,
+  3479	}
+  3480	
+  3481	impl LinkWigglePosterior {
+  3482	    /// Standardize q₀ values to [0,1] range using training knot bounds.
+  3483	    #[inline]
+  3484	    fn standardized_z(&self, u: &Array1<f64>) -> (Array1<f64>, Array1<f64>, f64) {
+  3485	        let (min_u, max_u) = self.spline.knot_range;
+  3486	        let rw = (max_u - min_u).max(1e-6);
+  3487	        let z_raw: Array1<f64> = u.mapv(|v| (v - min_u) / rw);
+  3488	        let z_c: Array1<f64> = z_raw.mapv(|z| z.clamp(0.0, 1.0));
+  3489	        (z_raw, z_c, rw)
+  3490	    }
+  3491	
+  3492	    /// Creates a new link-wiggle posterior target.
+  3493	    pub fn new(
+  3494	        x: ArrayView2<f64>,
+  3495	        y: ArrayView1<f64>,
+  3496	        weights: ArrayView1<f64>,
+  3497	        penalty_base: ArrayView2<f64>,
+  3498	        penalty_link: ArrayView2<f64>,
+  3499	        mode_beta: ArrayView1<f64>,
+  3500	        mode_theta: ArrayView1<f64>,
+  3501	        hessian: ArrayView2<f64>,
+  3502	        spline: LinkWiggleSplineArtifacts,
+  3503	        nuts_family: NutsFamily,
+  3504	        scale: f64,
+  3505	    ) -> Result<Self, String> {
+  3506	        let n_samples = x.nrows();
+  3507	        let p_base = x.ncols();
+  3508	        let p_link = mode_theta.len();
+  3509	        let dim = p_base + p_link;
+  3510	        if hessian.nrows() != dim || hessian.ncols() != dim {
+  3511	            return Err(HmcError::DimensionMismatch {
+  3512	                reason: format!(
+  3513	                    "LinkWigglePosterior: Hessian dim mismatch: {}x{} vs expected {}x{}",
+  3514	                    hessian.nrows(),
+  3515	                    hessian.ncols(),
+  3516	                    dim,
+  3517	                    dim,
+  3518	                ),
+  3519	            }
+  3520	            .into());
+  3521	        }
+  3522	        let hessian_owned = hessian.to_owned();
+  3523	        let chol_factor = hessian_owned
+  3524	            .cholesky(Side::Lower)
+  3525	            .map_err(|e| format!("LinkWigglePosterior Cholesky failed: {:?}", e))?;
+  3526	        let l_h = chol_factor.lower_triangular();
+  3527	        let chol = solve_upper_triangular_transpose(&l_h, dim);
+  3528	        let chol_t = chol.t().to_owned();
+  3529	        Ok(Self {
+  3530	            x: Arc::new(x.to_owned()),
+  3531	            y: Arc::new(y.to_owned()),
+  3532	            weights: Arc::new(weights.to_owned()),
+  3533	            penalty_base: Arc::new(penalty_base.to_owned()),
+  3534	            penalty_link: Arc::new(penalty_link.to_owned()),
+  3535	            mode_beta: Arc::new(mode_beta.to_owned()),
+
+exec
+/bin/zsh -lc "nl -ba src/inference/sample.rs | sed -n '300,380p'" in /Users/user/gam
+ succeeded in 0ms:
+   300	}
+   301	
+   302	/// Draw iid samples from `N(mode, H^{-1})` using the saved penalised
+   303	/// Hessian `H = L L^T`.
+   304	///
+   305	/// We solve `L^T δ = ε` for each iid `ε ~ N(0, I)` and report
+   306	/// `β = mode + δ`. The resulting draws are unbiased samples of the
+   307	/// Laplace-Gaussian approximation: their finite-sample mean / std
+   308	/// converge to `(mode, diag(H^{-1})^{1/2})` and the implied credible
+   309	/// bands match the surface that closed-form posterior tooling in
+   310	/// `mgcv` and `gam` itself uses for prediction intervals.
+   311	///
+   312	/// `rationale` is a short label appearing in error messages so callers
+   313	/// can tell which class fell back to this path. We mark `rhat = 1.0`
+   314	/// and `ess = n_total` because the draws are iid by construction.
+   315	pub fn laplace_gaussian_fallback(
+   316	    model: &SavedModel,
+   317	    cfg: &NutsConfig,
+   318	    rationale: &'static str,
+   319	) -> Result<NutsResult, SampleError> {
+   320	    let fit = fit_result_from_saved_model_for_prediction(model)?;
+   321	    let mode = fit.beta.clone();
+   322	    let p = mode.len();
+   323	    if p == 0 {
+   324	        return Err(SampleError::SamplerSetupFailed {
+   325	            reason: format!("{rationale}: cannot sample from an empty coefficient vector"),
+   326	        });
+   327	    }
+   328	    let h = fit
+   329	        .penalized_hessian()
+   330	        .ok_or_else(|| SampleError::SamplerSetupFailed {
+   331	            reason: format!(
+   332	                "{rationale}: posterior fallback requires the explicit penalised Hessian; \
+   333	             refit with exact geometry export to enable posterior sampling for this class."
+   334	            ),
+   335	        })?;
+   336	    if h.nrows() != p || h.ncols() != p {
+   337	        return Err(SampleError::SamplerSetupFailed {
+   338	            reason: format!(
+   339	                "{rationale}: penalised Hessian is {}x{}, expected {}x{}",
+   340	                h.nrows(),
+   341	                h.ncols(),
+   342	                p,
+   343	                p
+   344	            ),
+   345	        });
+   346	    }
+   347	    let chol = h
+   348	        .cholesky(Side::Lower)
+   349	        .map_err(|err| SampleError::SamplerSetupFailed {
+   350	            reason: format!(
+   351	                "{rationale}: Cholesky factorisation of the penalised Hessian failed: {err:?}"
+   352	            ),
+   353	        })?;
+   354	    let l = chol.lower_triangular();
+   355	
+   356	    let n_total = cfg.n_samples.saturating_mul(cfg.n_chains).max(1);
+   357	    let mut samples = Array2::<f64>::zeros((n_total, p));
+   358	    let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.seed);
+   359	    let mut eps = Array1::<f64>::zeros(p);
+   360	    let mut delta = Array1::<f64>::zeros(p);
+   361	    for k in 0..n_total {
+   362	        for i in 0..p {
+   363	            eps[i] = sample_standard_normal(&mut rng);
+   364	        }
+   365	        back_solve_lower_transpose(&l, &eps, &mut delta);
+   366	        for i in 0..p {
+   367	            samples[(k, i)] = mode[i] + delta[i];
+   368	        }
+   369	    }
+   370	
+   371	    let posterior_mean = samples
+   372	        .mean_axis(ndarray::Axis(0))
+   373	        .unwrap_or_else(|| Array1::<f64>::zeros(p));
+   374	    let posterior_std = samples.std_axis(ndarray::Axis(0), 1.0);
+   375	
+   376	    Ok(NutsResult {
+   377	        samples,
+   378	        posterior_mean,
+   379	        posterior_std,
+   380	        rhat: 1.0,
+
+exec
+/bin/zsh -lc "nl -ba src/inference/smooth_test.rs | sed -n '120,150p'" in /Users/user/gam
+ succeeded in 0ms:
+   120	    if ns > 0 {
+   121	        let beta_ns = input.beta.slice(s![0..ns]);
+   122	        let cov_ns = cov_block.slice(s![0..ns, 0..ns]).to_owned();
+   123	        stat += truncated_wald(beta_ns, &cov_ns, ns).unwrap_or(f64::NAN);
+   124	    }
+   125	    if penalized_k > 0 && penalized_rank > 0 {
+   126	        let beta_pen = input.beta.slice(s![ns..k]);
+   127	        let cov_pen = cov_block.slice(s![ns..k, ns..k]).to_owned();
+   128	        stat += truncated_wald(beta_pen, &cov_pen, penalized_rank).unwrap_or(f64::NAN);
+   129	    }
+   130	
+   131	    let fallback_df = input.edf.round().clamp(1.0, k.max(1) as f64);
+   132	    let ref_df = input
+   133	        .coefficient_influence
+   134	        .map(|f| influence_ref_df(f, input.coeff_range.clone(), fallback_df))
+   135	        .unwrap_or(fallback_df);
+   136	    let p_value = if stat.is_finite() {
+   137	        if input.dispersion.is_estimated() {
+   138	            input.residual_df.and_then(|den_df| {
+   139	                (den_df.is_finite() && den_df > 0.0)
+   140	                    .then(|| FisherSnedecor::new(ref_df, den_df).ok())
+   141	                    .flatten()
+   142	                    .map(|dist| 1.0 - dist.cdf(stat / ref_df / input.dispersion.phi()))
+   143	            })
+   144	        } else {
+   145	            ChiSquared::new(ref_df)
+   146	                .ok()
+   147	                .map(|dist| 1.0 - dist.cdf(stat))
+   148	        }
+   149	    } else {
+   150	        None
+
+exec
+/bin/zsh -lc "nl -ba src/inference/hmc.rs | sed -n '3730,3845p'" in /Users/user/gam
+ succeeded in 0ms:
+  3730	            .zip(g_prime.iter())
+  3731	            .map(|(&r, &g)| r * g)
+  3732	            .collect();
+  3733	        let grad_beta = &fast_atv(&self.x, &r_scaled) - &self.penalty_base.dot(&beta);
+  3734	
+  3735	        // Penalty
+  3736	        let penalty = 0.5 * beta.dot(&self.penalty_base.dot(&beta))
+  3737	            + 0.5 * theta.dot(&self.penalty_link.dot(&theta));
+  3738	
+  3739	        // Assemble joint gradient and transform to whitened space
+  3740	        let mut grad_q = Array1::<f64>::zeros(dim);
+  3741	        grad_q
+  3742	            .slice_mut(ndarray::s![0..self.p_base])
+  3743	            .assign(&grad_beta);
+  3744	        grad_q
+  3745	            .slice_mut(ndarray::s![self.p_base..])
+  3746	            .assign(&grad_theta);
+  3747	        (ll - penalty, self.chol_t.dot(&grad_q))
+  3748	    }
+  3749	
+  3750	    /// Get the Cholesky factor L for un-whitening samples.
+  3751	    pub fn chol(&self) -> &Array2<f64> {
+  3752	        &self.chol
+  3753	    }
+  3754	
+  3755	    /// Get the mode [β_eta; β_wiggle].
+  3756	    pub fn mode_joint(&self) -> Array1<f64> {
+  3757	        let dim = self.p_base + self.p_link;
+  3758	        let mut mode = Array1::<f64>::zeros(dim);
+  3759	        mode.slice_mut(ndarray::s![0..self.p_base])
+  3760	            .assign(&self.mode_beta);
+  3761	        mode.slice_mut(ndarray::s![self.p_base..])
+  3762	            .assign(&self.mode_theta);
+  3763	        mode
+  3764	    }
+  3765	}
+  3766	
+  3767	impl HamiltonianTarget<Array1<f64>> for LinkWigglePosterior {
+  3768	    fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
+  3769	        let (logp, g) = self.compute_logp_and_grad(position);
+  3770	        grad.assign(&g);
+  3771	        logp
+  3772	    }
+  3773	}
+  3774	
+  3775	/// Runs NUTS sampling for joint (β_eta, β_wiggle) in a link-wiggle model.
+  3776	pub fn run_link_wiggle_nuts_sampling(
+  3777	    x: ArrayView2<f64>,
+  3778	    y: ArrayView1<f64>,
+  3779	    weights: ArrayView1<f64>,
+  3780	    penalty_base: ArrayView2<f64>,
+  3781	    penalty_link: ArrayView2<f64>,
+  3782	    mode_beta: ArrayView1<f64>,
+  3783	    mode_theta: ArrayView1<f64>,
+  3784	    hessian: ArrayView2<f64>,
+  3785	    spline: LinkWiggleSplineArtifacts,
+  3786	    nuts_family: NutsFamily,
+  3787	    scale: f64,
+  3788	    config: &NutsConfig,
+  3789	) -> Result<NutsResult, String> {
+  3790	    validate_nuts_target_accept(config.target_accept).map_err(String::from)?;
+  3791	    let dim = mode_beta.len() + mode_theta.len();
+  3792	    let target = LinkWigglePosterior::new(
+  3793	        x,
+  3794	        y,
+  3795	        weights,
+  3796	        penalty_base,
+  3797	        penalty_link,
+  3798	        mode_beta,
+  3799	        mode_theta,
+  3800	        hessian,
+  3801	        spline,
+  3802	        nuts_family,
+  3803	        scale,
+  3804	    )?;
+  3805	    let chol = target.chol().clone();
+  3806	    let mode_arr = target.mode_joint();
+  3807	
+  3808	    let mut rng = StdRng::seed_from_u64(config.seed);
+  3809	    let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
+  3810	        .map(|_| {
+  3811	            Array1::from_shape_fn(dim, |_| {
+  3812	                let u1: f64 = rng.random::<f64>().max(1e-10);
+  3813	                let u2: f64 = rng.random();
+  3814	                (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos() * 0.1
+  3815	            })
+  3816	        })
+  3817	        .collect();
+  3818	
+  3819	    let mass_cfg = robust_mass_matrix_config(dim, config.nwarmup);
+  3820	    let mut sampler = GenericNUTS::new_with_mass_matrix(
+  3821	        target,
+  3822	        initial_positions,
+  3823	        config.target_accept,
+  3824	        mass_cfg,
+  3825	    );
+  3826	
+  3827	    let (samples_array, run_stats) = sampler
+  3828	        .run_progress(config.n_samples, config.nwarmup)
+  3829	        .map_err(|e| format!("Link-wiggle NUTS sampling failed: {e}"))?;
+  3830	    log::info!("Link-wiggle NUTS sampling complete: {}", run_stats);
+  3831	
+  3832	    // Un-whiten samples: β = mode + L·z
+  3833	    let shape = samples_array.shape();
+  3834	    let n_chains = shape[0];
+  3835	    let n_samples_out = shape[1];
+  3836	    let total_samples = n_chains * n_samples_out;
+  3837	
+  3838	    let mut samples = Array2::<f64>::zeros((total_samples, dim));
+  3839	    let mut z_buffer = Array1::<f64>::zeros(dim);
+  3840	    for chain in 0..n_chains {
+  3841	        for sample_i in 0..n_samples_out {
+  3842	            z_buffer.assign(&samples_array.slice(ndarray::s![chain, sample_i, ..]));
+  3843	            samples
+  3844	                .row_mut(chain * n_samples_out + sample_i)
+  3845	                .assign(&(&mode_arr + &chol.dot(&z_buffer)));
+
+exec
+/bin/zsh -lc "nl -ba src/inference/hmc.rs | sed -n '280,360p'" in /Users/user/gam
+ succeeded in 0ms:
+   280	                let diff = samples[[chain, i, d]] - mean1;
+   281	                var1 += diff * diff;
+   282	            }
+   283	            var1 /= (half - 1).max(1) as f64;
+   284	            let first_idx = chain;
+   285	            chain_means[first_idx] = mean1;
+   286	            chainvars[first_idx] = var1;
+   287	
+   288	            // Second half
+   289	            let mut sum2 = 0.0;
+   290	            for i in half..(2 * half) {
+   291	                sum2 += samples[[chain, i, d]];
+   292	            }
+   293	            let mean2 = sum2 / half as f64;
+   294	            let mut var2 = 0.0;
+   295	            for i in half..(2 * half) {
+   296	                let diff = samples[[chain, i, d]] - mean2;
+   297	                var2 += diff * diff;
+   298	            }
+   299	            var2 /= (half - 1).max(1) as f64;
+   300	            let second_idx = n_chains + chain;
+   301	            chain_means[second_idx] = mean2;
+   302	            chainvars[second_idx] = var2;
+   303	        }
+   304	
+   305	        // Within-chain variance W
+   306	        let w: f64 = chainvars.iter().copied().sum::<f64>() / n_split_chains as f64;
+   307	
+   308	        // Between-chain variance B
+   309	        let overall_mean: f64 = chain_means.iter().copied().sum::<f64>() / n_split_chains as f64;
+   310	        let b: f64 = chain_means
+   311	            .iter()
+   312	            .map(|m| (m - overall_mean).powi(2))
+   313	            .sum::<f64>()
+   314	            * n_split_samples as f64
+   315	            / (n_split_chains - 1) as f64;
+   316	
+   317	        // Estimated variance
+   318	        let var_hat = (n_split_samples as f64 - 1.0) / n_split_samples as f64 * w
+   319	            + b / n_split_samples as f64;
+   320	
+   321	        // R-hat
+   322	        let rhat_d = if w > 1e-10 { (var_hat / w).sqrt() } else { 1.0 };
+   323	        max_rhat = max_rhat.max(rhat_d);
+   324	
+   325	        // Real ESS via split-chain autocorrelation with Geyer IPS truncation.
+   326	        let ess_d = ess_from_split_dimension(samples, n_chains, half, d);
+   327	        min_ess = min_ess.min(ess_d);
+   328	    }
+   329	
+   330	    (max_rhat, min_ess.max(1.0))
+   331	}
+   332	
+   333	/// Solve L^T * X = I where L is lower triangular.
+   334	///
+   335	/// Returns X = L^{-T} (the inverse transpose of L).
+   336	///
+   337	/// This is the correct way to compute the whitening transform matrix:
+   338	/// Given H = L L^T (Cholesky), we need W where W W^T = H^{-1}
+   339	/// Since H^{-1} = L^{-T} L^{-1}, we have W = L^{-T}.
+   340	///
+   341	/// Implementation strategy (math-equivalent to back-substitution on L^T):
+   342	/// We compute L^{-1} column-wise via forward substitution on L, then the
+   343	/// result is `L^{-1}` transposed. Forward-substituting column `c` of L^{-1}
+   344	/// uses `L`'s rows (which are contiguous in row-major `Array2`), giving
+   345	/// stride-1 inner loops instead of the strided `l[[j, i]]` (column-major
+   346	/// access pattern) and double-indexed writes of the original. We also
+   347	/// exploit the triangular structure of `L^{-1}` (entries above the diagonal
+   348	/// are zero), skipping ~half of the inner work compared to the previous
+   349	/// version which traversed `i = (0..dim).rev()` for every column.
+   350	///
+   351	/// Total cost: ~dim^3 / 6 multiply-adds (down from dim^3 / 2), with all
+   352	/// inner loops on contiguous slices.
+   353	fn solve_upper_triangular_transpose(l: &Array2<f64>, dim: usize) -> Array2<f64> {
+   354	    let mut result = Array2::<f64>::zeros((dim, dim));
+   355	    if dim == 0 {
+   356	        return result;
+   357	    }
+   358	
+   359	    // Pull contiguous row slice access from L (row-major standard layout).
+   360	    // Falls back to a one-time owned copy if `l` is not standard-layout
+
+exec
+/bin/zsh -lc "nl -ba src/solver/estimate.rs | sed -n '3890,3948p'" in /Users/user/gam
+ succeeded in 0ms:
+  3890	/// Dispersion contract used by inferential covariance and reference distributions.
+  3891	///
+  3892	/// `Known(phi)` is used for fixed-scale exponential-family fits such as
+  3893	/// Poisson and Binomial (`phi = 1`). `Estimated(phi)` is used when the
+  3894	/// residual/likelihood scale is estimated from the data, e.g. Gaussian
+  3895	/// (`phi = sigma^2`) and Gamma (`phi = 1 / shape`). Stored covariance
+  3896	/// matrices below are scaled by this `phi`.
+  3897	#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+  3898	pub enum Dispersion {
+  3899	    Known(f64),
+  3900	    Estimated(f64),
+  3901	}
+  3902	
+  3903	impl Dispersion {
+  3904	    #[inline]
+  3905	    pub fn phi(self) -> f64 {
+  3906	        match self {
+  3907	            Self::Known(phi) | Self::Estimated(phi) => phi,
+  3908	        }
+  3909	    }
+  3910	
+  3911	    #[inline]
+  3912	    pub fn is_estimated(self) -> bool {
+  3913	        matches!(self, Self::Estimated(_))
+  3914	    }
+  3915	}
+  3916	
+  3917	impl Default for Dispersion {
+  3918	    fn default() -> Self {
+  3919	        Self::Known(1.0)
+  3920	    }
+  3921	}
+  3922	
+  3923	#[derive(Clone, Debug, Serialize, Deserialize)]
+  3924	pub struct FitInference {
+  3925	    pub edf_by_block: Vec<f64>,
+  3926	    pub edf_total: f64,
+  3927	    pub smoothing_correction: Option<Array2<f64>>,
+  3928	    pub penalized_hessian: Array2<f64>,
+  3929	    pub working_weights: Array1<f64>,
+  3930	    pub working_response: Array1<f64>,
+  3931	    pub reparam_qs: Option<Array2<f64>>,
+  3932	    /// Dispersion/scale used to scale all coefficient covariance matrices.
+  3933	    #[serde(default)]
+  3934	    pub dispersion: Dispersion,
+  3935	    /// Conditional Bayesian covariance under fixed smoothing parameters (mgcv
+  3936	    /// `Vb`): `Vb = H^{-1} * phi`, where `H = X'W_HX + S(lambda)` and `phi`
+  3937	    /// is [`dispersion`](Self::dispersion). Do not use an unscaled `H^{-1}`
+  3938	    /// for standard errors when scale is estimated.
+  3939	    pub beta_covariance: Option<Array2<f64>>,
+  3940	    /// Marginal SEs from `beta_covariance`.
+  3941	    pub beta_standard_errors: Option<Array1<f64>>,
+  3942	    /// Optional smoothing-parameter-corrected Bayesian covariance (mgcv `Vp`):
+  3943	    /// `Vp = Vb + V_lambda`, on the same dispersion scale as `Vb`. Usually
+  3944	    /// this is first-order: `Var*(β) ≈ Var(β|λ) + J Var(ρ) J^T`; high-risk
+  3945	    /// regimes may use adaptive cubature for higher-order terms.
+  3946	    pub beta_covariance_corrected: Option<Array2<f64>>,
+  3947	    /// Marginal SEs from `beta_covariance_corrected`.
+  3948	    pub beta_standard_errors_corrected: Option<Array1<f64>>,
+
+exec
+/bin/zsh -lc "nl -ba src/inference/hmc.rs | sed -n '996,1018p'" in /Users/user/gam
+ succeeded in 0ms:
+   996	/// Gaussian log-likelihood and gradient.
+   997	///
+   998	/// log p(y|η) = −½ w·(y − η)², gradient = X'(w ⊙ (y − η))
+   999	fn gaussian_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+  1000	    use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
+  1001	    let n = data.n_samples;
+  1002	    // Per-row: residual = y - η, weighted_residual = w·residual,
+  1003	    // ll contribution = -0.5·w·residual². All independent across rows.
+  1004	    let mut weighted_residual = Array1::<f64>::zeros(n);
+  1005	    let ll: f64 = weighted_residual
+  1006	        .as_slice_mut()
+  1007	        .unwrap()
+  1008	        .par_iter_mut()
+  1009	        .enumerate()
+  1010	        .map(|(i, slot)| {
+  1011	            let residual = data.y[i] - eta[i];
+  1012	            let w_i = data.weights[i];
+  1013	            *slot = w_i * residual;
+  1014	            -0.5 * w_i * residual * residual
+  1015	        })
+  1016	        .sum();
+  1017	
+  1018	    let grad_ll = fast_atv(&data.x, &weighted_residual);
+
+exec
+/bin/zsh -lc "nl -ba src/inference/hmc.rs | sed -n '3660,3710p'" in /Users/user/gam
+ succeeded in 0ms:
+  3660	            }
+  3661	            NutsFamily::BinomialLogit => {
+  3662	                let mut ll_acc = 0.0;
+  3663	                for i in 0..self.n_samples {
+  3664	                    let eta_i = eta[i];
+  3665	                    let (y_i, w_i) = (self.y[i], self.weights[i]);
+  3666	                    ll_acc += w_i * (y_i * eta_i - NutsPosterior::log1pexp(eta_i));
+  3667	                    let mu = NutsPosterior::sigmoid_stable(eta_i);
+  3668	                    residual[i] = w_i * (y_i - mu);
+  3669	                }
+  3670	                ll = ll_acc;
+  3671	            }
+  3672	            NutsFamily::BinomialProbit => {
+  3673	                let mut ll_acc = 0.0;
+  3674	                for i in 0..self.n_samples {
+  3675	                    let eta_i = eta[i];
+  3676	                    let (y_i, w_i) = (self.y[i], self.weights[i]);
+  3677	                    let log_phi_pos = log_ndtr(eta_i);
+  3678	                    let log_phi_neg = log_ndtr(-eta_i);
+  3679	                    ll_acc += w_i * (y_i * log_phi_pos + (1.0 - y_i) * log_phi_neg);
+  3680	                    let log_phi = standard_normal_log_pdf(eta_i);
+  3681	                    let ratio_pos = (log_phi - log_phi_pos).exp();
+  3682	                    let ratio_neg = (log_phi - log_phi_neg).exp();
+  3683	                    residual[i] = w_i * (y_i * ratio_pos - (1.0 - y_i) * ratio_neg);
+  3684	                }
+  3685	                ll = ll_acc;
+  3686	            }
+  3687	            NutsFamily::BinomialCLogLog => {
+  3688	                let mut ll_acc = 0.0;
+  3689	                for i in 0..self.n_samples {
+  3690	                    let (y_i, w_i) = (self.y[i], self.weights[i]);
+  3691	                    let (ll_i, residual_i) = cloglog_bernoulli_logp_and_residual(eta[i], y_i);
+  3692	                    ll_acc += w_i * ll_i;
+  3693	                    residual[i] = w_i * residual_i;
+  3694	                }
+  3695	                ll = ll_acc;
+  3696	            }
+  3697	            NutsFamily::PoissonLog => {
+  3698	                let mut ll_acc = 0.0;
+  3699	                for i in 0..self.n_samples {
+  3700	                    let eta_i = eta[i].clamp(-30.0, 30.0);
+  3701	                    let (y_i, w_i) = (self.y[i], self.weights[i]);
+  3702	                    let mu = eta_i.exp();
+  3703	                    ll_acc += w_i * (y_i * eta_i - mu);
+  3704	                    residual[i] = w_i * (y_i - mu);
+  3705	                }
+  3706	                ll = ll_acc;
+  3707	            }
+  3708	            NutsFamily::GammaLog => {
+  3709	                let mut ll_acc = 0.0;
+  3710	                let shape = self.scale.max(1e-10);
+
+exec
+/bin/zsh -lc "nl -ba src/inference/hmc.rs | sed -n '3638,3662p'" in /Users/user/gam
+ succeeded in 0ms:
+  3638	        let q = &mode + &self.chol.dot(z);
+  3639	        let beta = q.slice(ndarray::s![0..self.p_base]).to_owned();
+  3640	        let theta = q.slice(ndarray::s![self.p_base..]).to_owned();
+  3641	
+  3642	        // Compute η = q₀ + B(q₀)·θ where q₀ = X·β
+  3643	        let u = crate::faer_ndarray::fast_av(self.x.as_ref(), &beta);
+  3644	        let (bwiggle, eta) = self.evaluate_link(&u, &theta);
+  3645	
+  3646	        // Log-likelihood and residuals via family dispatch
+  3647	        let ll;
+  3648	        let mut residual = Array1::<f64>::zeros(self.n_samples);
+  3649	        match self.nuts_family {
+  3650	            NutsFamily::Gaussian => {
+  3651	                let inv_scale_sq = 1.0 / (self.scale * self.scale).max(1e-10);
+  3652	                let mut ll_acc = 0.0;
+  3653	                for i in 0..self.n_samples {
+  3654	                    let r = self.y[i] - eta[i];
+  3655	                    let w = self.weights[i];
+  3656	                    ll_acc -= 0.5 * w * r * r * inv_scale_sq;
+  3657	                    residual[i] = w * r * inv_scale_sq;
+  3658	                }
+  3659	                ll = ll_acc;
+  3660	            }
+  3661	            NutsFamily::BinomialLogit => {
+  3662	                let mut ll_acc = 0.0;
+
