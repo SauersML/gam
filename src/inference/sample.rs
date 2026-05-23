@@ -317,6 +317,7 @@ pub fn laplace_gaussian_fallback(
     cfg: &NutsConfig,
     rationale: &'static str,
 ) -> Result<NutsResult, SampleError> {
+    use crate::inference::dispersion_cov::DispersionExt as _;
     let fit = fit_result_from_saved_model_for_prediction(model)?;
     let mode = fit.beta.clone();
     let p = mode.len();
@@ -333,6 +334,14 @@ pub fn laplace_gaussian_fallback(
              refit with exact geometry export to enable posterior sampling for this class."
             ),
         })?;
+    // `penalized_hessian` is stored unscaled (no φ). To draw Laplace
+    // approximations of `N(mode, φ·H⁻¹)` we solve `Lᵀ δ = ε` (so
+    // `Var(δ) = H⁻¹`) and then rescale by √φ. For families with
+    // `Dispersion::Known(1.0)` (Binomial / Poisson) this is a no-op;
+    // for Gaussian / Gamma it restores the φ-scaled posterior
+    // covariance that the Wald-style intervals downstream assume.
+    let dispersion = fit.dispersion().unwrap_or_default();
+    let sqrt_phi = dispersion.sqrt_phi();
     if h.nrows() != p || h.ncols() != p {
         return Err(SampleError::SamplerSetupFailed {
             reason: format!(
@@ -364,7 +373,10 @@ pub fn laplace_gaussian_fallback(
         }
         back_solve_lower_transpose(&l, &eps, &mut delta);
         for i in 0..p {
-            samples[(k, i)] = mode[i] + delta[i];
+            // `delta` has covariance H⁻¹; multiplying by √φ produces a
+            // draw with covariance φ·H⁻¹, matching the φ-scaled
+            // posterior covariance `Vb` the rest of inference assumes.
+            samples[(k, i)] = mode[i] + sqrt_phi * delta[i];
         }
     }
 
@@ -486,6 +498,10 @@ fn sample_standard(
             mode: fit.beta.view(),
             hessian: explicit_fit_hessian_for_whitening(&fit, p, "sample refit")?.view(),
             gamma_shape: fit.likelihood_scale.gamma_shape(),
+            // Forward the fitted dispersion so the NUTS posterior whitens
+            // against `Vb = φ·H⁻¹` for Gaussian / Gamma and stays a
+            // no-op for fixed-scale families.
+            dispersion: fit.dispersion().unwrap_or_default(),
             firth_bias_reduction: false,
         }),
         cfg,

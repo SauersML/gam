@@ -3672,9 +3672,23 @@ where
                 coefficient_influence = Some(fmat);
             }
         }
-        beta_covariance = beta_covariance_unscaled
-            .as_ref()
-            .map(|cov| scaled_covariance(cov.clone(), dispersion_phi));
+        // INVARIANT: the value stored in `beta_covariance` below is the
+        // φ-scaled posterior covariance `Vb = φ·H⁻¹`. The newtype wrapper
+        // `crate::inference::dispersion_cov::PhiScaledCovariance` exists to
+        // make this explicit at API boundaries; we run the data through
+        // `wrap` and immediately unwrap here so the `FitInference` field
+        // stays `Array2<f64>` (which keeps `pirls`, `families`, GPU and
+        // CLI consumers — all outside the dispersion-ownership refactor
+        // scope — compiling unchanged) while documenting the convention
+        // in code. The unscaled `H` that lives in `FitInference::
+        // penalized_hessian` plays the role of `UnscaledPrecision`.
+        beta_covariance = beta_covariance_unscaled.as_ref().map(|cov| {
+            crate::inference::dispersion_cov::PhiScaledCovariance::wrap(scaled_covariance(
+                cov.clone(),
+                dispersion_phi,
+            ))
+            .into_array()
+        });
         smoothing_correction = reml_state
             .compute_smoothing_correction_auto(
                 &final_rho,
@@ -3682,7 +3696,16 @@ where
                 beta_covariance_unscaled.as_ref(),
                 finalgrad_norm,
             )
-            .map(|corr| scaled_covariance(corr, dispersion_phi));
+            .map(|corr| {
+                // Smoothing correction is added to `Vb`; it must live on
+                // the same φ-scaled scale, hence the same wrap/unwrap
+                // documentation pattern.
+                crate::inference::dispersion_cov::PhiScaledCovariance::wrap(scaled_covariance(
+                    corr,
+                    dispersion_phi,
+                ))
+                .into_array()
+            });
         beta_standard_errors = beta_covariance.as_ref().map(se_from_covariance);
         beta_covariance_corrected = match (&beta_covariance, &smoothing_correction) {
             (Some(base_cov), Some(corr)) if base_cov.dim() == corr.dim() => {
