@@ -5,8 +5,8 @@ use gam::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeFitResult, DeviationRuntime, LatentMeasureKind,
 };
 use gam::estimate::{
-    BlockRole, EstimationError, ExternalOptimOptions, saved_latent_cloglog_state_from_fit,
-    saved_mixture_state_from_fit, saved_sas_state_from_fit,
+    BlockRole, EstimationError, ExternalOptimOptions, optimize_external_designwith_heuristic_lambdas,
+    saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
 use gam::faer_ndarray::{
     FaerCholesky, FaerEigh, array2_to_matmut, factorize_symmetricwith_fallback, fast_xt_diag_x,
@@ -55,8 +55,10 @@ use gam::terms::basis::{
     build_thin_plate_penalty_matrix, create_basis, create_cyclic_difference_penalty_matrix,
     create_difference_penalty_matrix, create_periodic_bspline_basis_dense,
     create_periodic_bspline_derivative_dense, duchon_polynomial_first_derivative_nd,
-    duchon_radial_first_derivative_nd, matern_radial_first_derivative_nd,
+    duchon_radial_first_derivative_nd, evaluate_bspline_basis_scalar,
+    matern_radial_first_derivative_nd,
     periodic_bspline_first_derivative_nd, resolve_duchon_orders, sphere_first_derivative_nd,
+    SplineScratch,
 };
 use gam::terms::latent_coord::{
     AuxPriorFamily, InputLocationDerivative, LatentCoordValues, LatentIdMode, aux_prior_targets,
@@ -3376,6 +3378,126 @@ fn build_latent_duchon_design(
     Ok((design, t_mat))
 }
 
+fn t_matrix_from_flat(
+    t_flat: ArrayView1<'_, f64>,
+    n_obs: usize,
+    latent_dim: usize,
+) -> Result<Array2<f64>, String> {
+    if t_flat.len() != n_obs * latent_dim {
+        return Err(format!(
+            "latent t length {} != n_obs * latent_dim = {}",
+            t_flat.len(),
+            n_obs * latent_dim
+        ));
+    }
+    let mut t_mat = Array2::<f64>::zeros((n_obs, latent_dim));
+    for n in 0..n_obs {
+        for a in 0..latent_dim {
+            t_mat[[n, a]] = t_flat[n * latent_dim + a];
+        }
+    }
+    Ok(t_mat)
+}
+
+fn split_tensor_knot_views<'a>(
+    knots_concat: ArrayView1<'a, f64>,
+    knot_offsets: &'a [usize],
+    n_axes: usize,
+) -> Result<Vec<ArrayView1<'a, f64>>, String> {
+    if knot_offsets.len() != n_axes + 1 {
+        return Err(format!(
+            "tensor B-spline knot_offsets must have length n_axes + 1 = {}, got {}",
+            n_axes + 1,
+            knot_offsets.len()
+        ));
+    }
+    let mut per_axis = Vec::with_capacity(n_axes);
+    for axis in 0..n_axes {
+        let lo = knot_offsets[axis];
+        let hi = knot_offsets[axis + 1];
+        if lo > hi || hi > knots_concat.len() {
+            return Err(format!(
+                "tensor B-spline knot_offsets axis {axis} out of range \
+                 (lo={lo}, hi={hi}, total={})",
+                knots_concat.len()
+            ));
+        }
+        per_axis.push(knots_concat.slice(s![lo..hi]));
+    }
+    Ok(per_axis)
+}
+
+fn build_latent_tensor_bspline_design(
+    t_flat: ArrayView1<'_, f64>,
+    n_obs: usize,
+    latent_dim: usize,
+    knots_concat: ArrayView1<'_, f64>,
+    knot_offsets: &[usize],
+    degrees: &[usize],
+) -> Result<(Array2<f64>, Array2<f64>), String> {
+    if degrees.len() != latent_dim {
+        return Err(format!(
+            "tensor B-spline degrees length {} must equal latent_dim {}",
+            degrees.len(),
+            latent_dim
+        ));
+    }
+    let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
+    let knots_per_axis = split_tensor_knot_views(knots_concat, knot_offsets, latent_dim)?;
+    let mut k_per_axis = Vec::<usize>::with_capacity(latent_dim);
+    let mut total_cols = 1usize;
+    for axis in 0..latent_dim {
+        let k = knots_per_axis[axis]
+            .len()
+            .checked_sub(degrees[axis] + 1)
+            .ok_or_else(|| {
+                format!(
+                    "tensor B-spline axis {axis} knot vector too short for degree {}",
+                    degrees[axis]
+                )
+            })?;
+        k_per_axis.push(k);
+        total_cols = total_cols
+            .checked_mul(k)
+            .ok_or_else(|| "tensor B-spline basis size overflow".to_string())?;
+    }
+
+    let mut design = Array2::<f64>::zeros((n_obs, total_cols));
+    let mut values_per_axis: Vec<Vec<f64>> =
+        k_per_axis.iter().map(|&k| vec![0.0; k]).collect();
+    let mut scratch: Vec<SplineScratch> = (0..latent_dim)
+        .map(|axis| SplineScratch::new(degrees[axis]))
+        .collect();
+    let mut idx = vec![0usize; latent_dim];
+    for n in 0..n_obs {
+        for axis in 0..latent_dim {
+            evaluate_bspline_basis_scalar(
+                t_mat[[n, axis]],
+                knots_per_axis[axis],
+                degrees[axis],
+                &mut values_per_axis[axis],
+                &mut scratch[axis],
+            )
+            .map_err(|err| {
+                format!("failed to evaluate tensor B-spline latent axis {axis}: {err}")
+            })?;
+        }
+        for col in 0..total_cols {
+            let mut rem = col;
+            for axis in (0..latent_dim).rev() {
+                idx[axis] = rem % k_per_axis[axis];
+                rem /= k_per_axis[axis];
+            }
+            let mut prod = 1.0_f64;
+            for axis in 0..latent_dim {
+                prod *= values_per_axis[axis][idx[axis]];
+            }
+            design[[n, col]] = prod;
+        }
+    }
+    Ok((design, t_mat))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SigmaEffMode {
     Profiled,
@@ -3631,10 +3753,27 @@ fn add_latent_outer_reml_score_gradient(
     }
     let weight = gaussian_reml_weight_vector_local(n_obs, weights)?;
     let factor = latent_augmented_hessian_factor(design, penalty, weight.view(), fit.lambda)?;
-    let jet = latent_input_location_jet(basis_kind, t_mat, centers, m)?;
+    let latent = LatentCoordValues::from_matrix(t_mat, LatentIdMode::None);
+    let phi_r = match latent_basis_kind(basis_kind)? {
+        "duchon" => duchon_radial_first_derivative_nd(
+            t_mat,
+            centers,
+            None,
+            duchon_nullspace_from_m(m),
+        )
+        .map_err(|err| err.to_string())?,
+        "matern" => matern_radial_first_derivative_nd(t_mat, centers, 1.0, MaternNu::ThreeHalves)
+            .map_err(|err| err.to_string())?,
+        other => {
+            return Err(format!(
+                "outer REML latent score gradient currently streams radial bases only; got {other:?}"
+            ));
+        }
+    };
     let n_centers = centers.nrows().min(p);
     let mut rhs = Array2::<f64>::zeros((p, 1));
     let mut direction = Array1::<f64>::zeros(p);
+    let mut direction_kernel = Array1::<f64>::zeros(n_centers);
     for n in 0..n_obs {
         for col in 0..p {
             rhs[[col, 0]] = design[[n, col]];
@@ -3667,20 +3806,24 @@ fn add_latent_outer_reml_score_gradient(
             }
         }
         let row_scale = scale * weight[n];
-        for a in 0..latent_dim {
-            let mut acc = 0.0_f64;
-            for k in 0..n_centers {
-                acc += direction[k] * jet[[n, k, a]];
+        for k in 0..n_centers {
+            direction_kernel[k] = direction[k];
+        }
+        latent.contract_row_radial_gradient_into(
+            n,
+            direction_kernel.view(),
+            phi_r.row(n),
+            centers,
+            grad_t,
+            row_scale,
+        );
+        if p > n_centers {
+            let poly_start = n_centers;
+            let n_poly = p - poly_start;
+            let linear_cols = n_poly.saturating_sub(1).min(latent_dim);
+            for a in 0..linear_cols {
+                grad_t[n * latent_dim + a] += row_scale * direction[poly_start + 1 + a];
             }
-            if p > n_centers {
-                let poly_start = n_centers;
-                let n_poly = p - poly_start;
-                let linear_cols = n_poly.saturating_sub(1).min(latent_dim);
-                if a < linear_cols {
-                    acc += direction[poly_start + 1 + a];
-                }
-            }
-            grad_t[n * latent_dim + a] += row_scale * acc;
         }
     }
     Ok(())
@@ -3694,6 +3837,10 @@ fn gaussian_reml_fit_latent_impl(
     latent_dim: usize,
     centers: ArrayView2<'_, f64>,
     m: usize,
+    basis_kind: &str,
+    tensor_knots_concat: Option<ArrayView1<'_, f64>>,
+    tensor_knot_offsets: Option<&[usize]>,
+    tensor_degrees: Option<&[usize]>,
     penalty: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
     init_lambda: Option<f64>,
@@ -3702,8 +3849,26 @@ fn gaussian_reml_fit_latent_impl(
     aux_strength: Option<f64>,
     dim_selection_precision: Option<ArrayView1<'_, f64>>,
 ) -> Result<(gam::gaussian_reml::GaussianRemlMultiResult, Array2<f64>), String> {
-    let (design, t_mat) =
-        build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m)?;
+    let (design, t_mat) = match latent_basis_kind(basis_kind)? {
+        "duchon" => build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m)?,
+        "bspline_tensor" => {
+            let knots = tensor_knots_concat.ok_or_else(|| {
+                "tensor B-spline latent design requires knots_concat".to_string()
+            })?;
+            let offsets = tensor_knot_offsets.ok_or_else(|| {
+                "tensor B-spline latent design requires knot_offsets".to_string()
+            })?;
+            let degrees = tensor_degrees.ok_or_else(|| {
+                "tensor B-spline latent design requires degrees".to_string()
+            })?;
+            build_latent_tensor_bspline_design(t_flat, n_obs, latent_dim, knots, offsets, degrees)?
+        }
+        other => {
+            return Err(format!(
+                "gaussian_reml_fit_latent forward supports 'duchon' and 'tensor_bspline'; got {other:?}"
+            ));
+        }
+    };
     // Build the (optionally) augmented Y/X stack carrying the identifiability
     // penalty. The penalty `½ μ ‖t − t_ref‖²` is *not* on the design Φ; it
     // acts on t directly. Because t enters Φ nonlinearly, we cannot fold it
@@ -3770,7 +3935,7 @@ fn gaussian_reml_fit_latent_impl(
     Ok((fit, design))
 }
 
-/// Forward fit: build the N-D Duchon design at the current latent `t`,
+/// Forward fit: build the latent design at the current latent `t`,
 /// solve the Gaussian REML inner problem, and return the standard
 /// REML fit dictionary plus the materialized design (for warm-starts).
 ///
@@ -3792,6 +3957,10 @@ fn gaussian_reml_fit_latent_impl(
     aux_family = "ridge".to_string(),
     aux_strength = None,
     dim_selection_log_precision = None,
+    basis_kind = "duchon".to_string(),
+    tensor_knots_concat = None,
+    tensor_knot_offsets = None,
+    tensor_degrees = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_latent<'py>(
@@ -3810,6 +3979,10 @@ fn gaussian_reml_fit_latent<'py>(
     aux_family: String,
     aux_strength: Option<f64>,
     dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
+    basis_kind: String,
+    tensor_knots_concat: Option<PyReadonlyArray1<'py, f64>>,
+    tensor_knot_offsets: Option<Vec<usize>>,
+    tensor_degrees: Option<Vec<usize>>,
 ) -> PyResult<Py<PyDict>> {
     let family = match aux_family.to_ascii_lowercase().as_str() {
         "ridge" => AuxPriorFamily::Ridge,
@@ -3833,6 +4006,10 @@ fn gaussian_reml_fit_latent<'py>(
         latent_dim,
         centers.as_array(),
         m,
+        &basis_kind,
+        tensor_knots_concat.as_ref().map(|a| a.as_array()),
+        tensor_knot_offsets.as_deref(),
+        tensor_degrees.as_deref(),
         penalty.as_array(),
         effective_weights.as_ref().map(|w| w.view()),
         init_lambda,
@@ -3881,6 +4058,7 @@ fn gaussian_reml_fit_latent<'py>(
     grad_edf = 0.0,
     m = 2,
     weights = None,
+    fisher_W = None,
     init_lambda = None,
     aux_u = None,
     aux_family = "ridge".to_string(),
@@ -3888,6 +4066,9 @@ fn gaussian_reml_fit_latent<'py>(
     dim_selection_log_precision = None,
     basis_kind = "duchon".to_string(),
     sigma_eff_mode = "profiled".to_string(),
+    tensor_knots_concat = None,
+    tensor_knot_offsets = None,
+    tensor_degrees = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_latent_backward<'py>(
@@ -3905,6 +4086,7 @@ fn gaussian_reml_fit_latent_backward<'py>(
     grad_edf: f64,
     m: usize,
     weights: Option<PyReadonlyArray1<'py, f64>>,
+    fisher_w: Option<PyReadonlyArray3<'py, f64>>,
     init_lambda: Option<f64>,
     aux_u: Option<PyReadonlyArray2<'py, f64>>,
     aux_family: String,
@@ -3912,6 +4094,9 @@ fn gaussian_reml_fit_latent_backward<'py>(
     dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
     basis_kind: String,
     sigma_eff_mode: String,
+    tensor_knots_concat: Option<PyReadonlyArray1<'py, f64>>,
+    tensor_knot_offsets: Option<Vec<usize>>,
+    tensor_degrees: Option<Vec<usize>>,
 ) -> PyResult<Py<PyDict>> {
     let family = match aux_family.to_ascii_lowercase().as_str() {
         "ridge" => AuxPriorFamily::Ridge,
@@ -3924,11 +4109,6 @@ fn gaussian_reml_fit_latent_backward<'py>(
     };
     let sigma_eff_mode = SigmaEffMode::parse(&sigma_eff_mode).map_err(py_value_error)?;
     let basis_kind_normalized = latent_basis_kind(&basis_kind).map_err(py_value_error)?;
-    if basis_kind_normalized != "duchon" {
-        return Err(PyNotImplementedError::new_err(format!(
-            "gaussian_reml_fit_latent_backward currently builds only Duchon latent designs; derivative hook exists for {basis_kind_normalized:?}"
-        )));
-    }
     let centers_view = centers.as_array();
     let t_view = t.as_array();
     let y_view = y.as_array();
@@ -4130,8 +4310,382 @@ fn gaussian_reml_fit_latent_backward<'py>(
             grad.into_pyarray(py),
         )?;
     } else {
-        out.set_item("grad_dim_selection_log_precision", py.None())?;
+    out.set_item("grad_dim_selection_log_precision", py.None())?;
     }
+    Ok(out.unbind())
+}
+
+fn latent_glm_family_from_str(value: &str) -> Result<LikelihoodFamily, String> {
+    match value.to_ascii_lowercase().replace('_', "-").as_str() {
+        "gaussian" | "gaussian-identity" => Ok(LikelihoodFamily::GaussianIdentity),
+        "binomial" | "binomial-logit" | "logistic" => Ok(LikelihoodFamily::BinomialLogit),
+        "binomial-probit" | "probit" => Ok(LikelihoodFamily::BinomialProbit),
+        "binomial-cloglog" | "cloglog" => Ok(LikelihoodFamily::BinomialCLogLog),
+        "poisson" | "poisson-log" => Ok(LikelihoodFamily::PoissonLog),
+        "gamma" | "gamma-log" => Ok(LikelihoodFamily::GammaLog),
+        other => Err(format!(
+            "unsupported latent GLM family {other:?}; supported families are gaussian-identity, binomial-logit, binomial-probit, binomial-cloglog, poisson-log, gamma-log"
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn glm_reml_fit_latent_impl(
+    t_flat: ArrayView1<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    n_obs: usize,
+    latent_dim: usize,
+    centers: ArrayView2<'_, f64>,
+    m: usize,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_lambda: Option<f64>,
+    family: LikelihoodFamily,
+) -> Result<(gam::estimate::ExternalOptimResult, Array2<f64>, Array2<f64>), String> {
+    if y.ncols() != 1 {
+        return Err(format!(
+            "glm_reml_fit_latent currently requires y with one column; got {}",
+            y.ncols()
+        ));
+    }
+    let (design, t_mat) = build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m)?;
+    if penalty.dim() != (design.ncols(), design.ncols()) {
+        return Err(format!(
+            "penalty shape mismatch: expected {}x{}, got {}x{}",
+            design.ncols(),
+            design.ncols(),
+            penalty.nrows(),
+            penalty.ncols()
+        ));
+    }
+    let y_vec = y.column(0).to_owned();
+    let weights_owned = match weights {
+        Some(w) => gaussian_reml_weight_vector_local(n_obs, Some(w))?,
+        None => Array1::ones(n_obs),
+    };
+    let offset = Array1::<f64>::zeros(n_obs);
+    let penalty_block = BlockwisePenalty::new(0..design.ncols(), penalty.to_owned());
+    let opts = ExternalOptimOptions {
+        family,
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
+        compute_inference: false,
+        max_iter: 100,
+        tol: 1e-7,
+        nullspace_dims: vec![0],
+        linear_constraints: None,
+        firth_bias_reduction: Some(false),
+        penalty_shrinkage_floor: None,
+        rho_prior: RhoPrior::Flat,
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
+    };
+    let heuristic_lambda = init_lambda.map(|lambda| [lambda]);
+    let fit = optimize_external_designwith_heuristic_lambdas(
+        y_vec.view(),
+        weights_owned.view(),
+        design.clone(),
+        offset.view(),
+        vec![penalty_block],
+        heuristic_lambda.as_ref().map(|values| values.as_slice()),
+        &opts,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok((fit, design, t_mat))
+}
+
+fn set_ok_glm_latent_items<'py>(
+    py: Python<'py>,
+    out: &Bound<'py, PyDict>,
+    fit: gam::estimate::ExternalOptimResult,
+    n_obs: usize,
+    p: usize,
+) -> PyResult<()> {
+    let pirls = fit.artifacts.pirls.as_ref().ok_or_else(|| {
+        py_value_error("latent GLM fit did not return PIRLS artifacts".to_string())
+    })?;
+    let lambda = fit.lambdas.get(0).copied().unwrap_or(f64::NAN);
+    let rho = lambda.ln();
+    let mut coefficients = Array2::<f64>::zeros((p, 1));
+    for row in 0..p.min(fit.beta.len()) {
+        coefficients[[row, 0]] = fit.beta[row];
+    }
+    let mut fitted = Array2::<f64>::zeros((n_obs, 1));
+    for row in 0..n_obs.min(pirls.finalmu.len()) {
+        fitted[[row, 0]] = pirls.finalmu[row];
+    }
+    out.set_item("status", if fit.outer_converged { "ok" } else { "not_converged" })?;
+    out.set_item("lambda", lambda)?;
+    out.set_item("rho", rho)?;
+    out.set_item("reml_score", fit.reml_score)?;
+    out.set_item("reml_grad_lambda", f64::NAN)?;
+    out.set_item("reml_hess_lambda", f64::NAN)?;
+    out.set_item("reml_grad_rho", f64::NAN)?;
+    out.set_item("reml_hess_rho", f64::NAN)?;
+    out.set_item("edf", pirls.edf)?;
+    out.set_item("coefficients", coefficients.into_pyarray(py))?;
+    out.set_item("fitted", fitted.into_pyarray(py))?;
+    out.set_item(
+        "sigma2",
+        Array1::from_vec(vec![fit.standard_deviation * fit.standard_deviation]).into_pyarray(py),
+    )?;
+    out.set_item("cache_penalty_eigenvalues", Array1::<f64>::zeros(0).into_pyarray(py))?;
+    out.set_item("cache_eigenvectors", Array2::<f64>::zeros((0, 0)).into_pyarray(py))?;
+    out.set_item("cache_coefficient_basis", Array2::<f64>::zeros((0, 0)).into_pyarray(py))?;
+    out.set_item("cache_xtwx_fingerprint", 0_u64)?;
+    out.set_item("cache_penalty_fingerprint", 0_u64)?;
+    out.set_item("cache_logdet_xtwx", f64::NAN)?;
+    out.set_item("cache_logdet_penalty_positive", f64::NAN)?;
+    out.set_item("cache_penalty_rank", 0_usize)?;
+    out.set_item("cache_nullity", 0_usize)?;
+    Ok(())
+}
+
+#[pyfunction(signature = (
+    t,
+    y,
+    n_obs,
+    latent_dim,
+    centers,
+    penalty,
+    family,
+    m = 2,
+    weights = None,
+    fisher_W = None,
+    init_lambda = None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn glm_reml_fit_latent<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    n_obs: usize,
+    latent_dim: usize,
+    centers: PyReadonlyArray2<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    family: String,
+    m: usize,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    fisher_w: Option<PyReadonlyArray3<'py, f64>>,
+    init_lambda: Option<f64>,
+) -> PyResult<Py<PyDict>> {
+    let family = latent_glm_family_from_str(&family).map_err(py_value_error)?;
+    let effective_weights = latent_scalar_weights_with_fisher(
+        n_obs,
+        weights.as_ref().map(|w| w.as_array()),
+        fisher_w.as_ref().map(|w| w.as_array()),
+    )
+    .map_err(py_value_error)?;
+    let (fit, design, _) = glm_reml_fit_latent_impl(
+        t.as_array(),
+        y.as_array(),
+        n_obs,
+        latent_dim,
+        centers.as_array(),
+        m,
+        penalty.as_array(),
+        effective_weights.as_ref().map(|w| w.view()),
+        init_lambda,
+        family,
+    )
+    .map_err(py_value_error)?;
+    let out = PyDict::new(py);
+    set_ok_glm_latent_items(py, &out, fit, n_obs, design.ncols())?;
+    Ok(out.unbind())
+}
+
+#[pyfunction(signature = (
+    t,
+    y,
+    n_obs,
+    latent_dim,
+    centers,
+    penalty,
+    family,
+    grad_reml_score = 1.0,
+    m = 2,
+    weights = None,
+    fisher_W = None,
+    init_lambda = None,
+    aux_u = None,
+    aux_family = "ridge".to_string(),
+    aux_strength = None,
+    dim_selection_log_precision = None,
+    basis_kind = "duchon".to_string(),
+))]
+#[allow(clippy::too_many_arguments)]
+fn glm_reml_fit_latent_backward<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    n_obs: usize,
+    latent_dim: usize,
+    centers: PyReadonlyArray2<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    family: String,
+    grad_reml_score: f64,
+    m: usize,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    fisher_w: Option<PyReadonlyArray3<'py, f64>>,
+    init_lambda: Option<f64>,
+    aux_u: Option<PyReadonlyArray2<'py, f64>>,
+    aux_family: String,
+    aux_strength: Option<f64>,
+    dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
+    basis_kind: String,
+) -> PyResult<Py<PyDict>> {
+    let family = latent_glm_family_from_str(&family).map_err(py_value_error)?;
+    let aux_family = match aux_family.to_ascii_lowercase().as_str() {
+        "ridge" => AuxPriorFamily::Ridge,
+        "linear" => AuxPriorFamily::Linear,
+        other => {
+            return Err(py_value_error(format!(
+                "aux_family must be 'ridge' or 'linear'; got {other:?}"
+            )));
+        }
+    };
+    let basis_kind_normalized = latent_basis_kind(&basis_kind).map_err(py_value_error)?;
+    if basis_kind_normalized != "duchon" {
+        return Err(PyNotImplementedError::new_err(format!(
+            "glm_reml_fit_latent_backward currently builds only Duchon latent designs; derivative hook exists for {basis_kind_normalized:?}"
+        )));
+    }
+    let effective_weights = latent_scalar_weights_with_fisher(
+        n_obs,
+        weights.as_ref().map(|w| w.as_array()),
+        fisher_w.as_ref().map(|w| w.as_array()),
+    )
+    .map_err(py_value_error)?;
+    let (fit, design, t_mat) = glm_reml_fit_latent_impl(
+        t.as_array(),
+        y.as_array(),
+        n_obs,
+        latent_dim,
+        centers.as_array(),
+        m,
+        penalty.as_array(),
+        effective_weights.as_ref().map(|w| w.view()),
+        init_lambda,
+        family,
+    )
+    .map_err(py_value_error)?;
+    let pirls = fit.artifacts.pirls.as_ref().ok_or_else(|| {
+        py_value_error("latent GLM fit did not return PIRLS artifacts".to_string())
+    })?;
+    let h = pirls
+        .dense_stabilizedhessian_transformed("latent GLM backward")
+        .map_err(|err| py_value_error(err.to_string()))?;
+    let factor = factorize_symmetricwith_fallback(
+        gam::faer_ndarray::FaerArrayView::new(&h).as_ref(),
+        Side::Lower,
+    )
+    .map_err(|err| py_value_error(format!("latent GLM Hessian factorization failed: {err}")))?;
+    let qs = &pirls.reparam_result.qs;
+    let beta_t = pirls.beta_transformed.as_ref();
+    let q = beta_t.len();
+    let p = design.ncols();
+    let jet = latent_input_location_jet(
+        basis_kind_normalized,
+        t_mat.view(),
+        centers.as_array(),
+        m,
+    )
+    .map_err(py_value_error)?;
+    let n_centers = centers.as_array().nrows().min(p);
+    let mut grad_t = Array1::<f64>::zeros(n_obs * latent_dim);
+    let mut rhs = Array2::<f64>::zeros((q, 1));
+    let mut direction_t = Array1::<f64>::zeros(q);
+    let mut direction_orig = Array1::<f64>::zeros(p);
+    for n in 0..n_obs {
+        for col in 0..q {
+            let mut value = 0.0_f64;
+            for k in 0..p {
+                value += design[[n, k]] * qs[[k, col]];
+            }
+            rhs[[col, 0]] = value;
+        }
+        {
+            let mut rhs_view = array2_to_matmut(&mut rhs);
+            factor.solve_in_place(rhs_view.as_mut());
+        }
+        let score_eta =
+            pirls.solveweights[n] * (pirls.final_eta[n] - pirls.solveworking_response[n]);
+        for col in 0..q {
+            direction_t[col] = score_eta * beta_t[col] + pirls.finalweights[n] * rhs[[col, 0]];
+        }
+        direction_orig.fill(0.0);
+        for k in 0..p {
+            let mut value = 0.0_f64;
+            for col in 0..q {
+                value += qs[[k, col]] * direction_t[col];
+            }
+            direction_orig[k] = value;
+        }
+        for a in 0..latent_dim {
+            let mut acc = 0.0_f64;
+            for k in 0..n_centers {
+                acc += direction_orig[k] * jet[[n, k, a]];
+            }
+            if p > n_centers {
+                let poly_start = n_centers;
+                let n_poly = p - poly_start;
+                let linear_cols = n_poly.saturating_sub(1).min(latent_dim);
+                if a < linear_cols {
+                    acc += direction_orig[poly_start + 1 + a];
+                }
+            }
+            grad_t[n * latent_dim + a] += grad_reml_score * acc;
+        }
+    }
+
+    if let Some(u_arr) = aux_u.as_ref() {
+        let targets = aux_prior_targets(t_mat.view(), u_arr.as_array(), aux_family)
+            .map_err(py_value_error)?;
+        let mu = aux_strength.unwrap_or(1.0);
+        if !(mu.is_finite() && mu > 0.0) {
+            return Err(py_value_error(format!(
+                "aux_strength must be finite and positive; got {mu}"
+            )));
+        }
+        for n in 0..n_obs {
+            for a in 0..latent_dim {
+                grad_t[n * latent_dim + a] +=
+                    grad_reml_score * mu * (t_mat[[n, a]] - targets[[n, a]]);
+            }
+        }
+    }
+    if let Some(log_prec) = dim_selection_log_precision.as_ref() {
+        let lp = log_prec.as_array();
+        if lp.len() != latent_dim {
+            return Err(py_value_error(format!(
+                "dim_selection_log_precision length {} must equal latent_dim {}",
+                lp.len(),
+                latent_dim
+            )));
+        }
+        for n in 0..n_obs {
+            for a in 0..latent_dim {
+                let prec = lp[a].exp();
+                if !(prec.is_finite() && prec > 0.0) {
+                    return Err(py_value_error(format!(
+                        "dim_selection_log_precision[{a}] must exponentiate to a finite positive precision"
+                    )));
+                }
+                grad_t[n * latent_dim + a] += grad_reml_score * prec * t_mat[[n, a]];
+            }
+        }
+    }
+    let mut grad_t_matrix = Array2::<f64>::zeros((n_obs, latent_dim));
+    for n in 0..n_obs {
+        for a in 0..latent_dim {
+            grad_t_matrix[[n, a]] = grad_t[n * latent_dim + a];
+        }
+    }
+    let out = PyDict::new(py);
+    out.set_item("grad_t", grad_t_matrix.into_pyarray(py))?;
     Ok(out.unbind())
 }
 
@@ -6501,6 +7055,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         gaussian_reml_fit_latent_backward,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(glm_reml_fit_latent, module)?)?;
+    module.add_function(wrap_pyfunction!(glm_reml_fit_latent_backward, module)?)?;
     module.add_function(wrap_pyfunction!(arrow_schur_newton_step, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
