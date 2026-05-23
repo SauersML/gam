@@ -51,6 +51,11 @@ use crate::smooth::{
 use crate::terms::latent_coord::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };
+use crate::terms::{
+    ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DifferenceOpKind,
+    IBPAssignmentPenalty, IsometryPenalty, OrthogonalityPenalty, PenaltyTier, PsiSlice,
+    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TotalVariationPenalty,
+};
 use crate::survival::PenaltyBlock;
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkSpec, SasLinkSpec,
@@ -2950,6 +2955,322 @@ struct LatentSpec {
     explicit_none_mode: bool,
 }
 
+#[derive(Clone)]
+struct LatentPenaltyTarget {
+    name: String,
+    n: usize,
+    d: usize,
+}
+
+fn latent_penalty_targets(
+    latents: Option<&JsonValue>,
+) -> Result<Vec<LatentPenaltyTarget>, String> {
+    let Some(raw) = latents.filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let map = raw
+        .as_object()
+        .ok_or_else(|| "latents must be a JSON object keyed by formula symbol".to_string())?;
+    let mut out = Vec::with_capacity(map.len());
+    for (key, raw_block) in map {
+        let obj = raw_block
+            .as_object()
+            .ok_or_else(|| format!("latents['{key}'] must be an object"))?;
+        let name = obj
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .unwrap_or(key)
+            .to_string();
+        let n = obj
+            .get("n")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| format!("latents['{key}'].n is required"))? as usize;
+        let d = obj
+            .get("d")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| format!("latents['{key}'].d is required"))? as usize;
+        if n == 0 || d == 0 {
+            return Err(format!("latents['{key}'] requires positive n and d"));
+        }
+        out.push(LatentPenaltyTarget { name, n, d });
+    }
+    Ok(out)
+}
+
+fn penalty_target_for_descriptor<'a>(
+    targets: &'a [LatentPenaltyTarget],
+    descriptor: &serde_json::Map<String, JsonValue>,
+    context: &str,
+) -> Result<&'a LatentPenaltyTarget, String> {
+    let raw = descriptor
+        .get("target")
+        .ok_or_else(|| format!("{context}.target is required"))?;
+    if let Some(name) = raw.as_str() {
+        return targets
+            .iter()
+            .find(|target| target.name == name)
+            .ok_or_else(|| {
+                format!(
+                    "{context}.target references latent block {name:?}, but latents declares [{}]",
+                    targets
+                        .iter()
+                        .map(|target| target.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            });
+    }
+    if let Some(index) = raw.as_u64() {
+        return targets.get(index as usize).ok_or_else(|| {
+            format!(
+                "{context}.target references latent index {index}, but latents declares {} block(s)",
+                targets.len()
+            )
+        });
+    }
+    Err(format!("{context}.target must be a latent block name or index"))
+}
+
+fn analytic_descriptor_f64(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    default: f64,
+) -> Result<f64, String> {
+    let value = descriptor
+        .get(key)
+        .and_then(JsonValue::as_f64)
+        .unwrap_or(default);
+    if !(value.is_finite() && value > 0.0) {
+        return Err(format!("analytic penalty {key} must be finite and > 0"));
+    }
+    Ok(value)
+}
+
+fn analytic_descriptor_usize(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    key: &str,
+    default: usize,
+) -> Result<usize, String> {
+    let value = descriptor
+        .get(key)
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(default as u64) as usize;
+    if value == 0 {
+        return Err(format!("analytic penalty {key} must be > 0"));
+    }
+    Ok(value)
+}
+
+fn analytic_descriptor_weight_value(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    context: &str,
+) -> Result<(), String> {
+    let Some(value) = descriptor.get("weight") else {
+        return Ok(());
+    };
+    if value.as_str() == Some("auto") {
+        return Ok(());
+    }
+    let Some(weight) = value.as_f64() else {
+        return Err(format!(
+            "{context}.weight must be 'auto' or a finite positive float"
+        ));
+    };
+    if !(weight.is_finite() && weight > 0.0) {
+        return Err(format!("{context}.weight must be finite and > 0"));
+    }
+    Ok(())
+}
+
+fn analytic_descriptor_weight_sequence(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    context: &str,
+) -> Result<(), String> {
+    let Some(value) = descriptor.get("weight") else {
+        return Ok(());
+    };
+    if value.as_str() == Some("auto") {
+        return Ok(());
+    }
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("{context}.weight must be 'auto' or a list of positive floats"))?;
+    if values.is_empty() {
+        return Err(format!("{context}.weight must have at least one entry"));
+    }
+    for (idx, raw) in values.iter().enumerate() {
+        let Some(weight) = raw.as_f64() else {
+            return Err(format!("{context}.weight[{idx}] must be a finite positive float"));
+        };
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!("{context}.weight[{idx}] must be finite and > 0"));
+        }
+    }
+    Ok(())
+}
+
+fn analytic_descriptor_difference_op(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    context: &str,
+) -> Result<DifferenceOpKind, String> {
+    let op = descriptor
+        .get("difference_op")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("forward_1d")
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    match op.as_str() {
+        "forward_1d" => Ok(DifferenceOpKind::ForwardDiff1D),
+        "graph_edges" => {
+            let raw_edges = descriptor
+                .get("edges")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| format!("{context}.edges is required for graph_edges"))?;
+            let mut edges = Vec::with_capacity(raw_edges.len());
+            for (edge_idx, raw_edge) in raw_edges.iter().enumerate() {
+                let pair = raw_edge
+                    .as_array()
+                    .ok_or_else(|| format!("{context}.edges[{edge_idx}] must be a two-item list"))?;
+                if pair.len() != 2 {
+                    return Err(format!(
+                        "{context}.edges[{edge_idx}] must contain exactly two row indices"
+                    ));
+                }
+                let from = pair[0].as_u64().ok_or_else(|| {
+                    format!("{context}.edges[{edge_idx}][0] must be a non-negative integer")
+                })? as usize;
+                let to = pair[1].as_u64().ok_or_else(|| {
+                    format!("{context}.edges[{edge_idx}][1] must be a non-negative integer")
+                })? as usize;
+                edges.push((from, to));
+            }
+            Ok(DifferenceOpKind::GraphEdges(edges))
+        }
+        other => Err(format!(
+            "{context}.difference_op must be forward_1d or graph_edges; got {other:?}"
+        )),
+    }
+}
+
+fn build_standard_latent_analytic_penalty_registry(
+    latents: Option<&JsonValue>,
+    penalties: Option<&JsonValue>,
+) -> Result<AnalyticPenaltyRegistry, String> {
+    let mut registry = AnalyticPenaltyRegistry::new();
+    let Some(raw) = penalties.filter(|value| !value.is_null()) else {
+        return Ok(registry);
+    };
+    let items = raw
+        .as_array()
+        .ok_or_else(|| "penalties must be a list of analytic penalty descriptors".to_string())?;
+    let targets = latent_penalty_targets(latents)?;
+    if !items.is_empty() && targets.is_empty() {
+        return Err("penalties requires latents with at least one latent block".to_string());
+    }
+    for (idx, raw_item) in items.iter().enumerate() {
+        let context = format!("penalties[{idx}]");
+        let descriptor = raw_item
+            .as_object()
+            .ok_or_else(|| format!("{context} must be an object"))?;
+        let target = penalty_target_for_descriptor(&targets, descriptor, &context)?;
+        let slice = PsiSlice::full(target.n * target.d, Some(target.d));
+        let kind = descriptor
+            .get("kind")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| format!("{context}.kind is required"))?
+            .to_ascii_lowercase()
+            .replace('-', "_");
+        match kind.as_str() {
+            "isometry" => {
+                analytic_descriptor_weight_value(descriptor, &context)?;
+                registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
+                    IsometryPenalty::new_euclidean(slice, target.d),
+                )));
+            }
+            "ard" => {
+                analytic_descriptor_weight_sequence(descriptor, &context)?;
+                registry.push(AnalyticPenaltyKind::Ard(Arc::new(ARDPenalty::new(
+                    slice, target.d,
+                ))));
+            }
+            "orthogonality" => {
+                let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = analytic_descriptor_usize(descriptor, "n_eff", target.n)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                registry.push(AnalyticPenaltyKind::Orthogonality(Arc::new(
+                    OrthogonalityPenalty::new(slice, target.d, weight, n_eff, learnable)
+                        .map_err(|err| format!("{context}: {err}"))?,
+                )));
+            }
+            "sparsity" => {
+                analytic_descriptor_weight_value(descriptor, &context)?;
+                let sparsity_kind = descriptor
+                    .get("sparsity_kind")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("smooth_l1")
+                    .to_ascii_lowercase()
+                    .replace('-', "_");
+                let eps = analytic_descriptor_f64(descriptor, "eps", 1.0e-3)?;
+                let penalty = match sparsity_kind.as_str() {
+                    "smooth_l1" | "smoothed_l1" => {
+                        SparsityPenalty::smoothed_l1(PenaltyTier::Psi, eps)
+                    }
+                    "log" => SparsityPenalty::log(PenaltyTier::Psi, eps),
+                    "hoyer" => Ok(SparsityPenalty::hoyer(PenaltyTier::Psi)),
+                    other => Err(format!(
+                        "{context}.sparsity_kind must be smooth_l1, hoyer, or log; got {other:?}"
+                    )),
+                }?;
+                registry.push(AnalyticPenaltyKind::Sparsity(Arc::new(penalty)));
+            }
+            "ibp_assignment" | "ibp_assignment_penalty" => {
+                let k_max = analytic_descriptor_usize(descriptor, "k_max", target.d)?;
+                let alpha = analytic_descriptor_f64(descriptor, "alpha", 1.0)?;
+                let tau = analytic_descriptor_f64(descriptor, "tau", 1.0)?;
+                let learnable_alpha = descriptor
+                    .get("learnable_alpha")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                registry.push(AnalyticPenaltyKind::IBPAssignment(Arc::new(
+                    IBPAssignmentPenalty::new(k_max, alpha, tau, learnable_alpha),
+                )));
+            }
+            "softmax_assignment_sparsity" => {
+                let k_atoms = analytic_descriptor_usize(descriptor, "k_atoms", target.d)?;
+                let temperature = analytic_descriptor_f64(descriptor, "temperature", 1.0)?;
+                registry.push(AnalyticPenaltyKind::SoftmaxAssignmentSparsity(Arc::new(
+                    SoftmaxAssignmentSparsityPenalty::new(k_atoms, temperature),
+                )));
+            }
+            "total_variation" => {
+                let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = analytic_descriptor_usize(descriptor, "n_eff", target.n)?;
+                let difference_op = analytic_descriptor_difference_op(descriptor, &context)?;
+                let smoothing_eps = analytic_descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                registry.push(AnalyticPenaltyKind::TotalVariation(Arc::new(
+                    TotalVariationPenalty::new(
+                        weight,
+                        n_eff,
+                        difference_op,
+                        smoothing_eps,
+                        learnable,
+                    )
+                    .map_err(|err| format!("{context}: {err}"))?,
+                )));
+            }
+            other => return Err(format!("{context}.kind has unsupported analytic penalty {other:?}")),
+        }
+    }
+    Ok(registry)
+}
+
 fn json_array2(value: &JsonValue, context: &str) -> Result<Array2<f64>, String> {
     let rows = value.as_array().ok_or_else(|| {
         format!("{context} must be a two-dimensional numeric array")
@@ -3367,6 +3688,10 @@ fn prepare_standard_latent_coord(
     config: &FitConfig,
 ) -> Result<Option<(Dataset, ParsedFormula, StandardLatentCoordConfig)>, String> {
     let specs = parse_latent_specs(config.latents.as_ref())?;
+    let analytic_penalties = build_standard_latent_analytic_penalty_registry(
+        config.latents.as_ref(),
+        config.analytic_penalties.as_ref(),
+    )?;
     if specs.is_empty() {
         return Ok(None);
     }
@@ -3459,6 +3784,8 @@ fn prepare_standard_latent_coord(
             feature_cols,
             manifold: spec.manifold.manifold,
             manifold_auto: spec.manifold.auto,
+            analytic_penalties: (!analytic_penalties.penalties.is_empty())
+                .then(|| Arc::new(analytic_penalties)),
         },
     )))
 }

@@ -1702,6 +1702,7 @@ pub struct StandardLatentCoordConfig {
     pub feature_cols: Vec<usize>,
     pub manifold: crate::terms::latent_coord::LatentManifold,
     pub manifold_auto: bool,
+    pub analytic_penalties: Option<std::sync::Arc<crate::terms::AnalyticPenaltyRegistry>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -12914,6 +12915,153 @@ fn add_latent_id_objective_to_eval(
     Ok(())
 }
 
+fn analytic_penalty_objective_contribution(
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    latent: &crate::terms::latent_coord::LatentCoordValues,
+    registry: &crate::terms::AnalyticPenaltyRegistry,
+) -> Result<LatentIdObjectiveContribution, EstimationError> {
+    let flat_len = latent.len();
+    let t_start = rho_dim;
+    let t_end = t_start + flat_len;
+    if theta.len() < t_end {
+        return Err(EstimationError::InvalidInput(format!(
+            "latent-coordinate theta too short for analytic penalties: got {}, need at least {}",
+            theta.len(),
+            t_end
+        )));
+    }
+    let target_t = theta.slice(s![t_start..t_end]);
+    let rho = Array1::<f64>::zeros(registry.total_rho_count());
+    let mut cost = 0.0_f64;
+    let mut gradient = Array1::<f64>::zeros(theta.len());
+    for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(registry.rho_layout()) {
+        let rho_local = rho.slice(s![rho_slice]);
+        match tier {
+            crate::terms::PenaltyTier::Psi => {
+                cost += penalty.value(target_t.view(), rho_local);
+                let grad = penalty.grad_target(target_t.view(), rho_local);
+                if grad.len() != flat_len {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "analytic penalty {name:?} gradient length mismatch: got {}, expected {}",
+                        grad.len(),
+                        flat_len
+                    )));
+                }
+                gradient.slice_mut(s![t_start..t_end]).scaled_add(1.0, &grad);
+            }
+            crate::terms::PenaltyTier::Beta => {
+                return Err(EstimationError::InvalidInput(format!(
+                    "standard latent-coordinate analytic penalty {name:?} targets beta; formula latent fits only register Psi-tier latent penalties"
+                )));
+            }
+            crate::terms::PenaltyTier::Rho => {}
+        }
+    }
+    Ok(LatentIdObjectiveContribution { cost, gradient })
+}
+
+fn add_analytic_penalty_hessian_to_eval(
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    latent: &crate::terms::latent_coord::LatentCoordValues,
+    registry: &crate::terms::AnalyticPenaltyRegistry,
+    eval: &mut (
+        f64,
+        Array1<f64>,
+        crate::solver::outer_strategy::HessianResult,
+    ),
+) -> Result<(), EstimationError> {
+    let flat_len = latent.len();
+    let t_start = rho_dim;
+    let t_end = t_start + flat_len;
+    if theta.len() < t_end {
+        return Err(EstimationError::InvalidInput(format!(
+            "latent-coordinate theta too short for analytic penalty Hessian: got {}, need at least {}",
+            theta.len(),
+            t_end
+        )));
+    }
+    let crate::solver::outer_strategy::HessianResult::Analytic(hessian) = &mut eval.2 else {
+        if eval.2.is_analytic() {
+            eval.2 = crate::solver::outer_strategy::HessianResult::Unavailable;
+        }
+        return Ok(());
+    };
+    if hessian.dim() != (theta.len(), theta.len()) {
+        return Err(EstimationError::InvalidInput(format!(
+            "analytic penalty Hessian target shape mismatch: got {}x{}, expected {}x{}",
+            hessian.nrows(),
+            hessian.ncols(),
+            theta.len(),
+            theta.len()
+        )));
+    }
+    let target_t = theta.slice(s![t_start..t_end]);
+    let rho = Array1::<f64>::zeros(registry.total_rho_count());
+    for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout()) {
+        let rho_local = rho.slice(s![rho_slice]);
+        if !matches!(tier, crate::terms::PenaltyTier::Psi) {
+            continue;
+        }
+        if let Some(diag) = penalty.hessian_diag(target_t.view(), rho_local) {
+            if diag.len() != flat_len {
+                return Err(EstimationError::InvalidInput(format!(
+                    "analytic penalty Hessian diagonal length mismatch: got {}, expected {}",
+                    diag.len(),
+                    flat_len
+                )));
+            }
+            for i in 0..flat_len {
+                hessian[[t_start + i, t_start + i]] += diag[i];
+            }
+            continue;
+        }
+        let mut probe = Array1::<f64>::zeros(flat_len);
+        for col in 0..flat_len {
+            probe[col] = 1.0;
+            let hv = penalty.hvp(target_t.view(), rho_local, probe.view());
+            if hv.len() != flat_len {
+                return Err(EstimationError::InvalidInput(format!(
+                    "analytic penalty Hessian-vector length mismatch: got {}, expected {}",
+                    hv.len(),
+                    flat_len
+                )));
+            }
+            for row in 0..flat_len {
+                hessian[[t_start + row, t_start + col]] += hv[row];
+            }
+            probe[col] = 0.0;
+        }
+    }
+    Ok(())
+}
+
+fn add_analytic_penalty_objective_to_eval(
+    theta: &Array1<f64>,
+    rho_dim: usize,
+    latent: &crate::terms::latent_coord::LatentCoordValues,
+    registry: &crate::terms::AnalyticPenaltyRegistry,
+    eval: &mut (
+        f64,
+        Array1<f64>,
+        crate::solver::outer_strategy::HessianResult,
+    ),
+) -> Result<(), EstimationError> {
+    let contribution = analytic_penalty_objective_contribution(theta, rho_dim, latent, registry)?;
+    eval.0 += contribution.cost;
+    if eval.1.len() != contribution.gradient.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "latent-coordinate REML gradient length mismatch: base={}, analytic_penalty={}",
+            eval.1.len(),
+            contribution.gradient.len()
+        )));
+    }
+    eval.1 += &contribution.gradient;
+    add_analytic_penalty_hessian_to_eval(theta, rho_dim, latent, registry, eval)?;
+    Ok(())
+}
+
 fn spatial_log_kappa_hyper_dirs_frominfo_list(
     info_list: Vec<SpatialPsiDerivative>,
 ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
@@ -13310,6 +13458,7 @@ struct SingleBlockLatentCoordDesignCache {
     id_mode: crate::terms::latent_coord::LatentIdMode,
     manifold: crate::terms::latent_coord::LatentManifold,
     latent_id: u64,
+    analytic_penalties: Option<std::sync::Arc<crate::terms::AnalyticPenaltyRegistry>>,
     design_revision: u64,
 }
 
@@ -13364,6 +13513,7 @@ impl SingleBlockLatentCoordDesignCache {
             id_mode: latent.values.id_mode().clone(),
             manifold: latent.values.manifold().clone(),
             latent_id: latent.values.latent_id(),
+            analytic_penalties: latent.analytic_penalties.clone(),
             design_revision: 0,
         })
     }
@@ -13381,6 +13531,10 @@ impl SingleBlockLatentCoordDesignCache {
             .as_ref()
             .cloned()
             .ok_or_else(|| "latent-coordinate cache has not been realized".to_string())
+    }
+
+    fn analytic_penalties(&self) -> Option<std::sync::Arc<crate::terms::AnalyticPenaltyRegistry>> {
+        self.analytic_penalties.clone()
     }
 
     fn hyper_dirs(&self) -> Result<Vec<crate::estimate::reml::DirectionalHyperParam>, String> {
@@ -17082,6 +17236,15 @@ fn try_exact_joint_latent_coord_optimization(
                 design_revision,
             )?;
             let latent = self.cache.latent().map_err(EstimationError::InvalidInput)?;
+            if let Some(registry) = self.cache.analytic_penalties() {
+                add_analytic_penalty_objective_to_eval(
+                    theta,
+                    self.rho_dim,
+                    latent.as_ref(),
+                    registry.as_ref(),
+                    &mut eval,
+                )?;
+            }
             add_latent_id_objective_to_eval(theta, self.rho_dim, latent.as_ref(), &mut eval)?;
             self.cache.store_eval(eval.clone());
             Ok(eval)
@@ -17144,6 +17307,19 @@ fn try_exact_joint_latent_coord_optimization(
                             Err(_) => return f64::INFINITY,
                         };
                     let cost = cost + contribution.cost;
+                    let cost = if let Some(registry) = self.cache.analytic_penalties() {
+                        match analytic_penalty_objective_contribution(
+                            theta,
+                            self.rho_dim,
+                            latent.as_ref(),
+                            registry.as_ref(),
+                        ) {
+                            Ok(contribution) => cost + contribution.cost,
+                            Err(_) => return f64::INFINITY,
+                        }
+                    } else {
+                        cost
+                    };
                     self.cache.store_cost(cost);
                     cost
                 }
