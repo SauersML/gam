@@ -3536,23 +3536,58 @@ fn latent_input_location_jet(
     t_mat: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     m: usize,
+    tensor_knots_concat: Option<ArrayView1<'_, f64>>,
+    tensor_knot_offsets: Option<&[usize]>,
+    tensor_degrees: Option<&[usize]>,
 ) -> Result<Array3<f64>, String> {
     let latent = LatentCoordValues::from_matrix(t_mat, LatentIdMode::None);
     match latent_basis_kind(basis_kind)? {
         "duchon" => {
+            let nullspace_order = duchon_nullspace_from_m(m);
             let phi_r = duchon_radial_first_derivative_nd(
                 t_mat,
                 centers,
                 None,
-                duchon_nullspace_from_m(m),
+                nullspace_order,
             )
             .map_err(|err| err.to_string())?;
-            Ok(latent.design_gradient_wrt_t_dispatch(
+            let radial_jet = latent.design_gradient_wrt_t_dispatch(
                 InputLocationDerivative::Radial {
                     kernel_first_derivative: phi_r.view(),
                     centers,
                 },
-            ))
+            );
+            let poly_jet = duchon_polynomial_first_derivative_nd(t_mat, nullspace_order);
+            let n_rows = radial_jet.shape()[0];
+            let n_radial = radial_jet.shape()[1];
+            let n_poly = poly_jet.shape()[1];
+            let dim = radial_jet.shape()[2];
+            if poly_jet.shape()[0] != n_rows || poly_jet.shape()[2] != dim {
+                return Err(format!(
+                    "Duchon polynomial derivative shape mismatch: radial jet is \
+                     {}x{}x{}, polynomial jet is {}x{}x{}",
+                    n_rows,
+                    n_radial,
+                    dim,
+                    poly_jet.shape()[0],
+                    n_poly,
+                    poly_jet.shape()[2],
+                ));
+            }
+            let mut jet = Array3::<f64>::zeros((n_rows, n_radial + n_poly, dim));
+            for n in 0..n_rows {
+                for k in 0..n_radial {
+                    for a in 0..dim {
+                        jet[[n, k, a]] = radial_jet[[n, k, a]];
+                    }
+                }
+                for k in 0..n_poly {
+                    for a in 0..dim {
+                        jet[[n, n_radial + k, a]] = poly_jet[[n, k, a]];
+                    }
+                }
+            }
+            Ok(jet)
         }
         "matern" => {
             // Fixes audit-revised claim that non-Duchon latent input-location
@@ -3574,12 +3609,23 @@ fn latent_input_location_jet(
                 jet.view(),
             )))
         }
-        "bspline_tensor" => Err(
-            "LatentCoord tensor B-spline input-location derivative requires per-axis knot metadata; \
-             bspline_tensor_first_derivative is available but gaussian_reml_fit_latent_backward \
-             currently passes only centers"
-                .to_string(),
-        ),
+        "bspline_tensor" => {
+            let knots = tensor_knots_concat.ok_or_else(|| {
+                "tensor B-spline latent derivative requires knots_concat".to_string()
+            })?;
+            let offsets = tensor_knot_offsets.ok_or_else(|| {
+                "tensor B-spline latent derivative requires knot_offsets".to_string()
+            })?;
+            let degrees = tensor_degrees.ok_or_else(|| {
+                "tensor B-spline latent derivative requires degrees".to_string()
+            })?;
+            let per_axis = split_tensor_knot_views(knots, offsets, t_mat.ncols())?;
+            let jet = bspline_tensor_first_derivative(t_mat, &per_axis, degrees)
+                .map_err(|err| err.to_string())?;
+            Ok(latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Jet(
+                jet.view(),
+            )))
+        }
         "periodic_bspline" => {
             // Fixes audit-revised claim that periodic latent derivatives are
             // analytic jets. The latent pyffi path carries only centers today,
@@ -5309,9 +5355,22 @@ fn glm_reml_fit_latent_backward<'py>(
         t_mat.view(),
         centers.as_array(),
         m,
+        None,
+        None,
+        None,
     )
     .map_err(py_value_error)?;
-    let n_centers = centers.as_array().nrows().min(p);
+    if jet.shape()[0] != n_obs || jet.shape()[1] != p || jet.shape()[2] != latent_dim {
+        return Err(py_value_error(format!(
+            "latent input-location jet shape mismatch: expected {}x{}x{}, got {}x{}x{}",
+            n_obs,
+            p,
+            latent_dim,
+            jet.shape()[0],
+            jet.shape()[1],
+            jet.shape()[2],
+        )));
+    }
     let mut grad_t = Array1::<f64>::zeros(n_obs * latent_dim);
     let mut rhs = Array2::<f64>::zeros((q, 1));
     let mut direction_t = Array1::<f64>::zeros(q);
@@ -5343,16 +5402,8 @@ fn glm_reml_fit_latent_backward<'py>(
         }
         for a in 0..latent_dim {
             let mut acc = 0.0_f64;
-            for k in 0..n_centers {
+            for k in 0..p {
                 acc += direction_orig[k] * jet[[n, k, a]];
-            }
-            if p > n_centers {
-                let poly_start = n_centers;
-                let n_poly = p - poly_start;
-                let linear_cols = n_poly.saturating_sub(1).min(latent_dim);
-                if a < linear_cols {
-                    acc += direction_orig[poly_start + 1 + a];
-                }
             }
             grad_t[n * latent_dim + a] += grad_reml_score * acc;
         }

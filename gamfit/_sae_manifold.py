@@ -60,6 +60,7 @@ def sae_manifold_fit(
     *,
     assignment_prior: Literal["softmax", "ibp_map"] = "softmax",
     alpha: float | Literal["auto"] = "auto",
+    learnable_alpha: bool = False,
     tau: float = 0.5,
     max_iter: int = 12,
     learning_rate: float = 0.05,
@@ -74,7 +75,8 @@ def sae_manifold_fit(
     empirical variance survives the ARD precision. ``assignment_prior`` is
     ``"softmax"`` by default; ``"ibp_map"`` uses deterministic concrete
     Beta-Bernoulli active indicators with ``alpha="auto"`` evidence-ranked
-    over a small truncation-prior grid.
+    over a small truncation-prior grid. ``learnable_alpha`` mirrors the Rust
+    ``IBPAssignmentPenalty`` effective-alpha convention.
     """
 
     z = _as_2d_float(Z, "Z")
@@ -82,6 +84,8 @@ def sae_manifold_fit(
         raise ValueError("sae_manifold_fit requires a non-empty (N, p) matrix")
     if assignment_prior not in {"softmax", "ibp_map"}:
         raise ValueError("assignment_prior must be 'softmax' or 'ibp_map'")
+    if learnable_alpha and assignment_prior != "ibp_map":
+        raise ValueError("learnable_alpha only applies to assignment_prior='ibp_map'")
     if not np.isfinite(tau) or tau <= 0.0:
         raise ValueError("tau must be finite and positive")
 
@@ -100,6 +104,7 @@ def sae_manifold_fit(
             smoothness,
             assignment_prior,
             alpha,
+            learnable_alpha,
             tau,
             max_iter=max_iter,
             learning_rate=learning_rate,
@@ -129,6 +134,7 @@ def _fit_fixed_k(
     smoothness: float | Literal["auto"],
     assignment_prior: Literal["softmax", "ibp_map"],
     alpha: float | Literal["auto"],
+    learnable_alpha: bool,
     tau: float,
     *,
     max_iter: int,
@@ -147,6 +153,7 @@ def _fit_fixed_k(
                 smoothness,
                 assignment_prior,
                 alpha,
+                learnable_alpha,
                 tau,
                 max_iter=max_iter,
                 learning_rate=learning_rate,
@@ -176,6 +183,7 @@ def _fit_fixed_k(
                 smoothness,
                 assignment_prior,
                 candidate_alpha,
+                learnable_alpha,
                 tau,
                 max_iter=max_iter,
                 learning_rate=learning_rate,
@@ -211,6 +219,15 @@ def _fit_fixed_k(
     alpha_value = 1.0 if alpha == "auto" else float(alpha)
     if not np.isfinite(alpha_value) or alpha_value <= 0.0:
         raise ValueError("alpha must be positive, finite, or 'auto'")
+    # TODO: replace the Python IBP branch with a pyffi sae_manifold_fit_ibp
+    # entrypoint once gam-pyffi exposes SaeManifoldTerm construction. Until
+    # then, keep this resolved-alpha rule bit-for-bit with Rust's
+    # IBPAssignmentPenalty::resolved_alpha.
+    effective_alpha = (
+        alpha_value * lambda_sparse
+        if assignment_prior == "ibp_map" and learnable_alpha
+        else alpha_value
+    )
 
     last_payload: dict[str, Any] | None = None
     last_designs: list[np.ndarray] = []
@@ -243,7 +260,7 @@ def _fit_fixed_k(
             grad_a[:, atom] = -np.einsum("np,np->n", residual, decoded[atom])
         grad_logits = _assignment_jvp(assignments, grad_a, assignment_prior, tau)
         prior_grad = _assignment_prior_grad_logits(
-            assignments, assignment_prior, lambda_sparse, alpha_value, tau
+            assignments, assignment_prior, lambda_sparse, effective_alpha, tau
         )
         logits -= learning_rate * (grad_logits + prior_grad)
 
@@ -278,7 +295,7 @@ def _fit_fixed_k(
         fitted += last_assignments[:, [atom]] * decoded
     score = float(last_payload["reml_score"])
     score -= _assignment_prior_value(
-        last_assignments, assignment_prior, lambda_sparse, alpha_value
+        last_assignments, assignment_prior, lambda_sparse, effective_alpha
     )
     score -= _ard_value(coords, log_ard)
 
