@@ -8990,7 +8990,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 edf_by_block,
                 edf_total,
                 smoothing_correction: None,
-                penalized_hessian: penalized_hessian.clone(),
+                // Boundary adapter: wrap the raw `Array2<f64>` Hessian as
+                // `UnscaledPrecision` for the newtype storage.
+                penalized_hessian: penalized_hessian.clone().into(),
                 working_weights: final_eval.obs.fisherweight.clone(),
                 working_response: {
                     let mut out = final_eval.obs.eta.clone();
@@ -9002,7 +9004,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 },
                 reparam_qs: None,
                 dispersion: crate::estimate::Dispersion::Known(1.0),
-                beta_covariance,
+                // Boundary adapter: wrap the φ-scaled covariance as
+                // `PhiScaledCovariance` for the newtype storage.
+                beta_covariance: beta_covariance.clone().map(Into::into),
                 beta_standard_errors,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
@@ -9012,11 +9016,11 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 bias_correction_beta: None,
             };
             let geometry = Some(crate::estimate::FitGeometry {
-                penalized_hessian,
+                penalized_hessian: penalized_hessian.into(),
                 working_weights: inf.working_weights.clone(),
                 working_response: inf.working_response.clone(),
             });
-            let covariance_conditional = inf.beta_covariance.clone();
+            let covariance_conditional = beta_covariance;
             let pirls_status_val = if final_fit.outer_converged {
                 crate::pirls::PirlsStatus::Converged
             } else {
@@ -11405,7 +11409,7 @@ fn fit_bounded_term_collection_with_design(
         (vec![0.0; fit_penalties.len()], 0.0)
     };
     let geometry = Some(crate::estimate::FitGeometry {
-        penalized_hessian: penalized_hessian.clone(),
+        penalized_hessian: penalized_hessian.clone().into(),
         working_weights: eta_state.fisherweight.clone(),
         working_response: {
             let mut working_response = eta_state.eta.clone();
@@ -11427,7 +11431,9 @@ fn fit_bounded_term_collection_with_design(
                 edf_by_block,
                 edf_total,
                 smoothing_correction: None,
-                penalized_hessian: penalized_hessian.clone(),
+                // Boundary adapter: `penalized_hessian` storage is now
+                // `UnscaledPrecision`.
+                penalized_hessian: penalized_hessian.clone().into(),
                 working_weights: eta_state.fisherweight.clone(),
                 working_response: {
                     let mut working_response = eta_state.eta.clone();
@@ -11439,7 +11445,9 @@ fn fit_bounded_term_collection_with_design(
                 },
                 reparam_qs: None,
                 dispersion: crate::estimate::Dispersion::Known(1.0),
-                beta_covariance,
+                // Boundary adapter: `beta_covariance` storage is now
+                // `Option<PhiScaledCovariance>`.
+                beta_covariance: beta_covariance.clone().map(Into::into),
                 beta_standard_errors,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
@@ -11448,7 +11456,7 @@ fn fit_bounded_term_collection_with_design(
                 covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             };
-            let covariance_conditional = inf.beta_covariance.clone();
+            let covariance_conditional = beta_covariance;
             let pirls_status_val = if fit.outer_converged {
                 crate::pirls::PirlsStatus::Converged
             } else {

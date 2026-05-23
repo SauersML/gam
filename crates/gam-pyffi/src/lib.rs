@@ -6374,10 +6374,15 @@ fn insert_coefficient_into_saved_fit(
     let variance_diag = variance;
     let precision_diag = 1.0 / variance_diag;
     if let Some(inference) = fit.inference.as_mut() {
+        // Boundary adapter: `penalized_hessian` is the `UnscaledPrecision`
+        // newtype; unwrap for the `insert_symmetric_array2` helper and wrap
+        // the result back on assignment.
         inference.penalized_hessian =
-            insert_symmetric_array2(&inference.penalized_hessian, index, precision_diag)?;
+            insert_symmetric_array2(inference.penalized_hessian.as_array(), index, precision_diag)?
+                .into();
         if let Some(cov) = inference.beta_covariance.as_mut() {
-            *cov = insert_symmetric_array2(cov, index, variance_diag)?;
+            // `beta_covariance` is the `PhiScaledCovariance` newtype.
+            *cov = insert_symmetric_array2(cov.as_array(), index, variance_diag)?.into();
         }
         if let Some(se) = inference.beta_standard_errors.as_mut() {
             *se = insert_array1(se, index, variance_diag.sqrt());
@@ -6406,7 +6411,8 @@ fn insert_coefficient_into_saved_fit(
     }
     if let Some(geometry) = fit.geometry.as_mut() {
         geometry.penalized_hessian =
-            insert_symmetric_array2(&geometry.penalized_hessian, index, precision_diag)?;
+            insert_symmetric_array2(geometry.penalized_hessian.as_array(), index, precision_diag)?
+                .into();
     }
     Ok(())
 }
