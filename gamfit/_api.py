@@ -2105,6 +2105,7 @@ def gaussian_reml_fit_latent(
     *,
     m: int = 2,
     weights: Any | None = None,
+    fisher_W: Any | None = None,
     init_lambda: float | None = None,
     aux_u: Any | None = None,
     aux_family: str = "ridge",
@@ -2142,6 +2143,7 @@ def gaussian_reml_fit_latent(
             _numeric_matrix(penalty, "penalty"),
             int(m),
             None if weights is None else _numeric_vector(weights, "weights"),
+            None if fisher_W is None else np.asarray(fisher_W, dtype=float),
             None if init_lambda is None else float(init_lambda),
             None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
             str(aux_family),
@@ -2180,6 +2182,7 @@ def gaussian_reml_fit_latent_backward(
     grad_edf: float = 0.0,
     m: int = 2,
     weights: Any | None = None,
+    fisher_W: Any | None = None,
     init_lambda: float | None = None,
     aux_u: Any | None = None,
     aux_family: str = "ridge",
@@ -2222,6 +2225,7 @@ def gaussian_reml_fit_latent_backward(
             float(grad_edf),
             int(m),
             None if weights is None else _numeric_vector(weights, "weights"),
+            None if fisher_W is None else np.asarray(fisher_W, dtype=float),
             None if init_lambda is None else float(init_lambda),
             None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
             str(aux_family),
@@ -2246,6 +2250,113 @@ def gaussian_reml_fit_latent_backward(
     ):
         if result.get(key) is not None:
             result[key] = np.asarray(result[key], dtype=float)
+    return result
+
+
+def glm_reml_fit_latent(
+    t: Any,
+    y: Any,
+    n_obs: int,
+    latent_dim: int,
+    centers: Any,
+    penalty: Any,
+    family: str,
+    *,
+    m: int = 2,
+    weights: Any | None = None,
+    fisher_W: Any | None = None,
+    init_lambda: float | None = None,
+) -> dict[str, Any]:
+    """Latent-coordinate REML/LAML fit for GLM families via PIRLS.
+
+    ``family`` accepts ``"binomial-logit"``, ``"binomial-probit"``,
+    ``"binomial-cloglog"``, ``"poisson-log"``, ``"gamma-log"``, and
+    ``"gaussian-identity"``. ``fisher_W`` is an advanced internal hook; this
+    scalar-response entry point currently accepts blocks with shape ``(N,1,1)``.
+    """
+    import numpy as np
+
+    rust = rust_module()
+    try:
+        out = rust.glm_reml_fit_latent(
+            _numeric_vector(t, "t"),
+            _numeric_matrix(y, "y"),
+            int(n_obs),
+            int(latent_dim),
+            _numeric_matrix(centers, "centers"),
+            _numeric_matrix(penalty, "penalty"),
+            str(family),
+            int(m),
+            None if weights is None else _numeric_vector(weights, "weights"),
+            None if fisher_W is None else np.asarray(fisher_W, dtype=float),
+            None if init_lambda is None else float(init_lambda),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    result = dict(out)
+    for key in (
+        "coefficients",
+        "fitted",
+        "sigma2",
+        "cache_penalty_eigenvalues",
+        "cache_eigenvectors",
+    ):
+        if result.get(key) is not None:
+            result[key] = np.asarray(result[key], dtype=float)
+    return result
+
+
+def glm_reml_fit_latent_backward(
+    t: Any,
+    y: Any,
+    n_obs: int,
+    latent_dim: int,
+    centers: Any,
+    penalty: Any,
+    family: str,
+    *,
+    grad_reml_score: float = 1.0,
+    m: int = 2,
+    weights: Any | None = None,
+    fisher_W: Any | None = None,
+    init_lambda: float | None = None,
+    aux_u: Any | None = None,
+    aux_family: str = "ridge",
+    aux_strength: float | None = None,
+    dim_selection_log_precision: Any | None = None,
+    basis_kind: str = "duchon",
+) -> dict[str, Any]:
+    """Return the analytic latent gradient for ``glm_reml_fit_latent``."""
+    import numpy as np
+
+    rust = rust_module()
+    try:
+        out = rust.glm_reml_fit_latent_backward(
+            _numeric_vector(t, "t"),
+            _numeric_matrix(y, "y"),
+            int(n_obs),
+            int(latent_dim),
+            _numeric_matrix(centers, "centers"),
+            _numeric_matrix(penalty, "penalty"),
+            str(family),
+            float(grad_reml_score),
+            int(m),
+            None if weights is None else _numeric_vector(weights, "weights"),
+            None if fisher_W is None else np.asarray(fisher_W, dtype=float),
+            None if init_lambda is None else float(init_lambda),
+            None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
+            str(aux_family),
+            None if aux_strength is None else float(aux_strength),
+            None
+            if dim_selection_log_precision is None
+            else _numeric_vector(dim_selection_log_precision, "dim_selection_log_precision"),
+            str(basis_kind),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    result = dict(out)
+    if result.get("grad_t") is not None:
+        result["grad_t"] = np.asarray(result["grad_t"], dtype=float)
     return result
 
 
