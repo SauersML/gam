@@ -1367,7 +1367,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             family
         );
         let fitted = match fit_model(FitRequest::Standard(StandardFitRequest {
-            data: ds.values.view(),
+            data: ds.values.to_owned(),
             y: y.clone(),
             weights: weights.clone(),
             offset: offset.clone(),
@@ -1390,6 +1390,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             // config file, or formula-DSL syntax for them, and the magic-by-default
             // policy forbids inventing one here, so an empty prior list is correct.
             penalty_block_gamma_priors: Vec::new(),
+            latent_coord: None,
+            _marker: std::marker::PhantomData,
         })) {
             Ok(FitResult::Standard(result)) => {
                 log::info!(

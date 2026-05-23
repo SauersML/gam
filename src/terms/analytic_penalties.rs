@@ -56,7 +56,7 @@
 //! | IBP       | ψ (logits)  | 0 or 1 (log α)       |
 //! | ARD       | ψ (latent t)| d (one per axis)     |
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
+use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, CowArray, Ix2, Ix3};
 use std::sync::Arc;
 
 use crate::terms::basis::{
@@ -757,18 +757,18 @@ impl IsometryPenalty {
         Ok(out)
     }
 
-    fn jacobian_second(
-        &self,
+    fn jacobian_second<'a>(
+        &'a self,
         target: ArrayView1<'_, f64>,
         n_obs: usize,
         d: usize,
-    ) -> Option<Array2<f64>> {
+    ) -> Option<CowArray<'a, f64, Ix2>> {
         if let Some(jac2) = self.jacobian_second_cache.as_ref() {
-            return Some(jac2.as_ref().clone());
+            return Some(CowArray::from(jac2.view()));
         }
         let source = self.duchon_radial_source.as_ref()?;
         match self.duchon_radial_jacobian_second(target, n_obs, d, source) {
-            Ok(jac2) => Some(jac2),
+            Ok(jac2) => Some(CowArray::from(jac2)),
             Err(err) => {
                 self.missing_cache_default(
                     "jacobian_second",
@@ -779,18 +779,18 @@ impl IsometryPenalty {
         }
     }
 
-    fn jacobian_third(
-        &self,
+    fn jacobian_third<'a>(
+        &'a self,
         target: ArrayView1<'_, f64>,
         n_obs: usize,
         d: usize,
-    ) -> Option<ndarray::Array3<f64>> {
+    ) -> Option<CowArray<'a, f64, Ix3>> {
         if let Some(jac3) = self.cache_third_decoder_derivative.as_ref() {
-            return Some(jac3.as_ref().clone());
+            return Some(CowArray::from(jac3.view()));
         }
         let source = self.duchon_radial_source.as_ref()?;
         match self.duchon_radial_jacobian_third(target, n_obs, d, source) {
-            Ok(jac3) => Some(jac3),
+            Ok(jac3) => Some(CowArray::from(jac3)),
             Err(err) => {
                 self.missing_cache_default(
                     "jacobian_third",
@@ -836,7 +836,7 @@ impl IsometryPenalty {
     }
 
     /// Reference metric per row, `(n_obs, d*d)`.
-    fn reference_metric(&self, n_obs: usize, d: usize) -> Array2<f64> {
+    fn reference_metric(&self, n_obs: usize, d: usize) -> CowArray<'_, f64, Ix2> {
         match &self.reference {
             IsometryReference::Euclidean => {
                 let mut out = Array2::<f64>::zeros((n_obs, d * d));
@@ -845,12 +845,12 @@ impl IsometryPenalty {
                         out[[n, a * d + a]] = 1.0;
                     }
                 }
-                out
+                CowArray::from(out)
             }
             IsometryReference::UserSupplied(a) => {
                 debug_assert_eq!(a.nrows(), n_obs);
                 debug_assert_eq!(a.ncols(), d * d);
-                a.as_ref().clone()
+                CowArray::from(a.view())
             }
         }
     }

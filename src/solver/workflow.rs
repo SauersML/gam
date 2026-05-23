@@ -169,7 +169,8 @@ pub struct StandardFitRequest<'a> {
     pub coefficient_groups: Vec<CoefficientGroupSpec>,
     pub penalty_block_gamma_priors: Vec<(String, f64, f64)>,
     pub latent_coord: Option<StandardLatentCoordConfig>,
-    _marker: std::marker::PhantomData<&'a ()>,
+    #[doc(hidden)]
+    pub _marker: std::marker::PhantomData<&'a ()>,
 }
 
 pub struct GaussianLocationScaleFitRequest<'a> {
