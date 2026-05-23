@@ -1695,6 +1695,13 @@ pub struct FittedTermCollectionWithSpec {
     pub adaptive_diagnostics: Option<AdaptiveRegularizationDiagnostics>,
 }
 
+#[derive(Clone)]
+pub struct StandardLatentCoordConfig {
+    pub values: std::sync::Arc<crate::terms::latent_coord::LatentCoordValues>,
+    pub term_index: usize,
+    pub feature_cols: Vec<usize>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdaptiveSpatialMap {
     pub termname: String,
