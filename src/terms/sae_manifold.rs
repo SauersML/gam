@@ -9,15 +9,17 @@
 //! Tier assignment:
 //!
 //! * beta: [`SaeManifoldAtom::decoder_coefficients`] (`B_k`, one block per atom).
-//! * psi: [`SaeAssignment`] (`logits -> a_ik` and per-atom `LatentCoordValues`).
+//! * ext-coords: [`SaeAssignment`] (`logits -> a_ik` and per-atom
+//!   `LatentCoordValues`). Per-row latent coordinates are written `t`; reserve
+//!   `ψ` for existing kernel-shape state such as `SpatialLogKappaCoords`.
 //! * rho: [`SaeManifoldRho`] (`lambda_sparse`, `lambda_smooth`, `alpha_kj`) plus
 //!   the discrete `K` selected by the Python `compare_models` wrapper.
 //!
 //! The per-row local block is exactly the audit-revised shape:
 //!
 //! ```text
-//! psi_i = (logits_i[0..K], t_i0[0..d_0], ..., t_iK[0..d_K])
-//! dim(psi_i) = K + sum_k d_k
+//! ext_i = (logits_i[0..K], t_i0[0..d_0], ..., t_iK[0..d_K])
+//! dim(ext_i) = K + sum_k d_k
 //! ```
 //!
 //! [`SaeManifoldTerm::assemble_arrow_schur`] materializes the Gauss-Newton
@@ -462,7 +464,11 @@ impl SaeManifoldTerm {
         out
     }
 
-    pub fn loss(&self, z: ArrayView2<'_, f64>, rho: &SaeManifoldRho) -> Result<SaeManifoldLoss, String> {
+    pub fn loss(
+        &self,
+        z: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<SaeManifoldLoss, String> {
         if z.dim() != (self.n_obs(), self.output_dim()) {
             return Err(format!(
                 "SaeManifoldTerm::loss: Z must be ({}, {}); got {:?}",
@@ -479,8 +485,11 @@ impl SaeManifoldTerm {
                 data_fit += 0.5 * r * r;
             }
         }
-        let assignment_sparsity =
-            assignment_entropy_value(self.assignment.logits.view(), self.assignment.temperature, rho.lambda_sparse());
+        let assignment_sparsity = assignment_entropy_value(
+            self.assignment.logits.view(),
+            self.assignment.temperature,
+            rho.lambda_sparse(),
+        );
         let smoothness = self.decoder_smoothness_value(rho.lambda_smooth());
         let ard = self.ard_value(rho)?;
         Ok(SaeManifoldLoss {
@@ -585,7 +594,8 @@ impl SaeManifoldTerm {
                     let mut grad = 0.0;
                     for j in 0..m {
                         let beta_j = off + j * p + out_col;
-                        let s_ij = 0.5 * (atom.smooth_penalty[[i, j]] + atom.smooth_penalty[[j, i]]);
+                        let s_ij =
+                            0.5 * (atom.smooth_penalty[[i, j]] + atom.smooth_penalty[[j, i]]);
                         sys.hbb[[beta_i, beta_j]] += lambda_smooth * s_ij;
                         grad += lambda_smooth * s_ij * atom.decoder_coefficients[[j, out_col]];
                     }
@@ -615,8 +625,9 @@ impl SaeManifoldTerm {
             for logit_col in 0..k_atoms {
                 let inv_tau = 1.0 / self.assignment.temperature;
                 for out_col in 0..p {
-                    local_jac[[logit_col, out_col]] =
-                        assignments[logit_col] * (decoded[logit_col][out_col] - fitted[out_col]) * inv_tau;
+                    local_jac[[logit_col, out_col]] = assignments[logit_col]
+                        * (decoded[logit_col][out_col] - fitted[out_col])
+                        * inv_tau;
                 }
             }
             // Coordinate columns.
@@ -626,8 +637,7 @@ impl SaeManifoldTerm {
                 for axis in 0..d {
                     let dg = self.atoms[atom_idx].decoded_derivative_row(row, axis);
                     for out_col in 0..p {
-                        local_jac[[off + axis, out_col]] =
-                            assignments[atom_idx] * dg[out_col];
+                        local_jac[[off + axis, out_col]] = assignments[atom_idx] * dg[out_col];
                     }
                 }
             }
@@ -649,8 +659,11 @@ impl SaeManifoldTerm {
             }
 
             // Assignment entropy sparsity in logit space.
-            let (entropy_value_grad, entropy_diag) =
-                assignment_entropy_grad_hdiag(assignments.view(), self.assignment.temperature, lambda_sparse);
+            let (entropy_value_grad, entropy_diag) = assignment_entropy_grad_hdiag(
+                assignments.view(),
+                self.assignment.temperature,
+                lambda_sparse,
+            );
             for atom_idx in 0..k_atoms {
                 block.gt[atom_idx] += entropy_value_grad[atom_idx];
                 block.htt[[atom_idx, atom_idx]] += entropy_diag[atom_idx];
@@ -720,19 +733,17 @@ impl SaeManifoldTerm {
         let sys = self
             .assemble_arrow_schur(z, rho)
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
-        let mut options = ArrowSolveOptions::inexact_pcg();
-        options.trust_region.radius = 1.0;
-        sys.solve_with_options(ridge_psi, ridge_beta, &options)
+        sys.solve(ridge_psi, ridge_beta)
     }
 
     /// Build the analytic-penalty descriptors that correspond to the current
     /// SAE term. This is the bridge into `analytic_penalties.rs` for callers
     /// that want to register the same ρ axes with a REML driver.
-    pub fn analytic_penalty_descriptors(&self) -> (SoftmaxAssignmentSparsityPenalty, Vec<ARDPenalty>) {
-        let sparsity = SoftmaxAssignmentSparsityPenalty::new(
-            self.k_atoms(),
-            self.assignment.temperature,
-        );
+    pub fn analytic_penalty_descriptors(
+        &self,
+    ) -> (SoftmaxAssignmentSparsityPenalty, Vec<ARDPenalty>) {
+        let sparsity =
+            SoftmaxAssignmentSparsityPenalty::new(self.k_atoms(), self.assignment.temperature);
         let mut ard = Vec::with_capacity(self.k_atoms());
         for coord in &self.assignment.coords {
             ard.push(ARDPenalty::new(
@@ -814,7 +825,7 @@ fn assignment_entropy_grad_hdiag(
 /// selecting each atom's active prefix.
 #[allow(clippy::too_many_arguments)]
 pub fn term_from_padded_blocks(
-    z_n: usize,
+    n_obs: usize,
     p_out: usize,
     basis_kinds: &[SaeAtomBasisKind],
     basis_values: ArrayView3<'_, f64>,
@@ -831,9 +842,9 @@ pub fn term_from_padded_blocks(
     if latent_dims.len() != k_atoms || basis_kinds.len() != k_atoms || coords.len() != k_atoms {
         return Err("term_from_padded_blocks: K-length metadata mismatch".into());
     }
-    if logits.dim() != (z_n, k_atoms) {
+    if logits.dim() != (n_obs, k_atoms) {
         return Err(format!(
-            "term_from_padded_blocks: logits must be ({z_n}, {k_atoms}); got {:?}",
+            "term_from_padded_blocks: logits must be ({n_obs}, {k_atoms}); got {:?}",
             logits.dim()
         ));
     }
@@ -841,8 +852,8 @@ pub fn term_from_padded_blocks(
     for k in 0..k_atoms {
         let m = basis_sizes[k];
         let d = latent_dims[k];
-        let phi = basis_values.slice(s![k, 0..z_n, 0..m]).to_owned();
-        let jet = basis_jacobian.slice(s![k, 0..z_n, 0..m, 0..d]).to_owned();
+        let phi = basis_values.slice(s![k, 0..n_obs, 0..m]).to_owned();
+        let jet = basis_jacobian.slice(s![k, 0..n_obs, 0..m, 0..d]).to_owned();
         let b = decoder_coefficients.slice(s![k, 0..m, 0..p_out]).to_owned();
         let s = smooth_penalties.slice(s![k, 0..m, 0..m]).to_owned();
         atoms.push(SaeManifoldAtom::new(
@@ -855,6 +866,7 @@ pub fn term_from_padded_blocks(
             s,
         )?);
     }
-    let assignment = SaeAssignment::from_blocks_with_no_gauge(logits.to_owned(), coords.to_vec(), temperature)?;
+    let assignment =
+        SaeAssignment::from_blocks_with_no_gauge(logits.to_owned(), coords.to_vec(), temperature)?;
     SaeManifoldTerm::new(atoms, assignment)
 }

@@ -95,10 +95,9 @@ penalties = [
 ]
 ```
 
-`gamfit.sae_manifold_fit` exists as a Python assembly wrapper over the shipping
-REML primitives. The missing first-class primitive is the dedicated Rust formal
-term (`src/terms/sae_manifold.rs`) that would assemble all atom blocks into one
-Arrow-Schur solve.
+`gamfit.sae_manifold_fit` exists as a Python assembly wrapper, and
+`src/terms/sae_manifold.rs` now names the first-class Rust term shape for the
+joint Arrow-Schur row-block assembly.
 
 ## Identifiability Rules
 

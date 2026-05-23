@@ -46,8 +46,8 @@
 use ndarray::{Array1, ArrayView1};
 
 use crate::solver::arrow_schur::{
-    solve_arrow_newton_step_with_options, ArrowFactorCache, ArrowSchurError, ArrowSchurSystem,
-    ArrowSolveOptions, ArrowSolverMode,
+    ArrowFactorCache, ArrowSchurError, ArrowSchurSystem, ArrowSolveOptions, ArrowSolverMode,
+    solve_arrow_newton_step_with_options,
 };
 use crate::terms::latent_coord::LatentCoordValues;
 
