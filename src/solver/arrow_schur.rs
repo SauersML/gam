@@ -111,6 +111,7 @@ const DEFAULT_TRUST_REGION_RADIUS: f64 = f64::INFINITY;
 /// shared block before Agarwal-style inexact Schur PCG.
 pub type SharedBetaMatvec =
     Arc<dyn for<'a> Fn(ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync>;
+type MetricWeights = [f64];
 
 /// BA Schur solve variant for the reduced shared `β` system.
 ///
@@ -430,6 +431,8 @@ pub struct ArrowSchurSystem {
     pub d: usize,
     /// β dimensionality `K`.
     pub k: usize,
+    /// Optional per-coordinate metric for Steihaug trust-region dot products.
+    trust_region_metric_weights: Option<Vec<f64>>,
 }
 
 impl ArrowSchurSystem {
@@ -445,6 +448,7 @@ impl ArrowSchurSystem {
             gb: Array1::<f64>::zeros(k),
             d,
             k,
+            trust_region_metric_weights: None,
         }
     }
 
@@ -475,6 +479,7 @@ impl ArrowSchurSystem {
             gb: Array1::<f64>::zeros(k),
             d,
             k,
+            trust_region_metric_weights: None,
         }
     }
 
@@ -555,8 +560,10 @@ impl ArrowSchurSystem {
     pub fn apply_riemannian_latent_geometry(&mut self, latent: &LatentCoordValues) {
         let manifold = latent.manifold();
         if manifold.is_euclidean() {
+            self.trust_region_metric_weights = None;
             return;
         }
+        self.trust_region_metric_weights = Some(manifold.metric_weights());
         debug_assert_eq!(latent.n_obs(), self.rows.len());
         debug_assert_eq!(latent.latent_dim(), self.d);
         for (i, row) in self.rows.iter_mut().enumerate() {
@@ -868,11 +875,21 @@ pub fn solve_arrow_newton_step_with_options(
     let (delta_beta, schur_factor) = match options.mode {
         ArrowSolverMode::Direct => {
             let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, &backend)?;
-            solve_dense_reduced_system(&schur, &rhs_beta, options)?
+            solve_dense_reduced_system(
+                &schur,
+                &rhs_beta,
+                options,
+                trust_region_metric_weights_for_dim(sys, k),
+            )?
         }
         ArrowSolverMode::SqrtBA => {
             let schur = build_dense_schur_sqrt_ba(sys, &htt_factors, ridge_beta, &backend)?;
-            solve_dense_reduced_system(&schur, &rhs_beta, options)?
+            solve_dense_reduced_system(
+                &schur,
+                &rhs_beta,
+                options,
+                trust_region_metric_weights_for_dim(sys, k),
+            )?
         }
         ArrowSolverMode::InexactPCG => {
             let preconditioner =
@@ -886,6 +903,7 @@ pub fn solve_arrow_newton_step_with_options(
                 &options.pcg,
                 &options.trust_region,
                 &backend,
+                trust_region_metric_weights_for_dim(sys, k),
             )?;
             (delta, None)
         }

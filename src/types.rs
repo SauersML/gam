@@ -288,6 +288,7 @@ pub enum ResponseFamily {
     Gaussian,
     Binomial,
     Poisson,
+    Tweedie,
     Gamma,
     RoystonParmar,
 }
@@ -299,6 +300,7 @@ impl ResponseFamily {
             Self::Gaussian => "gaussian",
             Self::Binomial => "binomial",
             Self::Poisson => "poisson",
+            Self::Tweedie => "tweedie",
             Self::Gamma => "gamma",
             Self::RoystonParmar => "royston-parmar",
         }
@@ -376,7 +378,7 @@ impl LikelihoodSpec {
         match self.response {
             ResponseFamily::Gaussian => LikelihoodScaleMetadata::ProfiledGaussian,
             ResponseFamily::Gamma => LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 },
-            ResponseFamily::Binomial | ResponseFamily::Poisson => {
+            ResponseFamily::Binomial | ResponseFamily::Poisson | ResponseFamily::Tweedie => {
                 LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 }
             }
             ResponseFamily::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
@@ -389,6 +391,7 @@ impl From<LikelihoodFamily> for LikelihoodSpec {
         let response = match value {
             LikelihoodFamily::GaussianIdentity => ResponseFamily::Gaussian,
             LikelihoodFamily::PoissonLog => ResponseFamily::Poisson,
+            LikelihoodFamily::Tweedie { .. } => ResponseFamily::Tweedie,
             LikelihoodFamily::GammaLog => ResponseFamily::Gamma,
             LikelihoodFamily::RoystonParmar => ResponseFamily::RoystonParmar,
             LikelihoodFamily::BinomialLogit
@@ -408,7 +411,7 @@ impl From<LikelihoodFamily> for LikelihoodSpec {
             LikelihoodFamily::GaussianIdentity | LikelihoodFamily::RoystonParmar => {
                 InverseLink::Standard(LinkFunction::Identity)
             }
-            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+            LikelihoodFamily::PoissonLog | LikelihoodFamily::Tweedie { .. } | LikelihoodFamily::GammaLog => {
                 InverseLink::Standard(LinkFunction::Log)
             }
             LikelihoodFamily::BinomialLogit => InverseLink::Standard(LinkFunction::Logit),
@@ -448,6 +451,9 @@ impl TryFrom<LikelihoodSpec> for LikelihoodFamily {
             (ResponseFamily::Poisson, InverseLink::Standard(LinkFunction::Log)) => {
                 Ok(Self::PoissonLog)
             }
+            (ResponseFamily::Tweedie, InverseLink::Standard(LinkFunction::Log)) => {
+                Ok(Self::Tweedie { p: 1.5 })
+            }
             (ResponseFamily::Gamma, InverseLink::Standard(LinkFunction::Log)) => Ok(Self::GammaLog),
             (ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)) => {
                 Ok(Self::RoystonParmar)
@@ -476,7 +482,7 @@ impl TryFrom<LikelihoodSpec> for LikelihoodFamily {
 
 /// Engine-level likelihood selector used by generic APIs.
 /// Some families remain restricted to domain-specific entrypoints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum LikelihoodFamily {
     GaussianIdentity,
     BinomialLogit,
@@ -487,6 +493,7 @@ pub enum LikelihoodFamily {
     BinomialBetaLogistic,
     BinomialMixture,
     PoissonLog,
+    Tweedie { p: f64 },
     GammaLog,
     RoystonParmar,
 }
@@ -496,7 +503,7 @@ impl LikelihoodFamily {
     pub fn link_function(self) -> LinkFunction {
         match self {
             Self::GaussianIdentity | Self::RoystonParmar => LinkFunction::Identity,
-            Self::PoissonLog | Self::GammaLog => LinkFunction::Log,
+            Self::PoissonLog | Self::Tweedie { .. } | Self::GammaLog => LinkFunction::Log,
             Self::BinomialLogit | Self::BinomialMixture => LinkFunction::Logit,
             Self::BinomialProbit => LinkFunction::Probit,
             Self::BinomialCLogLog | Self::BinomialLatentCLogLog => LinkFunction::CLogLog,
@@ -517,6 +524,7 @@ impl LikelihoodFamily {
             Self::BinomialBetaLogistic => "binomial-beta-logistic",
             Self::BinomialMixture => "binomial-blended-inverse-link",
             Self::PoissonLog => "poisson-log",
+            Self::Tweedie { .. } => "tweedie-log",
             Self::GammaLog => "gamma-log",
             Self::RoystonParmar => "royston-parmar",
         }
@@ -534,6 +542,7 @@ impl LikelihoodFamily {
             Self::BinomialBetaLogistic => "Binomial Beta-Logistic",
             Self::BinomialMixture => "Binomial Blended Inverse-Link",
             Self::PoissonLog => "Poisson Log",
+            Self::Tweedie { .. } => "Tweedie Log",
             Self::GammaLog => "Gamma Log",
             Self::RoystonParmar => "Royston Parmar",
         }
@@ -609,6 +618,7 @@ impl LikelihoodFamily {
             | Self::BinomialSas
             | Self::BinomialBetaLogistic
             | Self::BinomialMixture
+            | Self::Tweedie { .. }
             | Self::PoissonLog => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
             Self::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
         }
@@ -616,7 +626,7 @@ impl LikelihoodFamily {
 }
 
 /// GLM-compatible likelihood families (survival families excluded by type).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum GlmLikelihoodFamily {
     GaussianIdentity,
     BinomialLogit,
@@ -626,6 +636,7 @@ pub enum GlmLikelihoodFamily {
     BinomialBetaLogistic,
     BinomialMixture,
     PoissonLog,
+    Tweedie { p: f64 },
     GammaLog,
 }
 
@@ -765,6 +776,7 @@ impl TryFrom<LikelihoodFamily> for GlmLikelihoodFamily {
             LikelihoodFamily::BinomialBetaLogistic => Ok(Self::BinomialBetaLogistic),
             LikelihoodFamily::BinomialMixture => Ok(Self::BinomialMixture),
             LikelihoodFamily::PoissonLog => Ok(Self::PoissonLog),
+            LikelihoodFamily::Tweedie { p } => Ok(Self::Tweedie { p }),
             LikelihoodFamily::GammaLog => Ok(Self::GammaLog),
             LikelihoodFamily::RoystonParmar => {
                 Err("RoystonParmar is survival-specific and not a GLM likelihood")
@@ -784,6 +796,7 @@ impl From<GlmLikelihoodFamily> for LikelihoodFamily {
             GlmLikelihoodFamily::BinomialBetaLogistic => Self::BinomialBetaLogistic,
             GlmLikelihoodFamily::BinomialMixture => Self::BinomialMixture,
             GlmLikelihoodFamily::PoissonLog => Self::PoissonLog,
+            GlmLikelihoodFamily::Tweedie { p } => Self::Tweedie { p },
             GlmLikelihoodFamily::GammaLog => Self::GammaLog,
         }
     }
