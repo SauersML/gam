@@ -21,13 +21,13 @@
 //! | Block | Lives in | Owner (piece) |
 //! |---|---|---|
 //! | `B_1..B_K` decoder coefficients (shared, *one block per atom*) | β / inner Newton | Piece 1 (decoder) — we only hold references |
-//! | `t_{n, k}` on-atom coordinate (per row, per atom) | ψ / row-local | this module + Piece 1 |
-//! | `a_{n, ·}` soft atom assignment (per row) | ψ / row-local | **this module** |
+//! | `t_{n, k}` on-atom coordinate (per row, per atom) | ext-coord / row-local | this module + Piece 1 |
+//! | `a_{n, ·}` soft atom assignment (per row) | ext-coord / row-local | **this module** |
 //! | `λ_sp` sparsity strength, `λ_sm` smoothness, `α_kj` ARD | ρ / REML outer loop | Piece 4 (sparsity), Piece 1 (ARD) |
 //! | `K` atom count | discrete / `compare_models` | upstream wrapper |
 //!
 //! The Schur / arrow structure is preserved: each row's
-//! `ψ_n = (a_{n,·}, t_{n,1,·}, …, t_{n,K,·})` is block-diagonal across `n`,
+//! `ext_n = (a_{n,·}, t_{n,1,·}, …, t_{n,K,·})` is block-diagonal across `n`,
 //! coupled to the dense decoder border only through the *active subset*
 //! `S_n` (inactive atoms contribute zero through the gating
 //! `a_{n,k} = 0`). The math-audit caveat from `sae_manifold.md` §3.3 about
@@ -42,14 +42,14 @@
 //! coordinates of every atom:
 //!
 //! ```text
-//!   ψ_n  =  ( a_{n, 1..K}  ;  t_{n, 1, ·}  ;  …  ;  t_{n, K, ·} )
+//!   ext_n  =  ( a_{n, 1..K}  ;  t_{n, 1, ·}  ;  …  ;  t_{n, K, ·} )
 //!         ∈  ℝ^{K + Σ_k d_k}.
 //! ```
 //!
 //! So the local-block dimension is
 //!
 //! ```text
-//!   dim(ψ_n)  =  K  +  Σ_{k=1..K} d_k,
+//!   dim(ext_n)  =  K  +  Σ_{k=1..K} d_k,
 //! ```
 //!
 //! and the local Hessian block is `(K + Σ_k d_k) × (K + Σ_k d_k)`,
@@ -69,7 +69,7 @@
 //! Hessian) and `proposals/arrow_schur_evidence.md` (Schur + evidence) land,
 //! the stacking recipe extends mechanically: the `(K, K)` assignment block
 //! (from this module — see [`AtomSelectionStrategy::row_hessian_block`])
-//! sits on the diagonal corner of `ψ_n`; the `K` per-atom `(d_k, d_k)`
+//! sits on the diagonal corner of `ext_n`; the `K` per-atom `(d_k, d_k)`
 //! coordinate blocks tile the rest of the diagonal; and the off-diagonal
 //! `(a_{n,k}, t_{n,k,·})` couplings are populated from Piece 1's
 //! basis-derivative jet `∂Φ_k/∂t` evaluated against `B_k` (the chain rule
@@ -263,7 +263,7 @@ impl AtomLibrary {
         self.atoms.iter()
     }
 
-    /// Total intrinsic-dimension count `Σ_k d_k`. The per-row ψ-block has
+    /// Total intrinsic-dimension count `Σ_k d_k`. The per-row ext-coordinate block has
     /// size `K + Σ_k d_k` (assignment plus per-atom coord).
     pub fn total_intrinsic_dim(&self) -> usize {
         self.atoms.iter().map(|a| a.intrinsic_dim()).sum()
@@ -280,9 +280,9 @@ impl AtomLibrary {
 
     /// Compute the data-fit residual for row `n`, given externally-provided
     /// decoder evaluations `decoder_outputs[k] = g_k(t_{n,k}) ∈ ℝ^p` and
-    /// observation `z_n ∈ ℝ^p`.
+    /// observation `Z_n ∈ ℝ^p`.
     ///
-    /// Returns `z_n − Σ_{k ∈ S_n} a_{n,k} · g_k(t_{n,k})`.
+    /// Returns `Z_n − Σ_{k ∈ S_n} a_{n,k} · g_k(t_{n,k})`.
     ///
     /// This is the per-row residual that the row-local Schur solve consumes.
     /// The function is decoder-agnostic (the caller supplies the `g_k`
@@ -298,14 +298,14 @@ impl AtomLibrary {
     pub fn row_block_residual(
         &self,
         n: usize,
-        z_n: ArrayView1<'_, f64>,
+        obs_n: ArrayView1<'_, f64>,
         code: &SparseAtomCode,
         decoder_outputs: &[ArrayView1<'_, f64>],
     ) -> Array1<f64> {
         debug_assert_eq!(decoder_outputs.len(), self.k_atoms());
         debug_assert!(n < self.n_obs);
-        let p = z_n.len();
-        let mut r = z_n.to_owned();
+        let p = obs_n.len();
+        let mut r = obs_n.to_owned();
         for k in code.active_mask.iter_ones() {
             debug_assert_eq!(decoder_outputs[k].len(), p);
             let w = code.weights[k];
@@ -343,12 +343,12 @@ pub fn reconstruct_row(
     z
 }
 
-/// Gradient of the row-`n` quadratic data fit `½ ‖z_n − Ẑ_n‖²` with respect
+/// Gradient of the row-`n` quadratic data fit `½ ‖Z_n − Ẑ_n‖²` with respect
 /// to the assignment vector `a_{n, ·}`.
 ///
 /// From `sae_manifold.md` §3.3:
 /// ```text
-///   ∂ℒ_data / ∂a_{n,k}  =  −(z_n − Ẑ_n)ᵀ  g_k(t_{n,k}).
+///   ∂ℒ_data / ∂a_{n,k}  =  −(Z_n − Ẑ_n)ᵀ  g_k(t_{n,k}).
 /// ```
 ///
 /// The returned vector has length `K`. Inactive coordinates also get filled

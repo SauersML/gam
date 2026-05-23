@@ -94,15 +94,22 @@
 //! §7 and `proposals/composition_engine.md` §7 first.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
+use std::sync::Arc;
 
-use crate::terms::analytic_penalties::{
-    AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier,
-};
+use crate::terms::analytic_penalties::{AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier};
 
 const DIRECT_SOLVE_MAX_K: usize = 2_000;
 const DEFAULT_PCG_MAX_ITERATIONS: usize = 200;
 const DEFAULT_PCG_RELATIVE_TOLERANCE: f64 = 1e-4;
 const DEFAULT_TRUST_REGION_RADIUS: f64 = f64::INFINITY;
+
+/// Matrix-free shared-block multiply for large BA/SAE Schur PCG.
+///
+/// The closure writes `out = H_ββ x` without the LM ridge. This is the hook
+/// that lets SAE-manifold scale callers avoid materializing a dense `K × K`
+/// shared block before Agarwal-style inexact Schur PCG.
+pub type SharedBetaMatvec =
+    Arc<dyn for<'a> Fn(ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync>;
 
 /// BA Schur solve variant for the reduced shared `β` system.
 ///
@@ -275,12 +282,7 @@ pub trait BatchedBlockSolver {
     fn sqrt_solve_block_matrix(&self, factor: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64>;
 
     /// Subtract a row-local Schur product from the dense reduced system.
-    fn block_gemm_subtract(
-        &self,
-        schur: &mut Array2<f64>,
-        left: &Array2<f64>,
-        right: &Array2<f64>,
-    );
+    fn block_gemm_subtract(&self, schur: &mut Array2<f64>, left: &Array2<f64>, right: &Array2<f64>);
 }
 
 /// Current CPU implementation of the BA batched block interface.
@@ -304,10 +306,12 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
             for a in 0..d {
                 block[[a, a]] += ridge_t;
             }
-            out.push(cholesky_lower(&block).map_err(|e| ArrowSchurError::PerRowFactorFailed {
-                row: out.len(),
-                reason: e,
-            })?);
+            out.push(
+                cholesky_lower(&block).map_err(|e| ArrowSchurError::PerRowFactorFailed {
+                    row: out.len(),
+                    reason: e,
+                })?,
+            );
         }
         Ok(out)
     }
@@ -377,8 +381,11 @@ impl ArrowRowBlock {
 /// Bordered (t, β) Newton system with arrow structure.
 ///
 /// The β-block is held as a dense `K × K` Hessian `H_ββ` plus a `K`-length
-/// gradient `g_β` (matching the existing PIRLS β-only convention). The
-/// t-block is a `Vec<ArrowRowBlock>` of length `N`.
+/// gradient `g_β` for direct BA modes. Large-scale inexact BA callers may
+/// additionally install a matrix-free `H_ββ x` operator and diagonal via
+/// [`ArrowSchurSystem::set_shared_beta_operator`]; the InexactPCG mode then
+/// avoids dense Schur formation/factorization.
+/// The t-block is a `Vec<ArrowRowBlock>` of length `N`.
 ///
 /// Construction is the driver's responsibility: the driver
 ///
@@ -395,8 +402,18 @@ impl ArrowRowBlock {
 pub struct ArrowSchurSystem {
     /// Per-row latent block (length `N`, each row `d × d` / `d × K` / `d`).
     pub rows: Vec<ArrowRowBlock>,
-    /// `H_ββ`, shape `(K, K)`.
+    /// `H_ββ`, shape `(K, K)` for direct BA modes; empty when constructed
+    /// by [`ArrowSchurSystem::new_matrix_free_shared`] for PCG-only use.
     pub hbb: Array2<f64>,
+    /// Optional matrix-free `H_ββ x` operator for large BA Schur PCG.
+    ///
+    /// Direct and Square-Root BA modes still require `hbb`; InexactPCG uses
+    /// this operator when present, avoiding dense shared-block storage for
+    /// SAE-manifold scale `K`.
+    pub hbb_matvec: Option<SharedBetaMatvec>,
+    /// Optional diagonal of the matrix-free shared block, used by the
+    /// Schur-Jacobi preconditioner in the Agarwal-style PCG path.
+    pub hbb_diag: Option<Array1<f64>>,
     /// `g_β`, shape `(K,)`.
     pub gb: Array1<f64>,
     /// Latent dimensionality `d`.
@@ -413,6 +430,38 @@ impl ArrowSchurSystem {
         Self {
             rows,
             hbb: Array2::<f64>::zeros((k, k)),
+            hbb_matvec: None,
+            hbb_diag: None,
+            gb: Array1::<f64>::zeros(k),
+            d,
+            k,
+        }
+    }
+
+    /// Allocate an arrow system whose shared `H_ββ` block is supplied only as
+    /// a matrix-free operator for large BA InexactPCG.
+    ///
+    /// Direct and Square-Root BA modes require dense `hbb` and must not be
+    /// used with this constructor. The row-local `H_tβ` slabs remain explicit;
+    /// a future MegBA backend can replace those slab operations behind
+    /// [`BatchedBlockSolver`].
+    pub fn new_matrix_free_shared<F>(
+        n: usize,
+        d: usize,
+        k: usize,
+        matvec: F,
+        diag: Array1<f64>,
+    ) -> Self
+    where
+        F: for<'a> Fn(ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync + 'static,
+    {
+        debug_assert_eq!(diag.len(), k);
+        let rows = (0..n).map(|_| ArrowRowBlock::new(d, k)).collect();
+        Self {
+            rows,
+            hbb: Array2::<f64>::zeros((0, 0)),
+            hbb_matvec: Some(Arc::new(matvec)),
+            hbb_diag: Some(diag),
             gb: Array1::<f64>::zeros(k),
             d,
             k,
@@ -422,6 +471,21 @@ impl ArrowSchurSystem {
     /// Number of BA point/latent rows `N`.
     pub fn n(&self) -> usize {
         self.rows.len()
+    }
+
+    /// Install a matrix-free shared-block operator for Agarwal-style
+    /// inexact Schur PCG.
+    ///
+    /// `diag` must be the diagonal of the same `H_ββ` operator and is used
+    /// for the Schur-Jacobi preconditioner. This is the BA "large camera
+    /// system" path mapped to large decoder coefficient blocks.
+    pub fn set_shared_beta_operator<F>(&mut self, matvec: F, diag: Array1<f64>)
+    where
+        F: for<'a> Fn(ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync + 'static,
+    {
+        debug_assert_eq!(diag.len(), self.k);
+        self.hbb_matvec = Some(Arc::new(matvec));
+        self.hbb_diag = Some(diag);
     }
 
     /// Fold analytic-penalty contributions into the appropriate blocks.
@@ -541,12 +605,20 @@ impl ArrowSchurSystem {
         if let Some(diag) = penalty.hessian_diag(target_beta, rho_local) {
             debug_assert_eq!(diag.len(), k);
             for j in 0..k {
-                self.hbb[[j, j]] += diag[j];
+                if self.hbb.dim() == (k, k) {
+                    self.hbb[[j, j]] += diag[j];
+                }
+                if let Some(hbb_diag) = self.hbb_diag.as_mut() {
+                    hbb_diag[j] += diag[j];
+                }
             }
             return;
         }
 
         // Dense Hessian: probe with unit β-vectors.
+        if self.hbb.dim() != (k, k) {
+            return;
+        }
         let mut probe = Array1::<f64>::zeros(k);
         for j in 0..k {
             probe.fill(0.0);
@@ -742,11 +814,11 @@ pub fn solve_arrow_newton_step_with_options(
     // 3. Solve reduced shared system using the selected BA mode.
     let (delta_beta, schur_factor) = match options.mode {
         ArrowSolverMode::Direct => {
-            let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, &backend);
+            let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, &backend)?;
             solve_dense_reduced_system(&schur, &rhs_beta, options)?
         }
         ArrowSolverMode::SqrtBA => {
-            let schur = build_dense_schur_sqrt_ba(sys, &htt_factors, ridge_beta, &backend);
+            let schur = build_dense_schur_sqrt_ba(sys, &htt_factors, ridge_beta, &backend)?;
             solve_dense_reduced_system(&schur, &rhs_beta, options)?
         }
         ArrowSolverMode::InexactPCG => {
@@ -827,8 +899,13 @@ fn build_dense_schur_direct<B: BatchedBlockSolver>(
     htt_factors: &[Array2<f64>],
     ridge_beta: f64,
     backend: &B,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, ArrowSchurError> {
     let k = sys.k;
+    if sys.hbb.dim() != (k, k) {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: "Direct BA requires a dense K×K shared H_ββ block".to_string(),
+        });
+    }
     let mut schur = sys.hbb.clone();
     for j in 0..k {
         schur[[j, j]] += ridge_beta;
@@ -838,7 +915,7 @@ fn build_dense_schur_direct<B: BatchedBlockSolver>(
         backend.block_gemm_subtract(&mut schur, &row.htbeta, &solved);
     }
     symmetrize_upper_from_lower(&mut schur);
-    schur
+    Ok(schur)
 }
 
 fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver>(
@@ -846,8 +923,14 @@ fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver>(
     htt_factors: &[Array2<f64>],
     ridge_beta: f64,
     backend: &B,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, ArrowSchurError> {
     let k = sys.k;
+    if sys.hbb.dim() != (k, k) {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: "Square-Root BA direct solve requires a dense K×K shared H_ββ block"
+                .to_string(),
+        });
+    }
     let mut schur = sys.hbb.clone();
     for j in 0..k {
         schur[[j, j]] += ridge_beta;
@@ -859,7 +942,7 @@ fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver>(
         backend.block_gemm_subtract(&mut schur, &whitened, &whitened);
     }
     symmetrize_upper_from_lower(&mut schur);
-    schur
+    Ok(schur)
 }
 
 fn solve_dense_reduced_system(
@@ -905,12 +988,19 @@ fn schur_matvec<B: BatchedBlockSolver>(
 ) {
     let k = sys.k;
     let d = sys.d;
-    for a in 0..k {
-        let mut acc = ridge_beta * x[a];
-        for b in 0..k {
-            acc += sys.hbb[[a, b]] * x[b];
+    if let Some(hbb_matvec) = sys.hbb_matvec.as_ref() {
+        hbb_matvec(x.view(), out);
+        for a in 0..k {
+            out[a] += ridge_beta * x[a];
         }
-        out[a] = acc;
+    } else {
+        for a in 0..k {
+            let mut acc = ridge_beta * x[a];
+            for b in 0..k {
+                acc += sys.hbb[[a, b]] * x[b];
+            }
+            out[a] = acc;
+        }
     }
     let mut local = Array1::<f64>::zeros(d);
     for (i, row) in sys.rows.iter().enumerate() {
@@ -955,7 +1045,11 @@ impl JacobiPreconditioner {
         let d = sys.d;
         let mut diag = Array1::<f64>::zeros(k);
         for a in 0..k {
-            diag[a] = sys.hbb[[a, a]] + ridge_beta;
+            let base = match sys.hbb_diag.as_ref() {
+                Some(hbb_diag) => hbb_diag[a],
+                None => sys.hbb[[a, a]],
+            };
+            diag[a] = base + ridge_beta;
         }
         let mut col = Array1::<f64>::zeros(d);
         for (i, row) in sys.rows.iter().enumerate() {
@@ -1016,7 +1110,8 @@ fn steihaug_pcg_reduced_system<B: BatchedBlockSolver>(
         |p, out| schur_matvec(sys, htt_factors, ridge_beta, p, out, backend),
         |r| preconditioner.apply(r),
         pcg.max_iterations.min(trust.max_iterations),
-        pcg.relative_tolerance.max(trust.steihaug_relative_tolerance),
+        pcg.relative_tolerance
+            .max(trust.steihaug_relative_tolerance),
         trust.radius,
     )
 }
@@ -1310,7 +1405,9 @@ fn lower_triangular_solve_matrix(l: &Array2<f64>, b: &Array2<f64>) -> Array2<f64
 /// The β block occupies entries `[0, K)`; the flat ψ block (per-row `t`
 /// row-major) occupies `[K, K + N·d)`. This matches the convention used
 /// by [`crate::terms::analytic_penalties::PsiSlice`] and by the existing
-/// `SpatialLogKappaCoords` extension to the outer ρ vector.
+/// `SpatialLogKappaCoords` extension to the outer ρ vector. BA analogue:
+/// export the reduced-camera-system shared step followed by point
+/// back-substitution increments.
 pub fn write_arrow_direction(
     delta_t: &Array1<f64>,
     delta_beta: &Array1<f64>,
@@ -1356,11 +1453,7 @@ mod tests {
         sys.rows[1].gt = array![-0.1_f64, 0.4];
 
         // β-block.
-        sys.hbb = array![
-            [4.0_f64, 0.2, 0.0],
-            [0.2, 5.0, 0.1],
-            [0.0, 0.1, 6.0],
-        ];
+        sys.hbb = array![[4.0_f64, 0.2, 0.0], [0.2, 5.0, 0.1], [0.0, 0.1, 6.0],];
         sys.gb = array![0.5_f64, -0.3, 0.2];
 
         let (delta_t, delta_beta) = sys.solve(0.0, 0.0).expect("arrow-schur solve");

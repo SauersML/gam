@@ -1328,8 +1328,9 @@ pub struct ArrowSchurInnerConfig {
     /// Returning `None` signals "fall back to the β-only path for this
     /// iteration" — useful for the seeding sweep before `t` has been
     /// initialized.
-    pub build:
-        std::sync::Arc<dyn Fn(&Array1<f64>) -> Option<crate::solver::arrow_schur::ArrowSchurSystem> + Send + Sync>,
+    pub build: std::sync::Arc<
+        dyn Fn(&Array1<f64>) -> Option<crate::solver::arrow_schur::ArrowSchurSystem> + Send + Sync,
+    >,
     /// BA Schur solve mode. `None` selects Direct for `K <= 2000` and
     /// InexactPCG above, following "Bundle Adjustment in the Large".
     pub solver_mode: Option<crate::solver::arrow_schur::ArrowSolverMode>,
@@ -5014,7 +5015,8 @@ where
                                 solve_options.mode = mode;
                             }
                             solve_options.trust_region.radius = arrow_cfg.trust_region_radius;
-                            match arrow_system.solve_with_options(0.0, loop_lambda, &solve_options) {
+                            match arrow_system.solve_with_options(0.0, loop_lambda, &solve_options)
+                            {
                                 Ok((delta_t, delta_beta)) => {
                                     // Apply latent increment immediately;
                                     // subsequent `model.update(&beta)`
@@ -10368,7 +10370,7 @@ pub fn latent_predict_and_apply_ift_warm_start(
     latent: &mut crate::terms::latent_coord::LatentCoordValues,
     max_row_delta: f64,
 ) -> (usize, bool) {
-    use crate::solver::persistent_warm_start::{ift_warm_start_latent, LatentIftOutcome};
+    use crate::solver::persistent_warm_start::{LatentIftOutcome, ift_warm_start_latent};
     match ift_warm_start_latent(cache, delta_beta, delta_gt) {
         LatentIftOutcome::Applied { delta_t } => {
             let clamped = latent_apply_ift_warm_start(latent, &delta_t, max_row_delta);
@@ -10670,7 +10672,13 @@ mod low_rank_weight_pirls_tests {
     fn xtwy_low_rank_matches_dense_reference() {
         let design = tiny_design();
         let d = array![1.0, 2.0, 0.5, 1.5, 0.8];
-        let u = array![[0.1, -0.2], [0.4, 0.3], [-0.1, 0.5], [0.2, 0.1], [0.0, -0.3]];
+        let u = array![
+            [0.1, -0.2],
+            [0.4, 0.3],
+            [-0.1, 0.5],
+            [0.2, 0.1],
+            [0.0, -0.3]
+        ];
         let v = array![[0.2, 0.1], [0.0, 0.4], [0.3, -0.2], [-0.1, 0.6], [0.5, 0.0]];
         let weight = LowRankWeight::new(d.view(), u.view(), v.view()).unwrap();
         let y = array![0.7, -1.2, 0.3, 0.9, -0.4];

@@ -24,14 +24,14 @@
 //!
 //! ## Per-point block locality (arrow structure)
 //!
-//! Each [`SparseAtomCode`] is the per-row ψ-block for observation `n`
+//! Each [`SparseAtomCode`] is the per-row ext-coordinate block for observation `n`
 //! restricted to the `K` atoms. Combined with the per-atom on-manifold
 //! coordinate `t_{n,k} ∈ ℝ^{d_k}` (held in
 //! [`crate::terms::atom_selection::AtomLibrary`]'s per-atom
-//! `LatentCoordValues`), the row-local ψ-vector is
+//! `LatentCoordValues`), the row-local ext-coordinate vector is
 //!
 //! ```text
-//!   ψ_n  =  ( a_{n,1..K}  ;  t_{n,1,·}  ;  …  ;  t_{n,K,·} )
+//!   ext_n  =  ( a_{n,1..K}  ;  t_{n,1,·}  ;  …  ;  t_{n,K,·} )
 //! ```
 //!
 //! whose interaction graph with the shared decoder coefficients `B_1..B_K`

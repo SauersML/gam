@@ -148,14 +148,16 @@ class SparsityPenalty:
     Alternatives: ``kind="hoyer"`` (scale-invariant; no diagonal HVP) and
     ``kind="log"`` (``log(1 + x²/δ²)``; aggressively sparsifying).
 
-    **When to use.** SAE codes on a β slice; soft atom amplitudes on a ψ
-    slice; any time the inductive bias is "this coefficient block should be
-    sparse" without giving up differentiability for an active-set solver.
+    **When to use.** SAE codes on a β slice; soft atom amplitudes on a
+    design-moving ext-coordinate slice; any time the inductive bias is
+    "this coefficient block should be sparse" without giving up
+    differentiability for an active-set solver.
 
     Parameters
     ----------
     target
-        The name of the β block (or ψ slice) to apply the penalty to.
+        The name of the β block (or ext-coordinate slice) to apply the
+        penalty to.
     kind
         ``"smooth_l1"`` (the default), ``"hoyer"``, or ``"log"``.
     strength
