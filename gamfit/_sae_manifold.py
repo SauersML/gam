@@ -13,8 +13,9 @@ Arrow-Schur row-block assembly for the same configuration.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Literal, Sequence
 
 import numpy as np
 
@@ -231,25 +232,22 @@ def _fit_fixed_k(
         raise ValueError("alpha must be positive, finite, or 'auto'")
 
     if assignment_prior == "ibp_map":
-        try:
-            return _fit_fixed_k_ibp_rust(
-                z,
-                k_atoms,
-                basis_specs,
-                dims,
-                lambda_sparse,
-                lambda_smooth,
-                alpha_value,
-                learnable_alpha,
-                tau,
-                logits,
-                coords,
-                gumbel_schedule,
-                max_iter=max_iter,
-                learning_rate=learning_rate,
-            )
-        except Exception:
-            pass
+        return _fit_fixed_k_ibp_rust(
+            z,
+            k_atoms,
+            basis_specs,
+            dims,
+            lambda_sparse,
+            lambda_smooth,
+            alpha_value,
+            learnable_alpha,
+            tau,
+            logits,
+            coords,
+            gumbel_schedule,
+            max_iter=max_iter,
+            learning_rate=learning_rate,
+        )
 
     effective_alpha = (
         alpha_value * lambda_sparse

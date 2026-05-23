@@ -5084,7 +5084,6 @@ fn sae_manifold_fit_ibp<'py>(
         .map(|&d| Array1::<f64>::zeros(d))
         .collect();
     let rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard);
-    let _ = term.analytic_penalty_descriptors();
     let loss = term
         .run_joint_fit_arrow_schur(
             z_view,
