@@ -102,7 +102,7 @@ use crate::terms::analytic_penalties::{
 const DIRECT_SOLVE_MAX_K: usize = 2_000;
 const DEFAULT_PCG_MAX_ITERATIONS: usize = 200;
 const DEFAULT_PCG_RELATIVE_TOLERANCE: f64 = 1e-4;
-const DEFAULT_TRUST_REGION_RADIUS: f64 = 1.0;
+const DEFAULT_TRUST_REGION_RADIUS: f64 = f64::INFINITY;
 
 /// BA Schur solve variant for the reduced shared `β` system.
 ///
@@ -363,6 +363,8 @@ pub struct ArrowRowBlock {
 }
 
 impl ArrowRowBlock {
+    /// Allocate one BA point-block row: local latent Hessian, point-camera
+    /// cross block, and point gradient.
     pub fn new(d: usize, k: usize) -> Self {
         Self {
             htt: Array2::<f64>::zeros((d, d)),
@@ -404,7 +406,8 @@ pub struct ArrowSchurSystem {
 }
 
 impl ArrowSchurSystem {
-    /// Allocate an empty arrow system sized `(N rows × d, K)`.
+    /// Allocate an empty BA reduced-camera-system instance sized
+    /// `(N point/latent rows × d, K shared decoder parameters)`.
     pub fn new(n: usize, d: usize, k: usize) -> Self {
         let rows = (0..n).map(|_| ArrowRowBlock::new(d, k)).collect();
         Self {
@@ -416,12 +419,16 @@ impl ArrowSchurSystem {
         }
     }
 
-    /// Number of rows `N`.
+    /// Number of BA point/latent rows `N`.
     pub fn n(&self) -> usize {
         self.rows.len()
     }
 
     /// Fold analytic-penalty contributions into the appropriate blocks.
+    ///
+    /// BA source mapping: these are extra prior/regularization normal-equation
+    /// terms before point elimination, the same place Ceres/g2o attach robust
+    /// priors or gauge-fixing constraints.
     ///
     /// **Composition path.** Each registered [`AnalyticPenaltyKind`] is
     /// queried for `grad_target` (added to `g_t` or `g_β`) and then for
@@ -637,7 +644,8 @@ impl ArrowFactorCache {
     ///
     /// IFT first-order predictor for the latent field under a
     /// shape-coefficient perturbation `Δβ`. See
-    /// `proposals/latent_coord.md` §2.2.
+    /// `proposals/latent_coord.md` §2.2. BA analogue: back-substitution after
+    /// reduced-camera-system solve.
     pub fn predict_delta_t_from_delta_beta(&self, delta_beta: ArrayView1<'_, f64>) -> Array1<f64> {
         let n = self.htt_factors.len();
         let d = self.d;
@@ -665,7 +673,8 @@ impl ArrowFactorCache {
     ///
     /// IFT first-order predictor for the latent field under a
     /// per-row gradient perturbation (typically `∂g_t/∂ρ · Δρ`
-    /// resolved externally by the driver).
+    /// resolved externally by the driver). BA analogue: reuse point-block
+    /// factors for local point updates after shared parameters move.
     pub fn predict_delta_t_from_delta_gt(&self, delta_gt: ArrayView1<'_, f64>) -> Array1<f64> {
         let n = self.htt_factors.len();
         let d = self.d;
@@ -695,7 +704,8 @@ impl ArrowFactorCache {
 /// `ridge_t` and `ridge_beta` are nonnegative diagonal regularizers added
 /// to the latent and β blocks respectively before factorization — used by
 /// the LM damping outer wrapper to recover from near-singular inner steps.
-/// Pass `0.0` for both to obtain the unregularized Newton direction.
+/// Pass `0.0` for both to obtain the unregularized Newton direction. The
+/// default mode selection follows Agarwal et al.'s dense-vs-inexact BA split.
 pub fn solve_arrow_newton_step(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
@@ -789,6 +799,381 @@ pub fn solve_arrow_newton_step_with_options(
     Ok((delta_t, delta_beta, cache))
 }
 
+fn reduced_rhs_beta<B: BatchedBlockSolver>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &[Array2<f64>],
+    backend: &B,
+) -> Array1<f64> {
+    let k = sys.k;
+    let mut rhs_beta = Array1::<f64>::zeros(k);
+    for (i, row) in sys.rows.iter().enumerate() {
+        let v = backend.solve_block_vector(&htt_factors[i], &row.gt);
+        for a in 0..k {
+            let mut acc = 0.0;
+            for c in 0..sys.d {
+                acc += row.htbeta[[c, a]] * v[c];
+            }
+            rhs_beta[a] += acc;
+        }
+    }
+    for j in 0..k {
+        rhs_beta[j] -= sys.gb[j];
+    }
+    rhs_beta
+}
+
+fn build_dense_schur_direct<B: BatchedBlockSolver>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &[Array2<f64>],
+    ridge_beta: f64,
+    backend: &B,
+) -> Array2<f64> {
+    let k = sys.k;
+    let mut schur = sys.hbb.clone();
+    for j in 0..k {
+        schur[[j, j]] += ridge_beta;
+    }
+    for (i, row) in sys.rows.iter().enumerate() {
+        let solved = backend.solve_block_matrix(&htt_factors[i], &row.htbeta);
+        backend.block_gemm_subtract(&mut schur, &row.htbeta, &solved);
+    }
+    symmetrize_upper_from_lower(&mut schur);
+    schur
+}
+
+fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &[Array2<f64>],
+    ridge_beta: f64,
+    backend: &B,
+) -> Array2<f64> {
+    let k = sys.k;
+    let mut schur = sys.hbb.clone();
+    for j in 0..k {
+        schur[[j, j]] += ridge_beta;
+    }
+    for (i, row) in sys.rows.iter().enumerate() {
+        // Square-Root BA: H_tβ^T H_tt^-1 H_tβ =
+        // (L^-1 H_tβ)^T (L^-1 H_tβ), where H_tt = L L^T.
+        let whitened = backend.sqrt_solve_block_matrix(&htt_factors[i], &row.htbeta);
+        backend.block_gemm_subtract(&mut schur, &whitened, &whitened);
+    }
+    symmetrize_upper_from_lower(&mut schur);
+    schur
+}
+
+fn solve_dense_reduced_system(
+    schur: &Array2<f64>,
+    rhs_beta: &Array1<f64>,
+    options: &ArrowSolveOptions,
+) -> Result<(Array1<f64>, Option<Array2<f64>>), ArrowSchurError> {
+    let factor =
+        cholesky_lower(schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
+    let direct = chol_solve_vector(&factor, rhs_beta);
+    if step_inside_trust_region(direct.view(), options.trust_region.radius) {
+        return Ok((direct, Some(factor)));
+    }
+
+    // Ceres-style trust-region correction: once the dense BA solve proposes a
+    // step outside the trust ball, Steihaug-CG returns the boundary point
+    // without requiring a second dense factorization.
+    let identity = IdentityPreconditioner;
+    let delta = steihaug_dense_system(
+        schur,
+        rhs_beta,
+        &identity,
+        &ArrowPcgOptions {
+            max_iterations: options.trust_region.max_iterations,
+            relative_tolerance: options.trust_region.steihaug_relative_tolerance,
+        },
+        &options.trust_region,
+    )?;
+    Ok((delta, Some(factor)))
+}
+
+fn step_inside_trust_region(step: ArrayView1<'_, f64>, radius: f64) -> bool {
+    !radius.is_finite() || array_l2_norm(step) <= radius
+}
+
+fn schur_matvec<B: BatchedBlockSolver>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &[Array2<f64>],
+    ridge_beta: f64,
+    x: &Array1<f64>,
+    out: &mut Array1<f64>,
+    backend: &B,
+) {
+    let k = sys.k;
+    let d = sys.d;
+    for a in 0..k {
+        let mut acc = ridge_beta * x[a];
+        for b in 0..k {
+            acc += sys.hbb[[a, b]] * x[b];
+        }
+        out[a] = acc;
+    }
+    let mut local = Array1::<f64>::zeros(d);
+    for (i, row) in sys.rows.iter().enumerate() {
+        for c in 0..d {
+            let mut acc = 0.0;
+            for a in 0..k {
+                acc += row.htbeta[[c, a]] * x[a];
+            }
+            local[c] = acc;
+        }
+        let solved = backend.solve_block_vector(&htt_factors[i], &local);
+        for a in 0..k {
+            let mut acc = 0.0;
+            for c in 0..d {
+                acc += row.htbeta[[c, a]] * solved[c];
+            }
+            out[a] -= acc;
+        }
+    }
+}
+
+/// Jacobi Schur preconditioner for BA's inexact reduced-system PCG.
+///
+/// This is the block-diagonal Schur preconditioner specialized to scalar
+/// decoder coefficients. When coefficient blocking metadata lands, this type
+/// is the replacement point for Ceres-style block-Jacobi or cluster-Jacobi.
+#[derive(Debug, Clone)]
+pub struct JacobiPreconditioner {
+    inverse_diag: Array1<f64>,
+}
+
+impl JacobiPreconditioner {
+    /// Build `diag(S)^-1` without materializing the dense Schur complement,
+    /// following the Schur-Jacobi preconditioner used by large BA PCG.
+    pub fn from_arrow_schur<B: BatchedBlockSolver>(
+        sys: &ArrowSchurSystem,
+        htt_factors: &[Array2<f64>],
+        ridge_beta: f64,
+        backend: &B,
+    ) -> Self {
+        let k = sys.k;
+        let d = sys.d;
+        let mut diag = Array1::<f64>::zeros(k);
+        for a in 0..k {
+            diag[a] = sys.hbb[[a, a]] + ridge_beta;
+        }
+        let mut col = Array1::<f64>::zeros(d);
+        for (i, row) in sys.rows.iter().enumerate() {
+            for a in 0..k {
+                for c in 0..d {
+                    col[c] = row.htbeta[[c, a]];
+                }
+                let solved = backend.solve_block_vector(&htt_factors[i], &col);
+                let mut acc = 0.0;
+                for c in 0..d {
+                    acc += col[c] * solved[c];
+                }
+                diag[a] -= acc;
+            }
+        }
+        let mut inverse_diag = Array1::<f64>::zeros(k);
+        for a in 0..k {
+            let v = diag[a];
+            inverse_diag[a] = if v.is_finite() && v.abs() > 1e-18 {
+                1.0 / v
+            } else {
+                1.0
+            };
+        }
+        Self { inverse_diag }
+    }
+
+    fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(r.len());
+        for i in 0..r.len() {
+            out[i] = self.inverse_diag[i] * r[i];
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IdentityPreconditioner;
+
+impl IdentityPreconditioner {
+    fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
+        r.clone()
+    }
+}
+
+fn steihaug_pcg_reduced_system<B: BatchedBlockSolver>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &[Array2<f64>],
+    ridge_beta: f64,
+    rhs: &Array1<f64>,
+    preconditioner: &JacobiPreconditioner,
+    pcg: &ArrowPcgOptions,
+    trust: &ArrowTrustRegionOptions,
+    backend: &B,
+) -> Result<Array1<f64>, ArrowSchurError> {
+    steihaug_cg(
+        rhs,
+        |p, out| schur_matvec(sys, htt_factors, ridge_beta, p, out, backend),
+        |r| preconditioner.apply(r),
+        pcg.max_iterations.min(trust.max_iterations),
+        pcg.relative_tolerance.max(trust.steihaug_relative_tolerance),
+        trust.radius,
+    )
+}
+
+fn steihaug_dense_system(
+    schur: &Array2<f64>,
+    rhs: &Array1<f64>,
+    preconditioner: &IdentityPreconditioner,
+    pcg: &ArrowPcgOptions,
+    trust: &ArrowTrustRegionOptions,
+) -> Result<Array1<f64>, ArrowSchurError> {
+    steihaug_cg(
+        rhs,
+        |p, out| dense_matvec(schur, p, out),
+        |r| preconditioner.apply(r),
+        pcg.max_iterations,
+        pcg.relative_tolerance,
+        trust.radius,
+    )
+}
+
+fn steihaug_cg<MatVec, ApplyPrec>(
+    rhs: &Array1<f64>,
+    mut matvec: MatVec,
+    mut apply_preconditioner: ApplyPrec,
+    max_iterations: usize,
+    relative_tolerance: f64,
+    trust_radius: f64,
+) -> Result<Array1<f64>, ArrowSchurError>
+where
+    MatVec: FnMut(&Array1<f64>, &mut Array1<f64>),
+    ApplyPrec: FnMut(&Array1<f64>) -> Array1<f64>,
+{
+    let n = rhs.len();
+    let radius = if trust_radius.is_finite() && trust_radius > 0.0 {
+        trust_radius
+    } else {
+        f64::INFINITY
+    };
+    let rhs_norm = array_l2_norm(rhs.view());
+    if rhs_norm == 0.0 {
+        return Ok(Array1::<f64>::zeros(n));
+    }
+    let tol = relative_tolerance.max(0.0) * rhs_norm;
+    let mut x = Array1::<f64>::zeros(n);
+    let mut r = rhs.clone();
+    let mut z = apply_preconditioner(&r);
+    let mut p = z.clone();
+    let mut rz = dot(&r, &z);
+    if rz <= 0.0 || !rz.is_finite() {
+        if radius.is_finite() {
+            return Ok(step_to_trust_boundary(&x, &r, radius));
+        }
+        return Err(ArrowSchurError::PcgFailed {
+            reason: "non-positive preconditioned residual in Schur PCG".to_string(),
+        });
+    }
+    if rz.sqrt() <= tol {
+        return Ok(x);
+    }
+    let mut ap = Array1::<f64>::zeros(n);
+    for _ in 0..max_iterations {
+        matvec(&p, &mut ap);
+        let pap = dot(&p, &ap);
+        if pap <= 0.0 || !pap.is_finite() {
+            if radius.is_finite() {
+                return Ok(step_to_trust_boundary(&x, &p, radius));
+            }
+            return Err(ArrowSchurError::PcgFailed {
+                reason: "negative curvature in unbounded Schur PCG".to_string(),
+            });
+        }
+        let alpha = rz / pap;
+        let mut candidate = x.clone();
+        for i in 0..n {
+            candidate[i] += alpha * p[i];
+        }
+        if radius.is_finite() && array_l2_norm(candidate.view()) >= radius {
+            return Ok(step_to_trust_boundary(&x, &p, radius));
+        }
+        x = candidate;
+        for i in 0..n {
+            r[i] -= alpha * ap[i];
+        }
+        if array_l2_norm(r.view()) <= tol {
+            return Ok(x);
+        }
+        z = apply_preconditioner(&r);
+        let rz_next = dot(&r, &z);
+        if rz_next <= 0.0 || !rz_next.is_finite() {
+            return Err(ArrowSchurError::PcgFailed {
+                reason: "non-positive or non-finite PCG residual".to_string(),
+            });
+        }
+        let beta = rz_next / rz;
+        for i in 0..n {
+            p[i] = z[i] + beta * p[i];
+        }
+        rz = rz_next;
+    }
+    Ok(x)
+}
+
+fn step_to_trust_boundary(x: &Array1<f64>, p: &Array1<f64>, radius: f64) -> Array1<f64> {
+    let pp = dot(p, p);
+    if pp == 0.0 {
+        return x.clone();
+    }
+    let xp = dot(x, p);
+    let xx = dot(x, x);
+    let disc = (xp * xp + pp * (radius * radius - xx)).max(0.0);
+    let tau = (-xp + disc.sqrt()) / pp;
+    let mut out = x.clone();
+    for i in 0..out.len() {
+        out[i] += tau * p[i];
+    }
+    out
+}
+
+fn dense_matvec(a: &Array2<f64>, x: &Array1<f64>, out: &mut Array1<f64>) {
+    let n = a.nrows();
+    for i in 0..n {
+        let mut acc = 0.0;
+        for j in 0..n {
+            acc += a[[i, j]] * x[j];
+        }
+        out[i] = acc;
+    }
+}
+
+fn dot(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+    let mut acc = 0.0;
+    for i in 0..a.len() {
+        acc += a[i] * b[i];
+    }
+    acc
+}
+
+fn array_l2_norm(v: ArrayView1<'_, f64>) -> f64 {
+    let mut acc = 0.0;
+    for x in v.iter() {
+        acc += x * x;
+    }
+    acc.sqrt()
+}
+
+fn symmetrize_upper_from_lower(a: &mut Array2<f64>) {
+    let n = a.nrows().min(a.ncols());
+    for i in 0..n {
+        for j in 0..i {
+            let v = 0.5 * (a[[i, j]] + a[[j, i]]);
+            a[[i, j]] = v;
+            a[[j, i]] = v;
+        }
+    }
+}
+
 /// Errors raised by [`ArrowSchurSystem::solve`].
 #[derive(Debug, Clone)]
 pub enum ArrowSchurError {
@@ -800,6 +1185,9 @@ pub enum ArrowSchurError {
     /// near-collinear decoder or a degenerate weighting; the LM outer
     /// wrapper should escalate `ridge_beta` and retry.
     SchurFactorFailed { reason: String },
+    /// The BA inexact-step PCG solve failed before producing a usable
+    /// Steihaug trust-region step.
+    PcgFailed { reason: String },
 }
 
 impl std::fmt::Display for ArrowSchurError {
@@ -811,6 +1199,9 @@ impl std::fmt::Display for ArrowSchurError {
             ),
             ArrowSchurError::SchurFactorFailed { reason } => {
                 write!(f, "arrow-Schur: Schur complement Cholesky failed: {reason}")
+            }
+            ArrowSchurError::PcgFailed { reason } => {
+                write!(f, "arrow-Schur: Schur PCG failed: {reason}")
             }
         }
     }
@@ -886,6 +1277,22 @@ fn chol_solve_matrix(l: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
         let x = chol_solve_vector(l, &col);
         for r in 0..n {
             out[[r, cidx]] = x[r];
+        }
+    }
+    out
+}
+
+fn lower_triangular_solve_matrix(l: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
+    let n = l.nrows();
+    let m = b.ncols();
+    let mut out = Array2::<f64>::zeros((n, m));
+    for cidx in 0..m {
+        for i in 0..n {
+            let mut sum = b[[i, cidx]];
+            for kk in 0..i {
+                sum -= l[[i, kk]] * out[[kk, cidx]];
+            }
+            out[[i, cidx]] = sum / l[[i, i]];
         }
     }
     out

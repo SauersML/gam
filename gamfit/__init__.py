@@ -50,6 +50,8 @@ from ._api import (
     gaussian_reml_fit_formula,
     gaussian_reml_fit_latent,
     gaussian_reml_fit_latent_backward,
+    glm_reml_fit_latent,
+    glm_reml_fit_latent_backward,
     gaussian_reml_fit_positions,
     gaussian_reml_fit_positions_backward,
     gaussian_reml_fit_positions_batched,
@@ -118,6 +120,7 @@ from ._sampling import (
     PosteriorSamples,
     SamplingConfig,
 )
+from ._sae_manifold import SaeManifoldAtomFit, SaeManifoldFitResult, sae_manifold_fit
 from ._schema import SchemaCheck, SchemaIssue
 from ._summary import Summary
 from ._validation import FormulaValidation
@@ -169,6 +172,8 @@ __all__ = [
     "ResponseGeometryModel",
     "RustExtensionUnavailableError",
     "SamplingConfig",
+    "SaeManifoldAtomFit",
+    "SaeManifoldFitResult",
     "SchemaCheck",
     "SchemaIssue",
     "SchemaMismatchError",
@@ -222,6 +227,8 @@ __all__ = [
     "gaussian_reml_fit_formula",
     "gaussian_reml_fit_latent",
     "gaussian_reml_fit_latent_backward",
+    "glm_reml_fit_latent",
+    "glm_reml_fit_latent_backward",
     "gaussian_reml_fit_positions",
     "gaussian_reml_fit_positions_backward",
     "gaussian_reml_fit_positions_batched",
@@ -238,5 +245,6 @@ __all__ = [
     "simplex_frechet_mean",
     "smoothness_penalty",
     "sphere_frechet_mean",
+    "sae_manifold_fit",
     "validate_formula",
 ]
