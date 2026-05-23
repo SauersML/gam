@@ -723,7 +723,21 @@ impl ArrowSchurSystem {
 #[derive(Debug, Clone)]
 pub struct ArrowFactorCache {
     /// Per-row lower-triangular Cholesky factors of `H_tt^(i) + ridge_t·I`.
+    ///
+    /// These are the *damped* factors used inside the Newton solve. The IFT
+    /// predictor must NOT use them — see [`Self::htt_factors_undamped`].
     pub htt_factors: Vec<Array2<f64>>,
+    /// Per-row lower-triangular Cholesky factors of the UNDAMPED
+    /// `H_tt^(i)` (no `ridge_t` added).
+    ///
+    /// The IFT predictor formula
+    /// `Δt_i = -(H_tt^(i))⁻¹ · (H_tβ^(i) Δβ + δg_t^(i))` is derived from
+    /// `∂g_t/∂t = H_tt` at the stationary point, with no LM damping term.
+    /// Reusing the damped factors would bias the predicted shift toward zero
+    /// in proportion to `ridge_t`. We pay one extra `O(N d³)` Cholesky per
+    /// Newton solve — the same complexity class as the Newton solve itself —
+    /// to make the IFT exact.
+    pub htt_factors_undamped: Vec<Array2<f64>>,
     /// Lower-triangular Cholesky factor of the Schur complement when the
     /// selected BA mode formed/factored dense RCS. `None` for
     /// [`ArrowSolverMode::InexactPCG`], where Agarwal-style inexact LM avoids
@@ -756,7 +770,7 @@ impl ArrowFactorCache {
     /// `proposals/latent_coord.md` §2.2. BA analogue: back-substitution after
     /// reduced-camera-system solve.
     pub fn predict_delta_t_from_delta_beta(&self, delta_beta: ArrayView1<'_, f64>) -> Array1<f64> {
-        let n = self.htt_factors.len();
+        let n = self.htt_factors_undamped.len();
         let d = self.d;
         let k = self.k;
         debug_assert_eq!(delta_beta.len(), k);
@@ -770,7 +784,8 @@ impl ArrowFactorCache {
                 }
                 rhs[c] = acc;
             }
-            let v = chol_solve_vector(&self.htt_factors[i], &rhs);
+            // Use UNDAMPED factor: IFT inverts H_tt, not H_tt + ridge_t·I.
+            let v = chol_solve_vector(&self.htt_factors_undamped[i], &rhs);
             for c in 0..d {
                 out[i * d + c] = -v[c];
             }
@@ -785,7 +800,7 @@ impl ArrowFactorCache {
     /// resolved externally by the driver). BA analogue: reuse point-block
     /// factors for local point updates after shared parameters move.
     pub fn predict_delta_t_from_delta_gt(&self, delta_gt: ArrayView1<'_, f64>) -> Array1<f64> {
-        let n = self.htt_factors.len();
+        let n = self.htt_factors_undamped.len();
         let d = self.d;
         debug_assert_eq!(delta_gt.len(), n * d);
         let mut out = Array1::<f64>::zeros(n * d);
@@ -794,7 +809,8 @@ impl ArrowFactorCache {
             for c in 0..d {
                 rhs[c] = delta_gt[i * d + c];
             }
-            let v = chol_solve_vector(&self.htt_factors[i], &rhs);
+            // Use UNDAMPED factor: IFT inverts H_tt, not H_tt + ridge_t·I.
+            let v = chol_solve_vector(&self.htt_factors_undamped[i], &rhs);
             for c in 0..d {
                 out[i * d + c] = -v[c];
             }
@@ -895,8 +911,18 @@ pub fn solve_arrow_newton_step_with_options(
     // Snapshot per-row cross-blocks so the IFT predictor can apply
     // the β-coupled sensitivity without re-running the assembler.
     let htbeta: Vec<Array2<f64>> = sys.rows.iter().map(|r| r.htbeta.clone()).collect();
+    // Factor the UNDAMPED per-row blocks for the IFT predictor. When
+    // ridge_t was zero the damped and undamped factors coincide and we
+    // can reuse htt_factors directly; otherwise pay a second per-row
+    // Cholesky (O(N d³), same complexity class as the Newton solve).
+    let htt_factors_undamped: Vec<Array2<f64>> = if ridge_t == 0.0 {
+        htt_factors.clone()
+    } else {
+        backend.factor_blocks(&sys.rows, 0.0, d)?
+    };
     let cache = ArrowFactorCache {
         htt_factors,
+        htt_factors_undamped,
         schur_factor,
         solver_mode: options.mode,
         ridge_t,
