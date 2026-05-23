@@ -47,9 +47,10 @@ pub enum ScheduleKind {
 /// Outer-state temperature annealing for SAE assignment relaxations.
 ///
 /// Annealing drives the continuous concrete/softmax assignment toward the
-/// discrete argmax or IBP active-set solution while PIRLS keeps solving smooth
-/// subproblems at each positive temperature. Once `tau` reaches its floor, the
-/// remaining iterations optimize the corresponding near-discrete MAP problem.
+/// discrete argmax or IBP active-set solution while PIRLS solves smooth
+/// positive-temperature subproblems. In the zero-floor limit, softmax becomes
+/// argmax and the IBP-MAP sigmoid active set becomes exact; a positive
+/// `tau_min` optimizes the corresponding near-discrete MAP problem.
 #[derive(Debug, Clone)]
 pub struct GumbelTemperatureSchedule {
     pub tau_start: f64,
@@ -605,11 +606,7 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
-    pub fn clear_temperature_schedule(&mut self) {
-        self.temperature_schedule = None;
-    }
-
-    pub fn advance_temperature_schedule(&mut self) -> Result<Option<f64>, String> {
+    fn advance_temperature_schedule(&mut self) -> Result<Option<f64>, String> {
         let Some(schedule) = self.temperature_schedule.as_mut() else {
             return Ok(None);
         };
@@ -819,7 +816,8 @@ impl SaeManifoldTerm {
         let beta_offsets = self.beta_offsets();
         let coord_offsets = self.assignment.coord_offsets();
         let lambda_smooth = rho.lambda_smooth();
-        let (assignment_grad, assignment_hdiag) = assignment_prior_grad_hdiag(&self.assignment, rho)?;
+        let (assignment_grad, assignment_hdiag) =
+            assignment_prior_grad_hdiag(&self.assignment, rho)?;
         let mut sys = ArrowSchurSystem::new(n, q, beta_dim);
 
         // Decoder smoothness penalty in the beta block.
@@ -1167,7 +1165,8 @@ fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f
             temperature,
             sparsity,
         } => {
-            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
+            let penalty =
+                SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
             let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
             penalty.value(target.view(), rho_view.view())
         }
@@ -1177,7 +1176,12 @@ fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f
             learnable_alpha,
         } => {
             let penalty =
-                IBPAssignmentPenalty::new(assignment.k_atoms(), alpha, temperature, learnable_alpha);
+                IBPAssignmentPenalty::new(
+                    assignment.k_atoms(),
+                    alpha,
+                    temperature,
+                    learnable_alpha,
+                );
             let rho_view = if learnable_alpha {
                 Array1::from_vec(vec![rho.log_lambda_sparse])
             } else {
@@ -1198,7 +1202,8 @@ fn assignment_prior_grad_hdiag(
             temperature,
             sparsity,
         } => {
-            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
+            let penalty =
+                SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
             let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
             let grad = penalty.grad_target(target.view(), rho_view.view());
             let diag = penalty
@@ -1212,7 +1217,12 @@ fn assignment_prior_grad_hdiag(
             learnable_alpha,
         } => {
             let penalty =
-                IBPAssignmentPenalty::new(assignment.k_atoms(), alpha, temperature, learnable_alpha);
+                IBPAssignmentPenalty::new(
+                    assignment.k_atoms(),
+                    alpha,
+                    temperature,
+                    learnable_alpha,
+                );
             let rho_view = if learnable_alpha {
                 Array1::from_vec(vec![rho.log_lambda_sparse])
             } else {

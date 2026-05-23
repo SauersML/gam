@@ -12,6 +12,10 @@ pub enum NoiseModel {
         sigma: Array1<f64>,
     },
     Poisson,
+    Tweedie {
+        p: f64,
+        phi: f64,
+    },
     NegativeBinomial {
         theta: f64,
     },
@@ -90,6 +94,67 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
                 })?;
                 let draw = rand_distr::Distribution::sample(&dist, rng);
                 y[i] = draw;
+            }
+            Ok(y)
+        }
+        NoiseModel::Tweedie { p, phi } => {
+            if !(p.is_finite() && *p >= 1.0 && *p <= 2.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "invalid Tweedie power p: {p}"
+                )));
+            }
+            if !(phi.is_finite() && *phi > 0.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "invalid Tweedie dispersion phi: {phi}"
+                )));
+            }
+            let mut y = Array1::<f64>::zeros(spec.mean.len());
+            if (*p - 1.0).abs() <= 1.0e-12 {
+                for i in 0..y.len() {
+                    let lam = (spec.mean[i] / *phi).max(1e-12);
+                    let dist = rand_distr::Poisson::new(lam).map_err(|e| {
+                        EstimationError::InvalidInput(format!("invalid Tweedie-Poisson rate {lam}: {e}"))
+                    })?;
+                    y[i] = *phi * rand_distr::Distribution::sample(&dist, rng);
+                }
+                return Ok(y);
+            }
+            if (*p - 2.0).abs() <= 1.0e-12 {
+                let shape = (1.0 / *phi).max(1e-12);
+                for i in 0..y.len() {
+                    let mu = spec.mean[i].max(1e-12);
+                    let scale = (mu * *phi).max(1e-12);
+                    let dist = rand_distr::Gamma::new(shape, scale).map_err(|e| {
+                        EstimationError::InvalidInput(format!(
+                            "invalid Tweedie-Gamma params shape={shape} scale={scale}: {e}"
+                        ))
+                    })?;
+                    y[i] = rand_distr::Distribution::sample(&dist, rng);
+                }
+                return Ok(y);
+            }
+            let alpha = (2.0 - *p) / (*p - 1.0);
+            for i in 0..y.len() {
+                let mu = spec.mean[i].max(1e-12);
+                let lambda = (mu.powf(2.0 - *p) / (*phi * (2.0 - *p))).max(1e-12);
+                let scale = (*phi * (*p - 1.0) * mu.powf(*p - 1.0)).max(1e-12);
+                let count_dist = rand_distr::Poisson::new(lambda).map_err(|e| {
+                    EstimationError::InvalidInput(format!(
+                        "invalid Tweedie compound-Poisson rate {lambda}: {e}"
+                    ))
+                })?;
+                let count = rand_distr::Distribution::sample(&count_dist, rng) as usize;
+                if count == 0 {
+                    continue;
+                }
+                let jump_dist = rand_distr::Gamma::new(alpha, scale).map_err(|e| {
+                    EstimationError::InvalidInput(format!(
+                        "invalid Tweedie jump params shape={alpha} scale={scale}: {e}"
+                    ))
+                })?;
+                y[i] = (0..count)
+                    .map(|_| rand_distr::Distribution::sample(&jump_dist, rng))
+                    .sum();
             }
             Ok(y)
         }
