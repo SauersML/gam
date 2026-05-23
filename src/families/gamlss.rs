@@ -5587,8 +5587,7 @@ struct GaussianLocationScaleJointPsiWorkspace<F: GaussianLocationScaleJointPsiFa
     /// row-linear in them, the resulting ψ score and ψ Hessian remain
     /// unbiased estimators of the full-data quantities. Built by
     /// `CustomFamily::exact_newton_joint_psi_workspace_with_options`.
-    outer_score_subsample:
-        Option<Arc<crate::families::marginal_slope_shared::OuterScoreSubsample>>,
+    outer_score_subsample: Option<Arc<crate::families::marginal_slope_shared::OuterScoreSubsample>>,
 }
 
 impl<F: GaussianLocationScaleJointPsiFamily> GaussianLocationScaleJointPsiWorkspace<F> {
@@ -7381,10 +7380,8 @@ impl GaussianLocationScaleFamily {
         let etamu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
-        let mut weights_i =
-            gaussian_joint_psi_firstweights(&rows, &dir_i.zmu_psi, &dir_i.z_ls_psi);
-        let mut weights_j =
-            gaussian_joint_psi_firstweights(&rows, &dir_j.zmu_psi, &dir_j.z_ls_psi);
+        let mut weights_i = gaussian_joint_psi_firstweights(&rows, &dir_i.zmu_psi, &dir_i.z_ls_psi);
+        let mut weights_j = gaussian_joint_psi_firstweights(&rows, &dir_j.zmu_psi, &dir_j.z_ls_psi);
         let mut secondweights = gaussian_joint_psisecondweights(
             &rows,
             &dir_i.zmu_psi,
@@ -16679,9 +16676,8 @@ impl CustomFamily for BinomialLocationScaleFamily {
                         })?;
                         jet.mu
                     };
-                    let term = binomial_location_scale_log_likelihood(
-                        self.y[i], wi, q, link_kind, mu,
-                    )?;
+                    let term =
+                        binomial_location_scale_log_likelihood(self.y[i], wi, q, link_kind, mu)?;
                     Ok(acc + row.weight * term)
                 },
             )
@@ -20605,9 +20601,8 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
                         })?;
                         jet.mu
                     };
-                    let term = binomial_location_scale_log_likelihood(
-                        self.y[i], wi, q, link_kind, mu,
-                    )?;
+                    let term =
+                        binomial_location_scale_log_likelihood(self.y[i], wi, q, link_kind, mu)?;
                     Ok(acc + row.weight * term)
                 },
             )

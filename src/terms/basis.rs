@@ -19472,12 +19472,8 @@ fn build_duchon_basis_mixed_periodicity(
                 let x_row = data.row(i);
                 for j in 0..k_centers {
                     let c_row = centers_owned.row(j);
-                    let r = duchon_mixed_periodicity_distance(
-                        x_row,
-                        c_row,
-                        periodic_per_axis,
-                        periods,
-                    );
+                    let r =
+                        duchon_mixed_periodicity_distance(x_row, c_row, periodic_per_axis, periods);
                     out_row[j] = ppc.eval(r);
                 }
             }
@@ -19518,11 +19514,8 @@ fn build_duchon_basis_mixed_periodicity(
         "mixed-periodicity Duchon",
     )?;
     let (design, primary) = if let Some(transform) = identifiability_transform.as_ref() {
-        let design = wrap_dense_design_with_transform(
-            base_design,
-            transform,
-            "mixed-periodicity Duchon",
-        )?;
+        let design =
+            wrap_dense_design_with_transform(base_design, transform, "mixed-periodicity Duchon")?;
         let transformed = fast_ab(&fast_atb(transform, &penalty), transform);
         (design, transformed)
     } else {

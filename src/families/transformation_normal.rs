@@ -1352,10 +1352,7 @@ impl TransformationNormalFamily {
     /// build at the same β so they must not alias). The subsample hash is
     /// computed over `m` so that two distinct masks at the same β never
     /// share a cache entry.
-    fn with_outer_subsample(
-        &self,
-        mask: &Array1<f64>,
-    ) -> Result<Self, TransformationNormalError> {
+    fn with_outer_subsample(&self, mask: &Array1<f64>) -> Result<Self, TransformationNormalError> {
         let n = self.weights.len();
         if mask.len() != n {
             return Err(TransformationNormalError::InvalidInput {
