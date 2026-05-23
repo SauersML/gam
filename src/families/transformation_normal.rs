@@ -15419,7 +15419,7 @@ pub fn fit_transformation_normal(
                 &exact_options,
                 warm_start.as_ref(),
                 0,
-                0.0,
+                None,
                 true,
             )
             .map_err(|e| format!("transformation fit_fn: {e}"))?;
