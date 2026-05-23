@@ -23,14 +23,11 @@ use crate::terms::latent_coord::LatentCoordValues;
 use crate::terms::smooth::TermCollectionDesign;
 
 const DEFAULT_LATENT_CACHE_CAPACITY: usize = 4;
-const DEFAULT_RELATIVE_L2_TOLERANCE: f64 = 1e-12;
 
 /// O(N) identity summary for a flat latent-coordinate vector.
 #[derive(Clone, Debug)]
 pub(crate) struct LatentFingerprint {
     pub(crate) hash: u64,
-    pub(crate) max_coordinate_norm: f64,
-    pub(crate) l2_norm: f64,
     pub(crate) len: usize,
     pub(crate) iteration: u64,
 }
@@ -38,19 +35,12 @@ pub(crate) struct LatentFingerprint {
 impl LatentFingerprint {
     pub(crate) fn from_flat(flat: &[f64], iteration: u64) -> Self {
         let mut hasher = DefaultHasher::new();
-        let mut max_coordinate_norm = 0.0_f64;
-        let mut l2 = 0.0_f64;
         flat.len().hash(&mut hasher);
         for &value in flat {
-            let normalized = if value == 0.0 { 0.0 } else { value };
-            normalized.to_bits().hash(&mut hasher);
-            max_coordinate_norm = max_coordinate_norm.max(value.abs());
-            l2 += value * value;
+            value.to_bits().hash(&mut hasher);
         }
         Self {
             hash: hasher.finish(),
-            max_coordinate_norm,
-            l2_norm: l2.sqrt(),
             len: flat.len(),
             iteration,
         }
@@ -150,7 +140,6 @@ impl BasisDerivativeJets {
 pub(crate) struct CachedDesign {
     pub(crate) id: u64,
     pub(crate) fingerprint: LatentFingerprint,
-    pub(crate) latent_flat: Arc<[f64]>,
     pub(crate) basis_signature: u64,
     pub(crate) design: TermCollectionDesign,
     pub(crate) hyper_dirs: Vec<DirectionalHyperParam>,
@@ -171,7 +160,6 @@ pub(crate) struct LatentDesignLookup<'a> {
 pub(crate) struct LatentDesignCache {
     entries: Vec<CachedDesign>,
     capacity: usize,
-    relative_l2_tolerance: f64,
     clock: u64,
     iteration: u64,
     next_entry_id: u64,
@@ -188,7 +176,6 @@ impl LatentDesignCache {
         Self {
             entries: Vec::new(),
             capacity: capacity.max(1),
-            relative_l2_tolerance: DEFAULT_RELATIVE_L2_TOLERANCE,
             clock: 0,
             iteration: 0,
             next_entry_id: 0,
@@ -197,6 +184,12 @@ impl LatentDesignCache {
 
     pub(crate) fn invalidate(&mut self) {
         self.entries.clear();
+    }
+
+    pub(crate) fn invalidate_all(&mut self) {
+        self.entries.clear();
+        self.clock = self.clock.wrapping_add(1);
+        self.iteration = self.iteration.wrapping_add(1);
     }
 
     pub(crate) fn lookup_or_compute<F>(
@@ -216,7 +209,7 @@ impl LatentDesignCache {
             .expect("LatentCoordValues flat storage must be contiguous");
         let fingerprint = LatentFingerprint::from_flat(flat_slice, self.iteration);
         let basis_signature = basis_kind.signature();
-        if let Some(index) = self.find_entry(flat_slice, &fingerprint, basis_signature) {
+        if let Some(index) = self.find_entry(&fingerprint, basis_signature) {
             self.entries[index].last_used = self.clock;
             return Ok(LatentDesignLookup {
                 cached: &self.entries[index],
@@ -232,7 +225,6 @@ impl LatentDesignCache {
         let entry = CachedDesign {
             id,
             fingerprint,
-            latent_flat: Arc::from(flat.to_vec()),
             basis_signature,
             design: computed.design,
             hyper_dirs: computed.hyper_dirs,
@@ -254,23 +246,13 @@ impl LatentDesignCache {
 
     fn find_entry(
         &mut self,
-        flat: &[f64],
         fingerprint: &LatentFingerprint,
         basis_signature: u64,
     ) -> Option<usize> {
         self.entries.iter().position(|entry| {
             entry.basis_signature == basis_signature
                 && entry.fingerprint.len == fingerprint.len
-                && (entry.fingerprint.hash == fingerprint.hash
-                    || relative_l2(
-                        flat,
-                        &entry.latent_flat,
-                        entry
-                            .fingerprint
-                            .l2_norm
-                            .max(entry.fingerprint.max_coordinate_norm),
-                    )
-                        <= self.relative_l2_tolerance)
+                && entry.fingerprint.hash == fingerprint.hash
         })
     }
 
@@ -323,22 +305,6 @@ impl CachedDesign {
                 .map_or(0, |values| values.len())
             + usize::from(self.basis_derivative_jets.operator_resident)
     }
-}
-
-fn relative_l2(current: &[f64], cached: &[f64], cached_norm: f64) -> f64 {
-    if current.len() != cached.len() {
-        return f64::INFINITY;
-    }
-    let diff = current
-        .iter()
-        .zip(cached.iter())
-        .map(|(&a, &b)| {
-            let d = a - b;
-            d * d
-        })
-        .sum::<f64>()
-        .sqrt();
-    diff / cached_norm.max(1.0)
 }
 
 fn build_radial_distances(

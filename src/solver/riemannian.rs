@@ -712,6 +712,7 @@ impl Default for RiemannianNewtonStep {
 ///      or the step exceeds the trust radius, fall back to a scaled
 ///      negative-gradient (Cauchy point) step.
 ///   4. Retract `point + ξ` back to the manifold.
+#[allow(dead_code)] // INTEGRATION-HOOK(piece-1): consumed by arrow_schur when manifold != Euclidean.
 pub(crate) fn riemannian_newton_step_on_point(
     manifold: &dyn Manifold,
     point: ArrayView1<f64>,
@@ -869,6 +870,7 @@ pub(crate) fn riemannian_newton_step_on_point(
 /// given ridge and bumps geometrically until the Cholesky factor succeeds.
 /// Returns `-(H + λI)⁻¹ g`; on hard failure returns the (truncated) gradient
 /// step `-g / ‖g‖`.
+#[allow(dead_code)] // INTEGRATION-HOOK(piece-1): helper for riemannian_newton_step_on_point.
 fn solve_symmetric_tikhonov(h: &Array2<f64>, g: &Array1<f64>) -> Array1<f64> {
     let n = g.len();
     debug_assert_eq!(h.shape(), &[n, n]);
@@ -913,6 +915,7 @@ fn solve_symmetric_tikhonov(h: &Array2<f64>, g: &Array1<f64>) -> Array1<f64> {
 
 /// Dense lower-triangular Cholesky `L` with `L Lᵀ = A`, returning `None` if
 /// `A` is not numerically PD.
+#[allow(dead_code)] // INTEGRATION-HOOK(piece-1): used by solve_symmetric_tikhonov.
 fn cholesky_lower(a: &Array2<f64>) -> Option<Array2<f64>> {
     let n = a.nrows();
     if a.ncols() != n {
@@ -938,6 +941,7 @@ fn cholesky_lower(a: &Array2<f64>) -> Option<Array2<f64>> {
     Some(l)
 }
 
+#[allow(dead_code)] // INTEGRATION-HOOK(piece-1): used by solve_symmetric_tikhonov.
 fn chol_solve_inplace(l: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
     let n = rhs.len();
     let mut y = Array1::<f64>::zeros(n);
