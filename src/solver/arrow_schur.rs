@@ -53,7 +53,8 @@
 //! penalty contributions to `H_tt` are themselves row-block-diagonal
 //! (true for [`crate::terms::analytic_penalties::ARDPenalty`] — diagonal —
 //! and for [`crate::terms::analytic_penalties::IsometryPenalty`] in its
-//! Gauss–Newton approximation — per-row `d × d` blocks via `J_n^T J_n`).
+//! metric-residual Gauss–Newton form — per-row `d × d` blocks through
+//! `∂(J_n^T W_n J_n)/∂t_n`).
 //!
 //! **Out of scope (do not confuse).** The REML *outer-loop* gradient of
 //! `log|H|` with respect to `t` carries a shared `Schur⁻¹` factor; only
@@ -154,14 +155,14 @@ impl ArrowSchurSystem {
     /// Fold analytic-penalty contributions into the appropriate blocks.
     ///
     /// **Composition path.** Each registered [`AnalyticPenaltyKind`] is
-    /// queried for `grad_target` (added to `g_t` or `g_β`) and for
-    /// `hvp` against the canonical basis vectors restricted to the per-row
-    /// `d`-block (when `tier == Psi`) or against `β` (when `tier ==
+    /// queried for `grad_target` (added to `g_t` or `g_β`) and then for
+    /// `hessian_diag` first. Diagonal penalties (ARD and the shipped
+    /// sparsity kernels) are injected directly. Dense penalties fall back to
+    /// `hvp` probes against the canonical basis vectors restricted to the
+    /// per-row `d`-block (when `tier == Psi`) or against `β` (when `tier ==
     /// Beta`). The Psi-tier contributions land on the per-row `H_tt^(i)`
-    /// **only** — we rely on the analytic-penalty contract that the
-    /// Psi-tier Hessian is block-diagonal across rows (true for ARD,
-    /// true for the Gauss–Newton form of Isometry; checked at runtime via
-    /// `hessian_diag` for the cheap diagonal case).
+    /// **only** — we rely on the analytic-penalty contract that Psi-tier
+    /// penalties are row-block-diagonal in their Hessian.
     ///
     /// `target_psi` is the full flat ψ vector (row-major, `N·d` entries)
     /// at the current iterate; `target_beta` is the current `β`. `rho`
@@ -209,7 +210,19 @@ impl ArrowSchurSystem {
                 self.rows[i].gt[a] += grad[i * d + a];
             }
         }
-        // Hessian: probe via HVP against each unit-`d`-vector for each row.
+        // Hessian: inject diagonal penalties directly. This avoids O(d)
+        // full-length HVP probes for ARD/sparsity on the Psi tier.
+        if let Some(diag) = penalty.hessian_diag(target_psi, rho_local) {
+            debug_assert_eq!(diag.len(), n * d);
+            for i in 0..n {
+                for a in 0..d {
+                    self.rows[i].htt[[a, a]] += diag[i * d + a];
+                }
+            }
+            return;
+        }
+
+        // Dense Hessian: probe via HVP against each unit-`d`-vector for each row.
         // For block-diagonal-across-rows penalties (ARD, Isometry GN-form)
         // this yields the exact per-row `d × d` block. For penalties that
         // would couple rows the off-row entries are silently dropped — a
@@ -246,10 +259,18 @@ impl ArrowSchurSystem {
         for j in 0..k {
             self.gb[j] += grad[j];
         }
-        // Hessian: probe with unit β-vectors. K may be large (~100K for
-        // production SAE), so this is `O(K²)` worst-case. For diagonal
-        // sparsity penalties prefer `hessian_diag` directly to avoid the
-        // K matvecs.
+        // Hessian: inject diagonal penalties directly. K may be large
+        // (~100K for production SAE), so this is the hot path for β-tier
+        // sparsity/ARD-style penalties.
+        if let Some(diag) = penalty.hessian_diag(target_beta, rho_local) {
+            debug_assert_eq!(diag.len(), k);
+            for j in 0..k {
+                self.hbb[[j, j]] += diag[j];
+            }
+            return;
+        }
+
+        // Dense Hessian: probe with unit β-vectors.
         let mut probe = Array1::<f64>::zeros(k);
         for j in 0..k {
             probe.fill(0.0);
