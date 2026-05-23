@@ -47,7 +47,7 @@
 //!
 //! `IsometryToReference` is deferred to a follow-up (see proposal §4(b)).
 
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, s};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2};
 
 /// Choice of auxiliary-prior conditional mean estimator `ĥ(u)`.
 ///
@@ -431,7 +431,6 @@ fn solve_spd(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Result<Array2<f6
             out[[i, col]] = sum / l[[i, i]];
         }
     }
-    let _ = s![..]; // silence unused-import lint when ndarray::s isn't otherwise used
     Ok(out)
 }
 
