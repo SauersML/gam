@@ -397,6 +397,86 @@ impl LatentCoordValues {
         }
         grad_t
     }
+
+    /// Streaming contraction for radial-kernel input-location derivatives.
+    ///
+    /// This computes the same result as
+    /// `contract_gradient(grad_phi, design_gradient_wrt_t(...))`, but never
+    /// materializes the dense `(n_obs, n_centers, latent_dim)` jet. Peak
+    /// storage is therefore `O(n_obs * n_centers + n_obs * latent_dim)` when
+    /// the caller already has the scalar radial derivative matrix, instead of
+    /// `O(n_obs * n_centers * latent_dim)`.
+    pub fn contract_gradient_radial_streaming(
+        &self,
+        grad_phi: ArrayView2<'_, f64>,
+        kernel_first_derivative: ArrayView2<'_, f64>,
+        centers: ArrayView2<'_, f64>,
+    ) -> Array1<f64> {
+        let n_obs = self.n_obs;
+        let d = self.latent_dim;
+        let n_centers = centers.nrows();
+        debug_assert_eq!(centers.ncols(), d);
+        debug_assert_eq!(grad_phi.shape(), &[n_obs, n_centers]);
+        debug_assert_eq!(kernel_first_derivative.shape(), &[n_obs, n_centers]);
+        let mut grad_t = Array1::<f64>::zeros(n_obs * d);
+        for n in 0..n_obs {
+            self.contract_row_radial_gradient_into(
+                n,
+                grad_phi.row(n),
+                kernel_first_derivative.row(n),
+                centers,
+                &mut grad_t,
+                1.0,
+            );
+        }
+        grad_t
+    }
+
+    /// Streaming row contraction for one radial-kernel latent row.
+    ///
+    /// `grad_phi_row[k]` is the downstream adjoint for `Φ[n,k]`, and
+    /// `kernel_first_derivative_row[k]` is `φ'(r_{n,k})`. The contribution is
+    /// accumulated into `grad_t[n, :]` with an optional scalar multiplier.
+    pub fn contract_row_radial_gradient_into(
+        &self,
+        n: usize,
+        grad_phi_row: ArrayView1<'_, f64>,
+        kernel_first_derivative_row: ArrayView1<'_, f64>,
+        centers: ArrayView2<'_, f64>,
+        grad_t: &mut Array1<f64>,
+        scale: f64,
+    ) {
+        let d = self.latent_dim;
+        let n_centers = centers.nrows();
+        debug_assert!(n < self.n_obs);
+        debug_assert_eq!(centers.ncols(), d);
+        debug_assert_eq!(grad_phi_row.len(), n_centers);
+        debug_assert_eq!(kernel_first_derivative_row.len(), n_centers);
+        debug_assert_eq!(grad_t.len(), self.values.len());
+        if scale == 0.0 {
+            return;
+        }
+        let t_n = self.row(n);
+        for k in 0..n_centers {
+            let weight = grad_phi_row[k] * kernel_first_derivative_row[k];
+            if weight == 0.0 {
+                continue;
+            }
+            let mut r2 = 0.0_f64;
+            for a in 0..d {
+                let delta = t_n[a] - centers[[k, a]];
+                r2 += delta * delta;
+            }
+            let r = r2.sqrt();
+            if r == 0.0 {
+                continue;
+            }
+            let row_scale = scale * weight / r;
+            for a in 0..d {
+                grad_t[n * d + a] += row_scale * (t_n[a] - centers[[k, a]]);
+            }
+        }
+    }
 }
 
 /// Auxiliary-prior penalty contribution: returns the per-row reference

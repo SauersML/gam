@@ -5,8 +5,8 @@ use gam::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeFitResult, DeviationRuntime, LatentMeasureKind,
 };
 use gam::estimate::{
-    BlockRole, EstimationError, saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit,
-    saved_sas_state_from_fit,
+    BlockRole, EstimationError, ExternalOptimOptions, saved_latent_cloglog_state_from_fit,
+    saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
 use gam::faer_ndarray::{
     FaerCholesky, FaerEigh, array2_to_matmut, factorize_symmetricwith_fallback, fast_xt_diag_x,
@@ -62,7 +62,8 @@ use gam::terms::latent_coord::{
     AuxPriorFamily, InputLocationDerivative, LatentCoordValues, LatentIdMode, aux_prior_targets,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
-use gam::types::{InverseLink, LikelihoodFamily, LinkFunction};
+use gam::terms::smooth::BlockwisePenalty;
+use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
 use numpy::{
@@ -409,6 +410,8 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "gaussian_reml_fit_positions_batched_backward",
             "gaussian_reml_fit_latent",
             "gaussian_reml_fit_latent_backward",
+            "glm_reml_fit_latent",
+            "glm_reml_fit_latent_backward",
             "arrow_schur_newton_step",
             "gaussian_reml_fit_formula_table",
             "gaussian_reml_fit_with_constraints_forward",
@@ -1276,6 +1279,7 @@ fn gaussian_reml_fit<'py>(
     grad_edf = 0.0,
     forward_state = None,
     weights = None,
+    fisher_W = None,
     init_lambda = None,
     by = None,
     by_start_col = 0
@@ -1292,6 +1296,7 @@ fn gaussian_reml_fit_backward<'py>(
     grad_edf: f64,
     forward_state: Option<&Bound<'py, PyDict>>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
+    fisher_w: Option<PyReadonlyArray3<'py, f64>>,
     init_lambda: Option<f64>,
     by: Option<PyReadonlyArray1<'py, f64>>,
     by_start_col: usize,
@@ -3503,6 +3508,36 @@ fn gaussian_reml_weight_vector_local(
     }
 }
 
+fn latent_scalar_weights_with_fisher(
+    n_obs: usize,
+    weights: Option<ArrayView1<'_, f64>>,
+    fisher_w: Option<ArrayView3<'_, f64>>,
+) -> Result<Option<Array1<f64>>, String> {
+    let Some(fw) = fisher_w else {
+        return Ok(weights.map(|w| w.to_owned()));
+    };
+    if fw.shape() != [n_obs, 1, 1] {
+        return Err(format!(
+            "fisher_W currently accepts scalar blocks of shape ({n_obs}, 1, 1) on this latent entry point; got {:?}",
+            fw.shape()
+        ));
+    }
+    let mut out = match weights {
+        Some(w) => gaussian_reml_weight_vector_local(n_obs, Some(w))?,
+        None => Array1::ones(n_obs),
+    };
+    for n in 0..n_obs {
+        let v = fw[[n, 0, 0]];
+        if !(v.is_finite() && v >= 0.0) {
+            return Err(format!(
+                "fisher_W[{n},0,0] must be finite and non-negative; got {v}"
+            ));
+        }
+        out[n] *= v;
+    }
+    Ok(Some(out))
+}
+
 fn latent_augmented_hessian_factor(
     design: ArrayView2<'_, f64>,
     penalty: ArrayView2<'_, f64>,
@@ -3751,6 +3786,7 @@ fn gaussian_reml_fit_latent_impl(
     penalty,
     m = 2,
     weights = None,
+    fisher_W = None,
     init_lambda = None,
     aux_u = None,
     aux_family = "ridge".to_string(),
@@ -3768,6 +3804,7 @@ fn gaussian_reml_fit_latent<'py>(
     penalty: PyReadonlyArray2<'py, f64>,
     m: usize,
     weights: Option<PyReadonlyArray1<'py, f64>>,
+    fisher_w: Option<PyReadonlyArray3<'py, f64>>,
     init_lambda: Option<f64>,
     aux_u: Option<PyReadonlyArray2<'py, f64>>,
     aux_family: String,
@@ -3783,6 +3820,12 @@ fn gaussian_reml_fit_latent<'py>(
             )));
         }
     };
+    let effective_weights = latent_scalar_weights_with_fisher(
+        n_obs,
+        weights.as_ref().map(|w| w.as_array()),
+        fisher_w.as_ref().map(|w| w.as_array()),
+    )
+    .map_err(py_value_error)?;
     let (fit, _design) = gaussian_reml_fit_latent_impl(
         t.as_array(),
         y.as_array(),
@@ -3791,7 +3834,7 @@ fn gaussian_reml_fit_latent<'py>(
         centers.as_array(),
         m,
         penalty.as_array(),
-        weights.as_ref().map(|w| w.as_array()),
+        effective_weights.as_ref().map(|w| w.view()),
         init_lambda,
         aux_u.as_ref().map(|a| a.as_array()),
         family,
@@ -3890,7 +3933,13 @@ fn gaussian_reml_fit_latent_backward<'py>(
     let t_view = t.as_array();
     let y_view = y.as_array();
     let penalty_view = penalty.as_array();
-    let weights_view = weights.as_ref().map(|w| w.as_array());
+    let effective_weights = latent_scalar_weights_with_fisher(
+        n_obs,
+        weights.as_ref().map(|w| w.as_array()),
+        fisher_w.as_ref().map(|w| w.as_array()),
+    )
+    .map_err(py_value_error)?;
+    let weights_view = effective_weights.as_ref().map(|w| w.view());
 
     // Forward design (Φ) and t-matrix for the radial gradient.
     let (design, t_mat) =
