@@ -3793,6 +3793,24 @@ impl<'a> RemlState<'a> {
         Ok(bundle)
     }
 
+    /// Fixes audit answer C for design-moving ext-coords: when the realized
+    /// design has been rebuilt from a full outer vector `(rho, psi/z)`, the
+    /// PIRLS bundle cache key must include those ext-coords rather than rho
+    /// alone.
+    pub(crate) fn obtain_eval_bundle_for_outer_theta(
+        &self,
+        rho: &Array1<f64>,
+        theta: &Array1<f64>,
+    ) -> Result<EvalShared, EstimationError> {
+        let key = self.rhokey_sanitized(theta);
+        if let Some(existing) = self.cache_manager.cached_eval_bundle(&key) {
+            return Ok(existing.clone());
+        }
+        let bundle = self.prepare_eval_bundlewithkey(rho, key)?;
+        self.cache_manager.store_eval_bundle(bundle.clone());
+        Ok(bundle)
+    }
+
     pub(crate) fn objective_innerhessian(
         &self,
         rho: &Array1<f64>,
@@ -8104,11 +8122,16 @@ impl<'a> RemlState<'a> {
     pub fn evaluate_unified_with_psi_ext(
         &self,
         rho: &Array1<f64>,
+        cache_theta: Option<&Array1<f64>>,
         mode: super::unified::EvalMode,
         hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
     ) -> Result<super::unified::RemlLamlResult, EstimationError> {
         let t0 = std::time::Instant::now();
-        let bundle = self.obtain_eval_bundle(rho)?;
+        let bundle = if let Some(theta) = cache_theta {
+            self.obtain_eval_bundle_for_outer_theta(rho, theta)?
+        } else {
+            self.obtain_eval_bundle(rho)?
+        };
         let pirls_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
         let t1 = std::time::Instant::now();
