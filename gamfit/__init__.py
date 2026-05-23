@@ -64,6 +64,7 @@ from ._api import (
     validate_formula,
 )
 from ._binding import RustExtensionUnavailableError
+from ._compare import compare_models
 from ._diagnostics import Diagnostics
 from .smooth import (
     BSpline,
@@ -165,6 +166,7 @@ __all__ = [
     "bspline_basis_derivative",
     "closure",
     "clr",
+    "compare_models",
     "competing_risks_cif",
     "cross_fit_shared_precision_groups",
     "cuda_diagnostics",

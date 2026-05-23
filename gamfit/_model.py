@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -2073,6 +2074,48 @@ class Model:
         if not isinstance(value, list):
             return ()
         return tuple(dict(item) for item in value if isinstance(item, dict))
+
+    @property
+    def evidence(self) -> float:
+        """REML / LAML log marginal-likelihood score for this fit.
+
+        Alias for ``summary()["reml_score"]``. This is the same scalar the
+        outer REML loop maximizes to select smoothing parameters; because the
+        LAML approximation already folds in the ``log|H| − log|S|_+`` Occam
+        factors, differences between two fits' ``evidence`` are log Bayes
+        factors with model-complexity already penalised. Use
+        :func:`gamfit.compare_models` to rank multiple fits, or
+        :meth:`bayes_factor_vs` for a pairwise comparison.
+        """
+        value = self.summary().get("reml_score")
+        if value is None:
+            raise ValueError("saved model payload is missing reml_score")
+        return float(value)
+
+    def bayes_factor_vs(self, other: "Model") -> float:
+        """Bayes factor of this fit against ``other``.
+
+        Returns ``exp(self.evidence - other.evidence)``. A value greater than
+        one means this fit is favoured; less than one means ``other`` is. For
+        large differences the result may overflow — use ``self.evidence -
+        other.evidence`` directly on the log scale in that case.
+
+        Parameters
+        ----------
+        other : Model
+            Competing fit, typically on the same response with a different
+            basis topology or penalty structure.
+
+        Examples
+        --------
+        >>> circle.bayes_factor_vs(torus)
+        1234.5
+        """
+        if not isinstance(other, Model):
+            raise TypeError(
+                f"bayes_factor_vs expects a gamfit.Model, got {type(other).__name__}"
+            )
+        return math.exp(self.evidence - other.evidence)
 
     def _model_class_from_payload(self) -> str:
         value = self._saved_payload_string("model_kind")
