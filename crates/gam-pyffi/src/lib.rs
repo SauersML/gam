@@ -72,7 +72,6 @@ use gam::transformation_normal::TransformationNormalFitResult;
 use gam::terms::{
     ARDPenalty, AnalyticPenaltyRegistry, IBPAssignmentPenalty, IsometryPenalty,
     OrthogonalityPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty, SparsityPenalty,
-    SparsityKind,
 };
 use gam::terms::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
@@ -4738,6 +4737,7 @@ fn gaussian_reml_fit_latent_impl(
     aux_family = "ridge".to_string(),
     aux_strength = None,
     dim_selection_log_precision = None,
+    analytic_penalties = None,
     basis_kind = "duchon".to_string(),
     tensor_knots_concat = None,
     tensor_knot_offsets = None,
@@ -4760,11 +4760,18 @@ fn gaussian_reml_fit_latent<'py>(
     aux_family: String,
     aux_strength: Option<f64>,
     dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
+    analytic_penalties: Option<serde_json::Value>,
     basis_kind: String,
     tensor_knots_concat: Option<PyReadonlyArray1<'py, f64>>,
     tensor_knot_offsets: Option<Vec<usize>>,
     tensor_degrees: Option<Vec<usize>>,
 ) -> PyResult<Py<PyDict>> {
+    let latent_payload = serde_json::json!({"t": {"name": "t", "n": n_obs, "d": latent_dim}});
+    let _registry = build_analytic_penalty_registry_from_json(
+        Some(&latent_payload),
+        analytic_penalties.as_ref(),
+    )
+    .map_err(py_value_error)?;
     let family = match aux_family.to_ascii_lowercase().as_str() {
         "ridge" => AuxPriorFamily::Ridge,
         "linear" => AuxPriorFamily::Linear,
@@ -5614,6 +5621,7 @@ fn set_ok_glm_latent_items<'py>(
     aux_family = "ridge".to_string(),
     aux_strength = None,
     dim_selection_log_precision = None,
+    analytic_penalties = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn glm_reml_fit_latent<'py>(
@@ -5635,7 +5643,14 @@ fn glm_reml_fit_latent<'py>(
     aux_family: String,
     aux_strength: Option<f64>,
     dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
+    analytic_penalties: Option<serde_json::Value>,
 ) -> PyResult<Py<PyDict>> {
+    let latent_payload = serde_json::json!({"t": {"name": "t", "n": n_obs, "d": latent_dim}});
+    let _registry = build_analytic_penalty_registry_from_json(
+        Some(&latent_payload),
+        analytic_penalties.as_ref(),
+    )
+    .map_err(py_value_error)?;
     let family_name = family.clone();
     let family_normalized = family_name.to_ascii_lowercase().replace('_', "-");
     let aux_family = match aux_family.to_ascii_lowercase().as_str() {
@@ -8292,6 +8307,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_latent, module)?)?;
+    module.add_function(wrap_pyfunction!(register_analytic_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;
     module.add_function(wrap_pyfunction!(
         gaussian_reml_fit_latent_backward,
@@ -10042,6 +10058,253 @@ fn report_html_impl(model_bytes: &[u8]) -> Result<String, String> {
     render_html(&report_input)
 }
 
+#[derive(Clone)]
+struct LatentPenaltyTarget {
+    name: String,
+    n: usize,
+    d: usize,
+}
+
+fn latent_penalty_targets(
+    latents: Option<&serde_json::Value>,
+) -> Result<Vec<LatentPenaltyTarget>, String> {
+    let Some(raw) = latents.filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let map = raw
+        .as_object()
+        .ok_or_else(|| "latents must be a JSON object keyed by formula symbol".to_string())?;
+    let mut out = Vec::with_capacity(map.len());
+    for (key, raw_block) in map {
+        let obj = raw_block
+            .as_object()
+            .ok_or_else(|| format!("latents['{key}'] must be an object"))?;
+        let name = obj
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(key)
+            .to_string();
+        let n = obj
+            .get("n")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("latents['{key}'].n is required"))? as usize;
+        let d = obj
+            .get("d")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("latents['{key}'].d is required"))? as usize;
+        if n == 0 || d == 0 {
+            return Err(format!("latents['{key}'] requires positive n and d"));
+        }
+        out.push(LatentPenaltyTarget { name, n, d });
+    }
+    Ok(out)
+}
+
+fn penalty_target_for_descriptor<'a>(
+    targets: &'a [LatentPenaltyTarget],
+    descriptor: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<&'a LatentPenaltyTarget, String> {
+    let raw = descriptor
+        .get("target")
+        .ok_or_else(|| format!("{context}.target is required"))?;
+    if let Some(name) = raw.as_str() {
+        return targets
+            .iter()
+            .find(|target| target.name == name)
+            .ok_or_else(|| {
+                format!(
+                    "{context}.target references latent block {name:?}, but latents declares [{}]",
+                    targets
+                        .iter()
+                        .map(|target| target.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            });
+    }
+    if let Some(index) = raw.as_u64() {
+        return targets.get(index as usize).ok_or_else(|| {
+            format!(
+                "{context}.target references latent index {index}, but latents declares {} block(s)",
+                targets.len()
+            )
+        });
+    }
+    Err(format!("{context}.target must be a latent block name or index"))
+}
+
+fn descriptor_f64(
+    descriptor: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    default: f64,
+) -> Result<f64, String> {
+    let value = descriptor
+        .get(key)
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(default);
+    if !(value.is_finite() && value > 0.0) {
+        return Err(format!("analytic penalty {key} must be finite and > 0"));
+    }
+    Ok(value)
+}
+
+fn descriptor_usize(
+    descriptor: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    default: usize,
+) -> Result<usize, String> {
+    let value = descriptor
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(default as u64) as usize;
+    if value == 0 {
+        return Err(format!("analytic penalty {key} must be > 0"));
+    }
+    Ok(value)
+}
+
+fn build_analytic_penalty_registry_from_json(
+    latents: Option<&serde_json::Value>,
+    penalties: Option<&serde_json::Value>,
+) -> Result<AnalyticPenaltyRegistry, String> {
+    let mut registry = AnalyticPenaltyRegistry::new();
+    let Some(raw) = penalties.filter(|value| !value.is_null()) else {
+        return Ok(registry);
+    };
+    let items = raw
+        .as_array()
+        .ok_or_else(|| "penalties must be a list of analytic penalty descriptors".to_string())?;
+    let targets = latent_penalty_targets(latents)?;
+    if !items.is_empty() && targets.is_empty() {
+        return Err("penalties requires latents with at least one latent block".to_string());
+    }
+    for (idx, raw_item) in items.iter().enumerate() {
+        let context = format!("penalties[{idx}]");
+        let descriptor = raw_item
+            .as_object()
+            .ok_or_else(|| format!("{context} must be an object"))?;
+        let target = penalty_target_for_descriptor(&targets, descriptor, &context)?;
+        let slice = PsiSlice::full(target.n * target.d, Some(target.d));
+        let kind = descriptor
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("{context}.kind is required"))?
+            .to_ascii_lowercase()
+            .replace('-', "_");
+        match kind.as_str() {
+            "isometry" => {
+                registry.push(gam::terms::AnalyticPenaltyKind::Isometry(std::sync::Arc::new(
+                    IsometryPenalty::new_euclidean(slice, target.d),
+                )));
+            }
+            "ard" => {
+                registry.push(gam::terms::AnalyticPenaltyKind::Ard(std::sync::Arc::new(
+                    ARDPenalty::new(slice, target.d),
+                )));
+            }
+            "orthogonality" => {
+                let weight = descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                registry.push(gam::terms::AnalyticPenaltyKind::Orthogonality(
+                    std::sync::Arc::new(
+                        OrthogonalityPenalty::new(slice, target.d, weight, n_eff, learnable)
+                            .map_err(|err| format!("{context}: {err}"))?,
+                    ),
+                ));
+            }
+            "sparsity" => {
+                let sparsity_kind = descriptor
+                    .get("sparsity_kind")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("smooth_l1")
+                    .to_ascii_lowercase()
+                    .replace('-', "_");
+                let eps = descriptor_f64(descriptor, "eps", 1.0e-3)?;
+                let penalty = match sparsity_kind.as_str() {
+                    "smooth_l1" | "smoothed_l1" => {
+                        SparsityPenalty::smoothed_l1(PenaltyTier::Psi, eps)
+                    }
+                    "log" => SparsityPenalty::log(PenaltyTier::Psi, eps),
+                    "hoyer" => Ok(SparsityPenalty::hoyer(PenaltyTier::Psi)),
+                    other => Err(format!(
+                        "{context}.sparsity_kind must be smooth_l1, hoyer, or log; got {other:?}"
+                    )),
+                }?;
+                registry.push(gam::terms::AnalyticPenaltyKind::Sparsity(std::sync::Arc::new(
+                    penalty,
+                )));
+            }
+            "ibp_assignment" | "ibp_assignment_penalty" => {
+                let k_max = descriptor_usize(descriptor, "k_max", target.d)?;
+                let alpha = descriptor_f64(descriptor, "alpha", 1.0)?;
+                let tau = descriptor_f64(descriptor, "tau", 1.0)?;
+                let learnable_alpha = descriptor
+                    .get("learnable_alpha")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                registry.push(gam::terms::AnalyticPenaltyKind::IBPAssignment(
+                    std::sync::Arc::new(IBPAssignmentPenalty::new(
+                        k_max,
+                        alpha,
+                        tau,
+                        learnable_alpha,
+                    )),
+                ));
+            }
+            "softmax_assignment_sparsity" => {
+                let k_atoms = descriptor_usize(descriptor, "k_atoms", target.d)?;
+                let temperature = descriptor_f64(descriptor, "temperature", 1.0)?;
+                registry.push(gam::terms::AnalyticPenaltyKind::SoftmaxAssignmentSparsity(
+                    std::sync::Arc::new(SoftmaxAssignmentSparsityPenalty::new(
+                        k_atoms,
+                        temperature,
+                    )),
+                ));
+            }
+            "total_variation" => {
+                return Err(format!(
+                    "{context}: TotalVariationPenalty descriptors are accepted by Python, but this build's AnalyticPenaltyKind registry does not expose a total-variation variant"
+                ));
+            }
+            other => return Err(format!("{context}.kind has unsupported analytic penalty {other:?}")),
+        }
+    }
+    Ok(registry)
+}
+
+#[pyfunction(signature = (latents_json, penalties_json))]
+fn register_analytic_penalties(latents_json: &str, penalties_json: &str) -> PyResult<String> {
+    let latents: serde_json::Value = serde_json::from_str(latents_json)
+        .map_err(|err| py_value_error(format!("invalid latents json: {err}")))?;
+    let penalties: serde_json::Value = serde_json::from_str(penalties_json)
+        .map_err(|err| py_value_error(format!("invalid penalties json: {err}")))?;
+    let registry = build_analytic_penalty_registry_from_json(Some(&latents), Some(&penalties))
+        .map_err(py_value_error)?;
+    let layout = registry
+        .rho_layout()
+        .into_iter()
+        .map(|(range, tier, name)| {
+            serde_json::json!({
+                "name": name,
+                "tier": format!("{tier:?}"),
+                "rho_start": range.start,
+                "rho_end": range.end,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string(&serde_json::json!({
+        "penalty_count": registry.penalties.len(),
+        "rho_count": registry.total_rho_count(),
+        "layout": layout,
+    }))
+    .map_err(|err| py_value_error(err.to_string()))
+}
+
 fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     let py_config = match config_json {
         Some(raw) if !raw.trim().is_empty() => serde_json::from_str::<PyFitConfig>(raw)
@@ -10054,7 +10317,13 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
         py_config.precision_hyperpriors,
         py_config.penalty_block_gamma_priors,
     )?;
+    let analytic_penalties = py_config.penalties;
+    let _registry = build_analytic_penalty_registry_from_json(
+        py_config.latents.as_ref(),
+        analytic_penalties.as_ref(),
+    )?;
     fit_config.latents = py_config.latents;
+    fit_config.analytic_penalties = analytic_penalties;
     fit_config.family = normalize_optional_family(py_config.family);
     fit_config.offset_column = py_config.offset;
     fit_config.weight_column = py_config.weights;
