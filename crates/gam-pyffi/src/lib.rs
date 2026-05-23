@@ -3956,23 +3956,24 @@ fn gaussian_reml_fit_latent_backward<'py>(
         }
     }
     let mut grad_t = LatentCoordValues::contract_gradient(grad_phi_kernel.view(), &jet);
-    // Polynomial-nullspace tail: ∂Φ_poly/∂t is a (small) constant pattern.
-    // For Duchon m=2 the polynomial block is [1, t_1, ..., t_d] (one
-    // intercept + d linear terms): ∂/∂t_a contributes 1.0 to the (n, a)
-    // column for a ∈ [0, d). Higher orders include cross-monomials, which
-    // we currently treat as locked (the radial portion dominates the
-    // observable gradient for the LatentCoord prototype). A maintainer
-    // pass should extend this to monomial-exponent-aware differentiation
-    // matching `fill_duchon_1d_polynomial_derivative` in the N-D layout.
+    // Fixes audit-revised claim that the Duchon polynomial-nullspace tail
+    // must use the N-D monomial derivative, not the legacy linear-only
+    // shortcut.
     if grad_x.ncols() > n_centers {
         let poly_start = n_centers;
         let n_poly = grad_x.ncols() - poly_start;
-        // Skip the intercept column (a=0 in the canonical polynomial
-        // ordering): ∂/∂t of a constant is zero.
-        let linear_cols = n_poly.saturating_sub(1).min(latent_dim);
+        let poly_jet =
+            duchon_polynomial_first_derivative_nd(t_mat.view(), duchon_nullspace_from_m(m));
+        let n_poly_contract = n_poly.min(poly_jet.shape()[1]);
         for n in 0..n_obs {
-            for a in 0..linear_cols {
-                grad_t[n * latent_dim + a] += grad_x[[n, poly_start + 1 + a]];
+            for poly_col in 0..n_poly_contract {
+                let gx = grad_x[[n, poly_start + poly_col]];
+                if gx == 0.0 {
+                    continue;
+                }
+                for a in 0..latent_dim {
+                    grad_t[n * latent_dim + a] += gx * poly_jet[[n, poly_col, a]];
+                }
             }
         }
     }
@@ -3993,17 +3994,34 @@ fn gaussian_reml_fit_latent_backward<'py>(
         )
         .map_err(py_value_error)?;
     }
-    // Identifiability-mode additive contributions to grad_t.
+    // Identifiability-mode additive contributions to grad_t plus log-normalizer
+    // adjoints. Fixes audit-revised claim that REML ARD/AuxPrior selection
+    // needs the normalized prior terms, not only raw quadratic gradients.
+    let mut grad_aux_log_strength: Option<f64> = None;
+    let mut grad_dim_selection_log_precision: Option<Array1<f64>> = None;
     if let Some(u_arr) = aux_u.as_ref() {
         let u_view = u_arr.as_array();
         let targets = aux_prior_targets(t_mat.view(), u_view, family)
             .map_err(py_value_error)?;
         let mu = aux_strength.unwrap_or(1.0);
+        if !(mu.is_finite() && mu > 0.0) {
+            return Err(py_value_error(format!(
+                "aux_strength must be finite and positive; got {mu}"
+            )));
+        }
+        let mut sq = 0.0_f64;
         for n in 0..n_obs {
             for a in 0..latent_dim {
-                grad_t[n * latent_dim + a] += mu * (t_mat[[n, a]] - targets[[n, a]]);
+                let diff = t_mat[[n, a]] - targets[[n, a]];
+                sq += diff * diff;
+                if grad_reml_score != 0.0 {
+                    grad_t[n * latent_dim + a] += grad_reml_score * mu * diff;
+                }
             }
         }
+        let effective_dim = (n_obs * latent_dim) as f64;
+        grad_aux_log_strength =
+            Some(grad_reml_score * (0.5 * mu * sq - 0.5 * effective_dim));
     }
     if let Some(log_prec) = dim_selection_log_precision.as_ref() {
         let lp = log_prec.as_array();
@@ -4014,12 +4032,31 @@ fn gaussian_reml_fit_latent_backward<'py>(
                 latent_dim
             )));
         }
+        let mut grad_log_prec = Array1::<f64>::zeros(latent_dim);
         for n in 0..n_obs {
             for a in 0..latent_dim {
                 let prec = lp[a].exp();
-                grad_t[n * latent_dim + a] += prec * t_mat[[n, a]];
+                if grad_reml_score != 0.0 {
+                    grad_t[n * latent_dim + a] += grad_reml_score * prec * t_mat[[n, a]];
+                }
             }
         }
+        for a in 0..latent_dim {
+            let log_alpha = lp[a];
+            let prec = log_alpha.exp();
+            if !(prec.is_finite() && prec > 0.0) {
+                return Err(py_value_error(format!(
+                    "dim_selection_log_precision[{a}] must exponentiate to a finite positive precision"
+                )));
+            }
+            let mut sq = 0.0_f64;
+            for n in 0..n_obs {
+                let v = t_mat[[n, a]];
+                sq += v * v;
+            }
+            grad_log_prec[a] = grad_reml_score * (0.5 * prec * sq - 0.5 * (n_obs as f64));
+        }
+        grad_dim_selection_log_precision = Some(grad_log_prec);
     }
     let mut grad_t_matrix = Array2::<f64>::zeros((n_obs, latent_dim));
     for n in 0..n_obs {
@@ -4032,6 +4069,19 @@ fn gaussian_reml_fit_latent_backward<'py>(
     out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
     out.set_item("grad_penalty", backward.grad_penalty.into_pyarray(py))?;
     out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
+    if let Some(grad) = grad_aux_log_strength {
+        out.set_item("grad_aux_log_strength", grad)?;
+    } else {
+        out.set_item("grad_aux_log_strength", py.None())?;
+    }
+    if let Some(grad) = grad_dim_selection_log_precision {
+        out.set_item(
+            "grad_dim_selection_log_precision",
+            grad.into_pyarray(py),
+        )?;
+    } else {
+        out.set_item("grad_dim_selection_log_precision", py.None())?;
+    }
     Ok(out.unbind())
 }
 

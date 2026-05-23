@@ -2235,7 +2235,15 @@ def gaussian_reml_fit_latent_backward(
     except Exception as exc:
         raise map_exception(exc) from exc
     result = dict(out)
-    for key in ("grad_t", "grad_y", "grad_penalty", "grad_weights"):
+    # Fixes audit-revised claim that latent ARD/AuxPrior REML selection needs
+    # adjoints for the normalized log-precision terms as well as grad_t.
+    for key in (
+        "grad_t",
+        "grad_y",
+        "grad_penalty",
+        "grad_weights",
+        "grad_dim_selection_log_precision",
+    ):
         if result.get(key) is not None:
             result[key] = np.asarray(result[key], dtype=float)
     return result

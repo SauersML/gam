@@ -2,8 +2,8 @@ use crate::construction::{KroneckerReparamResult, ReparamResult};
 use crate::estimate::EstimationError;
 use crate::estimate::reml::FirthDenseOperator;
 use crate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, array1_to_col_matmut, array2_to_matmut,
-    fast_ab, fast_atb, fast_atv, fast_av_into,
+    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, FaerSymmetricFactor,
+    array1_to_col_matmut, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av_into,
 };
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd, solve_sparse_spd_into,
@@ -3032,6 +3032,31 @@ fn solve_newton_direction_dense(
     gradient: &Array1<f64>,
     direction_out: &mut Array1<f64>,
 ) -> Result<(), EstimationError> {
+    solve_newton_direction_dense_with_factor(hessian, gradient, direction_out).map(|_| ())
+}
+
+fn solve_direction_with_dense_factor(
+    factor: &FaerSymmetricFactor,
+    gradient: &Array1<f64>,
+    direction_out: &mut Array1<f64>,
+) {
+    if direction_out.len() != gradient.len() {
+        *direction_out = Array1::zeros(gradient.len());
+    }
+    direction_out.assign(gradient);
+    let mut rhsview = array1_to_col_matmut(direction_out);
+    factor.solve_in_place(rhsview.as_mut());
+    direction_out.mapv_inplace(|v| -v);
+}
+
+/// Fixes the audit-revised geodesic-acceleration note: expose the dense
+/// factor so the optional second-order correction can reuse it instead of
+/// refactorizing the same Hessian.
+fn solve_newton_direction_dense_with_factor(
+    hessian: &Array2<f64>,
+    gradient: &Array1<f64>,
+    direction_out: &mut Array1<f64>,
+) -> Result<Option<FaerSymmetricFactor>, EstimationError> {
     let dense_solve_start = std::time::Instant::now();
     let p = hessian.nrows();
     if direction_out.len() != gradient.len() {
@@ -3058,7 +3083,7 @@ fn solve_newton_direction_dense(
                 dense_solve_start.elapsed().as_secs_f64(),
                 gpu_route,
             );
-            return Ok(());
+            return Ok(None);
         }
     }
     let cpu_route = if gpu_attempt_expected {
@@ -3073,10 +3098,7 @@ fn solve_newton_direction_dense(
     let factor = StableSolver::new("pirls newton direction")
         .factorize(hessian)
         .map_err(EstimationError::LinearSystemSolveFailed)?;
-    direction_out.assign(gradient);
-    let mut rhsview = array1_to_col_matmut(direction_out);
-    factor.solve_in_place(rhsview.as_mut());
-    direction_out.mapv_inplace(|v| -v);
+    solve_direction_with_dense_factor(&factor, gradient, direction_out);
     if array1_is_finite(direction_out) {
         log::info!(
             "[STAGE] PIRLS dense newton solve backend=CPU p={} flops~{} elapsed={:.3}s route=\"{}\"",
@@ -3085,7 +3107,7 @@ fn solve_newton_direction_dense(
             dense_solve_start.elapsed().as_secs_f64(),
             cpu_route,
         );
-        return Ok(());
+        return Ok(Some(factor));
     }
     Err(EstimationError::LinearSystemSolveFailed(
         FaerLinalgError::FactorizationFailed,
@@ -4882,6 +4904,7 @@ where
 
             let has_constraints =
                 options.linear_constraints.is_some() || options.coefficient_lower_bounds.is_some();
+            let mut dense_newton_factor: Option<FaerSymmetricFactor> = None;
             let direction = match if let Some(h_sparse) = state.hessian.as_sparse() {
                 if has_constraints {
                     Err(EstimationError::InvalidInput(
@@ -4994,7 +5017,12 @@ where
                         }
                     }
                 } else {
-                    solve_newton_direction_dense(dense_reg, &state.gradient, &mut newton_direction)
+                    dense_newton_factor = solve_newton_direction_dense_with_factor(
+                        dense_reg,
+                        &state.gradient,
+                        &mut newton_direction,
+                    )?;
+                    Ok(())
                 }
             } {
                 Ok(()) => &newton_direction,
@@ -5044,14 +5072,9 @@ where
             // derivative of the gradient along δp. Accept the correction
             // only if ‖δp₂‖ ≤ α‖δp‖ (Transtrum-Sethna 2011, α=0.75 here).
             //
-            // Reusing the existing Cholesky factor would require refactoring
-            // `solve_newton_direction_dense` to hand back the factor — out
-            // of scope for this opt-in flag. Instead the second solve
-            // refactorizes the same regularized Hessian (one extra O(p³)
-            // Cholesky per accepted step), plus two extra `model.update(·)`
-            // evaluations for the central FD. Only the dense, unconstrained
-            // path is wired; sparse-native / linear-inequality / lower-bound
-            // paths fall through to the bare LM step.
+            // Fixes audit-revised claim that GA should reuse the dense factor
+            // and skip the arrow-Schur path, whose Hessian is not the bare
+            // β-Hessian represented by `regularized`.
             //
             // The block must own `direction` mutably to write δp + δp₂ back
             // into the same buffer, so it operates on `newton_direction`
@@ -5060,6 +5083,7 @@ where
                 && cached_sparse_regularized.is_none()
                 && options.linear_constraints.is_none()
                 && options.coefficient_lower_bounds.is_none()
+                && options.arrow_schur.is_none()
             {
                 const GEODESIC_ACCEPT_ALPHA: f64 = 0.75;
                 // 1e-4 is the Transtrum-Sethna default for double precision.
@@ -5071,7 +5095,7 @@ where
                 let dir_norm = array1_l2_norm(&dir_snapshot);
                 if dir_norm > 0.0
                     && dir_norm.is_finite()
-                    && let Some(h_dense) = regularized.as_dense()
+                    && let Some(factor) = dense_newton_factor.as_ref()
                 {
                     let mut beta_pert = Array1::<f64>::zeros(beta.len());
                     beta_pert.assign(beta.as_ref());
@@ -5094,9 +5118,8 @@ where
 
                         if array1_is_finite(&k_rhs) {
                             let mut delta2 = Array1::<f64>::zeros(beta.len());
-                            if solve_newton_direction_dense(h_dense, &k_rhs, &mut delta2).is_ok()
-                                && array1_is_finite(&delta2)
-                            {
+                            solve_direction_with_dense_factor(factor, &k_rhs, &mut delta2);
+                            if array1_is_finite(&delta2) {
                                 let d2_norm = array1_l2_norm(&delta2);
                                 if d2_norm.is_finite()
                                     && d2_norm <= GEODESIC_ACCEPT_ALPHA * dir_norm
