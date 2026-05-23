@@ -8484,8 +8484,8 @@ fn write_gamma_log_working_state(
 }
 
 const TWEEDIE_LIMIT_EPS: f64 = 1.0e-6;
-const BETA_RESPONSE_EPS: f64 = 1.0e-12;
-const BETA_MU_EPS: f64 = 1.0e-12;
+pub const BETA_RESPONSE_EPS: f64 = 1.0e-12;
+pub const BETA_MU_EPS: f64 = 1.0e-12;
 
 #[inline]
 fn tweedie_p_is_poisson(p: f64) -> bool {
@@ -10784,8 +10784,8 @@ fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
 #[inline]
 fn beta_unit_deviance(yi: f64, mui: f64, phi: f64) -> f64 {
     let yi_c = safe_beta_response(yi);
-    2.0 * (beta_loglikelihood_full_unit(yi_c, yi_c, phi)
-        - beta_loglikelihood_full_unit(yi_c, mui, phi))
+    beta_loglikelihood_full_unit(yi_c, yi_c, phi)
+        - beta_loglikelihood_full_unit(yi_c, mui, phi)
 }
 
 #[inline]
@@ -10902,10 +10902,11 @@ pub fn calculate_deviance(
                 return f64::NAN;
             }
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            (0..y.len())
+            let total: f64 = (0..y.len())
                 .into_par_iter()
                 .map(|i| priorweights[i] * beta_unit_deviance(y[i], mu[i], phi))
-                .sum()
+                .sum();
+            2.0 * total
         }
         GlmLikelihoodFamily::GammaLog => {
             let shape = likelihood.gamma_shape().unwrap_or(1.0);
