@@ -518,6 +518,14 @@ fn dense_xtwx_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array2
 
 #[inline]
 fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array1<f64> {
+    // Diagonal of XᵀWX — used as Fisher-info diagonal for preconditioning and
+    // for diagonal-of-Gram queries. Negative weights have no sensible meaning
+    // here (the diagonal must be nonneg for it to act as a preconditioner), so
+    // we require the precondition rather than silently clipping.
+    debug_assert!(
+        weights.iter().all(|&w| w >= 0.0),
+        "dense_diag_gram_view requires nonneg weights"
+    );
     let p = matrix.ncols();
     let n = matrix.nrows();
     let large = (n as u64) * (p as u64) >= DENSE_ROW_PARALLEL_MIN_NP;
@@ -532,7 +540,7 @@ fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> A
                     .fold(
                         || vec![0.0_f64; p],
                         |mut acc, i| {
-                            let wi = w[i].max(0.0);
+                            let wi = w[i];
                             if wi != 0.0 {
                                 let row = &x[i * p..i * p + p];
                                 for j in 0..p {
@@ -557,7 +565,7 @@ fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> A
             let mut diag = Array1::<f64>::zeros(p);
             let diag_slice = diag.as_slice_mut().expect("zeros are contiguous");
             for i in 0..n {
-                let wi = w[i].max(0.0);
+                let wi = w[i];
                 if wi == 0.0 {
                     continue;
                 }
@@ -572,7 +580,7 @@ fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> A
     }
     let mut diag = Array1::<f64>::zeros(p);
     for i in 0..n {
-        let wi = weights[i].max(0.0);
+        let wi = weights[i];
         if wi == 0.0 {
             continue;
         }
@@ -631,9 +639,18 @@ fn sparse_csr_weighted_xtwx_rows(
     weights: ArrayView1<'_, f64>,
     rows: Range<usize>,
 ) -> Array2<f64> {
+    // PSD precondition. The CSC counterpart (`streaming_sparse_csc_xt_diag_x`)
+    // accepts signed weights and is the right path for observed-Hessian
+    // assembly; this CSR-row kernel is reserved for Fisher-scoring Gram builds
+    // where the working weights are guaranteed nonneg. Clipping silently here
+    // would drop negative-curvature mass and produce a wrong Newton step.
+    debug_assert!(
+        weights.iter().all(|&w| w >= 0.0),
+        "sparse_csr_weighted_xtwx_rows requires nonneg weights; route signed-weight Gram through the CSC kernel"
+    );
     let mut xtwx = Array2::<f64>::zeros((p, p));
     for i in rows {
-        let wi = weights[i].max(0.0);
+        let wi = weights[i];
         if wi == 0.0 {
             continue;
         }
@@ -4527,6 +4544,45 @@ impl SymmetricMatrix {
         let result_t = self.dot_matrix(&lhs_t);
         result_t.t().to_owned()
     }
+}
+
+/// Build `XᵀWX` from a design + signed weights, returning a symmetric matrix.
+///
+/// This is the observed-Hessian / non-canonical-link route: the input `diag`
+/// may contain negative entries when the working curvature is not guaranteed
+/// PSD (e.g. binomial + cloglog, Gamma + identity, any IRLS step that uses
+/// the true Hessian rather than the Fisher information). All internal kernels
+/// — `streaming_blas_xt_diag_x`, `streaming_sparse_csc_xt_diag_x`, and the
+/// sparse-row accumulator — preserve the sign of the weights; only the
+/// PSD-precondition kernels in this module (`sparse_csr_weighted_xtwx_rows`,
+/// `weighted_crossprod_dense_rows`, `dense_diag_gram_view`) clip / assert
+/// nonneg, and none of them is reachable from this entry.
+///
+/// Callers in PIRLS should select `_signed` for observed-Hessian / Newton
+/// curvature assembly and `_psd` for Fisher-scoring updates where the working
+/// weights are guaranteed nonneg.
+pub fn xt_diag_x_signed(
+    design: &DesignMatrix,
+    diag: &Array1<f64>,
+) -> Result<SymmetricMatrix, String> {
+    xt_diag_x_symmetric(design, diag)
+}
+
+/// PSD-precondition Gram: `XᵀWX` with `w ≥ 0`.
+///
+/// Use for Fisher-scoring / canonical-link IRLS, where the working weights are
+/// guaranteed nonneg by construction. The precondition is checked under
+/// `debug_assertions` and silently inherited in release builds; the underlying
+/// numeric path is identical to `xt_diag_x_signed`.
+pub fn xt_diag_x_psd(
+    design: &DesignMatrix,
+    diag: &Array1<f64>,
+) -> Result<SymmetricMatrix, String> {
+    debug_assert!(
+        diag.iter().all(|&w| w >= 0.0),
+        "xt_diag_x_psd requires nonneg weights; use xt_diag_x_signed for observed-Hessian assembly"
+    );
+    xt_diag_x_symmetric(design, diag)
 }
 
 pub fn xt_diag_x_symmetric(
