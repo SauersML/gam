@@ -2458,6 +2458,10 @@ pub struct FitConfig {
     /// the named smooth's synthetic covariates are rebuilt from `t`, and
     /// joint REML optimizes `[rho, vec(t)]` through latent design hyper-dirs.
     pub latents: Option<JsonValue>,
+    /// Python `gamfit.fit(..., penalties=[...])` analytic-penalty descriptors,
+    /// validated against the declared latent-coordinate blocks before a
+    /// standard latent fit starts.
+    pub analytic_penalties: Option<JsonValue>,
 }
 
 impl Default for FitConfig {
@@ -2498,6 +2502,7 @@ impl Default for FitConfig {
             coefficient_groups: Vec::new(),
             penalty_block_gamma_priors: Vec::new(),
             latents: None,
+            analytic_penalties: None,
         }
     }
 }

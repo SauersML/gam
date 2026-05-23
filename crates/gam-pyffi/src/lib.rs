@@ -69,6 +69,11 @@ use gam::terms::sae_manifold::{
     term_from_padded_blocks_with_mode,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
+use gam::terms::{
+    ARDPenalty, AnalyticPenaltyRegistry, IBPAssignmentPenalty, IsometryPenalty,
+    OrthogonalityPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty, SparsityPenalty,
+    SparsityKind,
+};
 use gam::terms::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
@@ -128,6 +133,7 @@ struct PyFitConfig {
     precision_hyperpriors: Option<serde_json::Value>,
     penalty_block_gamma_priors: Option<serde_json::Value>,
     latents: Option<serde_json::Value>,
+    penalties: Option<serde_json::Value>,
 
     // Frailty (only consumed by survival families today). Mirrors the CLI
     // names: --frailty-kind, --frailty-sd, --hazard-loading.
