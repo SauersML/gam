@@ -3607,7 +3607,10 @@ where
     let dispersion = dispersion_from_likelihood(pirls_res.likelihood, standard_deviation);
     let dispersion_phi = dispersion.phi();
 
-    // Compute gradient norm at final rho for reporting
+    // Compute gradient norm at final rho for reporting. Fall through to
+    // the outer's own measurement (if any), then to 0.0 — the codebase-wide
+    // "no gradient measurement at this termination" sentinel paired with
+    // `outer_converged` as the authoritative convergence signal.
     let finalgrad = reml_state
         .compute_gradient(&final_rho)
         .unwrap_or_else(|_| Array1::from_elem(final_rho.len(), f64::NAN));
@@ -3615,7 +3618,7 @@ where
     let finalgrad_norm = if finalgrad_norm_rho.is_finite() {
         finalgrad_norm_rho
     } else {
-        outer_result.final_grad_norm_or_nan()
+        outer_result.final_grad_norm.unwrap_or(0.0)
     };
 
     if opts.compute_inference {
@@ -4125,7 +4128,7 @@ pub struct UnifiedFitResultParts {
     pub penalized_objective: f64,
     pub outer_iterations: usize,
     pub outer_converged: bool,
-    pub outer_gradient_norm: f64,
+    pub outer_gradient_norm: Option<f64>,
     pub standard_deviation: f64,
     pub covariance_conditional: Option<Array2<f64>>,
     pub covariance_corrected: Option<Array2<f64>>,
@@ -4184,8 +4187,13 @@ pub struct UnifiedFitResult {
     pub outer_iterations: usize,
     /// Whether the outer optimization converged.
     pub outer_converged: bool,
-    /// Final gradient norm of the outer optimization.
-    pub outer_gradient_norm: f64,
+    /// Final gradient norm of the outer optimization. `None` when no
+    /// gradient was measured at termination — cache-hit short-circuit
+    /// (the prior fit's converged ρ was loaded from disk), gradient-free
+    /// solver, or a degenerate early-exit path where no outer ran.
+    /// `outer_converged` is the authoritative convergence signal.
+    #[serde(default)]
+    pub outer_gradient_norm: Option<f64>,
     /// Residual scale on the response scale.
     ///
     /// Contract: Gaussian identity models store residual standard deviation
