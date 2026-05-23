@@ -71,56 +71,14 @@ Using `v = ∇_E` gives the required correction
 
 ## 2. Source Alignment
 
-Relevant source already exists:
-
-```text
-src/terms/input_loc_derivatives.rs
-  basis_input_loc_grad
-  basis_input_loc_hess
-  tensor_product_input_loc_grad
-  periodic_radial_input_loc_grad_1d
-  sphere_s2_input_loc_grad
-  contract_input_loc_gradient
-
-src/terms/latent_coord.rs
-  LatentManifold
-  LatentCoordValues::retract_flat_delta
-  LatentCoordValues::design_gradient_wrt_t_dispatch
-  LatentCoordValues::contract_gradient
-  LatentManifold::project_to_tangent
-  LatentManifold::euclidean_to_riemannian_hessian
-  LatentManifold::riemannian_hessian_matrix
-
-src/solver/riemannian.rs
-  Manifold
-  Euclidean, Circle, Sphere, Interval, Torus, Product
-  ManifoldKind
-  RiemannianNewtonStep
-  riemannian_newton_step_on_point
-  retract_euclidean_delta
-
-src/solver/arrow_schur.rs
-  ArrowSystem::apply_riemannian_latent_geometry
-  apply_per_row_retraction
-
-src/solver/persistent_warm_start.rs
-  ift_warm_start_latent
-  apply_ift_retraction
-```
-
-There is currently a representation split:
-
-```text
-LatentManifold::Circle in src/terms/latent_coord.rs
-  scalar angle with wrapping
-
-Circle in src/solver/riemannian.rs
-  embedded unit vector in ℝ²
-```
-
-The optimizer contract should be embedded. Chart coordinates can remain API
-sugar, but Newton, Hessian conversion, vector transport, and IFT retraction
-should operate on embedded points.
+The relevant source is already present across `input_loc_derivatives.rs`,
+`latent_coord.rs`, `solver/riemannian.rs`, `arrow_schur.rs`, and
+`persistent_warm_start.rs`. The main cleanup is ownership: the optimizer
+contract should be embedded. Chart coordinates can remain API sugar or
+basis-evaluation inputs, but Newton, Hessian conversion, vector transport,
+and IFT retraction should operate on embedded points. This resolves the
+current split where `LatentManifold::Circle` stores a scalar angle while
+`solver::riemannian::Circle` stores `(cos θ, sin θ)`.
 
 ## 3. Row Chain Rule
 
@@ -214,12 +172,6 @@ Use normalization:
 R_p(ξ) = (p + ξ) / ||p + ξ||.
 ```
 
-The exact exponential map is:
-
-```text
-Exp_p(ξ) = cos(||ξ||)p + sin(||ξ||)ξ/||ξ||.
-```
-
 Normalization is the committed retraction because it is closed-form,
 first-order correct, and seam-free.
 
@@ -238,11 +190,8 @@ Committed default:
 τ_{p→q}(ξ) = P_q(ξ).
 ```
 
-Exact non-antipodal transport, optional later:
-
-```text
-τ_exact(ξ) = ξ - (<q,ξ> / (1 + <p,q>))(p + q).
-```
+Exact geodesic transport can be added later, but projection transport is the
+committed default.
 
 ### 4.5 Inner Product g_p
 
@@ -302,12 +251,6 @@ Q = [q1 q2].
 R_p(ξ) = (p + ξ) / ||p + ξ||.
 ```
 
-Exact exponential map:
-
-```text
-Exp_p(ξ) = cos(||ξ||)p + sin(||ξ||)ξ/||ξ||.
-```
-
 ### 5.3 Projection P_p: ℝ^m → T_p M
 
 ```text
@@ -323,11 +266,8 @@ Default:
 τ_{p→q}(ξ) = P_q(ξ).
 ```
 
-Exact non-antipodal transport:
-
-```text
-τ_exact(ξ) = ξ - (<q,ξ> / (1 + <p,q>))(p + q).
-```
+Exact geodesic transport has an antipodal singularity; projection transport
+is the committed default.
 
 ### 5.5 Inner Product g_p
 
@@ -406,13 +346,8 @@ Default:
 τ_{p→q}(ξ) = P_q(ξ).
 ```
 
-Exact non-antipodal transport:
-
-```text
-τ_exact(ξ) = ξ - (<q,ξ> / (1 + <p,q>))(p + q).
-```
-
-Avoid exact transport near `q ≈ -p`.
+Exact geodesic transport can be added later, but it must avoid the
+`q ≈ -p` denominator singularity.
 
 ### 6.5 Inner Product g_p
 
@@ -1001,69 +936,28 @@ If a previous tangent delta is reused after moving the point, transport it:
 
 ## 15. Numerical Pitfalls
 
-Sphere charts:
-
-```text
-Embedded spheres do not have pole singularities; latitude/longitude charts do.
-Keep optimizer state embedded.
-Use charts only for API display or chart-native basis evaluation.
-```
-
-South pole / chart transition:
-
-```text
-If a chart is required, switch charts near poles.
-Do not finite-difference longitude at a pole.
-Do not measure longitude residuals as Euclidean errors near a pole.
-```
-
-Antipodal sphere transport:
-
-```text
-τ_exact has denominator 1 + <p,q>.
-Use projection transport near q ≈ -p.
-Keep sphere trust steps well below π unless line search accepts larger moves.
-```
-
-Retraction normalization:
-
-```text
-Project ξ to tangent before normalization.
-Clip trust radius.
-Treat non-finite ||p+ξ|| as an error.
-```
-
-Interval boundary:
-
-```text
-clamp is nonsmooth at a,b.
-Use KKT active-set logic at boundaries.
-Avoid tanh chart near boundary unless its Jacobian is monitored.
-```
-
-Vector transport:
-
-```text
-Projection transport is cheap and stable but not exactly isometric.
-Use it for IFT warm starts.
-Check norm loss before using it for quasi-Newton curvature pairs.
-```
-
-Radial kernel collisions:
-
-```text
-Do not map degenerate collisions to zero.
-Respect BasisError::DegenerateAtCollision.
-Move centers or choose a smoother kernel.
-```
-
-Product units:
-
-```text
-Use metric weights for mixed S¹/Interval/ℝ products.
-Report weights in diagnostics.
-Clip trust radius in the weighted metric norm.
-```
+- Sphere charts: embedded spheres do not have pole singularities, but
+  latitude/longitude charts do. Keep optimizer state embedded; use charts
+  only for API display or chart-native basis evaluation.
+- South pole / chart transition: if a chart is required, switch charts near
+  poles. Do not finite-difference longitude at a pole or measure longitude
+  residuals as Euclidean errors there.
+- Antipodal sphere transport: exact transport has denominator
+  `1 + <p,q>`. Use projection transport near `q ≈ -p`, and keep sphere
+  trust steps well below `π` unless line search accepts a larger move.
+- Retraction normalization: project `ξ` to tangent before normalization,
+  clip the trust radius, and treat non-finite `||p+ξ||` as an error.
+- Interval boundary: `clamp` is nonsmooth at `a,b`; use KKT active-set
+  logic. Avoid a `tanh` chart near the boundary unless its Jacobian is
+  monitored.
+- Vector transport: projection transport is cheap and stable but not exactly
+  isometric. Use it for IFT warm starts; check norm loss before using it for
+  quasi-Newton curvature pairs.
+- Radial kernel collisions: do not map degenerate collisions to zero.
+  Respect `BasisError::DegenerateAtCollision`; move centers or choose a
+  smoother kernel.
+- Product units: use metric weights for mixed `S¹`/Interval/`ℝ` products,
+  report them in diagnostics, and clip trust radii in the weighted metric.
 
 ## 16. Final Rust Trait
 
@@ -1078,70 +972,28 @@ pub trait Manifold: Send + Sync {
     fn dim(&self) -> usize;
     fn ambient_dim(&self) -> usize;
 
-    fn project_point(
-        &self,
-        p: ArrayView1<'_, f64>,
-        out: ArrayViewMut1<'_, f64>,
-    ) -> Result<(), ManifoldError>;
+    fn project_point(&self, p: ArrayView1<'_, f64>, out: ArrayViewMut1<'_, f64>)
+        -> Result<(), ManifoldError>;
+    fn project_tangent(&self, p: ArrayView1<'_, f64>, v: ArrayViewMut1<'_, f64>)
+        -> Result<(), ManifoldError>;
+    fn retract(&self, p: ArrayView1<'_, f64>, xi: ArrayView1<'_, f64>, out: ArrayViewMut1<'_, f64>)
+        -> Result<(), ManifoldError>;
+    fn vector_transport(&self, from: ArrayView1<'_, f64>, to: ArrayView1<'_, f64>, xi: ArrayViewMut1<'_, f64>)
+        -> Result<(), ManifoldError>;
+    fn inner_product(&self, p: ArrayView1<'_, f64>, xi: ArrayView1<'_, f64>, eta: ArrayView1<'_, f64>)
+        -> Result<f64, ManifoldError>;
+    fn tangent_basis(&self, p: ArrayView1<'_, f64>) -> Result<Array2<f64>, ManifoldError>;
+    fn weingarten(&self, p: ArrayView1<'_, f64>, xi: ArrayView1<'_, f64>, ambient_grad: ArrayView1<'_, f64>, out: ArrayViewMut1<'_, f64>)
+        -> Result<(), ManifoldError>;
 
-    fn project_tangent(
-        &self,
-        p: ArrayView1<'_, f64>,
-        v: ArrayViewMut1<'_, f64>,
-    ) -> Result<(), ManifoldError>;
-
-    fn retract(
-        &self,
-        p: ArrayView1<'_, f64>,
-        xi: ArrayView1<'_, f64>,
-        out: ArrayViewMut1<'_, f64>,
-    ) -> Result<(), ManifoldError>;
-
-    fn vector_transport(
-        &self,
-        from: ArrayView1<'_, f64>,
-        to: ArrayView1<'_, f64>,
-        xi: ArrayViewMut1<'_, f64>,
-    ) -> Result<(), ManifoldError>;
-
-    fn inner_product(
-        &self,
-        p: ArrayView1<'_, f64>,
-        xi: ArrayView1<'_, f64>,
-        eta: ArrayView1<'_, f64>,
-    ) -> Result<f64, ManifoldError>;
-
-    fn tangent_basis(
-        &self,
-        p: ArrayView1<'_, f64>,
-    ) -> Result<Array2<f64>, ManifoldError>;
-
-    fn weingarten(
-        &self,
-        p: ArrayView1<'_, f64>,
-        xi: ArrayView1<'_, f64>,
-        ambient_grad: ArrayView1<'_, f64>,
-        out: ArrayViewMut1<'_, f64>,
-    ) -> Result<(), ManifoldError>;
-
-    fn euclidean_to_riemannian_grad(
-        &self,
-        p: ArrayView1<'_, f64>,
-        egrad: ArrayView1<'_, f64>,
-        out: ArrayViewMut1<'_, f64>,
-    ) -> Result<(), ManifoldError> {
+    fn euclidean_to_riemannian_grad(&self, p: ArrayView1<'_, f64>, egrad: ArrayView1<'_, f64>, out: ArrayViewMut1<'_, f64>)
+        -> Result<(), ManifoldError> {
         out.assign(&egrad);
         self.project_tangent(p, out)
     }
 
-    fn euclidean_to_riemannian_hess_vp(
-        &self,
-        p: ArrayView1<'_, f64>,
-        egrad: ArrayView1<'_, f64>,
-        ehess_xi: ArrayView1<'_, f64>,
-        xi: ArrayView1<'_, f64>,
-        out: ArrayViewMut1<'_, f64>,
-    ) -> Result<(), ManifoldError>;
+    fn euclidean_to_riemannian_hess_vp(&self, p: ArrayView1<'_, f64>, egrad: ArrayView1<'_, f64>, ehess_xi: ArrayView1<'_, f64>, xi: ArrayView1<'_, f64>, out: ArrayViewMut1<'_, f64>)
+        -> Result<(), ManifoldError>;
 }
 ```
 
@@ -1150,24 +1002,10 @@ Error type:
 ```rust
 #[derive(Debug, Clone)]
 pub enum ManifoldError {
-    DimensionMismatch {
-        manifold: &'static str,
-        expected: usize,
-        found: usize,
-        role: &'static str,
-    },
-    InvalidPoint {
-        manifold: &'static str,
-        reason: String,
-    },
-    InvalidTangent {
-        manifold: &'static str,
-        reason: String,
-    },
-    BoundaryActive {
-        manifold: &'static str,
-        reason: String,
-    },
+    DimensionMismatch { manifold: &'static str, expected: usize, found: usize, role: &'static str },
+    InvalidPoint { manifold: &'static str, reason: String },
+    InvalidTangent { manifold: &'static str, reason: String },
+    BoundaryActive { manifold: &'static str, reason: String },
 }
 ```
 
@@ -1182,10 +1020,7 @@ pub enum ManifoldKind {
     Interval { lo: f64, hi: f64 },
     Torus { dim: usize },
     Product { components: Vec<ManifoldKind> },
-    ProductWithMetric {
-        components: Vec<ManifoldKind>,
-        ambient_weights: Vec<f64>,
-    },
+    ProductWithMetric { components: Vec<ManifoldKind>, ambient_weights: Vec<f64> },
 }
 
 impl ManifoldKind {
@@ -1291,7 +1126,7 @@ pub fn retract_latent_rows(
 Derivative contraction extension:
 
 ```rust
-use ndarray::Array3;
+use ndarray::{Array3, ArrayView3};
 
 pub struct InputLocationHessianBlocks {
     pub grad_t: Array2<f64>,
@@ -1362,7 +1197,4 @@ t_new = R_p(ξ).
 7. Treat IFT warm-start deltas as tangent vectors and apply retraction.
 8. Use projection vector transport by default.
 9. Handle interval boundaries as active constraints.
-10. Do not add finite-difference derivative paths.
-11. Remove unused chart-specific optimizer paths once embedded manifolds own
-    the update path.
-
+10. Do not add finite-difference derivative paths; remove unused chart paths once embedded manifolds own the update.
