@@ -689,8 +689,8 @@ impl ArrowSchurSystem {
         ridge_t: f64,
         ridge_beta: f64,
     ) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
-        let (delta_t, delta_beta, _cache) = solve_arrow_newton_step(self, ridge_t, ridge_beta)?;
-        Ok((delta_t, delta_beta))
+        let options = ArrowSolveOptions::automatic(self.k);
+        solve_arrow_newton_step_core(self, ridge_t, ridge_beta, &options)
     }
 
     /// Solve with an explicit BA Schur mode.
@@ -706,9 +706,7 @@ impl ArrowSchurSystem {
         ridge_beta: f64,
         options: &ArrowSolveOptions,
     ) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
-        let (delta_t, delta_beta, _cache) =
-            solve_arrow_newton_step_with_options(self, ridge_t, ridge_beta, options)?;
-        Ok((delta_t, delta_beta))
+        solve_arrow_newton_step_core(self, ridge_t, ridge_beta, options)
     }
 }
 
@@ -820,9 +818,9 @@ impl ArrowFactorCache {
 /// Schur-eliminate the per-row latent block and solve for `(Δt, Δβ)`,
 /// returning the factor cache alongside the increments.
 ///
-/// This is the canonical entry point — both [`ArrowSchurSystem::solve`]
-/// (which discards the cache) and the joint Newton driver in
-/// `crate::solver::latent_inner` route through here.
+/// This cached entry point is for IFT warm-start consumers. Call
+/// [`ArrowSchurSystem::solve`] or [`ArrowSchurSystem::solve_with_options`]
+/// when the cache is not needed.
 ///
 /// `ridge_t` and `ridge_beta` are nonnegative diagonal regularizers added
 /// to the latent and β blocks respectively before factorization — used by
@@ -850,6 +848,62 @@ pub fn solve_arrow_newton_step_with_options(
     ridge_beta: f64,
     options: &ArrowSolveOptions,
 ) -> Result<(Array1<f64>, Array1<f64>, ArrowFactorCache), ArrowSchurError> {
+    let step = solve_arrow_newton_step_artifacts(sys, ridge_t, ridge_beta, options)?;
+    let backend = CpuBatchedBlockSolver;
+
+    // Snapshot per-row cross-blocks so the IFT predictor can apply
+    // the β-coupled sensitivity without re-running the assembler.
+    let htbeta: Vec<Array2<f64>> = sys.rows.iter().map(|r| r.htbeta.clone()).collect();
+    // Factor the UNDAMPED per-row blocks for the IFT predictor. When
+    // ridge_t was zero the damped and undamped factors coincide and we
+    // can reuse htt_factors directly; otherwise pay a second per-row
+    // Cholesky (O(N d³), same complexity class as the Newton solve).
+    let htt_factors_undamped: Vec<Array2<f64>> = if ridge_t == 0.0 {
+        step.htt_factors.clone()
+    } else {
+        backend.factor_blocks(&sys.rows, 0.0, sys.d)?
+    };
+    let cache = ArrowFactorCache {
+        htt_factors: step.htt_factors,
+        htt_factors_undamped,
+        schur_factor: step.schur_factor,
+        solver_mode: options.mode,
+        ridge_t,
+        ridge_beta,
+        htbeta,
+        d: sys.d,
+        k: sys.k,
+    };
+    Ok((step.delta_t, step.delta_beta, cache))
+}
+
+/// Schur-eliminate the per-row latent block and solve with explicit options,
+/// returning only `(Δt, Δβ)`.
+///
+/// Use this entry point when the IFT factor cache is not consumed.
+pub fn solve_arrow_newton_step_core(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    options: &ArrowSolveOptions,
+) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
+    solve_arrow_newton_step_artifacts(sys, ridge_t, ridge_beta, options)
+        .map(|step| (step.delta_t, step.delta_beta))
+}
+
+struct ArrowNewtonStepArtifacts {
+    delta_t: Array1<f64>,
+    delta_beta: Array1<f64>,
+    htt_factors: Vec<Array2<f64>>,
+    schur_factor: Option<Array2<f64>>,
+}
+
+fn solve_arrow_newton_step_artifacts(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    options: &ArrowSolveOptions,
+) -> Result<ArrowNewtonStepArtifacts, ArrowSchurError> {
     let n = sys.rows.len();
     let d = sys.d;
     let k = sys.k;
@@ -911,30 +965,12 @@ pub fn solve_arrow_newton_step_with_options(
         }
     }
 
-    // Snapshot per-row cross-blocks so the IFT predictor can apply
-    // the β-coupled sensitivity without re-running the assembler.
-    let htbeta: Vec<Array2<f64>> = sys.rows.iter().map(|r| r.htbeta.clone()).collect();
-    // Factor the UNDAMPED per-row blocks for the IFT predictor. When
-    // ridge_t was zero the damped and undamped factors coincide and we
-    // can reuse htt_factors directly; otherwise pay a second per-row
-    // Cholesky (O(N d³), same complexity class as the Newton solve).
-    let htt_factors_undamped: Vec<Array2<f64>> = if ridge_t == 0.0 {
-        htt_factors.clone()
-    } else {
-        backend.factor_blocks(&sys.rows, 0.0, d)?
-    };
-    let cache = ArrowFactorCache {
+    Ok(ArrowNewtonStepArtifacts {
+        delta_t,
+        delta_beta,
         htt_factors,
-        htt_factors_undamped,
         schur_factor,
-        solver_mode: options.mode,
-        ridge_t,
-        ridge_beta,
-        htbeta,
-        d,
-        k,
-    };
-    Ok((delta_t, delta_beta, cache))
+    })
 }
 
 // ===========================================================================

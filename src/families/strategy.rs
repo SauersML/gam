@@ -238,7 +238,9 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 )
                 .map(|v| v.mean)
             }
-            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+            LikelihoodFamily::PoissonLog
+            | LikelihoodFamily::NegativeBinomial { .. }
+            | LikelihoodFamily::GammaLog => {
                 // E[exp(η)] where η ~ N(eta, se²) = exp(eta + se²/2)  (log-normal MGF)
                 Ok((eta + 0.5 * se_eta * se_eta).exp())
             }
@@ -311,7 +313,9 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 });
                 Ok((m1, (m2 - m1 * m1).max(0.0)))
             }
-            LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+            LikelihoodFamily::PoissonLog
+            | LikelihoodFamily::NegativeBinomial { .. }
+            | LikelihoodFamily::GammaLog => {
                 // Log-normal moments: E[exp(η)] = exp(μ + σ²/2),
                 // Var[exp(η)] = exp(2μ + σ²)(exp(σ²) - 1)
                 let s2 = se_eta * se_eta;
@@ -345,6 +349,14 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture => Ok(NoiseModel::Bernoulli),
             LikelihoodFamily::PoissonLog => Ok(NoiseModel::Poisson),
+            LikelihoodFamily::NegativeBinomial { theta } => {
+                if !(theta.is_finite() && theta > 0.0) {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "negative-binomial theta must be finite and > 0; got {theta}"
+                    )));
+                }
+                Ok(NoiseModel::NegativeBinomial { theta })
+            }
             LikelihoodFamily::GammaLog => {
                 // Callers should pass the fitted Gamma shape; default to 1 only
                 // when older metadata does not expose it.
