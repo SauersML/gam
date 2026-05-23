@@ -2175,7 +2175,7 @@ def gaussian_reml_fit_latent(
     tensor_knot_offsets: Sequence[int] | None = None,
     tensor_degrees: Sequence[int] | None = None,
 ) -> dict[str, Any]:
-    """Fit a Gaussian Duchon decoder with per-row latent coordinates.
+    """Fit a Gaussian decoder with per-row latent coordinates.
 
     This is the low-level array API behind :class:`gamfit.LatentCoord`: each
     row has a latent coordinate ``t_n ∈ R^d`` and the fitted mean is
@@ -2191,8 +2191,10 @@ def gaussian_reml_fit_latent(
 
     ``t`` is supplied as a flat row-major ``(N * d,)`` vector; ``n_obs`` and
     ``latent_dim`` carry the shape. ``centers`` and ``penalty`` define the
-    Duchon decoder basis. The result contains coefficients, fitted values,
-    REML score fields, and caches used by the backward companion.
+    decoder basis. ``basis_kind`` currently supports ``"duchon"`` and
+    ``"tensor_bspline"`` on this forward path. The result contains
+    coefficients, fitted values, REML score fields, and caches used by the
+    backward companion.
 
     Identifiability options:
 
@@ -2296,6 +2298,9 @@ def gaussian_reml_fit_latent_backward(
     (auxiliary-prior pullback and/or ARD per-axis ridge); the outer
     driver may walk ``t`` directly under this combined gradient without
     re-applying the gauge fix.
+
+    ``basis_kind`` currently supports ``"duchon"`` and ``"tensor_bspline"``
+    for this backward path.
     """
     import numpy as np
 
@@ -2357,6 +2362,7 @@ def glm_reml_fit_latent(
     penalty: Any,
     family: str,
     *,
+    tweedie_p: float = 1.5,
     m: int = 2,
     weights: Any | None = None,
     fisher_w: Any | None = None,
@@ -2369,9 +2375,10 @@ def glm_reml_fit_latent(
     """Latent-coordinate REML/LAML fit for GLM families via PIRLS.
 
     ``family`` accepts ``"binomial-logit"``, ``"binomial-probit"``,
-    ``"binomial-cloglog"``, ``"poisson-log"``, ``"gamma-log"``, and
-    ``"gaussian-identity"``. ``fisher_w`` is an advanced internal hook; this
-    scalar-response entry point currently accepts blocks with shape ``(N,1,1)``.
+    ``"binomial-cloglog"``, ``"poisson-log"``, ``"tweedie-log"``,
+    ``"gamma-log"``, and ``"gaussian-identity"``. ``tweedie_p`` defaults to
+    ``1.5``. ``fisher_w`` is an advanced internal hook; this scalar-response
+    entry point currently accepts blocks with shape ``(N,1,1)``.
     """
     import numpy as np
 
@@ -2385,6 +2392,7 @@ def glm_reml_fit_latent(
             _numeric_matrix(centers, "centers"),
             _numeric_matrix(penalty, "penalty"),
             str(family),
+            float(tweedie_p),
             int(m),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if fisher_w is None else np.asarray(fisher_w, dtype=float),
@@ -2431,7 +2439,14 @@ def glm_reml_fit_latent_backward(
     dim_selection_log_precision: Any | None = None,
     basis_kind: str = "duchon",
 ) -> dict[str, Any]:
-    """Return the analytic latent gradient for ``glm_reml_fit_latent``."""
+    """Return the analytic Duchon latent gradient for ``glm_reml_fit_latent``.
+
+    The ``basis_kind`` argument is accepted for signature symmetry, but this
+    low-level GLM backward path currently implements only ``"duchon"``.
+    For ``family="tweedie-log"``, the Rust backward path uses the default
+    Tweedie power ``p=1.5``; it does not yet expose the forward path's
+    ``tweedie_p`` override.
+    """
     import numpy as np
 
     rust = rust_module()

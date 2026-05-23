@@ -10308,6 +10308,57 @@ pub fn calculate_deviance(
                 .sum();
             2.0 * total
         }
+        GlmLikelihoodFamily::Tweedie { p } => {
+            let p = sanitize_tweedie_p(p);
+            if tweedie_p_is_poisson(p) {
+                use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                let total: f64 = (0..y.len())
+                    .into_par_iter()
+                    .map(|i| {
+                        let yi = y[i];
+                        let mui_c = mu[i].max(EPS);
+                        let term = if yi > EPS {
+                            yi * (yi / mui_c).ln() - (yi - mui_c)
+                        } else {
+                            mui_c
+                        };
+                        priorweights[i] * term
+                    })
+                    .sum();
+                2.0 * total
+            } else if tweedie_p_is_gamma(p) {
+                let phi = estimate_tweedie_phi_from_mu(y, mu, priorweights, p);
+                use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                let total: f64 = (0..y.len())
+                    .into_par_iter()
+                    .map(|i| {
+                        let yi_c = y[i].max(EPS);
+                        let mui_c = mu[i].max(EPS);
+                        let ratio = yi_c / mui_c;
+                        priorweights[i] * (ratio - 1.0 - ratio.ln()) / phi
+                    })
+                    .sum();
+                2.0 * total
+            } else {
+                let phi = estimate_tweedie_phi_from_mu(y, mu, priorweights, p);
+                use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                let total: f64 = (0..y.len())
+                    .into_par_iter()
+                    .map(|i| {
+                        let yi = y[i];
+                        let mui_c = mu[i].max(EPS);
+                        let y_term = if yi > EPS {
+                            yi * (yi.powf(1.0 - p) - mui_c.powf(1.0 - p)) / (1.0 - p)
+                                - (yi.powf(2.0 - p) - mui_c.powf(2.0 - p)) / (2.0 - p)
+                        } else {
+                            mui_c.powf(2.0 - p) / (2.0 - p)
+                        };
+                        priorweights[i] * y_term / phi
+                    })
+                    .sum();
+                2.0 * total
+            }
+        }
         GlmLikelihoodFamily::GammaLog => {
             let shape = likelihood.gamma_shape().unwrap_or(1.0);
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -10366,6 +10417,24 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                 priorweights[i] * (log_term - mui_c)
             })
             .sum(),
+        GlmLikelihoodFamily::Tweedie { p } => {
+            let p = sanitize_tweedie_p(p);
+            if tweedie_p_is_poisson(p) {
+                (0..n)
+                    .into_par_iter()
+                    .map(|i| {
+                        let mui_c = mu[i].max(EPS);
+                        let log_term = if y[i] > 0.0 { y[i] * mui_c.ln() } else { 0.0 };
+                        priorweights[i] * (log_term - mui_c)
+                    })
+                    .sum()
+            } else if tweedie_p_is_gamma(p) {
+                let phi = estimate_tweedie_phi_from_mu(y, mu, priorweights, p);
+                gamma_loglikelihood_with_shape(y, mu, priorweights, 1.0 / phi)
+            } else {
+                -0.5 * calculate_deviance(y, mu, likelihood, priorweights)
+            }
+        }
         GlmLikelihoodFamily::GammaLog => gamma_loglikelihood_with_shape(
             y,
             mu,
