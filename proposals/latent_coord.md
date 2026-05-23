@@ -40,9 +40,11 @@ GPy / sklearn `IsoMap` or hand-rolled alternation (see this repo's
 `auto_74.py` for the alternation-then-ICA workaround).
 
 We already ship `gaussian_reml_fit_positions{,_backward}` for the 1-D
-case (B-spline positions with `grad_t` exposed). `LatentCoord` is the
-*N-D Duchon* generalization of that same idea, lifted to a configuration
-type rather than a bespoke function.
+case (B-spline positions with `grad_t` exposed; `gamfit/_api.py:1848`,
+`gamfit/_api.py:1920`) and the low-level N-D latent entry point
+`gaussian_reml_fit_latent` (`gamfit/_api.py:2157`). `LatentCoord`
+(`gamfit/smooth.py:232`) is the configuration-layer form of that same
+idea rather than a bespoke function.
 
 ## 2. Math
 
@@ -200,23 +202,25 @@ print(model.latents["t"].values) # (N, d) posterior mean
 
 ### 3.2 Rust
 
-A new sibling of `SpatialLogKappaCoords`:
+Current Rust shape, now landed as the sibling of `SpatialLogKappaCoords`
+(`src/terms/latent_coord.rs:561`):
 
 ```rust
-// src/terms/smooth.rs  (alongside SpatialLogKappaCoords)
-pub(crate) struct LatentCoordValues {
+// src/terms/latent_coord.rs
+pub struct LatentCoordValues {
     /// Flattened (N, d) latent matrix, row-major.
-    values: Array2<f64>,
-    /// Which design-term consumes this latent (one term per LatentCoord).
-    term_index: usize,
-    /// Identifiability mode.
+    values: Array1<f64>,
+    n_obs: usize,
+    latent_dim: usize,
     id_mode: LatentIdMode,
+    manifold: LatentManifold,
 }
 
-pub(crate) enum LatentIdMode {
-    AuxPrior { u: Array2<f64>, g: AuxPredictor, tau: f64 },
-    Orthogonality { weight: f64 },
-    ReMlDimSelect,
+pub enum LatentIdMode {
+    AuxPrior { u: Array2<f64>, family: AuxPriorFamily, strength: AuxPriorStrength },
+    AuxPriorDimSelection { ... },
+    DimSelection { ... },
+    None,
 }
 
 impl LatentCoordValues {
@@ -236,9 +240,12 @@ impl LatentCoordValues {
 }
 ```
 
-The outer optimizer receives `t` as a new block of `hyper_dirs` (existing
+The outer optimizer receives `t` as a block of `hyper_dirs` (existing
 machinery — `try_build_spatial_log_kappa_hyper_dirs` already builds these
-for ψ; the new builder is `try_build_latent_coord_hyper_dirs`).
+for ψ; the landed builder is `try_build_latent_coord_hyper_dirs`
+at `src/terms/smooth.rs:12527`). Basis-side derivatives flow through
+`LatentCoordDesignDerivative` (`src/terms/basis.rs:4118`) and
+`HyperDesignDerivative::from_latent_coord` (`src/solver/reml/mod.rs:2723`).
 
 ## 4. Mechanical reuse map
 
@@ -253,15 +260,19 @@ for ψ; the new builder is `try_build_latent_coord_hyper_dirs`).
 | `duchon_radial_jets` in `terms/basis.rs` | now also queried via `design_gradient_wrt_t` | same routine; first-arg derivative |
 | `gaussian_reml_fit_positions_backward_impl` + `contract_position_gradient` | shipped 1D special case → generalize to ND | already returns `grad_t` |
 
-**New pieces required:**
-1. `LatentCoordValues` struct + the three id-mode variants.
-2. A new term-spec attribute `latent: Option<LatentCoordRef>` on the
-   smooth-term builder so a term consumes `t` instead of an observed col.
-3. Outer-fit dispatch to build `hyper_dirs` for any registered
-   `LatentCoord`s, identical pattern to kernel-shape `ψ`.
-4. `dim_selection=True` path: when set, expand `d` by one and let
-   REML decide; needs an outer loop over `d` analogous to the existing
-   smoothing-grid search.
+**Implementation checkpoint:**
+1. `LatentCoordValues` and id modes are present (`src/terms/latent_coord.rs:561`,
+   `src/terms/latent_coord.rs:107`).
+2. The standard formula workflow accepts `latents={...}` and prepares a
+   single latent smooth term (`src/solver/workflow.rs:3105-3241`,
+   `src/solver/workflow.rs:3354-3457`).
+3. Outer-fit dispatch builds `hyper_dirs` through
+   `try_build_latent_coord_hyper_dirs` (`src/terms/smooth.rs:12527`) and
+   optimizes via `fit_term_collectionwith_latent_coord_optimization`
+   (`src/terms/smooth.rs:17191`).
+4. `dim_selection=True` is wired only with an auxiliary prior; the workflow
+   rejects ARD-alone latent fits because ARD is not a gauge fix
+   (`src/solver/workflow.rs:3231-3241`).
 
 Crucially: **no new optimizer**, **no new IFT code**, **no new
 matrix-free CG**. The existing ext-coordinate machinery covers it.
