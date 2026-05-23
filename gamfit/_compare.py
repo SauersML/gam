@@ -26,12 +26,8 @@ from ._model import Model
 _REML_SCORE_KEYS = ("reml_score", "evidence", "laml", "score")
 _EDF_KEYS = ("edf_total", "edf", "effective_dof")
 _PENALTY_RANK_KEYS = ("penalty_rank", "rank_s", "rank_S", "cache_penalty_rank")
-_NULLITY_KEYS = (
-    "null_dim",
-    "nullity",
-    "penalty_nullity",
-    "cache_nullity",
-)
+_NULL_DIM_KEYS = ("null_dim",)
+_NULLITY_KEYS = ("nullity", "penalty_nullity", "cache_nullity")
 _DIM_KEYS = ("effective_dim", "dim_h", "dim_H", "hessian_dim")
 _TK_LOG_2PI = math.log(2.0 * math.pi)
 
@@ -97,6 +93,9 @@ def _tierney_kadane_normalizer_from_null_dim(null_dim: float) -> float:
 
 
 def _extract_null_dim(fit: Any) -> float | None:
+    null_dim = _extract_float_metadata(fit, _NULL_DIM_KEYS)
+    if null_dim is not None:
+        return null_dim
     nullity = _extract_float_metadata(fit, _NULLITY_KEYS)
     if nullity is not None:
         return nullity * _extract_output_dim(fit)
