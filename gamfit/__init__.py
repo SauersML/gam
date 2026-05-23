@@ -88,7 +88,7 @@ from .topology import (
     Sphere as TopologySphere,
     Torus,
 )
-from .select_topology import (
+from ._select_topology import (
     BasisSpec,
     ScoreKind,
     ScoreScale,
