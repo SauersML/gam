@@ -25,6 +25,15 @@ from ._model import Model
 
 _REML_SCORE_KEYS = ("reml_score", "evidence", "laml", "score")
 _EDF_KEYS = ("edf_total", "edf", "effective_dof")
+_PENALTY_RANK_KEYS = ("penalty_rank", "rank_s", "rank_S", "cache_penalty_rank")
+_NULLITY_KEYS = (
+    "null_dim",
+    "nullity",
+    "penalty_nullity",
+    "cache_nullity",
+)
+_DIM_KEYS = ("effective_dim", "dim_h", "dim_H", "hessian_dim")
+_TK_LOG_2PI = math.log(2.0 * math.pi)
 
 
 def _extract_reml_score(fit: Any) -> float:
@@ -32,8 +41,13 @@ def _extract_reml_score(fit: Any) -> float:
 
     Accepts a :class:`Model` (uses its ``evidence`` / summary), a ``dict``
     returned by ``gaussian_reml_fit`` and friends, or anything mapping with a
-    ``reml_score`` / ``evidence`` key.
+    ``reml_score`` / ``evidence`` key. When rank metadata is present, the
+    score is converted to the Tierney-Kadane dimension-normalized convention.
     """
+    return _with_tierney_kadane_normalizer(fit, _extract_reml_score_raw(fit))
+
+
+def _extract_reml_score_raw(fit: Any) -> float:
     if isinstance(fit, Model):
         summary = fit.summary().payload
         for key in _REML_SCORE_KEYS:
@@ -58,6 +72,72 @@ def _extract_reml_score(fit: Any) -> float:
         f"compare_models: cannot extract reml_score from {type(fit).__name__}; "
         "pass a gamfit.Model, a dict with 'reml_score', or an object exposing .evidence"
     )
+
+
+def _with_tierney_kadane_normalizer(fit: Any, score: float) -> float:
+    """Apply ``-0.5 * (dim(H) - rank(S)) * log(2π)`` when metadata exists."""
+    null_dim = _extract_null_dim(fit)
+    if null_dim is None:
+        return float(score)
+    if not math.isfinite(null_dim) or null_dim < -1e-9:
+        raise ValueError(
+            "compare_models: invalid Tierney-Kadane null dimension "
+            f"{null_dim!r}"
+        )
+    return float(score) + _tierney_kadane_normalizer_from_null_dim(null_dim)
+
+
+def _tierney_kadane_normalizer_from_null_dim(null_dim: float) -> float:
+    if not math.isfinite(null_dim) or null_dim < -1e-9:
+        raise ValueError(
+            "compare_models: invalid Tierney-Kadane null dimension "
+            f"{null_dim!r}"
+        )
+    return -0.5 * max(0.0, null_dim) * _TK_LOG_2PI
+
+
+def _extract_null_dim(fit: Any) -> float | None:
+    nullity = _extract_float_metadata(fit, _NULLITY_KEYS)
+    if nullity is not None:
+        return nullity * _extract_output_dim(fit)
+    dim_h = _extract_float_metadata(fit, _DIM_KEYS)
+    penalty_rank = _extract_float_metadata(fit, _PENALTY_RANK_KEYS)
+    if dim_h is None or penalty_rank is None:
+        return None
+    return dim_h - penalty_rank
+
+
+def _extract_output_dim(fit: Any) -> float:
+    coefficients = _extract_metadata_value(fit, ("coefficients",))
+    shape = getattr(coefficients, "shape", None)
+    if shape is not None and len(shape) >= 2:
+        return float(shape[1])
+    return 1.0
+
+
+def _extract_float_metadata(fit: Any, keys: tuple[str, ...]) -> float | None:
+    value = _extract_metadata_value(fit, keys)
+    if value is None:
+        return None
+    return float(value)
+
+
+def _extract_metadata_value(fit: Any, keys: tuple[str, ...]) -> Any | None:
+    mappings: list[Mapping[str, Any]] = []
+    if isinstance(fit, Model):
+        mappings.append(fit.summary().payload)
+    if isinstance(fit, Mapping):
+        mappings.append(fit)
+    for mapping in mappings:
+        for key in keys:
+            value = mapping.get(key)
+            if value is not None:
+                return value
+    for key in keys:
+        value = getattr(fit, key, None)
+        if value is not None:
+            return value
+    return None
 
 
 def _extract_edf(fit: Any) -> float | None:
@@ -102,8 +182,9 @@ def compare_models(
 ) -> dict[str, Any]:
     """Rank candidate fits by Bayesian marginal-likelihood (REML / LAML).
 
-    Each fit's ``reml_score`` is treated as a log marginal likelihood with
-    Occam factors already included — differences are log Bayes factors. Use
+    Each fit's ``reml_score`` is treated as the Tierney-Kadane normalized
+    marginal likelihood: ``-0.5 * (dim(H) - rank(S)) * log(2π)`` is included
+    whenever rank metadata is present. Differences are log Bayes factors. Use
     this to compare fits that differ in *model structure* (basis topology,
     penalty order, presence of a term). The Occam-factor interpretation is
     only as good as the prior normalization and model comparability: candidate

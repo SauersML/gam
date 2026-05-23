@@ -579,7 +579,11 @@ fn latent_warmstart_delta(
     let mut delta = Array1::<f64>::zeros(cached_bits.len());
     let mut per_axis_linf = vec![0.0_f64; d];
     let mut max_linf = 0.0_f64;
-    for (idx, (current, previous_bits)) in latent.as_flat().iter().zip(cached_bits.iter()).enumerate()
+    for (idx, (current, previous_bits)) in latent
+        .as_flat()
+        .iter()
+        .zip(cached_bits.iter())
+        .enumerate()
     {
         let previous = f64::from_bits(*previous_bits);
         let diff = *current - previous;
