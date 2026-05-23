@@ -6883,3 +6883,1910 @@ src/terms/analytic_penalties.rs:286:    /// flattened row-major as `(n_obs, d*d)
 src/terms/analytic_penalties.rs:785:    /// `local = I_{n_obs}` and `col_range` equal to the flat indices of that
 src/terms/analytic_penalties.rs:791:            // The flat layout is row-major (n * d + a), so axis j picks rows
 
+exec
+/bin/zsh -lc 'rg -n "smoothing parameter|Smoothing|lambda|rho" src/types.rs src/solver/protocol.rs src/solver/reml/mod.rs src/solver/reml/runtime.rs src/solver/reml/hyper.rs src/terms/smooth.rs src/terms/construction.rs | head -n 240' in /Users/user/gam
+ succeeded in 0ms:
+src/types.rs:86:    pub initial_rho: Array1<f64>,
+src/types.rs:94:    pub rho: Array1<f64>,
+src/types.rs:183:/// Fixed prior family for smoothing parameters in joint HMC refinement.
+src/types.rs:191:    /// Gamma(shape, rate) conjugate hyperprior on the precision lambda = exp(rho).
+src/types.rs:194:    /// `rate * exp(rho) - (shape - 1) * rho` up to an additive constant. For a
+src/types.rs:205:    /// Coordinate-specific priors for models whose smoothing parameters do
+src/types.rs:432:                rho: Array1::zeros(0),
+src/types.rs:813:    /// Must remain independent of smoothing parameters (`rho`) for smooth outer derivatives.
+src/types.rs:814:    pub rho_independent: bool,
+src/types.rs:817:    /// Include ridge in penalty determinant term (e.g. `log|S_lambda + delta I|`).
+src/types.rs:831:            rho_independent: true,
+src/types.rs:911:// LAML rho-Hessian inversion, survival stabilization, custom-family
+src/types.rs:1202:array1_f64_newtype!(LogSmoothingParams, exp);
+src/types.rs:1206:pub struct LogSmoothingParamsView<'a>(pub ArrayView1<'a, f64>);
+src/types.rs:1208:impl<'a> LogSmoothingParamsView<'a> {
+src/types.rs:1218:impl<'a> Deref for LogSmoothingParamsView<'a> {
+src/terms/construction.rs:622:    /// First derivatives of log-determinant w.r.t. log-smoothing parameters
+src/terms/construction.rs:644:    /// The rho-independent shrinkage ridge magnitude that was added to each
+src/terms/construction.rs:893:    /// Accumulate lambda * S_k into a pre-allocated `p x p` target matrix.
+src/terms/construction.rs:895:    pub fn accumulate_weighted(&self, target: &mut Array2<f64>, lambda: f64) {
+src/terms/construction.rs:896:        if lambda == 0.0 || self.rank() == 0 {
+src/terms/construction.rs:902:            .scaled_add(lambda, &self.local);
+src/terms/construction.rs:1569:    /// This is lambda-independent and provides a natural scale for shrinkage.
+src/terms/construction.rs:1575:/// Precompute the lambda-invariant reparameterization structure from canonical penalties.
+src/terms/construction.rs:1899:/// Apply stable reparameterization using precomputed lambda-invariant structures.
+src/terms/construction.rs:1902:/// of the penalized block. If `Some(epsilon)`, a rho-independent ridge of
+src/terms/construction.rs:1910:    lambdas: &[f64],
+src/terms/construction.rs:1917:    if lambdas.len() != m {
+src/terms/construction.rs:1919:            "Lambda count mismatch: expected {} lambdas for {} penalties, got {}",
+src/terms/construction.rs:1922:            lambdas.len()
+src/terms/construction.rs:1926:    // No separate length check needed — penalties are matched against lambdas above,
+src/terms/construction.rs:1996:        // parallel above, but the lambda-weighted sum is accumulated serially in
+src/terms/construction.rs:1998:        for (lambda, s_k) in lambdas.iter().zip(s_k_penalized_cache.iter()) {
+src/terms/construction.rs:2001:                    range_block[(i, j)] += *lambda * s_k[(i, j)];
+src/terms/construction.rs:2022:        // keeping Q_s lambda-independent prevents BFGS coordinate-system
+src/terms/construction.rs:2031:        // q_pen and rs_transformed stay in the lambda-independent
+src/terms/construction.rs:2037:    // - Penalized and null spaces are fixed by the lambda-invariant basis `qs_base`.
+src/terms/construction.rs:2038:    // - Runtime lambda dependence only appears in the penalized block eigenvalues.
+src/terms/construction.rs:2043:    // Shrinkage floor: add a rho-independent ridge to the penalized block eigenvalues.
+src/terms/construction.rs:2047:    // balanced penalty's max eigenvalue (lambda-independent scale), so LAML gradients
+src/terms/construction.rs:2048:    // w.r.t. rho remain correct: d(epsilon * I)/d(rho_k) = 0.
+src/terms/construction.rs:2117:    // penalized subspace is NOT rotated by the lambda-dependent eigenvectors
+src/terms/construction.rs:2135:    // the lambda-weighted sum) are floored to `eigenvalue_floor` to keep the
+src/terms/construction.rs:2138:    // lambda dynamic range is wide (e.g. during BFGS line search probing extreme
+src/terms/construction.rs:2139:    // rho candidates).  Materially negative or non-finite spectra are already
+src/terms/construction.rs:2164:    // indexed parallel collection so the output vector preserves lambda order.
+src/terms/construction.rs:2165:    let det1vec: Vec<f64> = (0..lambdas.len())
+src/terms/construction.rs:2179:            lambdas[k] * trace
+src/terms/construction.rs:2190:        for (k, lambda) in lambdas.iter().enumerate() {
+src/terms/construction.rs:2201:            let reference = *lambda * trace.sum();
+src/terms/construction.rs:2295:    lambdas: &[f64],
+src/terms/construction.rs:2310:        lambdas,
+src/terms/construction.rs:2361:    pub fn materialize_s_transformed(&self, lambdas: &[f64]) -> Array2<f64> {
+src/terms/construction.rs:2371:                sigma += lambdas[k] * self.marginal_eigenvalues[k][multi_idx[k]];
+src/terms/construction.rs:2373:            if self.has_double_penalty && lambdas.len() > d {
+src/terms/construction.rs:2374:                sigma += lambdas[d];
+src/terms/construction.rs:2402:        lambdas: &[f64],
+src/terms/construction.rs:2415:        let s_transformed = self.materialize_s_transformed(lambdas);
+src/terms/construction.rs:2442:                    sigma += lambdas[k] * self.marginal_eigenvalues[k][multi_idx[k]];
+src/terms/construction.rs:2444:                if self.has_double_penalty && lambdas.len() > d {
+src/terms/construction.rs:2445:                    sigma += lambdas[d];
+src/terms/construction.rs:2513:    lambdas: &[f64],
+src/terms/construction.rs:2529:            sigma += lambdas[k] * marginal_eigenvalues[k][multi_idx[k]];
+src/terms/construction.rs:2532:            sigma += lambdas[d];
+src/terms/construction.rs:2541:                let ck = lambdas[k] * marginal_eigenvalues[k][multi_idx[k]];
+src/terms/construction.rs:2545:                grad[d] += lambdas[d] * inv_sigma;
+src/terms/construction.rs:2550:                    lambdas[k] * marginal_eigenvalues[k][multi_idx[k]]
+src/terms/construction.rs:2552:                    lambdas[d]
+src/terms/construction.rs:2557:                        lambdas[l] * marginal_eigenvalues[l][multi_idx[l]]
+src/terms/construction.rs:2559:                        lambdas[d]
+src/terms/construction.rs:2596:    lambdas: &[f64],
+src/terms/construction.rs:2673:        lambdas,
+src/terms/construction.rs:2695:///   cond_2(A) = max_i |lambda_i| / min_i |lambda_i|
+src/terms/construction.rs:2846:        let lambdas = vec![2.0];
+src/terms/construction.rs:2849:        let rep = stable_reparameterizationwith_invariant(&canonical, &lambdas, p, &inv, None)
+src/terms/construction.rs:2865:        let lambdas: Vec<f64> = Vec::new();
+src/terms/construction.rs:2868:        let rep = stable_reparameterizationwith_invariant(&canonical, &lambdas, p, &inv, None)
+src/terms/construction.rs:2880:        let lambdas = vec![4.0];
+src/terms/construction.rs:2883:        let rep = stable_reparameterizationwith_invariant(&canonical, &lambdas, p, &inv, None)
+src/terms/construction.rs:2925:        let lambdas = vec![5.0];
+src/terms/construction.rs:2929:        let rep = stable_reparameterizationwith_invariant(&canonical, &lambdas, p, &inv, None)
+src/terms/construction.rs:2935:        //   det1 = lambda * sum_l d_l / (lambda*d_l)
+src/terms/construction.rs:2938:        let lambda = 5.0_f64;
+src/terms/construction.rs:2939:        let expected_det1: f64 = s_k_eigs.iter().map(|&d| lambda * d / (lambda * d)).sum();
+src/terms/construction.rs:2985:        let lambdas = [2.5, 1.3];
+src/terms/construction.rs:2993:        s_dense.scaled_add(lambdas[0], &pen0);
+src/terms/construction.rs:2994:        s_dense.scaled_add(lambdas[1], &pen1);
+src/terms/construction.rs:3016:            &lambdas,
+src/terms/construction.rs:3031:        // Check derivatives via central FD in rho-space (rho = log lambda).
+src/terms/construction.rs:3032:        let rhos: Vec<f64> = lambdas.iter().map(|&l| l.ln()).collect();
+src/terms/construction.rs:3035:            let mut rho_plus = rhos.clone();
+src/terms/construction.rs:3036:            rho_plus[k] += eps;
+src/terms/construction.rs:3037:            let mut rho_minus = rhos.clone();
+src/terms/construction.rs:3038:            rho_minus[k] -= eps;
+src/terms/construction.rs:3039:            let lam_plus: Vec<f64> = rho_plus.iter().map(|&r| r.exp()).collect();
+src/terms/construction.rs:3040:            let lam_minus: Vec<f64> = rho_minus.iter().map(|&r| r.exp()).collect();
+src/solver/reml/mod.rs:43:    /// ρ at which the solve occurred. Mirror of `warm_start_rho`,
+src/solver/reml/mod.rs:45:    pub rho: ndarray::Array1<f64>,
+src/solver/reml/mod.rs:74:    pub lambda_s_beta_blocks: Option<Vec<ndarray::Array1<f64>>>,
+src/solver/reml/mod.rs:84:    pub(crate) rho_tau_penalty_bytes: usize,
+src/solver/reml/mod.rs:96:            .saturating_add(self.rho_tau_penalty_bytes)
+src/solver/reml/mod.rs:221:        rho_tau_penalty_bytes: 0,
+src/solver/reml/mod.rs:231:        rho_tau_penalty_bytes: first_penalty_component_count
+src/solver/reml/mod.rs:418:        fn rho(&self) -> &Array1<f64>;
+src/solver/reml/mod.rs:444:            let v_plus = state_plus.compute_cost(self.rho()).expect("cost+");
+src/solver/reml/mod.rs:445:            let v_minus = state_minus.compute_cost(self.rho()).expect("cost-");
+src/solver/reml/mod.rs:492:        rho_dim: usize,
+src/solver/reml/mod.rs:497:            rho_dim,
+src/solver/reml/mod.rs:529:        rho: &Array1<f64>,
+src/solver/reml/mod.rs:532:        let mut theta = Array1::<f64>::zeros(rho.len() + 1);
+src/solver/reml/mod.rs:533:        theta.slice_mut(s![..rho.len()]).assign(rho);
+src/solver/reml/mod.rs:536:            rho.len(),
+src/solver/reml/mod.rs:540:        Ok(gradient[rho.len()])
+src/solver/reml/mod.rs:549:        rho: &Array1<f64>,
+src/solver/reml/mod.rs:560:        let v_plus = state_plus.compute_cost(rho).expect("cost+");
+src/solver/reml/mod.rs:561:        let v_minus = state_minus.compute_cost(rho).expect("cost-");
+src/solver/reml/mod.rs:571:        rho: &Array1<f64>,
+src/solver/reml/mod.rs:603:                    single_directional_tau_gradient(&state_plus, rho, hyper_dirs[i].clone())
+src/solver/reml/mod.rs:606:                    single_directional_tau_gradient(&state_minus, rho, hyper_dirs[i].clone())
+src/solver/reml/mod.rs:618:        let rho = array![0.25, -0.0];
+src/solver/reml/mod.rs:619:        let rho_key = EvalCacheManager::sanitized_rhokey(&rho);
+src/solver/reml/mod.rs:627:        cache.store_outer_eval(&rho_key, &eval);
+src/solver/reml/mod.rs:630:            .cached_outer_eval(&rho_key)
+src/solver/reml/mod.rs:638:            cache.cached_outer_eval(&rho_key).is_none(),
+src/solver/reml/mod.rs:646:        // by evaluating the outer objective at one rho, then verify that
+src/solver/reml/mod.rs:661:        let rho = array![0.0];
+src/solver/reml/mod.rs:673:                &rho,
+src/solver/reml/mod.rs:802:        let rho = array![0.0];
+src/solver/reml/mod.rs:813:        let bundle = state.obtain_eval_bundle(&rho).expect("bundle");
+src/solver/reml/mod.rs:869:        let bundle_plus = state_plus.obtain_eval_bundle(&rho).expect("bundle+");
+src/solver/reml/mod.rs:870:        let bundle_minus = state_minus.obtain_eval_bundle(&rho).expect("bundle-");
+src/solver/reml/mod.rs:879:        let v_plus = state_plus.compute_cost(&rho).expect("cost+");
+src/solver/reml/mod.rs:880:        let v_minus = state_minus.compute_cost(&rho).expect("cost-");
+src/solver/reml/mod.rs:883:        let v_tau_analytic = single_directional_tau_gradient(&state, &rho, hyper.clone())
+src/solver/reml/mod.rs:998:        let rho = array![0.1, -0.2];
+src/solver/reml/mod.rs:1005:                &rho,
+src/solver/reml/mod.rs:1013:        let bundle = state.obtain_eval_bundle(&rho).expect("exact firth bundle");
+src/solver/reml/mod.rs:1015:            .compute_lamlhessian_exact_from_bundle(&rho, &bundle)
+src/solver/reml/mod.rs:1067:        let rho = array![0.15, -0.25];
+src/solver/reml/mod.rs:1070:                &rho,
+src/solver/reml/mod.rs:1076:        for col in 0..rho.len() {
+src/solver/reml/mod.rs:1077:            let mut rp = rho.clone();
+src/solver/reml/mod.rs:1078:            let mut rm = rho.clone();
+src/solver/reml/mod.rs:1095:            for row in 0..rho.len() {
+src/solver/reml/mod.rs:1156:        let rho = array![0.0];
+src/solver/reml/mod.rs:1163:        let bundle = state.obtain_eval_bundle(&rho).expect("bundle");
+src/solver/reml/mod.rs:1167:        let mut s_lambda = e.t().dot(e);
+src/solver/reml/mod.rs:1171:                s_lambda[[i, i]] += ridge;
+src/solver/reml/mod.rs:1174:        let (evals, evecs) = s_lambda.eigh(Side::Lower).expect("penalty eigh");
+src/solver/reml/mod.rs:1241:        let rho = array![0.0];
+src/solver/reml/mod.rs:1248:        let gradient = single_directional_tau_gradient(&state, &rho, hyper)
+src/solver/reml/mod.rs:1257:            &rho,
+src/solver/reml/mod.rs:1276:            .compute_efs_steps_with_psi_ext(&rho, &[efs_hyper])
+src/solver/reml/mod.rs:1302:        let rho = array![0.0];
+src/solver/reml/mod.rs:1309:        let gradient = single_directional_tau_gradient(&state, &rho, hyper)
+src/solver/reml/mod.rs:1314:        let fd = fd_directional_tau_cost_gradient(&y, &w, &x, &s0, &cfg, &rho, &x_tau, &s_tau);
+src/solver/reml/mod.rs:1347:        let rho = array![0.0];
+src/solver/reml/mod.rs:1357:                &rho,
+src/solver/reml/mod.rs:1370:            .compute_efs_steps_with_psi_ext(&rho, &hyper_dirs)
+src/solver/reml/mod.rs:1397:        let rho = array![0.0];
+src/solver/reml/mod.rs:1419:            compute_joint_hypercostgradienthessian(&state, &theta, rho.len(), &hyper_dirs)
+src/solver/reml/mod.rs:1464:        let rho = array![0.0];
+src/solver/reml/mod.rs:1466:        let theta = array![rho[0], psi[0], psi[1]];
+src/solver/reml/mod.rs:1487:            compute_joint_hypercostgradienthessian(&state, &theta, rho.len(), &hyper_dirs)
+src/solver/reml/mod.rs:1489:        let h_tt_analytic = h_full.slice(s![rho.len().., rho.len()..]).to_owned();
+src/solver/reml/mod.rs:1510:            &rho,
+src/solver/reml/mod.rs:1536:        // `rho.len()`; this test pins that contract.
+src/solver/reml/mod.rs:1605:        let rho = array![0.0];
+src/solver/reml/mod.rs:1627:            let mut t = Array1::<f64>::zeros(rho.len() + psi.len());
+src/solver/reml/mod.rs:1628:            t.slice_mut(s![..rho.len()]).assign(&rho);
+src/solver/reml/mod.rs:1629:            t.slice_mut(s![rho.len()..]).assign(&psi);
+src/solver/reml/mod.rs:1633:            compute_joint_hypercostgradienthessian(&state, &theta, rho.len(), &hyper_dirs)
+src/solver/reml/mod.rs:1635:        let h_tt_analytic = h_full.slice(s![rho.len().., rho.len()..]).to_owned();
+src/solver/reml/mod.rs:1658:            &rho,
+src/solver/reml/mod.rs:1692:        rho: Array1<f64>,
+src/solver/reml/mod.rs:1724:                rho: array![0.0],
+src/solver/reml/mod.rs:1758:        fn rho(&self) -> &Array1<f64> {
+src/solver/reml/mod.rs:1759:            &self.rho
+src/solver/reml/mod.rs:1777:        let v_tau_analytic = single_directional_tau_gradient(&state, &f.rho, hyper)
+src/solver/reml/mod.rs:1803:        let v_tau_analytic = single_directional_tau_gradient(&state, &f.rho, hyper)
+src/solver/reml/mod.rs:1833:        let mut theta = Array1::<f64>::zeros(f.rho.len() + hyper_dirs.len());
+src/solver/reml/mod.rs:1834:        theta.slice_mut(s![..f.rho.len()]).assign(&f.rho);
+src/solver/reml/mod.rs:1836:            compute_joint_hypercostgradienthessian(&state, &theta, f.rho.len(), &hyper_dirs)
+src/solver/reml/mod.rs:1838:        let h_tt_analytic = h_full.slice(s![f.rho.len().., f.rho.len()..]).to_owned();
+src/solver/reml/mod.rs:1850:            &f.rho,
+src/solver/reml/mod.rs:1906:        let rho = array![0.0];
+src/solver/reml/mod.rs:1926:        let v_tau_analytic = single_directional_tau_gradient(&state, &rho, hyper)
+src/solver/reml/mod.rs:1934:        let v_plus = state_plus.compute_cost(&rho).expect("cost+");
+src/solver/reml/mod.rs:1935:        let v_minus = state_minus.compute_cost(&rho).expect("cost-");
+src/solver/reml/mod.rs:1972:        let rho = array![0.0];
+src/solver/reml/mod.rs:1999:        let mut theta = Array1::<f64>::zeros(rho.len() + hyper_dirs.len());
+src/solver/reml/mod.rs:2000:        theta.slice_mut(s![..rho.len()]).assign(&rho);
+src/solver/reml/mod.rs:2002:            compute_joint_hypercostgradienthessian(&state, &theta, rho.len(), &hyper_dirs)
+src/solver/reml/mod.rs:2004:        let h_tt_analytic = h_full.slice(s![rho.len().., rho.len()..]).to_owned();
+src/solver/reml/mod.rs:2014:            &rho,
+src/solver/reml/mod.rs:2049:        rho: Array1<f64>,
+src/solver/reml/mod.rs:2157:                rho: array![0.0],
+src/solver/reml/mod.rs:2180:        fn rho(&self) -> &Array1<f64> {
+src/solver/reml/mod.rs:2181:            &self.rho
+src/solver/reml/mod.rs:2207:        let v_tau_analytic = single_directional_tau_gradient(&state, &f.rho, hyper)
+src/solver/reml/mod.rs:2237:        let v_tau_analytic = single_directional_tau_gradient(&state, &f.rho, hyper)
+src/solver/reml/mod.rs:2266:        let v_tau_analytic = single_directional_tau_gradient(&state, &f.rho, hyper)
+src/solver/reml/mod.rs:2298:        let mut theta = Array1::<f64>::zeros(f.rho.len() + hyper_dirs.len());
+src/solver/reml/mod.rs:2299:        theta.slice_mut(s![..f.rho.len()]).assign(&f.rho);
+src/solver/reml/mod.rs:2301:            compute_joint_hypercostgradienthessian(&state, &theta, f.rho.len(), &hyper_dirs)
+src/solver/reml/mod.rs:2303:        let h_tt_analytic = h_full.slice(s![f.rho.len().., f.rho.len()..]).to_owned();
+src/solver/reml/mod.rs:2313:            &f.rho,
+src/solver/reml/mod.rs:2334:    fn binomial_logit_n30_nonzero_rho_design_moving_gradient_matches_fd() {
+src/solver/reml/mod.rs:2335:        // Validate at a non-trivial smoothing parameter ρ = log(λ) = 1.5,
+src/solver/reml/mod.rs:2339:        let rho = array![1.5];
+src/solver/reml/mod.rs:2352:        let v_tau_analytic = single_directional_tau_gradient(&state, &rho, hyper)
+src/solver/reml/mod.rs:2358:        let v_plus = state_plus.compute_cost(&rho).expect("cost+");
+src/solver/reml/mod.rs:2359:        let v_minus = state_minus.compute_cost(&rho).expect("cost-");
+src/solver/reml/mod.rs:2365:            "Binomial-logit n=30 rho=1.5 design-moving gradient mismatch: rel={v_rel:.3e}, \
+src/solver/reml/mod.rs:2419:        let mut theta = Array1::<f64>::zeros(f.rho.len() + hyper_dirs.len());
+src/solver/reml/mod.rs:2420:        theta.slice_mut(s![..f.rho.len()]).assign(&f.rho);
+src/solver/reml/mod.rs:2422:            compute_joint_hypercostgradienthessian(&state, &theta, f.rho.len(), &hyper_dirs)
+src/solver/reml/mod.rs:2424:        let h_tt_analytic = h_full.slice(s![f.rho.len().., f.rho.len()..]).to_owned();
+src/solver/reml/mod.rs:2457:            st.compute_cost(&f.rho).expect("cost eval")
+src/solver/reml/mod.rs:3254:        rho: &Array1<f64>,
+src/solver/reml/mod.rs:3269:            if component.penalty_index >= rho.len() {
+src/solver/reml/mod.rs:3271:                    "penalty_index {} out of bounds for rho dimension {}",
+src/solver/reml/mod.rs:3273:                    rho.len()
+src/solver/reml/mod.rs:3278:                .scaled_add_to(&mut out, rho[component.penalty_index].exp())?;
+src/solver/reml/mod.rs:3520:/// for the same `rho` vector, which can happen during the line search.
+src/solver/reml/mod.rs:3705:    /// Creates a sanitized cache key from rho values.
+src/solver/reml/mod.rs:3708:    fn sanitized_rhokey(rho: &Array1<f64>) -> Option<Vec<u64>> {
+src/solver/reml/mod.rs:3709:        self::cache::sanitized_rhokey(rho)
+src/solver/reml/mod.rs:3786:    /// Relative shrinkage floor for penalized block eigenvalues (rho-independent).
+src/solver/reml/mod.rs:3788:    /// Explicit prior on log smoothing parameters used by the REML/LAML objective.
+src/solver/reml/mod.rs:3789:    rho_prior: crate::types::RhoPrior,
+src/solver/reml/mod.rs:3803:    pub(crate) warm_start_rho: RwLock<Option<Array1<f64>>>,
+src/solver/reml/mod.rs:3805:    pub(crate) prev_warm_start_rho: RwLock<Option<Array1<f64>>>,
+src/solver/reml/mod.rs:3860:    /// `PirlsConfig::initial_lm_lambda` hint so the inner Newton seeds
+src/solver/reml/mod.rs:3867:    pub(crate) last_pirls_lm_lambda: Arc<AtomicU64>,
+src/solver/reml/mod.rs:3884:    /// |Δρ| cap (`adaptive_ift_max_drho`): a small residual loosens
+src/solver/reml/mod.rs:3902:    /// `accept_rho` (model overstating predicted reduction) is a hint
+src/solver/reml/mod.rs:3906:    pub(crate) last_pirls_accept_rho: Arc<AtomicU64>,
+src/solver/reml/mod.rs:3930:    /// These depend only on the canonical penalty matrices, not on `rho`, so
+src/solver/reml/hyper.rs:661:        rho: &Array1<f64>,
+
+exec
+/bin/zsh -lc "sed -n '1,220p' src/types.rs" in /Users/user/gam
+ succeeded in 0ms:
+use ndarray::{Array1, ArrayView1};
+use serde::{Deserialize, Serialize};
+use std::ops::{Deref, DerefMut};
+
+pub use crate::hull::PeeledHull;
+
+/// Shared default for monotone wiggle/deviation blocks. Formula DSL defaults,
+/// workflow configs, and runtime deviation blocks should all derive from this
+/// type so reproducible presets do not drift across layers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WigglePenaltyConfig {
+    pub degree: usize,
+    pub num_internal_knots: usize,
+    pub penalty_orders: Vec<usize>,
+    pub double_penalty: bool,
+    pub monotonicity_eps: f64,
+}
+
+impl WigglePenaltyConfig {
+    pub fn cubic_triple_operator_default() -> Self {
+        Self {
+            degree: 3,
+            num_internal_knots: 8,
+            penalty_orders: vec![1, 2, 3],
+            double_penalty: true,
+            monotonicity_eps: 1e-4,
+        }
+    }
+}
+
+/// Shared engine-level link selector for generalized models.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkFunction {
+    Logit,
+    Probit,
+    CLogLog,
+    Sas,
+    BetaLogistic,
+    Identity,
+    Log,
+}
+
+impl LinkFunction {
+    #[inline]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Logit => "logit",
+            Self::Probit => "probit",
+            Self::CLogLog => "cloglog",
+            Self::Sas => "sas",
+            Self::BetaLogistic => "beta-logistic",
+            Self::Identity => "identity",
+            Self::Log => "log",
+        }
+    }
+}
+
+/// Supported inverse-link components for convex blended inverse links.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LinkComponent {
+    Probit,
+    Logit,
+    CLogLog,
+    LogLog,
+    Cauchit,
+}
+
+impl LinkComponent {
+    #[inline]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Probit => "probit",
+            Self::Logit => "logit",
+            Self::CLogLog => "cloglog",
+            Self::LogLog => "loglog",
+            Self::Cauchit => "cauchit",
+        }
+    }
+}
+
+/// User-facing configuration for a blended inverse link.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MixtureLinkSpec {
+    pub components: Vec<LinkComponent>,
+    /// Free logits for components [0..K-2]. The final component logit is fixed at 0.
+    pub initial_rho: Array1<f64>,
+}
+
+/// Runtime blended-link state with precomputed softmax weights.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MixtureLinkState {
+    pub components: Vec<LinkComponent>,
+    /// Free logits for components [0..K-2]. The final component logit is fixed at 0.
+    pub rho: Array1<f64>,
+    /// Softmax-normalized component weights (length K).
+    pub pi: Array1<f64>,
+}
+
+/// User-facing configuration for the continuous sinh-arcsinh inverse link.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SasLinkSpec {
+    pub initial_epsilon: f64,
+    pub initial_log_delta: f64,
+}
+
+/// Runtime SAS link state with cached positive tail parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SasLinkState {
+    pub epsilon: f64,
+    /// Raw optimization parameter.
+    pub log_delta: f64,
+    /// Effective tail parameter delta used in evaluation.
+    /// With current bounded parameterization:
+    /// delta = exp(B * tanh(log_delta / B)), B = SAS_LOG_DELTA_BOUND.
+    pub delta: f64,
+}
+
+/// Fixed latent Gaussian scale for the exact marginal cloglog family.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LatentCLogLogState {
+    pub latent_sd: f64,
+}
+
+impl LatentCLogLogState {
+    #[inline]
+    pub fn new(latent_sd: f64) -> Result<Self, String> {
+        if !latent_sd.is_finite() || latent_sd < 0.0 {
+            return Err(format!(
+                "latent cloglog standard deviation must be finite and >= 0, got {latent_sd}"
+            ));
+        }
+        Ok(Self { latent_sd })
+    }
+}
+
+/// Parameterized inverse-link selector used where mu/derivatives are evaluated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum InverseLink {
+    Standard(LinkFunction),
+    LatentCLogLog(LatentCLogLogState),
+    Sas(SasLinkState),
+    BetaLogistic(SasLinkState),
+    Mixture(MixtureLinkState),
+}
+
+impl InverseLink {
+    #[inline]
+    pub fn link_function(&self) -> LinkFunction {
+        match self {
+            Self::Standard(link) => *link,
+            Self::LatentCLogLog(_) => LinkFunction::CLogLog,
+            Self::Sas(_) => LinkFunction::Sas,
+            Self::BetaLogistic(_) => LinkFunction::BetaLogistic,
+            Self::Mixture(_) => LinkFunction::Logit,
+        }
+    }
+
+    #[inline]
+    pub fn mixture_state(&self) -> Option<&MixtureLinkState> {
+        match self {
+            Self::Mixture(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn sas_state(&self) -> Option<&SasLinkState> {
+        match self {
+            Self::Sas(state) | Self::BetaLogistic(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn latent_cloglog_state(&self) -> Option<&LatentCLogLogState> {
+        match self {
+            Self::LatentCLogLog(state) => Some(state),
+            _ => None,
+        }
+    }
+}
+
+/// Fixed prior family for smoothing parameters in joint HMC refinement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum RhoPrior {
+    Flat,
+    Normal {
+        mean: f64,
+        sd: f64,
+    },
+    /// Gamma(shape, rate) conjugate hyperprior on the precision lambda = exp(rho).
+    ///
+    /// The REML/LAML objective is minimized, so this contributes
+    /// `rate * exp(rho) - (shape - 1) * rho` up to an additive constant. For a
+    /// block with effective dimension n_p and centered quadratic
+    /// `(beta - mu)'S_p(beta - mu)`, the conditional posterior is
+    /// `Gamma(shape + n_p/2, rate + quadratic/2)` and the closed-form MAP
+    /// precision is `(shape + n_p/2 - 1) / (rate + quadratic/2)`.
+    /// `Gamma(1, 0)` is the explicit flat/default case and reproduces the
+    /// current MacKay/Tipping fixed point.
+    GammaPrecision {
+        shape: f64,
+        rate: f64,
+    },
+    /// Coordinate-specific priors for models whose smoothing parameters do
+    /// not share one prior family, such as nested coefficient groups.
+    Independent(Vec<RhoPrior>),
+}
+
+impl Default for RhoPrior {
+    fn default() -> Self {
+        Self::Normal { mean: 0.0, sd: 3.0 }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unified likelihood specification (in-progress migration)
+// ---------------------------------------------------------------------------
+//
+// The codebase historically carries two parallel selectors:
+
+exec
+/bin/zsh -lc "sed -n '1,220p' src/solver/protocol.rs" in /Users/user/gam
+ succeeded in 0ms:
+use crate::families::bernoulli_marginal_slope::{
+    DEFAULT_EMPIRICAL_LATENT_GRID_SIZE, DeviationBlockConfig, LatentMeasureSpec, LatentZCheckMode,
+    LatentZNormalizationMode, LatentZPolicy,
+};
+use crate::families::survival_construction::SurvivalBaselineTarget;
+use crate::types::{InverseLink, LinkFunction};
+
+/// Calibration semantics for the latent score `z` consumed by marginal-slope
+/// families. Every variant is fully effective — there are no silently-ignored
+/// metadata fields.
+#[derive(Clone, Debug)]
+pub enum LatentScoreSemantics {
+    /// z is already on a frozen latent scale and the calibration law is
+    /// assumed (approximately) standard normal. `check_mode` controls whether
+    /// the fit aborts (`Strict`), only warns (`WarnOnly`), or skips the
+    /// normality diagnostics entirely (`Off`).
+    FrozenConditionalNormal { check_mode: LatentZCheckMode },
+    /// z will be centered/scaled inside the fit.
+    FitWeightedNormalization,
+    /// z is carried by its observed empirical latent measure instead of
+    /// pretending the downstream calibration law is standard normal.
+    EmpiricalLatentMeasure { normalize_location_scale: bool },
+}
+
+impl LatentScoreSemantics {
+    pub fn into_policy(self) -> LatentZPolicy {
+        match self {
+            Self::FrozenConditionalNormal { check_mode } => LatentZPolicy {
+                check_mode,
+                ..LatentZPolicy::frozen_transformation_normal()
+            },
+            Self::FitWeightedNormalization => LatentZPolicy::exploratory_fit_weighted(),
+            Self::EmpiricalLatentMeasure {
+                normalize_location_scale,
+            } => LatentZPolicy {
+                normalization: if normalize_location_scale {
+                    LatentZNormalizationMode::FitWeighted
+                } else {
+                    LatentZNormalizationMode::None
+                },
+                latent_measure: LatentMeasureSpec::GlobalEmpirical {
+                    grid_size: DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
+                },
+                ..LatentZPolicy::exploratory_fit_weighted()
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct MarginalSlopeCalibrationProtocol {
+    pub base_link: InverseLink,
+    /// Optional cubic score-warp block. `None` selects the rigid
+    /// (algebraic closed-form) path for the score-warp axis.
+    pub score_warp: Option<DeviationBlockConfig>,
+    /// Optional cubic link-deviation block. `None` selects the rigid
+    /// (algebraic closed-form) path for the link-deviation axis.
+    pub link_deviation: Option<DeviationBlockConfig>,
+    pub latent_score: LatentScoreSemantics,
+}
+
+impl MarginalSlopeCalibrationProtocol {
+    fn default_latent_score() -> LatentScoreSemantics {
+        // WarnOnly mirrors `LatentZPolicy::frozen_transformation_normal`'s
+        // own default: at biobank dimensionality the upstream conditional
+        // transformation-normal preprocessor can leave the global latent z
+        // mildly heavy-tailed without violating per-strata calibration.
+        LatentScoreSemantics::FrozenConditionalNormal {
+            check_mode: LatentZCheckMode::WarnOnly,
+        }
+    }
+
+    /// Construct a probit-link marginal-slope protocol with caller-supplied
+    /// optional score-warp / link-deviation blocks and explicit latent-score
+    /// semantics. Pass `None` for either block to select the rigid algebraic
+    /// closed-form path on that axis.
+    pub fn probit(
+        score_warp: Option<DeviationBlockConfig>,
+        link_deviation: Option<DeviationBlockConfig>,
+        latent_score: LatentScoreSemantics,
+    ) -> Self {
+        Self {
+            base_link: InverseLink::Standard(LinkFunction::Probit),
+            score_warp,
+            link_deviation,
+            latent_score,
+        }
+    }
+
+    /// Rigid probit marginal-slope: no score-warp, no link-deviation.
+    pub fn probit_rigid() -> Self {
+        Self::probit(None, None, Self::default_latent_score())
+    }
+
+    /// Probit marginal-slope with both cubic blocks at their triple-penalty
+    /// defaults.
+    pub fn probit_with_score_and_link_wiggle() -> Self {
+        let wiggle = DeviationBlockConfig::triple_penalty_default();
+        Self::probit(
+            Some(wiggle.clone()),
+            Some(wiggle),
+            Self::default_latent_score(),
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SurvivalMarginalSlopeProtocol {
+    pub marginal: MarginalSlopeCalibrationProtocol,
+    pub baseline_target: SurvivalBaselineTarget,
+}
+
+impl SurvivalMarginalSlopeProtocol {
+    /// Survival marginal-slope on a Gompertz-Makeham baseline with the
+    /// supplied marginal-calibration protocol. Score-warp, link-deviation,
+    /// and latent-score semantics all flow through from `marginal` —
+    /// nothing is baked in.
+    pub fn gompertz_makeham_probit(marginal: MarginalSlopeCalibrationProtocol) -> Self {
+        Self {
+            marginal,
+            baseline_target: SurvivalBaselineTarget::GompertzMakeham,
+        }
+    }
+}
+
+exec
+/bin/zsh -lc "sed -n '760,860p' src/terms/analytic_penalties.rs" in /Users/user/gam
+ succeeded in 0ms:
+/// reduces to a [`BlockwisePenalty`] per axis and slots into the existing
+/// canonical-penalty pipeline with zero extra wiring beyond appending `d`
+/// hyperparameter axes to `ρ`.
+///
+/// When to use: any [`LatentCoordValues`] block where the intrinsic dimension
+/// is unknown. Compose with `IsometryPenalty` for full gauge fixing.
+#[derive(Debug, Clone)]
+pub struct ARDPenalty {
+    pub target: PsiSlice,
+    pub latent_dim: usize,
+    /// Local ρ indices for the `d` per-axis log-precisions.
+    pub rho_indices: Vec<usize>,
+}
+
+impl ARDPenalty {
+    pub fn new(target: PsiSlice, latent_dim: usize) -> Self {
+        let rho_indices = (0..latent_dim).collect();
+        Self {
+            target,
+            latent_dim,
+            rho_indices,
+        }
+    }
+
+    /// Build one [`BlockwisePenalty`] per latent axis. The j-th block has
+    /// `local = I_{n_obs}` and `col_range` equal to the flat indices of that
+    /// axis. The outer REML loop multiplies by `exp(ρ_j)`.
+    pub fn as_blockwise(&self, global_offset: usize) -> Vec<BlockwisePenalty> {
+        let n_obs = self.target.len() / self.latent_dim;
+        let mut out = Vec::with_capacity(self.latent_dim);
+        for j in 0..self.latent_dim {
+            // The flat layout is row-major (n * d + a), so axis j picks rows
+            // n=0..n_obs at columns global_offset + n*d + j. The "block" here
+            // is a single diagonal scalar repeated `n_obs` times — represent
+            // it as a ridge of size n_obs at the appropriate stride.
+            //
+            // For the canonical pipeline we collapse this to a contiguous
+            // ridge by reshape: the BlockwisePenalty machinery expects a
+            // contiguous range, so we expose the axis-j ridge as a
+            // length-`n_obs` ridge with a virtual stride captured in
+            // `structure_hint`. Callers that need the stride re-expand using
+            // `latent_dim`.
+            let start = global_offset + j * n_obs;
+            let end = start + n_obs;
+            out.push(
+                BlockwisePenalty::ridge(start..end, 1.0)
+                    .with_op(None),
+            );
+        }
+        out
+    }
+}
+
+impl AnalyticPenalty for ARDPenalty {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Psi
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        let d = self.latent_dim;
+        let n_obs = target.len() / d;
+        let mut acc = 0.0;
+        for j in 0..d {
+            let lam_j = rho[self.rho_indices[j]].exp();
+            let mut sq = 0.0;
+            for n in 0..n_obs {
+                let v = target[n * d + j];
+                sq += v * v;
+            }
+            acc += 0.5 * lam_j * sq;
+        }
+        acc
+    }
+
+    fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let d = self.latent_dim;
+        let n_obs = target.len() / d;
+        let mut g = Array1::<f64>::zeros(target.len());
+        for j in 0..d {
+            let lam_j = rho[self.rho_indices[j]].exp();
+            for n in 0..n_obs {
+                g[n * d + j] = lam_j * target[n * d + j];
+            }
+        }
+        g
+    }
+
+    fn hessian_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        let d = self.latent_dim;
+        let n_obs = target.len() / d;
+        let mut diag = Array1::<f64>::zeros(target.len());
+        for j in 0..d {
+            let lam_j = rho[self.rho_indices[j]].exp();
+
+exec
+/bin/zsh -lc "sed -n '860,1060p' src/terms/analytic_penalties.rs" in /Users/user/gam
+ succeeded in 0ms:
+            let lam_j = rho[self.rho_indices[j]].exp();
+            for n in 0..n_obs {
+                diag[n * d + j] = lam_j;
+            }
+        }
+        Some(diag)
+    }
+
+    fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        // P_j(ρ_j) = ½ exp(ρ_j) Σ_n t_{n,j}². ∂/∂ρ_j = P_j.
+        let d = self.latent_dim;
+        let n_obs = target.len() / d;
+        let mut out = Array1::<f64>::zeros(self.rho_count());
+        for j in 0..d {
+            let lam_j = rho[self.rho_indices[j]].exp();
+            let mut sq = 0.0;
+            for n in 0..n_obs {
+                let v = target[n * d + j];
+                sq += v * v;
+            }
+            out[self.rho_indices[j]] = 0.5 * lam_j * sq;
+        }
+        out
+    }
+
+    fn rho_count(&self) -> usize {
+        self.latent_dim
+    }
+
+    fn name(&self) -> &str {
+        "ard"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Operator-form wrapper for the REML/PIRLS canonical pipeline
+// ---------------------------------------------------------------------------
+
+/// Wraps any [`AnalyticPenalty`] so the existing PIRLS / REML consumers
+/// (which expect a `value + gradient + (hvp | hessian-diag)` quintuple) can
+/// query it uniformly. The wrapper is `Send + Sync` and `Arc`-shared so the
+/// outer loop can hand it to multiple workers.
+pub struct AnalyticPenaltyOp {
+    pub penalty: Arc<dyn AnalyticPenalty>,
+}
+
+impl AnalyticPenaltyOp {
+    pub fn new(penalty: Arc<dyn AnalyticPenalty>) -> Self {
+        Self { penalty }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registration helper — collects penalty kinds for the outer REML driver
+// ---------------------------------------------------------------------------
+
+/// Tagged sum of the three penalty kinds, with enough metadata for the outer
+/// REML driver to:
+///
+///   1. Concatenate each penalty's owned ρ-axes onto the global ρ vector.
+///   2. Route the inner gradient `∂L/∂target` contribution back into the
+///      correct β or ψ slice.
+///   3. Build a Hessian-block stub for `RemlState` cache-key invalidation.
+#[derive(Clone)]
+pub enum AnalyticPenaltyKind {
+    Isometry(Arc<IsometryPenalty>),
+    Sparsity(Arc<SparsityPenalty>),
+    Ard(Arc<ARDPenalty>),
+}
+
+impl AnalyticPenaltyKind {
+    pub fn tier(&self) -> PenaltyTier {
+        match self {
+            AnalyticPenaltyKind::Isometry(p) => p.tier(),
+            AnalyticPenaltyKind::Sparsity(p) => p.tier(),
+            AnalyticPenaltyKind::Ard(p) => p.tier(),
+        }
+    }
+
+    pub fn rho_count(&self) -> usize {
+        match self {
+            AnalyticPenaltyKind::Isometry(p) => p.rho_count(),
+            AnalyticPenaltyKind::Sparsity(p) => p.rho_count(),
+            AnalyticPenaltyKind::Ard(p) => p.rho_count(),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            AnalyticPenaltyKind::Isometry(p) => p.name(),
+            AnalyticPenaltyKind::Sparsity(p) => p.name(),
+            AnalyticPenaltyKind::Ard(p) => p.name(),
+        }
+    }
+
+    pub fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        match self {
+            AnalyticPenaltyKind::Isometry(p) => p.value(target, rho),
+            AnalyticPenaltyKind::Sparsity(p) => p.value(target, rho),
+            AnalyticPenaltyKind::Ard(p) => p.value(target, rho),
+        }
+    }
+
+    pub fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        match self {
+            AnalyticPenaltyKind::Isometry(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::Sparsity(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::Ard(p) => p.grad_target(target, rho),
+        }
+    }
+
+    pub fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        match self {
+            AnalyticPenaltyKind::Isometry(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::Sparsity(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::Ard(p) => p.grad_rho(target, rho),
+        }
+    }
+
+    pub fn hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        match self {
+            AnalyticPenaltyKind::Isometry(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::Sparsity(p) => {
+                if let Some(diag) = p.hessian_diag(target, rho) {
+                    let mut out = Array1::<f64>::zeros(v.len());
+                    for i in 0..v.len() {
+                        out[i] = diag[i] * v[i];
+                    }
+                    out
+                } else {
+                    p.hvp(target, rho, v)
+                }
+            }
+            AnalyticPenaltyKind::Ard(p) => {
+                let diag = p.hessian_diag(target, rho).expect("ARD diag");
+                let mut out = Array1::<f64>::zeros(v.len());
+                for i in 0..v.len() {
+                    out[i] = diag[i] * v[i];
+                }
+                out
+            }
+        }
+    }
+}
+
+/// Registry of analytic penalties active in a single fit. The owning
+/// `RemlState` builder concatenates the per-penalty ρ-axes onto its global
+/// ρ vector in the order they appear here, so the rho-index bookkeeping
+/// inside each penalty is interpreted relative to its local slice.
+#[derive(Clone, Default)]
+pub struct AnalyticPenaltyRegistry {
+    pub penalties: Vec<AnalyticPenaltyKind>,
+}
+
+impl AnalyticPenaltyRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn push(&mut self, p: AnalyticPenaltyKind) {
+        self.penalties.push(p);
+    }
+
+    pub fn total_rho_count(&self) -> usize {
+        self.penalties.iter().map(|p| p.rho_count()).sum()
+    }
+
+    /// Returns `(local_rho_slice, target_tier, name)` for each registered
+    /// penalty so the outer driver can wire its ρ-views.
+    pub fn rho_layout(&self) -> Vec<(std::ops::Range<usize>, PenaltyTier, &str)> {
+        let mut out = Vec::with_capacity(self.penalties.len());
+        let mut offset = 0usize;
+        for p in &self.penalties {
+            let n = p.rho_count();
+            out.push((offset..offset + n, p.tier(), p.name()));
+            offset += n;
+        }
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PenaltyOp integration
+// ---------------------------------------------------------------------------
+
+exec
+/bin/zsh -lc "sed -n '1180,1235p' src/types.rs" in /Users/user/gam
+ succeeded in 0ms:
+        impl From<Array1<f64>> for $name {
+            #[inline]
+            fn from(values: Array1<f64>) -> Self { Self(values) }
+        }
+
+        impl From<$name> for Array1<f64> {
+            #[inline]
+            fn from(values: $name) -> Self { values.0 }
+        }
+
+        $( array1_f64_newtype!(@extra $name $extra); )*
+    };
+    (@extra $name:ident exp) => {
+        impl $name {
+            #[inline]
+            pub fn exp(&self) -> Array1<f64> { self.0.mapv(f64::exp) }
+        }
+    };
+}
+
+array1_f64_newtype!(Coefficients);
+array1_f64_newtype!(LinearPredictor);
+array1_f64_newtype!(LogSmoothingParams, exp);
+
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
+pub struct LogSmoothingParamsView<'a>(pub ArrayView1<'a, f64>);
+
+impl<'a> LogSmoothingParamsView<'a> {
+    pub fn new(values: ArrayView1<'a, f64>) -> Self {
+        Self(values)
+    }
+
+    pub fn exp(&self) -> Array1<f64> {
+        self.0.mapv(f64::exp)
+    }
+}
+
+impl<'a> Deref for LogSmoothingParamsView<'a> {
+    type Target = ArrayView1<'a, f64>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+exec
+/bin/zsh -lc "sed -n '3525,3588p' src/solver/reml/mod.rs" in /Users/user/gam
+ succeeded in 0ms:
+pub(crate) struct EvalShared {
+    key: Option<Vec<u64>>,
+    pub(crate) pirls_result: Arc<PirlsResult>,
+    ridge_passport: RidgePassport,
+    geometry: RemlGeometry,
+    /// The exact H_total matrix used for LAML cost computation.
+    /// For Firth: effective Hessian minus hphi (plus any barrier curvature).
+    /// For non-Firth: the effective Hessian itself (plus any barrier curvature).
+    h_total: Arc<Array2<f64>>,
+    sparse_exact: Option<Arc<SparseExactEvalData>>,
+    firth_dense_operator: Option<Arc<FirthDenseOperator>>,
+    /// Cached FirthDenseOperator built from the original (non-reparameterized)
+    /// design matrix, for use by the sparse evaluation path.
+    firth_dense_operator_original: Option<Arc<FirthDenseOperator>>,
+}
+
+impl EvalShared {
+    fn matches(&self, key: &Option<Vec<u64>>) -> bool {
+        match (&self.key, key) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl PenalizedGeometry for EvalShared {
+    fn backend_kind(&self) -> GeometryBackendKind {
+        match self.geometry {
+            RemlGeometry::DenseSpectral => GeometryBackendKind::DenseSpectral,
+            RemlGeometry::SparseExactSpd => GeometryBackendKind::SparseExactSpd,
+        }
+    }
+}
+
+/// LRU cache keyed by sanitized ρ vectors that holds compacted PIRLS results
+/// for warm-starting outer line searches and revisited evaluations.
+///
+/// Eviction is byte-budgeted rather than entry-count-budgeted: each entry
+/// records its own estimated footprint (the surviving n-length vectors plus
+/// the two p×p Hessians plus per-entry overhead) and the cache evicts in
+/// LRU order until the running total fits under the budget. An entry that
+/// individually exceeds the budget is rejected silently rather than poisoning
+/// the cache.
+struct PirlsLruCache {
+    // Stored tuple: (compacted result, last-touched clock, estimated bytes).
+    map: HashMap<Vec<u64>, (Arc<PirlsResult>, u64, usize)>,
+    byte_budget: usize,
+    current_bytes: usize,
+    clock: u64,
+}
+
+impl PirlsLruCache {
+    fn new(byte_budget: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            byte_budget: byte_budget.max(1),
+            current_bytes: 0,
+            clock: 0,
+        }
+    }
+
+    fn get(&mut self, key: &Vec<u64>) -> Option<Arc<PirlsResult>> {
+        if let Some(entry) = self.map.get_mut(key) {
+
+exec
+/bin/zsh -lc "sed -n '1680,1745p' src/solver/reml/unified.rs" in /Users/user/gam
+ succeeded in 0ms:
+/// - Differentiating J (Jacobian drift, terms 2-4)
+/// - Differentiating W (weight drift, terms 3-5)
+/// - Cross terms between the two differentiations (terms 2, 3, 4)
+/// - The curvature of W itself through w'' (term 5)
+#[derive(Clone)]
+pub struct HyperCoord {
+    /// ∂_i F|_β — fixed-β cost derivative (scalar).
+    pub a: f64,
+    /// ∂_i (∇_β F)|_β — fixed-β score (p-vector).
+    pub g: Array1<f64>,
+    /// ∂_i H|_β — fixed-β Hessian drift.
+    ///
+    /// The drift may have a materialized dense contribution, an operator
+    /// contribution, or both. This replaces the old `b_mat + optional
+    /// b_operator + zero-sized placeholder` convention.
+    pub drift: HyperCoordDrift,
+    /// ∂_i L_δ(S) — smooth penalty pseudo-logdet first derivative.
+    /// Uses (S + δI)⁻¹ instead of the hard-truncated pseudoinverse S₊⁻¹.
+    pub ld_s: f64,
+    /// Whether B_i depends on β (true for ψ with non-Gaussian likelihood).
+    /// When true, M_i[u] = D_β B_i[u] contributes to the exact outer Hessian.
+    pub b_depends_on_beta: bool,
+    /// Whether this coordinate is "penalty-like" (τ) vs "design-moving" (ψ).
+    ///
+    /// Penalty-like coordinates (τ) have Hessian drifts derived from penalty
+    /// matrix derivatives (similar to ρ coordinates), so they are PSD.
+    /// Design-moving coordinates (ψ) have Hessian drifts that contain
+    /// design-motion and likelihood-curvature terms and need not be PSD or even
+    /// sign-definite.
+    ///
+    /// This flag controls eligibility for EFS (Fellner-Schall) updates.
+    /// See [`compute_efs_update`] for details.
+    pub is_penalty_like: bool,
+    /// Fixed-β Jeffreys/Firth gradient partial `(g_Φ)_i`, when the inner
+    /// objective includes the exact bias-reduction term.
+    pub firth_g: Option<Array1<f64>>,
+    /// Fixed-β linear predictor derivative used by the Tierney-Kadane
+    /// correction's direct c/d derivative terms.
+    pub tk_eta_fixed: Option<Array1<f64>>,
+    /// Fixed-β design derivative used by the Tierney-Kadane correction's
+    /// direct design-row derivative terms.
+    pub tk_x_fixed: Option<Array2<f64>>,
+}
+
+/// Second-order fixed-β objects for a pair of outer coordinates.
+///
+/// Used by the outer Hessian computation. For ρ-ρ diagonal pairs, these
+/// equal the first-order objects (a_kk = a_k, g_kk = g_k, B_kk = B_k).
+/// For ρ-ρ off-diagonal pairs with k≠l, these are all zero.
+pub struct HyperCoordPair {
+    /// ∂²_ij F|_β — fixed-β cost second derivative (scalar).
+    pub a: f64,
+    /// ∂²_ij (∇_β F)|_β — fixed-β score second derivative (p-vector).
+    pub g: Array1<f64>,
+    /// ∂²_ij H|_β — fixed-β Hessian second drift (p×p matrix).
+    pub b_mat: Array2<f64>,
+    /// ∂²_ij H|_β — operator-valued Hessian second drift (implicit, avoids p×p).
+    pub b_operator: Option<Box<dyn HyperOperator>>,
+    /// ∂²_ij L_δ(S) — smooth penalty pseudo-logdet second derivative.
+    /// Uses (S + δI)⁻¹ instead of the hard-truncated pseudoinverse S₊⁻¹.
+    pub ld_s: f64,
+}
+
+impl HyperCoordPair {
+    /// Return a zero-valued pair (used as a no-op fallback when hyper-coordinate
+    /// construction is skipped for large models).
+
+exec
+/bin/zsh -lc "sed -n '8080,8178p' src/solver/reml/runtime.rs" in /Users/user/gam
+ succeeded in 0ms:
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        mode: super::unified::EvalMode,
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        let assembly = self.build_sparse_assembly(rho, bundle, mode)?;
+        self.assemble_and_evaluate(rho, bundle, mode, assembly)
+    }
+    /// Evaluate the unified REML/LAML objective with anisotropic ψ ext_coords
+    /// injected into the `InnerSolution`.
+    ///
+    /// This is the primary bridge for joint [ρ, ψ] optimization of anisotropic
+    /// spatial smooths. It:
+    /// 1. Obtains the PIRLS bundle at the current ρ (with the design already
+    ///    rebuilt for the current ψ).
+    /// 2. Builds `HyperCoord` ext_coords from the supplied `DirectionalHyperParam`
+    ///    list via the dense/transformed or sparse/native τ builders, depending
+    ///    on the active backend.
+    /// 3. Builds the full `InnerSolution` (mirroring `evaluate_unified`), injects
+    ///    the ext_coords, and calls `reml_laml_evaluate`.
+    ///
+    /// The caller is responsible for rebuilding the `RemlState` with the design
+    /// X(ψ) and penalties S(ψ) corresponding to the current ψ values before
+    /// calling this method. The unified evaluator then preserves the backend:
+    /// dense spectral paths stay dense, and sparse exact paths stay sparse.
+    pub fn evaluate_unified_with_psi_ext(
+        &self,
+        rho: &Array1<f64>,
+        mode: super::unified::EvalMode,
+        hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
+    ) -> Result<super::unified::RemlLamlResult, EstimationError> {
+        let t0 = std::time::Instant::now();
+        let bundle = self.obtain_eval_bundle(rho)?;
+        let pirls_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = std::time::Instant::now();
+        let (ext_coords, ext_pair_fn, rho_ext_pair_fn, fixed_drift_deriv) =
+            if !hyper_dirs.is_empty() {
+                if mode == super::unified::EvalMode::ValueGradientHessian {
+                    let (coords, epf, repf, fixed_drift_deriv) =
+                        self.build_tau_unified_objects_from_bundle(rho, &bundle, hyper_dirs)?;
+                    (coords, Some(epf), Some(repf), fixed_drift_deriv)
+                } else if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
+                    (
+                        self.build_tau_hyper_coords_sparse_exact(rho, &bundle, hyper_dirs)?,
+                        None,
+                        None,
+                        None,
+                    )
+                } else if matches!(
+                    bundle.pirls_result.coordinate_frame,
+                    pirls::PirlsCoordinateFrame::TransformedQs
+                ) && self
+                    .active_constraint_free_basis(bundle.pirls_result.as_ref())
+                    .is_none()
+                {
+                    (
+                        self.build_tau_hyper_coords_original_basis(rho, &bundle, hyper_dirs)?,
+                        None,
+                        None,
+                        None,
+                    )
+                } else {
+                    (
+                        self.build_tau_hyper_coords(rho, &bundle, hyper_dirs)?,
+                        None,
+                        None,
+                        None,
+                    )
+                }
+            } else {
+                (Vec::new(), None, None, None)
+            };
+        let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
+        let t2 = std::time::Instant::now();
+        let mut assembly = self.build_auto_assembly(rho, &bundle, mode, !ext_coords.is_empty())?;
+        assembly.ext_coords = ext_coords;
+        assembly.ext_coord_pair_fn = ext_pair_fn;
+        assembly.rho_ext_pair_fn = rho_ext_pair_fn;
+        assembly.fixed_drift_deriv = fixed_drift_deriv;
+        let result = self.assemble_and_evaluate(rho, &bundle, mode, assembly);
+        let reml_eval_ms = t2.elapsed().as_secs_f64() * 1000.0;
+
+        log::debug!(
+            "[outer-timing] evaluate_unified_with_psi_ext: PIRLS={:.1}ms  tau_build={:.1}ms  reml_eval={:.1}ms  total={:.1}ms",
+            pirls_ms,
+            tau_build_ms,
+            reml_eval_ms,
+            t0.elapsed().as_secs_f64() * 1000.0,
+        );
+        result
+    }
+
+    /// Compute EFS (Extended Fellner-Schall) evaluation: runs the inner solve
+    /// at the given rho, computes the REML/LAML cost, and returns the EFS
+    /// step vector from `compute_efs_update`.
+    ///
+    /// This is the entry point called by the EFS branch of `run_outer` via
+    /// the `OuterObjective::eval_efs` method.
+    pub fn compute_efs_steps(
+
+exec
+/bin/zsh -lc "rg -n \"log\\|H\\||logdet|ld_h|ld_s|trace|gradient\\[|0\\.5.*ld|laplace|LAML|REML\" src/solver/reml/unified.rs src/solver/reml/runtime.rs src/solver/reml/assembly.rs | head -n 260" in /Users/user/gam
+ succeeded in 0ms:
+src/solver/reml/assembly.rs:44:/// This replaces the former clone-and-row-scale pattern used by REML assembly
+src/solver/reml/assembly.rs:224:    pub penalty_logdet: PenaltyLogdetDerivs,
+src/solver/reml/assembly.rs:228:    pub hessian_logdet_correction: f64,
+src/solver/reml/assembly.rs:229:    pub penalty_subspace_trace: Option<Arc<PenaltySubspaceTrace>>,
+src/solver/reml/assembly.rs:263:            self.penalty_logdet,
+src/solver/reml/assembly.rs:268:        builder = builder.hessian_logdet_correction(self.hessian_logdet_correction);
+src/solver/reml/assembly.rs:269:        builder = builder.penalty_subspace_trace(self.penalty_subspace_trace);
+src/solver/reml/runtime.rs:5:use crate::linalg::sparse_exact::build_sparse_penalty_blocks_from_canonical;
+src/solver/reml/runtime.rs:24:const ADAPTIVE_KKT_FLOOR_REML_DIVISOR: f64 = 100.0;
+src/solver/reml/runtime.rs:108:/// the inner-PIRLS, linear-solve, and trace-probe channels using sensitivity
+src/solver/reml/runtime.rs:120:///           + s_trace² / k,
+src/solver/reml/runtime.rs:125:/// residual on the IFT mode-response system, and `k` is the trace-probe
+src/solver/reml/runtime.rs:126:/// count. The sensitivities `s_inner`, `s_linear`, `s_trace` are
+src/solver/reml/runtime.rs:147:    /// Minimum reciprocal trace-probe count (i.e., max `1/k`) the
+src/solver/reml/runtime.rs:148:    /// controller will request, capping the trace-probe budget.
+src/solver/reml/runtime.rs:149:    pub(crate) trace_floor: f64,
+src/solver/reml/runtime.rs:156:    /// Current sensitivity of `MSE(∇V)` with respect to trace-probe
+src/solver/reml/runtime.rs:158:    pub(crate) s_trace: f64,
+src/solver/reml/runtime.rs:174:            trace_floor: HGB_TRACE_FLOOR,
+src/solver/reml/runtime.rs:177:            s_trace: S_TRACE_INIT,
+src/solver/reml/runtime.rs:219:        let Some(s_trace) = self.estimate_trace_sensitivity() else {
+src/solver/reml/runtime.rs:225:            s_trace.max(HGB_SENS_FLOOR),
+src/solver/reml/runtime.rs:229:        self.s_trace = sensitivities[2];
+src/solver/reml/runtime.rs:329:    fn estimate_trace_sensitivity(&self) -> Option<f64> {
+src/solver/reml/runtime.rs:372:        s_trace: f64,
+src/solver/reml/runtime.rs:374:        let floors = self.inner_floor + self.linear_floor + self.trace_floor;
+src/solver/reml/runtime.rs:385:                self.trace_floor,
+src/solver/reml/runtime.rs:394:        let wt = s_trace * s_trace;
+src/solver/reml/runtime.rs:399:            self.trace_floor + usable * wt / sum,
+src/solver/reml/runtime.rs:430:    trace_state: Arc<Mutex<super::unified::StochasticTraceState>>,
+src/solver/reml/runtime.rs:438:            trace_state: Arc::new(Mutex::new(super::unified::StochasticTraceState::default())),
+src/solver/reml/runtime.rs:577:/// so an absolute residual term would swamp the actual REML cost differences
+src/solver/reml/runtime.rs:587:/// production REML evaluations always operate on certified inner modes
+src/solver/reml/runtime.rs:704:/// Both `build_dense_derivative_context` and `build_sparse_derivative_context`
+src/solver/reml/runtime.rs:777:    fn hypergradient_trace_state(&self) -> Arc<Mutex<super::unified::StochasticTraceState>> {
+src/solver/reml/runtime.rs:782:        Arc::clone(&state.trace_state)
+src/solver/reml/runtime.rs:785:    fn reset_hypergradient_trace_telemetry(
+src/solver/reml/runtime.rs:786:        trace_state: &Arc<Mutex<super::unified::StochasticTraceState>>,
+src/solver/reml/runtime.rs:788:        let mut trace = match trace_state.lock() {
+src/solver/reml/runtime.rs:792:        trace.last_linear_residual_norm = None;
+src/solver/reml/runtime.rs:793:        trace.last_probe_sigma_sq = None;
+src/solver/reml/runtime.rs:794:        trace.last_probe_count = 0;
+src/solver/reml/runtime.rs:810:            (self.config.reml_convergence_tolerance / ADAPTIVE_KKT_FLOOR_REML_DIVISOR).min(ceiling);
+src/solver/reml/runtime.rs:838:            let trace = match state.trace_state.lock() {
+src/solver/reml/runtime.rs:842:            let linear_residual_norm = trace.last_linear_residual_norm.unwrap_or(0.0).max(0.0);
+src/solver/reml/runtime.rs:846:                trace.last_probe_sigma_sq.unwrap_or(0.0).max(0.0),
+src/solver/reml/runtime.rs:847:                trace.last_probe_count,
+src/solver/reml/runtime.rs:848:                trace.monotone_probe_floor,
+src/solver/reml/runtime.rs:884:            match state.trace_state.lock() {
+src/solver/reml/runtime.rs:885:                Ok(mut trace) => trace.solve_rel_tol_override = None,
+src/solver/reml/runtime.rs:887:                    let mut trace = poisoned.into_inner();
+src/solver/reml/runtime.rs:888:                    trace.solve_rel_tol_override = None;
+src/solver/reml/runtime.rs:894:        let [s_inner, s_linear, s_trace] = if let Some(sensitivities) = sensitivity_estimate {
+src/solver/reml/runtime.rs:903:        let (eps2_inner, eps2_linear, eps2_trace, floor_active) = state
+src/solver/reml/runtime.rs:905:            .allocate_with_sensitivities(s_inner, s_linear, s_trace);
+src/solver/reml/runtime.rs:909:            (self.config.reml_convergence_tolerance / ADAPTIVE_KKT_FLOOR_REML_DIVISOR).min(ceiling);
+src/solver/reml/runtime.rs:921:        let k_target = if eps2_trace > 0.0 && sigma_sq.is_finite() && sigma_sq > 0.0 {
+src/solver/reml/runtime.rs:922:            (sigma_sq / eps2_trace).ceil().clamp(0.0, usize::MAX as f64) as usize
+src/solver/reml/runtime.rs:928:            let mut trace = match state.trace_state.lock() {
+src/solver/reml/runtime.rs:932:            trace.solve_rel_tol_override =
+src/solver/reml/runtime.rs:934:            if raised_floor > trace.monotone_probe_floor {
+src/solver/reml/runtime.rs:935:                trace.monotone_probe_floor = raised_floor;
+src/solver/reml/runtime.rs:950:            s_trace,
+src/solver/reml/runtime.rs:953:            eps2_trace,
+src/solver/reml/runtime.rs:1124:        // unavailable at biobank scale, the dense `O(K²·n·p²)` LAML pairwise
+src/solver/reml/runtime.rs:1135:                 path unavailable, dense LAML pairwise assembly is \
+src/solver/reml/runtime.rs:1179:    fn dense_penalty_logdet_derivs(
+src/solver/reml/runtime.rs:1182:        e_for_logdet: &Array2<f64>,
+src/solver/reml/runtime.rs:1187:        let logdet_s_start = std::time::Instant::now();
+src/solver/reml/runtime.rs:1189:        let ridge = ridge_passport.penalty_logdet_ridge();
+src/solver/reml/runtime.rs:1190:        let kron_logdet = self
+src/solver/reml/runtime.rs:1194:            .map(|kron| kron.logdet_rank_and_derivatives(lambdas.as_slice().unwrap(), ridge));
+src/solver/reml/runtime.rs:1195:        let (penalty_rank, log_det_s) = if let Some((logdet, rank, _, _)) = kron_logdet.as_ref() {
+src/solver/reml/runtime.rs:1196:            (*rank, *logdet)
+src/solver/reml/runtime.rs:1198:            self.fixed_subspace_penalty_rank_and_logdet(e_for_logdet, ridge_passport)?
+src/solver/reml/runtime.rs:1201:            "[STAGE] logdet S rho_dim={} penalty_rank={} elapsed={:.3}s",
+src/solver/reml/runtime.rs:1204:            logdet_s_start.elapsed().as_secs_f64(),
+src/solver/reml/runtime.rs:1207:        // Use block-local path from canonical penalties (basis-invariant logdet).
+src/solver/reml/runtime.rs:1208:        // The penalty logdet log|Σ λ_k S_k|₊ is invariant under orthogonal
+src/solver/reml/runtime.rs:1211:        let (det1, det2_full) = if let Some((_, _, det1, det2)) = kron_logdet {
+src/solver/reml/runtime.rs:1216:            self.structural_penalty_logdet_derivatives_block_local(&lambdas, ridge)?
+src/solver/reml/runtime.rs:1218:            self.structural_penalty_logdet_derivatives(penalty_roots, &lambdas, ridge)?
+src/solver/reml/runtime.rs:1340:    fn tk_active_weighted_trace(
+src/solver/reml/runtime.rs:1345:        let mut trace = 0.0;
+src/solver/reml/runtime.rs:1349:                trace += c_i * x_vk[i] * lev_p[i];
+src/solver/reml/runtime.rs:1352:        trace
+src/solver/reml/runtime.rs:1550:            let trace_ak_p = lambdas[idx]
+src/solver/reml/runtime.rs:1554:            let correction_trace =
+src/solver/reml/runtime.rs:1555:                Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[idx], &lev_p);
+src/solver/reml/runtime.rs:1556:            let firth_trace =
+src/solver/reml/runtime.rs:1557:                Self::tk_firth_beta_hessian_trace(firth_op, &beta_dirs[idx], &p_total)?;
+src/solver/reml/runtime.rs:1562:            gradient[idx] = trace_ak_p - correction_trace + firth_trace + direct;
+src/solver/reml/runtime.rs:1577:                let mut trace_ak_p = 0.0;
+src/solver/reml/runtime.rs:1580:                        trace_ak_p += drift[[row, col]] * p_total[[col, row]];
+src/solver/reml/runtime.rs:1584:                let correction_trace =
+src/solver/reml/runtime.rs:1585:                    Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[x_vk_idx], &lev_p);
+src/solver/reml/runtime.rs:1586:                let firth_trace =
+src/solver/reml/runtime.rs:1587:                    Self::tk_firth_beta_hessian_trace(firth_op, &beta_dirs[x_vk_idx], &p_total)?;
+src/solver/reml/runtime.rs:1627:                Ok((x_vk_idx, trace_ak_p - correction_trace + firth_trace + direct))
+src/solver/reml/runtime.rs:1631:            gradient[idx] = value;
+src/solver/reml/runtime.rs:1644:    fn tk_firth_beta_hessian_trace(
+src/solver/reml/runtime.rs:1672:        let mut trace = 0.0;
+src/solver/reml/runtime.rs:1675:                trace -= hphi[[row, col]] * p_total[[col, row]];
+src/solver/reml/runtime.rs:1678:        Ok(trace)
+src/solver/reml/runtime.rs:3001:    /// These flow into the outer REML gradient's C[v] correction term and
+src/solver/reml/runtime.rs:3290:    // p(lambda) proportional to lambda^(a-1) exp(-b lambda). REML/LAML
+src/solver/reml/runtime.rs:3485:    /// Therefore the curvature used in LAML is
+src/solver/reml/runtime.rs:3494:    /// the final curvature arrays. Rebuilding from `finalweights` keeps the REML value
+src/solver/reml/runtime.rs:3504:        // floored W (via `outer_hessian_curvature_arrays`), so log|H| and
+src/solver/reml/runtime.rs:3505:        // its trace gradient live on a single, consistent surface.
+src/solver/reml/runtime.rs:3589:            build_sparse_penalty_blocks_from_canonical(canonical_penalties.as_ref(), p)?
+src/solver/reml/runtime.rs:3666:            build_sparse_penalty_blocks_from_canonical(canonical_penalties.as_ref(), p)?
+src/solver/reml/runtime.rs:3701:    /// When set, the REML evaluator will use O(∏q_j) logdet instead of O(p³)
+src/solver/reml/runtime.rs:3821:    /// Production REML/LAML cost reads this quantity via
+src/solver/reml/runtime.rs:3822:    /// `hop.logdet() + hessian_logdet_correction` (the latter carries the
+src/solver/reml/runtime.rs:3823:    /// `log|H_proj| − hop.logdet()` correction from the dense_assembly
+src/solver/reml/runtime.rs:3826:    /// projected logdet across nearby `theta` values produces the analytic
+src/solver/reml/runtime.rs:3827:    /// `d/dψ log|H_proj|` that production's trace formula computes — *not*
+src/solver/reml/runtime.rs:3830:    /// for the projected LAML cost identity.  Used by
+src/solver/reml/runtime.rs:3831:    /// `iso_kappa_duchon_penalty_subspace_projection_pins_trace`'s
+src/solver/reml/runtime.rs:3834:    pub(crate) fn objective_logdet_h_proj(
+src/solver/reml/runtime.rs:3841:        let logdet = super::unified::HessianOperator::logdet(assembly.hessian_op.as_ref())
+src/solver/reml/runtime.rs:3842:            + assembly.hessian_logdet_correction;
+src/solver/reml/runtime.rs:3843:        Ok(logdet)
+src/solver/reml/runtime.rs:3949:            log::trace!(
+src/solver/reml/runtime.rs:4006:    /// Compute the structural penalty rank and exact pseudo-logdet log|S|₊.
+src/solver/reml/runtime.rs:4008:    /// Uses the exact pseudo-logdet on the positive eigenspace:
+src/solver/reml/runtime.rs:4015:    /// same positive eigenspace as the pseudo-logdet; root row count overstates
+src/solver/reml/runtime.rs:4017:    pub(super) fn fixed_subspace_penalty_rank_and_logdet(
+src/solver/reml/runtime.rs:4027:        let ridge = ridge_passport.penalty_logdet_ridge();
+src/solver/reml/runtime.rs:4040:        // Why: the threshold path (`positive_penalty_rank_and_logdet`) uses
+src/solver/reml/runtime.rs:4047:        // toggled the rank-deficient LAML projection in the cost — a
+src/solver/reml/runtime.rs:4062:            let (rank, log_det) = positive_penalty_rank_and_logdet(evals.as_slice().unwrap());
+src/solver/reml/runtime.rs:4085:    /// Compute the projected logdet `log|U_Sᵀ H U_S|_+` together with the
+src/solver/reml/runtime.rs:4086:    /// matching trace kernel `(U_S, (U_Sᵀ H U_S)⁻¹)` — the [`PenaltySubspaceTrace`]
+src/solver/reml/runtime.rs:4087:    /// that pairs the rank-deficient LAML cost with a gradient-consistent
+src/solver/reml/runtime.rs:4092:    /// gradient trace path.  The kernel is `None` only when the penalty is
+src/solver/reml/runtime.rs:4124:        let ridge = ridge_passport.penalty_logdet_ridge();
+src/solver/reml/runtime.rs:4141:            // no pair to balance in the LAML ratio.
+src/solver/reml/runtime.rs:4165:        let log_det = super::unified::exact_pseudo_logdet(h_proj_evals.as_slice().unwrap(), h_thr);
+src/solver/reml/runtime.rs:4200:    pub(super) fn fixed_subspace_penalty_trace(
+src/solver/reml/runtime.rs:4207:            self.fixed_subspace_penalty_rank_and_logdet(e_transformed, ridge_passport)?;
+src/solver/reml/runtime.rs:4214:        let ridge = ridge_passport.penalty_logdet_ridge();
+src/solver/reml/runtime.rs:4224:        // Exact pseudoinverse trace: tr(S⁺ S_direction) on the positive eigenspace.
+src/solver/reml/runtime.rs:4227:        let mut trace = 0.0;
+src/solver/reml/runtime.rs:4233:                trace += u.dot(&spsi_u) / ev;
+src/solver/reml/runtime.rs:4236:        Ok(trace)
+src/solver/reml/runtime.rs:4846:            // runner see flat-region traces.
+src/solver/reml/runtime.rs:5114:        let build_start = std::time::Instant::now();
+src/solver/reml/runtime.rs:5139:        // exposes a sparse form. The sparse REML path rebuilds
+src/solver/reml/runtime.rs:5174:            build_start.elapsed().as_secs_f64() * 1e3
+src/solver/reml/runtime.rs:5184:    /// Compute the exact pseudo-logdet for the sparse penalty path.
+src/solver/reml/runtime.rs:5187:    /// {σ_1, ..., σ_r}, the exact pseudo-logdet of λ_k S_k is:
+src/solver/reml/runtime.rs:5193:    pub(super) fn sparse_penalty_logdet_runtime(
+src/solver/reml/runtime.rs:5198:        let mut logdet = 0.0_f64;
+src/solver/reml/runtime.rs:5205:                logdet += (lambda_k * eig).ln();
+src/solver/reml/runtime.rs:5214:        (logdet, det1)
+src/solver/reml/runtime.rs:5243:                    "dense REML eval bundle requires dense transformed design for Firth operator",
+src/solver/reml/runtime.rs:5246:                let firth_build_start = std::time::Instant::now();
+src/solver/reml/runtime.rs:5253:                    "[Firth-op] build n={} p={} r={} half_logdet={:.3e} elapsed={:.3}s",
+src/solver/reml/runtime.rs:5258:                    firth_build_start.elapsed().as_secs_f64(),
+src/solver/reml/runtime.rs:5292:        // that logdet, trace, and solve operations all reflect the barrier curvature.
+src/solver/reml/runtime.rs:5365:        // built once from constant weights. The outer REML loop never
+src/solver/reml/runtime.rs:5380:        let (logdet_s_pos, det1_values) =
+src/solver/reml/runtime.rs:5381:            self.sparse_penalty_logdet_runtime(rho, penalty_blocks.as_ref());
+src/solver/reml/runtime.rs:5401:                        "sparse exact REML runtime requires dense design for Firth operator",
+src/solver/reml/runtime.rs:5424:                // O(nnz) trace computations instead of O(p) column solves.
+src/solver/reml/runtime.rs:5433:                    logdet_h: sparse_system.logdet_h,
+src/solver/reml/runtime.rs:5434:                    logdet_s_pos,
+src/solver/reml/runtime.rs:5611:                        / ADAPTIVE_KKT_FLOOR_REML_DIVISOR)
+src/solver/reml/runtime.rs:5625:            // Gaussian + Identity outer REML reuses a precomputed XᵀWX and
+src/solver/reml/runtime.rs:5665:                    "[STAGE] inner pirls solve iters={} status={:?} max_eta={:.1} jeffreys_logdet={} elapsed={:.3}s",
+src/solver/reml/runtime.rs:5669:                    res.jeffreys_logdet()
+src/solver/reml/runtime.rs:6550:    /// Non-Gaussian branch (negative LAML form used by optimizer):
+src/solver/reml/runtime.rs:6551:    ///   V_LAML(ρ) =
+src/solver/reml/runtime.rs:6562:    /// Gaussian identity-link REML branch:
+src/solver/reml/runtime.rs:6563:    ///   V_REML(ρ, φ) =
+src/solver/reml/runtime.rs:6572:    ///   V_REML,prof(ρ) =
+src/solver/reml/runtime.rs:6584:    ///   - log|H| may use positive-part/stabilized spectrum conventions when needed.
+src/solver/reml/runtime.rs:6587:    /// These conventions are mirrored in gradient code via corresponding trace terms.
+src/solver/reml/runtime.rs:6598:                "[REML] eval#{} begin cost-only | rho[..4]=[{}] | k={}",
+src/solver/reml/runtime.rs:6607:                "[REML] eval#{} cache hit | cost {:.6e} | elapsed {:.1}ms",
+src/solver/reml/runtime.rs:6657:            "[REML] eval#{} pirls done | elapsed {:.1}ms | backend {:?}",
+src/solver/reml/runtime.rs:6668:                "[REML] eval#{} sparse cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
+src/solver/reml/runtime.rs:6745:            "[REML] eval#{} dense cost {:.6e} | assemble {:.1}ms | total {:.1}ms",
+src/solver/reml/runtime.rs:6763:    /// the mode — strictly better than ranking by the partial-fit V_LAML
+src/solver/reml/runtime.rs:6764:    /// criterion, whose `0.5·log|H|` term is dominated by noise at a
+src/solver/reml/runtime.rs:6777:        // assembling the LAML criterion. Bundle assembly already runs
+src/solver/reml/runtime.rs:6818:    ///   giving the familiar quadratic + trace structure.
+src/solver/reml/runtime.rs:6826:    /// - LAML differentiates a moving approximation:
+src/solver/reml/runtime.rs:6827:    ///     V_LAML(ρ) = -ℓ(β̂(ρ)) + 0.5 β̂(ρ)ᵀ S(ρ) β̂(ρ)
+src/solver/reml/runtime.rs:6856:    ///   feasible (H_k, H_{kℓ}, c/d arrays), and scalable trace backends.
+src/solver/reml/runtime.rs:6885:    /// Non-Gaussian negative LAML cost:
+src/solver/reml/runtime.rs:6886:    ///   V(ρ) = -ℓ(β̂) + 0.5 β̂ᵀSβ̂ + 0.5 log|H| - 0.5 log|S|_+
+src/solver/reml/runtime.rs:6904:    /// Gaussian REML note:
+src/solver/reml/runtime.rs:6918:    /// The calculation differs significantly between the Gaussian (REML) and non-Gaussian (LAML) cases.
+src/solver/reml/runtime.rs:6920:    /// # Mathematical Basis (Gaussian/REML Case)
+src/solver/reml/runtime.rs:6922:    /// For Gaussian models (Identity link), we minimize the negative REML log-likelihood, which serves as our cost function.
+src/solver/reml/runtime.rs:6937:    /// # Mathematical Basis (Non-Gaussian/LAML Case)
+src/solver/reml/runtime.rs:6942:    /// Exact LAML therefore differentiates the observed IRLS Hessian
+src/solver/reml/runtime.rs:6948:    /// - For Gaussian models (Identity link), this calculates the exact REML gradient
+src/solver/reml/runtime.rs:6950:    /// - For non-Gaussian GLMs, this calculates the LAML gradient (Laplace Approximate
+src/solver/reml/runtime.rs:6971:    /// # Key Distinction Between REML and LAML Gradients
+src/solver/reml/runtime.rs:6973:    /// - Gaussian (REML): the Hessian-side curvature is beta-independent, so
+src/solver/reml/runtime.rs:6976:    /// - Non-Gaussian (LAML): the determinant differentiates
+src/solver/reml/runtime.rs:6978:    ///   through c/d/e curvature arrays rather than pretending the logdet
+src/solver/reml/runtime.rs:6984:    // Stage: Note the two outer criteria—Gaussian likelihood maximizes REML, while non-Gaussian likelihood
+src/solver/reml/runtime.rs:6985:    //     maximizes a Laplace approximation to the marginal likelihood (LAML). These objectives respond differently to β̂.
+src/solver/reml/runtime.rs:6987:    //     2.1  Gaussian case, REML.
+src/solver/reml/runtime.rs:6988:    //          The REML construction integrates the fixed effects out of the likelihood.  At the optimum
+src/solver/reml/runtime.rs:6992:    //          −½ β̂ᵀ Sₖ β̂ / σ².  No opposing term exists, so the quantity stays in the REML gradient.
+src/solver/reml/runtime.rs:6995:    //          gradient[k] = 0.5 * λₖ * (beta_term / σ² − trace_term).
+src/solver/reml/runtime.rs:6997:    //     2.2  Non-Gaussian case, LAML.
+src/solver/reml/runtime.rs:7136:                include_logdet_h: true,
+src/solver/reml/runtime.rs:7137:                include_logdet_s: true,
+src/solver/reml/runtime.rs:7176:    fn build_sparse_derivative_context(
+src/solver/reml/runtime.rs:7199:                        "sparse exact REML runtime requires dense design for Firth operator",
+src/solver/reml/runtime.rs:7224:                        include_logdet_h: true,
+src/solver/reml/runtime.rs:7225:                        include_logdet_s: true,
+src/solver/reml/runtime.rs:7313:    /// `build_sparse_assembly`, `build_dense_original_assembly`) delegate
+src/solver/reml/runtime.rs:7321:        penalty_logdet: super::unified::PenaltyLogdetDerivs,
+src/solver/reml/runtime.rs:7323:        hessian_logdet_correction: f64,
+src/solver/reml/runtime.rs:7324:        penalty_subspace_trace: Option<std::sync::Arc<super::unified::PenaltySubspaceTrace>>,
+src/solver/reml/runtime.rs:7333:            penalty_logdet,
+src/solver/reml/runtime.rs:7337:            hessian_logdet_correction,
+src/solver/reml/runtime.rs:7338:            penalty_subspace_trace,
+src/solver/reml/runtime.rs:7372:        let (h_for_operator, e_for_logdet) = if let Some(z) = free_basis_opt.as_ref() {
+src/solver/reml/runtime.rs:7390:        // direction; both `log|H|` and its derivatives then count a direction
+src/solver/reml/runtime.rs:7392:        // those `σ_j ≤ ε` eigenpairs consistently across `logdet`,
+src/solver/reml/runtime.rs:7393:        // `trace_logdet_*`, and `H⁻¹` solves, so log|H|, its ρ-gradient, and
+src/solver/reml/runtime.rs:7398:        // `firth_op.q_basis`); extending the logdet kernel to the null space
+src/solver/reml/runtime.rs:7416:        let (penalty_rank, penalty_logdet) =
+src/solver/reml/runtime.rs:7417:            self.dense_penalty_logdet_derivs(rho, &e_for_logdet, &[], ridge_passport, mode)?;
+src/solver/reml/runtime.rs:7428:        // Rank-deficient LAML fix: under `Smooth` the spectral operator's
+src/solver/reml/runtime.rs:7429:        // cached logdet sums `ln r_ε(σ_j(H))` over ALL eigenvalues, so
+src/solver/reml/runtime.rs:7431:        // negative — and make `½(log|H| − log|S|_+)` diverge to −∞
+src/solver/reml/runtime.rs:7434:        // `hessian_logdet_correction`; `reml_laml_evaluate` already sums
+src/solver/reml/runtime.rs:7435:        // `hop.logdet() + correction`, so the evaluator sees
+src/solver/reml/runtime.rs:7439:        // The gradient trace kernel must pair with the **projected** logdet,
+src/solver/reml/runtime.rs:7446:        // scalar correction so `reml_laml_evaluate` can trace through the
+src/solver/reml/runtime.rs:7450:        // correct (the traces agree) but strictly unnecessary.
+src/solver/reml/runtime.rs:7453:        // consistently in `logdet`, `trace_logdet_*`, and `solve`, so the
+src/solver/reml/runtime.rs:7454:        // correction is zero there and no projected-trace kernel is needed.
+src/solver/reml/runtime.rs:7466:        // unbalanced trace term dominates the `λ_k tr(S_λ⁺ S_k)` and
+src/solver/reml/runtime.rs:7468:        // ARC's deterministic-replay detector fire on a flat REML surface
+src/solver/reml/runtime.rs:7479:        // from `log|H|` to `log|H_proj|`, putting the analytic ψ-gradient
+src/solver/reml/runtime.rs:7484:        // when `c ≡ 0` preserves the classical Gaussian REML cost identity
+src/solver/reml/runtime.rs:7485:        // (`log|H|`) and keeps that test on its analytic match.  For
+src/solver/reml/runtime.rs:7488:        // still built unconditionally — that is the rank-deficient LAML
+src/solver/reml/runtime.rs:7491:        let (hessian_logdet_correction, penalty_subspace_trace) =
+src/solver/reml/runtime.rs:7496:                    &e_for_logdet,
+src/solver/reml/runtime.rs:7500:                    log_det_h_proj - hessian_op.logdet(),
+src/solver/reml/runtime.rs:7514:            penalty_logdet,
+src/solver/reml/runtime.rs:7516:            hessian_logdet_correction,
+src/solver/reml/runtime.rs:7517:            penalty_subspace_trace,
+src/solver/reml/runtime.rs:7524:    fn build_sparse_assembly(
+src/solver/reml/runtime.rs:7539:            let mut op = SparseCholeskyOperator::new(sparse.factor.clone(), sparse.logdet_h, p_dim);
+src/solver/reml/runtime.rs:7546:        log::trace!(
+src/solver/reml/runtime.rs:7555:            let (_, det2) = self.structural_penalty_logdet_derivatives_block_local(
+src/solver/reml/runtime.rs:7557:                bundle.ridge_passport.penalty_logdet_ridge(),
+
+exec
+/bin/zsh -lc "sed -n '590,740p' src/solver/reml/penalty_logdet.rs" in /Users/user/gam
+ succeeded in 0ms:
+        lambdas: &[f64],
+        ridge: f64,
+        structural_nullity: Option<usize>,
+    ) -> Result<Self, String> {
+        if s_k_matrices.is_empty() {
+            return Ok(Self {
+                w_factor: Array2::zeros((0, 0)),
+                u_null: None,
+                inv_evals_sq: Array1::zeros(0),
+                rank: 0,
+                value: 0.0,
+                block_spans: Vec::new(),
+            });
+        }
+
+        let p_dim = s_k_matrices[0].nrows();
+        assert!(
+            s_k_matrices
+                .iter()
+                .all(|m| m.nrows() == p_dim && m.ncols() == p_dim)
+        );
+
+        let mut s_total = Array2::<f64>::zeros((p_dim, p_dim));
+        for (k, s_k) in s_k_matrices.iter().enumerate() {
+            s_total.scaled_add(lambdas[k], s_k);
+        }
+        if ridge > 0.0 {
+            for i in 0..p_dim {
+                s_total[[i, i]] += ridge;
+            }
+        }
+
+        Self::from_assembled_with_nullity(s_total, structural_nullity)
+    }
+
+    /// Build from a pre-assembled penalty matrix S (already = Σ λ_k S_k + ridge·I).
+    pub fn from_assembled(s_total: Array2<f64>) -> Result<Self, String> {
+        Self::from_assembled_inner(s_total, None)
+    }
+
+    /// Build from a pre-assembled penalty matrix with a known structural nullity.
+    ///
+    /// When `structural_nullity` is provided, the bottom `m0` eigenvalues are
+    /// treated as the nullspace even if ridge regularization makes them
+    /// numerically positive.
+    pub fn from_assembled_with_nullity(
+        s_total: Array2<f64>,
+        structural_nullity: Option<usize>,
+    ) -> Result<Self, String> {
+        Self::from_assembled_inner(s_total, structural_nullity)
+    }
+
+    fn from_assembled_inner(
+        s_total: Array2<f64>,
+        structural_nullity: Option<usize>,
+    ) -> Result<Self, String> {
+        let p_dim = s_total.nrows();
+        if p_dim == 0 {
+            return Ok(Self {
+                w_factor: Array2::zeros((0, 0)),
+                u_null: None,
+                inv_evals_sq: Array1::zeros(0),
+                rank: 0,
+                value: 0.0,
+                block_spans: Vec::new(),
+            });
+        }
+
+        // Eigendecomposition (ascending eigenvalues).
+        let (evals, evecs) = s_total
+            .eigh(Side::Lower)
+            .map_err(|e| format!("PenaltyPseudologdet eigendecomposition failed: {e}"))?;
+
+        let (rank, nullity) = if let Some(m0) = structural_nullity {
+            let m0 = m0.min(p_dim);
+            (p_dim - m0, m0)
+        } else {
+            let threshold =
+                super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+            let rank = evals.iter().filter(|&&e| e > threshold).count();
+            (rank, p_dim - rank)
+        };
+
+        // Value: log|S|₊ = Σ log σ_i for positive eigenvalues.
+        // Eigenvalues are ascending, so the last `rank` are the positive ones.
+        let value: f64 = evals
+            .iter()
+            .rev()
+            .take(rank)
+            .map(|&e| e.max(1e-300).ln())
+            .sum();
+
+        // W factor: p × rank, W_{:,j} = u_j / √σ_j for positive eigenvalues.
+        // Eigenvalues are ascending, so positive eigenvalues are the last `rank`.
+        let mut w_factor = Array2::<f64>::zeros((p_dim, rank));
+        let mut inv_evals_sq = Array1::<f64>::zeros(rank);
+        for col in 0..rank {
+            let idx = nullity + col;
+            let ev = evals[idx];
+            let scale = 1.0 / ev.sqrt();
+            inv_evals_sq[col] = 1.0 / (ev * ev);
+            for row in 0..p_dim {
+                w_factor[[row, col]] = evecs[[row, idx]] * scale;
+            }
+        }
+
+        // Null-space eigenvectors U₀: first `nullity` columns.
+        let u_null = if nullity > 0 {
+            let mut u0 = Array2::<f64>::zeros((p_dim, nullity));
+            for col in 0..nullity {
+                for row in 0..p_dim {
+                    u0[[row, col]] = evecs[[row, col]];
+                }
+            }
+            Some(u0)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            w_factor,
+            u_null,
+            inv_evals_sq,
+            rank,
+            value,
+            block_spans: Vec::new(),
+        })
+    }
+
+    /// log|S|₊.
+    pub fn value(&self) -> f64 {
+        self.value
+    }
+
+    /// Positive eigenspace rank.
+    pub fn rank(&self) -> usize {
+        self.rank
+    }
+
+    // ── Reduced-space representations ──────────────────────────────────────
+
+    /// Compute Y = W^T M W for an arbitrary symmetric matrix M.
+    ///
+    /// This gives the reduced (rank × rank) representation of S⁺ M:
+    /// tr(Y) = tr(S⁺ M), and tr(Y_a Y_b^T) = tr(S⁺ M_a S⁺ M_b).
+    fn reduced(&self, m: &Array2<f64>) -> Array2<f64> {
+        let wt_m = self.w_factor.t().dot(m);
+        wt_m.dot(&self.w_factor)
+    }
+
+    /// Compute the leakage matrix L = U₊^T M U₀ for the moving-nullspace correction.
+
+exec
+/bin/zsh -lc "sed -n '1,330p' gamfit/topology.py" in /Users/user/gam
+ succeeded in 0ms:
+"""Ergonomic one-line basis wrappers for common manifold topologies.
+
+These are *thin* wrappers around the existing :mod:`gamfit.smooth` primitives
+(``Duchon``, ``Sphere``, ``PeriodicSplineCurve``). The point is to let users
+compare candidate topologies with one line per candidate instead of manually
+constructing tensor products or remembering the right ``periodic_per_axis``
+flag::
+
+    import gamfit
+    from gamfit import topology
+
+    # candidates for an ambiguous latent coordinate
+    candidates = [
+        topology.Circle(name="circle"),
+        topology.Cylinder(name="cylinder"),
+        topology.Torus(name="torus"),
+        topology.Sphere(name="sphere"),
+        topology.EuclideanPatch(d=2, name="patch"),
+    ]
+    # then hand to gamfit.fit / a model-comparison helper
+
+Each wrapper returns a :class:`~gamfit.smooth.Smooth` instance and so slots
+directly into ``gamfit.fit(..., smooths=[...])``.
+
+Design choices
+--------------
+* All wrappers accept the standard ``name``, ``by``, ``double_penalty``,
+  ``shape_constraint`` kwargs for API consistency with other ``Smooth`` specs.
+* Defaults mirror the underlying primitives (``n_knots=20`` for 1D curves;
+  ``n_centers=64`` for Duchon patches; ``8`` per axis for 2D tensor / radial).
+* For ``Cylinder`` / ``Torus`` we rely on the ``periodic_per_axis`` flag on
+  :class:`~gamfit.smooth.Duchon`, which already handles mixed-periodic radial
+  kernels (see ``Duchon.periodic_per_axis`` docstring). This avoids a manual
+  Kronecker / tensor-product construction.
+* For d >= 2 the underlying Duchon basis requires explicit ``centers``; the
+  ``centers`` kwarg is forwarded so users can pass them. When omitted the
+  wrappers pass ``n_centers`` (an ``int``) through to the spec, which the
+  formula path treats as a request to auto-derive — auto-derivation is
+  presently only implemented for ``d=1`` in the Rust core. See the per-class
+  "Admissibility" notes below.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Sequence
+
+from .smooth import (
+    Duchon,
+    PeriodicSplineCurve,
+    ShapeConstraintLiteral,
+    Smooth,
+    Sphere as _SphereSmooth,
+)
+
+
+__all__ = [
+    "Circle",
+    "Cylinder",
+    "Torus",
+    "Sphere",
+    "EuclideanPatch",
+]
+
+
+def _common(
+    name: str | None,
+    by: Any | None,
+    double_penalty: bool,
+    shape_constraint: ShapeConstraintLiteral | None,
+) -> dict[str, Any]:
+    """Bundle the four Smooth-base kwargs into a dict for forwarding."""
+    return {
+        "name": name,
+        "by": by,
+        "double_penalty": double_penalty,
+        "shape_constraint": shape_constraint,
+    }
+
+
+def Circle(
+    name: str | None = None,
+    n_knots: int = 20,
+    *,
+    degree: int = 3,
+    penalty_order: int = 2,
+    output_dim: int = 1,
+    by: Any | None = None,
+    double_penalty: bool = False,
+    shape_constraint: ShapeConstraintLiteral | None = None,
+) -> Smooth:
+    """Closed loop, S^1.
+
+    Pick this when one coordinate is angularly periodic (e.g. hue, time of
+    day, phase of an oscillation). The input is a scalar parameter ``t`` and
+    the basis is the cyclic cubic spline on a periodic knot grid.
+
+    Implemented as :class:`~gamfit.smooth.PeriodicSplineCurve` with
+    ``output_dim=1``.
+
+    Parameters
+    ----------
+    n_knots : number of basis knots along the periodic parameter.
+    degree, penalty_order : forwarded to :class:`PeriodicSplineCurve`.
+    output_dim : ambient dimension of the curve (default ``1``: a scalar
+        smooth on the circle). Set ``>1`` to fit a closed loop in R^d.
+    """
+    return PeriodicSplineCurve(
+        n_knots=int(n_knots),
+        degree=int(degree),
+        output_dim=int(output_dim),
+        penalty_order=int(penalty_order),
+        **_common(name, by, double_penalty, shape_constraint),
+    )
+
+
+def Cylinder(
+    name: str | None = None,
+    n_knots: tuple[int, int] = (20, 8),
+    *,
+    centers: Any | None = None,
+    m: int = 2,
+    length_scale: float | None = None,
+    by: Any | None = None,
+    double_penalty: bool = False,
+    shape_constraint: ShapeConstraintLiteral | None = None,
+) -> Smooth:
+    """Cylinder, S^1 x R.
+
+    Pick this when one axis is periodic and one is not (e.g. hue x
+    lightness, time-of-day x temperature). The input is ``(N, 2)`` with
+    the first column the periodic axis.
+
+    Implemented as :class:`~gamfit.smooth.Duchon` with d=2 and
+    ``periodic_per_axis=(True, False)`` — the mixed-periodic radial
+    polyharmonic kernel on cylinder chord distance (see ``Duchon``
+    docstring).
+
+    Parameters
+    ----------
+    n_knots : ``(n_periodic, n_nonperiodic)`` — only used to size auto
+        centers; ignored when ``centers`` is supplied.
+    centers : optional ``(K, 2)`` array of control points. Required in
+        practice for d=2 (see Admissibility note below).
+
+    Admissibility
+    -------------
+    The Rust core's auto-center derivation is currently d=1 only; for the
+    d=2 cylinder the user must pass explicit ``centers``. Passing them as
+    a regular grid (e.g. ``itertools.product(periodic_grid, real_grid)``)
+    is the simplest pattern. This is a *maintainer-review item*: auto-grid
+    derivation for d>=2 radial bases would close the gap.
+    """
+    return Duchon(
+        centers=centers if centers is not None else int(n_knots[0] * n_knots[1]),
+        m=int(m),
+        length_scale=length_scale,
+        periodic_per_axis=(True, False),
+        **_common(name, by, double_penalty, shape_constraint),
+    )
+
+
+def Torus(
+    name: str | None = None,
+    n_knots: tuple[int, int] = (20, 20),
+    *,
+    centers: Any | None = None,
+    m: int = 2,
+    length_scale: float | None = None,
+    by: Any | None = None,
+    double_penalty: bool = False,
+    shape_constraint: ShapeConstraintLiteral | None = None,
+) -> Smooth:
+    """Torus, S^1 x S^1.
+
+    Pick this when both axes are angularly periodic (e.g. hue x phase,
+    longitude x time-of-day for a daily-cycle equirectangular field). The
+    input is ``(N, 2)`` with both columns periodic.
+
+    Implemented as :class:`~gamfit.smooth.Duchon` with d=2 and
+    ``periodic_per_axis=(True, True)`` — the mixed-periodic radial
+    polyharmonic kernel on toroidal chord distance.
+
+    Parameters
+    ----------
+    n_knots : ``(n_axis_0, n_axis_1)``. Defaults to ``(20, 20)``.
+    centers : optional ``(K, 2)`` array of control points.
+
+    Admissibility
+    -------------
+    Same caveat as :func:`Cylinder`: explicit d=2 ``centers`` are required
+    in the current Rust core because auto-derivation is d=1 only.
+    """
+    return Duchon(
+        centers=centers if centers is not None else int(n_knots[0] * n_knots[1]),
+        m=int(m),
+        length_scale=length_scale,
+        periodic_per_axis=(True, True),
+        **_common(name, by, double_penalty, shape_constraint),
+    )
+
+
+def Sphere(
+    name: str | None = None,
+    n_knots: int = 20,
+    *,
+    penalty_order: int = 2,
+    kernel: str = "sobolev",
+    radians: bool = False,
+    by: Any | None = None,
+    double_penalty: bool = False,
+    shape_constraint: ShapeConstraintLiteral | None = None,
+) -> Smooth:
+    """Two-sphere, S^2.
+
+    Pick this when the predictor is a direction in 3D — geographic
+    (latitude, longitude), a unit-vector embedding, or any orientation
+    coordinate that lives on the sphere. The input is ``(N, 2)``:
+    (latitude, longitude), degrees by default.
+
+    Implemented as :class:`~gamfit.smooth.Sphere` (spherical-harmonic /
+    Sobolev kernel basis on S^2).
+
+    Parameters
+    ----------
+    n_knots : number of basis centers / harmonic truncation degree
+        (forwarded as ``n_centers`` to the underlying spec).
+    penalty_order, kernel, radians : forwarded to
+        :class:`~gamfit.smooth.Sphere`.
+    """
+    return _SphereSmooth(
+        n_centers=int(n_knots),
+        penalty_order=int(penalty_order),
+        kernel=str(kernel),
+        radians=bool(radians),
+        **_common(name, by, double_penalty, shape_constraint),
+    )
+
+
+def EuclideanPatch(
+    d: int = 2,
+    name: str | None = None,
+    n_centers: int = 64,
+    *,
+    centers: Any | None = None,
+    m: int = 2,
+    length_scale: float | None = None,
+    by: Any | None = None,
+    double_penalty: bool = False,
+    shape_constraint: ShapeConstraintLiteral | None = None,
+) -> Smooth:
+    """Open Euclidean patch in R^d (no periodicity).
+
+    Pick this as the "no special topology" baseline against which closed
+    candidates (Circle, Cylinder, Torus, Sphere) should be compared. The
+    input is ``(N, d)``; the basis is the standard isotropic Duchon
+    m-spline.
+
+    Parameters
+    ----------
+    d : ambient dimension. ``d=2`` is the thin-plate spline. ``d>=3`` is
+        the generalized Duchon spline.
+    n_centers : default ``64``. Used as the auto-center count only when
+        ``d == 1`` (Rust auto-derivation is d=1 only) — otherwise pass
+        ``centers`` explicitly.
+    centers : optional ``(K, d)`` array of control points.
+
+    Admissibility
+    -------------
+    For ``d >= 2`` the user must pass explicit ``centers`` because the
+    Rust core does not yet auto-derive multi-d centers. A uniform grid
+    over the data's bounding box is the standard choice. This is a
+    *maintainer-review item* — adding multi-d auto-centers in Rust would
+    let the wrapper be a true one-liner for d>=2.
+    """
+    if centers is None and d == 1:
+        centers_arg: Any = int(n_centers)
+    else:
+        centers_arg = centers  # may be None for d>=2; the spec will then
+        # surface a clear "centers required for d>=2" error from the core.
+    return Duchon(
+        centers=centers_arg,
+        m=int(m),
+        length_scale=length_scale,
+        periodic_per_axis=None,
+        **_common(name, by, double_penalty, shape_constraint),
+    )
+
+codex
+The current tree already contains a first-pass arrow solver and latent inner driver, but it lacks the canonical evidence/IFT contract you asked for. I’m going to create the proposal as a design reference against the present names: `ArrowSchurSystem`, `ArrowRowBlock`, `ArrowFactorCache`, `LatentCoordValues`, `LogSmoothingParams(View)`, `AnalyticPenaltyRegistry`, and the REML `HyperCoord` machinery.
