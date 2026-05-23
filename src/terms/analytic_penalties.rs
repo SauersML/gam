@@ -67,7 +67,9 @@
 //! | Orthogonality | ext-coord (latent t) | 0 or 1 (log μ_orth) |
 
 use faer::Side;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, CowArray, Ix2, Ix3};
+use ndarray::{
+    Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, CowArray, Ix2, Ix3,
+};
 use std::sync::Arc;
 
 use crate::linalg::faer_ndarray::FaerEigh;
@@ -402,6 +404,17 @@ pub struct IsometryPenalty {
     /// memory and FLOPs scaling at `O(p · r · d)` per row instead of
     /// `O(p²)` per row.
     pub weight: WeightField,
+}
+
+struct IsometryHvpState<'a> {
+    d: usize,
+    n_obs: usize,
+    p: usize,
+    jac2: CowArray<'a, f64, Ix2>,
+    jac3: CowArray<'a, f64, Ix3>,
+    g: Array2<f64>,
+    g_ref: CowArray<'a, f64, Ix2>,
+    wj_rows: Vec<Array2<f64>>,
 }
 
 impl IsometryPenalty {
@@ -814,6 +827,140 @@ impl IsometryPenalty {
         }
     }
 
+    fn hvp_state<'a>(&'a self, target: ArrayView1<'_, f64>) -> Option<IsometryHvpState<'a>> {
+        let d = self
+            .target
+            .latent_dim
+            .expect("IsometryPenalty requires latent_dim on its PsiSlice");
+        let n_obs = target.len() / d;
+        if !self.has_jacobian_cache("hvp")
+            || !self.has_jacobian_second_source("hvp")
+            || !self.has_jacobian_third_source("hvp")
+        {
+            return None;
+        }
+        let p = self.p_out;
+        let jac2 = self.jacobian_second(target, n_obs, d)?;
+        let jac3 = self.jacobian_third(target, n_obs, d)?;
+        let g = self.pullback_metric(d)?;
+        let g_ref = self.reference_metric(n_obs, d);
+        let mut wj_rows = Vec::with_capacity(n_obs);
+        for n in 0..n_obs {
+            wj_rows.push(self.weighted_jacobian_row(n, d)?);
+        }
+        Some(IsometryHvpState {
+            d,
+            n_obs,
+            p,
+            jac2,
+            jac3,
+            g,
+            g_ref,
+            wj_rows,
+        })
+    }
+
+    fn hvp_with_precomputed_state(
+        &self,
+        state: &IsometryHvpState<'_>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let mu = rho[self.rho_index].exp();
+        let d = state.d;
+        let n_obs = state.n_obs;
+        let p = state.p;
+        let jac2 = &state.jac2;
+        let jac3 = &state.jac3;
+        let g = &state.g;
+        let g_ref = &state.g_ref;
+        let mut out = Array1::<f64>::zeros(v.len());
+
+        for n in 0..n_obs {
+            let wj = &state.wj_rows[n];
+            let mut delta_g = Array2::<f64>::zeros((d, d));
+            for a in 0..d {
+                for b in 0..d {
+                    let mut s = 0.0;
+                    for c in 0..d {
+                        let vc = v[n * d + c];
+                        if vc == 0.0 {
+                            continue;
+                        }
+                        for i in 0..p {
+                            s += vc * jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
+                            s += vc * wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
+                        }
+                    }
+                    delta_g[[a, b]] = s;
+                }
+            }
+            for c in 0..d {
+                let mut acc = 0.0;
+                for a in 0..d {
+                    for b in 0..d {
+                        let mut dg_c = 0.0;
+                        for i in 0..p {
+                            dg_c += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
+                            dg_c += wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
+                        }
+                        acc += dg_c * delta_g[[a, b]];
+                    }
+                }
+                out[n * d + c] = mu * acc;
+            }
+
+            for c in 0..d {
+                let mut acc_res = 0.0;
+                for a in 0..d {
+                    for b in 0..d {
+                        let diff = g[[n, a * d + b]] - g_ref[[n, a * d + b]];
+                        if diff == 0.0 {
+                            continue;
+                        }
+                        let mut bv = 0.0;
+                        for dd in 0..d {
+                            let vd = v[n * d + dd];
+                            if vd == 0.0 {
+                                continue;
+                            }
+                            let mut k_a_cd_w_j_b = 0.0;
+                            for i in 0..p {
+                                k_a_cd_w_j_b +=
+                                    jac3[[n, i, ((a * d) + c) * d + dd]] * wj[[i, b]];
+                            }
+                            let h_a_c_w_h_b_d = self.weighted_dot_decoder_vectors(
+                                n,
+                                p,
+                                |i| jac2[[n, (i * d + a) * d + c]],
+                                |i| jac2[[n, (i * d + b) * d + dd]],
+                            );
+                            let h_a_d_w_h_b_c = self.weighted_dot_decoder_vectors(
+                                n,
+                                p,
+                                |i| jac2[[n, (i * d + a) * d + dd]],
+                                |i| jac2[[n, (i * d + b) * d + c]],
+                            );
+                            let mut j_a_w_k_b_cd = 0.0;
+                            for i in 0..p {
+                                j_a_w_k_b_cd +=
+                                    wj[[i, a]] * jac3[[n, i, ((b * d) + c) * d + dd]];
+                            }
+                            bv += (k_a_cd_w_j_b
+                                + h_a_c_w_h_b_d
+                                + h_a_d_w_h_b_c
+                                + j_a_w_k_b_cd)
+                                * vd;
+                        }
+                        acc_res += diff * bv;
+                    }
+                }
+                out[n * d + c] += mu * acc_res;
+            }
+        }
+        out
+    }
+
     /// Per-row pullback metric `g_n = J_n^T W_n J_n = M_n^T M_n` with
     /// `M_n = U_n^T J_n ∈ ℝ^{r_n × d}`. Returns `(n_obs, d, d)` flattened
     /// row-major as `(n_obs, d*d)`.
@@ -980,119 +1127,10 @@ impl AnalyticPenalty for IsometryPenalty {
         //   B_{ab,cd} = K_{a,cd}^T W J_b + H_{a,c}^T W H_{b,d}
         //             + H_{a,d}^T W H_{b,c} + J_a^T W K_{b,cd},
         // where K is the third decoder derivative and H is the second.
-        let mu = rho[self.rho_index].exp();
-        let d = self
-            .target
-            .latent_dim
-            .expect("IsometryPenalty requires latent_dim on its PsiSlice");
-        let n_obs = target.len() / d;
-        if !self.has_jacobian_cache("hvp")
-            || !self.has_jacobian_second_source("hvp")
-            || !self.has_jacobian_third_source("hvp")
-        {
+        let Some(state) = self.hvp_state(target) else {
             return Array1::<f64>::zeros(v.len());
-        }
-        let p = self.p_out;
-        let mut out = Array1::<f64>::zeros(v.len());
-        let Some(jac2) = self.jacobian_second(target, n_obs, d) else {
-            return out;
         };
-        let Some(jac3) = self.jacobian_third(target, n_obs, d) else {
-            return out;
-        };
-        let Some(g) = self.pullback_metric(d) else {
-            return out;
-        };
-        let g_ref = self.reference_metric(n_obs, d);
-
-        for n in 0..n_obs {
-            let Some(wj) = self.weighted_jacobian_row(n, d) else {
-                return out;
-            };
-            let mut delta_g = Array2::<f64>::zeros((d, d));
-            for a in 0..d {
-                for b in 0..d {
-                    let mut s = 0.0;
-                    for c in 0..d {
-                        let vc = v[n * d + c];
-                        if vc == 0.0 {
-                            continue;
-                        }
-                        for i in 0..p {
-                            s += vc * jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
-                            s += vc * wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
-                        }
-                    }
-                    delta_g[[a, b]] = s;
-                }
-            }
-            for c in 0..d {
-                let mut acc = 0.0;
-                for a in 0..d {
-                    for b in 0..d {
-                        let mut dg_c = 0.0;
-                        for i in 0..p {
-                            dg_c += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
-                            dg_c += wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
-                        }
-                        acc += dg_c * delta_g[[a, b]];
-                    }
-                }
-                out[n * d + c] = mu * acc;
-            }
-
-            // Residual-curvature contribution:
-            // μ Σ_ab (g_ab - g_ref_ab) Σ_dd B_ab,c,dd v_dd.
-            // K shape: (n_obs, p, d*d*d), third index ((a*d)+c)*d+dd.
-            for c in 0..d {
-                let mut acc_res = 0.0;
-                for a in 0..d {
-                    for b in 0..d {
-                        let diff = g[[n, a * d + b]] - g_ref[[n, a * d + b]];
-                        if diff == 0.0 {
-                            continue;
-                        }
-                        let mut bv = 0.0;
-                        for dd in 0..d {
-                            let vd = v[n * d + dd];
-                            if vd == 0.0 {
-                                continue;
-                            }
-                            let mut k_a_cd_w_j_b = 0.0;
-                            for i in 0..p {
-                                k_a_cd_w_j_b +=
-                                    jac3[[n, i, ((a * d) + c) * d + dd]] * wj[[i, b]];
-                            }
-                            let h_a_c_w_h_b_d = self.weighted_dot_decoder_vectors(
-                                n,
-                                p,
-                                |i| jac2[[n, (i * d + a) * d + c]],
-                                |i| jac2[[n, (i * d + b) * d + dd]],
-                            );
-                            let h_a_d_w_h_b_c = self.weighted_dot_decoder_vectors(
-                                n,
-                                p,
-                                |i| jac2[[n, (i * d + a) * d + dd]],
-                                |i| jac2[[n, (i * d + b) * d + c]],
-                            );
-                            let mut j_a_w_k_b_cd = 0.0;
-                            for i in 0..p {
-                                j_a_w_k_b_cd +=
-                                    wj[[i, a]] * jac3[[n, i, ((b * d) + c) * d + dd]];
-                            }
-                            bv += (k_a_cd_w_j_b
-                                + h_a_c_w_h_b_d
-                                + h_a_d_w_h_b_c
-                                + j_a_w_k_b_cd)
-                                * vd;
-                        }
-                        acc_res += diff * bv;
-                    }
-                }
-                out[n * d + c] += mu * acc_res;
-            }
-        }
-        out
+        self.hvp_with_precomputed_state(&state, rho, v)
     }
 
     fn grad_rho(
@@ -2559,20 +2597,21 @@ impl OrthogonalityPenalty {
         out
     }
 
-    fn hvp_matrix(
+    fn hvp_with_precomputed_m(
         &self,
         t: ArrayView2<'_, f64>,
+        m: ArrayView2<'_, f64>,
         v: ArrayView2<'_, f64>,
         scale: f64,
     ) -> Array2<f64> {
         let n_obs = t.nrows();
         let d = t.ncols();
         debug_assert_eq!(v.dim(), t.dim(), "hvp matrix dimension mismatch");
+        debug_assert_eq!(m.dim(), (d, d), "precomputed gram dimension mismatch");
         if v.dim() != t.dim() {
             return Array2::<f64>::zeros((n_obs, d));
         }
 
-        let a = Self::gram_minus_identity(t);
         let mut vt_t_plus_tt_v = Array2::<f64>::zeros((d, d));
         for c in 0..d {
             for b in 0..d {
@@ -2590,7 +2629,7 @@ impl OrthogonalityPenalty {
                 let mut va = 0.0;
                 let mut tb = 0.0;
                 for c in 0..d {
-                    va += v[[n, c]] * a[[c, b]];
+                    va += v[[n, c]] * m[[c, b]];
                     tb += t[[n, c]] * vt_t_plus_tt_v[[c, b]];
                 }
                 out[[n, b]] = 2.0 * scale * (va + tb);
@@ -2667,7 +2706,8 @@ impl AnalyticPenalty for OrthogonalityPenalty {
         let Some(v_mat) = self.target_matrix(v) else {
             return Array1::<f64>::zeros(target.len());
         };
-        let hv = self.hvp_matrix(t.view(), v_mat.view(), self.scale(rho));
+        let m = Self::gram_minus_identity(t.view());
+        let hv = self.hvp_with_precomputed_m(t.view(), m.view(), v_mat.view(), self.scale(rho));
         Self::flatten_matrix(&hv)
     }
 
