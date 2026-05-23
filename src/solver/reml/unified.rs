@@ -8718,6 +8718,7 @@ fn compute_adjoint_z_c(
     ing: &ScalarGlmIngredients<'_>,
     hop: &dyn HessianOperator,
     leverage: &Array1<f64>,
+    subspace: Option<&PenaltySubspaceTrace>,
 ) -> Result<Array1<f64>, String> {
     let mut weighted = Array1::<f64>::zeros(ing.c_array.len());
     Zip::from(&mut weighted)
@@ -8727,7 +8728,32 @@ fn compute_adjoint_z_c(
     // Matrix-free Xᵀ · weighted via DesignMatrix transpose-apply, so
     // operator-backed (Lazy) designs at biobank scale never densify.
     let v = ing.x.transpose_vector_multiply(&weighted);
-    Ok(hop.solve(&v))
+    // Adjoint identity: tr(Kernel · C[u]) = uᵀ · Xᵀ(c ⊙ h^G), where the
+    // kernel and the leverage `h^G` must come from the SAME operator.
+    //
+    //   * Full-Hessian regime: Kernel = G_ε(H), leverage = diag(X G_ε(H) Xᵀ),
+    //     mode response u = H⁻¹ rhs, and the cheap shortcut reads
+    //     `rhs · z_c` with z_c = H⁻¹ · X'(c⊙h^G).
+    //   * Projected-subspace regime (rank-deficient LAML fix): Kernel = K,
+    //     leverage = h^{G,proj} = diag(X K Xᵀ), mode response u = K · rhs
+    //     (see `compute_ift_correction_trace`'s slow path and the standalone
+    //     coord-v computation above). For the same shortcut to hold the
+    //     adjoint must satisfy `rhs · z_c = (K rhs)ᵀ X'(c⊙h^{G,proj})
+    //                                     = rhsᵀ K · X'(c⊙h^{G,proj})`,
+    //     i.e. z_c^{proj} = K · X'(c ⊙ h^{G,proj}). Routing through
+    //     `hop.solve` here produces H⁻¹ · X'(c ⊙ h^{G,proj}) instead and
+    //     `scalar_correction_trace` then computes
+    //     `rhsᵀ H⁻¹ X'(c⊙h^{G,proj})` while the dense path's
+    //     `compute_ift_correction_trace` computes
+    //     `rhsᵀ K · X'(c⊙h^{G,proj})`, so the operator-form Hessian
+    //     disagrees with `compute_outer_hessian`'s materialisation on every
+    //     non-trivial subspace direction (the
+    //     `projected_operator_hessian_matches_dense_subspace_trace`
+    //     regression).
+    match subspace {
+        Some(kernel) => Ok(kernel.apply_pseudo_inverse(&v)),
+        None => Ok(hop.solve(&v)),
+    }
 }
 
 /// Compute the fourth-derivative trace: tr(G_ε(H) Xᵀ diag(d ⊙ (Xvₖ)(Xvₗ)) X).
@@ -9527,7 +9553,12 @@ fn compute_outer_hessian(
     };
     let adjoint_z_c = if incl_logdet_h {
         match (glm_ingredients.as_ref(), leverage.as_ref()) {
-            (Some(ing), Some(h_g)) => Some(compute_adjoint_z_c(ing, hop, h_g)?),
+            (Some(ing), Some(h_g)) => Some(compute_adjoint_z_c(
+                ing,
+                hop,
+                h_g,
+                solution.penalty_subspace_trace.as_deref(),
+            )?),
             _ => None,
         }
     } else {
@@ -10939,9 +10970,21 @@ fn build_outer_hessian_operator(
     // Mode responses are fixed-β stationarity derivatives. The main
     // evaluator passes precomputed responses so gradient and Hessian share
     // the same solve kernel, including projected kernels in rank-deficient
-    // LAML. The standalone path below preserves the historical full-H solve
-    // semantics and batches all RHS columns into a single factorization
-    // application.
+    // LAML. The standalone path below must mirror `compute_outer_hessian`'s
+    // kernel selection exactly: when `penalty_subspace_trace` is installed
+    // (rank-deficient LAML fix active), the per-coordinate mode response
+    // `v = -H^{-1} g` is replaced by the projected pseudo-inverse
+    // `v = K · g = U_S · H_proj^{-1} · U_S^T · g`, lifted to the
+    // active-constraint manifold via the Schur-complement
+    // `K_T = K_S − K_S A^T (A K_S A^T)^{-1} A K_S` when an active block is
+    // present. The dense gradient path applies the same selection at the
+    // gradient site (line ~7480) and the dense Hessian path uses it at
+    // line ~9585; if this fallback routes through `hop.solve_multi` instead,
+    // the operator-form Hessian computes `H^{-1} g` while the dense path
+    // computes `K g`, and the two materializations disagree on every entry
+    // whose row or column lives outside `range(U_S)`. The test
+    // `projected_operator_hessian_matches_dense_subspace_trace` exercises
+    // exactly that disagreement.
     let subspace = solution.penalty_subspace_trace.as_deref();
     let coord_vs_storage;
     let coord_vs: &[Array1<f64>] = if let Some(precomputed) = precomputed_coord_vs {
@@ -10959,6 +11002,25 @@ fn build_outer_hessian_operator(
     } else {
         let owned = if total == 0 {
             Vec::new()
+        } else if let Some(kernel) = subspace {
+            let constrained = solution
+                .active_constraints
+                .as_ref()
+                .map(|block| kernel.with_active_constraints(block.a.view()));
+            let apply = |v: &Array1<f64>| -> Array1<f64> {
+                match constrained.as_ref() {
+                    Some(ck) if ck.has_active_constraints() => ck.apply_pseudo_inverse(v),
+                    _ => kernel.apply_pseudo_inverse(v),
+                }
+            };
+            let mut vs = Vec::with_capacity(total);
+            for idx in 0..k {
+                vs.push(apply(&rho_curvature_a_k_betas[idx]));
+            }
+            for coord in solution.ext_coords.iter() {
+                vs.push(apply(&coord.g));
+            }
+            vs
         } else {
             let mut rhs_stack = Array2::<f64>::zeros((hop.dim(), total));
             for idx in 0..k {
@@ -11527,16 +11589,27 @@ fn build_outer_hessian_operator(
 
     // Leverage and the scalar-GLM adjoint-z_c cache support both the
     // full-Hessian and projected-subspace paths.  Under subspace,
-    //   h^{G,proj}_i = Xᵢᵀ · K · Xᵢ      (K = U_S H_proj⁻¹ U_Sᵀ)
-    //   z_c^{proj}   = H⁻¹ · Xᵀ(c ⊙ h^{G,proj})
+    //   h^{G,proj}_i = Xᵢᵀ · K · Xᵢ                  (K = U_S H_proj⁻¹ U_Sᵀ)
+    //   u            = K · rhs                       (mirrors
+    //                                                  `compute_ift_correction_trace`
+    //                                                  slow path and the
+    //                                                  per-coord v computation
+    //                                                  above)
+    //   z_c^{proj}   = K · Xᵀ(c ⊙ h^{G,proj})
     // and the adjoint identity
     //   tr(K · C[u]) = uᵀ · Xᵀ(c ⊙ h^{G,proj})
-    // (with u = H⁻¹ · rhs unchanged) lets `scalar_correction_trace` take
-    // the cheap branch via `(rhs)ᵀ z_c^{proj} = rhsᵀ H⁻¹ Xᵀ(c ⊙ h^{G,proj})
-    //                                      = uᵀ Xᵀ(c ⊙ h^{G,proj}) = tr(K C[u])`
-    // instead of materialising the second-derivative correction.  Only the
-    // leverage swaps to the projected diagonal; z_c stays gated by `H⁻¹`
-    // so the IFT mode-response semantics line up with `compute_outer_hessian`.
+    //               = (K rhs)ᵀ · Xᵀ(c ⊙ h^{G,proj})
+    //               = rhsᵀ · K · Xᵀ(c ⊙ h^{G,proj})
+    //               = rhsᵀ · z_c^{proj}
+    // lets `scalar_correction_trace` take the cheap branch
+    // `rhs · z_c^{proj}` instead of materialising the second-derivative
+    // correction.  Both the leverage AND the adjoint vector must swap to
+    // their projected forms — gating only one (the historical bug) made the
+    // operator path's `scalar_correction_trace` compute
+    // `rhsᵀ H⁻¹ Xᵀ(c⊙h^{G,proj})` while `compute_ift_correction_trace`
+    // computes `rhsᵀ K · X'(c⊙h^{G,proj})`, so the operator-form Hessian
+    // disagreed with the dense path materialisation in the regression
+    // `projected_operator_hessian_matches_dense_subspace_trace`.
     let leverage = if incl_logdet_h {
         match &kernel {
             OuterHessianDerivativeKernel::Gaussian => None,
@@ -11566,6 +11639,7 @@ fn build_outer_hessian_operator(
                 },
                 hop.as_ref(),
                 h_g,
+                subspace,
             )?),
             _ => None,
         }
@@ -18213,7 +18287,7 @@ mod tests {
             }
             h_dense[i] = acc;
         }
-        let streamed = compute_adjoint_z_c(&ing, &hop, &h_dense).expect("adjoint path");
+        let streamed = compute_adjoint_z_c(&ing, &hop, &h_dense, None).expect("adjoint path");
 
         let mut t = h_dense.clone();
         Zip::from(&mut t)
