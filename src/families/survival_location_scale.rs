@@ -4540,7 +4540,9 @@ fn finalize_survival_location_scale_fit(
                         beta_link_wiggle.as_ref().map_or(0, |b| b.len()),
                     )
                     .map(|penalized_hessian| FitGeometry {
-                        penalized_hessian,
+                        // Boundary adapter: wrap the lifted raw Hessian as
+                        // `UnscaledPrecision` for the newtype storage.
+                        penalized_hessian: penalized_hessian.into(),
                         working_weights: geom.working_weights.clone(),
                         working_response: geom.working_response.clone(),
                     }),
