@@ -494,6 +494,7 @@ pub fn ift_warm_start_latent(
 /// reuses the parallel-transport approximation embedded in each
 /// `Manifold::vector_transport` implementation — see
 /// [`crate::solver::riemannian`].
+#[allow(dead_code)]
 pub fn apply_ift_retraction(
     point_flat: &Array1<f64>,
     delta_t: &Array1<f64>,
