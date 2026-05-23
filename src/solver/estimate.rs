@@ -709,6 +709,7 @@ fn dispersion_from_likelihood(
         | GlmLikelihoodFamily::BinomialSas
         | GlmLikelihoodFamily::BinomialBetaLogistic
         | GlmLikelihoodFamily::BinomialMixture
+        | GlmLikelihoodFamily::Tweedie { .. }
         | GlmLikelihoodFamily::NegativeBinomial { .. }
         | GlmLikelihoodFamily::PoissonLog => Dispersion::Known(1.0),
     }
@@ -3619,6 +3620,7 @@ where
         | GlmLikelihoodFamily::BinomialSas
         | GlmLikelihoodFamily::BinomialBetaLogistic
         | GlmLikelihoodFamily::BinomialMixture
+        | GlmLikelihoodFamily::Tweedie { .. }
         | GlmLikelihoodFamily::NegativeBinomial { .. }
         | GlmLikelihoodFamily::PoissonLog => 1.0,
     };
@@ -5259,6 +5261,7 @@ impl UnifiedFitResult {
                 )),
             },
             crate::types::LikelihoodFamily::PoissonLog
+            | crate::types::LikelihoodFamily::Tweedie { .. }
             | crate::types::LikelihoodFamily::NegativeBinomial { .. }
             | crate::types::LikelihoodFamily::GammaLog => {
                 Ok(FittedLinkState::Standard(Some(LinkFunction::Log)))

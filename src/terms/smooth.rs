@@ -9352,6 +9352,11 @@ fn evaluate_standard_familyobservations(
                     "bounded linear terms are not supported for PoissonLog fits".to_string(),
                 ));
             }
+            LikelihoodFamily::Tweedie { .. } => {
+                return Err(EstimationError::InvalidInput(
+                    "bounded linear terms are not supported for Tweedie fits".to_string(),
+                ));
+            }
             LikelihoodFamily::NegativeBinomial { .. } => {
                 return Err(EstimationError::InvalidInput(
                     "bounded linear terms are not supported for NegativeBinomial fits".to_string(),
@@ -16262,6 +16267,7 @@ pub(crate) fn seed_risk_profile_for_likelihood_family(
         | LikelihoodFamily::BinomialBetaLogistic
         | LikelihoodFamily::BinomialMixture
         | LikelihoodFamily::PoissonLog
+        | LikelihoodFamily::Tweedie { .. }
         | LikelihoodFamily::NegativeBinomial { .. }
         | LikelihoodFamily::GammaLog => crate::seeding::SeedRiskProfile::GeneralizedLinear,
     }
