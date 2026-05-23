@@ -1877,7 +1877,11 @@ impl<'a> GamWorkingModel<'a> {
                 // Next call will reallocate (same cost as the existing zero-fill).
                 Ok(std::mem::take(&mut workspace.hessian_buf))
             }
-            _ => crate::matrix::xt_diag_x_symmetric(design, weights)
+            // Observed-Hessian assembly: working weights may be signed
+            // (binomial + cloglog, Gamma + identity, etc.). Route through the
+            // signed-Gram API so the CSC / sparse-accumulator paths preserve
+            // sign instead of silently clipping negative-curvature mass.
+            _ => crate::matrix::xt_diag_x_signed(design, weights)
                 .map(|h| h.to_dense())
                 .map_err(EstimationError::InvalidInput),
         }

@@ -435,6 +435,14 @@ struct SharedData {
     mode: Arc<Array1<f64>>,
     /// Fitted Gamma shape (used only for Gamma-log likelihoods).
     gamma_shape: f64,
+    /// Dispersion parameter φ used to scale the likelihood for families
+    /// with an estimated scale (Gaussian: σ²; Gamma: 1/shape). For fixed-
+    /// scale families this is `Known(1.0)`. The Gaussian log-likelihood
+    /// and its gradient multiply through by `1/φ` so that the whitened
+    /// sampler targets `φ·H⁻¹` rather than a silently mis-scaled
+    /// posterior. See `inference::dispersion_cov` for the ownership
+    /// invariants this field encodes.
+    dispersion: crate::solver::estimate::Dispersion,
     /// Number of samples
     n_samples: usize,
     /// Number of coefficients
@@ -539,6 +547,7 @@ impl NutsPosterior {
         hessian: ArrayView2<f64>,
         nuts_family: NutsFamily,
         gamma_shape: f64,
+        dispersion: crate::solver::estimate::Dispersion,
         firth_enabled: bool,
     ) -> Result<Self, String> {
         let n_samples = x.nrows();
@@ -580,7 +589,21 @@ impl NutsPosterior {
         // To get L_H^{-T}, we solve L_H^T * X = I using back-substitution
         // Since L_H is lower triangular, L_H^T is upper triangular
         let l_h = chol_factor.lower_triangular();
-        let chol = solve_upper_triangular_transpose(&l_h, dim);
+        let mut chol = solve_upper_triangular_transpose(&l_h, dim);
+        // Scale the Cholesky factor by sqrt(phi) so that L Lᵀ = phi · H⁻¹,
+        // i.e. the whitened sampler targets the φ-scaled posterior
+        // covariance `Vb`. For fixed-scale families (Binomial, Poisson)
+        // `phi == 1` and `sqrt_phi() == 1`, so this is a no-op. For
+        // Gaussian and Gamma the dispersion is estimated and this is the
+        // missing √φ that previously left the sampler whitening against
+        // a unit-variance reference instead of `Vb`.
+        {
+            use crate::inference::dispersion_cov::DispersionExt as _;
+            let sqrt_phi = dispersion.sqrt_phi();
+            if (sqrt_phi - 1.0).abs() > 0.0 {
+                chol.mapv_inplace(|v| v * sqrt_phi);
+            }
+        }
         let chol_t = chol.t().to_owned();
 
         // Precompute the whitened penalty operator and constants so that the
@@ -606,6 +629,7 @@ impl NutsPosterior {
             weights: Arc::new(weights.to_owned()),
             mode: Arc::new(mode_owned),
             gamma_shape,
+            dispersion,
             n_samples,
             dim,
         };
@@ -841,7 +865,13 @@ fn joint_binomial_logp_and_grad(
                 inverse_link.sas_state(),
             )
             .map_err(|err| err.to_string())?;
-            let mu = jet.mu.clamp(1.0e-15, 1.0 - 1.0e-15);
+            // Clamp `mu` away from the open-interval endpoints so the
+            // binomial log-likelihood below stays finite even when the
+            // inverse-link jet returns a saturated value. The epsilon
+            // matches the rest of the inference-side binomial safety
+            // helpers; see also: safe_mu_for_binomial in solver/pirls.rs
+            // for the centralised version Group B is introducing.
+            let mu = jet.mu.clamp(1.0e-12, 1.0 - 1.0e-12);
             let dmu_deta = jet.d1;
             let y_i = data.y[i];
             let w_i = data.weights[i];
@@ -995,12 +1025,22 @@ fn cloglog_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f
 
 /// Gaussian log-likelihood and gradient.
 ///
-/// log p(y|η) = −½ w·(y − η)², gradient = X'(w ⊙ (y − η))
+/// log p(y|η) = −½ (w/φ)·(y − η)²,  gradient = (1/φ)·X'(w ⊙ (y − η))
+///
+/// Both the log-likelihood and its β-gradient are scaled by `1/φ` so that
+/// the working likelihood matches the φ-scaled posterior covariance the
+/// HMC whitening transform targets. With `φ == 1` (the only value
+/// passed by the pre-refactor call sites) this collapses to the original
+/// `−½ w·(y − η)²` expression; with an estimated dispersion (the
+/// `Dispersion::Estimated(σ²)` branch) it removes the silent unit-σ
+/// approximation the Gaussian NUTS log-density used previously.
 fn gaussian_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    use crate::inference::dispersion_cov::DispersionExt as _;
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
-    // Per-row: residual = y - η, weighted_residual = w·residual,
-    // ll contribution = -0.5·w·residual². All independent across rows.
+    let inv_phi = data.dispersion.inv_phi();
+    // Per-row: residual = y - η, weighted_residual = (w/φ)·residual,
+    // ll contribution = -0.5·(w/φ)·residual². All independent across rows.
     let mut weighted_residual = Array1::<f64>::zeros(n);
     let ll: f64 = weighted_residual
         .as_slice_mut()
@@ -1010,8 +1050,9 @@ fn gaussian_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<
         .map(|(i, slot)| {
             let residual = data.y[i] - eta[i];
             let w_i = data.weights[i];
-            *slot = w_i * residual;
-            -0.5 * w_i * residual * residual
+            let scaled = w_i * inv_phi;
+            *slot = scaled * residual;
+            -0.5 * scaled * residual * residual
         })
         .sum();
 
@@ -1468,6 +1509,7 @@ mod tests {
             weights: Arc::new(weights.clone()),
             mode: Arc::new(Array1::zeros(1)),
             gamma_shape: shape,
+            dispersion: crate::estimate::Dispersion::Known(1.0),
             n_samples: x.nrows(),
             dim: x.ncols(),
         };
@@ -1508,6 +1550,7 @@ mod tests {
             weights: Arc::new(weights.clone()),
             mode: Arc::new(Array1::zeros(x.ncols())),
             gamma_shape: 1.0,
+            dispersion: crate::estimate::Dispersion::Known(1.0),
             n_samples: x.nrows(),
             dim: x.ncols(),
         };
@@ -1866,6 +1909,7 @@ mod tests {
             weights: Arc::new(weights),
             mode: Arc::new(Array1::zeros(1)),
             gamma_shape: 1.0,
+            dispersion: crate::estimate::Dispersion::Known(1.0),
             n_samples: 2,
             dim: 1,
         };
@@ -2024,6 +2068,7 @@ mod tests {
             weights: Arc::new(array![1.0, 1.0]),
             mode: Arc::new(Array1::zeros(1)),
             gamma_shape: 1.0,
+            dispersion: crate::estimate::Dispersion::Known(1.0),
             n_samples: 2,
             dim: 1,
         };
@@ -3093,6 +3138,7 @@ pub(crate) fn run_nuts_sampling(
     hessian: ArrayView2<f64>,
     nuts_family: NutsFamily,
     gamma_shape: f64,
+    dispersion: crate::solver::estimate::Dispersion,
     firth_bias_reduction: bool,
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
@@ -3111,6 +3157,7 @@ pub(crate) fn run_nuts_sampling(
         hessian,
         nuts_family,
         gamma_shape,
+        dispersion,
         firth_bias_reduction,
     )?;
 
@@ -4403,6 +4450,11 @@ impl JointBetaRhoPosterior {
             weights: Arc::new(weights.to_owned()),
             mode: Arc::new(mode.to_owned()),
             gamma_shape: gamma_shape.unwrap_or(1.0),
+            // Joint (β, ρ) HMC keeps the likelihood on its native scale;
+            // dispersion enters via the per-family scale parameter, not
+            // via the whitening transform here. `Known(1.0)` matches the
+            // pre-refactor behaviour for this code path.
+            dispersion: crate::solver::estimate::Dispersion::Known(1.0),
             n_samples,
             dim: n_beta,
         };

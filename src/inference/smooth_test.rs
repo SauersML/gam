@@ -139,7 +139,13 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> SmoothTestResult {
                 (den_df.is_finite() && den_df > 0.0)
                     .then(|| FisherSnedecor::new(ref_df, den_df).ok())
                     .flatten()
-                    .map(|dist| 1.0 - dist.cdf(stat / ref_df / input.dispersion.phi()))
+                    // `stat` is the quadratic form in `phi * H^{-1}` (the
+                    // stored `beta_covariance` is already phi-scaled — see
+                    // `solver/estimate.rs::scaled_covariance`), so it already
+                    // absorbs `1/phi`. Dividing by `phi` here a second time
+                    // shrank the F-statistic and inflated p-values for
+                    // families with estimated dispersion (Gaussian / Gamma).
+                    .map(|dist| 1.0 - dist.cdf(stat / ref_df))
             })
         } else {
             ChiSquared::new(ref_df)
