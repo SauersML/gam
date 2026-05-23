@@ -15136,12 +15136,34 @@ impl HessianOperator for MatrixFreeSpdOperator {
         true
     }
 
+    /// The operator delegates `logdet`, `trace_hinv_*`, `trace_logdet_*`,
+    /// `solve`, and `solve_multi` to a lazily-built `DenseSpectralOperator`
+    /// whenever the exact-dense materialization fits the configured byte cap
+    /// (see `exact_dense_spectral_budget_ok` / `EXACT_DENSE_SPECTRAL_MAX_BYTES`).
+    /// In that regime the algebra is exact spectral — there is no stochastic
+    /// preference to advertise, and forcing the caller to take the Hutchinson
+    /// path would replace an O(p²) exact reduction with O(k·apply) noisy probes.
+    ///
+    /// When the budget is exceeded the dense factor cannot be built and the
+    /// CG trace-solve path added in 2bd6af68 is the only feasible route; the
+    /// flag flips to `true` so `stochastic_trace_solve*` callers route through
+    /// `cg_trace_solve` instead of crashing in `exact_dense_spectral().expect`.
     fn prefers_stochastic_trace_estimation(&self) -> bool {
-        true
+        !self.exact_dense_spectral_budget_ok()
     }
 
+    /// Mirror the `prefers_stochastic_trace_estimation` gate: when the dense
+    /// factor is reachable the operator's logdet / trace_hinv reductions all
+    /// resolve through `DenseSpectralOperator`, whose
+    /// `logdet_traces_match_hinv_kernel` is `false` for the smooth-spectral
+    /// regularization variants we run. Reporting `true` here would let the
+    /// outer evaluator route logdet-gradient/Hessian traces through the
+    /// Hutchinson `H⁻¹` kernel which does not satisfy
+    /// `∂ log|H| = tr(H⁻¹ ∂H)` under smooth-spectral. The CG-only regime
+    /// (budget exceeded) lacks a dense reference so falling back to the
+    /// stochastic kernel is acceptable as a best-effort estimate.
     fn logdet_traces_match_hinv_kernel(&self) -> bool {
-        true
+        !self.exact_dense_spectral_budget_ok()
     }
 
     fn as_dense_spectral(&self) -> Option<&DenseSpectralOperator> {
