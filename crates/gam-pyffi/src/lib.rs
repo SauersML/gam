@@ -5424,6 +5424,7 @@ fn latent_glm_family_from_str(
     value: &str,
     tweedie_p: f64,
     negbin_theta: f64,
+    beta_phi: f64,
 ) -> Result<LikelihoodFamily, String> {
     match value.to_ascii_lowercase().replace('_', "-").as_str() {
         "gaussian" | "gaussian-identity" => Ok(LikelihoodFamily::GaussianIdentity),
@@ -5447,9 +5448,15 @@ fn latent_glm_family_from_str(
                 theta: negbin_theta,
             })
         }
+        "beta" | "beta-logit" | "beta-regression" | "beta-regression-logit" => {
+            if !(beta_phi.is_finite() && beta_phi > 0.0) {
+                return Err(format!("beta_phi must be finite and > 0; got {beta_phi}"));
+            }
+            Ok(LikelihoodFamily::BetaLogit { phi: beta_phi })
+        }
         "gamma" | "gamma-log" => Ok(LikelihoodFamily::GammaLog),
         other => Err(format!(
-            "unsupported latent GLM family {other:?}; supported families are gaussian-identity, binomial-logit, binomial-probit, binomial-cloglog, poisson-log, tweedie-log, negbin-log, gamma-log"
+            "unsupported latent GLM family {other:?}; supported families are gaussian-identity, binomial-logit, binomial-probit, binomial-cloglog, poisson-log, tweedie-log, negbin-log, beta-regression-logit, gamma-log"
         )),
     }
 }
@@ -5622,6 +5629,7 @@ fn set_ok_glm_latent_items<'py>(
     family,
     tweedie_p = 1.5,
     negbin_theta = 1.0,
+    beta_phi = 1.0,
     m = 2,
     weights = None,
     fisher_w = None,
@@ -5644,6 +5652,7 @@ fn glm_reml_fit_latent<'py>(
     family: String,
     tweedie_p: f64,
     negbin_theta: f64,
+    beta_phi: f64,
     m: usize,
     weights: Option<PyReadonlyArray1<'py, f64>>,
     fisher_w: Option<PyReadonlyArray3<'py, f64>>,
@@ -5707,7 +5716,8 @@ fn glm_reml_fit_latent<'py>(
         );
     }
     let family =
-        latent_glm_family_from_str(&family, tweedie_p, negbin_theta).map_err(py_value_error)?;
+        latent_glm_family_from_str(&family, tweedie_p, negbin_theta, beta_phi)
+            .map_err(py_value_error)?;
     let effective_weights = latent_scalar_weights_with_fisher(
         n_obs,
         weights.as_ref().map(|w| w.as_array()),
@@ -5776,7 +5786,7 @@ fn glm_reml_fit_latent_backward<'py>(
     dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
     basis_kind: String,
 ) -> PyResult<Py<PyDict>> {
-    let family = latent_glm_family_from_str(&family, 1.5, 1.0).map_err(py_value_error)?;
+    let family = latent_glm_family_from_str(&family, 1.5, 1.0, 1.0).map_err(py_value_error)?;
     let aux_family = match aux_family.to_ascii_lowercase().as_str() {
         "ridge" => AuxPriorFamily::Ridge,
         "linear" => AuxPriorFamily::Linear,
@@ -9632,6 +9642,7 @@ fn family_link_kind(family: LikelihoodFamily) -> &'static str {
         LikelihoodFamily::PoissonLog => "log",
         LikelihoodFamily::Tweedie { .. } => "log",
         LikelihoodFamily::NegativeBinomial { .. } => "log",
+        LikelihoodFamily::BetaLogit { .. } => "logit",
         LikelihoodFamily::GammaLog => "log",
         LikelihoodFamily::BinomialMixture => "logit",
         LikelihoodFamily::BinomialSas => "sas",

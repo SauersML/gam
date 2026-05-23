@@ -2622,6 +2622,9 @@ pub fn resolve_family(
         "binomial-cloglog" => Some(LikelihoodFamily::BinomialCLogLog),
         "latent-cloglog-binomial" => Some(LikelihoodFamily::BinomialLatentCLogLog),
         "poisson" => Some(LikelihoodFamily::PoissonLog),
+        "beta" | "beta-logit" | "beta-regression" | "beta-regression-logit" => {
+            Some(LikelihoodFamily::BetaLogit { phi: 1.0 })
+        }
         "gamma" => Some(LikelihoodFamily::GammaLog),
         _ => None,
     });

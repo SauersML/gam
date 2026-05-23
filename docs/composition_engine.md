@@ -56,14 +56,7 @@ model = gamfit.fit(df, "y ~ s(x) + duchon(u, v, centers=64)")
 Topology comparison:
 
 ```python
-from gamfit import topology
-
-candidates = [
-    ("circle", topology.Circle(name="theta")),
-    ("torus", topology.Torus(centers=torus_grid, name="theta_phi")),
-    ("patch", topology.EuclideanPatch(d=2, centers=patch_grid, name="uv")),
-]
-gamfit.select_topology(df, "y", candidates=candidates, score="reml")
+gamfit.select_topology(df, "y", score_scale="per_observation")
 ```
 
 LatentCoord / GP-LVM shape:
@@ -126,6 +119,13 @@ absorbed by refitting β. Use at least one gauge-breaking prior:
 - `aux_prior`, with the log-strength normalizer present, `h(u)` at least C1,
   and conditional precision positive-definite on the anchored subspace.
 - `IsometryPenalty`, which pins the decoder pullback metric to a reference.
+
+Topology evidence uses the Tierney-Kadane Laplace normalizer
+`F + 0.5 log|H| - 0.5 log|S| - 0.5(dim(H) - rank(S)) log(2*pi)`.
+`gamfit.select_topology(..., score_scale="per_observation")` is the default
+because it keeps cross-topology REML comparisons on the observed-data scale;
+`project_gumbel_anneal_population_sparsity_falsified` records the historical
+BIC/REML disagreement when basis dimensions were compared raw.
 
 `ARDPenalty` / `dim_selection=True` is a companion, not a gauge fix. It prunes
 axes only after an aux prior or isometry has pinned the coordinate system.
