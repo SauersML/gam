@@ -77,6 +77,7 @@ from .smooth import (
     Sphere,
     TensorBSpline,
 )
+from . import topology
 from ._exceptions import FormulaError, GamError, PredictionError, SchemaMismatchError
 from ._model import (
     CompetingRisksCIF,
@@ -179,6 +180,7 @@ __all__ = [
     "Smooth",
     "Sphere",
     "TensorBSpline",
+    "topology",
     "duchon_basis",
     "duchon_function_norm_penalty",
     "explain_error",
