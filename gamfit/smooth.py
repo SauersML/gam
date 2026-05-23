@@ -281,9 +281,9 @@ class LatentCoord:
           (e.g. environment label, observed RGB, …).
         * ``family``: ``"ridge"`` (default) or ``"linear"`` — choice of
           internal conditional-mean estimator ``ĥ(u)``.
-        * ``strength``: positive float, the penalty weight ``μ`` in
-          ``R_id = ½ μ ‖t − ĥ(u)‖²``. Pass ``"auto"`` to let REML choose
-          it as one extra outer ``ρ``-axis.
+        * ``strength``: ``"auto"`` (default) or a positive float, the
+          penalty weight ``μ`` in ``R_id = ½ μ ‖t − ĥ(u)‖²``. ``"auto"``
+          lets REML choose it as one extra outer ``ρ``-axis.
 
         This is the principled identifiability fix (Khemakhem et al. 2020)
         when the marginal likelihood includes the log-``μ`` normalizer,
@@ -309,7 +309,7 @@ class LatentCoord:
     >>> import gamfit
     >>> t = gamfit.LatentCoord(
     ...     n=N, d=4, init="pca",
-    ...     aux_prior={"u": rgb, "family": "ridge", "strength": 1.0},
+    ...     aux_prior={"u": rgb, "family": "ridge", "strength": "auto"},
     ... )
     """
 

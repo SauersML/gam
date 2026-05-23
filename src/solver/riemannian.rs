@@ -633,6 +633,7 @@ pub enum ManifoldKind {
 
 impl ManifoldKind {
     /// Materialise a trait-object instance.
+    #[must_use]
     pub fn build(&self) -> Box<dyn Manifold> {
         match self {
             ManifoldKind::Euclidean(d) => Box::new(Euclidean { d: *d }),
@@ -711,7 +712,7 @@ impl Default for RiemannianNewtonStep {
 ///      or the step exceeds the trust radius, fall back to a scaled
 ///      negative-gradient (Cauchy point) step.
 ///   4. Retract `point + ξ` back to the manifold.
-pub fn riemannian_newton_step_on_point(
+pub(crate) fn riemannian_newton_step_on_point(
     manifold: &dyn Manifold,
     point: ArrayView1<f64>,
     euclidean_hess: ArrayView2<f64>,
