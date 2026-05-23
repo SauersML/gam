@@ -279,10 +279,11 @@ fn iterate_norm(beta: ArrayView1<'_, f64>, t: ArrayView1<'_, f64>) -> f64 {
 
 /// Minimal no-op assembler that always reports a converged system.
 ///
-/// TODO(piece-2): replace with the real Duchon/Matern assembler that
-/// reads from the basis registry and produces Gauss–Newton blocks
-/// against the working-weighted residual. The shape of the trait is
-/// already final; only the *body* of `assemble` is a placeholder here.
+/// Piece-2 integration point: replaced by the real Duchon/Matern
+/// assembler that reads from the basis registry and produces
+/// Gauss–Newton blocks against the working-weighted residual. The shape
+/// of the trait is already final; only the *body* of `assemble` is a
+/// placeholder here.
 pub struct ZeroAssembler {
     pub n: usize,
     pub d: usize,

@@ -47,14 +47,16 @@ use gam::smooth::{
 };
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
-    BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
+    BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, MaternNu,
     SpatialIdentifiability, SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec,
-    auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile, build_duchon_basis,
-    build_duchon_basis_mixed_periodicity_auto, build_duchon_operator_penalty_matrices,
-    build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
-    create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
-    create_periodic_bspline_basis_dense, create_periodic_bspline_derivative_dense,
-    duchon_radial_first_derivative_nd, resolve_duchon_orders,
+    auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile, bspline_tensor_first_derivative,
+    build_duchon_basis, build_duchon_basis_mixed_periodicity_auto,
+    build_duchon_operator_penalty_matrices, build_spherical_spline_basis,
+    build_thin_plate_penalty_matrix, create_basis, create_cyclic_difference_penalty_matrix,
+    create_difference_penalty_matrix, create_periodic_bspline_basis_dense,
+    create_periodic_bspline_derivative_dense, duchon_polynomial_first_derivative_nd,
+    duchon_radial_first_derivative_nd, matern_radial_first_derivative_nd,
+    periodic_bspline_first_derivative_nd, resolve_duchon_orders, sphere_first_derivative_nd,
 };
 use gam::terms::latent_coord::{
     AuxPriorFamily, LatentCoordValues, LatentIdMode, aux_prior_targets,
@@ -407,6 +409,7 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "gaussian_reml_fit_positions_batched_backward",
             "gaussian_reml_fit_latent",
             "gaussian_reml_fit_latent_backward",
+            "arrow_schur_newton_step",
             "gaussian_reml_fit_formula_table",
             "gaussian_reml_fit_with_constraints_forward",
             "gaussian_reml_fit_with_constraints_backward",
@@ -3649,6 +3652,116 @@ fn gaussian_reml_fit_latent_backward<'py>(
     Ok(out.unbind())
 }
 
+// ---------------------------------------------------------------------------
+// Arrow-Schur joint (t, β) Newton step — thin pyffi wrapper
+// ---------------------------------------------------------------------------
+//
+// See `src/solver/arrow_schur.rs` (and `proposals/latent_coord.md` §4 +
+// `proposals/composition_engine.md` §7 audit revisions).
+//
+// Exposes the per-observation arrow-Schur Newton-direction solver to
+// Python for testing and for the prototype-stack `auto_75.py` to
+// validate the inner-loop math before the full REML driver wires up
+// auto-dispatch. The bordered system is supplied as packed arrays:
+//
+//   * `htt_blocks`    — shape `(N, d, d)` per-row latent Hessian blocks.
+//   * `htbeta_blocks` — shape `(N, d, K)` per-row cross-blocks.
+//   * `gt_blocks`     — shape `(N, d)` per-row latent gradient.
+//   * `hbb`           — shape `(K, K)` β Hessian.
+//   * `gb`            — shape `(K,)` β gradient.
+//
+// Returns `delta_t (N*d,)` and `delta_beta (K,)` — the *negated*
+// solutions of `H · x = -g`, matching the sign convention of
+// `solve_newton_direction_dense`.
+#[pyfunction(signature = (
+    htt_blocks,
+    htbeta_blocks,
+    gt_blocks,
+    hbb,
+    gb,
+    ridge_t = 0.0,
+    ridge_beta = 0.0,
+))]
+fn arrow_schur_newton_step<'py>(
+    py: Python<'py>,
+    htt_blocks: PyReadonlyArray3<'py, f64>,
+    htbeta_blocks: PyReadonlyArray3<'py, f64>,
+    gt_blocks: PyReadonlyArray2<'py, f64>,
+    hbb: PyReadonlyArray2<'py, f64>,
+    gb: PyReadonlyArray1<'py, f64>,
+    ridge_t: f64,
+    ridge_beta: f64,
+) -> PyResult<Py<PyDict>> {
+    use gam::solver::arrow_schur::{
+        solve_arrow_newton_step, ArrowRowBlock, ArrowSchurSystem,
+    };
+    let htt = htt_blocks.as_array();
+    let htb = htbeta_blocks.as_array();
+    let gt = gt_blocks.as_array();
+    let hbb_v = hbb.as_array();
+    let gb_v = gb.as_array();
+    let n = htt.shape()[0];
+    let d = htt.shape()[1];
+    let k = hbb_v.shape()[0];
+    if htt.shape()[2] != d {
+        return Err(py_value_error(format!(
+            "htt_blocks must be (N, d, d); got {:?}",
+            htt.shape()
+        )));
+    }
+    if htb.shape() != [n, d, k] {
+        return Err(py_value_error(format!(
+            "htbeta_blocks must be ({n}, {d}, {k}); got {:?}",
+            htb.shape()
+        )));
+    }
+    if gt.shape() != [n, d] {
+        return Err(py_value_error(format!(
+            "gt_blocks must be ({n}, {d}); got {:?}",
+            gt.shape()
+        )));
+    }
+    if hbb_v.shape() != [k, k] {
+        return Err(py_value_error(format!(
+            "hbb must be ({k}, {k}); got {:?}",
+            hbb_v.shape()
+        )));
+    }
+    if gb_v.len() != k {
+        return Err(py_value_error(format!(
+            "gb length {} must equal K = {}",
+            gb_v.len(),
+            k
+        )));
+    }
+    let mut sys = ArrowSchurSystem::new(n, d, k);
+    for i in 0..n {
+        let mut block = ArrowRowBlock::new(d, k);
+        for a in 0..d {
+            for b in 0..d {
+                block.htt[[a, b]] = htt[[i, a, b]];
+            }
+            for j in 0..k {
+                block.htbeta[[a, j]] = htb[[i, a, j]];
+            }
+            block.gt[a] = gt[[i, a]];
+        }
+        sys.rows[i] = block;
+    }
+    for a in 0..k {
+        for b in 0..k {
+            sys.hbb[[a, b]] = hbb_v[[a, b]];
+        }
+        sys.gb[a] = gb_v[a];
+    }
+    let (delta_t, delta_beta, _cache) = solve_arrow_newton_step(&sys, ridge_t, ridge_beta)
+        .map_err(|e| py_value_error(format!("arrow-Schur solve: {e}")))?;
+    let out = PyDict::new(py);
+    out.set_item("delta_t", delta_t.into_pyarray(py))?;
+    out.set_item("delta_beta", delta_beta.into_pyarray(py))?;
+    Ok(out.unbind())
+}
+
 fn gaussian_reml_result_to_pydict<'py>(
     py: Python<'py>,
     fit: gam::gaussian_reml::GaussianRemlMultiResult,
@@ -5649,6 +5762,188 @@ fn report_html(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
         .map_err(py_value_error)
 }
 
+// =========================================================================
+// LatentCoord input-location derivative helpers (thin pyffi wrappers).
+//
+// Each function here is a thin shim over a `*_first_derivative_nd` helper
+// in `gam::terms::basis`. The helpers are analytic, closed-form chain rules
+// of the underlying basis with respect to the *first* kernel argument
+// (the latent coordinate `t`). They share the same analytic machinery the
+// kernel-parameter ψ-chain (`SpatialLogKappaCoords`) uses, re-pointed at
+// `t` instead of at the anisotropy / log-kappa.
+// =========================================================================
+
+/// `φ'(r_{n,k})` for the Duchon kernel at every `(row, center)` pair.
+/// Returns `(n_rows, n_centers)`. Multiply by `(t − c)/r` at the call site
+/// to get the per-row gradient — or use
+/// [`crate::terms::latent_coord::LatentCoordValues::design_gradient_wrt_t`].
+#[pyfunction(signature = (t, centers, length_scale = None, m = 2))]
+fn duchon_input_location_first_derivative<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray2<'py, f64>,
+    centers: PyReadonlyArray2<'py, f64>,
+    length_scale: Option<f64>,
+    m: usize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    if m == 0 {
+        return Err(py_value_error(
+            "duchon_input_location_first_derivative: m must be >= 1".to_string(),
+        ));
+    }
+    let nullspace_order = duchon_nullspace_from_m(m);
+    let out = duchon_radial_first_derivative_nd(
+        t.as_array(),
+        centers.as_array(),
+        length_scale,
+        nullspace_order,
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+/// `(N, n_poly, d)` jet of the Duchon polynomial-nullspace tail (closed-form
+/// monomial derivatives). Column ordering matches the
+/// `monomial_basis_block` enumeration used by the Duchon design builder.
+#[pyfunction(signature = (t, m = 2))]
+fn duchon_polynomial_input_location_first_derivative<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray2<'py, f64>,
+    m: usize,
+) -> PyResult<Py<PyArray3<f64>>> {
+    if m == 0 {
+        return Err(py_value_error(
+            "duchon_polynomial_input_location_first_derivative: m must be >= 1".to_string(),
+        ));
+    }
+    let nullspace_order = duchon_nullspace_from_m(m);
+    let jet = duchon_polynomial_first_derivative_nd(t.as_array(), nullspace_order);
+    Ok(jet.into_pyarray(py).unbind())
+}
+
+/// `φ'(r_{n,k})` for the Matérn kernel at every `(row, center)` pair.
+/// Returns `(n_rows, n_centers)`. `nu` accepted: `"1/2"`, `"3/2"`, `"5/2"`,
+/// `"7/2"`, `"9/2"` (any whitespace stripped).
+#[pyfunction(signature = (t, centers, length_scale, nu = "3/2"))]
+fn matern_input_location_first_derivative<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray2<'py, f64>,
+    centers: PyReadonlyArray2<'py, f64>,
+    length_scale: f64,
+    nu: &str,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let nu_parsed = match nu.replace(char::is_whitespace, "").as_str() {
+        "1/2" | "0.5" => MaternNu::Half,
+        "3/2" | "1.5" => MaternNu::ThreeHalves,
+        "5/2" | "2.5" => MaternNu::FiveHalves,
+        "7/2" | "3.5" => MaternNu::SevenHalves,
+        "9/2" | "4.5" => MaternNu::NineHalves,
+        other => {
+            return Err(py_value_error(format!(
+                "matern_input_location_first_derivative: nu must be one of \
+                 '1/2','3/2','5/2','7/2','9/2'; got {other:?}"
+            )));
+        }
+    };
+    let out = matern_radial_first_derivative_nd(
+        t.as_array(),
+        centers.as_array(),
+        length_scale,
+        nu_parsed,
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+/// Closed-form `(N, n_centers, dim)` jet of the Sobolev sphere kernel
+/// w.r.t. ambient coordinates `t_n ∈ S^{dim-1}`.
+///
+/// Caller is responsible for the tangent projection if they want the
+/// intrinsic Riemannian gradient (`g − (g · t) t`); this helper returns
+/// the un-projected ambient gradient so the consumer can choose its own
+/// retraction / chart.
+#[pyfunction(signature = (points, centers, penalty_order = 2))]
+fn sphere_input_location_first_derivative<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+    centers: PyReadonlyArray2<'py, f64>,
+    penalty_order: usize,
+) -> PyResult<Py<PyArray3<f64>>> {
+    let jet = sphere_first_derivative_nd(points.as_array(), centers.as_array(), penalty_order)
+        .map_err(|err| py_value_error(err.to_string()))?;
+    Ok(jet.into_pyarray(py).unbind())
+}
+
+/// Closed-form `(N, num_basis, 1)` jet of the cyclic-B-spline basis w.r.t.
+/// the scalar latent coordinate. `t` is `(N, 1)`.
+#[pyfunction]
+fn periodic_bspline_input_location_first_derivative<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray2<'py, f64>,
+    data_range_left: f64,
+    data_range_right: f64,
+    degree: usize,
+    num_basis: usize,
+) -> PyResult<Py<PyArray3<f64>>> {
+    let jet = periodic_bspline_first_derivative_nd(
+        t.as_array(),
+        (data_range_left, data_range_right),
+        degree,
+        num_basis,
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
+    Ok(jet.into_pyarray(py).unbind())
+}
+
+/// Closed-form `(N, K_total, n_axes)` tensor-product B-spline derivative
+/// jet, via the product rule. `knots_concat` is the per-axis knot vectors
+/// flattened together; `knot_offsets` is `[0, len_axis_0, len_axis_0 +
+/// len_axis_1, ...]` (length `n_axes + 1`) — i.e. the standard CSR-style
+/// concat. `degrees` is per-axis.
+#[pyfunction]
+fn bspline_tensor_input_location_first_derivative<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray2<'py, f64>,
+    knots_concat: PyReadonlyArray1<'py, f64>,
+    knot_offsets: Vec<usize>,
+    degrees: Vec<usize>,
+) -> PyResult<Py<PyArray3<f64>>> {
+    let n_axes = degrees.len();
+    if knot_offsets.len() != n_axes + 1 {
+        return Err(py_value_error(format!(
+            "bspline_tensor_input_location_first_derivative: knot_offsets must have \
+             length n_axes + 1 = {}, got {}",
+            n_axes + 1,
+            knot_offsets.len()
+        )));
+    }
+    if t.as_array().ncols() != n_axes {
+        return Err(py_value_error(format!(
+            "bspline_tensor_input_location_first_derivative: t has {} cols but \
+             degrees has {} entries",
+            t.as_array().ncols(),
+            n_axes
+        )));
+    }
+    let knots_concat_view = knots_concat.as_array();
+    // Slice the concatenated knot vector into per-axis views.
+    let mut per_axis_views: Vec<ArrayView1<'_, f64>> = Vec::with_capacity(n_axes);
+    for a in 0..n_axes {
+        let lo = knot_offsets[a];
+        let hi = knot_offsets[a + 1];
+        if hi > knots_concat_view.len() || lo > hi {
+            return Err(py_value_error(format!(
+                "bspline_tensor_input_location_first_derivative: knot_offsets axis {a} \
+                 out of range (lo={lo}, hi={hi}, total={})",
+                knots_concat_view.len()
+            )));
+        }
+        per_axis_views.push(knots_concat_view.slice(s![lo..hi]));
+    }
+    let jet = bspline_tensor_first_derivative(t.as_array(), &per_axis_views, &degrees)
+        .map_err(|err| py_value_error(err.to_string()))?;
+    Ok(jet.into_pyarray(py).unbind())
+}
+
 #[pymodule(name = "_rust", gil_used = false)]
 fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     gam::init_parallelism();
@@ -5723,11 +6018,37 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         gaussian_reml_fit_latent_backward,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(arrow_schur_newton_step, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
     module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
     module.add_function(wrap_pyfunction!(check_json, module)?)?;
     module.add_function(wrap_pyfunction!(report_html, module)?)?;
+    // LatentCoord input-location derivative helpers (one per basis kind).
+    module.add_function(wrap_pyfunction!(
+        duchon_input_location_first_derivative,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        duchon_polynomial_input_location_first_derivative,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        matern_input_location_first_derivative,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        sphere_input_location_first_derivative,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        periodic_bspline_input_location_first_derivative,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        bspline_tensor_input_location_first_derivative,
+        module
+    )?)?;
     Ok(())
 }
 
