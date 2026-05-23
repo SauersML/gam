@@ -4761,12 +4761,16 @@ fn gaussian_reml_fit_latent<'py>(
     aux_family: String,
     aux_strength: Option<f64>,
     dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
-    analytic_penalties: Option<serde_json::Value>,
+    analytic_penalties: Option<String>,
     basis_kind: String,
     tensor_knots_concat: Option<PyReadonlyArray1<'py, f64>>,
     tensor_knot_offsets: Option<Vec<usize>>,
     tensor_degrees: Option<Vec<usize>>,
 ) -> PyResult<Py<PyDict>> {
+    let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
+        Some(s) => Some(serde_json::from_str(&s).map_err(|e| py_value_error(e.to_string()))?),
+        None => None,
+    };
     let latent_payload = serde_json::json!({"t": {"name": "t", "n": n_obs, "d": latent_dim}});
     let _registry = build_analytic_penalty_registry_from_json(
         Some(&latent_payload),
@@ -4964,8 +4968,12 @@ fn sae_manifold_fit_ibp<'py>(
     ridge_ext_coord: f64,
     ridge_beta: f64,
     gumbel_schedule: Option<&Bound<'py, PyDict>>,
-    analytic_penalties: Option<serde_json::Value>,
+    analytic_penalties: Option<String>,
 ) -> PyResult<Py<PyDict>> {
+    let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
+        Some(s) => Some(serde_json::from_str(&s).map_err(|e| py_value_error(e.to_string()))?),
+        None => None,
+    };
     let z_view = z.as_array();
     let (n_obs, p_out) = z_view.dim();
     if n_obs == 0 || p_out == 0 {
@@ -5661,8 +5669,12 @@ fn glm_reml_fit_latent<'py>(
     aux_family: String,
     aux_strength: Option<f64>,
     dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
-    analytic_penalties: Option<serde_json::Value>,
+    analytic_penalties: Option<String>,
 ) -> PyResult<Py<PyDict>> {
+    let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
+        Some(s) => Some(serde_json::from_str(&s).map_err(|e| py_value_error(e.to_string()))?),
+        None => None,
+    };
     let latent_payload = serde_json::json!({"t": {"name": "t", "n": n_obs, "d": latent_dim}});
     let _registry = build_analytic_penalty_registry_from_json(
         Some(&latent_payload),
