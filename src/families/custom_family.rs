@@ -3277,8 +3277,10 @@ pub fn blockwise_fit_from_parts(
         .map_err(|e| e.to_string())?;
     ensure_finite_scalar_estimation("blockwise_fit.stable_penalty_term", stable_penalty_term)
         .map_err(|e| e.to_string())?;
-    ensure_finite_scalar_estimation("blockwise_fit.outer_gradient_norm", outer_gradient_norm)
-        .map_err(|e| e.to_string())?;
+    if let Some(g) = outer_gradient_norm {
+        ensure_finite_scalar_estimation("blockwise_fit.outer_gradient_norm", g)
+            .map_err(|e| e.to_string())?;
+    }
 
     if block_states.len() != specs.len() {
         return Err(CustomFamilyError::DimensionMismatch {

@@ -4601,7 +4601,9 @@ impl UnifiedFitResult {
         ensure_finite_scalar_estimation("fit_result.reml_score", reml_score)?;
         ensure_finite_scalar_estimation("fit_result.stable_penalty_term", stable_penalty_term)?;
         ensure_finite_scalar_estimation("fit_result.penalized_objective", penalized_objective)?;
-        ensure_finite_scalar_estimation("fit_result.outer_gradient_norm", outer_gradient_norm)?;
+        if let Some(g) = outer_gradient_norm {
+            ensure_finite_scalar_estimation("fit_result.outer_gradient_norm", g)?;
+        }
         ensure_finite_scalar_estimation("fit_result.standard_deviation", standard_deviation)?;
         if let Some(v) = covariance_conditional.as_ref() {
             validate_all_finite_estimation("fit_result.beta_covariance", v.iter().copied())?;
@@ -5944,7 +5946,7 @@ where
         penalized_objective,
         outer_iterations: result.iterations,
         outer_converged: result.outer_converged,
-        outer_gradient_norm: result.finalgrad_norm,
+        outer_gradient_norm: Some(result.finalgrad_norm),
         standard_deviation: result.standard_deviation,
         covariance_conditional,
         covariance_corrected,
@@ -6527,7 +6529,7 @@ mod estimate_policy_tests {
             penalized_objective: 2.2,
             outer_iterations: 3,
             outer_converged: true,
-            outer_gradient_norm: 0.05,
+            outer_gradient_norm: Some(0.05),
             standard_deviation: 1.1,
             covariance_conditional: Some(array![[1.0, 0.1], [0.1, 2.0]]),
             covariance_corrected: Some(array![[1.2, 0.1], [0.1, 2.2]]),
