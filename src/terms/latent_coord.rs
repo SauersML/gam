@@ -36,8 +36,11 @@
 //! * [`LatentIdMode::AuxPrior`] — iVAE-style auxiliary-conditional prior
 //!   `R_id(t,u) = ½ μ ‖t − ĥ(u)‖²` where `ĥ` is a small ridge / linear map
 //!   fit internally against the auxiliary `u`. `μ` is REML-selectable like a
-//!   smoothing parameter. This is the principled identifiability fix
-//!   (Khemakhem et al. 2020).
+//!   smoothing parameter only when the marginal likelihood includes the
+//!   log-`μ` normalizer, `ĥ` is at least C¹, and the conditional precision is
+//!   positive-definite on the anchored subspace. Under those regularity
+//!   conditions this is the principled identifiability fix (Khemakhem et al.
+//!   2020).
 //! * [`LatentIdMode::DimSelection`] — ARD on each latent axis. One ridge
 //!   penalty per axis; REML drives unused axes' precision to infinity only
 //!   after `AuxPrior` or a future isometry prior fixes the gauge.
@@ -71,7 +74,9 @@ pub enum AuxPriorFamily {
 /// `Auto` defers the choice to REML — the strength is added to the outer
 /// vector as one extra `ρ`-axis (one log-precision per `LatentCoord`). When
 /// the caller supplies an explicit `Fixed(μ)` the strength is held constant
-/// throughout the fit; useful for warm-starts and reproducibility.
+/// throughout the fit; useful for warm-starts and reproducibility. The REML
+/// path is valid only with the prior normalizer included, a C¹ conditional
+/// mean map, and positive-definite precision on the anchored subspace.
 #[derive(Debug, Clone, Copy)]
 pub enum AuxPriorStrength {
     Auto,
@@ -87,7 +92,10 @@ pub enum AuxPriorStrength {
 pub enum LatentIdMode {
     /// Conditional Gaussian prior `p(t | u)` with mean `ĥ(u)` fit by
     /// `family`. The penalty contribution is
-    /// `R_id = ½ μ · ‖t − ĥ(u)‖²`. `u` has shape `(n_obs, p)`.
+    /// `R_id = ½ μ · ‖t − ĥ(u)‖²`. `u` has shape `(n_obs, p)`. If
+    /// `strength == Auto`, REML selection of `μ` requires the log-`μ`
+    /// normalizer, C¹ regularity of `ĥ`, and positive-definiteness on the
+    /// subspace anchored by `u`.
     AuxPrior {
         u: Array2<f64>,
         family: AuxPriorFamily,

@@ -313,6 +313,7 @@ def _build_fit_payload(
     adaptive_regularization: bool | None,
     firth: bool | None,
     precision_hyperpriors: Any | None,
+    latents: Mapping[str, Any] | None,
     config: dict[str, Any] | None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -338,6 +339,7 @@ def _build_fit_payload(
         "adaptive_regularization": adaptive_regularization,
         "firth": firth,
         "precision_hyperpriors": precision_hyperpriors,
+        "latents": _normalize_latents(latents),
     }
     for key, value in kwarg_items.items():
         if value is not None:
@@ -346,6 +348,39 @@ def _build_fit_payload(
         for key, value in config.items():
             payload.setdefault(key, value)
     return payload
+
+
+def _jsonable_array(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(k): _jsonable_array(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_array(v) for v in value]
+    try:
+        import numpy as np
+
+        arr = np.asarray(value, dtype=float)
+        return arr.tolist()
+    except Exception:
+        return value
+
+
+def _normalize_latents(latents: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if latents is None:
+        return None
+    out: dict[str, Any] = {}
+    for name, latent in latents.items():
+        raw = {
+            "name": getattr(latent, "name", None) or str(name),
+            "n": int(getattr(latent, "n")),
+            "d": int(getattr(latent, "d")),
+            "init": _jsonable_array(getattr(latent, "init", "pca")),
+            "aux_prior": _jsonable_array(getattr(latent, "aux_prior", None)),
+            "dim_selection": bool(getattr(latent, "dim_selection", False)),
+        }
+        out[str(name)] = {k: v for k, v in raw.items() if v is not None}
+    return out
 
 
 def _normalize_precision_pair(value: Any, label: str) -> list[float]:
@@ -563,6 +598,7 @@ def fit(
     response_columns: list[str] | tuple[str, ...] | None = ...,
     response_coordinates: str | None = ...,
     response_reference: int | None = ...,
+    latents: Mapping[str, Any] | None = ...,
     config: dict[str, Any] | None = ...,
 ) -> Model: ...
 
@@ -597,6 +633,7 @@ def fit(
     response_columns: list[str] | tuple[str, ...] | None = ...,
     response_coordinates: str | None = ...,
     response_reference: int | None = ...,
+    latents: Mapping[str, Any] | None = ...,
     config: dict[str, Any] | None = ...,
 ) -> ResponseGeometryModel: ...
 
@@ -630,6 +667,7 @@ def fit(
     response_columns: list[str] | tuple[str, ...] | None = None,
     response_coordinates: str | None = None,
     response_reference: int | None = None,
+    latents: Mapping[str, Any] | None = None,
     config: dict[str, Any] | None = None,
 ) -> Model | ResponseGeometryModel:
     """Fit a GAM model from a formula and a tabular dataset.
@@ -735,6 +773,12 @@ def fit(
     config:
         Escape-hatch dict of extra pipeline keys. Any key already set via a
         dedicated kwarg wins over the same key in ``config``.
+    latents:
+        Mapping from formula symbol to :class:`gamfit.LatentCoord`. This is
+        the standard fit API surface for per-row latent coordinates; the Rust
+        standard-workflow integration currently rejects the config with a
+        precise TODO until the full `evaluate_unified_with_psi_ext` route is
+        enabled.
 
     Returns
     -------
@@ -801,6 +845,7 @@ def fit(
                 "adaptive_regularization": adaptive_regularization,
                 "firth": firth,
                 "precision_hyperpriors": precision_hyperpriors,
+                "latents": latents,
                 "config": nested_config or None,
             },
         )
@@ -838,6 +883,7 @@ def fit(
         adaptive_regularization=adaptive_regularization,
         firth=firth,
         precision_hyperpriors=resolved_precision_hyperpriors,
+        latents=latents,
         config=rust_config or None,
     )
     try:
@@ -874,6 +920,7 @@ def fit_array(
     adaptive_regularization: bool | None = None,
     firth: bool | None = None,
     precision_hyperpriors: Any | None = None,
+    latents: Mapping[str, Any] | None = None,
     config: dict[str, Any] | None = None,
 ) -> Model:
     """Fit directly from numeric NumPy-compatible arrays.
@@ -909,6 +956,7 @@ def fit_array(
         adaptive_regularization=adaptive_regularization,
         firth=firth,
         precision_hyperpriors=resolved_precision_hyperpriors,
+        latents=latents,
         config=rust_config or None,
     )
     try:
@@ -1040,6 +1088,7 @@ def validate_formula(
         adaptive_regularization=adaptive_regularization,
         firth=firth,
         precision_hyperpriors=None,
+        latents=None,
         config=rust_config or None,
     )
     try:
@@ -2111,24 +2160,44 @@ def gaussian_reml_fit_latent(
     aux_family: str = "ridge",
     aux_strength: float | None = None,
     dim_selection_log_precision: Any | None = None,
+    basis_kind: str = "duchon",
+    tensor_knots_concat: Any | None = None,
+    tensor_knot_offsets: Sequence[int] | None = None,
+    tensor_degrees: Sequence[int] | None = None,
 ) -> dict[str, Any]:
-    """N-D generalization of :func:`gaussian_reml_fit_positions`.
+    """Fit a Gaussian Duchon decoder with per-row latent coordinates.
 
-    Per-row latent coordinates ``t ∈ ℝ^{N × d}`` enter a Duchon m-spline
-    design ``Φ(t)``; the inner Gaussian REML problem is solved against
-    ``Y``. ``t`` is a flat row-major ``(N · d,)`` array; ``n_obs`` and
-    ``latent_dim`` carry the shape because the flat vector cannot.
+    This is the low-level array API behind :class:`gamfit.LatentCoord`: each
+    row has a latent coordinate ``t_n ∈ R^d`` and the fitted mean is
 
-    Identifiability fixes (see :class:`gamfit.LatentCoord` for the math):
+    .. math::
 
-    * ``aux_u`` + ``aux_family`` + ``aux_strength`` — iVAE-style
-      conditional prior; pulls ``t`` toward ``ĥ(u)`` (ridge / linear).
-    * ``dim_selection_log_precision`` — length-``d`` log-precisions
-      enabling ARD on each latent axis.
+        \\hat Y_n = \\Phi(t_n; \\psi)\\,\\beta,
+        \\qquad
+        \\ell = \\tfrac12\\|Y - \\Phi(t)\\beta\\|^2
+             + \\tfrac12\\lambda\\beta^T S\\beta
+             + R_id(t, u)
+             - \\tfrac12\\log|H|.
 
-    Both are optional from the Rust call's perspective; passing neither
-    produces a forward fit but the corresponding ``_backward`` call will
-    return a ``grad_t`` whose null-space directions are ill-defined.
+    ``t`` is supplied as a flat row-major ``(N * d,)`` vector; ``n_obs`` and
+    ``latent_dim`` carry the shape. ``centers`` and ``penalty`` define the
+    Duchon decoder basis. The result contains coefficients, fitted values,
+    REML score fields, and caches used by the backward companion.
+
+    Identifiability options:
+
+    * ``aux_u`` / ``aux_family`` / ``aux_strength`` add the conditional
+      Gaussian prior ``R_id = 1/2 * mu * ||t - h(u)||^2``. REML selection of
+      ``mu`` is valid only when the marginal likelihood includes the log
+      ``mu`` normalizer, ``h`` is at least C1, and the conditional precision
+      is positive-definite on the anchored subspace.
+    * ``dim_selection_log_precision`` supplies ARD log-precisions, one per
+      latent axis. ARD must be paired with an auxiliary prior or an isometry
+      penalty to identify axes; by itself it is rotation-symmetric.
+
+    Passing neither identifiability option is allowed for mechanical
+    experiments, but the latent coordinate is gauge-unfixed and gradients in
+    null directions are not meaningful.
     """
     import numpy as np
 
@@ -2151,6 +2220,12 @@ def gaussian_reml_fit_latent(
             None
             if dim_selection_log_precision is None
             else _numeric_vector(dim_selection_log_precision, "dim_selection_log_precision"),
+            str(basis_kind),
+            None
+            if tensor_knots_concat is None
+            else _numeric_vector(tensor_knots_concat, "tensor_knots_concat"),
+            None if tensor_knot_offsets is None else [int(v) for v in tensor_knot_offsets],
+            None if tensor_degrees is None else [int(v) for v in tensor_degrees],
         )
     except Exception as exc:
         raise map_exception(exc) from exc
@@ -2190,6 +2265,9 @@ def gaussian_reml_fit_latent_backward(
     dim_selection_log_precision: Any | None = None,
     basis_kind: str = "duchon",
     sigma_eff_mode: str = "profiled",
+    tensor_knots_concat: Any | None = None,
+    tensor_knot_offsets: Sequence[int] | None = None,
+    tensor_degrees: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     """Backward / adjoint companion to :func:`gaussian_reml_fit_latent`.
 
@@ -2235,6 +2313,11 @@ def gaussian_reml_fit_latent_backward(
             else _numeric_vector(dim_selection_log_precision, "dim_selection_log_precision"),
             str(basis_kind),
             str(sigma_eff_mode),
+            None
+            if tensor_knots_concat is None
+            else _numeric_vector(tensor_knots_concat, "tensor_knots_concat"),
+            None if tensor_knot_offsets is None else [int(v) for v in tensor_knot_offsets],
+            None if tensor_degrees is None else [int(v) for v in tensor_degrees],
         )
     except Exception as exc:
         raise map_exception(exc) from exc
@@ -2266,6 +2349,10 @@ def glm_reml_fit_latent(
     weights: Any | None = None,
     fisher_W: Any | None = None,
     init_lambda: float | None = None,
+    aux_u: Any | None = None,
+    aux_family: str = "ridge",
+    aux_strength: float | None = None,
+    dim_selection_log_precision: Any | None = None,
 ) -> dict[str, Any]:
     """Latent-coordinate REML/LAML fit for GLM families via PIRLS.
 
@@ -2290,6 +2377,12 @@ def glm_reml_fit_latent(
             None if weights is None else _numeric_vector(weights, "weights"),
             None if fisher_W is None else np.asarray(fisher_W, dtype=float),
             None if init_lambda is None else float(init_lambda),
+            None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
+            str(aux_family),
+            None if aux_strength is None else float(aux_strength),
+            None
+            if dim_selection_log_precision is None
+            else _numeric_vector(dim_selection_log_precision, "dim_selection_log_precision"),
         )
     except Exception as exc:
         raise map_exception(exc) from exc
