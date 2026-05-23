@@ -26,14 +26,14 @@ The pitch is not to widen the API surface. It is to recognize that the existing 
 | Latent coordinate estimation (GP-LVM, autoencoder bottleneck) | ext-coordinate block whose design derivatives reuse the existing kernel-shape derivative machinery | landed in the standard path; see §4(a); pattern is `SpatialLogKappaCoords` (`src/terms/smooth.rs:1774`) and `LatentCoordValues` (`src/terms/latent_coord.rs:561`) |
 | Intrinsic-dimension selection (auto-discovery of latent dim) | ARD: one penalty per latent axis, REML drives unused axes to ∞ *given a paired gauge fix* (aux-conditional prior or isometry) | composition of (a) + per-axis `S(ρ)` + paired gauge-fix from (b) or (c) + existing REML; no new primitive |
 | Topology choice (S¹, S², torus, Euclidean patch) | basis family + tensor product | `PeriodicSpline1D` (`src/terms/basis.rs:1423`), `SphericalSplineBasisSpec` (`src/terms/basis.rs:2657`), `DuchonBasisSpec` (`src/terms/basis.rs:2786`), `TensorBSplineSpec` (`src/terms/smooth.rs:295`); TDA persistent cohomology suggests which |
-| Gauge / canonical coordinate (Riemannian isometry to a reference) | structured penalty pinning the pullback metric toward a reference | needs new — see §4(b) |
-| Identifiability via auxiliary variable (iVAE) | conditional prior on the latent block; mechanism sparsity = L¹-like on a sub-block | needs new — see §4(c); reuses `BlockwisePenalty` (`src/terms/smooth.rs:707`) |
+| Gauge / canonical coordinate (Riemannian isometry to a reference) | structured penalty pinning the pullback metric toward a reference | analytic penalty landed as `IsometryPenalty` (`src/terms/analytic_penalties.rs:353`); see §4(b) |
+| Identifiability via auxiliary variable (iVAE) | conditional prior on the latent block; mechanism sparsity = L¹-like on a sub-block | aux prior landed in `LatentIdMode` (`src/terms/latent_coord.rs:107`); sparsity landed as `SparsityPenalty` (`src/terms/analytic_penalties.rs:1141`) |
 | Behavioral vs geometric inner product (Fisher-Rao) | the working weight matrix `W` in PIRLS | already there — `WorkingModel::update`/`update_with_curvature` (`src/solver/pirls.rs:526-529`); `W` is computed inside the working model, so a custom working model that returns Fisher information *is* Fisher-Rao fitting |
 | Geodesic-acceleration Newton (Transtrum) | second-order Newton correction in the inner solver | landed behind `WorkingModelPirlsOptions::geodesic_acceleration` (`src/solver/pirls.rs:1289`) with the dense-factor correction block at `src/solver/pirls.rs:5086-5153`; see §4(e) |
 | Mechanism / sparse-coding amplitude gating | `by` multiplier on a smooth | `Smooth.by` (`gamfit/smooth.py:74`); already supported |
 | Closed-form linear operator penalties (PDE constraints, divergence-free, …) | `OperatorPenaltySpec` | `OperatorPenaltySpec` (`src/terms/basis.rs:2858`), `ClosedFormPenaltyOperator` (`src/terms/closed_form_operator.rs:26`) |
 
-The right column is mostly existing code. The "needs new" rows are §4.
+The right column is mostly existing code. §4 now marks which proposal pieces have landed and which still need integration hardening.
 
 ## 3. The impossibility-theorem framing
 
@@ -48,9 +48,9 @@ gamfit's primitive vocabulary is precisely the language of inductive biases:
 
 Lean into this. The marketing line for the broader community should not be "gamfit fits GAMs"; it should be "gamfit is a language for specifying inductive biases and a principled selector for their strengths." Every "GAM" is a particular sentence in that language.
 
-## 4. Concrete additions needed
+## 4. Concrete additions and landed primitives
 
-The new code is small. Each addition reuses an existing pattern; none requires inventing new IFT machinery.
+The new code stays small because each addition reuses an existing pattern; none requires inventing new IFT machinery.
 
 ### 4(a). `LatentCoord` parameter type
 
@@ -58,35 +58,37 @@ The new code is small. Each addition reuses an existing pattern; none requires i
 
 **Existing analogue.** `SpatialLogKappaCoords` (`src/terms/smooth.rs:1774-1891`) is exactly the data structure pattern: a flattened `Array1<f64>` of "extra hyper-coordinates" whose layout is given by a `Vec<usize> dims_per_term`. The downstream machinery — `HyperDesignDerivative::from_implicit` (`src/solver/reml/mod.rs:2706-2721`), `DirectionalHyperParam::new_compact` (`src/solver/reml/mod.rs:3277`), the `is_penalty_like = false` flag set via `.not_penalty_like()` (`src/solver/reml/mod.rs:3314`; spatial call at `src/terms/smooth.rs:13105`), and the final entry into `RemlState::evaluate_unified_with_psi_ext` (`src/solver/reml/runtime.rs:8122`) — is already designed to accept *non-penalty-like, design-moving* ext-coordinates. Kernel-shape `ψ` and latent coordinates `t` are the same kind of object as far as the IFT plumbing is concerned. Both move the design `X`, both leave `S(ρ)` untouched (in the bare case), and both ship first- and second-derivative blocks through `HyperDesignDerivative`.
 
-**Proposed Rust shape.** A sibling of `SpatialLogKappaCoords`:
+**Landed Rust shape.** A sibling of `SpatialLogKappaCoords` (`src/terms/latent_coord.rs:561`):
 
 ```rust
 #[derive(Debug, Clone)]
-pub(crate) struct LatentCoordValues {
+pub struct LatentCoordValues {
     /// Flattened latent vector: n_obs * latent_dim entries, row-major.
     values: Array1<f64>,
-    latent_dim: usize,
     n_obs: usize,
-    /// Which basis evaluates against t. Borrowed from the same basis registry
-    /// that handles observed covariates.
-    basis: Arc<dyn BasisOutput>,
+    latent_dim: usize,
+    id_mode: LatentIdMode,
+    manifold: LatentManifold,
 }
 ```
 
 with a `LatentCoordValues::build_x_ext_derivatives(&self) -> Vec<HyperDesignDerivative>` that produces one `HyperDesignDerivative` per latent column. For Duchon, Matern, sphere, periodic, and tensor bases, the landed `LatentCoordDesignDerivative` (`src/terms/basis.rs:4118`) routes through `LatentCoordValues::design_gradient_wrt_t_dispatch` (`src/terms/latent_coord.rs:825`): radial bases reuse the same radial derivative as `ψ`, while non-radial bases provide analytic jets. The remaining work is integration breadth, not new IFT math.
 
-**Proposed Python shape.** Add a smooth-spec subclass that flags "the input to this smooth is a free latent vector, not a column of the data table":
+**Landed Python shape.** `LatentCoord` (`gamfit/smooth.py:232`) flags "the input to this smooth is a free latent vector, not a column of the data table":
 
 ```python
 @dataclass
 class LatentCoord:
-    dim: int                       # latent dimensionality
-    basis: Smooth                  # any existing Smooth describing the decoder
-    init: Literal["pca", "random", "user"] = "pca"
-    init_values: Any | None = None # if init="user"
+    n: int
+    d: int                         # latent dimensionality
+    init: Any = "pca"
+    aux_prior: Mapping[str, Any] | None = None
+    dim_selection: bool = False
+    manifold: Any = "auto"
+    name: str | None = None
 ```
 
-`fit(..., latents={"t": LatentCoord(n=N, d=2, init="pca", aux_prior={...})}, smooths=[Duchon(centers=..., m=2, name="decoder")])` should construct the `LatentCoordValues` block, wire it into the same `DirectionalHyperParam` pipeline used for anisotropic `ψ`, and let REML run unchanged. Formula-side syntax can then bind `s(t, ...)` to that latent block.
+`fit(..., latents={"t": LatentCoord(n=N, d=2, init="pca", aux_prior={...})})` constructs the `LatentCoordValues` block in the standard workflow (`src/solver/workflow.rs:3354-3457`), wires it into the same `DirectionalHyperParam` pipeline used for anisotropic `ψ` (`src/terms/smooth.rs:12527`), and lets REML run unchanged. Formula-side syntax binds `s(t, ...)` to that latent block.
 
 **What's load-bearing.** The `is_penalty_like = false` derivation in `DirectionalHyperParam::new_compact` (`src/solver/reml/mod.rs:3277-3284`), backed by `HyperDesignDerivative::any_nonzero` (`src/solver/reml/mod.rs:2780-2786`), and downstream `validate_tk_ext_coords` (`src/solver/reml/runtime.rs:2521`) is what makes an ext-coordinate "design-moving" rather than "penalty-scaling". `LatentCoordValues` is design-moving. Roughly 70–90% of the code path is shared with anisotropic `ψ`; the new code is the per-observation indexing and the basis-side derivatives `∂X/∂t_n`, both of which are radial-kernel chain-rule applications of existing primitives.
 
@@ -110,11 +112,11 @@ approximated as a sum over either observation locations or a quadrature grid. `e
 
 **Problem and theory.** Khemakhem et al. (2020, iVAE) show that if the latent `t` has a prior conditioned on an observed auxiliary `u` — `p(t | u)` from an exponential family with `u`-dependent natural parameters — then under mild assumptions the decoder is identifiable up to a permutation and component-wise transformation. This is the cleanest known structural identifiability result for nonlinear latent-variable models.
 
-**Recasting in gamfit terms.** A conditional prior `p(t | u; η(u))` is, by Bayes, a penalty on the latent block whose Gram matrix is a function of `u`. Concretely, for a Gaussian conditional prior with `u`-dependent precision `Λ(u)`, the penalty contribution is `½ t_n^T Λ(u_n) t_n`, summed over `n`. This is a *blockwise diagonal penalty whose block is data-dependent*. The existing `BlockwisePenalty` infrastructure is the right home, with a new constructor `BlockwisePenalty::auxiliary_conditional_gaussian(u, precision_fn)`.
+**Recasting in gamfit terms.** A conditional prior `p(t | u; η(u))` is, by Bayes, a penalty on the latent block whose Gram matrix is a function of `u`. Concretely, for a Gaussian conditional prior with `u`-dependent precision `Λ(u)`, the penalty contribution is `½ t_n^T Λ(u_n) t_n`, summed over `n`. The landed low-level representation is `LatentIdMode::AuxPrior` / `AuxPriorDimSelection` (`src/terms/latent_coord.rs:107-127`), and the standard workflow rejects gauge-unfixed latent fits by default (`src/solver/workflow.rs:3231-3241`).
 
 **Mechanism sparsity.** iVAE-style identifiability additionally benefits from sparsity of the Jacobian `∂T/∂t` (each latent affects only a few outputs). This is an L¹-on-a-block penalty over rows of the decoder coefficient matrix — exactly the kind of structured penalty the existing `OperatorPenaltySpec` machinery (`src/terms/basis.rs:2858`) handles when paired with the active-set inner solver (`src/solver/active_set.rs`).
 
-**Interface.** One new smooth-spec field on `Latent`: `aux: Any | None = None` (column name or array), plus a `prior: Literal["gaussian", "gaussian-mixture", ...]` choice. Internals route to the new `BlockwisePenalty` constructor.
+**Interface.** The Python field is `LatentCoord.aux_prior` (`gamfit/smooth.py:277-291`), with `family` and `strength` options normalized by the workflow. Internals route to `LatentIdMode` and add direct hyperparameters for auto-selected auxiliary strength and ARD axes.
 
 **Regularity conditions (math audit).** The claim that the aux-conditional prior `μ ‖t − h(u)‖²` breaks gauge *and* that `μ` is REML-selectable holds only under three explicit conditions, which the implementation must enforce:
 
@@ -134,7 +136,7 @@ The sloppy-model "hyper-ribbon" diagnostic (Transtrum, Machta, Sethna) — the e
 
 No new code. Recipe-level recommendation: `manifold_fit(..., latent_dim=d_max, dim_selection=True, aux_prior=...)` (or `isometry=True`) translates to one `LatentCoord` block named `t` with per-axis ARD plus the requested gauge-breaking prior.
 
-### 4(e). Geodesic-acceleration Newton patch
+### 4(e). Geodesic-acceleration Newton path
 
 **Problem.** On problems with strongly nonlinear residuals — and `LatentCoordValues` is one — the standard Gauss-Newton / PIRLS step systematically over-shoots along curved valleys. Transtrum's geodesic-acceleration correction adds a second-order term `δ_2 = −½ H^{-1} A(δ_1, δ_1)`, where `A` is the directional second derivative of the residual along the first-order step `δ_1`. Empirically this can reduce inner iterations substantially on curved latent fits. (auto_71 used the LM variant of this trick and observed exactly this behavior.)
 
@@ -146,7 +148,7 @@ No new code. Recipe-level recommendation: `manifold_fit(..., latent_dim=d_max, d
 
 **Problem.** Basis topology alone is not enough for a latent coordinate. A cyclic basis can make `Φ(t)` continuous across the seam, but if the per-row coordinate update is Euclidean then an angular latent still has a spurious discontinuity at `2π → 0`. mGPLVM avoids this by putting the latent itself on the manifold (circle, sphere, torus, product manifolds) and optimizing with Riemannian updates.
 
-**Implementation.** `LatentCoordValues` carries a `LatentManifold`:
+**Implementation.** `LatentCoordValues` carries a `LatentManifold` (`src/terms/latent_coord.rs:149`, field at `src/terms/latent_coord.rs:572`):
 
 ```
 Euclidean | Circle | Sphere { dim } | Interval { lo, hi } | Product(...)

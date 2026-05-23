@@ -416,7 +416,7 @@ Internally `sae_manifold_fit` does:
 
 ## 7. Implementation status
 
-Already in flight or shipping:
+Already shipping or landed behind the current integration surface:
 
 - **`compare_models`** (`gamfit/_compare.py:97`) — picks `K`.
 - **REML outer loop** — picks `λ_sp`, `λ_sm`, `α_kj`.
