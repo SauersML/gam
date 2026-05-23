@@ -840,8 +840,8 @@ impl IsometryPenalty {
             return None;
         }
         let p = self.p_out;
-        let jac2 = self.jacobian_second(target, n_obs, d)?;
-        let jac3 = self.jacobian_third(target, n_obs, d)?;
+        let jac2 = self.jacobian_second(target.view(), n_obs, d)?;
+        let jac3 = self.jacobian_third(target.view(), n_obs, d)?;
         let g = self.pullback_metric(d)?;
         let g_ref = self.reference_metric(n_obs, d);
         let mut wj_rows = Vec::with_capacity(n_obs);
@@ -3098,8 +3098,50 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
     }
 
     fn as_dense(&self) -> Array2<f64> {
-        if let AnalyticPenaltyKind::TotalVariation(p) = &self.penalty {
-            return p.as_dense(self.target.view(), self.rho.view());
+        match &self.penalty {
+            AnalyticPenaltyKind::TotalVariation(p) => {
+                return p.as_dense(self.target.view(), self.rho.view());
+            }
+            AnalyticPenaltyKind::Orthogonality(p) => {
+                let n = self.target.len();
+                let Some(t) = p.target_matrix(self.target.view()) else {
+                    return Array2::<f64>::zeros((n, n));
+                };
+                let latent_dim = t.ncols();
+                let gram = OrthogonalityPenalty::gram_minus_identity(t.view());
+                let scale = p.scale(self.rho.view());
+                let mut dense = Array2::<f64>::zeros((n, n));
+                let mut v = Array2::<f64>::zeros(t.dim());
+                for j in 0..n {
+                    let row = j / latent_dim;
+                    let col = j % latent_dim;
+                    v[[row, col]] = 1.0;
+                    let h = p.hvp_with_precomputed_m(t.view(), gram.view(), v.view(), scale);
+                    for i in 0..n {
+                        dense[[i, j]] = h[[i / latent_dim, i % latent_dim]];
+                    }
+                    v[[row, col]] = 0.0;
+                }
+                return dense;
+            }
+            AnalyticPenaltyKind::Isometry(p) => {
+                let n = self.target.len();
+                let Some(state) = p.hvp_state(self.target.view()) else {
+                    return Array2::<f64>::zeros((n, n));
+                };
+                let mut dense = Array2::<f64>::zeros((n, n));
+                let mut e = Array1::<f64>::zeros(n);
+                for j in 0..n {
+                    e[j] = 1.0;
+                    let col = p.hvp_with_precomputed_state(&state, self.rho.view(), e.view());
+                    for i in 0..n {
+                        dense[[i, j]] = col[i];
+                    }
+                    e[j] = 0.0;
+                }
+                return dense;
+            }
+            _ => {}
         }
         let n = self.target.len();
         let mut m = Array2::<f64>::zeros((n, n));
@@ -3120,6 +3162,44 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
 
 impl FrozenAnalyticPenaltyOp {
     fn diag_via_matvec(&self) -> Array1<f64> {
+        match &self.penalty {
+            AnalyticPenaltyKind::Orthogonality(p) => {
+                let n = self.target.len();
+                let Some(t) = p.target_matrix(self.target.view()) else {
+                    return Array1::<f64>::zeros(n);
+                };
+                let latent_dim = t.ncols();
+                let gram = OrthogonalityPenalty::gram_minus_identity(t.view());
+                let scale = p.scale(self.rho.view());
+                let mut d = Array1::<f64>::zeros(n);
+                let mut v = Array2::<f64>::zeros(t.dim());
+                for i in 0..n {
+                    let row = i / latent_dim;
+                    let col = i % latent_dim;
+                    v[[row, col]] = 1.0;
+                    let h = p.hvp_with_precomputed_m(t.view(), gram.view(), v.view(), scale);
+                    d[i] = h[[row, col]];
+                    v[[row, col]] = 0.0;
+                }
+                return d;
+            }
+            AnalyticPenaltyKind::Isometry(p) => {
+                let n = self.target.len();
+                let Some(state) = p.hvp_state(self.target.view()) else {
+                    return Array1::<f64>::zeros(n);
+                };
+                let mut d = Array1::<f64>::zeros(n);
+                let mut e = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    e[i] = 1.0;
+                    let h = p.hvp_with_precomputed_state(&state, self.rho.view(), e.view());
+                    d[i] = h[i];
+                    e[i] = 0.0;
+                }
+                return d;
+            }
+            _ => {}
+        }
         let n = self.target.len();
         let mut d = Array1::<f64>::zeros(n);
         let mut e = Array1::<f64>::zeros(n);
@@ -3135,6 +3215,56 @@ impl FrozenAnalyticPenaltyOp {
     }
 
     fn stochastic_diag_via_matvec(&self) -> Array1<f64> {
+        match &self.penalty {
+            AnalyticPenaltyKind::Orthogonality(p) => {
+                let n = self.target.len();
+                let Some(t) = p.target_matrix(self.target.view()) else {
+                    return Array1::<f64>::zeros(n);
+                };
+                let gram = OrthogonalityPenalty::gram_minus_identity(t.view());
+                let scale = p.scale(self.rho.view());
+                let samples = HUTCHINSON_DIAG_SAMPLES.max(1);
+                let mut diag = Array1::<f64>::zeros(n);
+                let mut z = Array1::<f64>::zeros(n);
+                for probe in 0..samples {
+                    rademacher_unit_probe_into(z.view_mut(), probe as u64, 1.0);
+                    let Some(z_mat) = p.target_matrix(z.view()) else {
+                        return diag;
+                    };
+                    let hz = p.hvp_with_precomputed_m(t.view(), gram.view(), z_mat, scale);
+                    for i in 0..n {
+                        diag[i] += z[i] * hz[[i / t.ncols(), i % t.ncols()]];
+                    }
+                }
+                let inv_samples = 1.0 / samples as f64;
+                for i in 0..n {
+                    diag[i] *= inv_samples;
+                }
+                return diag;
+            }
+            AnalyticPenaltyKind::Isometry(p) => {
+                let n = self.target.len();
+                let Some(state) = p.hvp_state(self.target.view()) else {
+                    return Array1::<f64>::zeros(n);
+                };
+                let samples = HUTCHINSON_DIAG_SAMPLES.max(1);
+                let mut diag = Array1::<f64>::zeros(n);
+                let mut z = Array1::<f64>::zeros(n);
+                for probe in 0..samples {
+                    rademacher_unit_probe_into(z.view_mut(), probe as u64, 1.0);
+                    let hz = p.hvp_with_precomputed_state(&state, self.rho.view(), z.view());
+                    for i in 0..n {
+                        diag[i] += z[i] * hz[i];
+                    }
+                }
+                let inv_samples = 1.0 / samples as f64;
+                for i in 0..n {
+                    diag[i] *= inv_samples;
+                }
+                return diag;
+            }
+            _ => {}
+        }
         let n = self.target.len();
         let samples = HUTCHINSON_DIAG_SAMPLES.max(1);
         let mut diag = Array1::<f64>::zeros(n);

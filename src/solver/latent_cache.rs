@@ -11,8 +11,9 @@
 //! explicitly invalidates this cache.
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ndarray::{Array1, Array2};
 
@@ -23,6 +24,12 @@ use crate::terms::latent_coord::LatentCoordValues;
 use crate::terms::smooth::TermCollectionDesign;
 
 const DEFAULT_LATENT_CACHE_CAPACITY: usize = 4;
+const DEFAULT_PERSISTENT_LATENT_CACHE_CAPACITY: usize = 16;
+const PERSISTENT_LATENT_CACHE_WARMSTART_EPSILON: f64 = 1.0e-10;
+const DISABLE_PERSISTENT_LATENT_CACHE_ENV: &str = "GAMFIT_DISABLE_PERSISTENT_LATENT_CACHE";
+
+static PERSISTENT_LATENT_DESIGN_CACHE: OnceLock<Mutex<PersistentLatentDesignCache>> =
+    OnceLock::new();
 
 /// O(N) identity summary for a flat latent-coordinate vector.
 #[derive(Clone, Debug)]
@@ -194,8 +201,10 @@ impl BasisDerivativeJets {
 #[derive(Clone)]
 pub(crate) struct CachedDesign {
     pub(crate) id: u64,
+    pub(crate) latent_id: u64,
     pub(crate) fingerprint: LatentFingerprint,
     pub(crate) basis_signature: u64,
+    latent_bits: Arc<[u64]>,
     pub(crate) design: TermCollectionDesign,
     pub(crate) hyper_dirs: Vec<DirectionalHyperParam>,
     pub(crate) radial_distances: RadialDistanceMatrices,
@@ -210,6 +219,116 @@ pub(crate) struct ComputedLatentDesign {
 
 pub(crate) struct LatentDesignLookup<'a> {
     pub(crate) cached: &'a CachedDesign,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct PersistentLatentDesignKey {
+    latent_id: u64,
+    basis_signature: u64,
+}
+
+struct PersistentLatentDesignEntry {
+    fingerprint: LatentFingerprint,
+    cached: Arc<CachedDesign>,
+}
+
+pub(crate) struct PersistentLatentWarmstart {
+    pub(crate) delta: Array1<f64>,
+    pub(crate) per_axis_linf: Vec<f64>,
+    pub(crate) max_linf: f64,
+}
+
+pub(crate) enum PersistentLatentDesignHit {
+    Exact { cached: Arc<CachedDesign> },
+    EpsilonWarmstart {
+        cached: Arc<CachedDesign>,
+        warmstart: PersistentLatentWarmstart,
+    },
+}
+
+pub(crate) struct PersistentLatentDesignCache {
+    entries: HashMap<PersistentLatentDesignKey, PersistentLatentDesignEntry>,
+    lru: VecDeque<PersistentLatentDesignKey>,
+    capacity: usize,
+}
+
+impl Default for PersistentLatentDesignCache {
+    fn default() -> Self {
+        Self::new(DEFAULT_PERSISTENT_LATENT_CACHE_CAPACITY)
+    }
+}
+
+impl PersistentLatentDesignCache {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+            capacity: capacity.max(1),
+        }
+    }
+
+    pub(crate) fn lookup(
+        &mut self,
+        latent: &LatentCoordValues,
+        basis_signature: u64,
+        fingerprint: &LatentFingerprint,
+    ) -> Result<Option<PersistentLatentDesignHit>, EstimationError> {
+        let key = PersistentLatentDesignKey {
+            latent_id: latent.latent_id(),
+            basis_signature,
+        };
+        let Some(entry) = self.entries.get(&key) else {
+            return Ok(None);
+        };
+        let cached = entry.cached.clone();
+        let entry_fingerprint = entry.fingerprint.clone();
+        self.touch(key);
+        if entry_fingerprint.len != fingerprint.len {
+            return Ok(None);
+        }
+        if entry_fingerprint.hash == fingerprint.hash
+            && latent_bits_match(latent, &cached.latent_bits)
+        {
+            return Ok(Some(PersistentLatentDesignHit::Exact { cached }));
+        }
+        let Some(warmstart) = latent_warmstart_delta(
+            latent,
+            &cached.latent_bits,
+            PERSISTENT_LATENT_CACHE_WARMSTART_EPSILON,
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(PersistentLatentDesignHit::EpsilonWarmstart {
+            cached,
+            warmstart,
+        }))
+    }
+
+    pub(crate) fn insert(&mut self, cached: Arc<CachedDesign>) {
+        let key = PersistentLatentDesignKey {
+            latent_id: cached.latent_id,
+            basis_signature: cached.basis_signature,
+        };
+        let entry = PersistentLatentDesignEntry {
+            fingerprint: cached.fingerprint.clone(),
+            cached,
+        };
+        self.entries.insert(key, entry);
+        self.touch(key);
+        while self.entries.len() > self.capacity {
+            let Some(evicted) = self.lru.pop_front() else {
+                break;
+            };
+            self.entries.remove(&evicted);
+        }
+    }
+
+    fn touch(&mut self, key: PersistentLatentDesignKey) {
+        if let Some(index) = self.lru.iter().position(|queued| *queued == key) {
+            self.lru.remove(index);
+        }
+        self.lru.push_back(key);
+    }
 }
 
 pub(crate) struct LatentDesignCache {
@@ -264,11 +383,32 @@ impl LatentDesignCache {
             .expect("LatentCoordValues flat storage must be contiguous");
         let fingerprint = LatentFingerprint::from_flat(flat_slice, self.iteration);
         let basis_signature = basis_kind.signature();
-        if let Some(index) = self.find_entry(&fingerprint, basis_signature) {
+        if let Some(index) = self.find_entry(&latent, basis_signature) {
             self.entries[index].last_used = self.clock;
             return Ok(LatentDesignLookup {
                 cached: &self.entries[index],
             });
+        }
+        if let Some(hit) = lookup_persistent_latent_design(&latent, basis_signature, &fingerprint)?
+        {
+            match hit {
+                PersistentLatentDesignHit::Exact { cached } => {
+                    let id = self.next_entry_id;
+                    self.next_entry_id = self.next_entry_id.wrapping_add(1);
+                    let mut entry = (*cached).clone();
+                    entry.id = id;
+                    entry.fingerprint.iteration = self.iteration;
+                    entry.last_used = self.clock;
+                    self.insert(entry);
+                    return self.lookup_inserted(id);
+                }
+                PersistentLatentDesignHit::EpsilonWarmstart { cached, warmstart } => {
+                    let _ = cached.id;
+                    let _ = warmstart.delta.len();
+                    let _ = warmstart.per_axis_linf.len();
+                    let _ = warmstart.max_linf;
+                }
+            }
         }
 
         let computed = compute()?;
@@ -285,8 +425,10 @@ impl LatentDesignCache {
         self.next_entry_id = self.next_entry_id.wrapping_add(1);
         let entry = CachedDesign {
             id,
+            latent_id: latent.latent_id(),
             fingerprint,
             basis_signature,
+            latent_bits: latent_bits(&latent),
             design: computed.design,
             hyper_dirs: computed.hyper_dirs,
             radial_distances,
@@ -294,26 +436,27 @@ impl LatentDesignCache {
             last_used: self.clock,
         };
         let _resident_scalars = entry.resident_scalar_count();
+        insert_persistent_latent_design(Arc::new(entry.clone()))?;
         self.insert(entry);
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| entry.id == id)
-            .expect("inserted latent design cache entry missing");
-        Ok(LatentDesignLookup {
-            cached: &self.entries[index],
+        self.lookup_inserted(id)
+    }
+
+    fn find_entry(&mut self, latent: &LatentCoordValues, basis_signature: u64) -> Option<usize> {
+        self.entries.iter().position(|entry| {
+            entry.basis_signature == basis_signature
+                && entry.latent_id == latent.latent_id()
+                && latent_bits_match(latent, &entry.latent_bits)
         })
     }
 
-    fn find_entry(
-        &mut self,
-        fingerprint: &LatentFingerprint,
-        basis_signature: u64,
-    ) -> Option<usize> {
-        self.entries.iter().position(|entry| {
-            entry.basis_signature == basis_signature
-                && entry.fingerprint.len == fingerprint.len
-                && entry.fingerprint.hash == fingerprint.hash
+    fn lookup_inserted(&self, id: u64) -> Result<LatentDesignLookup<'_>, EstimationError> {
+        let Some(index) = self.entries.iter().position(|entry| entry.id == id) else {
+            return Err(EstimationError::InvalidInput(
+                "inserted latent design cache entry missing".to_string(),
+            ));
+        };
+        Ok(LatentDesignLookup {
+            cached: &self.entries[index],
         })
     }
 
@@ -365,6 +508,98 @@ impl CachedDesign {
                 .as_ref()
                 .map_or(0, |values| values.len())
             + usize::from(self.basis_derivative_jets.operator_resident)
+    }
+}
+
+fn lookup_persistent_latent_design(
+    latent: &LatentCoordValues,
+    basis_signature: u64,
+    fingerprint: &LatentFingerprint,
+) -> Result<Option<PersistentLatentDesignHit>, EstimationError> {
+    if persistent_latent_cache_disabled() {
+        return Ok(None);
+    }
+    let cache = PERSISTENT_LATENT_DESIGN_CACHE
+        .get_or_init(|| Mutex::new(PersistentLatentDesignCache::default()));
+    let mut guard = cache.lock().map_err(|_| {
+        EstimationError::InvalidInput("persistent latent design cache mutex poisoned".to_string())
+    })?;
+    guard.lookup(latent, basis_signature, fingerprint)
+}
+
+fn insert_persistent_latent_design(cached: Arc<CachedDesign>) -> Result<(), EstimationError> {
+    if persistent_latent_cache_disabled() {
+        return Ok(());
+    }
+    let cache = PERSISTENT_LATENT_DESIGN_CACHE
+        .get_or_init(|| Mutex::new(PersistentLatentDesignCache::default()));
+    let mut guard = cache.lock().map_err(|_| {
+        EstimationError::InvalidInput("persistent latent design cache mutex poisoned".to_string())
+    })?;
+    guard.insert(cached);
+    Ok(())
+}
+
+fn persistent_latent_cache_disabled() -> bool {
+    std::env::var(DISABLE_PERSISTENT_LATENT_CACHE_ENV)
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
+fn latent_bits(latent: &LatentCoordValues) -> Arc<[u64]> {
+    latent
+        .as_flat()
+        .iter()
+        .map(|value| value.to_bits())
+        .collect::<Vec<_>>()
+        .into()
+}
+
+fn latent_bits_match(latent: &LatentCoordValues, cached_bits: &[u64]) -> bool {
+    latent.as_flat().len() == cached_bits.len()
+        && latent
+            .as_flat()
+            .iter()
+            .zip(cached_bits.iter())
+            .all(|(value, bits)| value.to_bits() == *bits)
+}
+
+fn latent_warmstart_delta(
+    latent: &LatentCoordValues,
+    cached_bits: &[u64],
+    epsilon: f64,
+) -> Option<PersistentLatentWarmstart> {
+    if epsilon <= 0.0 || latent.as_flat().len() != cached_bits.len() {
+        return None;
+    }
+    let d = latent.latent_dim();
+    if d == 0 {
+        return None;
+    }
+    let mut delta = Array1::<f64>::zeros(cached_bits.len());
+    let mut per_axis_linf = vec![0.0_f64; d];
+    let mut max_linf = 0.0_f64;
+    for (idx, (current, previous_bits)) in latent.as_flat().iter().zip(cached_bits.iter()).enumerate()
+    {
+        let previous = f64::from_bits(*previous_bits);
+        let diff = *current - previous;
+        if !current.is_finite() || !previous.is_finite() || !diff.is_finite() {
+            return None;
+        }
+        delta[idx] = diff;
+        let abs = diff.abs();
+        let axis = idx % d;
+        per_axis_linf[axis] = per_axis_linf[axis].max(abs);
+        max_linf = max_linf.max(abs);
+    }
+    if per_axis_linf.iter().all(|axis_max| *axis_max < epsilon) {
+        Some(PersistentLatentWarmstart {
+            delta,
+            per_axis_linf,
+            max_linf,
+        })
+    } else {
+        None
     }
 }
 

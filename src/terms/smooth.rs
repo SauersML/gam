@@ -13309,6 +13309,7 @@ struct SingleBlockLatentCoordDesignCache {
     latent_dim: usize,
     id_mode: crate::terms::latent_coord::LatentIdMode,
     manifold: crate::terms::latent_coord::LatentManifold,
+    latent_id: u64,
     design_revision: u64,
 }
 
@@ -13362,6 +13363,7 @@ impl SingleBlockLatentCoordDesignCache {
             latent_dim: latent.values.latent_dim(),
             id_mode: latent.values.id_mode().clone(),
             manifold: latent.values.manifold().clone(),
+            latent_id: latent.values.latent_id(),
             design_revision: 0,
         })
     }
@@ -13505,12 +13507,13 @@ impl SingleBlockLatentCoordDesignCache {
             .slice(s![self.rho_dim..self.rho_dim + latent_flat_len])
             .to_owned();
         let latent = std::sync::Arc::new(
-            crate::terms::latent_coord::LatentCoordValues::from_flat_with_manifold(
+            crate::terms::latent_coord::LatentCoordValues::from_flat_with_manifold_and_id(
                 flat,
                 self.n_obs,
                 self.latent_dim,
                 self.id_mode.clone(),
                 self.manifold.clone(),
+                self.latent_id,
             ),
         );
         let latent_values_changed = self
