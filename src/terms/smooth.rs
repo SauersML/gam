@@ -13453,6 +13453,16 @@ impl SingleBlockLatentCoordDesignCache {
                 self.manifold.clone(),
             ),
         );
+        let latent_values_changed = self
+            .current_latent
+            .as_ref()
+            .map(|cached| !latent_values_match(cached.as_flat(), latent.as_flat()))
+            .unwrap_or(true);
+        if latent_values_changed {
+            self.latent_design_cache.invalidate_all();
+            self.current_design_cache_id = None;
+            self.design_revision = self.design_revision.wrapping_add(1);
+        }
         for n in 0..self.n_obs {
             for axis in 0..self.latent_dim {
                 let col = self.feature_cols[axis];
@@ -13511,10 +13521,10 @@ impl SingleBlockLatentCoordDesignCache {
         self.current_theta = Some(theta.clone());
         self.last_cost = None;
         self.last_eval = None;
-        if self.current_design_cache_id != Some(lookup.cached.id) {
+        if !latent_values_changed && self.current_design_cache_id != Some(lookup.cached.id) {
             self.design_revision = self.design_revision.wrapping_add(1);
-            self.current_design_cache_id = Some(lookup.cached.id);
         }
+        self.current_design_cache_id = Some(lookup.cached.id);
         Ok(())
     }
 
@@ -15347,6 +15357,10 @@ fn theta_values_match(left: &Array1<f64>, right: &Array1<f64>) -> bool {
             .all(|(&l, &r)| l.to_bits() == r.to_bits())
 }
 
+fn latent_values_match(left: &Array1<f64>, right: &Array1<f64>) -> bool {
+    theta_values_match(left, right)
+}
+
 fn spatial_aniso_matches(left: Option<&[f64]>, right: Option<&[f64]>) -> bool {
     match (left, right) {
         (None, None) => true,
@@ -16933,9 +16947,9 @@ fn try_exact_joint_latent_coord_optimization(
     }
     let direct_hypers =
         latent_coord_initial_direct_hypers(latent.values.id_mode(), latent.values.latent_dim())?;
-    let psi_dim = latent_flat_dim + direct_hypers.len();
+    let latent_coord_ext_dim = latent_flat_dim + direct_hypers.len();
 
-    let mut theta0 = Array1::<f64>::zeros(rho_dim + psi_dim);
+    let mut theta0 = Array1::<f64>::zeros(rho_dim + latent_coord_ext_dim);
     theta0
         .slice_mut(s![..rho_dim])
         .assign(&best.fit.lambdas.mapv(f64::ln));
@@ -17098,7 +17112,7 @@ fn try_exact_joint_latent_coord_optimization(
         &lower,
         &upper,
         rho_dim,
-        psi_dim,
+        latent_coord_ext_dim,
         theta0.len(),
         Derivative::Analytic,
         DeclaredHessianForm::Unavailable,
