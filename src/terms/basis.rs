@@ -4014,6 +4014,23 @@ pub struct ImplicitDesignPsiDerivative {
     axis_combinations: Option<Vec<Vec<(usize, f64)>>>,
 }
 
+/// Streaming design derivative for one per-row latent coordinate `t[n, a]`.
+///
+/// The operator stores the shared latent matrix, centers, radial kernel kind,
+/// and basis transforms once. Individual REML hyper-directions carry only a
+/// flat coordinate index and call `forward_mul_axis` / `transpose_mul_axis`
+/// to expose the corresponding one-row design derivative on demand.
+#[derive(Debug, Clone)]
+pub struct LatentCoordDesignDerivative {
+    latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+    centers: Arc<Array2<f64>>,
+    radial_kind: RadialScalarKind,
+    ident_transform: Option<Array2<f64>>,
+    full_ident_transform: Option<Array2<f64>>,
+    n_poly: usize,
+    polynomial_order: Option<DuchonNullspaceOrder>,
+}
+
 /// The rayon chunk size for parallel implicit matvec operations.
 /// Each chunk processes this many data points before reducing.
 const IMPLICIT_MATVEC_CHUNK_SIZE: usize = 1000;
@@ -4024,6 +4041,250 @@ const IMPLICIT_MATVEC_PAR_THRESHOLD: usize = 10_000;
 /// Number of lower-triangular center rows per tile when assembling dense
 /// ThinPlate penalty ψ-derivative kernel blocks.
 const THIN_PLATE_PENALTY_PSI_TILE_ROWS: usize = 32;
+
+impl LatentCoordDesignDerivative {
+    pub(crate) fn new_matern(
+        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        centers: Arc<Array2<f64>>,
+        length_scale: f64,
+        nu: MaternNu,
+        include_intercept: bool,
+        ident_transform: Option<Array2<f64>>,
+    ) -> Result<Self, BasisError> {
+        if latent.latent_dim() != centers.ncols() {
+            return Err(BasisError::DimensionMismatch(format!(
+                "LatentCoordDesignDerivative Matérn dimension mismatch: latent d={} centers d={}",
+                latent.latent_dim(),
+                centers.ncols()
+            )));
+        }
+        Ok(Self {
+            latent,
+            centers,
+            radial_kind: RadialScalarKind::Matern { length_scale, nu },
+            ident_transform,
+            full_ident_transform: None,
+            n_poly: usize::from(include_intercept),
+            polynomial_order: None,
+        })
+    }
+
+    pub(crate) fn new_duchon(
+        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        centers: Arc<Array2<f64>>,
+        length_scale: Option<f64>,
+        power: f64,
+        nullspace_order: DuchonNullspaceOrder,
+        full_ident_transform: Option<Array2<f64>>,
+    ) -> Result<Self, BasisError> {
+        if latent.latent_dim() != centers.ncols() {
+            return Err(BasisError::DimensionMismatch(format!(
+                "LatentCoordDesignDerivative Duchon dimension mismatch: latent d={} centers d={}",
+                latent.latent_dim(),
+                centers.ncols()
+            )));
+        }
+        let effective_order = duchon_effective_nullspace_order(centers.view(), nullspace_order);
+        let p_order = duchon_p_from_nullspace_order(effective_order);
+        let s_order = power.max(0.0).round() as usize;
+        let radial_kind = if let Some(length_scale) = length_scale {
+            RadialScalarKind::Duchon {
+                length_scale,
+                p_order,
+                s_order,
+                dim: centers.ncols(),
+                coeffs: duchon_partial_fraction_coeffs(
+                    p_order,
+                    s_order,
+                    1.0 / length_scale.max(1e-300),
+                ),
+            }
+        } else {
+            RadialScalarKind::PureDuchon {
+                block_order: pure_duchon_block_order(p_order, power).max(1.0) as usize,
+                p_order,
+                s_order,
+                dim: centers.ncols(),
+            }
+        };
+        let mut workspace = BasisWorkspace::default();
+        let ident_transform =
+            kernel_constraint_nullspace(centers.view(), effective_order, &mut workspace.cache)?;
+        let n_poly = polynomial_block_from_order(centers.view(), effective_order).ncols();
+        Ok(Self {
+            latent,
+            centers,
+            radial_kind,
+            ident_transform: Some(ident_transform),
+            full_ident_transform,
+            n_poly,
+            polynomial_order: Some(effective_order),
+        })
+    }
+
+    pub(crate) fn n_data(&self) -> usize {
+        self.latent.n_obs()
+    }
+
+    pub(crate) fn n_axes(&self) -> usize {
+        self.latent.len()
+    }
+
+    pub(crate) fn p_out(&self) -> usize {
+        self.full_ident_transform
+            .as_ref()
+            .map_or(self.p_after_pad(), Array2::ncols)
+    }
+
+    fn p_constrained(&self) -> usize {
+        self.ident_transform
+            .as_ref()
+            .map_or(self.centers.nrows(), Array2::ncols)
+    }
+
+    fn p_after_pad(&self) -> usize {
+        self.p_constrained() + self.n_poly
+    }
+
+    fn row_axis(&self, flat_axis: usize) -> (usize, usize) {
+        let d = self.latent.latent_dim();
+        (flat_axis / d, flat_axis % d)
+    }
+
+    fn unproject(&self, u: &ArrayView1<'_, f64>) -> (Array1<f64>, Array1<f64>) {
+        let after_full = match &self.full_ident_transform {
+            Some(zf) => zf.dot(u),
+            None => u.to_owned(),
+        };
+        let p_constrained = self.p_constrained();
+        let smooth_part = after_full.slice(s![..p_constrained]);
+        let raw_knot = match &self.ident_transform {
+            Some(z) => z.dot(&smooth_part),
+            None => smooth_part.to_owned(),
+        };
+        let poly = after_full
+            .slice(s![p_constrained..p_constrained + self.n_poly])
+            .to_owned();
+        (raw_knot, poly)
+    }
+
+    fn project_and_pad(&self, raw_knot: &Array1<f64>, raw_poly: &Array1<f64>) -> Array1<f64> {
+        let constrained = match &self.ident_transform {
+            Some(z) => z.t().dot(raw_knot),
+            None => raw_knot.clone(),
+        };
+        let mut padded = Array1::<f64>::zeros(constrained.len() + self.n_poly);
+        padded
+            .slice_mut(s![..constrained.len()])
+            .assign(&constrained);
+        if self.n_poly > 0 {
+            padded
+                .slice_mut(s![constrained.len()..])
+                .assign(raw_poly);
+        }
+        match &self.full_ident_transform {
+            Some(zf) => zf.t().dot(&padded),
+            None => padded,
+        }
+    }
+
+    fn kernel_axis_scalar(&self, row: usize, center: usize, axis: usize) -> Result<f64, BasisError> {
+        let t_row = self.latent.row(row);
+        let mut r2 = 0.0_f64;
+        for a in 0..self.latent.latent_dim() {
+            let delta = t_row[a] - self.centers[[center, a]];
+            r2 += delta * delta;
+        }
+        let r = r2.sqrt();
+        if r == 0.0 {
+            return Ok(0.0);
+        }
+        let (_, q, _) = self.radial_kind.eval_design_triplet(r)?;
+        Ok(q * (t_row[axis] - self.centers[[center, axis]]))
+    }
+
+    fn polynomial_axis_values(&self, row: usize, axis: usize) -> Array1<f64> {
+        let Some(order) = self.polynomial_order else {
+            return Array1::<f64>::zeros(self.n_poly);
+        };
+        let max_degree = match order {
+            DuchonNullspaceOrder::Zero => 0usize,
+            DuchonNullspaceOrder::Linear => 1usize,
+            DuchonNullspaceOrder::Degree(k) => k,
+        };
+        let t_row = self.latent.row(row);
+        let exponents = monomial_exponents(self.latent.latent_dim(), max_degree);
+        let mut out = Array1::<f64>::zeros(exponents.len());
+        for (col, alpha) in exponents.iter().enumerate() {
+            let a_axis = alpha[axis];
+            if a_axis == 0 {
+                continue;
+            }
+            let mut value = a_axis as f64;
+            for a in 0..self.latent.latent_dim() {
+                let exp_a = if a == axis { a_axis - 1 } else { alpha[a] };
+                if exp_a != 0 {
+                    value *= t_row[a].powi(exp_a as i32);
+                }
+            }
+            out[col] = value;
+        }
+        out
+    }
+
+    pub(crate) fn forward_mul_axis(
+        &self,
+        flat_axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, BasisError> {
+        assert!(flat_axis < self.n_axes());
+        assert_eq!(u.len(), self.p_out());
+        let (row, axis) = self.row_axis(flat_axis);
+        let (u_knot, u_poly) = self.unproject(u);
+        let mut value = 0.0_f64;
+        for center in 0..self.centers.nrows() {
+            value += self.kernel_axis_scalar(row, center, axis)? * u_knot[center];
+        }
+        let poly = self.polynomial_axis_values(row, axis);
+        value += poly.dot(&u_poly);
+        let mut out = Array1::<f64>::zeros(self.n_data());
+        out[row] = value;
+        Ok(out)
+    }
+
+    pub(crate) fn transpose_mul_axis(
+        &self,
+        flat_axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, BasisError> {
+        assert!(flat_axis < self.n_axes());
+        assert_eq!(v.len(), self.n_data());
+        let (row, axis) = self.row_axis(flat_axis);
+        let scale = v[row];
+        let mut raw_knot = Array1::<f64>::zeros(self.centers.nrows());
+        if scale != 0.0 {
+            for center in 0..self.centers.nrows() {
+                raw_knot[center] = scale * self.kernel_axis_scalar(row, center, axis)?;
+            }
+        }
+        let raw_poly = self.polynomial_axis_values(row, axis).mapv(|value| scale * value);
+        Ok(self.project_and_pad(&raw_knot, &raw_poly))
+    }
+
+    pub(crate) fn materialize_axis(&self, flat_axis: usize) -> Result<Array2<f64>, BasisError> {
+        assert!(flat_axis < self.n_axes());
+        let (row, axis) = self.row_axis(flat_axis);
+        let mut raw_knot = Array1::<f64>::zeros(self.centers.nrows());
+        for center in 0..self.centers.nrows() {
+            raw_knot[center] = self.kernel_axis_scalar(row, center, axis)?;
+        }
+        let raw_poly = self.polynomial_axis_values(row, axis);
+        let projected = self.project_and_pad(&raw_knot, &raw_poly);
+        let mut out = Array2::<f64>::zeros((self.n_data(), projected.len()));
+        out.row_mut(row).assign(&projected);
+        Ok(out)
+    }
+}
 
 impl ImplicitDesignPsiDerivative {
     /// Construct from pre-computed radial jet scalars.

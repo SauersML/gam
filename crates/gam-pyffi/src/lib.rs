@@ -3945,10 +3945,12 @@ fn dense_fisher_glm_fit_to_pydict<'py>(
         )));
     }
     if y.iter().any(|v| !v.is_finite()) {
-        return Err(py_value_error("dense Fisher GLM response must be finite"));
+        return Err(py_value_error(
+            "dense Fisher GLM response must be finite".to_string(),
+        ));
     }
-    if let Some(fw) = fisher_w {
-        validate_dense_fisher_w(n_obs, n_outputs, fw).map_err(py_value_error)?;
+    if let Some(fw) = fisher_w.as_ref() {
+        validate_dense_fisher_w(n_obs, n_outputs, fw.view()).map_err(py_value_error)?;
     }
     let row_weights = latent_row_weights(n_obs, weights).map_err(py_value_error)?;
     let lambda = init_lambda.unwrap_or(1.0);
@@ -3968,7 +3970,7 @@ fn dense_fisher_glm_fit_to_pydict<'py>(
     );
     if multinomial && n_outputs < 2 {
         return Err(py_value_error(
-            "multinomial-logit requires at least two response columns",
+            "multinomial-logit requires at least two response columns".to_string(),
         ));
     }
     if !(multinomial || binomial_multi) {
@@ -4012,7 +4014,7 @@ fn dense_fisher_glm_fit_to_pydict<'py>(
                         gradient[a * k + col] += row_weights[row] * design[[row, col]] * resid;
                     }
                     for b in 0..active_outputs {
-                        h_blocks[[row, a, b]] = if let Some(fw) = fisher_w {
+                        h_blocks[[row, a, b]] = if let Some(fw) = fisher_w.as_ref() {
                             fw[[row, a, b]]
                         } else if a == b {
                             probs[a] * (1.0 - probs[a])
@@ -4038,7 +4040,7 @@ fn dense_fisher_glm_fit_to_pydict<'py>(
                 }
                 for a in 0..active_outputs {
                     for b in 0..active_outputs {
-                        h_blocks[[row, a, b]] = if let Some(fw) = fisher_w {
+                        h_blocks[[row, a, b]] = if let Some(fw) = fisher_w.as_ref() {
                             fw[[row, a, b]]
                         } else if a == b {
                             fitted[[row, a]] * (1.0 - fitted[[row, a]])
@@ -4482,13 +4484,19 @@ fn gaussian_reml_fit_latent<'py>(
                         .as_ref()
                         .map(|a| a.as_array())
                         .ok_or_else(|| {
-                            py_value_error("tensor B-spline latent design requires knots_concat")
+                            py_value_error(
+                                "tensor B-spline latent design requires knots_concat".to_string(),
+                            )
                         })?;
                     let offsets = tensor_knot_offsets.as_deref().ok_or_else(|| {
-                        py_value_error("tensor B-spline latent design requires knot_offsets")
+                        py_value_error(
+                            "tensor B-spline latent design requires knot_offsets".to_string(),
+                        )
                     })?;
                     let degrees = tensor_degrees.as_deref().ok_or_else(|| {
-                        py_value_error("tensor B-spline latent design requires degrees")
+                        py_value_error(
+                            "tensor B-spline latent design requires degrees".to_string(),
+                        )
                     })?;
                     build_latent_tensor_bspline_design(
                         t.as_array(),
