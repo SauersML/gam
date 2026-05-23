@@ -2335,3 +2335,432 @@ exec
         // P(ρ) = ½ μ · S, where S is the (ρ-independent) Frobenius sum and
         // μ = exp(ρ_iso). So ∂P/∂ρ_iso = P.
 
+exec
+/bin/zsh -lc "sed -n '1328,1390p' src/terms/analytic_penalties.rs" in /Users/user/gam
+ succeeded in 0ms:
+
+    fn hessian_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        let (lam, smooth) = self.resolved(rho);
+        let mut d = Array1::<f64>::zeros(target.len());
+        match self.kind {
+            SparsityKind::SmoothedL1 { .. } => {
+                let eps2 = smooth * smooth;
+                for (i, &x) in target.iter().enumerate() {
+                    let r = (x * x + eps2).sqrt();
+                    d[i] = lam * eps2 / (r * r * r);
+                }
+                Some(d)
+            }
+            SparsityKind::Log { .. } => {
+                let d2 = smooth * smooth;
+                for (i, &x) in target.iter().enumerate() {
+                    let denom = d2 + x * x;
+                    d[i] = lam * 2.0 * (d2 - x * x) / (denom * denom);
+                }
+                Some(d)
+            }
+            // Hoyer's Hessian is dense (couples through L2). Provide the
+            // *diagonal* part only — the consumer that wants exact HVP must
+            // override (we expose `hvp` below for the rank-1 + diagonal
+            // form). Diagonal piece:
+            //   ∂²H/∂x_i² = (√n/((√n−1) L2)) · ( 3 L1 x_i² / L2⁴ − 1/L2² · something ).
+            // For an inner-loop preconditioner we use the L2-curvature term
+            // `λ · √n · L1 / ((√n−1) · L2³)` which is the dominant positive
+            // diagonal contribution near sparse minima.
+            SparsityKind::Hoyer => {
+                let n = target.len() as f64;
+                let l1: f64 = target.iter().map(|x| x.abs()).sum();
+                let l2: f64 = target.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if l2 == 0.0 {
+                    return Some(d);
+                }
+                let denom = n.sqrt() - 1.0;
+                let coeff = lam * n.sqrt() * l1 / (denom * l2 * l2 * l2);
+                for i in 0..target.len() {
+                    d[i] = coeff;
+                }
+                Some(d)
+            }
+        }
+    }
+
+    fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        // Strength axis: ∂P/∂ρ_strength = P (chain rule through exp).
+        // ε axis (if owned): ∂P/∂ρ_eps = ε · ∂P/∂ε.
+        let n_rho = self.rho_count();
+        let mut out = Array1::<f64>::zeros(n_rho);
+        let p_val = self.value(target, rho);
+        out[self.strength_rho_index] = p_val;
+        if let Some(eps_idx) = self.eps_rho_index {
+            let (lam, smooth) = self.resolved(rho);
+
+exec
+/bin/zsh -lc "sed -n '1390,1420p' src/terms/analytic_penalties.rs" in /Users/user/gam
+ succeeded in 0ms:
+            let (lam, smooth) = self.resolved(rho);
+            let mut dp_deps = 0.0;
+            match self.kind {
+                SparsityKind::SmoothedL1 { .. } => {
+                    for &x in target.iter() {
+                        dp_deps += smooth / (x * x + smooth * smooth).sqrt();
+                    }
+                    dp_deps *= lam;
+                }
+                SparsityKind::Log { .. } => {
+                    // d/dδ log(1 + x²/δ²) = -2 x² / (δ (δ² + x²))
+                    let d2 = smooth * smooth;
+                    for &x in target.iter() {
+                        dp_deps += -2.0 * x * x / (smooth * (d2 + x * x));
+                    }
+                    dp_deps *= lam;
+                }
+                SparsityKind::Hoyer => {}
+            }
+            // Chain through ρ_eps = log(ε)  ⇒  ∂ε/∂ρ_eps = ε.
+            out[eps_idx] = smooth * dp_deps;
+        }
+        out
+    }
+
+    fn rho_count(&self) -> usize {
+        1 + if self.eps_rho_index.is_some() { 1 } else { 0 }
+    }
+
+    fn name(&self) -> &str {
+        "sparsity"
+
+exec
+/bin/zsh -lc "rg -n \"fn hvp\\(|SparsityKind::Hoyer => \\{|hoyer|Hoyer\" src/terms/analytic_penalties.rs" in /Users/user/gam
+ succeeded in 0ms:
+13://!   * [`SparsityPenalty`] — smoothed L¹ (`sqrt(x² + ε²)`), Hoyer, or Log
+150:    fn hvp(
+775:    fn hvp(
+865:/// * `Hoyer` — `(√n · ‖x‖_1 − ‖x‖_2) / (√n − 1)`. Scale-invariant; encourages
+872:    Hoyer,
+1242:            (None, SparsityKind::Hoyer) => 0.0,
+1263:            SparsityKind::Hoyer => {
+1298:            SparsityKind::Hoyer => {
+1353:            // Hoyer's Hessian is dense (couples through L2). Provide the
+1361:            SparsityKind::Hoyer => {
+1407:                SparsityKind::Hoyer => {}
+1690:    pub fn hvp(
+1808:        // smoothed-L¹, Log; Hoyer currently exposes its preconditioner
+
+exec
+/bin/zsh -lc "rg -n \"let h =|n\\.sqrt\\(\\) \\* l1 / l2|sqrt\\(\\) \\* l1 / l2|n\\.sqrt\\(\\) \\* \\(sgn / l2|coeff = lam \\* n\\.sqrt\\(\\) \\* l1\" src/terms/analytic_penalties.rs" in /Users/user/gam
+ succeeded in 0ms:
+1270:                let h = (n.sqrt() * l1 / l2 - 1.0) / (n.sqrt() - 1.0);
+1316:                    g[i] = coeff * (n.sqrt() * (sgn / l2 - l1 * x / (l2 * l2 * l2)));
+1369:                let coeff = lam * n.sqrt() * l1 / (denom * l2 * l2 * l2);
+1800:        let h = self.penalty.hvp(self.target.view(), self.rho.view(), w);
+1888:            let h = self
+1977:        let h = ard
+
+exec
+/bin/zsh -lc "sed -n '1248,1322p' src/terms/analytic_penalties.rs" in /Users/user/gam
+ succeeded in 0ms:
+impl AnalyticPenalty for SparsityPenalty {
+    fn tier(&self) -> PenaltyTier {
+        self.target_tier
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        let (lam, smooth) = self.resolved(rho);
+        match self.kind {
+            SparsityKind::SmoothedL1 { .. } => {
+                let mut acc = 0.0;
+                for &x in target.iter() {
+                    acc += (x * x + smooth * smooth).sqrt();
+                }
+                lam * acc
+            }
+            SparsityKind::Hoyer => {
+                let n = target.len() as f64;
+                let l1: f64 = target.iter().map(|x| x.abs()).sum();
+                let l2: f64 = target.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if l2 == 0.0 {
+                    return 0.0;
+                }
+                let h = (n.sqrt() * l1 / l2 - 1.0) / (n.sqrt() - 1.0);
+                lam * h
+            }
+            SparsityKind::Log { .. } => {
+                let mut acc = 0.0;
+                let d2 = smooth * smooth;
+                for &x in target.iter() {
+                    acc += (1.0 + x * x / d2).ln();
+                }
+                lam * acc
+            }
+        }
+    }
+
+    fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let (lam, smooth) = self.resolved(rho);
+        let mut g = Array1::<f64>::zeros(target.len());
+        match self.kind {
+            SparsityKind::SmoothedL1 { .. } => {
+                let eps2 = smooth * smooth;
+                for (i, &x) in target.iter().enumerate() {
+                    g[i] = lam * x / (x * x + eps2).sqrt();
+                }
+            }
+            SparsityKind::Hoyer => {
+                // ∂(L1)/∂x_i = sign(x_i); ∂(L2)/∂x_i = x_i / L2.
+                let n = target.len() as f64;
+                let l1: f64 = target.iter().map(|x| x.abs()).sum();
+                let l2: f64 = target.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if l2 == 0.0 {
+                    return g;
+                }
+                let denom = n.sqrt() - 1.0;
+                let coeff = lam / denom;
+                for (i, &x) in target.iter().enumerate() {
+                    let sgn = if x > 0.0 {
+                        1.0
+                    } else if x < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                    g[i] = coeff * (n.sqrt() * (sgn / l2 - l1 * x / (l2 * l2 * l2)));
+                }
+            }
+            SparsityKind::Log { .. } => {
+                let d2 = smooth * smooth;
+                for (i, &x) in target.iter().enumerate() {
+                    g[i] = lam * 2.0 * x / (d2 + x * x);
+
+exec
+/bin/zsh -lc "sed -n '1760,1865p' src/terms/analytic_penalties.rs" in /Users/user/gam
+ succeeded in 0ms:
+// the frozen op once per outer iteration (after PIRLS converges on `β`), in
+// exactly the same place the existing closed-form operator is rebuilt when
+// `ψ` advances.
+
+/// `PenaltyOp` view of an [`AnalyticPenalty`] frozen at `(target, rho)`.
+///
+/// The Hessian at the frozen point is symmetric PSD for every penalty we
+/// ship (smoothed-L¹ and Log have positive diagonals by construction; ARD
+/// is a positive diagonal; Isometry's Gauss-Newton form is `2μ J^T J` which
+/// is PSD). `as_dense()` materializes via `n` matvecs against the standard
+/// basis — `O(n²)` and intended only for spectral diagnostics; the hot path
+/// uses `matvec` and `diag` directly.
+pub struct FrozenAnalyticPenaltyOp {
+    penalty: AnalyticPenaltyKind,
+    target: Array1<f64>,
+    rho: Array1<f64>,
+}
+
+impl FrozenAnalyticPenaltyOp {
+    pub fn new(penalty: AnalyticPenaltyKind, target: Array1<f64>, rho: Array1<f64>) -> Self {
+        Self {
+            penalty,
+            target,
+            rho,
+        }
+    }
+
+    /// Underlying penalty (read-only). Useful for the outer driver that needs
+    /// to query `grad_rho` while still holding the frozen op.
+    pub fn penalty(&self) -> &AnalyticPenaltyKind {
+        &self.penalty
+    }
+}
+
+impl PenaltyOp for FrozenAnalyticPenaltyOp {
+    fn dim(&self) -> usize {
+        self.target.len()
+    }
+
+    fn matvec(&self, w: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
+        let h = self.penalty.hvp(self.target.view(), self.rho.view(), w);
+        for i in 0..h.len() {
+            out[i] = h[i];
+        }
+    }
+
+    fn diag(&self) -> Array1<f64> {
+        // Each diagonal penalty exposes `hessian_diag` directly (ARD,
+        // smoothed-L¹, Log; Hoyer currently exposes its preconditioner
+        // diagonal). Dense penalties such as Isometry fall back to probing
+        // matvec on each standard basis vector (O(n²)).
+        match &self.penalty {
+            AnalyticPenaltyKind::Ard(p) => p
+                .hessian_diag(self.target.view(), self.rho.view())
+                .expect("ARD diag"),
+            AnalyticPenaltyKind::IBPAssignment(p) => p
+                .hessian_diag(self.target.view(), self.rho.view())
+                .expect("IBP assignment diag"),
+            AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p
+                .hessian_diag(self.target.view(), self.rho.view())
+                .expect("softmax assignment diag"),
+            AnalyticPenaltyKind::Sparsity(p) => {
+                if let Some(d) = p.hessian_diag(self.target.view(), self.rho.view()) {
+                    d
+                } else {
+                    self.diag_via_matvec()
+                }
+            }
+            AnalyticPenaltyKind::Isometry(_) => self.diag_via_matvec(),
+        }
+    }
+
+    fn log_det_plus_lambda_i(&self, lambda: f64) -> Result<f64, String> {
+        assert!(lambda > 0.0, "log_det_plus_lambda_i requires λ > 0");
+        // For the diagonal-Hessian penalties (ARD, smoothed-L¹ and Log) the
+        // closed form is `Σ_i log(d_i + λ)`. For the dense Isometry GN form
+        // we fall back to the materialize-and-eigh path on `as_dense`.
+        match &self.penalty {
+            AnalyticPenaltyKind::Ard(_)
+            | AnalyticPenaltyKind::Sparsity(_)
+            | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
+            | AnalyticPenaltyKind::IBPAssignment(_) => {
+                let d = self.diag();
+                let mut s = 0.0;
+                for &v in d.iter() {
+                    let r = v + lambda;
+                    if !r.is_finite() || r <= 0.0 {
+                        return Err(format!(
+                            "FrozenAnalyticPenaltyOp::log_det_plus_lambda_i: \
+                             non-positive entry {r:.3e} after λ shift"
+                        ));
+                    }
+                    s += r.ln();
+                }
+                Ok(s)
+            }
+            AnalyticPenaltyKind::Isometry(_) => {
+                let dense = self.as_dense();
+                <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
+            }
+        }
+    }
+
+    fn as_dense(&self) -> Array2<f64> {
+        let n = self.target.len();
+        let mut m = Array2::<f64>::zeros((n, n));
+
+exec
+/bin/zsh -lc "sed -n '1865,1900p' src/terms/analytic_penalties.rs" in /Users/user/gam
+ succeeded in 0ms:
+        let mut m = Array2::<f64>::zeros((n, n));
+        let mut e = Array1::<f64>::zeros(n);
+        for j in 0..n {
+            e[j] = 1.0;
+            let col = self
+                .penalty
+                .hvp(self.target.view(), self.rho.view(), e.view());
+            for i in 0..n {
+                m[[i, j]] = col[i];
+            }
+            e[j] = 0.0;
+        }
+        m
+    }
+}
+
+impl FrozenAnalyticPenaltyOp {
+    fn diag_via_matvec(&self) -> Array1<f64> {
+        let n = self.target.len();
+        let mut d = Array1::<f64>::zeros(n);
+        let mut e = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            e[i] = 1.0;
+            let h = self
+                .penalty
+                .hvp(self.target.view(), self.rho.view(), e.view());
+            d[i] = h[i];
+            e[i] = 0.0;
+        }
+        d
+    }
+}
+
+impl AnalyticPenaltyKind {
+    /// Freeze this kind at `(target, rho)` and return an `Arc<dyn PenaltyOp>`
+    /// ready to slot into `BlockwisePenalty::with_op` or `PenaltyForm::Operator`.
+
+exec
+/bin/zsh -lc "rg -n \"smoothed-L¹ and Log have positive|AnalyticPenaltyKind::Sparsity|P_j\\(ρ_j\\)|out\\[self\\.rho_indices\\[j\\]\\]|let r = v \\+ lambda|SparsityPenalty\" src/terms/analytic_penalties.rs" in /Users/user/gam
+ succeeded in 0ms:
+13://!   * [`SparsityPenalty`] — smoothed L¹ (`sqrt(x² + ε²)`), Hoyer, or Log
+47://! SparsityPenalty owns either zero (`ε` fixed) or one (`ε` REML-selected) plus
+890:pub struct SparsityPenalty {
+918:pub struct SoftmaxAssignmentSparsityPenalty {
+923:impl SoftmaxAssignmentSparsityPenalty {
+957:impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
+1220:impl SparsityPenalty {
+1248:impl AnalyticPenalty for SparsityPenalty {
+1544:        // P_j(ρ_j) = ½ exp(ρ_j) Σ_n t_{n,j}². ∂/∂ρ_j = P_j.
+1555:            out[self.rho_indices[j]] = 0.5 * lam_j * sq;
+1601:    Sparsity(Arc<SparsityPenalty>),
+1602:    SoftmaxAssignmentSparsity(Arc<SoftmaxAssignmentSparsityPenalty>),
+1611:            AnalyticPenaltyKind::Sparsity(p) => p.tier(),
+1621:            AnalyticPenaltyKind::Sparsity(p) => p.rho_count(),
+1631:            AnalyticPenaltyKind::Sparsity(p) => p.name(),
+1641:            AnalyticPenaltyKind::Sparsity(p) => p.value(target, rho),
+1655:            AnalyticPenaltyKind::Sparsity(p) => p.grad_target(target, rho),
+1669:            AnalyticPenaltyKind::Sparsity(p) => p.grad_rho(target, rho),
+1683:            AnalyticPenaltyKind::Sparsity(p) => p.hessian_diag(target, rho),
+1705:            AnalyticPenaltyKind::Sparsity(p) => p.hvp(target, rho, v),
+1767:/// ship (smoothed-L¹ and Log have positive diagonals by construction; ARD
+1821:            AnalyticPenaltyKind::Sparsity(p) => {
+1839:            | AnalyticPenaltyKind::Sparsity(_)
+1845:                    let r = v + lambda;
+1942:        let p = SparsityPenalty::smoothed_l1(PenaltyTier::Beta, 1e-3);
+
+exec
+/bin/zsh -lc "rg -n \"Square symmetric PSD penalty operator|All methods must be consistent|log det\\(S \\+ λI\\)|struct ScaledPenaltyOp|scale: f64|log_det\\(scale \\* S\" src/terms/penalty_op.rs" in /Users/user/gam
+ succeeded in 0ms:
+26:/// Square symmetric PSD penalty operator.
+47:    /// Exact `log det(S + λI)` for `λ > 0`.
+154:pub struct ScaledPenaltyOp {
+156:    scale: f64,
+160:    pub fn new(inner: Arc<dyn PenaltyOp>, scale: f64) -> Self {
+
+exec
+/bin/zsh -lc "rg -n \"sqrt\\(\\)|x / \\(x \\* x \\+ eps2\\)|eps2 / \\(r \\* r \\* r\\)|x \\* x / d2|2\\.0 \\* x / \\(d2 \\+ x \\* x\\)|2\\.0 \\* \\(d2 - x \\* x\\)|-2\\.0 \\* x \\* x / \\(smooth\" src/terms/analytic_penalties.rs" in /Users/user/gam
+ succeeded in 0ms:
+601:                let r = r2.sqrt();
+1259:                    acc += (x * x + smooth * smooth).sqrt();
+1266:                let l2: f64 = target.iter().map(|x| x * x).sum::<f64>().sqrt();
+1270:                let h = (n.sqrt() * l1 / l2 - 1.0) / (n.sqrt() - 1.0);
+1277:                    acc += (1.0 + x * x / d2).ln();
+1295:                    g[i] = lam * x / (x * x + eps2).sqrt();
+1302:                let l2: f64 = target.iter().map(|x| x * x).sum::<f64>().sqrt();
+1306:                let denom = n.sqrt() - 1.0;
+1316:                    g[i] = coeff * (n.sqrt() * (sgn / l2 - l1 * x / (l2 * l2 * l2)));
+1322:                    g[i] = lam * 2.0 * x / (d2 + x * x);
+1340:                    let r = (x * x + eps2).sqrt();
+1341:                    d[i] = lam * eps2 / (r * r * r);
+1349:                    d[i] = lam * 2.0 * (d2 - x * x) / (denom * denom);
+1364:                let l2: f64 = target.iter().map(|x| x * x).sum::<f64>().sqrt();
+1368:                let denom = n.sqrt() - 1.0;
+1369:                let coeff = lam * n.sqrt() * l1 / (denom * l2 * l2 * l2);
+1395:                        dp_deps += smooth / (x * x + smooth * smooth).sqrt();
+1403:                        dp_deps += -2.0 * x * x / (smooth * (d2 + x * x));
+
+exec
+/bin/zsh -lc "rg -n \"let denom = n\\.sqrt\\(\\) - 1\\.0|let h = \\(n\\.sqrt\\(\\) \\* l1 / l2|return 0\\.0;|if l2 == 0\\.0\" src/terms/analytic_penalties.rs" in /Users/user/gam
+ succeeded in 0ms:
+1267:                if l2 == 0.0 {
+1268:                    return 0.0;
+1270:                let h = (n.sqrt() * l1 / l2 - 1.0) / (n.sqrt() - 1.0);
+1303:                if l2 == 0.0 {
+1306:                let denom = n.sqrt() - 1.0;
+1365:                if l2 == 0.0 {
+1368:                let denom = n.sqrt() - 1.0;
+
