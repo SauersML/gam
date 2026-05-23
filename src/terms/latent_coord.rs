@@ -19,8 +19,8 @@
 //! `LatentCoordValues` is the structural sibling of [`SpatialLogKappaCoords`]
 //! (see [`crate::terms::smooth`]). Both store a flat `Array1<f64>` that the
 //! REML/IFT outer loop treats as *design-moving, non-penalty-like*
-//! hyper-coordinates. `SpatialLogKappaCoords` holds one (or a handful of) `ψ`
-//! per spatial term — log-anisotropies of the kernel. `LatentCoordValues`
+//! hyper-coordinates. `SpatialLogKappaCoords` holds one or more kernel-shape
+//! coordinates per spatial term. `LatentCoordValues`
 //! holds an `N × d` matrix of per-row latent coordinates `t_n ∈ ℝ^d`.
 //!
 //! For a Duchon (or any radial) basis:
@@ -30,10 +30,10 @@
 //! ∂Φ_{n,k}/∂t_n = φ'(r_{nk}) · (t_n − c_k) / r_{nk}.
 //! ```
 //!
-//! The radial-gradient `φ'(r)` is the *same scalar* the `ψ` machinery already
+//! The radial-gradient `φ'(r)` is the same scalar the kernel-shape machinery already
 //! computes via [`crate::basis::duchon_radial_jets`]; the chain rule
 //! `(t_n − c_k)/r_{nk}` is what differs between "differentiate against the
-//! kernel scale ψ" and "differentiate against the first kernel argument t".
+//! kernel scale" and "differentiate against the first kernel argument t".
 //! Everything downstream of `HyperDesignDerivative::from_implicit` (matrix-free
 //! Newton, IFT cache, persistent warm-start, REML/LAML evaluation) is reused
 //! verbatim.
@@ -537,7 +537,7 @@ impl LatentIdMode {
 ///
 /// The dispatch is an enum rather than a trait because each path's
 /// arguments differ structurally (radial bases reuse `φ'(r)` shared with
-/// the ψ-chain machinery; jet bases ship the full tensor). All chain rules
+/// the kernel-shape chain machinery; jet bases ship the full tensor). All chain rules
 /// are analytic and closed-form; no autodiff, no finite differences.
 pub enum InputLocationDerivative<'a> {
     /// Radial-kernel chain rule. The chain rule `(t − c)/r` is reconstructed
@@ -819,9 +819,9 @@ impl LatentCoordValues {
     /// [`InputLocationDerivative::Jet`].
     ///
     /// This is the single entry point the outer optimizer should call; it
-    /// stays in lock-step with the kernel-parameter ψ chain rule that
+    /// stays in lock-step with the kernel-parameter chain rule that
     /// `SpatialLogKappaCoords` uses (re-pointed at the first kernel argument
-    /// rather than at the anisotropy ψ).
+    /// rather than at kernel anisotropy).
     pub fn design_gradient_wrt_t_dispatch(
         &self,
         input: InputLocationDerivative<'_>,

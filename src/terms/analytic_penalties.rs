@@ -1,4 +1,4 @@
-//! Analytic penalty primitives for the three-tier (β / ψ / ρ) engine.
+//! Analytic penalty primitives for the three-tier (beta / ext-coord / rho) engine.
 //!
 //! See `proposals/composition_engine.md` §3-§4 and `proposals/latent_coord.md`
 //! §2.3 for the motivation. This module implements the three structured
@@ -6,12 +6,14 @@
 //! SAE / principal-manifold / latent-coordinate workflow:
 //!
 //!   * [`IsometryPenalty`] — pulls the pullback metric of the decoder toward a
-//!     reference metric on the latent manifold. Lives on `ψ` (specifically on
+//!     reference metric on the latent manifold. Lives on the extension-coordinate tier
+//!     (specifically on
 //!     a [`crate::terms::latent_coord::LatentCoordValues`] slice). Breaks the
 //!     diffeomorphism gauge so the inner Hessian on `t` is full-rank and the
 //!     IFT is well-defined.
 //!   * [`SparsityPenalty`] — smoothed L¹ (`sqrt(x² + ε²)`), Hoyer, or Log
-//!     sparsifier. Applied to a `β` slice (SAE codes) or `ψ` slice (soft atom
+//!     sparsifier. Applied to a `β` slice (SAE codes) or extension-coordinate
+//!     slice (soft atom
 //!     amplitudes). Differentiable everywhere; the smoothing parameter `ε` may
 //!     itself live in `ρ` so REML shrinks it.
 //!   * [`IBPAssignmentPenalty`] — deterministic continuous-relaxation
@@ -42,8 +44,8 @@
 //!
 //! Each penalty owns a (possibly empty) sub-range of the global `ρ` vector.
 //! See [`AnalyticPenaltyKind::rho_count`]. The outer REML loop concatenates
-//! these onto the existing per-smooth `ρ`s, exactly the way the anisotropic-ψ
-//! path appends `ψ` ext-coords. The IsometryPenalty owns one `ρ`; the
+//! these onto the existing per-smooth `ρ`s, exactly the way anisotropic
+//! kernel-shape paths append ext-coords. The IsometryPenalty owns one `ρ`; the
 //! SparsityPenalty owns either zero (`ε` fixed) or one (`ε` REML-selected) plus
 //! one strength; the ARDPenalty owns `d` (one per latent axis).
 //!
@@ -51,10 +53,10 @@
 //!
 //! | Penalty   | Target tier | ρ-axes owned         |
 //! |-----------|-------------|----------------------|
-//! | Isometry  | ψ (latent t)| 1 (log μ_iso)        |
-//! | Sparsity  | β or ψ      | 1 (strength) [+1 ε]  |
-//! | IBP       | ψ (logits)  | 0 or 1 (log α)       |
-//! | ARD       | ψ (latent t)| d (one per axis)     |
+//! | Isometry  | ext-coord (latent t) | 1 (log μ_iso)        |
+//! | Sparsity  | β or ext-coord       | 1 (strength) [+1 ε]  |
+//! | IBP       | ext-coord (logits)   | 0 or 1 (log α)       |
+//! | ARD       | ext-coord (latent t) | d (one per axis)     |
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, CowArray, Ix2, Ix3};
 use std::sync::Arc;
@@ -71,7 +73,8 @@ use crate::terms::smooth::BlockwisePenalty;
 // ---------------------------------------------------------------------------
 
 /// Whether a penalty's target is a slice of `β` (decoder coefficients), a
-/// slice of `ψ` (per-observation latent field, e.g. `LatentCoordValues`),
+/// slice of extension coordinates (per-observation latent field, e.g.
+/// `LatentCoordValues`),
 /// or a slice of `ρ` (a hyperparameter sub-block — rare, used by hyperpriors
 /// that we don't yet ship analytically).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,13 +87,13 @@ pub enum PenaltyTier {
 /// Reference for the column / coordinate range a penalty operates over.
 ///
 /// Mirrors `BlockwisePenalty::col_range` for the β tier and is the natural
-/// per-observation flat index for the ψ tier (matching the
+/// per-observation flat index for the extension-coordinate tier (matching the
 /// `LatentCoordValues` row-major flat layout: `n * d + a`).
 #[derive(Debug, Clone)]
 pub struct PsiSlice {
-    /// Inclusive-start, exclusive-end flat range into the underlying ψ vector.
+    /// Inclusive-start, exclusive-end flat range into the underlying ext-coordinate vector.
     pub range: std::ops::Range<usize>,
-    /// For latent-coordinate ψ slices: the latent dimensionality, used to
+    /// For latent-coordinate slices: the latent dimensionality, used to
     /// reshape the flat slice into per-row `(n_obs, d)` blocks.
     pub latent_dim: Option<usize>,
 }
@@ -115,12 +118,12 @@ impl PsiSlice {
 
 /// Uniform interface implemented by every analytic penalty in this module.
 ///
-/// `target` is the relevant slice of the (β or ψ) parameter vector, viewed as
+/// `target` is the relevant slice of the β or extension-coordinate vector, viewed as
 /// a flat `ArrayView1`. The owning REML driver is responsible for slicing the
 /// global parameter vector before calling, and for routing the returned
 /// gradient back into the correct global indices.
 pub trait AnalyticPenalty: Send + Sync {
-    /// Tier the target lives in (β or ψ).
+    /// Tier the target lives in (β or ext-coord).
     fn tier(&self) -> PenaltyTier;
 
     /// Scalar penalty contribution `P(target; ρ)`. The strength factor
@@ -299,7 +302,7 @@ impl WeightField {
 
 /// Isometry-to-reference penalty (canonical-coordinate gauge term).
 ///
-/// Lives on `ψ`: the target slice is a row of the `LatentCoordValues` flat
+/// Lives on ext-coords: the target slice is a row of the `LatentCoordValues` flat
 /// vector (row-major `n_obs × d`). Owns one ρ-axis (`log μ_iso`).
 ///
 /// Penalizes `½ μ Σ_n ‖g_n(t) − g^ref(t_n)‖²_F`, where the pullback metric
@@ -2030,7 +2033,7 @@ impl AnalyticPenaltyOp {
 ///
 ///   1. Concatenate each penalty's owned ρ-axes onto the global ρ vector.
 ///   2. Route the inner gradient `∂L/∂target` contribution back into the
-///      correct β or ψ slice.
+///      correct β or ext-coordinate slice.
 ///   3. Build a Hessian-block stub for `RemlState` cache-key invalidation.
 #[derive(Clone)]
 pub enum AnalyticPenaltyKind {
@@ -2196,7 +2199,7 @@ impl AnalyticPenaltyRegistry {
 // freezing `(target, rho)` and routing `matvec` to `hvp`. The solver re-builds
 // the frozen op once per outer iteration (after PIRLS converges on `β`), in
 // exactly the same place the existing closed-form operator is rebuilt when
-// `ψ` advances.
+// the extension-coordinate block advances.
 
 /// `PenaltyOp` view of an [`AnalyticPenalty`] frozen at `(target, rho)`.
 ///
