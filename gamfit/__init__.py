@@ -86,7 +86,12 @@ from .topology import (
     Sphere as TopologySphere,
     Torus,
 )
-from .select_topology import select_topology
+from .select_topology import (
+    BasisSpec,
+    ScoreKind,
+    SelectTopologyResult,
+    select_topology,
+)
 from ._diagnostics import Diagnostics
 from .smooth import (
     BSpline,
@@ -192,6 +197,7 @@ __all__ = [
     "SchemaIssue",
     "SchemaMismatchError",
     "SharedPrecisionGroup",
+    "BasisSpec",
     "ARDPenalty",
     "IBPAssignmentPenalty",
     "IsometryPenalty",
@@ -201,6 +207,8 @@ __all__ = [
     "SparsityPenalty",
     "TotalVariationPenalty",
     "Summary",
+    "ScoreKind",
+    "SelectTopologyResult",
     "SurvivalPrediction",
     "TermBlock",
     "__version__",
