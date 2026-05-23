@@ -13442,7 +13442,7 @@ mod tests {
         }
     }
 
-    /// FD check for the cached CTN barrier dH operator (third-derivative formula
+    /// Cached CTN barrier dH operator check (third-derivative formula
     /// `D(∇²B)[u]v = -2 μ Dᵀ((Du)(Dv)/c³)`).
     ///
     /// At fixed direction `d_beta`, builds `H(β ± ε d_beta) v` matrix-free via
@@ -13515,7 +13515,7 @@ mod tests {
         }
     }
 
-    /// FD check for the cached CTN barrier d²H operator (fourth-derivative
+    /// Cached CTN barrier d²H operator check (fourth-derivative
     /// formula `D²(∇²B)[u,w]v = 6 μ Dᵀ((Du)(Dw)(Dv)/c⁴)`).
     ///
     /// Centered FD on the dH operator along `dir_w` recovers d²H[u, w] · v;
