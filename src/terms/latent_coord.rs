@@ -47,7 +47,7 @@
 //!
 //! `IsometryToReference` is deferred to a follow-up (see proposal §4(b)).
 
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 
 /// Choice of auxiliary-prior conditional mean estimator `ĥ(u)`.
 ///
@@ -230,7 +230,9 @@ impl LatentCoordValues {
         self.as_matrix()
     }
 
-    /// Compute `∂Φ/∂t` for a radial-kernel design Φ.
+    /// Compute `∂Φ/∂t` for a radial-kernel design Φ — the original
+    /// Duchon/Matérn path. See [`Self::design_gradient_wrt_t_dispatch`] for
+    /// the basis-agnostic dispatch entry point.
     ///
     /// `kernel_first_derivative` is `φ'(r_{n,k})` for each (row, center)
     /// pair, shape `(n_obs, n_centers)`. `centers` is `(n_centers, d)`.
@@ -276,6 +278,40 @@ impl LatentCoordValues {
             }
         }
         jet
+    }
+
+    /// Compute `∂Φ/∂t` for an arbitrary supported basis kind, by dispatching
+    /// to the right closed-form chain rule.
+    ///
+    /// All radial-kernel bases (Duchon, Matérn) reduce to the same shape
+    /// `φ'(r)`-times-unit-vector chain that `design_gradient_wrt_t` already
+    /// implements. Non-radial bases (sphere, periodic-cyclic B-spline, tensor
+    /// B-spline) carry their own analytic `(N, K, d)` jet — the caller
+    /// pre-builds that jet using the matching `*_first_derivative_nd` helper
+    /// in [`crate::terms::basis`] and passes it in via
+    /// [`InputLocationDerivative::Jet`].
+    ///
+    /// This is the single entry point the outer optimizer should call; it
+    /// stays in lock-step with the kernel-parameter ψ chain rule that
+    /// `SpatialLogKappaCoords` uses (re-pointed at the first kernel argument
+    /// rather than at the anisotropy ψ).
+    pub fn design_gradient_wrt_t_dispatch(
+        &self,
+        input: InputLocationDerivative<'_>,
+    ) -> Array3<f64> {
+        match input {
+            InputLocationDerivative::Radial {
+                kernel_first_derivative,
+                centers,
+            } => self.design_gradient_wrt_t(kernel_first_derivative, centers),
+            InputLocationDerivative::Jet(jet) => {
+                // The non-radial helpers already produce a (N, K, d) tensor
+                // in the same layout `contract_gradient` consumes. Return a
+                // copy so the caller owns the data and is decoupled from the
+                // source array's lifetime.
+                jet.to_owned()
+            }
+        }
     }
 
     /// Contract a downstream gradient `∂L/∂Φ ∈ ℝ^(n_obs × n_centers)` and a
