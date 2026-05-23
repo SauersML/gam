@@ -172,8 +172,8 @@ est = GAMRegressor(formula="y ~ s(x)").fit(X, y)
 A smooth term contributes one or more penalized coefficient blocks,
 each with its own smoothing parameter selected by REML/LAML. For
 polyharmonic and Duchon radial bases, three penalty operators act on
-the same coefficient block: a magnitude operator, a gradient operator,
-and a curvature operator. P-spline, thin-plate, and tensor-product
+the same coefficient block: mass (L²), tension (gradient), and
+stiffness (Laplacian/curvature). P-spline, thin-plate, and tensor-product
 smooths use their standard derivative-based penalties.
 
 ## GPU

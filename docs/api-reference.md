@@ -170,12 +170,22 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.duchon_basis_1d
+::: gamfit.duchon_basis
     options:
       show_root_heading: true
       heading_level: 3
 
-::: gamfit.duchon_basis_1d_derivative
+::: gamfit.duchon_function_norm_penalty
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.periodic_spline_curve_basis
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.sphere_basis
     options:
       show_root_heading: true
       heading_level: 3
@@ -237,7 +247,79 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
+::: gamfit.gaussian_reml_fit_blocks_forward
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gaussian_reml_fit_blocks_backward
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gaussian_reml_fit_with_constraints_forward
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gaussian_reml_fit_with_constraints_backward
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ::: gamfit.gaussian_reml_fit_formula
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+## Smooth term builders
+
+::: gamfit.smooth.Smooth
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.smooth.BSpline
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.smooth.TensorBSpline
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.smooth.PeriodicSplineCurve
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.smooth.Duchon
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.smooth.Matern
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.smooth.Sphere
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.smooth.Categorical
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.smooth.ShapeConstraintLiteral
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.TermBlock
     options:
       show_root_heading: true
       heading_level: 3
