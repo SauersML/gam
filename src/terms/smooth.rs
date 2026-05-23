@@ -8740,9 +8740,14 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         // rel-to-cost form only kicks in once the absolute one has timed out
         // at `max_iter`, so unconverged divergent runs (which have large |g|)
         // still surface as errors.
-        let final_grad = outer_result.final_grad_norm_or_nan();
         let rel_to_cost_threshold = options.tol * (1.0_f64 + outer_result.final_value.abs());
-        if final_grad.is_finite() && final_grad <= rel_to_cost_threshold {
+        // Rel-to-cost acceptance requires an actual gradient measurement;
+        // `None` (cache-hit short-circuit, gradient-free path) cannot satisfy
+        // the mgcv-style criterion regardless of magnitude.
+        if let Some(final_grad) = outer_result
+            .final_grad_norm
+            .filter(|v| v.is_finite() && *v <= rel_to_cost_threshold)
+        {
             log::info!(
                 "[spatial-adaptive] outer optimization hit max_iter={} but \
                  projected gradient norm {:.3e} ≤ τ·(1+|f|) = {:.3e} \
