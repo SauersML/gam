@@ -185,8 +185,8 @@ impl Default for ArrowPcgOptions {
 ///
 /// This is the Ceres-style guard around LM: `ridge_t`/`ridge_beta` provide
 /// Levenberg damping, while the trust radius bounds the reduced shared step
-/// using Steihaug's truncated-CG stopping rules for boundary hits and negative
-/// curvature.
+/// in Euclidean β coordinates using Steihaug's truncated-CG stopping rules for
+/// boundary hits and negative curvature.
 #[derive(Debug, Clone)]
 pub struct ArrowTrustRegionOptions {
     pub radius: f64,
@@ -215,10 +215,8 @@ pub struct ArrowSolveOptions {
     pub mode: ArrowSolverMode,
     pub pcg: ArrowPcgOptions,
     pub trust_region: ArrowTrustRegionOptions,
-    /// Interpret trust-region norms in the Riemannian metric of the latent
-    /// manifold. The shipped manifolds use the ambient Euclidean pullback, so
-    /// Steihaug-CG's dot products remain the same after row blocks are
-    /// tangent-projected.
+    /// Use the Riemannian latent projection before the Schur reduction. The
+    /// reduced Steihaug solve itself remains in Euclidean β coordinates.
     pub riemannian_trust_region: bool,
 }
 
@@ -431,8 +429,6 @@ pub struct ArrowSchurSystem {
     pub d: usize,
     /// β dimensionality `K`.
     pub k: usize,
-    /// Optional per-coordinate metric for Steihaug trust-region dot products.
-    trust_region_metric_weights: Option<Vec<f64>>,
 }
 
 impl ArrowSchurSystem {
@@ -448,7 +444,6 @@ impl ArrowSchurSystem {
             gb: Array1::<f64>::zeros(k),
             d,
             k,
-            trust_region_metric_weights: None,
         }
     }
 
@@ -479,7 +474,6 @@ impl ArrowSchurSystem {
             gb: Array1::<f64>::zeros(k),
             d,
             k,
-            trust_region_metric_weights: None,
         }
     }
 
@@ -560,10 +554,8 @@ impl ArrowSchurSystem {
     pub fn apply_riemannian_latent_geometry(&mut self, latent: &LatentCoordValues) {
         let manifold = latent.manifold();
         if manifold.is_euclidean() {
-            self.trust_region_metric_weights = None;
             return;
         }
-        self.trust_region_metric_weights = Some(manifold.metric_weights());
         debug_assert_eq!(latent.n_obs(), self.rows.len());
         debug_assert_eq!(latent.latent_dim(), self.d);
         for (i, row) in self.rows.iter_mut().enumerate() {
@@ -869,11 +861,10 @@ pub fn solve_arrow_newton_step_with_options(
 
     // 2. Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
     let rhs_beta = reduced_rhs_beta(sys, &htt_factors, &backend);
-    let trust_metric_weights = if options.riemannian_trust_region {
-        trust_region_metric_weights_for_dim(sys, k)
-    } else {
-        None
-    };
+    // The Schur solve is over the reduced β vector. Latent manifold metric
+    // weights live on each d-dimensional t_i block, so the induced metric for
+    // this β-only Steihaug problem is Euclidean.
+    let trust_metric_weights = None;
 
     // 3. Solve reduced shared system using the selected BA mode.
     let (delta_beta, schur_factor) = match options.mode {
@@ -1134,18 +1125,6 @@ fn step_inside_trust_region(
     !radius.is_finite() || metric_norm(step, metric_weights) <= radius
 }
 
-fn trust_region_metric_weights_for_dim(
-    sys: &ArrowSchurSystem,
-    dim: usize,
-) -> Option<&MetricWeights> {
-    // Steihaug-CG here runs on the reduced shared vector. Latent manifold
-    // weights are only a valid metric for this vector when dimensions agree.
-    match sys.trust_region_metric_weights.as_deref() {
-        Some(weights) if weights.len() == dim => Some(weights),
-        _ => None,
-    }
-}
-
 fn schur_matvec<B: BatchedBlockSolver>(
     sys: &ArrowSchurSystem,
     htt_factors: &[Array2<f64>],
@@ -1319,6 +1298,13 @@ where
     ApplyPrec: FnMut(&Array1<f64>) -> Array1<f64>,
 {
     let n = rhs.len();
+    if let Some(weights) = metric_weights {
+        assert_eq!(
+            weights.len(),
+            n,
+            "Steihaug-CG metric weight length must match solve dimension"
+        );
+    }
     let radius = if trust_radius.is_finite() && trust_radius > 0.0 {
         trust_radius
     } else {
