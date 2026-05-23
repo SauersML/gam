@@ -2,6 +2,7 @@ pub mod basis;
 pub mod closed_form_operator;
 pub mod construction;
 pub mod hull;
+pub mod latent_coord;
 pub mod layout;
 pub mod penalty_op;
 pub mod smooth;

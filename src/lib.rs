@@ -88,7 +88,7 @@ pub use resource::{
     ProblemHints, ResidentBytes, ResourcePolicy,
 };
 pub use solver::{estimate, gaussian_reml, mixture_link, pirls, seeding, visualizer};
-pub use terms::{basis, construction, hull, layout, smooth, term_builder};
+pub use terms::{basis, construction, hull, latent_coord, layout, smooth, term_builder};
 
 pub use families::bernoulli_marginal_slope;
 pub use families::custom_family;
