@@ -64,6 +64,7 @@
 //! | IBP       | ext-coord (logits)   | 0 or 1 (log α)       |
 //! | ARD       | ext-coord (latent t) | d (one per axis)     |
 //! | TV        | ext-coord (latent t) | 0 or 1 (log μ_tv)    |
+//! | NuclearNorm | ext-coord (latent t) | 0 or 1 (log μ_nuc)  |
 //! | Orthogonality | ext-coord (latent t) | 0 or 1 (log μ_orth) |
 
 use faer::Side;
@@ -72,7 +73,7 @@ use ndarray::{
 };
 use std::sync::Arc;
 
-use crate::linalg::faer_ndarray::FaerEigh;
+use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd};
 use crate::terms::basis::{
     BasisError, DuchonNullspaceOrder, duchon_radial_first_derivative_nd,
     duchon_radial_second_derivative_nd, duchon_radial_third_derivative_nd,
