@@ -4938,6 +4938,7 @@ fn gumbel_temperature_schedule_from_pydict(
     ridge_ext_coord = 1.0e-6,
     ridge_beta = 1.0e-6,
     gumbel_schedule = None,
+    analytic_penalties = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn sae_manifold_fit_ibp<'py>(
@@ -4962,6 +4963,7 @@ fn sae_manifold_fit_ibp<'py>(
     ridge_ext_coord: f64,
     ridge_beta: f64,
     gumbel_schedule: Option<&Bound<'py, PyDict>>,
+    analytic_penalties: Option<serde_json::Value>,
 ) -> PyResult<Py<PyDict>> {
     let z_view = z.as_array();
     let (n_obs, p_out) = z_view.dim();
@@ -4983,6 +4985,12 @@ fn sae_manifold_fit_ibp<'py>(
             basis_sizes.len()
         )));
     }
+    let latent_payload = serde_json::json!({"t": {"name": "t", "n": n_obs, "d": atom_dim.iter().copied().max().unwrap_or(1)}});
+    let _registry = build_analytic_penalty_registry_from_json(
+        Some(&latent_payload),
+        analytic_penalties.as_ref(),
+    )
+    .map_err(py_value_error)?;
     if initial_logits.as_array().dim() != (n_obs, k_atoms) {
         return Err(py_value_error(format!(
             "initial_logits must be ({n_obs}, {k_atoms}); got {:?}",

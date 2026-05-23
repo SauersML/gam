@@ -99,6 +99,26 @@ def gumbel_reciprocal_iter_schedule(
     )
 
 
+def _normalize_penalty_descriptors(penalties: Sequence[Any] | None) -> list[dict[str, Any]] | None:
+    if penalties is None:
+        return None
+    if isinstance(penalties, (str, bytes)) or not isinstance(penalties, Sequence):
+        raise TypeError("penalties must be a sequence of analytic penalty wrappers")
+    out: list[dict[str, Any]] = []
+    for index, penalty in enumerate(penalties):
+        if hasattr(penalty, "to_rust_descriptor"):
+            out.append(penalty.to_rust_descriptor())
+        elif hasattr(penalty, "_to_rust_payload"):
+            out.append(penalty._to_rust_payload())
+        elif isinstance(penalty, Mapping):
+            out.append(dict(penalty))
+        else:
+            raise TypeError(
+                f"penalties[{index}] must expose to_rust_descriptor() or be a mapping"
+            )
+    return out
+
+
 def sae_manifold_fit(
     Z: Any,
     n_atoms: int | Literal["auto"] = 10,
@@ -115,6 +135,7 @@ def sae_manifold_fit(
     max_iter: int = 12,
     learning_rate: float = 0.05,
     random_state: int = 0,
+    penalties: Sequence[Any] | None = None,
 ) -> SaeManifoldFitResult:
     """Fit a sparse mixture of smooth manifold atoms to activations ``Z``.
 
@@ -165,6 +186,7 @@ def sae_manifold_fit(
             max_iter=max_iter,
             learning_rate=learning_rate,
             random_state=random_state + 1009 * k,
+            penalties=penalties,
         )
         fits.append(fit_k)
         names.append(f"K={k}")
@@ -197,6 +219,7 @@ def _fit_fixed_k(
     max_iter: int,
     learning_rate: float,
     random_state: int,
+    penalties: Sequence[Any] | None,
 ) -> SaeManifoldFitResult:
     if sparsity_strength == "auto" and assignment_prior == "softmax":
         lambda_grid = [0.1, 1.0, 10.0]
@@ -216,6 +239,7 @@ def _fit_fixed_k(
                 max_iter=max_iter,
                 learning_rate=learning_rate,
                 random_state=random_state + idx * 7919,
+                penalties=penalties,
             )
             for idx, lam in enumerate(lambda_grid)
         ]
@@ -247,6 +271,7 @@ def _fit_fixed_k(
                 max_iter=max_iter,
                 learning_rate=learning_rate,
                 random_state=random_state + idx * 3571,
+                penalties=penalties,
             )
             for idx, candidate_alpha in enumerate(alpha_grid)
         ]
@@ -295,6 +320,7 @@ def _fit_fixed_k(
             gumbel_schedule,
             max_iter=max_iter,
             learning_rate=learning_rate,
+            analytic_penalties=penalties,
         )
 
     effective_alpha = (
@@ -420,6 +446,7 @@ def _fit_fixed_k_ibp_rust(
     *,
     max_iter: int,
     learning_rate: float,
+    analytic_penalties: Sequence[Any] | None,
 ) -> SaeManifoldFitResult:
     designs: list[np.ndarray] = []
     jets: list[np.ndarray] = []
@@ -467,6 +494,7 @@ def _fit_fixed_k_ibp_rust(
         int(max_iter),
         float(learning_rate),
         gumbel_schedule=gumbel_schedule,
+        analytic_penalties=_normalize_penalty_descriptors(analytic_penalties),
     )
 
     assignments = np.asarray(payload["assignments_z"], dtype=float)
