@@ -6533,9 +6533,9 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                     .and_then(|r| r.map(|lk| lk.link_function()))
                 {
                     let alo_result = if let Some(unified) = model.unified() {
-                        let eta = design.design.dot(&fit.beta);
                         let (report_offset, _report_noise_offset) =
                             report_offset_for(&model, &ds, &col_map)?;
+                        let eta = &design.design.dot(&fit.beta) + &report_offset;
                         let dense_alo_design = design.design.to_dense();
                         gam::alo::compute_alo_diagnostics_from_unified(
                             unified,
