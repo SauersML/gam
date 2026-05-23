@@ -839,6 +839,96 @@ impl SaeManifoldTerm {
         sys.solve(ridge_psi, ridge_beta)
     }
 
+    pub fn apply_newton_step(
+        &mut self,
+        delta_psi: ArrayView1<'_, f64>,
+        delta_beta: ArrayView1<'_, f64>,
+        step_size: f64,
+    ) -> Result<(), String> {
+        if !(step_size.is_finite() && step_size > 0.0) {
+            return Err(format!(
+                "SaeManifoldTerm::apply_newton_step: step_size must be finite and positive; got {step_size}"
+            ));
+        }
+        let n = self.n_obs();
+        let q = self.assignment.row_block_dim();
+        if delta_psi.len() != n * q {
+            return Err(format!(
+                "SaeManifoldTerm::apply_newton_step: delta_psi length {} != expected {}",
+                delta_psi.len(),
+                n * q
+            ));
+        }
+        if delta_beta.len() != self.beta_dim() {
+            return Err(format!(
+                "SaeManifoldTerm::apply_newton_step: delta_beta length {} != expected {}",
+                delta_beta.len(),
+                self.beta_dim()
+            ));
+        }
+
+        let k_atoms = self.k_atoms();
+        let coord_offsets = self.assignment.coord_offsets();
+        for row in 0..n {
+            let row_base = row * q;
+            for atom_idx in 0..k_atoms {
+                self.assignment.logits[[row, atom_idx]] +=
+                    step_size * delta_psi[row_base + atom_idx];
+            }
+        }
+
+        for atom_idx in 0..k_atoms {
+            let d = self.assignment.coords[atom_idx].latent_dim();
+            let mut delta_coord = Array1::<f64>::zeros(n * d);
+            for row in 0..n {
+                let row_base = row * q + coord_offsets[atom_idx];
+                for axis in 0..d {
+                    delta_coord[row * d + axis] = step_size * delta_psi[row_base + axis];
+                }
+            }
+            self.assignment.coords[atom_idx].retract_flat_delta(delta_coord.view());
+
+            // The FFI caller supplies basis values and jets at the current grid.
+            // Advance the stored basis by the same first-order model used by
+            // the Gauss-Newton arrow-Schur step.
+            let m = self.atoms[atom_idx].basis_size();
+            for row in 0..n {
+                for basis_col in 0..m {
+                    let mut dphi = 0.0;
+                    for axis in 0..d {
+                        dphi += self.atoms[atom_idx].basis_jacobian[[row, basis_col, axis]]
+                            * delta_coord[row * d + axis];
+                    }
+                    self.atoms[atom_idx].basis_values[[row, basis_col]] += dphi;
+                }
+            }
+        }
+
+        let mut beta = self.flatten_beta();
+        for idx in 0..beta.len() {
+            beta[idx] += step_size * delta_beta[idx];
+        }
+        self.set_flat_beta(beta.view())
+    }
+
+    pub fn run_joint_fit_arrow_schur(
+        &mut self,
+        z: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        max_iter: usize,
+        step_size: f64,
+        ridge_psi: f64,
+        ridge_beta: f64,
+    ) -> Result<SaeManifoldLoss, String> {
+        for _ in 0..max_iter {
+            let (delta_psi, delta_beta) = self
+                .solve_newton_step(z, rho, ridge_psi, ridge_beta)
+                .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+            self.apply_newton_step(delta_psi.view(), delta_beta.view(), step_size)?;
+        }
+        self.loss(z, rho)
+    }
+
     /// Build the analytic-penalty descriptors that correspond to the current
     /// SAE term. This is the bridge into `analytic_penalties.rs` for callers
     /// that want to register the same ρ axes with a REML driver.
@@ -1006,6 +1096,37 @@ pub fn term_from_padded_blocks(
     coords: &[Array2<f64>],
     temperature: f64,
 ) -> Result<SaeManifoldTerm, String> {
+    term_from_padded_blocks_with_mode(
+        n_obs,
+        p_out,
+        basis_kinds,
+        basis_values,
+        basis_jacobian,
+        basis_sizes,
+        latent_dims,
+        decoder_coefficients,
+        smooth_penalties,
+        logits,
+        coords,
+        AssignmentMode::softmax(temperature),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn term_from_padded_blocks_with_mode(
+    n_obs: usize,
+    p_out: usize,
+    basis_kinds: &[SaeAtomBasisKind],
+    basis_values: ArrayView3<'_, f64>,
+    basis_jacobian: ArrayView4<'_, f64>,
+    basis_sizes: &[usize],
+    latent_dims: &[usize],
+    decoder_coefficients: ArrayView3<'_, f64>,
+    smooth_penalties: ArrayView3<'_, f64>,
+    logits: ArrayView2<'_, f64>,
+    coords: &[Array2<f64>],
+    mode: AssignmentMode,
+) -> Result<SaeManifoldTerm, String> {
     let k_atoms = basis_sizes.len();
     if latent_dims.len() != k_atoms || basis_kinds.len() != k_atoms || coords.len() != k_atoms {
         return Err("term_from_padded_blocks: K-length metadata mismatch".into());
@@ -1034,7 +1155,6 @@ pub fn term_from_padded_blocks(
             s,
         )?);
     }
-    let assignment =
-        SaeAssignment::from_blocks_with_no_gauge(logits.to_owned(), coords.to_vec(), temperature)?;
+    let assignment = SaeAssignment::from_blocks_with_mode(logits.to_owned(), coords.to_vec(), mode)?;
     SaeManifoldTerm::new(atoms, assignment)
 }

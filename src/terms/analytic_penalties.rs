@@ -56,16 +56,15 @@
 //! | IBP       | ψ (logits)  | 0 or 1 (log α)       |
 //! | ARD       | ψ (latent t)| d (one per axis)     |
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
 use std::sync::Arc;
 
 use crate::terms::basis::{
     BasisError, DuchonNullspaceOrder, duchon_radial_first_derivative_nd,
     duchon_radial_second_derivative_nd, duchon_radial_third_derivative_nd,
 };
-use crate::terms::latent_coord::LatentCoordValues;
 use crate::terms::penalty_op::PenaltyOp;
-use crate::terms::smooth::{BlockwisePenalty, PenaltyStructureHint};
+use crate::terms::smooth::BlockwisePenalty;
 
 // ---------------------------------------------------------------------------
 // Common trait
@@ -97,6 +96,7 @@ pub struct PsiSlice {
 }
 
 impl PsiSlice {
+    #[must_use]
     pub fn full(len: usize, latent_dim: Option<usize>) -> Self {
         Self {
             range: 0..len,
@@ -295,57 +295,6 @@ impl WeightField {
         m
     }
 
-    /// Apply `W_n J_n v_n = U_n (U_n^T J_n v_n)` for row `n`, returning a
-    /// length-`p` vector. Used by `hvp` to avoid materializing `J^T W J`
-    /// as a `d × d` block when the path through `U` is cheaper. Not used by
-    /// the current implementation (kept for future low-rank HVP).
-    #[allow(dead_code)]
-    fn apply_w_jacobian_vec(
-        u_row: Option<&[f64]>,
-        jac_row: &[f64],
-        v_row: &[f64],
-        p: usize,
-        d: usize,
-        rank: usize,
-    ) -> Array1<f64> {
-        match u_row {
-            None => {
-                // W = I: out_i = Σ_a J[i, a] · v_a.
-                let mut out = Array1::<f64>::zeros(p);
-                for i in 0..p {
-                    let mut s = 0.0;
-                    for a in 0..d {
-                        s += jac_row[i * d + a] * v_row[a];
-                    }
-                    out[i] = s;
-                }
-                out
-            }
-            Some(u) => {
-                // m_k = Σ_{i,a} U[i, k] J[i, a] v_a    (length rank)
-                // out_i = Σ_k U[i, k] · m_k             (length p)
-                let mut m = Array1::<f64>::zeros(rank);
-                for k in 0..rank {
-                    let mut s = 0.0;
-                    for i in 0..p {
-                        for a in 0..d {
-                            s += u[i * rank + k] * jac_row[i * d + a] * v_row[a];
-                        }
-                    }
-                    m[k] = s;
-                }
-                let mut out = Array1::<f64>::zeros(p);
-                for i in 0..p {
-                    let mut s = 0.0;
-                    for k in 0..rank {
-                        s += u[i * rank + k] * m[k];
-                    }
-                    out[i] = s;
-                }
-                out
-            }
-        }
-    }
 }
 
 /// Isometry-to-reference penalty (canonical-coordinate gauge term).
@@ -445,6 +394,7 @@ pub struct IsometryPenalty {
 impl IsometryPenalty {
     pub const DEFAULT_VALUE_ON_MISSING_CACHE: f64 = 0.0;
 
+    #[must_use]
     pub fn new_euclidean(target: PsiSlice, p_out: usize) -> Self {
         Self {
             target,
@@ -464,21 +414,25 @@ impl IsometryPenalty {
     /// row-major as `(n_obs, p * d * d * d)`. The Hessian-vector product
     /// uses the full residual-curvature term in addition to the metric
     /// Gauss-Newton piece.
+    #[must_use]
     pub fn with_third_decoder_derivative(mut self, k: Arc<ndarray::Array3<f64>>) -> Self {
         self.cache_third_decoder_derivative = Some(k);
         self
     }
 
+    #[must_use]
     pub fn with_reference(mut self, reference: IsometryReference) -> Self {
         self.reference = reference;
         self
     }
 
+    #[must_use]
     pub fn with_jacobian_cache(mut self, j: Arc<Array2<f64>>) -> Self {
         self.jacobian_cache = Some(j);
         self
     }
 
+    #[must_use]
     pub fn with_jacobian_second_cache(mut self, h: Arc<Array2<f64>>) -> Self {
         self.jacobian_second_cache = Some(h);
         self
@@ -490,6 +444,7 @@ impl IsometryPenalty {
     /// evaluate `grad_target(t)`, then central-difference `value(t ± h e_j)`;
     /// the analytic component should agree to finite-difference tolerance as
     /// `h` is refined before cancellation dominates.
+    #[must_use]
     pub fn with_duchon_radial_source(
         mut self,
         source: Arc<IsometryDuchonRadialSource>,
@@ -501,6 +456,7 @@ impl IsometryPenalty {
     /// Attach a per-row behavioral metric in low-rank factored form
     /// (`W_n = U_n U_n^T`). The contraction-order invariant is enforced by
     /// the per-row builder `M_n = U_n^T J_n`; see [`WeightField`].
+    #[must_use]
     pub fn with_weight(mut self, weight: WeightField) -> Self {
         self.weight = weight;
         self
@@ -1216,6 +1172,7 @@ pub struct SoftmaxAssignmentSparsityPenalty {
 }
 
 impl SoftmaxAssignmentSparsityPenalty {
+    #[must_use]
     pub fn new(k_atoms: usize, temperature: f64) -> Self {
         debug_assert!(k_atoms > 0);
         debug_assert!(temperature > 0.0);
@@ -1362,6 +1319,7 @@ pub struct IBPAssignmentPenalty {
 }
 
 impl IBPAssignmentPenalty {
+    #[must_use]
     pub fn new(k_max: usize, alpha: f64, tau: f64, learnable_alpha: bool) -> Self {
         debug_assert!(k_max > 0);
         debug_assert!(alpha.is_finite() && alpha > 0.0);
@@ -1513,6 +1471,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
 }
 
 impl SparsityPenalty {
+    #[must_use]
     pub fn smoothed_l1(target_tier: PenaltyTier, eps: f64) -> Self {
         assert!(
             eps.is_finite() && eps > 0.0,
@@ -1528,6 +1487,7 @@ impl SparsityPenalty {
         }
     }
 
+    #[must_use]
     pub fn log(target_tier: PenaltyTier, delta: f64) -> Self {
         assert!(
             delta.is_finite() && delta > 0.0,
@@ -1545,6 +1505,7 @@ impl SparsityPenalty {
 
     /// Hoyer scale-invariant sparsifier. Requires a target of length > 1
     /// because the normalized form divides by `sqrt(n) - 1`.
+    #[must_use]
     pub fn hoyer(target_tier: PenaltyTier) -> Self {
         Self {
             target_tier,
@@ -1554,6 +1515,7 @@ impl SparsityPenalty {
         }
     }
 
+    #[must_use]
     pub fn with_eps_reml(mut self, eps_rho_index: usize) -> Self {
         self.eps_rho_index = Some(eps_rho_index);
         self
@@ -1892,6 +1854,7 @@ pub struct ARDPenalty {
 }
 
 impl ARDPenalty {
+    #[must_use]
     pub fn new(target: PsiSlice, latent_dim: usize) -> Self {
         debug_assert!(latent_dim > 0, "ARDPenalty requires latent_dim > 0");
         let n_obs = if latent_dim == 0 {
@@ -1912,6 +1875,7 @@ impl ARDPenalty {
     /// term (default: `target.len() / latent_dim`). Pass the number of
     /// latent rows that actually contribute to axis `j` (uniform across
     /// axes for the current implementation).
+    #[must_use]
     pub fn with_n_eff(mut self, n_eff: f64) -> Self {
         assert!(
             n_eff.is_finite() && n_eff >= 0.0,
@@ -2047,6 +2011,7 @@ pub struct AnalyticPenaltyOp {
 }
 
 impl AnalyticPenaltyOp {
+    #[must_use]
     pub fn new(penalty: Arc<dyn AnalyticPenalty>) -> Self {
         Self { penalty }
     }
@@ -2188,6 +2153,7 @@ pub struct AnalyticPenaltyRegistry {
 }
 
 impl AnalyticPenaltyRegistry {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -2240,6 +2206,7 @@ pub struct FrozenAnalyticPenaltyOp {
 }
 
 impl FrozenAnalyticPenaltyOp {
+    #[must_use]
     pub fn new(penalty: AnalyticPenaltyKind, target: Array1<f64>, rho: Array1<f64>) -> Self {
         Self {
             penalty,
@@ -2362,21 +2329,10 @@ impl FrozenAnalyticPenaltyOp {
 impl AnalyticPenaltyKind {
     /// Freeze this kind at `(target, rho)` and return an `Arc<dyn PenaltyOp>`
     /// ready to slot into `BlockwisePenalty::with_op` or `PenaltyForm::Operator`.
+    #[must_use]
     pub fn freeze(&self, target: Array1<f64>, rho: Array1<f64>) -> Arc<dyn PenaltyOp> {
         Arc::new(FrozenAnalyticPenaltyOp::new(self.clone(), target, rho))
     }
-}
-
-// Suppress unused-import warnings on items that downstream wiring will pull
-// in soon (PenaltyStructureHint, ArrayView2, Axis, LatentCoordValues,
-// AnalyticPenaltyOp) without breaking strict builds.
-#[allow(dead_code)]
-fn _silence_unused_imports() {
-    let _: Option<PenaltyStructureHint> = None;
-    let _: Option<ArrayView2<'static, f64>> = None;
-    let _ = Axis(0);
-    let _ = std::mem::size_of::<LatentCoordValues>();
-    let _ = std::mem::size_of::<AnalyticPenaltyOp>();
 }
 
 // ---------------------------------------------------------------------------
