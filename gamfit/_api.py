@@ -2185,12 +2185,19 @@ def gaussian_reml_fit_latent_backward(
     aux_family: str = "ridge",
     aux_strength: float | None = None,
     dim_selection_log_precision: Any | None = None,
+    basis_kind: str = "duchon",
+    sigma_eff_mode: str = "profiled",
 ) -> dict[str, Any]:
     """Backward / adjoint companion to :func:`gaussian_reml_fit_latent`.
 
     Returns the standard REML adjoint gradients (``grad_y``,
-    ``grad_penalty``, ``grad_weights``) plus the flat latent gradient
-    ``grad_t`` of length ``n_obs * latent_dim``.
+    ``grad_penalty``, ``grad_weights``) plus the latent gradient
+    ``grad_t`` with shape ``(n_obs, latent_dim)``.
+
+    ``sigma_eff_mode`` selects the dispersion convention for the analytic
+    outer REML latent gradient. The default ``"profiled"`` matches the
+    existing REML objective; ``"fixed"`` is accepted for the fixed-dispersion
+    call shape.
 
     ``grad_t`` includes the additive identifiability-mode contributions
     (auxiliary-prior pullback and/or ARD per-axis ridge); the outer
@@ -2222,6 +2229,8 @@ def gaussian_reml_fit_latent_backward(
             None
             if dim_selection_log_precision is None
             else _numeric_vector(dim_selection_log_precision, "dim_selection_log_precision"),
+            str(basis_kind),
+            str(sigma_eff_mode),
         )
     except Exception as exc:
         raise map_exception(exc) from exc

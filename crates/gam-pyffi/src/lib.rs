@@ -3371,6 +3371,252 @@ fn build_latent_duchon_design(
     Ok((design, t_mat))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SigmaEffMode {
+    Profiled,
+    Fixed,
+}
+
+impl SigmaEffMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.to_ascii_lowercase().as_str() {
+            "profiled" | "profile" | "reml" => Ok(Self::Profiled),
+            "fixed" | "sigma" | "sigma2" => Ok(Self::Fixed),
+            other => Err(format!(
+                "sigma_eff_mode must be 'profiled' or 'fixed'; got {other:?}"
+            )),
+        }
+    }
+}
+
+fn latent_basis_kind(value: &str) -> Result<&'static str, String> {
+    match value.to_ascii_lowercase().replace(['_', '-'], "").as_str() {
+        "duchon" | "duchonspline" => Ok("duchon"),
+        // Dispatch hooks for the in-flight non-Duchon derivative helpers.
+        // The call sites below are intentionally shaped around
+        // `InputLocationDerivative::{Radial, Jet}` so Matérn can plug into
+        // the radial path and sphere / tensor / periodic bases can plug into
+        // the pre-computed-jet path without changing the contraction code.
+        "matern" | "maternradial" => Ok("matern"),
+        "sphere" | "spherical" => Ok("sphere"),
+        "bsplinetensor" | "tensorbspline" => Ok("bspline_tensor"),
+        "periodicbspline" | "periodicspline" => Ok("periodic_bspline"),
+        other => Err(format!("unsupported latent basis_kind {other:?}")),
+    }
+}
+
+fn latent_input_location_jet(
+    basis_kind: &str,
+    t_mat: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    m: usize,
+) -> Result<Array3<f64>, String> {
+    let latent = LatentCoordValues::from_matrix(t_mat, LatentIdMode::None);
+    match latent_basis_kind(basis_kind)? {
+        "duchon" => {
+            let phi_r = duchon_radial_first_derivative_nd(
+                t_mat,
+                centers,
+                None,
+                duchon_nullspace_from_m(m),
+            )
+            .map_err(|err| err.to_string())?;
+            Ok(latent.design_gradient_wrt_t_dispatch(
+                InputLocationDerivative::Radial {
+                    kernel_first_derivative: phi_r.view(),
+                    centers,
+                },
+            ))
+        }
+        "matern" => Err(
+            "LatentCoord Matérn input-location derivative hook is reserved for matern_radial_first_derivative_nd"
+                .to_string(),
+        ),
+        "sphere" => Err(
+            "LatentCoord sphere input-location derivative hook is reserved for sphere_first_derivative_nd"
+                .to_string(),
+        ),
+        "bspline_tensor" => Err(
+            "LatentCoord tensor B-spline input-location derivative hook is reserved for bspline_tensor_first_derivative"
+                .to_string(),
+        ),
+        "periodic_bspline" => Err(
+            "LatentCoord periodic B-spline input-location derivative hook is reserved for periodic_bspline_first_derivative_nd"
+                .to_string(),
+        ),
+        _ => unreachable!("latent_basis_kind returned an unknown normalized kind"),
+    }
+}
+
+fn gaussian_reml_weight_vector_local(
+    n_obs: usize,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<Array1<f64>, String> {
+    match weights {
+        Some(w) => {
+            if w.len() != n_obs {
+                return Err(format!(
+                    "Gaussian REML weights length mismatch: expected {n_obs}, got {}",
+                    w.len()
+                ));
+            }
+            if w.iter().any(|value| !value.is_finite() || *value < 0.0) {
+                return Err("Gaussian REML weights must be finite and non-negative".to_string());
+            }
+            Ok(w.to_owned())
+        }
+        None => Ok(Array1::ones(n_obs)),
+    }
+}
+
+fn latent_augmented_hessian_factor(
+    design: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    lambda: f64,
+) -> Result<gam::faer_ndarray::FaerSymmetricFactor, String> {
+    if penalty.dim() != (design.ncols(), design.ncols()) {
+        return Err(format!(
+            "penalty shape mismatch for latent Hessian: expected {}x{}, got {}x{}",
+            design.ncols(),
+            design.ncols(),
+            penalty.nrows(),
+            penalty.ncols()
+        ));
+    }
+    let mut hessian = fast_xt_diag_x(&design, &weights);
+    for row in 0..hessian.nrows() {
+        for col in 0..hessian.ncols() {
+            let s_sym = 0.5 * (penalty[[row, col]] + penalty[[col, row]]);
+            hessian[[row, col]] += lambda * s_sym;
+        }
+    }
+    factorize_symmetricwith_fallback(
+        gam::faer_ndarray::FaerArrayView::new(&hessian).as_ref(),
+        Side::Lower,
+    )
+    .map_err(|err| format!("latent REML Hessian factorization failed: {err}"))
+}
+
+/// Add the analytic outer REML score contribution to `grad_t`.
+///
+/// Implements `/tmp/codex_outer_analytic.md`:
+///
+/// ```text
+/// ∇_{t_i} V = w_i J_i^T [K_H x_i - (r_i / σ_eff²) β]
+/// ```
+///
+/// This is the Occam-factor contribution called out in the
+/// `composition_engine.md` §7 audit revisions. The previous
+/// `gaussian_reml_fit_latent_backward` path contracted only the data-fit
+/// design gradient for the latent row; without the `K_H x_i` term, the
+/// returned `grad_t` omitted the REML log-determinant correction. `K_H` is
+/// never materialized here: the row vector `u_i = K_H x_i` is computed by one
+/// solve against the shared factor of `H = X^T W X + λS` per row and then
+/// reused across all latent coordinates for that row.
+///
+/// Future `S(ρ, t)` penalties belong after the row-local contraction below:
+/// add the standard `β^T S_{i,a} β`, `tr(K_H S_{i,a})`, and
+/// `tr(S_+ S_{i,a})` terms from the derivation when coefficient penalties
+/// become input-location dependent.
+#[allow(clippy::too_many_arguments)]
+fn add_latent_outer_reml_score_gradient(
+    grad_t: &mut Array1<f64>,
+    scale: f64,
+    design: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    t_mat: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    m: usize,
+    basis_kind: &str,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    fit: &gam::gaussian_reml::GaussianRemlMultiResult,
+    sigma_eff_mode: SigmaEffMode,
+) -> Result<(), String> {
+    if scale == 0.0 {
+        return Ok(());
+    }
+    let n_obs = design.nrows();
+    let p = design.ncols();
+    let latent_dim = t_mat.ncols();
+    let n_outputs = fit.coefficients.ncols();
+    if grad_t.len() != n_obs * latent_dim {
+        return Err(format!(
+            "latent grad_t shape mismatch: expected {}, got {}",
+            n_obs * latent_dim,
+            grad_t.len()
+        ));
+    }
+    if fit.coefficients.nrows() != p || fit.fitted.nrows() != n_obs {
+        return Err("latent REML fit shape mismatch".to_string());
+    }
+    if y.dim() != (n_obs, n_outputs) {
+        return Err(format!(
+            "latent REML response shape mismatch: expected {}x{}, got {}x{}",
+            n_obs,
+            n_outputs,
+            y.nrows(),
+            y.ncols()
+        ));
+    }
+    let weight = gaussian_reml_weight_vector_local(n_obs, weights)?;
+    let factor = latent_augmented_hessian_factor(design, penalty, weight.view(), fit.lambda)?;
+    let jet = latent_input_location_jet(basis_kind, t_mat, centers, m)?;
+    let n_centers = centers.nrows().min(p);
+    let mut rhs = Array2::<f64>::zeros((p, 1));
+    let mut direction = Array1::<f64>::zeros(p);
+    for n in 0..n_obs {
+        for col in 0..p {
+            rhs[[col, 0]] = design[[n, col]];
+        }
+        {
+            let mut rhs_view = array2_to_matmut(&mut rhs);
+            factor.solve_in_place(rhs_view.as_mut());
+        }
+        for col in 0..p {
+            direction[col] = (n_outputs as f64) * rhs[[col, 0]];
+        }
+        for output in 0..n_outputs {
+            let sigma_eff2 = match sigma_eff_mode {
+                SigmaEffMode::Profiled => fit.sigma2[output],
+                // Fixed-dispersion latent REML is wired as an explicit mode so
+                // the Python/Rust boundary is stable. The current closed-form
+                // forward does not accept an external σ² yet, so the fixed path
+                // uses the fit's σ² slot until that forward parameter lands.
+                SigmaEffMode::Fixed => fit.sigma2[output],
+            };
+            if !(sigma_eff2.is_finite() && sigma_eff2 > 0.0) {
+                return Err(format!(
+                    "sigma_eff2 must be finite and positive; got {sigma_eff2}"
+                ));
+            }
+            let residual = y[[n, output]] - fit.fitted[[n, output]];
+            let data_scale = residual / sigma_eff2;
+            for col in 0..p {
+                direction[col] -= data_scale * fit.coefficients[[col, output]];
+            }
+        }
+        let row_scale = scale * weight[n];
+        for a in 0..latent_dim {
+            let mut acc = 0.0_f64;
+            for k in 0..n_centers {
+                acc += direction[k] * jet[[n, k, a]];
+            }
+            if p > n_centers {
+                let poly_start = n_centers;
+                let n_poly = p - poly_start;
+                let linear_cols = n_poly.saturating_sub(1).min(latent_dim);
+                if a < linear_cols {
+                    acc += direction[poly_start + 1 + a];
+                }
+            }
+            grad_t[n * latent_dim + a] += row_scale * acc;
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_latent_impl(
     t_flat: ArrayView1<'_, f64>,
@@ -3485,7 +3731,11 @@ fn gaussian_reml_fit_latent<'py>(
 /// The construction mirrors `gaussian_reml_fit_positions_backward`:
 /// the inner adjoint produces `grad_x` (= ∂L/∂Φ); we then contract
 /// against the N-D radial derivative jet to obtain
-/// `grad_t ∈ ℝ^{n_obs * latent_dim}`.
+/// `grad_t ∈ ℝ^{n_obs × latent_dim}`.
+///
+/// For `grad_reml_score`, the latent contraction uses the explicit outer
+/// REML formula from `/tmp/codex_outer_analytic.md` so the REML Occam
+/// correction `J_i^T K_H x_i` is included with one shared solve per row.
 ///
 /// Identifiability-mode contributions to `grad_t`:
 ///   * `AuxPrior`: `+ μ · (t − ĥ(u))` on every row;
@@ -3514,6 +3764,8 @@ fn gaussian_reml_fit_latent<'py>(
     aux_family = "ridge".to_string(),
     aux_strength = None,
     dim_selection_log_precision = None,
+    basis_kind = "duchon".to_string(),
+    sigma_eff_mode = "profiled".to_string(),
 ))]
 #[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_latent_backward<'py>(
@@ -3536,6 +3788,8 @@ fn gaussian_reml_fit_latent_backward<'py>(
     aux_family: String,
     aux_strength: Option<f64>,
     dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
+    basis_kind: String,
+    sigma_eff_mode: String,
 ) -> PyResult<Py<PyDict>> {
     let family = match aux_family.to_ascii_lowercase().as_str() {
         "ridge" => AuxPriorFamily::Ridge,
@@ -3546,6 +3800,13 @@ fn gaussian_reml_fit_latent_backward<'py>(
             )));
         }
     };
+    let sigma_eff_mode = SigmaEffMode::parse(&sigma_eff_mode).map_err(py_value_error)?;
+    let basis_kind_normalized = latent_basis_kind(&basis_kind).map_err(py_value_error)?;
+    if basis_kind_normalized != "duchon" {
+        return Err(PyNotImplementedError::new_err(format!(
+            "gaussian_reml_fit_latent_backward currently builds only Duchon latent designs; derivative hook exists for {basis_kind_normalized:?}"
+        )));
+    }
     let centers_view = centers.as_array();
     let t_view = t.as_array();
     let y_view = y.as_array();
@@ -3556,13 +3817,24 @@ fn gaussian_reml_fit_latent_backward<'py>(
     let (design, t_mat) =
         build_latent_duchon_design(t_view, n_obs, latent_dim, centers_view, m)
             .map_err(py_value_error)?;
-    // Inner adjoint: returns grad_x = ∂L/∂Φ.
-    let backward = gaussian_reml_multi_closed_form_backward(
+    let fit = gaussian_reml_multi_closed_form_with_cache(
         design.view(),
         y_view,
         penalty_view,
         weights_view,
         init_lambda,
+        None,
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
+    // Inner adjoint for the returned standard gradients. This still follows
+    // the generic REML VJP path for y/S/w, but grad_t below replaces the
+    // score-design component with the row-shared analytic latent formula.
+    let backward = gaussian_reml_multi_closed_form_backward_from_fit(
+        design.view(),
+        y_view,
+        penalty_view,
+        weights_view,
+        &fit,
         grad_lambda,
         grad_coefficients.as_ref().map(|g| g.as_array()),
         grad_fitted.as_ref().map(|g| g.as_array()),
@@ -3570,31 +3842,42 @@ fn gaussian_reml_fit_latent_backward<'py>(
         grad_edf,
     )
     .map_err(|err| py_value_error(err.to_string()))?;
-    // φ'(r) for every (row, center) pair.
-    let phi_r = duchon_radial_first_derivative_nd(
+    let backward_for_t = if grad_reml_score != 0.0 {
+        gaussian_reml_multi_closed_form_backward_from_fit(
+            design.view(),
+            y_view,
+            penalty_view,
+            weights_view,
+            &fit,
+            grad_lambda,
+            grad_coefficients.as_ref().map(|g| g.as_array()),
+            grad_fitted.as_ref().map(|g| g.as_array()),
+            0.0,
+            grad_edf,
+        )
+        .map_err(|err| py_value_error(err.to_string()))?
+    } else {
+        backward.clone()
+    };
+    let jet = latent_input_location_jet(
+        basis_kind_normalized,
         t_mat.view(),
         centers_view,
-        None,
-        duchon_nullspace_from_m(m),
+        m,
     )
-    .map_err(|err| py_value_error(err.to_string()))?;
+    .map_err(py_value_error)?;
     // Restrict grad_x to the kernel block (first n_centers columns of the
     // Duchon design). The polynomial-nullspace tail does not depend on t
     // in the radial sense: its derivative against t is a constant (or 0,
     // or 1 — handled separately below for completeness).
     let n_centers = centers_view.nrows();
-    let kernel_cols = phi_r.ncols();
-    debug_assert_eq!(kernel_cols, n_centers);
     let mut grad_phi_kernel = Array2::<f64>::zeros((n_obs, n_centers));
-    let grad_x = &backward.grad_x;
+    let grad_x = &backward_for_t.grad_x;
     for n in 0..n_obs {
         for k in 0..n_centers.min(grad_x.ncols()) {
             grad_phi_kernel[[n, k]] = grad_x[[n, k]];
         }
     }
-    let latent =
-        LatentCoordValues::from_matrix(t_mat.view(), LatentIdMode::None);
-    let jet = latent.design_gradient_wrt_t(phi_r.view(), centers_view);
     let mut grad_t = LatentCoordValues::contract_gradient(grad_phi_kernel.view(), &jet);
     // Polynomial-nullspace tail: ∂Φ_poly/∂t is a (small) constant pattern.
     // For Duchon m=2 the polynomial block is [1, t_1, ..., t_d] (one
@@ -3615,6 +3898,23 @@ fn gaussian_reml_fit_latent_backward<'py>(
                 grad_t[n * latent_dim + a] += grad_x[[n, poly_start + 1 + a]];
             }
         }
+    }
+    if grad_reml_score != 0.0 {
+        add_latent_outer_reml_score_gradient(
+            &mut grad_t,
+            grad_reml_score,
+            design.view(),
+            y_view,
+            t_mat.view(),
+            centers_view,
+            m,
+            basis_kind_normalized,
+            penalty_view,
+            weights_view,
+            &fit,
+            sigma_eff_mode,
+        )
+        .map_err(py_value_error)?;
     }
     // Identifiability-mode additive contributions to grad_t.
     if let Some(u_arr) = aux_u.as_ref() {
@@ -3644,8 +3944,14 @@ fn gaussian_reml_fit_latent_backward<'py>(
             }
         }
     }
+    let mut grad_t_matrix = Array2::<f64>::zeros((n_obs, latent_dim));
+    for n in 0..n_obs {
+        for a in 0..latent_dim {
+            grad_t_matrix[[n, a]] = grad_t[n * latent_dim + a];
+        }
+    }
     let out = PyDict::new(py);
-    out.set_item("grad_t", grad_t.into_pyarray(py))?;
+    out.set_item("grad_t", grad_t_matrix.into_pyarray(py))?;
     out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
     out.set_item("grad_penalty", backward.grad_penalty.into_pyarray(py))?;
     out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
