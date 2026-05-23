@@ -1,39 +1,26 @@
 """SAE-manifold + Fisher-Rao W worked example.
 
-This demo composes two new primitives:
+Composes ``gamfit.sae_manifold_fit(..., assignment_prior="ibp_map", ...)``
+with ``fisher_W`` / ``fisher_w`` shaped ``(N, p, p)``. The IBP active-set
+piece follows Infinite GPFA / IBP-GPFA latent feature assignments
+(Doshi-Velez et al., 2009; Rai and Daume, 2009; Knowles and Ghahramani, 2011).
+The Fisher-Rao piece follows the behavioral-metric framing where directions
+are close when they have similar local output/logit effects.
 
-1. ``gamfit.sae_manifold_fit(..., assignment_prior="ibp_map", ...)``: an
-   IBP-style per-row binary active set, following the Infinite GPFA / IBP-GPFA
-   literature on latent feature assignments (Doshi-Velez et al., 2009; Rai and
-   Daume, 2009; Knowles and Ghahramani, 2011).
-2. ``fisher_W`` / ``fisher_w`` with shape ``(N, p, p)``: dense per-row output
-   Fisher blocks, following the Fisher-Rao behavioral-metric framing where two
-   directions are close when they have similar local output/logit effects.
-
-The audit-revised gauge story is that IBP fixes "which atoms are active for
-this row" while Fisher-Rao W fixes "which output directions are steerable".
-Composed, they recover behaviorally meaningful manifolds, not just tidy
-Euclidean geometry.
+Audit-revised gauge story: IBP fixes "which atoms are active for this row";
+Fisher-Rao W fixes "which output directions are steerable". Together they
+recover behaviorally meaningful manifolds, not just tidy Euclidean geometry.
 
 Run with a wheel exposing the high-level Fisher hook:
-
-    python sae_manifold_fisher_rao_demo.py
-
-Older wheels degrade cleanly: the plain IBP fit runs if available, and the
-Fisher comparison row is a null placeholder with a clear "needs v0.1.115"
-message.
+``python sae_manifold_fisher_rao_demo.py``. Older wheels get a null Fisher
+comparison row with a clear "needs v0.1.115" message.
 """
-
-from __future__ import annotations
-
 from dataclasses import dataclass
-import inspect
-import math
+import inspect, math
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-
 try:
     import gamfit
 except Exception as exc:  # pragma: no cover - example fallback path
@@ -45,17 +32,12 @@ else:
 
 @dataclass
 class Data:
-    z: np.ndarray
-    fisher_w: np.ndarray
-    labels: np.ndarray
+    z: np.ndarray; fisher_w: np.ndarray; labels: np.ndarray
 
 
 @dataclass
 class Report:
-    name: str
-    fit: Any | None
-    ok: bool
-    message: str
+    name: str; fit: Any | None; ok: bool; message: str
     mean_active: float = math.nan
     heldout_r2: float = math.nan
     reml_score: float = math.nan
@@ -186,12 +168,8 @@ def atom_topologies(fit: Any) -> list[str]:
     return out
 
 
-def heldout_anchor_r2(
-    fit: Any,
-    z_train: np.ndarray,
-    z_test: np.ndarray,
-    fisher_w_test: np.ndarray | None,
-) -> float:
+def heldout_anchor_r2(fit: Any, z_train: np.ndarray, z_test: np.ndarray,
+                      fisher_w_test: np.ndarray | None) -> float:
     """Nearest-anchor R2 because current SAE-manifold fits are row-coordinate fits."""
 
     diff = z_test[:, None, :] - z_train[None, :, :]
@@ -205,14 +183,8 @@ def heldout_anchor_r2(
     return 1.0 - ss_res / max(ss_tot, 1e-12)
 
 
-def summarize(
-    name: str,
-    fit: Any | None,
-    message: str,
-    z_train: np.ndarray,
-    z_test: np.ndarray,
-    fisher_w_test: np.ndarray | None,
-) -> Report:
+def summarize(name: str, fit: Any | None, message: str, z_train: np.ndarray,
+              z_test: np.ndarray, fisher_w_test: np.ndarray | None) -> Report:
     if fit is None:
         return Report(name, None, False, message)
     return Report(
