@@ -3402,11 +3402,11 @@ fn t_matrix_from_flat(
     Ok(t_mat)
 }
 
-fn split_tensor_knot_views<'a>(
-    knots_concat: ArrayView1<'a, f64>,
+fn split_tensor_knots_owned(
+    knots_concat: ArrayView1<'_, f64>,
     knot_offsets: &[usize],
     n_axes: usize,
-) -> Result<Vec<ArrayView1<'a, f64>>, String> {
+) -> Result<Vec<Array1<f64>>, String> {
     if knot_offsets.len() != n_axes + 1 {
         return Err(format!(
             "tensor B-spline knot_offsets must have length n_axes + 1 = {}, got {}",
@@ -3425,7 +3425,7 @@ fn split_tensor_knot_views<'a>(
                 knots_concat.len()
             ));
         }
-        per_axis.push(knots_concat.slice(s![lo..hi]));
+        per_axis.push(knots_concat.slice(s![lo..hi]).to_owned());
     }
     Ok(per_axis)
 }
@@ -3446,11 +3446,15 @@ fn build_latent_tensor_bspline_design(
         ));
     }
     let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
-    let knots_per_axis = split_tensor_knot_views(knots_concat, knot_offsets, latent_dim)?;
+    let knots_per_axis = split_tensor_knots_owned(knots_concat, knot_offsets, latent_dim)?;
+    let knot_views = knots_per_axis
+        .iter()
+        .map(|knots| knots.view())
+        .collect::<Vec<_>>();
     let mut k_per_axis = Vec::<usize>::with_capacity(latent_dim);
     let mut total_cols = 1usize;
     for axis in 0..latent_dim {
-        let k = knots_per_axis[axis]
+        let k = knot_views[axis]
             .len()
             .checked_sub(degrees[axis] + 1)
             .ok_or_else(|| {
@@ -3476,7 +3480,7 @@ fn build_latent_tensor_bspline_design(
         for axis in 0..latent_dim {
             evaluate_bspline_basis_scalar(
                 t_mat[[n, axis]],
-                knots_per_axis[axis],
+                knot_views[axis],
                 degrees[axis],
                 &mut values_per_axis[axis],
                 &mut scratch[axis],
@@ -3624,8 +3628,12 @@ fn latent_input_location_jet(
             let degrees = tensor_degrees.ok_or_else(|| {
                 "tensor B-spline latent derivative requires degrees".to_string()
             })?;
-            let per_axis = split_tensor_knot_views(knots, offsets, t_mat.ncols())?;
-            let jet = bspline_tensor_first_derivative(t_mat, &per_axis, degrees)
+            let per_axis = split_tensor_knots_owned(knots, offsets, t_mat.ncols())?;
+            let per_axis_views = per_axis
+                .iter()
+                .map(|axis_knots| axis_knots.view())
+                .collect::<Vec<_>>();
+            let jet = bspline_tensor_first_derivative(t_mat, &per_axis_views, degrees)
                 .map_err(|err| err.to_string())?;
             Ok(latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Jet(
                 jet.view(),
@@ -5164,7 +5172,7 @@ fn gaussian_reml_fit_latent_backward<'py>(
                         "tensor B-spline latent backward requires knots_concat".to_string(),
                     )
                 })?;
-            let per_axis = split_tensor_knot_views(
+            let per_axis = split_tensor_knots_owned(
                 knots,
                 tensor_knot_offsets.as_deref().ok_or_else(|| {
                     py_value_error(
@@ -5174,10 +5182,14 @@ fn gaussian_reml_fit_latent_backward<'py>(
                 latent_dim,
             )
             .map_err(py_value_error)?;
+            let per_axis_views = per_axis
+                .iter()
+                .map(|axis_knots| axis_knots.view())
+                .collect::<Vec<_>>();
             let degrees = tensor_degrees.as_deref().ok_or_else(|| {
                 py_value_error("tensor B-spline latent backward requires degrees".to_string())
             })?;
-            let jet = bspline_tensor_first_derivative(t_mat.view(), &per_axis, degrees)
+            let jet = bspline_tensor_first_derivative(t_mat.view(), &per_axis_views, degrees)
                 .map_err(|err| py_value_error(err.to_string()))?;
             LatentCoordValues::contract_gradient(grad_x.view(), &jet)
         }
