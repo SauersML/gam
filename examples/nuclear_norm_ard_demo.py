@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """NuclearNormPenalty + ARDPenalty worked example.
 
-Motivation: per [[project_ard_gauge_fix_doesnt_help_cogito]], ARDPenalty alone
+Motivation: per [[project_ard_gauge_fix_doesnt_help_cogito]], ARDPenalty
 shrinks per-canonical-axis variance and failed on cogito because the prior is
-rotation-invariant and signal spread across all dims. NuclearNormPenalty
-penalizes singular values directly: basis-free low rank without needing the
-canonical basis to align with the active subspace. The pair tests whether
-NuclearNorm can find the intrinsic-rank subspace and ARD can then prune exact
-axes inside it. See ``docs/composition_engine.md#analytic-primitives``; this
-checkout has ARD/Orthogonality rows there, while NuclearNorm is documented in
+rotation-invariant and signal spread across all dims. NuclearNormPenalty is a
+basis-free singular-value penalty: it encourages low rank without canonical
+axis alignment. The pair tests whether NuclearNorm can find the intrinsic-rank
+subspace and ARD can prune exact axes inside it. See
+``docs/composition_engine.md#analytic-primitives``; this checkout has
+ARD/Orthogonality rows there, while NuclearNorm is documented in
 ``gamfit/_penalties.py`` until the primitives-table row lands.
 
 The demo embeds an 8D latent in a 16D ambient space with three active singular
@@ -21,7 +21,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import warnings
-
 import numpy as np
 
 
@@ -112,7 +111,6 @@ def plot_reports(reports: list[FitReport]) -> None:
     except ModuleNotFoundError as exc:
         warnings.warn(f"matplotlib unavailable; numeric demo completed without plot: {exc}")
         return
-
     fig, axes = plt.subplots(2, 2, figsize=(12.0, 7.0), constrained_layout=True)
     for ax, report in zip(axes.flat, reports):
         xs = np.arange(D)
@@ -128,7 +126,6 @@ def plot_reports(reports: list[FitReport]) -> None:
     axes.flat[2].set_ylabel("normalized magnitude")
     fig.savefig(FIG_PATH, dpi=160)
     plt.close(fig)
-
 def fmt(vals: np.ndarray) -> str:
     return "[" + ", ".join("~0" if v < 0.01 else f"{v:.2f}" for v in vals) + "]"
 
