@@ -199,7 +199,10 @@ impl<'a> LowRankWeight<'a> {
             ));
         }
         // Xᵀ (D y)
-        let dy: Array1<f64> = (&self.diag.to_owned()) * (&y.to_owned());
+        let mut dy = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            dy[i] = self.diag[i] * y[i];
+        }
         let mut out = design.transpose_vector_multiply(&dy);
 
         if !self.is_rank_zero() {
@@ -342,7 +345,7 @@ mod tests {
             [0.6, -0.3, 0.8],
             [0.2, 0.9, -0.5],
         ];
-        DesignMatrix::from_array(x)
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x))
     }
 
     /// Reference dense weight `W = diag(d) + u vᵀ`.

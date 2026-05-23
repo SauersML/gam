@@ -3642,7 +3642,20 @@ pub(crate) enum RadialScalarKind {
 
 impl RadialScalarKind {
     /// Evaluate the `(phi, q, t)` radial scalars for a given distance `r`.
-    fn eval_design_triplet(&self, r: f64) -> Result<(f64, f64, f64), BasisError> {
+    ///
+    /// `q = φ'(r)/r` and `t = (φ''(r) - q)/r²` (with the appropriate
+    /// finite limits at `r → 0`). This is exactly the scalar pair needed
+    /// to assemble the first and second derivatives of `Φ(t) = φ(‖t − c‖)`
+    /// with respect to the input location `t`:
+    ///
+    /// ```text
+    /// ∂Φ/∂t_a       = q · (t − c)_a
+    /// ∂²Φ/∂t_a∂t_b  = q · δ_ab + t · (t − c)_a (t − c)_b
+    /// ```
+    ///
+    /// Re-pointing the existing ψ-derivative machinery at the first kernel
+    /// argument t (see `crate::terms::input_loc_derivatives`).
+    pub(crate) fn eval_design_triplet(&self, r: f64) -> Result<(f64, f64, f64), BasisError> {
         match self {
             RadialScalarKind::Matern { length_scale, nu } => {
                 let (phi, q, t, _, _) =
@@ -12863,7 +12876,7 @@ pub(crate) struct DuchonPartialFractionCoeffs {
 }
 
 #[inline(always)]
-fn duchon_partial_fraction_coeffs(
+pub(crate) fn duchon_partial_fraction_coeffs(
     p_order: usize,
     s_order: usize,
     kappa: f64,

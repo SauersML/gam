@@ -280,86 +280,198 @@ impl ArrowSchurSystem {
         ridge_t: f64,
         ridge_beta: f64,
     ) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
-        let n = self.rows.len();
-        let d = self.d;
-        let k = self.k;
-
-        // 1. Per-row Cholesky factors of (H_tt^(i) + ridge_t · I).
-        let mut htt_factors: Vec<Array2<f64>> = Vec::with_capacity(n);
-        for row in &self.rows {
-            let mut block = row.htt.clone();
-            for a in 0..d {
-                block[[a, a]] += ridge_t;
-            }
-            htt_factors.push(cholesky_lower(&block).map_err(|e| {
-                ArrowSchurError::PerRowFactorFailed {
-                    row: htt_factors.len(),
-                    reason: e,
-                }
-            })?);
-        }
-
-        // 2. Schur complement S = H_ββ + ridge_β·I − Σ_i H_βt^(i) (H_tt^(i))⁻¹ H_tβ^(i).
-        let mut schur = self.hbb.clone();
-        for j in 0..k {
-            schur[[j, j]] += ridge_beta;
-        }
-        // Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
-        let mut rhs_beta = Array1::<f64>::zeros(k);
-        for i in 0..n {
-            // M = (H_tt^(i))⁻¹ H_tβ^(i)   ∈ ℝ^{d × K}
-            let m = chol_solve_matrix(&htt_factors[i], &self.rows[i].htbeta);
-            // S -= H_βt^(i) · M  = H_tβ^(i)^T · M
-            // Computed as: schur[a,b] -= Σ_c htbeta[c, a] * m[c, b]
-            for a in 0..k {
-                for b in 0..k {
-                    let mut acc = 0.0;
-                    for c in 0..d {
-                        acc += self.rows[i].htbeta[[c, a]] * m[[c, b]];
-                    }
-                    schur[[a, b]] -= acc;
-                }
-            }
-            // v = (H_tt^(i))⁻¹ g_t^(i)
-            let v = chol_solve_vector(&htt_factors[i], &self.rows[i].gt);
-            // rhs_beta += H_βt^(i) · v = H_tβ^(i)^T · v
-            for a in 0..k {
-                let mut acc = 0.0;
-                for c in 0..d {
-                    acc += self.rows[i].htbeta[[c, a]] * v[c];
-                }
-                rhs_beta[a] += acc;
-            }
-        }
-        for j in 0..k {
-            rhs_beta[j] -= self.gb[j];
-        }
-
-        // 3. Solve S · Δβ = rhs_beta.
-        let schur_factor =
-            cholesky_lower(&schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
-        let delta_beta = chol_solve_vector(&schur_factor, &rhs_beta);
-
-        // 4. Back-substitute Δt_i = -(H_tt^(i))⁻¹ (g_t^(i) + H_tβ^(i) Δβ).
-        let mut delta_t = Array1::<f64>::zeros(n * d);
-        for i in 0..n {
-            let mut tmp = self.rows[i].gt.clone();
-            // tmp += H_tβ^(i) · Δβ
-            for c in 0..d {
-                let mut acc = 0.0;
-                for a in 0..k {
-                    acc += self.rows[i].htbeta[[c, a]] * delta_beta[a];
-                }
-                tmp[c] += acc;
-            }
-            let dt_i = chol_solve_vector(&htt_factors[i], &tmp);
-            for c in 0..d {
-                delta_t[i * d + c] = -dt_i[c];
-            }
-        }
-
+        let (delta_t, delta_beta, _cache) = solve_arrow_newton_step(self, ridge_t, ridge_beta)?;
         Ok((delta_t, delta_beta))
     }
+}
+
+/// Per-row + Schur Cholesky factor cache produced by
+/// [`solve_arrow_newton_step`]. Consumed downstream by the IFT warm-start
+/// predictor in `crate::solver::persistent_warm_start`: when the outer
+/// loop perturbs `(β, ρ)` by a small amount, the new Newton step can be
+/// predicted by re-using these factors against a refreshed RHS, saving
+/// the dominant `O(N d³ + K³)` factorization cost.
+#[derive(Debug, Clone)]
+pub struct ArrowFactorCache {
+    /// Per-row lower-triangular Cholesky factors of `H_tt^(i) + ridge_t·I`.
+    pub htt_factors: Vec<Array2<f64>>,
+    /// Lower-triangular Cholesky factor of the Schur complement
+    /// `S = H_ββ + ridge_β·I − Σ_i H_βt^(i) (H_tt^(i))⁻¹ H_tβ^(i)`.
+    pub schur_factor: Array2<f64>,
+    /// Ridge values used to build the cached factors (recorded so the
+    /// warm-start predictor knows whether the cache is still valid for a
+    /// requested ridge level).
+    pub ridge_t: f64,
+    pub ridge_beta: f64,
+    /// Per-row cross-blocks `H_tβ^(i)` carried so the IFT warm-start
+    /// predictor (see `crate::solver::persistent_warm_start::ift_warm_start_latent`)
+    /// can rebuild the `β`-coupled RHS without revisiting the assembly
+    /// path. Length `N`, each entry shape `(d, K)`.
+    pub htbeta: Vec<Array2<f64>>,
+    /// Latent dimensionality `d`.
+    pub d: usize,
+    /// β dimensionality `K`.
+    pub k: usize,
+}
+
+impl ArrowFactorCache {
+    /// Apply `Δt_i = -(H_tt^(i))⁻¹ · (H_tβ^(i) · Δβ)` per row, returning
+    /// the flat row-major `Δt` of length `N · d`.
+    ///
+    /// IFT first-order predictor for the latent field under a
+    /// shape-coefficient perturbation `Δβ`. See
+    /// `proposals/latent_coord.md` §2.2.
+    pub fn predict_delta_t_from_delta_beta(&self, delta_beta: ArrayView1<'_, f64>) -> Array1<f64> {
+        let n = self.htt_factors.len();
+        let d = self.d;
+        let k = self.k;
+        debug_assert_eq!(delta_beta.len(), k);
+        let mut out = Array1::<f64>::zeros(n * d);
+        let mut rhs = Array1::<f64>::zeros(d);
+        for i in 0..n {
+            for c in 0..d {
+                let mut acc = 0.0_f64;
+                for a in 0..k {
+                    acc += self.htbeta[i][[c, a]] * delta_beta[a];
+                }
+                rhs[c] = acc;
+            }
+            let v = chol_solve_vector(&self.htt_factors[i], &rhs);
+            for c in 0..d {
+                out[i * d + c] = -v[c];
+            }
+        }
+        out
+    }
+
+    /// Apply `Δt_i = -(H_tt^(i))⁻¹ · δg_t^(i)` per row.
+    ///
+    /// IFT first-order predictor for the latent field under a
+    /// per-row gradient perturbation (typically `∂g_t/∂ρ · Δρ`
+    /// resolved externally by the driver).
+    pub fn predict_delta_t_from_delta_gt(&self, delta_gt: ArrayView1<'_, f64>) -> Array1<f64> {
+        let n = self.htt_factors.len();
+        let d = self.d;
+        debug_assert_eq!(delta_gt.len(), n * d);
+        let mut out = Array1::<f64>::zeros(n * d);
+        let mut rhs = Array1::<f64>::zeros(d);
+        for i in 0..n {
+            for c in 0..d {
+                rhs[c] = delta_gt[i * d + c];
+            }
+            let v = chol_solve_vector(&self.htt_factors[i], &rhs);
+            for c in 0..d {
+                out[i * d + c] = -v[c];
+            }
+        }
+        out
+    }
+}
+
+/// Schur-eliminate the per-row latent block and solve for `(Δt, Δβ)`,
+/// returning the factor cache alongside the increments.
+///
+/// This is the canonical entry point — both [`ArrowSchurSystem::solve`]
+/// (which discards the cache) and the joint Newton driver in
+/// `crate::solver::latent_inner` route through here.
+///
+/// `ridge_t` and `ridge_beta` are nonnegative diagonal regularizers added
+/// to the latent and β blocks respectively before factorization — used by
+/// the LM damping outer wrapper to recover from near-singular inner steps.
+/// Pass `0.0` for both to obtain the unregularized Newton direction.
+pub fn solve_arrow_newton_step(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+) -> Result<(Array1<f64>, Array1<f64>, ArrowFactorCache), ArrowSchurError> {
+    let n = sys.rows.len();
+    let d = sys.d;
+    let k = sys.k;
+
+    // 1. Per-row Cholesky factors of (H_tt^(i) + ridge_t · I).
+    let mut htt_factors: Vec<Array2<f64>> = Vec::with_capacity(n);
+    for row in &sys.rows {
+        let mut block = row.htt.clone();
+        for a in 0..d {
+            block[[a, a]] += ridge_t;
+        }
+        htt_factors.push(cholesky_lower(&block).map_err(|e| {
+            ArrowSchurError::PerRowFactorFailed {
+                row: htt_factors.len(),
+                reason: e,
+            }
+        })?);
+    }
+
+    // 2. Schur complement S = H_ββ + ridge_β·I − Σ_i H_βt^(i) (H_tt^(i))⁻¹ H_tβ^(i).
+    let mut schur = sys.hbb.clone();
+    for j in 0..k {
+        schur[[j, j]] += ridge_beta;
+    }
+    // Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
+    let mut rhs_beta = Array1::<f64>::zeros(k);
+    for i in 0..n {
+        // M = (H_tt^(i))⁻¹ H_tβ^(i)   ∈ ℝ^{d × K}
+        let m = chol_solve_matrix(&htt_factors[i], &sys.rows[i].htbeta);
+        // S -= H_βt^(i) · M  = H_tβ^(i)^T · M
+        for a in 0..k {
+            for b in 0..k {
+                let mut acc = 0.0;
+                for c in 0..d {
+                    acc += sys.rows[i].htbeta[[c, a]] * m[[c, b]];
+                }
+                schur[[a, b]] -= acc;
+            }
+        }
+        // v = (H_tt^(i))⁻¹ g_t^(i)
+        let v = chol_solve_vector(&htt_factors[i], &sys.rows[i].gt);
+        for a in 0..k {
+            let mut acc = 0.0;
+            for c in 0..d {
+                acc += sys.rows[i].htbeta[[c, a]] * v[c];
+            }
+            rhs_beta[a] += acc;
+        }
+    }
+    for j in 0..k {
+        rhs_beta[j] -= sys.gb[j];
+    }
+
+    // 3. Solve S · Δβ = rhs_beta.
+    let schur_factor =
+        cholesky_lower(&schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
+    let delta_beta = chol_solve_vector(&schur_factor, &rhs_beta);
+
+    // 4. Back-substitute Δt_i = -(H_tt^(i))⁻¹ (g_t^(i) + H_tβ^(i) Δβ).
+    let mut delta_t = Array1::<f64>::zeros(n * d);
+    for i in 0..n {
+        let mut tmp = sys.rows[i].gt.clone();
+        for c in 0..d {
+            let mut acc = 0.0;
+            for a in 0..k {
+                acc += sys.rows[i].htbeta[[c, a]] * delta_beta[a];
+            }
+            tmp[c] += acc;
+        }
+        let dt_i = chol_solve_vector(&htt_factors[i], &tmp);
+        for c in 0..d {
+            delta_t[i * d + c] = -dt_i[c];
+        }
+    }
+
+    // Snapshot per-row cross-blocks so the IFT predictor can apply
+    // the β-coupled sensitivity without re-running the assembler.
+    let htbeta: Vec<Array2<f64>> = sys.rows.iter().map(|r| r.htbeta.clone()).collect();
+    let cache = ArrowFactorCache {
+        htt_factors,
+        schur_factor,
+        ridge_t,
+        ridge_beta,
+        htbeta,
+        d,
+        k,
+    };
+    Ok((delta_t, delta_beta, cache))
 }
 
 /// Errors raised by [`ArrowSchurSystem::solve`].
@@ -470,185 +582,6 @@ fn chol_solve_matrix(l: &Array2<f64>, b: &Array2<f64>) -> Array2<f64> {
 // `[0, K)`; flat ψ occupies `[K, K + N·d)` by convention used by the
 // existing `SpatialLogKappaCoords` extension to the outer ρ vector).
 // ---------------------------------------------------------------------------
-
-/// Cached per-row Cholesky factors and Schur factor from a recent
-/// [`ArrowSchurSystem::solve`] / [`solve_arrow_newton_step`] call.
-///
-/// This is the artifact Piece 3's IFT warm-start consumes. After the
-/// inner Newton converges at outer iterate `(β̂, t̂; ρ)`, the IFT
-/// sensitivity of `t̂_i` to a downstream change in `β` is
-///
-/// ```text
-///   ∂t̂_i / ∂β  = -(H_tt^(i))⁻¹ · (H_tβ^(i))^T            (per-row)
-/// ```
-///
-/// and the sensitivity to `ρ` (or any other shared hyper-axis `η`) is
-///
-/// ```text
-///   ∂t̂_i / ∂η  = -(H_tt^(i))⁻¹ · ∂g_t^(i)/∂η.
-/// ```
-///
-/// Both right-hand sides are row-local; the cached per-row Cholesky
-/// factors let the predictor apply each row's correction in O(d²) ops
-/// without re-forming the per-row block.
-#[derive(Debug, Clone)]
-pub struct ArrowFactorCache {
-    /// Per-row lower-Cholesky factors of `H_tt^(i) (+ ridge_t · I)`.
-    pub htt_factors: Vec<Array2<f64>>,
-    /// Per-row cross-blocks `H_tβ^(i)` (carried so the IFT predictor can
-    /// rebuild the `β`-coupled RHS without revisiting the assembly path).
-    pub htbeta: Vec<Array2<f64>>,
-    /// Latent dimensionality `d`.
-    pub d: usize,
-    /// β dimensionality `K`.
-    pub k: usize,
-}
-
-impl ArrowFactorCache {
-    /// Apply `Δt_i = -(H_tt^(i))⁻¹ · (H_tβ^(i) · Δβ)` per row, returning
-    /// the flat row-major `Δt` of length `N · d`.
-    pub fn predict_delta_t_from_delta_beta(&self, delta_beta: ArrayView1<'_, f64>) -> Array1<f64> {
-        let n = self.htt_factors.len();
-        let d = self.d;
-        let k = self.k;
-        debug_assert_eq!(delta_beta.len(), k);
-        let mut out = Array1::<f64>::zeros(n * d);
-        let mut rhs = Array1::<f64>::zeros(d);
-        for i in 0..n {
-            // rhs = H_tβ^(i) · Δβ   (length d)
-            for c in 0..d {
-                let mut acc = 0.0_f64;
-                for a in 0..k {
-                    acc += self.htbeta[i][[c, a]] * delta_beta[a];
-                }
-                rhs[c] = acc;
-            }
-            let v = chol_solve_vector(&self.htt_factors[i], &rhs);
-            for c in 0..d {
-                out[i * d + c] = -v[c];
-            }
-        }
-        out
-    }
-
-    /// Apply `Δt_i = -(H_tt^(i))⁻¹ · δg_t^(i)` per row, where the caller
-    /// supplies a flat row-major `δg_t` of length `N · d`. Used when the
-    /// driver has computed `∂g_t/∂ρ · Δρ` (typically via the analytic
-    /// penalty registry's `grad_target` finite-difference) externally.
-    pub fn predict_delta_t_from_delta_gt(&self, delta_gt: ArrayView1<'_, f64>) -> Array1<f64> {
-        let n = self.htt_factors.len();
-        let d = self.d;
-        debug_assert_eq!(delta_gt.len(), n * d);
-        let mut out = Array1::<f64>::zeros(n * d);
-        let mut rhs = Array1::<f64>::zeros(d);
-        for i in 0..n {
-            for c in 0..d {
-                rhs[c] = delta_gt[i * d + c];
-            }
-            let v = chol_solve_vector(&self.htt_factors[i], &rhs);
-            for c in 0..d {
-                out[i * d + c] = -v[c];
-            }
-        }
-        out
-    }
-}
-
-/// One-shot arrow-Schur Newton solve that returns both the increment
-/// and the per-row factor cache.
-///
-/// This is the public entry point that the latent inner-solver
-/// ([`crate::solver::latent_inner`]) and the IFT warm-start predictor
-/// ([`crate::solver::persistent_warm_start::ift_warm_start_latent`])
-/// both call. The factor cache mirrors the convention used by
-/// `solve_newton_direction_dense` (which holds its dense factor for the
-/// geodesic-acceleration second solve): we expose it so downstream
-/// callers can chain the IFT-sensitivity solves without re-factoring.
-pub fn solve_arrow_newton_step(
-    system: &ArrowSchurSystem,
-    ridge_t: f64,
-    ridge_beta: f64,
-) -> Result<(Array1<f64>, Array1<f64>, ArrowFactorCache), ArrowSchurError> {
-    let n = system.rows.len();
-    let d = system.d;
-    let k = system.k;
-
-    // 1. Per-row Cholesky factors of (H_tt^(i) + ridge_t · I).
-    let mut htt_factors: Vec<Array2<f64>> = Vec::with_capacity(n);
-    let mut htbeta: Vec<Array2<f64>> = Vec::with_capacity(n);
-    for row in &system.rows {
-        let mut block = row.htt.clone();
-        for a in 0..d {
-            block[[a, a]] += ridge_t;
-        }
-        let l = cholesky_lower(&block).map_err(|e| ArrowSchurError::PerRowFactorFailed {
-            row: htt_factors.len(),
-            reason: e,
-        })?;
-        htt_factors.push(l);
-        htbeta.push(row.htbeta.clone());
-    }
-
-    // 2. Schur complement.
-    let mut schur = system.hbb.clone();
-    for j in 0..k {
-        schur[[j, j]] += ridge_beta;
-    }
-    let mut rhs_beta = Array1::<f64>::zeros(k);
-    for i in 0..n {
-        let m = chol_solve_matrix(&htt_factors[i], &system.rows[i].htbeta);
-        for a in 0..k {
-            for b in 0..k {
-                let mut acc = 0.0;
-                for c in 0..d {
-                    acc += system.rows[i].htbeta[[c, a]] * m[[c, b]];
-                }
-                schur[[a, b]] -= acc;
-            }
-        }
-        let v = chol_solve_vector(&htt_factors[i], &system.rows[i].gt);
-        for a in 0..k {
-            let mut acc = 0.0;
-            for c in 0..d {
-                acc += system.rows[i].htbeta[[c, a]] * v[c];
-            }
-            rhs_beta[a] += acc;
-        }
-    }
-    for j in 0..k {
-        rhs_beta[j] -= system.gb[j];
-    }
-
-    // 3. Solve for Δβ.
-    let schur_factor =
-        cholesky_lower(&schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
-    let delta_beta = chol_solve_vector(&schur_factor, &rhs_beta);
-
-    // 4. Back-substitute Δt.
-    let mut delta_t = Array1::<f64>::zeros(n * d);
-    for i in 0..n {
-        let mut tmp = system.rows[i].gt.clone();
-        for c in 0..d {
-            let mut acc = 0.0;
-            for a in 0..k {
-                acc += system.rows[i].htbeta[[c, a]] * delta_beta[a];
-            }
-            tmp[c] += acc;
-        }
-        let dt_i = chol_solve_vector(&htt_factors[i], &tmp);
-        for c in 0..d {
-            delta_t[i * d + c] = -dt_i[c];
-        }
-    }
-
-    let cache = ArrowFactorCache {
-        htt_factors,
-        htbeta,
-        d,
-        k,
-    };
-    Ok((delta_t, delta_beta, cache))
-}
 
 /// Layout convention for the joint (β, ψ) direction buffer.
 ///
