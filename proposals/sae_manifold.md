@@ -34,8 +34,10 @@ in that table; that the SAE row is already buildable with the
 shipping primitives; that the SAE-manifold row needs only what
 `latent_coord.md` already proposes; and that the well-known
 "shattering" pathology of linear SAEs dissolves under the manifold row
-because the REML Occam factor decisively prefers one curved atom over
-K linear shards.
+because the REML Occam factor can prefer one curved atom over `K`
+linear shards (under proper prior normalisation, controlled gauge, and
+smooth-decoder effective dimension growing slower than the required
+shard count — see §5.3 and the math-audit caveats).
 
 ## 2. The tier-assignment table
 
@@ -147,6 +149,17 @@ block-diagonal across `i`, coupled to the shared β only through the
 dense border, and the Schur complement reduces the per-step cost from
 `O((Nd+M)^3)` to `O(N d^3 + M^3 + Nd · M)`.
 
+**Audit caveat (REML `log|H|` gradient).** The arrow shape holds at
+the cost level; the gradient of the REML Occam term has a shared
+`Schur⁻¹` factor — it is *not* literally a sum of independent per-row
+contributions. Specifically, `∂/∂t_i log|Schur| =
+tr(Schur⁻¹ · ∂Schur/∂t_i)` with `Schur⁻¹` dense in all `t`, but
+`∂Schur/∂t_i` is a rank-≤d update because only row `i` of `Φ` moves
+with `t_i`. So per outer iteration: one dense `Schur⁻¹` formation
+(shared) plus N cheap per-row traces. Asymptotic cost is
+`O(N + decoder-cost)` per outer iteration, not `O(N²)`. See
+`latent_coord.md` §2.2 for the full derivation.
+
 ### 3.4 Identifiability priors
 
 Three gauge issues exist and all three are addressed by primitives
@@ -208,7 +221,11 @@ The composition is mechanical:
   cross-block. Schur-eliminate β first (the existing inner
   factorisation), then solve the row-local `(a, t)` blocks; this is
   the same pattern that makes the standard `LatentCoord` workflow
-  viable for large `N`.
+  viable for large `N`. (Caveat: the REML `log|H|` gradient carries
+  a shared `Schur⁻¹` factor — see §3.3 above and `latent_coord.md`
+  §2.2. Per-row contributions decompose into rank-≤d traces against
+  a Schur inverse computed once per outer iteration; the asymptotic
+  cost stays linear in `N`.)
 
 In short: every piece is either already shipping
 (`compare_models`, active-set, `BlockwisePenalty`, REML outer loop,
@@ -239,32 +256,31 @@ parameters are a single `B ∈ ℝ^{M × p}` plus a per-observation
 on-atom coordinate `t_i ∈ ℝ^{d_C}`. Reconstruction is `Ẑ_i = a_i ·
 Φ(t_i) B`. This is the K=1 special case of §3.
 
-### 5.3 Why REML picks the manifold over the shards
+### 5.3 Why REML may prefer the manifold over the shards
 
-Cast both as gamfit models and compute the REML / LAML score
-difference. Under the data fit + smoothness penalty + sparsity penalty
-of §3.2:
+Earlier drafts presented an unambiguous determinant proof that REML
+"decisively" picks the manifold over `K` linear shards. The math audit
+flagged that sketch as overstated. The defensible statement is:
 
-- Linear-K-atom model. Effective parameter count
-  `df_lin ≈ K · p` for decoder + sparse code df on `a`. The
-  log-evidence Occam factor pays
-  `½ log |I + λ_sp^{−1} A_lin' A_lin|` and an analogous
-  `½ log |I + λ_sm^{−1} B' P_lin B|` term that scales with `K`.
-- Manifold-atom model. Effective parameter count
-  `df_man ≈ M · p + N · d_C`. The smoothness Occam factor is a
-  single `½ log |I + λ_sm^{−1} B' P B|` independent of how
-  fine-grained `C` is; the on-atom coordinate `t_i` contributes
-  `N · d_C` to df but is bounded by the ARD penalty.
+> With properly normalised priors, fixed model families, controlled
+> gauge, comparable fit, and smooth-decoder effective dimension growing
+> slower than the required linear-shard count, marginal likelihood may
+> favour the manifold beyond some `K_required`. This is not an
+> unambiguous determinant proof; the asymptotic direction depends on
+> the specific prior normalisation and decoder complexity.
 
-For a curved feature where `K_required ≫ 1` to hit a target MSE, the
-linear model's evidence is dominated by the `K`-scaled Occam term while
-the manifold model's evidence is dominated by `M · p + N · d_C` which
-is independent of `K_required` (and `M` is selected by REML on `λ_sm`).
-Beyond a small threshold on `K_required`, the manifold-atom strictly
-dominates. The threshold depends on `p` and `d_C`, but the asymptotic
-direction is unambiguous: **for any feature curved enough that the
-linear SAE needs many shards, the marginal likelihood prefers a single
-manifold-atom**.
+Cast informally: the linear-K-atom model carries a log-evidence Occam
+load that scales with `K` (one decoder block and one sparsity-code df
+contribution per atom), while the manifold-atom model carries
+`df_man ≈ M · p + N · d_C` whose first term is REML-selected via
+`λ_sm` and whose second is bounded by ARD. Provided the prior
+normalisers (`(N/2) log α`-style terms, smoothness determinants) are
+all included and gauges are pinned, the manifold side's Occam load
+grows sublinearly in `K_required` while the linear side's grows
+linearly. That motivates — but does not prove — a crossover beyond
+some `K_required`. Sign and threshold depend on `p`, `d_C`, the
+normalisation choices, and the realised decoder complexity. The
+empirical hook in §5.4 is what currently carries the load.
 
 ### 5.4 Empirical hook
 
