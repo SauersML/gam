@@ -37,9 +37,9 @@ they slot into the same REML outer loop, and their weights are
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from operator import index
-from typing import Any, Literal, Sequence, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 __all__ = [
     "IsometryPenalty",
@@ -103,7 +103,7 @@ class IsometryPenalty:
     with ``g^\\mathrm{ref}`` either the identity (``reference="euclidean"``,
     pulling toward a local isometry) or a per-row reference metric supplied
     by the caller. ``e^{\\rho_\\mathrm{iso}}`` is REML-selectable like any
-    other smoothing strength.
+    other smoothing weight.
 
     **When to use.** Whenever a ``LatentCoord`` block is in play and there is
     no auxiliary prior to break the diffeomorphism gauge. The bare data-fit
@@ -169,7 +169,7 @@ class SparsityPenalty:
     with analytic gradient ``β_i / sqrt(β_i^2 + ε²)`` (smoothed sign) and
     diagonal Hessian ``ε² / (β_i^2 + ε²)^{3/2}``. The weight
     ``e^{\\rho_\\mathrm{spars}}`` is REML-selectable; ``ε`` may *also* be
-    REML-selected (``eps_strength="auto"``), in which case the Occam factor
+    REML-selected (``eps_weight="auto"``), in which case the Occam factor
     of the marginal likelihood shrinks ``ε`` only as far as the data warrants.
 
     Alternatives: ``kind="hoyer"`` (scale-invariant; no diagonal HVP) and
@@ -192,7 +192,7 @@ class SparsityPenalty:
     eps
         Smoothing scale for ``"smooth_l1"`` / ``"log"`` kernels. Default
         ``1e-3``.
-    eps_strength
+    eps_weight
         ``"auto"`` to let REML select ``ε`` as well; ``"fixed"`` to pin
         it at ``eps``. Defaults to ``"fixed"``.
     """
@@ -201,7 +201,7 @@ class SparsityPenalty:
     kind: Literal["smooth_l1", "hoyer", "log"] = "smooth_l1"
     weight: WeightSpec = "auto"
     eps: float = 1e-3
-    eps_strength: Literal["auto", "fixed"] = "fixed"
+    eps_weight: Literal["auto", "fixed"] = "fixed"
 
     def __post_init__(self) -> None:
         _validate_weight(self.weight, "SparsityPenalty")
@@ -210,17 +210,17 @@ class SparsityPenalty:
                 f"SparsityPenalty.kind must be one of 'smooth_l1' | 'hoyer' | 'log', "
                 f"got {self.kind!r}"
             )
-        if self.kind == "hoyer" and self.eps_strength == "auto":
+        if self.kind == "hoyer" and self.eps_weight == "auto":
             raise ValueError(
                 "SparsityPenalty(kind='hoyer'): Hoyer has no smoothing scale, "
-                "so eps_strength='auto' is not meaningful."
+                "so eps_weight='auto' is not meaningful."
             )
         if self.eps <= 0.0:
             raise ValueError(f"SparsityPenalty.eps must be > 0, got {self.eps}")
-        if self.eps_strength not in ("auto", "fixed"):
+        if self.eps_weight not in ("auto", "fixed"):
             raise ValueError(
-                f"SparsityPenalty.eps_strength must be 'auto' or 'fixed', "
-                f"got {self.eps_strength!r}"
+                f"SparsityPenalty.eps_weight must be 'auto' or 'fixed', "
+                f"got {self.eps_weight!r}"
             )
 
     def _to_rust_payload(self) -> dict[str, Any]:
@@ -230,7 +230,7 @@ class SparsityPenalty:
             "sparsity_kind": self.kind,
             "weight": self.weight,
             "eps": float(self.eps),
-            "eps_strength": self.eps_strength,
+            "eps_weight": self.eps_weight,
         }
 
     def to_rust_descriptor(self) -> dict[str, Any]:
@@ -311,7 +311,7 @@ class TotalVariationPenalty:
     Parameters
     ----------
     weight
-        Fixed base strength, or the base multiplier when ``learnable=True``.
+        Fixed base weight, or the base multiplier when ``learnable=True``.
     n_eff
         Number of rows in the row-major latent coefficient block.
     difference_op
@@ -424,7 +424,7 @@ class OrthogonalityPenalty:
     Parameters
     ----------
     weight
-        Fixed base strength, or the base multiplier when ``learnable=True``.
+        Fixed base weight, or the base multiplier when ``learnable=True``.
     n_eff
         Effective observation count used for normalization.
     learnable
