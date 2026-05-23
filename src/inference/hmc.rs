@@ -3800,8 +3800,21 @@ impl LinkWigglePosterior {
             }
         }
 
+        // Penalty scaling factor: the Gaussian likelihood block above
+        // multiplies through by `inv_scale_sq = 1/φ`, so the penalty
+        // quadratic and its gradient must use the same factor — otherwise
+        // the prior and likelihood live on incompatible scales and the
+        // MAP-anchored posterior used for whitening picks up a hidden
+        // φ-mismatch. Non-Gaussian branches above leave the data term
+        // un-scaled and pass `1.0` here so the prior shape is unchanged.
+        let penalty_scale = match self.nuts_family {
+            NutsFamily::Gaussian => 1.0 / (self.scale * self.scale).max(1e-10),
+            _ => 1.0,
+        };
+
         // Gradient w.r.t. θ (wiggle): ∂ℓ/∂θ = B(q₀)^T · residual − S_link · θ
-        let grad_theta = &fast_atv(&bwiggle, &residual) - &self.penalty_link.dot(&theta);
+        let s_link_theta = self.penalty_link.dot(&theta);
+        let grad_theta = &fast_atv(&bwiggle, &residual) - &(&s_link_theta * penalty_scale);
 
         // Gradient w.r.t. β_eta: ∂ℓ/∂β = X^T · (residual ⊙ g'(q₀)) − S_base · β
         // where g'(q₀) = dη/dq₀ is the chain-rule factor
@@ -3811,11 +3824,12 @@ impl LinkWigglePosterior {
             .zip(g_prime.iter())
             .map(|(&r, &g)| r * g)
             .collect();
-        let grad_beta = &fast_atv(&self.x, &r_scaled) - &self.penalty_base.dot(&beta);
+        let s_base_beta = self.penalty_base.dot(&beta);
+        let grad_beta = &fast_atv(&self.x, &r_scaled) - &(&s_base_beta * penalty_scale);
 
-        // Penalty
-        let penalty = 0.5 * beta.dot(&self.penalty_base.dot(&beta))
-            + 0.5 * theta.dot(&self.penalty_link.dot(&theta));
+        // Penalty (also φ-scaled for Gaussian; see `penalty_scale` above).
+        let penalty = penalty_scale
+            * (0.5 * beta.dot(&s_base_beta) + 0.5 * theta.dot(&s_link_theta));
 
         // Assemble joint gradient and transform to whitened space
         let mut grad_q = Array1::<f64>::zeros(dim);
