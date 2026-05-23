@@ -19829,7 +19829,7 @@ fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'static>(
             h.scaled_add(lambdas[k], &*s_dense);
         }
         return Ok(Some(FitGeometry {
-            penalized_hessian: h,
+            penalized_hessian: h.into(),
             working_weights: working_weights.clone(),
             working_response: working_response.clone(),
         }));
@@ -19885,7 +19885,7 @@ fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'static>(
     }
     let working_len = states.first().map(|state| state.eta.len()).unwrap_or(0);
     Ok(Some(FitGeometry {
-        penalized_hessian: h,
+        penalized_hessian: h.into(),
         working_weights: Array1::zeros(working_len),
         working_response: Array1::zeros(working_len),
     }))

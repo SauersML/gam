@@ -81,6 +81,19 @@ sparse-by-blocks), `H_tβ = − Φ_i ⊗ (g_i β) + …` is dense in β but only
 row-local in t. This is the *same* structure gamfit's matrix-free CG
 already exploits along the ψ direction (`hyper_dirs`).
 
+**Arrow shape — careful statement (per math audit).** The cost is
+arrow-shaped, but the REML `log|H|` Occam-term gradient is not literally
+`Σ_i f(t_i)`. After Schur elimination,
+`log|H| = log|H_tt| + log|Schur|`. The first term factorises trivially
+because `H_tt` is block-diagonal in rows. For the second,
+`∂/∂t_i log|Schur| = tr(Schur⁻¹ · ∂Schur/∂t_i)`, with `Schur⁻¹` dense in
+all `t`. However, only row `i` of `Φ` moves with `t_i`, so
+`∂Schur/∂t_i` is a rank-≤d update. Per outer iteration the cost is one
+dense `Schur⁻¹` formation (shared across all rows) + N cheap per-row
+traces — `O(N + decoder-cost)`, not `O(N²)` and not `O((Nd)³)`. The
+arrow shape holds at the cost level; the gradient formula carries a
+shared factor that is a one-time setup per outer iteration.
+
 ### 2.3 Gauge symmetry — load-bearing caveat
 
 The bare data-fit loss `½‖y − Φ(t) β‖²` is invariant under any

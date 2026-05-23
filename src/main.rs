@@ -8801,10 +8801,13 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> UnifiedFitResult {
             working_weights: inf.working_weights.clone(),
             working_response: inf.working_response.clone(),
         });
+    // Boundary adapter: `inf.beta_covariance` is now the `PhiScaledCovariance`
+    // newtype; unwrap to the raw `Array2<f64>` that the
+    // `covariance_conditional` parts field still uses.
     let covariance_conditional = ext
         .inference
         .as_ref()
-        .and_then(|inf| inf.beta_covariance.clone());
+        .and_then(|inf| inf.beta_covariance.as_ref().map(|c| c.as_array().clone()));
     let covariance_corrected = ext
         .inference
         .as_ref()
@@ -10529,7 +10532,7 @@ mod tests {
             inference: None,
             fitted_link: FittedLinkState::Standard(None),
             geometry: Some(FitGeometry {
-                penalized_hessian: array![[2.0]],
+                penalized_hessian: array![[2.0]].into(),
                 working_weights: Array1::zeros(0),
                 working_response: Array1::zeros(0),
             }),
@@ -11266,7 +11269,7 @@ mod tests {
                 edf_by_block: vec![1.5],
                 edf_total: 1.5,
                 smoothing_correction: None,
-                penalized_hessian: hessian.clone(),
+                penalized_hessian: hessian.clone().into(),
                 working_weights: working_weights.clone(),
                 working_response: working_response.clone(),
                 reparam_qs: Some(Array2::eye(2)),
@@ -11282,7 +11285,7 @@ mod tests {
             }),
             fitted_link: FittedLinkState::Standard(Some(LinkFunction::Logit)),
             geometry: Some(FitGeometry {
-                penalized_hessian: hessian,
+                penalized_hessian: hessian.into(),
                 working_weights,
                 working_response,
             }),
