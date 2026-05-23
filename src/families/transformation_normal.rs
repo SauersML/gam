@@ -13446,8 +13446,8 @@ mod tests {
     /// `D(∇²B)[u]v = -2 μ Dᵀ((Du)(Dv)/c³)`).
     ///
     /// At fixed direction `d_beta`, builds `H(β ± ε d_beta) v` matrix-free via
-    /// `apply_hessian` and checks that the centered FD quotient converges to the
-    /// operator's `mul_vec(v)`. This locks in both the analytic formula and the
+    /// `apply_hessian` and checks that the centered perturbation quotient
+    /// converges to the operator's `mul_vec(v)`. This locks in both the analytic formula and the
     /// `inv_hp_cu` cache (a stale cache would only show up under ε perturbation,
     /// not in the dense-equivalence test that probes a single iterate).
     #[test]
@@ -13518,7 +13518,7 @@ mod tests {
     /// Cached CTN barrier d²H operator check (fourth-derivative
     /// formula `D²(∇²B)[u,w]v = 6 μ Dᵀ((Du)(Dw)(Dv)/c⁴)`).
     ///
-    /// Centered FD on the dH operator along `dir_w` recovers d²H[u, w] · v;
+    /// A centered perturbation of the dH operator along `dir_w` recovers d²H[u, w] · v;
     /// this exercises both the cached `inv_hp_qu` and the chained Khatri–Rao
     /// apply on the perturbed iterate.
     #[test]
