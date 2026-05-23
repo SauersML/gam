@@ -10461,6 +10461,42 @@ fn xlogy(x: f64, y: f64) -> f64 {
 }
 
 #[inline]
+fn poisson_unit_deviance(yi: f64, mui_c: f64) -> f64 {
+    xlogy(yi, yi / mui_c) - (yi - mui_c)
+}
+
+#[inline]
+fn gamma_unit_deviance(yi_c: f64, mui_c: f64) -> f64 {
+    let ratio = yi_c / mui_c;
+    ratio - 1.0 - ratio.ln()
+}
+
+#[inline]
+fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64, eps: f64) -> f64 {
+    if tweedie_p_is_poisson(p) {
+        poisson_unit_deviance(yi, mui_c)
+    } else if tweedie_p_is_gamma(p) {
+        gamma_unit_deviance(yi.max(eps), mui_c)
+    } else if yi == 0.0 {
+        mui_c.powf(2.0 - p) / (2.0 - p)
+    } else {
+        yi.powf(2.0 - p) / ((1.0 - p) * (2.0 - p))
+            - yi * mui_c.powf(1.0 - p) / (1.0 - p)
+            + mui_c.powf(2.0 - p) / (2.0 - p)
+    }
+}
+
+#[inline]
+fn negative_binomial_unit_deviance(yi: f64, mui_c: f64, theta: f64) -> f64 {
+    if !valid_negbin_theta(theta) || yi < 0.0 {
+        return f64::NAN;
+    }
+    let y_term = xlogy(yi, (yi * (theta + mui_c)) / (mui_c * (theta + yi)));
+    let theta_term = theta * ((theta + mui_c) / (theta + yi)).ln();
+    theta_term + y_term
+}
+
+#[inline]
 pub fn calculate_deviance(
     y: ArrayView1<f64>,
     mu: &Array1<f64>,
@@ -10514,12 +10550,7 @@ pub fn calculate_deviance(
                 .map(|i| {
                     let yi = y[i];
                     let mui_c = mu[i].max(EPS);
-                    let term = if yi > EPS {
-                        xlogy(yi, yi / mui_c) - (yi - mui_c)
-                    } else {
-                        mui_c
-                    };
-                    priorweights[i] * term
+                    priorweights[i] * poisson_unit_deviance(yi, mui_c)
                 })
                 .sum();
             2.0 * total
@@ -10533,12 +10564,7 @@ pub fn calculate_deviance(
                     .map(|i| {
                         let yi = y[i];
                         let mui_c = mu[i].max(EPS);
-                        let term = if yi > EPS {
-                            xlogy(yi, yi / mui_c) - (yi - mui_c)
-                        } else {
-                            mui_c
-                        };
-                        priorweights[i] * term
+                        priorweights[i] * tweedie_unit_deviance(yi, mui_c, p, EPS)
                     })
                     .sum();
                 2.0 * total
@@ -10548,10 +10574,8 @@ pub fn calculate_deviance(
                 let total: f64 = (0..y.len())
                     .into_par_iter()
                     .map(|i| {
-                        let yi_c = y[i].max(EPS);
                         let mui_c = mu[i].max(EPS);
-                        let ratio = yi_c / mui_c;
-                        priorweights[i] * (ratio - 1.0 - ratio.ln()) / phi
+                        priorweights[i] * tweedie_unit_deviance(y[i], mui_c, p, EPS) / phi
                     })
                     .sum();
                 2.0 * total
@@ -10563,14 +10587,7 @@ pub fn calculate_deviance(
                     .map(|i| {
                         let yi = y[i];
                         let mui_c = mu[i].max(EPS);
-                        let y_term = if yi == 0.0 {
-                            mui_c.powf(2.0 - p) / (2.0 - p)
-                        } else {
-                            yi.powf(2.0 - p) / ((1.0 - p) * (2.0 - p))
-                                - yi * mui_c.powf(1.0 - p) / (1.0 - p)
-                                + mui_c.powf(2.0 - p) / (2.0 - p)
-                        };
-                        priorweights[i] * y_term / phi
+                        priorweights[i] * tweedie_unit_deviance(yi, mui_c, p, EPS) / phi
                     })
                     .sum();
                 2.0 * total
@@ -10581,21 +10598,9 @@ pub fn calculate_deviance(
             let total: f64 = (0..y.len())
                 .into_par_iter()
                 .map(|i| {
-                    if !valid_negbin_theta(theta) {
-                        return f64::NAN;
-                    }
                     let yi = y[i];
-                    if yi < 0.0 {
-                        return f64::NAN;
-                    }
                     let mui_c = mu[i].max(EPS);
-                    let y_term = if yi > EPS {
-                        xlogy(yi, (yi * (theta + mui_c)) / (mui_c * (theta + yi)))
-                    } else {
-                        0.0
-                    };
-                    let theta_term = theta * ((theta + mui_c) / (theta + yi)).ln();
-                    priorweights[i] * (theta_term + y_term)
+                    priorweights[i] * negative_binomial_unit_deviance(yi, mui_c, theta)
                 })
                 .sum();
             2.0 * total
@@ -10608,8 +10613,7 @@ pub fn calculate_deviance(
                 .map(|i| {
                     let yi_c = y[i].max(EPS);
                     let mui_c = mu[i].max(EPS);
-                    let ratio = yi_c / mui_c;
-                    priorweights[i] * shape * (ratio - 1.0 - ratio.ln())
+                    priorweights[i] * shape * gamma_unit_deviance(yi_c, mui_c)
                 })
                 .sum();
             2.0 * total
@@ -10687,11 +10691,10 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                     return f64::NAN;
                 }
                 let mui_c = mu[i].max(EPS);
-                let log_mu_term = if yi > 0.0 { yi * mui_c.ln() } else { 0.0 };
                 priorweights[i]
                     * (ln_gamma(yi + theta) - ln_gamma(theta) - ln_gamma(yi + 1.0)
                         + theta * (theta.ln() - (theta + mui_c).ln())
-                        + log_mu_term
+                        + xlogy(yi, mui_c)
                         - yi * (theta + mui_c).ln())
             })
             .sum(),
