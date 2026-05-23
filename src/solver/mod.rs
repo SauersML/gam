@@ -7,6 +7,7 @@ pub mod outer_strategy;
 pub(crate) mod persistent_warm_start;
 pub mod pirls;
 pub mod protocol;
+pub mod riemannian;
 pub mod seeding;
 pub mod visualizer;
 pub(crate) mod workflow;
