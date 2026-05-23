@@ -1114,7 +1114,8 @@ impl<'a> RemlState<'a> {
                     super::unified::EvalMode::ValueGradientHessian
                 }
             };
-            let result = self.evaluate_unified_with_psi_ext(&rho, eval_mode, hyper_dirs)?;
+            let result =
+                self.evaluate_unified_with_psi_ext(&rho, Some(theta), eval_mode, hyper_dirs)?;
             let cost = result.cost;
             let grad = result
                 .gradient

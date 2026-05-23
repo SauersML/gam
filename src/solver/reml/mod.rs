@@ -1355,6 +1355,7 @@ mod tests {
         let full = state
             .evaluate_unified_with_psi_ext(
                 &rho,
+                None,
                 crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient,
                 &hyper_dirs,
             )
