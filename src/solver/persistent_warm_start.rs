@@ -371,7 +371,15 @@ pub enum LatentIftOutcome {
     Applied { delta_t: Array1<f64> },
     /// Predictor declined (no cache, dim mismatch, or non-finite input).
     /// Caller should fall back to a from-scratch latent inner solve.
-    Noop { reason: &'static str },
+    /// `reason` is a stable string ID for diagnostics; the
+    /// `#[allow(dead_code)]` is required because the crate-wide
+    /// `deny(dead_code)` lint cannot see that this field is consumed
+    /// only by opt-in verbose IFT logging (Piece 2 driver integration,
+    /// not yet wired into the production REML loop).
+    Noop {
+        #[allow(dead_code)]
+        reason: &'static str,
+    },
 }
 
 /// Predict the analytic shift in the latent field `t̂` induced by a
