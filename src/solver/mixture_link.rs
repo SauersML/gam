@@ -1247,6 +1247,12 @@ pub fn inverse_link_jet_for_family(
                 sas_link_state,
             )
         }
+        LikelihoodFamily::BetaLogit { .. } => inverse_link_jet_for_link_function(
+            LinkFunction::Logit,
+            eta,
+            mixture_link_state,
+            sas_link_state,
+        ),
         LikelihoodFamily::RoystonParmar => Ok(royston_parmar_inverse_link_jet(eta)),
     }
 }
