@@ -48,8 +48,7 @@ const S_TRACE_INIT: f64 = 1.0;
 const HGB_SENS_FLOOR: f64 = 1e-6;
 const IFT_QUALITY_HISTORY_CAP: usize = 5;
 
-static OUTER_IFT_RESIDUAL_ENERGY: OnceLock<Mutex<HashMap<Vec<u64>, (f64, u64)>>> =
-    OnceLock::new();
+static OUTER_IFT_RESIDUAL_ENERGY: OnceLock<Mutex<HashMap<Vec<u64>, (f64, u64)>>> = OnceLock::new();
 static OUTER_IFT_RESIDUAL_ENERGY_ITER: AtomicU64 = AtomicU64::new(0);
 
 fn outer_ift_residual_energy_cache() -> &'static Mutex<HashMap<Vec<u64>, (f64, u64)>> {
@@ -78,7 +77,8 @@ pub(crate) fn cached_ift_residual_energy_for_outer_theta(
 ) -> Option<(f64, u64)> {
     let key = super::cache::sanitized_rhokey(theta)?;
     let (energy, iter) = *outer_ift_residual_energy_cache().lock().ok()?.get(&key)?;
-    (energy.is_finite() && energy >= 0.0).then_some(energy)
+    (energy.is_finite() && energy >= 0.0)
+        .then_some(energy)
         .map(|energy| (energy, iter))
 }
 
@@ -260,9 +260,7 @@ impl HyperGradientBudget {
                 if i == j || drho_j.len() != rho_dim || dg_j.len() != grad_dim {
                     continue;
                 }
-                if drho_j.iter().any(|v| !v.is_finite())
-                    || dg_j.iter().any(|v| !v.is_finite())
-                {
+                if drho_j.iter().any(|v| !v.is_finite()) || dg_j.iter().any(|v| !v.is_finite()) {
                     continue;
                 }
                 for row in 0..rho_dim {

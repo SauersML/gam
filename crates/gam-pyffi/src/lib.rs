@@ -9,8 +9,7 @@ use gam::estimate::{
     saved_sas_state_from_fit,
 };
 use gam::faer_ndarray::{
-    FaerCholesky, FaerEigh, array2_to_matmut, factorize_symmetricwith_fallback,
-    fast_xt_diag_x,
+    FaerCholesky, FaerEigh, array2_to_matmut, factorize_symmetricwith_fallback, fast_xt_diag_x,
 };
 use gam::families::family_meta::inverse_link_to_binomial_family;
 use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
@@ -51,11 +50,10 @@ use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
     SpatialIdentifiability, SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec,
     auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile, build_duchon_basis,
-    build_duchon_basis_mixed_periodicity_auto,
-    build_duchon_operator_penalty_matrices, build_spherical_spline_basis,
-    build_thin_plate_penalty_matrix, create_basis, create_difference_penalty_matrix,
-    create_cyclic_difference_penalty_matrix, create_periodic_bspline_basis_dense,
-    create_periodic_bspline_derivative_dense,
+    build_duchon_basis_mixed_periodicity_auto, build_duchon_operator_penalty_matrices,
+    build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
+    create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
+    create_periodic_bspline_basis_dense, create_periodic_bspline_derivative_dense,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction};
@@ -770,9 +768,8 @@ fn periodic_spline_curve_basis<'py>(
     degree: usize,
     penalty_order: usize,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
-    let basis =
-        create_periodic_bspline_basis_dense(t.as_array(), (0.0, 1.0), degree, n_knots)
-            .map_err(|err| py_value_error(err.to_string()))?;
+    let basis = create_periodic_bspline_basis_dense(t.as_array(), (0.0, 1.0), degree, n_knots)
+        .map_err(|err| py_value_error(err.to_string()))?;
     let penalty = create_cyclic_difference_penalty_matrix(n_knots, penalty_order)
         .map_err(|err| py_value_error(err.to_string()))?;
     Ok((
@@ -852,9 +849,7 @@ fn duchon_function_norm_penalty<'py>(
         arr2.as_array().to_owned()
     } else {
         let arr1 = centers.extract::<PyReadonlyArray1<f64>>().map_err(|_| {
-            py_value_error(
-                "centers must be a 1D (K,) or 2D (K, d) float array".to_string(),
-            )
+            py_value_error("centers must be a 1D (K,) or 2D (K, d) float array".to_string())
         })?;
         column_array(arr1.as_array())
     };
@@ -877,7 +872,8 @@ fn duchon_function_norm_penalty<'py>(
         if d != 1 {
             return Err(py_value_error(
                 "scalar `periodic=true` only valid for 1D centers; \
-                 use `periodic_per_axis` for d > 1".to_string(),
+                 use `periodic_per_axis` for d > 1"
+                    .to_string(),
             ));
         }
         vec![true]
@@ -891,8 +887,7 @@ fn duchon_function_norm_penalty<'py>(
     // scalar `period` is only meaningful in the 1D legacy path.
     if d == 1 {
         let col = center_matrix.column(0);
-        validate_position_period("duchon", col, any_periodic, period)
-            .map_err(py_value_error)?;
+        validate_position_period("duchon", col, any_periodic, period).map_err(py_value_error)?;
     } else if period.is_some() {
         return Err(py_value_error(
             "duchon scalar `period` is only valid for d=1 (multi-D periodic axes auto-derive period from centers)".to_string(),
@@ -1024,7 +1019,11 @@ fn sphere_basis<'py>(
     let (method, wahba_kernel, max_degree) = match kernel.to_ascii_lowercase().as_str() {
         "sobolev" => (SphereMethod::Wahba, SphereWahbaKernel::Sobolev, None),
         "pseudo" => (SphereMethod::Wahba, SphereWahbaKernel::Pseudo, None),
-        "harmonic" => (SphereMethod::Harmonic, SphereWahbaKernel::Sobolev, Some(n_centers)),
+        "harmonic" => (
+            SphereMethod::Harmonic,
+            SphereWahbaKernel::Sobolev,
+            Some(n_centers),
+        ),
         other => {
             return Err(py_value_error(format!(
                 "sphere_basis kernel must be one of 'sobolev', 'pseudo', 'harmonic'; got '{other}'"
@@ -1032,7 +1031,9 @@ fn sphere_basis<'py>(
         }
     };
     let spec = SphericalSplineBasisSpec {
-        center_strategy: CenterStrategy::FarthestPoint { num_centers: n_centers },
+        center_strategy: CenterStrategy::FarthestPoint {
+            num_centers: n_centers,
+        },
         penalty_order,
         double_penalty: false,
         radians,
@@ -1040,16 +1041,14 @@ fn sphere_basis<'py>(
         max_degree,
         wahba_kernel,
     };
-    let built = build_spherical_spline_basis(pts, &spec)
-        .map_err(|err| py_value_error(err.to_string()))?;
+    let built =
+        build_spherical_spline_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
     let primary_idx = built
         .penaltyinfo
         .iter()
         .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
         .ok_or_else(|| {
-            py_value_error(
-                "sphere_basis: primary penalty was not built; check spec".to_string(),
-            )
+            py_value_error("sphere_basis: primary penalty was not built; check spec".to_string())
         })?;
     let penalty = built.penalties[primary_idx].clone();
     let design = built.design.to_dense();
@@ -1387,8 +1386,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
                 n_rows,
             )));
         }
-        if let Some(((row, col), value)) =
-            view.indexed_iter().find(|(_, value)| !value.is_finite())
+        if let Some(((row, col), value)) = view.indexed_iter().find(|(_, value)| !value.is_finite())
         {
             return Err(py_value_error(format!(
                 "designs[{i}][{row},{col}] must be finite; got {value}"
@@ -1417,9 +1415,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
                 k,
             )));
         }
-        if let Some(((row, col), value)) =
-            pv.indexed_iter().find(|(_, value)| !value.is_finite())
-        {
+        if let Some(((row, col), value)) = pv.indexed_iter().find(|(_, value)| !value.is_finite()) {
             return Err(py_value_error(format!(
                 "penalties[{i}][{row},{col}] must be finite; got {value}"
             )));
@@ -1444,8 +1440,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
             y_arr.ncols(),
         )));
     }
-    if let Some(((row, col), value)) = y_arr.indexed_iter().find(|(_, value)| !value.is_finite())
-    {
+    if let Some(((row, col), value)) = y_arr.indexed_iter().find(|(_, value)| !value.is_finite()) {
         return Err(py_value_error(format!(
             "y[{row},{col}] must be finite; got {value}"
         )));
@@ -1576,8 +1571,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
     out.set_item("edf", edf_arr.into_pyarray(py))?;
     out.set_item(
         "col_offsets",
-        ndarray::Array1::from_iter(col_offsets.into_iter().map(|v| v as u64))
-            .into_pyarray(py),
+        ndarray::Array1::from_iter(col_offsets.into_iter().map(|v| v as u64)).into_pyarray(py),
     )?;
     Ok(out.unbind())
 }
@@ -1650,9 +1644,7 @@ fn invert_spd_with_ridge(
 ) -> Result<Array2<f64>, EstimationError> {
     let n = matrix.nrows();
     let eye = identity_matrix(n);
-    let scale = (0..n)
-        .map(|i| matrix[[i, i]].abs())
-        .fold(1.0_f64, f64::max);
+    let scale = (0..n).map(|i| matrix[[i, i]].abs()).fold(1.0_f64, f64::max);
     let ridges = [0.0, ridge_rel, 1.0e-10, 1.0e-8, 1.0e-6, 1.0e-4];
     for rel in ridges {
         let mut candidate = matrix.clone();
@@ -1677,11 +1669,11 @@ fn solve_symmetric_vector_with_floor(
 ) -> Result<Array1<f64>, EstimationError> {
     let n = matrix.nrows();
     let sym = symmetrized_matrix(matrix);
-    let (eigs, vecs) = sym.eigh(Side::Lower).map_err(|_| {
-        EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        }
-    })?;
+    let (eigs, vecs) =
+        sym.eigh(Side::Lower)
+            .map_err(|_| EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            })?;
     let max_eig = eigs.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
     let floor = (ridge_rel * max_eig.max(1.0)).max(1.0e-12);
     let projected = vecs.t().dot(rhs);
@@ -1795,42 +1787,35 @@ fn gaussian_reml_fit_blocks_backward_analytic(
         }
     }
     if let Some(gc) = grad_coefficients {
-        if let Some(((row, col), value)) =
-            gc.indexed_iter().find(|(_, value)| !value.is_finite())
-        {
+        if let Some(((row, col), value)) = gc.indexed_iter().find(|(_, value)| !value.is_finite()) {
             return Err(EstimationError::InvalidInput(format!(
                 "grad_coefficients[{row},{col}] must be finite; got {value}"
             )));
         }
     }
     if let Some(gf) = grad_fitted {
-        if let Some(((row, col), value)) =
-            gf.indexed_iter().find(|(_, value)| !value.is_finite())
-        {
+        if let Some(((row, col), value)) = gf.indexed_iter().find(|(_, value)| !value.is_finite()) {
             return Err(EstimationError::InvalidInput(format!(
                 "grad_fitted[{row},{col}] must be finite; got {value}"
             )));
         }
     }
     if let Some(vec) = grad_lambdas {
-        if let Some((block, value)) = vec.iter().enumerate().find(|(_, value)| !value.is_finite())
-        {
+        if let Some((block, value)) = vec.iter().enumerate().find(|(_, value)| !value.is_finite()) {
             return Err(EstimationError::InvalidInput(format!(
                 "grad_lambdas[{block}] must be finite; got {value}"
             )));
         }
     }
     if let Some(vec) = grad_log_lambdas {
-        if let Some((block, value)) = vec.iter().enumerate().find(|(_, value)| !value.is_finite())
-        {
+        if let Some((block, value)) = vec.iter().enumerate().find(|(_, value)| !value.is_finite()) {
             return Err(EstimationError::InvalidInput(format!(
                 "grad_log_lambdas[{block}] must be finite; got {value}"
             )));
         }
     }
     if let Some(vec) = grad_edf {
-        if let Some((block, value)) = vec.iter().enumerate().find(|(_, value)| !value.is_finite())
-        {
+        if let Some((block, value)) = vec.iter().enumerate().find(|(_, value)| !value.is_finite()) {
             return Err(EstimationError::InvalidInput(format!(
                 "grad_edf[{block}] must be finite; got {value}"
             )));
@@ -1916,7 +1901,11 @@ fn gaussian_reml_fit_blocks_backward_analytic(
     }
     let beta = r.dot(&xtwy);
     let fitted = z.dot(&beta);
-    if let Some((col, value)) = beta.iter().enumerate().find(|(_, value)| !value.is_finite()) {
+    if let Some((col, value)) = beta
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
         return Err(EstimationError::InvalidInput(format!(
             "solved coefficient {col} is non-finite: {value}"
         )));
@@ -2083,8 +2072,7 @@ fn gaussian_reml_fit_blocks_backward_analytic(
         for k in 0..f_blocks {
             for j in 0..f_blocks {
                 let beta_pk_r_pj_beta = p_betas[k].dot(&m_vectors[j]);
-                outer_h[[k, j]] = 0.5 * trace_pairs[[k, j]]
-                    + tau * beta_pk_r_pj_beta
+                outer_h[[k, j]] = 0.5 * trace_pairs[[k, j]] + tau * beta_pk_r_pj_beta
                     - if k == j {
                         0.5 * (t_values[k] + tau * b_values[k])
                     } else {
@@ -2097,9 +2085,8 @@ fn gaussian_reml_fit_blocks_backward_analytic(
         // equation. Preserve signed curvature directions while flooring
         // near-zero modes; flipping negative eigenvalues would change the VJP.
         symmetrize_in_place(&mut outer_h);
-        if let Some(((row, col), value)) = outer_h
-            .indexed_iter()
-            .find(|(_, value)| !value.is_finite())
+        if let Some(((row, col), value)) =
+            outer_h.indexed_iter().find(|(_, value)| !value.is_finite())
         {
             return Err(EstimationError::InvalidInput(format!(
                 "outer rho curvature entry ({row},{col}) is non-finite: {value}"
@@ -2139,8 +2126,7 @@ fn gaussian_reml_fit_blocks_backward_analytic(
             j_blocks[block] += &(r.slice(s![start..end, start..end]).to_owned() * (0.5 * zk));
             for i in 0..(end - start) {
                 for j in 0..(end - start) {
-                    j_blocks[block][[i, j]] +=
-                        0.5 * tau * zk * beta[start + i] * beta[start + j];
+                    j_blocks[block][[i, j]] += 0.5 * tau * zk * beta[start + i] * beta[start + j];
                 }
             }
         }
@@ -2527,9 +2513,10 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
             }
         };
 
-    let s_list: Vec<gam::smooth::BlockwisePenalty> = vec![
-        gam::smooth::BlockwisePenalty::new(0..p_cols, penalty_view.to_owned()),
-    ];
+    let s_list: Vec<gam::smooth::BlockwisePenalty> = vec![gam::smooth::BlockwisePenalty::new(
+        0..p_cols,
+        penalty_view.to_owned(),
+    )];
 
     let opts = gam::estimate::FitOptions {
         latent_cloglog: None,
@@ -2550,8 +2537,7 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
         kronecker_factored: None,
     };
 
-    let heuristic_owned: Option<Vec<f64>> =
-        init_log_lambda.map(|rho| vec![rho.exp()]);
+    let heuristic_owned: Option<Vec<f64>> = init_log_lambda.map(|rho| vec![rho.exp()]);
 
     let x_owned = x_view.to_owned();
     let x_for_active = x_owned.clone();
@@ -2594,7 +2580,10 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
             let ab: Array1<f64> = c.a.dot(&beta);
             for i in 0..c.a.nrows() {
                 let row_scale =
-                    c.a.row(i).iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+                    c.a.row(i)
+                        .iter()
+                        .fold(0.0_f64, |m, &v| m.max(v.abs()))
+                        .max(1.0);
                 let tol = 1e-8 * row_scale * beta_scale.max(c.b[i].abs().max(1.0));
                 if ab[i] >= c.b[i] - tol {
                     out.push(i as u64);
@@ -10109,11 +10098,7 @@ mod tests {
 
     #[test]
     fn symmetric_curvature_solve_preserves_negative_modes() {
-        let matrix = array![
-            [2.0, 0.0, 0.0],
-            [0.0, -4.0, 0.0],
-            [0.0, 0.0, -1.0e-15]
-        ];
+        let matrix = array![[2.0, 0.0, 0.0], [0.0, -4.0, 0.0], [0.0, 0.0, -1.0e-15]];
         let rhs = array![8.0, -8.0, 1.0];
         let solved = solve_symmetric_vector_with_floor(&matrix, &rhs, 1.0e-3)
             .expect("indefinite symmetric curvature solve");
@@ -10348,11 +10333,7 @@ mod tests {
                 _ => unreachable!(),
             }
         });
-        let s1 = array![
-            [0.7, 0.08, 0.02],
-            [0.08, 1.3, -0.04],
-            [0.02, -0.04, 2.1],
-        ];
+        let s1 = array![[0.7, 0.08, 0.02], [0.08, 1.3, -0.04], [0.02, -0.04, 2.1],];
         let s2 = array![[0.9, -0.06], [-0.06, 1.8]];
         let y = Array1::from_shape_fn(n, |row| {
             let t = (row as f64 + 0.5) / n as f64;
@@ -10540,13 +10521,7 @@ mod tests {
                 let mut sp = penalties.clone();
                 sp[block][[row, col]] = candidate;
                 sp[block][[col, row]] = candidate;
-                blocks_profile_reml_score(
-                    &designs,
-                    &sp,
-                    y.view(),
-                    weights.view(),
-                    rhos.as_slice(),
-                )
+                blocks_profile_reml_score(&designs, &sp, y.view(), weights.view(), rhos.as_slice())
             });
             let analytic = if row == col {
                 backward.grad_penalties[block][[row, col]]
