@@ -165,12 +165,6 @@ impl Manifold for Euclidean {
 #[derive(Debug, Clone)]
 pub struct Circle;
 
-impl Circle {
-    fn tangent_basis(p: ArrayView1<f64>) -> (f64, f64) {
-        (-p[1], p[0])
-    }
-}
-
 impl Manifold for Circle {
     fn dim(&self) -> usize {
         1
@@ -502,8 +496,6 @@ impl Manifold for Product {
             c.euclidean_to_riemannian_hess_vp(p_slice, eg_slice, eh_slice, xi_slice);
             off += m;
         }
-        // Suppress unused-self warning under -Dwarnings (helper kept for clarity).
-        let _ = (self.slice_for(0, p), self.slice_mut_for as fn(&Self, usize, ArrayViewMut1<f64>) -> ArrayViewMut1<f64>);
     }
     fn name(&self) -> &str {
         "Product"
@@ -858,7 +850,7 @@ mod tests {
         let m = Euclidean { d: 3 };
         let p = array![0.1_f64, 0.2, 0.3];
         let xi = array![1.0_f64, -1.0, 0.5];
-        let mut out = array![0.0_f64; 3];
+        let mut out = array![0.0_f64, 0.0, 0.0];
         m.retract(p.view(), xi.view(), out.view_mut());
         for i in 0..3 {
             assert!((out[i] - (p[i] + xi[i])).abs() < 1.0e-15);
