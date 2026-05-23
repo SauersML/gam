@@ -171,7 +171,7 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::estimate::EstimationError;
 use crate::mixture_link::{
@@ -203,7 +203,7 @@ pub struct QuadratureContext {
     // Clenshaw-Curtis rules are constructed on demand because the node count is
     // chosen from the certified truncation/ellipse heuristic rather than from a
     // tiny fixed family like the GHQ rules above.
-    cc_cache: Mutex<HashMap<usize, ClenshawCurtisRule>>,
+    cc_cache: Mutex<HashMap<usize, Arc<ClenshawCurtisRule>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -363,14 +363,14 @@ impl QuadratureContext {
         }
     }
 
-    fn clenshaw_curtis_n(&self, n: usize) -> ClenshawCurtisRule {
+    fn clenshaw_curtis_n(&self, n: usize) -> Arc<ClenshawCurtisRule> {
         let mut cache = match self.cc_cache.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         cache
             .entry(n)
-            .or_insert_with(|| compute_clenshaw_curtis_n(n))
+            .or_insert_with(|| Arc::new(compute_clenshaw_curtis_n(n)))
             .clone()
     }
 }
