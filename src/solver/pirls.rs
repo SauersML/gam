@@ -10514,7 +10514,7 @@ pub fn dense_block_xtwx(
             "dense block Fisher shape mismatch: expected ({n}, p, p), got {shape:?}"
         )));
     }
-    if let Some(w) = row_weights {
+    if let Some(w) = row_weights.as_ref() {
         if w.len() != n {
             return Err(EstimationError::InvalidInput(format!(
                 "dense block row weight length mismatch: expected {n}, got {}",
@@ -10592,7 +10592,7 @@ pub fn dense_block_xtwy(
             response.ncols()
         )));
     }
-    if let Some(w) = row_weights {
+    if let Some(w) = row_weights.as_ref() {
         if w.len() != n {
             return Err(EstimationError::InvalidInput(format!(
                 "dense block row weight length mismatch: expected {n}, got {}",
