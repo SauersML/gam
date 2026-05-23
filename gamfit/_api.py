@@ -384,6 +384,16 @@ def _normalize_latents(latents: Mapping[str, Any] | None) -> dict[str, Any] | No
     return out
 
 
+def _normalize_aux_strength(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value == "auto":
+            return None
+        raise ValueError(f"aux_strength string value must be 'auto', got {value!r}")
+    return float(value)
+
+
 def _normalize_precision_pair(value: Any, label: str) -> list[float]:
     if isinstance(value, dict):
         shape = value.get("shape", value.get("a", value.get("a_p")))
@@ -2158,7 +2168,7 @@ def gaussian_reml_fit_latent(
     init_lambda: float | None = None,
     aux_u: Any | None = None,
     aux_family: str = "ridge",
-    aux_strength: float | None = None,
+    aux_strength: float | str | None = None,
     dim_selection_log_precision: Any | None = None,
     basis_kind: str = "duchon",
     tensor_knots_concat: Any | None = None,
@@ -2188,9 +2198,11 @@ def gaussian_reml_fit_latent(
 
     * ``aux_u`` / ``aux_family`` / ``aux_strength`` add the conditional
       Gaussian prior ``R_id = 1/2 * mu * ||t - h(u)||^2``. REML selection of
-      ``mu`` is valid only when the marginal likelihood includes the log
-      ``mu`` normalizer, ``h`` is at least C1, and the conditional precision
-      is positive-definite on the anchored subspace.
+      ``mu`` is selected when ``aux_strength`` is ``None`` or ``"auto"``;
+      explicit floats keep ``mu`` fixed. Auto selection is valid only when
+      the marginal likelihood includes the log ``mu`` normalizer, ``h`` is
+      at least C1, and the conditional precision is positive-definite on the
+      anchored subspace.
     * ``dim_selection_log_precision`` supplies ARD log-precisions, one per
       latent axis. ARD must be paired with an auxiliary prior or an isometry
       penalty to identify axes; by itself it is rotation-symmetric.
@@ -2216,7 +2228,7 @@ def gaussian_reml_fit_latent(
             None if init_lambda is None else float(init_lambda),
             None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
             str(aux_family),
-            None if aux_strength is None else float(aux_strength),
+            _normalize_aux_strength(aux_strength),
             None
             if dim_selection_log_precision is None
             else _numeric_vector(dim_selection_log_precision, "dim_selection_log_precision"),
@@ -2261,7 +2273,7 @@ def gaussian_reml_fit_latent_backward(
     init_lambda: float | None = None,
     aux_u: Any | None = None,
     aux_family: str = "ridge",
-    aux_strength: float | None = None,
+    aux_strength: float | str | None = None,
     dim_selection_log_precision: Any | None = None,
     basis_kind: str = "duchon",
     sigma_eff_mode: str = "profiled",
@@ -2307,7 +2319,7 @@ def gaussian_reml_fit_latent_backward(
             None if init_lambda is None else float(init_lambda),
             None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
             str(aux_family),
-            None if aux_strength is None else float(aux_strength),
+            _normalize_aux_strength(aux_strength),
             None
             if dim_selection_log_precision is None
             else _numeric_vector(dim_selection_log_precision, "dim_selection_log_precision"),
@@ -2351,7 +2363,7 @@ def glm_reml_fit_latent(
     init_lambda: float | None = None,
     aux_u: Any | None = None,
     aux_family: str = "ridge",
-    aux_strength: float | None = None,
+    aux_strength: float | str | None = None,
     dim_selection_log_precision: Any | None = None,
 ) -> dict[str, Any]:
     """Latent-coordinate REML/LAML fit for GLM families via PIRLS.
@@ -2379,7 +2391,7 @@ def glm_reml_fit_latent(
             None if init_lambda is None else float(init_lambda),
             None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
             str(aux_family),
-            None if aux_strength is None else float(aux_strength),
+            _normalize_aux_strength(aux_strength),
             None
             if dim_selection_log_precision is None
             else _numeric_vector(dim_selection_log_precision, "dim_selection_log_precision"),
@@ -2415,7 +2427,7 @@ def glm_reml_fit_latent_backward(
     init_lambda: float | None = None,
     aux_u: Any | None = None,
     aux_family: str = "ridge",
-    aux_strength: float | None = None,
+    aux_strength: float | str | None = None,
     dim_selection_log_precision: Any | None = None,
     basis_kind: str = "duchon",
 ) -> dict[str, Any]:
@@ -2439,7 +2451,7 @@ def glm_reml_fit_latent_backward(
             None if init_lambda is None else float(init_lambda),
             None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
             str(aux_family),
-            None if aux_strength is None else float(aux_strength),
+            _normalize_aux_strength(aux_strength),
             None
             if dim_selection_log_precision is None
             else _numeric_vector(dim_selection_log_precision, "dim_selection_log_precision"),

@@ -3837,6 +3837,10 @@ fn latent_aux_prior_stats(
     if !residual_sq.is_finite() {
         return Err("auxiliary prior residual norm must be finite".to_string());
     }
+    // The pyffi latent entry points receive `t` as the current outer
+    // coordinate. When Python passes None/"auto", the log_mu coordinate has
+    // a closed-form REML optimum for this fixed t because only the normalized
+    // auxiliary prior depends on it.
     let (log_mu, mu, auto) = match aux_strength {
         Some(mu) => {
             if !(mu.is_finite() && mu > 0.0) {
@@ -3875,10 +3879,12 @@ fn set_aux_strength_items<'py>(
     if let Some(state) = state {
         out.set_item("aux_strength", state.mu)?;
         out.set_item("aux_log_strength", state.log_mu)?;
+        out.set_item("log_mu", state.log_mu)?;
         out.set_item("aux_strength_mode", if state.auto { "auto" } else { "fixed" })?;
     } else {
         out.set_item("aux_strength", py.None())?;
         out.set_item("aux_log_strength", py.None())?;
+        out.set_item("log_mu", py.None())?;
         out.set_item("aux_strength_mode", py.None())?;
     }
     Ok(())
@@ -3925,23 +3931,6 @@ fn latent_prior_score_and_aux_state_for_t(
         }
     }
     Ok((latent_prior_score, aux_strength_state))
-}
-
-fn latent_prior_score_for_t(
-    t_mat: ArrayView2<'_, f64>,
-    aux_u: Option<ArrayView2<'_, f64>>,
-    aux_family: AuxPriorFamily,
-    aux_strength: Option<f64>,
-    dim_selection_precision: Option<ArrayView1<'_, f64>>,
-) -> Result<f64, String> {
-    Ok(latent_prior_score_and_aux_state_for_t(
-        t_mat,
-        aux_u,
-        aux_family,
-        aux_strength,
-        dim_selection_precision,
-    )?
-    .0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4778,6 +4767,12 @@ fn sae_manifold_fit_ibp<'py>(
             basis_sizes.len()
         )));
     }
+    if initial_logits.as_array().dim() != (n_obs, k_atoms) {
+        return Err(py_value_error(format!(
+            "initial_logits must be ({n_obs}, {k_atoms}); got {:?}",
+            initial_logits.as_array().dim()
+        )));
+    }
     for (name, value) in [
         ("alpha", alpha),
         ("tau", tau),
@@ -4794,7 +4789,42 @@ fn sae_manifold_fit_ibp<'py>(
         }
     }
 
+    let basis_values_shape = basis_values.as_array().shape().to_vec();
+    if basis_values_shape[0] != k_atoms || basis_values_shape[1] != n_obs {
+        return Err(py_value_error(format!(
+            "basis_values must start with (K, N)=({k_atoms}, {n_obs}); got {:?}",
+            basis_values_shape
+        )));
+    }
+    let basis_jacobian_shape = basis_jacobian.as_array().shape().to_vec();
+    if basis_jacobian_shape[0] != k_atoms || basis_jacobian_shape[1] != n_obs {
+        return Err(py_value_error(format!(
+            "basis_jacobian must start with (K, N)=({k_atoms}, {n_obs}); got {:?}",
+            basis_jacobian_shape
+        )));
+    }
+    let decoder_shape = decoder_coefficients.as_array().shape().to_vec();
+    if decoder_shape[0] != k_atoms || decoder_shape[2] != p_out {
+        return Err(py_value_error(format!(
+            "decoder_coefficients must have shape (K, M_max, p)=({k_atoms}, M_max, {p_out}); got {:?}",
+            decoder_shape
+        )));
+    }
+    let smooth_shape = smooth_penalties.as_array().shape().to_vec();
+    if smooth_shape[0] != k_atoms || smooth_shape[1] != smooth_shape[2] {
+        return Err(py_value_error(format!(
+            "smooth_penalties must have shape (K, M_max, M_max); got {:?}",
+            smooth_shape
+        )));
+    }
     let coords_view = initial_coords.as_array();
+    let coords_shape = coords_view.shape().to_vec();
+    if coords_shape[0] != k_atoms || coords_shape[1] != n_obs {
+        return Err(py_value_error(format!(
+            "initial_coords must start with (K, N)=({k_atoms}, {n_obs}); got {:?}",
+            coords_shape
+        )));
+    }
     let max_dim = coords_view
         .shape()
         .get(2)
@@ -4805,9 +4835,25 @@ fn sae_manifold_fit_ibp<'py>(
     let mut coord_blocks = Vec::with_capacity(k_atoms);
     for atom_idx in 0..k_atoms {
         let d = atom_dim[atom_idx];
+        let m = basis_sizes[atom_idx];
+        if m > basis_values_shape[2]
+            || m > basis_jacobian_shape[2]
+            || m > decoder_shape[1]
+            || m > smooth_shape[1]
+        {
+            return Err(py_value_error(format!(
+                "basis_sizes[{atom_idx}]={m} exceeds one of the padded M_max dimensions"
+            )));
+        }
         if d > max_dim {
             return Err(py_value_error(format!(
                 "atom_dim[{atom_idx}]={d} exceeds initial_coords D_max={max_dim}"
+            )));
+        }
+        if d > basis_jacobian_shape[3] {
+            return Err(py_value_error(format!(
+                "atom_dim[{atom_idx}]={d} exceeds basis_jacobian D_max={}",
+                basis_jacobian_shape[3]
             )));
         }
         coord_blocks.push(coords_view.slice(s![atom_idx, 0..n_obs, 0..d]).to_owned());
@@ -4897,7 +4943,7 @@ fn sae_manifold_fit_ibp<'py>(
 /// correction `J_i^T K_H x_i` is included with one shared solve per row.
 ///
 /// Identifiability-mode contributions to `grad_t`:
-///   * `AuxPrior`: `+ μ · (t − ĥ(u))` on every row;
+///   * `AuxPrior`: the projected pullback of `μ · (t − ĥ(u))`;
 ///   * `DimSelection`: `+ Λ · t` with diagonal precision per axis.
 ///
 /// These additive terms are computed here from the supplied auxiliary /
@@ -5227,8 +5273,10 @@ fn gaussian_reml_fit_latent_backward<'py>(
     out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
     if let Some(grad) = grad_aux_log_strength {
         out.set_item("grad_aux_log_strength", grad)?;
+        out.set_item("grad_log_mu", grad)?;
     } else {
         out.set_item("grad_aux_log_strength", py.None())?;
+        out.set_item("grad_log_mu", py.None())?;
     }
     if let Some(grad) = grad_dim_selection_log_precision {
         out.set_item(
@@ -5727,8 +5775,10 @@ fn glm_reml_fit_latent_backward<'py>(
     out.set_item("grad_t", grad_t_matrix.into_pyarray(py))?;
     if let Some(grad) = grad_aux_log_strength {
         out.set_item("grad_aux_log_strength", grad)?;
+        out.set_item("grad_log_mu", grad)?;
     } else {
         out.set_item("grad_aux_log_strength", py.None())?;
+        out.set_item("grad_log_mu", py.None())?;
     }
     Ok(out.unbind())
 }

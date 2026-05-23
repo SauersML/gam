@@ -152,6 +152,7 @@ pub struct LatentInnerSolver<'a, A: ArrowSystemAssembler> {
 }
 
 impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
+    #[must_use]
     pub fn new(
         beta: Array1<f64>,
         latent: &'a mut LatentCoordValues,
@@ -299,51 +300,36 @@ fn iterate_norm(beta: ArrayView1<'_, f64>, t: ArrayView1<'_, f64>) -> f64 {
     acc.sqrt()
 }
 
-// ---------------------------------------------------------------------------
-// Placeholder assembler used by upstream tests and as a documentation
-// reference for the trait contract. Real assemblers belong to the REML
-// driver (Piece 2 owns the basis-derivative side and Piece 4/5 own the
-// weighted-Gram assembly).
-// ---------------------------------------------------------------------------
-
-/// Minimal no-op assembler that always reports a converged system.
-///
-/// Piece-2 integration point: replaced by the real Duchon/Matern
-/// assembler that reads from the basis registry and produces
-/// Gauss–Newton blocks against the working-weighted residual. The shape
-/// of the trait is already final; only the *body* of `assemble` is a
-/// placeholder here.
-pub struct ZeroAssembler {
-    pub n: usize,
-    pub d: usize,
-    pub k: usize,
-}
-
-impl ArrowSystemAssembler for ZeroAssembler {
-    fn assemble(
-        &mut self,
-        _beta: ArrayView1<'_, f64>,
-        _latent: &LatentCoordValues,
-    ) -> Result<ArrowSchurSystem, String> {
-        // Identity Hessian, zero gradient → immediate convergence.
-        let mut sys = ArrowSchurSystem::new(self.n, self.d, self.k);
-        for j in 0..self.k {
-            sys.hbb[[j, j]] = 1.0;
-        }
-        for row in sys.rows.iter_mut() {
-            for c in 0..self.d {
-                row.htt[[c, c]] = 1.0;
-            }
-        }
-        Ok(sys)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode};
     use ndarray::array;
+
+    struct ZeroAssembler {
+        n: usize,
+        d: usize,
+        k: usize,
+    }
+
+    impl ArrowSystemAssembler for ZeroAssembler {
+        fn assemble(
+            &mut self,
+            _beta: ArrayView1<'_, f64>,
+            _latent: &LatentCoordValues,
+        ) -> Result<ArrowSchurSystem, String> {
+            let mut sys = ArrowSchurSystem::new(self.n, self.d, self.k);
+            for j in 0..self.k {
+                sys.hbb[[j, j]] = 1.0;
+            }
+            for row in sys.rows.iter_mut() {
+                for c in 0..self.d {
+                    row.htt[[c, c]] = 1.0;
+                }
+            }
+            Ok(sys)
+        }
+    }
 
     #[test]
     fn zero_assembler_converges_immediately() {
