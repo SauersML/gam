@@ -468,7 +468,9 @@ fn append_latent_metric_weights(out: &mut Vec<f64>, manifold: &LatentManifold) {
         }
         LatentManifold::Sphere { dim } => {
             let scale = std::f64::consts::PI;
-            out.extend(std::iter::repeat_n(1.0 / (scale * scale), *dim));
+            for _ in 0..*dim {
+                out.push(1.0 / (scale * scale));
+            }
         }
         LatentManifold::Interval { lo, hi } => {
             let scale = hi - lo;
