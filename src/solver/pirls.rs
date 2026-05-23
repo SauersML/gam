@@ -39,6 +39,7 @@ use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
 use serde::{Deserialize, Serialize};
+use statrs::function::beta::ln_beta;
 use statrs::function::gamma::{digamma, ln_gamma};
 
 use faer::linalg::cholesky::llt::factor::LltParams;
@@ -10739,9 +10740,9 @@ fn negative_binomial_unit_deviance(yi: f64, mui_c: f64, theta: f64) -> f64 {
 fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
     let yi_c = safe_beta_response(yi);
     let mui_c = safe_beta_mu(mui);
-    let a = (mui_c * phi).max(BETA_MU_EPS);
-    let b = ((1.0 - mui_c) * phi).max(BETA_MU_EPS);
-    ln_gamma(phi) - ln_gamma(a) - ln_gamma(b)
+    let a = mui_c * phi;
+    let b = (1.0 - mui_c) * phi;
+    -ln_beta(a, b)
         + phi * xlogy(mui_c, yi_c)
         + phi * xlogy(1.0 - mui_c, 1.0 - yi_c)
         - yi_c.ln()
