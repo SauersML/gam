@@ -8769,9 +8769,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         }
     }
     let outer_iterations = outer_result.iterations;
-    // 0.0 = "no gradient measurement at termination" (cache-hit or
-    // gradient-free); finite signal lives in `outer_converged`.
-    let outer_grad_norm = outer_result.final_grad_norm.unwrap_or(0.0);
+    // `None` = no gradient measurement (cache-hit / gradient-free); the
+    // authoritative convergence signal is `outer_converged`.
+    let outer_grad_norm: Option<f64> = outer_result.final_grad_norm;
     let theta_star = outer_result.rho;
     let rho_star = theta_star.slice(s![..rho_dim]).to_owned();
     let adaptive_lambda_start = rho_dim;

@@ -222,7 +222,7 @@ fn biobank_reml_stress_main() {
     assert!(
         fitted.fit.outer_converged,
         "REML outer optimization did not converge \
-         (outer_iterations={}, outer_gradient_norm={:.3e})",
+         (outer_iterations={}, outer_gradient_norm={:?})",
         fitted.fit.outer_iterations, fitted.fit.outer_gradient_norm,
     );
     assert!(
