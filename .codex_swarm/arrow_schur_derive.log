@@ -8790,3 +8790,18 @@ def EuclideanPatch(
 
 codex
 The current tree already contains a first-pass arrow solver and latent inner driver, but it lacks the canonical evidence/IFT contract you asked for. I’m going to create the proposal as a design reference against the present names: `ArrowSchurSystem`, `ArrowRowBlock`, `ArrowFactorCache`, `LatentCoordValues`, `LogSmoothingParams(View)`, `AnalyticPenaltyRegistry`, and the REML `HyperCoord` machinery.
+2026-05-23T18:06:01.054144Z ERROR codex_core::tools::router: error=patch rejected: writing is blocked by read-only sandbox; rejected by user approval settings
+2026-05-23T18:06:12.092531Z ERROR codex_core::tools::router: error=write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open
+codex
+I could not create `/Users/user/gam/proposals/arrow_schur_evidence.md` in this session because the filesystem sandbox is read-only and approval is disabled. The write attempt was rejected by the environment before any file changes were made.
+
+I did read the relevant source only and did not run cargo/tests. The contract was drafted against the existing code names: `ArrowSchurSystem`, `ArrowRowBlock`, `ArrowFactorCache`, `LatentCoordValues`, `LogSmoothingParams(View)`, `AnalyticPenaltyRegistry`, `PenaltyPseudologdet`, `HyperCoord`, and the topology wrappers in `gamfit/topology.py`.
+
+No repository files were modified.
+tokens used
+119,864
+I could not create `/Users/user/gam/proposals/arrow_schur_evidence.md` in this session because the filesystem sandbox is read-only and approval is disabled. The write attempt was rejected by the environment before any file changes were made.
+
+I did read the relevant source only and did not run cargo/tests. The contract was drafted against the existing code names: `ArrowSchurSystem`, `ArrowRowBlock`, `ArrowFactorCache`, `LatentCoordValues`, `LogSmoothingParams(View)`, `AnalyticPenaltyRegistry`, `PenaltyPseudologdet`, `HyperCoord`, and the topology wrappers in `gamfit/topology.py`.
+
+No repository files were modified.

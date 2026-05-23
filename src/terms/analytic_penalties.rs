@@ -16,8 +16,8 @@
 //!     itself live in `ρ` so REML shrinks it.
 //!   * [`ARDPenalty`] — one penalty parameter per latent axis. The marginal
 //!     likelihood's Occam factor sends unused axes' precision to infinity,
-//!     simultaneously fixing the rotation gauge and discovering intrinsic
-//!     dimension.
+//!     discovering intrinsic dimension only after a separate gauge fix
+//!     (`AuxPrior` or `Isometry`) pins rotations / reparameterisations.
 //!
 //! All three are **analytic**: no autograd, no finite differencing. Each
 //! exposes:
@@ -249,48 +249,6 @@ impl std::fmt::Debug for WeightField {
 }
 
 impl WeightField {
-    /// Apply `U_n^T J_n` for row `n`, returning the `(rank × d)` matrix
-    /// flattened row-major. `jac_row` is `J_n` in flat row-major
-    /// `(p * d)` layout. Result for the `Identity` case is just `J_n`
-    /// itself (rank = p).
-    ///
-    /// This is the *one* contraction site in the module: every value/grad/hvp
-    /// path funnels its `W_n`-aware pullback through here, so the
-    /// `(J^T U)(U^T J)` ordering invariant is enforced by construction.
-    fn project_jac_row(
-        &self,
-        jac_row: &[f64],
-        d: usize,
-    ) -> (Array2<f64>, usize) {
-        match self {
-            WeightField::Identity => {
-                let p = jac_row.len() / d;
-                let mut m = Array2::<f64>::zeros((p, d));
-                for i in 0..p {
-                    for a in 0..d {
-                        m[[i, a]] = jac_row[i * d + a];
-                    }
-                }
-                (m, p)
-            }
-            WeightField::Factored { u, rank, p_out } => {
-                let p = *p_out;
-                let r = *rank;
-                debug_assert_eq!(jac_row.len(), p * d);
-                debug_assert_eq!(u.ncols(), p * r);
-                // We need the row of u that matches the row of jac. The caller
-                // passes `jac_row` for row n; we receive U_n as the n-th row of
-                // u — but project_jac_row doesn't know n. We require the
-                // caller to pass U_n directly via `project_jac_row_with_u`.
-                // Default Identity-like fallback (unused — see direct path).
-                let _ = (p, r);
-                unreachable!(
-                    "WeightField::Factored::project_jac_row must be called via project_jac_row_with_u"
-                );
-            }
-        }
-    }
-
     /// Apply `U_n^T J_n` for a specific row, given both the row's `J_n` flat
     /// `(p * d)` slice and the row's `U_n` flat `(p * rank)` slice. Returns
     /// the `(rank × d)` matrix and its row count.
@@ -599,22 +557,25 @@ impl AnalyticPenalty for IsometryPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        // Exact closed-form gradient (chain rule conventions documented at the
-        // top of `IsometryPenalty`):
+        // Exact closed-form gradient, W-aware (chain rule conventions
+        // documented at the top of `IsometryPenalty`):
         //
-        //   P = ½ μ Σ_n Σ_{a,b} D_{n,a,b}²,    D = g_n − g^ref_n
-        //   g_n = J_n^T J_n,   J_n ∈ ℝ^{p × d}
+        //   P     = ½ μ Σ_n ‖D_n‖²_F,   D_n = g_n − g^ref_n
+        //   g_n   = J_n^T W_n J_n,      W_n = U_n U_n^T
+        //   ∂g_{ab}/∂t_c
+        //         = (H_{:,a,c})^T (W J)_{:,b}  +  (J_{:,a})^T W H_{:,b,c}
+        //   ∂P/∂t_c
+        //         = 2 μ Σ_{a,b} D_{a,b} · (H_{:,a,c})^T (W J)_{:,b}     (D = D^T)
         //
-        // ∂P/∂t_{n,c} = μ Σ_{a,b} D_{a,b} · (∂g_{a,b}/∂t_c)
-        //             = μ Σ_{a,b} D_{a,b} · ( H[:,a,c]^T J[:,b] + J[:,a]^T H[:,b,c] )
-        //             = 2 μ Σ_{a,b} D_{a,b} · (H[:,a,c]^T J[:,b])      (by symmetry of D)
+        // where `(W J)_{:,b} = U M_{:,b}` with `M = U^T J ∈ ℝ^{r × d}` —
+        // i.e. the `p × p` `W_n` is never materialized: we form `M_n`
+        // (O(p r d)) and then `WJ_n = U_n M_n` (O(p r d)) per row.
         //
-        // where H_{n}[i, a, c] = ∂J_n[i, a] / ∂t_{n, c}. If the second-
-        // derivative cache is unavailable we fall back to the Gauss-Newton
-        // surrogate (the diagonal-block contraction H_n · t_n), which is what
-        // the IFT inner loop needs for a well-conditioned Newton step; the
-        // dropped term vanishes at the local minimum of the data-fit so this
-        // is also the principled REML-pass surrogate.
+        // When the second-derivative cache is unavailable we fall back to
+        // the Gauss-Newton surrogate `H · t` (also W-aware: `H = 2μ J^T W J`,
+        // which keeps the IFT inner loop well-conditioned; the dropped term
+        // vanishes at the local minimum so this is also the principled
+        // REML-pass surrogate).
         let d = self
             .target
             .latent_dim
@@ -633,33 +594,63 @@ impl AnalyticPenalty for IsometryPenalty {
         if let Some(jac2) = self.jacobian_second_cache.as_ref() {
             debug_assert_eq!(jac2.ncols(), p * d * d);
             for n in 0..n_obs {
+                // Form WJ_n via the low-rank factor: M_n = U_n^T J_n (r × d),
+                // then WJ_n = U_n M_n (p × d). For Identity weight WJ_n = J_n.
+                let wj = match &self.weight {
+                    WeightField::Identity => {
+                        let mut m = Array2::<f64>::zeros((p, d));
+                        for i in 0..p {
+                            for a in 0..d {
+                                m[[i, a]] = jac[[n, i * d + a]];
+                            }
+                        }
+                        m
+                    }
+                    WeightField::Factored { u, rank, p_out } => {
+                        let m_n = self.projected_jacobian_row(n, d);
+                        let r = *rank;
+                        debug_assert_eq!(p, *p_out);
+                        let mut wj = Array2::<f64>::zeros((p, d));
+                        for i in 0..p {
+                            for a in 0..d {
+                                let mut s = 0.0;
+                                for k in 0..r {
+                                    s += u[[n, i * r + k]] * m_n[[k, a]];
+                                }
+                                wj[[i, a]] = s;
+                            }
+                        }
+                        wj
+                    }
+                };
                 for c in 0..d {
                     let mut acc = 0.0;
                     for a in 0..d {
                         for b in 0..d {
                             let diff = g[[n, a * d + b]] - g_ref[[n, a * d + b]];
-                            let mut hj = 0.0;
+                            let mut hwj = 0.0;
                             for i in 0..p {
-                                hj += jac2[[n, (i * d + a) * d + c]] * jac[[n, i * d + b]];
+                                hwj += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
                             }
-                            acc += diff * hj;
+                            acc += diff * hwj;
                         }
                     }
                     grad[n * d + c] = 2.0 * mu * acc;
                 }
             }
         } else {
-            // Gauss-Newton surrogate: H_n · t_n with H_n = 2 J_n^T J_n. This
-            // is the dominant term and the one the inner Newton step uses for
-            // its block-diagonal preconditioner. Documented as the
-            // IFT-warm-start surrogate, not the exact gradient.
+            // Gauss-Newton surrogate: H_n · t_n with H_n = 2 μ J_n^T W_n J_n
+            // = 2 μ M_n^T M_n. M_n is the projected r × d block; this keeps
+            // the path strictly low-rank.
             for n in 0..n_obs {
+                let m = self.projected_jacobian_row(n, d);
+                let r = m.nrows();
                 for a in 0..d {
                     let mut acc = 0.0;
                     for b in 0..d {
                         let mut gab = 0.0;
-                        for i in 0..p {
-                            gab += jac[[n, i * d + a]] * jac[[n, i * d + b]];
+                        for k in 0..r {
+                            gab += m[[k, a]] * m[[k, b]];
                         }
                         acc += gab * target[n * d + b];
                     }
@@ -676,10 +667,20 @@ impl AnalyticPenalty for IsometryPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        // Gauss-Newton approximation: H ≈ 2 μ · M^T M, where M acts on t and
-        // returns vectorized (g - g^ref). The dominant term keeps the IFT
-        // well-conditioned; the dropped term is `O((g - g^ref))` which
+        // Gauss-Newton approximation (W-aware):
+        //   H ≈ 2 μ · J^T W J = 2 μ · M^T M,    M = U^T J ∈ ℝ^{r × d}.
+        //
+        // For each row n we (1) form M_n (r × d), (2) compute u = M_n v_n
+        // (length r), (3) write out_n = 2 μ · M_n^T u (length d). Cost per
+        // row: O(p · r · d + r · d). The dominant term keeps the IFT
+        // well-conditioned; the dropped exact term is `O(D_n)` which
         // vanishes at the local minimum.
+        //
+        // Cross-check with proposals/per_point_hessian.md once it lands: the
+        // Hessian contribution ∂²P_iso/∂t² is dominated by this 2 μ M^T M
+        // block, plus a curvature-of-J term that is the same `H · t` form
+        // appearing in `grad_target`'s exact path (and zero at convergence
+        // for the data-fit residual).
         let mu = rho[self.rho_index].exp();
         let d = self
             .target
@@ -690,20 +691,26 @@ impl AnalyticPenalty for IsometryPenalty {
             .as_ref()
             .expect("isometry penalty requires a live jacobian cache");
         let n_obs = jac.nrows();
-        let p = self.p_out;
         let mut out = Array1::<f64>::zeros(v.len());
         for n in 0..n_obs {
-            // Per-row Gauss-Newton block (d×d): G_n = J_n^T J_n acts on v_n.
-            for a in 0..d {
-                let mut acc = 0.0;
+            let m = self.projected_jacobian_row(n, d);
+            let r = m.nrows();
+            // u = M_n v_n  (r-vector).
+            let mut u = vec![0.0_f64; r];
+            for k in 0..r {
+                let mut s = 0.0;
                 for b in 0..d {
-                    let mut gab = 0.0;
-                    for i in 0..p {
-                        gab += jac[[n, i * d + a]] * jac[[n, i * d + b]];
-                    }
-                    acc += gab * v[n * d + b];
+                    s += m[[k, b]] * v[n * d + b];
                 }
-                out[n * d + a] = 2.0 * mu * acc;
+                u[k] = s;
+            }
+            // out_n = 2 μ · M_n^T u  (d-vector).
+            for a in 0..d {
+                let mut s = 0.0;
+                for k in 0..r {
+                    s += m[[k, a]] * u[k];
+                }
+                out[n * d + a] = 2.0 * mu * s;
             }
         }
         out
@@ -996,7 +1003,8 @@ impl AnalyticPenalty for SparsityPenalty {
 /// summed over `j ∈ [0, d)`. Under REML, axis `j` whose data evidence is too
 /// weak gets `ρ_j → +∞` (precision → ∞, coefficients → 0), so the latent
 /// dimension is effectively pruned. The intrinsic dimensionality is read off
-/// as the count of finite `ρ_j` at convergence.
+/// as the count of finite `ρ_j` at convergence, but only after a separate
+/// gauge-fixing prior (AuxPrior or Isometry) has fixed the rotation gauge.
 ///
 /// Because the penalty is quadratic and block-diagonal in latent axes, it
 /// reduces to a [`BlockwisePenalty`] per axis and slots into the existing
@@ -1023,30 +1031,17 @@ impl ARDPenalty {
         }
     }
 
-    /// Build one [`BlockwisePenalty`] per latent axis. The j-th block has
-    /// `local = I_{n_obs}` and `col_range` equal to the flat indices of that
-    /// axis. The outer REML loop multiplies by `exp(ρ_j)`.
+    /// Build scalar [`BlockwisePenalty`] entries for each latent-axis row.
+    /// Fixes the audit finding that the row-major `LatentCoordValues` layout
+    /// (`n * d + j`) cannot be represented as one contiguous per-axis range.
     pub fn as_blockwise(&self, global_offset: usize) -> Vec<BlockwisePenalty> {
         let n_obs = self.target.len() / self.latent_dim;
-        let mut out = Vec::with_capacity(self.latent_dim);
+        let mut out = Vec::with_capacity(n_obs * self.latent_dim);
         for j in 0..self.latent_dim {
-            // The flat layout is row-major (n * d + a), so axis j picks rows
-            // n=0..n_obs at columns global_offset + n*d + j. The "block" here
-            // is a single diagonal scalar repeated `n_obs` times — represent
-            // it as a ridge of size n_obs at the appropriate stride.
-            //
-            // For the canonical pipeline we collapse this to a contiguous
-            // ridge by reshape: the BlockwisePenalty machinery expects a
-            // contiguous range, so we expose the axis-j ridge as a
-            // length-`n_obs` ridge with a virtual stride captured in
-            // `structure_hint`. Callers that need the stride re-expand using
-            // `latent_dim`.
-            let start = global_offset + j * n_obs;
-            let end = start + n_obs;
-            out.push(
-                BlockwisePenalty::ridge(start..end, 1.0)
-                    .with_op(None),
-            );
+            for n in 0..n_obs {
+                let idx = global_offset + self.target.range.start + n * self.latent_dim + j;
+                out.push(BlockwisePenalty::ridge(idx..idx + 1, 1.0).with_op(None));
+            }
         }
         out
     }
@@ -1371,7 +1366,11 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 }
             }
             AnalyticPenaltyKind::Isometry(p) => {
-                // Gauss-Newton diagonal: diag(2μ J^T J).
+                // Gauss-Newton diagonal: diag(2μ J^T W J) = diag(2μ M^T M),
+                // where M = U^T J is the projected (r × d) Jacobian. The
+                // diagonal entry for axis a is `2 μ · Σ_k M[k, a]²`. Built
+                // via the same projected-jacobian helper that guarantees the
+                // `(J^T U)(U^T J)` contraction order.
                 let d = p
                     .target
                     .latent_dim
@@ -1381,14 +1380,15 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                     .as_ref()
                     .expect("isometry penalty requires a live jacobian cache");
                 let n_obs = jac.nrows();
-                let p_out = p.p_out;
                 let mu = self.rho[p.rho_index].exp();
                 let mut out = Array1::<f64>::zeros(self.target.len());
                 for n in 0..n_obs {
+                    let m = p.projected_jacobian_row(n, d);
+                    let r = m.nrows();
                     for a in 0..d {
                         let mut gaa = 0.0;
-                        for i in 0..p_out {
-                            let v = jac[[n, i * d + a]];
+                        for k in 0..r {
+                            let v = m[[k, a]];
                             gaa += v * v;
                         }
                         out[n * d + a] = 2.0 * mu * gaa;
