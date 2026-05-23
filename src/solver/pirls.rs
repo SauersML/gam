@@ -9691,6 +9691,20 @@ pub fn directionalworking_curvature_from_c_array(
     DirectionalWorkingCurvature::Diagonal(w_direction)
 }
 
+/// Floor/ceiling for binomial mu before taking `ln(mu)` / `ln(1 - mu)`.
+/// Matches the precedent in families/lognormal_kernel.rs (1e-12) so that
+/// saturating inverse links (probit, cloglog, logit at large |eta|) cannot
+/// produce -inf in the deviance or log-likelihood reductions.
+const BINOMIAL_MU_EPS: f64 = 1e-12;
+
+/// Clamp `mu` away from 0 and 1 so `mu.ln()` and `(1 - mu).ln()` are finite.
+/// Centralized to keep deviance and log-likelihood symmetric — both must use
+/// the same floor or the log-lik / deviance identity drifts near saturation.
+#[inline]
+fn safe_mu_for_binomial(mu: f64) -> f64 {
+    mu.clamp(BINOMIAL_MU_EPS, 1.0 - BINOMIAL_MU_EPS)
+}
+
 #[inline]
 pub fn calculate_deviance(
     y: ArrayView1<f64>,
@@ -9711,7 +9725,12 @@ pub fn calculate_deviance(
                 .into_par_iter()
                 .map(|i| {
                     let yi = y[i];
-                    let mui_c = mu[i];
+                    // Inverse links (probit, cloglog, logit) can saturate to
+                    // exactly 0 or 1 in finite precision; clamp before ln so
+                    // the deviance sum stays finite. Uses the same floor as
+                    // the log-likelihood site below to keep the two reductions
+                    // self-consistent.
+                    let mui_c = safe_mu_for_binomial(mu[i]);
                     let wi = priorweights[i];
                     let term1 = if yi > EPS {
                         yi * (yi.ln() - mui_c.ln())
@@ -9793,7 +9812,10 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
         | GlmLikelihoodFamily::BinomialMixture => (0..n)
             .into_par_iter()
             .map(|i| {
-                let mui_c = mu[i].clamp(EPS, 1.0 - EPS);
+                // Share the deviance helper so both reductions floor mu at
+                // the same epsilon — otherwise the deviance / log-lik identity
+                // drifts whenever the link saturates.
+                let mui_c = safe_mu_for_binomial(mu[i]);
                 priorweights[i] * (y[i] * mui_c.ln() + (1.0 - y[i]) * (1.0 - mui_c).ln())
             })
             .sum(),
