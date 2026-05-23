@@ -2154,7 +2154,7 @@ def gaussian_reml_fit_latent(
     *,
     m: int = 2,
     weights: Any | None = None,
-    fisher_W: Any | None = None,
+    fisher_w: Any | None = None,
     init_lambda: float | None = None,
     aux_u: Any | None = None,
     aux_family: str = "ridge",
@@ -2212,7 +2212,7 @@ def gaussian_reml_fit_latent(
             _numeric_matrix(penalty, "penalty"),
             int(m),
             None if weights is None else _numeric_vector(weights, "weights"),
-            None if fisher_W is None else np.asarray(fisher_W, dtype=float),
+            None if fisher_w is None else np.asarray(fisher_w, dtype=float),
             None if init_lambda is None else float(init_lambda),
             None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
             str(aux_family),
@@ -2257,7 +2257,7 @@ def gaussian_reml_fit_latent_backward(
     grad_edf: float = 0.0,
     m: int = 2,
     weights: Any | None = None,
-    fisher_W: Any | None = None,
+    fisher_w: Any | None = None,
     init_lambda: float | None = None,
     aux_u: Any | None = None,
     aux_family: str = "ridge",
@@ -2303,7 +2303,7 @@ def gaussian_reml_fit_latent_backward(
             float(grad_edf),
             int(m),
             None if weights is None else _numeric_vector(weights, "weights"),
-            None if fisher_W is None else np.asarray(fisher_W, dtype=float),
+            None if fisher_w is None else np.asarray(fisher_w, dtype=float),
             None if init_lambda is None else float(init_lambda),
             None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
             str(aux_family),
@@ -2347,7 +2347,7 @@ def glm_reml_fit_latent(
     *,
     m: int = 2,
     weights: Any | None = None,
-    fisher_W: Any | None = None,
+    fisher_w: Any | None = None,
     init_lambda: float | None = None,
     aux_u: Any | None = None,
     aux_family: str = "ridge",
@@ -2358,7 +2358,7 @@ def glm_reml_fit_latent(
 
     ``family`` accepts ``"binomial-logit"``, ``"binomial-probit"``,
     ``"binomial-cloglog"``, ``"poisson-log"``, ``"gamma-log"``, and
-    ``"gaussian-identity"``. ``fisher_W`` is an advanced internal hook; this
+    ``"gaussian-identity"``. ``fisher_w`` is an advanced internal hook; this
     scalar-response entry point currently accepts blocks with shape ``(N,1,1)``.
     """
     import numpy as np
@@ -2375,7 +2375,7 @@ def glm_reml_fit_latent(
             str(family),
             int(m),
             None if weights is None else _numeric_vector(weights, "weights"),
-            None if fisher_W is None else np.asarray(fisher_W, dtype=float),
+            None if fisher_w is None else np.asarray(fisher_w, dtype=float),
             None if init_lambda is None else float(init_lambda),
             None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
             str(aux_family),
@@ -2411,7 +2411,7 @@ def glm_reml_fit_latent_backward(
     grad_reml_score: float = 1.0,
     m: int = 2,
     weights: Any | None = None,
-    fisher_W: Any | None = None,
+    fisher_w: Any | None = None,
     init_lambda: float | None = None,
     aux_u: Any | None = None,
     aux_family: str = "ridge",
@@ -2435,7 +2435,7 @@ def glm_reml_fit_latent_backward(
             float(grad_reml_score),
             int(m),
             None if weights is None else _numeric_vector(weights, "weights"),
-            None if fisher_W is None else np.asarray(fisher_W, dtype=float),
+            None if fisher_w is None else np.asarray(fisher_w, dtype=float),
             None if init_lambda is None else float(init_lambda),
             None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
             str(aux_family),
