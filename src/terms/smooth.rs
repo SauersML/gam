@@ -9352,6 +9352,11 @@ fn evaluate_standard_familyobservations(
                     "bounded linear terms are not supported for PoissonLog fits".to_string(),
                 ));
             }
+            LikelihoodFamily::NegativeBinomial { .. } => {
+                return Err(EstimationError::InvalidInput(
+                    "bounded linear terms are not supported for NegativeBinomial fits".to_string(),
+                ));
+            }
             LikelihoodFamily::GammaLog => {
                 return Err(EstimationError::InvalidInput(
                     "bounded linear terms are not supported for GammaLog fits".to_string(),
@@ -12535,7 +12540,7 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
     }
     if latent_terms.len() != 1 {
         return Err(EstimationError::InvalidInput(
-            "LatentCoord standard-fit hyper_dirs currently require exactly one radial latent smooth term".to_string(),
+            "LatentCoord standard-fit hyper_dirs currently require exactly one latent smooth term".to_string(),
         ));
     }
     let term_idx = latent_terms[0];
@@ -12554,6 +12559,10 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
     let global_range =
         (smooth_start + smooth_term.coeff_range.start)..(smooth_start + smooth_term.coeff_range.end);
 
+    // Spline bases do not add a separate continuous basis-scale ψ coordinate
+    // here. When they are latent-coordinate terms, their ψ directions are the
+    // latent-coordinate axes below, using the same DirectionalHyperParam layout
+    // as Matérn and Duchon.
     let operator = match (&termspec.basis, &smooth_term.metadata) {
         (
             SmoothBasisSpec::Matern { .. },
@@ -13409,8 +13418,49 @@ impl SingleBlockLatentCoordDesignCache {
                 length_scale: *length_scale,
                 nullspace_order: *nullspace_order,
             }),
+            (
+                SmoothBasisSpec::Sphere { .. },
+                BasisMetadata::Sphere {
+                    centers,
+                    penalty_order,
+                    method,
+                    ..
+                },
+            ) if matches!(*method, crate::basis::SphereMethod::Wahba) => {
+                Ok(crate::solver::latent_cache::LatentBasisKind::Sphere {
+                    centers: centers.clone(),
+                    penalty_order: *penalty_order,
+                })
+            }
+            (
+                SmoothBasisSpec::BSpline1D { spec, .. },
+                BasisMetadata::BSpline1D {
+                    knots, periodic, ..
+                },
+            ) => {
+                if let Some((domain_start, period, num_basis)) = periodic {
+                    Ok(crate::solver::latent_cache::LatentBasisKind::PeriodicBspline {
+                        domain_start: *domain_start,
+                        period: *period,
+                        degree: spec.degree,
+                        num_basis: *num_basis,
+                    })
+                } else {
+                    Ok(crate::solver::latent_cache::LatentBasisKind::TensorBspline {
+                        knots: vec![knots.clone()],
+                        degrees: vec![spec.degree],
+                    })
+                }
+            }
+            (
+                SmoothBasisSpec::TensorBSpline { .. },
+                BasisMetadata::TensorBSpline { knots, degrees, .. },
+            ) => Ok(crate::solver::latent_cache::LatentBasisKind::TensorBspline {
+                knots: knots.clone(),
+                degrees: degrees.clone(),
+            }),
             _ => Err(SmoothError::invalid_config(
-                "latent-coordinate design cache supports Matérn and Duchon radial smooths"
+                "latent-coordinate design cache could not key the realized latent smooth basis"
                     .to_string(),
             )
             .into()),
@@ -16212,6 +16262,7 @@ pub(crate) fn seed_risk_profile_for_likelihood_family(
         | LikelihoodFamily::BinomialBetaLogistic
         | LikelihoodFamily::BinomialMixture
         | LikelihoodFamily::PoissonLog
+        | LikelihoodFamily::NegativeBinomial { .. }
         | LikelihoodFamily::GammaLog => crate::seeding::SeedRiskProfile::GeneralizedLinear,
     }
 }

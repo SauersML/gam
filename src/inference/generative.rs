@@ -12,6 +12,9 @@ pub enum NoiseModel {
         sigma: Array1<f64>,
     },
     Poisson,
+    NegativeBinomial {
+        theta: f64,
+    },
     Gamma {
         /// Fixed Gamma shape parameter (k > 0), with mean-driven scale.
         shape: f64,
@@ -87,6 +90,32 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
                 })?;
                 let draw = rand_distr::Distribution::sample(&dist, rng);
                 y[i] = draw;
+            }
+            Ok(y)
+        }
+        NoiseModel::NegativeBinomial { theta } => {
+            if !(theta.is_finite() && *theta > 0.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "invalid negative-binomial theta: {theta}"
+                )));
+            }
+            let mut y = Array1::<f64>::zeros(spec.mean.len());
+            for i in 0..y.len() {
+                let mu = spec.mean[i].max(1e-12);
+                let scale = (mu / *theta).max(1e-12);
+                let gamma = rand_distr::Gamma::new(*theta, scale).map_err(|e| {
+                    EstimationError::InvalidInput(format!(
+                        "invalid NegativeBinomial gamma mixture params theta={} scale={scale}: {e}",
+                        *theta
+                    ))
+                })?;
+                let lambda = rand_distr::Distribution::sample(&gamma, rng).max(1e-12);
+                let poisson = rand_distr::Poisson::new(lambda).map_err(|e| {
+                    EstimationError::InvalidInput(format!(
+                        "invalid NegativeBinomial Poisson rate {lambda}: {e}"
+                    ))
+                })?;
+                y[i] = rand_distr::Distribution::sample(&poisson, rng);
             }
             Ok(y)
         }

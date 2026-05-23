@@ -709,6 +709,7 @@ fn dispersion_from_likelihood(
         | GlmLikelihoodFamily::BinomialSas
         | GlmLikelihoodFamily::BinomialBetaLogistic
         | GlmLikelihoodFamily::BinomialMixture
+        | GlmLikelihoodFamily::NegativeBinomial { .. }
         | GlmLikelihoodFamily::PoissonLog => Dispersion::Known(1.0),
     }
 }
@@ -3618,6 +3619,7 @@ where
         | GlmLikelihoodFamily::BinomialSas
         | GlmLikelihoodFamily::BinomialBetaLogistic
         | GlmLikelihoodFamily::BinomialMixture
+        | GlmLikelihoodFamily::NegativeBinomial { .. }
         | GlmLikelihoodFamily::PoissonLog => 1.0,
     };
     let dispersion = dispersion_from_likelihood(pirls_res.likelihood, standard_deviation);
@@ -5257,6 +5259,7 @@ impl UnifiedFitResult {
                 )),
             },
             crate::types::LikelihoodFamily::PoissonLog
+            | crate::types::LikelihoodFamily::NegativeBinomial { .. }
             | crate::types::LikelihoodFamily::GammaLog => {
                 Ok(FittedLinkState::Standard(Some(LinkFunction::Log)))
             }
