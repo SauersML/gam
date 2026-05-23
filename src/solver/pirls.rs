@@ -9259,6 +9259,7 @@ fn integrated_inverse_link_from_family(
         | GlmLikelihoodFamily::PoissonLog
         | GlmLikelihoodFamily::Tweedie { .. }
         | GlmLikelihoodFamily::NegativeBinomial { .. }
+        | GlmLikelihoodFamily::BetaLogit { .. }
         | GlmLikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(format!(
             "Integrated link-runtime update is not supported for family {:?}",
             family
@@ -9708,6 +9709,44 @@ fn computeworkingweight_derivatives_from_eta(
                     },
                 )?;
         }
+        GlmLikelihoodFamily::BetaLogit { phi } => {
+            if !valid_beta_phi(phi) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "beta-regression phi must be finite and > 0; got {phi}"
+                )));
+            }
+            let c_s = c.as_slice_mut().expect("c must be contiguous");
+            let d_s = d.as_slice_mut().expect("d must be contiguous");
+            let dmu_s = dmu_deta
+                .as_slice_mut()
+                .expect("dmu_deta must be contiguous");
+            let d2_s = d2mu_deta2
+                .as_slice_mut()
+                .expect("d2mu_deta2 must be contiguous");
+            let d3_s = d3mu_deta3
+                .as_slice_mut()
+                .expect("d3mu_deta3 must be contiguous");
+            c_s.par_iter_mut()
+                .zip(d_s.par_iter_mut())
+                .zip(dmu_s.par_iter_mut())
+                .zip(d2_s.par_iter_mut())
+                .zip(d3_s.par_iter_mut())
+                .enumerate()
+                .try_for_each(
+                    |(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| -> Result<(), EstimationError> {
+                        let eta_used = eta[i].clamp(-700.0, 700.0);
+                        let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
+                        let mu_i = safe_beta_mu(jet.mu);
+                        let q = (mu_i * (1.0 - mu_i)).max(BETA_MU_EPS);
+                        *c_o = 0.0;
+                        *d_o = 0.0;
+                        *dmu_o = q;
+                        *d2_o = q * (1.0 - 2.0 * mu_i);
+                        *d3_o = q * (1.0 - 6.0 * q);
+                        Ok(())
+                    },
+                )?;
+        }
         GlmLikelihoodFamily::GammaLog => {
             let dmu_s = dmu_deta
                 .as_slice_mut()
@@ -9949,6 +9988,20 @@ impl VarianceJet {
         // V(μ) = μ(1−μ), same jet as Bernoulli
         Self::bernoulli(mu)
     }
+
+    /// Beta-regression variance V(μ) = μ(1−μ)/(1+φ).
+    #[inline]
+    pub fn beta(mu: f64, phi: f64) -> Self {
+        let scale = 1.0 / (1.0 + phi.max(1e-12));
+        let base = Self::bernoulli(mu);
+        Self {
+            v: base.v * scale,
+            v1: base.v1 * scale,
+            v2: base.v2 * scale,
+            v3: 0.0,
+            v4: 0.0,
+        }
+    }
 }
 
 const OBSERVED_HESSIAN_WEIGHT_FLOOR_FRAC: f64 = 1e-6;
@@ -10027,6 +10080,7 @@ pub fn weight_family_for_glm_likelihood(likelihood: GlmLikelihoodSpec) -> Weight
         GlmLikelihoodFamily::PoissonLog => WeightFamily::Poisson,
         GlmLikelihoodFamily::Tweedie { p } => WeightFamily::Tweedie { p },
         GlmLikelihoodFamily::NegativeBinomial { theta } => WeightFamily::NegativeBinomial { theta },
+        GlmLikelihoodFamily::BetaLogit { phi } => WeightFamily::Beta { phi },
         GlmLikelihoodFamily::GammaLog => WeightFamily::Gamma,
         GlmLikelihoodFamily::BinomialLogit
         | GlmLikelihoodFamily::BinomialProbit
@@ -10532,6 +10586,7 @@ pub enum WeightFamily {
     Poisson,
     Tweedie { p: f64 },
     NegativeBinomial { theta: f64 },
+    Beta { phi: f64 },
     Gamma,
 }
 
@@ -10557,6 +10612,7 @@ pub fn variance_jet_for_weight_family(family: WeightFamily, mu: f64) -> Variance
         WeightFamily::Poisson => VarianceJet::poisson(mu),
         WeightFamily::Tweedie { p } => VarianceJet::tweedie(mu, p),
         WeightFamily::NegativeBinomial { theta } => VarianceJet::negative_binomial(mu, theta),
+        WeightFamily::Beta { phi } => VarianceJet::beta(mu, phi),
         WeightFamily::Gamma => VarianceJet::gamma(mu),
     }
 }
@@ -10680,6 +10736,26 @@ fn negative_binomial_unit_deviance(yi: f64, mui_c: f64, theta: f64) -> f64 {
 }
 
 #[inline]
+fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
+    let yi_c = safe_beta_response(yi);
+    let mui_c = safe_beta_mu(mui);
+    let a = (mui_c * phi).max(BETA_MU_EPS);
+    let b = ((1.0 - mui_c) * phi).max(BETA_MU_EPS);
+    ln_gamma(phi) - ln_gamma(a) - ln_gamma(b)
+        + phi * xlogy(mui_c, yi_c)
+        + phi * xlogy(1.0 - mui_c, 1.0 - yi_c)
+        - yi_c.ln()
+        - (1.0 - yi_c).ln()
+}
+
+#[inline]
+fn beta_unit_deviance(yi: f64, mui: f64, phi: f64) -> f64 {
+    let yi_c = safe_beta_response(yi);
+    2.0 * (beta_loglikelihood_full_unit(yi_c, yi_c, phi)
+        - beta_loglikelihood_full_unit(yi_c, mui, phi))
+}
+
+#[inline]
 pub fn calculate_deviance(
     y: ArrayView1<f64>,
     mu: &Array1<f64>,
@@ -10788,6 +10864,16 @@ pub fn calculate_deviance(
                 .sum();
             2.0 * total
         }
+        GlmLikelihoodFamily::BetaLogit { phi } => {
+            if !valid_beta_phi(phi) {
+                return f64::NAN;
+            }
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            (0..y.len())
+                .into_par_iter()
+                .map(|i| priorweights[i] * beta_unit_deviance(y[i], mu[i], phi))
+                .sum()
+        }
         GlmLikelihoodFamily::GammaLog => {
             let shape = likelihood.gamma_shape().unwrap_or(1.0);
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -10879,6 +10965,15 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                         + theta * (theta.ln() - (theta + mui_c).ln())
                         + xlogy(yi, mui_c)
                         - yi * (theta + mui_c).ln())
+            })
+            .sum(),
+        GlmLikelihoodFamily::BetaLogit { phi } => (0..n)
+            .into_par_iter()
+            .map(|i| {
+                if !valid_beta_phi(phi) {
+                    return f64::NAN;
+                }
+                priorweights[i] * beta_loglikelihood_full_unit(y[i], mu[i], phi)
             })
             .sum(),
         GlmLikelihoodFamily::GammaLog => gamma_loglikelihood_with_shape(

@@ -711,6 +711,7 @@ fn dispersion_from_likelihood(
         | GlmLikelihoodFamily::BinomialMixture
         | GlmLikelihoodFamily::Tweedie { .. }
         | GlmLikelihoodFamily::NegativeBinomial { .. }
+        | GlmLikelihoodFamily::BetaLogit { .. }
         | GlmLikelihoodFamily::PoissonLog => Dispersion::Known(1.0),
     }
 }
@@ -3622,6 +3623,7 @@ where
         | GlmLikelihoodFamily::BinomialMixture
         | GlmLikelihoodFamily::Tweedie { .. }
         | GlmLikelihoodFamily::NegativeBinomial { .. }
+        | GlmLikelihoodFamily::BetaLogit { .. }
         | GlmLikelihoodFamily::PoissonLog => 1.0,
     };
     let dispersion = dispersion_from_likelihood(pirls_res.likelihood, standard_deviation);

@@ -245,6 +245,9 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 // E[exp(η)] where η ~ N(eta, se²) = exp(eta + se²/2)  (log-normal MGF)
                 Ok((eta + 0.5 * se_eta * se_eta).exp())
             }
+            LikelihoodFamily::BetaLogit { .. } => {
+                Ok(logit_posterior_meanvariance(quadctx, eta, se_eta).0)
+            }
             LikelihoodFamily::RoystonParmar => Ok(survival_posterior_mean(quadctx, eta, se_eta)),
         }
     }
@@ -325,6 +328,9 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 let m2 = (2.0 * eta + s2).exp() * (s2.exp() - 1.0);
                 Ok((m1, m2.max(0.0)))
             }
+            LikelihoodFamily::BetaLogit { .. } => {
+                Ok(logit_posterior_meanvariance(quadctx, eta, se_eta))
+            }
             LikelihoodFamily::RoystonParmar => {
                 Ok(survival_posterior_meanvariance(quadctx, eta, se_eta))
             }
@@ -362,6 +368,14 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                     )));
                 }
                 Ok(NoiseModel::NegativeBinomial { theta })
+            }
+            LikelihoodFamily::BetaLogit { phi } => {
+                if !(phi.is_finite() && phi > 0.0) {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "beta-regression phi must be finite and > 0; got {phi}"
+                    )));
+                }
+                Ok(NoiseModel::Beta { phi })
             }
             LikelihoodFamily::GammaLog => {
                 // Callers should pass the fitted Gamma shape; default to 1 only
