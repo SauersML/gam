@@ -97,6 +97,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
 use std::sync::Arc;
 
 use crate::terms::analytic_penalties::{AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier};
+use crate::terms::latent_coord::LatentCoordValues;
 
 const DIRECT_SOLVE_MAX_K: usize = 2_000;
 const DEFAULT_PCG_MAX_ITERATIONS: usize = 200;
@@ -213,6 +214,11 @@ pub struct ArrowSolveOptions {
     pub mode: ArrowSolverMode,
     pub pcg: ArrowPcgOptions,
     pub trust_region: ArrowTrustRegionOptions,
+    /// Interpret trust-region norms in the Riemannian metric of the latent
+    /// manifold. The shipped manifolds use the ambient Euclidean pullback, so
+    /// Steihaug-CG's dot products remain the same after row blocks are
+    /// tangent-projected.
+    pub riemannian_trust_region: bool,
 }
 
 impl ArrowSolveOptions {
@@ -223,6 +229,7 @@ impl ArrowSolveOptions {
             mode: ArrowSolverMode::automatic(k),
             pcg: ArrowPcgOptions::default(),
             trust_region: ArrowTrustRegionOptions::default(),
+            riemannian_trust_region: false,
         }
     }
 
@@ -233,6 +240,7 @@ impl ArrowSolveOptions {
             mode: ArrowSolverMode::Direct,
             pcg: ArrowPcgOptions::default(),
             trust_region: ArrowTrustRegionOptions::default(),
+            riemannian_trust_region: false,
         }
     }
 
@@ -242,6 +250,7 @@ impl ArrowSolveOptions {
             mode: ArrowSolverMode::SqrtBA,
             pcg: ArrowPcgOptions::default(),
             trust_region: ArrowTrustRegionOptions::default(),
+            riemannian_trust_region: false,
         }
     }
 
@@ -251,6 +260,7 @@ impl ArrowSolveOptions {
             mode: ArrowSolverMode::InexactPCG,
             pcg: ArrowPcgOptions::default(),
             trust_region: ArrowTrustRegionOptions::default(),
+            riemannian_trust_region: false,
         }
     }
 }
@@ -531,6 +541,31 @@ impl ArrowSchurSystem {
                     // outer level (see RemlState::evaluate_unified_with_psi_ext).
                 }
             }
+        }
+    }
+
+    /// Convert row-local Euclidean latent blocks to Riemannian tangent blocks.
+    ///
+    /// This is the only arrow-Schur algebra change needed for manifold
+    /// latents: `g_t`, `H_tt`, and each `H_tβ` column are projected to
+    /// `T_{t_i}M`, while the shared β block and Schur structure remain
+    /// untouched. Embedded constrained manifolds carry a pinned normal block
+    /// so the existing ambient Cholesky factorization still works; all RHS
+    /// terms live in the tangent space, so the solved update retracts cleanly.
+    pub fn apply_riemannian_latent_geometry(&mut self, latent: &LatentCoordValues) {
+        let manifold = latent.manifold();
+        if manifold.is_euclidean() {
+            return;
+        }
+        debug_assert_eq!(latent.n_obs(), self.rows.len());
+        debug_assert_eq!(latent.latent_dim(), self.d);
+        for (i, row) in self.rows.iter_mut().enumerate() {
+            let t_i = ArrayView1::from(latent.row(i));
+            let gt_e = row.gt.clone();
+            let htt_e = row.htt.clone();
+            row.gt = manifold.project_to_tangent(t_i, gt_e.view());
+            row.htt = manifold.riemannian_hessian_matrix(t_i, gt_e.view(), htt_e.view());
+            row.htbeta = manifold.project_matrix_columns_to_tangent(t_i, row.htbeta.view());
         }
     }
 
@@ -869,6 +904,81 @@ pub fn solve_arrow_newton_step_with_options(
         k,
     };
     Ok((delta_t, delta_beta, cache))
+}
+
+// ===========================================================================
+// Riemannian retraction hook (additive — opt-in)
+// ===========================================================================
+//
+// The existing Newton step above returns `delta_t` as a flat Euclidean
+// increment to be added to the current latent field. When the caller has
+// equipped each per-row latent coordinate `t_i` with a non-trivial manifold
+// (e.g. S¹ for periodic, S² for sphere) the increment must be applied via a
+// retraction rather than free addition. The helper below performs that
+// post-processing in-place and is intentionally orthogonal to the existing
+// solver: when no manifold is supplied — or every entry is
+// `ManifoldKind::Euclidean(d)` — the result is bit-equivalent to
+// `new_point[i] = point[i] + delta_t[i]`, matching the pre-Riemannian path.
+//
+// Callers integrating the Riemannian per-point step do:
+//
+//   let (delta_t, delta_beta, cache) = solve_arrow_newton_step_with_options(...);
+//   let new_points = apply_per_row_retraction(&points_flat, &delta_t,
+//                                              row_ambient_dim, manifolds);
+//
+// where `manifolds.get(i)` is the optional per-row `ManifoldKind`.
+
+/// Apply a per-row retraction to a Euclidean tangent `delta_t`.
+///
+/// `point_flat` has length `N · d_ambient` (row-major). `delta_t` has the
+/// same length. `manifolds.get(i)` supplies an optional per-row manifold; an
+/// entry of `None` or a `ManifoldKind::Euclidean(_)` is treated as flat space
+/// and produces `point + delta` bit-equivalently.
+///
+/// Returns the new flat point array; does not consume the cache or touch the
+/// existing Newton arithmetic.
+pub fn apply_per_row_retraction(
+    point_flat: &Array1<f64>,
+    delta_t: &Array1<f64>,
+    row_ambient_dim: usize,
+    manifolds: &[Option<crate::solver::riemannian::ManifoldKind>],
+) -> Array1<f64> {
+    let n = manifolds.len();
+    debug_assert_eq!(point_flat.len(), n * row_ambient_dim);
+    debug_assert_eq!(delta_t.len(), n * row_ambient_dim);
+    let mut out = Array1::<f64>::zeros(n * row_ambient_dim);
+    for i in 0..n {
+        let start = i * row_ambient_dim;
+        let end = start + row_ambient_dim;
+        let p = point_flat.slice(ndarray::s![start..end]);
+        let dx = delta_t.slice(ndarray::s![start..end]);
+        match manifolds[i].as_ref() {
+            None => {
+                for c in 0..row_ambient_dim {
+                    out[start + c] = p[c] + dx[c];
+                }
+            }
+            Some(kind) if kind.is_euclidean() => {
+                for c in 0..row_ambient_dim {
+                    out[start + c] = p[c] + dx[c];
+                }
+            }
+            Some(kind) => {
+                let m = kind.build();
+                let mut new_pt = Array1::<f64>::zeros(row_ambient_dim);
+                crate::solver::riemannian::retract_euclidean_delta(
+                    m.as_ref(),
+                    p,
+                    dx,
+                    new_pt.view_mut(),
+                );
+                for c in 0..row_ambient_dim {
+                    out[start + c] = new_pt[c];
+                }
+            }
+        }
+    }
+    out
 }
 
 fn reduced_rhs_beta<B: BatchedBlockSolver>(

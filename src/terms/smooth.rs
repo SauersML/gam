@@ -1700,6 +1700,8 @@ pub struct StandardLatentCoordConfig {
     pub values: std::sync::Arc<crate::terms::latent_coord::LatentCoordValues>,
     pub term_index: usize,
     pub feature_cols: Vec<usize>,
+    pub manifold: crate::terms::latent_coord::LatentManifold,
+    pub manifold_auto: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
