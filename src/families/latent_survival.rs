@@ -2586,13 +2586,67 @@ fn build_latent_survival_row(
 #[derive(Clone, Copy)]
 struct BinaryFromLogSurvival {
     log_lik: f64,
+    /// dℓ/ds where s = log_survival and ℓ = log_lik. For event=1 this is
+    /// ℓ' = -S/(1-S); for event=0 this is ℓ' = 1 (because ℓ ≡ s).
     grad_scale: f64,
+    /// Coefficient applied to `survival_jet.neg_hessian` (which equals
+    /// -d²s/dβ²) when assembling the negative Hessian of `wi * log_lik`
+    /// against β. The Newton accumulator computes
+    ///     neg_Hess(log_lik) = grad_scale * neg_hessian + outer_scale * score²
+    /// so by the chain rule this MUST equal `grad_scale` (= ℓ'). Keeping
+    /// the two fields separate is purely for readability at call sites;
+    /// the `debug_assert!` in [`binary_log_survival_scales`] enforces the
+    /// equality.
     neg_hess_scale: f64,
+    /// -ℓ''(s). For event=1 this is +S/(1-S)²; for event=0 it is 0.
     outer_scale: f64,
+    /// ℓ''(s) — derivative of `grad_scale` w.r.t. s.
     grad_scale_prime: f64,
+    /// ℓ'''(s) — second derivative of `grad_scale` w.r.t. s.
     grad_scale_second: f64,
+    /// -ℓ'''(s) — derivative of `outer_scale` w.r.t. s.
     outer_scale_prime: f64,
+    /// -ℓ''''(s) — second derivative of `outer_scale` w.r.t. s.
     outer_scale_second: f64,
+}
+
+/// Analytic source of truth for the directional derivatives of
+/// ℓ(s) = log(1 - exp(s)) at s = `log_survival`. Returns
+/// `(ℓ, ℓ', ℓ'', ℓ''', ℓ'''')`. All consumer scales (`grad_scale`,
+/// `neg_hess_scale`, `outer_scale`, and their two derivatives each)
+/// are derived from this single function so the sign/algebra cannot
+/// drift between sites.
+#[inline]
+fn binary_log_survival_scales(survival: f64, event_prob: f64) -> (f64, f64, f64, f64, f64) {
+    // ℓ(s)   = log(1 - exp(s)) = log(event_prob)
+    // dS/ds  = S,    dP/ds = -S        (S=survival, P=event_prob)
+    // ℓ'(s)  = -S/P
+    // ℓ''(s) = d/ds[-S/P] = -S/P²        (since P + S = 1)
+    // ℓ'''(s) = d/ds[-S/P²] = -S(1 + S)/P³
+    // ℓ''''(s) = d/ds[-S(1+S)/P³]
+    //          = -S/P³ - 3S²/P³ - 6S²(1+S)/P⁴ - ... ; expanded form below.
+    let log_lik = event_prob.ln();
+    let p = event_prob;
+    let p2 = p * p;
+    let p3 = p2 * p;
+    let p4 = p3 * p;
+    let s = survival;
+    let s2 = s * s;
+    let s3 = s2 * s;
+    let ell_prime = -s / p;
+    let ell_pp = -s / p2;
+    let ell_ppp = -s * (1.0 + s) / p3;
+    // ℓ''''(s) = -S·(1 + 4S + S²) / P⁴ - 3·S²·(1+S)/P⁴? Use the equivalent
+    // expansion that matches the prior closed form:
+    //   d/ds[-S(1+S)/P³] = -(S + 2S²)/P³ - 3·S·(1+S)·S/P⁴
+    //                    = -(S + 2S²)/P³ - 3S²(1+S)/P⁴
+    // Combining over P⁴: -(S + 2S²)·P/P⁴ - 3S²(1+S)/P⁴
+    //                  = -[S·P + 2S²·P + 3S² + 3S³] / P⁴
+    // With P = 1 - S: S·P = S - S²; 2S²·P = 2S² - 2S³.
+    //   numerator = -[S - S² + 2S² - 2S³ + 3S² + 3S³] = -[S + 4S² + S³].
+    // So ℓ''''(s) = -(S + 4S² + S³) / P⁴.
+    let ell_pppp = -(s + 4.0 * s2 + s3) / p4;
+    (log_lik, ell_prime, ell_pp, ell_ppp, ell_pppp)
 }
 
 fn binary_from_log_survival(
@@ -2600,6 +2654,7 @@ fn binary_from_log_survival(
     event: u8,
 ) -> Result<BinaryFromLogSurvival, LatentSurvivalError> {
     if event == 0 {
+        // ℓ(s) = s ⇒ ℓ' = 1, ℓ'' = ℓ''' = ℓ'''' = 0.
         return Ok(BinaryFromLogSurvival {
             log_lik: log_survival,
             grad_scale: 1.0,
@@ -2626,23 +2681,36 @@ fn binary_from_log_survival(
             ),
         });
     }
-    let event_prob2 = event_prob * event_prob;
-    let event_prob3 = event_prob2 * event_prob;
-    let event_prob4 = event_prob3 * event_prob;
-    let survival2 = survival * survival;
-    let survival3 = survival2 * survival;
-    let outer_scale = survival / event_prob2;
+    let (log_lik, ell_prime, ell_pp, ell_ppp, ell_pppp) =
+        binary_log_survival_scales(survival, event_prob);
+    let grad_scale = ell_prime;
+    let neg_hess_scale = ell_prime; // coefficient on (-d²s/dβ²); equals ℓ'.
+    let outer_scale = -ell_pp;
+    let grad_scale_prime = ell_pp;
+    let grad_scale_second = ell_ppp;
+    let outer_scale_prime = -ell_ppp;
+    let outer_scale_second = -ell_pppp;
+    // The Newton accumulator at the call sites computes
+    //     neg_Hess(log_lik) = neg_hess_scale * (-d²s/dβ²) + outer_scale * (ds/dβ)²
+    // For this identity to hold by the chain rule, the coefficient on the
+    // neg_hessian term must equal ℓ' (== grad_scale). Document the invariant.
+    debug_assert!(
+        (grad_scale - neg_hess_scale).abs() <= 1e-15 * grad_scale.abs().max(1.0),
+        "binary_from_log_survival invariant: neg_hess_scale ({neg_hess_scale}) must equal grad_scale ({grad_scale}) so that grad_scale and the coefficient on neg_hessian share sign"
+    );
+    debug_assert!(
+        outer_scale >= 0.0 || !outer_scale.is_finite(),
+        "binary_from_log_survival invariant: outer_scale (= -ℓ'') must be non-negative for event=1; got {outer_scale}"
+    );
     Ok(BinaryFromLogSurvival {
-        log_lik: event_prob.ln(),
-        grad_scale: -survival / event_prob,
-        neg_hess_scale: survival / event_prob,
+        log_lik,
+        grad_scale,
+        neg_hess_scale,
         outer_scale,
-        grad_scale_prime: -outer_scale,
-        grad_scale_second: -(outer_scale * (1.0 + 2.0 * survival / event_prob)),
-        outer_scale_prime: outer_scale * (1.0 + 2.0 * survival / event_prob),
-        outer_scale_second: survival / event_prob2
-            + 6.0 * survival2 / event_prob3
-            + 6.0 * survival3 / event_prob4,
+        grad_scale_prime,
+        grad_scale_second,
+        outer_scale_prime,
+        outer_scale_second,
     })
 }
 
