@@ -3400,7 +3400,7 @@ fn t_matrix_from_flat(
 
 fn split_tensor_knot_views<'a>(
     knots_concat: ArrayView1<'a, f64>,
-    knot_offsets: &'a [usize],
+    knot_offsets: &[usize],
     n_axes: usize,
 ) -> Result<Vec<ArrayView1<'a, f64>>, String> {
     if knot_offsets.len() != n_axes + 1 {
@@ -3841,7 +3841,8 @@ fn dense_fisher_gaussian_fit_to_pydict<'py>(
         .map_err(py_value_error)?;
     let rhs = gam::pirls::dense_block_xtwy(design, fisher_w, y, Some(row_weights.view()))
         .map_err(|err| py_value_error(err.to_string()))?;
-    let beta_vec = solve_dense_block_system(&hessian, &rhs, "dense Fisher Gaussian")?;
+    let beta_vec = solve_dense_block_system(&hessian, &rhs, "dense Fisher Gaussian")
+        .map_err(py_value_error)?;
     let mut coefficients = Array2::<f64>::zeros((k, n_outputs));
     for output in 0..n_outputs {
         for col in 0..k {
@@ -4119,7 +4120,7 @@ fn dense_fisher_glm_fit_to_pydict<'py>(
     out.set_item("edf", (k * active_outputs) as f64)?;
     out.set_item("coefficients", coefficients.into_pyarray(py))?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
-    out.set_item("sigma2", Array1::ones(n_outputs).into_pyarray(py))?;
+    out.set_item("sigma2", Array1::<f64>::ones(n_outputs).into_pyarray(py))?;
     out.set_item("iterations", iterations)?;
     out.set_item("cache_penalty_eigenvalues", Array1::<f64>::zeros(0).into_pyarray(py))?;
     out.set_item("cache_eigenvectors", Array2::<f64>::zeros((0, 0)).into_pyarray(py))?;
@@ -4424,7 +4425,7 @@ fn gaussian_reml_fit_latent_impl(
     penalty,
     m = 2,
     weights = None,
-    fisher_W = None,
+    fisher_w = None,
     init_lambda = None,
     aux_u = None,
     aux_family = "ridge".to_string(),
@@ -4599,7 +4600,7 @@ fn gaussian_reml_fit_latent<'py>(
     grad_edf = 0.0,
     m = 2,
     weights = None,
-    fisher_W = None,
+    fisher_w = None,
     init_lambda = None,
     aux_u = None,
     aux_family = "ridge".to_string(),
@@ -4671,7 +4672,9 @@ fn gaussian_reml_fit_latent_backward<'py>(
                 .as_ref()
                 .map(|a| a.as_array())
                 .ok_or_else(|| {
-                    py_value_error("tensor B-spline latent backward requires knots_concat")
+                    py_value_error(
+                        "tensor B-spline latent backward requires knots_concat".to_string(),
+                    )
                 })?;
             build_latent_tensor_bspline_design(
                 t_view,
@@ -4679,10 +4682,12 @@ fn gaussian_reml_fit_latent_backward<'py>(
                 latent_dim,
                 knots,
                 tensor_knot_offsets.as_deref().ok_or_else(|| {
-                    py_value_error("tensor B-spline latent backward requires knot_offsets")
+                    py_value_error(
+                        "tensor B-spline latent backward requires knot_offsets".to_string(),
+                    )
                 })?,
                 tensor_degrees.as_deref().ok_or_else(|| {
-                    py_value_error("tensor B-spline latent backward requires degrees")
+                    py_value_error("tensor B-spline latent backward requires degrees".to_string())
                 })?,
             )
             .map_err(py_value_error)?
@@ -4789,18 +4794,22 @@ fn gaussian_reml_fit_latent_backward<'py>(
                 .as_ref()
                 .map(|a| a.as_array())
                 .ok_or_else(|| {
-                    py_value_error("tensor B-spline latent backward requires knots_concat")
+                    py_value_error(
+                        "tensor B-spline latent backward requires knots_concat".to_string(),
+                    )
                 })?;
             let per_axis = split_tensor_knot_views(
                 knots,
                 tensor_knot_offsets.as_deref().ok_or_else(|| {
-                    py_value_error("tensor B-spline latent backward requires knot_offsets")
+                    py_value_error(
+                        "tensor B-spline latent backward requires knot_offsets".to_string(),
+                    )
                 })?,
                 latent_dim,
             )
             .map_err(py_value_error)?;
             let degrees = tensor_degrees.as_deref().ok_or_else(|| {
-                py_value_error("tensor B-spline latent backward requires degrees")
+                py_value_error("tensor B-spline latent backward requires degrees".to_string())
             })?;
             let jet = bspline_tensor_first_derivative(t_mat.view(), &per_axis, degrees)
                 .map_err(|err| py_value_error(err.to_string()))?;
@@ -5101,7 +5110,7 @@ fn set_ok_glm_latent_items<'py>(
     family,
     m = 2,
     weights = None,
-    fisher_W = None,
+    fisher_w = None,
     init_lambda = None,
     aux_u = None,
     aux_family = "ridge".to_string(),
@@ -5212,7 +5221,7 @@ fn glm_reml_fit_latent<'py>(
     grad_reml_score = 1.0,
     m = 2,
     weights = None,
-    fisher_W = None,
+    fisher_w = None,
     init_lambda = None,
     aux_u = None,
     aux_family = "ridge".to_string(),
@@ -5932,7 +5941,7 @@ fn gaussian_reml_fit_formula_table_impl(
             "closed-form Gaussian REML formula fitting does not support offsets".to_string(),
         );
     }
-    let design = gam::smooth::build_term_collection_design(standard.data, &standard.spec)
+    let design = gam::smooth::build_term_collection_design(standard.data.view(), &standard.spec)
         .map_err(|err| format!("failed to build formula design matrix: {err}"))?;
     let x = design
         .design
