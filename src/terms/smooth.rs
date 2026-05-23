@@ -13486,6 +13486,7 @@ struct SingleBlockLatentCoordDesignCache {
     manifold: crate::terms::latent_coord::LatentManifold,
     latent_id: u64,
     analytic_penalties: Option<std::sync::Arc<crate::terms::AnalyticPenaltyRegistry>>,
+    analytic_rho_count: usize,
     design_revision: u64,
 }
 
@@ -13521,6 +13522,10 @@ impl SingleBlockLatentCoordDesignCache {
             ))
             .into());
         }
+        let analytic_rho_count = latent
+            .analytic_penalties
+            .as_ref()
+            .map_or(0, |registry| registry.total_rho_count());
         Ok(Self {
             data,
             spec,
@@ -13541,6 +13546,7 @@ impl SingleBlockLatentCoordDesignCache {
             manifold: latent.values.manifold().clone(),
             latent_id: latent.values.latent_id(),
             analytic_penalties: latent.analytic_penalties.clone(),
+            analytic_rho_count,
             design_revision: 0,
         })
     }
@@ -13562,6 +13568,10 @@ impl SingleBlockLatentCoordDesignCache {
 
     fn analytic_penalties(&self) -> Option<std::sync::Arc<crate::terms::AnalyticPenaltyRegistry>> {
         self.analytic_penalties.clone()
+    }
+
+    fn analytic_penalty_rho_count(&self) -> usize {
+        self.analytic_rho_count
     }
 
     fn hyper_dirs(&self) -> Result<Vec<crate::estimate::reml::DirectionalHyperParam>, String> {
@@ -13689,15 +13699,17 @@ impl SingleBlockLatentCoordDesignCache {
         let latent_flat_len = self.n_obs * self.latent_dim;
         let direct_hyper_count =
             latent_coord_direct_hyper_count(&self.id_mode, self.latent_dim);
-        let expected = self.rho_dim + latent_flat_len + direct_hyper_count;
+        let expected =
+            self.rho_dim + latent_flat_len + self.analytic_rho_count + direct_hyper_count;
         if theta.len() != expected {
             return Err(SmoothError::dimension_mismatch(format!(
-                "latent-coordinate theta length mismatch: got {}, expected {} (rho_dim={}, n={}, d={}, direct_hypers={})",
+                "latent-coordinate theta length mismatch: got {}, expected {} (rho_dim={}, n={}, d={}, analytic_rhos={}, direct_hypers={})",
                 theta.len(),
                 expected,
                 self.rho_dim,
                 self.n_obs,
                 self.latent_dim,
+                self.analytic_rho_count,
                 direct_hyper_count
             ))
             .into());
@@ -13736,6 +13748,7 @@ impl SingleBlockLatentCoordDesignCache {
         let rebuilt_width = self.design.design.ncols();
         let spec = self.spec.clone();
         let term_index = self.term_index;
+        let analytic_rho_count = self.analytic_rho_count;
         let data = self.data.view();
         let lookup = self
             .latent_design_cache
@@ -13757,6 +13770,7 @@ impl SingleBlockLatentCoordDesignCache {
                     &spec,
                     &rebuilt,
                     &[term_index],
+                    analytic_rho_count,
                 )?
                 .ok_or_else(|| {
                     EstimationError::InvalidInput(
@@ -17212,7 +17226,11 @@ fn try_exact_joint_latent_coord_optimization(
     }
     let direct_hypers =
         latent_coord_initial_direct_hypers(latent.values.id_mode(), latent.values.latent_dim())?;
-    let latent_coord_ext_dim = latent_flat_dim + direct_hypers.len();
+    let analytic_rho_count = latent
+        .analytic_penalties
+        .as_ref()
+        .map_or(0, |registry| registry.total_rho_count());
+    let latent_coord_ext_dim = latent_flat_dim + analytic_rho_count + direct_hypers.len();
 
     let mut theta0 = Array1::<f64>::zeros(rho_dim + latent_coord_ext_dim);
     theta0
@@ -17222,8 +17240,9 @@ fn try_exact_joint_latent_coord_optimization(
         .slice_mut(s![rho_dim..rho_dim + latent_flat_dim])
         .assign(latent.values.as_flat());
     if !direct_hypers.is_empty() {
+        let direct_start = rho_dim + latent_flat_dim + analytic_rho_count;
         theta0
-            .slice_mut(s![rho_dim + latent_flat_dim..])
+            .slice_mut(s![direct_start..direct_start + direct_hypers.len()])
             .assign(&direct_hypers);
     }
 
@@ -17290,7 +17309,13 @@ fn try_exact_joint_latent_coord_optimization(
                     &mut eval,
                 )?;
             }
-            add_latent_id_objective_to_eval(theta, self.rho_dim, latent.as_ref(), &mut eval)?;
+            add_latent_id_objective_to_eval(
+                theta,
+                self.rho_dim,
+                self.cache.analytic_penalty_rho_count(),
+                latent.as_ref(),
+                &mut eval,
+            )?;
             self.cache.store_eval(eval.clone());
             Ok(eval)
         }
@@ -17370,12 +17395,15 @@ fn try_exact_joint_latent_coord_optimization(
                         Ok(latent) => latent,
                         Err(_) => return f64::INFINITY,
                     };
-                    let contribution =
-                        match latent_id_objective_contribution(theta, self.rho_dim, latent.as_ref())
-                        {
-                            Ok(contribution) => contribution,
-                            Err(_) => return f64::INFINITY,
-                        };
+                    let contribution = match latent_id_objective_contribution(
+                        theta,
+                        self.rho_dim,
+                        self.cache.analytic_penalty_rho_count(),
+                        latent.as_ref(),
+                    ) {
+                        Ok(contribution) => contribution,
+                        Err(_) => return f64::INFINITY,
+                    };
                     let cost = cost + contribution.cost;
                     let cost = if let Some(registry) = self.cache.analytic_penalties() {
                         match analytic_penalty_objective_contribution(
