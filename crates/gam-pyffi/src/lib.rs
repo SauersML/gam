@@ -47,10 +47,11 @@ use gam::smooth::{
 };
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
-    BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, MaternNu,
-    SpatialIdentifiability, SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec,
+    BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec,
+    MaternIdentifiability, MaternNu, SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
+    SphericalSplineBasisSpec,
     auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile, bspline_tensor_first_derivative,
-    build_duchon_basis, build_duchon_basis_mixed_periodicity_auto,
+    build_duchon_basis, build_duchon_basis_mixed_periodicity_auto, build_matern_basis,
     build_duchon_operator_penalty_matrices, build_spherical_spline_basis,
     build_thin_plate_penalty_matrix, create_basis, create_cyclic_difference_penalty_matrix,
     create_difference_penalty_matrix, create_periodic_bspline_basis_dense,
@@ -3314,7 +3315,7 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
 // produce grad_t. The latent path is the same construction lifted to
 // t ∈ ℝ^{N × d}:
 //
-//   * design Φ_{n,k} = K_psi(t_n, c_k) is built by `build_duchon_basis`
+//   * design Φ_{n,k} = K(t_n, c_k) is built by `build_duchon_basis`
 //     with N-D `data` and `centers` (an existing entry point);
 //   * radial first derivative `φ'(r_{nk})` is computed by the new
 //     `duchon_radial_first_derivative_nd` basis helper;
@@ -3503,6 +3504,200 @@ fn build_latent_tensor_bspline_design(
         }
     }
     Ok((design, t_mat))
+}
+
+fn latent_periodic_range_from_centers(
+    centers: ArrayView2<'_, f64>,
+) -> Result<(f64, f64), String> {
+    if centers.ncols() != 1 || centers.nrows() == 0 {
+        return Err("periodic B-spline latent design requires one-column centers".to_string());
+    }
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for &value in centers.column(0).iter() {
+        lo = lo.min(value);
+        hi = hi.max(value);
+    }
+    if !(lo.is_finite() && hi.is_finite() && hi > lo) {
+        return Err("periodic B-spline centers must define a finite range".to_string());
+    }
+    Ok((lo, hi))
+}
+
+fn project_latent_jet_columns(
+    raw_jet: &Array3<f64>,
+    transform: ArrayView2<'_, f64>,
+) -> Result<Array3<f64>, String> {
+    let n_rows = raw_jet.shape()[0];
+    let raw_cols = raw_jet.shape()[1];
+    let latent_dim = raw_jet.shape()[2];
+    if transform.nrows() != raw_cols {
+        return Err(format!(
+            "latent jet transform row mismatch: jet has {raw_cols} columns, transform has {} rows",
+            transform.nrows()
+        ));
+    }
+    let mut out = Array3::<f64>::zeros((n_rows, transform.ncols(), latent_dim));
+    for n in 0..n_rows {
+        for j in 0..transform.ncols() {
+            for k in 0..raw_cols {
+                let z = transform[[k, j]];
+                if z == 0.0 {
+                    continue;
+                }
+                for a in 0..latent_dim {
+                    out[[n, j, a]] += raw_jet[[n, k, a]] * z;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_latent_forward_design(
+    basis_kind: &str,
+    t_flat: ArrayView1<'_, f64>,
+    n_obs: usize,
+    latent_dim: usize,
+    centers: ArrayView2<'_, f64>,
+    m: usize,
+    tensor_knots_concat: Option<ArrayView1<'_, f64>>,
+    tensor_knot_offsets: Option<&[usize]>,
+    tensor_degrees: Option<&[usize]>,
+) -> Result<(Array2<f64>, Array2<f64>, Array3<f64>), String> {
+    let basis_kind = latent_basis_kind(basis_kind)?;
+    let (design, t_mat) = match basis_kind {
+        "duchon" => build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m)?,
+        "matern" => {
+            if centers.ncols() != latent_dim {
+                return Err(format!(
+                    "Matérn latent centers must have {latent_dim} columns; got {}",
+                    centers.ncols()
+                ));
+            }
+            let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
+            let spec = MaternBasisSpec {
+                center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
+                length_scale: 1.0,
+                nu: MaternNu::ThreeHalves,
+                include_intercept: false,
+                double_penalty: false,
+                identifiability: MaternIdentifiability::None,
+                aniso_log_scales: None,
+            };
+            let built = build_matern_basis(t_mat.view(), &spec)
+                .map_err(|err| format!("failed to evaluate Matérn latent basis: {err}"))?;
+            let design = built
+                .design
+                .try_to_dense_by_chunks("latent_matern_design")
+                .map_err(|err| format!("failed to evaluate Matérn latent basis: {err}"))?;
+            (design, t_mat)
+        }
+        "sphere" => {
+            if centers.ncols() != latent_dim {
+                return Err(format!(
+                    "sphere latent centers must have {latent_dim} columns; got {}",
+                    centers.ncols()
+                ));
+            }
+            let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
+            let spec = SphericalSplineBasisSpec {
+                center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
+                penalty_order: m,
+                double_penalty: false,
+                radians: true,
+                method: SphereMethod::Wahba,
+                max_degree: None,
+                wahba_kernel: SphereWahbaKernel::Sobolev,
+            };
+            let built = build_spherical_spline_basis(t_mat.view(), &spec)
+                .map_err(|err| format!("failed to evaluate sphere latent basis: {err}"))?;
+            let constraint_transform = match &built.metadata {
+                gam::basis::BasisMetadata::Sphere {
+                    constraint_transform,
+                    ..
+                } => constraint_transform.clone(),
+                _ => None,
+            };
+            let design = built
+                .design
+                .try_to_dense_by_chunks("latent_sphere_design")
+                .map_err(|err| format!("failed to evaluate sphere latent basis: {err}"))?;
+            let raw_jet = latent_input_location_jet(
+                basis_kind,
+                t_mat.view(),
+                centers,
+                m,
+                tensor_knots_concat,
+                tensor_knot_offsets,
+                tensor_degrees,
+            )?;
+            let jet = match constraint_transform {
+                Some(z) => project_latent_jet_columns(&raw_jet, z.view())?,
+                _ => raw_jet,
+            };
+            if jet.shape()[1] != design.ncols() {
+                return Err(format!(
+                    "sphere latent design/jet column mismatch: design has {}, jet has {}",
+                    design.ncols(),
+                    jet.shape()[1]
+                ));
+            }
+            return Ok((design, t_mat, jet));
+        }
+        "bspline_tensor" => {
+            let knots = tensor_knots_concat.ok_or_else(|| {
+                "tensor B-spline latent design requires knots_concat".to_string()
+            })?;
+            let offsets = tensor_knot_offsets.ok_or_else(|| {
+                "tensor B-spline latent design requires knot_offsets".to_string()
+            })?;
+            let degrees = tensor_degrees.ok_or_else(|| {
+                "tensor B-spline latent design requires degrees".to_string()
+            })?;
+            build_latent_tensor_bspline_design(t_flat, n_obs, latent_dim, knots, offsets, degrees)?
+        }
+        "periodic_bspline" => {
+            if latent_dim != 1 {
+                return Err(format!(
+                    "periodic B-spline latent design requires latent_dim 1; got {latent_dim}"
+                ));
+            }
+            let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
+            let range = latent_periodic_range_from_centers(centers)?;
+            let design = create_periodic_bspline_basis_dense(
+                t_mat.column(0),
+                range,
+                m,
+                centers.nrows(),
+            )
+            .map_err(|err| format!("failed to evaluate periodic B-spline latent basis: {err}"))?;
+            (design, t_mat)
+        }
+        other => {
+            return Err(format!(
+                "gaussian_reml_fit_latent does not support latent basis_kind {other:?}"
+            ));
+        }
+    };
+    let jet = latent_input_location_jet(
+        basis_kind,
+        t_mat.view(),
+        centers,
+        m,
+        tensor_knots_concat,
+        tensor_knot_offsets,
+        tensor_degrees,
+    )?;
+    if jet.shape()[1] != design.ncols() {
+        return Err(format!(
+            "latent design/jet column mismatch for {basis_kind:?}: design has {}, jet has {}",
+            design.ncols(),
+            jet.shape()[1]
+        ));
+    }
+    Ok((design, t_mat, jet))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4466,26 +4661,17 @@ fn gaussian_reml_fit_latent_impl(
     Array2<f64>,
     Option<LatentAuxStrengthState>,
 ), String> {
-    let (design, t_mat) = match latent_basis_kind(basis_kind)? {
-        "duchon" => build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m)?,
-        "bspline_tensor" => {
-            let knots = tensor_knots_concat.ok_or_else(|| {
-                "tensor B-spline latent design requires knots_concat".to_string()
-            })?;
-            let offsets = tensor_knot_offsets.ok_or_else(|| {
-                "tensor B-spline latent design requires knot_offsets".to_string()
-            })?;
-            let degrees = tensor_degrees.ok_or_else(|| {
-                "tensor B-spline latent design requires degrees".to_string()
-            })?;
-            build_latent_tensor_bspline_design(t_flat, n_obs, latent_dim, knots, offsets, degrees)?
-        }
-        other => {
-            return Err(format!(
-                "gaussian_reml_fit_latent forward supports 'duchon' and 'tensor_bspline'; got {other:?}"
-            ));
-        }
-    };
+    let (design, t_mat, _jet) = build_latent_forward_design(
+        basis_kind,
+        t_flat,
+        n_obs,
+        latent_dim,
+        centers,
+        m,
+        tensor_knots_concat,
+        tensor_knot_offsets,
+        tensor_degrees,
+    )?;
     // Build the (optionally) augmented Y/X stack carrying the identifiability
     // penalty. The penalty `½ μ ‖t − t_ref‖²` is *not* on the design Φ; it
     // acts on t directly. Because t enters Φ nonlinearly, we cannot fold it
@@ -4604,50 +4790,18 @@ fn gaussian_reml_fit_latent<'py>(
         let fw_view = fw.as_array();
         let n_outputs = y.as_array().ncols();
         if fw_view.shape() == [n_obs, n_outputs, n_outputs] && n_outputs > 1 {
-            let (design, t_mat) = match latent_basis_kind(&basis_kind).map_err(py_value_error)? {
-                "duchon" => build_latent_duchon_design(
-                    t.as_array(),
-                    n_obs,
-                    latent_dim,
-                    centers.as_array(),
-                    m,
-                )
-                .map_err(py_value_error)?,
-                "bspline_tensor" => {
-                    let knots = tensor_knots_concat
-                        .as_ref()
-                        .map(|a| a.as_array())
-                        .ok_or_else(|| {
-                            py_value_error(
-                                "tensor B-spline latent design requires knots_concat".to_string(),
-                            )
-                        })?;
-                    let offsets = tensor_knot_offsets.as_deref().ok_or_else(|| {
-                        py_value_error(
-                            "tensor B-spline latent design requires knot_offsets".to_string(),
-                        )
-                    })?;
-                    let degrees = tensor_degrees.as_deref().ok_or_else(|| {
-                        py_value_error(
-                            "tensor B-spline latent design requires degrees".to_string(),
-                        )
-                    })?;
-                    build_latent_tensor_bspline_design(
-                        t.as_array(),
-                        n_obs,
-                        latent_dim,
-                        knots,
-                        offsets,
-                        degrees,
-                    )
-                    .map_err(py_value_error)?
-                }
-                other => {
-                    return Err(py_value_error(format!(
-                        "gaussian_reml_fit_latent dense fisher supports 'duchon' and 'tensor_bspline'; got {other:?}"
-                    )));
-                }
-            };
+            let (design, t_mat, _jet) = build_latent_forward_design(
+                &basis_kind,
+                t.as_array(),
+                n_obs,
+                latent_dim,
+                centers.as_array(),
+                m,
+                tensor_knots_concat.as_ref().map(|a| a.as_array()),
+                tensor_knot_offsets.as_deref(),
+                tensor_degrees.as_deref(),
+            )
+            .map_err(py_value_error)?;
             let (prior_score, aux_strength_state) = latent_prior_score_and_aux_state_for_t(
                 t_mat.view(),
                 aux_u.as_ref().map(|a| a.as_array()),
@@ -5037,41 +5191,19 @@ fn gaussian_reml_fit_latent_backward<'py>(
     .map_err(py_value_error)?;
     let weights_view = effective_weights.as_ref().map(|w| w.view());
 
-    // Forward design (Φ) and t-matrix for the input-location gradient.
-    let (design, t_mat) = match basis_kind_normalized {
-        "duchon" => build_latent_duchon_design(t_view, n_obs, latent_dim, centers_view, m)
-            .map_err(py_value_error)?,
-        "bspline_tensor" => {
-            let knots = tensor_knots_concat
-                .as_ref()
-                .map(|a| a.as_array())
-                .ok_or_else(|| {
-                    py_value_error(
-                        "tensor B-spline latent backward requires knots_concat".to_string(),
-                    )
-                })?;
-            build_latent_tensor_bspline_design(
-                t_view,
-                n_obs,
-                latent_dim,
-                knots,
-                tensor_knot_offsets.as_deref().ok_or_else(|| {
-                    py_value_error(
-                        "tensor B-spline latent backward requires knot_offsets".to_string(),
-                    )
-                })?,
-                tensor_degrees.as_deref().ok_or_else(|| {
-                    py_value_error("tensor B-spline latent backward requires degrees".to_string())
-                })?,
-            )
-            .map_err(py_value_error)?
-        }
-        other => {
-            return Err(PyNotImplementedError::new_err(format!(
-                "gaussian_reml_fit_latent_backward currently supports 'duchon' and 'tensor_bspline'; got {other:?}"
-            )));
-        }
-    };
+    // Forward design (Φ), t-matrix, and input-location jet share one dispatcher.
+    let (design, t_mat, jet) = build_latent_forward_design(
+        basis_kind_normalized,
+        t_view,
+        n_obs,
+        latent_dim,
+        centers_view,
+        m,
+        tensor_knots_concat.as_ref().map(|a| a.as_array()),
+        tensor_knot_offsets.as_deref(),
+        tensor_degrees.as_deref(),
+    )
+    .map_err(py_value_error)?;
     let fit = gaussian_reml_multi_closed_form_with_cache(
         design.view(),
         y_view,
@@ -7939,7 +8071,7 @@ fn report_html(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
 // in `gam::terms::basis`. The helpers are analytic, closed-form chain rules
 // of the underlying basis with respect to the *first* kernel argument
 // (the latent coordinate `t`). They share the same analytic machinery the
-// kernel-parameter ψ-chain (`SpatialLogKappaCoords`) uses, re-pointed at
+// kernel-parameter chain (`SpatialLogKappaCoords`) uses, re-pointed at
 // `t` instead of at the anisotropy / log-kappa.
 // =========================================================================
 

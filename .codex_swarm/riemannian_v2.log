@@ -15085,3 +15085,5505 @@ fn unix_secs_now() -> u64 {
 
 codex
 I’m going to create `proposals/riemannian_per_point.md` now. The document will call out one important convention issue: the embedded Hessian correction needs the ambient gradient’s normal component; passing an already tangent-projected gradient into the Weingarten term makes the sphere correction vanish.
+apply patch
+patch: completed
+/Users/user/gam/proposals/riemannian_per_point.md
+diff --git a/proposals/riemannian_per_point.md b/proposals/riemannian_per_point.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..b47184943eaef91c8670bb02ec44ba997f8f48da
+--- /dev/null
++++ b/proposals/riemannian_per_point.md
+@@ -0,0 +1,1798 @@
++# Proposal: Retraction-Based Riemannian Optimization for Per-Point Latents
++
++Status: draft derivation.
++Audience: implementers wiring `LatentCoordValues`, `input_loc_derivatives`, and
++the arrow-Schur latent inner solver.
++
++## 0. Scope and Conventions
++
++This document derives the manifold-local optimization contract for a per-row
++latent coordinate `t_i`. The intent is to replace Euclidean additive updates
++with tangent-space updates followed by a retraction:
++
++```text
++t_i ∈ M
++ξ_i ∈ T_{t_i}M
++t_i,new = R_{t_i}(ξ_i)
++```
++
++The row-local Newton algebra remains the same arrow/bordered Hessian system
++already used by the latent inner solver. Only the row latent block changes:
++Euclidean gradients, Hessian-vector products, and warm-start deltas are
++projected into `T_{t_i}M`; the resulting tangent vector is applied by
++`R_{t_i}`.
++
++Notation:
++
++```text
++M              manifold for one row latent
++p ∈ M          current embedded point
++m              ambient embedding dimension
++d              intrinsic dimension
++ξ, η ∈ T_p M   tangent vectors at p
++q = R_p(ξ)     retracted point
++P_p            orthogonal tangent projection in ambient coordinates
++g_p            Riemannian metric / inner product
++∇_E f          ambient Euclidean gradient of a scalar objective
++∇²_E f · ξ     ambient Euclidean Hessian-vector product
++grad_R f       Riemannian gradient
++Hess_R f[ξ]    Riemannian Hessian applied to ξ
++W_p(ξ, v)      shape/Weingarten correction used by the embedded Hessian formula
++```
++
++All manifold implementations below use the ambient Euclidean pullback metric
++unless a product-level weight vector is explicitly supplied. Weighted product
++metrics only change `g_p`, trust-region norms, and tangent basis
++orthonormalization; they do not change the closed-form embedding,
++projection, or retraction.
++
++The embedded Hessian conversion used in code should be:
++
++```text
++grad_R = P_p(∇_E)
++Hess_R[ξ] = P_p(∇²_E · ξ - W_p(ξ, ∇_E))
++```
++
++Equivalently, since `W_p` only uses the normal component for the unit sphere
++and its products:
++
++```text
++Hess_R[ξ] = P_p(∇²_E · ξ - W_p(ξ, P_p^⊥(∇_E))).
++```
++
++The prompt shorthand
++
++```text
++Hess_R[ξ] = P_p(∇²_E · ξ - W_p(ξ, P_p(∇_E)))
++```
++
++is harmless for flat manifolds but would make the sphere correction vanish,
++because `P_p(∇_E)` is tangent and therefore orthogonal to `p`. The final Rust
++signature should pass the ambient gradient, or explicitly pass the normal
++gradient. This is the same correction already intended in
++`src/solver/riemannian.rs`: for a sphere, subtract `<p, ∇_E> ξ` before
++projecting.
++
++## 1. Existing Source Points
++
++The current implementation already has most of the needed pieces:
++
++```text
++src/terms/input_loc_derivatives.rs
++  basis_input_loc_grad
++  basis_input_loc_hess
++  tensor_product_input_loc_grad
++  periodic_radial_input_loc_grad_1d
++  sphere_s2_input_loc_grad
++  contract_input_loc_gradient
++
++src/terms/latent_coord.rs
++  LatentManifold
++  LatentCoordValues::retract_flat_delta
++  LatentCoordValues::design_gradient_wrt_t_dispatch
++  LatentCoordValues::contract_gradient
++  LatentCoordValues::contract_gradient_radial_streaming
++  LatentManifold::project_to_tangent
++  LatentManifold::euclidean_to_riemannian_hessian
++  LatentManifold::riemannian_hessian_matrix
++
++src/solver/riemannian.rs
++  Manifold
++  Euclidean
++  Circle
++  Sphere
++  Interval
++  Torus
++  Product
++  ManifoldKind
++  RiemannianNewtonStep
++  riemannian_newton_step_on_point
++  retract_euclidean_delta
++
++src/solver/arrow_schur.rs
++  ArrowSystem::apply_riemannian_latent_geometry
++  apply_per_row_retraction
++
++src/solver/persistent_warm_start.rs
++  ift_warm_start_latent
++  apply_ift_retraction
++```
++
++Two representations currently coexist:
++
++```text
++src/terms/latent_coord.rs::LatentManifold::Circle
++  stores a scalar angle in one ambient coordinate and wraps it.
++
++src/solver/riemannian.rs::Circle
++  stores the embedded unit vector (cos θ, sin θ) in R².
++```
++
++This proposal commits the final Riemannian optimizer contract to embedded
++coordinates. Chart coordinates may remain as API sugar, but the Newton,
++Hessian, vector-transport, and IFT update path should operate on embedded
++points. That removes seam discontinuities from the optimizer itself.
++
++## 2. Per-Row Objective and Chain Rule
++
++For one row `i`, the design row is:
++
++```text
++Φ_i(t_i) = [Φ_{i,1}(t_i), ..., Φ_{i,K}(t_i)].
++```
++
++The source in `input_loc_derivatives.rs` gives the two objects needed by
++the Euclidean row calculus:
++
++```text
++J_i[k,a]       = ∂Φ_{i,k}/∂t_{i,a}
++HΦ_i[k,a,b]   = ∂²Φ_{i,k}/∂t_{i,a}∂t_{i,b}
++```
++
++For radial kernels with center `c_k`:
++
++```text
++r_{ik} = ||t_i - c_k||
++Φ_{i,k} = φ(r_{ik})
++q(r) = φ'(r)/r
++s(r) = (φ''(r) - q(r))/r²
++
++J_i[k,a] = q(r_{ik}) (t_i - c_k)_a
++HΦ_i[k,a,b] = q(r_{ik}) δ_ab
++            + s(r_{ik}) (t_i - c_k)_a (t_i - c_k)_b
++```
++
++Those are exactly `basis_input_loc_grad` and `basis_input_loc_hess`.
++`RadialScalarKind::eval_design_triplet` supplies `(φ, q, s)` and owns the
++collision limits or collision errors.
++
++Let the scalar objective be `F(Φ_i(t_i), β, ...)`. If the upstream design
++gradient and Hessian with respect to `Φ_i` are:
++
++```text
++u_i[k]       = ∂F/∂Φ_{i,k}
++A_i[k,l]     = ∂²F/∂Φ_{i,k}∂Φ_{i,l}
++```
++
++then the Euclidean latent gradient is:
++
++```text
++∇_{E,t_i}F[a] = Σ_k u_i[k] J_i[k,a].
++```
++
++The Euclidean latent Hessian is:
++
++```text
++∇²_{E,t_i}F[a,b]
++  = Σ_{k,l} J_i[k,a] A_i[k,l] J_i[l,b]
++  + Σ_k u_i[k] HΦ_i[k,a,b].
++```
++
++For Gaussian residual least squares with prediction `ŷ_i = Φ_i β`:
++
++```text
++u_i[k] = -resid_i β_k
++A_i[k,l] = β_k β_l
++
++∇_{E,t_i}F = -(resid_i) J_iᵀ β
++∇²_{E,t_i}F = (J_iᵀ β)(J_iᵀ β)ᵀ - resid_i Σ_k β_k HΦ_i[k,:,:]
++```
++
++The Gauss-Newton row block drops the second term:
++
++```text
++H_GN = (J_iᵀ β)(J_iᵀ β)ᵀ.
++```
++
++The Riemannian layer does not change this chain rule. It only converts the
++ambient Euclidean row objects to tangent row objects:
++
++```text
++g_R_i = P_{t_i}(g_E_i)
++H_R_i[ξ] = P_{t_i}(H_E_i ξ - W_{t_i}(ξ, g_E_i)).
++```
++
++## 3. Manifold: S¹
++
++### 3.1 Embedding in R^m, tangent space T_p M
++
++Use the embedded unit circle:
++
++```text
++S¹ = {p ∈ R² : ||p|| = 1}
++p = (cos θ, sin θ)
++m = 2
++d = 1
++```
++
++The tangent space is:
++
++```text
++T_p S¹ = {ξ ∈ R² : <p, ξ> = 0}.
++```
++
++A canonical unit tangent basis is:
++
++```text
++Q(p) = [-p_y, p_x] ∈ R^{2×1}.
++```
++
++Any tangent vector has the form:
++
++```text
++ξ = Q(p) α,  α ∈ R.
++```
++
++### 3.2 Retraction R_p(ξ) closed-form
++
++Use the normalization retraction:
++
++```text
++R_p(ξ) = (p + ξ) / ||p + ξ||.
++```
++
++This is first-order equivalent to the exponential map and avoids angle seams.
++For a tangent vector `ξ = Qα`, the exact exponential map is:
++
++```text
++Exp_p(ξ) = cos(||ξ||) p + sin(||ξ||) ξ/||ξ||.
++```
++
++The optimizer commits to the normalization retraction because it is cheaper,
++closed-form, and already used by the shipped `Circle` and `Sphere`
++implementations.
++
++### 3.3 Projection P_p: R^m -> T_p M
++
++```text
++P_p(v) = v - <p, v> p.
++```
++
++For `S¹`, `P_p(v)` is also:
++
++```text
++P_p(v) = Q(p) Q(p)ᵀ v.
++```
++
++### 3.4 Vector transport τ_{p->q}(ξ)
++
++Use projection transport:
++
++```text
++τ_{p->q}(ξ) = P_q(ξ).
++```
++
++For `S¹`, exact parallel transport along the shorter geodesic can be written
++in closed form, but projection transport is sufficient for the row Newton
++and IFT warm-start path because every transported vector is re-projected
++before it is reused.
++
++If exact transport is needed later and `q ≠ -p`, define the Householder-like
++transport:
++
++```text
++τ_exact(ξ) = ξ - (<q, ξ> / (1 + <p, q>)) (p + q).
++```
++
++The final trait should expose projection transport only as the committed
++default; exact transport can be a separate implementation detail if needed.
++
++### 3.5 Inner product g_p
++
++Default ambient pullback:
++
++```text
++g_p(ξ, η) = <ξ, η>_R².
++```
++
++For product trust-region balancing, a scale-normalized metric may use:
++
++```text
++g_p(ξ, η) = (1 / (2π)²) <ξ, η>.
++```
++
++The scale-normalized metric changes step norms, not `P_p`, `R_p`, or the
++embedded Hessian correction.
++
++### 3.6 Euclidean to Riemannian gradient
++
++```text
++grad_R = P_p(∇_E)
++       = ∇_E - <p, ∇_E> p.
++```
++
++In the tangent basis:
++
++```text
++g_Q = Q(p)ᵀ grad_R.
++```
++
++### 3.7 Euclidean to Riemannian Hessian and Weingarten map
++
++For `S¹`, treat it as the unit sphere `S^1`:
++
++```text
++W_p(ξ, v) = <p, v> ξ.
++```
++
++The Hessian action is:
++
++```text
++Hess_R[ξ] = P_p(∇²_E · ξ - <p, ∇_E> ξ).
++```
++
++If the Weingarten call receives `v = P_p(∇_E)`, then `<p, v> = 0` and the
++curvature correction disappears. Therefore the committed Rust signature must
++pass the ambient gradient or its normal component.
++
++## 4. Manifold: S²
++
++### 4.1 Embedding in R^m, tangent space T_p M
++
++Use the embedded unit sphere:
++
++```text
++S² = {p ∈ R³ : ||p|| = 1}
++m = 3
++d = 2
++```
++
++The tangent space is:
++
++```text
++T_p S² = {ξ ∈ R³ : <p, ξ> = 0}.
++```
++
++For numerical work, an orthonormal basis `Q(p) ∈ R^{3×2}` can be built by:
++
++1. Choose an anchor axis `a` not nearly parallel to `p`.
++2. Set `q1 = normalize(a - <a,p>p)`.
++3. Set `q2 = p × q1`.
++
++A robust anchor rule:
++
++```text
++a = e_z if |p_z| < 0.9 else e_x.
++```
++
++### 4.2 Retraction R_p(ξ) closed-form
++
++Use the normalization retraction:
++
++```text
++R_p(ξ) = (p + ξ) / ||p + ξ||.
++```
++
++The exact exponential map is:
++
++```text
++Exp_p(ξ) = cos(||ξ||) p + sin(||ξ||) ξ / ||ξ||.
++```
++
++The normalization retraction is cheaper and agrees to first order:
++
++```text
++R_p(0) = p
++D R_p(0)[ξ] = ξ.
++```
++
++### 4.3 Projection P_p: R^m -> T_p M
++
++```text
++P_p(v) = v - <p, v> p
++       = (I - p pᵀ) v.
++```
++
++### 4.4 Vector transport τ_{p->q}(ξ)
++
++Committed default:
++
++```text
++τ_{p->q}(ξ) = P_q(ξ).
++```
++
++Exact geodesic parallel transport, valid away from antipodal points, is:
++
++```text
++τ_exact(ξ) = ξ - (<q, ξ> / (1 + <p, q>)) (p + q).
++```
++
++Projection transport is not exactly norm-preserving, but it is closed-form,
++cheap, and stable for small row Newton and IFT predictor steps.
++
++### 4.5 Inner product g_p
++
++Default:
++
++```text
++g_p(ξ, η) = <ξ, η>_R³.
++```
++
++Scale-normalized trust metric:
++
++```text
++g_p(ξ, η) = (1 / π²) <ξ, η>.
++```
++
++### 4.6 Euclidean to Riemannian gradient
++
++```text
++grad_R = P_p(∇_E)
++       = ∇_E - <p, ∇_E> p.
++```
++
++In tangent coordinates:
++
++```text
++g_Q = Qᵀ grad_R.
++```
++
++### 4.7 Euclidean to Riemannian Hessian and Weingarten map
++
++For the unit sphere:
++
++```text
++W_p(ξ, v) = <p, v> ξ.
++```
++
++Therefore:
++
++```text
++Hess_R[ξ] = P_p(∇²_E · ξ - <p, ∇_E> ξ).
++```
++
++This formula is the same as differentiating the projected gradient
++`P_p(∇_E)` and projecting the result back to `T_pS²`.
++
++## 5. Manifold: S^n
++
++### 5.1 Embedding in R^m, tangent space T_p M
++
++Use the embedded unit sphere:
++
++```text
++S^n = {p ∈ R^{n+1} : ||p|| = 1}
++m = n + 1
++d = n
++```
++
++Tangent space:
++
++```text
++T_p S^n = {ξ ∈ R^{n+1} : <p, ξ> = 0}.
++```
++
++The tangent basis `Q(p) ∈ R^{(n+1)×n}` is produced by projecting ambient
++basis vectors into `T_pS^n` and applying modified Gram-Schmidt, or by a
++Householder construction. The current generic `Manifold::tangent_basis`
++already uses the projection-plus-Gram-Schmidt approach.
++
++### 5.2 Retraction R_p(ξ) closed-form
++
++```text
++R_p(ξ) = (p + ξ) / ||p + ξ||.
++```
++
++Guard:
++
++```text
++if ||p + ξ|| is tiny, reject or shrink ξ before retraction.
++```
++
++Do not silently map to an arbitrary axis in optimizer code; that creates a
++discontinuous update. Construction-time projection can normalize invalid
++initial values, but Newton steps should be trust-radius clipped instead.
++
++### 5.3 Projection P_p: R^m -> T_p M
++
++```text
++P_p(v) = v - <p, v> p.
++```
++
++### 5.4 Vector transport τ_{p->q}(ξ)
++
++Default projection transport:
++
++```text
++τ_{p->q}(ξ) = P_q(ξ).
++```
++
++Exact non-antipodal geodesic transport:
++
++```text
++τ_exact(ξ) = ξ - (<q, ξ> / (1 + <p, q>)) (p + q).
++```
++
++Avoid exact transport near `q ≈ -p` because the denominator is unstable.
++
++### 5.5 Inner product g_p
++
++```text
++g_p(ξ, η) = <ξ, η>_R^{n+1}.
++```
++
++Optional scale-normalized metric:
++
++```text
++g_p(ξ, η) = (1 / π²) <ξ, η>.
++```
++
++### 5.6 Euclidean to Riemannian gradient
++
++```text
++grad_R = P_p(∇_E).
++```
++
++### 5.7 Euclidean to Riemannian Hessian and Weingarten map
++
++```text
++W_p(ξ, v) = <p, v> ξ.
++Hess_R[ξ] = P_p(∇²_E · ξ - <p, ∇_E> ξ).
++```
++
++For all `S^n`, the correction depends only on the normal scalar
++`<p, ∇_E>`. This is cheap and does not require forming a full second
++fundamental form tensor.
++
++## 6. Manifold: Interval[a,b]
++
++### 6.1 Embedding in R^m, tangent space T_p M
++
++Use the scalar embedding:
++
++```text
++M = [a,b] ⊂ R
++m = 1
++d = 1
++p ∈ [a,b].
++```
++
++The interior is a one-dimensional flat manifold:
++
++```text
++T_pM = R,  for a < p < b.
++```
++
++At the boundary, `[a,b]` is a manifold with boundary. The feasible tangent
++cone is:
++
++```text
++C_aM = {ξ ∈ R : ξ ≥ 0}
++C_bM = {ξ ∈ R : ξ ≤ 0}
++```
++
++The implementation should be explicit about whether it uses:
++
++```text
++open-interval chart:     p ∈ (a,b), T_pM = R
++closed-interval cone:    p ∈ [a,b], feasible tangent cone at boundary
++```
++
++For Newton updates, the committed behavior should be the closed interval with
++cone projection at the boundary. That matches bounded latent coordinates and
++avoids pretending the boundary has a two-sided tangent space.
++
++### 6.2 Retraction R_p(ξ) closed-form
++
++Closed interval retraction:
++
++```text
++R_p(ξ) = clamp(p + ξ, a, b).
++```
++
++This is first-order smooth only in the interior. At boundaries it is a
++projected-gradient retraction for a manifold with boundary.
++
++If a smooth interior chart is required:
++
++```text
++c = (a + b)/2
++r = (b - a)/2
++p = c + r tanh(z)
++z = artanh((p - c)/r)
++R_p(ξ) = c + r tanh(z + ξ / (r (1 - tanh(z)^2))).
++```
++
++The smooth chart becomes ill-conditioned near the boundary. Therefore the
++closed-interval optimizer should use `clamp` plus a trust-radius clip and
++active boundary handling.
++
++### 6.3 Projection P_p: R^m -> T_p M
++
++Interior:
++
++```text
++P_p(v) = v.
++```
++
++Boundary cone projection for feasible update directions:
++
++```text
++P_a(v) = max(v, 0)
++P_b(v) = min(v, 0)
++```
++
++For gradients, use the projected gradient convention:
++
++```text
++grad_R = 0 at a if ∇_E > 0 would request a negative descent step
++grad_R = 0 at b if ∇_E < 0 would request a positive descent step
++```
++
++Equivalently, project the Newton step rather than the gradient. The final
++implementation should pick one convention and keep the KKT condition visible.
++
++### 6.4 Vector transport τ_{p->q}(ξ)
++
++Interior flat transport:
++
++```text
++τ_{p->q}(ξ) = ξ.
++```
++
++Closed-interval cone-aware transport:
++
++```text
++τ_{p->q}(ξ) = P_q(ξ)
++```
++
++where `P_q` is the feasible tangent cone projection at `q`.
++
++### 6.5 Inner product g_p
++
++Default:
++
++```text
++g_p(ξ, η) = ξ η.
++```
++
++Scale-normalized:
++
++```text
++g_p(ξ, η) = ξ η / (b - a)².
++```
++
++### 6.6 Euclidean to Riemannian gradient
++
++Interior:
++
++```text
++grad_R = ∇_E.
++```
++
++Boundary:
++
++```text
++grad_R = projected KKT gradient under the tangent cone.
++```
++
++For minimization, a boundary point is stationary when all feasible directions
++have nonnegative directional derivative:
++
++```text
++p = a:  ∇_E ≥ 0 is stationary
++p = b:  ∇_E ≤ 0 is stationary
++```
++
++### 6.7 Euclidean to Riemannian Hessian and Weingarten map
++
++The interval is flat in `R`:
++
++```text
++W_p(ξ, v) = 0.
++```
++
++Interior:
++
++```text
++Hess_R[ξ] = ∇²_E · ξ.
++```
++
++Boundary:
++
++```text
++Hess_R[ξ] = P_p(∇²_E · ξ)
++```
++
++with `ξ` restricted to the feasible tangent cone. In practice the scalar
++row solve should enforce the active set:
++
++```text
++if p = a and proposed ξ < 0, set ξ = 0
++if p = b and proposed ξ > 0, set ξ = 0
++```
++
++## 7. Manifold: R
++
++### 7.1 Embedding in R^m, tangent space T_p M
++
++```text
++M = R
++m = 1
++d = 1
++T_pR = R.
++```
++
++For `R^d`, use the product of `d` copies of this manifold or a dedicated
++Euclidean block with `m = d`.
++
++### 7.2 Retraction R_p(ξ) closed-form
++
++```text
++R_p(ξ) = p + ξ.
++```
++
++### 7.3 Projection P_p: R^m -> T_p M
++
++```text
++P_p(v) = v.
++```
++
++### 7.4 Vector transport τ_{p->q}(ξ)
++
++```text
++τ_{p->q}(ξ) = ξ.
++```
++
++### 7.5 Inner product g_p
++
++```text
++g_p(ξ, η) = ξ η.
++```
++
++### 7.6 Euclidean to Riemannian gradient
++
++```text
++grad_R = ∇_E.
++```
++
++### 7.7 Euclidean to Riemannian Hessian and Weingarten map
++
++```text
++W_p(ξ, v) = 0.
++Hess_R[ξ] = ∇²_E · ξ.
++```
++
++## 8. Manifold: Torus
++
++### 8.1 Embedding in R^m, tangent space T_p M
++
++Use a product of embedded circles:
++
++```text
++T^d = (S¹)^d
++p = (p_1, ..., p_d)
++p_j ∈ R²
++||p_j|| = 1
++m = 2d
++intrinsic dimension = d
++```
++
++The tangent space is the direct sum:
++
++```text
++T_pT^d = T_{p_1}S¹ × ... × T_{p_d}S¹
++       = {ξ ∈ R^{2d} : <p_j, ξ_j> = 0 for every j}.
++```
++
++### 8.2 Retraction R_p(ξ) closed-form
++
++Blockwise normalization:
++
++```text
++R_p(ξ)_j = (p_j + ξ_j) / ||p_j + ξ_j||.
++```
++
++### 8.3 Projection P_p: R^m -> T_p M
++
++Blockwise circle projection:
++
++```text
++P_p(v)_j = v_j - <p_j, v_j> p_j.
++```
++
++### 8.4 Vector transport τ_{p->q}(ξ)
++
++Blockwise projection transport:
++
++```text
++τ_{p->q}(ξ)_j = P_{q_j}(ξ_j).
++```
++
++### 8.5 Inner product g_p
++
++Default:
++
++```text
++g_p(ξ, η) = Σ_j <ξ_j, η_j>.
++```
++
++Scale-normalized:
++
++```text
++g_p(ξ, η) = Σ_j <ξ_j, η_j> / (2π)².
++```
++
++### 8.6 Euclidean to Riemannian gradient
++
++```text
++grad_R,j = P_{p_j}(∇_{E,j}).
++```
++
++### 8.7 Euclidean to Riemannian Hessian and Weingarten map
++
++Blockwise:
++
++```text
++W_p(ξ, v)_j = <p_j, v_j> ξ_j.
++```
++
++The Hessian action is:
++
++```text
++Hess_R[ξ]_j = P_{p_j}((∇²_E · ξ)_j - <p_j, ∇_{E,j}> ξ_j).
++```
++
++If the ambient Hessian has cross-block torus terms, keep them in
++`∇²_E · ξ` and only apply the Weingarten correction blockwise. Do not drop
++cross-block Hessian entries merely because the manifold is a product.
++
++## 9. Manifold: Product
++
++### 9.1 Embedding in R^m, tangent space T_p M
++
++For components:
++
++```text
++M = M_1 × ... × M_r
++p = (p_1, ..., p_r)
++p_j ∈ M_j ⊂ R^{m_j}
++m = Σ_j m_j
++d = Σ_j d_j
++```
++
++Tangent space:
++
++```text
++T_pM = T_{p_1}M_1 × ... × T_{p_r}M_r.
++```
++
++### 9.2 Retraction R_p(ξ) closed-form
++
++Blockwise:
++
++```text
++R_p(ξ) = (R_{p_1}^{M_1}(ξ_1), ..., R_{p_r}^{M_r}(ξ_r)).
++```
++
++### 9.3 Projection P_p: R^m -> T_p M
++
++Block diagonal:
++
++```text
++P_p(v) = (P_{p_1}^{M_1}(v_1), ..., P_{p_r}^{M_r}(v_r)).
++```
++
++### 9.4 Vector transport τ_{p->q}(ξ)
++
++Blockwise:
++
++```text
++τ_{p->q}(ξ) =
++  (τ_{p_1->q_1}^{M_1}(ξ_1), ..., τ_{p_r->q_r}^{M_r}(ξ_r)).
++```
++
++### 9.5 Inner product g_p
++
++Default product metric:
++
++```text
++g_p(ξ, η) = Σ_j g_{p_j}^{M_j}(ξ_j, η_j).
++```
++
++Weighted product metric:
++
++```text
++g_p(ξ, η) = Σ_j w_j g_{p_j}^{M_j}(ξ_j, η_j)
++```
++
++or per-ambient-axis weights:
++
++```text
++g_p(ξ, η) = Σ_a w_a ξ_a η_a
++```
++
++where weights are positive and aligned with ambient coordinates.
++
++### 9.6 Euclidean to Riemannian gradient
++
++```text
++grad_R,j = P_{p_j}^{M_j}(∇_{E,j}).
++```
++
++### 9.7 Euclidean to Riemannian Hessian and Weingarten map
++
++The Weingarten correction is blockwise:
++
++```text
++W_p(ξ, v) =
++  (W_{p_1}^{M_1}(ξ_1, v_1), ..., W_{p_r}^{M_r}(ξ_r, v_r)).
++```
++
++The Euclidean Hessian-vector product is not blockwise in general:
++
++```text
++h_E = ∇²_E · ξ
++```
++
++may have cross-component contributions. The product conversion is:
++
++```text
++Hess_R[ξ] = P_p(h_E - W_p(ξ, ∇_E)).
++```
++
++This distinction matters. A product manifold has block-diagonal tangent
++projection and blockwise curvature, but the objective may couple product
++components through the basis row, penalties, or β border.
++
++## 10. Product Manifold Composition Rules
++
++Product composition must be structural, not string-based. Each component
++owns:
++
++```text
++ambient_dim
++intrinsic_dim
++point slice
++tangent slice
++projection
++retraction
++transport
++metric contribution
++Weingarten correction
++```
++
++The product implementation owns only:
++
++```text
++offset calculation
++slice validation
++metric summation
++blockwise operation dispatch
++```
++
++Dimension validation must happen once at construction:
++
++```text
++sum(component.ambient_dim()) == row_ambient_dim
++sum(component.intrinsic_dim()) == row_tangent_dim
++weights.len() == row_ambient_dim, if weights are supplied
++```
++
++The product tangent basis is block diagonal:
++
++```text
++Q = blockdiag(Q_1, ..., Q_r).
++```
++
++This is preferable to generic Gram-Schmidt for products because:
++
++1. It preserves component sparsity.
++2. It avoids mixing unrelated coordinate units.
++3. It lets interval active sets reduce local tangent dimension.
++4. It makes `QᵀH_RQ` cheaper to assemble.
++
++Final product behavior:
++
++```text
++project_point       blockwise
++project_tangent     blockwise
++retract             blockwise
++vector_transport    blockwise
++weingarten          blockwise
++inner_product       sum of component metrics or supplied weighted ambient sum
++tangent_basis       block diagonal component bases
++```
++
++## 11. Connection to `input_loc_derivatives.rs`
++
++The source file `src/terms/input_loc_derivatives.rs` currently derives
++chart or ambient Euclidean derivatives of design columns with respect to the
++input location. The Riemannian layer consumes those derivatives by chain
++rule.
++
++### 11.1 Radial basis
++
++For a radial basis:
++
++```text
++Φ_{i,k}(t_i) = φ(||t_i - c_k||)
++```
++
++`basis_input_loc_grad` computes:
++
++```text
++J_i[k,a] = ∂Φ_{i,k}/∂t_{i,a}.
++```
++
++`basis_input_loc_hess` computes:
++
++```text
++HΦ_i[k,a,b] = ∂²Φ_{i,k}/∂t_{i,a}∂t_{i,b}.
++```
++
++If `t_i` is already the embedded manifold point, these are ambient
++derivatives in `R^m`. Convert to Riemannian row objects by:
++
++```text
++g_E = contract upstream gradient through J_i
++H_E = contract upstream Hessian through J_i and HΦ_i
++g_R = P_{t_i}(g_E)
++H_R[ξ] = P_{t_i}(H_E ξ - W_{t_i}(ξ, g_E))
++```
++
++For radial kernels on `S^n`, centers must also live in the same ambient
++space if the kernel is an embedded chord-distance kernel. If the desired
++kernel is geodesic-distance based, `input_loc_derivatives.rs` needs a
++separate geodesic derivative path; chord-distance derivatives should not be
++silently reused.
++
++### 11.2 Periodic 1-D basis and S¹
++
++`periodic_radial_input_loc_grad_1d` computes chart derivatives in an angle
++coordinate:
++
++```text
++θ ∈ R / 2πZ.
++```
++
++For the embedded optimizer:
++
++```text
++p(θ) = (cos θ, sin θ)
++dp/dθ = (-sin θ, cos θ) = Q(p)
++```
++
++If source code gives chart derivatives:
++
++```text
++dF/dθ
++d²F/dθ²
++```
++
++then the embedded tangent gradient is:
++
++```text
++grad_R = Q(p) (dF/dθ).
++```
++
++The embedded tangent Hessian in basis coordinates is:
++
++```text
++Qᵀ Hess_R[Qα] = (d²F/dθ²) α.
++```
++
++If converting from chart to ambient Euclidean objects for the generic
++embedded formula:
++
++```text
++g_E can be any ambient vector satisfying Qᵀ g_E = dF/dθ.
++choose g_E = Q dF/dθ.
++```
++
++The normal component is then zero, which is correct for a function expressed
++directly on the circle chart. If the function is an ambient extension
++`F_bar(p)`, use its true ambient gradient and the sphere correction.
++
++### 11.3 Sphere S²
++
++`sphere_s2_input_loc_grad` already returns an ambient tangent vector:
++
++```text
++P_t(q(r)(t - c)).
++```
++
++That is a Riemannian first derivative of the design column on `S²` under the
++chord-distance embedding. For Hessian-level Newton, the second derivative
++must be consistent:
++
++```text
++Hess_R Φ_k[ξ] = P_t(HΦ_E,k ξ - <t, ∇_E Φ_k> ξ).
++```
++
++where:
++
++```text
++∇_E Φ_k = q(r)(t - c)
++HΦ_E,k = q I + s (t - c)(t - c)ᵀ.
++```
++
++Do not apply the Hessian formula to the already projected gradient and then
++drop the normal scalar. The normal scalar is:
++
++```text
++<t, ∇_E Φ_k> = q(r) <t, t - c> = q(r)(1 - <t,c>).
++```
++
++### 11.4 Tensor product basis
++
++`tensor_product_input_loc_grad` produces chart derivatives axis-by-axis:
++
++```text
++∂Φ/∂u_a
++```
++
++where `u` is the product chart coordinate. If the manifold is a product of
++embedded factors, apply the chart-to-embedding Jacobian factorwise:
++
++```text
++J_emb[k,:] = Σ_a (∂Φ_k/∂u_a) (∂u_a/∂p)^*
++```
++
++For an `S¹` factor:
++
++```text
++grad_emb contribution = Q(p_a) (∂Φ/∂θ_a).
++```
++
++For an interval or real factor:
++
++```text
++grad_emb contribution = ∂Φ/∂u_a.
++```
++
++The Hessian conversion from chart coordinates to Riemannian coordinates
++should happen in tangent basis coordinates:
++
++```text
++H_Q = J_chart_to_tangentᵀ H_chart J_chart_to_tangent
++      + second-chart terms if the chart is nonlinear.
++```
++
++For embedded `S¹`, prefer computing in the intrinsic angle basis and lifting
++the final tangent vector `ξ = Qη`; this avoids storing fake ambient Hessian
++entries for the normal direction.
++
++### 11.5 Contracted chain rule
++
++`contract_input_loc_gradient` and `LatentCoordValues::contract_gradient`
++implement:
++
++```text
++∂L/∂t_{i,a} = Σ_k (∂L/∂Φ_{i,k})(∂Φ_{i,k}/∂t_{i,a}).
++```
++
++The Riemannian post-processing is:
++
++```text
++g_R_i = manifold.project_tangent(t_i, g_E_i).
++```
++
++For row Newton, the Hessian contraction should be added with the same
++ownership:
++
++```text
++contract_input_loc_hessian(...)
++```
++
++with output row blocks:
++
++```text
++H_E_i ∈ R^{m×m}
++```
++
++then:
++
++```text
++H_R_i = manifold.riemannian_hessian_matrix(t_i, g_E_i, H_E_i).
++```
++
++## 12. Riemannian Newton on the Tangent Space
++
++For each row point `p = t_i`, assemble:
++
++```text
++g_E ∈ R^m
++H_E ∈ R^{m×m}
++```
++
++Convert:
++
++```text
++grad_R = P_p(g_E).
++H_R[ξ] = P_p(H_E ξ - W_p(ξ, g_E)).
++```
++
++Build an orthonormal tangent basis:
++
++```text
++Q ∈ R^{m×d}
++QᵀQ = I
++range(Q) = T_pM.
++```
++
++Solve the tangent-space damped Newton system:
++
++```text
++(Qᵀ H_R Q + μI) η = -Qᵀ grad_R
++ξ = Qη
++t_new = R_p(ξ).
++```
++
++This is the required row Newton formula. The solve must happen in intrinsic
++tangent coordinates, not in the full ambient space with a normal pin, because
++ambient normal directions make `H_R` structurally singular.
++
++For product manifolds, use:
++
++```text
++Q = blockdiag(Q_1, ..., Q_r)
++```
++
++For interval boundary active sets, `Q` may have zero columns if the row is
++at an active boundary and the descent direction points outside the interval.
++
++Trust-region clipping:
++
++```text
++if ||ξ||_g > Δ:
++    ξ ← (Δ / ||ξ||_g) ξ
++```
++
++Use the manifold metric:
++
++```text
++||ξ||_g² = g_p(ξ, ξ).
++```
++
++No Cauchy "fallback" should be hidden in the manifold trait. If the tangent
++Newton system is indefinite or singular, the row solver should report the
++regularization it applied and return a damped tangent step. The caller can
++decide whether to accept, shrink, or retry.
++
++## 13. IFT Warm-Start on a Manifold
++
++The existing IFT predictor computes a row-local update:
++
++```text
++Δt_i = -H_{tt,i}^{-1} rhs_i
++```
++
++For a manifold latent, interpret `Δt_i` as a tangent vector at the current
++point:
++
++```text
++Δt_i ∈ T_{t_i}M.
++```
++
++The warm-start update is:
++
++```text
++t_i,new = R_{t_i}(P_{t_i}(Δt_i)).
++```
++
++If the IFT cache was built from tangent-space Hessian blocks, the stored
++`Δt_i` should already be tangent up to numerical drift. Re-project anyway:
++
++```text
++ξ_i = P_{t_i}(Δt_i)
++t_i,new = R_{t_i}(ξ_i).
++```
++
++If the outer loop compares old and new tangent deltas, transport the previous
++tangent vector to the new point:
++
++```text
++Δt_i transported = τ_{t_i -> t_i,new}(Δt_i).
++```
++
++Default:
++
++```text
++τ_{p->q}(ξ) = P_q(ξ).
++```
++
++The IFT cache should store enough manifold metadata to know:
++
++```text
++row ambient dimension
++row intrinsic dimension
++point p used when factorizing H_tt
++tangent basis Q used for the solve, if solve is stored in intrinsic coords
++```
++
++Preferred cache design:
++
++```text
++store H_QQ factors for QᵀH_RQ
++store Q or enough data to rebuild Q(p)
++store p
++predict η in R^d
++lift ξ = Qη
++retract
++```
++
++This avoids mixing old ambient normal pins with new tangent updates.
++
++## 14. Numerical Pitfalls
++
++### 14.1 Sphere south pole and chart singularities
++
++Embedded spheres do not have a south-pole singularity. Chart conversions do.
++Any path that uses latitude/longitude has singular Jacobians at the poles and
++a seam in longitude.
++
++Rules:
++
++```text
++optimizer state: embedded unit vector
++display/API chart: optional and lossy at poles
++derivative source: prefer embedded chord derivatives for sphere kernels
++tangent basis: choose anchor axis away from p
++```
++
++If a chart must be used:
++
++```text
++switch charts when |cos(latitude)| is small
++do not finite-difference through longitude at a pole
++do not use longitude residuals as Euclidean errors near a pole
++```
++
++### 14.2 Sphere antipodal transport
++
++Exact geodesic transport formula has:
++
++```text
++1 + <p,q>
++```
++
++in the denominator. It is unstable near antipodal moves. Projection transport
++does not have this singularity but is only an approximation.
++
++Trust-region policy:
++
++```text
++keep ||ξ|| < π/2 for sphere row updates unless a line search explicitly accepts more
++```
++
++### 14.3 Retraction normalization near zero
++
++Normalization retraction fails if:
++
++```text
++||p + ξ|| ≈ 0.
++```
++
++For a unit sphere this means the tangent step is impossible in exact
++arithmetic because `ξ ⟂ p`, so:
++
++```text
++||p + ξ||² = 1 + ||ξ||².
++```
++
++The only way to hit zero is if `ξ` is not tangent and contains an invalid
++normal component near `-p`. Therefore:
++
++```text
++project ξ first
++clip trust radius
++assert norm is finite
++```
++
++### 14.4 Interval boundary
++
++`clamp(p + ξ, a, b)` is not smooth at the boundary. The correct boundary
++condition is KKT, not a two-sided Newton equation.
++
++Rules:
++
++```text
++if p = a and descent wants p < a, active-set the row coordinate
++if p = b and descent wants p > b, active-set the row coordinate
++do not use tanh chart near boundary without monitoring Jacobian
++```
++
++The smooth `tanh` chart can turn small changes in `p` into huge changes in
++`z`. This damages IFT warm starts.
++
++### 14.5 Vector-transport approximations
++
++Projection transport:
++
++```text
++τ(ξ) = P_q ξ
++```
++
++is not exactly norm preserving. For small accepted Newton steps this is
++usually fine. For large steps, it can shrink vectors and bias quasi-Newton
++updates.
++
++Rules:
++
++```text
++use projection transport for IFT warm-start deltas
++avoid using transported vectors to build BFGS curvature pairs unless the norm loss is checked
++for exact sphere/circle transport, reject antipodal denominator instability
++```
++
++### 14.6 Collision derivatives in radial kernels
++
++`input_loc_derivatives.rs` correctly surfaces degenerate collision cases for
++kernels whose `q` or `s` does not have a finite limit.
++
++Rules:
++
++```text
++do not map degenerate collision to zero
++do not add finite-difference derivatives
++move centers or choose a smoother kernel
++```
++
++### 14.7 Product units
++
++Product manifolds can mix `S¹`, intervals, and real axes. A raw ambient norm
++can make one radian comparable to one meter or one bounded-range unit.
++
++Rules:
++
++```text
++set metric weights per component
++scale trust-region radius in metric norm
++report weights in fit diagnostics
++```
++
++## 15. Final Rust Trait Signatures
++
++The implementation should consolidate the duplicated manifold logic into one
++embedded-coordinate trait. This is the final contract to commit to:
++
++```rust
++use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
++
++pub trait Manifold: Send + Sync {
++    fn name(&self) -> &'static str;
++
++    /// Intrinsic tangent dimension.
++    fn dim(&self) -> usize;
++
++    /// Ambient embedding dimension.
++    fn ambient_dim(&self) -> usize;
++
++    /// Project an ambient point to the manifold.
++    ///
++    /// Used for initialization and validation, not as a replacement for
++    /// retraction during optimization.
++    fn project_point(
++        &self,
++        p: ArrayView1<'_, f64>,
++        out: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++
++    /// Orthogonal projection onto T_pM, or tangent cone projection for
++    /// boundary manifolds such as Interval.
++    fn project_tangent(
++        &self,
++        p: ArrayView1<'_, f64>,
++        v: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++
++    /// Retraction R_p(xi).
++    fn retract(
++        &self,
++        p: ArrayView1<'_, f64>,
++        xi: ArrayView1<'_, f64>,
++        out: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++
++    /// Vector transport from T_from M to T_to M.
++    fn vector_transport(
++        &self,
++        from: ArrayView1<'_, f64>,
++        to: ArrayView1<'_, f64>,
++        xi: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++
++    /// Riemannian inner product at p.
++    fn inner_product(
++        &self,
++        p: ArrayView1<'_, f64>,
++        xi: ArrayView1<'_, f64>,
++        eta: ArrayView1<'_, f64>,
++    ) -> Result<f64, ManifoldError>;
++
++    /// Orthonormal tangent basis Q in ambient coordinates.
++    fn tangent_basis(
++        &self,
++        p: ArrayView1<'_, f64>,
++    ) -> Result<Array2<f64>, ManifoldError>;
++
++    /// Shape/Weingarten correction W_p(xi, ambient_gradient).
++    ///
++    /// This takes the ambient gradient, not the projected Riemannian gradient.
++    fn weingarten(
++        &self,
++        p: ArrayView1<'_, f64>,
++        xi: ArrayView1<'_, f64>,
++        ambient_grad: ArrayView1<'_, f64>,
++        out: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++
++    /// grad_R = P_p(egrad).
++    fn euclidean_to_riemannian_grad(
++        &self,
++        p: ArrayView1<'_, f64>,
++        egrad: ArrayView1<'_, f64>,
++        out: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError> {
++        out.assign(&egrad);
++        self.project_tangent(p, out)
++    }
++
++    /// Hess_R[xi] = P_p(ehess_xi - W_p(xi, egrad)).
++    fn euclidean_to_riemannian_hess_vp(
++        &self,
++        p: ArrayView1<'_, f64>,
++        egrad: ArrayView1<'_, f64>,
++        ehess_xi: ArrayView1<'_, f64>,
++        xi: ArrayView1<'_, f64>,
++        out: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++}
++```
++
++Error type:
++
++```rust
++#[derive(Debug, Clone)]
++pub enum ManifoldError {
++    DimensionMismatch {
++        manifold: &'static str,
++        expected: usize,
++        found: usize,
++        role: &'static str,
++    },
++    InvalidPoint {
++        manifold: &'static str,
++        reason: String,
++    },
++    InvalidTangent {
++        manifold: &'static str,
++        reason: String,
++    },
++    BoundaryActive {
++        manifold: &'static str,
++        reason: String,
++    },
++}
++```
++
++Concrete specs:
++
++```rust
++#[derive(Debug, Clone, PartialEq)]
++pub enum ManifoldKind {
++    Euclidean { dim: usize },
++    Circle,
++    Sphere { intrinsic_dim: usize },
++    Interval { lo: f64, hi: f64 },
++    Torus { dim: usize },
++    Product { components: Vec<ManifoldKind> },
++    ProductWithMetric {
++        components: Vec<ManifoldKind>,
++        ambient_weights: Vec<f64>,
++    },
++}
++
++impl ManifoldKind {
++    pub fn build(&self) -> Result<Box<dyn Manifold>, ManifoldError>;
++    pub fn dim(&self) -> usize;
++    pub fn ambient_dim(&self) -> usize;
++    pub fn is_euclidean(&self) -> bool;
++}
++```
++
++Concrete implementation structs:
++
++```rust
++#[derive(Debug, Clone)]
++pub struct Euclidean {
++    pub dim: usize,
++}
++
++#[derive(Debug, Clone)]
++pub struct Circle;
++
++#[derive(Debug, Clone)]
++pub struct Sphere {
++    pub intrinsic_dim: usize,
++}
++
++#[derive(Debug, Clone)]
++pub struct Interval {
++    pub lo: f64,
++    pub hi: f64,
++    pub boundary_mode: IntervalBoundaryMode,
++}
++
++#[derive(Debug, Clone)]
++pub enum IntervalBoundaryMode {
++    ClosedCone,
++    OpenInterior { edge_band: f64 },
++}
++
++#[derive(Debug, Clone)]
++pub struct Torus {
++    pub dim: usize,
++}
++
++pub struct Product {
++    pub components: Vec<Box<dyn Manifold>>,
++    pub ambient_weights: Option<Vec<f64>>,
++}
++```
++
++Row Newton API:
++
++```rust
++#[derive(Debug, Clone)]
++pub struct RiemannianNewtonConfig {
++    pub damping: f64,
++    pub trust_radius: Option<f64>,
++}
++
++#[derive(Debug, Clone)]
++pub struct RiemannianNewtonOutcome {
++    pub new_point: Array1<f64>,
++    pub tangent_step: Array1<f64>,
++    pub tangent_step_coords: Array1<f64>,
++    pub projected_gradient_norm: f64,
++    pub damping_used: f64,
++}
++
++pub fn riemannian_newton_step_on_point(
++    manifold: &dyn Manifold,
++    point: ArrayView1<'_, f64>,
++    euclidean_grad: ArrayView1<'_, f64>,
++    euclidean_hess: ArrayView2<'_, f64>,
++    config: &RiemannianNewtonConfig,
++) -> Result<RiemannianNewtonOutcome, ManifoldError>;
++```
++
++Required implementation of the solve:
++
++```text
++grad_R = P_p(egrad)
++construct H_R by H_R e_j or by operator callbacks
++Q = tangent_basis(p)
++solve (QᵀH_RQ + μI)η = -Qᵀgrad_R
++ξ = Qη
++clip ξ in g_p norm if trust_radius is set
++new_point = R_p(ξ)
++```
++
++Retraction helper for IFT:
++
++```rust
++pub fn retract_tangent_delta(
++    manifold: &dyn Manifold,
++    point: ArrayView1<'_, f64>,
++    delta: ArrayView1<'_, f64>,
++    out: ArrayViewMut1<'_, f64>,
++) -> Result<(), ManifoldError>;
++```
++
++Batch row helper:
++
++```rust
++pub fn retract_latent_rows(
++    manifold: &dyn Manifold,
++    point_flat: ArrayView1<'_, f64>,
++    delta_flat: ArrayView1<'_, f64>,
++    n_rows: usize,
++    out_flat: ArrayViewMut1<'_, f64>,
++) -> Result<(), ManifoldError>;
++```
++
++Derivative contraction extension:
++
++```rust
++pub struct InputLocationHessianBlocks {
++    /// Shape: (n_obs, ambient_dim)
++    pub grad_t: Array2<f64>,
++
++    /// Shape: (n_obs, ambient_dim, ambient_dim), row-local dense blocks.
++    pub hess_t: Array3<f64>,
++}
++
++pub fn contract_input_loc_hessian(
++    grad_phi: ArrayView2<'_, f64>,
++    hess_phi: ArrayView2<'_, f64>,
++    design_grad: ArrayView3<'_, f64>,
++    design_hess: ArrayView3<'_, f64>,
++) -> Result<InputLocationHessianBlocks, BasisError>;
++```
++
++The exact `hess_phi` shape can follow the existing row kernel layout, but the
++output contract should be row-local `m×m` Euclidean blocks ready for manifold
++conversion.
++
++## 16. Concrete Weingarten Map Summary
++
++```text
++R:
++  W_p(ξ, v) = 0
++
++Interval[a,b]:
++  W_p(ξ, v) = 0
++  boundary handled by tangent cone, not curvature
++
++S¹:
++  W_p(ξ, v) = <p, v> ξ
++
++S²:
++  W_p(ξ, v) = <p, v> ξ
++
++S^n:
++  W_p(ξ, v) = <p, v> ξ
++
++Torus T^d:
++  W_p(ξ, v)_j = <p_j, v_j> ξ_j
++
++Product:
++  W_p(ξ, v)_j = W_{p_j}^{M_j}(ξ_j, v_j)
++```
++
++For every sphere-like component, `v` must be the ambient gradient or normal
++gradient. Passing the projected Riemannian gradient removes the curvature
++correction.
++
++## 17. Implementation Commitments
++
++1. Store optimizer state for circle, sphere, torus, and products in embedded
++   coordinates.
++2. Keep chart coordinates only at API boundaries or for chart-native basis
++   evaluation.
++3. Project every row gradient into the tangent space before the row solve.
++4. Convert every row Hessian action with the embedded Weingarten correction.
++5. Solve Newton systems in tangent basis coordinates:
++
++```text
++(Qᵀ H_R Q + μI)η = -Qᵀgrad_R.
++```
++
++6. Lift and retract:
++
++```text
++ξ = Qη
++t_new = R_p(ξ).
++```
++
++7. Treat IFT warm-start deltas as tangent vectors and apply them by
++   retraction.
++8. Use projection vector transport as the default transport.
++9. Handle interval boundaries as active constraints.
++10. Do not introduce finite-difference derivative paths.
++11. Do not keep unused chart-specific dead code once embedded manifolds own
++    the optimization path.
++
+
+diff --git a/proposals/riemannian_per_point.md b/proposals/riemannian_per_point.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..b47184943eaef91c8670bb02ec44ba997f8f48da
+--- /dev/null
++++ b/proposals/riemannian_per_point.md
+@@ -0,0 +1,1798 @@
++# Proposal: Retraction-Based Riemannian Optimization for Per-Point Latents
++
++Status: draft derivation.
++Audience: implementers wiring `LatentCoordValues`, `input_loc_derivatives`, and
++the arrow-Schur latent inner solver.
++
++## 0. Scope and Conventions
++
++This document derives the manifold-local optimization contract for a per-row
++latent coordinate `t_i`. The intent is to replace Euclidean additive updates
++with tangent-space updates followed by a retraction:
++
++```text
++t_i ∈ M
++ξ_i ∈ T_{t_i}M
++t_i,new = R_{t_i}(ξ_i)
++```
++
++The row-local Newton algebra remains the same arrow/bordered Hessian system
++already used by the latent inner solver. Only the row latent block changes:
++Euclidean gradients, Hessian-vector products, and warm-start deltas are
++projected into `T_{t_i}M`; the resulting tangent vector is applied by
++`R_{t_i}`.
++
++Notation:
++
++```text
++M              manifold for one row latent
++p ∈ M          current embedded point
++m              ambient embedding dimension
++d              intrinsic dimension
++ξ, η ∈ T_p M   tangent vectors at p
++q = R_p(ξ)     retracted point
++P_p            orthogonal tangent projection in ambient coordinates
++g_p            Riemannian metric / inner product
++∇_E f          ambient Euclidean gradient of a scalar objective
++∇²_E f · ξ     ambient Euclidean Hessian-vector product
++grad_R f       Riemannian gradient
++Hess_R f[ξ]    Riemannian Hessian applied to ξ
++W_p(ξ, v)      shape/Weingarten correction used by the embedded Hessian formula
++```
++
++All manifold implementations below use the ambient Euclidean pullback metric
++unless a product-level weight vector is explicitly supplied. Weighted product
++metrics only change `g_p`, trust-region norms, and tangent basis
++orthonormalization; they do not change the closed-form embedding,
++projection, or retraction.
++
++The embedded Hessian conversion used in code should be:
++
++```text
++grad_R = P_p(∇_E)
++Hess_R[ξ] = P_p(∇²_E · ξ - W_p(ξ, ∇_E))
++```
++
++Equivalently, since `W_p` only uses the normal component for the unit sphere
++and its products:
++
++```text
++Hess_R[ξ] = P_p(∇²_E · ξ - W_p(ξ, P_p^⊥(∇_E))).
++```
++
++The prompt shorthand
++
++```text
++Hess_R[ξ] = P_p(∇²_E · ξ - W_p(ξ, P_p(∇_E)))
++```
++
++is harmless for flat manifolds but would make the sphere correction vanish,
++because `P_p(∇_E)` is tangent and therefore orthogonal to `p`. The final Rust
++signature should pass the ambient gradient, or explicitly pass the normal
++gradient. This is the same correction already intended in
++`src/solver/riemannian.rs`: for a sphere, subtract `<p, ∇_E> ξ` before
++projecting.
++
++## 1. Existing Source Points
++
++The current implementation already has most of the needed pieces:
++
++```text
++src/terms/input_loc_derivatives.rs
++  basis_input_loc_grad
++  basis_input_loc_hess
++  tensor_product_input_loc_grad
++  periodic_radial_input_loc_grad_1d
++  sphere_s2_input_loc_grad
++  contract_input_loc_gradient
++
++src/terms/latent_coord.rs
++  LatentManifold
++  LatentCoordValues::retract_flat_delta
++  LatentCoordValues::design_gradient_wrt_t_dispatch
++  LatentCoordValues::contract_gradient
++  LatentCoordValues::contract_gradient_radial_streaming
++  LatentManifold::project_to_tangent
++  LatentManifold::euclidean_to_riemannian_hessian
++  LatentManifold::riemannian_hessian_matrix
++
++src/solver/riemannian.rs
++  Manifold
++  Euclidean
++  Circle
++  Sphere
++  Interval
++  Torus
++  Product
++  ManifoldKind
++  RiemannianNewtonStep
++  riemannian_newton_step_on_point
++  retract_euclidean_delta
++
++src/solver/arrow_schur.rs
++  ArrowSystem::apply_riemannian_latent_geometry
++  apply_per_row_retraction
++
++src/solver/persistent_warm_start.rs
++  ift_warm_start_latent
++  apply_ift_retraction
++```
++
++Two representations currently coexist:
++
++```text
++src/terms/latent_coord.rs::LatentManifold::Circle
++  stores a scalar angle in one ambient coordinate and wraps it.
++
++src/solver/riemannian.rs::Circle
++  stores the embedded unit vector (cos θ, sin θ) in R².
++```
++
++This proposal commits the final Riemannian optimizer contract to embedded
++coordinates. Chart coordinates may remain as API sugar, but the Newton,
++Hessian, vector-transport, and IFT update path should operate on embedded
++points. That removes seam discontinuities from the optimizer itself.
++
++## 2. Per-Row Objective and Chain Rule
++
++For one row `i`, the design row is:
++
++```text
++Φ_i(t_i) = [Φ_{i,1}(t_i), ..., Φ_{i,K}(t_i)].
++```
++
++The source in `input_loc_derivatives.rs` gives the two objects needed by
++the Euclidean row calculus:
++
++```text
++J_i[k,a]       = ∂Φ_{i,k}/∂t_{i,a}
++HΦ_i[k,a,b]   = ∂²Φ_{i,k}/∂t_{i,a}∂t_{i,b}
++```
++
++For radial kernels with center `c_k`:
++
++```text
++r_{ik} = ||t_i - c_k||
++Φ_{i,k} = φ(r_{ik})
++q(r) = φ'(r)/r
++s(r) = (φ''(r) - q(r))/r²
++
++J_i[k,a] = q(r_{ik}) (t_i - c_k)_a
++HΦ_i[k,a,b] = q(r_{ik}) δ_ab
++            + s(r_{ik}) (t_i - c_k)_a (t_i - c_k)_b
++```
++
++Those are exactly `basis_input_loc_grad` and `basis_input_loc_hess`.
++`RadialScalarKind::eval_design_triplet` supplies `(φ, q, s)` and owns the
++collision limits or collision errors.
++
++Let the scalar objective be `F(Φ_i(t_i), β, ...)`. If the upstream design
++gradient and Hessian with respect to `Φ_i` are:
++
++```text
++u_i[k]       = ∂F/∂Φ_{i,k}
++A_i[k,l]     = ∂²F/∂Φ_{i,k}∂Φ_{i,l}
++```
++
++then the Euclidean latent gradient is:
++
++```text
++∇_{E,t_i}F[a] = Σ_k u_i[k] J_i[k,a].
++```
++
++The Euclidean latent Hessian is:
++
++```text
++∇²_{E,t_i}F[a,b]
++  = Σ_{k,l} J_i[k,a] A_i[k,l] J_i[l,b]
++  + Σ_k u_i[k] HΦ_i[k,a,b].
++```
++
++For Gaussian residual least squares with prediction `ŷ_i = Φ_i β`:
++
++```text
++u_i[k] = -resid_i β_k
++A_i[k,l] = β_k β_l
++
++∇_{E,t_i}F = -(resid_i) J_iᵀ β
++∇²_{E,t_i}F = (J_iᵀ β)(J_iᵀ β)ᵀ - resid_i Σ_k β_k HΦ_i[k,:,:]
++```
++
++The Gauss-Newton row block drops the second term:
++
++```text
++H_GN = (J_iᵀ β)(J_iᵀ β)ᵀ.
++```
++
++The Riemannian layer does not change this chain rule. It only converts the
++ambient Euclidean row objects to tangent row objects:
++
++```text
++g_R_i = P_{t_i}(g_E_i)
++H_R_i[ξ] = P_{t_i}(H_E_i ξ - W_{t_i}(ξ, g_E_i)).
++```
++
++## 3. Manifold: S¹
++
++### 3.1 Embedding in R^m, tangent space T_p M
++
++Use the embedded unit circle:
++
++```text
++S¹ = {p ∈ R² : ||p|| = 1}
++p = (cos θ, sin θ)
++m = 2
++d = 1
++```
++
++The tangent space is:
++
++```text
++T_p S¹ = {ξ ∈ R² : <p, ξ> = 0}.
++```
++
++A canonical unit tangent basis is:
++
++```text
++Q(p) = [-p_y, p_x] ∈ R^{2×1}.
++```
++
++Any tangent vector has the form:
++
++```text
++ξ = Q(p) α,  α ∈ R.
++```
++
++### 3.2 Retraction R_p(ξ) closed-form
++
++Use the normalization retraction:
++
++```text
++R_p(ξ) = (p + ξ) / ||p + ξ||.
++```
++
++This is first-order equivalent to the exponential map and avoids angle seams.
++For a tangent vector `ξ = Qα`, the exact exponential map is:
++
++```text
++Exp_p(ξ) = cos(||ξ||) p + sin(||ξ||) ξ/||ξ||.
++```
++
++The optimizer commits to the normalization retraction because it is cheaper,
++closed-form, and already used by the shipped `Circle` and `Sphere`
++implementations.
++
++### 3.3 Projection P_p: R^m -> T_p M
++
++```text
++P_p(v) = v - <p, v> p.
++```
++
++For `S¹`, `P_p(v)` is also:
++
++```text
++P_p(v) = Q(p) Q(p)ᵀ v.
++```
++
++### 3.4 Vector transport τ_{p->q}(ξ)
++
++Use projection transport:
++
++```text
++τ_{p->q}(ξ) = P_q(ξ).
++```
++
++For `S¹`, exact parallel transport along the shorter geodesic can be written
++in closed form, but projection transport is sufficient for the row Newton
++and IFT warm-start path because every transported vector is re-projected
++before it is reused.
++
++If exact transport is needed later and `q ≠ -p`, define the Householder-like
++transport:
++
++```text
++τ_exact(ξ) = ξ - (<q, ξ> / (1 + <p, q>)) (p + q).
++```
++
++The final trait should expose projection transport only as the committed
++default; exact transport can be a separate implementation detail if needed.
++
++### 3.5 Inner product g_p
++
++Default ambient pullback:
++
++```text
++g_p(ξ, η) = <ξ, η>_R².
++```
++
++For product trust-region balancing, a scale-normalized metric may use:
++
++```text
++g_p(ξ, η) = (1 / (2π)²) <ξ, η>.
++```
++
++The scale-normalized metric changes step norms, not `P_p`, `R_p`, or the
++embedded Hessian correction.
++
++### 3.6 Euclidean to Riemannian gradient
++
++```text
++grad_R = P_p(∇_E)
++       = ∇_E - <p, ∇_E> p.
++```
++
++In the tangent basis:
++
++```text
++g_Q = Q(p)ᵀ grad_R.
++```
++
++### 3.7 Euclidean to Riemannian Hessian and Weingarten map
++
++For `S¹`, treat it as the unit sphere `S^1`:
++
++```text
++W_p(ξ, v) = <p, v> ξ.
++```
++
++The Hessian action is:
++
++```text
++Hess_R[ξ] = P_p(∇²_E · ξ - <p, ∇_E> ξ).
++```
++
++If the Weingarten call receives `v = P_p(∇_E)`, then `<p, v> = 0` and the
++curvature correction disappears. Therefore the committed Rust signature must
++pass the ambient gradient or its normal component.
++
++## 4. Manifold: S²
++
++### 4.1 Embedding in R^m, tangent space T_p M
++
++Use the embedded unit sphere:
++
++```text
++S² = {p ∈ R³ : ||p|| = 1}
++m = 3
++d = 2
++```
++
++The tangent space is:
++
++```text
++T_p S² = {ξ ∈ R³ : <p, ξ> = 0}.
++```
++
++For numerical work, an orthonormal basis `Q(p) ∈ R^{3×2}` can be built by:
++
++1. Choose an anchor axis `a` not nearly parallel to `p`.
++2. Set `q1 = normalize(a - <a,p>p)`.
++3. Set `q2 = p × q1`.
++
++A robust anchor rule:
++
++```text
++a = e_z if |p_z| < 0.9 else e_x.
++```
++
++### 4.2 Retraction R_p(ξ) closed-form
++
++Use the normalization retraction:
++
++```text
++R_p(ξ) = (p + ξ) / ||p + ξ||.
++```
++
++The exact exponential map is:
++
++```text
++Exp_p(ξ) = cos(||ξ||) p + sin(||ξ||) ξ / ||ξ||.
++```
++
++The normalization retraction is cheaper and agrees to first order:
++
++```text
++R_p(0) = p
++D R_p(0)[ξ] = ξ.
++```
++
++### 4.3 Projection P_p: R^m -> T_p M
++
++```text
++P_p(v) = v - <p, v> p
++       = (I - p pᵀ) v.
++```
++
++### 4.4 Vector transport τ_{p->q}(ξ)
++
++Committed default:
++
++```text
++τ_{p->q}(ξ) = P_q(ξ).
++```
++
++Exact geodesic parallel transport, valid away from antipodal points, is:
++
++```text
++τ_exact(ξ) = ξ - (<q, ξ> / (1 + <p, q>)) (p + q).
++```
++
++Projection transport is not exactly norm-preserving, but it is closed-form,
++cheap, and stable for small row Newton and IFT predictor steps.
++
++### 4.5 Inner product g_p
++
++Default:
++
++```text
++g_p(ξ, η) = <ξ, η>_R³.
++```
++
++Scale-normalized trust metric:
++
++```text
++g_p(ξ, η) = (1 / π²) <ξ, η>.
++```
++
++### 4.6 Euclidean to Riemannian gradient
++
++```text
++grad_R = P_p(∇_E)
++       = ∇_E - <p, ∇_E> p.
++```
++
++In tangent coordinates:
++
++```text
++g_Q = Qᵀ grad_R.
++```
++
++### 4.7 Euclidean to Riemannian Hessian and Weingarten map
++
++For the unit sphere:
++
++```text
++W_p(ξ, v) = <p, v> ξ.
++```
++
++Therefore:
++
++```text
++Hess_R[ξ] = P_p(∇²_E · ξ - <p, ∇_E> ξ).
++```
++
++This formula is the same as differentiating the projected gradient
++`P_p(∇_E)` and projecting the result back to `T_pS²`.
++
++## 5. Manifold: S^n
++
++### 5.1 Embedding in R^m, tangent space T_p M
++
++Use the embedded unit sphere:
++
++```text
++S^n = {p ∈ R^{n+1} : ||p|| = 1}
++m = n + 1
++d = n
++```
++
++Tangent space:
++
++```text
++T_p S^n = {ξ ∈ R^{n+1} : <p, ξ> = 0}.
++```
++
++The tangent basis `Q(p) ∈ R^{(n+1)×n}` is produced by projecting ambient
++basis vectors into `T_pS^n` and applying modified Gram-Schmidt, or by a
++Householder construction. The current generic `Manifold::tangent_basis`
++already uses the projection-plus-Gram-Schmidt approach.
++
++### 5.2 Retraction R_p(ξ) closed-form
++
++```text
++R_p(ξ) = (p + ξ) / ||p + ξ||.
++```
++
++Guard:
++
++```text
++if ||p + ξ|| is tiny, reject or shrink ξ before retraction.
++```
++
++Do not silently map to an arbitrary axis in optimizer code; that creates a
++discontinuous update. Construction-time projection can normalize invalid
++initial values, but Newton steps should be trust-radius clipped instead.
++
++### 5.3 Projection P_p: R^m -> T_p M
++
++```text
++P_p(v) = v - <p, v> p.
++```
++
++### 5.4 Vector transport τ_{p->q}(ξ)
++
++Default projection transport:
++
++```text
++τ_{p->q}(ξ) = P_q(ξ).
++```
++
++Exact non-antipodal geodesic transport:
++
++```text
++τ_exact(ξ) = ξ - (<q, ξ> / (1 + <p, q>)) (p + q).
++```
++
++Avoid exact transport near `q ≈ -p` because the denominator is unstable.
++
++### 5.5 Inner product g_p
++
++```text
++g_p(ξ, η) = <ξ, η>_R^{n+1}.
++```
++
++Optional scale-normalized metric:
++
++```text
++g_p(ξ, η) = (1 / π²) <ξ, η>.
++```
++
++### 5.6 Euclidean to Riemannian gradient
++
++```text
++grad_R = P_p(∇_E).
++```
++
++### 5.7 Euclidean to Riemannian Hessian and Weingarten map
++
++```text
++W_p(ξ, v) = <p, v> ξ.
++Hess_R[ξ] = P_p(∇²_E · ξ - <p, ∇_E> ξ).
++```
++
++For all `S^n`, the correction depends only on the normal scalar
++`<p, ∇_E>`. This is cheap and does not require forming a full second
++fundamental form tensor.
++
++## 6. Manifold: Interval[a,b]
++
++### 6.1 Embedding in R^m, tangent space T_p M
++
++Use the scalar embedding:
++
++```text
++M = [a,b] ⊂ R
++m = 1
++d = 1
++p ∈ [a,b].
++```
++
++The interior is a one-dimensional flat manifold:
++
++```text
++T_pM = R,  for a < p < b.
++```
++
++At the boundary, `[a,b]` is a manifold with boundary. The feasible tangent
++cone is:
++
++```text
++C_aM = {ξ ∈ R : ξ ≥ 0}
++C_bM = {ξ ∈ R : ξ ≤ 0}
++```
++
++The implementation should be explicit about whether it uses:
++
++```text
++open-interval chart:     p ∈ (a,b), T_pM = R
++closed-interval cone:    p ∈ [a,b], feasible tangent cone at boundary
++```
++
++For Newton updates, the committed behavior should be the closed interval with
++cone projection at the boundary. That matches bounded latent coordinates and
++avoids pretending the boundary has a two-sided tangent space.
++
++### 6.2 Retraction R_p(ξ) closed-form
++
++Closed interval retraction:
++
++```text
++R_p(ξ) = clamp(p + ξ, a, b).
++```
++
++This is first-order smooth only in the interior. At boundaries it is a
++projected-gradient retraction for a manifold with boundary.
++
++If a smooth interior chart is required:
++
++```text
++c = (a + b)/2
++r = (b - a)/2
++p = c + r tanh(z)
++z = artanh((p - c)/r)
++R_p(ξ) = c + r tanh(z + ξ / (r (1 - tanh(z)^2))).
++```
++
++The smooth chart becomes ill-conditioned near the boundary. Therefore the
++closed-interval optimizer should use `clamp` plus a trust-radius clip and
++active boundary handling.
++
++### 6.3 Projection P_p: R^m -> T_p M
++
++Interior:
++
++```text
++P_p(v) = v.
++```
++
++Boundary cone projection for feasible update directions:
++
++```text
++P_a(v) = max(v, 0)
++P_b(v) = min(v, 0)
++```
++
++For gradients, use the projected gradient convention:
++
++```text
++grad_R = 0 at a if ∇_E > 0 would request a negative descent step
++grad_R = 0 at b if ∇_E < 0 would request a positive descent step
++```
++
++Equivalently, project the Newton step rather than the gradient. The final
++implementation should pick one convention and keep the KKT condition visible.
++
++### 6.4 Vector transport τ_{p->q}(ξ)
++
++Interior flat transport:
++
++```text
++τ_{p->q}(ξ) = ξ.
++```
++
++Closed-interval cone-aware transport:
++
++```text
++τ_{p->q}(ξ) = P_q(ξ)
++```
++
++where `P_q` is the feasible tangent cone projection at `q`.
++
++### 6.5 Inner product g_p
++
++Default:
++
++```text
++g_p(ξ, η) = ξ η.
++```
++
++Scale-normalized:
++
++```text
++g_p(ξ, η) = ξ η / (b - a)².
++```
++
++### 6.6 Euclidean to Riemannian gradient
++
++Interior:
++
++```text
++grad_R = ∇_E.
++```
++
++Boundary:
++
++```text
++grad_R = projected KKT gradient under the tangent cone.
++```
++
++For minimization, a boundary point is stationary when all feasible directions
++have nonnegative directional derivative:
++
++```text
++p = a:  ∇_E ≥ 0 is stationary
++p = b:  ∇_E ≤ 0 is stationary
++```
++
++### 6.7 Euclidean to Riemannian Hessian and Weingarten map
++
++The interval is flat in `R`:
++
++```text
++W_p(ξ, v) = 0.
++```
++
++Interior:
++
++```text
++Hess_R[ξ] = ∇²_E · ξ.
++```
++
++Boundary:
++
++```text
++Hess_R[ξ] = P_p(∇²_E · ξ)
++```
++
++with `ξ` restricted to the feasible tangent cone. In practice the scalar
++row solve should enforce the active set:
++
++```text
++if p = a and proposed ξ < 0, set ξ = 0
++if p = b and proposed ξ > 0, set ξ = 0
++```
++
++## 7. Manifold: R
++
++### 7.1 Embedding in R^m, tangent space T_p M
++
++```text
++M = R
++m = 1
++d = 1
++T_pR = R.
++```
++
++For `R^d`, use the product of `d` copies of this manifold or a dedicated
++Euclidean block with `m = d`.
++
++### 7.2 Retraction R_p(ξ) closed-form
++
++```text
++R_p(ξ) = p + ξ.
++```
++
++### 7.3 Projection P_p: R^m -> T_p M
++
++```text
++P_p(v) = v.
++```
++
++### 7.4 Vector transport τ_{p->q}(ξ)
++
++```text
++τ_{p->q}(ξ) = ξ.
++```
++
++### 7.5 Inner product g_p
++
++```text
++g_p(ξ, η) = ξ η.
++```
++
++### 7.6 Euclidean to Riemannian gradient
++
++```text
++grad_R = ∇_E.
++```
++
++### 7.7 Euclidean to Riemannian Hessian and Weingarten map
++
++```text
++W_p(ξ, v) = 0.
++Hess_R[ξ] = ∇²_E · ξ.
++```
++
++## 8. Manifold: Torus
++
++### 8.1 Embedding in R^m, tangent space T_p M
++
++Use a product of embedded circles:
++
++```text
++T^d = (S¹)^d
++p = (p_1, ..., p_d)
++p_j ∈ R²
++||p_j|| = 1
++m = 2d
++intrinsic dimension = d
++```
++
++The tangent space is the direct sum:
++
++```text
++T_pT^d = T_{p_1}S¹ × ... × T_{p_d}S¹
++       = {ξ ∈ R^{2d} : <p_j, ξ_j> = 0 for every j}.
++```
++
++### 8.2 Retraction R_p(ξ) closed-form
++
++Blockwise normalization:
++
++```text
++R_p(ξ)_j = (p_j + ξ_j) / ||p_j + ξ_j||.
++```
++
++### 8.3 Projection P_p: R^m -> T_p M
++
++Blockwise circle projection:
++
++```text
++P_p(v)_j = v_j - <p_j, v_j> p_j.
++```
++
++### 8.4 Vector transport τ_{p->q}(ξ)
++
++Blockwise projection transport:
++
++```text
++τ_{p->q}(ξ)_j = P_{q_j}(ξ_j).
++```
++
++### 8.5 Inner product g_p
++
++Default:
++
++```text
++g_p(ξ, η) = Σ_j <ξ_j, η_j>.
++```
++
++Scale-normalized:
++
++```text
++g_p(ξ, η) = Σ_j <ξ_j, η_j> / (2π)².
++```
++
++### 8.6 Euclidean to Riemannian gradient
++
++```text
++grad_R,j = P_{p_j}(∇_{E,j}).
++```
++
++### 8.7 Euclidean to Riemannian Hessian and Weingarten map
++
++Blockwise:
++
++```text
++W_p(ξ, v)_j = <p_j, v_j> ξ_j.
++```
++
++The Hessian action is:
++
++```text
++Hess_R[ξ]_j = P_{p_j}((∇²_E · ξ)_j - <p_j, ∇_{E,j}> ξ_j).
++```
++
++If the ambient Hessian has cross-block torus terms, keep them in
++`∇²_E · ξ` and only apply the Weingarten correction blockwise. Do not drop
++cross-block Hessian entries merely because the manifold is a product.
++
++## 9. Manifold: Product
++
++### 9.1 Embedding in R^m, tangent space T_p M
++
++For components:
++
++```text
++M = M_1 × ... × M_r
++p = (p_1, ..., p_r)
++p_j ∈ M_j ⊂ R^{m_j}
++m = Σ_j m_j
++d = Σ_j d_j
++```
++
++Tangent space:
++
++```text
++T_pM = T_{p_1}M_1 × ... × T_{p_r}M_r.
++```
++
++### 9.2 Retraction R_p(ξ) closed-form
++
++Blockwise:
++
++```text
++R_p(ξ) = (R_{p_1}^{M_1}(ξ_1), ..., R_{p_r}^{M_r}(ξ_r)).
++```
++
++### 9.3 Projection P_p: R^m -> T_p M
++
++Block diagonal:
++
++```text
++P_p(v) = (P_{p_1}^{M_1}(v_1), ..., P_{p_r}^{M_r}(v_r)).
++```
++
++### 9.4 Vector transport τ_{p->q}(ξ)
++
++Blockwise:
++
++```text
++τ_{p->q}(ξ) =
++  (τ_{p_1->q_1}^{M_1}(ξ_1), ..., τ_{p_r->q_r}^{M_r}(ξ_r)).
++```
++
++### 9.5 Inner product g_p
++
++Default product metric:
++
++```text
++g_p(ξ, η) = Σ_j g_{p_j}^{M_j}(ξ_j, η_j).
++```
++
++Weighted product metric:
++
++```text
++g_p(ξ, η) = Σ_j w_j g_{p_j}^{M_j}(ξ_j, η_j)
++```
++
++or per-ambient-axis weights:
++
++```text
++g_p(ξ, η) = Σ_a w_a ξ_a η_a
++```
++
++where weights are positive and aligned with ambient coordinates.
++
++### 9.6 Euclidean to Riemannian gradient
++
++```text
++grad_R,j = P_{p_j}^{M_j}(∇_{E,j}).
++```
++
++### 9.7 Euclidean to Riemannian Hessian and Weingarten map
++
++The Weingarten correction is blockwise:
++
++```text
++W_p(ξ, v) =
++  (W_{p_1}^{M_1}(ξ_1, v_1), ..., W_{p_r}^{M_r}(ξ_r, v_r)).
++```
++
++The Euclidean Hessian-vector product is not blockwise in general:
++
++```text
++h_E = ∇²_E · ξ
++```
++
++may have cross-component contributions. The product conversion is:
++
++```text
++Hess_R[ξ] = P_p(h_E - W_p(ξ, ∇_E)).
++```
++
++This distinction matters. A product manifold has block-diagonal tangent
++projection and blockwise curvature, but the objective may couple product
++components through the basis row, penalties, or β border.
++
++## 10. Product Manifold Composition Rules
++
++Product composition must be structural, not string-based. Each component
++owns:
++
++```text
++ambient_dim
++intrinsic_dim
++point slice
++tangent slice
++projection
++retraction
++transport
++metric contribution
++Weingarten correction
++```
++
++The product implementation owns only:
++
++```text
++offset calculation
++slice validation
++metric summation
++blockwise operation dispatch
++```
++
++Dimension validation must happen once at construction:
++
++```text
++sum(component.ambient_dim()) == row_ambient_dim
++sum(component.intrinsic_dim()) == row_tangent_dim
++weights.len() == row_ambient_dim, if weights are supplied
++```
++
++The product tangent basis is block diagonal:
++
++```text
++Q = blockdiag(Q_1, ..., Q_r).
++```
++
++This is preferable to generic Gram-Schmidt for products because:
++
++1. It preserves component sparsity.
++2. It avoids mixing unrelated coordinate units.
++3. It lets interval active sets reduce local tangent dimension.
++4. It makes `QᵀH_RQ` cheaper to assemble.
++
++Final product behavior:
++
++```text
++project_point       blockwise
++project_tangent     blockwise
++retract             blockwise
++vector_transport    blockwise
++weingarten          blockwise
++inner_product       sum of component metrics or supplied weighted ambient sum
++tangent_basis       block diagonal component bases
++```
++
++## 11. Connection to `input_loc_derivatives.rs`
++
++The source file `src/terms/input_loc_derivatives.rs` currently derives
++chart or ambient Euclidean derivatives of design columns with respect to the
++input location. The Riemannian layer consumes those derivatives by chain
++rule.
++
++### 11.1 Radial basis
++
++For a radial basis:
++
++```text
++Φ_{i,k}(t_i) = φ(||t_i - c_k||)
++```
++
++`basis_input_loc_grad` computes:
++
++```text
++J_i[k,a] = ∂Φ_{i,k}/∂t_{i,a}.
++```
++
++`basis_input_loc_hess` computes:
++
++```text
++HΦ_i[k,a,b] = ∂²Φ_{i,k}/∂t_{i,a}∂t_{i,b}.
++```
++
++If `t_i` is already the embedded manifold point, these are ambient
++derivatives in `R^m`. Convert to Riemannian row objects by:
++
++```text
++g_E = contract upstream gradient through J_i
++H_E = contract upstream Hessian through J_i and HΦ_i
++g_R = P_{t_i}(g_E)
++H_R[ξ] = P_{t_i}(H_E ξ - W_{t_i}(ξ, g_E))
++```
++
++For radial kernels on `S^n`, centers must also live in the same ambient
++space if the kernel is an embedded chord-distance kernel. If the desired
++kernel is geodesic-distance based, `input_loc_derivatives.rs` needs a
++separate geodesic derivative path; chord-distance derivatives should not be
++silently reused.
++
++### 11.2 Periodic 1-D basis and S¹
++
++`periodic_radial_input_loc_grad_1d` computes chart derivatives in an angle
++coordinate:
++
++```text
++θ ∈ R / 2πZ.
++```
++
++For the embedded optimizer:
++
++```text
++p(θ) = (cos θ, sin θ)
++dp/dθ = (-sin θ, cos θ) = Q(p)
++```
++
++If source code gives chart derivatives:
++
++```text
++dF/dθ
++d²F/dθ²
++```
++
++then the embedded tangent gradient is:
++
++```text
++grad_R = Q(p) (dF/dθ).
++```
++
++The embedded tangent Hessian in basis coordinates is:
++
++```text
++Qᵀ Hess_R[Qα] = (d²F/dθ²) α.
++```
++
++If converting from chart to ambient Euclidean objects for the generic
++embedded formula:
++
++```text
++g_E can be any ambient vector satisfying Qᵀ g_E = dF/dθ.
++choose g_E = Q dF/dθ.
++```
++
++The normal component is then zero, which is correct for a function expressed
++directly on the circle chart. If the function is an ambient extension
++`F_bar(p)`, use its true ambient gradient and the sphere correction.
++
++### 11.3 Sphere S²
++
++`sphere_s2_input_loc_grad` already returns an ambient tangent vector:
++
++```text
++P_t(q(r)(t - c)).
++```
++
++That is a Riemannian first derivative of the design column on `S²` under the
++chord-distance embedding. For Hessian-level Newton, the second derivative
++must be consistent:
++
++```text
++Hess_R Φ_k[ξ] = P_t(HΦ_E,k ξ - <t, ∇_E Φ_k> ξ).
++```
++
++where:
++
++```text
++∇_E Φ_k = q(r)(t - c)
++HΦ_E,k = q I + s (t - c)(t - c)ᵀ.
++```
++
++Do not apply the Hessian formula to the already projected gradient and then
++drop the normal scalar. The normal scalar is:
++
++```text
++<t, ∇_E Φ_k> = q(r) <t, t - c> = q(r)(1 - <t,c>).
++```
++
++### 11.4 Tensor product basis
++
++`tensor_product_input_loc_grad` produces chart derivatives axis-by-axis:
++
++```text
++∂Φ/∂u_a
++```
++
++where `u` is the product chart coordinate. If the manifold is a product of
++embedded factors, apply the chart-to-embedding Jacobian factorwise:
++
++```text
++J_emb[k,:] = Σ_a (∂Φ_k/∂u_a) (∂u_a/∂p)^*
++```
++
++For an `S¹` factor:
++
++```text
++grad_emb contribution = Q(p_a) (∂Φ/∂θ_a).
++```
++
++For an interval or real factor:
++
++```text
++grad_emb contribution = ∂Φ/∂u_a.
++```
++
++The Hessian conversion from chart coordinates to Riemannian coordinates
++should happen in tangent basis coordinates:
++
++```text
++H_Q = J_chart_to_tangentᵀ H_chart J_chart_to_tangent
++      + second-chart terms if the chart is nonlinear.
++```
++
++For embedded `S¹`, prefer computing in the intrinsic angle basis and lifting
++the final tangent vector `ξ = Qη`; this avoids storing fake ambient Hessian
++entries for the normal direction.
++
++### 11.5 Contracted chain rule
++
++`contract_input_loc_gradient` and `LatentCoordValues::contract_gradient`
++implement:
++
++```text
++∂L/∂t_{i,a} = Σ_k (∂L/∂Φ_{i,k})(∂Φ_{i,k}/∂t_{i,a}).
++```
++
++The Riemannian post-processing is:
++
++```text
++g_R_i = manifold.project_tangent(t_i, g_E_i).
++```
++
++For row Newton, the Hessian contraction should be added with the same
++ownership:
++
++```text
++contract_input_loc_hessian(...)
++```
++
++with output row blocks:
++
++```text
++H_E_i ∈ R^{m×m}
++```
++
++then:
++
++```text
++H_R_i = manifold.riemannian_hessian_matrix(t_i, g_E_i, H_E_i).
++```
++
++## 12. Riemannian Newton on the Tangent Space
++
++For each row point `p = t_i`, assemble:
++
++```text
++g_E ∈ R^m
++H_E ∈ R^{m×m}
++```
++
++Convert:
++
++```text
++grad_R = P_p(g_E).
++H_R[ξ] = P_p(H_E ξ - W_p(ξ, g_E)).
++```
++
++Build an orthonormal tangent basis:
++
++```text
++Q ∈ R^{m×d}
++QᵀQ = I
++range(Q) = T_pM.
++```
++
++Solve the tangent-space damped Newton system:
++
++```text
++(Qᵀ H_R Q + μI) η = -Qᵀ grad_R
++ξ = Qη
++t_new = R_p(ξ).
++```
++
++This is the required row Newton formula. The solve must happen in intrinsic
++tangent coordinates, not in the full ambient space with a normal pin, because
++ambient normal directions make `H_R` structurally singular.
++
++For product manifolds, use:
++
++```text
++Q = blockdiag(Q_1, ..., Q_r)
++```
++
++For interval boundary active sets, `Q` may have zero columns if the row is
++at an active boundary and the descent direction points outside the interval.
++
++Trust-region clipping:
++
++```text
++if ||ξ||_g > Δ:
++    ξ ← (Δ / ||ξ||_g) ξ
++```
++
++Use the manifold metric:
++
++```text
++||ξ||_g² = g_p(ξ, ξ).
++```
++
++No Cauchy "fallback" should be hidden in the manifold trait. If the tangent
++Newton system is indefinite or singular, the row solver should report the
++regularization it applied and return a damped tangent step. The caller can
++decide whether to accept, shrink, or retry.
++
++## 13. IFT Warm-Start on a Manifold
++
++The existing IFT predictor computes a row-local update:
++
++```text
++Δt_i = -H_{tt,i}^{-1} rhs_i
++```
++
++For a manifold latent, interpret `Δt_i` as a tangent vector at the current
++point:
++
++```text
++Δt_i ∈ T_{t_i}M.
++```
++
++The warm-start update is:
++
++```text
++t_i,new = R_{t_i}(P_{t_i}(Δt_i)).
++```
++
++If the IFT cache was built from tangent-space Hessian blocks, the stored
++`Δt_i` should already be tangent up to numerical drift. Re-project anyway:
++
++```text
++ξ_i = P_{t_i}(Δt_i)
++t_i,new = R_{t_i}(ξ_i).
++```
++
++If the outer loop compares old and new tangent deltas, transport the previous
++tangent vector to the new point:
++
++```text
++Δt_i transported = τ_{t_i -> t_i,new}(Δt_i).
++```
++
++Default:
++
++```text
++τ_{p->q}(ξ) = P_q(ξ).
++```
++
++The IFT cache should store enough manifold metadata to know:
++
++```text
++row ambient dimension
++row intrinsic dimension
++point p used when factorizing H_tt
++tangent basis Q used for the solve, if solve is stored in intrinsic coords
++```
++
++Preferred cache design:
++
++```text
++store H_QQ factors for QᵀH_RQ
++store Q or enough data to rebuild Q(p)
++store p
++predict η in R^d
++lift ξ = Qη
++retract
++```
++
++This avoids mixing old ambient normal pins with new tangent updates.
++
++## 14. Numerical Pitfalls
++
++### 14.1 Sphere south pole and chart singularities
++
++Embedded spheres do not have a south-pole singularity. Chart conversions do.
++Any path that uses latitude/longitude has singular Jacobians at the poles and
++a seam in longitude.
++
++Rules:
++
++```text
++optimizer state: embedded unit vector
++display/API chart: optional and lossy at poles
++derivative source: prefer embedded chord derivatives for sphere kernels
++tangent basis: choose anchor axis away from p
++```
++
++If a chart must be used:
++
++```text
++switch charts when |cos(latitude)| is small
++do not finite-difference through longitude at a pole
++do not use longitude residuals as Euclidean errors near a pole
++```
++
++### 14.2 Sphere antipodal transport
++
++Exact geodesic transport formula has:
++
++```text
++1 + <p,q>
++```
++
++in the denominator. It is unstable near antipodal moves. Projection transport
++does not have this singularity but is only an approximation.
++
++Trust-region policy:
++
++```text
++keep ||ξ|| < π/2 for sphere row updates unless a line search explicitly accepts more
++```
++
++### 14.3 Retraction normalization near zero
++
++Normalization retraction fails if:
++
++```text
++||p + ξ|| ≈ 0.
++```
++
++For a unit sphere this means the tangent step is impossible in exact
++arithmetic because `ξ ⟂ p`, so:
++
++```text
++||p + ξ||² = 1 + ||ξ||².
++```
++
++The only way to hit zero is if `ξ` is not tangent and contains an invalid
++normal component near `-p`. Therefore:
++
++```text
++project ξ first
++clip trust radius
++assert norm is finite
++```
++
++### 14.4 Interval boundary
++
++`clamp(p + ξ, a, b)` is not smooth at the boundary. The correct boundary
++condition is KKT, not a two-sided Newton equation.
++
++Rules:
++
++```text
++if p = a and descent wants p < a, active-set the row coordinate
++if p = b and descent wants p > b, active-set the row coordinate
++do not use tanh chart near boundary without monitoring Jacobian
++```
++
++The smooth `tanh` chart can turn small changes in `p` into huge changes in
++`z`. This damages IFT warm starts.
++
++### 14.5 Vector-transport approximations
++
++Projection transport:
++
++```text
++τ(ξ) = P_q ξ
++```
++
++is not exactly norm preserving. For small accepted Newton steps this is
++usually fine. For large steps, it can shrink vectors and bias quasi-Newton
++updates.
++
++Rules:
++
++```text
++use projection transport for IFT warm-start deltas
++avoid using transported vectors to build BFGS curvature pairs unless the norm loss is checked
++for exact sphere/circle transport, reject antipodal denominator instability
++```
++
++### 14.6 Collision derivatives in radial kernels
++
++`input_loc_derivatives.rs` correctly surfaces degenerate collision cases for
++kernels whose `q` or `s` does not have a finite limit.
++
++Rules:
++
++```text
++do not map degenerate collision to zero
++do not add finite-difference derivatives
++move centers or choose a smoother kernel
++```
++
++### 14.7 Product units
++
++Product manifolds can mix `S¹`, intervals, and real axes. A raw ambient norm
++can make one radian comparable to one meter or one bounded-range unit.
++
++Rules:
++
++```text
++set metric weights per component
++scale trust-region radius in metric norm
++report weights in fit diagnostics
++```
++
++## 15. Final Rust Trait Signatures
++
++The implementation should consolidate the duplicated manifold logic into one
++embedded-coordinate trait. This is the final contract to commit to:
++
++```rust
++use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
++
++pub trait Manifold: Send + Sync {
++    fn name(&self) -> &'static str;
++
++    /// Intrinsic tangent dimension.
++    fn dim(&self) -> usize;
++
++    /// Ambient embedding dimension.
++    fn ambient_dim(&self) -> usize;
++
++    /// Project an ambient point to the manifold.
++    ///
++    /// Used for initialization and validation, not as a replacement for
++    /// retraction during optimization.
++    fn project_point(
++        &self,
++        p: ArrayView1<'_, f64>,
++        out: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++
++    /// Orthogonal projection onto T_pM, or tangent cone projection for
++    /// boundary manifolds such as Interval.
++    fn project_tangent(
++        &self,
++        p: ArrayView1<'_, f64>,
++        v: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++
++    /// Retraction R_p(xi).
++    fn retract(
++        &self,
++        p: ArrayView1<'_, f64>,
++        xi: ArrayView1<'_, f64>,
++        out: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++
++    /// Vector transport from T_from M to T_to M.
++    fn vector_transport(
++        &self,
++        from: ArrayView1<'_, f64>,
++        to: ArrayView1<'_, f64>,
++        xi: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++
++    /// Riemannian inner product at p.
++    fn inner_product(
++        &self,
++        p: ArrayView1<'_, f64>,
++        xi: ArrayView1<'_, f64>,
++        eta: ArrayView1<'_, f64>,
++    ) -> Result<f64, ManifoldError>;
++
++    /// Orthonormal tangent basis Q in ambient coordinates.
++    fn tangent_basis(
++        &self,
++        p: ArrayView1<'_, f64>,
++    ) -> Result<Array2<f64>, ManifoldError>;
++
++    /// Shape/Weingarten correction W_p(xi, ambient_gradient).
++    ///
++    /// This takes the ambient gradient, not the projected Riemannian gradient.
++    fn weingarten(
++        &self,
++        p: ArrayView1<'_, f64>,
++        xi: ArrayView1<'_, f64>,
++        ambient_grad: ArrayView1<'_, f64>,
++        out: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++
++    /// grad_R = P_p(egrad).
++    fn euclidean_to_riemannian_grad(
++        &self,
++        p: ArrayView1<'_, f64>,
++        egrad: ArrayView1<'_, f64>,
++        out: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError> {
++        out.assign(&egrad);
++        self.project_tangent(p, out)
++    }
++
++    /// Hess_R[xi] = P_p(ehess_xi - W_p(xi, egrad)).
++    fn euclidean_to_riemannian_hess_vp(
++        &self,
++        p: ArrayView1<'_, f64>,
++        egrad: ArrayView1<'_, f64>,
++        ehess_xi: ArrayView1<'_, f64>,
++        xi: ArrayView1<'_, f64>,
++        out: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++}
++```
++
++Error type:
++
++```rust
++#[derive(Debug, Clone)]
++pub enum ManifoldError {
++    DimensionMismatch {
++        manifold: &'static str,
++        expected: usize,
++        found: usize,
++        role: &'static str,
++    },
++    InvalidPoint {
++        manifold: &'static str,
++        reason: String,
++    },
++    InvalidTangent {
++        manifold: &'static str,
++        reason: String,
++    },
++    BoundaryActive {
++        manifold: &'static str,
++        reason: String,
++    },
++}
++```
++
++Concrete specs:
++
++```rust
++#[derive(Debug, Clone, PartialEq)]
++pub enum ManifoldKind {
++    Euclidean { dim: usize },
++    Circle,
++    Sphere { intrinsic_dim: usize },
++    Interval { lo: f64, hi: f64 },
++    Torus { dim: usize },
++    Product { components: Vec<ManifoldKind> },
++    ProductWithMetric {
++        components: Vec<ManifoldKind>,
++        ambient_weights: Vec<f64>,
++    },
++}
++
++impl ManifoldKind {
++    pub fn build(&self) -> Result<Box<dyn Manifold>, ManifoldError>;
++    pub fn dim(&self) -> usize;
++    pub fn ambient_dim(&self) -> usize;
++    pub fn is_euclidean(&self) -> bool;
++}
++```
++
++Concrete implementation structs:
++
++```rust
++#[derive(Debug, Clone)]
++pub struct Euclidean {
++    pub dim: usize,
++}
++
++#[derive(Debug, Clone)]
++pub struct Circle;
++
++#[derive(Debug, Clone)]
++pub struct Sphere {
++    pub intrinsic_dim: usize,
++}
++
++#[derive(Debug, Clone)]
++pub struct Interval {
++    pub lo: f64,
++    pub hi: f64,
++    pub boundary_mode: IntervalBoundaryMode,
++}
++
++#[derive(Debug, Clone)]
++pub enum IntervalBoundaryMode {
++    ClosedCone,
++    OpenInterior { edge_band: f64 },
++}
++
++#[derive(Debug, Clone)]
++pub struct Torus {
++    pub dim: usize,
++}
++
++pub struct Product {
++    pub components: Vec<Box<dyn Manifold>>,
++    pub ambient_weights: Option<Vec<f64>>,
++}
++```
++
++Row Newton API:
++
++```rust
++#[derive(Debug, Clone)]
++pub struct RiemannianNewtonConfig {
++    pub damping: f64,
++    pub trust_radius: Option<f64>,
++}
++
++#[derive(Debug, Clone)]
++pub struct RiemannianNewtonOutcome {
++    pub new_point: Array1<f64>,
++    pub tangent_step: Array1<f64>,
++    pub tangent_step_coords: Array1<f64>,
++    pub projected_gradient_norm: f64,
++    pub damping_used: f64,
++}
++
++pub fn riemannian_newton_step_on_point(
++    manifold: &dyn Manifold,
++    point: ArrayView1<'_, f64>,
++    euclidean_grad: ArrayView1<'_, f64>,
++    euclidean_hess: ArrayView2<'_, f64>,
++    config: &RiemannianNewtonConfig,
++) -> Result<RiemannianNewtonOutcome, ManifoldError>;
++```
++
++Required implementation of the solve:
++
++```text
++grad_R = P_p(egrad)
++construct H_R by H_R e_j or by operator callbacks
++Q = tangent_basis(p)
++solve (QᵀH_RQ + μI)η = -Qᵀgrad_R
++ξ = Qη
++clip ξ in g_p norm if trust_radius is set
++new_point = R_p(ξ)
++```
++
++Retraction helper for IFT:
++
++```rust
++pub fn retract_tangent_delta(
++    manifold: &dyn Manifold,
++    point: ArrayView1<'_, f64>,
++    delta: ArrayView1<'_, f64>,
++    out: ArrayViewMut1<'_, f64>,
++) -> Result<(), ManifoldError>;
++```
++
++Batch row helper:
++
++```rust
++pub fn retract_latent_rows(
++    manifold: &dyn Manifold,
++    point_flat: ArrayView1<'_, f64>,
++    delta_flat: ArrayView1<'_, f64>,
++    n_rows: usize,
++    out_flat: ArrayViewMut1<'_, f64>,
++) -> Result<(), ManifoldError>;
++```
++
++Derivative contraction extension:
++
++```rust
++pub struct InputLocationHessianBlocks {
++    /// Shape: (n_obs, ambient_dim)
++    pub grad_t: Array2<f64>,
++
++    /// Shape: (n_obs, ambient_dim, ambient_dim), row-local dense blocks.
++    pub hess_t: Array3<f64>,
++}
++
++pub fn contract_input_loc_hessian(
++    grad_phi: ArrayView2<'_, f64>,
++    hess_phi: ArrayView2<'_, f64>,
++    design_grad: ArrayView3<'_, f64>,
++    design_hess: ArrayView3<'_, f64>,
++) -> Result<InputLocationHessianBlocks, BasisError>;
++```
++
++The exact `hess_phi` shape can follow the existing row kernel layout, but the
++output contract should be row-local `m×m` Euclidean blocks ready for manifold
++conversion.
++
++## 16. Concrete Weingarten Map Summary
++
++```text
++R:
++  W_p(ξ, v) = 0
++
++Interval[a,b]:
++  W_p(ξ, v) = 0
++  boundary handled by tangent cone, not curvature
++
++S¹:
++  W_p(ξ, v) = <p, v> ξ
++
++S²:
++  W_p(ξ, v) = <p, v> ξ
++
++S^n:
++  W_p(ξ, v) = <p, v> ξ
++
++Torus T^d:
++  W_p(ξ, v)_j = <p_j, v_j> ξ_j
++
++Product:
++  W_p(ξ, v)_j = W_{p_j}^{M_j}(ξ_j, v_j)
++```
++
++For every sphere-like component, `v` must be the ambient gradient or normal
++gradient. Passing the projected Riemannian gradient removes the curvature
++correction.
++
++## 17. Implementation Commitments
++
++1. Store optimizer state for circle, sphere, torus, and products in embedded
++   coordinates.
++2. Keep chart coordinates only at API boundaries or for chart-native basis
++   evaluation.
++3. Project every row gradient into the tangent space before the row solve.
++4. Convert every row Hessian action with the embedded Weingarten correction.
++5. Solve Newton systems in tangent basis coordinates:
++
++```text
++(Qᵀ H_R Q + μI)η = -Qᵀgrad_R.
++```
++
++6. Lift and retract:
++
++```text
++ξ = Qη
++t_new = R_p(ξ).
++```
++
++7. Treat IFT warm-start deltas as tangent vectors and apply them by
++   retraction.
++8. Use projection vector transport as the default transport.
++9. Handle interval boundaries as active constraints.
++10. Do not introduce finite-difference derivative paths.
++11. Do not keep unused chart-specific dead code once embedded manifolds own
++    the optimization path.
++
+
+codex
+The proposal file is written. I’m doing a quick structural pass for the requested section names and line-count target, then I’ll adjust headings if needed without running any build or tests.
+exec
+/bin/zsh -lc 'wc -l proposals/riemannian_per_point.md' in /Users/user/gam
+ succeeded in 0ms:
+    1798 proposals/riemannian_per_point.md
+
+exec
+/bin/zsh -lc 'rg -n "''^## [0-9]+'"\\. Manifold|"'^### [0-9]+'"\\.[0-9]+\" proposals/riemannian_per_point.md" in /Users/user/gam
+ succeeded in 0ms:
+215:## 3. Manifold: S¹
+217:### 3.1 Embedding in R^m, tangent space T_p M
+246:### 3.2 Retraction R_p(ξ) closed-form
+265:### 3.3 Projection P_p: R^m -> T_p M
+277:### 3.4 Vector transport τ_{p->q}(ξ)
+300:### 3.5 Inner product g_p
+317:### 3.6 Euclidean to Riemannian gradient
+330:### 3.7 Euclidean to Riemannian Hessian and Weingarten map
+348:## 4. Manifold: S²
+350:### 4.1 Embedding in R^m, tangent space T_p M
+378:### 4.2 Retraction R_p(ξ) closed-form
+399:### 4.3 Projection P_p: R^m -> T_p M
+406:### 4.4 Vector transport τ_{p->q}(ξ)
+423:### 4.5 Inner product g_p
+437:### 4.6 Euclidean to Riemannian gradient
+450:### 4.7 Euclidean to Riemannian Hessian and Weingarten map
+467:## 5. Manifold: S^n
+469:### 5.1 Embedding in R^m, tangent space T_p M
+490:### 5.2 Retraction R_p(ξ) closed-form
+506:### 5.3 Projection P_p: R^m -> T_p M
+512:### 5.4 Vector transport τ_{p->q}(ξ)
+528:### 5.5 Inner product g_p
+540:### 5.6 Euclidean to Riemannian gradient
+546:### 5.7 Euclidean to Riemannian Hessian and Weingarten map
+557:## 6. Manifold: Interval[a,b]
+559:### 6.1 Embedding in R^m, tangent space T_p M
+595:### 6.2 Retraction R_p(ξ) closed-form
+620:### 6.3 Projection P_p: R^m -> T_p M
+645:### 6.4 Vector transport τ_{p->q}(ξ)
+661:### 6.5 Inner product g_p
+675:### 6.6 Euclidean to Riemannian gradient
+697:### 6.7 Euclidean to Riemannian Hessian and Weingarten map
+725:## 7. Manifold: R
+727:### 7.1 Embedding in R^m, tangent space T_p M
+739:### 7.2 Retraction R_p(ξ) closed-form
+745:### 7.3 Projection P_p: R^m -> T_p M
+751:### 7.4 Vector transport τ_{p->q}(ξ)
+757:### 7.5 Inner product g_p
+763:### 7.6 Euclidean to Riemannian gradient
+769:### 7.7 Euclidean to Riemannian Hessian and Weingarten map
+776:## 8. Manifold: Torus
+778:### 8.1 Embedding in R^m, tangent space T_p M
+798:### 8.2 Retraction R_p(ξ) closed-form
+806:### 8.3 Projection P_p: R^m -> T_p M
+814:### 8.4 Vector transport τ_{p->q}(ξ)
+822:### 8.5 Inner product g_p
+836:### 8.6 Euclidean to Riemannian gradient
+842:### 8.7 Euclidean to Riemannian Hessian and Weingarten map
+860:## 9. Manifold: Product
+862:### 9.1 Embedding in R^m, tangent space T_p M
+880:### 9.2 Retraction R_p(ξ) closed-form
+888:### 9.3 Projection P_p: R^m -> T_p M
+896:### 9.4 Vector transport τ_{p->q}(ξ)
+905:### 9.5 Inner product g_p
+927:### 9.6 Euclidean to Riemannian gradient
+933:### 9.7 Euclidean to Riemannian Hessian and Weingarten map
+1024:### 11.1 Radial basis
+1060:### 11.2 Periodic 1-D basis and S¹
+1107:### 11.3 Sphere S²
+1137:### 11.4 Tensor product basis
+1176:### 11.5 Contracted chain rule
+1339:### 14.1 Sphere south pole and chart singularities
+1362:### 14.2 Sphere antipodal transport
+1379:### 14.3 Retraction normalization near zero
+1403:### 14.4 Interval boundary
+1419:### 14.5 Vector-transport approximations
+1439:### 14.6 Collision derivatives in radial kernels
+1452:### 14.7 Product units
+
+diff --git a/proposals/riemannian_per_point.md b/proposals/riemannian_per_point.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..b47184943eaef91c8670bb02ec44ba997f8f48da
+--- /dev/null
++++ b/proposals/riemannian_per_point.md
+@@ -0,0 +1,1798 @@
++# Proposal: Retraction-Based Riemannian Optimization for Per-Point Latents
++
++Status: draft derivation.
++Audience: implementers wiring `LatentCoordValues`, `input_loc_derivatives`, and
++the arrow-Schur latent inner solver.
++
++## 0. Scope and Conventions
++
++This document derives the manifold-local optimization contract for a per-row
++latent coordinate `t_i`. The intent is to replace Euclidean additive updates
++with tangent-space updates followed by a retraction:
++
++```text
++t_i ∈ M
++ξ_i ∈ T_{t_i}M
++t_i,new = R_{t_i}(ξ_i)
++```
++
++The row-local Newton algebra remains the same arrow/bordered Hessian system
++already used by the latent inner solver. Only the row latent block changes:
++Euclidean gradients, Hessian-vector products, and warm-start deltas are
++projected into `T_{t_i}M`; the resulting tangent vector is applied by
++`R_{t_i}`.
++
++Notation:
++
++```text
++M              manifold for one row latent
++p ∈ M          current embedded point
++m              ambient embedding dimension
++d              intrinsic dimension
++ξ, η ∈ T_p M   tangent vectors at p
++q = R_p(ξ)     retracted point
++P_p            orthogonal tangent projection in ambient coordinates
++g_p            Riemannian metric / inner product
++∇_E f          ambient Euclidean gradient of a scalar objective
++∇²_E f · ξ     ambient Euclidean Hessian-vector product
++grad_R f       Riemannian gradient
++Hess_R f[ξ]    Riemannian Hessian applied to ξ
++W_p(ξ, v)      shape/Weingarten correction used by the embedded Hessian formula
++```
++
++All manifold implementations below use the ambient Euclidean pullback metric
++unless a product-level weight vector is explicitly supplied. Weighted product
++metrics only change `g_p`, trust-region norms, and tangent basis
++orthonormalization; they do not change the closed-form embedding,
++projection, or retraction.
++
++The embedded Hessian conversion used in code should be:
++
++```text
++grad_R = P_p(∇_E)
++Hess_R[ξ] = P_p(∇²_E · ξ - W_p(ξ, ∇_E))
++```
++
++Equivalently, since `W_p` only uses the normal component for the unit sphere
++and its products:
++
++```text
++Hess_R[ξ] = P_p(∇²_E · ξ - W_p(ξ, P_p^⊥(∇_E))).
++```
++
++The prompt shorthand
++
++```text
++Hess_R[ξ] = P_p(∇²_E · ξ - W_p(ξ, P_p(∇_E)))
++```
++
++is harmless for flat manifolds but would make the sphere correction vanish,
++because `P_p(∇_E)` is tangent and therefore orthogonal to `p`. The final Rust
++signature should pass the ambient gradient, or explicitly pass the normal
++gradient. This is the same correction already intended in
++`src/solver/riemannian.rs`: for a sphere, subtract `<p, ∇_E> ξ` before
++projecting.
++
++## 1. Existing Source Points
++
++The current implementation already has most of the needed pieces:
++
++```text
++src/terms/input_loc_derivatives.rs
++  basis_input_loc_grad
++  basis_input_loc_hess
++  tensor_product_input_loc_grad
++  periodic_radial_input_loc_grad_1d
++  sphere_s2_input_loc_grad
++  contract_input_loc_gradient
++
++src/terms/latent_coord.rs
++  LatentManifold
++  LatentCoordValues::retract_flat_delta
++  LatentCoordValues::design_gradient_wrt_t_dispatch
++  LatentCoordValues::contract_gradient
++  LatentCoordValues::contract_gradient_radial_streaming
++  LatentManifold::project_to_tangent
++  LatentManifold::euclidean_to_riemannian_hessian
++  LatentManifold::riemannian_hessian_matrix
++
++src/solver/riemannian.rs
++  Manifold
++  Euclidean
++  Circle
++  Sphere
++  Interval
++  Torus
++  Product
++  ManifoldKind
++  RiemannianNewtonStep
++  riemannian_newton_step_on_point
++  retract_euclidean_delta
++
++src/solver/arrow_schur.rs
++  ArrowSystem::apply_riemannian_latent_geometry
++  apply_per_row_retraction
++
++src/solver/persistent_warm_start.rs
++  ift_warm_start_latent
++  apply_ift_retraction
++```
++
++Two representations currently coexist:
++
++```text
++src/terms/latent_coord.rs::LatentManifold::Circle
++  stores a scalar angle in one ambient coordinate and wraps it.
++
++src/solver/riemannian.rs::Circle
++  stores the embedded unit vector (cos θ, sin θ) in R².
++```
++
++This proposal commits the final Riemannian optimizer contract to embedded
++coordinates. Chart coordinates may remain as API sugar, but the Newton,
++Hessian, vector-transport, and IFT update path should operate on embedded
++points. That removes seam discontinuities from the optimizer itself.
++
++## 2. Per-Row Objective and Chain Rule
++
++For one row `i`, the design row is:
++
++```text
++Φ_i(t_i) = [Φ_{i,1}(t_i), ..., Φ_{i,K}(t_i)].
++```
++
++The source in `input_loc_derivatives.rs` gives the two objects needed by
++the Euclidean row calculus:
++
++```text
++J_i[k,a]       = ∂Φ_{i,k}/∂t_{i,a}
++HΦ_i[k,a,b]   = ∂²Φ_{i,k}/∂t_{i,a}∂t_{i,b}
++```
++
++For radial kernels with center `c_k`:
++
++```text
++r_{ik} = ||t_i - c_k||
++Φ_{i,k} = φ(r_{ik})
++q(r) = φ'(r)/r
++s(r) = (φ''(r) - q(r))/r²
++
++J_i[k,a] = q(r_{ik}) (t_i - c_k)_a
++HΦ_i[k,a,b] = q(r_{ik}) δ_ab
++            + s(r_{ik}) (t_i - c_k)_a (t_i - c_k)_b
++```
++
++Those are exactly `basis_input_loc_grad` and `basis_input_loc_hess`.
++`RadialScalarKind::eval_design_triplet` supplies `(φ, q, s)` and owns the
++collision limits or collision errors.
++
++Let the scalar objective be `F(Φ_i(t_i), β, ...)`. If the upstream design
++gradient and Hessian with respect to `Φ_i` are:
++
++```text
++u_i[k]       = ∂F/∂Φ_{i,k}
++A_i[k,l]     = ∂²F/∂Φ_{i,k}∂Φ_{i,l}
++```
++
++then the Euclidean latent gradient is:
++
++```text
++∇_{E,t_i}F[a] = Σ_k u_i[k] J_i[k,a].
++```
++
++The Euclidean latent Hessian is:
++
++```text
++∇²_{E,t_i}F[a,b]
++  = Σ_{k,l} J_i[k,a] A_i[k,l] J_i[l,b]
++  + Σ_k u_i[k] HΦ_i[k,a,b].
++```
++
++For Gaussian residual least squares with prediction `ŷ_i = Φ_i β`:
++
++```text
++u_i[k] = -resid_i β_k
++A_i[k,l] = β_k β_l
++
++∇_{E,t_i}F = -(resid_i) J_iᵀ β
++∇²_{E,t_i}F = (J_iᵀ β)(J_iᵀ β)ᵀ - resid_i Σ_k β_k HΦ_i[k,:,:]
++```
++
++The Gauss-Newton row block drops the second term:
++
++```text
++H_GN = (J_iᵀ β)(J_iᵀ β)ᵀ.
++```
++
++The Riemannian layer does not change this chain rule. It only converts the
++ambient Euclidean row objects to tangent row objects:
++
++```text
++g_R_i = P_{t_i}(g_E_i)
++H_R_i[ξ] = P_{t_i}(H_E_i ξ - W_{t_i}(ξ, g_E_i)).
++```
++
++## 3. Manifold: S¹
++
++### 3.1 Embedding in R^m, tangent space T_p M
++
++Use the embedded unit circle:
++
++```text
++S¹ = {p ∈ R² : ||p|| = 1}
++p = (cos θ, sin θ)
++m = 2
++d = 1
++```
++
++The tangent space is:
++
++```text
++T_p S¹ = {ξ ∈ R² : <p, ξ> = 0}.
++```
++
++A canonical unit tangent basis is:
++
++```text
++Q(p) = [-p_y, p_x] ∈ R^{2×1}.
++```
++
++Any tangent vector has the form:
++
++```text
++ξ = Q(p) α,  α ∈ R.
++```
++
++### 3.2 Retraction R_p(ξ) closed-form
++
++Use the normalization retraction:
++
++```text
++R_p(ξ) = (p + ξ) / ||p + ξ||.
++```
++
++This is first-order equivalent to the exponential map and avoids angle seams.
++For a tangent vector `ξ = Qα`, the exact exponential map is:
++
++```text
++Exp_p(ξ) = cos(||ξ||) p + sin(||ξ||) ξ/||ξ||.
++```
++
++The optimizer commits to the normalization retraction because it is cheaper,
++closed-form, and already used by the shipped `Circle` and `Sphere`
++implementations.
++
++### 3.3 Projection P_p: R^m -> T_p M
++
++```text
++P_p(v) = v - <p, v> p.
++```
++
++For `S¹`, `P_p(v)` is also:
++
++```text
++P_p(v) = Q(p) Q(p)ᵀ v.
++```
++
++### 3.4 Vector transport τ_{p->q}(ξ)
++
++Use projection transport:
++
++```text
++τ_{p->q}(ξ) = P_q(ξ).
++```
++
++For `S¹`, exact parallel transport along the shorter geodesic can be written
++in closed form, but projection transport is sufficient for the row Newton
++and IFT warm-start path because every transported vector is re-projected
++before it is reused.
++
++If exact transport is needed later and `q ≠ -p`, define the Householder-like
++transport:
++
++```text
++τ_exact(ξ) = ξ - (<q, ξ> / (1 + <p, q>)) (p + q).
++```
++
++The final trait should expose projection transport only as the committed
++default; exact transport can be a separate implementation detail if needed.
++
++### 3.5 Inner product g_p
++
++Default ambient pullback:
++
++```text
++g_p(ξ, η) = <ξ, η>_R².
++```
++
++For product trust-region balancing, a scale-normalized metric may use:
++
++```text
++g_p(ξ, η) = (1 / (2π)²) <ξ, η>.
++```
++
++The scale-normalized metric changes step norms, not `P_p`, `R_p`, or the
++embedded Hessian correction.
++
++### 3.6 Euclidean to Riemannian gradient
++
++```text
++grad_R = P_p(∇_E)
++       = ∇_E - <p, ∇_E> p.
++```
++
++In the tangent basis:
++
++```text
++g_Q = Q(p)ᵀ grad_R.
++```
++
++### 3.7 Euclidean to Riemannian Hessian and Weingarten map
++
++For `S¹`, treat it as the unit sphere `S^1`:
++
++```text
++W_p(ξ, v) = <p, v> ξ.
++```
++
++The Hessian action is:
++
++```text
++Hess_R[ξ] = P_p(∇²_E · ξ - <p, ∇_E> ξ).
++```
++
++If the Weingarten call receives `v = P_p(∇_E)`, then `<p, v> = 0` and the
++curvature correction disappears. Therefore the committed Rust signature must
++pass the ambient gradient or its normal component.
++
++## 4. Manifold: S²
++
++### 4.1 Embedding in R^m, tangent space T_p M
++
++Use the embedded unit sphere:
++
++```text
++S² = {p ∈ R³ : ||p|| = 1}
++m = 3
++d = 2
++```
++
++The tangent space is:
++
++```text
++T_p S² = {ξ ∈ R³ : <p, ξ> = 0}.
++```
++
++For numerical work, an orthonormal basis `Q(p) ∈ R^{3×2}` can be built by:
++
++1. Choose an anchor axis `a` not nearly parallel to `p`.
++2. Set `q1 = normalize(a - <a,p>p)`.
++3. Set `q2 = p × q1`.
++
++A robust anchor rule:
++
++```text
++a = e_z if |p_z| < 0.9 else e_x.
++```
++
++### 4.2 Retraction R_p(ξ) closed-form
++
++Use the normalization retraction:
++
++```text
++R_p(ξ) = (p + ξ) / ||p + ξ||.
++```
++
++The exact exponential map is:
++
++```text
++Exp_p(ξ) = cos(||ξ||) p + sin(||ξ||) ξ / ||ξ||.
++```
++
++The normalization retraction is cheaper and agrees to first order:
++
++```text
++R_p(0) = p
++D R_p(0)[ξ] = ξ.
++```
++
++### 4.3 Projection P_p: R^m -> T_p M
++
++```text
++P_p(v) = v - <p, v> p
++       = (I - p pᵀ) v.
++```
++
++### 4.4 Vector transport τ_{p->q}(ξ)
++
++Committed default:
++
++```text
++τ_{p->q}(ξ) = P_q(ξ).
++```
++
++Exact geodesic parallel transport, valid away from antipodal points, is:
++
++```text
++τ_exact(ξ) = ξ - (<q, ξ> / (1 + <p, q>)) (p + q).
++```
++
++Projection transport is not exactly norm-preserving, but it is closed-form,
++cheap, and stable for small row Newton and IFT predictor steps.
++
++### 4.5 Inner product g_p
++
++Default:
++
++```text
++g_p(ξ, η) = <ξ, η>_R³.
++```
++
++Scale-normalized trust metric:
++
++```text
++g_p(ξ, η) = (1 / π²) <ξ, η>.
++```
++
++### 4.6 Euclidean to Riemannian gradient
++
++```text
++grad_R = P_p(∇_E)
++       = ∇_E - <p, ∇_E> p.
++```
++
++In tangent coordinates:
++
++```text
++g_Q = Qᵀ grad_R.
++```
++
++### 4.7 Euclidean to Riemannian Hessian and Weingarten map
++
++For the unit sphere:
++
++```text
++W_p(ξ, v) = <p, v> ξ.
++```
++
++Therefore:
++
++```text
++Hess_R[ξ] = P_p(∇²_E · ξ - <p, ∇_E> ξ).
++```
++
++This formula is the same as differentiating the projected gradient
++`P_p(∇_E)` and projecting the result back to `T_pS²`.
++
++## 5. Manifold: S^n
++
++### 5.1 Embedding in R^m, tangent space T_p M
++
++Use the embedded unit sphere:
++
++```text
++S^n = {p ∈ R^{n+1} : ||p|| = 1}
++m = n + 1
++d = n
++```
++
++Tangent space:
++
++```text
++T_p S^n = {ξ ∈ R^{n+1} : <p, ξ> = 0}.
++```
++
++The tangent basis `Q(p) ∈ R^{(n+1)×n}` is produced by projecting ambient
++basis vectors into `T_pS^n` and applying modified Gram-Schmidt, or by a
++Householder construction. The current generic `Manifold::tangent_basis`
++already uses the projection-plus-Gram-Schmidt approach.
++
++### 5.2 Retraction R_p(ξ) closed-form
++
++```text
++R_p(ξ) = (p + ξ) / ||p + ξ||.
++```
++
++Guard:
++
++```text
++if ||p + ξ|| is tiny, reject or shrink ξ before retraction.
++```
++
++Do not silently map to an arbitrary axis in optimizer code; that creates a
++discontinuous update. Construction-time projection can normalize invalid
++initial values, but Newton steps should be trust-radius clipped instead.
++
++### 5.3 Projection P_p: R^m -> T_p M
++
++```text
++P_p(v) = v - <p, v> p.
++```
++
++### 5.4 Vector transport τ_{p->q}(ξ)
++
++Default projection transport:
++
++```text
++τ_{p->q}(ξ) = P_q(ξ).
++```
++
++Exact non-antipodal geodesic transport:
++
++```text
++τ_exact(ξ) = ξ - (<q, ξ> / (1 + <p, q>)) (p + q).
++```
++
++Avoid exact transport near `q ≈ -p` because the denominator is unstable.
++
++### 5.5 Inner product g_p
++
++```text
++g_p(ξ, η) = <ξ, η>_R^{n+1}.
++```
++
++Optional scale-normalized metric:
++
++```text
++g_p(ξ, η) = (1 / π²) <ξ, η>.
++```
++
++### 5.6 Euclidean to Riemannian gradient
++
++```text
++grad_R = P_p(∇_E).
++```
++
++### 5.7 Euclidean to Riemannian Hessian and Weingarten map
++
++```text
++W_p(ξ, v) = <p, v> ξ.
++Hess_R[ξ] = P_p(∇²_E · ξ - <p, ∇_E> ξ).
++```
++
++For all `S^n`, the correction depends only on the normal scalar
++`<p, ∇_E>`. This is cheap and does not require forming a full second
++fundamental form tensor.
++
++## 6. Manifold: Interval[a,b]
++
++### 6.1 Embedding in R^m, tangent space T_p M
++
++Use the scalar embedding:
++
++```text
++M = [a,b] ⊂ R
++m = 1
++d = 1
++p ∈ [a,b].
++```
++
++The interior is a one-dimensional flat manifold:
++
++```text
++T_pM = R,  for a < p < b.
++```
++
++At the boundary, `[a,b]` is a manifold with boundary. The feasible tangent
++cone is:
++
++```text
++C_aM = {ξ ∈ R : ξ ≥ 0}
++C_bM = {ξ ∈ R : ξ ≤ 0}
++```
++
++The implementation should be explicit about whether it uses:
++
++```text
++open-interval chart:     p ∈ (a,b), T_pM = R
++closed-interval cone:    p ∈ [a,b], feasible tangent cone at boundary
++```
++
++For Newton updates, the committed behavior should be the closed interval with
++cone projection at the boundary. That matches bounded latent coordinates and
++avoids pretending the boundary has a two-sided tangent space.
++
++### 6.2 Retraction R_p(ξ) closed-form
++
++Closed interval retraction:
++
++```text
++R_p(ξ) = clamp(p + ξ, a, b).
++```
++
++This is first-order smooth only in the interior. At boundaries it is a
++projected-gradient retraction for a manifold with boundary.
++
++If a smooth interior chart is required:
++
++```text
++c = (a + b)/2
++r = (b - a)/2
++p = c + r tanh(z)
++z = artanh((p - c)/r)
++R_p(ξ) = c + r tanh(z + ξ / (r (1 - tanh(z)^2))).
++```
++
++The smooth chart becomes ill-conditioned near the boundary. Therefore the
++closed-interval optimizer should use `clamp` plus a trust-radius clip and
++active boundary handling.
++
++### 6.3 Projection P_p: R^m -> T_p M
++
++Interior:
++
++```text
++P_p(v) = v.
++```
++
++Boundary cone projection for feasible update directions:
++
++```text
++P_a(v) = max(v, 0)
++P_b(v) = min(v, 0)
++```
++
++For gradients, use the projected gradient convention:
++
++```text
++grad_R = 0 at a if ∇_E > 0 would request a negative descent step
++grad_R = 0 at b if ∇_E < 0 would request a positive descent step
++```
++
++Equivalently, project the Newton step rather than the gradient. The final
++implementation should pick one convention and keep the KKT condition visible.
++
++### 6.4 Vector transport τ_{p->q}(ξ)
++
++Interior flat transport:
++
++```text
++τ_{p->q}(ξ) = ξ.
++```
++
++Closed-interval cone-aware transport:
++
++```text
++τ_{p->q}(ξ) = P_q(ξ)
++```
++
++where `P_q` is the feasible tangent cone projection at `q`.
++
++### 6.5 Inner product g_p
++
++Default:
++
++```text
++g_p(ξ, η) = ξ η.
++```
++
++Scale-normalized:
++
++```text
++g_p(ξ, η) = ξ η / (b - a)².
++```
++
++### 6.6 Euclidean to Riemannian gradient
++
++Interior:
++
++```text
++grad_R = ∇_E.
++```
++
++Boundary:
++
++```text
++grad_R = projected KKT gradient under the tangent cone.
++```
++
++For minimization, a boundary point is stationary when all feasible directions
++have nonnegative directional derivative:
++
++```text
++p = a:  ∇_E ≥ 0 is stationary
++p = b:  ∇_E ≤ 0 is stationary
++```
++
++### 6.7 Euclidean to Riemannian Hessian and Weingarten map
++
++The interval is flat in `R`:
++
++```text
++W_p(ξ, v) = 0.
++```
++
++Interior:
++
++```text
++Hess_R[ξ] = ∇²_E · ξ.
++```
++
++Boundary:
++
++```text
++Hess_R[ξ] = P_p(∇²_E · ξ)
++```
++
++with `ξ` restricted to the feasible tangent cone. In practice the scalar
++row solve should enforce the active set:
++
++```text
++if p = a and proposed ξ < 0, set ξ = 0
++if p = b and proposed ξ > 0, set ξ = 0
++```
++
++## 7. Manifold: R
++
++### 7.1 Embedding in R^m, tangent space T_p M
++
++```text
++M = R
++m = 1
++d = 1
++T_pR = R.
++```
++
++For `R^d`, use the product of `d` copies of this manifold or a dedicated
++Euclidean block with `m = d`.
++
++### 7.2 Retraction R_p(ξ) closed-form
++
++```text
++R_p(ξ) = p + ξ.
++```
++
++### 7.3 Projection P_p: R^m -> T_p M
++
++```text
++P_p(v) = v.
++```
++
++### 7.4 Vector transport τ_{p->q}(ξ)
++
++```text
++τ_{p->q}(ξ) = ξ.
++```
++
++### 7.5 Inner product g_p
++
++```text
++g_p(ξ, η) = ξ η.
++```
++
++### 7.6 Euclidean to Riemannian gradient
++
++```text
++grad_R = ∇_E.
++```
++
++### 7.7 Euclidean to Riemannian Hessian and Weingarten map
++
++```text
++W_p(ξ, v) = 0.
++Hess_R[ξ] = ∇²_E · ξ.
++```
++
++## 8. Manifold: Torus
++
++### 8.1 Embedding in R^m, tangent space T_p M
++
++Use a product of embedded circles:
++
++```text
++T^d = (S¹)^d
++p = (p_1, ..., p_d)
++p_j ∈ R²
++||p_j|| = 1
++m = 2d
++intrinsic dimension = d
++```
++
++The tangent space is the direct sum:
++
++```text
++T_pT^d = T_{p_1}S¹ × ... × T_{p_d}S¹
++       = {ξ ∈ R^{2d} : <p_j, ξ_j> = 0 for every j}.
++```
++
++### 8.2 Retraction R_p(ξ) closed-form
++
++Blockwise normalization:
++
++```text
++R_p(ξ)_j = (p_j + ξ_j) / ||p_j + ξ_j||.
++```
++
++### 8.3 Projection P_p: R^m -> T_p M
++
++Blockwise circle projection:
++
++```text
++P_p(v)_j = v_j - <p_j, v_j> p_j.
++```
++
++### 8.4 Vector transport τ_{p->q}(ξ)
++
++Blockwise projection transport:
++
++```text
++τ_{p->q}(ξ)_j = P_{q_j}(ξ_j).
++```
++
++### 8.5 Inner product g_p
++
++Default:
++
++```text
++g_p(ξ, η) = Σ_j <ξ_j, η_j>.
++```
++
++Scale-normalized:
++
++```text
++g_p(ξ, η) = Σ_j <ξ_j, η_j> / (2π)².
++```
++
++### 8.6 Euclidean to Riemannian gradient
++
++```text
++grad_R,j = P_{p_j}(∇_{E,j}).
++```
++
++### 8.7 Euclidean to Riemannian Hessian and Weingarten map
++
++Blockwise:
++
++```text
++W_p(ξ, v)_j = <p_j, v_j> ξ_j.
++```
++
++The Hessian action is:
++
++```text
++Hess_R[ξ]_j = P_{p_j}((∇²_E · ξ)_j - <p_j, ∇_{E,j}> ξ_j).
++```
++
++If the ambient Hessian has cross-block torus terms, keep them in
++`∇²_E · ξ` and only apply the Weingarten correction blockwise. Do not drop
++cross-block Hessian entries merely because the manifold is a product.
++
++## 9. Manifold: Product
++
++### 9.1 Embedding in R^m, tangent space T_p M
++
++For components:
++
++```text
++M = M_1 × ... × M_r
++p = (p_1, ..., p_r)
++p_j ∈ M_j ⊂ R^{m_j}
++m = Σ_j m_j
++d = Σ_j d_j
++```
++
++Tangent space:
++
++```text
++T_pM = T_{p_1}M_1 × ... × T_{p_r}M_r.
++```
++
++### 9.2 Retraction R_p(ξ) closed-form
++
++Blockwise:
++
++```text
++R_p(ξ) = (R_{p_1}^{M_1}(ξ_1), ..., R_{p_r}^{M_r}(ξ_r)).
++```
++
++### 9.3 Projection P_p: R^m -> T_p M
++
++Block diagonal:
++
++```text
++P_p(v) = (P_{p_1}^{M_1}(v_1), ..., P_{p_r}^{M_r}(v_r)).
++```
++
++### 9.4 Vector transport τ_{p->q}(ξ)
++
++Blockwise:
++
++```text
++τ_{p->q}(ξ) =
++  (τ_{p_1->q_1}^{M_1}(ξ_1), ..., τ_{p_r->q_r}^{M_r}(ξ_r)).
++```
++
++### 9.5 Inner product g_p
++
++Default product metric:
++
++```text
++g_p(ξ, η) = Σ_j g_{p_j}^{M_j}(ξ_j, η_j).
++```
++
++Weighted product metric:
++
++```text
++g_p(ξ, η) = Σ_j w_j g_{p_j}^{M_j}(ξ_j, η_j)
++```
++
++or per-ambient-axis weights:
++
++```text
++g_p(ξ, η) = Σ_a w_a ξ_a η_a
++```
++
++where weights are positive and aligned with ambient coordinates.
++
++### 9.6 Euclidean to Riemannian gradient
++
++```text
++grad_R,j = P_{p_j}^{M_j}(∇_{E,j}).
++```
++
++### 9.7 Euclidean to Riemannian Hessian and Weingarten map
++
++The Weingarten correction is blockwise:
++
++```text
++W_p(ξ, v) =
++  (W_{p_1}^{M_1}(ξ_1, v_1), ..., W_{p_r}^{M_r}(ξ_r, v_r)).
++```
++
++The Euclidean Hessian-vector product is not blockwise in general:
++
++```text
++h_E = ∇²_E · ξ
++```
++
++may have cross-component contributions. The product conversion is:
++
++```text
++Hess_R[ξ] = P_p(h_E - W_p(ξ, ∇_E)).
++```
++
++This distinction matters. A product manifold has block-diagonal tangent
++projection and blockwise curvature, but the objective may couple product
++components through the basis row, penalties, or β border.
++
++## 10. Product Manifold Composition Rules
++
++Product composition must be structural, not string-based. Each component
++owns:
++
++```text
++ambient_dim
++intrinsic_dim
++point slice
++tangent slice
++projection
++retraction
++transport
++metric contribution
++Weingarten correction
++```
++
++The product implementation owns only:
++
++```text
++offset calculation
++slice validation
++metric summation
++blockwise operation dispatch
++```
++
++Dimension validation must happen once at construction:
++
++```text
++sum(component.ambient_dim()) == row_ambient_dim
++sum(component.intrinsic_dim()) == row_tangent_dim
++weights.len() == row_ambient_dim, if weights are supplied
++```
++
++The product tangent basis is block diagonal:
++
++```text
++Q = blockdiag(Q_1, ..., Q_r).
++```
++
++This is preferable to generic Gram-Schmidt for products because:
++
++1. It preserves component sparsity.
++2. It avoids mixing unrelated coordinate units.
++3. It lets interval active sets reduce local tangent dimension.
++4. It makes `QᵀH_RQ` cheaper to assemble.
++
++Final product behavior:
++
++```text
++project_point       blockwise
++project_tangent     blockwise
++retract             blockwise
++vector_transport    blockwise
++weingarten          blockwise
++inner_product       sum of component metrics or supplied weighted ambient sum
++tangent_basis       block diagonal component bases
++```
++
++## 11. Connection to `input_loc_derivatives.rs`
++
++The source file `src/terms/input_loc_derivatives.rs` currently derives
++chart or ambient Euclidean derivatives of design columns with respect to the
++input location. The Riemannian layer consumes those derivatives by chain
++rule.
++
++### 11.1 Radial basis
++
++For a radial basis:
++
++```text
++Φ_{i,k}(t_i) = φ(||t_i - c_k||)
++```
++
++`basis_input_loc_grad` computes:
++
++```text
++J_i[k,a] = ∂Φ_{i,k}/∂t_{i,a}.
++```
++
++`basis_input_loc_hess` computes:
++
++```text
++HΦ_i[k,a,b] = ∂²Φ_{i,k}/∂t_{i,a}∂t_{i,b}.
++```
++
++If `t_i` is already the embedded manifold point, these are ambient
++derivatives in `R^m`. Convert to Riemannian row objects by:
++
++```text
++g_E = contract upstream gradient through J_i
++H_E = contract upstream Hessian through J_i and HΦ_i
++g_R = P_{t_i}(g_E)
++H_R[ξ] = P_{t_i}(H_E ξ - W_{t_i}(ξ, g_E))
++```
++
++For radial kernels on `S^n`, centers must also live in the same ambient
++space if the kernel is an embedded chord-distance kernel. If the desired
++kernel is geodesic-distance based, `input_loc_derivatives.rs` needs a
++separate geodesic derivative path; chord-distance derivatives should not be
++silently reused.
++
++### 11.2 Periodic 1-D basis and S¹
++
++`periodic_radial_input_loc_grad_1d` computes chart derivatives in an angle
++coordinate:
++
++```text
++θ ∈ R / 2πZ.
++```
++
++For the embedded optimizer:
++
++```text
++p(θ) = (cos θ, sin θ)
++dp/dθ = (-sin θ, cos θ) = Q(p)
++```
++
++If source code gives chart derivatives:
++
++```text
++dF/dθ
++d²F/dθ²
++```
++
++then the embedded tangent gradient is:
++
++```text
++grad_R = Q(p) (dF/dθ).
++```
++
++The embedded tangent Hessian in basis coordinates is:
++
++```text
++Qᵀ Hess_R[Qα] = (d²F/dθ²) α.
++```
++
++If converting from chart to ambient Euclidean objects for the generic
++embedded formula:
++
++```text
++g_E can be any ambient vector satisfying Qᵀ g_E = dF/dθ.
++choose g_E = Q dF/dθ.
++```
++
++The normal component is then zero, which is correct for a function expressed
++directly on the circle chart. If the function is an ambient extension
++`F_bar(p)`, use its true ambient gradient and the sphere correction.
++
++### 11.3 Sphere S²
++
++`sphere_s2_input_loc_grad` already returns an ambient tangent vector:
++
++```text
++P_t(q(r)(t - c)).
++```
++
++That is a Riemannian first derivative of the design column on `S²` under the
++chord-distance embedding. For Hessian-level Newton, the second derivative
++must be consistent:
++
++```text
++Hess_R Φ_k[ξ] = P_t(HΦ_E,k ξ - <t, ∇_E Φ_k> ξ).
++```
++
++where:
++
++```text
++∇_E Φ_k = q(r)(t - c)
++HΦ_E,k = q I + s (t - c)(t - c)ᵀ.
++```
++
++Do not apply the Hessian formula to the already projected gradient and then
++drop the normal scalar. The normal scalar is:
++
++```text
++<t, ∇_E Φ_k> = q(r) <t, t - c> = q(r)(1 - <t,c>).
++```
++
++### 11.4 Tensor product basis
++
++`tensor_product_input_loc_grad` produces chart derivatives axis-by-axis:
++
++```text
++∂Φ/∂u_a
++```
++
++where `u` is the product chart coordinate. If the manifold is a product of
++embedded factors, apply the chart-to-embedding Jacobian factorwise:
++
++```text
++J_emb[k,:] = Σ_a (∂Φ_k/∂u_a) (∂u_a/∂p)^*
++```
++
++For an `S¹` factor:
++
++```text
++grad_emb contribution = Q(p_a) (∂Φ/∂θ_a).
++```
++
++For an interval or real factor:
++
++```text
++grad_emb contribution = ∂Φ/∂u_a.
++```
++
++The Hessian conversion from chart coordinates to Riemannian coordinates
++should happen in tangent basis coordinates:
++
++```text
++H_Q = J_chart_to_tangentᵀ H_chart J_chart_to_tangent
++      + second-chart terms if the chart is nonlinear.
++```
++
++For embedded `S¹`, prefer computing in the intrinsic angle basis and lifting
++the final tangent vector `ξ = Qη`; this avoids storing fake ambient Hessian
++entries for the normal direction.
++
++### 11.5 Contracted chain rule
++
++`contract_input_loc_gradient` and `LatentCoordValues::contract_gradient`
++implement:
++
++```text
++∂L/∂t_{i,a} = Σ_k (∂L/∂Φ_{i,k})(∂Φ_{i,k}/∂t_{i,a}).
++```
++
++The Riemannian post-processing is:
++
++```text
++g_R_i = manifold.project_tangent(t_i, g_E_i).
++```
++
++For row Newton, the Hessian contraction should be added with the same
++ownership:
++
++```text
++contract_input_loc_hessian(...)
++```
++
++with output row blocks:
++
++```text
++H_E_i ∈ R^{m×m}
++```
++
++then:
++
++```text
++H_R_i = manifold.riemannian_hessian_matrix(t_i, g_E_i, H_E_i).
++```
++
++## 12. Riemannian Newton on the Tangent Space
++
++For each row point `p = t_i`, assemble:
++
++```text
++g_E ∈ R^m
++H_E ∈ R^{m×m}
++```
++
++Convert:
++
++```text
++grad_R = P_p(g_E).
++H_R[ξ] = P_p(H_E ξ - W_p(ξ, g_E)).
++```
++
++Build an orthonormal tangent basis:
++
++```text
++Q ∈ R^{m×d}
++QᵀQ = I
++range(Q) = T_pM.
++```
++
++Solve the tangent-space damped Newton system:
++
++```text
++(Qᵀ H_R Q + μI) η = -Qᵀ grad_R
++ξ = Qη
++t_new = R_p(ξ).
++```
++
++This is the required row Newton formula. The solve must happen in intrinsic
++tangent coordinates, not in the full ambient space with a normal pin, because
++ambient normal directions make `H_R` structurally singular.
++
++For product manifolds, use:
++
++```text
++Q = blockdiag(Q_1, ..., Q_r)
++```
++
++For interval boundary active sets, `Q` may have zero columns if the row is
++at an active boundary and the descent direction points outside the interval.
++
++Trust-region clipping:
++
++```text
++if ||ξ||_g > Δ:
++    ξ ← (Δ / ||ξ||_g) ξ
++```
++
++Use the manifold metric:
++
++```text
++||ξ||_g² = g_p(ξ, ξ).
++```
++
++No Cauchy "fallback" should be hidden in the manifold trait. If the tangent
++Newton system is indefinite or singular, the row solver should report the
++regularization it applied and return a damped tangent step. The caller can
++decide whether to accept, shrink, or retry.
++
++## 13. IFT Warm-Start on a Manifold
++
++The existing IFT predictor computes a row-local update:
++
++```text
++Δt_i = -H_{tt,i}^{-1} rhs_i
++```
++
++For a manifold latent, interpret `Δt_i` as a tangent vector at the current
++point:
++
++```text
++Δt_i ∈ T_{t_i}M.
++```
++
++The warm-start update is:
++
++```text
++t_i,new = R_{t_i}(P_{t_i}(Δt_i)).
++```
++
++If the IFT cache was built from tangent-space Hessian blocks, the stored
++`Δt_i` should already be tangent up to numerical drift. Re-project anyway:
++
++```text
++ξ_i = P_{t_i}(Δt_i)
++t_i,new = R_{t_i}(ξ_i).
++```
++
++If the outer loop compares old and new tangent deltas, transport the previous
++tangent vector to the new point:
++
++```text
++Δt_i transported = τ_{t_i -> t_i,new}(Δt_i).
++```
++
++Default:
++
++```text
++τ_{p->q}(ξ) = P_q(ξ).
++```
++
++The IFT cache should store enough manifold metadata to know:
++
++```text
++row ambient dimension
++row intrinsic dimension
++point p used when factorizing H_tt
++tangent basis Q used for the solve, if solve is stored in intrinsic coords
++```
++
++Preferred cache design:
++
++```text
++store H_QQ factors for QᵀH_RQ
++store Q or enough data to rebuild Q(p)
++store p
++predict η in R^d
++lift ξ = Qη
++retract
++```
++
++This avoids mixing old ambient normal pins with new tangent updates.
++
++## 14. Numerical Pitfalls
++
++### 14.1 Sphere south pole and chart singularities
++
++Embedded spheres do not have a south-pole singularity. Chart conversions do.
++Any path that uses latitude/longitude has singular Jacobians at the poles and
++a seam in longitude.
++
++Rules:
++
++```text
++optimizer state: embedded unit vector
++display/API chart: optional and lossy at poles
++derivative source: prefer embedded chord derivatives for sphere kernels
++tangent basis: choose anchor axis away from p
++```
++
++If a chart must be used:
++
++```text
++switch charts when |cos(latitude)| is small
++do not finite-difference through longitude at a pole
++do not use longitude residuals as Euclidean errors near a pole
++```
++
++### 14.2 Sphere antipodal transport
++
++Exact geodesic transport formula has:
++
++```text
++1 + <p,q>
++```
++
++in the denominator. It is unstable near antipodal moves. Projection transport
++does not have this singularity but is only an approximation.
++
++Trust-region policy:
++
++```text
++keep ||ξ|| < π/2 for sphere row updates unless a line search explicitly accepts more
++```
++
++### 14.3 Retraction normalization near zero
++
++Normalization retraction fails if:
++
++```text
++||p + ξ|| ≈ 0.
++```
++
++For a unit sphere this means the tangent step is impossible in exact
++arithmetic because `ξ ⟂ p`, so:
++
++```text
++||p + ξ||² = 1 + ||ξ||².
++```
++
++The only way to hit zero is if `ξ` is not tangent and contains an invalid
++normal component near `-p`. Therefore:
++
++```text
++project ξ first
++clip trust radius
++assert norm is finite
++```
++
++### 14.4 Interval boundary
++
++`clamp(p + ξ, a, b)` is not smooth at the boundary. The correct boundary
++condition is KKT, not a two-sided Newton equation.
++
++Rules:
++
++```text
++if p = a and descent wants p < a, active-set the row coordinate
++if p = b and descent wants p > b, active-set the row coordinate
++do not use tanh chart near boundary without monitoring Jacobian
++```
++
++The smooth `tanh` chart can turn small changes in `p` into huge changes in
++`z`. This damages IFT warm starts.
++
++### 14.5 Vector-transport approximations
++
++Projection transport:
++
++```text
++τ(ξ) = P_q ξ
++```
++
++is not exactly norm preserving. For small accepted Newton steps this is
++usually fine. For large steps, it can shrink vectors and bias quasi-Newton
++updates.
++
++Rules:
++
++```text
++use projection transport for IFT warm-start deltas
++avoid using transported vectors to build BFGS curvature pairs unless the norm loss is checked
++for exact sphere/circle transport, reject antipodal denominator instability
++```
++
++### 14.6 Collision derivatives in radial kernels
++
++`input_loc_derivatives.rs` correctly surfaces degenerate collision cases for
++kernels whose `q` or `s` does not have a finite limit.
++
++Rules:
++
++```text
++do not map degenerate collision to zero
++do not add finite-difference derivatives
++move centers or choose a smoother kernel
++```
++
++### 14.7 Product units
++
++Product manifolds can mix `S¹`, intervals, and real axes. A raw ambient norm
++can make one radian comparable to one meter or one bounded-range unit.
++
++Rules:
++
++```text
++set metric weights per component
++scale trust-region radius in metric norm
++report weights in fit diagnostics
++```
++
++## 15. Final Rust Trait Signatures
++
++The implementation should consolidate the duplicated manifold logic into one
++embedded-coordinate trait. This is the final contract to commit to:
++
++```rust
++use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
++
++pub trait Manifold: Send + Sync {
++    fn name(&self) -> &'static str;
++
++    /// Intrinsic tangent dimension.
++    fn dim(&self) -> usize;
++
++    /// Ambient embedding dimension.
++    fn ambient_dim(&self) -> usize;
++
++    /// Project an ambient point to the manifold.
++    ///
++    /// Used for initialization and validation, not as a replacement for
++    /// retraction during optimization.
++    fn project_point(
++        &self,
++        p: ArrayView1<'_, f64>,
++        out: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++
++    /// Orthogonal projection onto T_pM, or tangent cone projection for
++    /// boundary manifolds such as Interval.
++    fn project_tangent(
++        &self,
++        p: ArrayView1<'_, f64>,
++        v: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++
++    /// Retraction R_p(xi).
++    fn retract(
++        &self,
++        p: ArrayView1<'_, f64>,
++        xi: ArrayView1<'_, f64>,
++        out: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++
++    /// Vector transport from T_from M to T_to M.
++    fn vector_transport(
++        &self,
++        from: ArrayView1<'_, f64>,
++        to: ArrayView1<'_, f64>,
++        xi: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++
++    /// Riemannian inner product at p.
++    fn inner_product(
++        &self,
++        p: ArrayView1<'_, f64>,
++        xi: ArrayView1<'_, f64>,
++        eta: ArrayView1<'_, f64>,
++    ) -> Result<f64, ManifoldError>;
++
++    /// Orthonormal tangent basis Q in ambient coordinates.
++    fn tangent_basis(
++        &self,
++        p: ArrayView1<'_, f64>,
++    ) -> Result<Array2<f64>, ManifoldError>;
++
++    /// Shape/Weingarten correction W_p(xi, ambient_gradient).
++    ///
++    /// This takes the ambient gradient, not the projected Riemannian gradient.
++    fn weingarten(
++        &self,
++        p: ArrayView1<'_, f64>,
++        xi: ArrayView1<'_, f64>,
++        ambient_grad: ArrayView1<'_, f64>,
++        out: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++
++    /// grad_R = P_p(egrad).
++    fn euclidean_to_riemannian_grad(
++        &self,
++        p: ArrayView1<'_, f64>,
++        egrad: ArrayView1<'_, f64>,
++        out: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError> {
++        out.assign(&egrad);
++        self.project_tangent(p, out)
++    }
++
++    /// Hess_R[xi] = P_p(ehess_xi - W_p(xi, egrad)).
++    fn euclidean_to_riemannian_hess_vp(
++        &self,
++        p: ArrayView1<'_, f64>,
++        egrad: ArrayView1<'_, f64>,
++        ehess_xi: ArrayView1<'_, f64>,
++        xi: ArrayView1<'_, f64>,
++        out: ArrayViewMut1<'_, f64>,
++    ) -> Result<(), ManifoldError>;
++}
++```
++
++Error type:
++
++```rust
++#[derive(Debug, Clone)]
++pub enum ManifoldError {
++    DimensionMismatch {
++        manifold: &'static str,
++        expected: usize,
++        found: usize,
++        role: &'static str,
++    },
++    InvalidPoint {
++        manifold: &'static str,
++        reason: String,
++    },
++    InvalidTangent {
++        manifold: &'static str,
++        reason: String,
++    },
++    BoundaryActive {
++        manifold: &'static str,
++        reason: String,
++    },
++}
++```
++
++Concrete specs:
++
++```rust
++#[derive(Debug, Clone, PartialEq)]
++pub enum ManifoldKind {
++    Euclidean { dim: usize },
++    Circle,
++    Sphere { intrinsic_dim: usize },
++    Interval { lo: f64, hi: f64 },
++    Torus { dim: usize },
++    Product { components: Vec<ManifoldKind> },
++    ProductWithMetric {
++        components: Vec<ManifoldKind>,
++        ambient_weights: Vec<f64>,
++    },
++}
++
++impl ManifoldKind {
++    pub fn build(&self) -> Result<Box<dyn Manifold>, ManifoldError>;
++    pub fn dim(&self) -> usize;
++    pub fn ambient_dim(&self) -> usize;
++    pub fn is_euclidean(&self) -> bool;
++}
++```
++
++Concrete implementation structs:
++
++```rust
++#[derive(Debug, Clone)]
++pub struct Euclidean {
++    pub dim: usize,
++}
++
++#[derive(Debug, Clone)]
++pub struct Circle;
++
++#[derive(Debug, Clone)]
++pub struct Sphere {
++    pub intrinsic_dim: usize,
++}
++
++#[derive(Debug, Clone)]
++pub struct Interval {
++    pub lo: f64,
++    pub hi: f64,
++    pub boundary_mode: IntervalBoundaryMode,
++}
++
++#[derive(Debug, Clone)]
++pub enum IntervalBoundaryMode {
++    ClosedCone,
++    OpenInterior { edge_band: f64 },
++}
++
++#[derive(Debug, Clone)]
++pub struct Torus {
++    pub dim: usize,
++}
++
++pub struct Product {
++    pub components: Vec<Box<dyn Manifold>>,
++    pub ambient_weights: Option<Vec<f64>>,
++}
++```
++
++Row Newton API:
++
++```rust
++#[derive(Debug, Clone)]
++pub struct RiemannianNewtonConfig {
++    pub damping: f64,
++    pub trust_radius: Option<f64>,
++}
++
++#[derive(Debug, Clone)]
++pub struct RiemannianNewtonOutcome {
++    pub new_point: Array1<f64>,
++    pub tangent_step: Array1<f64>,
++    pub tangent_step_coords: Array1<f64>,
++    pub projected_gradient_norm: f64,
++    pub damping_used: f64,
++}
++
++pub fn riemannian_newton_step_on_point(
++    manifold: &dyn Manifold,
++    point: ArrayView1<'_, f64>,
++    euclidean_grad: ArrayView1<'_, f64>,
++    euclidean_hess: ArrayView2<'_, f64>,
++    config: &RiemannianNewtonConfig,
++) -> Result<RiemannianNewtonOutcome, ManifoldError>;
++```
++
++Required implementation of the solve:
++
++```text
++grad_R = P_p(egrad)
++construct H_R by H_R e_j or by operator callbacks
++Q = tangent_basis(p)
++solve (QᵀH_RQ + μI)η = -Qᵀgrad_R
++ξ = Qη
++clip ξ in g_p norm if trust_radius is set
++new_point = R_p(ξ)
++```
++
++Retraction helper for IFT:
++
++```rust
++pub fn retract_tangent_delta(
++    manifold: &dyn Manifold,
++    point: ArrayView1<'_, f64>,
++    delta: ArrayView1<'_, f64>,
++    out: ArrayViewMut1<'_, f64>,
++) -> Result<(), ManifoldError>;
++```
++
++Batch row helper:
++
++```rust
++pub fn retract_latent_rows(
++    manifold: &dyn Manifold,
++    point_flat: ArrayView1<'_, f64>,
++    delta_flat: ArrayView1<'_, f64>,
++    n_rows: usize,
++    out_flat: ArrayViewMut1<'_, f64>,
++) -> Result<(), ManifoldError>;
++```
++
++Derivative contraction extension:
++
++```rust
++pub struct InputLocationHessianBlocks {
++    /// Shape: (n_obs, ambient_dim)
++    pub grad_t: Array2<f64>,
++
++    /// Shape: (n_obs, ambient_dim, ambient_dim), row-local dense blocks.
++    pub hess_t: Array3<f64>,
++}
++
++pub fn contract_input_loc_hessian(
++    grad_phi: ArrayView2<'_, f64>,
++    hess_phi: ArrayView2<'_, f64>,
++    design_grad: ArrayView3<'_, f64>,
++    design_hess: ArrayView3<'_, f64>,
++) -> Result<InputLocationHessianBlocks, BasisError>;
++```
++
++The exact `hess_phi` shape can follow the existing row kernel layout, but the
++output contract should be row-local `m×m` Euclidean blocks ready for manifold
++conversion.
++
++## 16. Concrete Weingarten Map Summary
++
++```text
++R:
++  W_p(ξ, v) = 0
++
++Interval[a,b]:
++  W_p(ξ, v) = 0
++  boundary handled by tangent cone, not curvature
++
++S¹:
++  W_p(ξ, v) = <p, v> ξ
++
++S²:
++  W_p(ξ, v) = <p, v> ξ
++
++S^n:
++  W_p(ξ, v) = <p, v> ξ
++
++Torus T^d:
++  W_p(ξ, v)_j = <p_j, v_j> ξ_j
++
++Product:
++  W_p(ξ, v)_j = W_{p_j}^{M_j}(ξ_j, v_j)
++```
++
++For every sphere-like component, `v` must be the ambient gradient or normal
++gradient. Passing the projected Riemannian gradient removes the curvature
++correction.
++
++## 17. Implementation Commitments
++
++1. Store optimizer state for circle, sphere, torus, and products in embedded
++   coordinates.
++2. Keep chart coordinates only at API boundaries or for chart-native basis
++   evaluation.
++3. Project every row gradient into the tangent space before the row solve.
++4. Convert every row Hessian action with the embedded Weingarten correction.
++5. Solve Newton systems in tangent basis coordinates:
++
++```text
++(Qᵀ H_R Q + μI)η = -Qᵀgrad_R.
++```
++
++6. Lift and retract:
++
++```text
++ξ = Qη
++t_new = R_p(ξ).
++```
++
++7. Treat IFT warm-start deltas as tangent vectors and apply them by
++   retraction.
++8. Use projection vector transport as the default transport.
++9. Handle interval boundaries as active constraints.
++10. Do not introduce finite-difference derivative paths.
++11. Do not keep unused chart-specific dead code once embedded manifolds own
++    the optimization path.
++
+
+codex
+The first draft overshot the requested 600-1200 line range. I’m replacing it with a tighter version that keeps all required derivations and signatures while staying within the target.
+apply patch
+patch: completed
+/Users/user/gam/proposals/riemannian_per_point.md
