@@ -92,7 +92,7 @@ def fit_latent(points: np.ndarray, fisher_w: np.ndarray) -> dict:
         centers,
         penalty,
         m=2,
-        fisher_W=fisher_w,
+        fisher_w=fisher_w,
         init_lambda=1.0,
     )
 
