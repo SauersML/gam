@@ -14,6 +14,8 @@
 //!     sparsifier. Applied to a `β` slice (SAE codes) or `ψ` slice (soft atom
 //!     amplitudes). Differentiable everywhere; the smoothing parameter `ε` may
 //!     itself live in `ρ` so REML shrinks it.
+//!   * [`IBPAssignmentPenalty`] — deterministic continuous-relaxation
+//!     Beta-Bernoulli/IBP prior over per-row SAE-manifold active sets.
 //!   * [`ARDPenalty`] — one penalty parameter per latent axis. The marginal
 //!     likelihood's Occam factor sends unused axes' precision to infinity,
 //!     discovering intrinsic dimension only after a separate gauge fix
@@ -1037,6 +1039,183 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     }
 }
 
+/// IBP-MAP active-set prior over SAE-manifold assignment logits.
+///
+/// Infinite GPFA / IBP-GPFA in neuroscience uses an Indian Buffet Process
+/// prior over factor loadings to infer both a potentially unbounded factor
+/// set and which factors contribute at each observation. The relevant
+/// diagnosis carries over directly to SAE-manifold assignment: ordinary ARD
+/// selects one global factor set for all observations, not a different set
+/// for each observation. A per-row IBP active set is the established GPFA
+/// remedy, adapted here to gamfit's REML/MAP engine with a finite truncation
+/// and deterministic concrete relaxation.
+///
+/// The target is row-major `(N, K)` logits. For MAP we drop Gumbel noise and
+/// use `z_ik = sigmoid(logit_ik / tau)`. Each column has
+/// `pi_k ~ Beta(alpha / K, 1)` and `z_ik | pi_k ~ Bernoulli(pi_k)`. We plug in
+/// the columnwise Beta-Bernoulli MAP `pi_k` from the relaxed active mass, so
+/// the penalty is a gauge-fixing prior: it breaks the per-row
+/// interchangeability of atom indices by making each row choose a sparse
+/// binary-ish subset rather than assigning every atom a soft nonzero weight.
+#[derive(Debug, Clone)]
+pub struct IBPAssignmentPenalty {
+    pub k_max: usize,
+    pub alpha: f64,
+    pub tau: f64,
+    pub learnable_alpha: bool,
+}
+
+impl IBPAssignmentPenalty {
+    pub fn new(k_max: usize, alpha: f64, tau: f64, learnable_alpha: bool) -> Self {
+        debug_assert!(k_max > 0);
+        debug_assert!(alpha.is_finite() && alpha > 0.0);
+        debug_assert!(tau.is_finite() && tau > 0.0);
+        Self {
+            k_max,
+            alpha,
+            tau,
+            learnable_alpha,
+        }
+    }
+
+    fn resolved_alpha(&self, rho: ArrayView1<'_, f64>) -> f64 {
+        if self.learnable_alpha {
+            self.alpha * rho[0].exp()
+        } else {
+            self.alpha
+        }
+    }
+
+    fn sigmoid_logits(&self, target: ArrayView1<'_, f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(target.len());
+        for i in 0..target.len() {
+            let x = target[i] / self.tau;
+            out[i] = if x >= 0.0 {
+                1.0 / (1.0 + (-x).exp())
+            } else {
+                let ex = x.exp();
+                ex / (1.0 + ex)
+            };
+        }
+        out
+    }
+
+    fn pi_map(&self, z: ArrayView1<'_, f64>, alpha: f64) -> Array1<f64> {
+        let n = z.len() / self.k_max;
+        let a = alpha / self.k_max as f64;
+        let eps = 1.0e-9;
+        let mut pi = Array1::<f64>::zeros(self.k_max);
+        for k in 0..self.k_max {
+            let mut active_mass = 0.0;
+            for row in 0..n {
+                active_mass += z[row * self.k_max + k];
+            }
+            let denom = (n as f64 + a - 1.0).max(eps);
+            let raw = (active_mass + a - 1.0) / denom;
+            pi[k] = raw.clamp(eps, 1.0 - eps);
+        }
+        pi
+    }
+}
+
+impl AnalyticPenalty for IBPAssignmentPenalty {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Psi
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        let alpha = self.resolved_alpha(rho);
+        let a = alpha / self.k_max as f64;
+        let z = self.sigmoid_logits(target);
+        let pi = self.pi_map(z.view(), alpha);
+        let n = z.len() / self.k_max;
+        let mut acc = 0.0;
+        for row in 0..n {
+            let start = row * self.k_max;
+            for k in 0..self.k_max {
+                let zk = z[start + k].clamp(1.0e-12, 1.0 - 1.0e-12);
+                let pk = pi[k].clamp(1.0e-12, 1.0 - 1.0e-12);
+                acc -= zk * pk.ln() + (1.0 - zk) * (1.0 - pk).ln();
+            }
+        }
+        for k in 0..self.k_max {
+            acc += (a - 1.0) * pi[k].ln();
+        }
+        acc
+    }
+
+    fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let alpha = self.resolved_alpha(rho);
+        let z = self.sigmoid_logits(target);
+        let pi = self.pi_map(z.view(), alpha);
+        let n = z.len() / self.k_max;
+        let mut out = Array1::<f64>::zeros(target.len());
+        for row in 0..n {
+            let start = row * self.k_max;
+            for k in 0..self.k_max {
+                let zk = z[start + k];
+                let pk = pi[k].clamp(1.0e-12, 1.0 - 1.0e-12);
+                let d_p_d_z = ((1.0 - pk) / pk).ln();
+                out[start + k] = d_p_d_z * zk * (1.0 - zk) / self.tau;
+            }
+        }
+        out
+    }
+
+    fn hessian_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        let alpha = self.resolved_alpha(rho);
+        let z = self.sigmoid_logits(target);
+        let pi = self.pi_map(z.view(), alpha);
+        let n = z.len() / self.k_max;
+        let mut out = Array1::<f64>::zeros(target.len());
+        let inv_tau2 = 1.0 / (self.tau * self.tau);
+        for row in 0..n {
+            let start = row * self.k_max;
+            for k in 0..self.k_max {
+                let zk = z[start + k];
+                let pk = pi[k].clamp(1.0e-12, 1.0 - 1.0e-12);
+                let d_p_d_z = ((1.0 - pk) / pk).ln();
+                out[start + k] = d_p_d_z * zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2;
+            }
+        }
+        Some(out)
+    }
+
+    fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        if !self.learnable_alpha {
+            return Array1::<f64>::zeros(0);
+        }
+        let alpha = self.resolved_alpha(rho);
+        let z = self.sigmoid_logits(target);
+        let pi = self.pi_map(z.view(), alpha);
+        let mut sum_log_pi = 0.0;
+        for &pk in pi.iter() {
+            sum_log_pi += pk.clamp(1.0e-12, 1.0 - 1.0e-12).ln();
+        }
+        Array1::from_vec(vec![alpha * sum_log_pi / self.k_max as f64])
+    }
+
+    fn rho_count(&self) -> usize {
+        usize::from(self.learnable_alpha)
+    }
+
+    fn name(&self) -> &str {
+        "ibp_assignment_map"
+    }
+}
+
 impl SparsityPenalty {
     pub fn smoothed_l1(target_tier: PenaltyTier, eps: f64) -> Self {
         Self {
@@ -1420,6 +1599,7 @@ pub enum AnalyticPenaltyKind {
     Isometry(Arc<IsometryPenalty>),
     Sparsity(Arc<SparsityPenalty>),
     SoftmaxAssignmentSparsity(Arc<SoftmaxAssignmentSparsityPenalty>),
+    IBPAssignment(Arc<IBPAssignmentPenalty>),
     Ard(Arc<ARDPenalty>),
 }
 
@@ -1429,6 +1609,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Isometry(p) => p.tier(),
             AnalyticPenaltyKind::Sparsity(p) => p.tier(),
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.tier(),
+            AnalyticPenaltyKind::IBPAssignment(p) => p.tier(),
             AnalyticPenaltyKind::Ard(p) => p.tier(),
         }
     }
@@ -1438,6 +1619,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Isometry(p) => p.rho_count(),
             AnalyticPenaltyKind::Sparsity(p) => p.rho_count(),
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.rho_count(),
+            AnalyticPenaltyKind::IBPAssignment(p) => p.rho_count(),
             AnalyticPenaltyKind::Ard(p) => p.rho_count(),
         }
     }
@@ -1447,6 +1629,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Isometry(p) => p.name(),
             AnalyticPenaltyKind::Sparsity(p) => p.name(),
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.name(),
+            AnalyticPenaltyKind::IBPAssignment(p) => p.name(),
             AnalyticPenaltyKind::Ard(p) => p.name(),
         }
     }
@@ -1456,6 +1639,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Isometry(p) => p.value(target, rho),
             AnalyticPenaltyKind::Sparsity(p) => p.value(target, rho),
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.value(target, rho),
+            AnalyticPenaltyKind::IBPAssignment(p) => p.value(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.value(target, rho),
         }
     }
@@ -1469,6 +1653,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Isometry(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Sparsity(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::IBPAssignment(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.grad_target(target, rho),
         }
     }
@@ -1482,6 +1667,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Isometry(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Sparsity(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::IBPAssignment(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.grad_rho(target, rho),
         }
     }
@@ -1495,6 +1681,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Isometry(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Sparsity(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::IBPAssignment(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.hessian_diag(target, rho),
         }
     }
@@ -1516,6 +1703,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Isometry(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Sparsity(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::IBPAssignment(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Ard(p) => p.hvp(target, rho, v),
         }
     }
@@ -1623,6 +1811,12 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::Ard(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
                 .expect("ARD diag"),
+            AnalyticPenaltyKind::IBPAssignment(p) => p
+                .hessian_diag(self.target.view(), self.rho.view())
+                .expect("IBP assignment diag"),
+            AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p
+                .hessian_diag(self.target.view(), self.rho.view())
+                .expect("softmax assignment diag"),
             AnalyticPenaltyKind::Sparsity(p) => {
                 if let Some(d) = p.hessian_diag(self.target.view(), self.rho.view()) {
                     d
@@ -1640,7 +1834,10 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
         // closed form is `Σ_i log(d_i + λ)`. For the dense Isometry GN form
         // we fall back to the materialize-and-eigh path on `as_dense`.
         match &self.penalty {
-            AnalyticPenaltyKind::Ard(_) | AnalyticPenaltyKind::Sparsity(_) => {
+            AnalyticPenaltyKind::Ard(_)
+            | AnalyticPenaltyKind::Sparsity(_)
+            | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
+            | AnalyticPenaltyKind::IBPAssignment(_) => {
                 let d = self.diag();
                 let mut s = 0.0;
                 for &v in d.iter() {

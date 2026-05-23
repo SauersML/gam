@@ -12994,6 +12994,208 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
     }
 }
 
+#[derive(Debug)]
+struct SingleBlockLatentCoordDesignCache {
+    data: Array2<f64>,
+    spec: TermCollectionSpec,
+    design: TermCollectionDesign,
+    current_theta: Option<Array1<f64>>,
+    current_latent: Option<std::sync::Arc<crate::terms::latent_coord::LatentCoordValues>>,
+    last_cost: Option<f64>,
+    last_eval: Option<(
+        f64,
+        Array1<f64>,
+        crate::solver::outer_strategy::HessianResult,
+    )>,
+    term_index: usize,
+    feature_cols: Vec<usize>,
+    rho_dim: usize,
+    n_obs: usize,
+    latent_dim: usize,
+    id_mode: crate::terms::latent_coord::LatentIdMode,
+    design_revision: u64,
+}
+
+impl SingleBlockLatentCoordDesignCache {
+    fn new(
+        data: Array2<f64>,
+        spec: TermCollectionSpec,
+        design: TermCollectionDesign,
+        latent: &StandardLatentCoordConfig,
+        rho_dim: usize,
+    ) -> Result<Self, String> {
+        if latent.term_index >= spec.smooth_terms.len() {
+            return Err(SmoothError::dimension_mismatch(format!(
+                "latent-coordinate term index {} out of bounds for {} smooth terms",
+                latent.term_index,
+                spec.smooth_terms.len()
+            ))
+            .into());
+        }
+        if latent.feature_cols.len() != latent.values.latent_dim() {
+            return Err(SmoothError::dimension_mismatch(format!(
+                "latent-coordinate feature width mismatch: feature_cols={}, latent_dim={}",
+                latent.feature_cols.len(),
+                latent.values.latent_dim()
+            ))
+            .into());
+        }
+        if latent.values.n_obs() != data.nrows() {
+            return Err(SmoothError::dimension_mismatch(format!(
+                "latent-coordinate row mismatch: latent n={}, data n={}",
+                latent.values.n_obs(),
+                data.nrows()
+            ))
+            .into());
+        }
+        Ok(Self {
+            data,
+            spec,
+            design,
+            current_theta: None,
+            current_latent: None,
+            last_cost: None,
+            last_eval: None,
+            term_index: latent.term_index,
+            feature_cols: latent.feature_cols.clone(),
+            rho_dim,
+            n_obs: latent.values.n_obs(),
+            latent_dim: latent.values.latent_dim(),
+            id_mode: latent.values.id_mode().clone(),
+            design_revision: 0,
+        })
+    }
+
+    fn design_revision(&self) -> u64 {
+        self.design_revision
+    }
+
+    fn spec(&self) -> &TermCollectionSpec {
+        &self.spec
+    }
+
+    fn design(&self) -> &TermCollectionDesign {
+        &self.design
+    }
+
+    fn latent(&self) -> Result<std::sync::Arc<crate::terms::latent_coord::LatentCoordValues>, String> {
+        self.current_latent
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "latent-coordinate cache has not been realized".to_string())
+    }
+
+    fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), String> {
+        if self
+            .current_theta
+            .as_ref()
+            .is_some_and(|cached| theta_values_match(cached, theta))
+        {
+            return Ok(());
+        }
+        let expected = self.rho_dim + self.n_obs * self.latent_dim;
+        if theta.len() != expected {
+            return Err(SmoothError::dimension_mismatch(format!(
+                "latent-coordinate theta length mismatch: got {}, expected {} (rho_dim={}, n={}, d={})",
+                theta.len(),
+                expected,
+                self.rho_dim,
+                self.n_obs,
+                self.latent_dim
+            ))
+            .into());
+        }
+        let flat = theta.slice(s![self.rho_dim..]).to_owned();
+        let latent = std::sync::Arc::new(crate::terms::latent_coord::LatentCoordValues::from_flat(
+            flat,
+            self.n_obs,
+            self.latent_dim,
+            self.id_mode.clone(),
+        ));
+        for n in 0..self.n_obs {
+            for axis in 0..self.latent_dim {
+                let col = self.feature_cols[axis];
+                self.data[[n, col]] = latent.as_flat()[n * self.latent_dim + axis];
+            }
+        }
+
+        let rebuilt = build_term_collection_design(self.data.view(), &self.spec)
+            .map_err(|e| format!("failed to rebuild latent-coordinate design: {e}"))?;
+        if rebuilt.design.ncols() != self.design.design.ncols() {
+            return Err(SmoothError::dimension_mismatch(format!(
+                "latent-coordinate design topology changed: rebuilt p={}, cached p={}",
+                rebuilt.design.ncols(),
+                self.design.design.ncols()
+            ))
+            .into());
+        }
+        self.design = rebuilt;
+        self.current_latent = Some(latent);
+        self.current_theta = Some(theta.clone());
+        self.last_cost = None;
+        self.last_eval = None;
+        self.design_revision = self.design_revision.wrapping_add(1);
+        Ok(())
+    }
+
+    fn memoized_cost(&self, theta: &Array1<f64>) -> Option<f64> {
+        if self
+            .current_theta
+            .as_ref()
+            .is_some_and(|cached| theta_values_match(cached, theta))
+        {
+            self.last_eval
+                .as_ref()
+                .map(|cached| cached.0)
+                .or(self.last_cost)
+        } else {
+            None
+        }
+    }
+
+    fn memoized_eval(
+        &self,
+        theta: &Array1<f64>,
+    ) -> Option<(
+        f64,
+        Array1<f64>,
+        crate::solver::outer_strategy::HessianResult,
+    )> {
+        if self
+            .current_theta
+            .as_ref()
+            .is_some_and(|cached| theta_values_match(cached, theta))
+        {
+            self.last_eval.clone()
+        } else {
+            None
+        }
+    }
+
+    fn store_eval(
+        &mut self,
+        eval: (
+            f64,
+            Array1<f64>,
+            crate::solver::outer_strategy::HessianResult,
+        ),
+    ) {
+        self.last_cost = Some(eval.0);
+        self.last_eval = Some(eval);
+    }
+
+    fn store_cost(&mut self, cost: f64) {
+        self.last_cost = Some(cost);
+    }
+
+    fn reset(&mut self) {
+        self.current_theta = None;
+        self.current_latent = None;
+        self.last_cost = None;
+        self.last_eval = None;
+    }
+}
+
 fn try_exact_joint_spatial_length_scale_optimization(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -16322,6 +16524,321 @@ where
         designs,
         fit,
     })
+}
+
+fn try_exact_joint_latent_coord_optimization(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    resolvedspec: &TermCollectionSpec,
+    best: &FittedTermCollection,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+    latent: &StandardLatentCoordConfig,
+) -> Result<FittedTermCollectionWithSpec, EstimationError> {
+    use crate::solver::outer_strategy::{
+        DeclaredHessianForm, Derivative, OuterEval, OuterEvalOrder,
+    };
+
+    let rho_dim = best.fit.lambdas.len();
+    let latent_dim = latent.values.len();
+    if latent_dim == 0 {
+        return Err(EstimationError::InvalidInput(
+            "latent-coordinate optimization requires a non-empty latent block".to_string(),
+        ));
+    }
+
+    let mut theta0 = Array1::<f64>::zeros(rho_dim + latent_dim);
+    theta0
+        .slice_mut(s![..rho_dim])
+        .assign(&best.fit.lambdas.mapv(f64::ln));
+    theta0
+        .slice_mut(s![rho_dim..])
+        .assign(latent.values.as_flat());
+
+    let mut lower = Array1::<f64>::from_elem(theta0.len(), -12.0);
+    let mut upper = Array1::<f64>::from_elem(theta0.len(), 12.0);
+    let latent_bound = latent
+        .values
+        .as_flat()
+        .iter()
+        .fold(1.0_f64, |acc, &v| acc.max(v.abs()))
+        + 10.0;
+    for axis in rho_dim..theta0.len() {
+        lower[axis] = -latent_bound;
+        upper[axis] = latent_bound;
+    }
+
+    struct LatentJointContext<'d> {
+        rho_dim: usize,
+        cache: SingleBlockLatentCoordDesignCache,
+        evaluator: crate::estimate::ExternalJointHyperEvaluator<'d>,
+    }
+
+    impl<'d> LatentJointContext<'d> {
+        fn eval_full(
+            &mut self,
+            theta: &Array1<f64>,
+            order: OuterEvalOrder,
+        ) -> Result<
+            (
+                f64,
+                Array1<f64>,
+                crate::solver::outer_strategy::HessianResult,
+            ),
+            EstimationError,
+        > {
+            if let Some(eval) = self.cache.memoized_eval(theta) {
+                return Ok(eval);
+            }
+            self.cache
+                .ensure_theta(theta)
+                .map_err(EstimationError::InvalidInput)?;
+            let hyper_dirs = try_build_latent_coord_hyper_dirs(
+                self.cache.latent().map_err(EstimationError::InvalidInput)?,
+                self.cache.spec(),
+                self.cache.design(),
+                &[self.cache.term_index],
+            )?
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "failed to build latent-coordinate hyper_dirs".to_string(),
+                )
+            })?;
+            let design_revision = Some(self.cache.design_revision());
+            let eval = evaluate_joint_reml_outer_eval_at_theta(
+                &mut self.evaluator,
+                self.cache.design(),
+                theta,
+                self.rho_dim,
+                hyper_dirs,
+                None,
+                order,
+                design_revision,
+            );
+            if let Ok(ref value) = eval {
+                self.cache.store_eval(value.clone());
+            }
+            eval
+        }
+
+        fn eval_efs(
+            &mut self,
+            theta: &Array1<f64>,
+        ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
+            self.cache
+                .ensure_theta(theta)
+                .map_err(EstimationError::InvalidInput)?;
+            let hyper_dirs = try_build_latent_coord_hyper_dirs(
+                self.cache.latent().map_err(EstimationError::InvalidInput)?,
+                self.cache.spec(),
+                self.cache.design(),
+                &[self.cache.term_index],
+            )?
+            .ok_or_else(|| {
+                EstimationError::InvalidInput(
+                    "failed to build latent-coordinate hyper_dirs for EFS".to_string(),
+                )
+            })?;
+            evaluate_joint_reml_efs_at_theta(
+                &mut self.evaluator,
+                self.cache.design(),
+                theta,
+                self.rho_dim,
+                hyper_dirs,
+                None,
+                Some(self.cache.design_revision()),
+            )
+        }
+
+        fn eval_cost(&mut self, theta: &Array1<f64>) -> f64 {
+            if let Some(cost) = self.cache.memoized_cost(theta) {
+                return cost;
+            }
+            if self.cache.ensure_theta(theta).is_err() {
+                return f64::INFINITY;
+            }
+            let design_revision = Some(self.cache.design_revision());
+            let result = {
+                let design = self.cache.design();
+                self.evaluator.evaluate_cost_only(
+                    &design.design,
+                    &design.penalties,
+                    &design.nullspace_dims,
+                    design.linear_constraints.clone(),
+                    theta,
+                    self.rho_dim,
+                    None,
+                    "latent-coordinate-joint cost-only",
+                    design_revision,
+                )
+            };
+            match result {
+                Ok(cost) => {
+                    self.cache.store_cost(cost);
+                    cost
+                }
+                Err(_) => f64::INFINITY,
+            }
+        }
+    }
+
+    let mut ctx = LatentJointContext {
+        rho_dim,
+        cache: SingleBlockLatentCoordDesignCache::new(
+            data.to_owned(),
+            resolvedspec.clone(),
+            best.design.clone(),
+            latent,
+            rho_dim,
+        )
+        .map_err(EstimationError::InvalidInput)?,
+        evaluator: crate::estimate::ExternalJointHyperEvaluator::new(
+            y,
+            weights,
+            &best.design.design,
+            offset,
+            &best.design.penalties,
+            &external_opts_for_design(family, &best.design, options),
+            "latent-coordinate-joint",
+        )?,
+    };
+
+    let problem = exact_joint_multistart_outer_problem(
+        &theta0,
+        &lower,
+        &upper,
+        rho_dim,
+        latent_dim,
+        theta0.len(),
+        Derivative::Analytic,
+        DeclaredHessianForm::Unavailable,
+        false,
+        false,
+        seed_risk_profile_for_likelihood_family(family),
+        options.tol,
+        options.max_iter.max(1),
+        Some(5.0),
+        Some(0.5),
+        None,
+    );
+
+    let eval_outer = |ctx: &mut &mut LatentJointContext<'_>,
+                      theta: &Array1<f64>,
+                      order: OuterEvalOrder|
+     -> Result<OuterEval, EstimationError> {
+        let (cost, gradient, hessian) = ctx.eval_full(theta, order)?;
+        Ok(OuterEval {
+            cost,
+            gradient,
+            hessian,
+            inner_beta_hint: None,
+        })
+    };
+
+    let mut obj = problem.build_objective_with_eval_order(
+        &mut ctx,
+        |ctx: &mut &mut LatentJointContext<'_>, theta: &Array1<f64>| Ok(ctx.eval_cost(theta)),
+        |ctx: &mut &mut LatentJointContext<'_>, theta: &Array1<f64>| {
+            eval_outer(ctx, theta, OuterEvalOrder::ValueAndGradient)
+        },
+        |ctx: &mut &mut LatentJointContext<'_>, theta: &Array1<f64>, order: OuterEvalOrder| {
+            eval_outer(ctx, theta, order)
+        },
+        Some(|ctx: &mut &mut LatentJointContext<'_>| {
+            ctx.cache.reset();
+        }),
+        Some(|ctx: &mut &mut LatentJointContext<'_>, theta: &Array1<f64>| ctx.eval_efs(theta)),
+    );
+
+    let result = problem
+        .run(&mut obj, "latent-coordinate joint REML")
+        .map_err(|e| {
+            EstimationError::InvalidInput(format!(
+                "latent-coordinate joint optimization failed after exhausting strategy fallbacks: {e}"
+            ))
+        })?;
+    if !result.converged {
+        return Err(EstimationError::InvalidInput(format!(
+            "latent-coordinate joint optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+            result.iterations,
+            result.final_value,
+            result.final_grad_norm_report(),
+        )));
+    }
+
+    let theta_star = result.rho;
+    let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
+    let mut final_data = data.to_owned();
+    let flat_t = theta_star.slice(s![rho_dim..]).to_owned();
+    for n in 0..latent.values.n_obs() {
+        for axis in 0..latent.values.latent_dim() {
+            final_data[[n, latent.feature_cols[axis]]] =
+                flat_t[n * latent.values.latent_dim() + axis];
+        }
+    }
+    let optimized = fit_term_collection_forspecwith_heuristic_lambdas(
+        final_data.view(),
+        y,
+        weights,
+        offset,
+        resolvedspec,
+        rho_star.as_slice(),
+        family,
+        options,
+    )?;
+    let mut fit = optimized.fit;
+    fit.reml_score = result.final_value;
+    Ok(FittedTermCollectionWithSpec {
+        fit,
+        design: optimized.design,
+        resolvedspec: resolvedspec.clone(),
+        adaptive_diagnostics: optimized.adaptive_diagnostics,
+    })
+}
+
+pub fn fit_term_collectionwith_latent_coord_optimization(
+    data: ArrayView2<'_, f64>,
+    y: Array1<f64>,
+    weights: Array1<f64>,
+    offset: Array1<f64>,
+    spec: &TermCollectionSpec,
+    latent: &StandardLatentCoordConfig,
+    family: LikelihoodFamily,
+    options: &FitOptions,
+) -> Result<FittedTermCollectionWithSpec, EstimationError> {
+    let n = data.nrows();
+    if !(y.len() == n && weights.len() == n && offset.len() == n) {
+        return Err(EstimationError::InvalidInput(format!(
+            "fit_term_collectionwith_latent_coord_optimization row mismatch: n={}, y={}, weights={}, offset={}",
+            n,
+            y.len(),
+            weights.len(),
+            offset.len()
+        )));
+    }
+    let best = fit_term_collection_forspec(
+        data,
+        y.view(),
+        weights.view(),
+        offset.view(),
+        spec,
+        family,
+        options,
+    )?;
+    let resolvedspec = freeze_term_collection_from_design(spec, &best.design)?;
+    try_exact_joint_latent_coord_optimization(
+        data,
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &resolvedspec,
+        &best,
+        family,
+        options,
+        latent,
+    )
 }
 
 pub fn fit_term_collectionwith_spatial_length_scale_optimization(

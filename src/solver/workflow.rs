@@ -39,12 +39,17 @@ use crate::families::transformation_normal::{
     TransformationNormalConfig, TransformationNormalFitResult, TransformationWarmStart,
     fit_transformation_normal,
 };
+use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::smooth::{
     AdaptiveRegularizationDiagnostics, CoefficientGroupSpec, SpatialLengthScaleOptimizationOptions,
-    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
+    StandardLatentCoordConfig, TermCollectionDesign, TermCollectionSpec,
+    build_term_collection_design, fit_term_collectionwith_latent_coord_optimization,
     fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
     fit_term_collectionwith_spatial_length_scale_optimization,
+};
+use crate::terms::latent_coord::{
+    AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode,
 };
 use crate::survival::PenaltyBlock;
 use crate::types::{
@@ -151,7 +156,7 @@ pub struct StandardBinomialWiggleConfig {
 }
 
 pub struct StandardFitRequest<'a> {
-    pub data: ArrayView2<'a, f64>,
+    pub data: Array2<f64>,
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
     pub offset: Array1<f64>,
@@ -163,6 +168,8 @@ pub struct StandardFitRequest<'a> {
     pub wiggle_options: Option<BlockwiseFitOptions>,
     pub coefficient_groups: Vec<CoefficientGroupSpec>,
     pub penalty_block_gamma_priors: Vec<(String, f64, f64)>,
+    pub latent_coord: Option<StandardLatentCoordConfig>,
+    _marker: std::marker::PhantomData<&'a ()>,
 }
 
 pub struct GaussianLocationScaleFitRequest<'a> {
@@ -743,11 +750,26 @@ fn fixed_gaussian_shift_frailty_from_spec(
 }
 
 fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResult, String> {
-    let fitted = if !request.coefficient_groups.is_empty()
+    let fitted = if let Some(latent_coord) = request.latent_coord.as_ref() {
+        if !request.coefficient_groups.is_empty() || !request.penalty_block_gamma_priors.is_empty() {
+            return Err("latent-coordinate standard fits do not support coefficient_groups or penalty_block_gamma_priors in the same request".to_string());
+        }
+        fit_term_collectionwith_latent_coord_optimization(
+            request.data.view(),
+            request.y.clone(),
+            request.weights.clone(),
+            request.offset.clone(),
+            &request.spec,
+            latent_coord,
+            request.family,
+            &request.options,
+        )
+        .map_err(|e| e.to_string())?
+    } else if !request.coefficient_groups.is_empty()
         || !request.penalty_block_gamma_priors.is_empty()
     {
         let fitted = fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors(
-            request.data,
+            request.data.view(),
             request.y.view(),
             request.weights.view(),
             request.offset.view(),
@@ -766,7 +788,7 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
         }
     } else {
         fit_term_collectionwith_spatial_length_scale_optimization(
-            request.data,
+            request.data.view(),
             request.y.clone(),
             request.weights.clone(),
             request.offset.clone(),
@@ -809,7 +831,7 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
     )?;
 
     let solved = fit_binomial_mean_wiggle_terms_with_selected_basis(
-        request.data,
+        request.data.view(),
         &result.resolvedspec,
         &result.design,
         &result.fit,

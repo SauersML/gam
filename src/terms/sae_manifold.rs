@@ -27,9 +27,13 @@
 //! [`crate::solver::arrow_schur::ArrowSchurSystem`].
 
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayView4, s};
+use std::sync::Arc;
 
 use crate::solver::arrow_schur::{ArrowRowBlock, ArrowSchurError, ArrowSchurSystem};
-use crate::terms::analytic_penalties::{ARDPenalty, PsiSlice, SoftmaxAssignmentSparsityPenalty};
+use crate::terms::analytic_penalties::{
+    ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, IBPAssignmentPenalty, PsiSlice,
+    SoftmaxAssignmentSparsityPenalty,
+};
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode};
 
 /// Basis/topology tag for one SAE manifold atom.
@@ -157,15 +161,79 @@ impl SaeManifoldAtom {
     }
 }
 
+/// Assignment prior/relaxation used by [`SaeAssignment`].
+#[derive(Debug, Clone)]
+pub enum AssignmentMode {
+    /// Row-wise simplex assignment with entropy sparsity.
+    Softmax { temperature: f64, sparsity: f64 },
+    /// Deterministic concrete relaxation of a truncated IBP active set.
+    IBPMap {
+        temperature: f64,
+        alpha: f64,
+        learnable_alpha: bool,
+    },
+}
+
+impl AssignmentMode {
+    pub fn softmax(temperature: f64) -> Self {
+        Self::Softmax {
+            temperature,
+            sparsity: 1.0,
+        }
+    }
+
+    pub fn ibp_map(temperature: f64, alpha: f64, learnable_alpha: bool) -> Self {
+        Self::IBPMap {
+            temperature,
+            alpha,
+            learnable_alpha,
+        }
+    }
+
+    pub fn temperature(&self) -> f64 {
+        match *self {
+            AssignmentMode::Softmax { temperature, .. }
+            | AssignmentMode::IBPMap { temperature, .. } => temperature,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let temperature = self.temperature();
+        if !(temperature.is_finite() && temperature > 0.0) {
+            return Err(format!(
+                "AssignmentMode: temperature must be finite and positive; got {temperature}"
+            ));
+        }
+        match *self {
+            AssignmentMode::Softmax { sparsity, .. } => {
+                if !(sparsity.is_finite() && sparsity > 0.0) {
+                    return Err(format!(
+                        "AssignmentMode::Softmax: sparsity must be finite and positive; got {sparsity}"
+                    ));
+                }
+            }
+            AssignmentMode::IBPMap { alpha, .. } => {
+                if !(alpha.is_finite() && alpha > 0.0) {
+                    return Err(format!(
+                        "AssignmentMode::IBPMap: alpha must be finite and positive; got {alpha}"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Per-row latent assignment state.
 ///
 /// The free assignment parameter is `logits`; non-negative assignments are
-/// derived by row-wise softmax. `coords[k]` holds `t_{.,k}` for atom `k`.
+/// derived by row-wise softmax or by independent IBP-MAP sigmoid active
+/// indicators. `coords[k]` holds `t_{.,k}` for atom `k`.
 #[derive(Debug, Clone)]
 pub struct SaeAssignment {
     pub logits: Array2<f64>,
     pub coords: Vec<LatentCoordValues>,
-    pub temperature: f64,
+    pub mode: AssignmentMode,
 }
 
 impl SaeAssignment {
@@ -174,11 +242,15 @@ impl SaeAssignment {
         coords: Vec<LatentCoordValues>,
         temperature: f64,
     ) -> Result<Self, String> {
-        if !(temperature.is_finite() && temperature > 0.0) {
-            return Err(format!(
-                "SaeAssignment::new: temperature must be finite and positive; got {temperature}"
-            ));
-        }
+        Self::with_mode(logits, coords, AssignmentMode::softmax(temperature))
+    }
+
+    pub fn with_mode(
+        logits: Array2<f64>,
+        coords: Vec<LatentCoordValues>,
+        mode: AssignmentMode,
+    ) -> Result<Self, String> {
+        mode.validate()?;
         let n = logits.nrows();
         let k = logits.ncols();
         if coords.len() != k {
@@ -198,7 +270,7 @@ impl SaeAssignment {
         Ok(Self {
             logits,
             coords,
-            temperature,
+            mode,
         })
     }
 
@@ -242,7 +314,14 @@ impl SaeAssignment {
     }
 
     pub fn assignments_row(&self, row: usize) -> Array1<f64> {
-        softmax_row(self.logits.row(row), self.temperature)
+        match self.mode {
+            AssignmentMode::Softmax { temperature, .. } => {
+                softmax_row(self.logits.row(row), temperature)
+            }
+            AssignmentMode::IBPMap { temperature, .. } => {
+                sigmoid_row(self.logits.row(row), temperature)
+            }
+        }
     }
 
     /// Flatten ψ in row-major SAE layout:
@@ -279,6 +358,18 @@ impl SaeAssignment {
             .map(|c| LatentCoordValues::from_matrix(c.view(), LatentIdMode::None))
             .collect();
         Self::new(logits, coords, temperature)
+    }
+
+    pub fn from_blocks_with_mode(
+        logits: Array2<f64>,
+        coord_blocks: Vec<Array2<f64>>,
+        mode: AssignmentMode,
+    ) -> Result<Self, String> {
+        let coords = coord_blocks
+            .iter()
+            .map(|c| LatentCoordValues::from_matrix(c.view(), LatentIdMode::None))
+            .collect();
+        Self::with_mode(logits, coords, mode)
     }
 }
 
@@ -485,11 +576,7 @@ impl SaeManifoldTerm {
                 data_fit += 0.5 * r * r;
             }
         }
-        let assignment_sparsity = assignment_entropy_value(
-            self.assignment.logits.view(),
-            self.assignment.temperature,
-            rho.lambda_sparse(),
-        );
+        let assignment_sparsity = assignment_prior_value(&self.assignment, rho);
         let smoothness = self.decoder_smoothness_value(rho.lambda_smooth());
         let ard = self.ard_value(rho)?;
         Ok(SaeManifoldLoss {
@@ -581,7 +668,7 @@ impl SaeManifoldTerm {
         let beta_offsets = self.beta_offsets();
         let coord_offsets = self.assignment.coord_offsets();
         let lambda_smooth = rho.lambda_smooth();
-        let lambda_sparse = rho.lambda_sparse();
+        let (assignment_grad, assignment_hdiag) = assignment_prior_grad_hdiag(&self.assignment, rho);
         let mut sys = ArrowSchurSystem::new(n, q, beta_dim);
 
         // Decoder smoothness penalty in the beta block.
@@ -621,13 +708,30 @@ impl SaeManifoldTerm {
             }
 
             let mut local_jac = Array2::<f64>::zeros((q, p));
-            // Logit columns: da_k/dl_j = a_k (1[k=j] - a_j) / tau.
-            for logit_col in 0..k_atoms {
-                let inv_tau = 1.0 / self.assignment.temperature;
-                for out_col in 0..p {
-                    local_jac[[logit_col, out_col]] = assignments[logit_col]
-                        * (decoded[logit_col][out_col] - fitted[out_col])
-                        * inv_tau;
+            match self.assignment.mode {
+                AssignmentMode::Softmax { temperature, .. } => {
+                    // da_k/dl_j = a_k (1[k=j] - a_j) / tau, contracted
+                    // against the assignment-weighted fitted row.
+                    let inv_tau = 1.0 / temperature;
+                    for logit_col in 0..k_atoms {
+                        for out_col in 0..p {
+                            local_jac[[logit_col, out_col]] = assignments[logit_col]
+                                * (decoded[logit_col][out_col] - fitted[out_col])
+                                * inv_tau;
+                        }
+                    }
+                }
+                AssignmentMode::IBPMap { temperature, .. } => {
+                    // Independent concrete-Bernoulli active indicators:
+                    // dz_k/dl_k = z_k(1-z_k)/tau.
+                    let inv_tau = 1.0 / temperature;
+                    for logit_col in 0..k_atoms {
+                        let dz = assignments[logit_col] * (1.0 - assignments[logit_col]) * inv_tau;
+                        for out_col in 0..p {
+                            local_jac[[logit_col, out_col]] =
+                                dz * decoded[logit_col][out_col];
+                        }
+                    }
                 }
             }
             // Coordinate columns.
@@ -658,15 +762,11 @@ impl SaeManifoldTerm {
                 }
             }
 
-            // Assignment entropy sparsity in logit space.
-            let (entropy_value_grad, entropy_diag) = assignment_entropy_grad_hdiag(
-                assignments.view(),
-                self.assignment.temperature,
-                lambda_sparse,
-            );
+            // Assignment prior in logit space.
+            let assignment_base = row * k_atoms;
             for atom_idx in 0..k_atoms {
-                block.gt[atom_idx] += entropy_value_grad[atom_idx];
-                block.htt[[atom_idx, atom_idx]] += entropy_diag[atom_idx];
+                block.gt[atom_idx] += assignment_grad[assignment_base + atom_idx];
+                block.htt[[atom_idx, atom_idx]] += assignment_hdiag[assignment_base + atom_idx];
             }
 
             // ARD on each on-atom coordinate.
@@ -739,11 +839,24 @@ impl SaeManifoldTerm {
     /// Build the analytic-penalty descriptors that correspond to the current
     /// SAE term. This is the bridge into `analytic_penalties.rs` for callers
     /// that want to register the same ρ axes with a REML driver.
-    pub fn analytic_penalty_descriptors(
-        &self,
-    ) -> (SoftmaxAssignmentSparsityPenalty, Vec<ARDPenalty>) {
-        let sparsity =
-            SoftmaxAssignmentSparsityPenalty::new(self.k_atoms(), self.assignment.temperature);
+    pub fn analytic_penalty_descriptors(&self) -> (AnalyticPenaltyKind, Vec<ARDPenalty>) {
+        let assignment = match self.assignment.mode {
+            AssignmentMode::Softmax { temperature, .. } => {
+                AnalyticPenaltyKind::SoftmaxAssignmentSparsity(Arc::new(
+                    SoftmaxAssignmentSparsityPenalty::new(self.k_atoms(), temperature),
+                ))
+            }
+            AssignmentMode::IBPMap {
+                temperature,
+                alpha,
+                learnable_alpha,
+            } => AnalyticPenaltyKind::IBPAssignment(Arc::new(IBPAssignmentPenalty::new(
+                self.k_atoms(),
+                alpha,
+                temperature,
+                learnable_alpha,
+            ))),
+        };
         let mut ard = Vec::with_capacity(self.k_atoms());
         for coord in &self.assignment.coords {
             ard.push(ARDPenalty::new(
@@ -751,7 +864,7 @@ impl SaeManifoldTerm {
                 coord.latent_dim(),
             ));
         }
-        (sparsity, ard)
+        (assignment, ard)
     }
 }
 
