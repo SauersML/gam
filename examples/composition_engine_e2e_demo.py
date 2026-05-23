@@ -1,35 +1,27 @@
 #!/usr/bin/env python3
 """Minimal composition-engine end-to-end demo.
 
-Shows the proposed composition:
-
-    latents= + manifold="circle" + Fisher-Rao W + ARD identifiability
-
+Shows: latents= + manifold="circle" + Fisher-Rao W + ARD identifiability.
 Proposal references:
 * /Users/user/gam/proposals/composition_engine.md
 * /Users/user/gam/proposals/latent_coord.md
 * /Users/user/gam/proposals/sae_manifold.md
 
-API gap in current builds: formula ``gamfit.fit`` exposes ``LatentCoord`` with
-``manifold``, ``aux_prior``, and ``dim_selection``, while the low-level latent
-Gaussian API exposes ``fisher_W``. If formula fit has not yet accepted
-``fisher_W``, this script uses the low-level Fisher hook and applies the circle
-retraction in Python. The intended high-level call is kept below verbatim.
+API gap: current formula ``gamfit.fit`` may not expose ``fisher_W``. If so,
+the demo uses the low-level Fisher hook and applies circle retraction in Python.
 """
 
 from __future__ import annotations
 
+import inspect
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-import inspect
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 import gamfit
-
 N, P, KNOTS, SEED = 500, 32, 20, 23
 FIG_PATH = Path(__file__).with_suffix(".png")
 
@@ -68,32 +60,32 @@ def make_data():
     return df, theta, y, u_rgb, grad
 
 
-def fisher_blocks(grad: np.ndarray, alpha: float = 6.0) -> np.ndarray:
+def fisher_blocks(grad, alpha=6.0):
     """Synthetic Fisher pullback: W[n] = I_p + alpha * outer(grad_n, grad_n)."""
     direction = grad / np.linalg.norm(grad, axis=1, keepdims=True).clip(min=1e-12)
     return np.eye(P)[None, :, :] + alpha * np.einsum("ni,nj->nij", direction, direction)
 
 
-def pca_angle(y: np.ndarray) -> np.ndarray:
+def pca_angle(y):
     yc = y - y.mean(axis=0, keepdims=True)
     _, _, vt = np.linalg.svd(yc, full_matrices=False)
     pc = yc @ vt[:2].T
     return np.mod(np.arctan2(pc[:, 1], pc[:, 0]), 2.0 * np.pi)
 
 
-def align_and_corr(theta_true: np.ndarray, theta_hat: np.ndarray) -> tuple[np.ndarray, float]:
+def align_and_corr(theta_true, theta_hat):
     theta_hat = np.mod(theta_hat, 2.0 * np.pi)
     rot = np.angle(np.mean(np.exp(1j * (theta_true - theta_hat))))
     aligned = np.mod(theta_hat + rot, 2.0 * np.pi)
     return aligned, float(abs(np.mean(np.exp(1j * (theta_true - aligned)))))
 
 
-def seam_jump(theta_hat: np.ndarray) -> float:
+def seam_jump(theta_hat):
     ordered = np.sort(np.mod(theta_hat, 2.0 * np.pi))
     return float(np.diff(np.r_[ordered, ordered[0] + 2.0 * np.pi]).max())
 
 
-def scalar(result: Any, *names: str, default: float = float("nan")) -> float:
+def scalar(result, *names, default=float("nan")):
     for name in names:
         if isinstance(result, dict) and name in result:
             return float(result[name])
@@ -104,7 +96,7 @@ def scalar(result: Any, *names: str, default: float = float("nan")) -> float:
     return default
 
 
-def latent_theta(result: Any, fallback: np.ndarray) -> np.ndarray:
+def latent_theta(result, fallback):
     if hasattr(result, "latent"):
         return np.asarray(result.latent("t"), dtype=float).reshape(len(fallback), -1)[:, 0]
     if isinstance(result, dict):
@@ -114,8 +106,7 @@ def latent_theta(result: Any, fallback: np.ndarray) -> np.ndarray:
     return fallback
 
 
-def intended_formula_fit(df, theta0, u_rgb, w_per_row) -> Any:
-    """Target proposal API; the TypeError path documents current gaps."""
+def intended_formula_fit(df, theta0, u_rgb, w_per_row):
     return gamfit.fit(
         df,
         formula="y ~ s(t, type='periodic', n_knots=20)",
@@ -133,22 +124,14 @@ def intended_formula_fit(df, theta0, u_rgb, w_per_row) -> Any:
     )
 
 
-def low_level_fit(
-    y: np.ndarray,
-    theta0: np.ndarray,
-    u_rgb: np.ndarray,
-    w_per_row: np.ndarray | None,
-    *,
-    circle: bool,
-    steps: int,
-) -> DemoFit:
+def low_level_fit(y, theta0, u_rgb, w_per_row, *, circle, steps):
     started = time.perf_counter()
     theta = theta0.copy()
     centers = np.linspace(0.0, 2.0 * np.pi, KNOTS, endpoint=False)[:, None]
     penalty = np.eye(KNOTS + 2)
     penalty[:2, :2] = 0.0
     trace = [np.zeros(3)]  # active S1 axis + two inactive ARD diagnostic axes.
-    out: dict[str, Any] = {}
+    out = {}
     score = float("nan")
 
     for it in range(steps):
@@ -191,7 +174,7 @@ def low_level_fit(
     return DemoFit(latent_theta(out, theta), score, np.vstack(trace), 0.0, time.perf_counter() - started, gap)
 
 
-def plot_results(theta: np.ndarray, y: np.ndarray, comp: DemoFit, base: DemoFit) -> None:
+def plot_results(theta, y, comp, base):
     comp_aligned, comp_corr = align_and_corr(theta, comp.theta_hat)
     _, base_corr = align_and_corr(theta, base.theta_hat)
     yc = y - y.mean(axis=0, keepdims=True)
@@ -217,7 +200,7 @@ def plot_results(theta: np.ndarray, y: np.ndarray, comp: DemoFit, base: DemoFit)
     plt.show()
 
 
-def main() -> None:
+def main():
     df, theta, y, u_rgb, grad = make_data()
     theta0 = pca_angle(y)
     w_per_row = fisher_blocks(grad)
@@ -262,7 +245,6 @@ def main() -> None:
         print(f"closest working path:             {comp.gap}")
     print(f"plot written:                     {FIG_PATH}")
     plot_results(theta, y, comp, base)
-
 
 if __name__ == "__main__":
     main()
