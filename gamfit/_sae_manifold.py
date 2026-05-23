@@ -19,6 +19,7 @@ from typing import Any, Literal, Sequence
 import numpy as np
 
 from ._api import gaussian_reml_fit
+from ._binding import rust_module
 from ._compare import compare_models
 from .smooth import Duchon, PeriodicSplineCurve, Smooth, Sphere
 from .topology import Circle, EuclideanPatch
@@ -219,10 +220,27 @@ def _fit_fixed_k(
     alpha_value = 1.0 if alpha == "auto" else float(alpha)
     if not np.isfinite(alpha_value) or alpha_value <= 0.0:
         raise ValueError("alpha must be positive, finite, or 'auto'")
-    # TODO: replace the Python IBP branch with a pyffi sae_manifold_fit_ibp
-    # entrypoint once gam-pyffi exposes SaeManifoldTerm construction. Until
-    # then, keep this resolved-alpha rule bit-for-bit with Rust's
-    # IBPAssignmentPenalty::resolved_alpha.
+
+    if assignment_prior == "ibp_map":
+        try:
+            return _fit_fixed_k_ibp_rust(
+                z,
+                k_atoms,
+                basis_specs,
+                dims,
+                lambda_sparse,
+                lambda_smooth,
+                alpha_value,
+                learnable_alpha,
+                tau,
+                logits,
+                coords,
+                max_iter=max_iter,
+                learning_rate=learning_rate,
+            )
+        except Exception:
+            pass
+
     effective_alpha = (
         alpha_value * lambda_sparse
         if assignment_prior == "ibp_map" and learnable_alpha
@@ -327,6 +345,101 @@ def _fit_fixed_k(
     )
 
 
+def _fit_fixed_k_ibp_rust(
+    z: np.ndarray,
+    k_atoms: int,
+    basis_specs: Sequence[str | Smooth],
+    dims: Sequence[int],
+    lambda_sparse: float,
+    lambda_smooth: float,
+    alpha_value: float,
+    learnable_alpha: bool,
+    tau: float,
+    logits: np.ndarray,
+    coords: Sequence[np.ndarray],
+    *,
+    max_iter: int,
+    learning_rate: float,
+) -> SaeManifoldFitResult:
+    designs: list[np.ndarray] = []
+    jets: list[np.ndarray] = []
+    penalties: list[np.ndarray] = []
+    for atom in range(k_atoms):
+        phi, jet, penalty = _basis_and_jacobian(basis_specs[atom], coords[atom])
+        designs.append(np.ascontiguousarray(phi, dtype=float))
+        jets.append(np.ascontiguousarray(jet, dtype=float))
+        penalties.append(np.ascontiguousarray(penalty, dtype=float))
+
+    n, p = z.shape
+    m_max = max(d.shape[1] for d in designs)
+    d_max = max((c.shape[1] for c in coords), default=0)
+    basis_values = np.zeros((k_atoms, n, m_max), dtype=float)
+    basis_jacobian = np.zeros((k_atoms, n, m_max, d_max), dtype=float)
+    decoder_coefficients = np.zeros((k_atoms, m_max, p), dtype=float)
+    smooth_penalties = np.zeros((k_atoms, m_max, m_max), dtype=float)
+    coords_padded = np.zeros((k_atoms, n, d_max), dtype=float)
+    basis_sizes: list[int] = []
+    for atom in range(k_atoms):
+        m = designs[atom].shape[1]
+        d = coords[atom].shape[1]
+        basis_sizes.append(m)
+        basis_values[atom, :, :m] = designs[atom]
+        basis_jacobian[atom, :, :m, :d] = jets[atom]
+        smooth_penalties[atom, :m, :m] = penalties[atom]
+        coords_padded[atom, :, :d] = coords[atom]
+
+    payload = rust_module().sae_manifold_fit_ibp(
+        np.ascontiguousarray(z, dtype=float),
+        [_basis_kind_name(spec) for spec in basis_specs],
+        [int(d) for d in dims],
+        np.ascontiguousarray(basis_values),
+        np.ascontiguousarray(basis_jacobian),
+        basis_sizes,
+        np.ascontiguousarray(decoder_coefficients),
+        np.ascontiguousarray(smooth_penalties),
+        np.ascontiguousarray(logits, dtype=float),
+        np.ascontiguousarray(coords_padded),
+        float(alpha_value),
+        float(tau),
+        bool(learnable_alpha),
+        float(lambda_sparse),
+        float(lambda_smooth),
+        int(max_iter),
+        float(learning_rate),
+    )
+
+    assignments = np.asarray(payload["assignments_z"], dtype=float)
+    fitted = np.asarray(payload["fitted"], dtype=float)
+    score = float(payload["reml_score"])
+    atoms: list[SaeManifoldAtomFit] = []
+    out_coords: list[np.ndarray] = []
+    for atom, atom_payload in enumerate(payload["atoms"]):
+        atom_coords = np.asarray(atom_payload["on_atom_coords_t"], dtype=float)
+        decoder = np.asarray(atom_payload["decoder_B"], dtype=float)
+        out_coords.append(atom_coords.copy())
+        atoms.append(
+            SaeManifoldAtomFit(
+                basis=basis_specs[atom],
+                decoder_coefficients=decoder,
+                assignments=assignments[:, atom].copy(),
+                coords=atom_coords.copy(),
+                evidence=score,
+                active_dim=int(np.sum(np.var(atom_coords, axis=0) > 1e-5)),
+            )
+        )
+    comparison = compare_models([{"reml_score": score}], names=[f"K={k_atoms}"])
+    return SaeManifoldFitResult(
+        atoms=atoms,
+        chosen_k=k_atoms,
+        evidence_by_candidate={k_atoms: score},
+        comparison=comparison,
+        fitted=fitted,
+        assignments=assignments.copy(),
+        coords=out_coords,
+        reml_score=score,
+    )
+
+
 def _resolve_dims(k_atoms: int, atom_dim: int | Sequence[int] | Literal["auto"] | None) -> list[int]:
     if atom_dim == "auto" or atom_dim is None:
         return [2 for _ in range(k_atoms)]
@@ -361,6 +474,20 @@ def _basis_from_name(name: str) -> Smooth:
     if key == "sphere":
         return Sphere(n_centers=16)
     raise ValueError(f"unsupported atom_basis {name!r}")
+
+
+def _basis_kind_name(spec: str | Smooth) -> str:
+    if isinstance(spec, str):
+        return spec
+    if isinstance(spec, PeriodicSplineCurve):
+        return "periodic"
+    if isinstance(spec, Sphere):
+        return "sphere"
+    if isinstance(spec, Duchon):
+        return "duchon"
+    if isinstance(spec, EuclideanPatch):
+        return "euclidean_patch"
+    return spec.__class__.__name__
 
 
 def _basis_and_jacobian(spec: str | Smooth, t: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

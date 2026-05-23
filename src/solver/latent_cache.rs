@@ -14,9 +14,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 
-use crate::basis::{BasisError, DuchonNullspaceOrder, MaternNu, RadialScalarKind};
+use crate::basis::{DuchonNullspaceOrder, MaternNu, RadialScalarKind};
 use crate::estimate::EstimationError;
 use crate::solver::reml::DirectionalHyperParam;
 use crate::terms::latent_coord::LatentCoordValues;
@@ -102,7 +102,7 @@ impl LatentBasisKind {
                 centers.nrows().hash(&mut hasher);
                 centers.ncols().hash(&mut hasher);
                 length_scale.map(f64::to_bits).hash(&mut hasher);
-                std::mem::discriminant(nullspace_order).hash(&mut hasher);
+                nullspace_order.hash(&mut hasher);
                 hash_matrix(centers, &mut hasher);
             }
         }
@@ -130,6 +130,7 @@ pub(crate) struct BasisDerivativeJets {
     pub(crate) t: Option<Array2<f64>>,
     pub(crate) phi_r: Option<Array2<f64>>,
     pub(crate) phi_rr: Option<Array2<f64>>,
+    pub(crate) operator_resident: bool,
 }
 
 impl BasisDerivativeJets {
@@ -140,12 +141,14 @@ impl BasisDerivativeJets {
             t: None,
             phi_r: None,
             phi_rr: None,
+            operator_resident: false,
         }
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct CachedDesign {
+    pub(crate) id: u64,
     pub(crate) fingerprint: LatentFingerprint,
     pub(crate) latent_flat: Arc<[f64]>,
     pub(crate) basis_signature: u64,
@@ -163,7 +166,6 @@ pub(crate) struct ComputedLatentDesign {
 
 pub(crate) struct LatentDesignLookup<'a> {
     pub(crate) cached: &'a CachedDesign,
-    pub(crate) recomputed: bool,
 }
 
 pub(crate) struct LatentDesignCache {
@@ -172,6 +174,7 @@ pub(crate) struct LatentDesignCache {
     relative_l2_tolerance: f64,
     clock: u64,
     iteration: u64,
+    next_entry_id: u64,
 }
 
 impl Default for LatentDesignCache {
@@ -188,14 +191,8 @@ impl LatentDesignCache {
             relative_l2_tolerance: DEFAULT_RELATIVE_L2_TOLERANCE,
             clock: 0,
             iteration: 0,
+            next_entry_id: 0,
         }
-    }
-
-    pub(crate) fn with_relative_l2_tolerance(mut self, tolerance: f64) -> Self {
-        if tolerance.is_finite() && tolerance >= 0.0 {
-            self.relative_l2_tolerance = tolerance;
-        }
-        self
     }
 
     pub(crate) fn invalidate(&mut self) {
@@ -214,16 +211,15 @@ impl LatentDesignCache {
         self.iteration = self.iteration.wrapping_add(1);
         self.clock = self.clock.wrapping_add(1);
         let flat = latent.as_flat();
-        let fingerprint = LatentFingerprint::from_flat(
-            flat.as_slice().unwrap_or(&[]),
-            self.iteration,
-        );
+        let flat_slice = flat
+            .as_slice()
+            .expect("LatentCoordValues flat storage must be contiguous");
+        let fingerprint = LatentFingerprint::from_flat(flat_slice, self.iteration);
         let basis_signature = basis_kind.signature();
-        if let Some(index) = self.find_entry(flat.as_slice().unwrap_or(&[]), &fingerprint, basis_signature) {
+        if let Some(index) = self.find_entry(flat_slice, &fingerprint, basis_signature) {
             self.entries[index].last_used = self.clock;
             return Ok(LatentDesignLookup {
                 cached: &self.entries[index],
-                recomputed: false,
             });
         }
 
@@ -231,7 +227,10 @@ impl LatentDesignCache {
         let radial_distances = build_radial_distances(&latent, basis_kind.centers())?;
         let basis_derivative_jets =
             build_basis_derivative_jets(&latent, &basis_kind, &radial_distances)?;
+        let id = self.next_entry_id;
+        self.next_entry_id = self.next_entry_id.wrapping_add(1);
         let entry = CachedDesign {
+            id,
             fingerprint,
             latent_flat: Arc::from(flat.to_vec()),
             basis_signature,
@@ -241,15 +240,15 @@ impl LatentDesignCache {
             basis_derivative_jets,
             last_used: self.clock,
         };
+        let _resident_scalars = entry.resident_scalar_count();
         self.insert(entry);
         let index = self
             .entries
             .iter()
-            .position(|entry| entry.last_used == self.clock)
+            .position(|entry| entry.id == id)
             .expect("inserted latent design cache entry missing");
         Ok(LatentDesignLookup {
             cached: &self.entries[index],
-            recomputed: true,
         })
     }
 
@@ -263,7 +262,14 @@ impl LatentDesignCache {
             entry.basis_signature == basis_signature
                 && entry.fingerprint.len == fingerprint.len
                 && (entry.fingerprint.hash == fingerprint.hash
-                    || relative_l2(flat, &entry.latent_flat, entry.fingerprint.l2_norm)
+                    || relative_l2(
+                        flat,
+                        &entry.latent_flat,
+                        entry
+                            .fingerprint
+                            .l2_norm
+                            .max(entry.fingerprint.max_coordinate_norm),
+                    )
                         <= self.relative_l2_tolerance)
         })
     }
@@ -275,7 +281,7 @@ impl LatentDesignCache {
                 .entries
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, entry)| entry.last_used)
+                .min_by_key(|(_, entry)| (entry.last_used, entry.fingerprint.iteration))
                 .map(|(index, _)| index)
             {
                 self.entries.remove(evict_index);
@@ -283,6 +289,39 @@ impl LatentDesignCache {
                 break;
             }
         }
+    }
+}
+
+impl CachedDesign {
+    fn resident_scalar_count(&self) -> usize {
+        self.radial_distances.squared.len()
+            + self.radial_distances.distance.len()
+            + self
+                .basis_derivative_jets
+                .phi
+                .as_ref()
+                .map_or(0, |values| values.len())
+            + self
+                .basis_derivative_jets
+                .q
+                .as_ref()
+                .map_or(0, |values| values.len())
+            + self
+                .basis_derivative_jets
+                .t
+                .as_ref()
+                .map_or(0, |values| values.len())
+            + self
+                .basis_derivative_jets
+                .phi_r
+                .as_ref()
+                .map_or(0, |values| values.len())
+            + self
+                .basis_derivative_jets
+                .phi_rr
+                .as_ref()
+                .map_or(0, |values| values.len())
+            + usize::from(self.basis_derivative_jets.operator_resident)
     }
 }
 
@@ -362,36 +401,15 @@ fn build_basis_derivative_jets(
                 t: Some(t),
                 phi_r: None,
                 phi_rr: None,
+                operator_resident: false,
             })
         }
-        LatentBasisKind::Duchon {
-            centers,
-            length_scale,
-            nullspace_order,
-        } => {
-            let phi_r = crate::basis::duchon_radial_first_derivative_nd(
-                latent.as_matrix(),
-                centers.view(),
-                *length_scale,
-                *nullspace_order,
-            )
-            .map_err(map_basis_error)?;
-            let phi_rr = crate::basis::duchon_radial_second_derivative_nd(
-                latent.as_matrix(),
-                centers.view(),
-                *length_scale,
-                *nullspace_order,
-            )
-            .map_err(map_basis_error)?;
+        LatentBasisKind::Duchon { .. } => {
+            let _ = latent;
             Ok(BasisDerivativeJets {
-                phi_r: Some(phi_r),
-                phi_rr: Some(phi_rr),
+                operator_resident: true,
                 ..BasisDerivativeJets::empty()
             })
         }
     }
-}
-
-fn map_basis_error(err: BasisError) -> EstimationError {
-    EstimationError::from(err)
 }

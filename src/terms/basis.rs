@@ -4109,10 +4109,11 @@ pub struct ImplicitDesignPsiDerivative {
 
 /// Streaming design derivative for one per-row latent coordinate `t[n, a]`.
 ///
-/// The operator stores the shared latent matrix, centers, radial kernel kind,
-/// and basis transforms once. Individual REML hyper-directions carry only a
-/// flat coordinate index and call `forward_mul_axis` / `transpose_mul_axis`
-/// to expose the corresponding one-row design derivative on demand.
+/// The operator stores the shared latent matrix plus either radial-kernel
+/// ingredients or a precomputed non-radial derivative jet. Individual REML
+/// hyper-directions carry only a flat coordinate index and call
+/// `forward_mul_axis` / `transpose_mul_axis` to expose the corresponding
+/// one-row design derivative on demand.
 #[derive(Debug, Clone)]
 pub struct LatentCoordDesignDerivative {
     latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
@@ -4289,7 +4290,12 @@ impl LatentCoordDesignDerivative {
                 centers.ncols()
             )));
         }
-        let raw_jet = sphere_first_derivative_nd(latent.as_matrix().view(), centers.view(), penalty_order)?;
+        let raw_jet = sphere_first_derivative_nd(
+            latent.as_matrix().view(),
+            centers.view(),
+            penalty_order,
+            true,
+        )?;
         let jet = latent.design_gradient_wrt_t_dispatch(
             crate::terms::latent_coord::InputLocationDerivative::Jet(raw_jet.view()),
         );
@@ -4303,8 +4309,12 @@ impl LatentCoordDesignDerivative {
         num_basis: usize,
         ident_transform: Option<Array2<f64>>,
     ) -> Result<Self, BasisError> {
-        let raw_jet =
-            periodic_bspline_first_derivative_nd(latent.as_matrix().view(), data_range, degree, num_basis)?;
+        let raw_jet = periodic_bspline_first_derivative_nd(
+            latent.as_matrix().view(),
+            data_range,
+            degree,
+            num_basis,
+        )?;
         let jet = latent.design_gradient_wrt_t_dispatch(
             crate::terms::latent_coord::InputLocationDerivative::Jet(raw_jet.view()),
         );
@@ -4317,7 +4327,10 @@ impl LatentCoordDesignDerivative {
         degrees: Vec<usize>,
         ident_transform: Option<Array2<f64>>,
     ) -> Result<Self, BasisError> {
-        let knot_views = knots_per_axis.iter().map(Array1::view).collect::<Vec<_>>();
+        let knot_views = knots_per_axis
+            .iter()
+            .map(|knots| knots.view())
+            .collect::<Vec<_>>();
         let raw_jet =
             bspline_tensor_first_derivative(latent.as_matrix().view(), &knot_views, &degrees)?;
         let jet = latent.design_gradient_wrt_t_dispatch(
@@ -4370,14 +4383,6 @@ impl LatentCoordDesignDerivative {
         self.basis.p_out()
     }
 
-    fn p_constrained(&self) -> usize {
-        self.basis.p_constrained()
-    }
-
-    fn p_after_pad(&self) -> usize {
-        self.basis.p_after_pad()
-    }
-
     fn row_axis(&self, flat_axis: usize) -> (usize, usize) {
         let d = self.latent.latent_dim();
         (flat_axis / d, flat_axis % d)
@@ -4395,7 +4400,7 @@ impl LatentCoordDesignDerivative {
                     Some(zf) => zf.dot(u),
                     None => u.to_owned(),
                 };
-                let p_constrained = self.p_constrained();
+                let p_constrained = self.basis.p_constrained();
                 let smooth_part = after_full.slice(s![..p_constrained]);
                 let raw_knot = match ident_transform {
                     Some(z) => z.dot(&smooth_part),
@@ -4554,13 +4559,26 @@ impl LatentCoordDesignDerivative {
         assert!(flat_axis < self.n_axes());
         assert_eq!(u.len(), self.p_out());
         let (row, axis) = self.row_axis(flat_axis);
-        let (u_knot, u_poly) = self.unproject(u);
-        let mut value = 0.0_f64;
-        for center in 0..self.centers.nrows() {
-            value += self.kernel_axis_scalar(row, center, axis)? * u_knot[center];
-        }
-        let poly = self.polynomial_axis_values(row, axis);
-        value += poly.dot(&u_poly);
+        let value = match &self.basis {
+            LatentCoordDesignDerivativeBasis::Radial { centers, .. } => {
+                let (u_knot, u_poly) = self.unproject(u);
+                let mut value = 0.0_f64;
+                for center in 0..centers.nrows() {
+                    value += self.kernel_axis_scalar(row, center, axis)? * u_knot[center];
+                }
+                let poly = self.polynomial_axis_values(row, axis);
+                value += poly.dot(&u_poly);
+                value
+            }
+            LatentCoordDesignDerivativeBasis::Jet { jet, .. } => {
+                let u_knot = self.unproject_jet(u);
+                let mut value = 0.0_f64;
+                for basis_col in 0..jet.shape()[1] {
+                    value += jet[[row, basis_col, axis]] * u_knot[basis_col];
+                }
+                value
+            }
+        };
         let mut out = Array1::<f64>::zeros(self.n_data());
         out[row] = value;
         Ok(out)
@@ -4575,25 +4593,49 @@ impl LatentCoordDesignDerivative {
         assert_eq!(v.len(), self.n_data());
         let (row, axis) = self.row_axis(flat_axis);
         let scale = v[row];
-        let mut raw_knot = Array1::<f64>::zeros(self.centers.nrows());
-        if scale != 0.0 {
-            for center in 0..self.centers.nrows() {
-                raw_knot[center] = scale * self.kernel_axis_scalar(row, center, axis)?;
+        match &self.basis {
+            LatentCoordDesignDerivativeBasis::Radial { centers, .. } => {
+                let mut raw_knot = Array1::<f64>::zeros(centers.nrows());
+                if scale != 0.0 {
+                    for center in 0..centers.nrows() {
+                        raw_knot[center] = scale * self.kernel_axis_scalar(row, center, axis)?;
+                    }
+                }
+                let raw_poly = self.polynomial_axis_values(row, axis).mapv(|value| scale * value);
+                Ok(self.project_and_pad(&raw_knot, &raw_poly))
+            }
+            LatentCoordDesignDerivativeBasis::Jet { jet, .. } => {
+                let mut raw_knot = Array1::<f64>::zeros(jet.shape()[1]);
+                if scale != 0.0 {
+                    for basis_col in 0..jet.shape()[1] {
+                        raw_knot[basis_col] = scale * jet[[row, basis_col, axis]];
+                    }
+                }
+                Ok(self.project_jet(&raw_knot))
             }
         }
-        let raw_poly = self.polynomial_axis_values(row, axis).mapv(|value| scale * value);
-        Ok(self.project_and_pad(&raw_knot, &raw_poly))
     }
 
     pub(crate) fn materialize_axis(&self, flat_axis: usize) -> Result<Array2<f64>, BasisError> {
         assert!(flat_axis < self.n_axes());
         let (row, axis) = self.row_axis(flat_axis);
-        let mut raw_knot = Array1::<f64>::zeros(self.centers.nrows());
-        for center in 0..self.centers.nrows() {
-            raw_knot[center] = self.kernel_axis_scalar(row, center, axis)?;
-        }
-        let raw_poly = self.polynomial_axis_values(row, axis);
-        let projected = self.project_and_pad(&raw_knot, &raw_poly);
+        let projected = match &self.basis {
+            LatentCoordDesignDerivativeBasis::Radial { centers, .. } => {
+                let mut raw_knot = Array1::<f64>::zeros(centers.nrows());
+                for center in 0..centers.nrows() {
+                    raw_knot[center] = self.kernel_axis_scalar(row, center, axis)?;
+                }
+                let raw_poly = self.polynomial_axis_values(row, axis);
+                self.project_and_pad(&raw_knot, &raw_poly)
+            }
+            LatentCoordDesignDerivativeBasis::Jet { jet, .. } => {
+                let mut raw_knot = Array1::<f64>::zeros(jet.shape()[1]);
+                for basis_col in 0..jet.shape()[1] {
+                    raw_knot[basis_col] = jet[[row, basis_col, axis]];
+                }
+                self.project_jet(&raw_knot)
+            }
+        };
         let mut out = Array2::<f64>::zeros((self.n_data(), projected.len()));
         out.row_mut(row).assign(&projected);
         Ok(out)
@@ -19916,6 +19958,8 @@ pub fn matern_radial_first_derivative_nd(
 ///
 /// `x` should lie in `[−1, 1]`; values outside are clamped.
 fn wahba_sphere_kernel_sobolev_derivative_dcos(x: f64, m: usize) -> f64 {
+    const POLE_LIMIT_THRESHOLD: f64 = 1.0e-10;
+
     let l_max = match m {
         1 => 4096_usize,
         2 => 256,
@@ -19925,6 +19969,22 @@ fn wahba_sphere_kernel_sobolev_derivative_dcos(x: f64, m: usize) -> f64 {
     let x = x.clamp(-1.0, 1.0);
     let m_i = m as i32;
     let four_pi = 4.0 * std::f64::consts::PI;
+    if x.abs() > 1.0 - POLE_LIMIT_THRESHOLD {
+        // Within 1e-10 of the poles, the recurrence identity divides by
+        // 1-x^2 and loses the exact endpoint limit. Use
+        // P_l'(±1) = l(l+1)/2 * (±1)^(l+1) directly.
+        let pole = if x.is_sign_negative() { -1.0_f64 } else { 1.0_f64 };
+        let mut sum = 0.0_f64;
+        for l in 1..=l_max {
+            let ell = l as f64;
+            let sign = if pole < 0.0 && l % 2 == 0 { -1.0 } else { 1.0 };
+            let p_l_prime = 0.5 * ell * (ell + 1.0) * sign;
+            let eigen = (ell * (ell + 1.0)).powi(m_i);
+            let weight = (2.0 * ell + 1.0) / four_pi;
+            sum += weight * p_l_prime / eigen;
+        }
+        return sum;
+    }
     // P_l recurrence: P_0 = 1, P_1 = x, P_{l+1} = ((2l+1) x P_l − l P_{l−1}) / (l+1).
     // P_l'(x) recovered from (1−x²) P_l' = l (P_{l−1} − x P_l), with l ≥ 1.
     let one_minus_x2 = (1.0 - x * x).max(f64::EPSILON);
@@ -19963,18 +20023,20 @@ fn wahba_sphere_kernel_sobolev_derivative_dcos(x: f64, m: usize) -> f64 {
 /// ```
 ///
 /// where `K'` is `dK/d(cos γ)` from
-/// [`wahba_sphere_kernel_sobolev_derivative_dcos`]. The result is the
-/// *ambient* gradient; if the caller wants the gradient *intrinsic to the
-/// tangent plane at* `t_n`, they should project out the radial component
-/// via `g − (g · t_n) t_n`. This helper returns the un-projected ambient
-/// jet so the caller can pick its parameterisation (Stiefel update,
-/// extrinsic Riemannian step, exponential map, ...).
+/// [`wahba_sphere_kernel_sobolev_derivative_dcos`].
+///
+/// When `project_to_tangent` is `true`, each per-row gradient is projected
+/// through [`crate::terms::latent_coord::LatentManifold::Sphere`] onto
+/// `T_{t_n} S^{dim-1}` as `g − (g · t_n) t_n`, which is the correct
+/// Riemannian input-location derivative for embedded-sphere latent updates.
+/// Passing `false` returns the un-projected ambient jet.
 ///
 /// Returned tensor shape: `(n_rows, n_centers, dim)`.
 pub fn sphere_first_derivative_nd(
     points: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     penalty_order: usize,
+    project_to_tangent: bool,
 ) -> Result<Array3<f64>, BasisError> {
     let n_rows = points.nrows();
     let n_centers = centers.nrows();
@@ -19996,7 +20058,10 @@ pub fn sphere_first_derivative_nd(
             centers.ncols()
         )));
     }
+    let tangent_projector = project_to_tangent
+        .then_some(crate::terms::latent_coord::LatentManifold::Sphere { dim });
     let mut out = Array3::<f64>::zeros((n_rows, n_centers, dim));
+    let mut ambient = Array1::<f64>::zeros(dim);
     for n in 0..n_rows {
         for k in 0..n_centers {
             let mut cos_g = 0.0_f64;
@@ -20005,7 +20070,17 @@ pub fn sphere_first_derivative_nd(
             }
             let dk = wahba_sphere_kernel_sobolev_derivative_dcos(cos_g, penalty_order);
             for a in 0..dim {
-                out[[n, k, a]] = dk * centers[[k, a]];
+                ambient[a] = dk * centers[[k, a]];
+            }
+            if let Some(manifold) = &tangent_projector {
+                let tangent = manifold.project_to_tangent(points.row(n), ambient.view());
+                for a in 0..dim {
+                    out[[n, k, a]] = tangent[a];
+                }
+            } else {
+                for a in 0..dim {
+                    out[[n, k, a]] = ambient[a];
+                }
             }
         }
     }
