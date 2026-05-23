@@ -6112,3 +6112,1109 @@ src/solver/reml/unified.rs:22123:                include_logdet_s: true,
 src/solver/reml/unified.rs:22258:                include_logdet_h: true,
 src/solver/reml/unified.rs:22259:                include_logdet_s: true,
 
+exec
+/bin/zsh -lc "sed -n '430,520p' src/terms/latent_coord.rs" in /Users/user/gam
+ succeeded in 0ms:
+                let mut offset = 0_usize;
+                for part in parts {
+                    let dim = part.ambient_dim(1);
+                    let mut block = matrix
+                        .slice_mut(ndarray::s![offset..offset + dim, offset..offset + dim]);
+                    let mut owned = block.to_owned();
+                    part.add_normal_pinning(
+                        t.slice(ndarray::s![offset..offset + dim]),
+                        &mut owned,
+                    );
+                    block.assign(&owned);
+                    offset += dim;
+                }
+            }
+            Self::Euclidean | Self::Circle | Self::Interval { .. } => {}
+        }
+    }
+}
+
+impl LatentIdMode {
+    /// Fixes the audit finding that ARD/DimSelection alone is rotation
+    /// symmetric and therefore not a standalone identifiability mode.
+    pub fn is_identifiable(&self) -> bool {
+        matches!(
+            self,
+            Self::AuxPrior { .. } | Self::AuxPriorDimSelection { .. }
+        )
+    }
+
+    fn reject_dim_selection_alone(&self) {
+        if matches!(self, Self::DimSelection { .. }) {
+            panic!(
+                "LatentIdMode::DimSelection is not a standalone gauge fix; pair ARD with AuxPrior or Isometry"
+            );
+        }
+    }
+}
+
+/// Carrier for the `∂Φ/∂t` chain-rule input, dispatched on basis kind by
+/// [`LatentCoordValues::design_gradient_wrt_t_dispatch`].
+///
+/// * [`InputLocationDerivative::Radial`] is the *radial-kernel* path: the
+///   caller supplies the scalar `φ'(r_{n,k})` matrix together with the
+///   center coordinates, and the chain rule
+///   `∂Φ/∂t = φ'(r) · (t − c) / r` is applied internally. This covers every
+///   isotropic radial basis — Duchon (any nullspace order), Matérn (every
+///   supported half-integer ν), and anything else whose pointwise
+///   gradient is radial. Helpers:
+///   [`crate::terms::basis::duchon_radial_first_derivative_nd`],
+///   [`crate::terms::basis::matern_radial_first_derivative_nd`].
+/// * [`InputLocationDerivative::Jet`] is the *pre-computed jet* path: the
+///   caller has already assembled a closed-form `(N, K, d)` tensor for a
+///   basis whose chain rule is not a simple radial scalar times a unit
+///   vector. Sphere kernels carry the tangent-direction times `K'(cos γ)`;
+///   periodic-cyclic B-splines carry the closed-form cardinal derivative;
+///   tensor-product B-splines carry the product-rule mix. Helpers:
+///   [`crate::terms::basis::sphere_first_derivative_nd`],
+///   [`crate::terms::basis::periodic_bspline_first_derivative_nd`],
+///   [`crate::terms::basis::bspline_tensor_first_derivative`].
+///
+/// The dispatch is an enum rather than a trait because each path's
+/// arguments differ structurally (radial bases reuse `φ'(r)` shared with
+/// the ψ-chain machinery; jet bases ship the full tensor). All chain rules
+/// are analytic and closed-form; no autodiff, no finite differences.
+pub enum InputLocationDerivative<'a> {
+    /// Radial-kernel chain rule. The chain rule `(t − c)/r` is reconstructed
+    /// internally from the scalar `φ'(r_{n,k})` matrix and the center
+    /// coordinates.
+    Radial {
+        kernel_first_derivative: ArrayView2<'a, f64>,
+        centers: ArrayView2<'a, f64>,
+    },
+    /// Pre-computed analytic `(n_obs, n_centers, latent_dim)` jet.
+    Jet(ArrayView3<'a, f64>),
+}
+
+/// Per-row latent coordinates `t ∈ ℝ^{N × d}` stored as a flat
+/// row-major `Array1<f64>` of length `n_obs * latent_dim`.
+///
+/// The flat-`Array1` layout mirrors [`crate::terms::smooth::SpatialLogKappaCoords`]
+/// so the same `HyperDesignDerivative::from_implicit` / `DirectionalHyperParam`
+/// outer plumbing can consume it without modification.
+#[derive(Debug, Clone)]
+pub struct LatentCoordValues {
+    /// Flattened (n_obs, latent_dim) latent matrix, row-major
+    /// (so `values[n * d + k] = t_n[k]`).
+    values: Array1<f64>,
+    /// Number of rows `N`.
+    n_obs: usize,
+    /// Number of latent dimensions `d`.
+    latent_dim: usize,
+
+exec
+/bin/zsh -lc "nl -ba src/solver/arrow_schur.rs | sed -n '980,1065p'" in /Users/user/gam
+ succeeded in 0ms:
+   980	            }
+   981	        }
+   982	    }
+   983	    out
+   984	}
+   985	
+   986	fn reduced_rhs_beta<B: BatchedBlockSolver>(
+   987	    sys: &ArrowSchurSystem,
+   988	    htt_factors: &[Array2<f64>],
+   989	    backend: &B,
+   990	) -> Array1<f64> {
+   991	    let k = sys.k;
+   992	    let mut rhs_beta = Array1::<f64>::zeros(k);
+   993	    for (i, row) in sys.rows.iter().enumerate() {
+   994	        let v = backend.solve_block_vector(&htt_factors[i], &row.gt);
+   995	        for a in 0..k {
+   996	            let mut acc = 0.0;
+   997	            for c in 0..sys.d {
+   998	                acc += row.htbeta[[c, a]] * v[c];
+   999	            }
+  1000	            rhs_beta[a] += acc;
+  1001	        }
+  1002	    }
+  1003	    for j in 0..k {
+  1004	        rhs_beta[j] -= sys.gb[j];
+  1005	    }
+  1006	    rhs_beta
+  1007	}
+  1008	
+  1009	fn build_dense_schur_direct<B: BatchedBlockSolver>(
+  1010	    sys: &ArrowSchurSystem,
+  1011	    htt_factors: &[Array2<f64>],
+  1012	    ridge_beta: f64,
+  1013	    backend: &B,
+  1014	) -> Result<Array2<f64>, ArrowSchurError> {
+  1015	    let k = sys.k;
+  1016	    if sys.hbb.dim() != (k, k) {
+  1017	        return Err(ArrowSchurError::SchurFactorFailed {
+  1018	            reason: "Direct BA requires a dense K×K shared H_ββ block".to_string(),
+  1019	        });
+  1020	    }
+  1021	    let mut schur = sys.hbb.clone();
+  1022	    for j in 0..k {
+  1023	        schur[[j, j]] += ridge_beta;
+  1024	    }
+  1025	    for (i, row) in sys.rows.iter().enumerate() {
+  1026	        let solved = backend.solve_block_matrix(&htt_factors[i], &row.htbeta);
+  1027	        backend.block_gemm_subtract(&mut schur, &row.htbeta, &solved);
+  1028	    }
+  1029	    symmetrize_upper_from_lower(&mut schur);
+  1030	    Ok(schur)
+  1031	}
+  1032	
+  1033	fn build_dense_schur_sqrt_ba<B: BatchedBlockSolver>(
+  1034	    sys: &ArrowSchurSystem,
+  1035	    htt_factors: &[Array2<f64>],
+  1036	    ridge_beta: f64,
+  1037	    backend: &B,
+  1038	) -> Result<Array2<f64>, ArrowSchurError> {
+  1039	    let k = sys.k;
+  1040	    if sys.hbb.dim() != (k, k) {
+  1041	        return Err(ArrowSchurError::SchurFactorFailed {
+  1042	            reason: "Square-Root BA direct solve requires a dense K×K shared H_ββ block"
+  1043	                .to_string(),
+  1044	        });
+  1045	    }
+  1046	    let mut schur = sys.hbb.clone();
+  1047	    for j in 0..k {
+  1048	        schur[[j, j]] += ridge_beta;
+  1049	    }
+  1050	    for (i, row) in sys.rows.iter().enumerate() {
+  1051	        // Square-Root BA: H_tβ^T H_tt^-1 H_tβ =
+  1052	        // (L^-1 H_tβ)^T (L^-1 H_tβ), where H_tt = L L^T.
+  1053	        let whitened = backend.sqrt_solve_block_matrix(&htt_factors[i], &row.htbeta);
+  1054	        backend.block_gemm_subtract(&mut schur, &whitened, &whitened);
+  1055	    }
+  1056	    symmetrize_upper_from_lower(&mut schur);
+  1057	    Ok(schur)
+  1058	}
+  1059	
+  1060	fn solve_dense_reduced_system(
+  1061	    schur: &Array2<f64>,
+  1062	    rhs_beta: &Array1<f64>,
+  1063	    options: &ArrowSolveOptions,
+  1064	) -> Result<(Array1<f64>, Option<Array2<f64>>), ArrowSchurError> {
+  1065	    let factor =
+
+exec
+/bin/zsh -lc "nl -ba src/solver/arrow_schur.rs | sed -n '1088,1194p'" in /Users/user/gam
+ succeeded in 0ms:
+  1088	        &options.trust_region,
+  1089	    )?;
+  1090	    Ok((delta, Some(factor)))
+  1091	}
+  1092	
+  1093	fn step_inside_trust_region(
+  1094	    step: ArrayView1<'_, f64>,
+  1095	    radius: f64,
+  1096	    _riemannian_metric: bool,
+  1097	) -> bool {
+  1098	    // The current Riemannian manifolds use the ambient Euclidean pullback
+  1099	    // metric. Once row blocks have been tangent-projected, the trust-region
+  1100	    // norm is therefore the same L2 norm used by the Euclidean BA path.
+  1101	    !radius.is_finite() || array_l2_norm(step) <= radius
+  1102	}
+  1103	
+  1104	fn schur_matvec<B: BatchedBlockSolver>(
+  1105	    sys: &ArrowSchurSystem,
+  1106	    htt_factors: &[Array2<f64>],
+  1107	    ridge_beta: f64,
+  1108	    x: &Array1<f64>,
+  1109	    out: &mut Array1<f64>,
+  1110	    backend: &B,
+  1111	) {
+  1112	    let k = sys.k;
+  1113	    let d = sys.d;
+  1114	    if let Some(hbb_matvec) = sys.hbb_matvec.as_ref() {
+  1115	        hbb_matvec(x.view(), out);
+  1116	        for a in 0..k {
+  1117	            out[a] += ridge_beta * x[a];
+  1118	        }
+  1119	    } else {
+  1120	        for a in 0..k {
+  1121	            let mut acc = ridge_beta * x[a];
+  1122	            for b in 0..k {
+  1123	                acc += sys.hbb[[a, b]] * x[b];
+  1124	            }
+  1125	            out[a] = acc;
+  1126	        }
+  1127	    }
+  1128	    let mut local = Array1::<f64>::zeros(d);
+  1129	    for (i, row) in sys.rows.iter().enumerate() {
+  1130	        for c in 0..d {
+  1131	            let mut acc = 0.0;
+  1132	            for a in 0..k {
+  1133	                acc += row.htbeta[[c, a]] * x[a];
+  1134	            }
+  1135	            local[c] = acc;
+  1136	        }
+  1137	        let solved = backend.solve_block_vector(&htt_factors[i], &local);
+  1138	        for a in 0..k {
+  1139	            let mut acc = 0.0;
+  1140	            for c in 0..d {
+  1141	                acc += row.htbeta[[c, a]] * solved[c];
+  1142	            }
+  1143	            out[a] -= acc;
+  1144	        }
+  1145	    }
+  1146	}
+  1147	
+  1148	/// Jacobi Schur preconditioner for BA's inexact reduced-system PCG.
+  1149	///
+  1150	/// This is the block-diagonal Schur preconditioner specialized to scalar
+  1151	/// decoder coefficients. When coefficient blocking metadata lands, this type
+  1152	/// is the replacement point for Ceres-style block-Jacobi or cluster-Jacobi.
+  1153	#[derive(Debug, Clone)]
+  1154	pub struct JacobiPreconditioner {
+  1155	    inverse_diag: Array1<f64>,
+  1156	}
+  1157	
+  1158	impl JacobiPreconditioner {
+  1159	    /// Build `diag(S)^-1` without materializing the dense Schur complement,
+  1160	    /// following the Schur-Jacobi preconditioner used by large BA PCG.
+  1161	    pub fn from_arrow_schur<B: BatchedBlockSolver>(
+  1162	        sys: &ArrowSchurSystem,
+  1163	        htt_factors: &[Array2<f64>],
+  1164	        ridge_beta: f64,
+  1165	        backend: &B,
+  1166	    ) -> Self {
+  1167	        let k = sys.k;
+  1168	        let d = sys.d;
+  1169	        let mut diag = Array1::<f64>::zeros(k);
+  1170	        for a in 0..k {
+  1171	            let base = match sys.hbb_diag.as_ref() {
+  1172	                Some(hbb_diag) => hbb_diag[a],
+  1173	                None => sys.hbb[[a, a]],
+  1174	            };
+  1175	            diag[a] = base + ridge_beta;
+  1176	        }
+  1177	        let mut col = Array1::<f64>::zeros(d);
+  1178	        for (i, row) in sys.rows.iter().enumerate() {
+  1179	            for a in 0..k {
+  1180	                for c in 0..d {
+  1181	                    col[c] = row.htbeta[[c, a]];
+  1182	                }
+  1183	                let solved = backend.solve_block_vector(&htt_factors[i], &col);
+  1184	                let mut acc = 0.0;
+  1185	                for c in 0..d {
+  1186	                    acc += col[c] * solved[c];
+  1187	                }
+  1188	                diag[a] -= acc;
+  1189	            }
+  1190	        }
+  1191	        let mut inverse_diag = Array1::<f64>::zeros(k);
+  1192	        for a in 0..k {
+  1193	            let v = diag[a];
+  1194	            inverse_diag[a] = if v.is_finite() && v.abs() > 1e-18 {
+
+exec
+/bin/zsh -lc "nl -ba src/solver/riemannian.rs | sed -n '180,285p'" in /Users/user/gam
+ succeeded in 0ms:
+   180	        v[0] -= dot * p[0];
+   181	        v[1] -= dot * p[1];
+   182	    }
+   183	    fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
+   184	        // Standard projective retraction R_p(ξ) = (p + ξ)/||p + ξ||
+   185	        let x = p[0] + xi[0];
+   186	        let y = p[1] + xi[1];
+   187	        let norm = (x * x + y * y).sqrt().max(1.0e-300);
+   188	        out[0] = x / norm;
+   189	        out[1] = y / norm;
+   190	    }
+   191	    fn vector_transport(
+   192	        &self,
+   193	        _from: ArrayView1<f64>,
+   194	        to: ArrayView1<f64>,
+   195	        xi: ArrayViewMut1<f64>,
+   196	    ) {
+   197	        // Projection approximation: re-project ξ onto T_{to} M.
+   198	        self.project_tangent(to, xi);
+   199	    }
+   200	    fn euclidean_to_riemannian_hess_vp(
+   201	        &self,
+   202	        p: ArrayView1<f64>,
+   203	        egrad: ArrayView1<f64>,
+   204	        mut ehess_vp: ArrayViewMut1<f64>,
+   205	        xi: ArrayView1<f64>,
+   206	    ) {
+   207	        // S¹ is a 1-d submanifold of ℝ²; Weingarten map W_p(ξ, v) is the
+   208	        // tangential part of -D_ξ(N(p)·v) N(p) — analogous to the sphere
+   209	        // case (Circle = S¹). For a unit-sphere submanifold of codim 1:
+   210	        //   Hess_R[ξ] = P_T( Hess_E[ξ] - <egrad, p> ξ )
+   211	        let radial_egrad = egrad[0] * p[0] + egrad[1] * p[1];
+   212	        for i in 0..2 {
+   213	            ehess_vp[i] -= radial_egrad * xi[i];
+   214	        }
+   215	        self.project_tangent(p, ehess_vp);
+   216	    }
+   217	    fn name(&self) -> &str {
+   218	        "Circle"
+   219	    }
+   220	}
+   221	
+   222	/// The unit n-sphere S^n embedded in ℝ^{n+1} as a unit vector.
+   223	#[derive(Debug, Clone)]
+   224	pub struct Sphere {
+   225	    /// Intrinsic dimension; ambient = n + 1.
+   226	    pub n: usize,
+   227	}
+   228	
+   229	impl Manifold for Sphere {
+   230	    fn dim(&self) -> usize {
+   231	        self.n
+   232	    }
+   233	    fn ambient_dim(&self) -> usize {
+   234	        self.n + 1
+   235	    }
+   236	    fn project_tangent(&self, p: ArrayView1<f64>, mut v: ArrayViewMut1<f64>) {
+   237	        debug_assert_eq!(p.len(), self.n + 1);
+   238	        debug_assert_eq!(v.len(), self.n + 1);
+   239	        let mut dot = 0.0_f64;
+   240	        for i in 0..p.len() {
+   241	            dot += v[i] * p[i];
+   242	        }
+   243	        for i in 0..p.len() {
+   244	            v[i] -= dot * p[i];
+   245	        }
+   246	    }
+   247	    fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
+   248	        let m = self.n + 1;
+   249	        let mut s2 = 0.0_f64;
+   250	        for i in 0..m {
+   251	            let v = p[i] + xi[i];
+   252	            out[i] = v;
+   253	            s2 += v * v;
+   254	        }
+   255	        let norm = s2.sqrt().max(1.0e-300);
+   256	        for i in 0..m {
+   257	            out[i] /= norm;
+   258	        }
+   259	    }
+   260	    fn vector_transport(
+   261	        &self,
+   262	        _from: ArrayView1<f64>,
+   263	        to: ArrayView1<f64>,
+   264	        xi: ArrayViewMut1<f64>,
+   265	    ) {
+   266	        self.project_tangent(to, xi);
+   267	    }
+   268	    fn euclidean_to_riemannian_hess_vp(
+   269	        &self,
+   270	        p: ArrayView1<f64>,
+   271	        egrad: ArrayView1<f64>,
+   272	        mut ehess_vp: ArrayViewMut1<f64>,
+   273	        xi: ArrayView1<f64>,
+   274	    ) {
+   275	        // Weingarten for unit sphere: W_p(ξ, ν) = <p, ν> ξ where ν is the
+   276	        // ambient (Euclidean) gradient. Hess_R[ξ] = P_T(Hess_E[ξ] - W_p(ξ, ν)).
+   277	        let mut radial_egrad = 0.0_f64;
+   278	        for i in 0..p.len() {
+   279	            radial_egrad += egrad[i] * p[i];
+   280	        }
+   281	        for i in 0..ehess_vp.len() {
+   282	            ehess_vp[i] -= radial_egrad * xi[i];
+   283	        }
+   284	        self.project_tangent(p, ehess_vp);
+   285	    }
+
+codex
+I found one issue in the IFT predictor path: the cached per-row factors are the LM-damped factors, but the implicit derivative formula requires the undamped inner Hessian at the optimum. I’m checking whether this is the only definitive scoped issue or whether the Riemannian helper has another similarly concrete one.
+exec
+/bin/zsh -lc "nl -ba src/solver/arrow_schur.rs | sed -n '714,810p'" in /Users/user/gam
+ succeeded in 0ms:
+   714	    }
+   715	}
+   716	
+   717	/// Per-row + Schur Cholesky factor cache produced by
+   718	/// [`solve_arrow_newton_step`]. Consumed downstream by the IFT warm-start
+   719	/// predictor in `crate::solver::persistent_warm_start`: when the outer
+   720	/// loop perturbs `(β, ρ)` by a small amount, the new Newton step can be
+   721	/// predicted by re-using these factors against a refreshed RHS, saving
+   722	/// the dominant `O(N d³ + K³)` factorization cost.
+   723	#[derive(Debug, Clone)]
+   724	pub struct ArrowFactorCache {
+   725	    /// Per-row lower-triangular Cholesky factors of `H_tt^(i) + ridge_t·I`.
+   726	    pub htt_factors: Vec<Array2<f64>>,
+   727	    /// Lower-triangular Cholesky factor of the Schur complement when the
+   728	    /// selected BA mode formed/factored dense RCS. `None` for
+   729	    /// [`ArrowSolverMode::InexactPCG`], where Agarwal-style inexact LM avoids
+   730	    /// the dense `K × K` factor.
+   731	    pub schur_factor: Option<Array2<f64>>,
+   732	    /// BA mode used to create this cache.
+   733	    pub solver_mode: ArrowSolverMode,
+   734	    /// Ridge values used to build the cached factors (recorded so the
+   735	    /// warm-start predictor knows whether the cache is still valid for a
+   736	    /// requested ridge level).
+   737	    pub ridge_t: f64,
+   738	    pub ridge_beta: f64,
+   739	    /// Per-row cross-blocks `H_tβ^(i)` carried so the IFT warm-start
+   740	    /// predictor (see `crate::solver::persistent_warm_start::ift_warm_start_latent`)
+   741	    /// can rebuild the `β`-coupled RHS without revisiting the assembly
+   742	    /// path. Length `N`, each entry shape `(d, K)`.
+   743	    pub htbeta: Vec<Array2<f64>>,
+   744	    /// Latent dimensionality `d`.
+   745	    pub d: usize,
+   746	    /// β dimensionality `K`.
+   747	    pub k: usize,
+   748	}
+   749	
+   750	impl ArrowFactorCache {
+   751	    /// Apply `Δt_i = -(H_tt^(i))⁻¹ · (H_tβ^(i) · Δβ)` per row, returning
+   752	    /// the flat row-major `Δt` of length `N · d`.
+   753	    ///
+   754	    /// IFT first-order predictor for the latent field under a
+   755	    /// shape-coefficient perturbation `Δβ`. See
+   756	    /// `proposals/latent_coord.md` §2.2. BA analogue: back-substitution after
+   757	    /// reduced-camera-system solve.
+   758	    pub fn predict_delta_t_from_delta_beta(&self, delta_beta: ArrayView1<'_, f64>) -> Array1<f64> {
+   759	        let n = self.htt_factors.len();
+   760	        let d = self.d;
+   761	        let k = self.k;
+   762	        debug_assert_eq!(delta_beta.len(), k);
+   763	        let mut out = Array1::<f64>::zeros(n * d);
+   764	        let mut rhs = Array1::<f64>::zeros(d);
+   765	        for i in 0..n {
+   766	            for c in 0..d {
+   767	                let mut acc = 0.0_f64;
+   768	                for a in 0..k {
+   769	                    acc += self.htbeta[i][[c, a]] * delta_beta[a];
+   770	                }
+   771	                rhs[c] = acc;
+   772	            }
+   773	            let v = chol_solve_vector(&self.htt_factors[i], &rhs);
+   774	            for c in 0..d {
+   775	                out[i * d + c] = -v[c];
+   776	            }
+   777	        }
+   778	        out
+   779	    }
+   780	
+   781	    /// Apply `Δt_i = -(H_tt^(i))⁻¹ · δg_t^(i)` per row.
+   782	    ///
+   783	    /// IFT first-order predictor for the latent field under a
+   784	    /// per-row gradient perturbation (typically `∂g_t/∂ρ · Δρ`
+   785	    /// resolved externally by the driver). BA analogue: reuse point-block
+   786	    /// factors for local point updates after shared parameters move.
+   787	    pub fn predict_delta_t_from_delta_gt(&self, delta_gt: ArrayView1<'_, f64>) -> Array1<f64> {
+   788	        let n = self.htt_factors.len();
+   789	        let d = self.d;
+   790	        debug_assert_eq!(delta_gt.len(), n * d);
+   791	        let mut out = Array1::<f64>::zeros(n * d);
+   792	        let mut rhs = Array1::<f64>::zeros(d);
+   793	        for i in 0..n {
+   794	            for c in 0..d {
+   795	                rhs[c] = delta_gt[i * d + c];
+   796	            }
+   797	            let v = chol_solve_vector(&self.htt_factors[i], &rhs);
+   798	            for c in 0..d {
+   799	                out[i * d + c] = -v[c];
+   800	            }
+   801	        }
+   802	        out
+   803	    }
+   804	}
+   805	
+   806	/// Schur-eliminate the per-row latent block and solve for `(Δt, Δβ)`,
+   807	/// returning the factor cache alongside the increments.
+   808	///
+   809	/// This is the canonical entry point — both [`ArrowSchurSystem::solve`]
+   810	/// (which discards the cache) and the joint Newton driver in
+
+exec
+/bin/zsh -lc "nl -ba src/solver/arrow_schur.rs | sed -n '840,908p'" in /Users/user/gam
+ succeeded in 0ms:
+   840	    let d = sys.d;
+   841	    let k = sys.k;
+   842	    let backend = CpuBatchedBlockSolver;
+   843	
+   844	    // 1. BA point elimination: per-row Cholesky factors of
+   845	    // (H_tt^(i) + ridge_t · I).
+   846	    let htt_factors = backend.factor_blocks(&sys.rows, ridge_t, d)?;
+   847	
+   848	    // 2. Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
+   849	    let rhs_beta = reduced_rhs_beta(sys, &htt_factors, &backend);
+   850	
+   851	    // 3. Solve reduced shared system using the selected BA mode.
+   852	    let (delta_beta, schur_factor) = match options.mode {
+   853	        ArrowSolverMode::Direct => {
+   854	            let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, &backend)?;
+   855	            solve_dense_reduced_system(&schur, &rhs_beta, options)?
+   856	        }
+   857	        ArrowSolverMode::SqrtBA => {
+   858	            let schur = build_dense_schur_sqrt_ba(sys, &htt_factors, ridge_beta, &backend)?;
+   859	            solve_dense_reduced_system(&schur, &rhs_beta, options)?
+   860	        }
+   861	        ArrowSolverMode::InexactPCG => {
+   862	            let preconditioner =
+   863	                JacobiPreconditioner::from_arrow_schur(sys, &htt_factors, ridge_beta, &backend);
+   864	            let delta = steihaug_pcg_reduced_system(
+   865	                sys,
+   866	                &htt_factors,
+   867	                ridge_beta,
+   868	                &rhs_beta,
+   869	                &preconditioner,
+   870	                &options.pcg,
+   871	                &options.trust_region,
+   872	                &backend,
+   873	            )?;
+   874	            (delta, None)
+   875	        }
+   876	    };
+   877	
+   878	    // 4. Back-substitute Δt_i = -(H_tt^(i))⁻¹ (g_t^(i) + H_tβ^(i) Δβ).
+   879	    let mut delta_t = Array1::<f64>::zeros(n * d);
+   880	    for i in 0..n {
+   881	        let mut tmp = sys.rows[i].gt.clone();
+   882	        for c in 0..d {
+   883	            let mut acc = 0.0;
+   884	            for a in 0..k {
+   885	                acc += sys.rows[i].htbeta[[c, a]] * delta_beta[a];
+   886	            }
+   887	            tmp[c] += acc;
+   888	        }
+   889	        let dt_i = backend.solve_block_vector(&htt_factors[i], &tmp);
+   890	        for c in 0..d {
+   891	            delta_t[i * d + c] = -dt_i[c];
+   892	        }
+   893	    }
+   894	
+   895	    // Snapshot per-row cross-blocks so the IFT predictor can apply
+   896	    // the β-coupled sensitivity without re-running the assembler.
+   897	    let htbeta: Vec<Array2<f64>> = sys.rows.iter().map(|r| r.htbeta.clone()).collect();
+   898	    let cache = ArrowFactorCache {
+   899	        htt_factors,
+   900	        schur_factor,
+   901	        solver_mode: options.mode,
+   902	        ridge_t,
+   903	        ridge_beta,
+   904	        htbeta,
+   905	        d,
+   906	        k,
+   907	    };
+   908	    Ok((delta_t, delta_beta, cache))
+
+exec
+/bin/zsh -lc "nl -ba src/solver/latent_inner.rs | sed -n '184,232p'" in /Users/user/gam
+ succeeded in 0ms:
+   184	
+   185	            // Convergence test: relative joint gradient norm.
+   186	            let g_norm_sq = system_gradient_norm_sq(&system);
+   187	            let scale = 1.0 + iterate_norm(self.beta.view(), self.latent.as_flat().view());
+   188	            let rel = (g_norm_sq.sqrt()) / scale;
+   189	            if rel < opts.convergence_tolerance {
+   190	                converged = true;
+   191	                // Build a final factor cache for the warm-start IFT
+   192	                // predictor even though we didn't take a step. Best-
+   193	                // effort — if the factorization fails (e.g. ill-
+   194	                // conditioned at the very converged point), skip the
+   195	                // cache; the predictor will then no-op.
+   196	                let solve_options =
+   197	                    latent_arrow_solve_options(&system, &opts, !self.latent.manifold().is_euclidean());
+   198	                if let Ok((_, _, cache)) = solve_arrow_newton_step_with_options(
+   199	                    &system,
+   200	                    ridge_t.max(1e-12),
+   201	                    ridge_beta.max(1e-12),
+   202	                    &solve_options,
+   203	                ) {
+   204	                    last_cache = Some(cache);
+   205	                }
+   206	                break;
+   207	            }
+   208	
+   209	            // Attempt the LM-damped arrow-Schur step. On failure (per-
+   210	            // row PD violation or Schur PD violation), grow the ridge
+   211	            // and retry without consuming an outer iteration.
+   212	            let solve_options =
+   213	                latent_arrow_solve_options(&system, &opts, !self.latent.manifold().is_euclidean());
+   214	            let step_result =
+   215	                solve_arrow_newton_step_with_options(&system, ridge_t, ridge_beta, &solve_options);
+   216	            match step_result {
+   217	                Ok((delta_t, delta_beta, cache)) => {
+   218	                    // Accept step and shrink ridges.
+   219	                    for (b, db) in self.beta.iter_mut().zip(delta_beta.iter()) {
+   220	                        *b += *db;
+   221	                    }
+   222	                    self.latent.retract_flat_delta(delta_t.view());
+   223	                    ridge_t = (ridge_t * opts.lm_shrink).max(0.0);
+   224	                    ridge_beta = (ridge_beta * opts.lm_shrink).max(0.0);
+   225	                    last_cache = Some(cache);
+   226	                    iter += 1;
+   227	                }
+   228	                Err(ArrowSchurError::PerRowFactorFailed { .. })
+   229	                | Err(ArrowSchurError::SchurFactorFailed { .. })
+   230	                | Err(ArrowSchurError::PcgFailed { .. }) => {
+   231	                    // Grow ridges; retry without burning an iteration.
+   232	                    ridge_t = if ridge_t == 0.0 {
+
+exec
+/bin/zsh -lc "nl -ba src/solver/persistent_warm_start.rs | sed -n '390,460p'" in /Users/user/gam
+exec
+/bin/zsh -lc "nl -ba src/solver/riemannian.rs | sed -n '608,676p'" in /Users/user/gam
+ succeeded in 0ms:
+   390	///
+   391	/// This is the row-local analogue of
+   392	/// `RemlState::predict_warm_start_beta_ift_with_outcome`: it consumes
+   393	/// the per-row factor cache produced by
+   394	/// [`crate::solver::arrow_schur::solve_arrow_newton_step`] at the last
+   395	/// accepted Newton step and applies the IFT first-order predictor
+   396	///
+   397	/// ```text
+   398	///   Δt_i  =  -(H_tt^(i))⁻¹ · (H_tβ^(i) Δβ + δg_t^(i))
+   399	/// ```
+   400	///
+   401	/// per row. Both sources can be omitted (`None`) — at least one must be
+   402	/// supplied for the predictor to do useful work.
+   403	///
+   404	/// The result is meant to be applied to the existing
+   405	/// [`crate::terms::latent_coord::LatentCoordValues`] block via
+   406	/// `retract_flat_delta(Δt)` before the next inner Newton
+   407	/// launch — so the inner solver starts at a configuration already
+   408	/// consistent with the new `(β, ρ)`, requiring far fewer iterations
+   409	/// than a cold restart.
+   410	///
+   411	/// # Integration with [`crate::solver::latent_inner::LatentInnerSolver`]
+   412	///
+   413	/// The intended pipeline is:
+   414	///
+   415	///   1. inner solve at `(β₀, ρ₀)` produces
+   416	///      [`crate::solver::latent_inner::LatentInnerOutcome::factor_cache`];
+   417	///   2. REML outer loop proposes `(β₁, ρ₁)`;
+   418	///   3. caller invokes `ift_warm_start_latent(cache, Some(β₁ − β₀), δg_t)`
+   419	///      to obtain `Δt`;
+   420	///   4. caller updates the latent field by `Δt` and launches the next
+   421	///      inner Newton — typically converging in 1–2 iterations.
+   422	pub fn ift_warm_start_latent(
+   423	    cache: &ArrowFactorCache,
+   424	    delta_beta: Option<ArrayView1<'_, f64>>,
+   425	    delta_gt: Option<ArrayView1<'_, f64>>,
+   426	) -> LatentIftOutcome {
+   427	    let n = cache.htt_factors.len();
+   428	    let d = cache.d;
+   429	    let k = cache.k;
+   430	
+   431	    if delta_beta.is_none() && delta_gt.is_none() {
+   432	        return LatentIftOutcome::Noop {
+   433	            reason: "no-perturbation: both delta_beta and delta_gt are None",
+   434	        };
+   435	    }
+   436	    if let Some(db) = delta_beta.as_ref() {
+   437	        if db.len() != k {
+   438	            return LatentIftOutcome::Noop {
+   439	                reason: "delta_beta length mismatch with cached K",
+   440	            };
+   441	        }
+   442	        if db.iter().any(|v| !v.is_finite()) {
+   443	            return LatentIftOutcome::Noop {
+   444	                reason: "delta_beta contains non-finite entries",
+   445	            };
+   446	        }
+   447	    }
+   448	    if let Some(dg) = delta_gt.as_ref() {
+   449	        if dg.len() != n * d {
+   450	            return LatentIftOutcome::Noop {
+   451	                reason: "delta_gt length mismatch with cached N·d",
+   452	            };
+   453	        }
+   454	        if dg.iter().any(|v| !v.is_finite()) {
+   455	            return LatentIftOutcome::Noop {
+   456	                reason: "delta_gt contains non-finite entries",
+   457	            };
+   458	        }
+   459	    }
+   460	
+
+ succeeded in 0ms:
+   608	    manifold.euclidean_to_riemannian_grad(point, grad_r.view_mut());
+   609	
+   610	    // Build Riemannian Hessian column-by-column by applying the
+   611	    // euclidean->Riemannian operator to each basis vector.
+   612	    let mut hess_r = Array2::<f64>::zeros((m, m));
+   613	    let mut basis = Array1::<f64>::zeros(m);
+   614	    for j in 0..m {
+   615	        // basis = e_j projected to tangent space.
+   616	        for i in 0..m {
+   617	            basis[i] = 0.0;
+   618	        }
+   619	        basis[j] = 1.0;
+   620	        manifold.project_tangent(point, basis.view_mut());
+   621	
+   622	        // ehess_vp = H_E · basis
+   623	        let mut ehess_vp = Array1::<f64>::zeros(m);
+   624	        for i in 0..m {
+   625	            let mut acc = 0.0_f64;
+   626	            for k in 0..m {
+   627	                acc += euclidean_hess[[i, k]] * basis[k];
+   628	            }
+   629	            ehess_vp[i] = acc;
+   630	        }
+   631	        manifold.euclidean_to_riemannian_hess_vp(
+   632	            point,
+   633	            euclidean_grad,
+   634	            ehess_vp.view_mut(),
+   635	            basis.view(),
+   636	        );
+   637	        for i in 0..m {
+   638	            hess_r[[i, j]] = ehess_vp[i];
+   639	        }
+   640	    }
+   641	    // Symmetrize for numerical hygiene.
+   642	    for i in 0..m {
+   643	        for j in (i + 1)..m {
+   644	            let s = 0.5 * (hess_r[[i, j]] + hess_r[[j, i]]);
+   645	            hess_r[[i, j]] = s;
+   646	            hess_r[[j, i]] = s;
+   647	        }
+   648	    }
+   649	    // Add tangent-projected ridge.
+   650	    if step.ridge > 0.0 {
+   651	        for i in 0..m {
+   652	            hess_r[[i, i]] += step.ridge;
+   653	        }
+   654	    }
+   655	
+   656	    // Solve H_R ξ = -grad_R via a small Tikhonov-damped normal-equation
+   657	    // fallback. We do a tiny LDLᵀ-style pivoted solve via a regularised
+   658	    // Gauss-Newton: ξ = -(H_R + λ I)⁻¹ grad_R with adaptive λ. For non-SPD
+   659	    // H_R we add ridge until it is PD.
+   660	    let mut xi = solve_symmetric_tikhonov(&hess_r, &grad_r);
+   661	
+   662	    // Re-project ξ to the tangent space (the solve is in ambient coords).
+   663	    manifold.project_tangent(point, xi.view_mut());
+   664	
+   665	    // Trust-region clip: ‖ξ‖_g ≤ Δ (use the induced metric).
+   666	    if let Some(delta) = step.trust_radius {
+   667	        let norm2 = manifold.inner_product(point, xi.view(), xi.view());
+   668	        let norm = norm2.max(0.0).sqrt();
+   669	        if norm > delta && norm > 0.0 {
+   670	            let scale = delta / norm;
+   671	            for i in 0..m {
+   672	                xi[i] *= scale;
+   673	            }
+   674	        }
+   675	    }
+   676	
+
+exec
+/bin/zsh -lc "nl -ba src/solver/persistent_warm_start.rs | sed -n '460,482p'" in /Users/user/gam
+ succeeded in 0ms:
+   460	
+   461	    // Sum the two contributions on the RHS, then per-row solve.
+   462	    let mut delta_t = Array1::<f64>::zeros(n * d);
+   463	    if let Some(db) = delta_beta {
+   464	        let part = cache.predict_delta_t_from_delta_beta(db);
+   465	        for i in 0..delta_t.len() {
+   466	            delta_t[i] += part[i];
+   467	        }
+   468	    }
+   469	    if let Some(dg) = delta_gt {
+   470	        let part = cache.predict_delta_t_from_delta_gt(dg);
+   471	        for i in 0..delta_t.len() {
+   472	            delta_t[i] += part[i];
+   473	        }
+   474	    }
+   475	    LatentIftOutcome::Applied { delta_t }
+   476	}
+   477	
+   478	// ---------------------------------------------------------------------------
+   479	// Riemannian retraction wrapper (additive)
+   480	// ---------------------------------------------------------------------------
+   481	
+   482	/// Apply an IFT-predicted Euclidean tangent `delta_t` through per-row
+
+exec
+/bin/zsh -lc "nl -ba src/solver/riemannian.rs | sed -n '690,724p'" in /Users/user/gam
+ succeeded in 0ms:
+   690	    // Estimate trace for an initial ridge.
+   691	    let mut trace = 0.0_f64;
+   692	    for i in 0..n {
+   693	        trace += h[[i, i]].abs();
+   694	    }
+   695	    let scale = (trace / (n.max(1) as f64)).max(1.0);
+   696	    let mut lambda = 0.0_f64;
+   697	    let mut bumps = 0usize;
+   698	    loop {
+   699	        let mut a = h.clone();
+   700	        for i in 0..n {
+   701	            a[[i, i]] += lambda;
+   702	        }
+   703	        if let Some(l) = cholesky_lower(&a) {
+   704	            let mut rhs = Array1::<f64>::zeros(n);
+   705	            for i in 0..n {
+   706	                rhs[i] = -g[i];
+   707	            }
+   708	            return chol_solve_inplace(&l, &rhs);
+   709	        }
+   710	        // Bump ridge by ~1e-8 of scale → 1e-6 → ... up to a cap.
+   711	        bumps += 1;
+   712	        lambda = (lambda * 10.0).max(1.0e-8 * scale);
+   713	        if bumps > 20 {
+   714	            // Hard fallback: tiny steepest descent.
+   715	            let mut out = Array1::<f64>::zeros(n);
+   716	            let mut gn = 0.0_f64;
+   717	            for i in 0..n {
+   718	                gn += g[i] * g[i];
+   719	            }
+   720	            let gn = gn.sqrt().max(1.0e-300);
+   721	            for i in 0..n {
+   722	                out[i] = -g[i] / gn;
+   723	            }
+   724	            return out;
+
+exec
+/bin/zsh -lc "nl -ba src/solver/arrow_schur.rs | sed -n '300,324p'" in /Users/user/gam
+ succeeded in 0ms:
+   300	/// It is intentionally plain Rust loops because `d` is tiny. The trait shape,
+   301	/// not this implementation, is the load-bearing part for the future MegBA or
+   302	/// Ceres backend.
+   303	#[derive(Debug, Clone, Copy, Default)]
+   304	pub struct CpuBatchedBlockSolver;
+   305	
+   306	impl BatchedBlockSolver for CpuBatchedBlockSolver {
+   307	    fn factor_blocks(
+   308	        &self,
+   309	        rows: &[ArrowRowBlock],
+   310	        ridge_t: f64,
+   311	        d: usize,
+   312	    ) -> Result<Vec<Array2<f64>>, ArrowSchurError> {
+   313	        let mut out = Vec::with_capacity(rows.len());
+   314	        for row in rows {
+   315	            let mut block = row.htt.clone();
+   316	            for a in 0..d {
+   317	                block[[a, a]] += ridge_t;
+   318	            }
+   319	            out.push(
+   320	                cholesky_lower(&block).map_err(|e| ArrowSchurError::PerRowFactorFailed {
+   321	                    row: out.len(),
+   322	                    reason: e,
+   323	                })?,
+   324	            );
+
+exec
+/bin/zsh -lc "nl -ba proposals/latent_coord.md | sed -n '52,90p'" in /Users/user/gam
+ succeeded in 0ms:
+    52	
+    53	```
+    54	ℒ(t, β, ψ, λ) = ½‖y − Φ(t; ψ) β‖² + ½λ βᵀ S(ψ) β
+    55	                + R_id(t, u)                              # identifiability
+    56	                − ½ log|Σ(λ, ψ, t)|                       # REML log-det
+    57	```
+    58	
+    59	`Φ(t; ψ)_{i,k} = K_ψ(t_i, c_k)` is the design row built from the latent
+    60	coordinate `t_i ∈ ℝ^d` and the basis centers `c_k`. For Duchon thin-plate
+    61	splines, `K_ψ` is radial: `K(r)` with `r = ‖t_i − c_k‖`, modulated by
+    62	ψ-anisotropy exactly as today.
+    63	
+    64	### 2.2 Gradients
+    65	
+    66	Let `g_i = ∂Φ_i / ∂t_i ∈ ℝ^(K × d)`. For a Duchon kernel
+    67	`Φ_{i,k} = φ(r_{ik})` we have `∂Φ_{i,k}/∂t_i = φ'(r_{ik}) · (t_i − c_k)/r_{ik}`,
+    68	the same radial-gradient routine that
+    69	`SpatialLogKappaCoords::apply_tospec` invokes for `∂Φ/∂ψ` (anisotropy
+    70	just rescales components of `(t_i − c_k)` before contraction).
+    71	
+    72	The gradient w.r.t. `t_i` of the residual is row-local:
+    73	
+    74	```
+    75	∂(½‖y − Φβ‖²) / ∂t_i = −(y_i − Φ_i β) · (g_i β)        # shape (d,)
+    76	```
+    77	
+    78	so the per-row Hessian block (Gauss–Newton) is `(g_i β)(g_i β)ᵀ`. The
+    79	joint Hessian `H_tt` is block-diagonal in rows (huge — `N·d × N·d` — but
+    80	sparse-by-blocks), `H_tβ = − Φ_i ⊗ (g_i β) + …` is dense in β but only
+    81	row-local in t. This is the *same* structure gamfit's matrix-free CG
+    82	already exploits along the ψ direction (`hyper_dirs`).
+    83	
+    84	**Arrow shape — careful statement (per math audit).** The cost is
+    85	arrow-shaped, but the REML `log|H|` Occam-term gradient is not literally
+    86	`Σ_i f(t_i)`. After Schur elimination,
+    87	`log|H| = log|H_tt| + log|Schur|`. The first term factorises trivially
+    88	because `H_tt` is block-diagonal in rows. For the second,
+    89	`∂/∂t_i log|Schur| = tr(Schur⁻¹ · ∂Schur/∂t_i)`, with `Schur⁻¹` dense in
+    90	all `t`. However, only row `i` of `Φ` moves with `t_i`, so
+
+exec
+/bin/zsh -lc "nl -ba proposals/composition_engine.md | sed -n '210,252p'" in /Users/user/gam
+ succeeded in 0ms:
+   210	class FisherWorkingModel(WorkingModel):
+   211	    def update(self, beta):
+   212	        # standard mean/variance/eta computation, but W = output Fisher info
+   213	        ...
+   214	
+   215	model = gamfit.fit(
+   216	    response=color_responses,
+   217	    smooths=[Sphere(...), Duchon(centers=stimuli, m=2)],
+   218	    latents={"t": LatentCoord(n=N, d=2, aux_prior={...})},
+   219	    working_model=FisherWorkingModel(),
+   220	)
+   221	```
+   222	
+   223	The Fisher inner product is *just* the choice of `W` inside `WorkingModel::update`. Nothing about REML, IFT, or basis evaluation changes — the standard machinery already differentiates through arbitrary `W` because PIRLS is written for it (`src/solver/pirls.rs:525-562`).
+   224	
+   225	### Principal-curve fitting (Hastie–Stuetzle)
+   226	
+   227	```python
+   228	model = gamfit.fit(
+   229	    response=points,                       # (n, d)
+   230	    smooths=[BSpline(knots=...)],
+   231	    latents={"t": LatentCoord(n=N, d=1, init="pca", aux_prior={...})},
+   232	    family="gaussian",
+   233	)
+   234	curve = model.predict_along("t", np.linspace(0, 1, 200))
+   235	```
+   236	
+   237	Principal curves are just `LatentCoord(dim=1)` / `LatentCoordValues` with a smooth decoder. The smoothing parameter is selected by REML rather than by cross-validation. Hastie and Stuetzle's iterative projection is what the inner solver does anyway.
+   238	
+   239	### Topological coordinate after TDA
+   240	
+   241	```python
+   242	# 1. Persistent cohomology says: one nontrivial H^1 class, so latent is S¹.
+   243	# 2. Topology is the basis choice:
+   244	model = gamfit.fit(
+   245	    response=Y,
+   246	    smooths=[PeriodicSplineCurve(period=2*np.pi, ...)],
+   247	    latents={"t": LatentCoord(n=N, d=1, aux_prior={...})},
+   248	)
+   249	```
+   250	
+   251	This is the cleanest expression of the framing. TDA tells you *which* basis; gamfit gives you the *fit* under that topology, with REML choosing the regularity strength and the existing IFT pipeline propagating gradients.
+   252	
+
+exec
+/bin/zsh -lc 'rg -n "Differentiating implicitly|IFT|∂t|H_tt|H_tβ|warm-start|ridge" proposals/latent_coord.md proposals/composition_engine.md' in /Users/user/gam
+ succeeded in 0ms:
+proposals/composition_engine.md:16:and it returns the marginal-likelihood-optimal hyperparameters together with the inner-loop coefficients, with derivatives propagated through the inner solution by the implicit function theorem (IFT). Any statistical procedure that can be cast in that shape is something gamfit already fits. Most cross-pollinations people propose from interpretability, neuroscience, representation learning, and modern diffusion-model geometry are recompositions of primitives gamfit already owns. This proposal makes that mapping explicit and then identifies the minimal set of *new* primitives that close the gap.
+proposals/composition_engine.md:47:- *REML / LAML* chooses the strength of all of the above by marginal-likelihood comparison, with derivatives done correctly via the existing IFT plumbing.
+proposals/composition_engine.md:53:The new code is small. Each addition reuses an existing pattern; none requires inventing new IFT machinery.
+proposals/composition_engine.md:59:**Existing analogue.** `SpatialLogKappaCoords` (`src/terms/smooth.rs:1765-1900`) is exactly the data structure pattern: a flattened `Array1<f64>` of "extra hyper-coordinates" whose layout is given by a `Vec<usize> dims_per_term`. The downstream machinery — `HyperDesignDerivative::from_implicit` (`src/solver/reml/mod.rs:2653-2668`), `DirectionalHyperParam::new_compact` (`src/solver/reml/mod.rs:3127`), the `is_penalty_like = false` flag set via `.not_penalty_like()` (`src/terms/smooth.rs:12717`), and the final entry into `RemlState::evaluate_unified_with_psi_ext` (`src/solver/reml/runtime.rs:8104`) — is already designed to accept *non-penalty-like, design-moving* ext-coordinates. Kernel-shape `ψ` and latent coordinates `t` are the same kind of object as far as the IFT plumbing is concerned. Both move the design `X`, both leave `S(ρ)` untouched (in the bare case), and both ship first- and second-derivative blocks through `HyperDesignDerivative`.
+proposals/composition_engine.md:76:with a `LatentCoordValues::build_x_ext_derivatives(&self) -> Vec<HyperDesignDerivative>` that produces one `HyperDesignDerivative` per latent column. For Duchon, Matern, and sphere bases the existing `ImplicitDesignPsiDerivative` (`src/terms/basis.rs:3948`) already knows how to compute the radial part of `∂X/∂t_n` because the kernel is a function of distance and the chain rule from `length_scale` to `t` reuses the same radial derivative already used for `ψ`. The work is plumbing, not new math.
+proposals/composition_engine.md:91:**What's load-bearing.** The `is_penalty_like = false` branch in `HyperDesignDerivative::any_nonzero` (`src/solver/reml/mod.rs:2704-2709`) and downstream `validate_tk_ext_coords` (`src/solver/reml/runtime.rs:2521`) is what makes an ext-coordinate "design-moving" rather than "penalty-scaling". `LatentCoordValues` is design-moving. Roughly 70–90% of the code path is shared with anisotropic `ψ`; the new code is the per-observation indexing and the basis-side derivatives `∂X/∂t_n`, both of which are radial-kernel chain-rule applications of existing primitives.
+proposals/composition_engine.md:95:**Problem.** Bare `LatentCoordValues` has a gauge symmetry: any smooth invertible reparameterization `t → φ(t)` together with a re-fit decoder gives the same likelihood. Empirically this shows up as flat valleys in the inner objective and Procrustes alignment failures across seeds (this was the observation in `auto_71`). The IFT requires unique inner minima; flat valleys make the implicit Hessian rank-deficient and the implicit gradient ill-defined.
+proposals/composition_engine.md:97:**Math.** Let `T: M → ℝ^p` be the decoder, with induced pullback metric `g_ij(t) = ⟨∂T/∂t_i, ∂T/∂t_j⟩`. Let `g^ref_ij(t)` be a reference Riemannian metric on the latent manifold (e.g. the identity, or the metric of a held-out chart). The isometry penalty is
+proposals/composition_engine.md:105:**Interface.** A new `PenaltyKind::IsometryToReference { reference: Arc<dyn MetricField>, quadrature: QuadratureSpec }` slotted into the `BlockwisePenalty` machinery (`src/terms/smooth.rs:707`). The penalty Gram block is a function of `(β, t)` and therefore contributes a non-trivial `∂S/∂t` to the existing `PenaltyDerivativeComponent` (`src/solver/reml/mod.rs:3072-3088`) — this is the same code path used for `HyperPenaltyDerivative`.
+proposals/composition_engine.md:115:**Mechanism sparsity.** iVAE-style identifiability additionally benefits from sparsity of the Jacobian `∂T/∂t` (each latent affects only a few outputs). This is an L¹-on-a-block penalty over rows of the decoder coefficient matrix — exactly the kind of structured penalty the existing `OperatorPenaltySpec` machinery (`src/terms/basis.rs:2836`) handles when paired with the active-set inner solver (`src/solver/active_set.rs`).
+proposals/composition_engine.md:122:2. **Regularity of `h`.** `h` must be at least `C¹` (typically `C²`) for the IFT and Hessian-based gradient claims to hold.
+proposals/composition_engine.md:160:2. `H_tt^(i)` is converted to the Riemannian Hessian action.
+proposals/composition_engine.md:161:3. Each `H_tβ^(i)` column is tangent-projected.
+proposals/composition_engine.md:197:        aux_prior={"u": environment_id, "family": "ridge", "strength": "auto"},
+proposals/composition_engine.md:223:The Fisher inner product is *just* the choice of `W` inside `WorkingModel::update`. Nothing about REML, IFT, or basis evaluation changes — the standard machinery already differentiates through arbitrary `W` because PIRLS is written for it (`src/solver/pirls.rs:525-562`).
+proposals/composition_engine.md:251:This is the cleanest expression of the framing. TDA tells you *which* basis; gamfit gives you the *fit* under that topology, with REML choosing the regularity strength and the existing IFT pipeline propagating gradients.
+proposals/composition_engine.md:272:**Penalty blocks.** `BlockwisePenalty` (`src/terms/smooth.rs:707`) and `KroneckerPenaltySystem` (`src/terms/smooth.rs:855`) already accept arbitrary user-constructed Gram blocks. The new isometry and auxiliary-conditional penalties slot in at this layer, with `PenaltyDerivativeComponent` (`src/solver/reml/mod.rs:3083`) carrying the `∂S/∂t` and `∂S/∂ρ` blocks.
+proposals/composition_engine.md:278:**The gauge symmetry is mathematically load-bearing.** A bare `LatentCoordValues` block, with no auxiliary variable and no isometry penalty, has a continuous family of equivalent inner minima. The IFT requires *unique* (locally isolated) minima with full-rank inner Hessian; flat valleys violate this. Empirically this was seen in the `auto_71` runs: geodesic-LM converged to identical R² across seeds with Procrustes ≈ 0.99, i.e. the fit was great but the latent was indistinguishable from a smooth diffeomorphic image of any other. The proposal is to make `LatentCoord` *refuse to fit* unless at least one of {`aux_prior`, `IsometryPenalty`} is supplied. (ARD on its own is *not* in this list — per the §4(d) audit caveat, `α_k ‖t_{·,k}‖²` is rotation-symmetric and does not break gauge without a paired prior. ARD is a useful *companion* to a gauge fix, not a substitute.) The error message should explain why. This is a stronger position than mgcv takes about its own corner cases and is appropriate here because the failure mode is silent.
+proposals/composition_engine.md:280:**Composability under multiple new primitives.** The REML/IFT machinery is currently exercised with one `ψ` block and many `ρ` blocks. With `LatentCoordValues` (per-observation ext-coords), an auxiliary-conditional penalty (data-dependent Gram), and isometry-to-reference (β-and-t-dependent Gram) all in one fit, the unified Hessian gains substantial off-diagonal coupling. The Lean scaffolding (`src/solver/reml.lean`) proves the three-term LAML decomposition without assuming block-diagonality, so the math is fine, but the *numerical* conditioning of the joint Hessian and the *runtime* cost of the IFT solve in this regime need empirical study. A small scaling study (1, 2, 3, 4 simultaneously-active new primitive types) before declaring the manifold workflow stable would be appropriate.
+proposals/composition_engine.md:282:**Arrow / Schur cost — precise statement (math audit).** Earlier drafts said "per-row latent `t_i` has block-diagonal Hessian; arrow/Schur eliminates the latent cheaply." That is true at the cost level but the explanation must be precise. After Schur elimination, `log|H| = log|H_tt| + log|Schur|`. The first term factorises trivially because `H_tt` is block-diagonal across rows. For the second, `∂/∂t_i log|Schur| = tr(Schur⁻¹ · ∂Schur/∂t_i)` where `Schur⁻¹` is dense in all `t`; but `∂Schur/∂t_i` is a rank-≤d update because only row `i` of `Φ` moves with `t_i`. Per outer iteration the cost is therefore one dense `Schur⁻¹` formation (shared across rows) plus N cheap per-row traces — still `O(N + decoder-cost)`, not `O(N²)`. The arrow shape holds at the cost level; the gradient formula carries a shared factor that is a one-time setup per outer iteration.
+proposals/composition_engine.md:284:**REML behavior near-singular inner Hessian.** When `Latent` is used without gauge-fixing, the inner Hessian is rank-deficient by construction in the gauge direction, and the standard ridge regularization in `solve_newton_direction_dense` will hide this rather than reveal it. The diagnostics for "this fit is in a flat valley" need to be surfaced — most cleanly as a check on the smallest eigenvalue of the *unregularized* Hessian, gated by a flag. This is also useful for diagnosing user-data pathology in the existing GAM workflow, so the investment is not single-use.
+proposals/composition_engine.md:289:- Is the `BasisOutput` trait (`src/terms/basis.rs:248`) the right place to add a per-observation `∂X/∂t_n` method, or should that live on `ImplicitDesignPsiDerivative`? The latter is already where the radial-kernel chain rule lives.
+proposals/composition_engine.md:292:- The `final_lm_lambda` warm-start (`src/solver/pirls.rs:1273, 1320`) suggests an existing inner-solver warm-start strategy. For `LatentCoordValues` whose values change between REML outer iterations, is warm-starting `t` from the previous outer iterate the intended behavior, and is there a hook for that?
+proposals/latent_coord.md:17:IFT-warm-started nested optimizer moves `ψ` because `∂Φ/∂ψ` is computable
+proposals/latent_coord.md:27:`∂Φ/∂t` per row, and that's structurally the same radial-basis-gradient
+proposals/latent_coord.md:30:log-anisotropy. Everything downstream (IFT-warm-started Newton on the
+proposals/latent_coord.md:31:inner system, REML for the outer ridges, persistent warm-start) is reused
+proposals/latent_coord.md:66:Let `g_i = ∂Φ_i / ∂t_i ∈ ℝ^(K × d)`. For a Duchon kernel
+proposals/latent_coord.md:67:`Φ_{i,k} = φ(r_{ik})` we have `∂Φ_{i,k}/∂t_i = φ'(r_{ik}) · (t_i − c_k)/r_{ik}`,
+proposals/latent_coord.md:75:∂(½‖y − Φβ‖²) / ∂t_i = −(y_i − Φ_i β) · (g_i β)        # shape (d,)
+proposals/latent_coord.md:79:joint Hessian `H_tt` is block-diagonal in rows (huge — `N·d × N·d` — but
+proposals/latent_coord.md:80:sparse-by-blocks), `H_tβ = − Φ_i ⊗ (g_i β) + …` is dense in β but only
+proposals/latent_coord.md:87:`log|H| = log|H_tt| + log|Schur|`. The first term factorises trivially
+proposals/latent_coord.md:88:because `H_tt` is block-diagonal in rows. For the second,
+proposals/latent_coord.md:89:`∂/∂t_i log|Schur| = tr(Schur⁻¹ · ∂Schur/∂t_i)`, with `Schur⁻¹` dense in
+proposals/latent_coord.md:91:`∂Schur/∂t_i` is a rank-≤d update. Per outer iteration the cost is one
+proposals/latent_coord.md:109:gauge orbit per fit. **IFT is singular along this orbit** — the inner
+proposals/latent_coord.md:120:(ridge / shallow GAM). Different `φ` (latent reparameterisations) give
+proposals/latent_coord.md:134:2. `h` must be at least `C¹` (typically `C²` in practice) so the IFT
+proposals/latent_coord.md:149:warm-start regularizer or a cheap second-best.
+proposals/latent_coord.md:182:        family="ridge",         # 'ridge' | 'duchon'
+proposals/latent_coord.md:250:| `solver::estimate` IFT loop | unchanged | new hyper_dirs flow through |
+proposals/latent_coord.md:266:Crucially: **no new optimizer**, **no new IFT code**, **no new
+proposals/latent_coord.md:294:  IFT-warm-started `grad_t` would close this gap with better step
+proposals/latent_coord.md:307:2. **Auxiliary-prior choice for `g_φ`**: ridge sufficient, or do we
+
+codex
+**FINDINGS**
+
+1. [src/solver/arrow_schur.rs](/Users/user/gam/src/solver/arrow_schur.rs:725), [src/solver/arrow_schur.rs](/Users/user/gam/src/solver/arrow_schur.rs:773), [src/solver/latent_inner.rs](/Users/user/gam/src/solver/latent_inner.rs:198), [src/solver/persistent_warm_start.rs](/Users/user/gam/src/solver/persistent_warm_start.rs:398)  
+Severity: definitive.
+
+Wrong expression: the IFT predictor solves with cached factors documented as `H_tt^(i) + ridge_t·I`, then applies:
+```rust
+let v = chol_solve_vector(&self.htt_factors[i], &rhs);
+```
+and `LatentInnerSolver` can build the final cache with:
+```rust
+ridge_t.max(1e-12)
+```
+
+Correct expression: IFT requires the undamped Hessian:
+```text
+Δt_i = -(H_tt^(i))^{-1} (H_tβ^(i) Δβ + δg_t^(i))
+```
+not `(H_tt^(i) + λI)^{-1}`. Derivation: at the inner optimum,
+`g_t^(i)(t_i*, β, ρ)=0`; differentiating gives
+`H_tt^(i) dt_i + H_tβ^(i) dβ + δg_t^(i)=0`.
+
+2. [src/solver/riemannian.rs](/Users/user/gam/src/solver/riemannian.rs:660), [src/solver/riemannian.rs](/Users/user/gam/src/solver/riemannian.rs:699)  
+Severity: definitive.
+
+Wrong expression:
+```rust
+let mut xi = solve_symmetric_tikhonov(&hess_r, &grad_r);
+```
+where `solve_symmetric_tikhonov` makes the full ambient matrix PD via:
+```rust
+a[[i, i]] += lambda;
+```
+
+Correct expression: solve only on the tangent space, e.g.
+```text
+(Qᵀ H_R Q + μI) η = -Qᵀ grad_R,   ξ = Qη
+```
+for tangent basis `Q`, or equivalently pin only the normal block:
+```text
+(H_R + αP_N + μP_T) ξ = -grad_R
+```
+The ambient `H_R` is singular in normal directions by construction; that normal nullspace is representational, not negative curvature. Current code therefore introduces artificial tangent damping even when `step.ridge == 0`.
+tokens used
+100,143
+**FINDINGS**
+
+1. [src/solver/arrow_schur.rs](/Users/user/gam/src/solver/arrow_schur.rs:725), [src/solver/arrow_schur.rs](/Users/user/gam/src/solver/arrow_schur.rs:773), [src/solver/latent_inner.rs](/Users/user/gam/src/solver/latent_inner.rs:198), [src/solver/persistent_warm_start.rs](/Users/user/gam/src/solver/persistent_warm_start.rs:398)  
+Severity: definitive.
+
+Wrong expression: the IFT predictor solves with cached factors documented as `H_tt^(i) + ridge_t·I`, then applies:
+```rust
+let v = chol_solve_vector(&self.htt_factors[i], &rhs);
+```
+and `LatentInnerSolver` can build the final cache with:
+```rust
+ridge_t.max(1e-12)
+```
+
+Correct expression: IFT requires the undamped Hessian:
+```text
+Δt_i = -(H_tt^(i))^{-1} (H_tβ^(i) Δβ + δg_t^(i))
+```
+not `(H_tt^(i) + λI)^{-1}`. Derivation: at the inner optimum,
+`g_t^(i)(t_i*, β, ρ)=0`; differentiating gives
+`H_tt^(i) dt_i + H_tβ^(i) dβ + δg_t^(i)=0`.
+
+2. [src/solver/riemannian.rs](/Users/user/gam/src/solver/riemannian.rs:660), [src/solver/riemannian.rs](/Users/user/gam/src/solver/riemannian.rs:699)  
+Severity: definitive.
+
+Wrong expression:
+```rust
+let mut xi = solve_symmetric_tikhonov(&hess_r, &grad_r);
+```
+where `solve_symmetric_tikhonov` makes the full ambient matrix PD via:
+```rust
+a[[i, i]] += lambda;
+```
+
+Correct expression: solve only on the tangent space, e.g.
+```text
+(Qᵀ H_R Q + μI) η = -Qᵀ grad_R,   ξ = Qη
+```
+for tangent basis `Q`, or equivalently pin only the normal block:
+```text
+(H_R + αP_N + μP_T) ξ = -grad_R
+```
+The ambient `H_R` is singular in normal directions by construction; that normal nullspace is representational, not negative curvature. Current code therefore introduces artificial tangent damping even when `step.ridge == 0`.

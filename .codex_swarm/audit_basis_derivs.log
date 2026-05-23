@@ -4484,3 +4484,1330 @@ fn thin_plate_kernel_psi_triplet_from_distance(
     // and for any TPS radial kernel phi(r),
     //   d phi / dpsi       = phi_r(r) * r
 
+exec
+/bin/zsh -lc "sed -n '8545,8665p' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+            let q = -s * e / r;
+            let phi_rr = s * s * e;
+            let t = (phi_rr - q) / (r * r);
+            // t' from: t = f/r² where f = φ'' - q.
+            //   f'  = φ''' - q' = -s³E - t·r   (since q' = t·r)
+            //   t'  = (f' - 2t·r) / r²  = (-s³E - 3t·r) / r²
+            let dt_dr = (-s * s * s * e - 3.0 * t * r) / (r * r);
+            // t'' from: t' = g/r² where g = -s³E - 3tr.
+            //   g' = s⁴E - 3(t'r + t)
+            //   t'' = (g' - 2t'r) / r² = (s⁴E - 3t'r - 3t - 2t'r) / r²
+            //        = (s⁴E - 5t'r - 3t) / r²
+            let d2t_dr2 = (s.powi(4) * e - 5.0 * dt_dr * r - 3.0 * t) / (r * r);
+            Ok((phi, q, t, dt_dr, d2t_dr2))
+        }
+        // ----------------------------------------------------------------
+        // ν = 3/2:  φ = (1 + a)E, a = √3·r/ℓ, s = √3/ℓ
+        //   q  = -s²E         (finite at r=0)
+        //   t  = s³E/r        (diverges at r=0)
+        //   dt/dr = s³E(-sr - 1)/r²  (diverges at r=0)
+        //   At r=0, s_a = 0 so all products vanish.
+        // ----------------------------------------------------------------
+        MaternNu::ThreeHalves => {
+            let s = 3.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0 + a) * e;
+            let q = -s * s * e;
+            if r < 1e-14 {
+                return Ok((phi, q, 0.0, 0.0, 0.0));
+            }
+            let t = s * s * s * e / r;
+            // dt/dr: d/dr [s³ E / r] = s³ [-s E r - E] / r² = -s³ E (sr + 1) / r²
+            let dt_dr = -s * s * s * e * (a + 1.0) / (r * r);
+            // d²t/dr²: d/dr [-s³ E (a+1) / r²]
+            //   = -s³ [(-s E)(a+1)r² + s E r² - 2r E(a+1)] / r⁴ ... expand
+            // Let g(r) = -s³ E (a+1) / r²
+            // g'(r) = -s³ [E'(a+1) + E·s] / r² + 2s³ E(a+1) / r³
+            //       = -s³ [-sE(a+1) + sE] / r² + 2s³ E(a+1) / r³
+            //       = -s³ · sE[-a-1+1] / r² + 2s³ E(a+1) / r³
+            //       = s⁴ a E / r² + 2s³ E(a+1) / r³
+            //       = s³ E [s a r + 2(a+1)] / r³
+            let d2t_dr2 = s * s * s * e * (s * a * r + 2.0 * (a + 1.0)) / (r * r * r);
+            Ok((phi, q, t, dt_dr, d2t_dr2))
+        }
+        // ----------------------------------------------------------------
+        // ν = 5/2:  φ = (1 + a + a²/3)E, a = √5·r/ℓ, s = √5/ℓ
+        //   q = -(s²/3)(a+1)E
+        //   t = (s⁴/3)E
+        //   dt/dr = -(s⁵/3)E
+        //   d²t/dr² = (s⁶/3)E
+        // ----------------------------------------------------------------
+        MaternNu::FiveHalves => {
+            let s = 5.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0 + a + (a * a) / 3.0) * e;
+            let q = -(s * s / 3.0) * (a + 1.0) * e;
+            let t = (s * s * s * s / 3.0) * e;
+            let dt_dr = -(s * s * s * s * s / 3.0) * e;
+            let d2t_dr2 = (s.powi(6) / 3.0) * e;
+            Ok((phi, q, t, dt_dr, d2t_dr2))
+        }
+        // ----------------------------------------------------------------
+        // ν = 7/2:  φ = (1 + a + (2/5)a² + (1/15)a³)E
+        //   q = -(s²/15)(a² + 3a + 3)E
+        //   t = (s⁴/15)(a + 1)E
+        //   dt/dr = -(s⁵/15)aE
+        //   d²t/dr² = (s⁶/15)(a - 1)E
+        // ----------------------------------------------------------------
+        MaternNu::SevenHalves => {
+            let s = 7.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0 + a + (2.0 / 5.0) * a * a + (1.0 / 15.0) * a * a * a) * e;
+            let q = -(s * s / 15.0) * (a * a + 3.0 * a + 3.0) * e;
+            let t = (s * s * s * s / 15.0) * (a + 1.0) * e;
+            let dt_dr = -(s.powi(5) / 15.0) * a * e;
+            let d2t_dr2 = (s.powi(6) / 15.0) * (a - 1.0) * e;
+            Ok((phi, q, t, dt_dr, d2t_dr2))
+        }
+        // ----------------------------------------------------------------
+        // ν = 9/2:  φ = (1 + a + (3/7)a² + (2/21)a³ + (1/105)a⁴)E
+        //   q = -(s²/105)(a³ + 6a² + 15a + 15)E
+        //   t = (s⁴/105)(a² + 3a + 3)E
+        //   dt/dr = -(s⁵/105)a(a + 1)E
+        //   d²t/dr² = (s⁶/105)(a² - a - 1)E
+        // ----------------------------------------------------------------
+        MaternNu::NineHalves => {
+            let s = 9.0_f64.sqrt() / length_scale;
+            let a = s * r;
+            let e = (-a).exp();
+            let phi = (1.0
+                + a
+                + (3.0 / 7.0) * a * a
+                + (2.0 / 21.0) * a * a * a
+                + (1.0 / 105.0) * a * a * a * a)
+                * e;
+            let q = -(s * s / 105.0) * (a * a * a + 6.0 * a * a + 15.0 * a + 15.0) * e;
+            let t = (s * s * s * s / 105.0) * (a * a + 3.0 * a + 3.0) * e;
+            let dt_dr = -(s.powi(5) / 105.0) * a * (a + 1.0) * e;
+            let d2t_dr2 = (s.powi(6) / 105.0) * (a * a - a - 1.0) * e;
+            Ok((phi, q, t, dt_dr, d2t_dr2))
+        }
+    }
+}
+
+#[inline(always)]
+fn hessian_operator_entry(
+    q: f64,
+    t: f64,
+    h_b: f64,
+    h_c: f64,
+    w_b: f64,
+    w_c: f64,
+    axis_b: usize,
+    axis_c: usize,
+) -> f64 {
+    let diagonal = if axis_b == axis_c { w_b * q } else { 0.0 };
+    diagonal + (w_b * h_b) * (w_c * h_c) * t
+}
+
+
+exec
+/bin/zsh -lc "sed -n '3650,3705{=;p;}' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+3650
+    ///
+3651
+    /// ```text
+3652
+    /// ∂Φ/∂t_a       = q · (t − c)_a
+3653
+    /// ∂²Φ/∂t_a∂t_b  = q · δ_ab + t · (t − c)_a (t − c)_b
+3654
+    /// ```
+3655
+    ///
+3656
+    /// Re-pointing the existing ψ-derivative machinery at the first kernel
+3657
+    /// argument t (see `crate::terms::input_loc_derivatives`).
+3658
+    pub(crate) fn eval_design_triplet(&self, r: f64) -> Result<(f64, f64, f64), BasisError> {
+3659
+        match self {
+3660
+            RadialScalarKind::Matern { length_scale, nu } => {
+3661
+                let (phi, q, t, _, _) =
+3662
+                    matern_aniso_extended_radial_scalars(r, *length_scale, *nu)?;
+3663
+                Ok((phi, q, t))
+3664
+            }
+3665
+            RadialScalarKind::Duchon {
+3666
+                length_scale,
+3667
+                p_order,
+3668
+                s_order,
+3669
+                dim,
+3670
+                coeffs,
+3671
+            } => {
+3672
+                let jets = duchon_radial_jets(r, *length_scale, *p_order, *s_order, *dim, coeffs)?;
+3673
+                Ok((jets.phi, jets.q, jets.t))
+3674
+            }
+3675
+            RadialScalarKind::PureDuchon {
+3676
+                block_order, dim, ..
+3677
+            } => {
+3678
+                let phi = polyharmonic_kernel(r, (*block_order) as f64, *dim);
+3679
+                if r < 1e-14 {
+3680
+                    // Collision: q, t diverge but s_a = 0 ⇒ q·s_a, t·s_a vanish.
+3681
+                    return Ok((phi, 0.0, 0.0));
+3682
+                }
+3683
+                let (q, t, _, _) =
+3684
+                    duchon_polyharmonic_operator_block_jets(r, *block_order as f64, *dim)?;
+3685
+                Ok((phi, q, t))
+3686
+            }
+3687
+            RadialScalarKind::ThinPlate { length_scale, dim } => {
+3688
+                // At collision r=0 the operator's `s_0 = r²` is itself zero,
+3689
+                // so q and t are multiplied by zero and never observed; we
+3690
+                // still need a finite phi (= 0 for the standard TPS kernels).
+3691
+                if r < 1e-14 {
+3692
+                    let (phi, _, _) = thin_plate_kernel_triplet_from_scaled_distance(0.0, *dim)?;
+3693
+                    return Ok((phi, 0.0, 0.0));
+3694
+                }
+3695
+                let scaled_r = r / *length_scale;
+3696
+                let (phi, phi_kernel_first, phi_kernel_second) =
+3697
+                    thin_plate_kernel_triplet_from_scaled_distance(scaled_r, *dim)?;
+3698
+                // The implicit operator uses derivatives w.r.t. the unscaled r
+3699
+                // (the operator's chain rule will rescale them to ψ-derivatives
+3700
+                // via s_0 = r²). Convert φ'(z), φ''(z) → φ'(r), φ''(r) by the
+3701
+                // length-scale chain rule:
+3702
+                //   φ'(r)  = φ'(z) / length_scale
+3703
+                //   φ''(r) = φ''(z) / length_scale²
+3704
+                let phi_r = phi_kernel_first / *length_scale;
+3705
+                let phi_rr = phi_kernel_second / (*length_scale * *length_scale);
+
+exec
+/bin/zsh -lc "sed -n '8525,8585{=;p;}' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+8525
+            "Matérn length_scale must be finite and positive".to_string(),
+8526
+        ));
+8527
+    }
+8528
+
+8529
+    match nu {
+8530
+        // ----------------------------------------------------------------
+8531
+        // ν = 1/2:  φ = exp(-a), a = r / ℓ, s = 1/ℓ
+8532
+        //   q = -s·E/r  (diverges at r=0)
+8533
+        //   t = (s²E - q) / r²  (diverges at r=0)
+8534
+        //   At r=0 all products with s_a vanish, so return 0 for dt_dr, d2t_dr2.
+8535
+        // ----------------------------------------------------------------
+8536
+        MaternNu::Half => {
+8537
+            let s = 1.0 / length_scale;
+8538
+            let a = s * r;
+8539
+            let e = (-a).exp();
+8540
+            let phi = e;
+8541
+            if r < 1e-14 {
+8542
+                // Collision: q diverges but s_a = 0 ⇒ products vanish.
+8543
+                return Ok((phi, 0.0, 0.0, 0.0, 0.0));
+8544
+            }
+8545
+            let q = -s * e / r;
+8546
+            let phi_rr = s * s * e;
+8547
+            let t = (phi_rr - q) / (r * r);
+8548
+            // t' from: t = f/r² where f = φ'' - q.
+8549
+            //   f'  = φ''' - q' = -s³E - t·r   (since q' = t·r)
+8550
+            //   t'  = (f' - 2t·r) / r²  = (-s³E - 3t·r) / r²
+8551
+            let dt_dr = (-s * s * s * e - 3.0 * t * r) / (r * r);
+8552
+            // t'' from: t' = g/r² where g = -s³E - 3tr.
+8553
+            //   g' = s⁴E - 3(t'r + t)
+8554
+            //   t'' = (g' - 2t'r) / r² = (s⁴E - 3t'r - 3t - 2t'r) / r²
+8555
+            //        = (s⁴E - 5t'r - 3t) / r²
+8556
+            let d2t_dr2 = (s.powi(4) * e - 5.0 * dt_dr * r - 3.0 * t) / (r * r);
+8557
+            Ok((phi, q, t, dt_dr, d2t_dr2))
+8558
+        }
+8559
+        // ----------------------------------------------------------------
+8560
+        // ν = 3/2:  φ = (1 + a)E, a = √3·r/ℓ, s = √3/ℓ
+8561
+        //   q  = -s²E         (finite at r=0)
+8562
+        //   t  = s³E/r        (diverges at r=0)
+8563
+        //   dt/dr = s³E(-sr - 1)/r²  (diverges at r=0)
+8564
+        //   At r=0, s_a = 0 so all products vanish.
+8565
+        // ----------------------------------------------------------------
+8566
+        MaternNu::ThreeHalves => {
+8567
+            let s = 3.0_f64.sqrt() / length_scale;
+8568
+            let a = s * r;
+8569
+            let e = (-a).exp();
+8570
+            let phi = (1.0 + a) * e;
+8571
+            let q = -s * s * e;
+8572
+            if r < 1e-14 {
+8573
+                return Ok((phi, q, 0.0, 0.0, 0.0));
+8574
+            }
+8575
+            let t = s * s * s * e / r;
+8576
+            // dt/dr: d/dr [s³ E / r] = s³ [-s E r - E] / r² = -s³ E (sr + 1) / r²
+8577
+            let dt_dr = -s * s * s * e * (a + 1.0) / (r * r);
+8578
+            // d²t/dr²: d/dr [-s³ E (a+1) / r²]
+8579
+            //   = -s³ [(-s E)(a+1)r² + s E r² - 2r E(a+1)] / r⁴ ... expand
+8580
+            // Let g(r) = -s³ E (a+1) / r²
+8581
+            // g'(r) = -s³ [E'(a+1) + E·s] / r² + 2s³ E(a+1) / r³
+8582
+            //       = -s³ [-sE(a+1) + sE] / r² + 2s³ E(a+1) / r³
+8583
+            //       = -s³ · sE[-a-1+1] / r² + 2s³ E(a+1) / r³
+8584
+            //       = s⁴ a E / r² + 2s³ E(a+1) / r³
+8585
+            //       = s³ E [s a r + 2(a+1)] / r³
+
+exec
+/bin/zsh -lc "sed -n '8585,8665{=;p;}' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+8585
+            //       = s³ E [s a r + 2(a+1)] / r³
+8586
+            let d2t_dr2 = s * s * s * e * (s * a * r + 2.0 * (a + 1.0)) / (r * r * r);
+8587
+            Ok((phi, q, t, dt_dr, d2t_dr2))
+8588
+        }
+8589
+        // ----------------------------------------------------------------
+8590
+        // ν = 5/2:  φ = (1 + a + a²/3)E, a = √5·r/ℓ, s = √5/ℓ
+8591
+        //   q = -(s²/3)(a+1)E
+8592
+        //   t = (s⁴/3)E
+8593
+        //   dt/dr = -(s⁵/3)E
+8594
+        //   d²t/dr² = (s⁶/3)E
+8595
+        // ----------------------------------------------------------------
+8596
+        MaternNu::FiveHalves => {
+8597
+            let s = 5.0_f64.sqrt() / length_scale;
+8598
+            let a = s * r;
+8599
+            let e = (-a).exp();
+8600
+            let phi = (1.0 + a + (a * a) / 3.0) * e;
+8601
+            let q = -(s * s / 3.0) * (a + 1.0) * e;
+8602
+            let t = (s * s * s * s / 3.0) * e;
+8603
+            let dt_dr = -(s * s * s * s * s / 3.0) * e;
+8604
+            let d2t_dr2 = (s.powi(6) / 3.0) * e;
+8605
+            Ok((phi, q, t, dt_dr, d2t_dr2))
+8606
+        }
+8607
+        // ----------------------------------------------------------------
+8608
+        // ν = 7/2:  φ = (1 + a + (2/5)a² + (1/15)a³)E
+8609
+        //   q = -(s²/15)(a² + 3a + 3)E
+8610
+        //   t = (s⁴/15)(a + 1)E
+8611
+        //   dt/dr = -(s⁵/15)aE
+8612
+        //   d²t/dr² = (s⁶/15)(a - 1)E
+8613
+        // ----------------------------------------------------------------
+8614
+        MaternNu::SevenHalves => {
+8615
+            let s = 7.0_f64.sqrt() / length_scale;
+8616
+            let a = s * r;
+8617
+            let e = (-a).exp();
+8618
+            let phi = (1.0 + a + (2.0 / 5.0) * a * a + (1.0 / 15.0) * a * a * a) * e;
+8619
+            let q = -(s * s / 15.0) * (a * a + 3.0 * a + 3.0) * e;
+8620
+            let t = (s * s * s * s / 15.0) * (a + 1.0) * e;
+8621
+            let dt_dr = -(s.powi(5) / 15.0) * a * e;
+8622
+            let d2t_dr2 = (s.powi(6) / 15.0) * (a - 1.0) * e;
+8623
+            Ok((phi, q, t, dt_dr, d2t_dr2))
+8624
+        }
+8625
+        // ----------------------------------------------------------------
+8626
+        // ν = 9/2:  φ = (1 + a + (3/7)a² + (2/21)a³ + (1/105)a⁴)E
+8627
+        //   q = -(s²/105)(a³ + 6a² + 15a + 15)E
+8628
+        //   t = (s⁴/105)(a² + 3a + 3)E
+8629
+        //   dt/dr = -(s⁵/105)a(a + 1)E
+8630
+        //   d²t/dr² = (s⁶/105)(a² - a - 1)E
+8631
+        // ----------------------------------------------------------------
+8632
+        MaternNu::NineHalves => {
+8633
+            let s = 9.0_f64.sqrt() / length_scale;
+8634
+            let a = s * r;
+8635
+            let e = (-a).exp();
+8636
+            let phi = (1.0
+8637
+                + a
+8638
+                + (3.0 / 7.0) * a * a
+8639
+                + (2.0 / 21.0) * a * a * a
+8640
+                + (1.0 / 105.0) * a * a * a * a)
+8641
+                * e;
+8642
+            let q = -(s * s / 105.0) * (a * a * a + 6.0 * a * a + 15.0 * a + 15.0) * e;
+8643
+            let t = (s * s * s * s / 105.0) * (a * a + 3.0 * a + 3.0) * e;
+8644
+            let dt_dr = -(s.powi(5) / 105.0) * a * (a + 1.0) * e;
+8645
+            let d2t_dr2 = (s.powi(6) / 105.0) * (a * a - a - 1.0) * e;
+8646
+            Ok((phi, q, t, dt_dr, d2t_dr2))
+8647
+        }
+8648
+    }
+8649
+}
+8650
+
+8651
+#[inline(always)]
+8652
+fn hessian_operator_entry(
+8653
+    q: f64,
+8654
+    t: f64,
+8655
+    h_b: f64,
+8656
+    h_c: f64,
+8657
+    w_b: f64,
+8658
+    w_c: f64,
+8659
+    axis_b: usize,
+8660
+    axis_c: usize,
+8661
+) -> f64 {
+8662
+    let diagonal = if axis_b == axis_c { w_b * q } else { 0.0 };
+8663
+    diagonal + (w_b * h_b) * (w_c * h_c) * t
+8664
+}
+8665
+
+
+exec
+/bin/zsh -lc "sed -n '196,210{=;p;}' src/terms/input_loc_derivatives.rs" in /Users/user/gam
+ succeeded in 0ms:
+196
+        )));
+197
+    }
+198
+    let kind = kernel.into_scalar_kind();
+199
+    for n in 0..n_obs {
+200
+        for k in 0..n_centers {
+201
+            let mut r2 = 0.0_f64;
+202
+            for a in 0..d {
+203
+                let delta = t[[n, a]] - centers[[k, a]];
+204
+                r2 += delta * delta;
+205
+            }
+206
+            let r = r2.sqrt();
+207
+            let (_, q, _) = kind.eval_design_triplet(r)?;
+208
+            for a in 0..d {
+209
+                out[[n, k, a]] = q * (t[[n, a]] - centers[[k, a]]);
+210
+            }
+
+exec
+/bin/zsh -lc "sed -n '276,284{=;p;}' src/terms/input_loc_derivatives.rs" in /Users/user/gam
+ succeeded in 0ms:
+276
+                let v = t[[n, a]] - centers[[k, a]];
+277
+                delta[a] = v;
+278
+                r2 += v * v;
+279
+            }
+280
+            let r = r2.sqrt();
+281
+            let (_, q, s) = kind.eval_design_triplet(r)?;
+282
+            for a in 0..d {
+283
+                for b in 0..d {
+284
+                    let kron = if a == b { 1.0 } else { 0.0 };
+
+exec
+/bin/zsh -lc "sed -n '488,498{=;p;}' src/terms/input_loc_derivatives.rs" in /Users/user/gam
+ succeeded in 0ms:
+488
+    }
+489
+    let kind = kernel.into_scalar_kind();
+490
+    for n in 0..n_obs {
+491
+        for k in 0..n_centers {
+492
+            let raw = t[n] - centers[k];
+493
+            let signed = wrap_signed_displacement(raw, period);
+494
+            let r = signed.abs();
+495
+            let (_, q, _) = kind.eval_design_triplet(r)?;
+496
+            out[[n, k]] = q * signed;
+497
+        }
+498
+    }
+
+exec
+/bin/zsh -lc "sed -n '560,573{=;p;}' src/terms/input_loc_derivatives.rs" in /Users/user/gam
+ succeeded in 0ms:
+560
+            let cz = centers_unit[[k, 2]];
+561
+            let dx = tx - cx;
+562
+            let dy = ty - cy;
+563
+            let dz = tz - cz;
+564
+            let r2 = dx * dx + dy * dy + dz * dz;
+565
+            let r = r2.sqrt();
+566
+            let (_, q, _) = kind.eval_design_triplet(r)?;
+567
+            // Ambient gradient g = q · (t - c)
+568
+            let gx = q * dx;
+569
+            let gy = q * dy;
+570
+            let gz = q * dz;
+571
+            // Project onto tangent plane: g - (g · t) t
+572
+            let g_dot_t = gx * tx + gy * ty + gz * tz;
+573
+            out[[n, k, 0]] = gx - g_dot_t * tx;
+
+exec
+/bin/zsh -lc "sed -n '4080,4110p' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+        if latent.latent_dim() != centers.ncols() {
+            return Err(BasisError::DimensionMismatch(format!(
+                "LatentCoordDesignDerivative Duchon dimension mismatch: latent d={} centers d={}",
+                latent.latent_dim(),
+                centers.ncols()
+            )));
+        }
+        let effective_order = duchon_effective_nullspace_order(centers.view(), nullspace_order);
+        let p_order = duchon_p_from_nullspace_order(effective_order);
+        let s_order = power.max(0.0).round() as usize;
+        let radial_kind = if let Some(length_scale) = length_scale {
+            RadialScalarKind::Duchon {
+                length_scale,
+                p_order,
+                s_order,
+                dim: centers.ncols(),
+                coeffs: duchon_partial_fraction_coeffs(
+                    p_order,
+                    s_order,
+                    1.0 / length_scale.max(1e-300),
+                ),
+            }
+        } else {
+            RadialScalarKind::PureDuchon {
+                block_order: pure_duchon_block_order(p_order, power).max(1.0) as usize,
+                p_order,
+                s_order,
+                dim: centers.ncols(),
+            }
+        };
+        let mut workspace = BasisWorkspace::default();
+
+exec
+/bin/zsh -lc "rg -n \"PureDuchon \\{|block_order\" src/terms/basis.rs src/terms/input_loc_derivatives.rs" in /Users/user/gam
+ succeeded in 0ms:
+src/terms/input_loc_derivatives.rs:77:        block_order: usize,
+src/terms/input_loc_derivatives.rs:114:                block_order,
+src/terms/input_loc_derivatives.rs:118:            } => RadialScalarKind::PureDuchon {
+src/terms/input_loc_derivatives.rs:119:                block_order: *block_order,
+src/terms/input_loc_derivatives.rs:657:            block_order: 2,
+src/terms/basis.rs:3626:    PureDuchon {
+src/terms/basis.rs:3627:        block_order: usize,
+src/terms/basis.rs:3675:            RadialScalarKind::PureDuchon {
+src/terms/basis.rs:3676:                block_order, dim, ..
+src/terms/basis.rs:3678:                let phi = polyharmonic_kernel(r, (*block_order) as f64, *dim);
+src/terms/basis.rs:3684:                    duchon_polyharmonic_operator_block_jets(r, *block_order as f64, *dim)?;
+src/terms/basis.rs:3723:            RadialScalarKind::PureDuchon {
+src/terms/basis.rs:3739:            RadialScalarKind::Duchon { .. } | RadialScalarKind::PureDuchon { .. }
+src/terms/basis.rs:3758:                | RadialScalarKind::PureDuchon { .. }
+src/terms/basis.rs:4103:            RadialScalarKind::PureDuchon {
+src/terms/basis.rs:4104:                block_order: pure_duchon_block_order(p_order, power).max(1.0) as usize,
+src/terms/basis.rs:4455:                RadialScalarKind::Duchon { .. } | RadialScalarKind::PureDuchon { .. }
+src/terms/basis.rs:9358:    pure_block_order: usize,
+src/terms/basis.rs:9445:                    let phi = polyharmonic_kernel(r, (self.pure_block_order) as f64, d);
+src/terms/basis.rs:9448:                        self.pure_block_order as f64,
+src/terms/basis.rs:9643:    let pure_block_order = pure_duchon_block_order(p_order, s_order as f64) as usize;
+src/terms/basis.rs:9745:                            let phi = polyharmonic_kernel(r, (pure_block_order) as f64, d);
+src/terms/basis.rs:9748:                                pure_block_order as f64,
+src/terms/basis.rs:10167:        pure_block_order,
+src/terms/basis.rs:10225:            // through `pure_duchon_block_order` → `polyharmonic_kernel_triplet`
+src/terms/basis.rs:10230:            let m = pure_duchon_block_order(p_order, s_order as f64);
+src/terms/basis.rs:13018:fn pure_duchon_block_order(p_order: usize, s_order: f64) -> f64 {
+src/terms/basis.rs:13193:            pure_duchon_block_order(p_order, s_order as f64),
+src/terms/basis.rs:17222:    let block_order = pure_duchon_block_order(p_order, s_order as f64) as usize;
+src/terms/basis.rs:17231:        RadialScalarKind::PureDuchon {
+src/terms/basis.rs:17232:            block_order: block_order as usize,
+src/terms/basis.rs:18700:            (pure_duchon_block_order(p_order, s_order as f64)) as f64,
+src/terms/basis.rs:18979:            (pure_duchon_block_order(p_order, s_order as f64)) as f64,
+src/terms/basis.rs:19120:        PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order as f64)) as f64, 1);
+src/terms/basis.rs:19952:            (pure_duchon_block_order(p_order, s_order as f64)) as f64,
+src/terms/basis.rs:20275:    let m_kernel = pure_duchon_block_order(user_m, s_order_int as f64);
+src/terms/basis.rs:20497:                pure_duchon_block_order(p_order, s_order),
+src/terms/basis.rs:33076:        let block_order = pure_duchon_block_order(
+src/terms/basis.rs:33080:        let k23 = polyharmonic_kernel(2.0_f64.sqrt(), (block_order) as f64, 2);
+
+exec
+/bin/zsh -lc "sed -n '26605,26645p' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+        match create_difference_penalty_matrix(4, 1, Some(g.view())).unwrap_err() {
+            BasisError::InvalidKnotVector(msg) => {
+                assert!(msg.contains("singular"));
+            }
+            other => panic!("expected InvalidKnotVector, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_thin_plate_kernel_matches_dimensionspecific_forms() {
+        let dist2 = 4.0;
+        assert_abs_diff_eq!(thin_plate_kernel_from_dist2(dist2, 1).unwrap(), 8.0);
+        assert_abs_diff_eq!(
+            thin_plate_kernel_from_dist2(dist2, 2).unwrap(),
+            0.5 * dist2 * dist2.ln(),
+            epsilon = 1e-12
+        );
+        assert_abs_diff_eq!(thin_plate_kernel_from_dist2(dist2, 3).unwrap(), -2.0);
+        assert_abs_diff_eq!(thin_plate_kernel_from_dist2(0.0, 3).unwrap(), 0.0);
+
+        // d=4: general kernel with m=3, power = 2*3-4 = 2, d even & m>=d/2
+        let val4 = thin_plate_kernel_from_dist2(dist2, 4).unwrap();
+        assert!(val4.is_finite(), "d=4 kernel should be finite, got {val4}");
+        assert_ne!(val4, 0.0, "d=4 kernel at dist2=4 should be nonzero");
+
+        // d=5: m=3, power = 2*3-5 = 1 (odd) → c * r^1
+        let val5 = thin_plate_kernel_from_dist2(dist2, 5).unwrap();
+        assert!(val5.is_finite(), "d=5 kernel should be finite, got {val5}");
+
+        // d=19: m=10, power = 1 → c * r
+        let val19 = thin_plate_kernel_from_dist2(dist2, 19).unwrap();
+        assert!(
+            val19.is_finite(),
+            "d=19 kernel should be finite, got {val19}"
+        );
+
+        // Zero distance always returns zero
+        assert_abs_diff_eq!(thin_plate_kernel_from_dist2(0.0, 7).unwrap(), 0.0);
+    }
+
+    #[test]
+
+exec
+/bin/zsh -lc "sed -n '9350,9470p' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+/// isotropic scaling law. After assembling the shape-only pieces, this routine
+/// adds the exact raw-`psi` isotropic-share correction implied by
+/// `phi(r; kappa) = kappa^delta H(kappa r)`.
+struct DuchonCrossPenaltyContext {
+    centers: Array2<f64>,
+    length_scale: Option<f64>,
+    p_order: usize,
+    s_order: usize,
+    pure_block_order: usize,
+    coeffs: Option<DuchonPartialFractionCoeffs>,
+    aniso_log_scales: Vec<f64>,
+    z_kernel: Array2<f64>,
+    poly_cols: usize,
+    identifiability_transform: Option<Array2<f64>>,
+    penaltyinfo: Vec<PenaltyInfo>,
+    d0: Array2<f64>,
+    d1: Array2<f64>,
+    d2: Array2<f64>,
+    d0_eta_proj: Vec<Array2<f64>>,
+    d1_eta_proj: Vec<Array2<f64>>,
+    d2_eta_proj: Vec<Array2<f64>>,
+    op0_s_raw: Array2<f64>,
+    op1_s_raw: Array2<f64>,
+    op2_s_raw: Array2<f64>,
+    op0_c: f64,
+    op1_c: f64,
+    op2_c: f64,
+    op0_s_first_raw: Vec<Array2<f64>>,
+    op1_s_first_raw: Vec<Array2<f64>>,
+    op2_s_first_raw: Vec<Array2<f64>>,
+    // Closed-form cross-axis matrices per q. When `Some`, `compute_pair`
+    // returns the precomputed closed-form cross-axis derivative for that q
+    // and bypasses both `gram_cross_psi_derivative_from_operator` and the
+    // value_share/operator_share corrections (those corrections are for the
+    // centered-η chain rule used by collocation; the closed-form path uses
+    // raw η directly per math team Letter A §9). Indexed [a][b] across all
+    // (a, b) pairs (symmetric).
+    op0_cf_cross_raw: Option<Vec<Vec<Array2<f64>>>>,
+    op1_cf_cross_raw: Option<Vec<Vec<Array2<f64>>>>,
+    op2_cf_cross_raw: Option<Vec<Vec<Array2<f64>>>>,
+}
+
+impl DuchonCrossPenaltyContext {
+    fn project_operator(&self, mat: &Array2<f64>, row_dim: usize) -> Array2<f64> {
+        let kernel_cols = mat.ncols();
+        let total_cols = kernel_cols + self.poly_cols;
+        let mut padded = Array2::<f64>::zeros((row_dim, total_cols));
+        padded.slice_mut(s![.., 0..kernel_cols]).assign(mat);
+        if let Some(z) = self.identifiability_transform.as_ref() {
+            fast_ab(&padded, z)
+        } else {
+            padded
+        }
+    }
+
+    fn compute_pair(&self, axis_a: usize, axis_b: usize) -> Result<Vec<Array2<f64>>, BasisError> {
+        if axis_a >= self.aniso_log_scales.len() || axis_b >= self.aniso_log_scales.len() {
+            return Err(BasisError::InvalidInput(format!(
+                "Duchon cross-penalty pair out of bounds: ({axis_a}, {axis_b}) for dim={}",
+                self.aniso_log_scales.len()
+            )));
+        }
+        if axis_a == axis_b {
+            return Err(BasisError::InvalidInput(format!(
+                "Duchon cross-penalty pair must use distinct axes, got ({axis_a}, {axis_b})"
+            )));
+        }
+
+        let p = self.centers.nrows();
+        let d = self.centers.ncols();
+        let z_cols = self.z_kernel.ncols();
+        let metric_weights = centered_aniso_metric_weights(&self.aniso_log_scales);
+
+        let mut d0_raw_eta_cross = Array2::<f64>::zeros((p, z_cols));
+        let mut d1_raw_eta_cross = Array2::<f64>::zeros((p * d, z_cols));
+        let mut d2_raw_eta_cross = Array2::<f64>::zeros((p * d * d, z_cols));
+
+        for k in 0..p {
+            for j in 0..p {
+                let ci: Vec<f64> = (0..d).map(|a| self.centers[[k, a]]).collect();
+                let cj: Vec<f64> = (0..d).map(|a| self.centers[[j, a]]).collect();
+                let (r, s_vec) = aniso_distance_and_components(&ci, &cj, &self.aniso_log_scales);
+                let (_, _q, t, dt_dr, d2t_dr2) = if let Some(length_scale) = self.length_scale {
+                    let jets = duchon_radial_jets(
+                        r,
+                        length_scale,
+                        self.p_order,
+                        self.s_order,
+                        d,
+                        self.coeffs
+                            .as_ref()
+                            .expect("hybrid Duchon partial-fraction coefficients"),
+                    )?;
+                    (jets.phi, jets.q, jets.t, jets.t_r, jets.t_rr)
+                } else {
+                    let phi = polyharmonic_kernel(r, (self.pure_block_order) as f64, d);
+                    let (q, t, dt_dr, d2t_dr2) = duchon_polyharmonic_operator_block_jets(
+                        r,
+                        self.pure_block_order as f64,
+                        d,
+                    )?;
+                    (phi, q, t, dt_dr, d2t_dr2)
+                };
+                for col in 0..z_cols {
+                    let z_jc = self.z_kernel[[j, col]];
+                    let s_a = s_vec[axis_a];
+                    let s_b = s_vec[axis_b];
+                    let sa_sb = s_a * s_b;
+
+                    // At r=0 (center collisions) the displacement components
+                    // h vanish, so s_a = s_b = 0 and the limit of every cross
+                    // term is 0. Skip the t·s·s and h·h products explicitly to
+                    // avoid 0·∞ producing NaN for pure polyharmonic kernels
+                    // that have t→∞ at the origin.
+                    if r <= 1e-14 {
+                        continue;
+                    }
+                    d0_raw_eta_cross[[k, col]] += t * sa_sb * z_jc;
+
+                    for axis in 0..d {
+                        let h_l = ci[axis] - cj[axis];
+
+exec
+/bin/zsh -lc "sed -n '9728,9760p' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+                        let (r, s_vec) = aniso_distance_and_components(&ci, &cj, aniso_log_scales);
+
+                        // Get the Duchon radial jets, including the exact off-origin
+                        // derivatives of t = R²φ needed for D₁/D₂ anisotropic penalties.
+                        let (phi, q, t, dt_dr, d2t_dr2) = if let Some(length_scale) = length_scale {
+                            let jets = duchon_radial_jets(
+                                r,
+                                length_scale,
+                                p_order,
+                                s_order,
+                                d,
+                                coeffs
+                                    .as_ref()
+                                    .expect("hybrid Duchon partial-fraction coefficients"),
+                            )?;
+                            (jets.phi, jets.q, jets.t, jets.t_r, jets.t_rr)
+                        } else {
+                            let phi = polyharmonic_kernel(r, (pure_block_order) as f64, d);
+                            let (q, t, dt_dr, d2t_dr2) = duchon_polyharmonic_operator_block_jets(
+                                r,
+                                pure_block_order as f64,
+                                d,
+                            )?;
+                            (phi, q, t, dt_dr, d2t_dr2)
+                        };
+
+                        // Fill raw operator matrices (projected through Z_kernel).
+                        for col in 0..z_cols {
+                            let z_jc = z_kernel[[j, col]];
+                            chunk.d0_raw[[k_local, col]] += phi * z_jc;
+
+                            // D₁: anisotropic gradient components.
+                            //   ∂φ/∂x_b = φ_r · ∂r/∂x_b = (φ_r/r) · w_b · h_b = q · w_b · h_b
+
+exec
+/bin/zsh -lc "sed -n '13010,13025p' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+        / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
+
+    let (q, _, _, _, _) = duchon_matern_family_jet4(r, kappa, -c * kappa, nu - 1.0)?;
+    let (t, t_r, t_rr, _, _) = duchon_matern_family_jet4(r, kappa, c * kappa * kappa, nu - 2.0)?;
+    Ok((q, t, t_r, t_rr))
+}
+
+#[inline(always)]
+fn pure_duchon_block_order(p_order: usize, s_order: f64) -> f64 {
+    p_order as f64 + s_order
+}
+
+fn validate_duchon_kernel_orders(
+    length_scale: Option<f64>,
+    p_order: usize,
+    s_order: f64,
+
+exec
+/bin/zsh -lc "sed -n '17215,17238p' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+    validate_duchon_collocation_orders(
+        None,
+        p_order,
+        s_order as f64,
+        dim,
+        duchon_max_active_operator_derivative_order(&spec.operator_penalties),
+    )?;
+    let block_order = pure_duchon_block_order(p_order, s_order as f64) as usize;
+    let mut design_result = build_aniso_design_psi_derivatives_shared(
+        data,
+        centers.view(),
+        raw_eta,
+        p_final,
+        Some(z_kernel),
+        identifiability_transform.clone(),
+        poly_cols,
+        RadialScalarKind::PureDuchon {
+            block_order: block_order as usize,
+            p_order,
+            s_order,
+            dim,
+        },
+    )?;
+
+
+exec
+/bin/zsh -lc 'rg -n "fn validate_duchon_collocation_orders|duchon_max_active_operator_derivative_order|collocation" src/terms/basis.rs' in /Users/user/gam
+ succeeded in 0ms:
+1352:/// low-frequency null-space order. The penalty blocks are collocation
+2879:///   (a) operator collocation up to `max_op`:        `2(p + s) > d + max_op`
+2950:/// (`2(p+s) > d`), tension requires D1 collocation (`2(p+s) > d+1`), and
+2951:/// stiffness requires D2 collocation (`2(p+s) > d+2`).
+2952:pub fn duchon_max_active_operator_derivative_order(
+6413:    pub collocation_points: Array2<f64>,
+7823:    // spectrum — using parameters that satisfy Duchon's collocation gates:
+7824:    //   2(p + s) > d + max_op   pointwise kernel + collocation existence
+8237:    // Full derivation used by collocation operators:
+8498:/// operator collocation matrices D1 (gradient) and D2 (full Hessian).
+8784:/// collocation matrix (D₀, D₁, D₂) and assembles the Gram product-rule
+9384:    // centered-η chain rule used by collocation; the closed-form path uses
+9527:        // when `op_q_cf_cross_raw` is `Some`; collocation otherwise. Both
+9633:    validate_duchon_collocation_orders(
+9638:        duchon_max_active_operator_derivative_order(operator_penalties),
+10032:    // q=0 mass always stays on collocation (closed-form Lebesgue at q=0 is
+10034:    // gate is identical to the value-side path: q=0 stays collocation and
+10189:        op0_cf_cross_raw: None, // q=0 mass always stays on collocation.
+10581:///   to the collocation `D_q^T D_q` Gram instead — this routine returns
+10629:    // `D_q^T D_q` collocation instead.
+10676:/// (`4ℓ ≤ 2q + d`); the caller should fall back to the collocation
+10775:/// penalties. Matches the magnitude used by hybrid κ>0 collocation builders
+11188:/// eigenvalues); with this gate, both q's route to collocation
+11233:    // q=0 mass always uses collocation Gram for symmetry with the pure path
+11246:    // define the desired PSD operator block, so the finite-K collocation
+11325:        // Mass is the collocation Gram; no closed-form operator analog (the
+11326:        // factory takes q∈{1,2} via the closed-form path; q=0 is collocation).
+11442:/// the collocation Gram `D_q^T D_q`, which is the same regularization the
+11457:    // q=0 mass is the *centered* collocation Gram — the data-density-weighted
+11459:    // collocation sites. Centering each design column by its mean across rows
+11482:    // either test routes to collocation `D_qᵀD_q`, which is PSD by
+11553:fn operator_penalty_candidates_from_collocation(
+11880:pub fn build_matern_collocation_operator_matrices(
+11882:    collocationweights: Option<ArrayView1<'_, f64>>,
+11895:    let row_scales = if let Some(w) = collocationweights {
+11898:                "collocation weight length mismatch: got {}, expected {p}",
+11906:                    "collocation weights must be finite and non-negative; got {wk}"
+11921:    // and [k*d*d..(k+1)*d*d] in d2 are disjoint for each collocation row k.
+11953:                        "Matérn nu=1/2 has singular Laplacian at center collisions for d>1; choose nu>=3/2 or avoid collocation at centers".to_string(),
+12003:                        "non-finite Matérn collocation operator entry at row={k}, col={j}, r={r}, nu={nu:?}"
+12019:                        "non-finite Matérn collocation operator entry at row={k}, col={j}, r=0, nu={nu:?}"
+12081:        collocation_points: centers.to_owned(),
+12087:pub fn build_duchon_collocation_operator_matrices(
+12089:    collocationweights: Option<ArrayView1<'_, f64>>,
+12098:    build_duchon_collocation_operator_matriceswithworkspace(
+12100:        collocationweights,
+12113:    collocationweights: Option<ArrayView1<'_, f64>>,
+12120:    let ops = build_duchon_collocation_operator_matrices(
+12122:        collocationweights,
+12152:pub fn build_duchon_collocation_operator_matriceswithworkspace(
+12154:    collocationweights: Option<ArrayView1<'_, f64>>,
+12168:    validate_duchon_collocation_orders(
+12191:    let row_scales = if let Some(w) = collocationweights {
+12194:                "collocation weight length mismatch: got {}, expected {p_colloc}",
+12202:                    "collocation weights must be finite and non-negative; got {wk}"
+12252:                    "non-finite Duchon collocation operator derivative at rows ({k}, {j}), r={r}"
+12309:    // collocation operators feed only penalty construction, so the polynomial
+12322:        collocation_points: centers.to_owned(),
+13097:fn validate_duchon_collocation_orders(
+13110:    // — and therefore for k-th-order derivative *collocation* of the
+13116:    // matrices ultimately built from these collocation operators are of
+13122:            "Duchon D1 collocation requires 2*(p+s) > dimension+1; got 2*(p+s)={spectral_order}, dimension={k_dim}, p={p_order}, s={s_order}"
+13127:            "Duchon D2 collocation requires 2*(p+s) > dimension+2; got 2*(p+s)={spectral_order}, dimension={k_dim}, p={p_order}, s={s_order}"
+14015:    let ops = build_matern_collocation_operator_matrices(
+14025:    Ok(operator_penalty_candidates_from_collocation(
+15525:    // Raw Gram derivatives from operator-collocation matrix D(psi):
+15913:    validate_duchon_collocation_orders(
+15918:        duchon_max_active_operator_derivative_order(&spec.operator_penalties),
+16187:    // collocation Gram; q∈{1,2} uses the continuous closed-form Lebesgue
+17215:    validate_duchon_collocation_orders(
+17220:        duchon_max_active_operator_derivative_order(&spec.operator_penalties),
+17790:    // Once {phi, q, ell} and their psi derivatives are known, the collocation
+18636:/// matrices built from collocation images of the final function, not the
+20454:        duchon_max_active_operator_derivative_order(&spec.operator_penalties);
+20455:    validate_duchon_collocation_orders(
+20615:    let ops = build_duchon_collocation_operator_matriceswithworkspace(
+20630:    // object — not a substitute for the collocation D^T D poly block, which
+20632:    // Q^T G_raw Q matches the collocation kernel sub-block in the limit
+20634:    // forces the collocation D^T D fallback.
+20679:        // spring lives at the data rather than at the (subset) collocation
+20997:/// satisfying the collocation gate `2(p + s) > d + max_op` for max_op = 2
+21000:/// only the collocation/spectral-existence condition.
+21011:    let max_op = 2usize; // mass + tension + stiffness collocation
+29323:    /// acts on deviations from the function's row-mean over collocation
+29420:        // limited, and the collocation Gram fallbacks for q=1/q=2 fold in
+29577:    /// Integer power forces `s = 2` to clear D₂ collocation
+29619:    /// `2s = 1 < d = 2` (CPD) and `2(p+s) = 5 > d+2 = 4` (D₂ collocation)
+29657:    /// before the fix). The gate now forces the collocation fallback
+29701:    fn test_pure_duchon_candidate_factory_falls_back_to_collocation_in_divergent_regime() {
+29706:        // back to collocation `D_q^T D_q` for that q.
+29709:        // adequacy `2s < d`, D2 collocation `2(p+s) > d+2`, closed-form
+29719:        // = 8) so the factory must fall back to collocation `D_2^T D_2`
+29794:        // silently routing the tension penalty to collocation.
+29864:        // falls through to collocation when the per-q convergence
+29866:        // `test_pure_duchon_candidate_factory_falls_back_to_collocation_in_divergent_regime`).
+30026:    fn test_tps_closed_form_matches_collocation() {
+30028:        // built by the existing collocation path
+30092:    fn test_tps_pair_block_gates_to_collocation_for_q1_q2_at_s0() {
+30096:        // `D_q^T D_q` collocation). We verify this for the standard
+30113:                     to collocation D_q^T D_q",
+30120:    fn test_matern_closed_form_matches_collocation() {
+30184:        // Constancy of the closed-form-vs-collocation ratio. The reference
+30210:            "closed-form / collocation ratio must be finite and positive, got {ratio}"
+30221:                    "closed-form / collocation ratio non-constant at ({i},{j}): \
+30334:        // three active penalties matching collocation arity.
+30362:    fn test_duchon_linear_nullspace_uses_collocation() {
+30366:        // q ≥ 1 over R^d). The gate must fall back to collocation so all
+30380:            .expect("Linear-nullspace Duchon basis should build via collocation fallback");
+30567:    fn test_pure_duchon_rejects_undefined_gradient_collocation() {
+30574:        let err = match build_duchon_collocation_operator_matrices(
+30588:            err.to_string().contains("D1 collocation"),
+30594:    fn test_pure_duchon_rejects_divergent_laplacian_collocation() {
+30597:        // collocation regularity check instead of auto-degrading to the
+30600:        let err = match build_duchon_collocation_operator_matrices(
+30610:            Ok(_) => panic!("2D thin-plate Duchon collocation has no finite collision Laplacian"),
+30614:            err.to_string().contains("D2 collocation"),
+30694:    fn test_duchon_aniso_collocation_uses_metric_weights() {
+30697:        let ops = build_duchon_collocation_operator_matrices(
+30707:        .expect("anisotropic Duchon collocation");
+31122:    /// FD of the cost-side collocation operators. Isolates whether the
+31136:        let ops_plus = build_duchon_collocation_operator_matriceswithworkspace(
+31148:        let ops_minus = build_duchon_collocation_operator_matriceswithworkspace(
+31239:        let ops_base = build_duchon_collocation_operator_matriceswithworkspace(
+31254:        let ops_plus = build_duchon_collocation_operator_matriceswithworkspace(
+31266:        let ops_minus = build_duchon_collocation_operator_matriceswithworkspace(
+33515:    fn test_collocation_derivatives_are_finite_at_rzero() {
+33517:        let m_ops = build_matern_collocation_operator_matrices(
+33530:        let d_ops = build_duchon_collocation_operator_matrices(
+33546:    fn test_matern_collocationweights_scalerows_by_sqrtweight() {
+33548:        let unit = build_matern_collocation_operator_matrices(
+33559:        let weighted = build_matern_collocation_operator_matrices(
+33569:        // First collocation row should scale by sqrt(4)=2.
+33711:    fn matern_collocation_operator_matrices_should_match_closed_forms_in_1d() {
+33720:            let ops = build_matern_collocation_operator_matrices(
+33729:            .expect("matern collocation operators");
+34578:    fn build_collocation_operator_penalty_via_dq_dq(
+34586:        let ops = build_duchon_collocation_operator_matrices(
+34596:        .expect("collocation operator matrices");
+34614:        let ops = build_duchon_collocation_operator_matrices(
+34624:        .expect("collocation operator matrices");
+34656:    fn test_analytic_vs_collocation_high_k_agreement() {
+34659:        // collocation D_1^T D_1. Check structural invariants and rough
+34662:        // > 4m` (IR with κ>0), and `2(p+s) > d+1` (D1 collocation validity).
+34694:            let colloc = build_collocation_operator_penalty_via_dq_dq(
+34723:                "non-finite collocation q={q}"
+34730:            assert!(cl_norm > 1e-9, "collocation penalty is ~zero (q={q})");
+34733:            // integral; collocation is a Riemann-style approximation. After
+34744:                "closed-form vs collocation drift too far at K={k}, q={q}: rel_frob={rel}"
+
+exec
+/bin/zsh -lc "sed -n '13025,13125p' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+    s_order: f64,
+    k_dim: usize,
+) -> Result<(), BasisError> {
+    if k_dim == 0 {
+        return Err(BasisError::InvalidInput(
+            "Duchon basis requires at least one covariate dimension".to_string(),
+        ));
+    }
+    if let Some(scale) = length_scale
+        && (!scale.is_finite() || scale <= 0.0)
+    {
+        return Err(BasisError::InvalidInput(
+            "Duchon hybrid length_scale must be finite and positive".to_string(),
+        ));
+    }
+    // Two independent well-posedness conditions on (p, s, d) for pure Duchon.
+    //
+    // (1) CPD-vs-nullspace adequacy — gated below on `length_scale.is_none()`.
+    //     The pure-polyharmonic kernel of effective order m = p+s in R^d is
+    //     phi(r) = r^{2m-d}, or r^{2m-d}·log r when 2m-d is a non-negative
+    //     even integer (the "log case", reached precisely when d is even
+    //     and m >= d/2). Wendland's Theorem 8.17 / 8.18 give its
+    //     conditional-positive-definiteness order:
+    //
+    //         d odd,  exponent half-integer:  ceil((2m-d)/2) = m - (d-1)/2
+    //         d even, log case:               (2m-d)/2 + 1   = m - d/2 + 1
+    //
+    //     Duchon interpolation with polynomial nullspace P_p (polynomials
+    //     of degree < p) is uniquely solvable iff the kernel's CPD order
+    //     does not exceed p. Substituting m = p + s:
+    //
+    //         d odd:  s <= (d-1)/2     <=>  2s <= d - 1
+    //         d even: s <= d/2 - 1     <=>  2s <= d - 2
+    //
+    //     Both branches collapse to `2s < d` once we use that s and d are
+    //     integers and 2s is therefore even (so `2s = d - 1` is impossible
+    //     for even d, and `2s <= d - 2` is just `2s < d`).
+    //
+    //     Counter-example admitted if this guard is dropped: d=2, p=1, s=1
+    //     passes the spectral check (2(1+1)=4 > 2) and builds the TPS
+    //     kernel c·r²·log r against a constants-only nullspace P_1; the
+    //     interpolation form is not PD on lambda perp P_1 and the fitted
+    //     penalty is meaningless.
+    //
+    //     The hybrid (Matérn-blended) Duchon kernel sidesteps this entirely:
+    //     the Matérn remainder is strictly positive definite (CPD order 0),
+    //     so any P_p suffices — hence the `length_scale.is_none()` gate.
+    //
+    // (2) Spectral kernel-existence — universal, gated below on the sum.
+    //     The pointwise kernel comes from the inverse Fourier of
+    //     1/|xi|^{2(p+s)}, which is a finite distribution at the origin
+    //     iff `2(p+s) > d`. Below that threshold the radial kernel value
+    //     diverges and there is nothing to evaluate.
+    if !s_order.is_finite() || s_order < 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon spectral power must be finite and ≥ 0; got s={s_order}"
+        )));
+    }
+    if length_scale.is_none() && 2.0 * s_order >= k_dim as f64 {
+        return Err(BasisError::InvalidInput(format!(
+            "pure Duchon requires power < dimension/2 for nullspace degree < {p_order}; got power={s_order}, dimension={k_dim}"
+        )));
+    }
+    let spectral_order = 2.0 * (p_order as f64 + s_order);
+    if spectral_order <= k_dim as f64 {
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon pointwise kernel values require 2*(p+s) > dimension; got 2*(p+s)={spectral_order}, dimension={k_dim}, p={p_order}, s={s_order}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_duchon_collocation_orders(
+    length_scale: Option<f64>,
+    p_order: usize,
+    s_order: f64,
+    k_dim: usize,
+    max_operator_derivative_order: usize,
+) -> Result<(), BasisError> {
+    // Kernel-level conditions (existence + CPD/nullspace adequacy) come first;
+    // the operator-level conditions below build on a pointwise-valid kernel.
+    validate_duchon_kernel_orders(length_scale, p_order, s_order, k_dim)?;
+    // The spectral_order > k_dim + k checks below are C^k-at-origin
+    // conditions: for the polyharmonic kernel r^{2(p+s)-d} (or the log
+    // variant) to admit k-th radial derivatives in the distributional sense
+    // — and therefore for k-th-order derivative *collocation* of the
+    // kernel against centers to produce a finite operator — we need its
+    // exponent to clear the next k orders of differentiation at the
+    // origin. Equivalently: 2(p+s) - d > k.
+    //
+    // Note these are independent of the CPD/nullspace check. The penalty
+    // matrices ultimately built from these collocation operators are of
+    // the form S = D_k^T D_k and are PSD by construction; the discipline
+    // here is purely about *existence* of D_k itself.
+    let spectral_order = 2.0 * (p_order as f64 + s_order);
+    if max_operator_derivative_order >= 1 && spectral_order <= k_dim as f64 + 1.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon D1 collocation requires 2*(p+s) > dimension+1; got 2*(p+s)={spectral_order}, dimension={k_dim}, p={p_order}, s={s_order}"
+        )));
+    }
+    if max_operator_derivative_order >= 2 && spectral_order <= k_dim as f64 + 2.0 {
+
+exec
+/bin/zsh -lc "sed -n '17180,17215p' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+        return Err(BasisError::InvalidInput(
+            "aniso derivatives require aniso_log_scales to be set".to_string(),
+        ));
+    };
+    let dim = data.ncols();
+    if raw_eta.len() != dim {
+        return Err(BasisError::DimensionMismatch(format!(
+            "aniso_log_scales length {} != data dimension {dim}",
+            raw_eta.len()
+        )));
+    }
+    if spec.length_scale.is_some() {
+        return Err(BasisError::InvalidInput(
+            "pure Duchon aniso derivative path requires length_scale=None".to_string(),
+        ));
+    }
+    let mut workspace = BasisWorkspace::default();
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let effective_nullspace_order =
+        duchon_effective_nullspace_order(centers.view(), spec.nullspace_order);
+    let z_kernel = kernel_constraint_nullspace(
+        centers.view(),
+        effective_nullspace_order,
+        &mut workspace.cache,
+    )?;
+    let poly_cols = polynomial_block_from_order(data, effective_nullspace_order).ncols();
+    let p_padded = z_kernel.ncols() + poly_cols;
+    let identifiability_transform =
+        frozen_spatial_identifiability_transform(&spec.identifiability, p_padded, "Duchon")?;
+    let p_final = identifiability_transform
+        .as_ref()
+        .map(|transform| transform.ncols())
+        .unwrap_or(p_padded);
+    let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
+    let s_order = spec.power_as_usize();
+    validate_duchon_collocation_orders(
+
+exec
+/bin/zsh -lc "sed -n '13120,13135p' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+    if max_operator_derivative_order >= 1 && spectral_order <= k_dim as f64 + 1.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon D1 collocation requires 2*(p+s) > dimension+1; got 2*(p+s)={spectral_order}, dimension={k_dim}, p={p_order}, s={s_order}"
+        )));
+    }
+    if max_operator_derivative_order >= 2 && spectral_order <= k_dim as f64 + 2.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "Duchon D2 collocation requires 2*(p+s) > dimension+2; got 2*(p+s)={spectral_order}, dimension={k_dim}, p={p_order}, s={s_order}"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DuchonPartialFractionCoeffs {
+    a: Vec<f64>,
+
+exec
+/bin/zsh -lc "sed -n '4192,4204{=;p;}' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+4192
+        let t_row = self.latent.row(row);
+4193
+        let mut r2 = 0.0_f64;
+4194
+        for a in 0..self.latent.latent_dim() {
+4195
+            let delta = t_row[a] - self.centers[[center, a]];
+4196
+            r2 += delta * delta;
+4197
+        }
+4198
+        let r = r2.sqrt();
+4199
+        if r == 0.0 {
+4200
+            return Ok(0.0);
+4201
+        }
+4202
+        let (_, q, _) = self.radial_kind.eval_design_triplet(r)?;
+4203
+        Ok(q * (t_row[axis] - self.centers[[center, axis]]))
+4204
+    }
+
