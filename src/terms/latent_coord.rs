@@ -101,6 +101,15 @@ pub enum LatentIdMode {
         family: AuxPriorFamily,
         strength: AuxPriorStrength,
     },
+    /// Auxiliary prior plus ARD over latent axes. `AuxPrior` supplies the
+    /// identifiability anchor; `init_log_precision` seeds the per-axis ARD
+    /// coordinates.
+    AuxPriorDimSelection {
+        u: Array2<f64>,
+        family: AuxPriorFamily,
+        strength: AuxPriorStrength,
+        init_log_precision: Option<Array1<f64>>,
+    },
     /// ARD over latent axes. One ridge penalty per latent axis; the per-axis
     /// log-precision joins the outer ρ vector. `init_log_precision` seeds
     /// the per-axis ρ — a vector of length `d`. `None` defaults to a flat
@@ -118,7 +127,10 @@ impl LatentIdMode {
     /// Fixes the audit finding that ARD/DimSelection alone is rotation
     /// symmetric and therefore not a standalone identifiability mode.
     pub fn is_identifiable(&self) -> bool {
-        matches!(self, Self::AuxPrior { .. })
+        matches!(
+            self,
+            Self::AuxPrior { .. } | Self::AuxPriorDimSelection { .. }
+        )
     }
 
     fn reject_dim_selection_alone(&self) {
