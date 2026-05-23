@@ -768,6 +768,19 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
+            (GlmLikelihoodFamily::BetaLogit { phi }, _) => {
+                write_beta_logit_working_state(
+                    y,
+                    eta,
+                    priorweights,
+                    phi,
+                    mu,
+                    weights,
+                    z,
+                    derivatives,
+                )?;
+                Ok(())
+            }
             (GlmLikelihoodFamily::GammaLog, _) => {
                 write_gamma_log_working_state(
                     y,
@@ -8471,6 +8484,8 @@ fn write_gamma_log_working_state(
 }
 
 const TWEEDIE_LIMIT_EPS: f64 = 1.0e-6;
+const BETA_RESPONSE_EPS: f64 = 1.0e-12;
+const BETA_MU_EPS: f64 = 1.0e-12;
 
 #[inline]
 fn tweedie_p_is_poisson(p: f64) -> bool {
@@ -8506,6 +8521,41 @@ fn tweedie_log_weight_mu_power(mu: f64, p: f64) -> f64 {
 #[inline]
 fn valid_negbin_theta(theta: f64) -> bool {
     theta.is_finite() && theta > 0.0
+}
+
+#[inline]
+fn valid_beta_phi(phi: f64) -> bool {
+    phi.is_finite() && phi > 0.0
+}
+
+#[inline]
+fn safe_beta_response(y: f64) -> f64 {
+    y.clamp(BETA_RESPONSE_EPS, 1.0 - BETA_RESPONSE_EPS)
+}
+
+#[inline]
+fn safe_beta_mu(mu: f64) -> f64 {
+    mu.clamp(BETA_MU_EPS, 1.0 - BETA_MU_EPS)
+}
+
+#[inline]
+fn trigamma(mut x: f64) -> f64 {
+    if !(x.is_finite() && x > 0.0) {
+        return f64::NAN;
+    }
+    let mut acc = 0.0;
+    while x < 8.0 {
+        acc += 1.0 / (x * x);
+        x += 1.0;
+    }
+    let inv = 1.0 / x;
+    let inv2 = inv * inv;
+    acc + inv
+        + 0.5 * inv2
+        + inv2 * inv / 6.0
+        - inv2 * inv2 * inv / 30.0
+        + inv2 * inv2 * inv2 * inv / 42.0
+        - inv2 * inv2 * inv2 * inv2 * inv / 30.0
 }
 
 #[inline]
@@ -8794,6 +8844,116 @@ fn write_negative_binomial_log_working_state(
                     0.0
                 };
                 *z_o = eta_i + (y[i] - mu_i) / mu_i;
+            });
+    }
+    Ok(())
+}
+
+/// Working state for Beta(mu * phi, (1 - mu) * phi) with a logit link.
+#[inline]
+fn write_beta_logit_working_state(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<f64>,
+    phi: f64,
+    mu: &mut Array1<f64>,
+    weights: &mut Array1<f64>,
+    z: &mut Array1<f64>,
+    derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
+) -> Result<(), EstimationError> {
+    const MIN_WEIGHT: f64 = 1e-12;
+    if !valid_beta_phi(phi) {
+        return Err(EstimationError::InvalidInput(format!(
+            "beta-regression phi must be finite and > 0; got {phi}"
+        )));
+    }
+    if let Some(derivs) = derivatives {
+        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+        let z_s = z.as_slice_mut().expect("z must be contiguous");
+        let dmu_s = derivs
+            .dmu_deta
+            .as_slice_mut()
+            .expect("dmu_deta must be contiguous");
+        let d2_s = derivs
+            .d2mu_deta2
+            .as_slice_mut()
+            .expect("d2mu_deta2 must be contiguous");
+        let d3_s = derivs
+            .d3mu_deta3
+            .as_slice_mut()
+            .expect("d3mu_deta3 must be contiguous");
+        let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
+        let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
+        mu_s.par_iter_mut()
+            .zip(weights_s.par_iter_mut())
+            .zip(z_s.par_iter_mut())
+            .zip(dmu_s.par_iter_mut())
+            .zip(d2_s.par_iter_mut())
+            .zip(d3_s.par_iter_mut())
+            .zip(c_s.par_iter_mut())
+            .zip(d_s.par_iter_mut())
+            .enumerate()
+            .for_each(
+                |(i, (((((((mu_o, w_o), z_o), dmu_o), d2_o), d3_o), c_o), d_o))| {
+                    let eta_raw = eta[i];
+                    let eta_i = eta_raw.clamp(-700.0, 700.0);
+                    let jet = logit_inverse_link_jet5(eta_i);
+                    let mu_i = safe_beta_mu(jet.mu);
+                    let q = (mu_i * (1.0 - mu_i)).max(BETA_MU_EPS);
+                    let yi = safe_beta_response(y[i]);
+                    let a = (mu_i * phi).max(BETA_MU_EPS);
+                    let b = ((1.0 - mu_i) * phi).max(BETA_MU_EPS);
+                    let score_mu =
+                        phi * (digamma(b) - digamma(a) + yi.ln() - (1.0 - yi).ln());
+                    let info_mu = phi * phi * (trigamma(a) + trigamma(b));
+                    let raw_weight = priorweights[i].max(0.0) * q * q * info_mu;
+                    let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
+                    *mu_o = mu_i;
+                    *w_o = if raw_weight > 0.0 {
+                        raw_weight.max(MIN_WEIGHT)
+                    } else {
+                        0.0
+                    };
+                    *z_o = eta_i + score_mu / (q * info_mu).max(MIN_WEIGHT);
+                    *dmu_o = q;
+                    *d2_o = q * (1.0 - 2.0 * mu_i);
+                    *d3_o = q * (1.0 - 6.0 * q);
+                    if floor_active || eta_raw != eta_i {
+                        *c_o = 0.0;
+                        *d_o = 0.0;
+                    } else {
+                        *c_o = 0.0;
+                        *d_o = 0.0;
+                    }
+                },
+            );
+    } else {
+        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+        let z_s = z.as_slice_mut().expect("z must be contiguous");
+        mu_s.par_iter_mut()
+            .zip(weights_s.par_iter_mut())
+            .zip(z_s.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, ((mu_o, w_o), z_o))| {
+                let eta_i = eta[i].clamp(-700.0, 700.0);
+                let jet = logit_inverse_link_jet5(eta_i);
+                let mu_i = safe_beta_mu(jet.mu);
+                let q = (mu_i * (1.0 - mu_i)).max(BETA_MU_EPS);
+                let yi = safe_beta_response(y[i]);
+                let a = (mu_i * phi).max(BETA_MU_EPS);
+                let b = ((1.0 - mu_i) * phi).max(BETA_MU_EPS);
+                let score_mu = phi * (digamma(b) - digamma(a) + yi.ln() - (1.0 - yi).ln());
+                let info_mu = phi * phi * (trigamma(a) + trigamma(b));
+                let raw_weight = priorweights[i].max(0.0) * q * q * info_mu;
+                *mu_o = mu_i;
+                *w_o = if raw_weight > 0.0 {
+                    raw_weight.max(MIN_WEIGHT)
+                } else {
+                    0.0
+                };
+                *z_o = eta_i + score_mu / (q * info_mu).max(MIN_WEIGHT);
             });
     }
     Ok(())

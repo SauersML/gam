@@ -290,6 +290,7 @@ pub enum ResponseFamily {
     Poisson,
     Tweedie,
     NegativeBinomial,
+    Beta,
     Gamma,
     RoystonParmar,
 }
@@ -303,6 +304,7 @@ impl ResponseFamily {
             Self::Poisson => "poisson",
             Self::Tweedie => "tweedie",
             Self::NegativeBinomial => "negative-binomial",
+            Self::Beta => "beta",
             Self::Gamma => "gamma",
             Self::RoystonParmar => "royston-parmar",
         }
@@ -383,7 +385,8 @@ impl LikelihoodSpec {
             ResponseFamily::Binomial
             | ResponseFamily::Poisson
             | ResponseFamily::Tweedie
-            | ResponseFamily::NegativeBinomial => LikelihoodScaleMetadata::FixedDispersion {
+            | ResponseFamily::NegativeBinomial
+            | ResponseFamily::Beta => LikelihoodScaleMetadata::FixedDispersion {
                 phi: 1.0,
             },
             ResponseFamily::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
@@ -398,6 +401,7 @@ impl From<LikelihoodFamily> for LikelihoodSpec {
             LikelihoodFamily::PoissonLog => ResponseFamily::Poisson,
             LikelihoodFamily::Tweedie { .. } => ResponseFamily::Tweedie,
             LikelihoodFamily::NegativeBinomial { .. } => ResponseFamily::NegativeBinomial,
+            LikelihoodFamily::BetaLogit { .. } => ResponseFamily::Beta,
             LikelihoodFamily::GammaLog => ResponseFamily::Gamma,
             LikelihoodFamily::RoystonParmar => ResponseFamily::RoystonParmar,
             LikelihoodFamily::BinomialLogit
@@ -420,8 +424,9 @@ impl From<LikelihoodFamily> for LikelihoodSpec {
             LikelihoodFamily::PoissonLog
             | LikelihoodFamily::Tweedie { .. }
             | LikelihoodFamily::NegativeBinomial { .. }
+            | LikelihoodFamily::BetaLogit { .. }
             | LikelihoodFamily::GammaLog => {
-                InverseLink::Standard(LinkFunction::Log)
+                InverseLink::Standard(value.link_function())
             }
             LikelihoodFamily::BinomialLogit => InverseLink::Standard(LinkFunction::Logit),
             LikelihoodFamily::BinomialProbit => InverseLink::Standard(LinkFunction::Probit),
@@ -466,6 +471,9 @@ impl TryFrom<LikelihoodSpec> for LikelihoodFamily {
             (ResponseFamily::NegativeBinomial, InverseLink::Standard(LinkFunction::Log)) => {
                 Ok(Self::NegativeBinomial { theta: 1.0 })
             }
+            (ResponseFamily::Beta, InverseLink::Standard(LinkFunction::Logit)) => {
+                Ok(Self::BetaLogit { phi: 1.0 })
+            }
             (ResponseFamily::Gamma, InverseLink::Standard(LinkFunction::Log)) => Ok(Self::GammaLog),
             (ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)) => {
                 Ok(Self::RoystonParmar)
@@ -507,6 +515,7 @@ pub enum LikelihoodFamily {
     PoissonLog,
     Tweedie { p: f64 },
     NegativeBinomial { theta: f64 },
+    BetaLogit { phi: f64 },
     GammaLog,
     RoystonParmar,
 }
@@ -520,6 +529,7 @@ impl LikelihoodFamily {
             | Self::Tweedie { .. }
             | Self::NegativeBinomial { .. }
             | Self::GammaLog => LinkFunction::Log,
+            Self::BetaLogit { .. } => LinkFunction::Logit,
             Self::BinomialLogit | Self::BinomialMixture => LinkFunction::Logit,
             Self::BinomialProbit => LinkFunction::Probit,
             Self::BinomialCLogLog | Self::BinomialLatentCLogLog => LinkFunction::CLogLog,
@@ -542,6 +552,7 @@ impl LikelihoodFamily {
             Self::PoissonLog => "poisson-log",
             Self::Tweedie { .. } => "tweedie-log",
             Self::NegativeBinomial { .. } => "negative-binomial-log",
+            Self::BetaLogit { .. } => "beta-regression-logit",
             Self::GammaLog => "gamma-log",
             Self::RoystonParmar => "royston-parmar",
         }
@@ -561,6 +572,7 @@ impl LikelihoodFamily {
             Self::PoissonLog => "Poisson Log",
             Self::Tweedie { .. } => "Tweedie Log",
             Self::NegativeBinomial { .. } => "Negative-Binomial Log",
+            Self::BetaLogit { .. } => "Beta Regression Logit",
             Self::GammaLog => "Gamma Log",
             Self::RoystonParmar => "Royston Parmar",
         }
@@ -638,6 +650,7 @@ impl LikelihoodFamily {
             | Self::BinomialMixture
             | Self::Tweedie { .. }
             | Self::NegativeBinomial { .. }
+            | Self::BetaLogit { .. }
             | Self::PoissonLog => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
             Self::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
         }
@@ -657,6 +670,7 @@ pub enum GlmLikelihoodFamily {
     PoissonLog,
     Tweedie { p: f64 },
     NegativeBinomial { theta: f64 },
+    BetaLogit { phi: f64 },
     GammaLog,
 }
 
@@ -798,6 +812,7 @@ impl TryFrom<LikelihoodFamily> for GlmLikelihoodFamily {
             LikelihoodFamily::PoissonLog => Ok(Self::PoissonLog),
             LikelihoodFamily::Tweedie { p } => Ok(Self::Tweedie { p }),
             LikelihoodFamily::NegativeBinomial { theta } => Ok(Self::NegativeBinomial { theta }),
+            LikelihoodFamily::BetaLogit { phi } => Ok(Self::BetaLogit { phi }),
             LikelihoodFamily::GammaLog => Ok(Self::GammaLog),
             LikelihoodFamily::RoystonParmar => {
                 Err("RoystonParmar is survival-specific and not a GLM likelihood")
@@ -819,6 +834,7 @@ impl From<GlmLikelihoodFamily> for LikelihoodFamily {
             GlmLikelihoodFamily::PoissonLog => Self::PoissonLog,
             GlmLikelihoodFamily::Tweedie { p } => Self::Tweedie { p },
             GlmLikelihoodFamily::NegativeBinomial { theta } => Self::NegativeBinomial { theta },
+            GlmLikelihoodFamily::BetaLogit { phi } => Self::BetaLogit { phi },
             GlmLikelihoodFamily::GammaLog => Self::GammaLog,
         }
     }
