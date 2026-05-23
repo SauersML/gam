@@ -5,7 +5,7 @@ use faer::Side;
 use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::Llt as SparseLlt;
 use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
-use ndarray::{Array1, Array2, ArrayBase, Data, Ix1, Ix2};
+use ndarray::{Array1, Array2, ArrayBase, ArrayView2, Data, Ix1, Ix2};
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -402,34 +402,6 @@ pub fn sparse_symmetric_upper_matvec_public<S: Data<Elem = f64>>(
     out
 }
 
-// Lightweight aggregate profiler: count calls and accumulate per-stage time
-// across the whole fit, then dump once at the end. Avoids per-call eprintln
-// stderr-lock overhead that would dominate the very thing we're measuring.
-//
-// SAFETY/CORRECTNESS: temporary scaffolding for the symbolic-Cholesky-reuse
-// perf investigation. Atomics are used so the counters work across threads.
-use std::sync::atomic::{AtomicU64, Ordering};
-pub static PROF_FAC_COUNT: AtomicU64 = AtomicU64::new(0);
-pub static PROF_FAC_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
-pub static PROF_FAC_CHOL_NS: AtomicU64 = AtomicU64::new(0);
-pub static PROF_FAC_LOGDET_NS: AtomicU64 = AtomicU64::new(0);
-pub static PROF_FAC_CANON_NS: AtomicU64 = AtomicU64::new(0);
-
-pub fn prof_fac_dump_and_reset(label: &str) {
-    let calls = PROF_FAC_COUNT.swap(0, Ordering::SeqCst);
-    let total_ns = PROF_FAC_TOTAL_NS.swap(0, Ordering::SeqCst);
-    let chol_ns = PROF_FAC_CHOL_NS.swap(0, Ordering::SeqCst);
-    let logdet_ns = PROF_FAC_LOGDET_NS.swap(0, Ordering::SeqCst);
-    let canon_ns = PROF_FAC_CANON_NS.swap(0, Ordering::SeqCst);
-    eprintln!(
-        "[PROF-AGG {label}] factorize_sparse_spd calls={calls} total={:.3}s canon={:.3}s chol={:.3}s logdet={:.3}s",
-        total_ns as f64 / 1e9,
-        canon_ns as f64 / 1e9,
-        chol_ns as f64 / 1e9,
-        logdet_ns as f64 / 1e9,
-    );
-}
-
 pub fn factorize_sparse_spd(
     h: &SparseColMat<usize, f64>,
 ) -> Result<SparseExactFactor, EstimationError> {
@@ -444,26 +416,18 @@ pub fn factorize_sparse_spd(
     // symmetric-upper and makes the sparse factor path robust to caller encoding.
     let t_start = std::time::Instant::now();
     let n_input = h.ncols();
-    let canon_t = std::time::Instant::now();
     let h_upper = canonicalize_sparse_symmetric_upper(h, ZERO_TOL)?;
-    PROF_FAC_CANON_NS.fetch_add(canon_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    let chol_t = std::time::Instant::now();
     let factor = h_upper.as_ref().sp_cholesky(Side::Upper).map_err(|_| {
         EstimationError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         }
     })?;
-    PROF_FAC_CHOL_NS.fetch_add(chol_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     // Keep an explicit simplicial LLᵀ factor in addition to faer's solver
     // object. The raw L is needed by callers that must reconstruct H in a
     // changed basis, such as active-constraint tangent projection.
-    let logdet_t = std::time::Instant::now();
     let simplicial = factorize_simplicial_canonical_upper(&h_upper)?;
     let logdet = simplicial.logdet;
-    PROF_FAC_LOGDET_NS.fetch_add(logdet_t.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
-    PROF_FAC_COUNT.fetch_add(1, Ordering::Relaxed);
-    PROF_FAC_TOTAL_NS.fetch_add(t_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
     if elapsed_ms > 100.0 {
         log::info!(
             "[sparse-chol] factorize_sparse_spd | n={} | {:.1}ms",
@@ -566,6 +530,32 @@ fn canonicalize_sparse_symmetric_upper(
     })
 }
 
+fn solve_view<R, I, F>(
+    factor: &SparseExactFactor,
+    rhs: ArrayView2<'_, f64>,
+    indices: I,
+    mut result: R,
+    non_finite_message: &'static str,
+    mut consume: F,
+) -> Result<R, EstimationError>
+where
+    I: IntoIterator<Item = (usize, usize)>,
+    F: FnMut(&mut R, usize, usize, f64),
+{
+    let rhsview = FaerArrayView::new(&rhs);
+    let solved = factor.factor.solve(rhsview.as_ref());
+    for (row, col) in indices {
+        let value = solved[(row, col)];
+        if !value.is_finite() {
+            return Err(EstimationError::InvalidInput(
+                non_finite_message.to_string(),
+            ));
+        }
+        consume(&mut result, row, col, value);
+    }
+    Ok(result)
+}
+
 pub fn solve_sparse_spd<S>(
     factor: &SparseExactFactor,
     rhs: &ArrayBase<S, Ix1>,
@@ -580,18 +570,8 @@ where
             factor.n
         )));
     }
-    let rhsview = FaerColView::new(rhs);
-    let out = factor.factor.solve(rhsview.as_ref());
     let mut result = Array1::<f64>::zeros(rhs.len());
-    for i in 0..rhs.len() {
-        let value = out[(i, 0)];
-        if !value.is_finite() {
-            return Err(EstimationError::InvalidInput(
-                "sparse SPD solve produced non-finite values".to_string(),
-            ));
-        }
-        result[i] = value;
-    }
+    solve_sparse_spd_into(factor, rhs, &mut result)?;
     Ok(result)
 }
 
@@ -649,21 +629,17 @@ where
             factor.n
         )));
     }
-    let rhsview = FaerArrayView::new(rhs);
-    let out = factor.factor.solve(rhsview.as_ref());
-    let mut result = Array2::<f64>::zeros(rhs.raw_dim());
-    for i in 0..rhs.nrows() {
-        for j in 0..rhs.ncols() {
-            let value = out[(i, j)];
-            if !value.is_finite() {
-                return Err(EstimationError::InvalidInput(
-                    "sparse SPD multi-solve produced non-finite values".to_string(),
-                ));
-            }
-            result[[i, j]] = value;
-        }
-    }
-    Ok(result)
+    let indices = (0..rhs.nrows()).flat_map(|i| (0..rhs.ncols()).map(move |j| (i, j)));
+    solve_view(
+        factor,
+        rhs.view(),
+        indices,
+        Array2::<f64>::zeros(rhs.raw_dim()),
+        "sparse SPD multi-solve produced non-finite values",
+        |result, row, col, value| {
+            result[[row, col]] = value;
+        },
+    )
 }
 
 pub fn solve_sparse_spdmulti_rows<S>(
@@ -688,21 +664,17 @@ where
             row_start, row_end, factor.n
         )));
     }
-    let rhsview = FaerArrayView::new(rhs);
-    let out = factor.factor.solve(rhsview.as_ref());
-    let mut result = Array2::<f64>::zeros((row_end - row_start, rhs.ncols()));
-    for i in row_start..row_end {
-        for j in 0..rhs.ncols() {
-            let value = out[(i, j)];
-            if !value.is_finite() {
-                return Err(EstimationError::InvalidInput(
-                    "sparse SPD selected-row solve produced non-finite values".to_string(),
-                ));
-            }
-            result[[i - row_start, j]] = value;
-        }
-    }
-    Ok(result)
+    let indices = (row_start..row_end).flat_map(|i| (0..rhs.ncols()).map(move |j| (i, j)));
+    solve_view(
+        factor,
+        rhs.view(),
+        indices,
+        Array2::<f64>::zeros((row_end - row_start, rhs.ncols())),
+        "sparse SPD selected-row solve produced non-finite values",
+        |result, row, col, value| {
+            result[[row - row_start, col]] = value;
+        },
+    )
 }
 
 pub fn solve_sparse_spdmulti_diagonal_sum<S>(
@@ -721,19 +693,17 @@ where
             rhs.ncols()
         )));
     }
-    let rhsview = FaerArrayView::new(rhs);
-    let out = factor.factor.solve(rhsview.as_ref());
-    let mut sum = 0.0;
-    for col in 0..rhs.ncols() {
-        let value = out[(row_start + col, col)];
-        if !value.is_finite() {
-            return Err(EstimationError::InvalidInput(
-                "sparse SPD selected diagonal solve produced non-finite values".to_string(),
-            ));
-        }
-        sum += value;
-    }
-    Ok(sum)
+    let indices = (0..rhs.ncols()).map(|col| (row_start + col, col));
+    solve_view(
+        factor,
+        rhs.view(),
+        indices,
+        0.0,
+        "sparse SPD selected diagonal solve produced non-finite values",
+        |sum, _, _, value| {
+            *sum += value;
+        },
+    )
 }
 
 pub fn logdet_from_factor(factor: &SparseExactFactor) -> Result<f64, EstimationError> {
