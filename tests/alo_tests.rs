@@ -54,6 +54,7 @@ fn fit_unpenalized(
         convergence_tolerance: 1e-10,
         firth_bias_reduction: matches!(link, LinkFunction::Logit),
         initial_lm_lambda: None,
+        geodesic_acceleration: false,
     };
     let (res, _) = pirls::fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(rho.view()),
@@ -110,6 +111,7 @@ fn fit_identity_penalized(
         convergence_tolerance: 1e-10,
         firth_bias_reduction: false,
         initial_lm_lambda: None,
+        geodesic_acceleration: false,
     };
     let (res, _) = pirls::fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(rho.view()),

@@ -65,6 +65,12 @@ from ._api import (
 )
 from ._binding import RustExtensionUnavailableError
 from ._compare import compare_models
+from ._penalties import (
+    ARDPenalty,
+    IsometryPenalty,
+    Penalty,
+    SparsityPenalty,
+)
 from ._diagnostics import Diagnostics
 from .smooth import (
     BSpline,
@@ -157,6 +163,10 @@ __all__ = [
     "SchemaIssue",
     "SchemaMismatchError",
     "SharedPrecisionGroup",
+    "ARDPenalty",
+    "IsometryPenalty",
+    "Penalty",
+    "SparsityPenalty",
     "Summary",
     "SurvivalPrediction",
     "TermBlock",

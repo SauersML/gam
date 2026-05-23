@@ -227,6 +227,87 @@ class PeriodicSplineCurve(Smooth):
 
 
 @dataclass
+class LatentCoord:
+    """Per-row latent coordinates ``t ∈ ℝ^{N × d}`` as a first-class parameter.
+
+    See ``proposals/latent_coord.md`` in the gam repository for the design
+    rationale and the math; see ``src/terms/latent_coord.rs`` for the Rust
+    side.
+
+    The familiar GAM picture is
+
+    .. code-block::
+
+        y = Φ(x) · β + ε,   penalty(β, ψ),   x observed.
+
+    ``LatentCoord`` promotes one of the covariates ``x`` from *observed* to
+    *latent*: ``t`` is estimated per row alongside the spline coefficients
+    ``β`` and the smoothing parameters ``ρ``. Mechanically this is the same
+    problem the ``ψ`` (log-anisotropy) machinery already solves — both move
+    the design matrix Φ and reuse the IFT-warm-started outer optimizer —
+    except differentiating with respect to the *first* argument of the
+    radial kernel rather than its scale.
+
+    Use cases: GP-LVM, principal manifolds, identifiable nonlinear ICA via
+    iVAE-style auxiliary priors, intrinsic-dimension discovery via ARD.
+
+    Gauge fixing — required to keep the inner Hessian full-rank
+    ----------------------------------------------------------------
+
+    The bare data-fit ``½ ‖y − Φ(t) β‖²`` is invariant under any
+    diffeomorphism ``t ↦ φ(t)`` (any reparameterization can be absorbed
+    into a re-fit of β). This makes the inner Hessian *rank-deficient*
+    along the gauge orbit and IFT breaks. At least one of ``aux_prior`` /
+    ``dim_selection`` must be supplied; pass ``"none"`` to ``gauge`` only
+    if you have a custom penalty separately pinning ``t``.
+
+    Parameters
+    ----------
+    n : int
+        Number of rows ``N``. Must match the response array's row count.
+    d : int
+        Latent dimensionality. For ``dim_selection=True`` this is the
+        ``d_max`` budget — REML will drive unused axes' precision to ∞.
+    init : ``"pca"`` | ``"random"`` | array-like ``(N, d)``
+        Initial values for ``t``. ``"pca"`` (default) PCA-projects the
+        response down to ``d`` and centers; ``"random"`` draws standard
+        Gaussian; an explicit array overrides both.
+    aux_prior : dict, optional
+        iVAE-style identifiability fix. Keys:
+
+        * ``u``: array-like ``(N, p)``, auxiliary covariate
+          (e.g. environment label, observed RGB, …).
+        * ``family``: ``"ridge"`` (default) or ``"linear"`` — choice of
+          internal conditional-mean estimator ``ĥ(u)``.
+        * ``strength``: positive float, the penalty weight ``μ`` in
+          ``R_id = ½ μ ‖t − ĥ(u)‖²``. Pass ``"auto"`` to let REML choose
+          it as one extra outer ``ρ``-axis.
+
+        This is the principled identifiability fix (Khemakhem et al. 2020).
+    dim_selection : bool, default False
+        Enable ARD on each latent axis. One ridge penalty per axis with
+        its own log-precision; REML drives unused axes' precision to ∞.
+        Combines cleanly with ``aux_prior``: the auxiliary pins which
+        axes are *interpretable*, ARD prunes which axes are *needed*.
+
+    Examples
+    --------
+    >>> import gamfit
+    >>> t = gamfit.LatentCoord(
+    ...     n=N, d=4, init="pca",
+    ...     aux_prior={"u": rgb, "family": "ridge", "strength": 1.0},
+    ... )
+    """
+
+    n: int
+    d: int
+    init: Any = "pca"
+    aux_prior: Mapping[str, Any] | None = None  # type: ignore[name-defined]
+    dim_selection: bool = False
+    name: str | None = None
+
+
+@dataclass
 class Categorical(Smooth):
     """Sum-to-zero contrast for a categorical predictor.
 

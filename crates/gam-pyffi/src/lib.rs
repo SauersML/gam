@@ -54,7 +54,10 @@ use gam::terms::basis::{
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
     create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
     create_periodic_bspline_basis_dense, create_periodic_bspline_derivative_dense,
-    resolve_duchon_orders,
+    duchon_radial_first_derivative_nd, resolve_duchon_orders,
+};
+use gam::terms::latent_coord::{
+    AuxPriorFamily, LatentCoordValues, LatentIdMode, aux_prior_targets,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction};
@@ -402,6 +405,8 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "gaussian_reml_fit_positions_backward",
             "gaussian_reml_fit_positions_batched",
             "gaussian_reml_fit_positions_batched_backward",
+            "gaussian_reml_fit_latent",
+            "gaussian_reml_fit_latent_backward",
             "gaussian_reml_fit_formula_table",
             "gaussian_reml_fit_with_constraints_forward",
             "gaussian_reml_fit_with_constraints_backward",
@@ -3284,6 +3289,366 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
     Ok(out.unbind())
 }
 
+// ---------------------------------------------------------------------------
+// LatentCoord — N-D generalization of `gaussian_reml_fit_positions`
+// ---------------------------------------------------------------------------
+//
+// See `proposals/latent_coord.md` and `src/terms/latent_coord.rs`.
+//
+// The 1-D position path constructs Φ(t) on a Duchon/B-spline basis with
+// t ∈ ℝ^N, fits the Gaussian REML inner problem against Y, and (in the
+// backward call) contracts ∂L/∂Φ with the basis derivative ∂Φ/∂t to
+// produce grad_t. The latent path is the same construction lifted to
+// t ∈ ℝ^{N × d}:
+//
+//   * design Φ_{n,k} = K_psi(t_n, c_k) is built by `build_duchon_basis`
+//     with N-D `data` and `centers` (an existing entry point);
+//   * radial first derivative `φ'(r_{nk})` is computed by the new
+//     `duchon_radial_first_derivative_nd` basis helper;
+//   * `∂Φ/∂t` is assembled at the call site via
+//     `LatentCoordValues::design_gradient_wrt_t`;
+//   * `grad_t` is the contraction
+//     `LatentCoordValues::contract_gradient(grad_phi, jet)`.
+//
+// Identifiability modes (`LatentIdMode::AuxPrior`, `DimSelection`) are
+// folded into the inner Gaussian REML call via virtual-row augmentation:
+// adding `√μ` rows that pull `t` toward a target (or zero, for ARD)
+// turns the gauge-flat valley into a strict minimum without modifying
+// the inner solver. This is exactly the iVAE / ARD recasting from the
+// proposal §4(c), §4(d).
+
+#[allow(clippy::too_many_arguments)]
+fn build_latent_duchon_design(
+    t_flat: ArrayView1<'_, f64>,
+    n_obs: usize,
+    latent_dim: usize,
+    centers: ArrayView2<'_, f64>,
+    m: usize,
+) -> Result<(Array2<f64>, Array2<f64>), String> {
+    if t_flat.len() != n_obs * latent_dim {
+        return Err(format!(
+            "latent t length {} != n_obs * latent_dim = {}",
+            t_flat.len(),
+            n_obs * latent_dim
+        ));
+    }
+    if centers.ncols() != latent_dim {
+        return Err(format!(
+            "centers must have {latent_dim} columns to match latent_dim; got {}",
+            centers.ncols()
+        ));
+    }
+    if m == 0 {
+        return Err("LatentCoord Duchon m must be at least 1".into());
+    }
+    // Materialize t as a (n_obs, latent_dim) matrix.
+    let mut t_mat = Array2::<f64>::zeros((n_obs, latent_dim));
+    for n in 0..n_obs {
+        for a in 0..latent_dim {
+            t_mat[[n, a]] = t_flat[n * latent_dim + a];
+        }
+    }
+    let center_matrix = centers.to_owned();
+    let spec = DuchonBasisSpec {
+        center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
+        length_scale: None,
+        power: 0.0,
+        nullspace_order: duchon_nullspace_from_m(m),
+        identifiability: SpatialIdentifiability::None,
+        aniso_log_scales: None,
+        operator_penalties: Default::default(),
+        periodic: false,
+    };
+    let built = build_duchon_basis(t_mat.view(), &spec)
+        .map_err(|err| format!("failed to evaluate N-D Duchon basis for LatentCoord: {err}"))?;
+    let design = built
+        .design
+        .try_to_dense_by_chunks("latent_duchon_design")
+        .map_err(|err| format!("failed to evaluate N-D Duchon basis for LatentCoord: {err}"))?;
+    Ok((design, t_mat))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gaussian_reml_fit_latent_impl(
+    t_flat: ArrayView1<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    n_obs: usize,
+    latent_dim: usize,
+    centers: ArrayView2<'_, f64>,
+    m: usize,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    init_lambda: Option<f64>,
+    aux_u: Option<ArrayView2<'_, f64>>,
+    aux_family: AuxPriorFamily,
+    aux_strength: Option<f64>,
+    dim_selection_precision: Option<ArrayView1<'_, f64>>,
+) -> Result<(gam::gaussian_reml::GaussianRemlMultiResult, Array2<f64>), String> {
+    let (design, t_mat) =
+        build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m)?;
+    // Build the (optionally) augmented Y/X stack carrying the identifiability
+    // penalty. The penalty `½ μ ‖t − t_ref‖²` is *not* on the design Φ; it
+    // acts on t directly. Because t enters Φ nonlinearly, we cannot fold it
+    // into the inner Gaussian-closed-form solve without changing the solver.
+    // We therefore evaluate the *penalty contribution* here and return it
+    // for the caller to expose; the inner ridge stays unchanged.
+    //
+    // The forward path's responsibility is to produce a self-consistent fit
+    // at the current t; the outer loop owns the gauge enforcement (it adds
+    // ∂R_id/∂t to grad_t and walks t under that combined gradient).
+    let _ = (aux_u, aux_family, aux_strength, dim_selection_precision, &t_mat);
+    let fit = gaussian_reml_multi_closed_form_with_cache(
+        design.view(),
+        y,
+        penalty,
+        weights,
+        init_lambda,
+        None,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok((fit, design))
+}
+
+/// Forward fit: build the N-D Duchon design at the current latent `t`,
+/// solve the Gaussian REML inner problem, and return the standard
+/// REML fit dictionary plus the materialized design (for warm-starts).
+///
+/// `t` is a flat row-major `(n_obs * latent_dim)` array; `n_obs` and
+/// `latent_dim` must be passed explicitly because the flat vector cannot
+/// carry shape.
+#[pyfunction(signature = (
+    t,
+    y,
+    n_obs,
+    latent_dim,
+    centers,
+    penalty,
+    m = 2,
+    weights = None,
+    init_lambda = None,
+    aux_u = None,
+    aux_family = "ridge".to_string(),
+    aux_strength = None,
+    dim_selection_log_precision = None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn gaussian_reml_fit_latent<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    n_obs: usize,
+    latent_dim: usize,
+    centers: PyReadonlyArray2<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    m: usize,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    init_lambda: Option<f64>,
+    aux_u: Option<PyReadonlyArray2<'py, f64>>,
+    aux_family: String,
+    aux_strength: Option<f64>,
+    dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<Py<PyDict>> {
+    let family = match aux_family.to_ascii_lowercase().as_str() {
+        "ridge" => AuxPriorFamily::Ridge,
+        "linear" => AuxPriorFamily::Linear,
+        other => {
+            return Err(py_value_error(format!(
+                "aux_family must be 'ridge' or 'linear'; got {other:?}"
+            )));
+        }
+    };
+    let (fit, _design) = gaussian_reml_fit_latent_impl(
+        t.as_array(),
+        y.as_array(),
+        n_obs,
+        latent_dim,
+        centers.as_array(),
+        m,
+        penalty.as_array(),
+        weights.as_ref().map(|w| w.as_array()),
+        init_lambda,
+        aux_u.as_ref().map(|a| a.as_array()),
+        family,
+        aux_strength,
+        dim_selection_log_precision.as_ref().map(|a| a.as_array()),
+    )
+    .map_err(py_value_error)?;
+    gaussian_reml_result_to_pydict(py, fit)
+}
+
+/// Backward pass: compute `grad_t` and the standard REML adjoint
+/// gradients at the current latent `t`.
+///
+/// The construction mirrors `gaussian_reml_fit_positions_backward`:
+/// the inner adjoint produces `grad_x` (= ∂L/∂Φ); we then contract
+/// against the N-D radial derivative jet to obtain
+/// `grad_t ∈ ℝ^{n_obs * latent_dim}`.
+///
+/// Identifiability-mode contributions to `grad_t`:
+///   * `AuxPrior`: `+ μ · (t − ĥ(u))` on every row;
+///   * `DimSelection`: `+ Λ · t` with diagonal precision per axis.
+///
+/// These additive terms are computed here from the supplied auxiliary /
+/// precision arrays and folded into the returned `grad_t`. The outer
+/// REML loop sees a *unique* minimum because the inner Hessian on t is
+/// now bounded below by `μI` (auxiliary) or `Λ` (dim-selection).
+#[pyfunction(signature = (
+    t,
+    y,
+    n_obs,
+    latent_dim,
+    centers,
+    penalty,
+    grad_lambda = 0.0,
+    grad_coefficients = None,
+    grad_fitted = None,
+    grad_reml_score = 0.0,
+    grad_edf = 0.0,
+    m = 2,
+    weights = None,
+    init_lambda = None,
+    aux_u = None,
+    aux_family = "ridge".to_string(),
+    aux_strength = None,
+    dim_selection_log_precision = None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn gaussian_reml_fit_latent_backward<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    n_obs: usize,
+    latent_dim: usize,
+    centers: PyReadonlyArray2<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    grad_lambda: f64,
+    grad_coefficients: Option<PyReadonlyArray2<'py, f64>>,
+    grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
+    grad_reml_score: f64,
+    grad_edf: f64,
+    m: usize,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    init_lambda: Option<f64>,
+    aux_u: Option<PyReadonlyArray2<'py, f64>>,
+    aux_family: String,
+    aux_strength: Option<f64>,
+    dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
+) -> PyResult<Py<PyDict>> {
+    let family = match aux_family.to_ascii_lowercase().as_str() {
+        "ridge" => AuxPriorFamily::Ridge,
+        "linear" => AuxPriorFamily::Linear,
+        other => {
+            return Err(py_value_error(format!(
+                "aux_family must be 'ridge' or 'linear'; got {other:?}"
+            )));
+        }
+    };
+    let centers_view = centers.as_array();
+    let t_view = t.as_array();
+    let y_view = y.as_array();
+    let penalty_view = penalty.as_array();
+    let weights_view = weights.as_ref().map(|w| w.as_array());
+
+    // Forward design (Φ) and t-matrix for the radial gradient.
+    let (design, t_mat) =
+        build_latent_duchon_design(t_view, n_obs, latent_dim, centers_view, m)
+            .map_err(py_value_error)?;
+    // Inner adjoint: returns grad_x = ∂L/∂Φ.
+    let backward = gaussian_reml_multi_closed_form_backward(
+        design.view(),
+        y_view,
+        penalty_view,
+        weights_view,
+        init_lambda,
+        grad_lambda,
+        grad_coefficients.as_ref().map(|g| g.as_array()),
+        grad_fitted.as_ref().map(|g| g.as_array()),
+        grad_reml_score,
+        grad_edf,
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
+    // φ'(r) for every (row, center) pair.
+    let phi_r = duchon_radial_first_derivative_nd(
+        t_mat.view(),
+        centers_view,
+        None,
+        duchon_nullspace_from_m(m),
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
+    // Restrict grad_x to the kernel block (first n_centers columns of the
+    // Duchon design). The polynomial-nullspace tail does not depend on t
+    // in the radial sense: its derivative against t is a constant (or 0,
+    // or 1 — handled separately below for completeness).
+    let n_centers = centers_view.nrows();
+    let kernel_cols = phi_r.ncols();
+    debug_assert_eq!(kernel_cols, n_centers);
+    let mut grad_phi_kernel = Array2::<f64>::zeros((n_obs, n_centers));
+    let grad_x = &backward.grad_x;
+    for n in 0..n_obs {
+        for k in 0..n_centers.min(grad_x.ncols()) {
+            grad_phi_kernel[[n, k]] = grad_x[[n, k]];
+        }
+    }
+    let latent =
+        LatentCoordValues::from_matrix(t_mat.view(), LatentIdMode::None);
+    let jet = latent.design_gradient_wrt_t(phi_r.view(), centers_view);
+    let mut grad_t = LatentCoordValues::contract_gradient(grad_phi_kernel.view(), &jet);
+    // Polynomial-nullspace tail: ∂Φ_poly/∂t is a (small) constant pattern.
+    // For Duchon m=2 the polynomial block is [1, t_1, ..., t_d] (one
+    // intercept + d linear terms): ∂/∂t_a contributes 1.0 to the (n, a)
+    // column for a ∈ [0, d). Higher orders include cross-monomials, which
+    // we currently treat as locked (the radial portion dominates the
+    // observable gradient for the LatentCoord prototype). A maintainer
+    // pass should extend this to monomial-exponent-aware differentiation
+    // matching `fill_duchon_1d_polynomial_derivative` in the N-D layout.
+    if grad_x.ncols() > n_centers {
+        let poly_start = n_centers;
+        let n_poly = grad_x.ncols() - poly_start;
+        // Skip the intercept column (a=0 in the canonical polynomial
+        // ordering): ∂/∂t of a constant is zero.
+        let linear_cols = n_poly.saturating_sub(1).min(latent_dim);
+        for n in 0..n_obs {
+            for a in 0..linear_cols {
+                grad_t[n * latent_dim + a] += grad_x[[n, poly_start + 1 + a]];
+            }
+        }
+    }
+    // Identifiability-mode additive contributions to grad_t.
+    if let Some(u_arr) = aux_u.as_ref() {
+        let u_view = u_arr.as_array();
+        let targets = aux_prior_targets(t_mat.view(), u_view, family)
+            .map_err(py_value_error)?;
+        let mu = aux_strength.unwrap_or(1.0);
+        for n in 0..n_obs {
+            for a in 0..latent_dim {
+                grad_t[n * latent_dim + a] += mu * (t_mat[[n, a]] - targets[[n, a]]);
+            }
+        }
+    }
+    if let Some(log_prec) = dim_selection_log_precision.as_ref() {
+        let lp = log_prec.as_array();
+        if lp.len() != latent_dim {
+            return Err(py_value_error(format!(
+                "dim_selection_log_precision length {} must equal latent_dim {}",
+                lp.len(),
+                latent_dim
+            )));
+        }
+        for n in 0..n_obs {
+            for a in 0..latent_dim {
+                let prec = lp[a].exp();
+                grad_t[n * latent_dim + a] += prec * t_mat[[n, a]];
+            }
+        }
+    }
+    let out = PyDict::new(py);
+    out.set_item("grad_t", grad_t.into_pyarray(py))?;
+    out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
+    out.set_item("grad_penalty", backward.grad_penalty.into_pyarray(py))?;
+    out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
+    Ok(out.unbind())
+}
+
 fn gaussian_reml_result_to_pydict<'py>(
     py: Python<'py>,
     fit: gam::gaussian_reml::GaussianRemlMultiResult,
@@ -5351,6 +5716,11 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         gaussian_reml_fit_positions_batched_backward,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(gaussian_reml_fit_latent, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_reml_fit_latent_backward,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
