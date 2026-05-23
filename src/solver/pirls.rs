@@ -4932,6 +4932,57 @@ where
                         &mut newton_direction,
                         bound_active_hint.as_mut(),
                     )
+                } else if let Some(arrow_cfg) = options.arrow_schur.as_ref() {
+                    // Arrow-Schur structured-inner-solve path. See
+                    // `proposals/latent_coord.md` §4 and
+                    // `proposals/composition_engine.md` §7 (audit
+                    // revisions). The driver-supplied closure assembles
+                    // the bordered (t, β) system at the current β and
+                    // current latent t; we solve via per-row d×d
+                    // Cholesky + one K×K Schur factor, write the
+                    // β-direction into `newton_direction` so the
+                    // existing LM gain test / line search proceeds
+                    // unchanged for β, and push the latent increment
+                    // back into the driver via the `apply_delta_t`
+                    // callback so the next gradient evaluation sees the
+                    // updated t.
+                    //
+                    // NOTE: this branch exploits the inner-GN
+                    // block-diagonality of `H_tt`. The REML outer
+                    // gradient w.r.t. `t` carries a shared `Schur⁻¹`
+                    // factor — that's a separate plumbing change
+                    // handled at the REML driver level, NOT here.
+                    debug_assert_eq!(arrow_cfg.n_beta, beta.len());
+                    match arrow_cfg.build.as_ref()(&beta) {
+                        None => {
+                            // Driver opted out (e.g. latent not yet
+                            // initialized). Fall through to β-only path.
+                            solve_newton_direction_dense(
+                                dense_reg,
+                                &state.gradient,
+                                &mut newton_direction,
+                            )
+                        }
+                        Some(arrow_system) => {
+                            match arrow_system.solve(0.0, loop_lambda) {
+                                Ok((delta_t, delta_beta)) => {
+                                    // Apply latent increment immediately;
+                                    // subsequent `model.update(&beta)`
+                                    // will rebuild Φ at the new t.
+                                    arrow_cfg.apply_delta_t.as_ref()(&delta_t);
+                                    // Write β-step into the existing
+                                    // direction buffer so the rest of
+                                    // the LM loop proceeds unchanged.
+                                    newton_direction.assign(&delta_beta);
+                                    Ok(())
+                                }
+                                Err(e) => Err(EstimationError::InvalidInput(format!(
+                                    "arrow-Schur inner solve failed at iter {iter} \
+                                     (loop_lambda={loop_lambda:.3e}): {e}"
+                                ))),
+                            }
+                        }
+                    }
                 } else {
                     solve_newton_direction_dense(dense_reg, &state.gradient, &mut newton_direction)
                 }
@@ -7370,6 +7421,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         linear_constraints: linear_constraints.clone(),
         initial_lm_lambda: config.initial_lm_lambda,
         geodesic_acceleration: config.geodesic_acceleration,
+        arrow_schur: None,
     };
 
     let mut iteration_logger = |info: &WorkingModelIterationInfo| {
@@ -10703,6 +10755,7 @@ mod tests {
             firth_bias_reduction: false,
             initial_lm_lambda: None,
             geodesic_acceleration: false,
+            arrow_schur: None,
         };
         let problem = PirlsProblem {
             x,
@@ -10917,6 +10970,7 @@ mod tests {
             firth_bias_reduction: false,
             initial_lm_lambda: None,
             geodesic_acceleration: false,
+            arrow_schur: None,
         };
 
         let (fit, _) = fit_model_for_fixed_rho(
@@ -11128,6 +11182,7 @@ mod tests {
             firth_bias_reduction: false,
             initial_lm_lambda: None,
             geodesic_acceleration: false,
+            arrow_schur: None,
         };
 
         let (result, _) = fit_model_for_fixed_rho(
@@ -11203,6 +11258,7 @@ mod tests {
             firth_bias_reduction: false,
             initial_lm_lambda: None,
             geodesic_acceleration: false,
+            arrow_schur: None,
         };
 
         let (fit, _) = fit_model_for_fixed_rho(
@@ -11833,6 +11889,7 @@ mod root_cause_tests {
             }),
             initial_lm_lambda: None,
             geodesic_acceleration: false,
+            arrow_schur: None,
         };
 
         let summary =
@@ -12086,6 +12143,7 @@ mod root_cause_tests {
             linear_constraints: None,
             initial_lm_lambda: None,
             geodesic_acceleration: false,
+            arrow_schur: None,
         };
 
         let err = match runworking_model_pirls(
@@ -12147,6 +12205,7 @@ mod root_cause_tests {
             linear_constraints: None,
             initial_lm_lambda: None,
             geodesic_acceleration: false,
+            arrow_schur: None,
         };
 
         let err = match runworking_model_pirls(
@@ -12189,6 +12248,7 @@ mod root_cause_tests {
             linear_constraints: None,
             initial_lm_lambda: None,
             geodesic_acceleration: false,
+            arrow_schur: None,
         };
 
         let err = match runworking_model_pirls(
@@ -12241,6 +12301,7 @@ mod root_cause_tests {
             linear_constraints: None,
             initial_lm_lambda: None,
             geodesic_acceleration: false,
+            arrow_schur: None,
         };
 
         let result =
@@ -12279,6 +12340,7 @@ mod root_cause_tests {
             }),
             initial_lm_lambda: None,
             geodesic_acceleration: false,
+            arrow_schur: None,
         };
 
         let result =
@@ -12314,6 +12376,7 @@ mod root_cause_tests {
             linear_constraints: None,
             initial_lm_lambda: None,
             geodesic_acceleration: false,
+            arrow_schur: None,
         };
 
         let result =
@@ -12406,6 +12469,7 @@ mod root_cause_tests {
             firth_bias_reduction: false,
             initial_lm_lambda: None,
             geodesic_acceleration: false,
+            arrow_schur: None,
         };
 
         let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
@@ -12487,6 +12551,7 @@ mod root_cause_tests {
             firth_bias_reduction: false,
             initial_lm_lambda: None,
             geodesic_acceleration: false,
+            arrow_schur: None,
         };
 
         let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
@@ -12793,6 +12858,7 @@ mod root_cause_tests {
             linear_constraints: None,
             initial_lm_lambda: None,
             geodesic_acceleration: false,
+            arrow_schur: None,
         };
         let summary =
             runworking_model_pirls(&mut model, Coefficients::new(array![0.0]), &options, |_| {})
@@ -12853,6 +12919,7 @@ mod root_cause_tests {
             linear_constraints: None,
             initial_lm_lambda: None,
             geodesic_acceleration: false,
+            arrow_schur: None,
         };
         let summary =
             runworking_model_pirls(&mut model, Coefficients::new(array![0.0]), &options, |_| {})
