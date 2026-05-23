@@ -403,7 +403,7 @@ pub enum LatentIftOutcome {
 ///
 /// The result is meant to be applied to the existing
 /// [`crate::terms::latent_coord::LatentCoordValues`] block via
-/// `set_flat(latent.as_flat() + Δt)` before the next inner Newton
+/// `retract_flat_delta(Δt)` before the next inner Newton
 /// launch — so the inner solver starts at a configuration already
 /// consistent with the new `(β, ρ)`, requiring far fewer iterations
 /// than a cold restart.
