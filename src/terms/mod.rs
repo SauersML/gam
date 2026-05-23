@@ -16,6 +16,18 @@ pub mod term_builder;
 pub use analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyOp,
     AnalyticPenaltyRegistry, FrozenAnalyticPenaltyOp, IBPAssignmentPenalty, IsometryPenalty,
-    IsometryReference, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty, SparsityKind,
-    SparsityPenalty, WeightField,
+    IsometryDuchonRadialSource, IsometryReference, PenaltyTier, PsiSlice,
+    SoftmaxAssignmentSparsityPenalty, SparsityKind, SparsityPenalty, WeightField,
+};
+pub use atom_selection::{
+    AssignmentSparsityCoupling, AtomLibrary, AtomRecord, AtomSelectionStrategy, EntropicSoftmax,
+    L1Relaxed, ShapeRef, TopK,
+};
+pub use latent_coord::{
+    AuxPriorFamily, AuxPriorStrength, InputLocationDerivative, LatentCoordValues, LatentIdMode,
+    LatentManifold,
+};
+pub use sae_manifold::{
+    AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldLoss,
+    SaeManifoldRho, SaeManifoldTerm,
 };

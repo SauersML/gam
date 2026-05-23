@@ -1393,7 +1393,8 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
             }
         }
         for k in 0..self.k_max {
-            acc += (a - 1.0) * pi[k].ln();
+            // Beta(a,1) contributes -(a - 1) ln(pi), matching pi_map.
+            acc -= (a - 1.0) * pi[k].ln();
         }
         acc
     }
@@ -1458,7 +1459,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         for &pk in pi.iter() {
             sum_log_pi += pk.clamp(1.0e-12, 1.0 - 1.0e-12).ln();
         }
-        Array1::from_vec(vec![alpha * sum_log_pi / self.k_max as f64])
+        Array1::from_vec(vec![-alpha * sum_log_pi / self.k_max as f64])
     }
 
     fn rho_count(&self) -> usize {

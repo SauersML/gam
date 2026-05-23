@@ -13533,3 +13533,1555 @@ mod tests {
     }
 }
 
+exec
+/bin/zsh -lc "sed -n '760,1180p' src/terms/latent_coord.rs" in /Users/user/gam
+ succeeded in 0ms:
+    /// Compute `∂Φ/∂t` for a radial-kernel design Φ — the original
+    /// Duchon/Matérn path. See [`Self::design_gradient_wrt_t_dispatch`] for
+    /// the basis-agnostic dispatch entry point.
+    ///
+    /// `kernel_first_derivative` is `φ'(r_{n,k})` for each (row, center)
+    /// pair, shape `(n_obs, n_centers)`. `centers` is `(n_centers, d)`.
+    /// Returns a `(n_obs, n_centers, d)` jet whose `(n, k, a)` entry is
+    /// `∂Φ_{n,k} / ∂t_{n,a} = φ'(r_{n,k}) · (t_{n,a} − c_{k,a}) / r_{n,k}`.
+    ///
+    /// At `r = 0` the unit vector `(t − c)/r` is undefined; convention is
+    /// to set the jet to zero there (the kernel is smooth at the origin
+    /// for the supported Duchon orders, so `φ'(0) = 0` anyway and the
+    /// product is the right limit).
+    pub fn design_gradient_wrt_t(
+        &self,
+        kernel_first_derivative: ArrayView2<'_, f64>,
+        centers: ArrayView2<'_, f64>,
+    ) -> Array3<f64> {
+        let n_obs = self.n_obs;
+        let d = self.latent_dim;
+        let n_centers = centers.nrows();
+        debug_assert_eq!(centers.ncols(), d);
+        debug_assert_eq!(kernel_first_derivative.shape(), &[n_obs, n_centers]);
+        let mut jet = Array3::<f64>::zeros((n_obs, n_centers, d));
+        for n in 0..n_obs {
+            let t_n = self.row(n);
+            for k in 0..n_centers {
+                // r = ‖t_n − c_k‖
+                let mut r2 = 0.0_f64;
+                for a in 0..d {
+                    let delta = t_n[a] - centers[[k, a]];
+                    r2 += delta * delta;
+                }
+                let r = r2.sqrt();
+                if r == 0.0 {
+                    continue;
+                }
+                let phi_prime = kernel_first_derivative[[n, k]];
+                if phi_prime == 0.0 {
+                    continue;
+                }
+                let scale = phi_prime / r;
+                for a in 0..d {
+                    jet[[n, k, a]] = scale * (t_n[a] - centers[[k, a]]);
+                }
+            }
+        }
+        jet
+    }
+
+    /// Compute `∂Φ/∂t` for an arbitrary supported basis kind, by dispatching
+    /// to the right closed-form chain rule.
+    ///
+    /// All radial-kernel bases (Duchon, Matérn) reduce to the same shape
+    /// `φ'(r)`-times-unit-vector chain that `design_gradient_wrt_t` already
+    /// implements. Non-radial bases (sphere, periodic-cyclic B-spline, tensor
+    /// B-spline) carry their own analytic `(N, K, d)` jet — the caller
+    /// pre-builds that jet using the matching `*_first_derivative_nd` helper
+    /// in [`crate::terms::basis`] and passes it in via
+    /// [`InputLocationDerivative::Jet`].
+    ///
+    /// This is the single entry point the outer optimizer should call; it
+    /// stays in lock-step with the kernel-parameter ψ chain rule that
+    /// `SpatialLogKappaCoords` uses (re-pointed at the first kernel argument
+    /// rather than at the anisotropy ψ).
+    pub fn design_gradient_wrt_t_dispatch(
+        &self,
+        input: InputLocationDerivative<'_>,
+    ) -> Array3<f64> {
+        match input {
+            InputLocationDerivative::Radial {
+                kernel_first_derivative,
+                centers,
+            } => self.design_gradient_wrt_t(kernel_first_derivative, centers),
+            InputLocationDerivative::Jet(jet) => {
+                // The non-radial helpers already produce a (N, K, d) tensor
+                // in the same layout `contract_gradient` consumes. Return a
+                // copy so the caller owns the data and is decoupled from the
+                // source array's lifetime.
+                jet.to_owned()
+            }
+        }
+    }
+
+    /// Contract a downstream gradient `∂L/∂Φ ∈ ℝ^(n_obs × n_centers)` and a
+    /// `design_gradient_wrt_t` jet into a flat `∂L/∂t ∈ ℝ^(n_obs * d)`.
+    ///
+    /// This is the N-D generalization of
+    /// `gam_pyffi::contract_position_gradient` (1-D), used inside the
+    /// `_backward` pyffi entry point.
+    pub fn contract_gradient(
+        grad_phi: ArrayView2<'_, f64>,
+        jet: &Array3<f64>,
+    ) -> Array1<f64> {
+        let n_obs = jet.shape()[0];
+        let n_centers = jet.shape()[1];
+        let d = jet.shape()[2];
+        debug_assert_eq!(grad_phi.shape(), &[n_obs, n_centers]);
+        let mut grad_t = Array1::<f64>::zeros(n_obs * d);
+        for n in 0..n_obs {
+            for a in 0..d {
+                let mut acc = 0.0_f64;
+                for k in 0..n_centers {
+                    acc += grad_phi[[n, k]] * jet[[n, k, a]];
+                }
+                grad_t[n * d + a] = acc;
+            }
+        }
+        grad_t
+    }
+
+    /// Streaming contraction for radial-kernel input-location derivatives.
+    ///
+    /// This computes the same result as
+    /// `contract_gradient(grad_phi, design_gradient_wrt_t(...))`, but never
+    /// materializes the dense `(n_obs, n_centers, latent_dim)` jet. Peak
+    /// storage is therefore `O(n_obs * n_centers + n_obs * latent_dim)` when
+    /// the caller already has the scalar radial derivative matrix, instead of
+    /// `O(n_obs * n_centers * latent_dim)`.
+    pub fn contract_gradient_radial_streaming(
+        &self,
+        grad_phi: ArrayView2<'_, f64>,
+        kernel_first_derivative: ArrayView2<'_, f64>,
+        centers: ArrayView2<'_, f64>,
+    ) -> Array1<f64> {
+        let n_obs = self.n_obs;
+        let d = self.latent_dim;
+        let n_centers = centers.nrows();
+        debug_assert_eq!(centers.ncols(), d);
+        debug_assert_eq!(grad_phi.shape(), &[n_obs, n_centers]);
+        debug_assert_eq!(kernel_first_derivative.shape(), &[n_obs, n_centers]);
+        let mut grad_t = Array1::<f64>::zeros(n_obs * d);
+        for n in 0..n_obs {
+            self.contract_row_radial_gradient_into(
+                n,
+                grad_phi.row(n),
+                kernel_first_derivative.row(n),
+                centers,
+                &mut grad_t,
+                1.0,
+            );
+        }
+        grad_t
+    }
+
+    /// Streaming row contraction for one radial-kernel latent row.
+    ///
+    /// `grad_phi_row[k]` is the downstream adjoint for `Φ[n,k]`, and
+    /// `kernel_first_derivative_row[k]` is `φ'(r_{n,k})`. The contribution is
+    /// accumulated into `grad_t[n, :]` with an optional scalar multiplier.
+    pub fn contract_row_radial_gradient_into(
+        &self,
+        n: usize,
+        grad_phi_row: ArrayView1<'_, f64>,
+        kernel_first_derivative_row: ArrayView1<'_, f64>,
+        centers: ArrayView2<'_, f64>,
+        grad_t: &mut Array1<f64>,
+        scale: f64,
+    ) {
+        let d = self.latent_dim;
+        let n_centers = centers.nrows();
+        debug_assert!(n < self.n_obs);
+        debug_assert_eq!(centers.ncols(), d);
+        debug_assert_eq!(grad_phi_row.len(), n_centers);
+        debug_assert_eq!(kernel_first_derivative_row.len(), n_centers);
+        debug_assert_eq!(grad_t.len(), self.values.len());
+        if scale == 0.0 {
+            return;
+        }
+        let t_n = self.row(n);
+        for k in 0..n_centers {
+            let weight = grad_phi_row[k] * kernel_first_derivative_row[k];
+            if weight == 0.0 {
+                continue;
+            }
+            let mut r2 = 0.0_f64;
+            for a in 0..d {
+                let delta = t_n[a] - centers[[k, a]];
+                r2 += delta * delta;
+            }
+            let r = r2.sqrt();
+            if r == 0.0 {
+                continue;
+            }
+            let row_scale = scale * weight / r;
+            for a in 0..d {
+                grad_t[n * d + a] += row_scale * (t_n[a] - centers[[k, a]]);
+            }
+        }
+    }
+}
+
+fn wrap_angle(x: f64) -> f64 {
+    let y = x.rem_euclid(TWO_PI);
+    if y == TWO_PI { 0.0 } else { y }
+}
+
+fn normalize_or_axis(v: ArrayView1<'_, f64>, dim: usize) -> Array1<f64> {
+    let mut norm_sq = 0.0_f64;
+    for a in 0..dim {
+        norm_sq += v[a] * v[a];
+    }
+    if norm_sq <= 0.0 || !norm_sq.is_finite() {
+        let mut out = Array1::<f64>::zeros(dim);
+        if dim > 0 {
+            out[0] = 1.0;
+        }
+        return out;
+    }
+    let inv = 1.0 / norm_sq.sqrt();
+    let mut out = Array1::<f64>::zeros(dim);
+    for a in 0..dim {
+        out[a] = v[a] * inv;
+    }
+    out
+}
+
+fn dot_views(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = 0.0_f64;
+    for i in 0..a.len() {
+        acc += a[i] * b[i];
+    }
+    acc
+}
+
+fn matvec(a: ArrayView2<'_, f64>, x: ArrayView1<'_, f64>) -> Array1<f64> {
+    debug_assert_eq!(a.ncols(), x.len());
+    let mut out = Array1::<f64>::zeros(a.nrows());
+    for i in 0..a.nrows() {
+        let mut acc = 0.0_f64;
+        for j in 0..a.ncols() {
+            acc += a[[i, j]] * x[j];
+        }
+        out[i] = acc;
+    }
+    out
+}
+
+fn symmetrize(a: &mut Array2<f64>) {
+    let n = a.nrows().min(a.ncols());
+    for i in 0..n {
+        for j in 0..i {
+            let v = 0.5 * (a[[i, j]] + a[[j, i]]);
+            a[[i, j]] = v;
+            a[[j, i]] = v;
+        }
+    }
+}
+
+/// Auxiliary-prior penalty contribution: returns the per-row reference
+/// coordinates `ĥ(u_n)` shape `(n_obs, d)` and the effective strength `μ`.
+///
+/// `t_target` is broadcast across the inner ridge of `½ μ · ‖t − t_target‖²`,
+/// which the call site folds into the Y-stack via a virtual-row augmentation
+/// (`y' = [y; √μ · t_target]`, `X' = [X; √μ · I_d ⊗ row-block]`). This
+/// keeps the inner solver Gaussian-closed-form.
+///
+/// For `AuxPriorFamily::Ridge` the conditional mean is the closed-form ridge
+/// regression `(UᵀU + ε I)⁻¹ UᵀT` evaluated at each row's `u_n`. For
+/// `Linear` the ridge is zero (which raises if `UᵀU` is singular).
+pub fn aux_prior_targets(
+    t: ArrayView2<'_, f64>,
+    u: ArrayView2<'_, f64>,
+    family: AuxPriorFamily,
+) -> Result<Array2<f64>, String> {
+    let n_obs = t.nrows();
+    let d = t.ncols();
+    if u.nrows() != n_obs {
+        return Err(format!(
+            "aux_prior_targets: u has {} rows but t has {}",
+            u.nrows(),
+            n_obs
+        ));
+    }
+    let p = u.ncols();
+    if p == 0 {
+        return Err("aux_prior_targets: auxiliary u must have at least one column".into());
+    }
+    // gram = UᵀU  (p × p)
+    let mut gram = Array2::<f64>::zeros((p, p));
+    for n in 0..n_obs {
+        for i in 0..p {
+            for j in 0..p {
+                gram[[i, j]] += u[[n, i]] * u[[n, j]];
+            }
+        }
+    }
+    let ridge_eps = match family {
+        AuxPriorFamily::Ridge => {
+            let trace: f64 = (0..p).map(|i| gram[[i, i]]).sum();
+            (1e-6 * trace / p as f64).max(1e-12)
+        }
+        AuxPriorFamily::Linear => 0.0,
+    };
+    for i in 0..p {
+        gram[[i, i]] += ridge_eps;
+    }
+    // rhs = UᵀT  (p × d)
+    let mut rhs = Array2::<f64>::zeros((p, d));
+    for n in 0..n_obs {
+        for i in 0..p {
+            for k in 0..d {
+                rhs[[i, k]] += u[[n, i]] * t[[n, k]];
+            }
+        }
+    }
+    let coeffs = solve_spd(gram.view(), rhs.view())?;
+    // targets = U · coeffs  (n_obs × d)
+    let mut targets = Array2::<f64>::zeros((n_obs, d));
+    for n in 0..n_obs {
+        for k in 0..d {
+            let mut acc = 0.0_f64;
+            for i in 0..p {
+                acc += u[[n, i]] * coeffs[[i, k]];
+            }
+            targets[[n, k]] = acc;
+        }
+    }
+    Ok(targets)
+}
+
+/// Lightweight Cholesky-based SPD solve. Keeps this module dependency-free
+/// from the broader faer-wrapping surface; matrices here are tiny
+/// (`p × p` with p = aux-feature count, typically O(10)).
+fn solve_spd(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+    let n = a.nrows();
+    if a.ncols() != n {
+        return Err("solve_spd: A must be square".into());
+    }
+    if b.nrows() != n {
+        return Err("solve_spd: RHS row count mismatch".into());
+    }
+    // In-place Cholesky factorization. We pay the O(n³) copy + O(n³) factor
+    // up front; n is tiny in the auxiliary-prior path.
+    let mut l = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..=i {
+            let mut sum = a[[i, j]];
+            for k in 0..j {
+                sum -= l[[i, k]] * l[[j, k]];
+            }
+            if i == j {
+                if sum <= 0.0 {
+                    return Err(format!(
+                        "solve_spd: non-positive pivot {sum} at index {i} \
+                         (matrix is not positive definite)"
+                    ));
+                }
+                l[[i, j]] = sum.sqrt();
+            } else {
+                l[[i, j]] = sum / l[[j, j]];
+            }
+        }
+    }
+    // Solve L y = b, then Lᵀ x = y, column by column.
+    let d = b.ncols();
+    let mut out = Array2::<f64>::zeros((n, d));
+    for col in 0..d {
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let mut sum = b[[i, col]];
+            for k in 0..i {
+                sum -= l[[i, k]] * y[k];
+            }
+            y[i] = sum / l[[i, i]];
+        }
+        for i in (0..n).rev() {
+            let mut sum = y[i];
+            for k in (i + 1)..n {
+                sum -= l[[k, i]] * out[[k, col]];
+            }
+            out[[i, col]] = sum / l[[i, i]];
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn from_matrix_roundtrip() {
+        let m = array![[1.0_f64, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let lc = LatentCoordValues::from_matrix(m.view(), LatentIdMode::None);
+        assert_eq!(lc.n_obs(), 3);
+        assert_eq!(lc.latent_dim(), 2);
+        let back = lc.as_matrix();
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn row_access() {
+        let m = array![[1.0_f64, 2.0], [3.0, 4.0]];
+        let lc = LatentCoordValues::from_matrix(m.view(), LatentIdMode::None);
+        assert_eq!(lc.row(0), &[1.0, 2.0]);
+        assert_eq!(lc.row(1), &[3.0, 4.0]);
+    }
+}
+
+exec
+/bin/zsh -lc "sed -n '1,220p' proposals/latent_coord.md" in /Users/user/gam
+ succeeded in 0ms:
+# Proposal: `LatentCoord` — per-row latent coordinates as a first-class gamfit parameter
+
+Status: draft. Author: scottsauersc@gmail.com.  
+Companion prototype: `/Users/user/Manifold-SAE/experiments/auto_75.py`.
+
+## 1. Motivation
+
+gamfit today fits
+
+```
+y = Φ(x) · β + ε,   penalty(β, ψ),   x observed
+```
+
+where `β` are smoothing-spline coefficients, `ψ` are kernel / anisotropy
+hyper-parameters (currently flowing through `SpatialLogKappaCoords`), and `x`
+is an observed covariate. The REML/LAML loop selects smoothing; an
+IFT-warm-started nested optimizer moves `ψ` because `∂Φ/∂ψ` is computable
+from the radial basis.
+
+The proposal: promote some covariates from observed to **latent**:
+
+```
+y = Φ(t) · β + ε,   penalty(β, ψ),   t ∈ ℝ^(N×d) estimated per-row.
+```
+
+Mechanically this is the same problem as `ψ` already solves: we need
+`∂Φ/∂t` per row, and that's structurally the same radial-basis-gradient
+that gamfit's spatial machinery already computes — except differentiating
+with respect to the *first* argument of the kernel rather than the
+log-anisotropy. Everything downstream (IFT-warm-started Newton on the
+inner system, REML for the outer ridges, persistent warm-start) is reused
+verbatim.
+
+Use case: **GP-LVM and principal-manifold inference** (Lawrence 2005,
+Titsias 2010), entirely in gamfit primitives. This subsumes a non-trivial
+set of workloads — manifold learning, latent-trait inference, identifiable
+nonlinear ICA via iVAE-style auxiliary priors — that currently require
+GPy / sklearn `IsoMap` or hand-rolled alternation (see this repo's
+`experiments/auto_71.py` for a geodesic-LM gauge-unfixed example, and
+`auto_74.py` for the alternation-then-ICA workaround).
+
+We already ship `gaussian_reml_fit_positions{,_backward}` for the 1-D
+case (B-spline positions with `grad_t` exposed; `gamfit/_api.py:1848`,
+`gamfit/_api.py:1920`) and the low-level N-D latent entry point
+`gaussian_reml_fit_latent` (`gamfit/_api.py:2157`). `LatentCoord`
+(`gamfit/smooth.py:232`) is the configuration-layer form of that same
+idea rather than a bespoke function.
+
+## 2. Math
+
+### 2.1 Loss
+
+For Gaussian-identity, profiling out σ²:
+
+```
+ℒ(t, β, ψ, λ) = ½‖y − Φ(t; ψ) β‖² + ½λ βᵀ S(ψ) β
+                + R_id(t, u)                              # identifiability
+                − ½ log|Σ(λ, ψ, t)|                       # REML log-det
+```
+
+`Φ(t; ψ)_{i,k} = K_ψ(t_i, c_k)` is the design row built from the latent
+coordinate `t_i ∈ ℝ^d` and the basis centers `c_k`. For Duchon thin-plate
+splines, `K_ψ` is radial: `K(r)` with `r = ‖t_i − c_k‖`, modulated by
+ψ-anisotropy exactly as today.
+
+### 2.2 Gradients
+
+Let `g_i = ∂Φ_i / ∂t_i ∈ ℝ^(K × d)`. For a Duchon kernel
+`Φ_{i,k} = φ(r_{ik})` we have `∂Φ_{i,k}/∂t_i = φ'(r_{ik}) · (t_i − c_k)/r_{ik}`,
+the same radial-gradient routine that
+`SpatialLogKappaCoords::apply_tospec` invokes for `∂Φ/∂ψ` (anisotropy
+just rescales components of `(t_i − c_k)` before contraction).
+
+The gradient w.r.t. `t_i` of the residual is row-local:
+
+```
+∂(½‖y − Φβ‖²) / ∂t_i = −(y_i − Φ_i β) · (g_i β)        # shape (d,)
+```
+
+so the per-row Hessian block (Gauss–Newton) is `(g_i β)(g_i β)ᵀ`. The
+joint Hessian `H_tt` is block-diagonal in rows (huge — `N·d × N·d` — but
+sparse-by-blocks), `H_tβ = − Φ_i ⊗ (g_i β) + …` is dense in β but only
+row-local in t. This is the *same* structure gamfit's matrix-free CG
+already exploits along the ψ direction (`hyper_dirs`).
+
+**Arrow shape — careful statement (per math audit).** The cost is
+arrow-shaped, but the REML `log|H|` Occam-term gradient is not literally
+`Σ_i f(t_i)`. After Schur elimination,
+`log|H| = log|H_tt| + log|Schur|`. The first term factorises trivially
+because `H_tt` is block-diagonal in rows. For the second,
+`∂/∂t_i log|Schur| = tr(Schur⁻¹ · ∂Schur/∂t_i)`, with `Schur⁻¹` dense in
+all `t`. However, only row `i` of `Φ` moves with `t_i`, so
+`∂Schur/∂t_i` is a rank-≤d update. Per outer iteration the cost is one
+dense `Schur⁻¹` formation (shared across all rows) + N cheap per-row
+traces — `O(N + decoder-cost)`, not `O(N²)` and not `O((Nd)³)`. The
+arrow shape holds at the cost level; the gradient formula carries a
+shared factor that is a one-time setup per outer iteration.
+
+### 2.3 Gauge symmetry — load-bearing caveat
+
+The bare data-fit loss `½‖y − Φ(t) β‖²` is invariant under any
+diffeomorphism `t ↦ φ(t)`, because we can absorb `φ` into a re-fit of
+`β` against the relabeled basis. Concretely:
+
+- Translation / rotation of `t` ↔ relabeling of centers.
+- Smooth coordinate change ↔ basis transformation; β re-fits.
+
+The penalty `βᵀ S β` *does* depend on coordinates (it penalizes
+spline-curvature in `t`-space), but is invariant under isometries
+(rotation + translation), which still leaves at least a `d(d+1)/2`-dim
+gauge orbit per fit. **IFT is singular along this orbit** — the inner
+Hessian has zero eigenvalues, so the nested optimizer's predictor step
+blows up. `auto_71.py` in the companion repo demonstrates this: geodesic
+LM hits R² = 0.640 but Procrustes disparity = 0.99 across seeds —
+solutions wander freely along the gauge.
+
+Three model-level fixes, all exposed as `LatentCoord` configurations:
+
+**(a) `aux_prior`** — conditional prior `p(t | u)` with `u` observed
+(iVAE; Hyvärinen 2019, Khemakhem et al. 2020). Add a regulariser
+`R_id(t, u) = ½ τ · ‖t − h(u)‖²` where `h` is a small learned map
+(ridge / shallow GAM). Different `φ` (latent reparameterisations) give
+different `‖t − h(u)‖²`, so the orbit collapses to a single
+representative. This is the **principled fix**; identifiability of the
+resulting `t` follows from the iVAE result (assuming `u` varies enough
+across rows).
+
+**Regularity conditions (per math audit) — these must hold for the
+claim that `τ` is REML-selectable and gauge is broken:**
+
+1. The marginal likelihood for `τ` must include the `(N/2) log τ`
+   normaliser (or the equivalent for the chosen prior family).
+   Without it, optimising over `τ` can degenerate to `0`, `∞`, or be
+   indifferent — the data-fit/penalty trade-off lacks the term that
+   makes the trade-off well-posed.
+2. `h` must be at least `C¹` (typically `C²` in practice) so the IFT
+   and Hessian claims downstream are well-defined.
+3. The conditional precision `τ · I` (or `Λ(u)` in the Gaussian
+   conditional case) must be positive-definite on the anchored
+   subspace of `T` — i.e. the subspace `h(u)` actually constrains
+   across the realised rows.
+
+If any of (1)-(3) fails, the gauge-breaking and `τ`-selection claims
+do not go through. The implementation should enforce all three (the
+normaliser as a code path, `h` regularity by the basis choice, PD by
+a runtime check on the row-wise design).
+
+**(b) `orthogonality`** — penalize `‖TᵀT/N − I_d‖²_F` after centering
+`T ← T − T̄`. Cheap to compute, kills the rotation + scale gauge, but
+doesn't help with the diffeomorphism gauge for `d > 1`. Useful as a
+warm-start regularizer or a cheap second-best.
+
+**(c) `dim_selection`** — ARD per latent axis, with REML selecting the
+per-axis precisions `α_j`. **Not a standalone gauge fix.** The penalty
+`α_j ‖t_{·,j}‖²` is rotation-symmetric on `T`: a rotation can re-shuffle
+which axis is "used" vs "unused" without changing the penalty value.
+ARD discovers intrinsic dim only *given* a paired gauge fix from (a) or
+(b) and only when the marginal likelihood includes the proper
+normalisers — the `(N/2) log α_j` per-axis terms and the
+determinant/rank corrections. Under those conditions, REML drives
+`α_j → ∞` on axes the data does not support and the user reads off
+intrinsic dim as the count of finite `α_j`. The intended use is
+**combined**: aux-prior (a) breaks the rotation gauge, ARD (c)
+identifies which axes carry signal. ARD on its own does not break the
+gauge and does not by itself identify intrinsic dim. (Source: math
+audit on the original draft.)
+
+## 3. API sketch
+
+### 3.1 Python
+
+```python
+import gamfit
+from gamfit import LatentCoord
+
+# Replaces an observed-x covariate with a learned t of dimension d.
+t = LatentCoord(
+    n=N,
+    d=4,
+    init="pca",                 # 'pca' | 'random' | array (N, d)
+    bounds=(-3.0, 3.0),         # per-axis clamp (broadcast or per-d)
+    aux_prior=dict(             # (a) iVAE-style
+        u=rgb,                  # (N, p) observed auxiliary
+        family="ridge",         # 'ridge' | 'duchon'
+        strength=1.0,           # τ in the math
+    ),
+    # OR
+    orthogonality=0.1,          # (b)
+    # OR
+    dim_selection=True,         # (c)   ⇒ marginal-likelihood prunes d
+)
+
+model = gamfit.GAM(
+    y ~ s(t, basis="duchon", m=2, nullspace_order="degree2")
+       + s(observed_x, basis="duchon", m=2),
+    data=df,
+    latents={"t": t},
+)
+model.fit()                      # joint outer over (t, ψ, λ); REML inner
+print(model.latents["t"].values) # (N, d) posterior mean
+```
+
+### 3.2 Rust
+
+Current Rust shape, now landed as the sibling of `SpatialLogKappaCoords`
+(`src/terms/latent_coord.rs:561`):
+
+```rust
+// src/terms/latent_coord.rs
+pub struct LatentCoordValues {
+    /// Flattened (N, d) latent matrix, row-major.
+    values: Array1<f64>,
+    n_obs: usize,
+    latent_dim: usize,
+    id_mode: LatentIdMode,
+    manifold: LatentManifold,
+}
+
+pub enum LatentIdMode {
+    AuxPrior { u: Array2<f64>, family: AuxPriorFamily, strength: AuxPriorStrength },
+
+exec
+/bin/zsh -lc "sed -n '1,220p' proposals/sae_manifold.md" in /Users/user/gam
+ succeeded in 0ms:
+# Proposal: SAE and SAE-manifold as gamfit configurations
+
+Status: draft RFC
+Audience: gamfit maintainers
+Companion proposals: `composition_engine.md` (three-tier engine), `latent_coord.md` (per-row latent field)
+Companion empirical work: `/Users/user/Manifold-SAE` (Curve-SAE benchmark)
+
+## 1. Premise
+
+Sparse autoencoders (SAEs) are routinely framed as "a separate
+architecture for interpretability." This proposal argues the opposite:
+**a linear SAE is a particular configuration of gamfit's three-tier
+engine, and a non-linear "SAE-manifold" — the natural fix for
+representation shattering — is the same configuration with one
+additional primitive (`LatentCoord`) already proposed in
+`latent_coord.md`.** There is no new optimizer, no new objective family,
+no new identifiability theory required. There is a tier assignment and
+a choice of priors.
+
+The three-tier reading of gamfit is laid out in `composition_engine.md`:
+
+- **β** — decoder / smooth coefficients, solved by the penalised-LS
+  Newton inner solver (`src/solver/pirls.rs`).
+- **ψ / ext-coords** — kernel-shape `ψ` plus any design-moving external
+  coordinates transported through the inner solution by the implicit
+  function theorem (`HyperDesignDerivative`, `src/solver/reml/mod.rs:2687`;
+  `from_implicit`, `src/solver/reml/mod.rs:2706`).
+  Per-row latents are written `t`, not `ψ`.
+- **ρ** — penalty / hyperparameter scalings, selected by the marginal
+  likelihood in the REML outer loop (`src/solver/reml/runtime.rs`).
+
+"Methodspace" is the cross-product of (tier assignment) × (choice of
+basis / topology) × (choice of identifiability priors). The point of
+this proposal is to show that SAE and SAE-manifold are two more rows
+in that table; that the SAE row is already buildable with the
+shipping primitives; that the SAE-manifold row needs only what
+`latent_coord.md` already proposes; and that the well-known
+"shattering" pathology of linear SAEs dissolves under the manifold row
+because the REML Occam factor can prefer one curved atom over `K`
+linear shards (under proper prior normalisation, controlled gauge, and
+smooth-decoder effective dimension growing slower than the required
+shard count — see §5.3 and the math-audit caveats).
+
+## 2. The tier-assignment table
+
+| Method | β | ψ | ρ | Identifiability priors |
+|---|---|---|---|---|
+| GAM | smooth coefficients | (none) | smoothness | Duchon `S(ρ)` penalty (`gamfit/smooth.py:80`) |
+| Anisotropic-Matern fit | smooth coefficients | log length-scales (`SpatialLogKappaCoords`, `src/terms/smooth.rs:1774`) | smoothness + per-axis length | smoothness + Matern hyperprior |
+| Manifold / GP-LVM | decoder coefficients | per-row latent `t_i` (`LatentCoord`, `latent_coord.md` §3) | smoothness + ARD + topology | isometry / ARD / smoothness / topology-via-basis |
+| **Linear SAE** | dictionary `D` + codes `a_i` | (none) | sparsity strength `λ_sp` + dict size `K` | L¹-like on `a_i` (active-set, `src/solver/active_set.rs`); Occam on `K` via REML / `compare_models` |
+| **SAE-manifold** | per-atom decoder coeffs `B_k` | soft assignment `a_i` + on-atom coord `t_ik` (`LatentCoord` × K atoms) | sparsity + per-atom dim + smoothness | sparsity on `a_i`; ARD per `t_ik` axis; smoothness on each `B_k` |
+
+The middle four rows are already implementable: GAM ships today,
+anisotropic-Matern fits today, GP-LVM lands with `LatentCoord` (a
+single global latent block), linear SAE lands with the
+already-shipped active-set + `compare_models` combination plus a
+non-negativity / sparsity penalty on the code block. The bottom row
+is the new contribution and is treated in §3.
+
+The point is that "SAE" and "SAE-manifold" do not require a separate
+code path. They are choices about which parameter block lives in which
+tier and which prior is attached.
+
+## 3. The SAE-manifold formulation
+
+### 3.1 Variables
+
+Observed: `Z_i ∈ ℝ^p`, `i = 1 … N` (e.g. residual-stream activations
+at a layer).
+
+Parameters, partitioned by tier:
+
+- **β** = `{B_k}_{k=1..K}`, where `B_k ∈ ℝ^{M_k × p}` are the
+  spline-coefficient blocks of atom `k`'s decoder. `M_k` is the
+  basis size of atom `k`. β lives in the Newton inner solve.
+
+- **Ext-coordinates** decompose into two per-observation sub-blocks:
+  - `a_i ∈ ℝ^K_{≥0}` — soft assignment of observation `i` to each
+    atom. Constrained non-negative; the sparsity prior on `a_i`
+    encourages most entries to be exactly zero.
+  - `t_ik ∈ ℝ^{d_k}` — on-atom coordinate of observation `i`
+    *if* it is assigned to atom `k`. `d_k` is the intrinsic
+    dimension of atom `k`. `t_ik` is materially present only when
+    `a_ik > 0`; otherwise it is an unconstrained nuisance and its
+    penalty floats it at zero.
+
+  Both `a` and `t` are per-observation latent fields — exactly the
+  case `LatentCoord` (`latent_coord.md` §3) generalises from one
+  to two sub-blocks.
+
+- **ρ** = `(λ_sp, λ_sm, {α_kj}_{k,j}, K)` where `λ_sp` is the
+  sparsity strength on `a`, `λ_sm` is the smoothness strength on
+  each `B_k`, `α_kj` is the ARD precision on the `j`th axis of
+  atom `k`'s latent coordinate, and `K` is the discrete atom count.
+  Continuous components of ρ are selected by REML in the usual
+  outer loop; `K` is selected by `compare_models`
+  (`gamfit/_compare.py:97`) over candidate atom counts.
+
+### 3.2 Reconstruction and loss
+
+Each atom `k` has a smooth decoder `g_k : ℝ^{d_k} → ℝ^p` of the form
+`g_k(t) = Φ_k(t) · B_k`, where `Φ_k` is a basis on atom `k`'s
+internal latent manifold (a `Duchon`, `Sphere`, `PeriodicSplineCurve`,
+or tensor-product basis, exactly as in any other gamfit smooth). The
+reconstruction is the assignment-weighted sum of decoder outputs:
+
+```
+Ẑ_i = Σ_k a_ik · g_k(t_ik) = Σ_k a_ik · Φ_k(t_ik) · B_k.
+```
+
+The full penalised-likelihood objective is
+
+```
+ℒ(β, ext, ρ) =
+    ½ Σ_i ‖Z_i − Ẑ_i‖²                                 (data fit)
+  + λ_sp Σ_i Pen_sparse(a_i)                            (atom sparsity)
+  + λ_sm Σ_k B_k' P_k B_k                               (decoder smoothness)
+  + Σ_k Σ_j α_kj ‖t_{·, k, j}‖²                         (ARD per atom × axis)
+  + R_id(a, t)                                          (identifiability; §3.4)
+  − ½ log |Σ(ρ, ext)|                                   (REML log-det).
+```
+
+`Pen_sparse` is the existing active-set L¹ (`src/solver/active_set.rs`)
+on the non-negative orthant; `P_k` is the same Duchon-style
+function-norm penalty already used by every smooth (`Duchon` doc at
+`gamfit/smooth.py:80`); the ARD term is the `dim_selection=True`
+construction from `latent_coord.md` §2.3(c) replicated per atom.
+
+### 3.3 Tier assignment of the gradient
+
+All gradients are analytic and reuse existing machinery:
+
+- `∂ℒ/∂B_k` is the standard penalised-LS normal-equation block.
+- `∂ℒ/∂a_ik` = `−(Z_i − Ẑ_i)' g_k(t_ik) + λ_sp · ∂Pen_sparse/∂a_ik`;
+  the data-fit term is the inner product of the residual with
+  atom `k`'s decoded value at `t_ik`. This is row-local in `i`,
+  exactly the `LatentCoord` row-local structure.
+- `∂ℒ/∂t_ik` = `−a_ik · (Z_i − Ẑ_i)' (∂Φ_k/∂t · B_k)`; the
+  `∂Φ_k/∂t` factor is the radial-kernel chain rule now supplied
+  by `LatentCoordDesignDerivative` (`src/terms/basis.rs:4118`) via
+  `LatentCoordValues::design_gradient_wrt_t_dispatch`
+  (`src/terms/latent_coord.rs:825`).
+- `∂ℒ/∂ρ` is the standard REML gradient with the additional
+  ARD-per-axis terms; the implicit-function-theorem propagation
+  through the inner solution is the existing
+  `evaluate_unified_with_psi_ext` path.
+
+No autograd. No new IFT scaffolding. The arrow / bordered-Hessian
+structure is exactly the structure `composition_engine.md` §6
+identifies for `LatentCoord`: per-observation ext-coordinate blocks are
+block-diagonal across `i`, coupled to the shared β only through the
+dense border, and the Schur complement reduces the per-step cost from
+`O((Nd+M)^3)` to `O(N d^3 + M^3 + Nd · M)`.
+
+**Audit caveat (REML `log|H|` gradient).** The arrow shape holds at
+the cost level; the gradient of the REML Occam term has a shared
+`Schur⁻¹` factor — it is *not* literally a sum of independent per-row
+contributions. Specifically, `∂/∂t_i log|Schur| =
+tr(Schur⁻¹ · ∂Schur/∂t_i)` with `Schur⁻¹` dense in all `t`, but
+`∂Schur/∂t_i` is a rank-≤d update because only row `i` of `Φ` moves
+with `t_i`. So per outer iteration: one dense `Schur⁻¹` formation
+(shared) plus N cheap per-row traces. Asymptotic cost is
+`O(N + decoder-cost)` per outer iteration, not `O(N²)`. See
+`latent_coord.md` §2.2 for the full derivation.
+
+### 3.4 Identifiability priors
+
+Three gauge issues exist and all three are addressed by primitives
+already proposed:
+
+1. **Atom-label permutation.** Trivial and harmless; collapses on
+   `compare_models` by atom-set equivalence.
+2. **On-atom reparameterisation** (the GP-LVM gauge of
+   `latent_coord.md` §2.3). Resolved by the `IsometryToReference`
+   penalty (`composition_engine.md` §4(b)) or by an auxiliary-conditional
+   prior on `t_ik`. ARD on the `t_ik` axes is a useful *companion* — it
+   identifies which axes carry signal once gauge is fixed — but per the
+   math audit it is *not* a standalone gauge fix: `α_j ‖t_{·,j}‖²` is
+   rotation-symmetric, so ARD alone can re-shuffle "used" vs "unused"
+   axes without changing the objective. Combine ARD with the isometry
+   or aux-prior; do not rely on ARD on its own.
+3. **Atom overlap.** When two atoms' decoded sets overlap in
+   ℝ^p, the assignment `a_ik` is non-unique on the overlap. The
+   conditional-prior route from `composition_engine.md` §4(c) —
+   `R_id(a, t) = ½ τ ‖a_i − g_φ(Z_i)‖²` with `g_φ` a small
+   amortised encoder — handles this; equivalently a hard
+   winner-take-all assignment as a simplex projection collapses
+   the orbit at the cost of differentiability through the
+   assignment. See §8 for the choice.
+
+### 3.5 IBP-MAP per-row active sets
+
+The principled sparse-assignment variant is not a speculative new prior:
+it is the finite-MAP adaptation of the Indian Buffet Process construction
+used by Infinite GPFA / IBP-GPFA in neuroscience. That literature makes the
+same diagnosis this proposal needs: ordinary ARD selects one set of factors
+for all observations, not a different active set for each observation. That
+is exactly why ARD on atom coordinates cannot by itself separate coexisting
+manifolds.
+
+The gamfit adaptation is a truncated Beta-Bernoulli IBP prior over the
+assignment logits:
+
+```
+pi_k ~ Beta(alpha / K_max, 1)
+z_ik | pi_k ~ Bernoulli(pi_k)
+z_ik = sigmoid(logit_ik / tau)
+```
+
+For REML/MAP there is no sampling step: the concrete relaxation is
+deterministic, and the analytic penalty is the negative log prior
+
+```
+-Σ_i Σ_k [z_ik log pi_k + (1 - z_ik) log(1 - pi_k)]
+  + (alpha / K_max - 1) Σ_k log pi_k.
+```
+
+This replaces the finite-K softmax entropy penalty when the caller requests
+`assignment_prior="ibp_map"`. Softmax gives every row a nonzero weight on
+
+exec
+/bin/zsh -lc 'rg -n "riemannian|Riemannian|LatentManifold|retract_flat_delta|input_loc|contract_gradient|contract_hessian|design_gradient_wrt_t" src proposals docs tests' in /Users/user/gam
+ succeeded in 0ms:
+proposals/sae_manifold.md:142:  `LatentCoordValues::design_gradient_wrt_t_dispatch`
+proposals/latent_coord.md:216:    manifold: LatentManifold,
+proposals/latent_coord.md:236:    pub(crate) fn design_gradient_wrt_t(
+proposals/latent_coord.md:260:| `duchon_radial_jets` in `terms/basis.rs` | now also queried via `design_gradient_wrt_t` | same routine; first-arg derivative |
+proposals/composition_engine.md:29:| Gauge / canonical coordinate (Riemannian isometry to a reference) | structured penalty pinning the pullback metric toward a reference | analytic penalty landed as `IsometryPenalty` (`src/terms/analytic_penalties.rs:353`); see §4(b) |
+proposals/composition_engine.md:71:    manifold: LatentManifold,
+proposals/composition_engine.md:75:with a `LatentCoordValues::build_x_ext_derivatives(&self) -> Vec<HyperDesignDerivative>` that produces one `HyperDesignDerivative` per latent column. For Duchon, Matern, sphere, periodic, and tensor bases, the landed `LatentCoordDesignDerivative` (`src/terms/basis.rs:4118`) routes through `LatentCoordValues::design_gradient_wrt_t_dispatch` (`src/terms/latent_coord.rs:825`): radial bases reuse the same radial derivative as `ψ`, while non-radial bases provide analytic jets. The remaining work is integration breadth, not new IFT math.
+proposals/composition_engine.md:99:**Math.** Let `T: M → ℝ^p` be the decoder, with induced pullback metric `g_ij(t) = ⟨∂T/∂t_i, ∂T/∂t_j⟩`. Let `g^ref_ij(t)` be a reference Riemannian metric on the latent manifold (e.g. the identity, or the metric of a held-out chart). The isometry penalty is
+proposals/composition_engine.md:147:### 4(f). Riemannian latent updates for topology-matched `LatentCoord`
+proposals/composition_engine.md:149:**Problem.** Basis topology alone is not enough for a latent coordinate. A cyclic basis can make `Φ(t)` continuous across the seam, but if the per-row coordinate update is Euclidean then an angular latent still has a spurious discontinuity at `2π → 0`. mGPLVM avoids this by putting the latent itself on the manifold (circle, sphere, torus, product manifolds) and optimizing with Riemannian updates.
+proposals/composition_engine.md:151:**Implementation.** `LatentCoordValues` carries a `LatentManifold` (`src/terms/latent_coord.rs:149`, field at `src/terms/latent_coord.rs:572`):
+proposals/composition_engine.md:157:Each variant supplies three closed-form operations from Absil/Mahony/Sepulchre / Manopt / Pymanopt: a retraction `R_t(ξ)`, tangent projection `P_t(v)`, and Euclidean-to-Riemannian Hessian action `H_R(t)[ξ]`. Circle is a wrapped scalar angle; sphere uses the normalization retraction `(t + ξ) / ||t + ξ||`, tangent projection `v - (v·t)t`, and the embedded-sphere Hessian conversion `P_t(H_E ξ) - <∇f_E,t> ξ` (equivalently, differentiating the projected gradient with the normal curvature correction).
+proposals/composition_engine.md:162:2. `H_tt^(i)` is converted to the Riemannian Hessian action.
+proposals/composition_engine.md:167:For the shipped manifolds the Riemannian metric is the ambient Euclidean pullback, so Steihaug-CG's dot products already compute the right trust-region norm once row vectors are tangent-projected. Embedded constrained factors pin the normal block only to keep the existing ambient Cholesky path nonsingular; RHS and cross terms remain tangent, so the solved row step is a tangent vector.
+proposals/composition_engine.md:291:- The per-observation `∂X/∂t_n` method now lives in `LatentCoordDesignDerivative` (`src/terms/basis.rs:4118`) plus `LatentCoordValues::design_gradient_wrt_t_dispatch` (`src/terms/latent_coord.rs:825`), not on `BasisOutput` (`src/terms/basis.rs:270`). Is that the intended long-term ownership boundary?
+src/inference/hmc.rs:4277:/// directions constructed from pairs of eigenvectors. Runs a few Riemannian
+src/inference/hmc.rs:4335:    // One step of Riemannian gradient ascent on the whitened sphere for |T[v,v,v]|.
+src/solver/latent_inner.rs:118:/// [`crate::terms::latent_coord::LatentCoordValues::design_gradient_wrt_t`]),
+src/solver/latent_inner.rs:184:            system.apply_riemannian_latent_geometry(self.latent);
+src/solver/latent_inner.rs:223:                    self.latent.retract_flat_delta(delta_t.view());
+src/solver/latent_inner.rs:268:    riemannian_trust_region: bool,
+src/solver/latent_inner.rs:275:    solve_options.riemannian_trust_region = riemannian_trust_region;
+src/solver/pirls.rs:1369:    /// (`retract_flat_delta` for manifold latents). `delta_t` is the flat
+src/solver/pirls.rs:10984:    latent.retract_flat_delta(applied.view());
+src/solver/persistent_warm_start.rs:417:/// `retract_flat_delta(Δt)` before the next inner Newton
+src/solver/persistent_warm_start.rs:490:// Riemannian retraction wrapper (additive)
+src/solver/persistent_warm_start.rs:503:/// behavior collapses to plain addition (bit-equivalent to the pre-Riemannian
+src/solver/persistent_warm_start.rs:507:/// [`crate::solver::riemannian`].
+src/solver/persistent_warm_start.rs:513:    manifolds: &[Option<crate::solver::riemannian::ManifoldKind>],
+src/solver/mod.rs:13:pub mod riemannian;
+src/solver/arrow_schur.rs:218:    /// Use the Riemannian latent projection before the Schur reduction. The
+src/solver/arrow_schur.rs:220:    pub riemannian_trust_region: bool,
+src/solver/arrow_schur.rs:231:            riemannian_trust_region: false,
+src/solver/arrow_schur.rs:242:            riemannian_trust_region: false,
+src/solver/arrow_schur.rs:252:            riemannian_trust_region: false,
+src/solver/arrow_schur.rs:262:            riemannian_trust_region: false,
+src/solver/arrow_schur.rs:402:///      [`crate::terms::latent_coord::LatentCoordValues::design_gradient_wrt_t`]);
+src/solver/arrow_schur.rs:546:    /// Convert row-local Euclidean latent blocks to Riemannian tangent blocks.
+src/solver/arrow_schur.rs:554:    pub fn apply_riemannian_latent_geometry(&mut self, latent: &LatentCoordValues) {
+src/solver/arrow_schur.rs:567:            row.htt = manifold.riemannian_hessian_matrix(t_i.clone(), gt_e.view(), htt_e.view());
+src/solver/arrow_schur.rs:977:// Riemannian retraction hook (additive — opt-in)
+src/solver/arrow_schur.rs:988:// `new_point[i] = point[i] + delta_t[i]`, matching the pre-Riemannian path.
+src/solver/arrow_schur.rs:990:// Callers integrating the Riemannian per-point step do:
+src/solver/arrow_schur.rs:1011:    manifolds: &[Option<crate::solver::riemannian::ManifoldKind>],
+src/solver/arrow_schur.rs:1036:                crate::solver::riemannian::retract_euclidean_delta(
+src/solver/riemannian.rs:1://! Retraction-based Riemannian optimization for per-point latent coordinates.
+src/solver/riemannian.rs:10://!     a Euclidean→Riemannian gradient/Hessian conversion using the
+src/solver/riemannian.rs:15://!   * a per-point Riemannian Newton step (with optional trust radius)
+src/solver/riemannian.rs:16://!     [`riemannian_newton_step_on_point`].
+src/solver/riemannian.rs:83:    /// Riemannian inner product `<ξ, η>_p`. Default: weighted ambient
+src/solver/riemannian.rs:97:    /// Convert a Euclidean gradient to a Riemannian gradient in place:
+src/solver/riemannian.rs:99:    fn euclidean_to_riemannian_grad(&self, p: ArrayView1<f64>, egrad: ArrayViewMut1<f64>) {
+src/solver/riemannian.rs:103:    /// Convert a Euclidean Hessian-vector product to a Riemannian one:
+src/solver/riemannian.rs:106:    fn euclidean_to_riemannian_hess_vp(
+src/solver/riemannian.rs:192:/// the pre-Riemannian solver path.
+src/solver/riemannian.rs:220:    fn euclidean_to_riemannian_hess_vp(
+src/solver/riemannian.rs:275:    fn euclidean_to_riemannian_hess_vp(
+src/solver/riemannian.rs:347:    fn euclidean_to_riemannian_hess_vp(
+src/solver/riemannian.rs:429:    fn euclidean_to_riemannian_hess_vp(
+src/solver/riemannian.rs:496:    fn euclidean_to_riemannian_hess_vp(
+src/solver/riemannian.rs:584:    fn euclidean_to_riemannian_hess_vp(
+src/solver/riemannian.rs:599:            c.euclidean_to_riemannian_hess_vp(p_slice, eg_slice, eh_slice, xi_slice);
+src/solver/riemannian.rs:615:    /// Flat Euclidean ℝ^d. Default; bit-equivalent to no Riemannian step.
+src/solver/riemannian.rs:681:// Per-point Riemannian Newton step
+src/solver/riemannian.rs:684:/// Configuration of a single per-point Riemannian Newton step.
+src/solver/riemannian.rs:686:pub struct RiemannianNewtonStep {
+src/solver/riemannian.rs:687:    /// Optional trust-region radius in the Riemannian metric.
+src/solver/riemannian.rs:694:impl Default for RiemannianNewtonStep {
+src/solver/riemannian.rs:708:///   2. Form the Riemannian Hessian-vector operator
+src/solver/riemannian.rs:716:pub(crate) fn riemannian_newton_step_on_point(
+src/solver/riemannian.rs:721:    step: &RiemannianNewtonStep,
+src/solver/riemannian.rs:728:    // Riemannian gradient.
+src/solver/riemannian.rs:730:    manifold.euclidean_to_riemannian_grad(point, grad_r.view_mut());
+src/solver/riemannian.rs:732:    // Build Riemannian Hessian column-by-column by applying the
+src/solver/riemannian.rs:733:    // euclidean->Riemannian operator to each basis vector.
+src/solver/riemannian.rs:753:        manifold.euclidean_to_riemannian_hess_vp(
+src/solver/riemannian.rs:774:    // The ambient Riemannian Hessian H_R is structurally singular in the
+src/solver/riemannian.rs:873:#[allow(dead_code)] // INTEGRATION-HOOK(piece-1): helper for riemannian_newton_step_on_point.
+src/solver/riemannian.rs:967:// Convenience: apply a Euclidean delta as a Riemannian retraction step.
+src/solver/riemannian.rs:1052:        // Riemannian Hess applied to a tangent vector ξ should equal
+src/solver/riemannian.rs:1061:        // Path A: via euclidean_to_riemannian_hess_vp using identity ehess.
+src/solver/riemannian.rs:1063:        m.euclidean_to_riemannian_hess_vp(p.view(), egrad.view(), path_a.view_mut(), xi.view());
+src/terms/atom_selection.rs:138://!   into Piece 1's basis-derivative machinery (`design_gradient_wrt_t` in
+src/terms/atom_selection.rs:296:    // `LatentCoordValues::design_gradient_wrt_t`; (iii) restrict the active
+src/terms/atom_selection.rs:433:    // `design_gradient_wrt_t` from `latent_coord.rs` together with `B_k`
+src/terms/analytic_penalties.rs:187:/// Choice of reference Riemannian metric `g^ref(t)` on the latent manifold.
+src/terms/analytic_penalties.rs:343:/// `design_gradient_wrt_t` already computes for `LatentCoordValues`; the
+src/terms/input_loc_derivatives.rs:40://! so they slot directly into the `LatentCoordValues::design_gradient_wrt_t`
+src/terms/input_loc_derivatives.rs:175:pub fn basis_input_loc_grad(
+src/terms/input_loc_derivatives.rs:186:            "basis_input_loc_grad: centers have {} cols but t has {} cols",
+src/terms/input_loc_derivatives.rs:193:            "basis_input_loc_grad: out shape {:?} != expected {:?}",
+src/terms/input_loc_derivatives.rs:216:/// Allocating convenience wrapper around [`basis_input_loc_grad`].
+src/terms/input_loc_derivatives.rs:217:pub fn basis_input_loc_grad_alloc(
+src/terms/input_loc_derivatives.rs:223:    basis_input_loc_grad(kernel, t, centers, out.view_mut())?;
+src/terms/input_loc_derivatives.rs:247:pub fn basis_input_loc_hess(
+src/terms/input_loc_derivatives.rs:258:            "basis_input_loc_hess: centers have {} cols but t has {} cols",
+src/terms/input_loc_derivatives.rs:265:            "basis_input_loc_hess: out shape {:?} != expected {:?}",
+src/terms/input_loc_derivatives.rs:293:/// Allocating convenience wrapper around [`basis_input_loc_hess`].
+src/terms/input_loc_derivatives.rs:294:pub fn basis_input_loc_hess_alloc(
+src/terms/input_loc_derivatives.rs:301:    basis_input_loc_hess(kernel, t, centers, out.view_mut())?;
+src/terms/input_loc_derivatives.rs:309:/// Per-axis factor tables consumed by [`tensor_product_input_loc_grad`].
+src/terms/input_loc_derivatives.rs:359:pub fn tensor_product_input_loc_grad(
+src/terms/input_loc_derivatives.rs:368:            "tensor_product_input_loc_grad: at least one axis is required".to_string(),
+src/terms/input_loc_derivatives.rs:373:            "tensor_product_input_loc_grad: derivatives has {} axes, values has {}",
+src/terms/input_loc_derivatives.rs:381:                "tensor_product_input_loc_grad: axis {a} value/deriv shape mismatch"
+src/terms/input_loc_derivatives.rs:387:            "tensor_product_input_loc_grad: out shape {:?} != expected {:?}",
+src/terms/input_loc_derivatives.rs:426:pub fn tensor_product_input_loc_grad_alloc(
+src/terms/input_loc_derivatives.rs:433:    tensor_product_input_loc_grad(factors, out.view_mut())?;
+src/terms/input_loc_derivatives.rs:468:pub fn periodic_radial_input_loc_grad_1d(
+src/terms/input_loc_derivatives.rs:477:            "periodic_radial_input_loc_grad_1d: period must be finite and positive, got {period}"
+src/terms/input_loc_derivatives.rs:484:            "periodic_radial_input_loc_grad_1d: out shape {:?} != expected {:?}",
+src/terms/input_loc_derivatives.rs:551:pub fn sphere_s2_input_loc_grad(
+src/terms/input_loc_derivatives.rs:561:            "sphere_s2_input_loc_grad: t and centers must have 3 columns (ambient), got {} and {}",
+src/terms/input_loc_derivatives.rs:568:            "sphere_s2_input_loc_grad: out shape {:?} != expected {:?}",
+src/terms/input_loc_derivatives.rs:603:// Contraction helper (mirrors LatentCoordValues::contract_gradient)
+src/terms/input_loc_derivatives.rs:612:/// [`crate::terms::latent_coord::LatentCoordValues::contract_gradient`] for
+src/terms/input_loc_derivatives.rs:614:pub fn contract_input_loc_gradient(
+src/terms/input_loc_derivatives.rs:686:            basis_input_loc_grad_alloc(&kernel, t.view(), centers.view()).expect("analytic grad");
+src/terms/input_loc_derivatives.rs:711:        let g = basis_input_loc_grad_alloc(&kernel, t.view(), centers.view())
+src/terms/input_loc_derivatives.rs:725:        let h = basis_input_loc_hess_alloc(&kernel, t.view(), centers.view()).expect("hess");
+src/terms/input_loc_derivatives.rs:749:        let out = tensor_product_input_loc_grad_alloc(&factors).unwrap();
+src/terms/input_loc_derivatives.rs:795:        periodic_radial_input_loc_grad_1d(
+src/terms/input_loc_derivatives.rs:818:            sphere_s2_input_loc_grad(&kernel, t.view(), centers.view(), out.view_mut()).unwrap();
+src/terms/input_loc_derivatives.rs:828:    fn contract_input_loc_gradient_matches_einsum() {
+src/terms/input_loc_derivatives.rs:835:        let out = contract_input_loc_gradient(grad_phi.view(), &jet);
+src/terms/input_loc_derivatives.rs:863:        let err = basis_input_loc_grad_alloc(&kernel, t.view(), centers.view())
+src/terms/input_loc_derivatives.rs:899:        let err = basis_input_loc_grad_alloc(&kernel, t.view(), centers.view())
+src/terms/input_loc_derivatives.rs:914:        let err = basis_input_loc_grad_alloc(&kernel, t.view(), centers.view())
+src/terms/input_loc_derivatives.rs:945:        let err = periodic_radial_input_loc_grad_1d(
+src/solver/workflow.rs:52:    AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
+src/solver/workflow.rs:2928:struct LatentManifoldSpec {
+src/solver/workflow.rs:2929:    manifold: LatentManifold,
+src/solver/workflow.rs:2939:    manifold: LatentManifoldSpec,
+src/solver/workflow.rs:3000:) -> Result<LatentManifoldSpec, String> {
+src/solver/workflow.rs:3002:        return Ok(LatentManifoldSpec {
+src/solver/workflow.rs:3003:            manifold: LatentManifold::Euclidean,
+src/solver/workflow.rs:3011:        return Ok(LatentManifoldSpec {
+src/solver/workflow.rs:3012:            manifold: LatentManifold::Euclidean,
+src/solver/workflow.rs:3016:    let parse_named = |name: &str| -> Result<LatentManifold, String> {
+src/solver/workflow.rs:3018:            "euclidean" | "r" | "real" => Ok(LatentManifold::Euclidean),
+src/solver/workflow.rs:3021:                    Ok(LatentManifold::Circle)
+src/solver/workflow.rs:3023:                    Ok(LatentManifold::Product(
+src/solver/workflow.rs:3024:                        (0..d).map(|_| LatentManifold::Circle).collect(),
+src/solver/workflow.rs:3028:            "sphere" | "sn" => Ok(LatentManifold::Sphere { dim: d }),
+src/solver/workflow.rs:3029:            "torus" => Ok(LatentManifold::Product(
+src/solver/workflow.rs:3030:                (0..d).map(|_| LatentManifold::Circle).collect(),
+src/solver/workflow.rs:3037:                parts.push(LatentManifold::Circle);
+src/solver/workflow.rs:3039:                    parts.push(LatentManifold::Euclidean);
+src/solver/workflow.rs:3041:                Ok(LatentManifold::Product(parts))
+src/solver/workflow.rs:3058:                return Ok(LatentManifoldSpec {
+src/solver/workflow.rs:3059:                    manifold: LatentManifold::Euclidean,
+src/solver/workflow.rs:3077:                LatentManifold::Interval { lo, hi }
+src/solver/workflow.rs:3090:        LatentManifold::Product(parts)
+src/solver/workflow.rs:3100:    Ok(LatentManifoldSpec {
+src/solver/workflow.rs:3480:) -> LatentManifold {
+src/solver/workflow.rs:3487:                LatentManifold::Circle
+src/solver/workflow.rs:3489:                LatentManifold::Euclidean
+src/solver/workflow.rs:3492:        crate::smooth::SmoothBasisSpec::Sphere { .. } => LatentManifold::Sphere { dim: d },
+src/solver/workflow.rs:3494:            LatentManifold::Circle
+src/solver/workflow.rs:3497:            let parts: Vec<LatentManifold> = spec
+src/solver/workflow.rs:3505:                        LatentManifold::Circle
+src/solver/workflow.rs:3507:                        LatentManifold::Euclidean
+src/solver/workflow.rs:3512:                LatentManifold::Euclidean
+src/solver/workflow.rs:3514:                LatentManifold::Product(parts)
+src/solver/workflow.rs:3523:        | crate::smooth::SmoothBasisSpec::FactorSmooth { .. } => LatentManifold::Euclidean,
+src/terms/mod.rs:8:pub mod input_loc_derivatives;
+src/terms/sae_manifold.rs:894:            self.assignment.coords[atom_idx].retract_flat_delta(delta_coord.view());
+src/terms/latent_coord.rs:5://! The Riemannian update path follows manifold GPLVM practice (mGPLVM;
+src/terms/latent_coord.rs:9://! with basis-side periodic hacks. Retractions and Euclidean-to-Riemannian
+src/terms/latent_coord.rs:12://! Riemannian update is itself a gauge restriction: Circle/Sphere/Torus
+src/terms/latent_coord.rs:149:pub enum LatentManifold {
+src/terms/latent_coord.rs:159:    Product(Vec<LatentManifold>),
+src/terms/latent_coord.rs:166:        manifolds: Vec<LatentManifold>,
+src/terms/latent_coord.rs:171:impl Default for LatentManifold {
+src/terms/latent_coord.rs:177:impl LatentManifold {
+src/terms/latent_coord.rs:193:    /// Per-axis weights for the Riemannian trust-region metric.
+src/terms/latent_coord.rs:223:                    "LatentManifold::ProductWithMetric weights length must match ambient dimension"
+src/terms/latent_coord.rs:359:    /// Convert Euclidean Hessian action `eh · xi` to Riemannian Hessian action.
+src/terms/latent_coord.rs:366:    pub fn euclidean_to_riemannian_hessian(
+src/terms/latent_coord.rs:401:                    let converted = part.euclidean_to_riemannian_hessian(
+src/terms/latent_coord.rs:423:    pub fn riemannian_hessian_matrix(
+src/terms/latent_coord.rs:436:            let col = self.euclidean_to_riemannian_hessian(
+src/terms/latent_coord.rs:517:/// [`LatentCoordValues::design_gradient_wrt_t_dispatch`].
+src/terms/latent_coord.rs:571:    /// Manifold used for per-row Riemannian updates.
+src/terms/latent_coord.rs:572:    manifold: LatentManifold,
+src/terms/latent_coord.rs:578:        Self::from_matrix_with_manifold(matrix, id_mode, LatentManifold::Euclidean)
+src/terms/latent_coord.rs:585:        manifold: LatentManifold,
+src/terms/latent_coord.rs:614:        Self::from_flat_with_manifold(values, n_obs, latent_dim, id_mode, LatentManifold::Euclidean)
+src/terms/latent_coord.rs:623:        manifold: LatentManifold,
+src/terms/latent_coord.rs:665:    pub fn manifold(&self) -> &LatentManifold {
+src/terms/latent_coord.rs:669:    pub fn with_manifold(&self, manifold: LatentManifold) -> Self {
+src/terms/latent_coord.rs:712:    pub fn retract_flat_delta(&mut self, delta: ArrayView1<'_, f64>) {
+src/terms/latent_coord.rs:761:    /// Duchon/Matérn path. See [`Self::design_gradient_wrt_t_dispatch`] for
+src/terms/latent_coord.rs:773:    pub fn design_gradient_wrt_t(
+src/terms/latent_coord.rs:814:    /// `φ'(r)`-times-unit-vector chain that `design_gradient_wrt_t` already
+src/terms/latent_coord.rs:825:    pub fn design_gradient_wrt_t_dispatch(
+src/terms/latent_coord.rs:833:            } => self.design_gradient_wrt_t(kernel_first_derivative, centers),
+src/terms/latent_coord.rs:836:                // in the same layout `contract_gradient` consumes. Return a
+src/terms/latent_coord.rs:845:    /// `design_gradient_wrt_t` jet into a flat `∂L/∂t ∈ ℝ^(n_obs * d)`.
+src/terms/latent_coord.rs:850:    pub fn contract_gradient(
+src/terms/latent_coord.rs:874:    /// `contract_gradient(grad_phi, design_gradient_wrt_t(...))`, but never
+src/terms/latent_coord.rs:879:    pub fn contract_gradient_radial_streaming(
+src/terms/smooth.rs:1703:    pub manifold: crate::terms::latent_coord::LatentManifold,
+src/terms/smooth.rs:13301:    manifold: crate::terms::latent_coord::LatentManifold,
+src/terms/basis.rs:3679:    /// argument t (see `crate::terms::input_loc_derivatives`).
+src/terms/basis.rs:4299:        let jet = latent.design_gradient_wrt_t_dispatch(
+src/terms/basis.rs:4318:        let jet = latent.design_gradient_wrt_t_dispatch(
+src/terms/basis.rs:4336:        let jet = latent.design_gradient_wrt_t_dispatch(
+src/terms/basis.rs:19570:/// [`crate::terms::latent_coord::LatentCoordValues::design_gradient_wrt_t`]).
+src/terms/basis.rs:19909:/// [`crate::terms::latent_coord::LatentCoordValues::design_gradient_wrt_t`].
+src/terms/basis.rs:20029:/// through [`crate::terms::latent_coord::LatentManifold::Sphere`] onto
+src/terms/basis.rs:20031:/// Riemannian input-location derivative for embedded-sphere latent updates.
+src/terms/basis.rs:20062:        .then_some(crate::terms::latent_coord::LatentManifold::Sphere { dim });
+
+codex
+The existing code already has a partial Riemannian implementation in `src/solver/riemannian.rs` and a chart-oriented `LatentManifold` in `src/terms/latent_coord.rs`. I’m going to write the proposal as a derivation plus the trait signatures that should replace/settle the split.
+exec
+/bin/zsh -lc "sed -n '3600,3745p' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+            cross_frobenius: constraint_cross.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            constrained_gram_max_eigenvalue: f64::NAN,
+            constrained_gram_min_eigenvalue: f64::NAN,
+            spectral_tolerance: f64::NAN,
+        });
+    }
+
+    // Make the constrained design B*K_raw orthonormal under the W-inner product.
+    // If the constrained Gram K_raw^T G K_raw is rank-deficient (because some
+    // directions in null(M^T) collapse under B), the spectral whitener drops
+    // them — that is the right behavior: a degenerate column never contributes
+    // to B's column space and shouldn't appear in the reparameterized basis.
+    stabilized_orthogonality_transform_from_gram(gram, &transform_raw)
+}
+
+pub(crate) fn orthogonality_transform_for_design(
+    design: &DesignMatrix,
+    constraint_matrix: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<Array2<f64>, BasisError> {
+    let k = design.ncols();
+    if k == 0 {
+        return Err(BasisError::InsufficientColumnsForConstraint { found: 0 });
+    }
+    let q = constraint_matrix.ncols();
+    if q == 0 {
+        return Ok(Array2::eye(k));
+    }
+    let constraint_cross = design_constraint_cross(design, constraint_matrix, weights)?;
+    let gram = design_gram_matrix(design)?;
+    orthogonality_transform_from_cross_and_gram(&constraint_cross, &gram)
+}
+
+/// Which radial kernel family is being used. Stored in the streaming operator
+/// so that (q, t) scalars can be recomputed on the fly without a closure.
+#[derive(Debug, Clone)]
+pub(crate) enum RadialScalarKind {
+    /// Matern kernel: (length_scale, nu).
+    Matern { length_scale: f64, nu: MaternNu },
+    /// Hybrid Duchon kernel: parameters needed for `duchon_radial_jets`.
+    Duchon {
+        length_scale: f64,
+        p_order: usize,
+        s_order: usize,
+        dim: usize,
+        coeffs: DuchonPartialFractionCoeffs,
+    },
+    /// Pure Duchon kernel: a single intrinsic polyharmonic block.
+    PureDuchon {
+        block_order: usize,
+        p_order: usize,
+        s_order: usize,
+        dim: usize,
+    },
+    /// Thin-Plate Spline kernel: isotropic with a scalar length-scale, used
+    /// only with `n_axes = 1` (`ScalarTotal` streaming mode). The chain rule
+    /// for ψ = log κ = -log(length_scale) and r̃ = ‖x − c‖ gives
+    /// ∂φ/∂ψ   = φ'(z)·z
+    /// ∂²φ/∂ψ² = φ''(z)·z² + φ'(z)·z
+    /// where z = r̃ / length_scale. With the operator's c=0, s_0 = r̃²,
+    /// `shape_0 = q·s_0` and `shape_00 = t·s_0² + 2 q s_0` reproduce both
+    /// derivatives exactly when q = φ'(r̃)/r̃ and t = (φ''(r̃) − q)/r̃².
+    ThinPlate { length_scale: f64, dim: usize },
+}
+
+impl RadialScalarKind {
+    /// Evaluate the `(phi, q, t)` radial scalars for a given distance `r`.
+    ///
+    /// `q = φ'(r)/r` and `t = (φ''(r) - q)/r²` (with the appropriate
+    /// finite limits at `r → 0`). This is exactly the scalar pair needed
+    /// to assemble the first and second derivatives of `Φ(t) = φ(‖t − c‖)`
+    /// with respect to the input location `t`:
+    ///
+    /// ```text
+    /// ∂Φ/∂t_a       = q · (t − c)_a
+    /// ∂²Φ/∂t_a∂t_b  = q · δ_ab + t · (t − c)_a (t − c)_b
+    /// ```
+    ///
+    /// Re-pointing the existing ψ-derivative machinery at the first kernel
+    /// argument t (see `crate::terms::input_loc_derivatives`).
+    ///
+    /// Returns `true` iff both `q = φ'(r)/r` and `t = (φ''(r) − q)/r²` have
+    /// finite limits as `r → 0+` for this kernel. When this returns `false`
+    /// the design-row gradient/Hessian at a center collision (`r = 0`) is not
+    /// defined by a single finite value; callers must either move off the
+    /// collision or surface a `BasisError::DegenerateAtCollision`.
+    ///
+    /// Smoothness criteria used here (matching the analytic limits derived
+    /// in this file and the comments on `eval_design_triplet`):
+    ///   - Matérn ν = 1/2: `q = -s·E/r → -∞`, not smooth.
+    ///   - Matérn ν = 3/2: `q` finite but `t = s³E/r → ∞`, not smooth.
+    ///   - Matérn ν = 5/2: both finite, smooth.
+    ///   - Duchon hybrid (`Duchon`): finite via the hybrid PFD identity;
+    ///     the radial-jets routine produces a finite limit, so smooth.
+    ///   - PureDuchon (raw polyharmonic block, exponent α = 2m − d):
+    ///       non-log case and α ≥ 4 ⇒ both `q` and `t` vanish (smooth);
+    ///       log case at any α, or α < 4 ⇒ at least one derivative diverges.
+    ///   - ThinPlate dim = 1: φ = r³, `q = 3r → 0`, but `t = 3/r → ∞`. The
+    ///     1-D Hessian formula `q·δ + t·s·s` at r = 0 has the only diagonal
+    ///     entry contracted by `s_a = 0`, but the bare scalar limit is still
+    ///     not finite, so we report it as non-smooth and let callers in 1-D
+    ///     (where `s_a` literally vanishes) opt in by handling the error.
+    ///     Dim 2 (log r), Dim 3 (-r) both diverge.
+    #[inline]
+    pub(crate) fn is_smooth_at_collision(&self) -> bool {
+        match self {
+            RadialScalarKind::Matern { nu, .. } => matches!(nu, MaternNu::FiveHalves),
+            RadialScalarKind::Duchon { .. } => true,
+            RadialScalarKind::PureDuchon {
+                p_order,
+                s_order,
+                dim,
+                ..
+            } => {
+                let alpha = duchon_scaling_exponent(*p_order, *s_order, *dim);
+                let is_log = (*dim) % 2 == 0 && {
+                    let half = (alpha / 2.0).round();
+                    half >= 0.0 && (half * 2.0 - alpha).abs() < 1e-12
+                };
+                !is_log && alpha >= 4.0
+            }
+            RadialScalarKind::ThinPlate { .. } => false,
+        }
+    }
+
+    pub(crate) fn eval_design_triplet(&self, r: f64) -> Result<(f64, f64, f64), BasisError> {
+        match self {
+            RadialScalarKind::Matern { length_scale, nu } => {
+                let (phi, q, t, _, _) =
+                    matern_aniso_extended_radial_scalars(r, *length_scale, *nu)?;
+                Ok((phi, q, t))
+            }
+            RadialScalarKind::Duchon {
+                length_scale,
+                p_order,
+                s_order,
+                dim,
+                coeffs,
+            } => {
+                let jets = duchon_radial_jets(r, *length_scale, *p_order, *s_order, *dim, coeffs)?;
+                Ok((jets.phi, jets.q, jets.t))
+            }
+            RadialScalarKind::PureDuchon {
+                block_order, dim, ..
+            } => {
+                let phi = polyharmonic_kernel(r, (*block_order) as f64, *dim);
+
+exec
+/bin/zsh -lc "sed -n '4260,4355p' src/terms/basis.rs" in /Users/user/gam
+ succeeded in 0ms:
+                dim: centers.ncols(),
+            }
+        };
+        let mut workspace = BasisWorkspace::default();
+        let ident_transform =
+            kernel_constraint_nullspace(centers.view(), effective_order, &mut workspace.cache)?;
+        let n_poly = polynomial_block_from_order(centers.view(), effective_order).ncols();
+        Ok(Self {
+            latent,
+            basis: LatentCoordDesignDerivativeBasis::Radial {
+                centers,
+                radial_kind,
+                ident_transform: Some(ident_transform),
+                full_ident_transform,
+                n_poly,
+                polynomial_order: Some(effective_order),
+            },
+        })
+    }
+
+    pub(crate) fn new_sphere(
+        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        centers: Arc<Array2<f64>>,
+        penalty_order: usize,
+        ident_transform: Option<Array2<f64>>,
+    ) -> Result<Self, BasisError> {
+        if latent.latent_dim() != centers.ncols() {
+            return Err(BasisError::DimensionMismatch(format!(
+                "LatentCoordDesignDerivative sphere dimension mismatch: latent d={} centers d={}",
+                latent.latent_dim(),
+                centers.ncols()
+            )));
+        }
+        let raw_jet = sphere_first_derivative_nd(
+            latent.as_matrix().view(),
+            centers.view(),
+            penalty_order,
+            true,
+        )?;
+        let jet = latent.design_gradient_wrt_t_dispatch(
+            crate::terms::latent_coord::InputLocationDerivative::Jet(raw_jet.view()),
+        );
+        Self::from_jet(latent, jet, ident_transform)
+    }
+
+    pub(crate) fn new_periodic_bspline(
+        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        data_range: (f64, f64),
+        degree: usize,
+        num_basis: usize,
+        ident_transform: Option<Array2<f64>>,
+    ) -> Result<Self, BasisError> {
+        let raw_jet = periodic_bspline_first_derivative_nd(
+            latent.as_matrix().view(),
+            data_range,
+            degree,
+            num_basis,
+        )?;
+        let jet = latent.design_gradient_wrt_t_dispatch(
+            crate::terms::latent_coord::InputLocationDerivative::Jet(raw_jet.view()),
+        );
+        Self::from_jet(latent, jet, ident_transform)
+    }
+
+    pub(crate) fn new_tensor_bspline(
+        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        knots_per_axis: Vec<Array1<f64>>,
+        degrees: Vec<usize>,
+        ident_transform: Option<Array2<f64>>,
+    ) -> Result<Self, BasisError> {
+        let knot_views = knots_per_axis
+            .iter()
+            .map(|knots| knots.view())
+            .collect::<Vec<_>>();
+        let raw_jet =
+            bspline_tensor_first_derivative(latent.as_matrix().view(), &knot_views, &degrees)?;
+        let jet = latent.design_gradient_wrt_t_dispatch(
+            crate::terms::latent_coord::InputLocationDerivative::Jet(raw_jet.view()),
+        );
+        Self::from_jet(latent, jet, ident_transform)
+    }
+
+    fn from_jet(
+        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        jet: Array3<f64>,
+        ident_transform: Option<Array2<f64>>,
+    ) -> Result<Self, BasisError> {
+        if jet.shape()[0] != latent.n_obs() || jet.shape()[2] != latent.latent_dim() {
+            return Err(BasisError::DimensionMismatch(format!(
+                "LatentCoordDesignDerivative jet shape {:?} does not match latent shape ({}, {}, {})",
+                jet.shape(),
+                latent.n_obs(),
+                jet.shape()[1],
+                latent.latent_dim()
+            )));
+        }
+
+exec
+/bin/zsh -lc "sed -n '520,610p' src/solver/arrow_schur.rs" in /Users/user/gam
+ succeeded in 0ms:
+    pub fn add_analytic_penalty_contributions(
+        &mut self,
+        registry: &AnalyticPenaltyRegistry,
+        target_psi: ArrayView1<'_, f64>,
+        target_beta: ArrayView1<'_, f64>,
+        rho_global: ArrayView1<'_, f64>,
+    ) {
+        let layout = registry.rho_layout();
+        for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(layout.iter()) {
+            let rho_local = rho_global.slice(ndarray::s![rho_slice.clone()]);
+            match tier {
+                PenaltyTier::Psi => {
+                    self.add_psi_penalty(penalty, target_psi, rho_local);
+                }
+                PenaltyTier::Beta => {
+                    self.add_beta_penalty(penalty, target_beta, rho_local);
+                }
+                PenaltyTier::Rho => {
+                    // Rho-tier hyperpriors do not contribute to the inner
+                    // (t, β) Newton step; they enter only at the REML
+                    // outer level (see RemlState::evaluate_unified_with_psi_ext).
+                }
+            }
+        }
+    }
+
+    /// Convert row-local Euclidean latent blocks to Riemannian tangent blocks.
+    ///
+    /// This is the only arrow-Schur algebra change needed for manifold
+    /// latents: `g_t`, `H_tt`, and each `H_tβ` column are projected to
+    /// `T_{t_i}M`, while the shared β block and Schur structure remain
+    /// untouched. Embedded constrained manifolds carry a pinned normal block
+    /// so the existing ambient Cholesky factorization still works; all RHS
+    /// terms live in the tangent space, so the solved update retracts cleanly.
+    pub fn apply_riemannian_latent_geometry(&mut self, latent: &LatentCoordValues) {
+        let manifold = latent.manifold();
+        if manifold.is_euclidean() {
+            return;
+        }
+        debug_assert_eq!(latent.n_obs(), self.rows.len());
+        debug_assert_eq!(latent.latent_dim(), self.d);
+        for (i, row) in self.rows.iter_mut().enumerate() {
+            let t_i = ArrayView1::from(latent.row(i));
+            let gt_e = row.gt.clone();
+            let htt_e = row.htt.clone();
+            let htbeta_e = row.htbeta.clone();
+            row.gt = manifold.project_to_tangent(t_i.clone(), gt_e.view());
+            row.htt = manifold.riemannian_hessian_matrix(t_i.clone(), gt_e.view(), htt_e.view());
+            row.htbeta = manifold.project_matrix_columns_to_tangent(t_i, htbeta_e.view());
+        }
+    }
+
+    fn add_psi_penalty(
+        &mut self,
+        penalty: &AnalyticPenaltyKind,
+        target_psi: ArrayView1<'_, f64>,
+        rho_local: ArrayView1<'_, f64>,
+    ) {
+        let d = self.d;
+        let n = self.rows.len();
+        debug_assert_eq!(target_psi.len(), n * d);
+        // Gradient: per-row `d`-slice added to `g_t^(i)`.
+        let grad = penalty.grad_target(target_psi, rho_local);
+        for i in 0..n {
+            for a in 0..d {
+                self.rows[i].gt[a] += grad[i * d + a];
+            }
+        }
+        // Hessian: inject diagonal penalties directly. This avoids O(d)
+        // full-length HVP probes for ARD/sparsity on the Psi tier.
+        if let Some(diag) = penalty.hessian_diag(target_psi, rho_local) {
+            debug_assert_eq!(diag.len(), n * d);
+            for i in 0..n {
+                for a in 0..d {
+                    self.rows[i].htt[[a, a]] += diag[i * d + a];
+                }
+            }
+            return;
+        }
+
+        // Dense Hessian: probe via HVP against each unit-`d`-vector for each row.
+        // For row-block penalties (such as Isometry's metric-residual GN
+        // operator) this yields the per-row `d × d` block. For penalties that
+        // would couple rows the off-row entries are silently dropped — a
+        // design choice consistent with the arrow-shape precondition. The
+        // analytic-penalty contract documents that Psi-tier penalties
+        // *must* be row-block-diagonal in their Hessian.
+        let mut probe = Array1::<f64>::zeros(n * d);
+        for a in 0..d {
+            // One probe per latent axis: set the `a`-th column of each
+            // row simultaneously to 1, HVP once, extract the column-`a`
+
+exec
+/bin/zsh -lc "sed -n '400,530p' src/solver/persistent_warm_start.rs" in /Users/user/gam
+ succeeded in 0ms:
+///
+/// per row. Both sources can be omitted (`None`) — at least one must be
+/// supplied for the predictor to do useful work.
+///
+/// # Damping invariant
+///
+/// The IFT formula inverts the *undamped* inner Hessian `H_tt^(i)` — the LM
+/// ridge `ρ_t·I` is part of the Newton damping, not the implicit-function
+/// theorem derivation. The cache produced by
+/// [`crate::solver::arrow_schur::solve_arrow_newton_step`] stores both the
+/// damped Newton factor and the undamped IFT factor; this predictor
+/// dispatches into `predict_delta_t_from_delta_*` which select the latter.
+/// Callers MUST NOT hand-construct an `ArrowFactorCache` that leaves
+/// `htt_factors_undamped` empty — both arrays must be populated.
+///
+/// The result is meant to be applied to the existing
+/// [`crate::terms::latent_coord::LatentCoordValues`] block via
+/// `retract_flat_delta(Δt)` before the next inner Newton
+/// launch — so the inner solver starts at a configuration already
+/// consistent with the new `(β, ρ)`, requiring far fewer iterations
+/// than a cold restart.
+///
+/// # Integration with [`crate::solver::latent_inner::LatentInnerSolver`]
+///
+/// The intended pipeline is:
+///
+///   1. inner solve at `(β₀, ρ₀)` produces
+///      [`crate::solver::latent_inner::LatentInnerOutcome::factor_cache`];
+///   2. REML outer loop proposes `(β₁, ρ₁)`;
+///   3. caller invokes `ift_warm_start_latent(cache, Some(β₁ − β₀), δg_t)`
+///      to obtain `Δt`;
+///   4. caller updates the latent field by `Δt` and launches the next
+///      inner Newton — typically converging in 1–2 iterations.
+pub fn ift_warm_start_latent(
+    cache: &ArrowFactorCache,
+    delta_beta: Option<ArrayView1<'_, f64>>,
+    delta_gt: Option<ArrayView1<'_, f64>>,
+) -> LatentIftOutcome {
+    let n = cache.htt_factors.len();
+    let d = cache.d;
+    let k = cache.k;
+
+    if delta_beta.is_none() && delta_gt.is_none() {
+        return LatentIftOutcome::Noop {
+            reason: "no-perturbation: both delta_beta and delta_gt are None",
+        };
+    }
+    if let Some(db) = delta_beta.as_ref() {
+        if db.len() != k {
+            return LatentIftOutcome::Noop {
+                reason: "delta_beta length mismatch with cached K",
+            };
+        }
+        if db.iter().any(|v| !v.is_finite()) {
+            return LatentIftOutcome::Noop {
+                reason: "delta_beta contains non-finite entries",
+            };
+        }
+    }
+    if let Some(dg) = delta_gt.as_ref() {
+        if dg.len() != n * d {
+            return LatentIftOutcome::Noop {
+                reason: "delta_gt length mismatch with cached N·d",
+            };
+        }
+        if dg.iter().any(|v| !v.is_finite()) {
+            return LatentIftOutcome::Noop {
+                reason: "delta_gt contains non-finite entries",
+            };
+        }
+    }
+
+    // Sum the two contributions on the RHS, then per-row solve.
+    let mut delta_t = Array1::<f64>::zeros(n * d);
+    if let Some(db) = delta_beta {
+        let part = cache.predict_delta_t_from_delta_beta(db);
+        for i in 0..delta_t.len() {
+            delta_t[i] += part[i];
+        }
+    }
+    if let Some(dg) = delta_gt {
+        let part = cache.predict_delta_t_from_delta_gt(dg);
+        for i in 0..delta_t.len() {
+            delta_t[i] += part[i];
+        }
+    }
+    LatentIftOutcome::Applied { delta_t }
+}
+
+// ---------------------------------------------------------------------------
+// Riemannian retraction wrapper (additive)
+// ---------------------------------------------------------------------------
+
+/// Apply an IFT-predicted Euclidean tangent `delta_t` through per-row
+/// retractions, returning the *new* latent field as a flat row-major array.
+///
+/// The predicted `δt_i` produced by [`ift_warm_start_latent`] is a tangent
+/// vector at the current `t_i`. When the per-row latent coordinate lives on
+/// a non-trivial manifold (S¹, S², torus, interval), the additive update
+/// `t_i + δt_i` exits the manifold; we must apply the retraction
+/// `R_{t_i}(P_{T_{t_i}}(δt_i))`.
+///
+/// For `manifolds[i] = None` or `Some(ManifoldKind::Euclidean(_))` the
+/// behavior collapses to plain addition (bit-equivalent to the pre-Riemannian
+/// path). The vector-transport-aware Taylor extension for small `Δβ`
+/// reuses the parallel-transport approximation embedded in each
+/// `Manifold::vector_transport` implementation — see
+/// [`crate::solver::riemannian`].
+#[allow(dead_code)]
+pub fn apply_ift_retraction(
+    point_flat: &Array1<f64>,
+    delta_t: &Array1<f64>,
+    row_ambient_dim: usize,
+    manifolds: &[Option<crate::solver::riemannian::ManifoldKind>],
+) -> Array1<f64> {
+    crate::solver::arrow_schur::apply_per_row_retraction(
+        point_flat,
+        delta_t,
+        row_ambient_dim,
+        manifolds,
+    )
+}
+
+fn unix_secs_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+codex
+I’m going to create `proposals/riemannian_per_point.md` now. The document will call out one important convention issue: the embedded Hessian correction needs the ambient gradient’s normal component; passing an already tangent-projected gradient into the Weingarten term makes the sphere correction vanish.
