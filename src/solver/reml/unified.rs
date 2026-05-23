@@ -7436,8 +7436,7 @@ pub fn reml_laml_evaluate(
         })
         .collect();
     let need_family_corrections = effective_deriv.has_corrections();
-    let need_rho_mode_responses =
-        need_family_corrections || mode == EvalMode::ValueGradientHessian;
+    let need_rho_mode_responses = need_family_corrections || mode == EvalMode::ValueGradientHessian;
     // Stack the K curvature-penalty RHS whenever a later stage will need
     // rho mode responses (family logdet corrections or outer Hessian
     // assembly), plus all ext-coordinate gradient RHS, into one

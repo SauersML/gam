@@ -18,9 +18,9 @@ use crate::solver::estimate::reml::unified::{
     BlockCoupledOperator, DenseSpectralOperator, DispersionHandling, DriftDerivResult,
     FixedDriftDerivFn, HessianDerivativeProvider, HessianOperator, HyperCoord, HyperCoordDrift,
     HyperCoordPair, HyperOperator, MatrixFreeSpdOperator, PenaltySubspaceTrace,
-    ProjectedKktResidual, StochasticTraceState,
-    compute_block_penalty_logdet_derivs, exact_intersection_nullity, exact_pseudo_logdet,
-    positive_eigenvalue_threshold, spectral_epsilon, spectral_regularize,
+    ProjectedKktResidual, StochasticTraceState, compute_block_penalty_logdet_derivs,
+    exact_intersection_nullity, exact_pseudo_logdet, positive_eigenvalue_threshold,
+    spectral_epsilon, spectral_regularize,
 };
 use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
@@ -14954,7 +14954,8 @@ impl HessianOperator for FirstOrderTraceSkipOperator {
         if self.consume_first_order_trace() {
             0.0
         } else {
-            self.inner.trace_logdet_block_local(block, scale, start, end)
+            self.inner
+                .trace_logdet_block_local(block, scale, start, end)
         }
     }
 
@@ -15071,12 +15072,9 @@ fn unified_joint_cost_gradient(
     String,
 > {
     let hessian_op: Arc<dyn HessianOperator> = match first_order_trace_skip.as_ref() {
-        Some(trace_values) if !trace_values.is_empty() => {
-            Arc::new(FirstOrderTraceSkipOperator::new(
-                hessian_op,
-                trace_values.len(),
-            ))
-        }
+        Some(trace_values) if !trace_values.is_empty() => Arc::new(
+            FirstOrderTraceSkipOperator::new(hessian_op, trace_values.len()),
+        ),
         _ => hessian_op,
     };
     let (evaluator, ext_dim) = build_custom_family_inner_assembly(
@@ -15567,7 +15565,11 @@ fn joint_outer_evaluate(
         // soon-discarded first-order trace calls. The projected-subspace
         // trace path is left untouched because the Hessian shares that
         // kernel and it is not routed through HessianOperator trace methods.
-        if has_penalty_subspace_trace { None } else { first_order_trace_skip },
+        if has_penalty_subspace_trace {
+            None
+        } else {
+            first_order_trace_skip
+        },
     )?;
     if !objective.is_finite() {
         log::warn!(
