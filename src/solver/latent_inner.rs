@@ -168,8 +168,24 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
     }
 
     /// Run the joint Newton loop.
+    ///
+    /// Numerical-stability invariants:
+    ///   * `initial_ridge_t`, `initial_ridge_beta` are clamped to `≥ 0`.
+    ///   * On a per-row or Schur PD failure, both ridges are escalated
+    ///     by `lm_grow` (or seeded at `1e-6` when starting from `0`).
+    ///   * `max_ridge` is the cold-restart trigger: if we exhaust the
+    ///     ramp and the Hessian is still non-PSD, the loop bails with a
+    ///     clear diagnostic citing the iteration index and both ridge
+    ///     levels reached — the outer driver should treat this as an
+    ///     identifiability failure (missing gauge-fixing penalty,
+    ///     collinear basis, etc.).
     pub fn solve(&mut self) -> Result<LatentInnerOutcome, String> {
         let opts = self.options.clone();
+        debug_assert!(opts.lm_grow > 1.0, "LM ridge grow factor must exceed 1");
+        debug_assert!(
+            opts.lm_shrink > 0.0 && opts.lm_shrink < 1.0,
+            "LM ridge shrink factor must lie in (0, 1)"
+        );
         let mut ridge_t = opts.initial_ridge_t.max(0.0);
         let mut ridge_beta = opts.initial_ridge_beta.max(0.0);
         let mut last_cache: Option<ArrowFactorCache> = None;
@@ -226,10 +242,16 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                     last_cache = Some(cache);
                     iter += 1;
                 }
-                Err(ArrowSchurError::PerRowFactorFailed { .. })
-                | Err(ArrowSchurError::SchurFactorFailed { .. })
-                | Err(ArrowSchurError::PcgFailed { .. }) => {
+                Err(err @ ArrowSchurError::PerRowFactorFailed { .. })
+                | Err(err @ ArrowSchurError::SchurFactorFailed { .. })
+                | Err(err @ ArrowSchurError::PcgFailed { .. }) => {
                     // Grow ridges; retry without burning an iteration.
+                    // The per-row `factor_blocks` already ran an internal
+                    // ridge-ramp before surfacing the error here — if we
+                    // see it at this layer, the row block is
+                    // genuinely under-regularized (gauge issue or
+                    // collinear basis under U_i). Escalate the LM ridge
+                    // and let the outer Newton step damp.
                     ridge_t = if ridge_t == 0.0 {
                         1e-6
                     } else {
@@ -242,8 +264,10 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                     };
                     if ridge_t > opts.max_ridge || ridge_beta > opts.max_ridge {
                         return Err(format!(
-                            "LatentInnerSolver: LM ridge exceeded max ({}) at iter {} \
-                             (ridge_t={ridge_t:.3e}, ridge_beta={ridge_beta:.3e})",
+                            "LatentInnerSolver: cold-restart condition — LM ridge \
+                             exceeded max ({}) at iter {} \
+                             (ridge_t={ridge_t:.3e}, ridge_beta={ridge_beta:.3e}); \
+                             root-cause arrow-Schur error: {err}",
                             opts.max_ridge, iter,
                         ));
                     }

@@ -823,6 +823,33 @@ impl Manifold for Product {
             off += m;
         }
     }
+    /// Closed-form block-diagonal tangent basis (proposal §11):
+    ///   Q = blockdiag(Q_1, ..., Q_r).
+    /// Avoids re-running modified Gram-Schmidt on the full m×m projection
+    /// when each component already exposes a cheap closed-form basis.
+    fn tangent_basis(&self, p: ArrayView1<f64>) -> Array2<f64> {
+        let m = self.ambient_dim();
+        let d = self.dim();
+        let mut q = Array2::<f64>::zeros((m, d));
+        let mut row_off = 0usize;
+        let mut col_off = 0usize;
+        for c in &self.components {
+            let mc = c.ambient_dim();
+            let dc = c.dim();
+            let p_slice = p.slice(ndarray::s![row_off..row_off + mc]);
+            let qc = c.tangent_basis(p_slice);
+            debug_assert_eq!(qc.nrows(), mc);
+            debug_assert_eq!(qc.ncols(), dc);
+            for i in 0..mc {
+                for j in 0..dc {
+                    q[[row_off + i, col_off + j]] = qc[[i, j]];
+                }
+            }
+            row_off += mc;
+            col_off += dc;
+        }
+        q
+    }
     fn name(&self) -> &str {
         "Product"
     }
@@ -981,6 +1008,172 @@ mod tests {
         for i in 0..3 {
             assert!((out[i] - (p[i] + xi[i])).abs() < 1.0e-15);
         }
+    }
+
+    #[test]
+    fn circle_tangent_basis_is_orthogonal_to_point() {
+        let m = Circle;
+        let p = array![0.6_f64, 0.8];
+        let q = m.tangent_basis(p.view());
+        assert_eq!(q.shape(), &[2, 1]);
+        let dot = q[[0, 0]] * p[0] + q[[1, 0]] * p[1];
+        assert!(dot.abs() < 1.0e-12);
+        let nrm = (q[[0, 0]].powi(2) + q[[1, 0]].powi(2)).sqrt();
+        assert!((nrm - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn sphere_householder_basis_is_orthonormal_and_tangent() {
+        let m = Sphere { n: 3 };
+        // p = unit vector in ℝ^4 with a non-axis-aligned direction
+        let raw = array![0.5_f64, -0.3, 0.7, 0.2];
+        let nrm = (raw.iter().map(|x| x * x).sum::<f64>()).sqrt();
+        let p: Array1<f64> = raw.iter().map(|x| x / nrm).collect();
+        let q = m.tangent_basis(p.view());
+        assert_eq!(q.shape(), &[4, 3]);
+        // Q^T Q = I_3
+        for a in 0..3 {
+            for b in 0..3 {
+                let mut dot = 0.0_f64;
+                for i in 0..4 {
+                    dot += q[[i, a]] * q[[i, b]];
+                }
+                let expected = if a == b { 1.0 } else { 0.0 };
+                assert!((dot - expected).abs() < 1.0e-10, "QtQ[{a},{b}]={dot}");
+            }
+        }
+        // Each column orthogonal to p.
+        for a in 0..3 {
+            let mut dot = 0.0_f64;
+            for i in 0..4 {
+                dot += q[[i, a]] * p[i];
+            }
+            assert!(dot.abs() < 1.0e-10);
+        }
+    }
+
+    #[test]
+    fn torus_retraction_keeps_each_circle_unit() {
+        let m = Torus { d: 3 };
+        let p = array![1.0_f64, 0.0, 0.0, 1.0, 0.6, 0.8];
+        let xi = array![0.0_f64, 0.5, -0.4, 0.0, 0.1, -0.075];
+        // Project xi onto T_p M before retraction (caller contract).
+        let mut xi_p = xi.clone();
+        m.project_tangent(p.view(), xi_p.view_mut());
+        let mut out = Array1::<f64>::zeros(6);
+        m.retract(p.view(), xi_p.view(), out.view_mut());
+        for k in 0..3 {
+            let n2 = out[2 * k] * out[2 * k] + out[2 * k + 1] * out[2 * k + 1];
+            assert!((n2 - 1.0).abs() < 1.0e-12, "circle {k} not unit");
+        }
+    }
+
+    #[test]
+    fn torus_tangent_basis_is_block_diagonal() {
+        let m = Torus { d: 2 };
+        let p = array![1.0_f64, 0.0, 0.6, 0.8];
+        let q = m.tangent_basis(p.view());
+        assert_eq!(q.shape(), &[4, 2]);
+        // Block (0,1) row range × col 1 must be zero; (2,3) × col 0 must be zero.
+        assert!(q[[0, 1]].abs() < 1.0e-15);
+        assert!(q[[1, 1]].abs() < 1.0e-15);
+        assert!(q[[2, 0]].abs() < 1.0e-15);
+        assert!(q[[3, 0]].abs() < 1.0e-15);
+    }
+
+    #[test]
+    fn product_retraction_equals_component_retractions() {
+        // Product of Circle × Interval × ℝ
+        let prod = Product {
+            components: vec![
+                Box::new(Circle),
+                Box::new(Interval { lo: 0.0, hi: 1.0 }),
+                Box::new(Euclidean { d: 2 }),
+            ],
+            weights: None,
+        };
+        let p = array![1.0_f64, 0.0, 0.5, 3.0, -1.0];
+        let xi = array![0.0_f64, 0.2, 0.1, 1.5, -0.25];
+        // Project before retract.
+        let mut xi_p = xi.clone();
+        prod.project_tangent(p.view(), xi_p.view_mut());
+        let mut out = Array1::<f64>::zeros(5);
+        prod.retract(p.view(), xi_p.view(), out.view_mut());
+
+        // Component-wise comparison.
+        let mut c_out = Array1::<f64>::zeros(2);
+        Circle.retract(
+            p.slice(ndarray::s![0..2]),
+            xi_p.slice(ndarray::s![0..2]),
+            c_out.view_mut(),
+        );
+        let mut i_out = Array1::<f64>::zeros(1);
+        Interval { lo: 0.0, hi: 1.0 }.retract(
+            p.slice(ndarray::s![2..3]),
+            xi_p.slice(ndarray::s![2..3]),
+            i_out.view_mut(),
+        );
+        let mut e_out = Array1::<f64>::zeros(2);
+        (Euclidean { d: 2 }).retract(
+            p.slice(ndarray::s![3..5]),
+            xi_p.slice(ndarray::s![3..5]),
+            e_out.view_mut(),
+        );
+        for i in 0..2 {
+            assert!((out[i] - c_out[i]).abs() < 1.0e-15);
+        }
+        assert!((out[2] - i_out[0]).abs() < 1.0e-15);
+        for i in 0..2 {
+            assert!((out[3 + i] - e_out[i]).abs() < 1.0e-15);
+        }
+    }
+
+    #[test]
+    fn euclidean_projection_is_identity() {
+        let m = Euclidean { d: 4 };
+        let p = array![0.0_f64, 0.0, 0.0, 0.0];
+        let v_in = array![1.0_f64, -2.0, 3.0, -4.0];
+        let mut v = v_in.clone();
+        m.project_tangent(p.view(), v.view_mut());
+        for i in 0..4 {
+            assert!((v[i] - v_in[i]).abs() < 1.0e-15);
+        }
+    }
+
+    #[test]
+    fn circle_2pi_periodicity_under_retraction() {
+        // Starting at θ=0, applying repeated tangent steps summing to 2π
+        // should return to the start within numerical tolerance.
+        let m = Circle;
+        let mut p = array![1.0_f64, 0.0];
+        let n_steps = 100usize;
+        let step = (2.0 * std::f64::consts::PI) / (n_steps as f64);
+        for _ in 0..n_steps {
+            // Tangent at p is (-p_y, p_x) scaled by `step` (arc-length).
+            let xi = array![-p[1] * step, p[0] * step];
+            let mut out = array![0.0_f64, 0.0];
+            m.retract(p.view(), xi.view(), out.view_mut());
+            p = out;
+        }
+        // After 100 retraction-circumnavigations of S¹, accumulated error
+        // should be small (projective retraction is first-order, so error
+        // scales with step^2 per step).
+        assert!((p[0] - 1.0).abs() < 1.0e-3, "p[0]={}", p[0]);
+        assert!(p[1].abs() < 1.0e-3, "p[1]={}", p[1]);
+    }
+
+    #[test]
+    fn sphere_retraction_stays_on_unit_sphere() {
+        let m = Sphere { n: 4 };
+        let p = array![0.4_f64, -0.1, 0.5, 0.6, 0.2];
+        let nrm = (p.iter().map(|x| x * x).sum::<f64>()).sqrt();
+        let p: Array1<f64> = p.iter().map(|x| x / nrm).collect();
+        let mut xi = array![0.3_f64, -0.2, 0.1, 0.05, 0.4];
+        m.project_tangent(p.view(), xi.view_mut());
+        let mut out = Array1::<f64>::zeros(5);
+        m.retract(p.view(), xi.view(), out.view_mut());
+        let n2: f64 = out.iter().map(|x| x * x).sum();
+        assert!((n2 - 1.0).abs() < 1.0e-12);
     }
 
     #[test]
