@@ -13388,12 +13388,40 @@ fn try_exact_joint_spatial_aniso_optimization(
         ))
     })?;
     if !result.converged {
-        return Err(EstimationError::InvalidInput(format!(
-            "anisotropic analytic optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
-            result.iterations,
-            result.final_value,
-            result.final_grad_norm_report(),
-        )));
+        // Mirror `fit_term_collectionwith_exact_spatial_adaptive_regularization`
+        // (commit 0267d082): the strict absolute-floor gradient criterion is too
+        // tight when the outer Hessian carries a near-null direction (η-anchor
+        // drift, ill-conditioned operator-collocation Gram, etc.) — the iterate
+        // settles into a flat valley with ‖g‖_proj at numerical-noise scale
+        // (~1e-5 for cost ~1e1 in double precision) which is above the 1e-6
+        // absolute floor but well below the textbook mgcv `magic` REML rule
+        // ‖g‖_proj ≤ τ·(1 + |f|). Accept the iterate under the rel-to-cost
+        // form when the absolute form has timed out; divergent runs (‖g‖
+        // large relative to |f|) still surface as errors.
+        let rel_to_cost_threshold = options.tol * (1.0_f64 + result.final_value.abs());
+        if let Some(final_grad) = result
+            .final_grad_norm
+            .filter(|v| v.is_finite() && *v <= rel_to_cost_threshold)
+        {
+            log::info!(
+                "[spatial-aniso-joint] outer optimization hit max_iter={} but \
+                 projected gradient norm {:.3e} ≤ τ·(1+|f|) = {:.3e} \
+                 (τ={:.3e}, |f|={:.3e}); accepting iterate under the mgcv-style \
+                 relative-to-cost REML convergence criterion.",
+                result.iterations,
+                final_grad,
+                rel_to_cost_threshold,
+                options.tol,
+                result.final_value.abs(),
+            );
+        } else {
+            return Err(EstimationError::InvalidInput(format!(
+                "anisotropic analytic optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+                result.iterations,
+                result.final_value,
+                result.final_grad_norm_report(),
+            )));
+        }
     }
     log::trace!(
         "[spatial-aniso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={}",
@@ -13702,12 +13730,40 @@ fn try_exact_joint_spatial_isotropic_optimization(
         ))
     })?;
     if !result.converged {
-        return Err(EstimationError::InvalidInput(format!(
-            "isotropic analytic optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
-            result.iterations,
-            result.final_value,
-            result.final_grad_norm_report(),
-        )));
+        // Mirror `fit_term_collectionwith_exact_spatial_adaptive_regularization`
+        // (commit 0267d082): the strict absolute-floor gradient criterion is too
+        // tight when the outer Hessian carries a near-null direction (η-anchor
+        // drift, ill-conditioned operator-collocation Gram, etc.) — the iterate
+        // settles into a flat valley with ‖g‖_proj at numerical-noise scale
+        // (~1e-5 for cost ~1e1 in double precision) which is above the 1e-6
+        // absolute floor but well below the textbook mgcv `magic` REML rule
+        // ‖g‖_proj ≤ τ·(1 + |f|). Accept the iterate under the rel-to-cost
+        // form when the absolute form has timed out; divergent runs (‖g‖
+        // large relative to |f|) still surface as errors.
+        let rel_to_cost_threshold = options.tol * (1.0_f64 + result.final_value.abs());
+        if let Some(final_grad) = result
+            .final_grad_norm
+            .filter(|v| v.is_finite() && *v <= rel_to_cost_threshold)
+        {
+            log::info!(
+                "[spatial-iso-joint] outer optimization hit max_iter={} but \
+                 projected gradient norm {:.3e} ≤ τ·(1+|f|) = {:.3e} \
+                 (τ={:.3e}, |f|={:.3e}); accepting iterate under the mgcv-style \
+                 relative-to-cost REML convergence criterion.",
+                result.iterations,
+                final_grad,
+                rel_to_cost_threshold,
+                options.tol,
+                result.final_value.abs(),
+            );
+        } else {
+            return Err(EstimationError::InvalidInput(format!(
+                "isotropic analytic optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
+                result.iterations,
+                result.final_value,
+                result.final_grad_norm_report(),
+            )));
+        }
     }
     log::trace!(
         "[spatial-iso-joint] converged in {} iterations, final_value={:.6e}, grad_norm={}",
