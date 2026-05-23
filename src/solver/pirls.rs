@@ -755,6 +755,19 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 );
                 Ok(())
             }
+            (GlmLikelihoodFamily::NegativeBinomial { theta }, _) => {
+                write_negative_binomial_log_working_state(
+                    y,
+                    eta,
+                    priorweights,
+                    theta,
+                    mu,
+                    weights,
+                    z,
+                    derivatives,
+                )?;
+                Ok(())
+            }
             (GlmLikelihoodFamily::GammaLog, _) => {
                 write_gamma_log_working_state(
                     y,
@@ -8473,6 +8486,11 @@ fn sanitize_tweedie_p(p: f64) -> f64 {
 }
 
 #[inline]
+fn valid_negbin_theta(theta: f64) -> bool {
+    theta.is_finite() && theta > 0.0
+}
+
+#[inline]
 fn estimate_tweedie_phi_from_eta(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
@@ -8638,6 +8656,106 @@ fn write_tweedie_log_working_state(
                 *z_o = eta_i + (y[i] - mu_i) / mu_i;
             });
     }
+}
+
+/// Working state for NB(mu, theta) with a log link and fixed theta.
+///
+/// The size parameter is treated as a fixed hyperparameter for this GLM stack;
+/// no theta profiling or REML update is performed here.
+#[inline]
+fn write_negative_binomial_log_working_state(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<f64>,
+    theta: f64,
+    mu: &mut Array1<f64>,
+    weights: &mut Array1<f64>,
+    z: &mut Array1<f64>,
+    derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
+) -> Result<(), EstimationError> {
+    const MIN_MU: f64 = 1e-10;
+    const MIN_WEIGHT: f64 = 1e-12;
+    if !valid_negbin_theta(theta) {
+        return Err(EstimationError::InvalidInput(format!(
+            "negative-binomial theta must be finite and > 0; got {theta}"
+        )));
+    }
+    if let Some(derivs) = derivatives {
+        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+        let z_s = z.as_slice_mut().expect("z must be contiguous");
+        let dmu_s = derivs
+            .dmu_deta
+            .as_slice_mut()
+            .expect("dmu_deta must be contiguous");
+        let d2_s = derivs
+            .d2mu_deta2
+            .as_slice_mut()
+            .expect("d2mu_deta2 must be contiguous");
+        let d3_s = derivs
+            .d3mu_deta3
+            .as_slice_mut()
+            .expect("d3mu_deta3 must be contiguous");
+        let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
+        let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
+        mu_s.par_iter_mut()
+            .zip(weights_s.par_iter_mut())
+            .zip(z_s.par_iter_mut())
+            .zip(dmu_s.par_iter_mut())
+            .zip(d2_s.par_iter_mut())
+            .zip(d3_s.par_iter_mut())
+            .zip(c_s.par_iter_mut())
+            .zip(d_s.par_iter_mut())
+            .enumerate()
+            .for_each(
+                |(i, (((((((mu_o, w_o), z_o), dmu_o), d2_o), d3_o), c_o), d_o))| {
+                    let eta_raw = eta[i];
+                    let eta_i = eta_raw.clamp(-700.0, 700.0);
+                    let mu_i = eta_i.exp().max(MIN_MU);
+                    let denom = theta + mu_i;
+                    let raw_weight = priorweights[i].max(0.0) * theta * mu_i / denom;
+                    let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
+                    *mu_o = mu_i;
+                    *w_o = if raw_weight > 0.0 {
+                        raw_weight.max(MIN_WEIGHT)
+                    } else {
+                        0.0
+                    };
+                    *z_o = eta_i + (y[i] - mu_i) / mu_i;
+                    *dmu_o = mu_i;
+                    *d2_o = mu_i;
+                    *d3_o = mu_i;
+                    if floor_active || eta_raw != eta_i {
+                        *c_o = 0.0;
+                        *d_o = 0.0;
+                    } else {
+                        *c_o = raw_weight * theta / denom;
+                        *d_o = raw_weight * theta * (theta - mu_i) / (denom * denom);
+                    }
+                },
+            );
+    } else {
+        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+        let z_s = z.as_slice_mut().expect("z must be contiguous");
+        mu_s.par_iter_mut()
+            .zip(weights_s.par_iter_mut())
+            .zip(z_s.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, ((mu_o, w_o), z_o))| {
+                let eta_i = eta[i].clamp(-700.0, 700.0);
+                let mu_i = eta_i.exp().max(MIN_MU);
+                let raw_weight = priorweights[i].max(0.0) * theta * mu_i / (theta + mu_i);
+                *mu_o = mu_i;
+                *w_o = if raw_weight > 0.0 {
+                    raw_weight.max(MIN_WEIGHT)
+                } else {
+                    0.0
+                };
+                *z_o = eta_i + (y[i] - mu_i) / mu_i;
+            });
+    }
+    Ok(())
 }
 
 /// Zero-allocation update of GLM working vectors using pre-allocated buffers.
@@ -8939,6 +9057,7 @@ fn integrated_inverse_link_from_family(
         GlmLikelihoodFamily::GaussianIdentity
         | GlmLikelihoodFamily::PoissonLog
         | GlmLikelihoodFamily::Tweedie { .. }
+        | GlmLikelihoodFamily::NegativeBinomial { .. }
         | GlmLikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(format!(
             "Integrated link-runtime update is not supported for family {:?}",
             family
@@ -9335,6 +9454,52 @@ fn computeworkingweight_derivatives_from_eta(
                     },
                 )?;
         }
+        GlmLikelihoodFamily::NegativeBinomial { theta } => {
+            const MIN_WEIGHT: f64 = 1e-12;
+            if !valid_negbin_theta(theta) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "negative-binomial theta must be finite and > 0; got {theta}"
+                )));
+            }
+            let c_s = c.as_slice_mut().expect("c must be contiguous");
+            let d_s = d.as_slice_mut().expect("d must be contiguous");
+            let dmu_s = dmu_deta
+                .as_slice_mut()
+                .expect("dmu_deta must be contiguous");
+            let d2_s = d2mu_deta2
+                .as_slice_mut()
+                .expect("d2mu_deta2 must be contiguous");
+            let d3_s = d3mu_deta3
+                .as_slice_mut()
+                .expect("d3mu_deta3 must be contiguous");
+            c_s.par_iter_mut()
+                .zip(d_s.par_iter_mut())
+                .zip(dmu_s.par_iter_mut())
+                .zip(d2_s.par_iter_mut())
+                .zip(d3_s.par_iter_mut())
+                .enumerate()
+                .try_for_each(
+                    |(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| -> Result<(), EstimationError> {
+                        let eta_raw = eta[i];
+                        let eta_used = eta_raw.clamp(-700.0, 700.0);
+                        let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
+                        let denom = theta + jet.mu;
+                        let raw_weight = priorweights[i].max(0.0) * theta * jet.mu / denom;
+                        let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
+                        if eta_raw != eta_used || floor_active {
+                            *c_o = 0.0;
+                            *d_o = 0.0;
+                        } else {
+                            *c_o = raw_weight * theta / denom;
+                            *d_o = raw_weight * theta * (theta - jet.mu) / (denom * denom);
+                        }
+                        *dmu_o = jet.d1;
+                        *d2_o = jet.d2;
+                        *d3_o = jet.d3;
+                        Ok(())
+                    },
+                )?;
+        }
         GlmLikelihoodFamily::GammaLog => {
             let dmu_s = dmu_deta
                 .as_slice_mut()
@@ -9537,6 +9702,24 @@ impl VarianceJet {
         }
     }
 
+    /// Negative-binomial variance V(μ) = μ + μ² / theta.
+    #[inline]
+    pub fn negative_binomial(mu: f64, theta: f64) -> Self {
+        let mu = mu.max(1e-10);
+        let inv_theta = if valid_negbin_theta(theta) {
+            1.0 / theta
+        } else {
+            f64::NAN
+        };
+        Self {
+            v: mu + mu * mu * inv_theta,
+            v1: 1.0 + 2.0 * mu * inv_theta,
+            v2: 2.0 * inv_theta,
+            v3: 0.0,
+            v4: 0.0,
+        }
+    }
+
     /// Gaussian (identity) variance V(μ) = 1.
     #[inline]
     pub fn gaussian() -> Self {
@@ -9635,6 +9818,7 @@ pub fn weight_family_for_glm_likelihood(likelihood: GlmLikelihoodSpec) -> Weight
         GlmLikelihoodFamily::GaussianIdentity => WeightFamily::Gaussian,
         GlmLikelihoodFamily::PoissonLog => WeightFamily::Poisson,
         GlmLikelihoodFamily::Tweedie { p } => WeightFamily::Tweedie { p },
+        GlmLikelihoodFamily::NegativeBinomial { theta } => WeightFamily::NegativeBinomial { theta },
         GlmLikelihoodFamily::GammaLog => WeightFamily::Gamma,
         GlmLikelihoodFamily::BinomialLogit
         | GlmLikelihoodFamily::BinomialProbit
@@ -10139,6 +10323,7 @@ pub enum WeightFamily {
     Binomial,
     Poisson,
     Tweedie { p: f64 },
+    NegativeBinomial { theta: f64 },
     Gamma,
 }
 
@@ -10163,6 +10348,7 @@ pub fn variance_jet_for_weight_family(family: WeightFamily, mu: f64) -> Variance
         WeightFamily::Binomial => VarianceJet::binomial_n(mu),
         WeightFamily::Poisson => VarianceJet::poisson(mu),
         WeightFamily::Tweedie { p } => VarianceJet::tweedie(mu, p),
+        WeightFamily::NegativeBinomial { theta } => VarianceJet::negative_binomial(mu, theta),
         WeightFamily::Gamma => VarianceJet::gamma(mu),
     }
 }
@@ -10359,6 +10545,30 @@ pub fn calculate_deviance(
                 2.0 * total
             }
         }
+        GlmLikelihoodFamily::NegativeBinomial { theta } => {
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let total: f64 = (0..y.len())
+                .into_par_iter()
+                .map(|i| {
+                    if !valid_negbin_theta(theta) {
+                        return f64::NAN;
+                    }
+                    let yi = y[i];
+                    if yi < 0.0 {
+                        return f64::NAN;
+                    }
+                    let mui_c = mu[i].max(EPS);
+                    let y_term = if yi > EPS {
+                        yi * ((yi * (theta + mui_c)) / (mui_c * (theta + yi))).ln()
+                    } else {
+                        0.0
+                    };
+                    let theta_term = theta * ((theta + mui_c) / (theta + yi)).ln();
+                    priorweights[i] * (theta_term + y_term)
+                })
+                .sum();
+            2.0 * total
+        }
         GlmLikelihoodFamily::GammaLog => {
             let shape = likelihood.gamma_shape().unwrap_or(1.0);
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -10435,6 +10645,25 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                 -0.5 * calculate_deviance(y, mu, likelihood, priorweights)
             }
         }
+        GlmLikelihoodFamily::NegativeBinomial { theta } => (0..n)
+            .into_par_iter()
+            .map(|i| {
+                if !valid_negbin_theta(theta) {
+                    return f64::NAN;
+                }
+                let yi = y[i];
+                if yi < 0.0 {
+                    return f64::NAN;
+                }
+                let mui_c = mu[i].max(EPS);
+                let log_mu_term = if yi > 0.0 { yi * mui_c.ln() } else { 0.0 };
+                priorweights[i]
+                    * (ln_gamma(yi + theta) - ln_gamma(theta) - ln_gamma(yi + 1.0)
+                        + theta * (theta.ln() - (theta + mui_c).ln())
+                        + log_mu_term
+                        - yi * (theta + mui_c).ln())
+            })
+            .sum(),
         GlmLikelihoodFamily::GammaLog => gamma_loglikelihood_with_shape(
             y,
             mu,

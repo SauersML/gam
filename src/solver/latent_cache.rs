@@ -14,7 +14,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 
 use crate::basis::{DuchonNullspaceOrder, MaternNu, RadialScalarKind};
 use crate::estimate::EstimationError;
@@ -59,12 +59,29 @@ pub(crate) enum LatentBasisKind {
         length_scale: Option<f64>,
         nullspace_order: DuchonNullspaceOrder,
     },
+    Sphere {
+        centers: Array2<f64>,
+        penalty_order: usize,
+    },
+    PeriodicBspline {
+        domain_start: f64,
+        period: f64,
+        degree: usize,
+        num_basis: usize,
+    },
+    TensorBspline {
+        knots: Vec<Array1<f64>>,
+        degrees: Vec<usize>,
+    },
 }
 
 impl LatentBasisKind {
-    fn centers(&self) -> &Array2<f64> {
+    fn centers(&self) -> Option<&Array2<f64>> {
         match self {
-            Self::Matern { centers, .. } | Self::Duchon { centers, .. } => centers,
+            Self::Matern { centers, .. }
+            | Self::Duchon { centers, .. }
+            | Self::Sphere { centers, .. } => Some(centers),
+            Self::PeriodicBspline { .. } | Self::TensorBspline { .. } => None,
         }
     }
 
@@ -95,6 +112,36 @@ impl LatentBasisKind {
                 nullspace_order.hash(&mut hasher);
                 hash_matrix(centers, &mut hasher);
             }
+            Self::Sphere {
+                centers,
+                penalty_order,
+            } => {
+                2_u8.hash(&mut hasher);
+                centers.nrows().hash(&mut hasher);
+                centers.ncols().hash(&mut hasher);
+                penalty_order.hash(&mut hasher);
+                hash_matrix(centers, &mut hasher);
+            }
+            Self::PeriodicBspline {
+                domain_start,
+                period,
+                degree,
+                num_basis,
+            } => {
+                3_u8.hash(&mut hasher);
+                domain_start.to_bits().hash(&mut hasher);
+                period.to_bits().hash(&mut hasher);
+                degree.hash(&mut hasher);
+                num_basis.hash(&mut hasher);
+            }
+            Self::TensorBspline { knots, degrees } => {
+                4_u8.hash(&mut hasher);
+                degrees.hash(&mut hasher);
+                knots.len().hash(&mut hasher);
+                for axis_knots in knots {
+                    hash_vector(axis_knots, &mut hasher);
+                }
+            }
         }
         hasher.finish()
     }
@@ -102,6 +149,14 @@ impl LatentBasisKind {
 
 fn hash_matrix(matrix: &Array2<f64>, hasher: &mut DefaultHasher) {
     for &value in matrix.iter() {
+        let normalized = if value == 0.0 { 0.0 } else { value };
+        normalized.to_bits().hash(hasher);
+    }
+}
+
+fn hash_vector(vector: &Array1<f64>, hasher: &mut DefaultHasher) {
+    vector.len().hash(hasher);
+    for &value in vector.iter() {
         let normalized = if value == 0.0 { 0.0 } else { value };
         normalized.to_bits().hash(hasher);
     }
@@ -217,7 +272,13 @@ impl LatentDesignCache {
         }
 
         let computed = compute()?;
-        let radial_distances = build_radial_distances(&latent, basis_kind.centers())?;
+        let radial_distances = match basis_kind.centers() {
+            Some(centers) => build_radial_distances(&latent, centers)?,
+            None => RadialDistanceMatrices {
+                squared: Array2::<f64>::zeros((0, 0)),
+                distance: Array2::<f64>::zeros((0, 0)),
+            },
+        };
         let basis_derivative_jets =
             build_basis_derivative_jets(&latent, &basis_kind, &radial_distances)?;
         let id = self.next_entry_id;
@@ -372,6 +433,16 @@ fn build_basis_derivative_jets(
         }
         LatentBasisKind::Duchon { .. } => {
             let _ = latent;
+            Ok(BasisDerivativeJets {
+                operator_resident: true,
+                ..BasisDerivativeJets::empty()
+            })
+        }
+        LatentBasisKind::Sphere { .. }
+        | LatentBasisKind::PeriodicBspline { .. }
+        | LatentBasisKind::TensorBspline { .. } => {
+            let _ = latent;
+            let _ = distances;
             Ok(BasisDerivativeJets {
                 operator_resident: true,
                 ..BasisDerivativeJets::empty()
