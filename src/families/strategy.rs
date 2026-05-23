@@ -239,6 +239,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 .map(|v| v.mean)
             }
             LikelihoodFamily::PoissonLog
+            | LikelihoodFamily::Tweedie { .. }
             | LikelihoodFamily::NegativeBinomial { .. }
             | LikelihoodFamily::GammaLog => {
                 // E[exp(η)] where η ~ N(eta, se²) = exp(eta + se²/2)  (log-normal MGF)
@@ -314,6 +315,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 Ok((m1, (m2 - m1 * m1).max(0.0)))
             }
             LikelihoodFamily::PoissonLog
+            | LikelihoodFamily::Tweedie { .. }
             | LikelihoodFamily::NegativeBinomial { .. }
             | LikelihoodFamily::GammaLog => {
                 // Log-normal moments: E[exp(η)] = exp(μ + σ²/2),
@@ -349,6 +351,10 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture => Ok(NoiseModel::Bernoulli),
             LikelihoodFamily::PoissonLog => Ok(NoiseModel::Poisson),
+            LikelihoodFamily::Tweedie { p } => Ok(NoiseModel::Tweedie {
+                p,
+                phi: gaussian_scale.unwrap_or(1.0).max(1e-12),
+            }),
             LikelihoodFamily::NegativeBinomial { theta } => {
                 if !(theta.is_finite() && theta > 0.0) {
                     return Err(EstimationError::InvalidInput(format!(
