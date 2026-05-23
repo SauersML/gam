@@ -3639,7 +3639,7 @@ fn latent_scalar_weights_with_fisher(
     };
     if fw.shape() != [n_obs, 1, 1] {
         return Err(format!(
-            "fisher_W currently accepts scalar blocks of shape ({n_obs}, 1, 1) on this latent entry point; got {:?}",
+            "fisher_w currently accepts scalar blocks of shape ({n_obs}, 1, 1) on this latent entry point; got {:?}",
             fw.shape()
         ));
     }
@@ -3651,7 +3651,7 @@ fn latent_scalar_weights_with_fisher(
         let v = fw[[n, 0, 0]];
         if !(v.is_finite() && v >= 0.0) {
             return Err(format!(
-                "fisher_W[{n},0,0] must be finite and non-negative; got {v}"
+                "fisher_w[{n},0,0] must be finite and non-negative; got {v}"
             ));
         }
         out[n] *= v;
@@ -3673,7 +3673,7 @@ fn validate_dense_fisher_w(
 ) -> Result<(), String> {
     if fisher_w.shape() != [n_obs, n_outputs, n_outputs] {
         return Err(format!(
-            "fisher_W dense blocks must have shape ({n_obs}, {n_outputs}, {n_outputs}); got {:?}",
+            "fisher_w dense blocks must have shape ({n_obs}, {n_outputs}, {n_outputs}); got {:?}",
             fisher_w.shape()
         ));
     }
@@ -3682,12 +3682,12 @@ fn validate_dense_fisher_w(
             for b in 0..n_outputs {
                 let v = fisher_w[[n, a, b]];
                 if !v.is_finite() {
-                    return Err(format!("fisher_W[{n},{a},{b}] must be finite; got {v}"));
+                    return Err(format!("fisher_w[{n},{a},{b}] must be finite; got {v}"));
                 }
             }
             if fisher_w[[n, a, a]] < 0.0 {
                 return Err(format!(
-                    "fisher_W[{n},{a},{a}] must be non-negative; got {}",
+                    "fisher_w[{n},{a},{a}] must be non-negative; got {}",
                     fisher_w[[n, a, a]]
                 ));
             }

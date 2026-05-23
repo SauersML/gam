@@ -7,7 +7,7 @@ Proposal references:
 * /Users/user/gam/proposals/latent_coord.md
 * /Users/user/gam/proposals/sae_manifold.md
 
-API gap: current formula ``gamfit.fit`` may not expose ``fisher_W``. If so,
+API gap: current formula ``gamfit.fit`` may not expose ``fisher_w``. If so,
 the demo uses the low-level Fisher hook and applies circle retraction in Python.
 """
 
@@ -120,7 +120,7 @@ def intended_formula_fit(df, theta0, u_rgb, w_per_row):
                 dim_selection={"enabled": True},  # ARD per latent axis
             ),
         },
-        fisher_W=w_per_row,  # per-row output Fisher blocks
+        fisher_w=w_per_row,  # per-row output Fisher blocks
     )
 
 
@@ -144,7 +144,7 @@ def low_level_fit(y, theta0, u_rgb, w_per_row, *, circle, steps):
             centers=centers,
             penalty=penalty,
             m=2,
-            fisher_W=w_per_row,
+            fisher_w=w_per_row,
             init_lambda=1.0,
             aux_u=u_rgb,
             aux_family="ridge",
@@ -166,7 +166,7 @@ def low_level_fit(y, theta0, u_rgb, w_per_row, *, circle, steps):
         trace.append(np.r_[active, inactive])
 
     gap = (
-        "formula fit lacks fisher_W; used low-level Fisher hook; "
+        "formula fit lacks fisher_w; used low-level Fisher hook; "
         "circle retraction and inactive-axis ARD trace are demo-side"
     )
     if w_per_row is None:
@@ -208,8 +208,8 @@ def main():
     started = time.perf_counter()
 
     try:
-        if "fisher_W" not in inspect.signature(gamfit.fit).parameters:
-            raise TypeError("formula gamfit.fit does not expose fisher_W yet")
+        if "fisher_w" not in inspect.signature(gamfit.fit).parameters:
+            raise TypeError("formula gamfit.fit does not expose fisher_w yet")
         result = intended_formula_fit(df, theta0, u_rgb, w_per_row)
         comp = DemoFit(
             latent_theta(result, theta0),
