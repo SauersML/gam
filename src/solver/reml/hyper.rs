@@ -1335,8 +1335,7 @@ impl<'a> RemlState<'a> {
         let implicit_n_axes = if any_has_implicit {
             hyper_dirs
                 .iter()
-                .find_map(|d| d.implicit_first_axis_info())
-                .map(|(op, _)| op.n_axes())
+                .find_map(|d| d.implicit_axis_count_hint())
                 .unwrap_or(0)
         } else {
             0
