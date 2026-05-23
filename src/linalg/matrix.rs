@@ -774,9 +774,16 @@ fn sparse_csr_diag_gram_rows(
     weights: ArrayView1<'_, f64>,
     rows: Range<usize>,
 ) -> Array1<f64> {
+    // PSD precondition: callers (Fisher-scoring diag(XᵀWX)) must supply nonneg
+    // weights. Signed observed-Hessian assembly must use the signed Gram path
+    // (xt_diag_x_signed → streaming kernels).
+    debug_assert!(
+        weights.iter().all(|&w| w >= 0.0),
+        "sparse_csr_diag_gram_rows requires nonneg weights; use the signed Gram routine for observed-Hessian assembly"
+    );
     let mut diag = Array1::<f64>::zeros(p);
     for i in rows {
-        let wi = weights[i].max(0.0);
+        let wi = weights[i];
         if wi == 0.0 {
             continue;
         }
@@ -796,6 +803,10 @@ fn dense_transpose_weighted_response(
     y: &Array1<f64>,
     row_scale: Option<&Array1<f64>>,
 ) -> Array1<f64> {
+    // Signed-safe: XᵀWy is linear in W, so observed-Hessian / non-canonical-link
+    // IRLS sites that drive signed working weights through this kernel must be
+    // preserved end-to-end. Clipping negative weights here silently biases the
+    // pseudo-response and was the source of the Gram-cleanup mismatch.
     let p = matrix.ncols();
     let n = matrix.nrows();
     let mut out = Array1::<f64>::zeros(p);
@@ -806,7 +817,7 @@ fn dense_transpose_weighted_response(
             let scale_slice = row_scale.and_then(|s| s.as_slice());
             let out_slice = out.as_slice_mut().expect("zeros are contiguous");
             for i in 0..n {
-                let mut scaled = yslice[i] * w[i].max(0.0);
+                let mut scaled = yslice[i] * w[i];
                 if let Some(s) = scale_slice {
                     scaled *= s[i];
                 } else if let Some(scale) = row_scale {
@@ -824,7 +835,7 @@ fn dense_transpose_weighted_response(
         }
     }
     for i in 0..n {
-        let mut scaled = y[i] * weights[i].max(0.0);
+        let mut scaled = y[i] * weights[i];
         if let Some(scale) = row_scale {
             scaled *= scale[i];
         }
@@ -844,6 +855,8 @@ fn dense_transpose_weighted_response_view(
     weights: ArrayView1<'_, f64>,
     y: ArrayView1<'_, f64>,
 ) -> Array1<f64> {
+    // Signed-safe view variant of dense_transpose_weighted_response; see that
+    // function for the rationale on preserving sign through XᵀWy.
     let p = matrix.ncols();
     let n = matrix.nrows();
     let mut out = Array1::<f64>::zeros(p);
@@ -853,7 +866,7 @@ fn dense_transpose_weighted_response_view(
         {
             let out_slice = out.as_slice_mut().expect("zeros are contiguous");
             for i in 0..n {
-                let scaled = yslice[i] * w[i].max(0.0);
+                let scaled = yslice[i] * w[i];
                 if scaled == 0.0 {
                     continue;
                 }
@@ -866,7 +879,7 @@ fn dense_transpose_weighted_response_view(
         }
     }
     for i in 0..n {
-        let scaled = y[i] * weights[i].max(0.0);
+        let scaled = y[i] * weights[i];
         if scaled == 0.0 {
             continue;
         }
@@ -996,11 +1009,13 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
                 n
             ));
         }
+        // Signed-safe XᵀWy: linear in w, so observed-Hessian / non-canonical
+        // working weights must flow through unclipped.
         let mut wy = Array1::<f64>::zeros(n);
         ndarray::Zip::from(&mut wy)
             .and(weights)
             .and(y)
-            .par_for_each(|o, &w, &yi| *o = w.max(0.0) * yi);
+            .par_for_each(|o, &w, &yi| *o = w * yi);
         Ok(self.apply_transpose(&wy))
     }
 
