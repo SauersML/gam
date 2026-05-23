@@ -16,6 +16,7 @@ Dispatch layers do the appropriate conversion.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
 
@@ -302,7 +303,7 @@ class LatentCoord:
     n: int
     d: int
     init: Any = "pca"
-    aux_prior: Mapping[str, Any] | None = None  # type: ignore[name-defined]
+    aux_prior: Mapping[str, Any] | None = None
     dim_selection: bool = False
     name: str | None = None
 
@@ -329,5 +330,6 @@ __all__ = [
     "Matern",
     "Sphere",
     "Categorical",
+    "LatentCoord",
     "PeriodicSplineCurve",
 ]
