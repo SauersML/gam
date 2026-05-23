@@ -29378,3 +29378,61 @@ exec
    159	            if let Some(ref base_cov) = base_covariance {
    160	                if let Ok(hop) = super::unified::DenseSpectralOperator::from_symmetric(base_cov) {
 
+context compacted
+codex
+FINDINGS
+
+1. **Definitive**: unguarded binomial deviance logs can take `ln(0)`  
+   File: [pirls.rs](/Users/user/gam/src/solver/pirls.rs:9714)
+
+   Wrong expression:
+   ```rust
+   let mui_c = mu[i];
+   yi * (yi.ln() - mui_c.ln())
+   (1.0 - yi) * ((1.0 - yi).ln() - (1.0 - mui_c).ln())
+   ```
+
+   Correct expression:
+   ```rust
+   let mui_c = mu[i].clamp(EPS, 1.0 - EPS);
+   let term1 = if yi > EPS { yi * (yi / mui_c).ln() } else { 0.0 };
+   let term2 = if yi < 1.0 - EPS {
+       (1.0 - yi) * ((1.0 - yi) / (1.0 - mui_c)).ln()
+   } else {
+       0.0
+   };
+   ```
+
+   Derivation: binomial unit deviance is  
+   `2 * [ y log(y / mu) + (1 - y) log((1 - y) / (1 - mu)) ]`, with the `0 log 0` terms omitted. This formula requires `0 < mu < 1` before taking logs. The current code only guards `y`, not `mu`, while inverse links can produce exact `0.0` or `1.0` at tails, so `mui_c.ln()` or `(1.0 - mui_c).ln()` can become `ln(0)`. The same file’s binomial log-likelihood correctly clamps `mu`, so the deviance computation is inconsistent and can break step-halving/objective checks.
+
+I found no other definitive math errors in the inspected PIRLS update equation, Gaussian REML/LAML derivatives, active-set KKT sign convention, or mixture-link derivative formulas within the requested scope.
+tokens used
+273,877
+FINDINGS
+
+1. **Definitive**: unguarded binomial deviance logs can take `ln(0)`  
+   File: [pirls.rs](/Users/user/gam/src/solver/pirls.rs:9714)
+
+   Wrong expression:
+   ```rust
+   let mui_c = mu[i];
+   yi * (yi.ln() - mui_c.ln())
+   (1.0 - yi) * ((1.0 - yi).ln() - (1.0 - mui_c).ln())
+   ```
+
+   Correct expression:
+   ```rust
+   let mui_c = mu[i].clamp(EPS, 1.0 - EPS);
+   let term1 = if yi > EPS { yi * (yi / mui_c).ln() } else { 0.0 };
+   let term2 = if yi < 1.0 - EPS {
+       (1.0 - yi) * ((1.0 - yi) / (1.0 - mui_c)).ln()
+   } else {
+       0.0
+   };
+   ```
+
+   Derivation: binomial unit deviance is  
+   `2 * [ y log(y / mu) + (1 - y) log((1 - y) / (1 - mu)) ]`, with the `0 log 0` terms omitted. This formula requires `0 < mu < 1` before taking logs. The current code only guards `y`, not `mu`, while inverse links can produce exact `0.0` or `1.0` at tails, so `mui_c.ln()` or `(1.0 - mui_c).ln()` can become `ln(0)`. The same file’s binomial log-likelihood correctly clamps `mu`, so the deviance computation is inconsistent and can break step-halving/objective checks.
+
+I found no other definitive math errors in the inspected PIRLS update equation, Gaussian REML/LAML derivatives, active-set KKT sign convention, or mixture-link derivative formulas within the requested scope.
