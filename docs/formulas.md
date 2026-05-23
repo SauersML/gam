@@ -20,12 +20,18 @@ formula-level configuration terms (`link(...)`, `linkwiggle(...)`,
 | --- | --- |
 | `y` continuous | Gaussian family, identity link. |
 | `y` binary `{0, 1}` | Binomial family, logit link. |
-| `y` count, with `link(type=log)` and explicit family | Poisson. |
+| `y` non-negative integer, with `link(type=log)` | Poisson. |
 | `y` positive continuous, with `link(type=log)` | Gamma. |
 | `Surv(entry, exit, event)` | Survival model. See [survival.md](survival.md). |
 
-The family is inferred from the response with `family="auto"`. Override
-with `family=` or by setting an explicit `link()`.
+The family is inferred from the response. When `link(type=log)` is set,
+Poisson vs Gamma is chosen by whether `y` is integer-valued — `family=`
+is optional in that case. `family=` accepts `gaussian`, `binomial`
+(aliases `binomial-logit`, `binomial-probit`, `binomial-cloglog`),
+`latent-cloglog-binomial`, `poisson`, and `gamma`. Survival,
+transformation-normal, and Bernoulli marginal-slope families are
+selected through `Surv(...)` or dedicated CLI flags rather than
+`family=`.
 
 ## Linear and constrained coefficients
 
@@ -87,6 +93,7 @@ y ~ fs(x, site)                          # alias for bs="fs"
 y ~ s(site, x, bs="sz") + s(x)           # sum-to-zero deviations
 y ~ sz(site, x)                          # alias for bs="sz"
 y ~ s(site, x, bs="re") + group(site)    # random slopes + random intercepts
+y ~ s(x, site, bs="re") + group(site)    # column order interchangeable
 ```
 
 `group(name)` and `re(name)` add a random intercept per level of a
@@ -100,9 +107,9 @@ varying-coefficient smooth.
 
 `bs="fs"` builds factor smooths: each group gets its own curve,
 including penalized null-space components (intercept and linear
-trend). The default `m=2` applies two null-space shrinkage penalties;
-set `m=1` to apply one. New groups at prediction time contribute zero
-for the term.
+trend). `m` sets the order of the single null-space shrinkage penalty
+(default `m=2`, second-order). New groups at prediction time
+contribute zero for the term.
 
 `bs="sz"` builds sum-to-zero factor-smooth deviations; deviations sum
 to zero across factor levels at each spline coefficient. Use with a
@@ -139,7 +146,7 @@ second-order difference penalty.
 | `knots` | from data | Number of interior knots. Cannot combine with `k`. |
 | `degree` | 3 | Polynomial degree of the B-spline. |
 | `penalty_order` | 2 | Order of the difference penalty. |
-| `type` | `ps` (1-D), `tps` (≥2-D) | One of `ps`, `tps`, `matern`, `duchon`, etc. |
+| `type` | B-spline (1-D), `tps` (≥2-D) | One of `tps`, `matern`, `duchon`, `sphere`, `cyclic`. `ps` and the bare default both produce the 1-D B-spline; there is no separate `ps` dispatch. |
 | `double_penalty` | `true` | Add a ridge penalty alongside the difference penalty. |
 | `bc` | `free` | Same boundary condition on both ends: `free`, `clamped`, or `anchored`. |
 | `bc_left`, `bc_right` | `free` | Per-endpoint boundary condition. Aliases: `left_bc`/`right_bc`, `start_bc`/`end_bc`. |
@@ -223,16 +230,22 @@ stiffness). Scale-free unless `length_scale` is given.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `order` (`nullspace_order`) | auto | Polynomial nullspace order. |
-| `power` (`p`) | auto | Kernel power. |
+| `order` (`nullspace_order`) | auto | Polynomial nullspace order `p`. Polynomial block has `C(d + p, d)` columns (`p=0` → constant only, `p=1` (Linear) → `d+1` columns, `p=2` → `(d+1)(d+2)/2`). |
+| `power` (`p`) | auto | Riesz fractional smoothness `s`. Auto-resolved against `d` and the active operator penalties. |
 | `centers` (`k`, `basis_dim`) | auto | Number of centres. |
-| `length_scale` | none (scale-free) | Optional global scale. |
+| `length_scale` | none (scale-free) | Optional global scale. Without it, the kernel is pure polyharmonic; with it, the kernel is the hybrid Duchon-Matérn (κ = 1/length_scale). |
 | `scale_dims` | `false` | Per-axis contrasts. |
 | `periodic`, `period`, `period_start`, `period_end` | — | 1-D cyclic Duchon (see below). |
 
 `duchon()` rejects `double_penalty`; the three operator penalties
 (mass, tension, stiffness) each get their own smoothing parameter
 under REML.
+
+Duchon is not TPS. TPS forces `m = ⌊d/2⌋+1`, so its polynomial
+nullspace `C(d+m-1, d)` grows combinatorially with `d` (e.g. 735,471
+columns at `d=16`). Duchon keeps `p` small (typically `Linear`, giving
+`d+1` polynomial columns) and grows the Riesz power `s` instead, so
+the polynomial block stays linear in `d` at any ambient dimension.
 
 ### Tensor product (`te`, `tensor`, `interaction`)
 
@@ -419,13 +432,16 @@ such as `weibull`, `gompertz`, or `gompertz-makeham`. See
 ## `survmodel` — survival configuration
 
 ```
-Surv(entry, exit, event) ~ age + survmodel(spec=net, distribution=gaussian)
+Surv(entry, exit, event) ~ age + survmodel(distribution=gaussian)
 ```
 
 | Option | Meaning |
 | --- | --- |
-| `spec` | Baseline specification, e.g. `net`. |
 | `distribution` | Residual distribution. Case-insensitive. Accepted: `gaussian`/`probit`, `gumbel`/`cloglog`, `logistic`/`logit`. |
+
+Survival likelihood and baseline target are selected via CLI flags
+(`--survival-likelihood`, `--baseline-target`), not through `spec=` on
+`survmodel(...)`.
 
 `survmodel()` requires at least one named option and takes named
 arguments only. Only one `survmodel(...)` term is allowed per formula.
