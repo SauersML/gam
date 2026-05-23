@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Circle + Fisher-Rao + OrthogonalityPenalty + ARDPenalty worked example.
+"""Circle + Fisher-Rao + OrthogonalityPenalty + ARDPenalty showcase.
 
-This is the composition crescendo demo for a 2D latent signal: a circular
-angle plus one small Euclidean auxiliary coordinate, decoded into a 3D output
-with row-local heteroscedasticity. The public composition-engine path is tried
-first; wheels that predate the high-level ``fisher_w`` hook use the same
-NumPy fallback pattern as ``orthogonality_plus_ard_demo.py``.
+Synthetic 2D latent -> 3D output data: one circular angle plus one small
+Euclidean auxiliary coordinate. The demo tries the public composition-engine
+surface first and uses the NumPy fallback pattern from
+``orthogonality_plus_ard_demo.py`` when the installed wrapper lacks the new
+``gamfit.fit(..., fisher_w=...)`` hook.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 import inspect
 import warnings
@@ -28,25 +27,7 @@ CONFIGS = (
 )
 
 
-@dataclass
-class Synthetic:
-    theta: np.ndarray
-    aux: np.ndarray
-    y: np.ndarray
-    fisher_w: np.ndarray
-
-
-@dataclass
-class FitReport:
-    name: str
-    call: str
-    theta_hat: np.ndarray
-    axis_activity: np.ndarray
-    theta_r2: float
-    aux_dims_kept: int
-
-
-def make_data() -> Synthetic:
+def make_data() -> dict[str, np.ndarray]:
     rng = np.random.default_rng(SEED)
     theta = rng.permutation(np.linspace(0.0, 2.0 * np.pi, N, endpoint=False))
     aux = 0.28 * np.sin(3.0 * theta + 0.35) + 0.08 * rng.standard_normal(N)
@@ -62,14 +43,13 @@ def make_data() -> Synthetic:
     y = clean + row_scale[:, None] * out_scale[None, :] * rng.standard_normal(clean.shape)
     fisher_w = np.zeros((N, 3, 3))
     fisher_w[:, np.arange(3), np.arange(3)] = 1.0 / (row_scale[:, None] * out_scale[None, :]) ** 2
-    return Synthetic(theta, aux, y, fisher_w)
+    return {"theta": theta, "aux": aux, "y": y, "fisher_w": fisher_w}
 
 
 def circular_r2(theta: np.ndarray, theta_hat: np.ndarray) -> float:
     theta_hat = np.mod(theta_hat, 2.0 * np.pi)
     rot = np.angle(np.mean(np.exp(1j * (theta - theta_hat))))
-    aligned = np.mod(theta_hat + rot, 2.0 * np.pi)
-    return float(abs(np.mean(np.exp(1j * (theta - aligned)))) ** 2)
+    return float(abs(np.mean(np.exp(1j * (theta - np.mod(theta_hat + rot, 2.0 * np.pi))))) ** 2)
 
 
 def align_theta(theta: np.ndarray, theta_hat: np.ndarray) -> np.ndarray:
@@ -77,14 +57,12 @@ def align_theta(theta: np.ndarray, theta_hat: np.ndarray) -> np.ndarray:
     return np.mod(theta_hat + rot, 2.0 * np.pi)
 
 
-def pca_scores(y: np.ndarray, d: int = D) -> np.ndarray:
+def pca_scores(y: np.ndarray) -> np.ndarray:
     yc = y - y.mean(axis=0, keepdims=True)
     u, s, _ = np.linalg.svd(yc, full_matrices=False)
-    out = np.zeros((len(y), d))
-    out[:, : min(d, u.shape[1])] = u[:, :d] * s[:d]
-    if d > u.shape[1]:
-        rng = np.random.default_rng(SEED + 11)
-        out[:, u.shape[1] :] = 0.08 * rng.standard_normal((len(y), d - u.shape[1]))
+    out = np.zeros((len(y), D))
+    out[:, :3] = u[:, :3] * s[:3]
+    out[:, 3] = 0.08 * np.random.default_rng(SEED + 11).standard_normal(len(y))
     return out
 
 
@@ -94,88 +72,84 @@ def grid_angle(y: np.ndarray, fisher_w: np.ndarray | None) -> np.ndarray:
         [1.15 * np.cos(grid), 0.82 * np.sin(grid), 0.42 * np.cos(2.0 * grid - 0.4)]
     )
     diff = y[:, None, :] - curve[None, :, :]
-    if fisher_w is None:
-        dist = np.einsum("ngp,ngp->ng", diff, diff)
-    else:
-        dist = np.einsum("ngp,npq,ngq->ng", diff, fisher_w, diff)
+    dist = (
+        np.einsum("ngp,ngp->ng", diff, diff)
+        if fisher_w is None
+        else np.einsum("ngp,npq,ngq->ng", diff, fisher_w, diff)
+    )
     return grid[np.argmin(dist, axis=1)]
 
 
-def reports_from_fallback(data: Synthetic) -> tuple[list[FitReport], str]:
-    bare_scores = pca_scores(data.y)
+def summarize(theta: np.ndarray, theta_hat: np.ndarray, activity: np.ndarray, cfg: tuple[str, str]) -> dict:
+    return {
+        "name": cfg[0],
+        "call": cfg[1],
+        "theta_hat": theta_hat,
+        "activity": activity,
+        "theta_r2": circular_r2(theta, theta_hat),
+        "aux_dims_kept": int(np.count_nonzero(activity > ACTIVITY_CUTOFF)),
+    }
+
+
+def fallback_reports(data: dict[str, np.ndarray]) -> tuple[list[dict], str]:
     q, _ = np.linalg.qr(np.random.default_rng(SEED + 1).normal(size=(D, D)))
-    bare_latent = bare_scores @ q
-    bare_theta = np.mod(np.arctan2(bare_latent[:, 1], bare_latent[:, 0]), 2.0 * np.pi)
-    circle_theta = grid_angle(data.y, None)
-    fisher_theta = grid_angle(data.y, data.fisher_w)
-    final_theta = fisher_theta
+    bare = pca_scores(data["y"]) @ q
+    theta_hats = [
+        np.mod(np.arctan2(bare[:, 1], bare[:, 0]), 2.0 * np.pi),
+        grid_angle(data["y"], None),
+        grid_angle(data["y"], data["fisher_w"]),
+        grid_angle(data["y"], data["fisher_w"]),
+    ]
     activity = [
         np.array([1.00, 0.86, 0.22, 0.12]),
         np.array([1.00, 0.91, 0.24, 0.10]),
         np.array([1.00, 0.94, 0.19, 0.08]),
         np.array([1.00, 0.31, 0.012, 0.006]),
     ]
-    thetas = [bare_theta, circle_theta, fisher_theta, final_theta]
-    out = []
-    for (name, call), theta_hat, axis_activity in zip(CONFIGS, thetas, activity):
-        out.append(
-            FitReport(
-                name,
-                call,
-                theta_hat,
-                axis_activity,
-                circular_r2(data.theta, theta_hat),
-                int(np.count_nonzero(axis_activity > ACTIVITY_CUTOFF)),
-            )
-        )
-    return out, "fallback_emulator"
+    return [
+        summarize(data["theta"], theta_hat, act, cfg)
+        for theta_hat, act, cfg in zip(theta_hats, activity, CONFIGS)
+    ], "fallback_emulator"
 
 
-def reports_from_real_engine(data: Synthetic) -> tuple[list[FitReport], str]:
+def real_reports(data: dict[str, np.ndarray]) -> tuple[list[dict], str]:
     import gamfit
 
     if "fisher_w" not in inspect.signature(gamfit.fit).parameters:
         raise TypeError("gamfit.fit lacks public fisher_w kwarg")
-    df = {"y": data.y[:, 0].tolist()}
-    init = pca_scores(data.y)
+    df = {"y": data["y"][:, 0].tolist()}
+    init = pca_scores(data["y"])
     common = dict(data=df, formula="y ~ s(t, type='periodic', n_knots=24)")
+    latent = lambda manifold="auto": gamfit.LatentCoord(n=N, d=D, init=init, manifold=manifold)
     penalties = [
         gamfit.OrthogonalityPenalty(weight=40.0, n_eff=N, target="t"),
         gamfit.ARDPenalty("t"),
     ]
-    calls = [
-        dict(latents={"t": gamfit.LatentCoord(n=N, d=D, init=init)}),
-        dict(latents={"t": gamfit.LatentCoord(n=N, d=D, init=init, manifold="circle")}),
-        dict(latents={"t": gamfit.LatentCoord(n=N, d=D, init=init, manifold="circle")}, fisher_w=data.fisher_w),
-        dict(
-            latents={"t": gamfit.LatentCoord(n=N, d=D, init=init, manifold="circle")},
-            fisher_w=data.fisher_w,
-            penalties=penalties,
-        ),
+    kwargs = [
+        dict(latents={"t": latent()}),
+        dict(latents={"t": latent("circle")}),
+        dict(latents={"t": latent("circle")}, fisher_w=data["fisher_w"]),
+        dict(latents={"t": latent("circle")}, fisher_w=data["fisher_w"], penalties=penalties),
     ]
-    fits = [gamfit.fit(**common, **kwargs) for kwargs in calls]
     reports = []
-    for (name, call), fit in zip(CONFIGS, fits):
-        latent = np.asarray(fit.latent("t"), dtype=float).reshape(N, D)
-        theta_hat = np.mod(latent[:, 0], 2.0 * np.pi)
-        axis_activity = np.var(latent, axis=0)
-        axis_activity /= max(float(axis_activity.max()), 1e-12)
-        reports.append(
-            FitReport(name, call, theta_hat, axis_activity, circular_r2(data.theta, theta_hat),
-                      int(np.count_nonzero(axis_activity > ACTIVITY_CUTOFF)))
-        )
+    for cfg, kw in zip(CONFIGS, kwargs):
+        fit = gamfit.fit(**common, **kw)
+        t = np.asarray(fit.latent("t"), dtype=float).reshape(N, D)
+        activity = np.var(t, axis=0)
+        activity /= max(float(activity.max()), 1e-12)
+        reports.append(summarize(data["theta"], np.mod(t[:, 0], 2.0 * np.pi), activity, cfg))
     return reports, "real_composition_engine"
 
 
-def fit_reports(data: Synthetic) -> tuple[list[FitReport], str]:
+def fit_reports(data: dict[str, np.ndarray]) -> tuple[list[dict], str]:
     try:
-        return reports_from_real_engine(data)
+        return real_reports(data)
     except Exception as exc:
         warnings.warn(f"using NumPy fallback path: {exc!r}")
-        return reports_from_fallback(data)
+        return fallback_reports(data)
 
 
-def plot_reports(data: Synthetic, reports: list[FitReport]) -> None:
+def plot_reports(data: dict[str, np.ndarray], reports: list[dict]) -> None:
     try:
         import matplotlib.pyplot as plt
     except ModuleNotFoundError as exc:
@@ -183,15 +157,25 @@ def plot_reports(data: Synthetic, reports: list[FitReport]) -> None:
         return
     fig, axes = plt.subplots(1, 4, figsize=(17.0, 4.3), constrained_layout=True)
     for ax, report in zip(axes, reports):
-        aligned = align_theta(data.theta, report.theta_hat)
-        ax.scatter(data.theta, aligned, c=data.aux, cmap="viridis", s=10, alpha=0.74)
+        ax.scatter(
+            data["theta"],
+            align_theta(data["theta"], report["theta_hat"]),
+            c=data["aux"],
+            cmap="viridis",
+            s=10,
+            alpha=0.74,
+        )
         ax.plot([0.0, 2.0 * np.pi], [0.0, 2.0 * np.pi], color="black", lw=1)
-        xs = np.linspace(0.45, 2.45, D)
-        ax.bar(xs, 0.85 * report.axis_activity, width=0.28, bottom=-1.05, color="tab:orange", alpha=0.8)
+        ax.bar(np.linspace(0.45, 2.45, D), 0.85 * report["activity"],
+               width=0.28, bottom=-1.05, color="tab:orange", alpha=0.8)
         ax.axhline(-1.05 + 0.85 * ACTIVITY_CUTOFF, color="black", lw=1, ls=":")
-        ax.set(title=f"{report.name}\nθ R²={report.theta_r2:.2f}, kept={report.aux_dims_kept}",
-               xlabel="true θ", xlim=(0.0, 2.0 * np.pi), ylim=(-1.15, 2.0 * np.pi))
-    axes[0].set_ylabel("aligned recovered θ; orange bars = axis activity")
+        ax.set(
+            title=f"{report['name']}\ntheta R2={report['theta_r2']:.2f}, kept={report['aux_dims_kept']}",
+            xlabel="true theta",
+            xlim=(0.0, 2.0 * np.pi),
+            ylim=(-1.15, 2.0 * np.pi),
+        )
+    axes[0].set_ylabel("aligned recovered theta; orange bars = axis activity")
     fig.savefig(FIG_PATH, dpi=160)
     plt.close(fig)
 
@@ -200,16 +184,16 @@ def hand_rolled_topology(theta: np.ndarray, y: np.ndarray) -> str:
     x = (theta - theta.mean()) / theta.std()
     euclid = np.column_stack([np.ones_like(x), x, x**2, x**3])
     circle = np.column_stack([np.ones_like(theta), np.cos(theta), np.sin(theta), np.cos(2 * theta), np.sin(2 * theta)])
-    rss_e = float(np.square(y - euclid @ np.linalg.lstsq(euclid, y, rcond=None)[0]).sum())
-    rss_c = float(np.square(y - circle @ np.linalg.lstsq(circle, y, rcond=None)[0]).sum())
+    rss_e = np.square(y - euclid @ np.linalg.lstsq(euclid, y, rcond=None)[0]).sum()
+    rss_c = np.square(y - circle @ np.linalg.lstsq(circle, y, rcond=None)[0]).sum()
     return "Circle" if rss_c < rss_e else "Euclidean"
 
 
-def select_topology_verdict(data: Synthetic) -> tuple[str, str]:
+def select_topology_verdict(data: dict[str, np.ndarray]) -> tuple[str, str]:
     try:
         import gamfit
 
-        df = {"theta": data.theta.tolist(), "y0": data.y[:, 0].tolist()}
+        df = {"theta": data["theta"].tolist(), "y0": data["y"][:, 0].tolist()}
         result = gamfit.select_topology(
             df,
             response="y0",
@@ -220,26 +204,23 @@ def select_topology_verdict(data: Synthetic) -> tuple[str, str]:
         )
         return str(result.winner_name), "select_topology"
     except Exception:
-        return hand_rolled_topology(data.theta, data.y[:, 0]), "hand_rolled_equivalent"
-
-
-def print_report(reports: list[FitReport], path: str, topology: tuple[str, str]) -> None:
-    print("circle_fisher_ard_e2e_demo")
-    print(f"path = {path}")
-    print("fit_configurations:")
-    for report in reports:
-        print(f"{report.name}: {report.call}")
-    print(f"theta_R² = {[round(r.theta_r2, 3) for r in reports]}")
-    print(f"aux_kept = {[r.aux_dims_kept for r in reports]}")
-    print(f"plot written: {FIG_PATH}")
-    print(f"topology_winner = {topology[0]} via {topology[1]}")
+        return hand_rolled_topology(data["theta"], data["y"][:, 0]), "hand_rolled_equivalent"
 
 
 def main() -> None:
     data = make_data()
     reports, path = fit_reports(data)
     plot_reports(data, reports)
-    print_report(reports, path, select_topology_verdict(data))
+    winner, winner_path = select_topology_verdict(data)
+    print("circle_fisher_ard_e2e_demo")
+    print(f"path = {path}")
+    print("fit_configurations:")
+    for report in reports:
+        print(f"{report['name']}: {report['call']}")
+    print(f"theta_R2 = {[round(r['theta_r2'], 3) for r in reports]}")
+    print(f"aux_kept = {[r['aux_dims_kept'] for r in reports]}")
+    print(f"plot written: {FIG_PATH}")
+    print(f"topology_winner = {winner} via {winner_path}")
 
 
 if __name__ == "__main__":
