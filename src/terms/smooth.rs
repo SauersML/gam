@@ -13213,6 +13213,8 @@ struct SingleBlockLatentCoordDesignCache {
     design: TermCollectionDesign,
     current_theta: Option<Array1<f64>>,
     current_latent: Option<std::sync::Arc<crate::terms::latent_coord::LatentCoordValues>>,
+    current_hyper_dirs: Option<Vec<crate::estimate::reml::DirectionalHyperParam>>,
+    latent_design_cache: crate::solver::latent_cache::LatentDesignCache,
     last_cost: Option<f64>,
     last_eval: Option<(
         f64,
@@ -13267,6 +13269,8 @@ impl SingleBlockLatentCoordDesignCache {
             design,
             current_theta: None,
             current_latent: None,
+            current_hyper_dirs: None,
+            latent_design_cache: crate::solver::latent_cache::LatentDesignCache::default(),
             last_cost: None,
             last_eval: None,
             term_index: latent.term_index,
@@ -13297,6 +13301,61 @@ impl SingleBlockLatentCoordDesignCache {
             .as_ref()
             .cloned()
             .ok_or_else(|| "latent-coordinate cache has not been realized".to_string())
+    }
+
+    fn hyper_dirs(&self) -> Result<Vec<crate::estimate::reml::DirectionalHyperParam>, String> {
+        self.current_hyper_dirs
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "latent-coordinate hyper_dirs cache has not been realized".to_string())
+    }
+
+    fn latent_basis_kind(&self) -> Result<crate::solver::latent_cache::LatentBasisKind, String> {
+        let smooth_term = self.design.smooth.terms.get(self.term_index).ok_or_else(|| {
+            SmoothError::dimension_mismatch(format!(
+                "LatentCoord term index {} out of bounds for realized smooth design",
+                self.term_index
+            ))
+        })?;
+        let termspec = self.spec.smooth_terms.get(self.term_index).ok_or_else(|| {
+            SmoothError::dimension_mismatch(format!(
+                "LatentCoord term index {} out of bounds for resolved smooth spec",
+                self.term_index
+            ))
+        })?;
+        match (&termspec.basis, &smooth_term.metadata) {
+            (
+                SmoothBasisSpec::Matern { .. },
+                BasisMetadata::Matern {
+                    centers,
+                    length_scale,
+                    nu,
+                    ..
+                },
+            ) => Ok(crate::solver::latent_cache::LatentBasisKind::Matern {
+                centers: centers.clone(),
+                length_scale: *length_scale,
+                nu: *nu,
+            }),
+            (
+                SmoothBasisSpec::Duchon { .. },
+                BasisMetadata::Duchon {
+                    centers,
+                    length_scale,
+                    nullspace_order,
+                    ..
+                },
+            ) => Ok(crate::solver::latent_cache::LatentBasisKind::Duchon {
+                centers: centers.clone(),
+                length_scale: *length_scale,
+                nullspace_order: *nullspace_order,
+            }),
+            _ => Err(SmoothError::invalid_config(
+                "latent-coordinate design cache supports Matérn and Duchon radial smooths"
+                    .to_string(),
+            )
+            .into()),
+        }
     }
 
     fn ensure_theta(&mut self, theta: &Array1<f64>) -> Result<(), String> {
@@ -13342,22 +13401,63 @@ impl SingleBlockLatentCoordDesignCache {
             }
         }
 
-        let rebuilt = build_term_collection_design(self.data.view(), &self.spec)
-            .map_err(|e| format!("failed to rebuild latent-coordinate design: {e}"))?;
-        if rebuilt.design.ncols() != self.design.design.ncols() {
+        let basis_kind = self.latent_basis_kind()?;
+        let rebuilt_width = self.design.design.ncols();
+        let spec = self.spec.clone();
+        let term_index = self.term_index;
+        let data = self.data.view();
+        let lookup = self
+            .latent_design_cache
+            .lookup_or_compute(latent.clone(), basis_kind, || {
+                let rebuilt = build_term_collection_design(data, &spec).map_err(|e| {
+                    EstimationError::InvalidInput(format!(
+                        "failed to rebuild latent-coordinate design: {e}"
+                    ))
+                })?;
+                if rebuilt.design.ncols() != rebuilt_width {
+                    return Err(EstimationError::InvalidInput(
+                        SmoothError::dimension_mismatch(format!(
+                            "latent-coordinate design topology changed: rebuilt p={}, cached p={}",
+                            rebuilt.design.ncols(),
+                            rebuilt_width
+                        ))
+                        .to_string(),
+                    ));
+                }
+                let hyper_dirs = try_build_latent_coord_hyper_dirs(
+                    latent.clone(),
+                    &spec,
+                    &rebuilt,
+                    &[term_index],
+                )?
+                .ok_or_else(|| {
+                    EstimationError::InvalidInput(
+                        "failed to build latent-coordinate hyper_dirs".to_string(),
+                    )
+                })?;
+                Ok(crate::solver::latent_cache::ComputedLatentDesign {
+                    design: rebuilt,
+                    hyper_dirs,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        if lookup.cached.design.design.ncols() != self.design.design.ncols() {
             return Err(SmoothError::dimension_mismatch(format!(
                 "latent-coordinate design topology changed: rebuilt p={}, cached p={}",
-                rebuilt.design.ncols(),
+                lookup.cached.design.design.ncols(),
                 self.design.design.ncols()
             ))
             .into());
         }
-        self.design = rebuilt;
+        self.design = lookup.cached.design.clone();
+        self.current_hyper_dirs = Some(lookup.cached.hyper_dirs.clone());
         self.current_latent = Some(latent);
         self.current_theta = Some(theta.clone());
         self.last_cost = None;
         self.last_eval = None;
-        self.design_revision = self.design_revision.wrapping_add(1);
+        if lookup.recomputed {
+            self.design_revision = self.design_revision.wrapping_add(1);
+        }
         Ok(())
     }
 
@@ -13414,6 +13514,8 @@ impl SingleBlockLatentCoordDesignCache {
     fn reset(&mut self) {
         self.current_theta = None;
         self.current_latent = None;
+        self.current_hyper_dirs = None;
+        self.latent_design_cache.invalidate();
         self.last_cost = None;
         self.last_eval = None;
     }
@@ -16826,17 +16928,10 @@ fn try_exact_joint_latent_coord_optimization(
             self.cache
                 .ensure_theta(theta)
                 .map_err(EstimationError::InvalidInput)?;
-            let hyper_dirs = try_build_latent_coord_hyper_dirs(
-                self.cache.latent().map_err(EstimationError::InvalidInput)?,
-                self.cache.spec(),
-                self.cache.design(),
-                &[self.cache.term_index],
-            )?
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "failed to build latent-coordinate hyper_dirs".to_string(),
-                )
-            })?;
+            let hyper_dirs = self
+                .cache
+                .hyper_dirs()
+                .map_err(EstimationError::InvalidInput)?;
             let design_revision = Some(self.cache.design_revision());
             let mut eval = evaluate_joint_reml_outer_eval_at_theta(
                 &mut self.evaluator,
@@ -16861,17 +16956,10 @@ fn try_exact_joint_latent_coord_optimization(
             self.cache
                 .ensure_theta(theta)
                 .map_err(EstimationError::InvalidInput)?;
-            let hyper_dirs = try_build_latent_coord_hyper_dirs(
-                self.cache.latent().map_err(EstimationError::InvalidInput)?,
-                self.cache.spec(),
-                self.cache.design(),
-                &[self.cache.term_index],
-            )?
-            .ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "failed to build latent-coordinate hyper_dirs for EFS".to_string(),
-                )
-            })?;
+            let hyper_dirs = self
+                .cache
+                .hyper_dirs()
+                .map_err(EstimationError::InvalidInput)?;
             evaluate_joint_reml_efs_at_theta(
                 &mut self.evaluator,
                 self.cache.design(),

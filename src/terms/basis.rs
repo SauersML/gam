@@ -4116,12 +4116,69 @@ pub struct ImplicitDesignPsiDerivative {
 #[derive(Debug, Clone)]
 pub struct LatentCoordDesignDerivative {
     latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
-    centers: Arc<Array2<f64>>,
-    radial_kind: RadialScalarKind,
-    ident_transform: Option<Array2<f64>>,
-    full_ident_transform: Option<Array2<f64>>,
-    n_poly: usize,
-    polynomial_order: Option<DuchonNullspaceOrder>,
+    basis: LatentCoordDesignDerivativeBasis,
+}
+
+#[derive(Debug, Clone)]
+enum LatentCoordDesignDerivativeBasis {
+    Radial {
+        centers: Arc<Array2<f64>>,
+        radial_kind: RadialScalarKind,
+        ident_transform: Option<Array2<f64>>,
+        full_ident_transform: Option<Array2<f64>>,
+        n_poly: usize,
+        polynomial_order: Option<DuchonNullspaceOrder>,
+    },
+    Jet {
+        jet: Arc<Array3<f64>>,
+        ident_transform: Option<Array2<f64>>,
+    },
+}
+
+impl LatentCoordDesignDerivativeBasis {
+    fn raw_cols(&self) -> usize {
+        match self {
+            Self::Radial { centers, .. } => centers.nrows(),
+            Self::Jet { jet, .. } => jet.shape()[1],
+        }
+    }
+
+    fn p_constrained(&self) -> usize {
+        match self {
+            Self::Radial {
+                centers,
+                ident_transform,
+                ..
+            } => ident_transform
+                .as_ref()
+                .map_or(centers.nrows(), Array2::ncols),
+            Self::Jet {
+                jet,
+                ident_transform,
+            } => ident_transform.as_ref().map_or(jet.shape()[1], Array2::ncols),
+        }
+    }
+
+    fn p_after_pad(&self) -> usize {
+        match self {
+            Self::Radial { n_poly, .. } => self.p_constrained() + *n_poly,
+            Self::Jet { .. } => self.p_constrained(),
+        }
+    }
+
+    fn p_out(&self) -> usize {
+        match self {
+            Self::Radial {
+                full_ident_transform,
+                ..
+            } => full_ident_transform
+                .as_ref()
+                .map_or(self.p_after_pad(), Array2::ncols),
+            Self::Jet {
+                ident_transform, ..
+            } => ident_transform.as_ref().map_or(self.raw_cols(), Array2::ncols),
+        }
+    }
 }
 
 /// The rayon chunk size for parallel implicit matvec operations.
@@ -4153,12 +4210,14 @@ impl LatentCoordDesignDerivative {
         }
         Ok(Self {
             latent,
-            centers,
-            radial_kind: RadialScalarKind::Matern { length_scale, nu },
-            ident_transform,
-            full_ident_transform: None,
-            n_poly: usize::from(include_intercept),
-            polynomial_order: None,
+            basis: LatentCoordDesignDerivativeBasis::Radial {
+                centers,
+                radial_kind: RadialScalarKind::Matern { length_scale, nu },
+                ident_transform,
+                full_ident_transform: None,
+                n_poly: usize::from(include_intercept),
+                polynomial_order: None,
+            },
         })
     }
 
@@ -4206,12 +4265,96 @@ impl LatentCoordDesignDerivative {
         let n_poly = polynomial_block_from_order(centers.view(), effective_order).ncols();
         Ok(Self {
             latent,
-            centers,
-            radial_kind,
-            ident_transform: Some(ident_transform),
-            full_ident_transform,
-            n_poly,
-            polynomial_order: Some(effective_order),
+            basis: LatentCoordDesignDerivativeBasis::Radial {
+                centers,
+                radial_kind,
+                ident_transform: Some(ident_transform),
+                full_ident_transform,
+                n_poly,
+                polynomial_order: Some(effective_order),
+            },
+        })
+    }
+
+    pub(crate) fn new_sphere(
+        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        centers: Arc<Array2<f64>>,
+        penalty_order: usize,
+        ident_transform: Option<Array2<f64>>,
+    ) -> Result<Self, BasisError> {
+        if latent.latent_dim() != centers.ncols() {
+            return Err(BasisError::DimensionMismatch(format!(
+                "LatentCoordDesignDerivative sphere dimension mismatch: latent d={} centers d={}",
+                latent.latent_dim(),
+                centers.ncols()
+            )));
+        }
+        let raw_jet = sphere_first_derivative_nd(latent.as_matrix().view(), centers.view(), penalty_order)?;
+        let jet = latent.design_gradient_wrt_t_dispatch(
+            crate::terms::latent_coord::InputLocationDerivative::Jet(raw_jet.view()),
+        );
+        Self::from_jet(latent, jet, ident_transform)
+    }
+
+    pub(crate) fn new_periodic_bspline(
+        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        data_range: (f64, f64),
+        degree: usize,
+        num_basis: usize,
+        ident_transform: Option<Array2<f64>>,
+    ) -> Result<Self, BasisError> {
+        let raw_jet =
+            periodic_bspline_first_derivative_nd(latent.as_matrix().view(), data_range, degree, num_basis)?;
+        let jet = latent.design_gradient_wrt_t_dispatch(
+            crate::terms::latent_coord::InputLocationDerivative::Jet(raw_jet.view()),
+        );
+        Self::from_jet(latent, jet, ident_transform)
+    }
+
+    pub(crate) fn new_tensor_bspline(
+        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        knots_per_axis: Vec<Array1<f64>>,
+        degrees: Vec<usize>,
+        ident_transform: Option<Array2<f64>>,
+    ) -> Result<Self, BasisError> {
+        let knot_views = knots_per_axis.iter().map(Array1::view).collect::<Vec<_>>();
+        let raw_jet =
+            bspline_tensor_first_derivative(latent.as_matrix().view(), &knot_views, &degrees)?;
+        let jet = latent.design_gradient_wrt_t_dispatch(
+            crate::terms::latent_coord::InputLocationDerivative::Jet(raw_jet.view()),
+        );
+        Self::from_jet(latent, jet, ident_transform)
+    }
+
+    fn from_jet(
+        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        jet: Array3<f64>,
+        ident_transform: Option<Array2<f64>>,
+    ) -> Result<Self, BasisError> {
+        if jet.shape()[0] != latent.n_obs() || jet.shape()[2] != latent.latent_dim() {
+            return Err(BasisError::DimensionMismatch(format!(
+                "LatentCoordDesignDerivative jet shape {:?} does not match latent shape ({}, {}, {})",
+                jet.shape(),
+                latent.n_obs(),
+                jet.shape()[1],
+                latent.latent_dim()
+            )));
+        }
+        if let Some(z) = ident_transform.as_ref() {
+            if z.nrows() != jet.shape()[1] {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "LatentCoordDesignDerivative identifiability transform has {} rows but derivative jet has {} basis columns",
+                    z.nrows(),
+                    jet.shape()[1]
+                )));
+            }
+        }
+        Ok(Self {
+            latent,
+            basis: LatentCoordDesignDerivativeBasis::Jet {
+                jet: Arc::new(jet),
+                ident_transform,
+            },
         })
     }
 
@@ -4224,19 +4367,15 @@ impl LatentCoordDesignDerivative {
     }
 
     pub(crate) fn p_out(&self) -> usize {
-        self.full_ident_transform
-            .as_ref()
-            .map_or(self.p_after_pad(), Array2::ncols)
+        self.basis.p_out()
     }
 
     fn p_constrained(&self) -> usize {
-        self.ident_transform
-            .as_ref()
-            .map_or(self.centers.nrows(), Array2::ncols)
+        self.basis.p_constrained()
     }
 
     fn p_after_pad(&self) -> usize {
-        self.p_constrained() + self.n_poly
+        self.basis.p_after_pad()
     }
 
     fn row_axis(&self, flat_axis: usize) -> (usize, usize) {
@@ -4245,47 +4384,107 @@ impl LatentCoordDesignDerivative {
     }
 
     fn unproject(&self, u: &ArrayView1<'_, f64>) -> (Array1<f64>, Array1<f64>) {
-        let after_full = match &self.full_ident_transform {
-            Some(zf) => zf.dot(u),
-            None => u.to_owned(),
-        };
-        let p_constrained = self.p_constrained();
-        let smooth_part = after_full.slice(s![..p_constrained]);
-        let raw_knot = match &self.ident_transform {
-            Some(z) => z.dot(&smooth_part),
-            None => smooth_part.to_owned(),
-        };
-        let poly = after_full
-            .slice(s![p_constrained..p_constrained + self.n_poly])
-            .to_owned();
-        (raw_knot, poly)
+        match &self.basis {
+            LatentCoordDesignDerivativeBasis::Radial {
+                ident_transform,
+                full_ident_transform,
+                n_poly,
+                ..
+            } => {
+                let after_full = match full_ident_transform {
+                    Some(zf) => zf.dot(u),
+                    None => u.to_owned(),
+                };
+                let p_constrained = self.p_constrained();
+                let smooth_part = after_full.slice(s![..p_constrained]);
+                let raw_knot = match ident_transform {
+                    Some(z) => z.dot(&smooth_part),
+                    None => smooth_part.to_owned(),
+                };
+                let poly = after_full
+                    .slice(s![p_constrained..p_constrained + *n_poly])
+                    .to_owned();
+                (raw_knot, poly)
+            }
+            LatentCoordDesignDerivativeBasis::Jet { .. } => {
+                unreachable!("jet derivatives use unproject_jet")
+            }
+        }
+    }
+
+    fn unproject_jet(&self, u: &ArrayView1<'_, f64>) -> Array1<f64> {
+        match &self.basis {
+            LatentCoordDesignDerivativeBasis::Jet {
+                ident_transform, ..
+            } => match ident_transform {
+                Some(z) => z.dot(u),
+                None => u.to_owned(),
+            },
+            LatentCoordDesignDerivativeBasis::Radial { .. } => {
+                unreachable!("radial derivatives use unproject")
+            }
+        }
     }
 
     fn project_and_pad(&self, raw_knot: &Array1<f64>, raw_poly: &Array1<f64>) -> Array1<f64> {
-        let constrained = match &self.ident_transform {
-            Some(z) => z.t().dot(raw_knot),
-            None => raw_knot.clone(),
-        };
-        let mut padded = Array1::<f64>::zeros(constrained.len() + self.n_poly);
-        padded
-            .slice_mut(s![..constrained.len()])
-            .assign(&constrained);
-        if self.n_poly > 0 {
-            padded
-                .slice_mut(s![constrained.len()..])
-                .assign(raw_poly);
+        match &self.basis {
+            LatentCoordDesignDerivativeBasis::Radial {
+                ident_transform,
+                full_ident_transform,
+                n_poly,
+                ..
+            } => {
+                let constrained = match ident_transform {
+                    Some(z) => z.t().dot(raw_knot),
+                    None => raw_knot.clone(),
+                };
+                let mut padded = Array1::<f64>::zeros(constrained.len() + *n_poly);
+                padded
+                    .slice_mut(s![..constrained.len()])
+                    .assign(&constrained);
+                if *n_poly > 0 {
+                    padded
+                        .slice_mut(s![constrained.len()..])
+                        .assign(raw_poly);
+                }
+                match full_ident_transform {
+                    Some(zf) => zf.t().dot(&padded),
+                    None => padded,
+                }
+            }
+            LatentCoordDesignDerivativeBasis::Jet { .. } => {
+                unreachable!("jet derivatives use project_jet")
+            }
         }
-        match &self.full_ident_transform {
-            Some(zf) => zf.t().dot(&padded),
-            None => padded,
+    }
+
+    fn project_jet(&self, raw_knot: &Array1<f64>) -> Array1<f64> {
+        match &self.basis {
+            LatentCoordDesignDerivativeBasis::Jet {
+                ident_transform, ..
+            } => match ident_transform {
+                Some(z) => z.t().dot(raw_knot),
+                None => raw_knot.clone(),
+            },
+            LatentCoordDesignDerivativeBasis::Radial { .. } => {
+                unreachable!("radial derivatives use project_and_pad")
+            }
         }
     }
 
     fn kernel_axis_scalar(&self, row: usize, center: usize, axis: usize) -> Result<f64, BasisError> {
+        let LatentCoordDesignDerivativeBasis::Radial {
+            centers,
+            radial_kind,
+            ..
+        } = &self.basis
+        else {
+            unreachable!("jet derivatives do not use radial kernel scalar")
+        };
         let t_row = self.latent.row(row);
         let mut r2 = 0.0_f64;
         for a in 0..self.latent.latent_dim() {
-            let delta = t_row[a] - self.centers[[center, a]];
+            let delta = t_row[a] - centers[[center, a]];
             r2 += delta * delta;
         }
         let r = r2.sqrt();
@@ -4295,7 +4494,7 @@ impl LatentCoordDesignDerivative {
             // kernel whose q has a finite limit; for kernels where q diverges
             // the value is genuinely indeterminate (0 · ∞) and we must not
             // pretend it is zero. Defer to the kernel's classification.
-            if self.radial_kind.is_smooth_at_collision() {
+            if radial_kind.is_smooth_at_collision() {
                 return Ok(0.0);
             }
             return Err(BasisError::DegenerateAtCollision {
@@ -4306,13 +4505,21 @@ impl LatentCoordDesignDerivative {
                           the design row axis component is undefined",
             });
         }
-        let (_, q, _) = self.radial_kind.eval_design_triplet(r)?;
-        Ok(q * (t_row[axis] - self.centers[[center, axis]]))
+        let (_, q, _) = radial_kind.eval_design_triplet(r)?;
+        Ok(q * (t_row[axis] - centers[[center, axis]]))
     }
 
     fn polynomial_axis_values(&self, row: usize, axis: usize) -> Array1<f64> {
-        let Some(order) = self.polynomial_order else {
-            return Array1::<f64>::zeros(self.n_poly);
+        let LatentCoordDesignDerivativeBasis::Radial {
+            n_poly,
+            polynomial_order,
+            ..
+        } = &self.basis
+        else {
+            return Array1::<f64>::zeros(0);
+        };
+        let Some(order) = *polynomial_order else {
+            return Array1::<f64>::zeros(*n_poly);
         };
         let max_degree = match order {
             DuchonNullspaceOrder::Zero => 0usize,
