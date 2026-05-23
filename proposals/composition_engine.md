@@ -24,7 +24,7 @@ The pitch is not to widen the API surface. It is to recognize that the existing 
 | Smooth decoder `M → ℝ^p` (GP-LVM, principal manifolds, kernel PCA) | multi-output smooth on existing bases | `Smooth` (`gamfit/smooth.py:33`), `Duchon`/`Sphere`/`PeriodicSplineCurve` subclasses, `SmoothTerm` (`src/terms/smooth.rs:320`), `BasisFamily` (`src/terms/basis.rs:216`) |
 | Smoothness / wiggliness selection | `S(ρ)` penalty + REML / LAML | `RemlState::evaluate_unified` (`src/solver/reml/runtime.rs:8051`), `laml_*` proof scaffolding (`src/solver/reml.lean:164-200`) |
 | Latent coordinate estimation (GP-LVM, autoencoder bottleneck) | new parameter block whose design derivatives reuse the ψ-machinery | needs new — see §4(a); pattern is `SpatialLogKappaCoords` (`src/terms/smooth.rs:1765`) |
-| Intrinsic-dimension selection (auto-discovery of latent dim) | ARD: one penalty per latent axis, REML drives unused axes to ∞ | composition of (a) + per-axis `S(ρ)` + existing REML; no new primitive |
+| Intrinsic-dimension selection (auto-discovery of latent dim) | ARD: one penalty per latent axis, REML drives unused axes to ∞ *given a paired gauge fix* (aux-conditional prior or isometry) | composition of (a) + per-axis `S(ρ)` + paired gauge-fix from (b) or (c) + existing REML; no new primitive |
 | Topology choice (S¹, S², torus, Euclidean patch) | basis family + tensor product | `PeriodicSpline1D` (`src/terms/basis.rs:1401`), `SphericalSplineBasisSpec` (2635), `DuchonBasisSpec` (2764), `TensorBSplineSpec` (`src/terms/smooth.rs:295`); TDA persistent cohomology suggests which |
 | Gauge / canonical coordinate (Riemannian isometry to a reference) | structured penalty pinning the pullback metric toward a reference | needs new — see §4(b) |
 | Identifiability via auxiliary variable (iVAE) | conditional prior on the latent block; mechanism sparsity = L¹-like on a sub-block | needs new — see §4(c); reuses `BlockwisePenalty` (`src/terms/smooth.rs:707`) |
@@ -116,11 +116,23 @@ approximated as a sum over either observation locations or a quadrature grid. `e
 
 **Interface.** One new smooth-spec field on `Latent`: `aux: Any | None = None` (column name or array), plus a `prior: Literal["gaussian", "gaussian-mixture", ...]` choice. Internals route to the new `BlockwisePenalty` constructor.
 
+**Regularity conditions (math audit).** The claim that the aux-conditional prior `μ ‖t − h(u)‖²` breaks gauge *and* that `μ` is REML-selectable holds only under three explicit conditions, which the implementation must enforce:
+
+1. **Normaliser present.** The marginal likelihood for `μ` must include the `(N/2) log μ` normaliser (or the appropriate equivalent for the chosen prior family). Without it, optimising over `μ` may pick `0`, `∞`, or be indifferent.
+2. **Regularity of `h`.** `h` must be at least `C¹` (typically `C²`) for the IFT and Hessian-based gradient claims to hold.
+3. **PD on the anchored subspace.** The conditional precision must be positive-definite on the subspace of `T` that `h(u)` actually constrains across the realised rows. (The orthogonal complement is where ARD or another prior must step in if needed.)
+
+Without (1)-(3), the iVAE-style identifiability argument does not transfer; the prior may still regularise but it no longer provably breaks the gauge nor admits clean REML selection of `μ`.
+
 ### 4(d). ARD over latent dimensions
 
-This is a composition, not a primitive. Given `LatentCoords` of dimension `d_max`, place one independent smoothness penalty per latent axis with its own `ρ_k`. REML's normal mode-selection behavior will drive `ρ_k → +∞` (effectively zero contribution) on axes whose evidence does not justify them. The user reads off the intrinsic dimension as the count of finite `ρ_k`. The sloppy-model "hyper-ribbon" diagnostic (Transtrum, Machta, Sethna) — the eigenspectrum of the REML Hessian at convergence — is a geometry-native cross-check: a clean gap between stiff and sloppy directions is the same statement as a clean gap between active and ARD-pruned latent axes.
+This is a composition, not a primitive. Given `LatentCoords` of dimension `d_max`, place one independent smoothness penalty per latent axis with its own `ρ_k`. With the proper marginal-likelihood normalisers — the `(N/2) log α_k` per-axis terms and the determinant/rank corrections — and *paired with a gauge fix from another source* (the aux-conditional prior of §4(c) or the isometry penalty of §4(b)), REML drives unused `ρ_k → +∞` (effectively zero contribution) on axes whose evidence does not justify them. The user reads off the intrinsic dimension as the count of finite `ρ_k`.
 
-No new code. Recipe-level recommendation: `manifold_fit(..., latent_dim=d_max, ard=True)` translates to `[Latent(dim=1, basis=..., name=f"z{k}") for k in range(d_max)]`.
+**Audit caveat — ARD alone is gauge-invariant.** The penalty `α_k ‖t_{·,k}‖²` is rotation-symmetric on T: a rotation of the latent axes simply re-shuffles which dim is "used" vs "unused" while leaving the penalty value unchanged. Without a paired gauge fix and without the normalisers above, ARD does not by itself break the gauge and does not by itself identify intrinsic dim — it only relaxes a basis you have already pinned. The composition (ARD + gauge fix + REML normalisers) is what does the work; the marketing line "ARD discovers intrinsic dim" is shorthand for that composition, not a property of ARD in isolation.
+
+The sloppy-model "hyper-ribbon" diagnostic (Transtrum, Machta, Sethna) — the eigenspectrum of the REML Hessian at convergence — is a geometry-native cross-check: a clean gap between stiff and sloppy directions is the same statement as a clean gap between active and ARD-pruned latent axes, *once gauge is fixed*.
+
+No new code. Recipe-level recommendation: `manifold_fit(..., latent_dim=d_max, ard=True, aux=...)` (or `isometry=True`) translates to `[Latent(dim=1, basis=..., name=f"z{k}") for k in range(d_max)]` plus the requested gauge-breaking prior.
 
 ### 4(e). Geodesic-acceleration Newton patch
 
@@ -146,7 +158,7 @@ model = gamfit.fit(
 Z_hat = model.latent("z")
 ```
 
-REML selects the decoder smoothness; `Latent.init="pca"` gives the standard PCA warm start; the gauge symmetry is broken by adding `IsometryToReference` or by passing `ard=True`. With `ard=True`, the intrinsic dimension is auto-discovered.
+REML selects the decoder smoothness; `Latent.init="pca"` gives the standard PCA warm start; the gauge symmetry is broken by adding `IsometryToReference` or by supplying an auxiliary variable (`aux=`). `ard=True` *given* one of those gauge fixes (plus the proper marginal-likelihood normalisers) auto-discovers the intrinsic dimension; without a paired gauge fix, ARD on its own is rotation-symmetric and does not identify intrinsic dim (§4(d) audit caveat).
 
 ### iVAE-style identifiable representation (replaces hand-rolled VAE)
 
@@ -232,7 +244,7 @@ A `LatentCoords` block uses every step of this pipeline. Step 1 becomes per-obse
 
 ## 7. Open questions and risks
 
-**The gauge symmetry is mathematically load-bearing.** A bare `LatentCoords` block, with no auxiliary variable and no isometry penalty, has a continuous family of equivalent inner minima. The IFT requires *unique* (locally isolated) minima with full-rank inner Hessian; flat valleys violate this. Empirically this was seen in the `auto_71` runs: geodesic-LM converged to identical R² across seeds with Procrustes ≈ 0.99, i.e. the fit was great but the latent was indistinguishable from a smooth diffeomorphic image of any other. The proposal is to make `Latent` *refuse to fit* unless at least one of {`aux`, `IsometryToReference`, `ard=True` with a non-degenerate active set} is supplied. The error message should explain why. This is a stronger position than mgcv takes about its own corner cases and is appropriate here because the failure mode is silent.
+**The gauge symmetry is mathematically load-bearing.** A bare `LatentCoords` block, with no auxiliary variable and no isometry penalty, has a continuous family of equivalent inner minima. The IFT requires *unique* (locally isolated) minima with full-rank inner Hessian; flat valleys violate this. Empirically this was seen in the `auto_71` runs: geodesic-LM converged to identical R² across seeds with Procrustes ≈ 0.99, i.e. the fit was great but the latent was indistinguishable from a smooth diffeomorphic image of any other. The proposal is to make `Latent` *refuse to fit* unless at least one of {`aux`, `IsometryToReference`} is supplied. (ARD on its own is *not* in this list — per the §4(d) audit caveat, `α_k ‖t_{·,k}‖²` is rotation-symmetric and does not break gauge without a paired prior. ARD is a useful *companion* to a gauge fix, not a substitute.) The error message should explain why. This is a stronger position than mgcv takes about its own corner cases and is appropriate here because the failure mode is silent.
 
 **Composability under multiple new primitives.** The REML/IFT machinery is currently exercised with one ψ block and many ρ blocks. With `LatentCoords` (per-observation ψ-like ext-coords), an auxiliary-conditional penalty (data-dependent Gram), and isometry-to-reference (β-and-z-dependent Gram) all in one fit, the unified Hessian gains substantial off-diagonal coupling. The Lean scaffolding (`src/solver/reml.lean`) proves the three-term LAML decomposition without assuming block-diagonality, so the math is fine, but the *numerical* conditioning of the joint Hessian and the *runtime* cost of the IFT solve in this regime need empirical study. A small scaling study (1, 2, 3, 4 simultaneously-active new primitive types) before declaring the manifold workflow stable would be appropriate.
 
@@ -249,3 +261,16 @@ A `LatentCoords` block uses every step of this pipeline. Step 1 becomes per-obse
 - The `final_lm_lambda` warm-start (`src/solver/pirls.rs:1273, 1320`) suggests an existing inner-solver warm-start strategy. For `LatentCoords` whose values change between REML outer iterations, is warm-starting `z` from the previous outer iterate the intended behavior, and is there a hook for that?
 
 A short reply to these from the maintainers would unblock a prototype `LatentCoord` patch that demonstrates the GP-LVM and principal-curve examples end-to-end on the existing test data. The remaining items (isometry, auxiliary prior, geodesic acceleration) are independent and can land in any order.
+
+## 8. Audit revisions
+
+This document was revised in response to a math-audit pass on the original optimistic draft. Tightened claims:
+
+- **§2 tier-assignment table (Manifold/GP-LVM row, intrinsic-dim row).** The intrinsic-dim row now states that ARD discovers intrinsic dim *given* a paired gauge fix from (a)/(b)/(c) and the proper marginal-likelihood normalisers — not as a standalone consequence of ARD.
+- **§4(c) aux-conditional prior.** Three explicit regularity conditions added (normaliser present, `h` at least `C¹`, conditional precision PD on the anchored subspace). The earlier draft asserted "`μ` is REML-selectable" without these.
+- **§4(d) ARD over latent dimensions.** Rewritten to state that `α_k ‖t_{·,k}‖²` is rotation-symmetric and therefore does *not* break gauge by itself. The composition (ARD + paired gauge fix + REML normalisers) is what does the work. The earlier draft conflated "ARD" with "gauge fix + intrinsic-dim discovery."
+- **§5 worked GP-LVM example.** Removed the implication that `ard=True` alone is a sufficient gauge fix.
+- **§7 open questions (Latent refuse-to-fit policy).** ARD removed from the list of acceptable gauge-breaking choices, with the audit caveat cited.
+- **§7 composability under multiple new primitives.** Promoted the earlier footnote about Schur/arrow cost into the main complexity claim: cost is arrow-shaped, but the REML `log|H|` gradient carries a shared `Schur⁻¹` factor handled as one-time-per-outer-iteration setup plus N rank-≤d per-row traces.
+
+Source of caveats: math-audit findings summarised in `/Users/user/.claude/projects/-Users-user-Manifold-SAE/memory/project_gamfit_composition_engine.md` (the "Math-audit findings" section).

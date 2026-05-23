@@ -115,25 +115,53 @@ solutions wander freely along the gauge.
 Three model-level fixes, all exposed as `LatentCoord` configurations:
 
 **(a) `aux_prior`** — conditional prior `p(t | u)` with `u` observed
-(iVAE; Hyvärinen 2019, Khemakhem et al. 2020). Add a regularizer
-`R_id(t, u) = ½ τ · ‖t − g_φ(u)‖²` where `g_φ` is a small learned map
-(ridge / shallow GAM). Different φ have different `g_φ(u)` log-prob,
-so the orbit collapses to a single representative. This is the
-**principled fix**; identifiability of the resulting `t` follows from
-the iVAE result (assuming `u` varies enough across rows).
+(iVAE; Hyvärinen 2019, Khemakhem et al. 2020). Add a regulariser
+`R_id(t, u) = ½ τ · ‖t − h(u)‖²` where `h` is a small learned map
+(ridge / shallow GAM). Different `φ` (latent reparameterisations) give
+different `‖t − h(u)‖²`, so the orbit collapses to a single
+representative. This is the **principled fix**; identifiability of the
+resulting `t` follows from the iVAE result (assuming `u` varies enough
+across rows).
+
+**Regularity conditions (per math audit) — these must hold for the
+claim that `τ` is REML-selectable and gauge is broken:**
+
+1. The marginal likelihood for `τ` must include the `(N/2) log τ`
+   normaliser (or the equivalent for the chosen prior family).
+   Without it, optimising over `τ` can degenerate to `0`, `∞`, or be
+   indifferent — the data-fit/penalty trade-off lacks the term that
+   makes the trade-off well-posed.
+2. `h` must be at least `C¹` (typically `C²` in practice) so the IFT
+   and Hessian claims downstream are well-defined.
+3. The conditional precision `τ · I` (or `Λ(u)` in the Gaussian
+   conditional case) must be positive-definite on the anchored
+   subspace of `T` — i.e. the subspace `h(u)` actually constrains
+   across the realised rows.
+
+If any of (1)-(3) fails, the gauge-breaking and `τ`-selection claims
+do not go through. The implementation should enforce all three (the
+normaliser as a code path, `h` regularity by the basis choice, PD by
+a runtime check on the row-wise design).
 
 **(b) `orthogonality`** — penalize `‖TᵀT/N − I_d‖²_F` after centering
 `T ← T − T̄`. Cheap to compute, kills the rotation + scale gauge, but
 doesn't help with the diffeomorphism gauge for `d > 1`. Useful as a
 warm-start regularizer or a cheap second-best.
 
-**(c) `dim_selection`** — REML on `t` directly. Adding an extra latent
-dimension costs an `O(N)` increase in free parameters; the marginal
-likelihood penalizes this *unless* the data supports a higher-dim
-manifold. This gives an automatic intrinsic-dim estimator that
-matches the spirit of `twoNN` but inside the same loss the model is
-trained against. Combines with (a): aux-prior identifies the active
-dims, REML zeroes out the rest.
+**(c) `dim_selection`** — ARD per latent axis, with REML selecting the
+per-axis precisions `α_j`. **Not a standalone gauge fix.** The penalty
+`α_j ‖t_{·,j}‖²` is rotation-symmetric on `T`: a rotation can re-shuffle
+which axis is "used" vs "unused" without changing the penalty value.
+ARD discovers intrinsic dim only *given* a paired gauge fix from (a) or
+(b) and only when the marginal likelihood includes the proper
+normalisers — the `(N/2) log α_j` per-axis terms and the
+determinant/rank corrections. Under those conditions, REML drives
+`α_j → ∞` on axes the data does not support and the user reads off
+intrinsic dim as the count of finite `α_j`. The intended use is
+**combined**: aux-prior (a) breaks the rotation gauge, ARD (c)
+identifies which axes carry signal. ARD on its own does not break the
+gauge and does not by itself identify intrinsic dim. (Source: math
+audit on the original draft.)
 
 ## 3. API sketch
 
@@ -287,3 +315,29 @@ the Rust work lands.
 5. **Scaling**: for `N = 10⁶`, `(N, d)` is small but the per-row
    row-local Hessian needs the matrix-free CG path. Confirm this falls
    out of the existing infrastructure without new code.
+
+## 7. Audit revisions
+
+This document was revised in response to a math-audit pass on the
+original optimistic draft. Tightened claims:
+
+- **§2.2 arrow Hessian.** Added the explicit caveat that the REML
+  `log|H|` gradient is *not* literally `Σ_i f(t_i)` — it carries a
+  shared `Schur⁻¹` factor. Per outer iteration: one dense `Schur⁻¹`
+  formation + N rank-≤d per-row traces. Cost remains
+  `O(N + decoder-cost)`; arrow shape holds at the cost level. Earlier
+  draft framed rows as "completely independent."
+- **§2.3(a) aux_prior.** Added three explicit regularity conditions
+  required for the gauge-breaking and `τ`-selection claims to hold:
+  `(N/2) log τ` normaliser present, `h` at least `C¹`, conditional
+  precision PD on the anchored subspace. Earlier draft asserted "the
+  principled fix" without these.
+- **§2.3(c) dim_selection.** Rewritten to state that ARD per latent
+  axis is **not** a standalone gauge fix — `α_j ‖t_{·,j}‖²` is
+  rotation-symmetric. ARD discovers intrinsic dim only given (a) or
+  (b) and only with the proper REML normalisers. Earlier draft
+  claimed REML on `t` alone "gives an automatic intrinsic-dim
+  estimator."
+
+Source: math-audit findings in
+`/Users/user/.claude/projects/-Users-user-Manifold-SAE/memory/project_gamfit_composition_engine.md`.

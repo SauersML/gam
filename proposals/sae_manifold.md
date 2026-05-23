@@ -168,9 +168,14 @@ already proposed:
 1. **Atom-label permutation.** Trivial and harmless; collapses on
    `compare_models` by atom-set equivalence.
 2. **On-atom reparameterisation** (the GP-LVM gauge of
-   `latent_coord.md` §2.3). Resolved by ARD on `t_ik` axes plus,
-   optionally, the `IsometryToReference` penalty proposed in
-   `composition_engine.md` §4(b).
+   `latent_coord.md` §2.3). Resolved by the `IsometryToReference`
+   penalty (`composition_engine.md` §4(b)) or by an auxiliary-conditional
+   prior on `t_ik`. ARD on the `t_ik` axes is a useful *companion* — it
+   identifies which axes carry signal once gauge is fixed — but per the
+   math audit it is *not* a standalone gauge fix: `α_j ‖t_{·,j}‖²` is
+   rotation-symmetric, so ARD alone can re-shuffle "used" vs "unused"
+   axes without changing the objective. Combine ARD with the isometry
+   or aux-prior; do not rely on ARD on its own.
 3. **Atom overlap.** When two atoms' decoded sets overlap in
    ℝ^p, the assignment `a_ik` is non-unique on the overlap. The
    conditional-prior route from `composition_engine.md` §4(c) —
@@ -449,9 +454,15 @@ in §7 lands.
 
 **Identifiability minimum.** `composition_engine.md` §7 takes the
 position that `LatentCoord` should refuse to fit absent at least one
-gauge-breaking choice (aux prior, isometry, ARD). The SAE-manifold
-configuration always has ARD on `t` and L¹ on `a`, so the gauge is
-broken by construction; that should suffice, but worth confirming.
+gauge-breaking choice (aux prior, isometry). Per the math audit, ARD
+is **not** on that list: `α_j ‖t_{·,j}‖²` is rotation-symmetric and
+does not by itself break the on-atom reparameterisation gauge. The
+SAE-manifold configuration has ARD on `t` and L¹ on `a`; the L¹ on
+non-negative `a` does pin atom-amplitude scaling, but it does not pin
+the on-atom coordinate gauge. Recommendation: require either
+`IsometryToReference` per atom or an aux-conditional prior tying
+`t_ik` to an observed `u_i` whenever `d_k > 0`. Worth confirming with
+maintainers.
 
 ---
 
@@ -459,3 +470,43 @@ This is one configuration of one engine. Naming it makes the
 shattering pathology stop looking like a feature of SAEs and start
 looking like what it actually is: a basis-mismatch error, fixed by
 giving the basis enough expressive power to track the manifold.
+
+## 9. Audit revisions
+
+This document was revised in response to a math-audit pass on the
+original optimistic draft. Tightened claims:
+
+- **§1 premise.** "REML Occam factor decisively prefers one curved
+  atom over `K` linear shards" softened to "can prefer," with the
+  caveat list cross-referenced to §5.3.
+- **§3.3 tier-assignment of the gradient.** Added an audit caveat
+  describing the shared `Schur⁻¹` factor in the REML `log|H|`
+  gradient. The arrow/Schur cost still holds, but per-row
+  contributions are not literally independent — one Schur inverse is
+  formed per outer iteration and N rank-≤d per-row traces are
+  evaluated against it.
+- **§3.4 identifiability priors (item 2 on-atom reparameterisation).**
+  Removed the claim that ARD on `t_ik` axes is itself a gauge fix.
+  ARD is a useful *companion* to `IsometryToReference` or
+  aux-conditional priors; it is not a substitute.
+- **§4 "Why the existing engine already covers this"
+  (arrow/Schur bullet).** Added the audit caveat about the shared
+  `Schur⁻¹` factor.
+- **§5.3 "Why REML picks the manifold over the shards" → "Why REML
+  may prefer the manifold over the shards".** The determinant proof
+  sketch was wrong as written and has been replaced with the
+  defensible verbatim form from the audit: marginal likelihood may
+  favour the manifold beyond some `K_required` *given* proper prior
+  normalisation, fixed model families, controlled gauge, comparable
+  fit, and smooth-decoder effective dim growing slower than the
+  required linear-shard count. The empirical Curve-SAE 3.7×
+  efficiency result (§5.4) is now the load-bearing argument; the
+  theoretical sketch motivates rather than proves.
+- **§8 identifiability minimum open question.** ARD removed from the
+  list of acceptable standalone gauge fixes; explicit recommendation
+  added that `IsometryToReference` per atom or an aux-conditional
+  prior be required whenever `d_k > 0`.
+
+Source: math-audit findings summarised in
+`/Users/user/.claude/projects/-Users-user-Manifold-SAE/memory/project_gamfit_composition_engine.md`
+(section "Math-audit findings").
