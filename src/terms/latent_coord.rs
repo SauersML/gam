@@ -2,6 +2,18 @@
 //!
 //! See `proposals/latent_coord.md` for the full design.
 //!
+//! The Riemannian update path follows manifold GPLVM practice (mGPLVM;
+//! Jensen/Kao/Tran/Stevenson 2020 and related head-direction / population
+//! manifold work): angular, spherical, and product-topology latents are
+//! updated on their natural manifold instead of as Euclidean coordinates
+//! with basis-side periodic hacks. Retractions and Euclidean-to-Riemannian
+//! Hessian conversion follow Absil/Mahony/Sepulchre (2008) and the Manopt /
+//! Pymanopt implementation pattern. In the audit-revised gauge framing, the
+//! Riemannian update is itself a gauge restriction: Circle/Sphere/Torus
+//! structure identifies the latent up to the corresponding global isometry
+//! (for example one rotation per cycle), not up to the full diffeomorphism
+//! group of an unconstrained Euclidean latent chart.
+//!
 //! ## Summary
 //!
 //! `LatentCoordValues` is the structural sibling of [`SpatialLogKappaCoords`]
@@ -51,6 +63,9 @@
 //! `IsometryToReference` is deferred to a follow-up (see proposal §4(b)).
 
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
+
+const TWO_PI: f64 = std::f64::consts::PI * 2.0;
+const SPHERE_NORMAL_PIN: f64 = 1.0;
 
 /// Choice of auxiliary-prior conditional mean estimator `ĥ(u)`.
 ///
@@ -121,6 +136,309 @@ pub enum LatentIdMode {
     /// uniquely defined. Intended only for the explicit "I supply my own
     /// gauge constraint via the smoothing penalty" pathway.
     None,
+}
+
+/// Natural manifold for per-row latent-coordinate updates.
+///
+/// `Euclidean` preserves the original additive update. `Circle` is a scalar
+/// angular coordinate wrapped modulo `2π`. `Sphere { dim }` is the embedded
+/// unit sphere in `R^dim`, with retraction `(t + ξ) / ||t + ξ||`. `Product`
+/// composes these blockwise; inside a product, `Euclidean` denotes one
+/// unconstrained scalar axis.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LatentManifold {
+    /// Unconstrained `R^d` — the current default.
+    Euclidean,
+    /// Scalar angular coordinate on `S^1`, represented in radians.
+    Circle,
+    /// Embedded unit sphere `S^(dim-1)`.
+    Sphere { dim: usize },
+    /// Closed interval in `R`; the retraction clamps to the boundary.
+    Interval { lo: f64, hi: f64 },
+    /// Product manifold, split block-by-block in row-major ambient storage.
+    Product(Vec<LatentManifold>),
+}
+
+impl Default for LatentManifold {
+    fn default() -> Self {
+        Self::Euclidean
+    }
+}
+
+impl LatentManifold {
+    pub fn is_euclidean(&self) -> bool {
+        matches!(self, Self::Euclidean)
+    }
+
+    pub fn ambient_dim(&self, fallback_dim: usize) -> usize {
+        match self {
+            Self::Euclidean => fallback_dim,
+            Self::Circle | Self::Interval { .. } => 1,
+            Self::Sphere { dim } => *dim,
+            Self::Product(parts) => parts.iter().map(|part| part.ambient_dim(1)).sum(),
+        }
+    }
+
+    /// Project an arbitrary ambient point back to the manifold.
+    pub fn project_point(&self, t: ArrayView1<'_, f64>) -> Array1<f64> {
+        match self {
+            Self::Euclidean => t.to_owned(),
+            Self::Circle => {
+                let mut out = Array1::<f64>::zeros(1);
+                out[0] = wrap_angle(t[0]);
+                out
+            }
+            Self::Sphere { dim } => {
+                debug_assert_eq!(t.len(), *dim);
+                normalize_or_axis(t, *dim)
+            }
+            Self::Interval { lo, hi } => {
+                let mut out = Array1::<f64>::zeros(1);
+                out[0] = t[0].clamp(*lo, *hi);
+                out
+            }
+            Self::Product(parts) => {
+                let mut out = Array1::<f64>::zeros(t.len());
+                let mut offset = 0_usize;
+                for part in parts {
+                    let dim = part.ambient_dim(1);
+                    let projected = part.project_point(t.slice(ndarray::s![offset..offset + dim]));
+                    for a in 0..dim {
+                        out[offset + a] = projected[a];
+                    }
+                    offset += dim;
+                }
+                debug_assert_eq!(offset, t.len());
+                out
+            }
+        }
+    }
+
+    /// Retraction `R_t(ξ)`, using closed-form analytic maps for every variant.
+    pub fn retract(&self, t: ArrayView1<'_, f64>, xi: ArrayView1<'_, f64>) -> Array1<f64> {
+        debug_assert_eq!(t.len(), xi.len());
+        match self {
+            Self::Euclidean => {
+                let mut out = t.to_owned();
+                for a in 0..out.len() {
+                    out[a] += xi[a];
+                }
+                out
+            }
+            Self::Circle => {
+                let mut out = Array1::<f64>::zeros(1);
+                out[0] = wrap_angle(t[0] + xi[0]);
+                out
+            }
+            Self::Sphere { dim } => {
+                debug_assert_eq!(t.len(), *dim);
+                let mut y = Array1::<f64>::zeros(*dim);
+                for a in 0..*dim {
+                    y[a] = t[a] + xi[a];
+                }
+                normalize_or_axis(y.view(), *dim)
+            }
+            Self::Interval { lo, hi } => {
+                let mut out = Array1::<f64>::zeros(1);
+                out[0] = (t[0] + xi[0]).clamp(*lo, *hi);
+                out
+            }
+            Self::Product(parts) => {
+                let mut out = Array1::<f64>::zeros(t.len());
+                let mut offset = 0_usize;
+                for part in parts {
+                    let dim = part.ambient_dim(1);
+                    let next = part.retract(
+                        t.slice(ndarray::s![offset..offset + dim]),
+                        xi.slice(ndarray::s![offset..offset + dim]),
+                    );
+                    for a in 0..dim {
+                        out[offset + a] = next[a];
+                    }
+                    offset += dim;
+                }
+                debug_assert_eq!(offset, t.len());
+                out
+            }
+        }
+    }
+
+    /// Orthogonal projection of an ambient vector onto `T_t M`.
+    pub fn project_to_tangent(
+        &self,
+        t: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        debug_assert_eq!(t.len(), v.len());
+        match self {
+            Self::Euclidean | Self::Circle => v.to_owned(),
+            Self::Sphere { dim } => {
+                debug_assert_eq!(t.len(), *dim);
+                let tv = dot_views(t, v);
+                let mut out = v.to_owned();
+                for a in 0..*dim {
+                    out[a] -= tv * t[a];
+                }
+                out
+            }
+            Self::Interval { lo, hi } => {
+                let mut out = Array1::<f64>::zeros(1);
+                let at_lo = t[0] <= *lo && v[0] < 0.0;
+                let at_hi = t[0] >= *hi && v[0] > 0.0;
+                out[0] = if at_lo || at_hi { 0.0 } else { v[0] };
+                out
+            }
+            Self::Product(parts) => {
+                let mut out = Array1::<f64>::zeros(v.len());
+                let mut offset = 0_usize;
+                for part in parts {
+                    let dim = part.ambient_dim(1);
+                    let projected = part.project_to_tangent(
+                        t.slice(ndarray::s![offset..offset + dim]),
+                        v.slice(ndarray::s![offset..offset + dim]),
+                    );
+                    for a in 0..dim {
+                        out[offset + a] = projected[a];
+                    }
+                    offset += dim;
+                }
+                debug_assert_eq!(offset, v.len());
+                out
+            }
+        }
+    }
+
+    /// Convert Euclidean Hessian action `eh · xi` to Riemannian Hessian action.
+    ///
+    /// For the sphere this is the Absil/Mahony/Sepulchre embedded-sphere
+    /// conversion: differentiate the projected gradient and project back to
+    /// the tangent space. The ambient derivative includes the normal
+    /// curvature term `-<grad_R, ξ> t`; the tangent action is equivalent to
+    /// `P_t(eh ξ) - <eg, t> ξ`.
+    pub fn euclidean_to_riemannian_hessian(
+        &self,
+        t: ArrayView1<'_, f64>,
+        eg: ArrayView1<'_, f64>,
+        eh: ArrayView2<'_, f64>,
+        xi: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        debug_assert_eq!(t.len(), eg.len());
+        debug_assert_eq!(t.len(), xi.len());
+        debug_assert_eq!(eh.nrows(), t.len());
+        debug_assert_eq!(eh.ncols(), t.len());
+        match self {
+            Self::Euclidean | Self::Circle | Self::Interval { .. } => {
+                let eh_xi = matvec(eh, xi);
+                self.project_to_tangent(t, eh_xi.view())
+            }
+            Self::Sphere { dim } => {
+                debug_assert_eq!(t.len(), *dim);
+                let grad_r = self.project_to_tangent(t, eg);
+                let eh_xi = matvec(eh, xi);
+                let mut ambient = self.project_to_tangent(t, eh_xi.view());
+                let eg_normal = dot_views(eg, t);
+                let normal_curve = dot_views(grad_r.view(), xi);
+                for a in 0..*dim {
+                    ambient[a] -= eg_normal * xi[a];
+                    ambient[a] -= normal_curve * t[a];
+                }
+                self.project_to_tangent(t, ambient.view())
+            }
+            Self::Product(parts) => {
+                let mut out = Array1::<f64>::zeros(t.len());
+                let mut offset = 0_usize;
+                for part in parts {
+                    let dim = part.ambient_dim(1);
+                    let block = eh.slice(ndarray::s![offset..offset + dim, offset..offset + dim]);
+                    let converted = part.euclidean_to_riemannian_hessian(
+                        t.slice(ndarray::s![offset..offset + dim]),
+                        eg.slice(ndarray::s![offset..offset + dim]),
+                        block,
+                        xi.slice(ndarray::s![offset..offset + dim]),
+                    );
+                    for a in 0..dim {
+                        out[offset + a] = converted[a];
+                    }
+                    offset += dim;
+                }
+                debug_assert_eq!(offset, t.len());
+                out
+            }
+        }
+    }
+
+    /// Dense ambient matrix representation of the tangent Hessian action.
+    ///
+    /// Normal directions are pinned with an identity block for embedded
+    /// constrained factors so existing BA Cholesky code can factor the ambient
+    /// matrix while RHS/cross blocks stay tangent-projected.
+    pub fn riemannian_hessian_matrix(
+        &self,
+        t: ArrayView1<'_, f64>,
+        eg: ArrayView1<'_, f64>,
+        eh: ArrayView2<'_, f64>,
+    ) -> Array2<f64> {
+        let d = t.len();
+        let mut out = Array2::<f64>::zeros((d, d));
+        let mut xi = Array1::<f64>::zeros(d);
+        for a in 0..d {
+            xi.fill(0.0);
+            xi[a] = 1.0;
+            let tangent_xi = self.project_to_tangent(t, xi.view());
+            let col = self.euclidean_to_riemannian_hessian(t, eg, eh, tangent_xi.view());
+            for b in 0..d {
+                out[[b, a]] = col[b];
+            }
+        }
+        self.add_normal_pinning(t, &mut out);
+        symmetrize(&mut out);
+        out
+    }
+
+    /// Project every column of an ambient matrix into `T_t M`.
+    pub fn project_matrix_columns_to_tangent(
+        &self,
+        t: ArrayView1<'_, f64>,
+        matrix: ArrayView2<'_, f64>,
+    ) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros(matrix.dim());
+        for col_idx in 0..matrix.ncols() {
+            let col = self.project_to_tangent(t, matrix.column(col_idx));
+            for row_idx in 0..matrix.nrows() {
+                out[[row_idx, col_idx]] = col[row_idx];
+            }
+        }
+        out
+    }
+
+    fn add_normal_pinning(&self, t: ArrayView1<'_, f64>, matrix: &mut Array2<f64>) {
+        match self {
+            Self::Sphere { dim } => {
+                debug_assert_eq!(t.len(), *dim);
+                for a in 0..*dim {
+                    for b in 0..*dim {
+                        matrix[[a, b]] += SPHERE_NORMAL_PIN * t[a] * t[b];
+                    }
+                }
+            }
+            Self::Product(parts) => {
+                let mut offset = 0_usize;
+                for part in parts {
+                    let dim = part.ambient_dim(1);
+                    let mut block = matrix
+                        .slice_mut(ndarray::s![offset..offset + dim, offset..offset + dim]);
+                    let mut owned = block.to_owned();
+                    part.add_normal_pinning(
+                        t.slice(ndarray::s![offset..offset + dim]),
+                        &mut owned,
+                    );
+                    block.assign(&owned);
+                    offset += dim;
+                }
+            }
+            Self::Euclidean | Self::Circle | Self::Interval { .. } => {}
+        }
+    }
 }
 
 impl LatentIdMode {
@@ -197,11 +515,22 @@ pub struct LatentCoordValues {
     latent_dim: usize,
     /// Identifiability / gauge-fix mode.
     id_mode: LatentIdMode,
+    /// Manifold used for per-row Riemannian updates.
+    manifold: LatentManifold,
 }
 
 impl LatentCoordValues {
     /// Construct from a dense `(n_obs, latent_dim)` matrix.
     pub fn from_matrix(matrix: ArrayView2<'_, f64>, id_mode: LatentIdMode) -> Self {
+        Self::from_matrix_with_manifold(matrix, id_mode, LatentManifold::Euclidean)
+    }
+
+    /// Construct from a dense matrix and explicit latent manifold.
+    pub fn from_matrix_with_manifold(
+        matrix: ArrayView2<'_, f64>,
+        id_mode: LatentIdMode,
+        manifold: LatentManifold,
+    ) -> Self {
         id_mode.reject_dim_selection_alone();
         let n_obs = matrix.nrows();
         let latent_dim = matrix.ncols();
@@ -211,12 +540,15 @@ impl LatentCoordValues {
                 values[n * latent_dim + k] = matrix[[n, k]];
             }
         }
-        Self {
+        let mut out = Self {
             values,
             n_obs,
             latent_dim,
             id_mode,
-        }
+            manifold,
+        };
+        out.project_all_rows_to_manifold();
+        out
     }
 
     /// Construct directly from a flat (`n_obs * latent_dim`) array.
@@ -226,6 +558,17 @@ impl LatentCoordValues {
         latent_dim: usize,
         id_mode: LatentIdMode,
     ) -> Self {
+        Self::from_flat_with_manifold(values, n_obs, latent_dim, id_mode, LatentManifold::Euclidean)
+    }
+
+    /// Construct directly from a flat array and explicit latent manifold.
+    pub fn from_flat_with_manifold(
+        values: Array1<f64>,
+        n_obs: usize,
+        latent_dim: usize,
+        id_mode: LatentIdMode,
+        manifold: LatentManifold,
+    ) -> Self {
         id_mode.reject_dim_selection_alone();
         debug_assert_eq!(
             values.len(),
@@ -234,12 +577,15 @@ impl LatentCoordValues {
             values.len(),
             n_obs * latent_dim
         );
-        Self {
+        let mut out = Self {
             values,
             n_obs,
             latent_dim,
             id_mode,
-        }
+            manifold,
+        };
+        out.project_all_rows_to_manifold();
+        out
     }
 
     pub fn n_obs(&self) -> usize {
@@ -261,6 +607,20 @@ impl LatentCoordValues {
 
     pub fn id_mode(&self) -> &LatentIdMode {
         &self.id_mode
+    }
+
+    pub fn manifold(&self) -> &LatentManifold {
+        &self.manifold
+    }
+
+    pub fn with_manifold(&self, manifold: LatentManifold) -> Self {
+        Self::from_flat_with_manifold(
+            self.values.clone(),
+            self.n_obs,
+            self.latent_dim,
+            self.id_mode.clone(),
+            manifold,
+        )
     }
 
     /// View the flat value array.
@@ -292,6 +652,43 @@ impl LatentCoordValues {
     pub fn set_flat(&mut self, flat: ArrayView1<'_, f64>) {
         debug_assert_eq!(flat.len(), self.values.len());
         self.values.assign(&flat);
+        self.project_all_rows_to_manifold();
+    }
+
+    /// Apply a flat tangent update row-by-row through the manifold retraction.
+    pub fn retract_flat_delta(&mut self, delta: ArrayView1<'_, f64>) {
+        debug_assert_eq!(delta.len(), self.values.len());
+        if self.manifold.is_euclidean() {
+            for (t, dt) in self.values.iter_mut().zip(delta.iter()) {
+                *t += *dt;
+            }
+            return;
+        }
+        for n in 0..self.n_obs {
+            let start = n * self.latent_dim;
+            let end = start + self.latent_dim;
+            let current = self.values.slice(ndarray::s![start..end]);
+            let xi = delta.slice(ndarray::s![start..end]);
+            let next = self.manifold.retract(current, xi);
+            for a in 0..self.latent_dim {
+                self.values[start + a] = next[a];
+            }
+        }
+    }
+
+    fn project_all_rows_to_manifold(&mut self) {
+        if self.manifold.is_euclidean() {
+            return;
+        }
+        debug_assert_eq!(self.manifold.ambient_dim(self.latent_dim), self.latent_dim);
+        for n in 0..self.n_obs {
+            let start = n * self.latent_dim;
+            let end = start + self.latent_dim;
+            let projected = self.manifold.project_point(self.values.slice(ndarray::s![start..end]));
+            for a in 0..self.latent_dim {
+                self.values[start + a] = projected[a];
+            }
+        }
     }
 
     /// Apply this latent block back to a `TermCollectionSpec`-style covariate
@@ -495,6 +892,64 @@ impl LatentCoordValues {
             for a in 0..d {
                 grad_t[n * d + a] += row_scale * (t_n[a] - centers[[k, a]]);
             }
+        }
+    }
+}
+
+fn wrap_angle(x: f64) -> f64 {
+    let y = x.rem_euclid(TWO_PI);
+    if y == TWO_PI { 0.0 } else { y }
+}
+
+fn normalize_or_axis(v: ArrayView1<'_, f64>, dim: usize) -> Array1<f64> {
+    let mut norm_sq = 0.0_f64;
+    for a in 0..dim {
+        norm_sq += v[a] * v[a];
+    }
+    if norm_sq <= 0.0 || !norm_sq.is_finite() {
+        let mut out = Array1::<f64>::zeros(dim);
+        if dim > 0 {
+            out[0] = 1.0;
+        }
+        return out;
+    }
+    let inv = 1.0 / norm_sq.sqrt();
+    let mut out = Array1::<f64>::zeros(dim);
+    for a in 0..dim {
+        out[a] = v[a] * inv;
+    }
+    out
+}
+
+fn dot_views(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut acc = 0.0_f64;
+    for i in 0..a.len() {
+        acc += a[i] * b[i];
+    }
+    acc
+}
+
+fn matvec(a: ArrayView2<'_, f64>, x: ArrayView1<'_, f64>) -> Array1<f64> {
+    debug_assert_eq!(a.ncols(), x.len());
+    let mut out = Array1::<f64>::zeros(a.nrows());
+    for i in 0..a.nrows() {
+        let mut acc = 0.0_f64;
+        for j in 0..a.ncols() {
+            acc += a[[i, j]] * x[j];
+        }
+        out[i] = acc;
+    }
+    out
+}
+
+fn symmetrize(a: &mut Array2<f64>) {
+    let n = a.nrows().min(a.ncols());
+    for i in 0..n {
+        for j in 0..i {
+            let v = 0.5 * (a[[i, j]] + a[[j, i]]);
+            a[[i, j]] = v;
+            a[[j, i]] = v;
         }
     }
 }

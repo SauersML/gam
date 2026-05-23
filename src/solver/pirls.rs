@@ -10408,7 +10408,7 @@ pub fn latent_apply_ift_warm_start(
     let d = latent.latent_dim();
     debug_assert_eq!(delta_t.len(), n * d);
     let mut clamped_rows = 0_usize;
-    let mut new_flat = latent.as_flat().clone();
+    let mut applied = ndarray::Array1::<f64>::zeros(n * d);
     for i in 0..n {
         let mut row_norm_sq = 0.0_f64;
         for a in 0..d {
@@ -10423,10 +10423,10 @@ pub fn latent_apply_ift_warm_start(
             1.0
         };
         for a in 0..d {
-            new_flat[i * d + a] += scale * delta_t[i * d + a];
+            applied[i * d + a] = scale * delta_t[i * d + a];
         }
     }
-    latent.set_flat(new_flat.view());
+    latent.retract_flat_delta(applied.view());
     clamped_rows
 }
 
