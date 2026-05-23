@@ -3428,22 +3428,56 @@ fn latent_input_location_jet(
                 },
             ))
         }
-        "matern" => Err(
-            "LatentCoord Matérn input-location derivative hook is reserved for matern_radial_first_derivative_nd"
-                .to_string(),
-        ),
-        "sphere" => Err(
-            "LatentCoord sphere input-location derivative hook is reserved for sphere_first_derivative_nd"
-                .to_string(),
-        ),
+        "matern" => {
+            // Fixes audit-revised claim that non-Duchon latent input-location
+            // derivatives must use the closed-form helper instead of stubbing.
+            let phi_r = matern_radial_first_derivative_nd(t_mat, centers, 1.0, MaternNu::ThreeHalves)
+                .map_err(|err| err.to_string())?;
+            Ok(latent.design_gradient_wrt_t_dispatch(
+                InputLocationDerivative::Radial {
+                    kernel_first_derivative: phi_r.view(),
+                    centers,
+                },
+            ))
+        }
+        "sphere" => {
+            // Fixes audit-revised claim that sphere latent derivatives are
+            // analytic jets, not unsupported hooks.
+            let jet = sphere_first_derivative_nd(t_mat, centers, m).map_err(|err| err.to_string())?;
+            Ok(latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Jet(
+                jet.view(),
+            )))
+        }
         "bspline_tensor" => Err(
-            "LatentCoord tensor B-spline input-location derivative hook is reserved for bspline_tensor_first_derivative"
+            "LatentCoord tensor B-spline input-location derivative requires per-axis knot metadata; \
+             bspline_tensor_first_derivative is available but gaussian_reml_fit_latent_backward \
+             currently passes only centers"
                 .to_string(),
         ),
-        "periodic_bspline" => Err(
-            "LatentCoord periodic B-spline input-location derivative hook is reserved for periodic_bspline_first_derivative_nd"
-                .to_string(),
-        ),
+        "periodic_bspline" => {
+            // Fixes audit-revised claim that periodic latent derivatives are
+            // analytic jets. The latent pyffi path carries only centers today,
+            // so infer the period from the first center column.
+            if centers.ncols() != 1 || centers.nrows() == 0 {
+                return Err(
+                    "periodic B-spline latent derivative requires one-column centers".to_string(),
+                );
+            }
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for &value in centers.column(0).iter() {
+                lo = lo.min(value);
+                hi = hi.max(value);
+            }
+            if !(lo.is_finite() && hi.is_finite() && hi > lo) {
+                return Err("periodic B-spline centers must define a finite range".to_string());
+            }
+            let jet = periodic_bspline_first_derivative_nd(t_mat, (lo, hi), m, centers.nrows())
+                .map_err(|err| err.to_string())?;
+            Ok(latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Jet(
+                jet.view(),
+            )))
+        }
         _ => unreachable!("latent_basis_kind returned an unknown normalized kind"),
     }
 }
@@ -3645,8 +3679,7 @@ fn gaussian_reml_fit_latent_impl(
     // The forward path's responsibility is to produce a self-consistent fit
     // at the current t; the outer loop owns the gauge enforcement (it adds
     // ∂R_id/∂t to grad_t and walks t under that combined gradient).
-    let _ = (aux_u, aux_family, aux_strength, dim_selection_precision, &t_mat);
-    let fit = gaussian_reml_multi_closed_form_with_cache(
+    let mut fit = gaussian_reml_multi_closed_form_with_cache(
         design.view(),
         y,
         penalty,
@@ -3655,6 +3688,50 @@ fn gaussian_reml_fit_latent_impl(
         None,
     )
     .map_err(|err| err.to_string())?;
+    // Fixes audit-revised claim that ARD / aux-prior REML selection requires
+    // normalized priors, not raw quadratic corrections alone.
+    let mut latent_prior_score = 0.0_f64;
+    if let Some(u_view) = aux_u {
+        let targets = aux_prior_targets(t_mat.view(), u_view, aux_family)?;
+        let mu = aux_strength.unwrap_or(1.0);
+        if !(mu.is_finite() && mu > 0.0) {
+            return Err(format!("aux_strength must be finite and positive; got {mu}"));
+        }
+        let mut sq = 0.0_f64;
+        for n in 0..n_obs {
+            for a in 0..latent_dim {
+                let diff = t_mat[[n, a]] - targets[[n, a]];
+                sq += diff * diff;
+            }
+        }
+        let effective_dim = (n_obs * latent_dim) as f64;
+        latent_prior_score += 0.5 * mu * sq - 0.5 * effective_dim * mu.ln();
+    }
+    if let Some(log_prec) = dim_selection_precision {
+        if log_prec.len() != latent_dim {
+            return Err(format!(
+                "dim_selection_log_precision length {} must equal latent_dim {}",
+                log_prec.len(),
+                latent_dim
+            ));
+        }
+        for a in 0..latent_dim {
+            let log_alpha = log_prec[a];
+            let alpha = log_alpha.exp();
+            if !(alpha.is_finite() && alpha > 0.0) {
+                return Err(format!(
+                    "dim_selection_log_precision[{a}] must exponentiate to a finite positive precision"
+                ));
+            }
+            let mut sq = 0.0_f64;
+            for n in 0..n_obs {
+                let v = t_mat[[n, a]];
+                sq += v * v;
+            }
+            latent_prior_score += 0.5 * alpha * sq - 0.5 * (n_obs as f64) * log_alpha;
+        }
+    }
+    fit.reml_score += latent_prior_score;
     Ok((fit, design))
 }
 

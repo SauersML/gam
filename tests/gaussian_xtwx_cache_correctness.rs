@@ -130,6 +130,7 @@ fn fit_at_rho(
         firth_bias_reduction: false,
         initial_lm_lambda: None,
         geodesic_acceleration: false,
+        arrow_schur: None,
     };
     let (result, _working) = fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(array![rho].view()),
