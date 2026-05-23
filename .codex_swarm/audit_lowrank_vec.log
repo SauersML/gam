@@ -3287,3 +3287,46 @@ src/families/vector_response.rs:270:/// `vector_noise.as_low_rank_weight()` → 
 src/families/vector_response.rs:297:    likelihood: &dyn VectorLikelihood,
 src/families/mod.rs:25:    GaussianVectorLikelihood, PerRowHessianBlock, VectorLikelihood, VectorNoise,
 
+codex
+FINDINGS
+
+1. [src/linalg/low_rank_weight.rs:173](/Users/user/gam/src/linalg/low_rank_weight.rs:173)  
+   Wrong expression: `std::ptr::eq(self.u.as_ptr(), self.v.as_ptr()) && self.u.shape() == self.v.shape()`  
+   This can falsely treat `U == V` for valid ndarray views with the same pointer and shape but different strides, e.g. a square matrix view and its transpose. Then line 176 uses `xtu.clone()`, computing `(X^T U)(X^T U)^T` instead of `(X^T U)(X^T V)^T`.  
+   Correct condition: either always compute `X^T V`, or require equal pointer, shape, and strides before reusing `xtu`.  
+   Derivation: for `W = D + U V^T`, `X^T W X = X^T D X + X^T U V^T X = X^T D X + (X^T U)(X^T V)^T`.  
+   Severity: definitive.
+
+2. [src/families/vector_response.rs:114](/Users/user/gam/src/families/vector_response.rs:114)  
+   Wrong expression: `out[j] = 1.0 / d;`  
+   `VectorNoise::LowRank` is documented as precision/weight form `W = diag(diag) + factor factor^T`, and `as_low_rank_weight` passes `diag` directly into `LowRankWeight::symmetric`. Inverting it makes the Gaussian likelihood derivatives use the covariance diagonal reciprocal of the intended precision diagonal.  
+   Correct expression: `out[j] = d;`  
+   Derivation: for Gaussian identity with precision `W`, `ell = -1/2 r^T W r`, `∂ell/∂η = W r`, and `-∂²ell/∂η² = W`; the diagonal precision contribution is `d_j`, not `1/d_j`.  
+   Severity: definitive.
+
+3. [src/families/vector_response.rs:225](/Users/user/gam/src/families/vector_response.rs:225)  
+   Wrong expression: `row_acc += self.precision[m] * r * r;` for `VectorNoise::LowRank` targets accepted by `GaussianVectorLikelihood::from_target`. The low-rank precision term is dropped from the likelihood, and correspondingly from the gradient/Hessian at lines 240 and 253.  
+   Correct expression for row residual `r`: `row_acc = Σ_m d_m r_m^2 + ||F^T r||^2`; `grad_eta = row_weight * (diag(d) + F F^T) r`; `-H = row_weight * (diag(d) + F F^T)`.  
+   Severity: definitive.
+tokens used
+56,820
+FINDINGS
+
+1. [src/linalg/low_rank_weight.rs:173](/Users/user/gam/src/linalg/low_rank_weight.rs:173)  
+   Wrong expression: `std::ptr::eq(self.u.as_ptr(), self.v.as_ptr()) && self.u.shape() == self.v.shape()`  
+   This can falsely treat `U == V` for valid ndarray views with the same pointer and shape but different strides, e.g. a square matrix view and its transpose. Then line 176 uses `xtu.clone()`, computing `(X^T U)(X^T U)^T` instead of `(X^T U)(X^T V)^T`.  
+   Correct condition: either always compute `X^T V`, or require equal pointer, shape, and strides before reusing `xtu`.  
+   Derivation: for `W = D + U V^T`, `X^T W X = X^T D X + X^T U V^T X = X^T D X + (X^T U)(X^T V)^T`.  
+   Severity: definitive.
+
+2. [src/families/vector_response.rs:114](/Users/user/gam/src/families/vector_response.rs:114)  
+   Wrong expression: `out[j] = 1.0 / d;`  
+   `VectorNoise::LowRank` is documented as precision/weight form `W = diag(diag) + factor factor^T`, and `as_low_rank_weight` passes `diag` directly into `LowRankWeight::symmetric`. Inverting it makes the Gaussian likelihood derivatives use the covariance diagonal reciprocal of the intended precision diagonal.  
+   Correct expression: `out[j] = d;`  
+   Derivation: for Gaussian identity with precision `W`, `ell = -1/2 r^T W r`, `∂ell/∂η = W r`, and `-∂²ell/∂η² = W`; the diagonal precision contribution is `d_j`, not `1/d_j`.  
+   Severity: definitive.
+
+3. [src/families/vector_response.rs:225](/Users/user/gam/src/families/vector_response.rs:225)  
+   Wrong expression: `row_acc += self.precision[m] * r * r;` for `VectorNoise::LowRank` targets accepted by `GaussianVectorLikelihood::from_target`. The low-rank precision term is dropped from the likelihood, and correspondingly from the gradient/Hessian at lines 240 and 253.  
+   Correct expression for row residual `r`: `row_acc = Σ_m d_m r_m^2 + ||F^T r||^2`; `grad_eta = row_weight * (diag(d) + F F^T) r`; `-H = row_weight * (diag(d) + F F^T)`.  
+   Severity: definitive.

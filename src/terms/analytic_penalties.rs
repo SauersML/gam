@@ -1261,13 +1261,20 @@ impl AnalyticPenalty for SparsityPenalty {
                 lam * acc
             }
             SparsityKind::Hoyer => {
+                // Normalized anti-sparsity penalty
+                //   P(x) = (||x||_1 / ||x||_2 - 1) / (sqrt(n) - 1)
+                // maps [1, sqrt(n)] -> [0, 1]. A perfectly dense
+                // equal-magnitude vector hits ||x||_1/||x||_2 = sqrt(n),
+                // so P = 1; a 1-sparse vector has ratio 1, so P = 0
+                // (sparse vectors minimize the penalty).
                 let n = target.len() as f64;
+                debug_assert!(n > 1.0, "Hoyer requires n > 1");
                 let l1: f64 = target.iter().map(|x| x.abs()).sum();
                 let l2: f64 = target.iter().map(|x| x * x).sum::<f64>().sqrt();
                 if l2 == 0.0 {
                     return 0.0;
                 }
-                let h = (n.sqrt() * l1 / l2 - 1.0) / (n.sqrt() - 1.0);
+                let h = (l1 / l2 - 1.0) / (n.sqrt() - 1.0);
                 lam * h
             }
             SparsityKind::Log { .. } => {
