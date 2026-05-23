@@ -535,9 +535,8 @@ impl ArrowRowBlock {
 ///      `H_tt^(i) += (g_i β)(g_i β)^T`, `H_tβ^(i) += (g_i β) ⊗ Φ_i`,
 ///      `H_ββ += Φ^T W Φ + Σ_k λ_k S_k`;
 ///   3. calls [`ArrowSchurSystem::add_analytic_penalty_contributions`] to
-///      fold the registered analytic penalties (`IsometryPenalty`,
-///      `ARDPenalty`, `SparsityPenalty`) into the appropriate `H_tt^(i)`
-///      diagonal/dense block (Psi tier) and into `H_ββ` (Beta tier);
+///      fold row-block Psi-tier analytic penalties (`ARDPenalty`,
+///      `SparsityPenalty`) into `H_tt^(i)` and Beta-tier penalties into `H_ββ`;
 ///   4. calls [`ArrowSchurSystem::solve`] to obtain `(Δt, Δβ)`.
 pub struct ArrowSchurSystem {
     /// Per-row latent block (length `N`, each row `d × d` / `d × K` / `d`).
@@ -642,12 +641,10 @@ impl ArrowSchurSystem {
     /// **Composition path.** Each registered [`AnalyticPenaltyKind`] is
     /// queried for `grad_target` (added to `g_t` or `g_β`) and then for
     /// `hessian_diag` first. Diagonal penalties (ARD and the shipped
-    /// sparsity kernels) are injected directly. Dense penalties fall back to
-    /// `hvp` probes against the canonical basis vectors restricted to the
-    /// per-row `d`-block (when `tier == Psi`) or against `β` (when `tier ==
-    /// Beta`). The extension-coordinate contributions land on the per-row `H_tt^(i)`
-    /// **only** — we rely on the analytic-penalty contract that Psi-tier
-    /// penalties are row-block-diagonal in their Hessian.
+    /// sparsity kernels) are injected directly. Psi-tier penalties with
+    /// off-row Hessian blocks are rejected because the arrow representation
+    /// has no place to store them. Dense Beta-tier penalties still fall back
+    /// to `hvp` probes against the canonical basis vectors for `β`.
     ///
     /// `target_t` is the full flat latent-coordinate vector (row-major, `N·d` entries)
     /// at the current iterate; `target_beta` is the current `β`. `rho`
@@ -742,13 +739,9 @@ impl ArrowSchurSystem {
             return;
         }
 
-        // Dense Hessian: probe via HVP against each unit-`d`-vector for each row.
-        // For row-block penalties (such as Isometry's metric-residual GN
-        // operator) this yields the per-row `d × d` block. For penalties that
-        // would couple rows the off-row entries are silently dropped — a
-        // design choice consistent with the arrow-shape precondition. The
-        // analytic-penalty contract documents that extension-coordinate penalties
-        // *must* be row-block-diagonal in their Hessian.
+        // Dense row-block Hessian: probe via HVP against each unit-`d`-vector
+        // for each row. The public registry entry rejects Psi-tier penalties
+        // with off-row Hessian blocks before this point.
         let mut probe = Array1::<f64>::zeros(n * d);
         for a in 0..d {
             // One probe per latent axis: set the `a`-th column of each
