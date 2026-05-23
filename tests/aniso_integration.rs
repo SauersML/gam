@@ -88,7 +88,7 @@ fn aniso_matern_recovers_signal_axis() {
     };
 
     let result = gam::fit_model(FitRequest::Standard(StandardFitRequest {
-        data: x.view(),
+        data: x.to_owned(),
         y,
         weights,
         offset,
@@ -117,6 +117,8 @@ fn aniso_matern_recovers_signal_axis() {
         wiggle_options: None,
         coefficient_groups: Vec::new(),
         penalty_block_gamma_priors: Vec::new(),
+        latent_coord: None,
+        _marker: std::marker::PhantomData,
     }))
     .expect("anisotropic Matérn fit should converge");
 
