@@ -2798,22 +2798,6 @@ fn sample_standard_normal<R: rand::Rng + ?Sized>(rng: &mut R) -> f64 {
     (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
 }
 
-#[inline]
-fn forward_solve_lower_triangular(l: &Array2<f64>, rhs: &Array1<f64>, out: &mut Array1<f64>) {
-    let p = rhs.len();
-    debug_assert_eq!(l.nrows(), p);
-    debug_assert_eq!(l.ncols(), p);
-    debug_assert_eq!(out.len(), p);
-    for i in 0..p {
-        let mut v = rhs[i];
-        for j in 0..i {
-            v -= l[[i, j]] * out[j];
-        }
-        let d = l[[i, i]];
-        out[i] = if d.abs() > 1e-14 { v / d } else { 0.0 };
-    }
-}
-
 /// Back-substitution against `L^T x = rhs`, with `L` a lower-triangular factor.
 ///
 /// For `Q = L Lᵀ`, a draw `x ~ N(0, Q⁻¹)` is obtained from `z ~ N(0, I)` via

@@ -423,8 +423,9 @@ pub struct IsometryPenalty {
     /// the exact chain-rule path for callers that do not pre-cache `∂J/∂t`.
     pub duchon_radial_source: Option<Arc<IsometryDuchonRadialSource>>,
     /// Optional cached per-row Jacobian *third derivative*
-    /// `K_n ∈ ℝ^{p × d × d × d}`, flattened row-major as
-    /// `(n_obs, p * d * d * d)`. When present, `hvp` uses the full
+    /// `K_n ∈ ℝ^{p × d × d × d}`, stored as an `Array3` with shape
+    /// `(n_obs, p, d * d * d)` where the third axis packs `(a, c, d)` in
+    /// row-major order `((a * d) + c) * d + dd`. When present, `hvp` uses the full
     /// residual-curvature Hessian (proposal §4(b)):
     ///   B_{ab,cd} = K_{a,cd}^T W J_b + H_{a,c}^T W H_{b,d}
     ///             + H_{a,d}^T W H_{b,c} + J_a^T W K_{b,cd}.
@@ -801,12 +802,31 @@ impl AnalyticPenalty for IsometryPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        // Metric-residual Gauss-Newton HVP:
-        //   Hv = μ A^T A v,  A_c = ∂vec(g)/∂t_c.
-        // This is the HVP analogue of the exact gradient path above: `A`
-        // includes `∂J/∂t` via the radial `φ''(r)` jet. The residual-curvature
-        // term `Σ_ab D_ab ∂²g_ab/∂t∂t` would require third input derivatives
-        // of the decoder and is intentionally not part of this GN operator.
+        // Isometry Hessian-vector product.
+        //
+        // The full Hessian of P_iso = (μ/2) Σ_n ||J^T W J - G_ref||²_F
+        // (per proposal §4(b)) is
+        //   ∂²P/∂t_c ∂t_d = μ Σ_{a,b} [
+        //       ∂g_{ab}/∂t_c · ∂g_{ab}/∂t_d                  (GN piece)
+        //     + (g_{ab} - g^ref_{ab}) · B_{ab,cd}             (residual piece)
+        //   ],
+        //   B_{ab,cd} = K_{a,cd}^T W J_b + H_{a,c}^T W H_{b,d}
+        //             + H_{a,d}^T W H_{b,c} + J_a^T W K_{b,cd},
+        // where K is the third decoder derivative and H is the second.
+        //
+        // When `cache_third_decoder_derivative` is present we use the
+        // full Hessian. When absent — the current default for callers
+        // that have not pre-built a `K` jet — we FALL BACK to the
+        // GAUSS-NEWTON surrogate `Hv = μ A^T A v` with `A_c = ∂vec(g)/∂t_c`,
+        // which drops the residual-curvature term entirely.
+        //
+        // THE GAUSS-NEWTON FORM IS AN APPROXIMATION, NOT THE EXACT HESSIAN.
+        // It is symmetric PSD by construction (good for the canonical
+        // PIRLS / log-det pipeline) and matches the true Hessian whenever
+        // the residual g − g^ref is small (near a feasible isometric
+        // embedding), but at large residuals the GN HVP undercounts
+        // curvature in a direction-dependent way. Provide
+        // `cache_third_decoder_derivative` to switch to the exact form.
         let mu = rho[self.rho_index].exp();
         let d = self
             .target
@@ -815,6 +835,9 @@ impl AnalyticPenalty for IsometryPenalty {
         let n_obs = target.len() / d;
         let p = self.p_out;
         let jac2 = self.jacobian_second(target, n_obs, d);
+        let k_cache = self.cache_third_decoder_derivative.as_ref();
+        let g = self.pullback_metric(d);
+        let g_ref = self.reference_metric(n_obs, d);
         let mut out = Array1::<f64>::zeros(v.len());
 
         for n in 0..n_obs {
@@ -849,6 +872,52 @@ impl AnalyticPenalty for IsometryPenalty {
                     }
                 }
                 out[n * d + c] = mu * acc;
+            }
+
+            // Residual-curvature contribution. Only available when the
+            // third decoder derivative `K` is provided. Otherwise the
+            // GN surrogate above is used and the doc comment makes the
+            // approximation explicit.
+            if let Some(k) = k_cache {
+                // K shape: (n_obs, p, d*d*d) flattened so the third axis
+                // index is ((i*d + a)*d + c)*d + dd. Iterate every term.
+                for c in 0..d {
+                    let mut acc_res = 0.0;
+                    for a in 0..d {
+                        for b in 0..d {
+                            let diff = g[[n, a * d + b]] - g_ref[[n, a * d + b]];
+                            if diff == 0.0 {
+                                continue;
+                            }
+                            // B_{ab,cd} v_d summed over d.
+                            let mut bv = 0.0;
+                            for dd in 0..d {
+                                let vd = v[n * d + dd];
+                                if vd == 0.0 {
+                                    continue;
+                                }
+                                let mut term = 0.0;
+                                for i in 0..p {
+                                    // K_{a,cd}^T W J_b
+                                    term += k[[n, i, ((a * d) + c) * d + dd]]
+                                        * wj[[i, b]];
+                                    // H_{a,c}^T W H_{b,d}
+                                    term += jac2[[n, (i * d + a) * d + c]]
+                                        * jac2[[n, (i * d + b) * d + dd]];
+                                    // H_{a,d}^T W H_{b,c}
+                                    term += jac2[[n, (i * d + a) * d + dd]]
+                                        * jac2[[n, (i * d + b) * d + c]];
+                                    // J_a^T W K_{b,cd}
+                                    term += wj[[i, a]]
+                                        * k[[n, i, ((b * d) + c) * d + dd]];
+                                }
+                                bv += term * vd;
+                            }
+                            acc_res += diff * bv;
+                        }
+                    }
+                    out[n * d + c] += mu * acc_res;
+                }
             }
         }
         out
@@ -1242,9 +1311,41 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
 
 impl SparsityPenalty {
     pub fn smoothed_l1(target_tier: PenaltyTier, eps: f64) -> Self {
+        assert!(
+            eps.is_finite() && eps > 0.0,
+            "SparsityPenalty::smoothed_l1 requires eps > 0 \
+             (Hessian / gradient have a `1/sqrt(x² + eps²)` factor that needs eps > 0 \
+             for differentiability at x = 0); got eps = {eps}"
+        );
         Self {
             target_tier,
             kind: SparsityKind::SmoothedL1 { eps },
+            strength_rho_index: 0,
+            eps_rho_index: None,
+        }
+    }
+
+    pub fn log(target_tier: PenaltyTier, delta: f64) -> Self {
+        assert!(
+            delta.is_finite() && delta > 0.0,
+            "SparsityPenalty::log requires delta > 0 \
+             (the log-sparsifier is log(1 + x²/δ²), undefined at δ = 0); \
+             got delta = {delta}"
+        );
+        Self {
+            target_tier,
+            kind: SparsityKind::Log { delta },
+            strength_rho_index: 0,
+            eps_rho_index: None,
+        }
+    }
+
+    /// Hoyer scale-invariant sparsifier. Requires a target of length > 1
+    /// because the normalized form divides by `sqrt(n) - 1`.
+    pub fn hoyer(target_tier: PenaltyTier) -> Self {
+        Self {
+            target_tier,
+            kind: SparsityKind::Hoyer,
             strength_rho_index: 0,
             eps_rho_index: None,
         }
