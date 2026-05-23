@@ -82,6 +82,7 @@ from .topology import (
     Sphere as TopologySphere,
     Torus,
 )
+from .select_topology import select_topology
 from ._diagnostics import Diagnostics
 from .smooth import (
     BSpline,
@@ -246,5 +247,6 @@ __all__ = [
     "smoothness_penalty",
     "sphere_frechet_mean",
     "sae_manifold_fit",
+    "select_topology",
     "validate_formula",
 ]
