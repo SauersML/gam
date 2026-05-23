@@ -8726,6 +8726,7 @@ fn compute_adjoint_z_c(
     hop: &dyn HessianOperator,
     leverage: &Array1<f64>,
     subspace: Option<&PenaltySubspaceTrace>,
+    active_constraints: Option<&ActiveLinearConstraintBlock>,
 ) -> Result<Array1<f64>, String> {
     let mut weighted = Array1::<f64>::zeros(ing.c_array.len());
     Zip::from(&mut weighted)
@@ -8735,30 +8736,35 @@ fn compute_adjoint_z_c(
     // Matrix-free Xᵀ · weighted via DesignMatrix transpose-apply, so
     // operator-backed (Lazy) designs at biobank scale never densify.
     let v = ing.x.transpose_vector_multiply(&weighted);
-    // Adjoint identity: tr(Kernel · C[u]) = uᵀ · Xᵀ(c ⊙ h^G), where the
-    // kernel and the leverage `h^G` must come from the SAME operator.
+    // Adjoint identity: tr(Kernel · C[u]) = uᵀ · Xᵀ(c ⊙ leverage), where the
+    // kernel, the leverage, and the IFT-direction solve must all come from
+    // the SAME operator. The selection rule mirrors the per-coordinate IFT
+    // mode-response sites in `reml_laml_evaluate` and `compute_outer_hessian`
+    // (see those comments for the math).
     //
-    //   * Full-Hessian regime: Kernel = G_ε(H), leverage = diag(X G_ε(H) Xᵀ),
-    //     mode response u = H⁻¹ rhs, and the cheap shortcut reads
-    //     `rhs · z_c` with z_c = H⁻¹ · X'(c⊙h^G).
-    //   * Projected-subspace regime (rank-deficient LAML fix): Kernel = K,
-    //     leverage = h^{G,proj} = diag(X K Xᵀ), mode response u = K · rhs
-    //     (see `compute_ift_correction_trace`'s slow path and the standalone
-    //     coord-v computation above). For the same shortcut to hold the
-    //     adjoint must satisfy `rhs · z_c = (K rhs)ᵀ X'(c⊙h^{G,proj})
-    //                                     = rhsᵀ K · X'(c⊙h^{G,proj})`,
-    //     i.e. z_c^{proj} = K · X'(c ⊙ h^{G,proj}). Routing through
-    //     `hop.solve` here produces H⁻¹ · X'(c ⊙ h^{G,proj}) instead and
-    //     `scalar_correction_trace` then computes
-    //     `rhsᵀ H⁻¹ X'(c⊙h^{G,proj})` while the dense path's
-    //     `compute_ift_correction_trace` computes
-    //     `rhsᵀ K · X'(c⊙h^{G,proj})`, so the operator-form Hessian
-    //     disagrees with `compute_outer_hessian`'s materialisation on every
-    //     non-trivial subspace direction (the
-    //     `projected_operator_hessian_matches_dense_subspace_trace`
-    //     regression).
-    match subspace {
-        Some(kernel) => Ok(kernel.apply_pseudo_inverse(&v)),
+    //   * Full-Hessian regime (subspace = None): Kernel = G_ε(H),
+    //     leverage = diag(X G_ε(H) Xᵀ), mode response u = H⁻¹ rhs,
+    //     z_c = H⁻¹ · X'(c⊙h^G).
+    //   * Projected-subspace regime, NO active constraints (subspace = Some,
+    //     active_constraints empty): Kernel = K_S for the trace contraction,
+    //     leverage = h^{G,proj} = diag(X K_S Xᵀ), but the IFT-direction solve
+    //     stays on the FULL Hessian — PIRLS converges β̂ ∈ R^p in the
+    //     unconstrained full space, so dβ̂/dψ = -H⁻¹ g_ψ. Hence
+    //     z_c = H⁻¹ · X'(c⊙h^{G,proj}). The trace contraction's K-leverage
+    //     enters via `leverage` (which the caller computes as
+    //     `xt_projected_kernel_x_diagonal` whenever subspace is Some).
+    //   * Projected-subspace regime, WITH active constraints: Kernel = K_T
+    //     (lifted to T = range(S₊) ∩ ker(A_act)), leverage h^{G,proj}_T,
+    //     mode response u = K_T rhs, z_c = K_T · X'(c⊙h^{G,proj}_T).
+    let constrained = match (subspace, active_constraints) {
+        (Some(kernel), Some(block)) => {
+            let ck = kernel.with_active_constraints(block.a.view());
+            ck.has_active_constraints().then_some(ck)
+        }
+        _ => None,
+    };
+    match constrained {
+        Some(ck) => Ok(ck.apply_pseudo_inverse(&v)),
         None => Ok(hop.solve(&v)),
     }
 }
@@ -8883,6 +8889,7 @@ fn compute_ift_correction_trace(
     leverage: Option<&Array1<f64>>,
     precomputed_fourth_trace: Option<f64>,
     subspace: Option<&PenaltySubspaceTrace>,
+    active_constraints: Option<&ActiveLinearConstraintBlock>,
 ) -> Result<f64, String> {
     if !effective_deriv.has_corrections() {
         return Ok(0.0);
@@ -8904,9 +8911,25 @@ fn compute_ift_correction_trace(
         };
         Ok(c_trace + d_trace)
     } else {
-        // WS1a fallback: projected kernel for rank-deficient LAML path.
-        let u = if let Some(kernel) = subspace {
-            kernel.apply_pseudo_inverse(rhs)
+        // IFT second-order direction u = β_{ij}: pick the solve kernel to
+        // mirror the first-order v_i / v_j choice. See the parallel comment
+        // at the gradient/Hessian mode-response sites in
+        // `reml_laml_evaluate` and `compute_outer_hessian`. K_T applies
+        // only when active inequality constraints clamp the inner solver
+        // onto T = range(S₊) ∩ ker(A_act); otherwise the inner converges
+        // β̂ ∈ R^p and `u = -H⁻¹ rhs` (full solve) keeps the second-order
+        // chain rule consistent with the first-order v's. The outer trace
+        // contraction `tr[K · …]` keeps using the bare K_S — that side
+        // matches the projected LAML cost identity.
+        let constrained = match (subspace, active_constraints) {
+            (Some(kernel), Some(block)) => {
+                let ck = kernel.with_active_constraints(block.a.view());
+                ck.has_active_constraints().then_some(ck)
+            }
+            _ => None,
+        };
+        let u = if let Some(ck) = constrained.as_ref() {
+            ck.apply_pseudo_inverse(rhs)
         } else {
             hop.solve(rhs)
         };
@@ -9547,18 +9570,35 @@ fn compute_outer_hessian(
     // ── Adjoint trick precomputation ──
     //
     // For scalar GLMs with C[u] = Xᵀ diag(c ⊙ Xu) X:
-    //   h^G          = diag(X G_ε(H) Xᵀ)
-    //   z_c          = H⁻¹ Xᵀ (c ⊙ h^G)
-    //   tr(G_ε C[u]) = uᵀ Xᵀ (c ⊙ h^G) = uᵀ (Hu_old) · z_c
+    //   tr(Kernel · C[u]) = Σᵢ (X Kernel Xᵀ)ᵢᵢ · cᵢ · (Xu)ᵢ
+    //                     = uᵀ Xᵀ (c ⊙ leverage)
+    // where `leverage = diag(X · Kernel · Xᵀ)` MUST come from the SAME
+    // kernel as the trace contraction. The kernel choice tracks the cost
+    // identity:
+    //   * subspace = None  → kernel = G_ε(H), leverage = h^G = diag(X G_ε(H) Xᵀ)
+    //   * subspace = Some  → kernel = K_S, leverage = h^{G,proj} = diag(X K_S Xᵀ)
+    //     (rank-deficient LAML cost `½ log|U_Sᵀ H U_S|`).
+    // The operator-form sibling at `build_outer_hessian_operator` selects
+    // identically; before this alignment the dense path read `h^G` even
+    // under `penalty_subspace_trace = Some`, and the resulting adjoint
+    // shortcut disagreed with `trace_projected_logdet` on the K-leverage
+    // by `(h^G − h^{G,proj})` per row — the
+    // `projected_operator_hessian_matches_dense_subspace_trace`
+    // regression after the IFT routing fix.
     //
-    // h^G also plugs into the fourth-derivative trace
-    //   tr(G_ε Xᵀ diag(w) X) = Σᵢ wᵢ h^G[i],
-    // collapsing per-pair O(np²) → O(n) work.
+    // Leverage also plugs into the fourth-derivative trace
+    //   tr(Kernel · Xᵀ diag(w) X) = Σᵢ wᵢ · leverageᵢ,
+    // collapsing per-pair O(np²) → O(n) work; the kernel choice is the
+    // same so the fourth-derivative term stays consistent with the
+    // third-derivative adjoint above.
     let glm_ingredients = effective_deriv.scalar_glm_ingredients();
     let leverage = if incl_logdet_h {
-        glm_ingredients
-            .as_ref()
-            .map(|ing| hop.xt_logdet_kernel_x_diagonal(ing.x))
+        glm_ingredients.as_ref().map(|ing| {
+            match solution.penalty_subspace_trace.as_deref() {
+                Some(kernel) => kernel.xt_projected_kernel_x_diagonal(ing.x),
+                None => hop.xt_logdet_kernel_x_diagonal(ing.x),
+            }
+        })
     } else {
         None
     };
@@ -9569,6 +9609,7 @@ fn compute_outer_hessian(
                 hop,
                 h_g,
                 solution.penalty_subspace_trace.as_deref(),
+                solution.active_constraints.as_deref(),
             )?),
             _ => None,
         }
@@ -9986,6 +10027,7 @@ fn compute_outer_hessian(
                                 leverage.as_ref(),
                                 fourth_trace_matrix.as_ref().map(|trace| trace[[kk, ll]]),
                                 subspace,
+                                solution.active_constraints.as_deref(),
                             )?
                         };
 
@@ -10092,6 +10134,7 @@ fn compute_outer_hessian(
                             .as_ref()
                             .map(|trace| trace[[rho_idx, k + ext_idx]]),
                         subspace,
+                        solution.active_constraints.as_deref(),
                     )?;
 
                     (cross_trace, base + m_terms + correction)
@@ -10184,6 +10227,7 @@ fn compute_outer_hessian(
                             .as_ref()
                             .map(|trace| trace[[k + ii, k + jj]]),
                         subspace,
+                        solution.active_constraints.as_deref(),
                     )?;
 
                     let h2 = base + m_terms + correction;
@@ -11651,6 +11695,7 @@ fn build_outer_hessian_operator(
                 hop.as_ref(),
                 h_g,
                 subspace,
+                solution.active_constraints.as_deref(),
             )?),
             _ => None,
         }
@@ -18298,7 +18343,8 @@ mod tests {
             }
             h_dense[i] = acc;
         }
-        let streamed = compute_adjoint_z_c(&ing, &hop, &h_dense, None).expect("adjoint path");
+        let streamed =
+            compute_adjoint_z_c(&ing, &hop, &h_dense, None, None).expect("adjoint path");
 
         let mut t = h_dense.clone();
         Zip::from(&mut t)
