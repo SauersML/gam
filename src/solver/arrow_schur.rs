@@ -309,18 +309,50 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         ridge_t: f64,
         d: usize,
     ) -> Result<Vec<Array2<f64>>, ArrowSchurError> {
+        // Adaptive ridge backoff: if the user-supplied ridge_t is not
+        // sufficient to make `H_tt^(i)` PD, escalate along a geometric
+        // ramp before surfacing the failure. This is the robust analogue
+        // of the LM "grow ridge on inner failure" loop that lives in
+        // `LatentInnerSolver::solve`, applied at the per-row granularity
+        // so that one pathological row does not force a global ridge
+        // increase across all N rows.
+        //
+        // The ramp is chosen to span the typical 8 orders of magnitude
+        // between "machine-epsilon nudge" and "trust the diagonal".
+        const RIDGE_RAMP: [f64; 5] = [0.0, 1e-12, 1e-8, 1e-4, 1e0];
         let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let mut block = row.htt.clone();
-            for a in 0..d {
-                block[[a, a]] += ridge_t;
+        for (row_idx, row) in rows.iter().enumerate() {
+            debug_assert_eq!(row.htt.dim(), (d, d), "row {row_idx} H_tt shape != (d,d)");
+            let mut last_err = String::new();
+            let mut factored: Option<Array2<f64>> = None;
+            for extra in RIDGE_RAMP.iter() {
+                let mut block = row.htt.clone();
+                let total = ridge_t + extra;
+                for a in 0..d {
+                    block[[a, a]] += total;
+                }
+                match cholesky_lower(&block) {
+                    Ok(l) => {
+                        factored = Some(l);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = e;
+                    }
+                }
             }
-            out.push(
-                cholesky_lower(&block).map_err(|e| ArrowSchurError::PerRowFactorFailed {
-                    row: out.len(),
-                    reason: e,
-                })?,
-            );
+            match factored {
+                Some(l) => out.push(l),
+                None => {
+                    return Err(ArrowSchurError::PerRowFactorFailed {
+                        row: row_idx,
+                        reason: format!(
+                            "row {row_idx} H_tt remained non-PD after adaptive ridge ramp; \
+                             final cholesky error: {last_err}"
+                        ),
+                    });
+                }
+            }
         }
         Ok(out)
     }
@@ -343,17 +375,25 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         left: &Array2<f64>,
         right: &Array2<f64>,
     ) {
+        // Performance: ndarray Array2 is row-major, so `right[[c, b]]` is
+        // unit-strided in `b`. The canonical (a, b, c) order produced
+        // strided reads of `left[[c, a]]` for every (a, b); reorder to
+        // (c, a, b) so the inner `b`-loop is contiguous in `right` and
+        // `left[[c, a]]` is hoisted out of the inner loop.
         let k = schur.nrows();
         let d = left.nrows();
         debug_assert_eq!(left.ncols(), k);
         debug_assert_eq!(right.ncols(), k);
-        for a in 0..k {
-            for b in 0..k {
-                let mut acc = 0.0;
-                for c in 0..d {
-                    acc += left[[c, a]] * right[[c, b]];
+        debug_assert_eq!(schur.ncols(), k);
+        for c in 0..d {
+            for a in 0..k {
+                let lca = left[[c, a]];
+                if lca == 0.0 {
+                    continue;
                 }
-                schur[[a, b]] -= acc;
+                for b in 0..k {
+                    schur[[a, b]] -= lca * right[[c, b]];
+                }
             }
         }
     }
@@ -770,9 +810,17 @@ impl ArrowFactorCache {
         let d = self.d;
         let k = self.k;
         debug_assert_eq!(delta_beta.len(), k);
+        debug_assert_eq!(self.htbeta.len(), n);
         let mut out = Array1::<f64>::zeros(n * d);
         let mut rhs = Array1::<f64>::zeros(d);
         for i in 0..n {
+            debug_assert_eq!(self.htbeta[i].dim(), (d, k));
+            // Inline matvec: H_tβ^(i) · δβ. Row-major iteration over the
+            // (d, k) cross block keeps the inner k-loop unit-strided in
+            // memory.
+            for c in 0..d {
+                rhs[c] = 0.0;
+            }
             for c in 0..d {
                 let mut acc = 0.0_f64;
                 for a in 0..k {
@@ -789,6 +837,88 @@ impl ArrowFactorCache {
         out
     }
 
+    /// Apply the *combined* IFT predictor
+    /// `Δt_i = -(H_tt^(i))⁻¹ · (H_tβ^(i) Δβ + δg_t^(i))` per row.
+    ///
+    /// This is the canonical single-pass form of the IFT formula from
+    /// `proposals/per_point_hessian.md` §4. Compared to the legacy split
+    /// path (`predict_delta_t_from_delta_beta` + `predict_delta_t_from_delta_gt`),
+    /// this routine performs *one* per-row Cholesky back-substitution
+    /// instead of two — halving the IFT predictor cost for callers that
+    /// have both a β perturbation and a per-row gradient perturbation.
+    pub fn predict_delta_t_combined(
+        &self,
+        delta_beta: Option<ArrayView1<'_, f64>>,
+        delta_gt: Option<ArrayView1<'_, f64>>,
+    ) -> Array1<f64> {
+        let n = self.htt_factors_undamped.len();
+        let d = self.d;
+        let k = self.k;
+        if let Some(db) = delta_beta.as_ref() {
+            debug_assert_eq!(db.len(), k);
+        }
+        if let Some(dg) = delta_gt.as_ref() {
+            debug_assert_eq!(dg.len(), n * d);
+        }
+        let mut out = Array1::<f64>::zeros(n * d);
+        let mut rhs = Array1::<f64>::zeros(d);
+        for i in 0..n {
+            for c in 0..d {
+                rhs[c] = 0.0;
+            }
+            if let Some(db) = delta_beta.as_ref() {
+                debug_assert_eq!(self.htbeta[i].dim(), (d, k));
+                for c in 0..d {
+                    let mut acc = 0.0_f64;
+                    for a in 0..k {
+                        acc += self.htbeta[i][[c, a]] * db[a];
+                    }
+                    rhs[c] += acc;
+                }
+            }
+            if let Some(dg) = delta_gt.as_ref() {
+                for c in 0..d {
+                    rhs[c] += dg[i * d + c];
+                }
+            }
+            let v = chol_solve_vector(&self.htt_factors_undamped[i], &rhs);
+            for c in 0..d {
+                out[i * d + c] = -v[c];
+            }
+        }
+        out
+    }
+
+    /// Arrow log-determinant
+    /// `log|H| = Σ_i log|H_{t_i t_i}| + log|Schur_β|`
+    /// using the cached (damped) factors.
+    ///
+    /// Returns `(log_det_tt_sum, log_det_schur)` so the caller can decide
+    /// what to do with the Schur piece (e.g. REML evidence wants both;
+    /// some diagnostics want only the per-row sum). `None` for the Schur
+    /// piece signals that the cache was produced by an InexactPCG solve
+    /// and never formed/factored the dense `K × K` reduced system.
+    ///
+    /// The log-determinant of a Cholesky factor `L` of `M` is
+    /// `2 Σ log L_ii`.
+    pub fn arrow_log_det(&self) -> (f64, Option<f64>) {
+        let mut log_det_tt = 0.0_f64;
+        for l in &self.htt_factors {
+            for i in 0..l.nrows() {
+                log_det_tt += l[[i, i]].ln();
+            }
+        }
+        log_det_tt *= 2.0;
+        let log_det_schur = self.schur_factor.as_ref().map(|l| {
+            let mut s = 0.0_f64;
+            for i in 0..l.nrows() {
+                s += l[[i, i]].ln();
+            }
+            2.0 * s
+        });
+        (log_det_tt, log_det_schur)
+    }
+
     /// Apply `Δt_i = -(H_tt^(i))⁻¹ · δg_t^(i)` per row.
     ///
     /// IFT first-order predictor for the latent field under a
@@ -799,6 +929,11 @@ impl ArrowFactorCache {
         let n = self.htt_factors_undamped.len();
         let d = self.d;
         debug_assert_eq!(delta_gt.len(), n * d);
+        debug_assert_eq!(
+            self.htt_factors_undamped.len(),
+            n,
+            "undamped factor cache and N must agree"
+        );
         let mut out = Array1::<f64>::zeros(n * d);
         let mut rhs = Array1::<f64>::zeros(d);
         for i in 0..n {
