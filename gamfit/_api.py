@@ -1167,6 +1167,9 @@ def duchon_basis(
     *,
     m: int = 2,
     periodic_per_axis: Any = None,
+    length_scale: float | None = None,
+    nullspace_order: str | None = None,
+    power: float | None = None,
 ) -> Any:
     """Evaluate the Duchon m-spline basis at ``points`` against ``centers``.
 
@@ -1186,6 +1189,20 @@ def duchon_basis(
         ``d_j(x, y) = (P_j/π) sin(π(x − y)/P_j)`` on periodic axes and
         Euclidean distance on non-periodic axes; per-axis periods ``P_j``
         are auto-derived from the centers' span along each periodic axis.
+    length_scale : optional positive float. ``None`` (default) selects the
+        scale-free pure Duchon spectrum ``‖w‖^(2(p+s))``. A positive value
+        enables the hybrid (Matérn-blended) spectrum
+        ``‖w‖^(2p) · (κ² + ‖w‖²)^s`` with ``κ = 1/length_scale``. The
+        hybrid kernel keeps the polynomial nullspace order **linear in d**
+        (a single dim+1 column block), letting the same basis scale cleanly
+        to d=8, 16, 32, 64 without ratcheting the nullspace.
+    nullspace_order : optional string. ``"zero"`` (constant nullspace),
+        ``"linear"`` (constant + linear), or ``"degree<k>"`` for k ≥ 2.
+        ``None`` (default) falls back to the legacy ``m``-derived choice
+        (``m=1 → zero``, ``m=2 → linear``, ``m=k → degree(k-1)``).
+    power : optional float. Riesz spectral power ``s``. ``None`` (default)
+        auto-resolves the minimum admissible ``s`` for the requested
+        ``nullspace_order`` and dimension (matches the formula API).
 
     Returns
     -------
@@ -1220,7 +1237,15 @@ def duchon_basis(
     )
     try:
         return np.asarray(
-            rust_module().duchon_basis(pts_np, ctrs_np, int(m), periodic_arg),
+            rust_module().duchon_basis(
+                pts_np,
+                ctrs_np,
+                int(m),
+                periodic_arg,
+                None if length_scale is None else float(length_scale),
+                None if nullspace_order is None else str(nullspace_order),
+                None if power is None else float(power),
+            ),
             dtype=float,
         )
     except Exception as exc:
@@ -1384,6 +1409,9 @@ def duchon_function_norm_penalty(
     periodic: bool = False,
     period: float | None = None,
     periodic_per_axis: Any = None,
+    length_scale: float | None = None,
+    nullspace_order: str | None = None,
+    power: float | None = None,
 ) -> Any:
     """Duchon m-spline RKHS / function-norm penalty matrix.
 
@@ -1400,6 +1428,15 @@ def duchon_function_norm_penalty(
         mixed-periodicity radial polyharmonic kernel evaluated at the
         cylinder/torus chord distance (see :func:`duchon_basis` for the
         per-axis formula).
+    length_scale : optional positive float. ``None`` (default) selects the
+        scale-free pure Duchon spectrum. A positive value enables the
+        hybrid (Matérn-blended) spectrum, keeping the polynomial nullspace
+        order **linear in d** for clean scaling to d=8, 16, 32, 64.
+    nullspace_order : optional string. ``"zero"``, ``"linear"``, or
+        ``"degree<k>"`` (k ≥ 2). ``None`` falls back to the legacy
+        ``m``-derived choice.
+    power : optional float. Riesz spectral power ``s``. ``None`` (default)
+        auto-resolves the minimum admissible ``s``.
 
     Returns
     -------
@@ -1443,6 +1480,9 @@ def duchon_function_norm_penalty(
             False,
             float(period) if period is not None else None,
             per_list,
+            None if length_scale is None else float(length_scale),
+            None if nullspace_order is None else str(nullspace_order),
+            None if power is None else float(power),
         )
     except Exception as exc:
         raise map_exception(exc) from exc
