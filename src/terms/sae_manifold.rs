@@ -70,6 +70,7 @@ pub struct SaeManifoldAtom {
 
 impl SaeManifoldAtom {
     #[allow(clippy::too_many_arguments)]
+    #[must_use = "build error must be handled"]
     pub fn new(
         name: impl Into<String>,
         basis_kind: SaeAtomBasisKind,
@@ -175,6 +176,7 @@ pub enum AssignmentMode {
 }
 
 impl AssignmentMode {
+    #[must_use]
     pub fn softmax(temperature: f64) -> Self {
         Self::Softmax {
             temperature,
@@ -182,6 +184,7 @@ impl AssignmentMode {
         }
     }
 
+    #[must_use]
     pub fn ibp_map(temperature: f64, alpha: f64, learnable_alpha: bool) -> Self {
         Self::IBPMap {
             temperature,
@@ -237,6 +240,7 @@ pub struct SaeAssignment {
 }
 
 impl SaeAssignment {
+    #[must_use = "build error must be handled"]
     pub fn new(
         logits: Array2<f64>,
         coords: Vec<LatentCoordValues>,
@@ -245,6 +249,7 @@ impl SaeAssignment {
         Self::with_mode(logits, coords, AssignmentMode::softmax(temperature))
     }
 
+    #[must_use = "build error must be handled"]
     pub fn with_mode(
         logits: Array2<f64>,
         coords: Vec<LatentCoordValues>,
@@ -348,6 +353,7 @@ impl SaeAssignment {
         out
     }
 
+    #[must_use = "build error must be handled"]
     pub fn from_blocks_with_no_gauge(
         logits: Array2<f64>,
         coord_blocks: Vec<Array2<f64>>,
@@ -360,6 +366,7 @@ impl SaeAssignment {
         Self::new(logits, coords, temperature)
     }
 
+    #[must_use = "build error must be handled"]
     pub fn from_blocks_with_mode(
         logits: Array2<f64>,
         coord_blocks: Vec<Array2<f64>>,
@@ -386,16 +393,13 @@ pub struct SaeManifoldRho {
 }
 
 impl SaeManifoldRho {
+    #[must_use]
     pub fn new(log_lambda_sparse: f64, log_lambda_smooth: f64, log_ard: Vec<Array1<f64>>) -> Self {
         Self {
             log_lambda_sparse,
             log_lambda_smooth,
             log_ard,
         }
-    }
-
-    pub fn lambda_sparse(&self) -> f64 {
-        self.log_lambda_sparse.exp()
     }
 
     pub fn lambda_smooth(&self) -> f64 {
@@ -433,6 +437,7 @@ pub struct SaeManifoldTerm {
 }
 
 impl SaeManifoldTerm {
+    #[must_use = "build error must be handled"]
     pub fn new(atoms: Vec<SaeManifoldAtom>, assignment: SaeAssignment) -> Result<Self, String> {
         if atoms.is_empty() {
             return Err("SaeManifoldTerm::new: at least one atom required".into());
@@ -1082,37 +1087,7 @@ fn assignment_prior_grad_hdiag(
 /// `(K, N, M_max, D_max)` storage, with `basis_sizes` and `latent_dims`
 /// selecting each atom's active prefix.
 #[allow(clippy::too_many_arguments)]
-pub fn term_from_padded_blocks(
-    n_obs: usize,
-    p_out: usize,
-    basis_kinds: &[SaeAtomBasisKind],
-    basis_values: ArrayView3<'_, f64>,
-    basis_jacobian: ArrayView4<'_, f64>,
-    basis_sizes: &[usize],
-    latent_dims: &[usize],
-    decoder_coefficients: ArrayView3<'_, f64>,
-    smooth_penalties: ArrayView3<'_, f64>,
-    logits: ArrayView2<'_, f64>,
-    coords: &[Array2<f64>],
-    temperature: f64,
-) -> Result<SaeManifoldTerm, String> {
-    term_from_padded_blocks_with_mode(
-        n_obs,
-        p_out,
-        basis_kinds,
-        basis_values,
-        basis_jacobian,
-        basis_sizes,
-        latent_dims,
-        decoder_coefficients,
-        smooth_penalties,
-        logits,
-        coords,
-        AssignmentMode::softmax(temperature),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
+#[must_use = "build error must be handled"]
 pub fn term_from_padded_blocks_with_mode(
     n_obs: usize,
     p_out: usize,

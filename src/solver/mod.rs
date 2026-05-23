@@ -1,7 +1,7 @@
 pub(crate) mod active_set;
 pub mod arrow_schur;
 #[cfg(feature = "ceres-backend")]
-pub mod ceres_backend;
+pub(crate) mod ceres_backend;
 pub mod estimate;
 pub mod gaussian_reml;
 pub mod mixture_link;
