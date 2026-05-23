@@ -12593,6 +12593,67 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
             identifiability_transform.clone(),
         )
         .map_err(EstimationError::from)?,
+        (
+            SmoothBasisSpec::Sphere { .. },
+            BasisMetadata::Sphere {
+                centers,
+                penalty_order,
+                method,
+                constraint_transform,
+                ..
+            },
+        ) if matches!(*method, crate::basis::SphereMethod::Wahba) => {
+            crate::terms::basis::LatentCoordDesignDerivative::new_sphere(
+                latent.clone(),
+                std::sync::Arc::new(centers.clone()),
+                *penalty_order,
+                constraint_transform.clone(),
+            )
+            .map_err(EstimationError::from)?
+        }
+        (
+            SmoothBasisSpec::BSpline1D { spec, .. },
+            BasisMetadata::BSpline1D {
+                knots,
+                identifiability_transform,
+                periodic,
+                ..
+            },
+        ) => {
+            if let Some((domain_start, period, num_basis)) = periodic {
+                crate::terms::basis::LatentCoordDesignDerivative::new_periodic_bspline(
+                    latent.clone(),
+                    (*domain_start, *domain_start + *period),
+                    spec.degree,
+                    *num_basis,
+                    identifiability_transform.clone(),
+                )
+                .map_err(EstimationError::from)?
+            } else {
+                crate::terms::basis::LatentCoordDesignDerivative::new_tensor_bspline(
+                    latent.clone(),
+                    vec![knots.clone()],
+                    vec![spec.degree],
+                    identifiability_transform.clone(),
+                )
+                .map_err(EstimationError::from)?
+            }
+        }
+        (
+            SmoothBasisSpec::TensorBSpline { .. },
+            BasisMetadata::TensorBSpline {
+                knots,
+                degrees,
+                identifiability_transform,
+                ..
+            },
+        ) => crate::terms::basis::LatentCoordDesignDerivative::new_tensor_bspline(
+            latent.clone(),
+            knots.clone(),
+            degrees.clone(),
+            identifiability_transform.clone(),
+        )
+        .map_err(EstimationError::from)?,
         _ => return Ok(None),
     };
     if operator.p_out() != global_range.len() {
@@ -13214,6 +13275,7 @@ struct SingleBlockLatentCoordDesignCache {
     current_theta: Option<Array1<f64>>,
     current_latent: Option<std::sync::Arc<crate::terms::latent_coord::LatentCoordValues>>,
     current_hyper_dirs: Option<Vec<crate::estimate::reml::DirectionalHyperParam>>,
+    current_design_cache_id: Option<u64>,
     latent_design_cache: crate::solver::latent_cache::LatentDesignCache,
     last_cost: Option<f64>,
     last_eval: Option<(
@@ -13270,6 +13332,7 @@ impl SingleBlockLatentCoordDesignCache {
             current_theta: None,
             current_latent: None,
             current_hyper_dirs: None,
+            current_design_cache_id: None,
             latent_design_cache: crate::solver::latent_cache::LatentDesignCache::default(),
             last_cost: None,
             last_eval: None,
@@ -13286,10 +13349,6 @@ impl SingleBlockLatentCoordDesignCache {
 
     fn design_revision(&self) -> u64 {
         self.design_revision
-    }
-
-    fn spec(&self) -> &TermCollectionSpec {
-        &self.spec
     }
 
     fn design(&self) -> &TermCollectionDesign {
@@ -13415,14 +13474,11 @@ impl SingleBlockLatentCoordDesignCache {
                     ))
                 })?;
                 if rebuilt.design.ncols() != rebuilt_width {
-                    return Err(EstimationError::InvalidInput(
-                        SmoothError::dimension_mismatch(format!(
-                            "latent-coordinate design topology changed: rebuilt p={}, cached p={}",
-                            rebuilt.design.ncols(),
-                            rebuilt_width
-                        ))
-                        .to_string(),
-                    ));
+                    return Err(EstimationError::InvalidInput(format!(
+                        "latent-coordinate design topology changed: rebuilt p={}, cached p={}",
+                        rebuilt.design.ncols(),
+                        rebuilt_width
+                    )));
                 }
                 let hyper_dirs = try_build_latent_coord_hyper_dirs(
                     latent.clone(),
@@ -13455,8 +13511,9 @@ impl SingleBlockLatentCoordDesignCache {
         self.current_theta = Some(theta.clone());
         self.last_cost = None;
         self.last_eval = None;
-        if lookup.recomputed {
+        if self.current_design_cache_id != Some(lookup.cached.id) {
             self.design_revision = self.design_revision.wrapping_add(1);
+            self.current_design_cache_id = Some(lookup.cached.id);
         }
         Ok(())
     }
@@ -13515,6 +13572,7 @@ impl SingleBlockLatentCoordDesignCache {
         self.current_theta = None;
         self.current_latent = None;
         self.current_hyper_dirs = None;
+        self.current_design_cache_id = None;
         self.latent_design_cache.invalidate();
         self.last_cost = None;
         self.last_eval = None;

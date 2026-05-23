@@ -63,17 +63,21 @@ use gam::terms::basis::{
 use gam::terms::latent_coord::{
     AuxPriorFamily, InputLocationDerivative, LatentCoordValues, LatentIdMode, aux_prior_targets,
 };
+use gam::terms::sae_manifold::{
+    AssignmentMode, SaeAtomBasisKind, SaeManifoldRho, term_from_padded_blocks_with_mode,
+};
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::terms::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
+    IntoPyArray, PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArray3, PyReadonlyArray4,
 };
 use pyo3::exceptions::{PyNotImplementedError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyDict};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -3604,7 +3608,8 @@ fn latent_input_location_jet(
         "sphere" => {
             // Fixes audit-revised claim that sphere latent derivatives are
             // analytic jets, not unsupported hooks.
-            let jet = sphere_first_derivative_nd(t_mat, centers, m).map_err(|err| err.to_string())?;
+            let jet =
+                sphere_first_derivative_nd(t_mat, centers, m, true).map_err(|err| err.to_string())?;
             Ok(latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Jet(
                 jet.view(),
             )))
@@ -3799,31 +3804,101 @@ fn solve_dense_block_system(
     Ok(out)
 }
 
-fn latent_prior_score_for_t(
+#[derive(Clone, Copy, Debug)]
+struct LatentAuxStrengthState {
+    log_mu: f64,
+    mu: f64,
+    auto: bool,
+}
+
+struct LatentAuxPriorStats {
+    targets: Array2<f64>,
+    residual_sq: f64,
+    strength: LatentAuxStrengthState,
+    score: f64,
+}
+
+fn latent_aux_prior_stats(
+    t_mat: ArrayView2<'_, f64>,
+    u_view: ArrayView2<'_, f64>,
+    aux_family: AuxPriorFamily,
+    aux_strength: Option<f64>,
+) -> Result<LatentAuxPriorStats, String> {
+    let targets = aux_prior_targets(t_mat, u_view, aux_family)?;
+    let n_obs = t_mat.nrows();
+    let latent_dim = t_mat.ncols();
+    let mut residual_sq = 0.0_f64;
+    for n in 0..n_obs {
+        for a in 0..latent_dim {
+            let diff = t_mat[[n, a]] - targets[[n, a]];
+            residual_sq += diff * diff;
+        }
+    }
+    if !residual_sq.is_finite() {
+        return Err("auxiliary prior residual norm must be finite".to_string());
+    }
+    let (log_mu, mu, auto) = match aux_strength {
+        Some(mu) => {
+            if !(mu.is_finite() && mu > 0.0) {
+                return Err(format!("aux_strength must be finite and positive; got {mu}"));
+            }
+            (mu.ln(), mu, false)
+        }
+        None => {
+            if residual_sq <= 0.0 {
+                return Err(
+                    "aux_strength='auto' has no finite REML optimum when the auxiliary residual is zero"
+                        .to_string(),
+                );
+            }
+            let mu = (n_obs as f64) / residual_sq;
+            if !(mu.is_finite() && mu > 0.0) {
+                return Err(format!("auto aux_strength selected a non-finite precision: {mu}"));
+            }
+            (mu.ln(), mu, true)
+        }
+    };
+    let score = 0.5 * mu * residual_sq - 0.5 * (n_obs as f64) * log_mu;
+    Ok(LatentAuxPriorStats {
+        targets,
+        residual_sq,
+        strength: LatentAuxStrengthState { log_mu, mu, auto },
+        score,
+    })
+}
+
+fn set_aux_strength_items<'py>(
+    py: Python<'py>,
+    out: &Bound<'py, PyDict>,
+    state: Option<LatentAuxStrengthState>,
+) -> PyResult<()> {
+    if let Some(state) = state {
+        out.set_item("aux_strength", state.mu)?;
+        out.set_item("aux_log_strength", state.log_mu)?;
+        out.set_item("aux_strength_mode", if state.auto { "auto" } else { "fixed" })?;
+    } else {
+        out.set_item("aux_strength", py.None())?;
+        out.set_item("aux_log_strength", py.None())?;
+        out.set_item("aux_strength_mode", py.None())?;
+    }
+    Ok(())
+}
+
+fn latent_prior_score_and_aux_state_for_t(
     t_mat: ArrayView2<'_, f64>,
     aux_u: Option<ArrayView2<'_, f64>>,
     aux_family: AuxPriorFamily,
     aux_strength: Option<f64>,
     dim_selection_precision: Option<ArrayView1<'_, f64>>,
-) -> Result<f64, String> {
+) -> Result<(f64, Option<LatentAuxStrengthState>), String> {
     let n_obs = t_mat.nrows();
     let latent_dim = t_mat.ncols();
     let mut latent_prior_score = 0.0_f64;
+    let mut aux_strength_state = None;
     if let Some(u_view) = aux_u {
-        let targets = aux_prior_targets(t_mat, u_view, aux_family)?;
-        let mu = aux_strength.unwrap_or(1.0);
-        if !(mu.is_finite() && mu > 0.0) {
-            return Err(format!("aux_strength must be finite and positive; got {mu}"));
-        }
-        let mut sq = 0.0_f64;
-        for n in 0..n_obs {
-            for a in 0..latent_dim {
-                let diff = t_mat[[n, a]] - targets[[n, a]];
-                sq += diff * diff;
-            }
-        }
-        let effective_dim = (n_obs * latent_dim) as f64;
-        latent_prior_score += 0.5 * mu * sq - 0.5 * effective_dim * mu.ln();
+        let stats = latent_aux_prior_stats(t_mat, u_view, aux_family, aux_strength)?;
+        latent_prior_score += stats.score;
+        aux_strength_state = Some(stats.strength);
     }
     if let Some(log_prec) = dim_selection_precision {
         if log_prec.len() != latent_dim {
@@ -3849,7 +3924,24 @@ fn latent_prior_score_for_t(
             latent_prior_score += 0.5 * alpha * sq - 0.5 * (n_obs as f64) * log_alpha;
         }
     }
-    Ok(latent_prior_score)
+    Ok((latent_prior_score, aux_strength_state))
+}
+
+fn latent_prior_score_for_t(
+    t_mat: ArrayView2<'_, f64>,
+    aux_u: Option<ArrayView2<'_, f64>>,
+    aux_family: AuxPriorFamily,
+    aux_strength: Option<f64>,
+    dim_selection_precision: Option<ArrayView1<'_, f64>>,
+) -> Result<f64, String> {
+    Ok(latent_prior_score_and_aux_state_for_t(
+        t_mat,
+        aux_u,
+        aux_family,
+        aux_strength,
+        dim_selection_precision,
+    )?
+    .0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3862,6 +3954,7 @@ fn dense_fisher_gaussian_fit_to_pydict<'py>(
     fisher_w: ArrayView3<'_, f64>,
     init_lambda: Option<f64>,
     latent_prior_score: f64,
+    aux_strength_state: Option<LatentAuxStrengthState>,
 ) -> PyResult<Py<PyDict>> {
     let n_obs = design.nrows();
     let k = design.ncols();
@@ -3939,6 +4032,7 @@ fn dense_fisher_gaussian_fit_to_pydict<'py>(
     out.set_item("cache_logdet_penalty_positive", f64::NAN)?;
     out.set_item("cache_penalty_rank", 0_usize)?;
     out.set_item("cache_nullity", 0_usize)?;
+    set_aux_strength_items(py, &out, aux_strength_state)?;
     Ok(out.unbind())
 }
 
@@ -3980,6 +4074,7 @@ fn dense_fisher_glm_fit_to_pydict<'py>(
     init_lambda: Option<f64>,
     family_name: &str,
     latent_prior_score: f64,
+    aux_strength_state: Option<LatentAuxStrengthState>,
 ) -> PyResult<Py<PyDict>> {
     let n_obs = design.nrows();
     let k = design.ncols();
@@ -4177,6 +4272,7 @@ fn dense_fisher_glm_fit_to_pydict<'py>(
     out.set_item("cache_logdet_penalty_positive", f64::NAN)?;
     out.set_item("cache_penalty_rank", 0_usize)?;
     out.set_item("cache_nullity", 0_usize)?;
+    set_aux_strength_items(py, &out, aux_strength_state)?;
     Ok(out.unbind())
 }
 
@@ -4368,7 +4464,11 @@ fn gaussian_reml_fit_latent_impl(
     aux_family: AuxPriorFamily,
     aux_strength: Option<f64>,
     dim_selection_precision: Option<ArrayView1<'_, f64>>,
-) -> Result<(gam::gaussian_reml::GaussianRemlMultiResult, Array2<f64>), String> {
+) -> Result<(
+    gam::gaussian_reml::GaussianRemlMultiResult,
+    Array2<f64>,
+    Option<LatentAuxStrengthState>,
+), String> {
     let (design, t_mat) = match latent_basis_kind(basis_kind)? {
         "duchon" => build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m)?,
         "bspline_tensor" => {
@@ -4411,21 +4511,11 @@ fn gaussian_reml_fit_latent_impl(
     // Fixes audit-revised claim that ARD / aux-prior REML selection requires
     // normalized priors, not raw quadratic corrections alone.
     let mut latent_prior_score = 0.0_f64;
+    let mut aux_strength_state = None;
     if let Some(u_view) = aux_u {
-        let targets = aux_prior_targets(t_mat.view(), u_view, aux_family)?;
-        let mu = aux_strength.unwrap_or(1.0);
-        if !(mu.is_finite() && mu > 0.0) {
-            return Err(format!("aux_strength must be finite and positive; got {mu}"));
-        }
-        let mut sq = 0.0_f64;
-        for n in 0..n_obs {
-            for a in 0..latent_dim {
-                let diff = t_mat[[n, a]] - targets[[n, a]];
-                sq += diff * diff;
-            }
-        }
-        let effective_dim = (n_obs * latent_dim) as f64;
-        latent_prior_score += 0.5 * mu * sq - 0.5 * effective_dim * mu.ln();
+        let stats = latent_aux_prior_stats(t_mat.view(), u_view, aux_family, aux_strength)?;
+        latent_prior_score += stats.score;
+        aux_strength_state = Some(stats.strength);
     }
     if let Some(log_prec) = dim_selection_precision {
         if log_prec.len() != latent_dim {
@@ -4452,7 +4542,7 @@ fn gaussian_reml_fit_latent_impl(
         }
     }
     fit.reml_score += latent_prior_score;
-    Ok((fit, design))
+    Ok((fit, design, aux_strength_state))
 }
 
 /// Forward fit: build the latent design at the current latent `t`,
@@ -4561,7 +4651,7 @@ fn gaussian_reml_fit_latent<'py>(
                     )));
                 }
             };
-            let prior_score = latent_prior_score_for_t(
+            let (prior_score, aux_strength_state) = latent_prior_score_and_aux_state_for_t(
                 t_mat.view(),
                 aux_u.as_ref().map(|a| a.as_array()),
                 family,
@@ -4578,6 +4668,7 @@ fn gaussian_reml_fit_latent<'py>(
                 fw_view,
                 init_lambda,
                 prior_score,
+                aux_strength_state,
             );
         }
     }
@@ -4587,7 +4678,7 @@ fn gaussian_reml_fit_latent<'py>(
         fisher_w.as_ref().map(|w| w.as_array()),
     )
     .map_err(py_value_error)?;
-    let (fit, _design) = gaussian_reml_fit_latent_impl(
+    let (fit, _design, aux_strength_state) = gaussian_reml_fit_latent_impl(
         t.as_array(),
         y.as_array(),
         n_obs,
@@ -4607,7 +4698,190 @@ fn gaussian_reml_fit_latent<'py>(
         dim_selection_log_precision.as_ref().map(|a| a.as_array()),
     )
     .map_err(py_value_error)?;
-    gaussian_reml_result_to_pydict(py, fit)
+    let out = PyDict::new(py);
+    set_ok_gaussian_reml_items(py, &out, fit)?;
+    set_aux_strength_items(py, &out, aux_strength_state)?;
+    Ok(out.unbind())
+}
+
+fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
+    match value.to_ascii_lowercase().replace('-', "_").as_str() {
+        "duchon" => SaeAtomBasisKind::Duchon,
+        "periodic" | "periodic_spline" | "circle" => SaeAtomBasisKind::Periodic,
+        "sphere" => SaeAtomBasisKind::Sphere,
+        "euclidean" | "euclidean_patch" => SaeAtomBasisKind::EuclideanPatch,
+        other => SaeAtomBasisKind::Precomputed(other.to_string()),
+    }
+}
+
+#[pyfunction(signature = (
+    z,
+    atom_basis,
+    atom_dim,
+    basis_values,
+    basis_jacobian,
+    basis_sizes,
+    decoder_coefficients,
+    smooth_penalties,
+    initial_logits,
+    initial_coords,
+    alpha,
+    tau,
+    learnable_alpha,
+    sparsity_strength = 1.0,
+    smoothness = 1.0,
+    max_iter = 12,
+    learning_rate = 1.0,
+    ridge_psi = 1.0e-6,
+    ridge_beta = 1.0e-6,
+))]
+#[allow(clippy::too_many_arguments)]
+fn sae_manifold_fit_ibp<'py>(
+    py: Python<'py>,
+    z: PyReadonlyArray2<'py, f64>,
+    atom_basis: Vec<String>,
+    atom_dim: Vec<usize>,
+    basis_values: PyReadonlyArray3<'py, f64>,
+    basis_jacobian: PyReadonlyArray4<'py, f64>,
+    basis_sizes: Vec<usize>,
+    decoder_coefficients: PyReadonlyArray3<'py, f64>,
+    smooth_penalties: PyReadonlyArray3<'py, f64>,
+    initial_logits: PyReadonlyArray2<'py, f64>,
+    initial_coords: PyReadonlyArray3<'py, f64>,
+    alpha: f64,
+    tau: f64,
+    learnable_alpha: bool,
+    sparsity_strength: f64,
+    smoothness: f64,
+    max_iter: usize,
+    learning_rate: f64,
+    ridge_psi: f64,
+    ridge_beta: f64,
+) -> PyResult<Py<PyDict>> {
+    let z_view = z.as_array();
+    let (n_obs, p_out) = z_view.dim();
+    if n_obs == 0 || p_out == 0 {
+        return Err(py_value_error(
+            "sae_manifold_fit_ibp requires a non-empty (N, p) response".to_string(),
+        ));
+    }
+    let k_atoms = atom_dim.len();
+    if k_atoms == 0 {
+        return Err(py_value_error(
+            "sae_manifold_fit_ibp requires at least one atom".to_string(),
+        ));
+    }
+    if atom_basis.len() != k_atoms || basis_sizes.len() != k_atoms {
+        return Err(py_value_error(format!(
+            "sae_manifold_fit_ibp metadata lengths must equal K={k_atoms}; got atom_basis={}, basis_sizes={}",
+            atom_basis.len(),
+            basis_sizes.len()
+        )));
+    }
+    for (name, value) in [
+        ("alpha", alpha),
+        ("tau", tau),
+        ("sparsity_strength", sparsity_strength),
+        ("smoothness", smoothness),
+        ("learning_rate", learning_rate),
+        ("ridge_psi", ridge_psi),
+        ("ridge_beta", ridge_beta),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(py_value_error(format!(
+                "{name} must be finite and positive; got {value}"
+            )));
+        }
+    }
+
+    let coords_view = initial_coords.as_array();
+    let max_dim = coords_view
+        .shape()
+        .get(2)
+        .copied()
+        .ok_or_else(|| {
+            py_value_error("initial_coords must be a rank-3 (K, N, D_max) array".to_string())
+        })?;
+    let mut coord_blocks = Vec::with_capacity(k_atoms);
+    for atom_idx in 0..k_atoms {
+        let d = atom_dim[atom_idx];
+        if d > max_dim {
+            return Err(py_value_error(format!(
+                "atom_dim[{atom_idx}]={d} exceeds initial_coords D_max={max_dim}"
+            )));
+        }
+        coord_blocks.push(coords_view.slice(s![atom_idx, 0..n_obs, 0..d]).to_owned());
+    }
+
+    let basis_kinds: Vec<SaeAtomBasisKind> = atom_basis
+        .iter()
+        .map(|kind| sae_atom_basis_kind_from_str(kind))
+        .collect();
+    let mode = AssignmentMode::ibp_map(tau, alpha, learnable_alpha);
+    let mut term = term_from_padded_blocks_with_mode(
+        n_obs,
+        p_out,
+        &basis_kinds,
+        basis_values.as_array(),
+        basis_jacobian.as_array(),
+        &basis_sizes,
+        &atom_dim,
+        decoder_coefficients.as_array(),
+        smooth_penalties.as_array(),
+        initial_logits.as_array(),
+        &coord_blocks,
+        mode,
+    )
+    .map_err(py_value_error)?;
+
+    let log_ard = atom_dim
+        .iter()
+        .map(|&d| Array1::<f64>::zeros(d))
+        .collect();
+    let rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard);
+    let _ = term.analytic_penalty_descriptors();
+    let loss = term
+        .run_joint_fit_arrow_schur(
+            z_view,
+            &rho,
+            max_iter,
+            learning_rate,
+            ridge_psi,
+            ridge_beta,
+        )
+        .map_err(py_value_error)?;
+
+    let assignments = term.assignment.assignments();
+    let fitted = term.fitted();
+    let atoms_py = PyList::empty(py);
+    for atom_idx in 0..k_atoms {
+        let atom = &term.atoms[atom_idx];
+        let atom_dict = PyDict::new(py);
+        atom_dict.set_item("decoder_B", atom.decoder_coefficients.clone().into_pyarray(py))?;
+        atom_dict.set_item("basis_kind", atom_basis[atom_idx].clone())?;
+        atom_dict.set_item("basis_centers", py.None())?;
+        atom_dict.set_item(
+            "on_atom_coords_t",
+            term.assignment.coords[atom_idx].as_matrix().into_pyarray(py),
+        )?;
+        atom_dict.set_item("assignments_z", assignments.column(atom_idx).to_owned().into_pyarray(py))?;
+        atom_dict.set_item("active_dim", atom_dim[atom_idx])?;
+        atoms_py.append(atom_dict)?;
+    }
+
+    let active_mask: Vec<bool> = (0..k_atoms)
+        .map(|atom_idx| assignments.column(atom_idx).sum() > 1.0e-8)
+        .collect();
+    let out = PyDict::new(py);
+    out.set_item("atoms", atoms_py)?;
+    out.set_item("assignments_z", assignments.into_pyarray(py))?;
+    out.set_item("atom_active_mask", active_mask)?;
+    out.set_item("fitted", fitted.into_pyarray(py))?;
+    out.set_item("reml_score", loss.evidence_proxy())?;
+    out.set_item("log_alpha", alpha.ln() + if learnable_alpha { rho.log_lambda_sparse } else { 0.0 })?;
+    out.set_item("log_lambda_smooth", rho.log_lambda_smooth)?;
+    out.set_item("assignment_prior", "ibp_map")?;
+    Ok(out.unbind())
 }
 
 /// Backward pass: compute `grad_t` and the standard REML adjoint
@@ -4887,27 +5161,23 @@ fn gaussian_reml_fit_latent_backward<'py>(
     let mut grad_dim_selection_log_precision: Option<Array1<f64>> = None;
     if let Some(u_arr) = aux_u.as_ref() {
         let u_view = u_arr.as_array();
-        let targets = aux_prior_targets(t_mat.view(), u_view, family)
+        let stats = latent_aux_prior_stats(t_mat.view(), u_view, family, aux_strength)
             .map_err(py_value_error)?;
-        let mu = aux_strength.unwrap_or(1.0);
-        if !(mu.is_finite() && mu > 0.0) {
-            return Err(py_value_error(format!(
-                "aux_strength must be finite and positive; got {mu}"
-            )));
-        }
-        let mut sq = 0.0_f64;
+        let residual = &t_mat - &stats.targets;
+        let projected_residual = aux_prior_targets(residual.view(), u_view, family)
+            .map_err(py_value_error)?;
+        let grad_base = residual - projected_residual;
         for n in 0..n_obs {
             for a in 0..latent_dim {
-                let diff = t_mat[[n, a]] - targets[[n, a]];
-                sq += diff * diff;
                 if grad_reml_score != 0.0 {
-                    grad_t[n * latent_dim + a] += grad_reml_score * mu * diff;
+                    grad_t[n * latent_dim + a] +=
+                        grad_reml_score * stats.strength.mu * grad_base[[n, a]];
                 }
             }
         }
-        let effective_dim = (n_obs * latent_dim) as f64;
-        grad_aux_log_strength =
-            Some(grad_reml_score * (0.5 * mu * sq - 0.5 * effective_dim));
+        grad_aux_log_strength = Some(
+            grad_reml_score * (0.5 * stats.strength.mu * stats.residual_sq - 0.5 * n_obs as f64),
+        );
     }
     if let Some(log_prec) = dim_selection_log_precision.as_ref() {
         let lp = log_prec.as_array();
@@ -5001,7 +5271,12 @@ fn glm_reml_fit_latent_impl(
     aux_family: AuxPriorFamily,
     aux_strength: Option<f64>,
     dim_selection_precision: Option<ArrayView1<'_, f64>>,
-) -> Result<(gam::estimate::ExternalOptimResult, Array2<f64>, Array2<f64>), String> {
+) -> Result<(
+    gam::estimate::ExternalOptimResult,
+    Array2<f64>,
+    Array2<f64>,
+    Option<LatentAuxStrengthState>,
+), String> {
     if y.ncols() != 1 {
         return Err(format!(
             "glm_reml_fit_latent currently requires y with one column; got {}",
@@ -5055,21 +5330,11 @@ fn glm_reml_fit_latent_impl(
     )
     .map_err(|err| err.to_string())?;
     let mut latent_prior_score = 0.0_f64;
+    let mut aux_strength_state = None;
     if let Some(u_view) = aux_u {
-        let targets = aux_prior_targets(t_mat.view(), u_view, aux_family)?;
-        let mu = aux_strength.unwrap_or(1.0);
-        if !(mu.is_finite() && mu > 0.0) {
-            return Err(format!("aux_strength must be finite and positive; got {mu}"));
-        }
-        let mut sq = 0.0_f64;
-        for n in 0..n_obs {
-            for a in 0..latent_dim {
-                let diff = t_mat[[n, a]] - targets[[n, a]];
-                sq += diff * diff;
-            }
-        }
-        let effective_dim = (n_obs * latent_dim) as f64;
-        latent_prior_score += 0.5 * mu * sq - 0.5 * effective_dim * mu.ln();
+        let stats = latent_aux_prior_stats(t_mat.view(), u_view, aux_family, aux_strength)?;
+        latent_prior_score += stats.score;
+        aux_strength_state = Some(stats.strength);
     }
     if let Some(log_prec) = dim_selection_precision {
         if log_prec.len() != latent_dim {
@@ -5096,7 +5361,7 @@ fn glm_reml_fit_latent_impl(
         }
     }
     fit.reml_score += latent_prior_score;
-    Ok((fit, design, t_mat))
+    Ok((fit, design, t_mat, aux_strength_state))
 }
 
 fn set_ok_glm_latent_items<'py>(
@@ -5105,6 +5370,7 @@ fn set_ok_glm_latent_items<'py>(
     fit: gam::estimate::ExternalOptimResult,
     n_obs: usize,
     p: usize,
+    aux_strength_state: Option<LatentAuxStrengthState>,
 ) -> PyResult<()> {
     let pirls = fit.artifacts.pirls.as_ref().ok_or_else(|| {
         py_value_error("latent GLM fit did not return PIRLS artifacts".to_string())
@@ -5143,6 +5409,7 @@ fn set_ok_glm_latent_items<'py>(
     out.set_item("cache_logdet_penalty_positive", f64::NAN)?;
     out.set_item("cache_penalty_rank", 0_usize)?;
     out.set_item("cache_nullity", 0_usize)?;
+    set_aux_strength_items(py, out, aux_strength_state)?;
     Ok(())
 }
 
@@ -5207,7 +5474,7 @@ fn glm_reml_fit_latent<'py>(
             m,
         )
         .map_err(py_value_error)?;
-        let prior_score = latent_prior_score_for_t(
+        let (prior_score, aux_strength_state) = latent_prior_score_and_aux_state_for_t(
             t_mat.view(),
             aux_u.as_ref().map(|a| a.as_array()),
             aux_family,
@@ -5225,6 +5492,7 @@ fn glm_reml_fit_latent<'py>(
             init_lambda,
             &family_name,
             prior_score,
+            aux_strength_state,
         );
     }
     let family = latent_glm_family_from_str(&family).map_err(py_value_error)?;
@@ -5234,7 +5502,7 @@ fn glm_reml_fit_latent<'py>(
         fisher_w.as_ref().map(|w| w.as_array()),
     )
     .map_err(py_value_error)?;
-    let (fit, design, _) = glm_reml_fit_latent_impl(
+    let (fit, design, _, aux_strength_state) = glm_reml_fit_latent_impl(
         t.as_array(),
         y.as_array(),
         n_obs,
@@ -5252,7 +5520,7 @@ fn glm_reml_fit_latent<'py>(
     )
     .map_err(py_value_error)?;
     let out = PyDict::new(py);
-    set_ok_glm_latent_items(py, &out, fit, n_obs, design.ncols())?;
+    set_ok_glm_latent_items(py, &out, fit, n_obs, design.ncols(), aux_strength_state)?;
     Ok(out.unbind())
 }
 
@@ -5318,7 +5586,7 @@ fn glm_reml_fit_latent_backward<'py>(
         fisher_w.as_ref().map(|w| w.as_array()),
     )
     .map_err(py_value_error)?;
-    let (fit, design, t_mat) = glm_reml_fit_latent_impl(
+    let (fit, design, t_mat, _) = glm_reml_fit_latent_impl(
         t.as_array(),
         y.as_array(),
         n_obs,
@@ -5409,21 +5677,24 @@ fn glm_reml_fit_latent_backward<'py>(
         }
     }
 
+    let mut grad_aux_log_strength: Option<f64> = None;
     if let Some(u_arr) = aux_u.as_ref() {
-        let targets = aux_prior_targets(t_mat.view(), u_arr.as_array(), aux_family)
+        let u_view = u_arr.as_array();
+        let stats = latent_aux_prior_stats(t_mat.view(), u_view, aux_family, aux_strength)
             .map_err(py_value_error)?;
-        let mu = aux_strength.unwrap_or(1.0);
-        if !(mu.is_finite() && mu > 0.0) {
-            return Err(py_value_error(format!(
-                "aux_strength must be finite and positive; got {mu}"
-            )));
-        }
+        let residual = &t_mat - &stats.targets;
+        let projected_residual = aux_prior_targets(residual.view(), u_view, aux_family)
+            .map_err(py_value_error)?;
+        let grad_base = residual - projected_residual;
         for n in 0..n_obs {
             for a in 0..latent_dim {
                 grad_t[n * latent_dim + a] +=
-                    grad_reml_score * mu * (t_mat[[n, a]] - targets[[n, a]]);
+                    grad_reml_score * stats.strength.mu * grad_base[[n, a]];
             }
         }
+        grad_aux_log_strength = Some(
+            grad_reml_score * (0.5 * stats.strength.mu * stats.residual_sq - 0.5 * n_obs as f64),
+        );
     }
     if let Some(log_prec) = dim_selection_log_precision.as_ref() {
         let lp = log_prec.as_array();
@@ -5454,6 +5725,11 @@ fn glm_reml_fit_latent_backward<'py>(
     }
     let out = PyDict::new(py);
     out.set_item("grad_t", grad_t_matrix.into_pyarray(py))?;
+    if let Some(grad) = grad_aux_log_strength {
+        out.set_item("grad_aux_log_strength", grad)?;
+    } else {
+        out.set_item("grad_aux_log_strength", py.None())?;
+    }
     Ok(out.unbind())
 }
 
@@ -7662,19 +7938,24 @@ fn matern_input_location_first_derivative<'py>(
 /// Closed-form `(N, n_centers, dim)` jet of the Sobolev sphere kernel
 /// w.r.t. ambient coordinates `t_n ∈ S^{dim-1}`.
 ///
-/// Caller is responsible for the tangent projection if they want the
-/// intrinsic Riemannian gradient (`g − (g · t) t`); this helper returns
-/// the un-projected ambient gradient so the consumer can choose its own
-/// retraction / chart.
-#[pyfunction(signature = (points, centers, penalty_order = 2))]
+/// The returned jet is tangent-projected by default for the intrinsic
+/// Riemannian gradient (`g − (g · t) t`) used by embedded sphere updates.
+/// Pass `project_to_tangent = false` to receive the ambient gradient.
+#[pyfunction(signature = (points, centers, penalty_order = 2, project_to_tangent = true))]
 fn sphere_input_location_first_derivative<'py>(
     py: Python<'py>,
     points: PyReadonlyArray2<'py, f64>,
     centers: PyReadonlyArray2<'py, f64>,
     penalty_order: usize,
+    project_to_tangent: bool,
 ) -> PyResult<Py<PyArray3<f64>>> {
-    let jet = sphere_first_derivative_nd(points.as_array(), centers.as_array(), penalty_order)
-        .map_err(|err| py_value_error(err.to_string()))?;
+    let jet = sphere_first_derivative_nd(
+        points.as_array(),
+        centers.as_array(),
+        penalty_order,
+        project_to_tangent,
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
     Ok(jet.into_pyarray(py).unbind())
 }
 
@@ -7819,6 +8100,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_latent, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;
     module.add_function(wrap_pyfunction!(
         gaussian_reml_fit_latent_backward,
         module
