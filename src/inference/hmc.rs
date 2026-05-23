@@ -1197,7 +1197,7 @@ mod tests {
                 edf_by_block: vec![],
                 edf_total: 2.0,
                 smoothing_correction: None,
-                penalized_hessian: hessian.clone(),
+                penalized_hessian: hessian.clone().into(),
                 working_weights: array![1.0, 1.0, 1.0],
                 working_response: array![0.0, 0.1, -0.2],
                 reparam_qs: None,
@@ -1257,7 +1257,7 @@ mod tests {
             ],
             None,
             Some(FitGeometry {
-                penalized_hessian: hessian.clone(),
+                penalized_hessian: hessian.clone().into(),
                 working_weights: array![1.0, 0.8],
                 working_response: array![0.0, 0.1],
             }),
