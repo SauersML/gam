@@ -1457,6 +1457,9 @@ fn shape_dual(v: f64) -> ShapeDual {
     ShapeDual::constant(v)
 }
 
+// Analytic shape partials for I_x(a,b), obtained by differentiating the same
+// regularized-beta continued fraction used by statrs. The normalizing term uses
+// d log B(a,b) / da = psi(a) - psi(a+b) and likewise for b.
 fn beta_reg_with_shape_partials(a0: f64, b0: f64, x0: f64) -> (f64, f64, f64) {
     if x0 <= 0.0 {
         return (0.0, 0.0, 0.0);
@@ -1535,7 +1538,12 @@ fn beta_reg_with_shape_partials(a0: f64, b0: f64, x0: f64) -> (f64, f64, f64) {
             };
         }
     }
-    (f64::NAN, f64::NAN, f64::NAN)
+    let reg = bt * h / a;
+    if symm_transform {
+        (1.0 - reg.v, -reg.da, -reg.db)
+    } else {
+        (reg.v, reg.da, reg.db)
+    }
 }
 
 /// Beta-Logistic inverse-link jet for:
