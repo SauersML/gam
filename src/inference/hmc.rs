@@ -685,21 +685,33 @@ impl NutsPosterior {
         // This single dim×dim symmetric matvec replaces both the per-step
         // S·β multiply and the L^T·∇_β penalty chain-rule multiply, and lets
         // the penalty value, β-gradient and chain rule fuse into one pass.
+        //
+        // The module invariant `Vb = φ · H^{-1}` with `H = X'WX + S` requires
+        // that the prior is `1/φ`-scaled whenever the likelihood is (Gaussian,
+        // GammaLog with the shape ≡ 1/φ scaling at `gamma_log_logp_and_grad`).
+        // For fixed-scale families (Bernoulli / Poisson) `φ ≡ 1` so
+        // `inv_phi = 1` collapses this to the original expression. This
+        // mirrors the `penalty_scale` branching in `LinkWigglePosterior`.
+        use crate::inference::dispersion_cov::DispersionExt as _;
+        let penalty_scale = match self.nuts_family {
+            NutsFamily::Gaussian | NutsFamily::GammaLog => self.data.dispersion.inv_phi(),
+            _ => 1.0,
+        };
         let mz = self.penalty_z_quad.dot(z);
         let lin_term = self.penalty_z_lin.dot(z);
         let quad_term = 0.5 * z.dot(&mz);
-        let penalty = self.penalty_z_const + lin_term + quad_term;
+        let penalty = penalty_scale * (self.penalty_z_const + lin_term + quad_term);
 
         // === Step 5: z-space gradient ===
-        // ∇z log p = L^T ∇_β ℓ  −  (l + M z)
+        // ∇z log p = L^T ∇_β ℓ  −  penalty_scale · (l + M z)
         let mut gradz = self.chol_t.dot(&grad_ll_beta);
-        // gradz -= (penalty_z_lin + M z); fused parallel per-element update.
+        // gradz -= penalty_scale · (penalty_z_lin + M z); fused parallel update.
         let lin_view = self.penalty_z_lin.view();
         ndarray::Zip::from(&mut gradz)
             .and(&lin_view)
             .and(&mz)
             .par_for_each(|g, &l, &m| {
-                *g -= l + m;
+                *g -= penalty_scale * (l + m);
             });
 
         let logp = ll + firth_logdet - penalty;
@@ -2802,6 +2814,31 @@ fn forward_solve_lower_triangular(l: &Array2<f64>, rhs: &Array1<f64>, out: &mut 
     }
 }
 
+/// Back-substitution against `L^T x = rhs`, with `L` a lower-triangular factor.
+///
+/// For `Q = L Lᵀ`, a draw `x ~ N(0, Q⁻¹)` is obtained from `z ~ N(0, I)` via
+/// `x = L^{-T} z`, i.e. solving `Lᵀ x = z` by back-substitution. Using the
+/// forward solve (`L x = z`) instead would produce `Var(x) = L⁻¹ L^{-T}`,
+/// which equals `Q⁻¹` only when `L` is symmetric — wrong in general.
+#[inline]
+fn back_solve_lower_transposed(l: &Array2<f64>, rhs: &Array1<f64>, out: &mut Array1<f64>) {
+    let p = rhs.len();
+    debug_assert_eq!(l.nrows(), p);
+    debug_assert_eq!(l.ncols(), p);
+    debug_assert_eq!(out.len(), p);
+    // Solve Lᵀ x = rhs from the bottom row up. Row i of Lᵀ has nonzeros
+    // at columns j ≥ i (= column i of L at rows j ≥ i), so
+    //   rhs[i] = L[i,i] · x[i] + Σ_{j>i} L[j,i] · x[j].
+    for i in (0..p).rev() {
+        let mut v = rhs[i];
+        for j in (i + 1)..p {
+            v -= l[[j, i]] * out[j];
+        }
+        let d = l[[i, i]];
+        out[i] = if d.abs() > 1e-14 { v / d } else { 0.0 };
+    }
+}
+
 /// Runs a Pólya-Gamma Gibbs sampler for Bernoulli-logit models.
 ///
 /// This sampler is gradient-free: each iteration alternates
@@ -2908,7 +2945,7 @@ pub fn run_logit_polya_gamma_gibbs(
                 z[j] = sample_standard_normal(&mut rng);
             }
             let l = factor.lower_triangular();
-            forward_solve_lower_triangular(&l, &z, &mut noise);
+            back_solve_lower_transposed(&l, &z, &mut noise);
             beta.assign(&(&mean + &noise));
 
             if iter < config.nwarmup {
@@ -3075,7 +3112,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
                 z[j] = sample_standard_normal(&mut rng);
             }
             let l = factor.lower_triangular();
-            forward_solve_lower_triangular(&l, &z, &mut noise);
+            back_solve_lower_transposed(&l, &z, &mut noise);
             beta.assign(&(&mean + &noise));
 
             if iter < config.nwarmup {

@@ -111,7 +111,10 @@ impl VectorNoise {
                             "VectorNoise::LowRank: diag[{j}] must be > 0 (got {d})",
                         )));
                     }
-                    out[j] = 1.0 / d;
+                    // `diag` is the PRECISION diagonal (W = diag(d) + F·Fᵀ),
+                    // matching the `LowRankWeight::symmetric` contract used by
+                    // `as_low_rank_weight`. Pass it through unchanged.
+                    out[j] = d;
                 }
                 Ok(out)
             }
@@ -183,16 +186,24 @@ pub trait VectorLikelihood {
 
 /// Gaussian vector likelihood with identity link.
 ///
-/// `log p(Y|η) = −½ Σ_n Σ_m w_n · prec_m · (Y_{n,m} − η_{n,m})²` (up to the
-/// constant log-determinant of the noise covariance, dropped here because it
-/// does not depend on β or the latent t; the determinant is accounted for in
-/// the REML score, not the inner likelihood).
+/// `log p(Y|η) = −½ Σ_n w_n · rᵀ W r` where `r = Y_n − η_n` and `W` is the
+/// per-output **precision** matrix. For Isotropic / Diagonal `W = diag(prec)`;
+/// for `LowRank` it is `W = diag(prec) + F · Fᵀ`, with `F` carried alongside
+/// the diagonal here.
+///
+/// (Up to the constant log-determinant of the noise covariance, dropped here
+/// because it does not depend on β or the latent t; the determinant is
+/// accounted for in the REML score, not the inner likelihood.)
 #[derive(Clone, Debug)]
 pub struct GaussianVectorLikelihood {
-    /// Per-output diagonal precision (length M). For Isotropic/Diagonal/LowRank
-    /// this is `1/σ_m²` (LowRank's off-diagonal correction is applied through
-    /// Piece 5's `LowRankWeight` outside this struct).
+    /// Per-output diagonal precision (length M). For Isotropic / Diagonal /
+    /// LowRank this is the diagonal piece of the precision matrix
+    /// (`1/σ_m²` for Diagonal/Isotropic; `diag` for LowRank).
     pub precision: Array1<f64>,
+    /// Optional dense rank-r factor `F` of size `(M, r)` such that the full
+    /// per-row precision is `diag(precision) + F · Fᵀ`. `None` for the
+    /// Isotropic / Diagonal cases.
+    pub factor: Option<Array2<f64>>,
     /// Optional row weights (length N), or None for uniform.
     pub row_weights: Option<Array1<f64>>,
 }
@@ -200,8 +211,22 @@ pub struct GaussianVectorLikelihood {
 impl GaussianVectorLikelihood {
     pub fn from_target(target: &VectorResponseTarget) -> Result<Self, EstimationError> {
         let precision = target.noise.diag_precision(target.m())?;
+        let factor = match &target.noise {
+            VectorNoise::LowRank { factor, .. } => {
+                if factor.nrows() != target.m() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "VectorNoise::LowRank: factor has {} rows but M={}",
+                        factor.nrows(),
+                        target.m()
+                    )));
+                }
+                Some(factor.clone())
+            }
+            _ => None,
+        };
         Ok(Self {
             precision,
+            factor,
             row_weights: target.row_weights.clone(),
         })
     }
@@ -216,13 +241,33 @@ impl VectorLikelihood for GaussianVectorLikelihood {
     fn log_lik(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> f64 {
         debug_assert_eq!(eta.dim(), y.dim());
         debug_assert_eq!(eta.ncols(), self.precision.len());
+        let m = eta.ncols();
+        let rank = self.factor.as_ref().map_or(0, |f| f.ncols());
         let mut acc = 0.0;
+        // Scratch buffer for Fᵀ r (length rank), reused across rows.
+        let mut ftr = vec![0.0f64; rank];
         for n in 0..eta.nrows() {
             let w = self.row_weight(n);
+            // Diagonal part: Σ_m d_m r_m²
             let mut row_acc = 0.0;
-            for m in 0..eta.ncols() {
-                let r = y[[n, m]] - eta[[n, m]];
-                row_acc += self.precision[m] * r * r;
+            for j in 0..m {
+                let r = y[[n, j]] - eta[[n, j]];
+                row_acc += self.precision[j] * r * r;
+            }
+            // Low-rank part: ||Fᵀ r||²
+            if let Some(f) = self.factor.as_ref() {
+                for k in 0..rank {
+                    ftr[k] = 0.0;
+                }
+                for j in 0..m {
+                    let r = y[[n, j]] - eta[[n, j]];
+                    for k in 0..rank {
+                        ftr[k] += f[[j, k]] * r;
+                    }
+                }
+                for k in 0..rank {
+                    row_acc += ftr[k] * ftr[k];
+                }
             }
             acc += w * row_acc;
         }
@@ -232,25 +277,69 @@ impl VectorLikelihood for GaussianVectorLikelihood {
     fn grad_eta(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64> {
         debug_assert_eq!(eta.dim(), y.dim());
         let (n_rows, n_cols) = eta.dim();
+        let rank = self.factor.as_ref().map_or(0, |f| f.ncols());
         let mut out = Array2::<f64>::zeros((n_rows, n_cols));
+        let mut ftr = vec![0.0f64; rank];
         for n in 0..n_rows {
             let w = self.row_weight(n);
-            for m in 0..n_cols {
-                // ∂/∂η_{n,m} of −½ w · prec_m · (y − η)² = w · prec_m · (y − η)
-                out[[n, m]] = w * self.precision[m] * (y[[n, m]] - eta[[n, m]]);
+            // Diagonal part: w · d_m · (y − η)_m
+            for j in 0..n_cols {
+                out[[n, j]] = w * self.precision[j] * (y[[n, j]] - eta[[n, j]]);
+            }
+            // Low-rank part: + w · F (Fᵀ r) for r = y − η
+            if let Some(f) = self.factor.as_ref() {
+                for k in 0..rank {
+                    ftr[k] = 0.0;
+                }
+                for j in 0..n_cols {
+                    let r = y[[n, j]] - eta[[n, j]];
+                    for k in 0..rank {
+                        ftr[k] += f[[j, k]] * r;
+                    }
+                }
+                for j in 0..n_cols {
+                    let mut s = 0.0;
+                    for k in 0..rank {
+                        s += f[[j, k]] * ftr[k];
+                    }
+                    out[[n, j]] += w * s;
+                }
             }
         }
         out
     }
 
     fn hess_diag(&self, eta: ArrayView2<f64>, _y: ArrayView2<f64>) -> Array2<f64> {
-        // −∂² log p / ∂η² = w · prec_m, independent of η for Gaussian-identity.
+        // −∂² log p / ∂η² = w · (diag(d) + F·Fᵀ); the diagonal of (F·Fᵀ)
+        // at output m is Σ_k F[m, k]². Cross terms F[m, k]·F[m', k] live in
+        // the dense rank-r correction returned by `hess_full` (only exposed
+        // via the `GaussianVectorLikelihood` API; the `VectorLikelihood`
+        // trait sees the diagonal preconditioner).
         let (n_rows, n_cols) = eta.dim();
         let mut out = Array2::<f64>::zeros((n_rows, n_cols));
+        // Pre-compute Σ_k F[m, k]² per output m (independent of n).
+        let f_row_sqsum: Option<Array1<f64>> = self.factor.as_ref().map(|f| {
+            let m = f.nrows();
+            let r = f.ncols();
+            let mut s = Array1::<f64>::zeros(m);
+            for j in 0..m {
+                let mut acc = 0.0;
+                for k in 0..r {
+                    let v = f[[j, k]];
+                    acc += v * v;
+                }
+                s[j] = acc;
+            }
+            s
+        });
         for n in 0..n_rows {
             let w = self.row_weight(n);
-            for m in 0..n_cols {
-                out[[n, m]] = w * self.precision[m];
+            for j in 0..n_cols {
+                let mut d = self.precision[j];
+                if let Some(s) = f_row_sqsum.as_ref() {
+                    d += s[j];
+                }
+                out[[n, j]] = w * d;
             }
         }
         out

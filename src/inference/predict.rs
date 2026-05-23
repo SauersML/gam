@@ -113,9 +113,24 @@ fn conditional_prediction_backend<'a>(
         );
     }
     if let Some(hessian) = usable_penalized_hessian(fit, expected_dim, label) {
-        match PredictionCovarianceBackend::from_factorized_hessian(SymmetricMatrix::Dense(
-            hessian.clone(),
-        )) {
+        // The penalized Hessian is the *unscaled* precision `H = X'WX + S`,
+        // but the conditional covariance the predict path expects is
+        // `Vb = φ · H^{-1}` (matches the stored `beta_covariance()` route
+        // above). Without this scale the Hessian fallback would silently
+        // drop dispersion. For families with `φ = 1` (Binomial / Poisson)
+        // this collapses to the original behavior.
+        let phi = fit
+            .dispersion()
+            .map(|d| {
+                use crate::inference::dispersion_cov::DispersionExt as _;
+                let inv_phi = d.inv_phi();
+                if inv_phi > 0.0 { 1.0 / inv_phi } else { 1.0 }
+            })
+            .unwrap_or(1.0);
+        match PredictionCovarianceBackend::from_factorized_hessian_scaled(
+            SymmetricMatrix::Dense(hessian.clone()),
+            phi,
+        ) {
             Ok(backend) => return Some(backend),
             Err(err) => {
                 log::warn!(

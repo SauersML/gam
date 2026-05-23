@@ -422,6 +422,17 @@ pub struct IsometryPenalty {
     /// analytically from `φ'(r)` and the public `φ''(r)` jet helper. This is
     /// the exact chain-rule path for callers that do not pre-cache `∂J/∂t`.
     pub duchon_radial_source: Option<Arc<IsometryDuchonRadialSource>>,
+    /// Optional cached per-row Jacobian *third derivative*
+    /// `K_n ∈ ℝ^{p × d × d × d}`, flattened row-major as
+    /// `(n_obs, p * d * d * d)`. When present, `hvp` uses the full
+    /// residual-curvature Hessian (proposal §4(b)):
+    ///   B_{ab,cd} = K_{a,cd}^T W J_b + H_{a,c}^T W H_{b,d}
+    ///             + H_{a,d}^T W H_{b,c} + J_a^T W K_{b,cd}.
+    /// When absent, `hvp` falls back to the Gauss-Newton surrogate
+    /// `μ A^T A v` (which drops the residual third-derivative term). See
+    /// the `hvp` documentation: the GN surrogate is an approximation and
+    /// is not claimed to be exact.
+    pub cache_third_decoder_derivative: Option<Arc<ndarray::Array3<f64>>>,
     /// Output dimensionality `p` (column count of each per-row Jacobian).
     pub p_out: usize,
     /// Per-row behavioral metric in low-rank factored form. Defaults to
@@ -441,9 +452,21 @@ impl IsometryPenalty {
             jacobian_cache: None,
             jacobian_second_cache: None,
             duchon_radial_source: None,
+            cache_third_decoder_derivative: None,
             p_out,
             weight: WeightField::Identity,
         }
+    }
+
+    /// Attach a cached third decoder derivative
+    /// `K_n[i, a, c, d] = ∂²J_n[i, a] / ∂t_{n, c} ∂t_{n, d}`, flattened
+    /// row-major as `(n_obs, p * d * d * d)`. When present, the Hessian-
+    /// vector product uses the full residual-curvature term in addition
+    /// to the Gauss-Newton piece; when absent, the GN surrogate is used
+    /// and explicitly documented as an approximation.
+    pub fn with_third_decoder_derivative(mut self, k: Arc<ndarray::Array3<f64>>) -> Self {
+        self.cache_third_decoder_derivative = Some(k);
+        self
     }
 
     pub fn with_reference(mut self, reference: IsometryReference) -> Self {
@@ -1303,15 +1326,19 @@ impl AnalyticPenalty for SparsityPenalty {
                 }
             }
             SparsityKind::Hoyer => {
-                // ∂(L1)/∂x_i = sign(x_i); ∂(L2)/∂x_i = x_i / L2.
+                // P(x) = A · (L1/L2 - 1), A = lam / (sqrt(n) - 1).
+                // ∂P/∂x_i = A · (sign(x_i)/L2 - L1 · x_i / L2³).
                 let n = target.len() as f64;
+                debug_assert!(n > 1.0, "Hoyer requires n > 1");
                 let l1: f64 = target.iter().map(|x| x.abs()).sum();
                 let l2: f64 = target.iter().map(|x| x * x).sum::<f64>().sqrt();
                 if l2 == 0.0 {
                     return g;
                 }
                 let denom = n.sqrt() - 1.0;
-                let coeff = lam / denom;
+                let a = lam / denom;
+                let inv_l2 = 1.0 / l2;
+                let inv_l2_cubed = inv_l2 * inv_l2 * inv_l2;
                 for (i, &x) in target.iter().enumerate() {
                     let sgn = if x > 0.0 {
                         1.0
@@ -1320,7 +1347,7 @@ impl AnalyticPenalty for SparsityPenalty {
                     } else {
                         0.0
                     };
-                    g[i] = coeff * (n.sqrt() * (sgn / l2 - l1 * x / (l2 * l2 * l2)));
+                    g[i] = a * (sgn * inv_l2 - l1 * x * inv_l2_cubed);
                 }
             }
             SparsityKind::Log { .. } => {
@@ -1350,34 +1377,125 @@ impl AnalyticPenalty for SparsityPenalty {
                 Some(d)
             }
             SparsityKind::Log { .. } => {
+                // The TRUE second derivative of λ log(1 + x²/δ²) is
+                //   2λ(δ² − x²)/(δ² + x²)²
+                // which is NEGATIVE for |x| > δ — i.e. Log is nonconvex.
+                // We therefore expose the IRLS (MM) MAJORIZER
+                //   2λ / (δ² + x²)
+                // through `hessian_diag`. This is always strictly positive,
+                // matches the true Hessian at |x| = 0, and is the standard
+                // re-weighted ℓ₂ surrogate used by IRLS-based log-sparsity
+                // solvers. PSD consumers (preconditioner, `log_det_plus_λI`,
+                // FrozenAnalyticPenaltyOp routing) thus see a PSD operator
+                // even though `value` and `grad_target` use the exact log.
                 let d2 = smooth * smooth;
                 for (i, &x) in target.iter().enumerate() {
                     let denom = d2 + x * x;
-                    d[i] = lam * 2.0 * (d2 - x * x) / (denom * denom);
+                    d[i] = lam * 2.0 / denom;
                 }
                 Some(d)
             }
-            // Hoyer's Hessian is dense (couples through L2). Provide the
-            // *diagonal* part only — the consumer that wants exact HVP must
-            // override (we expose `hvp` below for the rank-1 + diagonal
-            // form). Diagonal piece:
-            //   ∂²H/∂x_i² = (√n/((√n−1) L2)) · ( 3 L1 x_i² / L2⁴ − 1/L2² · something ).
-            // For an inner-loop preconditioner we use the L2-curvature term
-            // `λ · √n · L1 / ((√n−1) · L2³)` which is the dominant positive
-            // diagonal contribution near sparse minima.
+            // Hoyer's Hessian is DENSE and NOT generally PSD (Hoyer is a
+            // nonconvex sparsifier). We cannot return a meaningful diagonal
+            // that would be safe to use as a preconditioner / Newton block
+            // through the standard `hessian_diag` path, so we return `None`
+            // and force callers through `hvp`. See `hvp` below for the exact
+            // dense-Hessian-vector product.
             SparsityKind::Hoyer => {
-                let n = target.len() as f64;
+                let _ = d;
+                None
+            }
+        }
+    }
+
+    fn hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        // For SmoothedL1/Log/Hoyer we route through the closed-form Hessian.
+        // SmoothedL1 and Log have purely diagonal Hessians and would
+        // ordinarily reach the diagonal branch of the default `hvp`; we
+        // override here to also serve Hoyer (whose Hessian is dense
+        // rank-1-plus-diagonal).
+        let (lam, smooth) = self.resolved(rho);
+        let n_target = target.len();
+        assert_eq!(v.len(), n_target, "hvp dimension mismatch");
+        match self.kind {
+            SparsityKind::SmoothedL1 { .. } => {
+                let mut out = Array1::<f64>::zeros(n_target);
+                let eps2 = smooth * smooth;
+                for (i, &x) in target.iter().enumerate() {
+                    let r = (x * x + eps2).sqrt();
+                    out[i] = lam * eps2 / (r * r * r) * v[i];
+                }
+                out
+            }
+            SparsityKind::Log { .. } => {
+                // PSD IRLS majorizer 2λ/(δ²+x²) — matches `hessian_diag`.
+                // The true second derivative 2λ(δ²−x²)/(δ²+x²)² is not used
+                // here because it is indefinite (negative for |x|>δ) and
+                // would break the PSD contract `FrozenAnalyticPenaltyOp`
+                // exposes through `matvec` to the canonical PIRLS / log-det
+                // pipeline. IRLS / MM theory: the surrogate is a global
+                // upper bound on the log-sparsity penalty and agrees with
+                // the exact Hessian at x = 0.
+                let mut out = Array1::<f64>::zeros(n_target);
+                let d2 = smooth * smooth;
+                for (i, &x) in target.iter().enumerate() {
+                    let denom = d2 + x * x;
+                    out[i] = lam * 2.0 / denom * v[i];
+                }
+                out
+            }
+            SparsityKind::Hoyer => {
+                // P(x) = A · (L1/L2 - 1), A = lam / (sqrt(n) - 1).
+                // H_ij = A · [ -s_i x_j/L2³ - x_i s_j/L2³
+                //              - L1 δ_ij/L2³ + 3 L1 x_i x_j/L2⁵ ]
+                // (Hv)_i = A · [ -s_i (xᵀv)/L2³ - x_i (sᵀv)/L2³
+                //                - L1 v_i/L2³ + 3 L1 x_i (xᵀv)/L2⁵ ]
+                let n = n_target as f64;
+                debug_assert!(n > 1.0, "Hoyer requires n > 1");
                 let l1: f64 = target.iter().map(|x| x.abs()).sum();
                 let l2: f64 = target.iter().map(|x| x * x).sum::<f64>().sqrt();
+                let mut out = Array1::<f64>::zeros(n_target);
                 if l2 == 0.0 {
-                    return Some(d);
+                    return out;
                 }
-                let denom = n.sqrt() - 1.0;
-                let coeff = lam * n.sqrt() * l1 / (denom * l2 * l2 * l2);
-                for i in 0..target.len() {
-                    d[i] = coeff;
+                let a = lam / (n.sqrt() - 1.0);
+                let inv_l2_cubed = 1.0 / (l2 * l2 * l2);
+                let inv_l2_5 = inv_l2_cubed / (l2 * l2);
+                let mut x_dot_v = 0.0;
+                let mut s_dot_v = 0.0;
+                for i in 0..n_target {
+                    let xi = target[i];
+                    let si = if xi > 0.0 {
+                        1.0
+                    } else if xi < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                    x_dot_v += xi * v[i];
+                    s_dot_v += si * v[i];
                 }
-                Some(d)
+                for i in 0..n_target {
+                    let xi = target[i];
+                    let si = if xi > 0.0 {
+                        1.0
+                    } else if xi < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                    out[i] = a
+                        * (-si * x_dot_v * inv_l2_cubed
+                            - xi * s_dot_v * inv_l2_cubed
+                            - l1 * v[i] * inv_l2_cubed
+                            + 3.0 * l1 * xi * x_dot_v * inv_l2_5);
+                }
+                out
             }
         }
     }
@@ -1460,16 +1578,43 @@ pub struct ARDPenalty {
     pub latent_dim: usize,
     /// Local ρ indices for the `d` per-axis log-precisions.
     pub rho_indices: Vec<usize>,
+    /// Effective number of observations contributing to each latent axis.
+    /// Enters the per-axis log-determinant Occam term in `grad_rho`:
+    /// at an unused axis (Σ_n t_{n,j}² = 0) the gradient becomes
+    /// `-n_eff / 2`, which under minimization pushes ρ_j → +∞ and prunes
+    /// the axis. Default is the number of latent-row observations
+    /// (`target.len() / latent_dim`).
+    pub n_eff: f64,
 }
 
 impl ARDPenalty {
     pub fn new(target: PsiSlice, latent_dim: usize) -> Self {
+        debug_assert!(latent_dim > 0, "ARDPenalty requires latent_dim > 0");
+        let n_obs = if latent_dim == 0 {
+            0
+        } else {
+            target.len() / latent_dim
+        };
         let rho_indices = (0..latent_dim).collect();
         Self {
             target,
             latent_dim,
             rho_indices,
+            n_eff: n_obs as f64,
         }
+    }
+
+    /// Override the effective observation count used in the Occam log-det
+    /// term (default: `target.len() / latent_dim`). Pass the number of
+    /// latent rows that actually contribute to axis `j` (uniform across
+    /// axes for the current implementation).
+    pub fn with_n_eff(mut self, n_eff: f64) -> Self {
+        assert!(
+            n_eff.is_finite() && n_eff >= 0.0,
+            "ARDPenalty::with_n_eff requires a finite non-negative value, got {n_eff}"
+        );
+        self.n_eff = n_eff;
+        self
     }
 
     /// Build scalar [`BlockwisePenalty`] entries for each latent-axis row.
@@ -1548,7 +1693,18 @@ impl AnalyticPenalty for ARDPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        // P_j(ρ_j) = ½ exp(ρ_j) Σ_n t_{n,j}². ∂/∂ρ_j = P_j.
+        // Occam-corrected REML penalty contribution per axis:
+        //
+        //   P_j(ρ_j) = ½ exp(ρ_j) Σ_n t_{n,j}²  −  (N_eff/2) · ρ_j  + const
+        //
+        // (the −(N/2) ρ comes from the −½ log|S| Gaussian normalizing
+        // constant under prior precision λ_j = exp(ρ_j)).
+        //
+        //   ∂P_j/∂ρ_j = ½ exp(ρ_j) Σ_n t_{n,j}²  −  N_eff/2.
+        //
+        // At an unused axis Σ_n t_{n,j}² = 0 the gradient is −N_eff/2 < 0;
+        // minimising the (negative-log) marginal drives ρ_j → +∞ and
+        // prunes the axis, recovering ARD's pruning behaviour.
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut out = Array1::<f64>::zeros(self.rho_count());
@@ -1559,7 +1715,7 @@ impl AnalyticPenalty for ARDPenalty {
                 let v = target[n * d + j];
                 sq += v * v;
             }
-            out[self.rho_indices[j]] = 0.5 * lam_j * sq;
+            out[self.rho_indices[j]] = 0.5 * lam_j * sq - 0.5 * self.n_eff;
         }
         out
     }
@@ -1991,14 +2147,19 @@ mod tests {
     }
 
     #[test]
-    fn ard_rho_grad_equals_per_axis_value() {
+    fn ard_rho_grad_includes_occam_log_det_term() {
         let d = 2;
         let t = array![1.0_f64, 0.0, 0.0, 2.0];
+        let n_obs = t.len() / d; // 2
         let target = PsiSlice::full(t.len(), Some(d));
         let ard = ARDPenalty::new(target, d);
+        assert!((ard.n_eff - n_obs as f64).abs() < 1e-12);
         let rho = array![0.0_f64, 0.0];
         let dr = ard.grad_rho(t.view(), rho.view());
-        assert!((dr[0] - 0.5).abs() < 1e-12); // ½·1·(1+0)
-        assert!((dr[1] - 2.0).abs() < 1e-12); // ½·1·(0+4)
+        // ∂P_j/∂ρ_j = ½ λ_j Σ t² − N_eff/2.
+        // Axis 0: ½·1·(1+0) − ½·2 = −0.5.
+        // Axis 1: ½·1·(0+4) − ½·2 =  1.0.
+        assert!((dr[0] - (-0.5)).abs() < 1e-12);
+        assert!((dr[1] - 1.0).abs() < 1e-12);
     }
 }

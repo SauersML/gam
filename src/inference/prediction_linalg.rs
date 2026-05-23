@@ -12,6 +12,14 @@ pub enum PredictionCovarianceBackend<'a> {
     Factorized {
         factor: Box<dyn FactorizedSystem>,
         dim: usize,
+        /// Multiplicative dispersion `φ` applied to the result of the solve.
+        ///
+        /// The fallback backend factorizes the *unscaled* penalized Hessian
+        /// `H = X'WX + S`, but the module invariant is `Vb = φ · H^{-1}`.
+        /// Without this scale the variance computed via
+        /// `H^{-1} rhs` would silently drop `φ` and disagree with the stored
+        /// `beta_covariance()` (which is already φ-scaled).
+        phi_scale: f64,
     },
 }
 
@@ -21,6 +29,16 @@ impl<'a> PredictionCovarianceBackend<'a> {
     }
 
     pub fn from_factorized_hessian(hessian: SymmetricMatrix) -> Result<Self, String> {
+        Self::from_factorized_hessian_scaled(hessian, 1.0)
+    }
+
+    /// Like [`from_factorized_hessian`] but multiplies the resulting `H^{-1} rhs`
+    /// by the supplied dispersion `φ`, so the backend returns `φ · H^{-1} rhs`
+    /// (i.e. the `Vb = φ · H^{-1}` covariance application).
+    pub fn from_factorized_hessian_scaled(
+        hessian: SymmetricMatrix,
+        phi: f64,
+    ) -> Result<Self, String> {
         if hessian.nrows() != hessian.ncols() {
             return Err(format!(
                 "prediction precision backend requires a square Hessian, got {}x{}",
@@ -40,7 +58,12 @@ impl<'a> PredictionCovarianceBackend<'a> {
         }
         let dim = hessian.nrows();
         let factor = hessian.factorize()?;
-        Ok(Self::Factorized { factor, dim })
+        let phi_scale = if phi.is_finite() && phi > 0.0 { phi } else { 1.0 };
+        Ok(Self::Factorized {
+            factor,
+            dim,
+            phi_scale,
+        })
     }
 
     pub fn parameter_dim(&self) -> usize {
@@ -67,7 +90,15 @@ impl<'a> PredictionCovarianceBackend<'a> {
         }
         match self {
             Self::Dense(covariance) => Ok(covariance.dot(rhs)),
-            Self::Factorized { factor, .. } => factor.solvemulti(rhs),
+            Self::Factorized {
+                factor, phi_scale, ..
+            } => {
+                let mut solved = factor.solvemulti(rhs)?;
+                if (*phi_scale - 1.0).abs() > 0.0 {
+                    solved.mapv_inplace(|v| v * *phi_scale);
+                }
+                Ok(solved)
+            }
         }
     }
 }
