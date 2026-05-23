@@ -2453,10 +2453,9 @@ pub struct FitConfig {
     pub penalty_block_gamma_priors: Vec<(String, f64, f64)>,
 
     /// Python `gamfit.fit(..., latents={...})` configuration. This reaches
-    /// the standard workflow boundary today; full standard-fit REML wiring is
-    /// intentionally rejected in `materialize_standard` until the per-row
-    /// `LatentCoord` hyper-direction block can be represented without
-    /// allocating one dense `N × K` derivative per coordinate.
+    /// the standard formula workflow as an owned latent-coordinate block:
+    /// the named smooth's synthetic covariates are rebuilt from `t`, and
+    /// joint REML optimizes `[rho, vec(t)]` through latent design hyper-dirs.
     pub latents: Option<JsonValue>,
 }
 
@@ -2905,16 +2904,436 @@ pub fn resolve_weight_column(
     Ok(values)
 }
 
+#[derive(Clone)]
+enum LatentInitSpec {
+    Pca,
+    Random,
+    Explicit(Array2<f64>),
+}
+
+#[derive(Clone)]
+struct LatentAuxPriorSpec {
+    u: Array2<f64>,
+    family: AuxPriorFamily,
+    strength: AuxPriorStrength,
+}
+
+#[derive(Clone)]
+struct LatentDimSelectionSpec {
+    init_log_precision: Option<Array1<f64>>,
+}
+
+#[derive(Clone)]
+struct LatentSpec {
+    target: String,
+    n: usize,
+    d: usize,
+    init: LatentInitSpec,
+    aux_prior: Option<LatentAuxPriorSpec>,
+    dim_selection: Option<LatentDimSelectionSpec>,
+}
+
+fn json_array2(value: &JsonValue, context: &str) -> Result<Array2<f64>, String> {
+    let rows = value.as_array().ok_or_else(|| {
+        format!("{context} must be a two-dimensional numeric array")
+    })?;
+    let n = rows.len();
+    let first = rows
+        .first()
+        .and_then(|row| row.as_array())
+        .ok_or_else(|| format!("{context} must contain array rows"))?;
+    let d = first.len();
+    let mut out = Array2::<f64>::zeros((n, d));
+    for (i, row_value) in rows.iter().enumerate() {
+        let row = row_value
+            .as_array()
+            .ok_or_else(|| format!("{context} row {i} must be an array"))?;
+        if row.len() != d {
+            return Err(format!(
+                "{context} row {i} has length {}, expected {d}",
+                row.len()
+            ));
+        }
+        for (j, cell) in row.iter().enumerate() {
+            let value = cell.as_f64().ok_or_else(|| {
+                format!("{context}[{i}][{j}] must be a finite number")
+            })?;
+            if !value.is_finite() {
+                return Err(format!("{context}[{i}][{j}] must be finite"));
+            }
+            out[[i, j]] = value;
+        }
+    }
+    Ok(out)
+}
+
+fn json_array1(value: &JsonValue, context: &str) -> Result<Array1<f64>, String> {
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("{context} must be a numeric array"))?;
+    let mut out = Array1::<f64>::zeros(values.len());
+    for (idx, cell) in values.iter().enumerate() {
+        let value = cell
+            .as_f64()
+            .ok_or_else(|| format!("{context}[{idx}] must be a finite number"))?;
+        if !value.is_finite() {
+            return Err(format!("{context}[{idx}] must be finite"));
+        }
+        out[idx] = value;
+    }
+    Ok(out)
+}
+
+fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, String> {
+    let Some(payload) = payload.filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let map = payload
+        .as_object()
+        .ok_or_else(|| "latents must be a JSON object keyed by formula symbol".to_string())?;
+    let mut specs = Vec::with_capacity(map.len());
+    for (key, raw) in map {
+        let obj = raw
+            .as_object()
+            .ok_or_else(|| format!("latents['{key}'] must be an object"))?;
+        let target = obj
+            .get("name")
+            .and_then(JsonValue::as_str)
+            .unwrap_or(key)
+            .to_string();
+        let n = obj
+            .get("n")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| format!("latents['{key}'].n is required"))? as usize;
+        let d = obj
+            .get("d")
+            .and_then(JsonValue::as_u64)
+            .ok_or_else(|| format!("latents['{key}'].d is required"))? as usize;
+        if n == 0 || d == 0 {
+            return Err(format!("latents['{key}'] requires positive n and d"));
+        }
+        let init = match obj.get("init") {
+            None => LatentInitSpec::Pca,
+            Some(value) if value.as_str().is_some_and(|s| s.eq_ignore_ascii_case("pca")) => {
+                LatentInitSpec::Pca
+            }
+            Some(value) if value.as_str().is_some_and(|s| s.eq_ignore_ascii_case("random")) => {
+                LatentInitSpec::Random
+            }
+            Some(value) => LatentInitSpec::Explicit(json_array2(
+                value,
+                &format!("latents['{key}'].init"),
+            )?),
+        };
+        let aux_prior = match obj.get("aux_prior").filter(|value| !value.is_null()) {
+            None => None,
+            Some(value) => {
+                let aux = value.as_object().ok_or_else(|| {
+                    format!("latents['{key}'].aux_prior must be an object")
+                })?;
+                let u = json_array2(
+                    aux.get("u").ok_or_else(|| {
+                        format!("latents['{key}'].aux_prior.u is required")
+                    })?,
+                    &format!("latents['{key}'].aux_prior.u"),
+                )?;
+                let family = match aux
+                    .get("family")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("ridge")
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "ridge" => AuxPriorFamily::Ridge,
+                    "linear" => AuxPriorFamily::Linear,
+                    other => {
+                        return Err(format!(
+                            "latents['{key}'].aux_prior.family must be 'ridge' or 'linear', got '{other}'"
+                        ));
+                    }
+                };
+                let strength = match aux.get("strength") {
+                    None => AuxPriorStrength::Fixed(1.0),
+                    Some(value)
+                        if value
+                            .as_str()
+                            .is_some_and(|s| s.eq_ignore_ascii_case("auto")) =>
+                    {
+                        AuxPriorStrength::Auto
+                    }
+                    Some(value) => {
+                        let mu = value.as_f64().ok_or_else(|| {
+                            format!(
+                                "latents['{key}'].aux_prior.strength must be positive or 'auto'"
+                            )
+                        })?;
+                        if !mu.is_finite() || mu <= 0.0 {
+                            return Err(format!(
+                                "latents['{key}'].aux_prior.strength must be positive"
+                            ));
+                        }
+                        AuxPriorStrength::Fixed(mu)
+                    }
+                };
+                Some(LatentAuxPriorSpec {
+                    u,
+                    family,
+                    strength,
+                })
+            }
+        };
+        let dim_selection = match obj.get("dim_selection") {
+            None | Some(JsonValue::Bool(false)) => None,
+            Some(JsonValue::Bool(true)) => Some(LatentDimSelectionSpec {
+                init_log_precision: None,
+            }),
+            Some(value) => {
+                let dim = value.as_object().ok_or_else(|| {
+                    format!("latents['{key}'].dim_selection must be a bool or object")
+                })?;
+                let init_log_precision = dim
+                    .get("init_log_precision")
+                    .map(|value| {
+                        json_array1(
+                            value,
+                            &format!("latents['{key}'].dim_selection.init_log_precision"),
+                        )
+                    })
+                    .transpose()?;
+                Some(LatentDimSelectionSpec { init_log_precision })
+            }
+        };
+        if dim_selection.is_some() && aux_prior.is_none() {
+            return Err(format!(
+                "latents['{key}'] uses dim_selection without aux_prior; ARD alone is not an identifiable latent-coordinate gauge"
+            ));
+        }
+        specs.push(LatentSpec {
+            target,
+            n,
+            d,
+            init,
+            aux_prior,
+            dim_selection,
+        });
+    }
+    Ok(specs)
+}
+
+fn deterministic_unit(seed: &mut u64) -> f64 {
+    *seed = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    ((*seed >> 11) as f64) * (1.0 / ((1_u64 << 53) as f64))
+}
+
+fn initial_latent_matrix(spec: &LatentSpec, y: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
+    match &spec.init {
+        LatentInitSpec::Explicit(matrix) => {
+            if matrix.nrows() != spec.n || matrix.ncols() != spec.d {
+                return Err(format!(
+                    "latent '{}' explicit init has shape {}x{}, expected {}x{}",
+                    spec.target,
+                    matrix.nrows(),
+                    matrix.ncols(),
+                    spec.n,
+                    spec.d
+                ));
+            }
+            Ok(matrix.clone())
+        }
+        LatentInitSpec::Random => {
+            let mut seed = 0x9E3779B97F4A7C15_u64 ^ ((spec.n as u64) << 32) ^ spec.d as u64;
+            let mut out = Array2::<f64>::zeros((spec.n, spec.d));
+            for value in out.iter_mut() {
+                *value = deterministic_unit(&mut seed);
+            }
+            Ok(out)
+        }
+        LatentInitSpec::Pca => {
+            let mut out = Array2::<f64>::zeros((spec.n, spec.d));
+            let mean = y.iter().sum::<f64>() / y.len().max(1) as f64;
+            let var = y
+                .iter()
+                .map(|v| {
+                    let centered = *v - mean;
+                    centered * centered
+                })
+                .sum::<f64>()
+                / y.len().max(1) as f64;
+            let sd = var.sqrt().max(1e-12);
+            for n in 0..spec.n {
+                out[[n, 0]] = (y[n] - mean) / sd;
+            }
+            if spec.d > 1 {
+                let mut seed =
+                    0xD1B54A32D192ED03_u64 ^ ((spec.n as u64) << 16) ^ spec.d as u64;
+                for n in 0..spec.n {
+                    for axis in 1..spec.d {
+                        out[[n, axis]] = deterministic_unit(&mut seed) - 0.5;
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn latent_id_mode(spec: &LatentSpec) -> Result<LatentIdMode, String> {
+    match (&spec.aux_prior, &spec.dim_selection) {
+        (Some(aux), Some(dim)) => {
+            if let Some(init) = dim.init_log_precision.as_ref() {
+                if init.len() != spec.d {
+                    return Err(format!(
+                        "latent '{}' dim_selection.init_log_precision has length {}, expected {}",
+                        spec.target,
+                        init.len(),
+                        spec.d
+                    ));
+                }
+            }
+            Ok(LatentIdMode::AuxPriorDimSelection {
+                u: aux.u.clone(),
+                family: aux.family,
+                strength: aux.strength,
+                init_log_precision: dim.init_log_precision.clone(),
+            })
+        }
+        (Some(aux), None) => Ok(LatentIdMode::AuxPrior {
+            u: aux.u.clone(),
+            family: aux.family,
+            strength: aux.strength,
+        }),
+        (None, None) => Ok(LatentIdMode::None),
+        (None, Some(_)) => Err(format!(
+            "latent '{}' dim_selection requires aux_prior for identifiability",
+            spec.target
+        )),
+    }
+}
+
+fn prepare_standard_latent_coord(
+    parsed: &ParsedFormula,
+    data: &Dataset,
+    y: ArrayView1<'_, f64>,
+    config: &FitConfig,
+) -> Result<Option<(Dataset, ParsedFormula, StandardLatentCoordConfig)>, String> {
+    let specs = parse_latent_specs(config.latents.as_ref())?;
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    if specs.len() != 1 {
+        return Err(
+            "standard latent-coordinate REML currently accepts exactly one latent smooth term"
+                .to_string(),
+        );
+    }
+    let spec = specs.into_iter().next().unwrap();
+    if spec.n != data.values.nrows() || spec.n != y.len() {
+        return Err(format!(
+            "latent '{}' row count {} does not match data rows {}",
+            spec.target,
+            spec.n,
+            data.values.nrows()
+        ));
+    }
+    if let Some(aux) = spec.aux_prior.as_ref() {
+        if aux.u.nrows() != spec.n {
+            return Err(format!(
+                "latent '{}' aux_prior.u has {} rows, expected {}",
+                spec.target,
+                aux.u.nrows(),
+                spec.n
+            ));
+        }
+    }
+
+    let matrix = initial_latent_matrix(&spec, y)?;
+    let id_mode = latent_id_mode(&spec)?;
+    let latent_values = Arc::new(LatentCoordValues::from_matrix(matrix.view(), id_mode));
+
+    let base_cols = data.values.ncols();
+    let mut values = Array2::<f64>::zeros((data.values.nrows(), base_cols + spec.d));
+    values.slice_mut(s![.., ..base_cols]).assign(&data.values);
+    let mut headers = data.headers.clone();
+    let mut columns = data.schema.columns.clone();
+    let mut column_kinds = data.column_kinds.clone();
+    let mut synthetic_vars = Vec::with_capacity(spec.d);
+    let mut feature_cols = Vec::with_capacity(spec.d);
+    for axis in 0..spec.d {
+        let name = format!("{}__latent{}", spec.target, axis);
+        let col = base_cols + axis;
+        values.column_mut(col).assign(&matrix.column(axis));
+        headers.push(name.clone());
+        columns.push(SchemaColumn {
+            name: name.clone(),
+            kind: ColumnKindTag::Continuous,
+            levels: Vec::new(),
+        });
+        column_kinds.push(ColumnKindTag::Continuous);
+        synthetic_vars.push(name);
+        feature_cols.push(col);
+    }
+    let augmented = Dataset {
+        headers,
+        values,
+        schema: DataSchema { columns },
+        column_kinds,
+    };
+
+    let mut rewritten = parsed.clone();
+    let mut matched = false;
+    for term in &mut rewritten.terms {
+        if let ParsedTerm::Smooth { vars, .. } = term {
+            if vars.len() == 1 && vars[0] == spec.target {
+                *vars = synthetic_vars.clone();
+                matched = true;
+            }
+        }
+    }
+    if !matched {
+        return Err(format!(
+            "latents provided '{}' but no formula smooth term s({}, ...) was found",
+            spec.target, spec.target
+        ));
+    }
+
+    Ok(Some((
+        augmented,
+        rewritten,
+        StandardLatentCoordConfig {
+            values: latent_values,
+            term_index: usize::MAX,
+            feature_cols,
+        },
+    )))
+}
+
+fn smooth_basis_feature_cols_for_latent(
+    basis: &crate::smooth::SmoothBasisSpec,
+) -> Option<Vec<usize>> {
+    match basis {
+        crate::smooth::SmoothBasisSpec::BSpline1D { feature_col, .. } => Some(vec![*feature_col]),
+        crate::smooth::SmoothBasisSpec::ThinPlate { feature_cols, .. }
+        | crate::smooth::SmoothBasisSpec::Sphere { feature_cols, .. }
+        | crate::smooth::SmoothBasisSpec::Matern { feature_cols, .. }
+        | crate::smooth::SmoothBasisSpec::Duchon { feature_cols, .. }
+        | crate::smooth::SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
+            Some(feature_cols.clone())
+        }
+        crate::smooth::SmoothBasisSpec::BySmooth { smooth, .. } => {
+            smooth_basis_feature_cols_for_latent(smooth)
+        }
+        crate::smooth::SmoothBasisSpec::FactorSmooth { .. } => None,
+    }
+}
+
 fn materialize_standard<'a>(
     parsed: &ParsedFormula,
     data: &'a Dataset,
     col_map: &HashMap<String, usize>,
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, String> {
-    let _latent_payload = config
-        .latents
-        .as_ref()
-        .filter(|value| !value.is_null());
     if config.noise_offset_column.is_some() {
         return Err(
             "noise_offset_column requires a location-scale model with noise_formula".to_string(),
@@ -2930,15 +3349,37 @@ fn materialize_standard<'a>(
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
 
-    let policy = resolved_resource_policy(config, data, crate::resource::ProblemHints::default());
+    let latent_prepared = prepare_standard_latent_coord(parsed, data, y.view(), config)?;
+    let (latent_dataset, latent_parsed, mut latent_coord) = match latent_prepared {
+        Some((dataset, parsed, coord)) => (Some(dataset), Some(parsed), Some(coord)),
+        None => (None, None, None),
+    };
+    let term_data = latent_dataset.as_ref().unwrap_or(data);
+    let term_parsed = latent_parsed.as_ref().unwrap_or(parsed);
+    let term_col_map = term_data.column_map();
+
+    let policy = resolved_resource_policy(config, term_data, crate::resource::ProblemHints::default());
     let spec = build_termspec_with_geometry(
-        &parsed.terms,
-        data,
-        col_map,
+        &term_parsed.terms,
+        term_data,
+        &term_col_map,
         &mut inference_notes,
         config.scale_dimensions,
         &policy,
     )?;
+    if let Some(coord) = latent_coord.as_mut() {
+        coord.term_index = spec
+            .smooth_terms
+            .iter()
+            .position(|term| {
+                smooth_basis_feature_cols_for_latent(&term.basis)
+                    .is_some_and(|cols| cols == coord.feature_cols)
+            })
+            .ok_or_else(|| {
+                "latent-coordinate smooth term disappeared during formula materialization"
+                    .to_string()
+            })?;
+    }
 
     let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
     let offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
@@ -3048,7 +3489,7 @@ fn materialize_standard<'a>(
 
     Ok(MaterializedModel {
         request: FitRequest::Standard(StandardFitRequest {
-            data: data.values.view(),
+            data: term_data.values.clone(),
             y,
             weights,
             offset,
@@ -3060,6 +3501,8 @@ fn materialize_standard<'a>(
             wiggle_options: None,
             coefficient_groups: config.coefficient_groups.clone(),
             penalty_block_gamma_priors: config.penalty_block_gamma_priors.clone(),
+            latent_coord,
+            _marker: std::marker::PhantomData,
         }),
         inference_notes,
     })

@@ -893,44 +893,96 @@ fn softmax_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
     out
 }
 
-fn assignment_entropy_value(logits: ArrayView2<'_, f64>, temperature: f64, lambda: f64) -> f64 {
-    let mut acc = 0.0;
-    for row in 0..logits.nrows() {
-        let a = softmax_row(logits.row(row), temperature);
-        for &v in a.iter() {
-            if v > 0.0 {
-                acc += -v * v.ln();
-            }
-        }
+fn sigmoid_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(logits.len());
+    for i in 0..logits.len() {
+        let x = logits[i] / temperature;
+        out[i] = if x >= 0.0 {
+            1.0 / (1.0 + (-x).exp())
+        } else {
+            let ex = x.exp();
+            ex / (1.0 + ex)
+        };
     }
-    lambda * acc
+    out
 }
 
-fn assignment_entropy_grad_hdiag(
-    assignments: ArrayView1<'_, f64>,
-    temperature: f64,
-    lambda: f64,
+fn flat_logits(logits: ArrayView2<'_, f64>) -> Array1<f64> {
+    let mut out = Array1::<f64>::zeros(logits.len());
+    for row in 0..logits.nrows() {
+        let start = row * logits.ncols();
+        for col in 0..logits.ncols() {
+            out[start + col] = logits[[row, col]];
+        }
+    }
+    out
+}
+
+fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f64 {
+    let target = flat_logits(assignment.logits.view());
+    match assignment.mode {
+        AssignmentMode::Softmax {
+            temperature,
+            sparsity,
+        } => {
+            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
+            let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
+            penalty.value(target.view(), rho_view.view())
+        }
+        AssignmentMode::IBPMap {
+            temperature,
+            alpha,
+            learnable_alpha,
+        } => {
+            let penalty =
+                IBPAssignmentPenalty::new(assignment.k_atoms(), alpha, temperature, learnable_alpha);
+            let rho_view = if learnable_alpha {
+                Array1::from_vec(vec![rho.log_lambda_sparse])
+            } else {
+                Array1::zeros(0)
+            };
+            penalty.value(target.view(), rho_view.view())
+        }
+    }
+}
+
+fn assignment_prior_grad_hdiag(
+    assignment: &SaeAssignment,
+    rho: &SaeManifoldRho,
 ) -> (Array1<f64>, Array1<f64>) {
-    let k = assignments.len();
-    let inv_tau = 1.0 / temperature;
-    let mut d_h_da = Array1::<f64>::zeros(k);
-    let mut mean = 0.0;
-    for i in 0..k {
-        let a = assignments[i].max(1e-300);
-        d_h_da[i] = -lambda * (a.ln() + 1.0);
-        mean += assignments[i] * d_h_da[i];
+    let target = flat_logits(assignment.logits.view());
+    match assignment.mode {
+        AssignmentMode::Softmax {
+            temperature,
+            sparsity,
+        } => {
+            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
+            let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
+            let grad = penalty.grad_target(target.view(), rho_view.view());
+            let diag = penalty
+                .hessian_diag(target.view(), rho_view.view())
+                .expect("softmax assignment hessian diag");
+            (grad, diag)
+        }
+        AssignmentMode::IBPMap {
+            temperature,
+            alpha,
+            learnable_alpha,
+        } => {
+            let penalty =
+                IBPAssignmentPenalty::new(assignment.k_atoms(), alpha, temperature, learnable_alpha);
+            let rho_view = if learnable_alpha {
+                Array1::from_vec(vec![rho.log_lambda_sparse])
+            } else {
+                Array1::zeros(0)
+            };
+            let grad = penalty.grad_target(target.view(), rho_view.view());
+            let diag = penalty
+                .hessian_diag(target.view(), rho_view.view())
+                .expect("IBP assignment hessian diag");
+            (grad, diag)
+        }
     }
-    let mut grad_logits = Array1::<f64>::zeros(k);
-    let mut hdiag = Array1::<f64>::zeros(k);
-    for i in 0..k {
-        grad_logits[i] = assignments[i] * (d_h_da[i] - mean) * inv_tau;
-        // Entropy is concave in logits near the simplex interior. For the
-        // Gauss-Newton row solve we add a positive diagonal curvature floor:
-        // it damps assignment movement without pretending to be the exact
-        // dense Hessian of the entropy term.
-        hdiag[i] = lambda * assignments[i] * (1.0 - assignments[i]) * inv_tau * inv_tau;
-    }
-    (grad_logits, hdiag)
 }
 
 /// Helper for padded FFI callers. Arrays use `(K, N, M_max)` and
