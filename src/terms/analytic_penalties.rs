@@ -22,6 +22,9 @@
 //!     likelihood's Occam factor sends unused axes' precision to infinity,
 //!     discovering intrinsic dimension only after a separate gauge fix
 //!     (`AuxPrior` or `Isometry`) pins rotations / reparameterisations.
+//!   * [`OrthogonalityPenalty`] — fixes the rotation gauge inside a latent
+//!     block by penalizing cross-axis correlations. Pair with ARD when
+//!     intrinsic dimension should be identifiable.
 //!
 //! All three are **analytic**: no autograd, no finite differencing. Each
 //! exposes:
@@ -57,6 +60,7 @@
 //! | Sparsity  | β or ext-coord       | 1 (strength) [+1 ε]  |
 //! | IBP       | ext-coord (logits)   | 0 or 1 (log α)       |
 //! | ARD       | ext-coord (latent t) | d (one per axis)     |
+//! | Orthogonality | ext-coord (latent t) | 0 or 1 (log μ_orth) |
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, CowArray, Ix2, Ix3};
 use std::sync::Arc;
@@ -2006,6 +2010,304 @@ impl AnalyticPenalty for ARDPenalty {
 }
 
 // ---------------------------------------------------------------------------
+// Orthogonality penalty
+// ---------------------------------------------------------------------------
+
+/// Gauge-fixing penalty for latent-coordinate axes.
+///
+/// ARD alone is rotation-invariant — pair with Orthogonality to identify
+/// intrinsic dim (auto_exp_21). This penalty locks a canonical orthogonal
+/// basis first; ARD can then shrink individual axis norms without fighting a
+/// unit-norm constraint because the Frobenius target is applied to
+/// column-normalized coordinates.
+#[derive(Debug, Clone)]
+pub struct OrthogonalityPenalty {
+    pub target: PsiSlice,
+    pub latent_dim: usize,
+    /// Base strength. If `learnable_weight` is true, the resolved strength is
+    /// `weight * exp(rho[rho_index])`; otherwise it is fixed at `weight`.
+    pub weight: f64,
+    /// Effective observation count used to keep the Frobenius contribution on
+    /// the same scale as per-axis latent priors.
+    pub n_eff: usize,
+    pub learnable_weight: bool,
+    pub rho_index: usize,
+}
+
+impl OrthogonalityPenalty {
+    #[must_use = "build error must be handled"]
+    pub fn new(
+        target: PsiSlice,
+        latent_dim: usize,
+        weight: f64,
+        n_eff: usize,
+        learnable_weight: bool,
+    ) -> Result<Self, String> {
+        if latent_dim == 0 {
+            return Err("OrthogonalityPenalty::new requires latent_dim > 0".to_string());
+        }
+        if target.len() % latent_dim != 0 {
+            return Err(format!(
+                "OrthogonalityPenalty::new target length {} is not divisible by latent_dim {}",
+                target.len(),
+                latent_dim
+            ));
+        }
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!(
+                "OrthogonalityPenalty::new requires finite weight > 0, got {weight}"
+            ));
+        }
+        if n_eff == 0 {
+            return Err("OrthogonalityPenalty::new requires n_eff > 0".to_string());
+        }
+        Ok(Self {
+            target,
+            latent_dim,
+            weight,
+            n_eff,
+            learnable_weight,
+            rho_index: 0,
+        })
+    }
+
+    fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
+        if self.learnable_weight {
+            self.weight * rho[self.rho_index].exp()
+        } else {
+            self.weight
+        }
+    }
+
+    fn scale(&self, rho: ArrayView1<'_, f64>) -> f64 {
+        self.resolved_weight(rho) / self.n_eff as f64
+    }
+
+    fn normalized_columns(
+        &self,
+        target: ArrayView1<'_, f64>,
+    ) -> (Array2<f64>, Array1<f64>) {
+        let d = self.latent_dim;
+        let n_obs = target.len() / d;
+        let mut z = Array2::<f64>::zeros((n_obs, d));
+        let mut inv_norm = Array1::<f64>::zeros(d);
+        for j in 0..d {
+            let mut sq = 0.0;
+            for n in 0..n_obs {
+                let x = target[n * d + j];
+                sq += x * x;
+            }
+            if sq > 0.0 && sq.is_finite() {
+                let inv = 1.0 / sq.sqrt();
+                inv_norm[j] = inv;
+                for n in 0..n_obs {
+                    z[[n, j]] = target[n * d + j] * inv;
+                }
+            }
+        }
+        (z, inv_norm)
+    }
+
+    fn offdiag_correlation(z: &Array2<f64>) -> Array2<f64> {
+        let n_obs = z.nrows();
+        let d = z.ncols();
+        let mut r = Array2::<f64>::zeros((d, d));
+        for a in 0..d {
+            for b in 0..d {
+                if a == b {
+                    continue;
+                }
+                let mut s = 0.0;
+                for n in 0..n_obs {
+                    s += z[[n, a]] * z[[n, b]];
+                }
+                r[[a, b]] = s;
+            }
+        }
+        r
+    }
+
+    fn z_times_square(z: &Array2<f64>, square: &Array2<f64>, factor: f64) -> Array2<f64> {
+        let n_obs = z.nrows();
+        let d = z.ncols();
+        let mut out = Array2::<f64>::zeros((n_obs, d));
+        for n in 0..n_obs {
+            for a in 0..d {
+                let mut s = 0.0;
+                for b in 0..d {
+                    s += z[[n, b]] * square[[b, a]];
+                }
+                out[[n, a]] = factor * s;
+            }
+        }
+        out
+    }
+
+    fn normalized_gradient_from_parts(
+        &self,
+        z: &Array2<f64>,
+        inv_norm: &Array1<f64>,
+        h_z: &Array2<f64>,
+    ) -> Array1<f64> {
+        let n_obs = z.nrows();
+        let d = z.ncols();
+        let mut out = Array1::<f64>::zeros(n_obs * d);
+        for a in 0..d {
+            let inv = inv_norm[a];
+            if inv == 0.0 {
+                continue;
+            }
+            let mut z_dot_h = 0.0;
+            for n in 0..n_obs {
+                z_dot_h += z[[n, a]] * h_z[[n, a]];
+            }
+            for n in 0..n_obs {
+                out[n * d + a] = inv * (h_z[[n, a]] - z[[n, a]] * z_dot_h);
+            }
+        }
+        out
+    }
+
+    /// Dense cross-axis Hessian; no blockwise reduction preserves the
+    /// rotation-gauge term.
+    pub fn as_blockwise(&self, _global_offset: usize) -> Option<Vec<BlockwisePenalty>> {
+        None
+    }
+}
+
+impl AnalyticPenalty for OrthogonalityPenalty {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Psi
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        let (z, _) = self.normalized_columns(target);
+        let r = Self::offdiag_correlation(&z);
+        let mut acc = 0.0;
+        for &v in r.iter() {
+            acc += v * v;
+        }
+        0.5 * self.scale(rho) * acc
+    }
+
+    fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        // Matrix-calculus core:
+        //   ∂/∂Z ||ZᵀZ - I||²_F = 4 Z (ZᵀZ - I).
+        // Since P = ½·scale·||R||² with R symmetric, ∂P/∂Z = 2·scale·Z·R.
+        // We then chain through z_j = t_j / ||t_j||, which removes the
+        // radial component so ARD remains free to shrink axis norms.
+        let (z, inv_norm) = self.normalized_columns(target);
+        let r = Self::offdiag_correlation(&z);
+        let h_z = Self::z_times_square(&z, &r, 2.0 * self.scale(rho));
+        self.normalized_gradient_from_parts(&z, &inv_norm, &h_z)
+    }
+
+    fn hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        let d = self.latent_dim;
+        let n_obs = target.len() / d;
+        let scale = self.scale(rho);
+        let (z, inv_norm) = self.normalized_columns(target);
+        let r = Self::offdiag_correlation(&z);
+        let h_z = Self::z_times_square(&z, &r, 2.0 * scale);
+
+        let mut dz = Array2::<f64>::zeros((n_obs, d));
+        for a in 0..d {
+            let inv = inv_norm[a];
+            if inv == 0.0 {
+                continue;
+            }
+            let mut z_dot_v = 0.0;
+            for n in 0..n_obs {
+                z_dot_v += z[[n, a]] * v[n * d + a];
+            }
+            for n in 0..n_obs {
+                dz[[n, a]] = inv * (v[n * d + a] - z[[n, a]] * z_dot_v);
+            }
+        }
+
+        let mut dr = Array2::<f64>::zeros((d, d));
+        for a in 0..d {
+            for b in 0..d {
+                if a == b {
+                    continue;
+                }
+                let mut s = 0.0;
+                for n in 0..n_obs {
+                    s += dz[[n, a]] * z[[n, b]] + z[[n, a]] * dz[[n, b]];
+                }
+                dr[[a, b]] = s;
+            }
+        }
+
+        let mut dh_z = Self::z_times_square(&dz, &r, 2.0 * scale);
+        let z_dr = Self::z_times_square(&z, &dr, 2.0 * scale);
+        for n in 0..n_obs {
+            for a in 0..d {
+                dh_z[[n, a]] += z_dr[[n, a]];
+            }
+        }
+
+        let mut out = Array1::<f64>::zeros(target.len());
+        for a in 0..d {
+            let inv = inv_norm[a];
+            if inv == 0.0 {
+                continue;
+            }
+            let mut z_dot_v = 0.0;
+            let mut z_dot_h = 0.0;
+            let mut dz_dot_h = 0.0;
+            let mut z_dot_dh = 0.0;
+            for n in 0..n_obs {
+                z_dot_v += z[[n, a]] * v[n * d + a];
+                z_dot_h += z[[n, a]] * h_z[[n, a]];
+                dz_dot_h += dz[[n, a]] * h_z[[n, a]];
+                z_dot_dh += z[[n, a]] * dh_z[[n, a]];
+            }
+            let dinv = -inv * inv * z_dot_v;
+            for n in 0..n_obs {
+                let projected_h = h_z[[n, a]] - z[[n, a]] * z_dot_h;
+                let d_projected_h = dh_z[[n, a]]
+                    - dz[[n, a]] * z_dot_h
+                    - z[[n, a]] * (dz_dot_h + z_dot_dh);
+                out[n * d + a] = dinv * projected_h + inv * d_projected_h;
+            }
+        }
+        out
+    }
+
+    fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        if !self.learnable_weight {
+            return Array1::<f64>::zeros(0);
+        }
+        let mut out = Array1::<f64>::zeros(1);
+        out[self.rho_index] = self.value(target, rho);
+        out
+    }
+
+    fn rho_count(&self) -> usize {
+        usize::from(self.learnable_weight)
+    }
+
+    fn name(&self) -> &str {
+        "orthogonality"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Operator-form wrapper for the REML/PIRLS canonical pipeline
 // ---------------------------------------------------------------------------
 
@@ -2042,6 +2344,7 @@ pub enum AnalyticPenaltyKind {
     SoftmaxAssignmentSparsity(Arc<SoftmaxAssignmentSparsityPenalty>),
     IBPAssignment(Arc<IBPAssignmentPenalty>),
     Ard(Arc<ARDPenalty>),
+    Orthogonality(Arc<OrthogonalityPenalty>),
 }
 
 impl AnalyticPenaltyKind {
@@ -2052,6 +2355,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.tier(),
             AnalyticPenaltyKind::IBPAssignment(p) => p.tier(),
             AnalyticPenaltyKind::Ard(p) => p.tier(),
+            AnalyticPenaltyKind::Orthogonality(p) => p.tier(),
         }
     }
 
@@ -2062,6 +2366,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.rho_count(),
             AnalyticPenaltyKind::IBPAssignment(p) => p.rho_count(),
             AnalyticPenaltyKind::Ard(p) => p.rho_count(),
+            AnalyticPenaltyKind::Orthogonality(p) => p.rho_count(),
         }
     }
 
@@ -2072,6 +2377,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.name(),
             AnalyticPenaltyKind::IBPAssignment(p) => p.name(),
             AnalyticPenaltyKind::Ard(p) => p.name(),
+            AnalyticPenaltyKind::Orthogonality(p) => p.name(),
         }
     }
 
@@ -2082,6 +2388,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.value(target, rho),
             AnalyticPenaltyKind::IBPAssignment(p) => p.value(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.value(target, rho),
+            AnalyticPenaltyKind::Orthogonality(p) => p.value(target, rho),
         }
     }
 
@@ -2096,6 +2403,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::IBPAssignment(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::Orthogonality(p) => p.grad_target(target, rho),
         }
     }
 
@@ -2110,6 +2418,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::IBPAssignment(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::Orthogonality(p) => p.grad_rho(target, rho),
         }
     }
 
@@ -2124,6 +2433,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::IBPAssignment(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::Orthogonality(p) => p.hessian_diag(target, rho),
         }
     }
 
@@ -2146,6 +2456,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::IBPAssignment(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Ard(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::Orthogonality(p) => p.hvp(target, rho, v),
         }
     }
 }
@@ -2250,6 +2561,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::Ard(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
                 .expect("ARD diag"),
+            AnalyticPenaltyKind::Orthogonality(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::IBPAssignment(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
                 .expect("IBP assignment diag"),
@@ -2295,7 +2607,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 }
                 Ok(s)
             }
-            AnalyticPenaltyKind::Isometry(_) => {
+            AnalyticPenaltyKind::Isometry(_) | AnalyticPenaltyKind::Orthogonality(_) => {
                 let dense = self.as_dense();
                 <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
             }

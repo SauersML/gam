@@ -72,6 +72,7 @@ from ._compare import compare_models
 from ._penalties import (
     ARDPenalty,
     IsometryPenalty,
+    OrthogonalityPenalty,
     Penalty,
     SparsityPenalty,
 )
@@ -190,6 +191,7 @@ __all__ = [
     "SharedPrecisionGroup",
     "ARDPenalty",
     "IsometryPenalty",
+    "OrthogonalityPenalty",
     "Penalty",
     "SparsityPenalty",
     "Summary",

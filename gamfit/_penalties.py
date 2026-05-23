@@ -1,4 +1,4 @@
-"""Analytic structured penalties: isometry, sparsity, ARD-per-latent-dim.
+"""Analytic structured penalties: isometry, sparsity, ARD-per-latent-dim, orthogonality.
 
 Thin Python configuration wrappers around the analytic primitives
 implemented in `src/terms/analytic_penalties.rs`. Each wrapper is a
@@ -22,6 +22,9 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
   REML-selectable. The Occam factor in the marginal likelihood
   prunes unused axes only after an AuxPrior or Isometry-style gauge
   fix pins rotations/reparameterisations.
+* `OrthogonalityPenalty` lives on ψ. It fixes the rotation gauge by
+  penalizing latent-axis correlations; pair it with ARD so pruned axes
+  are identifiable.
 
 All three compose with the existing smoothness penalty (`S(ρ)`),
 they slot into the same REML outer loop, and their strengths are
@@ -38,6 +41,7 @@ __all__ = [
     "IsometryPenalty",
     "SparsityPenalty",
     "ARDPenalty",
+    "OrthogonalityPenalty",
     "Penalty",
 ]
 
@@ -266,5 +270,64 @@ class ARDPenalty:
         }
 
 
+@dataclass(init=False)
+class OrthogonalityPenalty:
+    """Gauge-fixing penalty for latent-axis identifiability.
+
+    Applies a Frobenius orthogonality penalty to the column-normalized latent
+    coordinate matrix, so it breaks the rotation gauge while leaving ARD free
+    to shrink individual axis norms.
+
+    **When to use.** Pair with ``ARDPenalty`` when learning intrinsic
+    dimension. ARD alone is rotation-invariant; Orthogonality locks the basis
+    so an ARD-pruned axis has a stable meaning.
+
+    Parameters
+    ----------
+    weight
+        Fixed base strength, or the base multiplier when ``learnable=True``.
+    n_eff
+        Effective observation count used for normalization.
+    learnable
+        If true, expose one REML-selectable log-weight ``ρ``.
+    target
+        The ``LatentCoord`` block name/object. Defaults to ``"t"``.
+    """
+
+    target: Any
+    weight: float
+    n_eff: int
+    learnable: bool
+
+    def __init__(
+        self,
+        weight: float,
+        n_eff: int,
+        learnable: bool = False,
+        *,
+        target: Any = "t",
+    ) -> None:
+        self.target = target
+        self.weight = float(weight)
+        self.n_eff = int(n_eff)
+        self.learnable = bool(learnable)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        if not self.weight > 0.0:
+            raise ValueError(f"OrthogonalityPenalty.weight must be > 0, got {self.weight}")
+        if self.n_eff <= 0:
+            raise ValueError(f"OrthogonalityPenalty.n_eff must be > 0, got {self.n_eff}")
+
+    def _to_rust_payload(self) -> dict[str, Any]:
+        return {
+            "kind": "orthogonality",
+            "target": self.target if isinstance(self.target, str) else "__latent_object__",
+            "weight": self.weight,
+            "n_eff": self.n_eff,
+            "learnable": self.learnable,
+        }
+
+
 # Sum type for type hints on `gamfit.fit(..., penalties=...)` and similar.
-Penalty = "IsometryPenalty | SparsityPenalty | ARDPenalty"
+Penalty = "IsometryPenalty | SparsityPenalty | ARDPenalty | OrthogonalityPenalty"
