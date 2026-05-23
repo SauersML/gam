@@ -23,15 +23,33 @@
 //!   the canonical chart used by `retract` can amplify error in the tangent
 //!   solve. We do not switch charts at runtime; instead we expose a sentinel
 //!   threshold ([`SPHERE_POLE_WARN_THRESHOLD`]) and a [`Manifold::warn_at`]
-//!   advisory hook for callers that want to log.
+//!   advisory hook for callers that want to log. The typed sentinel
+//!   [`ManifoldWarning`] lets callers route warnings to a structured logger.
 //! * Near the boundary of an interval, the smooth `tanh` parameterization's
 //!   Jacobian blows up. [`Interval`] clips the retraction step to keep the
-//!   internal coordinate within a sane band.
+//!   internal coordinate within a sane band — the clip is applied to the
+//!   ambient coordinate *after* the additive update, matching the closed-
+//!   constraint retraction in proposal §7.2 (the open `tanh` chart is only
+//!   used implicitly through the clip).
 //! * [`Manifold::vector_transport`] uses a *parallel-transport approximation*
 //!   (re-project the moved tangent vector to the new tangent space). Full
 //!   parallel transport along the retraction curve would require an ODE solve;
 //!   the projection approximation is a standard Pymanopt-grade tradeoff —
-//!   first-order isometric, O(d) per call.
+//!   first-order isometric, O(d) per call. Antipodal sphere endpoints
+//!   (`<from, to> ≈ -1`) are safe: projection transport degenerates to
+//!   "project to T_to M" which is well-defined, but the resulting tangent
+//!   can be small; callers that care should check norm-loss after transport.
+//!
+//! ## Math invariants (per proposal `riemannian_per_point.md`)
+//!
+//! ```text
+//! grad_R = P_p(∇_E)
+//! Hess_R[ξ] = P_p(∇²_E · ξ - W_p(ξ, ∇_E))    // ambient (not projected) gradient
+//! S¹/S²/S^n   : W_p(ξ, v) = <p, v> ξ
+//! Torus T^d   : W_p(ξ, v)_j = <p_j, v_j> ξ_j (block diagonal)
+//! Euclidean/Interval : W_p(ξ, v) = 0
+//! Product     : W_p blockwise on components
+//! ```
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
 
@@ -41,6 +59,33 @@ const TWO_PI: f64 = std::f64::consts::PI * 2.0;
 /// singularity (currently only used as an advisory threshold; callers can
 /// hook a runtime warning here).
 pub const SPHERE_POLE_WARN_THRESHOLD: f64 = 1.0e-8;
+
+/// Typed advisory sentinel returned by [`Manifold::warn_at_typed`] so callers
+/// can route to a structured logger without string matching. The simpler
+/// [`Manifold::warn_at`] string accessor remains available for ad-hoc logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifoldWarning {
+    /// Point sits close to a chart pole on a sphere; retraction may amplify
+    /// numerical error in the canonical chart.
+    SphereNearPole,
+    /// Point sits within the edge band of an interval; the trust radius
+    /// should be clipped before retraction.
+    IntervalNearBoundary,
+}
+
+impl ManifoldWarning {
+    /// Stable string representation (for ad-hoc logging).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ManifoldWarning::SphereNearPole => {
+                "sphere: near chart pole, retraction may amplify error"
+            }
+            ManifoldWarning::IntervalNearBoundary => {
+                "interval: near boundary; trust radius should be clipped"
+            }
+        }
+    }
+}
 
 /// Trait for a smooth manifold on which a per-point latent coordinate lives.
 ///
@@ -114,7 +159,13 @@ pub trait Manifold: Send + Sync {
 
     /// Optional runtime advisory: callers may inspect this and log when the
     /// point is too close to a chart singularity. Default returns `None`.
-    fn warn_at(&self, _p: ArrayView1<f64>) -> Option<&'static str> {
+    fn warn_at(&self, p: ArrayView1<f64>) -> Option<&'static str> {
+        self.warn_at_typed(p).map(ManifoldWarning::as_str)
+    }
+
+    /// Typed advisory sentinel — preferred over [`Manifold::warn_at`] for
+    /// callers that route to a structured logger. Default returns `None`.
+    fn warn_at_typed(&self, _p: ArrayView1<f64>) -> Option<ManifoldWarning> {
         None
     }
 
