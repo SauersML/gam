@@ -39,7 +39,7 @@ model.sample(
 | `samples` | derived from coefficient count | Post-warmup draws per chain. |
 | `warmup` | matches `samples` | Warmup iterations per chain (discarded). |
 | `chains` | `2` if `p <= 50`, else `4` | Independent chains. |
-| `target_accept` | `0.8` | HMC target acceptance rate; must lie in `(0, 1)`. |
+| `target_accept` | `0.8` | NUTS step-size adaptation target acceptance; must lie in `(0, 1)`. Ignored by the Laplace and Polya-Gamma Gibbs paths. |
 | `seed` | `42` | RNG seed consumed by the sampler. |
 
 Total returned draws are `chains * samples`.
@@ -50,20 +50,27 @@ The dispatch is in `src/inference/sample.rs::sample_saved_model`:
 
 | Model class | Sampler |
 | --- | --- |
-| Standard GLM (Gaussian, binomial logit/probit/cloglog, Poisson, Gamma) | NUTS |
+| Standard GLM (Gaussian, binomial probit/cloglog, Poisson, Gamma) | NUTS |
+| Bernoulli-logit standard GLM (unit weights, Firth off) | Polya-Gamma Gibbs |
+| Bernoulli-logit standard GLM with weights or Firth | NUTS (fallback) |
 | Standard GLM with link-wiggle | NUTS (joint link-wiggle path) |
-| Survival: Royston-Parmar (transformation), Weibull, marginal-slope | NUTS |
+| Survival: Royston-Parmar, Weibull, marginal-slope | NUTS |
 | Survival: latent, latent-binary, location-scale | Laplace |
 | Gaussian location-scale | Laplace |
 | Binomial location-scale | Laplace |
 | Bernoulli marginal-slope | Laplace |
 | Transformation-normal | Laplace |
 
+Royston-Parmar above refers to the transformation survival
+likelihood; it is unrelated to the transformation-normal class.
+
 The Laplace path draws iid samples from `N(beta_hat, H_penalized^{-1})`
-using the saved penalized Hessian's Cholesky factor. The samples carry
-`method == "laplace"`, `rhat == 1.0`, `ess == n_draws`, and
+using the saved penalized Hessian's Cholesky factor. The Python/FFI
+wrapper sets `method == "laplace"` on these results; the underlying
+Rust `NutsResult` reports `rhat == 1.0`, `ess == chains * samples`, and
 `converged == True` by construction. The `PosteriorSamples` API is
-identical either way.
+identical either way. The Polya-Gamma Gibbs path also surfaces under
+`method == "nuts"` in the current build.
 
 ## SamplingConfig
 
@@ -92,7 +99,7 @@ Frozen dataclass holding the draws and convergence diagnostics.
 | `coefficient_names` | `tuple[str, ...]` | Currently emitted as `("beta_0", "beta_1", ...)`. |
 | `mean`, `std` | `numpy.ndarray` | Per-coefficient posterior mean and standard deviation. |
 | `rhat` | `float` | Maximum split-Rhat. `1.0` exactly for Laplace draws. |
-| `ess` | `float` | Minimum effective sample size across coefficients. |
+| `ess` | `float` | Minimum effective sample size across coefficients. For Laplace draws this is `chains * samples`. |
 | `converged` | `bool` | `rhat < 1.1`. |
 | `method` | `str` | `"nuts"` or `"laplace"`. |
 | `model_class` | `str` | Saved-model predictive class. |
@@ -189,6 +196,12 @@ after a round-trip. The archive uses `allow_pickle=True` on load
 (the metadata is stored as a 0-d object array); only load files you
 produced.
 
+`posterior.predict(...)` works for models with a closed-form design
+matrix. Model classes that require the full saved-model predict path
+(link-wiggle, survival, Bernoulli marginal-slope, transformation-normal,
+and any model with a custom `predict` pipeline) raise from the FFI;
+use `Model.predict(...)` for those.
+
 ## PairedPosteriorSamples
 
 Returned by `Model.sample_paired(...)`. Holds two `PosteriorSamples`
@@ -215,7 +228,7 @@ from the coefficient count `p`:
 | Parameter | Rule |
 | --- | --- |
 | `n_chains` | `2` if `p <= 50`, else `4`. |
-| `n_samples` | `clamp(round(100 * p * (1 + 2*sqrt(p)) * 1.5), 500, 10_000)`. |
+| `n_samples` | `clamp(floor(100 * p * (1 + 2 * max(1, sqrt(p))) * 1.5), 500, 10_000)`. |
 | `n_warmup` | Same as `n_samples`. |
 | `target_accept` | `0.8`. |
 | `seed` | `42` unless `seed=` is passed. |

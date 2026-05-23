@@ -8,8 +8,10 @@ the fitted joint coefficient covariance.
 model.difference_smooth(view="Time", group="Group", simultaneous=True)
 ```
 
-The result has one row per grid point and pair, with columns `diff`, `se`,
-`lower`, `upper`, `level`, `simultaneous`, and `critical`.
+The result has one row per grid point and pair. Columns: the view
+variable (e.g. `Time`), `group`, `level_1`, `level_2`, `diff`, `se`,
+`lower`, `upper`, `level`, `simultaneous`, `critical`, and
+`covariance_corrected`.
 
 ## Parameterisations
 
@@ -81,8 +83,11 @@ random deviation.
 ## Group means
 
 `group_means=True` (default) includes the full fitted trajectory
-difference. `group_means=False` zeroes the random-effect columns
-(categorical offsets are stored as random-effect blocks in this package).
+difference. `group_means=False` is intended to zero the parametric
+main-effect columns for the grouping factor in addition to the random
+columns. Under the default `marginalise_random=True` it is currently a
+no-op (the random columns are already zeroed and no further parametric
+columns are dropped). See issue tracker for the fix.
 
 ## References
 

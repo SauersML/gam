@@ -36,8 +36,8 @@ loss.backward()
 ```
 
 The same pattern applies to `gaussian_reml_fit_batched`,
-`gaussian_reml_fit_positions`, and `gaussian_reml_fit_positions_batched`
-(the position variants return `GaussianRemlPositionOutput`). Saved tensors
+`gaussian_reml_fit_additive`, and `gaussian_reml_fit_blocks`
+(the additive variant returns `AdditiveRemlOutput`). Saved tensors
 are version-checked; in-place mutation between forward and backward raises
 `RuntimeError`.
 
@@ -73,16 +73,16 @@ because they are written directly in torch.
 
 The gamfit Rust backend operates on f64 CPU buffers. Tensors are moved to
 CPU f64 for the call and returned on the caller's original device and
-dtype. For training-loop workloads, prefer the batched primitives
-(`gaussian_reml_fit_batched`, `gaussian_reml_fit_positions_batched`) over
-per-feature Python iteration.
+dtype. For training-loop workloads, prefer the batched and additive
+primitives (`gaussian_reml_fit_batched`, `gaussian_reml_fit_additive`,
+`gaussian_reml_fit_blocks`) over per-feature Python iteration.
 
 ## Public API
 
 | Group | Symbols |
 | --- | --- |
-| Closed-form REML | `gaussian_reml_fit`, `gaussian_reml_fit_batched`, `gaussian_reml_fit_positions`, `gaussian_reml_fit_positions_batched`, `GaussianRemlOutput`, `GaussianRemlPositionOutput`, `FrozenPositionPredictor` |
-| Basis evaluations | `bspline_basis`, `bspline_basis_derivative`, `duchon_basis_1d`, `duchon_basis_1d_derivative` |
+| Closed-form REML | `gaussian_reml_fit`, `gaussian_reml_fit_batched`, `gaussian_reml_fit_additive`, `gaussian_reml_fit_blocks`, `GaussianRemlOutput`, `AdditiveRemlOutput` |
+| Basis evaluations | `bspline_basis`, `bspline_basis_derivative`, `duchon_basis`, `periodic_spline_curve_basis`, `sphere_basis` |
 | Penalty / ridge | `smoothness_penalty`, `gaussian_weighted_ridge`, `gaussian_weighted_ridge_batch` |
 | Response geometry | `closure`, `clr`, `alr`, `inverse_alr`, `simplex_log_map`, `simplex_exp_map`, `simplex_frechet_mean`, `sphere_log_map`, `sphere_exp_map`, `sphere_frechet_mean` |
 | Fitted-model loader | `from_fitted` |
