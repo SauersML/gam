@@ -2,7 +2,8 @@
 //!
 //! This module is the single canonical entry point for:
 //!
-//!   1. Laplace evidence `V(ρ, T) = F + (1/2) log|H| - (1/2) log|S(ρ)|+`
+//!   1. Laplace evidence `V(ρ, T) = F + (1/2) log|H| - (1/2) log|S(ρ)|+
+//!      - ((dim(H)-rank(S))/2) log(2π)`
 //!      evaluated at the arrow-Schur inner-loop fixed point, per
 //!      `proposals/arrow_schur_evidence.md` §3 (3.1 and the formula sheet
 //!      in §7).
@@ -18,9 +19,10 @@
 //!   * Evidence log-determinants use **undamped** factors. The cached
 //!     `ArrowFactorCache::htt_factors_undamped` Cholesky factors of
 //!     `H_uu_i` (no `ridge_u`) are the ones that must enter
-//!     `Σ_i log|H_uu_i|`. Likewise the Schur log-det must be of
+//!     `Σ_i log|H_uu_i|`. Likewise a factored Schur log-det must be of
 //!     `A(0, 0) = H_ββ - Σ_i H_uβ_iᵀ H_uu_i⁻¹ H_uβ_i`, not the LM-damped
-//!     surrogate.
+//!     surrogate. Matrix-free evidence callers must provide the matching
+//!     undamped HVP so the same log-det is estimated by SLQ.
 //!   * IFT solves invert `H_uu`, not `H_uu + ridge_u I` (proposal §1.7,
 //!     §6.6). `predict_delta_t_from_delta_beta` and
 //!     `predict_delta_t_from_delta_gt` already use the undamped factors.
@@ -40,9 +42,40 @@
 //! **minimum** of that scalar (see `select_topology` below); equivalently
 //! the caller can negate and `argmax`.
 
+use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
+use crate::linalg::faer_ndarray::FaerEigh;
 use crate::solver::arrow_schur::{ArrowFactorCache, ArrowSchurSystem};
+
+pub const ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD: usize = 1024;
+const EVIDENCE_LOGDET_SLQ_PROBES: usize = 16;
+const EVIDENCE_LOGDET_LANCZOS_STEPS: usize = 32;
+
+/// Matrix-free SPD Hessian logdet source used when the arrow Schur factor is
+/// not materialized. The callback must apply the same undamped Hessian whose
+/// determinant enters the Laplace evidence.
+#[derive(Clone, Copy)]
+pub struct EvidenceHvpLogDet<'a> {
+    pub dim: usize,
+    pub apply: &'a dyn Fn(&[f64]) -> Vec<f64>,
+}
+
+/// Source for the Hessian log determinant in [`laplace_evidence`].
+#[derive(Clone, Copy)]
+pub enum EvidenceLogDetSource<'a> {
+    /// Use the exact arrow Cholesky factors, falling back to `fallback_hvp`
+    /// when the Schur factor is absent on a matrix-free solve.
+    FactoredArrow {
+        cache: &'a ArrowFactorCache,
+        fallback_hvp: Option<EvidenceHvpLogDet<'a>>,
+    },
+    /// Use an HVP callback directly. Dimensions at or below
+    /// [`ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD`] are materialized exactly;
+    /// larger operators use the same Rademacher-Lanczos SLQ constants as
+    /// `FrozenAnalyticPenaltyOp`.
+    Hvp(EvidenceHvpLogDet<'a>),
+}
 
 // ---------------------------------------------------------------------------
 // Topology candidate enum and selection result
@@ -87,6 +120,12 @@ pub struct TopologyCandidate {
     /// Negative-log-evidence `V(ρ_T*, T)` evaluated at the candidate's own
     /// fitted `(ρ_T*, β_T*, u_T*)`.
     pub negative_log_evidence: f64,
+    /// Effective integrated dimension after rank/nullspace accounting. This
+    /// is the dimension used for per-complexity topology normalization.
+    pub effective_dim: f64,
+    /// Number of response rows used to fit this topology candidate. This is
+    /// the dimension used for per-observation topology normalization.
+    pub n_obs: usize,
     /// `True` iff the candidate's continuous inner+outer fit converged
     /// cleanly. Failed candidates are excluded from ranking (proposal
     /// §4.4 item 7 and §6.11).
@@ -113,14 +152,29 @@ pub struct SelectedTopology {
 #[derive(Debug, Clone, Copy)]
 pub struct TopologySelectOptions {
     /// Maximum `|V_a - V_b|` for which two candidates are treated as
-    /// numerically tied. Default `1e-3` per proposal §4.6 examples.
+    /// numerically tied after [`TopologyScoreScale`] normalization. Default
+    /// `1e-3` per proposal §4.6 examples.
     pub tie_tolerance: f64,
+    /// Score scale used for discrete topology comparison. Raw evidence is
+    /// intentionally not a selector because candidates may have different
+    /// row counts and basis/nullspace dimensions.
+    pub score_scale: TopologyScoreScale,
+}
+
+/// Normalization applied before ranking topology candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopologyScoreScale {
+    /// Compare negative log evidence per observation row.
+    PerObservation,
+    /// Compare negative log evidence per effective integrated dimension.
+    PerEffectiveDim,
 }
 
 impl Default for TopologySelectOptions {
     fn default() -> Self {
         Self {
             tie_tolerance: 1e-3,
+            score_scale: TopologyScoreScale::PerObservation,
         }
     }
 }
