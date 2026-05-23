@@ -65,19 +65,12 @@
 //!    block collapses to `(|S_n| + Σ_{k ∈ S_n} d_k) × (·)` after dropping
 //!    the inactive coordinates from the active-set.
 //!
-//! When the companion proposals `proposals/per_point_hessian.md` (single-atom
-//! Hessian) and `proposals/arrow_schur_evidence.md` (Schur + evidence) land,
-//! the stacking recipe extends mechanically: the `(K, K)` assignment block
-//! (from this module — see [`AtomSelectionStrategy::row_hessian_block`])
-//! sits on the diagonal corner of `ext_n`; the `K` per-atom `(d_k, d_k)`
-//! coordinate blocks tile the rest of the diagonal; and the off-diagonal
-//! `(a_{n,k}, t_{n,k,·})` couplings are populated from Piece 1's
-//! basis-derivative jet `∂Φ_k/∂t` evaluated against `B_k` (the chain rule
-//! on the reconstruction `a_{n,k} · Φ_k(t_{n,k}) · B_k`).
-//! [`AtomLibrary::row_block_residual`] is the entry point Piece 1's row
-//! Newton solver calls into; this module owns the assignment-side diagonal
-//! and leaves the cross block to the call site that has access to `B_k`
-//! and `∂Φ_k/∂t`.
+//! The production SAE-manifold assembler now applies that stacking recipe in
+//! [`crate::terms::sae_manifold::SaeManifoldTerm::assemble_arrow_schur`]:
+//! the `(K, K)` assignment block sits on the diagonal corner of `ext_n`, the
+//! `K` per-atom `(d_k, d_k)` coordinate blocks tile the rest, and the
+//! off-diagonal `(a_{n,k}, t_{n,k,·})` couplings are populated from each
+//! atom's basis-derivative jet evaluated against `B_k`.
 //!
 //! ## Relaxation choices for the assignment
 //!
@@ -110,7 +103,7 @@
 //! gradient, and (where closed-form) Hessian of the assignment-to-code map
 //! and the corresponding penalty contribution.
 //!
-//! ## Closed-form gradients (what's implemented vs scaffolded)
+//! ## Closed-form gradients and production assembly
 //!
 //! Fully implemented (closed-form, this module):
 //!
@@ -127,23 +120,17 @@
 //!   ([`AssignmentSparsityCoupling`]) wired to
 //!   [`crate::terms::analytic_penalties::SparsityPenalty`].
 //!
-//! Scaffolded (signature + contract + integration-hook marker):
-//!
-//! * Integration with the full row-block Schur elimination — see
-//!   [`AtomLibrary::row_block_residual`] which is the hook Piece 1's
-//!   `solve_arrow_newton_step` will consume.
-//! * Joint `(a, t)` per-row Hessian assembly — the trait
-//!   [`AtomSelectionStrategy::row_hessian_block`] is defined and the
-//!   diagonal pieces are filled in, but the cross `(a, t)` couplings call
-//!   into Piece 1's basis-derivative machinery (`design_gradient_wrt_t` in
-//!   `latent_coord.rs`) which we cannot edit here.
+//! Production SAE-manifold assembly is now first-class in
+//! [`crate::terms::sae_manifold::SaeManifoldTerm::assemble_arrow_schur`]:
+//! it materializes the joint `(logits, t)` per-row block, including the
+//! assignment diagonal and `(a, t)` cross terms from the atom basis jets, then
+//! hands the result to [`crate::solver::arrow_schur::ArrowSchurSystem`].
 //!
 //! ## Integration hooks to other pieces
 //!
-//! * Piece 1 (`latent_coord.rs`, `solve_arrow_newton_step`): see
-//!   `INTEGRATION-HOOK(piece-1)` markers — the per-row arrow solve must dispatch on
-//!   the *active subset* `S_n` rather than the full `K`. The hook is
-//!   [`AtomLibrary::row_block_residual`].
+//! * Piece 1 (`arrow_schur.rs`, `solve_arrow_newton_step`): consumed by the
+//!   first-class SAE-manifold assembler in
+//!   [`crate::terms::sae_manifold::SaeManifoldTerm::assemble_arrow_schur`].
 //! * Piece 4 (`SparsityPenalty`): consumed as a black box via the
 //!   [`AssignmentSparsityCoupling`] trait below. We do not edit Piece 4.
 //! * Piece 5 (REML outer loop): the per-strategy relaxation parameter
@@ -151,7 +138,7 @@
 //!   already-existing [`crate::terms::analytic_penalties`] `rho_index`
 //!   plumbing; no new outer-loop code is needed here.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::terms::analytic_penalties::SparsityPenalty;
 use crate::terms::atom_codes::{BitVec, SparseAtomCode, SparseAtomCodes};
@@ -274,47 +261,6 @@ impl AtomLibrary {
         SparseAtomCodes::empty(self.n_obs, self.k_atoms())
     }
 
-    // -----------------------------------------------------------------
-    // Arrow-structure integration hook
-    // -----------------------------------------------------------------
-
-    /// Compute the data-fit residual for row `n`, given externally-provided
-    /// decoder evaluations `decoder_outputs[k] = g_k(t_{n,k}) ∈ ℝ^p` and
-    /// observation `Z_n ∈ ℝ^p`.
-    ///
-    /// Returns `Z_n − Σ_{k ∈ S_n} a_{n,k} · g_k(t_{n,k})`.
-    ///
-    /// This is the per-row residual that the row-local Schur solve consumes.
-    /// The function is decoder-agnostic (the caller supplies the `g_k`
-    /// evaluations from whichever basis machinery is in play), preserving
-    /// the layering boundary against `basis.rs` / `smooth.rs`.
-    ///
-    // INTEGRATION-HOOK(piece-1): plug into solve_arrow_newton_step for multi-atom case.
-    // Piece 1's row-local Newton step needs to (i) ask this function for the
-    // current residual; (ii) accumulate ∂/∂a and ∂/∂t contributions using
-    // [`data_grad_assignment_row`] + the basis-derivative jet from
-    // `LatentCoordValues::design_gradient_wrt_t`; (iii) restrict the active
-    // border to the atoms in `code.active_mask` rather than all K.
-    pub fn row_block_residual(
-        &self,
-        n: usize,
-        obs_n: ArrayView1<'_, f64>,
-        code: &SparseAtomCode,
-        decoder_outputs: &[ArrayView1<'_, f64>],
-    ) -> Array1<f64> {
-        debug_assert_eq!(decoder_outputs.len(), self.k_atoms());
-        debug_assert!(n < self.n_obs);
-        let p = obs_n.len();
-        let mut r = obs_n.to_owned();
-        for k in code.active_mask.iter_ones() {
-            debug_assert_eq!(decoder_outputs[k].len(), p);
-            let w = code.weights[k];
-            for i in 0..p {
-                r[i] -= w * decoder_outputs[k][i];
-            }
-        }
-        r
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -424,20 +370,6 @@ pub trait AtomSelectionStrategy: AssignmentSparsityCoupling {
         grad_a_row: ArrayView1<'_, f64>,
     ) -> Array1<f64>;
 
-    /// Per-row Hessian block of the *strategy-induced regulariser* (e.g.
-    /// entropy term for softmax). Returns the diagonal Hessian over the
-    /// K free amplitudes; off-diagonal Jacobian-Hessian couplings to `t`
-    /// are populated by the Piece 1 row solve.
-    ///
-    // INTEGRATION-HOOK(piece-1): the cross `(a, t)` Hessian block requires
-    // `design_gradient_wrt_t` from `latent_coord.rs` together with `B_k`
-    // (β tier) — supplied at the row-Newton call site. The trait returns
-    // only the `(a, a)` diagonal here; the row solve composes the rest.
-    fn row_hessian_block(
-        &self,
-        free_amplitudes_row: ArrayView1<'_, f64>,
-        code: &SparseAtomCode,
-    ) -> Array1<f64>;
 }
 
 // --- EntropicSoftmax --------------------------------------------------------
@@ -568,19 +500,6 @@ impl AtomSelectionStrategy for EntropicSoftmax {
         self.jvp_logits(a.view(), grad_a_row)
     }
 
-    fn row_hessian_block(
-        &self,
-        free_amplitudes_row: ArrayView1<'_, f64>,
-        _code: &SparseAtomCode,
-    ) -> Array1<f64> {
-        // The strategy itself contributes no regulariser to the assignment
-        // Hessian — the entropic term, if used, comes via the penalty layer.
-        // We return the *self-Jacobian diagonal* (a_k(1 − a_k)) / τ, which
-        // is the natural preconditioner for the logit-space step.
-        let a = self.softmax(free_amplitudes_row);
-        let inv_tau = 1.0 / self.temperature;
-        a.mapv(|v| v * (1.0 - v) * inv_tau)
-    }
 }
 
 impl AssignmentSparsityCoupling for EntropicSoftmax {
@@ -691,20 +610,6 @@ impl AtomSelectionStrategy for TopK {
         self.backward_straight_through(code, grad_a_row)
     }
 
-    fn row_hessian_block(
-        &self,
-        _free_amplitudes_row: ArrayView1<'_, f64>,
-        code: &SparseAtomCode,
-    ) -> Array1<f64> {
-        // Identity on the active set, zero elsewhere — the straight-through
-        // estimator's effective metric.
-        let k = code.k_atoms();
-        let mut h = Array1::<f64>::zeros(k);
-        for i in code.active_mask.iter_ones() {
-            h[i] = 1.0;
-        }
-        h
-    }
 }
 
 impl AssignmentSparsityCoupling for TopK {
@@ -796,20 +701,6 @@ impl AtomSelectionStrategy for L1Relaxed {
         out
     }
 
-    fn row_hessian_block(
-        &self,
-        _free_amplitudes_row: ArrayView1<'_, f64>,
-        code: &SparseAtomCode,
-    ) -> Array1<f64> {
-        // Identity on the active set; the smoothed-L¹ curvature contribution
-        // is added by the penalty layer (Piece 4).
-        let k = code.k_atoms();
-        let mut h = Array1::<f64>::zeros(k);
-        for i in code.active_mask.iter_ones() {
-            h[i] = 1.0;
-        }
-        h
-    }
 }
 
 impl AssignmentSparsityCoupling for L1Relaxed {
@@ -862,11 +753,6 @@ pub fn reconstruct_all(
         }
     }
     reconstruction
-}
-
-#[allow(dead_code)]
-fn _type_links(_: ArrayView2<'_, f64>) {
-    // Force a use of ArrayView2 so future refactors keep the import.
 }
 
 #[cfg(test)]
