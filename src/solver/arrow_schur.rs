@@ -1806,6 +1806,521 @@ pub fn write_arrow_direction(
     }
 }
 
+// ===========================================================================
+// Canonical per-point Hessian kernels (`proposals/per_point_hessian.md`).
+//
+// These functions implement the contraction order and sign conventions
+// derived in the proposal. They are the small, testable building blocks
+// that the higher-level row-block assembler should call. All routines
+// preserve the invariant "no `p' × p'` matrix is ever materialized"; every
+// path through the low-rank weight `W_i = U_i U_i^T` contracts through
+// the `(p_out, q_i)` factor `U_i` first.
+//
+// Numerical-stability invariants documented at function entry:
+//   * `weight_u` is the low-rank factor `U_i ∈ R^{p_out × q_i}`. If `q_i = 0`
+//     the data-fit Gauss-Newton block vanishes for that row; the function
+//     still completes successfully.
+//   * `phi_hessian` must be symmetric in its last two axes; the assembler
+//     symmetrizes the output before returning to absorb any floating-point
+//     loop-order asymmetry.
+//   * The residual is `r = z - η`, so the curvature term carries an
+//     overall minus sign per the proposal's §1(b).
+// ===========================================================================
+
+/// Options controlling the residual-curvature contribution and the final
+/// symmetrize.
+#[derive(Debug, Clone, Copy)]
+pub struct PerPointDataHessianOptions {
+    /// Include the `-Σ_α H^Φ_{α,a,b} (β_k W_i r_i)_α` term (not PSD).
+    /// Set `false` to obtain a pure Gauss-Newton row block.
+    pub include_residual_curvature: bool,
+    /// Symmetrize the output via `H ← 0.5 (H + Hᵀ)` after accumulation.
+    pub symmetrize_output: bool,
+}
+
+impl Default for PerPointDataHessianOptions {
+    fn default() -> Self {
+        Self {
+            include_residual_curvature: true,
+            symmetrize_output: true,
+        }
+    }
+}
+
+/// Flatten a `(block, basis_col α, output_col s)` triple into the shared
+/// `β`-slab column index, using the row-major layout
+/// `β_k[α, s] → offset_k + α · p_out + s`. See `proposals/per_point_hessian.md`
+/// §8(c).
+#[inline]
+pub fn flatten_beta_index(
+    beta_block_offsets: &[usize],
+    block: usize,
+    basis_col: usize,
+    output_col: usize,
+    p_out: usize,
+) -> usize {
+    debug_assert!(block < beta_block_offsets.len());
+    beta_block_offsets[block] + basis_col * p_out + output_col
+}
+
+/// Assemble the per-point data-Hessian block
+/// `H_{t_i t_i} ← H^GN_i + H^curv_i` for one observation and one decoder
+/// block `k`, contracting through the low-rank factor `U_i` so no
+/// `p_out × p_out` weight matrix is ever formed.
+///
+/// Contractions (proposal §1(a)–§1(b), §6):
+///
+/// ```text
+/// A[a, s]    = Σ_α J[α, a] β[α, s]                    (d_k × p_out)
+/// B[a, ℓ]    = Σ_s A[a, s] U[s, ℓ]                    (d_k × q_i)
+/// H_GN[a, b] = Σ_ℓ B[a, ℓ] B[b, ℓ]                    (PSD)
+/// c[ℓ]       = Σ_s U[s, ℓ] r[s]                       (q_i)
+/// h[s]       = Σ_ℓ U[s, ℓ] c[ℓ]                       (p_out)
+/// β_h[α]     = Σ_s β[α, s] h[s]                       (b_k)
+/// H[a, b]   -= Σ_α H^Φ[α, a, b] β_h[α]
+/// ```
+///
+/// `out` is INCREMENTED (not overwritten) so the caller can fold this
+/// contribution into a row block that already carries penalty and
+/// isometry contributions.
+pub fn assemble_per_point_data_hessian_block(
+    phi_jacobian: ndarray::ArrayView2<'_, f64>,
+    phi_hessian: ndarray::ArrayView3<'_, f64>,
+    beta: ndarray::ArrayView2<'_, f64>,
+    residual: ndarray::ArrayView1<'_, f64>,
+    weight_u: ndarray::ArrayView2<'_, f64>,
+    options: PerPointDataHessianOptions,
+    mut out: ndarray::ArrayViewMut2<'_, f64>,
+) -> Result<(), String> {
+    let (b_k, d_k) = phi_jacobian.dim();
+    let (p_out, q_i) = weight_u.dim();
+    if beta.dim() != (b_k, p_out) {
+        return Err(format!(
+            "assemble_per_point_data_hessian_block: beta shape {:?} ≠ ({b_k}, {p_out})",
+            beta.dim()
+        ));
+    }
+    if residual.len() != p_out {
+        return Err(format!(
+            "assemble_per_point_data_hessian_block: residual length {} ≠ p_out={p_out}",
+            residual.len()
+        ));
+    }
+    if phi_hessian.dim() != (b_k, d_k, d_k) {
+        return Err(format!(
+            "assemble_per_point_data_hessian_block: phi_hessian shape {:?} ≠ ({b_k}, {d_k}, {d_k})",
+            phi_hessian.dim()
+        ));
+    }
+    if out.dim() != (d_k, d_k) {
+        return Err(format!(
+            "assemble_per_point_data_hessian_block: out shape {:?} ≠ ({d_k}, {d_k})",
+            out.dim()
+        ));
+    }
+
+    // Gauss-Newton: A then B then BBᵀ.
+    if q_i > 0 {
+        // A[a, s] = Σ_α J[α, a] β[α, s]
+        let mut a_mat = ndarray::Array2::<f64>::zeros((d_k, p_out));
+        for alpha in 0..b_k {
+            for a in 0..d_k {
+                let jaa = phi_jacobian[[alpha, a]];
+                if jaa == 0.0 {
+                    continue;
+                }
+                for s in 0..p_out {
+                    a_mat[[a, s]] += jaa * beta[[alpha, s]];
+                }
+            }
+        }
+        // B[a, ℓ] = Σ_s A[a, s] U[s, ℓ]
+        let mut b_mat = ndarray::Array2::<f64>::zeros((d_k, q_i));
+        for a in 0..d_k {
+            for s in 0..p_out {
+                let aas = a_mat[[a, s]];
+                if aas == 0.0 {
+                    continue;
+                }
+                for l in 0..q_i {
+                    b_mat[[a, l]] += aas * weight_u[[s, l]];
+                }
+            }
+        }
+        // H_GN[a, b] += Σ_ℓ B[a, ℓ] B[b, ℓ]
+        for a in 0..d_k {
+            for b in 0..d_k {
+                let mut acc = 0.0_f64;
+                for l in 0..q_i {
+                    acc += b_mat[[a, l]] * b_mat[[b, l]];
+                }
+                out[[a, b]] += acc;
+            }
+        }
+    }
+
+    // Residual curvature: -Σ_α H^Φ_α (β h)_α.
+    // Compute β h once per row (length b_k), then contract with the
+    // symmetric (d_k, d_k) slice for each α — strictly cheaper than
+    // contracting H^Φ against (β, h) inside the (a, b) loop.
+    if options.include_residual_curvature && q_i > 0 {
+        // c[ℓ] = Uᵀ r
+        let mut c_vec = ndarray::Array1::<f64>::zeros(q_i);
+        for l in 0..q_i {
+            let mut acc = 0.0_f64;
+            for s in 0..p_out {
+                acc += weight_u[[s, l]] * residual[s];
+            }
+            c_vec[l] = acc;
+        }
+        // h[s] = U c
+        let mut h_vec = ndarray::Array1::<f64>::zeros(p_out);
+        for s in 0..p_out {
+            let mut acc = 0.0_f64;
+            for l in 0..q_i {
+                acc += weight_u[[s, l]] * c_vec[l];
+            }
+            h_vec[s] = acc;
+        }
+        // β_h[α] = Σ_s β[α, s] h[s]
+        let mut beta_h = ndarray::Array1::<f64>::zeros(b_k);
+        for alpha in 0..b_k {
+            let mut acc = 0.0_f64;
+            for s in 0..p_out {
+                acc += beta[[alpha, s]] * h_vec[s];
+            }
+            beta_h[alpha] = acc;
+        }
+        // H_curv[a, b] -= Σ_α H^Φ[α, a, b] β_h[α]
+        for alpha in 0..b_k {
+            let bh = beta_h[alpha];
+            if bh == 0.0 {
+                continue;
+            }
+            for a in 0..d_k {
+                for b in 0..d_k {
+                    out[[a, b]] -= phi_hessian[[alpha, a, b]] * bh;
+                }
+            }
+        }
+    }
+
+    if options.symmetrize_output {
+        for a in 0..d_k {
+            for b in 0..a {
+                let v = 0.5 * (out[[a, b]] + out[[b, a]]);
+                out[[a, b]] = v;
+                out[[b, a]] = v;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Variant accepting a row-of-rows-major packed Hessian
+/// `(b_k, d_k * d_k)` view (the storage layout used by
+/// `crate::terms::input_loc_derivatives::basis_input_loc_hess`). The
+/// packed entry `(α, a · d_k + b)` is interpreted as the unpacked
+/// `[α, a, b]` slot.
+pub fn assemble_per_point_data_hessian_block_from_packed_hphi(
+    phi_jacobian: ndarray::ArrayView2<'_, f64>,
+    phi_hessian_packed: ndarray::ArrayView2<'_, f64>,
+    beta: ndarray::ArrayView2<'_, f64>,
+    residual: ndarray::ArrayView1<'_, f64>,
+    weight_u: ndarray::ArrayView2<'_, f64>,
+    options: PerPointDataHessianOptions,
+    out: ndarray::ArrayViewMut2<'_, f64>,
+) -> Result<(), String> {
+    let (b_k, d_k) = phi_jacobian.dim();
+    if phi_hessian_packed.dim() != (b_k, d_k * d_k) {
+        return Err(format!(
+            "assemble_per_point_data_hessian_block_from_packed_hphi: \
+             packed shape {:?} ≠ ({b_k}, {d_k}*{d_k})",
+            phi_hessian_packed.dim()
+        ));
+    }
+    let mut unpacked = ndarray::Array3::<f64>::zeros((b_k, d_k, d_k));
+    for alpha in 0..b_k {
+        for a in 0..d_k {
+            for b in 0..d_k {
+                unpacked[[alpha, a, b]] = phi_hessian_packed[[alpha, a * d_k + b]];
+            }
+        }
+    }
+    assemble_per_point_data_hessian_block(
+        phi_jacobian,
+        unpacked.view(),
+        beta,
+        residual,
+        weight_u,
+        options,
+        out,
+    )
+}
+
+/// Assemble the per-point cross tensor
+/// `cross[a, γ, v] = φ_γ · gA[a, v] - J[γ, a] · h[v]`
+/// for the same decoder block (`m = k`). See `proposals/per_point_hessian.md`
+/// §2 and §2(a).
+///
+/// `out` is INCREMENTED with shape `(d_k, b_k, p_out)`.
+pub fn assemble_t_beta_cross_tensor_same_block(
+    phi: ndarray::ArrayView1<'_, f64>,
+    phi_jacobian: ndarray::ArrayView2<'_, f64>,
+    beta: ndarray::ArrayView2<'_, f64>,
+    residual: ndarray::ArrayView1<'_, f64>,
+    weight_u: ndarray::ArrayView2<'_, f64>,
+    mut out: ndarray::ArrayViewMut3<'_, f64>,
+) -> Result<(), String> {
+    let (b_k, d_k) = phi_jacobian.dim();
+    let (p_out, q_i) = weight_u.dim();
+    if phi.len() != b_k {
+        return Err(format!(
+            "assemble_t_beta_cross_tensor_same_block: phi length {} ≠ b_k={b_k}",
+            phi.len()
+        ));
+    }
+    if beta.dim() != (b_k, p_out) {
+        return Err(format!(
+            "assemble_t_beta_cross_tensor_same_block: beta shape {:?} ≠ ({b_k}, {p_out})",
+            beta.dim()
+        ));
+    }
+    if residual.len() != p_out {
+        return Err(format!(
+            "assemble_t_beta_cross_tensor_same_block: residual length {} ≠ p_out={p_out}",
+            residual.len()
+        ));
+    }
+    if out.dim() != (d_k, b_k, p_out) {
+        return Err(format!(
+            "assemble_t_beta_cross_tensor_same_block: out shape {:?} ≠ ({d_k}, {b_k}, {p_out})",
+            out.dim()
+        ));
+    }
+
+    if q_i == 0 {
+        // No data-fit weight: cross tensor identically zero for the
+        // data-fit term (the tangent-effect path requires `h = W r`).
+        return Ok(());
+    }
+
+    // c[ℓ] = Uᵀ r
+    let mut c_vec = ndarray::Array1::<f64>::zeros(q_i);
+    for l in 0..q_i {
+        let mut acc = 0.0_f64;
+        for s in 0..p_out {
+            acc += weight_u[[s, l]] * residual[s];
+        }
+        c_vec[l] = acc;
+    }
+    // h[v] = U c
+    let mut h_vec = ndarray::Array1::<f64>::zeros(p_out);
+    for v in 0..p_out {
+        let mut acc = 0.0_f64;
+        for l in 0..q_i {
+            acc += weight_u[[v, l]] * c_vec[l];
+        }
+        h_vec[v] = acc;
+    }
+    // A[a, s] = Σ_γ J[γ, a] β[γ, s]
+    let mut a_mat = ndarray::Array2::<f64>::zeros((d_k, p_out));
+    for gamma in 0..b_k {
+        for a in 0..d_k {
+            let jga = phi_jacobian[[gamma, a]];
+            if jga == 0.0 {
+                continue;
+            }
+            for s in 0..p_out {
+                a_mat[[a, s]] += jga * beta[[gamma, s]];
+            }
+        }
+    }
+    // B[a, ℓ] = Σ_s A[a, s] U[s, ℓ]
+    let mut b_mat = ndarray::Array2::<f64>::zeros((d_k, q_i));
+    for a in 0..d_k {
+        for s in 0..p_out {
+            let aas = a_mat[[a, s]];
+            if aas == 0.0 {
+                continue;
+            }
+            for l in 0..q_i {
+                b_mat[[a, l]] += aas * weight_u[[s, l]];
+            }
+        }
+    }
+    // gA[a, v] = Σ_ℓ U[v, ℓ] B[a, ℓ]
+    let mut ga = ndarray::Array2::<f64>::zeros((d_k, p_out));
+    for a in 0..d_k {
+        for l in 0..q_i {
+            let bal = b_mat[[a, l]];
+            if bal == 0.0 {
+                continue;
+            }
+            for v in 0..p_out {
+                ga[[a, v]] += weight_u[[v, l]] * bal;
+            }
+        }
+    }
+    // cross[a, γ, v] += φ_γ · gA[a, v] - J[γ, a] · h[v]
+    for a in 0..d_k {
+        for gamma in 0..b_k {
+            let pg = phi[gamma];
+            let jga = phi_jacobian[[gamma, a]];
+            for v in 0..p_out {
+                out[[a, gamma, v]] += pg * ga[[a, v]] - jga * h_vec[v];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Scatter a per-block cross tensor `(d_k, b_k, p_out)` into the shared
+/// `htbeta` slab `(d_k, total_beta_dim)` using
+/// `flatten_beta_index(beta_block_offset, γ, v)`. The output is
+/// INCREMENTED.
+pub fn scatter_t_beta_cross_tensor(
+    cross: ndarray::ArrayView3<'_, f64>,
+    beta_block_offset: usize,
+    p_out: usize,
+    mut out_htbeta: ndarray::ArrayViewMut2<'_, f64>,
+) -> Result<(), String> {
+    let (d_k, b_k, p) = cross.dim();
+    if p != p_out {
+        return Err(format!(
+            "scatter_t_beta_cross_tensor: cross last dim {p} ≠ p_out={p_out}"
+        ));
+    }
+    if out_htbeta.nrows() != d_k {
+        return Err(format!(
+            "scatter_t_beta_cross_tensor: out rows {} ≠ d_k={d_k}",
+            out_htbeta.nrows()
+        ));
+    }
+    let needed = beta_block_offset + b_k * p_out;
+    if out_htbeta.ncols() < needed {
+        return Err(format!(
+            "scatter_t_beta_cross_tensor: out has {} cols, need ≥ {needed}",
+            out_htbeta.ncols()
+        ));
+    }
+    for a in 0..d_k {
+        for gamma in 0..b_k {
+            let col_base = beta_block_offset + gamma * p_out;
+            for v in 0..p_out {
+                out_htbeta[[a, col_base + v]] += cross[[a, gamma, v]];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Apply the data-fit `H_{ββ}` low-rank operator
+/// `(H_ββ^{data} δβ)_{kαs} = Σ_i φ_{ikα} (U_i (U_iᵀ Σ_k φ_{ikα'} δβ_{kα's}))_s`
+/// per the proposal §3 contraction order.
+///
+/// `phi_rows_by_block[i][k][α]` is supplied via the slice convention
+/// `phi_rows_by_block.len() == n_obs * n_blocks` flattened row-major:
+/// entry `i * n_blocks + k` is the φ-row for `(i, k)`. The
+/// `delta_beta_blocks` slice carries one `Array2<f64>` per block of
+/// shape `(b_k, p_out)`, and `out_blocks` mirrors that shape. `weight_u`
+/// is the per-row factor `U_i` for the single observation `i` consumed
+/// by this matvec; callers iterating across rows should invoke once per
+/// row and accumulate into `out_blocks`.
+///
+/// This is the per-row contribution; the full `H_ββ δβ` is obtained by
+/// summing over `i`. Operating per-row keeps the inner contractions in
+/// `O(q_i · max(K_φ, p_out))` and matches the
+/// `set_shared_beta_operator` shape expected by the InexactPCG path.
+pub fn beta_beta_low_rank_matvec_row(
+    phi_rows_by_block: &[ndarray::ArrayView1<'_, f64>],
+    delta_beta_blocks: &[ndarray::ArrayView2<'_, f64>],
+    weight_u: ndarray::ArrayView2<'_, f64>,
+    out_blocks: &mut [ndarray::ArrayViewMut2<'_, f64>],
+) -> Result<(), String> {
+    let n_blocks = phi_rows_by_block.len();
+    if delta_beta_blocks.len() != n_blocks || out_blocks.len() != n_blocks {
+        return Err(format!(
+            "beta_beta_low_rank_matvec_row: block-count mismatch \
+             (phi={n_blocks}, dβ={}, out={})",
+            delta_beta_blocks.len(),
+            out_blocks.len()
+        ));
+    }
+    let (p_out, q_i) = weight_u.dim();
+    if p_out == 0 || q_i == 0 {
+        return Ok(());
+    }
+    // δy[s] = Σ_k Σ_α φ_{kα} δβ_{kαs}
+    let mut delta_y = ndarray::Array1::<f64>::zeros(p_out);
+    for k in 0..n_blocks {
+        let phi_k = phi_rows_by_block[k];
+        let db_k = delta_beta_blocks[k];
+        if db_k.ncols() != p_out {
+            return Err(format!(
+                "beta_beta_low_rank_matvec_row: block {k} dβ p_out={} ≠ {p_out}",
+                db_k.ncols()
+            ));
+        }
+        let b_k = phi_k.len();
+        if db_k.nrows() != b_k {
+            return Err(format!(
+                "beta_beta_low_rank_matvec_row: block {k} dβ rows {} ≠ b_k={b_k}",
+                db_k.nrows()
+            ));
+        }
+        for alpha in 0..b_k {
+            let pa = phi_k[alpha];
+            if pa == 0.0 {
+                continue;
+            }
+            for s in 0..p_out {
+                delta_y[s] += pa * db_k[[alpha, s]];
+            }
+        }
+    }
+    // d[ℓ] = Uᵀ δy
+    let mut d_vec = ndarray::Array1::<f64>::zeros(q_i);
+    for l in 0..q_i {
+        let mut acc = 0.0_f64;
+        for s in 0..p_out {
+            acc += weight_u[[s, l]] * delta_y[s];
+        }
+        d_vec[l] = acc;
+    }
+    // w δy[s] = Σ_ℓ U[s, ℓ] d[ℓ]
+    let mut w_dy = ndarray::Array1::<f64>::zeros(p_out);
+    for s in 0..p_out {
+        let mut acc = 0.0_f64;
+        for l in 0..q_i {
+            acc += weight_u[[s, l]] * d_vec[l];
+        }
+        w_dy[s] = acc;
+    }
+    // out_kαs += φ_{kα} · w δy[s]
+    for k in 0..n_blocks {
+        let phi_k = phi_rows_by_block[k];
+        let b_k = phi_k.len();
+        let out_k = &mut out_blocks[k];
+        if out_k.dim() != (b_k, p_out) {
+            return Err(format!(
+                "beta_beta_low_rank_matvec_row: out block {k} shape {:?} ≠ ({b_k}, {p_out})",
+                out_k.dim()
+            ));
+        }
+        for alpha in 0..b_k {
+            let pa = phi_k[alpha];
+            if pa == 0.0 {
+                continue;
+            }
+            for s in 0..p_out {
+                out_k[[alpha, s]] += pa * w_dy[s];
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
