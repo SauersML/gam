@@ -188,8 +188,14 @@ impl Default for TopologySelectOptions {
 /// Returns negative log evidence:
 ///
 /// ```text
-/// V(ρ, T) = F(β*, u*; ρ, T) + 0.5 log|H| - 0.5 log|S_pen(ρ)|+.
+/// V(ρ, T) = F(β*, u*; ρ, T)
+///         + 0.5 log|H|
+///         - 0.5 log|S_pen(ρ)|+
+///         - 0.5 (dim(H) - rank(S_pen)) log(2π).
 /// ```
+///
+/// The last term is the rank-aware Tierney-Kadane normalizer:
+/// `log p(y|T) ≈ -V`, with `0.5 log|2πH⁻¹| - 0.5 log|2πS⁻¹|`.
 ///
 /// The `H` log-determinant is computed from the arrow factorization
 ///
@@ -203,27 +209,251 @@ impl Default for TopologySelectOptions {
 /// `penalty_log_det` is `log|S_pen(ρ)|+` — the prior penalty
 /// pseudo-logdet from `crate::solver::reml::penalty_logdet` (proposal
 /// §3.6). It must NOT be confused with the arrow Schur log-det, which
-/// this function recomputes internally from `cache`.
+/// this function recomputes internally from `logdet_source`.
 ///
 /// `residual_objective` is `F(β*, u*; ρ, T)` at the inner optimum. The
 /// envelope theorem (proposal §3.2) makes this the only `F`-related
 /// contribution.
 ///
+/// `effective_dim` is `dim(H)` after constraints/projections and
+/// `penalty_rank` is `rank(S_pen)`. Their difference is the unpenalized
+/// nullspace dimension that remains in the Laplace integral.
+///
 /// # Errors
 ///
-/// Returns `f64::NAN` if the cache lacks the undamped Schur factor
-/// (`cache.schur_factor` was built under ridge damping or via PCG; see
-/// proposal §6.5 — PCG does not give exact log-determinants).
+/// Returns `f64::NAN` if the exact factor path is incoherent and no HVP
+/// fallback is supplied, or if the supplied dimensions are non-finite.
 pub fn laplace_evidence(
-    cache: &ArrowFactorCache,
+    logdet_source: EvidenceLogDetSource<'_>,
     penalty_log_det: f64,
     residual_objective: f64,
+    effective_dim: f64,
+    penalty_rank: f64,
 ) -> f64 {
-    let log_det_h = match arrow_log_det_from_cache(cache) {
-        Some(v) => v,
-        None => return f64::NAN,
+    if !(effective_dim.is_finite() && penalty_rank.is_finite()) {
+        return f64::NAN;
+    }
+    let log_det_h = match evidence_hessian_log_det(logdet_source) {
+        Ok(v) => v,
+        Err(_) => return f64::NAN,
     };
-    residual_objective + 0.5 * log_det_h - 0.5 * penalty_log_det
+    let null_dim = effective_dim - penalty_rank;
+    if !null_dim.is_finite() || null_dim < -1e-9 {
+        return f64::NAN;
+    }
+    residual_objective + 0.5 * log_det_h
+        - 0.5 * penalty_log_det
+        - 0.5 * null_dim.max(0.0) * (2.0 * std::f64::consts::PI).ln()
+}
+
+/// Compute the Hessian logdet from exact arrow factors or an HVP fallback.
+pub fn evidence_hessian_log_det(source: EvidenceLogDetSource<'_>) -> Result<f64, String> {
+    match source {
+        EvidenceLogDetSource::FactoredArrow {
+            cache,
+            fallback_hvp,
+        } => match arrow_log_det_from_cache(cache) {
+            Some(v) => Ok(v),
+            None => match fallback_hvp {
+                Some(hvp) => hessian_log_det_from_hvp(hvp),
+                None => Err("evidence Hessian logdet requires exact factors or HVP fallback".into()),
+            },
+        },
+        EvidenceLogDetSource::Hvp(hvp) => hessian_log_det_from_hvp(hvp),
+    }
+}
+
+/// Log determinant of an SPD operator supplied by HVP callback.
+///
+/// The dispatch boundary intentionally matches
+/// `ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD` in `terms::analytic_penalties`:
+/// small operators are materialized and diagonalized exactly; larger ones use
+/// Rademacher stochastic Lanczos quadrature.
+pub fn hessian_log_det_from_hvp(hvp: EvidenceHvpLogDet<'_>) -> Result<f64, String> {
+    if hvp.dim == 0 {
+        return Ok(0.0);
+    }
+    if hvp.dim <= ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD {
+        let mut dense = Array2::<f64>::zeros((hvp.dim, hvp.dim));
+        let mut basis = vec![0.0_f64; hvp.dim];
+        for j in 0..hvp.dim {
+            basis[j] = 1.0;
+            let col = (hvp.apply)(&basis);
+            basis[j] = 0.0;
+            if col.len() != hvp.dim || col.iter().any(|v| !v.is_finite()) {
+                return Err(format!(
+                    "evidence HVP logdet expected finite column of length {}, got {}",
+                    hvp.dim,
+                    col.len()
+                ));
+            }
+            for i in 0..hvp.dim {
+                dense[[i, j]] = col[i];
+            }
+        }
+        for i in 0..hvp.dim {
+            for j in (i + 1)..hvp.dim {
+                let avg = 0.5 * (dense[[i, j]] + dense[[j, i]]);
+                dense[[i, j]] = avg;
+                dense[[j, i]] = avg;
+            }
+        }
+        dense_spd_log_det(&dense)
+    } else {
+        stochastic_hvp_log_det(hvp)
+    }
+}
+
+fn dense_spd_log_det(matrix: &Array2<f64>) -> Result<f64, String> {
+    if matrix.nrows() != matrix.ncols() {
+        return Err(format!(
+            "evidence dense logdet requires square matrix, got {}x{}",
+            matrix.nrows(),
+            matrix.ncols()
+        ));
+    }
+    let (evals, _) = matrix
+        .eigh(Side::Lower)
+        .map_err(|e| format!("evidence dense logdet eigendecomposition failed: {e}"))?;
+    let mut logdet = 0.0_f64;
+    for (idx, &ev) in evals.iter().enumerate() {
+        if !ev.is_finite() || ev <= 0.0 {
+            return Err(format!(
+                "evidence dense logdet expected SPD Hessian, eigenvalue {idx} is {ev:.3e}"
+            ));
+        }
+        logdet += ev.ln();
+    }
+    Ok(logdet)
+}
+
+fn stochastic_hvp_log_det(hvp: EvidenceHvpLogDet<'_>) -> Result<f64, String> {
+    let probes = EVIDENCE_LOGDET_SLQ_PROBES.max(1);
+    let steps = EVIDENCE_LOGDET_LANCZOS_STEPS.min(hvp.dim).max(1);
+    let inv_norm = 1.0 / (hvp.dim as f64).sqrt();
+    let mut estimate = 0.0_f64;
+    for probe in 0..probes {
+        let mut q0 = vec![0.0_f64; hvp.dim];
+        rademacher_unit_probe_into_slice(&mut q0, probe as u64, inv_norm);
+        let quad = lanczos_log_quadrature_hvp(hvp, q0, steps)?;
+        estimate += hvp.dim as f64 * quad;
+    }
+    Ok(estimate / probes as f64)
+}
+
+fn lanczos_log_quadrature_hvp(
+    hvp: EvidenceHvpLogDet<'_>,
+    mut q: Vec<f64>,
+    max_steps: usize,
+) -> Result<f64, String> {
+    let n = hvp.dim;
+    let mut q_prev = vec![0.0_f64; n];
+    let mut alphas = Vec::<f64>::with_capacity(max_steps);
+    let mut betas = Vec::<f64>::with_capacity(max_steps.saturating_sub(1));
+    let mut beta_prev = 0.0_f64;
+    let tol = 1e-12_f64;
+
+    for step in 0..max_steps {
+        let applied = (hvp.apply)(&q);
+        if applied.len() != n || applied.iter().any(|v| !v.is_finite()) {
+            return Err(format!(
+                "evidence HVP SLQ expected finite vector of length {n}, got {}",
+                applied.len()
+            ));
+        }
+        let mut w = applied;
+        if step > 0 {
+            for i in 0..n {
+                w[i] -= beta_prev * q_prev[i];
+            }
+        }
+        let alpha = dot_slice(&q, &w);
+        if !alpha.is_finite() {
+            return Err("evidence HVP SLQ produced non-finite alpha".to_string());
+        }
+        for i in 0..n {
+            w[i] -= alpha * q[i];
+        }
+        let beta = norm2_slice(&w);
+        alphas.push(alpha);
+        if step + 1 == max_steps || beta <= tol {
+            break;
+        }
+        if !beta.is_finite() {
+            return Err("evidence HVP SLQ produced non-finite beta".to_string());
+        }
+        betas.push(beta);
+        q_prev = q;
+        q = w;
+        for v in q.iter_mut() {
+            *v /= beta;
+        }
+        beta_prev = beta;
+    }
+
+    let k = alphas.len();
+    let mut tri = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        tri[[i, i]] = alphas[i];
+        if i + 1 < k {
+            tri[[i, i + 1]] = betas[i];
+            tri[[i + 1, i]] = betas[i];
+        }
+    }
+    let (evals, evecs) = tri
+        .eigh(Side::Lower)
+        .map_err(|e| format!("evidence HVP SLQ eigendecomposition failed: {e}"))?;
+    let mut quad = 0.0_f64;
+    for j in 0..k {
+        let theta = evals[j];
+        if !theta.is_finite() || theta <= 0.0 {
+            return Err(format!(
+                "evidence HVP SLQ expected SPD Hessian, Lanczos Ritz value {j} is {theta:.3e}"
+            ));
+        }
+        let weight = evecs[[0, j]] * evecs[[0, j]];
+        quad += weight * theta.ln();
+    }
+    Ok(quad)
+}
+
+#[inline]
+fn dot_slice(a: &[f64], b: &[f64]) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    let mut s = 0.0_f64;
+    for i in 0..a.len() {
+        s += a[i] * b[i];
+    }
+    s
+}
+
+#[inline]
+fn norm2_slice(a: &[f64]) -> f64 {
+    dot_slice(a, a).sqrt()
+}
+
+fn rademacher_unit_probe_into_slice(z: &mut [f64], probe: u64, scale: f64) {
+    let mut state = 0x6A09E667F3BCC909_u64 ^ probe.wrapping_mul(0xD1B54A32D192ED03);
+    let mut bits = 0_u64;
+    let mut remaining_bits = 0_u32;
+    for value in z.iter_mut() {
+        if remaining_bits == 0 {
+            bits = splitmix64(&mut state);
+            remaining_bits = 64;
+        }
+        *value = if bits & 1 == 0 { scale } else { -scale };
+        bits >>= 1;
+        remaining_bits -= 1;
+    }
+}
+
+#[inline]
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E3779B97F4A7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z ^ (z >> 31)
 }
 
 /// Sum of per-row arrow log-determinants plus the Schur log-det.
@@ -231,11 +461,9 @@ pub fn laplace_evidence(
 /// `log|H| = Σ_i log|H_uu_i| + log|A|` using the undamped Cholesky
 /// factors of `H_uu_i` and the cached Schur Cholesky factor.
 ///
-/// Returns `None` if `cache.schur_factor` is absent (InexactPCG path —
-/// proposal §6.5 says this must error rather than silently approximate)
-/// or if a damped/incoherent cache is supplied. Callers that need a
-/// stochastic estimator should request it explicitly, not through this
-/// function.
+/// Returns `None` if `cache.schur_factor` is absent (InexactPCG path) or
+/// if a damped/incoherent cache is supplied. [`evidence_hessian_log_det`]
+/// routes such matrix-free cases to an explicit HVP fallback.
 pub fn arrow_log_det_from_cache(cache: &ArrowFactorCache) -> Option<f64> {
     if cache.ridge_t != 0.0 || cache.ridge_beta != 0.0 {
         // Per proposal §6.4 / §6.5 — evidence must use the undamped
@@ -378,18 +606,73 @@ pub fn ift_du_drho(
 }
 
 // ---------------------------------------------------------------------------
-// ∂V/∂ρ — analytic gradient via arrow trace formula (frozen-Hessian)
+// ∂V/∂ρ — analytic optimized-evidence gradient via IFT mode response
 // ---------------------------------------------------------------------------
 
-/// Per-`ρ` evidence gradient (frozen-Hessian Laplace mode per proposal
-/// §3.7 / §3.8 split):
+/// IFT terms needed to differentiate the optimized Laplace evidence through
+/// the fitted mode `(β*(ρ), u*(ρ))`.
+///
+/// For each hyperparameter `ρ_a`, the correction added to the direct trace is
+///
+/// ```text
+/// F_β · β_a + F_u · u_a
+/// + 0.5 (∂_β log|H| · β_a + ∂_u log|H| · u_a).
+/// ```
+///
+/// At an exact KKT point the value-gradient pieces are zero, but they are
+/// explicit here so the exported gradient matches the optimized objective
+/// whenever callers carry a certified nonzero residual correction.
+#[derive(Clone, Copy)]
+pub struct EvidenceIftGradientTerms<'a> {
+    pub dbeta_drho: ArrayView2<'a, f64>,
+    pub du_drho: ArrayView2<'a, f64>,
+    pub value_beta: ArrayView1<'a, f64>,
+    pub value_u: ArrayView1<'a, f64>,
+    pub logdet_h_beta: ArrayView1<'a, f64>,
+    pub logdet_h_u: ArrayView1<'a, f64>,
+}
+
+/// Contract the IFT mode-response columns into the optimized-evidence
+/// gradient correction.
+pub fn evidence_ift_gradient_correction(terms: EvidenceIftGradientTerms<'_>) -> Array1<f64> {
+    let k = terms.dbeta_drho.nrows();
+    let nd = terms.du_drho.nrows();
+    let r = terms.dbeta_drho.ncols();
+    debug_assert_eq!(terms.du_drho.ncols(), r);
+    debug_assert_eq!(terms.value_beta.len(), k);
+    debug_assert_eq!(terms.logdet_h_beta.len(), k);
+    debug_assert_eq!(terms.value_u.len(), nd);
+    debug_assert_eq!(terms.logdet_h_u.len(), nd);
+
+    let mut out = Array1::<f64>::zeros(r);
+    for a in 0..r {
+        let mut acc = 0.0_f64;
+        for j in 0..k {
+            let mode = terms.dbeta_drho[[j, a]];
+            acc += terms.value_beta[j] * mode;
+            acc += 0.5 * terms.logdet_h_beta[j] * mode;
+        }
+        for j in 0..nd {
+            let mode = terms.du_drho[[j, a]];
+            acc += terms.value_u[j] * mode;
+            acc += 0.5 * terms.logdet_h_u[j] * mode;
+        }
+        out[a] = acc;
+    }
+    out
+}
+
+/// Per-`ρ` optimized-evidence gradient (proposal §3.7 / §3.8 split):
 ///
 /// ```text
 /// ∂V/∂ρ_a =
 ///       F_{ρ_a}                                  (value part)
 ///   + 0.5 tr(H⁻¹ H_{ρ_a})                        (direct Hessian)
+///   + F_x · x_{ρ_a}
+///   + 0.5 (∂_x log|H|) · x_{ρ_a}                 (IFT mode response)
 ///   - 0.5 tr(S_pen⁺ S_{pen,ρ_a})                 (penalty pseudo-logdet)
 /// ```
+/// where `x = (β, u)`.
 ///
 /// The `tr(H⁻¹ H_{ρ_a})` trace is computed via the arrow structure
 /// (proposal §3.5 / §3.10):
@@ -398,17 +681,13 @@ pub fn ift_du_drho(
 /// tr(H⁻¹ H_{ρ_a}) = Σ_i tr(H_uu_i⁻¹ ∂_{ρ_a} H_uu_i) + tr(A⁻¹ ∂_{ρ_a} A).
 /// ```
 ///
-/// The exact ExactLaplace mode (proposal §3.8 grad_h_ift_beta /
-/// grad_h_ift_u parts) requires third-derivative callbacks. Per
-/// proposal §3.8 and §6.6, that exact extension is left to a separate
-/// signature; this function implements only the FrozenHessian branch
-/// and returns the named split.
-///
 /// `value_rho[a] = F_{ρ_a}` (envelope theorem, proposal §3.2).
 /// `huu_drho[i][a]` is `∂H_uu_i/∂ρ_a` as a `d × d` matrix.
 /// `hbb_drho[a]` is `∂H_ββ/∂ρ_a` as a `K × K` matrix.
 /// `htbeta_drho[i][a]` is `∂H_uβ_i/∂ρ_a` as a `d × K` matrix.
 /// `pen_logdet_drho[a]` is `∂_{ρ_a} log|S_pen|+`.
+/// `ift_terms` carries `∂β*/∂ρ`, `∂u*/∂ρ`, and the already-contracted
+/// mode derivatives of `F` and `log|H|`.
 ///
 /// Returns the per-`ρ` gradient. Returns a NaN-filled vector when the
 /// cache has no undamped Schur factor (PCG mode).
@@ -419,12 +698,15 @@ pub fn evidence_grad_rho(
     htbeta_drho: &[Vec<Array2<f64>>],
     hbb_drho: &[Array2<f64>],
     pen_logdet_drho: ArrayView1<'_, f64>,
+    ift_terms: EvidenceIftGradientTerms<'_>,
 ) -> Array1<f64> {
     let r = value_rho.len();
     let n = cache.htt_factors_undamped.len();
     let d = cache.d;
     let k = cache.k;
     let mut out = Array1::<f64>::zeros(r);
+    let ift_correction = evidence_ift_gradient_correction(ift_terms);
+    debug_assert_eq!(ift_correction.len(), r);
 
     let schur = match cache.schur_factor.as_ref() {
         Some(s) => s,
@@ -549,6 +831,7 @@ pub fn evidence_grad_rho(
         }
 
         grad += 0.5 * (row_trace_acc + schur_trace_acc);
+        grad += ift_correction[a];
 
         // Part 3: -0.5 ∂_{ρ_a} log|S_pen|+.
         grad -= 0.5 * pen_logdet_drho[a];
@@ -562,9 +845,9 @@ pub fn evidence_grad_rho(
 // Topology selection
 // ---------------------------------------------------------------------------
 
-/// Enumerate the candidate topologies, rank by negative log evidence,
-/// and return the winner. Failed/excluded candidates (proposal §6.11)
-/// are appended at the end of `ranking` and are never the winner.
+/// Enumerate the candidate topologies, rank by normalized negative log
+/// evidence, and return the winner. Failed/excluded candidates (proposal
+/// §6.11) are appended at the end of `ranking` and are never the winner.
 ///
 /// The caller fits each topology separately (proposal §4.2) and supplies
 /// the resulting `TopologyCandidate` records. This function is purely
@@ -572,10 +855,10 @@ pub fn evidence_grad_rho(
 ///
 /// # Tie-breaking
 ///
-/// Per proposal §4.6: if `|V_a - V_b| <= tie_tolerance`, prefer the
-/// simpler topology by `TopologyKind::complexity_rank` (flat < periodic
-/// < sphere < torus). The `tie` flag in the result records whether such
-/// a tie occurred at the top of the ranking.
+/// Per proposal §4.6: if normalized `|score_a - score_b| <= tie_tolerance`,
+/// prefer the simpler topology by `TopologyKind::complexity_rank` (flat <
+/// periodic < sphere < torus). The `tie` flag in the result records whether
+/// such a tie occurred at the top of the ranking.
 ///
 /// # Panics
 ///
@@ -592,6 +875,7 @@ pub fn select_topology(
         .iter()
         .filter(|c| {
             c.converged && c.exclusion_reason.is_none() && c.negative_log_evidence.is_finite()
+                && topology_selection_score(c, options.score_scale).is_finite()
         })
         .cloned()
         .collect();
@@ -599,6 +883,7 @@ pub fn select_topology(
         .iter()
         .filter(|c| {
             !(c.converged && c.exclusion_reason.is_none() && c.negative_log_evidence.is_finite())
+                || !topology_selection_score(c, options.score_scale).is_finite()
         })
         .cloned()
         .collect();
@@ -608,19 +893,19 @@ pub fn select_topology(
         "select_topology: no finite valid candidates; proposal §6.11 forbids silent fallback"
     );
 
-    // Sort by negative log evidence (ascending = best first), breaking
-    // ties by complexity_rank (smaller wins).
+    // Sort by normalized negative log evidence (ascending = best first),
+    // breaking ties by complexity_rank (smaller wins).
     valid.sort_by(|a, b| {
-        a.negative_log_evidence
-            .partial_cmp(&b.negative_log_evidence)
+        topology_selection_score(a, options.score_scale)
+            .partial_cmp(&topology_selection_score(b, options.score_scale))
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.kind.complexity_rank().cmp(&b.kind.complexity_rank()))
     });
 
     // Detect numerical tie at the top.
     let tie = if valid.len() >= 2 {
-        let top = valid[0].negative_log_evidence;
-        let next = valid[1].negative_log_evidence;
+        let top = topology_selection_score(&valid[0], options.score_scale);
+        let next = topology_selection_score(&valid[1], options.score_scale);
         (next - top).abs() <= options.tie_tolerance
     } else {
         false
@@ -628,11 +913,14 @@ pub fn select_topology(
 
     // If tied, prefer simpler topology among the tied prefix.
     if tie {
-        let top_score = valid[0].negative_log_evidence;
+        let top_score = topology_selection_score(&valid[0], options.score_scale);
         // Find the tied prefix range.
         let tied_end = valid
             .iter()
-            .position(|c| (c.negative_log_evidence - top_score).abs() > options.tie_tolerance)
+            .position(|c| {
+                (topology_selection_score(c, options.score_scale) - top_score).abs()
+                    > options.tie_tolerance
+            })
             .unwrap_or(valid.len());
         // Sort the tied prefix by complexity_rank ascending.
         valid[..tied_end].sort_by_key(|c| c.kind.complexity_rank());
@@ -647,14 +935,33 @@ pub fn select_topology(
     }
 }
 
+fn topology_selection_score(candidate: &TopologyCandidate, scale: TopologyScoreScale) -> f64 {
+    match scale {
+        TopologyScoreScale::PerObservation => {
+            if candidate.n_obs == 0 {
+                f64::NAN
+            } else {
+                candidate.negative_log_evidence / candidate.n_obs as f64
+            }
+        }
+        TopologyScoreScale::PerEffectiveDim => {
+            if !(candidate.effective_dim.is_finite() && candidate.effective_dim > 0.0) {
+                f64::NAN
+            } else {
+                candidate.negative_log_evidence / candidate.effective_dim
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cache verification helpers
 // ---------------------------------------------------------------------------
 
-/// Sanity check used by callers before passing a cache to
-/// [`laplace_evidence`] or [`evidence_grad_rho`]. Proposal §6.4 — ridges
-/// must be zero on the evidence-evaluation path. Proposal §6.5 — PCG
-/// caches lack the Schur factor and cannot supply exact logdets.
+/// Sanity check used by callers that require exact factor-backed evidence.
+/// Proposal §6.4 — ridges must be zero on the evidence-evaluation path.
+/// Matrix-free callers can instead pass an HVP fallback to
+/// [`laplace_evidence`].
 pub fn cache_supports_exact_evidence(cache: &ArrowFactorCache) -> bool {
     cache.ridge_t == 0.0 && cache.ridge_beta == 0.0 && cache.schur_factor.is_some()
 }
@@ -734,10 +1041,21 @@ mod tests {
     #[test]
     fn laplace_evidence_returns_finite_for_minimal_cache() {
         let cache = make_minimal_cache();
-        // log|H| = log(2) + log(1.875), V = F + 0.5 log|H| - 0.5 log|S_pen|+.
-        let v = laplace_evidence(&cache, 0.0, 0.0);
+        // log|H| = log(2) + log(1.875). With dim(H)=2 and rank(S)=1,
+        // V includes the rank-aware TK nullspace normalizer.
+        let v = laplace_evidence(
+            EvidenceLogDetSource::FactoredArrow {
+                cache: &cache,
+                fallback_hvp: None,
+            },
+            0.0,
+            0.0,
+            2.0,
+            1.0,
+        );
         assert!(v.is_finite());
-        let expected = 0.5 * (2.0_f64.ln() + 1.875_f64.ln());
+        let expected = 0.5 * (2.0_f64.ln() + 1.875_f64.ln())
+            - 0.5 * (2.0 * std::f64::consts::PI).ln();
         assert!((v - expected).abs() < 1e-12);
     }
 
@@ -745,7 +1063,42 @@ mod tests {
     fn laplace_evidence_nan_when_ridge_is_nonzero() {
         let mut cache = make_minimal_cache();
         cache.ridge_t = 1e-3;
-        assert!(laplace_evidence(&cache, 0.0, 0.0).is_nan());
+        assert!(
+            laplace_evidence(
+                EvidenceLogDetSource::FactoredArrow {
+                    cache: &cache,
+                    fallback_hvp: None,
+                },
+                0.0,
+                0.0,
+                2.0,
+                1.0,
+            )
+            .is_nan()
+        );
+    }
+
+    #[test]
+    fn laplace_evidence_uses_hvp_fallback_without_schur_factor() {
+        let mut cache = make_minimal_cache();
+        cache.schur_factor = None;
+        let hvp = |x: &[f64]| -> Vec<f64> { vec![2.0 * x[0], 1.875 * x[1]] };
+        let v = laplace_evidence(
+            EvidenceLogDetSource::FactoredArrow {
+                cache: &cache,
+                fallback_hvp: Some(EvidenceHvpLogDet {
+                    dim: 2,
+                    apply: &hvp,
+                }),
+            },
+            0.0,
+            0.0,
+            2.0,
+            1.0,
+        );
+        let expected = 0.5 * (2.0_f64.ln() + 1.875_f64.ln())
+            - 0.5 * (2.0 * std::f64::consts::PI).ln();
+        assert!((v - expected).abs() < 1e-12);
     }
 
     #[test]
@@ -773,18 +1126,24 @@ mod tests {
             TopologyCandidate {
                 kind: TopologyKind::Flat,
                 negative_log_evidence: 10.0,
+                effective_dim: 4.0,
+                n_obs: 100,
                 converged: true,
                 exclusion_reason: None,
             },
             TopologyCandidate {
                 kind: TopologyKind::Sphere,
                 negative_log_evidence: 8.0,
+                effective_dim: 5.0,
+                n_obs: 100,
                 converged: true,
                 exclusion_reason: None,
             },
             TopologyCandidate {
                 kind: TopologyKind::Torus,
                 negative_log_evidence: f64::NAN,
+                effective_dim: 6.0,
+                n_obs: 100,
                 converged: false,
                 exclusion_reason: Some("torus periods missing".to_string()),
             },
@@ -800,12 +1159,16 @@ mod tests {
             TopologyCandidate {
                 kind: TopologyKind::Sphere,
                 negative_log_evidence: 5.0,
+                effective_dim: 5.0,
+                n_obs: 100,
                 converged: true,
                 exclusion_reason: None,
             },
             TopologyCandidate {
                 kind: TopologyKind::Flat,
                 negative_log_evidence: 5.0 + 1e-6,
+                effective_dim: 4.0,
+                n_obs: 100,
                 converged: true,
                 exclusion_reason: None,
             },

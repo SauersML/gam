@@ -70,8 +70,9 @@ use gam::terms::sae_manifold::{
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::terms::{
-    ARDPenalty, AnalyticPenaltyRegistry, IBPAssignmentPenalty, IsometryPenalty,
+    ARDPenalty, AnalyticPenaltyRegistry, DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty,
     OrthogonalityPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty, SparsityPenalty,
+    TotalVariationPenalty,
 };
 use gam::terms::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
@@ -10172,6 +10173,97 @@ fn descriptor_usize(
     Ok(value)
 }
 
+fn descriptor_weight_value(
+    descriptor: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<(), String> {
+    let Some(value) = descriptor.get("weight") else {
+        return Ok(());
+    };
+    if value.as_str() == Some("auto") {
+        return Ok(());
+    }
+    let Some(weight) = value.as_f64() else {
+        return Err(format!(
+            "{context}.weight must be 'auto' or a finite positive float"
+        ));
+    };
+    if !(weight.is_finite() && weight > 0.0) {
+        return Err(format!("{context}.weight must be finite and > 0"));
+    }
+    Ok(())
+}
+
+fn descriptor_weight_sequence(
+    descriptor: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<(), String> {
+    let Some(value) = descriptor.get("weight") else {
+        return Ok(());
+    };
+    if value.as_str() == Some("auto") {
+        return Ok(());
+    }
+    let values = value
+        .as_array()
+        .ok_or_else(|| format!("{context}.weight must be 'auto' or a list of positive floats"))?;
+    if values.is_empty() {
+        return Err(format!("{context}.weight must have at least one entry"));
+    }
+    for (idx, raw) in values.iter().enumerate() {
+        let Some(weight) = raw.as_f64() else {
+            return Err(format!("{context}.weight[{idx}] must be a finite positive float"));
+        };
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!("{context}.weight[{idx}] must be finite and > 0"));
+        }
+    }
+    Ok(())
+}
+
+fn descriptor_difference_op(
+    descriptor: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<DifferenceOpKind, String> {
+    let op = descriptor
+        .get("difference_op")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("forward_1d")
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    match op.as_str() {
+        "forward_1d" => Ok(DifferenceOpKind::ForwardDiff1D),
+        "graph_edges" => {
+            let raw_edges = descriptor
+                .get("edges")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| format!("{context}.edges is required for graph_edges"))?;
+            let mut edges = Vec::with_capacity(raw_edges.len());
+            for (edge_idx, raw_edge) in raw_edges.iter().enumerate() {
+                let pair = raw_edge
+                    .as_array()
+                    .ok_or_else(|| format!("{context}.edges[{edge_idx}] must be a two-item list"))?;
+                if pair.len() != 2 {
+                    return Err(format!(
+                        "{context}.edges[{edge_idx}] must contain exactly two row indices"
+                    ));
+                }
+                let from = pair[0].as_u64().ok_or_else(|| {
+                    format!("{context}.edges[{edge_idx}][0] must be a non-negative integer")
+                })? as usize;
+                let to = pair[1].as_u64().ok_or_else(|| {
+                    format!("{context}.edges[{edge_idx}][1] must be a non-negative integer")
+                })? as usize;
+                edges.push((from, to));
+            }
+            Ok(DifferenceOpKind::GraphEdges(edges))
+        }
+        other => Err(format!(
+            "{context}.difference_op must be forward_1d or graph_edges; got {other:?}"
+        )),
+    }
+}
+
 fn build_analytic_penalty_registry_from_json(
     latents: Option<&serde_json::Value>,
     penalties: Option<&serde_json::Value>,
@@ -10202,11 +10294,13 @@ fn build_analytic_penalty_registry_from_json(
             .replace('-', "_");
         match kind.as_str() {
             "isometry" => {
+                descriptor_weight_value(descriptor, &context)?;
                 registry.push(gam::terms::AnalyticPenaltyKind::Isometry(std::sync::Arc::new(
                     IsometryPenalty::new_euclidean(slice, target.d),
                 )));
             }
             "ard" => {
+                descriptor_weight_sequence(descriptor, &context)?;
                 registry.push(gam::terms::AnalyticPenaltyKind::Ard(std::sync::Arc::new(
                     ARDPenalty::new(slice, target.d),
                 )));
@@ -10226,6 +10320,7 @@ fn build_analytic_penalty_registry_from_json(
                 ));
             }
             "sparsity" => {
+                descriptor_weight_value(descriptor, &context)?;
                 let sparsity_kind = descriptor
                     .get("sparsity_kind")
                     .and_then(serde_json::Value::as_str)
@@ -10275,8 +10370,25 @@ fn build_analytic_penalty_registry_from_json(
                 ));
             }
             "total_variation" => {
-                return Err(format!(
-                    "{context}: TotalVariationPenalty descriptors are accepted by Python, but this build's AnalyticPenaltyKind registry does not expose a total-variation variant"
+                let weight = descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
+                let difference_op = descriptor_difference_op(descriptor, &context)?;
+                let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                registry.push(gam::terms::AnalyticPenaltyKind::TotalVariation(
+                    std::sync::Arc::new(
+                        TotalVariationPenalty::new(
+                            weight,
+                            n_eff,
+                            difference_op,
+                            smoothing_eps,
+                            learnable,
+                        )
+                        .map_err(|err| format!("{context}: {err}"))?,
+                    ),
                 ));
             }
             other => return Err(format!("{context}.kind has unsupported analytic penalty {other:?}")),
