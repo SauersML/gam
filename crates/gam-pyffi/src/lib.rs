@@ -65,7 +65,8 @@ use gam::terms::latent_coord::{
     AuxPriorFamily, InputLocationDerivative, LatentCoordValues, LatentIdMode, aux_prior_targets,
 };
 use gam::terms::sae_manifold::{
-    AssignmentMode, SaeAtomBasisKind, SaeManifoldRho, term_from_padded_blocks_with_mode,
+    AssignmentMode, GumbelTemperatureSchedule, SaeAtomBasisKind, SaeManifoldRho, ScheduleKind,
+    term_from_padded_blocks_with_mode,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::terms::smooth::BlockwisePenalty;
@@ -4846,6 +4847,53 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
     }
 }
 
+fn gumbel_temperature_schedule_from_pydict(
+    schedule: Option<&Bound<'_, PyDict>>,
+) -> Result<Option<GumbelTemperatureSchedule>, String> {
+    fn get<'py>(state: &'py Bound<'py, PyDict>, key: &str) -> Result<Bound<'py, PyAny>, String> {
+        state
+            .get_item(key)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| format!("gumbel_schedule is missing key {key:?}"))
+    }
+
+    let Some(schedule) = schedule else {
+        return Ok(None);
+    };
+    let kind = get(schedule, "kind")?
+        .extract::<String>()
+        .map_err(|err| err.to_string())?
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    let tau_start = get(schedule, "tau_start")?
+        .extract::<f64>()
+        .map_err(|err| err.to_string())?;
+    let tau_min = get(schedule, "tau_min")?
+        .extract::<f64>()
+        .map_err(|err| err.to_string())?;
+    let decay = match kind.as_str() {
+        "geometric" => {
+            let rate = get(schedule, "rate")?
+                .extract::<f64>()
+                .map_err(|err| err.to_string())?;
+            ScheduleKind::Geometric { rate }
+        }
+        "linear" => {
+            let steps = get(schedule, "steps")?
+                .extract::<usize>()
+                .map_err(|err| err.to_string())?;
+            ScheduleKind::Linear { steps }
+        }
+        "reciprocal_iter" | "reciprocal" => ScheduleKind::ReciprocalIter,
+        other => {
+            return Err(format!(
+                "gumbel_schedule kind must be 'geometric', 'linear', or 'reciprocal_iter'; got {other:?}"
+            ));
+        }
+    };
+    GumbelTemperatureSchedule::new(tau_start, tau_min, decay).map(Some)
+}
+
 #[pyfunction(signature = (
     z,
     atom_basis,
@@ -4866,6 +4914,7 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
     learning_rate = 1.0,
     ridge_ext_coord = 1.0e-6,
     ridge_beta = 1.0e-6,
+    gumbel_schedule = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn sae_manifold_fit_ibp<'py>(
@@ -4889,6 +4938,7 @@ fn sae_manifold_fit_ibp<'py>(
     learning_rate: f64,
     ridge_ext_coord: f64,
     ridge_beta: f64,
+    gumbel_schedule: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
     let z_view = z.as_array();
     let (n_obs, p_out) = z_view.dim();
@@ -5022,6 +5072,12 @@ fn sae_manifold_fit_ibp<'py>(
         mode,
     )
     .map_err(py_value_error)?;
+    if let Some(schedule) =
+        gumbel_temperature_schedule_from_pydict(gumbel_schedule).map_err(py_value_error)?
+    {
+        term.set_temperature_schedule(schedule)
+            .map_err(py_value_error)?;
+    }
 
     let log_ard = atom_dim
         .iter()
