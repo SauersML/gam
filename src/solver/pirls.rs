@@ -742,6 +742,19 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives);
                 Ok(())
             }
+            (GlmLikelihoodFamily::Tweedie { p }, _) => {
+                write_tweedie_log_working_state(
+                    y,
+                    eta,
+                    priorweights,
+                    p,
+                    mu,
+                    weights,
+                    z,
+                    derivatives,
+                );
+                Ok(())
+            }
             (GlmLikelihoodFamily::GammaLog, _) => {
                 write_gamma_log_working_state(
                     y,
@@ -8444,6 +8457,189 @@ fn write_gamma_log_working_state(
     }
 }
 
+#[inline]
+fn tweedie_p_is_poisson(p: f64) -> bool {
+    (p - 1.0).abs() <= 1e-12
+}
+
+#[inline]
+fn tweedie_p_is_gamma(p: f64) -> bool {
+    (p - 2.0).abs() <= 1e-12
+}
+
+#[inline]
+fn sanitize_tweedie_p(p: f64) -> f64 {
+    if p.is_finite() { p } else { 1.5 }
+}
+
+#[inline]
+fn estimate_tweedie_phi_from_eta(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<f64>,
+    p: f64,
+) -> f64 {
+    const MIN_MU: f64 = 1e-10;
+    const MIN_PHI: f64 = 1e-12;
+    if tweedie_p_is_poisson(p) {
+        return 1.0;
+    }
+    let (num, den) = (0..eta.len())
+        .into_par_iter()
+        .map(|i| {
+            let wi = priorweights[i].max(0.0);
+            if wi == 0.0 {
+                return (0.0_f64, 0.0_f64);
+            }
+            let mui = eta[i].clamp(-700.0, 700.0).exp().max(MIN_MU);
+            let resid = y[i] - mui;
+            (wi * resid * resid / mui.powf(p), wi)
+        })
+        .reduce(
+            || (0.0_f64, 0.0_f64),
+            |(num_a, den_a), (num_b, den_b)| (num_a + num_b, den_a + den_b),
+        );
+    if den > 0.0 {
+        (num / den).max(MIN_PHI)
+    } else {
+        1.0
+    }
+}
+
+#[inline]
+fn estimate_tweedie_phi_from_mu(
+    y: ArrayView1<f64>,
+    mu: &Array1<f64>,
+    priorweights: ArrayView1<f64>,
+    p: f64,
+) -> f64 {
+    const MIN_MU: f64 = 1e-10;
+    const MIN_PHI: f64 = 1e-12;
+    if tweedie_p_is_poisson(p) {
+        return 1.0;
+    }
+    let (num, den) = (0..mu.len())
+        .into_par_iter()
+        .map(|i| {
+            let wi = priorweights[i].max(0.0);
+            if wi == 0.0 {
+                return (0.0_f64, 0.0_f64);
+            }
+            let mui = mu[i].max(MIN_MU);
+            let resid = y[i] - mui;
+            (wi * resid * resid / mui.powf(p), wi)
+        })
+        .reduce(
+            || (0.0_f64, 0.0_f64),
+            |(num_a, den_a), (num_b, den_b)| (num_a + num_b, den_a + den_b),
+        );
+    if den > 0.0 {
+        (num / den).max(MIN_PHI)
+    } else {
+        1.0
+    }
+}
+
+/// Working state for Tweedie with a log link.
+///
+/// With `mu = exp(eta)`, `V(mu) = phi * mu^p`, and `g'(mu) = 1 / mu`,
+/// the Fisher working weight is `mu^(2-p) / phi`, scaled by prior weight.
+#[inline]
+fn write_tweedie_log_working_state(
+    y: ArrayView1<f64>,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<f64>,
+    p: f64,
+    mu: &mut Array1<f64>,
+    weights: &mut Array1<f64>,
+    z: &mut Array1<f64>,
+    derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
+) {
+    const MIN_MU: f64 = 1e-10;
+    const MIN_WEIGHT: f64 = 1e-12;
+    let p = sanitize_tweedie_p(p);
+    if tweedie_p_is_poisson(p) {
+        write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives);
+        return;
+    }
+    let phi = estimate_tweedie_phi_from_eta(y, eta, priorweights, p);
+    let exponent = 2.0 - p;
+    if let Some(derivs) = derivatives {
+        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+        let z_s = z.as_slice_mut().expect("z must be contiguous");
+        let dmu_s = derivs
+            .dmu_deta
+            .as_slice_mut()
+            .expect("dmu_deta must be contiguous");
+        let d2_s = derivs
+            .d2mu_deta2
+            .as_slice_mut()
+            .expect("d2mu_deta2 must be contiguous");
+        let d3_s = derivs
+            .d3mu_deta3
+            .as_slice_mut()
+            .expect("d3mu_deta3 must be contiguous");
+        let c_s = derivs.c.as_slice_mut().expect("c must be contiguous");
+        let d_s = derivs.d.as_slice_mut().expect("d must be contiguous");
+        mu_s.par_iter_mut()
+            .zip(weights_s.par_iter_mut())
+            .zip(z_s.par_iter_mut())
+            .zip(dmu_s.par_iter_mut())
+            .zip(d2_s.par_iter_mut())
+            .zip(d3_s.par_iter_mut())
+            .zip(c_s.par_iter_mut())
+            .zip(d_s.par_iter_mut())
+            .enumerate()
+            .for_each(
+                |(i, (((((((mu_o, w_o), z_o), dmu_o), d2_o), d3_o), c_o), d_o))| {
+                    let eta_raw = eta[i];
+                    let eta_i = eta_raw.clamp(-700.0, 700.0);
+                    let mu_i = eta_i.exp().max(MIN_MU);
+                    *mu_o = mu_i;
+                    let raw_weight = priorweights[i].max(0.0) * mu_i.powf(exponent) / phi;
+                    let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
+                    *w_o = if raw_weight > 0.0 {
+                        raw_weight.max(MIN_WEIGHT)
+                    } else {
+                        0.0
+                    };
+                    *z_o = eta_i + (y[i] - mu_i) / mu_i;
+                    *dmu_o = mu_i;
+                    *d2_o = mu_i;
+                    *d3_o = mu_i;
+                    if floor_active || eta_raw != eta_i {
+                        *c_o = 0.0;
+                        *d_o = 0.0;
+                    } else {
+                        *c_o = exponent * raw_weight;
+                        *d_o = exponent * exponent * raw_weight;
+                    }
+                },
+            );
+    } else {
+        let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
+        let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
+        let z_s = z.as_slice_mut().expect("z must be contiguous");
+        mu_s.par_iter_mut()
+            .zip(weights_s.par_iter_mut())
+            .zip(z_s.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, ((mu_o, w_o), z_o))| {
+                let eta_i = eta[i].clamp(-700.0, 700.0);
+                let mu_i = eta_i.exp().max(MIN_MU);
+                *mu_o = mu_i;
+                let raw_weight = priorweights[i].max(0.0) * mu_i.powf(exponent) / phi;
+                *w_o = if raw_weight > 0.0 {
+                    raw_weight.max(MIN_WEIGHT)
+                } else {
+                    0.0
+                };
+                *z_o = eta_i + (y[i] - mu_i) / mu_i;
+            });
+    }
+}
+
 /// Zero-allocation update of GLM working vectors using pre-allocated buffers.
 #[inline]
 pub fn update_glmvectors(
@@ -8742,6 +8938,7 @@ fn integrated_inverse_link_from_family(
         }
         GlmLikelihoodFamily::GaussianIdentity
         | GlmLikelihoodFamily::PoissonLog
+        | GlmLikelihoodFamily::Tweedie { .. }
         | GlmLikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(format!(
             "Integrated link-runtime update is not supported for family {:?}",
             family
@@ -9095,6 +9292,49 @@ fn computeworkingweight_derivatives_from_eta(
                     },
                 )?;
         }
+        GlmLikelihoodFamily::Tweedie { p } => {
+            const MIN_WEIGHT: f64 = 1e-12;
+            let p = sanitize_tweedie_p(p);
+            let exponent = 2.0 - p;
+            let phi = fixed_glm_dispersion(likelihood);
+            let c_s = c.as_slice_mut().expect("c must be contiguous");
+            let d_s = d.as_slice_mut().expect("d must be contiguous");
+            let dmu_s = dmu_deta
+                .as_slice_mut()
+                .expect("dmu_deta must be contiguous");
+            let d2_s = d2mu_deta2
+                .as_slice_mut()
+                .expect("d2mu_deta2 must be contiguous");
+            let d3_s = d3mu_deta3
+                .as_slice_mut()
+                .expect("d3mu_deta3 must be contiguous");
+            c_s.par_iter_mut()
+                .zip(d_s.par_iter_mut())
+                .zip(dmu_s.par_iter_mut())
+                .zip(d2_s.par_iter_mut())
+                .zip(d3_s.par_iter_mut())
+                .enumerate()
+                .try_for_each(
+                    |(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| -> Result<(), EstimationError> {
+                        let eta_used = eta[i].clamp(-700.0, 700.0);
+                        let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
+                        let raw_weight =
+                            priorweights[i].max(0.0) * jet.mu.powf(exponent) / phi;
+                        let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
+                        if eta[i] != eta_used || floor_active {
+                            *c_o = 0.0;
+                            *d_o = 0.0;
+                        } else {
+                            *c_o = exponent * raw_weight;
+                            *d_o = exponent * exponent * raw_weight;
+                        }
+                        *dmu_o = jet.d1;
+                        *d2_o = jet.d2;
+                        *d3_o = jet.d3;
+                        Ok(())
+                    },
+                )?;
+        }
         GlmLikelihoodFamily::GammaLog => {
             let dmu_s = dmu_deta
                 .as_slice_mut()
@@ -9284,6 +9524,19 @@ impl VarianceJet {
         }
     }
 
+    /// Tweedie variance V(μ) = μ^p.
+    #[inline]
+    pub fn tweedie(mu: f64, p: f64) -> Self {
+        let mu = mu.max(1e-10);
+        Self {
+            v: mu.powf(p),
+            v1: p * mu.powf(p - 1.0),
+            v2: p * (p - 1.0) * mu.powf(p - 2.0),
+            v3: p * (p - 1.0) * (p - 2.0) * mu.powf(p - 3.0),
+            v4: p * (p - 1.0) * (p - 2.0) * (p - 3.0) * mu.powf(p - 4.0),
+        }
+    }
+
     /// Gaussian (identity) variance V(μ) = 1.
     #[inline]
     pub fn gaussian() -> Self {
@@ -9381,6 +9634,7 @@ pub fn weight_family_for_glm_likelihood(likelihood: GlmLikelihoodSpec) -> Weight
     match likelihood.family {
         GlmLikelihoodFamily::GaussianIdentity => WeightFamily::Gaussian,
         GlmLikelihoodFamily::PoissonLog => WeightFamily::Poisson,
+        GlmLikelihoodFamily::Tweedie { p } => WeightFamily::Tweedie { p },
         GlmLikelihoodFamily::GammaLog => WeightFamily::Gamma,
         GlmLikelihoodFamily::BinomialLogit
         | GlmLikelihoodFamily::BinomialProbit
@@ -9879,11 +10133,12 @@ fn observed_weight_binomial_logit_from_jet(
 /// This is a simplified family tag that identifies the variance function,
 /// independent of the link function. It is used by [`observed_weight_dispatch`]
 /// to select closed-form weight specializations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum WeightFamily {
     Gaussian,
     Binomial,
     Poisson,
+    Tweedie { p: f64 },
     Gamma,
 }
 
@@ -9907,6 +10162,7 @@ pub fn variance_jet_for_weight_family(family: WeightFamily, mu: f64) -> Variance
         WeightFamily::Gaussian => VarianceJet::gaussian(),
         WeightFamily::Binomial => VarianceJet::binomial_n(mu),
         WeightFamily::Poisson => VarianceJet::poisson(mu),
+        WeightFamily::Tweedie { p } => VarianceJet::tweedie(mu, p),
         WeightFamily::Gamma => VarianceJet::gamma(mu),
     }
 }
