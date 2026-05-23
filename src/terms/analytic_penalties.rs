@@ -61,7 +61,7 @@ use std::sync::Arc;
 
 use crate::terms::basis::{
     BasisError, DuchonNullspaceOrder, duchon_radial_first_derivative_nd,
-    duchon_radial_second_derivative_nd,
+    duchon_radial_second_derivative_nd, duchon_radial_third_derivative_nd,
 };
 use crate::terms::latent_coord::LatentCoordValues;
 use crate::terms::penalty_op::PenaltyOp;
@@ -425,14 +425,12 @@ pub struct IsometryPenalty {
     /// Optional cached per-row Jacobian *third derivative*
     /// `K_n ∈ ℝ^{p × d × d × d}`, stored as an `Array3` with shape
     /// `(n_obs, p, d * d * d)` where the third axis packs `(a, c, d)` in
-    /// row-major order `((a * d) + c) * d + dd`. When present, `hvp` uses the full
+    /// row-major order `((a * d) + c) * d + dd`. `hvp` uses the full
     /// residual-curvature Hessian (proposal §4(b)):
     ///   B_{ab,cd} = K_{a,cd}^T W J_b + H_{a,c}^T W H_{b,d}
     ///             + H_{a,d}^T W H_{b,c} + J_a^T W K_{b,cd}.
-    /// When absent, `hvp` falls back to the Gauss-Newton surrogate
-    /// `μ A^T A v` (which drops the residual third-derivative term). See
-    /// the `hvp` documentation: the GN surrogate is an approximation and
-    /// is not claimed to be exact.
+    /// Either this cache or `duchon_radial_source` must be present for
+    /// analytic `hvp` calls.
     pub cache_third_decoder_derivative: Option<Arc<ndarray::Array3<f64>>>,
     /// Output dimensionality `p` (column count of each per-row Jacobian).
     pub p_out: usize,
@@ -461,10 +459,9 @@ impl IsometryPenalty {
 
     /// Attach a cached third decoder derivative
     /// `K_n[i, a, c, d] = ∂²J_n[i, a] / ∂t_{n, c} ∂t_{n, d}`, flattened
-    /// row-major as `(n_obs, p * d * d * d)`. When present, the Hessian-
-    /// vector product uses the full residual-curvature term in addition
-    /// to the Gauss-Newton piece; when absent, the GN surrogate is used
-    /// and explicitly documented as an approximation.
+    /// row-major as `(n_obs, p * d * d * d)`. The Hessian-vector product
+    /// uses the full residual-curvature term in addition to the metric
+    /// Gauss-Newton piece.
     pub fn with_third_decoder_derivative(mut self, k: Arc<ndarray::Array3<f64>>) -> Self {
         self.cache_third_decoder_derivative = Some(k);
         self
@@ -579,6 +576,38 @@ impl IsometryPenalty {
         }
     }
 
+    fn weighted_dot_decoder_vectors<F, G>(&self, n: usize, p: usize, x: F, y: G) -> f64
+    where
+        F: Fn(usize) -> f64,
+        G: Fn(usize) -> f64,
+    {
+        match &self.weight {
+            WeightField::Identity => {
+                let mut s = 0.0;
+                for i in 0..p {
+                    s += x(i) * y(i);
+                }
+                s
+            }
+            WeightField::Factored { u, rank, p_out } => {
+                debug_assert_eq!(p, *p_out);
+                let r = *rank;
+                let mut s = 0.0;
+                for k in 0..r {
+                    let mut ux = 0.0;
+                    let mut uy = 0.0;
+                    for i in 0..p {
+                        let uik = u[[n, i * r + k]];
+                        ux += uik * x(i);
+                        uy += uik * y(i);
+                    }
+                    s += ux * uy;
+                }
+                s
+            }
+        }
+    }
+
     fn target_matrix(target: ArrayView1<'_, f64>, n_obs: usize, d: usize) -> Array2<f64> {
         let mut out = Array2::<f64>::zeros((n_obs, d));
         for n in 0..n_obs {
@@ -649,6 +678,80 @@ impl IsometryPenalty {
         Ok(out)
     }
 
+    fn duchon_radial_jacobian_third(
+        &self,
+        target: ArrayView1<'_, f64>,
+        n_obs: usize,
+        d: usize,
+        source: &IsometryDuchonRadialSource,
+    ) -> Result<ndarray::Array3<f64>, BasisError> {
+        let t = Self::target_matrix(target, n_obs, d);
+        let phi_r = duchon_radial_first_derivative_nd(
+            t.view(),
+            source.centers.view(),
+            source.length_scale,
+            source.nullspace_order,
+        )?;
+        let phi_rr = duchon_radial_second_derivative_nd(
+            t.view(),
+            source.centers.view(),
+            source.length_scale,
+            source.nullspace_order,
+        )?;
+        let phi_rrr = duchon_radial_third_derivative_nd(
+            t.view(),
+            source.centers.view(),
+            source.length_scale,
+            source.nullspace_order,
+        )?;
+        let n_centers = source.centers.nrows();
+        debug_assert_eq!(source.centers.ncols(), d);
+        debug_assert_eq!(source.radial_coefficients.nrows(), n_centers);
+        debug_assert_eq!(source.radial_coefficients.ncols(), self.p_out);
+
+        let mut out = ndarray::Array3::<f64>::zeros((n_obs, self.p_out, d * d * d));
+        for n in 0..n_obs {
+            for k in 0..n_centers {
+                let mut r2 = 0.0_f64;
+                for a in 0..d {
+                    let delta = t[[n, a]] - source.centers[[k, a]];
+                    r2 += delta * delta;
+                }
+                let r = r2.sqrt();
+                if r == 0.0 {
+                    continue;
+                }
+                let inv_r = 1.0 / r;
+                let q = phi_r[[n, k]] * inv_r;
+                let b_coef = (phi_rr[[n, k]] - q) * inv_r;
+                let a_coef = phi_rrr[[n, k]] - 3.0 * b_coef;
+                for a in 0..d {
+                    let u_a = (t[[n, a]] - source.centers[[k, a]]) * inv_r;
+                    for c in 0..d {
+                        let u_c = (t[[n, c]] - source.centers[[k, c]]) * inv_r;
+                        for dd in 0..d {
+                            let u_d = (t[[n, dd]] - source.centers[[k, dd]]) * inv_r;
+                            let eye_ac = if a == c { 1.0 } else { 0.0 };
+                            let eye_ad = if a == dd { 1.0 } else { 0.0 };
+                            let eye_cd = if c == dd { 1.0 } else { 0.0 };
+                            let basis_third = a_coef * u_a * u_c * u_d
+                                + b_coef * (eye_ac * u_d + eye_ad * u_c + eye_cd * u_a);
+                            if basis_third == 0.0 {
+                                continue;
+                            }
+                            let idx = ((a * d) + c) * d + dd;
+                            for i in 0..self.p_out {
+                                out[[n, i, idx]] +=
+                                    source.radial_coefficients[[k, i]] * basis_third;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn jacobian_second(
         &self,
         target: ArrayView1<'_, f64>,
@@ -664,6 +767,23 @@ impl IsometryPenalty {
         );
         self.duchon_radial_jacobian_second(target, n_obs, d, source)
             .expect("failed to materialize Duchon radial second derivative for isometry")
+    }
+
+    fn jacobian_third(
+        &self,
+        target: ArrayView1<'_, f64>,
+        n_obs: usize,
+        d: usize,
+    ) -> ndarray::Array3<f64> {
+        if let Some(jac3) = self.cache_third_decoder_derivative.as_ref() {
+            return jac3.as_ref().clone();
+        }
+        let source = self.duchon_radial_source.as_ref().expect(
+            "analytic isometry HVP requires cache_third_decoder_derivative \
+             or duchon_radial_source",
+        );
+        self.duchon_radial_jacobian_third(target, n_obs, d, source)
+            .expect("failed to materialize Duchon radial third derivative for isometry")
     }
 
     /// Per-row pullback metric `g_n = J_n^T W_n J_n = M_n^T M_n` with
@@ -802,7 +922,9 @@ impl AnalyticPenalty for IsometryPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        // Isometry Hessian-vector product.
+        // Fully analytic isometry Hessian-vector product wired through
+        // duchon_radial_third_derivative_nd when no third-derivative cache is
+        // supplied.
         //
         // The full Hessian of P_iso = (μ/2) Σ_n ||J^T W J - G_ref||²_F
         // (per proposal §4(b)) is
@@ -813,20 +935,6 @@ impl AnalyticPenalty for IsometryPenalty {
         //   B_{ab,cd} = K_{a,cd}^T W J_b + H_{a,c}^T W H_{b,d}
         //             + H_{a,d}^T W H_{b,c} + J_a^T W K_{b,cd},
         // where K is the third decoder derivative and H is the second.
-        //
-        // When `cache_third_decoder_derivative` is present we use the
-        // full Hessian. When absent — the current default for callers
-        // that have not pre-built a `K` jet — we FALL BACK to the
-        // GAUSS-NEWTON surrogate `Hv = μ A^T A v` with `A_c = ∂vec(g)/∂t_c`,
-        // which drops the residual-curvature term entirely.
-        //
-        // THE GAUSS-NEWTON FORM IS AN APPROXIMATION, NOT THE EXACT HESSIAN.
-        // It is symmetric PSD by construction (good for the canonical
-        // PIRLS / log-det pipeline) and matches the true Hessian whenever
-        // the residual g − g^ref is small (near a feasible isometric
-        // embedding), but at large residuals the GN HVP undercounts
-        // curvature in a direction-dependent way. Provide
-        // `cache_third_decoder_derivative` to switch to the exact form.
         let mu = rho[self.rho_index].exp();
         let d = self
             .target
@@ -835,7 +943,7 @@ impl AnalyticPenalty for IsometryPenalty {
         let n_obs = target.len() / d;
         let p = self.p_out;
         let jac2 = self.jacobian_second(target, n_obs, d);
-        let k_cache = self.cache_third_decoder_derivative.as_ref();
+        let jac3 = self.jacobian_third(target, n_obs, d);
         let g = self.pullback_metric(d);
         let g_ref = self.reference_metric(n_obs, d);
         let mut out = Array1::<f64>::zeros(v.len());
@@ -874,50 +982,55 @@ impl AnalyticPenalty for IsometryPenalty {
                 out[n * d + c] = mu * acc;
             }
 
-            // Residual-curvature contribution. Only available when the
-            // third decoder derivative `K` is provided. Otherwise the
-            // GN surrogate above is used and the doc comment makes the
-            // approximation explicit.
-            if let Some(k) = k_cache {
-                // K shape: (n_obs, p, d*d*d) flattened so the third axis
-                // index is ((i*d + a)*d + c)*d + dd. Iterate every term.
-                for c in 0..d {
-                    let mut acc_res = 0.0;
-                    for a in 0..d {
-                        for b in 0..d {
-                            let diff = g[[n, a * d + b]] - g_ref[[n, a * d + b]];
-                            if diff == 0.0 {
+            // Residual-curvature contribution:
+            // μ Σ_ab (g_ab - g_ref_ab) Σ_dd B_ab,c,dd v_dd.
+            // K shape: (n_obs, p, d*d*d), third index ((a*d)+c)*d+dd.
+            for c in 0..d {
+                let mut acc_res = 0.0;
+                for a in 0..d {
+                    for b in 0..d {
+                        let diff = g[[n, a * d + b]] - g_ref[[n, a * d + b]];
+                        if diff == 0.0 {
+                            continue;
+                        }
+                        let mut bv = 0.0;
+                        for dd in 0..d {
+                            let vd = v[n * d + dd];
+                            if vd == 0.0 {
                                 continue;
                             }
-                            // B_{ab,cd} v_d summed over d.
-                            let mut bv = 0.0;
-                            for dd in 0..d {
-                                let vd = v[n * d + dd];
-                                if vd == 0.0 {
-                                    continue;
-                                }
-                                let mut term = 0.0;
-                                for i in 0..p {
-                                    // K_{a,cd}^T W J_b
-                                    term += k[[n, i, ((a * d) + c) * d + dd]]
-                                        * wj[[i, b]];
-                                    // H_{a,c}^T W H_{b,d}
-                                    term += jac2[[n, (i * d + a) * d + c]]
-                                        * jac2[[n, (i * d + b) * d + dd]];
-                                    // H_{a,d}^T W H_{b,c}
-                                    term += jac2[[n, (i * d + a) * d + dd]]
-                                        * jac2[[n, (i * d + b) * d + c]];
-                                    // J_a^T W K_{b,cd}
-                                    term += wj[[i, a]]
-                                        * k[[n, i, ((b * d) + c) * d + dd]];
-                                }
-                                bv += term * vd;
+                            let mut k_a_cd_w_j_b = 0.0;
+                            for i in 0..p {
+                                k_a_cd_w_j_b +=
+                                    jac3[[n, i, ((a * d) + c) * d + dd]] * wj[[i, b]];
                             }
-                            acc_res += diff * bv;
+                            let h_a_c_w_h_b_d = self.weighted_dot_decoder_vectors(
+                                n,
+                                p,
+                                |i| jac2[[n, (i * d + a) * d + c]],
+                                |i| jac2[[n, (i * d + b) * d + dd]],
+                            );
+                            let h_a_d_w_h_b_c = self.weighted_dot_decoder_vectors(
+                                n,
+                                p,
+                                |i| jac2[[n, (i * d + a) * d + dd]],
+                                |i| jac2[[n, (i * d + b) * d + c]],
+                            );
+                            let mut j_a_w_k_b_cd = 0.0;
+                            for i in 0..p {
+                                j_a_w_k_b_cd +=
+                                    wj[[i, a]] * jac3[[n, i, ((b * d) + c) * d + dd]];
+                            }
+                            bv += (k_a_cd_w_j_b
+                                + h_a_c_w_h_b_d
+                                + h_a_d_w_h_b_c
+                                + j_a_w_k_b_cd)
+                                * vd;
                         }
+                        acc_res += diff * bv;
                     }
-                    out[n * d + c] += mu * acc_res;
                 }
+                out[n * d + c] += mu * acc_res;
             }
         }
         out
@@ -2014,12 +2127,11 @@ impl AnalyticPenaltyRegistry {
 // PenaltyOp integration
 // ---------------------------------------------------------------------------
 //
-// The canonical PIRLS / REML pipeline consumes square symmetric PSD operators
+// The canonical PIRLS / REML pipeline consumes square symmetric operators
 // through the `PenaltyOp` trait (see `terms::penalty_op`). The non-quadratic
 // analytic penalties here are *not* linear in their target, but the inner
-// Newton step only sees their **Hessian at the current iterate** — a square
-// symmetric PSD object once we choose the Gauss-Newton or diagonal surrogate
-// each penalty provides. We therefore expose each penalty as a `PenaltyOp` by
+// Newton step only sees their **Hessian at the current iterate**. We therefore
+// expose each penalty as a `PenaltyOp` by
 // freezing `(target, rho)` and routing `matvec` to `hvp`. The solver re-builds
 // the frozen op once per outer iteration (after PIRLS converges on `β`), in
 // exactly the same place the existing closed-form operator is rebuilt when
@@ -2027,12 +2139,9 @@ impl AnalyticPenaltyRegistry {
 
 /// `PenaltyOp` view of an [`AnalyticPenalty`] frozen at `(target, rho)`.
 ///
-/// The Hessian at the frozen point is symmetric PSD for every penalty we
-/// ship (smoothed-L¹ and Log have positive diagonals by construction; ARD
-/// is a positive diagonal; Isometry's Gauss-Newton form is `2μ J^T J` which
-/// is PSD). `as_dense()` materializes via `n` matvecs against the standard
-/// basis — `O(n²)` and intended only for spectral diagnostics; the hot path
-/// uses `matvec` and `diag` directly.
+/// `as_dense()` materializes the frozen local Hessian via `n` matvecs against
+/// the standard basis — `O(n²)` and intended only for spectral diagnostics;
+/// the hot path uses `matvec` and `diag` directly.
 pub struct FrozenAnalyticPenaltyOp {
     penalty: AnalyticPenaltyKind,
     target: Array1<f64>,
