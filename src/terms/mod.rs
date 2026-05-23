@@ -12,3 +12,10 @@ pub mod penalty_op;
 pub mod sae_manifold;
 pub mod smooth;
 pub mod term_builder;
+
+pub use analytic_penalties::{
+    ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyOp,
+    AnalyticPenaltyRegistry, FrozenAnalyticPenaltyOp, IBPAssignmentPenalty, IsometryPenalty,
+    IsometryReference, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty, SparsityKind,
+    SparsityPenalty, WeightField,
+};
