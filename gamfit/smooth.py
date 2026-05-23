@@ -107,6 +107,12 @@ class Duchon(Smooth):
         value enables the hybrid spectrum
         ``‖w‖^(2p) · (κ² + ‖w‖²)^s`` with ``κ = 1/length_scale``,
         which is closer to a Matérn for finite kernels at high d.
+        Honored on both the formula API and the primitive numpy API
+        (``gamfit.duchon_basis`` / ``gamfit.duchon_function_norm_penalty``);
+        the hybrid kernel keeps the polynomial nullspace order **linear in
+        d**, letting the same smooth scale cleanly to d=8, 16, 32, 64
+        without ratcheting the nullspace to absorb the Wendland CPD
+        constraint ``2s < d``.
     periodic_per_axis : optional sequence of bool of length d. Each
         axis can be periodic independently (cylinder = d=2 with
         ``(True, False)``, torus = d=2 with ``(True, True)``). The d=1
