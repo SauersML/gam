@@ -185,7 +185,7 @@ t = LatentCoord(
     # OR
     orthogonality=0.1,          # (b)
     # OR
-    dim_selection="reml",       # (c)   ⇒ marginal-likelihood prunes d
+    dim_selection=True,         # (c)   ⇒ marginal-likelihood prunes d
 )
 
 model = gamfit.GAM(
@@ -258,13 +258,13 @@ for ψ; the new builder is `try_build_latent_coord_hyper_dirs`).
 2. A new term-spec attribute `latent: Option<LatentCoordRef>` on the
    smooth-term builder so a term consumes `t` instead of an observed col.
 3. Outer-fit dispatch to build `hyper_dirs` for any registered
-   `LatentCoord`s, identical pattern to ψ.
-4. `dim_selection="reml"` path: when set, expand `d` by one and let
+   `LatentCoord`s, identical pattern to kernel-shape `ψ`.
+4. `dim_selection=True` path: when set, expand `d` by one and let
    REML decide; needs an outer loop over `d` analogous to the existing
    smoothing-grid search.
 
 Crucially: **no new optimizer**, **no new IFT code**, **no new
-matrix-free CG**. The ψ machinery covers it.
+matrix-free CG**. The existing ext-coordinate machinery covers it.
 
 ## 5. Test plan
 
@@ -284,7 +284,7 @@ config:
 Expected:
 - CV R² ≥ 0.60 (matches auto_74 stacked).
 - Procrustes disparity across seeds ≤ 0.2 (auto_71 was 0.99 unfixed).
-- REML-selected `d` ∈ {3, 4} when `dim_selection="reml"` is enabled.
+- REML-selected `d` ∈ {3, 4} when `dim_selection=True` is enabled.
 
 Empirical baseline observed in the prototype (`auto_75.py`, K_PC=16):
 - observed-only (hue + sv) CV R² = 0.41 (the K_PC=16 ceiling, vs 0.32 at K_PC=64).

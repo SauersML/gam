@@ -380,15 +380,21 @@ impl WeightField {
 /// Analytic gradient w.r.t. `t_n`:
 ///
 /// ```text
-///   ∂P/∂t_n = 2 μ Σ_{i,j} (g_n − g^ref_n)_{ij} · (∂J_n/∂t_n)_{[i,:]}^T J_n_{[:,j]}
-///           + symmetric term swapping i,j.
+///   ∂P/∂t_{n,c}
+///     = μ Σ_{a,b} (g_n − g^ref_n)_{ab}
+///         [ H_{n,:,a,c}^T W_n J_{n,:,b}
+///           + J_{n,:,a}^T W_n H_{n,:,b,c} ],
+///   H_{n,i,a,c} = ∂J_{n,i,a}/∂t_{n,c}.
 /// ```
 ///
 /// The per-row Jacobian `J_n` is exactly the radial-derivative jet
 /// `design_gradient_wrt_t` already computes for `LatentCoordValues`; the
-/// second derivative `∂J/∂t` is a one-line extension of the same radial
-/// chain rule (radial second derivative `φ''(r)` times outer product of unit
-/// directions). No autograd needed.
+/// second derivative `∂J/∂t` is rebuilt from
+/// [`crate::terms::basis::duchon_radial_second_derivative_nd`] using the
+/// radial Hessian identity. A finite-difference oracle for the docstring is
+/// to central-difference `value(t ± h e_j)` against `grad_target(t)[j]`;
+/// the analytic value follows the oracle until finite-difference
+/// cancellation dominates. No autograd needed.
 ///
 /// `μ = exp(ρ_iso)` is REML-selectable as one extra ρ axis.
 #[derive(Debug, Clone)]
@@ -889,6 +895,148 @@ pub struct SparsityPenalty {
     pub eps_rho_index: Option<usize>,
 }
 
+/// Entropy sparsity over row-wise softmax assignment logits.
+///
+/// This is the SAE-manifold soft-assignment penalty. The target is a flat
+/// row-major `(N, K)` logit matrix. Assignments are
+/// `a_i = softmax(logits_i / temperature)`, and the penalty is
+///
+/// ```text
+///   lambda_sparse * sum_i H(a_i)
+///   H(a_i) = -sum_k a_ik log a_ik
+/// ```
+///
+/// Minimizing entropy drives each row toward a small active support while the
+/// softmax keeps `a_ik >= 0` and `sum_k a_ik = 1`. The exact Hessian is dense
+/// and can be indefinite because entropy is concave in assignment space; the
+/// diagonal returned here is the positive Gauss-Newton damping used by the
+/// row-local arrow solve.
+#[derive(Debug, Clone)]
+pub struct SoftmaxAssignmentSparsityPenalty {
+    pub k_atoms: usize,
+    pub temperature: f64,
+}
+
+impl SoftmaxAssignmentSparsityPenalty {
+    pub fn new(k_atoms: usize, temperature: f64) -> Self {
+        debug_assert!(k_atoms > 0);
+        debug_assert!(temperature > 0.0);
+        Self {
+            k_atoms,
+            temperature,
+        }
+    }
+
+    fn softmax_row(&self, row: &[f64]) -> Vec<f64> {
+        let inv_tau = 1.0 / self.temperature;
+        let mut max_scaled = f64::NEG_INFINITY;
+        for &v in row {
+            max_scaled = max_scaled.max(v * inv_tau);
+        }
+        let mut out = vec![0.0; self.k_atoms];
+        let mut sum = 0.0;
+        for i in 0..self.k_atoms {
+            let v = (row[i] * inv_tau - max_scaled).exp();
+            out[i] = v;
+            sum += v;
+        }
+        if sum == 0.0 || !sum.is_finite() {
+            out.fill(1.0 / self.k_atoms as f64);
+        } else {
+            for v in out.iter_mut() {
+                *v /= sum;
+            }
+        }
+        out
+    }
+}
+
+impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Psi
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        let lambda = rho[0].exp();
+        let n = target.len() / self.k_atoms;
+        let slice = target.as_slice().expect("contiguous softmax target");
+        let mut acc = 0.0;
+        for row in 0..n {
+            let start = row * self.k_atoms;
+            let a = self.softmax_row(&slice[start..start + self.k_atoms]);
+            for v in a {
+                if v > 0.0 {
+                    acc += -v * v.ln();
+                }
+            }
+        }
+        lambda * acc
+    }
+
+    fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let lambda = rho[0].exp();
+        let n = target.len() / self.k_atoms;
+        let slice = target.as_slice().expect("contiguous softmax target");
+        let mut out = Array1::<f64>::zeros(target.len());
+        let inv_tau = 1.0 / self.temperature;
+        for row in 0..n {
+            let start = row * self.k_atoms;
+            let a = self.softmax_row(&slice[start..start + self.k_atoms]);
+            let mut d_h_da = vec![0.0; self.k_atoms];
+            let mut mean = 0.0;
+            for k in 0..self.k_atoms {
+                let ak = a[k].max(1e-300);
+                d_h_da[k] = -lambda * (ak.ln() + 1.0);
+                mean += a[k] * d_h_da[k];
+            }
+            for k in 0..self.k_atoms {
+                out[start + k] = a[k] * (d_h_da[k] - mean) * inv_tau;
+            }
+        }
+        out
+    }
+
+    fn hessian_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        let lambda = rho[0].exp();
+        let n = target.len() / self.k_atoms;
+        let slice = target.as_slice().expect("contiguous softmax target");
+        let mut out = Array1::<f64>::zeros(target.len());
+        let inv_tau2 = 1.0 / (self.temperature * self.temperature);
+        for row in 0..n {
+            let start = row * self.k_atoms;
+            let a = self.softmax_row(&slice[start..start + self.k_atoms]);
+            for k in 0..self.k_atoms {
+                out[start + k] = lambda * a[k] * (1.0 - a[k]) * inv_tau2;
+            }
+        }
+        Some(out)
+    }
+
+    fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        Array1::from_vec(vec![self.value(target, rho)])
+    }
+
+    fn rho_count(&self) -> usize {
+        1
+    }
+
+    fn name(&self) -> &str {
+        "softmax_assignment_sparsity"
+    }
+}
+
 impl SparsityPenalty {
     pub fn smoothed_l1(target_tier: PenaltyTier, eps: f64) -> Self {
         Self {
@@ -1271,6 +1419,7 @@ impl AnalyticPenaltyOp {
 pub enum AnalyticPenaltyKind {
     Isometry(Arc<IsometryPenalty>),
     Sparsity(Arc<SparsityPenalty>),
+    SoftmaxAssignmentSparsity(Arc<SoftmaxAssignmentSparsityPenalty>),
     Ard(Arc<ARDPenalty>),
 }
 
@@ -1279,6 +1428,7 @@ impl AnalyticPenaltyKind {
         match self {
             AnalyticPenaltyKind::Isometry(p) => p.tier(),
             AnalyticPenaltyKind::Sparsity(p) => p.tier(),
+            AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.tier(),
             AnalyticPenaltyKind::Ard(p) => p.tier(),
         }
     }
@@ -1287,6 +1437,7 @@ impl AnalyticPenaltyKind {
         match self {
             AnalyticPenaltyKind::Isometry(p) => p.rho_count(),
             AnalyticPenaltyKind::Sparsity(p) => p.rho_count(),
+            AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.rho_count(),
             AnalyticPenaltyKind::Ard(p) => p.rho_count(),
         }
     }
@@ -1295,6 +1446,7 @@ impl AnalyticPenaltyKind {
         match self {
             AnalyticPenaltyKind::Isometry(p) => p.name(),
             AnalyticPenaltyKind::Sparsity(p) => p.name(),
+            AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.name(),
             AnalyticPenaltyKind::Ard(p) => p.name(),
         }
     }
@@ -1303,6 +1455,7 @@ impl AnalyticPenaltyKind {
         match self {
             AnalyticPenaltyKind::Isometry(p) => p.value(target, rho),
             AnalyticPenaltyKind::Sparsity(p) => p.value(target, rho),
+            AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.value(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.value(target, rho),
         }
     }
@@ -1315,6 +1468,7 @@ impl AnalyticPenaltyKind {
         match self {
             AnalyticPenaltyKind::Isometry(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Sparsity(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.grad_target(target, rho),
         }
     }
@@ -1327,6 +1481,7 @@ impl AnalyticPenaltyKind {
         match self {
             AnalyticPenaltyKind::Isometry(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Sparsity(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.grad_rho(target, rho),
         }
     }
@@ -1339,6 +1494,7 @@ impl AnalyticPenaltyKind {
         match self {
             AnalyticPenaltyKind::Isometry(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Sparsity(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.hessian_diag(target, rho),
         }
     }
@@ -1359,6 +1515,7 @@ impl AnalyticPenaltyKind {
         match self {
             AnalyticPenaltyKind::Isometry(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Sparsity(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Ard(p) => p.hvp(target, rho, v),
         }
     }
@@ -1458,10 +1615,10 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
     }
 
     fn diag(&self) -> Array1<f64> {
-        // Each penalty exposes a hessian_diag (ARD, smoothed-L¹, Log directly;
-        // Isometry via Gauss-Newton diagonal of J^T J; Hoyer via dominant
-        // diagonal). When unavailable, fall back to probing matvec on each
-        // standard basis vector (O(n²)).
+        // Each diagonal penalty exposes `hessian_diag` directly (ARD,
+        // smoothed-L¹, Log; Hoyer currently exposes its preconditioner
+        // diagonal). Dense penalties such as Isometry fall back to probing
+        // matvec on each standard basis vector (O(n²)).
         match &self.penalty {
             AnalyticPenaltyKind::Ard(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
@@ -1473,37 +1630,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                     self.diag_via_matvec()
                 }
             }
-            AnalyticPenaltyKind::Isometry(p) => {
-                // Gauss-Newton diagonal: diag(2μ J^T W J) = diag(2μ M^T M),
-                // where M = U^T J is the projected (r × d) Jacobian. The
-                // diagonal entry for axis a is `2 μ · Σ_k M[k, a]²`. Built
-                // via the same projected-jacobian helper that guarantees the
-                // `(J^T U)(U^T J)` contraction order.
-                let d = p
-                    .target
-                    .latent_dim
-                    .expect("IsometryPenalty requires latent_dim");
-                let jac = p
-                    .jacobian_cache
-                    .as_ref()
-                    .expect("isometry penalty requires a live jacobian cache");
-                let n_obs = jac.nrows();
-                let mu = self.rho[p.rho_index].exp();
-                let mut out = Array1::<f64>::zeros(self.target.len());
-                for n in 0..n_obs {
-                    let m = p.projected_jacobian_row(n, d);
-                    let r = m.nrows();
-                    for a in 0..d {
-                        let mut gaa = 0.0;
-                        for k in 0..r {
-                            let v = m[[k, a]];
-                            gaa += v * v;
-                        }
-                        out[n * d + a] = 2.0 * mu * gaa;
-                    }
-                }
-                out
-            }
+            AnalyticPenaltyKind::Isometry(_) => self.diag_via_matvec(),
         }
     }
 

@@ -2429,6 +2429,13 @@ pub struct FitConfig {
     /// catalog-metadata-informed-prior hook for models that do not need a new
     /// user-defined coefficient group.
     pub penalty_block_gamma_priors: Vec<(String, f64, f64)>,
+
+    /// Python `gamfit.fit(..., latents={...})` configuration. This reaches
+    /// the standard workflow boundary today; full standard-fit REML wiring is
+    /// intentionally rejected in `materialize_standard` until the per-row
+    /// `LatentCoord` hyper-direction block can be represented without
+    /// allocating one dense `N × K` derivative per coordinate.
+    pub latents: Option<JsonValue>,
 }
 
 impl Default for FitConfig {
@@ -2468,6 +2475,7 @@ impl Default for FitConfig {
             group_metadata: None,
             coefficient_groups: Vec::new(),
             penalty_block_gamma_priors: Vec::new(),
+            latents: None,
         }
     }
 }

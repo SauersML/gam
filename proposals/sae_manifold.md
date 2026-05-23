@@ -21,9 +21,10 @@ The three-tier reading of gamfit is laid out in `composition_engine.md`:
 
 - **β** — decoder / smooth coefficients, solved by the penalised-LS
   Newton inner solver (`src/solver/pirls.rs`).
-- **ψ** — nonlinear design parameters, transported through the inner
-  solution by the implicit function theorem (`HyperDesignDerivative`,
-  `src/solver/reml/mod.rs:2653`).
+- **ψ / ext-coords** — kernel-shape `ψ` plus any design-moving external
+  coordinates transported through the inner solution by the implicit
+  function theorem (`HyperDesignDerivative`, `src/solver/reml/mod.rs:2653`).
+  Per-row latents are written `t`, not `ψ`.
 - **ρ** — penalty / hyperparameter scalings, selected by the marginal
   likelihood in the REML outer loop (`src/solver/reml/runtime.rs`).
 
@@ -73,7 +74,7 @@ Parameters, partitioned by tier:
   spline-coefficient blocks of atom `k`'s decoder. `M_k` is the
   basis size of atom `k`. β lives in the Newton inner solve.
 
-- **ψ** decomposes into two per-observation sub-blocks:
+- **Ext-coordinates** decompose into two per-observation sub-blocks:
   - `a_i ∈ ℝ^K_{≥0}` — soft assignment of observation `i` to each
     atom. Constrained non-negative; the sparsity prior on `a_i`
     encourages most entries to be exactly zero.
@@ -110,19 +111,19 @@ reconstruction is the assignment-weighted sum of decoder outputs:
 The full penalised-likelihood objective is
 
 ```
-ℒ(β, ψ, ρ) =
+ℒ(β, ext, ρ) =
     ½ Σ_i ‖Z_i − Ẑ_i‖²                                 (data fit)
   + λ_sp Σ_i Pen_sparse(a_i)                            (atom sparsity)
   + λ_sm Σ_k B_k' P_k B_k                               (decoder smoothness)
   + Σ_k Σ_j α_kj ‖t_{·, k, j}‖²                         (ARD per atom × axis)
   + R_id(a, t)                                          (identifiability; §3.4)
-  − ½ log |Σ(ρ, ψ)|                                     (REML log-det).
+  − ½ log |Σ(ρ, ext)|                                   (REML log-det).
 ```
 
 `Pen_sparse` is the existing active-set L¹ (`src/solver/active_set.rs`)
 on the non-negative orthant; `P_k` is the same Duchon-style
 function-norm penalty already used by every smooth (`Duchon` doc at
-`gamfit/smooth.py:79`); the ARD term is the `dim_selection="reml"`
+`gamfit/smooth.py:79`); the ARD term is the `dim_selection=True`
 construction from `latent_coord.md` §2.3(c) replicated per atom.
 
 ### 3.3 Tier assignment of the gradient
@@ -144,7 +145,7 @@ All gradients are analytic and reuse existing machinery:
 
 No autograd. No new IFT scaffolding. The arrow / bordered-Hessian
 structure is exactly the structure `composition_engine.md` §6
-identifies for `LatentCoord`: per-observation ψ blocks are
+identifies for `LatentCoord`: per-observation ext-coordinate blocks are
 block-diagonal across `i`, coupled to the shared β only through the
 dense border, and the Schur complement reduces the per-step cost from
 `O((Nd+M)^3)` to `O(N d^3 + M^3 + Nd · M)`.
@@ -194,9 +195,9 @@ The composition is mechanical:
   per-row by `a_ik`. The `by`-multiplier path on `Smooth`
   (`gamfit/smooth.py:73`) already accepts per-row multipliers on a
   smooth's contribution. The new content is making `by` be one of the
-  ψ blocks rather than a frozen observed column.
+  design-moving ext-coordinate blocks rather than a frozen observed column.
 
-- **ψ is the LatentCoord block with two sub-fields.** The
+- **The ext-coordinate tier is the LatentCoord block with two sub-fields.** The
   `LatentCoord` spec proposed in `latent_coord.md` §3 already
   packages a per-row latent vector with explicit `id_mode`. The
   extension here is structural: the latent field for SAE-manifold
@@ -220,7 +221,7 @@ The composition is mechanical:
   composition-engine table (row "Mechanism / sparse-coding amplitude
   gating").
 
-- **Arrow / bordered-Hessian structure.** Per-observation ψ
+- **Arrow / bordered-Hessian structure.** Per-observation ext-coordinates
   (`a_i`, `t_i·`) is block-diagonal across `i`, coupled to the
   shared `B = (B_1, …, B_K)` border only through the dense
   cross-block. Schur-eliminate β first (the existing inner
@@ -329,7 +330,7 @@ model = gamfit.fit(
         "t": LatentCoord(
             n=N, d=K_atoms * d_per_atom,
             layout=("per_atom", K_atoms, d_per_atom),
-            ard=True,                        # ARD per (atom, axis)
+            dim_selection=True,              # ARD per (atom, axis)
             init="pca-per-cluster",
         ),
     },
@@ -365,7 +366,7 @@ Internally `sae_manifold_fit` does:
    `compare_models` over their REML scores
    (`gamfit/_compare.py:97`).
 2. If `atom_dim="auto"`: each atom's `LatentCoord` is constructed
-   with the per-axis ARD `dim_selection="reml"` flag from
+   with the per-axis ARD `dim_selection=True` flag from
    `latent_coord.md` §2.3(c).
 3. Per-atom topology: `atom_basis` may be a single string applied
    uniformly, or a list aligning with `K` — each entry a `Smooth`
@@ -381,7 +382,7 @@ Already in flight or shipping:
 - **Active-set inner solver** (`src/solver/active_set.rs`) —
   enforces non-negativity and sparsity on `a`.
 - **`HyperDesignDerivative` / `evaluate_unified_with_psi_ext`** —
-  propagates IFT through design-moving ψ.
+  propagates IFT through design-moving ext-coordinates.
 - **`by`-multiplier on `Smooth`** (`gamfit/smooth.py:73`) — the
   multiplicative gate for `a` × decoder.
 - **Topology wrappers** — `Duchon`, `Sphere`,
