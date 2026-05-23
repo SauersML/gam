@@ -3684,7 +3684,7 @@ mod tests {
             penalized_objective: 0.0,
             outer_iterations: 0,
             outer_converged: true,
-            outer_gradient_norm: 0.0,
+            outer_gradient_norm: None,
             standard_deviation: 1.0,
             covariance_conditional: Some(Array2::zeros((p, p))),
             covariance_corrected: Some(Array2::zeros((p, p))),

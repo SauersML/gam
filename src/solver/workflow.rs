@@ -1030,7 +1030,7 @@ fn survival_unified_fit_result(
         penalized_objective: reml_score,
         outer_iterations: summary.iterations,
         outer_converged: true,
-        outer_gradient_norm: summary.lastgradient_norm,
+        outer_gradient_norm: Some(summary.lastgradient_norm),
         standard_deviation: 1.0,
         covariance_conditional: None,
         covariance_corrected: None,

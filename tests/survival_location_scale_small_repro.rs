@@ -123,7 +123,7 @@ fn fit_location_scale_survival_with_constant_noise_on_small_right_censored_data(
     let beta_log_sigma = unified.beta_log_sigma();
     assert!(
         unified.outer_converged,
-        "outer optimizer did not converge: iterations={} grad_norm={:.3e} lambdas={:?} log_lambdas={:?} pirls_status={:?} beta_time={:?} beta_threshold={:?} beta_log_sigma={:?}",
+        "outer optimizer did not converge: iterations={} grad_norm={:?} lambdas={:?} log_lambdas={:?} pirls_status={:?} beta_time={:?} beta_threshold={:?} beta_log_sigma={:?}",
         unified.outer_iterations,
         unified.outer_gradient_norm,
         unified.lambdas.to_vec(),

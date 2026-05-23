@@ -98,7 +98,7 @@ fn minimal_fit_result(fitted_link: FittedLinkState) -> UnifiedFitResult {
         penalized_objective: 0.0,
         outer_iterations: 1,
         outer_converged: true,
-        outer_gradient_norm: 0.0,
+        outer_gradient_norm: None,
         standard_deviation: 1.0,
         covariance_conditional: Some(
             Array2::from_shape_vec((1, 1), vec![1.0e-3]).expect("1x1 covariance"),
@@ -148,7 +148,7 @@ fn minimal_survival_fit_result() -> UnifiedFitResult {
         penalized_objective: 0.0,
         outer_iterations: 1,
         outer_converged: true,
-        outer_gradient_norm: 0.0,
+        outer_gradient_norm: None,
         standard_deviation: 1.0,
         covariance_conditional: Some(
             Array2::from_shape_vec((2, 2), vec![1.0e-3, 0.0, 0.0, 1.0e-3]).expect("2x2 covariance"),

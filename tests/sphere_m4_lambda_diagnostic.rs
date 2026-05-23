@@ -89,7 +89,7 @@ fn sphere_m_sweep_lambda_diagnostic() {
         );
         eprintln!(
             "[diag] m={m} REML score     = {reml_score:.6}   outer_iters={outer_iters}  \
-             outer_converged={outer_converged}  outer_grad_norm={outer_grad_norm:.3e}"
+             outer_converged={outer_converged}  outer_grad_norm={outer_grad_norm:?}"
         );
 
         // ── 15×15 grid prediction variance / range ──────────────────────
