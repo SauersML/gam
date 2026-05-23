@@ -3143,7 +3143,10 @@ pub struct BlockwiseFitResultParts {
     pub stable_penalty_term: f64,
     pub penalized_objective: f64,
     pub outer_iterations: usize,
-    pub outer_gradient_norm: f64,
+    /// `None` = no gradient measured at termination (cache-hit, gradient-free,
+    /// or trivial early-exit); `Some(g)` = measured norm. `outer_converged`
+    /// is the authoritative convergence signal.
+    pub outer_gradient_norm: Option<f64>,
     pub inner_cycles: usize,
     pub outer_converged: bool,
     pub geometry: Option<FitGeometry>,
@@ -20515,7 +20518,7 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
     options: &BlockwiseFitOptions,
     warm_start: Option<&CustomFamilyWarmStart>,
     outer_iterations: usize,
-    outer_gradient_norm: f64,
+    outer_gradient_norm: Option<f64>,
     outer_converged: bool,
 ) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
