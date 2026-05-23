@@ -3821,7 +3821,9 @@ fn gaussian_reml_fit_latent<'py>(
 /// These additive terms are computed here from the supplied auxiliary /
 /// precision arrays and folded into the returned `grad_t`. The outer
 /// REML loop sees a *unique* minimum because the inner Hessian on t is
-/// now bounded below by `μI` (auxiliary) or `Λ` (dim-selection).
+/// now bounded below by `μI` (auxiliary). Fixes the audit-revised claim:
+/// dim-selection/ARD alone is not a rotation-gauge fix and must be paired
+/// with AuxPrior or Isometry for identifiability.
 #[pyfunction(signature = (
     t,
     y,
@@ -3944,9 +3946,8 @@ fn gaussian_reml_fit_latent_backward<'py>(
     )
     .map_err(py_value_error)?;
     // Restrict grad_x to the kernel block (first n_centers columns of the
-    // Duchon design). The polynomial-nullspace tail does not depend on t
-    // in the radial sense: its derivative against t is a constant (or 0,
-    // or 1 — handled separately below for completeness).
+    // Duchon design). The polynomial-nullspace tail is contracted separately
+    // below with the N-D monomial derivative jet.
     let n_centers = centers_view.nrows();
     let mut grad_phi_kernel = Array2::<f64>::zeros((n_obs, n_centers));
     let grad_x = &backward_for_t.grad_x;

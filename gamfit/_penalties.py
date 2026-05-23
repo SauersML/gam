@@ -20,8 +20,8 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
   REML-selected.
 * `ARDPenalty` lives on ψ. One strength per latent axis, all
   REML-selectable. The Occam factor in the marginal likelihood
-  prunes unused axes; the count of finite strengths at convergence
-  is the intrinsic dimension.
+  prunes unused axes only after an AuxPrior or Isometry-style gauge
+  fix pins rotations/reparameterisations.
 
 All three compose with the existing smoothness penalty (`S(ρ)`),
 they slot into the same REML outer loop, and their strengths are
@@ -82,7 +82,7 @@ class IsometryPenalty:
     other smoothing strength.
 
     **When to use.** Whenever a ``LatentCoord`` block is in play without an
-    ``AuxPrior`` or active ARD to break the diffeomorphism gauge. The bare
+    ``AuxPrior`` or Isometry-style gauge fix to break the diffeomorphism gauge. The bare
     data-fit loss is invariant under any smooth invertible reparameterization
     of ``t``; the isometry penalty breaks that symmetry by pinning the local
     geometry of the decoder. The analytic gradient w.r.t. ``t`` reuses the
@@ -220,14 +220,11 @@ class ARDPenalty:
     REML's marginal-likelihood selection drives ``ρ_j → +∞`` (precision → ∞,
     coefficients → 0) on axes whose data evidence does not justify them.
     The intrinsic dimension is read off post-fit as the number of finite
-    ``ρ_j``. Solves two problems in one penalty: the rotation gauge (the
-    eigenbasis is fixed because each axis has its own strength), and
-    intrinsic-dim discovery (unused axes prune themselves).
+    ``ρ_j`` only after a separate gauge fix has pinned the latent axes.
 
     **When to use.** Any ``LatentCoord`` block where the intrinsic dimension
-    is unknown. Compose with ``IsometryPenalty`` for full gauge fixing on
-    higher-dim manifolds; ARD alone fixes the rotation, isometry fixes the
-    remaining diffeomorphisms.
+    is unknown. Fixes the audit-revised claim: compose with
+    ``IsometryPenalty`` or an auxiliary prior; ARD alone is rotation-symmetric.
 
     Parameters
     ----------

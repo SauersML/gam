@@ -350,8 +350,9 @@ impl WeightField {
 /// `O(p · r · d + r · d²)`, independent of `p²`.
 ///
 /// **When to use.** Whenever a `LatentCoord` block is in play without an
-/// auxiliary variable (`AuxPrior`) or active ARD to break the diffeomorphism
-/// gauge. With a Euclidean reference, the penalty pulls the decoder toward a
+/// auxiliary variable (`AuxPrior`) to break the diffeomorphism gauge. Fixes
+/// the audit finding that ARD is not a standalone gauge fix. With a Euclidean
+/// reference, the penalty pulls the decoder toward a
 /// local isometry, which is enough to make the inner Hessian on `t` full-rank
 /// and the IFT well-defined.
 ///
