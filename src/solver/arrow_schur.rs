@@ -563,10 +563,11 @@ impl ArrowSchurSystem {
             let t_i = ArrayView1::from(latent.row(i));
             let gt_e = row.gt.clone();
             let htt_e = row.htt.clone();
+            let htbeta_e = row.htbeta.clone();
             row.gt = manifold.project_to_tangent(t_i.clone(), gt_e.view());
             row.htt =
                 manifold.riemannian_hessian_matrix(t_i.clone(), gt_e.view(), htt_e.view());
-            row.htbeta = manifold.project_matrix_columns_to_tangent(t_i, row.htbeta.view());
+            row.htbeta = manifold.project_matrix_columns_to_tangent(t_i, htbeta_e.view());
         }
     }
 
@@ -1064,7 +1065,11 @@ fn solve_dense_reduced_system(
     let factor =
         cholesky_lower(schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
     let direct = chol_solve_vector(&factor, rhs_beta);
-    if step_inside_trust_region(direct.view(), options.trust_region.radius) {
+    if step_inside_trust_region(
+        direct.view(),
+        options.trust_region.radius,
+        options.riemannian_trust_region,
+    ) {
         return Ok((direct, Some(factor)));
     }
 
@@ -1085,7 +1090,14 @@ fn solve_dense_reduced_system(
     Ok((delta, Some(factor)))
 }
 
-fn step_inside_trust_region(step: ArrayView1<'_, f64>, radius: f64) -> bool {
+fn step_inside_trust_region(
+    step: ArrayView1<'_, f64>,
+    radius: f64,
+    _riemannian_metric: bool,
+) -> bool {
+    // The current Riemannian manifolds use the ambient Euclidean pullback
+    // metric. Once row blocks have been tangent-projected, the trust-region
+    // norm is therefore the same L2 norm used by the Euclidean BA path.
     !radius.is_finite() || array_l2_norm(step) <= radius
 }
 

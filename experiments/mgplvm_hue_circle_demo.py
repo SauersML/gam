@@ -53,12 +53,7 @@ def circular_procrustes_r2(theta_true: np.ndarray, theta_hat: np.ndarray) -> flo
 
 
 def extract_latent_angle(model: object, n: int) -> np.ndarray:
-    if hasattr(model, "latent"):
-        values = np.asarray(model.latent("t"), dtype=float)
-    elif hasattr(model, "latents") and "t" in model.latents:
-        values = np.asarray(model.latents["t"], dtype=float)
-    else:
-        raise RuntimeError("fitted model does not expose latent('t')")
+    values = np.asarray(model.latent("t"), dtype=float)
     values = values.reshape(n, -1)
     return np.mod(values[:, 0], 2.0 * np.pi)
 

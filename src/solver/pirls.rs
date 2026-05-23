@@ -1338,9 +1338,10 @@ pub struct ArrowSchurInnerConfig {
     /// the Ceres/BA trust-region guard while retaining PIRLS's LM damping.
     pub trust_region_radius: f64,
     /// Callback that the inner solver invokes after each LM-attempted
-    /// joint step to write the latent increment back into the driver's
-    /// `LatentCoordValues`. `delta_t` is the flat row-major increment of
-    /// length `n_rows * latent_dim`.
+    /// joint step to write the latent tangent increment back into the
+    /// driver's `LatentCoordValues` via that latent's update rule
+    /// (`retract_flat_delta` for manifold latents). `delta_t` is the flat
+    /// row-major increment of length `n_rows * latent_dim`.
     ///
     /// **Driver-side caveat:** the current PIRLS LM gain test may reject
     /// the β step via step halving; in that case the latent should be
