@@ -161,6 +161,8 @@ Default interior knots:
 dimension is then `k = internal_knots + degree + 1`. Passing both `k`
 and `knots` is an error.
 
+### Boundary-conditioned 1-D smooths {#boundary-conditioned-1d-smooths}
+
 Boundary-condition values: `free`/`none`/`open`,
 `clamped`/`zero_derivative`, `anchored`/`zero`/`zero_value`. `clamped`
 forces zero first derivative at the endpoint; `anchored` pins the
@@ -279,7 +281,7 @@ value are broadcast across all margins.
 
 ![four smooth families on the same dataset](images/smooth_zoo.png)
 
-### Periodic and cyclic smooths
+### Periodic and cyclic smooths {#periodic-cyclic-smooths}
 
 ```
 y ~ s(theta, periodic=true, period=6.283)             # cyclic 1-D B-spline
