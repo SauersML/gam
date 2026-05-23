@@ -14,7 +14,7 @@ Arrow-Schur row-block assembly for the same configuration.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Literal, Sequence
 
 import numpy as np
@@ -52,6 +52,53 @@ class SaeManifoldFitResult:
     reml_score: float
 
 
+@dataclass(frozen=True)
+class GumbelTemperatureSchedule:
+    """Deterministic temperature schedule for SAE assignment relaxations."""
+
+    tau_start: float
+    tau_min: float
+    decay: Literal["geometric", "linear", "reciprocal_iter"]
+    rate: float | None = None
+    steps: int | None = None
+    iter_count: int = 0
+
+
+def gumbel_geometric_schedule(
+    tau_start: float, tau_min: float, rate: float, iter_count: int = 0
+) -> GumbelTemperatureSchedule:
+    return GumbelTemperatureSchedule(
+        tau_start=tau_start,
+        tau_min=tau_min,
+        decay="geometric",
+        rate=rate,
+        iter_count=iter_count,
+    )
+
+
+def gumbel_linear_schedule(
+    tau_start: float, tau_min: float, steps: int, iter_count: int = 0
+) -> GumbelTemperatureSchedule:
+    return GumbelTemperatureSchedule(
+        tau_start=tau_start,
+        tau_min=tau_min,
+        decay="linear",
+        steps=steps,
+        iter_count=iter_count,
+    )
+
+
+def gumbel_reciprocal_iter_schedule(
+    tau_start: float, tau_min: float, iter_count: int = 0
+) -> GumbelTemperatureSchedule:
+    return GumbelTemperatureSchedule(
+        tau_start=tau_start,
+        tau_min=tau_min,
+        decay="reciprocal_iter",
+        iter_count=iter_count,
+    )
+
+
 def sae_manifold_fit(
     Z: Any,
     n_atoms: int | Literal["auto"] = 10,
@@ -64,7 +111,7 @@ def sae_manifold_fit(
     alpha: float | Literal["auto"] = "auto",
     learnable_alpha: bool = False,
     tau: float = 0.5,
-    gumbel_schedule: Mapping[str, Any] | None = None,
+    gumbel_schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None = None,
     max_iter: int = 12,
     learning_rate: float = 0.05,
     random_state: int = 0,
@@ -80,8 +127,9 @@ def sae_manifold_fit(
     Beta-Bernoulli active indicators with ``alpha="auto"`` evidence-ranked
     over a small truncation-prior grid. ``learnable_alpha`` mirrors the Rust
     ``IBPAssignmentPenalty`` effective-alpha convention. ``gumbel_schedule``
-    accepts dictionaries such as ``{"kind": "geometric", "tau_start": 1.0,
-    "tau_min": 1e-3, "rate": 0.95}`` and advances once per outer iteration.
+    accepts :class:`GumbelTemperatureSchedule` or dictionaries such as
+    ``{"decay": "geometric", "tau_start": 1.0, "tau_min": 1e-3,
+    "rate": 0.95}`` and advances once per outer iteration.
     """
 
     z = _as_2d_float(Z, "Z")
@@ -640,12 +688,16 @@ def _rbf_gram(centers: np.ndarray, power: int) -> np.ndarray:
     return gram @ gram.T + np.eye(gram.shape[0]) * 1e-6
 
 
-def _normalize_gumbel_schedule(schedule: Mapping[str, Any] | None) -> dict[str, Any] | None:
+def _normalize_gumbel_schedule(
+    schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
     if schedule is None:
         return None
+    if isinstance(schedule, GumbelTemperatureSchedule):
+        schedule = asdict(schedule)
     if not isinstance(schedule, Mapping):
-        raise ValueError("gumbel_schedule must be a mapping or None")
-    kind = str(_require_schedule_key(schedule, "kind")).lower().replace("-", "_")
+        raise ValueError("gumbel_schedule must be GumbelTemperatureSchedule, a mapping, or None")
+    decay = str(_require_schedule_key(schedule, "decay")).lower().replace("-", "_")
     tau_start = float(_require_schedule_key(schedule, "tau_start"))
     tau_min = float(_require_schedule_key(schedule, "tau_min"))
     if not np.isfinite(tau_start) or tau_start <= 0.0:
@@ -654,22 +706,30 @@ def _normalize_gumbel_schedule(schedule: Mapping[str, Any] | None) -> dict[str, 
         raise ValueError("gumbel_schedule['tau_min'] must be finite and positive")
     if tau_min > tau_start:
         raise ValueError("gumbel_schedule['tau_min'] cannot exceed tau_start")
-    out: dict[str, Any] = {"kind": kind, "tau_start": tau_start, "tau_min": tau_min}
-    if kind == "geometric":
+    iter_count = int(schedule.get("iter_count", 0))
+    if iter_count < 0:
+        raise ValueError("gumbel_schedule['iter_count'] must be non-negative")
+    out: dict[str, Any] = {
+        "decay": decay,
+        "tau_start": tau_start,
+        "tau_min": tau_min,
+        "iter_count": iter_count,
+    }
+    if decay == "geometric":
         rate = float(_require_schedule_key(schedule, "rate"))
         if not np.isfinite(rate) or rate <= 0.0 or rate >= 1.0:
             raise ValueError("gumbel_schedule['rate'] must be in (0, 1)")
         out["rate"] = rate
-    elif kind == "linear":
+    elif decay == "linear":
         steps = int(_require_schedule_key(schedule, "steps"))
         if steps <= 0:
             raise ValueError("gumbel_schedule['steps'] must be positive")
         out["steps"] = steps
-    elif kind in {"reciprocal_iter", "reciprocal"}:
-        out["kind"] = "reciprocal_iter"
+    elif decay == "reciprocal_iter":
+        out["decay"] = "reciprocal_iter"
     else:
         raise ValueError(
-            "gumbel_schedule['kind'] must be 'geometric', 'linear', or 'reciprocal_iter'"
+            "gumbel_schedule['decay'] must be 'geometric', 'linear', or 'reciprocal_iter'"
         )
     return out
 
@@ -683,19 +743,20 @@ def _require_schedule_key(schedule: Mapping[str, Any], key: str) -> Any:
 def _gumbel_tau_at(schedule: dict[str, Any] | None, iter_idx: int, tau: float) -> float:
     if schedule is None:
         return tau
-    kind = schedule["kind"]
+    decay = schedule["decay"]
     tau_start = float(schedule["tau_start"])
     tau_min = float(schedule["tau_min"])
-    if kind == "geometric":
-        raw = tau_start * (float(schedule["rate"]) ** iter_idx)
-    elif kind == "linear":
+    iter_at = int(schedule.get("iter_count", 0)) + iter_idx
+    if decay == "geometric":
+        raw = tau_start * (float(schedule["rate"]) ** iter_at)
+    elif decay == "linear":
         steps = int(schedule["steps"])
-        if iter_idx >= steps:
+        if iter_at >= steps:
             raw = tau_min
         else:
-            raw = tau_start + (iter_idx / steps) * (tau_min - tau_start)
+            raw = tau_start + (iter_at / steps) * (tau_min - tau_start)
     else:
-        raw = tau_start / (1.0 + iter_idx)
+        raw = tau_start / (1.0 + iter_at)
     return max(tau_min, raw)
 
 
@@ -825,4 +886,12 @@ def _as_2d_float(value: Any, name: str) -> np.ndarray:
     return arr
 
 
-__all__ = ["SaeManifoldAtomFit", "SaeManifoldFitResult", "sae_manifold_fit"]
+__all__ = [
+    "GumbelTemperatureSchedule",
+    "SaeManifoldAtomFit",
+    "SaeManifoldFitResult",
+    "gumbel_geometric_schedule",
+    "gumbel_linear_schedule",
+    "gumbel_reciprocal_iter_schedule",
+    "sae_manifold_fit",
+]

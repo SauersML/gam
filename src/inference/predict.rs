@@ -803,6 +803,7 @@ impl PredictableModel for StandardPredictor {
         let (lo, hi) = match self.family {
             crate::types::LikelihoodFamily::GaussianIdentity => (f64::NEG_INFINITY, f64::INFINITY),
             crate::types::LikelihoodFamily::PoissonLog
+            | crate::types::LikelihoodFamily::Tweedie { .. }
             | crate::types::LikelihoodFamily::NegativeBinomial { .. }
             | crate::types::LikelihoodFamily::GammaLog => (0.0, f64::INFINITY),
             _ => (1e-10, 1.0 - 1e-10),

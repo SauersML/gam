@@ -121,7 +121,15 @@ from ._sampling import (
     PosteriorSamples,
     SamplingConfig,
 )
-from ._sae_manifold import SaeManifoldAtomFit, SaeManifoldFitResult, sae_manifold_fit
+from ._sae_manifold import (
+    GumbelTemperatureSchedule,
+    SaeManifoldAtomFit,
+    SaeManifoldFitResult,
+    gumbel_geometric_schedule,
+    gumbel_linear_schedule,
+    gumbel_reciprocal_iter_schedule,
+    sae_manifold_fit,
+)
 from ._schema import SchemaCheck, SchemaIssue
 from ._summary import Summary
 from ._validation import FormulaValidation
@@ -162,6 +170,7 @@ __all__ = [
     "FormulaError",
     "FormulaValidation",
     "GamError",
+    "GumbelTemperatureSchedule",
     "CompetingRisksCIF",
     "CompetingRisksPrediction",
     "Model",
@@ -238,6 +247,9 @@ __all__ = [
     "gaussian_reml_fit_with_constraints_forward",
     "gaussian_weighted_ridge",
     "gaussian_weighted_ridge_batch",
+    "gumbel_geometric_schedule",
+    "gumbel_linear_schedule",
+    "gumbel_reciprocal_iter_schedule",
     "load",
     "load_posterior",
     "loads",
