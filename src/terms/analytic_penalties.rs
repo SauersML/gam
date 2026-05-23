@@ -1408,7 +1408,7 @@ impl AnalyticPenaltyOp {
 // Registration helper — collects penalty kinds for the outer REML driver
 // ---------------------------------------------------------------------------
 
-/// Tagged sum of the three penalty kinds, with enough metadata for the outer
+/// Tagged sum of the analytic penalty kinds, with enough metadata for the outer
 /// REML driver to:
 ///
 ///   1. Concatenate each penalty's owned ρ-axes onto the global ρ vector.

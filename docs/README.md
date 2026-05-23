@@ -41,6 +41,9 @@ Building a model
 - [Location-scale models](location-scale.md) — joint mean and variance.
 - [Response geometry](response-geometry.md) — spherical and
   compositional responses via Fréchet-mean tangent-space GAMs.
+- [Composition engine](composition_engine.md) — maintainer-facing map of
+  the β / ψ / ρ engine, `LatentCoord`, analytic penalties, and SAE-manifold
+  configurations.
 
 Using a fitted model
 

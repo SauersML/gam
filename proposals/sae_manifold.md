@@ -414,7 +414,10 @@ What remains, specific to SAE-manifold:
    "two sub-blocks" generalisation of §3.1, and the Rust-side change
    is small (the storage `Array1<f64>` already supports a
    `dims_per_term`-style layout).
-4. **`gamfit.sae_manifold_fit` Python entry point.** Thin wrapper.
+4. **First-class Rust SAE-manifold term.** `gamfit.sae_manifold_fit`
+   exists as a Python assembly wrapper; the missing primitive is the
+   dedicated Rust `src/terms/sae_manifold.rs` term that would build all
+   atom blocks into one Arrow-Schur solve.
 
 ## 8. Open questions for maintainers
 
