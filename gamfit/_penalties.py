@@ -1,4 +1,4 @@
-"""Analytic structured penalties: isometry, sparsity, ARD-per-latent-dim, orthogonality.
+"""Analytic structured penalties: isometry, sparsity, ARD, TV, orthogonality.
 
 Thin Python configuration wrappers around the analytic primitives
 implemented in `src/terms/analytic_penalties.rs`. Each wrapper is a
@@ -22,11 +22,14 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
   REML-selectable. The Occam factor in the marginal likelihood
   prunes unused axes only after an AuxPrior or Isometry-style gauge
   fix pins rotations/reparameterisations.
+* `TotalVariationPenalty` lives on ψ. Smoothed L¹ on first differences
+  promotes piecewise-constant latent atom maps over ordered contexts or
+  graph adjacencies.
 * `OrthogonalityPenalty` lives on ψ. It fixes the rotation gauge by
   penalizing latent-axis correlations; pair it with ARD so pruned axes
   are identifiable.
 
-All four compose with the existing smoothness penalty (`S(ρ)`),
+All five compose with the existing smoothness penalty (`S(ρ)`),
 they slot into the same REML outer loop, and their strengths are
 "just another hyperparameter" to that loop. Pass `strength="auto"`
 (the default) to let REML choose; pass an explicit float to pin.
@@ -41,7 +44,10 @@ __all__ = [
     "IsometryPenalty",
     "SparsityPenalty",
     "ARDPenalty",
+    "TotalVariationPenalty",
     "OrthogonalityPenalty",
+    "IBPAssignmentPenalty",
+    "SoftmaxAssignmentSparsityPenalty",
     "Penalty",
 ]
 
@@ -64,6 +70,18 @@ def _validate_strength(strength: Any, name: str) -> None:
         raise TypeError(
             f"{name}.strength must be 'auto' or a positive float, got {type(strength).__name__}"
         )
+
+
+def _target_descriptor(target: Any) -> str | int:
+    if isinstance(target, (str, int)):
+        return target
+    name = getattr(target, "name", None)
+    if name is not None:
+        return str(name)
+    raise TypeError(
+        "analytic penalty target must be a latent block name, latent block index, "
+        "or object exposing a 'name' attribute"
+    )
 
 
 @dataclass
@@ -126,10 +144,13 @@ class IsometryPenalty:
         """
         return {
             "kind": "isometry",
-            "target": self.target if isinstance(self.target, str) else "__latent_object__",
+            "target": _target_descriptor(self.target),
             "reference": self.reference if isinstance(self.reference, str) else "user_supplied",
             "strength": self.strength,
         }
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
 
 
 @dataclass
@@ -203,12 +224,15 @@ class SparsityPenalty:
     def _to_rust_payload(self) -> dict[str, Any]:
         return {
             "kind": "sparsity",
-            "target": self.target,
+            "target": _target_descriptor(self.target),
             "sparsity_kind": self.kind,
             "strength": self.strength,
             "eps": float(self.eps),
             "eps_strength": self.eps_strength,
         }
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
 
 
 @dataclass
@@ -265,9 +289,119 @@ class ARDPenalty:
     def _to_rust_payload(self) -> dict[str, Any]:
         return {
             "kind": "ard",
-            "target": self.target if isinstance(self.target, str) else "__latent_object__",
+            "target": _target_descriptor(self.target),
             "strength_per_dim": self.strength_per_dim,
         }
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
+
+
+@dataclass(init=False)
+class TotalVariationPenalty:
+    """Smoothed-L¹ total variation on first differences of a latent block.
+
+    Uses ``φ(x) = sqrt(x² + ε²) - ε`` on ``D @ T``. ``difference_op`` is either
+    ``"forward_1d"`` for adjacent ordered rows or a graph edge list
+    ``[(from_row, to_row), ...]``. Pair with ``OrthogonalityPenalty`` when
+    piecewise-constant atoms should be interpreted in a gauge-fixed basis.
+
+    Parameters
+    ----------
+    weight
+        Fixed base strength, or the base multiplier when ``learnable=True``.
+    n_eff
+        Number of rows in the row-major latent coefficient block.
+    difference_op
+        ``"forward_1d"`` or a sequence of ``(from_row, to_row)`` graph edges.
+    smoothing_eps
+        Positive smoothing scale ``ε`` for the smoothed-L¹ kernel.
+    learnable
+        If true, expose one REML-selectable log-weight ``ρ``.
+    target
+        The ``LatentCoord`` block name/object. Defaults to ``"t"``.
+    """
+
+    target: Any
+    weight: float
+    n_eff: int
+    difference_op: Any
+    smoothing_eps: float
+    learnable: bool
+    _edges: list[tuple[int, int]] | None
+
+    def __init__(
+        self,
+        weight: float,
+        n_eff: int,
+        difference_op: Any = "forward_1d",
+        smoothing_eps: float = 1e-6,
+        learnable: bool = False,
+        *,
+        target: Any = "t",
+    ) -> None:
+        self.target = target
+        self.weight = float(weight)
+        self.n_eff = int(n_eff)
+        self.difference_op = difference_op
+        self.smoothing_eps = float(smoothing_eps)
+        self.learnable = bool(learnable)
+        self._edges = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        if not self.weight > 0.0:
+            raise ValueError(f"TotalVariationPenalty.weight must be > 0, got {self.weight}")
+        if self.n_eff <= 0:
+            raise ValueError(f"TotalVariationPenalty.n_eff must be > 0, got {self.n_eff}")
+        if not self.smoothing_eps > 0.0:
+            raise ValueError(
+                "TotalVariationPenalty.smoothing_eps must be > 0, "
+                f"got {self.smoothing_eps}"
+            )
+        if isinstance(self.difference_op, str):
+            if self.difference_op != "forward_1d":
+                raise ValueError(
+                    "TotalVariationPenalty.difference_op string must be 'forward_1d', "
+                    f"got {self.difference_op!r}"
+                )
+            self._edges = None
+            return
+
+        try:
+            edges = [(int(a), int(b)) for a, b in self.difference_op]
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "TotalVariationPenalty.difference_op must be 'forward_1d' "
+                "or a sequence of (from_row, to_row) edges"
+            ) from exc
+        if not edges:
+            raise ValueError("TotalVariationPenalty graph edges must not be empty")
+        for a, b in edges:
+            if a < 0 or b < 0 or a >= self.n_eff or b >= self.n_eff:
+                raise ValueError(
+                    "TotalVariationPenalty graph edges must be within "
+                    f"[0, n_eff); got {(a, b)} for n_eff={self.n_eff}"
+                )
+            if a == b:
+                raise ValueError(f"TotalVariationPenalty graph edge {(a, b)} is self-referential")
+        self._edges = edges
+
+    def _to_rust_payload(self) -> dict[str, Any]:
+        payload = {
+            "kind": "total_variation",
+            "target": self.target if isinstance(self.target, str) else "__latent_object__",
+            "weight": self.weight,
+            "n_eff": self.n_eff,
+            "smoothing_eps": self.smoothing_eps,
+            "learnable": self.learnable,
+        }
+        if self._edges is None:
+            payload["difference_op"] = "forward_1d"
+        else:
+            payload["difference_op"] = "graph_edges"
+            payload["edges"] = self._edges
+        return payload
 
 
 @dataclass(init=False)
@@ -330,4 +464,7 @@ class OrthogonalityPenalty:
 
 
 # Sum type for type hints on `gamfit.fit(..., penalties=...)` and similar.
-Penalty = "IsometryPenalty | SparsityPenalty | ARDPenalty | OrthogonalityPenalty"
+Penalty = (
+    "IsometryPenalty | SparsityPenalty | ARDPenalty | "
+    "TotalVariationPenalty | OrthogonalityPenalty"
+)
