@@ -7,8 +7,8 @@ This module implements the Methodspace configuration from
 
 This wrapper owns candidate K construction, topology-basis materialization,
 decoder REML fits, and evidence ranking via :func:`gamfit.compare_models`.
-When the Rust ``src/terms/sae_manifold.rs`` formal term is available, it owns
-the joint Arrow-Schur row-block assembly for the same configuration.
+The Rust ``src/terms/sae_manifold.rs`` formal term owns the joint
+Arrow-Schur row-block assembly for the same configuration.
 """
 
 from __future__ import annotations
@@ -119,6 +119,32 @@ def _fit_fixed_k(
     learning_rate: float,
     random_state: int,
 ) -> SaeManifoldFitResult:
+    if sparsity_strength == "auto":
+        lambda_grid = [0.1, 1.0, 10.0]
+        fits = [
+            _fit_fixed_k(
+                z,
+                k_atoms,
+                atom_basis,
+                atom_dim,
+                lam,
+                smoothness,
+                max_iter=max_iter,
+                learning_rate=learning_rate,
+                random_state=random_state + idx * 7919,
+            )
+            for idx, lam in enumerate(lambda_grid)
+        ]
+        labels = [f"lambda_sparse={lam:g}" for lam in lambda_grid]
+        comparison = compare_models(
+            [{"reml_score": f.reml_score, "edf": _edf_proxy(f)} for f in fits],
+            names=labels,
+        )
+        winner = labels.index(comparison["winner"])
+        chosen = fits[winner]
+        chosen.comparison = comparison
+        return chosen
+
     rng = np.random.default_rng(random_state)
     n = z.shape[0]
     dims = _resolve_dims(k_atoms, atom_dim)
@@ -399,8 +425,7 @@ def _rbf_gram(centers: np.ndarray, power: int) -> np.ndarray:
         gram = (r ** power) * np.log(np.maximum(r, 1e-12))
     else:
         gram = r ** power
-    gram += np.eye(gram.shape[0]) * 1e-6
-    return gram
+    return gram @ gram.T + np.eye(gram.shape[0]) * 1e-6
 
 
 def _softmax(logits: np.ndarray) -> np.ndarray:

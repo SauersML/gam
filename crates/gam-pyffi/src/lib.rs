@@ -3659,6 +3659,478 @@ fn latent_scalar_weights_with_fisher(
     Ok(Some(out))
 }
 
+fn latent_row_weights(n_obs: usize, weights: Option<ArrayView1<'_, f64>>) -> Result<Array1<f64>, String> {
+    match weights {
+        Some(w) => gaussian_reml_weight_vector_local(n_obs, Some(w)),
+        None => Ok(Array1::ones(n_obs)),
+    }
+}
+
+fn validate_dense_fisher_w(
+    n_obs: usize,
+    n_outputs: usize,
+    fisher_w: ArrayView3<'_, f64>,
+) -> Result<(), String> {
+    if fisher_w.shape() != [n_obs, n_outputs, n_outputs] {
+        return Err(format!(
+            "fisher_W dense blocks must have shape ({n_obs}, {n_outputs}, {n_outputs}); got {:?}",
+            fisher_w.shape()
+        ));
+    }
+    for n in 0..n_obs {
+        for a in 0..n_outputs {
+            for b in 0..n_outputs {
+                let v = fisher_w[[n, a, b]];
+                if !v.is_finite() {
+                    return Err(format!("fisher_W[{n},{a},{b}] must be finite; got {v}"));
+                }
+            }
+            if fisher_w[[n, a, a]] < 0.0 {
+                return Err(format!(
+                    "fisher_W[{n},{a},{a}] must be non-negative; got {}",
+                    fisher_w[[n, a, a]]
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn add_block_diagonal_penalty(
+    hessian: &mut Array2<f64>,
+    penalty: ArrayView2<'_, f64>,
+    lambda: f64,
+    n_outputs: usize,
+) -> Result<(), String> {
+    let k = penalty.ncols();
+    if penalty.nrows() != k {
+        return Err(format!(
+            "penalty must be square for dense Fisher fit; got {}x{}",
+            penalty.nrows(),
+            penalty.ncols()
+        ));
+    }
+    if hessian.dim() != (k * n_outputs, k * n_outputs) {
+        return Err("dense Fisher Hessian shape mismatch while adding penalty".to_string());
+    }
+    for output in 0..n_outputs {
+        let offset = output * k;
+        for row in 0..k {
+            for col in 0..k {
+                let s_sym = 0.5 * (penalty[[row, col]] + penalty[[col, row]]);
+                hessian[[offset + row, offset + col]] += lambda * s_sym;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn solve_dense_block_system(
+    hessian: &Array2<f64>,
+    rhs: &Array1<f64>,
+    context: &str,
+) -> Result<Array1<f64>, String> {
+    let mut rhs2 = Array2::<f64>::zeros((rhs.len(), 1));
+    for i in 0..rhs.len() {
+        rhs2[[i, 0]] = rhs[i];
+    }
+    let factor = factorize_symmetricwith_fallback(
+        gam::faer_ndarray::FaerArrayView::new(hessian).as_ref(),
+        Side::Lower,
+    )
+    .map_err(|err| format!("{context} factorization failed: {err}"))?;
+    {
+        let mut rhs_view = array2_to_matmut(&mut rhs2);
+        factor.solve_in_place(rhs_view.as_mut());
+    }
+    let mut out = Array1::<f64>::zeros(rhs.len());
+    for i in 0..rhs.len() {
+        out[i] = rhs2[[i, 0]];
+    }
+    if out.iter().any(|v| !v.is_finite()) {
+        return Err(format!("{context} solve produced non-finite coefficients"));
+    }
+    Ok(out)
+}
+
+fn latent_prior_score_for_t(
+    t_mat: ArrayView2<'_, f64>,
+    aux_u: Option<ArrayView2<'_, f64>>,
+    aux_family: AuxPriorFamily,
+    aux_strength: Option<f64>,
+    dim_selection_precision: Option<ArrayView1<'_, f64>>,
+) -> Result<f64, String> {
+    let n_obs = t_mat.nrows();
+    let latent_dim = t_mat.ncols();
+    let mut latent_prior_score = 0.0_f64;
+    if let Some(u_view) = aux_u {
+        let targets = aux_prior_targets(t_mat, u_view, aux_family)?;
+        let mu = aux_strength.unwrap_or(1.0);
+        if !(mu.is_finite() && mu > 0.0) {
+            return Err(format!("aux_strength must be finite and positive; got {mu}"));
+        }
+        let mut sq = 0.0_f64;
+        for n in 0..n_obs {
+            for a in 0..latent_dim {
+                let diff = t_mat[[n, a]] - targets[[n, a]];
+                sq += diff * diff;
+            }
+        }
+        let effective_dim = (n_obs * latent_dim) as f64;
+        latent_prior_score += 0.5 * mu * sq - 0.5 * effective_dim * mu.ln();
+    }
+    if let Some(log_prec) = dim_selection_precision {
+        if log_prec.len() != latent_dim {
+            return Err(format!(
+                "dim_selection_log_precision length {} must equal latent_dim {}",
+                log_prec.len(),
+                latent_dim
+            ));
+        }
+        for a in 0..latent_dim {
+            let log_alpha = log_prec[a];
+            let alpha = log_alpha.exp();
+            if !(alpha.is_finite() && alpha > 0.0) {
+                return Err(format!(
+                    "dim_selection_log_precision[{a}] must exponentiate to a finite positive precision"
+                ));
+            }
+            let mut sq = 0.0_f64;
+            for n in 0..n_obs {
+                let v = t_mat[[n, a]];
+                sq += v * v;
+            }
+            latent_prior_score += 0.5 * alpha * sq - 0.5 * (n_obs as f64) * log_alpha;
+        }
+    }
+    Ok(latent_prior_score)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dense_fisher_gaussian_fit_to_pydict<'py>(
+    py: Python<'py>,
+    design: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    fisher_w: ArrayView3<'_, f64>,
+    init_lambda: Option<f64>,
+    latent_prior_score: f64,
+) -> PyResult<Py<PyDict>> {
+    let n_obs = design.nrows();
+    let k = design.ncols();
+    let n_outputs = y.ncols();
+    validate_dense_fisher_w(n_obs, n_outputs, fisher_w).map_err(py_value_error)?;
+    if y.nrows() != n_obs {
+        return Err(py_value_error(format!(
+            "dense Fisher Gaussian row mismatch: X has {n_obs}, y has {}",
+            y.nrows()
+        )));
+    }
+    let row_weights = latent_row_weights(n_obs, weights).map_err(py_value_error)?;
+    let lambda = init_lambda.unwrap_or(1.0);
+    if !(lambda.is_finite() && lambda > 0.0) {
+        return Err(py_value_error(format!(
+            "init_lambda must be finite and positive for dense Fisher fit; got {lambda}"
+        )));
+    }
+    let mut hessian =
+        gam::pirls::dense_block_xtwx(design, fisher_w, Some(row_weights.view()))
+            .map_err(|err| py_value_error(err.to_string()))?;
+    add_block_diagonal_penalty(&mut hessian, penalty, lambda, n_outputs)
+        .map_err(py_value_error)?;
+    let rhs = gam::pirls::dense_block_xtwy(design, fisher_w, y, Some(row_weights.view()))
+        .map_err(|err| py_value_error(err.to_string()))?;
+    let beta_vec = solve_dense_block_system(&hessian, &rhs, "dense Fisher Gaussian")?;
+    let mut coefficients = Array2::<f64>::zeros((k, n_outputs));
+    for output in 0..n_outputs {
+        for col in 0..k {
+            coefficients[[col, output]] = beta_vec[output * k + col];
+        }
+    }
+    let fitted = design.dot(&coefficients);
+    let mut sigma2 = Array1::<f64>::zeros(n_outputs);
+    let mut objective = latent_prior_score;
+    for row in 0..n_obs {
+        for a in 0..n_outputs {
+            let ra = y[[row, a]] - fitted[[row, a]];
+            sigma2[a] += row_weights[row] * ra * ra;
+            for b in 0..n_outputs {
+                objective += 0.5
+                    * row_weights[row]
+                    * ra
+                    * fisher_w[[row, a, b]]
+                    * (y[[row, b]] - fitted[[row, b]]);
+            }
+        }
+    }
+    for output in 0..n_outputs {
+        sigma2[output] /= (n_obs.saturating_sub(k).max(1)) as f64;
+        let beta_col = coefficients.column(output);
+        let s_beta = penalty.dot(&beta_col);
+        objective += 0.5 * lambda * beta_col.dot(&s_beta);
+    }
+    let out = PyDict::new(py);
+    out.set_item("status", "ok")?;
+    out.set_item("lambda", lambda)?;
+    out.set_item("rho", lambda.ln())?;
+    out.set_item("reml_score", objective)?;
+    out.set_item("reml_grad_lambda", f64::NAN)?;
+    out.set_item("reml_hess_lambda", f64::NAN)?;
+    out.set_item("reml_grad_rho", f64::NAN)?;
+    out.set_item("reml_hess_rho", f64::NAN)?;
+    out.set_item("edf", (k * n_outputs) as f64)?;
+    out.set_item("coefficients", coefficients.into_pyarray(py))?;
+    out.set_item("fitted", fitted.into_pyarray(py))?;
+    out.set_item("sigma2", sigma2.into_pyarray(py))?;
+    out.set_item("cache_penalty_eigenvalues", Array1::<f64>::zeros(0).into_pyarray(py))?;
+    out.set_item("cache_eigenvectors", Array2::<f64>::zeros((0, 0)).into_pyarray(py))?;
+    out.set_item("cache_coefficient_basis", Array2::<f64>::zeros((0, 0)).into_pyarray(py))?;
+    out.set_item("cache_xtwx_fingerprint", 0_u64)?;
+    out.set_item("cache_penalty_fingerprint", 0_u64)?;
+    out.set_item("cache_logdet_xtwx", f64::NAN)?;
+    out.set_item("cache_logdet_penalty_positive", f64::NAN)?;
+    out.set_item("cache_penalty_rank", 0_usize)?;
+    out.set_item("cache_nullity", 0_usize)?;
+    Ok(out.unbind())
+}
+
+fn sigmoid_stable(eta: f64) -> f64 {
+    if eta >= 0.0 {
+        let e = (-eta).exp();
+        1.0 / (1.0 + e)
+    } else {
+        let e = eta.exp();
+        e / (1.0 + e)
+    }
+}
+
+fn softmax_with_baseline(eta_active: &[f64], out: &mut [f64]) {
+    let mut max_eta = 0.0_f64;
+    for &v in eta_active {
+        max_eta = max_eta.max(v);
+    }
+    let mut denom = (-max_eta).exp();
+    for (idx, &v) in eta_active.iter().enumerate() {
+        let e = (v - max_eta).exp();
+        out[idx] = e;
+        denom += e;
+    }
+    for v in out.iter_mut().take(eta_active.len()) {
+        *v /= denom;
+    }
+    out[eta_active.len()] = (-max_eta).exp() / denom;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dense_fisher_glm_fit_to_pydict<'py>(
+    py: Python<'py>,
+    design: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    fisher_w: Option<ArrayView3<'_, f64>>,
+    init_lambda: Option<f64>,
+    family_name: &str,
+    latent_prior_score: f64,
+) -> PyResult<Py<PyDict>> {
+    let n_obs = design.nrows();
+    let k = design.ncols();
+    let n_outputs = y.ncols();
+    if y.nrows() != n_obs || n_outputs == 0 {
+        return Err(py_value_error(format!(
+            "dense Fisher GLM response shape mismatch: X has {n_obs} rows, y is {}x{}",
+            y.nrows(),
+            y.ncols()
+        )));
+    }
+    if y.iter().any(|v| !v.is_finite()) {
+        return Err(py_value_error("dense Fisher GLM response must be finite"));
+    }
+    if let Some(fw) = fisher_w {
+        validate_dense_fisher_w(n_obs, n_outputs, fw).map_err(py_value_error)?;
+    }
+    let row_weights = latent_row_weights(n_obs, weights).map_err(py_value_error)?;
+    let lambda = init_lambda.unwrap_or(1.0);
+    if !(lambda.is_finite() && lambda > 0.0) {
+        return Err(py_value_error(format!(
+            "init_lambda must be finite and positive for dense Fisher GLM fit; got {lambda}"
+        )));
+    }
+    let normalized = family_name.to_ascii_lowercase().replace('_', "-");
+    let multinomial = matches!(
+        normalized.as_str(),
+        "multinomial" | "multinomial-logit" | "softmax" | "categorical-logit"
+    );
+    let binomial_multi = matches!(
+        normalized.as_str(),
+        "binomial" | "binomial-logit" | "logistic"
+    );
+    if multinomial && n_outputs < 2 {
+        return Err(py_value_error(
+            "multinomial-logit requires at least two response columns",
+        ));
+    }
+    if !(multinomial || binomial_multi) {
+        return Err(py_value_error(format!(
+            "dense multi-output GLM latent supports binomial-logit and multinomial-logit; got {family_name:?}"
+        )));
+    }
+
+    let active_outputs = if multinomial { n_outputs - 1 } else { n_outputs };
+    let mut coefficients_active = Array2::<f64>::zeros((k, active_outputs));
+    let mut fitted = Array2::<f64>::zeros((n_obs, n_outputs));
+    let mut h_blocks = Array3::<f64>::zeros((n_obs, active_outputs, active_outputs));
+    let mut gradient = Array1::<f64>::zeros(k * active_outputs);
+    let max_iter = 50usize;
+    let tol = 1.0e-7_f64;
+    let mut iterations = 0usize;
+    let mut converged = false;
+
+    for iter in 0..max_iter {
+        iterations = iter + 1;
+        gradient.fill(0.0);
+        h_blocks.fill(0.0);
+        if multinomial {
+            let mut eta = vec![0.0_f64; active_outputs];
+            let mut probs = vec![0.0_f64; n_outputs];
+            for row in 0..n_obs {
+                for a in 0..active_outputs {
+                    let mut v = 0.0_f64;
+                    for col in 0..k {
+                        v += design[[row, col]] * coefficients_active[[col, a]];
+                    }
+                    eta[a] = v;
+                }
+                softmax_with_baseline(&eta, &mut probs);
+                for a in 0..n_outputs {
+                    fitted[[row, a]] = probs[a];
+                }
+                for a in 0..active_outputs {
+                    let resid = probs[a] - y[[row, a]];
+                    for col in 0..k {
+                        gradient[a * k + col] += row_weights[row] * design[[row, col]] * resid;
+                    }
+                    for b in 0..active_outputs {
+                        h_blocks[[row, a, b]] = if let Some(fw) = fisher_w {
+                            fw[[row, a, b]]
+                        } else if a == b {
+                            probs[a] * (1.0 - probs[a])
+                        } else {
+                            -probs[a] * probs[b]
+                        };
+                    }
+                }
+            }
+        } else {
+            for row in 0..n_obs {
+                for a in 0..active_outputs {
+                    let mut eta = 0.0_f64;
+                    for col in 0..k {
+                        eta += design[[row, col]] * coefficients_active[[col, a]];
+                    }
+                    let mu = sigmoid_stable(eta);
+                    fitted[[row, a]] = mu;
+                    let resid = mu - y[[row, a]];
+                    for col in 0..k {
+                        gradient[a * k + col] += row_weights[row] * design[[row, col]] * resid;
+                    }
+                }
+                for a in 0..active_outputs {
+                    for b in 0..active_outputs {
+                        h_blocks[[row, a, b]] = if let Some(fw) = fisher_w {
+                            fw[[row, a, b]]
+                        } else if a == b {
+                            fitted[[row, a]] * (1.0 - fitted[[row, a]])
+                        } else {
+                            0.0
+                        };
+                    }
+                }
+            }
+        }
+        let mut hessian =
+            gam::pirls::dense_block_xtwx(design, h_blocks.view(), Some(row_weights.view()))
+                .map_err(|err| py_value_error(err.to_string()))?;
+        add_block_diagonal_penalty(&mut hessian, penalty, lambda, active_outputs)
+            .map_err(py_value_error)?;
+        for a in 0..active_outputs {
+            let beta_col = coefficients_active.column(a);
+            let s_beta = penalty.dot(&beta_col);
+            for col in 0..k {
+                gradient[a * k + col] += lambda * s_beta[col];
+            }
+        }
+        let rhs = gradient.mapv(|v| -v);
+        let delta = solve_dense_block_system(&hessian, &rhs, "dense Fisher GLM")
+            .map_err(py_value_error)?;
+        let mut step_norm = 0.0_f64;
+        for a in 0..active_outputs {
+            for col in 0..k {
+                let d = delta[a * k + col];
+                coefficients_active[[col, a]] += d;
+                step_norm += d * d;
+            }
+        }
+        if step_norm.sqrt() <= tol * (1.0 + coefficients_active.iter().map(|v| v * v).sum::<f64>().sqrt()) {
+            converged = true;
+            break;
+        }
+    }
+
+    let mut objective = latent_prior_score;
+    if multinomial {
+        for row in 0..n_obs {
+            for a in 0..n_outputs {
+                objective -= row_weights[row] * y[[row, a]] * fitted[[row, a]].max(1.0e-12).ln();
+            }
+        }
+    } else {
+        for row in 0..n_obs {
+            for a in 0..n_outputs {
+                let mu = fitted[[row, a]].clamp(1.0e-12, 1.0 - 1.0e-12);
+                objective -= row_weights[row]
+                    * (y[[row, a]] * mu.ln() + (1.0 - y[[row, a]]) * (1.0 - mu).ln());
+            }
+        }
+    }
+    for a in 0..active_outputs {
+        let beta_col = coefficients_active.column(a);
+        let s_beta = penalty.dot(&beta_col);
+        objective += 0.5 * lambda * beta_col.dot(&s_beta);
+    }
+    let mut coefficients = Array2::<f64>::zeros((k, n_outputs));
+    for a in 0..active_outputs {
+        for col in 0..k {
+            coefficients[[col, a]] = coefficients_active[[col, a]];
+        }
+    }
+    let out = PyDict::new(py);
+    out.set_item("status", if converged { "ok" } else { "not_converged" })?;
+    out.set_item("lambda", lambda)?;
+    out.set_item("rho", lambda.ln())?;
+    out.set_item("reml_score", objective)?;
+    out.set_item("reml_grad_lambda", f64::NAN)?;
+    out.set_item("reml_hess_lambda", f64::NAN)?;
+    out.set_item("reml_grad_rho", f64::NAN)?;
+    out.set_item("reml_hess_rho", f64::NAN)?;
+    out.set_item("edf", (k * active_outputs) as f64)?;
+    out.set_item("coefficients", coefficients.into_pyarray(py))?;
+    out.set_item("fitted", fitted.into_pyarray(py))?;
+    out.set_item("sigma2", Array1::ones(n_outputs).into_pyarray(py))?;
+    out.set_item("iterations", iterations)?;
+    out.set_item("cache_penalty_eigenvalues", Array1::<f64>::zeros(0).into_pyarray(py))?;
+    out.set_item("cache_eigenvectors", Array2::<f64>::zeros((0, 0)).into_pyarray(py))?;
+    out.set_item("cache_coefficient_basis", Array2::<f64>::zeros((0, 0)).into_pyarray(py))?;
+    out.set_item("cache_xtwx_fingerprint", 0_u64)?;
+    out.set_item("cache_penalty_fingerprint", 0_u64)?;
+    out.set_item("cache_logdet_xtwx", f64::NAN)?;
+    out.set_item("cache_logdet_penalty_positive", f64::NAN)?;
+    out.set_item("cache_penalty_rank", 0_usize)?;
+    out.set_item("cache_nullity", 0_usize)?;
+    Ok(out.unbind())
+}
+
 fn latent_augmented_hessian_factor(
     design: ArrayView2<'_, f64>,
     penalty: ArrayView2<'_, f64>,
@@ -3992,6 +4464,68 @@ fn gaussian_reml_fit_latent<'py>(
             )));
         }
     };
+    if let Some(fw) = fisher_w.as_ref() {
+        let fw_view = fw.as_array();
+        let n_outputs = y.as_array().ncols();
+        if fw_view.shape() == [n_obs, n_outputs, n_outputs] && n_outputs > 1 {
+            let (design, t_mat) = match latent_basis_kind(&basis_kind).map_err(py_value_error)? {
+                "duchon" => build_latent_duchon_design(
+                    t.as_array(),
+                    n_obs,
+                    latent_dim,
+                    centers.as_array(),
+                    m,
+                )
+                .map_err(py_value_error)?,
+                "bspline_tensor" => {
+                    let knots = tensor_knots_concat
+                        .as_ref()
+                        .map(|a| a.as_array())
+                        .ok_or_else(|| {
+                            py_value_error("tensor B-spline latent design requires knots_concat")
+                        })?;
+                    let offsets = tensor_knot_offsets.as_deref().ok_or_else(|| {
+                        py_value_error("tensor B-spline latent design requires knot_offsets")
+                    })?;
+                    let degrees = tensor_degrees.as_deref().ok_or_else(|| {
+                        py_value_error("tensor B-spline latent design requires degrees")
+                    })?;
+                    build_latent_tensor_bspline_design(
+                        t.as_array(),
+                        n_obs,
+                        latent_dim,
+                        knots,
+                        offsets,
+                        degrees,
+                    )
+                    .map_err(py_value_error)?
+                }
+                other => {
+                    return Err(py_value_error(format!(
+                        "gaussian_reml_fit_latent dense fisher supports 'duchon' and 'tensor_bspline'; got {other:?}"
+                    )));
+                }
+            };
+            let prior_score = latent_prior_score_for_t(
+                t_mat.view(),
+                aux_u.as_ref().map(|a| a.as_array()),
+                family,
+                aux_strength,
+                dim_selection_log_precision.as_ref().map(|a| a.as_array()),
+            )
+            .map_err(py_value_error)?;
+            return dense_fisher_gaussian_fit_to_pydict(
+                py,
+                design.view(),
+                y.as_array(),
+                penalty.as_array(),
+                weights.as_ref().map(|w| w.as_array()),
+                fw_view,
+                init_lambda,
+                prior_score,
+            );
+        }
+    }
     let effective_weights = latent_scalar_weights_with_fisher(
         n_obs,
         weights.as_ref().map(|w| w.as_array()),
@@ -4585,7 +5119,8 @@ fn glm_reml_fit_latent<'py>(
     aux_strength: Option<f64>,
     dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
 ) -> PyResult<Py<PyDict>> {
-    let family = latent_glm_family_from_str(&family).map_err(py_value_error)?;
+    let family_name = family.clone();
+    let family_normalized = family_name.to_ascii_lowercase().replace('_', "-");
     let aux_family = match aux_family.to_ascii_lowercase().as_str() {
         "ridge" => AuxPriorFamily::Ridge,
         "linear" => AuxPriorFamily::Linear,
@@ -4595,6 +5130,41 @@ fn glm_reml_fit_latent<'py>(
             )));
         }
     };
+    if y.as_array().ncols() > 1
+        || matches!(
+            family_normalized.as_str(),
+            "multinomial" | "multinomial-logit" | "softmax" | "categorical-logit"
+        )
+    {
+        let (design, t_mat) = build_latent_duchon_design(
+            t.as_array(),
+            n_obs,
+            latent_dim,
+            centers.as_array(),
+            m,
+        )
+        .map_err(py_value_error)?;
+        let prior_score = latent_prior_score_for_t(
+            t_mat.view(),
+            aux_u.as_ref().map(|a| a.as_array()),
+            aux_family,
+            aux_strength,
+            dim_selection_log_precision.as_ref().map(|a| a.as_array()),
+        )
+        .map_err(py_value_error)?;
+        return dense_fisher_glm_fit_to_pydict(
+            py,
+            design.view(),
+            y.as_array(),
+            penalty.as_array(),
+            weights.as_ref().map(|w| w.as_array()),
+            fisher_w.as_ref().map(|w| w.as_array()),
+            init_lambda,
+            &family_name,
+            prior_score,
+        );
+    }
+    let family = latent_glm_family_from_str(&family).map_err(py_value_error)?;
     let effective_weights = latent_scalar_weights_with_fisher(
         n_obs,
         weights.as_ref().map(|w| w.as_array()),

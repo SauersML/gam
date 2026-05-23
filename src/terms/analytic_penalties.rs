@@ -870,7 +870,7 @@ pub enum SparsityKind {
     Log { delta: f64 },
 }
 
-/// Sparsity penalty on a slice of β (SAE codes) or ψ (soft atom assignments).
+/// Sparsity penalty on a slice of β (SAE codes) or ext-coords (soft atom assignments).
 ///
 /// The smoothed-L¹ default `Σ_i sqrt(x_i² + ε²)` is the simplest analytic
 /// option. Its gradient is `x_i / sqrt(x_i² + ε²)` (a smooth sign function),
@@ -879,8 +879,8 @@ pub enum SparsityKind {
 /// regularizer.
 ///
 /// When to use: any time a parameter block carries a "this should be sparse"
-/// prior — SAE atom codes (β slice), soft-routing weights on a latent (ψ
-/// slice). For SAE codes specifically, smoothed-L¹ with REML-selected `ε`
+/// prior — SAE atom codes (β slice), soft-routing weights on a latent
+/// ext-coordinate slice. For SAE codes specifically, smoothed-L¹ with REML-selected `ε`
 /// gives the principled relaxation of the L¹ objective without giving up
 /// differentiability.
 #[derive(Debug, Clone)]
