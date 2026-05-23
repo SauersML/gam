@@ -2527,8 +2527,7 @@ impl OrthogonalityPenalty {
             return None;
         }
         let n_obs = target.len() / d;
-        let slice = target.as_slice()?;
-        ArrayView2::from_shape((n_obs, d), slice).ok()
+        target.into_shape_with_order((n_obs, d)).ok()
     }
 
     fn gram_minus_identity(t: ArrayView2<'_, f64>) -> Array2<f64> {
