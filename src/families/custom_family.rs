@@ -20419,7 +20419,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             custom_outer_nonconvergence_error(&outer_result, specs, &last_error_detail),
         ));
     }
-    let outer_grad_norm = outer_result.final_grad_norm_or_nan();
+    // Gradient-free outer optimizers (compass search) legitimately return
+    // `final_grad_norm: None`. The persistence validator rejects NaN, so
+    // substitute 0.0 — `outer_converged` is the authoritative convergence
+    // signal and is persisted alongside.
+    let outer_grad_norm = outer_result.final_grad_norm.unwrap_or(0.0);
     let rho_star = outer_result.rho;
     let outer_iters = outer_result.iterations;
     screening_cap.store(0, Ordering::Relaxed);
