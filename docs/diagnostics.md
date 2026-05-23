@@ -4,7 +4,7 @@ A fitted `Model` exposes five inspection methods:
 
 | Method | Returns | Contents |
 | --- | --- | --- |
-| `summary()` | `Summary` | Formula, family/link name, model class, deviance, REML/LAML score, iterations, per-coefficient table. |
+| `summary()` | `Summary` | Formula, family/link name, model class, deviance, REML/LAML score (in the `reml_score` field), per-coefficient table, smoothing parameters (`lambdas`), group metadata, and deployment extensions. |
 | `diagnose(data)` | `Diagnostics` | Observed values, predicted columns, residuals, and aggregate metrics. |
 | `check(data)` | `SchemaCheck` | Schema validation result with structured issues. |
 | `plot(data, x=, kind=)` | `matplotlib.axes.Axes` | Prediction / residual / observed-vs-predicted plot. |

@@ -72,8 +72,9 @@ probs = model.predict(test_df, return_type="dict")["mean"]
 
 - `family="bernoulli-marginal-slope"` selects the marginal-slope
   likelihood.
-- `link="probit"`: required. The Bernoulli marginal-slope kernel is
-  derived for the probit base link and rejects any other link choice,
+- `link="probit"`: optional. The Bernoulli marginal-slope family
+  defaults to probit when no link is supplied. The kernel is derived
+  for the probit base link and rejects any other link choice,
   including `flexible(...)`, `blended(...)`, `sas`, and `beta-logistic`.
 - `z_column="z"`: name of the conditional z-score column in both the
   training and prediction tables.

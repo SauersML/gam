@@ -109,7 +109,8 @@ until then, `mode="independent"` is the right answer at SAE scale.
 
 ## Non-Gaussian LAML
 
-The analytic backward currently supports Gaussian identity link only.
-For Binomial/Poisson/Gamma the forward works (via `fit_gam_with_heuristic_lambdas`)
-but the analytic backward needs the IRLS curvature derivative terms
-(`t = ℓ_ηηη`, `κ = ℓ_ηηηη`, c-vector per the math memo). Deferred.
+Non-Gaussian families are not currently wired in `gamfit.torch`. Only
+the Gaussian-identity closed-form REML primitives have forward and
+backward support. Non-Gaussian families (Binomial/Poisson/Gamma) and
+the corresponding analytic backward (IRLS curvature derivative terms
+`t = ℓ_ηηη`, `κ = ℓ_ηηηη`, c-vector per the math memo) are deferred.

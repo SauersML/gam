@@ -13,22 +13,27 @@ overridden via `family=`.
 | --- | --- | --- |
 | Binary `{0, 1}` | binomial | logit |
 | Continuous numeric | Gaussian | identity |
+| Non-negative integer with `link(type=log)` | Poisson | log |
+| Positive non-integer with `link(type=log)` | Gamma | log |
 | `Surv(entry, exit, event)` | survival | depends on `survival_likelihood` |
 
-For Poisson counts and Gamma positive-continuous data, set the link with
-`link(type=log)` and pass `family=`:
+When `link(type=log)` is set, Poisson vs Gamma is chosen automatically
+by whether the response is integer-valued — `family=` is optional:
 
 ```python
-gamfit.fit(df, "y ~ s(x) + link(type=log)", family="poisson")
-gamfit.fit(df, "y ~ s(x) + link(type=log)", family="gamma")
+gamfit.fit(df, "y ~ s(x) + link(type=log)")     # auto-routes Poisson/Gamma
+gamfit.fit(df, "y ~ s(x) + link(type=log)", family="poisson")  # explicit
 ```
 
 ## Setting family and link
 
-The `family=` kwarg accepts `"auto"`, `"gaussian"`, `"binomial-logit"`,
-`"binomial-probit"`, `"binomial-cloglog"`, `"latent-cloglog-binomial"`,
-`"poisson-log"`, `"gamma-log"`, `"royston-parmar"`, `"transformation-normal"`,
-and `"bernoulli-marginal-slope"`. The link can be set in the formula via
+The `family=` kwarg accepts `"gaussian"`, `"binomial"` (aliases
+`"binomial-logit"`, `"binomial-probit"`, `"binomial-cloglog"`),
+`"latent-cloglog-binomial"`, `"poisson"`, and `"gamma"`. Omitting
+`family=` triggers auto-detection. Survival, transformation-normal,
+and Bernoulli marginal-slope families are selected via `Surv(...)` or
+dedicated flags (`--transformation-normal`, `--z-column`/`--logslope-formula`),
+not via `family=`. The link can be set in the formula via
 `link(type=...)` or with the `link=` kwarg. If both are set, the formula
 specification takes precedence.
 
