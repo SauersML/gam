@@ -3053,6 +3053,12 @@ fn parse_latent_manifold(
             .and_then(JsonValue::as_str)
             .unwrap_or("euclidean");
         match kind.to_ascii_lowercase().as_str() {
+            "auto" => {
+                return Ok(LatentManifoldSpec {
+                    manifold: LatentManifold::Euclidean,
+                    auto: true,
+                });
+            }
             "interval" => {
                 let lo = obj
                     .get("lo")
