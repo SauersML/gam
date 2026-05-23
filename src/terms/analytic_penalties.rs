@@ -56,6 +56,10 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis};
 use std::sync::Arc;
 
+use crate::terms::basis::{
+    BasisError, DuchonNullspaceOrder, duchon_radial_first_derivative_nd,
+    duchon_radial_second_derivative_nd,
+};
 use crate::terms::latent_coord::LatentCoordValues;
 use crate::terms::penalty_op::PenaltyOp;
 use crate::terms::smooth::{BlockwisePenalty, PenaltyStructureHint};
@@ -234,6 +238,21 @@ pub enum WeightField {
     },
 }
 
+/// Radial Duchon decoder metadata used to materialize
+/// `∂J_n[i, a] / ∂t_{n, c}` from `φ'(r)` and `φ''(r)` on demand.
+///
+/// `radial_coefficients[k, i]` is the decoder coefficient that maps radial
+/// basis column `k` into output channel `i`. Polynomial-tail columns are not
+/// represented here; callers whose decoder contains a non-linear polynomial
+/// tail should provide `jacobian_second_cache` directly.
+#[derive(Debug, Clone)]
+pub struct IsometryDuchonRadialSource {
+    pub centers: Arc<Array2<f64>>,
+    pub radial_coefficients: Arc<Array2<f64>>,
+    pub length_scale: Option<f64>,
+    pub nullspace_order: DuchonNullspaceOrder,
+}
+
 impl std::fmt::Debug for WeightField {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -386,12 +405,14 @@ pub struct IsometryPenalty {
     pub jacobian_cache: Option<Arc<Array2<f64>>>,
     /// Optional cached per-row Jacobian *second derivative*
     /// `H_n ∈ ℝ^{p × d × d}`, flattened row-major as `(n_obs, p*d*d)`.
-    /// `H_n[i, a, c] = ∂J_n[i, a] / ∂t_{n, c}`. When present, `grad_target`
-    /// returns the exact closed-form gradient. When absent, `grad_target`
-    /// falls back to the Gauss-Newton surrogate `H · t` consistent with the
-    /// IFT-warm-started inner Newton step (good enough for the implicit
-    /// gradient pass; the explicit gradient uses the cache when available).
+    /// `H_n[i, a, c] = ∂J_n[i, a] / ∂t_{n, c}`. Either this cache or
+    /// `duchon_radial_source` must be present for exact isometry
+    /// gradient/HVP calls.
     pub jacobian_second_cache: Option<Arc<Array2<f64>>>,
+    /// Optional radial-Duchon source used to build `jacobian_second_cache`
+    /// analytically from `φ'(r)` and the public `φ''(r)` jet helper. This is
+    /// the exact chain-rule path for callers that do not pre-cache `∂J/∂t`.
+    pub duchon_radial_source: Option<Arc<IsometryDuchonRadialSource>>,
     /// Output dimensionality `p` (column count of each per-row Jacobian).
     pub p_out: usize,
     /// Per-row behavioral metric in low-rank factored form. Defaults to
@@ -410,6 +431,7 @@ impl IsometryPenalty {
             rho_index: 0,
             jacobian_cache: None,
             jacobian_second_cache: None,
+            duchon_radial_source: None,
             p_out,
             weight: WeightField::Identity,
         }
@@ -427,6 +449,20 @@ impl IsometryPenalty {
 
     pub fn with_jacobian_second_cache(mut self, h: Arc<Array2<f64>>) -> Self {
         self.jacobian_second_cache = Some(h);
+        self
+    }
+
+    /// Attach radial Duchon decoder metadata so the exact `∂J/∂t` tensor can
+    /// be rebuilt from the current target coordinates. A doc-test oracle for
+    /// this path is: build `J(t)` from `duchon_radial_first_derivative_nd`,
+    /// evaluate `grad_target(t)`, then central-difference `value(t ± h e_j)`;
+    /// the analytic component should agree to finite-difference tolerance as
+    /// `h` is refined before cancellation dominates.
+    pub fn with_duchon_radial_source(
+        mut self,
+        source: Arc<IsometryDuchonRadialSource>,
+    ) -> Self {
+        self.duchon_radial_source = Some(source);
         self
     }
 
@@ -472,6 +508,129 @@ impl IsometryPenalty {
                 WeightField::project_jac_row_with_u(u_slice, jac_slice, *p_out, *rank, d)
             }
         }
+    }
+
+    /// Form `W_n J_n` without materializing `W_n`.
+    fn weighted_jacobian_row(&self, n: usize, d: usize) -> Array2<f64> {
+        let jac = self
+            .jacobian_cache
+            .as_ref()
+            .expect("isometry penalty requires a live jacobian cache");
+        let p = self.p_out;
+        match &self.weight {
+            WeightField::Identity => {
+                let mut out = Array2::<f64>::zeros((p, d));
+                for i in 0..p {
+                    for a in 0..d {
+                        out[[i, a]] = jac[[n, i * d + a]];
+                    }
+                }
+                out
+            }
+            WeightField::Factored { u, rank, p_out } => {
+                debug_assert_eq!(p, *p_out);
+                let r = *rank;
+                let m_n = self.projected_jacobian_row(n, d);
+                let mut out = Array2::<f64>::zeros((p, d));
+                for i in 0..p {
+                    for a in 0..d {
+                        let mut s = 0.0;
+                        for k in 0..r {
+                            s += u[[n, i * r + k]] * m_n[[k, a]];
+                        }
+                        out[[i, a]] = s;
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    fn target_matrix(target: ArrayView1<'_, f64>, n_obs: usize, d: usize) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((n_obs, d));
+        for n in 0..n_obs {
+            for a in 0..d {
+                out[[n, a]] = target[n * d + a];
+            }
+        }
+        out
+    }
+
+    fn duchon_radial_jacobian_second(
+        &self,
+        target: ArrayView1<'_, f64>,
+        n_obs: usize,
+        d: usize,
+        source: &IsometryDuchonRadialSource,
+    ) -> Result<Array2<f64>, BasisError> {
+        let t = Self::target_matrix(target, n_obs, d);
+        let phi_r = duchon_radial_first_derivative_nd(
+            t.view(),
+            source.centers.view(),
+            source.length_scale,
+            source.nullspace_order,
+        )?;
+        let phi_rr = duchon_radial_second_derivative_nd(
+            t.view(),
+            source.centers.view(),
+            source.length_scale,
+            source.nullspace_order,
+        )?;
+        let n_centers = source.centers.nrows();
+        debug_assert_eq!(source.centers.ncols(), d);
+        debug_assert_eq!(source.radial_coefficients.nrows(), n_centers);
+        debug_assert_eq!(source.radial_coefficients.ncols(), self.p_out);
+
+        let mut out = Array2::<f64>::zeros((n_obs, self.p_out * d * d));
+        for n in 0..n_obs {
+            for k in 0..n_centers {
+                let mut r2 = 0.0_f64;
+                for a in 0..d {
+                    let delta = t[[n, a]] - source.centers[[k, a]];
+                    r2 += delta * delta;
+                }
+                let r = r2.sqrt();
+                for a in 0..d {
+                    for c in 0..d {
+                        let basis_hess = if r == 0.0 {
+                            if a == c { phi_rr[[n, k]] } else { 0.0 }
+                        } else {
+                            let inv_r = 1.0 / r;
+                            let u_a = (t[[n, a]] - source.centers[[k, a]]) * inv_r;
+                            let u_c = (t[[n, c]] - source.centers[[k, c]]) * inv_r;
+                            let q = phi_r[[n, k]] * inv_r;
+                            let eye = if a == c { 1.0 } else { 0.0 };
+                            q * eye + (phi_rr[[n, k]] - q) * u_a * u_c
+                        };
+                        if basis_hess == 0.0 {
+                            continue;
+                        }
+                        for i in 0..self.p_out {
+                            out[[n, (i * d + a) * d + c]] +=
+                                source.radial_coefficients[[k, i]] * basis_hess;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn jacobian_second(
+        &self,
+        target: ArrayView1<'_, f64>,
+        n_obs: usize,
+        d: usize,
+    ) -> Array2<f64> {
+        if let Some(jac2) = self.jacobian_second_cache.as_ref() {
+            return jac2.as_ref().clone();
+        }
+        let source = self.duchon_radial_source.as_ref().expect(
+            "exact isometry gradient/HVP requires jacobian_second_cache \
+             or duchon_radial_source",
+        );
+        self.duchon_radial_jacobian_second(target, n_obs, d, source)
+            .expect("failed to materialize Duchon radial second derivative for isometry")
     }
 
     /// Per-row pullback metric `g_n = J_n^T W_n J_n = M_n^T M_n` with
@@ -558,25 +717,18 @@ impl AnalyticPenalty for IsometryPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        // Exact closed-form gradient, W-aware (chain rule conventions
-        // documented at the top of `IsometryPenalty`):
+        // Exact closed-form gradient, W-aware:
         //
         //   P     = ½ μ Σ_n ‖D_n‖²_F,   D_n = g_n − g^ref_n
         //   g_n   = J_n^T W_n J_n,      W_n = U_n U_n^T
         //   ∂g_{ab}/∂t_c
         //         = (H_{:,a,c})^T (W J)_{:,b}  +  (J_{:,a})^T W H_{:,b,c}
         //   ∂P/∂t_c
-        //         = 2 μ Σ_{a,b} D_{a,b} · (H_{:,a,c})^T (W J)_{:,b}     (D = D^T)
+        //         = μ Σ_{a,b} D_{a,b} · ∂g_{ab}/∂t_c
         //
-        // where `(W J)_{:,b} = U M_{:,b}` with `M = U^T J ∈ ℝ^{r × d}` —
-        // i.e. the `p × p` `W_n` is never materialized: we form `M_n`
-        // (O(p r d)) and then `WJ_n = U_n M_n` (O(p r d)) per row.
-        //
-        // When the second-derivative cache is unavailable we fall back to
-        // the Gauss-Newton surrogate `H · t` (also W-aware: `H = 2μ J^T W J`,
-        // which keeps the IFT inner loop well-conditioned; the dropped term
-        // vanishes at the local minimum so this is also the principled
-        // REML-pass surrogate).
+        // `H = ∂J/∂t` comes either from the live cache or from the radial
+        // Duchon `φ''(r)` helper. The sign is positive: differentiating
+        // `t - c` with respect to `t` contributes `+I`.
         let d = self
             .target
             .latent_dim
@@ -584,79 +736,28 @@ impl AnalyticPenalty for IsometryPenalty {
         let n_obs = target.len() / d;
         let g = self.pullback_metric(d);
         let g_ref = self.reference_metric(n_obs, d);
-        let jac = self
-            .jacobian_cache
-            .as_ref()
-            .expect("isometry penalty requires a live jacobian cache");
         let p = self.p_out;
         let mu = rho[self.rho_index].exp();
         let mut grad = Array1::<f64>::zeros(target.len());
+        let jac2 = self.jacobian_second(target, n_obs, d);
+        debug_assert_eq!(jac2.ncols(), p * d * d);
 
-        if let Some(jac2) = self.jacobian_second_cache.as_ref() {
-            debug_assert_eq!(jac2.ncols(), p * d * d);
-            for n in 0..n_obs {
-                // Form WJ_n via the low-rank factor: M_n = U_n^T J_n (r × d),
-                // then WJ_n = U_n M_n (p × d). For Identity weight WJ_n = J_n.
-                let wj = match &self.weight {
-                    WeightField::Identity => {
-                        let mut m = Array2::<f64>::zeros((p, d));
-                        for i in 0..p {
-                            for a in 0..d {
-                                m[[i, a]] = jac[[n, i * d + a]];
-                            }
-                        }
-                        m
-                    }
-                    WeightField::Factored { u, rank, p_out } => {
-                        let m_n = self.projected_jacobian_row(n, d);
-                        let r = *rank;
-                        debug_assert_eq!(p, *p_out);
-                        let mut wj = Array2::<f64>::zeros((p, d));
-                        for i in 0..p {
-                            for a in 0..d {
-                                let mut s = 0.0;
-                                for k in 0..r {
-                                    s += u[[n, i * r + k]] * m_n[[k, a]];
-                                }
-                                wj[[i, a]] = s;
-                            }
-                        }
-                        wj
-                    }
-                };
-                for c in 0..d {
-                    let mut acc = 0.0;
-                    for a in 0..d {
-                        for b in 0..d {
-                            let diff = g[[n, a * d + b]] - g_ref[[n, a * d + b]];
-                            let mut hwj = 0.0;
-                            for i in 0..p {
-                                hwj += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
-                            }
-                            acc += diff * hwj;
-                        }
-                    }
-                    grad[n * d + c] = 2.0 * mu * acc;
-                }
-            }
-        } else {
-            // Gauss-Newton surrogate: H_n · t_n with H_n = 2 μ J_n^T W_n J_n
-            // = 2 μ M_n^T M_n. M_n is the projected r × d block; this keeps
-            // the path strictly low-rank.
-            for n in 0..n_obs {
-                let m = self.projected_jacobian_row(n, d);
-                let r = m.nrows();
+        for n in 0..n_obs {
+            let wj = self.weighted_jacobian_row(n, d);
+            for c in 0..d {
+                let mut acc = 0.0;
                 for a in 0..d {
-                    let mut acc = 0.0;
                     for b in 0..d {
-                        let mut gab = 0.0;
-                        for k in 0..r {
-                            gab += m[[k, a]] * m[[k, b]];
+                        let diff = g[[n, a * d + b]] - g_ref[[n, a * d + b]];
+                        let mut dg = 0.0;
+                        for i in 0..p {
+                            dg += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
+                            dg += wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
                         }
-                        acc += gab * target[n * d + b];
+                        acc += diff * dg;
                     }
-                    grad[n * d + a] = 2.0 * mu * acc;
                 }
+                grad[n * d + c] = mu * acc;
             }
         }
         grad
@@ -664,54 +765,58 @@ impl AnalyticPenalty for IsometryPenalty {
 
     fn hvp(
         &self,
-        _target: ArrayView1<'_, f64>,
+        target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        // Gauss-Newton approximation (W-aware):
-        //   H ≈ 2 μ · J^T W J = 2 μ · M^T M,    M = U^T J ∈ ℝ^{r × d}.
-        //
-        // For each row n we (1) form M_n (r × d), (2) compute u = M_n v_n
-        // (length r), (3) write out_n = 2 μ · M_n^T u (length d). Cost per
-        // row: O(p · r · d + r · d). The dominant term keeps the IFT
-        // well-conditioned; the dropped exact term is `O(D_n)` which
-        // vanishes at the local minimum.
-        //
-        // Cross-check with proposals/per_point_hessian.md once it lands: the
-        // Hessian contribution ∂²P_iso/∂t² is dominated by this 2 μ M^T M
-        // block, plus a curvature-of-J term that is the same `H · t` form
-        // appearing in `grad_target`'s exact path (and zero at convergence
-        // for the data-fit residual).
+        // Metric-residual Gauss-Newton HVP:
+        //   Hv = μ A^T A v,  A_c = ∂vec(g)/∂t_c.
+        // This is the HVP analogue of the exact gradient path above: `A`
+        // includes `∂J/∂t` via the radial `φ''(r)` jet. The residual-curvature
+        // term `Σ_ab D_ab ∂²g_ab/∂t∂t` would require third input derivatives
+        // of the decoder and is intentionally not part of this GN operator.
         let mu = rho[self.rho_index].exp();
         let d = self
             .target
             .latent_dim
             .expect("IsometryPenalty requires latent_dim on its PsiSlice");
-        let jac = self
-            .jacobian_cache
-            .as_ref()
-            .expect("isometry penalty requires a live jacobian cache");
-        let n_obs = jac.nrows();
+        let n_obs = target.len() / d;
+        let p = self.p_out;
+        let jac2 = self.jacobian_second(target, n_obs, d);
         let mut out = Array1::<f64>::zeros(v.len());
+
         for n in 0..n_obs {
-            let m = self.projected_jacobian_row(n, d);
-            let r = m.nrows();
-            // u = M_n v_n  (r-vector).
-            let mut u = vec![0.0_f64; r];
-            for k in 0..r {
-                let mut s = 0.0;
-                for b in 0..d {
-                    s += m[[k, b]] * v[n * d + b];
-                }
-                u[k] = s;
-            }
-            // out_n = 2 μ · M_n^T u  (d-vector).
+            let wj = self.weighted_jacobian_row(n, d);
+            let mut delta_g = Array2::<f64>::zeros((d, d));
             for a in 0..d {
-                let mut s = 0.0;
-                for k in 0..r {
-                    s += m[[k, a]] * u[k];
+                for b in 0..d {
+                    let mut s = 0.0;
+                    for c in 0..d {
+                        let vc = v[n * d + c];
+                        if vc == 0.0 {
+                            continue;
+                        }
+                        for i in 0..p {
+                            s += vc * jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
+                            s += vc * wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
+                        }
+                    }
+                    delta_g[[a, b]] = s;
                 }
-                out[n * d + a] = 2.0 * mu * s;
+            }
+            for c in 0..d {
+                let mut acc = 0.0;
+                for a in 0..d {
+                    for b in 0..d {
+                        let mut dg_c = 0.0;
+                        for i in 0..p {
+                            dg_c += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
+                            dg_c += wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
+                        }
+                        acc += dg_c * delta_g[[a, b]];
+                    }
+                }
+                out[n * d + c] = mu * acc;
             }
         }
         out
@@ -1226,33 +1331,35 @@ impl AnalyticPenaltyKind {
         }
     }
 
+    pub fn hessian_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        match self {
+            AnalyticPenaltyKind::Isometry(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::Sparsity(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::Ard(p) => p.hessian_diag(target, rho),
+        }
+    }
+
     pub fn hvp(
         &self,
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
+        if let Some(diag) = self.hessian_diag(target, rho) {
+            let mut out = Array1::<f64>::zeros(v.len());
+            for i in 0..v.len() {
+                out[i] = diag[i] * v[i];
+            }
+            return out;
+        }
         match self {
             AnalyticPenaltyKind::Isometry(p) => p.hvp(target, rho, v),
-            AnalyticPenaltyKind::Sparsity(p) => {
-                if let Some(diag) = p.hessian_diag(target, rho) {
-                    let mut out = Array1::<f64>::zeros(v.len());
-                    for i in 0..v.len() {
-                        out[i] = diag[i] * v[i];
-                    }
-                    out
-                } else {
-                    p.hvp(target, rho, v)
-                }
-            }
-            AnalyticPenaltyKind::Ard(p) => {
-                let diag = p.hessian_diag(target, rho).expect("ARD diag");
-                let mut out = Array1::<f64>::zeros(v.len());
-                for i in 0..v.len() {
-                    out[i] = diag[i] * v[i];
-                }
-                out
-            }
+            AnalyticPenaltyKind::Sparsity(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::Ard(p) => p.hvp(target, rho, v),
         }
     }
 }
