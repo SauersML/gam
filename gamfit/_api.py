@@ -2445,6 +2445,7 @@ def glm_reml_fit_latent(
     *,
     tweedie_p: float = 1.5,
     negbin_theta: float | None = None,
+    beta_phi: float | None = None,
     m: int = 2,
     weights: Any | None = None,
     fisher_w: Any | None = None,
@@ -2459,7 +2460,7 @@ def glm_reml_fit_latent(
 
     ``family`` accepts ``"binomial-logit"``, ``"binomial-probit"``,
     ``"binomial-cloglog"``, ``"poisson-log"``, ``"tweedie-log"``,
-    ``"negbin-log"``, ``"gamma-log"``, and ``"gaussian-identity"``.
+    ``"negbin-log"``, ``"beta-regression-logit"``, ``"gamma-log"``, and ``"gaussian-identity"``.
     ``tweedie_p`` defaults to ``1.5``. ``fisher_w`` is an advanced internal
     hook; this scalar-response entry point currently accepts blocks with shape
     ``(N,1,1)``.
@@ -2474,11 +2475,22 @@ def glm_reml_fit_latent(
         "negative-binomial",
         "negative-binomial-log",
     }
+    is_beta = family_normalized in {
+        "beta",
+        "beta-logit",
+        "beta-regression",
+        "beta-regression-logit",
+    }
     if is_negbin and negbin_theta is None:
         raise ValueError("negbin_theta must be provided when family='negbin'")
     theta = 1.0 if negbin_theta is None else float(negbin_theta)
     if is_negbin and not (np.isfinite(theta) and theta > 0.0):
         raise ValueError(f"negbin_theta must be finite and > 0; got {theta!r}")
+    if is_beta and beta_phi is None:
+        raise ValueError("beta_phi must be provided when family='beta'")
+    phi = 1.0 if beta_phi is None else float(beta_phi)
+    if is_beta and not (np.isfinite(phi) and phi > 0.0):
+        raise ValueError(f"beta_phi must be finite and > 0; got {phi!r}")
     try:
         out = rust.glm_reml_fit_latent(
             _numeric_vector(t, "t"),
@@ -2490,6 +2502,7 @@ def glm_reml_fit_latent(
             str(family),
             float(tweedie_p),
             theta,
+            phi,
             int(m),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if fisher_w is None else np.asarray(fisher_w, dtype=float),

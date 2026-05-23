@@ -7354,6 +7354,7 @@ fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodFamily) -> O
     match family {
         LikelihoodFamily::Tweedie { p } => Some(p),
         LikelihoodFamily::NegativeBinomial { theta } => Some(theta),
+        LikelihoodFamily::BetaLogit { phi } => Some(phi),
         LikelihoodFamily::GammaLog => fit
             .likelihood_scale
             .gamma_shape()
@@ -8437,6 +8438,7 @@ fn build_model_summary(
         LikelihoodFamily::PoissonLog
         | LikelihoodFamily::Tweedie { .. }
         | LikelihoodFamily::NegativeBinomial { .. }
+        | LikelihoodFamily::BetaLogit { .. }
         | LikelihoodFamily::GammaLog => {
             let wsum = weights.iter().copied().sum::<f64>().max(1e-12);
             let mean = y
@@ -8447,6 +8449,8 @@ fn build_model_summary(
                 / wsum;
             let baseline = if family == LikelihoodFamily::PoissonLog {
                 mean.max(0.0)
+            } else if matches!(family, LikelihoodFamily::BetaLogit { .. }) {
+                mean.clamp(1e-10, 1.0 - 1e-10)
             } else {
                 mean.max(1e-12)
             };

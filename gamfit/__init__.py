@@ -89,6 +89,7 @@ from .topology import (
 from .select_topology import (
     BasisSpec,
     ScoreKind,
+    ScoreScale,
     SelectTopologyResult,
     select_topology,
 )
@@ -208,6 +209,7 @@ __all__ = [
     "TotalVariationPenalty",
     "Summary",
     "ScoreKind",
+    "ScoreScale",
     "SelectTopologyResult",
     "SurvivalPrediction",
     "TermBlock",

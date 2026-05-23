@@ -5268,6 +5268,9 @@ impl UnifiedFitResult {
             | crate::types::LikelihoodFamily::GammaLog => {
                 Ok(FittedLinkState::Standard(Some(LinkFunction::Log)))
             }
+            crate::types::LikelihoodFamily::BetaLogit { .. } => {
+                Ok(FittedLinkState::Standard(Some(LinkFunction::Logit)))
+            }
             crate::types::LikelihoodFamily::RoystonParmar => Ok(FittedLinkState::Standard(None)),
         }
     }
