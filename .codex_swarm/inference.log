@@ -17678,3 +17678,168 @@ exec
   3661	            NutsFamily::BinomialLogit => {
   3662	                let mut ll_acc = 0.0;
 
+exec
+/bin/zsh -lc "rg -n \"fn sigmoid\\(|pub fn sigmoid|component_point_jet|cloglog_point_jet|latent_cloglog_kernel_terms\" src/inference/quadrature.rs" in /Users/user/gam
+ succeeded in 0ms:
+922:    let (mean0, d1, d2, d3) = component_point_jet(LinkComponent::Logit, mu);
+1172:        let (p, d1, _, _) = component_point_jet(LinkComponent::Logit, x);
+2468:            // Gauss-Hermite nodes evaluate component_point_jet, so mean/d1
+2472:                component_point_jet(LinkComponent::Logit, x)
+2526:        let (mean, d1, d2, d3) = component_point_jet(LinkComponent::Logit, mu);
+2536:        component_point_jet(LinkComponent::Logit, x)
+2603:fn component_point_jet(component: LinkComponent, x: f64) -> (f64, f64, f64, f64) {
+2628:                component_point_jet(component, x)
+3174:        component_point_jet(LinkComponent::Logit, x)
+3198:        let (mean, d1, d2, d3, d4, d5) = cloglog_point_jet5(mu);
+3205:    let (k, log_k0, mode) = latent_cloglog_kernel_terms(ctx, mu, sigma, max_order);
+3263:fn latent_cloglog_kernel_terms(
+3894:fn sigmoid(x: f64) -> f64 {
+3943:pub(crate) fn cloglog_point_jet5(t: f64) -> (f64, f64, f64, f64, f64, f64) {
+3975:    let (g, g1, g2, g3, g4, _) = cloglog_point_jet5(t);
+4823:            let (p, _, _, _) = component_point_jet(LinkComponent::Logit, eta);
+4828:            let (_, p1, _, _) = component_point_jet(LinkComponent::Logit, eta);
+4833:            let (_, _, p2, _) = component_point_jet(LinkComponent::Logit, eta);
+4838:            let (_, _, _, p3) = component_point_jet(LinkComponent::Logit, eta);
+4900:        let logit = component_point_jet(LinkComponent::Logit, -710.0);
+4911:        let cloglog = component_point_jet(LinkComponent::CLogLog, eta);
+
+exec
+/bin/zsh -lc "sed -n '2588,2645p' src/inference/quadrature.rs && sed -n '3888,3965p' src/inference/quadrature.rs" in /Users/user/gam
+ succeeded in 0ms:
+    mean_abs_tol: f64,
+    mean_rel_tol: f64,
+    deriv_abs_tol: f64,
+    deriv_rel_tol: f64,
+) -> bool {
+    integrated_scalar_drift_exceeds(candidate.mean, reference.mean, mean_abs_tol, mean_rel_tol)
+        || integrated_scalar_drift_exceeds(
+            candidate.dmean_dmu,
+            reference.dmean_dmu,
+            deriv_abs_tol,
+            deriv_rel_tol,
+        )
+}
+
+#[inline]
+fn component_point_jet(component: LinkComponent, x: f64) -> (f64, f64, f64, f64) {
+    // Keep the point-mass quadrature kernels wired to the same inverse-link
+    // implementation used by mixture links and survival residual distributions.
+    let jet = component_inverse_link_jet(component, x);
+    (jet.mu, jet.d1, jet.d2, jet.d3)
+}
+
+#[inline]
+fn integrated_mixture_component_jet(
+    ctx: &QuadratureContext,
+    component: LinkComponent,
+    mu: f64,
+    sigma: f64,
+) -> IntegratedInverseLinkJet {
+    // Use the same controlled backends (exact/asymptotic/special-function)
+    // as integrated_inverse_link_jet so that the same (mu, sigma) always
+    // produces identical d2, d3 regardless of whether it enters as a
+    // standalone link or as a mixture component.
+    match component {
+        LinkComponent::Logit => integrated_inverse_link_jet(ctx, LinkFunction::Logit, mu, sigma)
+            .unwrap_or_else(|_| integrated_logit_jet_ghq(ctx, mu, sigma)),
+        LinkComponent::Probit => integrated_probit_jet(mu, sigma),
+        LinkComponent::CLogLog => integrated_cloglog_inverse_link_jet_controlled(ctx, mu, sigma),
+        LinkComponent::LogLog | LinkComponent::Cauchit => {
+            let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| {
+                component_point_jet(component, x)
+            });
+            IntegratedInverseLinkJet {
+                mean,
+                d1: d1.max(0.0),
+                d2,
+                d3,
+                mode: if sigma <= 1e-10 {
+                    IntegratedExpectationMode::ExactClosedForm
+                } else {
+                    IntegratedExpectationMode::QuadratureFallback
+                },
+            }
+        }
+    }
+}
+
+#[inline]
+        im: s_im * scale,
+    }
+}
+
+/// Standard sigmoid function with numerical stability.
+#[inline]
+fn sigmoid(x: f64) -> f64 {
+    let x_clamped = x.clamp(-700.0, 700.0);
+    1.0 / (1.0 + f64::exp(-x_clamped))
+}
+
+// CLogLog Gaussian convolution via differentiated Gauss-Hermite quadrature
+//
+// For location-scale (GAMLSS) models with CLogLog link we need to evaluate
+//   L(μ,σ) = E[g(μ + σZ)],  Z ~ N(0,1),  g(η) = 1 - exp(-exp(η)),
+// together with all partial derivatives up to fourth order w.r.t. μ and σ.
+//
+// GHQ gives
+//   L(μ,σ) ≈ (1/√π) Σ_m ω_m g(t_m),   t_m = μ + √2 σ x_m
+//
+// and by the chain rule (exact for the quadrature rule since t_m is affine
+// in μ and σ):
+//   ∂^a_μ ∂^b_σ L ≈ (√2)^b / √π  Σ_m ω_m x_m^b g^{(a+b)}(t_m)
+
+/// All partial derivatives of `L(μ,σ) = E[g(μ + σZ)]` up to fourth order,
+/// where `g` is the CLogLog inverse link and `Z ~ N(0,1)`.
+#[derive(Clone, Copy, Debug)]
+pub struct CLogLogConvolutionDerivatives {
+    // 0th order
+    pub l: f64,
+
+    // 1st order
+    pub l_mu: f64,
+    pub l_sigma: f64,
+
+    // 2nd order
+    pub l_mumu: f64,
+    pub l_musigma: f64,
+    pub l_sigmasigma: f64,
+
+    // 3rd order
+    pub l_mumumu: f64,
+    pub l_mumusigma: f64,
+    pub l_musigmasigma: f64,
+    pub l_sigmasigmasigma: f64,
+
+    // 4th order
+    pub l_mumumumu: f64,
+    pub l_mumumusigma: f64,
+    pub l_mumusigmasigma: f64,
+    pub l_musigmasigmasigma: f64,
+    pub l_sigmasigmasigmasigma: f64,
+}
+
+#[inline]
+pub(crate) fn cloglog_point_jet5(t: f64) -> (f64, f64, f64, f64, f64, f64) {
+    if t.is_nan() {
+        return (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+    }
+    let et = t.exp();
+    if !et.is_finite() {
+        return (1.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    (
+        -(-et).exp_m1(),
+        cloglog_stable_poly_times_exp_neg(et, &[0.0, 1.0]),
+        cloglog_stable_poly_times_exp_neg(et, &[0.0, 1.0, -1.0]),
+        cloglog_stable_poly_times_exp_neg(et, &[0.0, 1.0, -3.0, 1.0]),
+        cloglog_stable_poly_times_exp_neg(et, &[0.0, 1.0, -7.0, 6.0, -1.0]),
+        cloglog_stable_poly_times_exp_neg(et, &[0.0, 1.0, -15.0, 25.0, -10.0, 1.0]),
+    )
+}
+
+/// CLogLog inverse link `g(t) = 1 - exp(-exp(t))` and its first four
+/// derivatives, evaluated in a numerically stable way.
+///
+/// All derivatives share the common factor `h(t) = exp(t - exp(t))`:
+
