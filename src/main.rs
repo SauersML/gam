@@ -17,7 +17,7 @@ use gam::families::bernoulli_marginal_slope::{
     LatentZPolicy,
 };
 use gam::families::cubic_cell_kernel as exact_kernel;
-use gam::families::family_meta::inverse_link_to_binomial_family;
+use gam::families::family_meta::inverse_link_to_binomial_spec;
 use gam::families::latent_survival::latent_hazard_loading;
 use gam::families::scale_design::{
     ScaleDeviationTransform, build_scale_deviation_operator,
@@ -1789,7 +1789,7 @@ fn run_fit_bernoulli_marginal_slope(
             solved.link_dev_runtime.as_ref(),
             base_link,
             save_frailty,
-        );
+        )?;
         model.offset_column = args.offset_column.clone();
         model.noise_offset_column = args.noise_offset_column.clone();
         write_model_json(out, &model)?;
@@ -2301,8 +2301,17 @@ fn run_fitwith_predict_noise(
         );
         model.offset_column = args.offset_column.clone();
         model.noise_offset_column = args.noise_offset_column.clone();
+        let location_scale_likelihood_spec =
+            inverse_link_to_binomial_spec(&location_scale_link_kind).map_err(|e| e.to_string())?;
+        let location_scale_likelihood = LikelihoodFamily::try_from(location_scale_likelihood_spec)
+            .map_err(|e| {
+                format!(
+                    "failed to resolve LikelihoodFamily for binomial location-scale link {:?}: {e}",
+                    location_scale_link_kind
+                )
+            })?;
         model.family_state = FittedFamily::LocationScale {
-            likelihood: inverse_link_to_binomial_family(&location_scale_link_kind),
+            likelihood: location_scale_likelihood,
             base_link: Some(location_scale_link_kind.clone()),
         };
         if let Some((knots, degree, beta_link_wiggle)) = wiggle_meta {
@@ -2347,6 +2356,28 @@ fn effective_predict_offset_columns<'a>(
         args.noise_offset_column
             .as_deref()
             .or(model.noise_offset_column.as_deref()),
+    )
+}
+
+/// Resolve `(mean_offset, noise_offset)` for the report path.
+///
+/// Centralises the lookup of the saved offset/noise-offset column names and
+/// delegates to [`resolve_predict_offsets`] so the report's Gaussian R²,
+/// residuals, binary calibration, QQ plot, and ALO can never silently drop
+/// the offset. Use at every site in the report path that previously hardcoded
+/// `Array1::<f64>::zeros(...)` as the offset.
+fn report_offset_for(
+    model: &SavedModel,
+    data: &Dataset,
+    col_map: &HashMap<String, usize>,
+) -> Result<(Array1<f64>, Array1<f64>), String> {
+    let (saved_offset_column, saved_noise_offset_column) = saved_offset_columns(model);
+    resolve_predict_offsets(
+        model,
+        data,
+        col_map,
+        saved_offset_column,
+        saved_noise_offset_column,
     )
 }
 
@@ -6389,7 +6420,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                     .map_err(|e| format!("failed to build design for report diagnostics: {e}"))?;
                 progress.advance_workflow(3);
 
-                let offset = Array1::<f64>::zeros(ds.values.nrows());
+                let (offset, _report_noise_offset) = report_offset_for(&model, &ds, &col_map)?;
                 let pred = predict_gam(
                     design.design.clone(),
                     fit.beta.view(),
@@ -6503,7 +6534,8 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                 {
                     let alo_result = if let Some(unified) = model.unified() {
                         let eta = design.design.dot(&fit.beta);
-                        let report_offset = Array1::<f64>::zeros(design.design.nrows());
+                        let (report_offset, _report_noise_offset) =
+                            report_offset_for(&model, &ds, &col_map)?;
                         let dense_alo_design = design.design.to_dense();
                         gam::alo::compute_alo_diagnostics_from_unified(
                             unified,
@@ -7099,13 +7131,21 @@ fn build_bernoulli_marginal_slope_saved_model(
     link_dev_runtime: Option<&DeviationRuntime>,
     base_link: InverseLink,
     frailty: gam::families::lognormal_kernel::FrailtySpec,
-) -> SavedModel {
+) -> Result<SavedModel, String> {
+    let marginal_likelihood_spec =
+        inverse_link_to_binomial_spec(&base_link).map_err(|e| e.to_string())?;
+    let marginal_likelihood =
+        LikelihoodFamily::try_from(marginal_likelihood_spec).map_err(|e| {
+            format!(
+                "failed to resolve LikelihoodFamily for bernoulli marginal-slope base link {base_link:?}: {e}"
+            )
+        })?;
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
         formula,
         ModelKind::MarginalSlope,
         FittedFamily::MarginalSlope {
-            likelihood: inverse_link_to_binomial_family(&base_link),
+            likelihood: marginal_likelihood,
             base_link: Some(base_link.clone()),
             frailty,
         },
@@ -7146,7 +7186,7 @@ fn build_bernoulli_marginal_slope_saved_model(
         .map(|spec| vec![spec.clone()]);
     payload.score_warp_runtime = score_warp_runtime.map(saved_anchored_deviation_runtime);
     payload.link_deviation_runtime = link_dev_runtime.map(saved_anchored_deviation_runtime);
-    SavedModel::from_payload(payload)
+    Ok(SavedModel::from_payload(payload))
 }
 
 fn resolve_bernoulli_marginal_slope_base_link(
@@ -11963,7 +12003,8 @@ mod tests {
             None,
             InverseLink::Standard(LinkFunction::Probit),
             gam::families::lognormal_kernel::FrailtySpec::None,
-        );
+        )
+        .expect("build bernoulli marginal-slope saved model");
         assert_eq!(
             model.payload().latent_z_normalization,
             Some(SavedLatentZNormalization { mean: 0.2, sd: 1.3 })
@@ -12044,7 +12085,8 @@ mod tests {
             None,
             InverseLink::Standard(LinkFunction::Probit),
             gam::families::lognormal_kernel::FrailtySpec::None,
-        );
+        )
+        .expect("build bernoulli marginal-slope saved model");
         write_model_json(&model_path, &model).expect("write saved marginal-slope model");
         fs::write(&data_path, "z\n3.0\n").expect("write prediction data");
 
@@ -12100,6 +12142,7 @@ mod tests {
             InverseLink::Standard(LinkFunction::Probit),
             gam::families::lognormal_kernel::FrailtySpec::None,
         )
+        .expect("build bernoulli marginal-slope saved model")
         .payload()
         .clone();
         bernoulli.latent_z_normalization = None;
