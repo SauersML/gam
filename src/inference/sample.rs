@@ -220,6 +220,9 @@ fn validate_explicit_link_wiggle_joint_hessian(
 }
 
 fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodFamily) -> Option<f64> {
+    if let LikelihoodFamily::NegativeBinomial { theta } = family {
+        return Some(theta);
+    }
     let spec: crate::types::LikelihoodSpec = family.into();
     if matches!(spec.response, crate::types::ResponseFamily::Gamma) {
         fit.likelihood_scale
@@ -651,6 +654,7 @@ fn sample_standard_link_wiggle(
         LikelihoodFamily::BinomialCLogLog => NutsFamily::BinomialCLogLog,
         LikelihoodFamily::GaussianIdentity => NutsFamily::Gaussian,
         LikelihoodFamily::PoissonLog => NutsFamily::PoissonLog,
+        LikelihoodFamily::NegativeBinomial { .. } => NutsFamily::NegativeBinomialLog,
         LikelihoodFamily::GammaLog => NutsFamily::GammaLog,
         _ => {
             return Err(SampleError::UnsupportedFamily {

@@ -2386,13 +2386,16 @@ def glm_reml_fit_latent(
 
     rust = rust_module()
     family_normalized = str(family).lower().replace("_", "-")
-    theta = 1.0 if negbin_theta is None else float(negbin_theta)
-    if family_normalized in {
+    is_negbin = family_normalized in {
         "negbin",
         "negbin-log",
         "negative-binomial",
         "negative-binomial-log",
-    } and not (np.isfinite(theta) and theta > 0.0):
+    }
+    if is_negbin and negbin_theta is None:
+        raise ValueError("negbin_theta must be provided when family='negbin'")
+    theta = 1.0 if negbin_theta is None else float(negbin_theta)
+    if is_negbin and not (np.isfinite(theta) and theta > 0.0):
         raise ValueError(f"negbin_theta must be finite and > 0; got {theta!r}")
     try:
         out = rust.glm_reml_fit_latent(
