@@ -933,6 +933,10 @@ fn joint_family_logp_and_grad(
         LikelihoodFamily::NegativeBinomial { theta } => {
             Ok(negative_binomial_log_logp_and_grad(data, eta, theta))
         }
+        LikelihoodFamily::BetaLogit { .. } => Err(HmcError::UnsupportedFamily {
+            reason: "Joint HMC fallback is not implemented for BetaLogit".to_string(),
+        }
+        .into()),
         LikelihoodFamily::GammaLog => Ok(gamma_log_logp_and_grad(data, eta)),
         LikelihoodFamily::RoystonParmar => Err(HmcError::UnsupportedFamily {
             reason: "Joint HMC fallback is not implemented for RoystonParmar".to_string(),
@@ -3609,6 +3613,9 @@ pub fn run_nuts_sampling_flattened_family(
                 config,
             )
         }
+        (LikelihoodFamily::BetaLogit { .. }, FamilyNutsInputs::Glm(_)) => Err(
+            "NUTS sampling is not implemented for beta-regression logit".to_string(),
+        ),
         (LikelihoodFamily::GammaLog, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
             glm.x,
             glm.y,
@@ -4668,6 +4675,14 @@ impl JointBetaRhoPosterior {
                 if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Log)) {
                     return Err(HmcError::LinkMismatch {
                         reason: "Joint HMC log-link family requires a log inverse link".to_string(),
+                    }
+                    .into());
+                }
+            }
+            LikelihoodFamily::BetaLogit { .. } => {
+                if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Logit)) {
+                    return Err(HmcError::LinkMismatch {
+                        reason: "Joint HMC BetaLogit requires a logit inverse link".to_string(),
                     }
                     .into());
                 }
