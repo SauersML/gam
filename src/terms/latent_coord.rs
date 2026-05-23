@@ -105,6 +105,44 @@ pub enum LatentIdMode {
     None,
 }
 
+/// Carrier for the `∂Φ/∂t` chain-rule input, dispatched on basis kind by
+/// [`LatentCoordValues::design_gradient_wrt_t_dispatch`].
+///
+/// * [`InputLocationDerivative::Radial`] is the *radial-kernel* path: the
+///   caller supplies the scalar `φ'(r_{n,k})` matrix together with the
+///   center coordinates, and the chain rule
+///   `∂Φ/∂t = φ'(r) · (t − c) / r` is applied internally. This covers every
+///   isotropic radial basis — Duchon (any nullspace order), Matérn (every
+///   supported half-integer ν), and anything else whose pointwise
+///   gradient is radial. Helpers:
+///   [`crate::terms::basis::duchon_radial_first_derivative_nd`],
+///   [`crate::terms::basis::matern_radial_first_derivative_nd`].
+/// * [`InputLocationDerivative::Jet`] is the *pre-computed jet* path: the
+///   caller has already assembled a closed-form `(N, K, d)` tensor for a
+///   basis whose chain rule is not a simple radial scalar times a unit
+///   vector. Sphere kernels carry the tangent-direction times `K'(cos γ)`;
+///   periodic-cyclic B-splines carry the closed-form cardinal derivative;
+///   tensor-product B-splines carry the product-rule mix. Helpers:
+///   [`crate::terms::basis::sphere_first_derivative_nd`],
+///   [`crate::terms::basis::periodic_bspline_first_derivative_nd`],
+///   [`crate::terms::basis::bspline_tensor_first_derivative`].
+///
+/// The dispatch is an enum rather than a trait because each path's
+/// arguments differ structurally (radial bases reuse `φ'(r)` shared with
+/// the ψ-chain machinery; jet bases ship the full tensor). All chain rules
+/// are analytic and closed-form; no autodiff, no finite differences.
+pub enum InputLocationDerivative<'a> {
+    /// Radial-kernel chain rule. The chain rule `(t − c)/r` is reconstructed
+    /// internally from the scalar `φ'(r_{n,k})` matrix and the center
+    /// coordinates.
+    Radial {
+        kernel_first_derivative: ArrayView2<'a, f64>,
+        centers: ArrayView2<'a, f64>,
+    },
+    /// Pre-computed analytic `(n_obs, n_centers, latent_dim)` jet.
+    Jet(ArrayView3<'a, f64>),
+}
+
 /// Per-row latent coordinates `t ∈ ℝ^{N × d}` stored as a flat
 /// row-major `Array1<f64>` of length `n_obs * latent_dim`.
 ///

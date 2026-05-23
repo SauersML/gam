@@ -53,10 +53,11 @@
 //! | Sparsity  | β or ψ      | 1 (strength) [+1 ε]  |
 //! | ARD       | ψ (latent t)| d (one per axis)     |
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis};
 use std::sync::Arc;
 
 use crate::terms::latent_coord::LatentCoordValues;
+use crate::terms::penalty_op::PenaltyOp;
 use crate::terms::smooth::{BlockwisePenalty, PenaltyStructureHint};
 
 // ---------------------------------------------------------------------------
@@ -1069,9 +1070,6 @@ impl AnalyticPenaltyRegistry {
 // exactly the same place the existing closed-form operator is rebuilt when
 // `ψ` advances.
 
-use crate::terms::penalty_op::PenaltyOp;
-use ndarray::{ArrayViewMut1};
-
 /// `PenaltyOp` view of an [`AnalyticPenalty`] frozen at `(target, rho)`.
 ///
 /// The Hessian at the frozen point is symmetric PSD for every penalty we
@@ -1222,35 +1220,6 @@ impl FrozenAnalyticPenaltyOp {
     }
 }
 
-impl AnalyticPenaltyOp {
-    /// Promote this analytic-penalty handle into a frozen `PenaltyOp` at
-    /// `(target, rho)`. The returned `Arc<dyn PenaltyOp>` plugs directly into
-    /// `BlockwisePenalty::with_op` or `PenaltyForm::Operator`.
-    pub fn freeze(
-        &self,
-        target: Array1<f64>,
-        rho: Array1<f64>,
-    ) -> Arc<dyn PenaltyOp> {
-        // Wrap each kind back into `AnalyticPenaltyKind` for storage.
-        let kind = if let Some(p) =
-            (&self.penalty as &dyn std::any::Any).downcast_ref::<IsometryPenalty>()
-        {
-            AnalyticPenaltyKind::Isometry(Arc::new(p.clone()))
-        } else if let Some(p) =
-            (&self.penalty as &dyn std::any::Any).downcast_ref::<SparsityPenalty>()
-        {
-            AnalyticPenaltyKind::Sparsity(Arc::new(p.clone()))
-        } else if let Some(p) =
-            (&self.penalty as &dyn std::any::Any).downcast_ref::<ARDPenalty>()
-        {
-            AnalyticPenaltyKind::Ard(Arc::new(p.clone()))
-        } else {
-            unreachable!("AnalyticPenaltyOp::freeze: unknown analytic penalty kind");
-        };
-        Arc::new(FrozenAnalyticPenaltyOp::new(kind, target, rho))
-    }
-}
-
 impl AnalyticPenaltyKind {
     /// Freeze this kind at `(target, rho)` and return an `Arc<dyn PenaltyOp>`
     /// ready to slot into `BlockwisePenalty::with_op` or `PenaltyForm::Operator`.
@@ -1304,6 +1273,39 @@ mod tests {
         // At x=1, grad ≈ 1/sqrt(1 + ε²) ≈ 1.
         assert!((g[1] - 1.0).abs() < 1e-3);
         assert!((g[2] - (-1.0)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn ard_grad_target_matches_lambda_t() {
+        let d = 2;
+        let t = array![0.5_f64, 1.0, 2.0, -1.0];
+        let target = PsiSlice::full(t.len(), Some(d));
+        let ard = ARDPenalty::new(target, d);
+        // log-precisions: ρ0 = ln 2 (λ0 = 2), ρ1 = ln 3 (λ1 = 3).
+        let rho = array![2.0_f64.ln(), 3.0_f64.ln()];
+        let g = ard.grad_target(t.view(), rho.view());
+        // Axis 0 entries (n*d + 0): indices 0, 2. λ0 · t at those slots.
+        assert!((g[0] - 2.0 * 0.5).abs() < 1e-12);
+        assert!((g[2] - 2.0 * 2.0).abs() < 1e-12);
+        // Axis 1 entries (n*d + 1): indices 1, 3. λ1 · t.
+        assert!((g[1] - 3.0 * 1.0).abs() < 1e-12);
+        assert!((g[3] - 3.0 * (-1.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ard_hessian_diag_matches_lambda() {
+        let d = 2;
+        let t = array![0.5_f64, 1.0, 2.0, -1.0];
+        let target = PsiSlice::full(t.len(), Some(d));
+        let ard = ARDPenalty::new(target, d);
+        let rho = array![2.0_f64.ln(), 3.0_f64.ln()];
+        let h = ard
+            .hessian_diag(t.view(), rho.view())
+            .expect("ARD has a diagonal Hessian");
+        assert!((h[0] - 2.0).abs() < 1e-12);
+        assert!((h[2] - 2.0).abs() < 1e-12);
+        assert!((h[1] - 3.0).abs() < 1e-12);
+        assert!((h[3] - 3.0).abs() < 1e-12);
     }
 
     #[test]

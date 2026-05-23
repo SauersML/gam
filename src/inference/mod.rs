@@ -14,3 +14,4 @@ pub mod probability;
 pub mod quadrature;
 pub mod sample;
 pub mod smooth_test;
+pub mod vector_predict;
