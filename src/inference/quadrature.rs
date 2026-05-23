@@ -186,6 +186,23 @@ use statrs::function::erf::erfc;
 /// Number of quadrature points (7-point rule is exact for polynomials up to degree 13)
 const N_POINTS: usize = 7;
 const SQRT_2: f64 = std::f64::consts::SQRT_2;
+const QUADRATURE_EXP_LOG_MAX: f64 = 700.0;
+
+// Convention: finite moments saturate exp arguments at 700 and use ControlledAsymptotic mode on saturation.
+// Probability/tail kernels stay in log-space or bounded envelopes so overflow cannot turn finite targets into NaN.
+#[inline]
+fn safe_exp(x: f64) -> f64 {
+    if x.is_nan() {
+        f64::NAN
+    } else {
+        x.min(QUADRATURE_EXP_LOG_MAX).exp()
+    }
+}
+
+#[inline]
+fn safe_expwith_saturation(x: f64) -> (f64, bool) {
+    (safe_exp(x), x > QUADRATURE_EXP_LOG_MAX)
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Complex {
@@ -937,7 +954,7 @@ fn logit_tail_asymptotic(mu: f64, sigma: f64) -> Option<IntegratedMeanDerivative
     if mu <= 0.0 {
         let log_mean = mu + 0.5 * sigma * sigma;
         if log_mean <= LOGIT_TAIL_LOG_MAX {
-            let mean = log_mean.exp();
+            let mean = safe_exp(log_mean);
             return Some(IntegratedMeanDerivative {
                 mean,
                 dmean_dmu: mean,
@@ -947,7 +964,7 @@ fn logit_tail_asymptotic(mu: f64, sigma: f64) -> Option<IntegratedMeanDerivative
     } else {
         let log_tail = -mu + 0.5 * sigma * sigma;
         if log_tail <= LOGIT_TAIL_LOG_MAX {
-            let tail = log_tail.exp();
+            let tail = safe_exp(log_tail);
             return Some(IntegratedMeanDerivative {
                 mean: 1.0 - tail,
                 dmean_dmu: tail,
@@ -1230,7 +1247,7 @@ fn cloglog_large_sigma_transition_tail(mu: f64, sigma: f64) -> f64 {
     } else if log_tail <= -745.0 {
         0.0
     } else {
-        log_tail.exp().clamp(0.0, 1.0)
+        safe_exp(log_tail).clamp(0.0, 1.0)
     }
 }
 
@@ -1270,7 +1287,7 @@ fn cloglog_extreme_asymptotic(mu: f64, sigma: f64) -> Option<IntegratedMeanDeriv
     // branches so neighboring formulas still cover the transition band.
     let rare_log = mu + 0.5 * sigma * sigma;
     if rare_log <= CLOGLOG_RARE_EVENT_LOG_MAX {
-        let mean = rare_log.exp();
+        let mean = safe_exp(rare_log);
         return Some(IntegratedMeanDerivative {
             mean,
             dmean_dmu: mean,
@@ -1297,7 +1314,7 @@ fn cloglog_survival_extreme_asymptotic(
 ) -> Option<(f64, IntegratedExpectationMode)> {
     let rare_log = mu + 0.5 * sigma * sigma;
     if rare_log <= CLOGLOG_RARE_EVENT_LOG_MAX {
-        let mean = rare_log.exp();
+        let mean = safe_exp(rare_log);
         return Some((
             (1.0 - mean).clamp(0.0, 1.0),
             IntegratedExpectationMode::ControlledAsymptotic,
@@ -1335,16 +1352,16 @@ fn cloglog_survival_extreme_asymptotic(
 /// - exp(x) overflows to ∞ for x > 709  → S = exp(-∞) = 0.0
 #[inline]
 fn gumbel_survival(x: f64) -> f64 {
-    (-x.exp()).exp()
+    (-safe_exp(x)).exp()
 }
 
 /// Exact cloglog mean derivative: μ'(x) = exp(x) · exp(-exp(x)) = -S'(x).
 ///
-/// Handles intermediate overflow: when exp(x) = ∞, the true derivative
-/// is 0 (double-exponential decay dominates), so we return 0.0.
+/// Saturates the intermediate exp in the positive tail; double-exponential
+/// decay still drives the returned derivative to 0.0.
 #[inline]
 fn cloglog_mean_d1_exact(x: f64) -> f64 {
-    let ex = x.exp();
+    let ex = safe_exp(x);
     if ex.is_infinite() {
         0.0
     } else {
@@ -1392,7 +1409,7 @@ fn cloglog_negative_tail_mean(eta: f64) -> f64 {
     } else {
         // Use expm1(−exp(η)) = exp(−exp(η)) − 1, so μ = −expm1(−exp(η)).
         // This is more accurate than 1 − exp(−exp(η)) near zero.
-        let ex = eta.exp();
+        let ex = safe_exp(eta);
         -(-ex).exp_m1()
     }
 }
@@ -1408,7 +1425,7 @@ fn cloglog_negative_tail_derivative(eta: f64) -> f64 {
     if eta < -745.0 {
         0.0
     } else {
-        let ex = eta.exp();
+        let ex = safe_exp(eta);
         (ex * (-ex).exp()).max(0.0)
     }
 }
@@ -1446,9 +1463,9 @@ fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
         };
     }
 
-    let ex = mu.exp();
+    let ex = safe_exp(mu);
     if !ex.is_finite() {
-        // μ large enough that ex overflows to +∞; f saturates to 1 and f' to 0.
+        // Non-finite μ in the positive direction saturates f to 1 and f' to 0.
         return IntegratedMeanDerivative {
             mean: 1.0,
             dmean_dmu: 0.0,
@@ -1832,7 +1849,7 @@ fn cloglog_shift_identity_derivative(mu: f64, sigma: f64, shifted_survival: f64)
     if !log_derivative.is_finite() {
         return upper;
     }
-    log_derivative.exp().clamp(0.0, upper)
+    safe_exp(log_derivative).clamp(0.0, upper)
 }
 
 #[inline]
@@ -1896,7 +1913,13 @@ fn cloglog_survival_miles(mu: f64, sigma: f64) -> Result<f64, EstimationError> {
                 - statrs::function::gamma::ln_gamma(nf + 1.0);
             let u = (mu - alpha_ln + sigma * sigma * nf) / (SQRT_2 * sigma);
             let log_half_erfc = log_half_erfc_stable(u);
-            let term = sign * (base_log + log_half_erfc).exp();
+            let term_log = base_log + log_half_erfc;
+            if term_log > QUADRATURE_EXP_LOG_MAX {
+                return Err(EstimationError::InvalidInput(
+                    "Miles cloglog series term exceeded finite exp range".to_string(),
+                ));
+            }
+            let term = sign * safe_exp(term_log);
             pair_s += term;
         }
         s_sum += pair_s;
@@ -1989,7 +2012,7 @@ fn cloglog_survival_cc(
     for (&x, &w) in rule.nodes.iter().zip(rule.weights.iter()) {
         let t = a * x;
         let u = mu + sigma * t;
-        let e = if u > 709.78 { f64::INFINITY } else { u.exp() };
+        let e = safe_exp(u);
         let w0 = (-0.5 * t * t).exp() * inv_sqrt_2pi;
         let yk = w * w0 * (-e).exp() - c;
         let tk = sum + yk;
@@ -2420,11 +2443,15 @@ pub fn integrated_inverse_link_mean_and_derivative(
     // prediction code.
     match link {
         LinkFunction::Log => {
-            let mean = (mu + 0.5 * sigma * sigma).exp();
+            let (mean, saturated) = safe_expwith_saturation(mu + 0.5 * sigma * sigma);
             Ok(IntegratedMeanDerivative {
                 mean,
                 dmean_dmu: mean,
-                mode: IntegratedExpectationMode::ExactClosedForm,
+                mode: if saturated {
+                    IntegratedExpectationMode::ControlledAsymptotic
+                } else {
+                    IntegratedExpectationMode::ExactClosedForm
+                },
             })
         }
         LinkFunction::Probit => Ok(probit_posterior_meanwith_deriv_exact(mu, sigma)),
@@ -2453,13 +2480,17 @@ pub fn integrated_inverse_link_jet(
 ) -> Result<IntegratedInverseLinkJet, EstimationError> {
     match link {
         LinkFunction::Log => {
-            let mean = (mu + 0.5 * sigma * sigma).exp();
+            let (mean, saturated) = safe_expwith_saturation(mu + 0.5 * sigma * sigma);
             Ok(IntegratedInverseLinkJet {
                 mean,
                 d1: mean,
                 d2: mean,
                 d3: mean,
-                mode: IntegratedExpectationMode::ExactClosedForm,
+                mode: if saturated {
+                    IntegratedExpectationMode::ControlledAsymptotic
+                } else {
+                    IntegratedExpectationMode::ExactClosedForm
+                },
             })
         }
         LinkFunction::Probit => Ok(integrated_probit_jet(mu, sigma)),
@@ -2939,6 +2970,18 @@ pub fn integrated_family_moments_jetwith_state(
                 mode: jet.mode,
             })
         }
+        LikelihoodFamily::BetaLogit { phi } => {
+            let jet = integrated_inverse_link_jet(quadctx, LinkFunction::Logit, e, se)?;
+            let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
+            Ok(IntegratedMomentsJet {
+                mean,
+                variance: (mean * (1.0 - mean) / (1.0 + phi.max(1e-12))).max(PROB_EPS),
+                d1: jet.d1,
+                d2: jet.d2,
+                d3: jet.d3,
+                mode: jet.mode,
+            })
+        }
         LikelihoodFamily::PoissonLog
         | LikelihoodFamily::Tweedie { .. }
         | LikelihoodFamily::NegativeBinomial { .. }
@@ -2948,7 +2991,7 @@ pub fn integrated_family_moments_jetwith_state(
             // d²/de² = exp(e + s²/2)
             // d³/de³ = exp(e + s²/2)
             let s2 = se * se;
-            let mean = (e + 0.5 * s2).exp();
+            let (mean, saturated) = safe_expwith_saturation(e + 0.5 * s2);
             // Variance of the response depends on family:
             //   Poisson: Var = mean (since Var[Y|mu] = mu)
             //   Gamma:   Var = mean² / shape, but shape not available here;
@@ -2967,7 +3010,11 @@ pub fn integrated_family_moments_jetwith_state(
                 d1: mean,
                 d2: mean,
                 d3: mean,
-                mode: IntegratedExpectationMode::ExactClosedForm,
+                mode: if saturated {
+                    IntegratedExpectationMode::ControlledAsymptotic
+                } else {
+                    IntegratedExpectationMode::ExactClosedForm
+                },
             })
         }
     }
@@ -3293,7 +3340,13 @@ fn latent_cloglog_kernel_terms(
         if order == 0 {
             log_k0 = log_value;
         }
-        *out = log_value.exp();
+        let upper = if order == 0 {
+            1.0
+        } else {
+            let k_over_e = kf / std::f64::consts::E;
+            k_over_e.powf(kf)
+        };
+        *out = safe_exp(log_value).clamp(0.0, upper);
     }
 
     (k, log_k0, mode)
@@ -3951,10 +4004,7 @@ pub(crate) fn cloglog_point_jet5(t: f64) -> (f64, f64, f64, f64, f64, f64) {
     if t.is_nan() {
         return (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN);
     }
-    let et = t.exp();
-    if !et.is_finite() {
-        return (1.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    }
+    let et = safe_exp(t);
 
     (
         -(-et).exp_m1(),
