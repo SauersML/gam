@@ -634,6 +634,8 @@ impl SaeManifoldTerm {
                     let v = coord.row(row)[axis];
                     sq += v * v;
                 }
+                // Negative log Gaussian prior for precision alpha:
+                // 0.5 * alpha * ||t||^2 - 0.5 * n * log(alpha).
                 acc += 0.5 * alpha * sq - 0.5 * (n as f64) * log_alpha;
             }
         }
