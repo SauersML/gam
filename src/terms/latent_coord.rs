@@ -63,9 +63,15 @@
 //! `IsometryToReference` is deferred to a follow-up (see proposal §4(b)).
 
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const TWO_PI: f64 = std::f64::consts::PI * 2.0;
 const SPHERE_NORMAL_PIN: f64 = 1.0;
+static NEXT_LATENT_COORD_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_latent_coord_id() -> u64 {
+    NEXT_LATENT_COORD_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Choice of auxiliary-prior conditional mean estimator `ĥ(u)`.
 ///
@@ -559,6 +565,8 @@ pub enum InputLocationDerivative<'a> {
 /// outer plumbing can consume it without modification.
 #[derive(Debug, Clone)]
 pub struct LatentCoordValues {
+    /// Stable process-local identity for this latent-coordinate block.
+    id: u64,
     /// Flattened (n_obs, latent_dim) latent matrix, row-major
     /// (so `values[n * d + k] = t_n[k]`).
     values: Array1<f64>,
@@ -594,6 +602,7 @@ impl LatentCoordValues {
             }
         }
         let mut out = Self {
+            id: next_latent_coord_id(),
             values,
             n_obs,
             latent_dim,
@@ -622,6 +631,24 @@ impl LatentCoordValues {
         id_mode: LatentIdMode,
         manifold: LatentManifold,
     ) -> Self {
+        Self::from_flat_with_manifold_and_id(
+            values,
+            n_obs,
+            latent_dim,
+            id_mode,
+            manifold,
+            next_latent_coord_id(),
+        )
+    }
+
+    pub(crate) fn from_flat_with_manifold_and_id(
+        values: Array1<f64>,
+        n_obs: usize,
+        latent_dim: usize,
+        id_mode: LatentIdMode,
+        manifold: LatentManifold,
+        id: u64,
+    ) -> Self {
         id_mode.reject_dim_selection_alone();
         debug_assert_eq!(
             values.len(),
@@ -631,6 +658,7 @@ impl LatentCoordValues {
             n_obs * latent_dim
         );
         let mut out = Self {
+            id,
             values,
             n_obs,
             latent_dim,
@@ -639,6 +667,10 @@ impl LatentCoordValues {
         };
         out.project_all_rows_to_manifold();
         out
+    }
+
+    pub fn latent_id(&self) -> u64 {
+        self.id
     }
 
     pub fn n_obs(&self) -> usize {
@@ -667,12 +699,13 @@ impl LatentCoordValues {
     }
 
     pub fn with_manifold(&self, manifold: LatentManifold) -> Self {
-        Self::from_flat_with_manifold(
+        Self::from_flat_with_manifold_and_id(
             self.values.clone(),
             self.n_obs,
             self.latent_dim,
             self.id_mode.clone(),
             manifold,
+            self.id,
         )
     }
 
