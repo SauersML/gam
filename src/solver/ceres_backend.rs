@@ -38,11 +38,13 @@ const STUB_MESSAGE: &str = "Ceres backend stub - wire to ceres-rs or call out vi
 ///
 /// The type is available only with the `ceres-backend` Cargo feature and has
 /// no runtime dependencies until its methods are wired to a real backend.
+#[allow(dead_code)] // INTEGRATION-HOOK(ceres): scaffolding for future ceres-backend feature.
 #[derive(Debug, Clone, Default)]
 pub struct CeresBackend {
     pub config: CeresBackendConfig,
 }
 
+#[allow(dead_code)] // INTEGRATION-HOOK(ceres): see struct comment.
 impl CeresBackend {
     pub fn new(config: CeresBackendConfig) -> Self {
         Self { config }
@@ -52,6 +54,7 @@ impl CeresBackend {
 /// Ceres-style solver options a real backend would translate into
 /// `ceres::Solver::Options`.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // INTEGRATION-HOOK(ceres): config struct for future ceres-backend wiring.
 pub struct CeresBackendConfig {
     pub solver_type: String,
     pub linear_solver_type: String,

@@ -239,13 +239,13 @@ class LatentCoord:
 
     .. code-block::
 
-        y = Φ(x) · β + ε,   penalty(β, ψ),   x observed.
+        y = Φ(x) · β + ε,   penalty(β; ρ),   x observed.
 
     ``LatentCoord`` promotes one of the covariates ``x`` from *observed* to
     *latent*: ``t`` is estimated per row alongside the spline coefficients
     ``β`` and the smoothing parameters ``ρ``. Mechanically this is the same
-    problem the ``ψ`` (log-anisotropy) machinery already solves — both move
-    the design matrix Φ and reuse the IFT-warm-started outer optimizer —
+    problem the kernel-shape ``ψ`` (log-anisotropy) machinery already solves:
+    both move the design matrix Φ and reuse the IFT-warm-started outer optimizer,
     except differentiating with respect to the *first* argument of the
     radial kernel rather than its scale.
 
