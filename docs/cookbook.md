@@ -212,6 +212,11 @@ gamfit.fit(
 ## Survival surface on a time grid
 
 ```python
+model = gamfit.fit(
+    df,
+    "Surv(entry, exit, event) ~ s(age) + bmi",
+    survival_likelihood="transformation",
+)
 pred = model.predict(test_df)
 
 S = pred.survival_at([1, 5, 10, 20])      # (n_rows, 4)
