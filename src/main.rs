@@ -8450,7 +8450,10 @@ fn build_model_summary(
             let baseline = if family == LikelihoodFamily::PoissonLog {
                 mean.max(0.0)
             } else if matches!(family, LikelihoodFamily::BetaLogit { .. }) {
-                mean.clamp(gam::pirls::BETA_MU_EPS, 1.0 - gam::pirls::BETA_MU_EPS)
+                mean.clamp(
+                    gam::pirls::BETA_MU_EPS,
+                    1.0 - gam::pirls::BETA_MU_EPS,
+                )
             } else {
                 mean.max(1e-12)
             };

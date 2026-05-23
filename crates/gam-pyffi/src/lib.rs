@@ -71,8 +71,8 @@ use gam::terms::sae_manifold::{
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DifferenceOpKind,
-    IBPAssignmentPenalty, IsometryPenalty, OrthogonalityPenalty, PenaltyTier, PsiSlice,
-    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TotalVariationPenalty,
+    IBPAssignmentPenalty, IsometryPenalty, NuclearNormPenalty, OrthogonalityPenalty, PenaltyTier,
+    PsiSlice, SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TotalVariationPenalty,
 };
 use gam::terms::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
@@ -10491,6 +10491,40 @@ fn build_analytic_penalty_registry_from_json(
                             n_eff,
                             difference_op,
                             smoothing_eps,
+                            learnable,
+                        )
+                        .map_err(|err| format!("{context}: {err}"))?,
+                    ),
+                ));
+            }
+            "nuclear_norm" => {
+                let weight = descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
+                let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
+                let max_rank = match descriptor.get("max_rank") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(value) => {
+                        let raw = value.as_u64().ok_or_else(|| {
+                            format!("{context}.max_rank must be null or a positive integer")
+                        })?;
+                        if raw == 0 {
+                            return Err(format!("{context}.max_rank must be > 0"));
+                        }
+                        Some(raw as usize)
+                    }
+                };
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                registry.push(gam::terms::AnalyticPenaltyKind::NuclearNorm(
+                    std::sync::Arc::new(
+                        NuclearNormPenalty::new(
+                            slice,
+                            weight,
+                            n_eff,
+                            smoothing_eps,
+                            max_rank,
                             learnable,
                         )
                         .map_err(|err| format!("{context}: {err}"))?,
