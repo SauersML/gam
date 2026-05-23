@@ -12545,6 +12545,7 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
     resolvedspec: &TermCollectionSpec,
     design: &TermCollectionDesign,
     latent_terms: &[usize],
+    analytic_rho_count: usize,
 ) -> Result<Option<Vec<DirectionalHyperParam>>, EstimationError> {
     if latent_terms.is_empty() || latent.is_empty() {
         return Ok(None);
@@ -12702,12 +12703,18 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
         hyper_dirs.push(dir);
     }
     let direct_dim = latent_coord_direct_hyper_count(latent.id_mode(), latent.latent_dim());
-    if direct_dim > 0 {
+    if analytic_rho_count + direct_dim > 0 {
         let zero_x =
             crate::estimate::reml::HyperDesignDerivative::from(Array2::<f64>::zeros((
                 design.design.nrows(),
                 p_total,
             )));
+        for _ in 0..analytic_rho_count {
+            hyper_dirs.push(
+                DirectionalHyperParam::new_compact(zero_x.clone(), Vec::new(), None, None)?
+                    .not_penalty_like(),
+            );
+        }
         for _ in 0..direct_dim {
             hyper_dirs.push(
                 DirectionalHyperParam::new_compact(zero_x.clone(), Vec::new(), None, None)?
@@ -12798,6 +12805,7 @@ struct LatentIdObjectiveContribution {
 fn latent_id_objective_contribution(
     theta: &Array1<f64>,
     rho_dim: usize,
+    analytic_rho_count: usize,
     latent: &crate::terms::latent_coord::LatentCoordValues,
 ) -> Result<LatentIdObjectiveContribution, EstimationError> {
     use crate::terms::latent_coord::{AuxPriorStrength, LatentIdMode, aux_prior_targets};
@@ -12806,7 +12814,7 @@ fn latent_id_objective_contribution(
     let flat_len = latent.len();
     let mut gradient = Array1::<f64>::zeros(theta.len());
     let t_start = rho_dim;
-    let direct_start = t_start + flat_len;
+    let direct_start = t_start + flat_len + analytic_rho_count;
     if theta.len() < direct_start {
         return Err(EstimationError::InvalidInput(format!(
             "latent-coordinate theta too short for id objective: got {}, need at least {}",
@@ -12892,6 +12900,7 @@ fn latent_id_objective_contribution(
 fn add_latent_id_objective_to_eval(
     theta: &Array1<f64>,
     rho_dim: usize,
+    analytic_rho_count: usize,
     latent: &crate::terms::latent_coord::LatentCoordValues,
     eval: &mut (
         f64,
@@ -12899,7 +12908,8 @@ fn add_latent_id_objective_to_eval(
         crate::solver::outer_strategy::HessianResult,
     ),
 ) -> Result<(), EstimationError> {
-    let contribution = latent_id_objective_contribution(theta, rho_dim, latent)?;
+    let contribution =
+        latent_id_objective_contribution(theta, rho_dim, analytic_rho_count, latent)?;
     eval.0 += contribution.cost;
     if eval.1.len() != contribution.gradient.len() {
         return Err(EstimationError::InvalidInput(format!(
@@ -12924,19 +12934,21 @@ fn analytic_penalty_objective_contribution(
     let flat_len = latent.len();
     let t_start = rho_dim;
     let t_end = t_start + flat_len;
-    if theta.len() < t_end {
+    let rho_start = t_end;
+    let rho_end = rho_start + registry.total_rho_count();
+    if theta.len() < rho_end {
         return Err(EstimationError::InvalidInput(format!(
             "latent-coordinate theta too short for analytic penalties: got {}, need at least {}",
             theta.len(),
-            t_end
+            rho_end
         )));
     }
     let target_t = theta.slice(s![t_start..t_end]);
-    let rho = Array1::<f64>::zeros(registry.total_rho_count());
+    let rho = theta.slice(s![rho_start..rho_end]);
     let mut cost = 0.0_f64;
     let mut gradient = Array1::<f64>::zeros(theta.len());
     for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(registry.rho_layout()) {
-        let rho_local = rho.slice(s![rho_slice]);
+        let rho_local = rho.slice(s![rho_slice.clone()]);
         match tier {
             crate::terms::PenaltyTier::Psi => {
                 cost += penalty.value(target_t.view(), rho_local);
@@ -12950,6 +12962,17 @@ fn analytic_penalty_objective_contribution(
                 }
                 for i in 0..flat_len {
                     gradient[t_start + i] += grad[i];
+                }
+                let grad_rho_local = penalty.grad_rho(target_t.view(), rho_local);
+                if grad_rho_local.len() != rho_slice.len() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "analytic penalty {name:?} rho-gradient length mismatch: got {}, expected {}",
+                        grad_rho_local.len(),
+                        rho_slice.len()
+                    )));
+                }
+                for local_idx in 0..grad_rho_local.len() {
+                    gradient[rho_start + rho_slice.start + local_idx] += grad_rho_local[local_idx];
                 }
             }
             crate::terms::PenaltyTier::Beta => {
@@ -12977,11 +13000,13 @@ fn add_analytic_penalty_hessian_to_eval(
     let flat_len = latent.len();
     let t_start = rho_dim;
     let t_end = t_start + flat_len;
-    if theta.len() < t_end {
+    let rho_start = t_end;
+    let rho_end = rho_start + registry.total_rho_count();
+    if theta.len() < rho_end {
         return Err(EstimationError::InvalidInput(format!(
             "latent-coordinate theta too short for analytic penalty Hessian: got {}, need at least {}",
             theta.len(),
-            t_end
+            rho_end
         )));
     }
     let crate::solver::outer_strategy::HessianResult::Analytic(hessian) = &mut eval.2 else {
@@ -13000,7 +13025,7 @@ fn add_analytic_penalty_hessian_to_eval(
         )));
     }
     let target_t = theta.slice(s![t_start..t_end]);
-    let rho = Array1::<f64>::zeros(registry.total_rho_count());
+    let rho = theta.slice(s![rho_start..rho_end]);
     for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout()) {
         let rho_local = rho.slice(s![rho_slice]);
         if !matches!(tier, crate::terms::PenaltyTier::Psi) {

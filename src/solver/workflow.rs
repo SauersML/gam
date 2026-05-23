@@ -53,8 +53,8 @@ use crate::terms::latent_coord::{
 };
 use crate::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DifferenceOpKind,
-    IBPAssignmentPenalty, IsometryPenalty, OrthogonalityPenalty, PenaltyTier, PsiSlice,
-    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TotalVariationPenalty,
+    IBPAssignmentPenalty, IsometryPenalty, NuclearNormPenalty, OrthogonalityPenalty, PenaltyTier,
+    PsiSlice, SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TotalVariationPenalty,
 };
 use crate::survival::PenaltyBlock;
 use crate::types::{
@@ -3260,6 +3260,38 @@ fn build_standard_latent_analytic_penalty_registry(
                         n_eff,
                         difference_op,
                         smoothing_eps,
+                        learnable,
+                    )
+                    .map_err(|err| format!("{context}: {err}"))?,
+                )));
+            }
+            "nuclear_norm" => {
+                let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = analytic_descriptor_usize(descriptor, "n_eff", target.n)?;
+                let smoothing_eps = analytic_descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
+                let max_rank = match descriptor.get("max_rank") {
+                    None | Some(JsonValue::Null) => None,
+                    Some(value) => {
+                        let raw = value.as_u64().ok_or_else(|| {
+                            format!("{context}.max_rank must be null or a positive integer")
+                        })?;
+                        if raw == 0 {
+                            return Err(format!("{context}.max_rank must be > 0"));
+                        }
+                        Some(raw as usize)
+                    }
+                };
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                registry.push(AnalyticPenaltyKind::NuclearNorm(Arc::new(
+                    NuclearNormPenalty::new(
+                        slice,
+                        weight,
+                        n_eff,
+                        smoothing_eps,
+                        max_rank,
                         learnable,
                     )
                     .map_err(|err| format!("{context}: {err}"))?,

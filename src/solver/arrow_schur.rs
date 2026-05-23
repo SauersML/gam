@@ -659,12 +659,19 @@ impl ArrowSchurSystem {
         target_t: ArrayView1<'_, f64>,
         target_beta: ArrayView1<'_, f64>,
         rho_global: ArrayView1<'_, f64>,
-    ) {
+    ) -> Result<(), ArrowSchurError> {
         let layout = registry.rho_layout();
-        for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(layout.iter()) {
+        for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(layout.iter()) {
             let rho_local = rho_global.slice(ndarray::s![rho_slice.clone()]);
             match tier {
                 PenaltyTier::Psi => {
+                    if !analytic_penalty_is_row_block_diagonal(penalty) {
+                        return Err(ArrowSchurError::SchurFactorFailed {
+                            reason: format!(
+                                "analytic penalty {name:?} couples latent rows; this penalty requires the dense Schur path, use solver_mode=DenseSchur"
+                            ),
+                        });
+                    }
                     self.add_ext_coord_penalty(penalty, target_t, rho_local);
                 }
                 PenaltyTier::Beta => {
@@ -677,6 +684,7 @@ impl ArrowSchurSystem {
                 }
             }
         }
+        Ok(())
     }
 
     /// Convert row-local Euclidean latent blocks to Riemannian tangent blocks.
@@ -845,6 +853,16 @@ impl ArrowSchurSystem {
     ) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
         solve_arrow_newton_step_core(self, ridge_t, ridge_beta, options)
     }
+}
+
+fn analytic_penalty_is_row_block_diagonal(penalty: &AnalyticPenaltyKind) -> bool {
+    matches!(
+        penalty,
+        AnalyticPenaltyKind::Ard(_)
+            | AnalyticPenaltyKind::Sparsity(_)
+            | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
+            | AnalyticPenaltyKind::IBPAssignment(_)
+    )
 }
 
 /// Per-row + Schur Cholesky factor cache produced by
