@@ -37,6 +37,8 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
 
+const TWO_PI: f64 = std::f64::consts::PI * 2.0;
+
 /// Sentinel: warn when sphere retraction operates this close to a chart
 /// singularity (currently only used as an advisory threshold; callers can
 /// hook a runtime warning here).
@@ -73,14 +75,21 @@ pub trait Manifold: Send + Sync {
         xi: ArrayViewMut1<f64>,
     );
 
-    /// Riemannian inner product `<ξ, η>_p`. Default: ambient Euclidean
-    /// inner product restricted to `T_p M` (the induced metric).
+    /// Per-ambient-axis trust-region metric weights.
+    fn metric_weights(&self) -> Vec<f64> {
+        vec![1.0; self.ambient_dim()]
+    }
+
+    /// Riemannian inner product `<ξ, η>_p`. Default: weighted ambient
+    /// inner product restricted to `T_p M`.
     fn inner_product(&self, _p: ArrayView1<f64>, xi: ArrayView1<f64>, eta: ArrayView1<f64>)
         -> f64 {
         debug_assert_eq!(xi.len(), eta.len());
+        let weights = self.metric_weights();
+        debug_assert_eq!(weights.len(), xi.len());
         let mut acc = 0.0_f64;
         for i in 0..xi.len() {
-            acc += xi[i] * eta[i];
+            acc += weights[i] * xi[i] * eta[i];
         }
         acc
     }
@@ -234,6 +243,10 @@ impl Manifold for Circle {
     fn ambient_dim(&self) -> usize {
         2
     }
+    fn metric_weights(&self) -> Vec<f64> {
+        let w = 1.0 / (TWO_PI * TWO_PI);
+        vec![w; 2]
+    }
     fn project_tangent(&self, p: ArrayView1<f64>, mut v: ArrayViewMut1<f64>) {
         debug_assert_eq!(p.len(), 2);
         debug_assert_eq!(v.len(), 2);
@@ -294,6 +307,10 @@ impl Manifold for Sphere {
     }
     fn ambient_dim(&self) -> usize {
         self.n + 1
+    }
+    fn metric_weights(&self) -> Vec<f64> {
+        let w = 1.0 / (std::f64::consts::PI * std::f64::consts::PI);
+        vec![w; self.n + 1]
     }
     fn project_tangent(&self, p: ArrayView1<f64>, mut v: ArrayViewMut1<f64>) {
         debug_assert_eq!(p.len(), self.n + 1);
@@ -387,6 +404,10 @@ impl Manifold for Interval {
     fn ambient_dim(&self) -> usize {
         1
     }
+    fn metric_weights(&self) -> Vec<f64> {
+        let scale = self.hi - self.lo;
+        vec![1.0 / (scale * scale)]
+    }
     fn project_tangent(&self, _p: ArrayView1<f64>, _v: ArrayViewMut1<f64>) {
         // 1-d open submanifold of ℝ; tangent space is all of ℝ.
     }
@@ -442,6 +463,10 @@ impl Manifold for Torus {
     fn ambient_dim(&self) -> usize {
         2 * self.d
     }
+    fn metric_weights(&self) -> Vec<f64> {
+        let w = 1.0 / (TWO_PI * TWO_PI);
+        vec![w; 2 * self.d]
+    }
     fn project_tangent(&self, p: ArrayView1<f64>, mut v: ArrayViewMut1<f64>) {
         for k in 0..self.d {
             let px = p[2 * k];
@@ -491,6 +516,7 @@ impl Manifold for Torus {
 /// Cartesian product of manifolds; ambient dimensions concatenate.
 pub struct Product {
     pub components: Vec<Box<dyn Manifold>>,
+    pub weights: Option<Vec<f64>>,
 }
 
 impl Manifold for Product {
@@ -499,6 +525,21 @@ impl Manifold for Product {
     }
     fn ambient_dim(&self) -> usize {
         self.components.iter().map(|c| c.ambient_dim()).sum()
+    }
+    fn metric_weights(&self) -> Vec<f64> {
+        if let Some(weights) = &self.weights {
+            assert_eq!(
+                weights.len(),
+                self.ambient_dim(),
+                "Product manifold metric weights length must match ambient dimension"
+            );
+            return weights.clone();
+        }
+        let mut out = Vec::with_capacity(self.ambient_dim());
+        for c in &self.components {
+            out.extend(c.metric_weights());
+        }
+        out
     }
     fn project_tangent(&self, p: ArrayView1<f64>, v: ArrayViewMut1<f64>) {
         let mut off = 0usize;
@@ -583,6 +624,11 @@ pub enum ManifoldKind {
     Torus(usize),
     /// Cartesian product.
     Product(Vec<ManifoldKind>),
+    /// Cartesian product with explicit per-ambient-axis metric weights.
+    ProductWithMetric {
+        components: Vec<ManifoldKind>,
+        weights: Vec<f64>,
+    },
 }
 
 impl ManifoldKind {
@@ -596,6 +642,14 @@ impl ManifoldKind {
             ManifoldKind::Torus(d) => Box::new(Torus { d: *d }),
             ManifoldKind::Product(components) => Box::new(Product {
                 components: components.iter().map(|c| c.build()).collect(),
+                weights: None,
+            }),
+            ManifoldKind::ProductWithMetric {
+                components,
+                weights,
+            } => Box::new(Product {
+                components: components.iter().map(|c| c.build()).collect(),
+                weights: Some(weights.clone()),
             }),
         }
     }
@@ -613,7 +667,11 @@ impl ManifoldKind {
             ManifoldKind::Sphere(n) => n + 1,
             ManifoldKind::Interval(_, _) => 1,
             ManifoldKind::Torus(d) => 2 * d,
-            ManifoldKind::Product(components) => components.iter().map(|c| c.ambient_dim()).sum(),
+            ManifoldKind::Product(components)
+            | ManifoldKind::ProductWithMetric {
+                components,
+                weights: _,
+            } => components.iter().map(|c| c.ambient_dim()).sum(),
         }
     }
 }
@@ -787,7 +845,8 @@ pub fn riemannian_newton_step_on_point(
     // T_p M to numerical precision, but small drift can accumulate).
     manifold.project_tangent(point, xi.view_mut());
 
-    // Trust-region clip: ‖ξ‖_g ≤ Δ (use the induced metric).
+    // Trust-region clip: ‖ξ‖_g ≤ Δ. Product manifolds use per-axis metric
+    // weights so heterogeneous natural units share one radius coherently.
     if let Some(delta) = step.trust_radius {
         let norm2 = manifold.inner_product(point, xi.view(), xi.view());
         let norm = norm2.max(0.0).sqrt();
