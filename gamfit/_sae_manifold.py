@@ -482,6 +482,7 @@ def _fit_fixed_k_ibp_rust(
         smooth_penalties[atom, :m, :m] = penalties[atom]
         coords_padded[atom, :, :d] = coords[atom]
 
+    normalized_penalties = _normalize_penalty_descriptors(analytic_penalties)
     payload = rust_module().sae_manifold_fit_ibp(
         np.ascontiguousarray(z, dtype=float),
         [_basis_kind_name(spec) for spec in basis_specs],
@@ -501,7 +502,7 @@ def _fit_fixed_k_ibp_rust(
         int(max_iter),
         float(learning_rate),
         gumbel_schedule=gumbel_schedule,
-        analytic_penalties=_normalize_penalty_descriptors(analytic_penalties),
+        analytic_penalties=normalized_penalties,
     )
 
     assignments = np.asarray(payload["assignments_z"], dtype=float)
