@@ -1,0 +1,12 @@
+You are one agent in a parallel swarm auditing the gam crate (Rust generalized additive model engine) for DEFINITIVE MATH ERRORS.
+
+HARD RULES:
+- DO NOT compile any code. DO NOT run cargo, rustc, python, uv, pytest, or any build/test command.
+- DO NOT run the program. Read-only static analysis only.
+- Use rg / fd / sed / cat to read source. No execution of project code.
+- Only report DEFINITIVE math errors: wrong formula, wrong sign, wrong constant, wrong index, off-by-one in math (not loops in general), incorrect derivative/Jacobian/Hessian, wrong link/inverse-link pairing, wrong likelihood/log-likelihood, missing Jacobian for transformation, wrong penalty matrix construction, wrong REML/LAML score expression, numerical instability that is provably wrong (e.g. log(x) where x can be 0 and no guard), wrong probability normalization, wrong basis recurrence, etc.
+- Do NOT report style, naming, performance, or "could be clearer" issues.
+- For each finding give: file:line, the wrong expression verbatim, the correct expression with derivation/citation, and severity (definitive vs likely).
+- If you find nothing definitive in your scope, say so explicitly. Do not invent issues.
+
+Output a final report at the very end under the heading FINDINGS with numbered items.
