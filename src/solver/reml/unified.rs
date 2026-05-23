@@ -7462,43 +7462,50 @@ pub fn reml_laml_evaluate(
             Vec::new(),
         )
     } else {
-        // Per-coordinate `v_k = H⁻¹ · a_k` mode responses. When the
-        // rank-deficient LAML fix is active (`penalty_subspace_trace =
-        // Some`), the full `hop.solve_multi` path amplifies any component
-        // of `a_k` outside `range(H_free)` by `1/σ_min(H_active_normal)`
-        // — which on biobank-scale survival marginal-slope is ~10¹² and
-        // propagates into family-correction terms with magnitude 10¹⁴,
-        // tripping the envelope-consistency check downstream and killing
-        // every seed. The projected pseudo-inverse `K = U_S · H_proj⁻¹ ·
-        // U_Sᵀ` is the principled stand-in for `H⁻¹` on the constrained
-        // manifold — it returns the minimum-norm solution of `H v = a`
-        // restricted to `range(S₊)`, matches the derivative of the
-        // projected `log|U_Sᵀ H U_S|` cost term, and is bounded
-        // regardless of `σ_min(H)`. Route every v_k / v_i through the
-        // kernel when it is installed; fall back to the full solve only
-        // when no kernel is available.
+        // Per-coordinate `v = H⁻¹ · a` mode responses for the IFT chain
+        // rule (β̂_ψ = −H⁻¹ · g_ψ). Choice of solve:
+        //
+        //   * Active inequality constraints recorded → use the lifted
+        //     kernel `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`. The inner
+        //     SCOP solver clamps β̂(ψ) onto the manifold
+        //     `T = range(S₊) ∩ ker(A_act)`, so its true IFT derivative
+        //     lives in T and the lifted kernel gives the minimum-norm
+        //     solution there. The full `hop.solve_multi` amplifies any
+        //     component of `a` outside `range(H_free)` by
+        //     `1/σ_min(H_active_normal)` — which on biobank-scale
+        //     survival marginal-slope (commit d6b17a7f) is ~10¹² and
+        //     trips the envelope-consistency check downstream; the
+        //     lifted kernel drops that null-space contribution by
+        //     construction and stays bounded.
+        //
+        //   * Otherwise (no active constraints) → use the full
+        //     `hop.solve_multi`. The inner solver converges β̂ ∈ R^p in
+        //     the unconstrained full space, so the IFT derivative is
+        //     `β̂_ψ = −H⁻¹ · g_ψ` with the FULL Hessian, even when the
+        //     LAML cost surface itself uses the projected logdet
+        //     `½ log|U_Sᵀ H U_S|`. Projecting `v` through bare K_S
+        //     = U_S·(U_Sᵀ H U_S)⁻¹·U_Sᵀ here would discard the
+        //     `null(S₊)` component of dβ̂/dψ, which is non-zero for any
+        //     family whose `X` has columns living in `null(S₊)` (e.g.,
+        //     an intercept under a wiggle smoothing penalty under
+        //     Probit / Logit / cloglog, where the working weight
+        //     `W(η(β̂))` changes with ψ and pushes the intercept along
+        //     with β̂). The penalty-subspace projection on the TRACE
+        //     side (the outer `tr[K · …]` contraction with K_S) is
+        //     unchanged — that is what the projected LAML cost identity
+        //     demands — only the IFT *direction* `v` is restored to the
+        //     full solve, which is the kernel `duchon_probit_per_row_dnu_dpsi_fd_vs_analytic`
+        //     pins via the FD reference `c · dη/dψ_total = c · (η_+ − η_−)/2h`.
         let kernel = solution.penalty_subspace_trace.as_ref();
-        if let Some(kernel) = kernel {
-            // Lift to a *constraint-aware* kernel when the inner solver
-            // recorded active inequality constraints. The Schur-complement
-            // formula
-            //   K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S
-            // returns the minimum-norm IFT mode response inside
-            // T = range(S₊) ∩ ker(A_act) — the smooth manifold the inner
-            // is genuinely moving on — and matches the derivative of the
-            // projected Laplace cost log|U_Tᵀ H U_T|. When no active
-            // constraints are present the helper degrades to bare K_S
-            // with zero overhead.
-            let constrained = solution
-                .active_constraints
-                .as_ref()
-                .map(|block| kernel.with_active_constraints(block.a.view()));
-            let apply = |v: &Array1<f64>| -> Array1<f64> {
-                match constrained.as_ref() {
-                    Some(ck) if ck.has_active_constraints() => ck.apply_pseudo_inverse(v),
-                    _ => kernel.apply_pseudo_inverse(v),
-                }
-            };
+        let constrained_kernel = match (kernel, solution.active_constraints.as_ref()) {
+            (Some(kernel), Some(block)) => {
+                let ck = kernel.with_active_constraints(block.a.view());
+                ck.has_active_constraints().then_some(ck)
+            }
+            _ => None,
+        };
+        if let Some(ck) = constrained_kernel.as_ref() {
+            let apply = |v: &Array1<f64>| -> Array1<f64> { ck.apply_pseudo_inverse(v) };
             let rho_v_ks = if need_rho_mode_responses {
                 Some(
                     rho_curvature_a_k_betas
@@ -9453,24 +9460,28 @@ fn compute_outer_hessian(
     let v_ks_storage: Option<Vec<Array1<f64>>> = match workspace.and_then(|ws| ws.rho_v_ks) {
         Some(_) => None,
         None => {
+            // IFT mode responses: use lifted kernel `K_T` ONLY when active
+            // inequality constraints clamp the inner solution onto a smooth
+            // sub-manifold (`T = range(S₊) ∩ ker(A_act)`). Otherwise use
+            // the full `hop.solve` — the inner solver converges β̂ ∈ R^p in
+            // the unconstrained full space and the IFT identity demands
+            // the full Hessian solve `β̂_ψ = −H⁻¹ g_ψ`, even when the LAML
+            // cost surface uses the projected logdet `½ log|U_Sᵀ H U_S|`.
+            // See the parallel comment at the gradient site (`ext_v_is` /
+            // `rho_v_ks` construction in `reml_laml_evaluate`).
             let subspace = solution.penalty_subspace_trace.as_deref();
-            if let Some(kernel) = subspace {
-                let constrained = solution
-                    .active_constraints
-                    .as_ref()
-                    .map(|block| kernel.with_active_constraints(block.a.view()));
+            let constrained_kernel = match (subspace, solution.active_constraints.as_ref()) {
+                (Some(kernel), Some(block)) => {
+                    let ck = kernel.with_active_constraints(block.a.view());
+                    ck.has_active_constraints().then_some(ck)
+                }
+                _ => None,
+            };
+            if let Some(ck) = constrained_kernel.as_ref() {
                 Some(
                     curvature_a_k_betas
                         .iter()
-                        .map(|a_k_beta| {
-                            // WS1a fallback: projected kernel for rank-deficient LAML path.
-                            match constrained.as_ref() {
-                                Some(ck) if ck.has_active_constraints() => {
-                                    ck.apply_pseudo_inverse(a_k_beta)
-                                }
-                                _ => kernel.apply_pseudo_inverse(a_k_beta),
-                            }
-                        })
+                        .map(|a_k_beta| ck.apply_pseudo_inverse(a_k_beta))
                         .collect(),
                 )
             } else {
@@ -9613,22 +9624,25 @@ fn compute_outer_hessian(
             None
         }
         None => {
+            // IFT mode responses (see parallel comment at the gradient site):
+            // use lifted kernel `K_T` only when active inequality constraints
+            // are present; otherwise full `hop.solve` to keep the IFT chain
+            // rule `β̂_ψ = −H⁻¹ g_ψ` consistent with the unconstrained
+            // PIRLS fixed point.
             let subspace = solution.penalty_subspace_trace.as_deref();
-            if let Some(kernel) = subspace {
-                let constrained = solution
-                    .active_constraints
-                    .as_ref()
-                    .map(|block| kernel.with_active_constraints(block.a.view()));
+            let constrained_kernel = match (subspace, solution.active_constraints.as_ref()) {
+                (Some(kernel), Some(block)) => {
+                    let ck = kernel.with_active_constraints(block.a.view());
+                    ck.has_active_constraints().then_some(ck)
+                }
+                _ => None,
+            };
+            if let Some(ck) = constrained_kernel.as_ref() {
                 Some(
                     solution
                         .ext_coords
                         .iter()
-                        .map(|coord| match constrained.as_ref() {
-                            Some(ck) if ck.has_active_constraints() => {
-                                ck.apply_pseudo_inverse(&coord.g)
-                            }
-                            _ => kernel.apply_pseudo_inverse(&coord.g),
-                        })
+                        .map(|coord| ck.apply_pseudo_inverse(&coord.g))
                         .collect(),
                 )
             } else {
@@ -10969,23 +10983,29 @@ fn build_outer_hessian_operator(
         .collect();
     // Mode responses are fixed-β stationarity derivatives. The main
     // evaluator passes precomputed responses so gradient and Hessian share
-    // the same solve kernel, including projected kernels in rank-deficient
-    // LAML. The standalone path below must mirror `compute_outer_hessian`'s
-    // kernel selection exactly: when `penalty_subspace_trace` is installed
-    // (rank-deficient LAML fix active), the per-coordinate mode response
-    // `v = -H^{-1} g` is replaced by the projected pseudo-inverse
-    // `v = K · g = U_S · H_proj^{-1} · U_S^T · g`, lifted to the
-    // active-constraint manifold via the Schur-complement
-    // `K_T = K_S − K_S A^T (A K_S A^T)^{-1} A K_S` when an active block is
-    // present. The dense gradient path applies the same selection at the
-    // gradient site (line ~7480) and the dense Hessian path uses it at
-    // line ~9585; if this fallback routes through `hop.solve_multi` instead,
-    // the operator-form Hessian computes `H^{-1} g` while the dense path
-    // computes `K g`, and the two materializations disagree on every entry
-    // whose row or column lives outside `range(U_S)`. The test
+    // the same solve kernel; when none are provided this standalone path
+    // must mirror the dense evaluator's selection exactly, otherwise the
+    // operator-form Hessian and dense materialization disagree on every
+    // entry whose row or column lives outside `range(U_S)`. The test
     // `projected_operator_hessian_matches_dense_subspace_trace` exercises
-    // exactly that disagreement.
+    // that disagreement.
+    //
+    // Selection rule (same as the gradient and dense-Hessian sites — see
+    // their comments in `reml_laml_evaluate` / `compute_outer_hessian` for
+    // the math):
+    //   * Active inequality constraints present → lifted kernel
+    //     `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S` (β̂ constrained to T).
+    //   * Otherwise → full `hop.solve_multi` (IFT chain rule with the
+    //     full Hessian; LAML projection on the trace contraction side
+    //     only).
     let subspace = solution.penalty_subspace_trace.as_deref();
+    let constrained_kernel_for_v = match (subspace, solution.active_constraints.as_ref()) {
+        (Some(kernel), Some(block)) => {
+            let ck = kernel.with_active_constraints(block.a.view());
+            ck.has_active_constraints().then_some(ck)
+        }
+        _ => None,
+    };
     let coord_vs_storage;
     let coord_vs: &[Array1<f64>] = if let Some(precomputed) = precomputed_coord_vs {
         if precomputed.len() != total {
@@ -11002,17 +11022,8 @@ fn build_outer_hessian_operator(
     } else {
         let owned = if total == 0 {
             Vec::new()
-        } else if let Some(kernel) = subspace {
-            let constrained = solution
-                .active_constraints
-                .as_ref()
-                .map(|block| kernel.with_active_constraints(block.a.view()));
-            let apply = |v: &Array1<f64>| -> Array1<f64> {
-                match constrained.as_ref() {
-                    Some(ck) if ck.has_active_constraints() => ck.apply_pseudo_inverse(v),
-                    _ => kernel.apply_pseudo_inverse(v),
-                }
-            };
+        } else if let Some(ck) = constrained_kernel_for_v.as_ref() {
+            let apply = |v: &Array1<f64>| -> Array1<f64> { ck.apply_pseudo_inverse(v) };
             let mut vs = Vec::with_capacity(total);
             for idx in 0..k {
                 vs.push(apply(&rho_curvature_a_k_betas[idx]));
