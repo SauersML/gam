@@ -115,9 +115,10 @@ model.report("out.html")            # standalone HTML report
 ```
 
 `Model.summary()` returns a `Summary` carrying the formula, family
-name, model class, deviance, REML or LAML score, iteration count, and
-per-coefficient estimates with standard errors and credible-interval
-bounds. The summary is cached after the first call.
+name, model class, deviance, REML/LAML criterion (in the `reml_score`
+field), per-coefficient estimates with standard errors and
+credible-interval bounds, smoothing parameters, and group metadata.
+The summary is cached after the first call.
 
 See [diagnostics.md](diagnostics.md) for the full list.
 
