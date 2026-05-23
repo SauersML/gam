@@ -5844,7 +5844,7 @@ fn arrow_schur_newton_step<'py>(
     ridge_beta: f64,
 ) -> PyResult<Py<PyDict>> {
     use gam::solver::arrow_schur::{
-        solve_arrow_newton_step, ArrowRowBlock, ArrowSchurSystem,
+        solve_arrow_newton_step_core, ArrowRowBlock, ArrowSchurSystem, ArrowSolveOptions,
     };
     let htt = htt_blocks.as_array();
     let htb = htbeta_blocks.as_array();
@@ -5905,8 +5905,10 @@ fn arrow_schur_newton_step<'py>(
         }
         sys.gb[a] = gb_v[a];
     }
-    let (delta_t, delta_beta, _cache) = solve_arrow_newton_step(&sys, ridge_t, ridge_beta)
-        .map_err(|e| py_value_error(format!("arrow-Schur solve: {e}")))?;
+    let solve_options = ArrowSolveOptions::automatic(sys.k);
+    let (delta_t, delta_beta) =
+        solve_arrow_newton_step_core(&sys, ridge_t, ridge_beta, &solve_options)
+            .map_err(|e| py_value_error(format!("arrow-Schur solve: {e}")))?;
     let out = PyDict::new(py);
     out.set_item("delta_t", delta_t.into_pyarray(py))?;
     out.set_item("delta_beta", delta_beta.into_pyarray(py))?;
