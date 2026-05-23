@@ -3599,8 +3599,13 @@ impl LinkWigglePosterior {
         // against the unscaled Hessian, silently targeting H⁻¹.
         // Fixed-scale families (Binomial / Poisson) take this branch
         // with `sqrt_phi == 1` and pay no overhead.
+        // Gamma uses the shape parameterization: `scale = α = 1/φ`, so the
+        // dispersion that scales `Vb = φ·H⁻¹` is `φ = 1/α`. Without this
+        // factor the Gamma sampler whitened against an unscaled Hessian
+        // exactly the way the Gaussian branch did before this fix.
         let sqrt_phi = match nuts_family {
             NutsFamily::Gaussian => scale.max(0.0),
+            NutsFamily::GammaLog => 1.0 / scale.max(1e-10).sqrt(),
             _ => 1.0,
         };
         if (sqrt_phi - 1.0).abs() > 0.0 {
@@ -3805,10 +3810,23 @@ impl LinkWigglePosterior {
         // quadratic and its gradient must use the same factor — otherwise
         // the prior and likelihood live on incompatible scales and the
         // MAP-anchored posterior used for whitening picks up a hidden
-        // φ-mismatch. Non-Gaussian branches above leave the data term
-        // un-scaled and pass `1.0` here so the prior shape is unchanged.
+        // φ-mismatch.
+        //
+        // Gamma uses the shape parameterization: `self.scale = α = 1/φ` and
+        // the data-side log-likelihood already carries an explicit `shape`
+        // factor (`w_i * shape * (-y_i/μ - eta_i)` and
+        // `residual = w_i * shape * (y_i/μ - 1)`). Derivation: for the
+        // shape-rate Gamma with `Var(Y) = φ·μ² = μ²/α`, the canonical-form
+        // log-density score w.r.t. η on the log link is
+        // `dℓ/dη = α·(y/μ − 1)`. The data term is therefore implicitly
+        // `1/φ`-scaled via `shape = α`. The penalty must match that scale,
+        // so use `1/φ = shape` here.
+        //
+        // Other non-Gaussian fixed-scale branches (Binomial / Poisson) have
+        // `φ ≡ 1` and `1/φ = 1`, so the prior shape is unchanged.
         let penalty_scale = match self.nuts_family {
             NutsFamily::Gaussian => 1.0 / (self.scale * self.scale).max(1e-10),
+            NutsFamily::GammaLog => self.scale.max(1e-10),
             _ => 1.0,
         };
 
