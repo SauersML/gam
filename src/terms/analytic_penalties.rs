@@ -557,11 +557,11 @@ impl IsometryPenalty {
     /// This is the single contraction site where `W_n` (or its `U_n` factor)
     /// is consumed. Every value/grad/hvp path funnels through here, so the
     /// `(J^T U)(U^T J)` ordering invariant cannot be violated by accident.
-    fn projected_jacobian_row(&self, n: usize, d: usize) -> Array2<f64> {
-        let jac = self
-            .jacobian_cache
-            .as_ref()
-            .expect("isometry penalty requires a live jacobian cache");
+    fn projected_jacobian_row(&self, n: usize, d: usize) -> Option<Array2<f64>> {
+        let Some(jac) = self.jacobian_cache.as_ref() else {
+            self.missing_cache_default("projected_jacobian_row", "jacobian_cache is None");
+            return None;
+        };
         let jac_row = jac.row(n);
         let jac_slice = jac_row
             .as_slice()
@@ -575,24 +575,26 @@ impl IsometryPenalty {
                         m[[i, a]] = jac_slice[i * d + a];
                     }
                 }
-                m
+                Some(m)
             }
             WeightField::Factored { u, rank, p_out } => {
                 let u_row = u.row(n);
                 let u_slice = u_row
                     .as_slice()
                     .expect("weight factor U must be in standard row-major layout");
-                WeightField::project_jac_row_with_u(u_slice, jac_slice, *p_out, *rank, d)
+                Some(WeightField::project_jac_row_with_u(
+                    u_slice, jac_slice, *p_out, *rank, d,
+                ))
             }
         }
     }
 
     /// Form `W_n J_n` without materializing `W_n`.
-    fn weighted_jacobian_row(&self, n: usize, d: usize) -> Array2<f64> {
-        let jac = self
-            .jacobian_cache
-            .as_ref()
-            .expect("isometry penalty requires a live jacobian cache");
+    fn weighted_jacobian_row(&self, n: usize, d: usize) -> Option<Array2<f64>> {
+        let Some(jac) = self.jacobian_cache.as_ref() else {
+            self.missing_cache_default("weighted_jacobian_row", "jacobian_cache is None");
+            return None;
+        };
         let p = self.p_out;
         match &self.weight {
             WeightField::Identity => {
@@ -602,12 +604,12 @@ impl IsometryPenalty {
                         out[[i, a]] = jac[[n, i * d + a]];
                     }
                 }
-                out
+                Some(out)
             }
             WeightField::Factored { u, rank, p_out } => {
                 debug_assert_eq!(p, *p_out);
                 let r = *rank;
-                let m_n = self.projected_jacobian_row(n, d);
+                let m_n = self.projected_jacobian_row(n, d)?;
                 let mut out = Array2::<f64>::zeros((p, d));
                 for i in 0..p {
                     for a in 0..d {
@@ -618,7 +620,7 @@ impl IsometryPenalty {
                         out[[i, a]] = s;
                     }
                 }
-                out
+                Some(out)
             }
         }
     }
@@ -850,18 +852,18 @@ impl IsometryPenalty {
     /// Cost per row: `O(p · r · d)` for the `M_n` build (single pass over
     /// `U_n` and `J_n`) plus `O(r · d²)` for `M_n^T M_n`. The `p × p` weight
     /// `W_n` is never materialized.
-    fn pullback_metric(&self, latent_dim: usize) -> Array2<f64> {
-        let jac = self
-            .jacobian_cache
-            .as_ref()
-            .expect("isometry penalty requires a live jacobian cache");
+    fn pullback_metric(&self, latent_dim: usize) -> Option<Array2<f64>> {
+        let Some(jac) = self.jacobian_cache.as_ref() else {
+            self.missing_cache_default("pullback_metric", "jacobian_cache is None");
+            return None;
+        };
         let n_obs = jac.nrows();
         let p = self.p_out;
         debug_assert_eq!(jac.ncols(), p * latent_dim);
         let mut g_all = Array2::<f64>::zeros((n_obs, latent_dim * latent_dim));
         for n in 0..n_obs {
             // M_n = U_n^T J_n  (or J_n itself when W = I).
-            let m = self.projected_jacobian_row(n, latent_dim);
+            let m = self.projected_jacobian_row(n, latent_dim)?;
             let r = m.nrows();
             // g_n = M_n^T M_n: (d × d) result, contracting r.
             for a in 0..latent_dim {
@@ -874,7 +876,7 @@ impl IsometryPenalty {
                 }
             }
         }
-        g_all
+        Some(g_all)
     }
 
     /// Reference metric per row, `(n_obs, d*d)`.
@@ -912,7 +914,9 @@ impl AnalyticPenalty for IsometryPenalty {
         if !self.has_jacobian_cache("value") {
             return Self::DEFAULT_VALUE_ON_MISSING_CACHE;
         }
-        let g = self.pullback_metric(d);
+        let Some(g) = self.pullback_metric(d) else {
+            return Self::DEFAULT_VALUE_ON_MISSING_CACHE;
+        };
         let g_ref = self.reference_metric(n_obs, d);
         let mu = rho[self.rho_index].exp();
         let mut acc = 0.0;
@@ -952,7 +956,9 @@ impl AnalyticPenalty for IsometryPenalty {
         {
             return Array1::<f64>::zeros(target.len());
         }
-        let g = self.pullback_metric(d);
+        let Some(g) = self.pullback_metric(d) else {
+            return Array1::<f64>::zeros(target.len());
+        };
         let g_ref = self.reference_metric(n_obs, d);
         let p = self.p_out;
         let mu = rho[self.rho_index].exp();
@@ -963,7 +969,9 @@ impl AnalyticPenalty for IsometryPenalty {
         debug_assert_eq!(jac2.ncols(), p * d * d);
 
         for n in 0..n_obs {
-            let wj = self.weighted_jacobian_row(n, d);
+            let Some(wj) = self.weighted_jacobian_row(n, d) else {
+                return grad;
+            };
             for c in 0..d {
                 let mut acc = 0.0;
                 for a in 0..d {
@@ -1023,11 +1031,15 @@ impl AnalyticPenalty for IsometryPenalty {
         let Some(jac3) = self.jacobian_third(target, n_obs, d) else {
             return out;
         };
-        let g = self.pullback_metric(d);
+        let Some(g) = self.pullback_metric(d) else {
+            return out;
+        };
         let g_ref = self.reference_metric(n_obs, d);
 
         for n in 0..n_obs {
-            let wj = self.weighted_jacobian_row(n, d);
+            let Some(wj) = self.weighted_jacobian_row(n, d) else {
+                return out;
+            };
             let mut delta_g = Array2::<f64>::zeros((d, d));
             for a in 0..d {
                 for b in 0..d {
@@ -1848,7 +1860,7 @@ impl AnalyticPenalty for SparsityPenalty {
 /// REML-selectable log-precision per axis. Penalty contribution for axis `j`:
 ///
 /// ```text
-///   P_j(t; ρ) = ½ exp(ρ_j) · ‖t[:, j]‖²
+///   P_j(t; ρ) = ½ exp(ρ_j) · ‖t[:, j]‖² - (n_eff / 2) · ρ_j
 /// ```
 ///
 /// summed over `j ∈ [0, d)`. Under REML, axis `j` whose data evidence is too
