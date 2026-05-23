@@ -272,8 +272,8 @@ class LatentCoord:
         ``d_max`` budget — REML will drive unused axes' precision to ∞.
     init : ``"pca"`` | ``"random"`` | array-like ``(N, d)``
         Initial values for ``t``. ``"pca"`` (default) PCA-projects the
-        response down to ``d`` and centers; ``"random"`` draws standard
-        Gaussian; an explicit array overrides both.
+        response down to ``d`` and centers; ``"random"`` draws uniform
+        values in ``[0, 1)``; an explicit array overrides both.
     aux_prior : dict, optional
         iVAE-style identifiability fix. Keys:
 
