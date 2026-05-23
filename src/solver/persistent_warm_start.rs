@@ -544,6 +544,7 @@ pub fn apply_ift_retraction(
 ///
 /// `beta_rho[:, a]` is `∂β*/∂ρ_a`; `u_rho[:, a]` is `∂u*/∂ρ_a` flat
 /// row-major. Shapes follow the contract in proposal §5.3.
+#[allow(dead_code)] // INTEGRATION-HOOK(evidence): consumed by solver/evidence::evidence_grad_rho when REML driver routes IFT cascade through this entry point.
 #[derive(Debug, Clone)]
 pub struct ArrowIftCascade {
     pub beta_rho: ndarray::Array2<f64>,
@@ -564,6 +565,7 @@ pub struct ArrowIftCascade {
 ///
 /// This function does not mutate the cache and does not rebuild the
 /// design (proposal §5.3 operational contract).
+#[allow(dead_code)] // INTEGRATION-HOOK(evidence): see ArrowIftCascade.
 pub fn ift_cascade_through_rho(
     cache: &ArrowFactorCache,
     schur_rhs_rho: ndarray::ArrayView2<'_, f64>,
