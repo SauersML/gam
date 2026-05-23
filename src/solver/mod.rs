@@ -13,3 +13,9 @@ pub mod seeding;
 pub mod visualizer;
 pub(crate) mod workflow;
 pub mod latent_inner;
+pub mod evidence;
+
+pub use evidence::{
+    evidence_grad_rho, laplace_evidence, select_topology, SelectedTopology, TopologyCandidate,
+    TopologyKind, TopologySelectOptions,
+};
