@@ -218,6 +218,14 @@ fn weighted_crossprod_dense_rows(
     right: &Array2<f64>,
     rows: Range<usize>,
 ) -> Array2<f64> {
+    // PSD precondition: callers (Fisher-scoring weighted crossprod) must supply
+    // nonneg weights. The prior `.max(0.0)` clip silently discarded
+    // negative-curvature contributions and masked sign bugs upstream; the debug
+    // assertion turns that into a loud failure in tests instead.
+    debug_assert!(
+        weights.iter().all(|&w| w >= 0.0),
+        "weighted_crossprod_dense_rows requires nonneg weights; use the signed Gram routine for observed-Hessian assembly"
+    );
     let p_left = left.ncols();
     let p_right = right.ncols();
     let mut out = Array2::<f64>::zeros((p_left, p_right));
@@ -227,7 +235,7 @@ fn weighted_crossprod_dense_rows(
         {
             let out_slice = out.as_slice_mut().expect("zeros are contiguous");
             for i in rows {
-                let wi = w[i].max(0.0);
+                let wi = w[i];
                 if wi == 0.0 {
                     continue;
                 }
@@ -248,7 +256,7 @@ fn weighted_crossprod_dense_rows(
         }
     }
     for i in rows {
-        let wi = weights[i].max(0.0);
+        let wi = weights[i];
         if wi == 0.0 {
             continue;
         }
