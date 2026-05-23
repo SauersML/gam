@@ -9593,12 +9593,12 @@ fn compute_outer_hessian(
     // third-derivative adjoint above.
     let glm_ingredients = effective_deriv.scalar_glm_ingredients();
     let leverage = if incl_logdet_h {
-        glm_ingredients.as_ref().map(|ing| {
-            match solution.penalty_subspace_trace.as_deref() {
+        glm_ingredients
+            .as_ref()
+            .map(|ing| match solution.penalty_subspace_trace.as_deref() {
                 Some(kernel) => kernel.xt_projected_kernel_x_diagonal(ing.x),
                 None => hop.xt_logdet_kernel_x_diagonal(ing.x),
-            }
-        })
+            })
     } else {
         None
     };
@@ -18343,8 +18343,7 @@ mod tests {
             }
             h_dense[i] = acc;
         }
-        let streamed =
-            compute_adjoint_z_c(&ing, &hop, &h_dense, None, None).expect("adjoint path");
+        let streamed = compute_adjoint_z_c(&ing, &hop, &h_dense, None, None).expect("adjoint path");
 
         let mut t = h_dense.clone();
         Zip::from(&mut t)
