@@ -11,7 +11,7 @@ use gam::estimate::{
 use gam::faer_ndarray::{
     FaerCholesky, FaerEigh, array2_to_matmut, factorize_symmetricwith_fallback, fast_xt_diag_x,
 };
-use gam::families::family_meta::inverse_link_to_binomial_family;
+use gam::families::family_meta::inverse_link_to_binomial_spec;
 use gam::families::scale_design::{build_scale_deviation_transform, infer_non_intercept_start};
 use gam::families::survival_construction::{SavedSurvivalTimeBasis, survival_likelihood_modename};
 use gam::families::survival_location_scale::{
@@ -9180,7 +9180,14 @@ fn build_bernoulli_marginal_slope_ffi_payload(
         .clone()
         .ok_or_else(|| "bernoulli marginal-slope requires z_column".to_string())?;
 
-    let likelihood = inverse_link_to_binomial_family(&base_link);
+    let likelihood_spec =
+        inverse_link_to_binomial_spec(&base_link).map_err(|e| e.to_string())?;
+    let likelihood = LikelihoodFamily::try_from(likelihood_spec).map_err(|e| {
+        format!(
+            "failed to resolve LikelihoodFamily for bernoulli marginal-slope base link {:?}: {e}",
+            base_link
+        )
+    })?;
 
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
@@ -9592,12 +9599,21 @@ fn build_binomial_location_scale_ffi_payload(
         _ => None,
     };
 
+    let location_scale_likelihood_spec =
+        inverse_link_to_binomial_spec(&link_kind).map_err(|e| e.to_string())?;
+    let location_scale_likelihood = LikelihoodFamily::try_from(location_scale_likelihood_spec)
+        .map_err(|e| {
+            format!(
+                "failed to resolve LikelihoodFamily for binomial location-scale link {:?}: {e}",
+                link_kind
+            )
+        })?;
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
         formula,
         ModelKind::LocationScale,
         FittedFamily::LocationScale {
-            likelihood: inverse_link_to_binomial_family(&link_kind),
+            likelihood: location_scale_likelihood,
             base_link: Some(link_kind.clone()),
         },
         "binomial-location-scale".to_string(),
