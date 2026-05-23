@@ -1084,17 +1084,25 @@ fn solve_arrow_newton_step_artifacts(
     };
 
     // 4. Back-substitute Δt_i = -(H_tt^(i))⁻¹ (g_t^(i) + H_tβ^(i) Δβ).
+    //
+    // Reuse a single d-length scratch buffer across rows; the per-row
+    // factor `htt_factors[i]` and cross block `htbeta` are reused as
+    // read-only inputs. The row-major (d, k) layout of `htbeta` makes
+    // `htbeta[[c, a]]` unit-strided over `a`, which is exactly the
+    // inner-loop order used here.
     let mut delta_t = Array1::<f64>::zeros(n * d);
+    let mut rhs = Array1::<f64>::zeros(d);
     for i in 0..n {
-        let mut tmp = sys.rows[i].gt.clone();
+        debug_assert_eq!(sys.rows[i].gt.len(), d);
+        debug_assert_eq!(sys.rows[i].htbeta.dim(), (d, k));
         for c in 0..d {
-            let mut acc = 0.0;
+            let mut acc = sys.rows[i].gt[c];
             for a in 0..k {
                 acc += sys.rows[i].htbeta[[c, a]] * delta_beta[a];
             }
-            tmp[c] += acc;
+            rhs[c] = acc;
         }
-        let dt_i = backend.solve_block_vector(&htt_factors[i], &tmp);
+        let dt_i = backend.solve_block_vector(&htt_factors[i], &rhs);
         for c in 0..d {
             delta_t[i * d + c] = -dt_i[c];
         }
@@ -1188,16 +1196,25 @@ fn reduced_rhs_beta<B: BatchedBlockSolver>(
     htt_factors: &[Array2<f64>],
     backend: &B,
 ) -> Array1<f64> {
+    // Numerical invariant: each per-row `H_tt^(i)` factor must be PD
+    // (already enforced by the adaptive-ridge `factor_blocks`).
     let k = sys.k;
+    let d = sys.d;
     let mut rhs_beta = Array1::<f64>::zeros(k);
     for (i, row) in sys.rows.iter().enumerate() {
+        debug_assert_eq!(row.htbeta.dim(), (d, k));
         let v = backend.solve_block_vector(&htt_factors[i], &row.gt);
-        for a in 0..k {
-            let mut acc = 0.0;
-            for c in 0..sys.d {
-                acc += row.htbeta[[c, a]] * v[c];
+        // Reorder to (c, a): outer-loop on c hoists `v[c]` out of the
+        // inner-`a` loop and lets that loop walk `row.htbeta[[c, a]]`
+        // contiguously in the row-major Array2.
+        for c in 0..d {
+            let vc = v[c];
+            if vc == 0.0 {
+                continue;
             }
-            rhs_beta[a] += acc;
+            for a in 0..k {
+                rhs_beta[a] += row.htbeta[[c, a]] * vc;
+            }
         }
     }
     for j in 0..k {
@@ -1322,6 +1339,8 @@ fn schur_matvec<B: BatchedBlockSolver>(
     }
     let mut local = Array1::<f64>::zeros(d);
     for (i, row) in sys.rows.iter().enumerate() {
+        debug_assert_eq!(row.htbeta.dim(), (d, k));
+        // H_tβ^(i) · x : row-major (d, k) is unit-strided in the inner k-loop.
         for c in 0..d {
             let mut acc = 0.0;
             for a in 0..k {
@@ -1330,12 +1349,16 @@ fn schur_matvec<B: BatchedBlockSolver>(
             local[c] = acc;
         }
         let solved = backend.solve_block_vector(&htt_factors[i], &local);
-        for a in 0..k {
-            let mut acc = 0.0;
-            for c in 0..d {
-                acc += row.htbeta[[c, a]] * solved[c];
+        // H_βt^(i) · solved : iterate c outer to keep htbeta access
+        // contiguous in the inner a-loop.
+        for c in 0..d {
+            let sc = solved[c];
+            if sc == 0.0 {
+                continue;
             }
-            out[a] -= acc;
+            for a in 0..k {
+                out[a] -= row.htbeta[[c, a]] * sc;
+            }
         }
     }
 }
