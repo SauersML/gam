@@ -1231,6 +1231,7 @@ mod tests {
             explicit.view(),
             NutsFamily::Gaussian,
             1.0,
+            crate::estimate::Dispersion::Known(1.0),
             false,
         )
         .expect("HMC target whitens with upstream Hessian");
@@ -1462,6 +1463,7 @@ mod tests {
             hessian.view(),
             NutsFamily::BinomialLogit,
             1.0,
+            crate::estimate::Dispersion::Known(1.0),
             true,
         )
         .expect("posterior");
@@ -1735,6 +1737,7 @@ mod tests {
             hessian.view(),
             NutsFamily::Gaussian,
             1.0,
+            crate::estimate::Dispersion::Known(1.0),
             false,
             &cfg,
         )
