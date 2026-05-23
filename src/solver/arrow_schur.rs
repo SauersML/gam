@@ -572,8 +572,7 @@ impl ArrowSchurSystem {
             let htt_e = row.htt.clone();
             let htbeta_e = row.htbeta.clone();
             row.gt = manifold.project_to_tangent(t_i.clone(), gt_e.view());
-            row.htt =
-                manifold.riemannian_hessian_matrix(t_i.clone(), gt_e.view(), htt_e.view());
+            row.htt = manifold.riemannian_hessian_matrix(t_i.clone(), gt_e.view(), htt_e.view());
             row.htbeta = manifold.project_matrix_columns_to_tangent(t_i, htbeta_e.view());
         }
     }
@@ -870,26 +869,21 @@ pub fn solve_arrow_newton_step_with_options(
 
     // 2. Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
     let rhs_beta = reduced_rhs_beta(sys, &htt_factors, &backend);
+    let trust_metric_weights = if options.riemannian_trust_region {
+        trust_region_metric_weights_for_dim(sys, k)
+    } else {
+        None
+    };
 
     // 3. Solve reduced shared system using the selected BA mode.
     let (delta_beta, schur_factor) = match options.mode {
         ArrowSolverMode::Direct => {
             let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, &backend)?;
-            solve_dense_reduced_system(
-                &schur,
-                &rhs_beta,
-                options,
-                trust_region_metric_weights_for_dim(sys, k),
-            )?
+            solve_dense_reduced_system(&schur, &rhs_beta, options, trust_metric_weights)?
         }
         ArrowSolverMode::SqrtBA => {
             let schur = build_dense_schur_sqrt_ba(sys, &htt_factors, ridge_beta, &backend)?;
-            solve_dense_reduced_system(
-                &schur,
-                &rhs_beta,
-                options,
-                trust_region_metric_weights_for_dim(sys, k),
-            )?
+            solve_dense_reduced_system(&schur, &rhs_beta, options, trust_metric_weights)?
         }
         ArrowSolverMode::InexactPCG => {
             let preconditioner =
@@ -903,7 +897,7 @@ pub fn solve_arrow_newton_step_with_options(
                 &options.pcg,
                 &options.trust_region,
                 &backend,
-                trust_region_metric_weights_for_dim(sys, k),
+                trust_metric_weights,
             )?;
             (delta, None)
         }
@@ -1105,15 +1099,12 @@ fn solve_dense_reduced_system(
     schur: &Array2<f64>,
     rhs_beta: &Array1<f64>,
     options: &ArrowSolveOptions,
+    metric_weights: Option<&MetricWeights>,
 ) -> Result<(Array1<f64>, Option<Array2<f64>>), ArrowSchurError> {
     let factor =
         cholesky_lower(schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
     let direct = chol_solve_vector(&factor, rhs_beta);
-    if step_inside_trust_region(
-        direct.view(),
-        options.trust_region.radius,
-        options.riemannian_trust_region,
-    ) {
+    if step_inside_trust_region(direct.view(), options.trust_region.radius, metric_weights) {
         return Ok((direct, Some(factor)));
     }
 
@@ -1130,6 +1121,7 @@ fn solve_dense_reduced_system(
             relative_tolerance: options.trust_region.steihaug_relative_tolerance,
         },
         &options.trust_region,
+        metric_weights,
     )?;
     Ok((delta, Some(factor)))
 }
@@ -1137,12 +1129,21 @@ fn solve_dense_reduced_system(
 fn step_inside_trust_region(
     step: ArrayView1<'_, f64>,
     radius: f64,
-    _riemannian_metric: bool,
+    metric_weights: Option<&MetricWeights>,
 ) -> bool {
-    // The current Riemannian manifolds use the ambient Euclidean pullback
-    // metric. Once row blocks have been tangent-projected, the trust-region
-    // norm is therefore the same L2 norm used by the Euclidean BA path.
-    !radius.is_finite() || array_l2_norm(step) <= radius
+    !radius.is_finite() || metric_norm(step, metric_weights) <= radius
+}
+
+fn trust_region_metric_weights_for_dim(
+    sys: &ArrowSchurSystem,
+    dim: usize,
+) -> Option<&MetricWeights> {
+    // Steihaug-CG here runs on the reduced shared vector. Latent manifold
+    // weights are only a valid metric for this vector when dimensions agree.
+    match sys.trust_region_metric_weights.as_deref() {
+        Some(weights) if weights.len() == dim => Some(weights),
+        _ => None,
+    }
 }
 
 fn schur_matvec<B: BatchedBlockSolver>(
@@ -1271,6 +1272,7 @@ fn steihaug_pcg_reduced_system<B: BatchedBlockSolver>(
     pcg: &ArrowPcgOptions,
     trust: &ArrowTrustRegionOptions,
     backend: &B,
+    metric_weights: Option<&MetricWeights>,
 ) -> Result<Array1<f64>, ArrowSchurError> {
     steihaug_cg(
         rhs,
@@ -1280,6 +1282,7 @@ fn steihaug_pcg_reduced_system<B: BatchedBlockSolver>(
         pcg.relative_tolerance
             .max(trust.steihaug_relative_tolerance),
         trust.radius,
+        metric_weights,
     )
 }
 
@@ -1289,6 +1292,7 @@ fn steihaug_dense_system(
     preconditioner: &IdentityPreconditioner,
     pcg: &ArrowPcgOptions,
     trust: &ArrowTrustRegionOptions,
+    metric_weights: Option<&MetricWeights>,
 ) -> Result<Array1<f64>, ArrowSchurError> {
     steihaug_cg(
         rhs,
@@ -1297,6 +1301,7 @@ fn steihaug_dense_system(
         pcg.max_iterations,
         pcg.relative_tolerance,
         trust.radius,
+        metric_weights,
     )
 }
 
@@ -1307,6 +1312,7 @@ fn steihaug_cg<MatVec, ApplyPrec>(
     max_iterations: usize,
     relative_tolerance: f64,
     trust_radius: f64,
+    metric_weights: Option<&MetricWeights>,
 ) -> Result<Array1<f64>, ArrowSchurError>
 where
     MatVec: FnMut(&Array1<f64>, &mut Array1<f64>),
@@ -1318,7 +1324,7 @@ where
     } else {
         f64::INFINITY
     };
-    let rhs_norm = array_l2_norm(rhs.view());
+    let rhs_norm = metric_norm(rhs.view(), metric_weights);
     if rhs_norm == 0.0 {
         return Ok(Array1::<f64>::zeros(n));
     }
@@ -1327,10 +1333,10 @@ where
     let mut r = rhs.clone();
     let mut z = apply_preconditioner(&r);
     let mut p = z.clone();
-    let mut rz = dot(&r, &z);
+    let mut rz = metric_dot(&r, &z, metric_weights);
     if rz <= 0.0 || !rz.is_finite() {
         if radius.is_finite() {
-            return Ok(step_to_trust_boundary(&x, &r, radius));
+            return Ok(step_to_trust_boundary(&x, &r, radius, metric_weights));
         }
         return Err(ArrowSchurError::PcgFailed {
             reason: "non-positive preconditioned residual in Schur PCG".to_string(),
@@ -1342,10 +1348,10 @@ where
     let mut ap = Array1::<f64>::zeros(n);
     for _ in 0..max_iterations {
         matvec(&p, &mut ap);
-        let pap = dot(&p, &ap);
+        let pap = metric_dot(&p, &ap, metric_weights);
         if pap <= 0.0 || !pap.is_finite() {
             if radius.is_finite() {
-                return Ok(step_to_trust_boundary(&x, &p, radius));
+                return Ok(step_to_trust_boundary(&x, &p, radius, metric_weights));
             }
             return Err(ArrowSchurError::PcgFailed {
                 reason: "negative curvature in unbounded Schur PCG".to_string(),
@@ -1356,18 +1362,18 @@ where
         for i in 0..n {
             candidate[i] += alpha * p[i];
         }
-        if radius.is_finite() && array_l2_norm(candidate.view()) >= radius {
-            return Ok(step_to_trust_boundary(&x, &p, radius));
+        if radius.is_finite() && metric_norm(candidate.view(), metric_weights) >= radius {
+            return Ok(step_to_trust_boundary(&x, &p, radius, metric_weights));
         }
         x = candidate;
         for i in 0..n {
             r[i] -= alpha * ap[i];
         }
-        if array_l2_norm(r.view()) <= tol {
+        if metric_norm(r.view(), metric_weights) <= tol {
             return Ok(x);
         }
         z = apply_preconditioner(&r);
-        let rz_next = dot(&r, &z);
+        let rz_next = metric_dot(&r, &z, metric_weights);
         if rz_next <= 0.0 || !rz_next.is_finite() {
             return Err(ArrowSchurError::PcgFailed {
                 reason: "non-positive or non-finite PCG residual".to_string(),
@@ -1382,13 +1388,18 @@ where
     Ok(x)
 }
 
-fn step_to_trust_boundary(x: &Array1<f64>, p: &Array1<f64>, radius: f64) -> Array1<f64> {
-    let pp = dot(p, p);
+fn step_to_trust_boundary(
+    x: &Array1<f64>,
+    p: &Array1<f64>,
+    radius: f64,
+    metric_weights: Option<&MetricWeights>,
+) -> Array1<f64> {
+    let pp = metric_dot(p, p, metric_weights);
     if pp == 0.0 {
         return x.clone();
     }
-    let xp = dot(x, p);
-    let xx = dot(x, x);
+    let xp = metric_dot(x, p, metric_weights);
+    let xx = metric_dot(x, x, metric_weights);
     let disc = (xp * xp + pp * (radius * radius - xx)).max(0.0);
     let tau = (-xp + disc.sqrt()) / pp;
     let mut out = x.clone();
@@ -1417,10 +1428,35 @@ fn dot(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
     acc
 }
 
-fn array_l2_norm(v: ArrayView1<'_, f64>) -> f64 {
+fn metric_dot(a: &Array1<f64>, b: &Array1<f64>, metric_weights: Option<&MetricWeights>) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    match metric_weights {
+        Some(weights) => {
+            debug_assert_eq!(weights.len(), a.len());
+            let mut acc = 0.0;
+            for i in 0..a.len() {
+                acc += weights[i] * a[i] * b[i];
+            }
+            acc
+        }
+        None => dot(a, b),
+    }
+}
+
+fn metric_norm(v: ArrayView1<'_, f64>, metric_weights: Option<&MetricWeights>) -> f64 {
     let mut acc = 0.0;
-    for x in v.iter() {
-        acc += x * x;
+    match metric_weights {
+        Some(weights) => {
+            debug_assert_eq!(weights.len(), v.len());
+            for i in 0..v.len() {
+                acc += weights[i] * v[i] * v[i];
+            }
+        }
+        None => {
+            for x in v.iter() {
+                acc += x * x;
+            }
+        }
     }
     acc.sqrt()
 }
