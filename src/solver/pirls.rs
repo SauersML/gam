@@ -4916,6 +4916,80 @@ where
                 )));
             }
 
+            // Transtrum-Sethna geodesic-acceleration second-order correction.
+            //
+            // Standard LM update: δp = −(H + λ_lm·diag(H))⁻¹ g.
+            // Geodesic correction: δp₂ = −(H + λ_lm·diag(H))⁻¹ K, where
+            //     K ≈ (g(β + h·δp) + g(β − h·δp) − 2·g(β)) / h²
+            // is a central-difference estimate of the directional second
+            // derivative of the gradient along δp. Accept the correction
+            // only if ‖δp₂‖ ≤ α‖δp‖ (Transtrum-Sethna 2011, α=0.75 here).
+            //
+            // Reusing the existing Cholesky factor would require refactoring
+            // `solve_newton_direction_dense` to hand back the factor — out
+            // of scope for this opt-in flag. Instead the second solve
+            // refactorizes the same regularized Hessian (one extra O(p³)
+            // Cholesky per accepted step), plus two extra `model.update(·)`
+            // evaluations for the central FD. Only the dense, unconstrained
+            // path is wired; sparse-native / linear-inequality / lower-bound
+            // paths fall through to the bare LM step.
+            //
+            // The block must own `direction` mutably to write δp + δp₂ back
+            // into the same buffer, so it operates on `newton_direction`
+            // directly *before* `direction` is rebound below.
+            if options.geodesic_acceleration
+                && cached_sparse_regularized.is_none()
+                && options.linear_constraints.is_none()
+                && options.coefficient_lower_bounds.is_none()
+            {
+                const GEODESIC_ACCEPT_ALPHA: f64 = 0.75;
+                // 1e-4 is the Transtrum-Sethna default for double precision.
+                const GEODESIC_FD_H: f64 = 1.0e-4;
+
+                // Snapshot the standard-step direction; clone is cheap (p)
+                // relative to the two model.update calls below.
+                let dir_snapshot = newton_direction.clone();
+                let dir_norm = stable_norm(&dir_snapshot);
+                if dir_norm > 0.0
+                    && dir_norm.is_finite()
+                    && let Some(h_dense) = regularized.as_dense()
+                {
+                    let mut beta_pert = Array1::<f64>::zeros(beta.len());
+                    beta_pert.assign(beta.as_ref());
+                    beta_pert.scaled_add(GEODESIC_FD_H, &dir_snapshot);
+                    let plus = model.update(&Coefficients::new(beta_pert.clone()));
+                    beta_pert.assign(beta.as_ref());
+                    beta_pert.scaled_add(-GEODESIC_FD_H, &dir_snapshot);
+                    let minus = model.update(&Coefficients::new(beta_pert));
+
+                    // Re-sync the model's interior cache to the current
+                    // β; downstream `screen_candidate` / `update_with_*`
+                    // calls assume the workspace reflects an evaluation
+                    // along the trajectory the LM loop tracks.
+                    let restored = model.update(&beta);
+
+                    if let (Ok(g_plus), Ok(g_minus), Ok(_)) = (plus, minus, restored) {
+                        let mut k_rhs = &g_plus.gradient + &g_minus.gradient;
+                        k_rhs.scaled_add(-2.0, &state.gradient);
+                        k_rhs.mapv_inplace(|v| v / (GEODESIC_FD_H * GEODESIC_FD_H));
+
+                        if array1_is_finite(&k_rhs) {
+                            let mut delta2 = Array1::<f64>::zeros(beta.len());
+                            if solve_newton_direction_dense(h_dense, &k_rhs, &mut delta2).is_ok()
+                                && array1_is_finite(&delta2)
+                            {
+                                let d2_norm = stable_norm(&delta2);
+                                if d2_norm.is_finite()
+                                    && d2_norm <= GEODESIC_ACCEPT_ALPHA * dir_norm
+                                {
+                                    newton_direction += &delta2;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // 2. Compute Predicted Reduction
             // Pred = -g'δ - 0.5 * δ'(H)δ
             // Actually, we should check against the model: m(0) - m(δ)
