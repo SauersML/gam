@@ -111,6 +111,28 @@ joint Arrow-Schur row-block assembly.
 Both variants expose analytic HVPs; large graph log-determinants use the shared
 Hutchinson / SLQ helper through the analytic-penalty operator path.
 
+## GLM Families
+
+The composition engine accepts GLM likelihood selection through the `family=`
+kwarg on `gamfit.fit()` / `gamfit.glm_reml_fit_latent()`. Fixed-family
+hyperparameters are Python kwargs on the latent GLM path, validated before
+dispatch to exhaustive `GlmLikelihoodFamily` match arms in `pirls.rs`.
+
+| Family | Python kwarg | Use case | Reference |
+| --- | --- | --- | --- |
+| GaussianIdentity (default) | `family="gaussian"` | Continuous unbounded response | standard REML |
+| BinomialLogit | `family="binomial"` | Bernoulli / proportions | logit link |
+| PoissonLog | `family="poisson"` | Counts at equidispersion | log link |
+| GammaLog | `family="gamma"` | Positive continuous, multiplicative noise | shape param fixed |
+| NegativeBinomial { theta } | `family="negbin", negbin_theta=θ` | Over-dispersed counts | landed 2026-05-23; θ fixed |
+| Tweedie { p } | `family="tweedie", tweedie_p=p` | Compound Poisson-Gamma, p ∈ (1,2) | landed 2026-05-23; p fixed |
+| BetaLogit { phi } | `family="beta", beta_phi=φ` | Bounded continuous on (0,1) | landed 2026-05-23; φ fixed |
+
+For under-dispersed counts (`var / mean < 1`), Poisson is typically the right
+choice because the NegBin over-dispersion parameter collapses to ∞ otherwise.
+The `project_cogito_modifier_count_underdispersed` memory records this as the
+`auto_exp_28` finding.
+
 ## Identifiability Rules
 
 Bare `LatentCoord` is gauge-unfixed: a smooth reparameterization of `t` can be
@@ -134,6 +156,25 @@ rotation-invariant and kept all tested auxiliary dimensions. The established
 axis-selection composition is `OrthogonalityPenalty` plus `ARDPenalty`, as in
 `examples/orthogonality_plus_ard_demo.py`, because orthogonality fixes the
 rotation/scale gauge before ARD applies axis-wise evidence pressure.
+
+### Persistent Caching
+
+`gamfit` caches latent designs at two scopes: request-scope
+`LatentDesignCache` inside a fit call and process-scope
+`PersistentLatentDesignCache` across REML outer iterations. The process-scope
+cache reuses `Φ(t)` when latent values are bit-identical between outer
+iterations, avoiding `O(N * d * basis_dim)` design rebuilds on exact hits.
+
+```bash
+GAMFIT_DISABLE_PERSISTENT_LATENT_CACHE=1
+```
+
+Set that diagnostic toggle to bypass the process-scope cache. At LLM scale,
+`OrthogonalityPenalty`, `TotalVariationPenalty`, and `IsometryPenalty` all use
+Hutchinson / SLQ for log-determinants and Rademacher stochastic diagonals when
+`N * d > 1024`; `ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD` controls the dense-to-HVP
+switch. The diagonal path uses the Bekas et al. (2007) stochastic diagonal
+estimator.
 
 The arrow-Schur latent Hessian is cheap at the cost level, not because every
 REML derivative is independent. The outer Occam gradient uses one shared

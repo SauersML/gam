@@ -25,7 +25,6 @@ use crate::terms::smooth::TermCollectionDesign;
 
 const DEFAULT_LATENT_CACHE_CAPACITY: usize = 4;
 const DEFAULT_PERSISTENT_LATENT_CACHE_CAPACITY: usize = 16;
-const PERSISTENT_LATENT_CACHE_WARMSTART_EPSILON: f64 = 1.0e-10;
 const DISABLE_PERSISTENT_LATENT_CACHE_ENV: &str = "GAMFIT_DISABLE_PERSISTENT_LATENT_CACHE";
 
 static PERSISTENT_LATENT_DESIGN_CACHE: OnceLock<Mutex<PersistentLatentDesignCache>> =
@@ -224,26 +223,13 @@ pub(crate) struct LatentDesignLookup<'a> {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct PersistentLatentDesignKey {
     latent_id: u64,
+    flat_hash: u64,
     basis_signature: u64,
 }
 
 struct PersistentLatentDesignEntry {
     fingerprint: LatentFingerprint,
     cached: Arc<CachedDesign>,
-}
-
-pub(crate) struct PersistentLatentWarmstart {
-    pub(crate) delta: Array1<f64>,
-    pub(crate) per_axis_linf: Vec<f64>,
-    pub(crate) max_linf: f64,
-}
-
-pub(crate) enum PersistentLatentDesignHit {
-    Exact { cached: Arc<CachedDesign> },
-    EpsilonWarmstart {
-        cached: Arc<CachedDesign>,
-        warmstart: PersistentLatentWarmstart,
-    },
 }
 
 pub(crate) struct PersistentLatentDesignCache {
@@ -272,9 +258,10 @@ impl PersistentLatentDesignCache {
         latent: &LatentCoordValues,
         basis_signature: u64,
         fingerprint: &LatentFingerprint,
-    ) -> Result<Option<PersistentLatentDesignHit>, EstimationError> {
+    ) -> Result<Option<Arc<CachedDesign>>, EstimationError> {
         let key = PersistentLatentDesignKey {
             latent_id: latent.latent_id(),
+            flat_hash: fingerprint.hash,
             basis_signature,
         };
         let Some(entry) = self.entries.get(&key) else {
@@ -289,24 +276,15 @@ impl PersistentLatentDesignCache {
         if entry_fingerprint.hash == fingerprint.hash
             && latent_bits_match(latent, &cached.latent_bits)
         {
-            return Ok(Some(PersistentLatentDesignHit::Exact { cached }));
+            return Ok(Some(cached));
         }
-        let Some(warmstart) = latent_warmstart_delta(
-            latent,
-            &cached.latent_bits,
-            PERSISTENT_LATENT_CACHE_WARMSTART_EPSILON,
-        ) else {
-            return Ok(None);
-        };
-        Ok(Some(PersistentLatentDesignHit::EpsilonWarmstart {
-            cached,
-            warmstart,
-        }))
+        Ok(None)
     }
 
     pub(crate) fn insert(&mut self, cached: Arc<CachedDesign>) {
         let key = PersistentLatentDesignKey {
             latent_id: cached.latent_id,
+            flat_hash: cached.fingerprint.hash,
             basis_signature: cached.basis_signature,
         };
         let entry = PersistentLatentDesignEntry {
@@ -389,26 +367,16 @@ impl LatentDesignCache {
                 cached: &self.entries[index],
             });
         }
-        if let Some(hit) = lookup_persistent_latent_design(&latent, basis_signature, &fingerprint)?
+        if let Some(cached) = lookup_persistent_latent_design(&latent, basis_signature, &fingerprint)?
         {
-            match hit {
-                PersistentLatentDesignHit::Exact { cached } => {
-                    let id = self.next_entry_id;
-                    self.next_entry_id = self.next_entry_id.wrapping_add(1);
-                    let mut entry = (*cached).clone();
-                    entry.id = id;
-                    entry.fingerprint.iteration = self.iteration;
-                    entry.last_used = self.clock;
-                    self.insert(entry);
-                    return self.lookup_inserted(id);
-                }
-                PersistentLatentDesignHit::EpsilonWarmstart { cached, warmstart } => {
-                    let _ = cached.id;
-                    let _ = warmstart.delta.len();
-                    let _ = warmstart.per_axis_linf.len();
-                    let _ = warmstart.max_linf;
-                }
-            }
+            let id = self.next_entry_id;
+            self.next_entry_id = self.next_entry_id.wrapping_add(1);
+            let mut entry = (*cached).clone();
+            entry.id = id;
+            entry.fingerprint.iteration = self.iteration;
+            entry.last_used = self.clock;
+            self.insert(entry);
+            return self.lookup_inserted(id);
         }
 
         let computed = compute()?;
@@ -515,7 +483,7 @@ fn lookup_persistent_latent_design(
     latent: &LatentCoordValues,
     basis_signature: u64,
     fingerprint: &LatentFingerprint,
-) -> Result<Option<PersistentLatentDesignHit>, EstimationError> {
+) -> Result<Option<Arc<CachedDesign>>, EstimationError> {
     if persistent_latent_cache_disabled() {
         return Ok(None);
     }
@@ -562,49 +530,6 @@ fn latent_bits_match(latent: &LatentCoordValues, cached_bits: &[u64]) -> bool {
             .iter()
             .zip(cached_bits.iter())
             .all(|(value, bits)| value.to_bits() == *bits)
-}
-
-fn latent_warmstart_delta(
-    latent: &LatentCoordValues,
-    cached_bits: &[u64],
-    epsilon: f64,
-) -> Option<PersistentLatentWarmstart> {
-    if epsilon <= 0.0 || latent.as_flat().len() != cached_bits.len() {
-        return None;
-    }
-    let d = latent.latent_dim();
-    if d == 0 {
-        return None;
-    }
-    let mut delta = Array1::<f64>::zeros(cached_bits.len());
-    let mut per_axis_linf = vec![0.0_f64; d];
-    let mut max_linf = 0.0_f64;
-    for (idx, (current, previous_bits)) in latent
-        .as_flat()
-        .iter()
-        .zip(cached_bits.iter())
-        .enumerate()
-    {
-        let previous = f64::from_bits(*previous_bits);
-        let diff = *current - previous;
-        if !current.is_finite() || !previous.is_finite() || !diff.is_finite() {
-            return None;
-        }
-        delta[idx] = diff;
-        let abs = diff.abs();
-        let axis = idx % d;
-        per_axis_linf[axis] = per_axis_linf[axis].max(abs);
-        max_linf = max_linf.max(abs);
-    }
-    if per_axis_linf.iter().all(|axis_max| *axis_max < epsilon) {
-        Some(PersistentLatentWarmstart {
-            delta,
-            per_axis_linf,
-            max_linf,
-        })
-    } else {
-        None
-    }
 }
 
 fn build_radial_distances(
