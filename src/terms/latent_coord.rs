@@ -157,6 +157,15 @@ pub enum LatentManifold {
     Interval { lo: f64, hi: f64 },
     /// Product manifold, split block-by-block in row-major ambient storage.
     Product(Vec<LatentManifold>),
+    /// Product manifold with explicit per-axis trust-region metric weights.
+    ///
+    /// Without per-axis weighting, a Product of Circle + Interval treats
+    /// 1 radian as commensurate with the entire bounded range. With weights
+    /// = 1/scale², the trust-region radius respects each axis's natural unit.
+    ProductWithMetric {
+        manifolds: Vec<LatentManifold>,
+        weights: Vec<f64>,
+    },
 }
 
 impl Default for LatentManifold {
@@ -175,7 +184,46 @@ impl LatentManifold {
             Self::Euclidean => fallback_dim,
             Self::Circle | Self::Interval { .. } => 1,
             Self::Sphere { dim } => *dim,
-            Self::Product(parts) => parts.iter().map(|part| part.ambient_dim(1)).sum(),
+            Self::Product(parts) | Self::ProductWithMetric { manifolds: parts, .. } => {
+                parts.iter().map(|part| part.ambient_dim(1)).sum()
+            }
+        }
+    }
+
+    /// Per-axis weights for the Riemannian trust-region metric.
+    ///
+    /// Defaults use `1/scale²`: Circle scale is `2π`, Sphere scale is `π`,
+    /// Interval scale is `hi - lo`, and Euclidean scale is `1`. Product
+    /// manifolds recurse and concatenate; [`Self::ProductWithMetric`] uses
+    /// the caller-supplied weights directly.
+    pub fn metric_weights(&self) -> Vec<f64> {
+        match self {
+            Self::Euclidean => vec![1.0],
+            Self::Circle => vec![1.0 / (TWO_PI * TWO_PI)],
+            Self::Sphere { dim } => {
+                let w = 1.0 / (std::f64::consts::PI * std::f64::consts::PI);
+                vec![w; *dim]
+            }
+            Self::Interval { lo, hi } => {
+                let scale = hi - lo;
+                vec![1.0 / (scale * scale)]
+            }
+            Self::Product(parts) => {
+                let mut out = Vec::with_capacity(self.ambient_dim(1));
+                for part in parts {
+                    out.extend(part.metric_weights());
+                }
+                out
+            }
+            Self::ProductWithMetric { manifolds, weights } => {
+                let expected: usize = manifolds.iter().map(|part| part.ambient_dim(1)).sum();
+                assert_eq!(
+                    weights.len(),
+                    expected,
+                    "LatentManifold::ProductWithMetric weights length must match ambient dimension"
+                );
+                weights.clone()
+            }
         }
     }
 
@@ -197,7 +245,7 @@ impl LatentManifold {
                 out[0] = t[0].clamp(*lo, *hi);
                 out
             }
-            Self::Product(parts) => {
+            Self::Product(parts) | Self::ProductWithMetric { manifolds: parts, .. } => {
                 let mut out = Array1::<f64>::zeros(t.len());
                 let mut offset = 0_usize;
                 for part in parts {
@@ -243,7 +291,7 @@ impl LatentManifold {
                 out[0] = (t[0] + xi[0]).clamp(*lo, *hi);
                 out
             }
-            Self::Product(parts) => {
+            Self::Product(parts) | Self::ProductWithMetric { manifolds: parts, .. } => {
                 let mut out = Array1::<f64>::zeros(t.len());
                 let mut offset = 0_usize;
                 for part in parts {
@@ -288,7 +336,7 @@ impl LatentManifold {
                 out[0] = if at_lo || at_hi { 0.0 } else { v[0] };
                 out
             }
-            Self::Product(parts) => {
+            Self::Product(parts) | Self::ProductWithMetric { manifolds: parts, .. } => {
                 let mut out = Array1::<f64>::zeros(v.len());
                 let mut offset = 0_usize;
                 for part in parts {
@@ -344,7 +392,7 @@ impl LatentManifold {
                 }
                 self.project_to_tangent(t, ambient.view())
             }
-            Self::Product(parts) => {
+            Self::Product(parts) | Self::ProductWithMetric { manifolds: parts, .. } => {
                 let mut out = Array1::<f64>::zeros(t.len());
                 let mut offset = 0_usize;
                 for part in parts {
@@ -426,7 +474,7 @@ impl LatentManifold {
                     }
                 }
             }
-            Self::Product(parts) => {
+            Self::Product(parts) | Self::ProductWithMetric { manifolds: parts, .. } => {
                 let mut offset = 0_usize;
                 for part in parts {
                     let dim = part.ambient_dim(1);
