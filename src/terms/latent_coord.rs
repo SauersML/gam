@@ -39,8 +39,8 @@
 //!   smoothing parameter. This is the principled identifiability fix
 //!   (Khemakhem et al. 2020).
 //! * [`LatentIdMode::DimSelection`] — ARD on each latent axis. One ridge
-//!   penalty per axis; REML drives unused axes' precision to infinity, so
-//!   the intrinsic dimension is auto-discovered.
+//!   penalty per axis; REML drives unused axes' precision to infinity only
+//!   after `AuxPrior` or a future isometry prior fixes the gauge.
 //! * [`LatentIdMode::None`] — no gauge fix. Useful only as an explicit
 //!   opt-out; the caller is responsible for separately providing a unique
 //!   inner minimum (e.g. via a custom penalty).
@@ -80,8 +80,9 @@ pub enum AuxPriorStrength {
 
 /// Identifiability / gauge-fix mode for a [`LatentCoordValues`] block.
 ///
-/// At least one of `AuxPrior` / `DimSelection` must be enabled for the
-/// inner Hessian to be full-rank; see the module docstring.
+/// `AuxPrior` is currently the only standalone gauge-fixing mode; see the
+/// module docstring. `DimSelection` must be paired with `AuxPrior` (or a
+/// future isometry mode) by higher-level assembly before fitting.
 #[derive(Debug, Clone)]
 pub enum LatentIdMode {
     /// Conditional Gaussian prior `p(t | u)` with mean `ĥ(u)` fit by
@@ -103,6 +104,22 @@ pub enum LatentIdMode {
     /// uniquely defined. Intended only for the explicit "I supply my own
     /// gauge constraint via the smoothing penalty" pathway.
     None,
+}
+
+impl LatentIdMode {
+    /// Fixes the audit finding that ARD/DimSelection alone is rotation
+    /// symmetric and therefore not a standalone identifiability mode.
+    pub fn is_identifiable(&self) -> bool {
+        matches!(self, Self::AuxPrior { .. })
+    }
+
+    fn reject_dim_selection_alone(&self) {
+        if matches!(self, Self::DimSelection { .. }) {
+            panic!(
+                "LatentIdMode::DimSelection is not a standalone gauge fix; pair ARD with AuxPrior or Isometry"
+            );
+        }
+    }
 }
 
 /// Carrier for the `∂Φ/∂t` chain-rule input, dispatched on basis kind by
@@ -165,6 +182,7 @@ pub struct LatentCoordValues {
 impl LatentCoordValues {
     /// Construct from a dense `(n_obs, latent_dim)` matrix.
     pub fn from_matrix(matrix: ArrayView2<'_, f64>, id_mode: LatentIdMode) -> Self {
+        id_mode.reject_dim_selection_alone();
         let n_obs = matrix.nrows();
         let latent_dim = matrix.ncols();
         let mut values = Array1::<f64>::zeros(n_obs * latent_dim);
@@ -188,6 +206,7 @@ impl LatentCoordValues {
         latent_dim: usize,
         id_mode: LatentIdMode,
     ) -> Self {
+        id_mode.reject_dim_selection_alone();
         debug_assert_eq!(
             values.len(),
             n_obs * latent_dim,
