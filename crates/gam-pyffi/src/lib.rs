@@ -121,6 +121,7 @@ struct PyFitConfig {
     groups: Option<serde_json::Value>,
     precision_hyperpriors: Option<serde_json::Value>,
     penalty_block_gamma_priors: Option<serde_json::Value>,
+    latents: Option<serde_json::Value>,
 
     // Frailty (only consumed by survival families today). Mirrors the CLI
     // names: --frailty-kind, --frailty-sd, --hazard-loading.
@@ -1281,7 +1282,6 @@ fn gaussian_reml_fit<'py>(
     grad_edf = 0.0,
     forward_state = None,
     weights = None,
-    fisher_W = None,
     init_lambda = None,
     by = None,
     by_start_col = 0
@@ -1298,7 +1298,6 @@ fn gaussian_reml_fit_backward<'py>(
     grad_edf: f64,
     forward_state: Option<&Bound<'py, PyDict>>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
-    fisher_w: Option<PyReadonlyArray3<'py, f64>>,
     init_lambda: Option<f64>,
     by: Option<PyReadonlyArray1<'py, f64>>,
     by_start_col: usize,
@@ -4121,10 +4120,37 @@ fn gaussian_reml_fit_latent_backward<'py>(
     .map_err(py_value_error)?;
     let weights_view = effective_weights.as_ref().map(|w| w.view());
 
-    // Forward design (Φ) and t-matrix for the radial gradient.
-    let (design, t_mat) =
-        build_latent_duchon_design(t_view, n_obs, latent_dim, centers_view, m)
-            .map_err(py_value_error)?;
+    // Forward design (Φ) and t-matrix for the input-location gradient.
+    let (design, t_mat) = match basis_kind_normalized {
+        "duchon" => build_latent_duchon_design(t_view, n_obs, latent_dim, centers_view, m)
+            .map_err(py_value_error)?,
+        "bspline_tensor" => {
+            let knots = tensor_knots_concat
+                .as_ref()
+                .map(|a| a.as_array())
+                .ok_or_else(|| {
+                    py_value_error("tensor B-spline latent backward requires knots_concat")
+                })?;
+            build_latent_tensor_bspline_design(
+                t_view,
+                n_obs,
+                latent_dim,
+                knots,
+                tensor_knot_offsets.as_deref().ok_or_else(|| {
+                    py_value_error("tensor B-spline latent backward requires knot_offsets")
+                })?,
+                tensor_degrees.as_deref().ok_or_else(|| {
+                    py_value_error("tensor B-spline latent backward requires degrees")
+                })?,
+            )
+            .map_err(py_value_error)?
+        }
+        other => {
+            return Err(PyNotImplementedError::new_err(format!(
+                "gaussian_reml_fit_latent_backward currently supports 'duchon' and 'tensor_bspline'; got {other:?}"
+            )));
+        }
+    };
     let fit = gaussian_reml_multi_closed_form_with_cache(
         design.view(),
         y_view,
@@ -4167,46 +4193,79 @@ fn gaussian_reml_fit_latent_backward<'py>(
     } else {
         backward.clone()
     };
-    let jet = latent_input_location_jet(
-        basis_kind_normalized,
-        t_mat.view(),
-        centers_view,
-        m,
-    )
-    .map_err(py_value_error)?;
-    // Restrict grad_x to the kernel block (first n_centers columns of the
-    // Duchon design). The polynomial-nullspace tail is contracted separately
-    // below with the N-D monomial derivative jet.
-    let n_centers = centers_view.nrows();
-    let mut grad_phi_kernel = Array2::<f64>::zeros((n_obs, n_centers));
     let grad_x = &backward_for_t.grad_x;
-    for n in 0..n_obs {
-        for k in 0..n_centers.min(grad_x.ncols()) {
-            grad_phi_kernel[[n, k]] = grad_x[[n, k]];
-        }
-    }
-    let mut grad_t = LatentCoordValues::contract_gradient(grad_phi_kernel.view(), &jet);
-    // Fixes audit-revised claim that the Duchon polynomial-nullspace tail
-    // must use the N-D monomial derivative, not the legacy linear-only
-    // shortcut.
-    if grad_x.ncols() > n_centers {
-        let poly_start = n_centers;
-        let n_poly = grad_x.ncols() - poly_start;
-        let poly_jet =
-            duchon_polynomial_first_derivative_nd(t_mat.view(), duchon_nullspace_from_m(m));
-        let n_poly_contract = n_poly.min(poly_jet.shape()[1]);
-        for n in 0..n_obs {
-            for poly_col in 0..n_poly_contract {
-                let gx = grad_x[[n, poly_start + poly_col]];
-                if gx == 0.0 {
-                    continue;
-                }
-                for a in 0..latent_dim {
-                    grad_t[n * latent_dim + a] += gx * poly_jet[[n, poly_col, a]];
+    let latent = LatentCoordValues::from_matrix(t_mat.view(), LatentIdMode::None);
+    let mut grad_t = match basis_kind_normalized {
+        "duchon" => {
+            // Restrict grad_x to the kernel block (first n_centers columns).
+            // The `(N,K,d)` radial jet is intentionally not materialized here;
+            // row contractions stream through `LatentCoordValues`.
+            let n_centers = centers_view.nrows();
+            let mut grad_phi_kernel = Array2::<f64>::zeros((n_obs, n_centers));
+            for n in 0..n_obs {
+                for k in 0..n_centers.min(grad_x.ncols()) {
+                    grad_phi_kernel[[n, k]] = grad_x[[n, k]];
                 }
             }
+            let phi_r = duchon_radial_first_derivative_nd(
+                t_mat.view(),
+                centers_view,
+                None,
+                duchon_nullspace_from_m(m),
+            )
+            .map_err(|err| py_value_error(err.to_string()))?;
+            let mut out = latent.contract_gradient_radial_streaming(
+                grad_phi_kernel.view(),
+                phi_r.view(),
+                centers_view,
+            );
+            // Fixes audit-revised claim that the Duchon polynomial-nullspace
+            // tail must use the N-D monomial derivative, not the legacy
+            // linear-only shortcut.
+            if grad_x.ncols() > n_centers {
+                let poly_start = n_centers;
+                let n_poly = grad_x.ncols() - poly_start;
+                let poly_jet =
+                    duchon_polynomial_first_derivative_nd(t_mat.view(), duchon_nullspace_from_m(m));
+                let n_poly_contract = n_poly.min(poly_jet.shape()[1]);
+                for n in 0..n_obs {
+                    for poly_col in 0..n_poly_contract {
+                        let gx = grad_x[[n, poly_start + poly_col]];
+                        if gx == 0.0 {
+                            continue;
+                        }
+                        for a in 0..latent_dim {
+                            out[n * latent_dim + a] += gx * poly_jet[[n, poly_col, a]];
+                        }
+                    }
+                }
+            }
+            out
         }
-    }
+        "bspline_tensor" => {
+            let knots = tensor_knots_concat
+                .as_ref()
+                .map(|a| a.as_array())
+                .ok_or_else(|| {
+                    py_value_error("tensor B-spline latent backward requires knots_concat")
+                })?;
+            let per_axis = split_tensor_knot_views(
+                knots,
+                tensor_knot_offsets.as_deref().ok_or_else(|| {
+                    py_value_error("tensor B-spline latent backward requires knot_offsets")
+                })?,
+                latent_dim,
+            )
+            .map_err(py_value_error)?;
+            let degrees = tensor_degrees.as_deref().ok_or_else(|| {
+                py_value_error("tensor B-spline latent backward requires degrees")
+            })?;
+            let jet = bspline_tensor_first_derivative(t_mat.view(), &per_axis, degrees)
+                .map_err(|err| py_value_error(err.to_string()))?;
+            LatentCoordValues::contract_gradient(grad_x.view(), &jet)
+        }
+        _ => unreachable!("basis_kind_normalized checked above"),
+    };
     if grad_reml_score != 0.0 {
         add_latent_outer_reml_score_gradient(
             &mut grad_t,
@@ -4341,6 +4400,10 @@ fn glm_reml_fit_latent_impl(
     weights: Option<ArrayView1<'_, f64>>,
     init_lambda: Option<f64>,
     family: LikelihoodFamily,
+    aux_u: Option<ArrayView2<'_, f64>>,
+    aux_family: AuxPriorFamily,
+    aux_strength: Option<f64>,
+    dim_selection_precision: Option<ArrayView1<'_, f64>>,
 ) -> Result<(gam::estimate::ExternalOptimResult, Array2<f64>, Array2<f64>), String> {
     if y.ncols() != 1 {
         return Err(format!(
@@ -4384,7 +4447,7 @@ fn glm_reml_fit_latent_impl(
         kronecker_factored: None,
     };
     let heuristic_lambda = init_lambda.map(|lambda| [lambda]);
-    let fit = optimize_external_designwith_heuristic_lambdas(
+    let mut fit = optimize_external_designwith_heuristic_lambdas(
         y_vec.view(),
         weights_owned.view(),
         design.clone(),
@@ -4394,6 +4457,48 @@ fn glm_reml_fit_latent_impl(
         &opts,
     )
     .map_err(|err| err.to_string())?;
+    let mut latent_prior_score = 0.0_f64;
+    if let Some(u_view) = aux_u {
+        let targets = aux_prior_targets(t_mat.view(), u_view, aux_family)?;
+        let mu = aux_strength.unwrap_or(1.0);
+        if !(mu.is_finite() && mu > 0.0) {
+            return Err(format!("aux_strength must be finite and positive; got {mu}"));
+        }
+        let mut sq = 0.0_f64;
+        for n in 0..n_obs {
+            for a in 0..latent_dim {
+                let diff = t_mat[[n, a]] - targets[[n, a]];
+                sq += diff * diff;
+            }
+        }
+        let effective_dim = (n_obs * latent_dim) as f64;
+        latent_prior_score += 0.5 * mu * sq - 0.5 * effective_dim * mu.ln();
+    }
+    if let Some(log_prec) = dim_selection_precision {
+        if log_prec.len() != latent_dim {
+            return Err(format!(
+                "dim_selection_log_precision length {} must equal latent_dim {}",
+                log_prec.len(),
+                latent_dim
+            ));
+        }
+        for a in 0..latent_dim {
+            let log_alpha = log_prec[a];
+            let alpha = log_alpha.exp();
+            if !(alpha.is_finite() && alpha > 0.0) {
+                return Err(format!(
+                    "dim_selection_log_precision[{a}] must exponentiate to a finite positive precision"
+                ));
+            }
+            let mut sq = 0.0_f64;
+            for n in 0..n_obs {
+                let v = t_mat[[n, a]];
+                sq += v * v;
+            }
+            latent_prior_score += 0.5 * alpha * sq - 0.5 * (n_obs as f64) * log_alpha;
+        }
+    }
+    fit.reml_score += latent_prior_score;
     Ok((fit, design, t_mat))
 }
 
@@ -4456,6 +4561,10 @@ fn set_ok_glm_latent_items<'py>(
     weights = None,
     fisher_W = None,
     init_lambda = None,
+    aux_u = None,
+    aux_family = "ridge".to_string(),
+    aux_strength = None,
+    dim_selection_log_precision = None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn glm_reml_fit_latent<'py>(
@@ -4471,8 +4580,21 @@ fn glm_reml_fit_latent<'py>(
     weights: Option<PyReadonlyArray1<'py, f64>>,
     fisher_w: Option<PyReadonlyArray3<'py, f64>>,
     init_lambda: Option<f64>,
+    aux_u: Option<PyReadonlyArray2<'py, f64>>,
+    aux_family: String,
+    aux_strength: Option<f64>,
+    dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
 ) -> PyResult<Py<PyDict>> {
     let family = latent_glm_family_from_str(&family).map_err(py_value_error)?;
+    let aux_family = match aux_family.to_ascii_lowercase().as_str() {
+        "ridge" => AuxPriorFamily::Ridge,
+        "linear" => AuxPriorFamily::Linear,
+        other => {
+            return Err(py_value_error(format!(
+                "aux_family must be 'ridge' or 'linear'; got {other:?}"
+            )));
+        }
+    };
     let effective_weights = latent_scalar_weights_with_fisher(
         n_obs,
         weights.as_ref().map(|w| w.as_array()),
@@ -4490,6 +4612,10 @@ fn glm_reml_fit_latent<'py>(
         effective_weights.as_ref().map(|w| w.view()),
         init_lambda,
         family,
+        aux_u.as_ref().map(|a| a.as_array()),
+        aux_family,
+        aux_strength,
+        dim_selection_log_precision.as_ref().map(|a| a.as_array()),
     )
     .map_err(py_value_error)?;
     let out = PyDict::new(py);
@@ -4570,6 +4696,10 @@ fn glm_reml_fit_latent_backward<'py>(
         effective_weights.as_ref().map(|w| w.view()),
         init_lambda,
         family,
+        aux_u.as_ref().map(|a| a.as_array()),
+        aux_family,
+        aux_strength,
+        dim_selection_log_precision.as_ref().map(|a| a.as_array()),
     )
     .map_err(py_value_error)?;
     let pirls = fit.artifacts.pirls.as_ref().ok_or_else(|| {
@@ -8810,6 +8940,7 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
         py_config.precision_hyperpriors,
         py_config.penalty_block_gamma_priors,
     )?;
+    fit_config.latents = py_config.latents;
     fit_config.family = normalize_optional_family(py_config.family);
     fit_config.offset_column = py_config.offset;
     fit_config.weight_column = py_config.weights;

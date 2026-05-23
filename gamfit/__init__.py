@@ -73,6 +73,13 @@ from ._penalties import (
     Penalty,
     SparsityPenalty,
 )
+from .topology import (
+    Circle,
+    Cylinder,
+    EuclideanPatch,
+    Sphere as TopologySphere,
+    Torus,
+)
 from ._diagnostics import Diagnostics
 from .smooth import (
     BSpline,
@@ -195,6 +202,11 @@ __all__ = [
     "Sphere",
     "TensorBSpline",
     "topology",
+    "Circle",
+    "Cylinder",
+    "EuclideanPatch",
+    "TopologySphere",
+    "Torus",
     "duchon_basis",
     "duchon_function_norm_penalty",
     "explain_error",

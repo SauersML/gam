@@ -105,9 +105,13 @@ def compare_models(
     Each fit's ``reml_score`` is treated as a log marginal likelihood with
     Occam factors already included — differences are log Bayes factors. Use
     this to compare fits that differ in *model structure* (basis topology,
-    penalty order, presence of a term). It is **not** a substitute for held-out
-    predictive scoring on data the inner REML loop also saw; pass ``cv_scores``
-    to surface a cross-validation cross-check alongside the evidence.
+    penalty order, presence of a term). The Occam-factor interpretation is
+    only as good as the prior normalization and model comparability: candidate
+    families should share the same response likelihood, comparable priors,
+    controlled latent gauges, and the relevant normalizers for REML-selected
+    penalty strengths. It is **not** a substitute for held-out predictive
+    scoring on data the inner REML loop also saw; pass ``cv_scores`` to
+    surface a cross-validation cross-check alongside the evidence.
 
     Parameters
     ----------

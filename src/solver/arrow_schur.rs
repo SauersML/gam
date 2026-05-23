@@ -1,4 +1,22 @@
-//! Arrow / Schur structured Newton solve for joint (t, β) inner systems.
+//! Bundle-adjustment Schur solver for joint `(t, β)` inner systems.
+//!
+//! BIBLIOGRAPHY
+//!
+//! * Agarwal, Snavely, Seitz, Szeliski, "Bundle Adjustment in the Large",
+//!   ECCV 2010 / University of Washington technical report: inexact-step
+//!   Levenberg-Marquardt, reduced camera system, and PCG on the Schur system.
+//! * Demmel, Gao, Gu, et al., "Square Root Bundle Adjustment for Large-Scale
+//!   Reconstruction", CVPR 2021 / TheCVF: form Schur contributions through
+//!   square-root per-point factors for improved numerical stability.
+//! * Nocedal and Wright, "Numerical Optimization", 2nd ed.; Steihaug 1983:
+//!   truncated conjugate gradients for trust-region subproblems, used by
+//!   Ceres-style trust-region solvers.
+//! * Ceres Solver documentation, "Solving Non-linear Least Squares":
+//!   reduced camera systems, Schur preconditioners, and trust-region LM
+//!   practice for BA.
+//! * Liu et al., "MegBA: A GPU-Based Distributed Library for Large-Scale
+//!   Bundle Adjustment", ECCV 2020: batched point-block solves and Schur
+//!   reductions as GPU kernels.
 //!
 //! See `proposals/latent_coord.md` §4 (the plumbing change) and
 //! `proposals/composition_engine.md` §7 (audit-revised complexity claim:
@@ -11,7 +29,9 @@
 //!
 //! When a [`crate::terms::latent_coord::LatentCoordValues`] block is
 //! registered with the design, each inner Gauss–Newton iteration must
-//! solve the joint bordered system
+//! solve the same normal equations that bundle adjustment solves:
+//! per-3D-point blocks are our per-row latent coordinates `t_i`, and
+//! per-camera shared parameters are our decoder coefficients `β`.
 //!
 //! ```text
 //! [ H_tt   H_tβ ] [ Δt ]     [ -g_t ]
@@ -28,7 +48,8 @@
 //! * `H_ββ` is the standard `K × K` penalized Hessian already handled by
 //!   the existing PIRLS β-only path.
 //!
-//! Schur-eliminating `Δt` produces the reduced `K × K` system
+//! BA's reduced camera system (RCS) eliminates `Δt` first and produces the
+//! reduced `K × K` shared system
 //!
 //! ```text
 //! S · Δβ = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i),   S = H_ββ - Σ_i H_βt^(i) (H_tt^(i))⁻¹ H_tβ^(i)
@@ -66,16 +87,264 @@
 //! O(N d³ + K³); the *outer* gradient is O(K³ + N · K d) once `Schur⁻¹`
 //! is in scope.
 //!
-//! Future maintainers: if you find yourself extending `ArrowSchurSystem`
-//! with an outer-REML gradient hook, please re-read the audit revisions
-//! in `proposals/latent_coord.md` §7 and `proposals/composition_engine.md`
-//! §7 first.
+//! Future maintainers: this is BA. Solver improvements should first look
+//! at Ceres/g2o/MegBA/Square-Root BA literature, not bespoke algebra. If you
+//! find yourself extending `ArrowSchurSystem` with an outer-REML gradient
+//! hook, please re-read the audit revisions in `proposals/latent_coord.md`
+//! §7 and `proposals/composition_engine.md` §7 first.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
 
 use crate::terms::analytic_penalties::{
     AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier,
 };
+
+const DIRECT_SOLVE_MAX_K: usize = 2_000;
+const DEFAULT_PCG_MAX_ITERATIONS: usize = 200;
+const DEFAULT_PCG_RELATIVE_TOLERANCE: f64 = 1e-4;
+const DEFAULT_TRUST_REGION_RADIUS: f64 = 1.0;
+
+/// BA Schur solve variant for the reduced shared `β` system.
+///
+/// * [`ArrowSolverMode::Direct`] is BA's dense reduced-camera-system solve:
+///   eliminate the per-point/per-row blocks, form the reduced system, and
+///   Cholesky factor it. This is the Ceres/g2o default for modest camera
+///   counts and is appropriate here for `K <= 2000`.
+/// * [`ArrowSolverMode::SqrtBA`] ports Square-Root BA (Demmel/Gao/Gu et al.,
+///   CVPR 2021): Schur terms are formed as `(L_i^-1 H_tβ_i)^T
+///   (L_i^-1 H_tβ_i)` from the per-row square-root factor `L_i`, avoiding
+///   explicit `H_tt^-1 H_tβ` products. It is the preferred direct path when
+///   single-precision assembly is introduced or when row blocks are poorly
+///   conditioned.
+/// * [`ArrowSolverMode::InexactPCG`] ports "Bundle Adjustment in the Large"
+///   (Agarwal et al.): the Schur system is solved inexactly by PCG with a
+///   Jacobi Schur preconditioner, avoiding dense `K × K` factorization for
+///   SAE-manifold scale shared systems.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrowSolverMode {
+    Direct,
+    SqrtBA,
+    InexactPCG,
+}
+
+impl ArrowSolverMode {
+    /// BA-size heuristic: dense RCS for modest `K`, inexact Schur PCG for
+    /// large shared systems. This follows Agarwal et al.'s direct-vs-iterative
+    /// split for large BA, mapped from cameras to decoder coefficients.
+    pub fn automatic(k: usize) -> Self {
+        if k <= DIRECT_SOLVE_MAX_K {
+            Self::Direct
+        } else {
+            Self::InexactPCG
+        }
+    }
+
+    /// Square-Root BA is the direct-solve stability mode for future f32
+    /// callers. Large `K` still routes to inexact PCG because dense Schur
+    /// storage dominates precision concerns at that scale.
+    pub fn automatic_for_single_precision(k: usize) -> Self {
+        if k <= DIRECT_SOLVE_MAX_K {
+            Self::SqrtBA
+        } else {
+            Self::InexactPCG
+        }
+    }
+}
+
+/// PCG controls for BA's inexact reduced-camera-system solve.
+///
+/// The defaults mirror the loose inner tolerances used by inexact-step LM in
+/// "Bundle Adjustment in the Large": solve the Schur system only accurately
+/// enough for a useful trust-region step, then let the outer LM iteration
+/// correct the remaining error.
+#[derive(Debug, Clone)]
+pub struct ArrowPcgOptions {
+    pub max_iterations: usize,
+    pub relative_tolerance: f64,
+}
+
+impl Default for ArrowPcgOptions {
+    fn default() -> Self {
+        Self {
+            max_iterations: DEFAULT_PCG_MAX_ITERATIONS,
+            relative_tolerance: DEFAULT_PCG_RELATIVE_TOLERANCE,
+        }
+    }
+}
+
+/// Trust-region controls for Steihaug-CG on the reduced BA system.
+///
+/// This is the Ceres-style guard around LM: `ridge_t`/`ridge_beta` provide
+/// Levenberg damping, while the trust radius bounds the reduced shared step
+/// using Steihaug's truncated-CG stopping rules for boundary hits and negative
+/// curvature.
+#[derive(Debug, Clone)]
+pub struct ArrowTrustRegionOptions {
+    pub radius: f64,
+    pub steihaug_relative_tolerance: f64,
+    pub max_iterations: usize,
+}
+
+impl Default for ArrowTrustRegionOptions {
+    fn default() -> Self {
+        Self {
+            radius: DEFAULT_TRUST_REGION_RADIUS,
+            steihaug_relative_tolerance: DEFAULT_PCG_RELATIVE_TOLERANCE,
+            max_iterations: DEFAULT_PCG_MAX_ITERATIONS,
+        }
+    }
+}
+
+/// Complete BA Schur solve options.
+///
+/// Use [`ArrowSolveOptions::automatic`] for normal latent-coordinate fits;
+/// use [`ArrowSolveOptions::sqrt_ba`] when the assembler has single-precision
+/// row blocks or an ill-conditioned gauge; use [`ArrowSolveOptions::inexact_pcg`]
+/// for SAE-manifold scale `K`.
+#[derive(Debug, Clone)]
+pub struct ArrowSolveOptions {
+    pub mode: ArrowSolverMode,
+    pub pcg: ArrowPcgOptions,
+    pub trust_region: ArrowTrustRegionOptions,
+}
+
+impl ArrowSolveOptions {
+    /// Select Direct for `K <= 2000` and InexactPCG above, following BA RCS
+    /// practice for dense-vs-iterative reduced systems.
+    pub fn automatic(k: usize) -> Self {
+        Self {
+            mode: ArrowSolverMode::automatic(k),
+            pcg: ArrowPcgOptions::default(),
+            trust_region: ArrowTrustRegionOptions::default(),
+        }
+    }
+
+    /// Force dense reduced-camera-system Cholesky, the classic BA direct
+    /// solve for small `K`.
+    pub fn direct() -> Self {
+        Self {
+            mode: ArrowSolverMode::Direct,
+            pcg: ArrowPcgOptions::default(),
+            trust_region: ArrowTrustRegionOptions::default(),
+        }
+    }
+
+    /// Force Square-Root BA Schur assembly for the direct reduced solve.
+    pub fn sqrt_ba() -> Self {
+        Self {
+            mode: ArrowSolverMode::SqrtBA,
+            pcg: ArrowPcgOptions::default(),
+            trust_region: ArrowTrustRegionOptions::default(),
+        }
+    }
+
+    /// Force inexact BA Schur PCG with Jacobi preconditioning.
+    pub fn inexact_pcg() -> Self {
+        Self {
+            mode: ArrowSolverMode::InexactPCG,
+            pcg: ArrowPcgOptions::default(),
+            trust_region: ArrowTrustRegionOptions::default(),
+        }
+    }
+}
+
+/// CPU/GPU seam for BA point-block work.
+///
+/// BA systems spend most time in independent point-block factorizations,
+/// triangular solves, and Schur block products. MegBA maps exactly these
+/// operations to GPU kernels. This trait keeps that boundary explicit so a
+/// CUDA/Ceres backend can replace [`CpuBatchedBlockSolver`] without changing
+/// `ArrowSchurSystem` algebra.
+pub trait BatchedBlockSolver {
+    /// Factor every per-row point block `H_tt^(i) + ridge_t I`, as in BA's
+    /// point elimination stage.
+    fn factor_blocks(
+        &self,
+        rows: &[ArrowRowBlock],
+        ridge_t: f64,
+        d: usize,
+    ) -> Result<Vec<Array2<f64>>, ArrowSchurError>;
+
+    /// Solve one factored point block against a vector RHS.
+    fn solve_block_vector(&self, factor: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64>;
+
+    /// Solve one factored point block against a dense matrix RHS.
+    fn solve_block_matrix(&self, factor: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64>;
+
+    /// Apply the Square-Root BA lower-triangular solve `L_i^-1 rhs`.
+    fn sqrt_solve_block_matrix(&self, factor: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64>;
+
+    /// Subtract a row-local Schur product from the dense reduced system.
+    fn block_gemm_subtract(
+        &self,
+        schur: &mut Array2<f64>,
+        left: &Array2<f64>,
+        right: &Array2<f64>,
+    );
+}
+
+/// Current CPU implementation of the BA batched block interface.
+///
+/// It is intentionally plain Rust loops because `d` is tiny. The trait shape,
+/// not this implementation, is the load-bearing part for the future MegBA or
+/// Ceres backend.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CpuBatchedBlockSolver;
+
+impl BatchedBlockSolver for CpuBatchedBlockSolver {
+    fn factor_blocks(
+        &self,
+        rows: &[ArrowRowBlock],
+        ridge_t: f64,
+        d: usize,
+    ) -> Result<Vec<Array2<f64>>, ArrowSchurError> {
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut block = row.htt.clone();
+            for a in 0..d {
+                block[[a, a]] += ridge_t;
+            }
+            out.push(cholesky_lower(&block).map_err(|e| ArrowSchurError::PerRowFactorFailed {
+                row: out.len(),
+                reason: e,
+            })?);
+        }
+        Ok(out)
+    }
+
+    fn solve_block_vector(&self, factor: &Array2<f64>, rhs: &Array1<f64>) -> Array1<f64> {
+        chol_solve_vector(factor, rhs)
+    }
+
+    fn solve_block_matrix(&self, factor: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
+        chol_solve_matrix(factor, rhs)
+    }
+
+    fn sqrt_solve_block_matrix(&self, factor: &Array2<f64>, rhs: &Array2<f64>) -> Array2<f64> {
+        lower_triangular_solve_matrix(factor, rhs)
+    }
+
+    fn block_gemm_subtract(
+        &self,
+        schur: &mut Array2<f64>,
+        left: &Array2<f64>,
+        right: &Array2<f64>,
+    ) {
+        let k = schur.nrows();
+        let d = left.nrows();
+        debug_assert_eq!(left.ncols(), k);
+        debug_assert_eq!(right.ncols(), k);
+        for a in 0..k {
+            for b in 0..k {
+                let mut acc = 0.0;
+                for c in 0..d {
+                    acc += left[[c, a]] * right[[c, b]];
+                }
+                schur[[a, b]] -= acc;
+            }
+        }
+    }
+}
 
 /// Per-row block data for the arrow-Schur system.
 ///
@@ -223,8 +492,8 @@ impl ArrowSchurSystem {
         }
 
         // Dense Hessian: probe via HVP against each unit-`d`-vector for each row.
-        // For block-diagonal-across-rows penalties (ARD, Isometry GN-form)
-        // this yields the exact per-row `d × d` block. For penalties that
+        // For row-block penalties (such as Isometry's metric-residual GN
+        // operator) this yields the per-row `d × d` block. For penalties that
         // would couple rows the off-row entries are silently dropped — a
         // design choice consistent with the arrow-shape precondition. The
         // analytic-penalty contract documents that Psi-tier penalties
@@ -284,6 +553,11 @@ impl ArrowSchurSystem {
 
     /// Schur-eliminate the per-row latent block and solve for `(Δt, Δβ)`.
     ///
+    /// This uses [`ArrowSolveOptions::automatic`]: BA dense RCS for
+    /// `K <= 2000`, and Agarwal-style inexact Schur PCG above that size.
+    /// Call [`ArrowSchurSystem::solve_with_options`] to force Square-Root BA
+    /// or a specific inexact solve policy.
+    ///
     /// Returns `(delta_t, delta_beta)` with `delta_t` flat row-major of
     /// length `N · d` and `delta_beta` of length `K`. The sign convention
     /// matches `solve_newton_direction_dense`: the returned increments
@@ -304,6 +578,24 @@ impl ArrowSchurSystem {
         let (delta_t, delta_beta, _cache) = solve_arrow_newton_step(self, ridge_t, ridge_beta)?;
         Ok((delta_t, delta_beta))
     }
+
+    /// Solve with an explicit BA Schur mode.
+    ///
+    /// [`ArrowSolverMode::Direct`] is the classic dense reduced-camera-system
+    /// Cholesky path; [`ArrowSolverMode::SqrtBA`] forms the same dense system
+    /// through Square-Root BA factors; [`ArrowSolverMode::InexactPCG`] runs
+    /// inexact-step LM on the reduced system with Jacobi-preconditioned
+    /// Steihaug-CG.
+    pub fn solve_with_options(
+        &self,
+        ridge_t: f64,
+        ridge_beta: f64,
+        options: &ArrowSolveOptions,
+    ) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
+        let (delta_t, delta_beta, _cache) =
+            solve_arrow_newton_step_with_options(self, ridge_t, ridge_beta, options)?;
+        Ok((delta_t, delta_beta))
+    }
 }
 
 /// Per-row + Schur Cholesky factor cache produced by
@@ -316,9 +608,13 @@ impl ArrowSchurSystem {
 pub struct ArrowFactorCache {
     /// Per-row lower-triangular Cholesky factors of `H_tt^(i) + ridge_t·I`.
     pub htt_factors: Vec<Array2<f64>>,
-    /// Lower-triangular Cholesky factor of the Schur complement
-    /// `S = H_ββ + ridge_β·I − Σ_i H_βt^(i) (H_tt^(i))⁻¹ H_tβ^(i)`.
-    pub schur_factor: Array2<f64>,
+    /// Lower-triangular Cholesky factor of the Schur complement when the
+    /// selected BA mode formed/factored dense RCS. `None` for
+    /// [`ArrowSolverMode::InexactPCG`], where Agarwal-style inexact LM avoids
+    /// the dense `K × K` factor.
+    pub schur_factor: Option<Array2<f64>>,
+    /// BA mode used to create this cache.
+    pub solver_mode: ArrowSolverMode,
     /// Ridge values used to build the cached factors (recorded so the
     /// warm-start predictor knows whether the cache is still valid for a
     /// requested ridge level).
@@ -405,63 +701,60 @@ pub fn solve_arrow_newton_step(
     ridge_t: f64,
     ridge_beta: f64,
 ) -> Result<(Array1<f64>, Array1<f64>, ArrowFactorCache), ArrowSchurError> {
+    let options = ArrowSolveOptions::automatic(sys.k);
+    solve_arrow_newton_step_with_options(sys, ridge_t, ridge_beta, &options)
+}
+
+/// Schur-eliminate the per-row latent block and solve with an explicit BA
+/// mode, returning the factor cache alongside the increments.
+///
+/// This is the BA-grade entry point. Direct and Square-Root BA form the dense
+/// reduced camera/shared system; InexactPCG applies the same Schur operator by
+/// matvec and uses Jacobi-preconditioned Steihaug-CG, following Agarwal et al.
+pub fn solve_arrow_newton_step_with_options(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    options: &ArrowSolveOptions,
+) -> Result<(Array1<f64>, Array1<f64>, ArrowFactorCache), ArrowSchurError> {
     let n = sys.rows.len();
     let d = sys.d;
     let k = sys.k;
+    let backend = CpuBatchedBlockSolver;
 
-    // 1. Per-row Cholesky factors of (H_tt^(i) + ridge_t · I).
-    let mut htt_factors: Vec<Array2<f64>> = Vec::with_capacity(n);
-    for row in &sys.rows {
-        let mut block = row.htt.clone();
-        for a in 0..d {
-            block[[a, a]] += ridge_t;
-        }
-        htt_factors.push(cholesky_lower(&block).map_err(|e| {
-            ArrowSchurError::PerRowFactorFailed {
-                row: htt_factors.len(),
-                reason: e,
-            }
-        })?);
-    }
+    // 1. BA point elimination: per-row Cholesky factors of
+    // (H_tt^(i) + ridge_t · I).
+    let htt_factors = backend.factor_blocks(&sys.rows, ridge_t, d)?;
 
-    // 2. Schur complement S = H_ββ + ridge_β·I − Σ_i H_βt^(i) (H_tt^(i))⁻¹ H_tβ^(i).
-    let mut schur = sys.hbb.clone();
-    for j in 0..k {
-        schur[[j, j]] += ridge_beta;
-    }
-    // Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
-    let mut rhs_beta = Array1::<f64>::zeros(k);
-    for i in 0..n {
-        // M = (H_tt^(i))⁻¹ H_tβ^(i)   ∈ ℝ^{d × K}
-        let m = chol_solve_matrix(&htt_factors[i], &sys.rows[i].htbeta);
-        // S -= H_βt^(i) · M  = H_tβ^(i)^T · M
-        for a in 0..k {
-            for b in 0..k {
-                let mut acc = 0.0;
-                for c in 0..d {
-                    acc += sys.rows[i].htbeta[[c, a]] * m[[c, b]];
-                }
-                schur[[a, b]] -= acc;
-            }
-        }
-        // v = (H_tt^(i))⁻¹ g_t^(i)
-        let v = chol_solve_vector(&htt_factors[i], &sys.rows[i].gt);
-        for a in 0..k {
-            let mut acc = 0.0;
-            for c in 0..d {
-                acc += sys.rows[i].htbeta[[c, a]] * v[c];
-            }
-            rhs_beta[a] += acc;
-        }
-    }
-    for j in 0..k {
-        rhs_beta[j] -= sys.gb[j];
-    }
+    // 2. Reduced RHS r_β = -g_β + Σ_i H_βt^(i) (H_tt^(i))⁻¹ g_t^(i).
+    let rhs_beta = reduced_rhs_beta(sys, &htt_factors, &backend);
 
-    // 3. Solve S · Δβ = rhs_beta.
-    let schur_factor =
-        cholesky_lower(&schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
-    let delta_beta = chol_solve_vector(&schur_factor, &rhs_beta);
+    // 3. Solve reduced shared system using the selected BA mode.
+    let (delta_beta, schur_factor) = match options.mode {
+        ArrowSolverMode::Direct => {
+            let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, &backend);
+            solve_dense_reduced_system(&schur, &rhs_beta, options)?
+        }
+        ArrowSolverMode::SqrtBA => {
+            let schur = build_dense_schur_sqrt_ba(sys, &htt_factors, ridge_beta, &backend);
+            solve_dense_reduced_system(&schur, &rhs_beta, options)?
+        }
+        ArrowSolverMode::InexactPCG => {
+            let preconditioner =
+                JacobiPreconditioner::from_arrow_schur(sys, &htt_factors, ridge_beta, &backend);
+            let delta = steihaug_pcg_reduced_system(
+                sys,
+                &htt_factors,
+                ridge_beta,
+                &rhs_beta,
+                &preconditioner,
+                &options.pcg,
+                &options.trust_region,
+                &backend,
+            )?;
+            (delta, None)
+        }
+    };
 
     // 4. Back-substitute Δt_i = -(H_tt^(i))⁻¹ (g_t^(i) + H_tβ^(i) Δβ).
     let mut delta_t = Array1::<f64>::zeros(n * d);
@@ -474,7 +767,7 @@ pub fn solve_arrow_newton_step(
             }
             tmp[c] += acc;
         }
-        let dt_i = chol_solve_vector(&htt_factors[i], &tmp);
+        let dt_i = backend.solve_block_vector(&htt_factors[i], &tmp);
         for c in 0..d {
             delta_t[i * d + c] = -dt_i[c];
         }
@@ -486,6 +779,7 @@ pub fn solve_arrow_newton_step(
     let cache = ArrowFactorCache {
         htt_factors,
         schur_factor,
+        solver_mode: options.mode,
         ridge_t,
         ridge_beta,
         htbeta,

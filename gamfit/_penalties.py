@@ -81,13 +81,13 @@ class IsometryPenalty:
     by the caller. ``e^{\\rho_\\mathrm{iso}}`` is REML-selectable like any
     other smoothing strength.
 
-    **When to use.** Whenever a ``LatentCoord`` block is in play without an
-    ``AuxPrior`` or Isometry-style gauge fix to break the diffeomorphism gauge. The bare
-    data-fit loss is invariant under any smooth invertible reparameterization
-    of ``t``; the isometry penalty breaks that symmetry by pinning the local
-    geometry of the decoder. The analytic gradient w.r.t. ``t`` reuses the
-    radial-derivative ``∂Φ/∂t`` jet that ``LatentCoord`` already computes
-    via ``latent_coord::LatentCoordValues::design_gradient_wrt_t``.
+    **When to use.** Whenever a ``LatentCoord`` block is in play and there is
+    no auxiliary prior to break the diffeomorphism gauge. The bare data-fit
+    loss is invariant under any smooth invertible reparameterization of ``t``;
+    the isometry penalty breaks that symmetry by pinning the local geometry
+    of the decoder. The analytic gradient w.r.t. ``t`` reuses the
+    radial-derivative ``∂Φ/∂t`` jet that ``LatentCoord`` already computes via
+    ``latent_coord::LatentCoordValues::design_gradient_wrt_t``.
 
     Parameters
     ----------

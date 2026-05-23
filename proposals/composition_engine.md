@@ -23,7 +23,7 @@ The pitch is not to widen the API surface. It is to recognize that the existing 
 |---|---|---|
 | Smooth decoder `M → ℝ^p` (GP-LVM, principal manifolds, kernel PCA) | multi-output smooth on existing bases | `Smooth` (`gamfit/smooth.py:33`), `Duchon`/`Sphere`/`PeriodicSplineCurve` subclasses, `SmoothTerm` (`src/terms/smooth.rs:320`), `BasisFamily` (`src/terms/basis.rs:216`) |
 | Smoothness / wiggliness selection | `S(ρ)` penalty + REML / LAML | `RemlState::evaluate_unified` (`src/solver/reml/runtime.rs:8051`), `laml_*` proof scaffolding (`src/solver/reml.lean:164-200`) |
-| Latent coordinate estimation (GP-LVM, autoencoder bottleneck) | new parameter block whose design derivatives reuse the ψ-machinery | needs new — see §4(a); pattern is `SpatialLogKappaCoords` (`src/terms/smooth.rs:1765`) |
+| Latent coordinate estimation (GP-LVM, autoencoder bottleneck) | new ext-coordinate block whose design derivatives reuse the existing kernel-shape derivative machinery | needs new — see §4(a); pattern is `SpatialLogKappaCoords` (`src/terms/smooth.rs:1765`) |
 | Intrinsic-dimension selection (auto-discovery of latent dim) | ARD: one penalty per latent axis, REML drives unused axes to ∞ *given a paired gauge fix* (aux-conditional prior or isometry) | composition of (a) + per-axis `S(ρ)` + paired gauge-fix from (b) or (c) + existing REML; no new primitive |
 | Topology choice (S¹, S², torus, Euclidean patch) | basis family + tensor product | `PeriodicSpline1D` (`src/terms/basis.rs:1401`), `SphericalSplineBasisSpec` (2635), `DuchonBasisSpec` (2764), `TensorBSplineSpec` (`src/terms/smooth.rs:295`); TDA persistent cohomology suggests which |
 | Gauge / canonical coordinate (Riemannian isometry to a reference) | structured penalty pinning the pullback metric toward a reference | needs new — see §4(b) |
@@ -132,7 +132,7 @@ This is a composition, not a primitive. Given `LatentCoordValues` of dimension `
 
 The sloppy-model "hyper-ribbon" diagnostic (Transtrum, Machta, Sethna) — the eigenspectrum of the REML Hessian at convergence — is a geometry-native cross-check: a clean gap between stiff and sloppy directions is the same statement as a clean gap between active and ARD-pruned latent axes, *once gauge is fixed*.
 
-No new code. Recipe-level recommendation: `manifold_fit(..., latent_dim=d_max, ard=True, aux=...)` (or `isometry=True`) translates to `[Latent(dim=1, basis=..., name=f"z{k}") for k in range(d_max)]` plus the requested gauge-breaking prior.
+No new code. Recipe-level recommendation: `manifold_fit(..., latent_dim=d_max, dim_selection=True, aux_prior=...)` (or `isometry=True`) translates to one `LatentCoord` block named `t` with per-axis ARD plus the requested gauge-breaking prior.
 
 ### 4(e). Geodesic-acceleration Newton patch
 
@@ -144,36 +144,39 @@ No new code. Recipe-level recommendation: `manifold_fit(..., latent_dim=d_max, a
 
 ## 5. Worked examples
 
-Each example is a 3–5 line specification that replaces a foreign library. APIs follow the existing `gamfit.fit` conventions and the new `Latent` smooth-spec.
+Each example is a 3–5 line specification that replaces a foreign library. APIs follow the existing `gamfit.fit` conventions and the new `LatentCoord` configuration object.
 
 ### GP-LVM (replaces GPy.GPLVM)
 
 ```python
 model = gamfit.fit(
     response=Y,                            # (n, p) observation matrix
-    smooths=[Latent(dim=2, basis=Duchon(centers=..., m=2, length_scale=None),
-                    init="pca")],
+    smooths=[Duchon(centers=..., m=2, length_scale=None, name="decoder")],
+    latents={"t": LatentCoord(n=N, d=2, init="pca", aux_prior={...})},
     family="gaussian",
 )
-Z_hat = model.latent("z")
+t_hat = model.latent("t")
 ```
 
-REML selects the decoder smoothness; `Latent.init="pca"` gives the standard PCA warm start; the gauge symmetry is broken by adding `IsometryToReference` or by supplying an auxiliary variable (`aux=`). `ard=True` *given* one of those gauge fixes (plus the proper marginal-likelihood normalisers) auto-discovers the intrinsic dimension; without a paired gauge fix, ARD on its own is rotation-symmetric and does not identify intrinsic dim (§4(d) audit caveat).
+REML selects the decoder smoothness; `LatentCoord.init="pca"` gives the standard PCA warm start; the gauge symmetry is broken by adding `IsometryPenalty` or by supplying an auxiliary prior. `dim_selection=True` *given* one of those gauge fixes (plus the proper marginal-likelihood normalisers) auto-discovers the intrinsic dimension; without a paired gauge fix, ARD on its own is rotation-symmetric and does not identify intrinsic dim (§4(d) audit caveat).
 
 ### iVAE-style identifiable representation (replaces hand-rolled VAE)
 
 ```python
 model = gamfit.fit(
     response=X,                            # (n, p) observed
-    smooths=[Latent(dim=8, basis=Duchon(centers=..., m=2),
-                    aux="environment_id",  # auxiliary variable u_n
-                    prior="gaussian",
-                    mechanism_sparsity=True)],
+    smooths=[Duchon(centers=..., m=2, name="decoder")],
+    latents={"t": LatentCoord(
+        n=N, d=8,
+        aux_prior={"u": environment_id, "family": "ridge", "strength": "auto"},
+        dim_selection=True,
+    )},
+    penalties=[SparsityPenalty(target="decoder", strength="auto")],
     family="gaussian",
 )
 ```
 
-The `aux=` argument routes to the new `BlockwisePenalty::auxiliary_conditional_gaussian` constructor; `mechanism_sparsity=True` adds the L¹-on-rows penalty via the existing active-set path. Identifiability is the Khemakhem theorem; the selector for *how strongly* to enforce it is REML over the per-block ρ.
+The `aux_prior` argument routes to the new `BlockwisePenalty::auxiliary_conditional_gaussian` constructor; `SparsityPenalty` adds the L¹-on-rows penalty via the existing active-set path. Identifiability is the Khemakhem theorem under the normaliser / regularity / positive-definiteness conditions in §4(c); the selector for *how strongly* to enforce it is REML over the per-block ρ.
 
 ### Fisher-Rao color manifold (the cogito work)
 
@@ -185,8 +188,8 @@ class FisherWorkingModel(WorkingModel):
 
 model = gamfit.fit(
     response=color_responses,
-    smooths=[Latent(dim=2, basis=Sphere(...)),  # color manifold ≅ S²
-             Duchon(centers=stimuli, m=2)],
+    smooths=[Sphere(...), Duchon(centers=stimuli, m=2)],
+    latents={"t": LatentCoord(n=N, d=2, aux_prior={...})},
     working_model=FisherWorkingModel(),
 )
 ```
@@ -198,10 +201,11 @@ The Fisher inner product is *just* the choice of `W` inside `WorkingModel::updat
 ```python
 model = gamfit.fit(
     response=points,                       # (n, d)
-    smooths=[Latent(dim=1, basis=BSpline(knots=...), init="pca")],
+    smooths=[BSpline(knots=...)],
+    latents={"t": LatentCoord(n=N, d=1, init="pca", aux_prior={...})},
     family="gaussian",
 )
-curve = model.predict_along("z", np.linspace(0, 1, 200))
+curve = model.predict_along("t", np.linspace(0, 1, 200))
 ```
 
 Principal curves are just `LatentCoord(dim=1)` / `LatentCoordValues` with a smooth decoder. The smoothing parameter is selected by REML rather than by cross-validation. Hastie and Stuetzle's iterative projection is what the inner solver does anyway.
@@ -213,7 +217,8 @@ Principal curves are just `LatentCoord(dim=1)` / `LatentCoordValues` with a smoo
 # 2. Topology is the basis choice:
 model = gamfit.fit(
     response=Y,
-    smooths=[Latent(dim=1, basis=PeriodicSplineCurve(period=2*np.pi, ...))],
+    smooths=[PeriodicSplineCurve(period=2*np.pi, ...)],
+    latents={"t": LatentCoord(n=N, d=1, aux_prior={...})},
 )
 ```
 
@@ -223,7 +228,7 @@ This is the cleanest expression of the framing. TDA tells you *which* basis; gam
 
 This section is for the maintainers; it cites the precise sites that new work would touch.
 
-**The ψ-machinery.** The end-to-end pipeline for design-moving hyperparameters is:
+**The ext-coordinate machinery.** The end-to-end pipeline for design-moving hyperparameters is:
 
 1. `SpatialLogKappaCoords::from_length_scales_aniso` (`src/terms/smooth.rs:1835-1880`) constructs the flat ψ vector with a `dims_per_term` layout.
 2. `ImplicitDesignPsiDerivative` (`src/terms/basis.rs:3948`) provides `∂X/∂ψ` without materializing the dense matrix.
@@ -236,7 +241,7 @@ A `LatentCoordValues` block uses every step of this pipeline. Step 1 becomes per
 
 **The inner Newton solver.** `src/solver/pirls.rs:4493-4900` is the LM-damped Newton outer loop. The Newton direction is computed at one of three sites depending on backend: `solve_newton_directionwith_linear_constraints` (4841), `solve_newton_directionwith_lower_bounds` (4850), `solve_newton_direction_dense` (4859), with the sparse path at 4826-4828. Geodesic acceleration is a *post-processing* of the returned `direction`: with the factorization still in scope, evaluate the residual's second directional derivative along `δ_1`, then re-solve the same system for `δ_2`. The patch is local to this block and gated by a new field on `WorkingModelPirlsOptions`.
 
-**REML outer loop.** `src/solver/outer_strategy.rs::OuterProblem` (referenced at `src/solver/workflow.rs:1938-1980`) drives the BFGS / compass-search loop in ρ. Adding ext-coords (ψ, latent z) lengthens the optimization vector but does not change the loop structure; this is already exercised for anisotropic ψ.
+**REML outer loop.** `src/solver/outer_strategy.rs::OuterProblem` (referenced at `src/solver/workflow.rs:1938-1980`) drives the BFGS / compass-search loop in ρ. Adding ext-coords (`ψ`, latent `t`) lengthens the optimization vector but does not change the loop structure; this is already exercised for anisotropic `ψ`.
 
 **Penalty blocks.** `BlockwisePenalty` (`src/terms/smooth.rs:707`) and `KroneckerPenaltySystem` (`src/terms/smooth.rs:855`) already accept arbitrary user-constructed Gram blocks. The new isometry and auxiliary-conditional penalties slot in at this layer, with `PenaltyDerivativeComponent` (`src/solver/reml/mod.rs:3083`) carrying the `∂S/∂t` and `∂S/∂ρ` blocks.
 
@@ -269,7 +274,7 @@ This document was revised in response to a math-audit pass on the original optim
 - **§2 tier-assignment table (Manifold/GP-LVM row, intrinsic-dim row).** The intrinsic-dim row now states that ARD discovers intrinsic dim *given* a paired gauge fix from (a)/(b)/(c) and the proper marginal-likelihood normalisers — not as a standalone consequence of ARD.
 - **§4(c) aux-conditional prior.** Three explicit regularity conditions added (normaliser present, `h` at least `C¹`, conditional precision PD on the anchored subspace). The earlier draft asserted "`μ` is REML-selectable" without these.
 - **§4(d) ARD over latent dimensions.** Rewritten to state that `α_k ‖t_{·,k}‖²` is rotation-symmetric and therefore does *not* break gauge by itself. The composition (ARD + paired gauge fix + REML normalisers) is what does the work. The earlier draft conflated "ARD" with "gauge fix + intrinsic-dim discovery."
-- **§5 worked GP-LVM example.** Removed the implication that `ard=True` alone is a sufficient gauge fix.
+- **§5 worked GP-LVM example.** Removed the implication that `dim_selection=True` / ARD alone is a sufficient gauge fix.
 - **§7 open questions (Latent refuse-to-fit policy).** ARD removed from the list of acceptable gauge-breaking choices, with the audit caveat cited.
 - **§7 composability under multiple new primitives.** Promoted the earlier footnote about Schur/arrow cost into the main complexity claim: cost is arrow-shaped, but the REML `log|H|` gradient carries a shared `Schur⁻¹` factor handled as one-time-per-outer-iteration setup plus N rank-≤d per-row traces.
 
