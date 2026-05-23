@@ -24,6 +24,9 @@
 //!     (`AuxPrior` or `Isometry`) pins rotations / reparameterisations.
 //!   * [`TotalVariationPenalty`] — smoothed L¹ on first differences of a
 //!     latent coefficient block. Promotes piecewise-constant atom maps.
+//!   * [`NuclearNormPenalty`] — smoothed L¹ on singular values of a matrix
+//!     latent block. Promotes low intrinsic rank without choosing a canonical
+//!     axis basis.
 //!   * [`OrthogonalityPenalty`] — fixes the rotation gauge inside a latent
 //!     block by penalizing cross-axis correlations. Pair with ARD when
 //!     intrinsic dimension should be identifiable.
@@ -40,8 +43,8 @@
 //! The signatures are deliberately uniform with the existing smoothness path:
 //! the quadratic ARD penalty produces a [`crate::terms::smooth::BlockwisePenalty`]
 //! that slots directly into the canonical-penalty pipeline, while the
-//! non-quadratic Sparsity, Orthogonality, and Isometry penalties produce
-//! [`AnalyticPenaltyOp`] handles that downstream PIRLS / REML consumers query
+//! non-quadratic Sparsity, TV, NuclearNorm, Orthogonality, and Isometry
+//! penalties produce [`AnalyticPenaltyOp`] handles that downstream PIRLS / REML consumers query
 //! through the same `value / gradient / hvp` interface they already use for
 //! smoothness.
 //!
@@ -53,7 +56,8 @@
 //! kernel-shape paths append ext-coords. The IsometryPenalty owns one `ρ`; the
 //! SparsityPenalty owns either zero (`ε` fixed) or one (`ε` REML-selected) plus
 //! one strength; the ARDPenalty owns `d` (one per latent axis);
-//! Orthogonality owns one strength only when its weight is learnable.
+//! NuclearNorm and Orthogonality each own one strength only when their weight
+//! is learnable.
 //!
 //! ## Three-tier landings
 //!
@@ -2487,6 +2491,357 @@ impl AnalyticPenalty for TotalVariationPenalty {
 }
 
 // ---------------------------------------------------------------------------
+// Nuclear norm penalty
+// ---------------------------------------------------------------------------
+
+/// Basis-free low-rank penalty for a row-major `(n_eff, d)` latent block.
+///
+/// The smoothed nuclear norm applies a Huber-style L¹ penalty to the singular
+/// spectrum, encouraging low intrinsic rank even when useful axes are rotated
+/// away from the canonical basis. It complements ARD's per-axis pruning and
+/// Orthogonality's basis-fixing role.
+#[derive(Debug, Clone)]
+pub struct NuclearNormPenalty {
+    pub target: PsiSlice,
+    /// Base strength. If `learnable_weight` is true, the resolved strength is
+    /// `weight * exp(rho[rho_index])`; otherwise it is fixed at `weight`.
+    pub weight: f64,
+    /// Number of rows in the row-major matrix-valued latent block.
+    pub n_eff: usize,
+    pub smoothing_eps: f64,
+    /// Optional spectrum cap. The implementation computes faer's full thin SVD
+    /// and retains the leading `max_rank` singular triplets when present.
+    pub max_rank: Option<usize>,
+    pub learnable_weight: bool,
+    pub rho_index: usize,
+}
+
+struct NuclearSvdCache {
+    u: Array2<f64>,
+    singular: Array1<f64>,
+    vt: Array2<f64>,
+}
+
+impl NuclearNormPenalty {
+    #[must_use = "build error must be handled"]
+    pub fn new(
+        target: PsiSlice,
+        weight: f64,
+        n_eff: usize,
+        smoothing_eps: f64,
+        max_rank: Option<usize>,
+        learnable_weight: bool,
+    ) -> Result<Self, String> {
+        if target.is_empty() {
+            return Err("NuclearNormPenalty::new requires a non-empty target".to_string());
+        }
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!(
+                "NuclearNormPenalty::new requires finite weight > 0, got {weight}"
+            ));
+        }
+        if n_eff == 0 {
+            return Err("NuclearNormPenalty::new requires n_eff > 0".to_string());
+        }
+        if target.len() % n_eff != 0 {
+            return Err(format!(
+                "NuclearNormPenalty::new target length {} is not divisible by n_eff {}",
+                target.len(),
+                n_eff
+            ));
+        }
+        if let Some(latent_dim) = target.latent_dim {
+            let expected = n_eff.checked_mul(latent_dim).ok_or_else(|| {
+                "NuclearNormPenalty::new target shape overflows usize".to_string()
+            })?;
+            if expected != target.len() {
+                return Err(format!(
+                    "NuclearNormPenalty::new target length {} does not match n_eff {} × latent_dim {}",
+                    target.len(),
+                    n_eff,
+                    latent_dim
+                ));
+            }
+        }
+        if !(smoothing_eps.is_finite() && smoothing_eps > 0.0) {
+            return Err(format!(
+                "NuclearNormPenalty::new requires finite smoothing_eps > 0, got {smoothing_eps}"
+            ));
+        }
+        if matches!(max_rank, Some(0)) {
+            return Err("NuclearNormPenalty::new requires max_rank > 0".to_string());
+        }
+        Ok(Self {
+            target,
+            weight,
+            n_eff,
+            smoothing_eps,
+            max_rank,
+            learnable_weight,
+            rho_index: 0,
+        })
+    }
+
+    fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
+        if self.learnable_weight {
+            self.weight * rho[self.rho_index].exp()
+        } else {
+            self.weight
+        }
+    }
+
+    fn latent_dim(&self, target_len: usize) -> Option<usize> {
+        if self.n_eff == 0 || target_len % self.n_eff != 0 {
+            debug_assert_eq!(
+                target_len % self.n_eff.max(1),
+                0,
+                "target length must be divisible by n_eff"
+            );
+            return None;
+        }
+        Some(target_len / self.n_eff)
+    }
+
+    fn target_matrix<'a>(&self, target: ArrayView1<'a, f64>) -> Option<ArrayView2<'a, f64>> {
+        let d = self.latent_dim(target.len())?;
+        target.into_shape_with_order((self.n_eff, d)).ok()
+    }
+
+    fn rank_limit(&self, rank: usize) -> usize {
+        self.max_rank.unwrap_or(rank).min(rank)
+    }
+
+    fn compute_svd_cached(&self, t: ArrayView2<'_, f64>) -> NuclearSvdCache {
+        // Existing faer wrapper calls `faer::linalg::svd::svd(..., Thin, Thin, ...)`.
+        let owned = t.to_owned();
+        let (u, singular, vt) = owned
+            .svd(true, true)
+            .expect("NuclearNormPenalty SVD failed to converge");
+        NuclearSvdCache {
+            u: u.expect("NuclearNormPenalty requested left singular vectors"),
+            singular,
+            vt: vt.expect("NuclearNormPenalty requested right singular vectors"),
+        }
+    }
+
+    fn right_spectral_inverse_sqrt_derivative(
+        &self,
+        t: ArrayView2<'_, f64>,
+        v: ArrayView2<'_, f64>,
+    ) -> (Array2<f64>, Array2<f64>) {
+        // HVP for spectral matrix functions (matrix-derivative-with-singular-values):
+        // G(T)=T(TᵀT+ε²I)^(-1/2), so dG[V]=V R + T dR[V].
+        // The Fréchet derivative dR uses divided differences in the right
+        // singular-vector basis, avoiding any dense Hessian materialization.
+        let d = t.ncols();
+        let mut gram = Array2::<f64>::zeros((d, d));
+        let mut tangent_gram = Array2::<f64>::zeros((d, d));
+        for a in 0..d {
+            for b in 0..d {
+                let mut g = 0.0;
+                let mut dg = 0.0;
+                for n in 0..t.nrows() {
+                    g += t[[n, a]] * t[[n, b]];
+                    dg += t[[n, a]] * v[[n, b]] + v[[n, a]] * t[[n, b]];
+                }
+                gram[[a, b]] = g;
+                tangent_gram[[a, b]] = dg;
+            }
+            gram[[a, a]] += self.smoothing_eps * self.smoothing_eps;
+        }
+
+        let (evals, q) = gram
+            .eigh(Side::Lower)
+            .expect("NuclearNormPenalty Gram eigendecomposition failed");
+        let active_start = d.saturating_sub(self.rank_limit(d));
+        let mut f = Array1::<f64>::zeros(d);
+        let mut df = Array1::<f64>::zeros(d);
+        for i in 0..d {
+            let lambda = evals[i];
+            assert!(
+                lambda.is_finite() && lambda > 0.0,
+                "NuclearNormPenalty expected positive smoothed Gram eigenvalue"
+            );
+            if i >= active_start {
+                f[i] = lambda.powf(-0.5);
+                df[i] = -0.5 * lambda.powf(-1.5);
+            }
+        }
+
+        let mut right_filter = Array2::<f64>::zeros((d, d));
+        for a in 0..d {
+            for b in 0..d {
+                let mut s = 0.0;
+                for i in 0..d {
+                    s += q[[a, i]] * f[i] * q[[b, i]];
+                }
+                right_filter[[a, b]] = s;
+            }
+        }
+
+        let mut b_basis = Array2::<f64>::zeros((d, d));
+        for i in 0..d {
+            for j in 0..d {
+                let mut s = 0.0;
+                for a in 0..d {
+                    for b in 0..d {
+                        s += q[[a, i]] * tangent_gram[[a, b]] * q[[b, j]];
+                    }
+                }
+                b_basis[[i, j]] = s;
+            }
+        }
+
+        let mut derivative_basis = Array2::<f64>::zeros((d, d));
+        for i in 0..d {
+            for j in 0..d {
+                let denom = evals[i] - evals[j];
+                let scale = (evals[i].abs() + evals[j].abs()).max(1.0);
+                let divided_difference = if denom.abs() <= 1.0e-12 * scale {
+                    let i_active = i >= active_start;
+                    let j_active = j >= active_start;
+                    if i_active && j_active {
+                        0.5 * (df[i] + df[j])
+                    } else {
+                        0.0
+                    }
+                } else {
+                    (f[i] - f[j]) / denom
+                };
+                derivative_basis[[i, j]] = divided_difference * b_basis[[i, j]];
+            }
+        }
+
+        let mut right_filter_derivative = Array2::<f64>::zeros((d, d));
+        for a in 0..d {
+            for b in 0..d {
+                let mut s = 0.0;
+                for i in 0..d {
+                    for j in 0..d {
+                        s += q[[a, i]] * derivative_basis[[i, j]] * q[[b, j]];
+                    }
+                }
+                right_filter_derivative[[a, b]] = s;
+            }
+        }
+
+        (right_filter, right_filter_derivative)
+    }
+
+    fn flatten_matrix(m: &Array2<f64>) -> Array1<f64> {
+        let n_obs = m.nrows();
+        let d = m.ncols();
+        let mut out = Array1::<f64>::zeros(n_obs * d);
+        for n in 0..n_obs {
+            for a in 0..d {
+                out[n * d + a] = m[[n, a]];
+            }
+        }
+        out
+    }
+}
+
+impl AnalyticPenalty for NuclearNormPenalty {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Psi
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        let Some(t) = self.target_matrix(target) else {
+            return 0.0;
+        };
+        let svd = self.compute_svd_cached(t);
+        let rank = self.rank_limit(svd.singular.len());
+        let eps = self.smoothing_eps;
+        let mut acc = 0.0;
+        for i in 0..rank {
+            let sigma = svd.singular[i];
+            acc += (sigma * sigma + eps * eps).sqrt() - eps;
+        }
+        self.resolved_weight(rho) * acc
+    }
+
+    fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let svd = self.compute_svd_cached(t);
+        let rank = self.rank_limit(svd.singular.len());
+        let weight = self.resolved_weight(rho);
+        let eps2 = self.smoothing_eps * self.smoothing_eps;
+        let mut grad = Array2::<f64>::zeros(t.dim());
+        for i in 0..rank {
+            let sigma = svd.singular[i];
+            let spectral_grad = sigma / (sigma * sigma + eps2).sqrt();
+            for n in 0..t.nrows() {
+                for a in 0..t.ncols() {
+                    grad[[n, a]] += weight * svd.u[[n, i]] * spectral_grad * svd.vt[[i, a]];
+                }
+            }
+        }
+        Self::flatten_matrix(&grad)
+    }
+
+    fn hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        if target.len() != v.len() {
+            return Array1::<f64>::zeros(target.len());
+        }
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let Some(v_mat) = self.target_matrix(v) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let (right_filter, right_filter_derivative) =
+            self.right_spectral_inverse_sqrt_derivative(t.view(), v_mat.view());
+        let weight = self.resolved_weight(rho);
+        let mut out = Array2::<f64>::zeros(t.dim());
+        for n in 0..t.nrows() {
+            for a in 0..t.ncols() {
+                let mut term = 0.0;
+                for b in 0..t.ncols() {
+                    term += v_mat[[n, b]] * right_filter[[b, a]]
+                        + t[[n, b]] * right_filter_derivative[[b, a]];
+                }
+                out[[n, a]] = weight * term;
+            }
+        }
+        Self::flatten_matrix(&out)
+    }
+
+    fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        if !self.learnable_weight {
+            return Array1::<f64>::zeros(0);
+        }
+        let mut out = Array1::<f64>::zeros(1);
+        out[self.rho_index] = self.value(target, rho);
+        out
+    }
+
+    fn rho_count(&self) -> usize {
+        usize::from(self.learnable_weight)
+    }
+
+    fn name(&self) -> &str {
+        "nuclear_norm"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Orthogonality penalty
 // ---------------------------------------------------------------------------
 
@@ -2772,6 +3127,7 @@ pub enum AnalyticPenaltyKind {
     IBPAssignment(Arc<IBPAssignmentPenalty>),
     Ard(Arc<ARDPenalty>),
     TotalVariation(Arc<TotalVariationPenalty>),
+    NuclearNorm(Arc<NuclearNormPenalty>),
     Orthogonality(Arc<OrthogonalityPenalty>),
 }
 
@@ -2784,6 +3140,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::IBPAssignment(p) => p.tier(),
             AnalyticPenaltyKind::Ard(p) => p.tier(),
             AnalyticPenaltyKind::TotalVariation(p) => p.tier(),
+            AnalyticPenaltyKind::NuclearNorm(p) => p.tier(),
             AnalyticPenaltyKind::Orthogonality(p) => p.tier(),
         }
     }
@@ -2796,6 +3153,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::IBPAssignment(p) => p.rho_count(),
             AnalyticPenaltyKind::Ard(p) => p.rho_count(),
             AnalyticPenaltyKind::TotalVariation(p) => p.rho_count(),
+            AnalyticPenaltyKind::NuclearNorm(p) => p.rho_count(),
             AnalyticPenaltyKind::Orthogonality(p) => p.rho_count(),
         }
     }
@@ -2808,6 +3166,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::IBPAssignment(p) => p.name(),
             AnalyticPenaltyKind::Ard(p) => p.name(),
             AnalyticPenaltyKind::TotalVariation(p) => p.name(),
+            AnalyticPenaltyKind::NuclearNorm(p) => p.name(),
             AnalyticPenaltyKind::Orthogonality(p) => p.name(),
         }
     }
@@ -2820,6 +3179,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::IBPAssignment(p) => p.value(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.value(target, rho),
             AnalyticPenaltyKind::TotalVariation(p) => p.value(target, rho),
+            AnalyticPenaltyKind::NuclearNorm(p) => p.value(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.value(target, rho),
         }
     }
@@ -2836,6 +3196,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::IBPAssignment(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::TotalVariation(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::NuclearNorm(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_target(target, rho),
         }
     }
@@ -2852,6 +3213,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::IBPAssignment(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::TotalVariation(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::NuclearNorm(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_rho(target, rho),
         }
     }
@@ -2868,6 +3230,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::IBPAssignment(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::TotalVariation(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::NuclearNorm(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.hessian_diag(target, rho),
         }
     }
@@ -2892,6 +3255,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::IBPAssignment(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Ard(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::TotalVariation(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::NuclearNorm(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Orthogonality(p) => p.hvp(target, rho, v),
         }
     }
@@ -3018,6 +3382,12 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 self.stochastic_diag_via_matvec()
             }
             AnalyticPenaltyKind::Orthogonality(_) => self.diag_via_matvec(),
+            AnalyticPenaltyKind::NuclearNorm(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_diag_via_matvec()
+            }
+            AnalyticPenaltyKind::NuclearNorm(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::IBPAssignment(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
                 .expect("IBP assignment diag"),
@@ -3091,7 +3461,16 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             {
                 self.stochastic_log_det_plus_lambda_i(lambda)
             }
+            AnalyticPenaltyKind::NuclearNorm(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_log_det_plus_lambda_i(lambda)
+            }
             AnalyticPenaltyKind::Isometry(_) | AnalyticPenaltyKind::Orthogonality(_) => {
+                let dense = self.as_dense();
+                <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
+            }
+            AnalyticPenaltyKind::NuclearNorm(_) => {
                 let dense = self.as_dense();
                 <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
             }
