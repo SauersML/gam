@@ -96,13 +96,15 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
 use std::sync::Arc;
 
+use crate::solver::persistent_warm_start::StableHasher;
 use crate::terms::analytic_penalties::{AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier};
-use crate::terms::latent_coord::LatentCoordValues;
+use crate::terms::latent_coord::{LatentCoordValues, LatentManifold};
 
 const DIRECT_SOLVE_MAX_K: usize = 2_000;
 const DEFAULT_PCG_MAX_ITERATIONS: usize = 200;
 const DEFAULT_PCG_RELATIVE_TOLERANCE: f64 = 1e-4;
 const DEFAULT_TRUST_REGION_RADIUS: f64 = f64::INFINITY;
+const EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT: u64 = 0;
 
 /// Matrix-free shared-block multiply for large BA/SAE Schur PCG.
 ///
@@ -399,6 +401,93 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
     }
 }
 
+fn manifold_mode_fingerprint(latent: &LatentCoordValues) -> u64 {
+    let manifold = latent.manifold();
+    if manifold.is_euclidean() {
+        return EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT;
+    }
+
+    let mut hasher = StableHasher::new();
+    hasher.write_str("arrow-schur-manifold-mode-v1");
+    hasher.write_usize(latent.n_obs());
+    hasher.write_usize(latent.latent_dim());
+    write_latent_manifold(&mut hasher, manifold);
+    let mut metric_weights = Vec::new();
+    append_latent_metric_weights(&mut metric_weights, manifold);
+    hasher.write_usize(metric_weights.len());
+    for weight in metric_weights {
+        hasher.write_f64(weight);
+    }
+    hasher.finish_u64()
+}
+
+fn write_latent_manifold(hasher: &mut StableHasher, manifold: &LatentManifold) {
+    match manifold {
+        LatentManifold::Euclidean => {
+            hasher.write_str("euclidean");
+        }
+        LatentManifold::Circle => {
+            hasher.write_str("circle");
+        }
+        LatentManifold::Sphere { dim } => {
+            hasher.write_str("sphere");
+            hasher.write_usize(*dim);
+        }
+        LatentManifold::Interval { lo, hi } => {
+            hasher.write_str("interval");
+            hasher.write_f64(*lo);
+            hasher.write_f64(*hi);
+        }
+        LatentManifold::Product(parts) => {
+            hasher.write_str("product");
+            hasher.write_usize(parts.len());
+            for part in parts {
+                write_latent_manifold(hasher, part);
+            }
+        }
+        LatentManifold::ProductWithMetric { manifolds, weights } => {
+            hasher.write_str("product-with-metric");
+            hasher.write_usize(manifolds.len());
+            for part in manifolds {
+                write_latent_manifold(hasher, part);
+            }
+            hasher.write_usize(weights.len());
+            for weight in weights {
+                hasher.write_f64(*weight);
+            }
+        }
+    }
+}
+
+fn append_latent_metric_weights(out: &mut Vec<f64>, manifold: &LatentManifold) {
+    match manifold {
+        LatentManifold::Euclidean => out.push(1.0),
+        LatentManifold::Circle => {
+            let scale = std::f64::consts::PI * 2.0;
+            out.push(1.0 / (scale * scale));
+        }
+        LatentManifold::Sphere { dim } => {
+            let scale = std::f64::consts::PI;
+            out.extend(std::iter::repeat_n(1.0 / (scale * scale), *dim));
+        }
+        LatentManifold::Interval { lo, hi } => {
+            let scale = hi - lo;
+            out.push(1.0 / (scale * scale));
+        }
+        LatentManifold::Product(parts) => {
+            for part in parts {
+                append_latent_metric_weights(out, part);
+            }
+        }
+        LatentManifold::ProductWithMetric {
+            manifolds: _,
+            weights,
+        } => {
+            out.extend(weights.iter().copied());
+        }
+    }
+}
+
 /// Per-row block data for the arrow-Schur system.
 ///
 /// `htt` holds the `d × d` Gauss–Newton block for row `i` (including any
@@ -469,6 +558,9 @@ pub struct ArrowSchurSystem {
     pub d: usize,
     /// β dimensionality `K`.
     pub k: usize,
+    /// Geometry tag for the row-local latent blocks after optional
+    /// Riemannian projection. Euclidean/no-op geometry uses the sentinel.
+    pub manifold_mode_fingerprint: u64,
 }
 
 impl ArrowSchurSystem {
@@ -484,6 +576,7 @@ impl ArrowSchurSystem {
             gb: Array1::<f64>::zeros(k),
             d,
             k,
+            manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
         }
     }
 
@@ -514,6 +607,7 @@ impl ArrowSchurSystem {
             gb: Array1::<f64>::zeros(k),
             d,
             k,
+            manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
         }
     }
 
@@ -593,6 +687,7 @@ impl ArrowSchurSystem {
     /// terms live in the tangent space, so the solved update retracts cleanly.
     pub fn apply_riemannian_latent_geometry(&mut self, latent: &LatentCoordValues) {
         let manifold = latent.manifold();
+        self.manifold_mode_fingerprint = manifold_mode_fingerprint(latent);
         if manifold.is_euclidean() {
             return;
         }
@@ -795,6 +890,8 @@ pub struct ArrowFactorCache {
     pub d: usize,
     /// β dimensionality `K`.
     pub k: usize,
+    /// Geometry tag for the row-local factors and cross-blocks.
+    pub manifold_mode_fingerprint: u64,
 }
 
 impl ArrowFactorCache {
@@ -1008,6 +1105,7 @@ pub fn solve_arrow_newton_step_with_options(
         htbeta,
         d: sys.d,
         k: sys.k,
+        manifold_mode_fingerprint: sys.manifold_mode_fingerprint,
     };
     Ok((step.delta_t, step.delta_beta, cache))
 }
