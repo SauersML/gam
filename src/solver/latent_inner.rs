@@ -46,7 +46,8 @@
 use ndarray::{Array1, ArrayView1};
 
 use crate::solver::arrow_schur::{
-    solve_arrow_newton_step, ArrowFactorCache, ArrowSchurError, ArrowSchurSystem,
+    solve_arrow_newton_step_with_options, ArrowFactorCache, ArrowSchurError, ArrowSchurSystem,
+    ArrowSolveOptions, ArrowSolverMode,
 };
 use crate::terms::latent_coord::LatentCoordValues;
 
@@ -67,6 +68,12 @@ pub struct LatentInnerOptions {
     pub lm_shrink: f64,
     /// Maximum ridge value before declaring failure.
     pub max_ridge: f64,
+    /// BA Schur mode for the reduced shared system. `None` selects Direct for
+    /// `K <= 2000` and InexactPCG above, matching large-scale BA practice.
+    pub solver_mode: Option<ArrowSolverMode>,
+    /// Reduced-system trust-region radius for Steihaug-CG. This is the
+    /// Ceres/BA trust-region bound layered on top of the existing LM ridges.
+    pub trust_region_radius: f64,
 }
 
 impl Default for LatentInnerOptions {
@@ -79,6 +86,8 @@ impl Default for LatentInnerOptions {
             lm_grow: 10.0,
             lm_shrink: 0.5,
             max_ridge: 1e12,
+            solver_mode: None,
+            trust_region_radius: 1.0,
         }
     }
 }
@@ -183,9 +192,13 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                 // effort — if the factorization fails (e.g. ill-
                 // conditioned at the very converged point), skip the
                 // cache; the predictor will then no-op.
-                if let Ok((_, _, cache)) =
-                    solve_arrow_newton_step(&system, ridge_t.max(1e-12), ridge_beta.max(1e-12))
-                {
+                let solve_options = latent_arrow_solve_options(&system, &opts);
+                if let Ok((_, _, cache)) = solve_arrow_newton_step_with_options(
+                    &system,
+                    ridge_t.max(1e-12),
+                    ridge_beta.max(1e-12),
+                    &solve_options,
+                ) {
                     last_cache = Some(cache);
                 }
                 break;
@@ -194,7 +207,9 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
             // Attempt the LM-damped arrow-Schur step. On failure (per-
             // row PD violation or Schur PD violation), grow the ridge
             // and retry without consuming an outer iteration.
-            let step_result = solve_arrow_newton_step(&system, ridge_t, ridge_beta);
+            let solve_options = latent_arrow_solve_options(&system, &opts);
+            let step_result =
+                solve_arrow_newton_step_with_options(&system, ridge_t, ridge_beta, &solve_options);
             match step_result {
                 Ok((delta_t, delta_beta, cache)) => {
                     // Accept step and shrink ridges.
@@ -212,7 +227,8 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                     iter += 1;
                 }
                 Err(ArrowSchurError::PerRowFactorFailed { .. })
-                | Err(ArrowSchurError::SchurFactorFailed { .. }) => {
+                | Err(ArrowSchurError::SchurFactorFailed { .. })
+                | Err(ArrowSchurError::PcgFailed { .. }) => {
                     // Grow ridges; retry without burning an iteration.
                     ridge_t = if ridge_t == 0.0 {
                         1e-6
@@ -244,6 +260,18 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
             final_ridge_beta: ridge_beta,
         })
     }
+}
+
+fn latent_arrow_solve_options(
+    system: &ArrowSchurSystem,
+    opts: &LatentInnerOptions,
+) -> ArrowSolveOptions {
+    let mut solve_options = ArrowSolveOptions::automatic(system.k);
+    if let Some(mode) = opts.solver_mode {
+        solve_options.mode = mode;
+    }
+    solve_options.trust_region.radius = opts.trust_region_radius;
+    solve_options
 }
 
 fn system_gradient_norm_sq(sys: &ArrowSchurSystem) -> f64 {

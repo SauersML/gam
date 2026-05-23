@@ -106,6 +106,12 @@ Each pair shows the noisy input (left) and the recovered smooth
 (right). The full gallery and reproduction script:
 [docs/manifold-smooths.md](docs/manifold-smooths.md).
 
+Maintainers and advanced users who want the engine view rather than only the
+GAM facade should start with
+[docs/composition_engine.md](docs/composition_engine.md): it maps β / ψ / ρ
+tiers to `LatentCoord`, topology choice, analytic penalties, and SAE-manifold
+configurations.
+
 Learnable link functions. A `flexible(base)` link adds a spline offset
 on top of a base link. `blended(l1, l2)` learns a mixture weight. `sas`
 and `beta-logistic` learn shape parameters.

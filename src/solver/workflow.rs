@@ -2889,6 +2889,17 @@ fn materialize_standard<'a>(
     col_map: &HashMap<String, usize>,
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, String> {
+    if config
+        .latents
+        .as_ref()
+        .is_some_and(|value| !value.is_null())
+    {
+        let _ = crate::terms::smooth::try_build_latent_coord_hyper_dirs()
+            .map_err(|err| err.to_string())?;
+        return Err(
+            "gamfit.fit(..., latents={...}) is parsed at the Python/Rust boundary, but the standard workflow still needs the TODO in src/terms/smooth.rs::try_build_latent_coord_hyper_dirs: represent per-row LatentCoord design-moving directions without materializing N*K*d or one dense N*K derivative per coordinate, then inject them through evaluate_unified_with_psi_ext. Use gaussian_reml_fit_latent for the current explicit latent REML path.".to_string(),
+        );
+    }
     if config.noise_offset_column.is_some() {
         return Err(
             "noise_offset_column requires a location-scale model with noise_formula".to_string(),

@@ -12515,6 +12515,26 @@ fn try_build_spatial_log_kappa_hyper_dirs(
     Ok(Some(spatial_log_kappa_hyper_dirs_frominfo_list(info_list)?))
 }
 
+/// TODO(latent-platform): build per-row `LatentCoord` design-moving
+/// hyper-directions via the same `HyperDesignDerivative` /
+/// `DirectionalHyperParam::not_penalty_like` path used by
+/// `spatial_log_kappa_hyper_dirs_frominfo_list`.
+///
+/// The missing representation is not the chain rule itself (that lives in
+/// `LatentCoordValues` and the input-location helpers); it is a streaming
+/// `HyperDesignDerivative` storage variant that exposes each `t[n, a]`
+/// direction without allocating either a dense `(N, K, d)` jet or one dense
+/// `(N, K)` matrix per latent coordinate.
+pub(crate) fn try_build_latent_coord_hyper_dirs(
+) -> Result<Option<Vec<DirectionalHyperParam>>, EstimationError> {
+    Err(EstimationError::InvalidInput(
+        "LatentCoord standard-fit hyper_dirs TODO: add streaming per-row \
+         HyperDesignDerivative storage, then inject those non-penalty-like \
+         directions into evaluate_unified_with_psi_ext"
+            .to_string(),
+    ))
+}
+
 fn spatial_log_kappa_hyper_dirs_frominfo_list(
     info_list: Vec<SpatialPsiDerivative>,
 ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {

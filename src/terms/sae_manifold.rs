@@ -720,7 +720,9 @@ impl SaeManifoldTerm {
         let sys = self
             .assemble_arrow_schur(z, rho)
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
-        sys.solve(ridge_psi, ridge_beta)
+        let mut options = ArrowSolveOptions::inexact_pcg();
+        options.trust_region.radius = 1.0;
+        sys.solve_with_options(ridge_psi, ridge_beta, &options)
     }
 
     /// Build the analytic-penalty descriptors that correspond to the current
