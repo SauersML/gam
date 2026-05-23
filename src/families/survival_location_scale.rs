@@ -946,7 +946,9 @@ pub struct SurvivalLocationScaleFitResultParts {
     pub stable_penalty_term: f64,
     pub penalized_objective: f64,
     pub outer_iterations: usize,
-    pub outer_gradient_norm: f64,
+    /// `None` = no gradient measured at termination; `Some(g)` = measured.
+    /// `outer_converged` is the authoritative convergence signal.
+    pub outer_gradient_norm: Option<f64>,
     pub outer_converged: bool,
     pub covariance_conditional: Option<Array2<f64>>,
     pub geometry: Option<FitGeometry>,
