@@ -1331,7 +1331,7 @@ impl TransformationNormalFamily {
     pub(crate) fn effective_weights(&self) -> &Array1<f64> {
         match self.outer_subsample_weights.as_ref() {
             Some(w) => w.as_ref(),
-            None => self.effective_weights(),
+            None => self.weights.as_ref(),
         }
     }
 
