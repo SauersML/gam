@@ -12515,24 +12515,103 @@ fn try_build_spatial_log_kappa_hyper_dirs(
     Ok(Some(spatial_log_kappa_hyper_dirs_frominfo_list(info_list)?))
 }
 
-/// TODO(latent-platform): build per-row `LatentCoord` design-moving
-/// hyper-directions via the same `HyperDesignDerivative` /
-/// `DirectionalHyperParam::not_penalty_like` path used by
-/// `spatial_log_kappa_hyper_dirs_frominfo_list`.
-///
-/// The missing representation is not the chain rule itself (that lives in
-/// `LatentCoordValues` and the input-location helpers); it is a streaming
-/// `HyperDesignDerivative` storage variant that exposes each `t[n, a]`
-/// direction without allocating either a dense `(N, K, d)` jet or one dense
-/// `(N, K)` matrix per latent coordinate.
 pub(crate) fn try_build_latent_coord_hyper_dirs(
+    latent: std::sync::Arc<crate::terms::latent_coord::LatentCoordValues>,
+    resolvedspec: &TermCollectionSpec,
+    design: &TermCollectionDesign,
+    latent_terms: &[usize],
 ) -> Result<Option<Vec<DirectionalHyperParam>>, EstimationError> {
-    Err(EstimationError::InvalidInput(
-        "LatentCoord standard-fit hyper_dirs TODO: add streaming per-row \
-         HyperDesignDerivative storage, then inject those non-penalty-like \
-         directions into evaluate_unified_with_psi_ext"
-            .to_string(),
-    ))
+    if latent_terms.is_empty() || latent.is_empty() {
+        return Ok(None);
+    }
+    if latent_terms.len() != 1 {
+        return Err(EstimationError::InvalidInput(
+            "LatentCoord standard-fit hyper_dirs currently require exactly one radial latent smooth term".to_string(),
+        ));
+    }
+    let term_idx = latent_terms[0];
+    let smooth_term = design.smooth.terms.get(term_idx).ok_or_else(|| {
+        EstimationError::InvalidInput(format!(
+            "LatentCoord term index {term_idx} out of bounds for realized smooth design"
+        ))
+    })?;
+    let termspec = resolvedspec.smooth_terms.get(term_idx).ok_or_else(|| {
+        EstimationError::InvalidInput(format!(
+            "LatentCoord term index {term_idx} out of bounds for resolved smooth spec"
+        ))
+    })?;
+    let p_total = design.design.ncols();
+    let smooth_start = p_total.saturating_sub(design.smooth.total_smooth_cols());
+    let global_range =
+        (smooth_start + smooth_term.coeff_range.start)..(smooth_start + smooth_term.coeff_range.end);
+
+    let operator = match (&termspec.basis, &smooth_term.metadata) {
+        (
+            SmoothBasisSpec::Matern { .. },
+            BasisMetadata::Matern {
+                centers,
+                length_scale,
+                nu,
+                include_intercept,
+                identifiability_transform,
+                ..
+            },
+        ) => crate::terms::basis::LatentCoordDesignDerivative::new_matern(
+            latent.clone(),
+            std::sync::Arc::new(centers.clone()),
+            *length_scale,
+            *nu,
+            *include_intercept,
+            identifiability_transform.clone(),
+        )
+        .map_err(EstimationError::from)?,
+        (
+            SmoothBasisSpec::Duchon { .. },
+            BasisMetadata::Duchon {
+                centers,
+                length_scale,
+                power,
+                nullspace_order,
+                identifiability_transform,
+                ..
+            },
+        ) => crate::terms::basis::LatentCoordDesignDerivative::new_duchon(
+            latent.clone(),
+            std::sync::Arc::new(centers.clone()),
+            *length_scale,
+            *power,
+            *nullspace_order,
+            identifiability_transform.clone(),
+        )
+        .map_err(EstimationError::from)?,
+        _ => return Ok(None),
+    };
+    if operator.p_out() != global_range.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "LatentCoord derivative width mismatch for term '{}': operator p={}, coeff range={}",
+            smooth_term.name,
+            operator.p_out(),
+            global_range.len()
+        )));
+    }
+    let operator = std::sync::Arc::new(operator);
+    let mut hyper_dirs = Vec::with_capacity(operator.n_axes());
+    for flat_axis in 0..operator.n_axes() {
+        let dir = DirectionalHyperParam::new_compact(
+            crate::estimate::reml::HyperDesignDerivative::from_latent_coord(
+                operator.clone(),
+                flat_axis,
+                global_range.clone(),
+                p_total,
+            ),
+            Vec::new(),
+            None,
+            None,
+        )?
+        .not_penalty_like();
+        hyper_dirs.push(dir);
+    }
+    Ok(Some(hyper_dirs))
 }
 
 fn spatial_log_kappa_hyper_dirs_frominfo_list(
