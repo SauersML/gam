@@ -328,6 +328,145 @@ pub(crate) fn open_outer_session(key: &str) -> Option<std::sync::Arc<crate::cach
     Some(std::sync::Arc::new(crate::cache::Session::open(store, fp)))
 }
 
+// ---------------------------------------------------------------------------
+// Piece 3 — IFT warm-starting of the latent field
+//
+// See `proposals/latent_coord.md` §2 / §4 and
+// `proposals/composition_engine.md` §6 (the ψ-machinery mapping). The
+// existing β-IFT predictor lives in
+// `crate::solver::reml::runtime::predict_warm_start_beta_ift_with_outcome`
+// and operates on the dense `H_pen` Cholesky factor cached after the
+// inner solve. The latent IFT predictor below is the row-local analogue
+// for the arrow-structured (t, β) system: per-row `H_tt^(i)` factors
+// already produced by
+// [`crate::solver::arrow_schur::solve_arrow_newton_step`] are reused to
+// apply the per-row sensitivity in O(d²) ops per row, independent of K.
+//
+// Math recap (proposal §2.3 + composition_engine §7):
+//
+//   At convergence, g_t^(i)(t̂_i, β̂, ρ) = 0  for every row i.
+//   Differentiating implicitly w.r.t. β:
+//       H_tt^(i) · ∂t̂_i/∂β = -H_tβ^(i)        (the cross-block).
+//   Hence for a candidate β-shift Δβ:
+//       Δt_i ≈ -(H_tt^(i))⁻¹ · (H_tβ^(i) · Δβ).
+//
+//   For a ρ-shift (or any external hyper-axis η) the driver supplies
+//   the per-row partial g_t^(i) shift δg_t^(i); the predictor returns
+//       Δt_i ≈ -(H_tt^(i))⁻¹ · δg_t^(i).
+//
+// Both forms reuse the per-row Cholesky factor cached at the last
+// accepted Newton step — no per-row re-factor, no `Schur⁻¹` formation,
+// O(N · d²) total apply cost.
+// ---------------------------------------------------------------------------
+
+use crate::solver::arrow_schur::ArrowFactorCache;
+use ndarray::{Array1, ArrayView1};
+
+/// Outcome of an [`ift_warm_start_latent`] call.
+#[derive(Debug, Clone)]
+pub enum LatentIftOutcome {
+    /// Predictor applied a finite shift; `delta_t` is the flat row-major
+    /// increment of length `N · d` (sum of the β-coupled and ρ-coupled
+    /// contributions).
+    Applied { delta_t: Array1<f64> },
+    /// Predictor declined (no cache, dim mismatch, or non-finite input).
+    /// Caller should fall back to a from-scratch latent inner solve.
+    Noop { reason: &'static str },
+}
+
+/// Predict the analytic shift in the latent field `t̂` induced by a
+/// shape-coefficient change `Δβ` and/or an external `δg_t` shift
+/// (typically coming from a ρ perturbation that the driver has already
+/// resolved into per-row gradient shifts via the analytic-penalty
+/// registry).
+///
+/// This is the row-local analogue of
+/// `RemlState::predict_warm_start_beta_ift_with_outcome`: it consumes
+/// the per-row factor cache produced by
+/// [`crate::solver::arrow_schur::solve_arrow_newton_step`] at the last
+/// accepted Newton step and applies the IFT first-order predictor
+///
+/// ```text
+///   Δt_i  =  -(H_tt^(i))⁻¹ · (H_tβ^(i) Δβ + δg_t^(i))
+/// ```
+///
+/// per row. Both sources can be omitted (`None`) — at least one must be
+/// supplied for the predictor to do useful work.
+///
+/// The result is meant to be applied to the existing
+/// [`crate::terms::latent_coord::LatentCoordValues`] block via
+/// `set_flat(latent.as_flat() + Δt)` before the next inner Newton
+/// launch — so the inner solver starts at a configuration already
+/// consistent with the new `(β, ρ)`, requiring far fewer iterations
+/// than a cold restart.
+///
+/// # Integration with [`crate::solver::latent_inner::LatentInnerSolver`]
+///
+/// The intended pipeline is:
+///
+///   1. inner solve at `(β₀, ρ₀)` produces
+///      [`crate::solver::latent_inner::LatentInnerOutcome::factor_cache`];
+///   2. REML outer loop proposes `(β₁, ρ₁)`;
+///   3. caller invokes `ift_warm_start_latent(cache, Some(β₁ − β₀), δg_t)`
+///      to obtain `Δt`;
+///   4. caller updates the latent field by `Δt` and launches the next
+///      inner Newton — typically converging in 1–2 iterations.
+pub fn ift_warm_start_latent(
+    cache: &ArrowFactorCache,
+    delta_beta: Option<ArrayView1<'_, f64>>,
+    delta_gt: Option<ArrayView1<'_, f64>>,
+) -> LatentIftOutcome {
+    let n = cache.htt_factors.len();
+    let d = cache.d;
+    let k = cache.k;
+
+    if delta_beta.is_none() && delta_gt.is_none() {
+        return LatentIftOutcome::Noop {
+            reason: "no-perturbation: both delta_beta and delta_gt are None",
+        };
+    }
+    if let Some(db) = delta_beta.as_ref() {
+        if db.len() != k {
+            return LatentIftOutcome::Noop {
+                reason: "delta_beta length mismatch with cached K",
+            };
+        }
+        if db.iter().any(|v| !v.is_finite()) {
+            return LatentIftOutcome::Noop {
+                reason: "delta_beta contains non-finite entries",
+            };
+        }
+    }
+    if let Some(dg) = delta_gt.as_ref() {
+        if dg.len() != n * d {
+            return LatentIftOutcome::Noop {
+                reason: "delta_gt length mismatch with cached N·d",
+            };
+        }
+        if dg.iter().any(|v| !v.is_finite()) {
+            return LatentIftOutcome::Noop {
+                reason: "delta_gt contains non-finite entries",
+            };
+        }
+    }
+
+    // Sum the two contributions on the RHS, then per-row solve.
+    let mut delta_t = Array1::<f64>::zeros(n * d);
+    if let Some(db) = delta_beta {
+        let part = cache.predict_delta_t_from_delta_beta(db);
+        for i in 0..delta_t.len() {
+            delta_t[i] += part[i];
+        }
+    }
+    if let Some(dg) = delta_gt {
+        let part = cache.predict_delta_t_from_delta_gt(dg);
+        for i in 0..delta_t.len() {
+            delta_t[i] += part[i];
+        }
+    }
+    LatentIftOutcome::Applied { delta_t }
+}
+
 fn unix_secs_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
