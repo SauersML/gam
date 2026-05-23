@@ -4636,11 +4636,43 @@ fn analytic_penalty_value_for_targets(
     for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(registry.rho_layout()) {
         let rho_local = rho.slice(s![rho_slice]);
         let target = match tier {
-            PenaltyTier::Psi => target_t,
-            PenaltyTier::Beta => target_beta.ok_or_else(|| {
+            PenaltyTier::Psi => target_t.view(),
+            PenaltyTier::Beta => target_beta.as_ref().ok_or_else(|| {
                 format!("analytic penalty {name:?} targets beta, but this fit has no beta target")
-            })?,
+            })?.view(),
             PenaltyTier::Rho => continue,
+        };
+        value += penalty.value(target, rho_local);
+    }
+    Ok(value)
+}
+
+fn analytic_penalty_value_for_sae_manifold(
+    registry: &AnalyticPenaltyRegistry,
+    logits: ArrayView2<'_, f64>,
+    coords: &[LatentCoordValues],
+) -> Result<f64, String> {
+    let logits_flat = Array1::from_iter(logits.iter().copied());
+    let coord_flat = if coords.len() == 1 {
+        Some(coords[0].as_flat().to_owned())
+    } else {
+        None
+    };
+    let rho = Array1::<f64>::zeros(registry.total_rho_count());
+    let mut value = 0.0_f64;
+    for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(registry.rho_layout()) {
+        if matches!(tier, PenaltyTier::Rho) {
+            continue;
+        }
+        let rho_local = rho.slice(s![rho_slice]);
+        let target = match penalty {
+            AnalyticPenaltyKind::IBPAssignment(_)
+            | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_) => logits_flat.view(),
+            _ => coord_flat.as_ref().ok_or_else(|| {
+                format!(
+                    "analytic penalty {name:?} targets SAE coordinates; multi-atom coordinate penalties require an explicit atom target"
+                )
+            })?.view(),
         };
         value += penalty.value(target, rho_local);
     }
@@ -5025,7 +5057,7 @@ fn sae_manifold_fit_ibp<'py>(
         )));
     }
     let latent_payload = serde_json::json!({"t": {"name": "t", "n": n_obs, "d": atom_dim.iter().copied().max().unwrap_or(1)}});
-    let _registry = build_analytic_penalty_registry_from_json(
+    let registry = build_analytic_penalty_registry_from_json(
         Some(&latent_payload),
         analytic_penalties.as_ref(),
     )
@@ -5164,6 +5196,9 @@ fn sae_manifold_fit_ibp<'py>(
             ridge_beta,
         )
         .map_err(py_value_error)?;
+    let analytic_score =
+        analytic_penalty_value_for_sae_manifold(&registry, term.assignment.logits.view(), &term.assignment.coords)
+            .map_err(py_value_error)?;
 
     let assignments = term.assignment.assignments();
     let fitted = term.fitted();
@@ -5191,7 +5226,7 @@ fn sae_manifold_fit_ibp<'py>(
     out.set_item("assignments_z", assignments.into_pyarray(py))?;
     out.set_item("atom_active_mask", active_mask)?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
-    out.set_item("reml_score", loss.evidence_proxy())?;
+    out.set_item("reml_score", loss.evidence_proxy() - analytic_score)?;
     out.set_item("log_alpha", alpha.ln() + if learnable_alpha { rho.log_lambda_sparse } else { 0.0 })?;
     out.set_item("log_lambda_smooth", rho.log_lambda_smooth)?;
     out.set_item("assignment_prior", "ibp_map")?;
@@ -5741,30 +5776,30 @@ fn glm_reml_fit_latent<'py>(
             m,
         )
         .map_err(py_value_error)?;
-            let (prior_score, aux_strength_state) = latent_prior_score_and_aux_state_for_t(
-                t_mat.view(),
-                aux_u.as_ref().map(|a| a.as_array()),
+        let (prior_score, aux_strength_state) = latent_prior_score_and_aux_state_for_t(
+            t_mat.view(),
+            aux_u.as_ref().map(|a| a.as_array()),
             aux_family,
             aux_strength,
-                dim_selection_log_precision.as_ref().map(|a| a.as_array()),
-            )
-            .map_err(py_value_error)?;
-            let analytic_score =
-                analytic_penalty_value_for_targets(&registry, t.as_array(), None)
-                    .map_err(py_value_error)?;
-            return dense_fisher_glm_fit_to_pydict(
-                py,
-                design.view(),
+            dim_selection_log_precision.as_ref().map(|a| a.as_array()),
+        )
+        .map_err(py_value_error)?;
+        let analytic_score =
+            analytic_penalty_value_for_targets(&registry, t.as_array(), None)
+                .map_err(py_value_error)?;
+        return dense_fisher_glm_fit_to_pydict(
+            py,
+            design.view(),
             y.as_array(),
             penalty.as_array(),
             weights.as_ref().map(|w| w.as_array()),
             fisher_w.as_ref().map(|w| w.as_array()),
-                init_lambda,
-                &family_name,
-                prior_score + analytic_score,
-                aux_strength_state,
-            );
-        }
+            init_lambda,
+            &family_name,
+            prior_score + analytic_score,
+            aux_strength_state,
+        );
+    }
     let family =
         latent_glm_family_from_str(&family, tweedie_p, negbin_theta, beta_phi)
             .map_err(py_value_error)?;
@@ -10509,7 +10544,7 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
         py_config.penalty_block_gamma_priors,
     )?;
     let analytic_penalties = py_config.penalties;
-    let _registry = build_analytic_penalty_registry_from_json(
+    build_analytic_penalty_registry_from_json(
         py_config.latents.as_ref(),
         analytic_penalties.as_ref(),
     )?;
