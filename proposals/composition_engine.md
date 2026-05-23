@@ -142,6 +142,32 @@ No new code. Recipe-level recommendation: `manifold_fit(..., latent_dim=d_max, d
 
 **Gating.** Default off; opt in via `WorkingModelPirlsOptions::geodesic_acceleration: bool` (`src/solver/pirls.rs:1247`). Cost: ~1.3× per accepted step, big speedup on the problems that need it, no effect on the problems that don't.
 
+### 4(f). Riemannian latent updates for topology-matched `LatentCoord`
+
+**Problem.** Basis topology alone is not enough for a latent coordinate. A cyclic basis can make `Φ(t)` continuous across the seam, but if the per-row coordinate update is Euclidean then an angular latent still has a spurious discontinuity at `2π → 0`. mGPLVM avoids this by putting the latent itself on the manifold (circle, sphere, torus, product manifolds) and optimizing with Riemannian updates.
+
+**Implementation.** `LatentCoordValues` carries a `LatentManifold`:
+
+```
+Euclidean | Circle | Sphere { dim } | Interval { lo, hi } | Product(...)
+```
+
+Each variant supplies three closed-form operations from Absil/Mahony/Sepulchre / Manopt / Pymanopt: a retraction `R_t(ξ)`, tangent projection `P_t(v)`, and Euclidean-to-Riemannian Hessian action `H_R(t)[ξ]`. Circle is a wrapped scalar angle; sphere uses the normalization retraction `(t + ξ) / ||t + ξ||`, tangent projection `v - (v·t)t`, and the embedded-sphere Hessian conversion `P_t(H_E ξ) - <∇f_E,t> ξ` (equivalently, differentiating the projected gradient with the normal curvature correction).
+
+**Composition with arrow-Schur.** The BA-grade arrow system stays arrow-shaped. Before point elimination, each row block is converted in place:
+
+1. `g_t^(i)` is projected to `T_{t_i}M`.
+2. `H_tt^(i)` is converted to the Riemannian Hessian action.
+3. Each `H_tβ^(i)` column is tangent-projected.
+4. The same Schur elimination / Sqrt-BA / Steihaug-CG machinery solves for a tangent `ξ_i`.
+5. The accepted latent update is `t_i ← R_{t_i}(ξ_i)`, not `t_i += ξ_i`.
+
+For the shipped manifolds the Riemannian metric is the ambient Euclidean pullback, so Steihaug-CG's dot products already compute the right trust-region norm once row vectors are tangent-projected. Embedded constrained factors pin the normal block only to keep the existing ambient Cholesky path nonsingular; RHS and cross terms remain tangent, so the solved row step is a tangent vector.
+
+**Auto-dispatch.** Python `LatentCoord(..., manifold="auto")` infers the natural manifold from the consuming basis: periodic/cyclic 1-D bases become `Circle`, spherical bases become `Sphere { dim }`, tensor bases with periodic margins become a product (torus/cylinder), and ordinary Duchon/Matérn/TPS bases stay `Euclidean`. Explicit `manifold="circle"`, `"sphere"`, `"torus"`, `"cylinder"`, or interval objects override inference.
+
+**Gauge framing.** This is not a numerical convenience. Restricting the update to `S¹`, `S²`, or a product manifold is itself a gauge restriction: the latent is identifiable up to the manifold's global isometries (for example a single rotation per cycle) rather than an arbitrary diffeomorphism of Euclidean coordinates.
+
 ## 5. Worked examples
 
 Each example is a 3–5 line specification that replaces a foreign library. APIs follow the existing `gamfit.fit` conventions and the new `LatentCoord` configuration object.
