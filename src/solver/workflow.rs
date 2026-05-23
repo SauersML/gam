@@ -1722,6 +1722,7 @@ fn fit_survival_transformation_model(
                     linear_constraints: None,
                     initial_lm_lambda: None,
                     geodesic_acceleration: false,
+                    arrow_schur: None,
                 };
                 let summary = crate::pirls::runworking_model_pirls(
                     &mut model,
@@ -1765,6 +1766,7 @@ fn fit_survival_transformation_model(
         linear_constraints: None,
         initial_lm_lambda: None,
         geodesic_acceleration: false,
+        arrow_schur: None,
     };
     let rho_for_cache = survival_transformation_log_lambdas(&penalty_blocks);
     let persistent_warm_start_key = persistent_survival_transformation_key(

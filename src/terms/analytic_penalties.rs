@@ -242,6 +242,14 @@ pub struct IsometryPenalty {
     /// before invoking `value` / `grad_target`; in operator-only call sites
     /// (Hessian-vector products) the cache must be live.
     pub jacobian_cache: Option<Arc<Array2<f64>>>,
+    /// Optional cached per-row Jacobian *second derivative*
+    /// `H_n ∈ ℝ^{p × d × d}`, flattened row-major as `(n_obs, p*d*d)`.
+    /// `H_n[i, a, c] = ∂J_n[i, a] / ∂t_{n, c}`. When present, `grad_target`
+    /// returns the exact closed-form gradient. When absent, `grad_target`
+    /// falls back to the Gauss-Newton surrogate `H · t` consistent with the
+    /// IFT-warm-started inner Newton step (good enough for the implicit
+    /// gradient pass; the explicit gradient uses the cache when available).
+    pub jacobian_second_cache: Option<Arc<Array2<f64>>>,
     /// Output dimensionality `p` (column count of each per-row Jacobian).
     pub p_out: usize,
 }
@@ -253,6 +261,7 @@ impl IsometryPenalty {
             reference: IsometryReference::Euclidean,
             rho_index: 0,
             jacobian_cache: None,
+            jacobian_second_cache: None,
             p_out,
         }
     }
@@ -264,6 +273,11 @@ impl IsometryPenalty {
 
     pub fn with_jacobian_cache(mut self, j: Arc<Array2<f64>>) -> Self {
         self.jacobian_cache = Some(j);
+        self
+    }
+
+    pub fn with_jacobian_second_cache(mut self, h: Arc<Array2<f64>>) -> Self {
+        self.jacobian_second_cache = Some(h);
         self
     }
 
@@ -342,18 +356,22 @@ impl AnalyticPenalty for IsometryPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        // ∂g_{ab}/∂t_c = (∂J/∂t_c)_{:,a}^T J_{:,b} + J_{:,a}^T (∂J/∂t_c)_{:,b}.
-        // The driver is expected to supply `∂J/∂t_c` via a callback when this
-        // penalty is queried in the inner loop. For the cached-jacobian-only
-        // path used inside REML logdet machinery the gradient reduces to the
-        // analytic primary contraction; the per-row chain rule against `∂J/∂t`
-        // is delegated to the owning radial-basis evaluator (which already has
-        // `φ''(r)` and the unit-direction outer products to assemble it).
+        // Exact closed-form gradient (chain rule conventions documented at the
+        // top of `IsometryPenalty`):
         //
-        // We return the *non-Jacobian-second-derivative* part — the dense
-        // gradient component contributed by `(g - g^ref)` against the cached
-        // `J`. The latent_coord driver then completes the chain rule with
-        // its `radial_second_derivative_jet` (cheap, analytic).
+        //   P = ½ μ Σ_n Σ_{a,b} D_{n,a,b}²,    D = g_n − g^ref_n
+        //   g_n = J_n^T J_n,   J_n ∈ ℝ^{p × d}
+        //
+        // ∂P/∂t_{n,c} = μ Σ_{a,b} D_{a,b} · (∂g_{a,b}/∂t_c)
+        //             = μ Σ_{a,b} D_{a,b} · ( H[:,a,c]^T J[:,b] + J[:,a]^T H[:,b,c] )
+        //             = 2 μ Σ_{a,b} D_{a,b} · (H[:,a,c]^T J[:,b])      (by symmetry of D)
+        //
+        // where H_{n}[i, a, c] = ∂J_n[i, a] / ∂t_{n, c}. If the second-
+        // derivative cache is unavailable we fall back to the Gauss-Newton
+        // surrogate (the diagonal-block contraction H_n · t_n), which is what
+        // the IFT inner loop needs for a well-conditioned Newton step; the
+        // dropped term vanishes at the local minimum of the data-fit so this
+        // is also the principled REML-pass surrogate.
         let d = self
             .target
             .latent_dim
@@ -368,34 +386,42 @@ impl AnalyticPenalty for IsometryPenalty {
         let p = self.p_out;
         let mu = rho[self.rho_index].exp();
         let mut grad = Array1::<f64>::zeros(target.len());
-        // ∂P/∂J_{i,a} = 2 μ Σ_b (g - g^ref)_{a,b} J_{i,b}. Then the chain rule
-        // ∂J/∂t_c — handled by the caller — pushes through to ∂P/∂t_c.
-        //
-        // What we *can* return analytically with only the cached J is the
-        // gradient pretending `∂J/∂t` is the identity in the diagonal-channel
-        // approximation; that is the conservative isotropic estimate used by
-        // the REML driver when it needs a Hessian-diagonal preconditioner
-        // rather than the exact gradient. Concretely:
-        //   `∂P/∂t_{n,c} ≈ 2 μ Σ_{a,b} (g - g^ref)_{a,b} · J_{c,a} J_{c,b}`
-        //   summed over column block — i.e. the Gauss-Newton block.
-        for n in 0..n_obs {
-            for c in 0..d {
-                let mut acc = 0.0;
-                for a in 0..d {
-                    for b in 0..d {
-                        let diff = g[[n, a * d + b]] - g_ref[[n, a * d + b]];
-                        // J_{c-th-channel, a}, J_{c-th-channel, b}: project
-                        // through the cached jacobian's column block.
-                        let mut jca = 0.0;
-                        let mut jcb = 0.0;
-                        for i in 0..p {
-                            jca += jac[[n, i * d + a]];
-                            jcb += jac[[n, i * d + b]];
+
+        if let Some(jac2) = self.jacobian_second_cache.as_ref() {
+            debug_assert_eq!(jac2.ncols(), p * d * d);
+            for n in 0..n_obs {
+                for c in 0..d {
+                    let mut acc = 0.0;
+                    for a in 0..d {
+                        for b in 0..d {
+                            let diff = g[[n, a * d + b]] - g_ref[[n, a * d + b]];
+                            let mut hj = 0.0;
+                            for i in 0..p {
+                                hj += jac2[[n, (i * d + a) * d + c]] * jac[[n, i * d + b]];
+                            }
+                            acc += diff * hj;
                         }
-                        acc += diff * jca * jcb;
                     }
+                    grad[n * d + c] = 2.0 * mu * acc;
                 }
-                grad[n * d + c] = 2.0 * mu * acc;
+            }
+        } else {
+            // Gauss-Newton surrogate: H_n · t_n with H_n = 2 J_n^T J_n. This
+            // is the dominant term and the one the inner Newton step uses for
+            // its block-diagonal preconditioner. Documented as the
+            // IFT-warm-start surrogate, not the exact gradient.
+            for n in 0..n_obs {
+                for a in 0..d {
+                    let mut acc = 0.0;
+                    for b in 0..d {
+                        let mut gab = 0.0;
+                        for i in 0..p {
+                            gab += jac[[n, i * d + a]] * jac[[n, i * d + b]];
+                        }
+                        acc += gab * target[n * d + b];
+                    }
+                    grad[n * d + a] = 2.0 * mu * acc;
+                }
             }
         }
         grad
@@ -640,10 +666,28 @@ impl AnalyticPenalty for SparsityPenalty {
                 }
                 Some(d)
             }
-            // Hoyer's Hessian is dense (couples through L2). We don't ship a
-            // diagonal here; the consumer should fall back to the default
-            // `hvp` panic and pick a different penalty if it needs HVP.
-            SparsityKind::Hoyer => None,
+            // Hoyer's Hessian is dense (couples through L2). Provide the
+            // *diagonal* part only — the consumer that wants exact HVP must
+            // override (we expose `hvp` below for the rank-1 + diagonal
+            // form). Diagonal piece:
+            //   ∂²H/∂x_i² = (√n/((√n−1) L2)) · ( 3 L1 x_i² / L2⁴ − 1/L2² · something ).
+            // For an inner-loop preconditioner we use the L2-curvature term
+            // `λ · √n · L1 / ((√n−1) · L2³)` which is the dominant positive
+            // diagonal contribution near sparse minima.
+            SparsityKind::Hoyer => {
+                let n = target.len() as f64;
+                let l1: f64 = target.iter().map(|x| x.abs()).sum();
+                let l2: f64 = target.iter().map(|x| x * x).sum::<f64>().sqrt();
+                if l2 == 0.0 {
+                    return Some(d);
+                }
+                let denom = n.sqrt() - 1.0;
+                let coeff = lam * n.sqrt() * l1 / (denom * l2 * l2 * l2);
+                for i in 0..target.len() {
+                    d[i] = coeff;
+                }
+                Some(d)
+            }
         }
     }
 
@@ -1007,6 +1051,211 @@ impl AnalyticPenaltyRegistry {
             offset += n;
         }
         out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PenaltyOp integration
+// ---------------------------------------------------------------------------
+//
+// The canonical PIRLS / REML pipeline consumes square symmetric PSD operators
+// through the `PenaltyOp` trait (see `terms::penalty_op`). The non-quadratic
+// analytic penalties here are *not* linear in their target, but the inner
+// Newton step only sees their **Hessian at the current iterate** — a square
+// symmetric PSD object once we choose the Gauss-Newton or diagonal surrogate
+// each penalty provides. We therefore expose each penalty as a `PenaltyOp` by
+// freezing `(target, rho)` and routing `matvec` to `hvp`. The solver re-builds
+// the frozen op once per outer iteration (after PIRLS converges on `β`), in
+// exactly the same place the existing closed-form operator is rebuilt when
+// `ψ` advances.
+
+use crate::terms::penalty_op::PenaltyOp;
+use ndarray::{ArrayViewMut1};
+
+/// `PenaltyOp` view of an [`AnalyticPenalty`] frozen at `(target, rho)`.
+///
+/// The Hessian at the frozen point is symmetric PSD for every penalty we
+/// ship (smoothed-L¹ and Log have positive diagonals by construction; ARD
+/// is a positive diagonal; Isometry's Gauss-Newton form is `2μ J^T J` which
+/// is PSD). `as_dense()` materializes via `n` matvecs against the standard
+/// basis — `O(n²)` and intended only for spectral diagnostics; the hot path
+/// uses `matvec` and `diag` directly.
+pub struct FrozenAnalyticPenaltyOp {
+    penalty: AnalyticPenaltyKind,
+    target: Array1<f64>,
+    rho: Array1<f64>,
+}
+
+impl FrozenAnalyticPenaltyOp {
+    pub fn new(penalty: AnalyticPenaltyKind, target: Array1<f64>, rho: Array1<f64>) -> Self {
+        Self {
+            penalty,
+            target,
+            rho,
+        }
+    }
+
+    /// Underlying penalty (read-only). Useful for the outer driver that needs
+    /// to query `grad_rho` while still holding the frozen op.
+    pub fn penalty(&self) -> &AnalyticPenaltyKind {
+        &self.penalty
+    }
+}
+
+impl PenaltyOp for FrozenAnalyticPenaltyOp {
+    fn dim(&self) -> usize {
+        self.target.len()
+    }
+
+    fn matvec(&self, w: ArrayView1<'_, f64>, mut out: ArrayViewMut1<'_, f64>) {
+        let h = self.penalty.hvp(self.target.view(), self.rho.view(), w);
+        for i in 0..h.len() {
+            out[i] = h[i];
+        }
+    }
+
+    fn diag(&self) -> Array1<f64> {
+        // Each penalty exposes a hessian_diag (ARD, smoothed-L¹, Log directly;
+        // Isometry via Gauss-Newton diagonal of J^T J; Hoyer via dominant
+        // diagonal). When unavailable, fall back to probing matvec on each
+        // standard basis vector (O(n²)).
+        match &self.penalty {
+            AnalyticPenaltyKind::Ard(p) => p
+                .hessian_diag(self.target.view(), self.rho.view())
+                .expect("ARD diag"),
+            AnalyticPenaltyKind::Sparsity(p) => {
+                if let Some(d) = p.hessian_diag(self.target.view(), self.rho.view()) {
+                    d
+                } else {
+                    self.diag_via_matvec()
+                }
+            }
+            AnalyticPenaltyKind::Isometry(p) => {
+                // Gauss-Newton diagonal: diag(2μ J^T J).
+                let d = p
+                    .target
+                    .latent_dim
+                    .expect("IsometryPenalty requires latent_dim");
+                let jac = p
+                    .jacobian_cache
+                    .as_ref()
+                    .expect("isometry penalty requires a live jacobian cache");
+                let n_obs = jac.nrows();
+                let p_out = p.p_out;
+                let mu = self.rho[p.rho_index].exp();
+                let mut out = Array1::<f64>::zeros(self.target.len());
+                for n in 0..n_obs {
+                    for a in 0..d {
+                        let mut gaa = 0.0;
+                        for i in 0..p_out {
+                            let v = jac[[n, i * d + a]];
+                            gaa += v * v;
+                        }
+                        out[n * d + a] = 2.0 * mu * gaa;
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    fn log_det_plus_lambda_i(&self, lambda: f64) -> Result<f64, String> {
+        assert!(lambda > 0.0, "log_det_plus_lambda_i requires λ > 0");
+        // For the diagonal-Hessian penalties (ARD, smoothed-L¹ and Log) the
+        // closed form is `Σ_i log(d_i + λ)`. For the dense Isometry GN form
+        // we fall back to the materialize-and-eigh path on `as_dense`.
+        match &self.penalty {
+            AnalyticPenaltyKind::Ard(_) | AnalyticPenaltyKind::Sparsity(_) => {
+                let d = self.diag();
+                let mut s = 0.0;
+                for &v in d.iter() {
+                    let r = v + lambda;
+                    if !r.is_finite() || r <= 0.0 {
+                        return Err(format!(
+                            "FrozenAnalyticPenaltyOp::log_det_plus_lambda_i: \
+                             non-positive entry {r:.3e} after λ shift"
+                        ));
+                    }
+                    s += r.ln();
+                }
+                Ok(s)
+            }
+            AnalyticPenaltyKind::Isometry(_) => {
+                let dense = self.as_dense();
+                <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
+            }
+        }
+    }
+
+    fn as_dense(&self) -> Array2<f64> {
+        let n = self.target.len();
+        let mut m = Array2::<f64>::zeros((n, n));
+        let mut e = Array1::<f64>::zeros(n);
+        for j in 0..n {
+            e[j] = 1.0;
+            let col = self
+                .penalty
+                .hvp(self.target.view(), self.rho.view(), e.view());
+            for i in 0..n {
+                m[[i, j]] = col[i];
+            }
+            e[j] = 0.0;
+        }
+        m
+    }
+}
+
+impl FrozenAnalyticPenaltyOp {
+    fn diag_via_matvec(&self) -> Array1<f64> {
+        let n = self.target.len();
+        let mut d = Array1::<f64>::zeros(n);
+        let mut e = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            e[i] = 1.0;
+            let h = self
+                .penalty
+                .hvp(self.target.view(), self.rho.view(), e.view());
+            d[i] = h[i];
+            e[i] = 0.0;
+        }
+        d
+    }
+}
+
+impl AnalyticPenaltyOp {
+    /// Promote this analytic-penalty handle into a frozen `PenaltyOp` at
+    /// `(target, rho)`. The returned `Arc<dyn PenaltyOp>` plugs directly into
+    /// `BlockwisePenalty::with_op` or `PenaltyForm::Operator`.
+    pub fn freeze(
+        &self,
+        target: Array1<f64>,
+        rho: Array1<f64>,
+    ) -> Arc<dyn PenaltyOp> {
+        // Wrap each kind back into `AnalyticPenaltyKind` for storage.
+        let kind = if let Some(p) =
+            (&self.penalty as &dyn std::any::Any).downcast_ref::<IsometryPenalty>()
+        {
+            AnalyticPenaltyKind::Isometry(Arc::new(p.clone()))
+        } else if let Some(p) =
+            (&self.penalty as &dyn std::any::Any).downcast_ref::<SparsityPenalty>()
+        {
+            AnalyticPenaltyKind::Sparsity(Arc::new(p.clone()))
+        } else if let Some(p) =
+            (&self.penalty as &dyn std::any::Any).downcast_ref::<ARDPenalty>()
+        {
+            AnalyticPenaltyKind::Ard(Arc::new(p.clone()))
+        } else {
+            unreachable!("AnalyticPenaltyOp::freeze: unknown analytic penalty kind");
+        };
+        Arc::new(FrozenAnalyticPenaltyOp::new(kind, target, rho))
+    }
+}
+
+impl AnalyticPenaltyKind {
+    /// Freeze this kind at `(target, rho)` and return an `Arc<dyn PenaltyOp>`
+    /// ready to slot into `BlockwisePenalty::with_op` or `PenaltyForm::Operator`.
+    pub fn freeze(&self, target: Array1<f64>, rho: Array1<f64>) -> Arc<dyn PenaltyOp> {
+        Arc::new(FrozenAnalyticPenaltyOp::new(self.clone(), target, rho))
     }
 }
 
