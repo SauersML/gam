@@ -113,7 +113,9 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
                 for i in 0..y.len() {
                     let lam = (spec.mean[i] / *phi).max(1e-12);
                     let dist = rand_distr::Poisson::new(lam).map_err(|e| {
-                        EstimationError::InvalidInput(format!("invalid Tweedie-Poisson rate {lam}: {e}"))
+                        EstimationError::InvalidInput(format!(
+                            "invalid Tweedie-Poisson rate {lam}: {e}"
+                        ))
                     })?;
                     y[i] = *phi * rand_distr::Distribution::sample(&dist, rng);
                 }
