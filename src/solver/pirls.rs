@@ -8491,7 +8491,9 @@ fn sanitize_tweedie_p(p: f64) -> f64 {
 
 #[inline]
 fn tweedie_log_weight_mu_power(mu: f64, p: f64) -> f64 {
-    if tweedie_p_is_gamma(p) {
+    if tweedie_p_is_poisson(p) {
+        mu
+    } else if tweedie_p_is_gamma(p) {
         1.0
     } else {
         // Match the 1e-300 MIN_DEVIANCE floor used by the REML deviance path:
@@ -8592,11 +8594,26 @@ fn write_tweedie_log_working_state(
     const MIN_MU: f64 = 1e-10;
     const MIN_WEIGHT: f64 = 1e-12;
     let p = sanitize_tweedie_p(p);
+    // Keep IRLS on the same fuzzy p-boundary convention as deviance/log-likelihood dispatch.
+    // TWEEDIE_LIMIT_EPS = 1e-6: below this, f64 relative error in (1-p)(2-p) dominates the general formula.
     if tweedie_p_is_poisson(p) {
         write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives);
         return;
     }
     let phi = estimate_tweedie_phi_from_eta(y, eta, priorweights, p);
+    if tweedie_p_is_gamma(p) {
+        write_gamma_log_working_state(
+            y,
+            eta,
+            priorweights,
+            1.0 / phi,
+            mu,
+            weights,
+            z,
+            derivatives,
+        );
+        return;
+    }
     let exponent = 2.0 - p;
     if let Some(derivs) = derivatives {
         let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
@@ -9438,7 +9455,13 @@ fn computeworkingweight_derivatives_from_eta(
         GlmLikelihoodFamily::Tweedie { p } => {
             const MIN_WEIGHT: f64 = 1e-12;
             let p = sanitize_tweedie_p(p);
-            let exponent = 2.0 - p;
+            let exponent = if tweedie_p_is_poisson(p) {
+                1.0
+            } else if tweedie_p_is_gamma(p) {
+                0.0
+            } else {
+                2.0 - p
+            };
             let phi = fixed_glm_dispersion(likelihood);
             let c_s = c.as_slice_mut().expect("c must be contiguous");
             let d_s = d.as_slice_mut().expect("d must be contiguous");
