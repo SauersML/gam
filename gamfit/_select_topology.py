@@ -358,9 +358,25 @@ def _topology_term(candidate: _Candidate, option_keys: set[str]) -> _TopologyTer
             options.append(f"centers={topo.centers}")
         if topo.length_scale is not None:
             options.append(f"length_scale={float(topo.length_scale)!r}")
-        required_dim = _centers_dim(topo.centers)
+        required_dim = _candidate_required_dim(topo)
         return _TopologyTerm("s", tuple(options), required_dim)
     raise TypeError(f"unsupported topology candidate {type(topo).__name__}")
+
+
+def _candidate_required_dim(topo: Smooth) -> int | None:
+    dim = getattr(topo, "_gamfit_topology_dim", None)
+    if dim is not None:
+        return int(dim)
+    if isinstance(topo, PeriodicSplineCurve):
+        return 1
+    if isinstance(topo, Sphere):
+        return 2
+    if isinstance(topo, Duchon):
+        periodic = tuple(bool(v) for v in topo.periodic_per_axis or ())
+        if periodic in {(True, False), (True, True)}:
+            return 2
+        return _centers_dim(topo.centers)
+    return None
 
 
 def _centers_dim(centers: Any) -> int | None:
@@ -393,4 +409,135 @@ def _quote(value: str) -> str:
     return f"'{escaped}'"
 
 
-__all__ = ["select_topology"]
+def _normalize_score_kind(score: str) -> ScoreKind:
+    normalized = str(score).strip().lower()
+    if normalized not in {"reml", "laml", "bic"}:
+        raise ValueError("score must be one of: 'reml', 'laml', 'bic'")
+    return normalized  # type: ignore[return-value]
+
+
+def _score_for_kind(
+    fit_obj: Any,
+    score_kind: ScoreKind,
+    n_obs: int,
+    basis_size: int,
+) -> float:
+    if score_kind == "reml":
+        return _extract_reml_score(fit_obj)
+    if score_kind == "laml":
+        return _extract_laml_score(fit_obj)
+    return _bic_value(fit_obj, n_obs, basis_size)
+
+
+def _comparison_score(score: float, score_kind: ScoreKind) -> float:
+    return -float(score) if score_kind == "bic" else float(score)
+
+
+def _extract_laml_score(fit_obj: Any) -> float:
+    payload = _summary_payload(fit_obj)
+    if payload is not None:
+        value = payload.get("laml")
+        if value is not None:
+            return float(value)
+    if isinstance(fit_obj, Mapping):
+        value = fit_obj.get("laml")
+        if value is not None:
+            return float(value)
+    return _extract_reml_score(fit_obj)
+
+
+def _bic_value(fit_obj: Any, n_obs: int, basis_size: int) -> float:
+    if n_obs <= 1:
+        raise ValueError("BIC scoring requires at least two observations")
+    deviance = _extract_float_field(fit_obj, ("deviance",))
+    if deviance is None:
+        raise ValueError("BIC scoring requires fit.summary()['deviance']")
+    return float(deviance) + math.log(float(n_obs)) * float(basis_size)
+
+
+def _basis_size(fit_obj: Any) -> int:
+    payload = _summary_payload(fit_obj)
+    if payload is not None:
+        coefficients = payload.get("coefficients")
+        if isinstance(coefficients, Sequence) and not isinstance(
+            coefficients,
+            (str, bytes, bytearray),
+        ):
+            return len(coefficients)
+        for key in ("n_coefficients", "n_coeffs", "basis_size"):
+            value = payload.get(key)
+            if value is not None:
+                return int(value)
+    if isinstance(fit_obj, Mapping):
+        coefficients = fit_obj.get("coefficients")
+        shape = getattr(coefficients, "shape", None)
+        if shape is not None and len(shape) >= 1:
+            return int(shape[-1] if len(shape) > 1 else shape[0])
+        if isinstance(coefficients, Sequence) and not isinstance(
+            coefficients,
+            (str, bytes, bytearray),
+        ):
+            return len(coefficients)
+    raise ValueError("select_topology could not determine fitted basis size")
+
+
+def _extract_float_field(fit_obj: Any, keys: tuple[str, ...]) -> float | None:
+    payload = _summary_payload(fit_obj)
+    if payload is not None:
+        for key in keys:
+            value = payload.get(key)
+            if value is not None:
+                return float(value)
+    if isinstance(fit_obj, Mapping):
+        for key in keys:
+            value = fit_obj.get(key)
+            if value is not None:
+                return float(value)
+    for key in keys:
+        value = getattr(fit_obj, key, None)
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _summary_payload(fit_obj: Any) -> Mapping[str, Any] | None:
+    summary = getattr(fit_obj, "summary", None)
+    if callable(summary):
+        summary_obj = summary()
+        payload = getattr(summary_obj, "payload", summary_obj)
+        if isinstance(payload, Mapping):
+            return payload
+    return None
+
+
+def _score_disagreement_warnings(
+    fits: Mapping[str, Any],
+    n_obs: int,
+    basis_sizes: Mapping[str, int],
+) -> list[str]:
+    orders: dict[str, tuple[str, ...]] = {}
+    for kind in ("reml", "laml", "bic"):
+        scores = {
+            name: _score_for_kind(fit_obj, kind, n_obs, basis_sizes[name])
+            for name, fit_obj in fits.items()
+        }
+        comparison = compare_models(
+            [{"reml_score": _comparison_score(scores[name], kind)}
+             for name in fits],
+            names=list(fits),
+        )
+        orders[kind] = tuple(name for name, *_ in comparison["ranking"])
+    if len(set(orders.values())) == 1:
+        return []
+    detail = "; ".join(
+        f"{kind}: {', '.join(order)}" for kind, order in orders.items()
+    )
+    return [
+        "Topology score rankings differ across score kinds "
+        f"({detail}). See memory "
+        "`project_gumbel_anneal_population_sparsity_falsified`: BIC and REML "
+        "can disagree when candidate basis sizes differ wildly."
+    ]
+
+
+__all__ = ["BasisSpec", "ScoreKind", "SelectTopologyResult", "select_topology"]
