@@ -461,6 +461,7 @@ pub enum NutsFamily {
     BinomialProbit,
     BinomialCLogLog,
     PoissonLog,
+    TweedieLog,
     NegativeBinomialLog,
     GammaLog,
 }
@@ -474,6 +475,7 @@ impl NutsFamily {
             Self::BinomialProbit => LikelihoodFamily::BinomialProbit,
             Self::BinomialCLogLog => LikelihoodFamily::BinomialCLogLog,
             Self::PoissonLog => LikelihoodFamily::PoissonLog,
+            Self::TweedieLog => LikelihoodFamily::Tweedie { p: 1.5 },
             Self::NegativeBinomialLog => LikelihoodFamily::NegativeBinomial { theta: 1.0 },
             Self::GammaLog => LikelihoodFamily::GammaLog,
         }
@@ -855,6 +857,7 @@ fn nuts_family_logp_and_grad(
         NutsFamily::BinomialCLogLog => cloglog_logp_and_grad(data, eta),
         NutsFamily::Gaussian => gaussian_logp_and_grad(data, eta),
         NutsFamily::PoissonLog => poisson_log_logp_and_grad(data, eta),
+        NutsFamily::TweedieLog => tweedie_log_quasilogp_and_grad(data, eta, data.gamma_shape),
         NutsFamily::NegativeBinomialLog => {
             negative_binomial_log_logp_and_grad(data, eta, data.gamma_shape)
         }
@@ -926,6 +929,7 @@ fn joint_family_logp_and_grad(
         }
         LikelihoodFamily::GaussianIdentity => Ok(gaussian_logp_and_grad(data, eta)),
         LikelihoodFamily::PoissonLog => Ok(poisson_log_logp_and_grad(data, eta)),
+        LikelihoodFamily::Tweedie { p } => Ok(tweedie_log_quasilogp_and_grad(data, eta, p)),
         LikelihoodFamily::NegativeBinomial { theta } => {
             Ok(negative_binomial_log_logp_and_grad(data, eta, theta))
         }
@@ -1099,6 +1103,44 @@ fn poisson_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Arra
             let w_i = data.weights[i];
             *slot = w_i * (y_i - mu_i);
             w_i * (y_i * eta_i - mu_i)
+        })
+        .sum();
+
+    let grad_ll = fast_atv(&data.x, &residual);
+    (ll, grad_ll)
+}
+
+fn tweedie_log_quasilogp_and_grad(
+    data: &SharedData,
+    eta: &Array1<f64>,
+    p: f64,
+) -> (f64, Array1<f64>) {
+    use crate::inference::dispersion_cov::DispersionExt as _;
+    use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
+    let n = data.n_samples;
+    let p = if p.is_finite() { p } else { 1.5 };
+    let inv_phi = data.dispersion.inv_phi();
+    let mut residual = Array1::<f64>::zeros(n);
+    let ll: f64 = residual
+        .as_slice_mut()
+        .unwrap()
+        .par_iter_mut()
+        .enumerate()
+        .map(|(i, slot)| {
+            let eta_i = eta[i].clamp(-700.0, 700.0);
+            let mu_i = eta_i.exp().max(1e-300);
+            let y_i = data.y[i];
+            let w_i = data.weights[i] * inv_phi;
+            *slot = w_i * (y_i - mu_i) * mu_i.powf(1.0 - p);
+            let qll = if (p - 1.0).abs() <= 1.0e-12 {
+                y_i * eta_i - mu_i
+            } else if (p - 2.0).abs() <= 1.0e-12 {
+                -y_i / mu_i - eta_i
+            } else {
+                y_i * mu_i.powf(1.0 - p) / (1.0 - p)
+                    - mu_i.powf(2.0 - p) / (2.0 - p)
+            };
+            w_i * qll
         })
         .sum();
 
@@ -3539,6 +3581,19 @@ pub fn run_nuts_sampling_flattened_family(
             glm.firth_bias_reduction,
             config,
         ),
+        (LikelihoodFamily::Tweedie { p }, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
+            glm.x,
+            glm.y,
+            glm.weights,
+            glm.penalty_matrix,
+            glm.mode,
+            glm.hessian,
+            NutsFamily::TweedieLog,
+            p,
+            glm.dispersion,
+            glm.firth_bias_reduction,
+            config,
+        ),
         (LikelihoodFamily::NegativeBinomial { theta }, FamilyNutsInputs::Glm(glm)) => {
             run_nuts_sampling(
                 glm.x,
@@ -4583,6 +4638,7 @@ impl JointBetaRhoPosterior {
                 }
             }
             LikelihoodFamily::PoissonLog
+            | LikelihoodFamily::Tweedie { .. }
             | LikelihoodFamily::NegativeBinomial { .. }
             | LikelihoodFamily::GammaLog => {
                 if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Log)) {

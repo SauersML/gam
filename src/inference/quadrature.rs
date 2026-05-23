@@ -2940,6 +2940,7 @@ pub fn integrated_family_moments_jetwith_state(
             })
         }
         LikelihoodFamily::PoissonLog
+        | LikelihoodFamily::Tweedie { .. }
         | LikelihoodFamily::NegativeBinomial { .. }
         | LikelihoodFamily::GammaLog => {
             // Log-normal MGF: E[exp(η)] = exp(e + s²/2)
@@ -2954,6 +2955,7 @@ pub fn integrated_family_moments_jetwith_state(
             //            use mean² as proxy (shape=1).
             let variance = match family {
                 LikelihoodFamily::PoissonLog => mean,
+                LikelihoodFamily::Tweedie { p } => mean.powf(p),
                 LikelihoodFamily::NegativeBinomial { theta } => {
                     mean + mean * mean / theta.max(1e-12)
                 }
