@@ -1619,8 +1619,30 @@ def gaussian_reml_fit(
     init_lambda: float | None = None,
     by: Any | None = None,
     by_start_col: int = 0,
+    geodesic_acceleration: bool = False,
 ) -> dict[str, Any]:
-    """Fit a closed-form Gaussian REML problem from NumPy-compatible arrays."""
+    """Fit a closed-form Gaussian REML problem from NumPy-compatible arrays.
+
+    Parameters
+    ----------
+    geodesic_acceleration:
+        Enable the Transtrum-Sethna geodesic-acceleration second-order
+        correction in the inner Newton / Levenberg-Marquardt solver
+        (Transtrum & Sethna, 2011, "Improvements to the Levenberg-Marquardt
+        algorithm for nonlinear least-squares minimization"). The standard
+        LM step ``δp = −(H + λ_lm·diag(H))⁻¹ g`` is augmented with a
+        second-order correction ``δp₂ = −(H + λ_lm·diag(H))⁻¹ K`` where
+        ``K`` is a central-difference estimate of the directional second
+        derivative of the gradient along ``δp``; the correction is
+        accepted only when ``‖δp₂‖ ≤ 0.75 · ‖δp‖``. Most useful for fits
+        with near-singular Hessians (latent-coordinate fits, near-collinear
+        bases). Default ``False`` until validated. *Note:* the closed-form
+        Gaussian-identity path used by this function does not run an inner
+        Newton loop, so this flag is accepted for API parity with the
+        PIRLS-based fits and is a no-op here; it is honored by the
+        formula-based ``gamfit.fit(...)`` entrypoint and any GLM-family
+        fits that drive the inner Newton solver.
+    """
     import numpy as np
 
     try:

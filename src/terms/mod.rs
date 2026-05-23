@@ -1,3 +1,4 @@
+pub mod analytic_penalties;
 pub mod basis;
 pub mod closed_form_operator;
 pub mod construction;
