@@ -314,8 +314,10 @@ def _build_fit_payload(
     firth: bool | None,
     precision_hyperpriors: Any | None,
     latents: Mapping[str, Any] | None,
+    penalties: Sequence[Any] | None,
     config: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    normalized_latents = _normalize_latents(latents)
     payload: dict[str, Any] = {
         "family": family,
         "offset": offset,
@@ -339,7 +341,8 @@ def _build_fit_payload(
         "adaptive_regularization": adaptive_regularization,
         "firth": firth,
         "precision_hyperpriors": precision_hyperpriors,
-        "latents": _normalize_latents(latents),
+        "latents": normalized_latents,
+        "penalties": _normalize_penalties(penalties, normalized_latents),
     }
     for key, value in kwarg_items.items():
         if value is not None:
@@ -381,6 +384,70 @@ def _normalize_latents(latents: Mapping[str, Any] | None) -> dict[str, Any] | No
             "dim_selection": bool(getattr(latent, "dim_selection", False)),
         }
         out[str(name)] = {k: v for k, v in raw.items() if v is not None}
+    return out
+
+
+def _normalize_penalties(
+    penalties: Sequence[Any] | None,
+    latents: Mapping[str, Any] | None,
+) -> list[dict[str, Any]] | None:
+    if penalties is None:
+        return None
+    if isinstance(penalties, (str, bytes)) or not isinstance(penalties, Sequence):
+        raise TypeError("penalties must be a sequence of analytic penalty wrappers")
+    latent_names = list((latents or {}).keys())
+    out: list[dict[str, Any]] = []
+    for index, penalty in enumerate(penalties):
+        if hasattr(penalty, "to_rust_descriptor"):
+            descriptor = penalty.to_rust_descriptor()
+        elif hasattr(penalty, "_to_rust_payload"):
+            descriptor = penalty._to_rust_payload()
+        elif isinstance(penalty, Mapping):
+            descriptor = dict(penalty)
+        else:
+            raise TypeError(
+                f"penalties[{index}] must expose to_rust_descriptor() or be a mapping"
+            )
+        target = descriptor.get("target")
+        if isinstance(target, int):
+            if target < 0 or target >= len(latent_names):
+                raise ValueError(
+                    f"penalties[{index}] targets latent index {target}, "
+                    f"but latents has {len(latent_names)} block(s)"
+                )
+            descriptor["target"] = latent_names[target]
+        elif isinstance(target, str):
+            if target not in (latents or {}):
+                raise ValueError(
+                    f"penalties[{index}] targets latent block {target!r}, "
+                    "which is not present in latents"
+                )
+        else:
+            raise TypeError(
+                f"penalties[{index}] target must be a latent block name or index"
+            )
+        out.append(_jsonable_array(descriptor))
+    return out
+
+
+def _normalize_penalty_descriptors(penalties: Sequence[Any] | None) -> list[dict[str, Any]] | None:
+    if penalties is None:
+        return None
+    if isinstance(penalties, (str, bytes)) or not isinstance(penalties, Sequence):
+        raise TypeError("penalties must be a sequence of analytic penalty wrappers")
+    out: list[dict[str, Any]] = []
+    for index, penalty in enumerate(penalties):
+        if hasattr(penalty, "to_rust_descriptor"):
+            descriptor = penalty.to_rust_descriptor()
+        elif hasattr(penalty, "_to_rust_payload"):
+            descriptor = penalty._to_rust_payload()
+        elif isinstance(penalty, Mapping):
+            descriptor = dict(penalty)
+        else:
+            raise TypeError(
+                f"penalties[{index}] must expose to_rust_descriptor() or be a mapping"
+            )
+        out.append(_jsonable_array(descriptor))
     return out
 
 
@@ -610,6 +677,7 @@ def fit(
     response_coordinates: str | None = ...,
     response_reference: int | None = ...,
     latents: Mapping[str, Any] | None = ...,
+    penalties: Sequence[Any] | None = ...,
     config: dict[str, Any] | None = ...,
 ) -> Model: ...
 
@@ -645,6 +713,7 @@ def fit(
     response_coordinates: str | None = ...,
     response_reference: int | None = ...,
     latents: Mapping[str, Any] | None = ...,
+    penalties: Sequence[Any] | None = ...,
     config: dict[str, Any] | None = ...,
 ) -> ResponseGeometryModel: ...
 
@@ -679,6 +748,7 @@ def fit(
     response_coordinates: str | None = None,
     response_reference: int | None = None,
     latents: Mapping[str, Any] | None = None,
+    penalties: Sequence[Any] | None = None,
     config: dict[str, Any] | None = None,
 ) -> Model | ResponseGeometryModel:
     """Fit a GAM model from a formula and a tabular dataset.
@@ -789,6 +859,10 @@ def fit(
         the standard fit API surface for per-row latent coordinates. The Rust
         standard workflow maps the named formula smooth onto the latent
         coordinate matrix and optimizes it jointly with the REML parameters.
+    penalties:
+        Analytic penalty wrappers such as :class:`gamfit.OrthogonalityPenalty`
+        or :class:`gamfit.ARDPenalty`, targeted at latent block names or
+        indices declared in ``latents``.
 
     Returns
     -------
@@ -856,6 +930,7 @@ def fit(
                 "firth": firth,
                 "precision_hyperpriors": precision_hyperpriors,
                 "latents": latents,
+                "penalties": penalties,
                 "config": nested_config or None,
             },
         )
@@ -894,6 +969,7 @@ def fit(
         firth=firth,
         precision_hyperpriors=resolved_precision_hyperpriors,
         latents=latents,
+        penalties=penalties,
         config=rust_config or None,
     )
     try:
@@ -931,6 +1007,7 @@ def fit_array(
     firth: bool | None = None,
     precision_hyperpriors: Any | None = None,
     latents: Mapping[str, Any] | None = None,
+    penalties: Sequence[Any] | None = None,
     config: dict[str, Any] | None = None,
 ) -> Model:
     """Fit directly from numeric NumPy-compatible arrays.
@@ -967,6 +1044,7 @@ def fit_array(
         firth=firth,
         precision_hyperpriors=resolved_precision_hyperpriors,
         latents=latents,
+        penalties=penalties,
         config=rust_config or None,
     )
     try:
@@ -1099,6 +1177,7 @@ def validate_formula(
         firth=firth,
         precision_hyperpriors=None,
         latents=None,
+        penalties=None,
         config=rust_config or None,
     )
     try:
@@ -2170,6 +2249,7 @@ def gaussian_reml_fit_latent(
     aux_family: str = "ridge",
     aux_strength: float | str | None = None,
     dim_selection_log_precision: Any | None = None,
+    penalties: Sequence[Any] | None = None,
     basis_kind: str = "duchon",
     tensor_knots_concat: Any | None = None,
     tensor_knot_offsets: Sequence[int] | None = None,
@@ -2234,6 +2314,7 @@ def gaussian_reml_fit_latent(
             None
             if dim_selection_log_precision is None
             else _numeric_vector(dim_selection_log_precision, "dim_selection_log_precision"),
+            _normalize_penalty_descriptors(penalties),
             str(basis_kind),
             None
             if tensor_knots_concat is None
@@ -2372,6 +2453,7 @@ def glm_reml_fit_latent(
     aux_family: str = "ridge",
     aux_strength: float | str | None = None,
     dim_selection_log_precision: Any | None = None,
+    penalties: Sequence[Any] | None = None,
 ) -> dict[str, Any]:
     """Latent-coordinate REML/LAML fit for GLM families via PIRLS.
 
@@ -2418,6 +2500,7 @@ def glm_reml_fit_latent(
             None
             if dim_selection_log_precision is None
             else _numeric_vector(dim_selection_log_precision, "dim_selection_log_precision"),
+            _normalize_penalty_descriptors(penalties),
         )
     except Exception as exc:
         raise map_exception(exc) from exc

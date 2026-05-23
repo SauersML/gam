@@ -38,6 +38,7 @@ they slot into the same REML outer loop, and their strengths are
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from operator import index
 from typing import Any, Literal, Sequence
 
 __all__ = [
@@ -369,7 +370,7 @@ class TotalVariationPenalty:
             return
 
         try:
-            edges = [(int(a), int(b)) for a, b in self.difference_op]
+            edges = [(index(a), index(b)) for a, b in self.difference_op]
         except (TypeError, ValueError) as exc:
             raise TypeError(
                 "TotalVariationPenalty.difference_op must be 'forward_1d' "
@@ -390,7 +391,7 @@ class TotalVariationPenalty:
     def _to_rust_payload(self) -> dict[str, Any]:
         payload = {
             "kind": "total_variation",
-            "target": self.target if isinstance(self.target, str) else "__latent_object__",
+            "target": _target_descriptor(self.target),
             "weight": self.weight,
             "n_eff": self.n_eff,
             "smoothing_eps": self.smoothing_eps,
@@ -402,6 +403,9 @@ class TotalVariationPenalty:
             payload["difference_op"] = "graph_edges"
             payload["edges"] = self._edges
         return payload
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
 
 
 @dataclass(init=False)
@@ -456,15 +460,79 @@ class OrthogonalityPenalty:
     def _to_rust_payload(self) -> dict[str, Any]:
         return {
             "kind": "orthogonality",
-            "target": self.target if isinstance(self.target, str) else "__latent_object__",
+            "target": _target_descriptor(self.target),
             "weight": self.weight,
             "n_eff": self.n_eff,
             "learnable": self.learnable,
         }
 
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
+
+
+@dataclass
+class IBPAssignmentPenalty:
+    target: Any
+    k_max: int
+    alpha: float = 1.0
+    tau: float = 1.0
+    learnable_alpha: bool = False
+
+    def __post_init__(self) -> None:
+        if self.k_max <= 0:
+            raise ValueError(f"IBPAssignmentPenalty.k_max must be > 0, got {self.k_max}")
+        if self.alpha <= 0.0:
+            raise ValueError(f"IBPAssignmentPenalty.alpha must be > 0, got {self.alpha}")
+        if self.tau <= 0.0:
+            raise ValueError(f"IBPAssignmentPenalty.tau must be > 0, got {self.tau}")
+
+    def _to_rust_payload(self) -> dict[str, Any]:
+        return {
+            "kind": "ibp_assignment",
+            "target": _target_descriptor(self.target),
+            "k_max": int(self.k_max),
+            "alpha": float(self.alpha),
+            "tau": float(self.tau),
+            "learnable_alpha": bool(self.learnable_alpha),
+        }
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
+
+
+@dataclass
+class SoftmaxAssignmentSparsityPenalty:
+    target: Any
+    k_atoms: int
+    temperature: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.k_atoms <= 0:
+            raise ValueError(
+                "SoftmaxAssignmentSparsityPenalty.k_atoms must be > 0, "
+                f"got {self.k_atoms}"
+            )
+        if self.temperature <= 0.0:
+            raise ValueError(
+                "SoftmaxAssignmentSparsityPenalty.temperature must be > 0, "
+                f"got {self.temperature}"
+            )
+
+    def _to_rust_payload(self) -> dict[str, Any]:
+        return {
+            "kind": "softmax_assignment_sparsity",
+            "target": _target_descriptor(self.target),
+            "k_atoms": int(self.k_atoms),
+            "temperature": float(self.temperature),
+        }
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
+
 
 # Sum type for type hints on `gamfit.fit(..., penalties=...)` and similar.
 Penalty = (
     "IsometryPenalty | SparsityPenalty | ARDPenalty | "
-    "TotalVariationPenalty | OrthogonalityPenalty"
+    "TotalVariationPenalty | OrthogonalityPenalty | IBPAssignmentPenalty | "
+    "SoftmaxAssignmentSparsityPenalty"
 )

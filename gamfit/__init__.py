@@ -71,9 +71,11 @@ from ._binding import RustExtensionUnavailableError
 from ._compare import compare_models
 from ._penalties import (
     ARDPenalty,
+    IBPAssignmentPenalty,
     IsometryPenalty,
     OrthogonalityPenalty,
     Penalty,
+    SoftmaxAssignmentSparsityPenalty,
     SparsityPenalty,
     TotalVariationPenalty,
 )
@@ -191,9 +193,11 @@ __all__ = [
     "SchemaMismatchError",
     "SharedPrecisionGroup",
     "ARDPenalty",
+    "IBPAssignmentPenalty",
     "IsometryPenalty",
     "OrthogonalityPenalty",
     "Penalty",
+    "SoftmaxAssignmentSparsityPenalty",
     "SparsityPenalty",
     "TotalVariationPenalty",
     "Summary",
