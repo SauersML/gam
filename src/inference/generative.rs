@@ -19,6 +19,9 @@ pub enum NoiseModel {
     NegativeBinomial {
         theta: f64,
     },
+    Beta {
+        phi: f64,
+    },
     Gamma {
         /// Fixed Gamma shape parameter (k > 0), with mean-driven scale.
         shape: f64,
@@ -183,6 +186,26 @@ pub fn sampleobservations<R: rand::Rng + ?Sized>(
                     ))
                 })?;
                 y[i] = rand_distr::Distribution::sample(&poisson, rng);
+            }
+            Ok(y)
+        }
+        NoiseModel::Beta { phi } => {
+            if !(phi.is_finite() && *phi > 0.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "invalid beta-regression phi: {phi}"
+                )));
+            }
+            let mut y = Array1::<f64>::zeros(spec.mean.len());
+            for i in 0..y.len() {
+                let mu = spec.mean[i].clamp(1e-12, 1.0 - 1e-12);
+                let alpha = (mu * *phi).max(1e-12);
+                let beta = ((1.0 - mu) * *phi).max(1e-12);
+                let dist = rand_distr::Beta::new(alpha, beta).map_err(|e| {
+                    EstimationError::InvalidInput(format!(
+                        "invalid Beta params alpha={alpha} beta={beta}: {e}"
+                    ))
+                })?;
+                y[i] = rand_distr::Distribution::sample(&dist, rng);
             }
             Ok(y)
         }

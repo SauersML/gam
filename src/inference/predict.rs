@@ -806,6 +806,7 @@ impl PredictableModel for StandardPredictor {
             | crate::types::LikelihoodFamily::Tweedie { .. }
             | crate::types::LikelihoodFamily::NegativeBinomial { .. }
             | crate::types::LikelihoodFamily::GammaLog => (0.0, f64::INFINITY),
+            crate::types::LikelihoodFamily::BetaLogit { .. } => (1e-10, 1.0 - 1e-10),
             _ => (1e-10, 1.0 - 1e-10),
         };
         mean_lower.mapv_inplace(|v| v.clamp(lo, hi));
@@ -4358,10 +4359,16 @@ pub fn enrich_posterior_mean_bounds(
             | crate::types::LikelihoodFamily::BinomialSas
             | crate::types::LikelihoodFamily::BinomialBetaLogistic
             | crate::types::LikelihoodFamily::BinomialMixture
+            | crate::types::LikelihoodFamily::BetaLogit { .. }
             | crate::types::LikelihoodFamily::RoystonParmar
     ) {
-        mean_lower.mapv_inplace(|v| v.clamp(0.0, 1.0));
-        mean_upper.mapv_inplace(|v| v.clamp(0.0, 1.0));
+        let (lo, hi) = if matches!(family, crate::types::LikelihoodFamily::BetaLogit { .. }) {
+            (1e-10, 1.0 - 1e-10)
+        } else {
+            (0.0, 1.0)
+        };
+        mean_lower.mapv_inplace(|v| v.clamp(lo, hi));
+        mean_upper.mapv_inplace(|v| v.clamp(lo, hi));
     }
 
     result.mean_lower = Some(mean_lower);
@@ -5182,10 +5189,16 @@ where
             | crate::types::LikelihoodFamily::BinomialSas
             | crate::types::LikelihoodFamily::BinomialBetaLogistic
             | crate::types::LikelihoodFamily::BinomialMixture
+            | crate::types::LikelihoodFamily::BetaLogit { .. }
             | crate::types::LikelihoodFamily::RoystonParmar
     ) {
-        mean_lower.mapv_inplace(|v| v.clamp(0.0, 1.0));
-        mean_upper.mapv_inplace(|v| v.clamp(0.0, 1.0));
+        let (lo, hi) = if matches!(family, crate::types::LikelihoodFamily::BetaLogit { .. }) {
+            (1e-10, 1.0 - 1e-10)
+        } else {
+            (0.0, 1.0)
+        };
+        mean_lower.mapv_inplace(|v| v.clamp(lo, hi));
+        mean_upper.mapv_inplace(|v| v.clamp(lo, hi));
     }
 
     let (observation_lower, observation_upper) =
