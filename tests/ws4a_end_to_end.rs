@@ -78,9 +78,7 @@ fn make_data(n: usize, sigma: f64, seed: u64) -> gam::data::EncodedDataset {
 /// Materialize a Gaussian-LS (mean smooth + intercept-only log-sigma) fit
 /// request. Returns the request so the caller can mutate
 /// `BlockwiseFitOptions::outer_score_subsample` before calling `fit_model`.
-fn materialize_gls<'a>(
-    data: &'a gam::data::EncodedDataset,
-) -> gam::MaterializedModel<'a> {
+fn materialize_gls<'a>(data: &'a gam::data::EncodedDataset) -> gam::MaterializedModel<'a> {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         noise_formula: Some("1".to_string()),

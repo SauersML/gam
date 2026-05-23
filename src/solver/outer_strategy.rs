@@ -3322,23 +3322,16 @@ impl TrustEnergyGateState {
         };
         let energy_contamination = match (accepted.ift_residual_energy, predicted_decrease) {
             (Some((e, cached_iter)), p) if p.abs() > 0.0 => {
-                let current_iter =
-                    crate::solver::estimate::reml::runtime::current_outer_iter();
+                let current_iter = crate::solver::estimate::reml::runtime::current_outer_iter();
                 if cached_iter == 0 || current_iter == 0 {
                     false
                 } else if current_iter < cached_iter {
                     let gap = cached_iter - current_iter;
-                    log::info!(
-                        "[TRUST-ENERGY] cache stale (gap={}), skipping gate",
-                        gap
-                    );
+                    log::info!("[TRUST-ENERGY] cache stale (gap={}), skipping gate", gap);
                     false
                 } else if current_iter - cached_iter > 1 {
                     let gap = current_iter - cached_iter;
-                    log::info!(
-                        "[TRUST-ENERGY] cache stale (gap={}), skipping gate",
-                        gap
-                    );
+                    log::info!("[TRUST-ENERGY] cache stale (gap={}), skipping gate", gap);
                     false
                 } else {
                     e > TRUST_ENERGY_FACTOR * p.abs()
