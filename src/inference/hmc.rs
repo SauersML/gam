@@ -3591,7 +3591,21 @@ impl LinkWigglePosterior {
             .cholesky(Side::Lower)
             .map_err(|e| format!("LinkWigglePosterior Cholesky failed: {:?}", e))?;
         let l_h = chol_factor.lower_triangular();
-        let chol = solve_upper_triangular_transpose(&l_h, dim);
+        let mut chol = solve_upper_triangular_transpose(&l_h, dim);
+        // Scale the Cholesky factor by √φ for families with estimated
+        // dispersion. For Gaussian the relevant scale is σ (so φ = σ²)
+        // and the posterior covariance the sampler should target is
+        // `Vb = φ·H⁻¹`. Without this scaling the sampler whitened
+        // against the unscaled Hessian, silently targeting H⁻¹.
+        // Fixed-scale families (Binomial / Poisson) take this branch
+        // with `sqrt_phi == 1` and pay no overhead.
+        let sqrt_phi = match nuts_family {
+            NutsFamily::Gaussian => scale.max(0.0),
+            _ => 1.0,
+        };
+        if (sqrt_phi - 1.0).abs() > 0.0 {
+            chol.mapv_inplace(|v| v * sqrt_phi);
+        }
         let chol_t = chol.t().to_owned();
         Ok(Self {
             x: Arc::new(x.to_owned()),
