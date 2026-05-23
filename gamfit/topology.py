@@ -203,6 +203,7 @@ def Sphere(
     name: str | None = None,
     n_knots: int = 20,
     *,
+    dim: int = 2,
     penalty_order: int = 2,
     kernel: str = "sobolev",
     radians: bool = False,
@@ -222,18 +223,23 @@ def Sphere(
 
     Parameters
     ----------
+    dim : coordinate dimension. Must be ``2`` for latitude/longitude.
     n_knots : number of basis centers / harmonic truncation degree
         (forwarded as ``n_centers`` to the underlying spec).
     penalty_order, kernel, radians : forwarded to
         :class:`~gamfit.smooth.Sphere`.
     """
-    return _SphereSmooth(
+    if int(dim) != 2:
+        raise ValueError("topology.Sphere supports dim=2 latitude/longitude inputs")
+    spec = _SphereSmooth(
         n_centers=int(n_knots),
         penalty_order=int(penalty_order),
         kernel=str(kernel),
         radians=bool(radians),
         **_common(name, by, double_penalty, shape_constraint),
     )
+    setattr(spec, "_gamfit_topology_dim", 2)
+    return spec
 
 
 def EuclideanPatch(
@@ -277,10 +283,12 @@ def EuclideanPatch(
     else:
         centers_arg = centers  # may be None for d>=2; the spec will then
         # surface a clear "centers required for d>=2" error from the core.
-    return Duchon(
+    spec = Duchon(
         centers=centers_arg,
         m=int(m),
         length_scale=length_scale,
         periodic_per_axis=None,
         **_common(name, by, double_penalty, shape_constraint),
     )
+    setattr(spec, "_gamfit_topology_dim", int(d))
+    return spec
