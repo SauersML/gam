@@ -1329,10 +1329,20 @@ pub struct ArrowSchurInnerConfig {
     /// initialized.
     pub build:
         std::sync::Arc<dyn Fn(&Array1<f64>) -> Option<crate::solver::arrow_schur::ArrowSchurSystem> + Send + Sync>,
-    /// Callback that the inner solver invokes after each accepted joint
-    /// step to write the latent increment back into the driver's
+    /// Callback that the inner solver invokes after each LM-attempted
+    /// joint step to write the latent increment back into the driver's
     /// `LatentCoordValues`. `delta_t` is the flat row-major increment of
     /// length `n_rows * latent_dim`.
+    ///
+    /// **Driver-side caveat:** the current PIRLS LM gain test may reject
+    /// the β step via step halving; in that case the latent should be
+    /// reverted symmetrically. The recommended pattern is for the driver
+    /// to snapshot its `LatentCoordValues` before each PIRLS call and to
+    /// manage revert/commit via the dedicated `LatentInnerSolver`
+    /// (`crate::solver::latent_inner`), which owns the joint gain-test
+    /// bookkeeping. The hook here is the back-compat path for PIRLS-driven
+    /// inner loops; the cleanest production path moves the LM control
+    /// into `LatentInnerSolver` and bypasses PIRLS's β-only LM scaffolding.
     pub apply_delta_t: std::sync::Arc<dyn Fn(&Array1<f64>) + Send + Sync>,
 }
 
@@ -4952,8 +4962,8 @@ where
                     // gradient w.r.t. `t` carries a shared `Schur⁻¹`
                     // factor — that's a separate plumbing change
                     // handled at the REML driver level, NOT here.
-                    debug_assert_eq!(arrow_cfg.n_beta, beta.len());
-                    match arrow_cfg.build.as_ref()(&beta) {
+                    debug_assert_eq!(arrow_cfg.n_beta, beta.as_ref().len());
+                    match arrow_cfg.build.as_ref()(beta.as_ref()) {
                         None => {
                             // Driver opted out (e.g. latent not yet
                             // initialized). Fall through to β-only path.

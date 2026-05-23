@@ -59,7 +59,7 @@ use gam::terms::basis::{
     periodic_bspline_first_derivative_nd, resolve_duchon_orders, sphere_first_derivative_nd,
 };
 use gam::terms::latent_coord::{
-    AuxPriorFamily, LatentCoordValues, LatentIdMode, aux_prior_targets,
+    AuxPriorFamily, InputLocationDerivative, LatentCoordValues, LatentIdMode, aux_prior_targets,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction};

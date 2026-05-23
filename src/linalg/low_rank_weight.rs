@@ -37,7 +37,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 
-use crate::faer_ndarray::{fast_ab, fast_atb, fast_atv, fast_av_into};
+use crate::faer_ndarray::{fast_ab, fast_atb, fast_atv};
 use crate::matrix::DesignMatrix;
 
 /// `W = diag(diag) + u · vᵀ`. Rows: `n`. Rank of correction: `u.ncols()`.
@@ -326,7 +326,6 @@ fn transpose_design_times_dense(
         let xt_col = design.transpose_vector_multiply(&col_owned);
         out.column_mut(k).assign(&xt_col);
     }
-    let _ = fast_av_into; // silence unused warning in code paths that skip it
     Ok(out)
 }
 
