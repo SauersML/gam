@@ -19017,6 +19017,94 @@ pub fn duchon_radial_first_derivative_nd(
     Ok(out)
 }
 
+/// N-D Duchon radial second derivative `φ''(r)` evaluated for every
+/// `(row, center)` pair.
+///
+/// Returns an `(n_rows, n_centers)` matrix whose `(n, k)` entry is the scalar
+/// radial second derivative `φ''(r_{nk})` of the Duchon kernel, where
+/// `r_{nk} = ‖t_n − c_k‖_2`.
+///
+/// This is the companion primitive to
+/// [`duchon_radial_first_derivative_nd`]. Together the two scalars reconstruct
+/// the full input-location Hessian:
+///
+/// ```text
+/// ∂²φ/∂t_a∂t_b = (φ'(r)/r) δ_ab
+///              + (φ''(r) − φ'(r)/r) (t_a − c_a)(t_b − c_b) / r².
+/// ```
+///
+/// At `r = 0`, consumers should use the isotropic collision limit
+/// `φ''(0) δ_ab`; `duchon_radial_jets` supplies that finite scalar whenever
+/// the selected Duchon order is smooth enough for the supported latent path.
+pub fn duchon_radial_second_derivative_nd(
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: Option<f64>,
+    nullspace_order: DuchonNullspaceOrder,
+) -> Result<Array2<f64>, BasisError> {
+    let n_rows = t.nrows();
+    let n_centers = centers.nrows();
+    let dim = centers.ncols();
+    if dim == 0 {
+        return Err(BasisError::InvalidInput(
+            "duchon_radial_second_derivative_nd: centers must have at least one column".into(),
+        ));
+    }
+    if t.ncols() != dim {
+        return Err(BasisError::InvalidInput(format!(
+            "duchon_radial_second_derivative_nd: t has {} cols but centers have {}",
+            t.ncols(),
+            dim
+        )));
+    }
+    let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_order);
+    let s_order: usize = 0;
+    let kappa = length_scale.map(|l| 1.0 / l.max(1e-300)).unwrap_or(0.0);
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+    let effective_length_scale = length_scale.unwrap_or_else(|| {
+        let mut acc = 0.0_f64;
+        let mut cnt = 0usize;
+        for i in 0..n_centers.min(8) {
+            for j in (i + 1)..n_centers.min(8) {
+                let mut r2 = 0.0_f64;
+                for a in 0..dim {
+                    let dv = centers[[i, a]] - centers[[j, a]];
+                    r2 += dv * dv;
+                }
+                acc += r2.sqrt();
+                cnt += 1;
+            }
+        }
+        if cnt == 0 || acc <= 0.0 {
+            1.0
+        } else {
+            acc / cnt as f64
+        }
+    });
+    let mut out = Array2::<f64>::zeros((n_rows, n_centers));
+    for n in 0..n_rows {
+        for k in 0..n_centers {
+            let mut r2 = 0.0_f64;
+            for a in 0..dim {
+                let dv = t[[n, a]] - centers[[k, a]];
+                r2 += dv * dv;
+            }
+            let r = r2.sqrt();
+            let jets = duchon_radial_jets(
+                r,
+                effective_length_scale,
+                p_order,
+                s_order,
+                dim,
+                &coeffs,
+            )?;
+            out[[n, k]] = jets.phi_rr;
+        }
+    }
+    Ok(out)
+}
+
 fn fill_duchon_1d_polynomial_derivative(
     basis: &mut Array2<f64>,
     start_col: usize,
