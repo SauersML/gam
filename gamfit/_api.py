@@ -2182,7 +2182,7 @@ def gaussian_reml_fit_latent(
 
     .. math::
 
-        \\hat Y_n = \\Phi(t_n; \\psi)\\,\\beta,
+        \\hat Y_n = \\Phi(t_n)\\,\\beta,
         \\qquad
         \\ell = \\tfrac12\\|Y - \\Phi(t)\\beta\\|^2
              + \\tfrac12\\lambda\\beta^T S\\beta
