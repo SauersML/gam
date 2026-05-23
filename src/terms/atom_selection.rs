@@ -188,7 +188,7 @@ pub struct ShapeRef {
 /// on-atom coordinates `t_{·, k} ∈ ℝ^{N × d_k}`.
 ///
 /// Note that the *decoder coefficients* `B_k` live in the β tier (owned by
-/// Piece 1 / `pirls.rs`); we hold only ψ-side state here.
+/// Piece 1 / `pirls.rs`); we hold only row-local extension-coordinate state here.
 #[derive(Debug, Clone)]
 pub struct AtomRecord {
     pub shape: ShapeRef,
@@ -332,15 +332,15 @@ pub fn reconstruct_row(
 ) -> Array1<f64> {
     debug_assert_eq!(decoder_outputs.len(), code.k_atoms());
     let p = decoder_outputs.first().map(|v| v.len()).unwrap_or(0);
-    let mut z = Array1::<f64>::zeros(p);
+    let mut reconstruction = Array1::<f64>::zeros(p);
     for k in code.active_mask.iter_ones() {
         debug_assert_eq!(decoder_outputs[k].len(), p);
         let w = code.weights[k];
         for i in 0..p {
-            z[i] += w * decoder_outputs[k][i];
+            reconstruction[i] += w * decoder_outputs[k][i];
         }
     }
-    z
+    reconstruction
 }
 
 /// Gradient of the row-`n` quadratic data fit `½ ‖Z_n − Ẑ_n‖²` with respect
@@ -854,14 +854,14 @@ pub fn reconstruct_all(
     p_out: usize,
 ) -> Array2<f64> {
     let n = codes.n_obs();
-    let mut z = Array2::<f64>::zeros((n, p_out));
+    let mut reconstruction = Array2::<f64>::zeros((n, p_out));
     for nn in 0..n {
         let row = reconstruct_row(codes.row(nn), &decoder_outputs[nn]);
         for i in 0..p_out {
-            z[[nn, i]] = row[i];
+            reconstruction[[nn, i]] = row[i];
         }
     }
-    z
+    reconstruction
 }
 
 #[allow(dead_code)]
