@@ -299,18 +299,27 @@ impl Manifold for Circle {
     fn project_tangent(&self, p: ArrayView1<f64>, mut v: ArrayViewMut1<f64>) {
         debug_assert_eq!(p.len(), 2);
         debug_assert_eq!(v.len(), 2);
-        // remove the radial component <v, p> p
+        // P_p(v) = v - <p,v> p ;  idempotent: P_p ∘ P_p = P_p.
         let dot = v[0] * p[0] + v[1] * p[1];
         v[0] -= dot * p[0];
         v[1] -= dot * p[1];
+        // Tangency invariant: <p, v> ≈ 0 after one application.
+        debug_assert!((v[0] * p[0] + v[1] * p[1]).abs() < 1.0e-9);
     }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
-        // Standard projective retraction R_p(ξ) = (p + ξ)/||p + ξ||
+        // Closed-form projective retraction (proposal §4.2):
+        //   R_p(ξ) = (p + ξ)/||p + ξ||.
+        // First-order accurate, seam-free, no angle parameterization needed
+        // (so no 2π wrap to handle here — periodicity is automatic).
         let x = p[0] + xi[0];
         let y = p[1] + xi[1];
-        let norm = (x * x + y * y).sqrt().max(1.0e-300);
+        let s2 = x * x + y * y;
+        debug_assert!(s2.is_finite() && s2 > 0.0, "Circle::retract degenerate ||p+ξ||");
+        let norm = s2.sqrt().max(1.0e-300);
         out[0] = x / norm;
         out[1] = y / norm;
+        // Post-condition: retraction stays on S¹.
+        debug_assert!((out[0] * out[0] + out[1] * out[1] - 1.0).abs() < 1.0e-9);
     }
     fn vector_transport(
         &self,
@@ -318,7 +327,8 @@ impl Manifold for Circle {
         to: ArrayView1<f64>,
         xi: ArrayViewMut1<f64>,
     ) {
-        // Projection approximation: re-project ξ onto T_{to} M.
+        // Projection approximation τ_{p→q}(ξ) = P_q(ξ) (proposal §4.4).
+        // Safe even at antipodal endpoints since it does not divide by 1+<p,q>.
         self.project_tangent(to, xi);
     }
     fn euclidean_to_riemannian_hess_vp(
@@ -328,15 +338,32 @@ impl Manifold for Circle {
         mut ehess_vp: ArrayViewMut1<f64>,
         xi: ArrayView1<f64>,
     ) {
-        // S¹ is a 1-d submanifold of ℝ²; Weingarten map W_p(ξ, v) is the
-        // tangential part of -D_ξ(N(p)·v) N(p) — analogous to the sphere
-        // case (Circle = S¹). For a unit-sphere submanifold of codim 1:
-        //   Hess_R[ξ] = P_T( Hess_E[ξ] - <egrad, p> ξ )
+        // S¹ Weingarten (proposal §4.7 / §18):
+        //   W_p(ξ, v) = <p, v> ξ
+        // Hess_R[ξ] = P_p(∇²_E · ξ - W_p(ξ, ∇_E)).
+        // CRITICAL: the second argument of W is the *ambient* (or normal)
+        // gradient ∇_E, not P_p(∇_E). If we passed the projected gradient
+        // here the radial-egrad scalar would be exactly zero and the
+        // curvature correction would silently vanish.
+        debug_assert_eq!(p.len(), 2);
+        debug_assert_eq!(egrad.len(), 2);
+        debug_assert_eq!(ehess_vp.len(), 2);
+        debug_assert_eq!(xi.len(), 2);
         let radial_egrad = egrad[0] * p[0] + egrad[1] * p[1];
-        for i in 0..2 {
-            ehess_vp[i] -= radial_egrad * xi[i];
-        }
+        ehess_vp[0] -= radial_egrad * xi[0];
+        ehess_vp[1] -= radial_egrad * xi[1];
         self.project_tangent(p, ehess_vp);
+    }
+    /// Closed-form tangent basis: a single unit vector orthogonal to `p`,
+    /// `Q(p) = [-p_y, p_x]ᵀ` (proposal §4.1). O(1) vs the default O(m³).
+    fn tangent_basis(&self, p: ArrayView1<f64>) -> Array2<f64> {
+        debug_assert_eq!(p.len(), 2);
+        let mut q = Array2::<f64>::zeros((2, 1));
+        q[[0, 0]] = -p[1];
+        q[[1, 0]] = p[0];
+        // p is already unit on the manifold, so ||Q|| = 1 by construction;
+        // we do not renormalize here.
+        q
     }
     fn name(&self) -> &str {
         "Circle"
@@ -364,6 +391,7 @@ impl Manifold for Sphere {
     fn project_tangent(&self, p: ArrayView1<f64>, mut v: ArrayViewMut1<f64>) {
         debug_assert_eq!(p.len(), self.n + 1);
         debug_assert_eq!(v.len(), self.n + 1);
+        // P_p(v) = (I - pp^T) v = v - <p, v> p (proposal §6.3). Idempotent.
         let mut dot = 0.0_f64;
         for i in 0..p.len() {
             dot += v[i] * p[i];
@@ -371,8 +399,18 @@ impl Manifold for Sphere {
         for i in 0..p.len() {
             v[i] -= dot * p[i];
         }
+        if cfg!(debug_assertions) {
+            let mut chk = 0.0_f64;
+            for i in 0..p.len() {
+                chk += v[i] * p[i];
+            }
+            debug_assert!(chk.abs() < 1.0e-8 * (1.0 + p.len() as f64));
+        }
     }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
+        // Closed-form projective retraction R_p(ξ) = (p + ξ)/||p + ξ||
+        // (proposal §6.2). Caller is expected to have already projected ξ
+        // onto T_p M and clipped its trust radius.
         let m = self.n + 1;
         let mut s2 = 0.0_f64;
         for i in 0..m {
@@ -380,9 +418,17 @@ impl Manifold for Sphere {
             out[i] = v;
             s2 += v * v;
         }
+        debug_assert!(s2.is_finite() && s2 > 0.0, "Sphere::retract degenerate ||p+ξ||");
         let norm = s2.sqrt().max(1.0e-300);
         for i in 0..m {
             out[i] /= norm;
+        }
+        if cfg!(debug_assertions) {
+            let mut n2 = 0.0_f64;
+            for i in 0..m {
+                n2 += out[i] * out[i];
+            }
+            debug_assert!((n2 - 1.0).abs() < 1.0e-9, "Sphere::retract output not on S^n");
         }
     }
     fn vector_transport(
@@ -391,6 +437,11 @@ impl Manifold for Sphere {
         to: ArrayView1<f64>,
         xi: ArrayViewMut1<f64>,
     ) {
+        // Projection transport (proposal §6.4). Cheap, stable, not exactly
+        // isometric. Antipodal case (to ≈ -from) does not divide by zero
+        // here — unlike exact geodesic transport which has a 1+<p,q>
+        // denominator. The transported tangent can be small near antipodal
+        // endpoints; that is a correctness-preserving degradation.
         self.project_tangent(to, xi);
     }
     fn euclidean_to_riemannian_hess_vp(
@@ -400,8 +451,16 @@ impl Manifold for Sphere {
         mut ehess_vp: ArrayViewMut1<f64>,
         xi: ArrayView1<f64>,
     ) {
-        // Weingarten for unit sphere: W_p(ξ, ν) = <p, ν> ξ where ν is the
-        // ambient (Euclidean) gradient. Hess_R[ξ] = P_T(Hess_E[ξ] - W_p(ξ, ν)).
+        // Proposal §6.7 / §18:  W_p(ξ, v) = <p, v> ξ for the unit sphere.
+        // Hess_R[ξ] = P_p(∇²_E · ξ - W_p(ξ, ∇_E)).
+        // The second arg of W is the AMBIENT gradient ∇_E. Passing the
+        // projected gradient would make <p, ∇_E> ≡ 0 and silently drop the
+        // curvature correction — this matches the explicit warning in the
+        // derivation.
+        debug_assert_eq!(p.len(), self.n + 1);
+        debug_assert_eq!(egrad.len(), self.n + 1);
+        debug_assert_eq!(ehess_vp.len(), self.n + 1);
+        debug_assert_eq!(xi.len(), self.n + 1);
         let mut radial_egrad = 0.0_f64;
         for i in 0..p.len() {
             radial_egrad += egrad[i] * p[i];
@@ -411,12 +470,84 @@ impl Manifold for Sphere {
         }
         self.project_tangent(p, ehess_vp);
     }
-    fn warn_at(&self, p: ArrayView1<f64>) -> Option<&'static str> {
+    /// Closed-form orthonormal tangent basis via Householder reflection:
+    /// map `e_m → p`, then drop the column that would span `p`. This is
+    /// O(m) vs the default modified-Gram-Schmidt O(m^3).
+    ///
+    /// Construction: choose anchor `a = e_k` with `k = argmax |p_i|` for
+    /// numerical stability. Householder vector `u = (p - a)/||p - a||`
+    /// reflects `e_k` to ±p. The reflection `H = I - 2 u u^T` sends `e_k`
+    /// to `±p`; the remaining `m-1` ambient basis vectors map to an
+    /// orthonormal basis of `T_p M`.
+    fn tangent_basis(&self, p: ArrayView1<f64>) -> Array2<f64> {
+        let m = self.n + 1;
+        debug_assert_eq!(p.len(), m);
+        if m == 0 {
+            return Array2::<f64>::zeros((0, 0));
+        }
+        // Pick the largest-|p_i| as the Householder anchor axis for stability.
+        let mut anchor = 0usize;
+        let mut amax = -1.0_f64;
+        for i in 0..m {
+            let a = p[i].abs();
+            if a > amax {
+                amax = a;
+                anchor = i;
+            }
+        }
+        // Reflect e_anchor onto sign(p_anchor) * p so 1 + <e_anchor, ...>·sign
+        // stays bounded away from zero (avoids the antipodal degeneracy).
+        let sign = if p[anchor] >= 0.0 { 1.0 } else { -1.0 };
+        // u = p - sign * e_anchor (then renormalize).
+        let mut u = Array1::<f64>::zeros(m);
+        for i in 0..m {
+            u[i] = sign * p[i];
+        }
+        u[anchor] -= 1.0;
+        let mut u_n2 = 0.0_f64;
+        for i in 0..m {
+            u_n2 += u[i] * u[i];
+        }
+        // If u is essentially zero, p ≈ sign·e_anchor exactly; the natural
+        // tangent basis is just the other axes.
+        let mut basis = Array2::<f64>::zeros((m, self.n));
+        if u_n2 < 1.0e-30 {
+            let mut col = 0usize;
+            for i in 0..m {
+                if i == anchor {
+                    continue;
+                }
+                basis[[i, col]] = 1.0;
+                col += 1;
+            }
+            return basis;
+        }
+        let inv_un = 1.0 / u_n2.sqrt();
+        for i in 0..m {
+            u[i] *= inv_un;
+        }
+        // Columns of basis are H · e_j for j ≠ anchor, where H = I - 2 u u^T.
+        // H · e_j = e_j - 2 u_j u.
+        let mut col = 0usize;
+        for j in 0..m {
+            if j == anchor {
+                continue;
+            }
+            let coef = 2.0 * u[j];
+            for i in 0..m {
+                basis[[i, col]] = -coef * u[i];
+            }
+            basis[[j, col]] += 1.0;
+            col += 1;
+        }
+        basis
+    }
+    fn warn_at_typed(&self, p: ArrayView1<f64>) -> Option<ManifoldWarning> {
         // Advisory only: if the last coordinate is very small the canonical
         // chart near the equator/pole is ill-conditioned.
         if let Some(last) = p.iter().last() {
             if last.abs() < SPHERE_POLE_WARN_THRESHOLD {
-                return Some("sphere: near chart pole, retraction may amplify error");
+                return Some(ManifoldWarning::SphereNearPole);
             }
         }
         None
@@ -461,12 +592,20 @@ impl Manifold for Interval {
         // 1-d open submanifold of ℝ; tangent space is all of ℝ.
     }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
-        // Smooth clamp using a tanh-style retraction:
-        //   R_p(ξ) = clamp_band(p + ξ).
-        // Geometrically this is the projective retraction onto the open
-        // interval — first-order accurate, and the band keeps the implicit
-        // tanh Jacobian bounded near the boundary.
+        // Closed-constraint retraction (proposal §7.2):
+        //   R_p(ξ) = clamp(p + ξ, lo+ε, hi−ε).
+        // The clip lives in the *ambient* (= internal) coordinate before any
+        // tanh chart would be applied, so the implicit chart Jacobian
+        // J = r·(1 - tanh(z)^2) stays bounded throughout the optimizer
+        // (this matches proposal §15 numerical-pitfalls discussion).
+        debug_assert_eq!(p.len(), 1);
+        debug_assert_eq!(xi.len(), 1);
+        debug_assert_eq!(out.len(), 1);
         out[0] = self.clip(p[0] + xi[0]);
+        debug_assert!(
+            out[0] > self.lo && out[0] < self.hi,
+            "Interval::retract output left feasible band"
+        );
     }
     fn vector_transport(
         &self,
@@ -485,13 +624,20 @@ impl Manifold for Interval {
         // Open submanifold of ℝ: no second fundamental form correction in
         // the natural chart used here.
     }
-    fn warn_at(&self, p: ArrayView1<f64>) -> Option<&'static str> {
+    fn warn_at_typed(&self, p: ArrayView1<f64>) -> Option<ManifoldWarning> {
         let band = (self.hi - self.lo).abs() * Self::EDGE_FRAC * 10.0;
         if p[0] < self.lo + band || p[0] > self.hi - band {
-            Some("interval: near boundary; trust radius should be clipped")
+            Some(ManifoldWarning::IntervalNearBoundary)
         } else {
             None
         }
+    }
+    /// Closed-form trivial 1×1 identity basis (proposal §7: T_p M = ℝ in
+    /// the interior). Override avoids the generic O(m³) Gram-Schmidt path.
+    fn tangent_basis(&self, _p: ArrayView1<f64>) -> Array2<f64> {
+        let mut q = Array2::<f64>::zeros((1, 1));
+        q[[0, 0]] = 1.0;
+        q
     }
     fn name(&self) -> &str {
         "Interval"
@@ -526,12 +672,22 @@ impl Manifold for Torus {
         }
     }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
+        // Blockwise S¹ retraction (proposal §9.2):
+        //   R_p(ξ)_j = (p_j + ξ_j)/||p_j + ξ_j||.
+        // Per-axis factoring keeps the cost O(d) instead of touching cross
+        // terms (which the curvature correction also avoids).
         for k in 0..self.d {
             let x = p[2 * k] + xi[2 * k];
             let y = p[2 * k + 1] + xi[2 * k + 1];
-            let norm = (x * x + y * y).sqrt().max(1.0e-300);
+            let s2 = x * x + y * y;
+            debug_assert!(s2.is_finite() && s2 > 0.0, "Torus::retract degenerate at axis {}", k);
+            let norm = s2.sqrt().max(1.0e-300);
             out[2 * k] = x / norm;
             out[2 * k + 1] = y / norm;
+            if cfg!(debug_assertions) {
+                let n2 = out[2 * k] * out[2 * k] + out[2 * k + 1] * out[2 * k + 1];
+                debug_assert!((n2 - 1.0).abs() < 1.0e-9);
+            }
         }
     }
     fn vector_transport(
@@ -549,13 +705,31 @@ impl Manifold for Torus {
         mut ehess_vp: ArrayViewMut1<f64>,
         xi: ArrayView1<f64>,
     ) {
-        // Block-diagonal sphere Weingarten on each S¹ factor.
+        // Blockwise S¹ Weingarten on each circle factor (proposal §9.7 / §18):
+        //   W_p(ξ, v)_j = <p_j, v_j> ξ_j.
+        // The projection P_p is itself block-diagonal so the *full* product
+        // structure here is per-axis; we never need to mix cross-axis entries
+        // of the ambient Hessian for the curvature correction (only ∇²_E·ξ
+        // — supplied by the caller — may legitimately have cross-axis
+        // entries, and we keep them through the projection step).
         for k in 0..self.d {
             let radial = egrad[2 * k] * p[2 * k] + egrad[2 * k + 1] * p[2 * k + 1];
             ehess_vp[2 * k] -= radial * xi[2 * k];
             ehess_vp[2 * k + 1] -= radial * xi[2 * k + 1];
         }
         self.project_tangent(p, ehess_vp);
+    }
+    /// Closed-form block-diagonal basis (proposal §11):
+    ///   Q = blockdiag(Q_1, ..., Q_d) with Q_j = [-p_{j,y}, p_{j,x}]ᵀ.
+    /// O(d) vs default O(m³) where m = 2d.
+    fn tangent_basis(&self, p: ArrayView1<f64>) -> Array2<f64> {
+        debug_assert_eq!(p.len(), 2 * self.d);
+        let mut q = Array2::<f64>::zeros((2 * self.d, self.d));
+        for k in 0..self.d {
+            q[[2 * k, k]] = -p[2 * k + 1];
+            q[[2 * k + 1, k]] = p[2 * k];
+        }
+        q
     }
     fn name(&self) -> &str {
         "Torus"
