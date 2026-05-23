@@ -18,7 +18,7 @@ use ndarray::Array2;
 
 use crate::basis::{DuchonNullspaceOrder, MaternNu, RadialScalarKind};
 use crate::estimate::EstimationError;
-use crate::solver::reml::DirectionalHyperParam;
+use crate::estimate::reml::DirectionalHyperParam;
 use crate::terms::latent_coord::LatentCoordValues;
 use crate::terms::smooth::TermCollectionDesign;
 
