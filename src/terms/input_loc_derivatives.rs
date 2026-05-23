@@ -487,9 +487,30 @@ pub fn periodic_radial_input_loc_grad_1d(
         )));
     }
     let kind = kernel.into_scalar_kind();
+    // Branch-cut guard: at raw ≡ (m + 1/2)·period the wrapped signed
+    // displacement is at the boundary between +period/2 and −period/2 and
+    // the derivative of `wrap(raw)` w.r.t. `t` has a one-sided
+    // discontinuity. There is no well-defined two-sided derivative; the
+    // chord distance also achieves its maximum here, so any kernel that
+    // is not C² at that distance would give different left/right limits.
+    // We surface this rather than silently pick a side.
+    let half = period * 0.5;
+    let branch_eps = period * f64::EPSILON * 8.0;
     for n in 0..n_obs {
         for k in 0..n_centers {
             let raw = t[n] - centers[k];
+            // Reduce `raw` into the principal branch (−half, +half] and
+            // check distance to the branch cut at exactly +half (and its
+            // periodic image −half).
+            let mut reduced = raw % period;
+            if reduced > half {
+                reduced -= period;
+            } else if reduced <= -half {
+                reduced += period;
+            }
+            if (reduced.abs() - half).abs() <= branch_eps {
+                return Err(BasisError::PeriodicWrapBranchCut { raw, period });
+            }
             let signed = wrap_signed_displacement(raw, period);
             let r = signed.abs();
             let (_, q, _) = kind.eval_design_triplet(r)?;

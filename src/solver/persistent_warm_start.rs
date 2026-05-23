@@ -401,6 +401,17 @@ pub enum LatentIftOutcome {
 /// per row. Both sources can be omitted (`None`) — at least one must be
 /// supplied for the predictor to do useful work.
 ///
+/// # Damping invariant
+///
+/// The IFT formula inverts the *undamped* inner Hessian `H_tt^(i)` — the LM
+/// ridge `ρ_t·I` is part of the Newton damping, not the implicit-function
+/// theorem derivation. The cache produced by
+/// [`crate::solver::arrow_schur::solve_arrow_newton_step`] stores both the
+/// damped Newton factor and the undamped IFT factor; this predictor
+/// dispatches into `predict_delta_t_from_delta_*` which select the latter.
+/// Callers MUST NOT hand-construct an `ArrowFactorCache` that leaves
+/// `htt_factors_undamped` empty — both arrays must be populated.
+///
 /// The result is meant to be applied to the existing
 /// [`crate::terms::latent_coord::LatentCoordValues`] block via
 /// `retract_flat_delta(Δt)` before the next inner Newton

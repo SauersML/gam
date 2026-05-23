@@ -152,6 +152,28 @@ pub enum BasisError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    #[error(
+        "Radial basis derivative is undefined at center collision (r = 0) for {kernel} \
+         with dim = {dim}, m = {m}: {message}. The first/second derivative of the \
+         underlying φ(r) does not have a finite limit as r → 0+, so the design-row \
+         gradient and Hessian have no well-defined value at coincident points."
+    )]
+    DegenerateAtCollision {
+        kernel: &'static str,
+        dim: usize,
+        m: f64,
+        message: &'static str,
+    },
+
+    #[error(
+        "Periodic radial basis derivative is undefined at the wrap branch cut \
+         (signed displacement = ±period/2) for raw delta = {raw}, period = {period}: \
+         the wrapped displacement jumps between ±period/2 and the first derivative \
+         w.r.t. the input has a one-sided discontinuity. Move the evaluation point \
+         off the branch cut or define a one-sided convention."
+    )]
+    PeriodicWrapBranchCut { raw: f64, period: f64 },
+
     #[error("{0}")]
     Other(String),
 }
@@ -3655,6 +3677,51 @@ impl RadialScalarKind {
     ///
     /// Re-pointing the existing ψ-derivative machinery at the first kernel
     /// argument t (see `crate::terms::input_loc_derivatives`).
+    ///
+    /// Returns `true` iff both `q = φ'(r)/r` and `t = (φ''(r) − q)/r²` have
+    /// finite limits as `r → 0+` for this kernel. When this returns `false`
+    /// the design-row gradient/Hessian at a center collision (`r = 0`) is not
+    /// defined by a single finite value; callers must either move off the
+    /// collision or surface a `BasisError::DegenerateAtCollision`.
+    ///
+    /// Smoothness criteria used here (matching the analytic limits derived
+    /// in this file and the comments on `eval_design_triplet`):
+    ///   - Matérn ν = 1/2: `q = -s·E/r → -∞`, not smooth.
+    ///   - Matérn ν = 3/2: `q` finite but `t = s³E/r → ∞`, not smooth.
+    ///   - Matérn ν = 5/2: both finite, smooth.
+    ///   - Duchon hybrid (`Duchon`): finite via the hybrid PFD identity;
+    ///     the radial-jets routine produces a finite limit, so smooth.
+    ///   - PureDuchon (raw polyharmonic block, exponent α = 2m − d):
+    ///       non-log case and α ≥ 4 ⇒ both `q` and `t` vanish (smooth);
+    ///       log case at any α, or α < 4 ⇒ at least one derivative diverges.
+    ///   - ThinPlate dim = 1: φ = r³, `q = 3r → 0`, but `t = 3/r → ∞`. The
+    ///     1-D Hessian formula `q·δ + t·s·s` at r = 0 has the only diagonal
+    ///     entry contracted by `s_a = 0`, but the bare scalar limit is still
+    ///     not finite, so we report it as non-smooth and let callers in 1-D
+    ///     (where `s_a` literally vanishes) opt in by handling the error.
+    ///     Dim 2 (log r), Dim 3 (-r) both diverge.
+    #[inline]
+    pub(crate) fn is_smooth_at_collision(&self) -> bool {
+        match self {
+            RadialScalarKind::Matern { nu, .. } => matches!(nu, MaternNu::FiveHalves),
+            RadialScalarKind::Duchon { .. } => true,
+            RadialScalarKind::PureDuchon {
+                p_order,
+                s_order,
+                dim,
+                ..
+            } => {
+                let alpha = duchon_scaling_exponent(*p_order, *s_order, *dim);
+                let is_log = (*dim) % 2 == 0 && {
+                    let half = (alpha / 2.0).round();
+                    half >= 0.0 && (half * 2.0 - alpha).abs() < 1e-12
+                };
+                !is_log && alpha >= 4.0
+            }
+            RadialScalarKind::ThinPlate { .. } => false,
+        }
+    }
+
     pub(crate) fn eval_design_triplet(&self, r: f64) -> Result<(f64, f64, f64), BasisError> {
         match self {
             RadialScalarKind::Matern { length_scale, nu } => {
@@ -3677,7 +3744,21 @@ impl RadialScalarKind {
             } => {
                 let phi = polyharmonic_kernel(r, (*block_order) as f64, *dim);
                 if r < 1e-14 {
-                    // Collision: q, t diverge but s_a = 0 ⇒ q·s_a, t·s_a vanish.
+                    // Collision: q = φ'/r and t = (φ'' − q)/r² generally
+                    // diverge here. Only the non-log, α = 2m − d ≥ 4 case
+                    // gives finite limits (both 0). Otherwise the design
+                    // gradient/Hessian at r = 0 is undefined: surface a
+                    // `DegenerateAtCollision` so callers can detect it.
+                    if !self.is_smooth_at_collision() {
+                        return Err(BasisError::DegenerateAtCollision {
+                            kernel: "PureDuchon (polyharmonic)",
+                            dim: *dim,
+                            m: *block_order as f64,
+                            message: "raw polyharmonic block φ(r) = c r^α (log r) is \
+                                      not C² at r = 0 for α = 2m − d < 4 or for log \
+                                      cases; first/second radial derivatives diverge",
+                        });
+                    }
                     return Ok((phi, 0.0, 0.0));
                 }
                 let (q, t, _, _) =
@@ -3685,12 +3766,24 @@ impl RadialScalarKind {
                 Ok((phi, q, t))
             }
             RadialScalarKind::ThinPlate { length_scale, dim } => {
-                // At collision r=0 the operator's `s_0 = r²` is itself zero,
-                // so q and t are multiplied by zero and never observed; we
-                // still need a finite phi (= 0 for the standard TPS kernels).
+                // At r = 0 the analytic limits of q = φ'(r)/r and
+                // t = (φ''(r) − q)/r² depend strongly on dim:
+                //   dim = 1 (φ = r³):  q = 3r → 0, but t = 3/r → ∞.
+                //   dim = 2 (φ = r² log r): q = 2 log r + 1 → −∞.
+                //   dim = 3 (φ = −r):  q = −1/r → −∞.
+                // None of these has a finite (q, t) pair at the collision
+                // (and for dim ∈ {2, 3} the gradient direction is itself
+                // ill-defined). Surface the degeneracy rather than emit
+                // silent zeros that would smuggle a wrong gradient through
+                // the chain rule.
                 if r < 1e-14 {
-                    let (phi, _, _) = thin_plate_kernel_triplet_from_scaled_distance(0.0, *dim)?;
-                    return Ok((phi, 0.0, 0.0));
+                    return Err(BasisError::DegenerateAtCollision {
+                        kernel: "ThinPlate",
+                        dim: *dim,
+                        m: thin_plate_penalty_order(*dim) as f64,
+                        message: "thin-plate radial derivative φ'(r)/r or \
+                                  (φ''(r) − q)/r² diverges as r → 0 for this dim",
+                    });
                 }
                 let scaled_r = r / *length_scale;
                 let (phi, phi_kernel_first, phi_kernel_second) =
@@ -4197,7 +4290,21 @@ impl LatentCoordDesignDerivative {
         }
         let r = r2.sqrt();
         if r == 0.0 {
-            return Ok(0.0);
+            // At a center collision the axis component s_axis = (t − c)_axis
+            // is exactly zero. The product q · s_axis is therefore 0 for any
+            // kernel whose q has a finite limit; for kernels where q diverges
+            // the value is genuinely indeterminate (0 · ∞) and we must not
+            // pretend it is zero. Defer to the kernel's classification.
+            if self.radial_kind.is_smooth_at_collision() {
+                return Ok(0.0);
+            }
+            return Err(BasisError::DegenerateAtCollision {
+                kernel: "RadialScalarKind (design axis)",
+                dim: self.latent.latent_dim(),
+                m: 0.0,
+                message: "radial scalar q = φ'/r has no finite limit at r = 0; \
+                          the design row axis component is undefined",
+            });
         }
         let (_, q, _) = self.radial_kind.eval_design_triplet(r)?;
         Ok(q * (t_row[axis] - self.centers[[center, axis]]))
@@ -8539,8 +8646,17 @@ fn matern_aniso_extended_radial_scalars(
             let e = (-a).exp();
             let phi = e;
             if r < 1e-14 {
-                // Collision: q diverges but s_a = 0 ⇒ products vanish.
-                return Ok((phi, 0.0, 0.0, 0.0, 0.0));
+                // Collision: φ(r) = exp(−s r) has a cusp at r = 0, so
+                // q = φ'/r = −s exp(−s r)/r diverges to −∞. There is no
+                // finite limit; surface a `DegenerateAtCollision` rather
+                // than emit silent zero gradients/Hessians.
+                return Err(BasisError::DegenerateAtCollision {
+                    kernel: "Matérn ν = 1/2",
+                    dim: 0,
+                    m: 0.5,
+                    message: "exponential kernel φ(r) = exp(−s r) is not \
+                              differentiable at r = 0 (cusp); q = φ'/r → −∞",
+                });
             }
             let q = -s * e / r;
             let phi_rr = s * s * e;

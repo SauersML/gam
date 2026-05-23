@@ -110,6 +110,68 @@ pub trait Manifold: Send + Sync {
     fn warn_at(&self, _p: ArrayView1<f64>) -> Option<&'static str> {
         None
     }
+
+    /// Orthonormal basis `Q ∈ ℝ^{m × d}` for the tangent space `T_p M`,
+    /// where `m = ambient_dim()` and `d = dim()`.
+    ///
+    /// Default implementation: project each ambient basis vector `e_j` onto
+    /// `T_p M` and orthonormalize the resulting `m × m` matrix via modified
+    /// Gram-Schmidt, keeping the first `dim()` columns whose norm exceeds a
+    /// numerical tolerance. This is generic and correct for every shipped
+    /// manifold; concrete manifolds can override with a closed-form basis if
+    /// it is cheaper (the default is `O(m² · dim) ≤ O(m³)`).
+    ///
+    /// For [`Euclidean`] (`m = d`) the returned matrix is the identity, so
+    /// solving in the tangent basis is bit-equivalent to solving in the
+    /// ambient space.
+    fn tangent_basis(&self, p: ArrayView1<f64>) -> Array2<f64> {
+        let m = self.ambient_dim();
+        let d = self.dim();
+        // Project each ambient basis vector onto T_p M.
+        let mut cols: Vec<Array1<f64>> = Vec::with_capacity(m);
+        for j in 0..m {
+            let mut e = Array1::<f64>::zeros(m);
+            e[j] = 1.0;
+            self.project_tangent(p, e.view_mut());
+            cols.push(e);
+        }
+        // Modified Gram–Schmidt; keep up to `d` orthonormal columns.
+        let tol = 1.0e-12;
+        let mut basis: Vec<Array1<f64>> = Vec::with_capacity(d);
+        for mut v in cols.into_iter() {
+            if basis.len() == d {
+                break;
+            }
+            for q in basis.iter() {
+                let mut dot = 0.0_f64;
+                for i in 0..m {
+                    dot += v[i] * q[i];
+                }
+                for i in 0..m {
+                    v[i] -= dot * q[i];
+                }
+            }
+            let mut nrm2 = 0.0_f64;
+            for i in 0..m {
+                nrm2 += v[i] * v[i];
+            }
+            let nrm = nrm2.sqrt();
+            if nrm > tol {
+                for i in 0..m {
+                    v[i] /= nrm;
+                }
+                basis.push(v);
+            }
+        }
+        let cols_kept = basis.len();
+        let mut q = Array2::<f64>::zeros((m, cols_kept));
+        for (j, col) in basis.into_iter().enumerate() {
+            for i in 0..m {
+                q[[i, j]] = col[i];
+            }
+        }
+        q
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -646,20 +708,83 @@ pub fn riemannian_newton_step_on_point(
             hess_r[[j, i]] = s;
         }
     }
-    // Add tangent-projected ridge.
-    if step.ridge > 0.0 {
-        for i in 0..m {
-            hess_r[[i, i]] += step.ridge;
+    // Build an orthonormal tangent basis Q ∈ ℝ^{m × d_t} and reduce the
+    // solve to the d_t-dimensional tangent space.
+    //
+    // The ambient Riemannian Hessian H_R is structurally singular in the
+    // (m - d_t) normal directions. Adding Tikhonov `λ I_m` to H_R damps
+    // tangent and normal directions equally, leaving the tangent direction
+    // artificially damped (even when `step.ridge == 0`) because the
+    // adaptive `solve_symmetric_tikhonov` must bump `λ` until the
+    // rank-d_t matrix becomes PD.
+    //
+    // Instead form the d_t × d_t reduced Hessian `Q^T H_R Q` and gradient
+    // `Q^T grad_R`, solve there, and lift back via `ξ = Q η`. For
+    // [`Euclidean`] (`d_t == m` with `Q = I`), this is bit-equivalent to
+    // the previous full-space solve.
+    let q = manifold.tangent_basis(point);
+    let dt = q.ncols();
+    let mut xi = if dt == 0 {
+        Array1::<f64>::zeros(m)
+    } else {
+        // h_red = Q^T H_R Q  (d_t × d_t).
+        let mut h_red = Array2::<f64>::zeros((dt, dt));
+        for a in 0..dt {
+            for b in 0..dt {
+                let mut acc = 0.0_f64;
+                for i in 0..m {
+                    let qi_a = q[[i, a]];
+                    if qi_a == 0.0 {
+                        continue;
+                    }
+                    let mut inner = 0.0_f64;
+                    for j in 0..m {
+                        inner += hess_r[[i, j]] * q[[j, b]];
+                    }
+                    acc += qi_a * inner;
+                }
+                h_red[[a, b]] = acc;
+            }
         }
-    }
+        // Symmetrize for hygiene.
+        for a in 0..dt {
+            for b in (a + 1)..dt {
+                let s = 0.5 * (h_red[[a, b]] + h_red[[b, a]]);
+                h_red[[a, b]] = s;
+                h_red[[b, a]] = s;
+            }
+        }
+        // g_red = Q^T grad_R.
+        let mut g_red = Array1::<f64>::zeros(dt);
+        for a in 0..dt {
+            let mut acc = 0.0_f64;
+            for i in 0..m {
+                acc += q[[i, a]] * grad_r[i];
+            }
+            g_red[a] = acc;
+        }
+        // Apply `step.ridge` on the tangent diagonal so it scales the
+        // tangent direction rather than the irrelevant normal directions.
+        if step.ridge > 0.0 {
+            for a in 0..dt {
+                h_red[[a, a]] += step.ridge;
+            }
+        }
+        let eta = solve_symmetric_tikhonov(&h_red, &g_red);
+        // Lift back: ξ = Q η.
+        let mut xi_full = Array1::<f64>::zeros(m);
+        for i in 0..m {
+            let mut acc = 0.0_f64;
+            for a in 0..dt {
+                acc += q[[i, a]] * eta[a];
+            }
+            xi_full[i] = acc;
+        }
+        xi_full
+    };
 
-    // Solve H_R ξ = -grad_R via a small Tikhonov-damped normal-equation
-    // fallback. We do a tiny LDLᵀ-style pivoted solve via a regularised
-    // Gauss-Newton: ξ = -(H_R + λ I)⁻¹ grad_R with adaptive λ. For non-SPD
-    // H_R we add ridge until it is PD.
-    let mut xi = solve_symmetric_tikhonov(&hess_r, &grad_r);
-
-    // Re-project ξ to the tangent space (the solve is in ambient coords).
+    // Re-project ξ to the tangent space (defensive — Q's columns lie in
+    // T_p M to numerical precision, but small drift can accumulate).
     manifold.project_tangent(point, xi.view_mut());
 
     // Trust-region clip: ‖ξ‖_g ≤ Δ (use the induced metric).
