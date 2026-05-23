@@ -18,15 +18,15 @@
 //! what the arrow Schur elimination in `solver/arrow_schur.rs` consumes.
 
 use crate::estimate::EstimationError;
-use crate::linalg::low_rank_weight::LowRankWeight;
 use ndarray::{Array1, Array2, ArrayView2};
 
 /// Per-output noise model for a vector response.
 ///
-/// `LowRank` hands off to Piece 5's [`LowRankWeight`] machinery; the inner
-/// `factor` is the `U` in the symmetric structured form `W = diag(diag) + U Uᵀ`.
-/// Storage here is owned (`Array1` / `Array2`); the caller acquires the
-/// borrowed `LowRankWeight<'_>` view through [`VectorNoise::as_low_rank_weight`].
+/// `LowRank` stores the symmetric structured precision
+/// `W = diag(diag) + U Uᵀ`, with `factor` holding `U`. The vector likelihood
+/// consumes the owned arrays directly; PIRLS low-rank Gram assembly is handled
+/// by `crate::linalg::low_rank_weight::LowRankWeight` and
+/// `crate::solver::pirls`.
 #[derive(Clone, Debug)]
 pub enum VectorNoise {
     /// Shared σ across all M outputs: Σ = σ² I_M.
@@ -34,32 +34,10 @@ pub enum VectorNoise {
     /// Per-output σ_m: Σ = diag(σ_m²).
     Diagonal(Array1<f64>),
     /// Symmetric structured form `W = diag(diag) + factor · factorᵀ`.
-    ///
-    /// Borrowed as a [`LowRankWeight`] via [`VectorNoise::as_low_rank_weight`].
     LowRank {
         diag: Array1<f64>,
         factor: Array2<f64>,
     },
-}
-
-impl VectorNoise {
-    /// Borrow a `LowRank` variant as Piece 5's [`LowRankWeight`] (symmetric:
-    /// `U == V`). Returns `None` for the diagonal / isotropic variants. The
-    /// returned view borrows the owned arrays inside `self`, so the caller
-    /// must keep `self` alive for the lifetime of the borrow.
-    ///
-    /// INTEGRATION-HOOK(piece-5): this is the canonical wire from
-    /// `VectorResponseTarget` into the structured weight kernel used by
-    /// `add_low_rank_xtwx_correction` / `xtw_y`.
-    pub fn as_low_rank_weight(&self) -> Option<Result<LowRankWeight<'_>, EstimationError>> {
-        match self {
-            Self::LowRank { diag, factor } => Some(
-                LowRankWeight::symmetric(diag.view(), factor.view())
-                    .map_err(EstimationError::InvalidInput),
-            ),
-            _ => None,
-        }
-    }
 }
 
 impl VectorNoise {
@@ -111,9 +89,8 @@ impl VectorNoise {
                             "VectorNoise::LowRank: diag[{j}] must be > 0 (got {d})",
                         )));
                     }
-                    // `diag` is the PRECISION diagonal (W = diag(d) + F·Fᵀ),
-                    // matching the `LowRankWeight::symmetric` contract used by
-                    // `as_low_rank_weight`. Pass it through unchanged.
+                    // `diag` is the PRECISION diagonal (W = diag(d) + F·Fᵀ).
+                    // Pass it through unchanged.
                     out[j] = d;
                 }
                 Ok(out)
@@ -347,20 +324,8 @@ impl VectorLikelihood for GaussianVectorLikelihood {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Piece 5 / Piece 1 integration hooks
+// Piece 5 / Piece 1 row-block support
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Re-export of Piece 5's structured weight type. Callers driving the
-/// behavioral-metric weighted Gauss-Newton step (`XᵀWr`, `XᵀWX`) consume
-/// `VectorNoise::as_low_rank_weight(&noise)` to acquire a borrowed view of
-/// this type backed by the owned arrays inside `VectorResponseTarget`.
-///
-/// INTEGRATION-HOOK(piece-5): the canonical wire is
-/// `vector_noise.as_low_rank_weight()` → `LowRankWeight::add_low_rank_xtwx_correction`
-/// / `LowRankWeight::xtw_y`, which together assemble
-/// `XᵀWX = XᵀDX + (XᵀU)(XᵀU)ᵀ` and `Xᵀ W r = XᵀDr + (XᵀU)(Uᵀ r)` without ever
-/// materialising the N×N weight.
-pub use crate::linalg::low_rank_weight::LowRankWeight as VectorWeight;
 
 /// Per-row Hessian block consumed by the arrow Schur elimination in
 /// `solver/arrow_schur.rs`.
