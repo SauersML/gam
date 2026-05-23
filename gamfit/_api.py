@@ -775,10 +775,9 @@ def fit(
         dedicated kwarg wins over the same key in ``config``.
     latents:
         Mapping from formula symbol to :class:`gamfit.LatentCoord`. This is
-        the standard fit API surface for per-row latent coordinates; the Rust
-        standard-workflow integration currently rejects the config with a
-        precise TODO until the full `evaluate_unified_with_psi_ext` route is
-        enabled.
+        the standard fit API surface for per-row latent coordinates. The Rust
+        standard workflow maps the named formula smooth onto the latent
+        coordinate matrix and optimizes it jointly with the REML parameters.
 
     Returns
     -------

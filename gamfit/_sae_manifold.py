@@ -58,6 +58,9 @@ def sae_manifold_fit(
     sparsity_strength: float | Literal["auto"] = "auto",
     smoothness: float | Literal["auto"] = "auto",
     *,
+    assignment_prior: Literal["softmax", "ibp_map"] = "softmax",
+    alpha: float | Literal["auto"] = "auto",
+    tau: float = 0.5,
     max_iter: int = 12,
     learning_rate: float = 0.05,
     random_state: int = 0,
@@ -74,6 +77,10 @@ def sae_manifold_fit(
     z = _as_2d_float(Z, "Z")
     if z.shape[0] == 0 or z.shape[1] == 0:
         raise ValueError("sae_manifold_fit requires a non-empty (N, p) matrix")
+    if assignment_prior not in {"softmax", "ibp_map"}:
+        raise ValueError("assignment_prior must be 'softmax' or 'ibp_map'")
+    if not np.isfinite(tau) or tau <= 0.0:
+        raise ValueError("tau must be finite and positive")
 
     candidates = [int(n_atoms)] if n_atoms != "auto" else [1, 2, 4, 8, 16, 32]
     fits: list[SaeManifoldFitResult] = []
@@ -88,6 +95,9 @@ def sae_manifold_fit(
             atom_dim,
             sparsity_strength,
             smoothness,
+            assignment_prior,
+            alpha,
+            tau,
             max_iter=max_iter,
             learning_rate=learning_rate,
             random_state=random_state + 1009 * k,
@@ -114,12 +124,15 @@ def _fit_fixed_k(
     atom_dim: int | Sequence[int] | Literal["auto"] | None,
     sparsity_strength: float | Literal["auto"],
     smoothness: float | Literal["auto"],
+    assignment_prior: Literal["softmax", "ibp_map"],
+    alpha: float | Literal["auto"],
+    tau: float,
     *,
     max_iter: int,
     learning_rate: float,
     random_state: int,
 ) -> SaeManifoldFitResult:
-    if sparsity_strength == "auto":
+    if sparsity_strength == "auto" and assignment_prior == "softmax":
         lambda_grid = [0.1, 1.0, 10.0]
         fits = [
             _fit_fixed_k(
@@ -129,6 +142,9 @@ def _fit_fixed_k(
                 atom_dim,
                 lam,
                 smoothness,
+                assignment_prior,
+                alpha,
+                tau,
                 max_iter=max_iter,
                 learning_rate=learning_rate,
                 random_state=random_state + idx * 7919,
@@ -136,6 +152,35 @@ def _fit_fixed_k(
             for idx, lam in enumerate(lambda_grid)
         ]
         labels = [f"lambda_sparse={lam:g}" for lam in lambda_grid]
+        comparison = compare_models(
+            [{"reml_score": f.reml_score, "edf": _edf_proxy(f)} for f in fits],
+            names=labels,
+        )
+        winner = labels.index(comparison["winner"])
+        chosen = fits[winner]
+        chosen.comparison = comparison
+        return chosen
+
+    if assignment_prior == "ibp_map" and alpha == "auto":
+        alpha_grid = [0.25, 0.5, 1.0, 2.0]
+        fits = [
+            _fit_fixed_k(
+                z,
+                k_atoms,
+                atom_basis,
+                atom_dim,
+                sparsity_strength,
+                smoothness,
+                assignment_prior,
+                candidate_alpha,
+                tau,
+                max_iter=max_iter,
+                learning_rate=learning_rate,
+                random_state=random_state + idx * 3571,
+            )
+            for idx, candidate_alpha in enumerate(alpha_grid)
+        ]
+        labels = [f"alpha={candidate_alpha:g}" for candidate_alpha in alpha_grid]
         comparison = compare_models(
             [{"reml_score": f.reml_score, "edf": _edf_proxy(f)} for f in fits],
             names=labels,
@@ -160,13 +205,16 @@ def _fit_fixed_k(
     lambda_smooth = 1.0 if smoothness == "auto" else float(smoothness)
     if lambda_sparse <= 0.0 or lambda_smooth <= 0.0:
         raise ValueError("sparsity_strength and smoothness must be positive or 'auto'")
+    alpha_value = 1.0 if alpha == "auto" else float(alpha)
+    if not np.isfinite(alpha_value) or alpha_value <= 0.0:
+        raise ValueError("alpha must be positive, finite, or 'auto'")
 
     last_payload: dict[str, Any] | None = None
     last_designs: list[np.ndarray] = []
-    last_assignments = _softmax(logits)
+    last_assignments = _assignment_from_logits(logits, assignment_prior, tau)
 
     for _ in range(int(max_iter)):
-        assignments = _softmax(logits)
+        assignments = _assignment_from_logits(logits, assignment_prior, tau)
         designs: list[np.ndarray] = []
         jets: list[np.ndarray] = []
         penalties: list[np.ndarray] = []
@@ -190,9 +238,11 @@ def _fit_fixed_k(
         grad_a = np.zeros_like(assignments)
         for atom in range(k_atoms):
             grad_a[:, atom] = -np.einsum("np,np->n", residual, decoded[atom])
-        grad_logits = _softmax_jvp(assignments, grad_a)
-        entropy_grad = _entropy_grad_logits(assignments) * lambda_sparse
-        logits -= learning_rate * (grad_logits + entropy_grad)
+        grad_logits = _assignment_jvp(assignments, grad_a, assignment_prior, tau)
+        prior_grad = _assignment_prior_grad_logits(
+            assignments, assignment_prior, lambda_sparse, alpha_value, tau
+        )
+        logits -= learning_rate * (grad_logits + prior_grad)
 
         for atom in range(k_atoms):
             d = dims[atom]
@@ -224,7 +274,9 @@ def _fit_fixed_k(
         decoded = last_designs[atom] @ decoder_blocks[atom]
         fitted += last_assignments[:, [atom]] * decoded
     score = float(last_payload["reml_score"])
-    score -= _entropy_value(last_assignments) * lambda_sparse
+    score -= _assignment_prior_value(
+        last_assignments, assignment_prior, lambda_sparse, alpha_value
+    )
     score -= _ard_value(coords, log_ard)
 
     # Fixed-K runs get a single-candidate comparison object; auto-K replaces
@@ -428,26 +480,85 @@ def _rbf_gram(centers: np.ndarray, power: int) -> np.ndarray:
     return gram @ gram.T + np.eye(gram.shape[0]) * 1e-6
 
 
-def _softmax(logits: np.ndarray) -> np.ndarray:
-    shifted = logits - logits.max(axis=1, keepdims=True)
+def _assignment_from_logits(
+    logits: np.ndarray, assignment_prior: Literal["softmax", "ibp_map"], tau: float
+) -> np.ndarray:
+    if assignment_prior == "softmax":
+        return _softmax(logits, tau)
+    return _sigmoid(logits / tau)
+
+
+def _softmax(logits: np.ndarray, tau: float) -> np.ndarray:
+    scaled = logits / tau
+    shifted = scaled - scaled.max(axis=1, keepdims=True)
     ex = np.exp(shifted)
     return ex / ex.sum(axis=1, keepdims=True)
 
 
-def _softmax_jvp(assignments: np.ndarray, grad_a: np.ndarray) -> np.ndarray:
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    out = np.empty_like(x, dtype=float)
+    pos = x >= 0.0
+    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
+    ex = np.exp(x[~pos])
+    out[~pos] = ex / (1.0 + ex)
+    return out
+
+
+def _assignment_jvp(
+    assignments: np.ndarray,
+    grad_a: np.ndarray,
+    assignment_prior: Literal["softmax", "ibp_map"],
+    tau: float,
+) -> np.ndarray:
+    if assignment_prior == "softmax":
+        return _softmax_jvp(assignments, grad_a, tau)
+    return grad_a * assignments * (1.0 - assignments) / tau
+
+
+def _softmax_jvp(assignments: np.ndarray, grad_a: np.ndarray, tau: float) -> np.ndarray:
     mean = np.sum(assignments * grad_a, axis=1, keepdims=True)
-    return assignments * (grad_a - mean)
+    return assignments * (grad_a - mean) / tau
 
 
-def _entropy_value(assignments: np.ndarray) -> float:
-    a = np.clip(assignments, 1e-300, 1.0)
-    return float(np.sum(-a * np.log(a)))
+def _assignment_prior_value(
+    assignments: np.ndarray,
+    assignment_prior: Literal["softmax", "ibp_map"],
+    lambda_sparse: float,
+    alpha: float,
+) -> float:
+    if assignment_prior == "softmax":
+        a = np.clip(assignments, 1e-300, 1.0)
+        return float(lambda_sparse * np.sum(-a * np.log(a)))
+    pi = _ibp_pi_map(assignments, alpha)
+    z = np.clip(assignments, 1e-12, 1.0 - 1e-12)
+    p = np.clip(pi, 1e-12, 1.0 - 1e-12)
+    nll = -np.sum(z * np.log(p)[None, :] + (1.0 - z) * np.log(1.0 - p)[None, :])
+    nll += np.sum((alpha / assignments.shape[1] - 1.0) * np.log(p))
+    return float(nll)
 
 
-def _entropy_grad_logits(assignments: np.ndarray) -> np.ndarray:
-    d_h_da = -(np.log(np.clip(assignments, 1e-300, 1.0)) + 1.0)
-    mean = np.sum(assignments * d_h_da, axis=1, keepdims=True)
-    return assignments * (d_h_da - mean)
+def _assignment_prior_grad_logits(
+    assignments: np.ndarray,
+    assignment_prior: Literal["softmax", "ibp_map"],
+    lambda_sparse: float,
+    alpha: float,
+    tau: float,
+) -> np.ndarray:
+    if assignment_prior == "softmax":
+        d_h_da = -lambda_sparse * (np.log(np.clip(assignments, 1e-300, 1.0)) + 1.0)
+        mean = np.sum(assignments * d_h_da, axis=1, keepdims=True)
+        return assignments * (d_h_da - mean) / tau
+    pi = np.clip(_ibp_pi_map(assignments, alpha), 1e-12, 1.0 - 1e-12)
+    d_p_d_z = np.log((1.0 - pi) / pi)[None, :]
+    return d_p_d_z * assignments * (1.0 - assignments) / tau
+
+
+def _ibp_pi_map(assignments: np.ndarray, alpha: float) -> np.ndarray:
+    n, k = assignments.shape
+    a = alpha / k
+    denom = max(float(n) + a - 1.0, 1e-9)
+    raw = (assignments.sum(axis=0) + a - 1.0) / denom
+    return np.clip(raw, 1e-9, 1.0 - 1e-9)
 
 
 def _ard_value(coords: list[np.ndarray], log_ard: list[np.ndarray]) -> float:
