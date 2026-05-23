@@ -1046,6 +1046,8 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
             ndarray::Zip::from(&mut chunk_out)
                 .and(x_chunk.rows())
                 .and(xm_chunk.rows())
+                // clamp tiny-negative fp drift on diag(X M Xᵀ) when M is a
+                // PSD covariance/precision matrix; not a weight clip.
                 .par_for_each(|o, xr, xmr| *o = xr.dot(&xmr).max(0.0));
             start = end;
         }
@@ -1370,6 +1372,12 @@ impl LinearOperator for DenseDesignMatrix {
     }
 
     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+        // PSD precondition: diag(XᵀWX) is computed for Fisher-scoring
+        // preconditioners; observed-Hessian sites use the signed Gram path.
+        debug_assert!(
+            weights.iter().all(|&w| w >= 0.0),
+            "DenseDesignMatrix::diag_gram requires nonneg weights; use the signed Gram routine for observed-Hessian assembly"
+        );
         match self {
             Self::Materialized(matrix) => {
                 let n = matrix.nrows();
@@ -1377,7 +1385,7 @@ impl LinearOperator for DenseDesignMatrix {
                 if (n as u64) * (p as u64) < DENSE_ROW_PARALLEL_MIN_NP {
                     let mut diag = Array1::<f64>::zeros(p);
                     for i in 0..n {
-                        let wi = weights[i].max(0.0);
+                        let wi = weights[i];
                         if wi == 0.0 {
                             continue;
                         }
@@ -1393,7 +1401,7 @@ impl LinearOperator for DenseDesignMatrix {
                     .fold(
                         || Array1::<f64>::zeros(p),
                         |mut acc, i| {
-                            let wi = weights[i].max(0.0);
+                            let wi = weights[i];
                             if wi != 0.0 {
                                 for j in 0..p {
                                     let xij = matrix[[i, j]];
@@ -1423,6 +1431,13 @@ impl LinearOperator for DenseDesignMatrix {
         penalty: Option<&Array2<f64>>,
         ridge: f64,
     ) -> Array1<f64> {
+        // PSD precondition: apply_weighted_normal is the Fisher-scoring PCG
+        // normal-equations matvec ((XᵀWX + S + ρI) v); signed observed-Hessian
+        // assembly routes through xt_diag_x_signed instead.
+        debug_assert!(
+            weights.iter().all(|&w| w >= 0.0),
+            "DenseDesignMatrix::apply_weighted_normal requires nonneg weights; observed-Hessian Newton steps must not reach this PSD kernel"
+        );
         match self {
             Self::Materialized(matrix) => {
                 let n = matrix.nrows();
@@ -1430,7 +1445,7 @@ impl LinearOperator for DenseDesignMatrix {
                 let mut out = if (n as u64) * (p as u64) < DENSE_ROW_PARALLEL_MIN_NP {
                     let mut out = Array1::<f64>::zeros(p);
                     for i in 0..n {
-                        let wi = weights[i].max(0.0);
+                        let wi = weights[i];
                         if wi == 0.0 {
                             continue;
                         }
@@ -1453,7 +1468,7 @@ impl LinearOperator for DenseDesignMatrix {
                         .fold(
                             || Array1::<f64>::zeros(p),
                             |mut acc, i| {
-                                let wi = weights[i].max(0.0);
+                                let wi = weights[i];
                                 if wi != 0.0 {
                                     let mut row_dot = 0.0_f64;
                                     for j in 0..p {
@@ -1547,10 +1562,14 @@ impl DenseDesignOperator for DenseDesignMatrix {
                             for j in 0..p {
                                 acc += m_row[j] * xc_row[j];
                             }
+                            // clamp tiny-negative fp drift on diag(X M Xᵀ)
+                            // when M is a PSD covariance/precision matrix.
                             slot[0] = acc.max(0.0);
                         });
                 } else {
                     for i in 0..n {
+                        // clamp tiny-negative fp drift on diag(X M Xᵀ)
+                        // when M is a PSD covariance/precision matrix.
                         out[i] = matrix.row(i).dot(&xc.row(i)).max(0.0);
                     }
                 }
@@ -1679,12 +1698,18 @@ impl LinearOperator for ReparamOperator {
         penalty: Option<&Array2<f64>>,
         ridge: f64,
     ) -> Array1<f64> {
+        // PSD precondition: Fisher-scoring PCG normal-equations matvec; signed
+        // observed-Hessian assembly does not reach this path.
+        debug_assert!(
+            weights.iter().all(|&w| w >= 0.0),
+            "ReparamOperator::apply_weighted_normal requires nonneg weights; observed-Hessian Newton steps must not reach this PSD kernel"
+        );
         // Qs^T X^T W X Qs v + S v + ridge v
         let qv = self.qs.dot(vector);
         let xqv = self.x_original.apply(&qv);
         let mut wxqv = xqv;
         for i in 0..wxqv.len() {
-            wxqv[i] *= weights[i].max(0.0);
+            wxqv[i] *= weights[i];
         }
         let xtw = self.x_original.apply_transpose(&wxqv);
         let mut out = fast_atv(&self.qs, &xtw);
