@@ -433,7 +433,7 @@ struct SharedData {
     weights: Arc<Array1<f64>>,
     /// MAP estimate (mode) μ [dim]
     mode: Arc<Array1<f64>>,
-    /// Fitted Gamma shape (used only for Gamma-log likelihoods).
+    /// Auxiliary log-link family parameter: Gamma shape, Tweedie power, or NB theta.
     gamma_shape: f64,
     /// Dispersion parameter φ used to scale the likelihood for families
     /// with an estimated scale (Gaussian: σ²; Gamma: 1/shape). For fixed-
@@ -3924,6 +3924,30 @@ impl LinkWigglePosterior {
                     let mu = eta_i.exp();
                     ll_acc += w_i * (y_i * eta_i - mu);
                     residual[i] = w_i * (y_i - mu);
+                }
+                ll = ll_acc;
+            }
+            NutsFamily::TweedieLog => {
+                let mut ll_acc = 0.0;
+                let p = if self.scale.is_finite() {
+                    self.scale
+                } else {
+                    1.5
+                };
+                for i in 0..self.n_samples {
+                    let eta_i = eta[i].clamp(-30.0, 30.0);
+                    let (y_i, w_i) = (self.y[i], self.weights[i]);
+                    let mu = eta_i.exp().max(1e-300);
+                    ll_acc += w_i
+                        * if (p - 1.0).abs() <= 1.0e-12 {
+                            y_i * eta_i - mu
+                        } else if (p - 2.0).abs() <= 1.0e-12 {
+                            -y_i / mu - eta_i
+                        } else {
+                            y_i * mu.powf(1.0 - p) / (1.0 - p)
+                                - mu.powf(2.0 - p) / (2.0 - p)
+                        };
+                    residual[i] = w_i * (y_i - mu) * mu.powf(1.0 - p);
                 }
                 ll = ll_acc;
             }
