@@ -39,8 +39,9 @@
 //! penalized negative log posterior. The maximizer of evidence is the
 //! minimizer of `V`. For the public API we expose **negative log
 //! evidence** under `laplace_evidence` and rank topologies by the
-//! **minimum** of that scalar (see `select_topology` below); equivalently
-//! the caller can negate and `argmax`.
+//! **minimum** of the configured per-row or per-effective-dimension
+//! normalization (see `select_topology` below); equivalently the caller can
+//! negate and `argmax`.
 
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
@@ -622,7 +623,7 @@ pub fn ift_du_drho(
 /// At an exact KKT point the value-gradient pieces are zero, but they are
 /// explicit here so the exported gradient matches the optimized objective
 /// whenever callers carry a certified nonzero residual correction.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct EvidenceIftGradientTerms<'a> {
     pub dbeta_drho: ArrayView2<'a, f64>,
     pub du_drho: ArrayView2<'a, f64>,
