@@ -3242,6 +3242,13 @@ pub struct GlmFlatInputs<'a> {
     pub mode: ArrayView1<'a, f64>,
     pub hessian: ArrayView2<'a, f64>,
     pub gamma_shape: Option<f64>,
+    /// Dispersion parameter φ used to scale the likelihood and the
+    /// whitening Cholesky. For fixed-scale families (Binomial, Poisson)
+    /// this is `Dispersion::Known(1.0)` and has no numerical effect;
+    /// for Gaussian / Gamma it carries the estimated `phi` so that the
+    /// sampler targets the φ-scaled posterior covariance `Vb = φ·H⁻¹`.
+    /// See `inference::dispersion_cov` for the ownership invariants.
+    pub dispersion: crate::solver::estimate::Dispersion,
     pub firth_bias_reduction: bool,
 }
 
