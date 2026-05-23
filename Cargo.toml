@@ -35,9 +35,6 @@ path = "src/lib.rs"
 members = ["crates/gam-pyffi"]
 resolver = "3"
 
-[features]
-ceres-backend = []
-
 [lints.rust]
 warnings = "deny"
 
