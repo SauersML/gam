@@ -53,6 +53,7 @@
 //! |-----------|-------------|----------------------|
 //! | Isometry  | ψ (latent t)| 1 (log μ_iso)        |
 //! | Sparsity  | β or ψ      | 1 (strength) [+1 ε]  |
+//! | IBP       | ψ (logits)  | 0 or 1 (log α)       |
 //! | ARD       | ψ (latent t)| d (one per axis)     |
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, Axis};

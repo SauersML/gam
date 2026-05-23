@@ -186,6 +186,42 @@ already proposed:
    the orbit at the cost of differentiability through the
    assignment. See §8 for the choice.
 
+### 3.5 IBP-MAP per-row active sets
+
+The principled sparse-assignment variant is not a speculative new prior:
+it is the finite-MAP adaptation of the Indian Buffet Process construction
+used by Infinite GPFA / IBP-GPFA in neuroscience. That literature makes the
+same diagnosis this proposal needs: ordinary ARD selects one set of factors
+for all observations, not a different active set for each observation. That
+is exactly why ARD on atom coordinates cannot by itself separate coexisting
+manifolds.
+
+The gamfit adaptation is a truncated Beta-Bernoulli IBP prior over the
+assignment logits:
+
+```
+pi_k ~ Beta(alpha / K_max, 1)
+z_ik | pi_k ~ Bernoulli(pi_k)
+z_ik = sigmoid(logit_ik / tau)
+```
+
+For REML/MAP there is no sampling step: the concrete relaxation is
+deterministic, and the analytic penalty is the negative log prior
+
+```
+-Σ_i Σ_k [z_ik log pi_k + (1 - z_ik) log(1 - pi_k)]
+  + (alpha / K_max - 1) Σ_k log pi_k.
+```
+
+This replaces the finite-K softmax entropy penalty when the caller requests
+`assignment_prior="ibp_map"`. Softmax gives every row a nonzero weight on
+every atom because it lives on the simplex. IBP-MAP gives each row an
+independent binary-ish active set, so multiple atoms can coexist when needed
+and disappear for rows where they are irrelevant. In the audit-revised gauge
+language, IBP is also a gauge-fixing prior: it breaks per-row atom-index
+interchangeability by making the active set itself part of the prior
+structure.
+
 ## 4. Why the existing engine already covers this
 
 The composition is mechanical:
