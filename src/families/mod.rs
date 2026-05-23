@@ -22,6 +22,5 @@ pub mod transformation_normal;
 pub mod vector_response;
 
 pub use vector_response::{
-    GaussianVectorLikelihood, PerRowHessianBlock, VectorLikelihood, VectorNoise,
-    VectorResponseTarget, per_row_hessian_blocks,
+    GaussianVectorLikelihood, VectorLikelihood, VectorNoise, VectorResponseTarget,
 };
