@@ -10,8 +10,8 @@
 //!
 //! * beta: [`SaeManifoldAtom::decoder_coefficients`] (`B_k`, one block per atom).
 //! * ext-coords: [`SaeAssignment`] (`logits -> a_ik` and per-atom
-//!   `LatentCoordValues`). Per-row latent coordinates are written `t`; reserve
-//!   `ψ` for existing kernel-shape state such as `SpatialLogKappaCoords`.
+//!   `LatentCoordValues`). Per-row latent coordinates are written `t`; existing
+//!   kernel-shape state remains with carriers such as `SpatialLogKappaCoords`.
 //! * rho: [`SaeManifoldRho`] (`lambda_sparse`, `lambda_smooth`, `alpha_kj`) plus
 //!   the discrete `K` selected by the Python `compare_models` wrapper.
 //!

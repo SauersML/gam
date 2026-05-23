@@ -99,10 +99,9 @@ fn alo_eta_updatewith_offset(
     z: f64,
     offset: f64,
     x_hinv_x: f64,
-    hessian_weight: f64,
     score_weight: f64,
+    denom: f64,
 ) -> f64 {
-    let denom = 1.0 - hessian_weight * x_hinv_x;
     // PIRLS working-response algebra is centered on offset, so the scalar
     // score uses (eta - offset) - (z - offset).
     let eta_centered = eta_hat - offset;
@@ -134,6 +133,7 @@ const LEVERAGE_HIGH_THRESHOLD: f64 = 0.99;
 const LEVERAGE_VERY_HIGH_THRESHOLD: f64 = 0.999;
 const LEVERAGE_RATE_THRESHOLDS: [f64; 3] = [0.90, 0.95, 0.99];
 const LEVERAGE_PERCENTILES: [f64; 3] = [0.50, 0.95, 0.99];
+const ALO_DENOMINATOR_MIN: f64 = 1e-12;
 const MULTIBLOCK_ALO_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 #[inline]
@@ -599,11 +599,11 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
         .into_par_iter()
         .map(|i| {
             let denom_raw = 1.0 - aii[i];
-            if denom_raw <= 0.0 || !denom_raw.is_finite() {
+            if denom_raw <= ALO_DENOMINATOR_MIN || !denom_raw.is_finite() {
                 return Err(AloError::LooComputationFailed {
                     reason: format!(
-                        "ALO denominator is non-positive at row {i}: a_ii={:.6e}, 1-a_ii={:.6e}",
-                        aii[i], denom_raw
+                        "ALO denominator is too small at row {i}: a_ii={:.6e}, 1-a_ii={:.6e}, min={:.1e}",
+                        aii[i], denom_raw, ALO_DENOMINATOR_MIN
                     ),
                 });
             }
@@ -612,8 +612,8 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
                 z[i],
                 offset[i],
                 x_hinv_x_diag[i],
-                w_h[i],
                 w_s[i],
+                denom_raw,
             );
             if !v.is_finite() {
                 return Err(AloError::LooComputationFailed {
@@ -1501,9 +1501,16 @@ mod tests {
         let score_weight = 1.0;
         // centered: eta~=off + ((eta-off)-a(z-off))/(1-a) when W_S = W_H.
         let leverage = hessian_weight * x_hinv_x;
-        let expected = offset + ((eta_hat - offset) - leverage * (z - offset)) / (1.0 - leverage);
-        let got =
-            alo_eta_updatewith_offset(eta_hat, z, offset, x_hinv_x, hessian_weight, score_weight);
+        let expected =
+            offset + ((eta_hat - offset) - leverage * (z - offset)) / (1.0 - leverage);
+        let got = alo_eta_updatewith_offset(
+            eta_hat,
+            z,
+            offset,
+            x_hinv_x,
+            score_weight,
+            1.0 - leverage,
+        );
         assert!((got - expected).abs() < 1e-12);
     }
 
@@ -1516,8 +1523,14 @@ mod tests {
         let score_weight = 1.0;
         let leverage = hessian_weight * x_hinv_x;
         let expected = (eta_hat - leverage * z) / (1.0 - leverage);
-        let got =
-            alo_eta_updatewith_offset(eta_hat, z, 0.0, x_hinv_x, hessian_weight, score_weight);
+        let got = alo_eta_updatewith_offset(
+            eta_hat,
+            z,
+            0.0,
+            x_hinv_x,
+            score_weight,
+            1.0 - leverage,
+        );
         assert!((got - expected).abs() < 1e-12);
     }
 
@@ -1533,8 +1546,14 @@ mod tests {
             + (eta_hat - offset)
             + x_hinv_x * score_weight * ((eta_hat - offset) - (z - offset))
                 / (1.0 - hessian_weight * x_hinv_x);
-        let got =
-            alo_eta_updatewith_offset(eta_hat, z, offset, x_hinv_x, hessian_weight, score_weight);
+        let got = alo_eta_updatewith_offset(
+            eta_hat,
+            z,
+            offset,
+            x_hinv_x,
+            score_weight,
+            1.0 - hessian_weight * x_hinv_x,
+        );
         assert!((got - expected).abs() < 1e-12);
     }
 
@@ -1549,8 +1568,14 @@ mod tests {
         let expected = offset
             + (eta_hat - offset)
             + x_hinv_x * score_weight * ((eta_hat - offset) - (z - offset));
-        let got =
-            alo_eta_updatewith_offset(eta_hat, z, offset, x_hinv_x, hessian_weight, score_weight);
+        let got = alo_eta_updatewith_offset(
+            eta_hat,
+            z,
+            offset,
+            x_hinv_x,
+            score_weight,
+            1.0 - hessian_weight * x_hinv_x,
+        );
         assert!((got - expected).abs() < 1e-12);
     }
 
