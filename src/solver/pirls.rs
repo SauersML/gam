@@ -8486,6 +8486,18 @@ fn sanitize_tweedie_p(p: f64) -> f64 {
 }
 
 #[inline]
+fn tweedie_log_weight_mu_power(mu: f64, p: f64) -> f64 {
+    if tweedie_p_is_gamma(p) {
+        1.0
+    } else {
+        // Match the 1e-300 MIN_DEVIANCE floor used by the REML deviance path:
+        // smaller positive mu values are below a non-degenerate f64 likelihood
+        // contribution, but flooring here keeps mu^(2-p) away from underflow.
+        mu.max(1.0e-300).powf(2.0 - p)
+    }
+}
+
+#[inline]
 fn valid_negbin_theta(theta: f64) -> bool {
     theta.is_finite() && theta > 0.0
 }
@@ -8615,7 +8627,11 @@ fn write_tweedie_log_working_state(
                     let eta_i = eta_raw.clamp(-700.0, 700.0);
                     let mu_i = eta_i.exp().max(MIN_MU);
                     *mu_o = mu_i;
-                    let raw_weight = priorweights[i].max(0.0) * mu_i.powf(exponent) / phi;
+                    // `mu_i` is already floored like Poisson/Gamma for the log-link
+                    // working response; the helper adds the deeper deviance-scale
+                    // floor needed specifically by the Tweedie fractional power.
+                    let raw_weight =
+                        priorweights[i].max(0.0) * tweedie_log_weight_mu_power(mu_i, p) / phi;
                     let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
                     *w_o = if raw_weight > 0.0 {
                         raw_weight.max(MIN_WEIGHT)
@@ -8647,7 +8663,11 @@ fn write_tweedie_log_working_state(
                 let eta_i = eta[i].clamp(-700.0, 700.0);
                 let mu_i = eta_i.exp().max(MIN_MU);
                 *mu_o = mu_i;
-                let raw_weight = priorweights[i].max(0.0) * mu_i.powf(exponent) / phi;
+                // `mu_i` is already floored like Poisson/Gamma for the log-link
+                // working response; the helper adds the deeper deviance-scale
+                // floor needed specifically by the Tweedie fractional power.
+                let raw_weight =
+                    priorweights[i].max(0.0) * tweedie_log_weight_mu_power(mu_i, p) / phi;
                 *w_o = if raw_weight > 0.0 {
                     raw_weight.max(MIN_WEIGHT)
                 } else {
@@ -9437,8 +9457,9 @@ fn computeworkingweight_derivatives_from_eta(
                     |(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| -> Result<(), EstimationError> {
                         let eta_used = eta[i].clamp(-700.0, 700.0);
                         let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                        let raw_weight =
-                            priorweights[i].max(0.0) * jet.mu.powf(exponent) / phi;
+                        let raw_weight = priorweights[i].max(0.0)
+                            * tweedie_log_weight_mu_power(jet.mu, p)
+                            / phi;
                         let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
                         if eta[i] != eta_used || floor_active {
                             *c_o = 0.0;

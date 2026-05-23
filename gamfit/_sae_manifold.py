@@ -14,7 +14,7 @@ Arrow-Schur row-block assembly for the same configuration.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 import numpy as np
 
@@ -63,6 +63,7 @@ def sae_manifold_fit(
     alpha: float | Literal["auto"] = "auto",
     learnable_alpha: bool = False,
     tau: float = 0.5,
+    gumbel_schedule: Mapping[str, Any] | None = None,
     max_iter: int = 12,
     learning_rate: float = 0.05,
     random_state: int = 0,
@@ -77,7 +78,9 @@ def sae_manifold_fit(
     ``"softmax"`` by default; ``"ibp_map"`` uses deterministic concrete
     Beta-Bernoulli active indicators with ``alpha="auto"`` evidence-ranked
     over a small truncation-prior grid. ``learnable_alpha`` mirrors the Rust
-    ``IBPAssignmentPenalty`` effective-alpha convention.
+    ``IBPAssignmentPenalty`` effective-alpha convention. ``gumbel_schedule``
+    accepts dictionaries such as ``{"kind": "geometric", "tau_start": 1.0,
+    "tau_min": 1e-3, "rate": 0.95}`` and advances once per outer iteration.
     """
 
     z = _as_2d_float(Z, "Z")
@@ -89,6 +92,8 @@ def sae_manifold_fit(
         raise ValueError("learnable_alpha only applies to assignment_prior='ibp_map'")
     if not np.isfinite(tau) or tau <= 0.0:
         raise ValueError("tau must be finite and positive")
+    schedule = _normalize_gumbel_schedule(gumbel_schedule)
+    tau_initial = tau if schedule is None else float(schedule["tau_start"])
 
     candidates = [int(n_atoms)] if n_atoms != "auto" else [1, 2, 4, 8, 16, 32]
     fits: list[SaeManifoldFitResult] = []
@@ -106,7 +111,8 @@ def sae_manifold_fit(
             assignment_prior,
             alpha,
             learnable_alpha,
-            tau,
+            tau_initial,
+            schedule,
             max_iter=max_iter,
             learning_rate=learning_rate,
             random_state=random_state + 1009 * k,
@@ -137,6 +143,7 @@ def _fit_fixed_k(
     alpha: float | Literal["auto"],
     learnable_alpha: bool,
     tau: float,
+    gumbel_schedule: dict[str, Any] | None,
     *,
     max_iter: int,
     learning_rate: float,
@@ -156,6 +163,7 @@ def _fit_fixed_k(
                 alpha,
                 learnable_alpha,
                 tau,
+                gumbel_schedule,
                 max_iter=max_iter,
                 learning_rate=learning_rate,
                 random_state=random_state + idx * 7919,
@@ -186,6 +194,7 @@ def _fit_fixed_k(
                 candidate_alpha,
                 learnable_alpha,
                 tau,
+                gumbel_schedule,
                 max_iter=max_iter,
                 learning_rate=learning_rate,
                 random_state=random_state + idx * 3571,
@@ -235,6 +244,7 @@ def _fit_fixed_k(
                 tau,
                 logits,
                 coords,
+                gumbel_schedule,
                 max_iter=max_iter,
                 learning_rate=learning_rate,
             )
@@ -249,10 +259,13 @@ def _fit_fixed_k(
 
     last_payload: dict[str, Any] | None = None
     last_designs: list[np.ndarray] = []
-    last_assignments = _assignment_from_logits(logits, assignment_prior, tau)
+    last_assignments = _assignment_from_logits(
+        logits, assignment_prior, _gumbel_tau_at(gumbel_schedule, 0, tau)
+    )
 
-    for _ in range(int(max_iter)):
-        assignments = _assignment_from_logits(logits, assignment_prior, tau)
+    for iter_idx in range(int(max_iter)):
+        tau_iter = _gumbel_tau_at(gumbel_schedule, iter_idx, tau)
+        assignments = _assignment_from_logits(logits, assignment_prior, tau_iter)
         designs: list[np.ndarray] = []
         jets: list[np.ndarray] = []
         penalties: list[np.ndarray] = []
@@ -276,9 +289,9 @@ def _fit_fixed_k(
         grad_a = np.zeros_like(assignments)
         for atom in range(k_atoms):
             grad_a[:, atom] = -np.einsum("np,np->n", residual, decoded[atom])
-        grad_logits = _assignment_jvp(assignments, grad_a, assignment_prior, tau)
+        grad_logits = _assignment_jvp(assignments, grad_a, assignment_prior, tau_iter)
         prior_grad = _assignment_prior_grad_logits(
-            assignments, assignment_prior, lambda_sparse, effective_alpha, tau
+            assignments, assignment_prior, lambda_sparse, effective_alpha, tau_iter
         )
         logits -= learning_rate * (grad_logits + prior_grad)
 
@@ -357,6 +370,7 @@ def _fit_fixed_k_ibp_rust(
     tau: float,
     logits: np.ndarray,
     coords: Sequence[np.ndarray],
+    gumbel_schedule: dict[str, Any] | None,
     *,
     max_iter: int,
     learning_rate: float,
@@ -406,6 +420,7 @@ def _fit_fixed_k_ibp_rust(
         float(lambda_smooth),
         int(max_iter),
         float(learning_rate),
+        gumbel_schedule=gumbel_schedule,
     )
 
     assignments = np.asarray(payload["assignments_z"], dtype=float)
@@ -625,6 +640,65 @@ def _rbf_gram(centers: np.ndarray, power: int) -> np.ndarray:
     else:
         gram = r ** power
     return gram @ gram.T + np.eye(gram.shape[0]) * 1e-6
+
+
+def _normalize_gumbel_schedule(schedule: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if schedule is None:
+        return None
+    if not isinstance(schedule, Mapping):
+        raise ValueError("gumbel_schedule must be a mapping or None")
+    kind = str(_require_schedule_key(schedule, "kind")).lower().replace("-", "_")
+    tau_start = float(_require_schedule_key(schedule, "tau_start"))
+    tau_min = float(_require_schedule_key(schedule, "tau_min"))
+    if not np.isfinite(tau_start) or tau_start <= 0.0:
+        raise ValueError("gumbel_schedule['tau_start'] must be finite and positive")
+    if not np.isfinite(tau_min) or tau_min <= 0.0:
+        raise ValueError("gumbel_schedule['tau_min'] must be finite and positive")
+    if tau_min > tau_start:
+        raise ValueError("gumbel_schedule['tau_min'] cannot exceed tau_start")
+    out: dict[str, Any] = {"kind": kind, "tau_start": tau_start, "tau_min": tau_min}
+    if kind == "geometric":
+        rate = float(_require_schedule_key(schedule, "rate"))
+        if not np.isfinite(rate) or rate <= 0.0 or rate >= 1.0:
+            raise ValueError("gumbel_schedule['rate'] must be in (0, 1)")
+        out["rate"] = rate
+    elif kind == "linear":
+        steps = int(_require_schedule_key(schedule, "steps"))
+        if steps <= 0:
+            raise ValueError("gumbel_schedule['steps'] must be positive")
+        out["steps"] = steps
+    elif kind in {"reciprocal_iter", "reciprocal"}:
+        out["kind"] = "reciprocal_iter"
+    else:
+        raise ValueError(
+            "gumbel_schedule['kind'] must be 'geometric', 'linear', or 'reciprocal_iter'"
+        )
+    return out
+
+
+def _require_schedule_key(schedule: Mapping[str, Any], key: str) -> Any:
+    if key not in schedule:
+        raise ValueError(f"gumbel_schedule is missing required key {key!r}")
+    return schedule[key]
+
+
+def _gumbel_tau_at(schedule: dict[str, Any] | None, iter_idx: int, tau: float) -> float:
+    if schedule is None:
+        return tau
+    kind = schedule["kind"]
+    tau_start = float(schedule["tau_start"])
+    tau_min = float(schedule["tau_min"])
+    if kind == "geometric":
+        raw = tau_start * (float(schedule["rate"]) ** iter_idx)
+    elif kind == "linear":
+        steps = int(schedule["steps"])
+        if iter_idx >= steps:
+            raw = tau_min
+        else:
+            raw = tau_start + (iter_idx / steps) * (tau_min - tau_start)
+    else:
+        raw = tau_start / (1.0 + iter_idx)
+    return max(tau_min, raw)
 
 
 def _assignment_from_logits(
