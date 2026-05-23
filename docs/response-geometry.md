@@ -11,7 +11,7 @@ Supported geometries:
 
 | `response_geometry` | Response space | Tangent coordinates |
 | --- | --- | --- |
-| `"spherical"` | unit sphere | ambient tangent coordinates at the Karcher/Fréchet mean |
+| `"spherical"` | unit sphere | geodesic log-map at the Karcher/Fréchet mean (lives in the ambient tangent plane; norm equals geodesic distance) |
 | `"simplex"` / `"clr"` | strictly positive simplex | centered log-ratio |
 | `"alr"` | strictly positive simplex | additive log-ratio |
 

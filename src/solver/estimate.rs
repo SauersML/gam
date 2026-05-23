@@ -4192,7 +4192,6 @@ pub struct UnifiedFitResult {
     /// (the prior fit's converged ρ was loaded from disk), gradient-free
     /// solver, or a degenerate early-exit path where no outer ran.
     /// `outer_converged` is the authoritative convergence signal.
-    #[serde(default)]
     pub outer_gradient_norm: Option<f64>,
     /// Residual scale on the response scale.
     ///

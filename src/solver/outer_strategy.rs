@@ -4946,11 +4946,9 @@ pub struct OuterResult {
 impl OuterResult {
     /// Display helper. `None` (cache-hit short-circuit, gradient-free
     /// compass search) renders as "n/a" so logs distinguish "not measured"
-    /// from a literal zero gradient. For *storage*, consumers should
-    /// `.final_grad_norm.unwrap_or(0.0)` directly — there is no truthful
-    /// scalar fallback, so 0.0 is the codebase-wide "no measurement at
-    /// this termination" sentinel (paired with `outer_converged` as the
-    /// authoritative convergence signal).
+    /// from a literal zero gradient. Storage paths carry `final_grad_norm`
+    /// through as `Option<f64>` directly; `outer_converged` is the
+    /// authoritative convergence signal.
     pub fn final_grad_norm_report(&self) -> String {
         self.final_grad_norm
             .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3e}"))
