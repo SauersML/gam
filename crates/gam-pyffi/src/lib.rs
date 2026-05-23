@@ -50,10 +50,18 @@ use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
     SpatialIdentifiability, SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec,
     auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile, build_duchon_basis,
+<<<<<<< HEAD
     build_duchon_basis_mixed_periodicity_auto, build_duchon_operator_penalty_matrices,
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
     create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
     create_periodic_bspline_basis_dense, create_periodic_bspline_derivative_dense,
+=======
+    build_duchon_basis_mixed_periodicity_auto,
+    build_duchon_operator_penalty_matrices, build_spherical_spline_basis,
+    build_thin_plate_penalty_matrix, create_basis, create_difference_penalty_matrix,
+    create_cyclic_difference_penalty_matrix, create_periodic_bspline_basis_dense,
+    create_periodic_bspline_derivative_dense, resolve_duchon_orders,
+>>>>>>> 76caaafa (gam-pyffi: add Duchon hybrid kwargs to Python bindings)
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction};
@@ -664,13 +672,24 @@ fn bspline_basis_derivative<'py>(
 /// periodic axis, the multi-D mixed-periodicity radial polyharmonic builder
 /// is used (cylinder/torus chord distance); per-axis periods are auto-derived
 /// from the centers' span along each periodic axis.
-#[pyfunction(signature = (points, centers, m = 2, periodic_per_axis = None))]
+#[pyfunction(signature = (
+    points,
+    centers,
+    m = 2,
+    periodic_per_axis = None,
+    length_scale = None,
+    nullspace_order = None,
+    power = None,
+))]
 fn duchon_basis<'py>(
     py: Python<'py>,
     points: PyReadonlyArray2<'py, f64>,
     centers: PyReadonlyArray2<'py, f64>,
     m: usize,
     periodic_per_axis: Option<Vec<bool>>,
+    length_scale: Option<f64>,
+    nullspace_order: Option<&str>,
+    power: Option<f64>,
 ) -> PyResult<Py<PyArray2<f64>>> {
     if m == 0 {
         return Err(py_value_error("Duchon m must be at least 1".to_string()));
@@ -694,14 +713,27 @@ fn duchon_basis<'py>(
         )));
     }
     let any_periodic = periodic_flags.iter().any(|&b| b);
+    // Preserve the pre-change default path bit-for-bit when no hybrid /
+    // explicit-order keyword is supplied: `length_scale=None`,
+    // `power=0.0`, and `nullspace_order = duchon_nullspace_from_m(m)`.
+    // When any of the three new keywords is set, route through the
+    // shared hybrid resolver (matches the formula API).
+    let hybrid_requested =
+        length_scale.is_some() || nullspace_order.is_some() || power.is_some();
+    let (spec_length_scale, spec_nullspace, spec_power) = if hybrid_requested {
+        let cfg = resolve_duchon_hybrid_config(d, m, length_scale, nullspace_order, power)?;
+        (cfg.length_scale, cfg.nullspace_order, cfg.power)
+    } else {
+        (None, duchon_nullspace_from_m(m), 0.0)
+    };
     // Multi-D periodic: route through the mixed-periodicity builder
     // (cylinder/torus chord-distance polyharmonic).
     if any_periodic && d > 1 {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(ctrs.to_owned()),
-            length_scale: None,
-            power: 0.0,
-            nullspace_order: duchon_nullspace_from_m(m),
+            length_scale: spec_length_scale,
+            power: spec_power,
+            nullspace_order: spec_nullspace,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: Default::default(),
@@ -713,9 +745,9 @@ fn duchon_basis<'py>(
     }
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::UserProvided(ctrs.to_owned()),
-        length_scale: None,
-        power: 0.0,
-        nullspace_order: duchon_nullspace_from_m(m),
+        length_scale: spec_length_scale,
+        power: spec_power,
+        nullspace_order: spec_nullspace,
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
         operator_penalties: Default::default(),
@@ -831,7 +863,16 @@ fn duchon_operator_penalties<'py>(
     ))
 }
 
-#[pyfunction(signature = (centers, m = 2, periodic = false, period = None, periodic_per_axis = None))]
+#[pyfunction(signature = (
+    centers,
+    m = 2,
+    periodic = false,
+    period = None,
+    periodic_per_axis = None,
+    length_scale = None,
+    nullspace_order = None,
+    power = None,
+))]
 fn duchon_function_norm_penalty<'py>(
     py: Python<'py>,
     centers: &Bound<'py, PyAny>,
@@ -839,6 +880,9 @@ fn duchon_function_norm_penalty<'py>(
     periodic: bool,
     period: Option<f64>,
     periodic_per_axis: Option<Vec<bool>>,
+    length_scale: Option<f64>,
+    nullspace_order: Option<&str>,
+    power: Option<f64>,
 ) -> PyResult<Py<PyArray2<f64>>> {
     if m == 0 {
         return Err(py_value_error("Duchon m must be at least 1".to_string()));
@@ -893,14 +937,25 @@ fn duchon_function_norm_penalty<'py>(
             "duchon scalar `period` is only valid for d=1 (multi-D periodic axes auto-derive period from centers)".to_string(),
         ));
     }
+    // Preserve the pre-change default path bit-for-bit when no hybrid /
+    // explicit-order keyword is supplied. When any of the three new
+    // keywords is set, route through the shared hybrid resolver.
+    let hybrid_requested =
+        length_scale.is_some() || nullspace_order.is_some() || power.is_some();
+    let (spec_length_scale, spec_nullspace, spec_power) = if hybrid_requested {
+        let cfg = resolve_duchon_hybrid_config(d, m, length_scale, nullspace_order, power)?;
+        (cfg.length_scale, cfg.nullspace_order, cfg.power)
+    } else {
+        (None, duchon_nullspace_from_m(m), 0.0)
+    };
     // Multi-D periodic: route through the mixed-periodicity builder
     // (cylinder/torus chord-distance polyharmonic).
     if any_periodic && d > 1 {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
-            length_scale: None,
-            power: 0.0,
-            nullspace_order: duchon_nullspace_from_m(m),
+            length_scale: spec_length_scale,
+            power: spec_power,
+            nullspace_order: spec_nullspace,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: Default::default(),
@@ -930,9 +985,9 @@ fn duchon_function_norm_penalty<'py>(
     }
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
-        length_scale: None,
-        power: 0.0,
-        nullspace_order: duchon_nullspace_from_m(m),
+        length_scale: spec_length_scale,
+        power: spec_power,
+        nullspace_order: spec_nullspace,
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
         operator_penalties: Default::default(),
@@ -8541,6 +8596,77 @@ fn duchon_nullspace_from_m(m: usize) -> DuchonNullspaceOrder {
         2 => DuchonNullspaceOrder::Linear,
         other => DuchonNullspaceOrder::Degree(other - 1),
     }
+}
+
+/// Parse the optional ``nullspace_order`` keyword on the primitive Duchon
+/// bindings. ``None`` falls back to the legacy default derived from ``m``
+/// (so existing call sites stay bit-identical). Accepted strings:
+/// ``"zero"`` (constant nullspace), ``"linear"`` (constant + linear),
+/// or ``"degree<k>"`` for k ≥ 2 (polynomials of total degree ≤ k).
+fn parse_nullspace_order(
+    raw: Option<&str>,
+    m: usize,
+) -> PyResult<DuchonNullspaceOrder> {
+    let Some(raw) = raw else {
+        return Ok(duchon_nullspace_from_m(m));
+    };
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "zero" => Ok(DuchonNullspaceOrder::Zero),
+        "linear" => Ok(DuchonNullspaceOrder::Linear),
+        other if other.starts_with("degree") => {
+            let suffix = other.trim_start_matches("degree").trim_start_matches('=');
+            let k: usize = suffix.parse().map_err(|_| {
+                py_value_error(format!(
+                    "invalid nullspace_order '{raw}'; expected 'zero', 'linear', or 'degree<k>' with integer k ≥ 2"
+                ))
+            })?;
+            if k < 2 {
+                return Err(py_value_error(format!(
+                    "nullspace_order 'degree{k}' must have k ≥ 2; use 'zero' or 'linear' instead"
+                )));
+            }
+            Ok(DuchonNullspaceOrder::Degree(k))
+        }
+        _ => Err(py_value_error(format!(
+            "invalid nullspace_order '{raw}'; expected 'zero', 'linear', or 'degree<k>'"
+        ))),
+    }
+}
+
+/// Resolved Duchon hybrid-mode configuration as derived from the public
+/// keyword surface (``length_scale``, ``nullspace_order``, ``power``).
+/// All three primitives share this resolver so the auto-resolution policy
+/// matches the formula path 1:1.
+struct DuchonHybridConfig {
+    length_scale: Option<f64>,
+    nullspace_order: DuchonNullspaceOrder,
+    power: f64,
+}
+
+/// Resolve the (nullspace_order, power) pair given the optional public
+/// keywords. Auto-resolution uses :func:`resolve_duchon_orders` with
+/// ``max_operator_derivative_order = 0`` because the primitive Python
+/// bindings emit the function-norm Gram (or the bare basis) only — they
+/// do not assemble the operator-triplet collocation that drives the
+/// ``max_op = 2`` path inside the formula term builder.
+fn resolve_duchon_hybrid_config(
+    dim: usize,
+    m: usize,
+    length_scale: Option<f64>,
+    nullspace_order: Option<&str>,
+    explicit_power: Option<f64>,
+) -> PyResult<DuchonHybridConfig> {
+    let requested_nullspace = parse_nullspace_order(nullspace_order, m)?;
+    let (resolved_nullspace, auto_power) =
+        resolve_duchon_orders(dim, requested_nullspace, 0, length_scale);
+    let power = explicit_power.unwrap_or(auto_power as f64);
+    Ok(DuchonHybridConfig {
+        length_scale,
+        nullspace_order: resolved_nullspace,
+        power,
+    })
 }
 
 fn column_array(values: ArrayView1<'_, f64>) -> Array2<f64> {
