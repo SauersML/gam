@@ -27,6 +27,11 @@
 //!   * [`NuclearNormPenalty`] — smoothed L¹ on singular values of a matrix
 //!     latent block. Promotes low intrinsic rank without choosing a canonical
 //!     axis basis.
+//!   * [`BlockSparsityPenalty`] — group-lasso smoothed L¹ over predefined
+//!     latent-axis blocks. Unlike per-element L¹ or per-axis L² ARD, it
+//!     shrinks whole semantic groups together; pair with
+//!     `LatentIdMode::AuxPriorDimSelection` when aux classes define the active
+//!     group subset.
 //!   * [`OrthogonalityPenalty`] — fixes the rotation gauge inside a latent
 //!     block by penalizing cross-axis correlations. Pair with ARD when
 //!     intrinsic dimension should be identifiable.
@@ -69,6 +74,7 @@
 //! | ARD       | ext-coord (latent t) | d (one per axis)     |
 //! | TV        | ext-coord (latent t) | 0 or 1 (log μ_tv)    |
 //! | NuclearNorm | ext-coord (latent t) | 0 or 1 (log μ_nuc)  |
+//! | BlockSparsity | ext-coord (latent t) | 0 or 1 (log μ_group) |
 //! | Orthogonality | ext-coord (latent t) | 0 or 1 (log μ_orth) |
 
 use faer::Side;
