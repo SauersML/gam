@@ -7279,7 +7279,7 @@ fn core_saved_fit_result(
             penalized_objective,
             outer_iterations: summary.iterations,
             outer_converged: matches!(summary.pirls_status, gam::pirls::PirlsStatus::Converged),
-            outer_gradient_norm: summary.finalgrad_norm,
+            outer_gradient_norm: Some(summary.finalgrad_norm),
             standard_deviation,
             covariance_conditional,
             covariance_corrected,
@@ -7349,7 +7349,11 @@ impl SavedFitSummary {
             log_likelihood_normalization: fit.log_likelihood_normalization,
             log_likelihood: fit.log_likelihood,
             iterations: fit.outer_iterations,
-            finalgrad_norm: fit.outer_gradient_norm,
+            // FitInfo.finalgrad_norm is a hard f64 (its own validator
+            // ensure_finite_scalar fires below); when the outer skipped
+            // gradient measurement (cache hit / gradient-free), persist 0.0
+            // and rely on `pirls_status` for convergence quality.
+            finalgrad_norm: fit.outer_gradient_norm.unwrap_or(0.0),
             pirls_status: if fit.outer_converged {
                 gam::pirls::PirlsStatus::Converged
             } else {
@@ -8779,7 +8783,7 @@ fn fit_result_from_external(ext: ExternalOptimResult) -> UnifiedFitResult {
         penalized_objective,
         outer_iterations: ext.iterations,
         outer_converged: ext.outer_converged,
-        outer_gradient_norm: ext.finalgrad_norm,
+        outer_gradient_norm: Some(ext.finalgrad_norm),
         standard_deviation: ext.standard_deviation,
         covariance_conditional,
         covariance_corrected,
@@ -9378,7 +9382,7 @@ mod tests {
         let fit = core_saved_fit_result(array![1.0], Array1::zeros(0), 1.0, None, None, summary);
 
         assert_eq!(fit.outer_iterations, 60);
-        assert_eq!(fit.outer_gradient_norm, 42.0);
+        assert_eq!(fit.outer_gradient_norm, Some(42.0));
         assert!(
             !fit.outer_converged,
             "compact saved fit must not synthesize convergence for stalled fits"
@@ -9412,7 +9416,7 @@ mod tests {
         let fit = fit_result_from_external(ext);
 
         assert_eq!(fit.outer_iterations, 17);
-        assert_eq!(fit.outer_gradient_norm, 3.0);
+        assert_eq!(fit.outer_gradient_norm, Some(3.0));
         assert!(
             !fit.outer_converged,
             "external optimizer conversion must preserve the optimizer's convergence flag"
@@ -10472,7 +10476,7 @@ mod tests {
             penalized_objective: 1.0,
             outer_iterations: 0,
             outer_converged: true,
-            outer_gradient_norm: 0.0,
+            outer_gradient_norm: None,
             standard_deviation: 1.0,
             covariance_conditional: None,
             covariance_corrected: None,
@@ -11208,7 +11212,7 @@ mod tests {
             penalized_objective: 2.25,
             outer_iterations: 2,
             outer_converged: true,
-            outer_gradient_norm: 1e-8,
+            outer_gradient_norm: Some(1e-8),
             standard_deviation: 1.0,
             covariance_conditional: None,
             covariance_corrected: None,
@@ -11283,7 +11287,7 @@ mod tests {
         let payload = serde_json::to_string(&fit).expect("serialize fit result");
         let parsed: gam::estimate::UnifiedFitResult =
             serde_json::from_str(&payload).expect("deserialize fit result");
-        assert_eq!(parsed.outer_gradient_norm, 0.25);
+        assert_eq!(parsed.outer_gradient_norm, Some(0.25));
         assert_eq!(parsed.deviance, 1.5);
         assert_eq!(parsed.reml_score, 0.95);
     }
