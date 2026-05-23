@@ -3647,9 +3647,9 @@ fn build_latent_forward_design(
             return Ok((design, t_mat, jet));
         }
         "bspline_tensor" => {
-            let knots = tensor_knots_concat.ok_or_else(|| {
+            let knots = tensor_knots_concat.as_ref().ok_or_else(|| {
                 "tensor B-spline latent design requires knots_concat".to_string()
-            })?;
+            })?.clone();
             let offsets = tensor_knot_offsets.ok_or_else(|| {
                 "tensor B-spline latent design requires knot_offsets".to_string()
             })?;
@@ -4525,9 +4525,7 @@ fn add_latent_outer_reml_score_gradient(
     design: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,
     t_mat: ArrayView2<'_, f64>,
-    centers: ArrayView2<'_, f64>,
-    m: usize,
-    basis_kind: &str,
+    jet: &Array3<f64>,
     penalty: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
     fit: &gam::gaussian_reml::GaussianRemlMultiResult,
@@ -4561,27 +4559,19 @@ fn add_latent_outer_reml_score_gradient(
     }
     let weight = gaussian_reml_weight_vector_local(n_obs, weights)?;
     let factor = latent_augmented_hessian_factor(design, penalty, weight.view(), fit.lambda)?;
-    let latent = LatentCoordValues::from_matrix(t_mat, LatentIdMode::None);
-    let phi_r = match latent_basis_kind(basis_kind)? {
-        "duchon" => duchon_radial_first_derivative_nd(
-            t_mat,
-            centers,
-            None,
-            duchon_nullspace_from_m(m),
-        )
-        .map_err(|err| err.to_string())?,
-        "matern" => matern_radial_first_derivative_nd(t_mat, centers, 1.0, MaternNu::ThreeHalves)
-            .map_err(|err| err.to_string())?,
-        other => {
-            return Err(format!(
-                "outer REML latent score gradient currently streams radial bases only; got {other:?}"
-            ));
-        }
-    };
-    let n_centers = centers.nrows().min(p);
+    if jet.shape() != [n_obs, p, latent_dim] {
+        return Err(format!(
+            "latent REML jet shape mismatch: expected {}x{}x{}, got {}x{}x{}",
+            n_obs,
+            p,
+            latent_dim,
+            jet.shape()[0],
+            jet.shape()[1],
+            jet.shape()[2],
+        ));
+    }
     let mut rhs = Array2::<f64>::zeros((p, 1));
     let mut direction = Array1::<f64>::zeros(p);
-    let mut direction_kernel = Array1::<f64>::zeros(n_centers);
     for n in 0..n_obs {
         for col in 0..p {
             rhs[[col, 0]] = design[[n, col]];
@@ -4614,23 +4604,14 @@ fn add_latent_outer_reml_score_gradient(
             }
         }
         let row_scale = scale * weight[n];
-        for k in 0..n_centers {
-            direction_kernel[k] = direction[k];
-        }
-        latent.contract_row_radial_gradient_into(
-            n,
-            direction_kernel.view(),
-            phi_r.row(n),
-            centers,
-            grad_t,
-            row_scale,
-        );
-        if p > n_centers {
-            let poly_start = n_centers;
-            let n_poly = p - poly_start;
-            let linear_cols = n_poly.saturating_sub(1).min(latent_dim);
-            for a in 0..linear_cols {
-                grad_t[n * latent_dim + a] += row_scale * direction[poly_start + 1 + a];
+        for col in 0..p {
+            let d_col = direction[col];
+            if d_col == 0.0 {
+                continue;
+            }
+            let col_scale = row_scale * d_col;
+            for a in 0..latent_dim {
+                grad_t[n * latent_dim + a] += col_scale * jet[[n, col, a]];
             }
         }
     }
@@ -5247,86 +5228,7 @@ fn gaussian_reml_fit_latent_backward<'py>(
         backward.clone()
     };
     let grad_x = &backward_for_t.grad_x;
-    let latent = LatentCoordValues::from_matrix(t_mat.view(), LatentIdMode::None);
-    let mut grad_t = match basis_kind_normalized {
-        "duchon" => {
-            // Restrict grad_x to the kernel block (first n_centers columns).
-            // The `(N,K,d)` radial jet is intentionally not materialized here;
-            // row contractions stream through `LatentCoordValues`.
-            let n_centers = centers_view.nrows();
-            let mut grad_phi_kernel = Array2::<f64>::zeros((n_obs, n_centers));
-            for n in 0..n_obs {
-                for k in 0..n_centers.min(grad_x.ncols()) {
-                    grad_phi_kernel[[n, k]] = grad_x[[n, k]];
-                }
-            }
-            let phi_r = duchon_radial_first_derivative_nd(
-                t_mat.view(),
-                centers_view,
-                None,
-                duchon_nullspace_from_m(m),
-            )
-            .map_err(|err| py_value_error(err.to_string()))?;
-            let mut out = latent.contract_gradient_radial_streaming(
-                grad_phi_kernel.view(),
-                phi_r.view(),
-                centers_view,
-            );
-            // Fixes audit-revised claim that the Duchon polynomial-nullspace
-            // tail must use the N-D monomial derivative, not the legacy
-            // linear-only shortcut.
-            if grad_x.ncols() > n_centers {
-                let poly_start = n_centers;
-                let n_poly = grad_x.ncols() - poly_start;
-                let poly_jet =
-                    duchon_polynomial_first_derivative_nd(t_mat.view(), duchon_nullspace_from_m(m));
-                let n_poly_contract = n_poly.min(poly_jet.shape()[1]);
-                for n in 0..n_obs {
-                    for poly_col in 0..n_poly_contract {
-                        let gx = grad_x[[n, poly_start + poly_col]];
-                        if gx == 0.0 {
-                            continue;
-                        }
-                        for a in 0..latent_dim {
-                            out[n * latent_dim + a] += gx * poly_jet[[n, poly_col, a]];
-                        }
-                    }
-                }
-            }
-            out
-        }
-        "bspline_tensor" => {
-            let knots = tensor_knots_concat
-                .as_ref()
-                .map(|a| a.as_array())
-                .ok_or_else(|| {
-                    py_value_error(
-                        "tensor B-spline latent backward requires knots_concat".to_string(),
-                    )
-                })?;
-            let per_axis = split_tensor_knots_owned(
-                knots,
-                tensor_knot_offsets.as_deref().ok_or_else(|| {
-                    py_value_error(
-                        "tensor B-spline latent backward requires knot_offsets".to_string(),
-                    )
-                })?,
-                latent_dim,
-            )
-            .map_err(py_value_error)?;
-            let per_axis_views = per_axis
-                .iter()
-                .map(|axis_knots| axis_knots.view())
-                .collect::<Vec<_>>();
-            let degrees = tensor_degrees.as_deref().ok_or_else(|| {
-                py_value_error("tensor B-spline latent backward requires degrees".to_string())
-            })?;
-            let jet = bspline_tensor_first_derivative(t_mat.view(), &per_axis_views, degrees)
-                .map_err(|err| py_value_error(err.to_string()))?;
-            LatentCoordValues::contract_gradient(grad_x.view(), &jet)
-        }
-        _ => unreachable!("basis_kind_normalized checked above"),
-    };
+    let mut grad_t = LatentCoordValues::contract_gradient(grad_x.view(), &jet);
     if grad_reml_score != 0.0 {
         add_latent_outer_reml_score_gradient(
             &mut grad_t,
@@ -5334,9 +5236,7 @@ fn gaussian_reml_fit_latent_backward<'py>(
             design.view(),
             y_view,
             t_mat.view(),
-            centers_view,
-            m,
-            basis_kind_normalized,
+            &jet,
             penalty_view,
             weights_view,
             &fit,
