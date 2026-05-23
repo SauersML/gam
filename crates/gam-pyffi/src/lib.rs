@@ -4729,7 +4729,7 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
     smoothness = 1.0,
     max_iter = 12,
     learning_rate = 1.0,
-    ridge_psi = 1.0e-6,
+    ridge_ext_coord = 1.0e-6,
     ridge_beta = 1.0e-6,
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -4752,7 +4752,7 @@ fn sae_manifold_fit_ibp<'py>(
     smoothness: f64,
     max_iter: usize,
     learning_rate: f64,
-    ridge_psi: f64,
+    ridge_ext_coord: f64,
     ridge_beta: f64,
 ) -> PyResult<Py<PyDict>> {
     let z_view = z.as_array();
@@ -4787,7 +4787,7 @@ fn sae_manifold_fit_ibp<'py>(
         ("sparsity_strength", sparsity_strength),
         ("smoothness", smoothness),
         ("learning_rate", learning_rate),
-        ("ridge_psi", ridge_psi),
+        ("ridge_ext_coord", ridge_ext_coord),
         ("ridge_beta", ridge_beta),
     ] {
         if !value.is_finite() || value <= 0.0 {
@@ -4900,7 +4900,7 @@ fn sae_manifold_fit_ibp<'py>(
             &rho,
             max_iter,
             learning_rate,
-            ridge_psi,
+            ridge_ext_coord,
             ridge_beta,
         )
         .map_err(py_value_error)?;

@@ -329,9 +329,9 @@ impl SaeAssignment {
         }
     }
 
-    /// Flatten ψ in row-major SAE layout:
+    /// Flatten extension coordinates in row-major SAE layout:
     /// `(logits_i[0..K], t_i0[0..d_0], ..., t_iK[0..d_K])` for every row.
-    pub fn flatten_psi(&self) -> Array1<f64> {
+    pub fn flatten_ext_coords(&self) -> Array1<f64> {
         let n = self.n_obs();
         let q = self.row_block_dim();
         let k = self.k_atoms();
@@ -563,22 +563,22 @@ impl SaeManifoldTerm {
 
     pub fn loss(
         &self,
-        z: ArrayView2<'_, f64>,
+        target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
     ) -> Result<SaeManifoldLoss, String> {
-        if z.dim() != (self.n_obs(), self.output_dim()) {
+        if target.dim() != (self.n_obs(), self.output_dim()) {
             return Err(format!(
                 "SaeManifoldTerm::loss: Z must be ({}, {}); got {:?}",
                 self.n_obs(),
                 self.output_dim(),
-                z.dim()
+                target.dim()
             ));
         }
         let fitted = self.fitted();
         let mut data_fit = 0.0_f64;
-        for row in 0..z.nrows() {
-            for out_col in 0..z.ncols() {
-                let r = z[[row, out_col]] - fitted[[row, out_col]];
+        for row in 0..target.nrows() {
+            for out_col in 0..target.ncols() {
+                let r = target[[row, out_col]] - fitted[[row, out_col]];
                 data_fit += 0.5 * r * r;
             }
         }
@@ -650,15 +650,15 @@ impl SaeManifoldTerm {
     /// Assemble the enlarged `(logits, t)` row-local Arrow-Schur system.
     pub fn assemble_arrow_schur(
         &self,
-        z: ArrayView2<'_, f64>,
+        target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
     ) -> Result<ArrowSchurSystem, String> {
-        if z.dim() != (self.n_obs(), self.output_dim()) {
+        if target.dim() != (self.n_obs(), self.output_dim()) {
             return Err(format!(
                 "SaeManifoldTerm::assemble_arrow_schur: Z must be ({}, {}); got {:?}",
                 self.n_obs(),
                 self.output_dim(),
-                z.dim()
+                target.dim()
             ));
         }
         if rho.log_ard.len() != self.k_atoms() {
@@ -712,7 +712,7 @@ impl SaeManifoldTerm {
             }
             let mut error = Array1::<f64>::zeros(p);
             for out_col in 0..p {
-                error[out_col] = fitted[out_col] - z[[row, out_col]];
+                error[out_col] = fitted[out_col] - target[[row, out_col]];
             }
 
             let mut local_jac = Array2::<f64>::zeros((q, p));
@@ -833,20 +833,20 @@ impl SaeManifoldTerm {
 
     pub fn solve_newton_step(
         &self,
-        z: ArrayView2<'_, f64>,
+        target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
-        ridge_psi: f64,
+        ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
         let sys = self
-            .assemble_arrow_schur(z, rho)
+            .assemble_arrow_schur(target, rho)
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
-        sys.solve(ridge_psi, ridge_beta)
+        sys.solve(ridge_ext_coord, ridge_beta)
     }
 
     pub fn apply_newton_step(
         &mut self,
-        delta_psi: ArrayView1<'_, f64>,
+        delta_ext_coord: ArrayView1<'_, f64>,
         delta_beta: ArrayView1<'_, f64>,
         step_size: f64,
     ) -> Result<(), String> {
@@ -857,10 +857,10 @@ impl SaeManifoldTerm {
         }
         let n = self.n_obs();
         let q = self.assignment.row_block_dim();
-        if delta_psi.len() != n * q {
+        if delta_ext_coord.len() != n * q {
             return Err(format!(
-                "SaeManifoldTerm::apply_newton_step: delta_psi length {} != expected {}",
-                delta_psi.len(),
+                "SaeManifoldTerm::apply_newton_step: delta_ext_coord length {} != expected {}",
+                delta_ext_coord.len(),
                 n * q
             ));
         }
@@ -878,7 +878,7 @@ impl SaeManifoldTerm {
             let row_base = row * q;
             for atom_idx in 0..k_atoms {
                 self.assignment.logits[[row, atom_idx]] +=
-                    step_size * delta_psi[row_base + atom_idx];
+                    step_size * delta_ext_coord[row_base + atom_idx];
             }
         }
 
@@ -888,7 +888,7 @@ impl SaeManifoldTerm {
             for row in 0..n {
                 let row_base = row * q + coord_offsets[atom_idx];
                 for axis in 0..d {
-                    delta_coord[row * d + axis] = step_size * delta_psi[row_base + axis];
+                    delta_coord[row * d + axis] = step_size * delta_ext_coord[row_base + axis];
                 }
             }
             self.assignment.coords[atom_idx].retract_flat_delta(delta_coord.view());
@@ -918,20 +918,20 @@ impl SaeManifoldTerm {
 
     pub fn run_joint_fit_arrow_schur(
         &mut self,
-        z: ArrayView2<'_, f64>,
+        target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
         max_iter: usize,
         step_size: f64,
-        ridge_psi: f64,
+        ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<SaeManifoldLoss, String> {
         for _ in 0..max_iter {
-            let (delta_psi, delta_beta) = self
-                .solve_newton_step(z, rho, ridge_psi, ridge_beta)
+            let (delta_ext_coord, delta_beta) = self
+                .solve_newton_step(target, rho, ridge_ext_coord, ridge_beta)
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
-            self.apply_newton_step(delta_psi.view(), delta_beta.view(), step_size)?;
+            self.apply_newton_step(delta_ext_coord.view(), delta_beta.view(), step_size)?;
         }
-        self.loss(z, rho)
+        self.loss(target, rho)
     }
 
     /// Build the analytic-penalty descriptors that correspond to the current
