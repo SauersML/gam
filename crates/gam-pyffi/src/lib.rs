@@ -70,9 +70,9 @@ use gam::terms::sae_manifold::{
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::terms::{
-    ARDPenalty, AnalyticPenaltyRegistry, DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty,
-    OrthogonalityPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty, SparsityPenalty,
-    TotalVariationPenalty,
+    ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DifferenceOpKind,
+    IBPAssignmentPenalty, IsometryPenalty, OrthogonalityPenalty, PenaltyTier, PsiSlice,
+    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TotalVariationPenalty,
 };
 use gam::terms::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
@@ -4626,6 +4626,28 @@ fn add_latent_outer_reml_score_gradient(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn analytic_penalty_value_for_targets(
+    registry: &AnalyticPenaltyRegistry,
+    target_t: ArrayView1<'_, f64>,
+    target_beta: Option<ArrayView1<'_, f64>>,
+) -> Result<f64, String> {
+    let rho = Array1::<f64>::zeros(registry.total_rho_count());
+    let mut value = 0.0_f64;
+    for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(registry.rho_layout()) {
+        let rho_local = rho.slice(s![rho_slice]);
+        let target = match tier {
+            PenaltyTier::Psi => target_t,
+            PenaltyTier::Beta => target_beta.ok_or_else(|| {
+                format!("analytic penalty {name:?} targets beta, but this fit has no beta target")
+            })?,
+            PenaltyTier::Rho => continue,
+        };
+        value += penalty.value(target, rho_local);
+    }
+    Ok(value)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_latent_impl(
     t_flat: ArrayView1<'_, f64>,
     y: ArrayView2<'_, f64>,
@@ -4644,6 +4666,7 @@ fn gaussian_reml_fit_latent_impl(
     aux_family: AuxPriorFamily,
     aux_strength: Option<f64>,
     dim_selection_precision: Option<ArrayView1<'_, f64>>,
+    analytic_penalties: Option<&AnalyticPenaltyRegistry>,
 ) -> Result<(
     gam::gaussian_reml::GaussianRemlMultiResult,
     Array2<f64>,
@@ -4712,6 +4735,9 @@ fn gaussian_reml_fit_latent_impl(
             latent_prior_score += 0.5 * alpha * sq - 0.5 * (n_obs as f64) * log_alpha;
         }
     }
+    if let Some(registry) = analytic_penalties {
+        latent_prior_score += analytic_penalty_value_for_targets(registry, t_flat, None)?;
+    }
     fit.reml_score += latent_prior_score;
     Ok((fit, design, aux_strength_state))
 }
@@ -4772,7 +4798,7 @@ fn gaussian_reml_fit_latent<'py>(
         None => None,
     };
     let latent_payload = serde_json::json!({"t": {"name": "t", "n": n_obs, "d": latent_dim}});
-    let _registry = build_analytic_penalty_registry_from_json(
+    let registry = build_analytic_penalty_registry_from_json(
         Some(&latent_payload),
         analytic_penalties.as_ref(),
     )
@@ -4810,6 +4836,9 @@ fn gaussian_reml_fit_latent<'py>(
                 dim_selection_log_precision.as_ref().map(|a| a.as_array()),
             )
             .map_err(py_value_error)?;
+            let analytic_score =
+                analytic_penalty_value_for_targets(&registry, t.as_array(), None)
+                    .map_err(py_value_error)?;
             return dense_fisher_gaussian_fit_to_pydict(
                 py,
                 design.view(),
@@ -4818,7 +4847,7 @@ fn gaussian_reml_fit_latent<'py>(
                 weights.as_ref().map(|w| w.as_array()),
                 fw_view,
                 init_lambda,
-                prior_score,
+                prior_score + analytic_score,
                 aux_strength_state,
             );
         }
@@ -4847,6 +4876,7 @@ fn gaussian_reml_fit_latent<'py>(
         family,
         aux_strength,
         dim_selection_log_precision.as_ref().map(|a| a.as_array()),
+        Some(&registry),
     )
     .map_err(py_value_error)?;
     let out = PyDict::new(py);
@@ -5485,6 +5515,7 @@ fn glm_reml_fit_latent_impl(
     aux_family: AuxPriorFamily,
     aux_strength: Option<f64>,
     dim_selection_precision: Option<ArrayView1<'_, f64>>,
+    analytic_penalties: Option<&AnalyticPenaltyRegistry>,
 ) -> Result<(
     gam::estimate::ExternalOptimResult,
     Array2<f64>,
@@ -5573,6 +5604,10 @@ fn glm_reml_fit_latent_impl(
             }
             latent_prior_score += 0.5 * alpha * sq - 0.5 * (n_obs as f64) * log_alpha;
         }
+    }
+    if let Some(registry) = analytic_penalties {
+        latent_prior_score +=
+            analytic_penalty_value_for_targets(registry, t_flat, Some(fit.beta.view()))?;
     }
     fit.reml_score += latent_prior_score;
     Ok((fit, design, t_mat, aux_strength_state))
@@ -5676,7 +5711,7 @@ fn glm_reml_fit_latent<'py>(
         None => None,
     };
     let latent_payload = serde_json::json!({"t": {"name": "t", "n": n_obs, "d": latent_dim}});
-    let _registry = build_analytic_penalty_registry_from_json(
+    let registry = build_analytic_penalty_registry_from_json(
         Some(&latent_payload),
         analytic_penalties.as_ref(),
     )
@@ -5706,27 +5741,30 @@ fn glm_reml_fit_latent<'py>(
             m,
         )
         .map_err(py_value_error)?;
-        let (prior_score, aux_strength_state) = latent_prior_score_and_aux_state_for_t(
-            t_mat.view(),
-            aux_u.as_ref().map(|a| a.as_array()),
+            let (prior_score, aux_strength_state) = latent_prior_score_and_aux_state_for_t(
+                t_mat.view(),
+                aux_u.as_ref().map(|a| a.as_array()),
             aux_family,
             aux_strength,
-            dim_selection_log_precision.as_ref().map(|a| a.as_array()),
-        )
-        .map_err(py_value_error)?;
-        return dense_fisher_glm_fit_to_pydict(
-            py,
-            design.view(),
+                dim_selection_log_precision.as_ref().map(|a| a.as_array()),
+            )
+            .map_err(py_value_error)?;
+            let analytic_score =
+                analytic_penalty_value_for_targets(&registry, t.as_array(), None)
+                    .map_err(py_value_error)?;
+            return dense_fisher_glm_fit_to_pydict(
+                py,
+                design.view(),
             y.as_array(),
             penalty.as_array(),
             weights.as_ref().map(|w| w.as_array()),
             fisher_w.as_ref().map(|w| w.as_array()),
-            init_lambda,
-            &family_name,
-            prior_score,
-            aux_strength_state,
-        );
-    }
+                init_lambda,
+                &family_name,
+                prior_score + analytic_score,
+                aux_strength_state,
+            );
+        }
     let family =
         latent_glm_family_from_str(&family, tweedie_p, negbin_theta, beta_phi)
             .map_err(py_value_error)?;
@@ -5751,6 +5789,7 @@ fn glm_reml_fit_latent<'py>(
         aux_family,
         aux_strength,
         dim_selection_log_precision.as_ref().map(|a| a.as_array()),
+        Some(&registry),
     )
     .map_err(py_value_error)?;
     let out = PyDict::new(py);
@@ -5775,6 +5814,9 @@ fn glm_reml_fit_latent<'py>(
     aux_family = "ridge".to_string(),
     aux_strength = None,
     dim_selection_log_precision = None,
+    tweedie_p = 1.5,
+    negbin_theta = 1.0,
+    beta_phi = 1.0,
     basis_kind = "duchon".to_string(),
 ))]
 #[allow(clippy::too_many_arguments)]
@@ -5796,9 +5838,14 @@ fn glm_reml_fit_latent_backward<'py>(
     aux_family: String,
     aux_strength: Option<f64>,
     dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
+    tweedie_p: f64,
+    negbin_theta: f64,
+    beta_phi: f64,
     basis_kind: String,
 ) -> PyResult<Py<PyDict>> {
-    let family = latent_glm_family_from_str(&family, 1.5, 1.0, 1.0).map_err(py_value_error)?;
+    let family =
+        latent_glm_family_from_str(&family, tweedie_p, negbin_theta, beta_phi)
+            .map_err(py_value_error)?;
     let aux_family = match aux_family.to_ascii_lowercase().as_str() {
         "ridge" => AuxPriorFamily::Ridge,
         "linear" => AuxPriorFamily::Linear,
@@ -5835,6 +5882,7 @@ fn glm_reml_fit_latent_backward<'py>(
         aux_family,
         aux_strength,
         dim_selection_log_precision.as_ref().map(|a| a.as_array()),
+        None,
     )
     .map_err(py_value_error)?;
     let pirls = fit.artifacts.pirls.as_ref().ok_or_else(|| {

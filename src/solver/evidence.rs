@@ -975,6 +975,7 @@ pub fn cache_matches_system(cache: &ArrowFactorCache, sys: &ArrowSchurSystem) ->
         && cache.k == sys.k
         && cache.htbeta.len() == sys.rows.len()
         && cache.htt_factors_undamped.len() == sys.rows.len()
+        && cache.manifold_mode_fingerprint == sys.manifold_mode_fingerprint
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,6 +1037,7 @@ mod tests {
             htbeta,
             d: 1,
             k: 1,
+            manifold_mode_fingerprint: 0,
         }
     }
 

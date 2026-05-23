@@ -39,7 +39,6 @@ use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
 use serde::{Deserialize, Serialize};
-use statrs::function::beta::ln_beta;
 use statrs::function::gamma::{digamma, ln_gamma};
 
 use faer::linalg::cholesky::llt::factor::LltParams;
@@ -10701,6 +10700,39 @@ fn xlogy(x: f64, y: f64) -> f64 {
 }
 
 #[inline]
+fn log_gamma_stirling_correction(x: f64) -> f64 {
+    let inv = 1.0 / x;
+    let inv2 = inv * inv;
+    inv / 12.0 - inv * inv2 / 360.0 + inv * inv2 * inv2 / 1260.0
+}
+
+#[inline]
+fn log_gamma_large_ratio(base: f64, delta: f64) -> f64 {
+    let ratio = delta / base;
+    delta * base.ln() + (base + delta - 0.5) * ratio.ln_1p() - delta
+        + log_gamma_stirling_correction(base + delta)
+        - log_gamma_stirling_correction(base)
+}
+
+#[inline]
+fn beta_log_normalizer(a: f64, b: f64, sum: f64) -> f64 {
+    let direct = ln_gamma(sum) - ln_gamma(a) - ln_gamma(b);
+    if direct.is_finite() {
+        return direct;
+    }
+    let small = a.min(b);
+    let large = a.max(b);
+    if small < 8.0 {
+        return log_gamma_large_ratio(large, small) - ln_gamma(small);
+    }
+    -xlogy(a, a / sum) - xlogy(b, b / sum)
+        + 0.5 * (a.ln() + b.ln() - sum.ln() - (2.0 * std::f64::consts::PI).ln())
+        + log_gamma_stirling_correction(sum)
+        - log_gamma_stirling_correction(a)
+        - log_gamma_stirling_correction(b)
+}
+
+#[inline]
 fn poisson_unit_deviance(yi: f64, mui_c: f64) -> f64 {
     xlogy(yi, yi / mui_c) - (yi - mui_c)
 }
@@ -10742,7 +10774,7 @@ fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
     let mui_c = safe_beta_mu(mui);
     let a = mui_c * phi;
     let b = (1.0 - mui_c) * phi;
-    -ln_beta(a, b)
+    beta_log_normalizer(a, b, phi)
         + phi * xlogy(mui_c, yi_c)
         + phi * xlogy(1.0 - mui_c, 1.0 - yi_c)
         - yi_c.ln()
