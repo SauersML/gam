@@ -18914,6 +18914,96 @@ pub fn create_duchon_basis_1d_derivative_dense(
     Ok(basis)
 }
 
+/// N-D Duchon radial first-derivative `φ'(r)` evaluated for every
+/// `(row, center)` pair.
+///
+/// Returns an `(n_rows, n_centers)` matrix whose `(n, k)` entry is the
+/// scalar radial derivative `φ'(r_{nk})` of the Duchon kernel,
+/// where `r_{nk} = ‖t_n − c_k‖_2`.
+///
+/// This is the load-bearing primitive for differentiating a Duchon design
+/// against its *first* kernel argument (i.e. per-row latent coordinates
+/// `t_n`); the full per-row gradient is reconstructed at the call site as
+/// `∂Φ_{n,k}/∂t_n = φ'(r_{n,k}) · (t_n − c_k) / r_{n,k}` (see
+/// [`crate::terms::latent_coord::LatentCoordValues::design_gradient_wrt_t`]).
+///
+/// `length_scale = None` selects the scale-free pure-Duchon spectrum
+/// (matches `gam_pyffi::position_basis_derivative` for the 1-D case).
+pub fn duchon_radial_first_derivative_nd(
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: Option<f64>,
+    nullspace_order: DuchonNullspaceOrder,
+) -> Result<Array2<f64>, BasisError> {
+    let n_rows = t.nrows();
+    let n_centers = centers.nrows();
+    let dim = centers.ncols();
+    if dim == 0 {
+        return Err(BasisError::InvalidInput(
+            "duchon_radial_first_derivative_nd: centers must have at least one column".into(),
+        ));
+    }
+    if t.ncols() != dim {
+        return Err(BasisError::InvalidInput(format!(
+            "duchon_radial_first_derivative_nd: t has {} cols but centers have {}",
+            t.ncols(),
+            dim
+        )));
+    }
+    let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_order);
+    // Hybrid Matérn-tail order. The latent-coord helper conservatively uses
+    // s_order = 0 (pure polyharmonic), matching the 1-D `position_basis_*`
+    // entry points and the configuration the LatentCoord prototype targets.
+    let s_order: usize = 0;
+    // Pre-compute partial-fraction coefficients when in hybrid mode. For
+    // `s_order = 0` this is the trivial `a_p = 1` case.
+    let kappa = length_scale.map(|l| 1.0 / l.max(1e-300)).unwrap_or(0.0);
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+    // `duchon_radial_jets` requires a positive length_scale for its r_floor
+    // and collision-Taylor radii. Use the data diameter (or 1.0 fallback) as
+    // the effective scale when the caller passed `None` — this only sets the
+    // numerical guards near r = 0 and does not change the analytic kernel.
+    let effective_length_scale = length_scale.unwrap_or_else(|| {
+        // pick a safe default: the typical inter-center distance.
+        let mut acc = 0.0_f64;
+        let mut cnt = 0usize;
+        for i in 0..n_centers.min(8) {
+            for j in (i + 1)..n_centers.min(8) {
+                let mut r2 = 0.0_f64;
+                for a in 0..dim {
+                    let dv = centers[[i, a]] - centers[[j, a]];
+                    r2 += dv * dv;
+                }
+                acc += r2.sqrt();
+                cnt += 1;
+            }
+        }
+        if cnt == 0 || acc <= 0.0 { 1.0 } else { acc / cnt as f64 }
+    });
+    let mut out = Array2::<f64>::zeros((n_rows, n_centers));
+    for n in 0..n_rows {
+        for k in 0..n_centers {
+            let mut r2 = 0.0_f64;
+            for a in 0..dim {
+                let dv = t[[n, a]] - centers[[k, a]];
+                r2 += dv * dv;
+            }
+            let r = r2.sqrt();
+            let jets = duchon_radial_jets(
+                r,
+                effective_length_scale,
+                p_order,
+                s_order,
+                dim,
+                &coeffs,
+            )?;
+            out[[n, k]] = jets.phi_r;
+        }
+    }
+    Ok(out)
+}
+
 fn fill_duchon_1d_polynomial_derivative(
     basis: &mut Array2<f64>,
     start_col: usize,
