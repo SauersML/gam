@@ -99,7 +99,13 @@ def gumbel_reciprocal_iter_schedule(
     )
 
 
-def _normalize_penalty_descriptors(penalties: Sequence[Any] | None) -> list[dict[str, Any]] | None:
+def _normalize_penalty_descriptors(penalties: Sequence[Any] | None) -> str | None:
+    """Normalize a Python penalty list to a JSON string accepted by the Rust FFI.
+
+    The Rust pyfunctions take ``Option<String>`` (JSON-serialized) because
+    PyO3 cannot bind ``Option<serde_json::Value>`` directly; we keep the
+    Python-side data structure list-of-dicts and serialize at the FFI edge.
+    """
     if penalties is None:
         return None
     if isinstance(penalties, (str, bytes)) or not isinstance(penalties, Sequence):
@@ -116,7 +122,8 @@ def _normalize_penalty_descriptors(penalties: Sequence[Any] | None) -> list[dict
             raise TypeError(
                 f"penalties[{index}] must expose to_rust_descriptor() or be a mapping"
             )
-    return out
+    import json as _json
+    return _json.dumps(out)
 
 
 def sae_manifold_fit(
