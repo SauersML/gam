@@ -11,27 +11,27 @@ See `proposals/composition_engine.md` §3-§4 and
 penalties span the identifiability tools the impossibility theorem
 says a principal-manifold / SAE / SAE-manifold engine needs:
 
-* `IsometryPenalty` lives on ψ (the per-observation latent field
+* `IsometryPenalty` lives on t (the per-observation latent field
   produced by `LatentCoord`). Pulls the decoder's pullback metric
   toward a reference Riemannian metric — gauge fix for the
   diffeomorphism gauge that bare `LatentCoord` carries.
-* `SparsityPenalty` lives on β (SAE codes) or ψ (soft atom
+* `SparsityPenalty` lives on β (SAE codes) or t (soft atom
   assignments). Smoothed L¹ by default, with `ε` itself optionally
   REML-selected.
-* `ARDPenalty` lives on ψ. One strength per latent axis, all
+* `ARDPenalty` lives on t. One weight per latent axis, all
   REML-selectable. The Occam factor in the marginal likelihood
   prunes unused axes only after an AuxPrior or Isometry-style gauge
   fix pins rotations/reparameterisations.
-* `TotalVariationPenalty` lives on ψ. Smoothed L¹ on first differences
+* `TotalVariationPenalty` lives on t. Smoothed L¹ on first differences
   promotes piecewise-constant latent atom maps over ordered contexts or
   graph adjacencies.
-* `OrthogonalityPenalty` lives on ψ. It fixes the rotation gauge by
+* `OrthogonalityPenalty` lives on t. It fixes the rotation gauge by
   penalizing latent-axis correlations; pair it with ARD so pruned axes
   are identifiable.
 
 All five compose with the existing smoothness penalty (`S(ρ)`),
-they slot into the same REML outer loop, and their strengths are
-"just another hyperparameter" to that loop. Pass `strength="auto"`
+they slot into the same REML outer loop, and their weights are
+"just another hyperparameter" to that loop. Pass `weight="auto"`
 (the default) to let REML choose; pass an explicit float to pin.
 """
 
@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from operator import index
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Sequence, TypeAlias
 
 __all__ = [
     "IsometryPenalty",
@@ -53,23 +53,24 @@ __all__ = [
 ]
 
 
-# Strength specification: either "auto" (REML-selected) or a positive float
+# Weight specification: either "auto" (REML-selected) or a positive float
 # (held fixed at that value throughout the fit).
-StrengthSpec = "str | float"
+WeightSpec: TypeAlias = str | float
+TargetSpec: TypeAlias = str | int | Any
 
 
-def _validate_strength(strength: Any, name: str) -> None:
-    if isinstance(strength, str):
-        if strength != "auto":
+def _validate_weight(weight: Any, name: str) -> None:
+    if isinstance(weight, str):
+        if weight != "auto":
             raise ValueError(
-                f"{name}.strength: only 'auto' is accepted as a string, got {strength!r}"
+                f"{name}.weight: only 'auto' is accepted as a string, got {weight!r}"
             )
-    elif isinstance(strength, (int, float)):
-        if float(strength) <= 0.0:
-            raise ValueError(f"{name}.strength must be > 0, got {strength}")
+    elif isinstance(weight, (int, float)):
+        if float(weight) <= 0.0:
+            raise ValueError(f"{name}.weight must be > 0, got {weight}")
     else:
         raise TypeError(
-            f"{name}.strength must be 'auto' or a positive float, got {type(strength).__name__}"
+            f"{name}.weight must be 'auto' or a positive float, got {type(weight).__name__}"
         )
 
 
@@ -120,16 +121,16 @@ class IsometryPenalty:
     reference
         ``"euclidean"`` for the identity reference metric, or a callable /
         array yielding per-row ``(d, d)`` reference metrics.
-    strength
+    weight
         ``"auto"`` (REML-selected; the default) or a fixed positive float.
     """
 
-    target: Any
+    target: TargetSpec
     reference: Any = "euclidean"
-    strength: Any = "auto"
+    weight: WeightSpec = "auto"
 
     def __post_init__(self) -> None:
-        _validate_strength(self.strength, "IsometryPenalty")
+        _validate_weight(self.weight, "IsometryPenalty")
         if isinstance(self.reference, str) and self.reference != "euclidean":
             raise ValueError(
                 "IsometryPenalty.reference: only 'euclidean' is supported as a string; "
@@ -147,7 +148,7 @@ class IsometryPenalty:
             "kind": "isometry",
             "target": _target_descriptor(self.target),
             "reference": self.reference if isinstance(self.reference, str) else "user_supplied",
-            "strength": self.strength,
+            "weight": self.weight,
         }
 
     def to_rust_descriptor(self) -> dict[str, Any]:
@@ -156,7 +157,7 @@ class IsometryPenalty:
 
 @dataclass
 class SparsityPenalty:
-    """Smoothed-L¹ / Hoyer / Log sparsifier on a β or ψ slice.
+    """Smoothed-L¹ / Hoyer / Log sparsifier on a β or t slice.
 
     The smoothed-L¹ default is
 
@@ -166,7 +167,7 @@ class SparsityPenalty:
             \\sum_i \\sqrt{\\beta_i^2 + \\varepsilon^2},
 
     with analytic gradient ``β_i / sqrt(β_i^2 + ε²)`` (smoothed sign) and
-    diagonal Hessian ``ε² / (β_i^2 + ε²)^{3/2}``. The strength
+    diagonal Hessian ``ε² / (β_i^2 + ε²)^{3/2}``. The weight
     ``e^{\\rho_\\mathrm{spars}}`` is REML-selectable; ``ε`` may *also* be
     REML-selected (``eps_strength="auto"``), in which case the Occam factor
     of the marginal likelihood shrinks ``ε`` only as far as the data warrants.
@@ -186,7 +187,7 @@ class SparsityPenalty:
         penalty to.
     kind
         ``"smooth_l1"`` (the default), ``"hoyer"``, or ``"log"``.
-    strength
+    weight
         ``"auto"`` (REML) or a fixed positive float.
     eps
         Smoothing scale for ``"smooth_l1"`` / ``"log"`` kernels. Default
@@ -196,14 +197,14 @@ class SparsityPenalty:
         it at ``eps``. Defaults to ``"fixed"``.
     """
 
-    target: str
+    target: TargetSpec
     kind: Literal["smooth_l1", "hoyer", "log"] = "smooth_l1"
-    strength: Any = "auto"
+    weight: WeightSpec = "auto"
     eps: float = 1e-3
     eps_strength: Literal["auto", "fixed"] = "fixed"
 
     def __post_init__(self) -> None:
-        _validate_strength(self.strength, "SparsityPenalty")
+        _validate_weight(self.weight, "SparsityPenalty")
         if self.kind not in ("smooth_l1", "hoyer", "log"):
             raise ValueError(
                 f"SparsityPenalty.kind must be one of 'smooth_l1' | 'hoyer' | 'log', "
@@ -227,7 +228,7 @@ class SparsityPenalty:
             "kind": "sparsity",
             "target": _target_descriptor(self.target),
             "sparsity_kind": self.kind,
-            "strength": self.strength,
+            "weight": self.weight,
             "eps": float(self.eps),
             "eps_strength": self.eps_strength,
         }
@@ -261,37 +262,37 @@ class ARDPenalty:
     ----------
     target
         The ``LatentCoord`` block (or its name).
-    strength_per_dim
+    weight
         ``"auto"`` (REML-selected per axis; the default) or a length-``d``
         sequence of fixed positive floats.
     """
 
-    target: Any
-    strength_per_dim: Any = "auto"
+    target: TargetSpec
+    weight: Any = "auto"
 
     def __post_init__(self) -> None:
-        if isinstance(self.strength_per_dim, str):
-            if self.strength_per_dim != "auto":
+        if isinstance(self.weight, str):
+            if self.weight != "auto":
                 raise ValueError(
-                    "ARDPenalty.strength_per_dim: only 'auto' is accepted as a string"
+                    "ARDPenalty.weight: only 'auto' is accepted as a string"
                 )
         else:
             try:
-                vals = [float(v) for v in self.strength_per_dim]
+                vals = [float(v) for v in self.weight]
             except TypeError as exc:
                 raise TypeError(
-                    "ARDPenalty.strength_per_dim must be 'auto' or a sequence of floats"
+                    "ARDPenalty.weight must be 'auto' or a sequence of floats"
                 ) from exc
             if not vals:
-                raise ValueError("ARDPenalty.strength_per_dim must have at least one entry")
+                raise ValueError("ARDPenalty.weight must have at least one entry")
             if any(v <= 0.0 for v in vals):
-                raise ValueError("ARDPenalty.strength_per_dim entries must be > 0")
+                raise ValueError("ARDPenalty.weight entries must be > 0")
 
     def _to_rust_payload(self) -> dict[str, Any]:
         return {
             "kind": "ard",
             "target": _target_descriptor(self.target),
-            "strength_per_dim": self.strength_per_dim,
+            "weight": self.weight,
         }
 
     def to_rust_descriptor(self) -> dict[str, Any]:
@@ -323,7 +324,7 @@ class TotalVariationPenalty:
         The ``LatentCoord`` block name/object. Defaults to ``"t"``.
     """
 
-    target: Any
+    target: TargetSpec
     weight: float
     n_eff: int
     difference_op: Any
@@ -339,7 +340,7 @@ class TotalVariationPenalty:
         smoothing_eps: float = 1e-6,
         learnable: bool = False,
         *,
-        target: Any = "t",
+        target: TargetSpec = "t",
     ) -> None:
         self.target = target
         self.weight = float(weight)
@@ -432,7 +433,7 @@ class OrthogonalityPenalty:
         The ``LatentCoord`` block name/object. Defaults to ``"t"``.
     """
 
-    target: Any
+    target: TargetSpec
     weight: float
     n_eff: int
     learnable: bool
@@ -443,7 +444,7 @@ class OrthogonalityPenalty:
         n_eff: int,
         learnable: bool = False,
         *,
-        target: Any = "t",
+        target: TargetSpec = "t",
     ) -> None:
         self.target = target
         self.weight = float(weight)
@@ -472,7 +473,7 @@ class OrthogonalityPenalty:
 
 @dataclass
 class IBPAssignmentPenalty:
-    target: Any
+    target: TargetSpec
     k_max: int
     alpha: float = 1.0
     tau: float = 1.0
@@ -502,7 +503,7 @@ class IBPAssignmentPenalty:
 
 @dataclass
 class SoftmaxAssignmentSparsityPenalty:
-    target: Any
+    target: TargetSpec
     k_atoms: int
     temperature: float = 1.0
 

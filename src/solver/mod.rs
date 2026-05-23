@@ -16,6 +16,8 @@ pub mod latent_inner;
 pub mod evidence;
 
 pub use evidence::{
-    evidence_grad_rho, laplace_evidence, select_topology, SelectedTopology, TopologyCandidate,
-    TopologyKind, TopologySelectOptions,
+    evidence_grad_rho, evidence_hessian_log_det, evidence_ift_gradient_correction,
+    hessian_log_det_from_hvp, laplace_evidence, select_topology, EvidenceHvpLogDet,
+    EvidenceIftGradientTerms, EvidenceLogDetSource, SelectedTopology, TopologyCandidate,
+    TopologyKind, TopologyScoreScale, TopologySelectOptions,
 };
