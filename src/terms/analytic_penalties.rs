@@ -916,6 +916,7 @@ impl AnalyticPenalty for IsometryPenalty {
         grad
     }
 
+    /// Fully analytic - wired through `duchon_radial_third_derivative_nd`.
     fn hvp(
         &self,
         target: ArrayView1<'_, f64>,
