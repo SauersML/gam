@@ -1286,6 +1286,64 @@ pub struct WorkingModelPirlsOptions {
     /// near-collinear bases). Default `false`; opt-in until validated
     /// across the broader family of likelihoods and penalties.
     pub geodesic_acceleration: bool,
+    /// Optional arrow-Schur structured-inner-solve descriptor.
+    ///
+    /// When `Some`, every accepted LM Newton step inside the inner loop
+    /// is computed by the per-observation arrow-Schur path
+    /// ([`crate::solver::arrow_schur::ArrowSchurSystem`]) instead of the
+    /// β-only `solve_newton_direction_dense`. When `None`, the existing
+    /// β-only path is used unchanged (back-compat: every existing call
+    /// site that does not opt in is unaffected).
+    ///
+    /// **Scope note.** This wires the *inner* Gauss–Newton step. The REML
+    /// outer-loop gradient w.r.t. `t` (which carries a shared `Schur⁻¹`
+    /// factor — see `proposals/composition_engine.md` §7 audit revisions)
+    /// is a separate plumbing change owned by the REML driver and is
+    /// **not** handled here.
+    pub arrow_schur: Option<ArrowSchurInnerConfig>,
+}
+
+/// Per-iteration arrow-Schur builder hook.
+///
+/// The driver supplies a closure that, given the current `β` iterate,
+/// returns a freshly-populated [`crate::solver::arrow_schur::ArrowSchurSystem`]
+/// — i.e. the per-row `H_tt^(i)`, `H_tβ^(i)`, `g_t^(i)` blocks and the
+/// β-block `H_ββ`, `g_β`. The driver owns the assembly because the
+/// per-row Jacobians depend on the latent-coord term's basis (Duchon,
+/// Sphere, …) and the analytic-penalty contributions depend on the
+/// registry the outer-fit configuration owns. PIRLS only knows how to
+/// *solve* the bordered system once it has been assembled.
+#[derive(Clone)]
+pub struct ArrowSchurInnerConfig {
+    /// Number of latent rows `N`.
+    pub n_rows: usize,
+    /// Latent dimensionality `d`.
+    pub latent_dim: usize,
+    /// β dimensionality `K` (must match the inner Hessian dimension).
+    pub n_beta: usize,
+    /// Closure that builds the bordered system at the current `β` and
+    /// current latent `t` (the latter held externally by the driver, e.g.
+    /// in a `LatentCoordValues` registered alongside the working model).
+    /// Returning `None` signals "fall back to the β-only path for this
+    /// iteration" — useful for the seeding sweep before `t` has been
+    /// initialized.
+    pub build:
+        std::sync::Arc<dyn Fn(&Array1<f64>) -> Option<crate::solver::arrow_schur::ArrowSchurSystem> + Send + Sync>,
+    /// Callback that the inner solver invokes after each accepted joint
+    /// step to write the latent increment back into the driver's
+    /// `LatentCoordValues`. `delta_t` is the flat row-major increment of
+    /// length `n_rows * latent_dim`.
+    pub apply_delta_t: std::sync::Arc<dyn Fn(&Array1<f64>) + Send + Sync>,
+}
+
+impl std::fmt::Debug for ArrowSchurInnerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArrowSchurInnerConfig")
+            .field("n_rows", &self.n_rows)
+            .field("latent_dim", &self.latent_dim)
+            .field("n_beta", &self.n_beta)
+            .finish_non_exhaustive()
+    }
 }
 
 #[inline]
