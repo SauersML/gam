@@ -17492,6 +17492,7 @@ struct DuchonRadialJets {
     phi: f64,
     phi_r: f64,
     phi_rr: f64,
+    phi_rrr: f64,
     q: f64,
     q_r: f64,
     q_rr: f64,
@@ -17544,6 +17545,7 @@ fn duchon_operator_jets_from_primary_core(
     out.lap_rr = (d + 2.0) * out.t + (d + 4.0) * r * out.t_r + r2 * out.t_rr;
     out.phi_r = r * out.q;
     out.phi_rr = out.q + r2 * out.t;
+    out.phi_rrr = 3.0 * r * out.t + r2 * out.t_r;
 
     assert!(((out.phi_rr - (out.q + r * out.q_r)).abs()) <= 1e-10 * out.phi_rr.abs().max(1.0));
     assert!(((out.phi_rr - (out.q + r2 * out.t)).abs()) <= 1e-10 * out.phi_rr.abs().max(1.0));
@@ -17856,6 +17858,7 @@ fn duchon_radial_jets(
     }
     if !out.phi_r.is_finite()
         || !out.phi_rr.is_finite()
+        || !out.phi_rrr.is_finite()
         || !out.q.is_finite()
         || !out.q_r.is_finite()
         || !out.q_rr.is_finite()
@@ -19477,6 +19480,81 @@ pub fn duchon_radial_second_derivative_nd(
                 &coeffs,
             )?;
             out[[n, k]] = jets.phi_rr;
+        }
+    }
+    Ok(out)
+}
+
+/// N-D Duchon radial third derivative `φ'''(r)` evaluated for every
+/// `(row, center)` pair.
+///
+/// Returns an `(n_rows, n_centers)` matrix whose `(n, k)` entry is the scalar
+/// third radial derivative `φ'''(r_{nk})` from the same
+/// [`duchon_radial_jets`] path used by the first/second derivative helpers.
+pub fn duchon_radial_third_derivative_nd(
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    length_scale: Option<f64>,
+    nullspace_order: DuchonNullspaceOrder,
+) -> Result<Array2<f64>, BasisError> {
+    let n_rows = t.nrows();
+    let n_centers = centers.nrows();
+    let dim = centers.ncols();
+    if dim == 0 {
+        return Err(BasisError::InvalidInput(
+            "duchon_radial_third_derivative_nd: centers must have at least one column".into(),
+        ));
+    }
+    if t.ncols() != dim {
+        return Err(BasisError::InvalidInput(format!(
+            "duchon_radial_third_derivative_nd: t has {} cols but centers have {}",
+            t.ncols(),
+            dim
+        )));
+    }
+    let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_order);
+    let s_order: usize = 0;
+    let kappa = length_scale.map(|l| 1.0 / l.max(1e-300)).unwrap_or(0.0);
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
+    let effective_length_scale = length_scale.unwrap_or_else(|| {
+        let mut acc = 0.0_f64;
+        let mut cnt = 0usize;
+        for i in 0..n_centers.min(8) {
+            for j in (i + 1)..n_centers.min(8) {
+                let mut r2 = 0.0_f64;
+                for a in 0..dim {
+                    let dv = centers[[i, a]] - centers[[j, a]];
+                    r2 += dv * dv;
+                }
+                acc += r2.sqrt();
+                cnt += 1;
+            }
+        }
+        if cnt == 0 || acc <= 0.0 {
+            1.0
+        } else {
+            acc / cnt as f64
+        }
+    });
+    let mut out = Array2::<f64>::zeros((n_rows, n_centers));
+    for n in 0..n_rows {
+        for k in 0..n_centers {
+            let mut r2 = 0.0_f64;
+            for a in 0..dim {
+                let dv = t[[n, a]] - centers[[k, a]];
+                r2 += dv * dv;
+            }
+            let r = r2.sqrt();
+            let jets = duchon_radial_jets(
+                r,
+                effective_length_scale,
+                p_order,
+                s_order,
+                dim,
+                &coeffs,
+            )?;
+            out[[n, k]] = jets.phi_rrr;
         }
     }
     Ok(out)
