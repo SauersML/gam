@@ -228,6 +228,10 @@ impl StableHasher {
     pub(crate) fn finish_hex(&self) -> String {
         format!("{:016x}", self.state)
     }
+
+    pub(crate) fn finish_u64(&self) -> u64 {
+        self.state
+    }
 }
 
 pub(crate) fn load_record(key: &str) -> Option<PersistentWarmStartRecord> {
