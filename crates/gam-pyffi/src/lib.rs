@@ -10531,6 +10531,48 @@ fn build_analytic_penalty_registry_from_json(
                     ),
                 ));
             }
+            "block_sparsity" | "group_lasso" => {
+                let raw_groups = descriptor
+                    .get("groups")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| format!("{context}.groups is required"))?;
+                let mut groups = Vec::with_capacity(raw_groups.len());
+                for (group_idx, raw_group) in raw_groups.iter().enumerate() {
+                    let raw_axes = raw_group.as_array().ok_or_else(|| {
+                        format!("{context}.groups[{group_idx}] must be a list of latent axes")
+                    })?;
+                    let mut group = Vec::with_capacity(raw_axes.len());
+                    for (axis_idx, raw_axis) in raw_axes.iter().enumerate() {
+                        let axis = raw_axis.as_u64().ok_or_else(|| {
+                            format!(
+                                "{context}.groups[{group_idx}][{axis_idx}] must be a non-negative integer"
+                            )
+                        })? as usize;
+                        group.push(axis);
+                    }
+                    groups.push(group);
+                }
+                let weight = descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
+                let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                registry.push(gam::terms::AnalyticPenaltyKind::BlockSparsity(
+                    std::sync::Arc::new(
+                        gam::terms::BlockSparsityPenalty::new(
+                            slice,
+                            groups,
+                            weight,
+                            n_eff,
+                            smoothing_eps,
+                            learnable,
+                        )
+                        .map_err(|err| format!("{context}: {err}"))?,
+                    ),
+                ));
+            }
             other => return Err(format!("{context}.kind has unsupported analytic penalty {other:?}")),
         }
     }

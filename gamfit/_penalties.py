@@ -1,4 +1,4 @@
-"""Analytic structured penalties: isometry, sparsity, ARD, TV, nuclear norm, orthogonality.
+"""Analytic structured penalties: isometry, sparsity, ARD, TV, nuclear norm, block sparsity, orthogonality.
 
 Thin Python configuration wrappers around the analytic primitives
 implemented in `src/terms/analytic_penalties.rs`. Each wrapper is a
@@ -28,11 +28,14 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
 * `NuclearNormPenalty` lives on t. Smoothed L¹ on singular values
   encourages low rank in a basis-free way; pair with ARD/Orthogonality
   depending on whether canonical-axis pruning or gauge fixing is also needed.
+* `BlockSparsityPenalty` lives on t. Group-lasso smoothed L¹ on predefined
+  latent-axis blocks, shrinking whole groups rather than individual entries
+  or single ARD axes.
 * `OrthogonalityPenalty` lives on t. It fixes the rotation gauge by
   penalizing latent-axis correlations; pair it with ARD so pruned axes
   are identifiable.
 
-All six compose with the existing smoothness penalty (`S(ρ)`),
+All seven compose with the existing smoothness penalty (`S(ρ)`),
 they slot into the same REML outer loop, and their weights are
 "just another hyperparameter" to that loop. Pass `weight="auto"`
 (the default) to let REML choose; pass an explicit float to pin.
@@ -50,6 +53,7 @@ __all__ = [
     "ARDPenalty",
     "TotalVariationPenalty",
     "NuclearNormPenalty",
+    "BlockSparsityPenalty",
     "OrthogonalityPenalty",
     "IBPAssignmentPenalty",
     "SoftmaxAssignmentSparsityPenalty",
@@ -492,6 +496,120 @@ class NuclearNormPenalty:
 
 
 @dataclass(init=False)
+class BlockSparsityPenalty:
+    """Group-lasso sparsity over predefined latent-axis groups.
+
+    Uses ``sum_g sqrt(||T[:, G_g]||² + ε²)``. This differs from per-element
+    L¹ by selecting whole groups, and from ARD by applying L¹ to each group's
+    L² norm rather than an independent axis precision. Pair with
+    ``LatentIdMode.AuxPriorDimSelection`` when auxiliary classes should select
+    active latent groups.
+
+    Parameters
+    ----------
+    groups
+        Partition of latent column indices, e.g. ``[[0, 1], [2, 3]]``.
+    weight
+        Fixed base weight, or the base multiplier when ``learnable=True``.
+    n_eff
+        Number of rows in the row-major latent coefficient block.
+    smoothing_eps
+        Positive smoothing scale ``ε`` for group norms near zero.
+    learnable
+        If true, expose one REML-selectable log-weight ``ρ``.
+    target
+        The ``LatentCoord`` block name/object. Defaults to ``"t"``.
+    """
+
+    target: TargetSpec
+    groups: list[list[int]]
+    weight: float
+    n_eff: int
+    smoothing_eps: float
+    learnable: bool
+
+    def __init__(
+        self,
+        groups: Any,
+        weight: float,
+        n_eff: int,
+        smoothing_eps: float = 1e-6,
+        learnable: bool = False,
+        *,
+        target: TargetSpec = "t",
+    ) -> None:
+        self.target = target
+        self.groups = self._coerce_groups(groups)
+        self.weight = float(weight)
+        self.n_eff = int(n_eff)
+        self.smoothing_eps = float(smoothing_eps)
+        self.learnable = bool(learnable)
+        self.__post_init__()
+
+    @staticmethod
+    def _coerce_groups(groups: Any) -> list[list[int]]:
+        try:
+            coerced = [[index(axis) for axis in group] for group in groups]
+        except TypeError as exc:
+            raise TypeError(
+                "BlockSparsityPenalty.groups must be a sequence of integer sequences"
+            ) from exc
+        if not coerced:
+            raise ValueError("BlockSparsityPenalty.groups must not be empty")
+        seen: set[int] = set()
+        for group_idx, group in enumerate(coerced):
+            if not group:
+                raise ValueError(
+                    f"BlockSparsityPenalty.groups[{group_idx}] must not be empty"
+                )
+            for axis in group:
+                if axis < 0:
+                    raise ValueError(
+                        "BlockSparsityPenalty.groups entries must be non-negative; "
+                        f"got {axis}"
+                    )
+                if axis in seen:
+                    raise ValueError(
+                        f"BlockSparsityPenalty.groups axis {axis} appears more than once"
+                    )
+                seen.add(axis)
+        max_axis = max(seen)
+        missing = set(range(max_axis + 1)) - seen
+        if missing:
+            first = min(missing)
+            raise ValueError(
+                "BlockSparsityPenalty.groups must partition contiguous axes from 0; "
+                f"missing axis {first}"
+            )
+        return coerced
+
+    def __post_init__(self) -> None:
+        if not self.weight > 0.0:
+            raise ValueError(f"BlockSparsityPenalty.weight must be > 0, got {self.weight}")
+        if self.n_eff <= 0:
+            raise ValueError(f"BlockSparsityPenalty.n_eff must be > 0, got {self.n_eff}")
+        if not self.smoothing_eps > 0.0:
+            raise ValueError(
+                "BlockSparsityPenalty.smoothing_eps must be > 0, "
+                f"got {self.smoothing_eps}"
+            )
+
+    def _to_rust_payload(self) -> dict[str, Any]:
+        return {
+            "kind": "block_sparsity",
+            "target": _target_descriptor(self.target),
+            "groups": self.groups,
+            "weight": self.weight,
+            "n_eff": self.n_eff,
+            "smoothing_eps": self.smoothing_eps,
+            "learnable": self.learnable,
+        }
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
+
+
+@dataclass(init=False)
 class OrthogonalityPenalty:
     """Gauge-fixing penalty for latent-axis identifiability.
 
@@ -616,6 +734,6 @@ class SoftmaxAssignmentSparsityPenalty:
 # Sum type for type hints on `gamfit.fit(..., penalties=...)` and similar.
 Penalty = (
     "IsometryPenalty | SparsityPenalty | ARDPenalty | "
-    "TotalVariationPenalty | NuclearNormPenalty | OrthogonalityPenalty | "
-    "IBPAssignmentPenalty | SoftmaxAssignmentSparsityPenalty"
+    "TotalVariationPenalty | NuclearNormPenalty | BlockSparsityPenalty | "
+    "OrthogonalityPenalty | IBPAssignmentPenalty | SoftmaxAssignmentSparsityPenalty"
 )
