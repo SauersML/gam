@@ -29,7 +29,6 @@ through the inner optimum.
 
 Related design notes:
 
-- [`proposals/composition_engine.md`](https://github.com/SauersML/gam/blob/main/proposals/composition_engine.md)
 - [`proposals/latent_coord.md`](https://github.com/SauersML/gam/blob/main/proposals/latent_coord.md)
 - [`proposals/sae_manifold.md`](https://github.com/SauersML/gam/blob/main/proposals/sae_manifold.md)
 
