@@ -133,3 +133,5 @@ nav:
     - API reference: api-reference.md
     - Exceptions: exceptions.md
     - Cookbook: cookbook.md
+    - Composition engine: composition_engine.md
+    - REML scaling: reml_scaling.md
