@@ -376,7 +376,8 @@ impl SaeAssignment {
 /// REML-selected continuous hyperparameters for SAE-manifold.
 #[derive(Debug, Clone)]
 pub struct SaeManifoldRho {
-    /// `log(lambda_sparse)` for the assignment entropy sparsifier.
+    /// `log(lambda_sparse)` for softmax entropy, or the learnable `log(alpha)`
+    /// offset for IBP-MAP assignment.
     pub log_lambda_sparse: f64,
     /// `log(lambda_smooth)` shared by the per-atom decoder penalties.
     pub log_lambda_smooth: f64,

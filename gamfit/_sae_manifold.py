@@ -71,7 +71,10 @@ def sae_manifold_fit(
     ``K in {1, 2, 4, 8, 16, 32}`` by REML evidence. ``atom_dim="auto"``
     starts from two coordinates per atom and uses the ARD normalised prior
     in the evidence score; the reported ``active_dim`` counts axes whose
-    empirical variance survives the ARD precision.
+    empirical variance survives the ARD precision. ``assignment_prior`` is
+    ``"softmax"`` by default; ``"ibp_map"`` uses deterministic concrete
+    Beta-Bernoulli active indicators with ``alpha="auto"`` evidence-ranked
+    over a small truncation-prior grid.
     """
 
     z = _as_2d_float(Z, "Z")
