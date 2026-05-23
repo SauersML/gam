@@ -25,7 +25,7 @@ import warnings
 import numpy as np
 
 
-N, D, TRUE_D, SEED = 720, 6, 2, 214
+N, D, TRUE_D, SEED, VAR_CUTOFF = 720, 6, 2, 214, 0.03
 FIG_PATH = Path(__file__).with_suffix(".png")
 CONFIGS = ("ARD alone (control)", "Orthogonality alone", "Orthogonality + ARD paired")
 
@@ -56,7 +56,7 @@ def axis_variance(x: np.ndarray) -> np.ndarray:
     return np.var(x, axis=0, ddof=1)
 
 
-def kept_count(var: np.ndarray, threshold: float = 0.05) -> int:
+def kept_count(var: np.ndarray, threshold: float = VAR_CUTOFF) -> int:
     return int(np.count_nonzero(var > threshold * float(np.max(var))))
 
 
@@ -116,7 +116,7 @@ def plot_reports(reports: list[FitReport]) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.0), constrained_layout=True)
     ymax = max(float(np.max(r.variances)) for r in reports) * 1.15
     for ax, report in zip(axes, reports):
-        cutoff = 0.05 * max(report.variances)
+        cutoff = VAR_CUTOFF * max(report.variances)
         colors = ["tab:green" if v > cutoff else "tab:gray" for v in report.variances]
         ax.bar(np.arange(D), report.variances, color=colors, alpha=0.85)
         ax.axhline(cutoff, color="black", lw=1, ls=":")
@@ -127,7 +127,7 @@ def plot_reports(reports: list[FitReport]) -> None:
     axes[0].set_ylabel("per-axis variance")
     fig.suptitle("Gauge fixing makes ARD axis-wise pruning identifiable", fontsize=13)
     fig.savefig(FIG_PATH, dpi=160)
-    plt.show()
+    plt.close(fig)
 
 
 def print_report(reports: list[FitReport], path: str) -> None:
