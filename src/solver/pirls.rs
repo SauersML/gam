@@ -7431,7 +7431,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         linear_constraints: linear_constraints.clone(),
         initial_lm_lambda: config.initial_lm_lambda,
         geodesic_acceleration: config.geodesic_acceleration,
-        arrow_schur: None,
+        arrow_schur: config.arrow_schur.clone(),
     };
 
     let mut iteration_logger = |info: &WorkingModelIterationInfo| {
@@ -7582,6 +7582,17 @@ pub struct PirlsConfig {
     /// field's doc for the full semantics and cost model. Default
     /// `false`; opt-in until validated.
     pub geodesic_acceleration: bool,
+    /// Optional arrow-Schur structured-inner-solve descriptor. When
+    /// `Some`, forwarded to `WorkingModelPirlsOptions::arrow_schur` so
+    /// each accepted LM step is solved by the per-observation
+    /// arrow-Schur path
+    /// ([`crate::solver::arrow_schur::ArrowSchurSystem`]). When `None`
+    /// (the default), the existing β-only path is used unchanged.
+    ///
+    /// See `proposals/latent_coord.md` for the design and the math
+    /// audit caveats; see [`ArrowSchurInnerConfig`] for the closure
+    /// contract.
+    pub arrow_schur: Option<ArrowSchurInnerConfig>,
 }
 
 impl PirlsConfig {
@@ -10295,6 +10306,38 @@ where
 // pieces). Names are `latent_*`-prefixed per the shared-file convention.
 // ---------------------------------------------------------------------------
 
+/// Predict an IFT latent shift from a cached
+/// [`crate::solver::arrow_schur::ArrowFactorCache`] and a candidate
+/// `(Δβ, δg_t)` perturbation, then apply it (with per-row magnitude
+/// clamp) to the supplied `LatentCoordValues`.
+///
+/// Thin façade around
+/// [`crate::solver::persistent_warm_start::ift_warm_start_latent`] +
+/// [`latent_apply_ift_warm_start`] so the latent IFT pipeline is
+/// reachable from the PIRLS-side driver code (the existing β-only
+/// PIRLS LM loop) without that code taking a dependency on the
+/// `persistent_warm_start` module directly.
+///
+/// Returns `(applied_rows_clamped, applied)` where `applied=false`
+/// means the predictor declined (no-op outcome) and the latent field
+/// is unchanged.
+pub fn latent_predict_and_apply_ift_warm_start(
+    cache: &crate::solver::arrow_schur::ArrowFactorCache,
+    delta_beta: Option<ndarray::ArrayView1<'_, f64>>,
+    delta_gt: Option<ndarray::ArrayView1<'_, f64>>,
+    latent: &mut crate::terms::latent_coord::LatentCoordValues,
+    max_row_delta: f64,
+) -> (usize, bool) {
+    use crate::solver::persistent_warm_start::{ift_warm_start_latent, LatentIftOutcome};
+    match ift_warm_start_latent(cache, delta_beta, delta_gt) {
+        LatentIftOutcome::Applied { delta_t } => {
+            let clamped = latent_apply_ift_warm_start(latent, &delta_t, max_row_delta);
+            (clamped, true)
+        }
+        LatentIftOutcome::Noop { .. } => (0, false),
+    }
+}
+
 /// Apply an IFT-predicted latent shift `Δt` to a
 /// [`crate::terms::latent_coord::LatentCoordValues`] block.
 ///
@@ -12877,6 +12920,7 @@ mod root_cause_tests {
                 firth_bias_reduction: false,
                 initial_lm_lambda: None,
                 geodesic_acceleration: false,
+                arrow_schur: None,
             };
 
             let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
