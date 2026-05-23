@@ -109,7 +109,6 @@ fn biobank_perf_cylinder_n1m() {
         &cfg,
     );
     eprintln!("[biobank-fit] cylinder N=1M p={p}: {ms:.0} ms");
-    gam::linalg::sparse_exact::prof_fac_dump_and_reset("cylinder_n1m");
 }
 
 #[test]
