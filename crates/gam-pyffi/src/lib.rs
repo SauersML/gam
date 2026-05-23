@@ -711,8 +711,7 @@ fn duchon_basis<'py>(
     // `power=0.0`, and `nullspace_order = duchon_nullspace_from_m(m)`.
     // When any of the three new keywords is set, route through the
     // shared hybrid resolver (matches the formula API).
-    let hybrid_requested =
-        length_scale.is_some() || nullspace_order.is_some() || power.is_some();
+    let hybrid_requested = length_scale.is_some() || nullspace_order.is_some() || power.is_some();
     let (spec_length_scale, spec_nullspace, spec_power) = if hybrid_requested {
         let cfg = resolve_duchon_hybrid_config(d, m, length_scale, nullspace_order, power)?;
         (cfg.length_scale, cfg.nullspace_order, cfg.power)
@@ -933,8 +932,7 @@ fn duchon_function_norm_penalty<'py>(
     // Preserve the pre-change default path bit-for-bit when no hybrid /
     // explicit-order keyword is supplied. When any of the three new
     // keywords is set, route through the shared hybrid resolver.
-    let hybrid_requested =
-        length_scale.is_some() || nullspace_order.is_some() || power.is_some();
+    let hybrid_requested = length_scale.is_some() || nullspace_order.is_some() || power.is_some();
     let (spec_length_scale, spec_nullspace, spec_power) = if hybrid_requested {
         let cfg = resolve_duchon_hybrid_config(d, m, length_scale, nullspace_order, power)?;
         (cfg.length_scale, cfg.nullspace_order, cfg.power)
@@ -8596,10 +8594,7 @@ fn duchon_nullspace_from_m(m: usize) -> DuchonNullspaceOrder {
 /// (so existing call sites stay bit-identical). Accepted strings:
 /// ``"zero"`` (constant nullspace), ``"linear"`` (constant + linear),
 /// or ``"degree<k>"`` for k ≥ 2 (polynomials of total degree ≤ k).
-fn parse_nullspace_order(
-    raw: Option<&str>,
-    m: usize,
-) -> PyResult<DuchonNullspaceOrder> {
+fn parse_nullspace_order(raw: Option<&str>, m: usize) -> PyResult<DuchonNullspaceOrder> {
     let Some(raw) = raw else {
         return Ok(duchon_nullspace_from_m(m));
     };
