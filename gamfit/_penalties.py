@@ -1,4 +1,4 @@
-"""Analytic structured penalties: isometry, sparsity, ARD, TV, orthogonality.
+"""Analytic structured penalties: isometry, sparsity, ARD, TV, nuclear norm, orthogonality.
 
 Thin Python configuration wrappers around the analytic primitives
 implemented in `src/terms/analytic_penalties.rs`. Each wrapper is a
@@ -25,11 +25,14 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
 * `TotalVariationPenalty` lives on t. Smoothed L¹ on first differences
   promotes piecewise-constant latent atom maps over ordered contexts or
   graph adjacencies.
+* `NuclearNormPenalty` lives on t. Smoothed L¹ on singular values
+  encourages low rank in a basis-free way; pair with ARD/Orthogonality
+  depending on whether canonical-axis pruning or gauge fixing is also needed.
 * `OrthogonalityPenalty` lives on t. It fixes the rotation gauge by
   penalizing latent-axis correlations; pair it with ARD so pruned axes
   are identifiable.
 
-All five compose with the existing smoothness penalty (`S(ρ)`),
+All six compose with the existing smoothness penalty (`S(ρ)`),
 they slot into the same REML outer loop, and their weights are
 "just another hyperparameter" to that loop. Pass `weight="auto"`
 (the default) to let REML choose; pass an explicit float to pin.
@@ -46,6 +49,7 @@ __all__ = [
     "SparsityPenalty",
     "ARDPenalty",
     "TotalVariationPenalty",
+    "NuclearNormPenalty",
     "OrthogonalityPenalty",
     "IBPAssignmentPenalty",
     "SoftmaxAssignmentSparsityPenalty",
@@ -410,6 +414,84 @@ class TotalVariationPenalty:
 
 
 @dataclass(init=False)
+class NuclearNormPenalty:
+    """Smoothed nuclear norm on a matrix-valued latent block.
+
+    Uses ``sum_i sqrt(σ_i² + ε²) - ε`` on the singular values of the row-major
+    latent matrix. This encourages low rank without requiring useful axes to
+    align with the canonical basis, complementing ARD's per-axis shrinkage and
+    Orthogonality's gauge-fixing role.
+
+    Parameters
+    ----------
+    weight
+        Fixed base weight, or the base multiplier when ``learnable=True``.
+    n_eff
+        Number of rows in the row-major latent coefficient block.
+    smoothing_eps
+        Positive smoothing scale ``ε`` for singular values near zero.
+    max_rank
+        Optional cap on retained singular values.
+    learnable
+        If true, expose one REML-selectable log-weight ``ρ``.
+    target
+        The ``LatentCoord`` block name/object. Defaults to ``"t"``.
+    """
+
+    target: TargetSpec
+    weight: float
+    n_eff: int
+    smoothing_eps: float
+    max_rank: int | None
+    learnable: bool
+
+    def __init__(
+        self,
+        weight: float,
+        n_eff: int,
+        smoothing_eps: float = 1e-6,
+        max_rank: int | None = None,
+        learnable: bool = False,
+        *,
+        target: TargetSpec = "t",
+    ) -> None:
+        self.target = target
+        self.weight = float(weight)
+        self.n_eff = int(n_eff)
+        self.smoothing_eps = float(smoothing_eps)
+        self.max_rank = None if max_rank is None else index(max_rank)
+        self.learnable = bool(learnable)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        if not self.weight > 0.0:
+            raise ValueError(f"NuclearNormPenalty.weight must be > 0, got {self.weight}")
+        if self.n_eff <= 0:
+            raise ValueError(f"NuclearNormPenalty.n_eff must be > 0, got {self.n_eff}")
+        if not self.smoothing_eps > 0.0:
+            raise ValueError(
+                "NuclearNormPenalty.smoothing_eps must be > 0, "
+                f"got {self.smoothing_eps}"
+            )
+        if self.max_rank is not None and self.max_rank <= 0:
+            raise ValueError(f"NuclearNormPenalty.max_rank must be > 0, got {self.max_rank}")
+
+    def _to_rust_payload(self) -> dict[str, Any]:
+        return {
+            "kind": "nuclear_norm",
+            "target": _target_descriptor(self.target),
+            "weight": self.weight,
+            "n_eff": self.n_eff,
+            "smoothing_eps": self.smoothing_eps,
+            "max_rank": self.max_rank,
+            "learnable": self.learnable,
+        }
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
+
+
+@dataclass(init=False)
 class OrthogonalityPenalty:
     """Gauge-fixing penalty for latent-axis identifiability.
 
@@ -534,6 +616,6 @@ class SoftmaxAssignmentSparsityPenalty:
 # Sum type for type hints on `gamfit.fit(..., penalties=...)` and similar.
 Penalty = (
     "IsometryPenalty | SparsityPenalty | ARDPenalty | "
-    "TotalVariationPenalty | OrthogonalityPenalty | IBPAssignmentPenalty | "
-    "SoftmaxAssignmentSparsityPenalty"
+    "TotalVariationPenalty | NuclearNormPenalty | OrthogonalityPenalty | "
+    "IBPAssignmentPenalty | SoftmaxAssignmentSparsityPenalty"
 )
