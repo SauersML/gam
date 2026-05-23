@@ -1236,7 +1236,9 @@ pub fn inverse_link_jet_for_family(
                 sas_link_state,
             )
         }
-        LikelihoodFamily::PoissonLog | LikelihoodFamily::GammaLog => {
+        LikelihoodFamily::PoissonLog
+        | LikelihoodFamily::NegativeBinomial { .. }
+        | LikelihoodFamily::GammaLog => {
             inverse_link_jet_for_link_function(
                 LinkFunction::Log,
                 eta,
