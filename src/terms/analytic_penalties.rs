@@ -61,8 +61,8 @@
 //! kernel-shape paths append ext-coords. The IsometryPenalty owns one `ρ`; the
 //! SparsityPenalty owns either zero (`ε` fixed) or one (`ε` REML-selected) plus
 //! one strength; the ARDPenalty owns `d` (one per latent axis);
-//! NuclearNorm and Orthogonality each own one strength only when their weight
-//! is learnable.
+//! NuclearNorm, BlockSparsity, and Orthogonality each own one strength only
+//! when their weight is learnable.
 //!
 //! ## Three-tier landings
 //!
@@ -2848,6 +2848,328 @@ impl AnalyticPenalty for NuclearNormPenalty {
 }
 
 // ---------------------------------------------------------------------------
+// Block sparsity / group-lasso penalty
+// ---------------------------------------------------------------------------
+
+/// Group-lasso penalty over predefined latent-axis blocks.
+///
+/// This is structured L¹ on group L² norms: per-element L¹ can zero isolated
+/// coefficients, ARD applies per-axis L² precision, while block sparsity
+/// zeroes whole semantic axis groups together. It pairs directly with
+/// `LatentIdMode::AuxPriorDimSelection` when the auxiliary prior supplies
+/// class-specific active group subsets.
+#[derive(Debug, Clone)]
+pub struct BlockSparsityPenalty {
+    pub target: PsiSlice,
+    pub groups: Vec<Vec<usize>>,
+    /// Base strength. If `learnable_weight` is true, the resolved strength is
+    /// `weight * exp(rho[rho_index])`; otherwise it is fixed at `weight`.
+    pub weight: f64,
+    /// Number of rows in the row-major matrix-valued latent block.
+    pub n_eff: usize,
+    pub smoothing_eps: f64,
+    pub learnable_weight: bool,
+    pub rho_index: usize,
+}
+
+impl BlockSparsityPenalty {
+    #[must_use = "build error must be handled"]
+    pub fn new(
+        target: PsiSlice,
+        groups: Vec<Vec<usize>>,
+        weight: f64,
+        n_eff: usize,
+        smoothing_eps: f64,
+        learnable_weight: bool,
+    ) -> Result<Self, String> {
+        if target.is_empty() {
+            return Err("BlockSparsityPenalty::new requires a non-empty target".to_string());
+        }
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!(
+                "BlockSparsityPenalty::new requires finite weight > 0, got {weight}"
+            ));
+        }
+        if n_eff == 0 {
+            return Err("BlockSparsityPenalty::new requires n_eff > 0".to_string());
+        }
+        if target.len() % n_eff != 0 {
+            return Err(format!(
+                "BlockSparsityPenalty::new target length {} is not divisible by n_eff {}",
+                target.len(),
+                n_eff
+            ));
+        }
+        let latent_dim = target.len() / n_eff;
+        if let Some(expected_dim) = target.latent_dim {
+            let expected = n_eff.checked_mul(expected_dim).ok_or_else(|| {
+                "BlockSparsityPenalty::new target shape overflows usize".to_string()
+            })?;
+            if expected != target.len() {
+                return Err(format!(
+                    "BlockSparsityPenalty::new target length {} does not match n_eff {} × latent_dim {}",
+                    target.len(),
+                    n_eff,
+                    expected_dim
+                ));
+            }
+        }
+        if !(smoothing_eps.is_finite() && smoothing_eps > 0.0) {
+            return Err(format!(
+                "BlockSparsityPenalty::new requires finite smoothing_eps > 0, got {smoothing_eps}"
+            ));
+        }
+        if groups.is_empty() {
+            return Err("BlockSparsityPenalty::new requires at least one group".to_string());
+        }
+        let mut seen = vec![false; latent_dim];
+        for (group_idx, group) in groups.iter().enumerate() {
+            if group.is_empty() {
+                return Err(format!(
+                    "BlockSparsityPenalty::new groups[{group_idx}] must not be empty"
+                ));
+            }
+            for &axis in group {
+                if axis >= latent_dim {
+                    return Err(format!(
+                        "BlockSparsityPenalty::new groups[{group_idx}] axis {axis} exceeds latent_dim {latent_dim}"
+                    ));
+                }
+                if seen[axis] {
+                    return Err(format!(
+                        "BlockSparsityPenalty::new axis {axis} appears in more than one group"
+                    ));
+                }
+                seen[axis] = true;
+            }
+        }
+        for (axis, present) in seen.iter().copied().enumerate() {
+            if !present {
+                return Err(format!(
+                    "BlockSparsityPenalty::new groups must partition latent axes; missing axis {axis}"
+                ));
+            }
+        }
+        Ok(Self {
+            target,
+            groups,
+            weight,
+            n_eff,
+            smoothing_eps,
+            learnable_weight,
+            rho_index: 0,
+        })
+    }
+
+    fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
+        if self.learnable_weight {
+            self.weight * rho[self.rho_index].exp()
+        } else {
+            self.weight
+        }
+    }
+
+    fn latent_dim(&self, target_len: usize) -> Option<usize> {
+        if self.n_eff == 0 || target_len % self.n_eff != 0 {
+            debug_assert_eq!(
+                target_len % self.n_eff.max(1),
+                0,
+                "target length must be divisible by n_eff"
+            );
+            return None;
+        }
+        Some(target_len / self.n_eff)
+    }
+
+    fn target_matrix<'a>(&self, target: ArrayView1<'a, f64>) -> Option<ArrayView2<'a, f64>> {
+        let d = self.latent_dim(target.len())?;
+        target.into_shape_with_order((self.n_eff, d)).ok()
+    }
+
+    fn group_norm(&self, t: ArrayView2<'_, f64>, group: &[usize]) -> f64 {
+        let mut norm2 = 0.0;
+        for n in 0..t.nrows() {
+            for &axis in group {
+                let x = t[[n, axis]];
+                norm2 += x * x;
+            }
+        }
+        (norm2 + self.smoothing_eps * self.smoothing_eps).sqrt()
+    }
+
+    fn flatten_matrix(m: &Array2<f64>) -> Array1<f64> {
+        let n_obs = m.nrows();
+        let d = m.ncols();
+        let mut out = Array1::<f64>::zeros(n_obs * d);
+        for n in 0..n_obs {
+            for a in 0..d {
+                out[n * d + a] = m[[n, a]];
+            }
+        }
+        out
+    }
+
+    pub fn diag_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let weight = self.resolved_weight(rho);
+        let mut out = Array1::<f64>::zeros(target.len());
+        for group in &self.groups {
+            let s = self.group_norm(t.view(), group);
+            let inv_s = 1.0 / s;
+            let inv_s3 = inv_s * inv_s * inv_s;
+            for n in 0..t.nrows() {
+                for &axis in group {
+                    let x = t[[n, axis]];
+                    out[n * t.ncols() + axis] = weight * (inv_s - x * x * inv_s3);
+                }
+            }
+        }
+        out
+    }
+
+    /// Materialize the group-lasso Hessian for small-block spectral paths.
+    pub fn as_dense(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array2<f64> {
+        let n = target.len();
+        let Some(t) = self.target_matrix(target) else {
+            return Array2::<f64>::zeros((n, n));
+        };
+        let d = t.ncols();
+        let weight = self.resolved_weight(rho);
+        let mut dense = Array2::<f64>::zeros((n, n));
+        for group in &self.groups {
+            let s = self.group_norm(t.view(), group);
+            let inv_s = 1.0 / s;
+            let inv_s3 = inv_s * inv_s * inv_s;
+            for row1 in 0..t.nrows() {
+                for &col1 in group {
+                    let i = row1 * d + col1;
+                    let x_i = t[[row1, col1]];
+                    for row2 in 0..t.nrows() {
+                        for &col2 in group {
+                            let j = row2 * d + col2;
+                            let mut entry = -x_i * t[[row2, col2]] * inv_s3;
+                            if i == j {
+                                entry += inv_s;
+                            }
+                            dense[[i, j]] = weight * entry;
+                        }
+                    }
+                }
+            }
+        }
+        dense
+    }
+}
+
+impl AnalyticPenalty for BlockSparsityPenalty {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Psi
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        let Some(t) = self.target_matrix(target) else {
+            return 0.0;
+        };
+        let mut acc = 0.0;
+        for group in &self.groups {
+            acc += self.group_norm(t.view(), group);
+        }
+        self.resolved_weight(rho) * acc
+    }
+
+    fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let weight = self.resolved_weight(rho);
+        let mut grad = Array2::<f64>::zeros(t.dim());
+        for group in &self.groups {
+            let s = self.group_norm(t.view(), group);
+            let factor = weight / s;
+            for n in 0..t.nrows() {
+                for &axis in group {
+                    grad[[n, axis]] = factor * t[[n, axis]];
+                }
+            }
+        }
+        Self::flatten_matrix(&grad)
+    }
+
+    fn hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        if target.len() != v.len() {
+            return Array1::<f64>::zeros(target.len());
+        }
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let Some(v_mat) = self.target_matrix(v) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let weight = self.resolved_weight(rho);
+        let mut out = Array2::<f64>::zeros(t.dim());
+        for group in &self.groups {
+            let s = self.group_norm(t.view(), group);
+            let inv_s = 1.0 / s;
+            let inv_s3 = inv_s * inv_s * inv_s;
+            let mut inner = 0.0;
+            for n in 0..t.nrows() {
+                for &axis in group {
+                    inner += t[[n, axis]] * v_mat[[n, axis]];
+                }
+            }
+            for n in 0..t.nrows() {
+                for &axis in group {
+                    out[[n, axis]] =
+                        weight * (v_mat[[n, axis]] * inv_s - t[[n, axis]] * inner * inv_s3);
+                }
+            }
+        }
+        Self::flatten_matrix(&out)
+    }
+
+    fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        if !self.learnable_weight {
+            return Array1::<f64>::zeros(0);
+        }
+        let mut out = Array1::<f64>::zeros(1);
+        out[self.rho_index] = self.value(target, rho);
+        out
+    }
+
+    fn rho_count(&self) -> usize {
+        usize::from(self.learnable_weight)
+    }
+
+    fn name(&self) -> &str {
+        "block_sparsity"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Orthogonality penalty
 // ---------------------------------------------------------------------------
 
@@ -3000,6 +3322,46 @@ impl OrthogonalityPenalty {
         out
     }
 
+    fn as_dense_with_precomputed_m(
+        &self,
+        t: ArrayView2<'_, f64>,
+        m: ArrayView2<'_, f64>,
+        scale: f64,
+    ) -> Array2<f64> {
+        let n_obs = t.nrows();
+        let d = t.ncols();
+        debug_assert_eq!(m.dim(), (d, d), "precomputed gram dimension mismatch");
+        if m.dim() != (d, d) {
+            return Array2::<f64>::zeros((n_obs * d, n_obs * d));
+        }
+
+        let mut dense = Array2::<f64>::zeros((n_obs * d, n_obs * d));
+        let factor = 2.0 * scale;
+        for row1 in 0..n_obs {
+            for row2 in 0..n_obs {
+                let mut row_dot = 0.0;
+                for axis in 0..d {
+                    row_dot += t[[row1, axis]] * t[[row2, axis]];
+                }
+                for col1 in 0..d {
+                    let i = row1 * d + col1;
+                    for col2 in 0..d {
+                        let j = row2 * d + col2;
+                        let mut entry = t[[row1, col2]] * t[[row2, col1]];
+                        if row1 == row2 {
+                            entry += m[[col2, col1]];
+                        }
+                        if col1 == col2 {
+                            entry += row_dot;
+                        }
+                        dense[[i, j]] = factor * entry;
+                    }
+                }
+            }
+        }
+        dense
+    }
+
     /// Dense cross-axis Hessian; no blockwise reduction preserves the
     /// rotation-gauge term.
     pub fn as_blockwise(&self, _global_offset: usize) -> Option<Vec<BlockwisePenalty>> {
@@ -3134,6 +3496,7 @@ pub enum AnalyticPenaltyKind {
     Ard(Arc<ARDPenalty>),
     TotalVariation(Arc<TotalVariationPenalty>),
     NuclearNorm(Arc<NuclearNormPenalty>),
+    BlockSparsity(Arc<BlockSparsityPenalty>),
     Orthogonality(Arc<OrthogonalityPenalty>),
 }
 
@@ -3147,6 +3510,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Ard(p) => p.tier(),
             AnalyticPenaltyKind::TotalVariation(p) => p.tier(),
             AnalyticPenaltyKind::NuclearNorm(p) => p.tier(),
+            AnalyticPenaltyKind::BlockSparsity(p) => p.tier(),
             AnalyticPenaltyKind::Orthogonality(p) => p.tier(),
         }
     }
@@ -3160,6 +3524,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Ard(p) => p.rho_count(),
             AnalyticPenaltyKind::TotalVariation(p) => p.rho_count(),
             AnalyticPenaltyKind::NuclearNorm(p) => p.rho_count(),
+            AnalyticPenaltyKind::BlockSparsity(p) => p.rho_count(),
             AnalyticPenaltyKind::Orthogonality(p) => p.rho_count(),
         }
     }
@@ -3173,6 +3538,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Ard(p) => p.name(),
             AnalyticPenaltyKind::TotalVariation(p) => p.name(),
             AnalyticPenaltyKind::NuclearNorm(p) => p.name(),
+            AnalyticPenaltyKind::BlockSparsity(p) => p.name(),
             AnalyticPenaltyKind::Orthogonality(p) => p.name(),
         }
     }
@@ -3186,6 +3552,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Ard(p) => p.value(target, rho),
             AnalyticPenaltyKind::TotalVariation(p) => p.value(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.value(target, rho),
+            AnalyticPenaltyKind::BlockSparsity(p) => p.value(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.value(target, rho),
         }
     }
@@ -3203,6 +3570,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Ard(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::TotalVariation(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::BlockSparsity(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_target(target, rho),
         }
     }
@@ -3220,6 +3588,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Ard(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::TotalVariation(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::BlockSparsity(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_rho(target, rho),
         }
     }
@@ -3237,6 +3606,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Ard(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::TotalVariation(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::BlockSparsity(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.hessian_diag(target, rho),
         }
     }
@@ -3262,6 +3632,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::Ard(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::TotalVariation(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::NuclearNorm(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::BlockSparsity(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Orthogonality(p) => p.hvp(target, rho, v),
         }
     }
@@ -3394,6 +3765,14 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 self.stochastic_diag_via_matvec()
             }
             AnalyticPenaltyKind::NuclearNorm(_) => self.diag_via_matvec(),
+            AnalyticPenaltyKind::BlockSparsity(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_diag_via_matvec()
+            }
+            AnalyticPenaltyKind::BlockSparsity(p) => {
+                p.diag_target(self.target.view(), self.rho.view())
+            }
             AnalyticPenaltyKind::IBPAssignment(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
                 .expect("IBP assignment diag"),
@@ -3473,11 +3852,16 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             {
                 self.stochastic_log_det_plus_lambda_i(lambda)
             }
+            AnalyticPenaltyKind::BlockSparsity(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_log_det_plus_lambda_i(lambda)
+            }
             AnalyticPenaltyKind::Isometry(_) | AnalyticPenaltyKind::Orthogonality(_) => {
                 let dense = self.as_dense();
                 <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
             }
-            AnalyticPenaltyKind::NuclearNorm(_) => {
+            AnalyticPenaltyKind::NuclearNorm(_) | AnalyticPenaltyKind::BlockSparsity(_) => {
                 let dense = self.as_dense();
                 <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
             }
@@ -3489,27 +3873,20 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::TotalVariation(p) => {
                 return p.as_dense(self.target.view(), self.rho.view());
             }
+            AnalyticPenaltyKind::BlockSparsity(p) => {
+                return p.as_dense(self.target.view(), self.rho.view());
+            }
             AnalyticPenaltyKind::Orthogonality(p) => {
                 let n = self.target.len();
                 let Some(t) = p.target_matrix(self.target.view()) else {
                     return Array2::<f64>::zeros((n, n));
                 };
-                let latent_dim = t.ncols();
                 let gram = OrthogonalityPenalty::gram_minus_identity(t.view());
-                let scale = p.scale(self.rho.view());
-                let mut dense = Array2::<f64>::zeros((n, n));
-                let mut v = Array2::<f64>::zeros(t.dim());
-                for j in 0..n {
-                    let row = j / latent_dim;
-                    let col = j % latent_dim;
-                    v[[row, col]] = 1.0;
-                    let h = p.hvp_with_precomputed_m(t.view(), gram.view(), v.view(), scale);
-                    for i in 0..n {
-                        dense[[i, j]] = h[[i / latent_dim, i % latent_dim]];
-                    }
-                    v[[row, col]] = 0.0;
-                }
-                return dense;
+                return p.as_dense_with_precomputed_m(
+                    t.view(),
+                    gram.view(),
+                    p.scale(self.rho.view()),
+                );
             }
             AnalyticPenaltyKind::Isometry(p) => {
                 let n = self.target.len();

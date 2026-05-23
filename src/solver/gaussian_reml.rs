@@ -1420,18 +1420,20 @@ fn add_reml_rho_gradient_vjp(
     grad_weights: &mut Array1<f64>,
 ) {
     let d = beta.ncols() as f64;
-    let k_matrix = penalty.to_owned() * lambda;
-    let inverse_k = dense_ab(inverse_hessian.view(), k_matrix.view());
-    let trace_kernel = dense_ab(inverse_k.view(), inverse_hessian.view());
+    let inverse_s = dense_ab(inverse_hessian.view(), penalty);
+    let trace_kernel = dense_ab(inverse_s.view(), inverse_hessian.view());
     for row in 0..grad_penalty.nrows() {
         for col in 0..grad_penalty.ncols() {
-            grad_penalty[[row, col]] +=
-                scale * 0.5 * d * lambda * (inverse_hessian[[col, row]] - trace_kernel[[col, row]]);
+            grad_penalty[[row, col]] += scale
+                * 0.5
+                * d
+                * lambda
+                * (inverse_hessian[[col, row]] - lambda * trace_kernel[[col, row]]);
         }
     }
     let xt = dense_ab(x, trace_kernel.view());
     for i in 0..x.nrows() {
-        let wi = -scale * d * weights[i];
+        let wi = -scale * d * lambda * weights[i];
         for k in 0..x.ncols() {
             grad_x[[i, k]] += wi * xt[[i, k]];
         }
@@ -1439,17 +1441,17 @@ fn add_reml_rho_gradient_vjp(
         for k in 0..x.ncols() {
             quad += x[[i, k]] * xt[[i, k]];
         }
-        grad_weights[i] -= scale * 0.5 * d * quad;
+        grad_weights[i] -= scale * 0.5 * d * lambda * quad;
     }
 
-    let k_beta = dense_ab(k_matrix.view(), beta.view());
+    let s_beta = dense_ab(penalty, beta.view());
     let mut upstream_beta = Array2::<f64>::zeros(beta.dim());
     for j in 0..beta.ncols() {
         let dp = (sigma2[j] * nu).max(MIN_DEVIANCE);
-        let q = beta.column(j).dot(&k_beta.column(j));
+        let q = lambda * beta.column(j).dot(&s_beta.column(j));
         let q_coef = scale * nu / dp;
         for row in 0..beta.nrows() {
-            upstream_beta[[row, j]] = q_coef * k_beta[[row, j]];
+            upstream_beta[[row, j]] = q_coef * lambda * s_beta[[row, j]];
         }
         let dp_coef = -scale * 0.5 * nu * q / (dp * dp);
         add_rank_one_penalty_vjp(
