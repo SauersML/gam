@@ -3788,6 +3788,37 @@ impl PirlsLruCache {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PenaltySubspaceCacheKey {
+    penalty_matrix_fingerprint: u64,
+    ridge_passport_signature: u64,
+}
+
+struct PenaltySubspaceCache {
+    entry: Option<(PenaltySubspaceCacheKey, Arc<runtime::PenaltySubspace>)>,
+}
+
+impl PenaltySubspaceCache {
+    fn new() -> Self {
+        Self { entry: None }
+    }
+
+    fn get(&self, key: &PenaltySubspaceCacheKey) -> Option<Arc<runtime::PenaltySubspace>> {
+        self.entry
+            .as_ref()
+            .filter(|(cached_key, _)| cached_key == key)
+            .map(|(_, value)| value.clone())
+    }
+
+    fn insert(&mut self, key: PenaltySubspaceCacheKey, value: Arc<runtime::PenaltySubspace>) {
+        self.entry = Some((key, value));
+    }
+
+    fn clear(&mut self) {
+        self.entry = None;
+    }
+}
+
 /// Estimate the in-cache footprint of a (compacted) PIRLS result.
 ///
 /// Mirrors what `compact_for_reml_cache` keeps:
@@ -3841,6 +3872,7 @@ fn symmetric_matrix_cache_bytes(m: &crate::linalg::matrix::SymmetricMatrix) -> u
 /// the math kernels so objective/derivative routines can stay algebra-focused.
 struct EvalCacheManager {
     pirls_cache: RwLock<PirlsLruCache>,
+    penalty_subspace_cache: RwLock<PenaltySubspaceCache>,
     current_eval_bundle: RwLock<Option<EvalShared>>,
     current_outer_eval: RwLock<Option<(Vec<u64>, OuterEval)>>,
     pirls_cache_enabled: AtomicBool,
@@ -3850,6 +3882,7 @@ impl EvalCacheManager {
     fn new() -> Self {
         Self {
             pirls_cache: RwLock::new(PirlsLruCache::new(PIRLS_CACHE_BYTE_BUDGET)),
+            penalty_subspace_cache: RwLock::new(PenaltySubspaceCache::new()),
             current_eval_bundle: RwLock::new(None),
             current_outer_eval: RwLock::new(None),
             pirls_cache_enabled: AtomicBool::new(true),
@@ -3899,6 +3932,7 @@ impl EvalCacheManager {
 
     fn clear_eval_and_factor_caches(&self) {
         self.invalidate_eval_bundle();
+        self.penalty_subspace_cache.write().unwrap().clear();
     }
 }
 
