@@ -685,7 +685,7 @@ impl IsometryPenalty {
 
     fn missing_cache_default(&self, method: &str, detail: &str) {
         let has_required_cache = false;
-        debug_assert!(
+        assert!(
             has_required_cache,
             "IsometryPenalty::{method} missing required derivative state: {detail}"
         );
@@ -784,7 +784,7 @@ impl IsometryPenalty {
                 Some(out)
             }
             WeightField::Factored { u, rank, p_out } => {
-                debug_assert_eq!(p, *p_out);
+                assert_eq!(p, *p_out);
                 let r = *rank;
                 let m_n = self.projected_jacobian_row(n, d)?;
                 let mut out = Array2::<f64>::zeros((p, d));
@@ -816,7 +816,7 @@ impl IsometryPenalty {
                 s
             }
             WeightField::Factored { u, rank, p_out } => {
-                debug_assert_eq!(p, *p_out);
+                assert_eq!(p, *p_out);
                 let r = *rank;
                 let mut s = 0.0;
                 for k in 0..r {
@@ -865,9 +865,9 @@ impl IsometryPenalty {
             source.nullspace_order,
         )?;
         let n_centers = source.centers.nrows();
-        debug_assert_eq!(source.centers.ncols(), d);
-        debug_assert_eq!(source.radial_coefficients.nrows(), n_centers);
-        debug_assert_eq!(source.radial_coefficients.ncols(), self.p_out);
+        assert_eq!(source.centers.ncols(), d);
+        assert_eq!(source.radial_coefficients.nrows(), n_centers);
+        assert_eq!(source.radial_coefficients.ncols(), self.p_out);
 
         let mut out = Array2::<f64>::zeros((n_obs, self.p_out * d * d));
         for n in 0..n_obs {
@@ -931,9 +931,9 @@ impl IsometryPenalty {
             source.nullspace_order,
         )?;
         let n_centers = source.centers.nrows();
-        debug_assert_eq!(source.centers.ncols(), d);
-        debug_assert_eq!(source.radial_coefficients.nrows(), n_centers);
-        debug_assert_eq!(source.radial_coefficients.ncols(), self.p_out);
+        assert_eq!(source.centers.ncols(), d);
+        assert_eq!(source.radial_coefficients.nrows(), n_centers);
+        assert_eq!(source.radial_coefficients.ncols(), self.p_out);
 
         let mut out = ndarray::Array3::<f64>::zeros((n_obs, self.p_out, d * d * d));
         for n in 0..n_obs {
@@ -1165,7 +1165,7 @@ impl IsometryPenalty {
         };
         let n_obs = jac.nrows();
         let p = self.p_out;
-        debug_assert_eq!(jac.ncols(), p * latent_dim);
+        assert_eq!(jac.ncols(), p * latent_dim);
         let mut g_all = Array2::<f64>::zeros((n_obs, latent_dim * latent_dim));
         for n in 0..n_obs {
             // M_n = U_n^T J_n  (or J_n itself when W = I).
@@ -1198,8 +1198,8 @@ impl IsometryPenalty {
                 CowArray::from(out)
             }
             IsometryReference::UserSupplied(a) => {
-                debug_assert_eq!(a.nrows(), n_obs);
-                debug_assert_eq!(a.ncols(), d * d);
+                assert_eq!(a.nrows(), n_obs);
+                assert_eq!(a.ncols(), d * d);
                 CowArray::from(a.view())
             }
         }
@@ -1268,7 +1268,7 @@ impl AnalyticPenalty for IsometryPenalty {
         let Some(jac2) = self.jacobian_second(target, n_obs, d) else {
             return grad;
         };
-        debug_assert_eq!(jac2.ncols(), p * d * d);
+        assert_eq!(jac2.ncols(), p * d * d);
 
         for n in 0..n_obs {
             let Some(wj) = self.weighted_jacobian_row(n, d) else {
@@ -1414,8 +1414,8 @@ pub struct SoftmaxAssignmentSparsityPenalty {
 impl SoftmaxAssignmentSparsityPenalty {
     #[must_use]
     pub fn new(k_atoms: usize, temperature: f64) -> Self {
-        debug_assert!(k_atoms > 0);
-        debug_assert!(temperature > 0.0);
+        assert!(k_atoms > 0);
+        assert!(temperature > 0.0);
         Self {
             k_atoms,
             temperature,
@@ -1620,9 +1620,9 @@ pub struct IBPAssignmentPenalty {
 impl IBPAssignmentPenalty {
     #[must_use]
     pub fn new(k_max: usize, alpha: f64, tau: f64, learnable_alpha: bool) -> Self {
-        debug_assert!(k_max > 0);
-        debug_assert!(alpha.is_finite() && alpha > 0.0);
-        debug_assert!(tau.is_finite() && tau > 0.0);
+        assert!(k_max > 0);
+        assert!(alpha.is_finite() && alpha > 0.0);
+        assert!(tau.is_finite() && tau > 0.0);
         Self {
             k_max,
             alpha,
@@ -1897,7 +1897,7 @@ impl AnalyticPenalty for SparsityPenalty {
                 // so P = 1; a 1-sparse vector has ratio 1, so P = 0
                 // (sparse vectors minimize the penalty).
                 let n = target.len() as f64;
-                debug_assert!(n > 1.0, "Hoyer requires n > 1");
+                assert!(n > 1.0, "Hoyer requires n > 1");
                 let l1: f64 = target.iter().map(|x| x.abs()).sum();
                 let l2: f64 = target.iter().map(|x| x * x).sum::<f64>().sqrt();
                 if l2 == 0.0 {
@@ -1931,7 +1931,7 @@ impl AnalyticPenalty for SparsityPenalty {
                 // P(x) = A · (L1/L2 - 1), A = lam / (sqrt(n) - 1).
                 // ∂P/∂x_i = A · (sign(x_i)/L2 - L1 · x_i / L2³).
                 let n = target.len() as f64;
-                debug_assert!(n > 1.0, "Hoyer requires n > 1");
+                assert!(n > 1.0, "Hoyer requires n > 1");
                 let l1: f64 = target.iter().map(|x| x.abs()).sum();
                 let l2: f64 = target.iter().map(|x| x * x).sum::<f64>().sqrt();
                 if l2 == 0.0 {
@@ -2058,7 +2058,7 @@ impl AnalyticPenalty for SparsityPenalty {
                 // (Hv)_i = A · [ -s_i (xᵀv)/L2³ - x_i (sᵀv)/L2³
                 //                - L1 v_i/L2³ + 3 L1 x_i (xᵀv)/L2⁵ ]
                 let n = n_target as f64;
-                debug_assert!(n > 1.0, "Hoyer requires n > 1");
+                assert!(n > 1.0, "Hoyer requires n > 1");
                 let l1: f64 = target.iter().map(|x| x.abs()).sum();
                 let l2: f64 = target.iter().map(|x| x * x).sum::<f64>().sqrt();
                 let mut out = Array1::<f64>::zeros(n_target);
@@ -2195,7 +2195,7 @@ pub struct ARDPenalty {
 impl ARDPenalty {
     #[must_use]
     pub fn new(target: PsiSlice, latent_dim: usize) -> Self {
-        debug_assert!(latent_dim > 0, "ARDPenalty requires latent_dim > 0");
+        assert!(latent_dim > 0, "ARDPenalty requires latent_dim > 0");
         let n_obs = if latent_dim == 0 {
             0
         } else {
@@ -2756,7 +2756,7 @@ impl TotalVariationPenalty {
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
         if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
-            debug_assert_eq!(
+            assert_eq!(
                 target_len % self.n_eff.max(1),
                 0,
                 "target length must be divisible by n_eff"
@@ -3039,7 +3039,7 @@ impl AnalyticPenalty for TotalVariationPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
         if target.len() != v.len() {
             return Array1::<f64>::zeros(target.len());
         }
@@ -3196,7 +3196,7 @@ impl NuclearNormPenalty {
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
         if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
-            debug_assert_eq!(
+            assert_eq!(
                 target_len % self.n_eff.max(1),
                 0,
                 "target length must be divisible by n_eff"
@@ -3404,7 +3404,7 @@ impl AnalyticPenalty for NuclearNormPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
         if target.len() != v.len() {
             return Array1::<f64>::zeros(target.len());
         }
@@ -3595,7 +3595,7 @@ impl BlockSparsityPenalty {
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
         if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
-            debug_assert_eq!(
+            assert_eq!(
                 target_len % self.n_eff.max(1),
                 0,
                 "target length must be divisible by n_eff"
@@ -3737,7 +3737,7 @@ impl AnalyticPenalty for BlockSparsityPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
         if target.len() != v.len() {
             return Array1::<f64>::zeros(target.len());
         }
@@ -4070,7 +4070,7 @@ impl AnalyticPenalty for MechanismSparsityPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
         if target.len() != v.len() {
             return Array1::<f64>::zeros(target.len());
         }
@@ -4265,7 +4265,7 @@ impl RowPrecisionPriorPenalty {
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
         if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
-            debug_assert_eq!(
+            assert_eq!(
                 target_len % self.n_eff.max(1),
                 0,
                 "target length must be divisible by n_eff"
@@ -4435,7 +4435,7 @@ impl AnalyticPenalty for RowPrecisionPriorPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
         if target.len() != v.len() {
             return Array1::<f64>::zeros(target.len());
         }
@@ -4653,7 +4653,7 @@ impl IvaeRidgeMeanGauge {
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
         if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
-            debug_assert_eq!(
+            assert_eq!(
                 target_len % self.n_eff.max(1),
                 0,
                 "target length must be divisible by n_eff"
@@ -4818,7 +4818,7 @@ impl AnalyticPenalty for IvaeRidgeMeanGauge {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
         if target.len() != v.len() {
             return Array1::<f64>::zeros(target.len());
         }
@@ -5034,7 +5034,7 @@ impl ParametricRowPrecisionPriorPenalty {
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
         if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
-            debug_assert_eq!(
+            assert_eq!(
                 target_len % self.n_eff.max(1),
                 0,
                 "target length must be divisible by n_eff"
@@ -5218,7 +5218,7 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
         if target.len() != v.len() {
             return Array1::<f64>::zeros(target.len());
         }
@@ -5597,7 +5597,7 @@ impl AnalyticPenalty for ScadMcpPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
         if target.len() != v.len() {
             return Array1::<f64>::zeros(target.len());
         }
@@ -5771,7 +5771,7 @@ impl BlockOrthogonalityPenalty {
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
         if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
-            debug_assert_eq!(
+            assert_eq!(
                 target_len % self.n_eff.max(1),
                 0,
                 "target length must be divisible by n_eff"
@@ -5820,7 +5820,7 @@ impl BlockOrthogonalityPenalty {
         cross_right_left: ArrayView2<'_, f64>,
         factor: f64,
     ) {
-        debug_assert_eq!(cross_right_left.dim(), (right_axes.len(), left_axes.len()));
+        assert_eq!(cross_right_left.dim(), (right_axes.len(), left_axes.len()));
         for n in 0..out.nrows() {
             for (li, &left_axis) in left_axes.iter().enumerate() {
                 let mut s = 0.0;
@@ -5839,7 +5839,7 @@ impl BlockOrthogonalityPenalty {
         v: ArrayView2<'_, f64>,
         weight: f64,
     ) -> Array2<f64> {
-        debug_assert_eq!(v.dim(), t.dim(), "hvp matrix dimension mismatch");
+        assert_eq!(v.dim(), t.dim(), "hvp matrix dimension mismatch");
         if v.dim() != t.dim() {
             return Array2::<f64>::zeros(t.dim());
         }
@@ -5959,7 +5959,7 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
         if target.len() != v.len() {
             return Array1::<f64>::zeros(target.len());
         }
@@ -6099,7 +6099,7 @@ impl OrthogonalityPenalty {
     fn target_matrix<'a>(&self, target: ArrayView1<'a, f64>) -> Option<ArrayView2<'a, f64>> {
         let d = self.latent_dim;
         if !target.len().is_multiple_of(d) {
-            debug_assert_eq!(
+            assert_eq!(
                 target.len() % d,
                 0,
                 "target length must be divisible by latent_dim"
@@ -6148,8 +6148,8 @@ impl OrthogonalityPenalty {
     ) -> Array2<f64> {
         let n_obs = t.nrows();
         let d = t.ncols();
-        debug_assert_eq!(v.dim(), t.dim(), "hvp matrix dimension mismatch");
-        debug_assert_eq!(m.dim(), (d, d), "precomputed gram dimension mismatch");
+        assert_eq!(v.dim(), t.dim(), "hvp matrix dimension mismatch");
+        assert_eq!(m.dim(), (d, d), "precomputed gram dimension mismatch");
         if v.dim() != t.dim() {
             return Array2::<f64>::zeros((n_obs, d));
         }
@@ -6188,7 +6188,7 @@ impl OrthogonalityPenalty {
     ) -> Array2<f64> {
         let n_obs = t.nrows();
         let d = t.ncols();
-        debug_assert_eq!(m.dim(), (d, d), "precomputed gram dimension mismatch");
+        assert_eq!(m.dim(), (d, d), "precomputed gram dimension mismatch");
         if m.dim() != (d, d) {
             return Array2::<f64>::zeros((n_obs * d, n_obs * d));
         }
@@ -6268,7 +6268,7 @@ impl AnalyticPenalty for OrthogonalityPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
         if target.len() != v.len() {
             return Array1::<f64>::zeros(target.len());
         }
@@ -7033,7 +7033,7 @@ impl FrozenAnalyticPenaltyOp {
 
 #[inline]
 fn dot(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len());
     let mut s = 0.0;
     for i in 0..a.len() {
         s += a[i] * b[i];
@@ -7249,7 +7249,7 @@ impl AnalyticPenalty for NestedPrefixPenalty {
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
         let f = self.latent_dim();
-        debug_assert!(
+        assert!(
             target.len().is_multiple_of(f),
             "target length must be n_rows · F"
         );

@@ -36,7 +36,7 @@ impl LinearInequalityConstraints {
     /// [`Self::new`] instead.
     #[inline]
     pub(crate) fn from_paired(a: Array2<f64>, b: Array1<f64>) -> Self {
-        debug_assert_eq!(a.nrows(), b.len(), "paired constraint shape invariant");
+        assert_eq!(a.nrows(), b.len(), "paired constraint shape invariant");
         Self { a, b }
     }
 

@@ -239,8 +239,8 @@ impl GaussianVectorLikelihood {
 
 impl VectorLikelihood for GaussianVectorLikelihood {
     fn log_lik(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> f64 {
-        debug_assert_eq!(eta.dim(), y.dim());
-        debug_assert_eq!(eta.ncols(), self.precision.len());
+        assert_eq!(eta.dim(), y.dim());
+        assert_eq!(eta.ncols(), self.precision.len());
         let m = eta.ncols();
         let rank = self.factor.as_ref().map_or(0, |f| f.ncols());
         let mut acc = 0.0;
@@ -275,7 +275,7 @@ impl VectorLikelihood for GaussianVectorLikelihood {
     }
 
     fn grad_eta(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64> {
-        debug_assert_eq!(eta.dim(), y.dim());
+        assert_eq!(eta.dim(), y.dim());
         let (n_rows, n_cols) = eta.dim();
         let rank = self.factor.as_ref().map_or(0, |f| f.ncols());
         let mut out = Array2::<f64>::zeros((n_rows, n_cols));

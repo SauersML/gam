@@ -669,7 +669,7 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
     /// is `rank` cheap K×K bilinear forms (K=2 or 4 in practice — fully
     /// unrolled by the compiler).
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.p);
+        assert_eq!(factor.nrows(), self.p);
         let rank = factor.ncols();
         let n_rows = self.kern.n_rows();
         if rank == 0 || n_rows == 0 {
@@ -692,7 +692,7 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         factor: &Array2<f64>,
         cache: &ProjectedFactorCache,
     ) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.p);
+        assert_eq!(factor.nrows(), self.p);
         let rank = factor.ncols();
         let n_rows = self.kern.n_rows();
         if rank == 0 || n_rows == 0 {
@@ -738,7 +738,7 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
     /// matmuls; still dwarfed by the saved `rank × n` jet evaluations
     /// the default path would have done.
     fn projected_matrix(&self, factor: &Array2<f64>) -> Array2<f64> {
-        debug_assert_eq!(factor.nrows(), self.p);
+        assert_eq!(factor.nrows(), self.p);
         let rank = factor.ncols();
         let n_rows = self.kern.n_rows();
         if rank == 0 || n_rows == 0 {
@@ -774,7 +774,7 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
 
         // Build J·F once (BLAS-3 fast path when the kernel exposes one).
         let jf = self.compute_jf(factor);
-        debug_assert_eq!(jf.dim(), (n_rows, K * rank));
+        assert_eq!(jf.dim(), (n_rows, K * rank));
 
         // Per-row T_r tensor: T[r, a, b] = row_third_contracted(r,
         // J_r·direction)[a][b]. Layout flat (n × K × K) row-major so
@@ -806,7 +806,7 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
                 // initial zero at that slot. Addition is therefore safe
                 // (zero + value = value) and matches the merge semantic
                 // used by the dense-output `mul_vec` reduce above.
-                debug_assert_eq!(left.len(), right.len());
+                assert_eq!(left.len(), right.len());
                 for (l, r) in left.iter_mut().zip(right.iter()) {
                     *l += *r;
                 }
@@ -948,7 +948,7 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
     fn trace_projected_factor_with_jf(&self, factor: &Array2<f64>, jf: ArrayView2<'_, f64>) -> f64 {
         let rank = factor.ncols();
         let n_rows = self.kern.n_rows();
-        debug_assert_eq!(jf.dim(), (n_rows, K * rank));
+        assert_eq!(jf.dim(), (n_rows, K * rank));
         let direction = self.direction.as_slice();
 
         (0..n_rows)
@@ -1045,7 +1045,7 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
     /// ```
     /// computed once per row instead of `rank` times.
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.p);
+        assert_eq!(factor.nrows(), self.p);
         let rank = factor.ncols();
         let n_rows = self.kern.n_rows();
         if rank == 0 || n_rows == 0 {
@@ -1063,7 +1063,7 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
         factor: &Array2<f64>,
         cache: &ProjectedFactorCache,
     ) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.p);
+        assert_eq!(factor.nrows(), self.p);
         let rank = factor.ncols();
         let n_rows = self.kern.n_rows();
         if rank == 0 || n_rows == 0 {
@@ -1127,7 +1127,7 @@ impl<const K: usize, T: RowKernel<K>> RowKernelSecondDirectionalDerivativeOperat
     fn trace_projected_factor_with_jf(&self, factor: &Array2<f64>, jf: ArrayView2<'_, f64>) -> f64 {
         let rank = factor.ncols();
         let n_rows = self.kern.n_rows();
-        debug_assert_eq!(jf.dim(), (n_rows, K * rank));
+        assert_eq!(jf.dim(), (n_rows, K * rank));
         let direction_u = self.direction_u.as_slice();
         let direction_v = self.direction_v.as_slice();
 

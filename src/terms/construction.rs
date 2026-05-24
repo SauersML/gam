@@ -207,7 +207,7 @@ fn mat_max_abs_element(matrix: MatRef<'_, f64>) -> f64 {
 
 fn sanitize_symmetric_faer(matrix: &Mat<f64>) -> Mat<f64> {
     let (rows, cols) = matrix.as_ref().shape();
-    debug_assert_eq!(rows, cols, "Matrix must be square for sanitization");
+    assert_eq!(rows, cols, "Matrix must be square for sanitization");
 
     let mut sanitized = matrix.clone();
 
@@ -314,7 +314,7 @@ fn trace_penalty_in_orthogonal_basis(
 ) -> f64 {
     let matrix_block = matrix.as_ref().submatrix(0, 0, block_dim, block_dim);
     let cols = orthogonal.ncols();
-    debug_assert!(rotated_eigenvalues.len() >= cols);
+    assert!(rotated_eigenvalues.len() >= cols);
     let mut projected = Mat::<f64>::zeros(block_dim, cols);
     matmul(
         projected.as_mut(),
@@ -835,7 +835,7 @@ impl CanonicalPenalty {
     }
 
     pub fn from_dense_root_with_mean(root: Array2<f64>, p: usize, prior_mean: Array1<f64>) -> Self {
-        debug_assert_eq!(prior_mean.len(), p);
+        assert_eq!(prior_mean.len(), p);
         let local = root.t().dot(&root);
         let positive_eigenvalues = Vec::new(); // not needed for TK paths
         Self {
@@ -1038,7 +1038,7 @@ pub fn report_penalty_pair_redundancy(canonical: &[CanonicalPenalty]) -> Vec<(us
             }
             // Shapes must match — they do when col_range matches because
             // `local` is `block_dim × block_dim` and `block_dim = col_range.len()`.
-            debug_assert_eq!(canonical[i].local.dim(), canonical[j].local.dim());
+            assert_eq!(canonical[i].local.dim(), canonical[j].local.dim());
 
             let inner: f64 = canonical[i]
                 .local

@@ -346,9 +346,9 @@ fn back_solve_lower_transpose(l: &Array2<f64>, rhs: &Array1<f64>, out: &mut Arra
     // Cholesky factor of the penalised Hessian. Walks bottom-up since
     // L^T is upper triangular.
     let p = rhs.len();
-    debug_assert_eq!(l.nrows(), p);
-    debug_assert_eq!(l.ncols(), p);
-    debug_assert_eq!(out.len(), p);
+    assert_eq!(l.nrows(), p);
+    assert_eq!(l.ncols(), p);
+    assert_eq!(out.len(), p);
     for i in (0..p).rev() {
         let mut v = rhs[i];
         for j in (i + 1)..p {

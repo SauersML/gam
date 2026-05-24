@@ -121,11 +121,11 @@ pub trait Manifold: Send + Sync {
     /// Riemannian inner product `<ξ, η>_p`. Default: weighted ambient
     /// inner product restricted to `T_p M`.
     fn inner_product(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, eta: ArrayView1<f64>) -> f64 {
-        debug_assert_eq!(p.len(), self.ambient_dim());
-        debug_assert_eq!(xi.len(), eta.len());
-        debug_assert_eq!(xi.len(), p.len());
+        assert_eq!(p.len(), self.ambient_dim());
+        assert_eq!(xi.len(), eta.len());
+        assert_eq!(xi.len(), p.len());
         let weights = self.metric_weights();
-        debug_assert_eq!(weights.len(), xi.len());
+        assert_eq!(weights.len(), xi.len());
         let mut acc = 0.0_f64;
         for i in 0..xi.len() {
             acc += weights[i] * xi[i] * eta[i];
@@ -162,7 +162,7 @@ pub trait Manifold: Send + Sync {
     /// Typed advisory sentinel — preferred over [`Manifold::warn_at`] for
     /// callers that route to a structured logger. Default returns `None`.
     fn warn_at_typed(&self, p: ArrayView1<f64>) -> Option<ManifoldWarning> {
-        debug_assert_eq!(p.len(), self.ambient_dim());
+        assert_eq!(p.len(), self.ambient_dim());
         None
     }
 
@@ -249,20 +249,20 @@ impl Manifold for Euclidean {
         self.d
     }
     fn project_tangent(&self, p: ArrayView1<f64>, v: ArrayViewMut1<f64>) {
-        debug_assert_eq!(p.len(), self.d);
-        debug_assert_eq!(v.len(), self.d);
+        assert_eq!(p.len(), self.d);
+        assert_eq!(v.len(), self.d);
     }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
-        debug_assert_eq!(p.len(), self.d);
-        debug_assert_eq!(xi.len(), self.d);
+        assert_eq!(p.len(), self.d);
+        assert_eq!(xi.len(), self.d);
         for i in 0..self.d {
             out[i] = p[i] + xi[i];
         }
     }
     fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
-        debug_assert_eq!(from.len(), self.d);
-        debug_assert_eq!(to.len(), self.d);
-        debug_assert_eq!(xi.len(), self.d);
+        assert_eq!(from.len(), self.d);
+        assert_eq!(to.len(), self.d);
+        assert_eq!(xi.len(), self.d);
     }
     fn euclidean_to_riemannian_hess_vp(
         &self,
@@ -271,10 +271,10 @@ impl Manifold for Euclidean {
         ehess_vp: ArrayViewMut1<f64>,
         xi: ArrayView1<f64>,
     ) {
-        debug_assert_eq!(p.len(), self.d);
-        debug_assert_eq!(egrad.len(), self.d);
-        debug_assert_eq!(ehess_vp.len(), self.d);
-        debug_assert_eq!(xi.len(), self.d);
+        assert_eq!(p.len(), self.d);
+        assert_eq!(egrad.len(), self.d);
+        assert_eq!(ehess_vp.len(), self.d);
+        assert_eq!(xi.len(), self.d);
         // Identity: no Weingarten correction in flat space.
     }
     fn name(&self) -> &str {
@@ -299,14 +299,14 @@ impl Manifold for Circle {
         vec![w; 2]
     }
     fn project_tangent(&self, p: ArrayView1<f64>, mut v: ArrayViewMut1<f64>) {
-        debug_assert_eq!(p.len(), 2);
-        debug_assert_eq!(v.len(), 2);
+        assert_eq!(p.len(), 2);
+        assert_eq!(v.len(), 2);
         // P_p(v) = v - <p,v> p ;  idempotent: P_p ∘ P_p = P_p.
         let dot = v[0] * p[0] + v[1] * p[1];
         v[0] -= dot * p[0];
         v[1] -= dot * p[1];
         // Tangency invariant: <p, v> ≈ 0 after one application.
-        debug_assert!((v[0] * p[0] + v[1] * p[1]).abs() < 1.0e-9);
+        assert!((v[0] * p[0] + v[1] * p[1]).abs() < 1.0e-9);
     }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
         // Closed-form projective retraction (proposal §4.2):
@@ -316,7 +316,7 @@ impl Manifold for Circle {
         let x = p[0] + xi[0];
         let y = p[1] + xi[1];
         let s2 = x * x + y * y;
-        debug_assert!(
+        assert!(
             s2.is_finite() && s2 > 0.0,
             "Circle::retract degenerate ||p+ξ||"
         );
@@ -324,12 +324,12 @@ impl Manifold for Circle {
         out[0] = x / norm;
         out[1] = y / norm;
         // Post-condition: retraction stays on S¹.
-        debug_assert!((out[0] * out[0] + out[1] * out[1] - 1.0).abs() < 1.0e-9);
+        assert!((out[0] * out[0] + out[1] * out[1] - 1.0).abs() < 1.0e-9);
     }
     fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
         // Projection approximation τ_{p→q}(ξ) = P_q(ξ) (proposal §4.4).
         // Safe even at antipodal endpoints since it does not divide by 1+<p,q>.
-        debug_assert_eq!(from.len(), 2);
+        assert_eq!(from.len(), 2);
         self.project_tangent(to, xi);
     }
     fn euclidean_to_riemannian_hess_vp(
@@ -346,10 +346,10 @@ impl Manifold for Circle {
         // gradient ∇_E, not P_p(∇_E). If we passed the projected gradient
         // here the radial-egrad scalar would be exactly zero and the
         // curvature correction would silently vanish.
-        debug_assert_eq!(p.len(), 2);
-        debug_assert_eq!(egrad.len(), 2);
-        debug_assert_eq!(ehess_vp.len(), 2);
-        debug_assert_eq!(xi.len(), 2);
+        assert_eq!(p.len(), 2);
+        assert_eq!(egrad.len(), 2);
+        assert_eq!(ehess_vp.len(), 2);
+        assert_eq!(xi.len(), 2);
         let radial_egrad = egrad[0] * p[0] + egrad[1] * p[1];
         ehess_vp[0] -= radial_egrad * xi[0];
         ehess_vp[1] -= radial_egrad * xi[1];
@@ -358,7 +358,7 @@ impl Manifold for Circle {
     /// Closed-form tangent basis: a single unit vector orthogonal to `p`,
     /// `Q(p) = [-p_y, p_x]ᵀ` (proposal §4.1). O(1) vs the default O(m³).
     fn tangent_basis(&self, p: ArrayView1<f64>) -> Array2<f64> {
-        debug_assert_eq!(p.len(), 2);
+        assert_eq!(p.len(), 2);
         let mut q = Array2::<f64>::zeros((2, 1));
         q[[0, 0]] = -p[1];
         q[[1, 0]] = p[0];
@@ -390,8 +390,8 @@ impl Manifold for Sphere {
         vec![w; self.n + 1]
     }
     fn project_tangent(&self, p: ArrayView1<f64>, mut v: ArrayViewMut1<f64>) {
-        debug_assert_eq!(p.len(), self.n + 1);
-        debug_assert_eq!(v.len(), self.n + 1);
+        assert_eq!(p.len(), self.n + 1);
+        assert_eq!(v.len(), self.n + 1);
         // P_p(v) = (I - pp^T) v = v - <p, v> p (proposal §6.3). Idempotent.
         let mut dot = 0.0_f64;
         for i in 0..p.len() {
@@ -405,7 +405,7 @@ impl Manifold for Sphere {
             for i in 0..p.len() {
                 chk += v[i] * p[i];
             }
-            debug_assert!(chk.abs() < 1.0e-8 * (1.0 + p.len() as f64));
+            assert!(chk.abs() < 1.0e-8 * (1.0 + p.len() as f64));
         }
     }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
@@ -419,7 +419,7 @@ impl Manifold for Sphere {
             out[i] = v;
             s2 += v * v;
         }
-        debug_assert!(
+        assert!(
             s2.is_finite() && s2 > 0.0,
             "Sphere::retract degenerate ||p+ξ||"
         );
@@ -432,7 +432,7 @@ impl Manifold for Sphere {
             for i in 0..m {
                 n2 += out[i] * out[i];
             }
-            debug_assert!(
+            assert!(
                 (n2 - 1.0).abs() < 1.0e-9,
                 "Sphere::retract output not on S^n"
             );
@@ -444,7 +444,7 @@ impl Manifold for Sphere {
         // here — unlike exact geodesic transport which has a 1+<p,q>
         // denominator. The transported tangent can be small near antipodal
         // endpoints; that is a correctness-preserving degradation.
-        debug_assert_eq!(from.len(), self.n + 1);
+        assert_eq!(from.len(), self.n + 1);
         self.project_tangent(to, xi);
     }
     fn euclidean_to_riemannian_hess_vp(
@@ -460,10 +460,10 @@ impl Manifold for Sphere {
         // projected gradient would make <p, ∇_E> ≡ 0 and silently drop the
         // curvature correction — this matches the explicit warning in the
         // derivation.
-        debug_assert_eq!(p.len(), self.n + 1);
-        debug_assert_eq!(egrad.len(), self.n + 1);
-        debug_assert_eq!(ehess_vp.len(), self.n + 1);
-        debug_assert_eq!(xi.len(), self.n + 1);
+        assert_eq!(p.len(), self.n + 1);
+        assert_eq!(egrad.len(), self.n + 1);
+        assert_eq!(ehess_vp.len(), self.n + 1);
+        assert_eq!(xi.len(), self.n + 1);
         let mut radial_egrad = 0.0_f64;
         for i in 0..p.len() {
             radial_egrad += egrad[i] * p[i];
@@ -484,7 +484,7 @@ impl Manifold for Sphere {
     /// orthonormal basis of `T_p M`.
     fn tangent_basis(&self, p: ArrayView1<f64>) -> Array2<f64> {
         let m = self.n + 1;
-        debug_assert_eq!(p.len(), m);
+        assert_eq!(p.len(), m);
         if m == 0 {
             return Array2::<f64>::zeros((0, 0));
         }
@@ -592,8 +592,8 @@ impl Manifold for Interval {
         vec![1.0 / (scale * scale)]
     }
     fn project_tangent(&self, p: ArrayView1<f64>, v: ArrayViewMut1<f64>) {
-        debug_assert_eq!(p.len(), 1);
-        debug_assert_eq!(v.len(), 1);
+        assert_eq!(p.len(), 1);
+        assert_eq!(v.len(), 1);
         // 1-d open submanifold of ℝ; tangent space is all of ℝ.
     }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
@@ -603,19 +603,19 @@ impl Manifold for Interval {
         // tanh chart would be applied, so the implicit chart Jacobian
         // J = r·(1 - tanh(z)^2) stays bounded throughout the optimizer
         // (this matches proposal §15 numerical-pitfalls discussion).
-        debug_assert_eq!(p.len(), 1);
-        debug_assert_eq!(xi.len(), 1);
-        debug_assert_eq!(out.len(), 1);
+        assert_eq!(p.len(), 1);
+        assert_eq!(xi.len(), 1);
+        assert_eq!(out.len(), 1);
         out[0] = self.clip(p[0] + xi[0]);
-        debug_assert!(
+        assert!(
             out[0] > self.lo && out[0] < self.hi,
             "Interval::retract output left feasible band"
         );
     }
     fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
-        debug_assert_eq!(from.len(), 1);
-        debug_assert_eq!(to.len(), 1);
-        debug_assert_eq!(xi.len(), 1);
+        assert_eq!(from.len(), 1);
+        assert_eq!(to.len(), 1);
+        assert_eq!(xi.len(), 1);
     }
     fn euclidean_to_riemannian_hess_vp(
         &self,
@@ -624,10 +624,10 @@ impl Manifold for Interval {
         ehess_vp: ArrayViewMut1<f64>,
         xi: ArrayView1<f64>,
     ) {
-        debug_assert_eq!(p.len(), 1);
-        debug_assert_eq!(egrad.len(), 1);
-        debug_assert_eq!(ehess_vp.len(), 1);
-        debug_assert_eq!(xi.len(), 1);
+        assert_eq!(p.len(), 1);
+        assert_eq!(egrad.len(), 1);
+        assert_eq!(ehess_vp.len(), 1);
+        assert_eq!(xi.len(), 1);
         // Open submanifold of ℝ: no second fundamental form correction in
         // the natural chart used here.
     }
@@ -642,7 +642,7 @@ impl Manifold for Interval {
     /// Closed-form trivial 1×1 identity basis (proposal §7: T_p M = ℝ in
     /// the interior). Override avoids the generic O(m³) Gram-Schmidt path.
     fn tangent_basis(&self, p: ArrayView1<f64>) -> Array2<f64> {
-        debug_assert_eq!(p.len(), 1);
+        assert_eq!(p.len(), 1);
         let mut q = Array2::<f64>::zeros((1, 1));
         q[[0, 0]] = 1.0;
         q
@@ -688,7 +688,7 @@ impl Manifold for Torus {
             let x = p[2 * k] + xi[2 * k];
             let y = p[2 * k + 1] + xi[2 * k + 1];
             let s2 = x * x + y * y;
-            debug_assert!(
+            assert!(
                 s2.is_finite() && s2 > 0.0,
                 "Torus::retract degenerate at axis {}",
                 k
@@ -698,12 +698,12 @@ impl Manifold for Torus {
             out[2 * k + 1] = y / norm;
             if cfg!(debug_assertions) {
                 let n2 = out[2 * k] * out[2 * k] + out[2 * k + 1] * out[2 * k + 1];
-                debug_assert!((n2 - 1.0).abs() < 1.0e-9);
+                assert!((n2 - 1.0).abs() < 1.0e-9);
             }
         }
     }
     fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
-        debug_assert_eq!(from.len(), 2 * self.d);
+        assert_eq!(from.len(), 2 * self.d);
         self.project_tangent(to, xi);
     }
     fn euclidean_to_riemannian_hess_vp(
@@ -731,7 +731,7 @@ impl Manifold for Torus {
     ///   Q = blockdiag(Q_1, ..., Q_d) with Q_j = [-p_{j,y}, p_{j,x}]ᵀ.
     /// O(d) vs default O(m³) where m = 2d.
     fn tangent_basis(&self, p: ArrayView1<f64>) -> Array2<f64> {
-        debug_assert_eq!(p.len(), 2 * self.d);
+        assert_eq!(p.len(), 2 * self.d);
         let mut q = Array2::<f64>::zeros((2 * self.d, self.d));
         for k in 0..self.d {
             q[[2 * k, k]] = -p[2 * k + 1];
@@ -841,8 +841,8 @@ impl Manifold for Product {
             let dc = c.dim();
             let p_slice = p.slice(ndarray::s![row_off..row_off + mc]);
             let qc = c.tangent_basis(p_slice);
-            debug_assert_eq!(qc.nrows(), mc);
-            debug_assert_eq!(qc.ncols(), dc);
+            assert_eq!(qc.nrows(), mc);
+            assert_eq!(qc.ncols(), dc);
             for i in 0..mc {
                 for j in 0..dc {
                     q[[row_off + i, col_off + j]] = qc[[i, j]];
@@ -949,8 +949,8 @@ pub fn retract_euclidean_delta(
     out_new_point: ArrayViewMut1<f64>,
 ) {
     let m = manifold.ambient_dim();
-    debug_assert_eq!(point.len(), m);
-    debug_assert_eq!(delta.len(), m);
+    assert_eq!(point.len(), m);
+    assert_eq!(delta.len(), m);
     let mut xi = delta.to_owned();
     manifold.project_tangent(point, xi.view_mut());
     manifold.retract(point, xi.view(), out_new_point);

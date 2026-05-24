@@ -1231,7 +1231,7 @@ fn logit_logp_and_grad_into(
 ) -> (f64, Array1<f64>) {
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
-    debug_assert_eq!(residual.len(), n);
+    assert_eq!(residual.len(), n);
     // Per-row independent: write residual entry into a pre-allocated buffer and
     // reduce the ll contribution in parallel — avoids materialising a
     // Vec<(f64, f64)> and the serial scatter that follows.
@@ -1272,7 +1272,7 @@ fn probit_logp_and_grad_into(
 ) -> (f64, Array1<f64>) {
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
-    debug_assert_eq!(residual.len(), n);
+    assert_eq!(residual.len(), n);
     let ll: f64 = residual
         .as_slice_mut()
         .unwrap()
@@ -1334,7 +1334,7 @@ fn cloglog_logp_and_grad_into(
 ) -> (f64, Array1<f64>) {
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
-    debug_assert_eq!(residual.len(), n);
+    assert_eq!(residual.len(), n);
     if eta
         .iter()
         .any(|&eta_i| !(eta_i.is_finite() && (-700.0..=700.0).contains(&eta_i)))
@@ -1385,7 +1385,7 @@ fn gaussian_logp_and_grad_into(
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
     let inv_phi = data.dispersion.inv_phi();
-    debug_assert_eq!(weighted_residual.len(), n);
+    assert_eq!(weighted_residual.len(), n);
     // Per-row: residual = y - η, weighted_residual = (w/φ)·residual,
     // ll contribution = -0.5·(w/φ)·residual². All independent across rows.
     let ll: f64 = weighted_residual
@@ -3278,9 +3278,9 @@ fn sample_standard_normal<R: rand::Rng + ?Sized>(rng: &mut R) -> f64 {
 #[inline]
 fn back_solve_lower_transposed(l: &Array2<f64>, rhs: &Array1<f64>, out: &mut Array1<f64>) {
     let p = rhs.len();
-    debug_assert_eq!(l.nrows(), p);
-    debug_assert_eq!(l.ncols(), p);
-    debug_assert_eq!(out.len(), p);
+    assert_eq!(l.nrows(), p);
+    assert_eq!(l.ncols(), p);
+    assert_eq!(out.len(), p);
     // Solve Lᵀ x = rhs from the bottom row up. Row i of Lᵀ has nonzeros
     // at columns j ≥ i (= column i of L at rows j ≥ i), so
     //   rhs[i] = L[i,i] · x[i] + Σ_{j>i} L[j,i] · x[j].

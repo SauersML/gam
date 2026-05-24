@@ -1071,7 +1071,7 @@ impl PirlsWorkspace {
         if n == 0 || p == 0 {
             return;
         }
-        debug_assert_eq!(
+        assert_eq!(
             weights.len(),
             n,
             "weight length must match row count for signed streamed XtWX"
@@ -1557,7 +1557,7 @@ impl KroneckerQsTransform {
     }
 
     fn apply_internal(&self, vector: &Array1<f64>, transpose: bool) -> Array1<f64> {
-        debug_assert_eq!(vector.len(), self.p);
+        assert_eq!(vector.len(), self.p);
         // Ping-pong two thread-local scratch buffers across axes so we
         // allocate at most twice per thread for the whole solver lifetime
         // instead of once per `apply` call per axis.
@@ -1627,7 +1627,7 @@ fn apply_kron_mode_into(
     let before: usize = dims[..axis].iter().product();
     let dim = dims[axis];
     let after: usize = dims[axis + 1..].iter().product();
-    debug_assert_eq!(out.len(), data.len());
+    assert_eq!(out.len(), data.len());
     for b in 0..before {
         for s in 0..after {
             for i in 0..dim {
@@ -2777,7 +2777,7 @@ impl DenseOuterState {
         n: usize,
         p: usize,
     ) {
-        debug_assert_eq!(self.xtwx_dense.dim(), (p, p));
+        assert_eq!(self.xtwx_dense.dim(), (p, p));
         self.xtwx_dense.fill(0.0);
         if n == 0 || p == 0 {
             return;
@@ -2857,8 +2857,8 @@ impl SparseSpGemmState {
         xtwxvalues: &mut [f64],
     ) {
         let n = x_t.ncols();
-        debug_assert_eq!(weights.len(), n);
-        debug_assert_eq!(self.sqrt_weights.len(), n);
+        assert_eq!(weights.len(), n);
+        assert_eq!(self.sqrt_weights.len(), n);
 
         assert!(
             weights.iter().all(|&w| w.is_finite() && w >= 0.0),
@@ -2933,7 +2933,7 @@ fn accumulate_outer_upper(
     weights: &Array1<f64>,
     rows: std::ops::Range<usize>,
 ) {
-    debug_assert_eq!(acc.nrows(), acc.ncols());
+    assert_eq!(acc.nrows(), acc.ncols());
     let p = acc.ncols();
     let acc_data = acc
         .as_slice_mut()
@@ -4982,7 +4982,7 @@ where
                     // gradient w.r.t. `t` carries a shared `Schur⁻¹`
                     // factor — that's a separate plumbing change
                     // handled at the REML driver level, NOT here.
-                    debug_assert_eq!(arrow_cfg.n_beta, beta.as_ref().len());
+                    assert_eq!(arrow_cfg.n_beta, beta.as_ref().len());
                     match arrow_cfg.build.as_ref()(beta.as_ref()) {
                         None => {
                             // Driver opted out (e.g. latent not yet
@@ -7873,7 +7873,7 @@ fn solve_penalized_least_squares_implicit(
     //    is identical across outer iterations, so reuse the precomputed
     //    `XᵀW(y − offset)` directly.
     let xtwy_orig = if let Some(cache) = gaussian_fixed_cache {
-        debug_assert_eq!(
+        assert_eq!(
             cache.xtwy_orig.len(),
             x_original.ncols(),
             "GaussianFixedCache XᵀW(y−offset) length must match design p"
@@ -11303,7 +11303,7 @@ pub fn latent_apply_ift_warm_start(
 ) -> usize {
     let n = latent.n_obs();
     let d = latent.latent_dim();
-    debug_assert_eq!(delta_t.len(), n * d);
+    assert_eq!(delta_t.len(), n * d);
     let mut clamped_rows = 0_usize;
     let mut applied = ndarray::Array1::<f64>::zeros(n * d);
     for i in 0..n {

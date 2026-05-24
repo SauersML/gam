@@ -95,7 +95,7 @@ fn assign_populations(pcs: &[[f64; PC_DIM]]) -> Vec<usize> {
         }
         start += size;
     }
-    debug_assert_eq!(start, n);
+    assert_eq!(start, n);
     pop
 }
 

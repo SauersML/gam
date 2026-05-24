@@ -1885,7 +1885,7 @@ fn poly_conv_into(lhs: &[f64], rhs: &[f64], out: &mut [f64]) -> usize {
         return 0;
     }
     let len = lhs.len() + rhs.len() - 1;
-    debug_assert!(out.len() >= len);
+    assert!(out.len() >= len);
     for slot in out[..len].iter_mut() {
         *slot = 0.0;
     }
@@ -3082,7 +3082,7 @@ fn affine_anchor_moment_vector_into(
     max_degree: usize,
     out: &mut [f64],
 ) {
-    debug_assert_eq!(out.len(), max_degree + 1);
+    assert_eq!(out.len(), max_degree + 1);
     let s = (1.0 + beta * beta).sqrt();
     let mu = -alpha * beta / (1.0 + beta * beta);
     let y_left = if left.is_infinite() {
@@ -3104,7 +3104,7 @@ fn affine_anchor_moment_vector_into(
         s * (right - mu)
     };
     let anchor = (-alpha * alpha / (2.0 * s * s)).exp() / s;
-    debug_assert!(
+    assert!(
         max_degree <= MAX_AFFINE_ANCHOR_DEGREE,
         "affine_anchor_moment_vector max_degree {} exceeds compile-time bound {}",
         max_degree,
@@ -3230,7 +3230,7 @@ fn evaluate_non_affine_cell_state(
     let c2 = cell.c2;
     let c3 = cell.c3;
     let moments_slice: &mut [f64] = &mut moments;
-    debug_assert_eq!(GL_NODES.len(), GL_WEIGHTS.len());
+    assert_eq!(GL_NODES.len(), GL_WEIGHTS.len());
     // SIMD path: process 4 GL nodes per outer iteration, batching the two
     // scalar `exp` calls into single 4-wide `wide::f64x4::exp` invocations.
     // 384 is divisible by 4, so no scalar tail is needed for the GL sweep.

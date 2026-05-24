@@ -2647,7 +2647,7 @@ struct BinaryFromLogSurvival {
     ///     neg_Hess(log_lik) = grad_scale * neg_hessian + outer_scale * score²
     /// so by the chain rule this MUST equal `grad_scale` (= ℓ'). Keeping
     /// the two fields separate is purely for readability at call sites;
-    /// the `debug_assert!` in [`binary_log_survival_scales`] enforces the
+    /// the `assert!` in [`binary_log_survival_scales`] enforces the
     /// equality.
     neg_hess_scale: f64,
     /// -ℓ''(s). For event=1 this is +S/(1-S)²; for event=0 it is 0.
@@ -2746,11 +2746,11 @@ fn binary_from_log_survival(
     //     neg_Hess(log_lik) = neg_hess_scale * (-d²s/dβ²) + outer_scale * (ds/dβ)²
     // For this identity to hold by the chain rule, the coefficient on the
     // neg_hessian term must equal ℓ' (== grad_scale). Document the invariant.
-    debug_assert!(
+    assert!(
         (grad_scale - neg_hess_scale).abs() <= 1e-15 * grad_scale.abs().max(1.0),
         "binary_from_log_survival invariant: neg_hess_scale ({neg_hess_scale}) must equal grad_scale ({grad_scale}) so that grad_scale and the coefficient on neg_hessian share sign"
     );
-    debug_assert!(
+    assert!(
         outer_scale >= 0.0 || !outer_scale.is_finite(),
         "binary_from_log_survival invariant: outer_scale (= -ℓ'') must be non-negative for event=1; got {outer_scale}"
     );

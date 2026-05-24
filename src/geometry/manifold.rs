@@ -135,7 +135,7 @@ pub(crate) const fn check_len(
 }
 
 pub(crate) fn dot(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len());
     let mut out = 0.0;
     for i in 0..a.len() {
         out += a[i] * b[i];

@@ -192,8 +192,8 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
     ///     collinear basis, etc.).
     pub fn solve(&mut self) -> Result<LatentInnerOutcome, String> {
         let opts = self.options.clone();
-        debug_assert!(opts.lm_grow > 1.0, "LM ridge grow factor must exceed 1");
-        debug_assert!(
+        assert!(opts.lm_grow > 1.0, "LM ridge grow factor must exceed 1");
+        assert!(
             opts.lm_shrink > 0.0 && opts.lm_shrink < 1.0,
             "LM ridge shrink factor must lie in (0, 1)"
         );
@@ -444,8 +444,8 @@ fn arrow_predicted_reduction(
     ridge_t: f64,
     ridge_beta: f64,
 ) -> f64 {
-    debug_assert_eq!(delta_t.len(), sys.rows.len() * sys.d);
-    debug_assert_eq!(delta_beta.len(), sys.k);
+    assert_eq!(delta_t.len(), sys.rows.len() * sys.d);
+    assert_eq!(delta_beta.len(), sys.k);
     let mut lin = sys.gb.dot(&delta_beta);
     let mut quad = ridge_beta * delta_beta.dot(&delta_beta);
 

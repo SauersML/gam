@@ -81,7 +81,7 @@ impl<'a> RemlState<'a> {
         let Some(scale) = observation_weight_sqrt else {
             return;
         };
-        debug_assert_eq!(out.nrows(), scale.len());
+        assert_eq!(out.nrows(), scale.len());
         let ncols = out.ncols();
         if ncols == 0 {
             return;
@@ -140,11 +140,11 @@ impl<'a> RemlState<'a> {
         w3: &mut Array1<f64>,
         w4: &mut Array1<f64>,
     ) {
-        debug_assert_eq!(eta.len(), w.len());
-        debug_assert_eq!(eta.len(), w1.len());
-        debug_assert_eq!(eta.len(), w2.len());
-        debug_assert_eq!(eta.len(), w3.len());
-        debug_assert_eq!(eta.len(), w4.len());
+        assert_eq!(eta.len(), w.len());
+        assert_eq!(eta.len(), w1.len());
+        assert_eq!(eta.len(), w2.len());
+        assert_eq!(eta.len(), w3.len());
+        assert_eq!(eta.len(), w4.len());
 
         if Self::parallelize_firth_derivative_rows(eta.len()) {
             Zip::from(w)
@@ -186,14 +186,14 @@ impl<'a> RemlState<'a> {
         right: &Array2<f64>,
         weights: &Array1<f64>,
     ) -> Array2<f64> {
-        debug_assert_eq!(left.nrows(), right.nrows());
-        debug_assert_eq!(left.nrows(), weights.len());
+        assert_eq!(left.nrows(), right.nrows());
+        assert_eq!(left.nrows(), weights.len());
         super::assembly::weighted_cross_dense(left, right, weights)
     }
 
     pub(crate) fn trace_product(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
-        debug_assert_eq!(a.nrows(), b.ncols());
-        debug_assert_eq!(a.ncols(), b.nrows());
+        assert_eq!(a.nrows(), b.ncols());
+        assert_eq!(a.ncols(), b.nrows());
         let elems = a.nrows().saturating_mul(a.ncols());
         if elems >= 32 * 32 {
             let aview = FaerArrayView::new(a);
@@ -337,7 +337,7 @@ impl FirthDenseOperator {
         gram: &Array2<f64>,
     ) -> Result<(Array2<f64>, Array1<f64>), EstimationError> {
         let p = gram.nrows();
-        debug_assert_eq!(p, gram.ncols());
+        assert_eq!(p, gram.ncols());
         if p == 0 {
             return Ok((Array2::<f64>::eye(0), Array1::<f64>::zeros(0)));
         }
@@ -377,8 +377,8 @@ impl FirthDenseOperator {
 
     #[inline]
     fn trace_diag_product(diag: &Array1<f64>, matrix: &Array2<f64>) -> f64 {
-        debug_assert_eq!(diag.len(), matrix.nrows());
-        debug_assert_eq!(matrix.nrows(), matrix.ncols());
+        assert_eq!(diag.len(), matrix.nrows());
+        assert_eq!(matrix.nrows(), matrix.ncols());
         kahan_sum((0..diag.len()).map(|i| diag[i] * matrix[[i, i]]))
     }
 
@@ -662,7 +662,7 @@ impl FirthDenseOperator {
     pub(crate) fn jeffreys_logdet_projected(&self, z: ndarray::ArrayView2<'_, f64>) -> f64 {
         use crate::faer_ndarray::{fast_ab, fast_xt_diag_x};
         let p = self.x_dense.ncols();
-        debug_assert_eq!(
+        assert_eq!(
             z.nrows(),
             p,
             "jeffreys_logdet_projected: Z must have {} rows (β-space dim), got {}",
@@ -965,8 +965,8 @@ impl FirthDenseOperator {
     }
 
     pub(super) fn rowwise_dot(a: &Array2<f64>, b: &Array2<f64>) -> Array1<f64> {
-        debug_assert_eq!(a.nrows(), b.nrows());
-        debug_assert_eq!(a.ncols(), b.ncols());
+        assert_eq!(a.nrows(), b.nrows());
+        assert_eq!(a.ncols(), b.ncols());
         let mut out = Array1::<f64>::zeros(a.nrows());
         for i in 0..a.nrows() {
             let mut acc = 0.0_f64;
@@ -984,9 +984,9 @@ impl FirthDenseOperator {
         b: &Array2<f64>,
     ) -> Array1<f64> {
         // Returns vector with entries a_iᵀ M b_i for each row i.
-        debug_assert_eq!(a.nrows(), b.nrows());
-        debug_assert_eq!(a.ncols(), m.nrows());
-        debug_assert_eq!(b.ncols(), m.ncols());
+        assert_eq!(a.nrows(), b.nrows());
+        assert_eq!(a.ncols(), m.nrows());
+        assert_eq!(b.ncols(), m.ncols());
         let am = fast_ab(a, m);
         Self::rowwise_dot(&am, b)
     }

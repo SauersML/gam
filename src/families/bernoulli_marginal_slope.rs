@@ -704,8 +704,8 @@ impl LatentZRankIntCalibration {
     }
 
     fn apply_with_knots(z: f64, sorted_z: &[f64], weighted_cdf: &[f64]) -> f64 {
-        debug_assert_eq!(sorted_z.len(), weighted_cdf.len());
-        debug_assert!(!sorted_z.is_empty());
+        assert_eq!(sorted_z.len(), weighted_cdf.len());
+        assert!(!sorted_z.is_empty());
         let n = sorted_z.len();
         let p = if z <= sorted_z[0] {
             weighted_cdf[0]
@@ -1918,8 +1918,8 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
         .runtime
         .design_at_training_with_residual(candidate_arg_at_training_rows)?;
     let new_p = new_design.ncols();
-    debug_assert_eq!(new_p, k_kept);
-    debug_assert_eq!(new_design.nrows(), n);
+    assert_eq!(new_p, k_kept);
+    assert_eq!(new_design.nrows(), n);
     candidate.block.design =
         DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(new_design));
     candidate.block.penalties.clear();
@@ -3927,7 +3927,7 @@ impl BernoulliBlockHessianAccumulator {
         t: &[[f64; 2]; 2],
         w: f64,
     ) {
-        debug_assert!(
+        assert!(
             self.dense_correction.is_none(),
             "add_pullback_rigid_2x2 called on accumulator with dense_correction"
         );
@@ -4177,9 +4177,9 @@ impl BernoulliBlockHessianAccumulator {
                     // h_mm += s * (psi outer x_row + x_row outer psi)
                     let s = right_primary[0];
                     let p = x_row.len();
-                    debug_assert_eq!(psi_row.len(), p);
-                    debug_assert_eq!(self.h_mm.nrows(), p);
-                    debug_assert_eq!(self.h_mm.ncols(), p);
+                    assert_eq!(psi_row.len(), p);
+                    assert_eq!(self.h_mm.nrows(), p);
+                    assert_eq!(self.h_mm.ncols(), p);
                     for i in 0..p {
                         let psi_i = psi_row[i];
                         if psi_i == 0.0 {
@@ -4202,8 +4202,8 @@ impl BernoulliBlockHessianAccumulator {
                     let s = right_primary[0];
                     let pm = x_row.len();
                     let pl = psi_row.len();
-                    debug_assert_eq!(self.h_mg.nrows(), pm);
-                    debug_assert_eq!(self.h_mg.ncols(), pl);
+                    assert_eq!(self.h_mg.nrows(), pm);
+                    assert_eq!(self.h_mg.ncols(), pl);
                     for j in 0..pl {
                         let psi_j = psi_row[j];
                         if psi_j == 0.0 {
@@ -4228,8 +4228,8 @@ impl BernoulliBlockHessianAccumulator {
                     let s = right_primary[1];
                     let pm = psi_row.len();
                     let pl = g_row.len();
-                    debug_assert_eq!(self.h_mg.nrows(), pm);
-                    debug_assert_eq!(self.h_mg.ncols(), pl);
+                    assert_eq!(self.h_mg.nrows(), pm);
+                    assert_eq!(self.h_mg.ncols(), pl);
                     for i in 0..pm {
                         let psi_i = psi_row[i];
                         if psi_i == 0.0 {
@@ -4247,9 +4247,9 @@ impl BernoulliBlockHessianAccumulator {
                     // h_gg += s * (psi outer g_row + g_row outer psi)
                     let s = right_primary[1];
                     let p = g_row.len();
-                    debug_assert_eq!(psi_row.len(), p);
-                    debug_assert_eq!(self.h_gg.nrows(), p);
-                    debug_assert_eq!(self.h_gg.ncols(), p);
+                    assert_eq!(psi_row.len(), p);
+                    assert_eq!(self.h_gg.nrows(), p);
+                    assert_eq!(self.h_gg.ncols(), p);
                     for i in 0..p {
                         let psi_i = psi_row[i];
                         if psi_i == 0.0 {
@@ -4466,7 +4466,7 @@ struct RowCellMomentsBundle {
 impl RowCellMomentsBundle {
     #[inline]
     fn row(&self, row: usize, required_degree: usize) -> Option<&[CachedDenestedCellMoments]> {
-        debug_assert!(
+        assert!(
             self.max_degree >= required_degree,
             "row cell moments bundle max_degree={} required_degree={}",
             self.max_degree,
@@ -5145,8 +5145,8 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
             None => self::axis_jf_via_column_dot(&self.family.logslope_design, &f_logs, n_rows),
         };
 
-        debug_assert_eq!(jf_marg.dim(), (n_rows, rank));
-        debug_assert_eq!(jf_logs.dim(), (n_rows, rank));
+        assert_eq!(jf_marg.dim(), (n_rows, rank));
+        assert_eq!(jf_logs.dim(), (n_rows, rank));
 
         // Pack into row-major (n × 2·rank): first `rank` columns are
         // k=0 (marginal axis), next `rank` are k=1 (logslope axis). This
@@ -8501,7 +8501,7 @@ impl BernoulliMarginalSlopeFamily {
                 exact::DenestedPartitionCell,
                 std::borrow::Cow<'_, exact::CellDerivativeMomentState>,
             )> = if let Some(cached) = row_cell_moments {
-                debug_assert!(
+                assert!(
                     !cached.is_empty(),
                     "row cell moments bundle was selected but row {row} has no cells"
                 );
@@ -15853,8 +15853,8 @@ impl BernoulliMarginalSlopeFamily {
 
     fn row_primary_trace_contract(third: &Array2<f64>, gram: &[f64]) -> f64 {
         let r = third.nrows();
-        debug_assert_eq!(third.ncols(), r);
-        debug_assert_eq!(gram.len(), r * r);
+        assert_eq!(third.ncols(), r);
+        assert_eq!(gram.len(), r * r);
         let mut total = 0.0;
         for a in 0..r {
             for b in 0..r {
