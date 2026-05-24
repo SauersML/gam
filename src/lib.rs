@@ -66,6 +66,7 @@ pub mod cache;
 pub mod families;
 pub mod geometry;
 pub mod gpu;
+pub mod identifiability;
 pub mod inference;
 pub mod linalg;
 pub mod report;
