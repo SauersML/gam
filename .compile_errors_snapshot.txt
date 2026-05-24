@@ -153,3 +153,87 @@ error[E0614]: type `usize` cannot be dereferenced
 4775 |                 BSplineKnotSpec::PeriodicUniform { num_basis, .. } => *num_basis,
      |                                                                       ^^^^^^^^^^ can't be dereferenced
 
+error[E0004]: non-exhaustive patterns: `&AnalyticPenaltyKind::NestedPrefix(_)` not covered
+    --> src/solver/reml/runtime.rs:860:11
+     |
+ 860 |     match penalty {
+     |           ^^^^^^^ pattern `&AnalyticPenaltyKind::NestedPrefix(_)` not covered
+     |
+note: `AnalyticPenaltyKind` defined here
+    --> src/terms/analytic_penalties.rs:6336:18
+     |
+6336 |         pub enum AnalyticPenaltyKind {
+     |                  ^^^^^^^^^^^^^^^^^^^
+...
+6440 | crate::analytic_penalty_registry!(define_analytic_penalty_kind);
+     | --------------------------------------------------------------- in this macro invocation
+     |
+    ::: src/terms/penalties/mod.rs:53:23
+     |
+  53 |             register!(NestedPrefix, NestedPrefixPenalty);
+     |                       ------------ not covered
+     = note: the matched value is of type `&AnalyticPenaltyKind`
+     = note: this error originates in the macro `define_analytic_penalty_kind` which comes from the expansion of the macro `crate::analytic_penalty_registry` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+     |
+1092 ~         },
+1093 +         &AnalyticPenaltyKind::NestedPrefix(_) => todo!()
+     |
+
+error[E0004]: non-exhaustive patterns: `&AnalyticPenaltyKind::NestedPrefix(_)` not covered
+    --> src/terms/analytic_penalties.rs:6549:15
+     |
+6549 |         match &self.penalty {
+     |               ^^^^^^^^^^^^^ pattern `&AnalyticPenaltyKind::NestedPrefix(_)` not covered
+     |
+note: `AnalyticPenaltyKind` defined here
+    --> src/terms/analytic_penalties.rs:6336:18
+     |
+6336 |         pub enum AnalyticPenaltyKind {
+     |                  ^^^^^^^^^^^^^^^^^^^
+...
+6440 | crate::analytic_penalty_registry!(define_analytic_penalty_kind);
+     | --------------------------------------------------------------- in this macro invocation
+     |
+    ::: src/terms/penalties/mod.rs:53:23
+     |
+  53 |             register!(NestedPrefix, NestedPrefixPenalty);
+     |                       ------------ not covered
+     = note: the matched value is of type `&AnalyticPenaltyKind`
+     = note: this error originates in the macro `define_analytic_penalty_kind` which comes from the expansion of the macro `crate::analytic_penalty_registry` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+     |
+6612 ~             AnalyticPenaltyKind::Isometry(_) => self.diag_via_matvec(),
+6613 ~             &AnalyticPenaltyKind::NestedPrefix(_) => todo!(),
+     |
+
+error[E0004]: non-exhaustive patterns: `&AnalyticPenaltyKind::NestedPrefix(_)` not covered
+    --> src/terms/analytic_penalties.rs:6629:15
+     |
+6629 |         match &self.penalty {
+     |               ^^^^^^^^^^^^^ pattern `&AnalyticPenaltyKind::NestedPrefix(_)` not covered
+     |
+note: `AnalyticPenaltyKind` defined here
+    --> src/terms/analytic_penalties.rs:6336:18
+     |
+6336 |         pub enum AnalyticPenaltyKind {
+     |                  ^^^^^^^^^^^^^^^^^^^
+...
+6440 | crate::analytic_penalty_registry!(define_analytic_penalty_kind);
+     | --------------------------------------------------------------- in this macro invocation
+     |
+    ::: src/terms/penalties/mod.rs:53:23
+     |
+  53 |             register!(NestedPrefix, NestedPrefixPenalty);
+     |                       ------------ not covered
+     = note: the matched value is of type `&AnalyticPenaltyKind`
+     = note: this error originates in the macro `define_analytic_penalty_kind` which comes from the expansion of the macro `crate::analytic_penalty_registry` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: ensure that all possible cases are being handled by adding a match arm with a wildcard pattern or an explicit pattern as shown
+     |
+6719 ~             },
+6720 +             &AnalyticPenaltyKind::NestedPrefix(_) => todo!()
+     |
+
+Some errors have detailed explanations: E0004, E0425, E0614.
+For more information about an error, try `rustc --explain E0004`.
+error: could not compile `gam` (lib) due to 28 previous errors

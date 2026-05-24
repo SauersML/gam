@@ -97,8 +97,8 @@ extern "C" __global__ void row_scale_inplace_kernel(
     let w_slice = w.as_slice().ok_or_else(|| GpuError::DriverCallFailed {
         reason: "row_scale weight slice not contiguous".to_string(),
     })?;
-    let mut dx = stream.memcpy_stod(&host).map_err(map_drv)?;
-    let dw = stream.memcpy_stod(w_slice).map_err(map_drv)?;
+    let mut dx = stream.clone_htod(&host).map_err(map_drv)?;
+    let dw = stream.clone_htod(w_slice).map_err(map_drv)?;
 
     let tx: u32 = 16;
     let ty: u32 = 16;
@@ -118,7 +118,7 @@ extern "C" __global__ void row_scale_inplace_kernel(
     // SAFETY: all kernel-arg lifetimes + bounds checked above.
     unsafe { builder.launch(cfg) }.map_err(map_drv)?;
 
-    let host_back = stream.memcpy_dtov(&dx).map_err(map_drv)?;
+    let host_back = stream.clone_dtoh(&dx).map_err(map_drv)?;
     for i in 0..n {
         for j in 0..p {
             x[[i, j]] = host_back[i * p + j];
