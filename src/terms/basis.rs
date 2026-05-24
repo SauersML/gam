@@ -1249,57 +1249,12 @@ pub fn create_difference_penalty_matrix(
     Ok(s)
 }
 
-fn validate_periodic_spline_curve_spec(spec: &PeriodicSplineCurveSpec) -> Result<(), BasisError> {
-    if spec.degree < 1 {
-        return Err(BasisError::InvalidDegree(spec.degree));
-    }
-    if spec.num_basis <= spec.degree {
-        return Err(BasisError::InvalidInput(format!(
-            "periodic spline requires num_basis > degree, got num_basis={} and degree={}",
-            spec.num_basis, spec.degree
-        )));
-    }
-    if !(spec.period_start.is_finite() && spec.period_end.is_finite())
-        || spec.period_end <= spec.period_start
-    {
-        return Err(BasisError::InvalidRange(spec.period_start, spec.period_end));
-    }
-    if spec.penalty_order == 0 || spec.penalty_order >= spec.num_basis {
-        return Err(BasisError::InvalidPenaltyOrder {
-            order: spec.penalty_order,
-            num_basis: spec.num_basis,
-        });
-    }
-    if !spec.lambda.is_finite() || spec.lambda < 0.0 {
-        return Err(BasisError::InvalidInput(format!(
-            "periodic spline lambda must be finite and non-negative, got {}",
-            spec.lambda
-        )));
-    }
-    if !spec.ridge.is_finite() || spec.ridge < 0.0 {
-        return Err(BasisError::InvalidInput(format!(
-            "periodic spline ridge must be finite and non-negative, got {}",
-            spec.ridge
-        )));
-    }
-    Ok(())
-}
-
-#[inline]
-fn wrap_to_period_unit(u: f64, start: f64, period: f64) -> f64 {
-    let mut w = (u - start).rem_euclid(period) / period;
-    // Guard against a platform rem_euclid round-off returning exactly 1.0.
-    if w >= 1.0 {
-        w = 0.0;
-    }
-    w
-}
-
-/// Dense cyclic finite-difference penalty for periodic spline coefficients.
+/// Creates a cyclic finite-difference penalty `S = D' D`.
 ///
-/// Unlike an ordinary P-spline penalty, this wraps the last coefficient back to
-/// the first before each differencing pass. The resulting null space is the
-/// constant closed-curve offset shared across all ambient dimensions.
+/// Unlike the ordinary P-spline Reinsch penalty, every difference stencil wraps
+/// around the coefficient ring. For `order = 2`, each row is
+/// `β_i - 2β_{i+1} + β_{i+2}` modulo the number of coefficients, so the
+/// constant vector is the only null direction and no endpoint is privileged.
 pub fn create_cyclic_difference_penalty_matrix(
     num_basis_functions: usize,
     order: usize,
@@ -1313,142 +1268,71 @@ pub fn create_cyclic_difference_penalty_matrix(
 
     let mut d = Array2::<f64>::eye(num_basis_functions);
     for _ in 0..order {
-        let mut next = Array2::<f64>::zeros((num_basis_functions, num_basis_functions));
+        let previous = d;
+        d = Array2::<f64>::zeros((num_basis_functions, num_basis_functions));
         for i in 0..num_basis_functions {
-            let ip1 = (i + 1) % num_basis_functions;
+            let next = (i + 1) % num_basis_functions;
             for j in 0..num_basis_functions {
-                next[[i, j]] = d[[ip1, j]] - d[[i, j]];
+                d[[i, j]] = previous[[next, j]] - previous[[i, j]];
             }
         }
-        d = next;
     }
     Ok(fast_ata(&d))
 }
 
-/// Build a dense 1D periodic B-spline basis over `spec`'s period.
-///
-/// Rows are evaluated after modular wrapping, and the extra uniform-cardinal
-/// B-spline columns needed near the seam are folded back modulo
-/// `spec.num_basis`. Therefore `u = period_start` and `u = period_end` produce
-/// identical rows, and the basis can drive a closed multi-output curve.
-pub fn create_periodic_bspline_basis_1d(
-    u: ArrayView1<'_, f64>,
-    spec: &PeriodicSplineCurveSpec,
-) -> Result<Array2<f64>, BasisError> {
-    validate_periodic_spline_curve_spec(spec)?;
-    if u.iter().any(|x| !x.is_finite()) {
-        return Err(BasisError::InvalidInput(
-            "periodic spline coordinates must be finite".to_string(),
-        ));
+fn wrap_to_period(x: f64, start: f64, period: f64) -> f64 {
+    start + (x - start).rem_euclid(period)
+}
+
+fn cyclic_distance_1d(x: f64, c: f64, period: f64) -> f64 {
+    let delta = (x - c).abs().rem_euclid(period);
+    delta.min(period - delta)
+}
+
+fn cyclic_uniform_knot_vector(
+    start: f64,
+    end: f64,
+    degree: usize,
+    num_basis: usize,
+) -> Array1<f64> {
+    let period = end - start;
+    let h = period / num_basis as f64;
+    let total_knots = num_basis + 2 * degree + 1;
+    Array1::from_iter((0..total_knots).map(|i| start + (i as f64 - degree as f64) * h))
+}
+
+fn create_cyclic_bspline_basis_dense(
+    data: ArrayView1<'_, f64>,
+    start: f64,
+    end: f64,
+    degree: usize,
+    num_basis: usize,
+) -> Result<(Array2<f64>, Array1<f64>), BasisError> {
+    if end <= start {
+        return Err(BasisError::InvalidRange(start, end));
     }
-
-    let period = spec.period_end - spec.period_start;
-    let scale = spec.num_basis as f64;
-    let t = u.mapv(|x| wrap_to_period_unit(x, spec.period_start, period) * scale);
-
-    // Uniform cardinal knots from `-degree` through `num_basis + degree` give
-    // enough non-periodic columns to cover both sides of the seam. Folding
-    // those columns modulo `num_basis` turns the open cardinal basis into a
-    // cyclic one.
-    let knot_start = -(spec.degree as isize);
-    let knot_end = spec.num_basis as isize + spec.degree as isize;
-    let knots = Array1::from_iter((knot_start..=knot_end).map(|v| v as f64));
-    let (extended_arc, _) = create_basis::<Dense>(
-        t.view(),
+    if num_basis <= degree {
+        return Err(BasisError::InvalidInput(format!(
+            "cyclic B-spline basis requires more basis functions ({num_basis}) than degree ({degree})"
+        )));
+    }
+    let period = end - start;
+    let wrapped = data.mapv(|x| wrap_to_period(x, start, period));
+    let knots = cyclic_uniform_knot_vector(start, end, degree, num_basis);
+    let (extended, _) = create_basis::<Dense>(
+        wrapped.view(),
         KnotSource::Provided(knots.view()),
-        spec.degree,
+        degree,
         BasisOptions::value(),
     )?;
-    let extended = extended_arc.as_ref();
-    let mut cyclic = Array2::<f64>::zeros((u.len(), spec.num_basis));
+    let mut cyclic = Array2::<f64>::zeros((data.len(), num_basis));
     for i in 0..extended.nrows() {
         for j in 0..extended.ncols() {
-            cyclic[[i, j % spec.num_basis]] += extended[[i, j]];
+            let target = j % num_basis;
+            cyclic[[i, target]] += extended[[i, j]];
         }
     }
-    Ok(cyclic)
-}
-
-/// Fit a penalized multi-output periodic spline curve `u -> R^d_ambient`.
-///
-/// The normal equations are solved once with all ambient output columns as the
-/// right-hand side, so affine stretching, shearing, or embedding in a higher
-/// dimensional ambient space is learned directly from `y` without any unit
-/// circle/ellipsoid special case.
-pub fn fit_periodic_spline_curve(
-    u: ArrayView1<'_, f64>,
-    y: ArrayView2<'_, f64>,
-    spec: &PeriodicSplineCurveSpec,
-) -> Result<PeriodicSplineCurve, BasisError> {
-    validate_periodic_spline_curve_spec(spec)?;
-    if y.nrows() != u.len() {
-        return Err(BasisError::DimensionMismatch(format!(
-            "periodic spline y row count {} does not match u length {}",
-            y.nrows(),
-            u.len()
-        )));
-    }
-    if y.ncols() == 0 {
-        return Err(BasisError::InvalidInput(
-            "periodic spline requires at least one ambient output column".to_string(),
-        ));
-    }
-    if y.iter().any(|v| !v.is_finite()) {
-        return Err(BasisError::InvalidInput(
-            "periodic spline outputs must be finite".to_string(),
-        ));
-    }
-
-    let b = create_periodic_bspline_basis_1d(u, spec)?;
-    let mut normal = fast_ata(&b);
-    if spec.lambda > 0.0 {
-        let penalty = create_cyclic_difference_penalty_matrix(spec.num_basis, spec.penalty_order)?;
-        normal = normal + penalty.mapv(|v| spec.lambda * v);
-    }
-    let ridge = spec.ridge.max(0.0);
-    if ridge > 0.0 {
-        for i in 0..normal.nrows() {
-            normal[[i, i]] += ridge;
-        }
-    }
-    let rhs = fast_atb(&b, &y.to_owned());
-
-    let mut jitter = ridge.max(1e-12);
-    let coefficients = loop {
-        match normal.cholesky(Side::Lower) {
-            Ok(chol) => break chol.solve_mat(&rhs),
-            Err(err) => {
-                if jitter > 1e-4 {
-                    return Err(BasisError::LinalgError(err));
-                }
-                for i in 0..normal.nrows() {
-                    normal[[i, i]] += jitter;
-                }
-                jitter *= 10.0;
-            }
-        }
-    };
-
-    Ok(PeriodicSplineCurve {
-        spec: spec.clone(),
-        coefficients,
-    })
-}
-
-/// Evaluate a fitted multi-output periodic spline curve at arbitrary `u`.
-pub fn evaluate_periodic_spline_curve(
-    u: ArrayView1<'_, f64>,
-    curve: &PeriodicSplineCurve,
-) -> Result<Array2<f64>, BasisError> {
-    if curve.coefficients.nrows() != curve.spec.num_basis {
-        return Err(BasisError::DimensionMismatch(format!(
-            "periodic spline coefficient row count {} does not match num_basis {}",
-            curve.coefficients.nrows(),
-            curve.spec.num_basis
-        )));
-    }
-    let b = create_periodic_bspline_basis_1d(u, &curve.spec)?;
-    Ok(fast_ab(&b, &curve.coefficients))
+    Ok((cyclic, knots))
 }
 
 fn is_effectively_uniform_knot_geometry(knot_vector: &Array1<f64>, degree: usize) -> bool {
@@ -1598,416 +1482,36 @@ struct DuchonBasisDesign {
     nullspace_order: DuchonNullspaceOrder,
 }
 
-/// Options for fitting a closed 1D periodic spline curve `u -> R^d`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct PeriodicSpline1DOptions {
-    /// Period of the parameter.  For angles in radians this is usually `2π`.
-    pub period: f64,
-    /// Origin used for wrapping.  Values differing by integer multiples of
-    /// `period` are identified after subtracting this origin.
-    pub origin: f64,
-    /// Absolute tolerance used when coalescing duplicate periodic sites.
-    pub duplicate_tolerance: f64,
-}
-
-impl PeriodicSpline1DOptions {
-    pub fn new(period: f64) -> Self {
-        Self {
-            period,
-            origin: 0.0,
-            duplicate_tolerance: 1e-10,
-        }
-    }
-}
-
-/// A C² periodic cubic spline whose scalar parameter traces a curve in an
-/// arbitrary ambient dimension.
-///
-/// The coefficient solve is shared across output coordinates.  This means a
-/// single fit can represent circles, ellipses, ovals, and arbitrarily stretched
-/// or skewed closed loops in `R^d` without assuming a unit-radius embedding.
+/// Boundary-condition policy for one-dimensional smooth bases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeriodicSpline1D {
-    options: PeriodicSpline1DOptions,
-    /// Sorted periodic sites in `[origin, origin + period)`.
-    sites: Array1<f64>,
-    /// Function values at each site, shape `(n_sites, ambient_dim)`.
-    values: Array2<f64>,
-    /// Periodic cubic second derivatives at each site, shape `(n_sites, ambient_dim)`.
-    second_derivatives: Array2<f64>,
+pub enum OneDimensionalBoundary {
+    /// Ordinary open interval basis with clamped endpoint behavior.
+    Open,
+    /// Periodic/cyclic basis over the half-open interval `[start, end)`.
+    ///
+    /// Values are evaluated modulo `period = end - start`; the basis and its
+    /// first `degree - 1` derivatives agree at the two endpoints for B-splines.
+    Cyclic { start: f64, end: f64 },
 }
 
-impl PeriodicSpline1D {
-    pub fn fit(
-        u: ArrayView1<'_, f64>,
-        y: ArrayView2<'_, f64>,
-        options: PeriodicSpline1DOptions,
-    ) -> Result<Self, BasisError> {
-        if !options.period.is_finite() || options.period <= 0.0 {
-            return Err(BasisError::InvalidInput(format!(
-                "periodic spline period must be finite and positive; got {}",
-                options.period
-            )));
-        }
-        if !options.origin.is_finite() {
-            return Err(BasisError::InvalidInput(
-                "periodic spline origin must be finite".to_string(),
-            ));
-        }
-        if !options.duplicate_tolerance.is_finite() || options.duplicate_tolerance < 0.0 {
-            return Err(BasisError::InvalidInput(
-                "periodic spline duplicate_tolerance must be finite and non-negative".to_string(),
-            ));
-        }
-        if y.nrows() != u.len() {
-            return Err(BasisError::DimensionMismatch(format!(
-                "periodic spline parameter length {} does not match output row count {}",
-                u.len(),
-                y.nrows()
-            )));
-        }
-        if u.len() < 3 {
-            return Err(BasisError::InvalidInput(
-                "periodic spline requires at least three samples".to_string(),
-            ));
-        }
-        if y.ncols() == 0 {
-            return Err(BasisError::InvalidInput(
-                "periodic spline requires at least one output/ambient dimension".to_string(),
-            ));
-        }
-        if u.iter().any(|v| !v.is_finite()) || y.iter().any(|v| !v.is_finite()) {
-            return Err(BasisError::InvalidInput(
-                "periodic spline inputs must be finite".to_string(),
-            ));
-        }
-
-        let (sites, values) = coalesce_periodic_samples(u, y, options)?;
-        let n = sites.len();
-        if n < 3 {
-            return Err(BasisError::InvalidInput(format!(
-                "periodic spline requires at least three distinct sites after wrapping; found {n}"
-            )));
-        }
-        let h = periodic_spacings(sites.view(), options)?;
-        if h.iter().any(|v| *v <= 0.0 || !v.is_finite()) {
-            return Err(BasisError::InvalidInput(
-                "periodic spline wrapped sites must be strictly increasing over one period"
-                    .to_string(),
-            ));
-        }
-        let second_derivatives = solve_periodic_cubic_second_derivatives(values.view(), &h)?;
-        Ok(Self {
-            options,
-            sites,
-            values,
-            second_derivatives,
-        })
-    }
-
-    pub fn period(&self) -> f64 {
-        self.options.period
-    }
-
-    pub fn origin(&self) -> f64 {
-        self.options.origin
-    }
-
-    pub fn ambient_dim(&self) -> usize {
-        self.values.ncols()
-    }
-
-    pub fn num_sites(&self) -> usize {
-        self.sites.len()
-    }
-
-    pub fn sites(&self) -> ArrayView1<'_, f64> {
-        self.sites.view()
-    }
-
-    pub fn values(&self) -> ArrayView2<'_, f64> {
-        self.values.view()
-    }
-
-    pub fn evaluate(&self, u: ArrayView1<'_, f64>) -> Result<Array2<f64>, BasisError> {
-        self.evaluate_with_derivative_order(u, 0)
-    }
-
-    pub fn evaluate_derivative(&self, u: ArrayView1<'_, f64>) -> Result<Array2<f64>, BasisError> {
-        self.evaluate_with_derivative_order(u, 1)
-    }
-
-    pub fn evaluate_second_derivative(
-        &self,
-        u: ArrayView1<'_, f64>,
-    ) -> Result<Array2<f64>, BasisError> {
-        self.evaluate_with_derivative_order(u, 2)
-    }
-
-    fn evaluate_with_derivative_order(
-        &self,
-        u: ArrayView1<'_, f64>,
-        derivative_order: usize,
-    ) -> Result<Array2<f64>, BasisError> {
-        if derivative_order > 2 {
-            return Err(BasisError::InvalidInput(format!(
-                "unsupported periodic spline derivative order {derivative_order}; only 0, 1, 2 are supported"
-            )));
-        }
-        if u.iter().any(|v| !v.is_finite()) {
-            return Err(BasisError::InvalidInput(
-                "periodic spline evaluation points must be finite".to_string(),
-            ));
-        }
-        let n = self.sites.len();
-        let d = self.ambient_dim();
-        let mut out = Array2::<f64>::zeros((u.len(), d));
-        for (row, &raw) in u.iter().enumerate() {
-            let x = wrap_periodic(raw, self.options);
-            let i = periodic_interval_index(self.sites.view(), x);
-            let j = if i + 1 == n { 0 } else { i + 1 };
-            let x_i = self.sites[i];
-            let h = if i + 1 == n {
-                self.sites[0] + self.options.period - x_i
-            } else {
-                self.sites[i + 1] - x_i
-            };
-            let x_eval = if i + 1 == n && x < x_i {
-                x + self.options.period
-            } else {
-                x
-            };
-            let a = (x_i + h - x_eval) / h;
-            let b = (x_eval - x_i) / h;
-            for col in 0..d {
-                let y_i = self.values[[i, col]];
-                let y_j = self.values[[j, col]];
-                let m_i = self.second_derivatives[[i, col]];
-                let m_j = self.second_derivatives[[j, col]];
-                out[[row, col]] = match derivative_order {
-                    0 => {
-                        a * y_i
-                            + b * y_j
-                            + ((a * a * a - a) * m_i + (b * b * b - b) * m_j) * h * h / 6.0
-                    }
-                    1 => {
-                        (y_j - y_i) / h
-                            + ((-3.0 * a * a + 1.0) * m_i + (3.0 * b * b - 1.0) * m_j) * h / 6.0
-                    }
-                    2 => a * m_i + b * m_j,
-                    _ => unreachable!(),
-                };
-            }
-        }
-        Ok(out)
+impl Default for OneDimensionalBoundary {
+    fn default() -> Self {
+        Self::Open
     }
 }
 
-pub fn fit_periodic_spline_1d(
-    u: ArrayView1<'_, f64>,
-    y: ArrayView2<'_, f64>,
-    options: PeriodicSpline1DOptions,
-) -> Result<PeriodicSpline1D, BasisError> {
-    PeriodicSpline1D::fit(u, y, options)
-}
-
-fn wrap_periodic(x: f64, options: PeriodicSpline1DOptions) -> f64 {
-    let shifted = (x - options.origin).rem_euclid(options.period);
-    let mut wrapped = options.origin + shifted;
-    let upper = options.origin + options.period;
-    if wrapped >= upper {
-        wrapped = options.origin;
-    }
-    wrapped
-}
-
-fn coalesce_periodic_samples(
-    u: ArrayView1<'_, f64>,
-    y: ArrayView2<'_, f64>,
-    options: PeriodicSpline1DOptions,
-) -> Result<(Array1<f64>, Array2<f64>), BasisError> {
-    let mut rows: Vec<(f64, Vec<f64>)> = u
-        .iter()
-        .enumerate()
-        .map(|(i, &ui)| (wrap_periodic(ui, options), y.row(i).to_vec()))
-        .collect();
-    rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let tol = options
-        .duplicate_tolerance
-        .max(64.0 * f64::EPSILON * options.period.abs());
-    let d = y.ncols();
-    let mut grouped_sites: Vec<f64> = Vec::new();
-    let mut grouped_values: Vec<Vec<f64>> = Vec::new();
-    let mut grouped_counts: Vec<usize> = Vec::new();
-
-    for (site, value) in rows {
-        if let Some(last) = grouped_sites.last_mut() {
-            if (site - *last).abs() <= tol {
-                let count = *grouped_counts.last().expect("group count exists") as f64;
-                let target = grouped_values.last_mut().expect("group value exists");
-                for col in 0..d {
-                    target[col] = (target[col] * count + value[col]) / (count + 1.0);
-                }
-                *last = (*last * count + site) / (count + 1.0);
-                *grouped_counts.last_mut().expect("group count exists") += 1;
-                continue;
+impl OneDimensionalBoundary {
+    fn period(&self) -> Option<(f64, f64, f64)> {
+        match *self {
+            OneDimensionalBoundary::Open => None,
+            OneDimensionalBoundary::Cyclic { start, end } if end > start => {
+                Some((start, end, end - start))
             }
+            OneDimensionalBoundary::Cyclic { .. } => None,
         }
-        grouped_sites.push(site);
-        grouped_values.push(value);
-        grouped_counts.push(1);
-    }
-
-    if grouped_sites.len() >= 2 {
-        let first = grouped_sites[0];
-        let last_idx = grouped_sites.len() - 1;
-        let last_equiv = grouped_sites[last_idx] - options.period;
-        if (first - last_equiv).abs() <= tol {
-            let first_count = grouped_counts[0] as f64;
-            let last_count = grouped_counts[last_idx] as f64;
-            let total = first_count + last_count;
-            for col in 0..d {
-                grouped_values[0][col] = (grouped_values[0][col] * first_count
-                    + grouped_values[last_idx][col] * last_count)
-                    / total;
-            }
-            grouped_counts[0] += grouped_counts[last_idx];
-            grouped_sites.remove(last_idx);
-            grouped_values.remove(last_idx);
-            grouped_counts.remove(last_idx);
-        }
-    }
-
-    let n = grouped_sites.len();
-    let sites = Array1::from_vec(grouped_sites);
-    let flat: Vec<f64> = grouped_values.into_iter().flatten().collect();
-    let values = Array2::from_shape_vec((n, d), flat).map_err(|e| {
-        BasisError::InvalidInput(format!("failed to construct periodic output matrix: {e}"))
-    })?;
-    Ok((sites, values))
-}
-
-fn periodic_spacings(
-    sites: ArrayView1<'_, f64>,
-    options: PeriodicSpline1DOptions,
-) -> Result<Vec<f64>, BasisError> {
-    let n = sites.len();
-    let mut h = Vec::with_capacity(n);
-    for i in 0..n {
-        let next = if i + 1 == n {
-            sites[0] + options.period
-        } else {
-            sites[i + 1]
-        };
-        h.push(next - sites[i]);
-    }
-    Ok(h)
-}
-
-fn periodic_interval_index(sites: ArrayView1<'_, f64>, x: f64) -> usize {
-    let n = sites.len();
-    match sites
-        .as_slice()
-        .expect("sites array is contiguous")
-        .binary_search_by(|v| v.partial_cmp(&x).unwrap_or(std::cmp::Ordering::Less))
-    {
-        Ok(idx) => idx.min(n - 1),
-        Err(0) => n - 1,
-        Err(idx) => idx - 1,
     }
 }
 
-fn solve_periodic_cubic_second_derivatives(
-    values: ArrayView2<'_, f64>,
-    h: &[f64],
-) -> Result<Array2<f64>, BasisError> {
-    let n = values.nrows();
-    let d = values.ncols();
-    if h.len() != n {
-        return Err(BasisError::DimensionMismatch(
-            "periodic spacing count must match value rows".to_string(),
-        ));
-    }
-    let mut a = Array2::<f64>::zeros((n, n));
-    for i in 0..n {
-        let prev = if i == 0 { n - 1 } else { i - 1 };
-        let next = if i + 1 == n { 0 } else { i + 1 };
-        a[[i, prev]] = h[prev];
-        a[[i, i]] = 2.0 * (h[prev] + h[i]);
-        a[[i, next]] = h[i];
-    }
-    let mut rhs = Array2::<f64>::zeros((n, d));
-    for i in 0..n {
-        let prev = if i == 0 { n - 1 } else { i - 1 };
-        let next = if i + 1 == n { 0 } else { i + 1 };
-        for col in 0..d {
-            let slope_next = (values[[next, col]] - values[[i, col]]) / h[i];
-            let slope_prev = (values[[i, col]] - values[[prev, col]]) / h[prev];
-            rhs[[i, col]] = 6.0 * (slope_next - slope_prev);
-        }
-    }
-    solve_dense_linear_system_multi_rhs(a, rhs)
-}
-
-fn solve_dense_linear_system_multi_rhs(
-    mut a: Array2<f64>,
-    mut b: Array2<f64>,
-) -> Result<Array2<f64>, BasisError> {
-    let n = a.nrows();
-    if a.ncols() != n || b.nrows() != n {
-        return Err(BasisError::DimensionMismatch(
-            "dense linear solve shape mismatch".to_string(),
-        ));
-    }
-    let nrhs = b.ncols();
-    for k in 0..n {
-        let mut pivot = k;
-        let mut pivot_abs = a[[k, k]].abs();
-        for r in (k + 1)..n {
-            let candidate = a[[r, k]].abs();
-            if candidate > pivot_abs {
-                pivot = r;
-                pivot_abs = candidate;
-            }
-        }
-        if pivot_abs <= 1e-14 {
-            return Err(BasisError::InvalidInput(
-                "periodic cubic spline system is singular".to_string(),
-            ));
-        }
-        if pivot != k {
-            for c in k..n {
-                a.swap((k, c), (pivot, c));
-            }
-            for c in 0..nrhs {
-                b.swap((k, c), (pivot, c));
-            }
-        }
-        for r in (k + 1)..n {
-            let factor = a[[r, k]] / a[[k, k]];
-            a[[r, k]] = 0.0;
-            for c in (k + 1)..n {
-                a[[r, c]] -= factor * a[[k, c]];
-            }
-            for c in 0..nrhs {
-                b[[r, c]] -= factor * b[[k, c]];
-            }
-        }
-    }
-    let mut x = Array2::<f64>::zeros((n, nrhs));
-    for rhs_col in 0..nrhs {
-        for i_rev in 0..n {
-            let i = n - 1 - i_rev;
-            let mut sum = b[[i, rhs_col]];
-            for c in (i + 1)..n {
-                sum -= a[[i, c]] * x[[c, rhs_col]];
-            }
-            x[[i, rhs_col]] = sum / a[[i, i]];
-        }
-    }
-    Ok(x)
-}
 /// Which knot strategy to use for 1D B-spline bases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BSplineKnotSpec {
@@ -2047,47 +1551,8 @@ pub struct BSplineBasisSpec {
     pub knotspec: BSplineKnotSpec,
     pub double_penalty: bool,
     pub identifiability: BSplineIdentifiability,
-    /// Optional endpoint value/slope constraints for 1D B-spline smooths.
-    ///
-    /// These are enforced by the smooth-term builder as linear equality
-    /// constraints (represented internally as paired inequalities) in the
-    /// final coefficient coordinates, after identifiability and shape
-    /// reparameterizations have been applied.
     #[serde(default)]
-    pub boundary_condition: BSplineBoundaryCondition,
-}
-
-/// Per-endpoint boundary condition for a 1D B-spline smooth.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum BSplineEndpointCondition {
-    /// Do not constrain this endpoint.
-    None,
-    /// Force the first derivative to zero at this endpoint.
-    Clamped,
-    /// Force the smooth value to the supplied value at this endpoint.
-    Anchored { value: f64 },
-}
-
-impl Default for BSplineEndpointCondition {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-/// Boundary conditions for the left and right endpoints of a 1D B-spline smooth.
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
-pub struct BSplineBoundaryCondition {
-    #[serde(default)]
-    pub left: BSplineEndpointCondition,
-    #[serde(default)]
-    pub right: BSplineEndpointCondition,
-}
-
-impl BSplineBoundaryCondition {
-    pub fn is_unconstrained(self) -> bool {
-        matches!(self.left, BSplineEndpointCondition::None)
-            && matches!(self.right, BSplineEndpointCondition::None)
-    }
+    pub boundary: OneDimensionalBoundary,
 }
 
 /// Per-smooth identifiability policy for 1D B-spline bases.
@@ -2686,31 +2151,8 @@ pub struct DuchonBasisSpec {
     pub aniso_log_scales: Option<Vec<f64>>,
     #[serde(default)]
     pub operator_penalties: DuchonOperatorPenaltySpec,
-    /// Treat a one-dimensional Duchon smooth as living on a circle by using
-    /// wrapped chord distance over the fitted domain. Periodic Duchon smooths
-    /// use the constant null space and a native kernel Gram penalty.
     #[serde(default)]
-    pub periodic: bool,
-}
-
-impl DuchonBasisSpec {
-    /// Cast the f64 [`Self::power`] back to `usize` for the integer-only
-    /// downstream chain. Panics with a clear message if the value isn't
-    /// whole — fractional `s` is the Tier 1 #1 refactor target and isn't
-    /// supported end-to-end yet. Use this at every site that previously
-    /// read `spec.power` as a `usize`; future fractional support replaces
-    /// the call sites with a paired f64 path.
-    pub fn power_as_usize(&self) -> usize {
-        duchon_power_to_usize(self.power)
-    }
-}
-
-fn duchon_power_to_usize(power: f64) -> usize {
-    assert!(
-        power.is_finite() && power >= 0.0 && power.fract() == 0.0,
-        "DuchonBasisSpec.power = {power}: fractional / non-integer values are not yet supported by the integer-only downstream chain; pass an integer value (e.g. `1.0`, `2.0`)"
-    );
-    power as usize
+    pub boundary: OneDimensionalBoundary,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -7244,8 +6686,88 @@ pub fn build_bspline_basis_1d(
     data: ArrayView1<'_, f64>,
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
-    if let BSplineBoundaryCondition::Periodic { period, origin } = spec.boundary_condition {
-        return build_periodic_fourier_basis_1d(data, spec, period, origin);
+    if let Some((start, end, _period)) = spec.boundary.period() {
+        if spec.degree != 3 {
+            return Err(BasisError::InvalidInput(format!(
+                "cyclic P-splines currently require cubic degree=3, got degree={}",
+                spec.degree
+            )));
+        }
+        let num_basis = match &spec.knotspec {
+            BSplineKnotSpec::Generate {
+                num_internal_knots, ..
+            } => num_internal_knots + spec.degree + 1,
+            BSplineKnotSpec::Automatic {
+                num_internal_knots, ..
+            } => {
+                num_internal_knots.unwrap_or_else(|| {
+                    default_internal_knot_count_for_data(data.len(), spec.degree)
+                }) + spec.degree
+                    + 1
+            }
+            BSplineKnotSpec::Provided(knots) => knots.len().saturating_sub(spec.degree + 1),
+        };
+        let (basis, knots) =
+            create_cyclic_bspline_basis_dense(data, start, end, spec.degree, num_basis)?;
+        let s_bend_raw = create_cyclic_difference_penalty_matrix(num_basis, spec.penalty_order)?;
+        let mut penalties_raw = vec![PenaltyCandidate {
+            matrix: s_bend_raw.clone(),
+            nullspace_dim_hint: 1,
+            source: PenaltySource::Primary,
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+            op: None,
+        }];
+        if spec.double_penalty {
+            penalties_raw.push(PenaltyCandidate {
+                matrix: build_nullspace_shrinkage_penalty(&s_bend_raw)?
+                    .map(|shrink| shrink.sym_penalty)
+                    .unwrap_or_else(|| Array2::<f64>::zeros(s_bend_raw.raw_dim())),
+                nullspace_dim_hint: 0,
+                source: PenaltySource::DoublePenaltyNullspace,
+                normalization_scale: 1.0,
+                kronecker_factors: None,
+                op: None,
+            });
+        }
+        let penalties_raw_mats = penalties_raw
+            .iter()
+            .map(|candidate| candidate.matrix.clone())
+            .collect();
+        let (design_c, penalty_mats, identifiability_transform) =
+            apply_bspline_identifiability_policy(
+                basis,
+                penalties_raw_mats,
+                &knots,
+                spec.degree,
+                &spec.identifiability,
+            )?;
+        let transformed_candidates = penalty_mats
+            .into_iter()
+            .zip(penalties_raw.into_iter())
+            .map(|(matrix, candidate)| PenaltyCandidate {
+                nullspace_dim_hint: candidate.nullspace_dim_hint,
+                matrix,
+                source: candidate.source,
+                normalization_scale: candidate.normalization_scale,
+                kronecker_factors: None,
+                op: None,
+            })
+            .collect();
+        let (penalties, nullspace_dims, penaltyinfo, ops) =
+            filter_active_penalty_candidates_with_ops(transformed_candidates)?;
+        return Ok(BasisBuildResult {
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design_c)),
+            penalties,
+            nullspace_dims,
+            penaltyinfo,
+            metadata: BasisMetadata::BSpline1D {
+                knots,
+                identifiability_transform,
+            },
+            kronecker_factored: None,
+            ops,
+        });
     }
     let prefer_sparse_design = matches!(
         spec.identifiability,
@@ -8178,7 +7700,7 @@ pub fn build_thin_plate_basiswithworkspace(
             identifiability: spec.identifiability.clone(),
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         log::info!(
             "thin-plate basis auto-promoted to hybrid Duchon ({:?}, s={}) in d={}: \
@@ -19418,6 +18940,134 @@ fn build_duchon_basis_designwithworkspace(
     })
 }
 
+fn build_cyclic_duchon_basis_1dwithworkspace(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+    start: f64,
+    end: f64,
+    workspace: &mut BasisWorkspace,
+) -> Result<BasisBuildResult, BasisError> {
+    if data.ncols() != 1 {
+        return Err(BasisError::InvalidInput(
+            "cyclic Duchon smooths currently require exactly one covariate".to_string(),
+        ));
+    }
+    if end <= start {
+        return Err(BasisError::InvalidRange(start, end));
+    }
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    if centers.ncols() != 1 {
+        return Err(BasisError::DimensionMismatch(format!(
+            "cyclic Duchon centers must have one column, got {}",
+            centers.ncols()
+        )));
+    }
+    let k = centers.nrows();
+    if k <= spec.power.max(1) {
+        return Err(BasisError::InvalidInput(format!(
+            "cyclic Duchon basis requires more centers ({k}) than power ({})",
+            spec.power
+        )));
+    }
+    let period = end - start;
+    let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Zero);
+    validate_duchon_kernel_orders(spec.length_scale, p_order, spec.power, 1)?;
+    let coeffs = spec
+        .length_scale
+        .map(|ls| duchon_partial_fraction_coeffs(p_order, spec.power, 1.0 / ls.max(1e-300)));
+    let pure_poly_coeff = if spec.length_scale.is_none() {
+        Some(PolyharmonicBlockCoeff::new(
+            pure_duchon_block_order(p_order, spec.power),
+            1,
+        ))
+    } else {
+        None
+    };
+    let kernel_amp = duchon_kernel_amplification(
+        centers.view(),
+        spec.length_scale,
+        p_order,
+        spec.power,
+        1,
+        None,
+        coeffs.as_ref(),
+        pure_poly_coeff.as_ref(),
+        DuchonNullspaceOrder::Zero,
+        &mut workspace.cache,
+    )?;
+    let mut basis = Array2::<f64>::zeros((data.nrows(), k + 1));
+    for i in 0..data.nrows() {
+        let x = wrap_to_period(data[[i, 0]], start, period);
+        for j in 0..k {
+            let c = wrap_to_period(centers[[j, 0]], start, period);
+            let r = cyclic_distance_1d(x, c, period);
+            let raw = if let Some(ref ppc) = pure_poly_coeff {
+                ppc.eval(r)
+            } else {
+                duchon_matern_kernel_general_from_distance(
+                    r,
+                    spec.length_scale,
+                    p_order,
+                    spec.power,
+                    1,
+                    coeffs.as_ref(),
+                )?
+            };
+            basis[[i, j]] = raw * kernel_amp;
+        }
+        basis[[i, k]] = 1.0;
+    }
+
+    let identifiability_transform = spatial_identifiability_transform_from_design(
+        data,
+        basis.view(),
+        &spec.identifiability,
+        "cyclic Duchon",
+    )?;
+    let (design_matrix, transform_for_penalty) = if let Some(z) = identifiability_transform.as_ref()
+    {
+        (fast_ab(&basis, z), Some(z))
+    } else {
+        (basis, None)
+    };
+
+    let mut s_kernel = Array2::<f64>::zeros((k + 1, k + 1));
+    let s_cyclic = create_cyclic_difference_penalty_matrix(k, spec.power.max(1).min(k - 1))?;
+    s_kernel.slice_mut(s![..k, ..k]).assign(&s_cyclic);
+    let s_final = if let Some(z) = transform_for_penalty {
+        fast_ab(&fast_atb(z, &s_kernel), z)
+    } else {
+        s_kernel
+    };
+    let candidates = vec![PenaltyCandidate {
+        matrix: s_final,
+        nullspace_dim_hint: 1,
+        source: PenaltySource::Primary,
+        normalization_scale: 1.0,
+        kronecker_factors: None,
+        op: None,
+    }];
+    let (penalties, nullspace_dims, penaltyinfo, ops) =
+        filter_active_penalty_candidates_with_ops(candidates)?;
+    Ok(BasisBuildResult {
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design_matrix)),
+        penalties,
+        nullspace_dims,
+        penaltyinfo,
+        metadata: BasisMetadata::Duchon {
+            centers,
+            length_scale: spec.length_scale,
+            power: spec.power,
+            nullspace_order: DuchonNullspaceOrder::Zero,
+            identifiability_transform,
+            input_scales: None,
+            aniso_log_scales: None,
+        },
+        kronecker_factored: None,
+        ops,
+    })
+}
+
 /// Generic Duchon builder returning design + penalty list.
 pub fn build_duchon_basis(
     data: ArrayView2<'_, f64>,
@@ -20903,8 +20553,10 @@ pub fn build_duchon_basiswithworkspace(
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
-    let original_centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let centers = expand_periodic_centers(&original_centers, spec.periodic.as_deref())?;
+    if let Some((start, end, _period)) = spec.boundary.period() {
+        return build_cyclic_duchon_basis_1dwithworkspace(data, spec, start, end, workspace);
+    }
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view());
     if spec.periodic {
         return build_periodic_duchon_basis_1d(data, spec, centers, workspace);
@@ -28233,7 +27885,7 @@ mod tests {
             },
             double_penalty: true,
             identifiability: BSplineIdentifiability::default(),
-            boundary_condition: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
         assert_eq!(result.penalties.len(), 2);
@@ -28376,7 +28028,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
-            boundary_condition: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28401,7 +28053,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
-            boundary_condition: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28439,7 +28091,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
-            boundary_condition: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28483,7 +28135,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
-            boundary_condition: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).expect("build sparse bspline");
@@ -28502,7 +28154,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
-            boundary_condition: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).expect("build centered sparse bspline");
@@ -28521,7 +28173,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
-            boundary_condition: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
 
         match build_bspline_basis_1d(x.view(), &spec).unwrap_err() {
@@ -28574,7 +28226,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
-            boundary_condition: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28628,7 +28280,7 @@ mod tests {
             identifiability: BSplineIdentifiability::WeightedSumToZero {
                 weights: Some(weights.clone()),
             },
-            boundary_condition: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28655,7 +28307,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
-            boundary_condition: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
         let constrained = BSplineBasisSpec {
             identifiability: BSplineIdentifiability::RemoveLinearTrend,
@@ -28687,7 +28339,7 @@ mod tests {
                 columns: constraints.clone(),
                 weights: None,
             },
-            boundary_condition: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28702,6 +28354,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_cyclic_difference_penalty_wraps_nullspace() {
+        let s = create_cyclic_difference_penalty_matrix(8, 2).unwrap();
+        assert_eq!(s.nrows(), 8);
+        assert_eq!(s.ncols(), 8);
+        for i in 0..8 {
+            for j in 0..8 {
+                assert!((s[[i, j]] - s[[j, i]]).abs() < 1e-12);
+            }
+        }
+        let ones = Array1::<f64>::ones(8);
+        let q = ones.dot(&s.dot(&ones));
+        assert!(q.abs() < 1e-10);
+        assert!(
+            s[[0, 7]].abs() > 0.0,
+            "endpoint coefficients must be coupled"
+        );
+    }
+
+    #[test]
+    fn test_cyclic_cubic_pspline_matches_at_period_boundary() {
+        let x = Array1::from_vec(vec![0.0, 0.25, 0.5, 0.75, 1.0]);
+        let spec = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 8,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Cyclic {
+                start: 0.0,
+                end: 1.0,
+            },
+        };
+        let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
+        let dense = built.design.to_dense();
+        for j in 0..dense.ncols() {
+            assert!((dense[[0, j]] - dense[[4, j]]).abs() < 1e-12);
+        }
+        for i in 0..dense.nrows() {
+            let sum = dense.row(i).sum();
+            assert!((sum - 1.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_cyclic_duchon_matches_at_period_boundary() {
+        let x = Array2::from_shape_vec((5, 1), vec![0.0, 0.2, 0.5, 0.8, 1.0]).unwrap();
+        let centers =
+            Array2::from_shape_vec((6, 1), (0..6).map(|i| i as f64 / 6.0).collect()).unwrap();
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: Some(0.25),
+            power: 2,
+            nullspace_order: DuchonNullspaceOrder::Zero,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+            boundary: OneDimensionalBoundary::Cyclic {
+                start: 0.0,
+                end: 1.0,
+            },
+        };
+        let built = build_duchon_basis(x.view(), &spec).unwrap();
+        let dense = built.design.to_dense();
+        for j in 0..dense.ncols() {
+            assert!((dense[[0, j]] - dense[[4, j]]).abs() < 1e-10);
+        }
+        assert_eq!(built.penalties.len(), 1);
+        assert_eq!(built.penalties[0].nrows(), dense.ncols());
     }
 
     #[test]
@@ -30281,7 +30007,7 @@ mod tests {
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let out = build_duchon_basis(data.view(), &spec).unwrap();
         match &out.metadata {
@@ -30327,7 +30053,7 @@ mod tests {
             identifiability: SpatialIdentifiability::OrthogonalToParametric,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let out = build_duchon_basis(data.view(), &spec).unwrap();
         let out_design = out.design.to_dense();
@@ -30511,7 +30237,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
     }
@@ -31348,7 +31074,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
         assert_eq!(out.penaltyinfo.len(), 3);
@@ -31391,7 +31117,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let out = build_duchon_basis(data.view(), &spec)
             .expect("Zero-nullspace Duchon basis should build");
@@ -31416,7 +31142,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let out = build_duchon_basis(data.view(), &spec)
             .expect("Linear-nullspace Duchon basis should build via collocation fallback");
@@ -32371,7 +32097,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let derivative = build_duchon_basis_log_kappa_derivatives(data.view(), &spec)
             .expect("analytic Duchon derivative should build");
@@ -32416,7 +32142,7 @@ mod tests {
             identifiability: SpatialIdentifiability::default(),
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let base = build_duchon_basis(data.view(), &spec).expect("base build");
         let z_frozen = match &base.metadata {
@@ -32498,7 +32224,7 @@ mod tests {
             identifiability: SpatialIdentifiability::default(),
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let base = build_duchon_basis(data.view(), &spec).expect("base build");
         let z_frozen = match &base.metadata {
@@ -32562,7 +32288,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let derivative = build_duchon_basis_log_kappa_derivatives(data.view(), &spec)
             .expect("analytic Duchon derivative should build");
@@ -32609,7 +32335,7 @@ mod tests {
             identifiability: SpatialIdentifiability::default(),
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let derivative = build_duchon_basis_log_kappa_derivatives(data.view(), &spec)
             .expect("analytic Duchon derivative should build");
@@ -32688,7 +32414,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let mut workspace = BasisWorkspace::default();
         let derivative = build_duchon_basis_log_kappa_derivativewithworkspace(
@@ -32769,60 +32495,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: true,
-        };
-        let derivative = build_duchon_basis_log_kappa_derivative(data.view(), &spec)
-            .expect("periodic Duchon analytic derivative should build");
-
-        let eps: f64 = 1e-6;
-        let kappa = 1.0 / spec.length_scale.expect("hybrid Duchon length_scale");
-        let ls_plus = 1.0 / (kappa * eps.exp());
-        let ls_minus = 1.0 / (kappa * (-eps).exp());
-        let mut spec_plus = spec.clone();
-        let mut spec_minus = spec.clone();
-        spec_plus.length_scale = Some(ls_plus);
-        spec_minus.length_scale = Some(ls_minus);
-        let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
-        let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
-
-        let fd_design = (&plus.design.to_dense() - &minus.design.to_dense()) / (2.0 * eps);
-        let design_err = (&derivative.design_derivative - &fd_design)
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt();
-        assert!(
-            design_err < 1e-4,
-            "periodic Duchon design derivative mismatch too large: {design_err}"
-        );
-
-        assert_eq!(derivative.penalties_derivative.len(), plus.penalties.len());
-        let fd_penalty = (&plus.penalties[0] - &minus.penalties[0]) / (2.0 * eps);
-        let penalty_err = (&derivative.penalties_derivative[0] - &fd_penalty)
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt();
-        assert!(
-            penalty_err < 1e-4,
-            "periodic Duchon penalty derivative mismatch too large: {penalty_err}"
-        );
-    }
-
-    #[test]
-    fn test_duchon_log_kappasecond_derivative_matchesfd() {
-        let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
-        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
-        let spec = DuchonBasisSpec {
-            periodic: None,
-            center_strategy: CenterStrategy::UserProvided(centers),
-            length_scale: Some(0.9),
-            power: 2.0,
-            nullspace_order: DuchonNullspaceOrder::Linear,
-            identifiability: SpatialIdentifiability::None,
-            aniso_log_scales: None,
-            operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let mut workspace = BasisWorkspace::default();
         let second_derivative = build_duchon_basis_log_kappasecond_derivativewithworkspace(
@@ -33664,7 +33337,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let analytic = build_duchon_basis_log_kappasecond_derivative(data.view(), &spec)
             .expect("analytic Duchon second derivative should build");
@@ -33726,7 +33399,7 @@ mod tests {
             identifiability: SpatialIdentifiability::default(),
             aniso_log_scales: Some(vec![0.0, 0.0]),
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
 
         let basis = build_duchon_basis(data.view(), &spec).expect("aniso Duchon basis");
@@ -33788,7 +33461,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(vec![0.2, -0.1, -0.1]),
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
 
         let basis = build_duchon_basis(data.view(), &spec).expect("pure Duchon basis");
@@ -33829,7 +33502,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(eta),
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         build_duchon_basis(data.view(), &spec)
             .expect("pure Duchon basis")
@@ -33874,7 +33547,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(eta.clone()),
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let derivs = build_duchon_basis_log_kappa_aniso_derivatives(data.view(), &spec)
             .expect("pure Duchon anisotropic derivatives");
@@ -33991,7 +33664,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: Some(vec![0.2, -0.05, -0.15]),
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let derivs = build_duchon_basis_log_kappa_aniso_derivatives(data.view(), &spec)
             .expect("pure Duchon anisotropic derivatives");
@@ -34124,7 +33797,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let err = match build_duchon_basis(data.view(), &spec) {
             Ok(_) => panic!("pure Duchon default tuple violates the nullspace-order condition"),
@@ -34160,7 +33833,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let err = match build_duchon_basis(centers.view(), &spec) {
             Ok(_) => panic!("indefinite pure Duchon counterexample should be rejected"),
