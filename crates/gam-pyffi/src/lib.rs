@@ -721,8 +721,19 @@ fn duchon_basis<'py>(
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
         operator_penalties: Default::default(),
-        periodic: if any_periodic { Some(vec![None; d]) } else { None },
-        boundary: OneDimensionalBoundary::Open,
+        periodic: None,
+        boundary: if any_periodic && d == 1 {
+            let left = ctrs[[0, 0]];
+            let right = ctrs[[ctrs.nrows() - 1, 0]];
+            if !(left.is_finite() && right.is_finite() && right > left) {
+                return Err(py_value_error(
+                    "periodic Duchon centers must define a finite ordered domain".to_string(),
+                ));
+            }
+            OneDimensionalBoundary::Cyclic { start: left, end: right }
+        } else {
+            OneDimensionalBoundary::Open
+        },
     };
     let built = build_duchon_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
     Ok(built.design.to_dense().into_pyarray(py).unbind())
@@ -938,8 +949,19 @@ fn duchon_function_norm_penalty<'py>(
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
         operator_penalties: Default::default(),
-        periodic: if any_periodic { Some(vec![None; d]) } else { None },
-        boundary: OneDimensionalBoundary::Open,
+        periodic: None,
+        boundary: if any_periodic && d == 1 {
+            let left = center_matrix[[0, 0]];
+            let right = center_matrix[[center_matrix.nrows() - 1, 0]];
+            if !(left.is_finite() && right.is_finite() && right > left) {
+                return Err(py_value_error(
+                    "periodic Duchon centers must define a finite ordered domain".to_string(),
+                ));
+            }
+            OneDimensionalBoundary::Cyclic { start: left, end: right }
+        } else {
+            OneDimensionalBoundary::Open
+        },
     };
     let built = build_duchon_basis(center_matrix.view(), &spec)
         .map_err(|err| py_value_error(err.to_string()))?;
@@ -3431,7 +3453,8 @@ fn build_latent_duchon_design(
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
         operator_penalties: Default::default(),
-        periodic: false,
+        periodic: None,
+        boundary: OneDimensionalBoundary::Open,
     };
     let built = build_duchon_basis(t_mat.view(), &spec)
         .map_err(|err| format!("failed to evaluate N-D Duchon basis for LatentCoord: {err}"))?;
@@ -3641,6 +3664,7 @@ fn build_latent_forward_design(
                 double_penalty: false,
                 identifiability: MaternIdentifiability::None,
                 aniso_log_scales: None,
+                periodic: None,
             };
             let built = build_matern_basis(t_mat.view(), &spec)
                 .map_err(|err| format!("failed to evaluate Matérn latent basis: {err}"))?;
