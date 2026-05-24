@@ -18272,7 +18272,7 @@ mod tests {
                 intercept_warm_starts: cache,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let marginal_eta = Array1::from_iter((0..n).map(|i| 0.15 * ((i as f64) * 0.001).sin()));
         let slope_eta = Array1::from_iter((0..n).map(|i| 0.35 + 0.02 * ((i as f64) * 0.003).cos()));
         let states = vec![
@@ -20481,7 +20481,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
 
         let a = 0.35;
         let b = 0.6;
@@ -20654,7 +20654,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let specs = vec![
             dummy_blockspec(1, 3),
             dummy_blockspec(1, 3),
@@ -21779,7 +21779,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -21935,7 +21935,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -22214,7 +22214,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -22305,7 +22305,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -22418,7 +22418,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -22550,7 +22550,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -23149,7 +23149,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -23281,7 +23281,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -23400,7 +23400,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -23517,7 +23517,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -23886,7 +23886,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -24677,7 +24677,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let beta_w = Array1::from_iter(
             (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
         );
@@ -24793,7 +24793,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
         );
@@ -24918,7 +24918,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
         );
@@ -25068,7 +25068,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
         );
@@ -25629,7 +25629,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let block_states = vec![
             ParameterBlockState {
                 beta: array![0.25],
@@ -25704,7 +25704,7 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                };
+            };
         let family = make_family(sigma);
         let block_states = vec![
             ParameterBlockState {
