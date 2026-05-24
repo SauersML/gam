@@ -3274,7 +3274,7 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
             };
             let snapshot = feedback.snapshot();
             let cap = first_order_inner_cap_schedule(self.eval_count, g_ratio, snapshot);
-            let _prev = feedback.cap.swap(cap, Ordering::Relaxed);
+            drop(feedback.cap.swap(cap, Ordering::Relaxed));
         }
         let stage_start = std::time::Instant::now();
         log::info!(

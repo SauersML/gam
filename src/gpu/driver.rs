@@ -57,11 +57,9 @@ impl DriverApi {
         let sym = |e: libloading::Error| GpuError::DriverSymbolMissing {
             reason: e.to_string(),
         };
-        // SAFETY: each `library.get` returns a libloading::Symbol whose
-        // signature we are asserting matches the libcuda export of the
-        // same name; deref'ing yields the raw fn pointer. The `library`
-        // is the process-static dlopen handle from load_static_library,
-        // so the pointers we copy out stay valid for the process.
+        // SAFETY: each library.get asserts a signature matching the
+        // libcuda export of the same name; deref yields raw fn pointers
+        // backed by the process-static handle from load_static_library.
         unsafe {
             Ok(Self {
                 cu_init: *library.get(b"cuInit\0").map_err(sym)?,
