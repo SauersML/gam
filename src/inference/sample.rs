@@ -685,25 +685,31 @@ fn sample_standard_link_wiggle(
         degree,
     };
 
-    let nuts_family = match family {
-        LikelihoodFamily::BinomialLogit => NutsFamily::BinomialLogit,
-        LikelihoodFamily::BinomialProbit => NutsFamily::BinomialProbit,
-        LikelihoodFamily::BinomialCLogLog => NutsFamily::BinomialCLogLog,
-        LikelihoodFamily::GaussianIdentity => NutsFamily::Gaussian,
-        LikelihoodFamily::PoissonLog => NutsFamily::PoissonLog,
-        LikelihoodFamily::Tweedie { .. } => NutsFamily::TweedieLog,
-        LikelihoodFamily::NegativeBinomial { .. } => NutsFamily::NegativeBinomialLog,
-        LikelihoodFamily::GammaLog => NutsFamily::GammaLog,
+    let nuts_family = match (&likelihood.response, &likelihood.link) {
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+            NutsFamily::BinomialLogit
+        }
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+            NutsFamily::BinomialProbit
+        }
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+            NutsFamily::BinomialCLogLog
+        }
+        (ResponseFamily::Gaussian, _) => NutsFamily::Gaussian,
+        (ResponseFamily::Poisson, _) => NutsFamily::PoissonLog,
+        (ResponseFamily::Tweedie { .. }, _) => NutsFamily::TweedieLog,
+        (ResponseFamily::NegativeBinomial { .. }, _) => NutsFamily::NegativeBinomialLog,
+        (ResponseFamily::Gamma, _) => NutsFamily::GammaLog,
         _ => {
             return Err(format!(
                 "NUTS sampling with link wiggle is not supported for family {}",
-                family.pretty_name()
+                spec_pretty_name(&likelihood)
             ));
         }
     };
 
     let weights = Array1::ones(data.nrows());
-    let scale = family_noise_parameter(&fit, family).unwrap_or(fit.standard_deviation);
+    let scale = family_noise_parameter(&fit, &likelihood).unwrap_or(fit.standard_deviation);
 
     let wiggle_nuts_dense = design.design.as_dense_cow();
     run_link_wiggle_nuts_sampling(

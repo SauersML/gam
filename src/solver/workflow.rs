@@ -239,7 +239,7 @@ pub struct StandardFitRequest<'a> {
     pub weights: Array1<f64>,
     pub offset: Array1<f64>,
     pub spec: TermCollectionSpec,
-    pub family: LikelihoodFamily,
+    pub family: LikelihoodSpec,
     pub options: FitOptions,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
     pub wiggle: Option<StandardBinomialWiggleConfig>,
@@ -761,11 +761,14 @@ pub enum FitResult {
 }
 
 fn resolved_wiggle_inverse_link(
-    family: LikelihoodFamily,
+    spec: &LikelihoodSpec,
     fit: &UnifiedFitResult,
     fallback: &InverseLink,
 ) -> Result<InverseLink, String> {
-    let resolved = match fit.fitted_link_state(family).map_err(|e| e.to_string())? {
+    let resolved = match fit
+        .fitted_link_state(legacy_family_from_spec(spec))
+        .map_err(|e| e.to_string())?
+    {
         FittedLinkState::Standard(Some(link)) => InverseLink::Standard(link),
         FittedLinkState::Standard(None) => fallback.clone(),
         FittedLinkState::LatentCLogLog { state } => InverseLink::LatentCLogLog(state),
@@ -841,7 +844,7 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
             request.offset.clone(),
             &request.spec,
             latent_coord,
-            request.family,
+            legacy_family_from_spec(&request.family),
             &request.options,
         )
         .map_err(|e| e.to_string())?
@@ -856,7 +859,7 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
             &request.spec,
             &request.coefficient_groups,
             &request.penalty_block_gamma_priors,
-            request.family,
+            legacy_family_from_spec(&request.family),
             &request.options,
         )
         .map_err(|e| e.to_string())?;
@@ -873,7 +876,7 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
             request.weights.clone(),
             request.offset.clone(),
             &request.spec,
-            request.family,
+            legacy_family_from_spec(&request.family),
             &request.options,
             &request.kappa_options,
         )
