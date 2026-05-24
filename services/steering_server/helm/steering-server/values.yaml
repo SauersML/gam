@@ -1,0 +1,33 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/sauersml/gam/steering-server
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8000
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 8
+  targetCPUUtilizationPercentage: 70
+
+config:
+  databaseUrl: postgresql+psycopg://steering:steering@postgres:5432/steering
+  otlpEndpoint: http://otel-collector:4317
+  queueRunInline: false
+  bootstrapUser: service-admin
+
+secret:
+  bootstrapApiKey: compose-steering-key

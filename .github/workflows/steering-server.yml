@@ -1,0 +1,68 @@
+name: steering-server
+
+on:
+  pull_request:
+    paths:
+      - "services/steering_server/**"
+      - ".github/workflows/steering-server.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "services/steering_server/**"
+      - ".github/workflows/steering-server.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/steering_server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements.txt "pytest>=8" "httpx>=0.27" "ruff>=0.8" "mypy>=1.13"
+      - run: ruff check app tests
+      - run: mypy app
+      - run: pytest
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        if: github.event_name == 'push'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: services/steering_server
+          push: ${{ github.event_name == 'push' }}
+          tags: ghcr.io/sauersml/gam/steering-server:${{ github.sha }}
+
+  helm:
+    runs-on: ubuntu-latest
+    needs: docker
+    defaults:
+      run:
+        working-directory: services/steering_server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint helm/steering-server
+      - run: helm package helm/steering-server --destination dist
+
+  staging:
+    runs-on: ubuntu-latest
+    needs: helm
+    if: github.event_name == 'push'
+    steps:
+      - run: echo "stub: to-be-implemented staging deploy once cluster credentials are provisioned"

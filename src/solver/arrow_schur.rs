@@ -1354,6 +1354,8 @@ fn analytic_penalty_is_row_block_diagonal(penalty: &AnalyticPenaltyKind) -> bool
     matches!(
         penalty,
         AnalyticPenaltyKind::Ard(_)
+            | AnalyticPenaltyKind::TopKActivation(_)
+            | AnalyticPenaltyKind::JumpReLU(_)
             | AnalyticPenaltyKind::Sparsity(_)
             | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
             | AnalyticPenaltyKind::IBPAssignment(_)
@@ -1817,7 +1819,7 @@ pub fn solve_arrow_newton_step_with_proximal_correction<F>(
     mut trial_objective: F,
 ) -> Result<ArrowAcceptedProximalStep, ArrowSchurError>
 where
-    F: FnMut(ArrayView1<'_, f64>, ArrayView1<'_, f64>) -> f64,
+    F: for<'a, 'b> FnMut(ArrayView1<'a, f64>, ArrayView1<'b, f64>) -> f64,
 {
     if !current_objective_value.is_finite() {
         return Err(ArrowSchurError::AdaptiveCorrectionFailed {
@@ -1869,8 +1871,7 @@ where
                         format!("candidate was not a finite descent direction: g·p={g_dot_p}");
                 } else {
                     let trial_value = trial_objective(delta_t.view(), delta_beta.view());
-                    let armijo_bound =
-                        current_objective_value + correction.armijo_c1 * g_dot_p;
+                    let armijo_bound = current_objective_value + correction.armijo_c1 * g_dot_p;
                     if trial_value.is_finite() && trial_value <= armijo_bound {
                         return Ok(ArrowAcceptedProximalStep {
                             delta_t,
@@ -2618,7 +2619,10 @@ impl std::fmt::Display for ArrowSchurError {
                 write!(f, "arrow-Schur: Schur PCG failed: {reason}")
             }
             ArrowSchurError::AdaptiveCorrectionFailed { reason } => {
-                write!(f, "arrow-Schur: adaptive proximal correction failed: {reason}")
+                write!(
+                    f,
+                    "arrow-Schur: adaptive proximal correction failed: {reason}"
+                )
             }
         }
     }

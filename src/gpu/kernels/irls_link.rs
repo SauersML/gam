@@ -266,10 +266,9 @@ extern "C" __global__ void irls_link_kernel(
         .arg(&nn)
         .arg(&cc)
         .arg(&link_code);
-    // SAFETY: func is loaded from a freshly NVRTC-compiled module bound to
-    // this context; all device args (deta, dout) point to live allocations of
-    // size n and n*cols respectively; nn/cc/link_code are pod scalars; the
-    // grid covers exactly the n threads the kernel guards against.
+    // NVRTC module fresh; deta/dout live; nn/cc/link_code pod.
+    // Grid covers exactly the n threads kernel guards against.
+    // SAFETY: all kernel-arg lifetimes + bounds checked above.
     unsafe { builder.launch(cfg) }.map_err(map_drv)?;
 
     let host = stream.memcpy_dtov(&dout).map_err(map_drv)?;

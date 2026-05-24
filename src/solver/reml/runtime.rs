@@ -952,6 +952,23 @@ fn hash_analytic_penalty_kind(
             }
             hasher.write_f64(p.n_eff);
         }
+        AnalyticPenaltyKind::TopKActivation(p) => {
+            hasher.write_str("topk-activation");
+            hash_psi_slice(hasher, &p.target);
+            hasher.write_usize(p.k);
+            hasher.write_usize(p.latent_dim);
+            hasher.write_f64(p.weight);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
+        AnalyticPenaltyKind::JumpReLU(p) => {
+            hasher.write_str("jumprelu");
+            hash_psi_slice(hasher, &p.target);
+            hasher.write_usize(p.latent_dim);
+            hash_array_view(hasher, p.thresholds.view());
+            hasher.write_f64(p.weight);
+            hasher.write_f64(p.smoothing_eps);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
         AnalyticPenaltyKind::TotalVariation(p) => {
             hasher.write_str("total-variation");
             hasher.write_f64(p.weight);

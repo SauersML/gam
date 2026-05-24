@@ -74,6 +74,7 @@ from ._penalties import (
     AuxConditionalPriorPenalty,
     BlockOrthogonalityPenalty,
     BlockSparsityPenalty,
+    GatedSAEDecoder,
     IBPAssignmentPenalty,
     IsometryPenalty,
     IvaeRidgeMeanGauge,

@@ -1,5 +1,6 @@
 pub(crate) mod active_set;
 pub mod arrow_schur;
+pub mod arrow_schur_convergence_check;
 pub mod estimate;
 pub mod gpu;
 pub mod mixture_link;
