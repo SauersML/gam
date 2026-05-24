@@ -45,6 +45,8 @@
 //!   * [`OrthogonalityPenalty`] — fixes the rotation gauge inside a latent
 //!     block by penalizing cross-axis correlations. Pair with ARD when
 //!     intrinsic dimension should be identifiable.
+//!   * [`BlockOrthogonalityPenalty`] — penalizes only between-block
+//!     cross-products of latent axes, leaving within-block structure free.
 //!
 //! All shipped primitives are **analytic**: no autograd, no finite differencing. Each
 //! exposes:
@@ -71,10 +73,11 @@
 //! kernel-shape paths append ext-coords. The IsometryPenalty owns one `ρ`; the
 //! SparsityPenalty owns either zero (`ε` fixed) or one (`ε` REML-selected) plus
 //! one strength; the ARDPenalty owns `d` (one per latent axis);
-//! NuclearNorm, BlockSparsity, RowPrecisionPrior, and Orthogonality each own
-//! one strength only when their weight is learnable. ParametricRowPrecisionPrior
-//! owns its log-baseline precision, raw distance sensitivity, and reference
-//! point coordinates, plus one strength axis when requested.
+//! NuclearNorm, BlockSparsity, BlockOrthogonality, RowPrecisionPrior, and
+//! Orthogonality each own one strength only when their weight is learnable.
+//! ParametricRowPrecisionPrior owns its log-baseline precision, raw distance
+//! sensitivity, and reference point coordinates, plus one strength axis when
+//! requested.
 //!
 //! ## Three-tier landings
 //!
@@ -90,6 +93,7 @@
 //! | RowPrecisionPrior | ext-coord (latent t) | 0 or 1 (log μ_aux) |
 //! | ParametricRowPrecisionPrior | ext-coord (latent t) | d + d + d·du [+1 log μ_aux] |
 //! | Orthogonality | ext-coord (latent t) | 0 or 1 (log μ_orth) |
+//! | BlockOrthogonality | ext-coord (latent t) | 0 or 1 (log μ_block_orth) |
 
 use faer::Side;
 use ndarray::{
