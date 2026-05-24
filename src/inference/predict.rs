@@ -4356,6 +4356,7 @@ pub fn enrich_posterior_mean_bounds(
         crate::types::LikelihoodFamily::BinomialLogit
             | crate::types::LikelihoodFamily::BinomialProbit
             | crate::types::LikelihoodFamily::BinomialCLogLog
+            | crate::types::LikelihoodFamily::BinomialLatentCLogLog
             | crate::types::LikelihoodFamily::BinomialSas
             | crate::types::LikelihoodFamily::BinomialBetaLogistic
             | crate::types::LikelihoodFamily::BinomialMixture
@@ -5186,6 +5187,7 @@ where
         crate::types::LikelihoodFamily::BinomialLogit
             | crate::types::LikelihoodFamily::BinomialProbit
             | crate::types::LikelihoodFamily::BinomialCLogLog
+            | crate::types::LikelihoodFamily::BinomialLatentCLogLog
             | crate::types::LikelihoodFamily::BinomialSas
             | crate::types::LikelihoodFamily::BinomialBetaLogistic
             | crate::types::LikelihoodFamily::BinomialMixture
@@ -5242,6 +5244,10 @@ where
                 );
                 (Some(lower), Some(upper))
             }
+            crate::types::LikelihoodFamily::PoissonLog => {
+                let response_var = mean.mapv(|mu| mu.max(0.0));
+                response_observation_bounds(response_var)
+            }
             crate::types::LikelihoodFamily::NegativeBinomial { theta } => {
                 let response_var = mean.mapv(|mu| mu + mu.powi(2) / theta);
                 response_observation_bounds(response_var)
@@ -5251,8 +5257,28 @@ where
                 let response_var = mean.mapv(|mu| phi * mu.powf(p));
                 response_observation_bounds(response_var)
             }
+            crate::types::LikelihoodFamily::GammaLog => {
+                let phi = fit.likelihood_scale.fixed_phi().unwrap_or(1.0);
+                let response_var = mean.mapv(|mu| phi * mu.powi(2));
+                response_observation_bounds(response_var)
+            }
             crate::types::LikelihoodFamily::BetaLogit { phi } => {
                 let response_var = mean.mapv(|mu| mu * (1.0 - mu) / (1.0 + phi));
+                response_observation_bounds(response_var)
+            }
+            crate::types::LikelihoodFamily::BinomialLogit
+            | crate::types::LikelihoodFamily::BinomialProbit
+            | crate::types::LikelihoodFamily::BinomialCLogLog
+            | crate::types::LikelihoodFamily::BinomialLatentCLogLog
+            | crate::types::LikelihoodFamily::BinomialSas
+            | crate::types::LikelihoodFamily::BinomialBetaLogistic
+            | crate::types::LikelihoodFamily::BinomialMixture => {
+                // Prediction returns probability/proportion means; trial counts are not in this API.
+                // Beta-logistic and mixture links use the closest conditional Bernoulli variance.
+                let response_var = mean.mapv(|mu| {
+                    let p = mu.clamp(0.0, 1.0);
+                    p * (1.0 - p)
+                });
                 response_observation_bounds(response_var)
             }
             _ => (None, None),

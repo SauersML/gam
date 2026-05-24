@@ -3521,16 +3521,19 @@ fn build_standard_latent_analytic_penalty_registry(
                     "lambda_per_row_shape",
                     &context,
                 )?;
-                registry.push(AnalyticPenaltyKind::AuxConditionalPrior(Arc::new(
-                    AuxConditionalPriorPenalty::new(
-                        slice,
-                        lambda_per_row,
-                        weight,
-                        n_eff,
-                        learnable,
-                    )
-                    .map_err(|err| format!("{context}: {err}"))?,
-                )));
+                let penalty = AuxConditionalPriorPenalty::new(
+                    slice,
+                    lambda_per_row,
+                    weight,
+                    n_eff,
+                    learnable,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(AnalyticPenaltyKind::AuxConditionalPrior(Arc::new(penalty)));
             }
             "parametric_aux_conditional_prior" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
@@ -3547,21 +3550,17 @@ fn build_standard_latent_analytic_penalty_registry(
                     analytic_descriptor_array1_flat(descriptor, "raw_beta", &context)?;
                 let mu =
                     analytic_descriptor_array2_flat(descriptor, "mu", "mu_shape", &context)?;
-                registry.push(AnalyticPenaltyKind::ParametricAuxConditionalPrior(
-                    Arc::new(
-                        ParametricAuxConditionalPriorPenalty::new(
-                            slice,
-                            aux,
-                            log_alpha,
-                            raw_beta,
-                            mu,
-                            weight,
-                            n_eff,
-                            learnable,
-                        )
-                        .map_err(|err| format!("{context}: {err}"))?,
-                    ),
-                ));
+                let penalty = ParametricAuxConditionalPriorPenalty::new(
+                    slice, aux, log_alpha, raw_beta, mu, weight, n_eff, learnable,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(AnalyticPenaltyKind::ParametricAuxConditionalPrior(Arc::new(
+                    penalty,
+                )));
             }
             other => return Err(format!("{context}.kind has unsupported analytic penalty {other:?}")),
         }
