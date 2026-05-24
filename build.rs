@@ -1018,43 +1018,58 @@ fn compute_trait_impl_mask(content: &str) -> Vec<bool> {
     let mut mask = vec![false; n];
     let stripped_lines: Vec<String> = strip_file_lines(content);
 
-    // Stack entry: depth-just-before-open, is_trait_impl.
+    // Stack entry: depth-just-before-open, is_trait_impl. Only the FIRST `{`
+    // following an `impl ...` header is matched with that header — subsequent
+    // braces (fn bodies, match arms, struct literals, blocks) inside that
+    // impl are classified as non-trait-impl scopes, so dead-guard consts
+    // inside, say, a fn inside a trait impl still get correctly flagged.
     let mut stack: Vec<(i32, bool)> = Vec::new();
     let mut depth: i32 = 0;
+    // True when we have seen `impl ` on a recent line but not yet found its
+    // opening `{`. `pending_is_trait` tracks whether ` for ` was seen during
+    // the header span.
+    let mut pending_impl = false;
+    let mut pending_is_trait = false;
 
     for (idx, stripped) in stripped_lines.iter().enumerate() {
         let inside_trait_impl = stack.iter().any(|(_, t)| *t);
         mask[idx] = inside_trait_impl;
+
+        // Detect an item-position `impl` header opener. We accept the
+        // trimmed line starting with `impl`, `pub impl` (rare), `unsafe impl`,
+        // `default impl`, etc. — the common shape is `impl`, optionally
+        // preceded by visibility/`unsafe`/`default` modifiers.
+        let trimmed = stripped.trim_start();
+        let starts_impl = trimmed.starts_with("impl ")
+            || trimmed.starts_with("impl<")
+            || trimmed.starts_with("unsafe impl ")
+            || trimmed.starts_with("unsafe impl<")
+            || trimmed.starts_with("default impl ")
+            || trimmed.starts_with("default impl<");
+        if starts_impl && depth == 0 {
+            // Top-level impl: it opens a fresh trait-impl-or-inherent scope.
+            pending_impl = true;
+            pending_is_trait = stripped.contains(" for ");
+        } else if pending_impl && stripped.contains(" for ") {
+            // ` for ` showed up on a continuation line of the header.
+            pending_is_trait = true;
+        }
 
         let bytes = stripped.as_bytes();
         for &b in bytes {
             if b == b'{' {
                 let opened_at_depth = depth;
                 depth += 1;
-                // Determine whether the brace just opened is the body of a
-                // trait impl. Look at the current line plus up to 3
-                // preceding non-blank stripped lines for `impl ` and
-                // ` for `.
-                let mut header = String::new();
-                header.push_str(stripped);
-                let mut seen = 0usize;
-                let mut k = idx;
-                while k > 0 && seen < 3 {
-                    k -= 1;
-                    let prev = &stripped_lines[k];
-                    if prev.trim().is_empty() {
-                        continue;
-                    }
-                    seen += 1;
-                    header.insert(0, ' ');
-                    header.insert_str(0, prev);
-                    if line_has_keyword(prev, "impl") {
-                        break;
-                    }
+                if pending_impl && opened_at_depth == 0 {
+                    stack.push((opened_at_depth, pending_is_trait));
+                    pending_impl = false;
+                    pending_is_trait = false;
+                } else {
+                    // A non-impl brace (fn body, match, block, struct literal,
+                    // etc.) — push it as a non-trait-impl scope so we balance
+                    // correctly on `}` without claiming trait-impl context.
+                    stack.push((opened_at_depth, false));
                 }
-                let is_trait_impl = line_has_keyword(&header, "impl")
-                    && header.contains(" for ");
-                stack.push((opened_at_depth, is_trait_impl));
             } else if b == b'}' {
                 if let Some(&(entry, _)) = stack.last() {
                     if depth - 1 == entry {
@@ -1715,9 +1730,36 @@ fn scan_for_underscore_fn_args(
                 sig_text.push('\n');
             }
             let sig_bytes = sig_text.as_bytes();
-            let Some(paren_open) = sig_text.find('(') else {
-                idx = sig_end_line + 1;
-                continue;
+            // Find the first `(` at angle-depth 0 — the actual parameter list
+            // opener. A naive `find('(')` mistakes tuple types inside generic
+            // bounds (e.g. `fn foo<T: Iter<Item = (i32, i32)>>(_x: i32)`) for
+            // the param list and silently misses the real underscore-prefixed
+            // params.
+            let paren_open = {
+                let mut ang: i32 = 0;
+                let mut found: Option<usize> = None;
+                for (k, &b) in sig_bytes.iter().enumerate() {
+                    match b {
+                        b'<' => ang += 1,
+                        b'>' => {
+                            if ang > 0 {
+                                ang -= 1;
+                            }
+                        }
+                        b'(' if ang == 0 => {
+                            found = Some(k);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                match found {
+                    Some(p) => p,
+                    None => {
+                        idx = sig_end_line + 1;
+                        continue;
+                    }
+                }
             };
             let Some(close_rel) =
                 find_matching_paren(&sig_bytes[paren_open + 1..])
@@ -1878,6 +1920,28 @@ fn scan_for_useless_tests(
                 continue;
             }
             let mut has_should_panic = s.contains("#[should_panic");
+            // `#[should_panic]` is commonly placed BEFORE `#[test]`. Walk back
+            // through immediately-preceding attribute lines (and blank/
+            // comment lines) so the ordering does not matter.
+            let mut back = i;
+            while back > 0 {
+                back -= 1;
+                let prev = stripped_lines
+                    .get(back)
+                    .map(String::as_str)
+                    .unwrap_or(lines[back]);
+                let pt = prev.trim();
+                if pt.is_empty() || pt.starts_with("//") {
+                    continue;
+                }
+                if pt.starts_with("#[") || pt.starts_with("#![") {
+                    if prev.contains("#[should_panic") {
+                        has_should_panic = true;
+                    }
+                    continue;
+                }
+                break;
+            }
             let mut j = i + 1;
             while j < n {
                 let sj = stripped_lines

@@ -2489,7 +2489,7 @@ pub enum BasisMetadata {
         periods: Vec<Option<f64>>,
         identifiability_transform: Option<Array2<f64>>,
     },
-    Sphere {
+    SphereHarmonics {
         max_degree: usize,
         radians: bool,
     },

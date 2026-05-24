@@ -7805,10 +7805,10 @@ fn with_identifiability_transform(
                 transform,
             )?,
         }),
-        BasisMetadata::Sphere {
+        BasisMetadata::SphereHarmonics {
             max_degree,
             radians,
-        } => Ok(BasisMetadata::Sphere {
+        } => Ok(BasisMetadata::SphereHarmonics {
             max_degree: *max_degree,
             radians: *radians,
         }),
@@ -7844,14 +7844,16 @@ fn with_identifiability_transform(
             group_col,
             knots,
             degree,
-            levels,
+            periodic,
+            group_levels,
             flavour,
         } => Ok(BasisMetadata::FactorSmooth {
             continuous_cols: continuous_cols.clone(),
             group_col: *group_col,
             knots: knots.clone(),
             degree: *degree,
-            levels: levels.clone(),
+            periodic: *periodic,
+            group_levels: group_levels.clone(),
             flavour: flavour.clone(),
         }),
     }
@@ -16300,12 +16302,12 @@ pub fn freeze_term_collection_from_design(
             }
             (
                 SmoothBasisSpec::Sphere { spec: s, .. },
-                BasisMetadata::Sphere {
+                BasisMetadata::SphereHarmonics {
                     max_degree,
                     radians,
                 },
             ) => {
-                s.max_degree = *max_degree;
+                s.max_degree = Some(*max_degree);
                 s.radians = *radians;
             }
             (
