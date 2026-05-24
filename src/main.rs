@@ -3286,6 +3286,9 @@ fn run_predict_survival(
                 &prepared,
                 primary_offset,
             ),
+            // SAFETY: the surrounding `if matches!(saved_likelihood_mode,
+            // Latent | LatentBinary)` block gates this match; no other
+            // discriminant can reach here.
             _ => unreachable!(),
         };
     }
@@ -5282,6 +5285,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                             }
                             Err(e) => return Err(format!("latent binary fit failed: {e}")),
                         },
+                        // SAFETY: enclosing `if matches!(saved_likelihood_mode,
+                        // Latent | LatentBinary)` block (line ~3246) gates this
+                        // match — no other discriminant can reach here.
                         _ => unreachable!(),
                     };
                     Ok(objective)
@@ -5333,6 +5339,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     Err(e) => return Err(format!("latent binary fit failed: {e}")),
                 }
             }
+            // SAFETY: outer block guards `likelihood_mode` to Latent or
+            // LatentBinary via the same gate at line ~3246.
             _ => unreachable!(),
         };
         cli_out!(
@@ -5377,6 +5385,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     SurvivalLikelihoodMode::LatentBinary => FittedFamily::LatentBinary {
                         frailty: frailty.clone(),
                     },
+                    // SAFETY: same outer gate as above — `likelihood_mode` is
+                    // restricted to Latent / LatentBinary on this path.
                     _ => unreachable!(),
                 },
                 if likelihood_mode == SurvivalLikelihoodMode::Latent {
@@ -7593,6 +7603,10 @@ fn collect_spatial_smooth_usagewarnings(
                 "thinplate/tps" => format!("thinplate({})", cols.join(", ")),
                 "matern" => format!("matern({})", cols.join(", ")),
                 "duchon" => format!("duchon({})", cols.join(", ")),
+                "sphere/sos" => format!("sphere({})", cols.join(", ")),
+                // SAFETY: family strings come from
+                // `spatial_basiswarning_family_and_cols`, which only ever
+                // returns the four spellings handled above.
                 _ => unreachable!("unexpected spatial basis family"),
             };
             let bad_example = match family {
@@ -7611,6 +7625,13 @@ fn collect_spatial_smooth_usagewarnings(
                     .map(|col| format!("s({col}, type=duchon)"))
                     .collect::<Vec<_>>()
                     .join(" + "),
+                "sphere/sos" => cols
+                    .iter()
+                    .map(|col| format!("s({col}, type=sphere)"))
+                    .collect::<Vec<_>>()
+                    .join(" + "),
+                // SAFETY: identical exhaustive set to the `example` match
+                // above; same `spatial_basiswarning_family_and_cols` source.
                 _ => unreachable!("unexpected spatial basis family"),
             };
             Some(format!(

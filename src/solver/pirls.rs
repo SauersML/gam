@@ -2094,7 +2094,9 @@ impl<'a> GamWorkingModel<'a> {
                         // returns Gpu when a concrete backend reports support. Keep the branch
                         // explicit so CUDA/HIP/Metal implementations can slot in here without
                         // changing P-IRLS control flow.
-                        unreachable!("native GPU DenseXtDiagX dispatch without implementation")
+                        return Err(EstimationError::InvalidInput(
+                            "native GPU DenseXtDiagX dispatch without implementation".to_string(),
+                        ));
                     }
                     Ok(gpu::GpuDispatch::Cpu { reason }) => {
                         log::debug!(

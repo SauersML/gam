@@ -5613,7 +5613,12 @@ fn build_factor_smooth_basis(
         BasisMetadata::BSpline1D {
             knots, periodic, ..
         } => (knots, periodic),
-        _ => unreachable!(),
+        other => {
+            return Err(BasisError::InvalidInput(format!(
+                "factor smooth marginal must produce BSpline1D metadata, got {:?}",
+                std::mem::discriminant(&other)
+            )));
+        }
     };
     if matches!(spec.flavour, FactorSmoothFlavour::Re) {
         x = Array2::<f64>::zeros((data.nrows(), 2));
@@ -6322,7 +6327,9 @@ fn build_single_local_smooth_term(
             build_tensor_bspline_basis(data, feature_cols, spec)?
         }
         SmoothBasisSpec::ByVariable { .. } => {
-            unreachable!("ByVariable smooths return before inner basis dispatch")
+            return Err(BasisError::InvalidInput(
+                "internal: ByVariable smooths must return before inner basis dispatch".to_string(),
+            ));
         }
     };
 
@@ -16182,7 +16189,12 @@ pub fn freeze_term_collection_from_design(
                 SmoothBasisSpec::ThinPlate {
                     feature_cols, spec, ..
                 } => (feature_cols.clone(), spec.identifiability.clone()),
-                _ => unreachable!("guarded by the matches! above"),
+                _ => {
+                    return Err(EstimationError::InvalidInput(
+                        "internal: TPS-to-Duchon rewrite guard saw non-ThinPlate basis variant"
+                            .to_string(),
+                    ));
+                }
             };
             term.basis = SmoothBasisSpec::Duchon {
                 feature_cols,
@@ -18577,6 +18589,9 @@ fn try_exact_joint_latent_coord_optimization(
                 .hyper_dirs()
                 .map_err(EstimationError::InvalidInput)?;
             let design_revision = Some(self.cache.design_revision());
+            let registry_for_key = self.cache.analytic_penalties();
+            self.evaluator
+                .set_analytic_penalty_registry(registry_for_key.as_deref());
             let mut eval = evaluate_joint_reml_outer_eval_at_theta(
                 &mut self.evaluator,
                 self.cache.design(),
@@ -18588,7 +18603,7 @@ fn try_exact_joint_latent_coord_optimization(
                 design_revision,
             )?;
             let latent = self.cache.latent().map_err(EstimationError::InvalidInput)?;
-            if let Some(registry) = self.cache.analytic_penalties() {
+            if let Some(registry) = registry_for_key {
                 let mut registry = registry.as_ref().clone();
                 registry.apply_weight_schedules(
                     crate::solver::estimate::reml::runtime::current_outer_iter() as usize,
@@ -18623,6 +18638,9 @@ fn try_exact_joint_latent_coord_optimization(
                 .cache
                 .hyper_dirs()
                 .map_err(EstimationError::InvalidInput)?;
+            let registry_for_key = self.cache.analytic_penalties();
+            self.evaluator
+                .set_analytic_penalty_registry(registry_for_key.as_deref());
             let mut efs = evaluate_joint_reml_efs_at_theta(
                 &mut self.evaluator,
                 self.cache.design(),
@@ -18632,7 +18650,7 @@ fn try_exact_joint_latent_coord_optimization(
                 None,
                 Some(self.cache.design_revision()),
             )?;
-            if let Some(registry) = self.cache.analytic_penalties() {
+            if let Some(registry) = registry_for_key {
                 let mut registry = registry.as_ref().clone();
                 registry.apply_weight_schedules(
                     crate::solver::estimate::reml::runtime::current_outer_iter() as usize,
@@ -18671,6 +18689,9 @@ fn try_exact_joint_latent_coord_optimization(
                 return f64::INFINITY;
             }
             let design_revision = Some(self.cache.design_revision());
+            let registry_for_key = self.cache.analytic_penalties();
+            self.evaluator
+                .set_analytic_penalty_registry(registry_for_key.as_deref());
             let result = {
                 let design = self.cache.design();
                 self.evaluator.evaluate_cost_only(
@@ -18701,7 +18722,7 @@ fn try_exact_joint_latent_coord_optimization(
                         Err(_) => return f64::INFINITY,
                     };
                     let cost = cost + contribution.cost;
-                    let cost = if let Some(registry) = self.cache.analytic_penalties() {
+                    let cost = if let Some(registry) = registry_for_key {
                         let mut registry = registry.as_ref().clone();
                         registry.apply_weight_schedules(
                             crate::solver::estimate::reml::runtime::current_outer_iter()

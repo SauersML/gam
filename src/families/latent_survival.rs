@@ -1278,6 +1278,7 @@ fn latent_survival_basis_direction(primary_idx: usize) -> LatentSurvivalPrimaryD
         // above, so this wildcard fires only on an out-of-range index,
         // which the internal iteration bounds (`0..LATENT_SURVIVAL_PRIMARY_DIM`)
         // make unreachable.
+        // SAFETY: primary_idx is bounded by LATENT_SURVIVAL_PRIMARY_DIM at every internal call site.
         _ => panic!("invalid latent survival primary index {primary_idx}"),
     }
 }

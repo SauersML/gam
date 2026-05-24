@@ -11,12 +11,6 @@
 # Concurrent branches that both remove markers will produce additive
 # line-level diff conflicts that resolve by union — the next build
 # then re-validates each surviving entry.
-crates/gam-pyffi/src/lib.rs	fn latent_input_location_jet( basis_kind: &str, t_mat: ArrayView2<'_, f64>, centers: ArrayView2<'_, f64>, m: usize, tensor_knots_concat: Option<ArrayView1<'_, f64>>, tensor_knot_offsets: Option<&[usize]>, tensor_degrees: Option<&[usize]>, ) -> Result<Array3<f64>, String>	unreachable!
-crates/gam-pyffi/src/lib.rs	fn position_basis_derivative( t: ArrayView1<'_, f64>, knots_or_centers: ArrayView1<'_, f64>, basis_kind: &str, basis_order: usize, periodic: bool, period: Option<f64>, ) -> Result<Array2<f64>, String>	unreachable!
-crates/gam-pyffi/src/lib.rs	fn position_basis_design( t: ArrayView1<'_, f64>, knots_or_centers: ArrayView1<'_, f64>, basis_kind: &str, basis_order: usize, periodic: bool, period: Option<f64>, ) -> Result<Array2<f64>, String>	unreachable!
-src/families/bernoulli_marginal_slope.rs	fn fourth_full_from_symmetric_components( t_qqqq: f64, t_qqqg: f64, t_qqgg: f64, t_qggg: f64, t_gggg: f64, ) -> [[[[f64; 2]; 2]; 2]; 2]	unreachable!
-src/families/bernoulli_marginal_slope.rs	fn validate_spec( data: ArrayView2<'_, f64>, spec: &BernoulliMarginalSlopeTermSpec, ) -> Result<(), String>	unreachable!
-src/families/bernoulli_marginal_slope.rs	pub fn fit_bernoulli_marginal_slope_terms( data: ArrayView2<'_, f64>, spec: BernoulliMarginalSlopeTermSpec, options: &BlockwiseFitOptions, kappa_options: &SpatialLengthScaleOptimizationOptions, policy: &crate::resource::ResourcePolicy, ) -> Result<BernoulliMarginalSlopeFitResult, String>	unreachable!
 src/families/latent_survival.rs	fn build_latent_survival_row( row_index: usize, hazard_loading: HazardLoading, event_type: LatentSurvivalEventType, q_entry: f64, q_exit: f64, qdot_exit: f64, unloaded_mass_entry: f64, unloaded_mass_exit: f64, unloaded_hazard_exit: f64, ) -> Result<LatentSurvivalRow, LatentSurvivalError>	unreachable!
 src/families/survival_construction.rs	pub fn parse_survival_time_basis_config( time_basis: &str, time_degree: usize, time_num_internal_knots: usize, time_smooth_lambda: f64, ) -> Result<SurvivalTimeBasisConfig, String>	unreachable!
 src/linalg/matrix.rs	pub fn crossdiag_axpy_row_into( &self, row: usize, other: &DesignMatrix, alpha: f64, out: &mut ArrayViewMut1<'_, f64>, ) -> Result<(), String>	unreachable!
@@ -26,12 +20,8 @@ src/main.rs	fn run_survival(args: SurvivalArgs) -> Result<(), String>	unreachabl
 src/solver/pirls.rs	fn compute_xtwx_blas( workspace: &mut PirlsWorkspace, design: &DesignMatrix, weights: &Array1<f64>, ) -> Result<Array2<f64>, EstimationError>	unreachable!
 src/solver/pirls.rs	fn default_beta_guess_external( p: usize, link_function: LinkFunction, y: ArrayView1<f64>, priorweights: ArrayView1<f64>, mixture_link_state: Option<&MixtureLinkState>, sas_link_state: Option<&SasLinkState>, ) -> Array1<f64>	unreachable!
 src/solver/pirls.rs	fn solve_penalized_least_squares_implicit( x_original: &DesignMatrix, transform: Option<&WorkingReparamTransform>, z: ArrayView1<f64>, weights: ArrayView1<f64>, offset: ArrayView1<f64>, penalty: &PirlsPenalty, workspace: &mut PirlsWorkspace, y: ArrayView1<f64>, link_function: LinkFunction, gaussian_fixed_cache: Option<&GaussianFixedCache>, ) -> Result<(StablePLSResult, usize), EstimationError>	unreachable!
-src/solver/workflow.rs	fn materialize_survival<'a>( parsed: &ParsedFormula, data: &'a Dataset, col_map: &HashMap<String, usize>, config: &FitConfig, entry_col: &str, exit_col: &str, event_col: &str, ) -> Result<MaterializedModel<'a>, String>	unreachable!
 src/terms/basis.rs	fn isotropic_radial_laplacian_power_from_q0( q: usize, d: usize, m: usize, s: usize, kappa: f64, big_r: f64, ) -> f64	unreachable!
 src/terms/basis.rs	fn matern_collocation_operator_matrices_should_match_closed_forms_in_1d()	unreachable!
 src/terms/basis.rs	fn matern_operator_psi_triplet_should_match_closed_form_polynomials()	unreachable!
 src/terms/basis.rs	fn test_duchon_design_log_kappa_derivative_matchesfd_dim1_power1_frozen()	unreachable!
 src/terms/basis.rs	fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_frozen()	unreachable!
-src/terms/smooth.rs	fn build_factor_smooth_basis( data: ArrayView2<'_, f64>, spec: &FactorSmoothSpec, ) -> Result<BasisBuildResult, BasisError>	unreachable!
-src/terms/smooth.rs	fn build_single_local_smooth_term( data: ArrayView2<'_, f64>, term: &SmoothTermSpec, workspace: &mut crate::basis::BasisWorkspace, ) -> Result<LocalSmoothTermBuild, BasisError>	unreachable!
-src/terms/smooth.rs	pub fn freeze_term_collection_from_design( spec: &TermCollectionSpec, design: &TermCollectionDesign, ) -> Result<TermCollectionSpec, EstimationError>	unreachable!
