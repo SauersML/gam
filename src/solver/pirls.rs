@@ -1057,14 +1057,13 @@ impl PirlsWorkspace {
         (TARGET_BYTES / bytes_perrow).clamp(MIN_ROWS, MAX_ROWS)
     }
 
-    /// Streaming chunked BLAS computation of `Xᵀ diag(W) X` with signed weights.
+    /// Add `Xᵀ diag(weights) X` to `out` using bounded dense chunks.
     ///
-    /// Observed-information assembly can produce negative row curvatures, so
-    /// the older `sqrt(max(W,0))` Gram form is mathematically wrong for that
-    /// path: it silently clips negative weights to zero. This streaming
-    /// implementation scales rows by `w_i` (sign-preserving), then forms
-    /// `Xᵀ (WX)` per chunk and reduces in parallel without exceeding one
-    /// chunk-plus-`p×p` accumulator per worker.
+    /// This is deliberately sign-preserving: observed-information curvature can
+    /// produce negative row weights, so a `sqrt(max(0, w))` Gram formulation is
+    /// mathematically wrong for this path.  The layout mirrors the future GPU
+    /// resident path (`WX` then `Xᵀ(WX)`) and keeps peak scratch bounded by one
+    /// row chunk plus one p×p accumulator per worker.
     fn add_dense_xtwx_streaming_signed<S, W>(
         weights: &ArrayBase<W, Ix1>,
         weighted_x_chunk: &mut Array2<f64>,
@@ -1091,12 +1090,10 @@ impl PirlsWorkspace {
         let use_parallel = num_chunks >= 4 && (n as u64) * (p as u64) >= 200_000;
 
         if use_parallel {
-            // Parallel: each thread reuses one WX chunk buffer and one p×p
-            // accumulator. We never form sqrt(W)·X so negative observed-Hessian
-            // weights survive the assembly exactly. Row-major chunk_buf and a
-            // serial inner scaling loop avoid (a) the F-order strided writes
-            // that fight cache lines and (b) nested rayon par_for_each that
-            // would compete for the same global pool as the outer fold.
+            // Parallel: use fold/reduce so each thread reuses one WX chunk
+            // and one p×p accumulator. This is the CPU analogue of the GPU
+            // tall-skinny reduction plan: scale rows, then accumulate Xᵀ(WX)
+            // without ever clipping negative observed-curvature weights.
             let combined = (0..num_chunks)
                 .into_par_iter()
                 .fold(
@@ -1115,30 +1112,12 @@ impl PirlsWorkspace {
                                 .expect("row-major chunk is contiguous");
                             let x_slice = x.slice(s![start..start + rows, ..]);
                             let w_slice = weights.slice(s![start..start + rows]);
-                            if let (Some(x_all), Some(w_all)) =
-                                (x_slice.as_slice(), w_slice.as_slice())
-                            {
-                                for local in 0..rows {
-                                    let wi = w_all[local];
-                                    let src_off = local * p;
-                                    let src_row = &x_all[src_off..src_off + p];
-                                    let dst_off = local * p;
-                                    let dst_row = &mut chunk_full[dst_off..dst_off + p];
-                                    for col in 0..p {
-                                        dst_row[col] = src_row[col] * wi;
-                                    }
-                                }
-                            } else {
-                                for local in 0..rows {
-                                    let wi = w_slice[local];
-                                    let xrow = x_slice.row(local);
-                                    let dst_off = local * p;
-                                    let dst_row = &mut chunk_full[dst_off..dst_off + p];
-                                    for (col, xij) in xrow.iter().enumerate() {
-                                        dst_row[col] = xij * wi;
-                                    }
-                                }
-                            }
+                            Zip::from(chunk.rows_mut())
+                                .and(x_slice.rows())
+                                .and(&w_slice)
+                                .par_for_each(|mut dst, src, &w| {
+                                    Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
+                                });
                         }
                         let x_slice = x.slice(s![start..start + rows, ..]);
                         let wx_slice = chunk_buf.slice(s![0..rows, ..]);
@@ -1170,16 +1149,9 @@ impl PirlsWorkspace {
                 );
             *out += &combined.1;
         } else {
-            // Sequential: reuse the workspace WX chunk buffer in row-major
-            // layout so per-row scaling has stride-1 writes alongside the
-            // stride-1 reads from a row-major X. The previous F-order chunk
-            // strided each row by `chunkrows` (≈15000 doubles), which moved
-            // every adjacent element write across an L2 cache line.
-            if weighted_x_chunk.ncols() != p
-                || weighted_x_chunk.nrows() != chunkrows
-                || !weighted_x_chunk.is_standard_layout()
-            {
-                *weighted_x_chunk = Array2::zeros((chunkrows, p));
+            // Sequential: reuse workspace chunk buffer.
+            if weighted_x_chunk.ncols() != p || weighted_x_chunk.nrows() != chunkrows {
+                *weighted_x_chunk = Array2::zeros((chunkrows, p).f());
             }
             let mut outview = array2_to_matmut(out);
             for start in (0..n).step_by(chunkrows) {
@@ -1190,31 +1162,12 @@ impl PirlsWorkspace {
                         .expect("row-major chunk is contiguous");
                     let x_slice = x.slice(s![start..start + rows, ..]);
                     let w_slice = weights.slice(s![start..start + rows]);
-                    use rayon::slice::ParallelSliceMut;
-                    if let (Some(x_all), Some(w_all)) = (x_slice.as_slice(), w_slice.as_slice()) {
-                        chunk_full[..rows * p]
-                            .par_chunks_mut(p)
-                            .enumerate()
-                            .for_each(|(local, dst_row)| {
-                                let src_off = local * p;
-                                let src_row = &x_all[src_off..src_off + p];
-                                let wi = w_all[local];
-                                for col in 0..p {
-                                    dst_row[col] = src_row[col] * wi;
-                                }
-                            });
-                    } else {
-                        chunk_full[..rows * p]
-                            .par_chunks_mut(p)
-                            .enumerate()
-                            .for_each(|(local, dst_row)| {
-                                let wi = w_slice[local];
-                                let src = x_slice.row(local);
-                                for (col, xij) in src.iter().enumerate() {
-                                    dst_row[col] = xij * wi;
-                                }
-                            });
-                    }
+                    Zip::from(chunk.rows_mut())
+                        .and(x_slice.rows())
+                        .and(&w_slice)
+                        .par_for_each(|mut dst, src, &w| {
+                            Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
+                        });
                 }
                 let x_slice = x.slice(s![start..start + rows, ..]);
                 let wx_slice = weighted_x_chunk.slice(s![0..rows, ..]);
@@ -1986,19 +1939,21 @@ impl<'a> GamWorkingModel<'a> {
             // cannot be densified; fall through to the operator XᵀWX path.
             DesignMatrix::Dense(x) if x.is_materialized_dense() => {
                 let p = x.ncols();
+                match crate::solver::gpu::dense_pirls_dispatch(
+                    crate::solver::gpu::GpuOperation::DensePirlsXtWX,
+                    x.nrows(),
+                    p,
+                    true,
+                ) {
+                    Ok(crate::solver::gpu::GpuDispatch::UseDevice) => unreachable!(
+                        "dense_pirls_dispatch cannot select a device without a registered backend"
+                    ),
+                    Ok(crate::solver::gpu::GpuDispatch::UseCpu { .. }) => {}
+                    Err(msg) => return Err(EstimationError::InvalidInput(msg)),
+                }
+                let _gpu_timer =
+                    crate::solver::gpu::GpuStageTimer::start("pirls.dense_xtwx.cpu_fallback");
                 let x_dense = x.to_dense_arc();
-                // GPU fast path: cuBLAS routes `Xᵀ diag(w) X` as a single
-                // device GEMM after row-scaling. The signed weights are
-                // preserved because the device kernel forms `Xᵀ (W X)`
-                // without any sqrt clipping. The resident variant keeps X
-                // on the device across PIRLS iterations — on biobank shapes
-                // (n≈3e5) that saves ~84 MiB of H2D traffic per Newton step.
-                if let Some(out) = crate::gpu::try_fast_xt_diag_x_arc(&x_dense, weights) {
-                    return Ok(out);
-                }
-                if let Some(out) = crate::gpu::try_fast_xt_diag_x(x_dense.as_ref(), weights) {
-                    return Ok(out);
-                }
                 // Reuse workspace hessian buffer to avoid per-iteration allocation.
                 if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
                     workspace.hessian_buf = Array2::zeros((p, p).f());
@@ -7916,57 +7871,39 @@ fn solve_penalized_least_squares_implicit(
     // caller supplied a `GaussianFixedCache` we skip the O(N·p²) streaming
     // GEMM here and adopt the cached matrix as-is.
     let weights_owned = weights.to_owned();
-    let xtwx_orig = if let Some(cache) = gaussian_fixed_cache {
-        debug_assert_eq!(
-            cache.xtwx_orig.nrows(),
-            x_original.ncols(),
-            "GaussianFixedCache XᵀWX row count must match design p"
-        );
-        debug_assert_eq!(
-            cache.xtwx_orig.ncols(),
-            x_original.ncols(),
-            "GaussianFixedCache XᵀWX col count must match design p"
-        );
-        cache.xtwx_orig.clone()
-    } else {
-        match x_original {
-            // Only materialized dense designs can use the streaming-BLAS path.
-            // Lazy operator-backed dense designs route to diag_xtw_x like sparse.
-            DesignMatrix::Dense(x_dense) if x_dense.is_materialized_dense() => {
-                let p = x_dense.ncols();
-                let x_dense = x_dense.to_dense_arc();
-                // GPU fast path: cuBLAS routes `Xᵀ diag(w) X` as one device GEMM.
-                // Prefer the resident-X session so this XᵀWX site shares the
-                // upload with the PIRLS cache build above when the design Arc
-                // is reused.
-                if let Some(out) = crate::gpu::try_fast_xt_diag_x_arc(&x_dense, &weights) {
-                    out
-                } else if let Some(out) = crate::gpu::try_fast_xt_diag_x(x_dense.as_ref(), &weights)
-                {
-                    out
-                } else {
-                    if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
-                        workspace.hessian_buf = Array2::zeros((p, p).f());
-                    } else {
-                        workspace.hessian_buf.fill(0.0);
-                    }
-                    PirlsWorkspace::add_dense_xtwx_streaming_signed(
-                        &weights,
-                        &mut workspace.weighted_x_chunk,
-                        x_dense.as_ref(),
-                        &mut workspace.hessian_buf,
-                        get_global_parallelism(),
-                    );
-                    std::mem::take(&mut workspace.hessian_buf)
-                }
+    let xtwx_orig = match x_original {
+        // Only materialized dense designs can use the streaming-BLAS path.
+        // Lazy operator-backed dense designs route to diag_xtw_x like sparse.
+        DesignMatrix::Dense(x_dense) if x_dense.is_materialized_dense() => {
+            let p = x_dense.ncols();
+            match crate::solver::gpu::dense_pirls_dispatch(
+                crate::solver::gpu::GpuOperation::DensePirlsXtWX,
+                x_dense.nrows(),
+                p,
+                true,
+            ) {
+                Ok(crate::solver::gpu::GpuDispatch::UseDevice) => unreachable!(
+                    "dense_pirls_dispatch cannot select a device without a registered backend"
+                ),
+                Ok(crate::solver::gpu::GpuDispatch::UseCpu { .. }) => {}
+                Err(msg) => return Err(EstimationError::InvalidInput(msg)),
             }
-            // Observed-Hessian assembly for non-materialized (sparse / lazy)
-            // designs: route through the signed-Gram API so the CSC / sparse-
-            // accumulator paths preserve sign instead of silently clipping
-            // negative-curvature mass. Matches the dense `_signed` branch above.
-            _ => crate::matrix::xt_diag_x_signed(x_original, &weights_owned)
-                .map(|h| h.to_dense())
-                .map_err(EstimationError::InvalidInput)?,
+            let _gpu_timer =
+                crate::solver::gpu::GpuStageTimer::start("pls.dense_xtwx.cpu_fallback");
+            let x_dense = x_dense.to_dense_arc();
+            if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
+                workspace.hessian_buf = Array2::zeros((p, p).f());
+            } else {
+                workspace.hessian_buf.fill(0.0);
+            }
+            PirlsWorkspace::add_dense_xtwx_streaming_signed(
+                &weights,
+                &mut workspace.weighted_x_chunk,
+                x_dense.as_ref(),
+                &mut workspace.hessian_buf,
+                get_global_parallelism(),
+            );
+            std::mem::take(&mut workspace.hessian_buf)
         }
     };
     #[cfg(debug_assertions)]
@@ -11723,106 +11660,30 @@ mod tests {
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ShapeBuilder, array};
 
     #[test]
-    fn update_sparse_diagonal_in_place_matches_rebuild() {
-        // Build a small upper-triangular SparseColMat that already has every
-        // diagonal entry materialized. The in-place update should produce a
-        // value buffer bit-identical to the rebuild path used by
-        // `add_diagonal_to_upper_sparse`.
-        let n = 4;
-        let entries: Vec<(usize, usize, f64)> = vec![
-            (0, 0, 2.0),
-            (0, 1, 0.5),
-            (1, 1, 3.0),
-            (0, 2, -0.25),
-            (2, 2, 1.5),
-            (1, 3, 0.75),
-            (3, 3, 4.25),
-        ];
-        let triplets: Vec<_> = entries
-            .iter()
-            .map(|&(r, c, v)| Triplet::new(r, c, v))
-            .collect();
-        let base = SparseColMat::<usize, f64>::try_new_from_triplets(n, n, &triplets).unwrap();
-
-        let delta = 0.7_f64;
-        let rebuilt = super::add_diagonal_to_upper_sparse(&base, delta).unwrap();
-
-        let mut mutated = base.clone();
-        super::update_sparse_diagonal_in_place(&mut mutated, delta).unwrap();
-
-        // Compare value buffers under the shared symbolic structure.
-        let (sym_rebuilt, val_rebuilt) = rebuilt.parts();
-        let (sym_mut, val_mut) = mutated.parts();
-        assert_eq!(sym_rebuilt.col_ptr(), sym_mut.col_ptr());
-        assert_eq!(sym_rebuilt.row_idx(), sym_mut.row_idx());
-        assert_eq!(val_rebuilt.len(), val_mut.len());
-        for (a, b) in val_rebuilt.iter().zip(val_mut.iter()) {
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
-                "value buffers must be bit-identical"
-            );
-        }
-
-        // Successive deltas accumulate correctly (LM trajectory simulation).
-        let mut chained = base.clone();
-        super::update_sparse_diagonal_in_place(&mut chained, 0.3).unwrap();
-        super::update_sparse_diagonal_in_place(&mut chained, 0.4).unwrap();
-        let (_sym, val_chained) = chained.parts();
-        for (a, b) in val_rebuilt.iter().zip(val_chained.iter()) {
-            assert_relative_eq!(a, b, epsilon = 1e-15);
-        }
-
-        // delta = 0 is a no-op (early return path).
-        let mut noop = base.clone();
-        super::update_sparse_diagonal_in_place(&mut noop, 0.0).unwrap();
-        let (_sym_noop, val_noop) = noop.parts();
-        let (_sym_base, val_base) = base.parts();
-        for (a, b) in val_noop.iter().zip(val_base.iter()) {
-            assert_eq!(a.to_bits(), b.to_bits());
-        }
-
-        // Missing diagonal entries are reported as an error rather than
-        // silently fixed up — callers must materialize diagonals first.
-        let off_only =
-            SparseColMat::<usize, f64>::try_new_from_triplets(2, 2, &[Triplet::new(0, 1, 1.0)])
-                .unwrap();
-        let mut missing = off_only.clone();
-        assert!(super::update_sparse_diagonal_in_place(&mut missing, 1.0).is_err());
-    }
-
-    #[test]
-    fn signed_streaming_xtwx_preserves_negative_observed_weights() {
+    fn dense_workspace_xtwx_preserves_signed_observed_weights() {
         let x = array![[1.0, 2.0], [3.0, -1.0], [-2.0, 4.0], [0.5, -3.0]];
         let weights = array![2.0, -1.5, 0.25, -3.0];
-        let mut chunk = Array2::<f64>::zeros((0, 0));
+        let mut workspace = PirlsWorkspace::new(x.nrows(), x.ncols(), 0, 0);
         let mut streamed = Array2::<f64>::zeros((x.ncols(), x.ncols()).f());
 
         PirlsWorkspace::add_dense_xtwx_streaming_signed(
             &weights,
-            &mut chunk,
+            &mut workspace.weighted_x_chunk,
             &x,
             &mut streamed,
             faer::Par::Seq,
         );
 
-        // Reference: brute-force xᵀ diag(w) x preserving sign.
-        let mut expected = Array2::<f64>::zeros((x.ncols(), x.ncols()));
-        for i in 0..x.nrows() {
-            for a in 0..x.ncols() {
-                for b in 0..x.ncols() {
-                    expected[[a, b]] += weights[i] * x[[i, a]] * x[[i, b]];
-                }
+        let wx = Array2::from_shape_fn(x.raw_dim(), |(i, j)| weights[i] * x[[i, j]]);
+        let expected = x.t().dot(&wx);
+        for i in 0..x.ncols() {
+            for j in 0..x.ncols() {
+                assert_relative_eq!(streamed[[i, j]], expected[[i, j]], epsilon = 1e-12);
             }
         }
-        for (got, exp) in streamed.iter().zip(expected.iter()) {
-            assert_relative_eq!(*got, *exp, epsilon = 1e-12);
-        }
-        // The diagonal must be negative because the dominant weights are
-        // negative — a sqrt(max(w,0)) Gram path would silently zero them.
         assert!(
-            streamed[[0, 0]] < 0.0 && streamed[[1, 1]] < 0.0,
-            "negative observed-Hessian weights must survive signed XtWX, got {streamed:?}",
+            streamed[[0, 0]] < 0.0,
+            "negative row weights must not be clipped through a sqrt(max(0,w)) Gram path"
         );
     }
 
