@@ -7664,13 +7664,12 @@ fn build_bernoulli_marginal_slope_saved_model(
 ) -> Result<SavedModel, String> {
     let marginal_likelihood_spec =
         inverse_link_to_binomial_spec(&base_link).map_err(|e| e.to_string())?;
-    let marginal_likelihood = spec_to_legacy_family(&marginal_likelihood_spec);
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
         formula,
         ModelKind::MarginalSlope,
         FittedFamily::MarginalSlope {
-            likelihood: marginal_likelihood,
+            likelihood: marginal_likelihood_spec,
             base_link: Some(base_link.clone()),
             frailty,
         },
