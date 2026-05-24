@@ -1368,7 +1368,7 @@ impl BarrierConfig {
     pub fn slacks(&self, beta: &Array1<f64>) -> Option<Vec<f64>> {
         let mut slacks = Vec::with_capacity(self.constrained_indices.len());
         for (ci, &idx) in self.constrained_indices.iter().enumerate() {
-            let sign = self.bound_signs.get(ci).copied().unwrap_or(1.0);
+            let sign = self.bound_signs[ci];
             let delta = sign * beta[idx] - self.lower_bounds[ci];
             if delta <= 0.0 {
                 return None;
@@ -10703,12 +10703,12 @@ fn build_outer_hessian_operator(
 
     if let Some(rho_ext_fn) = solution.rho_ext_pair_fn.as_ref() {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let pairs: Vec<(usize, usize)> = (0..k)
-            .flat_map(|rho_idx| (0..ext_dim).map(move |ext_idx| (rho_idx, ext_idx)))
-            .collect();
-        let entries: Vec<(usize, usize, HyperCoordPair)> = pairs
+        let pair_count = k * ext_dim;
+        let entries: Vec<(usize, usize, HyperCoordPair)> = (0..pair_count)
             .into_par_iter()
-            .map(|(rho_idx, ext_idx)| {
+            .map(|pair_idx| {
+                let rho_idx = pair_idx / ext_dim;
+                let ext_idx = pair_idx % ext_dim;
                 let pair = rho_ext_fn(rho_idx, ext_idx);
                 (rho_idx, ext_idx, pair)
             })
@@ -10740,12 +10740,11 @@ fn build_outer_hessian_operator(
 
     if let Some(ext_pair_fn) = solution.ext_coord_pair_fn.as_ref() {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let pairs: Vec<(usize, usize)> = (0..ext_dim)
-            .flat_map(|ii| (ii..ext_dim).map(move |jj| (ii, jj)))
-            .collect();
-        let entries: Vec<(usize, usize, HyperCoordPair)> = pairs
+        let pair_count = ext_dim * (ext_dim + 1) / 2;
+        let entries: Vec<(usize, usize, HyperCoordPair)> = (0..pair_count)
             .into_par_iter()
-            .map(|(ii, jj)| {
+            .map(|pair_idx| {
+                let (ii, jj) = upper_triangle_pair_from_index(pair_idx, ext_dim);
                 let pair = ext_pair_fn(ii, jj);
                 (ii, jj, pair)
             })
@@ -10774,12 +10773,11 @@ fn build_outer_hessian_operator(
 
     {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let pairs: Vec<(usize, usize)> = (0..total)
-            .flat_map(|ii| (ii..total).map(move |jj| (ii, jj)))
-            .collect();
-        let pair_drifts: Vec<((usize, usize), Vec<DriftDerivResult>)> = pairs
+        let pair_count = total * (total + 1) / 2;
+        let pair_drifts: Vec<((usize, usize), Vec<DriftDerivResult>)> = (0..pair_count)
             .into_par_iter()
-            .map(|(ii, jj)| {
+            .map(|pair_idx| {
+                let (ii, jj) = upper_triangle_pair_from_index(pair_idx, total);
                 let beta_i = coords[ii].v.mapv(|value| -value);
                 let beta_j = coords[jj].v.mapv(|value| -value);
                 let mut drifts = Vec::new();
@@ -10874,12 +10872,11 @@ fn build_outer_hessian_operator(
                 })
                 .collect::<Vec<_>>();
             let reduced = penalty_subspace_reduce_drifts_batched(kernel, &drift_parts);
-            let pairs: Vec<(usize, usize)> = (0..total)
-                .flat_map(|ii| (ii..total).map(move |jj| (ii, jj)))
-                .collect();
-            let pair_values: Vec<((usize, usize), f64)> = pairs
+            let pair_count = total * (total + 1) / 2;
+            let pair_values: Vec<((usize, usize), f64)> = (0..pair_count)
                 .into_par_iter()
-                .map(|(ii, jj)| {
+                .map(|pair_idx| {
+                    let (ii, jj) = upper_triangle_pair_from_index(pair_idx, total);
                     let value =
                         -kernel.trace_projected_logdet_cross_reduced(&reduced[ii], &reduced[jj]);
                     ((ii, jj), value)
@@ -11003,12 +11000,11 @@ fn build_outer_hessian_operator(
             // independent unit of work — every entry of `cross_trace` is computed
             // from `coords[ii]` / `coords[jj]` only, with no shared mutable
             // state, so we can dispatch the K(K+1)/2 pair traces in parallel.
-            let pairs: Vec<(usize, usize)> = (0..total)
-                .flat_map(|ii| (ii..total).map(move |jj| (ii, jj)))
-                .collect();
-            let pair_values: Vec<((usize, usize), f64)> = pairs
+            let pair_count = total * (total + 1) / 2;
+            let pair_values: Vec<((usize, usize), f64)> = (0..pair_count)
                 .into_par_iter()
-                .map(|(ii, jj)| {
+                .map(|pair_idx| {
+                    let (ii, jj) = upper_triangle_pair_from_index(pair_idx, total);
                     let left = &coords[ii].total_drift;
                     let right = &coords[jj].total_drift;
                     let mut value = 0.0;
@@ -11838,12 +11834,11 @@ pub fn compute_hybrid_efs_update(
                     .collect();
                 if parallel_gram_pairs {
                     use rayon::iter::{IntoParallelIterator, ParallelIterator};
-                    let pairs: Vec<(usize, usize)> = (0..n_psi)
-                        .flat_map(|d| (d..n_psi).map(move |e| (d, e)))
-                        .collect();
-                    let pair_values: Vec<(usize, usize, f64)> = pairs
+                    let pair_count = n_psi * (n_psi + 1) / 2;
+                    let pair_values: Vec<(usize, usize, f64)> = (0..pair_count)
                         .into_par_iter()
-                        .map(|(d, e)| {
+                        .map(|pair_idx| {
+                            let (d, e) = upper_triangle_pair_from_index(pair_idx, n_psi);
                             let val = dense_hop
                                 .trace_projected_cross(&projected_drifts[d], &projected_drifts[e]);
                             (d, e, val)
@@ -11865,12 +11860,11 @@ pub fn compute_hybrid_efs_update(
                 }
             } else if parallel_gram_pairs {
                 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-                let pairs: Vec<(usize, usize)> = (0..n_psi)
-                    .flat_map(|d| (d..n_psi).map(move |e| (d, e)))
-                    .collect();
-                let pair_values: Vec<(usize, usize, f64)> = pairs
+                let pair_count = n_psi * (n_psi + 1) / 2;
+                let pair_values: Vec<(usize, usize, f64)> = (0..pair_count)
                     .into_par_iter()
-                    .map(|(d, e)| {
+                    .map(|pair_idx| {
+                        let (d, e) = upper_triangle_pair_from_index(pair_idx, n_psi);
                         let val = trace_hinv_cached_drift_cross(
                             hop,
                             dense_drifts[d].as_ref(),
@@ -15708,14 +15702,14 @@ impl StochasticTraceEstimator {
                     .collect()
             };
 
-            let pairs: Vec<(usize, usize)> = (0..total)
-                .flat_map(|d| (0..total).map(move |e| (d, e)))
-                .collect();
+            let pair_count = total * total;
             let pair_values: Vec<(usize, usize, f64)> = {
                 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-                pairs
+                (0..pair_count)
                     .into_par_iter()
-                    .map(|(d, e)| {
+                    .map(|pair_idx| {
+                        let d = pair_idx / total;
+                        let e = pair_idx % total;
                         let r_e = r.column(e);
                         let val = if d < n_dense {
                             // Dense A_d: u^T A_d r_e = (A_d u)^T r_e

@@ -15,7 +15,7 @@ pub enum AutoTopologyKind {
 }
 
 impl AutoTopologyKind {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             AutoTopologyKind::Euclidean => "euclidean",
             AutoTopologyKind::Circle => "circle",

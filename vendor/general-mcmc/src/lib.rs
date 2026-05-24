@@ -227,6 +227,7 @@
 
 pub mod batched_hmc;
 pub mod core;
+#[cfg(test)]
 mod dev_tools;
 mod diag_mass;
 pub mod distributions;
@@ -249,3 +250,20 @@ pub mod nuts {
     pub use crate::generic_nuts::GenericNUTS;
 }
 pub mod stats;
+
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __vmc_out {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        drop(writeln!(std::io::stdout(), $($t)*));
+    }};
+}
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __vmc_err {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        drop(writeln!(std::io::stderr(), $($t)*));
+    }};
+}

@@ -71,7 +71,7 @@ def _scalar_grad(grad: torch.Tensor | None) -> float:
     return float(grad.detach())
 
 
-def _batch_grad(grad: torch.Tensor | None) -> Any:
+def _batch_grad(grad: torch.Tensor | None) -> Any | None:
     if grad is None:
         return None
     return to_numpy_f64(grad)

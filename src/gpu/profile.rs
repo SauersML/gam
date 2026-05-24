@@ -53,6 +53,19 @@ pub fn clear() {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum OperationKind {
+    Gemv,
+    GemvTranspose,
+    JointHessian,
+    JointHessian2x2,
+    XtDiagX,
+    XtDiagY,
+}
+
+#[inline]
+pub fn profiling_enabled() -> bool { false }
+
 pub fn cpu_scope<R>(
     name: &'static str,
     n: usize,

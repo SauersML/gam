@@ -543,7 +543,8 @@ where
         let sample = ndarray::stack(Axis(0), &views).expect("expected stacking sample to succeed");
 
         if let Err(e) = progress_handle.join() {
-            eprintln!("Progress bar thread emitted error message: {:?}", e);
+            crate::__vmc_err!("Progress bar thread emitted error message (join error)");
+            drop(e);
         }
 
         let run_stats = RunStats::from(sample.view());
@@ -707,14 +708,14 @@ where
                     "Chain statistics tracker caused error: {}.\nAborting generation of further observations.",
                     e
                 );
-                println!("{}", msg);
+                crate::__vmc_out!("{}", msg);
                 msg
             })?;
 
             let now = Instant::now();
             if (now >= last + freq) | (i == total - 1) {
                 if let Err(e) = tx.send(tracker.stats()) {
-                    eprintln!("Sending chain statistics failed: {e}");
+                    crate::__vmc_err!("Sending chain statistics failed: {e}");
                 }
                 last = now;
             }
@@ -1070,8 +1071,10 @@ where
     );
     let mut k = V::Scalar::one();
 
-    while !ulogp_prime.is_finite() || !all_real_vec(&grad_prime) {
+    let mut shrink_tries = 0usize;
+    while (!ulogp_prime.is_finite() || !all_real_vec(&grad_prime)) && shrink_tries < 60 {
         k = k * half;
+        shrink_tries += 1;
         position_prime.assign(position);
         mom_prime.assign(mom);
         grad_prime.assign(&grad);
@@ -1083,6 +1086,9 @@ where
             gradient_target,
             mass_matrix,
         );
+    }
+    if !ulogp_prime.is_finite() || !all_real_vec(&grad_prime) {
+        return V::Scalar::from_f64(1e-12).unwrap();
     }
 
     epsilon = half * k * epsilon;
@@ -1097,7 +1103,11 @@ where
         -V::Scalar::one()
     };
 
-    while a * log_accept_prob > -a * V::Scalar::from_f64(2.0).unwrap().ln() {
+    let mut expand_tries = 0usize;
+    while a * log_accept_prob > -a * V::Scalar::from_f64(2.0).unwrap().ln()
+        && expand_tries < 60
+    {
+        expand_tries += 1;
         epsilon = epsilon * V::Scalar::from_f64(2.0).unwrap().powf(a);
         position_prime.assign(position);
         mom_prime.assign(mom);
@@ -1165,6 +1175,7 @@ where
         );
         let joint = logp_prime - kinetic_energy(mass_matrix, &mom_prime);
         let divergent = !joint.is_finite()
+            || !joint_0.is_finite()
             || (joint_0 - joint) > V::Scalar::from_f64(1000.0).unwrap()
             || !all_real_vec(&position_prime)
             || !all_real_vec(&mom_prime)

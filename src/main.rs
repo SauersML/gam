@@ -488,7 +488,7 @@ struct FitArgs {
     /// full dataset re-optimizes κ/anisotropy jointly. Set to 0 to disable.
     #[arg(long, value_name = "N", default_value_t = 10_000)]
     pilot_subsample_threshold: usize,
-    #[arg(long = "out")]
+    #[arg(long = "out", required = true)]
     out: Option<PathBuf>,
 }
 
@@ -2730,6 +2730,7 @@ fn run_predict_model(
 }
 
 fn run_predict(args: PredictArgs) -> Result<(), String> {
+    parse_probability_open_cli(&args.level).map_err(|e| format!("--level {e}"))?;
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.start_workflow("Predict", 5);
     let phase_start = std::time::Instant::now();
@@ -2743,6 +2744,7 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     let schema = model.require_data_schema()?;
     progress.set_stage("predict", "loading new data");
     let ds = load_datasetwith_schema(&args.new_data, schema)?;
+    require_dataset_rows("predict", &args.new_data, ds.values.nrows())?;
     log::info!(
         "[PHASE] predict load-data done elapsed={:.3}s n={}",
         phase_start.elapsed().as_secs_f64(),
@@ -3892,6 +3894,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     let schema = model.require_data_schema()?;
     progress.set_stage("diagnose", "loading diagnostic dataset");
     let ds = load_datasetwith_schema(&args.data, schema)?;
+    require_dataset_rows("diagnose", &args.data, ds.values.nrows())?;
     progress.advance_workflow(2);
     let col_map = ds.column_map();
     let training_headers = model.training_headers.as_ref();
@@ -6154,6 +6157,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
 }
 
 fn run_sample(args: SampleArgs) -> Result<(), String> {
+    validate_positive_optional_usize("--chains", args.chains)?;
+    validate_positive_optional_usize("--samples", args.samples)?;
+    validate_positive_optional_usize("--warmup", args.warmup)?;
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.start_workflow("Sample", 5);
     progress.set_stage("sample", "loading fitted model");
@@ -6162,9 +6168,11 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     let schema = model.require_data_schema()?;
     progress.set_stage("sample", "loading sampling data");
     let ds = load_datasetwith_schema(&args.data, schema)?;
+    require_dataset_rows("sample", &args.data, ds.values.nrows())?;
     progress.advance_workflow(2);
     let col_map = ds.column_map();
     let training_headers = model.training_headers.as_ref();
+    let family = model.likelihood();
     let n_base_params = model
         .fit_result
         .as_ref()
@@ -6223,7 +6231,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
 
     let out = args
         .out
-        .unwrap_or_else(|| PathBuf::from("posterior_samples.csv"));
+        .unwrap_or_else(|| default_output_path_from_model(&args.model, ".posterior.csv"));
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.start_workflow("Sample", 5);
     progress.advance_workflow(4);
@@ -6328,6 +6336,9 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
 }
 
 fn run_generate(args: GenerateArgs) -> Result<(), String> {
+    if args.n_draws == 0 {
+        return Err("--n-draws must be > 0".to_string());
+    }
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.start_workflow("Generate", 5);
     progress.set_stage("generate", "loading fitted model");
@@ -6344,6 +6355,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
     let schema = model.require_data_schema()?;
     progress.set_stage("generate", "loading conditioning data");
     let ds = load_datasetwith_schema(&args.data, schema)?;
+    require_dataset_rows("generate", &args.data, ds.values.nrows())?;
     progress.advance_workflow(2);
     let col_map = ds.column_map();
     let training_headers = model.training_headers.as_ref();
@@ -6374,7 +6386,9 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         .map_err(|e| format!("failed to sample synthetic observations: {e}"))?;
     progress.advance_workflow(4);
 
-    let out = args.out.unwrap_or_else(|| PathBuf::from("synthetic.csv"));
+    let out = args
+        .out
+        .unwrap_or_else(|| default_output_path_from_model(&args.model, ".generated.csv"));
     progress.set_stage("generate", "writing synthetic draws");
     // `sampleobservation_replicates` returns shape (n_draws, nobs): each
     // row is one synthetic observation vector. The natural CSV layout for
@@ -6555,6 +6569,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
         progress.set_stage("report", "loading report dataset");
         let schema = model.require_data_schema()?;
         let ds = load_datasetwith_schema(data_path, schema)?;
+        require_dataset_rows("report", data_path, ds.values.nrows())?;
         progress.advance_workflow(2);
 
         let col_map = ds.column_map();
@@ -6888,6 +6903,9 @@ fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result
         if args.predict_noise.is_some() {
             return Err("--transformation-normal conflicts with --predict-noise".to_string());
         }
+        if args.noise_offset_column.is_some() {
+            return Err("--transformation-normal conflicts with --noise-offset-column".to_string());
+        }
         if args.logslope_formula.is_some() || args.z_column.is_some() {
             return Err(
                 "--transformation-normal conflicts with marginal-slope --logslope-formula/--z-column"
@@ -6897,9 +6915,44 @@ fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result
         if args.firth {
             return Err("--transformation-normal conflicts with --firth".to_string());
         }
+        if args.adaptive_regularization {
+            return Err(
+                "--adaptive-regularization is only supported for standard GAM fitting".to_string(),
+            );
+        }
+        if args.frailty_kind.is_some() || args.frailty_sd.is_some() || args.hazard_loading.is_some()
+        {
+            return Err("--transformation-normal conflicts with frailty flags".to_string());
+        }
     }
     if args.logslope_formula.is_some() != args.z_column.is_some() {
         return Err("--logslope-formula and --z-column must be provided together".to_string());
+    }
+    if args.logslope_formula.is_some() {
+        if args.predict_noise.is_some() {
+            return Err(
+                "--predict-noise cannot be combined with --logslope-formula/--z-column".to_string(),
+            );
+        }
+        if args.firth {
+            return Err("--firth is not supported for marginal-slope fitting".to_string());
+        }
+        if args.adaptive_regularization {
+            return Err(
+                "--adaptive-regularization is only supported for standard GAM fitting".to_string(),
+            );
+        }
+        if args.family != FamilyArg::Auto {
+            return Err(
+                "--family is ignored by marginal-slope fitting; select its link in the formula"
+                    .to_string(),
+            );
+        }
+    }
+    if args.predict_noise.is_some() && args.adaptive_regularization {
+        return Err(
+            "--adaptive-regularization is only supported for standard GAM fitting".to_string(),
+        );
     }
     if args.negative_binomial_theta.is_some() && args.family != FamilyArg::NegativeBinomial {
         return Err("--negative-binomial-theta requires --family negative-binomial".to_string());
@@ -6913,7 +6966,26 @@ fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result
 
     let is_survival = parse_surv_response(&parsed.response)?.is_some();
     let survival_likelihood = parse_survival_likelihood_mode(&args.survival_likelihood)?;
+    let survival_likelihood_raw = args.survival_likelihood.trim().to_ascii_lowercase();
+    let baseline_target_raw = args.baseline_target.trim().to_ascii_lowercase();
+    let time_basis_raw = args.time_basis.trim().to_ascii_lowercase();
+    if is_survival {
+        if !matches!(args.family, FamilyArg::Auto | FamilyArg::RoystonParmar) {
+            return Err(
+                "--family is ignored by Surv(...) fitting; use survival formula/link options"
+                    .to_string(),
+            );
+        }
+        if args.adaptive_regularization {
+            return Err(
+                "--adaptive-regularization is only supported for standard GAM fitting".to_string(),
+            );
+        }
+    }
     if !is_survival {
+        if args.family == FamilyArg::RoystonParmar {
+            return Err("--family royston-parmar requires a Surv(entry, exit, event) response".to_string());
+        }
         if args.survival_time_anchor.is_some()
             || args.baseline_scale.is_some()
             || args.baseline_shape.is_some()
@@ -6921,19 +6993,22 @@ fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result
             || args.baseline_makeham.is_some()
             || args.threshold_time_k.is_some()
             || args.sigma_time_k.is_some()
-            || args.survival_likelihood != "transformation"
-            || args.baseline_target != "linear"
-            || args.time_basis != "ispline"
+            || survival_likelihood_raw != "transformation"
+            || baseline_target_raw != "linear"
+            || time_basis_raw != "ispline"
         {
             return Err(
                 "survival-only options require a Surv(entry, exit, event) response".to_string(),
             );
         }
+        if args.noise_offset_column.is_some() && args.predict_noise.is_none() {
+            return Err("--noise-offset-column requires --predict-noise".to_string());
+        }
     }
-    validate_survival_baseline_args(args, survival_likelihood)?;
+    validate_survival_baseline_args(args, survival_likelihood, &baseline_target_raw)?;
     validate_time_margin_args("--threshold-time-k", args.threshold_time_k, args.threshold_time_degree)?;
     validate_time_margin_args("--sigma-time-k", args.sigma_time_k, args.sigma_time_degree)?;
-    if args.time_basis == "ispline" {
+    if time_basis_raw == "ispline" {
         parse_survival_time_basis_config(
             &args.time_basis,
             args.time_degree,
@@ -6974,9 +7049,17 @@ fn validate_time_margin_args(
     Ok(())
 }
 
+fn validate_positive_optional_usize(flag: &str, value: Option<usize>) -> Result<(), String> {
+    if matches!(value, Some(0)) {
+        return Err(format!("{flag} must be > 0"));
+    }
+    Ok(())
+}
+
 fn validate_survival_baseline_args(
     args: &FitArgs,
     likelihood_mode: SurvivalLikelihoodMode,
+    baseline_target: &str,
 ) -> Result<(), String> {
     if likelihood_mode == SurvivalLikelihoodMode::Weibull {
         if args.baseline_rate.is_some() || args.baseline_makeham.is_some() {
@@ -6985,7 +7068,7 @@ fn validate_survival_baseline_args(
                     .to_string(),
             );
         }
-        if !matches!(args.baseline_target.as_str(), "linear" | "weibull") {
+        if !matches!(baseline_target, "linear" | "weibull") {
             return Err(
                 "--survival-likelihood weibull supports only --baseline-target linear|weibull"
                     .to_string(),
@@ -6994,7 +7077,7 @@ fn validate_survival_baseline_args(
         return Ok(());
     }
 
-    match args.baseline_target.as_str() {
+    match baseline_target {
         "linear" => {
             if args.baseline_scale.is_some()
                 || args.baseline_shape.is_some()

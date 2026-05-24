@@ -58,6 +58,7 @@ mod tests {
 
     #[test]
     fn test_main() {
+        assert!(file!().ends_with(".rs"));
         main();
     }
 }

@@ -1534,9 +1534,8 @@ class Model:
         expression from the formula (``Surv(entry, exit, event)``) to
         locate the entry/exit columns, then returns a uniform grid of
         64 points between the observed min entry and max exit times.
-        Returns ``None`` if the model is not a survival model, the
-        formula cannot be parsed, or the required columns aren't
-        present in ``headers``.
+        Returns ``None`` if the model is not a survival model or the
+        formula cannot be parsed.
         """
         import re
         import numpy as np
@@ -1556,24 +1555,42 @@ class Model:
         entry_idx = header_to_index.get(entry_name)
         exit_idx = header_to_index.get(exit_name)
         if entry_idx is None or exit_idx is None:
-            return None
+            missing = [
+                name
+                for name, idx in ((entry_name, entry_idx), (exit_name, exit_idx))
+                if idx is None
+            ]
+            raise ValueError(
+                "survival prediction data is missing required time column(s): "
+                + ", ".join(missing)
+            )
         entry_vals: list[float] = []
         exit_vals: list[float] = []
-        for row in rows:
+        for row_index, row in enumerate(rows):
             try:
                 entry_vals.append(float(row[entry_idx]))
-            except (TypeError, ValueError):
-                continue
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"survival entry column {entry_name!r} has a non-numeric value "
+                    f"at row {row_index + 1}: {row[entry_idx]!r}"
+                ) from exc
             try:
                 exit_vals.append(float(row[exit_idx]))
-            except (TypeError, ValueError):
-                continue
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"survival exit column {exit_name!r} has a non-numeric value "
+                    f"at row {row_index + 1}: {row[exit_idx]!r}"
+                ) from exc
         if not entry_vals or not exit_vals:
             return None
         lo = float(np.min(entry_vals))
         hi = float(np.max(exit_vals))
-        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-            return None
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            raise ValueError("survival time columns must contain only finite values")
+        if hi <= lo:
+            raise ValueError(
+                f"survival exit times must extend beyond entry times; got min entry {lo} and max exit {hi}"
+            )
         # Pad by a hair so interpolation queries at the exact max stay
         # inside the grid rather than clipping to the boundary.
         span = hi - lo
