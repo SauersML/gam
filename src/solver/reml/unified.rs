@@ -5201,14 +5201,93 @@ impl<'dp> InnerSolutionBuilder<'dp> {
 
     /// Build the `InnerSolution`, auto-computing nullspace_dim from penalty coordinates.
     pub fn build(self) -> InnerSolution<'dp> {
+        let beta_dim = self.beta.len();
+        let penalty_dim = self.penalty_coords.len();
+        assert_eq!(
+            self.hessian_op.dim(),
+            beta_dim,
+            "InnerSolutionBuilder: Hessian dimension {} does not match beta length {}",
+            self.hessian_op.dim(),
+            beta_dim
+        );
+        for (idx, coord) in self.penalty_coords.iter().enumerate() {
+            assert_eq!(
+                coord.dim(),
+                beta_dim,
+                "InnerSolutionBuilder: penalty coordinate {idx} has dimension {} but beta length is {}",
+                coord.dim(),
+                beta_dim
+            );
+        }
+        assert_eq!(
+            self.penalty_logdet.first.len(),
+            penalty_dim,
+            "InnerSolutionBuilder: penalty logdet first-derivative length {} does not match penalty coordinate count {}",
+            self.penalty_logdet.first.len(),
+            penalty_dim
+        );
+        if let Some(second) = self.penalty_logdet.second.as_ref() {
+            assert!(
+                second.nrows() == penalty_dim && second.ncols() == penalty_dim,
+                "InnerSolutionBuilder: penalty logdet Hessian shape {}x{} does not match penalty coordinate count {}",
+                second.nrows(),
+                second.ncols(),
+                penalty_dim
+            );
+        }
+        if let Some(tk_gradient) = self.tk_gradient.as_ref() {
+            assert_eq!(
+                tk_gradient.len(),
+                penalty_dim,
+                "InnerSolutionBuilder: TK gradient length {} does not match penalty coordinate count {}",
+                tk_gradient.len(),
+                penalty_dim
+            );
+        }
+        if let Some(barrier_config) = self.barrier_config.as_ref() {
+            assert_eq!(
+                barrier_config.constrained_indices.len(),
+                barrier_config.lower_bounds.len(),
+                "InnerSolutionBuilder: barrier constrained index count {} does not match lower-bound count {}",
+                barrier_config.constrained_indices.len(),
+                barrier_config.lower_bounds.len()
+            );
+            assert!(
+                barrier_config.tau.is_finite() && barrier_config.tau >= 0.0,
+                "InnerSolutionBuilder: barrier tau must be finite and non-negative, got {}",
+                barrier_config.tau
+            );
+            for (&idx, &lower_bound) in barrier_config
+                .constrained_indices
+                .iter()
+                .zip(barrier_config.lower_bounds.iter())
+            {
+                assert!(
+                    idx < beta_dim,
+                    "InnerSolutionBuilder: barrier constrained index {idx} out of bounds for beta length {beta_dim}"
+                );
+                assert!(
+                    lower_bound.is_finite(),
+                    "InnerSolutionBuilder: barrier lower bound for beta[{idx}] must be finite, got {lower_bound}"
+                );
+            }
+        }
+        if let Some(active_constraints) = self.active_constraints.as_ref() {
+            assert_eq!(
+                active_constraints.a.ncols(),
+                beta_dim,
+                "InnerSolutionBuilder: active constraint width {} does not match beta length {}",
+                active_constraints.a.ncols(),
+                beta_dim
+            );
+        }
         let nullspace_dim = self.nullspace_dim_override.unwrap_or_else(|| {
-            let total_p = self.beta.len();
             let penalty_rank: usize = self
                 .penalty_coords
                 .iter()
                 .map(PenaltyCoordinate::rank)
                 .sum();
-            total_p.saturating_sub(penalty_rank) as f64
+            beta_dim.saturating_sub(penalty_rank) as f64
         });
 
         InnerSolution {

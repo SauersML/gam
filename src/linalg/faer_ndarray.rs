@@ -221,7 +221,8 @@ pub fn array1_to_col_matmut(array: &mut Array1<f64>) -> MatMut<'_, f64> {
 /// This is MUCH faster than ndarray's .t().dot() for matrices where n > ~100.
 ///
 /// For a matrix A of shape (n, p), this computes the (p, p) result.
-/// Uses zero-copy view when possible, falls back to copy for non-contiguous arrays.
+/// Uses a zero-copy view for positive-stride layouts and copies only layouts
+/// with non-positive strides.
 #[inline]
 pub fn fast_ata<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>) -> Array2<f64> {
     let p = a.ncols();

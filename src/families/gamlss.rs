@@ -19089,6 +19089,14 @@ impl BinomialLocationScaleWiggleFamily {
         //
         // The wiggle specialization enters only through the rowwise q-objects
         // built below from the combined location-side row z_r = [x_{t,r}; B_r(q0)].
+        let mut b = Array1::<f64>::zeros(total);
+        let mut c_a = Array1::<f64>::zeros(total);
+        let mut c_b = Array1::<f64>::zeros(total);
+        let mut c_ab = Array1::<f64>::zeros(total);
+        let mut q_mat = Array2::<f64>::zeros((total, total));
+        let mut r_a = Array2::<f64>::zeros((total, total));
+        let mut r_b = Array2::<f64>::zeros((total, total));
+        let mut r_ab = Array2::<f64>::zeros((total, total));
         for row in 0..n {
             let q0 = base_core.q0[row];
             let q = q0 + etaw[row];
@@ -19242,24 +19250,24 @@ impl BinomialLocationScaleWiggleFamily {
             let xtab = x_t_ab_map.row_vector(row)?;
             let xlsab = x_ls_ab_map.row_vector(row)?;
 
-            let mut b = Array1::<f64>::zeros(total);
+            b.fill(0.0);
             b.slice_mut(s![0..pt]).assign(&(xtr.to_owned() * q_t));
             b.slice_mut(s![pt..pt + pls])
                 .assign(&(xlsr.to_owned() * q_ls));
             b.slice_mut(s![pt + pls..]).assign(&brow);
-            let mut c_a = Array1::<f64>::zeros(total);
+            c_a.fill(0.0);
             c_a.slice_mut(s![0..pt])
                 .assign(&(xtr.to_owned() * q_t_a + xta.clone() * q_t));
             c_a.slice_mut(s![pt..pt + pls])
                 .assign(&(xlsr.to_owned() * q_ls_a + xlsa.clone() * q_ls));
             c_a.slice_mut(s![pt + pls..]).assign(&qw_a);
-            let mut c_b = Array1::<f64>::zeros(total);
+            c_b.fill(0.0);
             c_b.slice_mut(s![0..pt])
                 .assign(&(xtr.to_owned() * q_t_b + xtb.clone() * q_t));
             c_b.slice_mut(s![pt..pt + pls])
                 .assign(&(xlsr.to_owned() * q_ls_b + xlsb.clone() * q_ls));
             c_b.slice_mut(s![pt + pls..]).assign(&qw_b);
-            let mut c_ab = Array1::<f64>::zeros(total);
+            c_ab.fill(0.0);
             c_ab.slice_mut(s![0..pt]).assign(
                 &(xtr.to_owned() * q_t_ab
                     + xta.clone() * q_t_b
@@ -19279,10 +19287,10 @@ impl BinomialLocationScaleWiggleFamily {
                 + loss_2 * q_a * &c_b
                 + (loss_2 * q_ab + loss_3 * q_a * q_b) * &b);
 
-            let mut q_mat = Array2::<f64>::zeros((total, total));
-            let mut r_a = Array2::<f64>::zeros((total, total));
-            let mut r_b = Array2::<f64>::zeros((total, total));
-            let mut r_ab = Array2::<f64>::zeros((total, total));
+            q_mat.fill(0.0);
+            r_a.fill(0.0);
+            r_b.fill(0.0);
+            r_ab.fill(0.0);
             {
                 let tt = xtr
                     .to_owned()
@@ -19792,6 +19800,14 @@ impl BinomialLocationScaleWiggleFamily {
         // only the location-side row changes to z_r = [x_{t,r}; B_r(q0)] with
         // q = q0 + betaw^T B(q0), q0 = -eta_t * exp(-eta_ls).
         let mut out = Array2::<f64>::zeros((total, total));
+        let mut b = Array1::<f64>::zeros(total);
+        let mut c_a = Array1::<f64>::zeros(total);
+        let mut gamma = Array1::<f64>::zeros(total);
+        let mut gamma_a = Array1::<f64>::zeros(total);
+        let mut q_mat = Array2::<f64>::zeros((total, total));
+        let mut r_a = Array2::<f64>::zeros((total, total));
+        let mut c_u = Array2::<f64>::zeros((total, total));
+        let mut delta_a = Array2::<f64>::zeros((total, total));
         for row in 0..n {
             let q = core.q0[row] + etaw[row];
             let (loss_1, loss_2, loss_3) = binomial_neglog_q_derivatives_dispatch(
@@ -19938,19 +19954,19 @@ impl BinomialLocationScaleWiggleFamily {
                 + &(ddr.clone() * (dq0_a_u * q0.q_ls + q0_a * dq0_ls_u + dq0_u * q0_ls_a))
                 + &(dr.clone() * dq0_ls_a_u);
 
-            let mut b = Array1::<f64>::zeros(total);
+            b.fill(0.0);
             b.slice_mut(s![0..pt]).assign(&(xtr.clone() * q_t));
             b.slice_mut(s![pt..pt + pls]).assign(&(xlsr.clone() * q_ls));
             b.slice_mut(s![pt + pls..]).assign(&br);
 
-            let mut c_a = Array1::<f64>::zeros(total);
+            c_a.fill(0.0);
             c_a.slice_mut(s![0..pt])
                 .assign(&(xtr.clone() * q_t_a + xta.clone() * q_t));
             c_a.slice_mut(s![pt..pt + pls])
                 .assign(&(xlsr.clone() * q_ls_a + xlsa.clone() * q_ls));
             c_a.slice_mut(s![pt + pls..]).assign(&qw_a);
 
-            let mut gamma = Array1::<f64>::zeros(total);
+            gamma.fill(0.0);
             gamma
                 .slice_mut(s![0..pt])
                 .assign(&(xtr.clone() * (q_tt * xi_t_i + q_tl * xi_ls_i + q0.q_t * d_dot_u)));
@@ -19963,7 +19979,7 @@ impl BinomialLocationScaleWiggleFamily {
 
             let q_tw_a_dot_u = q_tw_a.dot(&uw);
             let q_lw_a_dot_u = q_lw_a.dot(&uw);
-            let mut gamma_a = Array1::<f64>::zeros(total);
+            gamma_a.fill(0.0);
             gamma_a.slice_mut(s![0..pt]).assign(
                 &(xtr.clone()
                     * (q_tt_a * xi_t_i
@@ -19992,7 +20008,7 @@ impl BinomialLocationScaleWiggleFamily {
             let alpha = b.dot(d_beta_flat);
             let alpha_a = c_a.dot(d_beta_flat);
 
-            let mut q_mat = Array2::<f64>::zeros((total, total));
+            q_mat.fill(0.0);
             q_mat.slice_mut(s![0..pt, 0..pt]).assign(
                 &(xtr
                     .view()
@@ -20027,7 +20043,7 @@ impl BinomialLocationScaleWiggleFamily {
             );
             mirror_upper_to_lower(&mut q_mat);
 
-            let mut r_a = Array2::<f64>::zeros((total, total));
+            r_a.fill(0.0);
             r_a.slice_mut(s![0..pt, 0..pt]).assign(
                 &(xtr
                     .view()
@@ -20101,7 +20117,7 @@ impl BinomialLocationScaleWiggleFamily {
             );
             mirror_upper_to_lower(&mut r_a);
 
-            let mut c_u = Array2::<f64>::zeros((total, total));
+            c_u.fill(0.0);
             c_u.slice_mut(s![0..pt, 0..pt]).assign(
                 &(xtr
                     .view()
@@ -20136,7 +20152,7 @@ impl BinomialLocationScaleWiggleFamily {
             );
             mirror_upper_to_lower(&mut c_u);
 
-            let mut delta_a = Array2::<f64>::zeros((total, total));
+            delta_a.fill(0.0);
             delta_a.slice_mut(s![0..pt, 0..pt]).assign(
                 &(xtr
                     .view()
@@ -22019,9 +22035,6 @@ impl BinomialLocationScaleWiggleFamily {
         let mut c_ww_bdd = Array1::<f64>::zeros(n);
         let mut c_ww_dd_pair = Array1::<f64>::zeros(n);
 
-        let uw_arr = uw.to_owned();
-        let vw_arr = vw.to_owned();
-
         for i in 0..n {
             let q_i = core0.q0[i] + etaw[i];
             let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
@@ -22089,14 +22102,14 @@ impl BinomialLocationScaleWiggleFamily {
             let dr = d0.row(i);
             let ddr = dd0.row(i);
             let d3r = d3_basis.row(i);
-            let b_u = br.dot(&uw_arr);
-            let bv = br.dot(&vw_arr);
-            let b1_u = dr.dot(&uw_arr);
-            let b1v = dr.dot(&vw_arr);
-            let b2_u = ddr.dot(&uw_arr);
-            let b2v = ddr.dot(&vw_arr);
-            let b3_u = d3r.dot(&uw_arr);
-            let b3v = d3r.dot(&vw_arr);
+            let b_u = br.dot(&uw);
+            let bv = br.dot(&vw);
+            let b1_u = dr.dot(&uw);
+            let b1v = dr.dot(&vw);
+            let b2_u = ddr.dot(&uw);
+            let b2v = ddr.dot(&vw);
+            let b3_u = d3r.dot(&uw);
+            let b3v = d3r.dot(&vw);
 
             let dm_u = b1_u + g2[i] * dq0_u;
             let dmv = b1v + g2[i] * dq0v;
