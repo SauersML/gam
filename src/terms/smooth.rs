@@ -23053,7 +23053,7 @@ mod tests {
 
         assert!(matches!(design.design, DesignMatrix::Sparse(_)));
         assert!(exact_joint_spatial_outer_hessian_available(
-            LikelihoodSpec::new(
+            &LikelihoodSpec::new(
                 ResponseFamily::Binomial,
                 InverseLink::Standard(LinkFunction::Logit),
             ),
