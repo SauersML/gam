@@ -150,12 +150,15 @@ class BSpline(Smooth):
     being the canonical example), use :class:`TensorBSpline` instead.
     For multi-dimensional inputs with the SAME axis units (a continuous
     coordinate field), use :class:`Duchon` (isotropic radial kernel).
+    ``streaming_chunk_size`` optionally streams row chunks instead of
+    materializing the full basis matrix.
     """
 
     knots: Any = None                    # (K,) — auto-derived if None
     degree: int = 3
     penalty_order: int = 2
     periodic: bool = False
+    streaming_chunk_size: int | None = None
 
 
 @dataclass(slots=True)

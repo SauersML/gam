@@ -8510,6 +8510,14 @@ fn build_streaming_bspline_design_and_candidates(
     chunk_size: Option<usize>,
 ) -> Result<(DesignMatrix, Vec<PenaltyCandidate>, Option<Array2<f64>>), BasisError> {
     let chunk = chunk_size.unwrap_or(2048).max(1);
+    if !boundary_conditions.is_free()
+        && matches!(identifiability, BSplineIdentifiability::RemoveLinearTrend)
+    {
+        return Err(BasisError::InvalidInput(
+            "B-spline boundary conditions cannot currently be combined with RemoveLinearTrend identifiability"
+                .to_string(),
+        ));
+    }
     let mut transform_opt = if periodic.is_none() {
         bspline_boundary_transform(knots, degree, boundary_conditions)?
     } else {
