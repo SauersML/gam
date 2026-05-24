@@ -118,6 +118,14 @@ fn main() {
     let mut useless_test_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_useless_tests(&manifest_dir, &manifest_dir, &mut useless_test_offenders);
 
+    // Vendoring ban. Reject any `vendor/` directory under the manifest root
+    // (any depth). Vendored upstream crates fork the dependency tree from
+    // crates.io / git, hide upstream CVE / fix flow, and bypass the same
+    // first-party lint gate this scanner enforces. Use `[dependencies] ...
+    // = "version"` or `git = ".../"` in `Cargo.toml` instead.
+    let mut vendor_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_vendor_directories(&manifest_dir, &manifest_dir, &mut vendor_offenders);
+
     // Persistent unimplemented/todo/unreachable removal audit. Compares the
     // current set of marker-bearing functions against the on-disk ledger and
     // flags any function whose marker disappeared without a real implementation
@@ -284,6 +292,18 @@ fn main() {
                 "#[test] function without assertions (test must verify something — add assert! / assert_eq! / ? / #[should_panic] or delete the test)"
                     .to_string(),
             rows: useless_test_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !vendor_offenders.is_empty() {
+        sections.push(Section {
+            title:
+                "`vendor/` directory present — vendoring forks upstream dependencies past the same lint gate this scanner enforces; use `[dependencies]` in Cargo.toml (crates.io version or `git = ...`) instead"
+                    .to_string(),
+            rows: vendor_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
                 .collect(),
@@ -1690,9 +1710,6 @@ fn visit_files(root: &Path, dir: &Path, visitor: &mut dyn FnMut(&Path, &str)) {
             || name == "dist"
             || name == "build"
             || name == "site"
-            // Vendored upstream crates compile via their own Cargo.toml; the
-            // first-party lint rules in this scanner do not apply to them.
-            || name == "vendor"
         {
             continue;
         }
