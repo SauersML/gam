@@ -938,7 +938,8 @@ fn duchon_function_norm_penalty<'py>(
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
         operator_penalties: Default::default(),
-        periodic: any_periodic,
+        periodic: if any_periodic { Some(vec![None; d]) } else { None },
+        boundary: OneDimensionalBoundary::Open,
     };
     let built = build_duchon_basis(center_matrix.view(), &spec)
         .map_err(|err| py_value_error(err.to_string()))?;
