@@ -9181,7 +9181,7 @@ pub fn update_glmvectors(
 pub fn update_glmvectors_by_family(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
-    likelihood: GlmLikelihoodSpec,
+    likelihood: &GlmLikelihoodSpec,
     priorweights: ArrayView1<f64>,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
@@ -9191,15 +9191,17 @@ pub fn update_glmvectors_by_family(
 }
 
 fn integrated_inverse_link_from_family(
-    family: GlmFamily,
+    spec: &LikelihoodSpec,
     mixture_link_state: Option<&MixtureLinkState>,
     sas_link_state: Option<&SasLinkState>,
 ) -> Result<InverseLink, EstimationError> {
-    match family {
-        GlmFamily::BinomialLogit
-        | GlmFamily::BinomialProbit
-        | GlmFamily::BinomialCLogLog => Ok(InverseLink::Standard(family.link_function())),
-        GlmFamily::BinomialSas => {
+    match (&spec.response, &spec.link) {
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit))
+        | (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit))
+        | (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+            Ok(InverseLink::Standard(spec.link_function()))
+        }
+        (ResponseFamily::Binomial, InverseLink::Sas(_)) => {
             let state = sas_link_state.ok_or_else(|| {
                 EstimationError::InvalidInput(
                     "Integrated BinomialSas update requires explicit SasLinkState".to_string(),
@@ -9207,7 +9209,7 @@ fn integrated_inverse_link_from_family(
             })?;
             Ok(InverseLink::Sas(*state))
         }
-        GlmFamily::BinomialBetaLogistic => {
+        (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
             let state = sas_link_state.ok_or_else(|| {
                 EstimationError::InvalidInput(
                     "Integrated BinomialBetaLogistic update requires explicit SasLinkState"
@@ -9216,7 +9218,7 @@ fn integrated_inverse_link_from_family(
             })?;
             Ok(InverseLink::BetaLogistic(*state))
         }
-        GlmFamily::BinomialMixture => {
+        (ResponseFamily::Binomial, InverseLink::Mixture(_)) => {
             let state = mixture_link_state.ok_or_else(|| {
                 EstimationError::InvalidInput(
                     "Integrated BinomialMixture update requires explicit MixtureLinkState"
@@ -9225,14 +9227,9 @@ fn integrated_inverse_link_from_family(
             })?;
             Ok(InverseLink::Mixture(state.clone()))
         }
-        GlmFamily::GaussianIdentity
-        | GlmFamily::PoissonLog
-        | GlmFamily::Tweedie { .. }
-        | GlmFamily::NegativeBinomial { .. }
-        | GlmFamily::BetaLogit { .. }
-        | GlmFamily::GammaLog => Err(EstimationError::InvalidInput(format!(
-            "Integrated link-runtime update is not supported for family {:?}",
-            family
+        _ => Err(EstimationError::InvalidInput(format!(
+            "Integrated link-runtime update is not supported for likelihood (response={:?}, link={:?})",
+            spec.response, spec.link
         ))),
     }
 }
@@ -9474,7 +9471,7 @@ pub fn update_glmvectors_integrated_by_family(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     se: ArrayView1<f64>,
-    family: GlmFamily,
+    spec: &LikelihoodSpec,
     priorweights: ArrayView1<f64>,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
@@ -9484,7 +9481,7 @@ pub fn update_glmvectors_integrated_by_family(
     sas_link_state: Option<&SasLinkState>,
 ) -> Result<(), EstimationError> {
     let inverse_link =
-        integrated_inverse_link_from_family(family, mixture_link_state, sas_link_state)?;
+        integrated_inverse_link_from_family(spec, mixture_link_state, sas_link_state)?;
     update_glmvectors_integrated_for_link(
         quadctx,
         y,
@@ -9516,7 +9513,7 @@ pub fn update_glmvectors_integrated_by_family(
 ///   Setting c_i=d_i=0 is a practical subgradient-like choice to avoid unstable
 ///   explosive derivatives at the kink.
 fn computeworkingweight_derivatives_from_eta(
-    likelihood: GlmLikelihoodSpec,
+    likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
@@ -9536,8 +9533,8 @@ fn computeworkingweight_derivatives_from_eta(
     let mut dmu_deta = Array1::<f64>::zeros(n);
     let mut d2mu_deta2 = Array1::<f64>::zeros(n);
     let mut d3mu_deta3 = Array1::<f64>::zeros(n);
-    match likelihood.family {
-        GlmFamily::GaussianIdentity => {
+    match &likelihood.spec.response {
+        ResponseFamily::Gaussian => {
             dmu_deta.fill(1.0);
         }
         GlmFamily::PoissonLog => {
