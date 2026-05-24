@@ -34,6 +34,9 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
 * `AuxConditionalPriorPenalty` lives on t. Fixed-precomputed iVAE-style
   row-conditional precision, the auxiliary-supervised sibling to ARD/Ortho
   from `proposals/composition_engine.md` §4(c).
+* `ParametricAuxConditionalPriorPenalty` lives on t. Parametric iVAE-style
+  diagonal row precision learned from auxiliary covariates through a
+  distance-kernel map.
 * `OrthogonalityPenalty` lives on t. It fixes the rotation gauge by
   penalizing latent-axis correlations; pair it with ARD so pruned axes
   are identifiable.
@@ -60,6 +63,7 @@ __all__ = [
     "NuclearNormPenalty",
     "BlockSparsityPenalty",
     "AuxConditionalPriorPenalty",
+    "ParametricAuxConditionalPriorPenalty",
     "OrthogonalityPenalty",
     "IBPAssignmentPenalty",
     "SoftmaxAssignmentSparsityPenalty",
@@ -98,6 +102,10 @@ def _target_descriptor(target: Any) -> str | int:
         "analytic penalty target must be a latent block name, latent block index, "
         "or object exposing a 'name' attribute"
     )
+
+
+def _inverse_softplus(x: np.ndarray) -> np.ndarray:
+    return np.where(x > 30.0, x, np.log(np.expm1(x)))
 
 
 @dataclass
@@ -715,6 +723,156 @@ class AuxConditionalPriorPenalty:
 
 
 @dataclass(init=False)
+class ParametricAuxConditionalPriorPenalty:
+    """Parametric iVAE-style auxiliary-conditional prior on t.
+
+    Applies diagonal row precision
+    ``lambda_k(u_n) = alpha_k + beta_k * ||u_n - mu_k||^2`` with positive
+    ``alpha`` and ``beta`` initialized by the caller and then exposed as
+    REML-selectable log/raw parameters. This is the parametric sibling of
+    ``AuxConditionalPriorPenalty``: use FIXED when per-row ``Lambda`` is known;
+    use PARAMETRIC when the aux-to-precision map should be learned.
+
+    Parameters
+    ----------
+    aux
+        Numeric ndarray of shape ``(N, du)`` containing one aux row per latent row.
+    alpha_init
+        Positive baseline precision vector of shape ``(d,)``.
+    beta_init
+        Positive distance-sensitivity vector of shape ``(d,)``.
+    mu_init
+        Reference points in aux space with shape ``(d, du)``.
+    weight
+        Fixed base weight, or the base multiplier when ``learnable=True``.
+    n_eff
+        Number of rows in the row-major latent coefficient block.
+    learnable
+        If true, expose one additional REML-selectable log-weight ``rho``.
+    target
+        The ``LatentCoord`` block name/object. Defaults to ``"t"``.
+    """
+
+    target: TargetSpec
+    aux: np.ndarray
+    alpha_init: np.ndarray
+    beta_init: np.ndarray
+    mu_init: np.ndarray
+    weight: float
+    n_eff: int
+    learnable: bool
+
+    def __init__(
+        self,
+        aux: Any,
+        alpha_init: Any,
+        beta_init: Any,
+        mu_init: Any,
+        weight: float,
+        n_eff: int,
+        learnable: bool = False,
+        *,
+        target: TargetSpec = "t",
+    ) -> None:
+        self.target = target
+        self.aux = np.asarray(aux, dtype=float)
+        self.alpha_init = np.asarray(alpha_init, dtype=float)
+        self.beta_init = np.asarray(beta_init, dtype=float)
+        self.mu_init = np.asarray(mu_init, dtype=float)
+        self.weight = float(weight)
+        self.n_eff = int(n_eff)
+        self.learnable = bool(learnable)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        if not self.weight > 0.0:
+            raise ValueError(
+                f"ParametricAuxConditionalPriorPenalty.weight must be > 0, got {self.weight}"
+            )
+        if self.n_eff <= 0:
+            raise ValueError(
+                f"ParametricAuxConditionalPriorPenalty.n_eff must be > 0, got {self.n_eff}"
+            )
+        if self.aux.ndim != 2:
+            raise ValueError(
+                "ParametricAuxConditionalPriorPenalty.aux must have shape (N, du), "
+                f"got ndim={self.aux.ndim}"
+            )
+        if self.alpha_init.ndim != 1:
+            raise ValueError(
+                "ParametricAuxConditionalPriorPenalty.alpha_init must have shape (d,), "
+                f"got ndim={self.alpha_init.ndim}"
+            )
+        if self.beta_init.ndim != 1:
+            raise ValueError(
+                "ParametricAuxConditionalPriorPenalty.beta_init must have shape (d,), "
+                f"got ndim={self.beta_init.ndim}"
+            )
+        if self.mu_init.ndim != 2:
+            raise ValueError(
+                "ParametricAuxConditionalPriorPenalty.mu_init must have shape (d, du), "
+                f"got ndim={self.mu_init.ndim}"
+            )
+        n_obs, aux_dim = self.aux.shape
+        latent_dim = self.alpha_init.shape[0]
+        if n_obs != self.n_eff:
+            raise ValueError(
+                "ParametricAuxConditionalPriorPenalty.aux first dimension must equal "
+                f"n_eff={self.n_eff}, got {n_obs}"
+            )
+        if aux_dim == 0:
+            raise ValueError("ParametricAuxConditionalPriorPenalty.aux must have du > 0")
+        if latent_dim == 0:
+            raise ValueError(
+                "ParametricAuxConditionalPriorPenalty.alpha_init must be non-empty"
+            )
+        if self.beta_init.shape != (latent_dim,):
+            raise ValueError(
+                "ParametricAuxConditionalPriorPenalty.beta_init shape must match "
+                f"alpha_init shape {(latent_dim,)}, got {self.beta_init.shape}"
+            )
+        if self.mu_init.shape != (latent_dim, aux_dim):
+            raise ValueError(
+                "ParametricAuxConditionalPriorPenalty.mu_init must have shape "
+                f"({latent_dim}, {aux_dim}), got {self.mu_init.shape}"
+            )
+        if not np.isfinite(self.aux).all():
+            raise ValueError("ParametricAuxConditionalPriorPenalty.aux must be finite")
+        if not np.isfinite(self.alpha_init).all():
+            raise ValueError("ParametricAuxConditionalPriorPenalty.alpha_init must be finite")
+        if not np.isfinite(self.beta_init).all():
+            raise ValueError("ParametricAuxConditionalPriorPenalty.beta_init must be finite")
+        if not np.isfinite(self.mu_init).all():
+            raise ValueError("ParametricAuxConditionalPriorPenalty.mu_init must be finite")
+        if not np.all(self.alpha_init > 0.0):
+            raise ValueError("ParametricAuxConditionalPriorPenalty.alpha_init must be > 0")
+        if not np.all(self.beta_init > 0.0):
+            raise ValueError("ParametricAuxConditionalPriorPenalty.beta_init must be > 0")
+
+    def _to_rust_payload(self) -> dict[str, Any]:
+        aux = np.ascontiguousarray(self.aux, dtype=float)
+        alpha = np.ascontiguousarray(self.alpha_init, dtype=float)
+        beta = np.ascontiguousarray(self.beta_init, dtype=float)
+        mu = np.ascontiguousarray(self.mu_init, dtype=float)
+        return {
+            "kind": "parametric_aux_conditional_prior",
+            "target": _target_descriptor(self.target),
+            "aux": aux.reshape(-1).tolist(),
+            "aux_shape": list(aux.shape),
+            "log_alpha": np.log(alpha).reshape(-1).tolist(),
+            "raw_beta": _inverse_softplus(beta).reshape(-1).tolist(),
+            "mu": mu.reshape(-1).tolist(),
+            "mu_shape": list(mu.shape),
+            "weight": self.weight,
+            "n_eff": self.n_eff,
+            "learnable": self.learnable,
+        }
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
+
+
+@dataclass(init=False)
 class OrthogonalityPenalty:
     """Gauge-fixing penalty for latent-axis identifiability.
 
@@ -840,6 +998,6 @@ class SoftmaxAssignmentSparsityPenalty:
 Penalty = (
     "IsometryPenalty | SparsityPenalty | ARDPenalty | "
     "TotalVariationPenalty | NuclearNormPenalty | BlockSparsityPenalty | "
-    "AuxConditionalPriorPenalty | OrthogonalityPenalty | IBPAssignmentPenalty | "
-    "SoftmaxAssignmentSparsityPenalty"
+    "AuxConditionalPriorPenalty | ParametricAuxConditionalPriorPenalty | "
+    "OrthogonalityPenalty | IBPAssignmentPenalty | SoftmaxAssignmentSparsityPenalty"
 )

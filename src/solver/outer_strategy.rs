@@ -3727,10 +3727,25 @@ const MAX_CONSECUTIVE_PSI_STAGNATION: usize = 1;
 impl FixedPointObjective for OuterFixedPointBridge<'_> {
     fn eval_step(&mut self, x: &Array1<f64>) -> Result<FixedPointSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer EFS eval failed")?;
-        let eval = self
-            .obj
-            .eval_efs(x)
-            .map_err(|err| into_objective_error("outer EFS eval failed", err))?;
+        let eval = match self.obj.eval_efs(x) {
+            Ok(eval) => eval,
+            Err(err @ EstimationError::GradientUnavailable { .. })
+                if requests_immediate_first_order_fallback(&err.to_string()) =>
+            {
+                log::warn!(
+                    "[STAGE] EFS -> gradient fallback: gradient unavailable at \
+                     fixed-point dispatch; retrying with fixed-point disabled \
+                     (rho_dim={}, psi_dim={}, n_params={})",
+                    self.layout.rho_dim(),
+                    self.layout.psi_dim,
+                    self.layout.n_params,
+                );
+                return Err(ObjectiveEvalError::recoverable(format!(
+                    "outer EFS eval failed: {err}"
+                )));
+            }
+            Err(err) => return Err(into_objective_error("outer EFS eval failed", err)),
+        };
         self.layout
             .validate_efs_eval(&eval, "outer EFS eval failed")?;
         if !eval.cost.is_finite() {
