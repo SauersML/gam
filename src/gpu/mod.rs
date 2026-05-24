@@ -11,7 +11,6 @@ pub mod blas;
 pub mod cpu_traits;
 pub mod device;
 pub mod driver;
-pub mod driver;
 pub mod error;
 pub mod graph;
 pub mod kernels;

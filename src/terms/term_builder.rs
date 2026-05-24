@@ -728,7 +728,6 @@ fn bspline_boundary_declares_periodic_axis(options: &BTreeMap<String, String>) -
         .unwrap_or(false)
 }
 
-#[expect(dead_code)]
 fn parse_f64_option_list(raw: &str) -> Result<Vec<Option<f64>>, String> {
     parse_option_list(raw)
         .into_iter()
@@ -744,7 +743,6 @@ fn parse_f64_option_list(raw: &str) -> Result<Vec<Option<f64>>, String> {
         .collect()
 }
 
-#[expect(dead_code)]
 fn tensor_margin_boundaries(
     options: &BTreeMap<String, String>,
     cols: &[usize],
@@ -2193,7 +2191,6 @@ fn parse_spatial_identifiability(
     }
 }
 
-#[expect(dead_code)]
 fn parse_tensor_identifiability(
     options: &BTreeMap<String, String>,
 ) -> Result<TensorBSplineIdentifiability, TermBuilderError> {
