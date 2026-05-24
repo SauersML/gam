@@ -97,6 +97,24 @@ fn main() {
         &mut dead_guard_const_offenders,
     );
 
+    // Underscore-prefixed function parameter names. `_name: T` silences the
+    // unused-parameter warning by hiding it from the lint rather than fixing
+    // it. Use the parameter, restructure the API so it isn't passed, or
+    // delete the param. Bare `_` placeholders are allowed (rare; arguably
+    // legitimate). Build.rs is exempt.
+    let mut underscore_fn_arg_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_underscore_fn_args(
+        &manifest_dir,
+        &manifest_dir,
+        &mut underscore_fn_arg_offenders,
+    );
+
+    // `#[test]` functions whose bodies contain no assertion-shaped construct
+    // (assert macros, panic-shape macros, or `?`-propagation). Such tests
+    // silently pass without verifying anything.
+    let mut useless_test_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_useless_tests(&manifest_dir, &manifest_dir, &mut useless_test_offenders);
+
     // Persistent unimplemented/todo/unreachable removal audit. Compares the
     // current set of marker-bearing functions against the on-disk ledger and
     // flags any function whose marker disappeared without a real implementation
@@ -241,6 +259,30 @@ fn main() {
                 "const <name>: bool = <literal> (dead-by-construction guard — use cfg or delete)"
                     .to_string(),
             rows: dead_guard_const_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !underscore_fn_arg_offenders.is_empty() {
+        sections.push(Section {
+            title:
+                "underscore-prefixed fn parameter (use the value, restructure the API, or delete the param)"
+                    .to_string(),
+            rows: underscore_fn_arg_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !useless_test_offenders.is_empty() {
+        sections.push(Section {
+            title:
+                "#[test] function without assertions (test must verify something — add assert! / assert_eq! / ? / #[should_panic] or delete the test)"
+                    .to_string(),
+            rows: useless_test_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
                 .collect(),
@@ -465,8 +507,12 @@ fn compute_test_mask(content: &str, rel: &Path) -> Vec<bool> {
     // depth drops back to this value).
     let mut gate_stack: Vec<i32> = Vec::new();
 
-    for (idx, raw) in lines.iter().enumerate() {
-        let stripped = strip_strings_and_comments(raw);
+    let stripped_all = strip_file_lines(content);
+    for (idx, _raw) in lines.iter().enumerate() {
+        let stripped = stripped_all
+            .get(idx)
+            .cloned()
+            .unwrap_or_default();
 
         // Detect cfg-test attribute on this line. Attribute syntax is
         // `#[cfg(test)]`, `#[cfg(all(test, ...))]`, `#[cfg(any(test,
@@ -970,8 +1016,7 @@ fn compute_trait_impl_mask(content: &str) -> Vec<bool> {
     let lines: Vec<&str> = content.lines().collect();
     let n = lines.len();
     let mut mask = vec![false; n];
-    let stripped_lines: Vec<String> =
-        lines.iter().map(|l| strip_strings_and_comments(l)).collect();
+    let stripped_lines: Vec<String> = strip_file_lines(content);
 
     // Stack entry: depth-just-before-open, is_trait_impl.
     let mut stack: Vec<(i32, bool)> = Vec::new();
@@ -1142,11 +1187,15 @@ fn scan_for_debug_eprintln(
             return;
         }
         let mask = compute_test_mask(content, rel);
+        let stripped_lines = strip_file_lines(content);
         for (idx, line) in content.lines().enumerate() {
             if mask.get(idx).copied().unwrap_or(false) {
                 continue;
             }
-            let stripped = strip_strings_and_comments(line);
+            let stripped = stripped_lines
+                .get(idx)
+                .map(String::as_str)
+                .unwrap_or(line);
             if !stripped.contains("eprintln!(") && !stripped.contains("eprint!(") {
                 continue;
             }
@@ -1319,8 +1368,21 @@ fn scan_for_banned_marker(
         if !content.contains(needle) {
             return;
         }
+        // For .rs files, strip multi-line string contents so error-message
+        // strings that mention the marker by name don't false-fire. Non-.rs
+        // files (toml, yaml, shell, etc.) fall through to the raw scan.
+        let use_strip = rel.extension().and_then(OsStr::to_str) == Some("rs");
+        let stripped_lines = if use_strip {
+            Some(strip_file_lines(content))
+        } else {
+            None
+        };
         for (idx, line) in content.lines().enumerate() {
-            if line.contains(needle) {
+            let probe: &str = match &stripped_lines {
+                Some(v) => v.get(idx).map(String::as_str).unwrap_or(line),
+                None => line,
+            };
+            if probe.contains(needle) {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }
         }
