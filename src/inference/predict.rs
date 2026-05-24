@@ -4849,7 +4849,7 @@ pub fn predict_gam<X>(
     x: X,
     beta: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
-    family: crate::types::LikelihoodFamily,
+    family: LikelihoodSpec,
 ) -> Result<PredictResult, EstimationError>
 where
     X: Into<DesignMatrix>,
@@ -4864,7 +4864,7 @@ where
     let mut eta = x.matrixvectormultiply(&beta.to_owned());
     eta += &offset;
 
-    let mean = apply_family_inverse_link(&eta, family, None)?;
+    let mean = apply_family_inverse_link(&eta, &family)?;
 
     Ok(PredictResult { eta, mean })
 }
@@ -4877,7 +4877,7 @@ pub fn predict_gam_posterior_mean<X>(
     x: X,
     beta: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
-    family: crate::types::LikelihoodFamily,
+    family: LikelihoodSpec,
     covariance: ArrayView2<'_, f64>,
 ) -> Result<PredictPosteriorMeanResult, EstimationError>
 where
@@ -4885,7 +4885,7 @@ where
 {
     let x = x.into();
     let backend = PredictionCovarianceBackend::from_dense(covariance.view());
-    let strategy = strategy_for_family(family, None);
+    let strategy = strategy_for_spec(&family);
     predict_gam_posterior_mean_from_backend(
         x,
         beta,
@@ -4900,14 +4900,14 @@ pub fn predict_gam_posterior_meanwith_backend<X>(
     x: X,
     beta: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
-    family: crate::types::LikelihoodFamily,
+    family: LikelihoodSpec,
     backend: &PredictionCovarianceBackend<'_>,
 ) -> Result<PredictPosteriorMeanResult, EstimationError>
 where
     X: Into<DesignMatrix>,
 {
     let x = x.into();
-    let strategy = strategy_for_family(family, None);
+    let strategy = strategy_for_spec(&family);
     predict_gam_posterior_mean_from_backend(
         x,
         beta,
@@ -4926,7 +4926,7 @@ pub fn predict_gam_posterior_meanwith_fit<X>(
     x: X,
     beta: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
-    family: crate::types::LikelihoodFamily,
+    family: LikelihoodSpec,
     covariance: ArrayView2<'_, f64>,
     fit: &UnifiedFitResult,
 ) -> Result<PredictPosteriorMeanResult, EstimationError>
@@ -4935,7 +4935,7 @@ where
 {
     let x = x.into();
     let backend = PredictionCovarianceBackend::from_dense(covariance.view());
-    let strategy = strategy_from_fit(family, fit)?;
+    let strategy = strategy_from_fit(&family, fit)?;
     predict_gam_posterior_mean_from_backend(
         x,
         beta,
@@ -4992,7 +4992,7 @@ pub fn predict_gamwith_uncertainty<X>(
     x: X,
     beta: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
-    family: crate::types::LikelihoodFamily,
+    family: LikelihoodSpec,
     fit: &UnifiedFitResult,
     options: &PredictUncertaintyOptions,
 ) -> Result<PredictUncertaintyResult, EstimationError>

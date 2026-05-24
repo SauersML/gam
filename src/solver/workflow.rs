@@ -797,7 +797,7 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
             request.offset.clone(),
             &request.spec,
             latent_coord,
-            legacy_family_from_spec(&request.family),
+            request.family.clone(),
             &request.options,
         )
         .map_err(|e| e.to_string())?
@@ -812,7 +812,7 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
             &request.spec,
             &request.coefficient_groups,
             &request.penalty_block_gamma_priors,
-            legacy_family_from_spec(&request.family),
+            request.family.clone(),
             &request.options,
         )
         .map_err(|e| e.to_string())?;
