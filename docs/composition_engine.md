@@ -167,6 +167,13 @@ When the unsupervised priors fail, as in `auto_exp_21` through `auto_exp_32`,
 match `d_aux` to the actual signal dimensionality and use
 `AuxConditionalPriorPenalty` with supervised aux. `auto_exp_33` recovered the
 cogito run at `d_aux=3`: R²(hue)=0.70, and each latent axis aligned with one HSV channel.
+Extending to `d_aux=6` with concat(HSV, name-features) supervision recovers
+the full `U_3d` perceptual + name-semantic decomposition (`auto_exp_35`):
+each of the 6 supervised aux axes maps cleanly to its own latent axis (max
+axis-correlation 0.80–0.88), with no cross-subspace mixing. Mean R²=0.707
+across all 6 aux dims, exceeding the unsupervised `U_3d` ceiling of 0.61.
+This makes the §4(c) prediction ("structured prior + supervised aux breaks
+gauge") a demonstrated solution on real LLM data, not just synthetic.
 
 ### Persistent Caching
 
