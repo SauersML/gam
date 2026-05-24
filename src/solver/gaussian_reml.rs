@@ -943,18 +943,9 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
     problems: &[GaussianRemlMultiBackwardProblem<'a>],
     penalty: ArrayView2<'a, f64>,
 ) -> Vec<Result<GaussianRemlBackwardResult, EstimationError>> {
-    // Batched precompute of `(X'WX + λS)⁻¹` for all K problems via one
-    // strided-batched cuBLAS `A · Bᵀ`. The dispatch is gated on the same
-    // gemm policy threshold as single-fit dispatch, so it engages at
-    // biobank-scale `K = 16 000` for high-dim `p` where the K-aggregate
-    // FLOP count beats the per-fit threshold; for small `p` the policy
-    // declines and each fit falls back to its own
-    // `gaussian_reml_inverse_hessian_from_cache` call inside `_from_fit`.
-    let batched_inverses = batched_inverse_hessians_from_caches(problems);
     let results: Vec<Result<GaussianRemlBackwardResult, EstimationError>> = problems
         .par_iter()
-        .enumerate()
-        .map(|(b, problem)| {
+        .map(|problem| {
             validate_gaussian_reml_backward_upstreams(
                 problem.x.view(),
                 problem.y.view(),
@@ -983,9 +974,7 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
                 return Ok(zero_backward_result(n, p, d));
             }
             let weight = gaussian_reml_weights(n, problem.weights.as_ref().map(|w| w.view()))?;
-            let inverse_hessian = if let Some(ref stacks) = batched_inverses {
-                stacks[b].clone()
-            } else {
+            let inverse_hessian =
                 match gaussian_reml_inverse_hessian_from_cache(&problem.fit.cache, lambda) {
                     Ok(inv) => inv,
                     Err(EstimationError::ModelIsIllConditioned { condition_number }) => {
@@ -993,8 +982,7 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
                         return Ok(zero_backward_result(n, p, d));
                     }
                     Err(err) => return Err(err),
-                }
-            };
+                };
             gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
                 problem.x.view(),
                 problem.y.view(),
@@ -1014,16 +1002,6 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
         })
         .collect();
     results
-}
-
-/// The current GPU runtime does not expose a batched GEMM primitive for this
-/// path. Returning `None` keeps the backward pass on the ordinary per-fit
-/// inverse-Hessian route, which uses the same eigen-cache representation and
-/// numerical checks.
-fn batched_inverse_hessians_from_caches<'a>(
-    _problems: &[GaussianRemlMultiBackwardProblem<'a>],
-) -> Option<Vec<Array2<f64>>> {
-    None
 }
 
 fn rho_derivatives_to_lambda(lambda: f64, grad_rho: f64, hess_rho: f64) -> (f64, f64) {
@@ -1528,16 +1506,10 @@ fn fnv1a_mix(hash: u64, value: u64) -> u64 {
     (hash ^ value).wrapping_mul(0x100000001b3)
 }
 
-/// Build eigen caches for K problems that share the same penalty matrix in
-/// a single phased pipeline. The Cholesky step is dispatched as one
-/// `cusolverDnDpotrfBatched` call when every X'WX has the same shape and is
-/// positive definite; failures (any non-PD factor, GPU dispatch returning
-/// `None`, or non-uniform shapes) fall through to per-fit Cholesky. The
-/// remaining cache build (whitened-penalty eigh + basis solve) stays
-/// per-fit because cuSOLVER has no batched symmetric eigensolver — those
-/// individual dispatches still route to `try_syevd_inplace` when the policy
-/// approves. Designed for the biobank-scale batched fit entry where K can
-/// reach 16 000+ and per-fit Cholesky launch latency dominates.
+/// Build eigen caches for K problems that share the same penalty matrix in a
+/// single phased pipeline. X'WX construction is batched by the caller; each
+/// cache then uses the same Cholesky/eigendecomposition implementation as the
+/// single-fit path.
 pub fn build_gaussian_reml_eigen_cache_batched(
     xtwx_matrices: Vec<Array2<f64>>,
     penalty: ArrayView2<'_, f64>,
@@ -1549,13 +1521,10 @@ pub fn build_gaussian_reml_eigen_cache_batched(
     if k == 0 {
         return Vec::new();
     }
-    let p = xtwx_matrices[0].nrows();
-    let uniform_shape = p > 0 && xtwx_matrices.iter().all(|m| m.dim() == (p, p));
     let fingerprints: Vec<u64> = xtwx_matrices
         .iter()
         .map(|m| matrix_fingerprint(m.view()))
         .collect();
-    let _ = (uniform_shape, p);
 
     let mut results = Vec::with_capacity(k);
     for (b, xtwx) in xtwx_matrices.into_iter().enumerate() {
@@ -1689,11 +1658,7 @@ fn gaussian_reml_eigen_cache_from_lower(
 }
 
 /// Cache-build variant that accepts a pre-computed whitened penalty
-/// `L⁻¹·S·L⁻ᵀ`. The batched cache build supplies it via broadcast/strided
-/// batched cuBLAS gemms when the policy approves; per-fit callers pass
-/// `None` and the helper falls back to `invert_lower_triangular` + two
-/// `dense_ab` calls (which themselves route to `try_fast_*` per the
-/// host/GPU dispatch policy).
+/// `L⁻¹·S·L⁻ᵀ`. Callers pass `None` to compute it from the Cholesky factor.
 fn gaussian_reml_eigen_cache_from_lower_with_transform(
     lower: Array2<f64>,
     penalty: ArrayView2<'_, f64>,

@@ -1,136 +1,43 @@
-    Blocking waiting for file lock on build directory
    Compiling gam v0.2.1 (/Users/user/gam)
-error[E0428]: the name `dense_xt_diag_x` is defined multiple times
-    --> src/solver/gaussian_reml.rs:1569:1
-     |
-1557 | fn dense_xt_diag_x(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Array2<f64> {
-     | --------------------------------------------------------------------------------- previous definition of the value `dense_xt_diag_x` here
-...
-1569 | fn dense_xt_diag_x(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Array2<f64> {
-     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `dense_xt_diag_x` redefined here
-     |
-     = note: `dense_xt_diag_x` must be defined only once in the value namespace of this module
+error: unused import: `s`
+  --> src/solver/gaussian_reml.rs:6:91
+   |
+ 6 | use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s};
+   |                                                                                           ^
+   |
+note: the lint level is defined here
+  --> src/lib.rs:45:9
+   |
+45 | #![deny(unused_imports)]
+   |         ^^^^^^^^^^^^^^
 
-error[E0425]: cannot find function `try_fast_abt_strided_batched` in module `crate::gpu`
-    --> src/solver/gaussian_reml.rs:1073:21
+error: calls to `std::mem::drop` with a value that implements `Copy` does nothing
+    --> src/solver/gaussian_reml.rs:1400:5
      |
-1073 |         crate::gpu::try_fast_abt_strided_batched(scaled_stack.view(), basis_stack.view())?;
-     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `crate::gpu`
-
-error[E0425]: cannot find function `try_cholesky_batched_lower_inplace` in module `crate::gpu`
-    --> src/solver/gaussian_reml.rs:1624:30
+1400 |        drop(add_ridge_profile_vjp(
+     |   _____^    -
+     |  |__________|
+1401 | ||         1.0,
+1402 | ||         x,
+1403 | ||         y,
+...    ||
+1413 | ||         grad_weights,
+1414 | ||     ));
+     | ||_____-^
+     | |______|
+     |        argument has type `f64`
      |
-1624 |         let ok = crate::gpu::try_cholesky_batched_lower_inplace(&mut buffer).is_some()
-     |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `crate::gpu`
-
-error[E0425]: cannot find function `try_fast_ab_broadcast_b_batched` in module `crate::gpu`
-    --> src/solver/gaussian_reml.rs:1659:29
+     = note: `-D dropping-copy-types` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(dropping_copy_types)]`
+help: use `let _ = ...` to ignore the expression or result
      |
-1659 |                 crate::gpu::try_fast_ab_broadcast_b_batched(linv_stack.view(), penalty)
-     |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `crate::gpu`
-
-error[E0425]: cannot find function `try_fast_abt_strided_batched` in module `crate::gpu`
-    --> src/solver/gaussian_reml.rs:1662:33
-     |
-1662 |                     crate::gpu::try_fast_abt_strided_batched(m_stack.view(), linv_stack.view())
-     |                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `crate::gpu`
-
-error[E0425]: cannot find function `try_cholesky_lower_inplace` in module `crate::gpu`
-    --> src/solver/gaussian_reml.rs:1910:24
-     |
-1910 |         if crate::gpu::try_cholesky_lower_inplace(&mut gpu_xtwx).is_some()
-     |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `crate::gpu`
-
-error[E0425]: cannot find function `try_solve_lower_triangular_matrix` in module `crate::gpu`
-    --> src/solver/gaussian_reml.rs:2616:36
-     |
-2616 |     if let Some(out) = crate::gpu::try_solve_lower_triangular_matrix(lower, rhs)
-     |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `crate::gpu`
-
-error[E0425]: cannot find function `try_solve_upper_triangular_matrix` in module `crate::gpu`
-    --> src/solver/gaussian_reml.rs:2650:36
-     |
-2650 |     if let Some(out) = crate::gpu::try_solve_upper_triangular_matrix(upper, rhs)
-     |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in `crate::gpu`
-
-error[E0599]: no method named `policy` found for enum `std::option::Option<T>` in the current scope
-    --> src/solver/gaussian_reml.rs:1045:10
-     |
-1044 |       if !crate::gpu::GpuRuntime::global()
-     |  _________-
-1045 | |         .policy()
-     | |         -^^^^^^ method not found in `std::option::Option<&'static GpuRuntime>`
-     | |_________|
+1400 ~     let _ = add_ridge_profile_vjp(
+1401 |         1.0,
+ ...
+1413 |         grad_weights,
+1414 ~     );
      |
 
-error[E0599]: no method named `policy` found for enum `std::option::Option<T>` in the current scope
-    --> src/solver/gaussian_reml.rs:1620:14
-     |
-1619 |           && crate::gpu::GpuRuntime::global()
-     |  ____________-
-1620 | |             .policy()
-     | |             -^^^^^^ method not found in `std::option::Option<&'static GpuRuntime>`
-     | |_____________|
-     |
-
-error[E0282]: type annotations needed
-    --> src/solver/gaussian_reml.rs:1662:62
-     |
-1662 |                     crate::gpu::try_fast_abt_strided_batched(m_stack.view(), linv_stack.view())
-     |                                                              ^^^^^^^ cannot infer type
-
-error[E0282]: type annotations needed
-    --> src/solver/gaussian_reml.rs:1666:34
-     |
-1666 |                         out.push(t_stack.slice(s![b, .., ..]).to_owned());
-     |                                  ^^^^^^^ cannot infer type
-
-error[E0599]: no method named `policy` found for enum `std::option::Option<T>` in the current scope
-    --> src/solver/gaussian_reml.rs:1906:10
-     |
-1905 |       if crate::gpu::GpuRuntime::global()
-     |  ________-
-1906 | |         .policy()
-     | |         -^^^^^^ method not found in `std::option::Option<&'static GpuRuntime>`
-     | |_________|
-     |
-
-error[E0282]: type annotations needed
-    --> src/solver/gaussian_reml.rs:2617:12
-     |
-2617 |         && out.iter().all(|value| value.is_finite())
-     |            ^^^ cannot infer type
-
-error[E0282]: type annotations needed
-    --> src/solver/gaussian_reml.rs:2617:28
-     |
-2617 |         && out.iter().all(|value| value.is_finite())
-     |                            ^^^^^  ----- type must be known at this point
-     |
-help: consider giving this closure parameter an explicit type
-     |
-2617 |         && out.iter().all(|value: /* Type */| value.is_finite())
-     |                                 ++++++++++++
-
-error[E0282]: type annotations needed
-    --> src/solver/gaussian_reml.rs:2651:12
-     |
-2651 |         && out.iter().all(|value| value.is_finite())
-     |            ^^^ cannot infer type
-
-error[E0282]: type annotations needed
-    --> src/solver/gaussian_reml.rs:2651:28
-     |
-2651 |         && out.iter().all(|value| value.is_finite())
-     |                            ^^^^^  ----- type must be known at this point
-     |
-help: consider giving this closure parameter an explicit type
-     |
-2651 |         && out.iter().all(|value: /* Type */| value.is_finite())
-     |                                 ++++++++++++
-
-Some errors have detailed explanations: E0282, E0425, E0428, E0599.
-For more information about an error, try `rustc --explain E0282`.
-error: could not compile `gam` (lib) due to 17 previous errors
+error: could not compile `gam` (lib) due to 2 previous errors
 warning: build failed, waiting for other jobs to finish...
-error: could not compile `gam` (lib test) due to 17 previous errors
+error: could not compile `gam` (lib test) due to 2 previous errors
