@@ -10850,6 +10850,7 @@ mod ift_warm_start_tests {
     }
 }
 
+#[cfg(test)]
 mod tests_diagnostics {
     //! Diagnostic inherent-method extensions on `RemlState`.
     use super::*;
