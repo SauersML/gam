@@ -268,11 +268,47 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     /// Optional BLAS-3 Jacobian-action fast path: returns `Jᵢ · F` as an
     /// `(n_rows × stride)` dense matrix when the kernel can produce one
     /// (typically when the underlying design exposes a contiguous dense
-    /// `Array2`). The default returns `None`, in which case generic
-    /// per-row `jacobian_action` is used.
-    fn jacobian_action_matrix(&self, _factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
-        None
+    /// `Array2`). The default is the exact generic per-row implementation;
+    /// implementations may override when a structured batched path is cheaper.
+    fn jacobian_action_matrix(&self, factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
+        Some(row_kernel_jacobian_action_matrix_generic(self, factor))
     }
+}
+
+fn row_kernel_jacobian_action_matrix_generic<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized),
+    factor: ArrayView2<'_, f64>,
+) -> Array2<f64> {
+    assert_eq!(
+        factor.nrows(),
+        kern.n_coefficients(),
+        "row-kernel JF factor row count must match coefficient dimension"
+    );
+    let n_rows = kern.n_rows();
+    let rank = factor.ncols();
+    let stride = K * rank;
+    let mut jf = Array2::<f64>::zeros((n_rows, stride));
+    if n_rows == 0 || rank == 0 {
+        return jf;
+    }
+    let f_t: Array2<f64> = factor.t().as_standard_layout().into_owned();
+    jf.as_slice_mut()
+        .expect("row-major JF matrix must be contiguous")
+        .par_chunks_mut(stride)
+        .enumerate()
+        .for_each(|(row, jf_row)| {
+            for k_col in 0..rank {
+                let f_slice = f_t
+                    .row(k_col)
+                    .to_slice()
+                    .expect("standard-layout row must be contiguous");
+                let vec_k = kern.jacobian_action(row, f_slice);
+                for k in 0..K {
+                    jf_row[k * rank + k_col] = vec_k[k];
+                }
+            }
+        });
+    jf
 }
 
 // ── Cache ────────────────────────────────────────────────────────────
@@ -905,29 +941,16 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
         let n_rows = self.kern.n_rows();
         let rank = factor.ncols();
         let stride = K * rank;
-        let mut jf = Array2::<f64>::zeros((n_rows, stride));
         if n_rows == 0 || rank == 0 {
-            return jf;
+            return Array2::<f64>::zeros((n_rows, stride));
         }
-        // Standard-layout `F^T` (rank × p) so each column of F is a contiguous
-        // row of `f_t`, suitable for the slice-taking `jacobian_action`.
-        let f_t: Array2<f64> = factor.t().as_standard_layout().into_owned();
-        jf.as_slice_mut()
-            .expect("row-major JF matrix must be contiguous")
-            .par_chunks_mut(stride)
-            .enumerate()
-            .for_each(|(row, jf_row)| {
-                for k_col in 0..rank {
-                    let f_slice = f_t
-                        .row(k_col)
-                        .to_slice()
-                        .expect("standard-layout row must be contiguous");
-                    let vec_k = self.kern.jacobian_action(row, f_slice);
-                    for k in 0..K {
-                        jf_row[k * rank + k_col] = vec_k[k];
-                    }
-                }
+        let jf = self
+            .kern
+            .jacobian_action_matrix(factor.view())
+            .unwrap_or_else(|| {
+                row_kernel_jacobian_action_matrix_generic(&*self.kern, factor.view())
             });
+        assert_eq!(jf.dim(), (n_rows, stride));
         jf
     }
 
@@ -1094,27 +1117,16 @@ impl<const K: usize, T: RowKernel<K>> RowKernelSecondDirectionalDerivativeOperat
         let n_rows = self.kern.n_rows();
         let rank = factor.ncols();
         let stride = K * rank;
-        let mut jf = Array2::<f64>::zeros((n_rows, stride));
         if n_rows == 0 || rank == 0 {
-            return jf;
+            return Array2::<f64>::zeros((n_rows, stride));
         }
-        let f_t: Array2<f64> = factor.t().as_standard_layout().into_owned();
-        jf.as_slice_mut()
-            .expect("row-major JF matrix must be contiguous")
-            .par_chunks_mut(stride)
-            .enumerate()
-            .for_each(|(row, jf_row)| {
-                for k_col in 0..rank {
-                    let f_slice = f_t
-                        .row(k_col)
-                        .to_slice()
-                        .expect("standard-layout row must be contiguous");
-                    let vec_k = self.kern.jacobian_action(row, f_slice);
-                    for k in 0..K {
-                        jf_row[k * rank + k_col] = vec_k[k];
-                    }
-                }
+        let jf = self
+            .kern
+            .jacobian_action_matrix(factor.view())
+            .unwrap_or_else(|| {
+                row_kernel_jacobian_action_matrix_generic(&*self.kern, factor.view())
             });
+        assert_eq!(jf.dim(), (n_rows, stride));
         jf
     }
 
@@ -1385,8 +1397,17 @@ mod gram_inner_contraction_tests {
         fn n_coefficients(&self) -> usize {
             self.p
         }
-        fn row_kernel(&self, _: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
-            Ok((0.0, [0.0; 4], [[0.0; 4]; 4]))
+        fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
+            if row >= self.n {
+                return Err(format!("synthetic row {row} outside n={}", self.n));
+            }
+            let mut grad = [0.0_f64; 4];
+            let mut hess = [[0.0_f64; 4]; 4];
+            for k in 0..4 {
+                grad[k] = self.designs[k].row(row).sum();
+                hess[k][k] = 1.0 + (row as f64 + k as f64).abs() * 1.0e-6;
+            }
+            Ok((0.5 * grad.iter().map(|v| v * v).sum::<f64>(), grad, hess))
         }
         fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 4] {
             let mut out = [0.0_f64; 4];
@@ -1409,14 +1430,33 @@ mod gram_inner_contraction_tests {
             }
         }
         fn add_pullback_hessian(&self, row: usize, h: &[[f64; 4]; 4], target: &mut Array2<f64>) {
-            // Stub: this regression test exercises only Jacobian-side paths;
-            // pullback Hessian is not consumed. Drop args to satisfy the
-            // unused-variables deny while keeping the trait signature.
-            drop((row, h, target));
+            for a in 0..4 {
+                let row_a = self.designs[a].row(row);
+                for b in 0..4 {
+                    let scale = h[a][b];
+                    if scale == 0.0 {
+                        continue;
+                    }
+                    let row_b = self.designs[b].row(row);
+                    for i in 0..self.p {
+                        for j in 0..self.p {
+                            target[[i, j]] += scale * row_a[i] * row_b[j];
+                        }
+                    }
+                }
+            }
         }
         fn add_diagonal_quadratic(&self, row: usize, h: &[[f64; 4]; 4], diag: &mut [f64]) {
-            // Same as above — diagonal quadratic accumulation is unused here.
-            drop((row, h, diag));
+            for j in 0..self.p {
+                let mut acc = 0.0;
+                for a in 0..4 {
+                    let x_a = self.designs[a][[row, j]];
+                    for b in 0..4 {
+                        acc += h[a][b] * x_a * self.designs[b][[row, j]];
+                    }
+                }
+                diag[j] += acc;
+            }
         }
         fn row_third_contracted(
             &self,

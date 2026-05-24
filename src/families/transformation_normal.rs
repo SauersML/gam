@@ -8368,7 +8368,7 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         if block_states.len() != 1 {
             return Err(TransformationNormalError::InvalidInput {
@@ -8376,6 +8376,13 @@ impl CustomFamily for TransformationNormalFamily {
                     "TransformationNormalFamily expects 1 block, got {}",
                     block_states.len()
                 ),
+            }
+            .into());
+        }
+        if !self.inner_coefficient_hessian_hvp_available(specs) {
+            return Err(TransformationNormalError::InvalidInput {
+                reason: "TransformationNormalFamily joint Hessian workspace received incompatible block specs"
+                    .to_string(),
             }
             .into());
         }
@@ -8397,9 +8404,16 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_psi_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        if !self.inner_coefficient_hessian_hvp_available(specs) {
+            return Err(TransformationNormalError::InvalidInput {
+                reason: "TransformationNormalFamily joint psi workspace received incompatible block specs"
+                    .to_string(),
+            }
+            .into());
+        }
         Ok(Some(Arc::new(TransformationNormalPsiWorkspace::new(
             self.clone(),
             block_states.to_vec(),
@@ -8429,10 +8443,17 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_psi_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        if !self.inner_coefficient_hessian_hvp_available(specs) {
+            return Err(TransformationNormalError::InvalidInput {
+                reason: "TransformationNormalFamily joint psi workspace received incompatible block specs"
+                    .to_string(),
+            }
+            .into());
+        }
         // Route through a mask-aware family clone when an outer-score
         // subsample is active. Every CTN ψ assembly site — including the
         // workspace's `compute_all_axes` (per-row reduction near line ~13916)

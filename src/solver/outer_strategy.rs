@@ -1690,16 +1690,11 @@ pub trait OuterObjective {
     /// Seed the inner-solver iterate before the first eval, e.g. when the
     /// outer-iterate cache restored a `(ρ, β)` pair from a prior run.
     ///
-    /// The default is a no-op: families that don't expose an inner β slot
-    /// silently ignore the hint and the first `eval(ρ)` proceeds from
-    /// whatever inner state the family had — equivalent to a ρ-only resume.
-    /// Families that *do* expose β (PIRLS-based GAMs, custom-family marginal
-    /// slope, …) override this to install β as the warm-start iterate so the
-    /// first inner solve opens at `‖∇‖ ≈ 0` and the boundary-ρ conditioning
-    /// stops mattering.
-    fn seed_inner_state(&mut self, _beta: &Array1<f64>) -> Result<(), EstimationError> {
-        Ok(())
-    }
+    /// Objectives must make an explicit choice here. Implementations with an
+    /// inner β slot install the seed; implementations without one return a
+    /// contract error instead of silently degrading a β-bearing checkpoint into
+    /// a ρ-only resume.
+    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError>;
 }
 
 // ─── Persistent warm-start checkpoint plumbing ────────────────────────
@@ -2081,6 +2076,17 @@ where
             None => Err(EstimationError::RemlOptimizationFailed(
                 "EFS evaluation not implemented for this objective".to_string(),
             )),
+        }
+    }
+
+    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
+        if beta.is_empty() {
+            Ok(())
+        } else {
+            Err(EstimationError::InvalidInput(format!(
+                "cached inner beta has length {}, but this objective does not expose an inner-state seeding hook",
+                beta.len()
+            )))
         }
     }
 
