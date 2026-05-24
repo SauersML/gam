@@ -185,13 +185,11 @@ impl Session {
             (Some(_), None) => true,
             _ => false,
         };
-        if !improves {
-            if let Some(last) = guard.last_write {
-                if now.duration_since(last) < MIN_CHECKPOINT_INTERVAL {
+        if !improves
+            && let Some(last) = guard.last_write
+                && now.duration_since(last) < MIN_CHECKPOINT_INTERVAL {
                     return false;
                 }
-            }
-        }
         match self.store.save_overwrite(
             &self.key,
             &self.run_id,

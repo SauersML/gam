@@ -229,8 +229,8 @@ fn weighted_crossprod_dense_rows(
     let p_left = left.ncols();
     let p_right = right.ncols();
     let mut out = Array2::<f64>::zeros((p_left, p_right));
-    if left.is_standard_layout() && right.is_standard_layout() {
-        if let (Some(lx), Some(rx), Some(w)) =
+    if left.is_standard_layout() && right.is_standard_layout()
+        && let (Some(lx), Some(rx), Some(w)) =
             (left.as_slice(), right.as_slice(), weights.as_slice())
         {
             let out_slice = out.as_slice_mut().expect("zeros are contiguous");
@@ -254,7 +254,6 @@ fn weighted_crossprod_dense_rows(
             }
             return out;
         }
-    }
     for i in rows {
         let wi = weights[i];
         if wi == 0.0 {
@@ -537,8 +536,8 @@ fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> A
     let parallel = large && rayon::current_thread_index().is_none();
     // Fast path: if the matrix is row-major contiguous, read each row as a
     // slice and avoid n*p bounds-checked indexing.
-    if matrix.is_standard_layout() {
-        if let (Some(x), Some(w)) = (matrix.as_slice(), weights.as_slice()) {
+    if matrix.is_standard_layout()
+        && let (Some(x), Some(w)) = (matrix.as_slice(), weights.as_slice()) {
             if parallel {
                 return (0..n)
                     .into_par_iter()
@@ -582,7 +581,6 @@ fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> A
             }
             return diag;
         }
-    }
     let mut diag = Array1::<f64>::zeros(p);
     for i in 0..n {
         let wi = weights[i];
@@ -818,8 +816,8 @@ fn dense_transpose_weighted_response(
     let p = matrix.ncols();
     let n = matrix.nrows();
     let mut out = Array1::<f64>::zeros(p);
-    if matrix.is_standard_layout() {
-        if let (Some(x), Some(w), Some(yslice)) =
+    if matrix.is_standard_layout()
+        && let (Some(x), Some(w), Some(yslice)) =
             (matrix.as_slice(), weights.as_slice(), y.as_slice())
         {
             let scale_slice = row_scale.and_then(|s| s.as_slice());
@@ -841,7 +839,6 @@ fn dense_transpose_weighted_response(
             }
             return out;
         }
-    }
     for i in 0..n {
         let mut scaled = y[i] * weights[i];
         if let Some(scale) = row_scale {
@@ -868,8 +865,8 @@ fn dense_transpose_weighted_response_view(
     let p = matrix.ncols();
     let n = matrix.nrows();
     let mut out = Array1::<f64>::zeros(p);
-    if matrix.is_standard_layout() {
-        if let (Some(x), Some(w), Some(yslice)) =
+    if matrix.is_standard_layout()
+        && let (Some(x), Some(w), Some(yslice)) =
             (matrix.as_slice(), weights.as_slice(), y.as_slice())
         {
             let out_slice = out.as_slice_mut().expect("zeros are contiguous");
@@ -885,7 +882,6 @@ fn dense_transpose_weighted_response_view(
             }
             return out;
         }
-    }
     for i in 0..n {
         let scaled = y[i] * weights[i];
         if scaled == 0.0 {
@@ -3530,24 +3526,22 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
                 centers.ncols(),
             ));
         }
-        if let Some(z) = constraint_transform.as_ref() {
-            if z.nrows() != k {
+        if let Some(z) = constraint_transform.as_ref()
+            && z.nrows() != k {
                 return Err(format!(
                     "ChunkedKernelDesignOperator: constraint_transform rows {} != centers rows {}",
                     z.nrows(),
                     k,
                 ));
             }
-        }
-        if let Some(poly) = poly_basis.as_ref() {
-            if poly.nrows() != n {
+        if let Some(poly) = poly_basis.as_ref()
+            && poly.nrows() != n {
                 return Err(format!(
                     "ChunkedKernelDesignOperator: poly_basis rows {} != data rows {}",
                     poly.nrows(),
                     n,
                 ));
             }
-        }
         let k_eff = constraint_transform.as_ref().map_or(k, |z| z.ncols());
         let poly_cols = poly_basis.as_ref().map_or(0, |p| p.ncols());
         Ok(Self {
@@ -4867,7 +4861,7 @@ pub fn xt_diag_x_symmetric(
             let row_ptr = sym.row_ptr();
             let col_idx = sym.col_idx();
             let vals = csr.val();
-            let acc_template = SparseHessianAccumulator::from_single_csr(&*csr, p);
+            let acc_template = SparseHessianAccumulator::from_single_csr(&csr, p);
             let n_threads = rayon::current_num_threads().max(1);
             let target_chunks = (n_threads * 16).max(n_threads);
             let chunk_rows = (n / target_chunks).max(256).min(n.max(1));
@@ -5285,7 +5279,7 @@ pub trait LinearOperator {
         }
         for retry in 0..8 {
             let ridge = if baseridge > 0.0 {
-                baseridge * 10f64.powi(retry as i32)
+                baseridge * 10f64.powi(retry)
             } else {
                 0.0
             };
@@ -5369,13 +5363,12 @@ pub trait LinearOperator {
             0.0
         };
         // Try matrix-free PCG first to avoid assembling the dense p×p normal matrix.
-        if self.uses_matrix_free_pcg() && self.ncols() >= MATRIX_FREE_PCG_MIN_P {
-            if let Ok(solution) =
+        if self.uses_matrix_free_pcg() && self.ncols() >= MATRIX_FREE_PCG_MIN_P
+            && let Ok(solution) =
                 self.solve_system_matrix_free_pcg_try(weights, rhs, penalty, baseridge)
             {
                 return Ok(solution);
             }
-        }
         // Fallback: assemble dense system and solve via Cholesky with ridge retries.
         let mut system = self.diag_xtw_x(weights)?;
         if let Some(pen) = penalty {
@@ -6142,8 +6135,8 @@ fn assemble_sparseweighted_gram_system(
             triplets.push(Triplet::new(row, col, value));
         }
     }
-    Ok(SparseColMat::try_new_from_triplets(p, p, &triplets)
-        .map_err(|_| "failed to build sparse penalized system".to_string())?)
+    SparseColMat::try_new_from_triplets(p, p, &triplets)
+        .map_err(|_| "failed to build sparse penalized system".to_string())
 }
 
 impl DesignMatrix {

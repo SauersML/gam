@@ -36,7 +36,7 @@ mod cuda {
         let (n, p) = validate_design(x, weights)?;
         let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas init: {e}"))?;
         let x_col = to_col_major(&x);
-        let x_dev = pinned_htod(&ctx, &stream, &*x_col)?;
+        let x_dev = pinned_htod(&ctx, &stream, &x_col)?;
         let mut w_dev = pinned_htod(
             &ctx,
             &stream,
@@ -91,7 +91,7 @@ mod cuda {
         let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas init: {e}"))?;
         let solver = DnHandle::new(stream.clone()).map_err(|e| format!("cusolver init: {e}"))?;
         let x_col = to_col_major(&input.x);
-        let x_dev = pinned_htod(&ctx, &stream, &*x_col)?;
+        let x_dev = pinned_htod(&ctx, &stream, &x_col)?;
         let mut w_dev = pinned_htod(
             &ctx,
             &stream,
@@ -129,7 +129,7 @@ mod cuda {
         let penalty = penalty_with_ridge(input.penalty_hessian, input.lm_ridge);
         let penalty_view = penalty.view();
         let penalty_col = to_col_major(&penalty_view);
-        let penalty_dev = pinned_htod(&ctx, &stream, &*penalty_col)?;
+        let penalty_dev = pinned_htod(&ctx, &stream, &penalty_col)?;
         let mut h_dev = stream
             .alloc_zeros::<f64>(p.checked_mul(p).ok_or("H size overflow")?)
             .map_err(|e| format!("cuda alloc H total: {e}"))?;
@@ -180,8 +180,8 @@ mod cuda {
         let solver = DnHandle::new(stream.clone()).map_err(|e| format!("cusolver init: {e}"))?;
         let h_col = to_col_major(&hessian);
         let rhs_col = to_col_major(&rhs);
-        let mut h_dev = pinned_htod(&ctx, &stream, &*h_col)?;
-        let mut rhs_dev = pinned_htod(&ctx, &stream, &*rhs_col)?;
+        let mut h_dev = pinned_htod(&ctx, &stream, &h_col)?;
+        let mut rhs_dev = pinned_htod(&ctx, &stream, &rhs_col)?;
         potrf_in_place(&solver, &stream, p, &mut h_dev)?;
         potrs_in_place(&solver, &stream, p, nrhs, &h_dev, &mut rhs_dev)?;
         let factor_col = stream

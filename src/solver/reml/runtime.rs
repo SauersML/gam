@@ -1334,7 +1334,7 @@ impl<'a> RemlState<'a> {
         let mut states = ift_quality_states().lock().unwrap();
         let state = states
             .entry(self.hypergradient_owner_key())
-            .or_insert_with(IftQualityRuntimeState::default);
+            .or_default();
         state.quality_history.push(quality);
         while state.quality_history.len() > IFT_QUALITY_HISTORY_CAP {
             state.quality_history.remove(0);
@@ -2034,7 +2034,7 @@ impl<'a> RemlState<'a> {
             .par_for_each(|o, &d, &h, &c, &xy| *o = d * h - c * xy);
         let chunk_len = (n / (rayon::current_num_threads().saturating_mul(4).max(1)))
             .clamp(TK_BLOCK_SIZE, 2048);
-        let chunks = (n + chunk_len - 1) / chunk_len;
+        let chunks = n.div_ceil(chunk_len);
         let mut p_total = (0..chunks)
             .into_par_iter()
             .fold(
@@ -2199,8 +2199,8 @@ impl<'a> RemlState<'a> {
                     eta_total += eta_fixed;
                 }
                 let x_fixed = ext_x_fixed.get(extra_idx).and_then(|value| value.as_ref());
-                if let Some(x_fixed) = x_fixed {
-                    if x_fixed.raw_dim() != x_dense.raw_dim() {
+                if let Some(x_fixed) = x_fixed
+                    && x_fixed.raw_dim() != x_dense.raw_dim() {
                         return Err(EstimationError::InvalidInput(format!(
                             "Tierney-Kadane ext fixed design shape mismatch: expected {}x{}, got {}x{}",
                             x_dense.nrows(),
@@ -2209,7 +2209,6 @@ impl<'a> RemlState<'a> {
                             x_fixed.ncols()
                         )));
                     }
-                }
                 let mut local_gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
                 let direct = Self::tk_direct_gradient_from_cd_and_design(
                     x_dense,
@@ -3186,7 +3185,7 @@ impl<'a> RemlState<'a> {
         // Keep expensive diagnostics out of the hot path unless they can
         // be surfaced. This has zero effect on optimization math.
         (log::log_enabled!(log::Level::Info) || log::log_enabled!(log::Level::Warn))
-            && (eval_idx == 1 || eval_idx % 200 == 0)
+            && (eval_idx == 1 || eval_idx.is_multiple_of(200))
     }
 
     fn invalidate_link_dependent_state(&self) {
@@ -4794,7 +4793,7 @@ impl<'a> RemlState<'a> {
         // arithmetic.  Force exact symmetry before eigh — faer rejects
         // visibly non-symmetric input, and the two halves should match
         // up to roundoff.
-        let h_times_u = crate::faer_ndarray::fast_ab(&h_total, &u_s);
+        let h_times_u = crate::faer_ndarray::fast_ab(h_total, &u_s);
         let mut h_proj = crate::faer_ndarray::fast_atb(&u_s, &h_times_u);
         enforce_symmetry(&mut h_proj);
 
@@ -5434,11 +5433,10 @@ impl<'a> RemlState<'a> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return None;
         }
-        if self.take_ift_quality_flat_override() {
-            if let Some(cur_beta) = self.warm_start_beta.read().unwrap().clone() {
+        if self.take_ift_quality_flat_override()
+            && let Some(cur_beta) = self.warm_start_beta.read().unwrap().clone() {
                 return Some((cur_beta, WarmStartPredictionSource::Flat));
             }
-        }
         // Try the IFT-based predictor first. It uses the exact first-order
         // Jacobian of β(ρ) at the cached solve and beats the tangent-line
         // predictor whenever a converged H_pen is available — which is
@@ -5951,14 +5949,13 @@ impl<'a> RemlState<'a> {
         // Add log-barrier Hessian diagonal for monotonicity-constrained coefficients.
         // This augments the penalized Hessian before the spectral decomposition so
         // that logdet, trace, and solve operations all reflect the barrier curvature.
-        if let Some(ref lin) = pirls_result.linear_constraints_transformed {
-            if let Some(barrier_cfg) = Self::barrier_config_from_constraints(lin) {
+        if let Some(ref lin) = pirls_result.linear_constraints_transformed
+            && let Some(barrier_cfg) = Self::barrier_config_from_constraints(lin) {
                 let beta_t = pirls_result.beta_transformed.as_ref();
                 if let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut h_total, beta_t) {
                     log::warn!("Barrier Hessian diagonal skipped: {e}");
                 }
             }
-        }
 
         Ok(EvalShared {
             key,
@@ -6011,15 +6008,14 @@ impl<'a> RemlState<'a> {
         }
         // Add log-barrier Hessian diagonal for monotonicity-constrained
         // coefficients (sparse path uses original coordinates).
-        if let Some(ref lin) = self.linear_constraints {
-            if let Some(barrier_cfg) = Self::barrier_config_from_constraints(lin) {
+        if let Some(ref lin) = self.linear_constraints
+            && let Some(barrier_cfg) = Self::barrier_config_from_constraints(lin) {
                 let beta_orig = self.sparse_exact_beta_original(pirls_result.as_ref());
                 if let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut s_lambda, &beta_orig)
                 {
                     log::warn!("Sparse barrier Hessian diagonal skipped: {e}");
                 }
             }
-        }
 
         let mut workspace = PirlsWorkspace::new(self.y.len(), self.p, 0, 0);
         // Gaussian-Identity fast path: reuse the per-RemlState `XᵀWX` cache
@@ -7373,8 +7369,8 @@ impl<'a> RemlState<'a> {
                 // Eigenvalue diagnostics require dense; only pay the cost when
                 // hot diagnostics are requested and ridge was applied.
                 let pht_dense = pirls_result.penalized_hessian_transformed.to_dense();
-                if let Ok((eigs, _)) = pht_dense.eigh(Side::Lower) {
-                    if let Some(min_eig) = eigs.iter().cloned().reduce(f64::min) {
+                if let Ok((eigs, _)) = pht_dense.eigh(Side::Lower)
+                    && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min) {
                         if should_emit_h_min_eig_diag(min_eig) {
                             log::debug!(
                                 "[Diag] H min_eig={:.3e} (ridge={:.3e})",
@@ -7396,7 +7392,6 @@ impl<'a> RemlState<'a> {
                             );
                         }
                     }
-                }
             }
         }
         // Delegate to the unified evaluator for the actual formula computation.
@@ -7946,8 +7941,8 @@ impl<'a> RemlState<'a> {
     /// Build penalty coordinates from canonical penalties, with Kronecker
     /// fast-path when available and active.
     fn build_penalty_coords(&self) -> Vec<super::unified::PenaltyCoordinate> {
-        if let Some(ref kron) = self.kronecker_penalty_system {
-            if self.kronecker_factored.is_some() {
+        if let Some(ref kron) = self.kronecker_penalty_system
+            && self.kronecker_factored.is_some() {
                 let d = kron.ndim();
                 let total_dim = kron.p_total();
                 let eigenvalues: Vec<ndarray::Array1<f64>> = kron
@@ -7972,7 +7967,6 @@ impl<'a> RemlState<'a> {
                 }
                 return coords;
             }
-        }
         self.canonical_penalties
             .iter()
             .map(|cp| cp.to_penalty_coordinate())
@@ -8393,8 +8387,7 @@ impl<'a> RemlState<'a> {
             .linear_constraints
             .as_ref()
             .and_then(Self::barrier_config_from_constraints)
-        {
-            if let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut h_total_original, &beta) {
+            && let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut h_total_original, &beta) {
                 log::warn!(
                     "Original-basis barrier Hessian diagonal skipped: {e}; \
                      cost/gradient/logdet consistency may regress on infeasible \
@@ -8402,7 +8395,6 @@ impl<'a> RemlState<'a> {
                      feasibility for the barrier-aware outer objective."
                 );
             }
-        }
 
         // Match `build_dense_assembly`: under Firth bias-reduction the penalized
         // Hessian `X'WX + S − H_φ` inherits the Jeffreys-identifiable subspace,
@@ -8689,7 +8681,7 @@ impl<'a> RemlState<'a> {
             cost_result
                 .gradient
                 .as_ref()
-                .ok_or_else(|| EstimationError::GradientUnavailable {
+                .ok_or(EstimationError::GradientUnavailable {
                     context: concat!(
                         "[outer-efs-first-order-fallback] EFS needs gradient; ",
                         "switch to BFGS or compass search"
@@ -9049,7 +9041,7 @@ impl<'a> RemlState<'a> {
             store_ift_residual_energy_for_outer_theta(p, ift_residual_energy);
             let grad = result
                 .gradient
-                .ok_or_else(|| EstimationError::GradientUnavailable {
+                .ok_or(EstimationError::GradientUnavailable {
                     context: "REML sparse gradient evaluation requires gradient",
                     mode: "ValueAndGradient",
                 })?;
@@ -9069,7 +9061,7 @@ impl<'a> RemlState<'a> {
         store_ift_residual_energy_for_outer_theta(p, ift_residual_energy);
         let grad = result
             .gradient
-            .ok_or_else(|| EstimationError::GradientUnavailable {
+            .ok_or(EstimationError::GradientUnavailable {
                 context: "REML dense gradient evaluation requires gradient",
                 mode: "ValueAndGradient",
             })?;
@@ -9354,13 +9346,12 @@ impl<'a> RemlState<'a> {
                     coord.drift.operator.is_some(),
                 )));
             }
-            if let Some(b) = coord.drift.dense.as_mut() {
-                if b.nrows() == qs.nrows() && b.ncols() == qs.nrows() {
+            if let Some(b) = coord.drift.dense.as_mut()
+                && b.nrows() == qs.nrows() && b.ncols() == qs.nrows() {
                     // B_original = Qs · B_transformed · Qsᵀ
                     let tmp = qs.dot(&*b);
                     *b = tmp.dot(&qs_t);
                 }
-            }
         }
         Ok(())
     }

@@ -4009,7 +4009,7 @@ fn symmetric_matrix_cache_bytes(m: &crate::linalg::matrix::SymmetricMatrix) -> u
             // CSC sparse: f64 values + usize row indices + usize column pointers.
             let (symbolic, values) = s.parts();
             values.len() * (size_of::<f64>() + size_of::<usize>())
-                + symbolic.col_ptr().len() * size_of::<usize>()
+                + std::mem::size_of_val(symbolic.col_ptr())
         }
     }
 }

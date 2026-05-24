@@ -3,6 +3,27 @@ use super::penalty_logdet::PenaltyPseudologdet;
 use super::*;
 use crate::linalg::utils::enforce_symmetry;
 
+// Relative scale of the diagonal ridge added to the ρ-Hessian before
+// inverting it for sigma-point construction. Matches the analogous IFT
+// regularisation: tiny enough to leave well-conditioned Hessians intact,
+// large enough that a near-singular Hessian still yields a usable V_ρ.
+const AUTO_CUBATURE_HESSIAN_RIDGE_REL: f64 = 1e-8;
+// Absolute floor for the diagonal ridge (prevents zero ridge when the
+// Hessian diagonal is degenerate / all-zero).
+const AUTO_CUBATURE_HESSIAN_RIDGE_ABS: f64 = 1e-8;
+// Eigenvalues of V_ρ below this floor are treated as numerical zero and
+// dropped from the sigma-point spectrum. Set well below any meaningful
+// posterior variance scale so we don't propagate noise directions.
+const AUTO_CUBATURE_EIGENVALUE_FLOOR: f64 = 1e-12;
+// Inset from RHO_BOUND when clamping sigma points so the inner PIRLS
+// fit at a sigma point is strictly interior to the box constraint
+// (the box edge is unreachable by IRLS without barrier intervention).
+const AUTO_CUBATURE_RHO_CLAMP_INSET: f64 = 1e-8;
+// Skip cubature when the first-order rho-Hessian inverse already shows
+// negligible posterior variance on rho (max diag < this threshold) and
+// neither boundary contact nor large outer-gradient flags fired.
+const AUTO_CUBATURE_RHOVAR_TRIGGER: f64 = 0.1;
+
 impl<'a> RemlState<'a> {
     fn cached_penalty_block_structural_nullities(
         &self,
@@ -58,7 +79,7 @@ impl<'a> RemlState<'a> {
         let lambdas_slice = lambdas.as_slice().unwrap();
 
         let pld = PenaltyPseudologdet::from_components(&s_k_matrices, lambdas_slice, ridge)
-            .map_err(|e| EstimationError::LayoutError(e))?;
+            .map_err(EstimationError::LayoutError)?;
 
         let (det1, det2) = pld.rho_derivatives(&s_k_matrices, lambdas_slice);
         Ok((det1, det2))
@@ -156,8 +177,8 @@ impl<'a> RemlState<'a> {
         if n_rho == 0 {
             // No hyperparameters: the unified corrected covariance equals H^{-1}.
             // Validate the unified path using the spectral operator.
-            if let Some(ref base_cov) = base_covariance {
-                if let Ok(hop) = super::unified::DenseSpectralOperator::from_symmetric(base_cov) {
+            if let Some(base_cov) = base_covariance
+                && let Ok(hop) = super::unified::DenseSpectralOperator::from_symmetric(base_cov) {
                     let outer = Array2::<f64>::zeros((0, 0));
                     let unified_diag = super::unified::compute_corrected_covariance_diagonal(
                         &[],
@@ -184,7 +205,6 @@ impl<'a> RemlState<'a> {
                         );
                     }
                 }
-            }
             return first_order_correction;
         }
         if n_rho > AUTO_CUBATURE_MAX_RHO_DIM {
@@ -229,8 +249,8 @@ impl<'a> RemlState<'a> {
         // honor the rank deficiency: return the first-order correction (which
         // is already the correct rank-deficient inflation on the identified
         // subspace) and skip cubature entirely.
-        if let Some(rank) = first_order.active_rank {
-            if rank < n_rho {
+        if let Some(rank) = first_order.active_rank
+            && rank < n_rho {
                 log::debug!(
                     "Auto cubature skipped: first-order V_ρ is rank-deficient \
                      ({}/{}); higher-order propagation would impute spurious \
@@ -240,7 +260,6 @@ impl<'a> RemlState<'a> {
                 );
                 return first_order_correction;
             }
-        }
 
         // Build V_rho from the outer Hessian around rho_hat.
         let mut hessian_rho = if let Some(h) = first_order.hessian_rho {
@@ -255,13 +274,13 @@ impl<'a> RemlState<'a> {
             }
         };
         enforce_symmetry(&mut hessian_rho);
-        let ridge = 1e-8
+        let ridge = AUTO_CUBATURE_HESSIAN_RIDGE_REL
             * hessian_rho
                 .diag()
                 .iter()
                 .map(|&v| v.abs())
                 .fold(0.0, f64::max)
-                .max(1e-8);
+                .max(AUTO_CUBATURE_HESSIAN_RIDGE_ABS);
         for i in 0..n_rho {
             hessian_rho[[i, i]] += ridge;
         }
@@ -275,7 +294,7 @@ impl<'a> RemlState<'a> {
             .diag()
             .iter()
             .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        if !near_boundary && !highgrad && max_rhovar < 0.1 {
+        if !near_boundary && !highgrad && max_rhovar < AUTO_CUBATURE_RHOVAR_TRIGGER {
             return first_order_correction;
         }
 
@@ -289,7 +308,7 @@ impl<'a> RemlState<'a> {
             .iter()
             .copied()
             .enumerate()
-            .filter(|(_, v)| v.is_finite() && *v > 1e-12)
+            .filter(|(_, v)| v.is_finite() && *v > AUTO_CUBATURE_EIGENVALUE_FLOOR)
             .collect();
         if eig_pairs.is_empty() {
             return first_order_correction;
@@ -327,12 +346,14 @@ impl<'a> RemlState<'a> {
             let scale = radius * eigval.sqrt();
             let delta = axis.mapv(|v| v * scale);
 
+            let lo = -RHO_BOUND + AUTO_CUBATURE_RHO_CLAMP_INSET;
+            let hi = RHO_BOUND - AUTO_CUBATURE_RHO_CLAMP_INSET;
             for sign in [1.0_f64, -1.0_f64] {
                 let mut rho_point = final_rho.clone();
-                for i in 0..n_rho {
-                    rho_point[i] =
-                        (rho_point[i] + sign * delta[i]).clamp(-RHO_BOUND + 1e-8, RHO_BOUND - 1e-8);
-                }
+                rho_point
+                    .iter_mut()
+                    .zip(delta.iter())
+                    .for_each(|(r, &d)| *r = (*r + sign * d).clamp(lo, hi));
                 sigma_points.push(rho_point);
             }
         }
@@ -382,13 +403,15 @@ impl<'a> RemlState<'a> {
         let mut mean_beta = Array1::<f64>::zeros(p);
         let mut second_beta = Array2::<f64>::zeros((p, p));
         for (cov_point, beta_point) in point_results.into_iter().flatten() {
-            mean_hinv += &cov_point.mapv(|v| w * v);
-            mean_beta += &beta_point.mapv(|v| w * v);
-            let outer = beta_point
-                .view()
-                .insert_axis(ndarray::Axis(1))
-                .dot(&beta_point.view().insert_axis(ndarray::Axis(0)));
-            second_beta += &outer.mapv(|v| w * v);
+            // Use scaled_add to avoid allocating intermediate scaled arrays
+            // on every sigma-point iteration; numerically equivalent to
+            // `mean += &arr.mapv(|v| w * v)`.
+            mean_hinv.scaled_add(w, &cov_point);
+            mean_beta.scaled_add(w, &beta_point);
+            let beta_col = beta_point.view().insert_axis(ndarray::Axis(1));
+            let beta_row = beta_point.view().insert_axis(ndarray::Axis(0));
+            let outer = beta_col.dot(&beta_row);
+            second_beta.scaled_add(w, &outer);
         }
 
         let mean_outer = mean_beta

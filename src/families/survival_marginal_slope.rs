@@ -372,9 +372,9 @@ fn score_warp_component_range(runtime: &DeviationRuntime, coord: usize) -> std::
     coord * p..(coord + 1) * p
 }
 
-fn score_warp_component_beta<'a>(
+fn score_warp_component_beta(
     runtime: &DeviationRuntime,
-    beta: &'a Array1<f64>,
+    beta: &Array1<f64>,
     coord: usize,
 ) -> Result<Array1<f64>, String> {
     let range = score_warp_component_range(runtime, coord);
@@ -3733,14 +3733,13 @@ impl SurvivalMarginalSlopeFamily {
         logslope_eta: &Array1<f64>,
     ) -> Result<Vec<f64>, String> {
         let k = self.score_dim();
-        if self.logslope_surface_ranges.len() == k && k > 1 {
-            if logslope_eta.len() == self.n {
+        if self.logslope_surface_ranges.len() == k && k > 1
+            && logslope_eta.len() == self.n {
                 return Err(
                     "survival marginal-slope internal logslope vector requested scalar eta for a per-z surface layout"
                         .to_string(),
                 );
             }
-        }
         if logslope_eta.len() == self.n {
             return Ok(vec![logslope_eta[row]; k]);
         }
@@ -5358,7 +5357,7 @@ impl SurvivalMarginalSlopeFamily {
         });
         let a_init = cached_a.unwrap_or(a_closed_form);
         let mut solve_result = super::monotone_root::solve_monotone_root_detailed(
-            &eval,
+            eval,
             a_init,
             "survival intercept",
             1e-12,
@@ -5371,7 +5370,7 @@ impl SurvivalMarginalSlopeFamily {
         // exhausts; the closed-form seed always sits in the correct basin.
         if cached_a.is_some() && solve_result.is_err() {
             solve_result = super::monotone_root::solve_monotone_root_detailed(
-                &eval,
+                eval,
                 a_closed_form,
                 "survival intercept",
                 1e-12,
@@ -5457,11 +5456,10 @@ impl SurvivalMarginalSlopeFamily {
         // Cache the converged intercept for the next PIRLS iter, if a slot
         // was provided. When `slot` is None this is a no-op, preserving the
         // exact pre-warm-start behaviour.
-        if let Some((row, kind)) = slot {
-            if let Some(cache) = self.intercept_warm_starts.as_ref() {
+        if let Some((row, kind)) = slot
+            && let Some(cache) = self.intercept_warm_starts.as_ref() {
                 cache.store(row, kind, a);
             }
-        }
 
         Ok((a, abs_deriv))
     }
@@ -5532,7 +5530,7 @@ impl SurvivalMarginalSlopeFamily {
         proposed: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
         let p = current.len();
-        if p == 0 || proposed.len() == 0 {
+        if p == 0 || proposed.is_empty() {
             return Ok(proposed);
         }
         if proposed.len() != p {
@@ -5861,8 +5859,8 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(eval_coeff4_at(&obs.dc_dbb, z_obs));
         }
         if u == primary.g {
-            if let Some(h_range) = primary.h.as_ref() {
-                if v >= h_range.start && v < h_range.end {
+            if let Some(h_range) = primary.h.as_ref()
+                && v >= h_range.start && v < h_range.end {
                     let local_idx = v - h_range.start;
                     return Ok(eval_coeff4_at(
                         &scale_coeff4(
@@ -5872,9 +5870,8 @@ impl SurvivalMarginalSlopeFamily {
                         z_obs,
                     ));
                 }
-            }
-            if let Some(w_range) = primary.w.as_ref() {
-                if v >= w_range.start && v < w_range.end {
+            if let Some(w_range) = primary.w.as_ref()
+                && v >= w_range.start && v < w_range.end {
                     let local_idx = v - w_range.start;
                     let runtime = self
                         .link_dev
@@ -5885,7 +5882,6 @@ impl SurvivalMarginalSlopeFamily {
                         exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
                     return Ok(eval_coeff4_at(&scale_coeff4(dc_bw, scale), z_obs));
                 }
-            }
         }
         if v == primary.g {
             return self
@@ -5909,9 +5905,9 @@ impl SurvivalMarginalSlopeFamily {
         if u == primary.g && v == primary.g {
             return Ok(eval_coeff4_at(&obs.dc_dabb, z_obs));
         }
-        if u == primary.g {
-            if let Some(w_range) = primary.w.as_ref() {
-                if v >= w_range.start && v < w_range.end {
+        if u == primary.g
+            && let Some(w_range) = primary.w.as_ref()
+                && v >= w_range.start && v < w_range.end {
                     let local_idx = v - w_range.start;
                     let runtime = self
                         .link_dev
@@ -5922,8 +5918,6 @@ impl SurvivalMarginalSlopeFamily {
                         exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
                     return Ok(eval_coeff4_at(&scale_coeff4(dc_abw, scale), z_obs));
                 }
-            }
-        }
         if v == primary.g {
             return self.observed_fixed_chi_second_partial(primary, obs, v, u, z_obs, u_obs, a, b);
         }
@@ -8258,13 +8252,12 @@ impl SurvivalMarginalSlopeFamily {
         }
         if u == primary.g || v == primary.g {
             let other = if u == primary.g { v } else { u };
-            if let Some(h_range) = primary.h.as_ref() {
-                if other >= h_range.start && other < h_range.end {
+            if let Some(h_range) = primary.h.as_ref()
+                && other >= h_range.start && other < h_range.end {
                     return Ok(0.0);
                 }
-            }
-            if let Some(w_range) = primary.w.as_ref() {
-                if other >= w_range.start && other < w_range.end {
+            if let Some(w_range) = primary.w.as_ref()
+                && other >= w_range.start && other < w_range.end {
                     let local_idx = other - w_range.start;
                     let runtime = self
                         .link_dev
@@ -8276,7 +8269,6 @@ impl SurvivalMarginalSlopeFamily {
                     return Ok(eval_coeff4_at(&scale_coeff4(dc_abw, scale), z_obs) * a_dir
                         + eval_coeff4_at(&scale_coeff4(dc_bbw, scale), z_obs) * dir[primary.g]);
                 }
-            }
         }
         Ok(0.0)
     }
@@ -8298,8 +8290,8 @@ impl SurvivalMarginalSlopeFamily {
         }
         if u == primary.g || v == primary.g {
             let other = if u == primary.g { v } else { u };
-            if let Some(w_range) = primary.w.as_ref() {
-                if other >= w_range.start && other < w_range.end {
+            if let Some(w_range) = primary.w.as_ref()
+                && other >= w_range.start && other < w_range.end {
                     let local_idx = other - w_range.start;
                     let runtime = self
                         .link_dev
@@ -8311,7 +8303,6 @@ impl SurvivalMarginalSlopeFamily {
                     return Ok(eval_coeff4_at(&scale_coeff4(dc_aabw, scale), z_obs) * a_dir
                         + eval_coeff4_at(&scale_coeff4(dc_abbw, scale), z_obs) * dir[primary.g]);
                 }
-            }
         }
         Ok(0.0)
     }
@@ -8754,10 +8745,10 @@ impl SurvivalMarginalSlopeFamily {
                 let mut chi_u_poly = vec![PolyVec::new(); p];
                 for u in 0..p {
                     eta_u_poly[u] =
-                        poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u].to_vec());
+                        poly_add(&poly_scale(&chi_poly, a_u[u]), fixed.coeff_u[u].as_ref());
                     chi_u_poly[u] = poly_add(
                         &poly_scale(&eta_aa_poly, a_u[u]),
-                        &fixed.coeff_au[u].to_vec(),
+                        fixed.coeff_au[u].as_ref(),
                     );
                 }
 
@@ -8862,10 +8853,10 @@ impl SurvivalMarginalSlopeFamily {
                     let mut chi_u_poly = vec![PolyVec::new(); p];
                     for u in 0..p {
                         eta_u_poly[u] =
-                            poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u].to_vec());
+                            poly_add(&poly_scale(&chi_poly, a_u[u]), fixed.coeff_u[u].as_ref());
                         chi_u_poly[u] = poly_add(
                             &poly_scale(&eta_aa_poly, a_u[u]),
-                            &fixed.coeff_au[u].to_vec(),
+                            fixed.coeff_au[u].as_ref(),
                         );
                     }
                     let mut coeff_dir_poly = vec![0.0; 4];
@@ -8899,10 +8890,10 @@ impl SurvivalMarginalSlopeFamily {
                                         &poly_scale(&chi_poly, a_uv[[u, v]]),
                                         &poly_scale(&eta_aa_poly, a_u[u] * a_u[v]),
                                     ),
-                                    &poly_scale(&fixed.coeff_au[u].to_vec(), a_u[v]),
+                                    &poly_scale(fixed.coeff_au[u].as_ref(), a_u[v]),
                                 ),
                                 &poly_add(
-                                    &poly_scale(&fixed.coeff_au[v].to_vec(), a_u[u]),
+                                    &poly_scale(fixed.coeff_au[v].as_ref(), a_u[u]),
                                     &r_uv_fixed,
                                 ),
                             );
@@ -8914,9 +8905,9 @@ impl SurvivalMarginalSlopeFamily {
                                     &poly_scale(&eta_aaa_poly, a_u[u] * a_u[v]),
                                 ),
                                 &poly_add(
-                                    &poly_scale(&fixed.coeff_aau[u].to_vec(), a_u[v]),
+                                    &poly_scale(fixed.coeff_aau[u].as_ref(), a_u[v]),
                                     &poly_add(
-                                        &poly_scale(&fixed.coeff_aau[v].to_vec(), a_u[u]),
+                                        &poly_scale(fixed.coeff_aau[v].as_ref(), a_u[u]),
                                         &if u == primary.g {
                                             fixed.coeff_abu[v].to_vec()
                                         } else if v == primary.g {
@@ -9019,8 +9010,8 @@ impl SurvivalMarginalSlopeFamily {
                                 ),
                                 &poly_add(
                                     &poly_add(
-                                        &poly_scale(&fixed.coeff_au[u].to_vec(), a_u_dir[v]),
-                                        &poly_scale(&fixed.coeff_au[v].to_vec(), a_u_dir[u]),
+                                        &poly_scale(fixed.coeff_au[u].as_ref(), a_u_dir[v]),
+                                        &poly_scale(fixed.coeff_au[v].as_ref(), a_u_dir[u]),
                                     ),
                                     &{
                                         let mut fp = vec![0.0; 4];
@@ -9062,8 +9053,8 @@ impl SurvivalMarginalSlopeFamily {
                                     ),
                                 ),
                                 &poly_add(
-                                    &poly_scale(&fixed.coeff_aau[u].to_vec(), a_u_dir[v]),
-                                    &poly_scale(&fixed.coeff_aau[v].to_vec(), a_u_dir[u]),
+                                    &poly_scale(fixed.coeff_aau[u].as_ref(), a_u_dir[v]),
+                                    &poly_scale(fixed.coeff_aau[v].as_ref(), a_u_dir[u]),
                                 ),
                             );
                             let t2_dir = poly_scale(
@@ -16697,8 +16688,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             let current = &block_states[0].beta;
             return self.project_time_qd1_feasible(current, proposed);
         }
-        if self.score_warp.is_some() && block_idx == 3 {
-            if let Some(runtime) = &self.score_warp {
+        if self.score_warp.is_some() && block_idx == 3
+            && let Some(runtime) = &self.score_warp {
                 let current = &block_states[3].beta;
                 if current.len() != beta.len() {
                     return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
@@ -16737,10 +16728,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                 }
                 return Ok(projected);
             }
-        }
         let link_block_idx = if self.score_warp.is_some() { 4 } else { 3 };
-        if self.link_dev.is_some() && block_idx == link_block_idx {
-            if let Some(runtime) = &self.link_dev {
+        if self.link_dev.is_some() && block_idx == link_block_idx
+            && let Some(runtime) = &self.link_dev {
                 let current = block_states
                     .get(link_block_idx)
                     .map(|state| &state.beta)
@@ -16757,7 +16747,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                 }
                 return project_monotone_feasible_beta(runtime, current, &beta, "link_dev");
             }
-        }
         Ok(beta)
     }
 }
@@ -17633,10 +17622,10 @@ pub fn fit_survival_marginal_slope_terms(
     let extra_rho0 = {
         let mut out = Vec::new();
         if let Some(ref prepared) = score_warp_prepared {
-            out.extend(std::iter::repeat(0.0).take(prepared.block.penalties.len()));
+            out.extend(std::iter::repeat_n(0.0, prepared.block.penalties.len()));
         }
         if let Some(ref prepared) = link_dev_prepared {
-            out.extend(std::iter::repeat(0.0).take(prepared.block.penalties.len()));
+            out.extend(std::iter::repeat_n(0.0, prepared.block.penalties.len()));
         }
         out
     };
@@ -17915,11 +17904,10 @@ pub fn fit_survival_marginal_slope_terms(
                     if let Some(beta) = block_beta.get(2) {
                         hints_mut.logslope_beta = Some(beta.clone());
                     }
-                    if score_warp_prepared.is_some() {
-                        if let Some(beta) = block_beta.get(3) {
+                    if score_warp_prepared.is_some()
+                        && let Some(beta) = block_beta.get(3) {
                             hints_mut.score_warp_beta = Some(beta.clone());
                         }
-                    }
                     if link_dev_prepared.is_some() {
                         let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
                         if let Some(beta) = block_beta.get(link_idx) {
@@ -18108,7 +18096,7 @@ pub fn fit_survival_marginal_slope_terms(
             let family = make_family(&designs[0], &designs[1], sigma);
             let fit = inner_fit(&family, &blocks, options)?;
             let mut hints_mut = hints.borrow_mut();
-            if let Some(block) = fit.block_states.get(0) {
+            if let Some(block) = fit.block_states.first() {
                 hints_mut.time_beta = Some(block.beta.clone());
             }
             if let Some(block) = fit.block_states.get(1) {
@@ -18117,11 +18105,10 @@ pub fn fit_survival_marginal_slope_terms(
             if let Some(block) = fit.block_states.get(2) {
                 hints_mut.logslope_beta = Some(block.beta.clone());
             }
-            if score_warp_prepared.is_some() {
-                if let Some(block) = fit.block_states.get(3) {
+            if score_warp_prepared.is_some()
+                && let Some(block) = fit.block_states.get(3) {
                     hints_mut.score_warp_beta = Some(block.beta.clone());
                 }
-            }
             if link_dev_prepared.is_some() {
                 let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
                 if let Some(block) = fit.block_states.get(link_idx) {

@@ -547,11 +547,10 @@ impl Manifold for Sphere {
     fn warn_at_typed(&self, p: ArrayView1<f64>) -> Option<ManifoldWarning> {
         // Advisory only: if the last coordinate is very small the canonical
         // chart near the equator/pole is ill-conditioned.
-        if let Some(last) = p.iter().last() {
-            if last.abs() < SPHERE_POLE_WARN_THRESHOLD {
+        if let Some(last) = p.iter().last()
+            && last.abs() < SPHERE_POLE_WARN_THRESHOLD {
                 return Some(ManifoldWarning::SphereNearPole);
             }
-        }
         None
     }
     fn name(&self) -> &str {

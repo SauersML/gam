@@ -157,9 +157,7 @@ pub fn try_dispatch(
     if eta.is_empty() {
         return None;
     }
-    if crate::gpu::runtime::GpuRuntime::global().is_none() {
-        return None;
-    }
+    crate::gpu::runtime::GpuRuntime::global()?;
     Some(cuda_irls_link(eta, link, derivative_order))
 }
 
@@ -254,7 +252,7 @@ extern "C" __global__ void irls_link_kernel(
     let mut dout = stream.alloc_zeros::<f64>(n * cols).map_err(map_drv)?;
 
     let threads: u32 = 256;
-    let blocks = ((n as u32) + threads - 1) / threads;
+    let blocks = (n as u32).div_ceil(threads);
     let cfg = LaunchConfig {
         grid_dim: (blocks, 1, 1),
         block_dim: (threads, 1, 1),

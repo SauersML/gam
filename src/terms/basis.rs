@@ -1237,15 +1237,14 @@ pub fn create_difference_penalty_matrix(
         });
     }
 
-    if let Some(g) = greville_abscissae {
-        if g.len() != num_basis_functions {
+    if let Some(g) = greville_abscissae
+        && g.len() != num_basis_functions {
             return Err(BasisError::DimensionMismatch(format!(
                 "Greville abscissae length {} does not match num_basis_functions {}",
                 g.len(),
                 num_basis_functions
             )));
         }
-    }
 
     // Start with the identity matrix
     let mut d = Array2::<f64>::eye(num_basis_functions);
@@ -1590,8 +1589,10 @@ struct DuchonBasisDesign {
 
 /// Boundary-condition policy for one-dimensional smooth bases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum OneDimensionalBoundary {
     /// Ordinary open interval basis with clamped endpoint behavior.
+    #[default]
     Open,
     /// Periodic/cyclic basis over the half-open interval `[start, end)`.
     ///
@@ -1600,11 +1601,6 @@ pub enum OneDimensionalBoundary {
     Cyclic { start: f64, end: f64 },
 }
 
-impl Default for OneDimensionalBoundary {
-    fn default() -> Self {
-        Self::Open
-    }
-}
 
 impl OneDimensionalBoundary {
     fn period(&self) -> Option<(f64, f64, f64)> {
@@ -1668,8 +1664,10 @@ pub struct BSplineBasisSpec {
 
 /// Per-endpoint boundary constraint policy for B-spline 1D bases.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum BSplineEndpointBoundaryCondition {
     /// No endpoint constraint.
+    #[default]
     Free,
     /// Pin the first derivative to zero at this endpoint.
     Clamped,
@@ -1678,11 +1676,6 @@ pub enum BSplineEndpointBoundaryCondition {
     Anchored { value: f64 },
 }
 
-impl Default for BSplineEndpointBoundaryCondition {
-    fn default() -> Self {
-        Self::Free
-    }
-}
 
 /// Left/right pair of B-spline endpoint constraints.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
@@ -3433,15 +3426,14 @@ impl StreamingMaternEvaluator {
             }
             None => vec![1.0; data.ncols()],
         };
-        if let Some(z) = ident_transform.as_ref() {
-            if z.nrows() != centers.nrows() {
+        if let Some(z) = ident_transform.as_ref()
+            && z.nrows() != centers.nrows() {
                 return Err(format!(
                     "StreamingMaternEvaluator: identifiability transform rows {} != centers {}",
                     z.nrows(),
                     centers.nrows()
                 ));
             }
-        }
         let kernel_cols = ident_transform
             .as_ref()
             .map_or(centers.nrows(), |z| z.ncols());
@@ -3663,15 +3655,14 @@ impl StreamingSphereEvaluator {
                 "StreamingSphereEvaluator: penalty_order must be one of 1, 2, 3, 4; got {penalty_order}"
             ));
         }
-        if let Some(z) = constraint_transform.as_ref() {
-            if z.nrows() != centers.nrows() {
+        if let Some(z) = constraint_transform.as_ref()
+            && z.nrows() != centers.nrows() {
                 return Err(format!(
                     "StreamingSphereEvaluator: constraint transform rows {} != centers {}",
                     z.nrows(),
                     centers.nrows()
                 ));
             }
-        }
         let deg = if radians {
             1.0
         } else {
@@ -3935,15 +3926,14 @@ impl StreamingBSplineEvaluator {
         chunk_size: Option<usize>,
     ) -> Result<Self, String> {
         let raw_cols = bspline_raw_column_count(knots.as_ref(), degree, periodic)?;
-        if let Some(z) = transform.as_ref() {
-            if z.nrows() != raw_cols {
+        if let Some(z) = transform.as_ref()
+            && z.nrows() != raw_cols {
                 return Err(format!(
                     "StreamingBSplineEvaluator: transform rows {} != raw basis columns {}",
                     z.nrows(),
                     raw_cols
                 ));
             }
-        }
         Ok(Self {
             data: Arc::new(data.as_standard_layout().to_owned()),
             knots: Arc::new(knots.as_standard_layout().to_owned()),
@@ -4633,15 +4623,14 @@ impl LatentCoordDesignDerivative {
                 latent.latent_dim()
             )));
         }
-        if let Some(z) = ident_transform.as_ref() {
-            if z.nrows() != jet.shape()[1] {
+        if let Some(z) = ident_transform.as_ref()
+            && z.nrows() != jet.shape()[1] {
                 return Err(BasisError::DimensionMismatch(format!(
                     "LatentCoordDesignDerivative identifiability transform has {} rows but derivative jet has {} basis columns",
                     z.nrows(),
                     jet.shape()[1]
                 )));
             }
-        }
         Ok(Self {
             latent,
             basis: LatentCoordDesignDerivativeBasis::Jet {
@@ -5255,7 +5244,7 @@ impl ImplicitDesignPsiDerivative {
 
         if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
             // Parallel path: chunk data points and reduce.
-            let n_chunks = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
+            let n_chunks = n.div_ceil(IMPLICIT_MATVEC_CHUNK_SIZE);
             let partial_sums: Vec<Array1<f64>> = (0..n_chunks)
                 .into_par_iter()
                 .map(|chunk_idx| {
@@ -5310,7 +5299,7 @@ impl ImplicitDesignPsiDerivative {
         let (n, k, dim) = (self.n, self.n_knots, self.n_axes);
         if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
             let err_flag = std::sync::atomic::AtomicBool::new(false);
-            let nc = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
+            let nc = n.div_ceil(IMPLICIT_MATVEC_CHUNK_SIZE);
             let ps: Vec<Array1<f64>> = (0..nc)
                 .into_par_iter()
                 .map(|ci| {
@@ -5380,7 +5369,7 @@ impl ImplicitDesignPsiDerivative {
         let (n, k, dim) = (self.n, self.n_knots, self.n_axes);
         if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
             let err_flag = std::sync::atomic::AtomicBool::new(false);
-            let nc = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
+            let nc = n.div_ceil(IMPLICIT_MATVEC_CHUNK_SIZE);
             let cr: Vec<(usize, Vec<f64>)> = (0..nc)
                 .into_par_iter()
                 .map(|ci| {
@@ -5445,7 +5434,7 @@ impl ImplicitDesignPsiDerivative {
         let (n, k, dim) = (self.n, self.n_knots, self.n_axes);
         let mut raw = Array2::<f64>::zeros((n, k));
         let cs = IMPLICIT_MATVEC_CHUNK_SIZE;
-        let nc = (n + cs - 1) / cs;
+        let nc = n.div_ceil(cs);
         let err_flag = std::sync::atomic::AtomicBool::new(false);
         {
             let rp = SendPtr(raw.as_mut_ptr());
@@ -5651,7 +5640,7 @@ impl ImplicitDesignPsiDerivative {
             let c = self.psi_scale_share;
             if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
                 let mut result = Array1::<f64>::zeros(n);
-                let n_chunks = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
+                let n_chunks = n.div_ceil(IMPLICIT_MATVEC_CHUNK_SIZE);
                 let chunk_results: Vec<(usize, Vec<f64>)> = (0..n_chunks)
                     .into_par_iter()
                     .map(|chunk_idx| {
@@ -5718,7 +5707,7 @@ impl ImplicitDesignPsiDerivative {
         if n >= IMPLICIT_MATVEC_PAR_THRESHOLD {
             let mut result = Array1::<f64>::zeros(n);
             // Parallel over chunks of data points.
-            let n_chunks = (n + IMPLICIT_MATVEC_CHUNK_SIZE - 1) / IMPLICIT_MATVEC_CHUNK_SIZE;
+            let n_chunks = n.div_ceil(IMPLICIT_MATVEC_CHUNK_SIZE);
             let chunk_results: Vec<(usize, Vec<f64>)> = (0..n_chunks)
                 .into_par_iter()
                 .map(|chunk_idx| {
@@ -7618,11 +7607,10 @@ pub fn build_bspline_basis_1d(
     data: ArrayView1<'_, f64>,
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
-    if let OneDimensionalBoundary::Cyclic { start, end } = spec.boundary {
-        if end <= start {
+    if let OneDimensionalBoundary::Cyclic { start, end } = spec.boundary
+        && end <= start {
             return Err(BasisError::InvalidRange(start, end));
         }
-    }
 
     let periodic_build = match &spec.knotspec {
         BSplineKnotSpec::PeriodicUniform {
@@ -7744,7 +7732,7 @@ pub fn build_bspline_basis_1d(
                     )?;
                 let transformed_candidates = penalty_mats
                     .into_iter()
-                    .zip(penalties_raw.into_iter())
+                    .zip(penalties_raw)
                     .map(|(matrix, candidate)| PenaltyCandidate {
                         nullspace_dim_hint: candidate.nullspace_dim_hint,
                         matrix,
@@ -8595,7 +8583,7 @@ fn build_streaming_bspline_design_and_candidates(
 
     let transformed_candidates = penalty_mats
         .into_iter()
-        .zip(penalties_raw.into_iter())
+        .zip(penalties_raw)
         .map(|(matrix, candidate)| PenaltyCandidate {
             nullspace_dim_hint: candidate.nullspace_dim_hint,
             matrix,
@@ -8664,8 +8652,8 @@ fn apply_bspline_identifiability_policy(
         penalties
             .into_iter()
             .map(|s| {
-                let zt_s = fast_atb(&z, &s);
-                fast_ab(&zt_s, &z)
+                let zt_s = fast_atb(z, &s);
+                fast_ab(&zt_s, z)
             })
             .collect()
     } else {
@@ -9176,7 +9164,7 @@ pub fn build_thin_plate_basiswithworkspace(
         let poly_block = thin_plate_polynomial_block(data);
         let d = data.ncols();
         let length_scale_sq = spec.length_scale * spec.length_scale;
-        let shared_data = shared_owned_data_matrix(data, &mut workspace.cache);
+        let shared_data = shared_owned_data_matrix(data, &workspace.cache);
         let kernel_fn = move |data_row: &[f64], center_row: &[f64]| -> f64 {
             let mut dist2 = 0.0;
             for axis in 0..d {
@@ -10814,9 +10802,9 @@ impl DuchonCrossPenaltyContext {
         }
 
         let value_share =
-            duchon_scaling_exponent(self.p_order, self.s_order as usize, d) / d as f64;
+            duchon_scaling_exponent(self.p_order, self.s_order, d) / d as f64;
         let operator_share =
-            duchon_operator_scaling_exponent(self.p_order, self.s_order as usize, d) / d as f64;
+            duchon_operator_scaling_exponent(self.p_order, self.s_order, d) / d as f64;
 
         let mut d0_cross_proj = self.project_operator(&d0_raw_eta_cross, p);
         if value_share != 0.0 {
@@ -10953,7 +10941,7 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         duchon_max_active_operator_derivative_order(operator_penalties),
     )?;
     let coeffs = length_scale.map(|scale| {
-        duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / scale.max(1e-300))
+        duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300))
     });
     let pure_block_order = pure_duchon_block_order(p_order, s_order as f64) as usize;
 
@@ -11502,8 +11490,8 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         op1_s_first_raw: op1_info.s_first_raw,
         op2_s_first_raw: op2_info.s_first_raw,
         op0_cf_cross_raw: None, // q=0 mass always stays on collocation.
-        op1_cf_cross_raw: op1_cf_cross_raw,
-        op2_cf_cross_raw: op2_cf_cross_raw,
+        op1_cf_cross_raw,
+        op2_cf_cross_raw,
     };
     let cross_ctx = std::sync::Arc::new(cross_ctx);
     let cross_provider = AnisoPenaltyCrossProvider::new(move |a: usize, b: usize| {
@@ -11542,7 +11530,7 @@ fn duchon_kernel_radial_triplet(
             // `usize` here was the bug — for `s=1.5, p=2, d=4` it
             // collapsed `m=3.5` to `m=3` and tripped the integer-only
             // log-case branch at `m=d/2`, producing NaN at `r=0`.
-            let m = pure_duchon_block_order(p_order, s_order as f64);
+            let m = pure_duchon_block_order(p_order, s_order);
             polyharmonic_kernel_triplet(r, m, k_dim)?
         }
         Some(length_scale) => {
@@ -11966,7 +11954,7 @@ pub fn closed_form_thin_plate_pair_block(
     // for the standard TPS choice m = d/2 + 1 in even d. In either case the
     // closed-form Lebesgue Gram is not PSD-by-construction; caller must use
     // `D_q^T D_q` collocation instead.
-    let log_riesz_present = d % 2 == 0 && d / 2 <= 2 * m;
+    let log_riesz_present = d.is_multiple_of(2) && d / 2 <= 2 * m;
     let four_m = 4 * m;
     let dp2q = d + 2 * q;
     let convergent = four_m > dp2q && dp2q > four_m && 2 * m >= q + 1 && !log_riesz_present;
@@ -12071,7 +12059,7 @@ pub fn closed_form_matern_pair_block(
     let mut binom_coeffs: Vec<f64> = Vec::with_capacity(q + 1);
     for j in 0..=q {
         let cqj = crate::probability::binomial_coefficient_f64(q, j);
-        let sign_pow = if (q - j) % 2 == 0 { 1.0 } else { -1.0 };
+        let sign_pow = if (q - j).is_multiple_of(2) { 1.0 } else { -1.0 };
         let coeff = cqj * sign_pow * kappa_sq.powi((q - j) as i32);
         binom_coeffs.push(coeff);
     }
@@ -12550,7 +12538,7 @@ fn duchon_pure_closed_form_pair_block_cpd_adequate(
     }
     const LOG_EPS: f64 = 1e-12;
     let n_f = (beta / 2.0).round();
-    let is_log_case = dimension % 2 == 0 && n_f >= 0.0 && (n_f * 2.0 - beta).abs() < LOG_EPS;
+    let is_log_case = dimension.is_multiple_of(2) && n_f >= 0.0 && (n_f * 2.0 - beta).abs() < LOG_EPS;
     let cpd_required = if is_log_case {
         // Log case: kernel `c · r^{2n}(ln r + A_n)` is CPD of order n + 1
         // (Wendland Thm 8.18).
@@ -13516,18 +13504,17 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
     validate_duchon_collocation_orders(
         length_scale,
         p_order,
-        s_order as f64,
+        s_order,
         dim,
         max_operator_derivative_order,
     )?;
-    if let Some(eta) = aniso_log_scales {
-        if eta.len() != dim {
+    if let Some(eta) = aniso_log_scales
+        && eta.len() != dim {
             return Err(BasisError::DimensionMismatch(format!(
                 "Duchon anisotropy dimension mismatch: got {}, expected {dim}",
                 eta.len()
             )));
         }
-    }
     // Partial-fraction expansion only runs in the hybrid Matérn branch
     // (`length_scale = Some`). The scale-free path (`length_scale = None`)
     // skips it entirely and is fractional-clean down to the Riesz kernel.
@@ -13910,7 +13897,7 @@ impl PolyharmonicBlockCoeff {
         // integer `m` it matches the original integer modulo check exactly.
         const LOG_EPS: f64 = 1e-12;
         let two_m = 2.0 * m;
-        let is_log_case = k_dim % 2 == 0 && {
+        let is_log_case = k_dim.is_multiple_of(2) && {
             let n_f = (power / 2.0).round();
             n_f >= 0.0 && (n_f * 2.0 - power).abs() < LOG_EPS
         };
@@ -13997,7 +13984,7 @@ fn log_power_origin_limit(coeff: f64, exponent: f64, log_coeff: f64, pure_coeff:
 #[inline(always)]
 fn polyharmonic_log_sign(m: usize, k_dim: usize) -> f64 {
     assert!(
-        k_dim % 2 == 0,
+        k_dim.is_multiple_of(2),
         "polyharmonic_log_sign requires even kernel dimension: k_dim={k_dim}, m={m}"
     );
     (-1.0_f64).powi(m as i32 - (k_dim as i32 / 2) + 1)
@@ -14095,7 +14082,7 @@ fn polyharmonic_block_jet4(
     // Log case: k_dim even and `2m − k_dim` is a non-negative even integer
     // (within ε). For fractional `m` this never fires.
     const LOG_EPS: f64 = 1e-12;
-    let is_log_case = k_dim % 2 == 0 && {
+    let is_log_case = k_dim.is_multiple_of(2) && {
         let n_f = (alpha / 2.0).round();
         n_f >= 0.0 && (n_f * 2.0 - alpha).abs() < LOG_EPS
     };
@@ -14181,7 +14168,7 @@ fn duchon_polyharmonic_operator_block_jets(
     // (within ε). For fractional `m` this never fires; for integer `m` it
     // matches the original `k_dim % 2 == 0 && m >= k_dim / 2` check.
     const LOG_EPS: f64 = 1e-12;
-    let is_log_case = k_dim % 2 == 0 && {
+    let is_log_case = k_dim.is_multiple_of(2) && {
         let n_f = (alpha / 2.0).round();
         n_f >= 0.0 && (n_f * 2.0 - alpha).abs() < LOG_EPS
     };
@@ -14505,13 +14492,13 @@ pub(crate) fn duchon_partial_fraction_coeffs(
         return DuchonPartialFractionCoeffs { a, b };
     }
     for m in 1..=p_order {
-        let sign = if (p_order - m) % 2 == 0 { 1.0 } else { -1.0 };
+        let sign = if (p_order - m).is_multiple_of(2) { 1.0 } else { -1.0 };
         let expo = -2.0 * (s_order + p_order - m) as f64;
         let comb = binomial_f64(s_order + p_order - m - 1, p_order - m);
         a[m] = sign * kappa.powf(expo) * comb;
     }
     for n in 1..=s_order {
-        let sign = if p_order % 2 == 0 { 1.0 } else { -1.0 };
+        let sign = if p_order.is_multiple_of(2) { 1.0 } else { -1.0 };
         let expo = -2.0 * (p_order + s_order - n) as f64;
         let comb = if p_order == 0 && n == s_order {
             // p=0 reduces to the pure Matérn block 1/(κ²+ρ²)^s.
@@ -14556,7 +14543,7 @@ fn duchon_matern_kernel_general_from_distance(
     let coeffs_ref = if let Some(c) = coeffs {
         c
     } else {
-        coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa);
+        coeffs_local = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
         &coeffs_local
     };
     let collision_taylor_radius = DUCHON_COLLISION_TAYLOR_REL * length_scale.max(1e-8);
@@ -15597,17 +15584,17 @@ fn validate_lat_lon_matrix(
 /// Direct power series with early exit. For `z ∈ [0, 0.5]` ~50 terms
 /// reach 1e-15; for `z ∈ (0.5, 1)` we raise the cap to 5000, which gives
 /// > 13 digits even at `z = 0.999`. The standard Landen identity
-///   `Li_3(z) + Li_3(1−z) + Li_3(z/(z−1)) = ζ(3) + ...`
-/// is *not* useful in `(0, 1)` because `z/(z−1) ∈ (−∞, 0)` lies outside
-/// the radius of convergence for the direct series at `Li_3(z/(z−1))`.
-/// A previous attempt at a Landen-shifted identity (using `−(1−z)/z`
-/// instead of `z/(z−1)`) was numerically incorrect — direct verification
-/// against high-term direct series showed errors of order 1 at
-/// `z = 0.7..0.9`. The plain direct-series approach below has been
-/// validated against tabulated `Li_3(1/2) = 7ζ(3)/8 − π²/12·ln 2 +
+/// > `Li_3(z) + Li_3(1−z) + Li_3(z/(z−1)) = ζ(3) + ...`
+/// > is *not* useful in `(0, 1)` because `z/(z−1) ∈ (−∞, 0)` lies outside
+/// > the radius of convergence for the direct series at `Li_3(z/(z−1))`.
+/// > A previous attempt at a Landen-shifted identity (using `−(1−z)/z`
+/// > instead of `z/(z−1)`) was numerically incorrect — direct verification
+/// > against high-term direct series showed errors of order 1 at
+/// > `z = 0.7..0.9`. The plain direct-series approach below has been
+/// > validated against tabulated `Li_3(1/2) = 7ζ(3)/8 − π²/12·ln 2 +
 /// ln³ 2 / 6 ≈ 0.5372131936` to 15 digits, and against scipy's
-/// `spence`-based Li₃ on a sweep of `z ∈ {0.1, ..., 0.99}` to ≤ 1e-13.
-/// Dilogarithm `Li_2(z) = Σ_{k≥1} z^k / k²` for `z ∈ [0, 1]`.
+/// > `spence`-based Li₃ on a sweep of `z ∈ {0.1, ..., 0.99}` to ≤ 1e-13.
+/// > Dilogarithm `Li_2(z) = Σ_{k≥1} z^k / k²` for `z ∈ [0, 1]`.
 #[inline]
 fn dilog_unit(z: f64) -> f64 {
     if !z.is_finite() {
@@ -16547,7 +16534,7 @@ pub fn build_matern_basiswithworkspace(
             design_cols,
             chunk,
         );
-        let shared_data = shared_owned_data_matrix(data, &mut workspace.cache);
+        let shared_data = shared_owned_data_matrix(data, &workspace.cache);
         let op = StreamingMaternEvaluator::new(
             shared_data,
             Arc::new(centers.clone()),
@@ -16601,7 +16588,7 @@ pub fn build_matern_basiswithworkspace(
             design_cols,
             dense_bytes as f64 / (1024.0 * 1024.0),
         );
-        let shared_data = shared_owned_data_matrix(data, &mut workspace.cache);
+        let shared_data = shared_owned_data_matrix(data, &workspace.cache);
         let d = data.ncols();
         let length_scale = spec.length_scale;
         let nu = spec.nu;
@@ -17834,7 +17821,7 @@ fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
     let s_order = spec.power_as_usize();
     validate_duchon_kernel_orders(Some(length_scale), p_order, s_order as f64, 1)?;
     let coeffs =
-        duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale.max(1e-300));
+        duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale.max(1e-300));
     let z_kernel = kernel_constraint_nullspace(
         centers.view(),
         effective_nullspace_order,
@@ -18478,7 +18465,7 @@ fn build_duchon_design_psi_aniso_derivatives(
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power_as_usize();
     let kappa = 1.0 / length_scale.max(1e-300);
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa);
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
 
     // Z_kernel: null-space constraint projection for Duchon polynomial conditions.
     let z_kernel =
@@ -19400,7 +19387,7 @@ fn duchon_matern_block_taylor_r2j(
     let c = kappa.powf(k_half - n)
         / ((2.0 * std::f64::consts::PI).powf(k_half) * 2.0_f64.powf(n - 1.0) * gamma_lanczos(n));
 
-    if k_dim % 2 == 0 {
+    if k_dim.is_multiple_of(2) {
         // Integer ν.
         let nu_int = n_order as i64 - (k_dim as i64) / 2;
         duchon_matern_block_taylor_r2j_integer_nu(kappa, c, nu_int, j)
@@ -19451,16 +19438,16 @@ fn duchon_matern_block_taylor_r2j_triplet(
     let mut log_part = (0.0, 0.0, 0.0);
     let log_kappa_half = (0.5 * kappa).ln();
 
-    if k_dim % 2 == 0 {
+    if k_dim.is_multiple_of(2) {
         let nu_int = n_order as i64 - (k_dim as i64) / 2;
         let mu = nu_int.unsigned_abs() as usize;
-        let sign_mu = if mu % 2 == 0 { 1.0 } else { -1.0 };
+        let sign_mu = if mu.is_multiple_of(2) { 1.0 } else { -1.0 };
 
         if nu_int >= 0 {
             let nu_usize = nu_int as usize;
 
             if j < nu_usize {
-                let sign = if j % 2 == 0 { 1.0 } else { -1.0 };
+                let sign = if j.is_multiple_of(2) { 1.0 } else { -1.0 };
                 let power = 2 * j as i32 - nu_usize as i32;
                 let coeff = 0.5 * sign * gamma_lanczos((nu_usize - j) as f64)
                     / gamma_lanczos((j + 1) as f64)
@@ -19528,7 +19515,7 @@ fn duchon_matern_block_taylor_r2j_triplet(
                 continue;
             }
             let q = q_needed as usize;
-            let sign = if q % 2 == 0 { 1.0 } else { -1.0 };
+            let sign = if q.is_multiple_of(2) { 1.0 } else { -1.0 };
             let exponent = c_exp + prefactor_exp - i as f64 + q as f64;
             let value = c_const * prefactor_const * c_i * 2.0_f64.powi(-(i as i32)) * sign
                 / gamma_lanczos((q + 1) as f64)
@@ -19574,7 +19561,7 @@ fn duchon_matern_block_taylor_r2j_integer_nu(
         // Source 1: singular sum at k = j.
         if j < nu {
             // (1/2) · (−1)^j · (ν−j−1)!/j! · (κ/2)^{2j−ν}
-            let sign = if j % 2 == 0 { 1.0 } else { -1.0 };
+            let sign = if j.is_multiple_of(2) { 1.0 } else { -1.0 };
             let coeff = sign * gamma_lanczos((nu - j) as f64) / gamma_lanczos((j + 1) as f64)
                 * kappa_half.powi(2 * j as i32 - nu as i32)
                 * 0.5;
@@ -19587,7 +19574,7 @@ fn duchon_matern_block_taylor_r2j_integer_nu(
             let inv_fac =
                 1.0 / (gamma_lanczos((k + 1) as f64) * gamma_lanczos((nu + k + 1) as f64));
             let kp = kappa_half.powi(2 * k as i32 + nu as i32);
-            let sign_mu = if mu % 2 == 0 { 1.0 } else { -1.0 }; // (−1)^μ
+            let sign_mu = if mu.is_multiple_of(2) { 1.0 } else { -1.0 }; // (−1)^μ
 
             // Log coefficient: (−1)^{μ+1} · (κ/2)^{ν+2k} / (k!(ν+k)!)
             log_part += -sign_mu * kp * inv_fac;
@@ -19609,7 +19596,7 @@ fn duchon_matern_block_taylor_r2j_integer_nu(
         let k = j;
         let inv_fac = 1.0 / (gamma_lanczos((k + 1) as f64) * gamma_lanczos((mu + k + 1) as f64));
         let kp = kappa_half.powi(mu as i32 + 2 * k as i32);
-        let sign_mu = if mu % 2 == 0 { 1.0 } else { -1.0 };
+        let sign_mu = if mu.is_multiple_of(2) { 1.0 } else { -1.0 };
 
         // Log coefficient: (−1)^{μ+1} · (κ/2)^{μ+2k} / (k!(μ+k)!)
         let log_part = -sign_mu * kp * inv_fac;
@@ -19699,7 +19686,7 @@ fn duchon_polyharmonic_block_taylor_r2j(m: usize, k_dim: usize, j: usize) -> (f6
     }
 
     // α = 2j: compute the normalization constant.
-    if k_dim % 2 == 0 && m >= k_dim / 2 {
+    if k_dim.is_multiple_of(2) && m >= k_dim / 2 {
         // Log case: Φ_m = c · r^α · ln(r).
         let c = polyharmonic_log_sign(m, k_dim)
             / (2.0_f64.powi((2 * m - 1) as i32)
@@ -19962,7 +19949,7 @@ fn build_duchon_design_psi_derivativeswithworkspace(
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power_as_usize();
     let kappa = 1.0 / length_scale;
-    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa);
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
     let z_kernel =
         kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
     let poly_cols = polynomial_block_from_order(data, effective_nullspace_order).ncols();
@@ -20145,15 +20132,11 @@ pub fn create_duchon_spline_basiswithworkspace(
     let s_order = duchon_power_to_usize(power);
     let d = centers.ncols();
     let k = centers.nrows();
-    let coeffs = if let Some(ls) = length_scale {
-        Some(duchon_partial_fraction_coeffs(
+    let coeffs = length_scale.map(|ls| duchon_partial_fraction_coeffs(
             p_order,
             s_order,
             1.0 / ls.max(1e-300),
-        ))
-    } else {
-        None
-    };
+        ));
     let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
     let pure_poly_coeff = if length_scale.is_none() {
         Some(PolyharmonicBlockCoeff::new(
@@ -20319,17 +20302,11 @@ fn build_duchon_basis_designwithworkspace(
     // and yields free-parameter penalty gamma^T (Z^T K_CC Z) gamma.
     let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
 
-    let coeffs = if let Some(ls) = length_scale {
-        // Hybrid Matérn partial-fraction expansion needs integer s; assert
-        // at this boundary so the scale-free path stays fractional-clean.
-        Some(duchon_partial_fraction_coeffs(
+    let coeffs = length_scale.map(|ls| duchon_partial_fraction_coeffs(
             p_order,
             duchon_power_to_usize(s_order),
             1.0 / ls.max(1e-300),
-        ))
-    } else {
-        None
-    };
+        ));
 
     // Practical safe operating range (document Eq. D.2):
     //   κ in [1e-2 / r_max, 1e2 / r_min]
@@ -20369,7 +20346,7 @@ fn build_duchon_basis_designwithworkspace(
     // This avoids 2 gamma_lanczos calls per kernel evaluation (n × k total).
     let pure_poly_coeff = if length_scale.is_none() {
         Some(PolyharmonicBlockCoeff::new(
-            (pure_duchon_block_order(p_order, s_order as f64)) as f64,
+            (pure_duchon_block_order(p_order, s_order)) as f64,
             d,
         ))
     } else {
@@ -21606,7 +21583,7 @@ fn build_periodic_duchon_basis_1d(
     let mut basis = Array2::<f64>::zeros((data.nrows(), kernel_cols + 1));
     let coeffs = spec
         .length_scale
-        .map(|ls| duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / ls.max(1e-300)));
+        .map(|ls| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls.max(1e-300)));
     let pure_poly_coeff = if spec.length_scale.is_none() {
         Some(PolyharmonicBlockCoeff::new(
             (pure_duchon_block_order(p_order, s_order as f64)) as f64,
@@ -22148,7 +22125,7 @@ pub fn build_duchon_basiswithworkspace(
             dense_bytes as f64 / (1024.0 * 1024.0),
         );
         let d = data.ncols();
-        let shared_data = shared_owned_data_matrix(data, &mut workspace.cache);
+        let shared_data = shared_owned_data_matrix(data, &workspace.cache);
         let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
         let s_order: f64 = spec.power;
         let length_scale = spec.length_scale;
@@ -24783,7 +24760,7 @@ pub fn create_ispline_derivative_dense(
         .ok_or_else(|| BasisError::InvalidInput("I-spline degree overflow".to_string()))?;
     if derivative_order > bs_degree {
         // Derivative order exceeds basis degree — result is identically zero.
-        let num_bspline_basis = knot_vector.len().checked_sub(bs_degree + 1).unwrap_or(0);
+        let num_bspline_basis = knot_vector.len().saturating_sub(bs_degree + 1);
         let num_ispline_basis = num_bspline_basis.saturating_sub(1);
         return Ok(Array2::zeros((data.len(), num_ispline_basis)));
     }
@@ -25871,7 +25848,7 @@ pub mod closed_form_penalty {
 
         // Logarithmic part
         let i_m = bessel_i_series(m as f64, x);
-        let sign_log = if m % 2 == 0 { -1.0 } else { 1.0 };
+        let sign_log = if m.is_multiple_of(2) { -1.0 } else { 1.0 };
         let log_part = sign_log * half_x.ln() * i_m;
 
         // Series with digamma sums
@@ -25892,7 +25869,7 @@ pub mod closed_form_penalty {
                 break;
             }
         }
-        let sign_m = if m % 2 == 0 { 1.0 } else { -1.0 };
+        let sign_m = if m.is_multiple_of(2) { 1.0 } else { -1.0 };
         let series_part = sign_m * 0.5 * half_x.powi(m as i32) * series_sum;
 
         finite + log_part + series_part
@@ -25953,7 +25930,7 @@ pub mod closed_form_penalty {
             if n_f64 >= 0.0 && (n_f64 * 2.0 - offset).abs() < LOG_EPS {
                 let n = n_f64 as usize;
                 let two_j_i = (two_j.round()) as i32;
-                let sign = if n % 2 == 0 { -1.0 } else { 1.0 }; // (−1)^{n+1}
+                let sign = if n.is_multiple_of(2) { -1.0 } else { 1.0 }; // (−1)^{n+1}
                 let denom = 2.0_f64.powi(two_j_i - 1)
                     * std::f64::consts::PI.powf(d as f64 / 2.0)
                     * gamma_fn(j)
@@ -26243,7 +26220,7 @@ pub mod closed_form_penalty {
         // A_j = (-1)^{a-j} · C(a+b-j-1, a-j) · κ^{-2(a+b-j)}, j = 1..a
         let mut sum = KahanSum::default();
         for j in 1..=a {
-            let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
+            let sign = if (a - j).is_multiple_of(2) { 1.0 } else { -1.0 };
             let binom = binomial_f64(a + b - j - 1, a - j);
             let coeff = sign * binom * kappa_sq.powi(-((a + b - j) as i32));
             let term = coeff * riesz_kernel_value(d, j as f64, r);
@@ -26251,7 +26228,7 @@ pub mod closed_form_penalty {
         }
 
         // B_ℓ = (-1)^a · C(a+b-ℓ-1, b-ℓ) · κ^{-2(a+b-ℓ)}, ℓ = 1..b
-        let sign_a = if a % 2 == 0 { 1.0 } else { -1.0 };
+        let sign_a = if a.is_multiple_of(2) { 1.0 } else { -1.0 };
         for ell in 1..=b {
             let binom = binomial_f64(a + b - ell - 1, b - ell);
             let coeff = sign_a * binom * kappa_sq.powi(-((a + b - ell) as i32));
@@ -26283,7 +26260,7 @@ pub mod closed_form_penalty {
         );
         assert!(!r.is_empty(), "anisotropic_duchon_penalty: empty input");
         assert!(q <= 2, "anisotropic_duchon_penalty: q must be in {{0,1,2}}");
-        anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa, eta, r)
+        anisotropic_duchon_penalty_radial(q, m, (s), kappa, eta, r)
     }
 
     /// Bundled value + first/second derivatives of the anisotropic pair-block
@@ -26749,7 +26726,7 @@ pub mod closed_form_penalty {
         // an integer and every successive derivative leaves `a` integer-
         // valued; we then use `r.powi` (≈5–10× faster than `powf`).
         // For odd d (half-integer ν), fall back to `powf`.
-        let a_is_integer = d % 2 == 0;
+        let a_is_integer = d.is_multiple_of(2);
         let evaluate = |terms: &Vec<(f64, f64, i32)>| -> f64 {
             let mut sum = 0.0_f64;
             if a_is_integer {
@@ -26806,12 +26783,11 @@ pub mod closed_form_penalty {
         });
         let mut out: Vec<(f64, f64, i32)> = Vec::with_capacity(terms.len());
         for (c, a, b) in terms {
-            if let Some(last) = out.last_mut() {
-                if last.2 == b && (last.1 - a).abs() < 1e-15 {
+            if let Some(last) = out.last_mut()
+                && last.2 == b && (last.1 - a).abs() < 1e-15 {
                     last.0 += c;
                     continue;
                 }
-            }
             out.push((c, a, b));
         }
         out
@@ -26845,7 +26821,7 @@ pub mod closed_form_penalty {
             let n_f = (offset / 2.0).round();
             let n = n_f as usize;
             let two_j_i = two_j.round() as i32;
-            let sign = if n % 2 == 0 { -1.0 } else { 1.0 };
+            let sign = if n.is_multiple_of(2) { -1.0 } else { 1.0 };
             let denom = 2.0_f64.powi(two_j_i - 1)
                 * std::f64::consts::PI.powf(d as f64 / 2.0)
                 * gamma_fn(j)
@@ -26996,7 +26972,7 @@ pub mod closed_form_penalty {
         let kappa_sq = kappa * kappa;
         let mut total_acc = vec![KahanSum::default(); max_order + 1];
         for j in 1..=a {
-            let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
+            let sign = if (a - j).is_multiple_of(2) { 1.0 } else { -1.0 };
             let binom = binomial_f64(a + b - j - 1, a - j);
             let coeff = sign * binom * kappa_sq.powi(-((a + b - j) as i32));
             let block = riesz_block_radial_derivatives(d, (j) as f64, r, max_order);
@@ -27005,7 +26981,7 @@ pub mod closed_form_penalty {
                 total_acc[k].add(term);
             }
         }
-        let sign_a = if a % 2 == 0 { 1.0 } else { -1.0 };
+        let sign_a = if a.is_multiple_of(2) { 1.0 } else { -1.0 };
         for ell in 1..=b {
             let binom = binomial_f64(a + b - ell - 1, b - ell);
             let coeff = sign_a * binom * kappa_sq.powi(-((a + b - ell) as i32));
@@ -27059,7 +27035,7 @@ pub mod closed_form_penalty {
         // Detect log case: 2·mm == d + 2n for some n ≥ 0 ⇔ p = 2 mm − d
         // is a non-negative even integer.
         let two_mm = 2 * mm;
-        if two_mm >= d && (two_mm - d) % 2 == 0 {
+        if two_mm >= d && (two_mm - d).is_multiple_of(2) {
             return None; // log regime — Hadamard not implemented here
         }
         let p_int = two_mm as isize - d as isize; // exponent of R in f(R) = c·R^p
@@ -27140,7 +27116,7 @@ pub mod closed_form_penalty {
         );
 
         let powers = AnisoMetricPowers::new(eta);
-        anisotropic_duchon_penalty_radial_with_powers(q, m, s as f64, kappa, eta, &powers, r)
+        anisotropic_duchon_penalty_radial_with_powers(q, m, s, kappa, eta, &powers, r)
     }
 
     pub(crate) fn anisotropic_duchon_penalty_radial_with_powers(
@@ -27199,7 +27175,7 @@ pub mod closed_form_penalty {
             if let Some(value) = uniform_metric_radial_duchon_penalty(
                 q,
                 m,
-                (s) as f64,
+                (s),
                 kappa,
                 d,
                 common_eta,
@@ -27260,7 +27236,7 @@ pub mod closed_form_penalty {
 
         let big_r = (b * euclidean_r2).sqrt();
         let max_order = if q == 0 { 0 } else { 2 * q };
-        let fr = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, max_order);
+        let fr = radial_derivatives_of_isotropic_duchon(d, m, (s), kappa, big_r, max_order);
         let big_r2 = big_r * big_r;
         let s1 = (d as f64) * b;
         let s2 = (d as f64) * b * b;
@@ -27520,7 +27496,7 @@ pub mod closed_form_penalty {
         // Riesz piece: A_j'(κ) = -(2 n_j / κ) · A_j(κ).
         for j in 1..=a {
             let n_j = a + b - j;
-            let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
+            let sign = if (a - j).is_multiple_of(2) { 1.0 } else { -1.0 };
             let binom = binomial_f64(a + b - j - 1, a - j);
             let a_j = sign * binom * kappa_sq.powi(-(n_j as i32));
             let a_j_prime = -(2.0 * n_j as f64 / kappa) * a_j;
@@ -27531,7 +27507,7 @@ pub mod closed_form_penalty {
         }
 
         // Matérn pieces: B_ℓ'·M_ℓ + B_ℓ·∂_κ M_ℓ, with ∂_κ M_ℓ = -2ℓκ·M_{ℓ+1}.
-        let sign_a = if a % 2 == 0 { 1.0 } else { -1.0 };
+        let sign_a = if a.is_multiple_of(2) { 1.0 } else { -1.0 };
         for ell in 1..=b {
             let n_ell = a + b - ell;
             let binom = binomial_f64(a + b - ell - 1, b - ell);
@@ -27593,7 +27569,7 @@ pub mod closed_form_penalty {
 
         for j in 1..=a {
             let n_j = a + b - j;
-            let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
+            let sign = if (a - j).is_multiple_of(2) { 1.0 } else { -1.0 };
             let binom = binomial_f64(a + b - j - 1, a - j);
             let a_j = sign * binom * kappa_sq.powi(-(n_j as i32));
             let nj_f = n_j as f64;
@@ -27604,7 +27580,7 @@ pub mod closed_form_penalty {
             }
         }
 
-        let sign_a = if a % 2 == 0 { 1.0 } else { -1.0 };
+        let sign_a = if a.is_multiple_of(2) { 1.0 } else { -1.0 };
         for ell in 1..=b {
             let n_ell = a + b - ell;
             let binom = binomial_f64(a + b - ell - 1, b - ell);

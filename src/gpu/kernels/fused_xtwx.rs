@@ -107,8 +107,8 @@ extern "C" __global__ void row_scale_kernel(
 
     let tx: u32 = 16;
     let ty: u32 = 16;
-    let bx = ((p as u32) + tx - 1) / tx;
-    let by = ((n as u32) + ty - 1) / ty;
+    let bx = (p as u32).div_ceil(tx);
+    let by = (n as u32).div_ceil(ty);
     let cfg = LaunchConfig {
         grid_dim: (bx, by, 1),
         block_dim: (tx, ty, 1),

@@ -971,8 +971,8 @@ impl ArrowSchurSystem {
             let gt_e = row.gt.clone();
             let htt_e = row.htt.clone();
             let htbeta_e = row.htbeta.clone();
-            row.gt = manifold.project_to_tangent(t_i.clone(), gt_e.view());
-            row.htt = manifold.riemannian_hessian_matrix(t_i.clone(), gt_e.view(), htt_e.view());
+            row.gt = manifold.project_to_tangent(t_i, gt_e.view());
+            row.htt = manifold.riemannian_hessian_matrix(t_i, gt_e.view(), htt_e.view());
             row.htbeta = manifold.project_matrix_columns_to_tangent(t_i, htbeta_e.view());
         }
         self.refresh_row_hessian_fingerprint();

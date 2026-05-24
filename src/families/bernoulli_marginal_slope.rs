@@ -243,7 +243,9 @@ impl EmpiricalZGrid {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum LatentMeasureKind {
+    #[default]
     StandardNormal,
     GlobalEmpirical {
         grid: EmpiricalZGrid,
@@ -261,11 +263,6 @@ pub enum LatentMeasureKind {
     },
 }
 
-impl Default for LatentMeasureKind {
-    fn default() -> Self {
-        Self::StandardNormal
-    }
-}
 
 impl LatentMeasureKind {
     pub fn validate(&self, context: &str) -> Result<(), String> {
@@ -630,15 +627,14 @@ impl LatentZRankIntCalibration {
             cum_w += weights[idx];
             let zi = z[idx];
             // Collapse ties: store one knot per unique z (last cumulative).
-            if let Some(prev) = last_z {
-                if zi == prev {
+            if let Some(prev) = last_z
+                && zi == prev {
                     if let Some(slot) = weighted_cdf.last_mut() {
                         let p = ((cum_w - 0.375) / denom).clamp(eps, 1.0 - eps);
                         *slot = p;
                     }
                     continue;
                 }
-            }
             let p = ((cum_w - 0.375) / denom).clamp(eps, 1.0 - eps);
             sorted_z.push(zi);
             weighted_cdf.push(p);
@@ -3295,7 +3291,7 @@ pub(crate) fn empirical_intercept_from_marginal(
     let abs_tol = 1e-13_f64.max(4.0 * f64::EPSILON);
     let solve_from = |s: f64| {
         super::monotone_root::solve_monotone_root(
-            &eval,
+            eval,
             s,
             "empirical latent intercept",
             abs_tol,
@@ -4315,7 +4311,7 @@ impl BernoulliBlockHessianAccumulator {
         self.h_mm += &other.h_mm;
         self.h_gg += &other.h_gg;
         self.h_mg += &other.h_mg;
-        if let (Some(ref mut dc), Some(ref odc)) = (
+        if let (Some(ref mut dc), Some(odc)) = (
             self.dense_correction.as_mut(),
             other.dense_correction.as_ref(),
         ) {
@@ -6104,8 +6100,8 @@ impl BernoulliMarginalSlopeFamily {
                 // check decides on the bit-exact full-data objective.
                 // Rejected trials short-circuit through the `Err` path —
                 // no full-data work paid on the reject.
-                if trial_subsample_installed {
-                    if let Ok(_subsample_ll) = trial_result {
+                if trial_subsample_installed
+                    && let Ok(_subsample_ll) = trial_result {
                         let full_total: Result<f64, String> = (0..n)
                             .into_par_iter()
                             .try_fold(
@@ -6121,7 +6117,6 @@ impl BernoulliMarginalSlopeFamily {
                             );
                         return full_total;
                     }
-                }
                 return trial_result;
             }
             let total: Result<f64, String> = weighted_rows
@@ -6166,8 +6161,8 @@ impl BernoulliMarginalSlopeFamily {
                 threshold,
                 row_ll,
             );
-            if trial_subsample_installed {
-                if let Ok(_subsample_ll) = trial_result {
+            if trial_subsample_installed
+                && let Ok(_subsample_ll) = trial_result {
                     let full_total: Result<f64, String> = (0..n)
                         .into_par_iter()
                         .try_fold(
@@ -6183,7 +6178,6 @@ impl BernoulliMarginalSlopeFamily {
                         );
                     return full_total;
                 }
-            }
             return trial_result;
         }
         let total: Result<f64, String> = weighted_rows
@@ -7472,7 +7466,7 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         let mut solve_result = super::monotone_root::solve_monotone_root_detailed(
-            &eval,
+            eval,
             a_init,
             "bernoulli intercept",
             abs_tol,
@@ -7487,7 +7481,7 @@ impl BernoulliMarginalSlopeFamily {
         // basin.
         if (predictor_a.is_some() || cached_a.is_some()) && solve_result.is_err() {
             solve_result = super::monotone_root::solve_monotone_root_detailed(
-                &eval,
+                eval,
                 a_closed_form,
                 "bernoulli intercept",
                 abs_tol,
@@ -8114,24 +8108,22 @@ impl BernoulliMarginalSlopeFamily {
                 &mut logslope,
             )?;
         }
-        if let Some(primary_h) = primary.h.as_ref() {
-            if let Some(block_h) = slices.h.as_ref() {
+        if let Some(primary_h) = primary.h.as_ref()
+            && let Some(block_h) = slices.h.as_ref() {
                 out.slice_mut(s![block_h.clone()]).assign(
                     &primary_vec
                         .slice(s![primary_h.start..primary_h.end])
                         .to_owned(),
                 );
             }
-        }
-        if let Some(primary_w) = primary.w.as_ref() {
-            if let Some(block_w) = slices.w.as_ref() {
+        if let Some(primary_w) = primary.w.as_ref()
+            && let Some(block_w) = slices.w.as_ref() {
                 out.slice_mut(s![block_w.clone()]).assign(
                     &primary_vec
                         .slice(s![primary_w.start..primary_w.end])
                         .to_owned(),
                 );
             }
-        }
         Ok(out)
     }
 
@@ -12473,7 +12465,7 @@ impl BernoulliMarginalSlopeFamily {
 
         // ── Rigid closed-form: scalar kernel + design row ops ────────
         if !self.effective_flex_active(block_states)? {
-            let out = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+            let out = (0..n.div_ceil(ROW_CHUNK_SIZE))
                 .into_par_iter()
                 .try_fold(
                     || Array1::<f64>::zeros(slices.total),
@@ -12516,7 +12508,7 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(out);
         }
 
-        let out = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+        let out = (0..n.div_ceil(ROW_CHUNK_SIZE))
             .into_par_iter()
             .try_fold(
                 || Array1::<f64>::zeros(slices.total),
@@ -12640,7 +12632,7 @@ impl BernoulliMarginalSlopeFamily {
 
         // ── Rigid closed-form: no jets, no row contexts ──────────────
         if !self.effective_flex_active(block_states)? {
-            let diagonal = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+            let diagonal = (0..n.div_ceil(ROW_CHUNK_SIZE))
                 .into_par_iter()
                 .try_fold(
                     || Array1::<f64>::zeros(slices.total),
@@ -12677,7 +12669,7 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(diagonal);
         }
 
-        let diagonal = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+        let diagonal = (0..n.div_ceil(ROW_CHUNK_SIZE))
             .into_par_iter()
             .try_fold(
                 || Array1::<f64>::zeros(slices.total),
@@ -13865,7 +13857,7 @@ impl BernoulliMarginalSlopeFamily {
         let progress_started = started;
         let bump_progress = |progress: &AtomicUsize| {
             let now = progress.fetch_add(1, Ordering::Relaxed) + 1;
-            if now == n_rows || now % progress_step == 0 {
+            if now == n_rows || now.is_multiple_of(progress_step) {
                 log::info!(
                     "[BMS batched dH progress] rows={}/{} dirs={} elapsed={:.3}s",
                     now,
@@ -14111,7 +14103,7 @@ impl BernoulliMarginalSlopeFamily {
                     if w != 1.0 {
                         third.mapv_inplace(|v| v * w);
                     }
-                    accs[idx].add_pullback(self, row, slices, primary, &third);
+                    accs[idx].add_pullback(self, row, slices, primary, third);
                 }
                 bump_progress(&progress);
                 Ok(())
@@ -14515,7 +14507,7 @@ impl BernoulliMarginalSlopeFamily {
                     Array2::<f64>::zeros((p_logslope, p_logslope)),
                 )
             };
-            let (hess_marginal, hess_logslope) = (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+            let (hess_marginal, hess_logslope) = (0..n.div_ceil(ROW_CHUNK_SIZE))
                 .into_par_iter()
                 .try_fold(
                     make_pair,
@@ -14624,7 +14616,7 @@ impl BernoulliMarginalSlopeFamily {
             )
         };
         let (ll, grad_marginal, grad_logslope, hess_marginal, hess_logslope) =
-            (0..((n + ROW_CHUNK_SIZE - 1) / ROW_CHUNK_SIZE))
+            (0..n.div_ceil(ROW_CHUNK_SIZE))
                 .into_par_iter()
                 .try_fold(
                     make_acc,
@@ -15428,8 +15420,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 block_states.len()
             ));
         }
-        if self.score_block_index().is_some_and(|idx| block_idx == idx) {
-            if let (Some(runtime), Some(score)) =
+        if self.score_block_index().is_some_and(|idx| block_idx == idx)
+            && let (Some(runtime), Some(score)) =
                 (&self.score_warp, self.score_block_state(block_states)?)
             {
                 let current = &score.beta;
@@ -15442,9 +15434,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 }
                 return project_monotone_feasible_beta(runtime, current, &beta, "score_warp_dev");
             }
-        }
-        if self.link_block_index().is_some_and(|idx| block_idx == idx) {
-            if let (Some(runtime), Some(link)) =
+        if self.link_block_index().is_some_and(|idx| block_idx == idx)
+            && let (Some(runtime), Some(link)) =
                 (&self.link_dev, self.link_block_state(block_states)?)
             {
                 let current = &link.beta;
@@ -15457,7 +15448,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 }
                 return project_monotone_feasible_beta(runtime, current, &beta, "link_dev");
             }
-        }
         Ok(beta)
     }
 }
@@ -17227,10 +17217,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let extra_rho0 = {
         let mut out = Vec::new();
         if let Some(ref prepared) = score_warp_prepared {
-            out.extend(std::iter::repeat(0.0).take(prepared.block.penalties.len()));
+            out.extend(std::iter::repeat_n(0.0, prepared.block.penalties.len()));
         }
         if let Some(ref prepared) = link_dev_prepared {
-            out.extend(std::iter::repeat(0.0).take(prepared.block.penalties.len()));
+            out.extend(std::iter::repeat_n(0.0, prepared.block.penalties.len()));
         }
         out
     };
@@ -17490,11 +17480,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 }
                 bidx += 1;
             }
-            if link_dev_prepared.is_some() {
-                if let Some(block) = fit.block_states.get(bidx) {
+            if link_dev_prepared.is_some()
+                && let Some(block) = fit.block_states.get(bidx) {
                     hints_mut.link_dev_beta = Some(block.beta.clone());
                 }
-            }
             Ok(fit)
         },
         |theta,

@@ -396,20 +396,18 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
                 dir[self.primary_index],
             );
         }
-        if support.include_h {
-            if let Some(h_range) = self.h_range.as_ref() {
+        if support.include_h
+            && let Some(h_range) = self.h_range.as_ref() {
                 for idx in h_range.clone() {
                     add_scaled_coeff4(&mut out, &family[idx], dir[idx]);
                 }
             }
-        }
-        if support.include_w {
-            if let Some(w_range) = self.w_range.as_ref() {
+        if support.include_w
+            && let Some(w_range) = self.w_range.as_ref() {
                 for idx in w_range.clone() {
                     add_scaled_coeff4(&mut out, &family[idx], dir[idx]);
                 }
             }
-        }
         out
     }
 
@@ -425,20 +423,18 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
             direction_adjoint[self.primary_index] +=
                 coeff4_dot(coeff_adjoint, &family[self.primary_index]);
         }
-        if support.include_h {
-            if let Some(h_range) = self.h_range.as_ref() {
+        if support.include_h
+            && let Some(h_range) = self.h_range.as_ref() {
                 for idx in h_range.clone() {
                     direction_adjoint[idx] += coeff4_dot(coeff_adjoint, &family[idx]);
                 }
             }
-        }
-        if support.include_w {
-            if let Some(w_range) = self.w_range.as_ref() {
+        if support.include_w
+            && let Some(w_range) = self.w_range.as_ref() {
                 for idx in w_range.clone() {
                     direction_adjoint[idx] += coeff4_dot(coeff_adjoint, &family[idx]);
                 }
             }
-        }
     }
 
     pub(crate) fn mixed_directional_from_b_family(
@@ -458,8 +454,8 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
                 dir_u_primary * dir_v_primary,
             );
         }
-        if support.include_h {
-            if let Some(h_range) = self.h_range.as_ref() {
+        if support.include_h
+            && let Some(h_range) = self.h_range.as_ref() {
                 for idx in h_range.clone() {
                     add_scaled_coeff4(
                         &mut out,
@@ -468,9 +464,8 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
                     );
                 }
             }
-        }
-        if support.include_w {
-            if let Some(w_range) = self.w_range.as_ref() {
+        if support.include_w
+            && let Some(w_range) = self.w_range.as_ref() {
                 for idx in w_range.clone() {
                     add_scaled_coeff4(
                         &mut out,
@@ -479,7 +474,6 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
                     );
                 }
             }
-        }
         out
     }
 
@@ -931,9 +925,9 @@ pub fn auto_outer_score_subsample(
 /// outer iterations, not function evaluations. The counter only ticks
 /// when the incoming ρ differs from the last observed ρ in L2 by
 /// > 1e-10 — well below any meaningful BFGS step on log-scale ρ, well
-/// above float-noise from cloning. The mutex around `last_rho` is the
-/// minimal coordination needed: `(counter, last_rho)` must update
-/// together so two threads cannot both decide "new ρ" and double-bump.
+/// > above float-noise from cloning. The mutex around `last_rho` is the
+/// > minimal coordination needed: `(counter, last_rho)` must update
+/// > together so two threads cannot both decide "new ρ" and double-bump.
 ///
 /// The transition at `phase_idx == phase1_budget` is logged exactly
 /// once via `log::info!` with the supplied `family_label`. Each phase-1
@@ -1087,7 +1081,7 @@ pub fn build_outer_score_subsample(
         if rows.is_empty() {
             continue;
         }
-        let take = ((k as u128 * rows.len() as u128 + n as u128 - 1) / n as u128) as usize;
+        let take = (k as u128 * rows.len() as u128).div_ceil(n as u128) as usize;
         let take = take.max(1).min(rows.len());
         // HT inverse-inclusion weight for this stratum: w_h = N_h / k_h.
         // Identical for every row drawn from `stratum_id`.

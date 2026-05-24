@@ -806,8 +806,8 @@ impl LatentDesignCache {
         let basis_digest = basis_kind.cache_digest();
         let latent_metadata_digest = latent_metadata_cache_digest(&latent);
         let cacheable = flat_slice.iter().all(|value| value.is_finite());
-        if cacheable {
-            if let Some(index) = self.find_entry(
+        if cacheable
+            && let Some(index) = self.find_entry(
                 &latent,
                 basis_digest,
                 latent_metadata_digest,
@@ -819,9 +819,8 @@ impl LatentDesignCache {
                     entry_id: self.entries[index].id,
                 });
             }
-        }
-        if cacheable {
-            if let Some(cached) = lookup_persistent_latent_design(
+        if cacheable
+            && let Some(cached) = lookup_persistent_latent_design(
                 &latent,
                 basis_digest,
                 latent_metadata_digest,
@@ -833,7 +832,6 @@ impl LatentDesignCache {
                 self.insert(cached, id);
                 return self.lookup_inserted(id);
             }
-        }
 
         let computed = compute()?;
         let radial_distances = if basis_kind.streams_radial_cache() {

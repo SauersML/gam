@@ -1322,16 +1322,14 @@ pub fn parse_surv_response(lhs: &str) -> Result<Option<(String, String, String)>
                      zeros and call `Surv(0_entry, {}, {})`.",
                     vars[0], vars[1], vars[0], vars[1]
                 ),
-            }
-            .into());
+            });
         }
         return Err(FormulaDslError::InvalidArgument {
             reason: format!(
                 "Surv(...) expects exactly three columns: Surv(entry, exit, event); got {}",
                 vars.len()
             ),
-        }
-        .into());
+        });
     }
     Ok(Some((vars[0].clone(), vars[1].clone(), vars[2].clone())))
 }
@@ -1373,8 +1371,7 @@ pub fn parse_matching_auxiliary_formula(
             reason: format!(
                 "{flag_name} expects only the terms after '~', not a full 'response ~ terms' formula; use {flag_name} 's(x)' instead of {flag_name} 'y ~ s(x)' (or pass '1' for an intercept-only noise model)"
             ),
-        }
-        .into());
+        });
     }
     let parsed_formula = parse_formula(&format!("{response} ~ {rhs}"))?;
     Ok((rhs.to_string(), parsed_formula))
@@ -1454,8 +1451,7 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
             return Err(FormulaDslError::IncompatibleTerm {
                 reason: "formula terms '0'/'-1' (intercept removal) are not supported yet"
                     .to_string(),
-            }
-            .into());
+            });
         }
         // Normalize whitespace so `smooth(x)` and `smooth( x )` match.
         let key: String = t.split_whitespace().collect();
@@ -1466,16 +1462,14 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
                      Duplicate terms produce a rank-deficient design; \
                      keep one copy or differentiate them (e.g. distinct k=, bs= options)."
                 ),
-            }
-            .into());
+            });
         }
         match parse_term(t)? {
             ParsedTerm::LinkWiggle { options } => {
                 if linkwiggle.is_some() {
                     return Err(FormulaDslError::IncompatibleTerm {
                         reason: "formula can include at most one linkwiggle(...) term".to_string(),
-                    }
-                    .into());
+                    });
                 }
                 linkwiggle = Some(parse_linkwiggle_formulaspec(&options, t)?);
             }
@@ -1483,8 +1477,7 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
                 if timewiggle.is_some() {
                     return Err(FormulaDslError::IncompatibleTerm {
                         reason: "formula can include at most one timewiggle(...) term".to_string(),
-                    }
-                    .into());
+                    });
                 }
                 timewiggle = Some(parse_linkwiggle_formulaspec(&options, t)?);
             }
@@ -1492,8 +1485,7 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
                 if linkspec.is_some() {
                     return Err(FormulaDslError::IncompatibleTerm {
                         reason: "formula can include at most one link(...) term".to_string(),
-                    }
-                    .into());
+                    });
                 }
                 linkspec = Some(parse_link_formulaspec(&options, t)?);
             }
@@ -1501,8 +1493,7 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
                 if survivalspec.is_some() {
                     return Err(FormulaDslError::IncompatibleTerm {
                         reason: "formula can include at most one survmodel(...) term".to_string(),
-                    }
-                    .into());
+                    });
                 }
                 survivalspec = Some(parse_survival_formulaspec(&options, t)?);
             }
@@ -1527,8 +1518,7 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
                  This fits y as a function of itself and is almost certainly a typo. \
                  Drop the term that mentions `{lhs}` from the right-hand side."
             ),
-        }
-        .into());
+        });
     }
     Ok(ParsedFormula {
         response: lhs.to_string(),
@@ -1976,8 +1966,7 @@ pub fn parse_link_choice(
                 reason:
                     "flexible(...) does not support blended(...)/mixture(...) links; wiggle is only supported for jointly fit standard links"
                         .to_string(),
-            }
-            .into());
+            });
         }
         let link = parse_linkname(inner)?;
         if !linkname_supports_joint_wiggle(link) {
@@ -1985,8 +1974,7 @@ pub fn parse_link_choice(
                 reason:
                     "flexible(...) does not support sas/beta-logistic links; wiggle is only supported for jointly fit standard links"
                         .to_string(),
-            }
-            .into());
+            });
         }
         return Ok(Some(LinkChoice {
             mode: LinkMode::Flexible,
@@ -2004,8 +1992,7 @@ pub fn parse_link_choice(
                 reason:
                     "--flexible-link cannot be combined with --link blended(...)/mixture(...); blended inverse links are not flexible-link mode"
                         .to_string(),
-            }
-            .into());
+            });
         }
         let components = parse_link_component_list(inner)?;
         return Ok(Some(LinkChoice {
@@ -2021,8 +2008,7 @@ pub fn parse_link_choice(
             reason:
                 "--flexible-link does not support sas/beta-logistic links; wiggle is only supported for jointly fit standard links"
                     .to_string(),
-        }
-        .into());
+        });
     }
     Ok(Some(LinkChoice {
         mode: if flexible_flag {

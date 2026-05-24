@@ -373,13 +373,12 @@ fn dense_block_or_operator<'a>(
     }
 
     let dense_bytes = 8usize.saturating_mul(n).saturating_mul(p);
-    if dense_bytes <= budget_bytes {
-        if let Ok(arc) = design
+    if dense_bytes <= budget_bytes
+        && let Ok(arc) = design
             .try_to_dense_with_policy(&policy.material_policy(), "gamlss dense_block_or_operator")
         {
             return DenseOrOperator::Owned(arc.as_ref().clone());
         }
-    }
 
     DenseOrOperator::Operator(design.clone())
 }
@@ -2012,7 +2011,7 @@ impl BlockwiseTermWiggleFitResult {
         } = parts;
 
         fit.validate_numeric_finiteness()
-            .map_err(|e| format!("{e}"))?;
+            .map_err(|e| e.to_string())?;
         if fit.fit.block_states.len() < 3 {
             return Err(GamlssError::DimensionMismatch {
                 reason: format!(
@@ -3554,7 +3553,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                     penalties: pilot_design
                         .penalties
                         .iter()
-                        .map(|bp| crate::solver::estimate::PenaltySpec::from_blockwise_ref(bp))
+                        .map(crate::solver::estimate::PenaltySpec::from_blockwise_ref)
                         .collect(),
                     nullspace_dims: vec![],
                     initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(1e-12).ln())),
@@ -3615,7 +3614,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 penalties: baseline_design
                     .penalties
                     .iter()
-                    .map(|bp| crate::solver::estimate::PenaltySpec::from_blockwise_ref(bp))
+                    .map(crate::solver::estimate::PenaltySpec::from_blockwise_ref)
                     .collect(),
                 nullspace_dims: vec![],
                 initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(1e-12).ln())),
@@ -3989,7 +3988,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                 penalties: design
                     .penalties
                     .iter()
-                    .map(|bp| crate::solver::estimate::PenaltySpec::from_blockwise_ref(bp))
+                    .map(crate::solver::estimate::PenaltySpec::from_blockwise_ref)
                     .collect(),
                 nullspace_dims: vec![],
                 initial_log_lambdas: Some(theta_star.slice(s![0..eta_penalty_count]).to_owned()),
@@ -6542,11 +6541,11 @@ fn gaussian_joint_psisecondhessian_fromweights(
     let hmumu = &a_ab_mu
         + &a_ab_mu.t()
         + &a_ij_mu
-        + &a_ij_mu.t()
+        + a_ij_mu.t()
         + &a_iwj_mu
-        + &a_iwj_mu.t()
+        + a_iwj_mu.t()
         + &a_jwi_mu
-        + &a_jwi_mu.t()
+        + a_jwi_mu.t()
         + &xt_diag_x_dense(xmu, &secondweights.d2hmumu)?;
     let hmu_ls = weighted_crossprod_psi_maps(
         xmu_ab,
@@ -6599,11 +6598,11 @@ fn gaussian_joint_psisecondhessian_fromweights(
     let h_ls_ls = &a_ab_ls
         + &a_ab_ls.t()
         + &a_ij_ls
-        + &a_ij_ls.t()
+        + a_ij_ls.t()
         + &a_iwj_ls
-        + &a_iwj_ls.t()
+        + a_iwj_ls.t()
         + &a_jwi_ls
-        + &a_jwi_ls.t()
+        + a_jwi_ls.t()
         + &xt_diag_x_dense(x_ls, &secondweights.d2h_ls_ls)?;
     Ok(gaussian_pack_joint_symmetrichessian(
         &hmumu, &hmu_ls, &h_ls_ls,
@@ -7594,13 +7593,13 @@ impl GaussianLocationScaleFamily {
             apply_ht_mask_mixed(&mut mixedweights, sub_rows);
         }
 
-        Ok(gaussian_joint_psi_mixedhessian_drift_fromweights(
+        gaussian_joint_psi_mixedhessian_drift_fromweights(
             xmu,
             x_ls,
             xmu_map,
             x_ls_map,
             &mixedweights,
-        )?)
+        )
     }
 }
 
@@ -10427,11 +10426,11 @@ impl GaussianLocationScaleWiggleFamily {
         let h_ww = &a_ab
             + &a_ab.t()
             + &a_ij
-            + &a_ij.t()
+            + a_ij.t()
             + &a_iwj
-            + &a_iwj.t()
+            + a_iwj.t()
             + &a_jwi
-            + &a_jwi.t()
+            + a_jwi.t()
             + &xt_diag_x_dense(&geom.basis, &dw_uv)?;
         Ok(Some(gaussian_pack_wiggle_joint_symmetrichessian(
             &h_mm, &h_ml, &h_mw, &h_ll, &h_lw, &h_ww,
@@ -10842,11 +10841,11 @@ impl GaussianLocationScaleWiggleFamily {
         let h_mm = &hmm_ab
             + &hmm_ab.t()
             + &hmm_ij
-            + &hmm_ij.t()
+            + hmm_ij.t()
             + &hmm_iwj
-            + &hmm_iwj.t()
+            + hmm_iwj.t()
             + &hmm_jwi
-            + &hmm_jwi.t()
+            + hmm_jwi.t()
             + &xt_diag_x_dense(xmu, &coeff_mm_ab)?;
         let h_ml = weighted_crossprod_psi_maps(
             xmu_ab_map,
@@ -10899,11 +10898,11 @@ impl GaussianLocationScaleWiggleFamily {
         let h_ll = &hll_ab
             + &hll_ab.t()
             + &hll_ij
-            + &hll_ij.t()
+            + hll_ij.t()
             + &hll_iwj
-            + &hll_iwj.t()
+            + hll_iwj.t()
             + &hll_jwi
-            + &hll_jwi.t()
+            + hll_jwi.t()
             + &xt_diag_x_dense(x_ls, &coeff_ll_ab)?;
         let h_mw = weighted_crossprod_psi_maps(
             xmu_ab_map,
@@ -10991,11 +10990,11 @@ impl GaussianLocationScaleWiggleFamily {
         let h_ww = &hww_ab
             + &hww_ab.t()
             + &hww_ij
-            + &hww_ij.t()
+            + hww_ij.t()
             + &hww_iwj
-            + &hww_iwj.t()
+            + hww_iwj.t()
             + &hww_jwi
-            + &hww_jwi.t()
+            + hww_jwi.t()
             + &xt_diag_x_dense(&geom.basis, &dw_ab)?;
 
         Ok(crate::custom_family::ExactNewtonJointPsiSecondOrderTerms {
@@ -11244,9 +11243,9 @@ impl GaussianLocationScaleWiggleFamily {
         let h_ww = &hww_a_u
             + &hww_a_u.t()
             + &hww_aw
-            + &hww_aw.t()
+            + hww_aw.t()
             + &hww_au
-            + &hww_au.t()
+            + hww_au.t()
             + &xt_diag_x_dense(&geom.basis, &dw_a_u)?;
 
         Ok(gaussian_pack_wiggle_joint_symmetrichessian(
@@ -11804,7 +11803,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         if spec.name != "wiggle" {
             return Ok((spec.design.clone(), spec.offset.clone()));
         }
-        if block_states.len() < 1 {
+        if block_states.is_empty() {
             return Err(GamlssError::UnsupportedConfiguration {
                 reason: "Gaussian wiggle geometry requires mean block".to_string(),
             }
@@ -12985,7 +12984,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         if spec.name != "wiggle" {
             return Ok((spec.design.clone(), spec.offset.clone()));
         }
-        if block_states.len() < 1 {
+        if block_states.is_empty() {
             return Err(GamlssError::UnsupportedConfiguration {
                 reason: "wiggle geometry requires eta block".to_string(),
             }
@@ -13165,7 +13164,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             + &xt_diag_y_dense(&x_eta, &coeff_etaw_d1, &geom.basis_d1)?
             + &xt_diag_y_dense(&x_eta, &coeff_etaw_d2, &geom.basis_d2)?;
         let a_ww = xt_diag_y_dense(&geom.basis_d1, &coeff_ww_db, &geom.basis)?;
-        let d_h_ww = xt_diag_x_dense(&geom.basis, &coeff_ww_bb)? + &a_ww + &a_ww.t();
+        let d_h_ww = xt_diag_x_dense(&geom.basis, &coeff_ww_bb)? + &a_ww + a_ww.t();
         Ok(Some(binomial_pack_mean_wiggle_joint_symmetrichessian(
             &d_h_eta_eta,
             &d_h_eta_w,
@@ -13474,11 +13473,11 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         let d2_h_ww = &a_ab
             + &a_ab.t()
             + &a_ij
-            + &a_ij.t()
+            + a_ij.t()
             + &a_iwj
-            + &a_iwj.t()
+            + a_iwj.t()
             + &a_jwi
-            + &a_jwi.t()
+            + a_jwi.t()
             + &xt_diag_x_dense(&geom.basis, &dw_uv)?;
 
         Ok(Some(binomial_pack_mean_wiggle_joint_symmetrichessian(
@@ -13701,7 +13700,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
             + &xt_diag_y_dense(x_eta_psi, &coeff_eta_w_xa_d1, &geom.basis_d1)?
             + &xt_diag_y_dense(&x_eta, &coeff_eta_w_x_d2, &geom.basis_d2)?;
         let a_ww = xt_diag_y_dense(&geom.basis_d1, &coeff_ww_db, &geom.basis)?;
-        let h_ww = xt_diag_x_dense(&geom.basis, &coeff_ww_bb)? + &a_ww + &a_ww.t();
+        let h_ww = xt_diag_x_dense(&geom.basis, &coeff_ww_bb)? + &a_ww + a_ww.t();
 
         Ok(Some(crate::custom_family::ExactNewtonJointPsiTerms {
             objective_psi,
@@ -18803,7 +18802,7 @@ impl BinomialLocationScaleWiggleFamily {
             + &xt_diag_y_dense(x_ls, &coeff_lw_d1_d, &d0)?
             + &xt_diag_y_dense(x_ls, &coeff_lw_d2_d, &dd0)?;
         let a_ww = xt_diag_y_dense(&d0, &coeff_ww_db, &b0)?;
-        let h_ww = xt_diag_x_dense(&b0, &coeff_ww_bb)? + &a_ww + &a_ww.t();
+        let h_ww = xt_diag_x_dense(&b0, &coeff_ww_bb)? + &a_ww + a_ww.t();
 
         let mut hessian_psi = Array2::<f64>::zeros((total, total));
         hessian_psi.slice_mut(s![0..pt, 0..pt]).assign(&h_tt_block);

@@ -581,7 +581,7 @@ impl SaeAssignment {
         }
         let coords = coord_blocks
             .iter()
-            .zip(manifolds.into_iter())
+            .zip(manifolds)
             .map(|(c, manifold)| {
                 LatentCoordValues::from_matrix_with_manifold(c.view(), LatentIdMode::None, manifold)
             })

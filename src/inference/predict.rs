@@ -1016,11 +1016,11 @@ impl BernoulliMarginalSlopePredictor {
         let needs_score = self
             .score_warp_runtime
             .as_ref()
-            .map_or(false, |r| r.anchor_residual_coefficients.is_some());
+            .is_some_and(|r| r.anchor_residual_coefficients.is_some());
         let needs_link = self
             .link_deviation_runtime
             .as_ref()
-            .map_or(false, |r| r.anchor_residual_coefficients.is_some());
+            .is_some_and(|r| r.anchor_residual_coefficients.is_some());
         if !needs_score && !needs_link {
             return Ok(BmsAnchorCorrections::default());
         }
@@ -2008,7 +2008,7 @@ impl BernoulliMarginalSlopePredictor {
         let score_warp_offset = logslope_offset + logslope_dim;
         let link_dev_offset = score_warp_offset + score_warp_dim;
         let chunk_size = prediction_chunk_rows(theta.len(), 1, n);
-        let num_chunks = (n + chunk_size - 1) / chunk_size;
+        let num_chunks = n.div_ceil(chunk_size);
         let scale = self.probit_frailty_scale();
         // Cross-block anchor corrections: when either runtime carries an
         // anchor residual, precompute the per-row correction matrices
@@ -2145,7 +2145,7 @@ impl BernoulliMarginalSlopePredictor {
             })
             .transpose()?;
         let score_dev_obs = if let (Some(design), Some(beta)) =
-            (score_warp_obs_design.as_ref(), beta_score_warp.clone())
+            (score_warp_obs_design.as_ref(), beta_score_warp)
         {
             design.dot(&beta.to_owned())
         } else {
@@ -3106,7 +3106,7 @@ impl GaussianLocationScalePredictor {
         }
         if let Some(runtime) = self.link_wiggle.as_ref() {
             let eta_base = input.design.dot(&self.beta_mu) + &input.offset;
-            linear_predictor_se_from_backend(&backend, eta_len, |rows| {
+            linear_predictor_se_from_backend(backend, eta_len, |rows| {
                 let q0_chunk = eta_base.slice(ndarray::s![rows.clone()]).to_owned();
                 let x_mu = design_row_chunk(&input.design, rows.clone())?;
                 let wiggle_design = runtime.design(&q0_chunk)?;
@@ -3125,7 +3125,7 @@ impl GaussianLocationScalePredictor {
         } else {
             padded_design_standard_errors_from_backend(
                 &input.design,
-                &backend,
+                backend,
                 0,
                 p_sigma + p_w,
                 "gaussian location-scale posterior mean",
@@ -3208,7 +3208,7 @@ impl PredictableModel for GaussianLocationScalePredictor {
         let sigma = self.compute_sigma(design_noise, input.offset_noise.as_ref())?;
         let eta_se = self.eta_standard_error(input, fit, pred.eta.len())?;
         let z = crate::probability::standard_normal_quantile(0.5 + options.confidence_level * 0.5)
-            .map_err(|e| EstimationError::InvalidInput(e))?;
+            .map_err(EstimationError::InvalidInput)?;
         let z_se = eta_se.mapv(|s| z * s);
         let eta_lower = &pred.eta - &z_se;
         let eta_upper = &pred.eta + &z_se;
@@ -4006,7 +4006,7 @@ impl PredictableModel for SurvivalPredictor {
     ) -> Result<PredictUncertaintyResult, EstimationError> {
         let pred = self.predict_with_uncertainty(input)?;
         let z = crate::probability::standard_normal_quantile(0.5 + options.confidence_level * 0.5)
-            .map_err(|e| EstimationError::InvalidInput(e))?;
+            .map_err(EstimationError::InvalidInput)?;
 
         let eta_se = pred.eta_se.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(

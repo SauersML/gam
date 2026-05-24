@@ -1410,7 +1410,7 @@ pub fn build_survival_time_basis(
                 let chain = 1.0 / age_exit[i].max(SURVIVAL_TIME_FLOOR);
                 for (j_new, &j_old) in keep_cols.iter().enumerate() {
                     let raw_v = d_i_log_full[j_old] * chain;
-                    let v = if raw_v < 0.0 && raw_v >= -1e-12 {
+                    let v = if (-1e-12..0.0).contains(&raw_v) {
                         0.0
                     } else {
                         raw_v

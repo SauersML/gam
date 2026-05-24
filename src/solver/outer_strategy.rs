@@ -630,15 +630,14 @@ impl OuterThetaLayout {
                 self.psi_dim
             )));
         }
-        if let Some(ref psi_gradient) = eval.psi_gradient {
-            if psi_gradient.len() != self.psi_dim {
+        if let Some(ref psi_gradient) = eval.psi_gradient
+            && psi_gradient.len() != self.psi_dim {
                 return Err(ObjectiveEvalError::recoverable(format!(
                     "{context}: outer EFS psi-gradient length mismatch: got {}, expected {}",
                     psi_gradient.len(),
                     self.psi_dim
                 )));
             }
-        }
         if let Some(ref psi_indices) = eval.psi_indices {
             if psi_indices.len() != self.psi_dim {
                 return Err(ObjectiveEvalError::recoverable(format!(
@@ -1300,12 +1299,10 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
 
     if cap.gradient == Derivative::Analytic
         && matches!(plan(cap).solver, Solver::Efs | Solver::HybridEfs)
-    {
-        if let Some(no_fp_cap) = disable_fixed_point(cap) {
+        && let Some(no_fp_cap) = disable_fixed_point(cap) {
             attempts.push(no_fp_cap.clone());
             return attempts;
         }
-    }
 
     // Arc primary: no lateral demotion to BFGS. The runner's ARC-budget-bump
     // retry covers cases where ARC needed more iterations; if even that is
@@ -1989,11 +1986,10 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         // cache so a subsequent finalize-write encodes the seeded β if no
         // eval surfaces a fresher β first.
         let result = self.inner.seed_inner_state(beta);
-        if result.is_ok() && beta.iter().all(|v| v.is_finite()) {
-            if let Ok(mut guard) = self.last_inner_beta.lock() {
+        if result.is_ok() && beta.iter().all(|v| v.is_finite())
+            && let Ok(mut guard) = self.last_inner_beta.lock() {
                 *guard = Some(beta.clone());
             }
-        }
         result
     }
 
@@ -3506,8 +3502,8 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                 eval.cost,
             )));
         }
-        if let Some(ref barrier_cfg) = self.barrier_config {
-            if let Some(ref beta) = eval.beta {
+        if let Some(ref barrier_cfg) = self.barrier_config
+            && let Some(ref beta) = eval.beta {
                 // Scale-free precondition check for EFS. Wood–Fasiolo's
                 // multiplicative log-λ update is derived under the
                 // assumption that the inner Hessian is ≈ X'WX + S. A log
@@ -3576,7 +3572,6 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                     )));
                 }
             }
-        }
         let status = FixedPointStatus::Continue;
 
         let raw_step = Array1::from_vec(eval.steps);
@@ -3667,8 +3662,8 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                 rho_only[i] = 0.0;
             }
             let max_rho_abs = rho_only.iter().map(|s| s.abs()).fold(0.0_f64, f64::max);
-            if max_rho_abs >= EFS_NEGLIGIBLE_STEP {
-                if let Some(scaled) =
+            if max_rho_abs >= EFS_NEGLIGIBLE_STEP
+                && let Some(scaled) =
                     self.efs_backtrack(x, &rho_only, current_cost, MAX_EFS_BACKTRACK)?
                 {
                     self.consecutive_psi_zero_iters =
@@ -3707,7 +3702,6 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                         status,
                     });
                 }
-            }
             // ρ/τ-only backtracking also failed — surface the joint-solver
             // fallback marker so the runner abandons EFS for this attempt.
             log::info!(
@@ -4347,7 +4341,7 @@ impl OuterProblem {
             tolerance: self.tolerance,
             max_iter: self.max_iter,
             bounds: self.bounds.clone(),
-            seed_config: self.seed_config.clone(),
+            seed_config: self.seed_config,
             rho_bound: self.rho_bound,
             heuristic_lambdas: self.heuristic_lambdas.clone(),
             initial_rho: self.initial_rho.clone(),
@@ -4534,7 +4528,7 @@ impl OuterProblem {
                     if config
                         .initial_rho
                         .as_ref()
-                        .is_none_or(|initial| initial != &rho)
+                        .is_none_or(|initial| initial != rho)
                     {
                         log::info!(
                             "[CACHE] hit  key={}.. context={} rho_dim={} beta_dim={} prior_obj={:.6e} iter={}",
@@ -5066,7 +5060,7 @@ fn run_outer_with_plan(
         let projected = project_to_bounds(&seed, Some(&bounds_template));
         if !projected_seeds
             .iter()
-            .any(|existing: &Array1<f64>| existing == &projected)
+            .any(|existing: &Array1<f64>| existing == projected)
         {
             projected_seeds.push(projected);
         }
@@ -5143,7 +5137,7 @@ fn run_outer_with_plan(
         let result: Result<OuterResult, EstimationError> = match the_plan.solver {
             Solver::Arc => {
                 let seed_eval = obj
-                    .eval_with_order(&seed, OuterEvalOrder::ValueGradientHessian)
+                    .eval_with_order(seed, OuterEvalOrder::ValueGradientHessian)
                     .map_err(|err| into_objective_error("outer eval failed", err));
                 let seed_eval = match seed_eval {
                     Ok(seed_eval) => seed_eval,
@@ -5472,7 +5466,7 @@ fn run_outer_with_plan(
                     )));
                 }
                 let seed_eval = obj
-                    .eval_with_order(&seed, OuterEvalOrder::ValueAndGradient)
+                    .eval_with_order(seed, OuterEvalOrder::ValueAndGradient)
                     .map_err(|err| into_objective_error("outer eval failed", err));
                 let seed_eval = match seed_eval {
                     Ok(seed_eval) => seed_eval,
@@ -5614,7 +5608,7 @@ fn run_outer_with_plan(
                             && last_solution
                                 .final_gradient
                                 .as_ref()
-                                .map_or(true, |g| g.iter().all(|v| v.is_finite()))
+                                .is_none_or(|g| g.iter().all(|v| v.is_finite()))
                         {
                             Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                         } else {
@@ -5646,7 +5640,7 @@ fn run_outer_with_plan(
                     fixed_point_tolerance: config.tolerance,
                     consecutive_psi_zero_iters: 0,
                 };
-                match objective.eval_step(&seed) {
+                match objective.eval_step(seed) {
                     Ok(_) => {}
                     Err(err) => {
                         let err = match err {
@@ -5699,7 +5693,7 @@ fn run_outer_with_plan(
                     fixed_point_tolerance: config.tolerance,
                     consecutive_psi_zero_iters: 0,
                 };
-                match objective.eval_step(&seed) {
+                match objective.eval_step(seed) {
                     Ok(_) => {}
                     Err(err) => {
                         let err = match err {

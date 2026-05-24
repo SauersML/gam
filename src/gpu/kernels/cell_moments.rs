@@ -172,7 +172,7 @@ extern "C" __global__ void cell_moments_kernel(
         .map_err(map_drv)?;
 
     let threads: u32 = 128;
-    let blocks = ((n_cells as u32) + threads - 1) / threads;
+    let blocks = (n_cells as u32).div_ceil(threads);
     let cfg = LaunchConfig {
         grid_dim: (blocks, 1, 1),
         block_dim: (threads, 1, 1),
