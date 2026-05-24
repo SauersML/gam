@@ -22174,7 +22174,7 @@ mod tests {
         let psi_dim: usize = dims_per_term.iter().sum();
         assert!(psi_dim >= 1);
 
-        let external_opts = external_opts_for_design(family, &frozen_design, &fit_opts);
+        let external_opts = external_opts_for_design(&family, &frozen_design, &fit_opts);
         let mut cache = SingleBlockExactJointDesignCache::new(
             data.view(),
             frozen.clone(),
