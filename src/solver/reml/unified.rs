@@ -14577,18 +14577,6 @@ pub struct BlockCoupledOperator {
 }
 
 impl BlockCoupledOperator {
-    /// Create from an assembled joint Hessian using the `Smooth` regularizer.
-    ///
-    /// Test-only convenience wrapper around
-    /// [`from_joint_hessian_with_mode`](Self::from_joint_hessian_with_mode).
-    /// Production call sites thread the family's `PseudoLogdetMode`
-    /// explicitly through `_with_mode`, so the Smooth-only entry point is
-    /// intentionally gated to tests to keep the family-mode choice
-    /// unambiguous at every production callsite.
-    pub fn from_joint_hessian(joint_hessian: &Array2<f64>) -> Result<Self, String> {
-        Self::from_joint_hessian_with_mode(joint_hessian, PseudoLogdetMode::Smooth)
-    }
-
     /// Construct from an assembled joint Hessian using the supplied
     /// [`PseudoLogdetMode`].  Internally performs a single
     /// eigendecomposition of `joint_hessian`.
