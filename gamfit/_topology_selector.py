@@ -313,6 +313,7 @@ def _latent_for_topology(latent: LatentCoord, name: str) -> LatentCoord:
         aux_prior=latent.aux_prior,
         dim_selection=latent.dim_selection,
         manifold=name,
+        retraction=getattr(latent, "retraction", "euclidean"),
         name=latent.name,
     )
 
