@@ -229,6 +229,7 @@ class IsometryPenalty:
     target: TargetSpec
     reference: Any = "euclidean"
     weight: WeightSpec = "auto"
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _validate_weight(self.weight, "IsometryPenalty")
@@ -245,12 +246,12 @@ class IsometryPenalty:
         `terms::analytic_penalties::IsometryPenalty` instance. Kept as a dict
         rather than a typed handle so the Python surface stays import-light.
         """
-        return {
+        return _add_weight_schedule({
             "kind": "isometry",
             "target": _target_descriptor(self.target),
             "reference": self.reference if isinstance(self.reference, str) else "user_supplied",
             "weight": self.weight,
-        }
+        }, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         return self._to_rust_payload()
@@ -303,6 +304,7 @@ class SparsityPenalty:
     weight: WeightSpec = "auto"
     eps: float = 1e-3
     eps_weight: Literal["auto", "fixed"] = "fixed"
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _validate_weight(self.weight, "SparsityPenalty")
@@ -325,14 +327,14 @@ class SparsityPenalty:
             )
 
     def _to_rust_payload(self) -> dict[str, Any]:
-        return {
+        return _add_weight_schedule({
             "kind": "sparsity",
             "target": _target_descriptor(self.target),
             "sparsity_kind": self.kind,
             "weight": self.weight,
             "eps": float(self.eps),
             "eps_weight": self.eps_weight,
-        }
+        }, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         return self._to_rust_payload()
@@ -382,6 +384,7 @@ class ScadMcpPenalty:
         self.gamma = float(gamma)
         self.smoothing_eps = float(smoothing_eps)
         self.learnable = bool(learnable)
+        self.weight_schedule = None
         self.__post_init__()
 
     def __post_init__(self) -> None:
@@ -402,7 +405,7 @@ class ScadMcpPenalty:
             )
 
     def _to_rust_payload(self) -> dict[str, Any]:
-        return {
+        return _add_weight_schedule({
             "kind": "scad_mcp",
             "target": _target_descriptor(self.target),
             "weight": self.weight,
@@ -411,7 +414,7 @@ class ScadMcpPenalty:
             "variant": self.variant,
             "smoothing_eps": self.smoothing_eps,
             "learnable": self.learnable,
-        }
+        }, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         return self._to_rust_payload()
@@ -449,6 +452,7 @@ class ARDPenalty:
 
     target: TargetSpec
     weight: Any = "auto"
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.weight, str):
@@ -469,11 +473,11 @@ class ARDPenalty:
                 raise ValueError("ARDPenalty.weight entries must be > 0")
 
     def _to_rust_payload(self) -> dict[str, Any]:
-        return {
+        return _add_weight_schedule({
             "kind": "ard",
             "target": _target_descriptor(self.target),
             "weight": self.weight,
-        }
+        }, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         return self._to_rust_payload()
