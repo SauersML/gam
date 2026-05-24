@@ -70,6 +70,7 @@ __all__ = [
     "OrthogonalityPenalty",
     "IBPAssignmentPenalty",
     "SoftmaxAssignmentSparsityPenalty",
+    "ScalarWeightSchedule",
     "Penalty",
 ]
 
@@ -78,6 +79,53 @@ __all__ = [
 # (held fixed at that value throughout the fit).
 WeightSpec: TypeAlias = str | float
 TargetSpec: TypeAlias = str | int | Any
+
+
+@dataclass(frozen=True)
+class ScalarWeightSchedule:
+    """Temperature-style annealing schedule for analytic penalty weights."""
+
+    w_start: float
+    w_end: float
+    kind: Literal["geometric", "linear", "reciprocal_iter"] = "geometric"
+    rate: float | None = 0.9
+    steps: int | None = None
+    iter_count: int = 0
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.w_start) or self.w_start < 0.0:
+            raise ValueError(
+                f"ScalarWeightSchedule.w_start must be finite and >= 0, got {self.w_start}"
+            )
+        if not np.isfinite(self.w_end) or self.w_end < 0.0:
+            raise ValueError(
+                f"ScalarWeightSchedule.w_end must be finite and >= 0, got {self.w_end}"
+            )
+        if self.kind == "geometric":
+            if self.rate is None or not np.isfinite(self.rate) or not 0.0 < self.rate < 1.0:
+                raise ValueError("ScalarWeightSchedule geometric rate must be in (0, 1)")
+        elif self.kind == "linear":
+            if self.steps is None or self.steps <= 0:
+                raise ValueError("ScalarWeightSchedule linear steps must be positive")
+        elif self.kind != "reciprocal_iter":
+            raise ValueError(
+                "ScalarWeightSchedule.kind must be 'geometric', 'linear', or 'reciprocal_iter'"
+            )
+        if self.iter_count < 0:
+            raise ValueError("ScalarWeightSchedule.iter_count must be non-negative")
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "w_start": float(self.w_start),
+            "w_end": float(self.w_end),
+            "kind": self.kind,
+            "iter_count": int(self.iter_count),
+        }
+        if self.kind == "geometric":
+            payload["rate"] = float(self.rate)
+        if self.kind == "linear":
+            payload["steps"] = int(self.steps)
+        return payload
 
 
 def _validate_weight(weight: Any, name: str) -> None:
@@ -93,6 +141,30 @@ def _validate_weight(weight: Any, name: str) -> None:
         raise TypeError(
             f"{name}.weight must be 'auto' or a positive float, got {type(weight).__name__}"
         )
+
+
+def _weight_schedule_descriptor(schedule: Any) -> dict[str, Any] | None:
+    if schedule is None:
+        return None
+    if isinstance(schedule, ScalarWeightSchedule):
+        return schedule.to_rust_descriptor()
+    if isinstance(schedule, dict):
+        return dict(schedule)
+    raise TypeError(
+        "weight_schedule must be ScalarWeightSchedule, a mapping, or None"
+    )
+
+
+def _add_weight_schedule(payload: dict[str, Any], owner: Any) -> dict[str, Any]:
+    schedule = _weight_schedule_descriptor(getattr(owner, "weight_schedule", None))
+    if schedule is not None:
+        payload["weight_schedule"] = schedule
+    return payload
+
+
+def _set_weight_schedule(self: Any, schedule: ScalarWeightSchedule | dict[str, Any]) -> Any:
+    self.weight_schedule = schedule
+    return self
 
 
 def _target_descriptor(target: Any) -> str | int:
