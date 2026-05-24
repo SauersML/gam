@@ -1976,9 +1976,9 @@ impl AnalyticPenalty for SparsityPenalty {
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
         let (lam, smooth) = self.resolved(rho);
-        let mut d = Array1::<f64>::zeros(target.len());
         match self.kind {
             SparsityKind::SmoothedL1 { .. } => {
+                let mut d = Array1::<f64>::zeros(target.len());
                 let eps2 = smooth * smooth;
                 for (i, &x) in target.iter().enumerate() {
                     let r = (x * x + eps2).sqrt();
@@ -1987,6 +1987,7 @@ impl AnalyticPenalty for SparsityPenalty {
                 Some(d)
             }
             SparsityKind::Log { .. } => {
+                let mut d = Array1::<f64>::zeros(target.len());
                 // The TRUE second derivative of λ log(1 + x²/δ²) is
                 //   2λ(δ² − x²)/(δ² + x²)²
                 // which is NEGATIVE for |x| > δ — i.e. Log is nonconvex.
@@ -2011,10 +2012,7 @@ impl AnalyticPenalty for SparsityPenalty {
             // through the standard `hessian_diag` path, so we return `None`
             // and force callers through `hvp`. See `hvp` below for the exact
             // dense-Hessian-vector product.
-            SparsityKind::Hoyer => {
-                drop(d);
-                None
-            }
+            SparsityKind::Hoyer => None,
         }
     }
 

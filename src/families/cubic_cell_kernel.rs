@@ -1760,15 +1760,6 @@ pub fn reduce_sextic_moments(
     Ok(moments)
 }
 
-#[cfg(test)]
-#[inline]
-pub fn polynomial_value(coefficients: &[f64], z: f64) -> f64 {
-    coefficients
-        .iter()
-        .rev()
-        .fold(0.0, |acc, &coeff| acc * z + coeff)
-}
-
 #[inline]
 pub fn cell_first_derivative_from_moments(
     derivative_coefficients: &[f64],
@@ -3584,6 +3575,22 @@ pub fn evaluate_cell_moments_with_scratch<'a>(
 mod tests {
     use super::*;
     use crate::probability::normal_pdf;
+
+    #[inline]
+    pub(super) fn polynomial_value(coefficients: &[f64], z: f64) -> f64 {
+        coefficients
+            .iter()
+            .rev()
+            .fold(0.0, |acc, &coeff| acc * z + coeff)
+    }
+
+    fn reset_cell_moment_test_reallocs() {
+        super::CELL_MOMENT_REALLOCS.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn cell_moment_test_reallocs() -> usize {
+        super::CELL_MOMENT_REALLOCS.load(std::sync::atomic::Ordering::Relaxed)
+    }
 
     fn assert_close_rel(label: &str, actual: f64, expected: f64, tol: f64) {
         let denom = expected.abs().max(1.0);

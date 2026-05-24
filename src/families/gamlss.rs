@@ -2377,7 +2377,19 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 gamlss_disable_fixed_point,
                 None,
                 outer_policy,
-                |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+                |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+                    assert_eq!(
+                        specs.len(),
+                        2,
+                        "joint spatial closure expects exactly two block specs (mean, noise); got {}",
+                        specs.len(),
+                    );
+                    assert_eq!(
+                        designs.len(),
+                        2,
+                        "joint spatial closure expects exactly two block designs (mean, noise); got {}",
+                        designs.len(),
+                    );
                     let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
                     let fit = {
                         let blocks = builder.build_blocks(
