@@ -18,13 +18,42 @@ fn main() {
 
     // Outright TO-DO ban (split below to avoid self-trigger in this file).
     let needle: &str = concat!("TO", "DO");
-    let mut offenders: Vec<(PathBuf, usize, String)> = Vec::new();
-    scan_for_banned_marker(&manifest_dir, &manifest_dir, needle, &mut offenders);
-    if !offenders.is_empty() {
+    let mut todo_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_banned_marker(&manifest_dir, &manifest_dir, needle, &mut todo_offenders);
+
+    // `#[allow(unused_*)]` and `#[allow(dead_code)]` ban. Unused-* lints
+    // (unused_assignments, unused_variables, unused_imports, unused_mut,
+    // unused_must_use, unused_macros, unused_doc_comments, unused_attributes,
+    // unused_parens, unused_braces, ...) catch dead code or dead writes that
+    // signal a logic error. `dead_code` is the same story for unused items.
+    // Silencing them locally hides bugs — use or delete instead.
+    let mut allow_offenders: Vec<(PathBuf, usize, String, String)> = Vec::new();
+    scan_for_banned_allow(&manifest_dir, &manifest_dir, &mut allow_offenders);
+
+    // `let _...` ban (any underscore-leading let pattern). This covers
+    // `let _ = expr;`, `let _: T = expr;`, `let _name = expr;`,
+    // `let mut _name = expr;`. Every underscore-leading binding silences
+    // the type system's unused-value feedback. Use or delete: bind a real
+    // name and read it, or call the expression for its effect without a
+    // binding (e.g. `drop(expr)` or just `expr;` for `Result` consumers
+    // wrapped behind an explicit check).
+    let mut underscore_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_let_underscore(&manifest_dir, &manifest_dir, &mut underscore_offenders);
+
+    // Ignored-test ban: every `#[ignore]` / `#[ignore = "..."]` attribute is
+    // a test the suite no longer enforces. Stop the build until they are
+    // either deleted or restored to the running suite.
+    let mut ignored: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_ignored_tests(&manifest_dir, &manifest_dir, &mut ignored);
+
+    let mut any_violation = false;
+
+    if !todo_offenders.is_empty() {
+        any_violation = true;
         eprintln!();
         eprintln!("error: {} markers are banned. just do it now.", needle);
         eprintln!();
-        for (rel, line_no, line) in &offenders {
+        for (rel, line_no, line) in &todo_offenders {
             let trimmed = line.trim();
             let snippet: String = trimmed.chars().take(160).collect();
             eprintln!("  {}:{}: {}", rel.display(), line_no, snippet);
@@ -32,23 +61,13 @@ fn main() {
         eprintln!();
         eprintln!(
             "error: {} {} marker(s) found. just do it now.",
-            offenders.len(),
+            todo_offenders.len(),
             needle
         );
-        std::process::exit(1);
     }
 
-    // `#[allow(unused_*)]` and `#[allow(dead_code)]` ban. Unused-* lints
-    // (unused_assignments, unused_variables, unused_imports, unused_mut,
-    // unused_must_use, unused_macros, unused_doc_comments, unused_attributes,
-    // unused_parens, unused_braces, ...) catch dead code or dead writes that
-    // signal a logic error. `dead_code` is the same story for unused items.
-    // Silencing them locally hides bugs — use or delete instead. Rewrite the
-    // code so the offending binding is actually read, or remove it.
-    let mut allow_offenders: Vec<(PathBuf, usize, String, String)> = Vec::new();
-    scan_for_banned_allow(&manifest_dir, &manifest_dir, &mut allow_offenders);
-    let allow_violations = !allow_offenders.is_empty();
-    if allow_violations {
+    if !allow_offenders.is_empty() {
+        any_violation = true;
         eprintln!();
         eprintln!(
             "error: {} banned `#[allow(...)]` attribute(s) found. \
@@ -60,28 +79,24 @@ fn main() {
         for (rel, line_no, lint, line) in &allow_offenders {
             let trimmed = line.trim();
             let snippet: String = trimmed.chars().take(160).collect();
-            eprintln!("  {}:{}: [allow({})] {}", rel.display(), line_no, lint, snippet);
+            eprintln!(
+                "  {}:{}: [allow({})] {}",
+                rel.display(),
+                line_no,
+                lint,
+                snippet
+            );
         }
         eprintln!();
     }
 
-    // `let _name = ...` ban (underscore-prefixed binding with a non-empty
-    // suffix). Such bindings silence `unused_variables` without naming the
-    // intent. Explicit alternatives exist for every legitimate case:
-    //   - drop result:        `let _ = expr;` or `drop(expr);`
-    //   - RAII guard scope:   `{ let g = lock(); ...use g... }` or
-    //                         `let g = lock(); std::mem::drop(g);` at exit
-    //   - keep alive to end:  bind with a real name and read it
-    // The bare `_` pattern (`let _ = ...`, `let _: T = ...`) is fine and
-    // not flagged here.
-    let mut underscore_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
-    scan_for_let_underscore_binding(&manifest_dir, &manifest_dir, &mut underscore_offenders);
     if !underscore_offenders.is_empty() {
+        any_violation = true;
         eprintln!();
         eprintln!(
-            "error: {} `let _name = ...` binding(s) found. \
-             Underscore-prefixed names silence unused-variable warnings — \
-             use a real name and read it, or use `let _ = ...` / `drop(...)`.",
+            "error: {} underscore-leading `let _...` binding(s) found. \
+             Every `let _...` (bare `_` or `_name`) is banned — bind a real \
+             name and read it, or call the expression without a binding.",
             underscore_offenders.len()
         );
         eprintln!();
@@ -91,15 +106,10 @@ fn main() {
             eprintln!("  {}:{}: {}", rel.display(), line_no, snippet);
         }
         eprintln!();
-        std::process::exit(1);
     }
 
-    // Ignored-test ban: every `#[ignore]` / `#[ignore = "..."]` attribute is
-    // a test the suite no longer enforces. Stop the build until they are
-    // either deleted or restored to the running suite.
-    let mut ignored: Vec<(PathBuf, usize, String)> = Vec::new();
-    scan_for_ignored_tests(&manifest_dir, &manifest_dir, &mut ignored);
     if !ignored.is_empty() {
+        any_violation = true;
         eprintln!();
         eprintln!(
             "error: {} `#[ignore]` test attribute(s) found.",
@@ -116,6 +126,9 @@ fn main() {
             eprintln!("  {}:{}: {}", rel.display(), line_no, snippet);
         }
         eprintln!();
+    }
+
+    if any_violation {
         std::process::exit(1);
     }
 }
@@ -204,13 +217,11 @@ fn scan_for_banned_allow(
     });
 }
 
-/// Scan for `let _name = ...` / `let mut _name = ...` / `let _name: T = ...`.
-/// Matches an underscore followed by at least one identifier char. The bare
-/// `let _ = ...` / `let _: T = ...` discard pattern is allowed and not
-/// flagged. Build.rs is exempt (its `let _name` would be self-flagging if
-/// any ever appeared; none do today, but the exemption mirrors the other
-/// scanners for consistency).
-fn scan_for_let_underscore_binding(
+/// Scan for any `let _...` binding (bare `_`, `_name`, `mut _`, `mut _name`).
+/// Skips lines whose `let` is inside a `//`-line-comment or a string literal.
+/// Multi-line raw strings and `/* ... */` blocks are out of scope: the scanner
+/// is a line-level heuristic, not a full parser. Build.rs is exempt.
+fn scan_for_let_underscore(
     root: &Path,
     dir: &Path,
     offenders: &mut Vec<(PathBuf, usize, String)>,
@@ -227,20 +238,18 @@ fn scan_for_let_underscore_binding(
             return;
         }
         for (idx, line) in content.lines().enumerate() {
-            if matches_let_underscore(line) {
+            if line_has_let_underscore(line) {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }
         }
     });
 }
 
-/// Returns true when `line` contains a `let` (or `let mut`) binding whose
-/// pattern starts with `_<ident_char>...`. Skips lines whose `let` is inside
-/// a `//`-line-comment or a string literal on that line. Multi-line raw
-/// strings and `/* ... */` blocks are out of scope: the scanner is a
-/// line-level heuristic, not a full parser, and the codebase does not use
-/// such constructs to embed `let _foo`.
-fn matches_let_underscore(line: &str) -> bool {
+/// Returns true when `line` contains a `let` (optionally followed by `mut`)
+/// whose pattern starts with `_`. Lexer-lite: tracks `//` line comments and
+/// string literals so the keyword check does not false-fire on commentary
+/// or string content.
+fn line_has_let_underscore(line: &str) -> bool {
     let bytes = line.as_bytes();
     let mut i = 0usize;
     let mut in_str = false;
@@ -267,7 +276,6 @@ fn matches_let_underscore(line: &str) -> bool {
             i += 1;
             continue;
         }
-        // Look for word `let` at this position with a word boundary before.
         if c == b'l'
             && i + 3 <= bytes.len()
             && &bytes[i..i + 3] == b"let"
@@ -275,26 +283,21 @@ fn matches_let_underscore(line: &str) -> bool {
             && i + 3 < bytes.len()
             && bytes[i + 3].is_ascii_whitespace()
         {
-            // Advance past `let` and any whitespace.
             let mut j = i + 3;
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                 j += 1;
             }
-            // Optional `mut `.
-            if j + 4 <= bytes.len() && &bytes[j..j + 3] == b"mut" && bytes[j + 3].is_ascii_whitespace()
+            if j + 4 <= bytes.len()
+                && &bytes[j..j + 3] == b"mut"
+                && bytes[j + 3].is_ascii_whitespace()
             {
                 j += 3;
                 while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                     j += 1;
                 }
             }
-            // Pattern must begin with `_` followed by at least one ident char.
             if j < bytes.len() && bytes[j] == b'_' {
-                if let Some(&next) = bytes.get(j + 1) {
-                    if is_ident_byte(next) {
-                        return true;
-                    }
-                }
+                return true;
             }
             i = j;
             continue;
