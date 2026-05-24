@@ -3962,6 +3962,7 @@ fn build_shape_constraint_design_1d(
                 knots,
                 identifiability_transform,
                 periodic,
+                ..
             },
         ) => {
             let evalspec = BSplineBasisSpec {
@@ -5248,6 +5249,7 @@ fn bspline_boundary_linear_constraints(
         knots,
         identifiability_transform,
         periodic: _,
+        ..
     } = metadata
     else {
         return Err(BasisError::InvalidInput(
@@ -7748,6 +7750,7 @@ fn with_identifiability_transform(
             knots,
             identifiability_transform,
             periodic,
+            streaming_chunk_size,
         } => Ok(BasisMetadata::BSpline1D {
             knots: knots.clone(),
             periodic: *periodic,
@@ -7755,6 +7758,7 @@ fn with_identifiability_transform(
                 identifiability_transform.as_ref(),
                 transform,
             )?,
+            streaming_chunk_size: *streaming_chunk_size,
         }),
         BasisMetadata::ThinPlate {
             centers,
@@ -14841,7 +14845,10 @@ impl SingleBlockLatentCoordDesignCache {
             (
                 SmoothBasisSpec::BSpline1D { spec, .. },
                 BasisMetadata::BSpline1D {
-                    knots, periodic, ..
+                    knots,
+                    periodic,
+                    streaming_chunk_size,
+                    ..
                 },
             ) => {
                 if let Some((domain_start, period, num_basis)) = periodic {
@@ -14850,11 +14857,13 @@ impl SingleBlockLatentCoordDesignCache {
                         period: *period,
                         degree: spec.degree,
                         num_basis: *num_basis,
+                        chunk_size: *streaming_chunk_size,
                     })
                 } else {
                     Ok(crate::solver::latent_cache::LatentBasisKind::TensorBspline {
                         knots: vec![knots.clone()],
                         degrees: vec![spec.degree],
+                        chunk_size: *streaming_chunk_size,
                     })
                 }
             }
@@ -14864,6 +14873,7 @@ impl SingleBlockLatentCoordDesignCache {
             ) => Ok(crate::solver::latent_cache::LatentBasisKind::TensorBspline {
                 knots: knots.clone(),
                 degrees: degrees.clone(),
+                chunk_size: None,
             }),
             (
                 SmoothBasisSpec::Pca { .. },
@@ -16130,6 +16140,7 @@ fn freeze_inner_smooth_basis_from_metadata(
                 knots,
                 identifiability_transform,
                 periodic,
+                ..
             },
         ) => {
             s.knotspec = periodic
@@ -16241,6 +16252,7 @@ pub fn freeze_term_collection_from_design(
                     knots,
                     identifiability_transform,
                     periodic,
+                    ..
                 },
             ) => {
                 s.knotspec = periodic
@@ -16532,6 +16544,7 @@ pub fn freeze_term_collection_from_design(
                         knots,
                         periodic,
                         identifiability_transform,
+                        ..
                     } = metadata
                 {
                     inner.knotspec = periodic
