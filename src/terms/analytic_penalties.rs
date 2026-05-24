@@ -34,14 +34,14 @@
 //!     shrinks whole semantic groups together; pair with
 //!     `LatentIdMode::AuxPriorDimSelection` when aux classes define the active
 //!     group subset.
-//!   * [`AuxConditionalPriorPenalty`] — iVAE-style auxiliary-conditional
-//!     prior on latent rows. This fixed-precomputed v1 accepts one precision
-//!     matrix per row; when ARD/Ortho fail to break the gauge, it adds the
-//!     missing supervision signal (memory `project_ard_gauge_fix_doesnt_help_cogito`,
-//!     `proposals/composition_engine.md` §4(c)).
-//!   * [`ParametricAuxConditionalPriorPenalty`] — iVAE-style aux-conditional
-//!     prior with a learnable distance-kernel map from auxiliary rows to
-//!     diagonal per-row precision.
+//!   * [`RowPrecisionPriorPenalty`] — zero-mean Gaussian row-precision
+//!     prior on latent rows. This fixed-precomputed variant accepts one
+//!     precision matrix per row. It is not an iVAE conditional-mean gauge;
+//!     use `LatentIdMode::AuxPrior` for the ridge/linear projection residual.
+//!   * [`ParametricRowPrecisionPriorPenalty`] — zero-mean Gaussian
+//!     row-precision prior with a learnable distance-kernel map from auxiliary
+//!     rows to diagonal per-row precision. It changes shrinkage strength, not
+//!     the conditional mean.
 //!   * [`OrthogonalityPenalty`] — fixes the rotation gauge inside a latent
 //!     block by penalizing cross-axis correlations. Pair with ARD when
 //!     intrinsic dimension should be identifiable.
@@ -71,8 +71,8 @@
 //! kernel-shape paths append ext-coords. The IsometryPenalty owns one `ρ`; the
 //! SparsityPenalty owns either zero (`ε` fixed) or one (`ε` REML-selected) plus
 //! one strength; the ARDPenalty owns `d` (one per latent axis);
-//! NuclearNorm, BlockSparsity, AuxConditionalPrior, and Orthogonality each own
-//! one strength only when their weight is learnable. ParametricAuxConditional
+//! NuclearNorm, BlockSparsity, RowPrecisionPrior, and Orthogonality each own
+//! one strength only when their weight is learnable. ParametricRowPrecisionPrior
 //! owns its log-baseline precision, raw distance sensitivity, and reference
 //! point coordinates, plus one strength axis when requested.
 //!
@@ -87,8 +87,8 @@
 //! | TV        | ext-coord (latent t) | 0 or 1 (log μ_tv)    |
 //! | NuclearNorm | ext-coord (latent t) | 0 or 1 (log μ_nuc)  |
 //! | BlockSparsity | ext-coord (latent t) | 0 or 1 (log μ_group) |
-//! | AuxConditionalPrior | ext-coord (latent t) | 0 or 1 (log μ_aux) |
-//! | ParametricAuxConditionalPrior | ext-coord (latent t) | d + d + d·du [+1 log μ_aux] |
+//! | RowPrecisionPrior | ext-coord (latent t) | 0 or 1 (log μ_aux) |
+//! | ParametricRowPrecisionPrior | ext-coord (latent t) | d + d + d·du [+1 log μ_aux] |
 //! | Orthogonality | ext-coord (latent t) | 0 or 1 (log μ_orth) |
 
 use faer::Side;
@@ -3444,18 +3444,18 @@ impl AnalyticPenalty for BlockSparsityPenalty {
 }
 
 // ---------------------------------------------------------------------------
-// Aux-conditional prior penalty
+// Row-precision prior penalty
 // ---------------------------------------------------------------------------
 
-/// iVAE-style auxiliary-conditional prior on the latent block.
+/// Fixed zero-mean Gaussian row-precision prior on the latent block.
 ///
-/// Fixed-precomputed v1 of `p(t_n | u_n) ∝ exp(-½ t_nᵀ Λ_n t_n)`: callers pass
-/// one positive-definite precision matrix per row. This is the missing sibling
-/// to ARD/Ortho/sparsity from `proposals/composition_engine.md` §4(c); when
-/// ARD/Ortho fail to break the gauge, aux-conditional precision adds the HSV
-/// supervision signal identified in memory `project_ard_gauge_fix_doesnt_help_cogito`.
+/// Evaluates the row-wise precision energy `½ μ Σ_n t_nᵀ Λ_n t_n`, with the
+/// `ρ`-dependent Gaussian precision normalizer when `μ` is learnable. Callers
+/// pass one positive-definite precision matrix per row. This is not the iVAE
+/// conditional-mean gauge `½ μ ||t - h(u)||²`; use `LatentIdMode::AuxPrior`
+/// for the ridge/linear projection-residual gauge.
 #[derive(Debug, Clone)]
-pub struct AuxConditionalPriorPenalty {
+pub struct RowPrecisionPriorPenalty {
     pub lambda_per_row: Array3<f64>,
     /// Base strength. If `learnable_weight` is true, the resolved strength is
     /// `weight * exp(rho[rho_index])`; otherwise it is fixed at `weight`.
@@ -3468,7 +3468,7 @@ pub struct AuxConditionalPriorPenalty {
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
-impl AuxConditionalPriorPenalty {
+impl RowPrecisionPriorPenalty {
     #[must_use = "build error must be handled"]
     pub fn new(
         target: PsiSlice,
@@ -3478,19 +3478,19 @@ impl AuxConditionalPriorPenalty {
         learnable_weight: bool,
     ) -> Result<Self, String> {
         if target.is_empty() {
-            return Err("AuxConditionalPriorPenalty::new requires a non-empty target".to_string());
+            return Err("RowPrecisionPriorPenalty::new requires a non-empty target".to_string());
         }
         if !(weight.is_finite() && weight > 0.0) {
             return Err(format!(
-                "AuxConditionalPriorPenalty::new requires finite weight > 0, got {weight}"
+                "RowPrecisionPriorPenalty::new requires finite weight > 0, got {weight}"
             ));
         }
         if n_eff == 0 {
-            return Err("AuxConditionalPriorPenalty::new requires n_eff > 0".to_string());
+            return Err("RowPrecisionPriorPenalty::new requires n_eff > 0".to_string());
         }
         if target.len() % n_eff != 0 {
             return Err(format!(
-                "AuxConditionalPriorPenalty::new target length {} is not divisible by n_eff {}",
+                "RowPrecisionPriorPenalty::new target length {} is not divisible by n_eff {}",
                 target.len(),
                 n_eff
             ));
@@ -3498,11 +3498,11 @@ impl AuxConditionalPriorPenalty {
         let latent_dim = target.len() / n_eff;
         if let Some(expected_dim) = target.latent_dim {
             let expected = n_eff.checked_mul(expected_dim).ok_or_else(|| {
-                "AuxConditionalPriorPenalty::new target shape overflows usize".to_string()
+                "RowPrecisionPriorPenalty::new target shape overflows usize".to_string()
             })?;
             if expected != target.len() {
                 return Err(format!(
-                    "AuxConditionalPriorPenalty::new target length {} does not match n_eff {} × latent_dim {}",
+                    "RowPrecisionPriorPenalty::new target length {} does not match n_eff {} × latent_dim {}",
                     target.len(),
                     n_eff,
                     expected_dim
@@ -3510,14 +3510,14 @@ impl AuxConditionalPriorPenalty {
             }
             if expected_dim != latent_dim {
                 return Err(format!(
-                    "AuxConditionalPriorPenalty::new inferred latent_dim {latent_dim} does not match target latent_dim {expected_dim}"
+                    "RowPrecisionPriorPenalty::new inferred latent_dim {latent_dim} does not match target latent_dim {expected_dim}"
                 ));
             }
         }
         let (lambda_n, lambda_rows, lambda_cols) = lambda_per_row.dim();
         if lambda_n != n_eff || lambda_rows != latent_dim || lambda_cols != latent_dim {
             return Err(format!(
-                "AuxConditionalPriorPenalty::new lambda_per_row shape must be ({n_eff}, {latent_dim}, {latent_dim}), got ({lambda_n}, {lambda_rows}, {lambda_cols})"
+                "RowPrecisionPriorPenalty::new lambda_per_row shape must be ({n_eff}, {latent_dim}, {latent_dim}), got ({lambda_n}, {lambda_rows}, {lambda_cols})"
             ));
         }
         for n in 0..n_eff {
@@ -3527,13 +3527,13 @@ impl AuxConditionalPriorPenalty {
                     let value = lambda_per_row[[n, i, j]];
                     if !value.is_finite() {
                         return Err(format!(
-                            "AuxConditionalPriorPenalty::new lambda_per_row[{n},{i},{j}] must be finite"
+                            "RowPrecisionPriorPenalty::new lambda_per_row[{n},{i},{j}] must be finite"
                         ));
                     }
                     let transpose = lambda_per_row[[n, j, i]];
                     if (value - transpose).abs() >= 1.0e-10 {
                         return Err(format!(
-                            "AuxConditionalPriorPenalty::new lambda_per_row[{n}] must be symmetric; |Λ[{i},{j}] - Λ[{j},{i}]| = {:.3e}",
+                            "RowPrecisionPriorPenalty::new lambda_per_row[{n}] must be symmetric; |Λ[{i},{j}] - Λ[{j},{i}]| = {:.3e}",
                             (value - transpose).abs()
                         ));
                     }
@@ -3541,12 +3541,12 @@ impl AuxConditionalPriorPenalty {
                 }
             }
             let (evals, _) = matrix.eigh(Side::Lower).map_err(|err| {
-                format!("AuxConditionalPriorPenalty::new lambda_per_row[{n}] eigendecomposition failed: {err}")
+                format!("RowPrecisionPriorPenalty::new lambda_per_row[{n}] eigendecomposition failed: {err}")
             })?;
             let min_eval = evals.iter().fold(f64::INFINITY, |acc, &v| acc.min(v));
             if !(min_eval.is_finite() && min_eval > 0.0) {
                 return Err(format!(
-                    "AuxConditionalPriorPenalty::new lambda_per_row[{n}] must be positive definite; minimum eigenvalue {min_eval:.3e}"
+                    "RowPrecisionPriorPenalty::new lambda_per_row[{n}] must be positive definite; minimum eigenvalue {min_eval:.3e}"
                 ));
             }
         }
@@ -3654,7 +3654,7 @@ impl AuxConditionalPriorPenalty {
     ) -> Result<f64, String> {
         if !(lambda.is_finite() && lambda > 0.0) {
             return Err(format!(
-                "AuxConditionalPriorPenalty::log_det_plus_lambda_i requires finite λ > 0; got {lambda}"
+                "RowPrecisionPriorPenalty::log_det_plus_lambda_i requires finite λ > 0; got {lambda}"
             ));
         }
         let (n_obs, d, _) = self.lambda_per_row.dim();
@@ -3668,13 +3668,13 @@ impl AuxConditionalPriorPenalty {
                 }
             }
             let (evals, _) = matrix.eigh(Side::Lower).map_err(|err| {
-                format!("AuxConditionalPriorPenalty::log_det_plus_lambda_i lambda_per_row[{n}] eigendecomposition failed: {err}")
+                format!("RowPrecisionPriorPenalty::log_det_plus_lambda_i lambda_per_row[{n}] eigendecomposition failed: {err}")
             })?;
             for &eval in evals.iter() {
                 let shifted = weight * eval + lambda;
                 if !(shifted.is_finite() && shifted > 0.0) {
                     return Err(format!(
-                        "AuxConditionalPriorPenalty::log_det_plus_lambda_i non-positive shifted eigenvalue {shifted:.3e}"
+                        "RowPrecisionPriorPenalty::log_det_plus_lambda_i non-positive shifted eigenvalue {shifted:.3e}"
                     ));
                 }
                 sum += shifted.ln();
@@ -3684,7 +3684,7 @@ impl AuxConditionalPriorPenalty {
     }
 }
 
-impl AnalyticPenalty for AuxConditionalPriorPenalty {
+impl AnalyticPenalty for RowPrecisionPriorPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
     }
@@ -3703,7 +3703,9 @@ impl AnalyticPenalty for AuxConditionalPriorPenalty {
                 acc += t[[n, i]] * row_dot;
             }
         }
-        0.5 * self.resolved_weight(rho) * acc
+        let weight = self.resolved_weight(rho);
+        let log_weight_normalizer = -0.5 * target.len() as f64 * weight.ln();
+        0.5 * weight * acc + log_weight_normalizer
     }
 
     fn grad_target(
@@ -3726,6 +3728,26 @@ impl AnalyticPenalty for AuxConditionalPriorPenalty {
             }
         }
         Self::flatten_matrix(&grad)
+    }
+
+    fn hessian_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        let Some(t) = self.target_matrix(target) else {
+            return Some(Array1::<f64>::zeros(target.len()));
+        };
+        for n in 0..t.nrows() {
+            for i in 0..t.ncols() {
+                for j in 0..t.ncols() {
+                    if i != j && self.lambda_per_row[[n, i, j]] != 0.0 {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(self.diag_target(target, rho))
     }
 
     fn hvp(
@@ -3766,8 +3788,22 @@ impl AnalyticPenalty for AuxConditionalPriorPenalty {
         if !self.learnable_weight {
             return Array1::<f64>::zeros(0);
         }
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(1);
+        };
+        let mut quad = 0.0;
+        for n in 0..t.nrows() {
+            for i in 0..t.ncols() {
+                let mut row_dot = 0.0;
+                for j in 0..t.ncols() {
+                    row_dot += self.lambda_per_row[[n, i, j]] * t[[n, j]];
+                }
+                quad += t[[n, i]] * row_dot;
+            }
+        }
+        let weight = self.resolved_weight(rho);
         let mut out = Array1::<f64>::zeros(1);
-        out[self.rho_index] = self.value(target, rho);
+        out[self.rho_index] = 0.5 * weight * quad - 0.5 * target.len() as f64;
         out
     }
 
@@ -3776,7 +3812,7 @@ impl AnalyticPenalty for AuxConditionalPriorPenalty {
     }
 
     fn name(&self) -> &str {
-        "aux_conditional_prior"
+        "row_precision_prior"
     }
 
     fn apply_schedule(&mut self, iter: usize) {
@@ -3785,23 +3821,18 @@ impl AnalyticPenalty for AuxConditionalPriorPenalty {
 }
 
 // ---------------------------------------------------------------------------
-// Parametric auxiliary-conditional prior penalty
+// Parametric row-precision prior penalty
 // ---------------------------------------------------------------------------
 
-/// Parametric iVAE auxiliary-conditional prior on the latent block.
+/// Parametric zero-mean Gaussian row-precision prior on the latent block.
 ///
-/// Distance-kernel variant of `p(t_n | u_n) ∝ exp(-½ t_nᵀ Λ(u_n)t_n)` with
-/// diagonal precision `λ_k(u_n) = exp(log_alpha_k) + softplus(raw_beta_k)
-/// ||u_n - μ_k||²`. Use the FIXED variant when Λ is known per row; use this
-/// PARAMETRIC variant when REML should learn the aux-to-Λ mapping.
-///
-/// Motivation: `examples/aux_conditional_prior_demo.py` (b31w36m23) showed
-/// that AuxConditional + ARD recovers iVAE §4(c) identifiability on synthetic
-/// data with `axes_kept = [4, 4, 2]`; ML workflows such as cogito steering and
-/// gene-expression iVAE need learnable `Λ(u_n) = f(u_n; ψ)` rather than
-/// externally precomputed row inverses.
+/// Uses a diagonal precision
+/// `λ_k(u_n) = exp(log_alpha_k) + softplus(raw_beta_k) ||u_n - μ_k||²`.
+/// REML may learn that conditional precision map, including the Gaussian
+/// precision normalizer derivatives. This is not a learnable conditional
+/// mean map and does not implement the iVAE projection-residual gauge.
 #[derive(Debug, Clone)]
-pub struct ParametricAuxConditionalPriorPenalty {
+pub struct ParametricRowPrecisionPriorPenalty {
     pub aux: Array2<f64>,
     pub log_alpha: Array1<f64>,
     pub raw_beta: Array1<f64>,
@@ -3816,7 +3847,7 @@ pub struct ParametricAuxConditionalPriorPenalty {
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
-impl ParametricAuxConditionalPriorPenalty {
+impl ParametricRowPrecisionPriorPenalty {
     #[must_use = "build error must be handled"]
     pub fn new(
         target: PsiSlice,
@@ -3830,22 +3861,22 @@ impl ParametricAuxConditionalPriorPenalty {
     ) -> Result<Self, String> {
         if target.is_empty() {
             return Err(
-                "ParametricAuxConditionalPriorPenalty::new requires a non-empty target".to_string(),
+                "ParametricRowPrecisionPriorPenalty::new requires a non-empty target".to_string(),
             );
         }
         if !(weight.is_finite() && weight > 0.0) {
             return Err(format!(
-                "ParametricAuxConditionalPriorPenalty::new requires finite weight > 0, got {weight}"
+                "ParametricRowPrecisionPriorPenalty::new requires finite weight > 0, got {weight}"
             ));
         }
         if n_eff == 0 {
             return Err(
-                "ParametricAuxConditionalPriorPenalty::new requires n_eff > 0".to_string(),
+                "ParametricRowPrecisionPriorPenalty::new requires n_eff > 0".to_string(),
             );
         }
         if target.len() % n_eff != 0 {
             return Err(format!(
-                "ParametricAuxConditionalPriorPenalty::new target length {} is not divisible by n_eff {}",
+                "ParametricRowPrecisionPriorPenalty::new target length {} is not divisible by n_eff {}",
                 target.len(),
                 n_eff
             ));
@@ -3853,16 +3884,16 @@ impl ParametricAuxConditionalPriorPenalty {
         let latent_dim = target.len() / n_eff;
         if latent_dim == 0 {
             return Err(
-                "ParametricAuxConditionalPriorPenalty::new requires latent_dim > 0".to_string(),
+                "ParametricRowPrecisionPriorPenalty::new requires latent_dim > 0".to_string(),
             );
         }
         if let Some(expected_dim) = target.latent_dim {
             let expected = n_eff.checked_mul(expected_dim).ok_or_else(|| {
-                "ParametricAuxConditionalPriorPenalty::new target shape overflows usize".to_string()
+                "ParametricRowPrecisionPriorPenalty::new target shape overflows usize".to_string()
             })?;
             if expected != target.len() {
                 return Err(format!(
-                    "ParametricAuxConditionalPriorPenalty::new target length {} does not match n_eff {} × latent_dim {}",
+                    "ParametricRowPrecisionPriorPenalty::new target length {} does not match n_eff {} × latent_dim {}",
                     target.len(),
                     n_eff,
                     expected_dim
@@ -3870,43 +3901,43 @@ impl ParametricAuxConditionalPriorPenalty {
             }
             if expected_dim != latent_dim {
                 return Err(format!(
-                    "ParametricAuxConditionalPriorPenalty::new inferred latent_dim {latent_dim} does not match target latent_dim {expected_dim}"
+                    "ParametricRowPrecisionPriorPenalty::new inferred latent_dim {latent_dim} does not match target latent_dim {expected_dim}"
                 ));
             }
         }
         let (aux_n, aux_dim) = aux.dim();
         if aux_n != n_eff {
             return Err(format!(
-                "ParametricAuxConditionalPriorPenalty::new aux rows must equal n_eff {n_eff}, got {aux_n}"
+                "ParametricRowPrecisionPriorPenalty::new aux rows must equal n_eff {n_eff}, got {aux_n}"
             ));
         }
         if aux_dim == 0 {
             return Err(
-                "ParametricAuxConditionalPriorPenalty::new requires aux dimension > 0".to_string(),
+                "ParametricRowPrecisionPriorPenalty::new requires aux dimension > 0".to_string(),
             );
         }
         if log_alpha.len() != latent_dim {
             return Err(format!(
-                "ParametricAuxConditionalPriorPenalty::new log_alpha length must equal latent_dim {latent_dim}, got {}",
+                "ParametricRowPrecisionPriorPenalty::new log_alpha length must equal latent_dim {latent_dim}, got {}",
                 log_alpha.len()
             ));
         }
         if raw_beta.len() != latent_dim {
             return Err(format!(
-                "ParametricAuxConditionalPriorPenalty::new raw_beta length must equal latent_dim {latent_dim}, got {}",
+                "ParametricRowPrecisionPriorPenalty::new raw_beta length must equal latent_dim {latent_dim}, got {}",
                 raw_beta.len()
             ));
         }
         let (mu_rows, mu_cols) = mu.dim();
         if mu_rows != latent_dim || mu_cols != aux_dim {
             return Err(format!(
-                "ParametricAuxConditionalPriorPenalty::new mu shape must be ({latent_dim}, {aux_dim}), got ({mu_rows}, {mu_cols})"
+                "ParametricRowPrecisionPriorPenalty::new mu shape must be ({latent_dim}, {aux_dim}), got ({mu_rows}, {mu_cols})"
             ));
         }
         for (idx, &value) in aux.iter().enumerate() {
             if !value.is_finite() {
                 return Err(format!(
-                    "ParametricAuxConditionalPriorPenalty::new aux[{idx}] must be finite"
+                    "ParametricRowPrecisionPriorPenalty::new aux[{idx}] must be finite"
                 ));
             }
         }
@@ -3914,32 +3945,32 @@ impl ParametricAuxConditionalPriorPenalty {
             let log_alpha_k = log_alpha[k];
             if !log_alpha_k.is_finite() {
                 return Err(format!(
-                    "ParametricAuxConditionalPriorPenalty::new log_alpha[{k}] must be finite"
+                    "ParametricRowPrecisionPriorPenalty::new log_alpha[{k}] must be finite"
                 ));
             }
             let alpha_k = log_alpha_k.exp();
             if !(alpha_k.is_finite() && alpha_k > 0.0) {
                 return Err(format!(
-                    "ParametricAuxConditionalPriorPenalty::new exp(log_alpha[{k}]) must be finite and > 0"
+                    "ParametricRowPrecisionPriorPenalty::new exp(log_alpha[{k}]) must be finite and > 0"
                 ));
             }
             let raw_beta_k = raw_beta[k];
             if !raw_beta_k.is_finite() {
                 return Err(format!(
-                    "ParametricAuxConditionalPriorPenalty::new raw_beta[{k}] must be finite"
+                    "ParametricRowPrecisionPriorPenalty::new raw_beta[{k}] must be finite"
                 ));
             }
             let beta_k = stable_softplus(raw_beta_k);
             if !(beta_k.is_finite() && beta_k >= 0.0) {
                 return Err(format!(
-                    "ParametricAuxConditionalPriorPenalty::new softplus(raw_beta[{k}]) must be finite and >= 0"
+                    "ParametricRowPrecisionPriorPenalty::new softplus(raw_beta[{k}]) must be finite and >= 0"
                 ));
             }
         }
         for (idx, &value) in mu.iter().enumerate() {
             if !value.is_finite() {
                 return Err(format!(
-                    "ParametricAuxConditionalPriorPenalty::new mu[{idx}] must be finite"
+                    "ParametricRowPrecisionPriorPenalty::new mu[{idx}] must be finite"
                 ));
             }
         }
@@ -4083,7 +4114,7 @@ impl ParametricAuxConditionalPriorPenalty {
     ) -> Result<f64, String> {
         if !(lambda.is_finite() && lambda > 0.0) {
             return Err(format!(
-                "ParametricAuxConditionalPriorPenalty::log_det_plus_lambda_i requires finite λ > 0; got {lambda}"
+                "ParametricRowPrecisionPriorPenalty::log_det_plus_lambda_i requires finite λ > 0; got {lambda}"
             ));
         }
         let weight = self.resolved_weight(rho);
@@ -4093,7 +4124,7 @@ impl ParametricAuxConditionalPriorPenalty {
                 let shifted = lambda + weight * self.lambda_at(n, k, rho);
                 if !(shifted.is_finite() && shifted > 0.0) {
                     return Err(format!(
-                        "ParametricAuxConditionalPriorPenalty::log_det_plus_lambda_i non-positive shifted diagonal {shifted:.3e}"
+                        "ParametricRowPrecisionPriorPenalty::log_det_plus_lambda_i non-positive shifted diagonal {shifted:.3e}"
                     ));
                 }
                 sum += shifted.ln();
@@ -4103,7 +4134,7 @@ impl ParametricAuxConditionalPriorPenalty {
     }
 }
 
-impl AnalyticPenalty for ParametricAuxConditionalPriorPenalty {
+impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
     fn tier(&self) -> PenaltyTier {
         PenaltyTier::Psi
     }
@@ -4112,13 +4143,17 @@ impl AnalyticPenalty for ParametricAuxConditionalPriorPenalty {
         let Some(t) = self.target_matrix(target) else {
             return 0.0;
         };
-        let mut acc = 0.0;
+        let weight = self.resolved_weight(rho);
+        let mut quadratic = 0.0;
+        let mut log_det = 0.0;
         for n in 0..t.nrows() {
             for k in 0..t.ncols() {
-                acc += self.lambda_at(n, k, rho) * t[[n, k]] * t[[n, k]];
+                let lambda = self.lambda_at(n, k, rho);
+                quadratic += lambda * t[[n, k]] * t[[n, k]];
+                log_det += (weight * lambda).ln();
             }
         }
-        0.5 * self.resolved_weight(rho) * acc
+        0.5 * weight * quadratic - 0.5 * log_det
     }
 
     fn grad_target(
@@ -4177,6 +4212,7 @@ impl AnalyticPenalty for ParametricAuxConditionalPriorPenalty {
         let mut out = Array1::<f64>::zeros(self.rho_count());
         let d = t.ncols();
         let du = self.aux.ncols();
+        let mut grad_weight_direct = 0.0;
         for k in 0..d {
             let log_alpha = self.active_log_alpha(k, rho);
             let alpha = log_alpha.exp();
@@ -4190,11 +4226,14 @@ impl AnalyticPenalty for ParametricAuxConditionalPriorPenalty {
                 let tk = t[[n, k]];
                 let sq = tk * tk;
                 let r2 = self.dist2(n, k, rho);
-                grad_alpha_direct += 0.5 * weight * sq;
-                grad_beta_direct += 0.5 * weight * sq * r2;
+                let lambda = alpha + beta * r2;
+                let precision_score = 0.5 * weight * sq - 0.5 / lambda;
+                grad_weight_direct += 0.5 * weight * lambda * sq;
+                grad_alpha_direct += precision_score;
+                grad_beta_direct += precision_score * r2;
                 for a in 0..du {
                     let delta = self.aux[[n, a]] - self.active_mu(k, a, rho);
-                    grad_mu_direct[a] += -weight * sq * beta * delta;
+                    grad_mu_direct[a] += -2.0 * precision_score * beta * delta;
                 }
             }
             out[self.log_alpha_offset() + k] = grad_alpha_direct * alpha;
@@ -4204,7 +4243,7 @@ impl AnalyticPenalty for ParametricAuxConditionalPriorPenalty {
             }
         }
         if self.learnable_weight {
-            out[self.weight_offset()] = self.value(target, rho);
+            out[self.weight_offset()] = grad_weight_direct - 0.5 * target.len() as f64;
         }
         out
     }
@@ -4214,7 +4253,7 @@ impl AnalyticPenalty for ParametricAuxConditionalPriorPenalty {
     }
 
     fn name(&self) -> &str {
-        "parametric_aux_conditional_prior"
+        "parametric_row_precision_prior"
     }
 
     fn apply_schedule(&mut self, iter: usize) {
@@ -4236,7 +4275,7 @@ impl AnalyticPenalty for ParametricAuxConditionalPriorPenalty {
 /// gradient magnitude stays constant outside the Huber region. That constant
 /// pull over-shrinks moderate true signals. SCAD/MCP flatten the gradient for
 /// large coefficients, which gives less-biased estimates while still shrinking
-/// near-zero noise; paired with AuxConditional/Parametric priors, the aux prior
+/// near-zero noise; paired with row-precision priors, the precision field
 /// anchors which axes are active and this penalty fits their magnitudes without
 /// L¹'s constant pull.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4941,8 +4980,8 @@ pub enum AnalyticPenaltyKind {
     TotalVariation(Arc<TotalVariationPenalty>),
     NuclearNorm(Arc<NuclearNormPenalty>),
     BlockSparsity(Arc<BlockSparsityPenalty>),
-    AuxConditionalPrior(Arc<AuxConditionalPriorPenalty>),
-    ParametricAuxConditionalPrior(Arc<ParametricAuxConditionalPriorPenalty>),
+    RowPrecisionPrior(Arc<RowPrecisionPriorPenalty>),
+    ParametricRowPrecisionPrior(Arc<ParametricRowPrecisionPriorPenalty>),
     ScadMcp(Arc<ScadMcpPenalty>),
     Orthogonality(Arc<OrthogonalityPenalty>),
 }
@@ -4960,8 +4999,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => Arc::make_mut(p).apply_schedule(iter),
             AnalyticPenaltyKind::NuclearNorm(p) => Arc::make_mut(p).apply_schedule(iter),
             AnalyticPenaltyKind::BlockSparsity(p) => Arc::make_mut(p).apply_schedule(iter),
-            AnalyticPenaltyKind::AuxConditionalPrior(p) => Arc::make_mut(p).apply_schedule(iter),
-            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => {
+            AnalyticPenaltyKind::RowPrecisionPrior(p) => Arc::make_mut(p).apply_schedule(iter),
+            AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => {
                 Arc::make_mut(p).apply_schedule(iter)
             }
             AnalyticPenaltyKind::ScadMcp(p) => Arc::make_mut(p).apply_schedule(iter),
@@ -4979,8 +5018,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.tier(),
             AnalyticPenaltyKind::NuclearNorm(p) => p.tier(),
             AnalyticPenaltyKind::BlockSparsity(p) => p.tier(),
-            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.tier(),
-            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.tier(),
+            AnalyticPenaltyKind::RowPrecisionPrior(p) => p.tier(),
+            AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.tier(),
             AnalyticPenaltyKind::ScadMcp(p) => p.tier(),
             AnalyticPenaltyKind::Orthogonality(p) => p.tier(),
         }
@@ -4996,8 +5035,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.rho_count(),
             AnalyticPenaltyKind::NuclearNorm(p) => p.rho_count(),
             AnalyticPenaltyKind::BlockSparsity(p) => p.rho_count(),
-            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.rho_count(),
-            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.rho_count(),
+            AnalyticPenaltyKind::RowPrecisionPrior(p) => p.rho_count(),
+            AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.rho_count(),
             AnalyticPenaltyKind::ScadMcp(p) => p.rho_count(),
             AnalyticPenaltyKind::Orthogonality(p) => p.rho_count(),
         }
@@ -5013,8 +5052,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.name(),
             AnalyticPenaltyKind::NuclearNorm(p) => p.name(),
             AnalyticPenaltyKind::BlockSparsity(p) => p.name(),
-            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.name(),
-            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.name(),
+            AnalyticPenaltyKind::RowPrecisionPrior(p) => p.name(),
+            AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.name(),
             AnalyticPenaltyKind::ScadMcp(p) => p.name(),
             AnalyticPenaltyKind::Orthogonality(p) => p.name(),
         }
@@ -5030,8 +5069,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.value(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.value(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.value(target, rho),
-            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.value(target, rho),
-            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.value(target, rho),
+            AnalyticPenaltyKind::RowPrecisionPrior(p) => p.value(target, rho),
+            AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.value(target, rho),
             AnalyticPenaltyKind::ScadMcp(p) => p.value(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.value(target, rho),
         }
@@ -5051,8 +5090,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.grad_target(target, rho),
-            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.grad_target(target, rho),
-            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::RowPrecisionPrior(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::ScadMcp(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_target(target, rho),
         }
@@ -5072,8 +5111,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.grad_rho(target, rho),
-            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.grad_rho(target, rho),
-            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::RowPrecisionPrior(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::ScadMcp(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_rho(target, rho),
         }
@@ -5093,8 +5132,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.hessian_diag(target, rho),
-            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.hessian_diag(target, rho),
-            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::RowPrecisionPrior(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::ScadMcp(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.hessian_diag(target, rho),
         }
@@ -5122,8 +5161,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::NuclearNorm(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::BlockSparsity(p) => p.hvp(target, rho, v),
-            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.hvp(target, rho, v),
-            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::RowPrecisionPrior(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::ScadMcp(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Orthogonality(p) => p.hvp(target, rho, v),
         }
@@ -5254,10 +5293,10 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::BlockSparsity(p) => {
                 p.diag_target(self.target.view(), self.rho.view())
             }
-            AnalyticPenaltyKind::AuxConditionalPrior(p) => {
+            AnalyticPenaltyKind::RowPrecisionPrior(p) => {
                 p.diag_target(self.target.view(), self.rho.view())
             }
-            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => {
+            AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => {
                 p.diag_target(self.target.view(), self.rho.view())
             }
             AnalyticPenaltyKind::ScadMcp(p) => {
@@ -5342,10 +5381,10 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             {
                 self.stochastic_log_det_plus_lambda_i(lambda)
             }
-            AnalyticPenaltyKind::AuxConditionalPrior(p) => {
+            AnalyticPenaltyKind::RowPrecisionPrior(p) => {
                 p.log_det_plus_lambda_i(self.rho.view(), lambda)
             }
-            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => {
+            AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => {
                 p.log_det_plus_lambda_i(self.rho.view(), lambda)
             }
             AnalyticPenaltyKind::ScadMcp(p) => {
@@ -5375,10 +5414,10 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::BlockSparsity(p) => {
                 return p.as_dense(self.target.view(), self.rho.view());
             }
-            AnalyticPenaltyKind::AuxConditionalPrior(p) => {
+            AnalyticPenaltyKind::RowPrecisionPrior(p) => {
                 return p.as_dense(self.target.view(), self.rho.view());
             }
-            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => {
+            AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => {
                 return p.as_dense(self.target.view(), self.rho.view());
             }
             AnalyticPenaltyKind::Orthogonality(p) => {

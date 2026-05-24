@@ -46,6 +46,24 @@ fn main() {
     let mut ignored: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_ignored_tests(&manifest_dir, &manifest_dir, &mut ignored);
 
+    // Banned substrings in code (skipping `//` line comments and `"..."` /
+    // `'..'` literals via a lexer-lite). Each entry is matched against the
+    // stripped code portion of every line. Build.rs is exempt (it names the
+    // needles as part of this scanner's contract).
+    let mut substring_offenders: Vec<(PathBuf, usize, &'static str, String)> = Vec::new();
+    scan_for_banned_substrings(&manifest_dir, &manifest_dir, &mut substring_offenders);
+
+    // `unsafe` requires a `// SAFETY:` justification within the same line or
+    // one of the 3 preceding non-blank lines. Keeps `unsafe` legal but makes
+    // every use cite a reason.
+    let mut unsafe_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_unsafe_without_safety(&manifest_dir, &manifest_dir, &mut unsafe_offenders);
+
+    // `#[should_panic]` without `expected = "..."` catches any panic and
+    // masks unrelated bugs. Require an `expected` string.
+    let mut should_panic_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_bare_should_panic(&manifest_dir, &manifest_dir, &mut should_panic_offenders);
+
     let mut any_violation = false;
 
     if !todo_offenders.is_empty() {
@@ -128,9 +146,279 @@ fn main() {
         eprintln!();
     }
 
+    if !substring_offenders.is_empty() {
+        any_violation = true;
+        eprintln!();
+        eprintln!(
+            "error: {} banned substring(s) found in code. \
+             These patterns are sketchy by default — replace them with the \
+             explicit alternative noted per pattern.",
+            substring_offenders.len()
+        );
+        eprintln!();
+        for (rel, line_no, needle, line) in &substring_offenders {
+            let trimmed = line.trim();
+            let snippet: String = trimmed.chars().take(160).collect();
+            eprintln!("  {}:{}: [{}] {}", rel.display(), line_no, needle, snippet);
+        }
+        eprintln!();
+    }
+
+    if !unsafe_offenders.is_empty() {
+        any_violation = true;
+        eprintln!();
+        eprintln!(
+            "error: {} `unsafe` use(s) without a `// SAFETY:` justification. \
+             Add a `// SAFETY: <why this is sound>` comment on the same line \
+             or one of the 3 preceding non-blank lines.",
+            unsafe_offenders.len()
+        );
+        eprintln!();
+        for (rel, line_no, line) in &unsafe_offenders {
+            let trimmed = line.trim();
+            let snippet: String = trimmed.chars().take(160).collect();
+            eprintln!("  {}:{}: {}", rel.display(), line_no, snippet);
+        }
+        eprintln!();
+    }
+
+    if !should_panic_offenders.is_empty() {
+        any_violation = true;
+        eprintln!();
+        eprintln!(
+            "error: {} `#[should_panic]` attribute(s) without `expected = \"...\"`. \
+             Bare `#[should_panic]` accepts any panic and masks unrelated bugs; \
+             require an `expected` substring.",
+            should_panic_offenders.len()
+        );
+        eprintln!();
+        for (rel, line_no, line) in &should_panic_offenders {
+            let trimmed = line.trim();
+            let snippet: String = trimmed.chars().take(160).collect();
+            eprintln!("  {}:{}: {}", rel.display(), line_no, snippet);
+        }
+        eprintln!();
+    }
+
     if any_violation {
         std::process::exit(1);
     }
+}
+
+/// Build the table of banned substrings. Each entry is matched in the
+/// "stripped" portion of each line (string/char literal contents replaced by
+/// spaces, `//` line comments dropped). The label is shown in the error
+/// output so the offender knows which rule fired.
+fn banned_substrings() -> &'static [(&'static str, &'static str)] {
+    &[
+        // Debug residue.
+        ("dbg!(", "dbg!"),
+        // Runtime "not done yet" markers — same family as the TO-DO text ban.
+        ("todo!(", "todo!"),
+        ("unimplemented!(", "unimplemented!"),
+        // Direct panics. Tests should use `assert*!` macros which carry
+        // failure context; production code should propagate `Result`.
+        ("panic!(", "panic!"),
+        // Memory-leak primitives.
+        ("mem::forget(", "mem::forget"),
+        ("Box::leak(", "Box::leak"),
+        // Environment-variable reads (see feedback_no_env_vars memory).
+        ("env::var(", "env::var"),
+        ("env::var_os(", "env::var_os"),
+        // Discarded inner values in `if let` and match arms — same family
+        // as the `let _...` ban.
+        ("if let Ok(_)", "if let Ok(_)"),
+        ("if let Some(_)", "if let Some(_)"),
+        ("if let Err(_)", "if let Err(_)"),
+        ("Ok(_) =>", "Ok(_) =>"),
+        ("Err(_) =>", "Err(_) =>"),
+        ("Some(_) =>", "Some(_) =>"),
+        // Poison-panic on lock acquisition.
+        (".lock().unwrap()", ".lock().unwrap()"),
+        (".read().unwrap()", ".read().unwrap()"),
+        (".write().unwrap()", ".write().unwrap()"),
+        // Redundant boolean comparisons.
+        ("== true", "== true"),
+        ("== false", "== false"),
+        ("!= true", "!= true"),
+        ("!= false", "!= false"),
+        // Sleep hides latency / introduces flakiness.
+        ("thread::sleep(", "thread::sleep"),
+        ("std::thread::sleep(", "std::thread::sleep"),
+    ]
+}
+
+fn scan_for_banned_substrings(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, &'static str, String)>,
+) {
+    let needles = banned_substrings();
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        for (idx, line) in content.lines().enumerate() {
+            let stripped = strip_strings_and_comments(line);
+            for (needle, label) in needles {
+                if stripped.contains(needle) {
+                    offenders.push((rel.to_path_buf(), idx + 1, *label, line.to_string()));
+                }
+            }
+        }
+    });
+}
+
+/// Walks `unsafe` keyword sites and requires a `// SAFETY:` comment within
+/// the same line or one of the 3 preceding non-blank lines. The `unsafe`
+/// match is by-word so identifiers like `unsafely_typed` do not fire.
+fn scan_for_unsafe_without_safety(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("unsafe") {
+            return;
+        }
+        let lines: Vec<&str> = content.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            let stripped = strip_strings_and_comments(line);
+            if !line_has_keyword(&stripped, "unsafe") {
+                continue;
+            }
+            if line.contains("SAFETY:") {
+                continue;
+            }
+            // Scan up to 3 preceding non-blank lines for `// SAFETY:`.
+            let mut justified = false;
+            let mut seen = 0usize;
+            let mut k = idx;
+            while k > 0 && seen < 3 {
+                k -= 1;
+                let prev = lines[k];
+                if prev.trim().is_empty() {
+                    continue;
+                }
+                seen += 1;
+                if prev.contains("SAFETY:") {
+                    justified = true;
+                    break;
+                }
+            }
+            if !justified {
+                offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+            }
+        }
+    });
+}
+
+fn scan_for_bare_should_panic(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("#[should_panic") {
+            return;
+        }
+        for (idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("#[should_panic]")
+                || (trimmed.starts_with("#[should_panic")
+                    && !trimmed.contains("expected"))
+            {
+                offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+            }
+        }
+    });
+}
+
+/// Replace string-literal contents and `'...'` char-literal contents with
+/// spaces, and truncate at `//` line comments. Preserves length where the
+/// caller relies on column alignment; for substring search this only needs
+/// to remove confusing content, which it does. Raw strings (`r"..."`,
+/// `r#"..."#`) and block comments (`/* ... */`) are not modeled — the
+/// scanner is a line-level heuristic.
+fn strip_strings_and_comments(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    let mut in_str = false;
+    let mut str_quote: u8 = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if c == b'\\' && i + 1 < bytes.len() {
+                out.push(b' ');
+                out.push(b' ');
+                i += 2;
+                continue;
+            }
+            if c == str_quote {
+                in_str = false;
+                out.push(c);
+            } else {
+                out.push(b' ');
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            break;
+        }
+        if c == b'"' || c == b'\'' {
+            in_str = true;
+            str_quote = c;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| line.to_string())
+}
+
+/// True if `line` contains `kw` as a whole word (boundaries on both sides
+/// are non-identifier bytes or string ends).
+fn line_has_keyword(line: &str, kw: &str) -> bool {
+    let bytes = line.as_bytes();
+    let kw_bytes = kw.as_bytes();
+    if kw_bytes.is_empty() || bytes.len() < kw_bytes.len() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i + kw_bytes.len() <= bytes.len() {
+        if &bytes[i..i + kw_bytes.len()] == kw_bytes {
+            let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+            let after_ok = i + kw_bytes.len() == bytes.len()
+                || !is_ident_byte(bytes[i + kw_bytes.len()]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 fn scan_for_banned_marker(
