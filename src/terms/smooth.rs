@@ -3964,6 +3964,7 @@ fn build_shape_constraint_design_1d(
                     })
                     .unwrap_or(BSplineIdentifiability::None),
                 boundary: spec.boundary.clone(),
+                boundary_conditions: BSplineBoundaryConditions::default(),
             };
             build_bspline_basis_1d(x_grid.view(), &evalspec)?
                 .design
@@ -14551,6 +14552,7 @@ struct SingleBlockLatentCoordDesignCache {
     latent_dim: usize,
     id_mode: crate::terms::latent_coord::LatentIdMode,
     manifold: crate::terms::latent_coord::LatentManifold,
+    retraction_registry: crate::solver::latent_cache::LatentRetractionRegistry,
     latent_id: u64,
     analytic_penalties: Option<std::sync::Arc<crate::terms::AnalyticPenaltyRegistry>>,
     analytic_rho_count: usize,
@@ -14615,6 +14617,7 @@ impl SingleBlockLatentCoordDesignCache {
             latent_dim: latent.values.latent_dim(),
             id_mode: latent.values.id_mode().clone(),
             manifold: latent.values.manifold().clone(),
+            retraction_registry: latent.values.retraction_registry().clone(),
             latent_id: latent.values.latent_id(),
             analytic_penalties: latent.analytic_penalties.clone(),
             analytic_rho_count,
@@ -14819,12 +14822,13 @@ impl SingleBlockLatentCoordDesignCache {
             .slice(s![self.rho_dim..self.rho_dim + latent_flat_len])
             .to_owned();
         let latent = std::sync::Arc::new(
-            crate::terms::latent_coord::LatentCoordValues::from_flat_with_manifold_and_id(
+            crate::terms::latent_coord::LatentCoordValues::from_flat_with_manifold_and_retraction_and_id(
                 flat,
                 self.n_obs,
                 self.latent_dim,
                 self.id_mode.clone(),
                 self.manifold.clone(),
+                self.retraction_registry.clone(),
                 self.latent_id,
             ),
         );
@@ -19000,9 +19004,9 @@ mod tests {
                     },
                     double_penalty: false,
                     identifiability: BSplineIdentifiability::None,
-                    boundary_condition: BSplineBoundaryCondition {
-                        left: BSplineEndpointCondition::Anchored { value: 2.0 },
-                        right: BSplineEndpointCondition::Clamped,
+                    boundary_conditions: BSplineBoundaryConditions {
+                        left: BSplineEndpointBoundaryCondition::Anchored { value: 2.0 },
+                        right: BSplineEndpointBoundaryCondition::Clamped,
                     },
                 },
             },
@@ -19068,9 +19072,9 @@ mod tests {
                     identifiability: BSplineIdentifiability::FrozenTransform {
                         transform: z.clone(),
                     },
-                    boundary_condition: BSplineBoundaryCondition {
-                        left: BSplineEndpointCondition::Anchored { value: 0.0 },
-                        right: BSplineEndpointCondition::None,
+                    boundary_conditions: BSplineBoundaryConditions {
+                        left: BSplineEndpointBoundaryCondition::Anchored { value: 0.0 },
+                        right: BSplineEndpointBoundaryCondition::Free,
                     },
                 },
             },
@@ -19487,6 +19491,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: BSplineIdentifiability::default(),
                         boundary: OneDimensionalBoundary::Open,
+                        boundary_conditions: BSplineBoundaryConditions::default(),
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -19800,6 +19805,7 @@ mod tests {
                     double_penalty: false,
                     identifiability: BSplineIdentifiability::default(),
                     boundary: OneDimensionalBoundary::Open,
+                    boundary_conditions: BSplineBoundaryConditions::default(),
                 },
             },
             shape: ShapeConstraint::MonotoneIncreasing,
@@ -19893,6 +19899,7 @@ mod tests {
                         double_penalty: false,
                         identifiability: BSplineIdentifiability::default(),
                         boundary: OneDimensionalBoundary::Open,
+                        boundary_conditions: BSplineBoundaryConditions::default(),
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -20263,6 +20270,7 @@ mod tests {
                         double_penalty: false,
                         identifiability: BSplineIdentifiability::default(),
                         boundary: OneDimensionalBoundary::Open,
+                        boundary_conditions: BSplineBoundaryConditions::default(),
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -20389,6 +20397,7 @@ mod tests {
                     double_penalty: false,
                     identifiability: BSplineIdentifiability::default(),
                     boundary: OneDimensionalBoundary::Open,
+                    boundary_conditions: BSplineBoundaryConditions::default(),
                 },
             },
             shape: ShapeConstraint::None,
@@ -20538,6 +20547,7 @@ mod tests {
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::default(),
                             boundary: OneDimensionalBoundary::Open,
+                            boundary_conditions: BSplineBoundaryConditions::default(),
                         },
                     },
                     shape: ShapeConstraint::None,
@@ -21189,6 +21199,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
         let spec_y = BSplineBasisSpec {
             degree: 3,
@@ -21200,6 +21211,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
 
         let terms = vec![SmoothTermSpec {
@@ -21427,6 +21439,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
         let spec_y = BSplineBasisSpec {
             degree: 3,
@@ -21438,6 +21451,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
         let mx = build_bspline_basis_1d(data.column(0), &spec_x)
             .unwrap()
@@ -21493,6 +21507,7 @@ mod tests {
                 period: 7.0,
                 origin: 0.0,
             },
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
         let periodic_hour = BSplineBasisSpec {
             degree: 3,
@@ -21507,6 +21522,7 @@ mod tests {
                 period: 24.0,
                 origin: 0.0,
             },
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
         let term = SmoothTermSpec {
             name: "te_day_hour".to_string(),
@@ -21561,6 +21577,7 @@ mod tests {
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::default(),
                             boundary: OneDimensionalBoundary::Open,
+                            boundary_conditions: BSplineBoundaryConditions::default(),
                         },
                         BSplineBasisSpec {
                             degree: 3,
@@ -21572,6 +21589,7 @@ mod tests {
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::default(),
                             boundary: OneDimensionalBoundary::Open,
+                            boundary_conditions: BSplineBoundaryConditions::default(),
                         },
                     ],
                     double_penalty: false,
@@ -23252,6 +23270,7 @@ mod tests {
                         double_penalty: false,
                         identifiability: BSplineIdentifiability::default(),
                         boundary: OneDimensionalBoundary::Open,
+                        boundary_conditions: BSplineBoundaryConditions::default(),
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -23526,6 +23545,7 @@ mod tests {
                     double_penalty: true,
                     identifiability: BSplineIdentifiability::None,
                     boundary: OneDimensionalBoundary::Open,
+                    boundary_conditions: BSplineBoundaryConditions::default(),
                 },
             },
             shape: ShapeConstraint::None,
@@ -23704,6 +23724,7 @@ mod tests {
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::None,
                             boundary: OneDimensionalBoundary::Open,
+                            boundary_conditions: BSplineBoundaryConditions::default(),
                         },
                     },
                     shape: ShapeConstraint::MonotoneIncreasing,
@@ -24062,6 +24083,7 @@ mod tests {
                             left: BSplineEndpointCondition::None,
                             right: BSplineEndpointCondition::None,
                         },
+                        boundary_conditions: BSplineBoundaryConditions::default(),
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -25548,6 +25570,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: BSplineIdentifiability::None,
                         boundary: OneDimensionalBoundary::Open,
+                        boundary_conditions: BSplineBoundaryConditions::default(),
                     },
                 },
                 shape: ShapeConstraint::None,

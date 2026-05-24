@@ -595,6 +595,13 @@ fn lookup_cache() -> &'static Mutex<HashMap<LookupCacheKey, CachedLookup>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+const LOOKUP_CACHE_MAX_ENTRIES: usize = 128;
+const LOOKUP_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+fn cached_lookup_resident_bytes(value: &CachedLookup) -> usize {
+    std::mem::size_of::<CachedLookup>().saturating_add(value.entry.payload.capacity())
+}
+
 fn lookup_cache_get(key: &LookupCacheKey) -> Option<CachedLookup> {
     let guard = lookup_cache().lock().ok()?;
     guard.get(key).cloned()
@@ -602,6 +609,28 @@ fn lookup_cache_get(key: &LookupCacheKey) -> Option<CachedLookup> {
 
 fn lookup_cache_insert(key: LookupCacheKey, val: CachedLookup) {
     if let Ok(mut guard) = lookup_cache().lock() {
+        let new_bytes = cached_lookup_resident_bytes(&val);
+        if new_bytes > LOOKUP_CACHE_MAX_BYTES {
+            return;
+        }
+        let mut resident_bytes: usize = guard.values().map(cached_lookup_resident_bytes).sum();
+        if let Some(old) = guard.remove(&key) {
+            resident_bytes = resident_bytes.saturating_sub(cached_lookup_resident_bytes(&old));
+        }
+        while guard.len() >= LOOKUP_CACHE_MAX_ENTRIES
+            || resident_bytes.saturating_add(new_bytes) > LOOKUP_CACHE_MAX_BYTES
+        {
+            let oldest = guard
+                .iter()
+                .min_by_key(|(_, cached)| cached.write_nanos)
+                .map(|(old_key, _)| *old_key);
+            let Some(oldest) = oldest else {
+                break;
+            };
+            if let Some(old) = guard.remove(&oldest) {
+                resident_bytes = resident_bytes.saturating_sub(cached_lookup_resident_bytes(&old));
+            }
+        }
         guard.insert(key, val);
     }
 }
