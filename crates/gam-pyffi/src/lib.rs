@@ -234,6 +234,8 @@ struct SummaryPayload {
     deployment_extensions: Vec<SavedDeploymentExtension>,
     deviance: f64,
     reml_score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    null_space_logdet: Option<f64>,
     iterations: usize,
     edf_total: Option<f64>,
     lambdas: Vec<f64>,
@@ -10103,6 +10105,7 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         deployment_extensions: model.payload().deployment_extensions.clone(),
         deviance: fit.deviance,
         reml_score: fit.reml_score,
+        null_space_logdet: fit.artifacts.null_space_logdet,
         iterations: fit.outer_iterations,
         edf_total: fit.edf_total(),
         lambdas: fit.lambdas.to_vec(),
@@ -10617,21 +10620,42 @@ fn build_analytic_penalty_registry_from_json(
                 )));
             }
             "orthogonality" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &["kind", "target", "weight", "n_eff", "learnable", "weight_schedule"],
+                )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
                 let learnable = descriptor
                     .get("learnable")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
+                let penalty = OrthogonalityPenalty::new(slice, target.d, weight, n_eff, learnable)
+                    .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
                 registry.push(gam::terms::AnalyticPenaltyKind::Orthogonality(
-                    std::sync::Arc::new(
-                        OrthogonalityPenalty::new(slice, target.d, weight, n_eff, learnable)
-                            .map_err(|err| format!("{context}: {err}"))?,
-                    ),
+                    std::sync::Arc::new(penalty),
                 ));
             }
             "sparsity" => {
-                descriptor_weight_value(descriptor, &context)?;
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &[
+                        "kind",
+                        "target",
+                        "sparsity_kind",
+                        "weight",
+                        "eps",
+                        "eps_weight",
+                        "weight_schedule",
+                    ],
+                )?;
+                let weight = descriptor_weight_scalar(descriptor, &context)?;
                 let sparsity_kind = descriptor
                     .get("sparsity_kind")
                     .and_then(serde_json::Value::as_str)
@@ -10639,7 +10663,13 @@ fn build_analytic_penalty_registry_from_json(
                     .to_ascii_lowercase()
                     .replace('-', "_");
                 let eps = descriptor_f64(descriptor, "eps", 1.0e-3)?;
-                let penalty = match sparsity_kind.as_str() {
+                let eps_weight = descriptor
+                    .get("eps_weight")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("fixed")
+                    .to_ascii_lowercase()
+                    .replace('-', "_");
+                let mut penalty = match sparsity_kind.as_str() {
                     "smooth_l1" | "smoothed_l1" => {
                         SparsityPenalty::smoothed_l1(PenaltyTier::Psi, eps)
                     }
@@ -10649,6 +10679,25 @@ fn build_analytic_penalty_registry_from_json(
                         "{context}.sparsity_kind must be smooth_l1, hoyer, or log; got {other:?}"
                     )),
                 }?;
+                penalty.weight = weight;
+                let penalty = match eps_weight.as_str() {
+                    "fixed" => penalty,
+                    "auto" if sparsity_kind == "hoyer" => {
+                        return Err(format!(
+                            "{context}.eps_weight='auto' is not meaningful for Hoyer sparsity"
+                        ));
+                    }
+                    "auto" => penalty.with_eps_reml(1),
+                    other => {
+                        return Err(format!(
+                            "{context}.eps_weight must be 'auto' or 'fixed'; got {other:?}"
+                        ));
+                    }
+                };
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
                 registry.push(gam::terms::AnalyticPenaltyKind::Sparsity(std::sync::Arc::new(
                     penalty,
                 )));
@@ -12566,6 +12615,81 @@ fn greville_abscissae(
     Ok(out)
 }
 
+fn fit_with_null_space_logdet(
+    design: &TermCollectionDesign,
+    fit: &gam::estimate::UnifiedFitResult,
+) -> Result<gam::estimate::UnifiedFitResult, String> {
+    let mut fit = fit.clone();
+    fit.artifacts.null_space_logdet = Some(compute_null_space_logdet(design, &fit)?);
+    Ok(fit)
+}
+
+fn compute_null_space_logdet(
+    design: &TermCollectionDesign,
+    fit: &gam::estimate::UnifiedFitResult,
+) -> Result<f64, String> {
+    let hessian = fit
+        .penalized_hessian()
+        .ok_or_else(|| "null-space Hessian logdet requires fitted penalized Hessian".to_string())?;
+    let p = hessian.nrows();
+    if hessian.ncols() != p {
+        return Err(format!(
+            "null-space Hessian logdet requires a square Hessian, got {}x{}",
+            hessian.nrows(),
+            hessian.ncols()
+        ));
+    }
+    if p != design.design.ncols() {
+        return Err(format!(
+            "null-space Hessian logdet design/Hessian mismatch: design has {} columns, Hessian is {}x{}",
+            design.design.ncols(),
+            hessian.nrows(),
+            hessian.ncols()
+        ));
+    }
+
+    let mut penalty = Array2::<f64>::zeros((p, p));
+    for (idx, block) in design.penalties.iter().enumerate() {
+        let range = block.col_range.clone();
+        if range.end > p || block.local.nrows() != range.len() || block.local.ncols() != range.len()
+        {
+            return Err(format!(
+                "null-space Hessian logdet penalty {idx} shape mismatch: range {}..{}, local {}x{}, p={p}",
+                range.start,
+                range.end,
+                block.local.nrows(),
+                block.local.ncols()
+            ));
+        }
+        penalty
+            .slice_mut(s![range.clone(), range])
+            .scaled_add(1.0, &block.local);
+    }
+
+    let (null_basis, _) = gam::faer_ndarray::rrqr_nullspace_basis(
+        &penalty,
+        gam::faer_ndarray::default_rrqr_rank_alpha(),
+    )
+    .map_err(|err| format!("failed to compute penalty null-space basis: {err}"))?;
+    let q = null_basis.ncols();
+    if q == 0 {
+        return Ok(0.0);
+    }
+
+    let projected = hessian.dot(&null_basis);
+    let mut restricted = null_basis.t().dot(&projected);
+    restricted = (&restricted + &restricted.t()) * 0.5;
+    let chol = restricted
+        .cholesky(Side::Lower)
+        .map_err(|err| format!("null-space Hessian is not positive definite: {err}"))?;
+    let logdet = 2.0 * chol.diag().iter().map(|value| value.ln()).sum::<f64>();
+    if logdet.is_finite() {
+        Ok(logdet)
+    } else {
+        Err(format!("null-space Hessian logdet is not finite: {logdet}"))
+    }
+}
+
 fn build_standard_payload(
     formula: String,
     dataset: &EncodedDataset,
@@ -12578,13 +12702,14 @@ fn build_standard_payload(
     wiggle_knots: Option<Vec<f64>>,
     wiggle_degree: Option<usize>,
 ) -> Result<FittedModelPayload, String> {
+    let saved_fit = fit_with_null_space_logdet(design, saved_fit)?;
     let latent_cloglog_state =
         if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
-            Some(saved_latent_cloglog_state_from_fit(saved_fit).expect(
+            Some(saved_latent_cloglog_state_from_fit(&saved_fit).expect(
                 "latent-cloglog-binomial fit must produce an explicit latent-cloglog state",
             ))
         } else {
-            saved_latent_cloglog_state_from_fit(saved_fit)
+            saved_latent_cloglog_state_from_fit(&saved_fit)
         };
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
@@ -12600,7 +12725,7 @@ fn build_standard_payload(
         family.name().to_string(),
     );
     payload.unified = Some(saved_fit.clone());
-    payload.fit_result = Some(saved_fit.clone());
+    payload.fit_result = Some(saved_fit);
     payload.data_schema = Some(dataset.schema.clone());
     payload.link = Some(InverseLink::Standard(family.link_function()));
     payload.linkwiggle_knots = wiggle_knots;
