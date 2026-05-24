@@ -1005,7 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn solve_spd_pcg_into_rejects_zero_iteration_budget() {
+    fn solve_spd_pcg_with_info_into_rejects_zero_iteration_budget() {
         let h = array![[4.0, 1.0], [1.0, 3.0]];
         let b = array![1.0, 2.0];
         let m = Array1::from_vec(vec![4.0, 3.0]);
