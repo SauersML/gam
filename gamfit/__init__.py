@@ -100,6 +100,11 @@ from ._select_topology import (
     SelectTopologyResult,
     select_topology,
 )
+from ._topology_selector import (
+    TopologyAutoSelector,
+    TopologyAutoSelectorRank,
+    TopologyAutoSelectorResult,
+)
 from ._diagnostics import Diagnostics
 from .smooth import (
     BSpline,
@@ -255,6 +260,9 @@ __all__ = [
     "Cylinder",
     "EuclideanPatch",
     "TopologySphere",
+    "TopologyAutoSelector",
+    "TopologyAutoSelectorRank",
+    "TopologyAutoSelectorResult",
     "Torus",
     "duchon_basis",
     "duchon_function_norm_penalty",
