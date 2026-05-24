@@ -3974,6 +3974,36 @@ fn validate_survival_location_scale_spec(
 ) -> Result<(), SurvivalLocationScaleError> {
     let n = spec.event_target.len();
     let monotone_time_wiggle_ncols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
+    match &spec.inverse_link {
+        InverseLink::Standard(LinkFunction::Log) => {
+            return Err(SurvivalLocationScaleError::InvalidConfiguration {
+                reason: "fit_survival_location_scale does not support Standard(Log)".to_string(),
+            }
+            .into());
+        }
+        InverseLink::Standard(LinkFunction::Sas) => {
+            return Err(SurvivalLocationScaleError::InvalidConfiguration {
+                reason: "fit_survival_location_scale requires explicit SasLinkState; state-less Standard(Sas) is unsupported"
+                    .to_string(),
+            }
+            .into());
+        }
+        InverseLink::Standard(LinkFunction::BetaLogistic) => {
+            return Err(SurvivalLocationScaleError::InvalidConfiguration {
+                reason: "fit_survival_location_scale requires explicit Beta-Logistic link state; state-less Standard(BetaLogistic) is unsupported"
+                    .to_string(),
+            }
+            .into());
+        }
+        InverseLink::Standard(LinkFunction::Logit)
+        | InverseLink::Standard(LinkFunction::Probit)
+        | InverseLink::Standard(LinkFunction::CLogLog)
+        | InverseLink::Standard(LinkFunction::Identity)
+        | InverseLink::LatentCLogLog(_)
+        | InverseLink::Sas(_)
+        | InverseLink::BetaLogistic(_)
+        | InverseLink::Mixture(_) => {}
+    }
     if n == 0 {
         return Err(SurvivalLocationScaleError::InternalInvariant {
             reason: "fit_survival_location_scale: empty dataset".to_string(),

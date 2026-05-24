@@ -2938,9 +2938,9 @@ impl NuclearNormPenalty {
             gram[[a, a]] += self.smoothing_eps * self.smoothing_eps;
         }
 
-        let (evals, q) = gram
-            .eigh(Side::Lower)
-            .expect("NuclearNormPenalty Gram eigendecomposition failed");
+        let (evals, q) = gram.eigh(Side::Lower).map_err(|err| {
+            format!("NuclearNormPenalty Gram eigendecomposition failed: {err}")
+        })?;
         let active_start = d.saturating_sub(self.rank_limit(d));
         if self.max_rank.is_some() && active_start > 0 && active_start < d {
             let left = evals[active_start - 1];
@@ -3102,12 +3102,13 @@ impl AnalyticPenalty for NuclearNormPenalty {
         let Some(v_mat) = self.target_matrix(v) else {
             return Array1::<f64>::zeros(target.len());
         };
-        // `right_spectral_inverse_sqrt_derivative` only errors on a non-SPD
-        // spectral target; upstream `target_matrix` returned `Some` above,
-        // so the SPD precondition was enforced.
-        // SAFETY: reaching the closure means the contract was violated.
+        // `AnalyticPenalty::hvp_target` has no Result channel; decomposition
+        // or active-rank cutoff failures from `right_spectral_inverse_sqrt_derivative`
+        // are upstream contract violations that must surface loudly.
         let (right_filter, right_filter_derivative) = self
             .right_spectral_inverse_sqrt_derivative(t.view(), v_mat.view())
+            // SAFETY: error path is a caller contract violation; the upstream
+            // helper already formatted a diagnostic message.
             .unwrap_or_else(|message| panic!("{}", message));
         let weight = self.resolved_weight(rho);
         let mut out = Array2::<f64>::zeros(t.dim());

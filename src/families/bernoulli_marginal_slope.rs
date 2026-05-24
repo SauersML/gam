@@ -6236,8 +6236,8 @@ impl BernoulliMarginalSlopeFamily {
                 out[[u, v]] = val;
                 out[[v, u]] = val;
             }
-            Ok(out)
-        })
+        }
+        Ok(out)
     }
 
     fn empirical_flex_row_fourth_contracted_recompute(
@@ -6296,8 +6296,8 @@ impl BernoulliMarginalSlopeFamily {
                 out[[p, q_idx]] = val;
                 out[[q_idx, p]] = val;
             }
-            Ok(out)
-        })
+        }
+        Ok(out)
     }
 
     fn rigid_row_kernel_eval(
