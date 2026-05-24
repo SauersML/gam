@@ -72,9 +72,21 @@ pub trait RiemannianManifold: Send + Sync {
 
     fn project_tangent(
         &self,
-        _point: ArrayView1<'_, f64>,
+        point: ArrayView1<'_, f64>,
         vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
+        // Default projection is the identity (Euclidean-flat tangent space).
+        // Validate the input point dimension matches the manifold's ambient
+        // dimension so a caller passing the wrong-length vector fails fast
+        // here rather than producing a silently mis-shaped tangent vector.
+        let expected = self.ambient_dim();
+        if point.len() != expected {
+            return Err(GeometryError::DimensionMismatch {
+                context: "project_tangent point",
+                expected,
+                got: point.len(),
+            });
+        }
         Ok(vec.to_owned())
     }
 
