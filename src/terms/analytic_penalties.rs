@@ -319,9 +319,36 @@ pub trait AnalyticPenalty: Send + Sync {
             }
             return out;
         }
-        unreachable!(
-            "AnalyticPenalty::hvp default requires hessian_diag — non-diagonal penalties must override hvp"
-        );
+        // Principled generic default: central finite-difference of `grad_target`
+        // along direction `v`. The directional derivative of the gradient *is*
+        // the Hessian-vector product, so this is exact up to FD truncation /
+        // round-off and requires no closed-form Hessian. Cost is two extra
+        // `grad_target` evaluations per call — the price of a derivative-free,
+        // dense-Hessian-agnostic column extractor.
+        let n = v.len();
+        let mut v_inf: f64 = 0.0;
+        for i in 0..n {
+            let a = v[i].abs();
+            if a > v_inf {
+                v_inf = a;
+            }
+        }
+        if v_inf == 0.0 {
+            return Array1::<f64>::zeros(n);
+        }
+        let eps: f64 = 1e-7_f64.max(v_inf * 1e-7);
+        let v_scaled = &v.to_owned() * eps;
+        let target_owned = target.to_owned();
+        let t_plus = &target_owned + &v_scaled;
+        let t_minus = &target_owned - &v_scaled;
+        let g_plus = self.grad_target(t_plus.view(), rho);
+        let g_minus = self.grad_target(t_minus.view(), rho);
+        let mut out = Array1::<f64>::zeros(n);
+        let inv_two_eps = 1.0 / (2.0 * eps);
+        for i in 0..n {
+            out[i] = (g_plus[i] - g_minus[i]) * inv_two_eps;
+        }
+        out
     }
 
     /// Gradient of the penalty value w.r.t. each owned ρ-axis. Length equals

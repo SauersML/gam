@@ -31,7 +31,10 @@ use crate::estimate::{UnifiedFitResult, validate_explicit_dense_hessian_for_whit
 use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv};
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::matrix::DesignMatrix;
-use crate::solver::mixture_link::inverse_link_jet_for_family;
+use crate::solver::mixture_link::{
+    InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link,
+    softmax_last_fixedzero,
+};
 use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior, is_valid_tweedie_power};
 use crate::visualizer::VisualizerSession;
 use faer::Side;
@@ -578,6 +581,9 @@ impl NutsPosterior {
         }
 
         validate_firth_support(nuts_family, firth_enabled).map_err(String::from)?;
+        if nuts_family.likelihood_family().is_binomial() {
+            validate_binary_responses("binomial NUTS", &y, &weights).map_err(String::from)?;
+        }
         if matches!(nuts_family, NutsFamily::NegativeBinomialLog) {
             validate_count_responses("negative-binomial NUTS", &y, &weights).map_err(String::from)?;
         }
@@ -819,6 +825,23 @@ fn validate_count_responses(
     Ok(())
 }
 
+fn validate_binary_responses(
+    family: &str,
+    y: &ArrayView1<'_, f64>,
+    weights: &ArrayView1<'_, f64>,
+) -> Result<(), HmcError> {
+    for (i, (&yi, &wi)) in y.iter().zip(weights.iter()).enumerate() {
+        if wi > 0.0 && !(yi == 0.0 || yi == 1.0) {
+            return Err(HmcError::InvalidConfig {
+                reason: format!(
+                    "{family} response must be exactly 0 or 1 at positive-weight row {i}; got {yi}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Compute the identifiable-subspace Jeffreys/Firth contribution and its
 /// β-gradient.
 ///
@@ -894,50 +917,213 @@ fn nuts_family_logp_and_grad(
     }
 }
 
+#[derive(Clone, Debug)]
+struct BinomialLinkTerms {
+    log_mu: f64,
+    log1m_mu: f64,
+    dlog_mu_deta: f64,
+    dlog1m_mu_deta: f64,
+    dmu_dlink: Vec<f64>,
+}
+
+#[inline]
+fn log_terms_from_mu_and_dmu(
+    mu: f64,
+    dmu_deta: f64,
+    dmu_dlink: Vec<f64>,
+) -> Result<BinomialLinkTerms, String> {
+    if !(mu.is_finite() && (0.0..=1.0).contains(&mu) && dmu_deta.is_finite()) {
+        return Err(format!(
+            "binomial inverse link returned invalid mu/deta derivative: mu={mu}, dmu_deta={dmu_deta}"
+        ));
+    }
+    let log_mu = if mu == 0.0 { f64::NEG_INFINITY } else { mu.ln() };
+    let one_minus_mu = 1.0 - mu;
+    let log1m_mu = if one_minus_mu == 0.0 {
+        f64::NEG_INFINITY
+    } else {
+        one_minus_mu.ln()
+    };
+    let dlog_mu_deta = if mu == 0.0 {
+        f64::INFINITY.copysign(dmu_deta)
+    } else {
+        dmu_deta / mu
+    };
+    let dlog1m_mu_deta = if one_minus_mu == 0.0 {
+        f64::NEG_INFINITY.copysign(dmu_deta)
+    } else {
+        -dmu_deta / one_minus_mu
+    };
+    Ok(BinomialLinkTerms {
+        log_mu,
+        log1m_mu,
+        dlog_mu_deta,
+        dlog1m_mu_deta,
+        dmu_dlink,
+    })
+}
+
+#[inline]
+fn binomial_link_terms(
+    inverse_link: &InverseLink,
+    eta: f64,
+    n_link_params: usize,
+) -> Result<BinomialLinkTerms, String> {
+    let jet = inverse_link_jet_for_inverse_link(inverse_link, eta).map_err(|err| err.to_string())?;
+    let mut dmu_dlink = vec![0.0; n_link_params];
+    if n_link_params > 0 {
+        match inverse_link
+            .param_partials(eta)
+            .map_err(|err| err.to_string())?
+        {
+            Some(LinkParamPartials::Sas(partials)) => {
+                if n_link_params != 2 {
+                    return Err(format!(
+                        "SAS/Beta-Logistic link parameter dimension mismatch: expected 2, got {n_link_params}"
+                    ));
+                }
+                dmu_dlink[0] = partials.djet_depsilon.mu;
+                dmu_dlink[1] = partials.djet_dlog_delta.mu;
+            }
+            Some(LinkParamPartials::Mixture(partials)) => {
+                if partials.djet_drho.len() != n_link_params {
+                    return Err(format!(
+                        "mixture link parameter dimension mismatch: expected {}, got {n_link_params}",
+                        partials.djet_drho.len()
+                    ));
+                }
+                for (slot, partial) in dmu_dlink.iter_mut().zip(partials.djet_drho.iter()) {
+                    *slot = partial.mu;
+                }
+            }
+            None => {
+                return Err(format!(
+                    "joint HMC expected {n_link_params} adaptive link parameters, but the inverse link exposes none"
+                ));
+            }
+        }
+    }
+    log_terms_from_mu_and_dmu(jet.mu, jet.d1, dmu_dlink)
+}
+
+fn joint_binomial_logp_grad_and_link_grad(
+    inverse_link: &InverseLink,
+    data: &SharedData,
+    eta: &Array1<f64>,
+    n_link_params: usize,
+) -> Result<(f64, Array1<f64>, Array1<f64>), String> {
+    let n = data.n_samples;
+    // Per-row: compute stable log-tail terms and derivatives without endpoint
+    // clamping. Positive-weight responses were validated as Bernoulli before
+    // target construction, so each row selects exactly one log branch.
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let per_row: Result<Vec<(f64, f64, Vec<f64>)>, String> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let y_i = data.y[i];
+            let w_i = data.weights[i];
+            if w_i <= 0.0 {
+                return Ok((0.0, 0.0, vec![0.0; n_link_params]));
+            }
+            let terms = binomial_link_terms(inverse_link, eta[i], n_link_params)?;
+            if y_i == 1.0 {
+                let inv_mu = terms.log_mu.exp().recip();
+                let log_mu = terms.log_mu;
+                let dlog_mu_deta = terms.dlog_mu_deta;
+                let grad_link = terms
+                    .dmu_dlink
+                    .into_iter()
+                    .map(|dmu| w_i * dmu * inv_mu)
+                    .collect();
+                Ok((w_i * log_mu, w_i * dlog_mu_deta, grad_link))
+            } else if y_i == 0.0 {
+                let inv_one_minus_mu = terms.log1m_mu.exp().recip();
+                let log1m_mu = terms.log1m_mu;
+                let dlog1m_mu_deta = terms.dlog1m_mu_deta;
+                let grad_link = terms
+                    .dmu_dlink
+                    .into_iter()
+                    .map(|dmu| -w_i * dmu * inv_one_minus_mu)
+                    .collect();
+                Ok((w_i * log1m_mu, w_i * dlog1m_mu_deta, grad_link))
+            } else {
+                Err(format!(
+                    "binomial joint HMC response must be exactly 0 or 1 after validation; got {y_i}"
+                ))
+            }
+        })
+        .collect();
+    let per_row = per_row?;
+    let mut residual = Array1::<f64>::zeros(n);
+    let mut grad_link = Array1::<f64>::zeros(n_link_params);
+    let mut ll = 0.0;
+    for (i, (ll_i, residual_i, grad_link_i)) in per_row.into_iter().enumerate() {
+        ll += ll_i;
+        residual[i] = residual_i;
+        for (slot, value) in grad_link.iter_mut().zip(grad_link_i.iter()) {
+            *slot += *value;
+        }
+    }
+
+    Ok((ll, fast_atv(&data.x, &residual), grad_link))
+}
+
 fn joint_binomial_logp_and_grad(
     family: LikelihoodFamily,
     inverse_link: &InverseLink,
     data: &SharedData,
     eta: &Array1<f64>,
 ) -> Result<(f64, Array1<f64>), String> {
-    let n = data.n_samples;
-    // Per-row: compute jet → log-likelihood contribution + residual entry.
-    // Independent across rows; parallel reduce sums + collected residual.
-    use rayon::iter::{IntoParallelIterator, ParallelIterator};
-    let per_row: Result<Vec<(f64, f64)>, String> = (0..n)
-        .into_par_iter()
-        .map(|i| {
-            let jet = inverse_link_jet_for_family(
-                family,
-                eta[i],
-                inverse_link.mixture_state(),
-                inverse_link.sas_state(),
-            )
-            .map_err(|err| err.to_string())?;
-            // Clamp `mu` away from the open-interval endpoints so the
-            // binomial log-likelihood below stays finite even when the
-            // inverse-link jet returns a saturated value. The epsilon
-            // matches the rest of the inference-side binomial safety
-            // helpers; see also: safe_mu_for_binomial in solver/pirls.rs
-            // for the centralised version Group B is introducing.
-            let mu = jet.mu.clamp(1.0e-12, 1.0 - 1.0e-12);
-            let dmu_deta = jet.d1;
-            let y_i = data.y[i];
-            let w_i = data.weights[i];
-            let ll_i = w_i * (y_i * mu.ln() + (1.0 - y_i) * (1.0 - mu).ln());
-            let residual_i = w_i * (y_i - mu) * dmu_deta / (mu * (1.0 - mu)).max(1.0e-30);
-            Ok((ll_i, residual_i))
-        })
-        .collect();
-    let per_row = per_row?;
-    let mut residual = Array1::<f64>::zeros(n);
-    let mut ll = 0.0;
-    for (i, (ll_i, residual_i)) in per_row.into_iter().enumerate() {
-        ll += ll_i;
-        residual[i] = residual_i;
+    match family {
+        LikelihoodFamily::BinomialLogit => Ok(logit_logp_and_grad(data, eta)),
+        LikelihoodFamily::BinomialProbit => Ok(probit_logp_and_grad(data, eta)),
+        LikelihoodFamily::BinomialCLogLog => Ok(cloglog_logp_and_grad(data, eta)),
+        LikelihoodFamily::BinomialLatentCLogLog
+        | LikelihoodFamily::BinomialSas
+        | LikelihoodFamily::BinomialBetaLogistic
+        | LikelihoodFamily::BinomialMixture => {
+            let (ll, grad_beta, _) =
+                joint_binomial_logp_grad_and_link_grad(inverse_link, data, eta, 0)?;
+            Ok((ll, grad_beta))
+        }
+        _ => Err(HmcError::UnsupportedFamily {
+            reason: format!("{} is not a binomial joint-HMC family", family.pretty_name()),
+        }
+        .into()),
     }
+}
 
-    Ok((ll, fast_atv(&data.x, &residual)))
+fn joint_family_logp_grad_and_link_grad(
+    family: LikelihoodFamily,
+    inverse_link: &InverseLink,
+    data: &SharedData,
+    eta: &Array1<f64>,
+    n_link_params: usize,
+) -> Result<(f64, Array1<f64>, Array1<f64>), String> {
+    match family {
+        LikelihoodFamily::BinomialLogit => {
+            let (ll, grad) = logit_logp_and_grad(data, eta);
+            Ok((ll, grad, Array1::zeros(n_link_params)))
+        }
+        LikelihoodFamily::BinomialProbit => {
+            let (ll, grad) = probit_logp_and_grad(data, eta);
+            Ok((ll, grad, Array1::zeros(n_link_params)))
+        }
+        LikelihoodFamily::BinomialCLogLog => {
+            let (ll, grad) = cloglog_logp_and_grad(data, eta);
+            Ok((ll, grad, Array1::zeros(n_link_params)))
+        }
+        LikelihoodFamily::BinomialLatentCLogLog
+        | LikelihoodFamily::BinomialSas
+        | LikelihoodFamily::BinomialBetaLogistic
+        | LikelihoodFamily::BinomialMixture => {
+            joint_binomial_logp_grad_and_link_grad(inverse_link, data, eta, n_link_params)
+        }
+        other => {
+            let (ll, grad) = joint_family_logp_and_grad(other, inverse_link, data, eta)?;
+            Ok((ll, grad, Array1::zeros(n_link_params)))
+        }
+    }
 }
 
 fn joint_family_logp_and_grad(
@@ -3798,6 +3984,9 @@ impl LinkWigglePosterior {
             }
             .into());
         }
+        if nuts_family.likelihood_family().is_binomial() {
+            validate_binary_responses("binomial link-wiggle NUTS", &y, &weights).map_err(String::from)?;
+        }
         if matches!(nuts_family, NutsFamily::NegativeBinomialLog) {
             validate_count_responses("negative-binomial link-wiggle NUTS", &y, &weights)
                 .map_err(String::from)?;
@@ -4595,6 +4784,10 @@ pub struct JointBetaRhoResult {
     pub rho_samples: Array2<f64>,
     /// Posterior mean of β
     pub beta_mean: Array1<f64>,
+    /// Adaptive inverse-link parameter samples: shape (n_total_samples, n_link_params)
+    pub link_param_samples: Array2<f64>,
+    /// Posterior mean of adaptive inverse-link parameters
+    pub link_param_mean: Array1<f64>,
     /// Posterior mean of ρ
     pub rho_mean: Array1<f64>,
     /// R-hat diagnostic
@@ -4613,7 +4806,8 @@ pub struct JointBetaRhoResult {
 /// completely bypassing the Laplace approximation.
 ///
 /// The parameter vector is [z_β; ρ] where z_β = L⁻¹(β - μ) is the
-/// whitened β and ρ is the raw log-smoothing parameters.
+/// whitened β, ρ is the raw log-smoothing parameters, and adaptive inverse-link
+/// parameters follow when the binomial link has fitted shape/mixing parameters.
 struct JointBetaRhoPosterior {
     data: SharedData,
     /// L where LL' = H⁻¹ (whitening for β block)
@@ -4628,6 +4822,10 @@ struct JointBetaRhoPosterior {
     n_beta: usize,
     /// Dimension of ρ
     n_rho: usize,
+    /// Dimension of adaptive inverse-link parameters
+    n_link_params: usize,
+    /// LAML-converged adaptive inverse-link parameters (used only to initialize chains)
+    link_param_mode: Array1<f64>,
     /// Canonical penalties in the transformed basis.
     penalty_canonical: Vec<crate::construction::CanonicalPenalty>,
     /// Fixed prior on rho used by the sampled target.
@@ -4781,6 +4979,9 @@ impl JointBetaRhoPosterior {
             validate_count_responses("negative-binomial joint HMC", &y, &weights)
                 .map_err(String::from)?;
         }
+        if likelihood_family.is_binomial() {
+            validate_binary_responses("binomial joint HMC", &y, &weights).map_err(String::from)?;
+        }
 
         // Cholesky of H for β-whitening (same as NutsPosterior)
         let hessian_owned = hessian.to_owned();
@@ -4805,6 +5006,7 @@ impl JointBetaRhoPosterior {
             n_samples,
             dim: n_beta,
         };
+        let link_param_mode = Self::link_param_mode(&inverse_link);
 
         Ok(Self {
             data,
@@ -4814,6 +5016,8 @@ impl JointBetaRhoPosterior {
             inverse_link,
             n_beta,
             n_rho,
+            n_link_params: link_param_mode.len(),
+            link_param_mode,
             penalty_canonical,
             rho_prior,
             rho_mode: rho_mode.to_owned(),
@@ -4837,6 +5041,52 @@ impl JointBetaRhoPosterior {
         h
     }
 
+    fn link_param_mode(inverse_link: &InverseLink) -> Array1<f64> {
+        match inverse_link {
+            InverseLink::Sas(state) | InverseLink::BetaLogistic(state) => {
+                Array1::from_vec(vec![state.epsilon, state.log_delta])
+            }
+            InverseLink::Mixture(state) => state.rho.clone(),
+            InverseLink::Standard(_) | InverseLink::LatentCLogLog(_) => Array1::zeros(0),
+        }
+    }
+
+    fn inverse_link_with_params(
+        &self,
+        link_params: ndarray::ArrayView1<'_, f64>,
+    ) -> Result<InverseLink, String> {
+        match &self.inverse_link {
+            InverseLink::Sas(_) => {
+                if link_params.len() != 2 {
+                    return Err(format!("SAS link parameter length must be 2, got {}", link_params.len()));
+                }
+                Ok(InverseLink::Sas(crate::types::SasLinkState::new(
+                    link_params[0],
+                    link_params[1],
+                )?))
+            }
+            InverseLink::BetaLogistic(_) => {
+                if link_params.len() != 2 || !link_params.iter().all(|v| v.is_finite()) {
+                    return Err("Beta-Logistic link parameters must be finite with length 2".to_string());
+                }
+                Ok(InverseLink::BetaLogistic(crate::types::SasLinkState {
+                    epsilon: link_params[0],
+                    log_delta: link_params[1],
+                    delta: link_params[1].exp(),
+                }))
+            }
+            InverseLink::Mixture(state) => {
+                let rho = link_params.to_owned();
+                Ok(InverseLink::Mixture(crate::types::MixtureLinkState {
+                    components: state.components.clone(),
+                    pi: softmax_last_fixedzero(&rho),
+                    rho,
+                }))
+            }
+            InverseLink::Standard(_) | InverseLink::LatentCLogLog(_) => Ok(self.inverse_link.clone()),
+        }
+    }
+
     /// Compute the joint log-posterior and gradient.
     ///
     /// The joint log-posterior is:
@@ -4847,16 +5097,28 @@ impl JointBetaRhoPosterior {
     /// an explicit parameter being sampled, evaluated at arbitrary values — not
     /// just at the mode β̂(ρ).
     ///
-    /// Parameter vector layout: [z_β (whitened, length n_beta); ρ (length n_rho)]
+    /// Parameter vector layout: [z_β (whitened, length n_beta); ρ (length n_rho);
+    /// adaptive inverse-link params (length n_link_params)]
     fn compute_joint_logp_and_grad(&self, params: &Array1<f64>) -> (f64, Array1<f64>) {
         let n_beta = self.n_beta;
         let n_rho = self.n_rho;
+        let n_link_params = self.n_link_params;
+        let total_dim = n_beta + n_rho + n_link_params;
 
         // Split parameter vector — keep as views to avoid two per-step
         // `to_owned()` allocations of size n_beta and n_rho.
         let z = params.slice(ndarray::s![..n_beta]);
-        let rho = params.slice(ndarray::s![n_beta..]);
+        let rho = params.slice(ndarray::s![n_beta..n_beta + n_rho]);
+        let link_params = params.slice(ndarray::s![n_beta + n_rho..]);
         let lambdas: Array1<f64> = rho.mapv(f64::exp);
+
+        let inverse_link = match self.inverse_link_with_params(link_params) {
+            Ok(link) => link,
+            Err(err) => {
+                log::warn!("[Joint HMC] adaptive inverse-link parameters are invalid: {}", err);
+                return (f64::NEG_INFINITY, Array1::zeros(total_dim));
+            }
+        };
 
         // Un-whiten: β = μ + L z
         let beta = self.data.mode.as_ref() + &self.chol.dot(&z);
@@ -4865,11 +5127,12 @@ impl JointBetaRhoPosterior {
         let eta = crate::faer_ndarray::fast_av(self.data.x.as_ref(), &beta);
 
         // ---- Log-likelihood ℓ(y|β) and ∇_β ℓ ----
-        let (ll, mut grad_ll_beta) = match joint_family_logp_and_grad(
+        let (ll, mut grad_ll_beta, grad_link) = match joint_family_logp_grad_and_link_grad(
             self.likelihood_family,
-            &self.inverse_link,
+            &inverse_link,
             &self.data,
             &eta,
+            n_link_params,
         ) {
             Ok(value) => value,
             Err(err) => {
@@ -4877,7 +5140,7 @@ impl JointBetaRhoPosterior {
                     "[Joint HMC] likelihood target became invalid at the current state: {}",
                     err
                 );
-                return (f64::NEG_INFINITY, Array1::zeros(n_beta + n_rho));
+                return (f64::NEG_INFINITY, Array1::zeros(total_dim));
             }
         };
 
@@ -4893,7 +5156,7 @@ impl JointBetaRhoPosterior {
                         "[Joint HMC/Firth] Jeffreys target became invalid at the current state: {}",
                         err
                     );
-                    return (f64::NEG_INFINITY, Array1::zeros(n_beta + n_rho));
+                    return (f64::NEG_INFINITY, Array1::zeros(total_dim));
                 }
             }
         }
@@ -4985,7 +5248,7 @@ impl JointBetaRhoPosterior {
                             "[Joint HMC] structural penalty logdet became invalid at the current state: {}",
                             err
                         );
-                        return (f64::NEG_INFINITY, Array1::zeros(n_beta + n_rho));
+                        return (f64::NEG_INFINITY, Array1::zeros(total_dim));
                     }
                 }
             }
@@ -5016,7 +5279,7 @@ impl JointBetaRhoPosterior {
             }
             RhoPrior::Independent(priors) => {
                 if priors.len() != n_rho {
-                    return (f64::NEG_INFINITY, Array1::zeros(n_beta + n_rho));
+                    return (f64::NEG_INFINITY, Array1::zeros(total_dim));
                 }
                 for k in 0..n_rho {
                     match &priors[k] {
@@ -5033,7 +5296,7 @@ impl JointBetaRhoPosterior {
                             grad_rho[k] += (*shape - 1.0) - *rate * lambda;
                         }
                         RhoPrior::Independent(_) => {
-                            return (f64::NEG_INFINITY, Array1::zeros(n_beta + n_rho));
+                            return (f64::NEG_INFINITY, Array1::zeros(total_dim));
                         }
                     }
                 }
@@ -5049,10 +5312,11 @@ impl JointBetaRhoPosterior {
         // Chain rule to whitened space: ∇_z = L' ∇_β
         let grad_z = self.chol_t.dot(&grad_beta);
 
-        // Combined gradient: [∇_z; ∇_ρ]
-        let mut grad = Array1::<f64>::zeros(n_beta + n_rho);
+        // Combined gradient: [∇_z; ∇_ρ; ∇_link]
+        let mut grad = Array1::<f64>::zeros(total_dim);
         grad.slice_mut(ndarray::s![..n_beta]).assign(&grad_z);
-        grad.slice_mut(ndarray::s![n_beta..]).assign(&grad_rho);
+        grad.slice_mut(ndarray::s![n_beta..n_beta + n_rho]).assign(&grad_rho);
+        grad.slice_mut(ndarray::s![n_beta + n_rho..]).assign(&grad_link);
 
         (logp, grad)
     }
@@ -5098,12 +5362,14 @@ pub fn run_joint_beta_rho_sampling(
     validate_nuts_target_accept(config.target_accept).map_err(String::from)?;
     let n_beta = inputs.mode.len();
     let n_rho = inputs.penalty_roots.len();
-    let total_dim = n_beta + n_rho;
+    let n_link_params = JointBetaRhoPosterior::link_param_mode(&inputs.inverse_link).len();
+    let total_dim = n_beta + n_rho + n_link_params;
 
     log::info!(
-        "[Joint HMC] Sampling (β, ρ) jointly: {} β-params + {} ρ-params = {} total (triggered by skewness {:.3})",
+        "[Joint HMC] Sampling (β, ρ, link) jointly: {} β-params + {} ρ-params + {} link-params = {} total (triggered by skewness {:.3})",
         n_beta,
         n_rho,
+        n_link_params,
         total_dim,
         inputs.trigger_skewness,
     );
@@ -5126,8 +5392,9 @@ pub fn run_joint_beta_rho_sampling(
     let chol = target.chol.clone();
     let mode_arr = target.data.mode.clone();
     let rho_mode = target.rho_mode.clone();
+    let link_param_mode = target.link_param_mode.clone();
 
-    // Initialize chains: z_β at 0 (= mode), ρ at rho_mode
+    // Initialize chains: z_β at 0 (= mode), ρ at rho_mode, link params at fitted state.
     let mut rng = StdRng::seed_from_u64(config.seed);
     let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
         .map(|_| {
@@ -5139,6 +5406,10 @@ pub fn run_joint_beta_rho_sampling(
             // Small jitter for ρ around mode
             for k in 0..n_rho {
                 pos[n_beta + k] = rho_mode[k] + sample_standard_normal(&mut rng) * 0.2;
+            }
+            // Small jitter for adaptive link parameters around fitted state
+            for k in 0..n_link_params {
+                pos[n_beta + n_rho + k] = link_param_mode[k] + sample_standard_normal(&mut rng) * 0.05;
             }
             pos
         })
@@ -5170,6 +5441,7 @@ pub fn run_joint_beta_rho_sampling(
 
     let mut beta_samples = Array2::<f64>::zeros((total_samples, n_beta));
     let mut rho_samples = Array2::<f64>::zeros((total_samples, n_rho));
+    let mut link_param_samples = Array2::<f64>::zeros((total_samples, n_link_params));
 
     for chain in 0..n_chains {
         for sample_i in 0..n_samples_out {
@@ -5181,9 +5453,11 @@ pub fn run_joint_beta_rho_sampling(
             let beta = mode_arr.as_ref() + &chol.dot(&z_beta);
             beta_samples.row_mut(sample_idx).assign(&beta);
 
-            // ρ is stored directly
-            let rho_slice = zview.slice(ndarray::s![n_beta..]);
+            // ρ and adaptive link parameters are stored directly
+            let rho_slice = zview.slice(ndarray::s![n_beta..n_beta + n_rho]);
             rho_samples.row_mut(sample_idx).assign(&rho_slice);
+            let link_slice = zview.slice(ndarray::s![n_beta + n_rho..]);
+            link_param_samples.row_mut(sample_idx).assign(&link_slice);
         }
     }
 
@@ -5193,6 +5467,9 @@ pub fn run_joint_beta_rho_sampling(
     let rho_mean = rho_samples
         .mean_axis(Axis(0))
         .unwrap_or_else(|| Array1::zeros(n_rho));
+    let link_param_mean = link_param_samples
+        .mean_axis(Axis(0))
+        .unwrap_or_else(|| Array1::zeros(n_link_params));
 
     let (rhat, ess) = compute_split_rhat_and_ess(&samples_array);
 
@@ -5209,6 +5486,8 @@ pub fn run_joint_beta_rho_sampling(
         beta_samples,
         rho_samples,
         beta_mean,
+        link_param_samples,
+        link_param_mean,
         rho_mean,
         rhat,
         ess,
@@ -5340,7 +5619,7 @@ mod survival_hmc {
                 .base_model
                 .update_state(&sampler_position)
                 .map_err(|e| format!("Survival state update failed: {:?}", e))?;
-            let logp = state.log_likelihood - 0.5 * state.penalty_term;
+            let logp = state.log_likelihood - state.penalty_term;
             let grad_beta = state.gradient.mapv(|g| -g);
             let gradz = self.chol_t.dot(&grad_beta);
             Ok((logp, gradz))
