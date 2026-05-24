@@ -103,6 +103,8 @@ fn closed_form_scalar_matches_existing_gaussian_reml_path() {
         .zip(existing.blocks[0].beta.iter())
         .enumerate()
     {
+        let a: f64 = a;
+        let b: f64 = b;
         let rel = (a - b).abs() / a.abs().max(1e-6);
         assert!(
             (a - b).abs() < 1e-2 || rel < 5e-2,
@@ -117,8 +119,10 @@ fn closed_form_scalar_matches_existing_gaussian_reml_path() {
         closed.reml_score,
         existing.reml_score
     );
-    let fitted = x.dot(&closed.coefficients);
+    let fitted: Array1<f64> = x.dot(&closed.coefficients);
     for (idx, (&a, &b)) in closed.fitted.iter().zip(fitted.iter()).enumerate() {
+        let a: f64 = a;
+        let b: f64 = b;
         assert!(
             (a - b).abs() < 1e-10,
             "fitted value {idx} mismatch: closed={a} explicit={b}"
@@ -155,8 +159,9 @@ fn closed_form_multi_output_pools_shared_lambda_and_coefficients() {
         assert!((multi.coefficients[[j, 1]] - 2.0 * scalar.coefficients[j]).abs() < 1e-10);
         assert!((multi.coefficients[[j, 2]] + 0.5 * scalar.coefficients[j]).abs() < 1e-10);
     }
-    let fitted = x.dot(&multi.coefficients);
+    let fitted: Array2<f64> = x.dot(&multi.coefficients);
     for ((i, j), &explicit) in fitted.indexed_iter() {
+        let explicit: f64 = explicit;
         assert!((multi.fitted[[i, j]] - explicit).abs() < 1e-10);
     }
     assert!(multi.reml_grad_lambda.abs() < 1e-6);
@@ -209,7 +214,7 @@ fn closed_form_batches_ragged_scalar_and_multi_problems() {
             problem.x.view(),
             problem.y.view(),
             s.view(),
-            problem.weights.as_ref().map(|weights| weights.view()),
+            problem.weights.as_ref().map(|weights: &ndarray::ArrayView1<f64>| weights.view()),
             problem.init_rho,
         )
         .expect("individual scalar fit");
@@ -247,7 +252,7 @@ fn closed_form_batches_ragged_scalar_and_multi_problems() {
             problem.x.view(),
             problem.y.view(),
             s.view(),
-            problem.weights.as_ref().map(|weights| weights.view()),
+            problem.weights.as_ref().map(|weights: &ndarray::ArrayView1<f64>| weights.view()),
             problem.init_rho,
         )
         .expect("individual multi fit");

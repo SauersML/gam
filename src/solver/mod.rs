@@ -3,6 +3,7 @@ pub mod arrow_schur;
 pub mod arrow_schur_convergence_check;
 pub mod estimate;
 pub mod evidence;
+pub mod gaussian_reml;
 pub mod gpu;
 pub(crate) mod latent_cache;
 pub mod latent_inner;

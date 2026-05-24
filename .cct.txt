@@ -1,1 +1,1 @@
-   Compiling gam v0.2.1 (/Users/user/gam)
+    Blocking waiting for file lock on build directory
