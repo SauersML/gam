@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """OrthogonalityPenalty + ARDPenalty worked example.
 
-Motivation: auto_exp_21 (2026-05-23) tested Circle + Fisher-Rao + ARD on
-cogito L40 color manifold and found ARD failed to prune 4 aux dims to 2-3
-because ``alpha_k ||t_{.,k}||^2`` is rotation-invariant on its own:
-``hypothesis_b_aux_2_to_3 = False``; all 4 dims were kept, tau was uniform
-around 24, and U's singular spectrum was flat [1.00, 0.98, 0.94, 0.90].
-docs/composition_engine.md section 4(c) predicted this: "ARD alone is
-gauge-invariant ... the composition (ARD + gauge fix + REML normalisers) is
-what does the work." OrthogonalityPenalty is the cleanest gauge fix.
+Motivation: ARD alone is rotation-invariant — ``alpha_k * ||t_{.,k}||^2`` is
+unchanged by any orthogonal rotation of the latent basis, so without a gauge
+fix it cannot identify which axes to prune even when the intrinsic dimension
+is strictly less than the allocated latent width. docs/composition_engine.md
+section 4(c) summarises this: "ARD alone is gauge-invariant ... the
+composition (ARD + gauge fix + REML normalisers) is what does the work."
+OrthogonalityPenalty is the cleanest gauge fix.
 
 The demo embeds a 2D latent in 6D, applies rotation + scaling, and compares
 ARD alone, Orthogonality alone, and paired Orthogonality + ARD. Wheels without

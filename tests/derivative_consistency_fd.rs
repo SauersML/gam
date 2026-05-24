@@ -20,7 +20,7 @@ use gam::estimate::{
     evaluate_externalcost_andridge, evaluate_externalgradient,
 };
 use gam::smooth::BlockwisePenalty;
-use gam::types::LikelihoodFamily;
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -37,6 +37,13 @@ use rand::{RngExt, SeedableRng};
 const INNER_TOL: f64 = 1e-12;
 const INNER_MAX_ITER: usize = 500;
 
+fn gaussian_identity_spec() -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(LinkFunction::Identity),
+    )
+}
+
 fn gaussian_opts(nullspace_dims: Vec<usize>) -> ExternalOptimOptions {
     ExternalOptimOptions {
         latent_cloglog: None,
@@ -44,7 +51,7 @@ fn gaussian_opts(nullspace_dims: Vec<usize>) -> ExternalOptimOptions {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        family: LikelihoodFamily::GaussianIdentity,
+        family: gaussian_identity_spec(),
         compute_inference: true,
         max_iter: INNER_MAX_ITER,
         tol: INNER_TOL,

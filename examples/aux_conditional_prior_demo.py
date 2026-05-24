@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """AuxConditionalPriorPenalty + ARDPenalty worked example.
 
-Motivation: memory ``project_ard_gauge_fix_doesnt_help_cogito.md`` records
-four failed cogito experiments: ARD-alone, ARD+QR-Ortho, ARD+soft-Ortho, and
-BlockSparsity+supervised. It promotes "aux-conditional prior with HSV as aux"
-as the next-direction hypothesis. Commit ``boutjufz0`` just landed
-``AuxConditionalPriorPenalty`` in ``src/terms/analytic_penalties.rs``,
-``gamfit/_penalties.py``, and the ``gamfit.__init__`` re-export.
-
-Proposal section 4(c)'s iVAE-sibling prediction is that observed aux ``u_n``
-supplies ``p(t_n | u_n) propto exp(-0.5 * t_n.T @ Lambda(u_n) @ t_n)``.
-Varying ``Lambda(u_n)`` breaks the rotation gauge; ARD then has a pinned basis
-where axes that do not load on aux can be pruned.
+Motivation: ARD alone is rotation-invariant on the latent block, so when the
+true signal is spread across an arbitrary rotation of the coordinate basis it
+cannot identify any axis to prune. The iVAE-style construction supplies an
+observed auxiliary covariate ``u_n`` and a conditional Gaussian prior
+``p(t_n | u_n) propto exp(-0.5 * t_n.T @ Lambda(u_n) @ t_n)``. Varying
+``Lambda(u_n)`` per row breaks the rotation gauge; ARD then operates in a
+pinned basis where axes that do not load on the auxiliary can be pruned.
 """
 
 from dataclasses import dataclass
@@ -22,10 +18,10 @@ AUX_WEIGHT, AXIS_CUTOFF, AUX_CUTOFF = 8.0, 0.04, 0.35
 FIG_PATH = Path(__file__).with_suffix(".png")
 INTRO = """# AuxConditionalPriorPenalty + ARDPenalty
 
-Memory `project_ard_gauge_fix_doesnt_help_cogito.md` says ARD-alone, ARD+QR-Ortho,
-ARD+soft-Ortho, and BlockSparsity+supervised failed on cogito; aux-conditional
-prior with HSV as aux is the next hypothesis. Proposal section 4(c) predicts an
-iVAE sibling: aux anchors the basis through `Lambda(u_n)`, then ARD prunes."""
+ARD on the latent block is rotation-invariant: without a gauge anchor, no axis
+is preferred and ARD cannot shrink. An iVAE-style aux-conditional prior with
+per-row precision `Lambda(u_n)` pins the latent basis, and ARD then prunes
+axes that do not load on the auxiliary covariate."""
 CONFIGS = (
     ("ARD only", "gamfit.fit(..., penalties=[ARDPenalty('t')])"),
     ("AuxConditional only", "gamfit.fit(..., penalties=[AuxConditionalPriorPenalty(lambda_per_row, weight=8.0, n_eff=N)])"),

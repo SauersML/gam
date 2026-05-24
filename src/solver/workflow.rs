@@ -2663,7 +2663,10 @@ pub fn resolve_family(
                 ),
                 "latent-cloglog-binomial" => LikelihoodSpec::new(
                     ResponseFamily::Binomial,
-                    InverseLink::LatentCLogLog(LatentCLogLogState::default()),
+                    InverseLink::LatentCLogLog(
+                        LatentCLogLogState::new(1.0)
+                            .map_err(|err| format!("latent cloglog default state: {err}"))?,
+                    ),
                 ),
                 "poisson" => LikelihoodSpec::new(
                     ResponseFamily::Poisson,
@@ -2711,10 +2714,15 @@ pub fn resolve_family(
     if let Some(choice) = link_choice {
         let from_link: LikelihoodSpec = if let Some(components) = choice.mixture_components.as_ref()
         {
-            LikelihoodSpec::new(
-                ResponseFamily::Binomial,
-                InverseLink::Mixture(MixtureLinkSpec::initial_state(components)),
-            )
+            let n = components.len();
+            let free = n.saturating_sub(1);
+            let mix_spec = MixtureLinkSpec {
+                components: components.clone(),
+                initial_rho: Array1::<f64>::zeros(free),
+            };
+            let state = state_fromspec(&mix_spec)
+                .map_err(|err| format!("mixture link initial state: {err}"))?;
+            LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Mixture(state))
         } else {
             match choice.link {
                 LinkFunction::Identity => LikelihoodSpec::new(
@@ -2748,14 +2756,23 @@ pub fn resolve_family(
                     ResponseFamily::Binomial,
                     InverseLink::Standard(LinkFunction::CLogLog),
                 ),
-                LinkFunction::Sas => LikelihoodSpec::new(
-                    ResponseFamily::Binomial,
-                    InverseLink::Sas(SasLinkSpec::default_initial_state()),
-                ),
-                LinkFunction::BetaLogistic => LikelihoodSpec::new(
-                    ResponseFamily::Binomial,
-                    InverseLink::BetaLogistic(SasLinkSpec::default_beta_logistic_state()),
-                ),
+                LinkFunction::Sas => {
+                    let state = state_from_sasspec(SasLinkSpec {
+                        initial_epsilon: 0.0,
+                        initial_log_delta: 0.0,
+                    })
+                    .map_err(|err| format!("SAS link initial state: {err}"))?;
+                    LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(state))
+                }
+                LinkFunction::BetaLogistic => {
+                    let state =
+                        state_from_beta_logisticspec(SasLinkSpec {
+                            initial_epsilon: 0.0,
+                            initial_log_delta: 0.0,
+                        })
+                        .map_err(|err| format!("Beta-Logistic link initial state: {err}"))?;
+                    LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::BetaLogistic(state))
+                }
             }
         };
         if let Some(explicit_spec) = explicit.as_ref() {

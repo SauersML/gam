@@ -13,7 +13,8 @@ use crate::solver::persistent_warm_start::{
     PersistentWarmStartRecord, StableHasher, load_record, store_record,
 };
 use crate::types::{
-    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LinkFunction, RhoPrior, SasLinkState,
+    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
+    MixtureLinkState, ResponseFamily, RhoPrior, SasLinkState,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1234,65 +1235,126 @@ struct DerivativeContext {
     barrier_config: Option<super::unified::BarrierConfig>,
 }
 
+/// Project a `GlmLikelihoodSpec` onto a `LikelihoodSpec` for pattern matching
+/// on the `(response, link)` form used elsewhere in the codebase.
+///
+/// Mapping per migration spec:
+///   GaussianIdentity              -> { Gaussian,         Standard(Identity) }
+///   BinomialLogit                 -> { Binomial,         Standard(Logit)    }
+///   BinomialProbit                -> { Binomial,         Standard(Probit)   }
+///   BinomialCLogLog               -> { Binomial,         Standard(CLogLog)  }
+///   BinomialSas                   -> { Binomial,         Sas(placeholder)         }
+///   BinomialBetaLogistic          -> { Binomial,         BetaLogistic(placeholder) }
+///   BinomialMixture               -> { Binomial,         Mixture(placeholder)      }
+///   PoissonLog                    -> { Poisson,          Standard(Log)      }
+///   Tweedie { p }                 -> { Tweedie { p },    Standard(Log)      }
+///   NegativeBinomial { theta }    -> { NegativeBinomial { theta }, Standard(Log) }
+///   BetaLogit { phi }             -> { Beta { phi },     Standard(Logit)    }
+///   GammaLog                      -> { Gamma,            Standard(Log)      }
+///
+/// `GlmLikelihoodSpec` does not carry the parameterized link state for the
+/// SAS / BetaLogistic / Mixture binomial variants, so placeholder states are
+/// substituted. The REML helpers below only consult variant kinds (not link
+/// payloads), which keeps the substitution sound.
+#[inline]
+fn reml_likelihood_spec(likelihood: GlmLikelihoodSpec) -> LikelihoodSpec {
+    let placeholder_sas = SasLinkState {
+        epsilon: 0.0,
+        log_delta: 0.0,
+        delta: 1.0,
+    };
+    match likelihood.family {
+        GlmLikelihoodFamily::GaussianIdentity => LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(LinkFunction::Identity),
+        ),
+        GlmLikelihoodFamily::BinomialLogit => LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        ),
+        GlmLikelihoodFamily::BinomialProbit => LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Probit),
+        ),
+        GlmLikelihoodFamily::BinomialCLogLog => LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::CLogLog),
+        ),
+        GlmLikelihoodFamily::BinomialSas => {
+            LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(placeholder_sas))
+        }
+        GlmLikelihoodFamily::BinomialBetaLogistic => LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::BetaLogistic(placeholder_sas),
+        ),
+        GlmLikelihoodFamily::BinomialMixture => LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Mixture(MixtureLinkState {
+                components: Vec::new(),
+                rho: ndarray::Array1::<f64>::zeros(0),
+                pi: ndarray::Array1::<f64>::zeros(0),
+            }),
+        ),
+        GlmLikelihoodFamily::PoissonLog => LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            InverseLink::Standard(LinkFunction::Log),
+        ),
+        GlmLikelihoodFamily::Tweedie { p } => LikelihoodSpec::new(
+            ResponseFamily::Tweedie { p },
+            InverseLink::Standard(LinkFunction::Log),
+        ),
+        GlmLikelihoodFamily::NegativeBinomial { theta } => LikelihoodSpec::new(
+            ResponseFamily::NegativeBinomial { theta },
+            InverseLink::Standard(LinkFunction::Log),
+        ),
+        GlmLikelihoodFamily::BetaLogit { phi } => LikelihoodSpec::new(
+            ResponseFamily::Beta { phi },
+            InverseLink::Standard(LinkFunction::Logit),
+        ),
+        GlmLikelihoodFamily::GammaLog => LikelihoodSpec::new(
+            ResponseFamily::Gamma,
+            InverseLink::Standard(LinkFunction::Log),
+        ),
+    }
+}
+
 #[inline]
 fn reml_is_gaussian_identity(likelihood: GlmLikelihoodSpec) -> bool {
-    match likelihood.family {
-        GlmLikelihoodFamily::GaussianIdentity => true,
-        GlmLikelihoodFamily::BinomialLogit
-        | GlmLikelihoodFamily::BinomialProbit
-        | GlmLikelihoodFamily::BinomialCLogLog
-        | GlmLikelihoodFamily::BinomialSas
-        | GlmLikelihoodFamily::BinomialBetaLogistic
-        | GlmLikelihoodFamily::BinomialMixture
-        | GlmLikelihoodFamily::PoissonLog
-        | GlmLikelihoodFamily::Tweedie { .. }
-        | GlmLikelihoodFamily::NegativeBinomial { .. }
-        | GlmLikelihoodFamily::BetaLogit { .. }
-        | GlmLikelihoodFamily::GammaLog => false,
-    }
+    reml_likelihood_spec(likelihood).is_gaussian_identity()
 }
 
 #[inline]
 fn reml_supports_firth(likelihood: GlmLikelihoodSpec) -> bool {
-    match likelihood.family {
-        GlmLikelihoodFamily::BinomialLogit => true,
-        GlmLikelihoodFamily::GaussianIdentity
-        | GlmLikelihoodFamily::BinomialProbit
-        | GlmLikelihoodFamily::BinomialCLogLog
-        | GlmLikelihoodFamily::BinomialSas
-        | GlmLikelihoodFamily::BinomialBetaLogistic
-        | GlmLikelihoodFamily::BinomialMixture
-        | GlmLikelihoodFamily::PoissonLog
-        | GlmLikelihoodFamily::Tweedie { .. }
-        | GlmLikelihoodFamily::NegativeBinomial { .. }
-        | GlmLikelihoodFamily::BetaLogit { .. }
-        | GlmLikelihoodFamily::GammaLog => false,
-    }
+    let spec = reml_likelihood_spec(likelihood);
+    matches!(spec.response, ResponseFamily::Binomial)
+        && matches!(spec.link, InverseLink::Standard(LinkFunction::Logit))
 }
 
 #[inline]
 fn reml_fixed_glm_dispersion(likelihood: GlmLikelihoodSpec) -> f64 {
-    match likelihood.family {
-        GlmLikelihoodFamily::GaussianIdentity
-        | GlmLikelihoodFamily::BinomialLogit
-        | GlmLikelihoodFamily::BinomialProbit
-        | GlmLikelihoodFamily::BinomialCLogLog
-        | GlmLikelihoodFamily::BinomialSas
-        | GlmLikelihoodFamily::BinomialBetaLogistic
-        | GlmLikelihoodFamily::BinomialMixture
-        | GlmLikelihoodFamily::PoissonLog => likelihood.fixed_phi().unwrap_or(1.0),
-        GlmLikelihoodFamily::Tweedie { .. } => {
-            // REML dispersion is the exponential-family scale phi from the scale slot.
-            // The family field stores only the Tweedie variance power p used by IRLS weights.
-            likelihood.fixed_phi().unwrap_or(1.0)
-        }
-        GlmLikelihoodFamily::NegativeBinomial { .. } => {
-            // REML uses unit scale for NB; overdispersion is encoded by theta in the family slot.
-            // IRLS consumes theta through the variance chain, not as a separate phi.
-            1.0
-        }
-        GlmLikelihoodFamily::BetaLogit { phi } => phi,
-        GlmLikelihoodFamily::GammaLog => likelihood.fixed_phi().unwrap_or(1.0),
+    let spec = reml_likelihood_spec(likelihood);
+    match (&spec.response, &spec.link) {
+        // Beta carries phi inside the response variant under the LikelihoodSpec form.
+        (ResponseFamily::Beta { phi }, _) => *phi,
+        // REML uses unit scale for NB; overdispersion is encoded by theta in the
+        // response variant. IRLS consumes theta through the variance chain, not
+        // as a separate phi.
+        (ResponseFamily::NegativeBinomial { .. }, _) => 1.0,
+        // Tweedie's variance power lives on the response variant; the scale phi
+        // comes from the dispersion slot.
+        (ResponseFamily::Tweedie { .. }, _) => likelihood.fixed_phi().unwrap_or(1.0),
+        // All other (response, link) combinations share the dispersion-slot phi
+        // (defaulting to 1.0 when absent).
+        (
+            ResponseFamily::Gaussian
+            | ResponseFamily::Binomial
+            | ResponseFamily::Poisson
+            | ResponseFamily::Gamma,
+            _,
+        ) => likelihood.fixed_phi().unwrap_or(1.0),
+        // RoystonParmar is survival-specific and not produced by
+        // `reml_likelihood_spec` from any `GlmLikelihoodFamily` variant.
+        (ResponseFamily::RoystonParmar, _) => likelihood.fixed_phi().unwrap_or(1.0),
     }
 }
 
@@ -3694,10 +3756,11 @@ impl<'a> RemlState<'a> {
         // taken from the dedicated 5-jet (no variance-jet machinery).
         // Mixture links advertise `link_function() == Logit` but are
         // non-canonical; route them through the general path below.
-        let canonical_logit = matches!(
-            pirls_result.likelihood.family,
-            GlmLikelihoodFamily::BinomialLogit
-        ) && self.runtime_mixture_link_state.is_none();
+        let canonical_logit = {
+            let spec = reml_likelihood_spec(pirls_result.likelihood);
+            matches!(spec.response, ResponseFamily::Binomial)
+                && matches!(spec.link, InverseLink::Standard(LinkFunction::Logit))
+        } && self.runtime_mixture_link_state.is_none();
 
         if canonical_logit {
             // Canonical Logit fast path: per-row 5-jet evaluation, no
@@ -3805,10 +3868,11 @@ impl<'a> RemlState<'a> {
         pirls_result: &PirlsResult,
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
         let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
-        let canonical_logit = matches!(
-            pirls_result.likelihood.family,
-            GlmLikelihoodFamily::BinomialLogit
-        ) && self.runtime_mixture_link_state.is_none();
+        let canonical_logit = {
+            let spec = reml_likelihood_spec(pirls_result.likelihood);
+            matches!(spec.response, ResponseFamily::Binomial)
+                && matches!(spec.link, InverseLink::Standard(LinkFunction::Logit))
+        } && self.runtime_mixture_link_state.is_none();
         if !canonical_logit {
             return Err(EstimationError::InvalidInput(
                 "Tierney-Kadane outer Hessian is implemented for canonical Binomial Logit Firth fits only".to_string(),
@@ -5727,10 +5791,8 @@ impl<'a> RemlState<'a> {
     ) -> Option<Arc<crate::pirls::GaussianFixedCache>> {
         // Static eligibility — these only depend on data the outer loop
         // never mutates, so the gate is correct once and stays correct.
-        let family_ok = matches!(
-            self.config.likelihood.family,
-            crate::types::GlmLikelihoodFamily::GaussianIdentity
-        );
+        let spec = reml_likelihood_spec(self.config.likelihood);
+        let family_ok = matches!(spec.response, ResponseFamily::Gaussian);
         let link_ok = matches!(
             self.config.link_kind,
             crate::types::InverseLink::Standard(LinkFunction::Identity)

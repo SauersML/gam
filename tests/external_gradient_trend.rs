@@ -2,7 +2,7 @@ use gam::estimate::{
     ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
 };
 use gam::smooth::BlockwisePenalty;
-use gam::types::LikelihoodFamily;
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -51,7 +51,10 @@ fn analytic_gradient_matchescost_trend() {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        family: LikelihoodFamily::BinomialLogit,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        ),
         compute_inference: true,
         tol: 1e-10,
         max_iter: 500,
@@ -139,7 +142,10 @@ fn hypothesis_analytic_gradient_matchescost_trend() {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        family: LikelihoodFamily::BinomialLogit,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        ),
         compute_inference: true,
         tol: 1e-10,
         max_iter: 500,

@@ -15,9 +15,64 @@ use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, logit_inverse
 use crate::probability::standard_normal_quantile;
 use crate::solver::active_set;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
+// MIGRATION_TODO(pirls/LikelihoodSpec): this module is currently parameterized
+// on `GlmLikelihoodSpec`/`GlmLikelihoodFamily` (the GLM-restricted projection of
+// the legacy `LikelihoodFamily` enum). The agreed migration target is the
+// unified `LikelihoodSpec { response: ResponseFamily, link: InverseLink }` type
+// from `types.rs`.
+//
+// Mapping (legacy `LikelihoodFamily` variant -> `LikelihoodSpec { response, link }`):
+//   GaussianIdentity         -> { Gaussian, Standard(Identity) }
+//   BinomialLogit            -> { Binomial, Standard(Logit) }
+//   BinomialProbit           -> { Binomial, Standard(Probit) }
+//   BinomialCLogLog          -> { Binomial, Standard(CLogLog) }
+//   PoissonLog               -> { Poisson, Standard(Log) }
+//   Tweedie { p }            -> { Tweedie { p }, Standard(Log) }
+//   NegativeBinomial { theta }
+//                            -> { NegativeBinomial { theta }, Standard(Log) }
+//   BetaLogit { phi }        -> { Beta { phi }, Standard(Logit) }
+//   GammaLog                 -> { Gamma, Standard(Log) }
+//   RoystonParmar            -> { RoystonParmar, Standard(Identity) }
+//   BinomialMixture          -> { Binomial, InverseLink::Mixture(state) }
+//   BinomialSas              -> { Binomial, InverseLink::Sas(state) }
+//   BinomialBetaLogistic     -> { Binomial, InverseLink::BetaLogistic(state) }
+//   BinomialLatentCLogLog    -> { Binomial, InverseLink::LatentCLogLog(state) }
+//
+// Why this migration is staged here as a TODO rather than completed in this
+// pass:
+//   * `GlmLikelihoodSpec` carries `LikelihoodScaleMetadata` (gamma shape that
+//     is *dynamically estimated* during PIRLS, Tweedie dispersion, etc.).
+//     `LikelihoodSpec` deliberately omits that field (scale lives separately
+//     in the new design). The PIRLS working model mutates the gamma shape
+//     inside its inner loop via `self.likelihood.with_gamma_shape(shape)`
+//     (see `screen_candidate_from_direction` and the IRLS update site), and
+//     that shape must flow into deviance/log-lik/weight evaluation. Switching
+//     `likelihood` to `LikelihoodSpec` without threading the estimated shape
+//     through every consumer (`calculate_deviance`,
+//     `calculate_loglikelihood_omitting_constants`, the `Gamma` write_state
+//     writer, plus the assemblers) would silently freeze the gamma shape at
+//     1.0, which is a correctness regression — Gamma-log REML fits do
+//     estimate the shape jointly with the mean model.
+//   * The public structs `PirlsResult` and `PirlsConfig` expose
+//     `likelihood: GlmLikelihoodSpec` (and `assemble_pirls_result` is
+//     parameterized on it). Flipping those types in this file alone would
+//     break ~150 call sites in the broader crate which is out of scope for a
+//     pirls-only edit.
+//   * `update_glmvectors_by_family`, `update_glmvectors_integrated_by_family`,
+//     `weight_family_for_glm_likelihood`, `calculate_deviance` and
+//     `calculate_loglikelihood_omitting_constants` are `pub`/`pub(crate)` and
+//     consumed by sibling solver/inference modules.
+//
+// Completing the migration requires (a) threading the dynamic gamma shape as
+// a separate `f64` field on `GamWorkingModel` (and through the deviance /
+// log-likelihood / write_state APIs), and (b) flipping the public type on the
+// same commit as every other call site is flipped — i.e. a cross-module
+// change. Until that companion change lands, the file keeps the existing
+// `GlmLikelihoodSpec` parameterization.
 use crate::types::{
-    InverseLink, LikelihoodSpec, LinkFunction, MixtureLinkState, ResponseFamily, RidgePassport,
-    RidgePolicy, SasLinkState, is_valid_tweedie_power,
+    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
+    MixtureLinkState, ResponseFamily, RidgePassport, RidgePolicy, SasLinkState,
+    is_valid_tweedie_power,
 };
 use dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::matmul::matmul;
@@ -669,7 +724,7 @@ pub(crate) trait WorkingLikelihood {
     ) -> Result<f64, EstimationError>;
 }
 
-impl WorkingLikelihood for LikelihoodSpec {
+impl WorkingLikelihood for GlmLikelihoodSpec {
     fn irls_update(
         &self,
         y: ArrayView1<f64>,
@@ -681,14 +736,22 @@ impl WorkingLikelihood for LikelihoodSpec {
         integrated: Option<IntegratedWorkingInput<'_>>,
         derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
     ) -> Result<(), EstimationError> {
-        match (&self.response, &self.link, integrated) {
-            (ResponseFamily::Binomial, _, Some(integ)) => {
+        match (self.family, integrated) {
+            (
+                GlmLikelihoodFamily::BinomialLogit
+                | GlmLikelihoodFamily::BinomialProbit
+                | GlmLikelihoodFamily::BinomialCLogLog
+                | GlmLikelihoodFamily::BinomialSas
+                | GlmLikelihoodFamily::BinomialBetaLogistic
+                | GlmLikelihoodFamily::BinomialMixture,
+                Some(integ),
+            ) => {
                 update_glmvectors_integrated_by_family(
                     integ.quadctx,
                     y,
                     eta,
                     integ.se,
-                    self,
+                    self.family,
                     priorweights,
                     mu,
                     weights,
@@ -700,12 +763,11 @@ impl WorkingLikelihood for LikelihoodSpec {
                 Ok(())
             }
             (
-                ResponseFamily::Binomial,
-                InverseLink::Standard(LinkFunction::Logit)
-                | InverseLink::Standard(LinkFunction::Probit)
-                | InverseLink::Standard(LinkFunction::CLogLog)
-                | InverseLink::Sas(_)
-                | InverseLink::BetaLogistic(_),
+                GlmLikelihoodFamily::BinomialLogit
+                | GlmLikelihoodFamily::BinomialProbit
+                | GlmLikelihoodFamily::BinomialCLogLog
+                | GlmLikelihoodFamily::BinomialSas
+                | GlmLikelihoodFamily::BinomialBetaLogistic,
                 None,
             ) => {
                 update_glmvectors(
@@ -720,18 +782,10 @@ impl WorkingLikelihood for LikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (ResponseFamily::Binomial, InverseLink::Mixture(_), None) => {
-                Err(EstimationError::InvalidInput(
-                    "BinomialMixture IRLS update requires explicit mixture link state".to_string(),
-                ))
-            }
-            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_), _)
-            | (ResponseFamily::Binomial, InverseLink::Standard(_), None) => {
-                Err(EstimationError::InvalidInput(
-                    "Unsupported binomial inverse-link in PIRLS IRLS update".to_string(),
-                ))
-            }
-            (ResponseFamily::Gaussian, _, _) => {
+            (GlmLikelihoodFamily::BinomialMixture, None) => Err(EstimationError::InvalidInput(
+                "BinomialMixture IRLS update requires explicit mixture link state".to_string(),
+            )),
+            (GlmLikelihoodFamily::GaussianIdentity, _) => {
                 update_glmvectors(
                     y,
                     eta,
@@ -744,17 +798,17 @@ impl WorkingLikelihood for LikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (ResponseFamily::Poisson, _, _) => {
+            (GlmLikelihoodFamily::PoissonLog, _) => {
                 write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives);
                 Ok(())
             }
-            (ResponseFamily::Tweedie { p }, _, _) => {
+            (GlmLikelihoodFamily::Tweedie { p }, _) => {
                 write_tweedie_log_working_state(
                     y,
                     eta,
                     priorweights,
-                    *p,
-                    fixed_glm_dispersion(self),
+                    p,
+                    fixed_glm_dispersion(*self),
                     mu,
                     weights,
                     z,
@@ -762,12 +816,12 @@ impl WorkingLikelihood for LikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (ResponseFamily::NegativeBinomial { theta }, _, _) => {
+            (GlmLikelihoodFamily::NegativeBinomial { theta }, _) => {
                 write_negative_binomial_log_working_state(
                     y,
                     eta,
                     priorweights,
-                    *theta,
+                    theta,
                     mu,
                     weights,
                     z,
@@ -775,12 +829,12 @@ impl WorkingLikelihood for LikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (ResponseFamily::Beta { phi }, _, _) => {
+            (GlmLikelihoodFamily::BetaLogit { phi }, _) => {
                 write_beta_logit_working_state(
                     y,
                     eta,
                     priorweights,
-                    *phi,
+                    phi,
                     mu,
                     weights,
                     z,
@@ -788,12 +842,12 @@ impl WorkingLikelihood for LikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (ResponseFamily::Gamma, _, _) => {
+            (GlmLikelihoodFamily::GammaLog, _) => {
                 write_gamma_log_working_state(
                     y,
                     eta,
                     priorweights,
-                    self.default_scale_metadata().gamma_shape().unwrap_or(1.0),
+                    self.gamma_shape().unwrap_or(1.0),
                     mu,
                     weights,
                     z,
@@ -801,10 +855,6 @@ impl WorkingLikelihood for LikelihoodSpec {
                 );
                 Ok(())
             }
-            (ResponseFamily::RoystonParmar, _, _) => Err(EstimationError::InvalidInput(
-                "RoystonParmar IRLS update is not handled by the PIRLS GLM working likelihood"
-                    .to_string(),
-            )),
         }
     }
 
@@ -814,10 +864,10 @@ impl WorkingLikelihood for LikelihoodSpec {
         mu: &Array1<f64>,
         priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError> {
-        if matches!(self.response, ResponseFamily::Tweedie { .. }) {
+        if let GlmLikelihoodFamily::Tweedie { .. } = self.family {
             validate_tweedie_responses(&y, &priorweights)?;
         }
-        Ok(calculate_deviance(y, mu, self, priorweights))
+        Ok(calculate_deviance(y, mu, *self, priorweights))
     }
 }
 
@@ -1701,7 +1751,7 @@ struct GamWorkingModel<'a> {
     priorweights: ArrayView1<'a, f64>,
     penalty: PirlsPenalty,
     workspace: PirlsWorkspace,
-    likelihood: LikelihoodSpec,
+    likelihood: GlmLikelihoodSpec,
     link_kind: InverseLink,
     firth_bias_reduction: bool,
     lastmu: Array1<f64>,
@@ -1725,7 +1775,7 @@ struct GamWorkingModel<'a> {
 }
 
 struct GamModelFinalState {
-    likelihood: LikelihoodSpec,
+    likelihood: GlmLikelihoodSpec,
     coordinate_frame: PirlsCoordinateFrame,
     finalmu: Array1<f64>,
     finalweights: Array1<f64>,
