@@ -455,64 +455,107 @@ def _fit_fixed_k_ibp_rust(
     learning_rate: float,
     analytic_penalties: Sequence[Any] | None,
 ) -> SaeManifoldFitResult:
-    designs: list[np.ndarray] = []
-    jets: list[np.ndarray] = []
-    penalties: list[np.ndarray] = []
-    for atom in range(k_atoms):
-        phi, jet, penalty = _basis_and_jacobian(basis_specs[atom], coords[atom])
-        designs.append(np.ascontiguousarray(phi, dtype=float))
-        jets.append(np.ascontiguousarray(jet, dtype=float))
-        penalties.append(np.ascontiguousarray(penalty, dtype=float))
-
     n, p = z.shape
-    m_max = max(d.shape[1] for d in designs)
     d_max = max((c.shape[1] for c in coords), default=0)
-    basis_values = np.zeros((k_atoms, n, m_max), dtype=float)
-    basis_jacobian = np.zeros((k_atoms, n, m_max, d_max), dtype=float)
-    decoder_coefficients = np.zeros((k_atoms, m_max, p), dtype=float)
-    smooth_penalties = np.zeros((k_atoms, m_max, m_max), dtype=float)
-    coords_padded = np.zeros((k_atoms, n, d_max), dtype=float)
-    basis_sizes: list[int] = []
-    for atom in range(k_atoms):
-        m = designs[atom].shape[1]
-        d = coords[atom].shape[1]
-        basis_sizes.append(m)
-        basis_values[atom, :, :m] = designs[atom]
-        basis_jacobian[atom, :, :m, :d] = jets[atom]
-        smooth_penalties[atom, :m, :m] = penalties[atom]
-        coords_padded[atom, :, :d] = coords[atom]
-
+    coords_current = [np.asarray(c, dtype=float).copy() for c in coords]
+    logits_current = np.asarray(logits, dtype=float).copy()
+    decoder_blocks: list[np.ndarray] | None = None
+    log_ard = [np.zeros(d, dtype=float) for d in dims]
     normalized_penalties = _normalize_penalty_descriptors(analytic_penalties)
-    payload = rust_module().sae_manifold_fit_ibp(
-        np.ascontiguousarray(z, dtype=float),
-        [_basis_kind_name(spec) for spec in basis_specs],
-        [int(d) for d in dims],
-        np.ascontiguousarray(basis_values),
-        np.ascontiguousarray(basis_jacobian),
-        basis_sizes,
-        np.ascontiguousarray(decoder_coefficients),
-        np.ascontiguousarray(smooth_penalties),
-        np.ascontiguousarray(logits, dtype=float),
-        np.ascontiguousarray(coords_padded),
-        float(alpha_value),
-        float(tau),
-        bool(learnable_alpha),
-        float(lambda_sparse),
-        float(lambda_smooth),
-        int(max_iter),
-        float(learning_rate),
-        gumbel_schedule=gumbel_schedule,
-        analytic_penalties=normalized_penalties,
-    )
+    payload: Mapping[str, Any] | None = None
+    for iter_idx in range(int(max_iter)):
+        designs: list[np.ndarray] = []
+        jets: list[np.ndarray] = []
+        penalties: list[np.ndarray] = []
+        for atom in range(k_atoms):
+            phi, jet, penalty = _basis_and_jacobian(basis_specs[atom], coords_current[atom])
+            designs.append(np.ascontiguousarray(phi, dtype=float))
+            jets.append(np.ascontiguousarray(jet, dtype=float))
+            penalties.append(np.ascontiguousarray(penalty, dtype=float))
+
+        m_max = max(d.shape[1] for d in designs)
+        basis_values = np.zeros((k_atoms, n, m_max), dtype=float)
+        basis_jacobian = np.zeros((k_atoms, n, m_max, d_max), dtype=float)
+        decoder_coefficients = np.zeros((k_atoms, m_max, p), dtype=float)
+        smooth_penalties = np.zeros((k_atoms, m_max, m_max), dtype=float)
+        coords_padded = np.zeros((k_atoms, n, d_max), dtype=float)
+        basis_sizes: list[int] = []
+        for atom in range(k_atoms):
+            m = designs[atom].shape[1]
+            d = coords_current[atom].shape[1]
+            basis_sizes.append(m)
+            basis_values[atom, :, :m] = designs[atom]
+            basis_jacobian[atom, :, :m, :d] = jets[atom]
+            smooth_penalties[atom, :m, :m] = penalties[atom]
+            coords_padded[atom, :, :d] = coords_current[atom]
+            if decoder_blocks is not None:
+                decoder_coefficients[atom, :m, :] = decoder_blocks[atom]
+
+        schedule_iter = None
+        if gumbel_schedule is not None:
+            schedule_iter = dict(gumbel_schedule)
+            schedule_iter["iter_count"] = int(schedule_iter.get("iter_count", 0)) + iter_idx
+        payload = rust_module().sae_manifold_fit_ibp(
+            np.ascontiguousarray(z, dtype=float),
+            [_basis_kind_name(spec) for spec in basis_specs],
+            [int(d) for d in dims],
+            np.ascontiguousarray(basis_values),
+            np.ascontiguousarray(basis_jacobian),
+            basis_sizes,
+            np.ascontiguousarray(decoder_coefficients),
+            np.ascontiguousarray(smooth_penalties),
+            np.ascontiguousarray(logits_current, dtype=float),
+            np.ascontiguousarray(coords_padded),
+            float(alpha_value),
+            float(tau),
+            bool(learnable_alpha),
+            float(lambda_sparse),
+            float(lambda_smooth),
+            1,
+            float(learning_rate),
+            gumbel_schedule=schedule_iter,
+            analytic_penalties=normalized_penalties,
+        )
+        logits_current = np.asarray(payload["logits"], dtype=float)
+        coords_current = [
+            np.asarray(atom_payload["on_atom_coords_t"], dtype=float).copy()
+            for atom_payload in payload["atoms"]
+        ]
+        decoder_blocks = [
+            np.asarray(atom_payload["decoder_B"], dtype=float).copy()
+            for atom_payload in payload["atoms"]
+        ]
+        if "log_ard" in payload:
+            log_ard = [np.asarray(v, dtype=float).copy() for v in payload["log_ard"]]
+
+    if payload is None or decoder_blocks is None:
+        raise RuntimeError("sae_manifold_fit did not execute an optimization iteration")
 
     assignments = np.asarray(payload["assignments_z"], dtype=float)
-    fitted = np.asarray(payload["fitted"], dtype=float)
-    score = float(payload["reml_score"])
+    final_designs = []
+    final_penalties = []
+    fitted = np.zeros_like(z)
+    for atom in range(k_atoms):
+        phi, _jet, penalty = _basis_and_jacobian(basis_specs[atom], coords_current[atom])
+        final_designs.append(np.ascontiguousarray(phi, dtype=float))
+        final_penalties.append(np.ascontiguousarray(penalty, dtype=float))
+        fitted += assignments[:, [atom]] * (final_designs[atom] @ decoder_blocks[atom])
+    data_fit = 0.5 * float(np.sum((z - fitted) ** 2))
+    smooth = 0.0
+    for decoder, penalty in zip(decoder_blocks, final_penalties):
+        smooth += 0.5 * lambda_smooth * float(np.sum(decoder * (penalty @ decoder)))
+    effective_alpha = alpha_value * lambda_sparse if learnable_alpha else alpha_value
+    score = -(
+        data_fit
+        + _assignment_prior_value(assignments, "ibp_map", lambda_sparse, effective_alpha)
+        + smooth
+        + _ard_value(coords_current, log_ard)
+    )
     atoms: list[SaeManifoldAtomFit] = []
     out_coords: list[np.ndarray] = []
     for atom, atom_payload in enumerate(payload["atoms"]):
-        atom_coords = np.asarray(atom_payload["on_atom_coords_t"], dtype=float)
-        decoder = np.asarray(atom_payload["decoder_B"], dtype=float)
+        atom_coords = coords_current[atom]
+        decoder = decoder_blocks[atom]
         out_coords.append(atom_coords.copy())
         atoms.append(
             SaeManifoldAtomFit(
