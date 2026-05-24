@@ -1341,6 +1341,8 @@ pub enum SparsityKind {
 pub struct SparsityPenalty {
     pub target_tier: PenaltyTier,
     pub kind: SparsityKind,
+    pub weight: f64,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
     /// Index of `log strength` inside this penalty's local ρ view.
     pub strength_rho_index: usize,
     /// If `Some`, the index of `log ε` (or `log δ`) inside this penalty's
@@ -1369,6 +1371,8 @@ pub struct SparsityPenalty {
 pub struct SoftmaxAssignmentSparsityPenalty {
     pub k_atoms: usize,
     pub temperature: f64,
+    pub weight: f64,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl SoftmaxAssignmentSparsityPenalty {
@@ -1379,7 +1383,16 @@ impl SoftmaxAssignmentSparsityPenalty {
         Self {
             k_atoms,
             temperature,
+            weight: 1.0,
+            weight_schedule: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
     }
 
     fn softmax_row(&self, row: &[f64]) -> Vec<f64> {
@@ -1412,7 +1425,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     }
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
-        let lambda = rho[0].exp();
+        let lambda = self.weight * rho[0].exp();
         let n = target.len() / self.k_atoms;
         let values: Vec<f64> = target.iter().copied().collect();
         let mut acc = 0.0;
@@ -1433,7 +1446,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        let lambda = rho[0].exp();
+        let lambda = self.weight * rho[0].exp();
         let n = target.len() / self.k_atoms;
         let values: Vec<f64> = target.iter().copied().collect();
         let mut out = Array1::<f64>::zeros(target.len());
@@ -1460,7 +1473,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
-        let lambda = rho[0].exp();
+        let lambda = self.weight * rho[0].exp();
         let n = target.len() / self.k_atoms;
         let values: Vec<f64> = target.iter().copied().collect();
         let mut out = Array1::<f64>::zeros(target.len());
@@ -1516,6 +1529,8 @@ pub struct IBPAssignmentPenalty {
     pub alpha: f64,
     pub tau: f64,
     pub learnable_alpha: bool,
+    pub weight: f64,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl IBPAssignmentPenalty {
@@ -1529,7 +1544,16 @@ impl IBPAssignmentPenalty {
             alpha,
             tau,
             learnable_alpha,
+            weight: 1.0,
+            weight_schedule: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
     }
 
     fn resolved_alpha(&self, rho: ArrayView1<'_, f64>) -> f64 {
@@ -1596,7 +1620,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
             // Beta(a,1) contributes -(a - 1) ln(pi), matching pi_map.
             acc -= (a - 1.0) * pi[k].ln();
         }
-        acc
+        self.weight * acc
     }
 
     fn grad_target(
@@ -1615,7 +1639,7 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
                 let zk = z[start + k];
                 let pk = pi[k].clamp(1.0e-12, 1.0 - 1.0e-12);
                 let d_p_d_z = ((1.0 - pk) / pk).ln();
-                out[start + k] = d_p_d_z * zk * (1.0 - zk) / self.tau;
+                out[start + k] = self.weight * d_p_d_z * zk * (1.0 - zk) / self.tau;
             }
         }
         out
@@ -1638,7 +1662,8 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
                 let zk = z[start + k];
                 let pk = pi[k].clamp(1.0e-12, 1.0 - 1.0e-12);
                 let d_p_d_z = ((1.0 - pk) / pk).ln();
-                out[start + k] = d_p_d_z * zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2;
+                out[start + k] =
+                    self.weight * d_p_d_z * zk * (1.0 - zk) * (1.0 - 2.0 * zk) * inv_tau2;
             }
         }
         Some(out)
@@ -1659,7 +1684,9 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         for &pk in pi.iter() {
             sum_log_pi += pk.clamp(1.0e-12, 1.0 - 1.0e-12).ln();
         }
-        Array1::from_vec(vec![-alpha * sum_log_pi / self.k_max as f64])
+        Array1::from_vec(vec![
+            -self.weight * alpha * sum_log_pi / self.k_max as f64,
+        ])
     }
 
     fn rho_count(&self) -> usize {
@@ -1684,6 +1711,8 @@ impl SparsityPenalty {
         Ok(Self {
             target_tier,
             kind: SparsityKind::SmoothedL1 { eps },
+            weight: 1.0,
+            weight_schedule: None,
             strength_rho_index: 0,
             eps_rho_index: None,
         })
@@ -1701,6 +1730,8 @@ impl SparsityPenalty {
         Ok(Self {
             target_tier,
             kind: SparsityKind::Log { delta },
+            weight: 1.0,
+            weight_schedule: None,
             strength_rho_index: 0,
             eps_rho_index: None,
         })
@@ -1713,9 +1744,18 @@ impl SparsityPenalty {
         Self {
             target_tier,
             kind: SparsityKind::Hoyer,
+            weight: 1.0,
+            weight_schedule: None,
             strength_rho_index: 0,
             eps_rho_index: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
     }
 
     #[must_use]
@@ -1726,7 +1766,7 @@ impl SparsityPenalty {
 
     /// Resolve `(strength, eps_or_delta)` from the current ρ view.
     fn resolved(&self, rho: ArrayView1<'_, f64>) -> (f64, f64) {
-        let strength = rho[self.strength_rho_index].exp();
+        let strength = self.weight * rho[self.strength_rho_index].exp();
         let smoothing = match (self.eps_rho_index, self.kind) {
             (Some(idx), _) => rho[idx].exp(),
             (None, SparsityKind::SmoothedL1 { eps }) => eps,
@@ -2045,6 +2085,8 @@ impl AnalyticPenalty for SparsityPenalty {
 pub struct ARDPenalty {
     pub target: PsiSlice,
     pub latent_dim: usize,
+    pub weight: f64,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
     /// Local ρ indices for the `d` per-axis log-precisions.
     pub rho_indices: Vec<usize>,
     /// Effective number of observations contributing to each latent axis.
@@ -2069,9 +2111,18 @@ impl ARDPenalty {
         Self {
             target,
             latent_dim,
+            weight: 1.0,
+            weight_schedule: None,
             rho_indices,
             n_eff: n_obs as f64,
         }
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
     }
 
     /// Override the effective observation count used in the Occam log-det
@@ -2116,7 +2167,7 @@ impl AnalyticPenalty for ARDPenalty {
         let mut acc = 0.0;
         for j in 0..d {
             let rho_j = rho[self.rho_indices[j]];
-            let lam_j = rho_j.exp();
+            let lam_j = self.weight * rho_j.exp();
             let mut sq = 0.0;
             for n in 0..n_obs {
                 let v = target[n * d + j];
@@ -2136,7 +2187,7 @@ impl AnalyticPenalty for ARDPenalty {
         let n_obs = target.len() / d;
         let mut g = Array1::<f64>::zeros(target.len());
         for j in 0..d {
-            let lam_j = rho[self.rho_indices[j]].exp();
+            let lam_j = self.weight * rho[self.rho_indices[j]].exp();
             for n in 0..n_obs {
                 g[n * d + j] = lam_j * target[n * d + j];
             }
@@ -2153,7 +2204,7 @@ impl AnalyticPenalty for ARDPenalty {
         let n_obs = target.len() / d;
         let mut diag = Array1::<f64>::zeros(target.len());
         for j in 0..d {
-            let lam_j = rho[self.rho_indices[j]].exp();
+            let lam_j = self.weight * rho[self.rho_indices[j]].exp();
             for n in 0..n_obs {
                 diag[n * d + j] = lam_j;
             }
@@ -2182,7 +2233,7 @@ impl AnalyticPenalty for ARDPenalty {
         let n_obs = target.len() / d;
         let mut out = Array1::<f64>::zeros(self.rho_count());
         for j in 0..d {
-            let lam_j = rho[self.rho_indices[j]].exp();
+            let lam_j = self.weight * rho[self.rho_indices[j]].exp();
             let mut sq = 0.0;
             for n in 0..n_obs {
                 let v = target[n * d + j];
@@ -2235,6 +2286,7 @@ pub struct TotalVariationPenalty {
     pub smoothing_eps: f64,
     pub learnable_weight: bool,
     pub rho_index: usize,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl TotalVariationPenalty {
@@ -2286,7 +2338,15 @@ impl TotalVariationPenalty {
             smoothing_eps,
             learnable_weight,
             rho_index: 0,
+            weight_schedule: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
     }
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
@@ -2660,6 +2720,7 @@ pub struct NuclearNormPenalty {
     pub max_rank: Option<usize>,
     pub learnable_weight: bool,
     pub rho_index: usize,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 struct NuclearSvdCache {
@@ -2725,7 +2786,15 @@ impl NuclearNormPenalty {
             max_rank,
             learnable_weight,
             rho_index: 0,
+            weight_schedule: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
     }
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
@@ -3023,6 +3092,7 @@ pub struct BlockSparsityPenalty {
     pub smoothing_eps: f64,
     pub learnable_weight: bool,
     pub rho_index: usize,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl BlockSparsityPenalty {
@@ -3111,7 +3181,15 @@ impl BlockSparsityPenalty {
             smoothing_eps,
             learnable_weight,
             rho_index: 0,
+            weight_schedule: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
     }
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
@@ -3344,6 +3422,7 @@ pub struct AuxConditionalPriorPenalty {
     pub learnable_weight: bool,
     pub rho_index: usize,
     pub target: PsiSlice,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl AuxConditionalPriorPenalty {
@@ -3435,7 +3514,15 @@ impl AuxConditionalPriorPenalty {
             learnable_weight,
             rho_index: 0,
             target,
+            weight_schedule: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
     }
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {

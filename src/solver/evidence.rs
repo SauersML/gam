@@ -539,12 +539,16 @@ pub fn ift_du_dbeta(cache: &ArrowFactorCache) -> Array2<f64> {
 /// `dg_red_drho` is the `K × R` matrix whose `a`-th column is `q_a =
 /// ∂g_red/∂ρ_a`. Returns the `K × R` matrix `β_ρ`.
 ///
-/// Returns `None` if the Schur factor is unavailable (PCG mode);
-/// callers must not silently substitute an approximation.
+/// Returns `None` if the Schur factor is unavailable (PCG mode) or was
+/// built from a damped operator; callers must not silently substitute an
+/// approximation.
 pub fn ift_dbeta_drho(
     cache: &ArrowFactorCache,
     dg_red_drho: ArrayView2<'_, f64>,
 ) -> Option<Array2<f64>> {
+    if cache.ridge_t != 0.0 || cache.ridge_beta != 0.0 {
+        return None;
+    }
     let schur = cache.schur_factor.as_ref()?;
     let k = cache.k;
     let r = dg_red_drho.ncols();
