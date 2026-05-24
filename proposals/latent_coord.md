@@ -330,6 +330,3 @@ original optimistic draft. Tightened claims:
   (b) and only with the proper REML normalisers. Earlier draft
   claimed REML on `t` alone "gives an automatic intrinsic-dim
   estimator."
-
-Source: math-audit findings in
-`/Users/user/.claude/projects/-Users-user-Manifold-SAE/memory/project_gamfit_composition_engine.md`.
