@@ -857,8 +857,12 @@ fn nuts_family_logp_and_grad(
         NutsFamily::BinomialCLogLog => cloglog_logp_and_grad(data, eta),
         NutsFamily::Gaussian => gaussian_logp_and_grad(data, eta),
         NutsFamily::PoissonLog => poisson_log_logp_and_grad(data, eta),
+        // Family mapping: TweedieLog stores variance power p in data.gamma_shape.
+        // Its dispersion phi stays in data.dispersion, matching REML scale ownership.
         NutsFamily::TweedieLog => tweedie_log_quasilogp_and_grad(data, eta, data.gamma_shape),
         NutsFamily::NegativeBinomialLog => {
+            // Family mapping: NegativeBinomialLog stores theta in data.gamma_shape.
+            // NB has unit REML scale; theta is never sourced from fixed_phi.
             negative_binomial_log_logp_and_grad(data, eta, data.gamma_shape)
         }
         NutsFamily::GammaLog => gamma_log_logp_and_grad(data, eta),
@@ -929,8 +933,14 @@ fn joint_family_logp_and_grad(
         }
         LikelihoodFamily::GaussianIdentity => Ok(gaussian_logp_and_grad(data, eta)),
         LikelihoodFamily::PoissonLog => Ok(poisson_log_logp_and_grad(data, eta)),
-        LikelihoodFamily::Tweedie { p } => Ok(tweedie_log_quasilogp_and_grad(data, eta, p)),
+        LikelihoodFamily::Tweedie { p } => {
+            // Family mapping: Tweedie payload p is the variance power.
+            // Its dispersion phi stays in data.dispersion, matching REML.
+            Ok(tweedie_log_quasilogp_and_grad(data, eta, p))
+        }
         LikelihoodFamily::NegativeBinomial { theta } => {
+            // Family mapping: NegativeBinomial payload theta is overdispersion.
+            // NB keeps unit REML scale and never reads fixed_phi for theta.
             Ok(negative_binomial_log_logp_and_grad(data, eta, theta))
         }
         LikelihoodFamily::BetaLogit { .. } => Err(HmcError::UnsupportedFamily {
@@ -1122,7 +1132,11 @@ fn tweedie_log_quasilogp_and_grad(
     use crate::inference::dispersion_cov::DispersionExt as _;
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
-    let p = if p.is_finite() { p } else { 1.5 };
+    // Family mapping: Tweedie p is the variant payload; phi is data.dispersion.
+    // Invalid payloads invalidate the target instead of falling back to p=1.5.
+    if !p.is_finite() {
+        return (f64::NAN, Array1::from_elem(data.dim, f64::NAN));
+    }
     let inv_phi = data.dispersion.inv_phi();
     let mut residual = Array1::<f64>::zeros(n);
     let ll: f64 = residual
@@ -3585,20 +3599,26 @@ pub fn run_nuts_sampling_flattened_family(
             glm.firth_bias_reduction,
             config,
         ),
-        (LikelihoodFamily::Tweedie { p }, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
-            glm.x,
-            glm.y,
-            glm.weights,
-            glm.penalty_matrix,
-            glm.mode,
-            glm.hessian,
-            NutsFamily::TweedieLog,
-            p,
-            glm.dispersion,
-            glm.firth_bias_reduction,
-            config,
-        ),
+        (LikelihoodFamily::Tweedie { p }, FamilyNutsInputs::Glm(glm)) => {
+            // Family mapping: Tweedie payload p is passed through the family-parameter slot.
+            // The Tweedie dispersion phi remains in glm.dispersion, matching REML.
+            run_nuts_sampling(
+                glm.x,
+                glm.y,
+                glm.weights,
+                glm.penalty_matrix,
+                glm.mode,
+                glm.hessian,
+                NutsFamily::TweedieLog,
+                p,
+                glm.dispersion,
+                glm.firth_bias_reduction,
+                config,
+            )
+        }
         (LikelihoodFamily::NegativeBinomial { theta }, FamilyNutsInputs::Glm(glm)) => {
+            // Family mapping: NegativeBinomial payload theta is passed through the family slot.
+            // NB dispersion scale is unit; theta is not derived from fixed_phi.
             run_nuts_sampling(
                 glm.x,
                 glm.y,
@@ -3936,11 +3956,12 @@ impl LinkWigglePosterior {
             }
             NutsFamily::TweedieLog => {
                 let mut ll_acc = 0.0;
-                let p = if self.scale.is_finite() {
-                    self.scale
-                } else {
-                    1.5
-                };
+                // Family mapping: Tweedie scale carries payload p; phi is not stored here.
+                // Invalid p makes the link-wiggle target invalid instead of defaulting.
+                if !self.scale.is_finite() {
+                    return (f64::NEG_INFINITY, Array1::zeros(dim));
+                }
+                let p = self.scale;
                 for i in 0..self.n_samples {
                     let eta_i = eta[i].clamp(-30.0, 30.0);
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
@@ -3960,7 +3981,12 @@ impl LinkWigglePosterior {
             }
             NutsFamily::NegativeBinomialLog => {
                 let mut ll_acc = 0.0;
-                let theta = self.scale.max(1e-10);
+                // Family mapping: NegativeBinomial scale carries payload theta.
+                // Invalid theta makes the link-wiggle target invalid instead of clamping.
+                if !(self.scale.is_finite() && self.scale > 0.0) {
+                    return (f64::NEG_INFINITY, Array1::zeros(dim));
+                }
+                let theta = self.scale;
                 for i in 0..self.n_samples {
                     let eta_i = eta[i].clamp(-30.0, 30.0);
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
