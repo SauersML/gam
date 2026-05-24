@@ -796,36 +796,6 @@ fn auto_centers_1d<'py>(
     Ok(centers.into_pyarray(py).unbind())
 }
 
-/// Build a closed cyclic uniform B-spline basis and its cyclic difference
-/// penalty on the periodic parameter `t`.
-///
-/// Inputs are reduced into the canonical `[0, 1)` domain (rem_euclid). The
-/// returned `(basis, penalty)` pair lives in the same `K = n_knots` cyclic
-/// control-point space: rows of `basis` are periodic with period 1, and
-/// `penalty` is the cyclic second-difference penalty `D'D` (default
-/// `penalty_order=2`).
-///
-/// To fit a closed parametric curve `t -> R^d`, regress the response `(N, d)`
-/// against `basis` (shape `(N, K)`) with `penalty` and stack the per-column
-/// coefficient vectors into a `(K, d)` control point matrix.
-#[pyfunction(signature = (t, n_knots, degree = 3, penalty_order = 2))]
-fn periodic_spline_curve_basis<'py>(
-    py: Python<'py>,
-    t: PyReadonlyArray1<'py, f64>,
-    n_knots: usize,
-    degree: usize,
-    penalty_order: usize,
-) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
-    let basis = periodic_bspline_basis_dense_via_spec(t.as_array(), (0.0, 1.0), degree, n_knots)
-        .map_err(py_value_error)?;
-    let penalty = create_cyclic_difference_penalty_matrix(n_knots, penalty_order)
-        .map_err(|err| py_value_error(err.to_string()))?;
-    Ok((
-        basis.into_pyarray(py).unbind(),
-        penalty.into_pyarray(py).unbind(),
-    ))
-}
-
 #[pyfunction(signature = (knots, degree = 3, order = 2))]
 fn smoothness_penalty<'py>(
     py: Python<'py>,
