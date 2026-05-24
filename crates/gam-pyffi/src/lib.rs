@@ -2716,7 +2716,7 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     // callers can pre-compute or cache it, but the analytic backward
     // derives the residual `y - X β̂` from the closed-form fit and never
     // reads this argument back.
-    _coefficients_at_optimum: Option<PyReadonlyArray2<'py, f64>>,
+    coefficients_at_optimum: Option<PyReadonlyArray2<'py, f64>>,
     fitted_at_optimum: Option<PyReadonlyArray2<'py, f64>>,
     active_indices: Option<PyReadonlyArray1<'py, u64>>,
     grad_coefficients: Option<PyReadonlyArray2<'py, f64>>,
@@ -2727,6 +2727,7 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     grad_edf: f64,
 ) -> PyResult<Py<PyDict>> {
     drop(b_inequality);
+    drop(coefficients_at_optimum);
     drop(fitted_at_optimum);
 
     let x_view = x.as_array();
