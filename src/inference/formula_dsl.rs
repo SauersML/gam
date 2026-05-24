@@ -1751,14 +1751,11 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
-            "sphere" | "s2" | "sos" => {
+            "s2" => {
                 if vars.len() != 2 {
                     return Err(format!(
-                        "sphere()/s2()/sos() expects exactly two variables (lat, lon): {raw}"
+                        "s2() expects exactly two variables (lat, lon): {raw}"
                     ));
-                }
-                if matches!(name.as_str(), "cyclic" | "cc" | "cp") {
-                    options.insert("type".to_string(), "cyclic".to_string());
                 }
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),

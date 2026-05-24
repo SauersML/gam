@@ -5,8 +5,7 @@ use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, FaerSymmetricFactor,
     array1_to_col_matmut, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av_into,
 };
-use crate::gpu::{self, GpuOperation};
-use crate::solver::gpu::GpuStageTimer;
+use crate::gpu;
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd, solve_sparse_spd_into,
     sparse_symmetric_upper_matvec_public,
@@ -38,7 +37,7 @@ use ndarray::{
     Zip, s,
 };
 use rayon::iter::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
+    IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
 use serde::{Deserialize, Serialize};
 use statrs::function::gamma::{digamma, ln_gamma};
@@ -1843,25 +1842,7 @@ impl<'a> GamWorkingModel<'a> {
         match &self.coordinate_design {
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
                 if let Some(dense) = x_transformed.as_dense() {
-                    if let Ok(gpu::GpuDispatch::UseCpu { reason }) =
-                        gpu::dense_pirls_dispatch(
-                            gpu::GpuOperation::DensePirlsMatvec,
-                            dense.nrows(),
-                            dense.ncols(),
-                            false,
-                        )
-                    {
-                        log::debug!(
-                            "[gpu-dispatch] op={} backend=cpu reason={} rows={} cols={}",
-                            gpu::GpuOperation::DensePirlsMatvec.label(),
-                            reason,
-                            dense.nrows(),
-                            dense.ncols()
-                        );
-                    }
-                    let timer = gpu::GpuStageTimer::start("dense-pirls-matvec");
                     fast_av_into(dense, beta.as_ref(), out);
-                    drop(timer);
                     return;
                 }
                 out.assign(&x_transformed.matrixvectormultiply(beta));
@@ -1871,25 +1852,7 @@ impl<'a> GamWorkingModel<'a> {
                 // then write X·(Qs·beta) directly into out when X is dense.
                 let beta_orig = transform.apply(beta);
                 if let Some(dense) = self.x_original.as_dense() {
-                    if let Ok(gpu::GpuDispatch::UseCpu { reason }) =
-                        gpu::dense_pirls_dispatch(
-                            gpu::GpuOperation::DensePirlsMatvec,
-                            dense.nrows(),
-                            dense.ncols(),
-                            false,
-                        )
-                    {
-                        log::debug!(
-                            "[gpu-dispatch] op={} backend=cpu reason={} rows={} cols={}",
-                            gpu::GpuOperation::DensePirlsMatvec.label(),
-                            reason,
-                            dense.nrows(),
-                            dense.ncols()
-                        );
-                    }
-                    let timer = gpu::GpuStageTimer::start("dense-pirls-matvec");
                     fast_av_into(dense, &beta_orig, out);
-                    drop(timer);
                 } else {
                     out.assign(&self.x_original.apply(&beta_orig));
                 }
@@ -1928,37 +1891,6 @@ impl<'a> GamWorkingModel<'a> {
             // cannot be densified; fall through to the operator XᵀWX path.
             DesignMatrix::Dense(x) if x.is_materialized_dense() => {
                 let p = x.ncols();
-                let n = x.nrows();
-                let has_signed_weights = weights.iter().any(|w| *w < 0.0);
-                match gpu::dense_pirls_dispatch(
-                    gpu::GpuOperation::DensePirlsXtWX,
-                    n,
-                    p,
-                    has_signed_weights,
-                ) {
-                    Ok(gpu::GpuDispatch::UseDevice) => {
-                        // No native GPU backend is linked in this build yet; dispatch only
-                        // returns UseDevice when a concrete backend reports support. Keep the branch
-                        // explicit so CUDA/HIP/Metal implementations can slot in here without
-                        // changing P-IRLS control flow.
-                        return Err(EstimationError::InvalidInput(
-                            "native GPU DensePirlsXtWX dispatch without implementation".to_string(),
-                        ));
-                    }
-                    Ok(gpu::GpuDispatch::UseCpu { reason }) => {
-                        log::debug!(
-                            "[gpu-dispatch] op={} backend=cpu reason={} rows={} cols={} signed_weights={}",
-                            gpu::GpuOperation::DensePirlsXtWX.label(),
-                            reason,
-                            n,
-                            p,
-                            has_signed_weights
-                        );
-                    }
-                    Err(err) => return Err(EstimationError::InvalidInput(err.to_string())),
-                }
-                let timer = gpu::GpuStageTimer::start("dense-pirls-xtwx");
-                drop(timer);
                 let x_dense = x.to_dense_arc();
                 // Reuse workspace hessian buffer to avoid per-iteration allocation.
                 if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
@@ -7831,21 +7763,6 @@ fn solve_penalized_least_squares_implicit(
         // Lazy operator-backed dense designs route to diag_xtw_x like sparse.
         DesignMatrix::Dense(x_dense) if x_dense.is_materialized_dense() => {
             let p = x_dense.ncols();
-            match crate::solver::gpu::dense_pirls_dispatch(
-                crate::solver::gpu::GpuOperation::DensePirlsXtWX,
-                x_dense.nrows(),
-                p,
-                true,
-            ) {
-                Ok(crate::solver::gpu::GpuDispatch::UseDevice) => {
-                    return Err(EstimationError::InvalidInput(
-                        "dense_pirls_dispatch cannot select a device without a registered backend"
-                            .to_string(),
-                    ));
-                }
-                Ok(crate::solver::gpu::GpuDispatch::UseCpu { .. }) => {}
-                Err(msg) => return Err(EstimationError::InvalidInput(msg)),
-            }
             let x_dense = x_dense.to_dense_arc();
             if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
                 workspace.hessian_buf = Array2::zeros((p, p).f());
