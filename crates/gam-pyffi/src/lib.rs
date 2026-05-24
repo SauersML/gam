@@ -13143,6 +13143,24 @@ fn string_records_from_rows(
         .collect()
 }
 
+fn periodic_bspline_basis_dense_via_spec(
+    t: ArrayView1<'_, f64>,
+    domain: (f64, f64),
+    degree: usize,
+    num_basis: usize,
+) -> Result<Array2<f64>, String> {
+    let (left, right) = domain;
+    let period = right - left;
+    if !(period.is_finite() && period > 0.0) {
+        return Err(format!(
+            "periodic B-spline domain must be a finite ordered interval; got ({left}, {right})"
+        ));
+    }
+    let spec = PeriodicBSplineBasisSpec::new(degree, num_basis, period, left, 0);
+    build_periodic_bspline_basis_1d(t, &spec)
+        .map_err(|err| format!("failed to evaluate periodic B-spline basis: {err}"))
+}
+
 fn bspline_basis_impl(
     t: ArrayView1<'_, f64>,
     knots: ArrayView1<'_, f64>,
@@ -13153,8 +13171,7 @@ fn bspline_basis_impl(
     validate_vector("knots", knots)?;
     if periodic {
         let (left, right, num_basis) = periodic_knot_domain(knots)?;
-        create_periodic_bspline_basis_dense(t, (left, right), degree, num_basis)
-            .map_err(|err| format!("failed to evaluate periodic B-spline basis: {err}"))
+        periodic_bspline_basis_dense_via_spec(t, (left, right), degree, num_basis)
     } else {
         let (basis, _) = create_basis::<Dense>(
             t,
@@ -13177,30 +13194,26 @@ fn bspline_basis_derivative_impl(
     validate_vector("t", t)?;
     validate_vector("knots", knots)?;
     if periodic {
-        if order != 1 {
+        return Err(
+            "periodic B-spline first-derivative as a dense (N, K) matrix is no longer exposed; \
+             use periodic_bspline_input_location_first_derivative for the (N, K, 1) jet"
+                .to_string(),
+        );
+    }
+    let options = match order {
+        0 => BasisOptions::value(),
+        1 => BasisOptions::first_derivative(),
+        2 => BasisOptions::second_derivative(),
+        _ => {
             return Err(format!(
-                "periodic B-spline derivative supports order=1; got order={order}"
+                "B-spline derivative supports orders 0, 1, and 2; got order={order}"
             ));
         }
-        let (left, right, num_basis) = periodic_knot_domain(knots)?;
-        create_periodic_bspline_derivative_dense(t, (left, right), degree, num_basis)
-            .map_err(|err| format!("failed to evaluate periodic B-spline derivative: {err}"))
-    } else {
-        let options = match order {
-            0 => BasisOptions::value(),
-            1 => BasisOptions::first_derivative(),
-            2 => BasisOptions::second_derivative(),
-            _ => {
-                return Err(format!(
-                    "B-spline derivative supports orders 0, 1, and 2; got order={order}"
-                ));
-            }
-        };
-        let (basis, _) =
-            create_basis::<Dense>(t, gam::basis::KnotSource::Provided(knots), degree, options)
-                .map_err(|err| format!("failed to evaluate B-spline derivative: {err}"))?;
-        Ok((*basis).clone())
-    }
+    };
+    let (basis, _) =
+        create_basis::<Dense>(t, gam::basis::KnotSource::Provided(knots), degree, options)
+            .map_err(|err| format!("failed to evaluate B-spline derivative: {err}"))?;
+    Ok((*basis).clone())
 }
 
 fn duchon_basis_1d_impl(
