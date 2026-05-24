@@ -182,7 +182,7 @@ class Matern(Smooth):
     aniso_log_scales: Sequence[float] | None = None
 
 
-@dataclass
+@dataclass(init=False)
 class Pca(Smooth):
     """Precomputed-PCA linear feature projection as a first-class smooth.
 
@@ -210,6 +210,26 @@ class Pca(Smooth):
     basis: Any | None = None
     centered: bool = True
     smooth_penalty: float = 1.0
+
+    def __init__(
+        self,
+        K: int | None = None,
+        basis: Any | None = None,
+        centered: bool = True,
+        name: str | None = None,
+        smooth_penalty: float = 1.0,
+        by: Any | None = None,
+        double_penalty: bool = False,
+        shape_constraint: ShapeConstraintLiteral | None = None,
+    ) -> None:
+        self.name = name
+        self.by = by
+        self.double_penalty = double_penalty
+        self.shape_constraint = shape_constraint
+        self.K = K
+        self.basis = basis
+        self.centered = centered
+        self.smooth_penalty = smooth_penalty
 
 
 @dataclass
