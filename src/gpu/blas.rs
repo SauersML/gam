@@ -2,15 +2,17 @@
 //!
 //! The public surface here is the lowest level of the GPU dispatch stack: it
 //! takes ndarray views, copies them to a device buffer, calls a cuBLAS / kernel
-//! routine, and returns the host result. Every entry point is gated on the
-//! `cuda` Cargo feature; under the default feature set this module only
-//! exposes a status enum so callers can advertise that no backend is wired.
+//! routine, and returns the host result. The cudarc-backed implementations
+//! always compile (cudarc dynamically loads `libcuda` at runtime via the
+//! `fallback-dynamic-loading` feature), and dispatch is gated at runtime on
+//! `super::runtime::GpuRuntime::global()` — when no device is probed the
+//! status enum advertises `CudaUnavailable` and callers fall back to CPU.
 //!
-//! When `--features cuda` is enabled, the implementations route through
-//! `super::runtime::cuda_context_for` and the cudarc 0.19 cuBLAS API. Any
-//! transient backend failure (OOM, launch error, …) is converted to `None`
-//! so the auto-dispatch shim in `super::linalg` falls back to the CPU fast
-//! path without disturbing numerics.
+//! The implementations route through `super::runtime::cuda_context_for` and
+//! the cudarc 0.19 cuBLAS API. Any transient backend failure (OOM, launch
+//! error, …) is converted to `None` so the auto-dispatch shim in
+//! `super::linalg` falls back to the CPU fast path without disturbing
+//! numerics.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendStatus {

@@ -7624,6 +7624,7 @@ mod tests {
         // Latent 1: group{0,1} → sqrt(2)·sqrt(0.01+0.36+eps²); group{2} → 1·sqrt(0.25+eps²)
         let l1 = sqrt2 * (0.01_f64 + 0.36 + eps2).sqrt() + (0.25_f64 + eps2).sqrt();
         let expected = 1.5 * (l0 + l1);
+        assert!(v.is_finite(), "mechanism-sparsity value must be finite");
         assert_abs_diff_eq!(v, expected, epsilon = 1e-12);
     }
 

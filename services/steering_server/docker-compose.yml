@@ -1,0 +1,56 @@
+services:
+  steering-server:
+    build:
+      context: .
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: steering
+      POSTGRES_USER: steering
+      POSTGRES_PASSWORD: steering
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U steering -d steering"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - steering-postgres:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.112.0
+    command: ["--config=/etc/otelcol/config.yml"]
+    ports:
+      - "4317:4317"
+    volumes:
+      - ./otel-collector.yml:/etc/otelcol/config.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+
+volumes:
+  steering-postgres:

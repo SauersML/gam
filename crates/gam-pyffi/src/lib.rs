@@ -70,7 +70,7 @@ use gam::terms::sae_manifold::{
 use gam::terms::smooth::BlockwisePenalty;
 use gam::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
-    DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty, JumpReLUPenalty,
+    DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty,
     MechanismSparsityPenalty, NuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
@@ -11807,6 +11807,47 @@ fn build_analytic_penalty_registry_from_json(
                     None => penalty,
                 };
                 registry.push(gam::terms::AnalyticPenaltyKind::RowPrecisionPrior(
+                    std::sync::Arc::new(penalty),
+                ));
+            }
+            "ivae_ridge_mean_gauge" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &[
+                        "kind",
+                        "target",
+                        "aux",
+                        "aux_shape",
+                        "ridge_eps",
+                        "weight",
+                        "n_eff",
+                        "learnable",
+                        "weight_schedule",
+                    ],
+                )?;
+                let aux = descriptor_array2_flat(descriptor, "aux", "aux_shape", &context)?;
+                let ridge_eps = descriptor_f64(descriptor, "ridge_eps", 1.0e-6)?;
+                let weight = descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let penalty = IvaeRidgeMeanGauge::new(
+                    slice,
+                    aux,
+                    ridge_eps,
+                    weight,
+                    n_eff,
+                    learnable,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(gam::terms::AnalyticPenaltyKind::IvaeRidgeMeanGauge(
                     std::sync::Arc::new(penalty),
                 ));
             }

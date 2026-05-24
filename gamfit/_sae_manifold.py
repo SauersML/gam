@@ -69,7 +69,7 @@ class ManifoldSAE:
 
     atoms: list[SaeManifoldAtomFit]
     atom_topology: str
-    assignment: Literal["ibp", "softmax"]
+    assignment: Literal["ibp", "softmax", "topk", "jumprelu", "gated"]
     latent: LatentCoord
     penalties: list[Any]
     primitive_names: list[str]
@@ -241,7 +241,7 @@ def sae_manifold_fit(
     K: int,
     d_atom: int = 2,
     atom_topology: Literal["circle", "sphere", "euclidean"] = "circle",
-    assignment: Literal["ibp", "softmax"] = "ibp",
+    assignment: Literal["ibp", "softmax", "topk", "jumprelu", "gated"] = "ibp",
     schedule: GumbelTemperatureSchedule | None = None,
     isometry_weight: float = 1.0,
     ard_per_atom: bool = True,
@@ -255,6 +255,7 @@ def sae_manifold_fit(
     random_state: int = 0,
     block_orthogonality_weight: float = 0.0,
     topology_selector: TopologyAutoSelector | None = None,
+    top_k: int | None = None,
 ) -> ManifoldSAE:
     """Fit K manifold atoms and return a fitted SAE object."""
 
@@ -263,8 +264,8 @@ def sae_manifold_fit(
         raise ValueError(f"K must be positive, got {K}")
     if d_atom < 0:
         raise ValueError(f"d_atom must be non-negative, got {d_atom}")
-    if assignment not in {"ibp", "softmax"}:
-        raise ValueError("assignment must be 'ibp' or 'softmax'")
+    if assignment not in {"ibp", "softmax", "topk", "jumprelu", "gated"}:
+        raise ValueError("assignment must be 'ibp', 'softmax', 'topk', 'jumprelu', or 'gated'")
     topology_name = _resolve_public_topology(atom_topology, topology_selector)
     basis = _basis_for_public_topology(topology_name, d_atom)
     retraction = _retraction_for_public_topology(topology_name, d_atom)
@@ -308,8 +309,12 @@ def sae_manifold_fit(
                 temperature_schedule=schedule,
             )
         )
-    else:
+    elif assignment == "softmax":
         penalties.append(SoftmaxAssignmentSparsityPenalty(K, target="t"))
+    elif assignment == "topk":
+        penalties.append(TopKActivationPenalty(top_k or max(1, min(K, K // 4 or 1)), target="t"))
+    elif assignment == "jumprelu":
+        penalties.append(JumpReLUPenalty(np.full(K, 0.5, dtype=float), target="t"))
 
     low_level = _fit_fixed_k(
         x,
@@ -318,7 +323,7 @@ def sae_manifold_fit(
         int(d_atom),
         float(sparsity_weight),
         float(smoothness_weight),
-        "ibp_map" if assignment == "ibp" else "softmax",
+        {"ibp": "ibp_map", "softmax": "softmax", "topk": "topk", "jumprelu": "jumprelu", "gated": "gated"}[assignment],
         float(alpha),
         False,
         float(schedule.tau_start if schedule is not None else 0.5),
@@ -327,6 +332,7 @@ def sae_manifold_fit(
         learning_rate=float(learning_rate),
         random_state=int(random_state),
         penalties=penalties,
+        top_k=top_k,
     )
     return _build_manifold_sae(
         x=x,
@@ -363,97 +369,6 @@ def _normalize_penalty_descriptors(penalties: Sequence[Any] | None) -> str | Non
             )
     import json as _json
     return _json.dumps(out)
-
-
-def _legacy_sae_manifold_fit(
-    Z: Any,
-    n_atoms: int | Literal["auto"] = 10,
-    atom_basis: str | Smooth | Sequence[str | Smooth] = "duchon",
-    atom_dim: int | Sequence[int] | Literal["auto"] | None = None,
-    sparsity_strength: float | Literal["auto"] = "auto",
-    smoothness: float | Literal["auto"] = "auto",
-    *,
-    assignment_prior: Literal["softmax", "ibp_map"] = "softmax",
-    alpha: float | Literal["auto"] = "auto",
-    learnable_alpha: bool = False,
-    tau: float = 0.5,
-    gumbel_schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None = None,
-    max_iter: int = 12,
-    learning_rate: float = 0.05,
-    random_state: int = 0,
-    penalties: Sequence[Any] | None = None,
-    assignment: Literal["softmax", "ibp_map", "topk", "jumprelu", "gated"] | None = None,
-) -> SaeManifoldFitResult:
-    """Fit a sparse mixture of smooth manifold atoms to activations ``Z``.
-
-    Parameters follow the proposal. ``n_atoms="auto"`` compares
-    ``K in {1, 2, 4, 8, 16, 32}`` by REML evidence. ``atom_dim="auto"``
-    starts from two coordinates per atom and uses the ARD normalised prior
-    in the evidence score; the reported ``active_dim`` counts axes whose
-    empirical variance survives the ARD precision. ``assignment_prior`` is
-    ``"softmax"`` by default; ``"ibp_map"`` uses deterministic concrete
-    Beta-Bernoulli active indicators with ``alpha="auto"`` evidence-ranked
-    over a small truncation-prior grid. ``learnable_alpha`` mirrors the Rust
-    ``IBPAssignmentPenalty`` effective-alpha convention. ``gumbel_schedule``
-    accepts :class:`GumbelTemperatureSchedule` or dictionaries such as
-    ``{"decay": "geometric", "tau_start": 1.0, "tau_min": 1e-3,
-    "rate": 0.95}`` and advances once per outer iteration.
-    """
-
-    z = _as_2d_float(Z, "Z")
-    if z.shape[0] == 0 or z.shape[1] == 0:
-        raise ValueError("sae_manifold_fit requires a non-empty (N, p) matrix")
-    if assignment is None:
-        assignment_mode = assignment_prior
-    else:
-        assignment_mode = assignment
-    if assignment_mode not in {"softmax", "ibp_map", "topk", "jumprelu", "gated"}:
-        raise ValueError("assignment must be 'softmax', 'ibp_map', 'topk', 'jumprelu', or 'gated'")
-    if assignment_prior not in {"softmax", "ibp_map"}:
-        raise ValueError("assignment_prior must be 'softmax' or 'ibp_map'")
-    if learnable_alpha and assignment_mode != "ibp_map":
-        raise ValueError("learnable_alpha only applies to assignment='ibp_map'")
-    if not np.isfinite(tau) or tau <= 0.0:
-        raise ValueError("tau must be finite and positive")
-    schedule = _normalize_gumbel_schedule(gumbel_schedule)
-    tau_initial = tau if schedule is None else float(schedule["tau_start"])
-
-    candidates = [int(n_atoms)] if n_atoms != "auto" else [1, 2, 4, 8, 16, 32]
-    fits: list[SaeManifoldFitResult] = []
-    names: list[str] = []
-    for k in candidates:
-        if k <= 0:
-            raise ValueError(f"n_atoms candidates must be positive; got {k}")
-        fit_k = _fit_fixed_k(
-            z,
-            k,
-            atom_basis,
-            atom_dim,
-            sparsity_strength,
-            smoothness,
-            assignment_mode,
-            alpha,
-            learnable_alpha,
-            tau_initial,
-            schedule,
-            max_iter=max_iter,
-            learning_rate=learning_rate,
-            random_state=random_state + 1009 * k,
-            penalties=penalties,
-        )
-        fits.append(fit_k)
-        names.append(f"K={k}")
-
-    comparison = compare_models(
-        [{"reml_score": f.reml_score, "edf": _edf_proxy(f)} for f in fits],
-        names=names,
-    )
-    chosen_name = comparison["winner"]
-    chosen_idx = names.index(chosen_name)
-    chosen = fits[chosen_idx]
-    chosen.comparison = comparison
-    chosen.evidence_by_candidate = {k: f.reml_score for k, f in zip(candidates, fits)}
-    return chosen
 
 
 def _resolve_public_topology(
@@ -503,7 +418,7 @@ def _build_manifold_sae(
     x: np.ndarray,
     low_level: SaeManifoldFitResult,
     atom_topology: str,
-    assignment: Literal["ibp", "softmax"],
+    assignment: Literal["ibp", "softmax", "topk", "jumprelu", "gated"],
     latent: LatentCoord,
     penalties: list[Any],
 ) -> ManifoldSAE:
@@ -520,6 +435,8 @@ def _build_manifold_sae(
     anchors = [_anchors_for_atom(spec, coord) for spec, coord in zip(basis_specs, low_level.coords)]
     r2 = _reconstruction_r2(x, low_level.fitted)
     primitives = ["LatentCoord", "RiemannianRetraction", "gaussian_reml_fit"]
+    if assignment == "gated":
+        primitives.append("GatedSAEDecoder")
     primitives.extend(type(p).__name__ for p in penalties)
     primitives.extend(_basis_kind_name(spec) for spec in basis_specs)
     return ManifoldSAE(
@@ -560,6 +477,8 @@ def _assignment_targets(assignments: np.ndarray, assignment: str) -> np.ndarray:
     z = np.clip(assignments, 1e-6, 1.0 - 1e-6)
     if assignment == "ibp":
         return np.log(z / (1.0 - z))
+    if assignment in {"topk", "jumprelu", "gated"}:
+        return assignments
     return np.log(np.clip(assignments, 1e-12, 1.0))
 
 
@@ -603,6 +522,7 @@ def _fit_fixed_k(
     learning_rate: float,
     random_state: int,
     penalties: Sequence[Any] | None,
+    top_k: int | None = None,
 ) -> SaeManifoldFitResult:
     if sparsity_strength == "auto" and assignment_prior == "softmax":
         lambda_grid = [0.1, 1.0, 10.0]
@@ -623,6 +543,7 @@ def _fit_fixed_k(
                 learning_rate=learning_rate,
                 random_state=random_state + idx * 7919,
                 penalties=penalties,
+                top_k=top_k,
             )
             for idx, lam in enumerate(lambda_grid)
         ]
@@ -655,6 +576,7 @@ def _fit_fixed_k(
                 learning_rate=learning_rate,
                 random_state=random_state + idx * 3571,
                 penalties=penalties,
+                top_k=top_k,
             )
             for idx, candidate_alpha in enumerate(alpha_grid)
         ]
@@ -715,12 +637,12 @@ def _fit_fixed_k(
     last_payload: dict[str, Any] | None = None
     last_designs: list[np.ndarray] = []
     last_assignments = _assignment_from_logits(
-        logits, assignment_prior, _gumbel_tau_at(gumbel_schedule, 0, tau)
+        logits, assignment_prior, _gumbel_tau_at(gumbel_schedule, 0, tau), top_k
     )
 
     for iter_idx in range(int(max_iter)):
         tau_iter = _gumbel_tau_at(gumbel_schedule, iter_idx, tau)
-        assignments = _assignment_from_logits(logits, assignment_prior, tau_iter)
+        assignments = _assignment_from_logits(logits, assignment_prior, tau_iter, top_k)
         designs: list[np.ndarray] = []
         jets: list[np.ndarray] = []
         penalties: list[np.ndarray] = []
@@ -1250,11 +1172,31 @@ def _gumbel_tau_at(schedule: dict[str, Any] | None, iter_idx: int, tau: float) -
 
 
 def _assignment_from_logits(
-    logits: np.ndarray, assignment_prior: Literal["softmax", "ibp_map"], tau: float
+    logits: np.ndarray,
+    assignment_prior: Literal["softmax", "ibp_map", "topk", "jumprelu", "gated"],
+    tau: float,
+    top_k: int | None = None,
 ) -> np.ndarray:
     if assignment_prior == "softmax":
         return _softmax(logits, tau)
-    return _sigmoid(logits / tau)
+    if assignment_prior == "ibp_map":
+        return _sigmoid(logits / tau)
+    if assignment_prior == "topk":
+        k = top_k if top_k is not None else max(1, min(logits.shape[1], int(round(tau))))
+        return _topk_mask(logits, max(1, min(logits.shape[1], int(k))))
+    if assignment_prior == "jumprelu":
+        gate = _sigmoid((logits - tau) / max(tau, 1e-12))
+        return logits * gate
+    gate = (_sigmoid(logits / tau) > 0.5).astype(float)
+    return gate * logits
+
+
+def _topk_mask(values: np.ndarray, k: int) -> np.ndarray:
+    order = np.argpartition(-np.abs(values), kth=k - 1, axis=1)[:, :k]
+    out = np.zeros_like(values, dtype=float)
+    rows = np.arange(values.shape[0])[:, None]
+    out[rows, order] = values[rows, order]
+    return out
 
 
 def _softmax(logits: np.ndarray, tau: float) -> np.ndarray:
@@ -1276,12 +1218,14 @@ def _sigmoid(x: np.ndarray) -> np.ndarray:
 def _assignment_jvp(
     assignments: np.ndarray,
     grad_a: np.ndarray,
-    assignment_prior: Literal["softmax", "ibp_map"],
+    assignment_prior: Literal["softmax", "ibp_map", "topk", "jumprelu", "gated"],
     tau: float,
 ) -> np.ndarray:
     if assignment_prior == "softmax":
         return _softmax_jvp(assignments, grad_a, tau)
-    return grad_a * assignments * (1.0 - assignments) / tau
+    if assignment_prior == "ibp_map":
+        return grad_a * assignments * (1.0 - assignments) / tau
+    return grad_a * (assignments != 0.0)
 
 
 def _softmax_jvp(assignments: np.ndarray, grad_a: np.ndarray, tau: float) -> np.ndarray:
@@ -1291,13 +1235,15 @@ def _softmax_jvp(assignments: np.ndarray, grad_a: np.ndarray, tau: float) -> np.
 
 def _assignment_prior_value(
     assignments: np.ndarray,
-    assignment_prior: Literal["softmax", "ibp_map"],
+    assignment_prior: Literal["softmax", "ibp_map", "topk", "jumprelu", "gated"],
     lambda_sparse: float,
     alpha: float,
 ) -> float:
     if assignment_prior == "softmax":
         a = np.clip(assignments, 1e-300, 1.0)
         return float(lambda_sparse * np.sum(-a * np.log(a)))
+    if assignment_prior in {"topk", "jumprelu", "gated"}:
+        return float(lambda_sparse * np.sum(np.abs(assignments)))
     pi = _ibp_pi_map(assignments, alpha)
     z = np.clip(assignments, 1e-12, 1.0 - 1e-12)
     p = np.clip(pi, 1e-12, 1.0 - 1e-12)
@@ -1308,7 +1254,7 @@ def _assignment_prior_value(
 
 def _assignment_prior_grad_logits(
     assignments: np.ndarray,
-    assignment_prior: Literal["softmax", "ibp_map"],
+    assignment_prior: Literal["softmax", "ibp_map", "topk", "jumprelu", "gated"],
     lambda_sparse: float,
     alpha: float,
     tau: float,
@@ -1317,6 +1263,8 @@ def _assignment_prior_grad_logits(
         d_h_da = -lambda_sparse * (np.log(np.clip(assignments, 1e-300, 1.0)) + 1.0)
         mean = np.sum(assignments * d_h_da, axis=1, keepdims=True)
         return assignments * (d_h_da - mean) / tau
+    if assignment_prior in {"topk", "jumprelu", "gated"}:
+        return lambda_sparse * np.sign(assignments) * (assignments != 0.0)
     pi = np.clip(_ibp_pi_map(assignments, alpha), 1e-12, 1.0 - 1e-12)
     d_p_d_z = np.log((1.0 - pi) / pi)[None, :]
     return d_p_d_z * assignments * (1.0 - assignments) / tau
