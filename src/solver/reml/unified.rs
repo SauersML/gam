@@ -7543,17 +7543,31 @@ pub fn reml_laml_evaluate(
             Some(OuterHessianDerivativeKernel::Callback { .. })
         );
         let has_subspace_trace = solution.penalty_subspace_trace.is_some();
-        let route_plan = outer_hessian_route_plan(
-            n_obs,
-            p_dim,
-            k_outer,
-            hessian_kernel.is_some(),
-            callback_operator_kernel,
-            has_subspace_trace,
-        );
-        let use_operator = route_plan.use_operator;
-        let route_choice = route_plan.choice();
-        let route_reason = route_plan.reason;
+        let use_operator = hessian_kernel.is_some()
+            && use_outer_hessian_operator_path(n_obs, p_dim, k_outer, callback_operator_kernel);
+        // Reason mnemonic: which clause carried the routing.  This is purely
+        // a log-telemetry attribution — the actual routing decision is made
+        // above by `use_operator`.  When `choice=dense`, only "kernel_absent"
+        // or "below_crossover" can be the reason (a Callback kernel does NOT
+        // by itself flip the choice; see `use_outer_hessian_operator_path`).
+        let route_reason = if hessian_kernel.is_none() {
+            "kernel_absent"
+        } else if has_subspace_trace && (scale_prefers_operator || callback_prefers_operator) {
+            "subspace_projected_operator"
+        } else if callback_prefers_operator {
+            "callback_row_pair_work"
+        } else if large_k {
+            "large_k"
+        } else if large_p {
+            "large_p"
+        } else if large_n_and_moderate_p {
+            "large_n_moderate_p"
+        } else if large_linear_work {
+            "large_linear_work"
+        } else {
+            "below_crossover"
+        };
+        let route_choice = if use_operator { "operator" } else { "dense" };
         log::info!(
             "[OUTER hessian-route] choice={route_choice} reason={route_reason} \
              n={n_obs} p={p_dim} k={k_outer} \
