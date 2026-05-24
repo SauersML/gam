@@ -6208,6 +6208,18 @@ fn build_single_local_smooth_term(
                 "internal: ByVariable smooths must return before inner basis dispatch".to_string(),
             ));
         }
+        SmoothBasisSpec::BySmooth { .. } => {
+            return Err(BasisError::InvalidInput(
+                "internal: BySmooth smooths must be lowered to ByVariable before inner basis dispatch"
+                    .to_string(),
+            ));
+        }
+        SmoothBasisSpec::FactorSmooth { .. } => {
+            return Err(BasisError::InvalidInput(
+                "internal: FactorSmooth smooths must be expanded before inner basis dispatch"
+                    .to_string(),
+            ));
+        }
     };
 
     match &term.basis {
@@ -6973,19 +6985,17 @@ fn smooth_basis_feature_cols(basis: &SmoothBasisSpec) -> Vec<usize> {
             cols.dedup();
             cols
         }
+        SmoothBasisSpec::BySmooth { smooth, .. } => smooth_basis_feature_cols(smooth),
         SmoothBasisSpec::BSpline1D { feature_col, .. } => vec![*feature_col],
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
         | SmoothBasisSpec::Sphere { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
+        | SmoothBasisSpec::Pca { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
-        SmoothBasisSpec::ByVariable { inner, by_col, .. } => {
-            let mut cols = smooth_term_feature_cols(&SmoothTermSpec {
-                name: term.name.clone(),
-                basis: (**inner).clone(),
-                shape: term.shape,
-            });
-            cols.push(*by_col);
+        SmoothBasisSpec::FactorSmooth { spec } => {
+            let mut cols = spec.continuous_cols.clone();
+            cols.push(spec.group_col);
             cols.sort_unstable();
             cols.dedup();
             cols
@@ -7013,11 +7023,13 @@ fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
         SmoothBasisSpec::Sphere { .. } => 3,
         SmoothBasisSpec::Matern { .. } => 4,
         SmoothBasisSpec::Duchon { .. } => 5,
-        SmoothBasisSpec::ByVariable { inner, .. } => smooth_basis_family_rank(&SmoothTermSpec {
+        SmoothBasisSpec::Pca { .. } => 6,
+        SmoothBasisSpec::BySmooth { smooth, .. } => smooth_basis_family_rank(&SmoothTermSpec {
             name: term.name.clone(),
-            basis: (**inner).clone(),
+            basis: (**smooth).clone(),
             shape: term.shape,
         }),
+        SmoothBasisSpec::FactorSmooth { .. } => 7,
     }
 }
 
@@ -7883,6 +7895,35 @@ fn with_identifiability_transform(
             group_levels: group_levels.clone(),
             flavour: flavour.clone(),
         }),
+        BasisMetadata::Pca {
+            feature_cols,
+            basis_matrix,
+            centered,
+            smooth_penalty,
+            center_mean,
+            pca_basis_path,
+            chunk_size,
+        } => {
+            // PCA bases carry an orthonormal projection matrix and do not
+            // expose an identifiability transform that can be re-composed
+            // (the constraint, if any, lives inside the PCA loadings
+            // themselves), so the caller cannot meaningfully attach a
+            // post-hoc Z transform here.
+            if transform.is_some() {
+                return Err(BasisError::InvalidInput(
+                    "PCA bases do not expose a composable identifiability transform".to_string(),
+                ));
+            }
+            Ok(BasisMetadata::Pca {
+                feature_cols: feature_cols.clone(),
+                basis_matrix: basis_matrix.clone(),
+                centered: *centered,
+                smooth_penalty: *smooth_penalty,
+                center_mean: center_mean.clone(),
+                pca_basis_path: pca_basis_path.clone(),
+                chunk_size: *chunk_size,
+            })
+        }
     }
 }
 fn orthogonality_relative_residual_for_design(
@@ -10102,12 +10143,14 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 },
                 reparam_qs: None,
                 dispersion: crate::estimate::Dispersion::Known(1.0),
-                beta_covariance,
+                beta_covariance: beta_covariance
+                    .clone()
+                    .map(crate::inference::dispersion_cov::PhiScaledCovariance::from),
                 beta_standard_errors,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
                 beta_covariance_frequentist: None,
-                influence_matrix: None,
+                coefficient_influence: None,
                 covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             };
@@ -12561,12 +12604,14 @@ fn fit_bounded_term_collection_with_design(
                 },
                 reparam_qs: None,
                 dispersion: crate::estimate::Dispersion::Known(1.0),
-                beta_covariance,
+                beta_covariance: beta_covariance
+                    .clone()
+                    .map(crate::inference::dispersion_cov::PhiScaledCovariance::from),
                 beta_standard_errors,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
                 beta_covariance_frequentist: None,
-                influence_matrix: None,
+                coefficient_influence: None,
                 covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             };
