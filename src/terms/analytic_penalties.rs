@@ -3674,7 +3674,7 @@ impl MechanismSparsityPenalty {
         }
         let d = self.latent_dim()?;
         let p = self.feature_count()?;
-        let local = target.slice(ndarray::s![self.target.range.start..self.target.range.end]);
+        let local = target.slice_move(ndarray::s![self.target.range.start..self.target.range.end]);
         local.into_shape_with_order((d, p)).ok()
     }
 
