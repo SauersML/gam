@@ -15398,7 +15398,7 @@ impl BernoulliMarginalSlopeFamily {
         // path because that branch routes through the flex jet machinery
         // instead of `rigid_fourth_full_cached`.
         if !self.effective_flex_active(block_states)? {
-            let _ = self.rigid_fourth_full_cached(block_states, cache, 0)?;
+            drop(self.rigid_fourth_full_cached(block_states, cache, 0)?);
         }
 
         // ── Rigid closed-form: 4th-order scalar kernel ───────────────
@@ -15486,7 +15486,7 @@ impl BernoulliMarginalSlopeFamily {
         // entering the per-row `par_iter` to avoid the OnceLock-under-rayon
         // deadlock — see `feedback_oncelock_rayon_deadlock`.
         if !self.effective_flex_active(block_states)? {
-            let _ = self.rigid_fourth_full_cached(block_states, cache, 0)?;
+            drop(self.rigid_fourth_full_cached(block_states, cache, 0)?);
         }
 
         if !self.effective_flex_active(block_states)? {
@@ -18018,12 +18018,12 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
         // parallel — but priming here lifts the first-axis cost out of the
         // workspace's `first_order_terms` measurement.
         if !family.effective_flex_active(&block_states)? {
-            let _ = family.rigid_third_full_cached(&block_states, &cache, 0)?;
+            drop(family.rigid_third_full_cached(&block_states, &cache, 0)?);
             // Outer-Hessian path consumes per-row fourth-tensor over every
             // (ψ-axis-i, ψ-axis-j) pair — prime here too so the 528-pair
             // sweep reads a populated cache instead of triggering the
             // 8-direction empirical jet on its first per-pair call.
-            let _ = family.rigid_fourth_full_cached(&block_states, &cache, 0)?;
+            drop(family.rigid_fourth_full_cached(&block_states, &cache, 0)?);
         }
         Ok(Self {
             family,
@@ -18568,7 +18568,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             anchors.push(CrossBlockAnchor::FlexEvaluation(a));
             anchor_tags.push(None);
         }
-        let _ = link_dev_seed; // padded knot-seed retained only for knot construction
+        drop(link_dev_seed); // padded knot-seed retained only for knot construction
         // W-metric for link-deviation orthogonalisation: same IRLS-style
         // probit Hessian row weight as the score-warp path, but evaluated at
         // `eta_pilot` (the one-GN-stepped pilot at which the link-dev basis
