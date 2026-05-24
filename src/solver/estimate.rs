@@ -6721,7 +6721,7 @@ mod estimate_policy_tests {
                 working_response: array![0.1, 0.2, 0.3],
                 reparam_qs: Some(array![[1.0, 0.0], [0.0, 1.0]]),
                 dispersion: Dispersion::Known(1.0),
-                beta_covariance: Some(array![[1.0, 0.1], [0.1, 2.0]]),
+                beta_covariance: Some(array![[1.0, 0.1], [0.1, 2.0]].into()),
                 beta_standard_errors: Some(array![1.0, 2.0_f64.sqrt()]),
                 beta_covariance_corrected: Some(array![[1.2, 0.1], [0.1, 2.2]]),
                 beta_standard_errors_corrected: Some(array![1.2_f64.sqrt(), 2.2_f64.sqrt()]),

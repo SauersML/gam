@@ -494,7 +494,7 @@ impl AtomSelectionStrategy for EntropicSoftmax {
         code: &SparseAtomCode,
         grad_a_row: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        drop(code);
+        std::hint::black_box(code);
         // Recompute softmax (cheap; alternative is to cache it in the code,
         // but that conflates the masked weights with the *unmasked* softmax
         // needed by the Jacobian).
@@ -510,8 +510,8 @@ impl AssignmentSparsityCoupling for EntropicSoftmax {
         free_amplitudes_row: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> (f64, Array1<f64>) {
-        drop(penalty);
-        drop(rho);
+        std::hint::black_box(penalty);
+        std::hint::black_box(rho);
         // Entropic-softmax does not consume the L¹ sparsity penalty
         // directly; the entropy regularisation lives inside the strategy
         // itself. We return zero contribution here (Piece 4 sees nothing
@@ -610,7 +610,7 @@ impl AtomSelectionStrategy for TopK {
         code: &SparseAtomCode,
         grad_a_row: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        drop(free_amplitudes_row);
+        std::hint::black_box(free_amplitudes_row);
         self.backward_straight_through(code, grad_a_row)
     }
 }
@@ -622,8 +622,8 @@ impl AssignmentSparsityCoupling for TopK {
         free_amplitudes_row: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> (f64, Array1<f64>) {
-        drop(penalty);
-        drop(rho);
+        std::hint::black_box(penalty);
+        std::hint::black_box(rho);
         // Cardinality is enforced structurally; no smooth penalty consumed.
         let k = free_amplitudes_row.len();
         (0.0, Array1::<f64>::zeros(k))

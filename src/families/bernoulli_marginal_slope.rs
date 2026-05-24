@@ -655,7 +655,7 @@ impl LatentZRankIntCalibration {
         let mut sum_wz = 0.0_f64;
         let mut sum_w = 0.0_f64;
         for (i, &idx) in order.iter().enumerate() {
-            drop(i);
+            std::hint::black_box(i);
             let zi = z[idx];
             let calibrated = Self::apply_with_knots(zi, &sorted_z, &weighted_cdf);
             sum_wz += weights[idx] * calibrated;
@@ -789,8 +789,8 @@ fn build_latent_measure_with_geometry(
                     calibration.post_sd,
                     calibration.sorted_z.len(),
                 );
-                drop(data);
-                drop(specs);
+                std::hint::black_box(data);
+                std::hint::black_box(specs);
                 Ok((
                     LatentMeasureKind::StandardNormal,
                     LatentMeasureCalibration::RankInverseNormal(calibration),
@@ -1363,7 +1363,7 @@ pub(crate) fn build_score_warp_deviation_block_from_seed_empirical_anchor(
     weights: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    drop(weights);
+    std::hint::black_box(weights);
     // The `weights` argument is retained for caller-API stability but no
     // longer participates in basis construction: identifiability now comes
     // from the smoothness-penalty null-space drop (β-independent), not from a
@@ -1515,7 +1515,7 @@ pub(crate) fn build_link_deviation_block_from_knots_design_seed_and_weights(
     anchor_weights: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    drop(anchor_weights);
+    std::hint::black_box(anchor_weights);
     // The `anchor_weights` argument is retained for caller-API stability but
     // no longer participates in basis construction (see
     // `build_score_warp_deviation_block_from_seed_empirical_anchor` for the
@@ -5190,8 +5190,8 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         // Touch both caches so their parallel builds run here, not later
         // (nested inside the outer ext-idx par_iter where the lock-holder
         // thread would have to do each row pass alone).
-        drop(self.third_full_cache());
-        drop(self.fourth_full_cache());
+        std::hint::black_box(self.third_full_cache());
+        std::hint::black_box(self.fourth_full_cache());
         Ok(())
     }
 
@@ -6728,7 +6728,7 @@ impl BernoulliMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        drop(specs);
+        std::hint::black_box(specs);
         if self.effective_flex_active(block_states)? {
             return Err("bernoulli marginal-slope log-sigma hyperderivatives are implemented for the rigid probit marginal-slope kernel; flexible score/link kernels require the analytic denested cell-tensor sigma path"
                         .to_string());
@@ -8347,8 +8347,8 @@ impl BernoulliMarginalSlopeFamily {
         let mut cache = self.build_exact_eval_cache_with_options(block_states, Some(options))?;
         cache.row_primary_hessians = self.build_row_primary_hessian_cache(block_states, &cache)?;
         if !self.effective_flex_active(block_states)? {
-            drop(self.rigid_third_full_cached(block_states, &cache, 0)?);
-            drop(self.rigid_fourth_full_cached(block_states, &cache, 0)?);
+            std::hint::black_box(self.rigid_third_full_cached(block_states, &cache, 0)?);
+            std::hint::black_box(self.rigid_fourth_full_cached(block_states, &cache, 0)?);
         }
         let arc = Arc::new(cache);
         let mut guard = self.shared_eval_cache.lock().map_err(|e| e.to_string())?;
@@ -13290,7 +13290,7 @@ impl BernoulliMarginalSlopeFamily {
         // on the FLEX path because that branch routes through the flex jet
         // machinery, which has its own row-cell-moments cache.
         if !self.effective_flex_active(block_states)? {
-            drop(self.rigid_third_full_cached(block_states, cache, 0)?);
+            std::hint::black_box(self.rigid_third_full_cached(block_states, cache, 0)?);
         }
 
         // Block-local accumulator path: avoids O(n p^2) dense Hessian
@@ -14319,13 +14319,13 @@ impl BernoulliMarginalSlopeFamily {
         // Mirrors the same discipline applied in
         // `exact_newton_joint_hessiansecond_directional_derivative_from_cache_with_options`.
         if !flex_active && n > 0 {
-            drop(self.rigid_third_full_cached(block_states, cache, 0)?);
+            std::hint::black_box(self.rigid_third_full_cached(block_states, cache, 0)?);
         }
         if n > 0 {
             let warm_marg = Array1::<f64>::zeros(slices.marginal.end - slices.marginal.start);
-            drop(self.marginal_design.dot_row_view(0, warm_marg.view()));
+            std::hint::black_box(self.marginal_design.dot_row_view(0, warm_marg.view()));
             let warm_log = Array1::<f64>::zeros(slices.logslope.end - slices.logslope.start);
-            drop(self.logslope_design.dot_row_view(0, warm_log.view()));
+            std::hint::black_box(self.logslope_design.dot_row_view(0, warm_log.view()));
         }
         // Even with the warm-up above, fall back to a serial row loop when the
         // par_iter cannot pay for its own dispatch overhead, or when we are
@@ -14616,7 +14616,7 @@ impl BernoulliMarginalSlopeFamily {
         // path because that branch routes through the flex jet machinery
         // instead of `rigid_fourth_full_cached`.
         if !self.effective_flex_active(block_states)? {
-            drop(self.rigid_fourth_full_cached(block_states, cache, 0)?);
+            std::hint::black_box(self.rigid_fourth_full_cached(block_states, cache, 0)?);
         }
 
         // ── Rigid closed-form: 4th-order scalar kernel ───────────────
@@ -14709,7 +14709,7 @@ impl BernoulliMarginalSlopeFamily {
         // entering the per-row `par_iter` to avoid the OnceLock-under-rayon
         // deadlock — see `feedback_oncelock_rayon_deadlock`.
         if !self.effective_flex_active(block_states)? {
-            drop(self.rigid_fourth_full_cached(block_states, cache, 0)?);
+            std::hint::black_box(self.rigid_fourth_full_cached(block_states, cache, 0)?);
         }
 
         if !self.effective_flex_active(block_states)? {
@@ -15627,7 +15627,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         // The workspace impl above unconditionally returns `Some(workspace)`
         // — the rigid path produces a `RowKernelHessianWorkspace` and the
         // flex path produces a
@@ -15639,12 +15639,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     }
 
     fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         true
     }
 
     fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         true
     }
 
@@ -17191,12 +17191,12 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
         // parallel — but priming here lifts the first-axis cost out of the
         // workspace's `first_order_terms` measurement.
         if !family.effective_flex_active(&block_states)? {
-            drop(family.rigid_third_full_cached(&block_states, &cache, 0)?);
+            std::hint::black_box(family.rigid_third_full_cached(&block_states, &cache, 0)?);
             // Outer-Hessian path consumes per-row fourth-tensor over every
             // (ψ-axis-i, ψ-axis-j) pair — prime here too so the 528-pair
             // sweep reads a populated cache instead of triggering the
             // 8-direction empirical jet on its first per-pair call.
-            drop(family.rigid_fourth_full_cached(&block_states, &cache, 0)?);
+            std::hint::black_box(family.rigid_fourth_full_cached(&block_states, &cache, 0)?);
         }
         Ok(Self {
             family,
@@ -18051,7 +18051,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
          designs: &[TermCollectionDesign],
          eval_mode,
          row_set: &crate::families::row_kernel::RowSet| {
-            drop(row_set);
+            std::hint::black_box(row_set);
             use crate::solver::estimate::reml::unified::EvalMode;
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;

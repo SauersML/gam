@@ -1076,8 +1076,8 @@ fn build_basis_derivative_jets(
             ..
         } => {
             if chunk_size.is_some() {
-                drop(latent);
-                drop(distances);
+                std::hint::black_box(latent);
+                std::hint::black_box(distances);
                 return Ok(BasisDerivativeJets {
                     operator_resident: true,
                     ..BasisDerivativeJets::empty()
@@ -1110,7 +1110,7 @@ fn build_basis_derivative_jets(
             })
         }
         LatentBasisKind::Duchon { .. } => {
-            drop(latent);
+            std::hint::black_box(latent);
             Ok(BasisDerivativeJets {
                 operator_resident: true,
                 ..BasisDerivativeJets::empty()
@@ -1120,8 +1120,8 @@ fn build_basis_derivative_jets(
         | LatentBasisKind::PeriodicBspline { .. }
         | LatentBasisKind::Pca { .. }
         | LatentBasisKind::TensorBspline { .. } => {
-            drop(latent);
-            drop(distances);
+            std::hint::black_box(latent);
+            std::hint::black_box(distances);
             Ok(BasisDerivativeJets {
                 operator_resident: true,
                 ..BasisDerivativeJets::empty()

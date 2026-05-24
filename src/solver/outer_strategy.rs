@@ -1718,7 +1718,7 @@ pub trait OuterObjective {
     /// first inner solve opens at `‖∇‖ ≈ 0` and the boundary-ρ conditioning
     /// stops mattering.
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
-        drop(beta);
+        std::hint::black_box(beta);
         Ok(())
     }
 }
@@ -1850,7 +1850,7 @@ pub(crate) fn classify_cache_entry_for_outer(
     expected_rho_dim: usize,
     rho_bound: f64,
 ) -> CacheSeedDecision {
-    drop(rho_bound);
+    std::hint::black_box(rho_bound);
     let entry = &loaded.entry;
     let Some(payload) = decode_iterate(&entry.payload, expected_rho_dim) else {
         return CacheSeedDecision::Discard {
@@ -3102,7 +3102,7 @@ struct OuterAcceptObserver {
 
 impl OptimizerObserver for OuterAcceptObserver {
     fn on_step_accepted(&mut self, info: &StepInfo) {
-        drop(info);
+        std::hint::black_box(info);
         self.feedback.accepted_iter.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -3238,7 +3238,7 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
             };
             let snapshot = feedback.snapshot();
             let cap = first_order_inner_cap_schedule(self.eval_count, g_ratio, snapshot);
-            drop(feedback.cap.swap(cap, Ordering::Relaxed));
+            std::hint::black_box(feedback.cap.swap(cap, Ordering::Relaxed));
         }
         let stage_start = std::time::Instant::now();
         log::info!(
@@ -6688,6 +6688,7 @@ mod tests {
                     cost: theta[0] * theta[0],
                     gradient: array![2.0 * theta[0]],
                     hessian: HessianResult::Unavailable,
+                    inner_beta_hint: None,
                 })
             },
             None::<fn(&mut ())>,
