@@ -11,6 +11,12 @@ use std::marker::PhantomData;
 
 mod common;
 
+fn stateless_ad_output<T>(freeze: bool, output: T) -> Vec<T> {
+    match freeze {
+        true | false => vec![output],
+    }
+}
+
 #[derive(Clone, Debug)]
 struct E2EData {
     a: Vec<f64>,
@@ -108,7 +114,7 @@ impl<T: AD> DifferentiableFunctionTrait<T> for SigmaFn<T> {
     const NAME: &'static str = "SigmaFn";
 
     fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
-        vec![inputs[0].exp()]
+        stateless_ad_output(freeze, inputs[0].exp())
     }
 
     fn num_inputs(&self) -> usize {
@@ -158,7 +164,7 @@ impl<T: AD> DifferentiableFunctionTrait<T> for E2EFn<T> {
             acc += w * phi;
         }
 
-        vec![acc]
+        stateless_ad_output(freeze, acc)
     }
 
     fn num_inputs(&self) -> usize {

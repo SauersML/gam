@@ -10,6 +10,12 @@ use std::marker::PhantomData;
 
 mod common;
 
+fn stateless_ad_output<T>(freeze: bool, output: T) -> Vec<T> {
+    match freeze {
+        true | false => vec![output],
+    }
+}
+
 const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 const SAS_U_CLAMP: f64 = 50.0;
 
@@ -245,11 +251,7 @@ impl<T: AD> DifferentiableFunctionTrait<T> for SasD1Fn<T> {
     const NAME: &'static str = "SasD1Fn";
 
     fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
-        if freeze {
-            vec![sas_eta_d1_ad(self.eta, inputs[0], self.log_delta)]
-        } else {
-            vec![sas_eta_d1_ad(self.eta, inputs[0], self.log_delta)]
-        }
+        stateless_ad_output(freeze, sas_eta_d1_ad(self.eta, inputs[0], self.log_delta))
     }
 
     fn num_inputs(&self) -> usize {
@@ -286,11 +288,7 @@ impl<T: AD> DifferentiableFunctionTrait<T> for SasD2Fn<T> {
     const NAME: &'static str = "SasD2Fn";
 
     fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
-        if freeze {
-            vec![sas_eta_d2_ad(self.eta, inputs[0], self.log_delta)]
-        } else {
-            vec![sas_eta_d2_ad(self.eta, inputs[0], self.log_delta)]
-        }
+        stateless_ad_output(freeze, sas_eta_d2_ad(self.eta, inputs[0], self.log_delta))
     }
 
     fn num_inputs(&self) -> usize {
