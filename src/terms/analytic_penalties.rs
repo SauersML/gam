@@ -7894,6 +7894,7 @@ mod tests {
 
     #[test]
     fn nested_prefix_grad_rho_matches_finite_difference() {
+        assert!(file!().ends_with(".rs"));
         let (t, _n, f) = nested_prefix_test_target();
         let target = PsiSlice::full(t.len(), Some(f));
         let pen = NestedPrefixPenalty::new(
