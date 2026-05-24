@@ -268,14 +268,11 @@ pub trait OuterHessianOperator: Send + Sync {
     fn apply_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<(), String> {
         let result = self.matvec(v)?;
         if result.len() != out.len() {
-            return Err(OuterStrategyError::OperatorShape {
-                reason: format!(
-                    "outer Hessian operator matvec produced length {} but expected {}",
-                    result.len(),
-                    out.len()
-                ),
-            }
-            .into());
+            return Err(format!(
+                "outer Hessian operator matvec produced length {} but expected {}",
+                result.len(),
+                out.len()
+            ));
         }
         out.assign(&result);
         Ok(())
@@ -528,6 +525,16 @@ impl DeclaredHessianForm {
     /// arms while richer routing decisions consult the form directly.
     pub fn is_analytic(self) -> bool {
         !matches!(self, DeclaredHessianForm::Unavailable)
+    }
+
+    /// True when the declaration commits to a matrix-free path.
+    pub fn is_operator_only(self) -> bool {
+        matches!(self, DeclaredHessianForm::Operator { .. })
+    }
+
+    /// True when the declaration commits to a dense path.
+    pub fn is_dense_only(self) -> bool {
+        matches!(self, DeclaredHessianForm::Dense)
     }
 }
 
@@ -3079,11 +3086,6 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
                 .collect::<Vec<_>>()
                 .join(","),
         );
-        // Live-chart trial sample (ARC bridge second-order entry). ARC
-        // typically calls eval_grad then eval_hessian in the same outer
-        // iter; both push so the chart's outer_eval_counter advances per
-        // physical bridge call, which matches the [OUTER] eval# log cadence.
-        crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
         let hessian = build_bridge_hessian_for_source(
             self.hessian_source,
             eval.hessian,
@@ -3131,60 +3133,13 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
 /// matrix-free TR). The bridge's inner-cap schedule reads
 /// `accepted_iter` from the feedback channel instead of inferring
 /// it from raw eval counts.
-///
-/// Also emits the trust-region accept/reject decision at INFO level
-/// so logs can distinguish a trial-eval `[OUTER] eval#k (hess)` line
-/// (emitted unconditionally inside the bridge before opt decides
-/// accept/reject) from the actually-accepted iterate. Without this
-/// pairing, a sequence of trial logs with non-monotone costs looks
-/// like the optimizer accepting ascent steps, when in reality some
-/// are rejected and the iterate stays put.
 struct OuterAcceptObserver {
-    feedback: Option<InnerProgressFeedback>,
-    trust_energy_gate: Option<Arc<Mutex<TrustEnergyGateState>>>,
+    feedback: InnerProgressFeedback,
 }
 
 impl OptimizerObserver for OuterAcceptObserver {
-    fn on_step_accepted(&mut self, info: &StepInfo) {
-        if let Some(feedback) = self.feedback.as_ref() {
-            feedback.accepted_iter.fetch_add(1, Ordering::Relaxed);
-        }
-        if let Some(gate) = self.trust_energy_gate.as_ref()
-            && let Ok(mut gate) = gate.lock()
-        {
-            gate.promote_latest_trial();
-        }
-        // Promote the bridge-side trial sample into the visualizer's accepted
-        // series. Paired with `record_outer_eval` calls inside the bridges so
-        // the live chart shows trial scatter + accepted line. Pushed BEFORE
-        // logging so a Ctrl-C between accept and log still reflects the
-        // accepted iterate on the visible chart.
-        crate::solver::visualizer::record_outer_accept();
-        log::info!(
-            "[OUTER step] iter={} accepted step_norm={:.3e} actual={:+.3e} predicted={:+.3e}",
-            info.iter,
-            info.step_norm,
-            info.actual_decrease,
-            info.predicted_decrease,
-        );
-    }
-    fn on_step_rejected(&mut self, info: &StepInfo) {
-        if let Some(gate) = self.trust_energy_gate.as_ref()
-            && let Ok(mut gate) = gate.lock()
-        {
-            gate.clear_latest_trial();
-        }
-        // Rejected trials remain in the visualizer's trial-scatter series
-        // (recorded by the bridges' `record_outer_eval` call). Nothing to
-        // promote here; just log so the [OUTER step] line in the log stream
-        // distinguishes accept from reject.
-        log::info!(
-            "[OUTER step] iter={} REJECTED step_norm={:.3e} actual={:+.3e} predicted={:+.3e}",
-            info.iter,
-            info.step_norm,
-            info.actual_decrease,
-            info.predicted_decrease,
-        );
+    fn on_step_accepted(&mut self, _info: &StepInfo) {
+        self.feedback.accepted_iter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -3232,139 +3187,6 @@ impl HessianOperator for OuterToOptHessianOperator {
     }
 }
 
-#[derive(Clone)]
-struct TrustEnergyModel {
-    point: Array1<f64>,
-    gradient: Array1<f64>,
-    hessian: HessianValue,
-    ift_residual_energy: Option<(f64, u64)>,
-}
-
-impl TrustEnergyModel {
-    fn new(
-        point: Array1<f64>,
-        gradient: Array1<f64>,
-        hessian: HessianValue,
-        ift_residual_energy: Option<(f64, u64)>,
-    ) -> Self {
-        Self {
-            point,
-            gradient,
-            hessian,
-            ift_residual_energy: ift_residual_energy
-                .filter(|(energy, _)| energy.is_finite() && *energy >= 0.0),
-        }
-    }
-
-    fn predicted_decrease_to(&self, trial_point: &Array1<f64>) -> Option<f64> {
-        if trial_point.len() != self.point.len() || self.gradient.len() != self.point.len() {
-            return None;
-        }
-        let step = trial_point - &self.point;
-        let step_norm_sq = step.dot(&step);
-        if !step_norm_sq.is_finite() || step_norm_sq <= 0.0 {
-            return None;
-        }
-        let mut h_step = Array1::<f64>::zeros(step.len());
-        match &self.hessian {
-            HessianValue::Dense(hessian) => {
-                if hessian.nrows() != step.len() || hessian.ncols() != step.len() {
-                    return None;
-                }
-                h_step.assign(&hessian.dot(&step));
-            }
-            HessianValue::Operator(op) => {
-                if op.dim() != step.len() || op.apply_into(&step, &mut h_step).is_err() {
-                    return None;
-                }
-            }
-            HessianValue::Unavailable => return None,
-        }
-        let predicted_decrease = -self.gradient.dot(&step) - 0.5 * step.dot(&h_step);
-        predicted_decrease.is_finite().then_some(predicted_decrease)
-    }
-}
-
-struct TrustEnergyGateState {
-    accepted: Option<TrustEnergyModel>,
-    latest_trial: Option<TrustEnergyModel>,
-}
-
-impl TrustEnergyGateState {
-    fn new(seed: TrustEnergyModel) -> Self {
-        Self {
-            accepted: Some(seed),
-            latest_trial: None,
-        }
-    }
-
-    fn promote_latest_trial(&mut self) {
-        if let Some(trial) = self.latest_trial.take() {
-            self.accepted = Some(trial);
-        }
-    }
-
-    fn clear_latest_trial(&mut self) {
-        self.latest_trial = None;
-    }
-
-    fn reject_if_contaminated(
-        &mut self,
-        trial: TrustEnergyModel,
-    ) -> Result<(), ObjectiveEvalError> {
-        let Some(accepted) = self.accepted.as_ref() else {
-            self.latest_trial = Some(trial);
-            return Ok(());
-        };
-        let Some(predicted_decrease) = accepted.predicted_decrease_to(&trial.point) else {
-            self.latest_trial = Some(trial);
-            return Ok(());
-        };
-        let energy_contamination = match (accepted.ift_residual_energy, predicted_decrease) {
-            (Some((e, cached_iter)), p) if p.abs() > 0.0 => {
-                let current_iter = crate::solver::estimate::reml::runtime::current_outer_iter();
-                if cached_iter == 0 || current_iter == 0 {
-                    false
-                } else if current_iter < cached_iter {
-                    let gap = cached_iter - current_iter;
-                    log::info!("[TRUST-ENERGY] cache stale (gap={}), skipping gate", gap);
-                    false
-                } else if current_iter - cached_iter > 1 {
-                    let gap = current_iter - cached_iter;
-                    log::info!("[TRUST-ENERGY] cache stale (gap={}), skipping gate", gap);
-                    false
-                } else {
-                    e > TRUST_ENERGY_FACTOR * p.abs()
-                }
-            }
-            _ => false,
-        };
-        if energy_contamination {
-            let energy = accepted
-                .ift_residual_energy
-                .map(|(energy, _)| energy)
-                .unwrap_or(f64::NAN);
-            let step_norm = (&trial.point - &accepted.point)
-                .dot(&(&trial.point - &accepted.point))
-                .sqrt();
-            log::info!(
-                "[TRUST-ENERGY] shrinking radius: energy={:.3e} predicted_decrease={:.3e} factor={:.3e} shrink_factor={:.3e} step_norm={:.3e}",
-                energy,
-                predicted_decrease,
-                TRUST_ENERGY_FACTOR,
-                TRUST_ENERGY_SHRINK_FACTOR,
-                step_norm,
-            );
-            self.latest_trial = None;
-            return Err(ObjectiveEvalError::recoverable(format!(
-                "trust-energy gate rejected trial: energy={energy:.3e} predicted_decrease={predicted_decrease:.3e}"
-            )));
-        }
-        self.latest_trial = Some(trial);
-        Ok(())
-    }
-}
-
 /// Translate a gam `HessianResult` into an `opt::HessianValue` for
 /// consumption by `MatrixFreeTrustRegion`. `Analytic` becomes
 /// `Dense`; `Operator` is wrapped in the adapter; `Unavailable` is
@@ -3389,30 +3211,14 @@ struct OuterOperatorBridge<'a> {
     layout: OuterThetaLayout,
     /// Inner-PIRLS cap atomic, mirroring the BFGS / ARC bridges.
     outer_inner_cap: Option<InnerProgressFeedback>,
-    /// Counts gradient/Hessian evaluations for progress logs. Inner-cap
-    /// scheduling uses accepted outer iterations from `outer_inner_cap`.
+    /// Counts gradient/Hessian evaluations for the inner-cap schedule
+    /// and progress logs.
     eval_count: usize,
     /// First observed `‖g‖`. Used by the inner-cap schedule's
     /// gradient-ratio gate.
     g_norm_initial: Option<f64>,
     /// `‖g‖` from the most recent eval.
     last_g_norm: Option<f64>,
-    trust_energy_gate: Option<Arc<Mutex<TrustEnergyGateState>>>,
-}
-
-impl OuterOperatorBridge<'_> {
-    fn update_inner_cap_from_accepted_iter(&mut self) {
-        if let Some(feedback) = self.outer_inner_cap.as_ref() {
-            let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
-                (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
-                _ => None,
-            };
-            let snapshot = feedback.snapshot();
-            let accepted_iter = feedback.accepted_iter.load(Ordering::Relaxed);
-            let cap = first_order_inner_cap_schedule(accepted_iter, g_ratio, snapshot);
-            let _prev = feedback.cap.swap(cap, Ordering::Relaxed);
-        }
-    }
 }
 
 impl ZerothOrderObjective for OuterOperatorBridge<'_> {
@@ -3430,10 +3236,6 @@ impl ZerothOrderObjective for OuterOperatorBridge<'_> {
 impl FirstOrderObjective for OuterOperatorBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
-        self.update_inner_cap_from_accepted_iter();
-        crate::solver::estimate::reml::runtime::record_current_outer_iter_for_ift(
-            self.eval_count.saturating_add(1) as u64,
-        );
         let eval = self
             .obj
             .eval_with_order(x, OuterEvalOrder::ValueAndGradient)
@@ -3446,16 +3248,8 @@ impl FirstOrderObjective for OuterOperatorBridge<'_> {
         if g_norm.is_finite() {
             self.last_g_norm = Some(g_norm);
         }
-        // Live-chart trial sample (matrix-free TR operator bridge,
-        // first-order entry). Some opt subroutines call eval_grad without
-        // going through eval_value_grad_op; pushing here as well makes the
-        // chart progress monotonically for those callers too. Duplicate
-        // pushes are harmless — they just produce trial scatter at adjacent
-        // x-coords if the same outer iter is sampled by both entry points.
-        crate::solver::visualizer::record_outer_eval(eval.cost, g_norm);
-        let value = eval.cost;
         Ok(FirstOrderSample {
-            value,
+            value: eval.cost,
             gradient: eval.gradient,
         })
     }
@@ -3467,10 +3261,21 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
         x: &Array1<f64>,
     ) -> Result<OperatorSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
-        self.update_inner_cap_from_accepted_iter();
-        crate::solver::estimate::reml::runtime::record_current_outer_iter_for_ift(
-            self.eval_count.saturating_add(1) as u64,
-        );
+        // Drive the outer-aware inner-PIRLS cap, mirroring
+        // OuterSecondOrderBridge::eval_grad / eval_hessian. Each
+        // accepted outer iter calls eval_value_grad_op exactly once
+        // (the matrix-free TR's inner CG uses HVPs, not full
+        // evaluations), so we increment per call without the /2 the
+        // ARC bridge needs.
+        if let Some(feedback) = self.outer_inner_cap.as_ref() {
+            let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
+                (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
+                _ => None,
+            };
+            let snapshot = feedback.snapshot();
+            let cap = first_order_inner_cap_schedule(self.eval_count, g_ratio, snapshot);
+            let _prev = feedback.cap.swap(cap, Ordering::Relaxed);
+        }
         let stage_start = std::time::Instant::now();
         log::info!(
             "[STAGE] outer eval start order=ValueGradientHessian dim={} (operator bridge)",
@@ -3495,32 +3300,10 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
             eval.cost,
             g_norm,
         );
-        let value = eval.cost;
-        let gradient = eval.gradient;
-        let hessian = hessian_result_to_value(eval.hessian);
-        if let Some(gate) = self.trust_energy_gate.as_ref()
-            && let Ok(mut gate) = gate.lock()
-        {
-            let ift_residual_energy =
-                crate::solver::estimate::reml::runtime::cached_ift_residual_energy_for_outer_theta(
-                    x,
-                );
-            gate.reject_if_contaminated(TrustEnergyModel::new(
-                x.clone(),
-                gradient.clone(),
-                hessian.clone(),
-                ift_residual_energy,
-            ))?;
-        }
-        // Live-chart trial sample (matrix-free TR operator bridge). Each
-        // accepted outer iter calls eval_value_grad_op exactly once — HVPs
-        // inside the inner CG do not flow through here — so this push
-        // matches one bridge eval per chart x-tick.
-        crate::solver::visualizer::record_outer_eval(value, g_norm);
         Ok(OperatorSample {
-            value,
-            gradient,
-            hessian,
+            value: eval.cost,
+            gradient: eval.gradient,
+            hessian: hessian_result_to_value(eval.hessian),
         })
     }
 }
@@ -3550,8 +3333,8 @@ fn project_to_bounds(x: &Array1<f64>, bounds: Option<&(Array1<f64>, Array1<f64>)
 ///
 /// For `HessianSource::Analytic` (the exact second-order route) a missing
 /// or non-materializable Hessian is FATAL: returning `None` here would
-/// invite `opt::SecondOrderCache` to silently synthesize a Hessian from
-/// gradient probes, which (a)
+/// invite `opt::SecondOrderCache::finite_difference_hessian` to silently
+/// estimate the Hessian by finite-differencing the gradient, which (a)
 /// throws away the analytic structure the route was selected for, and
 /// (b) costs O(K) full outer evaluations per ARC iteration — at biobank
 /// scale, hours of work per silently-mis-routed step. The right
@@ -3599,14 +3382,14 @@ fn build_bridge_hessian_for_source(
                 message: format!(
                     "outer plan declared HessianSource::Analytic but the runtime returned a \
                      non-materializable Hessian operator (dim={}, materialization={:?}); \
-                     numeric Hessian synthesis is not permitted on the analytic route",
+                     finite-difference Hessian estimation is not permitted on the analytic route",
                     op.dim(),
                     op.materialization_capability(),
                 ),
             }),
             HessianResult::Unavailable => Err(ObjectiveEvalError::Fatal {
                 message: "outer plan declared HessianSource::Analytic but the runtime returned \
-                          HessianResult::Unavailable; numeric Hessian synthesis is \
+                          HessianResult::Unavailable; finite-difference Hessian estimation is \
                           not permitted on the analytic route"
                     .to_string(),
             }),
@@ -4951,18 +4734,6 @@ pub struct OuterResult {
     pub operator_stop_reason: Option<OperatorTrustRegionStopReason>,
 }
 
-impl OuterResult {
-    /// Display helper. `None` (cache-hit short-circuit, gradient-free
-    /// compass search) renders as "n/a" so logs distinguish "not measured"
-    /// from a literal zero gradient. Storage paths carry `final_grad_norm`
-    /// through as `Option<f64>` directly; `outer_converged` is the
-    /// authoritative convergence signal.
-    pub fn final_grad_norm_report(&self) -> String {
-        self.final_grad_norm
-            .map_or_else(|| "n/a".to_string(), |v| format!("{v:.3e}"))
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperatorTrustRegionStopReason {
     Converged,
@@ -5406,19 +5177,12 @@ fn run_outer_with_plan(
                     let (lo, hi) = &bounds_template;
                     let bounds_obj = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                         .expect("outer rho bounds must be valid");
-                    // Smoothing-parameter gradients are not on the same
-                    // scale as the raw REML/LAML objective: the objective
-                    // contains an O(n) likelihood constant, while ∂/∂logλ
-                    // stationarity balances effective degrees of freedom,
-                    // traces, and penalty quadratics. Scaling the gradient
-                    // tolerance by |f| gets looser as n grows and can declare
-                    // convergence with materially nonzero outer gradients.
-                    // Use an absolute tolerance plus a relative reduction
-                    // from the seed gradient instead.
-                    let grad_tol = outer_gradient_tolerance_with_scale(
-                        config.tolerance,
-                        config.objective_scale,
-                    );
+                    // Scale-aware tolerance via opt 0.5.0:
+                    // `relative_to_cost(τ)` = `τ * (1 + |f|)` resolved
+                    // at run time from the seed cost and initial grad
+                    // norm. Replaces the previous gam-side
+                    // precomputed `outer_scaled_tolerance` hack.
+                    let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
                     let max_iter =
                         MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
 
@@ -5428,29 +5192,10 @@ fn run_outer_with_plan(
                     // eval. The Hessian translation goes through the
                     // gam->opt operator adapter when the seed Hessian is
                     // an Hv operator; Analytic seeds become Dense.
-                    // Destructure `seed_eval` to move `gradient` /
-                    // `hessian` into the sample instead of cloning the
-                    // length-`p` array and dense `p×p` Hessian — the
-                    // seed eval is not consulted again in this branch.
-                    let OuterEval {
-                        cost: seed_cost,
-                        gradient: seed_gradient,
-                        hessian: seed_hessian_result,
-                        ..
-                    } = seed_eval;
-                    let seed_hessian = hessian_result_to_value(seed_hessian_result);
-                    let trust_energy_gate = Arc::new(Mutex::new(TrustEnergyGateState::new(
-                        TrustEnergyModel::new(
-                            seed.clone(),
-                            seed_gradient.clone(),
-                            seed_hessian.clone(),
-                            crate::solver::estimate::reml::runtime::cached_ift_residual_energy_for_outer_theta(seed),
-                        ),
-                    )));
                     let initial_op_sample = OperatorSample {
-                        value: seed_cost,
-                        gradient: seed_gradient,
-                        hessian: seed_hessian,
+                        value: seed_eval.cost,
+                        gradient: seed_eval.gradient.clone(),
+                        hessian: hessian_result_to_value(seed_eval.hessian.clone()),
                     };
 
                     let bridge_obj = OuterOperatorBridge {
@@ -5460,7 +5205,6 @@ fn run_outer_with_plan(
                         eval_count: 0,
                         g_norm_initial: None,
                         last_g_norm: None,
-                        trust_energy_gate: Some(Arc::clone(&trust_energy_gate)),
                     };
 
                     let mut solver = MatrixFreeTrustRegion::new(seed.clone(), bridge_obj)
@@ -5485,10 +5229,11 @@ fn run_outer_with_plan(
                         // exact analytic Hessians; an `Unavailable`
                         // here is a routing/contract violation.
                         .with_hessian_fallback_policy(HessianFallbackPolicy::Error);
-                    solver = solver.with_observer(OuterAcceptObserver {
-                        feedback: config.outer_inner_cap.clone(),
-                        trust_energy_gate: Some(Arc::clone(&trust_energy_gate)),
-                    });
+                    if let Some(feedback) = config.outer_inner_cap.as_ref() {
+                        solver = solver.with_observer(OuterAcceptObserver {
+                            feedback: feedback.clone(),
+                        });
+                    }
                     if let Some(r) = config.operator_initial_trust_radius {
                         solver = solver.with_initial_trust_radius(r);
                     }
@@ -5520,11 +5265,7 @@ fn run_outer_with_plan(
                     // already learned instead of redoing the trust-radius
                     // adaptation from the configured initial radius.
                     match report.status {
-                        OptimizationStatus::Converged
-                        | OptimizationStatus::NumericallyConverged => {
-                            // NumericallyConverged is opt's exit when the predicted-reduction
-                            // cost-ratio test drops below the cost's ULP floor: continuing
-                            // would race float noise. Treat as a successful terminal state.
+                        OptimizationStatus::Converged => {
                             let mut result =
                                 solution_into_outer_result(report.solution, true, *the_plan);
                             result.operator_stop_reason =
@@ -5562,10 +5303,7 @@ fn run_outer_with_plan(
                     let (lo, hi) = &bounds_template;
                     let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                         .expect("outer rho bounds must be valid");
-                    let grad_tol = outer_gradient_tolerance_with_scale(
-                        config.tolerance,
-                        config.objective_scale,
-                    );
+                    let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
                     let max_iter =
                         MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
 
@@ -5586,20 +5324,9 @@ fn run_outer_with_plan(
                     // analytic-route contract (no None Hessian on
                     // `HessianSource::Analytic`) applies at seed time
                     // too, not just inside the bridge's live path.
-                    // Destructure `seed_eval` to move `gradient` /
-                    // `hessian` into the bridge translation and sample
-                    // instead of cloning a length-`p` array and a
-                    // dense `p×p` Hessian per seed iteration — the
-                    // seed eval is not consulted again in this branch.
-                    let OuterEval {
-                        cost: seed_cost,
-                        gradient: seed_gradient,
-                        hessian: seed_hessian_result,
-                        ..
-                    } = seed_eval;
                     let seed_hessian = build_bridge_hessian_for_source(
                         hessian_source,
-                        seed_hessian_result,
+                        seed_eval.hessian.clone(),
                         OUTER_HVP_MATERIALIZE_MAX_DIM,
                     )
                     .map_err(|err| match err {
@@ -5609,8 +5336,8 @@ fn run_outer_with_plan(
                         }
                     })?;
                     let initial_sample = SecondOrderSample {
-                        value: seed_cost,
-                        gradient: seed_gradient,
+                        value: seed_eval.cost,
+                        gradient: seed_eval.gradient.clone(),
                         hessian: seed_hessian,
                     };
 
@@ -5619,21 +5346,13 @@ fn run_outer_with_plan(
                         .with_gradient_tolerance(grad_tol)
                         .with_max_iterations(max_iter)
                         .with_initial_sample(seed.clone(), initial_sample);
-                    if let Some(sigma) = config.arc_initial_regularization {
-                        // Caller-supplied initial cubic-regularization
-                        // sigma; smaller sigma → less penalty on the
-                        // first ARC step. Defaults to opt's 1.0 when
-                        // unset, matching the legacy behavior.
-                        optimizer = optimizer.with_initial_regularization(sigma);
-                    }
                     if let Some(feedback) = config.outer_inner_cap.as_ref() {
                         optimizer = optimizer.with_observer(OuterAcceptObserver {
-                            feedback: Some(feedback.clone()),
-                            trust_energy_gate: None,
+                            feedback: feedback.clone(),
                         });
                     }
                     // On the exact-Hessian ARC route, forbid both (a)
-                    // numeric Hessian synthesis if the
+                    // finite-difference Hessian estimation if the
                     // objective ever returns
                     // `SecondOrderSample { hessian: None }` and (b)
                     // `opt`'s internal AutoBfgs demotion on step
@@ -5718,8 +5437,7 @@ fn run_outer_with_plan(
                 let (lo, hi) = &bounds_template;
                 let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
                     .expect("outer rho bounds must be valid");
-                let grad_tol =
-                    outer_gradient_tolerance_with_scale(config.tolerance, config.objective_scale);
+                let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
                 let max_iter =
                     MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
                 let objective = OuterFirstOrderBridge {
@@ -5738,54 +5456,19 @@ fn run_outer_with_plan(
                 // is one of the cheapest wins available. (opt 0.3.0
                 // API; before that this was implemented via a
                 // gam-side cache on the bridge.)
-                // Destructure `seed_eval` to move `gradient` into the
-                // sample instead of cloning a length-`p` array per seed
-                // iteration — the seed eval is not consulted again.
-                let OuterEval {
-                    cost: seed_cost,
-                    gradient: seed_gradient,
-                    ..
-                } = seed_eval;
                 let initial_sample = FirstOrderSample {
-                    value: seed_cost,
-                    gradient: seed_gradient,
+                    value: seed_eval.cost,
+                    gradient: seed_eval.gradient.clone(),
                 };
                 let mut optimizer = Bfgs::new(seed.clone(), objective)
                     .with_initial_sample(seed.clone(), initial_sample)
                     .with_bounds(bounds)
                     .with_gradient_tolerance(grad_tol)
-                    .with_max_iterations(max_iter);
-                // Native per-axis L∞ trust budget (opt 0.5.10
-                // `Bfgs::with_axis_step_caps`). Rho axes (the first
-                // `rho_dim` parameters = log-λ) get the rho cap; psi axes
-                // (trailing = kappa / aniso-log-scales) get the psi cap;
-                // unspecified caps default to `f64::INFINITY` (uncapped).
-                // The cap is enforced by shortening the BFGS direction
-                // before line search, not by sentinel costs from the
-                // bridge, so the line search sees real costs throughout.
-                if config.bfgs_step_cap.is_some() || config.bfgs_step_cap_psi.is_some() {
-                    let rho_dim = layout.rho_dim();
-                    let axis_caps = ndarray::Array1::<f64>::from_shape_fn(seed.len(), |i| {
-                        let cap = if i < rho_dim {
-                            config.bfgs_step_cap
-                        } else {
-                            config.bfgs_step_cap_psi
-                        };
-                        cap.filter(|v| v.is_finite() && *v > 0.0)
-                            .unwrap_or(f64::INFINITY)
-                    });
-                    log::info!(
-                        "[OUTER/BFGS] axis step caps installed (opt-native): rho_dim={} step_cap_rho={:?} step_cap_psi={:?}",
-                        rho_dim,
-                        config.bfgs_step_cap,
-                        config.bfgs_step_cap_psi,
-                    );
-                    optimizer = optimizer.with_axis_step_caps(axis_caps);
-                }
+                    .with_max_iterations(max_iter)
+                    .with_initial_sample(seed.clone(), initial_sample);
                 if let Some(feedback) = config.outer_inner_cap.as_ref() {
                     optimizer = optimizer.with_observer(OuterAcceptObserver {
-                        feedback: Some(feedback.clone()),
-                        trust_energy_gate: None,
+                        feedback: feedback.clone(),
                     });
                 }
                 let bfgs_start = std::time::Instant::now();
@@ -6162,82 +5845,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    #[test]
-    fn outer_gradient_tolerance_is_absolute_only() {
-        // The shape is intentionally abs-only: a rel-from-seed (or
-        // rel-from-cost) component can fire at iter 1 on a resumed-
-        // from-cache start where the line search accepts a near-zero
-        // step, and the optimizer "converges" at the very gradient it
-        // started with. The runner relies on the abs floor being the
-        // sole exit gate.
-        let tol = outer_gradient_tolerance_with_scale(1e-5, None);
-        assert_eq!(tol.abs, 1e-5);
-        assert_eq!(tol.rel_initial_grad, None);
-        assert_eq!(tol.rel_cost, None);
-        // Threshold equals abs at every (seed_cost, g_0) — the relative
-        // components are off, so the seed gradient norm cannot widen
-        // the exit window.
-        assert!((tol.threshold(1.0e9, 2.0) - 1.0e-5).abs() < 1e-14);
-        assert!((tol.threshold(0.0, 0.0) - 1.0e-5).abs() < 1e-14);
-    }
-
-    #[test]
-    fn outer_gradient_tolerance_with_scale_widens_absolute_floor_for_large_scale() {
-        // Without a scale: abs == tol.
-        let unscaled = outer_gradient_tolerance_with_scale(1e-7, None);
-        assert_eq!(unscaled.abs, 1e-7);
-        assert_eq!(unscaled.rel_initial_grad, None);
-
-        // With scale = 1e6 (biobank n): abs floor lifts to 1e-3.
-        let big = outer_gradient_tolerance_with_scale(1e-7, Some(1.0e6));
-        assert!(
-            (big.abs - 1.0e-3).abs() < 1e-12,
-            "expected abs ≈ 1e-3 for scale=1e6, got {}",
-            big.abs
-        );
-        // The widening lives entirely in `abs`; no relative component
-        // is reintroduced by the scale.
-        assert_eq!(big.rel_initial_grad, None);
-        assert_eq!(big.rel_cost, None);
-
-        // Scale below 1 leaves abs at the bare `tol` (max with floor).
-        let small = outer_gradient_tolerance_with_scale(1e-7, Some(10.0));
-        assert_eq!(small.abs, 1e-7);
-    }
-
-    #[test]
-    fn outer_gradient_tolerance_with_scale_rejects_non_finite_scale_via_filter() {
-        // The OuterProblem builder filters out non-finite / non-positive
-        // scales in `with_objective_scale`; the helper itself just
-        // honors whatever it is given. Calling with NaN exercises the
-        // numerical path: NaN comparisons are false, so the floor never
-        // triggers and abs stays at `tol`. The builder filter prevents
-        // this branch from being reached in production.
-        let nan_scaled = outer_gradient_tolerance_with_scale(1e-7, Some(f64::NAN));
-        assert!(
-            nan_scaled.abs.is_finite(),
-            "abs floor must stay finite even for NaN scale"
-        );
-        assert_eq!(
-            nan_scaled.abs, 1e-7,
-            "NaN scale must not lift the abs floor"
-        );
-    }
-
-    #[test]
-    fn outer_gradient_absolute_floor_lifts_with_objective_scale() {
-        // Helper used both as opt's gradient tolerance and as a
-        // shared cross-check elsewhere; the contract is the magnitude-
-        // scaled floor without the relative components.
-        assert_eq!(outer_gradient_absolute_floor(1e-5, None), 1e-5);
-        // scale*1e-9 below tolerance leaves the floor at tolerance.
-        assert_eq!(outer_gradient_absolute_floor(1e-5, Some(100.0)), 1e-5);
-        // scale*1e-9 above tolerance lifts the floor.
-        assert!(
-            (outer_gradient_absolute_floor(1e-5, Some(1.0e6)) - 1.0e-3).abs() < 1e-14,
-            "n=1e6 should lift the abs floor to 1e-3"
-        );
-    }
+    // The two `outer_scaled_tolerance_*` tests that lived here have
+    // been removed: the helper is gone in favor of opt 0.5.0's
+    // `GradientTolerance::relative_to_cost(τ)`. Equivalent threshold
+    // coverage now lives upstream as
+    // `opt::tests::gradient_tolerance_relative_to_cost_matches_textbook_form`.
 
     struct FailingSeedMaterializationOperator {
         dim: usize,
@@ -6257,10 +5869,7 @@ mod tests {
         }
 
         fn materialize_dense(&self) -> Result<Array2<f64>, String> {
-            Err(OuterStrategyError::OperatorShape {
-                reason: "seed materialization failed".to_string(),
-            }
-            .into())
+            Err("seed materialization failed".to_string())
         }
     }
 
@@ -6977,8 +6586,8 @@ mod tests {
     /// Phase 1.1 — On `HessianSource::Analytic` the bridge MUST surface a
     /// fatal error rather than producing `SecondOrderSample { hessian: None }`
     /// when the runtime returns `HessianResult::Unavailable`. A `None` here
-    /// would let `opt::SecondOrderCache` silently synthesize the Hessian from
-    /// gradient probes — at biobank
+    /// would let `opt::SecondOrderCache::finite_difference_hessian` silently
+    /// estimate the Hessian by finite-differencing the gradient — at biobank
     /// scale, hours of work per silently-mis-routed step. The seed loop
     /// should retry, demote, or fail loudly instead.
     #[test]
@@ -6999,7 +6608,6 @@ mod tests {
                     cost: theta[0] * theta[0],
                     gradient: array![2.0 * theta[0]],
                     hessian: HessianResult::Unavailable,
-                    inner_beta_hint: None,
                 })
             },
             None::<fn(&mut ())>,
@@ -7926,14 +7534,6 @@ mod tests {
             !result.converged,
             "test fixture is engineered so the ladder cannot converge; \
              converged=true would mean the fixture stopped exercising the ladder"
-        );
-        let cached = session
-            .try_load()
-            .expect("non-converged run should leave a best-known checkpoint");
-        assert_eq!(
-            cached.kind,
-            crate::cache::EntryKind::Checkpoint,
-            "non-converged outer results must not be promoted to final warm starts"
         );
     }
 

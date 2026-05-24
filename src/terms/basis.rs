@@ -5499,102 +5499,6 @@ impl ImplicitDesignPsiDerivative {
         })
     }
 
-    /// All-axis variant of [`Self::row_chunk_first_raw`]: produces the raw
-    /// first-order kernel scalars for every ψ-axis in a single sweep over
-    /// (row, knot) pairs. The radial scalars `(phi, q, r²)` only depend on
-    /// `r²` — not on the axis — so an N-axis Duchon term that previously
-    /// invoked `compute_pair` N× per (row, knot) now invokes it once and
-    /// fills N output matrices cheaply. Transformed `axis_combinations`
-    /// remap axes nontrivially, so defer to the per-axis path in that case.
-    pub fn row_chunk_first_raw_all_axes(
-        &self,
-        rows: std::ops::Range<usize>,
-    ) -> Result<Vec<Array2<f64>>, BasisError> {
-        let n_axes = self.n_axes();
-        if self.axis_combinations.is_some() {
-            let mut out = Vec::with_capacity(n_axes);
-            for a in 0..n_axes {
-                out.push(self.row_chunk_first_raw(a, rows.clone())?);
-            }
-            return Ok(out);
-        }
-        let c = self.psi_scale_share;
-        let chunk_n = rows.end - rows.start;
-        let mut out: Vec<Array2<f64>> = (0..n_axes)
-            .map(|_| Array2::<f64>::zeros((chunk_n, self.n_knots)))
-            .collect();
-        if let Some(st) = self.streaming.as_ref() {
-            let mut sb = vec![0.0; self.n_axes];
-            if let Some(cache) = st.ensure_triplet_cache() {
-                for (local, i) in rows.clone().enumerate() {
-                    let base = i * self.n_knots;
-                    for j in 0..self.n_knots {
-                        let idx = base + j;
-                        st.fill_s_buf(i, j, &mut sb);
-                        let phi = cache.phi[idx];
-                        let q = cache.q[idx];
-                        let cphi = c * phi;
-                        for a in 0..n_axes {
-                            out[a][[local, j]] = q * sb[a] + cphi;
-                        }
-                    }
-                }
-            } else {
-                for (local, i) in rows.clone().enumerate() {
-                    for j in 0..self.n_knots {
-                        let (phi, q, _t) = st.compute_pair(i, j, &mut sb)?;
-                        let cphi = c * phi;
-                        for a in 0..n_axes {
-                            out[a][[local, j]] = q * sb[a] + cphi;
-                        }
-                    }
-                }
-            }
-        } else {
-            // axis_components is laid out as (total_rows*n_knots, n_axes).
-            // Read each row once via a slice to avoid n_axes strided indexed
-            // accesses per (i, j) pair.
-            let axis_std = self.axis_components.is_standard_layout();
-            let axis_slice_opt = if axis_std {
-                self.axis_components.as_slice()
-            } else {
-                None
-            };
-            if let Some(axis_slice) = axis_slice_opt {
-                let n_total_axes = self.axis_components.ncols();
-                for (local, i) in rows.clone().enumerate() {
-                    let base = i * self.n_knots;
-                    for j in 0..self.n_knots {
-                        let idx = base + j;
-                        let phi = self.phi_values[idx];
-                        let q = self.q_values[idx];
-                        let cphi = c * phi;
-                        let axis_row =
-                            &axis_slice[idx * n_total_axes..idx * n_total_axes + n_total_axes];
-                        for a in 0..n_axes {
-                            out[a][[local, j]] = q * axis_row[a] + cphi;
-                        }
-                    }
-                }
-            } else {
-                for (local, i) in rows.clone().enumerate() {
-                    let base = i * self.n_knots;
-                    for j in 0..self.n_knots {
-                        let idx = base + j;
-                        let phi = self.phi_values[idx];
-                        let q = self.q_values[idx];
-                        let cphi = c * phi;
-                        for a in 0..n_axes {
-                            let s = self.axis_components[[idx, a]];
-                            out[a][[local, j]] = q * s + cphi;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
-
     pub fn row_chunk_second_diag(
         &self,
         axis: usize,
@@ -18538,84 +18442,40 @@ pub fn create_duchon_spline_basiswithworkspace(
 }
 
 /// Multiplicative amplification factor that lifts an underflowing Duchon
-/// kernel back into a representable range. The probe constructs the centers
-/// kernel matrix `K_CC` and its polynomial-orthogonal projection `K_CC · Z`,
-/// measures the per-entry RMS of `K_CC · Z`, and returns a multiplier that
-/// raises that scale to a fixed amplification floor when the residual lives
-/// near double-precision noise. Returns `1.0` whenever the basis is already
-/// well-conditioned.
+/// kernel back into a representable range. Probes max|K_CC| (the kernel at
+/// every center pair) and returns `1/max` when the kernel collapses to the
+/// double-precision noise floor; otherwise returns `1.0`.
 ///
-/// **Why**: there are two distinct underflow regimes, and probing only the
-/// raw kernel catches just one of them.
+/// **Why**: in high d with a small length scale the spectral normalization
+/// `c = κ^{d/2-n} / ((2π)^{d/2}·2^{n-1}·Γ(n))` of the Matérn block is `~1e-14`,
+/// driving every `K(r) = c · r^ν · K_ν(κr)` to `~1e-16`. Downstream
+/// `B^T B` is then at `~1e-32` — below `eps²` — and the spectral whitener
+/// truncates everything as noise, even though the basis is mathematically
+/// well-defined.
 ///
-///   1. *Spectral coefficient underflow* (the original biobank-CTN case):
-///      with high `d` and small length scale the Matérn normalization
-///      `c = κ^{d/2-n} / ((2π)^{d/2}·2^{n-1}·Γ(n))` itself collapses to
-///      `~1e-14`, so every `K(r) = c · r^ν · K_ν(κr)` is `~1e-16` and even
-///      `max|K_CC|` is at noise.
-///
-///   2. *Post-projection underflow* (the d=10 hybrid case): `max|K_CC|`
-///      is moderate (e.g. `~1e-5`) but the kernel is nearly proportional to
-///      the constant `1` across centers — the partial-fraction expansion
-///      cancels almost completely on the relevant data scale, leaving only a
-///      tiny residual once `Z` strips the polynomial direction. `B = K · Z`
-///      then has column norms `~1e-10`, `B^T B` is at `~1e-20`, and the
-///      downstream parametric-orthogonality whitener truncates the entire
-///      spectrum as noise — surfacing as `ConstraintNullspaceCollapsed` from
-///      `positive_spectral_whitener_from_gram`.
-///
-/// Probing `K_CC · Z` instead of `K_CC` covers both regimes uniformly: in
-/// regime (1) `||K_CC·Z||` collapses with `||K_CC||`, in regime (2) only
-/// `||K_CC·Z||` collapses. Rescaling the basis by `α` produces the same
-/// predictions (β rescales by `α`, REML's λ adapts). Since the probe is
-/// determined entirely by `centers + kernel parameters + nullspace order` —
-/// all stored verbatim in `BasisMetadata::Duchon` — prediction recomputes
-/// an identical `α`, so fit-time and predict-time bases share a single
-/// coefficient frame.
+/// Rescaling the basis by α = 1/max|K_CC| produces the same predictions
+/// (β rescales by α, REML's λ adapts). Since the probe is computed from
+/// `centers + kernel parameters` which are stored verbatim in
+/// `BasisMetadata::Duchon`, prediction recomputes an identical α — so
+/// fit-time and predict-time bases share a single coefficient frame.
 fn duchon_kernel_amplification(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
     p_order: usize,
-    s_order: f64,
+    s_order: usize,
     d: usize,
     aniso_log_scales: Option<&[f64]>,
     coeffs: Option<&DuchonPartialFractionCoeffs>,
     pure_poly_coeff: Option<&PolyharmonicBlockCoeff>,
-    nullspace_order: DuchonNullspaceOrder,
-    cache: &mut BasisCacheContext,
-) -> Result<f64, BasisError> {
-    // Choose an amplification α so that the basis the rest of the pipeline
-    // sees — `B = (α · K) · Z`, where `Z` spans the null-space of the
-    // polynomial side conditions on the *centers* — sits in a range where
-    // `B^T B` clears double-precision noise. Probing only `max|K_CC|` (the
-    // raw kernel) is insufficient: with hybrid Matérn-Duchon kernels in
-    // moderate-to-high `d` the partial-fraction expansion can leave a
-    // nearly-constant kernel matrix whose `||K_CC·Z||` is many orders of
-    // magnitude smaller than `max|K_CC|`. The constant slice gets absorbed
-    // by `Z` (the polynomial-orthogonal projector) and the residual basis
-    // collapses to numerical zero, so the downstream parametric
-    // orthogonalization has nothing to whiten and aborts with
-    // `ConstraintNullspaceCollapsed`.
-    //
-    // We therefore probe the *post-Z* center-Gram norm directly:
-    //   m_post = ‖(K_CC · Z) · (K_CC · Z)^T‖_F   (proportional to ‖B^T B‖)
-    // and amplify when `m_post` is at or below ~1e-10 (well above the
-    // ~1e-15 noise floor but still tiny compared with any meaningful
-    // smoothing-relevant scale). This is the same well-posedness probe the
-    // original `max|K_CC|` heuristic targeted, applied to the right
-    // matrix. Centers-only — O(k³) per build, dwarfed by the n×k design
-    // assembly. Returns `α` so prediction-time code can recompute the same
-    // factor from `(centers, kernel_params)` and stay coefficient-frame-
-    // consistent with the fitted basis.
+) -> f64 {
     let k = centers.nrows();
     if k == 0 {
-        return Ok(1.0);
+        return 1.0;
     }
     let axis_scales = aniso_log_scales.map(aniso_axis_scales);
-    let mut k_cc = Array2::<f64>::zeros((k, k));
-    let mut nonzero = false;
+    let mut max_abs = 0.0_f64;
     for i in 0..k {
-        for j in 0..k {
+        for j in i..k {
             let r = if let Some(scales) = axis_scales.as_deref() {
                 aniso_distance_rows_with_scales(centers, i, centers, j, scales)
             } else {
@@ -18628,49 +18488,26 @@ fn duchon_kernel_amplification(
                     r,
                     length_scale,
                     p_order,
-                    duchon_power_to_usize(s_order),
+                    s_order,
                     d,
                     coeffs,
                 ) {
                     Ok(v) => v,
-                    Err(_) => 0.0,
+                    Err(_) => continue,
                 }
             };
-            k_cc[[i, j]] = val;
-            if val != 0.0 {
-                nonzero = true;
+            if val.abs() > max_abs {
+                max_abs = val.abs();
             }
         }
     }
-    if !nonzero {
-        return Ok(1.0);
-    }
-
-    // Project K_CC onto the polynomial null-space; amplification must
-    // protect ‖K_CC·Z‖, not ‖K_CC‖.
-    let z = kernel_constraint_nullspace(centers, nullspace_order, cache)?;
-    let kz = fast_ab(&k_cc, &z);
-    let post_fro_sq: f64 = kz.iter().map(|v| v * v).sum();
-    if post_fro_sq == 0.0 {
-        // Pathological: nothing survives the polynomial projection. No
-        // amount of amplification can rescue a zero basis; let the
-        // downstream check emit its own diagnostic.
-        return Ok(1.0);
-    }
-    // Per-entry RMS of (K_CC·Z) — the scale that drives B's column norms.
-    let denom = (kz.nrows() * kz.ncols()).max(1) as f64;
-    let post_rms = (post_fro_sq / denom).sqrt();
-    // Threshold matches the original 1e-10 intent: keep well-conditioned
-    // bases (α = 1) while rescuing kernels whose post-Z residual lives
-    // anywhere near double-precision noise (~1e-15). The 1e-5 ceiling
-    // leaves five decades of headroom above noise so chained operations
-    // (B^T B, eigendecomposition, whitening) stay in the regime where
-    // relative errors are tracked, not dominated by absolute roundoff.
-    let amp_floor = 1e-5_f64;
-    if post_rms >= amp_floor {
-        Ok(1.0)
+    // Only amplify when the kernel has underflowed. The 1e-10 threshold is
+    // well above any meaningful smoothing-relevant kernel scale yet far from
+    // 1.0, so well-conditioned kernels pass through unchanged (α = 1).
+    if max_abs > 0.0 && max_abs < 1e-10 {
+        1.0 / max_abs
     } else {
-        Ok(amp_floor / post_rms)
+        1.0
     }
 }
 
@@ -18783,14 +18620,12 @@ fn build_duchon_basis_designwithworkspace(
         centers,
         length_scale,
         p_order,
-        s_order as f64,
+        s_order,
         d,
         aniso_log_scales,
         coeffs.as_ref(),
         pure_poly_coeff.as_ref(),
-        nullspace_order,
-        &mut workspace.cache,
-    )?;
+    );
     let mut basis = Array2::<f64>::zeros((n, total_cols));
     // Process rows in chunks to amortize thread-local allocation across many rows.
     // Use larger chunks (1024) for better cache utilization at biobank scale.
@@ -20550,9 +20385,7 @@ pub fn build_duchon_basiswithworkspace(
             aniso.as_deref(),
             coeffs.as_ref(),
             pure_poly_coeff.as_ref(),
-            effective_nullspace_order,
-            &mut workspace.cache,
-        )?;
+        );
         let base_design = if let Some(eta) = aniso.as_ref() {
             let metric_weights = eta.iter().map(|&v| (2.0 * v).exp()).collect::<Vec<_>>();
             let coeffs = coeffs.clone();

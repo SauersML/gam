@@ -1,6 +1,6 @@
 [package]
 name = "gam"
-version = "0.3.65"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.93"
 autobins = false
@@ -50,7 +50,7 @@ rand = "0.10.1"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
-opt = "0.5.11"
+opt = "0.5.2"
 log = "0.4.29"
 csv = "1.4.0"
 faer = "0.24.0"
@@ -154,11 +154,6 @@ harness = false
 [[bench]]
 name = "bms_hv_row_skip"
 path = "bench/cargo_benches/bms_hv_row_skip.rs"
-harness = false
-
-[[bench]]
-name = "bms_hw_cross_terms"
-path = "bench/cargo_benches/bms_hw_cross_terms.rs"
 harness = false
 
 [profile.release]

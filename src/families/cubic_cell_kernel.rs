@@ -1319,37 +1319,15 @@ impl CachedCellMoments {
 
 impl ResidentBytes for CachedCellMoments {
     fn resident_bytes(&self) -> usize {
-        let value_spilled = self
-            .state
-            .as_ref()
-            .map(|s| {
-                let s = s.as_ref();
-                if s.moments.spilled() {
-                    s.moments
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<f64>())
-                } else {
-                    0
-                }
-            })
-            .unwrap_or(0);
-        let deriv_spilled = self
-            .derivative_state
-            .as_ref()
-            .map(|s| {
-                let s = s.as_ref();
-                if s.moments.spilled() {
-                    s.moments
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<f64>())
-                } else {
-                    0
-                }
-            })
-            .unwrap_or(0);
-        std::mem::size_of::<Self>()
-            .saturating_add(value_spilled)
-            .saturating_add(deriv_spilled)
+        let spilled_bytes = if self.state.moments.spilled() {
+            self.state
+                .moments
+                .capacity()
+                .saturating_mul(std::mem::size_of::<f64>())
+        } else {
+            0
+        };
+        std::mem::size_of::<Self>().saturating_add(spilled_bytes)
     }
 }
 
@@ -1360,6 +1338,11 @@ pub struct CellMomentCacheStats {
 }
 
 impl CellMomentCacheStats {
+    #[inline]
+    pub fn record_miss(&self) {
+        self.misses.fetch_add(1, Ordering::Relaxed);
+    }
+
     #[inline]
     pub fn snapshot(&self) -> (u64, u64) {
         (
@@ -3140,61 +3123,17 @@ fn evaluate_affine_cell_derivative_state(
     })
 }
 
-/// Accumulate `moment_weight * z^k` into `moments[k]` for `k = 0..moments.len()`
-/// using a 4-way unrolled slab that breaks the `z_pow *= z` serial dependency
-/// chain of the naive formulation. Each group of four FMAs is independent
-/// (they share only the multiplicative power `z^(4j)`), letting the backend
-/// issue them in parallel.
-///
-/// Numerical contract: each slot still receives exactly one FMA per call,
-/// with operands `(mw, z^k, *slot)`. The per-iteration powers `z^k,
-/// z^(k+1), z^(k+2), z^(k+3)` are formed via `z_pow`, `z·z_pow`,
-/// `z²·z_pow`, `z³·z_pow` with `z_pow` advanced by `*= z^4` between blocks;
-/// this is a different multiplication tree than the scalar `z_pow *= z`
-/// chain, so individual `z^k` values can differ in the last ULP, but the
-/// downstream moment is a smooth function of those powers and the resulting
-/// drift is well within the GL quadrature error.
-#[inline(always)]
-fn accumulate_moments_unrolled4(moments: &mut [f64], moment_weight: f64, z: f64) {
-    let n = moments.len();
-    let z2 = z * z;
-    let z3 = z2 * z;
-    let z4 = z2 * z2;
-    let mut z_pow = 1.0_f64;
-    let chunks = n / 4;
-    let tail = n % 4;
-    let mut idx = 0;
-    for _ in 0..chunks {
-        let p0 = z_pow;
-        let p1 = z * z_pow;
-        let p2 = z2 * z_pow;
-        let p3 = z3 * z_pow;
-        // SAFETY: idx + 3 < n because idx advances in steps of 4 over
-        // `chunks` blocks, with chunks = n / 4.
-        unsafe {
-            let s0 = moments.get_unchecked_mut(idx);
-            *s0 = moment_weight.mul_add(p0, *s0);
-            let s1 = moments.get_unchecked_mut(idx + 1);
-            *s1 = moment_weight.mul_add(p1, *s1);
-            let s2 = moments.get_unchecked_mut(idx + 2);
-            *s2 = moment_weight.mul_add(p2, *s2);
-            let s3 = moments.get_unchecked_mut(idx + 3);
-            *s3 = moment_weight.mul_add(p3, *s3);
-        }
-        z_pow *= z4;
-        idx += 4;
-    }
-    // Scalar tail (0..=3 remaining slots).
-    for j in 0..tail {
-        let slot = &mut moments[idx + j];
-        let p = match j {
-            0 => 1.0,
-            1 => z,
-            2 => z2,
-            _ => z3,
-        } * z_pow;
-        *slot = moment_weight.mul_add(p, *slot);
-    }
+fn evaluate_affine_cell_derivative_state(
+    cell: DenestedCubicCell,
+    max_degree: usize,
+) -> Result<CellDerivativeMomentState, String> {
+    let alpha = cell.c0;
+    let beta = cell.c1;
+    let moments = affine_anchor_moment_vector(alpha, beta, cell.left, cell.right, max_degree);
+    Ok(CellDerivativeMomentState {
+        branch: ExactCellBranch::Affine,
+        moments: moments.into(),
+    })
 }
 
 fn evaluate_non_affine_cell_state(
@@ -3208,17 +3147,6 @@ fn evaluate_non_affine_cell_state(
     // step recurrences in reduce_quartic/sextic_moments, which amplify
     // roundoff by (1/lead)^n with lead = 2c2²/3c3² and overflow to NaN for
     // small c2/c3 cells that arise naturally in production.
-    //
-    // Hot-path notes:
-    //   * `cell.eta(z)` is computed once via Horner and reused both to form
-    //     `q(z) = 0.5*(z² + η²)` and to feed `normal_cdf(eta)`; the previous
-    //     formulation called `cell.q(z)` which redundantly recomputed η.
-    //   * `half_width` is folded into the per-node weight, eliminating the
-    //     post-loop scaling pass over `moments` and the trailing
-    //     `* half_width` on `value_integral`.
-    //   * The inner moment accumulation reborrows the moments slice as `&mut
-    //     [f64]` and steps via raw indexing so the compiler emits a clean
-    //     bounds-check-hoisted FMA chain.
     let mut moments: CellMomentVec = smallvec![0.0_f64; max_degree + 1];
     let mut value_integral = 0.0_f64;
     let center = 0.5 * (cell.left + cell.right);
@@ -3314,65 +3242,17 @@ fn evaluate_non_affine_cell_derivative_state(
     let mut moments: CellMomentVec = smallvec![0.0_f64; max_degree + 1];
     let center = 0.5 * (cell.left + cell.right);
     let half_width = 0.5 * (cell.right - cell.left);
-    let c0 = cell.c0;
-    let c1 = cell.c1;
-    let c2 = cell.c2;
-    let c3 = cell.c3;
-    let moments_slice: &mut [f64] = &mut moments;
-    debug_assert_eq!(GL_NODES.len(), GL_WEIGHTS.len());
-    // See `evaluate_non_affine_cell_state` for the SIMD strategy. The
-    // derivative variant only needs `exp(-q)` (no value integral and so no
-    // second `exp` per node), but the same 4-wide GL batching still amortizes
-    // the single `exp` call across 4 lanes.
-    use wide::f64x4;
-    let center_v = f64x4::splat(center);
-    let half_width_v = f64x4::splat(half_width);
-    let c0_v = f64x4::splat(c0);
-    let c1_v = f64x4::splat(c1);
-    let c2_v = f64x4::splat(c2);
-    let c3_v = f64x4::splat(c3);
-    let neg_half_v = f64x4::splat(-0.5);
-    let n_total = GL_NODES.len();
-    let n_simd = n_total - (n_total % 4);
-    let mut i = 0;
-    while i < n_simd {
-        let node_v = f64x4::from([
-            GL_NODES[i],
-            GL_NODES[i + 1],
-            GL_NODES[i + 2],
-            GL_NODES[i + 3],
-        ]);
-        let weight_v = f64x4::from([
-            GL_WEIGHTS[i],
-            GL_WEIGHTS[i + 1],
-            GL_WEIGHTS[i + 2],
-            GL_WEIGHTS[i + 3],
-        ]);
-        let z_v = half_width_v.mul_add(node_v, center_v);
-        let eta_v = c3_v
-            .mul_add(z_v, c2_v)
-            .mul_add(z_v, c1_v)
-            .mul_add(z_v, c0_v);
-        let z2_v = z_v * z_v;
-        let neg_q_v = neg_half_v * (z2_v + eta_v * eta_v);
-        let scaled_weight_v = weight_v * half_width_v;
-        let moment_weight_v = scaled_weight_v * neg_q_v.exp();
-        let z_arr = z_v.to_array();
-        let mw_arr = moment_weight_v.to_array();
-        for lane in 0..4 {
-            accumulate_moments_unrolled4(moments_slice, mw_arr[lane], z_arr[lane]);
-        }
-        i += 4;
-    }
-    while i < n_total {
-        let node = GL_NODES[i];
-        let weight = GL_WEIGHTS[i];
+    for (&node, &weight) in GL_NODES.iter().zip(GL_WEIGHTS.iter()) {
         let z = center + half_width * node;
-        let eta = c3.mul_add(z, c2).mul_add(z, c1).mul_add(z, c0);
-        let q = 0.5 * (z * z + eta * eta);
-        let moment_weight = (weight * half_width) * (-q).exp();
-        accumulate_moments_unrolled4(moments_slice, moment_weight, z);
-        i += 1;
+        let moment_weight = weight * (-cell.q(z)).exp();
+        let mut z_pow = 1.0_f64;
+        for moment in &mut moments {
+            *moment = moment_weight.mul_add(z_pow, *moment);
+            z_pow *= z;
+        }
+    }
+    for moment in &mut moments {
+        *moment *= half_width;
     }
     Ok(CellDerivativeMomentState { branch, moments })
 }
@@ -3513,6 +3393,67 @@ fn evaluate_cell_state_dispatched<S>(
         }
     }
     non_affine(cell, branch, max_degree)
+}
+
+/// Evaluate only the moment vector needed by derivative contractions.
+///
+/// This deliberately does not compute the cell probability value
+/// `∫ φ(z) Φ(η(z)) dz`. Derivative contractions consume
+/// `∫ z^k exp(-q(z)) dz` moments only, so keeping the value out of the return
+/// type prevents this cheaper evaluator from satisfying value-bearing calls.
+pub fn evaluate_cell_derivative_moments_uncached(
+    cell: DenestedCubicCell,
+    max_degree: usize,
+) -> Result<CellDerivativeMomentState, String> {
+    let left_inf = !cell.left.is_finite();
+    let right_inf = !cell.right.is_finite();
+    if left_inf || right_inf {
+        if cell.c2.abs() > NORMALIZED_CELL_BRANCH_TOL || cell.c3.abs() > NORMALIZED_CELL_BRANCH_TOL
+        {
+            return Err(format!(
+                "semi-infinite cell [{}, {}] must be affine (c2=c3=0), got c2={:.3e}, c3={:.3e}",
+                cell.left, cell.right, cell.c2, cell.c3
+            ));
+        }
+        return evaluate_affine_cell_derivative_state(cell, max_degree);
+    }
+    if cell.right <= cell.left {
+        return Err(format!(
+            "finite cell must have left < right, got [{}, {}]",
+            cell.left, cell.right
+        ));
+    }
+    let branch = branch_cell(cell)?;
+    if branch == ExactCellBranch::Affine {
+        return evaluate_affine_cell_derivative_state(cell, max_degree);
+    }
+    if branch == ExactCellBranch::Sextic {
+        let lead = sextic_qprime_coefficients(cell.c0, cell.c1, cell.c2, cell.c3)[5];
+        if !lead.is_finite() {
+            return Err(format!(
+                "sextic cell evaluation encountered non-finite leading coefficient: {lead:.3e}"
+            ));
+        }
+        if let Some(lower_branch) = degenerate_sextic_branch(cell, lead)? {
+            return match lower_branch {
+                ExactCellBranch::Quartic => evaluate_non_affine_cell_derivative_state(
+                    DenestedCubicCell { c3: 0.0, ..cell },
+                    ExactCellBranch::Quartic,
+                    max_degree,
+                ),
+                ExactCellBranch::Affine => evaluate_affine_cell_derivative_state(
+                    DenestedCubicCell {
+                        c2: 0.0,
+                        c3: 0.0,
+                        ..cell
+                    },
+                    max_degree,
+                ),
+                ExactCellBranch::Sextic => unreachable!("sextic cannot be a lowered branch"),
+            };
+        }
+    }
+    evaluate_non_affine_cell_derivative_state(cell, branch, max_degree)
 }
 
 /// Evaluate a de-nested cubic cell through a fit-lifetime byte-limited LRU cache.
