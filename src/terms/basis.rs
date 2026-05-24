@@ -1,6 +1,6 @@
 use crate::faer_ndarray::{
-    FaerCholesky, FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb,
-    rrqr_nullspace_basis,
+    FaerCholesky, FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_abt,
+    fast_ata, fast_atb, rrqr_nullspace_basis,
 };
 use crate::linalg::utils::{KahanSum, StableSolver};
 use crate::matrix::{
@@ -13648,7 +13648,13 @@ struct ConstraintNullspaceCacheKey {
     centersrows: usize,
     centers_cols: usize,
     centers_hash: u64,
-    order_code: u8,
+    order: ConstraintNullspaceOrderKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ConstraintNullspaceOrderKey {
+    Duchon(DuchonNullspaceOrder),
+    ThinPlate,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -13745,19 +13751,6 @@ fn hash_arrayview2(values: ArrayView2<'_, f64>) -> u64 {
     hasher.finish()
 }
 
-fn constraint_nullspace_order_code(order: DuchonNullspaceOrder) -> u8 {
-    match order {
-        DuchonNullspaceOrder::Zero => 0,
-        DuchonNullspaceOrder::Linear => 1,
-        DuchonNullspaceOrder::Degree(degree) => degree.min(u8::MAX as usize) as u8,
-    }
-}
-
-#[inline(always)]
-fn thin_plate_constraint_nullspace_order_code() -> u8 {
-    16
-}
-
 fn shared_owned_data_matrix(
     data: ArrayView2<'_, f64>,
     cache: &BasisCacheContext,
@@ -13814,7 +13807,7 @@ fn kernel_constraint_nullspace(
         centersrows: centers.nrows(),
         centers_cols: centers.ncols(),
         centers_hash: hash_arrayview2(centers),
-        order_code: constraint_nullspace_order_code(effective_order),
+        order: ConstraintNullspaceOrderKey::Duchon(effective_order),
     };
 
     if let Some(hit) = cache.constraint_nullspace.map.get(&key) {
@@ -13861,7 +13854,7 @@ fn thin_plate_kernel_constraint_nullspace(
         centersrows: centers.nrows(),
         centers_cols: centers.ncols(),
         centers_hash: hash_arrayview2(centers),
-        order_code: thin_plate_constraint_nullspace_order_code(),
+        order: ConstraintNullspaceOrderKey::ThinPlate,
     };
 
     if let Some(hit) = cache.constraint_nullspace.map.get(&key) {
@@ -22004,7 +21997,7 @@ pub fn applyweighted_orthogonality_constraint(
     // M = B^T W C. Its transpose M^T has nullspace directions in coefficient space
     // that produce basis columns orthogonal to C under the W-inner product.
     let constraint_cross = basis_matrix.t().dot(&weighted_constraints); // k×q
-    let gram = fast_ata(&basis_matrix.to_owned());
+    let gram = fast_ata(&basis_matrix);
     let transform = orthogonality_transform_from_cross_and_gram(&constraint_cross, &gram)?;
     let basis_orthonormal = fast_ab(&basis_matrix, &transform);
     Ok((basis_orthonormal, transform))

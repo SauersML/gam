@@ -63,6 +63,12 @@ pub enum MatrixMaterializationError {
     #[error("{context}: operator does not implement chunked row access")]
     MissingRowChunk { context: &'static str },
 
+    #[error("{context}: row materialization failed: {reason}")]
+    RowMaterializationFailed {
+        context: &'static str,
+        reason: String,
+    },
+
     #[error("{context}: materialization forbidden by policy (mode={mode:?})")]
     Forbidden {
         context: &'static str,

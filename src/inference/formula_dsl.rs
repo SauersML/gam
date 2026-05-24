@@ -873,11 +873,11 @@ pub fn option_usize_strict(
 ) -> Result<Option<usize>, String> {
     match map.get(key) {
         None => Ok(None),
-        Some(raw) => raw.parse::<usize>().map(Some).map_err(|_| {
+        Some(raw) => raw.parse::<usize>().map(Some).map_err(|err| {
             FormulaDslError::InvalidArgument {
                 reason: format!(
                     "option `{key}={raw}` is not a non-negative integer; \
-                     expected a whole number ≥ 0"
+                     expected a whole number >= 0: {err}"
                 ),
             }
             .into()
@@ -915,9 +915,9 @@ pub fn option_f64_strict(map: &BTreeMap<String, String>, key: &str) -> Result<Op
                 reason: format!("option `{key}={raw}` parses as {v} which is not a finite number"),
             }
             .into()),
-            Err(_) => Err(FormulaDslError::InvalidArgument {
+            Err(err) => Err(FormulaDslError::InvalidArgument {
                 reason: format!(
-                    "option `{key}={raw}` is not a valid number; expected a finite decimal"
+                    "option `{key}={raw}` is not a valid number; expected a finite decimal: {err}"
                 ),
             }
             .into()),
@@ -978,10 +978,10 @@ fn parse_required_f64_option(
         .ok_or_else(|| FormulaDslError::MalformedConfig {
             reason: format!("bounded() is missing required '{key}' argument: {raw}"),
         })?;
-    value.parse::<f64>().map_err(|_| {
+    value.parse::<f64>().map_err(|err| {
         FormulaDslError::InvalidArgument {
             reason: format!(
-                "bounded() argument '{key}' must be a finite number, got '{}': {raw}",
+                "bounded() argument '{key}' must be a finite number, got '{}': {err}: {raw}",
                 value
             ),
         }
@@ -995,10 +995,10 @@ fn parse_optional_f64_option(
     raw: &str,
 ) -> Result<Option<f64>, String> {
     match options.get(key) {
-        Some(value) => value.parse::<f64>().map(Some).map_err(|_| {
+        Some(value) => value.parse::<f64>().map(Some).map_err(|err| {
             FormulaDslError::InvalidArgument {
                 reason: format!(
-                    "bounded() argument '{key}' must be a finite number, got '{}': {raw}",
+                    "bounded() argument '{key}' must be a finite number, got '{}': {err}: {raw}",
                     value
                 ),
             }
@@ -1019,9 +1019,9 @@ fn parse_optional_f64_option_alias(
         if let Some(value) = options.get(*key) {
             let parsed = value
                 .parse::<f64>()
-                .map_err(|_| FormulaDslError::InvalidArgument {
+                .map_err(|err| FormulaDslError::InvalidArgument {
                     reason: format!(
-                        "{fn_label}() argument '{key}' must be a finite number, got '{}': {raw}",
+                        "{fn_label}() argument '{key}' must be a finite number, got '{}': {err}: {raw}",
                         value
                     ),
                 })?;

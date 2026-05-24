@@ -8284,7 +8284,7 @@ fn parse_comma_f64(v: &str, label: &str) -> Result<Vec<f64>, String> {
         }
         let parsed = t
             .parse::<f64>()
-            .map_err(|_| format!("{label} contains non-numeric value '{t}'"))?;
+            .map_err(|err| format!("{label} contains non-numeric value '{t}': {err}"))?;
         if !parsed.is_finite() {
             return Err(format!("{label} contains non-finite value '{t}'"));
         }
@@ -8506,6 +8506,10 @@ fn parse_survival_inverse_link(args: &SurvivalArgs) -> Result<InverseLink, Strin
                 .map(InverseLink::BetaLogistic)
                 .map_err(|e| format!("invalid survival Beta-Logistic link state: {e}"))
             }
+            LinkFunction::Log => Err(format!(
+                "unsupported survival --link 'log'; {}",
+                survival_link_usage()
+            )),
             other => {
                 if args.sas_init.is_some() {
                     return Err("--sas-init requires --link sas".to_string());
@@ -8968,8 +8972,8 @@ fn invert_symmetric_matrix(a: &Array2<f64>) -> Result<Array2<f64>, CliError> {
         rhs[(i, i)] = 1.0;
     }
     let factor = gam::faer_ndarray::factorize_symmetricwith_fallback(h.as_ref(), Side::Lower)
-        .map_err(|_| CliError::Internal {
-            reason: "failed to factorize matrix for inversion".to_string(),
+        .map_err(|err| CliError::Internal {
+            reason: format!("failed to factorize matrix for inversion: {err}"),
         })?;
     factor.solve_in_place(rhs.as_mut());
     let mut out = Array2::<f64>::zeros((n, n));

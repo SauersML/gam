@@ -2216,7 +2216,7 @@ impl FittedModel {
                     PredictModelClass::BinomialLocationScale
                 }
             }
-            _ => PredictModelClass::Standard,
+            ModelKind::Standard => PredictModelClass::Standard,
         };
         match class {
             PredictModelClass::Survival => {
@@ -2342,7 +2342,7 @@ impl FittedModel {
                 ..
             } => PredictModelClass::GaussianLocationScale,
             FittedFamily::LocationScale { .. } => PredictModelClass::BinomialLocationScale,
-            _ => PredictModelClass::Standard,
+            FittedFamily::Standard { .. } => PredictModelClass::Standard,
         }
     }
 

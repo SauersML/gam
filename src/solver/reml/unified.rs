@@ -6087,11 +6087,7 @@ fn assemble_h_raw_dense(op: &DenseSpectralOperator) -> Array2<f64> {
             }
         }
     }
-    // H = VS · Vᵀ. `fast_ab(A, B)` computes A·B; for A·Bᵀ use the
-    // transposed view via `fast_ab(&VS, &eigenvectors.t().to_owned())`.
-    // Avoid the explicit transpose copy by going through `fast_abt`
-    // when available; otherwise an explicit transpose is acceptable
-    // because the cost is O(p²) vs the O(p³) matmul.
+    // H = VS · Vᵀ without materializing Vᵀ.
     crate::faer_ndarray::fast_abt(&vs, &op.eigenvectors)
 }
 
