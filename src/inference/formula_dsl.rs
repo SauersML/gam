@@ -369,17 +369,17 @@ mod tests {
     }
 
     #[test]
-    fn parses_sphere_smooth_aliases() {
-        let parsed = parse_formula("y ~ sphere(lat, lon, degree=6)").expect("sphere formula");
-        let ParsedTerm::Smooth { vars, options, .. } = &parsed.terms[0] else {
-            panic!("expected smooth term");
-        };
-        assert_eq!(vars, &vec!["lat".to_string(), "lon".to_string()]);
-        assert_eq!(options.get("type").map(String::as_str), Some("sphere"));
-        assert_eq!(options.get("degree").map(String::as_str), Some("6"));
-
-        let err = parse_formula("y ~ sphere(lat)").expect_err("arity");
-        assert!(err.contains("expects exactly two variables"));
+    fn parses_cyclic_formula_aliases() {
+        let parsed = parse_formula("y ~ cyclic(theta, period_start=0, period_end=6.283)")
+            .expect("parse cyclic formula");
+        match &parsed.terms[0] {
+            super::ParsedTerm::Smooth { vars, options, .. } => {
+                assert_eq!(vars, &vec!["theta".to_string()]);
+                assert_eq!(options.get("type").map(String::as_str), Some("cyclic"));
+                assert_eq!(options.get("period_start").map(String::as_str), Some("0"));
+            }
+            other => panic!("expected cyclic smooth term, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1708,7 +1708,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
-            "smooth" | "s" | "cyclic" | "periodic" | "cc" | "cp" | "fs" | "sz" => {
+            "smooth" | "s" | "cyclic" | "cc" | "cp" => {
                 if vars.is_empty() {
                     return Err(FormulaDslError::InvalidArgument {
                         reason: format!("smooth()/s() requires at least one variable: {raw}"),
@@ -1752,7 +1752,9 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                         "sphere()/s2()/sos() expects exactly two variables (lat, lon): {raw}"
                     ));
                 }
-                options.insert("type".to_string(), "sphere".to_string());
+                if matches!(name.as_str(), "cyclic" | "cc" | "cp") {
+                    options.insert("type".to_string(), "cyclic".to_string());
+                }
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),
                     vars,
@@ -1781,6 +1783,11 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                         reason: format!("duchon() requires at least one variable: {raw}"),
                     }
                     .into());
+                }
+                if option_bool(&options, "cyclic").unwrap_or(false)
+                    || option_bool(&options, "periodic").unwrap_or(false)
+                {
+                    options.insert("cyclic".to_string(), "true".to_string());
                 }
                 options.insert("type".to_string(), "duchon".to_string());
                 return Ok(ParsedTerm::Smooth {
@@ -1908,7 +1915,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth() / s(), fs(), sz(), cyclic() / periodic() / cc() / cp(), thinplate() / tps(), tensor() / te(), group() / re(), sphere() / sos() / spherical(), matern(), duchon(), linkwiggle(), timewiggle(), link(), survmodel()"
+                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth(), cyclic()/cc()/cp(), thinplate(), tensor(), group(), matern(), duchon(), linkwiggle(), timewiggle(), link(), survmodel()"
                 ));
             }
         }

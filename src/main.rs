@@ -335,7 +335,7 @@ struct FitArgs {
     #[arg(
         value_name = "FORMULA",
         help = "Model formula, e.g. 'y ~ x + smooth(age) + bounded(mu_hat, min=0, max=1)'",
-        long_help = "Model formula using linear columns and term wrappers.\n\nLinear and constrained coefficients:\n- x or linear(x): ordinary penalized linear term (ridge-penalized by default)\n- linear(x, min=..., max=...): box-constrained linear coefficient via active-set\n- constrain(x, min=..., max=...) (aliases: constraint, box): same as linear with bounds\n- nonnegative(x) / nonpositive(x): sugar for sign-constrained linear\n- bounded(x, min=..., max=...): exact interval transform on x (distinct from constrained linear)\n  - prior=uniform | log-jacobian | jacobian: flat on original scale (log-Jacobian correction)\n  - prior=center: symmetric interior Beta prior\n  - target=t, strength=s: Beta prior parameterized by an interior target\n\nUnivariate smooths:\n- s(x) / smooth(x): cubic P-spline (B-spline + difference penalty)\n  - k= / basis_dim=, knots=, degree= (default 3), penalty_order= (default 2)\n  - bc= clamped | anchored | free (both endpoints); bc_left=/bc_right= for per-side\n  - anchor=/anchor_left=/anchor_right= for anchored endpoint values\n  - periodic=true, period=, period_start=, period_end= for cyclic 1-D smooths\n  - monotone_increasing=true / mpi (monotone non-decreasing); monotone_decreasing / mpd\n- bc(x) / boundary(x): sugar for s(x, bc=clamped); adds bc=anchored when any anchor= is set\n- cyclic(x) / periodic(x) / cc(x) / cp(x): 1-D periodic B-spline; period= required for raw scale\n\nMultivariate smooths (joint d-dimensional):\n- s(x1, x2, ...) defaults to thin-plate when d>=2; pass type= to switch:\n  - tps / thinplate / thin_plate: thin-plate regression spline (m=floor(d/2)+1)\n  - matern: Matern radial basis (nu=1/2,3/2,5/2 default,7/2,9/2; length_scale=; scale_dims=)\n  - duchon: triple-operator (mass + tension + stiffness) radial basis; order=, power=,\n    length_scale= (opt-in hybrid Duchon-Matern), scale_dims=, centers=\n  - sphere / sos / spherical: intrinsic S^2 smooth from (lat, lon)\n    - method= wahba (default) | pseudo-wahba | mgcv | sos | harmonic\n    - max_degree= for harmonic; radians= or units=degrees|radians for input scaling\n- te(x, z, ...) / tensor / interaction: Kronecker tensor-product B-spline\n  - k=[k1,k2,...], degree=, knots=[...] per margin\n  - periodic=[true,false] (cylinder), periodic=[true,true] (torus); period=[...] per axis\n\nFactor smooths and random effects:\n- group(id) / re(id): random intercept per level (single column)\n- s(num, group, bs=\"fs\") / fs(num, group): factor-smooth (one penalised curve per level)\n- s(group, num, bs=\"sz\") / sz(group, num): sum-to-zero factor-smooth deviations\n- s(group, num, bs=\"re\") or s(num, group, bs=\"re\"): random slopes (column order interchangeable)\n- All factor-smooth flavours accept by=, k=, knots=, degree=, penalty_order=, m= (fs only)\n\nTop-level wrappers (one per formula):\n- link(type=...): formula-side link choice (identity, log, logit, probit, cloglog, sas,\n  beta-logistic, flexible(...), blended(...), mixture(...))\n- linkwiggle(internal_knots=, degree=, penalty_order=, double_penalty=): wiggly link correction\n- timewiggle(internal_knots=, ...): same as linkwiggle but along the survival time axis;\n  pair with a non-linear --baseline-target (weibull / gompertz / gompertz-makeham)\n- survmodel(distribution=gaussian|gumbel|logistic): survival residual distribution config.\n  Note: --survival-likelihood / --baseline-target are CLI flags, not options on survmodel()\n- logslope(z, ...sub-formula...): log-slope surface for the Bernoulli marginal-slope family\n\nDuchon vs TPS at high d:\n- TPS fixes m=floor(d/2)+1; its polynomial nullspace C(d+m-1,d) grows combinatorially\n  (e.g. 735471 columns at d=16). Infeasible TPS calls auto-promote to Duchon.\n- Duchon keeps order small (typically Linear -> d+1 polynomial columns) and grows the Riesz\n  power s instead. Pure scale-free Duchon by default; add length_scale= for the hybrid.\n\nNumerics:\n- penalized linear columns are centered/scaled internally during fitting for conditioning\n  and mapped back to the original scale in summaries, prediction, and saved models.\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ s(time, bc_left=clamped, bc_right=anchored, anchor_right=0)'\n- 'y ~ cyclic(hour, period=24) + s(day_of_year, periodic=true, period=366)'\n- 'y ~ sphere(lat, lon, method=harmonic, max_degree=20)'\n- 'y ~ te(theta, h, periodic=[true,false], k=[24,10])    # cylinder'\n- 'y ~ s(x, monotone_increasing=true)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3, scale_dims=true)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, length_scale=0.7)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(logv_hat, min=0, max=2, target=1, strength=5) + x'\n- 'case ~ s(age) + link(type=probit) + linkwiggle(internal_knots=6)'\n- 'Surv(t0, t1, event) ~ s(age) + bmi + timewiggle(internal_knots=8)'\n- 'y ~ s(num, site, bs=\"fs\") + s(site, num, bs=\"sz\")'"
+        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): ordinary penalized linear term (all non-intercept linear coefficients are ridge-penalized by default)\n- linear(x, min=..., max=...): penalized linear term with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for penalized generic coefficient constraints\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and no extra prior\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), cyclic(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- penalized linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n- `type=cyclic` / `cyclic(x)` uses periodic cubic P-spline boundaries; `duchon(x, cyclic=true)` uses periodic 1D Duchon distances; `type=duchon` is pure scale-free Duchon by default; add `length_scale=...` only to opt into the hybrid Duchon-Matern variant\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, length_scale=0.7)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(logv_hat, min=0, max=2, target=1, strength=5) + x'"
     )]
     formula_positional: String,
     /// Fit a second RHS-only formula for the scale/noise block in
@@ -11592,7 +11592,7 @@ mod tests {
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
                             operator_penalties: DuchonOperatorPenaltySpec::default(),
-                            periodic: false,
+                            boundary: OneDimensionalBoundary::Open,
                         },
                         input_scales: None,
                     },
@@ -11610,7 +11610,7 @@ mod tests {
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
                             operator_penalties: DuchonOperatorPenaltySpec::default(),
-                            periodic: false,
+                            boundary: OneDimensionalBoundary::Open,
                         },
                         input_scales: None,
                     },
@@ -11628,7 +11628,7 @@ mod tests {
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
                             operator_penalties: DuchonOperatorPenaltySpec::default(),
-                            periodic: false,
+                            boundary: OneDimensionalBoundary::Open,
                         },
                         input_scales: None,
                     },
@@ -11752,7 +11752,7 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
-                        periodic: false,
+                        boundary: OneDimensionalBoundary::Open,
                     },
                     input_scales: None,
                 },
@@ -11789,7 +11789,7 @@ mod tests {
                             identifiability: SpatialIdentifiability::default(),
                             aniso_log_scales: None,
                             operator_penalties: DuchonOperatorPenaltySpec::default(),
-                            periodic: false,
+                            boundary: OneDimensionalBoundary::Open,
                         },
                         input_scales: None,
                     },
@@ -11808,7 +11808,7 @@ mod tests {
                             },
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::default(),
-                            boundary_condition: Default::default(),
+                            boundary: OneDimensionalBoundary::Open,
                         },
                     },
                     shape: gam::smooth::ShapeConstraint::None,
