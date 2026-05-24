@@ -330,6 +330,60 @@ impl LikelihoodSpec {
             ResponseFamily::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
         }
     }
+
+    /// Build a `LikelihoodSpec` from a non-parameterized `LikelihoodFamily`
+    /// variant. Returns `None` for the parameterized binomial variants
+    /// (`Sas`, `BetaLogistic`, `Mixture`, `LatentCLogLog`) whose new
+    /// `InverseLink` form carries extra state that must be sourced from the
+    /// caller's surrounding context.
+    pub fn from_non_parameterized(family: LikelihoodFamily) -> Option<Self> {
+        match family {
+            LikelihoodFamily::GaussianIdentity => Some(Self {
+                response: ResponseFamily::Gaussian,
+                link: InverseLink::Standard(LinkFunction::Identity),
+            }),
+            LikelihoodFamily::BinomialLogit => Some(Self {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Standard(LinkFunction::Logit),
+            }),
+            LikelihoodFamily::BinomialProbit => Some(Self {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Standard(LinkFunction::Probit),
+            }),
+            LikelihoodFamily::BinomialCLogLog => Some(Self {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Standard(LinkFunction::CLogLog),
+            }),
+            LikelihoodFamily::PoissonLog => Some(Self {
+                response: ResponseFamily::Poisson,
+                link: InverseLink::Standard(LinkFunction::Log),
+            }),
+            LikelihoodFamily::Tweedie { p } => Some(Self {
+                response: ResponseFamily::Tweedie { p },
+                link: InverseLink::Standard(LinkFunction::Log),
+            }),
+            LikelihoodFamily::NegativeBinomial { theta } => Some(Self {
+                response: ResponseFamily::NegativeBinomial { theta },
+                link: InverseLink::Standard(LinkFunction::Log),
+            }),
+            LikelihoodFamily::BetaLogit { phi } => Some(Self {
+                response: ResponseFamily::Beta { phi },
+                link: InverseLink::Standard(LinkFunction::Logit),
+            }),
+            LikelihoodFamily::GammaLog => Some(Self {
+                response: ResponseFamily::Gamma,
+                link: InverseLink::Standard(LinkFunction::Log),
+            }),
+            LikelihoodFamily::RoystonParmar => Some(Self {
+                response: ResponseFamily::RoystonParmar,
+                link: InverseLink::Standard(LinkFunction::Identity),
+            }),
+            LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialBetaLogistic
+            | LikelihoodFamily::BinomialMixture
+            | LikelihoodFamily::BinomialLatentCLogLog => None,
+        }
+    }
 }
 
 /// Engine-level likelihood selector used by generic APIs.
