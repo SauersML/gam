@@ -31,7 +31,7 @@ pub fn backend_status() -> BackendStatus {
 /// [`crate::linalg::utils::splitmix64`] so existing call sites in this
 /// module are unchanged.
 #[inline]
-fn splitmix64(state: &mut u64) -> u64 {
+const fn splitmix64(state: &mut u64) -> u64 {
     crate::linalg::utils::splitmix64(state)
 }
 

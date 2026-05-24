@@ -32,8 +32,8 @@ use crate::inference::model::{
 use crate::inference::predict::{BernoulliMarginalSlopePredictor, PredictInput, predict_gam};
 use crate::linalg::matrix::DesignMatrix;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
-use crate::solver::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::solver::estimate::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResult};
+use crate::solver::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::term_builder::resolve_role_col;
 use crate::terms::smooth::{TermCollectionSpec, build_term_collection_design};
 use crate::types::{InverseLink, LikelihoodFamily, LinkFunction};

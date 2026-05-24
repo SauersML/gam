@@ -52,6 +52,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
 opt = "0.5.2"
 log = "0.4.29"
+libloading = "0.8.9"
 csv = "1.4.0"
 faer = "0.24.0"
 memmap2 = "0.9.10"

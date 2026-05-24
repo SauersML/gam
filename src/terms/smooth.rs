@@ -4156,7 +4156,6 @@ fn normalize_penalty_in_constrained_space(matrix: &Array2<f64>) -> (Array2<f64>,
     }
 }
 
-
 fn build_periodic_fourier_margin(
     x: ArrayView1<'_, f64>,
     period: f64,

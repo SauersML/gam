@@ -7057,7 +7057,7 @@ fn rademacher_unit_probe_into(mut z: ArrayViewMut1<'_, f64>, probe: u64, scale: 
 }
 
 #[inline]
-fn splitmix64(state: &mut u64) -> u64 {
+const fn splitmix64(state: &mut u64) -> u64 {
     crate::linalg::utils::splitmix64(state)
 }
 
