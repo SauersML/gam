@@ -1,1 +1,2 @@
    Compiling gam v0.2.1 (/Users/user/gam)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 03s
