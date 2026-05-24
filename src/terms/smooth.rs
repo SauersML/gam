@@ -15158,7 +15158,7 @@ fn try_exact_joint_spatial_aniso_optimization(
         // EFS/HybridEFS remain eligible; the Wood-Fasiolo PSD structure holds
         // for single-block families with β-independent joint H_L.
         false,
-        seed_risk_profile_for_likelihood_family(family),
+        seed_risk_profile_for_likelihood_family(&family),
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
         // Rho-axis BFGS cap: log-λ's natural step is ≈ 5 per
@@ -15513,7 +15513,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
         // EFS/HybridEFS remain eligible; the Wood-Fasiolo PSD structure holds
         // for single-block families with β-independent joint H_L.
         false,
-        seed_risk_profile_for_likelihood_family(family),
+        seed_risk_profile_for_likelihood_family(&family),
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
         // Rho-axis cap: log-λ natural step ≈ 5.
@@ -18405,7 +18405,7 @@ fn try_exact_joint_latent_coord_optimization(
         DeclaredHessianForm::Unavailable,
         false,
         false,
-        seed_risk_profile_for_likelihood_family(family),
+        seed_risk_profile_for_likelihood_family(&family),
         options.tol,
         options.max_iter.max(1),
         Some(5.0),

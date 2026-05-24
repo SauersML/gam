@@ -69,53 +69,6 @@ use crate::types::{
     MixtureLinkSpec, ResponseFamily, SasLinkSpec, WigglePenaltyConfig,
 };
 
-/// Project a `LikelihoodSpec` down to the legacy `LikelihoodFamily` selector
-/// used by the downstream solver entrypoints that have not yet migrated to
-/// `LikelihoodSpec`. This is a pure value projection (no shim type/wrapper);
-/// it exists only to bridge the per-file migration boundary.
-fn legacy_family_from_spec(spec: &LikelihoodSpec) -> LikelihoodFamily {
-    match (&spec.response, &spec.link) {
-        (ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)) => {
-            LikelihoodFamily::GaussianIdentity
-        }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
-            LikelihoodFamily::BinomialLogit
-        }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
-            LikelihoodFamily::BinomialProbit
-        }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
-            LikelihoodFamily::BinomialCLogLog
-        }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Sas)) => {
-            LikelihoodFamily::BinomialSas
-        }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::BetaLogistic)) => {
-            LikelihoodFamily::BinomialBetaLogistic
-        }
-        (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
-            LikelihoodFamily::BinomialLatentCLogLog
-        }
-        (ResponseFamily::Binomial, InverseLink::Sas(_)) => LikelihoodFamily::BinomialSas,
-        (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
-            LikelihoodFamily::BinomialBetaLogistic
-        }
-        (ResponseFamily::Binomial, InverseLink::Mixture(_)) => LikelihoodFamily::BinomialMixture,
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Identity))
-        | (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Log)) => {
-            LikelihoodFamily::BinomialLogit
-        }
-        (ResponseFamily::Poisson, _) => LikelihoodFamily::PoissonLog,
-        (ResponseFamily::Tweedie { p }, _) => LikelihoodFamily::Tweedie { p: *p },
-        (ResponseFamily::NegativeBinomial { theta }, _) => {
-            LikelihoodFamily::NegativeBinomial { theta: *theta }
-        }
-        (ResponseFamily::Beta { phi }, _) => LikelihoodFamily::BetaLogit { phi: *phi },
-        (ResponseFamily::Gamma, _) => LikelihoodFamily::GammaLog,
-        (ResponseFamily::RoystonParmar, _) => LikelihoodFamily::RoystonParmar,
-        (ResponseFamily::Gaussian, _) => LikelihoodFamily::GaussianIdentity,
-    }
-}
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis, s};
 use serde_json::Value as JsonValue;
 use std::cell::RefCell;
@@ -876,7 +829,7 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
             request.weights.clone(),
             request.offset.clone(),
             &request.spec,
-            legacy_family_from_spec(&request.family),
+            request.family.clone(),
             &request.options,
             &request.kappa_options,
         )
@@ -2788,11 +2741,9 @@ pub fn resolve_family(
                     None,
                 )
             );
-            let explicit_legacy = legacy_family_from_spec(explicit_spec);
-            let from_link_legacy = legacy_family_from_spec(&from_link);
-            if explicit_legacy != from_link_legacy && !compatible_log_nb {
+            if explicit_spec.name() != from_link.name() && !compatible_log_nb {
                 return Err(WorkflowError::InvalidConfig {
-                    reason: format!("family '{}' conflicts with link", explicit_legacy.name()),
+                    reason: format!("family '{}' conflicts with link", explicit_spec.name()),
                 }
                 .into());
             }

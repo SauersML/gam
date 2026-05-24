@@ -130,6 +130,15 @@ pub fn strategy_for_family(
     }
 }
 
+/// Construct a `ResolvedFamilyStrategy` directly from a `LikelihoodSpec`.
+/// Mirrors `strategy_for_family` but takes the modern (response, link)
+/// representation without any legacy-enum round-trip. The spec is cloned
+/// into the resulting strategy.
+#[inline]
+pub fn strategy_for_spec(spec: &LikelihoodSpec) -> ResolvedFamilyStrategy {
+    ResolvedFamilyStrategy { spec: spec.clone() }
+}
+
 /// Build a `ResolvedFamilyStrategy` from a fitted result, lifting the
 /// fitted link state (`FittedLinkState`) into an `InverseLink` variant
 /// suitable for predict-time evaluation.  Returns an error when the
