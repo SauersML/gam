@@ -41,7 +41,7 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
   penalizing latent-axis correlations; pair it with ARD so pruned axes
   are identifiable.
 
-All eight compose with the existing smoothness penalty (`S(ρ)`),
+All analytic penalties compose with the existing smoothness penalty (`S(ρ)`),
 they slot into the same REML outer loop, and their weights are
 "just another hyperparameter" to that loop. Pass `weight="auto"`
 (the default) to let REML choose; pass an explicit float to pin.
@@ -105,7 +105,11 @@ def _target_descriptor(target: Any) -> str | int:
 
 
 def _inverse_softplus(x: np.ndarray) -> np.ndarray:
-    return np.where(x > 30.0, x, np.log(np.expm1(x)))
+    out = np.empty_like(x, dtype=float)
+    large = x > 30.0
+    out[large] = x[large]
+    out[~large] = np.log(np.expm1(x[~large]))
+    return out
 
 
 @dataclass
