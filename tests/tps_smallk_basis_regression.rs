@@ -144,6 +144,7 @@ fn equal_mass_tps_train_test_designs(
         center_strategy: CenterStrategy::EqualMass {
             num_centers: centers,
         },
+        periodic: None,
         length_scale: 1.0,
         double_penalty: false,
         identifiability: SpatialIdentifiability::None,
@@ -161,6 +162,7 @@ fn equal_mass_tps_train_test_designs(
     };
     let test_spec = ThinPlateBasisSpec {
         center_strategy: CenterStrategy::UserProvided(fit_centers),
+        periodic: None,
         length_scale: 1.0,
         double_penalty: false,
         identifiability: SpatialIdentifiability::None,
@@ -242,6 +244,7 @@ fn marginal_tps_spec(num_centers: usize) -> TermCollectionSpec {
                     feature_cols: vec![feature],
                     spec: ThinPlateBasisSpec {
                         center_strategy: CenterStrategy::EqualMass { num_centers },
+                        periodic: None,
                         length_scale: 1.0,
                         double_penalty: false,
                         identifiability: SpatialIdentifiability::default(),

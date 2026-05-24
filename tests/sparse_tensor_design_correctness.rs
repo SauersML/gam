@@ -157,6 +157,7 @@ fn build_non_periodic_design(n: usize, seed: u64) -> (DesignMatrix, Array2<f64>)
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
+        boundary: Default::default(),
         boundary_conditions: Default::default(),
     };
     let spec_h = BSplineBasisSpec {
@@ -168,6 +169,7 @@ fn build_non_periodic_design(n: usize, seed: u64) -> (DesignMatrix, Array2<f64>)
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
+        boundary: Default::default(),
         boundary_conditions: Default::default(),
     };
     let spec = TermCollectionSpec {
@@ -179,6 +181,7 @@ fn build_non_periodic_design(n: usize, seed: u64) -> (DesignMatrix, Array2<f64>)
                 feature_cols: vec![0, 1],
                 spec: TensorBSplineSpec {
                     marginalspecs: vec![spec_x.clone(), spec_h.clone()],
+                    periods: vec![None, None],
                     double_penalty: false,
                     // Identifiability=None gates the new sparse path on.
                     identifiability: TensorBSplineIdentifiability::None,
@@ -229,6 +232,7 @@ fn build_cylinder_design(n: usize) -> (DesignMatrix, Array2<f64>) {
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
+        boundary: Default::default(),
         boundary_conditions: Default::default(),
     };
     let spec_h = BSplineBasisSpec {
@@ -240,6 +244,7 @@ fn build_cylinder_design(n: usize) -> (DesignMatrix, Array2<f64>) {
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
+        boundary: Default::default(),
         boundary_conditions: Default::default(),
     };
     let spec = TermCollectionSpec {
@@ -251,6 +256,7 @@ fn build_cylinder_design(n: usize) -> (DesignMatrix, Array2<f64>) {
                 feature_cols: vec![0, 1],
                 spec: TensorBSplineSpec {
                     marginalspecs: vec![spec_theta, spec_h],
+                    periods: vec![Some(TAU), None],
                     double_penalty: false,
                     // SumToZero forces the dense fall-back path: the
                     // sparse-branch gate (identifiability=None) is closed,

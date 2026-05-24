@@ -1,41 +1,35 @@
-pub fn assert_manualwith_ad_band(
-    case: &str,
-    x: f64,
-    quantity: &str,
-    manual: f64,
-    refs: &[(&str, f64)],
-) {
-    assert!(!refs.is_empty(), "refs must be non-empty");
-    let mut minv = f64::INFINITY;
-    let mut maxv = f64::NEG_INFINITY;
-    let mut nearestname = refs[0].0;
-    let mut nearestv = refs[0].1;
-    let mut nearest_abs = (manual - refs[0].1).abs();
-    for (name, v) in refs {
-        minv = minv.min(*v);
-        maxv = maxv.max(*v);
-        let abs = (manual - *v).abs();
-        if abs < nearest_abs {
-            nearest_abs = abs;
-            nearestname = name;
-            nearestv = *v;
-        }
-    }
-    let band = (maxv - minv).abs();
-    let scale = manual.abs().max(nearestv.abs()).max(1.0);
-    let roundoff = 64.0 * f64::EPSILON * scale;
-    if nearest_abs > band + roundoff {
-        panic!(
-            "{case} x={x:.6} {quantity}: manual={manual:.16e} nearest({nearestname})={nearestv:.16e} abs_err={nearest_abs:.3e} ad_band={band:.3e} roundoff={roundoff:.3e}"
-        );
-    }
-}
-
 #[macro_export]
 macro_rules! assert_manual_ad_band {
     ($case:expr, $x:expr, $quantity:expr, $manual:expr, $( $name:expr => $value:expr ),+ $(,)?) => {{
-        let refs = [$(($name, $value)),+];
-        $crate::common::assert_manualwith_ad_band($case, $x, $quantity, $manual, &refs);
+        let case: &str = $case;
+        let x: f64 = $x;
+        let quantity: &str = $quantity;
+        let manual: f64 = $manual;
+        let refs: &[(&str, f64)] = &[$(($name, $value)),+];
+        assert!(!refs.is_empty(), "refs must be non-empty");
+        let mut minv = f64::INFINITY;
+        let mut maxv = f64::NEG_INFINITY;
+        let mut nearestname = refs[0].0;
+        let mut nearestv = refs[0].1;
+        let mut nearest_abs = (manual - refs[0].1).abs();
+        for (name, v) in refs {
+            minv = minv.min(*v);
+            maxv = maxv.max(*v);
+            let abs = (manual - *v).abs();
+            if abs < nearest_abs {
+                nearest_abs = abs;
+                nearestname = name;
+                nearestv = *v;
+            }
+        }
+        let band = (maxv - minv).abs();
+        let scale = manual.abs().max(nearestv.abs()).max(1.0);
+        let roundoff = 64.0 * f64::EPSILON * scale;
+        if nearest_abs > band + roundoff {
+            panic!(
+                "{case} x={x:.6} {quantity}: manual={manual:.16e} nearest({nearestname})={nearestv:.16e} abs_err={nearest_abs:.3e} ad_band={band:.3e} roundoff={roundoff:.3e}"
+            );
+        }
     }};
 }
 
@@ -59,22 +53,13 @@ pub enum BudgetVerdict {
     OverBudget,
 }
 
-#[derive(Clone, Debug)]
-pub struct PowerLawExtrapolation {
-    pub label: String,
-    pub x_target: f64,
-    pub pred_y: f64,
-    pub verdict: BudgetVerdict,
-}
-
-/// Structured result of `report_power_law` — the fit plus per-target
-/// extrapolation predictions and budget verdicts. Returned alongside
-/// the side-effect printing so callers (tests, downstream analyzers)
-/// can assert against the verdicts directly instead of parsing stderr.
+/// Structured result of `report_power_law` — the fit alone. Per-target
+/// extrapolation predictions are emitted to stderr as a side effect of
+/// `report_power_law_full`; structured access to them is no longer part
+/// of the contract.
 #[derive(Clone, Debug)]
 pub struct PowerLawReport {
     pub fit: PowerLawFit,
-    pub extrapolations: Vec<PowerLawExtrapolation>,
 }
 
 /// Fit `y = a · x^α` to `(x, y)` pairs via log-log OLS. Returns `None`
