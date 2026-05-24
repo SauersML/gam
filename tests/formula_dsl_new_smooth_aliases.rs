@@ -91,3 +91,24 @@ fn periodic_period_decimal_and_2pi_expressions_parse() {
         let _ = parse_formula(&f).unwrap_or_else(|e| panic!("`{f}` parse failed: {e}"));
     }
 }
+
+#[test]
+fn difference_smooth_options_parse_by_and_sz() {
+    let parsed = parse_formula("y ~ s(x, by=group, k=8) + s(group, x, bs='sz')")
+        .expect("difference-smooth formula parses");
+    let mut saw_by = false;
+    let mut saw_sz = false;
+    for term in &parsed.terms {
+        if let ParsedTerm::Smooth { options, vars, .. } = term {
+            if options.get("by").map(String::as_str) == Some("group") {
+                saw_by = true;
+            }
+            if options.get("bs").map(String::as_str) == Some("sz") {
+                assert_eq!(vars, &vec!["group".to_string(), "x".to_string()]);
+                saw_sz = true;
+            }
+        }
+    }
+    assert!(saw_by, "by= option was not retained");
+    assert!(saw_sz, "bs=sz option was not retained");
+}

@@ -153,6 +153,18 @@ pub fn column_map_with_alias(
     aliased
 }
 
+fn unique_finite_level_bits(column: ArrayView1<'_, f64>) -> Vec<u64> {
+    let mut levels = column
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .map(f64::to_bits)
+        .collect::<Vec<_>>();
+    levels.sort_unstable();
+    levels.dedup();
+    levels
+}
+
 // ---------------------------------------------------------------------------
 // ParsedTerm[] + Dataset → TermCollectionSpec
 // ---------------------------------------------------------------------------
@@ -275,6 +287,60 @@ pub fn build_termspec(
                 kind,
                 options,
             } => {
+                let bs = options
+                    .get("bs")
+                    .or_else(|| options.get("type"))
+                    .map(|v| v.trim().to_ascii_lowercase());
+                if matches!(bs.as_deref(), Some("sz")) {
+                    if vars.len() < 2 {
+                        return Err(format!(
+                            "bs=sz smooth '{}' requires a factor column followed by at least one smooth variable",
+                            label
+                        ));
+                    }
+                    let group_col = resolve_col(col_map, &vars[0])?;
+                    if !matches!(
+                        ds.column_kinds.get(group_col),
+                        Some(ColumnKindTag::Categorical)
+                    ) {
+                        return Err(format!(
+                            "bs=sz smooth '{}' requires categorical first variable '{}'; got non-categorical column",
+                            label, vars[0]
+                        ));
+                    }
+                    let inner_vars = vars[1..].to_vec();
+                    let inner_cols = inner_vars
+                        .iter()
+                        .map(|v| resolve_col(col_map, v))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut inner_options = options.clone();
+                    inner_options.remove("bs");
+                    inner_options.remove("type");
+                    let inner = build_smooth_basis(
+                        *kind,
+                        &inner_vars,
+                        &inner_cols,
+                        &inner_options,
+                        ds,
+                        inference_notes,
+                        policy,
+                        smooth_coordinate_count,
+                    )?;
+                    smooth_terms.push(SmoothTermSpec {
+                        name: label.clone(),
+                        basis: SmoothBasisSpec::FactorSumToZero {
+                            inner: Box::new(inner),
+                            group_col,
+                            levels: unique_finite_level_bits(ds.values.column(group_col)),
+                        },
+                        shape: ShapeConstraint::None,
+                    });
+                    continue;
+                }
+
+                let by_name = options.get("by").cloned();
+                let mut inner_options = options.clone();
+                inner_options.remove("by");
                 let cols = vars
                     .iter()
                     .map(|v| resolve_col(col_map, v))
@@ -291,45 +357,53 @@ pub fn build_termspec(
                     policy,
                     smooth_coordinate_count,
                 )?;
-                let basis = if let Some(by_name) = by_name {
+                if let Some(by_name) = by_name {
                     let by_col = resolve_col(col_map, &by_name)?;
-                    let by_kind = match ds
+                    match ds
                         .column_kinds
                         .get(by_col)
                         .copied()
                         .unwrap_or(ColumnKindTag::Continuous)
                     {
                         ColumnKindTag::Categorical => {
-                            let has_main = terms.iter().any(|term| matches!(term,
-                                ParsedTerm::Linear { name, .. } | ParsedTerm::RandomEffect { name } if name == &by_name));
-                            if !has_main {
-                                inference_notes.push(format!(
-                                    "factor by-smooth '{}' uses by={} without an explicit main-effect term; add '{}' for mgcv-style level identifiability",
-                                    label, by_name, by_name
-                                ));
-                            }
-                            ByVarKind::Factor {
-                                feature_col: by_col,
-                                ordered: false,
-                                frozen_levels: None,
+                            for bits in unique_finite_level_bits(ds.values.column(by_col)) {
+                                smooth_terms.push(SmoothTermSpec {
+                                    name: format!(
+                                        "{}:by({}={})",
+                                        label,
+                                        by_name,
+                                        f64::from_bits(bits)
+                                    ),
+                                    basis: SmoothBasisSpec::By {
+                                        inner: Box::new(basis.clone()),
+                                        by_col,
+                                        by_level: Some(bits),
+                                        center_active: true,
+                                    },
+                                    shape: ShapeConstraint::None,
+                                });
                             }
                         }
-                        _ => ByVarKind::Numeric {
-                            feature_col: by_col,
-                        },
-                    };
-                    SmoothBasisSpec::BySmooth {
-                        smooth: Box::new(basis_inner),
-                        by_kind,
+                        ColumnKindTag::Binary | ColumnKindTag::Continuous => {
+                            smooth_terms.push(SmoothTermSpec {
+                                name: format!("{}:by({})", label, by_name),
+                                basis: SmoothBasisSpec::By {
+                                    inner: Box::new(basis),
+                                    by_col,
+                                    by_level: None,
+                                    center_active: false,
+                                },
+                                shape: ShapeConstraint::None,
+                            });
+                        }
                     }
                 } else {
-                    basis_inner
-                };
-                smooth_terms.push(SmoothTermSpec {
-                    name: label.clone(),
-                    basis,
-                    shape,
-                });
+                    smooth_terms.push(SmoothTermSpec {
+                        name: label.clone(),
+                        basis,
+                        shape: ShapeConstraint::None,
+                    });
+                }
             }
             ParsedTerm::LinkWiggle { .. }
             | ParsedTerm::TimeWiggle { .. }
