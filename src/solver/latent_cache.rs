@@ -83,6 +83,9 @@ pub(crate) enum LatentBasisKind {
         knots: Vec<Array1<f64>>,
         degrees: Vec<usize>,
     },
+    Pca {
+        basis_matrix: Array2<f64>,
+    },
 }
 
 impl LatentBasisKind {
@@ -92,6 +95,7 @@ impl LatentBasisKind {
             | Self::Duchon { centers, .. }
             | Self::Sphere { centers, .. } => Some(centers),
             Self::PeriodicBspline { .. } | Self::TensorBspline { .. } => None,
+            Self::Pca { .. } => None,
         }
     }
 
@@ -160,6 +164,12 @@ impl LatentBasisKind {
                 for axis_knots in knots {
                     hash_vector(axis_knots, &mut hasher);
                 }
+            }
+            Self::Pca { basis_matrix } => {
+                hasher.write_usize(5);
+                hasher.write_usize(basis_matrix.nrows());
+                hasher.write_usize(basis_matrix.ncols());
+                hash_matrix(basis_matrix, &mut hasher);
             }
         }
         hasher.finish_u64()
