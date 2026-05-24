@@ -5049,7 +5049,7 @@ where
             );
         }
     }
-    let fitted_link_state = fit.fitted_link_state(family).ok();
+    let fitted_link_state = fit.fitted_link_state(&family).ok();
     let mixture_state = match fitted_link_state.as_ref() {
         Some(FittedLinkState::Mixture { state, .. }) => Some(state.clone()),
         _ => None,
@@ -5069,8 +5069,13 @@ where
         Some(FittedLinkState::Mixture { state, .. }) => Some(InverseLink::Mixture(state.clone())),
         Some(FittedLinkState::Standard(None)) | None => None,
     };
-    let strategy = strategy_for_family(family, link_kind.as_ref());
-    let mean = apply_family_inverse_link(&eta, family, link_kind.as_ref())?;
+    let likelihood = if let Some(link) = link_kind.clone() {
+        LikelihoodSpec::new(family.response.clone(), link)
+    } else {
+        family.clone()
+    };
+    let strategy = strategy_for_spec(&likelihood);
+    let mean = apply_family_inverse_link(&eta, &likelihood)?;
 
     let etavar_raw = linear_predictorvariance_from_backend(&x, &backend)?;
     let n_rows = etavar_raw.len();
@@ -5262,10 +5267,8 @@ where
             ),
         ),
         MeanIntervalMethod::TransformEta => {
-            let transformed_lower =
-                apply_family_inverse_link(&eta_lower, family, link_kind.as_ref())?;
-            let transformed_upper =
-                apply_family_inverse_link(&eta_upper, family, link_kind.as_ref())?;
+            let transformed_lower = apply_family_inverse_link(&eta_lower, &likelihood)?;
+            let transformed_upper = apply_family_inverse_link(&eta_upper, &likelihood)?;
             (
                 Array1::from_iter(
                     transformed_lower
@@ -5283,14 +5286,14 @@ where
         }
     };
 
-    let spec = spec_from_family_link(family, link_kind.as_ref());
+    let spec = &likelihood;
     if matches!(
-        spec.response,
+        &spec.response,
         ResponseFamily::Binomial
             | ResponseFamily::Beta { .. }
             | ResponseFamily::RoystonParmar
     ) {
-        let (lo, hi) = if matches!(spec.response, ResponseFamily::Beta { .. }) {
+        let (lo, hi) = if matches!(&spec.response, ResponseFamily::Beta { .. }) {
             (1e-10, 1.0 - 1e-10)
         } else {
             (0.0, 1.0)
@@ -5322,7 +5325,7 @@ where
             (Some(lower), Some(upper))
         };
 
-        match spec.response {
+        match &spec.response {
             ResponseFamily::Gaussian => {
                 let obsvar = fit.standard_deviation.max(0.0).powi(2);
                 let obs_se = etavar.mapv(|v| (v + obsvar).max(0.0).sqrt());
@@ -5345,12 +5348,12 @@ where
                 response_observation_bounds(response_var)
             }
             ResponseFamily::NegativeBinomial { theta } => {
-                let response_var = mean.mapv(|mu| mu + mu.powi(2) / theta);
+                let response_var = mean.mapv(|mu| mu + mu.powi(2) / *theta);
                 response_observation_bounds(response_var)
             }
             ResponseFamily::Tweedie { p } => {
                 let phi = fit.likelihood_scale.fixed_phi().unwrap_or(1.0);
-                let response_var = mean.mapv(|mu| phi * mu.powf(p));
+                let response_var = mean.mapv(|mu| phi * mu.powf(*p));
                 response_observation_bounds(response_var)
             }
             ResponseFamily::Gamma => {
@@ -5359,7 +5362,7 @@ where
                 response_observation_bounds(response_var)
             }
             ResponseFamily::Beta { phi } => {
-                let response_var = mean.mapv(|mu| mu * (1.0 - mu) / (1.0 + phi));
+                let response_var = mean.mapv(|mu| mu * (1.0 - mu) / (1.0 + *phi));
                 response_observation_bounds(response_var)
             }
             ResponseFamily::Binomial => {
