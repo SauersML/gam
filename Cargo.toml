@@ -161,17 +161,6 @@ name = "bms_hw_cross_terms"
 path = "bench/cargo_benches/bms_hw_cross_terms.rs"
 harness = false
 
-# Dev / test profile — full DWARF (debug = 2) on a dep graph this heavy
-# (faer, burn, bevy_reflect, ndarray, nalgebra, arrow, parquet, criterion,
-# ad_trait, autodiff, num-dual, …) blows out the ubuntu-latest CI runner's
-# ~14 GB free disk at link time of `cargo test --all-features`, producing
-# the "linking with `cc` failed … No space left on device" failure. Line
-# tables are enough to keep `RUST_BACKTRACE=1` informative for `cargo test`
-# triage; the per-variable / per-type DWARF that dominates object size is
-# what we drop.
-[profile.dev]
-debug = "line-tables-only"
-
 [profile.release]
 lto = "thin"
 codegen-units = 1
