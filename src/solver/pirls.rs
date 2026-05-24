@@ -1841,7 +1841,7 @@ impl<'a> GamWorkingModel<'a> {
         match &self.coordinate_design {
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
                 if let Some(dense) = x_transformed.as_dense() {
-                    fast_av_into(dense, beta.as_ref(), out);
+                    fast_av_into(dense, beta, out);
                     return;
                 }
                 out.assign(&x_transformed.matrixvectormultiply(beta));
