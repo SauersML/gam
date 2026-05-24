@@ -37,18 +37,18 @@ def make_data():
         0.30 + 0.45 / (1.0 + np.exp(1.2 * aux[:, 1])),
         np.full((N, 4), [0.75, 0.65, 0.50, 0.42]),
     ))
-    z = rng.normal(size=(N, D)) * scales
-    z -= z.mean(axis=0, keepdims=True)
+    t_true = rng.normal(size=(N, D)) * scales
+    t_true -= t_true.mean(axis=0, keepdims=True)
     embed, _ = np.linalg.qr(rng.normal(size=(AMBIENT_D, D)))
-    ambient = z @ embed.T + 0.03 * rng.normal(size=(N, AMBIENT_D))
-    eta = 1.15 + 0.45 * np.sin(1.3 * z[:, 0]) - 0.35 * z[:, 1]
-    eta += 0.22 * z[:, 2] ** 2 + 0.28 * z[:, 3] * z[:, 4] - 0.18 * z[:, 5]
+    ambient = t_true @ embed.T + 0.03 * rng.normal(size=(N, AMBIENT_D))
+    eta = 1.15 + 0.45 * np.sin(1.3 * t_true[:, 0]) - 0.35 * t_true[:, 1]
+    eta += 0.22 * t_true[:, 2] ** 2 + 0.28 * t_true[:, 3] * t_true[:, 4] - 0.18 * t_true[:, 5]
     mu = np.exp(np.clip(eta, -2.5, 3.0))
     y = rng.negative_binomial(THETA, THETA / (THETA + mu)).astype(float)
     lambda_per_row = np.zeros((N, D, D))
     lambda_per_row[:, np.arange(D), np.arange(D)] = 1.0 / scales**2
     df = {"y": y.tolist()} | {f"x{j}": ambient[:, j].tolist() for j in range(AMBIENT_D)}
-    return df, z, ambient, y[:, None], lambda_per_row
+    return df, t_true, ambient, y[:, None], lambda_per_row
 
 def penalties(lambda_per_row):
     return [
