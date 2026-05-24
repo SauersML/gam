@@ -52,7 +52,11 @@ impl CustomFamily for ScalarPseudoLaplaceRhoFamily {
         direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         assert!(block_index < block_states.len(), "rho block index in range");
-        assert_eq!(direction.len(), block_states[block_index].beta.len(), "rho dir len matches beta");
+        assert_eq!(
+            direction.len(),
+            block_states[block_index].beta.len(),
+            "rho dir len matches beta"
+        );
         Ok(Some(array![[0.0]]))
     }
 
@@ -99,7 +103,11 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
         direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         assert!(block_index < block_states.len(), "psi block index in range");
-        assert_eq!(direction.len(), block_states[block_index].beta.len(), "psi dir len matches beta");
+        assert_eq!(
+            direction.len(),
+            block_states[block_index].beta.len(),
+            "psi dir len matches beta"
+        );
         Ok(Some(array![[0.0]]))
     }
 
@@ -128,8 +136,16 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        assert_eq!(block_states.len(), block_specs.len(), "psi terms: states/specs aligned");
-        assert_eq!(derivative_blocks.len(), block_states.len(), "psi terms: derivs/states aligned");
+        assert_eq!(
+            block_states.len(),
+            block_specs.len(),
+            "psi terms: states/specs aligned"
+        );
+        assert_eq!(
+            derivative_blocks.len(),
+            block_states.len(),
+            "psi terms: derivs/states aligned"
+        );
         assert_eq!(psi_index, 0, "psi terms: scalar psi index expected 0");
         let beta = block_states
             .first()

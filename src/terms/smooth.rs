@@ -1350,7 +1350,7 @@ fn validate_gamma_precision_prior(label: &str, shape: f64, rate: f64) -> Result<
             "Gamma precision hyperprior for penalty block '{label}' requires rate >= 0, got {rate}"
         )));
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 fn realize_penalty_block_gamma_priors<F>(
@@ -11421,7 +11421,7 @@ fn expect_block_idx_zero(block_idx: usize, family_name: &str, context: &str) -> 
         ))
         .into());
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 impl BoundedLinearFamily {

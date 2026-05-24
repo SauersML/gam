@@ -273,7 +273,7 @@ pub(crate) fn predict_gam_dimension_mismatch_message(
             x_rows, offset_len
         ));
     }
-    None
+    None::<String>
 }
 
 pub(crate) fn add_relative_diag_ridge(matrix: &mut Array2<f64>, scale: f64, floor: f64) -> f64 {

@@ -8583,7 +8583,7 @@ fn validate_flat_direction_length(
         }
         .into());
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 fn exact_newton_joint_hessian_from_exact_blocks<F: CustomFamily + ?Sized>(
@@ -23924,16 +23924,17 @@ mod tests {
             options,
         } = binomial_location_scale_wiggle_outer_fixture();
 
-        let (outer_obj, outer_grad, outer_hessian, _) = super::test_support::outerobjectivegradienthessian(
-            &family,
-            &specs,
-            &options,
-            &penalty_counts,
-            &rho,
-            None,
-            EvalMode::ValueGradientHessian,
-        )
-        .expect("rho-only outer objective");
+        let (outer_obj, outer_grad, outer_hessian, _) =
+            super::test_support::outerobjectivegradienthessian(
+                &family,
+                &specs,
+                &options,
+                &penalty_counts,
+                &rho,
+                None,
+                EvalMode::ValueGradientHessian,
+            )
+            .expect("rho-only outer objective");
         let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()];
         let joint_result = evaluate_custom_family_joint_hyper(
             &family,

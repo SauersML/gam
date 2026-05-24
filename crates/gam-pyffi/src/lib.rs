@@ -13815,7 +13815,7 @@ fn validate_vector(name: &str, values: ArrayView1<'_, f64>) -> Result<(), String
     if values.iter().any(|value| !value.is_finite()) {
         return Err(format!("{name} must contain only finite values"));
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 fn periodic_knot_domain(knots: ArrayView1<'_, f64>) -> Result<(f64, f64, usize), String> {

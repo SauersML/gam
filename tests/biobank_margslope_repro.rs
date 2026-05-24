@@ -54,8 +54,9 @@ static INIT_LOGGER: Once = Once::new();
 fn init() {
     gam::init_parallelism();
     INIT_LOGGER.call_once(|| {
-        let _ = log::set_logger(&LOGGER);
-        log::set_max_level(log::LevelFilter::Info);
+        if log::set_logger(&LOGGER).is_ok() {
+            log::set_max_level(log::LevelFilter::Info);
+        }
     });
 }
 

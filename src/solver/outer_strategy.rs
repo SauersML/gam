@@ -564,7 +564,7 @@ impl OuterThetaLayout {
                 self.psi_dim, self.n_params
             )));
         }
-        Ok(())
+        Ok::<(), _>(())
     }
 
     fn validate_point_len(
@@ -581,7 +581,7 @@ impl OuterThetaLayout {
                 self.psi_dim
             )));
         }
-        Ok(())
+        Ok::<(), _>(())
     }
 
     fn validate_gradient_len(
@@ -598,7 +598,7 @@ impl OuterThetaLayout {
                 self.psi_dim
             )));
         }
-        Ok(())
+        Ok::<(), _>(())
     }
 
     fn validate_hessian_shape(
@@ -617,7 +617,7 @@ impl OuterThetaLayout {
                 self.psi_dim
             )));
         }
-        Ok(())
+        Ok::<(), _>(())
     }
 
     fn validate_efs_eval(&self, eval: &EfsEval, context: &str) -> Result<(), ObjectiveEvalError> {

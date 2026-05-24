@@ -1014,7 +1014,7 @@ impl SurvivalLambdaLayout {
             }
             .into());
         }
-        Ok(())
+        Ok::<(), _>(())
     }
 
     fn time_from(&self, rho: &Array1<f64>) -> Array1<f64> {
@@ -6992,30 +6992,20 @@ fn exact_survival_response_moments(
     let quadctx = crate::quadrature::QuadratureContext::new();
     {
         // Warm GH rule caches on the calling thread with cheap probes.
-        drop(crate::quadrature::normal_expectation_nd_adaptive_result::<
-            1,
-            _,
-            _,
-            String,
-        >(
+        crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, String>(
             &quadctx,
             [0.0_f64],
             [[1.0_f64]],
             21,
             |_x: [f64; 1]| Ok((0.0_f64, 0.0_f64)),
-        ));
-        drop(crate::quadrature::normal_expectation_nd_adaptive_result::<
-            1,
-            _,
-            _,
-            String,
-        >(
+        )?;
+        crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, String>(
             &quadctx,
             [0.0_f64],
             [[1.0_f64]],
             15,
             |_x: [f64; 1]| Ok((0.0_f64, 0.0_f64)),
-        ));
+        )?;
     }
     if n >= SURVIVAL_ROW_PARALLEL_THRESHOLD {
         let first_slice = first

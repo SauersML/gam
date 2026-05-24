@@ -2248,13 +2248,14 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 let mut x_tau = dir.x_tau_dense();
                 self.conditioning
                     .transform_matrix_columnswith_a_inplace(&mut x_tau);
-                dir.x_tau_original = crate::estimate::reml::HyperDesignDerivative::from(x_tau);
+                dir.x_tau_original =
+                    crate::solver::estimate::reml::HyperDesignDerivative::from(x_tau);
                 if let Some(rows) = dir.x_tau_tau_original.as_mut() {
                     for mat in rows.iter_mut().flatten() {
                         let mut dense = mat.materialize();
                         self.conditioning
                             .transform_matrix_columnswith_a_inplace(&mut dense);
-                        *mat = crate::estimate::reml::HyperDesignDerivative::from(dense);
+                        *mat = crate::solver::estimate::reml::HyperDesignDerivative::from(dense);
                     }
                 }
             }
@@ -2280,13 +2281,13 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             let mut x_tau = dir.x_tau_dense();
             self.conditioning
                 .transform_matrix_columnswith_a_inplace(&mut x_tau);
-            dir.x_tau_original = crate::estimate::reml::HyperDesignDerivative::from(x_tau);
+            dir.x_tau_original = crate::solver::estimate::reml::HyperDesignDerivative::from(x_tau);
             if let Some(rows) = dir.x_tau_tau_original.as_mut() {
                 for mat in rows.iter_mut().flatten() {
                     let mut dense = mat.materialize();
                     self.conditioning
                         .transform_matrix_columnswith_a_inplace(&mut dense);
-                    *mat = crate::estimate::reml::HyperDesignDerivative::from(dense);
+                    *mat = crate::solver::estimate::reml::HyperDesignDerivative::from(dense);
                 }
             }
         }
@@ -2338,12 +2339,13 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             // Primitive B in the reduced Firth dense operator; the tau-tau
             // policy no longer needs the Firth+Logit gap downgrade.
             let firth_pair_terms_unavailable = false;
-            let tau_tau_policy = crate::estimate::reml::exact_tau_tau_hessian_policy_with_firth(
-                x.nrows(),
-                x.ncols(),
-                &hyper_dirs,
-                firth_pair_terms_unavailable,
-            );
+            let tau_tau_policy =
+                crate::solver::estimate::reml::exact_tau_tau_hessian_policy_with_firth(
+                    x.nrows(),
+                    x.ncols(),
+                    &hyper_dirs,
+                    firth_pair_terms_unavailable,
+                );
             if tau_tau_policy.prefer_gradient_only() {
                 log::warn!(
                     "[OUTER] disabling exact tau Hessian before conditioning; using gradient-only outer eval \
@@ -2884,9 +2886,11 @@ where
             } else {
                 DeclaredHessianForm::Unavailable
             })
-            .with_barrier(self::reml::unified::BarrierConfig::from_constraints(
-                fit_linear_constraints.as_ref(),
-            ))
+            .with_barrier(
+                crate::solver::estimate::reml::unified::BarrierConfig::from_constraints(
+                    fit_linear_constraints.as_ref(),
+                ),
+            )
             .with_tolerance(reml_tol)
             .with_max_iter(reml_max_iter)
             .with_seed_config(reml_seed_config)
@@ -2973,8 +2977,10 @@ where
 
         let mut obj = problem.build_objective_with_screening_proxy(
             &mut reml_state,
-            |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| state.compute_cost(rho),
-            |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
+            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
+                state.compute_cost(rho)
+            },
+            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
                 outer_eval_idx.fetch_add(1, Ordering::Relaxed);
                 state.compute_outer_eval_with_order(
                     rho,
@@ -2985,19 +2991,22 @@ where
                     },
                 )
             },
-            |state: &mut &mut self::reml::RemlState<'_>,
+            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
              rho: &Array1<f64>,
              order: OuterEvalOrder| {
                 outer_eval_idx.fetch_add(1, Ordering::Relaxed);
                 state.compute_outer_eval_with_order(rho, order)
             },
-            Some(|state: &mut &mut self::reml::RemlState<'_>| state.reset_outer_seed_state()),
             Some(
-                |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
-                    state.compute_efs_steps(rho)
+                |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>| {
+                    state.reset_outer_seed_state()
                 },
             ),
-            |state: &mut &mut self::reml::RemlState<'_>, rho: &Array1<f64>| {
+            Some(
+                |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
+                 rho: &Array1<f64>| { state.compute_efs_steps(rho) },
+            ),
+            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
                 state.compute_screening_proxy(rho)
             },
         );
@@ -3021,7 +3030,7 @@ where
             // tolerance and the refit would be a wasted inner Newton solve
             // (~30s at biobank n=320k).
             let guard_start = std::time::Instant::now();
-            drop(reml_state.compute_cost(&strategy_result.rho));
+            reml_state.compute_cost(&strategy_result.rho)?;
             log::info!(
                 "[OUTER guard] convergence-guard re-eval at converged ρ done (prev_cap={prev_cap}, elapsed={:.3}s)",
                 guard_start.elapsed().as_secs_f64()
@@ -3087,9 +3096,11 @@ where
             .with_gradient(Derivative::Analytic)
             .with_hessian(DeclaredHessianForm::Either)
             .with_psi_dim(mixture_dim + sas_dim)
-            .with_barrier(self::reml::unified::BarrierConfig::from_constraints(
-                fit_linear_constraints.as_ref(),
-            ))
+            .with_barrier(
+                crate::solver::estimate::reml::unified::BarrierConfig::from_constraints(
+                    fit_linear_constraints.as_ref(),
+                ),
+            )
             .with_tolerance(reml_tol)
             .with_max_iter(reml_max_iter)
             .with_seed_config(reml_seed_config_mix)
@@ -3113,7 +3124,7 @@ where
             None => problem,
         };
         // Shared helper: parse theta into rho + link params, update link state.
-        let apply_link_theta = |state: &mut &mut self::reml::RemlState<'_>,
+        let apply_link_theta = |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
                                 theta: &Array1<f64>|
          -> Result<Array1<f64>, EstimationError> {
             let rho = theta.slice(s![..k]).to_owned();
@@ -3191,12 +3202,14 @@ where
 
         let mut obj = problem.build_objective(
             &mut reml_state,
-            |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
+            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
+             theta: &Array1<f64>| {
                 let rho = apply_link_theta(state, theta)?;
                 let cost = state.compute_cost(&rho)? + sas_ridge_cost(theta);
                 Ok(cost)
             },
-            |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
+            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
+             theta: &Array1<f64>| {
                 let eval_idx = outer_eval_idx.fetch_add(1, Ordering::Relaxed) + 1;
                 let rho = apply_link_theta(state, theta)?;
                 let tcost = Instant::now();
@@ -3204,7 +3217,8 @@ where
                 // Use the unified REML evaluator with link ext_coords.
                 // This computes ρ gradient AND link parameter gradient jointly
                 // through the same HyperCoord infrastructure used for aniso ψ.
-                let eval_mode = self::reml::unified::EvalMode::ValueGradientHessian;
+                let eval_mode =
+                    crate::solver::estimate::reml::unified::EvalMode::ValueGradientHessian;
                 let result = state.evaluate_unified_with_link_ext(&rho, eval_mode)?;
 
                 let cost = result.cost + sas_ridge_cost(theta);
@@ -3262,7 +3276,7 @@ where
                     inner_beta_hint: state.current_original_basis_beta(),
                 })
             },
-            Some(|state: &mut &mut self::reml::RemlState<'_>| {
+            Some(|state: &mut &mut crate::solver::estimate::reml::RemlState<'_>| {
                 state.reset_outer_seed_state();
                 state.set_link_states(
                     initial_link_kind.mixture_state().cloned(),
@@ -3270,7 +3284,8 @@ where
                 );
             }),
             Some(
-                |state: &mut &mut self::reml::RemlState<'_>, theta: &Array1<f64>| {
+                |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
+                 theta: &Array1<f64>| {
                     let rho = apply_link_theta(state, theta)?;
                     let mut efs_eval = state.compute_efs_steps_with_link_ext(&rho)?;
 
@@ -3313,7 +3328,7 @@ where
             // See standard-REML arm: only re-eval when the schedule had
             // capped, otherwise the cached β is already at full tolerance.
             let guard_start_mix = std::time::Instant::now();
-            drop(reml_state.compute_cost(&outer_result.rho));
+            reml_state.compute_cost(&outer_result.rho)?;
             log::info!(
                 "[OUTER guard] convergence-guard re-eval at converged ρ done (mixture/SAS arm; prev_cap={prev_cap_mix}, elapsed={:.3}s)",
                 guard_start_mix.elapsed().as_secs_f64()
@@ -6474,7 +6489,7 @@ where
         cfg.link_kind.sas_state().copied(),
     );
 
-    drop(reml_state.compute_gradient(rho)?);
+    reml_state.compute_gradient(rho)?;
     let beta_hat = reml_state
         .warm_start_beta
         .read()

@@ -164,7 +164,7 @@ impl SavedLatentZNormalization {
                 ),
             });
         }
-        Ok(())
+        Ok::<(), _>(())
     }
 
     pub fn apply(&self, z: &Array1<f64>, context: &str) -> Result<Array1<f64>, FittedModelError> {
@@ -222,7 +222,7 @@ impl TransformationScoreCalibration {
                 ),
             });
         }
-        Ok(())
+        Ok::<(), _>(())
     }
 }
 

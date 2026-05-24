@@ -1419,7 +1419,7 @@ pub fn validate_auxiliary_formula_controls(
         }
         .into());
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
