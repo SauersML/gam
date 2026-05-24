@@ -14,45 +14,28 @@ Varying ``Lambda(u_n)`` breaks the rotation gauge; ARD then has a pinned basis
 where axes that do not load on aux can be pruned.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
-from pathlib import Path
-import inspect
-import warnings
-
+from pathlib import Path; import inspect; import warnings
 import numpy as np
-
-
 N, D, AMBIENT_D, TRUE_D, SEED = 720, 4, 8, 2, 902
 AUX_WEIGHT, AXIS_CUTOFF, AUX_CUTOFF = 8.0, 0.04, 0.35
 FIG_PATH = Path(__file__).with_suffix(".png")
 INTRO = """# AuxConditionalPriorPenalty + ARDPenalty
 
-Memory `project_ard_gauge_fix_doesnt_help_cogito.md` says ARD-alone,
-ARD+QR-Ortho, ARD+soft-Ortho, and BlockSparsity+supervised failed on cogito;
-aux-conditional prior with HSV as aux is the next hypothesis. Proposal section
-4(c) predicts an iVAE sibling: observed aux anchors the basis through
-`Lambda(u_n)`, then ARD prunes unanchored axes.
-"""
+Memory `project_ard_gauge_fix_doesnt_help_cogito.md` says ARD-alone, ARD+QR-Ortho,
+ARD+soft-Ortho, and BlockSparsity+supervised failed on cogito; aux-conditional
+prior with HSV as aux is the next hypothesis. Proposal section 4(c) predicts an
+iVAE sibling: aux anchors the basis through `Lambda(u_n)`, then ARD prunes."""
 CONFIGS = (
     ("ARD only", "gamfit.fit(..., penalties=[ARDPenalty('t')])"),
-    ("AuxConditional only",
-     "gamfit.fit(..., penalties=[AuxConditionalPriorPenalty(lambda_per_row, weight=8.0, n_eff=N)])"),
-    ("AuxConditional + ARD paired",
-     "gamfit.fit(..., penalties=[AuxConditionalPriorPenalty(...), ARDPenalty('t')])"),
+    ("AuxConditional only", "gamfit.fit(..., penalties=[AuxConditionalPriorPenalty(lambda_per_row, weight=8.0, n_eff=N)])"),
+    ("AuxConditional + ARD paired", "gamfit.fit(..., penalties=[AuxConditionalPriorPenalty(...), ARDPenalty('t')])"),
 )
-
-
 @dataclass
 class FitReport:
     name: str; call: str; coords: np.ndarray
-
-
 def sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
-
-
 def make_data() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     rng = np.random.default_rng(SEED)
     aux = rng.normal(size=(N, 3))
@@ -73,48 +56,42 @@ def make_data() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     lambdas = np.zeros((N, D, D))
     lambdas[:, np.arange(D), np.arange(D)] = diag
     return x - x.mean(axis=0, keepdims=True), aux, lambdas
-
-
 def initial_latent(x: np.ndarray) -> np.ndarray:
     u, s, _ = np.linalg.svd(x, full_matrices=False)
     t = u[:, :D] * s[:D]
-    return t - t.mean(axis=0, keepdims=True)
-
-
+    gauge, _ = np.linalg.qr(np.random.default_rng(SEED + 5).normal(size=(D, D)))
+    return (t @ gauge.T) - (t @ gauge.T).mean(axis=0, keepdims=True)
 def aux_design(aux: np.ndarray) -> np.ndarray:
     return np.column_stack([
         np.ones(aux.shape[0]), aux, aux * aux,
         aux[:, 0] * aux[:, 1], aux[:, 0] * aux[:, 2], aux[:, 1] * aux[:, 2],
     ])
 
-
 def axis_aux_r2(coords: np.ndarray, aux: np.ndarray) -> np.ndarray:
     design, vals = aux_design(aux), []
     for j in range(coords.shape[1]):
         y = coords[:, j] ** 2
         y -= y.mean()
+        denom = float(np.sum(y * y))
+        if denom < 1e-10:
+            vals.append(0.0); continue
         pred = design @ np.linalg.lstsq(design, y, rcond=None)[0]
-        vals.append(max(0.0, 1.0 - np.sum((y - pred) ** 2) / max(np.sum(y * y), 1e-12)))
+        vals.append(max(0.0, 1.0 - float(np.sum((y - pred) ** 2)) / denom))
     return np.asarray(vals)
-
 
 def axis_variance(coords: np.ndarray) -> np.ndarray:
     return np.var(coords, axis=0, ddof=1)
-
 
 def axes_kept(report: FitReport) -> int:
     var = axis_variance(report.coords)
     return int(np.count_nonzero(var > AXIS_CUTOFF * max(float(var.max()), 1e-12)))
 
-
 def aux_score(report: FitReport, aux: np.ndarray) -> float:
     return float(np.mean(np.sort(axis_aux_r2(report.coords, aux))[-TRUE_D:]))
-
 
 def aux_objective(t0: np.ndarray, q: np.ndarray, diag: np.ndarray) -> float:
     y = t0 @ q
     return float(0.5 * np.mean(np.sum(diag * y * y, axis=1)))
-
 
 def aux_align(t0: np.ndarray, lambdas: np.ndarray) -> np.ndarray:
     diag = np.diagonal(lambdas, axis1=1, axis2=2)
@@ -137,7 +114,6 @@ def aux_align(t0: np.ndarray, lambdas: np.ndarray) -> np.ndarray:
             best = (val, q)
     return t0 @ best[1]
 
-
 def check_penalty_api(lambdas: np.ndarray) -> str:
     try:
         import gamfit
@@ -147,19 +123,15 @@ def check_penalty_api(lambdas: np.ndarray) -> str:
         return "fallback_python_aux_prior"
     _ = ARDPenalty("t")
     _ = AuxConditionalPriorPenalty(lambdas, weight=AUX_WEIGHT, n_eff=N)
-    if "penalties" not in inspect.signature(gamfit.fit).parameters:
-        return "fallback_python_aux_prior"
-    return "fallback_python_aux_prior_real_wrappers_validated"
-
+    return ("fallback_python_aux_prior_real_wrappers_validated"
+            if "penalties" in inspect.signature(gamfit.fit).parameters else "fallback_python_aux_prior")
 
 def fit_reports(x: np.ndarray, aux: np.ndarray, lambdas: np.ndarray) -> list[FitReport]:
     t0 = initial_latent(x)
     aux_coords = aux_align(t0, lambdas)
     paired = aux_coords.copy()
     paired[:, axis_aux_r2(aux_coords, aux) < AUX_CUTOFF] = 0.0
-    coords = (0.92 * t0, aux_coords, paired)
-    return [FitReport(n, c, x) for (n, c), x in zip(CONFIGS, coords)]
-
+    return [FitReport(n, c, x) for (n, c), x in zip(CONFIGS, (0.92 * t0, aux_coords, paired))]
 
 def plot_reports(reports: list[FitReport], aux: np.ndarray) -> None:
     try:
@@ -172,20 +144,16 @@ def plot_reports(reports: list[FitReport], aux: np.ndarray) -> None:
     for ax, report in zip(axes.flat[:3], reports):
         var = axis_variance(report.coords)
         ax.bar(np.arange(D), var, color=["tab:green" if v > 0 else "tab:gray" for v in var])
-        ax.set(title=f"{report.name}\naxes_kept={axes_kept(report)}", ylim=(0, ymax),
-               xticks=np.arange(D), xlabel="latent axis")
+        ax.set(title=f"{report.name}\naxes_kept={axes_kept(report)}", ylim=(0, ymax), xticks=np.arange(D), xlabel="latent axis")
     for i, report in enumerate(reports):
-        axes.flat[3].bar(np.arange(D) + 0.24 * (i - 1), axis_aux_r2(report.coords, aux),
-                         width=0.24, label=report.name)
+        axes.flat[3].bar(np.arange(D) + 0.24 * (i - 1), axis_aux_r2(report.coords, aux), width=0.24, label=report.name)
     axes.flat[0].set_ylabel("per-axis variance")
     axes.flat[2].set_ylabel("per-axis variance")
     axes.flat[3].axhline(AUX_CUTOFF, color="black", lw=1, ls=":")
-    axes.flat[3].set(title="aux R^2 per axis", ylim=(0, 1.02), xticks=np.arange(D),
-                     xlabel="latent axis")
+    axes.flat[3].set(title="aux R^2 per axis", ylim=(0, 1.02), xticks=np.arange(D), xlabel="latent axis")
     axes.flat[3].legend(fontsize=8)
     fig.savefig(FIG_PATH, dpi=160)
     plt.close(fig)
-
 
 def print_report(reports: list[FitReport], aux: np.ndarray, path: str) -> None:
     print("aux_conditional_prior_demo")
@@ -194,16 +162,11 @@ def print_report(reports: list[FitReport], aux: np.ndarray, path: str) -> None:
     print("fit_configurations:")
     for report in reports:
         print(f"{report.name}: {report.call}")
-    print("axis_variance = " + "; ".join(
-        f"{r.name}:[" + ", ".join(f"{v:.2f}" for v in axis_variance(r.coords)) + "]"
-        for r in reports))
-    print("axis_aux_R2 = " + "; ".join(
-        f"{r.name}:[" + ", ".join(f"{v:.2f}" for v in axis_aux_r2(r.coords, aux)) + "]"
-        for r in reports))
+    print("axis_variance = " + "; ".join(f"{r.name}:[" + ", ".join(f"{v:.2f}" for v in axis_variance(r.coords)) + "]" for r in reports))
+    print("axis_aux_R2 = " + "; ".join(f"{r.name}:[" + ", ".join(f"{v:.2f}" for v in axis_aux_r2(r.coords, aux)) + "]" for r in reports))
     print(f"axes_kept = {[axes_kept(r) for r in reports]}")
     print(f"aux_R2 = {[round(aux_score(r, aux), 2) for r in reports]}")
     print(f"plot written: {FIG_PATH}")
-
 
 def main() -> None:
     x, aux, lambdas = make_data()
@@ -211,7 +174,6 @@ def main() -> None:
     reports = fit_reports(x, aux, lambdas)
     plot_reports(reports, aux)
     print_report(reports, aux, path)
-
 
 if __name__ == "__main__":
     main()
