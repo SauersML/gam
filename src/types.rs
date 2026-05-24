@@ -367,6 +367,13 @@ impl LikelihoodSpec {
         self.as_likelihood_family().pretty_name()
     }
 
+    /// Short identifier mirroring `LikelihoodFamily::name`, derived directly
+    /// from the `(response, link)` pair.
+    #[inline]
+    pub fn name(&self) -> &'static str {
+        self.as_likelihood_family().name()
+    }
+
     /// Build a `LikelihoodSpec` from a non-parameterized `LikelihoodFamily`
     /// variant. Returns `None` for the parameterized binomial variants
     /// (`Sas`, `BetaLogistic`, `Mixture`, `LatentCLogLog`) whose new

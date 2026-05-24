@@ -223,41 +223,6 @@ fn likelihood_spec_for_saved_model(model: &SavedModel) -> Result<LikelihoodSpec,
     }
 }
 
-/// Map a `LikelihoodSpec` back to the flat legacy `LikelihoodFamily` enum
-/// that the downstream sampling engine (`fit_gam`,
-/// `run_nuts_sampling_flattened_family`) still consumes. The mapping is
-/// total because every `(response, link)` combination produced by a saved
-/// model corresponds to exactly one legacy variant.
-fn legacy_family_from_spec(spec: &LikelihoodSpec) -> LikelihoodFamily {
-    match (&spec.response, &spec.link) {
-        (ResponseFamily::Gaussian, _) => LikelihoodFamily::GaussianIdentity,
-        (ResponseFamily::Poisson, _) => LikelihoodFamily::PoissonLog,
-        (ResponseFamily::Tweedie { p }, _) => LikelihoodFamily::Tweedie { p: *p },
-        (ResponseFamily::NegativeBinomial { theta }, _) => {
-            LikelihoodFamily::NegativeBinomial { theta: *theta }
-        }
-        (ResponseFamily::Beta { phi }, _) => LikelihoodFamily::BetaLogit { phi: *phi },
-        (ResponseFamily::Gamma, _) => LikelihoodFamily::GammaLog,
-        (ResponseFamily::RoystonParmar, _) => LikelihoodFamily::RoystonParmar,
-        (ResponseFamily::Binomial, link) => match link {
-            InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
-            InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
-            InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
-            InverseLink::Standard(_) => LikelihoodFamily::BinomialLogit,
-            InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
-            InverseLink::Sas(_) => LikelihoodFamily::BinomialSas,
-            InverseLink::BetaLogistic(_) => LikelihoodFamily::BinomialBetaLogistic,
-            InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
-        },
-    }
-}
-
-/// Human-readable label for a `LikelihoodSpec`, mirroring the legacy
-/// `LikelihoodFamily::pretty_name` used in error messages.
-fn spec_pretty_name(spec: &LikelihoodSpec) -> &'static str {
-    legacy_family_from_spec(spec).pretty_name()
-}
-
 #[inline]
 const fn splitmix64(x: u64) -> u64 {
     crate::linalg::utils::splitmix64_hash(x)
@@ -482,7 +447,7 @@ fn sample_standard(
             cfg,
         );
     }
-    let family = legacy_family_from_spec(&likelihood);
+    let family = likelihood.as_likelihood_family();
     let parsed = parse_formula(&model.formula)?;
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = data.column(y_col).to_owned();
