@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::cublas::sys::{cublasOperation_t, cublasSideMode_t, cublasStatus_t};
 use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, Gemv, GemvConfig};
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use ndarray::{Array2, ArrayBase, Data, Ix1};
 
 use super::device::GpuDeviceInfo;
@@ -431,7 +431,7 @@ fn cache() -> &'static SessionCache {
 
 fn upload_x(x: &Arc<Array2<f64>>) -> Option<DeviceXSession> {
     let runtime = GpuRuntime::global()?;
-    let device = runtime.selected_device()?.clone();
+    let device = runtime.selected_device().clone();
 
     let (rows, cols) = x.dim();
     if rows == 0 || cols == 0 {
@@ -440,13 +440,8 @@ fn upload_x(x: &Arc<Array2<f64>>) -> Option<DeviceXSession> {
 
     // Share the process-wide cached primary context for this device with
     // every other consumer (calibration, blas dispatchers, future sessions
-    // on the same ordinal). Falls back to a fresh `CudaContext::new` —
-    // also a primary-context retain under the hood — if the cache misses,
-    // which only happens for devices that weren't probed at startup.
-    let ctx = match cuda_context_for(device.ordinal) {
-        Some(ctx) => ctx,
-        None => CudaContext::new(device.ordinal).ok()?,
-    };
+    // on the same ordinal).
+    let ctx = cuda_context_for(device.ordinal)?;
     let stream = ctx.new_stream().ok()?;
     let blas = CudaBlas::new(stream.clone()).ok()?;
 

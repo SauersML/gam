@@ -12,7 +12,7 @@ pub(crate) fn log_cuda_enabled(device: &GpuDeviceInfo, policy: &GpuDispatchPolic
         device.name,
         format_bytes(device.total_mem_bytes),
         policy.xtwx_n_min,
-        format_count(policy.gemm_min_flops),
+        format_count(policy.gemm_min_flops as u64),
         format_count(policy.sparse_min_nnz as u64),
         policy.potrf_min_p,
         policy.syevd_min_p,
@@ -229,14 +229,6 @@ fn format_bytes(bytes: usize) -> String {
         format!("{:.2}KiB", bytes_f / KIB)
     } else {
         format!("{bytes}B")
-    }
-}
-
-fn format_float(value: f64) -> String {
-    if value >= 100.0 {
-        format!("{value:.0}")
-    } else {
-        format!("{value:.1}")
     }
 }
 
