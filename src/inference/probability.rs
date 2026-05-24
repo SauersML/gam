@@ -364,11 +364,7 @@ mod tests {
                 .expect("sas state"),
             ),
         );
-        let sas = try_inverse_link_array(
-            &sas_likelihood,
-            eta.view(),
-        )
-        .expect("SAS with params");
+        let sas = try_inverse_link_array(&sas_likelihood, eta.view()).expect("SAS with params");
         assert_eq!(sas.len(), eta.len());
         assert!(sas.iter().all(|p| p.is_finite() && *p > 0.0 && *p < 1.0));
 
@@ -379,11 +375,7 @@ mod tests {
         let state = state_fromspec(&spec).expect("mixture state");
         let mix_likelihood =
             LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Mixture(state));
-        let mix = try_inverse_link_array(
-            &mix_likelihood,
-            eta.view(),
-        )
-        .expect("mixture with state");
+        let mix = try_inverse_link_array(&mix_likelihood, eta.view()).expect("mixture with state");
         assert_eq!(mix.len(), eta.len());
         assert!(mix.iter().all(|p| p.is_finite() && *p > 0.0 && *p < 1.0));
     }

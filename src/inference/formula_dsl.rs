@@ -6,7 +6,7 @@ use pest_derive::Parser;
 
 use crate::smooth::BoundedCoefficientPriorSpec;
 use crate::types::{
-    InverseLink, LikelihoodFamily, LinkComponent, LinkFunction, WigglePenaltyConfig,
+    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, WigglePenaltyConfig,
 };
 
 #[derive(Parser)]
@@ -739,21 +739,15 @@ pub fn require_linkchoice_supports_joint_wiggle(
     }
 }
 
-pub const fn likelihood_family_supports_joint_wiggle(family: LikelihoodFamily) -> bool {
-    !matches!(
-        family,
-        LikelihoodFamily::BinomialLatentCLogLog
-            | LikelihoodFamily::BinomialSas
-            | LikelihoodFamily::BinomialBetaLogistic
-            | LikelihoodFamily::BinomialMixture
-    )
+pub const fn likelihood_spec_supports_joint_wiggle(likelihood: &LikelihoodSpec) -> bool {
+    inverse_link_supports_joint_wiggle(&likelihood.link)
 }
 
-pub fn require_likelihood_family_supports_joint_wiggle(
-    family: LikelihoodFamily,
+pub fn require_likelihood_spec_supports_joint_wiggle(
+    likelihood: &LikelihoodSpec,
     context: &str,
 ) -> Result<(), String> {
-    if likelihood_family_supports_joint_wiggle(family) {
+    if likelihood_spec_supports_joint_wiggle(likelihood) {
         Ok(())
     } else {
         Err(joint_wiggle_unsupported_link_message(context))

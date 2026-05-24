@@ -7566,7 +7566,7 @@ pub fn fit_term_collection_forspec(
     weights: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
     spec: &TermCollectionSpec,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
     fit_term_collection_forspecwith_heuristic_lambdas(
@@ -7581,7 +7581,7 @@ pub fn fit_term_collection_with_coefficient_groups(
     offset: ArrayView1<'_, f64>,
     spec: &TermCollectionSpec,
     groups: &[CoefficientGroupSpec],
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
     if groups.is_empty() {
@@ -7619,7 +7619,7 @@ pub fn fit_term_collection_with_penalty_block_gamma_prior_callback<F>(
     offset: ArrayView1<'_, f64>,
     spec: &TermCollectionSpec,
     callback: F,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError>
 where
@@ -7654,7 +7654,7 @@ pub fn fit_term_collection_with_penalty_block_gamma_priors(
     offset: ArrayView1<'_, f64>,
     spec: &TermCollectionSpec,
     priors: &[(String, f64, f64)],
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
     let design = build_term_collection_design(data, spec)?;
@@ -7687,7 +7687,7 @@ pub fn fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_prior
     spec: &TermCollectionSpec,
     groups: &[CoefficientGroupSpec],
     priors: &[(String, f64, f64)],
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
     if groups.is_empty() {
@@ -7735,7 +7735,7 @@ fn fit_term_collection_forspecwith_heuristic_lambdas(
     offset: ArrayView1<'_, f64>,
     spec: &TermCollectionSpec,
     heuristic_lambdas: Option<&[f64]>,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
     let base_design = build_term_collection_design(data, spec)?;
@@ -7767,7 +7767,7 @@ fn fit_term_collection_on_realized_design(
     spec: &TermCollectionSpec,
     design: &TermCollectionDesign,
     heuristic_lambdas: Option<&[f64]>,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
     if has_bounded_linear_terms(spec) {
@@ -8897,7 +8897,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     options: &FitOptions,
     runtime_caches: &[SpatialOperatorRuntimeCache],
 ) -> Result<FittedTermCollection, EstimationError> {
@@ -9850,7 +9850,7 @@ struct BoundedLinearTermMeta {
 
 #[derive(Clone)]
 struct BoundedLinearFamily {
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     latent_cloglog_state: Option<LatentCLogLogState>,
     mixture_link_state: Option<MixtureLinkState>,
     sas_link_state: Option<SasLinkState>,
@@ -9930,7 +9930,7 @@ fn bounded_prior_terms(theta: f64, prior: &BoundedCoefficientPriorSpec) -> (f64,
 }
 
 fn evaluate_standard_familyobservations(
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     latent_cloglog_state: Option<&LatentCLogLogState>,
     mixture_link_state: Option<&MixtureLinkState>,
     sas_link_state: Option<&SasLinkState>,
@@ -10193,7 +10193,7 @@ impl SpatialAdaptiveExactEvaluation {
 
 #[derive(Clone)]
 struct SpatialAdaptiveExactFamily {
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     latent_cloglog_state: Option<LatentCLogLogState>,
     mixture_link_state: Option<MixtureLinkState>,
     sas_link_state: Option<SasLinkState>,
@@ -11925,7 +11925,7 @@ fn fit_bounded_term_collection_with_design(
     spec: &TermCollectionSpec,
     design: &TermCollectionDesign,
     heuristic_lambdas: Option<&[f64]>,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     options: &FitOptions,
 ) -> Result<FittedTermCollection, EstimationError> {
     let conditioning_cols: Vec<usize> = spec
@@ -12699,7 +12699,7 @@ fn require_successful_spatial_optimization_result<T>(
 }
 
 fn external_opts_for_design(
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     design: &TermCollectionDesign,
     options: &FitOptions,
 ) -> ExternalOptimOptions {
@@ -12792,7 +12792,7 @@ fn evaluate_joint_reml_efs_at_theta(
 }
 
 fn exact_joint_spatial_outer_hessian_available(
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     design: &TermCollectionDesign,
 ) -> bool {
     // Every `LikelihoodFamily` variant (Gaussian, Binomial-*, Poisson, Gamma,
@@ -14702,7 +14702,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     offset: ArrayView1<'_, f64>,
     resolvedspec: &TermCollectionSpec,
     best: &FittedTermCollection,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     options: &FitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     spatial_terms: &[usize],
@@ -14921,7 +14921,7 @@ fn try_exact_joint_spatial_aniso_optimization(
     offset: ArrayView1<'_, f64>,
     resolvedspec: &TermCollectionSpec,
     baseline_design: &TermCollectionDesign,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     options: &FitOptions,
     spatial_terms: &[usize],
     dims_per_term: &[usize],
@@ -15281,7 +15281,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
     offset: ArrayView1<'_, f64>,
     resolvedspec: &TermCollectionSpec,
     baseline_design: &TermCollectionDesign,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     options: &FitOptions,
     spatial_terms: &[usize],
     dims_per_term: &[usize],
@@ -17390,7 +17390,7 @@ impl<'d> ExactJointDesignCache<'d> {
 }
 
 pub(crate) fn seed_risk_profile_for_likelihood_family(
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
 ) -> crate::seeding::SeedRiskProfile {
     match family {
         LikelihoodFamily::GaussianIdentity => crate::seeding::SeedRiskProfile::Gaussian,
@@ -18124,7 +18124,7 @@ fn try_exact_joint_latent_coord_optimization(
     offset: ArrayView1<'_, f64>,
     resolvedspec: &TermCollectionSpec,
     best: &FittedTermCollection,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     options: &FitOptions,
     latent: &StandardLatentCoordConfig,
 ) -> Result<FittedTermCollectionWithSpec, EstimationError> {
@@ -18510,7 +18510,7 @@ pub fn fit_term_collectionwith_latent_coord_optimization(
     offset: Array1<f64>,
     spec: &TermCollectionSpec,
     latent: &StandardLatentCoordConfig,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     options: &FitOptions,
 ) -> Result<FittedTermCollectionWithSpec, EstimationError> {
     let n = data.nrows();
@@ -18552,7 +18552,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     weights: Array1<f64>,
     offset: Array1<f64>,
     spec: &TermCollectionSpec,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     options: &FitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<FittedTermCollectionWithSpec, EstimationError> {
@@ -22061,7 +22061,7 @@ mod tests {
     fn iso_kappa_fd_variant_driver(
         label: &str,
         n: usize,
-        family: LikelihoodFamily,
+        family: LikelihoodSpec,
         use_thinplate: bool,
         skip_psi: bool,
     ) -> (bool, f64, Vec<String>) {
@@ -25874,7 +25874,10 @@ mod tests {
         let y = array![0.4, 1.0, 1.7, 2.2];
         let weights = Array1::ones(y.len());
         let family = BoundedLinearFamily {
-            family: LikelihoodFamily::GaussianIdentity,
+            family: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             latent_cloglog_state: None,
             mixture_link_state: None,
             sas_link_state: None,
@@ -25980,7 +25983,10 @@ mod tests {
     #[test]
     fn adaptive_exact_psigradient_symmetrizes_nearly_symmetrichessian() {
         let family = SpatialAdaptiveExactFamily {
-            family: LikelihoodFamily::GaussianIdentity,
+            family: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             latent_cloglog_state: None,
             mixture_link_state: None,
             sas_link_state: None,
@@ -26542,7 +26548,10 @@ mod tests {
                 .collect::<Vec<_>>(),
         ];
         let base_family = SpatialAdaptiveExactFamily {
-            family: LikelihoodFamily::GaussianIdentity,
+            family: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             latent_cloglog_state: None,
             mixture_link_state: None,
             sas_link_state: None,
@@ -26760,7 +26769,10 @@ mod tests {
                 .collect::<Vec<_>>(),
         ];
         let base_family = SpatialAdaptiveExactFamily {
-            family: LikelihoodFamily::GaussianIdentity,
+            family: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             latent_cloglog_state: None,
             mixture_link_state: None,
             sas_link_state: None,
