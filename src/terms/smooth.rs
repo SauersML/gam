@@ -14735,7 +14735,7 @@ impl SingleBlockLatentCoordDesignCache {
         })?;
         match (&termspec.basis, &smooth_term.metadata) {
             (
-                SmoothBasisSpec::Matern { .. },
+                SmoothBasisSpec::Matern { spec, .. },
                 BasisMetadata::Matern {
                     centers,
                     length_scale,
@@ -14750,6 +14750,7 @@ impl SingleBlockLatentCoordDesignCache {
                 aniso_log_scales: aniso_log_scales
                     .clone()
                     .unwrap_or_else(|| vec![0.0; centers.ncols()]),
+                chunk_size: spec.streaming_chunk_size,
             }),
             (
                 SmoothBasisSpec::Duchon { .. },

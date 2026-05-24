@@ -187,12 +187,14 @@ class Matern(Smooth):
     aniso_log_scales : optional length-d sequence. Per-axis log-scale
         contrasts with sum constraint Σ η_a = 0, implementing geometric
         anisotropy ``Λ = κ·diag(exp η)``. ``None`` uses isotropic.
+    streaming_chunk_size : optional row chunk size for streaming design evaluation.
     """
 
     centers: Any = None
     nu: float = 1.5
     length_scale: float = 1.0
     aniso_log_scales: Sequence[float] | None = None
+    streaming_chunk_size: int | None = None
 
 
 @dataclass(init=False, slots=True)
