@@ -55,14 +55,14 @@ fn rho_so3_jvp(omega: [f64; 3], domega: [f64; 3]) -> Array2<f64> {
 
 /// EquivariantPenalty commutator residual ½‖resid·z‖²,
 /// resid = W ρ(θ) − P_W W ρ(θ),  P_W = W (W^T W)^{-1} W^T.
-fn commutator_residual_so2(W: &Array3<f64>, theta: &Array2<f64>, z: &Array2<f64>) -> f64 {
-    let (n_atoms, d, r) = (W.shape()[0], W.shape()[1], W.shape()[2]);
+fn commutator_residual_so2(w_frame: &Array3<f64>, theta: &Array2<f64>, z: &Array2<f64>) -> f64 {
+    let (n_atoms, _d, r) = (w_frame.shape()[0], w_frame.shape()[1], w_frame.shape()[2]);
     assert_eq!(r, 2, "SO(2) needs R=2");
     let n_b = theta.shape()[0];
     let mut total = 0.0;
     let mut count = 0usize;
     for a in 0..n_atoms {
-        let wa = W.slice(s![a, .., ..]).to_owned(); // (D, 2)
+        let wa = w_frame.slice(s![a, .., ..]).to_owned(); // (D, 2)
         // WtW^{-1}
         let wtw = wa.t().dot(&wa) + Array2::<f64>::eye(2) * 1e-6;
         let det = wtw[[0, 0]] * wtw[[1, 1]] - wtw[[0, 1]] * wtw[[1, 0]];
@@ -95,12 +95,12 @@ fn commutator_residual_so2(W: &Array3<f64>, theta: &Array2<f64>, z: &Array2<f64>
 fn so2_unitarity_and_determinant() {
     assert!(file!().ends_with(".rs"));
     for &theta in &[0.0, 0.3, 1.1, std::f64::consts::PI, 4.7, -2.3] {
-        let R = rho_so2(theta);
-        let RtR = R.t().dot(&R);
-        assert_relative_eq!(RtR[[0, 0]], 1.0, epsilon = 1e-12);
-        assert_relative_eq!(RtR[[1, 1]], 1.0, epsilon = 1e-12);
-        assert_relative_eq!(RtR[[0, 1]], 0.0, epsilon = 1e-12);
-        let det = R[[0, 0]] * R[[1, 1]] - R[[0, 1]] * R[[1, 0]];
+        let r_mat = rho_so2(theta);
+        let rt_r = r_mat.t().dot(&r_mat);
+        assert_relative_eq!(rt_r[[0, 0]], 1.0, epsilon = 1e-12);
+        assert_relative_eq!(rt_r[[1, 1]], 1.0, epsilon = 1e-12);
+        assert_relative_eq!(rt_r[[0, 1]], 0.0, epsilon = 1e-12);
+        let det = r_mat[[0, 0]] * r_mat[[1, 1]] - r_mat[[0, 1]] * r_mat[[1, 0]];
         assert_relative_eq!(det, 1.0, epsilon = 1e-12);
     }
 }
@@ -117,18 +117,18 @@ fn so3_unitarity_rodrigues() {
         [0.3, 0.4, 1.2],
         [1e-8, 0.0, 0.0],
     ] {
-        let R = rho_so3(omega);
-        let RtR = R.t().dot(&R);
+        let r_mat = rho_so3(omega);
+        let rt_r = r_mat.t().dot(&r_mat);
         for i in 0..3 {
             for j in 0..3 {
                 let target = if i == j { 1.0 } else { 0.0 };
-                assert_relative_eq!(RtR[[i, j]], target, epsilon = 1e-10);
+                assert_relative_eq!(rt_r[[i, j]], target, epsilon = 1e-10);
             }
         }
         // det = +1
-        let det = R[[0, 0]] * (R[[1, 1]] * R[[2, 2]] - R[[1, 2]] * R[[2, 1]])
-            - R[[0, 1]] * (R[[1, 0]] * R[[2, 2]] - R[[1, 2]] * R[[2, 0]])
-            + R[[0, 2]] * (R[[1, 0]] * R[[2, 1]] - R[[1, 1]] * R[[2, 0]]);
+        let det = r_mat[[0, 0]] * (r_mat[[1, 1]] * r_mat[[2, 2]] - r_mat[[1, 2]] * r_mat[[2, 1]])
+            - r_mat[[0, 1]] * (r_mat[[1, 0]] * r_mat[[2, 2]] - r_mat[[1, 2]] * r_mat[[2, 0]])
+            + r_mat[[0, 2]] * (r_mat[[1, 0]] * r_mat[[2, 1]] - r_mat[[1, 1]] * r_mat[[2, 0]]);
         assert_relative_eq!(det, 1.0, epsilon = 1e-10);
     }
 }
@@ -140,11 +140,11 @@ fn so3_unitarity_rodrigues() {
 fn commutator_residual_gradient_fd() {
     // 1 atom, D=4, R=2. Make W a (4, 2) frame that is NOT ρ-invariant —
     // grad w.r.t. θ should be non-zero, and FD should agree with analytic.
-    let mut W = Array3::<f64>::zeros((1, 4, 2));
-    W[[0, 0, 0]] = 1.0;
-    W[[0, 1, 1]] = 1.0; // first two coords align
-    W[[0, 2, 0]] = 0.3;
-    W[[0, 3, 1]] = 0.5; // extra mass in other coords
+    let mut w = Array3::<f64>::zeros((1, 4, 2));
+    w[[0, 0, 0]] = 1.0;
+    w[[0, 1, 1]] = 1.0; // first two coords align
+    w[[0, 2, 0]] = 0.3;
+    w[[0, 3, 1]] = 0.5; // extra mass in other coords
     let theta0 = array![[0.7]];
     let z = array![[1.0]];
 
@@ -154,8 +154,8 @@ fn commutator_residual_gradient_fd() {
     t_p[[0, 0]] += h;
     let mut t_m = theta0.clone();
     t_m[[0, 0]] -= h;
-    let fp = commutator_residual_so2(&W, &t_p, &z);
-    let fm = commutator_residual_so2(&W, &t_m, &z);
+    let fp = commutator_residual_so2(&w, &t_p, &z);
+    let fm = commutator_residual_so2(&w, &t_m, &z);
     let grad_fd = (fp - fm) / (2.0 * h);
 
     // Analytic grad: d/dθ ‖(I - P) W ρ(θ) e_1‖² · ½
@@ -168,8 +168,8 @@ fn commutator_residual_gradient_fd() {
     t_p2[[0, 0]] += h2;
     let mut t_m2 = theta0.clone();
     t_m2[[0, 0]] -= h2;
-    let grad_fd2 = (commutator_residual_so2(&W, &t_p2, &z)
-        - commutator_residual_so2(&W, &t_m2, &z))
+    let grad_fd2 = (commutator_residual_so2(&w, &t_p2, &z)
+        - commutator_residual_so2(&w, &t_m2, &z))
         / (2.0 * h2);
     // Both FD estimates should be finite and agree to ~1e-3 relative.
     assert!(grad_fd.is_finite());
@@ -182,7 +182,7 @@ fn commutator_residual_gradient_fd() {
         grad_fd2
     );
     // Non-trivial: penalty is non-zero somewhere on its θ-trajectory.
-    let f0 = commutator_residual_so2(&W, &theta0, &z);
+    let f0 = commutator_residual_so2(&w, &theta0, &z);
     assert!(f0 > 0.0, "residual should be positive for non-invariant W");
 }
 
@@ -204,10 +204,10 @@ fn reml_jointly_selects_lambda_eq_and_bandwidth() {
     }
     // Random frame W (4 x 2). Use deterministic init for reproducibility.
     let w_arr = array![[1.0, 0.0], [0.0, 1.0], [0.1, 0.0], [0.0, 0.2]];
-    let mut W = Array3::<f64>::zeros((1, 4, 2));
+    let mut w = Array3::<f64>::zeros((1, 4, 2));
     for i in 0..4 {
         for j in 0..2 {
-            W[[0, i, j]] = w_arr[[i, j]];
+            w[[0, i, j]] = w_arr[[i, j]];
         }
     }
 
@@ -234,7 +234,7 @@ fn reml_jointly_selects_lambda_eq_and_bandwidth() {
             }
             t
         };
-        let comm = commutator_residual_so2(&W, &theta_b, &z);
+        let comm = commutator_residual_so2(&w, &theta_b, &z);
         let ard = ard_w * (1.0 + b * b).ln();
         scores.push(lambda_eq * comm + ard);
     }
