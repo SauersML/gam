@@ -627,14 +627,14 @@ pub struct SaeManifoldLoss {
 }
 
 impl SaeManifoldLoss {
-    pub fn total(&self) -> f64 {
+    pub const fn total(&self) -> f64 {
         self.data_fit + self.assignment_sparsity + self.smoothness + self.ard
     }
 
     /// Laplace/REML wrappers rank larger evidence higher. This local score is
     /// the negative penalized objective, used when a full `RemlState` is not
     /// driving the term yet.
-    pub fn evidence_proxy(&self) -> f64 {
+    pub const fn evidence_proxy(&self) -> f64 {
         -self.total()
     }
 }
