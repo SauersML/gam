@@ -52,16 +52,17 @@ use crate::terms::latent_coord::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };
 use crate::terms::{
-    ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DifferenceOpKind,
-    IBPAssignmentPenalty, IsometryPenalty, NuclearNormPenalty, OrthogonalityPenalty, PenaltyTier,
-    PsiSlice, SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TotalVariationPenalty,
+    ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, AuxConditionalPriorPenalty,
+    DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty, NuclearNormPenalty,
+    OrthogonalityPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty,
+    SparsityPenalty, TotalVariationPenalty,
 };
 use crate::survival::PenaltyBlock;
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkSpec, SasLinkSpec,
     WigglePenaltyConfig,
 };
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis, s};
 use serde_json::Value as JsonValue;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -3292,6 +3293,30 @@ fn build_standard_latent_analytic_penalty_registry(
                         n_eff,
                         smoothing_eps,
                         max_rank,
+                        learnable,
+                    )
+                    .map_err(|err| format!("{context}: {err}"))?,
+                )));
+            }
+            "aux_conditional_prior" => {
+                let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = analytic_descriptor_usize(descriptor, "n_eff", target.n)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                let lambda_per_row = analytic_descriptor_array3_flat(
+                    descriptor,
+                    "lambda_per_row",
+                    "lambda_per_row_shape",
+                    &context,
+                )?;
+                registry.push(AnalyticPenaltyKind::AuxConditionalPrior(Arc::new(
+                    AuxConditionalPriorPenalty::new(
+                        slice,
+                        lambda_per_row,
+                        weight,
+                        n_eff,
                         learnable,
                     )
                     .map_err(|err| format!("{context}: {err}"))?,
