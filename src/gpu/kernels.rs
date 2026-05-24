@@ -1,22 +1,15 @@
-/// Validation tolerances for GPU-vs-CPU comparisons.  GPU reductions are not
-/// expected to be bit-identical because their addition tree differs.
-#[derive(Clone, Copy, Debug)]
-pub struct ValidationTolerances {
-    pub relative: f64,
-    pub absolute: f64,
-}
+use crate::gpu::memory::DeviceMatrix;
+use crate::gpu::stream::GpuStream;
 
-impl Default for ValidationTolerances {
-    fn default() -> Self {
-        Self {
-            relative: 1e-10,
-            absolute: 1e-10,
-        }
-    }
-}
+pub trait DeviceDesignOperator {
+    fn rows(&self) -> usize;
+    fn cols(&self) -> usize;
 
-#[must_use]
-pub fn within_tolerance(cpu: f64, gpu: f64, tol: ValidationTolerances) -> bool {
-    let scale = cpu.abs().max(gpu.abs()).max(1.0);
-    (cpu - gpu).abs() <= tol.absolute.max(tol.relative * scale)
+    fn materialize_chunk_device(
+        &self,
+        row_start: usize,
+        row_count: usize,
+        out: &mut DeviceMatrix<f64>,
+        stream: &GpuStream,
+    ) -> Result<(), String>;
 }
