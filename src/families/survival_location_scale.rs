@@ -1957,17 +1957,11 @@ impl SurvivalLocationScaleFamily {
         /// surrounding scope.
         #[derive(Clone, Copy)]
         struct SendPtr(*mut f64);
-        // SAFETY: `SendPtr` is only ever constructed below from
-        // `Array1::<f64>::as_mut_ptr()` on buffers of length `n` whose
-        // exclusive mutable borrow is released before the `into_par_iter`
-        // closure runs. The closure writes a unique index `i ∈ 0..n` per
-        // iteration (rayon `(0..n).into_par_iter()`), so the writes are
-        // disjoint and never alias. The pointers do not outlive this function.
+        // SAFETY: SendPtr is constructed from Array1::as_mut_ptr() on
+        // length-n buffers; the rayon (0..n).into_par_iter() driver gives
+        // each thread a unique i, so writes via SendPtr never alias.
         unsafe impl Send for SendPtr {}
-        // SAFETY: Sync is sound for the same disjoint-index reason — every
-        // thread that observes `&SendPtr` only writes a unique row index
-        // owned by that rayon iteration, so no two threads ever touch the
-        // same `*mut f64` slot.
+        // SAFETY: same disjoint-index invariant as the Send impl above.
         unsafe impl Sync for SendPtr {}
         impl SendPtr {
             #[inline(always)]

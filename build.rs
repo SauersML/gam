@@ -402,8 +402,16 @@ fn scan_for_banned_substrings(
             return;
         }
         let mask = compute_test_mask(content, rel);
+        // Use the state-carrying stripper so substrings that appear inside
+        // multi-line `"..."` literals (the common false-positive: long
+        // multi-line error messages that mention `panic!`, `unsafe`, etc.
+        // by name) do not trip the scanner.
+        let stripped_lines = strip_file_lines(content);
         for (idx, line) in content.lines().enumerate() {
-            let stripped = strip_strings_and_comments(line);
+            let stripped = stripped_lines
+                .get(idx)
+                .map(String::as_str)
+                .unwrap_or(line);
             let in_test = mask.get(idx).copied().unwrap_or(false);
             for (needle, label, test_aware) in needles {
                 if *test_aware && in_test {
@@ -623,9 +631,16 @@ fn scan_for_unsafe_without_safety(
             return;
         }
         let lines: Vec<&str> = content.lines().collect();
+        // State-aware stripper so the `unsafe` token inside a multi-line
+        // `"..."` literal (e.g., a long diagnostic message that names the
+        // word "unsafe") is masked out before keyword detection.
+        let stripped_lines = strip_file_lines(content);
         for (idx, line) in lines.iter().enumerate() {
-            let stripped = strip_strings_and_comments(line);
-            if !line_has_keyword(&stripped, "unsafe") {
+            let stripped = stripped_lines
+                .get(idx)
+                .map(String::as_str)
+                .unwrap_or(line);
+            if !line_has_keyword(stripped, "unsafe") {
                 continue;
             }
             if line.contains("SAFETY:") {
@@ -634,7 +649,7 @@ fn scan_for_unsafe_without_safety(
             // `unsafe impl Send` / `unsafe impl Sync` — the SAFETY
             // rationale belongs on the type's documentation, not the impl
             // line. Skip both spellings, whitespace-tolerant.
-            if is_unsafe_marker_impl(&stripped) {
+            if is_unsafe_marker_impl(stripped) {
                 continue;
             }
             // Scan up to 3 preceding non-blank lines for `// SAFETY:`.
@@ -714,9 +729,13 @@ fn scan_for_transmute_without_safety(
             return;
         }
         let lines: Vec<&str> = content.lines().collect();
+        let stripped_lines = strip_file_lines(content);
         for (idx, line) in lines.iter().enumerate() {
-            let stripped = strip_strings_and_comments(line);
-            if !line_has_keyword(&stripped, "transmute") {
+            let stripped = stripped_lines
+                .get(idx)
+                .map(String::as_str)
+                .unwrap_or(line);
+            if !line_has_keyword(stripped, "transmute") {
                 continue;
             }
             if !stripped.contains("mem::") && !stripped.contains("transmute::<") {
@@ -771,11 +790,15 @@ fn scan_for_panic_without_safety(
         }
         let mask = compute_test_mask(content, rel);
         let lines: Vec<&str> = content.lines().collect();
+        let stripped_lines = strip_file_lines(content);
         for (idx, line) in lines.iter().enumerate() {
             if mask.get(idx).copied().unwrap_or(false) {
                 continue;
             }
-            let stripped = strip_strings_and_comments(line);
+            let stripped = stripped_lines
+                .get(idx)
+                .map(String::as_str)
+                .unwrap_or(line);
             if !stripped.contains("panic!(") {
                 continue;
             }
@@ -1387,15 +1410,57 @@ fn scan_for_let_underscore(
             return;
         }
         let mask = compute_test_mask(content, rel);
+        let stripped_lines = strip_file_lines(content);
         for (idx, line) in content.lines().enumerate() {
             if mask.get(idx).copied().unwrap_or(false) {
                 continue;
             }
-            if line_has_let_underscore(line) {
+            let stripped = stripped_lines
+                .get(idx)
+                .map(String::as_str)
+                .unwrap_or(line);
+            if stripped_line_has_let_underscore(stripped) {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }
         }
     });
+}
+
+/// `let _...` detector that runs over an already-stripped line (string and
+/// comment contents already masked to spaces). Looks for `let` followed by
+/// an optional `mut` and then `_`.
+fn stripped_line_has_let_underscore(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + 3 < bytes.len()
+            && &bytes[i..i + 3] == b"let"
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && bytes[i + 3].is_ascii_whitespace()
+        {
+            let mut j = i + 3;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j + 3 <= bytes.len()
+                && &bytes[j..j + 3] == b"mut"
+                && j + 3 < bytes.len()
+                && bytes[j + 3].is_ascii_whitespace()
+            {
+                j += 3;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+            }
+            if j < bytes.len() && bytes[j] == b'_' {
+                return true;
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Returns true when `line` contains a `let` (optionally followed by `mut`)
