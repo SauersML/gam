@@ -1605,24 +1605,10 @@ pub fn sextic_qprime_coefficients(c0: f64, c1: f64, c2: f64, c3: f64) -> [f64; 6
     ]
 }
 
-#[inline]
-pub fn moment_boundary_term(cell: DenestedCubicCell, n: usize) -> f64 {
-    let left_term = if cell.left.is_infinite() {
-        0.0
-    } else {
-        cell.left.powi(n as i32) * (-cell.q(cell.left)).exp()
-    };
-    let right_term = if cell.right.is_infinite() {
-        0.0
-    } else {
-        cell.right.powi(n as i32) * (-cell.q(cell.right)).exp()
-    };
-    right_term - left_term
-}
-
-/// Same as [`moment_boundary_term`] but takes precomputed `left^n` and
-/// `right^n` so callers can roll the powers across a recurrence — each
-/// iteration becomes one multiply instead of a fresh `powi(n)`.
+/// Boundary term `right^n · exp(−q(right)) − left^n · exp(−q(left))` used by
+/// the moment recurrences. Takes precomputed `left^n` and `right^n` so callers
+/// can roll the powers across a recurrence — each iteration becomes one
+/// multiply instead of a fresh `powi(n)`.
 #[inline]
 fn moment_boundary_term_with_powers(
     cell: DenestedCubicCell,
