@@ -16126,7 +16126,9 @@ pub(crate) fn hutchpp_estimate_trace_hinv_operator<H: HessianOperator + ?Sized>(
                 let stderr = (var / n).sqrt();
                 let denom = (mean.abs()).max(config.tau_rel);
                 if stderr / denom <= config.relative_tol {
-                    let _ = m; // matvec count just for documentation
+                    // `m` is the matvec count at exit, useful for
+                    // diagnostics but not consumed by the caller.
+                    drop(m);
                     break;
                 }
             }

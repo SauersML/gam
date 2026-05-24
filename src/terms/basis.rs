@@ -2729,6 +2729,12 @@ pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usiz
     let needed = first.saturating_add(second);
     match policy.derivative_storage_mode {
         crate::resource::DerivativeStorageMode::AnalyticOperatorRequired => {
+            // SAFETY: this assertion helper exists specifically to enforce
+            // the biobank-scale invariant that spatial-PC Duchon derivative
+            // designs never persist as dense `Array2<f64>` storage. When the
+            // resource policy is `AnalyticOperatorRequired`, any caller that
+            // reached this point has materialized something the strict
+            // operator contract forbids.
             panic!(
                 "spatial PC Duchon derivative designs must remain operator-backed; refused persistent dense derivative materialization (n={n}, p={p}, d_pc={d_pc}, first_order={:.1} MiB, second_order={:.1} MiB)",
                 first as f64 / (1024.0 * 1024.0),
@@ -25510,6 +25516,11 @@ pub mod closed_form_penalty {
             {
                 return bundle.value / eta.iter().sum::<f64>().exp();
             }
+            // SAFETY: zero-lag self-pair values are well-defined only when the
+            // nullspace-order condition (m > d/2 + s) holds; the public
+            // Duchon constructors validate this at term creation, so a
+            // missing analytic bundle here means an unvalidated tuple
+            // reached the kernel evaluator — a caller-contract violation.
             panic!(
                 "anisotropic_duchon_penalty_radial: zero lag has no finite analytic self-pair for q={q} d={d} m={m} s={s}"
             );
@@ -26033,6 +26044,12 @@ pub mod closed_form_penalty {
                 let g_u2 = f4;
                 (g, g_r, g_s1, g_s2, g_u1, g_u2)
             }
+            // SAFETY: `q` is the spatial-derivative order of the radial
+            // Duchon kernel, which the type-level callers (q=0,1,2 only via
+            // `RadialKernel::value`/`gradient`/`laplacian`) restrict to
+            // `{0, 1, 2}`; reaching this wildcard means an unsupported `q`
+            // was forwarded by an internal entry point that should never
+            // expose it.
             _ => panic!("radial_g_q_partials: q must be in {{0, 1, 2}}"),
         }
     }
@@ -26188,6 +26205,11 @@ pub mod closed_form_penalty {
                     g_u1u1, 0.0, 0.0,
                 )
             }
+            // SAFETY: companion to `radial_g_q_partials` above — `q` is
+            // statically restricted to `{0, 1, 2}` by the public radial
+            // kernel API (value/gradient/laplacian only). An unsupported `q`
+            // here means an internal helper forwarded an out-of-contract
+            // value.
             _ => panic!("radial_g_q_hessian: q must be in {{0, 1, 2}}"),
         }
     }
