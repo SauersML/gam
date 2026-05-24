@@ -1,18 +1,16 @@
+//! Placeholder module for the CUDA backend phase described in the GPU HAL.
+//!
+//! The public HAL is present so solver call sites can be routed without CUDA
+//! types. Concrete cudarc kernels are intentionally isolated here in follow-up
+//! implementations and unavailable backends fall back to CPU numerics.
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StreamRole {
-    Main,
-    LinkKernel,
-    XtWx,
-    Reduction,
+pub enum BackendStatus {
+    CpuFallback,
+    CudaUnavailable,
+    CudaReady,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct GpuStreamPool {
-    pub streams: usize,
-}
-
-impl GpuStreamPool {
-    pub fn new(streams: usize) -> Self {
-        Self { streams }
-    }
+pub fn backend_status() -> BackendStatus {
+    BackendStatus::CpuFallback
 }

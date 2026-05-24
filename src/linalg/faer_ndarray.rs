@@ -377,17 +377,18 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     }
     let (n, p) = a.dim();
     let (_, q) = b.dim();
-    let op = Operation::Gemm {
-        m: n,
-        n: q,
-        k: p,
-        resident: false,
-    };
-    gpu_linalg::profile_cpu(op, || {
-        let mut out = Array2::<f64>::zeros((n, q));
-        fast_ab_into(a, b, &mut out);
-        out
-    })
+    crate::gpu::profile::cpu_scope(
+        "fast_ab",
+        n,
+        q,
+        a.ncols(),
+        n.saturating_mul(q).saturating_mul(8),
+        || {
+            let mut out = Array2::<f64>::zeros((n, q));
+            fast_ab_into(a, b, &mut out);
+            out
+        },
+    )
 }
 
 /// Compute A * v using faer's SIMD-optimized GEMV.
@@ -397,9 +398,17 @@ pub fn fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     v: &ArrayBase<S2, Ix1>,
 ) -> Array1<f64> {
-    if let Some(out) = crate::gpu::linalg::try_fast_av(a, v) {
-        return out;
-    }
+    let (n, p) = a.dim();
+    crate::gpu::profile::cpu_scope("fast_av", n, 1, p, n.saturating_mul(8), || {
+        fast_av_impl(a, v)
+    })
+}
+
+#[inline]
+fn fast_av_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    v: &ArrayBase<S2, Ix1>,
+) -> Array1<f64> {
     use faer::linalg::matmul::matmul;
     use faer::{Accum, Mat};
 
@@ -461,10 +470,18 @@ pub fn fast_av_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     v: &ArrayBase<S2, Ix1>,
     out: &mut Array1<f64>,
 ) {
-    if let Some(gpu_out) = crate::gpu::linalg::try_fast_av(a, v) {
-        out.assign(&gpu_out);
-        return;
-    }
+    let (n, p) = a.dim();
+    crate::gpu::profile::cpu_scope("fast_av_into", n, 1, p, n.saturating_mul(8), || {
+        fast_av_into_impl(a, v, out);
+    });
+}
+
+#[inline]
+fn fast_av_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    v: &ArrayBase<S2, Ix1>,
+    out: &mut Array1<f64>,
+) {
     use faer::Accum;
     use faer::linalg::matmul::matmul;
 
@@ -512,6 +529,18 @@ pub fn fast_av_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 /// `out` must have length n where A is (n, p) and v is length p.
 #[inline]
 pub fn fast_av_view_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    v: &ArrayBase<S2, Ix1>,
+    out: ArrayViewMut1<'_, f64>,
+) {
+    let (n, p) = a.dim();
+    crate::gpu::profile::cpu_scope("fast_av_view_into", n, 1, p, n.saturating_mul(8), || {
+        fast_av_view_into_impl(a, v, out);
+    });
+}
+
+#[inline]
+fn fast_av_view_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     v: &ArrayBase<S2, Ix1>,
     mut out: ArrayViewMut1<'_, f64>,
@@ -569,9 +598,17 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     v: &ArrayBase<S2, Ix1>,
 ) -> Array1<f64> {
-    if let Some(out) = crate::gpu::linalg::try_fast_atv(a, v) {
-        return out;
-    }
+    let (n, p) = a.dim();
+    crate::gpu::profile::cpu_scope("fast_atv", p, 1, n, p.saturating_mul(8), || {
+        fast_atv_impl(a, v)
+    })
+}
+
+#[inline]
+fn fast_atv_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    v: &ArrayBase<S2, Ix1>,
+) -> Array1<f64> {
     use faer::linalg::matmul::matmul;
     use faer::{Accum, Mat};
 
@@ -633,10 +670,18 @@ pub fn fast_atv_into<S: Data<Elem = f64>>(
     v: &Array1<f64>,
     out: &mut Array1<f64>,
 ) {
-    if let Some(gpu_out) = crate::gpu::linalg::try_fast_atv(a, v) {
-        out.assign(&gpu_out);
-        return;
-    }
+    let (n, p) = a.dim();
+    crate::gpu::profile::cpu_scope("fast_atv_into", p, 1, n, p.saturating_mul(8), || {
+        fast_atv_into_impl(a, v, out);
+    });
+}
+
+#[inline]
+fn fast_atv_into_impl<S: Data<Elem = f64>>(
+    a: &ArrayBase<S, Ix2>,
+    v: &Array1<f64>,
+    out: &mut Array1<f64>,
+) {
     use faer::Accum;
     use faer::linalg::matmul::matmul;
 
@@ -690,7 +735,14 @@ pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     w: &ArrayBase<S2, Ix1>,
 ) -> Array2<f64> {
     let (_, p) = x.dim();
-    fast_xt_diag_x_with_parallelism(x, w, matmul_parallelism(p, p, x.nrows()))
+    crate::gpu::profile::cpu_scope(
+        "fast_xt_diag_x",
+        p,
+        p,
+        x.nrows(),
+        x.nrows().saturating_mul(p).saturating_mul(16),
+        || fast_xt_diag_x_with_parallelism(x, w, matmul_parallelism(p, p, x.nrows())),
+    )
 }
 
 /// Compute A^T * diag(W) * A with an explicit faer parallelism policy for
@@ -701,19 +753,19 @@ pub fn fast_xt_diag_x_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64
     w: &ArrayBase<S2, Ix1>,
     par: Par,
 ) -> Array2<f64> {
-    if let GpuDispatch::Executed(out) = gpu_linalg::try_fast_xt_diag_x(x, w) {
-        return out;
-    }
-    let op = Operation::XtDiagX {
-        rows: x.nrows(),
-        cols: x.ncols(),
-        resident: false,
-    };
-    gpu_linalg::profile_cpu(op, || fast_xt_diag_x_cpu_with_parallelism(x, w, par))
+    let (n, p) = x.dim();
+    crate::gpu::profile::cpu_scope(
+        "fast_xt_diag_x_with_parallelism",
+        p,
+        p,
+        n,
+        n.saturating_mul(p).saturating_mul(16),
+        || fast_xt_diag_x_with_parallelism_impl(x, w, par),
+    )
 }
 
 #[inline]
-fn fast_xt_diag_x_cpu_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+fn fast_xt_diag_x_with_parallelism_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     x: &ArrayBase<S1, Ix2>,
     w: &ArrayBase<S2, Ix1>,
     par: Par,
@@ -846,20 +898,21 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
     w: &ArrayBase<S2, Ix1>,
     y: &ArrayBase<S3, Ix2>,
 ) -> Array2<f64> {
-    if let GpuDispatch::Executed(out) = gpu_linalg::try_fast_xt_diag_y(x, w, y) {
-        return out;
-    }
-    let op = Operation::XtDiagY {
-        rows: x.nrows(),
-        x_cols: x.ncols(),
-        y_cols: y.ncols(),
-        resident: false,
-    };
-    gpu_linalg::profile_cpu(op, || fast_xt_diag_y_cpu(x, w, y))
+    let n = x.nrows();
+    let px = x.ncols();
+    let q = y.ncols();
+    crate::gpu::profile::cpu_scope(
+        "fast_xt_diag_y",
+        px,
+        q,
+        n,
+        n.saturating_mul(px + q).saturating_mul(16),
+        || fast_xt_diag_y_impl(x, w, y),
+    )
 }
 
 #[inline]
-fn fast_xt_diag_y_cpu<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem = f64>>(
+fn fast_xt_diag_y_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem = f64>>(
     x: &ArrayBase<S1, Ix2>,
     w: &ArrayBase<S2, Ix1>,
     y: &ArrayBase<S3, Ix2>,
@@ -989,23 +1042,20 @@ pub fn fast_joint_hessian_2x2<
     w_ab: &ArrayBase<S4, Ix1>,
     w_bb: &ArrayBase<S5, Ix1>,
 ) -> Array2<f64> {
-    if let GpuDispatch::Executed(out) =
-        gpu_linalg::try_fast_joint_hessian_2x2(x_a, x_b, w_aa, w_ab, w_bb)
-    {
-        return out;
-    }
-    let op = Operation::JointHessian2x2 {
-        rows: x_a.nrows(),
-        a_cols: x_a.ncols(),
-        b_cols: x_b.ncols(),
-        resident: false,
-    };
-    gpu_linalg::profile_cpu(op, || {
-        fast_joint_hessian_2x2_cpu(x_a, x_b, w_aa, w_ab, w_bb)
-    })
+    let n = x_a.nrows();
+    let total = x_a.ncols() + x_b.ncols();
+    crate::gpu::profile::cpu_scope(
+        "fast_joint_hessian_2x2",
+        total,
+        total,
+        n,
+        n.saturating_mul(total).saturating_mul(24),
+        || fast_joint_hessian_2x2_impl(x_a, x_b, w_aa, w_ab, w_bb),
+    )
 }
 
-fn fast_joint_hessian_2x2_cpu<
+#[inline]
+fn fast_joint_hessian_2x2_impl<
     S1: Data<Elem = f64>,
     S2: Data<Elem = f64>,
     S3: Data<Elem = f64>,
@@ -1244,6 +1294,26 @@ fn mat_to_array(mat: MatRef<'_, f64>) -> Array2<f64> {
 /// Avoids the intermediate faer::Mat allocation and mat_to_array copy.
 #[inline]
 pub fn fast_ab_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    a: &ArrayBase<S1, Ix2>,
+    b: &ArrayBase<S2, Ix2>,
+    out: &mut Array2<f64>,
+) {
+    let (n, p) = a.dim();
+    let q = b.ncols();
+    crate::gpu::profile::cpu_scope(
+        "fast_ab_into",
+        n,
+        q,
+        p,
+        n.saturating_mul(q).saturating_mul(8),
+        || {
+            fast_ab_into_impl(a, b, out);
+        },
+    );
+}
+
+#[inline]
+fn fast_ab_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
     out: &mut Array2<f64>,
