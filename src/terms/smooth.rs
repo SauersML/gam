@@ -21708,7 +21708,7 @@ mod tests {
 
         let external_opts =
             external_opts_for_design(
-                LikelihoodSpec::new(
+                &LikelihoodSpec::new(
                     ResponseFamily::Gaussian,
                     InverseLink::Standard(LinkFunction::Identity),
                 ),
@@ -21870,7 +21870,7 @@ mod tests {
 
         let external_opts =
             external_opts_for_design(
-                LikelihoodSpec::new(
+                &LikelihoodSpec::new(
                     ResponseFamily::Binomial,
                     InverseLink::Standard(LinkFunction::Probit),
                 ),
@@ -22448,7 +22448,7 @@ mod tests {
 
         let external_opts =
             external_opts_for_design(
-                LikelihoodSpec::new(
+                &LikelihoodSpec::new(
                     ResponseFamily::Binomial,
                     InverseLink::Standard(LinkFunction::Probit),
                 ),
@@ -22680,7 +22680,7 @@ mod tests {
 
         let external_opts =
             external_opts_for_design(
-                LikelihoodSpec::new(
+                &LikelihoodSpec::new(
                     ResponseFamily::Binomial,
                     InverseLink::Standard(LinkFunction::Probit),
                 ),
@@ -22936,7 +22936,7 @@ mod tests {
 
         let external_opts =
             external_opts_for_design(
-                LikelihoodSpec::new(
+                &LikelihoodSpec::new(
                     ResponseFamily::Binomial,
                     InverseLink::Standard(LinkFunction::Probit),
                 ),
@@ -24001,7 +24001,7 @@ mod tests {
 
         let external_opts =
             external_opts_for_design(
-                LikelihoodSpec::new(
+                &LikelihoodSpec::new(
                     ResponseFamily::Gaussian,
                     InverseLink::Standard(LinkFunction::Identity),
                 ),

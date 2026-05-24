@@ -876,7 +876,7 @@ impl PredictableModel for StandardPredictor {
                 input.design.clone(),
                 self.beta.view(),
                 input.offset.view(),
-                self.family,
+                spec_from_family_link(self.family, self.link_kind.as_ref()),
                 fit,
                 options,
             );

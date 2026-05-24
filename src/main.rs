@@ -11087,7 +11087,7 @@ mod tests {
                 .to_string(),
             ModelKind::MarginalSlope,
             FittedFamily::MarginalSlope {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::BinomialProbit),
+                likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)),
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
@@ -11177,7 +11177,7 @@ mod tests {
             "y ~ x".to_string(),
             ModelKind::Standard,
             FittedFamily::Standard {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::BinomialLogit),
+                likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)),
                 link: Some(LinkFunction::Logit),
                 latent_cloglog_state: None,
                 mixture_state: None,
@@ -11506,7 +11506,7 @@ mod tests {
             "y ~ 1",
             ModelKind::LocationScale,
             FittedFamily::LocationScale {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::BinomialProbit),
+                likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)),
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
             "binomial-location-scale",
@@ -16093,7 +16093,7 @@ mod tests {
             "y ~ x",
             ModelKind::LocationScale,
             FittedFamily::LocationScale {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::BinomialProbit),
+                likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)),
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
             "binomial-location-scale",
@@ -16285,7 +16285,7 @@ mod tests {
             "y ~ x",
             ModelKind::LocationScale,
             FittedFamily::LocationScale {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::BinomialProbit),
+                likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)),
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
             "binomial-location-scale",
@@ -16302,7 +16302,7 @@ mod tests {
             "y ~ x",
             ModelKind::LocationScale,
             FittedFamily::LocationScale {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::BinomialProbit),
+                likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)),
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
             "binomial-location-scale",
