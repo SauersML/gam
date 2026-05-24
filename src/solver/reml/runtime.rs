@@ -648,7 +648,7 @@ fn hash_aux_prior_strength(
     }
 }
 
-pub(crate) fn latent_id_mode_cache_fingerprint(
+pub(in crate::solver::estimate) fn latent_id_mode_cache_fingerprint(
     id_mode: &crate::terms::latent_coord::LatentIdMode,
 ) -> u64 {
     use crate::terms::latent_coord::{AuxPriorFamily, LatentIdMode};
@@ -4264,7 +4264,7 @@ impl<'a> RemlState<'a> {
         })
     }
 
-    pub(crate) fn reset_surface<X>(
+    pub(in crate::solver::estimate) fn reset_surface<X>(
         &mut self,
         x: X,
         canonical_penalties: Arc<Vec<crate::construction::CanonicalPenalty>>,
@@ -4363,7 +4363,10 @@ impl<'a> RemlState<'a> {
             .store(false, Ordering::Relaxed);
     }
 
-    pub(crate) fn set_analytic_penalty_registry_fingerprint(&mut self, fingerprint: u64) {
+    pub(in crate::solver::estimate) fn set_analytic_penalty_registry_fingerprint(
+        &mut self,
+        fingerprint: u64,
+    ) {
         if self.analytic_penalty_registry_fingerprint == fingerprint {
             return;
         }
