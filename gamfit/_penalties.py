@@ -179,6 +179,10 @@ def _temperature_schedule_descriptor(schedule: Any) -> dict[str, Any] | None:
     elif isinstance(schedule, Mapping):
         raw = dict(schedule)
     else:
+        if not hasattr(schedule, "tau_start") or not hasattr(schedule, "decay"):
+            raise TypeError(
+                "temperature_schedule must be GumbelTemperatureSchedule, a mapping, or None"
+            )
         raw = {
             "tau_start": getattr(schedule, "tau_start"),
             "tau_min": getattr(schedule, "tau_min", getattr(schedule, "tau_end", None)),

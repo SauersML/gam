@@ -22776,8 +22776,6 @@ pub struct PeriodicBSplineBasisSpec {
     pub origin: f64,
     /// Cyclic finite-difference order used by curve fitting penalties.
     pub penalty_order: usize,
-    boundary_conditions: BSplineBoundaryConditions::default(),
-    boundary: OneDimensionalBoundary::Open,
 }
 
 impl PeriodicBSplineBasisSpec {
@@ -22797,9 +22795,7 @@ impl PeriodicBSplineBasisSpec {
             origin,
             penalty_order,
         }
-    },
-    boundary_conditions: BSplineBoundaryConditions::default(),
-    boundary: OneDimensionalBoundary::Open,
+    }
 }
 
 /// Fitted vector-valued periodic spline curve.

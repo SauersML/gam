@@ -11142,6 +11142,7 @@ fn build_analytic_penalty_registry_from_json(
                         "alpha",
                         "tau",
                         "learnable",
+                        "learnable_alpha",
                         "temperature_schedule",
                         "weight_schedule",
                     ],
@@ -11152,6 +11153,7 @@ fn build_analytic_penalty_registry_from_json(
                 let temperature_schedule = descriptor_temperature_schedule(descriptor, &context)?;
                 let learnable = descriptor
                     .get("learnable")
+                    .or_else(|| descriptor.get("learnable_alpha"))
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 let penalty = IBPAssignmentPenalty::new(k_max, alpha, tau, learnable);
