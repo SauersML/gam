@@ -410,4 +410,4 @@ Pair it with `survival_likelihood=` on `fit()`. See
 "y ~ smooth(x) + group(site)"
 ```
 
-* [Difference smooths](difference-smooths.md)
+See also: [Difference smooths](difference-smooths.md) for `by=` smooths, `bs="sz"`, and covariance-aware group contrasts.

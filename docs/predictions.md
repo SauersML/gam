@@ -196,4 +196,4 @@ Use this to compose your own posterior quantity that
 isn't a straightforward `predict()` call. Restricted to standard
 non-link-wiggle GAMs.
 
-* [Difference smooths](difference-smooths.md)
+See also: [Difference smooths](difference-smooths.md) for pointwise and simultaneous bands on group trajectory contrasts.
