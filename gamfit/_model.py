@@ -1277,8 +1277,8 @@ class Model:
         # offsets and not (e.g.) some unrelated random intercept term.
         group_random_ranges = [
             (int(block["start"]), int(block["end"]))
-            for block in state.get("term_blocks", []) or []
-            if block.get("kind") == "random_effect" and block.get("name") == group
+            for block in state["term_blocks"]
+            if block["kind"] == "random_effect" and block["name"] == group
         ]
 
         for a, b in pairs:
