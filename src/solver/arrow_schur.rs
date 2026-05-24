@@ -1054,8 +1054,6 @@ pub struct StreamingArrowSchur {
     hbb: Array2<f64>,
     gb: Array1<f64>,
     row_builder: StreamingArrowRowBuilder,
-    manifold_mode_fingerprint: u64,
-    row_hessian_fingerprint: u64,
 }
 
 impl std::fmt::Debug for StreamingArrowSchur {
@@ -1092,8 +1090,6 @@ impl StreamingArrowSchur {
             hbb,
             gb,
             row_builder,
-            manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
-            row_hessian_fingerprint: 0,
         }
     }
 
@@ -1107,7 +1103,7 @@ impl StreamingArrowSchur {
                     reason: format!("streaming row {row} out of bounds"),
                 })
         });
-        let mut out = Self::new(
+        Self::new(
             sys.rows.len(),
             sys.d,
             sys.k,
@@ -1115,15 +1111,7 @@ impl StreamingArrowSchur {
             sys.gb.clone(),
             row_builder,
             chunk_size,
-        );
-        out.manifold_mode_fingerprint = sys.manifold_mode_fingerprint;
-        out.row_hessian_fingerprint = sys.current_row_hessian_fingerprint();
-        out
-    }
-
-    pub fn set_fingerprints(&mut self, manifold_mode: u64, row_hessian: u64) {
-        self.manifold_mode_fingerprint = manifold_mode;
-        self.row_hessian_fingerprint = row_hessian;
+        )
     }
 
     /// Reset the dense shared accumulator to `H_ββ + ridge_beta I`.
@@ -3323,6 +3311,13 @@ mod tests {
         sys.gb = array![0.5_f64, -0.3, 0.2];
 
         let (delta_t, delta_beta) = sys.solve(0.0, 0.0).expect("arrow-schur solve");
+        let streaming_options =
+            ArrowSolveOptions::direct().with_streaming_chunk_size(Some(1));
+        let (delta_t_stream, delta_beta_stream) = sys
+            .solve_with_options(0.0, 0.0, &streaming_options)
+            .expect("streaming arrow-schur solve");
+        assert_eq!(delta_beta, delta_beta_stream);
+        assert_eq!(delta_t, delta_t_stream);
 
         // Build dense reference: order is [β; t_0; t_1] = K + N·d entries.
         let total = k + n * d;

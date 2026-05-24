@@ -67,7 +67,16 @@ pub fn log1mexp_positive(a: f64) -> f64 {
     }
 }
 
-/// Computes `log|sum_j signs[j] * exp(log_mags[j])|` and the resulting sign.
+/// Numerically stable signed log-sum-exp.  Given pairs
+/// `(log|aⱼ|, sign(aⱼ))` (with `signs[j] ∈ {−1, 0, +1}`), returns
+/// `(log|S|, sign(S))` for `S = Σⱼ signs[j]·exp(log_mags[j])`.  Positive
+/// and negative magnitudes are reduced separately with the standard
+/// log-sum-exp trick (subtract the max, sum, log, add back); the two
+/// partial sums are then combined via `log(|p − n|) =
+/// max(log p, log n) + log1mexp(|log p − log n|)`, preserving accuracy
+/// even when `p ≈ n` (catastrophic cancellation regime).  When all
+/// signs are zero or all magnitudes are `−∞`, returns
+/// `(NEG_INFINITY, 0.0)`.
 pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
     let mut pos_max = f64::NEG_INFINITY;
     let mut neg_max = f64::NEG_INFINITY;
@@ -125,6 +134,11 @@ fn horner_polynomial(x: f64, coeffs: &[f64]) -> f64 {
     coeffs.iter().rev().fold(0.0, |acc, &c| acc * x + c)
 }
 
+/// Evaluate `(Σ_k coeffs[k]·x^k) · exp(−x)` without overflow.  For moderate
+/// `x ≤ 600` uses Horner + `exp(−x)` directly; for very large `x` rewrites
+/// `xᵈ · exp(−x) = exp(d·ln x − x)` and runs Horner in `1/x`, which keeps
+/// both the polynomial sum and its multiplier inside double range.  Returns
+/// `0.0` for non-finite `x` or empty `coeffs`.
 #[inline]
 pub fn stable_polynomial_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
     if coeffs.is_empty() || !x.is_finite() {
@@ -144,6 +158,11 @@ pub fn stable_polynomial_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
     scale * tail
 }
 
+/// Numerically stable `C(n,k) = n! / (k!·(n−k)!)` as `f64`.  Uses the
+/// symmetry `C(n,k) = C(n, n−k)` to keep the loop count `min(k, n−k)`
+/// and the multiplicative recurrence `C(n,j+1) = C(n,j)·(n−j)/(j+1)`,
+/// avoiding the overflow of separate factorial evaluations.  Returns
+/// `0.0` for `k > n` and exact integer results within `2^53`.
 #[inline]
 pub fn binomial_coefficient_f64(n: usize, k: usize) -> f64 {
     if k > n {
@@ -160,6 +179,12 @@ pub fn binomial_coefficient_f64(n: usize, k: usize) -> f64 {
     out
 }
 
+/// Numerically stable `ln Φ(x)` for the standard normal CDF.  For `x ≥ 0`
+/// computes `ln(Φ(x))` directly with a small floor against underflow; for
+/// `x < 0` rewrites
+/// `ln Φ(x) = −u² + ln(½·erfcx(u))`, `u = −x/√2`,
+/// which preserves digits all the way into the deep left tail (no
+/// `ln(0)`).  Returns `±∞` and `NaN` at the corresponding inputs.
 #[inline]
 pub fn normal_logcdf(x: f64) -> f64 {
     if x == f64::INFINITY {
@@ -179,11 +204,20 @@ pub fn normal_logcdf(x: f64) -> f64 {
     }
 }
 
+/// Numerically stable `ln(1 − Φ(x)) = ln Φ(−x)` for the standard normal
+/// survival function.  Delegates to `normal_logcdf(-x)` so the deep-right
+/// tail benefits from the same `erfcx`-based representation.
 #[inline]
 pub fn normal_logsf(x: f64) -> f64 {
     normal_logcdf(-x)
 }
 
+/// Joint evaluation of `ln Φ(x)` and the Mills-ratio analogue
+/// `φ(x) / Φ(x)`, signed for the symmetric branch.  Used by the latent
+/// probit families where the inverse-link gradient needs the ratio and
+/// the likelihood needs the log-CDF on the same `x`; computing both in
+/// one call shares the `erfcx` evaluation that dominates the cost in the
+/// deep tail.
 #[inline]
 pub fn signed_probit_logcdf_and_mills_ratio(x: f64) -> (f64, f64) {
     if x == f64::INFINITY {

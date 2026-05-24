@@ -11,12 +11,27 @@ use ndarray::{Array1, Array2, ArrayView1, s};
 use statrs::distribution::{ChiSquared, ContinuousCDF, FisherSnedecor};
 use std::ops::Range;
 
+/// Whether the residual dispersion `φ` is known or estimated from the
+/// fit.  Selects the reference distribution for the Wald p-value: `Known`
+/// → `χ²_{ref_df}` (e.g. binomial/Poisson), `Estimated` → `F_{ref_df,
+/// residual_df}` (e.g. Gaussian where `φ̂` carries its own sampling
+/// variability).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SmoothTestScale {
     Known,
     Estimated,
 }
 
+/// Inputs to `wood_smooth_test`. `beta` is the full coefficient vector;
+/// the term block being tested is `beta[coeff_range]`. `covariance` is the
+/// matching posterior covariance Σ̂ (full p×p; the diagonal block is sliced
+/// out). `influence_matrix` is the optional coefficient-space influence
+/// `F = H⁻¹ X'WX`; when present `tr(F_jj)² / tr(F_jj²)` is used as the
+/// Wood-corrected reference d.f. `edf` is the smooth's effective d.f.
+/// (rank truncation for the penalized subblock); `nullspace_dim` is the
+/// fixed-effect (unpenalized) leading dimension within the block.
+/// `dispersion` is the residual variance estimate `φ̂`; `residual_df` is
+/// the matching denominator d.f. for the F branch.
 #[derive(Debug, Clone)]
 pub struct SmoothTestInput<'a> {
     pub beta: ArrayView1<'a, f64>,
@@ -30,6 +45,10 @@ pub struct SmoothTestInput<'a> {
     pub scale: SmoothTestScale,
 }
 
+/// Output of `wood_smooth_test`: the Wald statistic
+/// `T = β̂'·Σ̂⁻ᵣ·β̂` (rank-`r` pseudo-inverse on the penalized subblock,
+/// full-rank on the nullspace subblock), the reference d.f. used to compute
+/// the tail probability, and the resulting `p_value` (clamped to `[0,1]`).
 #[derive(Debug, Clone)]
 pub struct SmoothTestResult {
     pub statistic: f64,
