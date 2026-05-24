@@ -52,6 +52,8 @@ use crate::solver::arrow_schur::{ArrowFactorCache, ArrowSchurSystem};
 pub const ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD: usize = 1024;
 const EVIDENCE_LOGDET_SLQ_PROBES: usize = 16;
 const EVIDENCE_LOGDET_LANCZOS_STEPS: usize = 32;
+const EVIDENCE_HVP_SYMMETRY_REL_TOL: f64 = 1e-8;
+const EVIDENCE_HVP_SYMMETRY_PROBES: usize = 4;
 
 /// Matrix-free SPD Hessian logdet source used when the arrow Schur factor is
 /// not materialized. The callback must apply the same undamped Hessian whose
@@ -292,6 +294,7 @@ pub fn hessian_log_det_from_hvp(hvp: EvidenceHvpLogDet<'_>) -> Result<f64, Strin
                 dense[[i, j]] = col[i];
             }
         }
+        validate_dense_hvp_symmetry(&dense)?;
         for i in 0..hvp.dim {
             for j in (i + 1)..hvp.dim {
                 let avg = 0.5 * (dense[[i, j]] + dense[[j, i]]);
@@ -328,7 +331,74 @@ fn dense_spd_log_det(matrix: &Array2<f64>) -> Result<f64, String> {
     Ok(logdet)
 }
 
+fn validate_dense_hvp_symmetry(matrix: &Array2<f64>) -> Result<(), String> {
+    let n = matrix.nrows();
+    let mut norm_sq = 0.0_f64;
+    for &value in matrix.iter() {
+        norm_sq += value * value;
+    }
+
+    let mut skew_sq = 0.0_f64;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let skew = matrix[[i, j]] - matrix[[j, i]];
+            skew_sq += 2.0 * skew * skew;
+        }
+    }
+
+    let rel_skew = skew_sq.sqrt() / norm_sq.sqrt().max(1.0);
+    if !rel_skew.is_finite() || rel_skew > EVIDENCE_HVP_SYMMETRY_REL_TOL {
+        return Err(format!(
+            "evidence HVP logdet requires symmetric operator, relative skew norm is {rel_skew:.3e}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_hvp_randomized_symmetry(hvp: EvidenceHvpLogDet<'_>) -> Result<(), String> {
+    let inv_norm = 1.0 / (hvp.dim as f64).sqrt();
+    for probe in 0..EVIDENCE_HVP_SYMMETRY_PROBES.max(1) {
+        let mut x = vec![0.0_f64; hvp.dim];
+        let mut y = vec![0.0_f64; hvp.dim];
+        rademacher_unit_probe_into_slice(&mut x, (2 * probe) as u64, inv_norm);
+        rademacher_unit_probe_into_slice(&mut y, (2 * probe + 1) as u64, inv_norm);
+
+        let hx = (hvp.apply)(&x);
+        let hy = (hvp.apply)(&y);
+        if hx.len() != hvp.dim || hx.iter().any(|v| !v.is_finite()) {
+            return Err(format!(
+                "evidence HVP symmetry check expected finite vector of length {}, got {}",
+                hvp.dim,
+                hx.len()
+            ));
+        }
+        if hy.len() != hvp.dim || hy.iter().any(|v| !v.is_finite()) {
+            return Err(format!(
+                "evidence HVP symmetry check expected finite vector of length {}, got {}",
+                hvp.dim,
+                hy.len()
+            ));
+        }
+
+        let lhs = dot_slice(&x, &hy);
+        let rhs = dot_slice(&hx, &y);
+        let scale = (norm2_slice(&hx) * norm2_slice(&y))
+            .max(norm2_slice(&hy) * norm2_slice(&x))
+            .max(lhs.abs())
+            .max(rhs.abs())
+            .max(1.0);
+        let rel = (lhs - rhs).abs() / scale;
+        if !rel.is_finite() || rel > EVIDENCE_HVP_SYMMETRY_REL_TOL {
+            return Err(format!(
+                "evidence HVP logdet requires symmetric operator, randomized symmetry probe {probe} has relative bilinear mismatch {rel:.3e}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn stochastic_hvp_log_det(hvp: EvidenceHvpLogDet<'_>) -> Result<f64, String> {
+    validate_hvp_randomized_symmetry(hvp)?;
     let probes = EVIDENCE_LOGDET_SLQ_PROBES.max(1);
     let steps = EVIDENCE_LOGDET_LANCZOS_STEPS.min(hvp.dim).max(1);
     let inv_norm = 1.0 / (hvp.dim as f64).sqrt();
