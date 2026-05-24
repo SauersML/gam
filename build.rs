@@ -1874,8 +1874,8 @@ fn scan_for_underscore_fn_args(
                     let mut brack: i32 = 0;
                     let mut found: Option<(usize, usize)> = None;
                     let limit = (idx + 64).min(n);
-                    'outer: for j in idx..limit {
-                        let sj = &stripped_lines[j];
+                    'outer: for (rel, sj) in stripped_lines[idx..limit].iter().enumerate() {
+                        let j = idx + rel;
                         for (k, b) in sj.as_bytes().iter().enumerate() {
                             match *b {
                                 b'(' => paren += 1,
@@ -1904,11 +1904,12 @@ fn scan_for_underscore_fn_args(
             };
             let mut sig_text = String::new();
             let mut line_offsets: Vec<(usize, usize)> = Vec::new();
-            for j in sig_start..=sig_end_line {
+            for (rel, stripped_line) in stripped_lines[sig_start..=sig_end_line].iter().enumerate() {
+                let j = sig_start + rel;
                 let part = if j == sig_end_line {
-                    &stripped_lines[j][..sig_end_col_excl]
+                    &stripped_line[..sig_end_col_excl]
                 } else {
-                    &stripped_lines[j]
+                    stripped_line.as_str()
                 };
                 line_offsets.push((sig_text.len(), j));
                 sig_text.push_str(part);
@@ -2422,10 +2423,9 @@ fn save_history_ledger(
         out.push_str(&kinds.join(","));
         out.push('\n');
     }
-    if let Ok(existing) = fs::read_to_string(path) {
-        if existing == out {
-            return;
-        }
+    match fs::read_to_string(path) {
+        Ok(existing) if existing == out => return,
+        _ => {}
     }
     if fs::write(path, out).is_err() {
         // Non-fatal: write failures (e.g. read-only checkout) leave the
