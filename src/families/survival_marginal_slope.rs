@@ -4280,9 +4280,10 @@ impl SurvivalMarginalSlopeFamily {
     pub(crate) fn sigma_exact_joint_psi_terms_with_options(
         &self,
         block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        drop(specs);
         if self.flex_active() {
             return Err(
                 "survival marginal-slope log-sigma hyperderivatives are implemented for the rigid probit marginal-slope kernel; flex score/link/timewiggle kernels still require the analytic cell-tensor sigma path"
@@ -16120,9 +16121,11 @@ fn time_wiggle_basis_ncols(knots: &Array1<f64>, degree: usize) -> Result<usize, 
 impl CustomFamily for SurvivalMarginalSlopeFamily {
     fn persistent_warm_start_fingerprint(
         &self,
-        _specs: &[ParameterBlockSpec],
-        _options: &BlockwiseFitOptions,
+        specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
     ) -> Option<String> {
+        drop(specs);
+        drop(options);
         let mut hasher = crate::solver::persistent_warm_start::StableHasher::new();
         hasher.write_str("survival-marginal-slope-family");
         hasher.write_usize(self.n);
@@ -16279,9 +16282,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        _line_search_options: &BlockwiseFitOptions,
+        line_search_options: &BlockwiseFitOptions,
         workspace_options: &BlockwiseFitOptions,
     ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
+        drop(line_search_options);
         if self.per_z_logslope_active()
             || self.effective_flex_active(block_states)?
             || self.flex_timewiggle_active()
@@ -16439,7 +16443,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         )))
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        drop(specs);
         // The workspace impl above unconditionally returns `Some(workspace)`
         // — the rigid path produces a `RowKernelHessianWorkspace` and the
         // flex path produces a
@@ -16449,7 +16454,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         !self.per_z_logslope_active()
     }
 
-    fn outer_hyper_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        drop(specs);
         // The exact outer Hessian over θ=(ρ,ψ[,log σ]) can be applied without
         // pairwise θθ materialization: coefficient-Hessian drift terms use the
         // joint-Hessian workspace's directional-derivative operators, and ψ

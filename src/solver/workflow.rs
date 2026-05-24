@@ -2679,8 +2679,9 @@ fn build_termspec_with_geometry(
 
 fn standard_adaptive_regularization_options(
     config: &FitConfig,
-    _spec: &TermCollectionSpec,
+    spec: &TermCollectionSpec,
 ) -> Option<AdaptiveRegularizationOptions> {
+    drop(spec);
     let enabled = config.adaptive_regularization.unwrap_or(false);
     enabled.then(|| AdaptiveRegularizationOptions {
         enabled: true,

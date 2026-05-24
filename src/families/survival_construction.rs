@@ -949,19 +949,22 @@ pub fn parse_survival_time_basis_config(
             })
         }
         "linear" | "bspline" => {
-            // Forward to the shared structural-basis check so the error
-            // text stays consistent with every other call site. `linear` /
+            // Forward to the shared structural-basis check so error text
+            // stays consistent with every other call site. `linear` /
             // `bspline` are not structural, so this always returns Err;
-            // mapping `Ok` to an explicit error keeps the match total
-            // without introducing an `unreachable!`.
-            require_structural_survival_time_basis(time_basis, "survival model configuration")
-                .and_then(|()| {
-                    Err(format!(
-                        "survival time basis '{time_basis}' is not structural and \
-                         cannot be selected here; use --time-basis ispline"
-                    ))
-                })
-                .map(|_: String| unreachable_unused())
+            // we map a (currently impossible) `Ok` to an explicit error
+            // string instead of `unreachable!`, keeping the match total
+            // without relying on a never-executes claim.
+            match require_structural_survival_time_basis(
+                time_basis,
+                "survival model configuration",
+            ) {
+                Err(e) => Err(e),
+                Ok(()) => Err(format!(
+                    "internal: structural-basis check accepted non-structural \
+                     survival time basis '{time_basis}'"
+                )),
+            }
         }
         other => Err(format!(
             "unsupported --time-basis '{other}'; accepted values: ispline, none"
