@@ -4546,6 +4546,121 @@ impl BernoulliBlockHessianAccumulator {
         Ok(())
     }
 
+    /// Batch the exact h/w pullback terms for one row chunk.
+    ///
+    /// The large marginal/logslope blocks are already accumulated as chunked
+    /// weighted Gram products.  h/w used to be the remaining per-row dense
+    /// path: for every sampled row and every h/w coordinate we performed two
+    /// design-row AXPYs (column plus symmetric row).  At biobank `n` that
+    /// repeated row materialization dominates even though the h/w blocks are
+    /// tiny.  This routine keeps the same exact Hessian entries, but turns the
+    /// cross terms into `X_chunk^T weights` / `G_chunk^T weights` products and
+    /// sums the tiny h/w self-blocks in registers.
+    fn add_weighted_hw_cross_terms(
+        &mut self,
+        family: &BernoulliMarginalSlopeFamily,
+        rows: std::ops::Range<usize>,
+        slices: &BlockSlices,
+        h_q: Option<&Array2<f64>>,
+        h_g: Option<&Array2<f64>>,
+        h_h: Option<&Array2<f64>>,
+        w_q: Option<&Array2<f64>>,
+        w_g: Option<&Array2<f64>>,
+        h_w: Option<&Array2<f64>>,
+        w_w: Option<&Array2<f64>>,
+    ) -> Result<(), String> {
+        let Some(dc) = self.dense_correction.as_mut() else {
+            return Ok(());
+        };
+
+        let need_marginal = h_q.is_some() || w_q.is_some();
+        let need_logslope = h_g.is_some() || w_g.is_some();
+        let x = if need_marginal {
+            Some(
+                family
+                    .marginal_design
+                    .try_row_chunk(rows.clone())
+                    .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let g = if need_logslope {
+            Some(
+                family
+                    .logslope_design
+                    .try_row_chunk(rows)
+                    .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?,
+            )
+        } else {
+            None
+        };
+
+        if let (Some(block_h), Some(hq)) = (slices.h.as_ref(), h_q) {
+            let x = x.as_ref().expect("marginal chunk for h/q cross");
+            let cross = crate::faer_ndarray::fast_atb(x, hq);
+            for (local_idx, global_idx) in block_h.clone().enumerate() {
+                let col = cross.column(local_idx);
+                dc.slice_mut(s![slices.marginal.clone(), global_idx])
+                    .scaled_add(1.0, &col);
+                dc.slice_mut(s![global_idx, slices.marginal.clone()])
+                    .scaled_add(1.0, &col);
+            }
+        }
+        if let (Some(block_h), Some(hg)) = (slices.h.as_ref(), h_g) {
+            let g = g.as_ref().expect("logslope chunk for h/g cross");
+            let cross = crate::faer_ndarray::fast_atb(g, hg);
+            for (local_idx, global_idx) in block_h.clone().enumerate() {
+                let col = cross.column(local_idx);
+                dc.slice_mut(s![slices.logslope.clone(), global_idx])
+                    .scaled_add(1.0, &col);
+                dc.slice_mut(s![global_idx, slices.logslope.clone()])
+                    .scaled_add(1.0, &col);
+            }
+        }
+        if let (Some(block_h), Some(hh)) = (slices.h.as_ref(), h_h) {
+            dc.slice_mut(s![block_h.clone(), block_h.clone()])
+                .scaled_add(1.0, hh);
+        }
+
+        if let (Some(block_w), Some(wq)) = (slices.w.as_ref(), w_q) {
+            let x = x.as_ref().expect("marginal chunk for w/q cross");
+            let cross = crate::faer_ndarray::fast_atb(x, wq);
+            for (local_idx, global_idx) in block_w.clone().enumerate() {
+                let col = cross.column(local_idx);
+                dc.slice_mut(s![slices.marginal.clone(), global_idx])
+                    .scaled_add(1.0, &col);
+                dc.slice_mut(s![global_idx, slices.marginal.clone()])
+                    .scaled_add(1.0, &col);
+            }
+        }
+        if let (Some(block_w), Some(wg)) = (slices.w.as_ref(), w_g) {
+            let g = g.as_ref().expect("logslope chunk for w/g cross");
+            let cross = crate::faer_ndarray::fast_atb(g, wg);
+            for (local_idx, global_idx) in block_w.clone().enumerate() {
+                let col = cross.column(local_idx);
+                dc.slice_mut(s![slices.logslope.clone(), global_idx])
+                    .scaled_add(1.0, &col);
+                dc.slice_mut(s![global_idx, slices.logslope.clone()])
+                    .scaled_add(1.0, &col);
+            }
+        }
+        if let (Some(block_h), Some(block_w), Some(hw)) =
+            (slices.h.as_ref(), slices.w.as_ref(), h_w)
+        {
+            dc.slice_mut(s![block_h.clone(), block_w.clone()])
+                .scaled_add(1.0, hw);
+            dc.slice_mut(s![block_w.clone(), block_h.clone()])
+                .scaled_add(1.0, &hw.t());
+        }
+        if let (Some(block_w), Some(ww)) = (slices.w.as_ref(), w_w) {
+            dc.slice_mut(s![block_w.clone(), block_w.clone()])
+                .scaled_add(1.0, ww);
+        }
+
+        Ok(())
+    }
+
     /// Add a rank-1 update from psi_row (in the psi block) crossed with the
     /// pullback of a primary-space vector.  Adds both left outer right and right outer left.
     ///

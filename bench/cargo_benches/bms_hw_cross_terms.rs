@@ -1,7 +1,6 @@
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use gam::faer_ndarray::{fast_atb, fast_atv};
 use ndarray::Array2;
-use std::hint::black_box;
 
 fn deterministic_matrix(rows: usize, cols: usize, a: f64, b: f64) -> Array2<f64> {
     Array2::from_shape_fn((rows, cols), |(i, j)| {
