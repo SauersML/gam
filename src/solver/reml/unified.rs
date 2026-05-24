@@ -3851,8 +3851,16 @@ impl PenaltyCoordinate {
     }
 
     pub fn from_block_root(root: Array2<f64>, start: usize, end: usize, total_dim: usize) -> Self {
-        assert_eq!(root.ncols(), end.saturating_sub(start));
-        assert!(end <= total_dim);
+        assert_eq!(
+            root.ncols(),
+            end.saturating_sub(start),
+            "block prior root column count must match block width"
+        );
+        assert!(
+            end <= total_dim,
+            "block prior root end exceeds total dimension: start={start}, end={end}, total_dim={total_dim}, root_dim={:?}",
+            root.dim()
+        );
         Self::BlockRoot {
             root,
             start,
@@ -3868,9 +3876,22 @@ impl PenaltyCoordinate {
         total_dim: usize,
         prior_mean: Array1<f64>,
     ) -> Self {
-        assert_eq!(root.ncols(), end.saturating_sub(start));
-        assert_eq!(prior_mean.len(), end.saturating_sub(start));
-        assert!(end <= total_dim);
+        assert_eq!(
+            root.ncols(),
+            end.saturating_sub(start),
+            "centered block prior root column count must match block width"
+        );
+        assert_eq!(
+            prior_mean.len(),
+            end.saturating_sub(start),
+            "centered block prior mean length must match block width"
+        );
+        assert!(
+            end <= total_dim,
+            "centered block prior root end exceeds total dimension: start={start}, end={end}, total_dim={total_dim}, root_dim={:?}, prior_mean_len={}",
+            root.dim(),
+            prior_mean.len()
+        );
         if prior_mean.iter().all(|&value| value == 0.0) {
             Self::from_block_root(root, start, end, total_dim)
         } else {

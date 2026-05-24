@@ -1279,7 +1279,9 @@ fn latent_survival_basis_direction(primary_idx: usize) -> LatentSurvivalPrimaryD
         // which the internal iteration bounds (`0..LATENT_SURVIVAL_PRIMARY_DIM`)
         // make unreachable.
         // SAFETY: primary_idx is bounded by LATENT_SURVIVAL_PRIMARY_DIM at every internal call site.
-        _ => panic!("invalid latent survival primary index {primary_idx}"),
+        _ => panic!(
+            "latent survival primary index out of bounds: primary_idx={primary_idx}, primary_dim={LATENT_SURVIVAL_PRIMARY_DIM}"
+        ),
     }
 }
 
@@ -1731,7 +1733,14 @@ impl LatentSurvivalFamily {
                     mean_scale,
                     &mut target.slice_mut(s![slices.mean.clone()]),
                 )
-                .expect("latent survival mean gradient pullback dimension mismatch");
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "latent survival mean gradient pullback dimension mismatch: row={row}, mean_slice={:?}, target_len={}, x_mean_cols={}, error={error}",
+                        slices.mean,
+                        target.len(),
+                        self.x_mean.ncols()
+                    )
+                });
         }
 
         if let Some(log_sigma) = &slices.log_sigma {
@@ -1805,12 +1814,25 @@ impl LatentSurvivalFamily {
                 mean_weight,
                 target.slice_mut(s![slices.mean.clone(), slices.mean.clone()]),
             )
-            .expect("latent survival mean pullback dimension mismatch");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "latent survival mean Hessian pullback dimension mismatch: row={row}, mean_slice={:?}, target_dim={:?}, x_mean_cols={}, error={error}",
+                    slices.mean,
+                    target.dim(),
+                    self.x_mean.ncols()
+                )
+            });
 
         let mean_row = self
             .x_mean
             .try_row_chunk(row..row + 1)
-            .expect("latent survival mean pullback row_chunk must succeed");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "latent survival mean pullback row chunk failed: row={row}, x_mean_rows={}, x_mean_cols={}, error={error}",
+                    self.x_mean.nrows(),
+                    self.x_mean.ncols()
+                )
+            });
         let mean_vec = mean_row.row(0);
         let time_mean_weights = [
             (LATENT_SURVIVAL_PRIMARY_Q_ENTRY, self.x_time_entry.row(row)),
@@ -2019,7 +2041,13 @@ impl LatentSurvivalFamily {
         let mean_weight = h[[LATENT_SURVIVAL_PRIMARY_MU, LATENT_SURVIVAL_PRIMARY_MU]];
         self.x_mean
             .syr_row_into_view(row, mean_weight, mean_target.view_mut())
-            .expect("latent survival mean block-diagonal pullback dimension mismatch");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "latent survival mean block-diagonal pullback dimension mismatch: row={row}, mean_target_dim={:?}, x_mean_cols={}, error={error}",
+                    mean_target.dim(),
+                    self.x_mean.ncols()
+                )
+            });
         // Log-σ block (scalar).
         if let Some(target) = log_sigma_target {
             target[[0, 0]] += h[[
@@ -2787,7 +2815,14 @@ impl LatentBinaryFamily {
                     mean_scale,
                     &mut target.slice_mut(s![slices.mean.clone()]),
                 )
-                .expect("latent binary mean gradient pullback dimension mismatch");
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "latent binary mean gradient pullback dimension mismatch: row={row}, mean_slice={:?}, target_len={}, x_mean_cols={}, error={error}",
+                        slices.mean,
+                        target.len(),
+                        self.x_mean.ncols()
+                    )
+                });
         }
     }
 
@@ -2834,12 +2869,25 @@ impl LatentBinaryFamily {
                 mean_weight,
                 target.slice_mut(s![slices.mean.clone(), slices.mean.clone()]),
             )
-            .expect("latent binary mean pullback dimension mismatch");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "latent binary mean Hessian pullback dimension mismatch: row={row}, mean_slice={:?}, target_dim={:?}, x_mean_cols={}, error={error}",
+                    slices.mean,
+                    target.dim(),
+                    self.x_mean.ncols()
+                )
+            });
 
         let mean_row = self
             .x_mean
             .try_row_chunk(row..row + 1)
-            .expect("latent binary mean pullback row_chunk must succeed");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "latent binary mean pullback row chunk failed: row={row}, x_mean_rows={}, x_mean_cols={}, error={error}",
+                    self.x_mean.nrows(),
+                    self.x_mean.ncols()
+                )
+            });
         let mean_vec = mean_row.row(0);
         for (primary_idx, time_vec) in [
             (LATENT_SURVIVAL_PRIMARY_Q_ENTRY, self.x_time_entry.row(row)),
