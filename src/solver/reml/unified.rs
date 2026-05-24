@@ -2237,10 +2237,10 @@ impl ProjectedFactorCache {
                 .inner
                 .lock()
                 .expect("projected factor cache lock poisoned");
-            match inner.in_progress.get(&key) {
-                Some(m) => Arc::clone(m),
-                None => return false,
-            }
+            let Some(m) = inner.in_progress.get(&key) else {
+                return false;
+            };
+            Arc::clone(m)
         };
         if marker
             .waiter_count

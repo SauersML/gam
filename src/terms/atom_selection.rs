@@ -455,12 +455,8 @@ impl EntropicSoftmax {
         for i in 0..k {
             dot += a[i] * g_a[i];
         }
-        let mut out = Array1::<f64>::zeros(k);
         let inv_tau = 1.0 / self.temperature;
-        for i in 0..k {
-            out[i] = a[i] * (g_a[i] - dot) * inv_tau;
-        }
-        out
+        Array1::<f64>::from_iter((0..k).map(|i| a[i] * (g_a[i] - dot) * inv_tau))
     }
 }
 
@@ -724,10 +720,7 @@ impl AssignmentSparsityCoupling for L1Relaxed {
         // the penalty we evaluate on the *clipped* values to keep the
         // sub-gradient at zero consistent with the active-set semantics.
         let k = free_amplitudes_row.len();
-        let mut clipped = Array1::<f64>::zeros(k);
-        for i in 0..k {
-            clipped[i] = free_amplitudes_row[i].max(0.0);
-        }
+        let clipped = Array1::<f64>::from_iter((0..k).map(|i| free_amplitudes_row[i].max(0.0)));
         let v = penalty.value(clipped.view(), rho);
         let mut g = penalty.grad_target(clipped.view(), rho);
         for i in 0..k {
