@@ -4041,6 +4041,33 @@ impl EvalCacheManager {
         self::cache::sanitized_rhokey(rho)
     }
 
+    /// Memoizing wrapper for `PenaltySubspace` construction.
+    ///
+    /// The penalty-subspace eigendecomposition is shape-invariant: any two
+    /// outer evaluations at the same `(E_transformed, ridge_passport)` produce
+    /// bit-identical subspaces. The single-slot cache amortizes consecutive
+    /// fixed-S queries (rank, logdet, trace) within a single outer iter.
+    pub(super) fn cached_penalty_subspace<F>(
+        &self,
+        e_transformed: &ndarray::Array2<f64>,
+        ridge_passport: &crate::types::RidgePassport,
+        build: F,
+    ) -> Result<Arc<runtime::PenaltySubspace>, EstimationError>
+    where
+        F: FnOnce() -> Result<runtime::PenaltySubspace, EstimationError>,
+    {
+        let key = PenaltySubspaceCacheKey::from_inputs(e_transformed, ridge_passport);
+        if let Some(hit) = self.penalty_subspace_cache.read().unwrap().get(&key) {
+            return Ok(hit);
+        }
+        let value = Arc::new(build()?);
+        self.penalty_subspace_cache
+            .write()
+            .unwrap()
+            .insert(key, value.clone());
+        Ok(value)
+    }
+
     fn cached_eval_bundle(&self, key: &Option<Vec<u64>>) -> Option<EvalShared> {
         self.current_eval_bundle
             .read()
