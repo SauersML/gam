@@ -3160,7 +3160,7 @@ pub(crate) fn orthogonality_transform_for_design(
 /// Which radial kernel family is being used. Stored in the streaming operator
 /// so that (q, t) scalars can be recomputed on the fly without a closure.
 #[derive(Debug, Clone)]
-pub(crate) enum RadialScalarKind {
+pub enum RadialScalarKind {
     /// Matern kernel: (length_scale, nu).
     Matern { length_scale: f64, nu: MaternNu },
     /// Hybrid Duchon kernel: parameters needed for `duchon_radial_jets`.
@@ -3914,6 +3914,7 @@ pub(crate) struct StreamingBSplineEvaluator {
     data: Arc<Array1<f64>>,
     knots: Arc<Array1<f64>>,
     degree: usize,
+    #[expect(dead_code)]
     boundary_conditions: BSplineBoundaryConditions,
     periodic: Option<(f64, f64, usize)>,
     transform: Option<Arc<Array2<f64>>>,
@@ -14481,7 +14482,7 @@ fn validate_duchon_collocation_orders(
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct DuchonPartialFractionCoeffs {
+pub struct DuchonPartialFractionCoeffs {
     a: Vec<f64>,
     b: Vec<f64>,
 }
@@ -28317,7 +28318,7 @@ mod tests {
             -std::f64::consts::TAU,
         ];
 
-        let basis = create_periodic_bspline_basis_1d(u.view(), &spec).expect("periodic basis");
+        let basis = build_periodic_bspline_basis_1d(u.view(), &spec).expect("periodic basis");
         assert_eq!(basis.dim(), (u.len(), spec.num_basis));
         for i in 0..basis.nrows() {
             let rowsum = basis.row(i).sum();
@@ -28325,7 +28326,7 @@ mod tests {
         }
 
         let seam =
-            create_periodic_bspline_basis_1d(array![0.0, std::f64::consts::TAU].view(), &spec)
+            build_periodic_bspline_basis_1d(array![0.0, std::f64::consts::TAU].view(), &spec)
                 .expect("seam basis");
         for j in 0..spec.num_basis {
             assert_abs_diff_eq!(seam[[0, j]], seam[[1, j]], epsilon = 1e-14);
@@ -28346,14 +28347,14 @@ mod tests {
         }
 
         let spec = periodic_test_spec(48);
-        let curve = fit_periodic_spline_curve(u.view(), y.view(), &spec).expect("fit curve");
+        let curve = fit_periodic_bspline_curve(u.view(), y.view(), &spec).expect("fit curve");
         assert_eq!(curve.ambient_dim(), 3);
 
         let pred = curve.evaluate(u.view()).expect("predict curve");
         let rmse = pred
             .iter()
             .zip(y.iter())
-            .map(|(p, t)| (p - t).powi(2))
+            .map(|(p, t): (&f64, &f64)| (p - t).powi(2))
             .sum::<f64>()
             .sqrt()
             / ((n * 3) as f64).sqrt();
@@ -28363,13 +28364,19 @@ mod tests {
         let x_span = pred
             .column(0)
             .iter()
-            .fold(f64::NEG_INFINITY, |a, &b| a.max(b))
-            - pred.column(0).iter().fold(f64::INFINITY, |a, &b| a.min(b));
+            .fold(f64::NEG_INFINITY, |a: f64, &b: &f64| a.max(b))
+            - pred
+                .column(0)
+                .iter()
+                .fold(f64::INFINITY, |a: f64, &b: &f64| a.min(b));
         let y_span = pred
             .column(1)
             .iter()
-            .fold(f64::NEG_INFINITY, |a, &b| a.max(b))
-            - pred.column(1).iter().fold(f64::INFINITY, |a, &b| a.min(b));
+            .fold(f64::NEG_INFINITY, |a: f64, &b: &f64| a.max(b))
+            - pred
+                .column(1)
+                .iter()
+                .fold(f64::INFINITY, |a: f64, &b: &f64| a.min(b));
         assert!(
             x_span > 5.5,
             "x ambient span should preserve elongation: {x_span}"
@@ -28394,8 +28401,8 @@ mod tests {
         let spec = periodic_test_spec(36);
 
         let base_curve =
-            fit_periodic_spline_curve(u.view(), circle.view(), &spec).expect("fit base circle");
-        let stretched_curve = fit_periodic_spline_curve(u.view(), stretched.view(), &spec)
+            fit_periodic_bspline_curve(u.view(), circle.view(), &spec).expect("fit base circle");
+        let stretched_curve = fit_periodic_bspline_curve(u.view(), stretched.view(), &spec)
             .expect("fit stretched ambient curve");
 
         let query = Array1::from_iter((0..73).map(|i| -1.3 + 0.17 * i as f64));
@@ -28407,7 +28414,7 @@ mod tests {
         let max_abs = expected_stretched
             .iter()
             .zip(actual_stretched.iter())
-            .map(|(a, b)| (a - b).abs())
+            .map(|(a, b): (&f64, &f64)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         assert!(
             max_abs < 2e-8,
@@ -28428,7 +28435,7 @@ mod tests {
             y[[i, 3]] = 0.4 * (3.0 * ui).sin();
             y[[i, 4]] = 0.1 * ui.cos() - 2.0 * ui.sin();
         }
-        let curve = fit_periodic_spline_curve(u.view(), y.view(), &periodic_test_spec(40))
+        let curve = fit_periodic_bspline_curve(u.view(), y.view(), &periodic_test_spec(40))
             .expect("fit high-dimensional loop");
 
         let q = array![0.17, 1.91, 5.8];
@@ -28440,7 +28447,7 @@ mod tests {
         let max_abs = a
             .iter()
             .zip(b.iter())
-            .map(|(x, y)| (x - y).abs())
+            .map(|(x, y): (&f64, &f64)| (x - y).abs())
             .fold(0.0_f64, f64::max);
         assert_abs_diff_eq!(max_abs, 0.0, epsilon = 2e-13);
     }
@@ -30051,8 +30058,9 @@ mod tests {
             Array2::from_shape_vec((6, 1), (0..6).map(|i| i as f64 / 6.0).collect()).unwrap();
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
+            periodic: None,
             length_scale: Some(0.25),
-            power: 2,
+            power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Zero,
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
@@ -31762,7 +31770,7 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            boundary: OneDimensionalBoundary::Open,
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
         assert_eq!(out.penalties.len(), 3);
@@ -31886,6 +31894,7 @@ mod tests {
         ];
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
+            periodic: None,
             length_scale: None,
             power: 1.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
@@ -31913,7 +31922,8 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            periodic: None,
+            boundary: OneDimensionalBoundary::Open,
         };
         assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
     }
@@ -31945,7 +31955,8 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            periodic: None,
+            boundary: OneDimensionalBoundary::Open,
         };
         assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
     }
@@ -31991,7 +32002,8 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            periodic: None,
+            boundary: OneDimensionalBoundary::Open,
         };
         assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
     }
@@ -32034,7 +32046,8 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            periodic: None,
+            boundary: OneDimensionalBoundary::Open,
         };
         assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
     }
@@ -32067,7 +32080,8 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            periodic: None,
+            boundary: OneDimensionalBoundary::Open,
         };
         assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
     }
@@ -32118,7 +32132,8 @@ mod tests {
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            periodic: None,
+            boundary: OneDimensionalBoundary::Open,
         };
         assert_scale_free_joint_null_is_only_constant(data.view(), &spec);
     }
@@ -34170,6 +34185,7 @@ mod tests {
         let centers = array![[0.0], [0.9], [2.0], [3.3], [4.7], [6.3]];
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers),
+            periodic: None,
             length_scale: Some(0.8),
             power: 2.0,
             nullspace_order: DuchonNullspaceOrder::Linear,
