@@ -934,12 +934,16 @@ fn scan_for_dead_guard_consts(
             return;
         }
         let trait_impl_mask = compute_trait_impl_mask(content);
+        let stripped_lines = strip_file_lines(content);
         for (idx, line) in content.lines().enumerate() {
-            let stripped = strip_strings_and_comments(line);
-            if !line_has_keyword(&stripped, "const") {
+            let stripped = stripped_lines
+                .get(idx)
+                .map(String::as_str)
+                .unwrap_or(line);
+            if !line_has_keyword(stripped, "const") {
                 continue;
             }
-            if line_matches_bool_literal_const(&stripped) {
+            if line_matches_bool_literal_const(stripped) {
                 if trait_impl_mask.get(idx).copied().unwrap_or(false) {
                     // Trait-impl associated constants are required by the
                     // trait and cannot be replaced by `cfg`. Inherent-impl
