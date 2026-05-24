@@ -1,3 +1,1 @@
-    Blocking waiting for file lock on build directory
    Compiling gam v0.2.1 (/Users/user/gam)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.17s
