@@ -298,6 +298,7 @@ impl<'a> DenseRightProductView<'a> {
             // factor slots (`first` and `second`); reaching this branch means a
             // caller invoked `with_factor` a third time, which violates the
             // type's documented contract of at most two right factors.
+            // SAFETY: third `with_factor` call violates the type's two-factor invariant.
             panic!("DenseRightProductView supports at most two right factors");
         }
         self

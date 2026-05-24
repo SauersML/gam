@@ -13420,6 +13420,13 @@ impl SparseCholeskyOperator {
                 )
             };
             trace += diagonal_sum.unwrap_or_else(|e| {
+                // SAFETY: `SparseCholeskyOperator` is constructed only with a
+                // successfully-factorized SPD `self.factor`. The sparse SPD
+                // multi-RHS solve only fails on factor corruption or RHS
+                // shape mismatch; the RHS comes from `mul_basis_columns_into`
+                // matching the factor's dimension, so failure here means
+                // the cached factor was corrupted after construction —
+                // a hard invariant violation.
                 panic!("SparseCholeskyOperator exact trace_hinv_operator solve failed: {e}")
             });
             start = end;
@@ -13541,6 +13548,11 @@ impl SparseCholeskyOperator {
                 )
             };
             trace += diagonal_sum.unwrap_or_else(|e| {
+                // SAFETY: same invariant as `trace_hinv_operator_exact`
+                // above — `self.factor` is the validated SPD factor;
+                // sparse-SPD multi-RHS solves only fail on factor
+                // corruption, which `SparseCholeskyOperator`'s
+                // construction invariant forbids.
                 panic!("SparseCholeskyOperator exact block-local trace solve failed: {e}")
             });
             local_col_start += cols;
