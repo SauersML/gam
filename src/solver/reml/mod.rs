@@ -332,89 +332,25 @@ mod tests {
     use crate::solver::outer_strategy::{HessianResult, OuterEval};
     use crate::terms::basis::{ImplicitDesignPsiDerivative, RadialScalarKind};
     use crate::types::{
-        GlmFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
-        ResponseFamily,
+        GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily,
     };
     use faer::Side;
     use ndarray::{Array1, Array2, array, s};
     use std::sync::Arc;
 
-    /// Project a `LikelihoodSpec` (the new `(response, link)` form) back onto a
-    /// `GlmLikelihoodSpec` so test fixtures can construct their likelihoods via
-    /// the migrated `LikelihoodSpec` constructor while `RemlConfig::external`
-    /// continues to accept `GlmLikelihoodSpec`.
-    ///
-    /// Mapping follows the migration spec:
-    ///   { Gaussian,         Standard(Identity) } -> GaussianIdentity
-    ///   { Binomial,         Standard(Logit)    } -> BinomialLogit
-    ///   { Binomial,         Standard(Probit)   } -> BinomialProbit
-    ///   { Binomial,         Standard(CLogLog)  } -> BinomialCLogLog
-    ///   { Binomial,         Sas(_)             } -> BinomialSas
-    ///   { Binomial,         BetaLogistic(_)    } -> BinomialBetaLogistic
-    ///   { Binomial,         Mixture(_)         } -> BinomialMixture
-    ///   { Poisson,          Standard(Log)      } -> PoissonLog
-    ///   { Tweedie { p },    Standard(Log)      } -> Tweedie { p }
-    ///   { NegativeBinomial { theta }, Standard(Log) } -> NegativeBinomial { theta }
-    ///   { Beta { phi },     Standard(Logit)    } -> BetaLogit { phi }
-    ///   { Gamma,            Standard(Log)      } -> GammaLog
-    fn glm_spec_from_likelihood_spec(spec: LikelihoodSpec) -> GlmLikelihoodSpec {
-        let family = match (&spec.response, &spec.link) {
-            (ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)) => {
-                GlmFamily::GaussianIdentity
-            }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
-                GlmFamily::BinomialLogit
-            }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
-                GlmFamily::BinomialProbit
-            }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
-                GlmFamily::BinomialCLogLog
-            }
-            (ResponseFamily::Binomial, InverseLink::Sas(_)) => GlmFamily::BinomialSas,
-            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
-                GlmFamily::BinomialBetaLogistic
-            }
-            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => {
-                GlmFamily::BinomialMixture
-            }
-            (ResponseFamily::Poisson, InverseLink::Standard(LinkFunction::Log)) => {
-                GlmFamily::PoissonLog
-            }
-            (ResponseFamily::Tweedie { p }, InverseLink::Standard(LinkFunction::Log)) => {
-                GlmFamily::Tweedie { p: *p }
-            }
-            (
-                ResponseFamily::NegativeBinomial { theta },
-                InverseLink::Standard(LinkFunction::Log),
-            ) => GlmFamily::NegativeBinomial { theta: *theta },
-            (ResponseFamily::Beta { phi }, InverseLink::Standard(LinkFunction::Logit)) => {
-                GlmFamily::BetaLogit { phi: *phi }
-            }
-            (ResponseFamily::Gamma, InverseLink::Standard(LinkFunction::Log)) => {
-                GlmFamily::GammaLog
-            }
-            (response, link) => panic!(
-                "no GlmFamily mapping for LikelihoodSpec {{ response: {:?}, link: {:?} }}",
-                response, link,
-            ),
-        };
-        GlmLikelihoodSpec::canonical(family)
-    }
-
-    /// Shorthand for the canonical Binomial-Logit `LikelihoodSpec` used by the
-    /// REML test fixtures.
+    /// Shorthand for the canonical Binomial-Logit `GlmLikelihoodSpec` used by
+    /// the REML test fixtures.
     fn binomial_logit_glm_spec() -> GlmLikelihoodSpec {
-        glm_spec_from_likelihood_spec(LikelihoodSpec::new(
+        GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Binomial,
             InverseLink::Standard(LinkFunction::Logit),
         ))
     }
 
-    /// Shorthand for the canonical Gaussian-Identity `LikelihoodSpec` used by
-    /// the REML test fixtures.
+    /// Shorthand for the canonical Gaussian-Identity `GlmLikelihoodSpec` used
+    /// by the REML test fixtures.
     fn gaussian_identity_glm_spec() -> GlmLikelihoodSpec {
-        glm_spec_from_likelihood_spec(LikelihoodSpec::new(
+        GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Gaussian,
             InverseLink::Standard(LinkFunction::Identity),
         ))
