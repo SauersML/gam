@@ -708,7 +708,7 @@ fn both_sphere_methods_give_rotation_invariant_smoothers() {
             method,
             max_degree: Some(4),
             wahba_kernel: Default::default(),
-        streaming_chunk_size: None,
+            streaming_chunk_size: None,
         };
         let spec_b = SphericalSplineBasisSpec {
             center_strategy: CenterStrategy::UserProvided(rot.clone()),
@@ -718,7 +718,7 @@ fn both_sphere_methods_give_rotation_invariant_smoothers() {
             method,
             max_degree: Some(4),
             wahba_kernel: Default::default(),
-        streaming_chunk_size: None,
+            streaming_chunk_size: None,
         };
         let a = build_spherical_spline_basis(pts.view(), &spec_a).unwrap();
         let b = build_spherical_spline_basis(rot.view(), &spec_b).unwrap();
