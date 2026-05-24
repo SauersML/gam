@@ -2035,7 +2035,27 @@ impl FittedFamily {
                 return LikelihoodFamily::RoystonParmar;
             }
         };
-        spec.as_likelihood_family()
+        match (&spec.response, &spec.link) {
+            (ResponseFamily::Gaussian, _) => LikelihoodFamily::GaussianIdentity,
+            (ResponseFamily::Poisson, _) => LikelihoodFamily::PoissonLog,
+            (ResponseFamily::Tweedie { p }, _) => LikelihoodFamily::Tweedie { p: *p },
+            (ResponseFamily::NegativeBinomial { theta }, _) => {
+                LikelihoodFamily::NegativeBinomial { theta: *theta }
+            }
+            (ResponseFamily::Beta { phi }, _) => LikelihoodFamily::BetaLogit { phi: *phi },
+            (ResponseFamily::Gamma, _) => LikelihoodFamily::GammaLog,
+            (ResponseFamily::RoystonParmar, _) => LikelihoodFamily::RoystonParmar,
+            (ResponseFamily::Binomial, link) => match link {
+                InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
+                InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
+                InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
+                InverseLink::Standard(_) => LikelihoodFamily::BinomialLogit,
+                InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
+                InverseLink::Sas(_) => LikelihoodFamily::BinomialSas,
+                InverseLink::BetaLogistic(_) => LikelihoodFamily::BinomialBetaLogistic,
+                InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
+            },
+        }
     }
 
     #[inline]
