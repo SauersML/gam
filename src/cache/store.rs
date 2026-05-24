@@ -575,7 +575,7 @@ struct CachedLookup {
 /// than `ttl` relative to `now_nanos`. Mirrors the cutoff in
 /// [`WarmStartStore::evict_overflow`] so `lookup_with` cannot return an entry
 /// that the eviction sweep would have dropped.
-fn meta_expired(secs: u64, nanos: u32, ttl: Duration, now_nanos: u128) -> bool {
+const fn meta_expired(secs: u64, nanos: u32, ttl: Duration, now_nanos: u128) -> bool {
     let ttl_nanos = ttl.as_nanos();
     if ttl_nanos == 0 {
         return false;
@@ -725,7 +725,7 @@ fn test_time_offset_ns() -> u64 {
 }
 
 #[cfg(not(test))]
-fn test_time_offset_ns() -> u64 {
+const fn test_time_offset_ns() -> u64 {
     0
 }
 
