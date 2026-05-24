@@ -1148,7 +1148,7 @@ impl Clone for WorkingModelSurvival {
             offset_eta_exit: self.offset_eta_exit.clone(),
             offset_derivative_exit: self.offset_derivative_exit.clone(),
             penalties: self.penalties.clone(),
-            monotonicity: self.monotonicity.clone(),
+            monotonicity: self.monotonicity,
             structurally_monotonic: self.structurally_monotonic,
             structural_time_columns: self.structural_time_columns,
             monotonicity_constraint_rows: self.monotonicity_constraint_rows.clone(),
@@ -2000,13 +2000,13 @@ impl WorkingModelSurvival {
         // Phase 2: BLAS-accelerated Hessian and gradient via faer.
         //   H_interval = X_exit^T diag(w_exit) X_exit - X_entry^T diag(w_entry) X_entry
         //   grad_interval = X_exit^T w_exit - X_entry^T w_entry
-        let mut h = self.interval_hessian_blas(&w_hess_exit, &w_hess_entry);
-        let mut grad = self.interval_gradient_blas(&w_hess_exit, &w_hess_entry);
+        let mut h = self.interval_hessian_blas(w_hess_exit, w_hess_entry);
+        let mut grad = self.interval_gradient_blas(w_hess_exit, w_hess_entry);
 
-        grad -= &self.exit_transpose_vector_multiply(&w_event);
-        grad -= &self.derivative_transpose_vector_multiply(&w_event_inv_deriv);
+        grad -= &self.exit_transpose_vector_multiply(w_event);
+        grad -= &self.derivative_transpose_vector_multiply(w_event_inv_deriv);
 
-        h += &self.derivative_xt_diag_x(&w_event_outer);
+        h += &self.derivative_xt_diag_x(w_event_outer);
 
         // Norm of the unpenalized score, captured before adding the penalty
         // and ridge contributions, for the scale-invariant convergence

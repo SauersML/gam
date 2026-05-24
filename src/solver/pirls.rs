@@ -814,7 +814,9 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
 }
 
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum FirthDiagnostics {
+    #[default]
     Inactive,
     Active {
         jeffreys_logdet: f64,
@@ -822,11 +824,6 @@ pub enum FirthDiagnostics {
     },
 }
 
-impl Default for FirthDiagnostics {
-    fn default() -> Self {
-        Self::Inactive
-    }
-}
 
 impl FirthDiagnostics {
     #[inline]
@@ -2914,7 +2911,7 @@ impl SparseSpGemmState {
             1.0,
             &self.info,
             self.par,
-            &mut stack,
+            stack,
         );
     }
 }
@@ -3571,7 +3568,8 @@ fn estimate_sparse_native_decision(
     let nnz_x = x_sparse.val().len();
     match workspace.sparse_penalized_system_stats(x_sparse, s_lambda) {
         Ok(stats) => {
-            let decision = SparsePirlsDecision {
+            
+            SparsePirlsDecision {
                 path: if stats.density_upper <= SPARSE_NATIVE_MAX_H_DENSITY {
                     PirlsLinearSolvePath::SparseNative
                 } else {
@@ -3588,8 +3586,7 @@ fn estimate_sparse_native_decision(
                 nnz_s_lambda: stats.nnz_s_lambda_upper,
                 nnz_h_est: Some(stats.nnz_h_upper),
                 density_h_est: Some(stats.density_upper),
-            };
-            decision
+            }
         }
         Err(_) => dense_reject("sparse_stats_failed", nnz_x),
     }
@@ -4638,14 +4635,13 @@ where
 
     let penalizedobjective = |state: &WorkingState| {
         let mut value = state.deviance + state.penalty_term;
-        if options.firth_bias_reduction {
-            if let Some(jeffreys_logdet) = state.jeffreys_logdet() {
+        if options.firth_bias_reduction
+            && let Some(jeffreys_logdet) = state.jeffreys_logdet() {
                 // Jeffreys/Firth adds the identifiable-subspace Jeffreys term
                 // Φ to the log-likelihood,
                 // so the PIRLS deviance is reduced by 2 * Φ.
                 value -= 2.0 * jeffreys_logdet;
             }
-        }
         value
     };
 
@@ -5208,7 +5204,7 @@ where
             if force_fisher_for_rest && !aa_state.disabled {
                 let beta_old_ref: &Array1<f64> = beta.as_ref();
                 if let Some(beta_accel) = aa_state.aa1_mix(beta_old_ref, &candidate_buf) {
-                    candidate_buf.assign(&beta_accel);
+                    candidate_buf.assign(beta_accel);
                     // Apply the same bound projection the loop already runs on
                     // the plain candidate. Treat this as the "existing
                     // validity check": if projection moves the accelerated
@@ -5337,13 +5333,12 @@ where
                             madsen_reject_factor *= 2.0;
                             continue;
                         }
-                        if preferred_curvature == HessianCurvatureKind::Observed {
-                            if state.hessian_curvature == HessianCurvatureKind::Observed
+                        if preferred_curvature == HessianCurvatureKind::Observed
+                            && state.hessian_curvature == HessianCurvatureKind::Observed
                                 && !used_fisher_fallback_this_iter
                             {
                                 consecutive_fisher_fallbacks = 0;
                             }
-                        }
                         if aa_attempt {
                             aa_state.note_accept(iter);
                         }
@@ -6382,7 +6377,7 @@ impl PirlsResult {
             x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                 Array2::zeros((0, 0)),
             )),
-            coordinate_frame: self.coordinate_frame.clone(),
+            coordinate_frame: self.coordinate_frame,
             cache_compacted: true,
             min_penalized_deviance: self.min_penalized_deviance,
         }
@@ -6467,7 +6462,7 @@ impl PirlsResult {
             x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(
                 ReparamOperator::new(x_original.clone(), qs_arc),
             ))),
-            coordinate_frame: self.coordinate_frame.clone(),
+            coordinate_frame: self.coordinate_frame,
             cache_compacted: false,
             min_penalized_deviance: self.min_penalized_deviance,
         })
@@ -6675,7 +6670,7 @@ fn build_sparse_native_reparam_result(
     // In the sparse-native path, qs = I, so the penalties are already in the
     // right coordinate frame. We keep them as-is in canonical_transformed.
     let canonical_transformed: Vec<crate::construction::CanonicalPenalty> =
-        penalties.iter().cloned().collect();
+        penalties.to_vec();
     ReparamResult {
         penalty_shrinkage_ridge: base.penalty_shrinkage_ridge,
         s_transformed: s_original,
@@ -7398,7 +7393,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             linear_constraints_transformed: linear_constraints.clone(),
             reparam_result,
             x_transformed: make_reparam_operator(&x_original, &qs_arc_final, use_sparse_native),
-            coordinate_frame: coordinate_frame.clone(),
+            coordinate_frame: coordinate_frame,
             cache_compacted: false,
             min_penalized_deviance: working_summary.min_penalized_deviance,
         };
@@ -7410,7 +7405,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     let mut working_model = GamWorkingModel::new(
         None, // No pre-materialized x_transformed: use implicit Qs composition
         x_original.clone(),
-        coordinate_frame.clone(),
+        coordinate_frame,
         offset,
         y,
         priorweights,
@@ -7563,10 +7558,10 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         progress_stopped && near_stationary
     };
 
-    let mut status = working_summary.status.clone();
+    let mut status = working_summary.status;
     if status.is_failed_max_iterations() && stalled_at_valid_minimum(&working_summary) {
         status = PirlsStatus::StalledAtValidMinimum;
-        working_summary.status = status.clone();
+        working_summary.status = status;
     }
     if status.is_failed_max_iterations()
         && firth_active
@@ -7575,7 +7570,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         // Firth-adjusted fits can stall; accept under the same dual-criterion
         // near-stationary band.
         status = PirlsStatus::StalledAtValidMinimum;
-        working_summary.status = status.clone();
+        working_summary.status = status;
     }
     let has_penalty = penalty_active.rank() > 0;
     let firth_active = options.firth_bias_reduction;
@@ -7589,7 +7584,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         y,
     ) {
         status = PirlsStatus::Unstable;
-        working_summary.status = status.clone();
+        working_summary.status = status;
     }
 
     // Store a lazy ReparamOperator instead of materializing X·Qs.
@@ -7730,8 +7725,8 @@ fn solve_penalized_least_squares_implicit(
     // When design is sparse and we are in original coordinates (qs = None),
     // assemble the penalized Hessian in sparse format and solve with sparse
     // Cholesky.  This avoids O(p²) dense X'WX and O(p³) dense factorization.
-    if transform.is_none() {
-        if let Some(x_sparse) = x_original.as_sparse() {
+    if transform.is_none()
+        && let Some(x_sparse) = x_original.as_sparse() {
             let PirlsPenalty::Dense { s_transformed, .. } = penalty else {
                 return Err(EstimationError::InvalidInput(
                     "sparse-native PIRLS requires a dense transformed penalty matrix".to_string(),
@@ -7821,7 +7816,6 @@ fn solve_penalized_least_squares_implicit(
                 p_dim,
             ));
         }
-    }
 
     // ── Dense / QS-rotated path ──────────────────────────────────────────
 
@@ -11506,14 +11500,13 @@ pub fn dense_block_xtwy(
             response.ncols()
         )));
     }
-    if let Some(w) = row_weights.as_ref() {
-        if w.len() != n {
+    if let Some(w) = row_weights.as_ref()
+        && w.len() != n {
             return Err(EstimationError::InvalidInput(format!(
                 "dense block row weight length mismatch: expected {n}, got {}",
                 w.len()
             )));
         }
-    }
     let mut out = Array1::<f64>::zeros(k * p_out);
     for row in 0..n {
         let rw = row_weights.as_ref().map(|w| w[row]).unwrap_or(1.0);

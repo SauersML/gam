@@ -67,19 +67,19 @@ pub fn route_through_gpu(op: DispatchOp) -> Option<&'static GpuRuntime> {
     let policy = &runtime.policy;
     let admit = match op {
         DispatchOp::Gemm { m, n, k } => {
-            (op.flops() as u128) >= (policy.gemm_min_flops as u128) && m.min(n).min(k) > 0
+            op.flops() >= (policy.gemm_min_flops as u128) && m.min(n).min(k) > 0
         }
         DispatchOp::Gemv { m, k } => {
-            (op.flops() as u128) >= (policy.gemm_min_flops as u128) && m > 0 && k > 0
+            op.flops() >= (policy.gemm_min_flops as u128) && m > 0 && k > 0
         }
         DispatchOp::XtDiagX { n, p } => {
             n >= policy.xtwx_n_min
-                && (op.flops() as u128) >= (policy.xtwx_flops_min as u128)
+                && op.flops() >= (policy.xtwx_flops_min as u128)
                 && p > 0
         }
         DispatchOp::XtDiagY { n, px, q } => {
             n >= policy.xtwx_n_min
-                && (op.flops() as u128) >= (policy.xtwx_flops_min as u128)
+                && op.flops() >= (policy.xtwx_flops_min as u128)
                 && px > 0
                 && q > 0
         }

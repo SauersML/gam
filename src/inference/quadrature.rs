@@ -857,12 +857,7 @@ fn logistic_normal_exact_eligible(mu: f64, sigma: f64) -> bool {
     mu.is_finite()
         && sigma.is_finite()
         && mu.abs() <= LOGIT_ERFCX_MU_MAX
-        && sigma >= LOGIT_SIGMA_TAYLOR_MAX
-        // The real-valued erfcx series is the preferred exact backend on the
-        // central moderate regime. Outside that window we switch to explicit
-        // asymptotic formulas that are better conditioned than pushing the same
-        // series past its practical truncation range.
-        && sigma <= LOGIT_ERFCX_SIGMA_MAX
+        && (LOGIT_SIGMA_TAYLOR_MAX..=LOGIT_ERFCX_SIGMA_MAX).contains(&sigma)
 }
 
 /// A-priori truncation index for the erfcx series of the logistic-normal mean.
@@ -1554,7 +1549,7 @@ fn cloglog_posterior_meanwith_deriv_ghq(
     }
     let mean = cloglog_mean_from_survival(survival_posterior_mean_ghq(ctx, mu, sigma));
     let dmean_dmu =
-        integrate_normal_ghq_adaptive(ctx, mu, sigma, |x| cloglog_mean_d1_exact(x)).max(0.0);
+        integrate_normal_ghq_adaptive(ctx, mu, sigma, cloglog_mean_d1_exact).max(0.0);
     IntegratedMeanDerivative {
         mean,
         dmean_dmu,
@@ -1564,7 +1559,7 @@ fn cloglog_posterior_meanwith_deriv_ghq(
 
 #[inline]
 fn survival_posterior_mean_ghq(ctx: &QuadratureContext, eta: f64, se_eta: f64) -> f64 {
-    integrate_normal_ghq_adaptive(ctx, eta, se_eta, |x| gumbel_survival(x)).clamp(0.0, 1.0)
+    integrate_normal_ghq_adaptive(ctx, eta, se_eta, gumbel_survival).clamp(0.0, 1.0)
 }
 
 fn cloglog_survival_term_controlled(
@@ -1624,14 +1619,13 @@ fn cloglog_survival_term_controlled(
     if let Some(out) = cloglog_survival_extreme_asymptotic(mu, sigma) {
         return out;
     }
-    if (mu.abs() / sigma) >= 3.0 {
-        if let Ok(out) = cloglog_survival_miles(mu, sigma) {
+    if (mu.abs() / sigma) >= 3.0
+        && let Ok(out) = cloglog_survival_miles(mu, sigma) {
             return (
                 out.clamp(0.0, 1.0),
                 IntegratedExpectationMode::ExactSpecialFunction,
             );
         }
-    }
     if cloglog_should_prefer_cc(mu, sigma, CLOGLOG_CC_TOL)
         && let Ok(out) = cloglog_survival_cc(ctx, mu, sigma, CLOGLOG_CC_TOL)
     {

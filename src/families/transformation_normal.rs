@@ -547,7 +547,7 @@ pub(crate) fn transformation_normal_pit_score(
         let log_num = log_normal_cdf_diff(h_inside, lower)?;
         let log_den = log_normal_cdf_diff(upper, lower)?;
         let ratio = (log_num - log_den).exp();
-        if !(ratio.is_finite() && ratio >= -1.0e-12 && ratio <= 1.0 + 1.0e-12) {
+        if !(ratio.is_finite() && (-1.0e-12..=1.0 + 1.0e-12).contains(&ratio)) {
             return Err(TransformationNormalError::NumericalFailure { reason: format!(
                 "transformation-normal PIT probability is not representable: h={h:.6e}, lower={lower:.6e}, upper={upper:.6e}, ratio={ratio}"
             ) }.into());
@@ -10843,11 +10843,9 @@ impl TensorKroneckerPsiOperator {
         }
         if let Some(rows) = deriv_d.x_psi_psi.as_ref()
             && let Some(mat) = rows.get(axis_e)
-        {
-            if mat.nrows() == self.n_data() && mat.ncols() == self.p_cov() {
+            && mat.nrows() == self.n_data() && mat.ncols() == self.p_cov() {
                 return Ok(crate::faer_ndarray::fast_av(mat, u));
             }
-        }
         Ok(Array1::<f64>::zeros(self.n_data()))
     }
 
@@ -10873,11 +10871,9 @@ impl TensorKroneckerPsiOperator {
         }
         if let Some(rows) = deriv_d.x_psi_psi.as_ref()
             && let Some(mat) = rows.get(axis_e)
-        {
-            if mat.nrows() == self.n_data() && mat.ncols() == self.p_cov() {
+            && mat.nrows() == self.n_data() && mat.ncols() == self.p_cov() {
                 return Ok(crate::faer_ndarray::fast_atv(mat, v));
             }
-        }
         Ok(Array1::<f64>::zeros(self.p_cov()))
     }
 
@@ -10938,11 +10934,9 @@ impl TensorKroneckerPsiOperator {
         }
         if let Some(second_rows) = deriv_d.x_psi_psi.as_ref()
             && let Some(mat) = second_rows.get(axis_e)
-        {
-            if mat.nrows() == self.n_data() && mat.ncols() == self.p_cov() {
+            && mat.nrows() == self.n_data() && mat.ncols() == self.p_cov() {
                 return Ok(mat.slice(s![rows, ..]).to_owned());
             }
-        }
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p_cov())))
     }
 

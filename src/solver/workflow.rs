@@ -2483,10 +2483,10 @@ impl Default for FitConfig {
 /// the shape of the problem via
 /// [`crate::resource::ResourcePolicy::for_problem`]. At biobank scale (n_rows
 /// >= 100k or the marginal-slope biobank path active) this returns
-/// `analytic_operator_required` so that any silent dense materialization in
-/// the term-construction layer fails fast rather than allocating tens of GiB;
-/// at small scale it falls through to the permissive default-library policy
-/// so that non-operator bases still build cleanly.
+/// > `analytic_operator_required` so that any silent dense materialization in
+/// > the term-construction layer fails fast rather than allocating tens of GiB;
+/// > at small scale it falls through to the permissive default-library policy
+/// > so that non-operator bases still build cleanly.
 ///
 /// `p_estimate = 0` because the per-block coefficient count isn't known until
 /// the spec has been built; the n_rows and hints triggers are sufficient to
@@ -2543,8 +2543,7 @@ pub fn materialize<'a>(
             return Err(WorkflowError::InvalidConfig {
                 reason: "transformation_normal cannot be combined with a Surv(...) response"
                     .to_string(),
-            }
-            .into());
+            });
         }
         materialize_survival(
             &parsed, data, &col_map, config, &entry_col, &exit_col, &event_col,
@@ -2554,8 +2553,7 @@ pub fn materialize<'a>(
         if config.noise_formula.is_some() {
             return Err(WorkflowError::InvalidConfig {
                 reason: "transformation_normal cannot be combined with noise_formula".to_string(),
-            }
-            .into());
+            });
         }
         materialize_transformation_normal(&parsed, data, &col_map, config)
             .map_err(|reason| WorkflowError::IntegrationFailed { reason })
@@ -4368,8 +4366,8 @@ fn initial_latent_matrix(spec: &LatentSpec, y: ArrayView1<'_, f64>) -> Result<Ar
 fn latent_id_mode(spec: &LatentSpec) -> Result<LatentIdMode, String> {
     match (&spec.aux_prior, &spec.dim_selection) {
         (Some(aux), Some(dim)) => {
-            if let Some(init) = dim.init_log_precision.as_ref() {
-                if init.len() != spec.d {
+            if let Some(init) = dim.init_log_precision.as_ref()
+                && init.len() != spec.d {
                     return Err(format!(
                         "latent '{}' dim_selection.init_log_precision has length {}, expected {}",
                         spec.target,
@@ -4377,7 +4375,6 @@ fn latent_id_mode(spec: &LatentSpec) -> Result<LatentIdMode, String> {
                         spec.d
                     ));
                 }
-            }
             Ok(LatentIdMode::AuxPriorDimSelection {
                 u: aux.u.clone(),
                 family: aux.family,
@@ -4446,8 +4443,8 @@ fn prepare_standard_latent_coord(
             data.values.nrows()
         ));
     }
-    if let Some(aux) = spec.aux_prior.as_ref() {
-        if aux.u.nrows() != spec.n {
+    if let Some(aux) = spec.aux_prior.as_ref()
+        && aux.u.nrows() != spec.n {
             return Err(format!(
                 "latent '{}' aux_prior.u has {} rows, expected {}",
                 spec.target,
@@ -4455,7 +4452,6 @@ fn prepare_standard_latent_coord(
                 spec.n
             ));
         }
-    }
 
     let matrix = initial_latent_matrix(&spec, y)?;
     let id_mode = latent_id_mode(&spec)?;
@@ -4498,12 +4494,11 @@ fn prepare_standard_latent_coord(
     let mut rewritten = parsed.clone();
     let mut matched = false;
     for term in &mut rewritten.terms {
-        if let ParsedTerm::Smooth { vars, .. } = term {
-            if vars.len() == 1 && vars[0] == spec.target {
+        if let ParsedTerm::Smooth { vars, .. } = term
+            && vars.len() == 1 && vars[0] == spec.target {
                 *vars = synthetic_vars.clone();
                 matched = true;
             }
-        }
     }
     if !matched {
         return Err(format!(

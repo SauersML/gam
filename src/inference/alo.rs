@@ -501,8 +501,8 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
         // materialize a parallel ndarray copy.
         let s_chunk = factor.solve(rhs_chunk.as_ref());
 
-        if e_rank > 0 {
-            if let Some(e) = input.penalty_root {
+        if e_rank > 0
+            && let Some(e) = input.penalty_root {
                 let eview = FaerArrayView::new(e);
                 // Compute only the leading `width` columns; `col_as_slice` will
                 // index into the full-width buffer up to `width` below.
@@ -516,7 +516,6 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
                     Par::Seq,
                 );
             }
-        }
 
         let rhs_view = rhs_chunk_buf.slice(s![.., ..width]);
 

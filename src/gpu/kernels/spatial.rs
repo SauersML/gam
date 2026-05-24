@@ -109,9 +109,7 @@ pub fn try_dispatch(
     if points_a.nrows() == 0 || points_b.nrows() == 0 || points_a.ncols() != points_b.ncols() {
         return None;
     }
-    if crate::gpu::runtime::GpuRuntime::global().is_none() {
-        return None;
-    }
+    crate::gpu::runtime::GpuRuntime::global()?;
     Some(cuda_spatial(kernel, points_a, points_b))
 }
 
@@ -213,8 +211,8 @@ extern "C" __global__ void spatial_kernel(
 
     let tx: u32 = 16;
     let ty: u32 = 16;
-    let bx = ((nb as u32) + tx - 1) / tx;
-    let by = ((na as u32) + ty - 1) / ty;
+    let bx = (nb as u32).div_ceil(tx);
+    let by = (na as u32).div_ceil(ty);
     let cfg = LaunchConfig {
         grid_dim: (bx, by, 1),
         block_dim: (tx, ty, 1),

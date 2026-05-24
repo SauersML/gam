@@ -140,11 +140,11 @@ extern "C" __global__ void hutchpp_dot_kernel(
             })?;
 
     let threads: u32 = 256;
-    let blocks = ((n as u32) + threads - 1) / threads;
+    let blocks = (n as u32).div_ceil(threads);
     let cfg = LaunchConfig {
         grid_dim: (blocks, 1, 1),
         block_dim: (threads, 1, 1),
-        shared_mem_bytes: (threads as u32) * (std::mem::size_of::<f64>() as u32),
+        shared_mem_bytes: threads * (std::mem::size_of::<f64>() as u32),
     };
 
     let mut acc = 0.0_f64;

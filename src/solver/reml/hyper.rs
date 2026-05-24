@@ -1641,14 +1641,13 @@ impl<'a> RemlState<'a> {
                 // The D(H_φ)[β_{τ_j}] part is NOT included here because it
                 // depends on β_{τ_j} (the IFT solve result), which the unified
                 // evaluator computes itself. Only the fixed-β partial goes in B_j.
-                if let Some(op) = firth_op.as_ref() {
-                    if let Some(kernel) = firth_tau_kernel_j.as_ref() {
+                if let Some(op) = firth_op.as_ref()
+                    && let Some(kernel) = firth_tau_kernel_j.as_ref() {
                         let eye = Array2::<f64>::eye(p_dim);
                         let hphi_tau_partial =
                             Self::firth_hphi_tau_partial_apply(op, x_tau_j, kernel, &eye);
                         b_j -= &hphi_tau_partial;
                     }
-                }
 
                 Some(b_j)
             };
@@ -1933,7 +1932,7 @@ impl<'a> RemlState<'a> {
                 let beta_norm = beta_eval.iter().map(|v| v * v).sum::<f64>().sqrt();
                 let u_norm = u.iter().map(|v| v * v).sum::<f64>().sqrt();
                 // Show a few entries of x_tau and beta.
-                let xtb0 = if x_tau_beta_j.len() > 0 {
+                let xtb0 = if !x_tau_beta_j.is_empty() {
                     x_tau_beta_j[0]
                 } else {
                     0.0
@@ -2131,7 +2130,7 @@ impl<'a> RemlState<'a> {
         // Use block-factored penalty logdet when penalties are disjoint.
         let pld = super::penalty_logdet::PenaltyPseudologdet::from_penalties(
             &self.canonical_penalties,
-            &lambdas.as_slice().unwrap_or(&[]),
+            lambdas.as_slice().unwrap_or(&[]),
             bundle.ridge_passport.penalty_logdet_ridge(),
             p_dim,
         )
@@ -2200,11 +2199,10 @@ impl<'a> RemlState<'a> {
             let mut dense_tau_tau: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; n_dirs]; n_dirs];
             for ii in 0..n_dirs {
                 for jj in 0..n_dirs {
-                    if let Some(t) = x_tau_tau[ii][jj].as_ref() {
-                        if let TauTauDesignTerm::Dense(d) = t {
+                    if let Some(t) = x_tau_tau[ii][jj].as_ref()
+                        && let TauTauDesignTerm::Dense(d) = t {
                             dense_tau_tau[ii][jj] = Some(d.clone());
                         }
-                    }
                 }
             }
             (op_opt, dense_list, dense_tau_tau)
@@ -2363,7 +2361,7 @@ impl<'a> RemlState<'a> {
             };
         let pld = super::penalty_logdet::PenaltyPseudologdet::from_penalties(
             &ct_eval,
-            &lambdas.as_slice().unwrap_or(&[]),
+            lambdas.as_slice().unwrap_or(&[]),
             bundle.ridge_passport.penalty_logdet_ridge(),
             p_dim,
         )
@@ -2429,11 +2427,10 @@ impl<'a> RemlState<'a> {
             let mut dense_tau_tau: Vec<Vec<Option<Array2<f64>>>> = vec![vec![None; n_dirs]; n_dirs];
             for ii in 0..n_dirs {
                 for jj in 0..n_dirs {
-                    if let Some(t) = x_tau_tau[ii][jj].as_ref() {
-                        if let TauTauDesignTerm::Dense(d) = t {
+                    if let Some(t) = x_tau_tau[ii][jj].as_ref()
+                        && let TauTauDesignTerm::Dense(d) = t {
                             dense_tau_tau[ii][jj] = Some(d.clone());
                         }
-                    }
                 }
             }
             (op_opt, dense_list, dense_tau_tau)
