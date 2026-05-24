@@ -4444,6 +4444,10 @@ fn smooth_basis_feature_cols_for_latent(
         crate::smooth::SmoothBasisSpec::BySmooth { smooth, .. } => {
             smooth_basis_feature_cols_for_latent(smooth)
         }
+        crate::smooth::SmoothBasisSpec::ByVariable { inner, .. }
+        | crate::smooth::SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            smooth_basis_feature_cols_for_latent(inner)
+        }
         crate::smooth::SmoothBasisSpec::FactorSmooth { .. } => None,
     }
 }
@@ -4490,6 +4494,10 @@ fn natural_latent_manifold_for_basis(
         }
         crate::smooth::SmoothBasisSpec::BySmooth { smooth, .. } => {
             natural_latent_manifold_for_basis(smooth, d)
+        }
+        crate::smooth::SmoothBasisSpec::ByVariable { inner, .. }
+        | crate::smooth::SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            natural_latent_manifold_for_basis(inner, d)
         }
         crate::smooth::SmoothBasisSpec::ThinPlate { .. }
         | crate::smooth::SmoothBasisSpec::Matern { .. }
