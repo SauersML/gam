@@ -970,10 +970,26 @@ impl LatentCoordValues {
     ) -> Result<(), BasisError> {
         let d = self.latent_dim;
         let n_centers = centers.nrows();
-        assert!(n < self.n_obs);
-        assert_eq!(centers.ncols(), d);
-        assert_eq!(grad_phi_row.len(), n_centers);
-        assert_eq!(grad_t.len(), self.values.len());
+        assert!(
+            n < self.n_obs,
+            "latent coordinate gradient row out of bounds: row={n}, n_obs={}",
+            self.n_obs
+        );
+        assert_eq!(
+            centers.ncols(),
+            d,
+            "latent coordinate center dimension mismatch"
+        );
+        assert_eq!(
+            grad_phi_row.len(),
+            n_centers,
+            "latent coordinate radial-gradient row length mismatch"
+        );
+        assert_eq!(
+            grad_t.len(),
+            self.values.len(),
+            "latent coordinate gradient output length mismatch"
+        );
         if scale == 0.0 {
             return Ok(());
         }

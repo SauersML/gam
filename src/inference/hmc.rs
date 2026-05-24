@@ -1244,15 +1244,14 @@ fn probit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f6
 /// gradient_i = w_i · [y_i · exp(η_i)·exp(−exp(η_i)) / (1−exp(−exp(η_i))) − (1−y_i)·exp(η_i)]
 #[inline]
 fn cloglog_bernoulli_logp_and_residual(eta: f64, y: f64) -> (f64, f64) {
-    let eta_i = eta.clamp(-700.0, 700.0);
-    let exp_eta = eta_i.exp();
+    let exp_eta = eta.exp();
     let log_mu = if exp_eta <= std::f64::consts::LN_2 {
         (-(-exp_eta).exp_m1()).ln()
     } else {
         (-(-exp_eta).exp()).ln_1p()
     };
     let log_one_minus_mu = -exp_eta;
-    let grad_log_mu = (eta_i - exp_eta - log_mu).exp();
+    let grad_log_mu = (eta - exp_eta - log_mu).exp();
     let ll_i = y * log_mu + (1.0 - y) * log_one_minus_mu;
     let residual_i = y * grad_log_mu - (1.0 - y) * exp_eta;
     (ll_i, residual_i)
@@ -1261,6 +1260,12 @@ fn cloglog_bernoulli_logp_and_residual(eta: f64, y: f64) -> (f64, f64) {
 fn cloglog_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
+    if eta
+        .iter()
+        .any(|&eta_i| !(eta_i.is_finite() && (-700.0..=700.0).contains(&eta_i)))
+    {
+        return (f64::NEG_INFINITY, Array1::zeros(data.dim));
+    }
     let mut residual = Array1::<f64>::zeros(n);
     let ll: f64 = residual
         .as_slice_mut()
@@ -1323,6 +1328,12 @@ fn gaussian_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<
 fn poisson_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
+    if eta
+        .iter()
+        .any(|&eta_i| !(eta_i.is_finite() && (-700.0..=700.0).contains(&eta_i)))
+    {
+        return (f64::NEG_INFINITY, Array1::zeros(data.dim));
+    }
     let mut residual = Array1::<f64>::zeros(n);
     let ll: f64 = residual
         .as_slice_mut()
@@ -1330,7 +1341,7 @@ fn poisson_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Arra
         .par_iter_mut()
         .enumerate()
         .map(|(i, slot)| {
-            let eta_i = eta[i].clamp(-700.0, 700.0);
+            let eta_i = eta[i];
             let mu_i = eta_i.exp();
             let y_i = data.y[i];
             let w_i = data.weights[i];
@@ -1356,6 +1367,12 @@ fn tweedie_log_quasilogp_and_grad(
     if !is_valid_tweedie_power(p) {
         return (f64::NAN, Array1::from_elem(data.dim, f64::NAN));
     }
+    if eta
+        .iter()
+        .any(|&eta_i| !(eta_i.is_finite() && (-700.0..=700.0).contains(&eta_i)))
+    {
+        return (f64::NEG_INFINITY, Array1::zeros(data.dim));
+    }
     let inv_phi = data.dispersion.inv_phi();
     let mut residual = Array1::<f64>::zeros(n);
     let ll: f64 = residual
@@ -1364,7 +1381,7 @@ fn tweedie_log_quasilogp_and_grad(
         .par_iter_mut()
         .enumerate()
         .map(|(i, slot)| {
-            let eta_i = eta[i].clamp(-700.0, 700.0);
+            let eta_i = eta[i];
             let mu_i = eta_i.exp().max(1e-300);
             let y_i = data.y[i];
             let w_i = data.weights[i] * inv_phi;
@@ -1431,6 +1448,12 @@ fn negative_binomial_log_logp_and_grad(
 fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
+    if eta
+        .iter()
+        .any(|&eta_i| !(eta_i.is_finite() && (-700.0..=700.0).contains(&eta_i)))
+    {
+        return (f64::NEG_INFINITY, Array1::zeros(data.dim));
+    }
     let shape = data.gamma_shape.max(1e-10);
     // Hoist shape-only constants out of the per-sample loop: ln Γ(shape) and
     // shape · ln(shape) are independent of i, so previously each sample paid
@@ -1446,7 +1469,7 @@ fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1
         .par_iter_mut()
         .enumerate()
         .map(|(i, slot)| {
-            let eta_i = eta[i].clamp(-700.0, 700.0);
+            let eta_i = eta[i];
             let mu_i = eta_i.exp();
             let y_i = data.y[i];
             let w_i = data.weights[i];
@@ -4178,8 +4201,12 @@ impl LinkWigglePosterior {
             NutsFamily::BinomialCLogLog => {
                 let mut ll_acc = 0.0;
                 for i in 0..self.n_samples {
+                    let eta_i = eta[i];
+                    if !(eta_i.is_finite() && (-700.0..=700.0).contains(&eta_i)) {
+                        return (f64::NEG_INFINITY, Array1::zeros(dim));
+                    }
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
-                    let (ll_i, residual_i) = cloglog_bernoulli_logp_and_residual(eta[i], y_i);
+                    let (ll_i, residual_i) = cloglog_bernoulli_logp_and_residual(eta_i, y_i);
                     ll_acc += w_i * ll_i;
                     residual[i] = w_i * residual_i;
                 }
@@ -4188,7 +4215,10 @@ impl LinkWigglePosterior {
             NutsFamily::PoissonLog => {
                 let mut ll_acc = 0.0;
                 for i in 0..self.n_samples {
-                    let eta_i = eta[i].clamp(-30.0, 30.0);
+                    let eta_i = eta[i];
+                    if !(eta_i.is_finite() && (-30.0..=30.0).contains(&eta_i)) {
+                        return (f64::NEG_INFINITY, Array1::zeros(dim));
+                    }
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
                     let mu = eta_i.exp();
                     ll_acc += w_i * (y_i * eta_i - mu);
@@ -4205,7 +4235,10 @@ impl LinkWigglePosterior {
                 }
                 let p = self.scale;
                 for i in 0..self.n_samples {
-                    let eta_i = eta[i].clamp(-30.0, 30.0);
+                    let eta_i = eta[i];
+                    if !(eta_i.is_finite() && (-30.0..=30.0).contains(&eta_i)) {
+                        return (f64::NEG_INFINITY, Array1::zeros(dim));
+                    }
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
                     let mu = eta_i.exp().max(1e-300);
                     ll_acc += w_i
@@ -4250,7 +4283,10 @@ impl LinkWigglePosterior {
                 let mut ll_acc = 0.0;
                 let shape = self.scale.max(1e-10);
                 for i in 0..self.n_samples {
-                    let eta_i = eta[i].clamp(-30.0, 30.0);
+                    let eta_i = eta[i];
+                    if !(eta_i.is_finite() && (-30.0..=30.0).contains(&eta_i)) {
+                        return (f64::NEG_INFINITY, Array1::zeros(dim));
+                    }
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
                     let mu = eta_i.exp();
                     ll_acc += w_i * shape * (-y_i / mu - eta_i);
