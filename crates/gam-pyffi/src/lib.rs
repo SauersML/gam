@@ -14310,7 +14310,10 @@ fn build_gaussian_location_scale_ffi_payload(
         formula,
         ModelKind::LocationScale,
         FittedFamily::LocationScale {
-            likelihood: LikelihoodFamily::GaussianIdentity,
+            likelihood: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             base_link: None,
         },
         "gaussian-location-scale".to_string(),
