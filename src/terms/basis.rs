@@ -26260,7 +26260,7 @@ pub mod closed_form_penalty {
         );
         assert!(!r.is_empty(), "anisotropic_duchon_penalty: empty input");
         assert!(q <= 2, "anisotropic_duchon_penalty: q must be in {{0,1,2}}");
-        anisotropic_duchon_penalty_radial(q, m, (s), kappa, eta, r)
+        anisotropic_duchon_penalty_radial(q, m, s , kappa, eta, r)
     }
 
     /// Bundled value + first/second derivatives of the anisotropic pair-block
@@ -27175,7 +27175,7 @@ pub mod closed_form_penalty {
             if let Some(value) = uniform_metric_radial_duchon_penalty(
                 q,
                 m,
-                (s),
+                s ,
                 kappa,
                 d,
                 common_eta,
@@ -27236,7 +27236,7 @@ pub mod closed_form_penalty {
 
         let big_r = (b * euclidean_r2).sqrt();
         let max_order = if q == 0 { 0 } else { 2 * q };
-        let fr = radial_derivatives_of_isotropic_duchon(d, m, (s), kappa, big_r, max_order);
+        let fr = radial_derivatives_of_isotropic_duchon(d, m, s , kappa, big_r, max_order);
         let big_r2 = big_r * big_r;
         let s1 = (d as f64) * b;
         let s2 = (d as f64) * b * b;
