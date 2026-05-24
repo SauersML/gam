@@ -14483,8 +14483,8 @@ fn validate_duchon_collocation_orders(
 
 #[derive(Debug, Clone)]
 pub struct DuchonPartialFractionCoeffs {
-    a: Vec<f64>,
-    b: Vec<f64>,
+    pub(crate) a: Vec<f64>,
+    pub(crate) b: Vec<f64>,
 }
 
 #[inline(always)]
@@ -28297,13 +28297,16 @@ mod tests {
         panic!("test only covers nu >= 5/2; got {nu:?}")
     }
 
-    fn periodic_test_spec(num_basis: usize) -> PeriodicSplineCurve {
-        PeriodicSplineCurve {
-            lambda: 1e-10,
-            ridge: 1e-10,
-            ..PeriodicSplineCurve::cubic(num_basis, 0.0, std::f64::consts::TAU)
-        }
+    /// Cubic periodic B-spline basis spec for tests, with the standard
+    /// `period = TAU`, `origin = 0.0`, `penalty_order = 2` shape.
+    fn periodic_test_spec(num_basis: usize) -> PeriodicBSplineBasisSpec {
+        PeriodicBSplineBasisSpec::new(3, num_basis, std::f64::consts::TAU, 0.0, 2)
     }
+
+    /// Smoothing strength shared by the periodic-curve fit tests; tiny
+    /// ridge so the closed-form normal equations stay invertible without
+    /// biasing the fitted coefficients.
+    const PERIODIC_TEST_SMOOTHING_LAMBDA: f64 = 1.0e-10;
 
     #[test]
     fn periodic_bspline_basis_partitions_unity_and_closes_seam() {
@@ -28347,7 +28350,7 @@ mod tests {
         }
 
         let spec = periodic_test_spec(48);
-        let curve = fit_periodic_bspline_curve(u.view(), y.view(), &spec).expect("fit curve");
+        let curve = fit_periodic_bspline_curve(u.view(), y.view(), &spec, PERIODIC_TEST_SMOOTHING_LAMBDA).expect("fit curve");
         assert_eq!(curve.ambient_dim(), 3);
 
         let pred = curve.evaluate(u.view()).expect("predict curve");
@@ -28401,8 +28404,8 @@ mod tests {
         let spec = periodic_test_spec(36);
 
         let base_curve =
-            fit_periodic_bspline_curve(u.view(), circle.view(), &spec).expect("fit base circle");
-        let stretched_curve = fit_periodic_bspline_curve(u.view(), stretched.view(), &spec)
+            fit_periodic_bspline_curve(u.view(), circle.view(), &spec, PERIODIC_TEST_SMOOTHING_LAMBDA).expect("fit base circle");
+        let stretched_curve = fit_periodic_bspline_curve(u.view(), stretched.view(), &spec, PERIODIC_TEST_SMOOTHING_LAMBDA)
             .expect("fit stretched ambient curve");
 
         let query = Array1::from_iter((0..73).map(|i| -1.3 + 0.17 * i as f64));
@@ -28435,7 +28438,7 @@ mod tests {
             y[[i, 3]] = 0.4 * (3.0 * ui).sin();
             y[[i, 4]] = 0.1 * ui.cos() - 2.0 * ui.sin();
         }
-        let curve = fit_periodic_bspline_curve(u.view(), y.view(), &periodic_test_spec(40))
+        let curve = fit_periodic_bspline_curve(u.view(), y.view(), &periodic_test_spec(40), PERIODIC_TEST_SMOOTHING_LAMBDA)
             .expect("fit high-dimensional loop");
 
         let q = array![0.17, 1.91, 5.8];
