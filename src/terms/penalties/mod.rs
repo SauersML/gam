@@ -58,4 +58,3 @@ macro_rules! analytic_penalty_registry {
         }
     };
 }
-

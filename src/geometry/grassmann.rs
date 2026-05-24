@@ -1,8 +1,8 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::geometry::manifold::{
-    GEOMETRY_EPS, GeometryResult, RiemannianManifold, check_len, dot, flatten, from_flat,
-    identity, inverse, jacobi_symmetric, qr_thin, zero_christoffel,
+    GEOMETRY_EPS, GeometryResult, RiemannianManifold, check_len, dot, flatten, from_flat, identity,
+    inverse, jacobi_symmetric, qr_thin, zero_christoffel,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,7 +90,11 @@ impl RiemannianManifold for GrassmannManifold {
         tangent_vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
         let y = from_flat(point, self.n, self.k)?;
-        let tangent = from_flat(self.project_tangent(point, tangent_vec)?.view(), self.n, self.k)?;
+        let tangent = from_flat(
+            self.project_tangent(point, tangent_vec)?.view(),
+            self.n,
+            self.k,
+        )?;
         let (u, sigma, v) = self.compact_svd_from_tangent(&tangent)?;
         let mut cos_d = Array2::<f64>::zeros((self.k, self.k));
         let mut sin_d = Array2::<f64>::zeros((self.k, self.k));
@@ -139,7 +143,11 @@ impl RiemannianManifold for GrassmannManifold {
         point_along: ArrayView2<'_, f64>,
         vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
-        check_len("Grassmann transported vector", vec.len(), self.ambient_dim())?;
+        check_len(
+            "Grassmann transported vector",
+            vec.len(),
+            self.ambient_dim(),
+        )?;
         if point_along.nrows() == 0 {
             return Ok(vec.to_owned());
         }
@@ -152,7 +160,11 @@ impl RiemannianManifold for GrassmannManifold {
     }
 
     fn christoffel_symbols(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Vec<Array2<f64>>> {
-        check_len("Grassmann Christoffel point", point.len(), self.ambient_dim())?;
+        check_len(
+            "Grassmann Christoffel point",
+            point.len(),
+            self.ambient_dim(),
+        )?;
         Ok(zero_christoffel(self.ambient_dim()))
     }
 
@@ -162,8 +174,16 @@ impl RiemannianManifold for GrassmannManifold {
         tangent_pair: (ArrayView1<'_, f64>, ArrayView1<'_, f64>),
     ) -> GeometryResult<f64> {
         check_len("Grassmann curvature point", point.len(), self.ambient_dim())?;
-        check_len("Grassmann curvature tangent u", tangent_pair.0.len(), self.ambient_dim())?;
-        check_len("Grassmann curvature tangent v", tangent_pair.1.len(), self.ambient_dim())?;
+        check_len(
+            "Grassmann curvature tangent u",
+            tangent_pair.0.len(),
+            self.ambient_dim(),
+        )?;
+        check_len(
+            "Grassmann curvature tangent v",
+            tangent_pair.1.len(),
+            self.ambient_dim(),
+        )?;
         Ok(0.0)
     }
 
@@ -184,7 +204,11 @@ impl RiemannianManifold for GrassmannManifold {
         tangent_vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
         let y = from_flat(point, self.n, self.k)?;
-        let tangent = from_flat(self.project_tangent(point, tangent_vec)?.view(), self.n, self.k)?;
+        let tangent = from_flat(
+            self.project_tangent(point, tangent_vec)?.view(),
+            self.n,
+            self.k,
+        )?;
         Ok(flatten(&self.orthonormalize(&(y + tangent))))
     }
 }

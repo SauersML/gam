@@ -17,8 +17,8 @@ use crate::families::marginal_slope_shared::{
     build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
     eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
-    outer_weighted_rows, probit_frailty_scale,
-    probit_frailty_scale_multi_dir_jet, psi_derivative_location, scale_coeff4,
+    outer_weighted_rows, probit_frailty_scale, probit_frailty_scale_multi_dir_jet,
+    psi_derivative_location, scale_coeff4,
 };
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
@@ -290,58 +290,60 @@ impl LatentMeasureKind {
             } => {
                 if feature_cols.is_empty() {
                     return Err(format!(
-                            "{context} local empirical latent measure needs feature columns"
-                        ));
+                        "{context} local empirical latent measure needs feature columns"
+                    ));
                 }
                 if centers.is_empty() {
-                    return Err(format!("{context} local empirical latent measure needs centers"));
+                    return Err(format!(
+                        "{context} local empirical latent measure needs centers"
+                    ));
                 }
                 if centers.len() != grids.len() {
                     return Err(format!(
-                            "{context} local empirical latent measure center/grid length mismatch: centers={}, grids={}",
-                            centers.len(),
-                            grids.len()
-                        ));
+                        "{context} local empirical latent measure center/grid length mismatch: centers={}, grids={}",
+                        centers.len(),
+                        grids.len()
+                    ));
                 }
                 if *top_k == 0 || *top_k > centers.len() {
                     return Err(format!(
-                            "{context} local empirical latent measure top_k must be in 1..={}, got {top_k}",
-                            centers.len()
-                        ));
+                        "{context} local empirical latent measure top_k must be in 1..={}, got {top_k}",
+                        centers.len()
+                    ));
                 }
                 if !(*bandwidth).is_finite() || *bandwidth <= 0.0 {
                     return Err(format!(
-                            "{context} local empirical latent measure bandwidth must be finite and positive, got {bandwidth}"
-                        ));
+                        "{context} local empirical latent measure bandwidth must be finite and positive, got {bandwidth}"
+                    ));
                 }
                 if let Some(scales) = input_scales.as_ref() {
                     if scales.len() != feature_cols.len() {
                         return Err(format!(
-                                "{context} local empirical latent measure input scale dimension mismatch: scales={}, features={}",
-                                scales.len(),
-                                feature_cols.len()
-                            ));
+                            "{context} local empirical latent measure input scale dimension mismatch: scales={}, features={}",
+                            scales.len(),
+                            feature_cols.len()
+                        ));
                     }
                     for (scale_idx, scale) in scales.iter().enumerate() {
                         if !(scale.is_finite() && *scale > 0.0) {
                             return Err(format!(
-                                    "{context} local empirical latent measure input scale {scale_idx} must be finite and positive, got {scale}"
-                                ));
+                                "{context} local empirical latent measure input scale {scale_idx} must be finite and positive, got {scale}"
+                            ));
                         }
                     }
                 }
                 for (center_idx, center) in centers.iter().enumerate() {
                     if center.len() != feature_cols.len() {
                         return Err(format!(
-                                "{context} local empirical latent center {center_idx} dimension mismatch: got {}, expected {}",
-                                center.len(),
-                                feature_cols.len()
-                            ));
+                            "{context} local empirical latent center {center_idx} dimension mismatch: got {}, expected {}",
+                            center.len(),
+                            feature_cols.len()
+                        ));
                     }
                     if center.iter().any(|value| !value.is_finite()) {
                         return Err(format!(
-                                "{context} local empirical latent center {center_idx} has non-finite coordinates"
-                            ));
+                            "{context} local empirical latent center {center_idx} has non-finite coordinates"
+                        ));
                     }
                 }
                 for (grid_idx, grid) in grids.iter().enumerate() {
@@ -389,32 +391,34 @@ impl LatentMeasureKind {
 fn validate_empirical_z_grid(nodes: &[f64], weights: &[f64], context: &str) -> Result<(), String> {
     if nodes.len() != weights.len() {
         return Err(format!(
-                "{context} empirical latent measure node/weight length mismatch: nodes={}, weights={}",
-                nodes.len(),
-                weights.len()
-            ));
+            "{context} empirical latent measure node/weight length mismatch: nodes={}, weights={}",
+            nodes.len(),
+            weights.len()
+        ));
     }
     if nodes.len() < 2 {
-        return Err(format!("{context} empirical latent measure requires at least two nodes"));
+        return Err(format!(
+            "{context} empirical latent measure requires at least two nodes"
+        ));
     }
     let mut total = 0.0;
     for (idx, (&node, &weight)) in nodes.iter().zip(weights.iter()).enumerate() {
         if !node.is_finite() {
             return Err(format!(
-                    "{context} empirical latent measure node {idx} is non-finite ({node})"
-                ));
+                "{context} empirical latent measure node {idx} is non-finite ({node})"
+            ));
         }
         if !(weight.is_finite() && weight > 0.0) {
             return Err(format!(
-                    "{context} empirical latent measure weight {idx} must be finite and positive, got {weight}"
-                ));
+                "{context} empirical latent measure weight {idx} must be finite and positive, got {weight}"
+            ));
         }
         total += weight;
     }
     if !(total.is_finite() && (total - 1.0).abs() <= 1e-8) {
         return Err(format!(
-                "{context} empirical latent measure weights must sum to 1, got {total}"
-            ));
+            "{context} empirical latent measure weights must sum to 1, got {total}"
+        ));
     }
     Ok(())
 }
@@ -431,8 +435,8 @@ fn combine_empirical_grids(
     for &(grid_idx, grid_weight) in mixture {
         if !grid_weight.is_finite() || grid_weight <= 0.0 {
             return Err(format!(
-                    "local empirical latent mixture weight must be finite and positive, got {grid_weight}"
-                ));
+                "local empirical latent mixture weight must be finite and positive, got {grid_weight}"
+            ));
         }
         let grid = grids.get(grid_idx).ok_or_else(|| {
             format!("local empirical latent mixture references missing grid {grid_idx}")
@@ -444,8 +448,9 @@ fn combine_empirical_grids(
     }
     let total = weights.iter().copied().sum::<f64>();
     if !(total.is_finite() && total > 0.0) {
-        return Err("local empirical latent combined grid has non-positive total weight"
-                .to_string());
+        return Err(
+            "local empirical latent combined grid has non-positive total weight".to_string(),
+        );
     }
     for weight in &mut weights {
         *weight /= total;
@@ -518,9 +523,9 @@ impl LatentZNormalization {
     pub fn apply(&self, z: &Array1<f64>, context: &str) -> Result<Array1<f64>, String> {
         if !(self.mean.is_finite() && self.sd.is_finite() && self.sd > BMS_VARIANCE_FLOOR) {
             return Err(format!(
-                    "{context} requires finite latent z normalization with sd > 1e-12; got mean={} sd={}",
-                    self.mean, self.sd
-                ));
+                "{context} requires finite latent z normalization with sd > 1e-12; got mean={} sd={}",
+                self.mean, self.sd
+            ));
         }
         if z.iter().any(|value| !value.is_finite()) {
             return Err(format!("{context} requires finite z values"));
@@ -589,10 +594,10 @@ impl LatentZRankIntCalibration {
     pub fn fit(z: &Array1<f64>, weights: &Array1<f64>) -> Result<Self, String> {
         if z.len() != weights.len() {
             return Err(format!(
-                    "rank-INT calibration: z length {} != weights length {}",
-                    z.len(),
-                    weights.len()
-                ));
+                "rank-INT calibration: z length {} != weights length {}",
+                z.len(),
+                weights.len()
+            ));
         }
         if z.is_empty() {
             return Err("rank-INT calibration requires at least one observation".to_string());
@@ -600,19 +605,21 @@ impl LatentZRankIntCalibration {
         let w_total = weights.iter().copied().sum::<f64>();
         if !(w_total.is_finite() && w_total > 0.0) {
             return Err(format!(
-                    "rank-INT calibration requires positive finite total weight, got {w_total}"
-                ));
+                "rank-INT calibration requires positive finite total weight, got {w_total}"
+            ));
         }
         for (idx, value) in z.iter().enumerate() {
             if !value.is_finite() {
-                return Err(format!("rank-INT calibration: z[{idx}] = {value} not finite"));
+                return Err(format!(
+                    "rank-INT calibration: z[{idx}] = {value} not finite"
+                ));
             }
         }
         for (idx, weight) in weights.iter().enumerate() {
             if !(weight.is_finite() && *weight >= 0.0) {
                 return Err(format!(
-                        "rank-INT calibration: weight[{idx}] = {weight} not finite/non-negative"
-                    ));
+                    "rank-INT calibration: weight[{idx}] = {weight} not finite/non-negative"
+                ));
             }
         }
         let mut order: Vec<usize> = (0..z.len()).collect();
@@ -686,7 +693,9 @@ impl LatentZRankIntCalibration {
         let mut out = Array1::<f64>::zeros(z.len());
         for (idx, &zi) in z.iter().enumerate() {
             if !zi.is_finite() {
-                return Err(format!("rank-INT calibration apply: z[{idx}] = {zi} not finite"));
+                return Err(format!(
+                    "rank-INT calibration apply: z[{idx}] = {zi} not finite"
+                ));
             }
             out[idx] = self.apply_at_predict(zi);
         }
@@ -806,10 +815,10 @@ fn latent_z_is_standard_normal_enough(
 ) -> Result<bool, String> {
     if z.len() != weights.len() {
         return Err(format!(
-                "latent-measure auto-detection length mismatch: z={}, weights={}",
-                z.len(),
-                weights.len()
-            ));
+            "latent-measure auto-detection length mismatch: z={}, weights={}",
+            z.len(),
+            weights.len()
+        ));
     }
     let weight_sum = weights.iter().copied().sum::<f64>();
     let weight_sq_sum = weights.iter().map(|&w| w * w).sum::<f64>();
@@ -822,8 +831,10 @@ fn latent_z_is_standard_normal_enough(
     }
     let effective_n = weight_sum * weight_sum / weight_sq_sum;
     if !(effective_n.is_finite() && effective_n > 1.0) {
-        return Err("latent-measure auto-detection requires at least two effective observations"
-                .to_string());
+        return Err(
+            "latent-measure auto-detection requires at least two effective observations"
+                .to_string(),
+        );
     }
     let mean = z
         .iter()
@@ -900,8 +911,10 @@ fn weighted_ks_to_standard_normal(
     let mut pairs = Vec::<(f64, f64)>::with_capacity(z.len());
     for (&zi, &wi) in z.iter().zip(weights.iter()) {
         if !zi.is_finite() || !wi.is_finite() || wi < 0.0 {
-            return Err("latent-measure KS diagnostic requires finite z and non-negative finite weights"
-                        .to_string());
+            return Err(
+                "latent-measure KS diagnostic requires finite z and non-negative finite weights"
+                    .to_string(),
+            );
         }
         if wi > 0.0 {
             pairs.push((zi, wi));
@@ -945,32 +958,36 @@ fn build_empirical_z_grid(
 ) -> Result<EmpiricalZGrid, String> {
     if grid_size < 3 {
         return Err(format!(
-                "empirical latent measure grid_size must be at least 3, got {grid_size}"
-            ));
+            "empirical latent measure grid_size must be at least 3, got {grid_size}"
+        ));
     }
     if z.len() != weights.len() {
         return Err(format!(
-                "{context} length mismatch: z={}, weights={}",
-                z.len(),
-                weights.len()
-            ));
+            "{context} length mismatch: z={}, weights={}",
+            z.len(),
+            weights.len()
+        ));
     }
     let mut pairs = Vec::<(f64, f64)>::with_capacity(z.len());
     for (idx, (&zi, &wi)) in z.iter().zip(weights.iter()).enumerate() {
         if !zi.is_finite() {
-            return Err(format!("{context} z value at row {idx} is non-finite ({zi})"));
+            return Err(format!(
+                "{context} z value at row {idx} is non-finite ({zi})"
+            ));
         }
         if !wi.is_finite() || wi < 0.0 {
             return Err(format!(
-                    "{context} weight at row {idx} must be finite and non-negative, got {wi}"
-                ));
+                "{context} weight at row {idx} must be finite and non-negative, got {wi}"
+            ));
         }
         if wi > 0.0 {
             pairs.push((zi, wi));
         }
     }
     if pairs.len() < 2 {
-        return Err(format!("{context} requires at least two positive-weight rows"));
+        return Err(format!(
+            "{context} requires at least two positive-weight rows"
+        ));
     }
     pairs.sort_by(|left, right| {
         left.0
@@ -1011,7 +1028,9 @@ fn build_empirical_z_grid(
         }
     }
     if nodes.len() < 2 {
-        return Err(format!("{context} compression produced fewer than two nodes"));
+        return Err(format!(
+            "{context} compression produced fewer than two nodes"
+        ));
     }
     recenter_rescale_empirical_grid(&mut nodes, &out_weights);
     let total = out_weights.iter().sum::<f64>();
@@ -1445,8 +1464,8 @@ pub(crate) fn bernoulli_marginal_link_map(
     let phi_q = normal_pdf(q);
     if !phi_q.is_finite() || phi_q <= 0.0 {
         return Err(format!(
-                "bernoulli marginal-slope internal probit density must be positive, got phi(q)={phi_q} at eta={eta}, q={q}"
-            ));
+            "bernoulli marginal-slope internal probit density must be positive, got phi(q)={phi_q} at eta={eta}, q={q}"
+        ));
     }
     let mu1 = phi_eta;
     let mu2 = -eta * phi_eta;
@@ -1485,8 +1504,8 @@ fn require_probit_marginal_slope_link(
         Ok(())
     } else {
         Err(format!(
-                "{context} requires link(type=probit); non-probit marginal-slope base links are not supported by the calibrated de-nested probit kernel"
-            ))
+            "{context} requires link(type=probit); non-probit marginal-slope base links are not supported by the calibrated de-nested probit kernel"
+        ))
     }
 }
 
@@ -1511,9 +1530,9 @@ fn build_deviation_block_from_knots_and_design_seed(
 ) -> Result<DeviationPrepared, String> {
     if cfg.degree != 3 {
         return Err(format!(
-                "structural deviation runtime is cubic; degree must be 3, got {}",
-                cfg.degree
-            ));
+            "structural deviation runtime is cubic; degree must be 3, got {}",
+            cfg.degree
+        ));
     }
     let penalty_orders = resolve_deviation_operator_orders(cfg)?;
     let knots = initialize_monotone_wiggle_knots_from_seed(
@@ -1565,17 +1584,19 @@ fn resolve_deviation_operator_orders(cfg: &DeviationBlockConfig) -> Result<Vec<u
         }
         if order > cfg.degree {
             return Err(format!(
-                    "deviation function penalty derivative order {order} exceeds basis degree {}",
-                    cfg.degree
-                ));
+                "deviation function penalty derivative order {order} exceeds basis degree {}",
+                cfg.degree
+            ));
         }
         if !orders.contains(&order) {
             orders.push(order);
         }
     }
     if orders.is_empty() {
-        return Err("deviation block requires at least one positive function-penalty derivative order"
-                    .to_string());
+        return Err(
+            "deviation block requires at least one positive function-penalty derivative order"
+                .to_string(),
+        );
     }
     Ok(orders)
 }
@@ -1787,10 +1808,10 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
 
     if parametric_anchor_blocks.len() != anchors.len() {
         return Err(format!(
-                "cross-block identifiability: parametric_anchor_blocks length {} does not match anchors length {}",
-                parametric_anchor_blocks.len(),
-                anchors.len(),
-            ));
+            "cross-block identifiability: parametric_anchor_blocks length {} does not match anchors length {}",
+            parametric_anchor_blocks.len(),
+            anchors.len(),
+        ));
     }
 
     let candidate_design = candidate.runtime.design(candidate_arg_at_training_rows)?;
@@ -1801,10 +1822,10 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     }
     if training_row_weights.len() != n {
         return Err(format!(
-                "cross-block identifiability: training_row_weights length {} does not match candidate row count {}",
-                training_row_weights.len(),
-                n,
-            ));
+            "cross-block identifiability: training_row_weights length {} does not match candidate row count {}",
+            training_row_weights.len(),
+            n,
+        ));
     }
 
     // Materialise the parametric-anchor blocks to dense, stacking them
@@ -1822,20 +1843,20 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
             CrossBlockAnchor::FlexEvaluation(a) => {
                 if a.nrows() != n {
                     return Err(format!(
-                            "cross-block identifiability: flex anchor has {} rows, candidate has {}",
-                            a.nrows(),
-                            n,
-                        ));
+                        "cross-block identifiability: flex anchor has {} rows, candidate has {}",
+                        a.nrows(),
+                        n,
+                    ));
                 }
                 // Intentionally skipped — see comment above.
             }
             CrossBlockAnchor::Parametric(d) => {
                 if d.nrows() != n {
                     return Err(format!(
-                            "cross-block identifiability: parametric anchor has {} rows, candidate has {}",
-                            d.nrows(),
-                            n,
-                        ));
+                        "cross-block identifiability: parametric anchor has {} rows, candidate has {}",
+                        d.nrows(),
+                        n,
+                    ));
                 }
                 let p_a = d.ncols();
                 if p_a == 0 {
@@ -1886,8 +1907,8 @@ pub(crate) fn enforce_cross_block_identifiability_for_flex_block(
     for (i, &w) in training_row_weights.iter().enumerate() {
         if !w.is_finite() || w < 0.0 {
             return Err(format!(
-                    "cross-block identifiability: training_row_weights[{i}] = {w} is not finite/non-negative",
-                ));
+                "cross-block identifiability: training_row_weights[{i}] = {w} is not finite/non-negative",
+            ));
         }
         sqrt_w[i] = w.sqrt();
     }
@@ -2091,17 +2112,17 @@ pub(crate) fn project_monotone_feasible_beta(
 ) -> Result<Array1<f64>, String> {
     if current.len() != runtime.basis_dim() {
         return Err(format!(
-                "{label} monotone projection current length mismatch: current={}, expected={}",
-                current.len(),
-                runtime.basis_dim()
-            ));
+            "{label} monotone projection current length mismatch: current={}, expected={}",
+            current.len(),
+            runtime.basis_dim()
+        ));
     }
     if proposed.len() != runtime.basis_dim() {
         return Err(format!(
-                "{label} monotone projection length mismatch: proposed={}, expected={}",
-                proposed.len(),
-                runtime.basis_dim()
-            ));
+            "{label} monotone projection length mismatch: proposed={}, expected={}",
+            proposed.len(),
+            runtime.basis_dim()
+        ));
     }
     for (idx, value) in current.iter().enumerate() {
         if !value.is_finite() {
@@ -2151,14 +2172,14 @@ fn validate_spec(
         || spec.logslope_offset.len() != n
     {
         return Err(format!(
-                "bernoulli-marginal-slope row mismatch: data={}, y={}, weights={}, z={}, marginal_offset={}, logslope_offset={}",
-                n,
-                spec.y.len(),
-                spec.weights.len(),
-                spec.z.len(),
-                spec.marginal_offset.len(),
-                spec.logslope_offset.len()
-            ));
+            "bernoulli-marginal-slope row mismatch: data={}, y={}, weights={}, z={}, marginal_offset={}, logslope_offset={}",
+            n,
+            spec.y.len(),
+            spec.weights.len(),
+            spec.z.len(),
+            spec.marginal_offset.len(),
+            spec.logslope_offset.len()
+        ));
     }
     if spec
         .y
@@ -2188,13 +2209,15 @@ fn validate_spec(
                 && (!sigma.is_finite() || *sigma < 0.0)
             {
                 return Err(format!(
-                        "bernoulli-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
-                    ));
+                    "bernoulli-marginal-slope requires GaussianShift sigma >= 0, got {sigma}"
+                ));
             }
         }
         FrailtySpec::HazardMultiplier { .. } => {
-            return Err("bernoulli-marginal-slope does not support FrailtySpec::HazardMultiplier"
-                    .to_string());
+            return Err(
+                "bernoulli-marginal-slope does not support FrailtySpec::HazardMultiplier"
+                    .to_string(),
+            );
         }
     }
     Ok(())
@@ -2208,10 +2231,10 @@ pub(crate) fn standardize_latent_z_with_policy(
 ) -> Result<(Array1<f64>, LatentZNormalization), String> {
     if z.len() != weights.len() {
         return Err(format!(
-                "{context} latent-score normalization length mismatch: z={}, weights={}",
-                z.len(),
-                weights.len()
-            ));
+            "{context} latent-score normalization length mismatch: z={}, weights={}",
+            z.len(),
+            weights.len()
+        ));
     }
     let weight_sum = weights.iter().copied().sum::<f64>();
     let weight_sq_sum = weights.iter().map(|&w| w * w).sum::<f64>();
@@ -2225,8 +2248,8 @@ pub(crate) fn standardize_latent_z_with_policy(
     let effective_n = weight_sum * weight_sum / weight_sq_sum;
     if !(effective_n.is_finite() && effective_n > 1.0) {
         return Err(format!(
-                "{context} requires at least two effective observations for latent-score normalization"
-            ));
+            "{context} requires at least two effective observations for latent-score normalization"
+        ));
     }
     let mean = z
         .iter()
@@ -2243,8 +2266,8 @@ pub(crate) fn standardize_latent_z_with_policy(
     let sd = var.sqrt();
     if !(sd.is_finite() && sd > BMS_VARIANCE_FLOOR) {
         return Err(format!(
-                "{context} requires z with positive finite weighted standard deviation"
-            ));
+            "{context} requires z with positive finite weighted standard deviation"
+        ));
     }
     let target_norm = match policy.normalization {
         LatentZNormalizationMode::None => LatentZNormalization { mean: 0.0, sd: 1.0 },
@@ -2332,16 +2355,18 @@ fn pooled_probit_baseline(
 ) -> Result<(f64, f64), String> {
     if y.len() != z.len() || y.len() != weights.len() {
         return Err(format!(
-                "pooled bernoulli-marginal-slope pilot length mismatch: y={}, z={}, weights={}",
-                y.len(),
-                z.len(),
-                weights.len()
-            ));
+            "pooled bernoulli-marginal-slope pilot length mismatch: y={}, z={}, weights={}",
+            y.len(),
+            z.len(),
+            weights.len()
+        ));
     }
     let weight_sum = weights.iter().copied().sum::<f64>();
     if !weight_sum.is_finite() || weight_sum <= 0.0 {
-        return Err("pooled bernoulli-marginal-slope pilot requires positive finite total weight"
-                .to_string());
+        return Err(
+            "pooled bernoulli-marginal-slope pilot requires positive finite total weight"
+                .to_string(),
+        );
     }
     let prevalence = y
         .iter()
@@ -2410,8 +2435,10 @@ fn pooled_probit_baseline(
     for _ in 0..50 {
         let (obj, g0, g1, h00, h01, h11) = objective_grad_hess(beta0, beta1)?;
         if !obj.is_finite() || !g0.is_finite() || !g1.is_finite() {
-            return Err("pooled bernoulli-marginal-slope pilot produced non-finite objective or gradient"
-                        .to_string());
+            return Err(
+                "pooled bernoulli-marginal-slope pilot produced non-finite objective or gradient"
+                    .to_string(),
+            );
         }
         let grad_max = g0.abs().max(g1.abs());
         if grad_max < BMS_DERIV_TOL {
@@ -2431,8 +2458,9 @@ fn pooled_probit_baseline(
             }
             ridge *= 10.0;
             if ridge > 1e6 {
-                return Err("pooled bernoulli-marginal-slope pilot Hessian solve failed"
-                        .to_string());
+                return Err(
+                    "pooled bernoulli-marginal-slope pilot Hessian solve failed".to_string()
+                );
             }
         };
         let mut accepted = false;
@@ -2571,10 +2599,10 @@ fn pilot_eta_for_link_dev_orthogonalisation(
     let n = y.len();
     if marginal_design.nrows() != n {
         return Err(format!(
-                "pilot_eta_for_link_dev_orthogonalisation: marginal design has {} rows, expected {}",
-                marginal_design.nrows(),
-                n,
-            ));
+            "pilot_eta_for_link_dev_orthogonalisation: marginal design has {} rows, expected {}",
+            marginal_design.nrows(),
+            n,
+        ));
     }
     let mut working_eta = Array1::<f64>::zeros(n);
     let mut w_irls = Array1::<f64>::zeros(n);
@@ -2746,8 +2774,8 @@ pub(crate) fn signed_probit_neglog_derivatives_up_to_fourth(
     }
     if !signed_margin.is_finite() {
         return Err(format!(
-                "non-finite signed margin in exact probit derivative helper: {signed_margin}"
-            ));
+            "non-finite signed margin in exact probit derivative helper: {signed_margin}"
+        ));
     }
     Ok(signed_probit_neglog_derivatives_up_to_fourth_numeric(
         signed_margin,
@@ -2896,46 +2924,48 @@ impl MarginalSlopeCovariance {
                 for (idx, &value) in diag.iter().enumerate() {
                     if !(value.is_finite() && value >= 0.0) {
                         return Err(format!(
-                                "{context} diagonal covariance entry {idx} must be finite and non-negative, got {value}"
-                            ));
+                            "{context} diagonal covariance entry {idx} must be finite and non-negative, got {value}"
+                        ));
                     }
                 }
             }
             Self::Full(cov) => {
                 if cov.nrows() == 0 || cov.nrows() != cov.ncols() {
                     return Err(format!(
-                            "{context} full covariance must be non-empty and square, got {}x{}",
-                            cov.nrows(),
-                            cov.ncols()
-                        ));
+                        "{context} full covariance must be non-empty and square, got {}x{}",
+                        cov.nrows(),
+                        cov.ncols()
+                    ));
                 }
                 for i in 0..cov.nrows() {
                     for j in 0..cov.ncols() {
                         let value = cov[[i, j]];
                         if !value.is_finite() {
                             return Err(format!(
-                                    "{context} full covariance entry ({i},{j}) is non-finite"
-                                ));
+                                "{context} full covariance entry ({i},{j}) is non-finite"
+                            ));
                         }
                         if (value - cov[[j, i]]).abs()
                             > 1e-10 * (1.0 + value.abs().max(cov[[j, i]].abs()))
                         {
                             return Err(format!(
-                                    "{context} full covariance must be symmetric at ({i},{j})"
-                                ));
+                                "{context} full covariance must be symmetric at ({i},{j})"
+                            ));
                         }
                     }
                 }
             }
             Self::LowRank(factor) => {
                 if factor.nrows() == 0 {
-                    return Err(format!("{context} low-rank covariance factor has zero rows"));
+                    return Err(format!(
+                        "{context} low-rank covariance factor has zero rows"
+                    ));
                 }
                 for ((i, j), &value) in factor.indexed_iter() {
                     if !value.is_finite() {
                         return Err(format!(
-                                "{context} low-rank covariance factor entry ({i},{j}) is non-finite"
-                            ));
+                            "{context} low-rank covariance factor entry ({i},{j}) is non-finite"
+                        ));
                     }
                 }
             }
@@ -2947,10 +2977,10 @@ impl MarginalSlopeCovariance {
         self.validate("marginal-slope covariance")?;
         if vector.len() != self.dim() {
             return Err(format!(
-                    "marginal-slope covariance dimension mismatch: vector={}, covariance={}",
-                    vector.len(),
-                    self.dim()
-                ));
+                "marginal-slope covariance dimension mismatch: vector={}, covariance={}",
+                vector.len(),
+                self.dim()
+            ));
         }
         if vector.iter().any(|value| !value.is_finite()) {
             return Err("marginal-slope covariance vector contains non-finite values".to_string());
@@ -2993,8 +3023,8 @@ impl MarginalSlopeCovariance {
             Ok(value.max(0.0))
         } else {
             Err(format!(
-                    "marginal-slope covariance quadratic form must be non-negative, got {value}"
-                ))
+                "marginal-slope covariance quadratic form must be non-negative, got {value}"
+            ))
         }
     }
 }
@@ -3035,9 +3065,9 @@ pub fn marginal_slope_covariance_from_scores(
     }
     if weights.len() != n {
         return Err(format!(
-                "marginal-slope covariance weight length mismatch: weights={}, rows={n}",
-                weights.len()
-            ));
+            "marginal-slope covariance weight length mismatch: weights={}, rows={n}",
+            weights.len()
+        ));
     }
     let total_weight = weights.iter().copied().sum::<f64>();
     if !(total_weight.is_finite() && total_weight > 0.0) {
@@ -3048,13 +3078,15 @@ pub fn marginal_slope_covariance_from_scores(
         let weight = weights[i];
         if !(weight.is_finite() && weight >= 0.0) {
             return Err(format!(
-                    "marginal-slope covariance weight {i} must be finite and non-negative, got {weight}"
-                ));
+                "marginal-slope covariance weight {i} must be finite and non-negative, got {weight}"
+            ));
         }
         for j in 0..k {
             let score = scores[[i, j]];
             if !score.is_finite() {
-                return Err(format!("marginal-slope covariance score ({i},{j}) is non-finite"));
+                return Err(format!(
+                    "marginal-slope covariance score ({i},{j}) is non-finite"
+                ));
             }
             mean[j] += weight * score;
         }
@@ -3182,7 +3214,9 @@ pub fn marginal_slope_preserving_scale(
     probit_scale: f64,
 ) -> Result<f64, String> {
     if !probit_scale.is_finite() {
-        return Err(format!("marginal-slope probit scale must be finite, got {probit_scale}"));
+        return Err(format!(
+            "marginal-slope probit scale must be finite, got {probit_scale}"
+        ));
     }
     let observed_slopes = slopes
         .iter()
@@ -3201,17 +3235,17 @@ pub fn marginal_slope_probit_eta(
 ) -> Result<f64, String> {
     if z.len() != slopes.len() {
         return Err(format!(
-                "marginal-slope score/slope dimension mismatch: z={}, slopes={}",
-                z.len(),
-                slopes.len()
-            ));
+            "marginal-slope score/slope dimension mismatch: z={}, slopes={}",
+            z.len(),
+            slopes.len()
+        ));
     }
     if slopes.len() != covariance.dim() {
         return Err(format!(
-                "marginal-slope covariance dimension mismatch: slopes={}, covariance={}",
-                slopes.len(),
-                covariance.dim()
-            ));
+            "marginal-slope covariance dimension mismatch: slopes={}, covariance={}",
+            slopes.len(),
+            covariance.dim()
+        ));
     }
     if !q.is_finite() || z.iter().any(|value| !value.is_finite()) {
         return Err("marginal-slope probit eta inputs must be finite".to_string());
@@ -3263,7 +3297,9 @@ fn empirical_rigid_calibration_eval(
     weights: &[f64],
 ) -> Result<(f64, f64, f64), String> {
     if !intercept.is_finite() {
-        return Err(format!("empirical latent calibration: non-finite intercept {intercept}"));
+        return Err(format!(
+            "empirical latent calibration: non-finite intercept {intercept}"
+        ));
     }
     let observed_slope = rigid_observed_logslope(slope, probit_scale);
     const HALF_LOG_2PI: f64 = 0.918_938_533_204_672_8; // 0.5 * ln(2π)
@@ -3289,8 +3325,8 @@ fn empirical_rigid_calibration_eval(
         let eta = intercept + observed_slope * node;
         if !eta.is_finite() {
             return Err(format!(
-                    "empirical latent calibration: non-finite η at intercept={intercept}, slope={slope}, node={node}"
-                ));
+                "empirical latent calibration: non-finite η at intercept={intercept}, slope={slope}, node={node}"
+            ));
         }
         let log_w = weight.ln();
         let log_phi = -0.5 * eta * eta - HALF_LOG_2PI;
@@ -3312,8 +3348,8 @@ fn empirical_rigid_calibration_eval(
 
     if !(sum_phi.is_finite() && sum_cdf.is_finite() && sum_phi > 0.0 && sum_cdf > 0.0) {
         return Err(format!(
-                "empirical latent calibration: log-space accumulation failed (sum_phi={sum_phi}, sum_cdf={sum_cdf}, intercept={intercept})"
-            ));
+            "empirical latent calibration: log-space accumulation failed (sum_phi={sum_phi}, sum_cdf={sum_cdf}, intercept={intercept})"
+        ));
     }
 
     let log_s_phi = log_max_phi + sum_phi.ln();
@@ -3362,8 +3398,8 @@ fn empirical_rigid_calibration_eval(
 
     if !(f.is_finite() && f_prime.is_finite() && f_prime > 0.0 && f_double_prime.is_finite()) {
         return Err(format!(
-                "empirical latent calibration: non-finite log-space state f={f}, f'={f_prime}, f''={f_double_prime} at intercept={intercept}"
-            ));
+            "empirical latent calibration: non-finite log-space state f={f}, f'={f_prime}, f''={f_double_prime} at intercept={intercept}"
+        ));
     }
     Ok((f, f_prime, f_double_prime))
 }
@@ -3379,8 +3415,8 @@ pub(crate) fn empirical_intercept_from_marginal(
 ) -> Result<f64, String> {
     if !(target_mu.is_finite() && target_mu > 0.0 && target_mu < 1.0) {
         return Err(format!(
-                "empirical latent calibration requires target mu in (0,1), got {target_mu}"
-            ));
+            "empirical latent calibration requires target mu in (0,1), got {target_mu}"
+        ));
     }
     let log_target_mu = target_mu.ln();
     let closed_form_seed = rigid_intercept_from_marginal(target_q, slope, probit_scale);
@@ -3431,8 +3467,8 @@ pub(crate) fn empirical_intercept_from_marginal(
     };
     if f_best.abs() > abs_tol {
         return Err(format!(
-                "empirical latent intercept solve failed: log-residual={f_best:.3e} at a={root:.6}, target mu={target_mu:.6}"
-            ));
+            "empirical latent intercept solve failed: log-residual={f_best:.3e} at a={root:.6}, target mu={target_mu:.6}"
+        ));
     }
     Ok(root)
 }
@@ -3514,8 +3550,8 @@ impl RigidProbitKernel {
         let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m);
         if !logcdf.is_finite() {
             return Err(format!(
-                    "rigid probit neglog_only: non-finite log Φ at q={q}, g={g}, z={z}, y={y}"
-                ));
+                "rigid probit neglog_only: non-finite log Φ at q={q}, g={g}, z={z}, y={y}"
+            ));
         }
         Ok(-w * logcdf)
     }
@@ -5340,8 +5376,8 @@ where
 {
     if !threshold.is_finite() {
         return Err(format!(
-                "bernoulli marginal-slope early-exit threshold must be finite, got {threshold}"
-            ));
+            "bernoulli marginal-slope early-exit threshold must be finite, got {threshold}"
+        ));
     }
     let mut total_ll = 0.0;
     for chunk in weighted_rows.chunks(BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS) {
@@ -5367,9 +5403,9 @@ where
         // the full row sweep finishes.
         if -total_ll > threshold {
             return Err(format!(
-                    "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
-                    -total_ll, threshold
-                ));
+                "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
+                -total_ll, threshold
+            ));
         }
     }
     Ok(total_ll)
@@ -5469,7 +5505,9 @@ impl BernoulliMarginalSlopeFamily {
         let signed = (2.0 * self.y[row] - 1.0) * observed_eta;
         let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
         if !logcdf.is_finite() {
-            return Err(format!("empirical rigid neglog_only: non-finite log Φ at row {row}"));
+            return Err(format!(
+                "empirical rigid neglog_only: non-finite log Φ at row {row}"
+            ));
         }
         Ok(-self.weights[row] * logcdf)
     }
@@ -5704,16 +5742,16 @@ impl BernoulliMarginalSlopeFamily {
         let n_dirs = directions.len();
         if n_dirs > 6 {
             return Err(format!(
-                    "bernoulli empirical flex jet supports at most 6 directions, got {n_dirs}"
-                ));
+                "bernoulli empirical flex jet supports at most 6 directions, got {n_dirs}"
+            ));
         }
         for dir in directions {
             if dir.len() != primary.total {
                 return Err(format!(
-                        "bernoulli empirical flex direction length {} != primary dimension {}",
-                        dir.len(),
-                        primary.total
-                    ));
+                    "bernoulli empirical flex direction length {} != primary dimension {}",
+                    dir.len(),
+                    primary.total
+                ));
             }
         }
         if !(row_ctx.intercept.is_finite() && row_ctx.m_a.is_finite() && row_ctx.m_a > 0.0) {
@@ -5738,9 +5776,9 @@ impl BernoulliMarginalSlopeFamily {
             )?;
             if !(f_a.coeff(0).is_finite() && f_a.coeff(0) > 0.0) {
                 return Err(format!(
-                        "empirical flex calibration jet has invalid F_a={}",
-                        f_a.coeff(0)
-                    ));
+                    "empirical flex calibration jet has invalid F_a={}",
+                    f_a.coeff(0)
+                ));
             }
             let inv_f_a = f_a.compose_unary(unary_derivatives_reciprocal(f_a.coeff(0)));
             a_jet = a_jet.add(&f.mul(&inv_f_a).scale(-1.0));
@@ -5778,9 +5816,9 @@ impl BernoulliMarginalSlopeFamily {
         let r = primary.total;
         if dir.len() != r {
             return Err(format!(
-                    "bernoulli empirical flex third contraction direction length {} != primary dimension {r}",
-                    dir.len()
-                ));
+                "bernoulli empirical flex third contraction direction length {} != primary dimension {r}",
+                dir.len()
+            ));
         }
         if dir.iter().all(|value| *value == 0.0) {
             return Ok(Array2::<f64>::zeros((r, r)));
@@ -5792,11 +5830,7 @@ impl BernoulliMarginalSlopeFamily {
         let mut out = Array2::<f64>::zeros((r, r));
         for u in 0..r {
             for v in u..r {
-                let directions = [
-                    basis_dirs[u].view(),
-                    basis_dirs[v].view(),
-                    dir_owned.view(),
-                ];
+                let directions = [basis_dirs[u].view(), basis_dirs[v].view(), dir_owned.view()];
                 let jet = self.empirical_flex_neglog_jet(
                     row,
                     primary,
@@ -5832,10 +5866,10 @@ impl BernoulliMarginalSlopeFamily {
         let r = primary.total;
         if dir_u.len() != r || dir_v.len() != r {
             return Err(format!(
-                    "bernoulli empirical flex fourth contraction direction lengths ({},{}) != primary dimension {r}",
-                    dir_u.len(),
-                    dir_v.len()
-                ));
+                "bernoulli empirical flex fourth contraction direction lengths ({},{}) != primary dimension {r}",
+                dir_u.len(),
+                dir_v.len()
+            ));
         }
         if dir_u.iter().all(|value| *value == 0.0) || dir_v.iter().all(|value| *value == 0.0) {
             return Ok(Array2::<f64>::zeros((r, r)));
@@ -6454,9 +6488,9 @@ impl BernoulliMarginalSlopeFamily {
                 && -log_likelihood > threshold
             {
                 return Err(format!(
-                        "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
-                        -log_likelihood, threshold
-                    ));
+                    "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
+                    -log_likelihood, threshold
+                ));
             }
         }
 
@@ -6536,14 +6570,14 @@ impl BernoulliMarginalSlopeFamily {
         let k = dirs.len();
         if k > 4 {
             return Err(format!(
-                    "bernoulli marginal-slope sigma row directional expects 0..=4 directions, got {k}"
-                ));
+                "bernoulli marginal-slope sigma row directional expects 0..=4 directions, got {k}"
+            ));
         }
         if scale_jet.coeffs.len() != (1usize << k) {
             return Err(format!(
-                    "bernoulli marginal-slope sigma scale jet dimension mismatch: coeffs={}, dirs={k}",
-                    scale_jet.coeffs.len()
-                ));
+                "bernoulli marginal-slope sigma scale jet dimension mismatch: coeffs={}, dirs={k}",
+                scale_jet.coeffs.len()
+            ));
         }
 
         let first = |idx: usize| -> Vec<f64> { dirs.iter().map(|dir| dir[idx]).collect() };
@@ -6850,10 +6884,10 @@ impl BernoulliMarginalSlopeFamily {
         let slices = block_slices(self);
         if d_beta_flat.len() != slices.total {
             return Err(format!(
-                    "bernoulli marginal-slope d_beta length mismatch for sigma Hessian derivative: got {}, expected {}",
-                    d_beta_flat.len(),
-                    slices.total
-                ));
+                "bernoulli marginal-slope d_beta length mismatch for sigma Hessian derivative: got {}, expected {}",
+                d_beta_flat.len(),
+                slices.total
+            ));
         }
         let n = self.y.len();
         let primary = primary_slices(&slices);
@@ -7002,10 +7036,10 @@ impl BernoulliMarginalSlopeFamily {
             2usize + usize::from(self.score_warp.is_some()) + usize::from(self.link_dev.is_some());
         if block_states.len() != expected_blocks {
             return Err(format!(
-                    "bernoulli marginal-slope block count mismatch: got {}, expected {}",
-                    block_states.len(),
-                    expected_blocks
-                ));
+                "bernoulli marginal-slope block count mismatch: got {}, expected {}",
+                block_states.len(),
+                expected_blocks
+            ));
         }
 
         let n_rows = self.y.len();
@@ -7013,34 +7047,34 @@ impl BernoulliMarginalSlopeFamily {
         let marginal_ncols = self.marginal_design.ncols();
         if marginal_ncols > 0 && marginal.beta.len() != marginal_ncols {
             return Err(format!(
-                    "bernoulli marginal-slope marginal beta length mismatch: got {}, expected {}",
-                    marginal.beta.len(),
-                    marginal_ncols
-                ));
+                "bernoulli marginal-slope marginal beta length mismatch: got {}, expected {}",
+                marginal.beta.len(),
+                marginal_ncols
+            ));
         }
         if marginal.eta.len() != n_rows {
             return Err(format!(
-                    "bernoulli marginal-slope marginal eta length mismatch: got {}, expected {}",
-                    marginal.eta.len(),
-                    n_rows
-                ));
+                "bernoulli marginal-slope marginal eta length mismatch: got {}, expected {}",
+                marginal.eta.len(),
+                n_rows
+            ));
         }
 
         let logslope = &block_states[1];
         let logslope_ncols = self.logslope_design.ncols();
         if logslope_ncols > 0 && logslope.beta.len() != logslope_ncols {
             return Err(format!(
-                    "bernoulli marginal-slope logslope beta length mismatch: got {}, expected {}",
-                    logslope.beta.len(),
-                    logslope_ncols
-                ));
+                "bernoulli marginal-slope logslope beta length mismatch: got {}, expected {}",
+                logslope.beta.len(),
+                logslope_ncols
+            ));
         }
         if logslope.eta.len() != n_rows {
             return Err(format!(
-                    "bernoulli marginal-slope logslope eta length mismatch: got {}, expected {}",
-                    logslope.eta.len(),
-                    n_rows
-                ));
+                "bernoulli marginal-slope logslope eta length mismatch: got {}, expected {}",
+                logslope.eta.len(),
+                n_rows
+            ));
         }
 
         if let Some(runtime) = &self.score_warp {
@@ -7049,17 +7083,17 @@ impl BernoulliMarginalSlopeFamily {
                 .expect("score-warp block should exist when runtime is present");
             if score.beta.len() != runtime.basis_dim() {
                 return Err(format!(
-                        "bernoulli marginal-slope score-warp beta length mismatch: got {}, expected {}",
-                        score.beta.len(),
-                        runtime.basis_dim()
-                    ));
+                    "bernoulli marginal-slope score-warp beta length mismatch: got {}, expected {}",
+                    score.beta.len(),
+                    runtime.basis_dim()
+                ));
             }
             if score.eta.len() != n_rows {
                 return Err(format!(
-                        "bernoulli marginal-slope score-warp eta length mismatch: got {}, expected {}",
-                        score.eta.len(),
-                        n_rows
-                    ));
+                    "bernoulli marginal-slope score-warp eta length mismatch: got {}, expected {}",
+                    score.eta.len(),
+                    n_rows
+                ));
             }
         }
 
@@ -7069,17 +7103,17 @@ impl BernoulliMarginalSlopeFamily {
                 .expect("link-deviation block should exist when runtime is present");
             if link.beta.len() != runtime.basis_dim() {
                 return Err(format!(
-                        "bernoulli marginal-slope link-deviation beta length mismatch: got {}, expected {}",
-                        link.beta.len(),
-                        runtime.basis_dim()
-                    ));
+                    "bernoulli marginal-slope link-deviation beta length mismatch: got {}, expected {}",
+                    link.beta.len(),
+                    runtime.basis_dim()
+                ));
             }
             if link.eta.len() != n_rows {
                 return Err(format!(
-                        "bernoulli marginal-slope link-deviation eta length mismatch: got {}, expected {}",
-                        link.eta.len(),
-                        n_rows
-                    ));
+                    "bernoulli marginal-slope link-deviation eta length mismatch: got {}, expected {}",
+                    link.eta.len(),
+                    n_rows
+                ));
             }
         }
 
@@ -7189,10 +7223,10 @@ impl BernoulliMarginalSlopeFamily {
     {
         if primary_range.len() != runtime.basis_dim() {
             return Err(format!(
-                    "{label} primary range length {} does not match deviation basis dimension {}",
-                    primary_range.len(),
-                    runtime.basis_dim()
-                ));
+                "{label} primary range length {} does not match deviation basis dimension {}",
+                primary_range.len(),
+                runtime.basis_dim()
+            ));
         }
         runtime.for_each_basis_cubic_at(value, |local_idx, basis_span| {
             visit(local_idx, primary_range.start + local_idx, basis_span)
@@ -7261,8 +7295,8 @@ impl BernoulliMarginalSlopeFamily {
         }
         if !(f.is_finite() && f_a.is_finite() && f_a > 0.0 && f_aa.is_finite()) {
             return Err(format!(
-                    "empirical latent denested calibration produced invalid root state: f={f}, f_a={f_a}, f_aa={f_aa}"
-                ));
+                "empirical latent denested calibration produced invalid root state: f={f}, f_a={f_a}, f_aa={f_aa}"
+            ));
         }
         Ok((f, f_a, f_aa))
     }
@@ -7359,9 +7393,9 @@ impl BernoulliMarginalSlopeFamily {
         let basis = if let Some(anchor_rows) = runtime.anchor_rows_at_training() {
             if row >= anchor_rows.nrows() {
                 return Err(format!(
-                        "link_terms_value_d1_at_row: row {row} out of bounds for {} cached training anchor rows",
-                        anchor_rows.nrows()
-                    ));
+                    "link_terms_value_d1_at_row: row {row} out of bounds for {} cached training anchor rows",
+                    anchor_rows.nrows()
+                ));
             }
             let anchor_view = anchor_rows.slice(ndarray::s![row..row + 1, ..]);
             runtime.design_with_anchor_rows(&values, anchor_view)?
@@ -7858,9 +7892,9 @@ impl BernoulliMarginalSlopeFamily {
 
         if f_best.abs() > abs_tol {
             return Err(format!(
-                    "bernoulli marginal-slope intercept solve failed: \
+                "bernoulli marginal-slope intercept solve failed: \
                      residual={f_best:.3e} at a={a:.6}, target mu={target:.6}"
-                ));
+            ));
         }
 
         // Cache the converged intercept for the next PIRLS iter.
@@ -8334,10 +8368,10 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<Array1<f64>, String> {
         if d_beta_flat.len() != slices.total {
             return Err(format!(
-                    "bernoulli marginal-slope d_beta length mismatch: got {}, expected {}",
-                    d_beta_flat.len(),
-                    slices.total
-                ));
+                "bernoulli marginal-slope d_beta length mismatch: got {}, expected {}",
+                d_beta_flat.len(),
+                slices.total
+            ));
         }
         let mut out = Array1::<f64>::zeros(primary.total);
         out[primary.q] = self
@@ -8437,8 +8471,8 @@ impl BernoulliMarginalSlopeFamily {
             }
             _ => {
                 return Err(format!(
-                        "bernoulli marginal-slope psi direction only supports spatial marginal/logslope blocks, got block {block_idx}"
-                    ));
+                    "bernoulli marginal-slope psi direction only supports spatial marginal/logslope blocks, got block {block_idx}"
+                ));
             }
         }
         Ok(out)
@@ -8471,8 +8505,8 @@ impl BernoulliMarginalSlopeFamily {
             }
             _ => {
                 return Err(format!(
-                        "bernoulli marginal-slope psi action only supports marginal/logslope blocks, got block {block_idx}"
-                    ));
+                    "bernoulli marginal-slope psi action only supports marginal/logslope blocks, got block {block_idx}"
+                ));
             }
         }
         Ok(out)
@@ -8542,8 +8576,8 @@ impl BernoulliMarginalSlopeFamily {
             ),
             _ => {
                 return Err(format!(
-                        "bernoulli marginal-slope psi embedding only supports marginal/logslope blocks, got block {block_idx}"
-                    ));
+                    "bernoulli marginal-slope psi embedding only supports marginal/logslope blocks, got block {block_idx}"
+                ));
             }
         };
         Ok(BlockPsiRow {
@@ -9304,8 +9338,10 @@ impl BernoulliMarginalSlopeFamily {
             )));
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
-            return Err("non-finite flexible row context in third-order directional contraction"
-                    .to_string());
+            return Err(
+                "non-finite flexible row context in third-order directional contraction"
+                    .to_string(),
+            );
         }
         use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
 
@@ -9910,9 +9946,9 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<(), String> {
         if moments.len() < 10 {
             return Err(format!(
-                    "insufficient reduced moments for second-derivative adjoint: need 10, have {}",
-                    moments.len()
-                ));
+                "insufficient reduced moments for second-derivative adjoint: need 10, have {}",
+                moments.len()
+            ));
         }
         let scale = scalar_adjoint / std::f64::consts::TAU;
         let eta = [cell.c0, cell.c1, cell.c2, cell.c3];
@@ -9945,9 +9981,9 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<(), String> {
         if moments.len() < 16 {
             return Err(format!(
-                    "insufficient reduced moments for third-derivative adjoint: need 16, have {}",
-                    moments.len()
-                ));
+                "insufficient reduced moments for third-derivative adjoint: need 16, have {}",
+                moments.len()
+            ));
         }
         let scale = scalar_adjoint / std::f64::consts::TAU;
         let eta = [cell.c0, cell.c1, cell.c2, cell.c3];
@@ -10012,10 +10048,10 @@ impl BernoulliMarginalSlopeFamily {
         let r = primary.total;
         if gram.len() != r * r {
             return Err(format!(
-                    "bernoulli marginal-slope row trace gram length {} != {}",
-                    gram.len(),
-                    r * r
-                ));
+                "bernoulli marginal-slope row trace gram length {} != {}",
+                gram.len(),
+                r * r
+            ));
         }
 
         if !self.effective_flex_active(block_states)? {
@@ -10032,8 +10068,10 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(grad);
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
-            return Err("non-finite flexible row context in third-order trace-gradient contraction"
-                    .to_string());
+            return Err(
+                "non-finite flexible row context in third-order trace-gradient contraction"
+                    .to_string(),
+            );
         }
 
         let point = self.primary_point_from_block_states(row, block_states, primary)?;
@@ -10760,16 +10798,16 @@ impl BernoulliMarginalSlopeFamily {
         }
         if gram.len() != r * r {
             return Err(format!(
-                    "bernoulli marginal-slope row trace gram length {} != {}",
-                    gram.len(),
-                    r * r
-                ));
+                "bernoulli marginal-slope row trace gram length {} != {}",
+                gram.len(),
+                r * r
+            ));
         }
         if let Some((idx, dir)) = row_dirs.iter().enumerate().find(|(_, dir)| dir.len() != r) {
             return Err(format!(
-                    "bernoulli marginal-slope row trace direction {idx} length {} != {r}",
-                    dir.len()
-                ));
+                "bernoulli marginal-slope row trace direction {idx} length {} != {r}",
+                dir.len()
+            ));
         }
 
         if row_dirs.len() > 1 {
@@ -10800,8 +10838,10 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(traces);
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
-            return Err("non-finite flexible row context in batched third-order trace contraction"
-                    .to_string());
+            return Err(
+                "non-finite flexible row context in batched third-order trace contraction"
+                    .to_string(),
+            );
         }
         let point = self.primary_point_from_block_states(row, block_states, primary)?;
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
@@ -11328,10 +11368,10 @@ impl BernoulliMarginalSlopeFamily {
         let expected_dir_len = if flex_active { cache.primary.total } else { 2 };
         if dir_u.len() != expected_dir_len || dir_v.len() != expected_dir_len {
             return Err(format!(
-                    "bernoulli fourth contracted row {row}: direction lengths ({},{}) != {expected_dir_len}",
-                    dir_u.len(),
-                    dir_v.len()
-                ));
+                "bernoulli fourth contracted row {row}: direction lengths ({},{}) != {expected_dir_len}",
+                dir_u.len(),
+                dir_v.len()
+            ));
         }
 
         // Keep this row-local helper serial. All expensive callers parallelize
@@ -11359,8 +11399,10 @@ impl BernoulliMarginalSlopeFamily {
             )));
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
-            return Err("non-finite flexible row context in fourth-order directional contraction"
-                    .to_string());
+            return Err(
+                "non-finite flexible row context in fourth-order directional contraction"
+                    .to_string(),
+            );
         }
         use crate::families::bernoulli_marginal_slope::exact_kernel as exact;
 
@@ -13210,8 +13252,8 @@ impl BernoulliMarginalSlopeFamily {
             ),
             _ => {
                 return Err(format!(
-                        "bernoulli marginal-slope psi terms only support marginal/logslope blocks, got block {block_idx}"
-                    ));
+                    "bernoulli marginal-slope psi terms only support marginal/logslope blocks, got block {block_idx}"
+                ));
             }
         };
         let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
@@ -13415,8 +13457,8 @@ impl BernoulliMarginalSlopeFamily {
             ),
             _ => {
                 return Err(format!(
-                        "bernoulli marginal-slope psi second-order only supports marginal/logslope blocks, got block {block_i}"
-                    ));
+                    "bernoulli marginal-slope psi second-order only supports marginal/logslope blocks, got block {block_i}"
+                ));
             }
         };
         let (p_psi_j, label_j) = match block_j {
@@ -13430,8 +13472,8 @@ impl BernoulliMarginalSlopeFamily {
             ),
             _ => {
                 return Err(format!(
-                        "bernoulli marginal-slope psi second-order only supports marginal/logslope blocks, got block {block_j}"
-                    ));
+                    "bernoulli marginal-slope psi second-order only supports marginal/logslope blocks, got block {block_j}"
+                ));
             }
         };
 
@@ -13770,8 +13812,8 @@ impl BernoulliMarginalSlopeFamily {
             ),
             _ => {
                 return Err(format!(
-                        "bernoulli marginal-slope psi hessian only supports marginal/logslope blocks, got block {block_idx}"
-                    ));
+                    "bernoulli marginal-slope psi hessian only supports marginal/logslope blocks, got block {block_idx}"
+                ));
             }
         };
 
@@ -13905,8 +13947,8 @@ impl BernoulliMarginalSlopeFamily {
             ),
             _ => {
                 return Err(format!(
-                        "bernoulli marginal-slope psi hessian operator only supports marginal/logslope blocks, got block {block_idx}"
-                    ));
+                    "bernoulli marginal-slope psi hessian operator only supports marginal/logslope blocks, got block {block_idx}"
+                ));
             }
         };
 
@@ -14756,10 +14798,12 @@ impl BernoulliMarginalSlopeFamily {
         // ever grab a chunk; each chunk reuses the worker's existing
         // dense buffers via in-place += accumulation. Keep the row scratch in
         // the same pool: it owns primary_dim² arrays and is also chunk-local.
-        let pool: Mutex<Vec<(
-            BernoulliExactNewtonAccumulator,
-            BernoulliMarginalSlopeFlexRowScratch,
-        )>> = Mutex::new(Vec::new());
+        let pool: Mutex<
+            Vec<(
+                BernoulliExactNewtonAccumulator,
+                BernoulliMarginalSlopeFlexRowScratch,
+            )>,
+        > = Mutex::new(Vec::new());
         let result: Result<(), String> =
             (0..n_chunks)
                 .into_par_iter()
@@ -15264,10 +15308,10 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         };
         if h.nrows() != total || h.ncols() != total {
             return Err(format!(
-                    "bernoulli marginal-slope batched gradient Hessian shape {}x{} != {total}x{total}",
-                    h.nrows(),
-                    h.ncols()
-                ));
+                "bernoulli marginal-slope batched gradient Hessian shape {}x{} != {total}x{total}",
+                h.nrows(),
+                h.ncols()
+            ));
         }
 
         let ridge = options.ridge_floor.max(1e-15);
@@ -15599,10 +15643,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         true
     }
 
-    fn inner_joint_workspace_log_likelihood_available(
-        &self,
-        specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         drop(specs);
         true
     }
@@ -15801,10 +15842,10 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         self.validate_exact_block_state_shapes(block_states)?;
         if block_idx >= block_states.len() {
             return Err(format!(
-                    "post-update block index {} out of range for {} blocks",
-                    block_idx,
-                    block_states.len()
-                ));
+                "post-update block index {} out of range for {} blocks",
+                block_idx,
+                block_states.len()
+            ));
         }
         if self.score_block_index().is_some_and(|idx| block_idx == idx) {
             if let (Some(runtime), Some(score)) =
@@ -15813,10 +15854,10 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 let current = &score.beta;
                 if current.len() != beta.len() {
                     return Err(format!(
-                            "score-warp post-update beta length mismatch: current={}, proposed={}",
-                            current.len(),
-                            beta.len()
-                        ));
+                        "score-warp post-update beta length mismatch: current={}, proposed={}",
+                        current.len(),
+                        beta.len()
+                    ));
                 }
                 return project_monotone_feasible_beta(runtime, current, &beta, "score_warp_dev");
             }
@@ -15828,10 +15869,10 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 let current = &link.beta;
                 if current.len() != beta.len() {
                     return Err(format!(
-                            "link-deviation post-update beta length mismatch: current={}, proposed={}",
-                            current.len(),
-                            beta.len()
-                        ));
+                        "link-deviation post-update beta length mismatch: current={}, proposed={}",
+                        current.len(),
+                        beta.len()
+                    ));
                 }
                 return project_monotone_feasible_beta(runtime, current, &beta, "link_dev");
             }
@@ -16174,10 +16215,10 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<Array1<f64>, String> {
         if block_states.len() != specs.len() {
             return Err(format!(
-                    "bernoulli marginal-slope batched gradient state/spec mismatch: states={}, specs={}",
-                    block_states.len(),
-                    specs.len()
-                ));
+                "bernoulli marginal-slope batched gradient state/spec mismatch: states={}, specs={}",
+                block_states.len(),
+                specs.len()
+            ));
         }
         let total = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
         let mut beta = Array1::<f64>::zeros(total);
@@ -16186,10 +16227,10 @@ impl BernoulliMarginalSlopeFamily {
             let width = spec.design.ncols();
             if state.beta.len() != width {
                 return Err(format!(
-                        "bernoulli marginal-slope batched gradient block {idx} beta length {} != spec width {}",
-                        state.beta.len(),
-                        width
-                    ));
+                    "bernoulli marginal-slope batched gradient block {idx} beta length {} != spec width {}",
+                    state.beta.len(),
+                    width
+                ));
             }
             beta.slice_mut(s![cursor..cursor + width])
                 .assign(&state.beta);
@@ -16209,10 +16250,10 @@ impl BernoulliMarginalSlopeFamily {
         let rank = factor.ncols();
         if out.len() != primary.total * rank {
             return Err(format!(
-                    "primary projection scratch length {} != {}",
-                    out.len(),
-                    primary.total * rank
-                ));
+                "primary projection scratch length {} != {}",
+                out.len(),
+                primary.total * rank
+            ));
         }
         out.fill(0.0);
         for col in 0..rank {
@@ -16335,9 +16376,9 @@ impl BernoulliMarginalSlopeFamily {
         }
         if let Some((idx, dir)) = row_dirs.iter().enumerate().find(|(_, dir)| dir.len() != r) {
             return Err(format!(
-                    "bernoulli marginal-slope row third direction {idx} length {} != {r}",
-                    dir.len()
-                ));
+                "bernoulli marginal-slope row third direction {idx} length {} != {r}",
+                dir.len()
+            ));
         }
         if row_dirs.len() == 1 {
             return Ok(vec![
@@ -16366,8 +16407,9 @@ impl BernoulliMarginalSlopeFamily {
                 .collect();
         }
         if !row_ctx.intercept.is_finite() || !row_ctx.m_a.is_finite() || row_ctx.m_a <= 0.0 {
-            return Err("non-finite flexible row context in batched third-order contraction"
-                    .to_string());
+            return Err(
+                "non-finite flexible row context in batched third-order contraction".to_string(),
+            );
         }
 
         let point = self.primary_point_from_block_states(row, block_states, primary)?;
@@ -16888,13 +16930,13 @@ impl BernoulliMarginalSlopeFamily {
         let n_dirs = directions.ncols();
         if factor.nrows() != slices.total || directions.nrows() != slices.total {
             return Err(format!(
-                    "bernoulli marginal-slope batched trace shape mismatch: factor={}x{}, directions={}x{}, p={}",
-                    factor.nrows(),
-                    factor.ncols(),
-                    directions.nrows(),
-                    directions.ncols(),
-                    slices.total
-                ));
+                "bernoulli marginal-slope batched trace shape mismatch: factor={}x{}, directions={}x{}, p={}",
+                factor.nrows(),
+                factor.ncols(),
+                directions.nrows(),
+                directions.ncols(),
+                slices.total
+            ));
         }
         let traces = weighted_rows
             .par_iter()
@@ -17456,8 +17498,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
         FrailtySpec::GaussianShift { sigma_fixed: None } => Some(0.5),
         FrailtySpec::None => None,
         FrailtySpec::HazardMultiplier { .. } => {
-            return Err("internal: validate_spec should have rejected unsupported marginal-slope frailty"
-                        .to_string());
+            return Err(
+                "internal: validate_spec should have rejected unsupported marginal-slope frailty"
+                    .to_string(),
+            );
         }
     };
     let probit_scale = probit_frailty_scale(initial_sigma);

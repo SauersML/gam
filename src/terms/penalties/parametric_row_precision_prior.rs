@@ -7,4 +7,3 @@ impl PenaltyManifest for ParametricRowPrecisionPriorPenalty {
     const PYTHON_WRAPPER: &'static str = "ParametricAuxConditionalPriorPenalty";
     const ROW_BLOCK_DIAGONAL: bool = true;
 }
-

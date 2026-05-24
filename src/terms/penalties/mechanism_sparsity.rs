@@ -7,4 +7,3 @@ impl PenaltyManifest for MechanismSparsityPenalty {
     const PYTHON_WRAPPER: &'static str = "MechanismSparsityPenalty";
     const ROW_BLOCK_DIAGONAL: bool = false;
 }
-

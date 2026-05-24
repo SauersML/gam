@@ -13,8 +13,8 @@ use crate::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
     BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy, DuchonBasisSpec,
     DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
-    MaternNu, OneDimensionalBoundary, SpatialIdentifiability, SphereMethod,
-    SphereWahbaKernel, SphericalSplineBasisSpec, ThinPlateBasisSpec, auto_spatial_center_strategy,
+    MaternNu, OneDimensionalBoundary, SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
+    SphericalSplineBasisSpec, ThinPlateBasisSpec, auto_spatial_center_strategy,
     default_num_centers, default_spatial_center_strategy, default_spherical_harmonic_degree,
     plan_spatial_basis, resolve_duchon_orders,
 };
@@ -26,7 +26,7 @@ use crate::inference::formula_dsl::{
 use crate::inference::model::ColumnKindTag;
 use crate::resource::ResourcePolicy;
 use crate::smooth::{
-    ByVarKind, BySmoothKind, ByVariableSpec, FactorSmoothFlavour, FactorSmoothSpec,
+    BySmoothKind, ByVarKind, ByVariableSpec, FactorSmoothFlavour, FactorSmoothSpec,
     LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
     SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TensorBSplineSpec,
     TermCollectionSpec,
@@ -776,9 +776,14 @@ fn tensor_margin_boundaries(
     for (i, boundary) in boundaries.iter().enumerate() {
         match boundary.as_str() {
             "periodic" | "cyclic" | "cc" => {
-                let origin = origins.get(i).copied().flatten().map(Ok).unwrap_or_else(|| {
-                    col_minmax(ds.values.column(cols[i])).map(|(minv, _)| minv)
-                })?;
+                let origin = origins
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        col_minmax(ds.values.column(cols[i])).map(|(minv, _)| minv)
+                    })?;
                 let period = periods.get(i).copied().flatten().ok_or_else(|| {
                     "te()/tensor() periodic margins require period=[...] with one positive period per margin".to_string()
                 })?;
@@ -1289,13 +1294,14 @@ pub fn build_smooth_basis(
                 }
             };
             let max_degree = if matches!(method, SphereMethod::Harmonic) {
-                let degree = option_usize_any(options, &["degree", "l", "max_degree", "max-degree"])
-                    .or_else(|| option_usize(options, "centers"))
-                    .or_else(|| {
-                        option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
-                            .and_then(|k| (1..=128).find(|&l| l * (l + 2) >= k))
-                    })
-                    .unwrap_or_else(|| default_spherical_harmonic_degree(ds.values.nrows()));
+                let degree =
+                    option_usize_any(options, &["degree", "l", "max_degree", "max-degree"])
+                        .or_else(|| option_usize(options, "centers"))
+                        .or_else(|| {
+                            option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
+                                .and_then(|k| (1..=128).find(|&l| l * (l + 2) >= k))
+                        })
+                        .unwrap_or_else(|| default_spherical_harmonic_degree(ds.values.nrows()));
                 if degree == 0 {
                     return Err("sphere smooth requires degree/max_degree >= 1".to_string());
                 }
@@ -2514,7 +2520,10 @@ mod tests {
     #[test]
     fn parse_tensor_periods_and_origins_aliases() {
         let mut opts = BTreeMap::new();
-        opts.insert("boundary".to_string(), "['periodic', 'periodic']".to_string());
+        opts.insert(
+            "boundary".to_string(),
+            "['periodic', 'periodic']".to_string(),
+        );
         opts.insert("periods".to_string(), "[7, 24]".to_string());
         opts.insert("origins".to_string(), "[0, -12]".to_string());
         let axes = parse_periodic_axes(&opts, 2).expect("axes");

@@ -157,7 +157,6 @@ pub(crate) fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
     }
 }
 
-
 #[inline]
 pub fn array2_to_matmut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
     let (rows, cols) = array.dim();
@@ -753,11 +752,7 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
     w: &ArrayBase<S2, Ix1>,
     y: &ArrayBase<S3, Ix2>,
 ) -> Array2<f64> {
-    assert_eq!(
-        x.nrows(),
-        y.nrows(),
-        "fast_xt_diag_y X/Y row mismatch"
-    );
+    assert_eq!(x.nrows(), y.nrows(), "fast_xt_diag_y X/Y row mismatch");
     assert_eq!(
         y.nrows(),
         w.len(),

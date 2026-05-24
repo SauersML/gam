@@ -36,10 +36,7 @@ pub fn cpu_row_scale(x: &mut Array2<f64>, w: ArrayView1<'_, f64>) {
 }
 
 /// Attempt to dispatch the row-scale kernel to the device backend.
-pub fn try_dispatch(
-    x: &mut Array2<f64>,
-    w: ArrayView1<'_, f64>,
-) -> Option<Result<(), GpuError>> {
+pub fn try_dispatch(x: &mut Array2<f64>, w: ArrayView1<'_, f64>) -> Option<Result<(), GpuError>> {
     let n = x.nrows();
     if n == 0 || n != w.len() {
         return None;
@@ -78,9 +75,11 @@ extern "C" __global__ void row_scale_inplace_kernel(
     let ptx = compile_ptx(KERNEL).map_err(|e| GpuError::DriverCallFailed {
         reason: format!("row_scale NVRTC compile failed: {e}"),
     })?;
-    let module = ctx.load_module(ptx).map_err(|e| GpuError::DriverCallFailed {
-        reason: format!("row_scale load module failed: {e}"),
-    })?;
+    let module = ctx
+        .load_module(ptx)
+        .map_err(|e| GpuError::DriverCallFailed {
+            reason: format!("row_scale load module failed: {e}"),
+        })?;
     let func = module
         .load_function("row_scale_inplace_kernel")
         .map_err(|e| GpuError::DriverCallFailed {

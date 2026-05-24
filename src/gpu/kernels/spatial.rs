@@ -37,12 +37,7 @@ pub enum SpatialKernel {
     InnerProduct,
 }
 
-fn squared_distance(
-    a: ArrayView2<'_, f64>,
-    b: ArrayView2<'_, f64>,
-    i: usize,
-    j: usize,
-) -> f64 {
+fn squared_distance(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>, i: usize, j: usize) -> f64 {
     let d = a.ncols().min(b.ncols());
     let mut s = 0.0_f64;
     for k in 0..d {
@@ -52,12 +47,7 @@ fn squared_distance(
     s
 }
 
-fn inner_product(
-    a: ArrayView2<'_, f64>,
-    b: ArrayView2<'_, f64>,
-    i: usize,
-    j: usize,
-) -> f64 {
+fn inner_product(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>, i: usize, j: usize) -> f64 {
     let d = a.ncols().min(b.ncols());
     let mut s = 0.0_f64;
     for k in 0..d {
@@ -187,9 +177,11 @@ extern "C" __global__ void spatial_kernel(
     let ptx = compile_ptx(KERNEL).map_err(|e| GpuError::DriverCallFailed {
         reason: format!("spatial NVRTC compile failed: {e}"),
     })?;
-    let module = ctx.load_module(ptx).map_err(|e| GpuError::DriverCallFailed {
-        reason: format!("spatial load module failed: {e}"),
-    })?;
+    let module = ctx
+        .load_module(ptx)
+        .map_err(|e| GpuError::DriverCallFailed {
+            reason: format!("spatial load module failed: {e}"),
+        })?;
     let func = module
         .load_function("spatial_kernel")
         .map_err(|e| GpuError::DriverCallFailed {

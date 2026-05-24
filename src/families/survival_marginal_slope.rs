@@ -16296,11 +16296,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         {
             return Ok(None);
         }
-        let Some(workspace) = self.exact_newton_joint_hessian_workspace_with_options(
-            block_states,
-            specs,
-            options,
-        )?
+        let Some(workspace) =
+            self.exact_newton_joint_hessian_workspace_with_options(block_states, specs, options)?
         else {
             return Ok(None);
         };

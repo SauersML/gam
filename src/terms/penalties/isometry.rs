@@ -7,4 +7,3 @@ impl PenaltyManifest for IsometryPenalty {
     const PYTHON_WRAPPER: &'static str = "IsometryPenalty";
     const ROW_BLOCK_DIAGONAL: bool = false;
 }
-

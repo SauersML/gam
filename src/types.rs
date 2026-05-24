@@ -386,9 +386,7 @@ impl LikelihoodSpec {
             | ResponseFamily::Poisson
             | ResponseFamily::Tweedie
             | ResponseFamily::NegativeBinomial
-            | ResponseFamily::Beta => LikelihoodScaleMetadata::FixedDispersion {
-                phi: 1.0,
-            },
+            | ResponseFamily::Beta => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
             ResponseFamily::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
         }
     }
@@ -425,9 +423,7 @@ impl From<LikelihoodFamily> for LikelihoodSpec {
             | LikelihoodFamily::Tweedie { .. }
             | LikelihoodFamily::NegativeBinomial { .. }
             | LikelihoodFamily::BetaLogit { .. }
-            | LikelihoodFamily::GammaLog => {
-                InverseLink::Standard(value.link_function())
-            }
+            | LikelihoodFamily::GammaLog => InverseLink::Standard(value.link_function()),
             LikelihoodFamily::BinomialLogit => InverseLink::Standard(LinkFunction::Logit),
             LikelihoodFamily::BinomialProbit => InverseLink::Standard(LinkFunction::Probit),
             LikelihoodFamily::BinomialCLogLog => InverseLink::Standard(LinkFunction::CLogLog),
@@ -782,9 +778,9 @@ impl GlmLikelihoodSpec {
             | GlmLikelihoodFamily::Tweedie { .. }
             | GlmLikelihoodFamily::NegativeBinomial { .. }
             | GlmLikelihoodFamily::BetaLogit { .. }
-            | GlmLikelihoodFamily::PoissonLog => LikelihoodScaleMetadata::FixedDispersion {
-                phi: 1.0,
-            },
+            | GlmLikelihoodFamily::PoissonLog => {
+                LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 }
+            }
         };
         Self { family, scale }
     }
@@ -859,9 +855,7 @@ impl TryFrom<LikelihoodFamily> for GlmLikelihoodFamily {
             LikelihoodFamily::BinomialBetaLogistic => Ok(Self::BinomialBetaLogistic),
             LikelihoodFamily::BinomialMixture => Ok(Self::BinomialMixture),
             LikelihoodFamily::PoissonLog => Ok(Self::PoissonLog),
-            LikelihoodFamily::Tweedie { p } if is_valid_tweedie_power(p) => {
-                Ok(Self::Tweedie { p })
-            }
+            LikelihoodFamily::Tweedie { p } if is_valid_tweedie_power(p) => Ok(Self::Tweedie { p }),
             LikelihoodFamily::Tweedie { .. } => Err(
                 "Tweedie variance power must be finite and strictly between 1 and 2; use PoissonLog or GammaLog for boundary cases",
             ),

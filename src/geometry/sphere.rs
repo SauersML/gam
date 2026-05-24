@@ -18,7 +18,9 @@ impl SphereManifold {
     fn normalize(&self, x: Array1<f64>) -> GeometryResult<Array1<f64>> {
         let nrm = norm(x.view());
         if nrm <= GEOMETRY_EPS || !nrm.is_finite() {
-            return Err(GeometryError::InvalidPoint("sphere normalization underflow"));
+            return Err(GeometryError::InvalidPoint(
+                "sphere normalization underflow",
+            ));
         }
         Ok(x / nrm)
     }
@@ -151,8 +153,16 @@ impl RiemannianManifold for SphereManifold {
         tangent_pair: (ArrayView1<'_, f64>, ArrayView1<'_, f64>),
     ) -> GeometryResult<f64> {
         check_len("Sphere curvature point", point.len(), self.ambient_dim())?;
-        check_len("Sphere curvature tangent u", tangent_pair.0.len(), self.ambient_dim())?;
-        check_len("Sphere curvature tangent v", tangent_pair.1.len(), self.ambient_dim())?;
+        check_len(
+            "Sphere curvature tangent u",
+            tangent_pair.0.len(),
+            self.ambient_dim(),
+        )?;
+        check_len(
+            "Sphere curvature tangent v",
+            tangent_pair.1.len(),
+            self.ambient_dim(),
+        )?;
         Ok(1.0)
     }
 

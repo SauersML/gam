@@ -1351,18 +1351,7 @@ fn apply_analytic_penalty<S, G, D, P, H>(
 }
 
 fn analytic_penalty_is_row_block_diagonal(penalty: &AnalyticPenaltyKind) -> bool {
-    matches!(
-        penalty,
-        AnalyticPenaltyKind::Ard(_)
-            | AnalyticPenaltyKind::TopKActivation(_)
-            | AnalyticPenaltyKind::JumpReLU(_)
-            | AnalyticPenaltyKind::Sparsity(_)
-            | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
-            | AnalyticPenaltyKind::IBPAssignment(_)
-            | AnalyticPenaltyKind::RowPrecisionPrior(_)
-            | AnalyticPenaltyKind::ParametricRowPrecisionPrior(_)
-            | AnalyticPenaltyKind::ScadMcp(_)
-    )
+    penalty.is_row_block_diagonal()
 }
 
 /// Per-row + Schur Cholesky factor cache produced by

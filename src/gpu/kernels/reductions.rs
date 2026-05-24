@@ -115,18 +115,22 @@ extern "C" __global__ void reduce_kernel(
     let ptx = compile_ptx(KERNEL).map_err(|e| GpuError::DriverCallFailed {
         reason: format!("reductions NVRTC compile failed: {e}"),
     })?;
-    let module = ctx.load_module(ptx).map_err(|e| GpuError::DriverCallFailed {
-        reason: format!("reductions load module failed: {e}"),
-    })?;
+    let module = ctx
+        .load_module(ptx)
+        .map_err(|e| GpuError::DriverCallFailed {
+            reason: format!("reductions load module failed: {e}"),
+        })?;
     let func = module
         .load_function("reduce_kernel")
         .map_err(|e| GpuError::DriverCallFailed {
             reason: format!("reductions load function failed: {e}"),
         })?;
 
-    let slice = values.as_slice().ok_or_else(|| GpuError::DriverCallFailed {
-        reason: "reductions input slice not contiguous".to_string(),
-    })?;
+    let slice = values
+        .as_slice()
+        .ok_or_else(|| GpuError::DriverCallFailed {
+            reason: "reductions input slice not contiguous".to_string(),
+        })?;
     let dx = stream.memcpy_stod(slice).map_err(map_drv)?;
 
     let threads: u32 = 256;
@@ -148,11 +152,7 @@ extern "C" __global__ void reduce_kernel(
     };
     let nn = n as u64;
     let mut builder = stream.launch_builder(&func);
-    builder
-        .arg(&dx)
-        .arg(&mut dpart)
-        .arg(&nn)
-        .arg(&op_code);
+    builder.arg(&dx).arg(&mut dpart).arg(&nn).arg(&op_code);
     // NVRTC func fresh; dx len-n; dpart per-block partial sums.
     // Grid covers exactly the kernel's bounded tid range.
     // SAFETY: all kernel-arg lifetimes + bounds checked above.

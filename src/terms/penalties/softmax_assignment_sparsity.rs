@@ -7,4 +7,3 @@ impl PenaltyManifest for SoftmaxAssignmentSparsityPenalty {
     const PYTHON_WRAPPER: &'static str = "SoftmaxAssignmentSparsityPenalty";
     const ROW_BLOCK_DIAGONAL: bool = true;
 }
-

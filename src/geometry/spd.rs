@@ -21,7 +21,12 @@ impl SpdManifold {
         Ok(p)
     }
 
-    fn affine_inner(&self, p: &Array2<f64>, u: &Array2<f64>, v: &Array2<f64>) -> GeometryResult<f64> {
+    fn affine_inner(
+        &self,
+        p: &Array2<f64>,
+        u: &Array2<f64>,
+        v: &Array2<f64>,
+    ) -> GeometryResult<f64> {
         let pinv = inverse(p)?;
         let a = pinv.dot(u).dot(&pinv).dot(v);
         let mut trace = 0.0;
@@ -168,7 +173,9 @@ impl RiemannianManifold for SpdManifold {
         let uv = self.affine_inner(&p, &u, &v)?;
         let denom = uu * vv - uv * uv;
         if denom.abs() <= 1.0e-14 {
-            return Err(GeometryError::Singular("SPD sectional curvature plane is degenerate"));
+            return Err(GeometryError::Singular(
+                "SPD sectional curvature plane is degenerate",
+            ));
         }
         Ok(-0.25 * comm_norm / denom)
     }

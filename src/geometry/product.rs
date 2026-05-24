@@ -79,7 +79,8 @@ impl RiemannianManifold for ProductManifold {
         let mut off = 0usize;
         for component in &self.components {
             let m = component.ambient_dim();
-            let part = component.log_map(p_from.slice(s![off..off + m]), p_to.slice(s![off..off + m]))?;
+            let part =
+                component.log_map(p_from.slice(s![off..off + m]), p_to.slice(s![off..off + m]))?;
             for i in 0..m {
                 out[off + i] = part[i];
             }
@@ -93,7 +94,11 @@ impl RiemannianManifold for ProductManifold {
         point_along: ArrayView2<'_, f64>,
         vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
-        check_len("Product path width", point_along.ncols(), self.ambient_dim())?;
+        check_len(
+            "Product path width",
+            point_along.ncols(),
+            self.ambient_dim(),
+        )?;
         check_len("Product transported vector", vec.len(), self.ambient_dim())?;
         let mut out = Array1::<f64>::zeros(self.ambient_dim());
         let mut off = 0usize;
@@ -159,8 +164,16 @@ impl RiemannianManifold for ProductManifold {
         tangent_pair: (ArrayView1<'_, f64>, ArrayView1<'_, f64>),
     ) -> GeometryResult<f64> {
         check_len("Product curvature point", point.len(), self.ambient_dim())?;
-        check_len("Product curvature tangent u", tangent_pair.0.len(), self.ambient_dim())?;
-        check_len("Product curvature tangent v", tangent_pair.1.len(), self.ambient_dim())?;
+        check_len(
+            "Product curvature tangent u",
+            tangent_pair.0.len(),
+            self.ambient_dim(),
+        )?;
+        check_len(
+            "Product curvature tangent v",
+            tangent_pair.1.len(),
+            self.ambient_dim(),
+        )?;
         Ok(0.0)
     }
 
@@ -175,7 +188,8 @@ impl RiemannianManifold for ProductManifold {
         let mut off = 0usize;
         for component in &self.components {
             let m = component.ambient_dim();
-            let part = component.project_tangent(point.slice(s![off..off + m]), vec.slice(s![off..off + m]))?;
+            let part = component
+                .project_tangent(point.slice(s![off..off + m]), vec.slice(s![off..off + m]))?;
             for i in 0..m {
                 out[off + i] = part[i];
             }

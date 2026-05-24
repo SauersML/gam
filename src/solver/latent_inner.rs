@@ -228,12 +228,11 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                 // effort — if the factorization fails (e.g. ill-
                 // conditioned at the very converged point), skip the
                 // cache; the predictor will then no-op.
-                let solve_options =
-                    latent_arrow_solve_options(
-                        &system,
-                        &opts,
-                        !self.latent.retraction_registry().is_all_euclidean(),
-                    );
+                let solve_options = latent_arrow_solve_options(
+                    &system,
+                    &opts,
+                    !self.latent.retraction_registry().is_all_euclidean(),
+                );
                 if let Ok((_, _, cache)) = solve_arrow_newton_step_with_options(
                     &system,
                     ridge_t.max(1e-12),
@@ -248,12 +247,11 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
             // Attempt the LM-damped arrow-Schur step. On failure (per-
             // row PD violation or Schur PD violation), grow the ridge
             // and retry without consuming an outer iteration.
-            let solve_options =
-                latent_arrow_solve_options(
-                    &system,
-                    &opts,
-                    !self.latent.retraction_registry().is_all_euclidean(),
-                );
+            let solve_options = latent_arrow_solve_options(
+                &system,
+                &opts,
+                !self.latent.retraction_registry().is_all_euclidean(),
+            );
             let step_result =
                 solve_arrow_newton_step_with_options(&system, ridge_t, ridge_beta, &solve_options);
             match step_result {
@@ -281,8 +279,8 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                         .assembler
                         .objective(self.beta.view(), self.latent)
                         .map_err(|e| {
-                            format!("LatentInnerSolver: objective failed at trial iter {iter}: {e}")
-                        })?;
+                        format!("LatentInnerSolver: objective failed at trial iter {iter}: {e}")
+                    })?;
                     let objective_scale = current_objective.abs().max(1.0);
                     let noise_floor = objective_scale * 1e-14;
                     let actual_reduction = current_objective - trial_objective;
