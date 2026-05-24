@@ -331,22 +331,59 @@ pub fn generate_rho_candidates(
             );
         }
     }
-    // For exactly three penalties (mass/tension/stiffness), inject
+    // For exactly three smoothing penalties (mass/tension/stiffness), inject
     // physically coherent manifold seeds in rho-space:
     // - general SPDE manifold over (log_tau, log_kappa, nu),
-    // - backward-compatible nu=2 reverse-map seeds,
+    // - nu=2 reverse-map seeds,
     // - first-order fallback seeds (lambda2 near lower bound).
-    if num_penalties == 3 {
+    if num_smoothing == 3 {
+        let smoothing_primary =
+            Array1::from_vec(primary.iter().take(num_smoothing).copied().collect());
+        let smoothing_heuristic_lambdas = heuristic_lambdas.and_then(|vals| {
+            if vals.len() >= num_smoothing {
+                Some(&vals[..num_smoothing])
+            } else {
+                None
+            }
+        });
+        let mut spde_prefix_seeds = Vec::new();
+        let mut spde_prefix_seen: HashSet<Vec<u64>> = HashSet::new();
         // Guarantee a first-order fallback anchor regardless of later truncation.
         add_seed_dedup(
-            &mut seeds,
-            &mut seen,
+            &mut spde_prefix_seeds,
+            &mut spde_prefix_seen,
             Array1::from_vec(vec![primary[0], primary[1], bounds.0]),
         );
         // Ensure a nu=2-consistent seed is always present before broader grids.
-        add_nu2_reverse_manifold_seeds(&mut seeds, &mut seen, bounds, &primary);
-        add_first_order_fallback_seeds(&mut seeds, &mut seen, bounds, heuristic_lambdas);
-        add_spde_manifold_seeds(&mut seeds, &mut seen, bounds, heuristic_lambdas, &primary);
+        add_nu2_reverse_manifold_seeds(
+            &mut spde_prefix_seeds,
+            &mut spde_prefix_seen,
+            bounds,
+            &smoothing_primary,
+        );
+        add_first_order_fallback_seeds(
+            &mut spde_prefix_seeds,
+            &mut spde_prefix_seen,
+            bounds,
+            smoothing_heuristic_lambdas,
+        );
+        add_spde_manifold_seeds(
+            &mut spde_prefix_seeds,
+            &mut spde_prefix_seen,
+            bounds,
+            smoothing_heuristic_lambdas,
+            &smoothing_primary,
+        );
+        for prefix_seed in spde_prefix_seeds {
+            let mut seed = Array1::<f64>::zeros(num_penalties);
+            for i in 0..num_smoothing {
+                seed[i] = prefix_seed[i];
+            }
+            for (i, &v) in aux_initial.iter().enumerate() {
+                seed[num_smoothing + i] = v;
+            }
+            add_seed_dedup(&mut seeds, &mut seen, seed);
+        }
     }
 
     // Backward-compatible scalar heuristic support: treat each value as a symmetric λ seed.
