@@ -29,14 +29,14 @@ use crate::inference::model::{
     FittedFamily, FittedModel as SavedModel, SavedBaselineTimeWiggleRuntime,
     load_survival_time_basis_config_from_model, survival_baseline_config_from_model,
 };
-use crate::inference::predict::{BernoulliMarginalSlopePredictor, PredictInput, predict_gam};
+use crate::inference::predict::{BernoulliMarginalSlopePredictor, PredictInput};
 use crate::linalg::matrix::DesignMatrix;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
 use crate::solver::estimate::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResult};
 use crate::solver::mixture_link::inverse_link_jet_for_inverse_link;
 use crate::term_builder::resolve_role_col;
 use crate::terms::smooth::{TermCollectionSpec, build_term_collection_design};
-use crate::types::{InverseLink, LikelihoodFamily, LinkFunction};
+use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 
 /// Typed errors emitted by the survival prediction pipeline.
 ///
@@ -1320,16 +1320,51 @@ fn evaluate_rp_row_with_beta(
             .assign(cov_row);
     }
     let offset_view = Array1::from_elem(1, eta_time_offset_row + primary_offset_row);
-    let pred = predict_gam(
+    let likelihood = LikelihoodSpec::new(
+        ResponseFamily::RoystonParmar,
+        InverseLink::Standard(LinkFunction::Identity),
+    );
+    let eta = predict_royston_parmar_eta(
         x_exit.view(),
         beta.view(),
         offset_view.view(),
-        LikelihoodFamily::RoystonParmar,
-    )
-    .map_err(|e| format!("survival prediction failed: {e}"))?;
-    let eta = pred.eta[0];
+        &likelihood,
+    )?[0];
     let (cum, haz) = royston_parmar_survival_hazard_components(eta, eta_derivative)?;
     Ok((eta, cum, haz))
+}
+
+fn predict_royston_parmar_eta<X>(
+    x: X,
+    beta: ndarray::ArrayView1<'_, f64>,
+    offset: ndarray::ArrayView1<'_, f64>,
+    likelihood: &LikelihoodSpec,
+) -> Result<Array1<f64>, SurvivalPredictError>
+where
+    X: Into<DesignMatrix>,
+{
+    if !matches!(likelihood.response, ResponseFamily::RoystonParmar)
+        || !matches!(likelihood.link, InverseLink::Standard(LinkFunction::Identity))
+    {
+        return Err(SurvivalPredictError::UnsupportedConfiguration {
+            reason: "survival prediction requires RoystonParmar with identity link".to_string(),
+        });
+    }
+    let x = x.into();
+    if x.nrows() != offset.len() || x.ncols() != beta.len() {
+        return Err(SurvivalPredictError::IncompatibleSchema {
+            reason: format!(
+                "survival prediction design dimensions disagree: design is {}x{}, beta has length {}, offset has length {}",
+                x.nrows(),
+                x.ncols(),
+                beta.len(),
+                offset.len()
+            ),
+        });
+    }
+    let mut eta = x.matrixvectormultiply(&beta.to_owned());
+    eta += &offset;
+    Ok(eta)
 }
 
 #[inline]
