@@ -138,14 +138,13 @@ fn report_extrapolation_verdicts_track_budget_boundary() {
         .map(|&x| (x, a_true * x.powf(alpha_true)))
         .collect();
     let extrapolate = [("under", 30_000.0), ("over", 90_000.0)];
-    let report = report_power_law_full("[BOUNDARY]", &points, &extrapolate, 60.0)
+    let fit = report_power_law_full("[BOUNDARY]", &points, &extrapolate, 60.0)
         .expect("clean fit should produce a report");
     // With the structured-extrapolations contract removed, validate the
     // fit recovered the linear law that drives the side-effect verdicts:
     // a · x^α with α=1, a=0.001 implies pred(30k)=30 < 60 (FITS) and
     // pred(90k)=90 > 60 (OVER BUDGET). The verdicts themselves are now
     // stderr-only.
-    let fit = report.fit;
     assert!(
         (fit.alpha - alpha_true).abs() < 1e-9,
         "alpha drift: got {} expected {}",
@@ -189,11 +188,11 @@ fn report_refuses_extrapolation_when_fit_poor() {
         (5.0, 1.0),
     ];
     let extrapolate = [("biobank", 320_000.0)];
-    let report = report_power_law_full("[NOISY]", &points, &extrapolate, 1e9);
+    let fit = report_power_law_full("[NOISY]", &points, &extrapolate, 1e9);
     assert!(
-        report.is_none(),
+        fit.is_none(),
         "report must refuse extrapolation when fit's max log-resid > 0.5; got {:?}",
-        report
+        fit
     );
 }
 

@@ -85,7 +85,8 @@ fn bench_reml_gpu(c: &mut Criterion) {
                         derivative_hessians: dh_views.clone(),
                     },
                 );
-                black_box(result);
+                let output = result.expect("CUDA REML evidence benchmark must solve successfully");
+                black_box(output);
             }
             start.elapsed()
         })

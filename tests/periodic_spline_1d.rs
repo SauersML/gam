@@ -107,17 +107,17 @@ fn periodic_spline_rejects_scalar_only_or_degenerate_inputs() {
     let u = array![0.0, 1.0];
     let y = Array2::<f64>::zeros((2, 2));
     let spec = PeriodicBSplineBasisSpec::new(3, 4, 2.0, 0.0, 2);
-    fit_periodic_bspline_curve(u.view(), y.view(), &spec, 0.0)
-        .expect_err("too few samples should fail");
+    let too_few = fit_periodic_bspline_curve(u.view(), y.view(), &spec, 0.0);
+    assert!(too_few.is_err(), "too few samples should fail");
 
     let u3 = array![0.0, 1.0, 2.0];
     let y_bad = Array2::<f64>::zeros((2, 2));
     let spec3 = PeriodicBSplineBasisSpec::new(3, 4, 3.0, 0.0, 2);
-    fit_periodic_bspline_curve(u3.view(), y_bad.view(), &spec3, 0.0)
-        .expect_err("row mismatch should fail");
+    let row_mismatch = fit_periodic_bspline_curve(u3.view(), y_bad.view(), &spec3, 0.0);
+    assert!(row_mismatch.is_err(), "row mismatch should fail");
 
     let y3 = Array2::<f64>::zeros((3, 1));
     let spec_nan = PeriodicBSplineBasisSpec::new(3, 4, f64::NAN, 0.0, 2);
-    fit_periodic_bspline_curve(u3.view(), y3.view(), &spec_nan, 0.0)
-        .expect_err("bad period should fail");
+    let bad_period = fit_periodic_bspline_curve(u3.view(), y3.view(), &spec_nan, 0.0);
+    assert!(bad_period.is_err(), "bad period should fail");
 }
