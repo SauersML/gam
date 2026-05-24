@@ -19,7 +19,7 @@
 //! assemblers can stay backend-agnostic: they call `crate::faer_ndarray::fast_*`
 //! and get GPU acceleration automatically whenever it is profitable.
 
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 
 use super::runtime::GpuRuntime;
 
@@ -123,12 +123,7 @@ pub fn try_fast_ab_broadcast_b_batched(
         return None;
     }
     let runtime = route_through_gpu(DispatchOp::BatchedGemm { batch, m, n, k })?;
-    let mut out = Array3::<f64>::zeros((batch, m, n));
-    for idx in 0..batch {
-        let product = cuda_backend::gemm(runtime, a.index_axis(Axis(0), idx), b, false, false)?;
-        out.index_axis_mut(Axis(0), idx).assign(&product);
-    }
-    Some(out)
+    cuda_backend::gemm_broadcast_b_batched(runtime, a, b)
 }
 
 #[inline]
@@ -143,18 +138,7 @@ pub fn try_fast_abt_strided_batched(
         return None;
     }
     let runtime = route_through_gpu(DispatchOp::BatchedGemm { batch, m, n, k })?;
-    let mut out = Array3::<f64>::zeros((batch, m, n));
-    for idx in 0..batch {
-        let product = cuda_backend::gemm(
-            runtime,
-            a.index_axis(Axis(0), idx),
-            b.index_axis(Axis(0), idx),
-            false,
-            true,
-        )?;
-        out.index_axis_mut(Axis(0), idx).assign(&product);
-    }
-    Some(out)
+    cuda_backend::gemm_abt_strided_batched(runtime, a, b)
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +343,7 @@ mod cuda_backend {
     //! is exercised — there is never a silent panic, and the numerical
     //! result is identical to the CPU code modulo IEEE-754 reduction order.
 
-    use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+    use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 
     use super::super::runtime::GpuRuntime;
     use crate::gpu::driver::{from_col_major, to_col_major, to_i32};
@@ -385,6 +369,24 @@ mod cuda_backend {
         trans_a: bool,
     ) -> Option<Array1<f64>> {
         super::super::blas::gemv_cuda(runtime, a, v, trans_a)
+    }
+
+    #[inline]
+    pub(super) fn gemm_broadcast_b_batched(
+        runtime: &GpuRuntime,
+        a: ArrayView3<'_, f64>,
+        b: ArrayView2<'_, f64>,
+    ) -> Option<Array3<f64>> {
+        super::super::blas::gemm_broadcast_b_batched_cuda(runtime, a, b)
+    }
+
+    #[inline]
+    pub(super) fn gemm_abt_strided_batched(
+        runtime: &GpuRuntime,
+        a: ArrayView3<'_, f64>,
+        b: ArrayView3<'_, f64>,
+    ) -> Option<Array3<f64>> {
+        super::super::blas::gemm_abt_strided_batched_cuda(runtime, a, b)
     }
 
     #[inline]
