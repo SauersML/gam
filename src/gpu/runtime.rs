@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use super::diagnostics;
 use super::device::GpuDeviceInfo;
+use super::diagnostics;
 use super::policy::GpuDispatchPolicy;
 use cudarc::driver::{CudaContext, result, sys};
 
@@ -41,7 +41,9 @@ impl GpuRuntime {
             .map_err(|_| GpuProbeError::Driver("negative CUDA device count".into()))?
         {
             let ctx = cuda_context_for(ordinal).ok_or_else(|| {
-                GpuProbeError::Driver(format!("failed to create CUDA context for device {ordinal}"))
+                GpuProbeError::Driver(format!(
+                    "failed to create CUDA context for device {ordinal}"
+                ))
             })?;
             ctx.bind_to_thread()
                 .map_err(|err| GpuProbeError::Driver(err.to_string()))?;

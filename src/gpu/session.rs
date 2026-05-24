@@ -282,7 +282,10 @@ pub fn try_fast_xt_diag_x_arc<S: Data<Elem = f64>>(
     let (rows, cols) = x.dim();
     let runtime = GpuRuntime::global()?;
     let policy = runtime.policy();
-    let flops = rows.saturating_mul(cols).saturating_mul(cols).saturating_mul(2);
+    let flops = rows
+        .saturating_mul(cols)
+        .saturating_mul(cols)
+        .saturating_mul(2);
     if rows < policy.xtwx_n_min || flops < policy.xtwx_flops_min {
         diagnostics::log_policy_cpu(
             "xt_diag_x_resident",
