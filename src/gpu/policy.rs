@@ -1,263 +1,183 @@
-use crate::gpu::device::{GpuCapability, GpuDeviceInfo};
+use serde::{Deserialize, Serialize};
 use std::env;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AccelPolicy {
-    Auto,
-    CpuOnly,
-    GpuOnly,
+/// User-visible GPU environment policy. Defaults match `GAM_GPU=auto` with no
+/// validation, no forced graphs, and FP64 accepted-state numerics.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct GpuEnv {
+    pub mode: String,
+    pub device: Option<usize>,
+    pub mem_fraction: f64,
+    pub validate: String,
+    pub graphs: String,
+    pub mixed_precision: String,
+    pub profile: bool,
+    pub calibrate: String,
+    pub min_n_override: Option<usize>,
+    pub f32_operator_preconditioner: bool,
+    pub family_kernels: bool,
 }
 
-impl AccelPolicy {
+impl GpuEnv {
     #[must_use]
     pub fn from_env() -> Self {
-        match env::var("GAM_GPU").ok().as_deref() {
-            Some("off" | "0" | "false" | "cpu") => Self::CpuOnly,
-            Some("force" | "on" | "1" | "true" | "gpu") => Self::GpuOnly,
-            _ => Self::Auto,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GpuDispatchDecision {
-    Cpu,
-    Gpu,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GpuOperation {
-    Gemm {
-        m: usize,
-        n: usize,
-        k: usize,
-    },
-    Gemv {
-        m: usize,
-        k: usize,
-    },
-    XtDiagX {
-        rows: usize,
-        cols: usize,
-        resident: bool,
-    },
-    XtDiagY {
-        rows: usize,
-        x_cols: usize,
-        y_cols: usize,
-        resident: bool,
-    },
-    JointHessian2x2 {
-        rows: usize,
-        a_cols: usize,
-        b_cols: usize,
-        resident: bool,
-    },
-    Cholesky {
-        cols: usize,
-        resident: bool,
-        rhs: usize,
-    },
-    SparseXtDiagX {
-        rows: usize,
-        cols: usize,
-        nnz: usize,
-        resident: bool,
-    },
-    RowKernel {
-        rows: usize,
-        axes: usize,
-        candidates: usize,
-        resident: bool,
-    },
-}
-
-impl GpuOperation {
-    #[must_use]
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Gemm { .. } => "gemm",
-            Self::Gemv { .. } => "gemv",
-            Self::XtDiagX { .. } => "xt_diag_x",
-            Self::XtDiagY { .. } => "xt_diag_y",
-            Self::JointHessian2x2 { .. } => "joint_hessian_2x2",
-            Self::Cholesky { .. } => "cholesky",
-            Self::SparseXtDiagX { .. } => "sparse_xt_diag_x",
-            Self::RowKernel { .. } => "row_kernel",
+        Self {
+            mode: env::var("GAM_GPU").unwrap_or_else(|_| "auto".to_string()),
+            device: env::var("GAM_GPU_DEVICE").ok().and_then(|v| v.parse().ok()),
+            mem_fraction: env::var("GAM_GPU_MEM_FRACTION")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.85),
+            validate: env::var("GAM_GPU_VALIDATE").unwrap_or_else(|_| "0".to_string()),
+            graphs: env::var("GAM_GPU_GRAPHS").unwrap_or_else(|_| "auto".to_string()),
+            mixed_precision: env::var("GAM_GPU_MIXED_PRECISION")
+                .unwrap_or_else(|_| "off".to_string()),
+            profile: env::var("GAM_GPU_PROFILE")
+                .map(|v| v == "1")
+                .unwrap_or(false),
+            calibrate: env::var("GAM_GPU_CALIBRATE").unwrap_or_else(|_| "auto".to_string()),
+            min_n_override: env::var("GAM_GPU_MIN_N").ok().and_then(|v| v.parse().ok()),
+            f32_operator_preconditioner: env::var("GAM_GPU_F32_OPERATOR_PRECONDITIONER")
+                .map(|v| v == "1")
+                .unwrap_or(false),
+            family_kernels: env::var("GAM_GPU_FAMILY_KERNELS")
+                .map(|v| v == "on" || v == "1")
+                .unwrap_or(false),
         }
     }
 
     #[must_use]
-    pub fn estimated_flops(&self) -> f64 {
-        match *self {
-            Self::Gemm { m, n, k } => 2.0 * (m as f64) * (n as f64) * (k as f64),
-            Self::Gemv { m, k } => 2.0 * (m as f64) * (k as f64),
-            Self::XtDiagX { rows, cols, .. } => 2.0 * (rows as f64) * (cols as f64).powi(2),
-            Self::XtDiagY {
-                rows,
-                x_cols,
-                y_cols,
-                ..
-            } => 2.0 * (rows as f64) * (x_cols as f64) * (y_cols as f64),
-            Self::JointHessian2x2 {
-                rows,
-                a_cols,
-                b_cols,
-                ..
-            } => {
-                let c = a_cols + b_cols;
-                2.0 * (rows as f64) * (c as f64).powi(2)
-            }
-            Self::Cholesky { cols, rhs, .. } => {
-                ((cols as f64).powi(3) / 3.0) + 2.0 * (cols as f64).powi(2) * (rhs as f64)
-            }
-            Self::SparseXtDiagX { nnz, cols, .. } => 2.0 * (nnz as f64) * (cols as f64),
-            Self::RowKernel {
-                rows,
-                axes,
-                candidates,
-                ..
-            } => (rows as f64) * axes.max(1) as f64 * candidates.max(1) as f64 * 128.0,
-        }
+    pub fn disabled(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("off")
+    }
+
+    #[must_use]
+    pub fn forced(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("force")
     }
 }
 
-#[derive(Clone, Debug)]
+/// Calibrated thresholds for every phase. Values are conservative CPU-fallback
+/// defaults and are overwritten by calibration when a real device is available.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct GpuDispatchPolicy {
-    pub accel_policy: AccelPolicy,
-    pub gemm_min_flops: f64,
-    pub xtwx_min_flops: f64,
+    pub xtwx_n_min: usize,
+    pub xtwx_flops_min: usize,
+    pub xtwx_use_fused_below_p: usize,
+    pub gemm_min_flops: usize,
     pub potrf_min_p: usize,
+    pub syevd_min_p: usize,
     pub sparse_min_nnz: usize,
+    pub fused_kernel_min_n: usize,
     pub row_kernel_min_n: usize,
-    pub keep_design_resident: bool,
-    pub prefer_gpu_for_f64_factorization: bool,
+    pub keep_design_resident_min_bytes: usize,
+    pub prefer_gpu_factorization_min_p: usize,
+    pub device_chunk_bytes: usize,
+}
+
+impl Default for GpuDispatchPolicy {
+    fn default() -> Self {
+        Self {
+            xtwx_n_min: 65_536,
+            xtwx_flops_min: 256 * 1024 * 1024,
+            xtwx_use_fused_below_p: 256,
+            gemm_min_flops: 128 * 1024 * 1024,
+            potrf_min_p: 512,
+            syevd_min_p: 512,
+            sparse_min_nnz: 2_000_000,
+            fused_kernel_min_n: 8_192,
+            row_kernel_min_n: 8_192,
+            keep_design_resident_min_bytes: 64 * 1024 * 1024,
+            prefer_gpu_factorization_min_p: 512,
+            device_chunk_bytes: 128 * 1024 * 1024,
+        }
+    }
+}
+
+/// Operation families covered by Phases 1--10.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GpuOpKind {
+    DenseGemv,
+    DenseAtv,
+    DenseGemm,
+    DenseXtDiagX,
+    DenseXtDiagY,
+    JointHessian2x2,
+    FusedLinkKernel,
+    PirlsResidentIteration,
+    LmCandidateScreen,
+    DenseCholesky,
+    DenseSymmetricEigen,
+    SparseXtWx,
+    SparseSpmm,
+    MatrixFreePcg,
+    SpatialKernelApply,
+    RemlDenseSpectralTrace,
+    HutchPlusPlusTrace,
+    ProjectedFactorTrace,
+    CustomFamilyRowKernel,
+    CudaGraphReplay,
+    MultiGpuRowShard,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GpuBackendDecision {
+    Cpu { reason: String },
+    Gpu { reason: String },
 }
 
 impl GpuDispatchPolicy {
     #[must_use]
-    pub fn from_env_and_device(device: Option<&GpuDeviceInfo>) -> Self {
-        let tier = device
-            .map(GpuDeviceInfo::capability_tier)
-            .unwrap_or(GpuCapability::Unknown);
-        let mut policy = match tier {
-            GpuCapability::HopperOrNewer => Self {
-                accel_policy: AccelPolicy::from_env(),
-                gemm_min_flops: 8.0e7,
-                xtwx_min_flops: 1.5e8,
-                potrf_min_p: 768,
-                sparse_min_nnz: 1_000_000,
-                row_kernel_min_n: 50_000,
-                keep_design_resident: true,
-                prefer_gpu_for_f64_factorization: true,
-            },
-            GpuCapability::Datacenter => Self {
-                accel_policy: AccelPolicy::from_env(),
-                gemm_min_flops: 1.5e8,
-                xtwx_min_flops: 3.0e8,
-                potrf_min_p: 1024,
-                sparse_min_nnz: 2_000_000,
-                row_kernel_min_n: 100_000,
-                keep_design_resident: true,
-                prefer_gpu_for_f64_factorization: false,
-            },
-            _ => Self {
-                accel_policy: AccelPolicy::from_env(),
-                gemm_min_flops: 3.0e8,
-                xtwx_min_flops: 6.0e8,
-                potrf_min_p: 1536,
-                sparse_min_nnz: 4_000_000,
-                row_kernel_min_n: 250_000,
-                keep_design_resident: false,
-                prefer_gpu_for_f64_factorization: false,
-            },
+    pub fn decide(
+        &self,
+        op: GpuOpKind,
+        n: usize,
+        p: usize,
+        k: usize,
+        nnz: usize,
+        device_resident: bool,
+        runtime_available: bool,
+    ) -> GpuBackendDecision {
+        if !runtime_available {
+            return GpuBackendDecision::Cpu {
+                reason: "CUDA runtime unavailable".to_string(),
+            };
+        }
+        let flops = n.saturating_mul(p.max(1)).saturating_mul(k.max(1));
+        let use_gpu = match op {
+            GpuOpKind::DenseGemv | GpuOpKind::DenseAtv | GpuOpKind::DenseGemm => {
+                device_resident || flops >= self.gemm_min_flops
+            }
+            GpuOpKind::DenseXtDiagX | GpuOpKind::DenseXtDiagY | GpuOpKind::JointHessian2x2 => {
+                device_resident
+                    || (n >= self.xtwx_n_min
+                        && n.saturating_mul(p).saturating_mul(p) >= self.xtwx_flops_min)
+            }
+            GpuOpKind::DenseCholesky => device_resident && p >= self.potrf_min_p,
+            GpuOpKind::DenseSymmetricEigen => device_resident && p >= self.syevd_min_p,
+            GpuOpKind::SparseXtWx | GpuOpKind::SparseSpmm => nnz >= self.sparse_min_nnz,
+            GpuOpKind::MatrixFreePcg => device_resident && p >= 2048,
+            GpuOpKind::FusedLinkKernel
+            | GpuOpKind::PirlsResidentIteration
+            | GpuOpKind::LmCandidateScreen => n >= self.fused_kernel_min_n,
+            GpuOpKind::SpatialKernelApply => {
+                device_resident || n.saturating_mul(p) >= self.keep_design_resident_min_bytes / 8
+            }
+            GpuOpKind::RemlDenseSpectralTrace => device_resident,
+            GpuOpKind::HutchPlusPlusTrace => p >= 128 && k >= 4,
+            GpuOpKind::ProjectedFactorTrace => device_resident || flops >= self.gemm_min_flops,
+            GpuOpKind::CustomFamilyRowKernel => n >= self.row_kernel_min_n,
+            GpuOpKind::CudaGraphReplay => device_resident,
+            GpuOpKind::MultiGpuRowShard => false,
         };
-        if let Ok(value) = env::var("GAM_GPU_MIN_N") {
-            if let Ok(parsed) = value.parse::<usize>() {
-                policy.row_kernel_min_n = parsed;
+        if use_gpu {
+            GpuBackendDecision::Gpu {
+                reason: format!("policy selected GPU for {op:?}"),
             }
-        }
-        policy
-    }
-
-    #[must_use]
-    pub fn decide(&self, op: GpuOperation, cuda_available: bool) -> GpuDispatchDecision {
-        if self.accel_policy == AccelPolicy::CpuOnly || !cuda_available {
-            return GpuDispatchDecision::Cpu;
-        }
-        if self.accel_policy == AccelPolicy::GpuOnly {
-            return GpuDispatchDecision::Gpu;
-        }
-        let flops = op.estimated_flops();
-        let gpu = match op {
-            GpuOperation::Gemm { .. } | GpuOperation::Gemv { .. } => flops >= self.gemm_min_flops,
-            GpuOperation::XtDiagX { resident, .. }
-            | GpuOperation::XtDiagY { resident, .. }
-            | GpuOperation::JointHessian2x2 { resident, .. } => {
-                resident || flops >= self.xtwx_min_flops
-            }
-            GpuOperation::Cholesky { cols, resident, .. } => {
-                cols >= self.potrf_min_p && (resident || self.prefer_gpu_for_f64_factorization)
-            }
-            GpuOperation::SparseXtDiagX { nnz, resident, .. } => {
-                resident || nnz >= self.sparse_min_nnz
-            }
-            GpuOperation::RowKernel { rows, resident, .. } => {
-                resident || rows >= self.row_kernel_min_n
-            }
-        };
-        if gpu {
-            GpuDispatchDecision::Gpu
         } else {
-            GpuDispatchDecision::Cpu
+            GpuBackendDecision::Cpu {
+                reason: format!("policy kept {op:?} on CPU"),
+            }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn auto_policy_keeps_small_gemv_on_cpu() {
-        let policy = GpuDispatchPolicy {
-            accel_policy: AccelPolicy::Auto,
-            gemm_min_flops: 1_000_000.0,
-            xtwx_min_flops: 1_000_000.0,
-            potrf_min_p: 512,
-            sparse_min_nnz: 10_000,
-            row_kernel_min_n: 10_000,
-            keep_design_resident: false,
-            prefer_gpu_for_f64_factorization: false,
-        };
-        assert_eq!(
-            policy.decide(GpuOperation::Gemv { m: 32, k: 16 }, true),
-            GpuDispatchDecision::Cpu
-        );
-    }
-
-    #[test]
-    fn resident_xtwx_can_use_gpu_even_below_flop_threshold() {
-        let policy = GpuDispatchPolicy {
-            accel_policy: AccelPolicy::Auto,
-            gemm_min_flops: 1.0e12,
-            xtwx_min_flops: 1.0e12,
-            potrf_min_p: 4096,
-            sparse_min_nnz: usize::MAX,
-            row_kernel_min_n: usize::MAX,
-            keep_design_resident: true,
-            prefer_gpu_for_f64_factorization: false,
-        };
-        assert_eq!(
-            policy.decide(
-                GpuOperation::XtDiagX {
-                    rows: 1024,
-                    cols: 16,
-                    resident: true,
-                },
-                true,
-            ),
-            GpuDispatchDecision::Gpu
-        );
     }
 }

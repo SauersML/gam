@@ -38,9 +38,25 @@ resolver = "3"
 [lints.rust]
 warnings = "deny"
 
+
 [features]
 default = []
-cuda = []
+cuda = [
+    "dep:cudarc",
+    "cudarc/driver",
+    "cudarc/runtime",
+    "cudarc/nvrtc",
+    "cudarc/cublas",
+    "cudarc/cublaslt",
+    "cudarc/cusparse",
+    "cudarc/cusolver",
+    "cudarc/cusolvermg",
+    "cudarc/curand",
+    "cudarc/nvtx",
+    "cudarc/cupti",
+    "cudarc/fallback-dynamic-loading",
+    "cudarc/cuda-12080",
+]
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
@@ -69,7 +85,7 @@ arrow = { version = "54", default-features = false, features = ["ffi"] }
 parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
 wide = "0.7"
 smallvec = "1"
-cudarc = { version = "0.19.6", optional = true, default-features = false, features = ["std", "driver", "runtime", "cublas", "cublaslt", "fallback-dynamic-loading", "cuda-12080"] }
+cudarc = { version = "0.19.6", optional = true, default-features = false }
 
 [dependencies.general-mcmc]
 package = "general-mcmc"
