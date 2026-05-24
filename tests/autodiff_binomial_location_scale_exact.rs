@@ -8,6 +8,12 @@ use std::marker::PhantomData;
 
 mod common;
 
+fn stateless_ad_output<T>(freeze: bool, output: T) -> Vec<T> {
+    match freeze {
+        true | false => vec![output],
+    }
+}
+
 const POLY_LOSS_KAPPA: f64 = 0.2;
 
 #[derive(Clone, Copy)]
@@ -216,7 +222,7 @@ impl<T: AD> DifferentiableFunctionTrait<T> for PsiQuantityFn<T> {
     const NAME: &'static str = "PsiQuantityFn";
 
     fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
-        vec![psi_quantity_ad(inputs[0], &self.params, self.quantity)]
+        stateless_ad_output(freeze, psi_quantity_ad(inputs[0], &self.params, self.quantity))
     }
 
     fn num_inputs(&self) -> usize {
@@ -519,13 +525,13 @@ impl<T: AD> DifferentiableFunctionTrait<T> for EpsHessianPsiFn<T> {
     const NAME: &'static str = "EpsHessianPsiFn";
 
     fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
-        vec![epshessian_psi_ad(
+        stateless_ad_output(freeze, epshessian_psi_ad(
             inputs[0],
             self.psi0,
             &self.params,
             self.i,
             self.j,
-        )]
+        ))
     }
 
     fn num_inputs(&self) -> usize {
@@ -575,7 +581,7 @@ impl<T: AD> DifferentiableFunctionTrait<T> for QFn<T> {
     const NAME: &'static str = "QFn";
 
     fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
-        vec![q_ad(inputs[0], self.eta_t)]
+        stateless_ad_output(freeze, q_ad(inputs[0], self.eta_t))
     }
 
     fn num_inputs(&self) -> usize {
@@ -634,7 +640,7 @@ impl<T: AD> DifferentiableFunctionTrait<T> for ScalingPhiFn<T> {
     const NAME: &'static str = "ScalingPhiFn";
 
     fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
-        vec![scalingphi_ad(inputs[0], self.r, self.eta)]
+        stateless_ad_output(freeze, scalingphi_ad(inputs[0], self.r, self.eta))
     }
 
     fn num_inputs(&self) -> usize {

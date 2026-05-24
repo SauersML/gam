@@ -11,6 +11,12 @@ use std::marker::PhantomData;
 
 mod common;
 
+fn stateless_ad_output<T>(freeze: bool, output: T) -> Vec<T> {
+    match freeze {
+        true | false => vec![output],
+    }
+}
+
 const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 
 fn normal_pdf_numdual<D: DualNum<f64> + Copy>(x: D) -> D {
@@ -252,8 +258,8 @@ impl<T: AD> PdfFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for PdfFn<T> {
     const NAME: &'static str = "PdfFn";
 
-    fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
-        vec![normal_pdf_ad(inputs[0])]
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
+        stateless_ad_output(freeze, normal_pdf_ad(inputs[0]))
     }
 
     fn num_inputs(&self) -> usize {
@@ -285,8 +291,8 @@ impl<T: AD> LogitFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for LogitFn<T> {
     const NAME: &'static str = "LogitFn";
 
-    fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
-        vec![logistic_ad(inputs[0])]
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
+        stateless_ad_output(freeze, logistic_ad(inputs[0]))
     }
 
     fn num_inputs(&self) -> usize {
@@ -318,8 +324,8 @@ impl<T: AD> WeightFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for WeightFn<T> {
     const NAME: &'static str = "WeightFn";
 
-    fn call(&self, inputs: &[T], _freeze: bool) -> Vec<T> {
-        vec![weight_ad(inputs[0])]
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
+        stateless_ad_output(freeze, weight_ad(inputs[0]))
     }
 
     fn num_inputs(&self) -> usize {
