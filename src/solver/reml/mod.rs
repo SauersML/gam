@@ -4182,6 +4182,7 @@ pub(crate) struct RemlState<'a> {
     /// Stable disk-cache key for the current realized REML surface. Computed
     /// lazily because it hashes the row-chunked design and data vectors.
     pub(crate) persistent_warm_start_key: RwLock<Option<String>>,
+    pub(crate) analytic_penalty_registry_fingerprint: u64,
     /// Ensures the process attempts at most one disk restore per surface.
     pub(crate) persistent_warm_start_loaded: AtomicBool,
 }
