@@ -863,6 +863,10 @@ pub fn evidence_grad_rho(
         y_blocks.push(yi);
     }
 
+    // Outer-hoisted scratch reused across all (a, i) iterations.
+    let mut trace_rhs = Array1::<f64>::zeros(d);
+    let mut da_tmp = Array2::<f64>::zeros((d, k));
+    let mut col_scratch = Array1::<f64>::zeros(k);
     for a in 0..r {
         // Part 1: F_{ρ_a} envelope contribution.
         let mut grad = value_rho[a];
@@ -877,12 +881,11 @@ pub fn evidence_grad_rho(
         for i in 0..n {
             let m_i = &huu_drho[i][a];
             debug_assert_eq!(m_i.shape(), &[d, d]);
-            let mut rhs = Array1::<f64>::zeros(d);
             for col in 0..d {
                 for r0 in 0..d {
-                    rhs[r0] = m_i[[r0, col]];
+                    trace_rhs[r0] = m_i[[r0, col]];
                 }
-                let v = chol_lower_solve_vector(cache.undamped_factor(i), &rhs);
+                let v = chol_lower_solve_vector(cache.undamped_factor(i), &trace_rhs);
                 row_trace_acc += v[col];
             }
         }
@@ -922,15 +925,14 @@ pub fn evidence_grad_rho(
             }
             // + Y_iᵀ (∂H_uu_i) Y_i
             let dhuu = &huu_drho[i][a];
-            // tmp = (∂H_uu_i) Y_i  (d × K)
-            let mut tmp = Array2::<f64>::zeros((d, k));
+            // tmp = (∂H_uu_i) Y_i  (d × K) — reuse hoisted da_tmp buffer.
             for r0 in 0..d {
                 for c0 in 0..k {
                     let mut acc = 0.0;
                     for cc in 0..d {
                         acc += dhuu[[r0, cc]] * yi[[cc, c0]];
                     }
-                    tmp[[r0, c0]] = acc;
+                    da_tmp[[r0, c0]] = acc;
                 }
             }
             // da += Y_iᵀ tmp
@@ -938,7 +940,7 @@ pub fn evidence_grad_rho(
                 for c0 in 0..k {
                     let mut acc = 0.0;
                     for cc in 0..d {
-                        acc += yi[[cc, r0]] * tmp[[cc, c0]];
+                        acc += yi[[cc, r0]] * da_tmp[[cc, c0]];
                     }
                     da[[r0, c0]] += acc;
                 }
@@ -947,12 +949,11 @@ pub fn evidence_grad_rho(
 
         // tr(A⁻¹ ∂A) via column solves.
         let mut schur_trace_acc = 0.0_f64;
-        let mut col = Array1::<f64>::zeros(k);
         for j in 0..k {
             for r0 in 0..k {
-                col[r0] = da[[r0, j]];
+                col_scratch[r0] = da[[r0, j]];
             }
-            let v = chol_lower_solve_vector(schur, &col);
+            let v = chol_lower_solve_vector(schur, &col_scratch);
             schur_trace_acc += v[j];
         }
 
