@@ -1122,7 +1122,6 @@ pub fn build_survival_time_basis(
                         identifiability: BSplineIdentifiability::None,
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
-                        streaming_chunk_size: None,
                     },
                 )
                 .map_err(|e| format!("failed to infer survival time knots: {e}"))?;
@@ -1219,7 +1218,6 @@ pub fn build_survival_time_basis(
                     identifiability: BSplineIdentifiability::None,
                     boundary: OneDimensionalBoundary::Open,
                     boundary_conditions: BSplineBoundaryConditions::default(),
-                    streaming_chunk_size: None,
                 },
             )
             .map_err(|e| format!("failed to build bspline entry basis: {e}"))?;
@@ -1233,7 +1231,6 @@ pub fn build_survival_time_basis(
                     identifiability: BSplineIdentifiability::None,
                     boundary: OneDimensionalBoundary::Open,
                     boundary_conditions: BSplineBoundaryConditions::default(),
-                    streaming_chunk_size: None,
                 },
             )
             .map_err(|e| format!("failed to build bspline exit basis: {e}"))?;
@@ -1467,7 +1464,6 @@ pub fn build_survival_time_basis(
                     identifiability: BSplineIdentifiability::None,
                     boundary: OneDimensionalBoundary::Open,
                     boundary_conditions: BSplineBoundaryConditions::default(),
-                    streaming_chunk_size: None,
                 },
             )
             .map_err(|e| format!("failed to build ispline smoothing penalty: {e}"))?;
@@ -1618,7 +1614,6 @@ pub fn evaluate_survival_time_basis_row(
                     identifiability: BSplineIdentifiability::None,
                     boundary: OneDimensionalBoundary::Open,
                     boundary_conditions: BSplineBoundaryConditions::default(),
-                    streaming_chunk_size: None,
                 },
             )
             .map_err(|e| format!("failed to evaluate survival bspline anchor row: {e}"))?;
@@ -1924,9 +1919,8 @@ pub fn baseline_chain_rule_gradient(
     let grad = (0..n)
         .into_par_iter()
         .try_fold(
-            || Ok::<Array1<f64>, String>(Array1::<f64>::zeros(theta_dim)),
-            |acc, i| -> Result<Result<Array1<f64>, String>, String> {
-                let mut acc = acc?;
+            || Array1::<f64>::zeros(theta_dim),
+            |mut acc, i| -> Result<Array1<f64>, String> {
                 let t_exit = age_exit[i];
                 // Exit + derivative partials both come from the age_exit evaluation.
                 let partials_exit = baseline_offset_theta_partials(t_exit, cfg)?
@@ -1958,17 +1952,13 @@ pub fn baseline_chain_rule_gradient(
                         acc[k] += r_e * partials_entry[k].0;
                     }
                 }
-                Ok(Ok(acc))
+                Ok(acc)
             },
         )
         .try_reduce(
-            || Ok::<Array1<f64>, String>(Array1::<f64>::zeros(theta_dim)),
-            |a, b| -> Result<Result<Array1<f64>, String>, String> {
-                let a = a?;
-                let b = b?;
-                Ok(Ok(a + b))
-            },
-        )??;
+            || Array1::<f64>::zeros(theta_dim),
+            |a, b| Ok(a + b),
+        )?;
     Ok(Some(grad))
 }
 
@@ -3064,7 +3054,6 @@ pub fn build_time_varying_survival_covariate_template(
         identifiability: BSplineIdentifiability::None,
         boundary: OneDimensionalBoundary::Open,
         boundary_conditions: BSplineBoundaryConditions::default(),
-        streaming_chunk_size: None,
     };
 
     let time_build = build_bspline_basis_1d(log_exit.view(), &time_spec)
@@ -3090,7 +3079,6 @@ pub fn build_time_varying_survival_covariate_template(
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         },
     )
     .map_err(|e| format!("failed to evaluate {block_name} time-margin basis at entry: {e}"))?;
