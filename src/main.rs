@@ -922,9 +922,8 @@ fn run() -> CliResult<()> {
     }
 }
 
-fn blockwise_options_from_fit_args(
-    _args: &FitArgs,
-) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
+fn blockwise_options_from_fit_args()
+-> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
     let options = gam::families::custom_family::BlockwiseFitOptions::default();
     Ok(options)
 }
@@ -1522,7 +1521,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 && args.predict_noise.is_none()
                 && (!mean_only_flexible_linkwiggle || route_flexible_through_standard)
             {
-                Some(blockwise_options_from_fit_args(&args)?)
+                Some(blockwise_options_from_fit_args()?)
             } else {
                 None
             },
@@ -1823,7 +1822,7 @@ fn run_fit_bernoulli_marginal_slope(
                 .to_string(),
         );
     }
-    let mut options = blockwise_options_from_fit_args(args)?;
+    let mut options = blockwise_options_from_fit_args()?;
     options.compute_covariance = true;
     let kappa_options = {
         let mut opts = SpatialLengthScaleOptimizationOptions::default();
@@ -1995,7 +1994,7 @@ fn run_fit_transformation_normal(
     emit_smooth_structure_warnings("fit-start", &spatial_usagewarnings);
     print_inference_summary(inference_notes);
 
-    let options = blockwise_options_from_fit_args(args)?;
+    let options = blockwise_options_from_fit_args()?;
     let config = TransformationNormalConfig::default();
     let weights = resolve_weight_column(ds, col_map, args.weights_column.as_deref())?;
     let offset = resolve_offset_column(ds, col_map, args.offset_column.as_deref())?;
@@ -2143,7 +2142,7 @@ fn run_fitwith_predict_noise(
     if family == LikelihoodFamily::GaussianIdentity {
         let response_scale = sample_std(y.view()).max(1e-6);
         let y_scaled = y.mapv(|v| v / response_scale);
-        let options = blockwise_options_from_fit_args(args)?;
+        let options = blockwise_options_from_fit_args()?;
         progress.set_stage("fit", "optimizing gaussian location-scale model");
         let phase_start = std::time::Instant::now();
         log::info!(
@@ -2323,7 +2322,7 @@ fn run_fitwith_predict_noise(
         require_inverse_link_supports_joint_wiggle(&location_scale_link_kind, "linkwiggle(...)")?;
     }
 
-    let options = blockwise_options_from_fit_args(args)?;
+    let options = blockwise_options_from_fit_args()?;
     progress.set_stage("fit", "optimizing binomial location-scale model");
     let phase_start = std::time::Instant::now();
     log::info!(

@@ -5523,7 +5523,7 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         psi_b: &GaussianLocationScaleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-        _subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
+        _: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
         // Wiggle ψ path: full-data exact (= trivially unbiased). The
         // wiggle-specific second-order from-parts function inlines 30+
@@ -5561,7 +5561,7 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         d_beta_flat: &Array1<f64>,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-        _subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
+        _: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<Array2<f64>, String> {
         // Same rationale as `ws_psi_second_order_terms_from_parts` above:
         // the wiggle ψ-Hessian directional-derivative function also inlines
@@ -13746,9 +13746,11 @@ impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
 
     fn directional_derivative(
         &self,
-        _d_beta_flat: &Array1<f64>,
+        d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        Ok(None)
+        Ok(self
+            .directional_derivative_operator(d_beta_flat)?
+            .map(|operator| operator.to_dense()))
     }
 
     fn directional_derivative_operator(
@@ -13762,10 +13764,12 @@ impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
 
     fn second_directional_derivative(
         &self,
-        _d_beta_u_flat: &Array1<f64>,
-        _d_beta_v_flat: &Array1<f64>,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        Ok(None)
+        Ok(self
+            .second_directional_derivative_operator(d_beta_u_flat, d_beta_v_flat)?
+            .map(|operator| operator.to_dense()))
     }
 
     fn second_directional_derivative_operator(
@@ -17063,8 +17067,8 @@ impl CustomFamily for BinomialLocationScaleFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         rho: &ndarray::Array1<f64>,
-        _options: &BlockwiseFitOptions,
-        _hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+        _: &BlockwiseFitOptions,
+        _: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
         use crate::faer_ndarray::FaerCholesky;
         use faer::Side;
@@ -17814,9 +17818,11 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
 
     fn directional_derivative(
         &self,
-        _d_beta_flat: &Array1<f64>,
+        d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        Ok(None)
+        Ok(self
+            .directional_derivative_operator(d_beta_flat)?
+            .map(|operator| operator.to_dense()))
     }
 
     fn directional_derivative_operator(
@@ -17851,10 +17857,12 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
 
     fn second_directional_derivative(
         &self,
-        _d_beta_u_flat: &Array1<f64>,
-        _d_beta_v_flat: &Array1<f64>,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        Ok(None)
+        Ok(self
+            .second_directional_derivative_operator(d_beta_u_flat, d_beta_v_flat)?
+            .map(|operator| operator.to_dense()))
     }
 
     fn second_directional_derivative_operator(

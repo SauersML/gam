@@ -370,7 +370,7 @@ pub trait AnalyticPenalty: Send + Sync {
     /// Update any attached scalar weight schedule at the given REML outer
     /// iteration. Penalties without schedules keep their stored weight.
     fn apply_schedule(&mut self, iter: usize) {
-        assert!(iter < usize::MAX);
+        let _iter_unused = iter;
     }
 }
 

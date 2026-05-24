@@ -732,6 +732,13 @@ fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
         ("debug_assert!(", "debug_assert!", false),
         ("debug_assert_eq!(", "debug_assert_eq!", false),
         ("debug_assert_ne!(", "debug_assert_ne!", false),
+        // `hint::black_box(name)` / `std::hint::black_box(name)` — the
+        // second-round dodge for silencing an unused-value warning after
+        // `let _ = name;` got banned. Benches that need it to prevent
+        // optimization across iterations live under `benches/` and are
+        // exempt via the test mask.
+        ("hint::black_box(", "hint::black_box", true),
+        ("std::hint::black_box(", "std::hint::black_box", true),
         // `file!().ends_with(".rs")` is a tautological assertion (the
         // compile-time `file!()` macro always returns the `.rs` source
         // path) commonly used to satisfy `scan_for_useless_tests` without
