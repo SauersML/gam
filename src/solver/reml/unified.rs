@@ -106,7 +106,7 @@ use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::{Arc, Condvar, Mutex};
 
-use crate::faer_ndarray::{FaerCholesky, FaerEigh};
+use crate::faer_ndarray::FaerEigh;
 use crate::linalg::matrix::DesignMatrix;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2671,6 +2671,260 @@ fn trace_projected_factors_batched(
     out
 }
 
+fn dense_trace_projected_factor(matrix: &Array2<f64>, factor: &Array2<f64>) -> f64 {
+    let matrix_factor = matrix.dot(factor);
+    factor
+        .iter()
+        .zip(matrix_factor.iter())
+        .map(|(&f, &mf)| f * mf)
+        .sum()
+}
+
+fn dense_projected_matrix(matrix: &Array2<f64>, factor: &Array2<f64>) -> Array2<f64> {
+    factor.t().dot(&matrix.dot(factor))
+}
+
+fn collect_projected_trace_terms<'a>(
+    out_idx: usize,
+    weight: f64,
+    op: &'a dyn HyperOperator,
+    factor: &Array2<f64>,
+    dense_acc: &mut [f64],
+    terms: &mut Vec<(usize, f64, &'a dyn HyperOperator)>,
+) {
+    if weight == 0.0 {
+        return;
+    }
+    if let Some(composite) = op.as_composite() {
+        if let Some(dense) = composite.dense.as_ref() {
+            dense_acc[out_idx] += weight * dense_trace_projected_factor(dense, factor);
+        }
+        for inner in &composite.operators {
+            collect_projected_trace_terms(
+                out_idx,
+                weight,
+                inner.as_ref(),
+                factor,
+                dense_acc,
+                terms,
+            );
+        }
+    } else if let Some(weighted) = op.as_weighted() {
+        for (term_weight, inner) in &weighted.terms {
+            collect_projected_trace_terms(
+                out_idx,
+                weight * *term_weight,
+                inner.as_ref(),
+                factor,
+                dense_acc,
+                terms,
+            );
+        }
+    } else {
+        terms.push((out_idx, weight, op));
+    }
+}
+
+fn collect_projected_matrix_terms<'a>(
+    out_idx: usize,
+    weight: f64,
+    op: &'a dyn HyperOperator,
+    factor: &Array2<f64>,
+    dense_acc: &mut [Array2<f64>],
+    terms: &mut Vec<(usize, f64, &'a dyn HyperOperator)>,
+) {
+    if weight == 0.0 {
+        return;
+    }
+    if let Some(composite) = op.as_composite() {
+        if let Some(dense) = composite.dense.as_ref() {
+            dense_acc[out_idx].scaled_add(weight, &dense_projected_matrix(dense, factor));
+        }
+        for inner in &composite.operators {
+            collect_projected_matrix_terms(
+                out_idx,
+                weight,
+                inner.as_ref(),
+                factor,
+                dense_acc,
+                terms,
+            );
+        }
+    } else if let Some(weighted) = op.as_weighted() {
+        for (term_weight, inner) in &weighted.terms {
+            collect_projected_matrix_terms(
+                out_idx,
+                weight * *term_weight,
+                inner.as_ref(),
+                factor,
+                dense_acc,
+                terms,
+            );
+        }
+    } else {
+        terms.push((out_idx, weight, op));
+    }
+}
+
+fn trace_projected_operator_terms_batched(
+    n_out: usize,
+    terms: &[(usize, f64, &dyn HyperOperator)],
+    factor: &Array2<f64>,
+    cache: &ProjectedFactorCache,
+) -> Vec<f64> {
+    let mut out = vec![0.0_f64; n_out];
+    let mut handled = vec![false; terms.len()];
+
+    for i in 0..terms.len() {
+        if handled[i] {
+            continue;
+        }
+        let Some(impl_i) = terms[i].2.as_implicit() else {
+            continue;
+        };
+        let mut group = vec![i];
+        handled[i] = true;
+        for j in (i + 1)..terms.len() {
+            if handled[j] {
+                continue;
+            }
+            if let Some(impl_j) = terms[j].2.as_implicit()
+                && Arc::ptr_eq(&impl_i.implicit_deriv, &impl_j.implicit_deriv)
+                && Arc::ptr_eq(&impl_i.x_design, &impl_j.x_design)
+                && Arc::ptr_eq(&impl_i.w_diag, &impl_j.w_diag)
+                && impl_i.p == impl_j.p
+            {
+                group.push(j);
+                handled[j] = true;
+            }
+        }
+
+        let lead = terms[group[0]].2.as_implicit().unwrap();
+        let xf = lead.cached_xf(factor, cache);
+        let axes: Vec<(usize, &Array2<f64>, Option<&Array1<f64>>)> = group
+            .iter()
+            .map(|&term_idx| {
+                let op = terms[term_idx].2.as_implicit().unwrap();
+                (op.axis, &op.s_psi, op.c_x_psi_beta.as_deref())
+            })
+            .collect();
+        let values = lead.trace_projected_factor_all_axes_with_xf(factor, xf.view(), &axes);
+        for (&term_idx, value) in group.iter().zip(values.iter()) {
+            let (out_idx, weight, _) = terms[term_idx];
+            out[out_idx] += weight * *value;
+        }
+    }
+
+    for (i, (out_idx, weight, op)) in terms.iter().enumerate() {
+        if handled[i] {
+            continue;
+        }
+        out[*out_idx] += *weight * op.trace_projected_factor_cached(factor, cache);
+    }
+
+    out
+}
+
+fn projected_operator_terms_batched(
+    n_out: usize,
+    terms: &[(usize, f64, &dyn HyperOperator)],
+    factor: &Array2<f64>,
+    cache: &ProjectedFactorCache,
+) -> Vec<Array2<f64>> {
+    let rank = factor.ncols();
+    let mut out: Vec<Array2<f64>> = (0..n_out)
+        .map(|_| Array2::<f64>::zeros((rank, rank)))
+        .collect();
+    for (out_idx, weight, op) in terms.iter() {
+        let projected = op.projected_matrix_cached(factor, cache);
+        out[*out_idx].scaled_add(*weight, &projected);
+    }
+    out
+}
+
+fn project_hyper_operators_batched(
+    n_out: usize,
+    terms: &[(usize, f64, &dyn HyperOperator)],
+    factor: &Array2<f64>,
+    cache: &ProjectedFactorCache,
+) -> Vec<Array2<f64>> {
+    projected_operator_terms_batched(n_out, terms, factor, cache)
+}
+
+fn trace_logdet_drifts_projected_factor_batched(
+    drifts: &[DriftDerivResult],
+    factor: &Array2<f64>,
+    cache: &ProjectedFactorCache,
+) -> Vec<f64> {
+    let mut out = vec![0.0_f64; drifts.len()];
+    let mut terms: Vec<(usize, f64, &dyn HyperOperator)> = Vec::new();
+    for (idx, drift) in drifts.iter().enumerate() {
+        match drift {
+            DriftDerivResult::Dense(matrix) => {
+                out[idx] += dense_trace_projected_factor(matrix, factor);
+            }
+            DriftDerivResult::Operator(op) => {
+                collect_projected_trace_terms(idx, 1.0, op.as_ref(), factor, &mut out, &mut terms);
+            }
+        }
+    }
+    let batched = trace_projected_operator_terms_batched(drifts.len(), &terms, factor, cache);
+    for (dst, value) in out.iter_mut().zip(batched) {
+        *dst += value;
+    }
+    out
+}
+
+fn dense_spectral_trace_logdet_drifts_batched(
+    ds: &DenseSpectralOperator,
+    drifts: &[DriftDerivResult],
+) -> Vec<f64> {
+    trace_logdet_drifts_projected_factor_batched(drifts, &ds.g_factor, &ds.projected_factor_cache)
+}
+
+fn penalty_subspace_trace_factor(kernel: &PenaltySubspaceTrace) -> Array2<f64> {
+    let (evals, evecs) = kernel
+        .h_proj_inverse
+        .eigh(faer::Side::Lower)
+        .expect("PenaltySubspaceTrace kernel factor eigendecomposition failed");
+    let r = evals.len();
+    let max_eval = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let floor = f64::EPSILON.sqrt() * (r as f64).max(1.0) * max_eval.max(1.0);
+    let mut root = evecs.clone();
+    for col in 0..r {
+        let scale = evals[col].max(floor).sqrt();
+        for row in 0..r {
+            root[[row, col]] *= scale;
+        }
+    }
+    crate::faer_ndarray::fast_ab(&kernel.u_s, &root)
+}
+
+fn penalty_subspace_trace_drifts_batched(
+    kernel: &PenaltySubspaceTrace,
+    drifts: &[DriftDerivResult],
+) -> Vec<f64> {
+    let factor = penalty_subspace_trace_factor(kernel);
+    let cache = ProjectedFactorCache::default();
+    trace_logdet_drifts_projected_factor_batched(drifts, &factor, &cache)
+}
+
+fn penalty_subspace_reduce_drifts_batched(
+    kernel: &PenaltySubspaceTrace,
+    drifts: &[DriftDerivResult],
+) -> Vec<Array2<f64>> {
+    drifts
+        .iter()
+        .map(|drift| match drift {
+            DriftDerivResult::Dense(matrix) => kernel.reduce(matrix),
+            DriftDerivResult::Operator(op) => {
+                let dense = op.to_dense();
+                kernel.reduce(&dense)
+            }
+        })
+        .collect()
+}
+
 fn dense_spectral_trace_logdet_operators_batched(
     ds: &DenseSpectralOperator,
     operators: &[Arc<dyn HyperOperator>],
@@ -3518,6 +3772,77 @@ impl ImplicitHyperOperator {
         let penalty: f64 = factor.iter().zip(s_f.iter()).map(|(&f, &s)| f * s).sum();
 
         2.0 * design_total + correction_total + penalty
+    }
+
+    /// Batched-axis sibling of [`Self::trace_projected_factor_with_xf`].
+    /// Returns `tr(Fᵀ B_d F)` for every `(axis, s_psi, c_x_psi_beta)` triple
+    /// in `axes`, sharing the unproject-and-row-sweep work across axes that
+    /// only differ in their axis index / penalty matrix / correction vector.
+    fn trace_projected_factor_all_axes_with_xf(
+        &self,
+        factor: &Array2<f64>,
+        xf: ArrayView2<'_, f64>,
+        axes: &[(usize, &Array2<f64>, Option<&Array1<f64>>)],
+    ) -> Vec<f64> {
+        let rank = factor.ncols();
+        let n_obs = self.w_diag.len();
+        debug_assert_eq!(xf.dim(), (n_obs, rank));
+
+        let u_knot = self.implicit_deriv.unproject_matrix(&factor.view());
+
+        const TARGET_BYTES: usize = 8 * 1024 * 1024;
+        let chunk_rows = (TARGET_BYTES / ((self.p + rank).max(1) * 8))
+            .max(512)
+            .min(n_obs.max(1));
+
+        let w = self.w_diag.as_ref();
+        let mut design_totals = vec![0.0_f64; axes.len()];
+        let mut correction_totals = vec![0.0_f64; axes.len()];
+
+        let mut start = 0usize;
+        while start < n_obs {
+            let end = (start + chunk_rows).min(n_obs);
+            let chunk_n = end - start;
+            let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
+
+            for (axis_idx, (axis, _s_psi, c_opt_axis)) in axes.iter().enumerate() {
+                let kd_chunk = self
+                    .implicit_deriv
+                    .row_chunk_first_raw(*axis, start..end)
+                    .expect(
+                        "radial scalar evaluation failed during \
+                         trace_projected_factor_all_axes_with_xf",
+                    );
+                let dxf_chunk = crate::faer_ndarray::fast_ab(&kd_chunk, &u_knot);
+
+                for i_local in 0..chunk_n {
+                    let i = start + i_local;
+                    let w_i = w[i];
+                    let dxf_row = dxf_chunk.row(i_local);
+                    let xf_row = xf_chunk.row(i_local);
+                    for k in 0..rank {
+                        design_totals[axis_idx] += dxf_row[k] * w_i * xf_row[k];
+                    }
+                    if let Some(c) = c_opt_axis {
+                        let c_i = c[i];
+                        for k in 0..rank {
+                            let v = xf_row[k];
+                            correction_totals[axis_idx] += c_i * v * v;
+                        }
+                    }
+                }
+            }
+            start = end;
+        }
+
+        axes.iter()
+            .enumerate()
+            .map(|(idx, (_axis, s_psi, _c_opt_axis))| {
+                let s_f = s_psi.dot(factor);
+                let penalty: f64 = factor.iter().zip(s_f.iter()).map(|(&f, &s)| f * s).sum();
+                2.0 * design_totals[idx] + correction_totals[idx] + penalty
+            })
+            .collect()
     }
 
     fn accumulate_c_correction_xt_into(
@@ -7042,29 +7367,33 @@ pub fn reml_laml_evaluate(
             (rho_v_ks, ext_v_is)
         }
     };
-    let rho_corrections: Vec<Option<DriftDerivResult>> = if effective_deriv.has_corrections() {
+    let coord_corrections: Vec<Option<DriftDerivResult>> = if effective_deriv.has_corrections() {
         let rho_vs = rho_v_ks
             .as_ref()
             .expect("rho mode responses required for Hessian corrections");
+        let mut correction_vs: Vec<Array1<f64>> = Vec::with_capacity(k + ext_dim);
+        correction_vs.extend(rho_vs.iter().cloned());
+        correction_vs.extend(ext_v_is.iter().cloned());
         let correction_work = solution
             .n_observations
             .saturating_mul(hop.dim())
-            .saturating_mul(k.max(1));
+            .saturating_mul((k + ext_dim).max(1));
         let parallel_corrections = correction_work <= 64_000_000;
         if parallel_corrections {
-            rho_vs
+            correction_vs
                 .par_iter()
                 .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
                 .collect::<Result<Vec<_>, _>>()?
         } else {
             log::info!(
-                "[STAGE] reml_laml rho_corrections mode=serial k={} n={} dim={} work={}",
+                "[STAGE] reml_laml coord_corrections mode=serial k={} ext_dim={} n={} dim={} work={}",
                 k,
+                ext_dim,
                 solution.n_observations,
                 hop.dim(),
                 correction_work
             );
-            rho_vs
+            correction_vs
                 .iter()
                 .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
                 .collect::<Result<Vec<_>, _>>()?
@@ -7084,6 +7413,29 @@ pub fn reml_laml_evaluate(
     }
     let rho_corrections = &coord_corrections[..k];
     let ext_corrections = &coord_corrections[k..];
+
+    // Stash the per-coordinate mode-response columns so downstream callers
+    // (notably the cached outer-Hessian path) can reuse `v_k = H⁻¹ a_k` and
+    // `v_i = H⁻¹ g_i` without re-solving.  Each column is one coordinate's
+    // mode response; rho columns are present only when `rho_v_ks` was built.
+    let rho_mode_response_cols: Option<Array2<f64>> = rho_v_ks.as_ref().map(|cols| {
+        let p = hop.dim();
+        let mut out = Array2::<f64>::zeros((p, cols.len()));
+        for (idx, v) in cols.iter().enumerate() {
+            out.column_mut(idx).assign(v);
+        }
+        out
+    });
+    let ext_mode_response_cols: Option<Array2<f64>> = if ext_v_is.is_empty() {
+        None
+    } else {
+        let p = hop.dim();
+        let mut out = Array2::<f64>::zeros((p, ext_v_is.len()));
+        for (idx, v) in ext_v_is.iter().enumerate() {
+            out.column_mut(idx).assign(v);
+        }
+        Some(out)
+    };
 
     // --- Stochastic trace estimation decision ---
     //
