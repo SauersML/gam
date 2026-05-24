@@ -923,9 +923,8 @@ fn run() -> CliResult<()> {
 }
 
 fn blockwise_options_from_fit_args(
-    args: &FitArgs,
+    _args: &FitArgs,
 ) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
-    std::hint::black_box(args);
     let options = gam::families::custom_family::BlockwiseFitOptions::default();
     Ok(options)
 }
@@ -3882,7 +3881,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // useful default and matches user expectation that `gam diagnose` does
     // SOMETHING (a smoke-test for the most common workflow). If/when more
     // diagnostics land, this path can route based on explicit flags.
-    std::hint::black_box(args.alo);
+    // (`args.alo` is intentionally ignored until other diagnostics land.)
 
     progress.set_stage("diagnose", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
@@ -8937,16 +8936,6 @@ fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
         .all(|v| (*v - 0.0).abs() < 1e-12 || (*v - 1.0).abs() < 1e-12)
 }
 
-#[cfg(test)]
-fn chi_square_survival_approx(chi_sq: f64, df: f64) -> Option<f64> {
-    if !chi_sq.is_finite() || !df.is_finite() || chi_sq < 0.0 || df <= 0.0 {
-        return None;
-    }
-    let dist = ChiSquared::new(df).ok()?;
-    let p = 1.0 - dist.cdf(chi_sq);
-    p.is_finite().then_some(p)
-}
-
 fn build_model_summary(
     design: &gam::smooth::TermCollectionDesign,
     spec: &TermCollectionSpec,
@@ -9888,7 +9877,7 @@ mod tests {
         FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, LikelihoodFamily, LinkChoice,
         LinkMode, MODEL_VERSION, ModelKind, ResidualDistribution, SavedFitSummary, SavedModel,
         SurvivalArgs, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
-        build_survival_time_basis, chi_square_survival_approx, classify_cli_error,
+        build_survival_time_basis, classify_cli_error,
         collect_hierarchical_smooth_overlapwarnings, collect_linear_smooth_overlapwarnings,
         collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
         compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
@@ -10015,6 +10004,18 @@ mod tests {
             max_abs_eta: 0.0,
             reml_score: 0.0,
         }
+    }
+
+    use statrs::distribution::ChiSquared;
+
+    fn chi_square_survival_approx(chi_sq: f64, df: f64) -> Option<f64> {
+        use super::ContinuousCDF;
+        if !chi_sq.is_finite() || !df.is_finite() || chi_sq < 0.0 || df <= 0.0 {
+            return None;
+        }
+        let dist = ChiSquared::new(df).ok()?;
+        let p = 1.0 - dist.cdf(chi_sq);
+        p.is_finite().then_some(p)
     }
 
     #[test]
