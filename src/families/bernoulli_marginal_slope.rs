@@ -721,7 +721,7 @@ impl LatentZRankIntCalibration {
         let mut sum_wz = 0.0_f64;
         let mut sum_w = 0.0_f64;
         for (i, &idx) in order.iter().enumerate() {
-            let _ = i;
+            drop(i);
             let zi = z[idx];
             let calibrated = Self::apply_with_knots(zi, &sorted_z, &weighted_cdf);
             sum_wz += weights[idx] * calibrated;
