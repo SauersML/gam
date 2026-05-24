@@ -3,16 +3,30 @@ use gam::basis::{
     OneDimensionalBoundary,
 };
 use gam::estimate::{AdaptiveRegularizationOptions, FitOptions};
-use gam::predict::predict_gam;
+use gam::probability::try_inverse_link_array;
 use gam::smooth::{
     FittedTermCollectionWithSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
     TermCollectionSpec,
 };
-use gam::types::LikelihoodFamily;
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, Normal};
+
+fn gaussian_identity_likelihood() -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(LinkFunction::Identity),
+    )
+}
+
+fn binomial_logit_likelihood() -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::Standard(LinkFunction::Logit),
+    )
+}
 
 fn simulate_duchon_regression(n: usize, d: usize) -> (Array2<f64>, Array1<f64>, Array1<f64>) {
     let mut rng = StdRng::seed_from_u64(20260224);
@@ -87,7 +101,7 @@ fn assert_invalid_pure_duchon_simulated_10d(power: usize, nullspace_order: Ducho
         weights.view(),
         offset.view(),
         &spec,
-        LikelihoodFamily::GaussianIdentity,
+        gaussian_identity_likelihood(),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -168,7 +182,7 @@ fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
         weights.view(),
         offset.view(),
         &spec,
-        LikelihoodFamily::GaussianIdentity,
+        gaussian_identity_likelihood(),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -294,7 +308,7 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
         weights.view(),
         offset.view(),
         &spec,
-        LikelihoodFamily::GaussianIdentity,
+        gaussian_identity_likelihood(),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -358,16 +372,12 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
 
     // Prediction quality: the model should beat the baseline (predicting mean).
     let design = fitted.design.design.to_dense();
-    let pred = predict_gam(
-        design.view(),
-        fitted.fit.beta.view(),
-        offset.view(),
-        LikelihoodFamily::GaussianIdentity,
-    )
-    .expect("prediction on fitted aniso Duchon design should succeed");
-    assert!(pred.mean.iter().all(|v| v.is_finite()));
+    let eta = design.dot(&fitted.fit.beta) + &offset;
+    let pred_mean = try_inverse_link_array(&gaussian_identity_likelihood(), eta.view())
+        .expect("prediction on fitted aniso Duchon design should succeed");
+    assert!(pred_mean.iter().all(|v| v.is_finite()));
 
-    let mse_model = (&pred.mean - &y_true)
+    let mse_model = (&pred_mean - &y_true)
         .mapv(|v| v * v)
         .mean()
         .unwrap_or(f64::INFINITY);
@@ -437,7 +447,7 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
         weights.view(),
         offset.view(),
         &spec,
-        LikelihoodFamily::BinomialLogit,
+        binomial_logit_likelihood(),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
