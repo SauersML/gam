@@ -520,6 +520,11 @@ pub enum LikelihoodFamily {
     RoystonParmar,
 }
 
+#[inline]
+pub fn is_valid_tweedie_power(p: f64) -> bool {
+    p.is_finite() && p > 1.0 && p < 2.0
+}
+
 impl LikelihoodFamily {
     #[inline]
     pub fn link_function(self) -> LinkFunction {
@@ -810,7 +815,12 @@ impl TryFrom<LikelihoodFamily> for GlmLikelihoodFamily {
             LikelihoodFamily::BinomialBetaLogistic => Ok(Self::BinomialBetaLogistic),
             LikelihoodFamily::BinomialMixture => Ok(Self::BinomialMixture),
             LikelihoodFamily::PoissonLog => Ok(Self::PoissonLog),
-            LikelihoodFamily::Tweedie { p } => Ok(Self::Tweedie { p }),
+            LikelihoodFamily::Tweedie { p } if is_valid_tweedie_power(p) => {
+                Ok(Self::Tweedie { p })
+            }
+            LikelihoodFamily::Tweedie { .. } => Err(
+                "Tweedie variance power must be finite and strictly between 1 and 2; use PoissonLog or GammaLog for boundary cases",
+            ),
             LikelihoodFamily::NegativeBinomial { theta } => Ok(Self::NegativeBinomial { theta }),
             LikelihoodFamily::BetaLogit { phi } => Ok(Self::BetaLogit { phi }),
             LikelihoodFamily::GammaLog => Ok(Self::GammaLog),
