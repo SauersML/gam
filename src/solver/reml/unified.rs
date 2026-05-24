@@ -181,20 +181,6 @@ pub mod debug_stash {
         /// matrix is `−X' diag(c · X · v_ψ) X`, so multiplying this by c
         /// (from PIRLS) gives the diagonal entering the correction sandwich.
         pub c_x_v_psi_diag: Option<ndarray::Array1<f64>>,
-        /// Unprojected eigenmode trace Σ φ'(σ_j)·(Uᵀ op U)_jj — i.e. the value
-        /// of tr(K · op_total) using the full-space `G_ε(H)` kernel without
-        /// the penalty-subspace projection. Recorded for tests that need to
-        /// pin the projection-vs-unprojected gap.
-        pub unprojected_tr: Option<f64>,
-        /// The production `trace_logdet_i` value that actually enters the
-        /// outer gradient. Routes through `kernel.trace_projected_logdet`
-        /// when `penalty_subspace_trace` is Some, otherwise through the
-        /// full-space kernel. Recorded so tests can pin
-        /// `unprojected_tr ≠ production_tr` when projection is active.
-        pub production_tr: Option<f64>,
-        /// Whether `penalty_subspace_trace` was Some for this coordinate
-        /// (i.e. the production trace ran through the projected kernel).
-        pub projection_active: Option<bool>,
     }
 
     // Thread-local storage keyed on the THREAD THAT CALLED `reml_laml_evaluate`
@@ -218,9 +204,6 @@ pub mod debug_stash {
         static TERMS: RefCell<TermStash> = const { RefCell::new(TermStash {
             c_x_tau_beta_diag: None,
             c_x_v_psi_diag: None,
-            unprojected_tr: None,
-            production_tr: None,
-            projection_active: None,
         }) };
     }
 
@@ -231,13 +214,6 @@ pub mod debug_stash {
     /// `take_terms()` from the same thread.
     pub fn store_terms(stash: TermStash) {
         TERMS.with(|cell| *cell.borrow_mut() = stash);
-    }
-    /// Consume the calling thread's `TermStash` and return its contents.
-    /// Tests call this after running an evaluation to inspect the
-    /// diagnostic captures (`unprojected_tr`, `production_tr`,
-    /// `c_x_*_diag`, etc.).
-    pub fn take_terms() -> TermStash {
-        TERMS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
     }
 }
 
@@ -3407,13 +3383,13 @@ pub struct ImplicitHyperOperator {
     /// Which axis this operator is for.
     pub axis: usize,
     /// The active-basis design matrix X. This may be lazy / operator-backed.
-    pub x_design: std::sync::Arc<DesignMatrix>,
+    pub(crate) x_design: std::sync::Arc<DesignMatrix>,
     /// Working weights W (diagonal, length n). Shared reference.
-    pub w_diag: std::sync::Arc<Array1<f64>>,
+    pub(crate) w_diag: std::sync::Arc<Array1<f64>>,
     /// Penalty derivative matrix S_{ψ_d} (p × p), dense.
     pub s_psi: Array2<f64>,
     /// Total basis dimension p.
-    pub p: usize,
+    pub(crate) p: usize,
     /// Non-Gaussian fixed-β third-derivative correction: c ⊙ (X_{ψ_d} β̂),
     /// length n. When present, the operator additionally applies
     /// `Xᵀ diag(c_x_psi_beta) X v` so that the full B_d formula
@@ -3993,21 +3969,21 @@ impl ImplicitHyperOperator {
 /// exact first-order τ Hessian drift
 ///   B_τ = X_τᵀ W X + Xᵀ W X_τ + Xᵀ diag(c ⊙ X_τ β̂) X + S_τ − (H_φ)_{τ}|_β
 /// without materializing the full dense matrix up front.
-pub struct SparseDirectionalHyperOperator {
+pub(crate) struct SparseDirectionalHyperOperator {
     /// Original-basis design derivative X_τ.
-    pub x_tau: super::HyperDesignDerivative,
+    pub(crate) x_tau: super::HyperDesignDerivative,
     /// Design matrix X in the sparse-native basis.
-    pub x_design: DesignMatrix,
+    pub(crate) x_design: DesignMatrix,
     /// Working weights W (diagonal).
-    pub w_diag: std::sync::Arc<Array1<f64>>,
+    pub(crate) w_diag: std::sync::Arc<Array1<f64>>,
     /// Penalty derivative S_τ.
-    pub s_tau: Array2<f64>,
+    pub(crate) s_tau: Array2<f64>,
     /// Fixed-β non-Gaussian curvature term c ⊙ (X_τ β̂), if applicable.
-    pub c_x_tau_beta: Option<Array1<f64>>,
+    pub(crate) c_x_tau_beta: Option<Array1<f64>>,
     /// Fixed-β Firth partial Hessian drift (H_φ)_{τ}|_β, if applicable.
-    pub firth_hphi_tau_partial: Option<Array2<f64>>,
+    pub(crate) firth_hphi_tau_partial: Option<Array2<f64>>,
     /// Total coefficient dimension.
-    pub p: usize,
+    pub(crate) p: usize,
 }
 
 impl HyperOperator for SparseDirectionalHyperOperator {
@@ -7818,78 +7794,18 @@ pub fn reml_laml_evaluate(
                 }
             };
 
-            // Eigenmode diagnostic of the trace_logdet path. This captures the unprojected
-            // `Σ φ'(σ_j)·(Uᵀ op_total U)_jj` alongside the production trace
-            // `trace_logdet_i`, so the reader can never mistake one for the
-            // other. For Duchon ψ axes the two values can disagree by orders of
-            // magnitude because the penalty-subspace projection eliminates a
-            // spurious null-space contribution that has no place in the cost
-            // identity. The block runs whenever the Hessian has an exact
-            // dense-spectral view at small p so the stash is populated
-            // regardless of which precomputed-trace path satisfied
-            // `trace_logdet_i` above.
-            if incl_logdet_h
-                && let Some(ds) = hop.as_exact_dense_spectral()
-                && ds.dim() <= 12
-            {
-                let correction = ext_corrections[ext_idx].as_ref();
-                let mut op_dense = Array2::<f64>::zeros((ds.dim(), ds.dim()));
-                let b_drift_again = hyper_coord_total_drift_result(&coord.drift, None, ds.dim());
-                let b_dense = match b_drift_again {
-                    DriftDerivResult::Operator(o) => o.to_dense(),
-                    DriftDerivResult::Dense(m) => m,
-                };
-                op_dense += &b_dense;
-                if let Some(c) = correction {
-                    match c {
-                        DriftDerivResult::Dense(m) => op_dense += m,
-                        DriftDerivResult::Operator(o) => op_dense += &o.to_dense(),
-                    }
-                }
-                // Rotate to eigenbasis: (U^T op U)_jj per eigenmode
-                let p = ds.dim();
-                let mut u_mat = Array2::<f64>::zeros((p, p));
-                for col in 0..p {
-                    for row in 0..p {
-                        u_mat[[row, col]] = ds.eigenvector_entry(row, col);
-                    }
-                }
-                let ut_op = crate::faer_ndarray::fast_atb(&u_mat, &op_dense);
-                let proj = crate::faer_ndarray::fast_ab(&ut_op, &u_mat);
-                let eps_sq = {
-                    let eps_f = (2.22e-16_f64).sqrt() * (p as f64);
-                    4.0 * eps_f * eps_f
-                };
-                let mut unprojected_tr = 0.0_f64;
-                for j in 0..p {
-                    // reg_eigenvalue = r_ε(σ) = ½(σ + √(σ²+4ε²)). Recover σ.
-                    let r = ds.reg_eigenvalue(j);
-                    let sigma = r - eps_sq / (4.0 * r); // r = ½(σ + √(σ²+4ε²)) ⇒ σ = r − ε²/r
-                    let phi_prime = 1.0 / (sigma * sigma + eps_sq).sqrt();
-                    let contrib = phi_prime * proj[[j, j]];
-                    unprojected_tr += contrib;
-                }
-                let projection_active = solution.penalty_subspace_trace.is_some();
-                if ext_idx == 0 {
-                    let mut stash = debug_stash::TermStash {
-                        unprojected_tr: Some(unprojected_tr),
-                        production_tr: Some(trace_logdet_i),
-                        projection_active: Some(projection_active),
-                        ..Default::default()
-                    };
-                    if let Some(op_arc) = coord.drift.operator.as_ref()
-                        && let Some(sd) = op_arc.as_sparse_directional()
-                    {
-                        // Stash term4's diagonal `c · X_τβ̂` directly,
-                        // plus `X · v_ψ` per row where
-                        // v_ψ = ext_v_is[ext_idx] = hop⁻¹·coord.g. The
-                        // diagonal entering the correction sandwich is
-                        // `c · X · v_ψ`; multiplying by the test's known
-                        // c recovers that diagonal.
-                        stash.c_x_tau_beta_diag = sd.c_x_tau_beta.clone();
-                        let v_i = &ext_v_is[ext_idx];
-                        stash.c_x_v_psi_diag = Some(sd.x_design.matrixvectormultiply(v_i));
-                    }
+            // Per-row diagnostic stash: captures term4's `c · X_τβ̂` diagonal
+            // plus `X · v_ψ` per row, where v_ψ = ext_v_is[ext_idx] = hop⁻¹·coord.g.
+            // The diagonal entering the correction sandwich is `c · X · v_ψ`;
+            // multiplying by the test's known c recovers that diagonal.
+            if incl_logdet_h && ext_idx == 0 {
+                if let Some(op_arc) = coord.drift.operator.as_ref()
+                    && let Some(sd) = op_arc.as_sparse_directional()
+                {
+                    let mut stash = debug_stash::TermStash::default();
+                    stash.c_x_tau_beta_diag = sd.c_x_tau_beta.clone();
+                    let v_i = &ext_v_is[ext_idx];
+                    stash.c_x_v_psi_diag = Some(sd.x_design.matrixvectormultiply(v_i));
                     // Hand the stash back through the per-call sink. The
                     // calling thread copies it into its own thread-local
                     // after the par_iter completes, so concurrent tests

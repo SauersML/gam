@@ -1025,16 +1025,16 @@ fn assert_rho_matches_specs(rho: &Array1<f64>, specs: &[ParameterBlockSpec], con
     );
 }
 
-fn assert_workspace_arc(
+fn validate_hessian_workspace_ready(
     hessian_workspace: &Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     context: &str,
-) {
+) -> Result<(), String> {
     if let Some(workspace) = hessian_workspace.as_ref() {
-        assert!(
-            Arc::strong_count(workspace) > 0,
-            "{context}: workspace Arc invariant violated"
-        );
+        workspace
+            .warm_up_outer_caches()
+            .map_err(|err| format!("{context}: failed to warm Hessian workspace caches: {err}"))?;
     }
+    Ok(())
 }
 
 pub fn exact_outer_order_from_capability(
@@ -2002,7 +2002,7 @@ pub trait CustomFamily {
         );
         assert_rho_matches_specs(rho, specs, "batched outer gradient terms");
         assert_valid_options(options, "batched outer gradient terms");
-        assert_workspace_arc(&hessian_workspace, "batched outer gradient terms");
+        validate_hessian_workspace_ready(&hessian_workspace, "batched outer gradient terms")?;
         Ok(None)
     }
 
@@ -2031,7 +2031,7 @@ pub trait CustomFamily {
             "batched outer Hessian terms",
         );
         assert_rho_matches_specs(rho, specs, "batched outer Hessian terms");
-        assert_workspace_arc(&hessian_workspace, "batched outer Hessian terms");
+        validate_hessian_workspace_ready(&hessian_workspace, "batched outer Hessian terms")?;
         Ok(self
             .outer_hyper_hessian_operator(specs)
             .map(|operator| BatchedOuterHessianTerms {
