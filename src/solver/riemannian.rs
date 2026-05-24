@@ -65,6 +65,8 @@ pub const SPHERE_POLE_WARN_THRESHOLD: f64 = 1.0e-8;
 /// [`Manifold::warn_at`] string accessor remains available for ad-hoc logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifoldWarning {
+    /// Point dimensionality does not match the manifold embedding dimension.
+    InvalidPointDimension,
     /// Point sits close to a chart pole on a sphere; retraction may amplify
     /// numerical error in the canonical chart.
     SphereNearPole,
@@ -77,6 +79,9 @@ impl ManifoldWarning {
     /// Stable string representation (for ad-hoc logging).
     pub const fn as_str(self) -> &'static str {
         match self {
+            ManifoldWarning::InvalidPointDimension => {
+                "manifold: point dimension does not match ambient dimension"
+            }
             ManifoldWarning::SphereNearPole => {
                 "sphere: near chart pole, retraction may amplify error"
             }
@@ -90,11 +95,7 @@ impl ManifoldWarning {
 fn no_manifold_warning(p: ArrayView1<'_, f64>, ambient_dim: usize) -> Option<ManifoldWarning> {
     match p.len().cmp(&ambient_dim) {
         std::cmp::Ordering::Equal => None,
-        _ => panic!(
-            "manifold warning point dimension {} does not match ambient dimension {}",
-            p.len(),
-            ambient_dim
-        ),
+        _ => Some(ManifoldWarning::InvalidPointDimension),
     }
 }
 

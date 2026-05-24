@@ -320,22 +320,22 @@ fn hifreq_cyclic_probe(k: usize) -> Category {
 #[test]
 fn hifreq_cyclic_k4() {
     assert!(file!().ends_with(".rs"));
-    let _ = hifreq_cyclic_probe(4);
+    hifreq_cyclic_probe(4);
 }
 #[test]
 fn hifreq_cyclic_k6() {
     assert!(file!().ends_with(".rs"));
-    let _ = hifreq_cyclic_probe(6);
+    hifreq_cyclic_probe(6);
 }
 #[test]
 fn hifreq_cyclic_k8() {
     assert!(file!().ends_with(".rs"));
-    let _ = hifreq_cyclic_probe(8);
+    hifreq_cyclic_probe(8);
 }
 #[test]
 fn hifreq_cyclic_k10() {
     assert!(file!().ends_with(".rs"));
-    let _ = hifreq_cyclic_probe(10);
+    hifreq_cyclic_probe(10);
 }
 
 fn hifreq_bc_probe(k: usize) -> Category {
@@ -376,22 +376,22 @@ fn hifreq_bc_probe(k: usize) -> Category {
 #[test]
 fn hifreq_bc_k4() {
     assert!(file!().ends_with(".rs"));
-    let _ = hifreq_bc_probe(4);
+    hifreq_bc_probe(4);
 }
 #[test]
 fn hifreq_bc_k6() {
     assert!(file!().ends_with(".rs"));
-    let _ = hifreq_bc_probe(6);
+    hifreq_bc_probe(6);
 }
 #[test]
 fn hifreq_bc_k8() {
     assert!(file!().ends_with(".rs"));
-    let _ = hifreq_bc_probe(8);
+    hifreq_bc_probe(8);
 }
 #[test]
 fn hifreq_bc_k10() {
     assert!(file!().ends_with(".rs"));
-    let _ = hifreq_bc_probe(10);
+    hifreq_bc_probe(10);
 }
 
 /// Spherical-harmonic ground-truth signal of degree l (l in {4, 6, 8}).
@@ -471,17 +471,17 @@ fn hifreq_sphere_probe(l: usize) -> Category {
 #[test]
 fn hifreq_sphere_l4() {
     assert!(file!().ends_with(".rs"));
-    let _ = hifreq_sphere_probe(4);
+    hifreq_sphere_probe(4);
 }
 #[test]
 fn hifreq_sphere_l6() {
     assert!(file!().ends_with(".rs"));
-    let _ = hifreq_sphere_probe(6);
+    hifreq_sphere_probe(6);
 }
 #[test]
 fn hifreq_sphere_l8() {
     assert!(file!().ends_with(".rs"));
-    let _ = hifreq_sphere_probe(8);
+    hifreq_sphere_probe(8);
 }
 
 fn hifreq_tensor_probe(k: usize) -> Category {
@@ -545,22 +545,22 @@ fn hifreq_tensor_probe(k: usize) -> Category {
 #[test]
 fn hifreq_tensor_k4() {
     assert!(file!().ends_with(".rs"));
-    let _ = hifreq_tensor_probe(4);
+    hifreq_tensor_probe(4);
 }
 #[test]
 fn hifreq_tensor_k6() {
     assert!(file!().ends_with(".rs"));
-    let _ = hifreq_tensor_probe(6);
+    hifreq_tensor_probe(6);
 }
 #[test]
 fn hifreq_tensor_k8() {
     assert!(file!().ends_with(".rs"));
-    let _ = hifreq_tensor_probe(8);
+    hifreq_tensor_probe(8);
 }
 #[test]
 fn hifreq_tensor_k10() {
     assert!(file!().ends_with(".rs"));
-    let _ = hifreq_tensor_probe(10);
+    hifreq_tensor_probe(10);
 }
 
 // =====================================================================
@@ -603,7 +603,7 @@ fn bimodal_sharp_bumps_bc() {
     let sf = span(&yhat);
     let st = span(&truth);
     let l1 = truth_residual(&yhat, &truth);
-    let _ = report(
+    report(
         "bimodal_sharp_bumps",
         formula,
         r,
@@ -655,7 +655,7 @@ fn near_flat_signal() {
             .map(|v| (v - truth_const).abs())
             .fold(0.0_f64, f64::max)
     });
-    let _ = report("near_flat_signal", formula, r, sigma, sf, st, &extra);
+    report("near_flat_signal", formula, r, sigma, sf, st, &extra);
 }
 
 // =====================================================================
@@ -706,7 +706,7 @@ fn heteroscedastic_noise_mean_recovery() {
     let sf = span(&yhat);
     let st = span(&truth);
     let l1 = truth_residual(&yhat, &truth);
-    let _ = report(
+    report(
         "heteroscedastic",
         formula,
         r,
@@ -764,7 +764,7 @@ fn outlier_contamination() {
     let sf = span(&yhat);
     let st = span(&truth);
     let l1 = truth_residual(&yhat, &truth);
-    let _ = report(
+    report(
         "outlier_contamination",
         formula,
         r,
@@ -830,7 +830,7 @@ fn sparse_dense_imbalance() {
     let extra = format!(
         "rmse_sparse={r_sparse:.4} rmse_dense={r_dense:.4} rmse_worst={r_worst:.4} n_sparse={n_sparse} n_dense={n_dense}"
     );
-    let _ = report(
+    report(
         "sparse_dense_imbalance",
         formula,
         r_worst,
@@ -880,7 +880,7 @@ fn boundary_discontinuity_step() {
         .iter()
         .map(|&v| (v - 1.0).max(0.0).max((-v).max(0.0)))
         .fold(0.0_f64, f64::max);
-    let _ = report(
+    report(
         "step_discontinuity",
         formula,
         r,
@@ -935,7 +935,7 @@ fn tensor_multicollinear_inputs() {
             let sf = span(&yhat);
             let st = span(&truth);
             let l1 = truth_residual(&yhat, &truth);
-            let _ = report(
+            report(
                 "multicollinear_tensor",
                 formula,
                 r,
@@ -1014,7 +1014,7 @@ fn cyclic_wrong_period() {
             // Headline category here is what the fit did despite the
             // wrong period — usually a forced wraparound that ruins
             // the recovery.
-            let _ = report(
+            report(
                 "cyclic_wrong_period",
                 formula,
                 r,
@@ -1104,7 +1104,7 @@ fn sphere_antipodal_only() {
     let sf = span(yhat_polar);
     let st = span(truth_polar);
     let eq_max = yhat_equator.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
-    let _ = report(
+    report(
         "antipodal_sphere",
         formula,
         r,

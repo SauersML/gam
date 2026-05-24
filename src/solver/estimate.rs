@@ -22,7 +22,7 @@
 //! This two-tiered structure allows the model to learn the appropriate complexity for
 //! each smooth term directly from the data.
 
-use self::reml::{DirectionalHyperParam, RemlState};
+use crate::solver::estimate::reml::{DirectionalHyperParam, RemlState};
 // BlockwiseFitResult and SurvivalLocationScaleFitResult are now type aliases
 // for UnifiedFitResult, defined in their respective modules.
 use std::fmt;
@@ -2179,8 +2179,10 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         let fingerprint = registry
             .map(crate::solver::estimate::reml::runtime::analytic_penalty_registry_fingerprint)
             .unwrap_or(0);
-        self.reml_state
-            .set_analytic_penalty_registry_fingerprint(fingerprint);
+        crate::solver::estimate::reml::RemlState::set_analytic_penalty_registry_fingerprint(
+            &mut self.reml_state,
+            fingerprint,
+        );
     }
 
     pub(crate) fn set_persistent_latent_values_fingerprint(
@@ -2189,8 +2191,10 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     ) {
         let fingerprint =
             crate::solver::estimate::reml::runtime::latent_id_mode_cache_fingerprint(id_mode);
-        self.reml_state
-            .set_persistent_latent_values_fingerprint(fingerprint);
+        crate::solver::estimate::reml::RemlState::set_persistent_latent_values_fingerprint(
+            &mut self.reml_state,
+            fingerprint,
+        );
     }
 
     pub(crate) fn load_persistent_latent_values(
@@ -2198,12 +2202,18 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         n_obs: usize,
         latent_dim: usize,
     ) -> Option<Array2<f64>> {
-        self.reml_state
-            .load_persistent_latent_values(n_obs, latent_dim)
+        crate::solver::estimate::reml::RemlState::load_persistent_latent_values(
+            &self.reml_state,
+            n_obs,
+            latent_dim,
+        )
     }
 
     pub(crate) fn store_persistent_latent_values(&self, values: &Array2<f64>) {
-        self.reml_state.store_persistent_latent_values(values);
+        crate::solver::estimate::reml::RemlState::store_persistent_latent_values(
+            &self.reml_state,
+            values,
+        );
     }
 
     fn prepare_eval_state(
@@ -2281,7 +2291,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             }
         }
 
-        self.reml_state.reset_surface(
+        crate::solver::estimate::reml::RemlState::reset_surface(
+            &mut self.reml_state,
             x_fit,
             Arc::new(canonical),
             p,
@@ -2367,8 +2378,13 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             context,
             design_revision,
         )?;
-        self.reml_state
-            .compute_joint_hyper_eval_with_order(theta, rho_dim, &hyper_dirs, order)
+        crate::solver::estimate::reml::RemlState::compute_joint_hyper_eval_with_order(
+            &self.reml_state,
+            theta,
+            rho_dim,
+            &hyper_dirs,
+            order,
+        )
     }
 
     pub(crate) fn evaluate_efs(
@@ -2446,7 +2462,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
 
         // Cost-only paths do not introduce design drift via hyper_dirs, so
         // the directional-hyper-support check is unnecessary here.
-        self.reml_state.reset_surface(
+        crate::solver::estimate::reml::RemlState::reset_surface(
+            &mut self.reml_state,
             x_fit,
             Arc::new(canonical),
             p,
