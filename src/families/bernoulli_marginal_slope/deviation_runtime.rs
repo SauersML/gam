@@ -813,7 +813,7 @@ impl DeviationRuntime {
             }
             .into());
         }
-        Ok(())
+        Ok::<(), _>(())
     }
 
     /// Raw cubic-span polynomial design evaluation, without any

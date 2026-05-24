@@ -17360,9 +17360,9 @@ mod tests {
     fn projected_factor_cache_zero_budget_disables_eviction() {
         let cache = ProjectedFactorCache::with_budget(0);
         for seed in 0..16 {
-            drop(cache.get_or_insert_with(make_factor_key(seed), || {
+            cache.get_or_insert_with(make_factor_key(seed), || {
                 Array2::from_elem((8, 8), seed as f64)
-            }));
+            });
         }
         assert_eq!(cache.len(), 16);
     }

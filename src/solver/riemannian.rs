@@ -560,7 +560,7 @@ impl Manifold for Sphere {
         {
             return Some(ManifoldWarning::SphereNearPole);
         }
-        None
+        no_manifold_warning(p.len() == self.ambient_dim())
     }
     fn name(&self) -> &str {
         "Sphere"

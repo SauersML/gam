@@ -805,7 +805,7 @@ fn validate_firth_support(family: NutsFamily, firth_enabled: bool) -> Result<(),
             ),
         });
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 #[inline]
@@ -822,7 +822,7 @@ fn validate_firth_likelihood_support(
             ),
         });
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 #[inline]

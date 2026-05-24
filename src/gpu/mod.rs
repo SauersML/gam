@@ -190,58 +190,10 @@ pub fn log_backend_inventory_once() {
     static LOGGED: OnceLock<()> = OnceLock::new();
     LOGGED.get_or_init(|| {
         log::debug!(
-            "[GPU backend] policy={} compiled_backends=none kernels=dense-matvec,dense-transpose-matvec,dense-xtwx,candidate-screen,dense-solve,matrix-free-pcg,sparse-assembly,spatial-kernel-operator,marginal-slope-rows,reml-trace,final-inference",
+            "[GPU backend] policy={} compiled_backends=cuda-dynamic kernels=dense-matvec,dense-transpose-matvec,dense-xtwx,candidate-screen,dense-solve,matrix-free-pcg,sparse-assembly,spatial-kernel-operator,marginal-slope-rows,reml-trace,final-inference",
             global_policy().as_str()
         );
     });
-}
-
-/// Operation kind passed through dispatch & profiling — CPU-only build
-/// uses this purely as a label.
-#[derive(Clone, Copy, Debug)]
-pub enum GpuOperation {
-    Gemm { m: usize, n: usize, k: usize },
-    Gemv { m: usize, k: usize },
-    XtDiagX { n: usize, p: usize },
-    XtDiagY { n: usize, px: usize, q: usize },
-}
-
-/// Decide whether a generic dense kernel should be routed to the device.
-///
-/// Today this returns `GpuDispatch::UseCpu` whenever the GPU layer cannot
-/// admit the workload (no device probed, kernel below threshold, cuda
-/// feature not compiled). When a device backend is wired into
-/// `gpu::blas`, the result variant carries the device output instead, and
-/// callers that consume `GpuDispatch::UseDevice` automatically take
-/// the GPU path with no further changes.
-#[inline]
-pub fn try_dispatch_dense(op: GpuOperation) -> crate::solver::gpu::GpuDispatch {
-    // Probe the auto-dispatch policy so the kernel-level decision matches
-    // the per-call auto-dispatch in `crate::faer_ndarray::fast_*`. Today
-    // there is no compiled backend, so we still return `Cpu` and the
-    // matrix-typed entry points return `None`; the architecture is in
-    // place to swap in cudarc kernels behind runtime GPU probing
-    // and have every caller pick them up automatically.
-    let dispatch_op = match op {
-        GpuOperation::Gemm { m, n, k } => linalg::DispatchOp::Gemm { m, n, k },
-        GpuOperation::Gemv { m, k } => linalg::DispatchOp::Gemv { m, k },
-        GpuOperation::XtDiagX { n, p } => linalg::DispatchOp::XtDiagX { n, p },
-        GpuOperation::XtDiagY { n, px, q } => linalg::DispatchOp::XtDiagY { n, px, q },
-    };
-    let admitted_by_gpu_policy = linalg::route_through_gpu(dispatch_op).is_some();
-    if admitted_by_gpu_policy {
-        log::trace!(
-            "GPU dispatch policy admitted {}, but no erased result is available",
-            op_label(op)
-        );
-    }
-    crate::solver::gpu::GpuDispatch::UseCpu {
-        reason: format!(
-            "dense {} admitted_by_policy={} has no erased device result in this dispatch layer",
-            op_label(op),
-            admitted_by_gpu_policy
-        ),
-    }
 }
 
 #[inline]
@@ -301,105 +253,6 @@ pub fn try_solve_upper_triangular_matrix(
 ) -> Option<ndarray::Array2<f64>> {
     linalg::try_solve_upper_triangular_matrix(upper, rhs)
 }
-#[inline]
-pub fn try_syevd_inplace(a: &mut ndarray::Array2<f64>) -> Option<ndarray::Array1<f64>> {
-    let (rows, cols) = a.dim();
-    if rows == 0 || rows != cols {
-        return None;
-    }
-    None
-}
-#[inline]
-pub fn record_cpu_kernel(op: GpuOperation, elapsed: std::time::Duration) {
-    let (name, n, p, k, flops_est) = op_profile(op);
-    profile::record(profile::KernelStat {
-        name,
-        n,
-        p,
-        k,
-        nnz: 0,
-        flops_est,
-        bytes_est: 0,
-        cpu_ms: elapsed.as_secs_f64() * 1_000.0,
-        gpu_ms: None,
-    });
-}
-#[inline]
-pub fn record_cpu_fallback(
-    name: &str,
-    kind: profile::OperationKind,
-    n: usize,
-    p: usize,
-    q: usize,
-    flops: usize,
-) {
-    let profile_name = operation_kind_name(kind);
-    if name != profile_name {
-        log::trace!("CPU fallback {name} recorded as {profile_name}");
-    }
-    profile::record(profile::KernelStat {
-        name: profile_name,
-        n,
-        p,
-        k: q,
-        nnz: 0,
-        flops_est: flops,
-        bytes_est: 0,
-        cpu_ms: 0.0,
-        gpu_ms: None,
-    });
-}
-
-#[inline]
-const fn op_label(op: GpuOperation) -> &'static str {
-    match op {
-        GpuOperation::Gemm { .. } => "gemm",
-        GpuOperation::Gemv { .. } => "gemv",
-        GpuOperation::XtDiagX { .. } => "xt_diag_x",
-        GpuOperation::XtDiagY { .. } => "xt_diag_y",
-    }
-}
-
-#[inline]
-const fn op_profile(op: GpuOperation) -> (&'static str, usize, usize, usize, usize) {
-    match op {
-        GpuOperation::Gemm { m, n, k } => (
-            "gemm",
-            m,
-            n,
-            k,
-            m.saturating_mul(n).saturating_mul(k).saturating_mul(2),
-        ),
-        GpuOperation::Gemv { m, k } => ("gemv", m, k, 1, m.saturating_mul(k).saturating_mul(2)),
-        GpuOperation::XtDiagX { n, p } => (
-            "xt_diag_x",
-            n,
-            p,
-            p,
-            n.saturating_mul(p).saturating_mul(p).saturating_mul(2),
-        ),
-        GpuOperation::XtDiagY { n, px, q } => (
-            "xt_diag_y",
-            n,
-            px,
-            q,
-            n.saturating_mul(px).saturating_mul(q).saturating_mul(2),
-        ),
-    }
-}
-
-#[inline]
-const fn operation_kind_name(kind: profile::OperationKind) -> &'static str {
-    match kind {
-        profile::OperationKind::Gemv => "gemv",
-        profile::OperationKind::GemvTranspose => "gemv_transpose",
-        profile::OperationKind::JointHessian => "joint_hessian",
-        profile::OperationKind::JointHessian2x2 => "joint_hessian_2x2",
-        profile::OperationKind::XtDiagX => "xt_diag_x",
-        profile::OperationKind::XtDiagY => "xt_diag_y",
-    }
-}
-
 #[cfg(test)]
 mod policy_tests {
     use super::*;

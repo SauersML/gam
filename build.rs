@@ -2985,12 +2985,7 @@ const HISTORY_LEDGER_FILENAME: &str = "ban_history.txt";
 /// production code, once removed, must be replaced by a substantive body —
 /// not silently downgraded to `Ok(())` / a generic `Err(...)` stub that
 /// returns success on the previously-rejected input.
-const HISTORY_MARKERS: &[&str] = &[
-    "unimplemented!(",
-    "todo!(",
-    "unreachable!(",
-    "panic!(",
-];
+const HISTORY_MARKERS: &[&str] = &["unimplemented!(", "todo!(", "unreachable!(", "panic!("];
 
 /// Macros that, if present anywhere in a function body, mean the body is
 /// "still a panic" — even if the original marker was syntactically removed.
@@ -3928,12 +3923,18 @@ fn body_is_trivial_sentinel(body: &str) -> bool {
     // parameters. The real body still has to be a trivial sentinel for
     // the whole function to count as a stub — legitimate validation
     // followed by real logic survives because the tail won't match the
-    // sentinel list. This catches the hack documented in the bypass
-    // ledger: rename `_param: T` to `param: T`, add a single
-    // `assert!(param.<predicate>())` (and optionally a one-line
-    // empty-input early return), then return `None` / `Ok(())`. With
-    // `debug_assert*!` already banned, `assert!` is the next-cheapest
-    // fake-use shape and must be stripped here.
+    // sentinel list. Each iteration of `strip_validation_prologue`
+    // tries, in order: any of the four `assert*!` / `assert_matches!`
+    // macros (paren/bracket/brace delimited); a single-statement
+    // `if <cond> { return <expr>; }` early-return guard;
+    // `drop(<expr>);`; a `_ = <expr>;` wildcard-assignment statement
+    // (the non-`let` form `scan_for_let_underscore` cannot see);
+    // and a terminator-method expression statement ending in
+    // `.unwrap()`, `.unwrap_or_default()`, or `.expect(...)`. Together
+    // these cover the documented bypass shapes the underscore-fn-arg
+    // ban produced in the wild — workers renaming `_param: T` to
+    // `param: T` and adding a single fake-use line to satisfy the
+    // scanner.
     let after_prologue = strip_validation_prologue(body);
     let mut s = after_prologue.trim();
     if let Some(stripped) = s.strip_suffix(';') {
@@ -4157,7 +4158,22 @@ fn strip_leading_drop_call(s: &str) -> Option<&str> {
 /// scanner because there is no `let`. The expression body is consumed
 /// up to the next top-level `;`.
 fn strip_leading_wildcard_assignment(s: &str) -> Option<&str> {
-    let rest = s.strip_prefix("_ ")?.strip_prefix('=')?;
+    let after_underscore = s.strip_prefix('_')?;
+    // Reject identifier continuations (`_x`, `_1`, `__`): those are
+    // ordinary identifiers, not the wildcard pattern.
+    if after_underscore
+        .as_bytes()
+        .first()
+        .is_some_and(|b| is_ident_byte(*b))
+    {
+        return None;
+    }
+    let rest = after_underscore.trim_start().strip_prefix('=')?;
+    // Reject `_ == ...` (comparison) — only the single-`=` assignment
+    // form is the wildcard discard.
+    if rest.as_bytes().first() == Some(&b'=') {
+        return None;
+    }
     let rest = rest.trim_start();
     let bytes = rest.as_bytes();
     let mut paren: i32 = 0;
@@ -4219,6 +4235,30 @@ fn strip_leading_terminator_method(s: &str) -> Option<&str> {
         i += 1;
     }
     None
+}
+
+/// Count semicolons in `s` that are at brace/paren/bracket depth zero.
+/// Used by the if-return stripper to enforce "the gated block is a
+/// single statement" — a block containing more than one top-level `;`
+/// could be doing real work and must not be stripped as fake validation.
+fn count_top_level_semicolons(s: &str) -> usize {
+    let mut paren: i32 = 0;
+    let mut brack: i32 = 0;
+    let mut brace: i32 = 0;
+    let mut count = 0usize;
+    for &b in s.as_bytes() {
+        match b {
+            b'(' => paren += 1,
+            b')' => paren -= 1,
+            b'[' => brack += 1,
+            b']' => brack -= 1,
+            b'{' => brace += 1,
+            b'}' => brace -= 1,
+            b';' if paren == 0 && brack == 0 && brace == 0 => count += 1,
+            _ => {}
+        }
+    }
+    count
 }
 
 /// True when `segment` syntactically ends with a method call whose
@@ -4569,12 +4609,7 @@ fn scan_for_src_items_used_only_by_tests(
                 // `dead_code` lint cannot see this in a library-shaped
                 // crate. Routed through the dedicated section so the
                 // report is distinct from the test-only finding.
-                unreferenced_pub_scoped.push((
-                    sf.rel.clone(),
-                    line_idx + 1,
-                    ident.clone(),
-                    raw,
-                ));
+                unreferenced_pub_scoped.push((sf.rel.clone(), line_idx + 1, ident.clone(), raw));
             }
             (None, _) => {
                 // Private with zero consumers — rustc's `dead_code`

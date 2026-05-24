@@ -52,7 +52,7 @@ impl RiemannianManifold for GrassmannManifold {
     }
 
     fn tangent_basis(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
-        let y = from_flat(point, self.n, self.k)?;
+        from_flat(point, self.n, self.k).map(|_| ())?;
         let mut columns: Vec<Array1<f64>> = Vec::with_capacity(self.dim());
         for col in 0..self.k {
             for row in 0..self.n {
@@ -75,12 +75,10 @@ impl RiemannianManifold for GrassmannManifold {
                             out[[i, j]] = columns[j][i];
                         }
                     }
-                    drop(y);
                     return Ok(out);
                 }
             }
         }
-        drop(y);
         Ok(Array2::<f64>::zeros((self.ambient_dim(), columns.len())))
     }
 

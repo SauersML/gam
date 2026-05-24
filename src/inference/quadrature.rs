@@ -280,7 +280,7 @@ pub(crate) fn validate_latent_cloglog_inputs(eta: f64, sigma: f64) -> Result<(),
             "latent cloglog jet requires finite eta and sigma >= 0, got eta={eta}, sigma={sigma}"
         )));
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 /// Typed integrated moments/derivative jet used by solver integration paths.

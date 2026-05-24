@@ -240,7 +240,11 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, GpuErr
     let c_host = stream
         .clone_dtoh(&c_dev)
         .map_err(|e| driver_err(format!("d2h C result: {e}")))?;
-    drop(c_host);
+    if c_host.iter().any(|value| !value.is_finite()) {
+        return Err(driver_err(
+            "d2h C result contained a non-finite calibration value".to_string(),
+        ));
+    }
     stream
         .synchronize()
         .map_err(|e| driver_err(format!("d2h C result sync: {e}")))?;
