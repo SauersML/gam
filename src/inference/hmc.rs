@@ -5390,14 +5390,17 @@ impl JointBetaRhoPosterior {
         // exact-equality cache eliminates the dominant SVD/eigendecomp
         // cost in `PenaltyPseudologdet::from_penalties` across leapfrog
         // half-steps.
-        let (log_det_s, logdet_grad) = if self.penalty_canonical.is_empty() {
-            (0.0, Array1::zeros(n_rho))
+        let log_det_s = if self.penalty_canonical.is_empty() {
+            0.0
         } else {
             let rho_hash = Self::hash_rho(rho);
             let cached = self.penalty_logdet_cache.lock().ok().and_then(|guard| {
                 guard.as_ref().and_then(|(h, v, g)| {
                     if *h == rho_hash && g.len() == n_rho {
-                        Some((*v, g.clone()))
+                        for k in 0..n_rho {
+                            grad_rho[k] += 0.5 * g[k];
+                        }
+                        Some(*v)
                     } else {
                         None
                     }
@@ -5421,7 +5424,10 @@ impl JointBetaRhoPosterior {
                         if let Ok(mut guard) = self.penalty_logdet_cache.lock() {
                             *guard = Some((rho_hash, value, det1.clone()));
                         }
-                        (value, det1)
+                        for k in 0..n_rho {
+                            grad_rho[k] += 0.5 * det1[k];
+                        }
+                        value
                     }
                     Err(err) => {
                         log::warn!(
@@ -5434,10 +5440,6 @@ impl JointBetaRhoPosterior {
                 }
             }
         };
-
-        for k in 0..n_rho {
-            grad_rho[k] += 0.5 * logdet_grad[k];
-        }
 
         // ---- Prior on ρ ----
         let mut rho_prior = 0.0;
