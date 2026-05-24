@@ -241,18 +241,13 @@ impl LatentBasisKind {
     }
 }
 
-pub(crate) fn pca_center_mean_fingerprint(centered: bool, center_mean: Option<&Array1<f64>>) -> Option<u64> {
-    if !centered {
-        return None;
+pub(crate) fn pca_center_mean_fingerprint(mean: &Array1<f64>) -> u64 {
+    let mut hasher = StableHasher::new();
+    hasher.write_usize(mean.len());
+    for &value in mean.iter() {
+        hasher.write_f64(value);
     }
-    center_mean.map(|mean| {
-        let mut hasher = StableHasher::new();
-        hasher.write_usize(mean.len());
-        for &value in mean.iter() {
-            hasher.write_f64(value);
-        }
-        hasher.finish_u64()
-    })
+    hasher.finish_u64()
 }
 
 fn matern_nu_signature(nu: MaternNu) -> usize {

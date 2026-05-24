@@ -62,6 +62,7 @@
 //!
 //! `IsometryToReference` is deferred to a follow-up (see proposal §4(b)).
 
+use crate::terms::basis::{BasisError, RadialScalarKind};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -380,16 +381,28 @@ impl LatentManifold {
         debug_assert_eq!(t.len(), xi.len());
         debug_assert_eq!(eh.nrows(), t.len());
         debug_assert_eq!(eh.ncols(), t.len());
+        let eh_xi = matvec(eh, xi.clone());
+        self.euclidean_hessian_action_to_riemannian(t, eg, xi, eh_xi.view())
+    }
+
+    fn euclidean_hessian_action_to_riemannian(
+        &self,
+        t: ArrayView1<'_, f64>,
+        eg: ArrayView1<'_, f64>,
+        xi: ArrayView1<'_, f64>,
+        eh_xi: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        debug_assert_eq!(t.len(), eg.len());
+        debug_assert_eq!(t.len(), xi.len());
+        debug_assert_eq!(t.len(), eh_xi.len());
         match self {
             Self::Euclidean | Self::Circle | Self::Interval { .. } => {
-                let eh_xi = matvec(eh, xi);
-                self.project_to_tangent(t, eh_xi.view())
+                self.project_to_tangent(t, eh_xi)
             }
             Self::Sphere { dim } => {
                 debug_assert_eq!(t.len(), *dim);
                 let grad_r = self.project_to_tangent(t.clone(), eg.clone());
-                let eh_xi = matvec(eh, xi.clone());
-                let mut ambient = self.project_to_tangent(t.clone(), eh_xi.view());
+                let mut ambient = self.project_to_tangent(t.clone(), eh_xi);
                 let eg_normal = dot_views(eg, t.clone());
                 let normal_curve = dot_views(grad_r.view(), xi.clone());
                 for a in 0..*dim {
@@ -403,12 +416,11 @@ impl LatentManifold {
                 let mut offset = 0_usize;
                 for part in parts {
                     let dim = part.ambient_dim(1);
-                    let block = eh.slice(ndarray::s![offset..offset + dim, offset..offset + dim]);
-                    let converted = part.euclidean_to_riemannian_hessian(
+                    let converted = part.euclidean_hessian_action_to_riemannian(
                         t.slice(ndarray::s![offset..offset + dim]),
                         eg.slice(ndarray::s![offset..offset + dim]),
-                        block,
                         xi.slice(ndarray::s![offset..offset + dim]),
+                        eh_xi.slice(ndarray::s![offset..offset + dim]),
                     );
                     for a in 0..dim {
                         out[offset + a] = converted[a];
@@ -523,9 +535,9 @@ impl LatentIdMode {
 /// [`LatentCoordValues::design_gradient_wrt_t_dispatch`].
 ///
 /// * [`InputLocationDerivative::Radial`] is the *radial-kernel* path: the
-///   caller supplies the scalar `φ'(r_{n,k})` matrix together with the
-///   center coordinates, and the chain rule
-///   `∂Φ/∂t = φ'(r) · (t − c) / r` is applied internally. This covers every
+///   caller supplies the radial kernel family together with the center
+///   coordinates, and the chain rule
+///   `∂Φ/∂t = q(r) · (t − c)` is applied internally. This covers every
 ///   isotropic radial basis — Duchon (any nullspace order), Matérn (every
 ///   supported half-integer ν), and anything else whose pointwise
 ///   gradient is radial. Helpers:
@@ -542,16 +554,15 @@ impl LatentIdMode {
 ///   [`crate::terms::basis::bspline_tensor_first_derivative`].
 ///
 /// The dispatch is an enum rather than a trait because each path's
-/// arguments differ structurally (radial bases reuse `φ'(r)` shared with
+/// arguments differ structurally (radial bases reuse scalar radial kernels shared with
 /// the kernel-shape chain machinery; jet bases ship the full tensor). All chain rules
 /// are analytic and closed-form; no autodiff, no finite differences.
-pub enum InputLocationDerivative<'a> {
+pub(crate) enum InputLocationDerivative<'a> {
     /// Radial-kernel chain rule. The chain rule `(t − c)/r` is reconstructed
-    /// internally from the scalar `φ'(r_{n,k})` matrix and the center
-    /// coordinates.
+    /// internally from the finite `q = φ'(r)/r` scalar and the center coordinates.
     Radial {
-        kernel_first_derivative: ArrayView2<'a, f64>,
         centers: ArrayView2<'a, f64>,
+        radial_kind: &'a RadialScalarKind,
     },
     /// Pre-computed analytic `(n_obs, n_centers, latent_dim)` jet.
     Jet(ArrayView3<'a, f64>),
@@ -794,58 +805,56 @@ impl LatentCoordValues {
     /// Duchon/Matérn path. See [`Self::design_gradient_wrt_t_dispatch`] for
     /// the basis-agnostic dispatch entry point.
     ///
-    /// `kernel_first_derivative` is `φ'(r_{n,k})` for each (row, center)
-    /// pair, shape `(n_obs, n_centers)`. `centers` is `(n_centers, d)`.
+    /// `centers` is `(n_centers, d)`.
     /// Returns a `(n_obs, n_centers, d)` jet whose `(n, k, a)` entry is
-    /// `∂Φ_{n,k} / ∂t_{n,a} = φ'(r_{n,k}) · (t_{n,a} − c_{k,a}) / r_{n,k}`.
+    /// `∂Φ_{n,k} / ∂t_{n,a} = q(r_{n,k}) · (t_{n,a} − c_{k,a})`.
     ///
-    /// At `r = 0` the unit vector `(t − c)/r` is undefined; convention is
-    /// to set the jet to zero there (the kernel is smooth at the origin
-    /// for the supported Duchon orders, so `φ'(0) = 0` anyway and the
-    /// product is the right limit).
-    pub fn design_gradient_wrt_t(
+    /// At `r = 0` the unit vector `(t − c)/r` is undefined; the radial scalar
+    /// path therefore asks the kernel for the finite `q` limit and surfaces
+    /// `BasisError::DegenerateAtCollision` when that limit does not exist.
+    pub(crate) fn design_gradient_wrt_t(
         &self,
-        kernel_first_derivative: ArrayView2<'_, f64>,
         centers: ArrayView2<'_, f64>,
-    ) -> Array3<f64> {
+        radial_kind: &RadialScalarKind,
+    ) -> Result<Array3<f64>, BasisError> {
         let n_obs = self.n_obs;
         let d = self.latent_dim;
         let n_centers = centers.nrows();
-        debug_assert_eq!(centers.ncols(), d);
-        debug_assert_eq!(kernel_first_derivative.shape(), &[n_obs, n_centers]);
+        if centers.ncols() != d {
+            return Err(BasisError::DimensionMismatch(format!(
+                "LatentCoordValues::design_gradient_wrt_t center dimension mismatch: centers have {} cols but latent_dim is {}",
+                centers.ncols(),
+                d
+            )));
+        }
         let mut jet = Array3::<f64>::zeros((n_obs, n_centers, d));
         for n in 0..n_obs {
             let t_n = self.row(n);
             for k in 0..n_centers {
-                // r = ‖t_n − c_k‖
                 let mut r2 = 0.0_f64;
                 for a in 0..d {
                     let delta = t_n[a] - centers[[k, a]];
                     r2 += delta * delta;
                 }
                 let r = r2.sqrt();
-                if r == 0.0 {
+                let (_, q, _) = radial_kind.eval_design_triplet(r)?;
+                if q == 0.0 {
                     continue;
                 }
-                let phi_prime = kernel_first_derivative[[n, k]];
-                if phi_prime == 0.0 {
-                    continue;
-                }
-                let scale = phi_prime / r;
                 for a in 0..d {
-                    jet[[n, k, a]] = scale * (t_n[a] - centers[[k, a]]);
+                    jet[[n, k, a]] = q * (t_n[a] - centers[[k, a]]);
                 }
             }
         }
-        jet
+        Ok(jet)
     }
 
     /// Compute `∂Φ/∂t` for an arbitrary supported basis kind, by dispatching
     /// to the right closed-form chain rule.
     ///
-    /// All radial-kernel bases (Duchon, Matérn) reduce to the same shape
-    /// `φ'(r)`-times-unit-vector chain that `design_gradient_wrt_t` already
-    /// implements. Non-radial bases (sphere, periodic-cyclic B-spline, tensor
+    /// All radial-kernel bases (Duchon, Matérn) reduce to the same
+    /// `q(r) · (t − c)` chain that `design_gradient_wrt_t` already implements.
+    /// Non-radial bases (sphere, periodic-cyclic B-spline, tensor
     /// B-spline) carry their own analytic `(N, K, d)` jet — the caller
     /// pre-builds that jet using the matching `*_first_derivative_nd` helper
     /// in [`crate::terms::basis`] and passes it in via
@@ -855,21 +864,30 @@ impl LatentCoordValues {
     /// stays in lock-step with the kernel-parameter chain rule that
     /// `SpatialLogKappaCoords` uses (re-pointed at the first kernel argument
     /// rather than at kernel anisotropy).
-    pub fn design_gradient_wrt_t_dispatch(
+    pub(crate) fn design_gradient_wrt_t_dispatch(
         &self,
         input: InputLocationDerivative<'_>,
-    ) -> Array3<f64> {
+    ) -> Result<Array3<f64>, BasisError> {
         match input {
             InputLocationDerivative::Radial {
-                kernel_first_derivative,
                 centers,
-            } => self.design_gradient_wrt_t(kernel_first_derivative, centers),
+                radial_kind,
+            } => self.design_gradient_wrt_t(centers, radial_kind),
             InputLocationDerivative::Jet(jet) => {
+                if jet.shape() != &[self.n_obs, jet.shape()[1], self.latent_dim] {
+                    return Err(BasisError::DimensionMismatch(format!(
+                        "LatentCoordValues::design_gradient_wrt_t_dispatch jet shape {:?} does not match latent shape ({}, {}, {})",
+                        jet.shape(),
+                        self.n_obs,
+                        jet.shape()[1],
+                        self.latent_dim
+                    )));
+                }
                 // The non-radial helpers already produce a (N, K, d) tensor
                 // in the same layout `contract_gradient` consumes. Return a
                 // copy so the caller owns the data and is decoupled from the
                 // source array's lifetime.
-                jet.to_owned()
+                Ok(jet.to_owned())
             }
         }
     }
@@ -880,14 +898,14 @@ impl LatentCoordValues {
     /// This is the N-D generalization of
     /// `gam_pyffi::contract_position_gradient` (1-D), used inside the
     /// `_backward` pyffi entry point.
-    pub fn contract_gradient(
+    pub(crate) fn contract_gradient(
         grad_phi: ArrayView2<'_, f64>,
         jet: &Array3<f64>,
     ) -> Array1<f64> {
         let n_obs = jet.shape()[0];
         let n_centers = jet.shape()[1];
         let d = jet.shape()[2];
-        debug_assert_eq!(grad_phi.shape(), &[n_obs, n_centers]);
+        assert_eq!(grad_phi.shape(), &[n_obs, n_centers]);
         let mut grad_t = Array1::<f64>::zeros(n_obs * d);
         for n in 0..n_obs {
             for a in 0..d {
@@ -906,63 +924,59 @@ impl LatentCoordValues {
     /// This computes the same result as
     /// `contract_gradient(grad_phi, design_gradient_wrt_t(...))`, but never
     /// materializes the dense `(n_obs, n_centers, latent_dim)` jet. Peak
-    /// storage is therefore `O(n_obs * n_centers + n_obs * latent_dim)` when
-    /// the caller already has the scalar radial derivative matrix, instead of
-    /// `O(n_obs * n_centers * latent_dim)`.
-    pub fn contract_gradient_radial_streaming(
+    /// storage is therefore `O(n_obs * latent_dim)`.
+    pub(crate) fn contract_gradient_radial_streaming(
         &self,
         grad_phi: ArrayView2<'_, f64>,
-        kernel_first_derivative: ArrayView2<'_, f64>,
         centers: ArrayView2<'_, f64>,
-    ) -> Array1<f64> {
+        radial_kind: &RadialScalarKind,
+    ) -> Result<Array1<f64>, BasisError> {
         let n_obs = self.n_obs;
         let d = self.latent_dim;
         let n_centers = centers.nrows();
-        debug_assert_eq!(centers.ncols(), d);
-        debug_assert_eq!(grad_phi.shape(), &[n_obs, n_centers]);
-        debug_assert_eq!(kernel_first_derivative.shape(), &[n_obs, n_centers]);
+        assert_eq!(centers.ncols(), d);
+        assert_eq!(grad_phi.shape(), &[n_obs, n_centers]);
         let mut grad_t = Array1::<f64>::zeros(n_obs * d);
         for n in 0..n_obs {
             self.contract_row_radial_gradient_into(
                 n,
                 grad_phi.row(n),
-                kernel_first_derivative.row(n),
                 centers,
+                radial_kind,
                 &mut grad_t,
                 1.0,
-            );
+            )?;
         }
-        grad_t
+        Ok(grad_t)
     }
 
     /// Streaming row contraction for one radial-kernel latent row.
     ///
-    /// `grad_phi_row[k]` is the downstream adjoint for `Φ[n,k]`, and
-    /// `kernel_first_derivative_row[k]` is `φ'(r_{n,k})`. The contribution is
-    /// accumulated into `grad_t[n, :]` with an optional scalar multiplier.
-    pub fn contract_row_radial_gradient_into(
+    /// `grad_phi_row[k]` is the downstream adjoint for `Φ[n,k]`. The
+    /// contribution is accumulated into `grad_t[n, :]` with an optional scalar
+    /// multiplier.
+    pub(crate) fn contract_row_radial_gradient_into(
         &self,
         n: usize,
         grad_phi_row: ArrayView1<'_, f64>,
-        kernel_first_derivative_row: ArrayView1<'_, f64>,
         centers: ArrayView2<'_, f64>,
+        radial_kind: &RadialScalarKind,
         grad_t: &mut Array1<f64>,
         scale: f64,
-    ) {
+    ) -> Result<(), BasisError> {
         let d = self.latent_dim;
         let n_centers = centers.nrows();
-        debug_assert!(n < self.n_obs);
-        debug_assert_eq!(centers.ncols(), d);
-        debug_assert_eq!(grad_phi_row.len(), n_centers);
-        debug_assert_eq!(kernel_first_derivative_row.len(), n_centers);
-        debug_assert_eq!(grad_t.len(), self.values.len());
+        assert!(n < self.n_obs);
+        assert_eq!(centers.ncols(), d);
+        assert_eq!(grad_phi_row.len(), n_centers);
+        assert_eq!(grad_t.len(), self.values.len());
         if scale == 0.0 {
-            return;
+            return Ok(());
         }
         let t_n = self.row(n);
         for k in 0..n_centers {
-            let weight = grad_phi_row[k] * kernel_first_derivative_row[k];
-            if weight == 0.0 {
+            let adjoint = grad_phi_row[k];
+            if adjoint == 0.0 {
                 continue;
             }
             let mut r2 = 0.0_f64;
@@ -971,14 +985,16 @@ impl LatentCoordValues {
                 r2 += delta * delta;
             }
             let r = r2.sqrt();
-            if r == 0.0 {
+            let (_, q, _) = radial_kind.eval_design_triplet(r)?;
+            if q == 0.0 {
                 continue;
             }
-            let row_scale = scale * weight / r;
+            let row_scale = scale * adjoint * q;
             for a in 0..d {
                 grad_t[n * d + a] += row_scale * (t_n[a] - centers[[k, a]]);
             }
         }
+        Ok(())
     }
 }
 
@@ -993,11 +1009,9 @@ fn normalize_or_axis(v: ArrayView1<'_, f64>, dim: usize) -> Array1<f64> {
         norm_sq += v[a] * v[a];
     }
     if norm_sq <= 0.0 || !norm_sq.is_finite() {
-        let mut out = Array1::<f64>::zeros(dim);
-        if dim > 0 {
-            out[0] = 1.0;
-        }
-        return out;
+        panic!(
+            "LatentManifold::Sphere cannot normalize a zero or non-finite ambient vector"
+        );
     }
     let inv = 1.0 / norm_sq.sqrt();
     let mut out = Array1::<f64>::zeros(dim);

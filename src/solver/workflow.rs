@@ -3244,18 +3244,27 @@ fn build_standard_latent_analytic_penalty_registry(
             .ok_or_else(|| format!("{context}.kind is required"))?
             .to_ascii_lowercase()
             .replace('-', "_");
+        let weight_schedule = analytic_descriptor_weight_schedule(descriptor, &context)?;
         match kind.as_str() {
             "isometry" => {
                 analytic_descriptor_weight_value(descriptor, &context)?;
+                let penalty = IsometryPenalty::new_euclidean(slice, target.d);
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
                 registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
-                    IsometryPenalty::new_euclidean(slice, target.d),
+                    penalty,
                 )));
             }
             "ard" => {
                 analytic_descriptor_weight_sequence(descriptor, &context)?;
-                registry.push(AnalyticPenaltyKind::Ard(Arc::new(ARDPenalty::new(
-                    slice, target.d,
-                ))));
+                let penalty = ARDPenalty::new(slice, target.d);
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(AnalyticPenaltyKind::Ard(Arc::new(penalty)));
             }
             "orthogonality" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;

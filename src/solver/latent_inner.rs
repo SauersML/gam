@@ -250,6 +250,12 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                 solve_arrow_newton_step_with_options(&system, ridge_t, ridge_beta, &solve_options);
             match step_result {
                 Ok((delta_t, delta_beta, cache)) => {
+                    let delta_t = limit_delta_to_riemannian_trust_region(
+                        delta_t,
+                        self.latent,
+                        solve_options.riemannian_trust_region,
+                        solve_options.trust_region.radius,
+                    );
                     let predicted_reduction = arrow_predicted_reduction(
                         &system,
                         delta_t.view(),
@@ -366,6 +372,36 @@ fn latent_arrow_solve_options(
     solve_options.trust_region.radius = opts.trust_region_radius;
     solve_options.riemannian_trust_region = riemannian_trust_region;
     solve_options
+}
+
+fn limit_delta_to_riemannian_trust_region(
+    mut delta_t: Array1<f64>,
+    latent: &LatentCoordValues,
+    enabled: bool,
+    radius: f64,
+) -> Array1<f64> {
+    if !enabled || !radius.is_finite() || radius <= 0.0 {
+        return delta_t;
+    }
+    let row_weights = latent.manifold().metric_weights();
+    assert_eq!(row_weights.len(), latent.latent_dim());
+    let mut norm_sq = 0.0_f64;
+    for n in 0..latent.n_obs() {
+        let start = n * latent.latent_dim();
+        for a in 0..latent.latent_dim() {
+            let value = delta_t[start + a];
+            norm_sq += row_weights[a] * value * value;
+        }
+    }
+    let norm = norm_sq.sqrt();
+    if norm <= radius || norm == 0.0 {
+        return delta_t;
+    }
+    let shrink = radius / norm;
+    for value in delta_t.iter_mut() {
+        *value *= shrink;
+    }
+    delta_t
 }
 
 fn system_gradient_norm_sq(sys: &ArrowSchurSystem) -> f64 {
