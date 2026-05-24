@@ -11624,8 +11624,8 @@ mod tests {
     use crate::probability::standard_normal_quantile;
     use crate::solver::active_set;
     use crate::types::{
-        Coefficients, GlmFamily, GlmLikelihoodSpec, InverseLink, LinkFunction,
-        LogSmoothingParamsView,
+        Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
+        LogSmoothingParamsView, ResponseFamily,
     };
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
@@ -12001,7 +12001,10 @@ mod tests {
             crate::construction::canonicalize_penalty_specs(&specs, &nulls, p, "prior mean test")
                 .expect("canonical penalties");
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodSpec::canonical(GlmFamily::GaussianIdentity),
+            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            )),
             link_kind: InverseLink::Standard(LinkFunction::Identity),
             max_iterations: 20,
             convergence_tolerance: 1e-12,
@@ -12217,7 +12220,10 @@ mod tests {
             })
             .collect();
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodSpec::canonical(GlmFamily::BinomialLogit),
+            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Logit),
+            )),
             link_kind: InverseLink::Standard(LinkFunction::Logit),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -12370,7 +12376,10 @@ mod tests {
         let dev = calculate_deviance(
             y.view(),
             &mu,
-            GlmLikelihoodSpec::canonical(GlmFamily::GammaLog),
+            &GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Gamma,
+                InverseLink::Standard(LinkFunction::Log),
+            )),
             w.view(),
         );
         let expected = 2.0
@@ -12389,7 +12398,10 @@ mod tests {
         let fisher = w.clone();
 
         let (w_obs, c_obs, d_obs) = compute_observed_hessian_curvature_arrays(
-            GlmLikelihoodSpec::canonical(GlmFamily::GammaLog),
+            &GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Gamma,
+                InverseLink::Standard(LinkFunction::Log),
+            )),
             &InverseLink::Standard(LinkFunction::Log),
             &eta,
             y.view(),
@@ -12431,7 +12443,10 @@ mod tests {
             })
             .collect();
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodSpec::canonical(GlmFamily::GammaLog),
+            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Gamma,
+                InverseLink::Standard(LinkFunction::Log),
+            )),
             link_kind: InverseLink::Standard(LinkFunction::Log),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -12507,7 +12522,10 @@ mod tests {
             })
             .collect();
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodSpec::canonical(GlmFamily::PoissonLog),
+            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Poisson,
+                InverseLink::Standard(LinkFunction::Log),
+            )),
             link_kind: InverseLink::Standard(LinkFunction::Log),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -13733,7 +13751,10 @@ mod root_cause_tests {
             })
             .collect();
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodSpec::canonical(GlmFamily::GaussianIdentity),
+            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            )),
             link_kind: InverseLink::Standard(LinkFunction::Identity),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -13816,7 +13837,10 @@ mod root_cause_tests {
             })
             .collect();
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodSpec::canonical(GlmFamily::BinomialLogit),
+            likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Logit),
+            )),
             link_kind: InverseLink::Standard(LinkFunction::Logit),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -13918,7 +13942,10 @@ mod root_cause_tests {
                 })
                 .collect();
             let config = PirlsConfig {
-                likelihood: GlmLikelihoodSpec::canonical(GlmFamily::BinomialLogit),
+                likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Logit),
+            )),
                 link_kind: InverseLink::Standard(LinkFunction::Logit),
                 max_iterations: 100,
                 convergence_tolerance: 1e-8,

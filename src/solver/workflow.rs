@@ -65,8 +65,8 @@ use crate::terms::{
     TotalVariationPenalty,
 };
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, LikelihoodSpec, LinkFunction,
-    MixtureLinkSpec, ResponseFamily, SasLinkSpec, WigglePenaltyConfig,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkSpec,
+    ResponseFamily, SasLinkSpec, WigglePenaltyConfig,
 };
 
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis, s};

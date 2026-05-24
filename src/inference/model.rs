@@ -20,8 +20,8 @@ use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
 use crate::span::span_index_for_breakpoints;
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodSpec, LikelihoodSpec, LinkFunction,
-    MixtureLinkState, ResponseFamily, SasLinkSpec, SasLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkState,
+    ResponseFamily, SasLinkSpec, SasLinkState,
 };
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
@@ -2035,27 +2035,7 @@ impl FittedFamily {
                 return LikelihoodSpec::royston_parmar();
             }
         };
-        match (&spec.response, &spec.link) {
-            (ResponseFamily::Gaussian, _) => LikelihoodSpec::gaussian_identity(),
-            (ResponseFamily::Poisson, _) => LikelihoodSpec::poisson_log(),
-            (ResponseFamily::Tweedie { p }, _) => LikelihoodSpec::Tweedie { p: *p },
-            (ResponseFamily::NegativeBinomial { theta }, _) => {
-                LikelihoodSpec::NegativeBinomial { theta: *theta }
-            }
-            (ResponseFamily::Beta { phi }, _) => LikelihoodSpec::BetaLogit { phi: *phi },
-            (ResponseFamily::Gamma, _) => LikelihoodSpec::gamma_log(),
-            (ResponseFamily::RoystonParmar, _) => LikelihoodSpec::royston_parmar(),
-            (ResponseFamily::Binomial, link) => match link {
-                InverseLink::Standard(LinkFunction::Logit) => LikelihoodSpec::binomial_logit(),
-                InverseLink::Standard(LinkFunction::Probit) => LikelihoodSpec::binomial_probit(),
-                InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodSpec::binomial_cloglog(),
-                InverseLink::Standard(_) => LikelihoodSpec::binomial_logit(),
-                InverseLink::LatentCLogLog(_) => LikelihoodSpec::binomial_link(LinkFunction::CLogLog),
-                InverseLink::Sas(_) => LikelihoodSpec::binomial_link(LinkFunction::Sas),
-                InverseLink::BetaLogistic(_) => LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic),
-                InverseLink::Mixture(_) => LikelihoodSpec::binomial_link(LinkFunction::Logit),
-            },
-        }
+        spec.clone()
     }
 
     #[inline]
@@ -2760,7 +2740,7 @@ impl FittedModel {
                 let beta = if runtime.link_wiggle.is_some() {
                     fit.block_by_role(BlockRole::Mean)?.beta.clone()
                 } else if let Some(unified) = self.unified() {
-                    StandardPredictor::from_unified(unified, family, link_kind.clone(), None)
+                    StandardPredictor::from_unified(unified, family.clone(), link_kind.clone(), None)
                         .ok()
                         .map(|p| p.beta)
                         .unwrap_or_else(|| fit.beta.clone())
