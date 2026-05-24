@@ -872,8 +872,8 @@ fn validate_firth_support(family: NutsFamily, firth_enabled: bool) -> Result<(),
         return Err(HmcError::FirthUnsupported {
             reason: format!(
                 "NUTS with Firth is only supported for {}; {} does not support it",
-                likelihood_spec_pretty_name(&binomial_logit),
-                likelihood_spec_pretty_name(&spec)
+                binomial_logit.pretty_name(),
+                spec.pretty_name()
             ),
         });
     }
@@ -893,8 +893,8 @@ fn validate_firth_likelihood_support(
         return Err(HmcError::FirthUnsupported {
             reason: format!(
                 "Joint HMC with Firth is only supported for {}; {} does not support it",
-                likelihood_spec_pretty_name(&binomial_logit),
-                likelihood_spec_pretty_name(likelihood)
+                binomial_logit.pretty_name(),
+                likelihood.pretty_name()
             ),
         });
     }
@@ -1180,7 +1180,7 @@ fn joint_binomial_logp_and_grad(
         return Err(HmcError::UnsupportedFamily {
             reason: format!(
                 "{} is not a binomial joint-HMC family",
-                likelihood_spec_pretty_name(likelihood)
+                likelihood.pretty_name()
             ),
         }
         .into());
@@ -1200,7 +1200,7 @@ fn joint_binomial_logp_and_grad(
         InverseLink::Standard(_) => Err(HmcError::UnsupportedFamily {
             reason: format!(
                 "{} is not a binomial joint-HMC family",
-                likelihood_spec_pretty_name(likelihood)
+                likelihood.pretty_name()
             ),
         }
         .into()),
@@ -3957,8 +3957,8 @@ pub fn run_nuts_sampling_flattened_family(
         return Err(HmcError::FirthUnsupported {
             reason: format!(
                 "NUTS with Firth is only supported for {}; {} does not support it",
-                likelihood_spec_pretty_name(&binomial_logit),
-                likelihood_spec_pretty_name(&likelihood)
+                binomial_logit.pretty_name(),
+                likelihood.pretty_name()
             ),
         }
         .into());
