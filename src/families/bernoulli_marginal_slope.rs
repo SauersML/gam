@@ -859,8 +859,8 @@ fn build_latent_measure_with_geometry(
                     calibration.post_sd,
                     calibration.sorted_z.len(),
                 );
-                let _ = data;
-                let _ = specs;
+                drop(data);
+                drop(specs);
                 Ok((
                     LatentMeasureKind::StandardNormal,
                     LatentMeasureCalibration::RankInverseNormal(calibration),
@@ -5555,8 +5555,8 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         // Touch both caches so their parallel builds run here, not later
         // (nested inside the outer ext-idx par_iter where the lock-holder
         // thread would have to do each row pass alone).
-        let _ = self.third_full_cache();
-        let _ = self.fourth_full_cache();
+        drop(self.third_full_cache());
+        drop(self.fourth_full_cache());
         Ok(())
     }
 
