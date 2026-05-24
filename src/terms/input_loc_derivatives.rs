@@ -614,11 +614,17 @@ pub fn sphere_s2_input_loc_grad(
 pub fn contract_input_loc_gradient(
     grad_phi: ArrayView2<'_, f64>,
     jet: &Array3<f64>,
-) -> Array1<f64> {
+) -> Result<Array1<f64>, BasisError> {
     let n_obs = jet.shape()[0];
     let n_centers = jet.shape()[1];
     let d = jet.shape()[2];
-    debug_assert_eq!(grad_phi.shape(), &[n_obs, n_centers]);
+    if grad_phi.shape() != [n_obs, n_centers] {
+        return Err(BasisError::DimensionMismatch(format!(
+            "contract_input_loc_gradient: grad_phi shape {:?} != expected {:?}",
+            grad_phi.shape(),
+            [n_obs, n_centers]
+        )));
+    }
     let mut grad_t = Array1::<f64>::zeros(n_obs * d);
     for n in 0..n_obs {
         for a in 0..d {
@@ -629,7 +635,7 @@ pub fn contract_input_loc_gradient(
             grad_t[n * d + a] = acc;
         }
     }
-    grad_t
+    Ok(grad_t)
 }
 
 // =========================================================================
@@ -832,7 +838,7 @@ mod tests {
         )
         .unwrap();
         let grad_phi = array![[1.0_f64, 0.0, 1.0], [0.0, 1.0, 0.0]];
-        let out = contract_input_loc_gradient(grad_phi.view(), &jet);
+        let out = contract_input_loc_gradient(grad_phi.view(), &jet).unwrap();
         // n=0: a=0 → 1*1 + 0*3 + 1*5 = 6; a=1 → 1*2 + 0*4 + 1*6 = 8
         // n=1: a=0 → 0*7 + 1*9 + 0*11 = 9; a=1 → 0*8 + 1*10 + 0*12 = 10
         assert_eq!(out[0], 6.0);
