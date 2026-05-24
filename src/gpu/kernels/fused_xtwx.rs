@@ -131,6 +131,9 @@ extern "C" __global__ void row_scale_kernel(
     let pp = p as u64;
     let mut builder = stream.launch_builder(&scale_fn);
     builder.arg(&dx).arg(&dw).arg(&mut dwx).arg(&nn).arg(&pp);
+    // SAFETY: scale_fn was just loaded from a freshly NVRTC-compiled module
+    // for this context; all args bound to live device buffers (dx, dw, dwx)
+    // and pod u64 scalars (nn, pp); grid/block dims cover n*p threads.
     unsafe { builder.launch(cfg) }.map_err(map_drv)?;
 
     let mut dout = stream.alloc_zeros::<f64>(p * p).map_err(map_drv)?;
@@ -147,6 +150,10 @@ extern "C" __global__ void row_scale_kernel(
         beta: 0.0,
         ldc: p as i32,
     };
+    // SAFETY: cuBLAS gemm requires column-major device buffers of declared
+    // dimensions; dx is n×p column-major (caller contract), dwx is the n×p
+    // intermediate just written by scale_fn, dout is the p×p zero-initialized
+    // target. trans flags + leading-dim values match exactly.
     unsafe { blas.gemm(gemm, &dx, &dwx, &mut dout) }.map_err(|e| GpuError::DriverCallFailed {
         reason: format!("xtwx cublas gemm failed: {e}"),
     })?;

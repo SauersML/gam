@@ -1278,6 +1278,8 @@ pub struct ArrowSchurInnerConfig {
     /// BA Schur solve mode. `None` selects Direct for `K <= 2000` and
     /// InexactPCG above, following "Bundle Adjustment in the Large".
     pub solver_mode: Option<crate::solver::arrow_schur::ArrowSolverMode>,
+    /// When set, assemble the reduced dense Schur block in row chunks.
+    pub streaming_chunk_size: Option<usize>,
     /// Steihaug trust-region radius for the reduced shared step. This ports
     /// the Ceres/BA trust-region guard while retaining PIRLS's LM damping.
     pub trust_region_radius: f64,
@@ -1302,6 +1304,7 @@ impl std::fmt::Debug for ArrowSchurInnerConfig {
             .field("latent_dim", &self.latent_dim)
             .field("n_beta", &self.n_beta)
             .field("solver_mode", &self.solver_mode)
+            .field("streaming_chunk_size", &self.streaming_chunk_size)
             .field("trust_region_radius", &self.trust_region_radius)
             .finish_non_exhaustive()
     }
@@ -1593,7 +1596,10 @@ impl KroneckerQsTransform {
                 apply_kron_mode_into(front, &self.dims, axis, q, transpose, back);
                 std::mem::swap(front, back);
             }
-            Array1::from_vec(std::mem::take(front))
+            // Clone out the final result (one allocation per `apply`, vs. the
+            // previous N+1 allocations across N axes); the scratch retains
+            // its capacity for the next call on this thread.
+            Array1::from(front.clone())
         })
     }
 
@@ -4995,6 +5001,7 @@ where
                             if let Some(mode) = arrow_cfg.solver_mode {
                                 solve_options.mode = mode;
                             }
+                            solve_options.streaming_chunk_size = arrow_cfg.streaming_chunk_size;
                             solve_options.trust_region.radius = arrow_cfg.trust_region_radius;
                             let latent_snapshot = arrow_cfg.snapshot_t.as_ref()();
                             match arrow_system.solve_with_options(0.0, loop_lambda, &solve_options)

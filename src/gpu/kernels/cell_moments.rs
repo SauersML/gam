@@ -23,16 +23,9 @@ pub enum BackendStatus {
 
 #[inline]
 pub fn backend_status() -> BackendStatus {
-    #[cfg(feature = "cuda")]
-    {
-        match crate::gpu::runtime::GpuRuntime::global() {
-            Some(_) => BackendStatus::CudaReady,
-            None => BackendStatus::CudaUnavailable,
-        }
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        BackendStatus::CpuFallback
+    match crate::gpu::runtime::GpuRuntime::global() {
+        Some(_) => BackendStatus::CudaReady,
+        None => BackendStatus::CudaUnavailable,
     }
 }
 
@@ -77,21 +70,12 @@ pub fn try_dispatch(
     if cells.is_empty() {
         return None;
     }
-    #[cfg(feature = "cuda")]
-    {
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
-            return None;
-        };
-        Some(cuda_cell_moments(cells, degree))
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        drop((cells, degree));
-        None
-    }
+    let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+        return None;
+    };
+    Some(cuda_cell_moments(cells, degree))
 }
 
-#[cfg(feature = "cuda")]
 fn cuda_cell_moments(
     cells: &[DenestedCubicCell],
     degree: usize,
@@ -218,7 +202,6 @@ extern "C" __global__ void cell_moments_kernel(
     })
 }
 
-#[cfg(feature = "cuda")]
 fn map_drv(e: cudarc::driver::DriverError) -> GpuError {
     GpuError::DriverCallFailed {
         reason: format!("cell_moments cudarc driver error: {e}"),

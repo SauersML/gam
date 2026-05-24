@@ -39032,4 +39032,34 @@ mod tests {
              max rel diff = {max_rel:.3e}",
         );
     }
+
+    #[test]
+    fn auto_streaming_skips_small_bspline_basis() {
+        // Representative small B-spline workload: n = 100 rows, k = 10 basis
+        // columns. Dense buffer ≈ 100 · 10 · 8 = 8000 B ≪ 1 GiB threshold,
+        // so streaming must not engage and the helper must return None.
+        let chunk = auto_streaming_chunk_size_for_dense(100, 10);
+        assert!(
+            chunk.is_none(),
+            "auto-streaming engaged for tiny n=100 k=10 basis: {chunk:?}"
+        );
+    }
+
+    #[test]
+    fn auto_streaming_engages_for_large_synthetic_basis() {
+        // Virtual workload: 1e6 rows × 200 basis columns. Dense bytes
+        // = 1e6 · 200 · 8 = 1.6 GB > 1 GiB threshold, so streaming must
+        // engage. Target chunk ≈ 256 MiB / (200 · 8 B) ≈ 167_772 rows,
+        // clamped to [1024, n_rows].
+        let chunk = auto_streaming_chunk_size_for_dense(1_000_000, 200)
+            .expect("dense buffer exceeds 1 GiB → streaming must engage");
+        assert!(chunk >= 1024, "chunk {chunk} below MIN_CHUNK_ROWS");
+        assert!(chunk <= 1_000_000, "chunk {chunk} exceeds n_rows");
+        // The 256 MiB / row_bytes formula should land in the ~150k-200k row
+        // range for this column count.
+        assert!(
+            (100_000..=300_000).contains(&chunk),
+            "chunk {chunk} outside the expected ~256 MiB / (200·8) window"
+        );
+    }
 }

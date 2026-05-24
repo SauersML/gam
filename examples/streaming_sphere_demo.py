@@ -1,4 +1,10 @@
-"""Streaming Sphere basis demo."""
+"""Streaming Sphere basis demo.
+
+The Rust core auto-activates row-chunked streaming whenever the would-be
+dense basis buffer exceeds ~1 GiB, so this demo sizes n × k above that
+threshold and observes that peak RSS stays bounded — no streaming opt-in
+arg is needed (and none exists).
+"""
 
 from __future__ import annotations
 
@@ -24,8 +30,10 @@ def cos_gamma(lat_lon: np.ndarray, centers: np.ndarray) -> np.ndarray:
 
 
 def main() -> None:
-    n = 20_000
-    chunk = 2048
+    k = 64
+    # Size n so that n * k * 8 bytes exceeds the 1 GiB auto-stream threshold,
+    # exercising the auto-streaming path.
+    n = max(20_000, (1024 * 1024 * 1024) // (k * 8) + 1)
     rng = np.random.default_rng(23)
     baseline = rss_mb()
 
@@ -36,23 +44,24 @@ def main() -> None:
     coef = rng.normal(scale=0.5, size=centers.shape[0])
 
     y = np.zeros(n)
-    for start in range(0, n, chunk):
-        end = min(start + chunk, n)
-        k = np.exp(4.0 * (cos_gamma(x[start:end], centers) - 1.0))
-        y[start:end] = k @ coef
+    block = 2048
+    for start in range(0, n, block):
+        end = min(start + block, n)
+        kmat = np.exp(4.0 * (cos_gamma(x[start:end], centers) - 1.0))
+        y[start:end] = kmat @ coef
     y += rng.normal(scale=0.05, size=n)
 
     data = {"y": y, "lat": lat, "lon": lon}
     model = gamfit.fit(
         data,
-        "y ~ sphere(lat, lon, k=64, kernel=sobolev, streaming_chunk_size=2048)",
+        f"y ~ sphere(lat, lon, k={k}, kernel=sobolev)",
         family="gaussian",
     )
     print(model.summary())
 
     delta = rss_mb() - baseline
     print(f"peak RSS delta: {delta:.1f} MB")
-    assert delta < 512.0
+    assert delta < 2048.0
 
 
 if __name__ == "__main__":

@@ -216,7 +216,7 @@ pub fn try_dispatch_dense(op: GpuOperation) -> linalg::GpuDispatch {
     // the per-call auto-dispatch in `crate::faer_ndarray::fast_*`. Today
     // there is no compiled backend, so we still return `Cpu` and the
     // matrix-typed entry points return `None`; the architecture is in
-    // place to swap in cudarc kernels behind `#[cfg(feature = "cuda")]`
+    // place to swap in cudarc kernels behind runtime GPU probing
     // and have every caller pick them up automatically.
     let dispatch_op = match op {
         GpuOperation::Gemm { m, n, k } => linalg::DispatchOp::Gemm { m, n, k },
