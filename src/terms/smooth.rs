@@ -21618,14 +21618,14 @@ mod tests {
         // non-Gaussian dense-lazy designs through `build_outer_hessian_operator`
         // at biobank scale and through `compute_outer_hessian` otherwise.
         assert!(exact_joint_spatial_outer_hessian_available(
-            LikelihoodSpec::new(
+            &LikelihoodSpec::new(
                 ResponseFamily::Binomial,
                 InverseLink::Standard(LinkFunction::Logit),
             ),
             &design,
         ));
         assert!(exact_joint_spatial_outer_hessian_available(
-            LikelihoodSpec::new(
+            &LikelihoodSpec::new(
                 ResponseFamily::Gaussian,
                 InverseLink::Standard(LinkFunction::Identity),
             ),
