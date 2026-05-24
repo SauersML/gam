@@ -2479,7 +2479,6 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             (Array2::zeros((0, 0)), Some(h_sparse), ridge_used)
         } else {
             let mut penalized_hessian = self.penalized_hessian(&solver_weights)?;
-            #[cfg(debug_assertions)]
             assert_symmetric_tol(&penalized_hessian, "PIRLS penalized Hessian", 1e-8);
             let ridge_used = ensure_positive_definitewithridge(
                 &mut penalized_hessian,
@@ -7651,7 +7650,6 @@ impl PirlsConfig {
 }
 
 #[inline]
-#[cfg(debug_assertions)]
 fn max_symmetric_asymmetry(matrix: &Array2<f64>) -> f64 {
     let n = matrix.nrows().min(matrix.ncols());
     let mut max_asym = 0.0_f64;
@@ -7667,7 +7665,6 @@ fn max_symmetric_asymmetry(matrix: &Array2<f64>) -> f64 {
 }
 
 #[inline]
-#[cfg(debug_assertions)]
 fn assert_symmetric_tol(matrix: &Array2<f64>, label: &str, tol: f64) {
     let max_asym = max_symmetric_asymmetry(matrix);
     assert!(
@@ -7854,7 +7851,6 @@ fn solve_penalized_least_squares_implicit(
                 .map_err(EstimationError::InvalidInput)?
         }
     };
-    #[cfg(debug_assertions)]
     let xtwx_orig_asym = max_symmetric_asymmetry(&xtwx_orig);
     let xtwx_transformed = if let Some(transform) = transform {
         transform.conjugate_matrix(&xtwx_orig)
@@ -7890,7 +7886,6 @@ fn solve_penalized_least_squares_implicit(
     }
     workspace.vec_buf_p += penalty.linear_shift();
 
-    #[cfg(debug_assertions)]
     {
         let xtwx_asym = max_symmetric_asymmetry(&xtwx_transformed);
         let penalty_asym = match penalty {

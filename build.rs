@@ -3922,7 +3922,20 @@ fn extract_body_text(stripped_lines: &[String], open: usize, close: usize) -> St
 /// `Some(T::default())`, the empty tuple `()`, or a bare numeric / bool /
 /// empty-string literal. A trailing `;` is tolerated.
 fn body_is_trivial_sentinel(body: &str) -> bool {
-    let mut s = body.trim();
+    // Peel off a "fake validation prologue" first: a sequence of leading
+    // `assert*!(...);` and `if <expr>.is_empty() { return <expr>; }`
+    // statements that exist solely to consume otherwise-unused
+    // parameters. The real body still has to be a trivial sentinel for
+    // the whole function to count as a stub — legitimate validation
+    // followed by real logic survives because the tail won't match the
+    // sentinel list. This catches the hack documented in the bypass
+    // ledger: rename `_param: T` to `param: T`, add a single
+    // `assert!(param.<predicate>())` (and optionally a one-line
+    // empty-input early return), then return `None` / `Ok(())`. With
+    // `debug_assert*!` already banned, `assert!` is the next-cheapest
+    // fake-use shape and must be stripped here.
+    let after_prologue = strip_validation_prologue(body);
+    let mut s = after_prologue.trim();
     if let Some(stripped) = s.strip_suffix(';') {
         s = stripped.trim_end();
     }
