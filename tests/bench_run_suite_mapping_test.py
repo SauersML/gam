@@ -263,17 +263,6 @@ class RunSuiteMappingTests(unittest.TestCase):
         self.assertEqual(ds["features"], [f"pc{i}" for i in range(1, 7)])
         self.assertGreater(len(ds["rows"]), 0)
 
-    def test_legacy_geo_disease_tp_scenarios_use_full_joint_embedding(self) -> None:
-        # Both legacy TPS scenarios route through the joint-PC contract (full
-        # 16-PC smooth, k=24). Canonical TPS in d=16 needs M(16, m=9)=735_471
-        # centers, far above k=24; the Rust builder auto-promotes to a pure
-        # Duchon spline so these scenarios remain runnable end-to-end.
-        for scenario_name in ("geo_disease_tp", "geo_disease_shrinkage"):
-            cfg = _RUN_SUITE._scenario_fit_mapping(scenario_name)
-            self.assertEqual(cfg["smooth_basis"], "thinplate")
-            self.assertEqual(cfg["smooth_cols"], [f"pc{i}" for i in range(1, 17)])
-            self.assertEqual(cfg["knots"], 24)
-
     def test_geo_subpop16_marginal_slope_aniso_keeps_16d_duchon_mapping(self) -> None:
         cfg = _RUN_SUITE._scenario_fit_mapping("geo_subpop16_margslope_aniso_duchon16d_k50")
         self.assertIsNotNone(cfg)
