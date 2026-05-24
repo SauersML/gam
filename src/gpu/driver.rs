@@ -267,10 +267,14 @@ pub fn to_col_major<'a, S: Data<Elem = f64>>(a: &'a ArrayBase<S, Ix2>) -> Cow<'a
     let strides = a.strides();
     // F-order contiguous: column stride == 1, row stride == rows.
     // `as_slice_memory_order` confirms the buffer is contiguous in memory.
-    if rows > 0 && cols > 0 && strides[0] == 1 && strides[1] == rows as isize
-        && let Some(slice) = a.as_slice_memory_order() {
-            return Cow::Borrowed(slice);
-        }
+    if rows > 0
+        && cols > 0
+        && strides[0] == 1
+        && strides[1] == rows as isize
+        && let Some(slice) = a.as_slice_memory_order()
+    {
+        return Cow::Borrowed(slice);
+    }
     let mut out: Vec<f64> = Vec::with_capacity(rows.saturating_mul(cols));
     for col in 0..cols {
         out.extend(a.column(col).iter().copied());
