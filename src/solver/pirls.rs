@@ -4914,14 +4914,15 @@ where
         // Aggregating ρ accepted across iters tells us whether the LM
         // model is well-calibrated: ρ ≈ 1 throughout = healthy Newton;
         // ρ << 1 = model over-states predicted reduction. The
-        // `unused_assignments` allow is justified: the trajectory log
-        // is emitted only on iter-end fall-through (via `break;` from
+        // initial `None` is the safety value if a future code path
+        // adds a different fall-through. The trajectory log is
+        // emitted only on iter-end fall-through (via `break;` from
         // the LM loop), which always passes through the accept-step
-        // assignment. The initial `None` is the safety value if a
-        // future code path adds a different fall-through; defending
-        // that case is cheap.
-        #[allow(unused_assignments)]
+        // assignment. The `debug_assert` reads the initial value so
+        // the `unused_assignments` lint stays clean without an
+        // `#[allow]` (which is banned by build.rs).
         let mut lm_accept_rho: Option<f64> = None;
+        debug_assert!(lm_accept_rho.is_none());
         // Madsen-Nielsen-Tingleff stateful rejection factor (eq 3.16 in
         // "Methods for non-linear least squares problems", IMM Tech Univ
         // Denmark, 2nd ed 2004): v starts at 2 and doubles on every

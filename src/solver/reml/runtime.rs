@@ -7600,7 +7600,7 @@ impl<'a> RemlState<'a> {
         let needs_penalty_subspace = !uses_kron_penalty_logdet
             || (matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial);
         let penalty_subspace = if needs_penalty_subspace {
-            Some(self.compute_penalty_subspace(&e_for_logdet, ridge_passport)?)
+            Some(self.cached_penalty_subspace(&e_for_logdet, ridge_passport)?)
         } else {
             None
         };
@@ -7609,7 +7609,7 @@ impl<'a> RemlState<'a> {
             &e_for_logdet,
             &[],
             ridge_passport,
-            penalty_subspace.as_ref(),
+            penalty_subspace.as_deref(),
             mode,
         )?;
 
@@ -7687,7 +7687,7 @@ impl<'a> RemlState<'a> {
         let (hessian_logdet_correction, penalty_subspace_trace) =
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
                 use super::unified::HessianOperator;
-                let Some(penalty_subspace) = penalty_subspace.as_ref() else {
+                let Some(penalty_subspace) = penalty_subspace.as_deref() else {
                     return Err(EstimationError::InvalidInput(
                         "projected Hessian logdet requires penalty subspace".to_string(),
                     ));
@@ -7948,7 +7948,7 @@ impl<'a> RemlState<'a> {
         let needs_penalty_subspace = !uses_kron_penalty_logdet
             || (matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial);
         let penalty_subspace = if needs_penalty_subspace {
-            Some(self.compute_penalty_subspace(&e_for_logdet, ridge_passport)?)
+            Some(self.cached_penalty_subspace(&e_for_logdet, ridge_passport)?)
         } else {
             None
         };
@@ -7957,7 +7957,7 @@ impl<'a> RemlState<'a> {
             &e_for_logdet,
             &[],
             ridge_passport,
-            penalty_subspace.as_ref(),
+            penalty_subspace.as_deref(),
             mode,
         )?;
 
@@ -8013,7 +8013,7 @@ impl<'a> RemlState<'a> {
         let (hessian_logdet_correction, penalty_subspace_trace) =
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
                 use super::unified::HessianOperator;
-                let Some(penalty_subspace) = penalty_subspace.as_ref() else {
+                let Some(penalty_subspace) = penalty_subspace.as_deref() else {
                     return Err(EstimationError::InvalidInput(
                         "projected Hessian logdet requires penalty subspace".to_string(),
                     ));
