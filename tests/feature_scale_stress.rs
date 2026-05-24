@@ -9,10 +9,10 @@
 
 use gam::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-    BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, PeriodicSpline1DOptions, SphereMethod,
-    SphericalSplineBasisSpec, build_bspline_basis_1d, build_spherical_spline_basis,
-    create_cyclic_difference_penalty_matrix, create_periodic_bspline_basis_dense,
-    create_periodic_bspline_derivative_dense, fit_periodic_spline_1d,
+    BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, PeriodicBSplineBasisSpec,
+    SphereMethod, SphericalSplineBasisSpec, build_bspline_basis_1d, build_spherical_spline_basis,
+    create_cyclic_bspline_basis_dense, create_cyclic_difference_penalty_matrix,
+    fit_periodic_bspline_curve, periodic_bspline_first_derivative_nd,
     spherical_wahba_kernel_matrix,
 };
 use ndarray::{Array1, Array2};
@@ -55,7 +55,7 @@ fn periodic_bspline_scales_and_partitions_unity_at_100k() {
     for n in [1_000usize, 10_000, 100_000] {
         let xs = make_uniform_loop(n, period);
         let basis = time_label(&format!("periodic_bspline N={n} k=24 degree=3"), || {
-            create_periodic_bspline_basis_dense(xs.view(), (0.0, period), 3, 24).expect("basis")
+            create_cyclic_bspline_basis_dense(xs.view(), (0.0, period), 3, 24).expect("basis")
         });
         assert_eq!(basis.nrows(), n);
         assert_eq!(basis.ncols(), 24);
@@ -69,7 +69,7 @@ fn periodic_bspline_scales_and_partitions_unity_at_100k() {
         }
         // periodicity: row at x and x + period (mod) give the same row vector
         let xs_wrap = Array1::from_iter(xs.iter().map(|x| x + period));
-        let basis_wrap = create_periodic_bspline_basis_dense(xs_wrap.view(), (0.0, period), 3, 24)
+        let basis_wrap = create_cyclic_bspline_basis_dense(xs_wrap.view(), (0.0, period), 3, 24)
             .expect("wrap basis");
         for i in 0..n.min(2048) {
             for j in 0..24 {
@@ -86,7 +86,7 @@ fn periodic_bspline_derivative_integrates_to_zero_over_loop() {
     let n = 10_000;
     let xs = make_uniform_loop(n, period);
     let d = time_label(&format!("periodic_bspline_deriv N={n} k=20"), || {
-        create_periodic_bspline_derivative_dense(xs.view(), (0.0, period), 3, 20)
+        periodic_bspline_first_derivative_nd(xs.view(), (0.0, period), 3, 20)
             .expect("derivative basis")
     });
     // Integral of each derivative basis column around the loop is zero
@@ -114,7 +114,7 @@ fn exact_periodic_cubic_spline_scales_and_interpolates_at_100k() {
             y[(i, 2)] = 0.1 * (t + 0.3).sin() + 0.05 * (7.0 * t).cos();
         }
         let spline = time_label(&format!("exact_periodic_cubic N={n} d=3"), || {
-            fit_periodic_spline_1d(u.view(), y.view(), PeriodicSpline1DOptions::new(period))
+            fit_periodic_bspline_curve(u.view(), y.view(), &PeriodicBSplineBasisSpec::new(3, 24, period, 0.0, 2), 1e-10)
                 .expect("exact periodic spline")
         });
         assert_eq!(spline.num_sites(), n);
@@ -214,7 +214,6 @@ fn sphere_harmonic_basis_scales_and_keeps_diag_penalty_at_100k() {
             method: SphereMethod::Harmonic,
             max_degree: Some(l),
             wahba_kernel: Default::default(),
-            streaming_chunk_size: None,
         };
         let built = time_label(
             &format!("sphere_harmonic_basis N={n} L={l} p={}", l * (l + 2)),
@@ -341,7 +340,6 @@ fn sphere_harmonic_design_rows_are_finite_at_poles_and_seam() {
         method: SphereMethod::Harmonic,
         max_degree: Some(6),
         wahba_kernel: Default::default(),
-        streaming_chunk_size: None,
     };
     let built = build_spherical_spline_basis(data.view(), &spec).expect("pole+seam build");
     let design = built.design.to_dense();
