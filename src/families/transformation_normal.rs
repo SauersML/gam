@@ -15343,7 +15343,8 @@ pub fn fit_transformation_normal(
             })
         },
         // exact_fn
-        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], eval_mode| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign], eval_mode, row_set| {
+            drop(row_set);
             ensure_exact_geometry(&specs[0], &designs[0])?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
             let geometry = cache_ref
@@ -15355,7 +15356,7 @@ pub fn fit_transformation_normal(
             let eval = evaluate_custom_family_joint_hyper(
                 &geometry.family,
                 &geometry.blocks,
-                options,
+                &options,
                 &rho,
                 &geometry.derivative_blocks,
                 warm_start.as_ref(),
@@ -15395,7 +15396,7 @@ pub fn fit_transformation_normal(
             let eval = evaluate_custom_family_joint_hyper_efs(
                 &geometry.family,
                 &geometry.blocks,
-                options,
+                &options,
                 &rho,
                 &geometry.derivative_blocks,
                 warm_start.as_ref(),

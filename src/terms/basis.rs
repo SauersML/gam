@@ -1659,8 +1659,6 @@ pub struct BSplineBasisSpec {
     /// sides which is a no-op.
     #[serde(default)]
     pub boundary_conditions: BSplineBoundaryConditions,
-    #[serde(default)]
-    pub streaming_chunk_size: Option<usize>,
 }
 
 /// Per-endpoint boundary constraint policy for B-spline 1D bases.
@@ -2178,8 +2176,6 @@ pub struct SphericalSplineBasisSpec {
     /// DSL via term_builder) still produce Sobolev specs.
     #[serde(default = "legacy_pseudo_wahba_kernel")]
     pub wahba_kernel: SphereWahbaKernel,
-    #[serde(default)]
-    pub streaming_chunk_size: Option<usize>,
 }
 
 /// Serde-compat default for `SphericalSplineBasisSpec::wahba_kernel`.
@@ -2199,7 +2195,6 @@ impl Default for SphericalSplineBasisSpec {
             method: SphereMethod::Wahba,
             max_degree: None,
             wahba_kernel: SphereWahbaKernel::Sobolev,
-            streaming_chunk_size: None,
         }
     }
 }
@@ -2231,8 +2226,6 @@ pub struct MaternBasisSpec {
     /// When None, isotropic distance r = ‖x - c‖ is used.
     #[serde(default)]
     pub aniso_log_scales: Option<Vec<f64>>,
-    #[serde(default)]
-    pub streaming_chunk_size: Option<usize>,
 }
 
 /// Per-smooth identifiability policy for Matérn kernel coefficients.
@@ -2488,7 +2481,6 @@ pub enum BasisMetadata {
         knots: Array1<f64>,
         identifiability_transform: Option<Array2<f64>>,
         periodic: Option<(f64, f64, usize)>,
-        streaming_chunk_size: Option<usize>,
     },
     ThinPlate {
         centers: Array2<f64>,
@@ -2509,7 +2501,6 @@ pub enum BasisMetadata {
         max_degree: Option<usize>,
         wahba_kernel: SphereWahbaKernel,
         constraint_transform: Option<Array2<f64>>,
-        streaming_chunk_size: Option<usize>,
     },
     Matern {
         centers: Array2<f64>,
