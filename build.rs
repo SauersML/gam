@@ -38,6 +38,31 @@ fn main() {
         std::process::exit(1);
     }
 
+    // `#[allow(unused_assignments)]` ban. The lint catches dead writes that
+    // signal a logic error (a value computed and then overwritten without
+    // being read). Silencing it locally hides those bugs; rewrite the code
+    // so the initial value is actually read (e.g. via `debug_assert`) or
+    // restructure to assign only on the path that needs the value.
+    let mut allow_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_banned_allow(&manifest_dir, &manifest_dir, "unused_assignments", &mut allow_offenders);
+    if !allow_offenders.is_empty() {
+        eprintln!();
+        eprintln!(
+            "error: {} `#[allow(unused_assignments)]` attribute(s) found. \
+             Rewrite so the initial assignment is read, or restructure the \
+             control flow — do not silence the lint.",
+            allow_offenders.len()
+        );
+        eprintln!();
+        for (rel, line_no, line) in &allow_offenders {
+            let trimmed = line.trim();
+            let snippet: String = trimmed.chars().take(160).collect();
+            eprintln!("  {}:{}: {}", rel.display(), line_no, snippet);
+        }
+        eprintln!();
+        std::process::exit(1);
+    }
+
     // Ignored-test ban: every `#[ignore]` / `#[ignore = "..."]` attribute is
     // a test the suite no longer enforces. Stop the build until they are
     // either deleted or restored to the running suite.
@@ -76,6 +101,64 @@ fn scan_for_banned_marker(
         }
         for (idx, line) in content.lines().enumerate() {
             if line.contains(needle) {
+                offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+            }
+        }
+    });
+}
+
+/// Scan for `#[allow(<lint>)]` and `#[allow(..., <lint>, ...)]`. Matches the
+/// lint name as a whole word so `unused_assignments_foo` would not collide.
+/// Only Rust files are inspected; build.rs is exempt (it documents the bans
+/// it enforces, including the lint name).
+fn scan_for_banned_allow(
+    root: &Path,
+    dir: &Path,
+    lint: &str,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("allow(") || !content.contains(lint) {
+            return;
+        }
+        for (idx, line) in content.lines().enumerate() {
+            // Find `allow(` then look inside the parenthesized list for `lint`
+            // as a comma/whitespace-delimited token. This avoids matching
+            // identifiers that merely contain the lint name as a substring
+            // and also avoids matching the lint name in unrelated string
+            // literals or comments.
+            let bytes = line.as_bytes();
+            let mut search_from = 0usize;
+            let mut matched = false;
+            while let Some(rel_idx) = line[search_from..].find("allow(") {
+                let start = search_from + rel_idx + "allow(".len();
+                // Find matching ')' on the same line.
+                let Some(end_rel) = line[start..].find(')') else {
+                    break;
+                };
+                let inside = &line[start..start + end_rel];
+                for tok in inside.split(',') {
+                    if tok.trim() == lint {
+                        matched = true;
+                        break;
+                    }
+                }
+                if matched {
+                    break;
+                }
+                search_from = start + end_rel + 1;
+                if search_from >= bytes.len() {
+                    break;
+                }
+            }
+            if matched {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }
         }

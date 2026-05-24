@@ -56,7 +56,7 @@ use crate::terms::{
     BlockSparsityPenalty, DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty,
     NuclearNormPenalty, OrthogonalityPenalty, ParametricAuxConditionalPriorPenalty,
     PenaltyConcavity, PenaltyTier, PsiSlice, ScadMcpPenalty, SoftmaxAssignmentSparsityPenalty,
-    SparsityPenalty, TotalVariationPenalty,
+    SparsityPenalty, ScalarWeightSchedule, ScheduleKind, TotalVariationPenalty,
 };
 use crate::survival::PenaltyBlock;
 use crate::types::{
@@ -3152,6 +3152,68 @@ fn analytic_descriptor_difference_op(
             "{context}.difference_op must be forward_1d or graph_edges; got {other:?}"
         )),
     }
+}
+
+fn analytic_descriptor_weight_schedule(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    context: &str,
+) -> Result<Option<ScalarWeightSchedule>, String> {
+    let Some(raw_schedule) = descriptor.get("weight_schedule") else {
+        return Ok(None);
+    };
+    if raw_schedule.is_null() {
+        return Ok(None);
+    }
+    let schedule = raw_schedule
+        .as_object()
+        .ok_or_else(|| format!("{context}.weight_schedule must be an object"))?;
+    let w_start = schedule
+        .get("w_start")
+        .and_then(JsonValue::as_f64)
+        .ok_or_else(|| format!("{context}.weight_schedule.w_start must be a finite number"))?;
+    let w_end = schedule
+        .get("w_end")
+        .and_then(JsonValue::as_f64)
+        .ok_or_else(|| format!("{context}.weight_schedule.w_end must be a finite number"))?;
+    let kind_name = schedule
+        .get("kind")
+        .or_else(|| schedule.get("decay"))
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{context}.weight_schedule.kind is required"))?
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    let kind = match kind_name.as_str() {
+        "geometric" => {
+            let rate = schedule
+                .get("rate")
+                .and_then(JsonValue::as_f64)
+                .ok_or_else(|| format!("{context}.weight_schedule.rate is required for geometric"))?;
+            ScheduleKind::Geometric { rate }
+        }
+        "linear" => {
+            let steps = schedule
+                .get("steps")
+                .and_then(JsonValue::as_u64)
+                .ok_or_else(|| format!("{context}.weight_schedule.steps is required for linear"))?;
+            ScheduleKind::Linear {
+                steps: steps as usize,
+            }
+        }
+        "reciprocal_iter" => ScheduleKind::ReciprocalIter,
+        other => {
+            return Err(format!(
+                "{context}.weight_schedule.kind must be geometric, linear, or reciprocal_iter; got {other:?}"
+            ));
+        }
+    };
+    let mut parsed = ScalarWeightSchedule::new(w_start, w_end, kind)
+        .map_err(|err| format!("{context}.weight_schedule: {err}"))?;
+    if let Some(iter_count) = schedule.get("iter_count") {
+        parsed.iter_count = iter_count.as_u64().ok_or_else(|| {
+            format!("{context}.weight_schedule.iter_count must be a non-negative integer")
+        })? as usize;
+    }
+    Ok(Some(parsed))
 }
 
 fn build_standard_latent_analytic_penalty_registry(

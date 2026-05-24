@@ -13856,9 +13856,21 @@ impl SingleBlockLatentCoordDesignCache {
             }),
             (
                 SmoothBasisSpec::Pca { .. },
-                BasisMetadata::Pca { basis_matrix, .. },
+                BasisMetadata::Pca {
+                    basis_matrix,
+                    centered,
+                    smooth_penalty,
+                    center_mean,
+                    ..
+                },
             ) => Ok(crate::solver::latent_cache::LatentBasisKind::Pca {
                 basis_matrix: basis_matrix.clone(),
+                centered: *centered,
+                center_mean_fingerprint: crate::solver::latent_cache::pca_center_mean_fingerprint(
+                    *centered,
+                    center_mean.as_ref(),
+                ),
+                smooth_penalty: *smooth_penalty,
             }),
             _ => Err(SmoothError::invalid_config(
                 "latent-coordinate design cache could not key the realized latent smooth basis"
@@ -17525,11 +17537,15 @@ fn try_exact_joint_latent_coord_optimization(
             )?;
             let latent = self.cache.latent().map_err(EstimationError::InvalidInput)?;
             if let Some(registry) = self.cache.analytic_penalties() {
+                let mut registry = registry.as_ref().clone();
+                registry.apply_weight_schedules(
+                    crate::solver::estimate::reml::runtime::current_outer_iter() as usize,
+                );
                 add_analytic_penalty_objective_to_eval(
                     theta,
                     self.rho_dim,
                     latent.as_ref(),
-                    registry.as_ref(),
+                    &registry,
                     &mut eval,
                 )?;
             }
@@ -17565,12 +17581,16 @@ fn try_exact_joint_latent_coord_optimization(
                 Some(self.cache.design_revision()),
             )?;
             if let Some(registry) = self.cache.analytic_penalties() {
+                let mut registry = registry.as_ref().clone();
+                registry.apply_weight_schedules(
+                    crate::solver::estimate::reml::runtime::current_outer_iter() as usize,
+                );
                 let latent = self.cache.latent().map_err(EstimationError::InvalidInput)?;
                 let contribution = analytic_penalty_objective_contribution(
                     theta,
                     self.rho_dim,
                     latent.as_ref(),
-                    registry.as_ref(),
+                    &registry,
                 )?;
                 efs.cost += contribution.cost;
                 if let (Some(psi_gradient), Some(psi_indices)) =
@@ -17630,11 +17650,16 @@ fn try_exact_joint_latent_coord_optimization(
                     };
                     let cost = cost + contribution.cost;
                     let cost = if let Some(registry) = self.cache.analytic_penalties() {
+                        let mut registry = registry.as_ref().clone();
+                        registry.apply_weight_schedules(
+                            crate::solver::estimate::reml::runtime::current_outer_iter()
+                                as usize,
+                        );
                         match analytic_penalty_objective_contribution(
                             theta,
                             self.rho_dim,
                             latent.as_ref(),
-                            registry.as_ref(),
+                            &registry,
                         ) {
                             Ok(contribution) => cost + contribution.cost,
                             Err(_) => return f64::INFINITY,
