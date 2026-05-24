@@ -488,7 +488,7 @@ pub trait HessianOperator: Send + Sync {
     /// operator-backed (Lazy) designs never materialize the full (n×p)
     /// block at biobank scale.
     fn xt_logdet_kernel_x_diagonal(&self, x: &DesignMatrix) -> Array1<f64> {
-        debug_assert!(self.logdet_traces_match_hinv_kernel());
+        assert!(self.logdet_traces_match_hinv_kernel());
         let n = x.nrows();
         let p = x.ncols();
 
@@ -1960,7 +1960,7 @@ pub trait HyperOperator: Send + Sync {
     fn mul_basis_columns_into(&self, start: usize, mut out: ArrayViewMut2<'_, f64>) {
         let cols = out.ncols();
         let dim = out.nrows();
-        debug_assert!(start + cols <= dim);
+        assert!(start + cols <= dim);
         let mut basis = Array1::<f64>::zeros(dim);
         for local_col in 0..cols {
             let global_col = start + local_col;
@@ -2488,7 +2488,7 @@ impl HyperOperator for DenseMatrixHyperOperator {
 
     fn mul_basis_columns_into(&self, start: usize, mut out: ArrayViewMut2<'_, f64>) {
         let end = start + out.ncols();
-        debug_assert!(end <= self.matrix.ncols());
+        assert!(end <= self.matrix.ncols());
         out.assign(&self.matrix.slice(ndarray::s![.., start..end]));
     }
 
@@ -3376,7 +3376,7 @@ impl HyperCoordDrift {
     }
 
     pub fn scaled_add_apply(&self, v: ArrayView1<'_, f64>, scale: f64, out: &mut Array1<f64>) {
-        debug_assert_eq!(v.len(), out.len());
+        assert_eq!(v.len(), out.len());
         if scale == 0.0 {
             return;
         }
@@ -3494,7 +3494,7 @@ impl HyperOperator for ImplicitHyperOperator {
     }
 
     fn mul_vec_into(&self, v: ArrayView1<'_, f64>, out: ArrayViewMut1<'_, f64>) {
-        debug_assert_eq!(v.len(), self.p);
+        assert_eq!(v.len(), self.p);
         let n_obs = self.w_diag.len();
         // Reuse thread-local scratch across repeated matvec calls (e.g.
         // PCG iterations, basis-column sweeps) instead of allocating
@@ -3516,7 +3516,7 @@ impl HyperOperator for ImplicitHyperOperator {
 
     fn mul_basis_columns_into(&self, start: usize, mut out: ArrayViewMut2<'_, f64>) {
         let cols = out.ncols();
-        debug_assert!(start + cols <= self.p);
+        assert!(start + cols <= self.p);
 
         let n_obs = self.w_diag.len();
         let mut basis = Array1::<f64>::zeros(self.p);
@@ -3578,8 +3578,8 @@ impl HyperOperator for ImplicitHyperOperator {
     }
 
     fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
-        debug_assert_eq!(v.len(), self.p);
-        debug_assert_eq!(u.len(), self.p);
+        assert_eq!(v.len(), self.p);
+        assert_eq!(u.len(), self.p);
 
         let x_v = design_matrix_apply_view(&self.x_design, v);
         let x_u = design_matrix_apply_view(&self.x_design, u);
@@ -3650,7 +3650,7 @@ impl HyperOperator for ImplicitHyperOperator {
     /// the biobank-shape margslope-aniso-duchon16d shard each per-axis trace
     /// drops from ~30 s to a single chunked-GEMM cost.
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.p);
+        assert_eq!(factor.nrows(), self.p);
         let n_obs = self.w_diag.len();
         let rank = factor.ncols();
         if rank == 0 || n_obs == 0 {
@@ -3675,7 +3675,7 @@ impl HyperOperator for ImplicitHyperOperator {
         factor: &Array2<f64>,
         cache: &ProjectedFactorCache,
     ) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.p);
+        assert_eq!(factor.nrows(), self.p);
         let n_obs = self.w_diag.len();
         let rank = factor.ncols();
         if rank == 0 || n_obs == 0 {
@@ -3746,7 +3746,7 @@ impl ImplicitHyperOperator {
     fn trace_projected_factor_with_xf(&self, factor: &Array2<f64>, xf: ArrayView2<'_, f64>) -> f64 {
         let rank = factor.ncols();
         let n_obs = self.w_diag.len();
-        debug_assert_eq!(xf.dim(), (n_obs, rank));
+        assert_eq!(xf.dim(), (n_obs, rank));
 
         // Once: unproject F to raw knot space → (n_knots × rank).
         let u_knot = self.implicit_deriv.unproject_matrix(&factor.view());
@@ -3817,7 +3817,7 @@ impl ImplicitHyperOperator {
     ) -> Vec<f64> {
         let rank = factor.ncols();
         let n_obs = self.w_diag.len();
-        debug_assert_eq!(xf.dim(), (n_obs, rank));
+        assert_eq!(xf.dim(), (n_obs, rank));
 
         let u_knot = self.implicit_deriv.unproject_matrix(&factor.view());
 
@@ -3887,9 +3887,9 @@ impl ImplicitHyperOperator {
             return;
         };
         let c = c_x_psi_beta.as_ref();
-        debug_assert_eq!(x_col.len(), c.len());
-        debug_assert_eq!(n_work.len(), c.len());
-        debug_assert_eq!(p_work.len(), self.p);
+        assert_eq!(x_col.len(), c.len());
+        assert_eq!(n_work.len(), c.len());
+        assert_eq!(p_work.len(), self.p);
 
         for i in 0..c.len() {
             n_work[i] = c[i] * x_col[i];
@@ -3991,10 +3991,10 @@ impl ImplicitHyperOperator {
         mut n_work: ArrayViewMut1<'_, f64>,
         mut p_work: ArrayViewMut1<'_, f64>,
     ) {
-        debug_assert_eq!(z.len(), self.p);
-        debug_assert_eq!(out.len(), self.p);
-        debug_assert_eq!(n_work.len(), self.w_diag.len());
-        debug_assert_eq!(p_work.len(), self.p);
+        assert_eq!(z.len(), self.p);
+        assert_eq!(out.len(), self.p);
+        assert_eq!(n_work.len(), self.w_diag.len());
+        assert_eq!(p_work.len(), self.p);
 
         let w = &*self.w_diag;
         for i in 0..w.len() {
@@ -4064,7 +4064,7 @@ impl HyperOperator for SparseDirectionalHyperOperator {
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        debug_assert_eq!(v.len(), self.p);
+        assert_eq!(v.len(), self.p);
 
         // X v
         let x_v = self.x_design.matrixvectormultiply(v);
@@ -4322,7 +4322,7 @@ impl PenaltyCoordinate {
     }
 
     fn apply_root(&self, beta: &Array1<f64>) -> Array1<f64> {
-        debug_assert_eq!(beta.len(), self.dim());
+        assert_eq!(beta.len(), self.dim());
         match self {
             Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => root.dot(beta),
             Self::BlockRoot {
@@ -4347,7 +4347,7 @@ impl PenaltyCoordinate {
     }
 
     pub fn apply_penalty(&self, beta: &Array1<f64>, scale: f64) -> Array1<f64> {
-        debug_assert_eq!(beta.len(), self.dim());
+        assert_eq!(beta.len(), self.dim());
         let mut out = Array1::<f64>::zeros(self.dim());
         self.apply_penalty_view_into(beta.view(), scale, out.view_mut());
         out
@@ -4359,8 +4359,8 @@ impl PenaltyCoordinate {
         scale: f64,
         mut out: ArrayViewMut1<'_, f64>,
     ) {
-        debug_assert_eq!(beta.len(), self.dim());
-        debug_assert_eq!(out.len(), self.dim());
+        assert_eq!(beta.len(), self.dim());
+        assert_eq!(out.len(), self.dim());
         out.fill(0.0);
         self.scaled_add_penalty_view(beta, scale, out);
     }
@@ -4371,8 +4371,8 @@ impl PenaltyCoordinate {
         scale: f64,
         mut out: ArrayViewMut1<'_, f64>,
     ) {
-        debug_assert_eq!(beta.len(), self.dim());
-        debug_assert_eq!(out.len(), self.dim());
+        assert_eq!(beta.len(), self.dim());
+        assert_eq!(out.len(), self.dim());
         if scale == 0.0 {
             return;
         }
@@ -4437,7 +4437,7 @@ impl PenaltyCoordinate {
                     marginal_dims[..k].iter().copied().product::<usize>().max(1);
                 let inner_size = stride_k;
                 let eigs = &eigenvalues[k];
-                debug_assert_eq!(
+                assert_eq!(
                     outer_size * q_k * stride_k,
                     *total_dim,
                     "KroneckerMarginal dimension mismatch in apply"
@@ -4603,7 +4603,7 @@ impl PenaltyCoordinate {
                 let outer_size: usize =
                     marginal_dims[..k].iter().copied().product::<usize>().max(1);
                 let eigs = &eigenvalues[k];
-                debug_assert_eq!(
+                assert_eq!(
                     outer_size * q_k * stride_k,
                     *total_dim,
                     "KroneckerMarginal dimension mismatch in to_dense"
@@ -4962,9 +4962,9 @@ impl PenaltySubspaceTrace {
         let n = x.nrows();
         let p = x.ncols();
         let r = self.u_s.ncols();
-        debug_assert_eq!(self.u_s.nrows(), p);
-        debug_assert_eq!(self.h_proj_inverse.nrows(), r);
-        debug_assert_eq!(self.h_proj_inverse.ncols(), r);
+        assert_eq!(self.u_s.nrows(), p);
+        assert_eq!(self.h_proj_inverse.nrows(), r);
+        assert_eq!(self.h_proj_inverse.ncols(), r);
 
         let block = {
             const TARGET_CHUNK_FLOATS: usize = 1 << 16;
@@ -6148,8 +6148,8 @@ fn dense_matvec_into(
     x: ArrayView1<'_, f64>,
     mut out: ArrayViewMut1<'_, f64>,
 ) {
-    debug_assert_eq!(matrix.ncols(), x.len());
-    debug_assert_eq!(matrix.nrows(), out.len());
+    assert_eq!(matrix.ncols(), x.len());
+    assert_eq!(matrix.nrows(), out.len());
     for (row, out_value) in matrix.rows().into_iter().zip(out.iter_mut()) {
         *out_value = row.dot(&x);
     }
@@ -6162,8 +6162,8 @@ fn dense_matvec_scaled_add_into(
     scale: f64,
     mut out: ArrayViewMut1<'_, f64>,
 ) {
-    debug_assert_eq!(matrix.ncols(), x.len());
-    debug_assert_eq!(matrix.nrows(), out.len());
+    assert_eq!(matrix.ncols(), x.len());
+    assert_eq!(matrix.nrows(), out.len());
     if scale == 0.0 {
         return;
     }
@@ -6178,8 +6178,8 @@ fn dense_transpose_matvec_into(
     x: ArrayView1<'_, f64>,
     mut out: ArrayViewMut1<'_, f64>,
 ) {
-    debug_assert_eq!(matrix.nrows(), x.len());
-    debug_assert_eq!(matrix.ncols(), out.len());
+    assert_eq!(matrix.nrows(), x.len());
+    assert_eq!(matrix.ncols(), out.len());
     out.fill(0.0);
     dense_transpose_matvec_scaled_add_into(matrix, x, 1.0, out);
 }
@@ -6191,8 +6191,8 @@ fn dense_transpose_matvec_scaled_add_into(
     scale: f64,
     mut out: ArrayViewMut1<'_, f64>,
 ) {
-    debug_assert_eq!(matrix.nrows(), x.len());
-    debug_assert_eq!(matrix.ncols(), out.len());
+    assert_eq!(matrix.nrows(), x.len());
+    assert_eq!(matrix.ncols(), out.len());
     if scale == 0.0 {
         return;
     }
@@ -6209,8 +6209,8 @@ fn dense_transpose_matvec_scaled_add_into(
 
 #[inline]
 fn dense_bilinear(matrix: &Array2<f64>, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
-    debug_assert_eq!(matrix.ncols(), v.len());
-    debug_assert_eq!(matrix.nrows(), u.len());
+    assert_eq!(matrix.ncols(), v.len());
+    assert_eq!(matrix.nrows(), u.len());
     let mut total = 0.0;
     for (row, u_value) in matrix.rows().into_iter().zip(u.iter().copied()) {
         total += u_value * row.dot(&v);
@@ -6229,8 +6229,8 @@ fn design_matrix_column_into(
     col: usize,
     mut output: ArrayViewMut1<'_, f64>,
 ) {
-    debug_assert!(col < design.ncols());
-    debug_assert_eq!(design.nrows(), output.len());
+    assert!(col < design.ncols());
+    assert_eq!(design.nrows(), output.len());
 
     if let Some(dense) = design.as_dense() {
         output.assign(&dense.column(col));
@@ -6259,8 +6259,8 @@ fn design_matrix_apply_view_into(
     vector: ArrayView1<'_, f64>,
     mut output: ArrayViewMut1<'_, f64>,
 ) {
-    debug_assert_eq!(design.ncols(), vector.len());
-    debug_assert_eq!(design.nrows(), output.len());
+    assert_eq!(design.ncols(), vector.len());
+    assert_eq!(design.nrows(), output.len());
 
     if let Some(dense) = design.as_dense() {
         dense_matvec_into(dense, vector, output);
@@ -6293,8 +6293,8 @@ fn design_matrix_transpose_apply_view_into(
     vector: ArrayView1<'_, f64>,
     mut output: ArrayViewMut1<'_, f64>,
 ) {
-    debug_assert_eq!(design.nrows(), vector.len());
-    debug_assert_eq!(design.ncols(), output.len());
+    assert_eq!(design.nrows(), vector.len());
+    assert_eq!(design.ncols(), output.len());
 
     if let Some(dense) = design.as_dense() {
         dense_transpose_matvec_into(dense, vector, output);
@@ -6321,8 +6321,8 @@ fn design_matrix_transpose_apply_view_into(
 
 #[inline]
 fn trace_matrix_product(left: &Array2<f64>, right: &Array2<f64>) -> f64 {
-    debug_assert_eq!(left.nrows(), left.ncols());
-    debug_assert_eq!(left.raw_dim(), right.raw_dim());
+    assert_eq!(left.nrows(), left.ncols());
+    assert_eq!(left.raw_dim(), right.raw_dim());
     let n = left.nrows();
     let mut trace = 0.0;
     for i in 0..n {
@@ -6510,8 +6510,8 @@ fn materialize_penalty_coord_dense(coord: &PenaltyCoordinate, p: usize) -> Array
     // Routing through it replaces the previous serial p-fold matvec loop
     // with the variant-appropriate O(p²) (or O(p) for Kronecker) path.
     let out = coord.scaled_dense_matrix(1.0);
-    debug_assert_eq!(out.nrows(), p, "penalty coord dim mismatch");
-    debug_assert_eq!(out.ncols(), p, "penalty coord dim mismatch");
+    assert_eq!(out.nrows(), p, "penalty coord dim mismatch");
+    assert_eq!(out.ncols(), p, "penalty coord dim mismatch");
     out
 }
 
@@ -7381,7 +7381,7 @@ pub fn reml_laml_evaluate(
                 rhs_stack.column_mut(col_idx).assign(&coord.g);
                 col_idx += 1;
             }
-            debug_assert_eq!(col_idx, total_cols);
+            assert_eq!(col_idx, total_cols);
             let solved_stack = hop.solve_multi(&rhs_stack);
             let rho_v_ks = if need_rho_mode_responses {
                 Some((0..k).map(|i| solved_stack.column(i).to_owned()).collect())
@@ -10211,7 +10211,7 @@ impl StoredFirstDrift {
     }
 
     fn scaled_add_apply(&self, v: ArrayView1<'_, f64>, scale: f64, out: &mut Array1<f64>) {
-        debug_assert_eq!(v.len(), out.len());
+        assert_eq!(v.len(), out.len());
         if scale == 0.0 {
             return;
         }
@@ -10226,7 +10226,7 @@ impl StoredFirstDrift {
     }
 
     fn apply_dot(&self, v: ArrayView1<'_, f64>, test: ArrayView1<'_, f64>) -> f64 {
-        debug_assert_eq!(v.len(), test.len());
+        assert_eq!(v.len(), test.len());
         let mut total = 0.0;
         if let Some(matrix) = self.dense.as_ref() {
             total += dense_bilinear(matrix, v, test);
@@ -11637,7 +11637,7 @@ pub fn compute_efs_update(solution: &InnerSolution<'_>, rho: &[f64], gradient: &
     let k = rho.len();
     let ext_dim = solution.ext_coords.len();
     let total = k + ext_dim;
-    debug_assert_eq!(
+    assert_eq!(
         gradient.len(),
         total,
         "compute_efs_update: gradient length {} != n_rho({k}) + n_ext({ext_dim})",
@@ -11716,8 +11716,8 @@ pub(crate) fn efs_single_loop_diagnostics(
     let k = rho.len();
     let ext_dim = solution.ext_coords.len();
     let total = k + ext_dim;
-    debug_assert_eq!(gradient.len(), total);
-    debug_assert_eq!(steps.len(), total);
+    assert_eq!(gradient.len(), total);
+    assert_eq!(steps.len(), total);
 
     let (profiled_scale, dp_cgrad) = efs_profiling(solution);
     let mut grad_sq = 0.0_f64;
@@ -11896,7 +11896,7 @@ pub fn compute_hybrid_efs_update(
     let mut steps = vec![0.0; total];
 
     let (profiled_scale, dp_cgrad) = efs_profiling(solution);
-    debug_assert_eq!(
+    assert_eq!(
         gradient.len(),
         total,
         "compute_hybrid_efs_update: gradient length {} != n_rho({k}) + n_ext({ext_dim})",
@@ -13815,7 +13815,7 @@ impl SparseCholeskyOperator {
         block: &Array2<f64>,
         start: usize,
     ) -> f64 {
-        debug_assert_eq!(block.nrows(), block.ncols());
+        assert_eq!(block.nrows(), block.ncols());
         let mut trace = 0.0;
         for i in 0..block.nrows() {
             let diag = block[[i, i]];
@@ -13986,7 +13986,7 @@ impl SparseCholeskyOperator {
         if scale == 0.0 {
             return 0.0;
         }
-        debug_assert_eq!(block.nrows(), end - start);
+        assert_eq!(block.nrows(), end - start);
         let t_start = std::time::Instant::now();
         let block_size = end - start;
         let chunk = Self::OPERATOR_SOLVE_CHUNK.min(block_size.max(1));
@@ -14049,7 +14049,7 @@ impl SparseCholeskyOperator {
         start: usize,
         end: usize,
     ) -> Result<Array2<f64>, String> {
-        debug_assert_eq!(block.nrows(), end - start);
+        assert_eq!(block.nrows(), end - start);
         let block_size = end - start;
         let chunk = Self::OPERATOR_SOLVE_CHUNK.min(block_size.max(1));
         let mut solved = Array2::<f64>::zeros((block_size, block_size));
@@ -14395,7 +14395,7 @@ impl HessianOperator for SparseCholeskyOperator {
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
         if let Some(ref taka) = self.takahashi {
             if let Some((local, start, end)) = op.block_local_data() {
-                debug_assert_eq!(local.nrows(), end - start);
+                assert_eq!(local.nrows(), end - start);
                 return Self::takahashi_block_trace(taka, local, start);
             }
             // For other non-implicit operators: materialize and use Takahashi lookups
@@ -14419,7 +14419,7 @@ impl HessianOperator for SparseCholeskyOperator {
         end: usize,
     ) -> f64 {
         if let Some(ref taka) = self.takahashi {
-            debug_assert_eq!(block.nrows(), end - start);
+            assert_eq!(block.nrows(), end - start);
             return scale * Self::takahashi_block_trace(taka, block, start);
         }
         self.trace_hinv_block_local_exact(block, scale, start, end)
@@ -14433,7 +14433,7 @@ impl HessianOperator for SparseCholeskyOperator {
         end: usize,
     ) -> f64 {
         if let Some(ref taka) = self.takahashi {
-            debug_assert_eq!(block.nrows(), end - start);
+            assert_eq!(block.nrows(), end - start);
             let za = Self::takahashi_left_multiply_block(taka, block, start);
             return scale * scale * trace_matrix_product(&za, &za);
         }
@@ -16529,7 +16529,7 @@ fn rademacher_probe_into(mut z: ArrayViewMut1<'_, f64>, rng: &mut Xoshiro256SS) 
 fn modified_gram_schmidt(y: &Array2<f64>, q: &mut Array2<f64>) -> usize {
     let p = y.nrows();
     let m = y.ncols();
-    debug_assert_eq!(q.dim(), (p, m));
+    assert_eq!(q.dim(), (p, m));
     q.fill(0.0);
     if p == 0 || m == 0 {
         return 0;
@@ -16607,7 +16607,7 @@ where
     O: HyperOperator + ?Sized,
 {
     let p = hop.dim();
-    debug_assert_eq!(op.dim(), p, "Hutch++: operator dim mismatch");
+    assert_eq!(op.dim(), p, "Hutch++: operator dim mismatch");
     if p == 0 {
         return 0.0;
     }
@@ -16719,7 +16719,7 @@ where
     O: HyperOperator + ?Sized,
 {
     let p = hop.dim();
-    debug_assert_eq!(op.dim(), p, "Hutch++ squared: operator dim mismatch");
+    assert_eq!(op.dim(), p, "Hutch++ squared: operator dim mismatch");
     if p == 0 {
         return 0.0;
     }
@@ -16833,8 +16833,8 @@ where
     R: HyperOperator + ?Sized,
 {
     let p = hop.dim();
-    debug_assert_eq!(left.dim(), p, "cross trace: left operator dim mismatch");
-    debug_assert_eq!(right.dim(), p, "cross trace: right operator dim mismatch");
+    assert_eq!(left.dim(), p, "cross trace: left operator dim mismatch");
+    assert_eq!(right.dim(), p, "cross trace: right operator dim mismatch");
     if p == 0 {
         return 0.0;
     }

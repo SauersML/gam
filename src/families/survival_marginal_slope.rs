@@ -3562,7 +3562,7 @@ impl SurvivalMarginalSlopeFamily {
 
     #[inline]
     fn score_dim(&self) -> usize {
-        debug_assert_eq!(self.score_covariance.dim(), self.z.ncols());
+        assert_eq!(self.score_covariance.dim(), self.z.ncols());
         self.z.ncols()
     }
 
@@ -16941,7 +16941,7 @@ fn joint_setup(
     let core_len = time_penalties + marginal_penalties + logslope_penalties;
     let rho_dim = core_len + extra_rho0.len();
     let mut rho0vec = Array1::<f64>::zeros(rho_dim);
-    debug_assert_eq!(
+    assert_eq!(
         core_rho0_seed.len(),
         core_len,
         "core_rho0_seed length must equal time+marginal+logslope penalty count"

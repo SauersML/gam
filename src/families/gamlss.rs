@@ -4852,7 +4852,7 @@ fn stable_softplus(x: f64) -> f64 {
 
 #[inline]
 fn log1mexp_neg_positive(z: f64) -> f64 {
-    debug_assert!(z >= 0.0);
+    assert!(z >= 0.0);
     if z == 0.0 {
         f64::NEG_INFINITY
     } else if z <= std::f64::consts::LN_2 {
@@ -8492,8 +8492,8 @@ impl RowCoeffOperator {
     }
 
     fn trace_from_pair_gram_table(&self, grams: ArrayView2<'_, f64>) -> f64 {
-        debug_assert_eq!(grams.nrows(), self.nrows);
-        debug_assert_eq!(grams.ncols(), self.pair_coeffs.len());
+        assert_eq!(grams.nrows(), self.nrows);
+        assert_eq!(grams.ncols(), self.pair_coeffs.len());
         let mut trace = 0.0;
         for i in 0..self.nrows {
             for (pair_idx, pair) in self.pair_coeffs.iter().enumerate() {
@@ -8511,7 +8511,7 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        debug_assert_eq!(v.len(), self.dim);
+        assert_eq!(v.len(), self.dim);
         let mut scratch = self.acquire_scratch();
         let RowCoeffScratch { u, r } = &mut scratch;
 
@@ -8521,7 +8521,7 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
         for (k, ch) in self.channels.iter().enumerate() {
             let start = self.block_offsets[ch.block];
             let width = self.block_widths[ch.block];
-            debug_assert_eq!(ch.design.ncols(), width);
+            assert_eq!(ch.design.ncols(), width);
             let v_slice = v.slice(s![start..start + width]);
             crate::faer_ndarray::fast_av_into(ch.design.as_ref(), &v_slice, &mut u[k]);
         }
@@ -8601,7 +8601,7 @@ impl crate::solver::estimate::reml::unified::HyperOperator for RowCoeffOperator 
 
     fn mul_basis_columns_into(&self, start: usize, mut out: ndarray::ArrayViewMut2<'_, f64>) {
         let cols = out.ncols();
-        debug_assert!(start + cols <= self.dim);
+        assert!(start + cols <= self.dim);
         let mut basis = Array1::<f64>::zeros(self.dim);
         for local_col in 0..cols {
             let global_col = start + local_col;
@@ -8665,13 +8665,13 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        debug_assert_eq!(v.len(), self.dim);
+        assert_eq!(v.len(), self.dim);
         let v_a = v.slice(s![0..self.pa]);
         let v_b = v.slice(s![self.pa..self.dim]);
         let u_a = self.x_a.matrixvectormultiply(&v_a.to_owned());
         let u_b = self.x_b.matrixvectormultiply(&v_b.to_owned());
-        debug_assert_eq!(u_a.len(), self.nrows);
-        debug_assert_eq!(u_b.len(), self.nrows);
+        assert_eq!(u_a.len(), self.nrows);
+        assert_eq!(u_b.len(), self.nrows);
         let r_a = self.c_aa.as_ref() * &u_a + self.c_ab.as_ref() * &u_b;
         let r_b = self.c_ab.as_ref() * &u_a + self.c_bb.as_ref() * &u_b;
         let out_a = self.x_a.transpose_vector_multiply(&r_a);
@@ -8684,7 +8684,7 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
 
     fn mul_basis_columns_into(&self, start: usize, mut out: ndarray::ArrayViewMut2<'_, f64>) {
         let cols = out.ncols();
-        debug_assert!(start + cols <= self.dim);
+        assert!(start + cols <= self.dim);
         let mut basis = Array1::<f64>::zeros(self.dim);
         for local_col in 0..cols {
             let global_col = start + local_col;
@@ -8722,13 +8722,13 @@ impl crate::solver::estimate::reml::unified::HyperOperator for DesignTwoBlockRow
     ) -> f64 {
         // Validate the factor row count up front. Without this, a caller that
         // hands in a factor whose row count does not equal the joint p slips
-        // into the per-column `mul_vec` slicing where a `debug_assert_eq!`
+        // into the per-column `mul_vec` slicing where a `assert_eq!`
         // panics with the generic `left/right` message — that loses the
         // operator identity and the (pa, pb) split which is the only useful
         // diagnostic when the trace caller's own dimension bookkeeping is
         // off. Validate at the operator boundary so the panic localises the
         // caller, and so this contract is enforced in release builds too
-        // (the inner `debug_assert_eq!` is a debug-only safety net).
+        // (the inner `assert_eq!` is a debug-only safety net).
         assert_eq!(
             factor.nrows(),
             self.dim,
@@ -8843,8 +8843,8 @@ impl DesignTwoBlockRowCoeffOperator {
     }
 
     fn trace_from_row_gram_triples(&self, grams: ArrayView2<'_, f64>) -> f64 {
-        debug_assert_eq!(grams.nrows(), self.nrows);
-        debug_assert_eq!(grams.ncols(), 3);
+        assert_eq!(grams.nrows(), self.nrows);
+        assert_eq!(grams.ncols(), 3);
         let c_aa = self
             .c_aa
             .as_slice()
@@ -13074,8 +13074,8 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         let h_eta_w = xt_diag_y_dense(&x_eta, &coeff_etaw_b, &geom.basis)?
             + &xt_diag_y_dense(&x_eta, &coeff_etaw_d1, &geom.basis_d1)?;
         let h_ww = xt_diag_x_dense(&geom.basis, &coeff_ww)?;
-        debug_assert_eq!(h_eta_eta.nrows(), p_eta);
-        debug_assert_eq!(h_ww.nrows(), pw);
+        assert_eq!(h_eta_eta.nrows(), p_eta);
+        assert_eq!(h_ww.nrows(), pw);
         Ok(Some(binomial_pack_mean_wiggle_joint_symmetrichessian(
             &h_eta_eta, &h_eta_w, &h_ww,
         )))
@@ -14053,8 +14053,8 @@ impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
     }
     #[inline]
     fn row_kernel(&self, yi: f64, e_clamped: f64, m: f64, prior_w: f64) -> DiagonalIrlsRow {
-        debug_assert!(e_clamped.is_finite());
-        debug_assert!((e_clamped.exp() - m).abs() <= 1.0e-8 * m.abs().max(1.0));
+        assert!(e_clamped.is_finite());
+        assert!((e_clamped.exp() - m).abs() <= 1.0e-8 * m.abs().max(1.0));
         // Gamma(shape=k, scale=mu/k), dropping eta-independent constants.
         let log_lik_increment = prior_w * (-self.shape * (yi / m + m.ln()));
         // Gamma with log mean is non-canonical. Use the exact observed

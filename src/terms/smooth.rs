@@ -881,8 +881,8 @@ impl std::fmt::Debug for BlockwisePenalty {
 impl BlockwisePenalty {
     /// Create a new blockwise penalty.
     pub fn new(col_range: Range<usize>, local: Array2<f64>) -> Self {
-        debug_assert_eq!(col_range.len(), local.nrows());
-        debug_assert_eq!(col_range.len(), local.ncols());
+        assert_eq!(col_range.len(), local.nrows());
+        assert_eq!(col_range.len(), local.ncols());
         Self {
             col_range,
             local,
@@ -929,8 +929,8 @@ impl BlockwisePenalty {
         local: Array2<f64>,
         factors: Vec<Array2<f64>>,
     ) -> Self {
-        debug_assert_eq!(col_range.len(), local.nrows());
-        debug_assert_eq!(col_range.len(), local.ncols());
+        assert_eq!(col_range.len(), local.nrows());
+        assert_eq!(col_range.len(), local.ncols());
         Self {
             col_range,
             local,
@@ -976,7 +976,7 @@ pub fn weighted_blockwise_penalty_sum(
     lambdas: &[f64],
     p_total: usize,
 ) -> Array2<f64> {
-    debug_assert_eq!(penalties.len(), lambdas.len());
+    assert_eq!(penalties.len(), lambdas.len());
     let mut out = Array2::<f64>::zeros((p_total, p_total));
     for (bp, &lam) in penalties.iter().zip(lambdas.iter()) {
         let r = &bp.col_range;
@@ -1934,7 +1934,7 @@ enum AnisoBoundEnd {
 impl SpatialLogKappaCoords {
     /// Construct from an explicit dims layout plus values.
     pub(crate) fn new_with_dims(values: Array1<f64>, dims_per_term: Vec<usize>) -> Self {
-        debug_assert_eq!(
+        assert_eq!(
             values.len(),
             dims_per_term.iter().sum::<usize>(),
             "SpatialLogKappaCoords: values length {} != sum of dims_per_term {}",
@@ -2160,7 +2160,7 @@ impl SpatialLogKappaCoords {
         options: &SpatialLengthScaleOptimizationOptions,
         end: AnisoBoundEnd,
     ) -> Self {
-        debug_assert_eq!(term_indices.len(), dims_per_term.len());
+        assert_eq!(term_indices.len(), dims_per_term.len());
         let total: usize = dims_per_term.iter().sum();
         let mut values = Array1::<f64>::zeros(total);
         let options_psi = match end {
@@ -2213,7 +2213,7 @@ impl SpatialLogKappaCoords {
         term_indices: &[usize],
         options: &SpatialLengthScaleOptimizationOptions,
     ) -> Self {
-        debug_assert_eq!(term_indices.len(), self.dims_per_term.len());
+        assert_eq!(term_indices.len(), self.dims_per_term.len());
         let mut cursor = 0;
         for (slot, &term_idx) in term_indices.iter().enumerate() {
             let d = self.dims_per_term[slot];
@@ -2255,8 +2255,8 @@ impl SpatialLogKappaCoords {
         lower: &SpatialLogKappaCoords,
         upper: &SpatialLogKappaCoords,
     ) -> Self {
-        debug_assert_eq!(self.values.len(), lower.values.len());
-        debug_assert_eq!(self.values.len(), upper.values.len());
+        assert_eq!(self.values.len(), lower.values.len());
+        assert_eq!(self.values.len(), upper.values.len());
         let mut n_projected = 0usize;
         let mut worst_delta = 0.0_f64;
         for idx in 0..self.values.len() {
@@ -6157,12 +6157,12 @@ fn build_smooth_design_withworkspace_unvalidated(
         col_start = col_end;
     }
 
-    debug_assert_eq!(
+    assert_eq!(
         penalties_global.len(),
         nullspace_dims_global.len(),
         "global smooth penalty/nullspace bookkeeping diverged"
     );
-    debug_assert_eq!(
+    assert_eq!(
         penalties_global.len(),
         penaltyinfo_global.len(),
         "global smooth penalty metadata bookkeeping diverged"
@@ -6467,12 +6467,12 @@ fn build_term_collection_design_inner(
     }
     dropped_penaltyinfo.extend(smooth.dropped_penaltyinfo.iter().cloned());
 
-    debug_assert_eq!(
+    assert_eq!(
         penalties.len(),
         nullspace_dims.len(),
         "term-collection penalty/nullspace bookkeeping diverged"
     );
-    debug_assert_eq!(
+    assert_eq!(
         penalties.len(),
         penaltyinfo.len(),
         "term-collection penalty metadata bookkeeping diverged"
@@ -7136,12 +7136,12 @@ fn apply_global_smooth_identifiability(
         col_start = col_end;
     }
 
-    debug_assert_eq!(
+    assert_eq!(
         penalties_global.len(),
         nullspace_dims_global.len(),
         "globally reparameterized smooth penalty/nullspace bookkeeping diverged"
     );
-    debug_assert_eq!(
+    assert_eq!(
         penalties_global.len(),
         penaltyinfo_global.len(),
         "globally reparameterized smooth penalty metadata bookkeeping diverged"
@@ -13241,8 +13241,8 @@ fn try_build_spatial_term_log_kappa_derivative(
         penaltiessecond_derivative: local_s_psi_psi,
         implicit_operator: local_implicit_second_unused,
     } = derivative_bundle.second;
-    debug_assert!(local_implicit_first_unused.is_none());
-    debug_assert!(local_implicit_second_unused.is_none());
+    assert!(local_implicit_first_unused.is_none());
+    assert!(local_implicit_second_unused.is_none());
 
     if let Some(ref op) = implicit_operator {
         if op.p_out() != smooth_term.coeff_range.len() {
@@ -18925,7 +18925,7 @@ mod tests {
             .copied()
             .chain(noise_log_kappa.dims_per_term().iter().copied())
             .collect::<Vec<_>>();
-        debug_assert_eq!(
+        assert_eq!(
             dims_per_term,
             mean_dims_per_term
                 .iter()

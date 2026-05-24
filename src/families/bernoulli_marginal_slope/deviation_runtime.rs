@@ -883,7 +883,7 @@ impl DeviationRuntime {
     /// residual subtraction `n_row · M` is constant in the candidate
     /// argument, so its derivatives are identically zero.
     pub fn design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        debug_assert!(
+        assert!(
             self.anchor_residual.is_none(),
             "DeviationRuntime::design called on a runtime with an anchor residual; \
              use design_with_anchor_rows or design_at_training_with_residual instead"

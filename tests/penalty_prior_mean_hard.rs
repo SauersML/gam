@@ -497,7 +497,7 @@ fn nullspace_component_of_prior_mean_is_invisible() {
 
 // ---------------------------------------------------------------------------
 // 10. Length mismatch must be rejected.
-// `CanonicalPenalty::from_dense_root_with_mean` uses `debug_assert_eq!`; the
+// `CanonicalPenalty::from_dense_root_with_mean` uses `assert_eq!`; the
 // `PenaltyCoordinate` constructors use `assert_eq!` (panicking in release).
 // We probe via a panic catch on a debug-built binary.
 // ---------------------------------------------------------------------------

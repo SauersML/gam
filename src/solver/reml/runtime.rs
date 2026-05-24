@@ -1959,8 +1959,8 @@ impl<'a> RemlState<'a> {
     ) {
         let rows = i1 - i0;
         let cols = j1 - j0;
-        debug_assert!(rows <= gram.nrows());
-        debug_assert!(cols <= gram.ncols());
+        assert!(rows <= gram.nrows());
+        assert!(cols <= gram.ncols());
         let x_block = x_dense.slice(s![i0..i1, ..]);
         let z_block = z.slice(s![.., j0..j1]);
         let mut target = gram.slice_mut(s![..rows, ..cols]);
@@ -9356,7 +9356,7 @@ impl<'a> RemlState<'a> {
                     b_operator: None,
                     ld_s: 0.0,
                 }));
-            debug_assert!(ext_dim > 0);
+            assert!(ext_dim > 0);
         }
         self.assemble_and_evaluate(rho, &bundle, mode, assembly)
     }

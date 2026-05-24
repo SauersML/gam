@@ -117,7 +117,7 @@ impl super::unified::HyperOperator for TauTauPairHyperOperator {
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        debug_assert_eq!(v.len(), self.p);
+        assert_eq!(v.len(), self.p);
 
         let x_v = self.x_design.dot(v);
         let mut out = Array1::<f64>::zeros(self.p);
@@ -257,7 +257,7 @@ impl super::unified::HyperOperator for TauBetaDriftDerivOperator {
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        debug_assert_eq!(v.len(), self.p);
+        assert_eq!(v.len(), self.p);
         let x_v = self.x_design.matrixvectormultiply(v);
         let term1 = crate::faer_ndarray::fast_atv(&self.x_tau, &(&self.c_x_u * &x_v));
         let x_tau_v = crate::faer_ndarray::fast_av(&self.x_tau, v);
@@ -325,7 +325,7 @@ impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        debug_assert_eq!(v.len(), self.p);
+        assert_eq!(v.len(), self.p);
         let base = self.base.mul_vec(v);
         // `firth_hphi_tau_partial_apply` takes a (p × m) rhs block; wrap v as
         // a (p × 1) column, run the partial apply, and pull off column 0.
@@ -353,7 +353,7 @@ impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
     /// columns the per-column path would touch, but as one BLAS3
     /// contraction with no operator dispatch overhead per column.
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.p);
+        assert_eq!(factor.nrows(), self.p);
         let base_trace = self.base.trace_projected_factor(factor);
         let firth_out =
             self.firth_op
@@ -391,7 +391,7 @@ impl super::unified::HyperOperator for FirthAugmentedPairHyperOperator {
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        debug_assert_eq!(v.len(), self.p);
+        assert_eq!(v.len(), self.p);
         let base = self.base.mul_vec(v);
         //  Primitive A returns a p×m matrix; wrap v as a p×1 rhs, then read
         //  off its single column.

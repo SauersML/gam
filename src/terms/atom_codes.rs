@@ -81,7 +81,7 @@ impl BitVec {
 
     #[inline]
     pub fn get(&self, i: usize) -> bool {
-        debug_assert!(
+        assert!(
             i < self.len,
             "BitVec::get index {i} out of bounds {}",
             self.len
@@ -92,7 +92,7 @@ impl BitVec {
 
     #[inline]
     pub fn set(&mut self, i: usize, v: bool) {
-        debug_assert!(
+        assert!(
             i < self.len,
             "BitVec::set index {i} out of bounds {}",
             self.len
@@ -174,14 +174,14 @@ impl SparseAtomCode {
 
     /// Set the weight for atom `k` and mark it active.
     pub fn assign(&mut self, k: usize, w: f64) {
-        debug_assert!(k < self.k_atoms());
+        assert!(k < self.k_atoms());
         self.active_mask.set(k, true);
         self.weights[k] = w;
     }
 
     /// Deactivate atom `k` and zero its stored weight.
     pub fn deactivate(&mut self, k: usize) {
-        debug_assert!(k < self.k_atoms());
+        assert!(k < self.k_atoms());
         self.active_mask.set(k, false);
         self.weights[k] = 0.0;
     }

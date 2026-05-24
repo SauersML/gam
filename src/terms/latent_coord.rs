@@ -241,7 +241,7 @@ impl LatentManifold {
                 out
             }
             Self::Sphere { dim } => {
-                debug_assert_eq!(t.len(), *dim);
+                assert_eq!(t.len(), *dim);
                 normalize_or_axis(t, *dim)
             }
             Self::Interval { lo, hi } => {
@@ -263,7 +263,7 @@ impl LatentManifold {
                     }
                     offset += dim;
                 }
-                debug_assert_eq!(offset, t.len());
+                assert_eq!(offset, t.len());
                 out
             }
         }
@@ -271,7 +271,7 @@ impl LatentManifold {
 
     /// Retraction `R_t(ξ)`, using closed-form analytic maps for every variant.
     pub fn retract(&self, t: ArrayView1<'_, f64>, xi: ArrayView1<'_, f64>) -> Array1<f64> {
-        debug_assert_eq!(t.len(), xi.len());
+        assert_eq!(t.len(), xi.len());
         match self {
             Self::Euclidean => {
                 let mut out = t.to_owned();
@@ -286,7 +286,7 @@ impl LatentManifold {
                 out
             }
             Self::Sphere { dim } => {
-                debug_assert_eq!(t.len(), *dim);
+                assert_eq!(t.len(), *dim);
                 let mut y = Array1::<f64>::zeros(*dim);
                 for a in 0..*dim {
                     y[a] = t[a] + xi[a];
@@ -315,7 +315,7 @@ impl LatentManifold {
                     }
                     offset += dim;
                 }
-                debug_assert_eq!(offset, t.len());
+                assert_eq!(offset, t.len());
                 out
             }
         }
@@ -327,11 +327,11 @@ impl LatentManifold {
         t: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert_eq!(t.len(), v.len());
+        assert_eq!(t.len(), v.len());
         match self {
             Self::Euclidean | Self::Circle => v.to_owned(),
             Self::Sphere { dim } => {
-                debug_assert_eq!(t.len(), *dim);
+                assert_eq!(t.len(), *dim);
                 let tv = dot_views(t, v);
                 let mut out = v.to_owned();
                 for a in 0..*dim {
@@ -363,7 +363,7 @@ impl LatentManifold {
                     }
                     offset += dim;
                 }
-                debug_assert_eq!(offset, v.len());
+                assert_eq!(offset, v.len());
                 out
             }
         }
@@ -383,10 +383,10 @@ impl LatentManifold {
         eh: ArrayView2<'_, f64>,
         xi: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert_eq!(t.len(), eg.len());
-        debug_assert_eq!(t.len(), xi.len());
-        debug_assert_eq!(eh.nrows(), t.len());
-        debug_assert_eq!(eh.ncols(), t.len());
+        assert_eq!(t.len(), eg.len());
+        assert_eq!(t.len(), xi.len());
+        assert_eq!(eh.nrows(), t.len());
+        assert_eq!(eh.ncols(), t.len());
         let eh_xi = matvec(eh, xi);
         self.euclidean_hessian_action_to_riemannian(t, eg, xi, eh_xi.view())
     }
@@ -398,15 +398,15 @@ impl LatentManifold {
         xi: ArrayView1<'_, f64>,
         eh_xi: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert_eq!(t.len(), eg.len());
-        debug_assert_eq!(t.len(), xi.len());
-        debug_assert_eq!(t.len(), eh_xi.len());
+        assert_eq!(t.len(), eg.len());
+        assert_eq!(t.len(), xi.len());
+        assert_eq!(t.len(), eh_xi.len());
         match self {
             Self::Euclidean | Self::Circle | Self::Interval { .. } => {
                 self.project_to_tangent(t, eh_xi)
             }
             Self::Sphere { dim } => {
-                debug_assert_eq!(t.len(), *dim);
+                assert_eq!(t.len(), *dim);
                 let grad_r = self.project_to_tangent(t, eg);
                 let mut ambient = self.project_to_tangent(t, eh_xi);
                 let eg_normal = dot_views(eg, t);
@@ -436,7 +436,7 @@ impl LatentManifold {
                     }
                     offset += dim;
                 }
-                debug_assert_eq!(offset, t.len());
+                assert_eq!(offset, t.len());
                 out
             }
         }
@@ -489,7 +489,7 @@ impl LatentManifold {
     fn add_normal_pinning(&self, t: ArrayView1<'_, f64>, matrix: &mut Array2<f64>) {
         match self {
             Self::Sphere { dim } => {
-                debug_assert_eq!(t.len(), *dim);
+                assert_eq!(t.len(), *dim);
                 for a in 0..*dim {
                     for b in 0..*dim {
                         matrix[[a, b]] += SPHERE_NORMAL_PIN * t[a] * t[b];
@@ -697,7 +697,7 @@ impl LatentCoordValues {
         id: u64,
     ) -> Self {
         id_mode.reject_dim_selection_alone();
-        debug_assert_eq!(
+        assert_eq!(
             values.len(),
             n_obs * latent_dim,
             "LatentCoordValues::from_flat: length {} != n_obs * latent_dim = {}",
@@ -792,14 +792,14 @@ impl LatentCoordValues {
 
     /// Mutable write back of the flat value array, e.g. after a Newton step.
     pub fn set_flat(&mut self, flat: ArrayView1<'_, f64>) {
-        debug_assert_eq!(flat.len(), self.values.len());
+        assert_eq!(flat.len(), self.values.len());
         self.values.assign(&flat);
         self.project_all_rows_to_manifold();
     }
 
     /// Apply a flat tangent update row-by-row through the manifold retraction.
     pub fn retract_flat_delta(&mut self, delta: ArrayView1<'_, f64>) {
-        debug_assert_eq!(delta.len(), self.values.len());
+        assert_eq!(delta.len(), self.values.len());
         if self.retraction_registry.is_all_euclidean() {
             for (t, dt) in self.values.iter_mut().zip(delta.iter()) {
                 *t += *dt;
@@ -819,7 +819,7 @@ impl LatentCoordValues {
         if self.manifold.is_euclidean() {
             return;
         }
-        debug_assert_eq!(self.manifold.ambient_dim(self.latent_dim), self.latent_dim);
+        assert_eq!(self.manifold.ambient_dim(self.latent_dim), self.latent_dim);
         for n in 0..self.n_obs {
             let start = n * self.latent_dim;
             let end = start + self.latent_dim;
@@ -963,7 +963,7 @@ fn normalize_or_axis(v: ArrayView1<'_, f64>, dim: usize) -> Array1<f64> {
 }
 
 fn dot_views(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len());
     let mut acc = 0.0_f64;
     for i in 0..a.len() {
         acc += a[i] * b[i];
@@ -972,7 +972,7 @@ fn dot_views(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
 }
 
 fn matvec(a: ArrayView2<'_, f64>, x: ArrayView1<'_, f64>) -> Array1<f64> {
-    debug_assert_eq!(a.ncols(), x.len());
+    assert_eq!(a.ncols(), x.len());
     let mut out = Array1::<f64>::zeros(a.nrows());
     for i in 0..a.nrows() {
         let mut acc = 0.0_f64;

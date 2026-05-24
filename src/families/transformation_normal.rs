@@ -337,10 +337,10 @@ fn build_transformation_row_derived(
     weights: &Array1<f64>,
 ) -> Result<TransformationNormalRowDerived, String> {
     let n = h_prime.len();
-    debug_assert_eq!(h.len(), n);
-    debug_assert_eq!(h_lower.len(), n);
-    debug_assert_eq!(h_upper.len(), n);
-    debug_assert_eq!(weights.len(), n);
+    assert_eq!(h.len(), n);
+    assert_eq!(h_lower.len(), n);
+    assert_eq!(h_upper.len(), n);
+    assert_eq!(weights.len(), n);
 
     if let Some((i, value)) = h
         .iter()
@@ -902,8 +902,8 @@ impl TransformationNormalFamily {
         let x_val_kron = KroneckerDesign::new_khatri_rao(&resp_val, covariate_design.clone())?;
         let x_deriv_kron = KroneckerDesign::new_khatri_rao(&resp_deriv, covariate_design.clone())?;
         let p_total = p_resp * p_cov;
-        debug_assert_eq!(x_val_kron.ncols(), p_total);
-        debug_assert_eq!(x_deriv_kron.ncols(), p_total);
+        assert_eq!(x_val_kron.ncols(), p_total);
+        assert_eq!(x_deriv_kron.ncols(), p_total);
 
         // ----- 3. Warm start -----
         let initial_beta = compute_warm_start(
@@ -1098,8 +1098,8 @@ impl TransformationNormalFamily {
         let x_deriv_kron =
             KroneckerDesign::new_khatri_rao(&response_deriv_basis, covariate_design.clone())?;
         let p_total = p_resp * p_cov;
-        debug_assert_eq!(x_val_kron.ncols(), p_total);
-        debug_assert_eq!(x_deriv_kron.ncols(), p_total);
+        assert_eq!(x_val_kron.ncols(), p_total);
+        assert_eq!(x_deriv_kron.ncols(), p_total);
 
         let initial_beta = compute_warm_start(
             response,
@@ -8741,12 +8741,12 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        debug_assert_eq!(v.len(), self.p_total());
+        assert_eq!(v.len(), self.p_total());
         self.apply(v)
     }
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
-        debug_assert_eq!(factor.nrows(), self.p_total());
+        assert_eq!(factor.nrows(), self.p_total());
         self.family
             .scop_hessian_directional_matmat(
                 &self.beta,
@@ -8758,7 +8758,7 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
     }
 
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.p_total());
+        assert_eq!(factor.nrows(), self.p_total());
         let row_grams = self
             .family
             .scop_projected_response_gram_table(factor.view())
@@ -8778,7 +8778,7 @@ impl HyperOperator for TransformationNormalDhMatrixFreeOperator {
         factor: &Array2<f64>,
         cache: &ProjectedFactorCache,
     ) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.p_total());
+        assert_eq!(factor.nrows(), self.p_total());
         let key =
             ProjectedFactorKey::from_factor_view(self.projected_gram_cache_id(), factor.view());
         let row_grams = cache.get_or_insert_with(key, || {
@@ -8860,12 +8860,12 @@ impl HyperOperator for TransformationNormalD2hMatrixFreeOperator {
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        debug_assert_eq!(v.len(), self.p_total());
+        assert_eq!(v.len(), self.p_total());
         self.apply(v)
     }
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
-        debug_assert_eq!(factor.nrows(), self.p_total());
+        assert_eq!(factor.nrows(), self.p_total());
         self.family
             .scop_hessian_second_directional_matmat(
                 &self.beta,
@@ -8993,7 +8993,7 @@ impl TransformationNormalPsiHessianOperator {
     }
 
     fn projected_trace_table(&self, factor: &Array2<f64>) -> Array2<f64> {
-        debug_assert_eq!(factor.nrows(), self.dim());
+        assert_eq!(factor.nrows(), self.dim());
         let axes = self.trace_axes.as_slice();
         if axes.is_empty() {
             return Array2::<f64>::zeros((0, 1));
@@ -9042,7 +9042,7 @@ impl TransformationNormalPsiHessianOperator {
                 .expect(
                     "validated CTN psi Hessian all-axis projected trace inputs should not fail",
                 );
-            debug_assert_eq!(chunk_traces.len(), traces.len());
+            assert_eq!(chunk_traces.len(), traces.len());
             for (total, value) in traces.iter_mut().zip(chunk_traces.into_iter()) {
                 *total += value;
             }
@@ -9070,7 +9070,7 @@ impl HyperOperator for TransformationNormalPsiHessianOperator {
     }
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
-        debug_assert_eq!(factor.nrows(), self.dim());
+        assert_eq!(factor.nrows(), self.dim());
         let p = factor.nrows();
         let k = factor.ncols();
         let cov = self
@@ -9082,13 +9082,13 @@ impl HyperOperator for TransformationNormalPsiHessianOperator {
             .materialize_cov_first_axis(self.axis)
             .expect("validated CTN psi Hessian operator covariate derivative should not fail");
         let out = self.apply_columns_with_shared_cov(factor, cov.as_ref(), &cov_psi);
-        debug_assert_eq!(out.nrows(), p);
-        debug_assert_eq!(out.ncols(), k);
+        assert_eq!(out.nrows(), p);
+        assert_eq!(out.ncols(), k);
         out
     }
 
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.dim());
+        assert_eq!(factor.nrows(), self.dim());
         let cov = self
             .family
             .covariate_dense_arc()
@@ -9231,7 +9231,7 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
     }
 
     fn projected_factor_table(&self, factor: &Array2<f64>) -> Array2<f64> {
-        debug_assert_eq!(factor.nrows(), self.p_total());
+        assert_eq!(factor.nrows(), self.p_total());
         let n = self.family.response_val_basis.nrows();
         let p_cov = self.family.covariate_design.ncols();
         let p_resp = self.family.response_val_basis.ncols();
@@ -9285,13 +9285,13 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
         factor: &Array2<f64>,
         table: ArrayView2<'_, f64>,
     ) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.p_total());
+        assert_eq!(factor.nrows(), self.p_total());
         let n = self.family.response_val_basis.nrows();
         let p_cov = self.family.covariate_design.ncols();
         let p_resp = self.family.response_val_basis.ncols();
         let rank = factor.ncols();
         let projected_len = p_resp * rank;
-        debug_assert_eq!(table.dim(), (n, 2 * projected_len));
+        assert_eq!(table.dim(), (n, 2 * projected_len));
         let op = self.tensor_op();
         let policy = ResourcePolicy::default_library();
         let live_cols = p_cov.saturating_mul(2).max(1);
@@ -9385,17 +9385,17 @@ impl HyperOperator for TransformationNormalPsiDhMatrixFreeOperator {
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        debug_assert_eq!(v.len(), self.p_total());
+        assert_eq!(v.len(), self.p_total());
         self.dense_matrix().dot(v)
     }
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
-        debug_assert_eq!(factor.nrows(), self.p_total());
+        assert_eq!(factor.nrows(), self.p_total());
         self.dense_matrix().dot(factor)
     }
 
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.p_total());
+        assert_eq!(factor.nrows(), self.p_total());
 
         // At the CTN biobank benchmark shape (`p≈264`, `n≈20k`), the
         // coefficient-space directional Hessian is tiny (< 1 MiB) while the
@@ -9418,7 +9418,7 @@ impl HyperOperator for TransformationNormalPsiDhMatrixFreeOperator {
         factor: &Array2<f64>,
         cache: &crate::solver::estimate::reml::unified::ProjectedFactorCache,
     ) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.p_total());
+        assert_eq!(factor.nrows(), self.p_total());
         if self.p_total() <= 512 || !self.projected_factor_table_fits_budget(factor) {
             return self.trace_projected_factor(factor);
         }
@@ -9562,7 +9562,7 @@ impl TransformationNormalPsiPsiHessianOperator {
         row_start: usize,
         row_end: usize,
     ) -> Array2<f64> {
-        debug_assert_eq!(factor.nrows(), self.p_total());
+        assert_eq!(factor.nrows(), self.p_total());
         let p = factor.nrows();
         let k = factor.ncols();
         let mut out = Array2::<f64>::zeros((p, k));
@@ -9619,7 +9619,7 @@ impl TransformationNormalPsiPsiHessianOperator {
     }
 
     fn projected_trace_table(&self, factor: &Array2<f64>) -> Array2<f64> {
-        debug_assert_eq!(factor.nrows(), self.p_total());
+        assert_eq!(factor.nrows(), self.p_total());
         let n_axes = self.trace_axes.len();
         let n = self.family.response_val_basis.nrows();
         let p_cov = self.family.covariate_design.ncols();
@@ -9680,13 +9680,13 @@ impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
     }
 
     fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
-        debug_assert_eq!(v.len(), self.p_total());
+        assert_eq!(v.len(), self.p_total());
         self.apply(v)
     }
 
     fn bilinear_view(&self, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
-        debug_assert_eq!(v.len(), self.p_total());
-        debug_assert_eq!(u.len(), self.p_total());
+        assert_eq!(v.len(), self.p_total());
+        assert_eq!(u.len(), self.p_total());
         self.family
             .scop_psi_psi_bilinear_from_operator(
                 &self.beta,
@@ -9708,7 +9708,7 @@ impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
     }
 
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
-        debug_assert_eq!(factor.nrows(), self.p_total());
+        assert_eq!(factor.nrows(), self.p_total());
         let n = self.family.response_val_basis.nrows();
         let p_cov = self.family.covariate_design.ncols();
         let rows_per_chunk = self
@@ -9740,7 +9740,7 @@ impl HyperOperator for TransformationNormalPsiPsiHessianOperator {
     }
 
     fn mul_mat(&self, factor: &Array2<f64>) -> Array2<f64> {
-        debug_assert_eq!(factor.nrows(), self.p_total());
+        assert_eq!(factor.nrows(), self.p_total());
         let p = factor.nrows();
         let k = factor.ncols();
         let mut out = Array2::<f64>::zeros((p, k));
@@ -10115,7 +10115,7 @@ impl KroneckerDesign {
                 let pa = left.ncols();
                 let pb = right.ncols();
                 let n = left.nrows();
-                debug_assert_eq!(beta.len(), pa * pb);
+                assert_eq!(beta.len(), pa * pb);
                 let beta_mat = beta.view().into_shape_with_order((pa, pb)).unwrap();
                 let mut result = Array1::zeros(n);
                 if let Some(right_dense) = right.as_dense_ref() {
@@ -10162,7 +10162,7 @@ impl KroneckerDesign {
                 let pa = left.ncols();
                 let pb = right.ncols();
                 let n = left.nrows();
-                debug_assert_eq!(beta.len(), pa * pb);
+                assert_eq!(beta.len(), pa * pb);
                 let beta_mat = beta.view().into_shape_with_order((pa, pb)).unwrap();
                 let mut result = Array1::zeros(n);
                 if let Some(right_dense) = right.as_dense_ref() {
@@ -10211,7 +10211,7 @@ impl KroneckerDesign {
                 let n = left.nrows();
                 let pa = left.ncols();
                 let pb = right.ncols();
-                debug_assert_eq!(v.len(), n);
+                assert_eq!(v.len(), n);
                 if let Some(right_dense) = right.as_dense_ref() {
                     let weighted_left = weight_rows(left, v);
                     let blocks = fast_atb(right_dense, &weighted_left).reversed_axes();
@@ -10736,7 +10736,7 @@ fn calibrate_transformation_scores(
 fn weight_rows(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
     let n = x.nrows();
     let p = x.ncols();
-    debug_assert_eq!(n, w.len());
+    assert_eq!(n, w.len());
     let mut out = Array2::zeros((n, p));
     ndarray::Zip::from(out.rows_mut())
         .and(x.rows())

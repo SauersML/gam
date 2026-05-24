@@ -893,8 +893,8 @@ fn logistic_normal_exact_eligible(mu: f64, sigma: f64) -> bool {
 /// stability to declare convergence.
 #[inline]
 fn logistic_normal_tail_cutoff(mu: f64, sigma: f64, target_accuracy: f64) -> usize {
-    debug_assert!(sigma > 0.0);
-    debug_assert!(target_accuracy > 0.0);
+    assert!(sigma > 0.0);
+    assert!(target_accuracy > 0.0);
     let m = mu.abs();
     let s = sigma;
     // Leading asymptotic coefficient of the k-th term magnitude.
@@ -3251,7 +3251,7 @@ fn cloglog_inverse_link_controlled_values(
     sigma: f64,
     max_order: usize,
 ) -> ([f64; 6], IntegratedExpectationMode) {
-    debug_assert!(max_order <= 5);
+    assert!(max_order <= 5);
     if sigma <= 1e-10 {
         let (mean, d1, d2, d3, d4, d5) = cloglog_point_jet5(mu);
         return (

@@ -146,6 +146,6 @@ pub fn predict_vectorwith_uncertainty<M: VectorPredictableModel>(
 /// Convenience: residuals on the response scale, `Y − Ŷ`, shape (N, M).
 /// Useful for downstream diagnostics on vector targets.
 pub fn vector_residuals(y: ArrayView2<f64>, y_hat: ArrayView2<f64>) -> Array2<f64> {
-    debug_assert_eq!(y.dim(), y_hat.dim());
+    assert_eq!(y.dim(), y_hat.dim());
     &y.to_owned() - &y_hat.to_owned()
 }

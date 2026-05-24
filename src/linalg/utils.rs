@@ -169,7 +169,7 @@ impl<'a> StableSolver<'a> {
                 inv[[j, i]] = avg;
             }
         }
-        debug_assert_eq!(regularized.nrows(), p);
+        assert_eq!(regularized.nrows(), p);
         Some(inv)
     }
 
@@ -357,7 +357,7 @@ pub(crate) fn symmetric_extremes(matrix: &Array2<f64>) -> Option<(f64, f64)> {
 /// Enforce exact symmetry on a square matrix by averaging off-diagonal pairs.
 pub(crate) fn enforce_symmetry(matrix: &mut Array2<f64>) {
     let n = matrix.nrows();
-    debug_assert_eq!(n, matrix.ncols());
+    assert_eq!(n, matrix.ncols());
     for i in 0..n {
         for j in i + 1..n {
             let avg = 0.5 * (matrix[[i, j]] + matrix[[j, i]]);

@@ -81,7 +81,7 @@ impl LatentRetractionRegistry {
     }
 
     pub(crate) fn retract(&self, base: &mut ArrayViewMut1<f64>, tangent: ArrayView1<f64>) {
-        debug_assert_eq!(base.len(), tangent.len());
+        assert_eq!(base.len(), tangent.len());
         if let Some(block) = self.block.as_ref() {
             block.retract(base, tangent);
         } else {

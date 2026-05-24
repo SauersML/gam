@@ -222,7 +222,7 @@ fn weighted_crossprod_dense_rows(
     // nonneg weights. The prior `.max(0.0)` clip silently discarded
     // negative-curvature contributions and masked sign bugs upstream; the debug
     // assertion turns that into a loud failure in tests instead.
-    debug_assert!(
+    assert!(
         weights.iter().all(|&w| w >= 0.0),
         "weighted_crossprod_dense_rows requires nonneg weights; use the signed Gram routine for observed-Hessian assembly"
     );
@@ -352,7 +352,7 @@ impl<'a> EmbeddedColumnBlock<'a> {
         if self.local.nrows() == 0 {
             return Array2::<f64>::zeros((0, self.total_cols));
         }
-        debug_assert_eq!(
+        assert_eq!(
             self.local.ncols(),
             self.global_range.len(),
             "embedded column block width mismatch"
@@ -527,7 +527,7 @@ fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> A
     // for diagonal-of-Gram queries. Negative weights have no sensible meaning
     // here (the diagonal must be nonneg for it to act as a preconditioner), so
     // we require the precondition rather than silently clipping.
-    debug_assert!(
+    assert!(
         weights.iter().all(|&w| w >= 0.0),
         "dense_diag_gram_view requires nonneg weights"
     );
@@ -649,7 +649,7 @@ fn sparse_csr_weighted_xtwx_rows(
     // assembly; this CSR-row kernel is reserved for Fisher-scoring Gram builds
     // where the working weights are guaranteed nonneg. Clipping silently here
     // would drop negative-curvature mass and produce a wrong Newton step.
-    debug_assert!(
+    assert!(
         weights.iter().all(|&w| w >= 0.0),
         "sparse_csr_weighted_xtwx_rows requires nonneg weights; route signed-weight Gram through the CSC kernel"
     );
@@ -785,7 +785,7 @@ fn sparse_csr_diag_gram_rows(
     // PSD precondition: callers (Fisher-scoring diag(XᵀWX)) must supply nonneg
     // weights. Signed observed-Hessian assembly must use the signed Gram path
     // (xt_diag_x_signed → streaming kernels).
-    debug_assert!(
+    assert!(
         weights.iter().all(|&w| w >= 0.0),
         "sparse_csr_diag_gram_rows requires nonneg weights; use the signed Gram routine for observed-Hessian assembly"
     );
@@ -1405,7 +1405,7 @@ impl LinearOperator for DenseDesignMatrix {
     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
         // PSD precondition: diag(XᵀWX) is computed for Fisher-scoring
         // preconditioners; observed-Hessian sites use the signed Gram path.
-        debug_assert!(
+        assert!(
             weights.iter().all(|&w| w >= 0.0),
             "DenseDesignMatrix::diag_gram requires nonneg weights; use the signed Gram routine for observed-Hessian assembly"
         );
@@ -1482,7 +1482,7 @@ impl LinearOperator for DenseDesignMatrix {
         // PSD precondition: apply_weighted_normal is the Fisher-scoring PCG
         // normal-equations matvec ((XᵀWX + S + ρI) v); signed observed-Hessian
         // assembly routes through xt_diag_x_signed instead.
-        debug_assert!(
+        assert!(
             weights.iter().all(|&w| w >= 0.0),
             "DenseDesignMatrix::apply_weighted_normal requires nonneg weights; observed-Hessian Newton steps must not reach this PSD kernel"
         );
@@ -1766,7 +1766,7 @@ impl LinearOperator for ReparamOperator {
         );
         // PSD precondition: Fisher-scoring PCG normal-equations matvec; signed
         // observed-Hessian assembly does not reach this path.
-        debug_assert!(
+        assert!(
             weights.iter().all(|&w| w >= 0.0),
             "ReparamOperator::apply_weighted_normal requires nonneg weights; observed-Hessian Newton steps must not reach this PSD kernel"
         );
@@ -4787,7 +4787,7 @@ pub fn xt_diag_x_signed(
 /// `debug_assertions` and silently inherited in release builds; the underlying
 /// numeric path is identical to `xt_diag_x_signed`.
 pub fn xt_diag_x_psd(design: &DesignMatrix, diag: &Array1<f64>) -> Result<SymmetricMatrix, String> {
-    debug_assert!(
+    assert!(
         diag.iter().all(|&w| w >= 0.0),
         "xt_diag_x_psd requires nonneg weights; use xt_diag_x_signed for observed-Hessian assembly"
     );
@@ -5135,7 +5135,7 @@ impl SparseHessianAccumulator {
                     return;
                 }
             }
-            debug_assert!(
+            assert!(
                 false,
                 "SparseHessianAccumulator::add_upper: ({r}, {c}) not in pattern"
             );
@@ -5145,7 +5145,7 @@ impl SparseHessianAccumulator {
     /// Element-wise `self.values += other`.
     #[inline]
     pub fn add_values(&mut self, other: &[f64]) {
-        debug_assert_eq!(self.values.len(), other.len());
+        assert_eq!(self.values.len(), other.len());
         for (a, &b) in self.values.iter_mut().zip(other.iter()) {
             *a += b;
         }
@@ -6403,8 +6403,8 @@ impl DesignMatrix {
         alpha: f64,
         out: &mut ArrayViewMut1<'_, f64>,
     ) -> Result<(), String> {
-        debug_assert_eq!(self.ncols(), other.ncols());
-        debug_assert_eq!(out.len(), self.ncols());
+        assert_eq!(self.ncols(), other.ncols());
+        assert_eq!(out.len(), self.ncols());
         if alpha == 0.0 {
             return Ok(());
         }

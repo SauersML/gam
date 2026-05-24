@@ -45,7 +45,7 @@ fn dense_weighted_chunk_rows(cols: usize) -> usize {
 /// tests and Firth kernels. It is intentionally simple and deterministic for a
 /// fixed row order.
 pub(crate) fn row_scale_dense_into(x: &Array2<f64>, scale: &Array1<f64>, out: &mut Array2<f64>) {
-    debug_assert_eq!(x.nrows(), scale.len(), "scale length must match row count");
+    assert_eq!(x.nrows(), scale.len(), "scale length must match row count");
     if out.raw_dim() != x.raw_dim() {
         *out = Array2::<f64>::zeros(x.raw_dim());
     }
@@ -119,8 +119,8 @@ pub(crate) fn weighted_cross_dense(
     right: &Array2<f64>,
     weights: &Array1<f64>,
 ) -> Array2<f64> {
-    debug_assert_eq!(left.nrows(), right.nrows());
-    debug_assert_eq!(left.nrows(), weights.len());
+    assert_eq!(left.nrows(), right.nrows());
+    assert_eq!(left.nrows(), weights.len());
     let n = weights.len();
     let p = left.ncols();
     let q = right.ncols();
@@ -165,7 +165,7 @@ pub(crate) fn xt_diag_x_dense_into(
     weighted: &mut Array2<f64>,
 ) -> Array2<f64> {
     let (n, p) = x.dim();
-    debug_assert_eq!(diag.len(), n, "diag length must match row count");
+    assert_eq!(diag.len(), n, "diag length must match row count");
     if n == 0 || p == 0 {
         return Array2::<f64>::zeros((p, p));
     }

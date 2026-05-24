@@ -11,7 +11,7 @@ pub struct EuclideanRetraction;
 
 impl Retraction for EuclideanRetraction {
     fn retract(&self, base: &mut ArrayViewMut1<f64>, tangent: ArrayView1<f64>) {
-        debug_assert_eq!(base.len(), tangent.len());
+        assert_eq!(base.len(), tangent.len());
         let manifold = crate::geometry::EuclideanManifold::new(base.len());
         let next = crate::geometry::RiemannianManifold::exp_map(&manifold, base.view(), tangent)
             .expect("Euclidean retraction dimensions were prevalidated");
@@ -26,8 +26,8 @@ pub struct CircleRetraction;
 
 impl Retraction for CircleRetraction {
     fn retract(&self, base: &mut ArrayViewMut1<f64>, tangent: ArrayView1<f64>) {
-        debug_assert_eq!(base.len(), 1);
-        debug_assert_eq!(tangent.len(), 1);
+        assert_eq!(base.len(), 1);
+        assert_eq!(tangent.len(), 1);
         let manifold = crate::geometry::CircleManifold::new();
         let next = crate::geometry::RiemannianManifold::exp_map(&manifold, base.view(), tangent)
             .expect("Circle retraction dimensions were prevalidated");
@@ -42,8 +42,8 @@ pub struct SphereRetraction {
 
 impl Retraction for SphereRetraction {
     fn retract(&self, base: &mut ArrayViewMut1<f64>, tangent: ArrayView1<f64>) {
-        debug_assert_eq!(base.len(), self.dim);
-        debug_assert_eq!(tangent.len(), self.dim);
+        assert_eq!(base.len(), self.dim);
+        assert_eq!(tangent.len(), self.dim);
         assert!(
             self.dim >= 2,
             "SphereRetraction ambient dim must be at least 2"
@@ -74,7 +74,7 @@ impl ProductRetraction {
 
 impl Retraction for ProductRetraction {
     fn retract(&self, base: &mut ArrayViewMut1<f64>, tangent: ArrayView1<f64>) {
-        debug_assert_eq!(base.len(), tangent.len());
+        assert_eq!(base.len(), tangent.len());
         let mut offset = 0_usize;
         for part in &self.parts {
             let dim = part.ambient_dim();
@@ -83,7 +83,7 @@ impl Retraction for ProductRetraction {
             part.retract(&mut base_part, tangent_part);
             offset += dim;
         }
-        debug_assert_eq!(offset, base.len());
+        assert_eq!(offset, base.len());
     }
 }
 

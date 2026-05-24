@@ -1480,7 +1480,7 @@ fn softmax_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
         out[i] = v;
         sum += v;
     }
-    debug_assert!(sum.is_finite() && sum > 0.0);
+    assert!(sum.is_finite() && sum > 0.0);
     for v in out.iter_mut() {
         *v /= sum;
     }

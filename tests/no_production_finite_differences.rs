@@ -86,7 +86,7 @@ fn find_next_code_byte(source: &str, start: usize, needle: u8) -> Option<usize> 
 
 fn find_matching_code_brace(source: &str, open_brace: usize) -> Option<usize> {
     let bytes = source.as_bytes();
-    debug_assert_eq!(bytes[open_brace], b'{');
+    assert_eq!(bytes[open_brace], b'{');
     let mut depth = 1usize;
     let mut i = open_brace + 1;
     while i < bytes.len() {

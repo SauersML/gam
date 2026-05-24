@@ -404,9 +404,9 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         // `left[[c, a]]` is hoisted out of the inner loop.
         let k = schur.nrows();
         let d = left.nrows();
-        debug_assert_eq!(left.ncols(), k);
-        debug_assert_eq!(right.ncols(), k);
-        debug_assert_eq!(schur.ncols(), k);
+        assert_eq!(left.ncols(), k);
+        assert_eq!(right.ncols(), k);
+        assert_eq!(schur.ncols(), k);
         for c in 0..d {
             for a in 0..k {
                 let lca = left[[c, a]];
@@ -427,7 +427,7 @@ fn factor_one_row(
     d: usize,
     row_idx: usize,
 ) -> Result<Array2<f64>, ArrowSchurError> {
-    debug_assert_eq!(row.htt.dim(), (d, d), "row {row_idx} H_tt shape != (d,d)");
+    assert_eq!(row.htt.dim(), (d, d), "row {row_idx} H_tt shape != (d,d)");
     let mut block = row.htt.clone();
     for a in 0..d {
         block[[a, a]] += ridge_t;
@@ -800,7 +800,7 @@ impl ArrowSchurSystem {
     where
         F: for<'a> Fn(ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync + 'static,
     {
-        debug_assert_eq!(diag.len(), k);
+        assert_eq!(diag.len(), k);
         let rows = (0..n).map(|_| ArrowRowBlock::new(d, k)).collect();
         let mut sys = Self {
             rows,
@@ -855,7 +855,7 @@ impl ArrowSchurSystem {
     where
         F: for<'a> Fn(ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync + 'static,
     {
-        debug_assert_eq!(diag.len(), self.k);
+        assert_eq!(diag.len(), self.k);
         self.hbb_matvec = Some(Arc::new(matvec));
         self.hbb_diag = Some(diag);
         self.refresh_row_hessian_fingerprint();
@@ -964,8 +964,8 @@ impl ArrowSchurSystem {
             self.refresh_row_hessian_fingerprint();
             return;
         }
-        debug_assert_eq!(latent.n_obs(), self.rows.len());
-        debug_assert_eq!(latent.latent_dim(), self.d);
+        assert_eq!(latent.n_obs(), self.rows.len());
+        assert_eq!(latent.latent_dim(), self.d);
         for (i, row) in self.rows.iter_mut().enumerate() {
             let t_i = ArrayView1::from(latent.row(i));
             let gt_e = row.gt.clone();
@@ -1123,8 +1123,8 @@ impl StreamingArrowSchur {
         row_builder: StreamingArrowRowBuilder,
         chunk_size: usize,
     ) -> Self {
-        debug_assert_eq!(hbb.dim(), (k, k));
-        debug_assert_eq!(gb.len(), k);
+        assert_eq!(hbb.dim(), (k, k));
+        assert_eq!(gb.len(), k);
         Self {
             n_rows,
             d,
@@ -1326,7 +1326,7 @@ fn apply_analytic_penalty<S, G, D, P, H>(
     P: Fn(usize, &mut Array1<f64>),
     H: for<'a> FnMut(&mut S, usize, ArrayView1<'a, f64>),
 {
-    debug_assert_eq!(target.len(), expected_target_len);
+    assert_eq!(target.len(), expected_target_len);
 
     let grad = penalty.grad_target(target, rho_local);
     for index in 0..expected_target_len {
@@ -1334,7 +1334,7 @@ fn apply_analytic_penalty<S, G, D, P, H>(
     }
 
     if let Some(diag) = penalty.hessian_diag(target, rho_local) {
-        debug_assert_eq!(diag.len(), expected_target_len);
+        assert_eq!(diag.len(), expected_target_len);
         for index in 0..expected_target_len {
             diag_scatter(scatter_target, index, diag[index]);
         }
@@ -1547,7 +1547,7 @@ impl ArrowFactorCache {
     pub fn predict_delta_t_from_delta_beta(&self, delta_beta: ArrayView1<'_, f64>) -> Array1<f64> {
         let n = self.undamped_factor_count();
         let d = self.d;
-        debug_assert_eq!(delta_beta.len(), self.k);
+        assert_eq!(delta_beta.len(), self.k);
         if !self.htbeta_available() {
             return Array1::<f64>::zeros(n * d);
         }
@@ -1582,10 +1582,10 @@ impl ArrowFactorCache {
         let n = self.undamped_factor_count();
         let d = self.d;
         if let Some(db) = delta_beta.as_ref() {
-            debug_assert_eq!(db.len(), self.k);
+            assert_eq!(db.len(), self.k);
         }
         if let Some(dg) = delta_gt.as_ref() {
-            debug_assert_eq!(dg.len(), n * d);
+            assert_eq!(dg.len(), n * d);
         }
         let mut out = Array1::<f64>::zeros(n * d);
         let mut rhs = Array1::<f64>::zeros(d);
@@ -1656,8 +1656,8 @@ impl ArrowFactorCache {
     pub fn predict_delta_t_from_delta_gt(&self, delta_gt: ArrayView1<'_, f64>) -> Array1<f64> {
         let n = self.undamped_factor_count();
         let d = self.d;
-        debug_assert_eq!(delta_gt.len(), n * d);
-        debug_assert_eq!(
+        assert_eq!(delta_gt.len(), n * d);
+        assert_eq!(
             self.undamped_factor_count(),
             n,
             "undamped factor cache and N must agree"
@@ -1920,8 +1920,8 @@ fn arrow_gradient_dot_step(
     delta_t: ArrayView1<'_, f64>,
     delta_beta: ArrayView1<'_, f64>,
 ) -> f64 {
-    debug_assert_eq!(delta_t.len(), sys.rows.len() * sys.d);
-    debug_assert_eq!(delta_beta.len(), sys.k);
+    assert_eq!(delta_t.len(), sys.rows.len() * sys.d);
+    assert_eq!(delta_beta.len(), sys.k);
     let mut out = 0.0;
     for (i, row) in sys.rows.iter().enumerate() {
         for c in 0..sys.d {
@@ -2011,8 +2011,8 @@ fn solve_arrow_newton_step_artifacts(
     let mut delta_t = Array1::<f64>::zeros(n * d);
     let mut rhs = Array1::<f64>::zeros(d);
     for i in 0..n {
-        debug_assert_eq!(sys.rows[i].gt.len(), d);
-        debug_assert_eq!(sys.rows[i].htbeta.dim(), (d, k));
+        assert_eq!(sys.rows[i].gt.len(), d);
+        assert_eq!(sys.rows[i].htbeta.dim(), (d, k));
         for c in 0..d {
             let mut acc = sys.rows[i].gt[c];
             for a in 0..k {
@@ -2072,8 +2072,8 @@ pub fn apply_per_row_retraction(
     manifolds: &[Option<crate::solver::riemannian::ManifoldKind>],
 ) -> Array1<f64> {
     let n = manifolds.len();
-    debug_assert_eq!(point_flat.len(), n * row_ambient_dim);
-    debug_assert_eq!(delta_t.len(), n * row_ambient_dim);
+    assert_eq!(point_flat.len(), n * row_ambient_dim);
+    assert_eq!(delta_t.len(), n * row_ambient_dim);
     let mut out = Array1::<f64>::zeros(n * row_ambient_dim);
     for i in 0..n {
         let start = i * row_ambient_dim;
@@ -2120,7 +2120,7 @@ fn reduced_rhs_beta<B: BatchedBlockSolver>(
     let d = sys.d;
     let mut rhs_beta = Array1::<f64>::zeros(k);
     for (i, row) in sys.rows.iter().enumerate() {
-        debug_assert_eq!(row.htbeta.dim(), (d, k));
+        assert_eq!(row.htbeta.dim(), (d, k));
         let v = backend.solve_block_vector(&htt_factors[i], &row.gt);
         // Reorder to (c, a): outer-loop on c hoists `v[c]` out of the
         // inner-`a` loop and lets that loop walk `row.htbeta[[c, a]]`
@@ -2257,7 +2257,7 @@ fn schur_matvec<B: BatchedBlockSolver>(
     }
     let mut local = Array1::<f64>::zeros(d);
     for (i, row) in sys.rows.iter().enumerate() {
-        debug_assert_eq!(row.htbeta.dim(), (d, k));
+        assert_eq!(row.htbeta.dim(), (d, k));
         // H_tβ^(i) · x : row-major (d, k) is unit-strided in the inner k-loop.
         for c in 0..d {
             let mut acc = 0.0;
@@ -2532,10 +2532,10 @@ fn dot(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
 }
 
 fn metric_dot(a: &Array1<f64>, b: &Array1<f64>, metric_weights: Option<&MetricWeights>) -> f64 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len());
     match metric_weights {
         Some(weights) => {
-            debug_assert_eq!(weights.len(), a.len());
+            assert_eq!(weights.len(), a.len());
             let mut acc = 0.0;
             for i in 0..a.len() {
                 acc += weights[i] * a[i] * b[i];
@@ -2550,7 +2550,7 @@ fn metric_norm(v: ArrayView1<'_, f64>, metric_weights: Option<&MetricWeights>) -
     let mut acc = 0.0;
     match metric_weights {
         Some(weights) => {
-            debug_assert_eq!(weights.len(), v.len());
+            assert_eq!(weights.len(), v.len());
             for i in 0..v.len() {
                 acc += weights[i] * v[i] * v[i];
             }
@@ -2735,7 +2735,7 @@ pub fn write_arrow_direction(
 ) {
     let k = delta_beta.len();
     let nt = delta_t.len();
-    debug_assert_eq!(out.len(), k + nt);
+    assert_eq!(out.len(), k + nt);
     for j in 0..k {
         out[j] = delta_beta[j];
     }
@@ -2808,7 +2808,7 @@ pub fn flatten_beta_index(
     output_col: usize,
     p_out: usize,
 ) -> usize {
-    debug_assert!(block < beta_block_offsets.len());
+    assert!(block < beta_block_offsets.len());
     beta_block_offsets[block] + basis_col * p_out + output_col
 }
 

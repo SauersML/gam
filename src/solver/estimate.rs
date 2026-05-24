@@ -272,11 +272,11 @@ impl PenaltySpec {
         match self {
             PenaltySpec::Block { col_range, .. } => col_range.clone(),
             PenaltySpec::Dense(m) => {
-                debug_assert_eq!(m.ncols(), p);
+                assert_eq!(m.ncols(), p);
                 0..p
             }
             PenaltySpec::DenseWithMean { matrix, .. } => {
-                debug_assert_eq!(matrix.ncols(), p);
+                assert_eq!(matrix.ncols(), p);
                 0..p
             }
         }
@@ -338,11 +338,11 @@ impl PenaltySpec {
     pub fn to_global(&self, p_total: usize) -> Array2<f64> {
         match self {
             PenaltySpec::Dense(m) => {
-                debug_assert_eq!(m.nrows(), p_total);
+                assert_eq!(m.nrows(), p_total);
                 m.clone()
             }
             PenaltySpec::DenseWithMean { matrix, .. } => {
-                debug_assert_eq!(matrix.nrows(), p_total);
+                assert_eq!(matrix.nrows(), p_total);
                 matrix.clone()
             }
             PenaltySpec::Block {
@@ -3196,7 +3196,7 @@ where
                     )
                 })?;
 
-                debug_assert_eq!(
+                assert_eq!(
                     grad.len(),
                     theta_dim,
                     "unified evaluator gradient length {} != theta_dim {}",

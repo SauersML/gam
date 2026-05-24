@@ -420,7 +420,7 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
         support: CoeffSupport,
         direction_adjoint: &mut [f64],
     ) {
-        debug_assert!(direction_adjoint.len() > self.primary_index);
+        assert!(direction_adjoint.len() > self.primary_index);
         if support.include_primary {
             direction_adjoint[self.primary_index] +=
                 coeff4_dot(coeff_adjoint, &family[self.primary_index]);
@@ -509,7 +509,7 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
         support: CoeffSupport,
         direction_adjoint: &mut [f64],
     ) {
-        debug_assert!(direction_adjoint.len() > self.primary_index);
+        assert!(direction_adjoint.len() > self.primary_index);
         if param == self.primary_index {
             self.add_directional_family_adjoint(family, coeff_adjoint, support, direction_adjoint);
         } else if self.param_supported(param, support.without_primary()) {
@@ -595,7 +595,7 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
         support: CoeffSupport,
         direction_adjoint: &mut [f64],
     ) {
-        debug_assert!(direction_adjoint.len() > self.primary_index);
+        assert!(direction_adjoint.len() > self.primary_index);
         if u == self.primary_index && v == self.primary_index {
             self.add_directional_family_adjoint(family, coeff_adjoint, support, direction_adjoint);
         } else if u == self.primary_index && self.param_supported(v, support.without_primary()) {
@@ -1211,7 +1211,7 @@ pub fn outer_row_indices(
 pub fn outer_score_scale(opts: &crate::custom_family::BlockwiseFitOptions, n: usize) -> f64 {
     match opts.outer_score_subsample.as_ref() {
         Some(s) => {
-            debug_assert_eq!(
+            assert_eq!(
                 s.n_full, n,
                 "outer-score subsample full-data length must match caller length"
             );

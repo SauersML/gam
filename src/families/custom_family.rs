@@ -239,7 +239,7 @@ impl PenaltyMatrix {
             Self::KroneckerFactored { left, right } => {
                 let p_left = left.nrows();
                 let p_right = right.nrows();
-                debug_assert_eq!(target.len(), p_left * p_right);
+                assert_eq!(target.len(), p_left * p_right);
                 for i_left in 0..p_left {
                     let left_diag = left[[i_left, i_left]];
                     if left_diag == 0.0 {
@@ -717,7 +717,7 @@ pub fn realize_coefficient_groups_for_custom_family(
             base_prior_idx += 1;
         }
     }
-    debug_assert_eq!(base_prior_idx, base_count);
+    assert_eq!(base_prior_idx, base_count);
 
     for group in &realized_groups {
         outer_labels.push(group.label.clone());
@@ -6163,7 +6163,7 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         factor: &Array2<f64>,
         directions: &Array2<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        debug_assert_eq!(
+        assert_eq!(
             factor.nrows(),
             directions.nrows(),
             "projected directional derivative traces require shared coefficient dimension"
@@ -8461,7 +8461,7 @@ fn penalty_logdet_cholesky_fallback(
 }
 
 fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, dim: usize) -> RidgeDeterminantMode {
-    debug_assert!(
+    assert!(
         dim.checked_add(1).is_some(),
         "ridge determinant dimension overflow"
     );
@@ -18281,8 +18281,8 @@ fn apply_joint_block_penalty_into(
     diagonal_ridge: f64,
     out: &mut Array1<f64>,
 ) {
-    debug_assert_eq!(out.len(), vector.len());
-    debug_assert!(s_lambdas.len() <= ranges.len());
+    assert_eq!(out.len(), vector.len());
+    assert!(s_lambdas.len() <= ranges.len());
     out.fill(0.0);
 
     if s_lambdas.len() <= 1 {
@@ -18319,8 +18319,8 @@ fn apply_joint_block_penalty_into(
         let mut remaining = out_values;
         let mut cursor = 0usize;
         for &(start, end) in ranges.iter().take(s_lambdas.len()) {
-            debug_assert!(start >= cursor);
-            debug_assert!(end >= start);
+            assert!(start >= cursor);
+            assert!(end >= start);
             let (_, after_gap) = remaining.split_at_mut(start - cursor);
             let (out_block, after_block) = after_gap.split_at_mut(end - start);
             out_blocks.push(out_block);
@@ -18535,7 +18535,7 @@ fn projected_stationarity_inf_norm(
     constraints: Option<&LinearInequalityConstraints>,
     known_active_rows: Option<&[usize]>,
 ) -> f64 {
-    debug_assert_eq!(residual.len(), beta.len());
+    assert_eq!(residual.len(), beta.len());
     let raw_inf = residual.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     let Some(constraints) = constraints else {
         return raw_inf;

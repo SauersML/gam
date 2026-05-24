@@ -520,7 +520,7 @@ impl PenaltyPseudologdet {
                     null_col += 1;
                 }
             }
-            debug_assert_eq!(
+            assert_eq!(
                 null_col, total_nullity,
                 "block-factored pseudo-logdet nullspace assembly mismatch"
             );
@@ -892,7 +892,7 @@ impl PenaltyPseudologdet {
                     .slice(s![start..end, span.rank_start..span.rank_end])
                     .t()
                     .dot(&local_w);
-                debug_assert_eq!(local_end - local_start, penalty.local.nrows());
+                assert_eq!(local_end - local_start, penalty.local.nrows());
                 ReducedPenalty {
                     span: Some(span_idx),
                     y,
