@@ -1,24 +1,31 @@
-//! GPU acceleration backend facade.
+//! GPU acceleration HAL for `gam`.
 //!
-//! The CPU implementation remains the reference path. This module provides the
-//! runtime probe, dispatch policy, device-memory descriptors, and profiling
-//! hooks that hot kernels use to decide when a CUDA implementation may be used.
-//! When the `cuda` feature is disabled, or CUDA cannot be loaded at runtime,
-//! every operation deterministically falls back to the existing CPU kernels.
+//! The module is intentionally backend-contained: solver and linalg code talk
+//! to the traits and policy types exported here, while cudarc-backed execution
+//! remains behind the `cuda` Cargo feature.  In the initial implementation all
+//! operations are routed through the CPU fallback unless a future backend marks
+//! the operation as supported by the active [`GpuRuntime`].
 
+pub mod blas;
+pub mod cpu_traits;
 pub mod device;
+pub mod graph;
 pub mod kernels;
-pub mod linalg;
 pub mod memory;
 pub mod policy;
 pub mod profile;
+pub mod rand;
 pub mod runtime;
 pub mod solver;
 pub mod sparse;
 pub mod stream;
+pub mod validate;
 
+pub use cpu_traits::{
+    DeviceBlas, DeviceDesignOperator, DeviceSolver, ExecutionTarget, MatrixLocation,
+};
 pub use device::{GpuCapability, GpuDeviceInfo};
-pub use linalg::{GpuDenseKernel, try_dispatch_dense};
-pub use policy::{AccelPolicy, GpuDispatchDecision, GpuDispatchPolicy, GpuOperation};
-pub use profile::{KernelStat, record_cpu_kernel};
-pub use runtime::{ExecutionTarget, GpuContext, GpuRuntime, gpu_available, selected_gpu_info};
+pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector, GpuFitSession};
+pub use policy::{GpuBackendDecision, GpuDispatchPolicy, GpuEnv, GpuOpKind};
+pub use profile::{GpuProfile, KernelStat, record_cpu_kernel};
+pub use runtime::{GpuRuntime, GpuRuntimeStatus};

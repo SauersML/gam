@@ -1,16 +1,7 @@
-use crate::gpu::memory::MatrixLocationMut;
+//! Phase-specific GPU backend placeholder.
+//!
+//! The public marker keeps the HAL surface explicit while the default build and
+//! unsupported CUDA configurations use CPU fallback through dispatch policy.
 
-pub trait DenseSpdSolver {
-    type Factor;
-    type Error;
-
-    fn potrf(&self, matrix: MatrixLocationMut<'_, f64>) -> Result<Self::Factor, Self::Error>;
-    fn potrs(
-        &self,
-        factor: &Self::Factor,
-        rhs: MatrixLocationMut<'_, f64>,
-    ) -> Result<(), Self::Error>;
-}
-
-#[derive(Clone, Debug)]
-pub struct GpuSolverUnavailable;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BackendPhaseMarker;

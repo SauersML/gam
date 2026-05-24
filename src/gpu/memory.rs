@@ -1,70 +1,83 @@
-use std::marker::PhantomData;
+use ndarray::{Array1, Array2};
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MatrixLayout {
-    RowMajor,
-    ColumnMajor,
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceBuffer {
+    pub len: usize,
+    pub bytes: usize,
+    pub backend: String,
 }
 
-/// Host-side descriptor for a future device buffer allocation.
-#[derive(Clone, Debug)]
-pub struct DeviceBuffer<T> {
-    len: usize,
-    _marker: PhantomData<T>,
-}
-
-impl<T> DeviceBuffer<T> {
+impl DeviceBuffer {
     #[must_use]
-    pub fn new_unallocated(len: usize) -> Self {
+    pub fn placeholder(len: usize, elem_bytes: usize) -> Self {
         Self {
             len,
-            _marker: PhantomData,
+            bytes: len.saturating_mul(elem_bytes),
+            backend: "cpu-placeholder".to_string(),
         }
     }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
 }
 
-#[derive(Clone, Debug)]
-pub struct DeviceMatrix<T> {
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceMatrix {
     pub rows: usize,
     pub cols: usize,
-    pub ld: usize,
-    pub layout: MatrixLayout,
-    pub buffer: DeviceBuffer<T>,
+    pub buffer: DeviceBuffer,
 }
 
-impl<T> DeviceMatrix<T> {
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceVector {
+    pub len: usize,
+    pub buffer: DeviceBuffer,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceCsrMatrix {
+    pub rows: usize,
+    pub cols: usize,
+    pub nnz: usize,
+    pub rowptr: DeviceBuffer,
+    pub colidx: DeviceBuffer,
+    pub values: DeviceBuffer,
+}
+
+impl DeviceMatrix {
     #[must_use]
-    pub fn descriptor(rows: usize, cols: usize, layout: MatrixLayout) -> Self {
-        let ld = match layout {
-            MatrixLayout::RowMajor => cols,
-            MatrixLayout::ColumnMajor => rows,
-        };
+    pub fn from_host_shape(host: &Array2<f64>) -> Self {
+        let (rows, cols) = host.dim();
         Self {
             rows,
             cols,
-            ld,
-            layout,
-            buffer: DeviceBuffer::new_unallocated(rows * cols),
+            buffer: DeviceBuffer::placeholder(rows.saturating_mul(cols), 8),
         }
     }
 }
 
-pub enum MatrixLocation<'a, T> {
-    Host(&'a ndarray::Array2<T>),
-    Device(&'a DeviceMatrix<T>),
+impl DeviceVector {
+    #[must_use]
+    pub fn from_host_shape(host: &Array1<f64>) -> Self {
+        Self {
+            len: host.len(),
+            buffer: DeviceBuffer::placeholder(host.len(), 8),
+        }
+    }
 }
 
-pub enum MatrixLocationMut<'a, T> {
-    Host(&'a mut ndarray::Array2<T>),
-    Device(&'a mut DeviceMatrix<T>),
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GpuFitSession {
+    pub persistent_bytes: usize,
+    pub iteration_bytes: usize,
+    pub lm_attempt_bytes: usize,
+    pub dense_design: Option<DeviceMatrix>,
+    pub sparse_design: Option<DeviceCsrMatrix>,
+}
+
+impl GpuFitSession {
+    #[must_use]
+    pub fn total_bytes(&self) -> usize {
+        self.persistent_bytes
+            .saturating_add(self.iteration_bytes)
+            .saturating_add(self.lm_attempt_bytes)
+    }
 }
