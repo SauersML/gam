@@ -5282,19 +5282,14 @@ where
         }
     };
 
+    let spec = spec_from_family_link(family, link_kind.as_ref());
     if matches!(
-        family,
-        crate::types::LikelihoodFamily::BinomialLogit
-            | crate::types::LikelihoodFamily::BinomialProbit
-            | crate::types::LikelihoodFamily::BinomialCLogLog
-            | crate::types::LikelihoodFamily::BinomialLatentCLogLog
-            | crate::types::LikelihoodFamily::BinomialSas
-            | crate::types::LikelihoodFamily::BinomialBetaLogistic
-            | crate::types::LikelihoodFamily::BinomialMixture
-            | crate::types::LikelihoodFamily::BetaLogit { .. }
-            | crate::types::LikelihoodFamily::RoystonParmar
+        spec.response,
+        ResponseFamily::Binomial
+            | ResponseFamily::Beta { .. }
+            | ResponseFamily::RoystonParmar
     ) {
-        let (lo, hi) = if matches!(family, crate::types::LikelihoodFamily::BetaLogit { .. }) {
+        let (lo, hi) = if matches!(spec.response, ResponseFamily::Beta { .. }) {
             (1e-10, 1.0 - 1e-10)
         } else {
             (0.0, 1.0)
@@ -5326,8 +5321,8 @@ where
             (Some(lower), Some(upper))
         };
 
-        match family {
-            crate::types::LikelihoodFamily::GaussianIdentity => {
+        match spec.response {
+            ResponseFamily::Gaussian => {
                 let obsvar = fit.standard_deviation.max(0.0).powi(2);
                 let obs_se = etavar.mapv(|v| (v + obsvar).max(0.0).sqrt());
                 let lower = Array1::from_iter(
@@ -5344,35 +5339,29 @@ where
                 );
                 (Some(lower), Some(upper))
             }
-            crate::types::LikelihoodFamily::PoissonLog => {
+            ResponseFamily::Poisson => {
                 let response_var = mean.mapv(|mu| mu.max(0.0));
                 response_observation_bounds(response_var)
             }
-            crate::types::LikelihoodFamily::NegativeBinomial { theta } => {
+            ResponseFamily::NegativeBinomial { theta } => {
                 let response_var = mean.mapv(|mu| mu + mu.powi(2) / theta);
                 response_observation_bounds(response_var)
             }
-            crate::types::LikelihoodFamily::Tweedie { p } => {
+            ResponseFamily::Tweedie { p } => {
                 let phi = fit.likelihood_scale.fixed_phi().unwrap_or(1.0);
                 let response_var = mean.mapv(|mu| phi * mu.powf(p));
                 response_observation_bounds(response_var)
             }
-            crate::types::LikelihoodFamily::GammaLog => {
+            ResponseFamily::Gamma => {
                 let phi = fit.likelihood_scale.fixed_phi().unwrap_or(1.0);
                 let response_var = mean.mapv(|mu| phi * mu.powi(2));
                 response_observation_bounds(response_var)
             }
-            crate::types::LikelihoodFamily::BetaLogit { phi } => {
+            ResponseFamily::Beta { phi } => {
                 let response_var = mean.mapv(|mu| mu * (1.0 - mu) / (1.0 + phi));
                 response_observation_bounds(response_var)
             }
-            crate::types::LikelihoodFamily::BinomialLogit
-            | crate::types::LikelihoodFamily::BinomialProbit
-            | crate::types::LikelihoodFamily::BinomialCLogLog
-            | crate::types::LikelihoodFamily::BinomialLatentCLogLog
-            | crate::types::LikelihoodFamily::BinomialSas
-            | crate::types::LikelihoodFamily::BinomialBetaLogistic
-            | crate::types::LikelihoodFamily::BinomialMixture => {
+            ResponseFamily::Binomial => {
                 // Prediction returns probability/proportion means; trial counts are not in this API.
                 // Beta-logistic and mixture links use the closest conditional Bernoulli variance.
                 let response_var = mean.mapv(|mu| {
@@ -5381,7 +5370,7 @@ where
                 });
                 response_observation_bounds(response_var)
             }
-            _ => (None, None),
+            ResponseFamily::RoystonParmar => (None, None),
         }
     } else {
         (None, None)

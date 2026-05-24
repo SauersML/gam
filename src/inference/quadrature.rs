@@ -5230,15 +5230,22 @@ mod tests {
     }
 
     #[test]
-    fn integrated_family_moments_rejects_state_less_sas_and_mixture() {
+    fn integrated_family_moments_rejects_latent_cloglog_without_concrete_handler() {
+        // With the LikelihoodSpec migration, SAS and Mixture parameterized binomial
+        // variants carry their state through `InverseLink`, so the type system
+        // already prevents constructing a state-less call. The only remaining
+        // explicit error path here is `Binomial + LatentCLogLog`, which this
+        // dispatcher reports as needing an explicit latent-cloglog state handler.
         let ctx = QuadratureContext::new();
-        let sas = integrated_family_moments_jet(&ctx, LikelihoodFamily::BinomialSas, 0.2, 0.5)
-            .expect_err("state-less SAS moments should error");
-        assert!(format!("{sas}").contains("SasLinkState"));
-
-        let mix = integrated_family_moments_jet(&ctx, LikelihoodFamily::BinomialMixture, 0.2, 0.5)
-            .expect_err("state-less mixture moments should error");
-        assert!(format!("{mix}").contains("MixtureLinkState"));
+        let latent = crate::types::LatentCLogLogState::new(0.4)
+            .expect("valid latent cloglog state");
+        let spec = LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::LatentCLogLog(latent),
+        );
+        let err = integrated_family_moments_jet(&ctx, &spec, 0.2, 0.5)
+            .expect_err("latent cloglog moments should error in this dispatcher");
+        assert!(format!("{err}").contains("LatentCLogLog"));
     }
 
     #[test]
@@ -5249,15 +5256,9 @@ mod tests {
             initial_log_delta: -0.2,
         })
         .expect("sas state should reconstruct from raw parameters");
-        let out = integrated_family_moments_jetwith_state(
-            &ctx,
-            LikelihoodFamily::BinomialSas,
-            0.2,
-            0.5,
-            None,
-            Some(&sas),
-        )
-        .expect("stateful SAS integrated moments should evaluate");
+        let spec = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(sas));
+        let out = integrated_family_moments_jet(&ctx, &spec, 0.2, 0.5)
+            .expect("stateful SAS integrated moments should evaluate");
         assert!(out.mean.is_finite());
         assert!(out.d1.is_finite());
         assert!(out.d2.is_finite());
@@ -5273,15 +5274,9 @@ mod tests {
             initial_rho: ndarray::Array1::<f64>::zeros(0),
         })
         .expect("single-component probit mixture state");
-        let out = integrated_family_moments_jetwith_state(
-            &ctx,
-            LikelihoodFamily::BinomialMixture,
-            0.7,
-            1.3,
-            Some(&state),
-            None,
-        )
-        .expect("pure probit mixture integrated moments should evaluate");
+        let spec = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Mixture(state));
+        let out = integrated_family_moments_jet(&ctx, &spec, 0.7, 1.3)
+            .expect("pure probit mixture integrated moments should evaluate");
         let exact = integrated_probit_jet(0.7, 1.3);
         assert_relative_eq!(out.mean, exact.mean, epsilon = 1e-12);
         assert_relative_eq!(out.d1, exact.d1, epsilon = 1e-12);
@@ -5298,15 +5293,9 @@ mod tests {
             initial_rho: ndarray::Array1::<f64>::zeros(0),
         })
         .expect("single-component logit mixture state");
-        let out = integrated_family_moments_jetwith_state(
-            &ctx,
-            LikelihoodFamily::BinomialMixture,
-            1.1,
-            0.8,
-            Some(&state),
-            None,
-        )
-        .expect("pure logit mixture integrated moments should evaluate");
+        let spec = LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Mixture(state));
+        let out = integrated_family_moments_jet(&ctx, &spec, 1.1, 0.8)
+            .expect("pure logit mixture integrated moments should evaluate");
         let exact = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, 1.1, 0.8)
             .expect("canonical integrated logit jet");
         assert_relative_eq!(out.mean, exact.mean, epsilon = 1e-12);
@@ -5327,15 +5316,10 @@ mod tests {
             initial_rho: ndarray::array![0.35],
         })
         .expect("mixture state should reconstruct from rho");
-        let out = integrated_family_moments_jetwith_state(
-            &ctx,
-            LikelihoodFamily::BinomialMixture,
-            0.2,
-            0.5,
-            Some(&state),
-            None,
-        )
-        .expect("stateful mixture integrated moments should evaluate");
+        let spec =
+            LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Mixture(state.clone()));
+        let out = integrated_family_moments_jet(&ctx, &spec, 0.2, 0.5)
+            .expect("stateful mixture integrated moments should evaluate");
         let direct = integrated_mixture_jet(&ctx, 0.2, 0.5, &state)
             .expect("direct integrated mixture jet should evaluate");
         assert_relative_eq!(out.mean, direct.mean, epsilon = 1e-12);

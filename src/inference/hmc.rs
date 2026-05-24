@@ -1173,27 +1173,35 @@ fn joint_binomial_logp_grad_and_link_grad(
 }
 
 fn joint_binomial_logp_and_grad(
-    family: LikelihoodFamily,
-    inverse_link: &InverseLink,
+    likelihood: &LikelihoodSpec,
     data: &SharedData,
     eta: &Array1<f64>,
 ) -> Result<(f64, Array1<f64>), String> {
-    match family {
-        LikelihoodFamily::BinomialLogit => Ok(logit_logp_and_grad(data, eta)),
-        LikelihoodFamily::BinomialProbit => Ok(probit_logp_and_grad(data, eta)),
-        LikelihoodFamily::BinomialCLogLog => Ok(cloglog_logp_and_grad(data, eta)),
-        LikelihoodFamily::BinomialLatentCLogLog
-        | LikelihoodFamily::BinomialSas
-        | LikelihoodFamily::BinomialBetaLogistic
-        | LikelihoodFamily::BinomialMixture => {
-            let (ll, grad_beta, _) =
-                joint_binomial_logp_grad_and_link_grad(inverse_link, data, eta, 0)?;
-            Ok((ll, grad_beta))
-        }
-        _ => Err(HmcError::UnsupportedFamily {
+    if !matches!(likelihood.response, ResponseFamily::Binomial) {
+        return Err(HmcError::UnsupportedFamily {
             reason: format!(
                 "{} is not a binomial joint-HMC family",
-                family.pretty_name()
+                likelihood_spec_pretty_name(likelihood)
+            ),
+        }
+        .into());
+    }
+    match &likelihood.link {
+        InverseLink::Standard(LinkFunction::Logit) => Ok(logit_logp_and_grad(data, eta)),
+        InverseLink::Standard(LinkFunction::Probit) => Ok(probit_logp_and_grad(data, eta)),
+        InverseLink::Standard(LinkFunction::CLogLog) => Ok(cloglog_logp_and_grad(data, eta)),
+        InverseLink::LatentCLogLog(_)
+        | InverseLink::Sas(_)
+        | InverseLink::BetaLogistic(_)
+        | InverseLink::Mixture(_) => {
+            let (ll, grad_beta, _) =
+                joint_binomial_logp_grad_and_link_grad(&likelihood.link, data, eta, 0)?;
+            Ok((ll, grad_beta))
+        }
+        InverseLink::Standard(_) => Err(HmcError::UnsupportedFamily {
+            reason: format!(
+                "{} is not a binomial joint-HMC family",
+                likelihood_spec_pretty_name(likelihood)
             ),
         }
         .into()),
@@ -1201,33 +1209,33 @@ fn joint_binomial_logp_and_grad(
 }
 
 fn joint_family_logp_grad_and_link_grad(
-    family: LikelihoodFamily,
-    inverse_link: &InverseLink,
+    likelihood: &LikelihoodSpec,
     data: &SharedData,
     eta: &Array1<f64>,
     n_link_params: usize,
 ) -> Result<(f64, Array1<f64>, Array1<f64>), String> {
-    match family {
-        LikelihoodFamily::BinomialLogit => {
+    match (&likelihood.response, &likelihood.link) {
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
             let (ll, grad) = logit_logp_and_grad(data, eta);
             Ok((ll, grad, Array1::zeros(n_link_params)))
         }
-        LikelihoodFamily::BinomialProbit => {
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
             let (ll, grad) = probit_logp_and_grad(data, eta);
             Ok((ll, grad, Array1::zeros(n_link_params)))
         }
-        LikelihoodFamily::BinomialCLogLog => {
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
             let (ll, grad) = cloglog_logp_and_grad(data, eta);
             Ok((ll, grad, Array1::zeros(n_link_params)))
         }
-        LikelihoodFamily::BinomialLatentCLogLog
-        | LikelihoodFamily::BinomialSas
-        | LikelihoodFamily::BinomialBetaLogistic
-        | LikelihoodFamily::BinomialMixture => {
-            joint_binomial_logp_grad_and_link_grad(inverse_link, data, eta, n_link_params)
-        }
-        other => {
-            let (ll, grad) = joint_family_logp_and_grad(other, inverse_link, data, eta)?;
+        (
+            ResponseFamily::Binomial,
+            InverseLink::LatentCLogLog(_)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_)
+            | InverseLink::Mixture(_),
+        ) => joint_binomial_logp_grad_and_link_grad(&likelihood.link, data, eta, n_link_params),
+        _ => {
+            let (ll, grad) = joint_family_logp_and_grad(likelihood, data, eta)?;
             Ok((ll, grad, Array1::zeros(n_link_params)))
         }
     }

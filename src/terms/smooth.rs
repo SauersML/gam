@@ -45,7 +45,8 @@ use crate::mixture_link::{
 use crate::pirls::LinearInequalityConstraints;
 use crate::resource::MatrixMaterializationError;
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodFamily, MixtureLinkState, SasLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodFamily, LikelihoodSpec, LinkFunction,
+    MixtureLinkState, ResponseFamily, SasLinkState,
 };
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
@@ -57,6 +58,48 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
+
+// ---------------------------------------------------------------------------
+// LikelihoodSpec ↔ LikelihoodFamily bridge
+// ---------------------------------------------------------------------------
+//
+// smooth.rs takes `LikelihoodSpec { response, link }` at its public API
+// boundary. Several downstream helpers (estimate, custom_family, seeding,
+// workflow's `ExternalOptimOptions`) still consume the flat
+// `LikelihoodFamily` enum; this bridge collapses a `LikelihoodSpec` back to
+// the matching flat variant for those forwarding sites.
+
+fn spec_to_family(spec: &LikelihoodSpec) -> LikelihoodFamily {
+    match (&spec.response, &spec.link) {
+        (ResponseFamily::Gaussian, _) => LikelihoodFamily::GaussianIdentity,
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+            LikelihoodFamily::BinomialLogit
+        }
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+            LikelihoodFamily::BinomialProbit
+        }
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+            LikelihoodFamily::BinomialCLogLog
+        }
+        (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
+            LikelihoodFamily::BinomialLatentCLogLog
+        }
+        (ResponseFamily::Binomial, InverseLink::Sas(_)) => LikelihoodFamily::BinomialSas,
+        (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
+            LikelihoodFamily::BinomialBetaLogistic
+        }
+        (ResponseFamily::Binomial, InverseLink::Mixture(_)) => LikelihoodFamily::BinomialMixture,
+        (ResponseFamily::Binomial, InverseLink::Standard(_)) => LikelihoodFamily::BinomialLogit,
+        (ResponseFamily::Poisson, _) => LikelihoodFamily::PoissonLog,
+        (ResponseFamily::Tweedie { p }, _) => LikelihoodFamily::Tweedie { p: *p },
+        (ResponseFamily::NegativeBinomial { theta }, _) => {
+            LikelihoodFamily::NegativeBinomial { theta: *theta }
+        }
+        (ResponseFamily::Beta { phi }, _) => LikelihoodFamily::BetaLogit { phi: *phi },
+        (ResponseFamily::Gamma, _) => LikelihoodFamily::GammaLog,
+        (ResponseFamily::RoystonParmar, _) => LikelihoodFamily::RoystonParmar,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Typed errors
