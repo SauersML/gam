@@ -578,6 +578,9 @@ impl NutsPosterior {
         }
 
         validate_firth_support(nuts_family, firth_enabled).map_err(String::from)?;
+        if matches!(nuts_family, NutsFamily::NegativeBinomialLog) {
+            validate_count_responses("negative-binomial NUTS", &y, &weights).map_err(String::from)?;
+        }
 
         // Use faer for numerically stable Cholesky decomposition of H
         // H = L_H L_H^T where L_H is lower triangular
@@ -790,6 +793,28 @@ fn validate_firth_likelihood_support(
                 family.pretty_name()
             ),
         });
+    }
+    Ok(())
+}
+
+#[inline]
+fn valid_count_response(y: f64) -> bool {
+    y.is_finite() && y >= 0.0 && (y - y.round()).abs() <= 1e-9
+}
+
+fn validate_count_responses(
+    family: &str,
+    y: &ArrayView1<'_, f64>,
+    weights: &ArrayView1<'_, f64>,
+) -> Result<(), HmcError> {
+    for (i, (&yi, &wi)) in y.iter().zip(weights.iter()).enumerate() {
+        if wi > 0.0 && !valid_count_response(yi) {
+            return Err(HmcError::InvalidConfig {
+                reason: format!(
+                    "{family} response must be a finite non-negative integer at positive-weight row {i}; got {yi}"
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -1175,6 +1200,18 @@ fn negative_binomial_log_logp_and_grad(
 ) -> (f64, Array1<f64>) {
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
+    if !(theta.is_finite() && theta > 0.0)
+        || eta
+            .iter()
+            .any(|&eta_i| !(eta_i.is_finite() && (-700.0..=700.0).contains(&eta_i)))
+        || data
+            .y
+            .iter()
+            .zip(data.weights.iter())
+            .any(|(&y_i, &w_i)| w_i > 0.0 && !valid_count_response(y_i))
+    {
+        return (f64::NEG_INFINITY, Array1::zeros(data.dim));
+    }
     let mut residual = Array1::<f64>::zeros(n);
     let ll: f64 = residual
         .as_slice_mut()
@@ -1182,14 +1219,14 @@ fn negative_binomial_log_logp_and_grad(
         .par_iter_mut()
         .enumerate()
         .map(|(i, slot)| {
-            if !(theta.is_finite() && theta > 0.0) {
-                *slot = f64::NAN;
-                return f64::NAN;
-            }
-            let eta_i = eta[i].clamp(-700.0, 700.0);
+            let eta_i = eta[i];
             let mu_i = eta_i.exp().max(1e-12);
             let y_i = data.y[i];
             let w_i = data.weights[i];
+            if w_i <= 0.0 {
+                *slot = 0.0;
+                return 0.0;
+            }
             let log_mu_term = if y_i > 0.0 { y_i * mu_i.ln() } else { 0.0 };
             *slot = w_i * theta * (y_i - mu_i) / (theta + mu_i);
             w_i * (statrs::function::gamma::ln_gamma(y_i + theta)
@@ -3761,6 +3798,10 @@ impl LinkWigglePosterior {
             }
             .into());
         }
+        if matches!(nuts_family, NutsFamily::NegativeBinomialLog) {
+            validate_count_responses("negative-binomial link-wiggle NUTS", &y, &weights)
+                .map_err(String::from)?;
+        }
         let hessian_owned = hessian.to_owned();
         let chol_factor = hessian_owned
             .cholesky(Side::Lower)
@@ -3994,8 +4035,15 @@ impl LinkWigglePosterior {
                 }
                 let theta = self.scale;
                 for i in 0..self.n_samples {
-                    let eta_i = eta[i].clamp(-30.0, 30.0);
+                    let eta_i = eta[i];
+                    if !(eta_i.is_finite() && (-30.0..=30.0).contains(&eta_i)) {
+                        return (f64::NEG_INFINITY, Array1::zeros(dim));
+                    }
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
+                    if w_i <= 0.0 {
+                        residual[i] = 0.0;
+                        continue;
+                    }
                     let mu = eta_i.exp().max(1e-12);
                     let log_mu_term = if y_i > 0.0 { y_i * mu.ln() } else { 0.0 };
                     ll_acc += w_i
@@ -4729,6 +4777,10 @@ impl JointBetaRhoPosterior {
 
         validate_firth_likelihood_support(likelihood_family, firth_enabled)
             .map_err(String::from)?;
+        if matches!(likelihood_family, LikelihoodFamily::NegativeBinomial { .. }) {
+            validate_count_responses("negative-binomial joint HMC", &y, &weights)
+                .map_err(String::from)?;
+        }
 
         // Cholesky of H for β-whitening (same as NutsPosterior)
         let hessian_owned = hessian.to_owned();
