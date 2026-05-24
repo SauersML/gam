@@ -313,6 +313,30 @@ struct SampleConfigPayload {
 }
 
 #[derive(Serialize)]
+struct CompetingRisksPredictionPayload {
+    class: &'static str,
+    model_class: String,
+    likelihood_mode: String,
+    endpoint_names: Vec<String>,
+    times: Vec<f64>,
+    /// Per-endpoint hazard surface, shape `[n_endpoints][n_rows][n_times]`.
+    hazard: Vec<Vec<Vec<f64>>>,
+    /// Per-endpoint cause-specific survival, same shape as `hazard`.
+    survival: Vec<Vec<Vec<f64>>>,
+    /// Per-endpoint cumulative hazard, same shape as `hazard`.
+    cumulative_hazard: Vec<Vec<Vec<f64>>>,
+    /// Per-endpoint cumulative incidence function, same shape as `hazard`.
+    cif: Vec<Vec<Vec<f64>>>,
+    /// Overall survival across all endpoints, shape `[n_rows][n_times]`.
+    overall_survival: Vec<Vec<f64>>,
+    /// Per-endpoint linear predictor, shape `[n_endpoints][n_rows]`.
+    linear_predictor: Vec<Vec<f64>>,
+    /// Flattened scalar columns indexed by name (e.g. `eta_<endpoint>`,
+    /// `failure_prob_<endpoint>`, `overall_survival`).
+    columns: BTreeMap<String, Vec<f64>>,
+}
+
+#[derive(Serialize)]
 struct SurvivalPredictionPayload {
     class: &'static str,
     model_class: String,
