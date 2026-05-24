@@ -333,6 +333,17 @@ pub trait AnalyticPenalty: Send + Sync {
     fn apply_schedule(&mut self, _iter: usize) {}
 }
 
+fn advance_scalar_weight(
+    weight: &mut f64,
+    schedule: &mut Option<ScalarWeightSchedule>,
+    iter: usize,
+) {
+    if let Some(schedule) = schedule.as_mut() {
+        *weight = schedule.current_weight(iter);
+        schedule.iter_count = iter + 1;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Isometry penalty
 // ---------------------------------------------------------------------------
@@ -1301,6 +1312,10 @@ impl AnalyticPenalty for IsometryPenalty {
     fn name(&self) -> &str {
         "isometry"
     }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.scalar_weight, &mut self.weight_schedule, iter);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1503,6 +1518,10 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     fn name(&self) -> &str {
         "softmax_assignment_sparsity"
     }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
+    }
 }
 
 /// IBP-MAP active-set prior over SAE-manifold assignment logits.
@@ -1695,6 +1714,10 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
 
     fn name(&self) -> &str {
         "ibp_assignment_map"
+    }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
     }
 }
 
@@ -2053,6 +2076,10 @@ impl AnalyticPenalty for SparsityPenalty {
     fn name(&self) -> &str {
         "sparsity"
     }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2250,6 +2277,10 @@ impl AnalyticPenalty for ARDPenalty {
 
     fn name(&self) -> &str {
         "ard"
+    }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
     }
 }
 
@@ -2694,6 +2725,10 @@ impl AnalyticPenalty for TotalVariationPenalty {
     fn name(&self) -> &str {
         "total_variation"
     }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3067,6 +3102,10 @@ impl AnalyticPenalty for NuclearNormPenalty {
     fn name(&self) -> &str {
         "nuclear_norm"
     }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3397,6 +3436,10 @@ impl AnalyticPenalty for BlockSparsityPenalty {
 
     fn name(&self) -> &str {
         "block_sparsity"
+    }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
     }
 }
 
@@ -3735,6 +3778,10 @@ impl AnalyticPenalty for AuxConditionalPriorPenalty {
     fn name(&self) -> &str {
         "aux_conditional_prior"
     }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3766,6 +3813,7 @@ pub struct ParametricAuxConditionalPriorPenalty {
     pub n_eff: usize,
     pub learnable_weight: bool,
     pub target: PsiSlice,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl ParametricAuxConditionalPriorPenalty {
@@ -3904,7 +3952,15 @@ impl ParametricAuxConditionalPriorPenalty {
             n_eff,
             learnable_weight,
             target,
+            weight_schedule: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
     }
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
@@ -4160,6 +4216,10 @@ impl AnalyticPenalty for ParametricAuxConditionalPriorPenalty {
     fn name(&self) -> &str {
         "parametric_aux_conditional_prior"
     }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4200,6 +4260,7 @@ pub struct ScadMcpPenalty {
     pub variant: PenaltyConcavity,
     pub learnable_weight: bool,
     pub rho_index: usize,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl ScadMcpPenalty {
@@ -4263,7 +4324,15 @@ impl ScadMcpPenalty {
             variant,
             learnable_weight,
             rho_index: 0,
+            weight_schedule: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
     }
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
@@ -4512,6 +4581,10 @@ impl AnalyticPenalty for ScadMcpPenalty {
     fn name(&self) -> &str {
         "scad_mcp"
     }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4536,6 +4609,7 @@ pub struct OrthogonalityPenalty {
     pub n_eff: usize,
     pub learnable_weight: bool,
     pub rho_index: usize,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 impl OrthogonalityPenalty {
@@ -4585,7 +4659,15 @@ impl OrthogonalityPenalty {
             n_eff,
             learnable_weight,
             rho_index: 0,
+            weight_schedule: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
     }
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
@@ -4813,6 +4895,10 @@ impl AnalyticPenalty for OrthogonalityPenalty {
     fn name(&self) -> &str {
         "orthogonality"
     }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4862,6 +4948,27 @@ pub enum AnalyticPenaltyKind {
 }
 
 impl AnalyticPenaltyKind {
+    pub fn apply_schedule(&mut self, iter: usize) {
+        match self {
+            AnalyticPenaltyKind::Isometry(p) => Arc::make_mut(p).apply_schedule(iter),
+            AnalyticPenaltyKind::Sparsity(p) => Arc::make_mut(p).apply_schedule(iter),
+            AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => {
+                Arc::make_mut(p).apply_schedule(iter)
+            }
+            AnalyticPenaltyKind::IBPAssignment(p) => Arc::make_mut(p).apply_schedule(iter),
+            AnalyticPenaltyKind::Ard(p) => Arc::make_mut(p).apply_schedule(iter),
+            AnalyticPenaltyKind::TotalVariation(p) => Arc::make_mut(p).apply_schedule(iter),
+            AnalyticPenaltyKind::NuclearNorm(p) => Arc::make_mut(p).apply_schedule(iter),
+            AnalyticPenaltyKind::BlockSparsity(p) => Arc::make_mut(p).apply_schedule(iter),
+            AnalyticPenaltyKind::AuxConditionalPrior(p) => Arc::make_mut(p).apply_schedule(iter),
+            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => {
+                Arc::make_mut(p).apply_schedule(iter)
+            }
+            AnalyticPenaltyKind::ScadMcp(p) => Arc::make_mut(p).apply_schedule(iter),
+            AnalyticPenaltyKind::Orthogonality(p) => Arc::make_mut(p).apply_schedule(iter),
+        }
+    }
+
     pub fn tier(&self) -> PenaltyTier {
         match self {
             AnalyticPenaltyKind::Isometry(p) => p.tier(),
@@ -5044,6 +5151,12 @@ impl AnalyticPenaltyRegistry {
 
     pub fn total_rho_count(&self) -> usize {
         self.penalties.iter().map(|p| p.rho_count()).sum()
+    }
+
+    pub fn apply_weight_schedules(&mut self, iter: usize) {
+        for penalty in &mut self.penalties {
+            penalty.apply_schedule(iter);
+        }
     }
 
     /// Returns `(local_rho_slice, target_tier, name)` for each registered

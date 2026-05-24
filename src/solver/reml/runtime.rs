@@ -622,6 +622,39 @@ fn hash_array2(hasher: &mut StableHasher, values: &Array2<f64>) {
     }
 }
 
+fn ridge_passport_signature(ridge_passport: RidgePassport) -> u64 {
+    let mut hasher = StableHasher::new();
+    hasher.write_str("ridge-passport-v1");
+    hasher.write_f64(ridge_passport.delta);
+    hasher.write_u64(match ridge_passport.matrix_form {
+        crate::types::RidgeMatrixForm::ScaledIdentity => 0,
+    });
+    hasher.write_bool(ridge_passport.policy.rho_independent);
+    hasher.write_bool(ridge_passport.policy.include_quadratic_penalty);
+    hasher.write_bool(ridge_passport.policy.include_penalty_logdet);
+    hasher.write_bool(ridge_passport.policy.include_laplacehessian);
+    hasher.write_u64(match ridge_passport.policy.determinant_mode {
+        crate::types::RidgeDeterminantMode::Auto => 0,
+        crate::types::RidgeDeterminantMode::Full => 1,
+        crate::types::RidgeDeterminantMode::PositivePart => 2,
+    });
+    hasher.write_f64(ridge_passport.penalty_logdet_ridge());
+    hasher.finish_u64()
+}
+
+fn penalty_subspace_cache_key(
+    e_transformed: &Array2<f64>,
+    ridge_passport: RidgePassport,
+) -> PenaltySubspaceCacheKey {
+    let mut hasher = StableHasher::new();
+    hasher.write_str("penalty-subspace-e-v1");
+    hash_array2(&mut hasher, e_transformed);
+    PenaltySubspaceCacheKey {
+        penalty_matrix_fingerprint: hasher.finish_u64(),
+        ridge_passport_signature: ridge_passport_signature(ridge_passport),
+    }
+}
+
 fn hash_design_matrix(hasher: &mut StableHasher, design: &DesignMatrix) -> Result<(), String> {
     let n = design.nrows();
     let p = design.ncols();
@@ -4100,6 +4133,31 @@ impl<'a> RemlState<'a> {
     pub(super) fn projectwith_basis(matrix: &Array2<f64>, z: &Array2<f64>) -> Array2<f64> {
         let zt_m = crate::faer_ndarray::fast_atb(z, matrix);
         crate::faer_ndarray::fast_ab(&zt_m, z)
+    }
+
+    pub(super) fn cached_penalty_subspace(
+        &self,
+        e_transformed: &Array2<f64>,
+        ridge_passport: RidgePassport,
+    ) -> Result<Arc<PenaltySubspace>, EstimationError> {
+        let key = penalty_subspace_cache_key(e_transformed, ridge_passport);
+        if let Some(cached) = self
+            .cache_manager
+            .penalty_subspace_cache
+            .read()
+            .unwrap()
+            .get(&key)
+        {
+            return Ok(cached);
+        }
+
+        let computed = Arc::new(self.compute_penalty_subspace(e_transformed, ridge_passport)?);
+        self.cache_manager
+            .penalty_subspace_cache
+            .write()
+            .unwrap()
+            .insert(key, computed.clone());
+        Ok(computed)
     }
 
     pub(super) fn compute_penalty_subspace(
