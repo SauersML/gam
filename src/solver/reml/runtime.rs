@@ -2881,10 +2881,12 @@ impl<'a> RemlState<'a> {
         {
             return None;
         }
-        let _ext_col_count = cached
-            .ext_mode_response_cols
-            .as_ref()
-            .map_or(0, Array2::ncols);
+        drop(
+            cached
+                .ext_mode_response_cols
+                .as_ref()
+                .map_or(0, Array2::ncols),
+        );
         let cols = cached.rho_mode_response_cols.as_ref()?;
         if cols.nrows() != self.p || cols.ncols() != cache.rho.len() {
             return None;

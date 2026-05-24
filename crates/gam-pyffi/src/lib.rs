@@ -2736,8 +2736,7 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
         // projected variant requires constructing `P = Z (ZᵀHZ)⁻¹ Zᵀ` and a
         // projected penalty pinv `Z (ZᵀSZ)⁺ Zᵀ`, plus a projected
         // `reml_hess_rho_T`. Refactoring the per-helper VJPs to accept these
-        // as separate parameters (instead of pulling from `cache`) is
-        // intentionally deferred.
+        // as separate parameters instead of pulling from `cache`.
         return Err(PyNotImplementedError::new_err(
             "gaussian_reml_fit_with_constraints_backward: analytic VJP at \
              non-empty active sets (active cert exit) is not yet implemented. \

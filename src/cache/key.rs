@@ -130,9 +130,11 @@ impl Fingerprinter {
 fn absorb_f64_bytes(h: &mut Sha256, xs: &[f64]) {
     #[cfg(target_endian = "little")]
     {
-        // SAFETY: `f64` has no padding; reading the same memory as `u8` is
-        // sound. The slice covers exactly `xs.len() * 8` valid bytes and
-        // shares the lifetime of `xs`, which outlives this call.
+        // SAFETY: `xs.as_ptr()` comes from a valid slice, so it is non-null
+        // and aligned even when `xs` is empty. `f64` has no padding and all
+        // bit patterns are valid, so reading the same storage as `u8` is
+        // sound. `size_of_val(xs)` covers exactly the initialized bytes in
+        // `xs`, and the byte slice shares `xs`'s lifetime within this call.
         let bytes = unsafe {
             std::slice::from_raw_parts(xs.as_ptr() as *const u8, std::mem::size_of_val(xs))
         };
