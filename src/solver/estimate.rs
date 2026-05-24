@@ -2107,11 +2107,7 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     last_canonical_revision: Option<u64>,
 }
 
-#[cfg(test)]
-mod tests_diagnostics {
-    use super::*;
-
-    impl<'a> ExternalJointHyperEvaluator<'a> {
+impl<'a> ExternalJointHyperEvaluator<'a> {
     pub(crate) fn new(
         y: ArrayView1<'a, f64>,
         w: ArrayView1<'a, f64>,
@@ -2509,107 +2505,112 @@ mod tests_diagnostics {
         let rho = theta.slice(s![..rho_dim]).to_owned();
         self.reml_state.compute_cost(&rho)
     }
+}
 
-    /// DEBUG ONLY: run PIRLS at `theta` (cost-only path) and return the dense
-    /// effective Hessian `H_total = X' W_F X + S_λ + ridge I` in the
-    /// transformed basis. This is the same matrix the analytic operator
-    /// differentiates, so centered finite-difference probes of this H w.r.t.
-    /// ψ should match the analytic `B_i + correction`.
-    pub fn debug_full_h(
-        &mut self,
-        x: &DesignMatrix,
-        s_list: &[BlockwisePenalty],
-        nullspace_dims: &[usize],
-        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
-        theta: &Array1<f64>,
-        rho_dim: usize,
-        context: &str,
-    ) -> Result<Array2<f64>, EstimationError> {
-        if rho_dim > theta.len() {
-            return Err(EstimationError::InvalidInput(format!(
-                "rho_dim {} exceeds theta dimension {}",
-                rho_dim,
-                theta.len()
-            )));
+#[cfg(test)]
+mod tests_diagnostics {
+    use super::*;
+
+    impl<'a> ExternalJointHyperEvaluator<'a> {
+        /// DEBUG ONLY: run PIRLS at `theta` (cost-only path) and return the dense
+        /// effective Hessian `H_total = X' W_F X + S_λ + ridge I` in the
+        /// transformed basis. This is the same matrix the analytic operator
+        /// differentiates, so centered finite-difference probes of this H w.r.t.
+        /// ψ should match the analytic `B_i + correction`.
+        pub fn debug_full_h(
+            &mut self,
+            x: &DesignMatrix,
+            s_list: &[BlockwisePenalty],
+            nullspace_dims: &[usize],
+            linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+            theta: &Array1<f64>,
+            rho_dim: usize,
+            context: &str,
+        ) -> Result<Array2<f64>, EstimationError> {
+            if rho_dim > theta.len() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "rho_dim {} exceeds theta dimension {}",
+                    rho_dim,
+                    theta.len()
+                )));
+            }
+            self.prepare_eval_state_cost_only(
+                x,
+                s_list,
+                nullspace_dims,
+                linear_constraints,
+                None,
+                context,
+                None,
+            )?;
+            let rho = theta.slice(s![..rho_dim]).to_owned();
+            // Drive PIRLS at this theta (populates eval bundle cache).
+            self.reml_state.compute_cost(&rho)?;
+            self.reml_state.objective_innerhessian(&rho)
         }
-        self.prepare_eval_state_cost_only(
-            x,
-            s_list,
-            nullspace_dims,
-            linear_constraints,
-            None,
-            context,
-            None,
-        )?;
-        let rho = theta.slice(s![..rho_dim]).to_owned();
-        // Drive PIRLS at this theta (populates eval bundle cache).
-        self.reml_state.compute_cost(&rho)?;
-        self.reml_state.objective_innerhessian(&rho)
-    }
 
-    /// Debug-only: return the *projected* Hessian log-determinant
-    /// `log|U_Sᵀ H U_S|_+` at the PIRLS state driven to convergence at this
-    /// `theta`.  This is the same scalar that the REML/LAML cost identity
-    /// uses (via `hop.logdet() + hessian_logdet_correction`), so a centered
-    /// finite difference of it along ψ gives the analytic `d/dψ log|H_proj|`
-    /// that the production trace formula computes — i.e. the correct
-    /// finite-difference reference for the penalty-subspace projection invariant.
-    pub fn debug_logdet_h_proj(
-        &mut self,
-        x: &DesignMatrix,
-        s_list: &[BlockwisePenalty],
-        nullspace_dims: &[usize],
-        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
-        theta: &Array1<f64>,
-        rho_dim: usize,
-        context: &str,
-    ) -> Result<f64, EstimationError> {
-        if rho_dim > theta.len() {
-            return Err(EstimationError::InvalidInput(format!(
-                "rho_dim {} exceeds theta dimension {}",
-                rho_dim,
-                theta.len()
-            )));
+        /// Debug-only: return the *projected* Hessian log-determinant
+        /// `log|U_Sᵀ H U_S|_+` at the PIRLS state driven to convergence at this
+        /// `theta`.  This is the same scalar that the REML/LAML cost identity
+        /// uses (via `hop.logdet() + hessian_logdet_correction`), so a centered
+        /// finite difference of it along ψ gives the analytic `d/dψ log|H_proj|`
+        /// that the production trace formula computes — i.e. the correct
+        /// finite-difference reference for the penalty-subspace projection invariant.
+        pub fn debug_logdet_h_proj(
+            &mut self,
+            x: &DesignMatrix,
+            s_list: &[BlockwisePenalty],
+            nullspace_dims: &[usize],
+            linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+            theta: &Array1<f64>,
+            rho_dim: usize,
+            context: &str,
+        ) -> Result<f64, EstimationError> {
+            if rho_dim > theta.len() {
+                return Err(EstimationError::InvalidInput(format!(
+                    "rho_dim {} exceeds theta dimension {}",
+                    rho_dim,
+                    theta.len()
+                )));
+            }
+            self.prepare_eval_state_cost_only(
+                x,
+                s_list,
+                nullspace_dims,
+                linear_constraints,
+                None,
+                context,
+                None,
+            )?;
+            let rho = theta.slice(s![..rho_dim]).to_owned();
+            self.reml_state.compute_cost(&rho)?;
+            self.reml_state.objective_logdet_h_proj(&rho)
         }
-        self.prepare_eval_state_cost_only(
-            x,
-            s_list,
-            nullspace_dims,
-            linear_constraints,
-            None,
-            context,
-            None,
-        )?;
-        let rho = theta.slice(s![..rho_dim]).to_owned();
-        self.reml_state.compute_cost(&rho)?;
-        self.reml_state.objective_logdet_h_proj(&rho)
-    }
 
-    /// Debug-only: return `(η, finalweights, solve_c_array)` at this theta.
-    pub fn debug_full_eta_w_c(
-        &mut self,
-        x: &DesignMatrix,
-        s_list: &[BlockwisePenalty],
-        nullspace_dims: &[usize],
-        linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
-        theta: &Array1<f64>,
-        rho_dim: usize,
-        context: &str,
-    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
-        self.prepare_eval_state_cost_only(
-            x,
-            s_list,
-            nullspace_dims,
-            linear_constraints,
-            None,
-            context,
-            None,
-        )?;
-        let rho = theta.slice(s![..rho_dim]).to_owned();
-        self.reml_state.compute_cost(&rho)?;
-        self.reml_state.debug_eta_w_c(&rho)
-    }
-
+        /// Debug-only: return `(η, finalweights, solve_c_array)` at this theta.
+        pub fn debug_full_eta_w_c(
+            &mut self,
+            x: &DesignMatrix,
+            s_list: &[BlockwisePenalty],
+            nullspace_dims: &[usize],
+            linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+            theta: &Array1<f64>,
+            rho_dim: usize,
+            context: &str,
+        ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+            self.prepare_eval_state_cost_only(
+                x,
+                s_list,
+                nullspace_dims,
+                linear_constraints,
+                None,
+                context,
+                None,
+            )?;
+            let rho = theta.slice(s![..rho_dim]).to_owned();
+            self.reml_state.compute_cost(&rho)?;
+            self.reml_state.debug_eta_w_c(&rho)
+        }
     }
 }
 

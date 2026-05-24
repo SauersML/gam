@@ -33,18 +33,13 @@ pub trait VectorPredictableModel {
         m: usize,
     ) -> Result<Array1<f64>, EstimationError>;
 
-    /// Optional per-column SE on η. Default: None (scaffold the API).
+    /// Optional per-column SE on η.
     fn predict_column_se(
         &self,
         x: &Self::Design,
         t: &Self::Latent,
         m: usize,
-    ) -> Result<Option<Array1<f64>>, EstimationError> {
-        drop(x);
-        drop(t);
-        drop(m);
-        Ok(None)
-    }
+    ) -> Result<Option<Array1<f64>>, EstimationError>;
 }
 
 /// `(N, M)` reconstruction with optional `(N, M)` SE matrix.

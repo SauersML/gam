@@ -29,7 +29,7 @@ pub fn backend_status() -> BackendStatus {
 }
 
 mod cuda_impl {
-    use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+    use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis};
 
     use crate::gpu::driver::{from_col_major, to_col_major, to_i32};
 
@@ -37,7 +37,7 @@ mod cuda_impl {
     use cudarc::cublas::sys::{
         cublasDiagType_t, cublasFillMode_t, cublasOperation_t, cublasSideMode_t, cublasStatus_t,
     };
-    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, Gemv, GemvConfig};
+    use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, Gemv, GemvConfig, StridedBatchedConfig};
     use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
     use std::sync::Arc;
 
@@ -53,6 +53,39 @@ mod cuda_impl {
     #[inline]
     fn vector_values(v: ArrayView1<'_, f64>) -> Vec<f64> {
         v.iter().copied().collect()
+    }
+
+    #[inline]
+    fn to_col_major_batch(batch: ArrayView3<'_, f64>) -> Vec<f64> {
+        let (batch_len, rows, cols) = batch.dim();
+        let mut out = Vec::with_capacity(batch_len.saturating_mul(rows).saturating_mul(cols));
+        for matrix in batch.axis_iter(Axis(0)) {
+            out.extend(to_col_major(&matrix).iter().copied());
+        }
+        out
+    }
+
+    #[inline]
+    fn from_col_major_batch(
+        data: &[f64],
+        batch: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Option<Array3<f64>> {
+        if data.len() != batch.checked_mul(rows)?.checked_mul(cols)? {
+            return None;
+        }
+        let mut out = Array3::<f64>::zeros((batch, rows, cols));
+        let matrix_len = rows.checked_mul(cols)?;
+        for batch_idx in 0..batch {
+            let base = batch_idx.checked_mul(matrix_len)?;
+            for col in 0..cols {
+                for row in 0..rows {
+                    out[[batch_idx, row, col]] = data[base + col * rows + row];
+                }
+            }
+        }
+        Some(out)
     }
 
     #[inline]
@@ -236,6 +269,95 @@ mod cuda_impl {
     }
 
     #[inline]
+    pub(crate) fn gemm_broadcast_b_batched_cuda(
+        runtime: &GpuRuntime,
+        a: ArrayView3<'_, f64>,
+        b: ArrayView2<'_, f64>,
+    ) -> Option<Array3<f64>> {
+        let (batch, m, k) = a.dim();
+        let (b_rows, n) = b.dim();
+        if batch == 0 || m == 0 || n == 0 || k == 0 || b_rows != k {
+            return None;
+        }
+        let (stream, blas) = stream_and_blas(runtime)?;
+        let a_col = to_col_major_batch(a);
+        let b_col = to_col_major(&b);
+        let a_dev = stream.clone_htod(&a_col).ok()?;
+        let b_dev = stream.clone_htod(&*b_col).ok()?;
+        let mut out_dev = stream
+            .alloc_zeros::<f64>(batch.checked_mul(m)?.checked_mul(n)?)
+            .ok()?;
+        let cfg = StridedBatchedConfig::<f64> {
+            gemm: GemmConfig::<f64> {
+                transa: cublasOperation_t::CUBLAS_OP_N,
+                transb: cublasOperation_t::CUBLAS_OP_N,
+                m: to_i32(m)?,
+                n: to_i32(n)?,
+                k: to_i32(k)?,
+                alpha: 1.0,
+                lda: to_i32(m)?,
+                ldb: to_i32(k)?,
+                beta: 0.0,
+                ldc: to_i32(m)?,
+            },
+            batch_size: to_i32(batch)?,
+            stride_a: i64::try_from(m.checked_mul(k)?).ok()?,
+            stride_b: 0,
+            stride_c: i64::try_from(m.checked_mul(n)?).ok()?,
+        };
+        // SAFETY: `a_dev` is a stack of batch column-major m×k matrices,
+        // `b_dev` is one shared column-major k×n matrix with zero batch stride,
+        // and `out_dev` is a stack of batch column-major m×n outputs.
+        unsafe { blas.gemm_strided_batched(cfg, &a_dev, &b_dev, &mut out_dev) }.ok()?;
+        let out_col = stream.clone_dtoh(&out_dev).ok()?;
+        from_col_major_batch(&out_col, batch, m, n)
+    }
+
+    #[inline]
+    pub(crate) fn gemm_abt_strided_batched_cuda(
+        runtime: &GpuRuntime,
+        a: ArrayView3<'_, f64>,
+        b: ArrayView3<'_, f64>,
+    ) -> Option<Array3<f64>> {
+        let (batch, m, k) = a.dim();
+        let (batch_b, n, k_b) = b.dim();
+        if batch == 0 || m == 0 || n == 0 || k == 0 || batch != batch_b || k != k_b {
+            return None;
+        }
+        let (stream, blas) = stream_and_blas(runtime)?;
+        let a_col = to_col_major_batch(a);
+        let b_col = to_col_major_batch(b);
+        let a_dev = stream.clone_htod(&a_col).ok()?;
+        let b_dev = stream.clone_htod(&b_col).ok()?;
+        let mut out_dev = stream
+            .alloc_zeros::<f64>(batch.checked_mul(m)?.checked_mul(n)?)
+            .ok()?;
+        let cfg = StridedBatchedConfig::<f64> {
+            gemm: GemmConfig::<f64> {
+                transa: cublasOperation_t::CUBLAS_OP_N,
+                transb: cublasOperation_t::CUBLAS_OP_T,
+                m: to_i32(m)?,
+                n: to_i32(n)?,
+                k: to_i32(k)?,
+                alpha: 1.0,
+                lda: to_i32(m)?,
+                ldb: to_i32(n)?,
+                beta: 0.0,
+                ldc: to_i32(m)?,
+            },
+            batch_size: to_i32(batch)?,
+            stride_a: i64::try_from(m.checked_mul(k)?).ok()?,
+            stride_b: i64::try_from(n.checked_mul(k)?).ok()?,
+            stride_c: i64::try_from(m.checked_mul(n)?).ok()?,
+        };
+        // SAFETY: each batch item is column-major. The B batch stores n×k
+        // matrices and cuBLAS transposes each to k×n before multiplication.
+        unsafe { blas.gemm_strided_batched(cfg, &a_dev, &b_dev, &mut out_dev) }.ok()?;
+        let out_col = stream.clone_dtoh(&out_dev).ok()?;
+        from_col_major_batch(&out_col, batch, m, n)
+    }
+
+    #[inline]
     pub(crate) fn gemv_cuda(
         runtime: &GpuRuntime,
         a: ArrayView2<'_, f64>,
@@ -389,5 +511,6 @@ mod cuda_impl {
 }
 
 pub(crate) use cuda_impl::{
-    gemm_cuda, gemv_cuda, joint_hessian_2x2_cuda, trsm_cuda, xt_diag_x_cuda, xt_diag_y_cuda,
+    gemm_abt_strided_batched_cuda, gemm_broadcast_b_batched_cuda, gemm_cuda, gemv_cuda,
+    joint_hessian_2x2_cuda, trsm_cuda, xt_diag_x_cuda, xt_diag_y_cuda,
 };
