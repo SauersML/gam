@@ -8952,10 +8952,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        self.validate_joint_specs(
-            specs,
-            "SurvivalLocationScaleFamily joint Hessian workspace",
-        )?;
+        self.validate_joint_specs(specs, "SurvivalLocationScaleFamily joint Hessian workspace")?;
         Ok(Some(Arc::new(
             SurvivalLocationScaleExactNewtonJointHessianWorkspace::new(
                 self.clone(),

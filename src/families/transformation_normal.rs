@@ -7982,7 +7982,7 @@ impl CustomFamily for TransformationNormalFamily {
         true
     }
 
-    fn coefficient_hessian_cost(&self, _specs: &[ParameterBlockSpec]) -> u64 {
+    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Khatri–Rao tensor design: the coefficient block is X = R ⊙ C with
         // rows length p_resp · p_cov. Two regimes:
         //
@@ -8000,7 +8000,11 @@ impl CustomFamily for TransformationNormalFamily {
         let n_usize = self.response_val_basis.nrows();
         let p_resp = self.response_val_basis.ncols() as u64;
         let p_cov = self.covariate_design.ncols() as u64;
-        let p_total = p_resp.saturating_mul(p_cov);
+        let expected_p_total = p_resp.saturating_mul(p_cov);
+        let p_total = match specs {
+            [spec] if spec.design.ncols() as u64 == expected_p_total => spec.design.ncols() as u64,
+            _ => return u64::MAX,
+        };
         let n = n_usize as u64;
         if crate::custom_family::use_joint_matrix_free_path(p_total as usize, n_usize) {
             n.saturating_mul(p_resp.saturating_add(p_cov))
@@ -8461,21 +8465,22 @@ impl CustomFamily for TransformationNormalFamily {
         true
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         // CTN's SCOP coefficient-space joint Hessian is supplied as a
         // row-streaming matrix-free Hv operator.
-        true
+        matches!(specs, [spec] if spec.design.ncols()
+            == self.response_val_basis.ncols().saturating_mul(self.covariate_design.ncols()))
     }
 
-    fn outer_hyper_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
-        true
+    fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        self.inner_coefficient_hessian_hvp_available(specs)
     }
 
-    fn outer_hyper_hessian_dense_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn outer_hyper_hessian_dense_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         // Dense materialization remains mathematically available through the
         // outer-HVP operator, but SCOP's primary production path is the
         // matrix-free θθ operator above.
-        true
+        self.inner_coefficient_hessian_hvp_available(specs)
     }
 }
 

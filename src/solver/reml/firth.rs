@@ -88,26 +88,29 @@ impl<'a> RemlState<'a> {
         }
         const PAR_MIN_CELLS: usize = 64 * 1024;
         let cells = out.nrows().saturating_mul(ncols);
-        if cells >= PAR_MIN_CELLS && rayon::current_num_threads() > 1 && out.is_standard_layout()
-            && let Some(slice) = out.as_slice_memory_order_mut() {
-                slice
-                    .par_chunks_mut(ncols)
-                    .enumerate()
-                    .for_each(|(row, row_values)| {
-                        let s = scale[row];
-                        if s > 0.0 {
-                            let inv = s.recip();
-                            for value in row_values {
-                                *value *= inv;
-                            }
-                        } else {
-                            for value in row_values {
-                                *value = 0.0;
-                            }
+        if cells >= PAR_MIN_CELLS
+            && rayon::current_num_threads() > 1
+            && out.is_standard_layout()
+            && let Some(slice) = out.as_slice_memory_order_mut()
+        {
+            slice
+                .par_chunks_mut(ncols)
+                .enumerate()
+                .for_each(|(row, row_values)| {
+                    let s = scale[row];
+                    if s > 0.0 {
+                        let inv = s.recip();
+                        for value in row_values {
+                            *value *= inv;
                         }
-                    });
-                return;
-            }
+                    } else {
+                        for value in row_values {
+                            *value = 0.0;
+                        }
+                    }
+                });
+            return;
+        }
         for row in 0..out.nrows() {
             let s = scale[row];
             if s > 0.0 {

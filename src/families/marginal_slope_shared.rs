@@ -397,17 +397,19 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
             );
         }
         if support.include_h
-            && let Some(h_range) = self.h_range.as_ref() {
-                for idx in h_range.clone() {
-                    add_scaled_coeff4(&mut out, &family[idx], dir[idx]);
-                }
+            && let Some(h_range) = self.h_range.as_ref()
+        {
+            for idx in h_range.clone() {
+                add_scaled_coeff4(&mut out, &family[idx], dir[idx]);
             }
+        }
         if support.include_w
-            && let Some(w_range) = self.w_range.as_ref() {
-                for idx in w_range.clone() {
-                    add_scaled_coeff4(&mut out, &family[idx], dir[idx]);
-                }
+            && let Some(w_range) = self.w_range.as_ref()
+        {
+            for idx in w_range.clone() {
+                add_scaled_coeff4(&mut out, &family[idx], dir[idx]);
             }
+        }
         out
     }
 
@@ -424,17 +426,19 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
                 coeff4_dot(coeff_adjoint, &family[self.primary_index]);
         }
         if support.include_h
-            && let Some(h_range) = self.h_range.as_ref() {
-                for idx in h_range.clone() {
-                    direction_adjoint[idx] += coeff4_dot(coeff_adjoint, &family[idx]);
-                }
+            && let Some(h_range) = self.h_range.as_ref()
+        {
+            for idx in h_range.clone() {
+                direction_adjoint[idx] += coeff4_dot(coeff_adjoint, &family[idx]);
             }
+        }
         if support.include_w
-            && let Some(w_range) = self.w_range.as_ref() {
-                for idx in w_range.clone() {
-                    direction_adjoint[idx] += coeff4_dot(coeff_adjoint, &family[idx]);
-                }
+            && let Some(w_range) = self.w_range.as_ref()
+        {
+            for idx in w_range.clone() {
+                direction_adjoint[idx] += coeff4_dot(coeff_adjoint, &family[idx]);
             }
+        }
     }
 
     pub(crate) fn mixed_directional_from_b_family(
@@ -455,25 +459,27 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
             );
         }
         if support.include_h
-            && let Some(h_range) = self.h_range.as_ref() {
-                for idx in h_range.clone() {
-                    add_scaled_coeff4(
-                        &mut out,
-                        &family[idx],
-                        dir_u_primary * dir_v[idx] + dir_v_primary * dir_u[idx],
-                    );
-                }
+            && let Some(h_range) = self.h_range.as_ref()
+        {
+            for idx in h_range.clone() {
+                add_scaled_coeff4(
+                    &mut out,
+                    &family[idx],
+                    dir_u_primary * dir_v[idx] + dir_v_primary * dir_u[idx],
+                );
             }
+        }
         if support.include_w
-            && let Some(w_range) = self.w_range.as_ref() {
-                for idx in w_range.clone() {
-                    add_scaled_coeff4(
-                        &mut out,
-                        &family[idx],
-                        dir_u_primary * dir_v[idx] + dir_v_primary * dir_u[idx],
-                    );
-                }
+            && let Some(w_range) = self.w_range.as_ref()
+        {
+            for idx in w_range.clone() {
+                add_scaled_coeff4(
+                    &mut out,
+                    &family[idx],
+                    dir_u_primary * dir_v[idx] + dir_v_primary * dir_u[idx],
+                );
             }
+        }
         out
     }
 

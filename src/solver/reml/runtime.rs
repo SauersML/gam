@@ -1332,9 +1332,7 @@ impl<'a> RemlState<'a> {
             return None;
         }
         let mut states = ift_quality_states().lock().unwrap();
-        let state = states
-            .entry(self.hypergradient_owner_key())
-            .or_default();
+        let state = states.entry(self.hypergradient_owner_key()).or_default();
         state.quality_history.push(quality);
         while state.quality_history.len() > IFT_QUALITY_HISTORY_CAP {
             state.quality_history.remove(0);
@@ -4493,35 +4491,16 @@ impl<'a> RemlState<'a> {
     /// for the projected LAML cost identity.  Used by
     /// `iso_kappa_duchon_penalty_subspace_projection_pins_trace`'s
     /// INVARIANT 2.
-    #[cfg(test)]
-    pub(crate) fn objective_logdet_h_proj(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Result<f64, EstimationError> {
-        let bundle = self.obtain_eval_bundle(rho)?;
-        let assembly =
-            self.build_auto_assembly(rho, &bundle, super::unified::EvalMode::ValueOnly, false)?;
-        let logdet = super::unified::HessianOperator::logdet(assembly.hessian_op.as_ref())
-            + assembly.hessian_logdet_correction;
-        Ok(logdet)
-    }
+    // Test diagnostic `objective_logdet_h_proj` moved to tests_diagnostics impl
+    // block below so production builds carry no `#[cfg(test)]`-gated inherent
+    // methods on this type.
 
     /// Debug-only: return `(final_eta, finalweights, solve_c_array)` at the
     /// PIRLS state produced by driving the solver to convergence at this `rho`.
     /// Used by the iso-κ Duchon FD probe to test whether the analytic
     /// `c · dη/dψ_total` per-row diagonal matches FD `c · (η_+ − η_−) / 2h`.
-    #[cfg(test)]
-    pub(crate) fn debug_eta_w_c(
-        &self,
-        rho: &Array1<f64>,
-    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
-        let pr = self.execute_pirls_if_needed(rho)?;
-        Ok((
-            pr.final_eta.clone(),
-            pr.finalweights.clone(),
-            pr.solve_c_array.clone(),
-        ))
-    }
+    // Test diagnostic `debug_eta_w_c` moved to tests_diagnostics impl block
+    // below.
 
     pub(super) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
         let lin = pr.linear_constraints_transformed.as_ref()?;
@@ -5435,9 +5414,10 @@ impl<'a> RemlState<'a> {
             return None;
         }
         if self.take_ift_quality_flat_override()
-            && let Some(cur_beta) = self.warm_start_beta.read().unwrap().clone() {
-                return Some((cur_beta, WarmStartPredictionSource::Flat));
-            }
+            && let Some(cur_beta) = self.warm_start_beta.read().unwrap().clone()
+        {
+            return Some((cur_beta, WarmStartPredictionSource::Flat));
+        }
         // Try the IFT-based predictor first. It uses the exact first-order
         // Jacobian of β(ρ) at the cached solve and beats the tangent-line
         // predictor whenever a converged H_pen is available — which is
@@ -5951,12 +5931,13 @@ impl<'a> RemlState<'a> {
         // This augments the penalized Hessian before the spectral decomposition so
         // that logdet, trace, and solve operations all reflect the barrier curvature.
         if let Some(ref lin) = pirls_result.linear_constraints_transformed
-            && let Some(barrier_cfg) = Self::barrier_config_from_constraints(lin) {
-                let beta_t = pirls_result.beta_transformed.as_ref();
-                if let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut h_total, beta_t) {
-                    log::warn!("Barrier Hessian diagonal skipped: {e}");
-                }
+            && let Some(barrier_cfg) = Self::barrier_config_from_constraints(lin)
+        {
+            let beta_t = pirls_result.beta_transformed.as_ref();
+            if let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut h_total, beta_t) {
+                log::warn!("Barrier Hessian diagonal skipped: {e}");
             }
+        }
 
         Ok(EvalShared {
             key,
@@ -6010,13 +5991,13 @@ impl<'a> RemlState<'a> {
         // Add log-barrier Hessian diagonal for monotonicity-constrained
         // coefficients (sparse path uses original coordinates).
         if let Some(ref lin) = self.linear_constraints
-            && let Some(barrier_cfg) = Self::barrier_config_from_constraints(lin) {
-                let beta_orig = self.sparse_exact_beta_original(pirls_result.as_ref());
-                if let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut s_lambda, &beta_orig)
-                {
-                    log::warn!("Sparse barrier Hessian diagonal skipped: {e}");
-                }
+            && let Some(barrier_cfg) = Self::barrier_config_from_constraints(lin)
+        {
+            let beta_orig = self.sparse_exact_beta_original(pirls_result.as_ref());
+            if let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut s_lambda, &beta_orig) {
+                log::warn!("Sparse barrier Hessian diagonal skipped: {e}");
             }
+        }
 
         let mut workspace = PirlsWorkspace::new(self.y.len(), self.p, 0, 0);
         // Gaussian-Identity fast path: reuse the per-RemlState `XᵀWX` cache
@@ -7371,28 +7352,29 @@ impl<'a> RemlState<'a> {
                 // hot diagnostics are requested and ridge was applied.
                 let pht_dense = pirls_result.penalized_hessian_transformed.to_dense();
                 if let Ok((eigs, _)) = pht_dense.eigh(Side::Lower)
-                    && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min) {
-                        if should_emit_h_min_eig_diag(min_eig) {
-                            log::debug!(
-                                "[Diag] H min_eig={:.3e} (ridge={:.3e})",
-                                min_eig,
-                                ridge_used
-                            );
-                        }
-                        if min_eig <= 0.0 {
-                            log::warn!(
-                                "Penalized Hessian not PD (min eig <= 0) before stabilization; proceeding with ridge {:.3e}.",
-                                ridge_used
-                            );
-                        }
-                        if !min_eig.is_finite() || min_eig <= MIN_ACCEPTABLE_HESSIAN_EIGENVALUE {
-                            let condition_number = symmetric_spectrum_condition_number(&pht_dense);
-                            log::warn!(
-                                "Penalized Hessian extremely ill-conditioned (cond={:.3e}); continuing with stabilized Hessian.",
-                                condition_number
-                            );
-                        }
+                    && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min)
+                {
+                    if should_emit_h_min_eig_diag(min_eig) {
+                        log::debug!(
+                            "[Diag] H min_eig={:.3e} (ridge={:.3e})",
+                            min_eig,
+                            ridge_used
+                        );
                     }
+                    if min_eig <= 0.0 {
+                        log::warn!(
+                            "Penalized Hessian not PD (min eig <= 0) before stabilization; proceeding with ridge {:.3e}.",
+                            ridge_used
+                        );
+                    }
+                    if !min_eig.is_finite() || min_eig <= MIN_ACCEPTABLE_HESSIAN_EIGENVALUE {
+                        let condition_number = symmetric_spectrum_condition_number(&pht_dense);
+                        log::warn!(
+                            "Penalized Hessian extremely ill-conditioned (cond={:.3e}); continuing with stabilized Hessian.",
+                            condition_number
+                        );
+                    }
+                }
             }
         }
         // Delegate to the unified evaluator for the actual formula computation.
@@ -7943,31 +7925,32 @@ impl<'a> RemlState<'a> {
     /// fast-path when available and active.
     fn build_penalty_coords(&self) -> Vec<super::unified::PenaltyCoordinate> {
         if let Some(ref kron) = self.kronecker_penalty_system
-            && self.kronecker_factored.is_some() {
-                let d = kron.ndim();
-                let total_dim = kron.p_total();
-                let eigenvalues: Vec<ndarray::Array1<f64>> = kron
-                    .marginal_eigensystems
-                    .iter()
-                    .map(|(evals, _)| evals.clone())
-                    .collect();
-                let mut coords = Vec::with_capacity(kron.num_penalties());
-                for k in 0..d {
-                    coords.push(super::unified::PenaltyCoordinate::KroneckerMarginal {
-                        eigenvalues: eigenvalues.clone(),
-                        dim_index: k,
-                        marginal_dims: kron.marginal_dims.clone(),
-                        total_dim,
-                    });
-                }
-                if kron.has_double_penalty {
-                    let identity_root = ndarray::Array2::<f64>::eye(total_dim);
-                    coords.push(super::unified::PenaltyCoordinate::from_dense_root(
-                        identity_root,
-                    ));
-                }
-                return coords;
+            && self.kronecker_factored.is_some()
+        {
+            let d = kron.ndim();
+            let total_dim = kron.p_total();
+            let eigenvalues: Vec<ndarray::Array1<f64>> = kron
+                .marginal_eigensystems
+                .iter()
+                .map(|(evals, _)| evals.clone())
+                .collect();
+            let mut coords = Vec::with_capacity(kron.num_penalties());
+            for k in 0..d {
+                coords.push(super::unified::PenaltyCoordinate::KroneckerMarginal {
+                    eigenvalues: eigenvalues.clone(),
+                    dim_index: k,
+                    marginal_dims: kron.marginal_dims.clone(),
+                    total_dim,
+                });
             }
+            if kron.has_double_penalty {
+                let identity_root = ndarray::Array2::<f64>::eye(total_dim);
+                coords.push(super::unified::PenaltyCoordinate::from_dense_root(
+                    identity_root,
+                ));
+            }
+            return coords;
+        }
         self.canonical_penalties
             .iter()
             .map(|cp| cp.to_penalty_coordinate())
@@ -8388,14 +8371,15 @@ impl<'a> RemlState<'a> {
             .linear_constraints
             .as_ref()
             .and_then(Self::barrier_config_from_constraints)
-            && let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut h_total_original, &beta) {
-                log::warn!(
-                    "Original-basis barrier Hessian diagonal skipped: {e}; \
+            && let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut h_total_original, &beta)
+        {
+            log::warn!(
+                "Original-basis barrier Hessian diagonal skipped: {e}; \
                      cost/gradient/logdet consistency may regress on infeasible \
                      candidates (slack ≤ 0).  BFGS line search must maintain \
                      feasibility for the barrier-aware outer objective."
-                );
-            }
+            );
+        }
 
         // Match `build_dense_assembly`: under Firth bias-reduction the penalized
         // Hessian `X'WX + S − H_φ` inherits the Jeffreys-identifiable subspace,
@@ -8776,7 +8760,7 @@ impl<'a> RemlState<'a> {
         // `TransformedQs` fits through `build_dense_original_assembly`, which
         // maps β and H back to the original basis so every ingredient agrees
         // with the canonical-penalty coordinate frame.
-        let assembly = self.build_auto_assembly(rho, bundle, mode, false)?;
+        let assembly = self.build_auto_assembly(rho, bundle, mode)?;
         self.assemble_and_evaluate(rho, bundle, mode, assembly)
     }
 
@@ -8862,7 +8846,7 @@ impl<'a> RemlState<'a> {
             };
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let t2 = std::time::Instant::now();
-        let mut assembly = self.build_auto_assembly(rho, &bundle, mode, !ext_coords.is_empty())?;
+        let mut assembly = self.build_auto_assembly(rho, &bundle, mode)?;
         assembly.ext_coords = ext_coords;
         assembly.ext_coord_pair_fn = ext_pair_fn;
         assembly.rho_ext_pair_fn = rho_ext_pair_fn;
@@ -9141,7 +9125,7 @@ impl<'a> RemlState<'a> {
             crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient => None,
             crate::solver::outer_strategy::OuterEvalOrder::ValueGradientHessian => {
                 if allow_second_order {
-                    Some(self.selecthessian_strategy_policy(p, &bundle))
+                    Some(self.selecthessian_strategy_policy(&bundle))
                 } else {
                     None
                 }
@@ -9346,11 +9330,13 @@ impl<'a> RemlState<'a> {
                 )));
             }
             if let Some(b) = coord.drift.dense.as_mut()
-                && b.nrows() == qs.nrows() && b.ncols() == qs.nrows() {
-                    // B_original = Qs · B_transformed · Qsᵀ
-                    let tmp = qs.dot(&*b);
-                    *b = tmp.dot(&qs_t);
-                }
+                && b.nrows() == qs.nrows()
+                && b.ncols() == qs.nrows()
+            {
+                // B_original = Qs · B_transformed · Qsᵀ
+                let tmp = qs.dot(&*b);
+                *b = tmp.dot(&qs_t);
+            }
         }
         Ok(())
     }
@@ -9373,7 +9359,7 @@ impl<'a> RemlState<'a> {
         // no active constraints).  See `rotate_link_ext_coords_to_original`.
         self.rotate_link_ext_coords_to_original(&bundle, &mut ext_coords)?;
 
-        let mut assembly = self.build_auto_assembly(rho, &bundle, mode, true)?;
+        let mut assembly = self.build_auto_assembly(rho, &bundle, mode)?;
         let ext_dim = ext_coords.len();
         let p_dim = ext_coords.first().map(|coord| coord.g.len()).unwrap_or(0);
         assembly.ext_coords = ext_coords;
@@ -9433,12 +9419,8 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         ext_coords: Vec<super::unified::HyperCoord>,
     ) -> Result<crate::solver::outer_strategy::EfsEval, EstimationError> {
-        let mut assembly = self.build_auto_assembly(
-            rho,
-            bundle,
-            super::unified::EvalMode::ValueOnly,
-            !ext_coords.is_empty(),
-        )?;
+        let mut assembly =
+            self.build_auto_assembly(rho, bundle, super::unified::EvalMode::ValueOnly)?;
         assembly.tk_gradient = None;
         assembly.ext_coords = ext_coords;
         self.assemble_and_evaluate_efs(rho, bundle, assembly)

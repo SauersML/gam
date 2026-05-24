@@ -2368,9 +2368,10 @@ impl SpatialLogKappaCoords {
             let (next_length_scale, next_aniso) =
                 spatial_term_psi_to_length_scale_and_aniso(spec, term_idx, psi);
             if (d == 1 || next_length_scale.is_some())
-                && let Some(length_scale) = next_length_scale {
-                    set_spatial_length_scale(&mut updated, term_idx, length_scale)?;
-                }
+                && let Some(length_scale) = next_length_scale
+            {
+                set_spatial_length_scale(&mut updated, term_idx, length_scale)?;
+            }
             if let Some(eta) = next_aniso {
                 set_spatial_aniso_log_scales(&mut updated, term_idx, eta)?;
             }
@@ -2684,9 +2685,10 @@ pub(crate) fn sync_aniso_contrasts_from_metadata(
             _ => None,
         };
         if let Some(eta) = meta_aniso
-            && eta.len() > 1 {
-                set_spatial_aniso_log_scales(spec, term_idx, eta).ok();
-            }
+            && eta.len() > 1
+        {
+            set_spatial_aniso_log_scales(spec, term_idx, eta).ok();
+        }
     }
 }
 
@@ -10045,11 +10047,15 @@ fn evaluate_standard_familyobservations(
                     Some(InverseLink::LatentCLogLog(*state))
                 } else if let Some(state) = mixture_link_state {
                     Some(InverseLink::Mixture(state.clone()))
-                } else { sas_link_state.map(|state| if family.is_binomial_beta_logistic() {
-                        InverseLink::BetaLogistic(*state)
-                    } else {
-                        InverseLink::Sas(*state)
-                    }) };
+                } else {
+                    sas_link_state.map(|state| {
+                        if family.is_binomial_beta_logistic() {
+                            InverseLink::BetaLogistic(*state)
+                        } else {
+                            InverseLink::Sas(*state)
+                        }
+                    })
+                };
                 let jet =
                     strategy_for_family(family, inverse_link.as_ref()).inverse_link_jet(eta_i)?;
                 let mu_i_raw = jet.mu;
@@ -12945,21 +12951,23 @@ pub(crate) fn try_build_spatial_log_kappa_derivativeinfo_list(
         let aniso = get_spatial_aniso_log_scales(resolvedspec, term_idx);
         let dim = get_spatial_feature_dim(resolvedspec, term_idx);
         if let (Some(eta), Some(d)) = (&aniso, dim)
-            && eta.len() == d && d > 1 {
-                if let Some(entries) = try_build_spatial_term_log_kappa_aniso_derivativeinfos(
-                    data,
-                    resolvedspec,
-                    design,
-                    term_idx,
-                    aniso_gid,
-                )? {
-                    aniso_gid += 1;
-                    out.extend(entries);
-                    continue;
-                } else {
-                    return Ok(None);
-                }
+            && eta.len() == d
+            && d > 1
+        {
+            if let Some(entries) = try_build_spatial_term_log_kappa_aniso_derivativeinfos(
+                data,
+                resolvedspec,
+                design,
+                term_idx,
+                aniso_gid,
+            )? {
+                aniso_gid += 1;
+                out.extend(entries);
+                continue;
+            } else {
+                return Ok(None);
             }
+        }
         let Some(info) =
             try_build_spatial_term_log_kappa_derivativeinfo(data, resolvedspec, design, term_idx)?
         else {
@@ -17879,13 +17887,8 @@ where
             };
             let t0 = std::time::Instant::now();
             let row_set_borrow = current_row_set.borrow();
-            let result = (*exact_fn_cell.borrow_mut())(
-                theta,
-                &specs,
-                &designs,
-                eval_mode,
-                &row_set_borrow,
-            );
+            let result =
+                (*exact_fn_cell.borrow_mut())(theta, &specs, &designs, eval_mode, &row_set_borrow);
             drop(row_set_borrow);
             let elapsed_s = t0.elapsed().as_secs_f64();
             kphase_eval_calls.set(kphase_eval_calls.get() + 1);
@@ -26561,7 +26564,6 @@ mod tests {
         let derivative_blocks = vec![
             hyperspecs
                 .iter()
-                
                 .map(|_| CustomFamilyBlockPsiDerivative {
                     penalty_index: None,
                     x_psi: Array2::<f64>::zeros((0, 0)),
@@ -26780,7 +26782,6 @@ mod tests {
         let derivative_blocks = vec![
             hyperspecs
                 .iter()
-                
                 .map(|_| CustomFamilyBlockPsiDerivative {
                     penalty_index: None,
                     x_psi: Array2::<f64>::zeros((0, 0)),

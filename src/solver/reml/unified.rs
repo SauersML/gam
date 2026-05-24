@@ -1341,12 +1341,11 @@ impl BarrierConfig {
                     break;
                 }
             }
-            if is_simple
-                && let Some(col) = single_col {
-                    indices.push(col);
-                    lower_bounds.push(constraints.b[i]);
-                    bound_signs.push(single_sign);
-                }
+            if is_simple && let Some(col) = single_col {
+                indices.push(col);
+                lower_bounds.push(constraints.b[i]);
+                bound_signs.push(single_sign);
+            }
         }
         if indices.is_empty() {
             return None;
@@ -2552,13 +2551,13 @@ fn composite_trace_implicit_batched(
             }
             if let Some(impl_j) = operators[j].as_implicit()
                 && Arc::ptr_eq(&impl_i.implicit_deriv, &impl_j.implicit_deriv)
-                    && Arc::ptr_eq(&impl_i.x_design, &impl_j.x_design)
-                    && Arc::ptr_eq(&impl_i.w_diag, &impl_j.w_diag)
-                    && impl_i.p == impl_j.p
-                {
-                    group.push(j);
-                    handled[j] = true;
-                }
+                && Arc::ptr_eq(&impl_i.x_design, &impl_j.x_design)
+                && Arc::ptr_eq(&impl_i.w_diag, &impl_j.w_diag)
+                && impl_i.p == impl_j.p
+            {
+                group.push(j);
+                handled[j] = true;
+            }
         }
         group_starts.push(group);
     }
@@ -8815,15 +8814,17 @@ fn compute_drift_deriv_traces(
     // M_i[β_j] = D_β B_i[β_j]
     if b_i_depends
         && let (Some(ei), Some(drift_fn)) = (ext_i, fixed_drift_deriv)
-            && let Some(result) = drift_fn(ei, beta_j) {
-                trace += trace_via(result);
-            }
+        && let Some(result) = drift_fn(ei, beta_j)
+    {
+        trace += trace_via(result);
+    }
     // M_j[β_i] = D_β B_j[β_i]
     if b_j_depends
         && let (Some(ej), Some(drift_fn)) = (ext_j, fixed_drift_deriv)
-            && let Some(result) = drift_fn(ej, beta_i) {
-                trace += trace_via(result);
-            }
+        && let Some(result) = drift_fn(ej, beta_i)
+    {
+        trace += trace_via(result);
+    }
     trace
 }
 
@@ -8891,29 +8892,30 @@ fn compute_base_h2_traces(
     // biobank scale this turns the 16+ per-call `trace_logdet_operator`
     // hot spots into a single batched evaluation.
     if subspace.is_none()
-        && let Some(ds) = hop.as_exact_dense_spectral() {
-            let mut out = vec![0.0_f64; pairs.len()];
-            let mut op_terms: Vec<(usize, f64, &dyn HyperOperator)> = Vec::new();
-            for (idx, pair) in pairs.iter().enumerate() {
-                if let Some(op) = pair.b_operator.as_deref() {
-                    op_terms.push((idx, 1.0, op));
-                } else if pair.b_mat.nrows() > 0 {
-                    out[idx] = hop.trace_logdet_gradient(&pair.b_mat);
-                }
+        && let Some(ds) = hop.as_exact_dense_spectral()
+    {
+        let mut out = vec![0.0_f64; pairs.len()];
+        let mut op_terms: Vec<(usize, f64, &dyn HyperOperator)> = Vec::new();
+        for (idx, pair) in pairs.iter().enumerate() {
+            if let Some(op) = pair.b_operator.as_deref() {
+                op_terms.push((idx, 1.0, op));
+            } else if pair.b_mat.nrows() > 0 {
+                out[idx] = hop.trace_logdet_gradient(&pair.b_mat);
             }
-            if !op_terms.is_empty() {
-                let batched = trace_projected_operator_terms_batched(
-                    pairs.len(),
-                    &op_terms,
-                    &ds.g_factor,
-                    &ds.projected_factor_cache,
-                );
-                for (idx, val) in batched.into_iter().enumerate() {
-                    out[idx] += val;
-                }
-            }
-            return out;
         }
+        if !op_terms.is_empty() {
+            let batched = trace_projected_operator_terms_batched(
+                pairs.len(),
+                &op_terms,
+                &ds.g_factor,
+                &ds.projected_factor_cache,
+            );
+            for (idx, val) in batched.into_iter().enumerate() {
+                out[idx] += val;
+            }
+        }
+        return out;
+    }
     if subspace.is_none()
         && hop.prefers_stochastic_trace_estimation()
         && hop.logdet_traces_match_hinv_kernel()
@@ -9423,9 +9425,9 @@ fn compute_outer_hessian(
     // is large enough to warrant stochastic cross-traces instead of
     // materializing p x p Hessian drift matrices.
     let any_ext_implicit = solution.ext_coords.iter().any(|c| {
-        c.drift.operator_ref().is_some_and(|op| {
-            c.drift.uses_operator_fast_path() && op.is_implicit()
-        })
+        c.drift
+            .operator_ref()
+            .is_some_and(|op| c.drift.uses_operator_fast_path() && op.is_implicit())
     });
     let total_p = hop.dim();
     // Stochastic cross-traces are only used when:
@@ -11976,7 +11978,8 @@ pub fn compute_hybrid_efs_update(
         && rayon::current_thread_index().is_none()
     {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        tau_local_indices.to_vec()
+        tau_local_indices
+            .to_vec()
             .into_par_iter()
             .map(|ext_idx| {
                 let coord = &solution.ext_coords[ext_idx];
@@ -14489,18 +14492,20 @@ impl HessianOperator for SparseCholeskyOperator {
         if let Some(ref taka) = self.takahashi
             && let (Some((a_local, a_start, a_end)), Some((b_local, b_start, b_end))) =
                 (left.block_local_data(), right.block_local_data())
-                && a_start == b_start && a_end == b_end {
-                    // Same block: tr(Z_block * A_local * Z_block * B_local)
-                    let za = Self::takahashi_left_multiply_block(taka, a_local, a_start);
-                    if std::ptr::addr_eq(left, right) {
-                        return trace_matrix_product(&za, &za);
-                    }
-                    let zb = Self::takahashi_left_multiply_block(taka, b_local, b_start);
-                    // tr(ZA * ZB) = sum_ij (ZA)_ij * (ZB^T)_ij
-                    return (&za * &zb.t()).sum();
-                }
-                // Different blocks: column solves are better than materializing
-                // full p×p Z. Fall through to exact path.
+            && a_start == b_start
+            && a_end == b_end
+        {
+            // Same block: tr(Z_block * A_local * Z_block * B_local)
+            let za = Self::takahashi_left_multiply_block(taka, a_local, a_start);
+            if std::ptr::addr_eq(left, right) {
+                return trace_matrix_product(&za, &za);
+            }
+            let zb = Self::takahashi_left_multiply_block(taka, b_local, b_start);
+            // tr(ZA * ZB) = sum_ij (ZA)_ij * (ZB^T)_ij
+            return (&za * &zb.t()).sum();
+        }
+        // Different blocks: column solves are better than materializing
+        // full p×p Z. Fall through to exact path.
         self.trace_hinv_operator_cross_exact(left, right)
     }
 
@@ -15599,10 +15604,12 @@ impl StochasticTraceEstimator {
 
             let n_done = m + 1;
             n_drawn = n_done;
-            if n_done >= effective_n_probes_min && n_done % check_interval == 0
-                && self.check_convergence(n_done, &means, &m2s) {
-                    break;
-                }
+            if n_done >= effective_n_probes_min
+                && n_done % check_interval == 0
+                && self.check_convergence(n_done, &means, &m2s)
+            {
+                break;
+            }
         }
 
         self.record_probe_batch(Self::max_probe_variance(&m2s, n_drawn), n_drawn);
@@ -16655,7 +16662,7 @@ where
     let mut z_tilde = Array1::<f64>::zeros(p);
     let mut mz = Array1::<f64>::zeros(p);
     let check_interval = 4usize;
-    for m in 0..residual_budget {
+    for _ in 0..residual_budget {
         rademacher_probe_into(z.view_mut(), &mut rng_state);
         // z_tilde = (I - Q Qᵀ) z = z - Q (Qᵀ z)
         z_tilde.assign(&z);
@@ -17318,10 +17325,12 @@ mod tests {
         // Four ambient vectors with MIXED support (not the standard
         // basis) so Gram-Schmidt against `v_min` produces dense Q
         // columns and a dense `h_proj`.
-        let ambients = [array![1.0_f64, 0.3, -0.2, 0.5, 0.0],
+        let ambients = [
+            array![1.0_f64, 0.3, -0.2, 0.5, 0.0],
             array![0.4_f64, 1.0, 0.6, -0.3, 0.0],
             array![-0.5_f64, 0.2, 1.0, 0.7, 0.0],
-            array![0.6_f64, -0.4, 0.3, 1.0, 0.0]];
+            array![0.6_f64, -0.4, 0.3, 1.0, 0.0],
+        ];
         let mut q = Array2::<f64>::zeros((p, p));
         q.column_mut(p - 1).assign(&v_min);
         let mut col_idx = 0usize;
@@ -18534,7 +18543,8 @@ mod tests {
             dim_hint: 3,
         });
 
-        let pairs = [HyperCoordPair {
+        let pairs = [
+            HyperCoordPair {
                 a: 0.0,
                 g: Array1::zeros(3),
                 b_mat: dense_only,
@@ -18558,7 +18568,8 @@ mod tests {
                     dim_hint: 3,
                 })),
                 ld_s: 0.0,
-            }];
+            },
+        ];
         let pair_refs: Vec<&HyperCoordPair> = pairs.iter().collect();
 
         let batched = compute_base_h2_traces(&hop, &pair_refs, Some(&kernel), None);
@@ -18876,7 +18887,8 @@ mod tests {
         ];
 
         let batched = penalty_subspace_reduce_drifts_batched(&kernel, &drifts);
-        let serial = [kernel.reduce(&dense),
+        let serial = [
+            kernel.reduce(&dense),
             kernel.reduce_operator(&DenseMatrixHyperOperator {
                 matrix: op_matrix.clone(),
             }),
@@ -18884,7 +18896,8 @@ mod tests {
                 dim_hint: 3,
                 dense: Some(composite_dense),
                 operators: vec![Arc::new(DenseMatrixHyperOperator { matrix: op_matrix })],
-            })];
+            }),
+        ];
 
         for (batched_mat, serial_mat) in batched.iter().zip(serial.iter()) {
             for row in 0..batched_mat.nrows() {

@@ -1350,25 +1350,23 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let offset = resolve_offset_column(&ds, &col_map, args.offset_column.as_deref())?;
     let frailty = fit_frailty_spec_from_args(&args, "fit")?;
     if let Some(choice) = link_choice.as_ref()
-        && matches!(choice.mode, LinkMode::Flexible) {
-            if choice.mixture_components.is_some() {
-                return Err(
+        && matches!(choice.mode, LinkMode::Flexible)
+    {
+        if choice.mixture_components.is_some() {
+            return Err(
                     "flexible(blended(...)/mixture(...)) is currently supported only with --predict-noise binomial location-scale fitting or --survival-likelihood=location-scale"
                         .to_string(),
                 );
-            }
-            if has_bounded_terms {
-                return Err(
-                    "flexible(...) links are not yet supported with bounded() coefficients"
-                        .to_string(),
-                );
-            }
-            if !family.is_binomial() {
-                return Err(
-                    "flexible(...) links currently require a binomial family/link".to_string(),
-                );
-            }
         }
+        if has_bounded_terms {
+            return Err(
+                "flexible(...) links are not yet supported with bounded() coefficients".to_string(),
+            );
+        }
+        if !family.is_binomial() {
+            return Err("flexible(...) links currently require a binomial family/link".to_string());
+        }
+    }
     progress.advance_workflow(3);
     let adaptive_opts = if args.adaptive_regularization {
         Some(AdaptiveRegularizationOptions {
@@ -3756,11 +3754,12 @@ fn run_predict_survival(
     // dynamic timewiggle geometry above; this branch uses the saved fixed
     // basis reconstruction for `predict_gam`.
     if let Some((_, exit_w, _)) = saved_timewiggle.as_ref()
-        && p_timewiggle > 0 {
-            x_exit
-                .slice_mut(s![.., p_time..(p_time + p_timewiggle)])
-                .assign(exit_w);
-        }
+        && p_timewiggle > 0
+    {
+        x_exit
+            .slice_mut(s![.., p_time..(p_time + p_timewiggle)])
+            .assign(exit_w);
+    }
     if p_cov > 0 {
         let cov_start = p_time + p_timewiggle;
         let chunk_rows = (8 * 1024 * 1024 / (p_cov.max(1) * std::mem::size_of::<f64>()))
@@ -5870,7 +5869,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     )
                     .map_err(|e| format!("survival PIRLS failed: {e}"))?;
                     let beta = summary.beta.as_ref().to_owned();
-                    
+
                     model.update_state(&beta).map_err(|e| {
                         format!(
                             "failed to evaluate survival optimum in coefficient coordinates: {e}"
@@ -5889,7 +5888,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     )
                     .map_err(|e| format!("survival constrained PIRLS failed: {e}"))?;
                     let beta = summary.beta.as_ref().to_owned();
-                    
+
                     model.update_state(&beta).map_err(|e| {
                         format!("failed to evaluate structural survival optimum in spline coordinates: {e}")
                     })?
@@ -6790,24 +6789,24 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                 for st in &spec.smooth_terms {
                     if let Some(col) = smooth_term_primary_column(st)
                         && col < ds.values.ncols()
-                            && let Some(dt) = design.smooth.terms.iter().find(|t| t.name == st.name)
-                            {
-                                let x_col = ds.values.column(col);
-                                let dense_for_smooth = design.design.to_dense();
-                                let contrib = dense_for_smooth
-                                    .slice(s![.., dt.coeff_range.clone()])
-                                    .dot(&fit.beta.slice(s![dt.coeff_range.clone()]));
-                                let mut pairs: Vec<(f64, f64)> =
-                                    x_col.iter().copied().zip(contrib.iter().copied()).collect();
-                                pairs.sort_by(|a, b| {
-                                    a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                                });
-                                smooth_plots.push(report::SmoothPlotData {
-                                    name: st.name.clone(),
-                                    x: pairs.iter().map(|p| p.0).collect(),
-                                    y: pairs.iter().map(|p| p.1).collect(),
-                                });
-                            }
+                        && let Some(dt) = design.smooth.terms.iter().find(|t| t.name == st.name)
+                    {
+                        let x_col = ds.values.column(col);
+                        let dense_for_smooth = design.design.to_dense();
+                        let contrib = dense_for_smooth
+                            .slice(s![.., dt.coeff_range.clone()])
+                            .dot(&fit.beta.slice(s![dt.coeff_range.clone()]));
+                        let mut pairs: Vec<(f64, f64)> =
+                            x_col.iter().copied().zip(contrib.iter().copied()).collect();
+                        pairs.sort_by(|a, b| {
+                            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        smooth_plots.push(report::SmoothPlotData {
+                            name: st.name.clone(),
+                            x: pairs.iter().map(|p| p.0).collect(),
+                            y: pairs.iter().map(|p| p.1).collect(),
+                        });
+                    }
                 }
             }
         }
@@ -9877,17 +9876,17 @@ mod tests {
         FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, LikelihoodFamily, LinkChoice,
         LinkMode, MODEL_VERSION, ModelKind, ResidualDistribution, SavedFitSummary, SavedModel,
         SurvivalArgs, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
-        build_survival_time_basis, classify_cli_error,
-        collect_hierarchical_smooth_overlapwarnings, collect_linear_smooth_overlapwarnings,
-        collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
-        compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
-        covariance_from_model, effectivelinkwiggle_formulaspec, exact_kernel,
-        fit_result_from_external, load_dataset_projected, parse_formula, parse_link_choice,
-        parse_matching_auxiliary_formula, parse_surv_response, parse_survival_inverse_link,
-        parse_survival_time_basis_config, predict_gam, prepend_id_column_to_prediction_csv,
-        required_columns_for_fit, resolve_family, summarizewiggle_domain,
-        validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
-        write_prediction_csv, write_survival_binary_prediction_csv, write_survival_prediction_csv,
+        build_survival_time_basis, classify_cli_error, collect_hierarchical_smooth_overlapwarnings,
+        collect_linear_smooth_overlapwarnings, collect_spatial_smooth_usagewarnings,
+        compact_fit_result_for_batch, compact_saved_multiblock_fit_result,
+        compute_probit_q0_from_eta, core_saved_fit_result, covariance_from_model,
+        effectivelinkwiggle_formulaspec, exact_kernel, fit_result_from_external,
+        load_dataset_projected, parse_formula, parse_link_choice, parse_matching_auxiliary_formula,
+        parse_surv_response, parse_survival_inverse_link, parse_survival_time_basis_config,
+        predict_gam, prepend_id_column_to_prediction_csv, required_columns_for_fit, resolve_family,
+        summarizewiggle_domain, validate_cli_firth_configuration,
+        write_gaussian_location_scale_prediction_csv, write_prediction_csv,
+        write_survival_binary_prediction_csv, write_survival_prediction_csv,
     };
     use super::{
         Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit,
@@ -9990,7 +9989,7 @@ mod tests {
         }
     }
 
-    fn saved_fit_summary_stub() -> SavedFitSummary {
+    fn saved_fit_summary_fixture() -> SavedFitSummary {
         SavedFitSummary {
             likelihood_family: Some(LikelihoodFamily::GaussianIdentity),
             likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
@@ -10020,7 +10019,7 @@ mod tests {
 
     #[test]
     fn core_saved_fit_result_preserves_nonconverged_status() {
-        let mut summary = saved_fit_summary_stub();
+        let mut summary = saved_fit_summary_fixture();
         summary.pirls_status = gam::pirls::PirlsStatus::StalledAtValidMinimum;
         summary.iterations = 60;
         summary.finalgrad_norm = 42.0;
@@ -10763,7 +10762,7 @@ mod tests {
             Some(Array2::<f64>::eye(3)),
             None,
             None,
-            saved_fit_summary_stub(),
+            saved_fit_summary_fixture(),
         );
         let mut payload = test_payload(
             "Surv(entry, exit, event) ~ 1",
@@ -11060,7 +11059,7 @@ mod tests {
                 likelihood_family: Some(LikelihoodFamily::BinomialProbit),
                 likelihood_scale: LikelihoodScaleMetadata::Unspecified,
                 log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
-                ..saved_fit_summary_stub()
+                ..saved_fit_summary_fixture()
             },
         );
         let mut payload = FittedModelPayload::new(
@@ -11424,7 +11423,7 @@ mod tests {
             None,
             None,
             None,
-            saved_fit_summary_stub(),
+            saved_fit_summary_fixture(),
         );
         let mut payload = test_payload(
             "y ~ 1",
@@ -11482,7 +11481,7 @@ mod tests {
             Some(covariance.clone()),
             Some(covariance),
             None,
-            saved_fit_summary_stub(),
+            saved_fit_summary_fixture(),
         );
         let mut payload = test_payload(
             "y ~ 1",
@@ -11525,7 +11524,7 @@ mod tests {
             1.0,
             Some(covariance.clone()),
             Some(covariance),
-            saved_fit_summary_stub(),
+            saved_fit_summary_fixture(),
         );
         fit_result.blocks = vec![
             gam::estimate::FittedBlock {
@@ -12619,7 +12618,7 @@ mod tests {
                 1.0,
                 None,
                 None,
-                saved_fit_summary_stub(),
+                saved_fit_summary_fixture(),
             ),
             0.0,
             0.0,
@@ -12684,7 +12683,7 @@ mod tests {
                 likelihood_family: Some(LikelihoodFamily::BinomialProbit),
                 likelihood_scale: LikelihoodScaleMetadata::Unspecified,
                 log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
-                ..saved_fit_summary_stub()
+                ..saved_fit_summary_fixture()
             },
         );
         let model = super::build_bernoulli_marginal_slope_saved_model(
@@ -12757,7 +12756,7 @@ mod tests {
                 1.0,
                 None,
                 None,
-                saved_fit_summary_stub(),
+                saved_fit_summary_fixture(),
             ),
             0.0,
             0.0,
@@ -12795,7 +12794,7 @@ mod tests {
             1.0,
             None,
             None,
-            saved_fit_summary_stub(),
+            saved_fit_summary_fixture(),
         ));
         survival.data_schema = Some(DataSchema { columns: vec![] });
         survival.set_training_feature_metadata(vec![], vec![]);
@@ -13882,7 +13881,7 @@ mod tests {
             None,
             None,
             None,
-            saved_fit_summary_stub(),
+            saved_fit_summary_fixture(),
         );
 
         let mut payload = test_payload(
@@ -14025,7 +14024,7 @@ mod tests {
             Some(Array2::eye(2)),
             None,
             None,
-            saved_fit_summary_stub(),
+            saved_fit_summary_fixture(),
         );
 
         let mut payload = test_payload(
@@ -14229,7 +14228,7 @@ mod tests {
             1.0,
             Some(Array2::<f64>::eye(p)),
             None,
-            saved_fit_summary_stub(),
+            saved_fit_summary_fixture(),
         );
         let mut payload = test_payload(
             "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=4)",
@@ -14391,7 +14390,7 @@ mod tests {
             Some(Array2::<f64>::eye(p_time + 1)),
             None,
             None,
-            saved_fit_summary_stub(),
+            saved_fit_summary_fixture(),
         );
         let mut payload = test_payload(
             "Surv(entry, exit, event) ~ 1",
@@ -14549,7 +14548,7 @@ mod tests {
             1.0,
             None,
             None,
-            saved_fit_summary_stub(),
+            saved_fit_summary_fixture(),
         ));
         payload.baseline_timewiggle_knots = Some(built.knots.to_vec());
         payload.baseline_timewiggle_degree = Some(built.degree);
