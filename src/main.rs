@@ -58,12 +58,14 @@ use gam::predict::{
 use gam::probability::{normal_cdf, standard_normal_quantile};
 use gam::report;
 use gam::smooth::{
-    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
+    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
+    SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
     build_term_collection_design, freeze_term_collection_from_design,
 };
 use gam::smooth_test::SmoothTestScale;
-use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
+use gam::survival::{
+    MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec, survival_event_code_from_value,
+};
 use gam::survival_construction::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset,
@@ -878,10 +880,6 @@ const HARD_EXIT: fn(i32) -> ! = std::process::exit;
 fn main() {
     gam::init_parallelism();
     let result = run();
-    // Emit the GPU activity roll-up exactly once, regardless of success/
-    // failure path. Tells the user — and the log reader — how many kernels
-    // actually reached the device this run and what was kept on the host.
-    gam::gpu::flush_gpu_activity_summary();
     if let Err(e) = result {
         cli_err!("error: {e}");
         if let Some(advice) = e.advice() {
@@ -2743,7 +2741,9 @@ fn run_predict_model(
 }
 
 fn run_predict(args: PredictArgs) -> Result<(), String> {
-    parse_probability_open_cli(&args.level).map_err(|e| format!("--level {e}"))?;
+    if !(0.0 < args.level && args.level < 1.0) {
+        return Err(format!("--level must be in (0,1), got {}", args.level));
+    }
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.start_workflow("Predict", 5);
     let phase_start = std::time::Instant::now();
@@ -3416,9 +3416,9 @@ fn run_predict_survival(
             SurvivalLikelihoodMode::Transformation
             | SurvivalLikelihoodMode::Weibull
             | SurvivalLikelihoodMode::LocationScale
-            | SurvivalLikelihoodMode::MarginalSlope => Err(CliError::from(
+            | SurvivalLikelihoodMode::MarginalSlope => Err(
                 "internal: non-latent survival modes are routed earlier; this branch is gated by an outer `if matches!(_, Latent | LatentBinary)` and cannot fire".to_string(),
-            )),
+            ),
         };
     }
     let saved_location_scale_inverse_link =
@@ -6185,7 +6185,6 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     progress.advance_workflow(2);
     let col_map = ds.column_map();
     let training_headers = model.training_headers.as_ref();
-    let family = model.likelihood();
     let n_base_params = model
         .fit_result
         .as_ref()
@@ -6202,45 +6201,16 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
 
     progress.set_stage("sample", "running posterior sampling");
     progress.teardown();
-    // Collapsing this dispatch requires SurvivalPredictor and
-    // LocationScalePredictor implementations of PredictableModel.
-    let nuts = match model.predict_model_class() {
-        PredictModelClass::Survival => run_sample_survival(
-            &mut progress,
-            &model,
-            ds.values.view(),
-            &col_map,
-            training_headers,
-            &cfg,
-        )?,
-        PredictModelClass::GaussianLocationScale => gam::sample::laplace_gaussian_fallback(
-            &model,
-            &cfg,
-            "gaussian location-scale posterior",
-        )?,
-        PredictModelClass::BinomialLocationScale => gam::sample::laplace_gaussian_fallback(
-            &model,
-            &cfg,
-            "binomial location-scale posterior",
-        )?,
-        PredictModelClass::BernoulliMarginalSlope => gam::sample::laplace_gaussian_fallback(
-            &model,
-            &cfg,
-            "bernoulli marginal-slope posterior",
-        )?,
-        PredictModelClass::TransformationNormal => {
-            gam::sample::laplace_gaussian_fallback(&model, &cfg, "transformation-normal posterior")?
-        }
-        PredictModelClass::Standard => run_sample_standard(
-            &mut progress,
-            &model,
-            ds.values.view(),
-            &col_map,
-            training_headers,
-            family,
-            &cfg,
-        )?,
-    };
+    // Unified dispatch over saved model class; the inference::sample module
+    // routes Survival/Standard to their NUTS paths and every other class to
+    // the Laplace-Gaussian fallback.
+    let nuts = gam::sample::sample_saved_model(
+        &model,
+        ds.values.view(),
+        &col_map,
+        training_headers,
+        &cfg,
+    )?;
 
     let out = args
         .out
@@ -7173,19 +7143,14 @@ fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::Pca { feature_cols, .. }
-        | SmoothBasisSpec::TensorBSpline { feature_cols, .. }
-        | SmoothBasisSpec::Sphere { feature_cols, .. } => {
+        | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
             if feature_cols.len() == 1 {
                 Some(feature_cols[0])
             } else {
                 None
             }
         }
-        SmoothBasisSpec::ByVariable { inner, .. } => smooth_term_primary_column(&SmoothTermSpec {
-            name: term.name.clone(),
-            basis: (**inner).clone(),
-            shape: term.shape,
-        }),
+        SmoothBasisSpec::BySmooth { .. } | SmoothBasisSpec::FactorSmooth { .. } => None,
     }
 }
 
@@ -7980,18 +7945,10 @@ fn spatial_basiswarning_family_and_cols(term: &SmoothTermSpec) -> Option<(&'stat
         SmoothBasisSpec::Sphere { feature_cols, .. } => Some(("sphere/sos", feature_cols)),
         SmoothBasisSpec::Matern { feature_cols, .. } => Some(("matern", feature_cols)),
         SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
-        SmoothBasisSpec::ByVariable { inner, .. } => match inner.as_ref() {
-            SmoothBasisSpec::ThinPlate { feature_cols, .. } => {
-                Some(("thinplate/tps", feature_cols))
-            }
-            SmoothBasisSpec::Sphere { feature_cols, .. } => Some(("sphere/sos", feature_cols)),
-            SmoothBasisSpec::Matern { feature_cols, .. } => Some(("matern", feature_cols)),
-            SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
-            _ => None,
-        },
         SmoothBasisSpec::BSpline1D { .. }
         | SmoothBasisSpec::Pca { .. }
         | SmoothBasisSpec::TensorBSpline { .. } => None,
+        SmoothBasisSpec::BySmooth { .. } | SmoothBasisSpec::FactorSmooth { .. } => None,
     }
 }
 
@@ -8084,16 +8041,8 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::Pca { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
-        SmoothBasisSpec::ByVariable { inner, by_col, .. } => {
-            let mut cols = smooth_term_feature_cols(&SmoothTermSpec {
-                name: term.name.clone(),
-                basis: (**inner).clone(),
-                shape: term.shape,
-            });
-            cols.push(*by_col);
-            cols.sort_unstable();
-            cols.dedup();
-            cols
+        SmoothBasisSpec::BySmooth { .. } | SmoothBasisSpec::FactorSmooth { .. } => {
+            panic!("BySmooth/FactorSmooth not handled here yet")
         }
     }
 }
@@ -9156,7 +9105,7 @@ fn build_model_summary(
         penalty_cursor += 1;
         // Random-effect smooths are variance-component tests on the boundary;
         // a naive coefficient Wald χ² p-value is anti-conservative, so only EDF is reported.
-        let chi_sq_opt = None;
+        let chi_sq_opt: Option<f64> = None;
         let ref_df = edf.max(0.0);
         let pvalue = None;
         smooth_terms.push(SmoothTermSummary {
