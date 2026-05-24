@@ -38,18 +38,6 @@ resolver = "3"
 [lints.rust]
 warnings = "deny"
 
-[lints.clippy]
-all = { level = "allow", priority = -1 }
-correctness = { level = "allow", priority = -1 }
-suspicious = { level = "allow", priority = -1 }
-complexity = { level = "allow", priority = -1 }
-perf = { level = "allow", priority = -1 }
-style = { level = "allow", priority = -1 }
-pedantic = { level = "allow", priority = -1 }
-nursery = { level = "allow", priority = -1 }
-cargo = { level = "allow", priority = -1 }
-restriction = { level = "allow", priority = -1 }
-
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
 comfy-table = "7.2.2"

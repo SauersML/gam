@@ -111,7 +111,11 @@ fn main() {
     // level = "allow", ... }`) are the worst form: they preemptively
     // turn off every current and future lint in a category. Banned.
     let mut cargo_lint_allow_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
-    scan_for_cargo_lint_allows(&manifest_dir, &manifest_dir, &mut cargo_lint_allow_offenders);
+    scan_for_cargo_lint_allows(
+        &manifest_dir,
+        &manifest_dir,
+        &mut cargo_lint_allow_offenders,
+    );
 
     // `#[should_panic]` without `expected = "..."` catches any panic and
     // masks unrelated bugs. Require an `expected` string.
@@ -1328,10 +1332,7 @@ fn scan_for_cargo_feature_entries(
     offenders: &mut Vec<(PathBuf, usize, String)>,
 ) {
     visit_files(root, dir, &mut |rel, content| {
-        let basename = rel
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or("");
+        let basename = rel.file_name().and_then(OsStr::to_str).unwrap_or("");
         if basename != "Cargo.toml" {
             return;
         }
@@ -1384,10 +1385,23 @@ fn scan_for_cargo_feature_entries(
     });
 }
 
-/// Flags `allow` levels inside Cargo.toml `[lints.*]` tables. This mirrors
-/// the attribute scanner for manifest-level lint policy: `allow` hides the
-/// diagnostic instead of forcing the owning code to use, delete, or
-/// restructure the offending item.
+/// Flags `Cargo.toml` `[lints.*]` entries whose right-hand side sets the
+/// lint level to `"allow"`. Mirrors the `#[allow(...)]` ban: a
+/// manifest-level allow is the same act of silencing a lint that flagged
+/// real code. Both whole-category allows (`clippy.all = "allow"`,
+/// `pedantic = { level = "allow", priority = -1 }`) and per-lint allows
+/// (`too_many_arguments = "allow"`) are flagged.
+///
+/// Section headers covered: `[lints]`, `[lints.<group>]`,
+/// `[workspace.lints]`, `[workspace.lints.<group>]`.
+///
+/// Forms detected (all collapse to the same quoted `"allow"` token):
+/// - `<lint> = "allow"` (bare string form)
+/// - `<lint> = { level = "allow", ... }` (table form)
+/// - `<lint>.level = "allow"` (dotted-key form)
+///
+/// Other levels (`"deny"`, `"warn"`, `"forbid"`) are not flagged — the
+/// ban targets the silencing direction only.
 fn scan_for_cargo_lint_allows(
     root: &Path,
     dir: &Path,
@@ -1419,24 +1433,11 @@ fn scan_for_cargo_lint_allows(
             if !in_lints || code_part.is_empty() {
                 continue;
             }
-            if toml_assignment_mentions_allow_level(code_part) {
+            if code_part.contains("\"allow\"") {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }
         }
     });
-}
-
-fn toml_assignment_mentions_allow_level(code_part: &str) -> bool {
-    let Some(eq_pos) = code_part.find('=') else {
-        return false;
-    };
-    let rhs = code_part[eq_pos + 1..].trim();
-    rhs == "\"allow\""
-        || rhs == "'allow'"
-        || rhs.contains("level = \"allow\"")
-        || rhs.contains("level='allow'")
-        || rhs.contains("level = 'allow'")
-        || rhs.contains("level=\"allow\"")
 }
 
 /// Flags `#[cfg(test)]` (and `#[cfg(all(test, ...))]` / `#[cfg(any(test,
@@ -1508,7 +1509,10 @@ fn scan_for_cfg_test_on_pub_items(
             let mut j = idx + 1;
             let mut item_line: Option<usize> = None;
             while j < n {
-                let sj = stripped_lines.get(j).map(String::as_str).unwrap_or(lines[j]);
+                let sj = stripped_lines
+                    .get(j)
+                    .map(String::as_str)
+                    .unwrap_or(lines[j]);
                 let t = sj.trim();
                 if t.is_empty() {
                     j += 1;
@@ -4268,7 +4272,9 @@ fn strip_leading_item_modifiers(mut s: &str) -> &str {
 /// keyword (`fn`, `struct`, `enum`, `const`, `static`, `type`, `trait`).
 /// Returns None if `s` does not begin with one of those.
 fn extract_item_ident(s: &str) -> Option<String> {
-    for kw in ["fn ", "struct ", "enum ", "const ", "static ", "type ", "trait "] {
+    for kw in [
+        "fn ", "struct ", "enum ", "const ", "static ", "type ", "trait ",
+    ] {
         if let Some(rest) = s.strip_prefix(kw) {
             let rest = rest.trim_start();
             let bytes = rest.as_bytes();

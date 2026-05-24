@@ -3040,17 +3040,17 @@ where
             .ok_or_else(|| EstimationError::InvalidInput("missing mixture spec".to_string()))?;
         let mut heuristic_theta = Vec::new();
         if let Some(hvals) = heuristic_lambdas
-            && hvals.len() == k {
-                heuristic_theta.extend_from_slice(hvals);
-                if use_mixture {
-                    heuristic_theta
-                        .extend_from_slice(mixspec.initial_rho.as_slice().unwrap_or(&[]));
-                }
-                if let Some(spec) = sasspec {
-                    heuristic_theta.push(spec.initial_epsilon);
-                    heuristic_theta.push(spec.initial_log_delta);
-                }
+            && hvals.len() == k
+        {
+            heuristic_theta.extend_from_slice(hvals);
+            if use_mixture {
+                heuristic_theta.extend_from_slice(mixspec.initial_rho.as_slice().unwrap_or(&[]));
             }
+            if let Some(spec) = sasspec {
+                heuristic_theta.push(spec.initial_epsilon);
+                heuristic_theta.push(spec.initial_log_delta);
+            }
+        }
         let heuristic_theta_ref = if heuristic_theta.len() == theta_dim {
             Some(heuristic_theta.as_slice())
         } else {
@@ -4686,25 +4686,27 @@ impl UnifiedFitResult {
 
         let p = beta.len();
         if let Some(cov) = covariance_conditional.as_ref()
-            && (cov.nrows() != p || cov.ncols() != p) {
-                return Err(EstimationError::InvalidInput(format!(
-                    "UnifiedFitResult conditional covariance shape mismatch: got {}x{}, expected {}x{}",
-                    cov.nrows(),
-                    cov.ncols(),
-                    p,
-                    p
-                )));
-            }
+            && (cov.nrows() != p || cov.ncols() != p)
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "UnifiedFitResult conditional covariance shape mismatch: got {}x{}, expected {}x{}",
+                cov.nrows(),
+                cov.ncols(),
+                p,
+                p
+            )));
+        }
         if let Some(cov) = covariance_corrected.as_ref()
-            && (cov.nrows() != p || cov.ncols() != p) {
-                return Err(EstimationError::InvalidInput(format!(
-                    "UnifiedFitResult corrected covariance shape mismatch: got {}x{}, expected {}x{}",
-                    cov.nrows(),
-                    cov.ncols(),
-                    p,
-                    p
-                )));
-            }
+            && (cov.nrows() != p || cov.ncols() != p)
+        {
+            return Err(EstimationError::InvalidInput(format!(
+                "UnifiedFitResult corrected covariance shape mismatch: got {}x{}, expected {}x{}",
+                cov.nrows(),
+                cov.ncols(),
+                p,
+                p
+            )));
+        }
         if let Some(inf) = inference.as_ref() {
             if !inf.edf_by_block.is_empty() && inf.edf_by_block.len() != lambdas.len() {
                 return Err(EstimationError::InvalidInput(format!(

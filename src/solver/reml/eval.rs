@@ -182,33 +182,30 @@ impl<'a> RemlState<'a> {
             // No hyperparameters: the unified corrected covariance equals H^{-1}.
             // Validate the unified path using the spectral operator.
             if let Some(base_cov) = base_covariance
-                && let Ok(hop) = super::unified::DenseSpectralOperator::from_symmetric(base_cov) {
-                    let outer = Array2::<f64>::zeros((0, 0));
-                    let unified_diag = super::unified::compute_corrected_covariance_diagonal(
-                        &[],
-                        &[],
-                        &outer,
-                        &hop,
+                && let Ok(hop) = super::unified::DenseSpectralOperator::from_symmetric(base_cov)
+            {
+                let outer = Array2::<f64>::zeros((0, 0));
+                let unified_diag =
+                    super::unified::compute_corrected_covariance_diagonal(&[], &[], &outer, &hop);
+                if let Ok(diag) = unified_diag {
+                    let p = base_cov.nrows();
+                    let max_dev = (0..p)
+                        .map(|i| (base_cov[[i, i]] - diag[i]).abs())
+                        .fold(0.0_f64, f64::max);
+                    log::trace!(
+                        "[corrected-cov] unified diagonal validation: max_dev={:.4e}",
+                        max_dev,
                     );
-                    if let Ok(diag) = unified_diag {
-                        let p = base_cov.nrows();
-                        let max_dev = (0..p)
-                            .map(|i| (base_cov[[i, i]] - diag[i]).abs())
-                            .fold(0.0_f64, f64::max);
-                        log::trace!(
-                            "[corrected-cov] unified diagonal validation: max_dev={:.4e}",
-                            max_dev,
-                        );
-                    }
-                    let unified_full =
-                        super::unified::compute_corrected_covariance(&[], &[], &outer, &hop);
-                    if let Ok(full) = unified_full {
-                        log::trace!(
-                            "[corrected-cov] unified full norm: {:.4e}",
-                            full.iter().map(|v| v * v).sum::<f64>().sqrt(),
-                        );
-                    }
                 }
+                let unified_full =
+                    super::unified::compute_corrected_covariance(&[], &[], &outer, &hop);
+                if let Ok(full) = unified_full {
+                    log::trace!(
+                        "[corrected-cov] unified full norm: {:.4e}",
+                        full.iter().map(|v| v * v).sum::<f64>().sqrt(),
+                    );
+                }
+            }
             return first_order_correction;
         }
         if n_rho > AUTO_CUBATURE_MAX_RHO_DIM {
@@ -254,16 +251,17 @@ impl<'a> RemlState<'a> {
         // is already the correct rank-deficient inflation on the identified
         // subspace) and skip cubature entirely.
         if let Some(rank) = first_order.active_rank
-            && rank < n_rho {
-                log::debug!(
-                    "Auto cubature skipped: first-order V_ρ is rank-deficient \
+            && rank < n_rho
+        {
+            log::debug!(
+                "Auto cubature skipped: first-order V_ρ is rank-deficient \
                      ({}/{}); higher-order propagation would impute spurious \
                      variance along unidentified directions.",
-                    rank,
-                    n_rho,
-                );
-                return first_order_correction;
-            }
+                rank,
+                n_rho,
+            );
+            return first_order_correction;
+        }
 
         // Build V_rho from the outer Hessian around rho_hat.
         let mut hessian_rho = if let Some(h) = first_order.hessian_rho {

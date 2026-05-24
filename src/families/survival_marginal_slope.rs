@@ -3733,13 +3733,12 @@ impl SurvivalMarginalSlopeFamily {
         logslope_eta: &Array1<f64>,
     ) -> Result<Vec<f64>, String> {
         let k = self.score_dim();
-        if self.logslope_surface_ranges.len() == k && k > 1
-            && logslope_eta.len() == self.n {
-                return Err(
+        if self.logslope_surface_ranges.len() == k && k > 1 && logslope_eta.len() == self.n {
+            return Err(
                     "survival marginal-slope internal logslope vector requested scalar eta for a per-z surface layout"
                         .to_string(),
                 );
-            }
+        }
         if logslope_eta.len() == self.n {
             return Ok(vec![logslope_eta[row]; k]);
         }
@@ -4284,7 +4283,13 @@ impl SurvivalMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        std::hint::black_box(specs);
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "survival marginal-slope sigma psi terms: specs/block_states length mismatch {} vs {}",
+                specs.len(),
+                block_states.len()
+            ));
+        }
         if self.flex_active() {
             return Err(
                 "survival marginal-slope log-sigma hyperderivatives are implemented for the rigid probit marginal-slope kernel; flex score/link/timewiggle kernels still require the analytic cell-tensor sigma path"
@@ -5457,9 +5462,10 @@ impl SurvivalMarginalSlopeFamily {
         // was provided. When `slot` is None this is a no-op, preserving the
         // exact pre-warm-start behaviour.
         if let Some((row, kind)) = slot
-            && let Some(cache) = self.intercept_warm_starts.as_ref() {
-                cache.store(row, kind, a);
-            }
+            && let Some(cache) = self.intercept_warm_starts.as_ref()
+        {
+            cache.store(row, kind, a);
+        }
 
         Ok((a, abs_deriv))
     }
@@ -5860,28 +5866,32 @@ impl SurvivalMarginalSlopeFamily {
         }
         if u == primary.g {
             if let Some(h_range) = primary.h.as_ref()
-                && v >= h_range.start && v < h_range.end {
-                    let local_idx = v - h_range.start;
-                    return Ok(eval_coeff4_at(
-                        &scale_coeff4(
-                            self.observed_score_basis_coefficients(row, local_idx, z_obs, 1.0)?,
-                            scale,
-                        ),
-                        z_obs,
-                    ));
-                }
+                && v >= h_range.start
+                && v < h_range.end
+            {
+                let local_idx = v - h_range.start;
+                return Ok(eval_coeff4_at(
+                    &scale_coeff4(
+                        self.observed_score_basis_coefficients(row, local_idx, z_obs, 1.0)?,
+                        scale,
+                    ),
+                    z_obs,
+                ));
+            }
             if let Some(w_range) = primary.w.as_ref()
-                && v >= w_range.start && v < w_range.end {
-                    let local_idx = v - w_range.start;
-                    let runtime = self
-                        .link_dev
-                        .as_ref()
-                        .ok_or_else(|| "missing survival link runtime".to_string())?;
-                    let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
-                    let (_, dc_bw) =
-                        exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
-                    return Ok(eval_coeff4_at(&scale_coeff4(dc_bw, scale), z_obs));
-                }
+                && v >= w_range.start
+                && v < w_range.end
+            {
+                let local_idx = v - w_range.start;
+                let runtime = self
+                    .link_dev
+                    .as_ref()
+                    .ok_or_else(|| "missing survival link runtime".to_string())?;
+                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                let (_, dc_bw) =
+                    exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
+                return Ok(eval_coeff4_at(&scale_coeff4(dc_bw, scale), z_obs));
+            }
         }
         if v == primary.g {
             return self
@@ -5907,17 +5917,18 @@ impl SurvivalMarginalSlopeFamily {
         }
         if u == primary.g
             && let Some(w_range) = primary.w.as_ref()
-                && v >= w_range.start && v < w_range.end {
-                    let local_idx = v - w_range.start;
-                    let runtime = self
-                        .link_dev
-                        .as_ref()
-                        .ok_or_else(|| "missing survival link runtime".to_string())?;
-                    let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
-                    let (_, dc_abw, _) =
-                        exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
-                    return Ok(eval_coeff4_at(&scale_coeff4(dc_abw, scale), z_obs));
-                }
+            && v >= w_range.start
+            && v < w_range.end
+        {
+            let local_idx = v - w_range.start;
+            let runtime = self
+                .link_dev
+                .as_ref()
+                .ok_or_else(|| "missing survival link runtime".to_string())?;
+            let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+            let (_, dc_abw, _) = exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
+            return Ok(eval_coeff4_at(&scale_coeff4(dc_abw, scale), z_obs));
+        }
         if v == primary.g {
             return self.observed_fixed_chi_second_partial(primary, obs, v, u, z_obs, u_obs, a, b);
         }
@@ -8253,22 +8264,26 @@ impl SurvivalMarginalSlopeFamily {
         if u == primary.g || v == primary.g {
             let other = if u == primary.g { v } else { u };
             if let Some(h_range) = primary.h.as_ref()
-                && other >= h_range.start && other < h_range.end {
-                    return Ok(0.0);
-                }
+                && other >= h_range.start
+                && other < h_range.end
+            {
+                return Ok(0.0);
+            }
             if let Some(w_range) = primary.w.as_ref()
-                && other >= w_range.start && other < w_range.end {
-                    let local_idx = other - w_range.start;
-                    let runtime = self
-                        .link_dev
-                        .as_ref()
-                        .ok_or_else(|| "missing link runtime".to_string())?;
-                    let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
-                    let (_, dc_abw, dc_bbw) =
-                        exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
-                    return Ok(eval_coeff4_at(&scale_coeff4(dc_abw, scale), z_obs) * a_dir
-                        + eval_coeff4_at(&scale_coeff4(dc_bbw, scale), z_obs) * dir[primary.g]);
-                }
+                && other >= w_range.start
+                && other < w_range.end
+            {
+                let local_idx = other - w_range.start;
+                let runtime = self
+                    .link_dev
+                    .as_ref()
+                    .ok_or_else(|| "missing link runtime".to_string())?;
+                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                let (_, dc_abw, dc_bbw) =
+                    exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
+                return Ok(eval_coeff4_at(&scale_coeff4(dc_abw, scale), z_obs) * a_dir
+                    + eval_coeff4_at(&scale_coeff4(dc_bbw, scale), z_obs) * dir[primary.g]);
+            }
         }
         Ok(0.0)
     }
@@ -8291,18 +8306,20 @@ impl SurvivalMarginalSlopeFamily {
         if u == primary.g || v == primary.g {
             let other = if u == primary.g { v } else { u };
             if let Some(w_range) = primary.w.as_ref()
-                && other >= w_range.start && other < w_range.end {
-                    let local_idx = other - w_range.start;
-                    let runtime = self
-                        .link_dev
-                        .as_ref()
-                        .ok_or_else(|| "missing link runtime".to_string())?;
-                    let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
-                    let (_, dc_aabw, dc_abbw, _) =
-                        exact_kernel::link_basis_cell_third_partials(basis_span);
-                    return Ok(eval_coeff4_at(&scale_coeff4(dc_aabw, scale), z_obs) * a_dir
-                        + eval_coeff4_at(&scale_coeff4(dc_abbw, scale), z_obs) * dir[primary.g]);
-                }
+                && other >= w_range.start
+                && other < w_range.end
+            {
+                let local_idx = other - w_range.start;
+                let runtime = self
+                    .link_dev
+                    .as_ref()
+                    .ok_or_else(|| "missing link runtime".to_string())?;
+                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                let (_, dc_aabw, dc_abbw, _) =
+                    exact_kernel::link_basis_cell_third_partials(basis_span);
+                return Ok(eval_coeff4_at(&scale_coeff4(dc_aabw, scale), z_obs) * a_dir
+                    + eval_coeff4_at(&scale_coeff4(dc_abbw, scale), z_obs) * dir[primary.g]);
+            }
         }
         Ok(0.0)
     }
@@ -16115,14 +16132,25 @@ fn time_wiggle_basis_ncols(knots: &Array1<f64>, degree: usize) -> Result<usize, 
     Ok(monotone_wiggle_basis_with_derivative_order(h0.view(), knots, degree, 0)?.ncols())
 }
 
+fn parameter_block_specs_match_rows(specs: &[ParameterBlockSpec], expected_n: usize) -> bool {
+    !specs.is_empty()
+        && specs
+            .iter()
+            .all(|spec| spec.design.nrows() == expected_n && spec.offset.len() == expected_n)
+}
+
 impl CustomFamily for SurvivalMarginalSlopeFamily {
     fn persistent_warm_start_fingerprint(
         &self,
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Option<String> {
-        std::hint::black_box(specs);
-        std::hint::black_box(options);
+        if !parameter_block_specs_match_rows(specs, self.n)
+            || !options.inner_tol.is_finite()
+            || options.inner_tol <= 0.0
+        {
+            return None;
+        }
         let mut hasher = crate::solver::persistent_warm_start::StableHasher::new();
         hasher.write_str("survival-marginal-slope-family");
         hasher.write_usize(self.n);
@@ -16420,18 +16448,16 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        std::hint::black_box(specs);
         // The workspace impl above unconditionally returns `Some(workspace)`
         // — the rigid path produces a `RowKernelHessianWorkspace` and the
         // flex path produces a
         // `SurvivalMarginalSlopeExactNewtonJointHessianWorkspace`. Both
         // route the joint Hessian through Hv operators rather than dense
         // assembly.
-        !self.per_z_logslope_active()
+        !self.per_z_logslope_active() && parameter_block_specs_match_rows(specs, self.n)
     }
 
     fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        std::hint::black_box(specs);
         // The exact outer Hessian over θ=(ρ,ψ[,log σ]) can be applied without
         // pairwise θθ materialization: coefficient-Hessian drift terms use the
         // joint-Hessian workspace's directional-derivative operators, and ψ
@@ -16439,7 +16465,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         // `DriftDerivResult::Operator`. Advertising this capability lets the
         // outer planner keep ARC/Newton curvature at large n or large ψ_dim
         // while routing the representation through matrix-free HVPs.
-        !self.per_z_logslope_active()
+        !self.per_z_logslope_active() && parameter_block_specs_match_rows(specs, self.n)
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -16688,11 +16714,13 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             let current = &block_states[0].beta;
             return self.project_time_qd1_feasible(current, proposed);
         }
-        if self.score_warp.is_some() && block_idx == 3
-            && let Some(runtime) = &self.score_warp {
-                let current = &block_states[3].beta;
-                if current.len() != beta.len() {
-                    return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+        if self.score_warp.is_some()
+            && block_idx == 3
+            && let Some(runtime) = &self.score_warp
+        {
+            let current = &block_states[3].beta;
+            if current.len() != beta.len() {
+                return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
                         reason: format!(
                             "survival score-warp post-update beta length mismatch: current={}, proposed={}",
                             current.len(),
@@ -16700,10 +16728,10 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                         ),
                     }
                     .into());
-                }
-                let expected = runtime.basis_dim() * self.score_dim();
-                if beta.len() != expected {
-                    return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+            }
+            let expected = runtime.basis_dim() * self.score_dim();
+            if beta.len() != expected {
+                return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
                         reason: format!(
                             "survival score-warp post-update beta length mismatch: proposed={}, expected {expected} for K={} and basis dim {}",
                             beta.len(),
@@ -16712,31 +16740,33 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                         ),
                     }
                     .into());
-                }
-                let mut projected = Array1::<f64>::zeros(beta.len());
-                for coord in 0..self.score_dim() {
-                    let range = score_warp_component_range(runtime, coord);
-                    let current_local = current.slice(s![range.clone()]).to_owned();
-                    let proposed_local = beta.slice(s![range.clone()]).to_owned();
-                    let local = project_monotone_feasible_beta(
-                        runtime,
-                        &current_local,
-                        &proposed_local,
-                        &format!("score_warp_dev[z{coord}]"),
-                    )?;
-                    projected.slice_mut(s![range]).assign(&local);
-                }
-                return Ok(projected);
             }
+            let mut projected = Array1::<f64>::zeros(beta.len());
+            for coord in 0..self.score_dim() {
+                let range = score_warp_component_range(runtime, coord);
+                let current_local = current.slice(s![range.clone()]).to_owned();
+                let proposed_local = beta.slice(s![range.clone()]).to_owned();
+                let local = project_monotone_feasible_beta(
+                    runtime,
+                    &current_local,
+                    &proposed_local,
+                    &format!("score_warp_dev[z{coord}]"),
+                )?;
+                projected.slice_mut(s![range]).assign(&local);
+            }
+            return Ok(projected);
+        }
         let link_block_idx = if self.score_warp.is_some() { 4 } else { 3 };
-        if self.link_dev.is_some() && block_idx == link_block_idx
-            && let Some(runtime) = &self.link_dev {
-                let current = block_states
-                    .get(link_block_idx)
-                    .map(|state| &state.beta)
-                    .ok_or_else(|| "missing survival link-deviation block state".to_string())?;
-                if current.len() != beta.len() {
-                    return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+        if self.link_dev.is_some()
+            && block_idx == link_block_idx
+            && let Some(runtime) = &self.link_dev
+        {
+            let current = block_states
+                .get(link_block_idx)
+                .map(|state| &state.beta)
+                .ok_or_else(|| "missing survival link-deviation block state".to_string())?;
+            if current.len() != beta.len() {
+                return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
                         reason: format!(
                             "survival link-deviation post-update beta length mismatch: current={}, proposed={}",
                             current.len(),
@@ -16744,9 +16774,9 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
                         ),
                     }
                     .into());
-                }
-                return project_monotone_feasible_beta(runtime, current, &beta, "link_dev");
             }
+            return project_monotone_feasible_beta(runtime, current, &beta, "link_dev");
+        }
         Ok(beta)
     }
 }
@@ -17904,9 +17934,10 @@ pub fn fit_survival_marginal_slope_terms(
                         hints_mut.logslope_beta = Some(beta.clone());
                     }
                     if score_warp_prepared.is_some()
-                        && let Some(beta) = block_beta.get(3) {
-                            hints_mut.score_warp_beta = Some(beta.clone());
-                        }
+                        && let Some(beta) = block_beta.get(3)
+                    {
+                        hints_mut.score_warp_beta = Some(beta.clone());
+                    }
                     if link_dev_prepared.is_some() {
                         let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
                         if let Some(beta) = block_beta.get(link_idx) {
@@ -18105,9 +18136,10 @@ pub fn fit_survival_marginal_slope_terms(
                 hints_mut.logslope_beta = Some(block.beta.clone());
             }
             if score_warp_prepared.is_some()
-                && let Some(block) = fit.block_states.get(3) {
-                    hints_mut.score_warp_beta = Some(block.beta.clone());
-                }
+                && let Some(block) = fit.block_states.get(3)
+            {
+                hints_mut.score_warp_beta = Some(block.beta.clone());
+            }
             if link_dev_prepared.is_some() {
                 let link_idx = if score_warp_prepared.is_some() { 4 } else { 3 };
                 if let Some(block) = fit.block_states.get(link_idx) {
@@ -18125,13 +18157,17 @@ pub fn fit_survival_marginal_slope_terms(
          designs: &[TermCollectionDesign],
          eval_mode,
          row_set: &crate::families::row_kernel::RowSet| {
-            std::hint::black_box(row_set);
             use crate::solver::estimate::reml::unified::EvalMode;
+            let row_set_rows = match row_set {
+                crate::families::row_kernel::RowSet::All => outer_row_indices(options, n).len(),
+                crate::families::row_kernel::RowSet::Subsample { rows, .. } => rows.len(),
+            };
             let eval_started = std::time::Instant::now();
             log::info!(
-                "[survival-marginal-slope/outer-eval] start mode={:?} theta_dim={}",
+                "[survival-marginal-slope/outer-eval] start mode={:?} theta_dim={} row_set_rows={}",
                 eval_mode,
                 theta.len(),
+                row_set_rows,
             );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;

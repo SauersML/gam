@@ -2144,13 +2144,12 @@ impl BernoulliMarginalSlopePredictor {
                 }
             })
             .transpose()?;
-        let score_dev_obs = if let (Some(design), Some(beta)) =
-            (score_warp_obs_design.as_ref(), beta_score_warp)
-        {
-            design.dot(&beta.to_owned())
-        } else {
-            Array1::zeros(n)
-        };
+        let score_dev_obs =
+            if let (Some(design), Some(beta)) = (score_warp_obs_design.as_ref(), beta_score_warp) {
+                design.dot(&beta.to_owned())
+            } else {
+                Array1::zeros(n)
+            };
 
         // Solve intercepts and (when gradient needed) IFT scalars in chunk-parallel passes.
         // Outputs are preallocated and each parallel worker writes directly into

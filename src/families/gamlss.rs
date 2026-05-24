@@ -8200,13 +8200,17 @@ impl CustomFamily for GaussianLocationScaleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         // The Gaussian location-scale workspace is returned by
         // `exact_newton_joint_hessian_workspace` whenever
         // `exact_joint_dense_block_designs` succeeds, which itself depends on
         // both block designs being present. This is only a β-space operator
         // capability; outer θθ Hessian availability is declared separately.
         self.exact_joint_supported()
+            && matches!(
+                self.exact_joint_dense_block_designs(Some(specs)),
+                Ok(Some(_))
+            )
     }
 
     /// Outer-derivative policy: declare HT-subsample capability.
@@ -11920,7 +11924,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         }
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         // Same gating as the workspace impl above: matrix-free fires when
         // `exact_joint_dense_block_designs` is satisfiable, which requires
         // both location and scale block designs to be present.  The wiggle
@@ -11928,6 +11932,10 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         // presence is implied by reaching the wiggle family in the first
         // place — so the predicate matches the non-wiggle case.
         self.exact_joint_supported()
+            && matches!(
+                self.exact_joint_dense_block_designs(Some(specs)),
+                Ok(Some(_))
+            )
     }
 }
 
@@ -13016,8 +13024,8 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
-        true
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        self.dense_eta_design_fromspecs(specs).is_ok()
     }
 
     fn exact_newton_joint_hessian_with_specs(
@@ -14044,7 +14052,9 @@ impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
         Ok(())
     }
     #[inline]
-    fn row_kernel(&self, yi: f64, _e_clamped: f64, m: f64, prior_w: f64) -> DiagonalIrlsRow {
+    fn row_kernel(&self, yi: f64, e_clamped: f64, m: f64, prior_w: f64) -> DiagonalIrlsRow {
+        debug_assert!(e_clamped.is_finite());
+        debug_assert!((e_clamped.exp() - m).abs() <= 1.0e-8 * m.abs().max(1.0));
         // Gamma(shape=k, scale=mu/k), dropping eta-independent constants.
         let log_lik_increment = prior_w * (-self.shape * (yi / m + m.ln()));
         // Gamma with log mean is non-canonical. Use the exact observed
@@ -21566,13 +21576,17 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         }
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         // Same gating as the workspace impl: matrix-free path is available
         // when both threshold and log-σ block designs are present (the
         // wiggle block is folded into the per-row pieces inside
         // `BinomialLocationScaleWiggleHessianWorkspace`). This advertises
         // β-space representation support only.
         self.exact_joint_supported()
+            && matches!(
+                self.exact_joint_dense_block_designs(Some(specs)),
+                Ok(Some(_))
+            )
     }
 }
 

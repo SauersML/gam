@@ -812,13 +812,14 @@ impl LatentDesignCache {
                 basis_digest,
                 latent_metadata_digest,
                 design_context_digest,
-            ) {
-                self.entries[index].last_used = self.clock;
-                return Ok(LatentDesignLookup {
-                    cached: self.entries[index].cached.as_ref(),
-                    entry_id: self.entries[index].id,
-                });
-            }
+            )
+        {
+            self.entries[index].last_used = self.clock;
+            return Ok(LatentDesignLookup {
+                cached: self.entries[index].cached.as_ref(),
+                entry_id: self.entries[index].id,
+            });
+        }
         if cacheable
             && let Some(cached) = lookup_persistent_latent_design(
                 &latent,
@@ -826,12 +827,13 @@ impl LatentDesignCache {
                 latent_metadata_digest,
                 design_context_digest,
                 &fingerprint,
-            )? {
-                let id = self.next_entry_id;
-                self.next_entry_id = self.next_entry_id.wrapping_add(1);
-                self.insert(cached, id);
-                return self.lookup_inserted(id);
-            }
+            )?
+        {
+            let id = self.next_entry_id;
+            self.next_entry_id = self.next_entry_id.wrapping_add(1);
+            self.insert(cached, id);
+            return self.lookup_inserted(id);
+        }
 
         let computed = compute()?;
         let radial_distances = if basis_kind.streams_radial_cache() {
@@ -1103,20 +1105,16 @@ fn build_basis_derivative_jets(
                 operator_resident: false,
             })
         }
-        LatentBasisKind::Duchon { .. } => {
-            Ok(BasisDerivativeJets {
-                operator_resident: true,
-                ..BasisDerivativeJets::empty()
-            })
-        }
+        LatentBasisKind::Duchon { .. } => Ok(BasisDerivativeJets {
+            operator_resident: true,
+            ..BasisDerivativeJets::empty()
+        }),
         LatentBasisKind::Sphere { .. }
         | LatentBasisKind::PeriodicBspline { .. }
         | LatentBasisKind::Pca { .. }
-        | LatentBasisKind::TensorBspline { .. } => {
-            Ok(BasisDerivativeJets {
-                operator_resident: true,
-                ..BasisDerivativeJets::empty()
-            })
-        }
+        | LatentBasisKind::TensorBspline { .. } => Ok(BasisDerivativeJets {
+            operator_resident: true,
+            ..BasisDerivativeJets::empty()
+        }),
     }
 }

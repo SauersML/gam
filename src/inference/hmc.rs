@@ -760,8 +760,6 @@ impl NutsPosterior {
                 *g -= penalty_scale * (l + m);
             });
 
-        
-
         ll + firth_logdet - penalty
     }
 
@@ -3818,16 +3816,18 @@ pub fn run_nuts_sampling_flattened_family(
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
     if let FamilyNutsInputs::Glm(glm) = &inputs
-        && glm.firth_bias_reduction && !family.supports_firth() {
-            return Err(HmcError::FirthUnsupported {
-                reason: format!(
-                    "NUTS with Firth is only supported for {}; {} does not support it",
-                    LikelihoodFamily::BinomialLogit.pretty_name(),
-                    family.pretty_name()
-                ),
-            }
-            .into());
+        && glm.firth_bias_reduction
+        && !family.supports_firth()
+    {
+        return Err(HmcError::FirthUnsupported {
+            reason: format!(
+                "NUTS with Firth is only supported for {}; {} does not support it",
+                LikelihoodFamily::BinomialLogit.pretty_name(),
+                family.pretty_name()
+            ),
         }
+        .into());
+    }
 
     match (family, inputs) {
         (LikelihoodFamily::GaussianIdentity, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
@@ -4208,17 +4208,18 @@ impl LinkWigglePosterior {
                 &self.spline.knot_vector,
                 self.spline.degree,
                 1,
-            ) {
-                for i in 0..n {
-                    let dz = z_raw[i] - z_c[i];
-                    if dz.abs() <= 1e-12 {
-                        continue;
-                    }
-                    for j in 0..basis.ncols().min(b_prime.ncols()) {
-                        basis[[i, j]] += dz * b_prime[[i, j]];
-                    }
+            )
+        {
+            for i in 0..n {
+                let dz = z_raw[i] - z_c[i];
+                if dz.abs() <= 1e-12 {
+                    continue;
+                }
+                for j in 0..basis.ncols().min(b_prime.ncols()) {
+                    basis[[i, j]] += dz * b_prime[[i, j]];
                 }
             }
+        }
         (
             basis.clone(),
             u + &crate::faer_ndarray::fast_av(&basis, theta),

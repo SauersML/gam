@@ -259,12 +259,7 @@ impl Manifold for Euclidean {
             out[i] = p[i] + xi[i];
         }
     }
-    fn vector_transport(
-        &self,
-        from: ArrayView1<f64>,
-        to: ArrayView1<f64>,
-        xi: ArrayViewMut1<f64>,
-    ) {
+    fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
         debug_assert_eq!(from.len(), self.d);
         debug_assert_eq!(to.len(), self.d);
         debug_assert_eq!(xi.len(), self.d);
@@ -554,9 +549,10 @@ impl Manifold for Sphere {
         // Advisory only: if the last coordinate is very small the canonical
         // chart near the equator/pole is ill-conditioned.
         if let Some(last) = p.iter().last()
-            && last.abs() < SPHERE_POLE_WARN_THRESHOLD {
-                return Some(ManifoldWarning::SphereNearPole);
-            }
+            && last.abs() < SPHERE_POLE_WARN_THRESHOLD
+        {
+            return Some(ManifoldWarning::SphereNearPole);
+        }
         None
     }
     fn name(&self) -> &str {
@@ -616,12 +612,7 @@ impl Manifold for Interval {
             "Interval::retract output left feasible band"
         );
     }
-    fn vector_transport(
-        &self,
-        from: ArrayView1<f64>,
-        to: ArrayView1<f64>,
-        xi: ArrayViewMut1<f64>,
-    ) {
+    fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
         debug_assert_eq!(from.len(), 1);
         debug_assert_eq!(to.len(), 1);
         debug_assert_eq!(xi.len(), 1);

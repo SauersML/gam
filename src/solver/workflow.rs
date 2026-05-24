@@ -4365,14 +4365,15 @@ fn latent_id_mode(spec: &LatentSpec) -> Result<LatentIdMode, String> {
     match (&spec.aux_prior, &spec.dim_selection) {
         (Some(aux), Some(dim)) => {
             if let Some(init) = dim.init_log_precision.as_ref()
-                && init.len() != spec.d {
-                    return Err(format!(
-                        "latent '{}' dim_selection.init_log_precision has length {}, expected {}",
-                        spec.target,
-                        init.len(),
-                        spec.d
-                    ));
-                }
+                && init.len() != spec.d
+            {
+                return Err(format!(
+                    "latent '{}' dim_selection.init_log_precision has length {}, expected {}",
+                    spec.target,
+                    init.len(),
+                    spec.d
+                ));
+            }
             Ok(LatentIdMode::AuxPriorDimSelection {
                 u: aux.u.clone(),
                 family: aux.family,
@@ -4442,14 +4443,15 @@ fn prepare_standard_latent_coord(
         ));
     }
     if let Some(aux) = spec.aux_prior.as_ref()
-        && aux.u.nrows() != spec.n {
-            return Err(format!(
-                "latent '{}' aux_prior.u has {} rows, expected {}",
-                spec.target,
-                aux.u.nrows(),
-                spec.n
-            ));
-        }
+        && aux.u.nrows() != spec.n
+    {
+        return Err(format!(
+            "latent '{}' aux_prior.u has {} rows, expected {}",
+            spec.target,
+            aux.u.nrows(),
+            spec.n
+        ));
+    }
 
     let matrix = initial_latent_matrix(&spec, y)?;
     let id_mode = latent_id_mode(&spec)?;
@@ -4493,10 +4495,12 @@ fn prepare_standard_latent_coord(
     let mut matched = false;
     for term in &mut rewritten.terms {
         if let ParsedTerm::Smooth { vars, .. } = term
-            && vars.len() == 1 && vars[0] == spec.target {
-                *vars = synthetic_vars.clone();
-                matched = true;
-            }
+            && vars.len() == 1
+            && vars[0] == spec.target
+        {
+            *vars = synthetic_vars.clone();
+            matched = true;
+        }
     }
     if !matched {
         return Err(format!(

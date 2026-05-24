@@ -631,13 +631,14 @@ impl OuterThetaLayout {
             )));
         }
         if let Some(ref psi_gradient) = eval.psi_gradient
-            && psi_gradient.len() != self.psi_dim {
-                return Err(ObjectiveEvalError::recoverable(format!(
-                    "{context}: outer EFS psi-gradient length mismatch: got {}, expected {}",
-                    psi_gradient.len(),
-                    self.psi_dim
-                )));
-            }
+            && psi_gradient.len() != self.psi_dim
+        {
+            return Err(ObjectiveEvalError::recoverable(format!(
+                "{context}: outer EFS psi-gradient length mismatch: got {}, expected {}",
+                psi_gradient.len(),
+                self.psi_dim
+            )));
+        }
         if let Some(ref psi_indices) = eval.psi_indices {
             if psi_indices.len() != self.psi_dim {
                 return Err(ObjectiveEvalError::recoverable(format!(
@@ -1299,10 +1300,11 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
 
     if cap.gradient == Derivative::Analytic
         && matches!(plan(cap).solver, Solver::Efs | Solver::HybridEfs)
-        && let Some(no_fp_cap) = disable_fixed_point(cap) {
-            attempts.push(no_fp_cap.clone());
-            return attempts;
-        }
+        && let Some(no_fp_cap) = disable_fixed_point(cap)
+    {
+        attempts.push(no_fp_cap.clone());
+        return attempts;
+    }
 
     // Arc primary: no lateral demotion to BFGS. The runner's ARC-budget-bump
     // retry covers cases where ARC needed more iterations; if even that is
@@ -1982,10 +1984,12 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         // cache so a subsequent finalize-write encodes the seeded β if no
         // eval surfaces a fresher β first.
         let result = self.inner.seed_inner_state(beta);
-        if result.is_ok() && beta.iter().all(|v| v.is_finite())
-            && let Ok(mut guard) = self.last_inner_beta.lock() {
-                *guard = Some(beta.clone());
-            }
+        if result.is_ok()
+            && beta.iter().all(|v| v.is_finite())
+            && let Ok(mut guard) = self.last_inner_beta.lock()
+        {
+            *guard = Some(beta.clone());
+        }
         result
     }
 
@@ -3219,9 +3223,7 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
             let cap = first_order_inner_cap_schedule(self.eval_count, g_ratio, snapshot);
             let previous_cap = feedback.cap.swap(cap, Ordering::Relaxed);
             if previous_cap != cap {
-                log::trace!(
-                    "outer operator bridge updated inner cap from {previous_cap} to {cap}"
-                );
+                log::trace!("outer operator bridge updated inner cap from {previous_cap} to {cap}");
             }
         }
         let stage_start = std::time::Instant::now();
@@ -3510,75 +3512,76 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             )));
         }
         if let Some(ref barrier_cfg) = self.barrier_config
-            && let Some(ref beta) = eval.beta {
-                // Scale-free precondition check for EFS. Wood–Fasiolo's
-                // multiplicative log-λ update is derived under the
-                // assumption that the inner Hessian is ≈ X'WX + S. A log
-                // barrier adds τ/(β_j−l_j)² to the Hessian diagonal at the
-                // constrained coords; when the tightest slack is much
-                // smaller than the typical slack, that diagonal becomes
-                // locally dominant and the EFS direction is no longer
-                // guaranteed-ascent. Comparing slack *ratios* is
-                // dimensionless — independent of τ, β scale, and the
-                // inner-Hessian magnitude — which is exactly the regime
-                // change EFS cannot represent. The earlier criterion
-                // `barrier_curvature_is_significant(β, ref_diag=1.0, 0.01)`
-                // was dimensionful and depended on three quantities the
-                // bridge has no way to set correctly.
-                //
-                // Two principled triggers, each catching a distinct
-                // failure mode of the EFS precondition:
-                //  • `ratio = 0.1`        — asymmetric concentration:
-                //    the worst slack is ≥10× tighter than the median.
-                //    Catches the common "one coefficient hits its bound
-                //    while others stay healthy" case.
-                //  • `saturation = 1.0`   — absolute saturation:
-                //    `max_j τ/Δ_j² ≥ 1`, i.e. at least one barrier-
-                //    diagonal entry has reached the natural unit penalty
-                //    scale. Catches the symmetric near-boundary regime
-                //    that ratio-only checks would let through (median Δ
-                //    also small, so min/median ratio stays near 1, but
-                //    EFS's "ignore the barrier diagonal" assumption is
-                //    still violated everywhere on the active set).
-                const LOCAL_CONCENTRATION_RATIO: f64 = 0.1;
-                const BARRIER_CURVATURE_SATURATION: f64 = 1.0;
-                const BARRIER_CURVATURE_RELATIVE_THRESHOLD: f64 = 0.05;
-                if let Some(hessian_scale) = eval.inner_hessian_scale
-                    && hessian_scale.is_finite()
-                    && hessian_scale > 0.0
-                    && barrier_cfg.barrier_curvature_is_significant(
-                        beta,
-                        hessian_scale,
-                        BARRIER_CURVATURE_RELATIVE_THRESHOLD,
-                    )
-                {
-                    return Err(ObjectiveEvalError::recoverable(format!(
-                        "{} EFS barrier curvature significant relative to inner Hessian \
-                         (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e}, ref_diag={:.3e})",
-                        EFS_FIRST_ORDER_FALLBACK_MARKER,
-                        self.layout.rho_dim(),
-                        self.layout.psi_dim,
-                        self.layout.n_params,
-                        eval.cost,
-                        hessian_scale,
-                    )));
-                }
-                if barrier_cfg.barrier_curvature_locally_concentrated(
+            && let Some(ref beta) = eval.beta
+        {
+            // Scale-free precondition check for EFS. Wood–Fasiolo's
+            // multiplicative log-λ update is derived under the
+            // assumption that the inner Hessian is ≈ X'WX + S. A log
+            // barrier adds τ/(β_j−l_j)² to the Hessian diagonal at the
+            // constrained coords; when the tightest slack is much
+            // smaller than the typical slack, that diagonal becomes
+            // locally dominant and the EFS direction is no longer
+            // guaranteed-ascent. Comparing slack *ratios* is
+            // dimensionless — independent of τ, β scale, and the
+            // inner-Hessian magnitude — which is exactly the regime
+            // change EFS cannot represent. The earlier criterion
+            // `barrier_curvature_is_significant(β, ref_diag=1.0, 0.01)`
+            // was dimensionful and depended on three quantities the
+            // bridge has no way to set correctly.
+            //
+            // Two principled triggers, each catching a distinct
+            // failure mode of the EFS precondition:
+            //  • `ratio = 0.1`        — asymmetric concentration:
+            //    the worst slack is ≥10× tighter than the median.
+            //    Catches the common "one coefficient hits its bound
+            //    while others stay healthy" case.
+            //  • `saturation = 1.0`   — absolute saturation:
+            //    `max_j τ/Δ_j² ≥ 1`, i.e. at least one barrier-
+            //    diagonal entry has reached the natural unit penalty
+            //    scale. Catches the symmetric near-boundary regime
+            //    that ratio-only checks would let through (median Δ
+            //    also small, so min/median ratio stays near 1, but
+            //    EFS's "ignore the barrier diagonal" assumption is
+            //    still violated everywhere on the active set).
+            const LOCAL_CONCENTRATION_RATIO: f64 = 0.1;
+            const BARRIER_CURVATURE_SATURATION: f64 = 1.0;
+            const BARRIER_CURVATURE_RELATIVE_THRESHOLD: f64 = 0.05;
+            if let Some(hessian_scale) = eval.inner_hessian_scale
+                && hessian_scale.is_finite()
+                && hessian_scale > 0.0
+                && barrier_cfg.barrier_curvature_is_significant(
                     beta,
-                    LOCAL_CONCENTRATION_RATIO,
-                    BARRIER_CURVATURE_SATURATION,
-                ) {
-                    return Err(ObjectiveEvalError::recoverable(format!(
-                        "{} EFS barrier curvature locally concentrated \
-                         (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
-                        EFS_FIRST_ORDER_FALLBACK_MARKER,
-                        self.layout.rho_dim(),
-                        self.layout.psi_dim,
-                        self.layout.n_params,
-                        eval.cost,
-                    )));
-                }
+                    hessian_scale,
+                    BARRIER_CURVATURE_RELATIVE_THRESHOLD,
+                )
+            {
+                return Err(ObjectiveEvalError::recoverable(format!(
+                    "{} EFS barrier curvature significant relative to inner Hessian \
+                         (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e}, ref_diag={:.3e})",
+                    EFS_FIRST_ORDER_FALLBACK_MARKER,
+                    self.layout.rho_dim(),
+                    self.layout.psi_dim,
+                    self.layout.n_params,
+                    eval.cost,
+                    hessian_scale,
+                )));
             }
+            if barrier_cfg.barrier_curvature_locally_concentrated(
+                beta,
+                LOCAL_CONCENTRATION_RATIO,
+                BARRIER_CURVATURE_SATURATION,
+            ) {
+                return Err(ObjectiveEvalError::recoverable(format!(
+                    "{} EFS barrier curvature locally concentrated \
+                         (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
+                    EFS_FIRST_ORDER_FALLBACK_MARKER,
+                    self.layout.rho_dim(),
+                    self.layout.psi_dim,
+                    self.layout.n_params,
+                    eval.cost,
+                )));
+            }
+        }
         let status = FixedPointStatus::Continue;
 
         let raw_step = Array1::from_vec(eval.steps);
@@ -3672,43 +3675,42 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             if max_rho_abs >= EFS_NEGLIGIBLE_STEP
                 && let Some(scaled) =
                     self.efs_backtrack(x, &rho_only, current_cost, MAX_EFS_BACKTRACK)?
-                {
-                    self.consecutive_psi_zero_iters =
-                        self.consecutive_psi_zero_iters.saturating_add(1);
-                    log::info!(
-                        "[HYBRID-EFS] full-vector backtrack exhausted; ρ/τ-only step \
+            {
+                self.consecutive_psi_zero_iters = self.consecutive_psi_zero_iters.saturating_add(1);
+                log::info!(
+                    "[HYBRID-EFS] full-vector backtrack exhausted; ρ/τ-only step \
                          accepted. Consecutive ψ-zero iters = {}",
-                        self.consecutive_psi_zero_iters,
-                    );
-                    if self.consecutive_psi_zero_iters >= MAX_CONSECUTIVE_PSI_STAGNATION {
-                        log::info!(
-                            "[STAGE] HybridEFS -> joint gradient (BFGS/L-BFGS) fallback: \
+                    self.consecutive_psi_zero_iters,
+                );
+                if self.consecutive_psi_zero_iters >= MAX_CONSECUTIVE_PSI_STAGNATION {
+                    log::info!(
+                        "[STAGE] HybridEFS -> joint gradient (BFGS/L-BFGS) fallback: \
                              {} consecutive ψ-zero iterations after exhausted backtracking \
                              (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
-                            self.consecutive_psi_zero_iters,
-                            self.layout.rho_dim(),
-                            self.layout.psi_dim,
-                            self.layout.n_params,
-                            current_cost,
-                        );
-                        return Err(ObjectiveEvalError::recoverable(format!(
-                            "{} HybridEFS ψ stagnation: {} consecutive iterations \
+                        self.consecutive_psi_zero_iters,
+                        self.layout.rho_dim(),
+                        self.layout.psi_dim,
+                        self.layout.n_params,
+                        current_cost,
+                    );
+                    return Err(ObjectiveEvalError::recoverable(format!(
+                        "{} HybridEFS ψ stagnation: {} consecutive iterations \
                              exhausted backtracking and zeroed ψ step \
                              (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
-                            EFS_FIRST_ORDER_FALLBACK_MARKER,
-                            self.consecutive_psi_zero_iters,
-                            self.layout.rho_dim(),
-                            self.layout.psi_dim,
-                            self.layout.n_params,
-                            current_cost,
-                        )));
-                    }
-                    return Ok(FixedPointSample {
-                        value: current_cost,
-                        step: scaled,
-                        status,
-                    });
+                        EFS_FIRST_ORDER_FALLBACK_MARKER,
+                        self.consecutive_psi_zero_iters,
+                        self.layout.rho_dim(),
+                        self.layout.psi_dim,
+                        self.layout.n_params,
+                        current_cost,
+                    )));
                 }
+                return Ok(FixedPointSample {
+                    value: current_cost,
+                    step: scaled,
+                    status,
+                });
+            }
             // ρ/τ-only backtracking also failed — surface the joint-solver
             // fallback marker so the runner abandons EFS for this attempt.
             log::info!(
@@ -4489,7 +4491,7 @@ impl OuterProblem {
         let mut had_hit = false;
         let mut cached_inner_beta: Option<Array1<f64>> = None;
         if let Some(loaded) = session.try_load_with_source() {
-            match classify_cache_entry_for_outer(&loaded, self.n_params, config.rho_bound) {
+            match classify_cache_entry_for_outer(&loaded, self.n_params) {
                 CacheSeedDecision::ExactFinal {
                     rho,
                     beta: _beta_final,
@@ -5065,8 +5067,7 @@ fn run_outer_with_plan(
     let mut projected_seeds = Vec::with_capacity(seeds.len());
     for seed in seeds {
         let projected = project_to_bounds(&seed, Some(&bounds_template));
-        if !projected_seeds.contains(&projected)
-        {
+        if !projected_seeds.contains(&projected) {
             projected_seeds.push(projected);
         }
     }
@@ -8778,7 +8779,7 @@ mod tests {
         };
         let CacheSeedDecision::Seed {
             beta: decoded_beta, ..
-        } = classify_cache_entry_for_outer(&loaded, 2, 10.0)
+        } = classify_cache_entry_for_outer(&loaded, 2)
         else {
             panic!("expected Seed decision");
         };
@@ -8798,7 +8799,7 @@ mod tests {
         };
         let CacheSeedDecision::Seed {
             beta: decoded_beta, ..
-        } = classify_cache_entry_for_outer(&loaded, 2, 10.0)
+        } = classify_cache_entry_for_outer(&loaded, 2)
         else {
             panic!("expected Seed decision");
         };
@@ -8970,9 +8971,8 @@ mod tests {
                 source: crate::cache::LoadSource::Preloaded,
             };
 
-            assert!(cache_entry_would_help_outer(&loaded, 2, 10.0));
-            let CacheSeedDecision::Seed { rho, .. } =
-                classify_cache_entry_for_outer(&loaded, 2, 10.0)
+            assert!(cache_entry_would_help_outer(&loaded, 2));
+            let CacheSeedDecision::Seed { rho, .. } = classify_cache_entry_for_outer(&loaded, 2)
             else {
                 panic!(
                     "finite seed {:?} must be honored unchanged; the read-side clamp / \
@@ -9008,7 +9008,7 @@ mod tests {
             source: crate::cache::LoadSource::Preloaded,
         };
         assert!(matches!(
-            classify_cache_entry_for_outer(&loaded, 2, 10.0),
+            classify_cache_entry_for_outer(&loaded, 2),
             CacheSeedDecision::Discard {
                 reason: "non-finite-payload",
                 ..
@@ -9029,7 +9029,7 @@ mod tests {
             source: crate::cache::LoadSource::Preloaded,
         };
         assert!(matches!(
-            classify_cache_entry_for_outer(&loaded, 3, 10.0),
+            classify_cache_entry_for_outer(&loaded, 3),
             CacheSeedDecision::Discard {
                 reason: "payload-shape-mismatch",
                 ..
@@ -9051,9 +9051,9 @@ mod tests {
             source: crate::cache::LoadSource::Exact,
         };
 
-        assert!(cache_entry_would_help_outer(&loaded, 2, 10.0));
+        assert!(cache_entry_would_help_outer(&loaded, 2));
         assert!(matches!(
-            classify_cache_entry_for_outer(&loaded, 2, 10.0),
+            classify_cache_entry_for_outer(&loaded, 2),
             CacheSeedDecision::ExactFinal { iterations: 3, .. }
         ));
     }

@@ -153,8 +153,7 @@ pub enum LatentIdMode {
 /// unit sphere in `R^dim`, with retraction `(t + ξ) / ||t + ξ||`. `Product`
 /// composes these blockwise; inside a product, `Euclidean` denotes one
 /// unconstrained scalar axis.
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum LatentManifold {
     /// Unconstrained `R^d` — the current default.
     #[default]
@@ -177,7 +176,6 @@ pub enum LatentManifold {
         weights: Vec<f64>,
     },
 }
-
 
 impl LatentManifold {
     pub fn is_euclidean(&self) -> bool {
@@ -462,12 +460,7 @@ impl LatentManifold {
             xi.fill(0.0);
             xi[a] = 1.0;
             let tangent_xi = self.project_to_tangent(t, xi.view());
-            let col = self.euclidean_to_riemannian_hessian(
-                t,
-                eg,
-                eh,
-                tangent_xi.view(),
-            );
+            let col = self.euclidean_to_riemannian_hessian(t, eg, eh, tangent_xi.view());
             for b in 0..d {
                 out[[b, a]] = col[b];
             }

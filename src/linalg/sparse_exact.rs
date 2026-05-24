@@ -745,103 +745,103 @@ pub fn assemble_and_factor_sparse_penalized_system(
 mod tests_blocks {
     use super::*;
 
-pub(super) fn build_sparse_penalty_blocks(
-    s_list: &[Array2<f64>],
-) -> Result<Option<Vec<SparsePenaltyBlock>>, EstimationError> {
-    use crate::faer_ndarray::FaerEigh;
-    let mut ranges = Vec::with_capacity(s_list.len());
-    for (term_index, s_k) in s_list.iter().enumerate() {
-        let mut min_idx = usize::MAX;
-        let mut max_idx = 0usize;
-        for row in 0..s_k.nrows() {
-            for col in 0..s_k.ncols() {
-                if s_k[[row, col]].abs() > ZERO_TOL {
-                    min_idx = min_idx.min(row.min(col));
-                    max_idx = max_idx.max(row.max(col));
-                }
-            }
-        }
-        if min_idx == usize::MAX {
-            ranges.push((term_index, 0usize, 0usize));
-        } else {
-            ranges.push((term_index, min_idx, max_idx + 1));
-        }
-    }
-    let mut sorted = ranges.clone();
-    sorted.sort_by_key(|(_, start, _)| *start);
-    for pair in sorted.windows(2) {
-        let (_, _, end_left) = pair[0];
-        let (_, start_right, _) = pair[1];
-        if end_left > start_right {
-            return Ok(None);
-        }
-    }
-
-    let mut blocks = Vec::with_capacity(s_list.len());
-    for (term_index, p_start, p_end) in ranges {
-        let s_k = &s_list[term_index];
-        let block_support_strict = if p_end > p_start {
-            let mut ok = true;
+    pub(super) fn build_sparse_penalty_blocks(
+        s_list: &[Array2<f64>],
+    ) -> Result<Option<Vec<SparsePenaltyBlock>>, EstimationError> {
+        use crate::faer_ndarray::FaerEigh;
+        let mut ranges = Vec::with_capacity(s_list.len());
+        for (term_index, s_k) in s_list.iter().enumerate() {
+            let mut min_idx = usize::MAX;
+            let mut max_idx = 0usize;
             for row in 0..s_k.nrows() {
                 for col in 0..s_k.ncols() {
-                    if s_k[[row, col]].abs() > ZERO_TOL
-                        && (row < p_start || row >= p_end || col < p_start || col >= p_end)
-                    {
-                        ok = false;
+                    if s_k[[row, col]].abs() > ZERO_TOL {
+                        min_idx = min_idx.min(row.min(col));
+                        max_idx = max_idx.max(row.max(col));
+                    }
+                }
+            }
+            if min_idx == usize::MAX {
+                ranges.push((term_index, 0usize, 0usize));
+            } else {
+                ranges.push((term_index, min_idx, max_idx + 1));
+            }
+        }
+        let mut sorted = ranges.clone();
+        sorted.sort_by_key(|(_, start, _)| *start);
+        for pair in sorted.windows(2) {
+            let (_, _, end_left) = pair[0];
+            let (_, start_right, _) = pair[1];
+            if end_left > start_right {
+                return Ok(None);
+            }
+        }
+
+        let mut blocks = Vec::with_capacity(s_list.len());
+        for (term_index, p_start, p_end) in ranges {
+            let s_k = &s_list[term_index];
+            let block_support_strict = if p_end > p_start {
+                let mut ok = true;
+                for row in 0..s_k.nrows() {
+                    for col in 0..s_k.ncols() {
+                        if s_k[[row, col]].abs() > ZERO_TOL
+                            && (row < p_start || row >= p_end || col < p_start || col >= p_end)
+                        {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
                         break;
                     }
                 }
-                if !ok {
-                    break;
+                ok
+            } else {
+                true
+            };
+            let s_k_block_dense = if p_end > p_start {
+                s_k.slice(ndarray::s![p_start..p_end, p_start..p_end])
+                    .to_owned()
+            } else {
+                Array2::<f64>::zeros((0, 0))
+            };
+            let mut s_k_block_upper_entries = Vec::<(usize, usize, f64)>::new();
+            for col in 0..s_k_block_dense.ncols() {
+                for row in 0..=col {
+                    let value = s_k_block_dense[[row, col]];
+                    if value.abs() > ZERO_TOL {
+                        s_k_block_upper_entries.push((row, col, value));
+                    }
                 }
             }
-            ok
-        } else {
-            true
-        };
-        let s_k_block_dense = if p_end > p_start {
-            s_k.slice(ndarray::s![p_start..p_end, p_start..p_end])
-                .to_owned()
-        } else {
-            Array2::<f64>::zeros((0, 0))
-        };
-        let mut s_k_block_upper_entries = Vec::<(usize, usize, f64)>::new();
-        for col in 0..s_k_block_dense.ncols() {
-            for row in 0..=col {
-                let value = s_k_block_dense[[row, col]];
-                if value.abs() > ZERO_TOL {
-                    s_k_block_upper_entries.push((row, col, value));
-                }
-            }
+            let s_k_sparse = dense_to_sparse(s_k, ZERO_TOL)?;
+            let block_dense = if p_end > p_start {
+                s_k.slice(ndarray::s![p_start..p_end, p_start..p_end])
+                    .to_owned()
+            } else {
+                Array2::<f64>::zeros((0, 0))
+            };
+            let positive_eigenvalues = if block_dense.nrows() == 0 {
+                Vec::new()
+            } else {
+                let (evals, _) = block_dense
+                    .eigh(Side::Lower)
+                    .map_err(EstimationError::EigendecompositionFailed)?;
+                evals.iter().copied().filter(|v| *v > ZERO_TOL).collect()
+            };
+            blocks.push(SparsePenaltyBlock {
+                term_index,
+                p_start,
+                p_end,
+                positive_eigenvalues: Arc::new(positive_eigenvalues),
+                block_support_strict,
+                s_k_sparse,
+                s_k_block_dense: Arc::new(s_k_block_dense),
+                s_k_block_upper_entries: Arc::new(s_k_block_upper_entries),
+            });
         }
-        let s_k_sparse = dense_to_sparse(s_k, ZERO_TOL)?;
-        let block_dense = if p_end > p_start {
-            s_k.slice(ndarray::s![p_start..p_end, p_start..p_end])
-                .to_owned()
-        } else {
-            Array2::<f64>::zeros((0, 0))
-        };
-        let positive_eigenvalues = if block_dense.nrows() == 0 {
-            Vec::new()
-        } else {
-            let (evals, _) = block_dense
-                .eigh(Side::Lower)
-                .map_err(EstimationError::EigendecompositionFailed)?;
-            evals.iter().copied().filter(|v| *v > ZERO_TOL).collect()
-        };
-        blocks.push(SparsePenaltyBlock {
-            term_index,
-            p_start,
-            p_end,
-            positive_eigenvalues: Arc::new(positive_eigenvalues),
-            block_support_strict,
-            s_k_sparse,
-            s_k_block_dense: Arc::new(s_k_block_dense),
-            s_k_block_upper_entries: Arc::new(s_k_block_upper_entries),
-        });
+        Ok(Some(blocks))
     }
-    Ok(Some(blocks))
-}
 }
 
 /// Build sparse penalty blocks from canonical penalties, avoiding redundant

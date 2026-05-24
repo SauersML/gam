@@ -1238,13 +1238,14 @@ pub fn create_difference_penalty_matrix(
     }
 
     if let Some(g) = greville_abscissae
-        && g.len() != num_basis_functions {
-            return Err(BasisError::DimensionMismatch(format!(
-                "Greville abscissae length {} does not match num_basis_functions {}",
-                g.len(),
-                num_basis_functions
-            )));
-        }
+        && g.len() != num_basis_functions
+    {
+        return Err(BasisError::DimensionMismatch(format!(
+            "Greville abscissae length {} does not match num_basis_functions {}",
+            g.len(),
+            num_basis_functions
+        )));
+    }
 
     // Start with the identity matrix
     let mut d = Array2::<f64>::eye(num_basis_functions);
@@ -1588,8 +1589,7 @@ struct DuchonBasisDesign {
 }
 
 /// Boundary-condition policy for one-dimensional smooth bases.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub enum OneDimensionalBoundary {
     /// Ordinary open interval basis with clamped endpoint behavior.
     #[default]
@@ -1600,7 +1600,6 @@ pub enum OneDimensionalBoundary {
     /// first `degree - 1` derivatives agree at the two endpoints for B-splines.
     Cyclic { start: f64, end: f64 },
 }
-
 
 impl OneDimensionalBoundary {
     fn period(&self) -> Option<(f64, f64, f64)> {
@@ -1663,8 +1662,7 @@ pub struct BSplineBasisSpec {
 }
 
 /// Per-endpoint boundary constraint policy for B-spline 1D bases.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 pub enum BSplineEndpointBoundaryCondition {
     /// No endpoint constraint.
     #[default]
@@ -1675,7 +1673,6 @@ pub enum BSplineEndpointBoundaryCondition {
     /// is accepted in the builder; non-zero anchors require an affine offset).
     Anchored { value: f64 },
 }
-
 
 /// Left/right pair of B-spline endpoint constraints.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
@@ -3425,13 +3422,14 @@ impl StreamingMaternEvaluator {
             None => vec![1.0; data.ncols()],
         };
         if let Some(z) = ident_transform.as_ref()
-            && z.nrows() != centers.nrows() {
-                return Err(format!(
-                    "StreamingMaternEvaluator: identifiability transform rows {} != centers {}",
-                    z.nrows(),
-                    centers.nrows()
-                ));
-            }
+            && z.nrows() != centers.nrows()
+        {
+            return Err(format!(
+                "StreamingMaternEvaluator: identifiability transform rows {} != centers {}",
+                z.nrows(),
+                centers.nrows()
+            ));
+        }
         let kernel_cols = ident_transform
             .as_ref()
             .map_or(centers.nrows(), |z| z.ncols());
@@ -3654,13 +3652,14 @@ impl StreamingSphereEvaluator {
             ));
         }
         if let Some(z) = constraint_transform.as_ref()
-            && z.nrows() != centers.nrows() {
-                return Err(format!(
-                    "StreamingSphereEvaluator: constraint transform rows {} != centers {}",
-                    z.nrows(),
-                    centers.nrows()
-                ));
-            }
+            && z.nrows() != centers.nrows()
+        {
+            return Err(format!(
+                "StreamingSphereEvaluator: constraint transform rows {} != centers {}",
+                z.nrows(),
+                centers.nrows()
+            ));
+        }
         let deg = if radians {
             1.0
         } else {
@@ -3925,13 +3924,14 @@ impl StreamingBSplineEvaluator {
     ) -> Result<Self, String> {
         let raw_cols = bspline_raw_column_count(knots.as_ref(), degree, periodic)?;
         if let Some(z) = transform.as_ref()
-            && z.nrows() != raw_cols {
-                return Err(format!(
-                    "StreamingBSplineEvaluator: transform rows {} != raw basis columns {}",
-                    z.nrows(),
-                    raw_cols
-                ));
-            }
+            && z.nrows() != raw_cols
+        {
+            return Err(format!(
+                "StreamingBSplineEvaluator: transform rows {} != raw basis columns {}",
+                z.nrows(),
+                raw_cols
+            ));
+        }
         Ok(Self {
             data: Arc::new(data.as_standard_layout().to_owned()),
             knots: Arc::new(knots.as_standard_layout().to_owned()),
@@ -4622,13 +4622,14 @@ impl LatentCoordDesignDerivative {
             )));
         }
         if let Some(z) = ident_transform.as_ref()
-            && z.nrows() != jet.shape()[1] {
-                return Err(BasisError::DimensionMismatch(format!(
-                    "LatentCoordDesignDerivative identifiability transform has {} rows but derivative jet has {} basis columns",
-                    z.nrows(),
-                    jet.shape()[1]
-                )));
-            }
+            && z.nrows() != jet.shape()[1]
+        {
+            return Err(BasisError::DimensionMismatch(format!(
+                "LatentCoordDesignDerivative identifiability transform has {} rows but derivative jet has {} basis columns",
+                z.nrows(),
+                jet.shape()[1]
+            )));
+        }
         Ok(Self {
             latent,
             basis: LatentCoordDesignDerivativeBasis::Jet {
@@ -7606,9 +7607,10 @@ pub fn build_bspline_basis_1d(
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
     if let OneDimensionalBoundary::Cyclic { start, end } = spec.boundary
-        && end <= start {
-            return Err(BasisError::InvalidRange(start, end));
-        }
+        && end <= start
+    {
+        return Err(BasisError::InvalidRange(start, end));
+    }
 
     let periodic_build = match &spec.knotspec {
         BSplineKnotSpec::PeriodicUniform {
@@ -10184,8 +10186,8 @@ impl MaternCrossPenaltyContext {
                         let w_c = metric_weights[c];
                         let row = (k * d + b) * d + c;
                         d2_cross_raw[[row, j]] = hessian_operator_eta_cross_entry(
-                            0.0, t, dt_dr, d2t_dr2, r, s_a, s_b, h_b, h_c, w_b, w_c, axis_a,
-                            axis_b, b, c,
+                            t, dt_dr, d2t_dr2, r, s_a, s_b, h_b, h_c, w_b, w_c, axis_a, axis_b, b,
+                            c,
                         );
                     }
                 }
@@ -10788,8 +10790,8 @@ impl DuchonCrossPenaltyContext {
                             let w_c = metric_weights[c];
                             let row = (k * d + b) * d + c;
                             d2_raw_eta_cross[[row, col]] += hessian_operator_eta_cross_entry(
-                                0.0, t, dt_dr, d2t_dr2, r, s_a, s_b, h_b, h_c, w_b, w_c, axis_a,
-                                axis_b, b, c,
+                                t, dt_dr, d2t_dr2, r, s_a, s_b, h_b, h_c, w_b, w_c, axis_a, axis_b,
+                                b, c,
                             ) * z_jc;
                         }
                     }
@@ -10797,8 +10799,7 @@ impl DuchonCrossPenaltyContext {
             }
         }
 
-        let value_share =
-            duchon_scaling_exponent(self.p_order, self.s_order, d) / d as f64;
+        let value_share = duchon_scaling_exponent(self.p_order, self.s_order, d) / d as f64;
         let operator_share =
             duchon_operator_scaling_exponent(self.p_order, self.s_order, d) / d as f64;
 
@@ -10936,9 +10937,8 @@ fn build_duchon_operator_penalty_aniso_derivatives(
         d,
         duchon_max_active_operator_derivative_order(operator_penalties),
     )?;
-    let coeffs = length_scale.map(|scale| {
-        duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300))
-    });
+    let coeffs = length_scale
+        .map(|scale| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / scale.max(1e-300)));
     let pure_block_order = pure_duchon_block_order(p_order, s_order as f64) as usize;
 
     let z_kernel = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
@@ -12534,7 +12534,8 @@ fn duchon_pure_closed_form_pair_block_cpd_adequate(
     }
     const LOG_EPS: f64 = 1e-12;
     let n_f = (beta / 2.0).round();
-    let is_log_case = dimension.is_multiple_of(2) && n_f >= 0.0 && (n_f * 2.0 - beta).abs() < LOG_EPS;
+    let is_log_case =
+        dimension.is_multiple_of(2) && n_f >= 0.0 && (n_f * 2.0 - beta).abs() < LOG_EPS;
     let cpd_required = if is_log_case {
         // Log case: kernel `c · r^{2n}(ln r + A_n)` is CPD of order n + 1
         // (Wendland Thm 8.18).
@@ -13505,12 +13506,13 @@ pub fn build_duchon_collocation_operator_matriceswithworkspace(
         max_operator_derivative_order,
     )?;
     if let Some(eta) = aniso_log_scales
-        && eta.len() != dim {
-            return Err(BasisError::DimensionMismatch(format!(
-                "Duchon anisotropy dimension mismatch: got {}, expected {dim}",
-                eta.len()
-            )));
-        }
+        && eta.len() != dim
+    {
+        return Err(BasisError::DimensionMismatch(format!(
+            "Duchon anisotropy dimension mismatch: got {}, expected {dim}",
+            eta.len()
+        )));
+    }
     // Partial-fraction expansion only runs in the hybrid Matérn branch
     // (`length_scale = Some`). The scale-free path (`length_scale = None`)
     // skips it entirely and is fractional-clean down to the Riesz kernel.
@@ -14488,7 +14490,11 @@ pub(crate) fn duchon_partial_fraction_coeffs(
         return DuchonPartialFractionCoeffs { a, b };
     }
     for m in 1..=p_order {
-        let sign = if (p_order - m).is_multiple_of(2) { 1.0 } else { -1.0 };
+        let sign = if (p_order - m).is_multiple_of(2) {
+            1.0
+        } else {
+            -1.0
+        };
         let expo = -2.0 * (s_order + p_order - m) as f64;
         let comb = binomial_f64(s_order + p_order - m - 1, p_order - m);
         a[m] = sign * kappa.powf(expo) * comb;
@@ -15476,9 +15482,6 @@ pub fn create_matern_spline_basiswithworkspace(
             );
         }
     }
-
-    let poly_cols = if include_intercept { 1 } else { 0 };
-    let total_cols = k + poly_cols;
 
     // Distance computation: anisotropic when eta is present, isotropic otherwise.
     // Under anisotropy we work in y-space (y = Ax), so r = |Ah| replaces |h|.
@@ -17698,7 +17701,7 @@ fn prepare_duchon_derivative_contextwithworkspace(
 ) -> Result<(Array2<f64>, Option<Array2<f64>>), BasisError> {
     let original_centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let centers = expand_periodic_centers(&original_centers, spec.periodic.as_deref())?;
-    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view())?;
+    assert_spatial_centers_below_biobank_cap(data.ncols(), centers.view())?;
     let raw_design = build_duchon_basis_designwithworkspace(
         data,
         centers.view(),
@@ -17818,14 +17821,13 @@ fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
         )
     })?;
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view())?;
+    assert_spatial_centers_below_biobank_cap(data.ncols(), centers.view())?;
     let (centers, left, period) = prepare_periodic_duchon_centers_1d(centers)?;
     let effective_nullspace_order = DuchonNullspaceOrder::Zero;
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power_as_usize();
     validate_duchon_kernel_orders(Some(length_scale), p_order, s_order as f64, 1)?;
-    let coeffs =
-        duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale.max(1e-300));
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale.max(1e-300));
     let z_kernel = kernel_constraint_nullspace(
         centers.view(),
         effective_nullspace_order,
@@ -20136,11 +20138,8 @@ pub fn create_duchon_spline_basiswithworkspace(
     let s_order = duchon_power_to_usize(power);
     let d = centers.ncols();
     let k = centers.nrows();
-    let coeffs = length_scale.map(|ls| duchon_partial_fraction_coeffs(
-            p_order,
-            s_order,
-            1.0 / ls.max(1e-300),
-        ));
+    let coeffs = length_scale
+        .map(|ls| duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls.max(1e-300)));
     let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
     let pure_poly_coeff = if length_scale.is_none() {
         Some(PolyharmonicBlockCoeff::new(
@@ -20306,11 +20305,13 @@ fn build_duchon_basis_designwithworkspace(
     // and yields free-parameter penalty gamma^T (Z^T K_CC Z) gamma.
     let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
 
-    let coeffs = length_scale.map(|ls| duchon_partial_fraction_coeffs(
+    let coeffs = length_scale.map(|ls| {
+        duchon_partial_fraction_coeffs(
             p_order,
             duchon_power_to_usize(s_order),
             1.0 / ls.max(1e-300),
-        ));
+        )
+    });
 
     // Practical safe operating range (document Eq. D.2):
     //   κ in [1e-2 / r_max, 1e2 / r_min]
@@ -22032,7 +22033,7 @@ pub fn build_duchon_basis_mixed_periodicity_auto(
 ) -> Result<BasisBuildResult, BasisError> {
     let mut workspace = BasisWorkspace::default();
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view())?;
+    assert_spatial_centers_below_biobank_cap(data.ncols(), centers.view())?;
     let d = data.ncols();
     if periodic_per_axis.len() != d {
         return Err(BasisError::InvalidInput(format!(
@@ -22087,7 +22088,7 @@ pub fn build_duchon_basiswithworkspace(
         return build_cyclic_duchon_basis_1dwithworkspace(data, spec, start, end);
     }
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view())?;
+    assert_spatial_centers_below_biobank_cap(data.ncols(), centers.view())?;
     if spec.periodic.is_some() {
         return build_periodic_duchon_basis_1d(data, spec, centers, workspace);
     }
@@ -25690,7 +25691,7 @@ pub mod closed_form_penalty {
             "stable_hybrid_duchon_radial requires max_order <= 6: max_order={max_order}"
         );
         debug_assert!(
-            schwinger_radial_is_convergent(d, m, s),
+            schwinger_radial_is_convergent(d, m),
             "stable_hybrid_duchon_radial: requires d > 4m"
         );
 
@@ -26263,7 +26264,7 @@ pub mod closed_form_penalty {
         );
         assert!(!r.is_empty(), "anisotropic_duchon_penalty: empty input");
         assert!(q <= 2, "anisotropic_duchon_penalty: q must be in {{0,1,2}}");
-        anisotropic_duchon_penalty_radial(q, m, s , kappa, eta, r)
+        anisotropic_duchon_penalty_radial(q, m, s, kappa, eta, r)
     }
 
     /// Bundled value + first/second derivatives of the anisotropic pair-block
@@ -26787,10 +26788,12 @@ pub mod closed_form_penalty {
         let mut out: Vec<(f64, f64, i32)> = Vec::with_capacity(terms.len());
         for (c, a, b) in terms {
             if let Some(last) = out.last_mut()
-                && last.2 == b && (last.1 - a).abs() < 1e-15 {
-                    last.0 += c;
-                    continue;
-                }
+                && last.2 == b
+                && (last.1 - a).abs() < 1e-15
+            {
+                last.0 += c;
+                continue;
+            }
             out.push((c, a, b));
         }
         out
@@ -26968,7 +26971,7 @@ pub mod closed_form_penalty {
                 d, a, b, kappa, r, max_order, 0,
             );
         }
-        if schwinger_radial_is_convergent(d, m, s) {
+        if schwinger_radial_is_convergent(d, m) {
             return stable_hybrid_duchon_radial(d, m, s, kappa, r, max_order);
         }
 
@@ -27175,15 +27178,9 @@ pub mod closed_form_penalty {
 
         if let Some(common_eta) = uniform_eta_value(eta) {
             let euclidean_r2 = squared_norm(r);
-            if let Some(value) = uniform_metric_radial_duchon_penalty(
-                q,
-                m,
-                s ,
-                kappa,
-                d,
-                common_eta,
-                euclidean_r2,
-            ) {
+            if let Some(value) =
+                uniform_metric_radial_duchon_penalty(q, m, s, kappa, d, common_eta, euclidean_r2)
+            {
                 return value;
             }
         }
@@ -27239,7 +27236,7 @@ pub mod closed_form_penalty {
 
         let big_r = (b * euclidean_r2).sqrt();
         let max_order = if q == 0 { 0 } else { 2 * q };
-        let fr = radial_derivatives_of_isotropic_duchon(d, m, s , kappa, big_r, max_order);
+        let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
         let big_r2 = big_r * big_r;
         let s1 = (d as f64) * b;
         let s2 = (d as f64) * b * b;
@@ -32207,7 +32204,7 @@ mod tests {
             &d2,
             &DuchonOperatorPenaltySpec::default(),
             p_order,
-            s_order as f64 ,
+            s_order as f64,
             None,
             None,
             0,
@@ -34547,8 +34544,7 @@ mod tests {
         let ls_plus = 1.0 / (kappa * eps.exp());
         let ls_minus = 1.0 / (kappa * (-eps).exp());
         let coeffs_plus = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls_plus);
-        let coeffs_minus =
-            duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls_minus);
+        let coeffs_minus = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls_minus);
         let (phi_rr_plus, _, _) =
             duchonphi_rr_collision_psi_triplet(ls_plus, p_order, s_order, k_dim, &coeffs_plus)
                 .expect("plus collision phi_rr");
@@ -37812,7 +37808,7 @@ mod tests {
                 let eta = vec![0.0_f64; d];
                 let mut r = vec![0.0_f64; d];
                 r[0] = big_r;
-                let aniso = anisotropic_duchon_penalty(q, m, (s) as f64, kappa , &eta, &r);
+                let aniso = anisotropic_duchon_penalty(q, m, (s) as f64, kappa, &eta, &r);
                 let expected = isotropic_radial_laplacian_power_from_q0(q, d, m, s, kappa, big_r);
                 let rel = (aniso - expected).abs() / expected.abs().max(aniso.abs()).max(1e-300);
                 assert!(
@@ -37836,7 +37832,7 @@ mod tests {
             let eta = vec![0.0_f64; d];
             let mut r = vec![0.0_f64; d];
             r[0] = big_r;
-            let aniso = anisotropic_duchon_penalty(q, m, (s) as f64, kappa , &eta, &r);
+            let aniso = anisotropic_duchon_penalty(q, m, (s) as f64, kappa, &eta, &r);
             let expected = isotropic_radial_laplacian_power_from_q0(q, d, m, s, kappa, big_r);
             let rel = (aniso - expected).abs() / expected.abs().max(aniso.abs()).max(1e-300);
             assert!(
@@ -37907,7 +37903,7 @@ mod tests {
         let eta = vec![c, 0.0_f64, 0.0_f64];
         let r = vec![1.0_f64, 0.0_f64, 0.0_f64];
 
-        let aniso_bare = anisotropic_duchon_penalty(q, m, (s) as f64, kappa , &eta, &r);
+        let aniso_bare = anisotropic_duchon_penalty(q, m, (s) as f64, kappa, &eta, &r);
         let z_norm = (-c).exp();
         let iso_at_z = isotropic_duchon_penalty(q, d, m, s as f64, kappa, z_norm);
 
@@ -37979,8 +37975,7 @@ mod tests {
             for r in r_choices {
                 for eta in eta_choices {
                     let radial = anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa, eta, r);
-                    let wrapped =
-                        anisotropic_duchon_penalty(q, m, (s) as f64, kappa , eta, r);
+                    let wrapped = anisotropic_duchon_penalty(q, m, (s) as f64, kappa, eta, r);
                     let rel =
                         (radial - wrapped).abs() / wrapped.abs().max(radial.abs()).max(1e-300);
                     assert!(
