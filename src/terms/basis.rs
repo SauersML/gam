@@ -2781,6 +2781,8 @@ pub fn center_strategy_with_num_centers(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinPlateBasisSpec {
     pub center_strategy: CenterStrategy,
+    #[serde(default)]
+    pub periodic: Option<Vec<Option<f64>>>,
     pub length_scale: f64,
     pub double_penalty: bool,
     #[serde(default)]
@@ -2946,6 +2948,8 @@ impl Default for SphericalSplineBasisSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MaternBasisSpec {
     pub center_strategy: CenterStrategy,
+    #[serde(default)]
+    pub periodic: Option<Vec<Option<f64>>>,
     pub length_scale: f64,
     pub nu: MaternNu,
     #[serde(default)]
@@ -3006,6 +3010,8 @@ pub enum DuchonNullspaceOrder {
 #[serde(deny_unknown_fields)]
 pub struct DuchonBasisSpec {
     pub center_strategy: CenterStrategy,
+    #[serde(default)]
+    pub periodic: Option<Vec<Option<f64>>>,
     /// Optional hybrid Matérn width. `None` means pure scale-free Duchon with
     /// spectrum `||w||^(2p + 2s)`. `Some(length_scale)` enables the hybrid
     /// spectrum `||w||^(2p) * (kappa^2 + ||w||^2)^s`, `kappa = 1/length_scale`.
@@ -3221,6 +3227,7 @@ pub enum BasisMetadata {
     ThinPlate {
         centers: Array2<f64>,
         length_scale: f64,
+        periodic: Option<Vec<Option<f64>>>,
         identifiability_transform: Option<Array2<f64>>,
         /// Per-column standard deviations used for input standardization (d > 1).
         input_scales: Option<Vec<f64>>,
@@ -3239,6 +3246,7 @@ pub enum BasisMetadata {
     Matern {
         centers: Array2<f64>,
         length_scale: f64,
+        periodic: Option<Vec<Option<f64>>>,
         nu: MaternNu,
         include_intercept: bool,
         identifiability_transform: Option<Array2<f64>>,
@@ -3251,11 +3259,8 @@ pub enum BasisMetadata {
     Duchon {
         centers: Array2<f64>,
         length_scale: Option<f64>,
-        /// Real-valued spectral power `s`. Stored as `f64` so the metadata
-        /// preserves the fractional values now accepted at the spec layer
-        /// and consumed end-to-end on the scale-free (`length_scale=None`)
-        /// closed-form chain.
-        power: f64,
+        periodic: Option<Vec<Option<f64>>>,
+        power: usize,
         nullspace_order: DuchonNullspaceOrder,
         identifiability_transform: Option<Array2<f64>>,
         /// Per-column standard deviations used for input standardization (d > 1).
@@ -3274,7 +3279,7 @@ pub enum BasisMetadata {
         feature_cols: Vec<usize>,
         knots: Vec<Array1<f64>>,
         degrees: Vec<usize>,
-        periodic: Vec<Option<(f64, f64, usize)>>,
+        periods: Vec<Option<f64>>,
         identifiability_transform: Option<Array2<f64>>,
     },
 }
@@ -8538,6 +8543,60 @@ fn finite_data_range(data: ArrayView1<'_, f64>) -> Result<(f64, f64), BasisError
     Ok((minv, maxv))
 }
 
+pub(crate) fn expand_periodic_centers(
+    centers: &Array2<f64>,
+    periodic: Option<&[Option<f64>]>,
+) -> Result<Array2<f64>, BasisError> {
+    let Some(periodic) = periodic else {
+        return Ok(centers.clone());
+    };
+    if periodic.len() != centers.ncols() {
+        return Err(BasisError::DimensionMismatch(format!(
+            "period vector length {} does not match smooth dimension {}",
+            periodic.len(),
+            centers.ncols()
+        )));
+    }
+    let active: Vec<(usize, f64)> = periodic
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| p.map(|v| (i, v)))
+        .collect();
+    if active.is_empty() {
+        return Ok(centers.clone());
+    }
+    for (axis, period) in &active {
+        if !period.is_finite() || *period <= 0.0 {
+            return Err(BasisError::InvalidInput(format!(
+                "period for axis {axis} must be finite and positive, got {period}"
+            )));
+        }
+    }
+    let shifts = 3usize.pow(active.len() as u32);
+    let mut out = Array2::<f64>::zeros((centers.nrows() * shifts, centers.ncols()));
+    let mut row_out = 0usize;
+    for code in 0..shifts {
+        let mut tmp = code;
+        let mut offsets = vec![0.0; centers.ncols()];
+        for &(axis, period) in &active {
+            let digit = tmp % 3;
+            tmp /= 3;
+            offsets[axis] = match digit {
+                0 => -period,
+                1 => 0.0,
+                _ => period,
+            };
+        }
+        for r in 0..centers.nrows() {
+            for c in 0..centers.ncols() {
+                out[[row_out, c]] = centers[[r, c]] + offsets[c];
+            }
+            row_out += 1;
+        }
+    }
+    Ok(out)
+}
+
 /// Generic thin-plate builder returning design + penalty list.
 pub fn build_thin_plate_basis(
     data: ArrayView2<'_, f64>,
@@ -8552,7 +8611,8 @@ pub fn build_thin_plate_basiswithworkspace(
     spec: &ThinPlateBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let original_centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let centers = expand_periodic_centers(&original_centers, spec.periodic.as_deref())?;
     // Canonical TPS in dimension d uses penalty order m = ⌊d/2⌋+1 and a
     // polynomial nullspace of size M(d) = C(d+m-1, d). For d=16 this is
     // 735_471, well above any practical knot count. When the requested
@@ -8572,7 +8632,8 @@ pub fn build_thin_plate_basiswithworkspace(
     {
         let d = data.ncols();
         let duchon_spec = DuchonBasisSpec {
-            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            center_strategy: CenterStrategy::UserProvided(original_centers.clone()),
+            periodic: spec.periodic.clone(),
             length_scale: Some(spec.length_scale),
             power: s as f64,
             nullspace_order,
@@ -8745,8 +8806,9 @@ pub fn build_thin_plate_basiswithworkspace(
         penaltyinfo,
         ops,
         metadata: BasisMetadata::ThinPlate {
-            centers,
+            centers: original_centers,
             length_scale: spec.length_scale,
+            periodic: spec.periodic.clone(),
             identifiability_transform,
             input_scales: None,
             radial_reparam: radial_reparam_meta,
@@ -15894,7 +15956,8 @@ pub fn build_matern_basiswithworkspace(
     spec: &MaternBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let original_centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let centers = expand_periodic_centers(&original_centers, spec.periodic.as_deref())?;
     // Initialize anisotropy contrasts from knot cloud geometry when the caller
     // enabled scale-dimensions but left η at the zero default.
     let aniso = maybe_initialize_aniso_contrasts(centers.view(), spec.aniso_log_scales.as_deref());
@@ -16036,8 +16099,9 @@ pub fn build_matern_basiswithworkspace(
         nullspace_dims,
         penaltyinfo,
         metadata: BasisMetadata::Matern {
-            centers,
+            centers: original_centers,
             length_scale: spec.length_scale,
+            periodic: spec.periodic.clone(),
             nu: spec.nu,
             include_intercept: spec.include_intercept,
             identifiability_transform,
@@ -17022,7 +17086,8 @@ fn prepare_duchon_derivative_contextwithworkspace(
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<(Array2<f64>, Option<Array2<f64>>), BasisError> {
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let original_centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let centers = expand_periodic_centers(&original_centers, spec.periodic.as_deref())?;
     assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view());
     let raw_design = build_duchon_basis_designwithworkspace(
         data,
@@ -21300,7 +21365,8 @@ pub fn build_duchon_basiswithworkspace(
     spec: &DuchonBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let original_centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let centers = expand_periodic_centers(&original_centers, spec.periodic.as_deref())?;
     assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view());
     if spec.periodic {
         return build_periodic_duchon_basis_1d(data, spec, centers, workspace);
@@ -21583,8 +21649,9 @@ pub fn build_duchon_basiswithworkspace(
         penaltyinfo,
         ops,
         metadata: BasisMetadata::Duchon {
-            centers,
+            centers: original_centers,
             length_scale: spec.length_scale,
+            periodic: spec.periodic.clone(),
             power: spec.power,
             nullspace_order: effective_nullspace_order,
             identifiability_transform,
@@ -28357,6 +28424,7 @@ mod tests {
             [0.5, 0.0]
         ];
         let spec = ThinPlateBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
             length_scale: 1.0,
             double_penalty: true,
@@ -28389,6 +28457,7 @@ mod tests {
             [0.5, 0.0]
         ];
         let spec = ThinPlateBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
             length_scale: 1.0,
             double_penalty: false,
@@ -28419,6 +28488,7 @@ mod tests {
             centers[[j, 0]] = j as f64 / (k - 1) as f64;
         }
         let spec = ThinPlateBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: 1.0,
             double_penalty: false,
@@ -28445,6 +28515,7 @@ mod tests {
             [0.2, 0.35]
         ];
         let spec = ThinPlateBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
             length_scale: 1.0,
             double_penalty: false,
@@ -28480,6 +28551,7 @@ mod tests {
         let data = array![[-1.5], [-0.7], [0.2], [0.8], [1.6]];
         let centers = array![[-1.5], [0.2], [1.6]];
         let spec = ThinPlateBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: 1.0,
             double_penalty: false,
@@ -28516,6 +28588,7 @@ mod tests {
         ];
         let specs = vec![
             ThinPlateBasisSpec {
+                periodic: None,
                 center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
                 length_scale: 1.0,
                 double_penalty: false,
@@ -28523,6 +28596,7 @@ mod tests {
                 radial_reparam: None,
             },
             ThinPlateBasisSpec {
+                periodic: None,
                 center_strategy: CenterStrategy::KMeans {
                     num_centers: 4,
                     max_iter: 5,
@@ -28533,6 +28607,7 @@ mod tests {
                 radial_reparam: None,
             },
             ThinPlateBasisSpec {
+                periodic: None,
                 center_strategy: CenterStrategy::UniformGrid { points_per_dim: 2 },
                 length_scale: 1.0,
                 double_penalty: false,
@@ -28540,6 +28615,7 @@ mod tests {
                 radial_reparam: None,
             },
             ThinPlateBasisSpec {
+                periodic: None,
                 center_strategy: CenterStrategy::UserProvided(array![
                     [0.0, 0.0],
                     [1.0, 0.0],
@@ -30658,6 +30734,7 @@ mod tests {
     fn test_build_duchon_basisfreezes_default_spatial_identifiability() {
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
             length_scale: Some(1.0),
             power: 2.0,
@@ -30703,6 +30780,7 @@ mod tests {
             [0.25, 0.75]
         ];
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
             length_scale: Some(1.0),
             power: 2.0,
@@ -30757,6 +30835,7 @@ mod tests {
             [1.0, 1.0, 1.0]
         ];
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
             length_scale: None,
             power: 1.0,
@@ -31722,6 +31801,7 @@ mod tests {
     fn test_build_duchon_basis_linear_nullspace_uses_operator_penalty_triplet() {
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
             length_scale: Some(1.0),
             power: 2.0,
@@ -31764,6 +31844,7 @@ mod tests {
             [0.5, 0.0],
         ];
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
             length_scale: Some(1.0),
             power: 2.0,
@@ -31788,6 +31869,7 @@ mod tests {
         // three penalties stay active and PSD.
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
             length_scale: Some(1.0),
             power: 2.0,
@@ -32200,6 +32282,7 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         let spec = MaternBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             length_scale: 0.7,
             nu: MaternNu::FiveHalves,
@@ -32233,6 +32316,7 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.4, 0.7]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         let spec = MaternBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             length_scale: 1.1,
             nu: MaternNu::ThreeHalves,
@@ -32253,6 +32337,7 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.4, 0.7]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         let spec = MaternBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: 1.1,
             nu: MaternNu::ThreeHalves,
@@ -32274,6 +32359,7 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.4, 0.7]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         let spec = MaternBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: 1.1,
             nu: MaternNu::ThreeHalves,
@@ -32299,6 +32385,7 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let spec = MaternBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: 0.9,
             nu: MaternNu::FiveHalves,
@@ -32368,6 +32455,7 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let spec = MaternBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: 0.9,
             nu: MaternNu::FiveHalves,
@@ -32415,6 +32503,7 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         let mut spec = ThinPlateBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: 0.9,
             double_penalty: true,
@@ -32477,6 +32566,7 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         let mut spec = ThinPlateBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: 0.9,
             double_penalty: true,
@@ -32734,6 +32824,7 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: Some(1.0),
             power: 2.0,
@@ -32778,6 +32869,7 @@ mod tests {
             data[[i, 0]] = i as f64 / (n as f64 - 1.0);
         }
         let mut spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
             length_scale: Some(1.0),
             power: 1.0,
@@ -32859,6 +32951,7 @@ mod tests {
             data[[i, 0]] = i as f64 / (n as f64 - 1.0);
         }
         let mut spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
             length_scale: Some(1.0),
             power: 1.0,
@@ -32922,6 +33015,7 @@ mod tests {
             data[[i, 0]] = i as f64 / (n as f64 - 1.0);
         }
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
             length_scale: Some(1.0),
             power: 1.0,
@@ -32968,6 +33062,7 @@ mod tests {
             data[[i, 0]] = i as f64 / (n as f64 - 1.0);
         }
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
             length_scale: Some(1.0),
             power: 1.0,
@@ -33046,6 +33141,7 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: Some(0.9),
             power: 2.0,
@@ -33179,6 +33275,7 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: Some(0.9),
             power: 2.0,
@@ -33925,6 +34022,7 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let spec = MaternBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: 0.9,
             nu: MaternNu::FiveHalves,
@@ -33985,6 +34083,7 @@ mod tests {
         ];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         let spec = MaternBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: 0.9,
             nu: MaternNu::FiveHalves,
@@ -34018,6 +34117,7 @@ mod tests {
         let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: Some(0.9),
             power: 2.0,
@@ -34079,6 +34179,7 @@ mod tests {
         ];
         let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: Some(0.9),
             power: 1.0,
@@ -34140,6 +34241,7 @@ mod tests {
         ];
         let centers = data.clone();
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: None,
             power: 1.0,
@@ -34180,6 +34282,7 @@ mod tests {
         eta: Vec<f64>,
     ) -> Array2<f64> {
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             length_scale: None,
             power: 1.0,
@@ -34224,6 +34327,7 @@ mod tests {
         eta: Vec<f64>,
     ) {
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             length_scale: None,
             power: 1.0,
@@ -34340,6 +34444,7 @@ mod tests {
             [0.5, 0.6, 1.2]
         ];
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: None,
             power: 1.0,
@@ -34472,6 +34577,7 @@ mod tests {
         let data = array![[0.0, 0.1], [0.2, 0.0], [0.4, 0.2], [0.6, 0.4], [0.8, 0.5]];
         let centers = data.slice(s![0..4, ..]).to_owned();
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers),
             length_scale: None,
             power: 2.0,
@@ -34507,6 +34613,7 @@ mod tests {
         );
 
         let spec = DuchonBasisSpec {
+            periodic: None,
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             length_scale: None,
             power: 2.0,
