@@ -678,17 +678,6 @@ impl NutsPosterior {
         })
     }
 
-    /// Compute log-posterior and gradient analytically using ndarray.
-    ///
-    /// Returns (log_posterior, gradientz) where gradientz is the gradient
-    /// with respect to the whitened parameters z.
-    fn compute_logp_and_grad_nd(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
-        let mut residual = Array1::<f64>::zeros(self.data.n_samples);
-        let mut grad = Array1::<f64>::zeros(z.len());
-        let logp = self.compute_logp_and_grad_nd_into(z, &mut residual, &mut grad);
-        (logp, grad)
-    }
-
     fn compute_logp_and_grad_nd_into(
         &self,
         z: &Array1<f64>,
@@ -4253,14 +4242,6 @@ impl LinkWigglePosterior {
         g
     }
 
-    /// Compute log-posterior and gradient in whitened coordinates.
-    fn compute_logp_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
-        let dim = self.p_base + self.p_link;
-        let mut grad = Array1::<f64>::zeros(dim);
-        let logp = self.compute_logp_and_grad_into(z, &mut grad);
-        (logp, grad)
-    }
-
     fn compute_logp_and_grad_into(&self, z: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
         let dim = self.p_base + self.p_link;
 
@@ -5252,25 +5233,6 @@ impl JointBetaRhoPosterior {
                 Ok(self.inverse_link.clone())
             }
         }
-    }
-
-    /// Compute the joint log-posterior and gradient.
-    ///
-    /// The joint log-posterior is:
-    ///   log p(β, ρ | y) = ℓ(y|β) + ½ log|I(β)| [if Firth]
-    ///                    − ½β'S(ρ)β + ½ log|S(ρ)|₊ + log p(ρ) + const
-    ///
-    /// This is NOT the REML/LAML objective (which integrates out β). Here β is
-    /// an explicit parameter being sampled, evaluated at arbitrary values — not
-    /// just at the mode β̂(ρ).
-    ///
-    /// Parameter vector layout: [z_β (whitened, length n_beta); ρ (length n_rho);
-    /// adaptive inverse-link params (length n_link_params)]
-    fn compute_joint_logp_and_grad(&self, params: &Array1<f64>) -> (f64, Array1<f64>) {
-        let total_dim = self.n_beta + self.n_rho + self.n_link_params;
-        let mut grad = Array1::<f64>::zeros(total_dim);
-        let logp = self.compute_joint_logp_and_grad_into(params, &mut grad);
-        (logp, grad)
     }
 
     fn compute_joint_logp_and_grad_into(

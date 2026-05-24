@@ -2236,7 +2236,7 @@ impl SurvivalLocationScaleFamily {
         let pls = self.x_log_sigma.ncols();
         let beta_t = &block_states[Self::BLOCK_THRESHOLD].beta;
         let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
-        drop(self.policy.row_chunk_target_bytes);
+        _ = self.policy.row_chunk_target_bytes;
         let t_time_varying = self.x_threshold_entry.is_some();
         let ls_time_varying = self.x_log_sigma_entry.is_some();
 
@@ -7809,7 +7809,7 @@ impl SurvivalLocationScaleFamily {
             }
             .into());
         }
-        drop(block_states);
+        _ = block_states;
 
         let time_dir = d_beta_flat.slice(s![offsets[0]..offsets[1]]).to_owned();
         let threshold_dir = d_beta_flat.slice(s![offsets[1]..offsets[2]]).to_owned();
@@ -8429,7 +8429,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         &self,
         specs: &[crate::custom_family::ParameterBlockSpec],
     ) -> bool {
-        drop(specs);
+        _ = specs;
         true
     }
 
@@ -8715,11 +8715,11 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        drop(block_states);
-        drop(specs);
-        drop(derivative_blocks);
-        drop(psi_i);
-        drop(psi_j);
+        _ = block_states;
+        _ = specs;
+        _ = derivative_blocks;
+        _ = psi_i;
+        _ = psi_j;
         Ok(None)
     }
 
@@ -8788,11 +8788,11 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(block_states);
-        drop(specs);
-        drop(derivative_blocks);
-        drop(psi_index);
-        drop(d_beta_flat);
+        _ = block_states;
+        _ = specs;
+        _ = derivative_blocks;
+        _ = psi_index;
+        _ = d_beta_flat;
         Ok(None)
     }
 
@@ -8802,9 +8802,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(block_states);
-        drop(d_beta_u_flat);
-        drop(d_beta_v_flat);
+        _ = block_states;
+        _ = d_beta_u_flat;
+        _ = d_beta_v_flat;
         Ok(None)
     }
 
@@ -8880,7 +8880,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        drop(specs);
+        _ = specs;
         Ok(Some(Arc::new(
             SurvivalLocationScaleExactNewtonJointHessianWorkspace::new(
                 self.clone(),
@@ -8895,7 +8895,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        drop(specs);
+        _ = specs;
         let mut workspace = SurvivalLocationScaleExactNewtonJointHessianWorkspace::new(
             self.clone(),
             block_states.to_vec(),
@@ -9648,8 +9648,8 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        drop(psi_i);
-        drop(psi_j);
+        _ = psi_i;
+        _ = psi_j;
         Ok(None)
     }
 
@@ -9658,8 +9658,8 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
-        drop(psi_index);
-        drop(d_beta_flat);
+        _ = psi_index;
+        _ = d_beta_flat;
         Ok(None)
     }
 }
@@ -9742,8 +9742,8 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(d_beta_u_flat);
-        drop(d_beta_v_flat);
+        _ = d_beta_u_flat;
+        _ = d_beta_v_flat;
         Ok(None)
     }
 
@@ -9752,8 +9752,8 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
-        drop(d_beta_u_flat);
-        drop(d_beta_v_flat);
+        _ = d_beta_u_flat;
+        _ = d_beta_v_flat;
         Ok(None)
     }
 }
@@ -10100,7 +10100,7 @@ pub(crate) fn fit_survival_location_scale_terms(
     // pays for a stalled fixed-point attempt before landing on BFGS.
     let outer_policy = {
         let psi_dim = joint_setup.theta0().len() - joint_setup.rho_dim();
-        drop(psi_dim);
+        _ = psi_dim;
         let capability = if analytic_joint_hessian_available {
             crate::families::custom_family::ExactOuterDerivativeOrder::Second
         } else {
@@ -10148,7 +10148,7 @@ pub(crate) fn fit_survival_location_scale_terms(
          designs: &[TermCollectionDesign],
          eval_mode,
          row_set: &crate::families::row_kernel::RowSet| {
-            drop(row_set);
+            _ = row_set;
             use crate::solver::estimate::reml::unified::EvalMode;
             if !analytic_joint_gradient_available {
                 return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: "analytic spatial psi derivatives are unavailable for survival exact two-block path"

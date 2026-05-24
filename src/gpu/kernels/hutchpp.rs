@@ -159,8 +159,8 @@ extern "C" __global__ void hutchpp_dot_kernel(
         let az_slice = az.as_slice().ok_or_else(|| GpuError::DriverCallFailed {
             reason: "hutchpp apply slice not contiguous".to_string(),
         })?;
-        let dz = stream.memcpy_stod(z_slice).map_err(map_drv)?;
-        let daz = stream.memcpy_stod(az_slice).map_err(map_drv)?;
+        let dz = stream.clone_htod(z_slice).map_err(map_drv)?;
+        let daz = stream.clone_htod(az_slice).map_err(map_drv)?;
         let mut dpart = stream
             .alloc_zeros::<f64>(blocks as usize)
             .map_err(map_drv)?;
@@ -171,7 +171,7 @@ extern "C" __global__ void hutchpp_dot_kernel(
         // context; dz/daz are length-n device vectors, dpart is the per-block
         // partial-sum buffer matching blocks. cfg grid covers exactly blocks.
         unsafe { builder.launch(cfg) }.map_err(map_drv)?;
-        let host_part = stream.memcpy_dtov(&dpart).map_err(map_drv)?;
+        let host_part = stream.clone_dtoh(&dpart).map_err(map_drv)?;
         let mut dot = 0.0_f64;
         for v in host_part {
             dot += v;

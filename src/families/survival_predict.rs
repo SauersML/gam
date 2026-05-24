@@ -1853,6 +1853,82 @@ fn location_scale_hazard_from_eta_derivative(
     Ok(Array1::from_vec(values))
 }
 
+/// Hazard component `h(t) = f(t)/S(t)` for a survival location-scale model
+/// evaluated at a single row.
+///
+/// The location-scale likelihood maps the linear predictor through one of the
+/// three standard residual-distribution inverse links (Logit/Probit/CLogLog).
+/// With `eta` the linear predictor and `eta_t = dη/dt` the time derivative,
+/// the hazard rate is the conditional failure intensity:
+///
+/// ```text
+///   F(t) = invlink(η(t))            (failure CDF)
+///   S(t) = 1 - F(t)                 (survival)
+///   f(t) = F'(η) · η_t              (event density)
+///   h(t) = f(t) / S(t)
+/// ```
+///
+/// Closed forms used here (`σ(·)` is the logistic CDF, `Mills(·)` is the
+/// stable Mills ratio `φ(η)/Φ(-η)`):
+///
+/// ```text
+///   logit:   h = σ(η)     · η_t
+///   probit:  h = Mills(η) · η_t
+///   cloglog: h = exp(η)   · η_t
+/// ```
+///
+/// Returns `Err` if `eta` or `eta_derivative` is non-finite, if the derivative
+/// is negative (the location-scale model encodes monotone failure-time
+/// transformations only), or if the inverse link is one of the non-standard
+/// variants (mixture / SAS / beta-logistic / latent cloglog) which are not
+/// part of the location-scale family.
+fn location_scale_hazard_component(
+    eta: f64,
+    eta_derivative: f64,
+    inverse_link: &InverseLink,
+) -> Result<f64, String> {
+    if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative >= 0.0) {
+        return Err(format!(
+            "survival location-scale hazard requires finite eta and non-negative finite eta_t; got eta={eta}, eta_t={eta_derivative}"
+        ));
+    }
+    let hazard = match inverse_link {
+        InverseLink::Standard(LinkFunction::Logit) => {
+            // σ(η) is bounded in (0,1); the product stays finite as long as η_t is.
+            let sigma = 1.0 / (1.0 + (-eta).exp());
+            sigma * eta_derivative
+        }
+        InverseLink::Standard(LinkFunction::CLogLog) => {
+            // exp(η) overflows to +∞ for large η; the +∞ hazard is the truthful
+            // saturated-fit answer, mirroring the saturation behaviour of the
+            // Royston-Parmar helper and the consumer's `exp(-cum).clamp(0,1)`
+            // survival materialization.
+            eta.exp() * eta_derivative
+        }
+        InverseLink::Standard(LinkFunction::Probit) => {
+            // Mills ratio φ(η)/Φ(-η) is what `probit_survival_hazard_components`
+            // returns; reuse it so probit consumers stay numerically aligned.
+            let (_, hazard) = probit_survival_hazard_components(eta, eta_derivative)
+                .map_err(|e| e.to_string())?;
+            hazard
+        }
+        _ => {
+            return Err(format!(
+                "survival location-scale hazard does not support inverse link '{}'; \
+                 only the standard residual-distribution links (logit/probit/cloglog) \
+                 are part of the location-scale family",
+                inverse_link.link_function().name()
+            ));
+        }
+    };
+    if !(hazard >= 0.0) {
+        return Err(format!(
+            "survival location-scale hazard produced invalid value: eta={eta}, eta_t={eta_derivative}, hazard={hazard}"
+        ));
+    }
+    Ok(hazard)
+}
+
 // ---------------------------------------------------------------------------
 // Shared library helpers (used by the CLI wrapper too).
 // ---------------------------------------------------------------------------

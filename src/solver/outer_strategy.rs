@@ -28,25 +28,6 @@ use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-/// Trigger ratio for the IFT-energy trust gate.
-///
-/// The gate fires (and shrinks the current trust radius) when the
-/// Newton-decrement energy bound on the accepted point exceeds
-/// `TRUST_ENERGY_FACTOR × |predicted_decrease|` for the trial step. The
-/// energy `½ rᵀH⁻¹r` upper-bounds `|V(β̂) − V(β*)|`, so when it dwarfs the
-/// model's predicted improvement the trial is dominated by inner-solve
-/// noise rather than real curvature signal.
-///
-/// `10.0` is deliberately conservative — roughly one decade above the
-/// observed noise floor of `½ rᵀH⁻¹r` for converged inner solves, so the
-/// gate rarely fires on well-behaved fits and only kicks in when the inner
-/// solve is grossly under-converged relative to the outer step.
-///
-/// Independent from the HyperGradientBudget (HGB) controller: HGB allocates
-/// *future* inner accuracy across channels by adjusting target MSE; this
-/// gate adjusts the *current* outer trust radius without changing inner
-/// tolerances.
-const TRUST_ENERGY_FACTOR: f64 = 10.0;
 const OPERATOR_TRUST_RESTART_RADIUS_FLOOR: f64 = 1.0e-6;
 
 /// Bidirectional inner-PIRLS feedback channel.
@@ -1718,7 +1699,7 @@ pub trait OuterObjective {
     /// first inner solve opens at `‖∇‖ ≈ 0` and the boundary-ρ conditioning
     /// stops mattering.
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
-        drop(beta);
+        _ = beta;
         Ok(())
     }
 }
@@ -1850,7 +1831,7 @@ pub(crate) fn classify_cache_entry_for_outer(
     expected_rho_dim: usize,
     rho_bound: f64,
 ) -> CacheSeedDecision {
-    drop(rho_bound);
+    _ = rho_bound;
     let entry = &loaded.entry;
     let Some(payload) = decode_iterate(&entry.payload, expected_rho_dim) else {
         return CacheSeedDecision::Discard {
@@ -3102,7 +3083,7 @@ struct OuterAcceptObserver {
 
 impl OptimizerObserver for OuterAcceptObserver {
     fn on_step_accepted(&mut self, info: &StepInfo) {
-        drop(info);
+        _ = info;
         self.feedback.accepted_iter.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -3238,7 +3219,7 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
             };
             let snapshot = feedback.snapshot();
             let cap = first_order_inner_cap_schedule(self.eval_count, g_ratio, snapshot);
-            drop(feedback.cap.swap(cap, Ordering::Relaxed));
+            _ = feedback.cap.swap(cap, Ordering::Relaxed);
         }
         let stage_start = std::time::Instant::now();
         log::info!(
@@ -4027,26 +4008,6 @@ struct OuterConfig {
     solver_class: SolverClass,
     operator_initial_trust_radius: Option<f64>,
     arc_initial_regularization: Option<f64>,
-    /// Optional scale factor for the objective's natural magnitude.
-    /// Used to widen the absolute gradient-norm floor on objectives whose
-    /// gradient lives on a non-unit scale (e.g. Gaussian-identity REML at
-    /// large `n`, whose ∂/∂logλ inherits the O(n) likelihood constant).
-    /// `None` falls back to the bare `tolerance` floor.
-    objective_scale: Option<f64>,
-    /// BFGS line-search infinity-norm cap applied to the leading `rho_dim`
-    /// outer parameters (log-λ axes). Documented natural step for
-    /// `log(lambda)` is ≈ 5 (`e^5 ≈ 148`-fold smoothing-parameter change
-    /// per accepted outer iter — matches typical quasi-Newton direction
-    /// magnitude on flat REML surfaces). Setting this `None` disables the
-    /// rho-axis cap entirely.
-    bfgs_step_cap: Option<f64>,
-    /// BFGS line-search infinity-norm cap applied to the trailing `psi_dim`
-    /// outer parameters (kappa / aniso-log-scale axes). Required because
-    /// the kernel scale axes need much tighter control (`e^1 ≈ 2.7`-fold
-    /// per iter is plenty) — using the rho-axis cap here lets the optimizer
-    /// jump kappa by orders of magnitude per step and oscillate. Setting
-    /// this `None` disables the psi-axis cap.
-    bfgs_step_cap_psi: Option<f64>,
     /// Optional persistent-cache session. When `Some`, every finite objective
     /// evaluation is written through to disk (rate-limited, atomic-rename)
     /// and the best on-disk rho is prepended as a seed at the start of each
@@ -4078,9 +4039,6 @@ impl Default for OuterConfig {
             solver_class: SolverClass::Primary,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
-            objective_scale: None,
-            bfgs_step_cap: None,
-            bfgs_step_cap_psi: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
         }
@@ -4120,9 +4078,6 @@ pub struct OuterProblem {
     solver_class: SolverClass,
     operator_initial_trust_radius: Option<f64>,
     arc_initial_regularization: Option<f64>,
-    objective_scale: Option<f64>,
-    bfgs_step_cap: Option<f64>,
-    bfgs_step_cap_psi: Option<f64>,
     cache_session: Option<Arc<CacheSession>>,
     cache_mirror_sessions: Vec<Arc<CacheSession>>,
 }
@@ -4151,9 +4106,6 @@ impl OuterProblem {
             solver_class: SolverClass::Primary,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
-            objective_scale: None,
-            bfgs_step_cap: None,
-            bfgs_step_cap_psi: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
         }
@@ -4279,47 +4231,6 @@ impl OuterProblem {
         self
     }
 
-    /// Set the objective's natural magnitude scale, used to derive an
-    /// `n`-aware absolute gradient-norm floor. When set to `Some(s)`,
-    /// the runner uses `abs_floor = max(tol, s * 1e-9)` for the
-    /// projected-gradient convergence check.
-    ///
-    /// Rationale: a fixed `abs = tol` (e.g. 1e-6) is appropriate when the
-    /// objective and its gradient live on a unit scale, but Gaussian-
-    /// identity REML carries an O(n) likelihood constant that flows into
-    /// ∂/∂logλ. At biobank n the floor becomes binding even when the
-    /// relative-from-seed component (`rel_initial_grad * ‖g0‖`) declared
-    /// convergence iters earlier — chasing sub-ULP changes in log-λ at
-    /// the cost of repeated k²·n·p² analytic-Hessian assemblies.
-    pub fn with_objective_scale(mut self, scale: Option<f64>) -> Self {
-        self.objective_scale = scale.filter(|v| v.is_finite() && *v > 0.0);
-        self
-    }
-
-    /// Cap the infinity-norm displacement of BFGS cost-only line-search probes
-    /// on the **rho axes** (the first `n_params - psi_dim` outer parameters,
-    /// = log-λ). Also scales the initial inverse metric so the first trial
-    /// direction respects the same local budget coordinate-wise. Documented
-    /// natural step on log-λ is ≈ 5; tighter values throttle BFGS and starve
-    /// convergence on flat REML valleys.
-    pub fn with_bfgs_step_cap(mut self, cap: Option<f64>) -> Self {
-        self.bfgs_step_cap = cap.filter(|v| v.is_finite() && *v > 0.0);
-        self
-    }
-
-    /// Cap the infinity-norm displacement of BFGS cost-only line-search probes
-    /// on the **psi axes** (the trailing `psi_dim` outer parameters, = kappa
-    /// or anisotropic log-scales). Mirrors [`Self::with_bfgs_step_cap`] but
-    /// scoped to kernel-scale parameters whose natural step is much smaller
-    /// than log-λ (≈ ln 2 per iter keeps kappa from oscillating). Without
-    /// this split, a uniform rho-scale cap lets psi explode while a uniform
-    /// psi-scale cap throttles rho — both fail the survival-marginal-slope
-    /// path at biobank scale, where rho needs |d|≈5 while psi wants |d|≤1.
-    pub fn with_bfgs_step_cap_psi(mut self, cap: Option<f64>) -> Self {
-        self.bfgs_step_cap_psi = cap.filter(|v| v.is_finite() && *v > 0.0);
-        self
-    }
-
     pub fn with_cache_session(mut self, session: Arc<CacheSession>) -> Self {
         self.cache_session = Some(session);
         self
@@ -4377,9 +4288,6 @@ impl OuterProblem {
             solver_class: self.solver_class,
             operator_initial_trust_radius: self.operator_initial_trust_radius,
             arc_initial_regularization: self.arc_initial_regularization,
-            objective_scale: self.objective_scale,
-            bfgs_step_cap: self.bfgs_step_cap,
-            bfgs_step_cap_psi: self.bfgs_step_cap_psi,
             cache_session: self.cache_session.clone(),
             cache_mirror_sessions: self.cache_mirror_sessions.clone(),
         }

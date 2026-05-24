@@ -82,9 +82,9 @@ extern "C" __global__ void row_scale_kernel(
             col_major.push(x[[i, j]]);
         }
     }
-    let dx = stream.memcpy_stod(&col_major).map_err(map_drv)?;
+    let dx = stream.clone_htod(&col_major).map_err(map_drv)?;
     let dw = stream
-        .memcpy_stod(w.as_slice().ok_or_else(|| GpuError::DriverCallFailed {
+        .clone_htod(w.as_slice().ok_or_else(|| GpuError::DriverCallFailed {
             reason: "xtwx weight slice not contiguous".to_string(),
         })?)
         .map_err(map_drv)?;
@@ -144,7 +144,7 @@ extern "C" __global__ void row_scale_kernel(
         reason: format!("xtwx cublas gemm failed: {e}"),
     })?;
 
-    let host_cm = stream.memcpy_dtov(&dout).map_err(map_drv)?;
+    let host_cm = stream.clone_dtoh(&dout).map_err(map_drv)?;
     let mut out = Array2::<f64>::zeros((p, p));
     for j in 0..p {
         for i in 0..p {

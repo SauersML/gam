@@ -32,7 +32,7 @@ use faer::sparse::{
 use faer::{Accum, Par, Side, Unbind, get_global_parallelism};
 use log;
 use ndarray::{
-    Array1, Array2, ArrayBase, ArrayView1, ArrayView2, ArrayView3, Data, Ix1, Ix2, ShapeBuilder,
+    Array1, Array2, ArrayBase, ArrayView1, ArrayView2, ArrayView3, Data, Ix2, ShapeBuilder,
     Zip, s,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
@@ -1119,19 +1119,6 @@ impl PirlsWorkspace {
                 par,
             );
         }
-    }
-
-    #[inline]
-    fn fill_sqrtweights<S>(&mut self, weights: &ArrayBase<S, Ix1>)
-    where
-        S: Data<Elem = f64>,
-    {
-        if self.sqrtw.len() != weights.len() {
-            self.sqrtw = Array1::zeros(weights.len());
-        }
-        Zip::from(&mut self.sqrtw)
-            .and(weights)
-            .par_for_each(|sqrtw, &w| *sqrtw = w.max(0.0).sqrt());
     }
 
     /// Ensure the sparse penalty cache is populated and consistent with `x` and `s_lambda`.
@@ -8539,7 +8526,7 @@ fn safe_beta_mu(mu: f64) -> f64 {
 
 #[inline]
 fn working_derivatives_unsupported(likelihood: GlmLikelihoodSpec) -> bool {
-    drop(likelihood);
+    _ = likelihood;
     false
 }
 

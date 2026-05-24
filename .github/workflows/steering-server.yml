@@ -59,3 +59,4 @@ jobs:
       - uses: azure/setup-helm@v4
       - run: helm lint helm/steering-server
       - run: helm package helm/steering-server --destination dist
+

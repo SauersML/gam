@@ -2922,7 +2922,7 @@ pub fn assert_spatial_centers_below_biobank_cap(
     d_pc: usize,
     centers: ArrayView2<'_, f64>,
 ) -> Result<(), BasisError> {
-    drop(n);
+    _ = n;
     if centers.ncols() != d_pc {
         return Err(BasisError::DimensionMismatch(format!(
             "spatial PC center dimension mismatch: centers have {} columns, expected {d_pc}",
@@ -3160,7 +3160,7 @@ pub(crate) fn orthogonality_transform_for_design(
 /// Which radial kernel family is being used. Stored in the streaming operator
 /// so that (q, t) scalars can be recomputed on the fly without a closure.
 #[derive(Debug, Clone)]
-pub(crate) enum RadialScalarKind {
+pub enum RadialScalarKind {
     /// Matern kernel: (length_scale, nu).
     Matern { length_scale: f64, nu: MaternNu },
     /// Hybrid Duchon kernel: parameters needed for `duchon_radial_jets`.
@@ -3914,7 +3914,6 @@ pub(crate) struct StreamingBSplineEvaluator {
     data: Arc<Array1<f64>>,
     knots: Arc<Array1<f64>>,
     degree: usize,
-    boundary_conditions: BSplineBoundaryConditions,
     periodic: Option<(f64, f64, usize)>,
     transform: Option<Arc<Array2<f64>>>,
     chunk_size: usize,
@@ -3926,7 +3925,6 @@ impl StreamingBSplineEvaluator {
         data: Arc<Array1<f64>>,
         knots: Arc<Array1<f64>>,
         degree: usize,
-        boundary_conditions: BSplineBoundaryConditions,
         periodic: Option<(f64, f64, usize)>,
         transform: Option<Arc<Array2<f64>>>,
         chunk_size: Option<usize>,
@@ -3945,7 +3943,6 @@ impl StreamingBSplineEvaluator {
             data: Arc::new(data.as_standard_layout().to_owned()),
             knots: Arc::new(knots.as_standard_layout().to_owned()),
             degree,
-            boundary_conditions,
             periodic,
             total_cols: transform.as_ref().map_or(raw_cols, |z| z.ncols()),
             transform,
@@ -8607,7 +8604,6 @@ fn build_streaming_bspline_design_and_candidates(
         Arc::new(data.to_owned()),
         Arc::new(knots.clone()),
         degree,
-        boundary_conditions,
         periodic,
         transform_opt.as_ref().map(|z| Arc::new(z.clone())),
         chunk_size,
@@ -10064,7 +10060,7 @@ fn hessian_operator_eta_cross_entry(
     axis_b: usize,
     axis_c: usize,
 ) -> f64 {
-    drop(q);
+    _ = q;
     debug_assert_ne!(axis_i, axis_j);
     let i_is_b = usize::from(axis_i == axis_b) as f64;
     let i_is_c = usize::from(axis_i == axis_c) as f64;
@@ -14481,7 +14477,7 @@ fn validate_duchon_collocation_orders(
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct DuchonPartialFractionCoeffs {
+pub struct DuchonPartialFractionCoeffs {
     a: Vec<f64>,
     b: Vec<f64>,
 }
@@ -15413,7 +15409,7 @@ pub fn create_matern_spline_basiswithworkspace(
     aniso_log_scales: Option<&[f64]>,
     workspace: &mut BasisWorkspace,
 ) -> Result<MaternSplineBasis, BasisError> {
-    drop(workspace);
+    _ = workspace;
     let n = data.nrows();
     let d = data.ncols();
     let k = centers.nrows();
@@ -25632,7 +25628,7 @@ pub mod closed_form_penalty {
     /// regime of canonical TPS, so we use `d > 4m` as the dispatch gate.
     #[inline]
     fn schwinger_radial_is_convergent(d: usize, m: usize, s: usize) -> bool {
-        drop(s);
+        _ = s;
         d > 4 * m
     }
 

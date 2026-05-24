@@ -697,25 +697,6 @@ impl LatentCoordValues {
         )
     }
 
-    pub(crate) fn from_flat_with_manifold_and_id(
-        values: Array1<f64>,
-        n_obs: usize,
-        latent_dim: usize,
-        id_mode: LatentIdMode,
-        manifold: LatentManifold,
-        id: u64,
-    ) -> Self {
-        Self::from_flat_with_manifold_and_retraction_and_id(
-            values,
-            n_obs,
-            latent_dim,
-            id_mode,
-            manifold,
-            LatentRetractionRegistry::all_euclidean(),
-            id,
-        )
-    }
-
     pub(crate) fn from_flat_with_manifold_and_retraction_and_id(
         values: Array1<f64>,
         n_obs: usize,
@@ -790,21 +771,6 @@ impl LatentCoordValues {
             self.id_mode.clone(),
             manifold,
             self.retraction_registry.clone(),
-            self.id,
-        )
-    }
-
-    pub(crate) fn with_retraction_registry(
-        &self,
-        retraction_registry: LatentRetractionRegistry,
-    ) -> Self {
-        Self::from_flat_with_manifold_and_retraction_and_id(
-            self.values.clone(),
-            self.n_obs,
-            self.latent_dim,
-            self.id_mode.clone(),
-            self.manifold.clone(),
-            retraction_registry,
             self.id,
         )
     }
@@ -980,126 +946,6 @@ impl LatentCoordValues {
         }
     }
 
-    /// Contract a downstream gradient `∂L/∂Φ ∈ ℝ^(n_obs × n_centers)` and a
-    /// `design_gradient_wrt_t` jet into a flat `∂L/∂t ∈ ℝ^(n_obs * d)`.
-    ///
-    /// This is the N-D generalization of
-    /// `gam_pyffi::contract_position_gradient` (1-D), used inside the
-    /// `_backward` pyffi entry point.
-    pub(crate) fn contract_gradient(
-        grad_phi: ArrayView2<'_, f64>,
-        jet: &Array3<f64>,
-    ) -> Array1<f64> {
-        let n_obs = jet.shape()[0];
-        let n_centers = jet.shape()[1];
-        let d = jet.shape()[2];
-        assert_eq!(grad_phi.shape(), &[n_obs, n_centers]);
-        let mut grad_t = Array1::<f64>::zeros(n_obs * d);
-        for n in 0..n_obs {
-            for a in 0..d {
-                let mut acc = 0.0_f64;
-                for k in 0..n_centers {
-                    acc += grad_phi[[n, k]] * jet[[n, k, a]];
-                }
-                grad_t[n * d + a] = acc;
-            }
-        }
-        grad_t
-    }
-
-    /// Streaming contraction for radial-kernel input-location derivatives.
-    ///
-    /// This computes the same result as
-    /// `contract_gradient(grad_phi, design_gradient_wrt_t(...))`, but never
-    /// materializes the dense `(n_obs, n_centers, latent_dim)` jet. Peak
-    /// storage is therefore `O(n_obs * latent_dim)`.
-    pub(crate) fn contract_gradient_radial_streaming(
-        &self,
-        grad_phi: ArrayView2<'_, f64>,
-        centers: ArrayView2<'_, f64>,
-        radial_kind: &RadialScalarKind,
-    ) -> Result<Array1<f64>, BasisError> {
-        let n_obs = self.n_obs;
-        let d = self.latent_dim;
-        let n_centers = centers.nrows();
-        assert_eq!(centers.ncols(), d);
-        assert_eq!(grad_phi.shape(), &[n_obs, n_centers]);
-        let mut grad_t = Array1::<f64>::zeros(n_obs * d);
-        for n in 0..n_obs {
-            self.contract_row_radial_gradient_into(
-                n,
-                grad_phi.row(n),
-                centers,
-                radial_kind,
-                &mut grad_t,
-                1.0,
-            )?;
-        }
-        Ok(grad_t)
-    }
-
-    /// Streaming row contraction for one radial-kernel latent row.
-    ///
-    /// `grad_phi_row[k]` is the downstream adjoint for `Φ[n,k]`. The
-    /// contribution is accumulated into `grad_t[n, :]` with an optional scalar
-    /// multiplier.
-    pub(crate) fn contract_row_radial_gradient_into(
-        &self,
-        n: usize,
-        grad_phi_row: ArrayView1<'_, f64>,
-        centers: ArrayView2<'_, f64>,
-        radial_kind: &RadialScalarKind,
-        grad_t: &mut Array1<f64>,
-        scale: f64,
-    ) -> Result<(), BasisError> {
-        let d = self.latent_dim;
-        let n_centers = centers.nrows();
-        assert!(
-            n < self.n_obs,
-            "latent coordinate gradient row out of bounds: row={n}, n_obs={}",
-            self.n_obs
-        );
-        assert_eq!(
-            centers.ncols(),
-            d,
-            "latent coordinate center dimension mismatch"
-        );
-        assert_eq!(
-            grad_phi_row.len(),
-            n_centers,
-            "latent coordinate radial-gradient row length mismatch"
-        );
-        assert_eq!(
-            grad_t.len(),
-            self.values.len(),
-            "latent coordinate gradient output length mismatch"
-        );
-        if scale == 0.0 {
-            return Ok(());
-        }
-        let t_n = self.row(n);
-        for k in 0..n_centers {
-            let adjoint = grad_phi_row[k];
-            if adjoint == 0.0 {
-                continue;
-            }
-            let mut r2 = 0.0_f64;
-            for a in 0..d {
-                let delta = t_n[a] - centers[[k, a]];
-                r2 += delta * delta;
-            }
-            let r = r2.sqrt();
-            let (_, q, _) = radial_kind.eval_design_triplet(r)?;
-            if q == 0.0 {
-                continue;
-            }
-            let row_scale = scale * adjoint * q;
-            for a in 0..d {
-                grad_t[n * d + a] += row_scale * (t_n[a] - centers[[k, a]]);
-            }
-        }
-        Ok(())
-    }
 }
 
 fn wrap_angle(x: f64) -> f64 {

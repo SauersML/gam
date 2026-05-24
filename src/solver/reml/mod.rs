@@ -1193,85 +1193,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fixed_subspace_penalty_trace_uses_positive_penalty_subspace_only() {
-        // Use a non-separable pattern so this test exercises penalty-subspace
-        // tracing logic rather than separation handling.
-        let y = array![0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
-        let w = Array1::<f64>::ones(y.len());
-        let x = array![
-            [1.0, -1.0, 0.2],
-            [1.0, -0.5, -0.4],
-            [1.0, 0.0, 0.7],
-            [1.0, 0.4, -0.3],
-            [1.0, 0.9, 0.1],
-            [1.0, 1.3, -0.6],
-        ];
-        // Rank-deficient penalty with clear nullspace on first coordinate.
-        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
-        let rho = array![0.0];
-        let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
-            1e-10,
-            false,
-        );
-        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
-        let bundle = state.obtain_eval_bundle(&rho).expect("bundle");
-        let pr = bundle.pirls_result.as_ref();
-        let e = &pr.reparam_result.e_transformed;
-        let p = e.ncols();
-        let mut s_lambda = e.t().dot(e);
-        let ridge = pr.ridge_passport.penalty_logdet_ridge();
-        if ridge > 0.0 {
-            for i in 0..p {
-                s_lambda[[i, i]] += ridge;
-            }
-        }
-        let (evals, evecs) = s_lambda.eigh(Side::Lower).expect("penalty eigh");
-        let mut order: Vec<usize> = (0..evals.len()).collect();
-        order.sort_by(|&a, &b| {
-            evals[b]
-                .partial_cmp(&evals[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let pos_idx = order[0];
-        let null_idx = order[order.len() - 1];
-        let u_pos = evecs.column(pos_idx).to_owned();
-        let u_null = evecs.column(null_idx).to_owned();
-
-        let s_dir_null = {
-            let col = u_null.clone().insert_axis(ndarray::Axis(1));
-            let row = u_null.insert_axis(ndarray::Axis(0));
-            col.dot(&row)
-        };
-        let s_dir_pos = {
-            let col = u_pos.clone().insert_axis(ndarray::Axis(1));
-            let row = u_pos.clone().insert_axis(ndarray::Axis(0));
-            col.dot(&row)
-        };
-
-        // With the exact pseudoinverse, the null-direction trace is zero:
-        // tr(S⁺ S_null) = 0 because S⁺ projects onto the positive eigenspace
-        // and u₀ is orthogonal to it.
-        let tr_null = state
-            .fixed_subspace_penalty_trace(e, &s_dir_null, pr.ridge_passport)
-            .expect("trace-null");
-        assert!(
-            tr_null.abs() < 1e-10,
-            "nullspace direction trace should be ~0 with exact pseudoinverse: got {tr_null:.3e}"
-        );
-
-        let tr_pos = state
-            .fixed_subspace_penalty_trace(e, &s_dir_pos, pr.ridge_passport)
-            .expect("trace-pos");
-        // With exact pseudoinverse, expected is 1/σ_pos.
-        let expected_pos = 1.0 / evals[pos_idx];
-        let rel = (tr_pos - expected_pos).abs() / expected_pos.abs().max(1e-12);
-        assert!(
-            rel < 1e-6,
-            "positive-subspace contraction mismatch: got={tr_pos:.6e}, expected={expected_pos:.6e}, rel={rel:.3e}"
-        );
-    }
 
     #[test]
     fn firth_logit_directional_hypergradient_accepts_penalty_only_with_full_tk_gradient() {
@@ -3909,17 +3830,6 @@ struct PenaltySubspaceCache {
 impl PenaltySubspaceCache {
     fn new() -> Self {
         Self { entry: None }
-    }
-
-    fn get(&self, key: &PenaltySubspaceCacheKey) -> Option<Arc<runtime::PenaltySubspace>> {
-        self.entry
-            .as_ref()
-            .filter(|(cached_key, _)| cached_key == key)
-            .map(|(_, value)| value.clone())
-    }
-
-    fn insert(&mut self, key: PenaltySubspaceCacheKey, value: Arc<runtime::PenaltySubspace>) {
-        self.entry = Some((key, value));
     }
 
     fn clear(&mut self) {
