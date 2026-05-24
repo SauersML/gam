@@ -209,9 +209,6 @@ pub mod debug_stash {
         }) };
     }
 
-    pub fn store_terms(stash: TermStash) {
-        TERMS.with(|cell| *cell.borrow_mut() = stash);
-    }
     pub fn take_terms() -> TermStash {
         TERMS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
     }
