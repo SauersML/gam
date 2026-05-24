@@ -349,13 +349,17 @@ def _build_fit_payload(
             payload[key] = value
     if config:
         for key, value in config.items():
-            payload.setdefault(key, value)
+            payload.setdefault(key, _jsonable_array(value))
     return payload
 
 
 def _jsonable_array(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
+    if hasattr(value, "to_rust_descriptor"):
+        return _jsonable_array(value.to_rust_descriptor())
+    if hasattr(value, "_to_rust_payload"):
+        return _jsonable_array(value._to_rust_payload())
     if isinstance(value, Mapping):
         return {str(k): _jsonable_array(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):

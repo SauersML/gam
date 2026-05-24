@@ -202,7 +202,7 @@ where
     }
     if ranked.is_empty() {
         return Err(format!(
-            "TopologyAutoSelector found no fitable topology candidates{}",
+            "TopologyAutoSelector found no fittable topology candidates{}",
             if errors.is_empty() {
                 String::new()
             } else {
