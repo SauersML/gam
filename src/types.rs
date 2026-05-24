@@ -517,7 +517,7 @@ pub enum LikelihoodFamily {
 }
 
 #[inline]
-pub fn is_valid_tweedie_power(p: f64) -> bool {
+pub const fn is_valid_tweedie_power(p: f64) -> bool {
     p.is_finite() && p > 1.0 && p < 2.0
 }
 

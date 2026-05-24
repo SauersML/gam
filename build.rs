@@ -2455,7 +2455,7 @@ enum HistoryBodyState {
 /// any `HISTORY_BODY_REJECT_MACROS` macro in the body.
 fn body_state_for_signature(content: &str, target_sig: &str) -> HistoryBodyState {
     let lines: Vec<&str> = content.lines().collect();
-    let mut idx = 0usize;
+    let mut idx = 0;
     while idx < lines.len() {
         let stripped = strip_strings_and_comments(lines[idx]);
         if !line_has_keyword(&stripped, "fn") {
@@ -2464,10 +2464,9 @@ fn body_state_for_signature(content: &str, target_sig: &str) -> HistoryBodyState
         }
         if let Some((sig, (open, close))) = find_fn_body_at(&lines, idx) {
             if sig == target_sig {
-                let mut code_lines = 0usize;
+                let mut code_lines = 0;
                 let mut first_snippet: Option<String> = None;
-                for j in open..=close {
-                    let raw = lines[j];
+                for raw in lines.iter().take(close + 1).skip(open) {
                     let s = strip_strings_and_comments(raw);
                     let t = s.trim();
                     if t.is_empty() {
@@ -2516,10 +2515,11 @@ fn find_enclosing_fn(lines: &[&str], at_line: usize) -> Option<(String, (usize, 
         if !line_has_keyword(&stripped, "fn") {
             continue;
         }
-        if let Some((sig, (open, close))) = find_fn_body_at(lines, start) {
-            if open <= at_line && at_line <= close {
-                return Some((sig, (open, close)));
-            }
+        if let Some((sig, (open, close))) = find_fn_body_at(lines, start)
+            && open <= at_line
+            && at_line <= close
+        {
+            return Some((sig, (open, close)));
         }
     }
     None
@@ -2547,23 +2547,23 @@ fn find_fn_body_at(lines: &[&str], fn_line: usize) -> Option<(String, (usize, us
                 }
                 b'}' => {
                     depth -= 1;
-                    if depth == 0 {
-                        if let Some(open) = body_open {
-                            let mut sig = String::new();
-                            for k in fn_line..=open {
-                                let ss = strip_strings_and_comments(lines[k]);
-                                let cut = if k == open {
-                                    ss.find('{').unwrap_or(ss.len())
-                                } else {
-                                    ss.len()
-                                };
-                                sig.push_str(&ss[..cut]);
-                                sig.push(' ');
-                            }
-                            let normalized: String =
-                                sig.split_whitespace().collect::<Vec<_>>().join(" ");
-                            return Some((normalized, (open, j)));
+                    if depth == 0
+                        && let Some(open) = body_open
+                    {
+                        let mut sig = String::new();
+                        for (k, line) in lines.iter().enumerate().take(open + 1).skip(fn_line) {
+                            let ss = strip_strings_and_comments(line);
+                            let cut = if k == open {
+                                ss.find('{').unwrap_or(ss.len())
+                            } else {
+                                ss.len()
+                            };
+                            sig.push_str(&ss[..cut]);
+                            sig.push(' ');
                         }
+                        let normalized: String =
+                            sig.split_whitespace().collect::<Vec<_>>().join(" ");
+                        return Some((normalized, (open, j)));
                     }
                 }
                 _ => {}

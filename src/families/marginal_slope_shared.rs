@@ -802,7 +802,7 @@ pub struct WeightedOuterRow {
 /// Splitmix64: deterministic single-u64 expansion. Thin wrapper over the
 /// canonical implementation in [`crate::linalg::utils::splitmix64`].
 #[inline]
-fn splitmix64(state: &mut u64) -> u64 {
+const fn splitmix64(state: &mut u64) -> u64 {
     crate::linalg::utils::splitmix64(state)
 }
 

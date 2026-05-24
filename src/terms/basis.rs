@@ -3919,6 +3919,7 @@ pub(crate) struct StreamingBSplineEvaluator {
     data: Arc<Array1<f64>>,
     knots: Arc<Array1<f64>>,
     degree: usize,
+    #[expect(dead_code)]
     boundary_conditions: BSplineBoundaryConditions,
     periodic: Option<(f64, f64, usize)>,
     transform: Option<Arc<Array2<f64>>>,
@@ -28347,7 +28348,9 @@ mod tests {
         }
 
         let spec = periodic_test_spec(48);
-        let curve = fit_periodic_bspline_curve(u.view(), y.view(), &spec, PERIODIC_TEST_SMOOTHING_LAMBDA).expect("fit curve");
+        let curve =
+            fit_periodic_bspline_curve(u.view(), y.view(), &spec, PERIODIC_TEST_SMOOTHING_LAMBDA)
+                .expect("fit curve");
         assert_eq!(curve.ambient_dim(), 3);
 
         let pred = curve.evaluate(u.view()).expect("predict curve");
@@ -28400,10 +28403,20 @@ mod tests {
         let stretched = fast_ab(&circle, &transform);
         let spec = periodic_test_spec(36);
 
-        let base_curve =
-            fit_periodic_bspline_curve(u.view(), circle.view(), &spec, PERIODIC_TEST_SMOOTHING_LAMBDA).expect("fit base circle");
-        let stretched_curve = fit_periodic_bspline_curve(u.view(), stretched.view(), &spec, PERIODIC_TEST_SMOOTHING_LAMBDA)
-            .expect("fit stretched ambient curve");
+        let base_curve = fit_periodic_bspline_curve(
+            u.view(),
+            circle.view(),
+            &spec,
+            PERIODIC_TEST_SMOOTHING_LAMBDA,
+        )
+        .expect("fit base circle");
+        let stretched_curve = fit_periodic_bspline_curve(
+            u.view(),
+            stretched.view(),
+            &spec,
+            PERIODIC_TEST_SMOOTHING_LAMBDA,
+        )
+        .expect("fit stretched ambient curve");
 
         let query = Array1::from_iter((0..73).map(|i| -1.3 + 0.17 * i as f64));
         let base_pred = base_curve.evaluate(query.view()).expect("base predict");
@@ -28435,8 +28448,13 @@ mod tests {
             y[[i, 3]] = 0.4 * (3.0 * ui).sin();
             y[[i, 4]] = 0.1 * ui.cos() - 2.0 * ui.sin();
         }
-        let curve = fit_periodic_bspline_curve(u.view(), y.view(), &periodic_test_spec(40), PERIODIC_TEST_SMOOTHING_LAMBDA)
-            .expect("fit high-dimensional loop");
+        let curve = fit_periodic_bspline_curve(
+            u.view(),
+            y.view(),
+            &periodic_test_spec(40),
+            PERIODIC_TEST_SMOOTHING_LAMBDA,
+        )
+        .expect("fit high-dimensional loop");
 
         let q = array![0.17, 1.91, 5.8];
         let q_wrapped = q.mapv(|v| v + 9.0 * std::f64::consts::TAU);
