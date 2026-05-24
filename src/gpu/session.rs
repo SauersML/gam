@@ -280,7 +280,6 @@ pub fn try_fast_xt_diag_x_arc<S: Data<Elem = f64>>(
     w: &ArrayBase<S, Ix1>,
 ) -> Option<Array2<f64>> {
     let (rows, cols) = x.dim();
-    debug_assert_eq!(rows, w.len(), "X rows must match W length");
     let runtime = GpuRuntime::global();
     if !runtime.is_available() {
         return None;
