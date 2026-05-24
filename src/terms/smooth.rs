@@ -22456,7 +22456,7 @@ mod tests {
             None,
         )
         .expect("analytic outer eval");
-        let stash = crate::solver::estimate::reml::unified::debug_stash::take_terms();
+        let stash = crate::test_support::debug_stash::take_terms();
 
         let unprojected_tr = stash
             .unprojected_tr
@@ -22755,7 +22755,7 @@ mod tests {
         .expect("analytic outer eval");
         assert!(analytic_cost.is_finite());
         assert!(analytic_gradient.iter().all(|value| value.is_finite()));
-        let stash = crate::solver::estimate::reml::unified::debug_stash::take_terms();
+        let stash = crate::test_support::debug_stash::take_terms();
         let c_x_tau_beta = stash.c_x_tau_beta_diag.clone().expect("term4 diag stashed");
         let x_v_psi = stash.c_x_v_psi_diag.clone().expect("X·v_ψ stashed");
         assert_eq!(c_x_tau_beta.len(), n);
