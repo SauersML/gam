@@ -28,7 +28,12 @@ _EDF_KEYS = ("edf_total", "edf", "effective_dof")
 _PENALTY_RANK_KEYS = ("penalty_rank", "rank_s", "rank_S", "cache_penalty_rank")
 _NULL_DIM_KEYS = ("null_dim",)
 _NULLITY_KEYS = ("nullity", "penalty_nullity", "cache_nullity")
-_NULL_HESSIAN_LOGDET_KEYS = ("null_hessian_logdet", "h_null_logdet", "logdet_h_null")
+_NULL_HESSIAN_LOGDET_KEYS = (
+    "null_space_logdet",
+    "null_hessian_logdet",
+    "h_null_logdet",
+    "logdet_h_null",
+)
 _DIM_KEYS = ("effective_dim", "dim_h", "dim_H", "hessian_dim")
 _TK_LOG_2PI = math.log(2.0 * math.pi)
 

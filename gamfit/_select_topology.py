@@ -41,7 +41,7 @@ class _TopologyTerm:
 
 
 BasisSpec: TypeAlias = Smooth
-ScoreKind: TypeAlias = Literal["reml", "laml", "bic"]
+ScoreKind: TypeAlias = Literal["reml", "laml", "bic", "tk"]
 ScoreScale: TypeAlias = Literal["per_observation", "per_effective_dim", "raw"]
 
 
@@ -73,6 +73,11 @@ def select_topology(
     **fit_kwargs: Any,
 ) -> SelectTopologyResult:
     """Select a topology by fitting candidates and ranking model evidence."""
+    # Gauge invariant: Tierney-Kadane comparisons require every candidate's
+    # penalty null space to be represented with the same deterministic
+    # orthonormal-basis convention. The Rust summary reports
+    # log|N.T @ H_p @ N| from the engine's RRQR null-space basis; mixing that
+    # with caller-supplied non-orthonormal gauges would change the normalizer.
     score_kind = _normalize_score_kind(score)
     score_scale_kind = _normalize_score_scale(score_scale)
     formula, feature_dim, n_obs = _formula_from_response(data, response)
@@ -540,8 +545,8 @@ def _quote(value: str) -> str:
 
 def _normalize_score_kind(score: str) -> ScoreKind:
     normalized = str(score).strip().lower()
-    if normalized not in {"reml", "laml", "bic"}:
-        raise ValueError("score must be one of: 'reml', 'laml', 'bic'")
+    if normalized not in {"reml", "laml", "bic", "tk"}:
+        raise ValueError("score must be one of: 'reml', 'laml', 'bic', 'tk'")
     return normalized  # type: ignore[return-value]
 
 
@@ -562,6 +567,10 @@ def _score_for_kind(
     basis_size: int,
     null_dim: float = 0.0,
 ) -> float:
+    if score_kind == "tk":
+        return _extract_reml_score_raw(
+            fit_obj
+        ) + _tk_normalizer_for_fit(fit_obj, null_dim)
     if score_kind == "reml":
         return _extract_reml_score_raw(
             fit_obj
