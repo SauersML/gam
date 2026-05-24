@@ -8,7 +8,56 @@
 
 use std::fmt;
 use std::sync::Once;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+pub mod arrow_schur_gpu;
+pub mod pirls_gpu;
+pub mod reml_gpu;
+
+/// Runtime solver device selection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Device {
+    #[default]
+    Cpu,
+    Cuda,
+}
+
+impl Device {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cpu" | "host" | "off" | "" => Some(Self::Cpu),
+            "cuda" | "gpu" | "device" => Some(Self::Cuda),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Device {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cpu => f.write_str("cpu"),
+            Self::Cuda => f.write_str("cuda"),
+        }
+    }
+}
+
+static DEVICE: OnceLock<Device> = OnceLock::new();
+
+pub fn configure_device(device: Device) {
+    drop(DEVICE.set(device));
+}
+
+#[must_use]
+pub fn selected_device() -> Device {
+    *DEVICE.get_or_init(Device::default)
+}
+
+#[inline]
+#[must_use]
+pub fn cuda_selected() -> bool {
+    selected_device() == Device::Cuda
+}
 
 /// Runtime GPU routing policy.
 ///

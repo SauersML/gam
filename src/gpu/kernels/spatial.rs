@@ -241,11 +241,9 @@ extern "C" __global__ void spatial_kernel(
         .arg(&dd)
         .arg(&kind_code)
         .arg(&p1);
-    // SAFETY: func loaded from a freshly NVRTC-compiled module on this
-    // context; da/db/dout are live device buffers sized na*d, nb*d, na*nb
-    // and pod scalars (nna, nnb, dd, kind_code, p1) match the kernel
-    // signature; the grid covers na*nb threads with the kernel's bounds
-    // check.
+    // NVRTC func fresh; da/db/dout sized na*d/nb*d/na*nb; pods match.
+    // Grid covers na*nb threads with kernel's bounds check.
+    // SAFETY: all kernel-arg lifetimes + bounds checked above.
     unsafe { builder.launch(cfg) }.map_err(map_drv)?;
 
     let host = stream.memcpy_dtov(&dout).map_err(map_drv)?;
