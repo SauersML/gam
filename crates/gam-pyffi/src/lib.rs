@@ -15433,7 +15433,10 @@ mod tests {
             offset.view(),
             &s_list,
             Some(heuristic_lambdas.as_slice()),
-            gam::types::LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &opts,
         )?;
         let beta = fit.beta.clone();
