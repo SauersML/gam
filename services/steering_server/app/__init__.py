@@ -1,2 +1,0 @@
-"""Steering server package."""
-
