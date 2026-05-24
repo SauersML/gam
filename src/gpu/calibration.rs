@@ -52,7 +52,7 @@ pub struct DeviceCalibration {
 impl DeviceCalibration {
     /// Are all three measurements positive and finite? Used by the probe to
     /// gate "did calibration succeed".
-    pub fn is_usable(&self) -> bool {
+    pub const fn is_usable(&self) -> bool {
         self.fp64_gflops.is_finite()
             && self.fp64_gflops > 0.0
             && self.h2d_gb_s.is_finite()
@@ -326,7 +326,7 @@ fn measure_cpu_fp64_inner() -> f64 {
     }
 }
 
-fn bytes_per_sec(bytes: usize, seconds: f64) -> f64 {
+const fn bytes_per_sec(bytes: usize, seconds: f64) -> f64 {
     if seconds <= 0.0 {
         0.0
     } else {
