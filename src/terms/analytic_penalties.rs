@@ -5039,16 +5039,23 @@ impl AnalyticPenalty for ScadMcpPenalty {
 // Block-orthogonality penalty
 // ---------------------------------------------------------------------------
 
-/// Between-block-only orthogonality; leaves within-block structure free.
-/// Codifies the auto_exp_38 gauge-fix-companion pattern: supervise one block
-/// via AuxConditional, leave the other free, pair with BlockOrthogonality to
-/// force the supervised gauge to anchor the free axes.
+/// Between-block-only orthogonality on a row-major matrix-valued latent
+/// block. Penalizes the squared Frobenius norm of the off-diagonal blocks
+/// of the latent Gram matrix `Tᵀ T`, where `T` is the row-major
+/// `n_eff × latent_dim` view of the target slice and `groups` partitions
+/// the latent axes into disjoint subsets:
 ///
-/// The `auto_exp_38` memory `project_cogito_recovery_at_d_aux_3.md`
-/// records the motivation: cogito-L40's name-semantic subspace emerged
-/// unsupervisedly when HSV was locked down on a companion 3-axis block, and
-/// the supervised block plus free block had to be orthogonal for gauge
-/// transfer.
+/// ```text
+///   P(T) = ½ · w · Σ_{g ≠ h}  ‖ (Tᵀ T)_{group_g, group_h} ‖²_F
+/// ```
+///
+/// Within-block structure is unconstrained — the penalty zeroes out only
+/// off-diagonal blocks. Pair with a per-block ARD penalty when you also
+/// want within-block axis sparsity / scale identification.
+///
+/// Typical use: gauge-fixing a latent decomposition where one block has
+/// been supervised (e.g. anchored to known coordinates) and a free block
+/// needs to inhabit the orthogonal complement of that supervision.
 #[derive(Debug, Clone)]
 pub struct BlockOrthogonalityPenalty {
     pub target: PsiSlice,

@@ -660,6 +660,205 @@ fn scan_for_unsafe_without_safety(
     });
 }
 
+/// Returns true when `stripped` declares `unsafe impl Send` or `unsafe
+/// impl Sync` (with generics tolerated after the marker trait name).
+/// Matches when the next non-whitespace byte after `Send`/`Sync` is `<`,
+/// `for`, whitespace, or end-of-line — keeps the check from firing on
+/// identifiers like `SendQueue`.
+fn is_unsafe_marker_impl(stripped: &str) -> bool {
+    for marker in ["Send", "Sync"] {
+        let needle_owned = format!("unsafe impl {}", marker);
+        let needle = needle_owned.as_str();
+        let bytes = stripped.as_bytes();
+        let nb = needle.as_bytes();
+        let mut i = 0usize;
+        while i + nb.len() <= bytes.len() {
+            if &bytes[i..i + nb.len()] == nb {
+                let after = i + nb.len();
+                if after == bytes.len() {
+                    return true;
+                }
+                let c = bytes[after];
+                if c == b'<' || c.is_ascii_whitespace() {
+                    return true;
+                }
+                if after + 3 <= bytes.len() && &bytes[after..after + 3] == b"for" {
+                    return true;
+                }
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
+/// Walks `transmute` keyword sites and requires a `// SAFETY:` comment
+/// within the same line or one of the 3 preceding non-blank lines.
+/// Whole-word match on `transmute`; additionally the stripped line must
+/// contain `mem::` or `transmute::<` so unrelated identifiers are not
+/// considered. Build.rs is exempt; strict everywhere else.
+fn scan_for_transmute_without_safety(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("transmute") {
+            return;
+        }
+        let lines: Vec<&str> = content.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            let stripped = strip_strings_and_comments(line);
+            if !line_has_keyword(&stripped, "transmute") {
+                continue;
+            }
+            if !stripped.contains("mem::") && !stripped.contains("transmute::<") {
+                continue;
+            }
+            if line.contains("SAFETY:") {
+                continue;
+            }
+            let mut justified = false;
+            let mut seen = 0usize;
+            let mut k = idx;
+            while k > 0 && seen < 3 {
+                k -= 1;
+                let prev = lines[k];
+                if prev.trim().is_empty() {
+                    continue;
+                }
+                seen += 1;
+                if prev.contains("SAFETY:") {
+                    justified = true;
+                    break;
+                }
+            }
+            if !justified {
+                offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+            }
+        }
+    });
+}
+
+/// Walks `panic!(` macro sites in non-test code and requires a `// SAFETY:`
+/// comment within the same line or one of the 3 preceding non-blank lines.
+/// Mirrors `scan_for_unsafe_without_safety`. The `panic!` family in the
+/// history audit still treats any panic-shape in a former-marker body as
+/// trivial, regardless of SAFETY comments — this softening applies only
+/// to the lexical scanner.
+fn scan_for_panic_without_safety(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("panic!(") {
+            return;
+        }
+        let mask = compute_test_mask(content, rel);
+        let lines: Vec<&str> = content.lines().collect();
+        for (idx, line) in lines.iter().enumerate() {
+            if mask.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let stripped = strip_strings_and_comments(line);
+            if !stripped.contains("panic!(") {
+                continue;
+            }
+            if line.contains("SAFETY:") {
+                continue;
+            }
+            let mut justified = false;
+            let mut seen = 0usize;
+            let mut k = idx;
+            while k > 0 && seen < 3 {
+                k -= 1;
+                let prev = lines[k];
+                if prev.trim().is_empty() {
+                    continue;
+                }
+                seen += 1;
+                if prev.contains("SAFETY:") {
+                    justified = true;
+                    break;
+                }
+            }
+            if !justified {
+                offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+            }
+        }
+    });
+}
+
+/// Flags `#[cfg(any())]` (permanently false) and `#[cfg(all())]`
+/// (permanently true) attributes. Whitespace inside the parens is
+/// tolerated (e.g. `cfg(any( ))`). Operates on the stripped line and
+/// requires `#[` on the same line to avoid matching commentary that
+/// quotes the attribute syntax. Build.rs is exempt; strict everywhere
+/// else.
+fn scan_for_dead_cfg_gates(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("cfg(") {
+            return;
+        }
+        for (idx, line) in content.lines().enumerate() {
+            let stripped = strip_strings_and_comments(line);
+            if !stripped.contains("#[") {
+                continue;
+            }
+            if line_has_empty_cfg_gate(&stripped) {
+                offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+            }
+        }
+    });
+}
+
+/// True when `stripped` contains `cfg(any(...))` or `cfg(all(...))` with
+/// only whitespace between the inner parens.
+fn line_has_empty_cfg_gate(stripped: &str) -> bool {
+    for marker in ["cfg(any(", "cfg(all("] {
+        let mut search_from = 0usize;
+        while let Some(rel_pos) = stripped[search_from..].find(marker) {
+            let inner_start = search_from + rel_pos + marker.len();
+            let bytes = stripped.as_bytes();
+            let mut j = inner_start;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b')' {
+                return true;
+            }
+            search_from = inner_start;
+        }
+    }
+    false
+}
+
 fn scan_for_bare_should_panic(
     root: &Path,
     dir: &Path,
@@ -711,16 +910,91 @@ fn scan_for_dead_guard_consts(
         if !content.contains("const ") {
             return;
         }
+        let trait_impl_mask = compute_trait_impl_mask(content);
         for (idx, line) in content.lines().enumerate() {
             let stripped = strip_strings_and_comments(line);
             if !line_has_keyword(&stripped, "const") {
                 continue;
             }
             if line_matches_bool_literal_const(&stripped) {
+                if trait_impl_mask.get(idx).copied().unwrap_or(false) {
+                    // Trait-impl associated constants are required by the
+                    // trait and cannot be replaced by `cfg`. Inherent-impl
+                    // and free-item consts are still flagged.
+                    continue;
+                }
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }
         }
     });
+}
+
+/// Build a per-line bitmap of "is this line inside the body of a `impl
+/// <Trait> for <Type>` block?". Used to suppress the dead-guard-const
+/// check on trait-required associated constants. Brace tracking uses
+/// `strip_strings_and_comments` per line so braces inside string literals
+/// or `//` comments don't perturb depth. Inherent impls (`impl Foo { ... }`,
+/// no ` for `) are NOT marked.
+///
+/// The detector tolerates multi-line impl headers: when a line opens a
+/// brace, we look back up to 3 non-blank lines to find an `impl` token
+/// and decide whether the header contains ` for `.
+fn compute_trait_impl_mask(content: &str) -> Vec<bool> {
+    let lines: Vec<&str> = content.lines().collect();
+    let n = lines.len();
+    let mut mask = vec![false; n];
+    let stripped_lines: Vec<String> =
+        lines.iter().map(|l| strip_strings_and_comments(l)).collect();
+
+    // Stack entry: depth-just-before-open, is_trait_impl.
+    let mut stack: Vec<(i32, bool)> = Vec::new();
+    let mut depth: i32 = 0;
+
+    for (idx, stripped) in stripped_lines.iter().enumerate() {
+        let inside_trait_impl = stack.iter().any(|(_, t)| *t);
+        mask[idx] = inside_trait_impl;
+
+        let bytes = stripped.as_bytes();
+        for &b in bytes {
+            if b == b'{' {
+                let opened_at_depth = depth;
+                depth += 1;
+                // Determine whether the brace just opened is the body of a
+                // trait impl. Look at the current line plus up to 3
+                // preceding non-blank stripped lines for `impl ` and
+                // ` for `.
+                let mut header = String::new();
+                header.push_str(stripped);
+                let mut seen = 0usize;
+                let mut k = idx;
+                while k > 0 && seen < 3 {
+                    k -= 1;
+                    let prev = &stripped_lines[k];
+                    if prev.trim().is_empty() {
+                        continue;
+                    }
+                    seen += 1;
+                    header.insert(0, ' ');
+                    header.insert_str(0, prev);
+                    if line_has_keyword(prev, "impl") {
+                        break;
+                    }
+                }
+                let is_trait_impl = line_has_keyword(&header, "impl")
+                    && header.contains(" for ");
+                stack.push((opened_at_depth, is_trait_impl));
+            } else if b == b'}' {
+                if let Some(&(entry, _)) = stack.last() {
+                    if depth - 1 == entry {
+                        stack.pop();
+                    }
+                }
+                depth -= 1;
+            }
+        }
+    }
+
+    mask
 }
 
 /// True if `stripped` contains a `const <ident>: bool = <true|false>;`
@@ -889,9 +1163,55 @@ fn strip_strings_and_comments(line: &str) -> String {
         if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
             break;
         }
-        if c == b'"' || c == b'\'' {
+        if c == b'"' {
             in_str = true;
             str_quote = c;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == b'\'' {
+            // Distinguish char literal from Rust lifetime. A real char
+            // literal is `'\...'` (escape) or `'X'` where X is a single
+            // non-`'` byte and the closing `'` appears within ~4 bytes.
+            // Otherwise (e.g. `'_`, `'static`, `'a,`, `'b>`), leave the
+            // `'` alone — it's a lifetime, not a literal.
+            let is_char_lit = if i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                // Escape form: look for closing `'` within next 8 bytes.
+                let mut k = i + 2;
+                let mut found = false;
+                while k < bytes.len() && k < i + 10 {
+                    if bytes[k] == b'\'' {
+                        found = true;
+                        break;
+                    }
+                    k += 1;
+                }
+                found
+            } else if i + 2 < bytes.len()
+                && bytes[i + 1] != b'\''
+                && bytes[i + 2] == b'\''
+            {
+                // Single-byte char literal `'X'`.
+                true
+            } else if i + 3 < bytes.len()
+                && bytes[i + 1] != b'\''
+                && bytes[i + 3] == b'\''
+            {
+                // Two-byte (rare; e.g. some unicode prefixes). Bounded
+                // lookahead within ~4 bytes.
+                true
+            } else {
+                false
+            };
+            if is_char_lit {
+                in_str = true;
+                str_quote = c;
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            // Lifetime: emit the apostrophe verbatim and continue.
             out.push(c);
             i += 1;
             continue;
@@ -1221,6 +1541,15 @@ const HISTORY_BODY_REJECT_MACROS: &[&str] = &[
     "todo!(",
     "unreachable!(",
     "panic!(",
+    // Vacuous-assertion impostor for `unimplemented!`: matches both
+    // `assert!(false)` and `assert!(false, "msg")` (no closing paren in
+    // the needle).
+    "assert!(false",
+    // Process-termination impostors. Both qualified (`std::process::exit(`)
+    // and unqualified (`process::exit(`) spellings end in `process::exit(`,
+    // so a single needle covers both.
+    "process::exit(",
+    "process::abort(",
 ];
 
 /// Minimum number of substantive (non-blank, non-comment, non-pure-brace,
