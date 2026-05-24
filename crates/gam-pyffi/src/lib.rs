@@ -126,6 +126,7 @@ struct PyFitConfig {
     noise_offset: Option<String>,
 
     firth: Option<bool>,
+    gpu: Option<String>,
 
     // Integration seam for task 04's group abstraction. The proposed group
     // type can pass either `group_metadata` directly or `groups` entries with
@@ -11273,6 +11274,14 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     }
     if let Some(flag) = py_config.firth {
         fit_config.firth = flag;
+    }
+    if let Some(raw_gpu) = py_config.gpu {
+        fit_config.gpu_policy = gam::gpu::GpuPolicy::parse(&raw_gpu).ok_or_else(|| {
+            format!(
+                "invalid gpu policy '{}'; supported values are auto, off, force",
+                raw_gpu
+            )
+        })?;
     }
     if let Some(kind) = py_config.frailty_kind {
         let trimmed = kind.trim().to_ascii_lowercase();
