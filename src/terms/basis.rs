@@ -7769,13 +7769,24 @@ pub fn build_bspline_basis_1d(
             ops,
         });
     }
-    if spec.streaming_chunk_size.is_some() {
-        let knots = match &spec.knotspec {
+    // Auto-streaming decision for non-periodic B-spline: we need `p_raw` to
+    // size the dense buffer estimate, which requires materializing the knot
+    // vector first. We build it here (cheap relative to a full N×P design)
+    // and check the auto threshold; if streaming activates we use the same
+    // knots/penalties downstream, otherwise we fall through to the regular
+    // dense/sparse path below (which will build its own knots — that path is
+    // shared with several knot-spec shapes and is not worth refactoring).
+    let auto_chunk_streaming = {
+        let knots_for_estimate = match &spec.knotspec {
             BSplineKnotSpec::Generate {
                 data_range,
                 num_internal_knots,
-            } => internal::generate_full_knot_vector(*data_range, *num_internal_knots, spec.degree)?,
-            BSplineKnotSpec::Provided(knots) => knots.clone(),
+            } => Some(internal::generate_full_knot_vector(
+                *data_range,
+                *num_internal_knots,
+                spec.degree,
+            )?),
+            BSplineKnotSpec::Provided(knots) => Some(knots.clone()),
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
                 placement,
@@ -7783,7 +7794,7 @@ pub fn build_bspline_basis_1d(
                 let inferred = num_internal_knots.unwrap_or_else(|| {
                     default_internal_knot_count_for_data(data.len(), spec.degree)
                 });
-                match placement {
+                Some(match placement {
                     BSplineKnotPlacement::Uniform => {
                         let range = finite_data_range(data)?;
                         internal::generate_full_knot_vector(range, inferred, spec.degree)?
@@ -7791,17 +7802,27 @@ pub fn build_bspline_basis_1d(
                     BSplineKnotPlacement::Quantile => {
                         internal::generate_full_knot_vector_quantile(data, inferred, spec.degree)?
                     }
-                }
+                })
             }
-            BSplineKnotSpec::PeriodicUniform { .. } => {
-                return Err(BasisError::InvalidInput(
-                    "periodic B-spline must be handled before non-periodic streaming".to_string(),
-                ));
-            }
+            BSplineKnotSpec::PeriodicUniform { .. } => None,
         };
-        let p_raw = knots.len().checked_sub(spec.degree + 1).ok_or_else(|| {
-            BasisError::InvalidInput("invalid B-spline knot/degree combination".to_string())
-        })?;
+        match knots_for_estimate {
+            Some(knots_est) => {
+                let p_raw_est = knots_est
+                    .len()
+                    .checked_sub(spec.degree + 1)
+                    .ok_or_else(|| {
+                        BasisError::InvalidInput(
+                            "invalid B-spline knot/degree combination".to_string(),
+                        )
+                    })?;
+                auto_streaming_chunk_size_for_dense(data.len(), p_raw_est)
+                    .map(|chunk| (knots_est, p_raw_est, chunk))
+            }
+            None => None,
+        }
+    };
+    if let Some((knots, p_raw, chunk)) = auto_chunk_streaming {
         let greville_for_penalty = penalty_greville_abscissae_for_knots(&knots, spec.degree)?;
         let s_bend_raw = create_difference_penalty_matrix(
             p_raw,
@@ -7833,10 +7854,10 @@ pub fn build_bspline_basis_1d(
             .map(|candidate| candidate.matrix.clone())
             .collect();
         log::info!(
-            "B-spline basis using explicit streaming evaluator: n={} p={} chunk_size={}",
+            "B-spline basis auto-streaming evaluator: n={} p={} chunk_size={}",
             data.len(),
             p_raw,
-            spec.streaming_chunk_size.unwrap_or(2048).max(1),
+            chunk,
         );
         let (design, transformed_candidates, identifiability_transform) =
             build_streaming_bspline_design_and_candidates(
@@ -7848,7 +7869,7 @@ pub fn build_bspline_basis_1d(
                 &spec.identifiability,
                 penalties_raw,
                 penalties_raw_mats,
-                spec.streaming_chunk_size,
+                Some(chunk),
             )?;
         let (penalties, nullspace_dims, penaltyinfo, ops) =
             filter_active_penalty_candidates_with_ops(transformed_candidates)?;
@@ -7861,7 +7882,6 @@ pub fn build_bspline_basis_1d(
                 knots,
                 identifiability_transform,
                 periodic: None,
-                streaming_chunk_size: spec.streaming_chunk_size,
             },
             kronecker_factored: None,
             ops,
@@ -8151,7 +8171,6 @@ pub fn build_bspline_basis_1d(
             knots,
             identifiability_transform,
             periodic: None,
-            streaming_chunk_size: spec.streaming_chunk_size,
         },
         kronecker_factored: None,
         ops,
@@ -16145,11 +16164,6 @@ pub fn build_spherical_spline_basis(
     spec: &SphericalSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
     if matches!(spec.method, SphereMethod::Harmonic) {
-        if spec.streaming_chunk_size.is_some() {
-            return Err(BasisError::InvalidInput(
-                "streaming_chunk_size is only supported for Wahba sphere bases".to_string(),
-            ));
-        }
         return build_spherical_harmonic_basis(data, spec);
     }
     validate_lat_lon_matrix(data, "spherical spline", spec.radians)?;
@@ -16181,12 +16195,13 @@ pub fn build_spherical_spline_basis(
     let weights = sphere_area_weights(centers.view(), spec.radians);
     let z = weighted_coefficient_sum_to_zero_transform(weights.view())?;
     let penalty = z.t().dot(&raw_penalty).dot(&z);
-    let design = if spec.streaming_chunk_size.is_some() {
+    let sphere_auto_chunk = auto_streaming_chunk_size_for_dense(data.nrows(), z.ncols());
+    let design = if let Some(chunk) = sphere_auto_chunk {
         log::info!(
-            "Sphere basis using explicit streaming evaluator: n={} p={} chunk_size={}",
+            "Sphere basis auto-streaming evaluator: n={} p={} chunk_size={}",
             data.nrows(),
             z.ncols(),
-            spec.streaming_chunk_size.unwrap_or(2048).max(1),
+            chunk,
         );
         let op = StreamingSphereEvaluator::new(
             Arc::new(data.as_standard_layout().to_owned()),
@@ -16195,7 +16210,7 @@ pub fn build_spherical_spline_basis(
             spec.radians,
             spec.wahba_kernel,
             Some(Arc::new(z.clone())),
-            spec.streaming_chunk_size,
+            Some(chunk),
         )
         .map_err(BasisError::InvalidInput)?;
         DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op)))
@@ -16244,7 +16259,6 @@ pub fn build_spherical_spline_basis(
             max_degree: None,
             wahba_kernel: spec.wahba_kernel,
             constraint_transform: Some(z),
-            streaming_chunk_size: spec.streaming_chunk_size,
         },
         kronecker_factored: None,
         ops,
@@ -16486,7 +16500,6 @@ fn build_spherical_harmonic_basis(
             max_degree: Some(l_max),
             wahba_kernel: spec.wahba_kernel,
             constraint_transform: None,
-            streaming_chunk_size: None,
         },
         kronecker_factored: None,
         ops,
@@ -16523,14 +16536,15 @@ pub fn build_matern_basiswithworkspace(
     let design_cols =
         z_opt.as_ref().map_or(centers.nrows(), Array2::ncols) + usize::from(spec.include_intercept);
     let dense_bytes = dense_design_bytes(data.nrows(), design_cols);
-    let use_streaming = spec.streaming_chunk_size.is_some();
+    let matern_auto_chunk = auto_streaming_chunk_size_for_dense(data.nrows(), design_cols);
+    let use_streaming = matern_auto_chunk.is_some();
     let use_lazy = !use_streaming && should_use_lazy_spatial_design(data.nrows(), design_cols, workspace.policy());
-    let (design, candidates) = if use_streaming {
+    let (design, candidates) = if let Some(chunk) = matern_auto_chunk {
         log::info!(
-            "Matérn basis using explicit streaming evaluator: n={} p={} chunk_size={}",
+            "Matérn basis auto-streaming evaluator: n={} p={} chunk_size={}",
             data.nrows(),
             design_cols,
-            spec.streaming_chunk_size.unwrap_or(2048).max(1),
+            chunk,
         );
         let shared_data = shared_owned_data_matrix(data, &mut workspace.cache);
         let op = StreamingMaternEvaluator::new(
@@ -16541,7 +16555,7 @@ pub fn build_matern_basiswithworkspace(
             aniso.clone(),
             z_opt.as_ref().map(|z| Arc::new(z.clone())),
             spec.include_intercept,
-            spec.streaming_chunk_size,
+            Some(chunk),
         )
         .map_err(BasisError::InvalidInput)?;
         let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op)));
@@ -16711,7 +16725,6 @@ pub fn build_matern_basiswithworkspace(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: aniso,
-            streaming_chunk_size: spec.streaming_chunk_size,
         },
         kronecker_factored: None,
         ops,

@@ -2310,6 +2310,11 @@ impl<'a> RemlState<'a> {
 
         let direct_blocks = Self::tk_cd_direct_active_blocks(c_array, &c_prime);
         let mut c_term_prime = 0.0_f64;
+        // Hoist per-block-pair scratch outside the double loop. Both buffers
+        // are sized at TK_BLOCK_SIZE × TK_BLOCK_SIZE; per-iteration we take
+        // sub-views matching the actual (rows, cols) of the current block.
+        let mut block_scratch = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
+        let mut reverse_scratch = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
         for (j_block_idx, j_block) in direct_blocks.iter().enumerate() {
             let j0 = j_block.start;
             let j1 = j_block.end;
@@ -2326,15 +2331,15 @@ impl<'a> RemlState<'a> {
                     let x_theta = x_fixed.expect("design derivative checked above");
                     let rows = i1 - i0;
                     let cols = j1 - j0;
-                    let mut block = Array2::<f64>::zeros((rows, cols));
+                    let mut block = block_scratch.slice_mut(s![..rows, ..cols]);
                     let x_theta_i = x_theta.slice(s![i0..i1, ..]);
                     let z_j = z.slice(s![.., j0..j1]);
                     ndarray::linalg::general_mat_mul(1.0, &x_theta_i, &z_j, 0.0, &mut block);
+                    let mut reverse = reverse_scratch.slice_mut(s![..cols, ..rows]);
                     let x_theta_j = x_theta.slice(s![j0..j1, ..]);
                     let z_i = z.slice(s![.., i0..i1]);
-                    let mut reverse = Array2::<f64>::zeros((cols, rows));
                     ndarray::linalg::general_mat_mul(1.0, &x_theta_j, &z_i, 0.0, &mut reverse);
-                    Some((block, reverse))
+                    Some((rows, cols))
                 } else {
                     None
                 };

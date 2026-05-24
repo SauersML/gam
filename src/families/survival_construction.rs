@@ -30,6 +30,7 @@ use crate::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix};
 use crate::probability::{normal_pdf, standard_normal_quantile};
 use crate::types::{InverseLink, LinkFunction};
 use ndarray::{Array1, Array2, array, s};
+use rayon::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Typed error
@@ -1917,38 +1918,57 @@ pub fn baseline_chain_rule_gradient(
             );
         }
     };
-    let mut grad = Array1::<f64>::zeros(theta_dim);
-    for i in 0..n {
-        let t_exit = age_exit[i];
-        // Exit + derivative partials both come from the age_exit evaluation.
-        let partials_exit = baseline_offset_theta_partials(t_exit, cfg)?
-            .ok_or_else(|| "unexpected None from baseline partials at exit".to_string())?;
-        if partials_exit.len() != theta_dim {
-            return Err(format!(
-                "baseline_chain_rule_gradient: theta_dim drifted ({} != {})",
-                partials_exit.len(),
-                theta_dim
-            ));
-        }
-        let r_x = residuals.exit[i];
-        let r_d = residuals.derivative[i];
-        for k in 0..theta_dim {
-            let (d_eta_dk, d_od_dk) = partials_exit[k];
-            grad[k] += r_x * d_eta_dk + r_d * d_od_dk;
-        }
-        // Entry channel is nonzero only for rows with a positive entry
-        // interval; for origin-entry rows age_entry may be 0 and calling
-        // baseline_offset_theta_partials would error. Gate on residual==0.
-        let r_e = residuals.entry[i];
-        if r_e != 0.0 {
-            let t_entry = age_entry[i];
-            let partials_entry = baseline_offset_theta_partials(t_entry, cfg)?
-                .ok_or_else(|| "unexpected None from baseline partials at entry".to_string())?;
-            for k in 0..theta_dim {
-                grad[k] += r_e * partials_entry[k].0;
-            }
-        }
-    }
+    // Per-row partial contractions are independent. Each iteration produces a
+    // length-`theta_dim` increment vector; rayon's try_fold/try_reduce sums them
+    // and short-circuits on the first Err. Identity = zeros(theta_dim).
+    let grad = (0..n)
+        .into_par_iter()
+        .try_fold(
+            || Ok::<Array1<f64>, String>(Array1::<f64>::zeros(theta_dim)),
+            |acc, i| -> Result<Result<Array1<f64>, String>, String> {
+                let mut acc = acc?;
+                let t_exit = age_exit[i];
+                // Exit + derivative partials both come from the age_exit evaluation.
+                let partials_exit = baseline_offset_theta_partials(t_exit, cfg)?
+                    .ok_or_else(|| "unexpected None from baseline partials at exit".to_string())?;
+                if partials_exit.len() != theta_dim {
+                    return Err(format!(
+                        "baseline_chain_rule_gradient: theta_dim drifted ({} != {})",
+                        partials_exit.len(),
+                        theta_dim
+                    ));
+                }
+                let r_x = residuals.exit[i];
+                let r_d = residuals.derivative[i];
+                for k in 0..theta_dim {
+                    let (d_eta_dk, d_od_dk) = partials_exit[k];
+                    acc[k] += r_x * d_eta_dk + r_d * d_od_dk;
+                }
+                // Entry channel is nonzero only for rows with a positive entry
+                // interval; for origin-entry rows age_entry may be 0 and calling
+                // baseline_offset_theta_partials would error. Gate on residual==0.
+                let r_e = residuals.entry[i];
+                if r_e != 0.0 {
+                    let t_entry = age_entry[i];
+                    let partials_entry = baseline_offset_theta_partials(t_entry, cfg)?
+                        .ok_or_else(|| {
+                            "unexpected None from baseline partials at entry".to_string()
+                        })?;
+                    for k in 0..theta_dim {
+                        acc[k] += r_e * partials_entry[k].0;
+                    }
+                }
+                Ok(Ok(acc))
+            },
+        )
+        .try_reduce(
+            || Ok::<Array1<f64>, String>(Array1::<f64>::zeros(theta_dim)),
+            |a, b| -> Result<Result<Array1<f64>, String>, String> {
+                let a = a?;
+                let b = b?;
+                Ok(Ok(a + b))
+            },
+        )??;
     Ok(Some(grad))
 }
 
