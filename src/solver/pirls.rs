@@ -2002,7 +2002,7 @@ impl<'a> GamWorkingModel<'a> {
     }
 
     fn supports_observed_hessian_curvature(&self) -> bool {
-        supports_observed_hessian_curvature_for_likelihood(self.likelihood, &self.link_kind)
+        supports_observed_hessian_curvature_for_likelihood(&self.likelihood, &self.link_kind)
     }
 
     /// Compute the Hessian-side weight arrays (w, c, d) for the requested curvature kind.
@@ -2037,7 +2037,7 @@ impl<'a> GamWorkingModel<'a> {
         }
 
         compute_observed_hessian_curvature_arrays_into(
-            self.likelihood,
+            &self.likelihood,
             &self.link_kind,
             &self.workspace.eta_buf,
             self.y,
@@ -2496,7 +2496,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         let log_likelihood = calculate_loglikelihood_omitting_constants(
             self.y,
             &self.lastmu,
-            self.likelihood,
+            &self.likelihood,
             self.priorweights,
         );
 
@@ -10075,25 +10075,21 @@ pub fn outer_hessian_curvature_arrays(
 }
 
 #[inline]
-fn fixed_glm_dispersion(likelihood: GlmLikelihoodSpec) -> f64 {
+fn fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
     likelihood.fixed_phi().unwrap_or(1.0)
 }
 
 #[inline]
-pub fn weight_family_for_glm_likelihood(likelihood: GlmLikelihoodSpec) -> WeightFamily {
-    match likelihood.family {
-        GlmFamily::GaussianIdentity => WeightFamily::Gaussian,
-        GlmFamily::PoissonLog => WeightFamily::Poisson,
-        GlmFamily::Tweedie { p } => WeightFamily::Tweedie { p },
-        GlmFamily::NegativeBinomial { theta } => WeightFamily::NegativeBinomial { theta },
-        GlmFamily::BetaLogit { phi } => WeightFamily::Beta { phi },
-        GlmFamily::GammaLog => WeightFamily::Gamma,
-        GlmFamily::BinomialLogit
-        | GlmFamily::BinomialProbit
-        | GlmFamily::BinomialCLogLog
-        | GlmFamily::BinomialSas
-        | GlmFamily::BinomialBetaLogistic
-        | GlmFamily::BinomialMixture => WeightFamily::Binomial,
+pub fn weight_family_for_glm_likelihood(likelihood: &GlmLikelihoodSpec) -> WeightFamily {
+    match &likelihood.spec.response {
+        ResponseFamily::Gaussian => WeightFamily::Gaussian,
+        ResponseFamily::Poisson => WeightFamily::Poisson,
+        ResponseFamily::Tweedie { p } => WeightFamily::Tweedie { p: *p },
+        ResponseFamily::NegativeBinomial { theta } => WeightFamily::NegativeBinomial { theta: *theta },
+        ResponseFamily::Beta { phi } => WeightFamily::Beta { phi: *phi },
+        ResponseFamily::Gamma => WeightFamily::Gamma,
+        ResponseFamily::Binomial => WeightFamily::Binomial,
+        ResponseFamily::RoystonParmar => WeightFamily::Gaussian,
     }
 }
 
@@ -10116,18 +10112,24 @@ fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> WeightLink {
 
 #[inline]
 fn supports_observed_hessian_curvature_for_likelihood(
-    likelihood: GlmLikelihoodSpec,
+    likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
 ) -> bool {
     assert!(std::mem::size_of_val(inverse_link) > 0);
+    let spec = &likelihood.spec;
+    if matches!(spec.response, ResponseFamily::Gamma) {
+        return true;
+    }
+    if !matches!(spec.response, ResponseFamily::Binomial) {
+        return false;
+    }
     matches!(
-        likelihood.family,
-        GlmFamily::GammaLog
-            | GlmFamily::BinomialProbit
-            | GlmFamily::BinomialCLogLog
-            | GlmFamily::BinomialSas
-            | GlmFamily::BinomialBetaLogistic
-            | GlmFamily::BinomialMixture
+        spec.link,
+        InverseLink::Standard(LinkFunction::Probit)
+            | InverseLink::Standard(LinkFunction::CLogLog)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_)
+            | InverseLink::Mixture(_)
     )
 }
 
@@ -10203,7 +10205,7 @@ fn solver_hessian_weights_into(
 /// response.md Section 3 for the mathematical justification of why observed
 /// (not Fisher) information is required.
 fn compute_observed_hessian_curvature_arrays_into(
-    likelihood: GlmLikelihoodSpec,
+    likelihood: &GlmLikelihoodSpec,
     inverse_link: &InverseLink,
     eta: &Array1<f64>,
     y: ArrayView1<'_, f64>,
@@ -10799,7 +10801,7 @@ fn beta_unit_deviance(yi: f64, mui: f64, phi: f64) -> f64 {
 pub fn calculate_deviance(
     y: ArrayView1<f64>,
     mu: &Array1<f64>,
-    likelihood: GlmLikelihoodSpec,
+    likelihood: &GlmLikelihoodSpec,
     priorweights: ArrayView1<f64>,
 ) -> f64 {
     const EPS: f64 = 1e-8;
@@ -10807,13 +10809,8 @@ pub fn calculate_deviance(
     // (`MIN_MU = 1e-10` in update_working_state_*_log) so deviance / weights
     // stay self-consistent when the linear predictor saturates.
     const MU_FLOOR: f64 = 1e-10;
-    match likelihood.family {
-        GlmFamily::BinomialLogit
-        | GlmFamily::BinomialProbit
-        | GlmFamily::BinomialCLogLog
-        | GlmFamily::BinomialSas
-        | GlmFamily::BinomialBetaLogistic
-        | GlmFamily::BinomialMixture => {
+    match &likelihood.spec.response {
+        ResponseFamily::Binomial => {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let total_residual: f64 = (0..y.len())
                 .into_par_iter()
@@ -10841,12 +10838,12 @@ pub fn calculate_deviance(
                 .sum();
             2.0 * total_residual
         }
-        GlmFamily::GaussianIdentity => ndarray::Zip::from(y)
+        ResponseFamily::Gaussian => ndarray::Zip::from(y)
             .and(mu)
             .and(priorweights)
             .map_collect(|&yi, &mui, &wi| wi * (yi - mui) * (yi - mui))
             .sum(),
-        GlmFamily::PoissonLog => {
+        ResponseFamily::Poisson => {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let total: f64 = (0..y.len())
                 .into_par_iter()
@@ -10858,7 +10855,8 @@ pub fn calculate_deviance(
                 .sum();
             2.0 * total
         }
-        GlmFamily::Tweedie { p } => {
+        ResponseFamily::Tweedie { p } => {
+            let p = *p;
             let phi = fixed_glm_dispersion(likelihood);
             if !is_valid_tweedie_power(p) || !(phi.is_finite() && phi > 0.0) {
                 return f64::NAN;
@@ -10877,7 +10875,8 @@ pub fn calculate_deviance(
                 .sum();
             2.0 * total
         }
-        GlmFamily::NegativeBinomial { theta } => {
+        ResponseFamily::NegativeBinomial { theta } => {
+            let theta = *theta;
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let total: f64 = (0..y.len())
                 .into_par_iter()
@@ -10889,7 +10888,8 @@ pub fn calculate_deviance(
                 .sum();
             2.0 * total
         }
-        GlmFamily::BetaLogit { phi } => {
+        ResponseFamily::Beta { phi } => {
+            let phi = *phi;
             if !valid_beta_phi(phi) {
                 return f64::NAN;
             }
@@ -10900,7 +10900,7 @@ pub fn calculate_deviance(
                 .sum();
             2.0 * total
         }
-        GlmFamily::GammaLog => {
+        ResponseFamily::Gamma => {
             let shape = likelihood.gamma_shape().unwrap_or(1.0);
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let total: f64 = (0..y.len())
@@ -10913,6 +10913,7 @@ pub fn calculate_deviance(
                 .sum();
             2.0 * total
         }
+        ResponseFamily::RoystonParmar => f64::NAN,
     }
 }
 
@@ -10920,7 +10921,7 @@ pub fn calculate_deviance(
 pub(crate) fn calculate_loglikelihood_omitting_constants(
     y: ArrayView1<f64>,
     mu: &Array1<f64>,
-    likelihood: GlmLikelihoodSpec,
+    likelihood: &GlmLikelihoodSpec,
     priorweights: ArrayView1<f64>,
 ) -> f64 {
     // Same μ floor as PIRLS log-link working-state writers; see note in
@@ -10928,20 +10929,15 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
     const MU_FLOOR: f64 = 1e-10;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = y.len();
-    match likelihood.family {
-        GlmFamily::GaussianIdentity => (0..n)
+    match &likelihood.spec.response {
+        ResponseFamily::Gaussian => (0..n)
             .into_par_iter()
             .map(|i| {
                 let resid = y[i] - mu[i];
                 -0.5 * priorweights[i] * resid * resid
             })
             .sum(),
-        GlmFamily::BinomialLogit
-        | GlmFamily::BinomialProbit
-        | GlmFamily::BinomialCLogLog
-        | GlmFamily::BinomialSas
-        | GlmFamily::BinomialBetaLogistic
-        | GlmFamily::BinomialMixture => (0..n)
+        ResponseFamily::Binomial => (0..n)
             .into_par_iter()
             .map(|i| {
                 // Share the deviance helper so both reductions floor mu at
@@ -10951,7 +10947,7 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                 priorweights[i] * (y[i] * mui_c.ln() + (1.0 - y[i]) * (1.0 - mui_c).ln())
             })
             .sum(),
-        GlmFamily::PoissonLog => (0..n)
+        ResponseFamily::Poisson => (0..n)
             .into_par_iter()
             .map(|i| {
                 let mui_c = mu[i].max(MU_FLOOR);
@@ -10959,46 +10955,54 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                 priorweights[i] * (log_term - mui_c)
             })
             .sum(),
-        GlmFamily::Tweedie { p } => {
+        ResponseFamily::Tweedie { p } => {
+            let p = *p;
             let phi = fixed_glm_dispersion(likelihood);
             if !is_valid_tweedie_power(p) || !(phi.is_finite() && phi > 0.0) {
                 return f64::NAN;
             }
             -0.5 * calculate_deviance(y, mu, likelihood, priorweights)
         }
-        GlmFamily::NegativeBinomial { theta } => (0..n)
-            .into_par_iter()
-            .map(|i| {
-                if !valid_negbin_theta(theta) {
-                    return f64::NAN;
-                }
-                let yi = y[i];
-                if !valid_count_response(yi) {
-                    return f64::NAN;
-                }
-                let mui_c = mu[i].max(MU_FLOOR);
-                priorweights[i]
-                    * (ln_gamma(yi + theta) - ln_gamma(theta) - ln_gamma(yi + 1.0)
-                        + theta * (theta.ln() - (theta + mui_c).ln())
-                        + xlogy(yi, mui_c)
-                        - yi * (theta + mui_c).ln())
-            })
-            .sum(),
-        GlmFamily::BetaLogit { phi } => (0..n)
-            .into_par_iter()
-            .map(|i| {
-                if !valid_beta_phi(phi) {
-                    return f64::NAN;
-                }
-                priorweights[i] * beta_loglikelihood_full_unit(y[i], mu[i], phi)
-            })
-            .sum(),
-        GlmFamily::GammaLog => gamma_loglikelihood_with_shape(
+        ResponseFamily::NegativeBinomial { theta } => {
+            let theta = *theta;
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    if !valid_negbin_theta(theta) {
+                        return f64::NAN;
+                    }
+                    let yi = y[i];
+                    if !valid_count_response(yi) {
+                        return f64::NAN;
+                    }
+                    let mui_c = mu[i].max(MU_FLOOR);
+                    priorweights[i]
+                        * (ln_gamma(yi + theta) - ln_gamma(theta) - ln_gamma(yi + 1.0)
+                            + theta * (theta.ln() - (theta + mui_c).ln())
+                            + xlogy(yi, mui_c)
+                            - yi * (theta + mui_c).ln())
+                })
+                .sum()
+        }
+        ResponseFamily::Beta { phi } => {
+            let phi = *phi;
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    if !valid_beta_phi(phi) {
+                        return f64::NAN;
+                    }
+                    priorweights[i] * beta_loglikelihood_full_unit(y[i], mu[i], phi)
+                })
+                .sum()
+        }
+        ResponseFamily::Gamma => gamma_loglikelihood_with_shape(
             y,
             mu,
             priorweights,
             likelihood.gamma_shape().unwrap_or(1.0),
         ),
+        ResponseFamily::RoystonParmar => f64::NAN,
     }
 }
 
