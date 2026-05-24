@@ -27,7 +27,11 @@ REFERENCE
 ---------
 Mendel et al. 2025 — Equivariant SAEs, arXiv:2511.09432
 Engels et al. 2024 — Concept Manifolds, arXiv:2604.28119
-auto_exp_38 (Manifold-SAE memory) — HSV gauge-fix recipe this generalizes.
+
+Design lesson generalized here: an auxiliary-supervised gauge-fix block paired
+with a free discovery block. The auxiliary block pins a known subspace (e.g.,
+HSV anchors on SO(2) atoms) so the equivariant prior + ARD can discover the
+residual semantic structure unsupervisedly in the free block.
 """
 from __future__ import annotations
 
@@ -238,21 +242,21 @@ class EquivariantPenalty:
 
 
 # ---------------------------------------------------------------------------
-# gauge_companion — auto_exp_38's recipe as a one-shot helper
+# gauge_companion — auxiliary-supervised gauge-fix recipe as a one-shot helper
 # ---------------------------------------------------------------------------
 
 @dataclass
 class GaugeCompanion:
-    """Bakes auto_exp_38's HSV-supervised gauge-fix recipe into one object.
+    """Auxiliary-supervised gauge-fix recipe wrapped into one object.
 
     Returns a list of (penalty, target) pairs that the caller wires into
     `gamfit.fit(..., penalties=[*gauge_companion("HSV").penalties, ...])`.
 
     The recipe:
-      - supervise `d_aux` SO(2) atoms' group elements g_a against HSV anchors
-        (atom 0 ↔ Hue, atom 1 ↔ Sat, atom 2 ↔ Val by default).
+      - supervise `d_aux` SO(2) atoms' group elements g_a against auxiliary
+        anchors (e.g. HSV: atom 0 ↔ Hue, atom 1 ↔ Sat, atom 2 ↔ Val).
       - leave the remaining atoms free; under EquivariantPenalty + ARD they
-        discover name-semantic axes unsupervisedly (per auto_exp_38).
+        discover the residual semantic axes unsupervisedly.
     """
     aux: Literal["HSV", "RGB", "LCh"]
     d_aux: int = 3
