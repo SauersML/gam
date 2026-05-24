@@ -36,23 +36,27 @@ use crate::estimate::{
 use crate::faer_ndarray::{FaerEigh, fast_atb, fast_atv};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{
-    BlockDesignOperator, CoefficientTransformOperator, DesignBlock, DesignMatrix,
-    RandomEffectOperator, SymmetricMatrix, TensorProductDesignOperator,
+    BlockDesignOperator, CoefficientTransformOperator, DenseDesignOperator, DesignBlock,
+    DesignMatrix, LinearOperator, RandomEffectOperator, SymmetricMatrix,
+    TensorProductDesignOperator,
 };
 use crate::mixture_link::{
     logit_inverse_link_jet5, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
 };
 use crate::pirls::LinearInequalityConstraints;
+use crate::resource::MatrixMaterializationError;
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, MixtureLinkState, SasLinkState,
 };
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::f64;
+use std::fs::File;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
@@ -257,6 +261,10 @@ pub enum SmoothBasisSpec {
         smooth_penalty: f64,
         #[serde(default)]
         center_mean: Option<Array1<f64>>,
+        #[serde(default)]
+        pca_basis_path: Option<PathBuf>,
+        #[serde(default = "default_pca_chunk_size")]
+        chunk_size: usize,
     },
     /// Tensor-product smooth built from 1D B-spline marginals.
     ///
@@ -486,6 +494,14 @@ pub struct LinearTermSpec {
 
 const fn default_linear_term_double_penalty() -> bool {
     true
+}
+
+const fn default_pca_smooth_penalty() -> f64 {
+    1.0
+}
+
+const fn default_pca_chunk_size() -> usize {
+    4096
 }
 
 /// Random-effects term specification.

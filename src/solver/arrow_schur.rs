@@ -145,7 +145,7 @@ impl ArrowSolverMode {
     /// BA-size heuristic: dense RCS for modest `K`, inexact Schur PCG for
     /// large shared systems. This follows Agarwal et al.'s direct-vs-iterative
     /// split for large BA, mapped from cameras to decoder coefficients.
-    pub fn automatic(k: usize) -> Self {
+    pub const fn automatic(k: usize) -> Self {
         if k <= DIRECT_SOLVE_MAX_K {
             Self::Direct
         } else {
@@ -156,7 +156,7 @@ impl ArrowSolverMode {
     /// Square-Root BA is the direct-solve stability mode for future f32
     /// callers. Large `K` still routes to inexact PCG because dense Schur
     /// storage dominates precision concerns at that scale.
-    pub fn automatic_for_single_precision(k: usize) -> Self {
+    pub const fn automatic_for_single_precision(k: usize) -> Self {
         if k <= DIRECT_SOLVE_MAX_K {
             Self::SqrtBA
         } else {

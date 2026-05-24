@@ -1228,11 +1228,11 @@ impl DenseDesignMatrix {
         }
     }
 
-    pub fn is_materialized_dense(&self) -> bool {
+    pub const fn is_materialized_dense(&self) -> bool {
         matches!(self, Self::Materialized(_))
     }
 
-    pub fn is_operator_backed(&self) -> bool {
+    pub const fn is_operator_backed(&self) -> bool {
         matches!(self, Self::Lazy(_))
     }
 
@@ -6856,11 +6856,11 @@ impl DesignMatrix {
         }
     }
 
-    pub fn is_materialized_dense(&self) -> bool {
+    pub const fn is_materialized_dense(&self) -> bool {
         matches!(self, Self::Dense(DenseDesignMatrix::Materialized(_)))
     }
 
-    pub fn is_operator_backed(&self) -> bool {
+    pub const fn is_operator_backed(&self) -> bool {
         match self {
             Self::Dense(matrix) => matrix.is_operator_backed(),
             Self::Sparse(_) => false,

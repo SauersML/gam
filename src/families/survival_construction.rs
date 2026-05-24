@@ -390,7 +390,7 @@ pub fn parse_survival_likelihood_mode(raw: &str) -> Result<SurvivalLikelihoodMod
     }
 }
 
-pub fn survival_likelihood_modename(mode: SurvivalLikelihoodMode) -> &'static str {
+pub const fn survival_likelihood_modename(mode: SurvivalLikelihoodMode) -> &'static str {
     match mode {
         SurvivalLikelihoodMode::Transformation => "transformation",
         SurvivalLikelihoodMode::Weibull => "weibull",
@@ -415,7 +415,7 @@ pub fn parse_survival_distribution(raw: &str) -> Result<ResidualDistribution, St
     }
 }
 
-pub fn survival_baseline_targetname(target: SurvivalBaselineTarget) -> &'static str {
+pub const fn survival_baseline_targetname(target: SurvivalBaselineTarget) -> &'static str {
     match target {
         SurvivalBaselineTarget::Linear => "linear",
         SurvivalBaselineTarget::Weibull => "weibull",

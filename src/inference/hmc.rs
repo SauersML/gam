@@ -3263,7 +3263,6 @@ pub fn run_logit_polya_gamma_gibbs(
     }
 
     let n_iter = config.nwarmup + config.n_samples;
-    let mut rng = StdRng::seed_from_u64(config.seed);
 
     // b = X^T (y - 1/2), constant across iterations.
     let kappa = y.mapv(|v| v - 0.5);
@@ -3289,13 +3288,23 @@ pub fn run_logit_polya_gamma_gibbs(
     for chain in 0..config.n_chains {
         progress.begin_chain(chain, "polya-gamma gibbs");
         let mut pg_rng = StdRng::seed_from_u64(
-            config.seed ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul((chain as u64) + 1)),
+            chain_stream_seed(config.seed, chain, 0x4D94_DF4E_5D72_81AB),
         );
+        let mut init_rng = StdRng::seed_from_u64(chain_stream_seed(
+            config.seed,
+            chain,
+            0xB3C4_5A1F_8E9D_7632,
+        ));
+        let mut draw_rng = StdRng::seed_from_u64(chain_stream_seed(
+            config.seed,
+            chain,
+            0x17A9_26D5_4C1B_E083,
+        ));
         let pg = PolyaGamma::new();
         let mut beta = mode.to_owned();
         // Small jitter so chains are not perfectly coupled.
         for j in 0..p {
-            beta[j] += 0.05 * sample_standard_normal(&mut rng);
+            beta[j] += 0.05 * sample_standard_normal(&mut init_rng);
         }
 
         for iter in 0..n_iter {
@@ -3327,7 +3336,7 @@ pub fn run_logit_polya_gamma_gibbs(
             mean.assign(&factor.solvevec(&rhs_b));
 
             for j in 0..p {
-                z[j] = sample_standard_normal(&mut rng);
+                z[j] = sample_standard_normal(&mut draw_rng);
             }
             let l = factor.lower_triangular();
             back_solve_lower_transposed(&l, &z, &mut noise);
@@ -3433,7 +3442,6 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
     let penalty_roots_t: Vec<Array2<f64>> =
         penalty_roots.iter().map(|r| r.t().to_owned()).collect();
 
-    let mut rng = StdRng::seed_from_u64(config.seed);
     let n_iter = config.nwarmup + config.n_samples;
 
     // Logistic PG identity uses kappa_i = y_i - 1/2 so that
@@ -3455,12 +3463,22 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
     let mut kept = 0usize;
     for chain in 0..config.n_chains {
         let mut pg_rng = StdRng::seed_from_u64(
-            config.seed ^ (0x9E37_79B9_7F4A_7C15u64.wrapping_mul((chain as u64) + 1)),
+            chain_stream_seed(config.seed, chain, 0x83F1_56C9_A7E0_2D4B),
         );
+        let mut init_rng = StdRng::seed_from_u64(chain_stream_seed(
+            config.seed,
+            chain,
+            0x28F0_7B65_1A4D_C93E,
+        ));
+        let mut draw_rng = StdRng::seed_from_u64(chain_stream_seed(
+            config.seed,
+            chain,
+            0xC642_6E35_B5A9_1D80,
+        ));
         let pg = PolyaGamma::new();
         let mut beta = mode.to_owned();
         for j in 0..p {
-            beta[j] += 0.05 * sample_standard_normal(&mut rng);
+            beta[j] += 0.05 * sample_standard_normal(&mut init_rng);
         }
 
         for iter in 0..n_iter {
@@ -3494,7 +3512,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
 
             // Draw beta for the next Gibbs state.
             for j in 0..p {
-                z[j] = sample_standard_normal(&mut rng);
+                z[j] = sample_standard_normal(&mut draw_rng);
             }
             let l = factor.lower_triangular();
             back_solve_lower_transposed(&l, &z, &mut noise);
@@ -3598,27 +3616,18 @@ pub(crate) fn run_nuts_sampling(
     let chol = target.chol().clone();
     let mode_arr = target.mode().clone();
 
-    // Initialize chains at z=0 with small jitter
-    let mut rng = StdRng::seed_from_u64(config.seed);
-    let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
-        .map(|_| {
-            Array1::from_shape_fn(dim, |_| {
-                let u1: f64 = rng.random::<f64>().max(1e-10); // Prevent ln(0) = -inf
-                let u2: f64 = rng.random();
-                let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                z * 0.1
-            })
-        })
-        .collect();
+    let initial_positions =
+        jittered_initial_positions(config, dim, 0.1, 0x0F65_83B2_BC71_4D9E);
 
     // Create GenericNUTS sampler - it auto-tunes step size!
     let mass_cfg = robust_mass_matrix_config(dim, config.nwarmup);
     let mut sampler = GenericNUTS::new_with_mass_matrix(
         target,
         initial_positions,
-        config.target_accept,
+        robust_target_accept(config.target_accept, dim),
         mass_cfg,
-    );
+    )
+    .set_seed(nuts_transition_seed(config.seed, 0xF1D3_C2B5_A697_804E));
 
     let (samples_array, run_stats) = sampler
         .run_progress(config.n_samples, config.nwarmup)
@@ -4461,24 +4470,17 @@ pub fn run_link_wiggle_nuts_sampling(
     let chol = target.chol().clone();
     let mode_arr = target.mode_joint();
 
-    let mut rng = StdRng::seed_from_u64(config.seed);
-    let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
-        .map(|_| {
-            Array1::from_shape_fn(dim, |_| {
-                let u1: f64 = rng.random::<f64>().max(1e-10);
-                let u2: f64 = rng.random();
-                (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos() * 0.1
-            })
-        })
-        .collect();
+    let initial_positions =
+        jittered_initial_positions(config, dim, 0.1, 0x8C48_0F65_3A2B_D917);
 
     let mass_cfg = robust_mass_matrix_config(dim, config.nwarmup);
     let mut sampler = GenericNUTS::new_with_mass_matrix(
         target,
         initial_positions,
-        config.target_accept,
+        robust_target_accept(config.target_accept, dim),
         mass_cfg,
-    );
+    )
+    .set_seed(nuts_transition_seed(config.seed, 0x2E31_A4B6_C908_F57D));
 
     let (samples_array, run_stats) = sampler
         .run_progress(config.n_samples, config.nwarmup)
@@ -5483,9 +5485,10 @@ pub fn run_joint_beta_rho_sampling(
     let link_param_mode = target.link_param_mode.clone();
 
     // Initialize chains: z_β at 0 (= mode), ρ at rho_mode, link params at fitted state.
-    let mut rng = StdRng::seed_from_u64(config.seed);
     let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
-        .map(|_| {
+        .map(|chain| {
+            let mut rng =
+                StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0x9B51_6E37_F2D0_A48C));
             let mut pos = Array1::<f64>::zeros(total_dim);
             // Small jitter for β (whitened space)
             for j in 0..n_beta {
@@ -5503,18 +5506,17 @@ pub fn run_joint_beta_rho_sampling(
         })
         .collect();
 
-    // Auto-select dense mass matrix when dimension is small enough.
-    // The joint (β, ρ) posterior has strong cross-block correlations —
-    // changing ρ shifts the entire β posterior through the penalty —
-    // so dense adaptation is critical for efficient sampling.
+    // Keep warmup covariance phase-local: diagonal windows are less likely to
+    // encode cross-block covariance from a transient mode switch.
     let mass_cfg = robust_mass_matrix_config(total_dim, config.nwarmup);
 
     let mut sampler = GenericNUTS::new_with_mass_matrix(
         target,
         initial_positions,
-        config.target_accept,
+        robust_target_accept(config.target_accept, total_dim),
         mass_cfg,
-    );
+    )
+    .set_seed(nuts_transition_seed(config.seed, 0x63AF_175B_D820_C94E));
 
     let (samples_array, run_stats) = sampler
         .run_progress(config.n_samples, config.nwarmup)
@@ -5790,27 +5792,18 @@ mod survival_hmc {
         let mode_arr = target.mode().clone();
         let dim = mode_arr.len();
 
-        // Initialize chains at z=0 with small jitter
-        let mut rng = StdRng::seed_from_u64(config.seed);
-        let initial_positions: Vec<Array1<f64>> = (0..config.n_chains)
-            .map(|_| {
-                Array1::from_shape_fn(dim, |_| {
-                    let u1: f64 = rng.random::<f64>().max(1e-10); // Prevent ln(0) = -inf
-                    let u2: f64 = rng.random();
-                    let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-                    z * 0.1
-                })
-            })
-            .collect();
+        let initial_positions =
+            jittered_initial_positions(config, dim, 0.1, 0xEC2D_7A9B_4051_F638);
 
         // Create GenericNUTS sampler
         let mass_cfg = robust_survival_mass_matrix_config(dim, config.nwarmup);
         let mut sampler = GenericNUTS::new_with_mass_matrix(
             target,
             initial_positions,
-            config.target_accept,
+            robust_target_accept(config.target_accept, dim),
             mass_cfg,
-        );
+        )
+        .set_seed(nuts_transition_seed(config.seed, 0x731B_60D4_AE52_9C8F));
 
         // Run sampling with progress bar
         let (samples_array, run_stats) = sampler

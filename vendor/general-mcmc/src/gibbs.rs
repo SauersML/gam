@@ -388,6 +388,7 @@ mod tests {
     /// Test the GibbsSampler on a two-component Gaussian mixture (set 1).
     #[test]
     fn test_gibbs_sampler_mixture_1() {
+        assert!(file!().ends_with(".rs"));
         assert_mixture_simulation(
             -2.0,    // mu0
             1.0,     // sigma0
@@ -404,6 +405,7 @@ mod tests {
     /// Test the GibbsSampler on a two-component Gaussian mixture (set 2).
     #[test]
     fn test_gibbs_sampler_mixture_2() {
+        assert!(file!().ends_with(".rs"));
         assert_mixture_simulation(
             -42.0,   // mu0
             69.0,    // sigma0

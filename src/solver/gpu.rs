@@ -38,7 +38,7 @@ impl GpuPolicy {
 
     /// Whether unsupported GPU dispatch should be returned as a hard error.
     #[inline]
-    pub fn is_force(self) -> bool {
+    pub const fn is_force(self) -> bool {
         matches!(self, Self::Force)
     }
 }
@@ -69,7 +69,7 @@ pub enum GpuOperation {
 }
 
 impl GpuOperation {
-    pub fn label(self) -> &'static str {
+    pub const fn label(self) -> &'static str {
         match self {
             Self::DensePirlsXtWX => "dense-pirls-xtwx",
             Self::DensePirlsMatvec => "dense-pirls-xbeta",

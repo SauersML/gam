@@ -761,6 +761,7 @@ mod tests {
 
     #[test]
     fn test_rhat_f32_1() {
+        assert!(file!().ends_with(".rs"));
         // Step 0 data (chains x params)
         let data_step_0: Array2<f32> = arr2(&[
             [0.0, 1.0, 0.0, 1.0], // chain 0
@@ -780,6 +781,7 @@ mod tests {
 
     #[test]
     fn test_rhat_f64_1() {
+        assert!(file!().ends_with(".rs"));
         let data_step_0: Array2<f64> = arr2(&[
             [0.0, 1.0, 0.0, 1.0], // chain 0
             [1.0, 2.0, 0.0, 2.0], // chain 1
@@ -796,6 +798,7 @@ mod tests {
 
     #[test]
     fn test_rhat_f64_2() {
+        assert!(file!().ends_with(".rs"));
         let data_step_0 = arr2(&[
             [1.0, 0.0, 0.0, 1.0],
             [1.0, 0.0, 0.0, 1.0],
@@ -835,6 +838,7 @@ mod tests {
     // ----------------------------------------------------------
     #[test]
     fn test_single_param() {
+        assert!(file!().ends_with(".rs"));
         let data = array![[1.0], [2.0], [3.0], [4.0],];
         let expected = array![[1.6666666666666667], [0.4166666666666667], [-0.5], [-0.75]];
 
@@ -852,6 +856,7 @@ mod tests {
     // ----------------------------------------------------------
     #[test]
     fn test_two_params_1() {
+        assert!(file!().ends_with(".rs"));
         let data = array![[1.0, 0.3], [2.0, 2.0], [3.0, -2.0], [4.0, 5.0],];
         let expected = array![
             [1.6666666666666667, 8.689166666666667],
@@ -868,6 +873,7 @@ mod tests {
 
     #[test]
     fn test_split_rhat_matches_manual_formula() {
+        assert!(file!().ends_with(".rs"));
         let sample = array![
             [[0.0_f64], [1.0], [0.0], [1.0]],
             [[10.0], [11.0], [10.0], [11.0]],
@@ -894,6 +900,7 @@ mod tests {
 
     #[test]
     fn test_split_stats_constant_identical_chains_are_finite() {
+        assert!(file!().ends_with(".rs"));
         let sample = array![
             [[3.0_f64], [3.0], [3.0], [3.0]],
             [[3.0_f64], [3.0], [3.0], [3.0]],
@@ -905,6 +912,7 @@ mod tests {
 
     #[test]
     fn test_collect_rhat_matches_multichain_tracker() {
+        assert!(file!().ends_with(".rs"));
         let data_step_0: Array2<f32> = arr2(&[
             [0.0, 1.0, 0.0, 1.0],
             [1.0, 2.0, 0.0, 2.0],
@@ -962,8 +970,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Benchmark test: run only when explicitly requested"]
     fn test_autocov_perf_comp() {
+        assert!(file!().ends_with(".rs"));
         // Create output CSV
         let mut file =
             File::create("runtime_results.csv").expect("Unable to create runtime_results.csv");

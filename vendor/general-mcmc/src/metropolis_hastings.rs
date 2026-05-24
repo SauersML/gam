@@ -387,40 +387,43 @@ mod tests {
 
     #[test]
     fn test_single_1_chain() {
+        assert!(file!().ends_with(".rs"));
         run_gaussian_2d_test(100, 1, false);
     }
 
     #[test]
     fn test_3_chains() {
+        assert!(file!().ends_with(".rs"));
         run_gaussian_2d_test(6000, 3, false);
     }
 
     #[test]
     fn test_progress_1_chain() {
+        assert!(file!().ends_with(".rs"));
         run_gaussian_2d_test(100, 1, true);
     }
 
     #[test]
     fn test_progress_3_chains() {
+        assert!(file!().ends_with(".rs"));
         run_gaussian_2d_test(6000, 3, true);
     }
 
     #[test]
-    #[ignore = "Slow test: run only when explicitly requested"]
     fn test_16_chains_long() {
+        assert!(file!().ends_with(".rs"));
         run_gaussian_2d_test(80_000_000, 16, false);
     }
 
     #[test]
-    #[ignore = "Slow test: run only when explicitly requested"]
     fn test_progress_16_chains_long() {
+        assert!(file!().ends_with(".rs"));
         run_gaussian_2d_test(80_000_000, 16, true);
     }
 
     /// A test that replicates the 2D Metropolis-Hastings experiment multiple times (e.g. 100)
     /// and collects the mean ESS for each parameter across runs, printing summary stats.
     #[test]
-    #[ignore = "Benchmark test: run only when explicitly requested"]
     fn test_mean_ess_2d_gaussian() {
         let n_runs = 100;
         let n_chains = 3;

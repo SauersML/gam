@@ -697,6 +697,8 @@ def _apply_scalar_fisher_rao_w_to_rows(
     weights: str | None,
     fisher_rao_w: Any,
 ) -> tuple[list[str], list[list[str]], str]:
+    import numpy as np
+
     w = _normalize_fisher_rao_w(fisher_rao_w, n_rows=len(rows), dim=1)[:, 0, 0]
     weight_col = "__gamfit_fisher_rao_weight"
     if weight_col in headers:
@@ -710,7 +712,10 @@ def _apply_scalar_fisher_rao_w_to_rows(
             weight_idx = headers.index(weights)
         except ValueError as exc:
             raise ValueError(f"weights column {weights!r} is not present") from exc
-        combined = [float(row[weight_idx]) * float(w[idx]) for idx, row in enumerate(out_rows)]
+        base_weights = np.asarray([row[weight_idx] for row in out_rows], dtype=float)
+        if not np.all(np.isfinite(base_weights)):
+            raise ValueError(f"weights column {weights!r} must contain only finite values")
+        combined = base_weights * w
     for row, value in zip(out_rows, combined, strict=True):
         row.append(repr(float(value)))
     return headers, out_rows, weight_col
@@ -2476,7 +2481,7 @@ def gaussian_reml_fit_latent(
             _numeric_matrix(penalty, "penalty"),
             int(m),
             None if weights is None else _numeric_vector(weights, "weights"),
-            None if fisher_w is None else np.asarray(fisher_w, dtype=float),
+            None if fisher_w is None else _numeric_array(fisher_w, "fisher_w"),
             None if init_lambda is None else float(init_lambda),
             None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
             str(aux_family),
@@ -2571,7 +2576,7 @@ def gaussian_reml_fit_latent_backward(
             float(grad_edf),
             int(m),
             None if weights is None else _numeric_vector(weights, "weights"),
-            None if fisher_w is None else np.asarray(fisher_w, dtype=float),
+            None if fisher_w is None else _numeric_array(fisher_w, "fisher_w"),
             None if init_lambda is None else float(init_lambda),
             None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
             str(aux_family),
@@ -2675,7 +2680,7 @@ def glm_reml_fit_latent(
             phi,
             int(m),
             None if weights is None else _numeric_vector(weights, "weights"),
-            None if fisher_w is None else np.asarray(fisher_w, dtype=float),
+            None if fisher_w is None else _numeric_array(fisher_w, "fisher_w"),
             None if init_lambda is None else float(init_lambda),
             None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
             str(aux_family),
@@ -2766,7 +2771,7 @@ def glm_reml_fit_latent_backward(
             float(grad_reml_score),
             int(m),
             None if weights is None else _numeric_vector(weights, "weights"),
-            None if fisher_w is None else np.asarray(fisher_w, dtype=float),
+            None if fisher_w is None else _numeric_array(fisher_w, "fisher_w"),
             None if init_lambda is None else float(init_lambda),
             None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
             str(aux_family),
@@ -2804,6 +2809,10 @@ def gaussian_reml_fit_formula(
         y_arr = y_arr.reshape(-1, 1)
     if y_arr.ndim != 2:
         raise ValueError("y must be a 1D or 2D numeric array")
+    if y_arr.shape[0] != len(rows):
+        raise ValueError(
+            f"formula design and y row counts must match; got {len(rows)} and {y_arr.shape[0]}"
+        )
     if not np.all(np.isfinite(y_arr)):
         raise ValueError("y must contain only finite values")
     fisher_w = None
@@ -3174,6 +3183,13 @@ def _index_vector(values: Any, label: str) -> Any:
         raise ValueError(f"{label} cannot be empty")
     if arr.dtype != np.dtype(np.uintp):
         raise TypeError(f"{label} must be a numpy uintp array for zero-copy FFI")
+    if label == "row_offsets":
+        if arr.size < 2:
+            raise ValueError("row_offsets must contain at least start and stop offsets")
+        if int(arr[0]) != 0:
+            raise ValueError("row_offsets must start at 0")
+        if np.any(arr[1:] < arr[:-1]):
+            raise ValueError("row_offsets must be nondecreasing")
     return arr
 
 
@@ -3204,6 +3220,17 @@ def _numeric_matrix(values: Any, label: str) -> Any:
         raise ValueError(f"{label} cannot be empty")
     if arr.dtype != np.float64:
         raise TypeError(f"{label} must be a float64 numpy array for zero-copy FFI")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{label} must contain only finite values")
+    return arr
+
+
+def _numeric_array(values: Any, label: str) -> Any:
+    import numpy as np
+
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        raise ValueError(f"{label} cannot be empty")
     if not np.all(np.isfinite(arr)):
         raise ValueError(f"{label} must contain only finite values")
     return arr
@@ -3248,16 +3275,19 @@ def _resolve_knots(
 
     Auto-derivation delegates to the Rust ``auto_knots_1d`` FFI export.
     """
+    degree_i = int(degree)
+    if degree_i < 0:
+        raise ValueError(f"{label}: degree must be non-negative, got {degree}")
     if knots is None:
         return _numpy_module().asarray(
-            rust_module().auto_knots_1d(t_arr, int(_DEFAULT_BASIS_K), int(degree)),
+            rust_module().auto_knots_1d(t_arr, int(_DEFAULT_BASIS_K), degree_i),
             dtype=float,
         )
     if isinstance(knots, int) and not isinstance(knots, bool):
         if knots < 0:
             raise ValueError(f"{label}: integer interior-knot count must be >= 0, got {knots}")
         return _numpy_module().asarray(
-            rust_module().auto_knots_1d(t_arr, int(knots), int(degree)),
+            rust_module().auto_knots_1d(t_arr, int(knots), degree_i),
             dtype=float,
         )
     return _numeric_vector(knots, label)

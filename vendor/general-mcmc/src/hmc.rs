@@ -544,7 +544,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Benchmark test: run only when explicitly requested"]
     fn test_gaussian_2d_hmc_single_run() {
         // Each experiment uses 3 chains:
         let n_chains = 3;
@@ -601,7 +600,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Benchmark test: run only when explicitly requested"]
     fn test_gaussian_2d_hmc_ess_stats() {
         use crate::stats::basic_stats;
         use indicatif::{ProgressBar, ProgressStyle};
@@ -760,7 +758,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Benchmark test: run only when explicitly requested"]
     fn test_bench_noprogress() {
         type BackendType = Autodiff<burn::backend::NdArray>;
 
@@ -795,7 +792,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Benchmark test: run only when explicitly requested"]
     fn test_progress_bench() {
         // Use the CPU backend (NdArray) wrapped in Autodiff.
         type BackendType = Autodiff<burn::backend::NdArray>;
@@ -846,7 +842,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Benchmark test: run only when explicitly requested"]
     fn test_bench_10000d() {
         // Use the CPU backend (NdArray) wrapped in Autodiff.
         type BackendType = Autodiff<burn::backend::NdArray>;
@@ -882,7 +877,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Benchmark test: run only when explicitly requested"]
     #[cfg(feature = "wgpu")]
     fn test_progress_10000d_bench() {
         type BackendType = Autodiff<burn::backend::Wgpu>;

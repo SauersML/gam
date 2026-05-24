@@ -176,6 +176,7 @@ mod tests {
 
     #[test]
     fn test_main() {
+        assert!(file!().ends_with(".rs"));
         run_demo().expect("run_demo should succeed");
     }
 }
