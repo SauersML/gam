@@ -2531,7 +2531,10 @@ impl FittedModel {
             PredictModelClass::BernoulliMarginalSlope
         ) {
             let unified = self.payload().unified.as_ref().ok_or_else(|| {
-                "marginal-slope model is missing unified fit payload; refit".to_string()
+                FittedModelError::MissingField {
+                    reason: "marginal-slope model is missing unified fit payload; refit"
+                        .to_string(),
+                }
             })?;
             validate_marginal_slope_saved_fit(
                 unified,
@@ -2891,7 +2894,9 @@ impl FittedModel {
         // identically between writers and readers running the same schema.
         self.validate_payload_version()?;
         if self.fit_result.is_none() {
-            return Err("model is missing canonical fit_result payload; refit".to_string());
+            return Err(FittedModelError::MissingField {
+                reason: "model is missing canonical fit_result payload; refit".to_string(),
+            });
         }
         if self.data_schema.is_none() {
             return Err(FittedModelError::MissingField {
@@ -2932,13 +2937,20 @@ impl FittedModel {
         }
         if matches!(self.family_state, FittedFamily::MarginalSlope { .. }) {
             if self.formula_logslope.is_none() {
-                return Err("marginal-slope model is missing formula_logslope; refit".to_string());
+                return Err(FittedModelError::MissingField {
+                    reason: "marginal-slope model is missing formula_logslope; refit".to_string(),
+                });
             }
             if self.z_column.is_none() {
-                return Err("marginal-slope model is missing z_column; refit".to_string());
+                return Err(FittedModelError::MissingField {
+                    reason: "marginal-slope model is missing z_column; refit".to_string(),
+                });
             }
             let z_normalization = self.latent_z_normalization.ok_or_else(|| {
-                "marginal-slope model is missing latent_z_normalization; refit".to_string()
+                FittedModelError::MissingField {
+                    reason: "marginal-slope model is missing latent_z_normalization; refit"
+                        .to_string(),
+                }
             })?;
             z_normalization.validate("marginal-slope model")?;
             let latent_measure =
@@ -2951,7 +2963,9 @@ impl FittedModel {
                 .validate("marginal-slope model latent_measure")
                 .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
             if self.marginal_baseline.is_none() || self.logslope_baseline.is_none() {
-                return Err("marginal-slope model is missing baseline offsets; refit".to_string());
+                return Err(FittedModelError::MissingField {
+                    reason: "marginal-slope model is missing baseline offsets; refit".to_string(),
+                });
             }
             if self.resolved_termspec_logslope.as_ref().is_none() {
                 return Err(FittedModelError::MissingField {
@@ -2977,9 +2991,10 @@ impl FittedModel {
                     });
                 }
                 None => {
-                    return Err(
-                        "marginal-slope model is missing family_state.frailty; refit".to_string(),
-                    );
+                    return Err(FittedModelError::MissingField {
+                        reason: "marginal-slope model is missing family_state.frailty; refit"
+                            .to_string(),
+                    });
                 }
             }
         }
@@ -3007,9 +3022,10 @@ impl FittedModel {
                     });
                 }
                 if self.z_column.is_none() {
-                    return Err(
-                        "survival marginal-slope model is missing z_column; refit".to_string()
-                    );
+                    return Err(FittedModelError::MissingField {
+                        reason: "survival marginal-slope model is missing z_column; refit"
+                            .to_string(),
+                    });
                 }
                 let z_normalization =
                     self.latent_z_normalization
@@ -3022,9 +3038,14 @@ impl FittedModel {
                         })?;
                 z_normalization.validate("survival marginal-slope model")?;
                 let latent_measure = self.latent_measure.as_ref().ok_or_else(|| {
-                    "survival marginal-slope model is missing latent_measure; refit".to_string()
+                    FittedModelError::MissingField {
+                        reason: "survival marginal-slope model is missing latent_measure; refit"
+                            .to_string(),
+                    }
                 })?;
-                latent_measure.validate("survival marginal-slope model latent_measure")?;
+                latent_measure
+                    .validate("survival marginal-slope model latent_measure")
+                    .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
                 if self.logslope_baseline.is_none() {
                     return Err(FittedModelError::MissingField {
                         reason: "survival marginal-slope model is missing logslope_baseline; refit"
@@ -3189,9 +3210,10 @@ impl FittedModel {
         if matches!(self.family_state, FittedFamily::Survival { .. })
             && self.survival_likelihood.is_none()
         {
-            return Err(
-                "saved survival model is missing survival_likelihood metadata; refit".to_string(),
-            );
+            return Err(FittedModelError::MissingField {
+                reason: "saved survival model is missing survival_likelihood metadata; refit"
+                    .to_string(),
+            });
         }
         let has_any_saved_link_wiggle = self.linkwiggle_knots.is_some()
             || self.linkwiggle_degree.is_some()
@@ -3276,7 +3298,10 @@ impl FittedModel {
                 "fit_result",
             )?;
             let unified = self.unified.as_ref().ok_or_else(|| {
-                "marginal-slope model is missing unified fit payload; refit".to_string()
+                FittedModelError::MissingField {
+                    reason: "marginal-slope model is missing unified fit payload; refit"
+                        .to_string(),
+                }
             })?;
             validate_marginal_slope_saved_fit(
                 unified,

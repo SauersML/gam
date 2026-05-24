@@ -3688,12 +3688,7 @@ where
             Some(diag_fallback())
         } else {
             match matrix_inversewith_regularization(&penalized_hessian, "posterior covariance") {
-                Some(cov_unscaled) => {
-                    let mut cov = cov_unscaled.clone();
-                    cov.mapv_inplace(|v| v * dispersion_phi);
-                    beta_covariance_unscaled = Some(cov_unscaled);
-                    Some(cov)
-                }
+                Some(cov_unscaled) => Some(cov_unscaled),
                 None => {
                     covariance_is_diagonal_only = true;
                     log::warn!(
@@ -3707,7 +3702,7 @@ where
         };
         beta_covariance = beta_covariance_unscaled
             .as_ref()
-            .map(|cov| cov * dispersion_phi);
+            .map(|cov| crate::inference::dispersion_cov::PhiScaledCovariance::wrap(cov * dispersion_phi));
 
         if let Some(h_inv) = beta_covariance_unscaled.as_ref()
             && !covariance_is_diagonal_only
@@ -4011,7 +4006,7 @@ pub struct FitInference {
     /// `Vb`): `Vb = H^{-1} * phi`, where `H = X'W_HX + S(lambda)` and `phi`
     /// is [`dispersion`](Self::dispersion). Do not use an unscaled `H^{-1}`
     /// for standard errors when scale is estimated.
-    pub beta_covariance: Option<Array2<f64>>,
+    pub beta_covariance: Option<crate::inference::dispersion_cov::PhiScaledCovariance>,
     /// Marginal SEs from `beta_covariance`.
     pub beta_standard_errors: Option<Array1<f64>>,
     /// Optional smoothing-parameter-corrected Bayesian covariance (mgcv `Vp`):

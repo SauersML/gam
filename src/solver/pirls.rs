@@ -1071,134 +1071,6 @@ impl PirlsWorkspace {
         (TARGET_BYTES / bytes_perrow).clamp(MIN_ROWS, MAX_ROWS)
     }
 
-    /// Add `Xᵀ diag(weights) X` to `out` using bounded dense chunks.
-    ///
-    /// This is deliberately sign-preserving: observed-information curvature can
-    /// produce negative row weights, so a `sqrt(max(0, w))` Gram formulation is
-    /// mathematically wrong for this path.  The layout mirrors the future GPU
-    /// resident path (`WX` then `Xᵀ(WX)`) and keeps peak scratch bounded by one
-    /// row chunk plus one p×p accumulator per worker.
-    fn add_dense_xtwx_streaming_signed<S, W>(
-        weights: &ArrayBase<W, Ix1>,
-        weighted_x_chunk: &mut Array2<f64>,
-        x: &ArrayBase<S, Ix2>,
-        out: &mut Array2<f64>,
-        par: Par,
-    ) where
-        S: Data<Elem = f64> + Sync,
-        W: Data<Elem = f64> + Sync,
-    {
-        let n = x.nrows();
-        let p = x.ncols();
-        if n == 0 || p == 0 {
-            return;
-        }
-        debug_assert_eq!(
-            weights.len(),
-            n,
-            "weight length must match row count for streamed XtWX"
-        );
-        let chunkrows = Self::dense_xtwx_chunkrows(p).min(n);
-
-        let num_chunks = (n + chunkrows - 1) / chunkrows;
-        let use_parallel = num_chunks >= 4 && (n as u64) * (p as u64) >= 200_000;
-
-        if use_parallel {
-            // Parallel: use fold/reduce so each thread reuses one WX chunk
-            // and one p×p accumulator. This is the CPU analogue of the GPU
-            // tall-skinny reduction plan: scale rows, then accumulate Xᵀ(WX)
-            // without ever clipping negative observed-curvature weights.
-            let combined = (0..num_chunks)
-                .into_par_iter()
-                .fold(
-                    || {
-                        (
-                            Array2::<f64>::zeros((chunkrows, p)),
-                            Array2::<f64>::zeros((p, p).f()),
-                        )
-                    },
-                    |(mut chunk_buf, mut acc), ci| {
-                        let start = ci * chunkrows;
-                        let rows = (n - start).min(chunkrows);
-                        {
-                            let chunk_full = chunk_buf
-                                .as_slice_mut()
-                                .expect("row-major chunk is contiguous");
-                            let x_slice = x.slice(s![start..start + rows, ..]);
-                            let w_slice = weights.slice(s![start..start + rows]);
-                            Zip::from(chunk.rows_mut())
-                                .and(x_slice.rows())
-                                .and(&w_slice)
-                                .par_for_each(|mut dst, src, &w| {
-                                    Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
-                                });
-                        }
-                        let x_slice = x.slice(s![start..start + rows, ..]);
-                        let wx_slice = chunk_buf.slice(s![0..rows, ..]);
-                        let x_view = FaerArrayView::new(&x_slice);
-                        let wx_view = FaerArrayView::new(&wx_slice);
-                        let mut accview = array2_to_matmut(&mut acc);
-                        matmul(
-                            accview.as_mut(),
-                            Accum::Add,
-                            x_view.as_ref().transpose(),
-                            wx_view.as_ref(),
-                            1.0,
-                            Par::Seq,
-                        );
-                        (chunk_buf, acc)
-                    },
-                )
-                .reduce(
-                    || {
-                        (
-                            Array2::<f64>::zeros((0, 0)),
-                            Array2::<f64>::zeros((p, p).f()),
-                        )
-                    },
-                    |(_, mut a), (_, b)| {
-                        a += &b;
-                        (Array2::zeros((0, 0)), a)
-                    },
-                );
-            *out += &combined.1;
-        } else {
-            // Sequential: reuse workspace chunk buffer.
-            if weighted_x_chunk.ncols() != p || weighted_x_chunk.nrows() != chunkrows {
-                *weighted_x_chunk = Array2::zeros((chunkrows, p).f());
-            }
-            let mut outview = array2_to_matmut(out);
-            for start in (0..n).step_by(chunkrows) {
-                let rows = (n - start).min(chunkrows);
-                {
-                    let chunk_full = weighted_x_chunk
-                        .as_slice_mut()
-                        .expect("row-major chunk is contiguous");
-                    let x_slice = x.slice(s![start..start + rows, ..]);
-                    let w_slice = weights.slice(s![start..start + rows]);
-                    Zip::from(chunk.rows_mut())
-                        .and(x_slice.rows())
-                        .and(&w_slice)
-                        .par_for_each(|mut dst, src, &w| {
-                            Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
-                        });
-                }
-                let x_slice = x.slice(s![start..start + rows, ..]);
-                let wx_slice = weighted_x_chunk.slice(s![0..rows, ..]);
-                let x_view = FaerArrayView::new(&x_slice);
-                let wx_view = FaerArrayView::new(&wx_slice);
-                matmul(
-                    outview.as_mut(),
-                    Accum::Add,
-                    x_view.as_ref().transpose(),
-                    wx_view.as_ref(),
-                    1.0,
-                    par,
-                );
-            }
-        }
-    }
-
     fn add_dense_xtwx_streaming_signed<S>(
         weights: &Array1<f64>,
         weighted_x_chunk: &mut Array2<f64>,
@@ -1971,21 +1843,25 @@ impl<'a> GamWorkingModel<'a> {
         match &self.coordinate_design {
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
                 if let Some(dense) = x_transformed.as_dense() {
-                    let workload = GpuWorkload::dense(dense.nrows(), dense.ncols());
-                    if let Ok(gpu::GpuDispatch::Cpu { reason }) =
-                        gpu::dispatch(GpuOperation::DenseMatvec, workload)
+                    if let Ok(gpu::GpuDispatch::UseCpu { reason }) =
+                        gpu::dense_pirls_dispatch(
+                            gpu::GpuOperation::DensePirlsMatvec,
+                            dense.nrows(),
+                            dense.ncols(),
+                            false,
+                        )
                     {
                         log::debug!(
                             "[gpu-dispatch] op={} backend=cpu reason={} rows={} cols={}",
-                            GpuOperation::DenseMatvec,
+                            gpu::GpuOperation::DensePirlsMatvec.label(),
                             reason,
                             dense.nrows(),
                             dense.ncols()
                         );
                     }
-                    let timer = GpuStageTimer::start(GpuOperation::DenseMatvec, workload, "cpu");
+                    let timer = gpu::GpuStageTimer::start("dense-pirls-matvec");
                     fast_av_into(dense, beta.as_ref(), out);
-                    timer.finish();
+                    drop(timer);
                     return;
                 }
                 out.assign(&x_transformed.matrixvectormultiply(beta));
@@ -1995,21 +1871,25 @@ impl<'a> GamWorkingModel<'a> {
                 // then write X·(Qs·beta) directly into out when X is dense.
                 let beta_orig = transform.apply(beta);
                 if let Some(dense) = self.x_original.as_dense() {
-                    let workload = GpuWorkload::dense(dense.nrows(), dense.ncols());
-                    if let Ok(gpu::GpuDispatch::Cpu { reason }) =
-                        gpu::dispatch(GpuOperation::DenseMatvec, workload)
+                    if let Ok(gpu::GpuDispatch::UseCpu { reason }) =
+                        gpu::dense_pirls_dispatch(
+                            gpu::GpuOperation::DensePirlsMatvec,
+                            dense.nrows(),
+                            dense.ncols(),
+                            false,
+                        )
                     {
                         log::debug!(
                             "[gpu-dispatch] op={} backend=cpu reason={} rows={} cols={}",
-                            GpuOperation::DenseMatvec,
+                            gpu::GpuOperation::DensePirlsMatvec.label(),
                             reason,
                             dense.nrows(),
                             dense.ncols()
                         );
                     }
-                    let timer = GpuStageTimer::start(GpuOperation::DenseMatvec, workload, "cpu");
+                    let timer = gpu::GpuStageTimer::start("dense-pirls-matvec");
                     fast_av_into(dense, &beta_orig, out);
-                    timer.finish();
+                    drop(timer);
                 } else {
                     out.assign(&self.x_original.apply(&beta_orig));
                 }
@@ -2050,21 +1930,25 @@ impl<'a> GamWorkingModel<'a> {
                 let p = x.ncols();
                 let n = x.nrows();
                 let has_signed_weights = weights.iter().any(|w| *w < 0.0);
-                let workload = GpuWorkload::dense(n, p).with_signed_weights(has_signed_weights);
-                match gpu::dispatch(GpuOperation::DenseXtDiagX, workload) {
-                    Ok(gpu::GpuDispatch::Gpu) => {
-                        // No native GPU backend is linked in this build yet; dispatch() only
-                        // returns Gpu when a concrete backend reports support. Keep the branch
+                match gpu::dense_pirls_dispatch(
+                    gpu::GpuOperation::DensePirlsXtWX,
+                    n,
+                    p,
+                    has_signed_weights,
+                ) {
+                    Ok(gpu::GpuDispatch::UseDevice) => {
+                        // No native GPU backend is linked in this build yet; dispatch only
+                        // returns UseDevice when a concrete backend reports support. Keep the branch
                         // explicit so CUDA/HIP/Metal implementations can slot in here without
                         // changing P-IRLS control flow.
                         return Err(EstimationError::InvalidInput(
-                            "native GPU DenseXtDiagX dispatch without implementation".to_string(),
+                            "native GPU DensePirlsXtWX dispatch without implementation".to_string(),
                         ));
                     }
-                    Ok(gpu::GpuDispatch::Cpu { reason }) => {
+                    Ok(gpu::GpuDispatch::UseCpu { reason }) => {
                         log::debug!(
                             "[gpu-dispatch] op={} backend=cpu reason={} rows={} cols={} signed_weights={}",
-                            GpuOperation::DenseXtDiagX,
+                            gpu::GpuOperation::DensePirlsXtWX.label(),
                             reason,
                             n,
                             p,
@@ -2073,7 +1957,8 @@ impl<'a> GamWorkingModel<'a> {
                     }
                     Err(err) => return Err(EstimationError::InvalidInput(err.to_string())),
                 }
-                let timer = GpuStageTimer::start(GpuOperation::DenseXtDiagX, workload, "cpu");
+                let timer = gpu::GpuStageTimer::start("dense-pirls-xtwx");
+                drop(timer);
                 let x_dense = x.to_dense_arc();
                 // Reuse workspace hessian buffer to avoid per-iteration allocation.
                 if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
@@ -2100,9 +1985,10 @@ impl<'a> GamWorkingModel<'a> {
                         get_global_parallelism(),
                     );
                 } else {
-                    workspace.fill_sqrtweights(weights);
-                    PirlsWorkspace::add_dense_xtwx_streaming_from_sqrt(
-                        &workspace.sqrtw,
+                    // All weights are non-negative; the signed-streaming path
+                    // computes Xᵀ·diag(w)·X directly without sqrt/clip.
+                    PirlsWorkspace::add_dense_xtwx_streaming_signed(
+                        weights,
                         &mut workspace.weighted_x_chunk,
                         x_dense.as_ref(),
                         &mut workspace.hessian_buf,
@@ -2192,113 +2078,6 @@ impl<'a> GamWorkingModel<'a> {
             &mut self.lasthessian_d,
         )?;
         Ok(HessianCurvatureKind::Observed)
-    }
-
-    fn screen_candidate_from_direction(
-        &mut self,
-        beta: &Coefficients,
-        direction: &Array1<f64>,
-        current_eta: &LinearPredictor,
-    ) -> Result<CandidateScreen, EstimationError> {
-        crate::gpu::log_backend_inventory_once();
-        let decision = crate::gpu::decide(
-            crate::gpu::GpuKernel::CandidateScreen,
-            false,
-            self.offset.len() >= 100_000,
-        );
-        decision
-            .require_supported()
-            .map_err(EstimationError::InvalidInput)?;
-        decision.log();
-
-        let n = self.offset.len();
-        if self.workspace.eta_buf.len() != n {
-            self.workspace.eta_buf = Array1::zeros(n);
-        }
-        if self.workspace.delta_eta.len() != n {
-            self.workspace.delta_eta = Array1::zeros(n);
-        }
-        let mut delta_eta = std::mem::take(&mut self.workspace.delta_eta);
-        self.transformed_matvec_into(&Coefficients::new(direction.clone()), &mut delta_eta);
-        Zip::from(&mut self.workspace.eta_buf)
-            .and(current_eta.as_ref())
-            .and(&delta_eta)
-            .par_for_each(|eta, &base, &delta| *eta = base + delta);
-        self.workspace.delta_eta = delta_eta;
-
-        if self.likelihood.scale.gamma_shape_is_estimated() {
-            let shape =
-                estimate_gamma_shape_from_eta(self.y, &self.workspace.eta_buf, self.priorweights);
-            self.likelihood = self.likelihood.with_gamma_shape(shape);
-        }
-
-        let integrated = self.covariate_se.as_ref().map(|se| IntegratedWorkingInput {
-            quadctx: &self.quadctx,
-            se: se.view(),
-            mixture_link_state: self.link_kind.mixture_state(),
-            sas_link_state: self.link_kind.sas_state(),
-        });
-        match &self.link_kind {
-            InverseLink::Mixture(_)
-            | InverseLink::LatentCLogLog(_)
-            | InverseLink::Sas(_)
-            | InverseLink::BetaLogistic(_) => {
-                if let Some(integ) = integrated {
-                    update_glmvectors_integrated_for_link(
-                        integ.quadctx,
-                        self.y,
-                        &self.workspace.eta_buf,
-                        integ.se,
-                        &self.link_kind,
-                        self.priorweights,
-                        &mut self.lastmu,
-                        &mut self.lastweights,
-                        &mut self.lastz,
-                        None,
-                    )?;
-                } else {
-                    update_glmvectors(
-                        self.y,
-                        &self.workspace.eta_buf,
-                        &self.link_kind,
-                        self.priorweights,
-                        &mut self.lastmu,
-                        &mut self.lastweights,
-                        &mut self.lastz,
-                        None,
-                    )?;
-                }
-            }
-            InverseLink::Standard(_) => {
-                self.likelihood.irls_update(
-                    self.y,
-                    &self.workspace.eta_buf,
-                    self.priorweights,
-                    &mut self.lastmu,
-                    &mut self.lastweights,
-                    &mut self.lastz,
-                    integrated,
-                    None,
-                )?;
-            }
-        }
-
-        let deviance = self
-            .likelihood
-            .loglik_deviance(self.y, &self.lastmu, self.priorweights)?;
-        let s_beta = self.penalty.apply(beta.as_ref());
-        let penalty_term = beta.as_ref().dot(&s_beta);
-        let penalized_objective = deviance + penalty_term;
-        let arithmetic_finite = penalized_objective.is_finite()
-            && self.workspace.eta_buf.iter().all(|v| v.is_finite())
-            && self.lastmu.iter().all(|v| v.is_finite())
-            && self.lastweights.iter().all(|v| v.is_finite());
-        Ok(CandidateScreen {
-            penalized_objective,
-            deviance,
-            penalty_term,
-            arithmetic_finite,
-        })
     }
 
     fn sparse_penalized_hessian(
@@ -3324,37 +3103,9 @@ fn solve_newton_direction_dense_with_factor(
         *direction_out = Array1::zeros(gradient.len());
     }
 
-    // GPU fast path: fused Cholesky factor + solve in a single host↔device
-    // round-trip. CPU execution remains in charge when the GPU is unavailable,
-    // the matrix is too small to amortize the round-trip, or the device
-    // factorization reports a non-PD pivot.
-    let mut hess_buf = hessian.clone();
-    let mut rhs_mat = gradient.to_owned().insert_axis(ndarray::Axis(1));
-    let gpu_route = crate::gpu::describe_chol_solve_route(p, rhs_mat.ncols());
-    let gpu_attempt_expected = crate::gpu::will_attempt_chol_solve(p);
-    if crate::gpu::try_chol_solve_inplace(&mut hess_buf, &mut rhs_mat).is_some() {
-        let mut solved = rhs_mat.remove_axis(ndarray::Axis(1));
-        if array1_is_finite(&solved) {
-            solved.mapv_inplace(|v| -v);
-            direction_out.assign(&solved);
-            log::info!(
-                "[STAGE] PIRLS dense newton solve backend=GPU p={} flops~{} elapsed={:.3}s route=\"{}\"",
-                p,
-                (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
-                dense_solve_start.elapsed().as_secs_f64(),
-                gpu_route,
-            );
-            return Ok(None);
-        }
-    }
-    let cpu_route = if gpu_attempt_expected {
-        format!(
-            "GPU route was eligible but cuSOLVER did not return a finite solution; \
-             falling back to CPU stable solver; initial_route=\"{gpu_route}\""
-        )
-    } else {
-        gpu_route
-    };
+    // No device Cholesky backend is registered in this build, so this routine
+    // executes entirely on the CPU stable solver path.
+    let cpu_route = String::from("CPU stable solver (no device Cholesky backend registered)");
 
     let factor = StableSolver::new("pirls newton direction")
         .factorize(hessian)
@@ -4231,6 +3982,11 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
     let blands_threshold = BLANDS_RULE_GRACE * (p + 1);
     let max_iters = 8 * (p + 1);
     let mut d_free = Array1::<f64>::zeros(p);
+    // Reusable hoisted buffers for the free-block Newton subsystem; sliced down
+    // to the current `n_free` each iteration to avoid reallocating the p×p
+    // block and length-p prefix on every active-set pivot.
+    let mut h_ff_buf = Array2::<f64>::zeros((p, p));
+    let mut g_f_buf = Array1::<f64>::zeros(p);
     for it in 0..max_iters {
         let use_blands = it >= blands_threshold;
         let free_idx: Vec<usize> = (0..p).filter(|&i| !active[i]).collect();
@@ -5114,7 +4870,7 @@ where
         // through the accept-step assignment; no initial value is
         // needed because rustc proves definite assignment before
         // the trajectory log reads it.
-        let mut lm_accept_rho: Option<f64>;
+        let lm_accept_rho: Option<f64>;
         // Madsen-Nielsen-Tingleff stateful rejection factor (eq 3.16 in
         // "Methods for non-linear least squares problems", IMM Tech Univ
         // Denmark, 2nd ed 2004): v starts at 2 and doubles on every
@@ -5604,7 +5360,11 @@ where
                         // smooth Marquardt update. See `madsen_lm_accept_factor`
                         // for the textbook derivation and canonical values.
                         lambda = (loop_lambda * madsen_lm_accept_factor(rho)).max(1e-9);
-                        pending_arrow_latent_restore = None;
+                        // Consume any pending arrow-latent snapshot now that
+                        // we have accepted the LM step; downstream cleanup
+                        // paths still drain via `pending_arrow_latent_restore
+                        // .take()` defensively.
+                        drop(pending_arrow_latent_restore.take());
 
                         // Updates for next iteration. Recycle the previous beta
                         // allocation as the next candidate buffer instead of
@@ -8093,13 +7853,21 @@ fn solve_penalized_least_squares_implicit(
                 workspace.hessian_buf.fill(0.0);
             }
             PirlsWorkspace::add_dense_xtwx_streaming_signed(
-                &weights,
+                &weights_owned,
                 &mut workspace.weighted_x_chunk,
                 x_dense.as_ref(),
                 &mut workspace.hessian_buf,
                 get_global_parallelism(),
             );
             std::mem::take(&mut workspace.hessian_buf)
+        }
+        _ => {
+            // Operator-form fallback: sparse designs and lazy operator-backed
+            // dense designs cannot be densified, so route through the signed
+            // XᵀWX operator.
+            crate::matrix::xt_diag_x_signed(x_original, &weights_owned)
+                .map(|h| h.to_dense())
+                .map_err(EstimationError::InvalidInput)?
         }
     };
     #[cfg(debug_assertions)]
