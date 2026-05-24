@@ -7020,7 +7020,7 @@ impl BernoulliMarginalSlopeFamily {
     ///
     /// so the design value at `(row, η_a)` is the raw basis minus a row-
     /// specific subtraction. `runtime.design()` returns the raw basis
-    /// only and `debug_assert`s in this configuration so callers don't
+    /// only and `assert`s in this configuration so callers don't
     /// silently miscompute; instead route through `design_with_anchor_rows`
     /// with the runtime's cached training-row anchor sliced to a single
     /// row. The derivative path is unaffected — the subtraction is
@@ -7135,7 +7135,7 @@ impl BernoulliMarginalSlopeFamily {
         //
         // Evaluating `link_dev.design()` on a single-row `eta0` vector
         // would discard the row-specific subtraction (`design()`
-        // debug_asserts that the runtime has no anchor residual exactly
+        // asserts that the runtime has no anchor residual exactly
         // to prevent this silent miscompute). Instead, feed the
         // full-length per-row `a_pre_scale_vec` through
         // `design_at_training_with_residual` so the runtime applies the
@@ -17216,7 +17216,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         // `anchor_residual` and cached the training-row parametric
         // anchor matrix on the runtime. `runtime.design()` on a
         // residualised runtime returns the *raw* basis evaluation,
-        // which `debug_assert`s the caller hasn't conflated with the
+        // which `assert`s the caller hasn't conflated with the
         // reparameterised basis — we want the reparameterised one
         // here, so go through `design_at_training_with_residual` so
         // the cached anchor rows are folded in. For score-warp

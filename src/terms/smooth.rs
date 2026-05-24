@@ -11184,10 +11184,11 @@ impl SpatialAdaptiveExactFamily {
 
     fn exacthessian_directional_derivative_from_evaluation(
         &self,
-        _: &Array1<f64>,
+        beta: &Array1<f64>,
         eval: &SpatialAdaptiveExactEvaluation,
         direction: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        assert_eq!(beta.len(), direction.len());
         let d_eta = crate::faer_ndarray::fast_av(self.design.as_ref(), direction);
         let mut total = xt_diag_x_dense(
             self.design.view(),
@@ -11325,10 +11326,12 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
 
     fn block_linear_constraints(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_idx: usize,
-        _: &ParameterBlockSpec,
+        block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
+        assert!(!block_states.is_empty());
+        assert!(!block_spec.name.is_empty());
         expect_block_idx_zero(block_idx, "spatial adaptive exact family", "")?;
         Ok(self.linear_constraints.clone())
     }
