@@ -12,7 +12,7 @@
 //! Self-contained: uses only `ndarray` + `approx` (both already gam deps).
 
 use approx::assert_relative_eq;
-use ndarray::{Array1, Array2, Array3, Axis, array, s};
+use ndarray::{Array1, Array2, Array3, array, s};
 
 /// SO(2) rep: θ -> 2x2 rotation.
 fn rho_so2(theta: f64) -> Array2<f64> {
@@ -64,7 +64,7 @@ fn commutator_residual_so2(W: &Array3<f64>, theta: &Array2<f64>, z: &Array2<f64>
     for a in 0..n_atoms {
         let wa = W.slice(s![a, .., ..]).to_owned(); // (D, 2)
         // WtW^{-1}
-        let wtw = wa.t().dot(&wa) + Array2::eye(2) * 1e-6;
+        let wtw = wa.t().dot(&wa) + Array2::<f64>::eye(2) * 1e-6;
         let det = wtw[[0, 0]] * wtw[[1, 1]] - wtw[[0, 1]] * wtw[[1, 0]];
         let inv = array![
             [wtw[[1, 1]] / det, -wtw[[0, 1]] / det],
