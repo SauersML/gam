@@ -323,7 +323,8 @@ pub(crate) fn firth_problem_scale_allows(n_obs: usize, p_coeff: usize) -> bool {
 mod tests {
     use super::{
         DirectionalHyperParam, EvalCacheManager, EvalShared, FirthDenseOperator,
-        GlmLikelihoodFamily, HyperDesignDerivative, ImplicitDerivLevel, RemlConfig, RemlState,
+        GlmLikelihoodFamily, HyperDesignDerivative, HyperPenaltyDerivative, ImplicitDerivLevel,
+        RemlConfig, RemlState,
     };
     use crate::estimate::EstimationError;
     use crate::faer_ndarray::{FaerCholesky, FaerEigh};
@@ -335,6 +336,65 @@ mod tests {
     use faer::Side;
     use ndarray::{Array1, Array2, array, s};
     use std::sync::Arc;
+
+    impl DirectionalHyperParam {
+        pub(super) fn new(
+            x_tau_original: Array2<f64>,
+            penalty_first_components: Vec<(usize, Array2<f64>)>,
+            x_tau_tau_original: Option<Vec<Option<Array2<f64>>>>,
+            penaltysecond_components: Option<Vec<Option<Vec<(usize, Array2<f64>)>>>>,
+        ) -> Result<Self, EstimationError> {
+            let x_tau_tau_original = x_tau_tau_original.map(|rows| {
+                rows.into_iter()
+                    .map(|entry| entry.map(HyperDesignDerivative::from))
+                    .collect::<Vec<_>>()
+            });
+            let penalty_first_components = penalty_first_components
+                .into_iter()
+                .map(|(idx, matrix)| (idx, HyperPenaltyDerivative::from(matrix)))
+                .collect();
+            let penaltysecond_components = penaltysecond_components.map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        row.map(|components| {
+                            components
+                                .into_iter()
+                                .map(|(idx, matrix)| {
+                                    (idx, HyperPenaltyDerivative::from(matrix))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            Self::new_compact(
+                HyperDesignDerivative::from(x_tau_original),
+                penalty_first_components,
+                x_tau_tau_original,
+                penaltysecond_components,
+            )
+        }
+
+        pub(super) fn single_penalty(
+            penalty_index: usize,
+            x_tau_original: Array2<f64>,
+            s_tau_original: Array2<f64>,
+            x_tau_tau_original: Option<Vec<Option<Array2<f64>>>>,
+            s_tau_tau_original: Option<Vec<Option<Array2<f64>>>>,
+        ) -> Result<Self, EstimationError> {
+            let penaltysecond_components = s_tau_tau_original.map(|rows| {
+                rows.into_iter()
+                    .map(|mat| mat.map(|mat| vec![(penalty_index, mat)]))
+                    .collect::<Vec<_>>()
+            });
+            Self::new(
+                x_tau_original,
+                vec![(penalty_index, s_tau_original)],
+                x_tau_tau_original,
+                penaltysecond_components,
+            )
+        }
+    }
 
     #[test]
     fn firth_problem_scale_gate_blocks_large_quadratic_work() {
@@ -3348,42 +3408,6 @@ impl DirectionalHyperParam {
         Ok(out)
     }
 
-    #[cfg(test)]
-    pub(crate) fn new(
-        x_tau_original: Array2<f64>,
-        penalty_first_components: Vec<(usize, Array2<f64>)>,
-        x_tau_tau_original: Option<Vec<Option<Array2<f64>>>>,
-        penaltysecond_components: Option<Vec<Option<Vec<(usize, Array2<f64>)>>>>,
-    ) -> Result<Self, EstimationError> {
-        let x_tau_tau_original = x_tau_tau_original.map(|rows| {
-            rows.into_iter()
-                .map(|entry| entry.map(HyperDesignDerivative::from))
-                .collect::<Vec<_>>()
-        });
-        let penalty_first_components = penalty_first_components
-            .into_iter()
-            .map(|(idx, matrix)| (idx, HyperPenaltyDerivative::from(matrix)))
-            .collect();
-        let penaltysecond_components = penaltysecond_components.map(|rows| {
-            rows.into_iter()
-                .map(|row| {
-                    row.map(|components| {
-                        components
-                            .into_iter()
-                            .map(|(idx, matrix)| (idx, HyperPenaltyDerivative::from(matrix)))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect::<Vec<_>>()
-        });
-        Self::new_compact(
-            HyperDesignDerivative::from(x_tau_original),
-            penalty_first_components,
-            x_tau_tau_original,
-            penaltysecond_components,
-        )
-    }
-
     pub(crate) fn new_compact(
         x_tau_original: HyperDesignDerivative,
         penalty_first_components: Vec<(usize, HyperPenaltyDerivative)>,
@@ -3461,27 +3485,6 @@ impl DirectionalHyperParam {
             .as_ref()
             .and_then(|rows| rows.get(j))
             .and_then(|entry| entry.clone())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn single_penalty(
-        penalty_index: usize,
-        x_tau_original: Array2<f64>,
-        s_tau_original: Array2<f64>,
-        x_tau_tau_original: Option<Vec<Option<Array2<f64>>>>,
-        s_tau_tau_original: Option<Vec<Option<Array2<f64>>>>,
-    ) -> Result<Self, EstimationError> {
-        let penaltysecond_components = s_tau_tau_original.map(|rows| {
-            rows.into_iter()
-                .map(|mat| mat.map(|mat| vec![(penalty_index, mat)]))
-                .collect::<Vec<_>>()
-        });
-        Self::new(
-            x_tau_original,
-            vec![(penalty_index, s_tau_original)],
-            x_tau_tau_original,
-            penaltysecond_components,
-        )
     }
 
     /// Whether this coordinate's design derivative uses implicit storage at the
