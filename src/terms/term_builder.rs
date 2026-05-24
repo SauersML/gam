@@ -280,62 +280,52 @@ pub fn build_termspec(
                     .iter()
                     .map(|v| resolve_col(col_map, v))
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut options_resolved = options.clone();
-                if let Some(by_name) = options.get("by") {
-                    let by_col = resolve_col(col_map, by_name)?;
-                    options_resolved.insert("__by_col".to_string(), by_col.to_string());
-                    if !terms.iter().any(|term| matches!(term, ParsedTerm::Linear { name, .. } | ParsedTerm::RandomEffect { name } if name == by_name)) {
-                        inference_notes.push(format!(
-                            "factor/numeric by-smooth `by={by_name}` is used without an explicit `{by_name}` main-effect term; add `{by_name}` or `group({by_name})` if level means should be identifiable."
-                        ));
-                    }
-                }
-                let basis = build_smooth_basis(
+                let mut inner_options = options.clone();
+                let by_name = inner_options.remove("by");
+                let basis_inner = build_smooth_basis(
                     *kind,
                     vars,
                     &cols,
-                    &options_resolved,
+                    &inner_options,
                     ds,
                     inference_notes,
                     policy,
                     smooth_coordinate_count,
                 )?;
-                if let Some(by_name) = by_name {
+                let basis = if let Some(by_name) = by_name {
                     let by_col = resolve_col(col_map, &by_name)?;
-                    let by_kind_tag = ds.column_kinds.get(by_col).copied().ok_or_else(|| {
-                        format!("internal column-kind lookup failed for by variable '{by_name}'")
-                    })?;
-                    let by_kind = match by_kind_tag {
+                    let by_kind = match ds
+                        .column_kinds
+                        .get(by_col)
+                        .copied()
+                        .unwrap_or(ColumnKindTag::Continuous)
+                    {
                         ColumnKindTag::Categorical => {
-                            let levels = sorted_levels_for_column(ds.values.column(by_col))?;
-                            let ordered = inner_options
-                                .get("ordered")
-                                .map(|v| {
-                                    matches!(
-                                        v.trim().to_ascii_lowercase().as_str(),
-                                        "true" | "1" | "yes" | "ordered"
-                                    )
-                                })
-                                .unwrap_or(false)
-                                || by_name.to_ascii_lowercase().contains("ord");
-                            if !terms.iter().any(|t| matches!(t, ParsedTerm::Linear { name, .. } | ParsedTerm::RandomEffect { name } if name == &by_name)) {
-                                inference_notes.push(format!("factor by-smooth s(..., by={by_name}) is usually identifiable with an explicit main-effect term for '{by_name}' (for example '+ {by_name}' or '+ group({by_name})')."));
+                            let has_main = terms.iter().any(|term| matches!(term,
+                                ParsedTerm::Linear { name, .. } | ParsedTerm::RandomEffect { name } if name == &by_name));
+                            if !has_main {
+                                inference_notes.push(format!(
+                                    "factor by-smooth '{}' uses by={} without an explicit main-effect term; add '{}' for mgcv-style level identifiability",
+                                    label, by_name, by_name
+                                ));
                             }
                             ByVarKind::Factor {
                                 feature_col: by_col,
-                                ordered,
-                                frozen_levels: Some(levels),
+                                ordered: false,
+                                frozen_levels: None,
                             }
                         }
-                        ColumnKindTag::Continuous | ColumnKindTag::Binary => ByVarKind::Numeric {
+                        _ => ByVarKind::Numeric {
                             feature_col: by_col,
                         },
                     };
-                    basis = SmoothBasisSpec::BySmooth {
-                        smooth: Box::new(basis),
+                    SmoothBasisSpec::BySmooth {
+                        smooth: Box::new(basis_inner),
                         by_kind,
-                    };
-                }
+                    }
+                } else {
+                    basis_inner
+                };
                 smooth_terms.push(SmoothTermSpec {
                     name: label.clone(),
                     basis,
@@ -831,7 +821,86 @@ pub fn build_smooth_basis(
     }
 
     match type_opt.as_str() {
-        "fs" | "factor-smooth" | "factor_smooth" | "sz" | "re" => {
+        "fs" | "sz" | "re" => {
+            validate_known_options(
+                type_opt.as_str(),
+                options,
+                &[
+                    "type",
+                    "bs",
+                    "k",
+                    "basis_dim",
+                    "basis-dim",
+                    "basisdim",
+                    "knots",
+                    "degree",
+                    "penalty_order",
+                    "m",
+                    "id",
+                ],
+            )?;
+            let mut group_idx = None;
+            let mut cont = Vec::new();
+            for (i, &c) in cols.iter().enumerate() {
+                match ds
+                    .column_kinds
+                    .get(c)
+                    .copied()
+                    .unwrap_or(ColumnKindTag::Continuous)
+                {
+                    ColumnKindTag::Categorical if group_idx.is_none() => group_idx = Some(i),
+                    _ => cont.push((i, c)),
+                }
+            }
+            let group_i = group_idx.ok_or_else(|| {
+                format!(
+                    "bs=\"{}\" smooth requires one categorical grouping variable",
+                    type_opt
+                )
+            })?;
+            if cont.len() != 1 {
+                return Err(format!(
+                    "bs=\"{}\" currently supports exactly one continuous variable plus one factor",
+                    type_opt
+                ));
+            }
+            let c = cont[0].1;
+            let (minv, maxv) = col_minmax(ds.values.column(c))?;
+            let degree = if type_opt == "re" {
+                1
+            } else {
+                option_usize(options, "degree").unwrap_or(3)
+            };
+            let default_internal = heuristic_knots_for_column(ds.values.column(c));
+            let (n_knots, _) = parse_ps_internal_knots(options, degree, default_internal)?;
+            let flavour = match type_opt.as_str() {
+                "fs" => FactorSmoothFlavour::Fs {
+                    m_null_penalty_orders: (0..option_usize(options, "m").unwrap_or(2)).collect(),
+                },
+                "sz" => FactorSmoothFlavour::Sz,
+                _ => FactorSmoothFlavour::Re,
+            };
+            Ok(SmoothBasisSpec::FactorSmooth {
+                spec: FactorSmoothSpec {
+                    continuous_cols: vec![c],
+                    group_col: cols[group_i],
+                    marginal: BSplineBasisSpec {
+                        degree,
+                        penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
+                        knotspec: BSplineKnotSpec::Generate {
+                            data_range: (minv, maxv),
+                            num_internal_knots: n_knots,
+                        },
+                        double_penalty: false,
+                        identifiability: BSplineIdentifiability::None,
+                        boundary_conditions: Default::default(),
+                    },
+                    flavour,
+                    group_frozen_levels: None,
+                },
+            })
+        }
+        "tensor" | "te" | "tensor-bspline" => {
             validate_known_options(
                 type_opt.as_str(),
                 options,

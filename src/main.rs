@@ -6719,10 +6719,11 @@ fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
                 None
             }
         }
-        SmoothBasisSpec::BySmooth { smooth, .. } => match smooth.as_ref() {
-            SmoothBasisSpec::BSpline1D { feature_col, .. } => Some(*feature_col),
-            _ => None,
-        },
+        SmoothBasisSpec::BySmooth { smooth, .. } => smooth_term_primary_column(&SmoothTermSpec {
+            name: String::new(),
+            basis: *smooth.clone(),
+            shape: gam::smooth::ShapeConstraint::None,
+        }),
         SmoothBasisSpec::FactorSmooth { spec } => spec.continuous_cols.first().copied(),
     }
 }
@@ -7594,15 +7595,11 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
         | SmoothBasisSpec::Pca { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
         SmoothBasisSpec::BySmooth { smooth, by_kind } => {
-            let mut cols = match smooth.as_ref() {
-                SmoothBasisSpec::BSpline1D { feature_col, .. } => vec![*feature_col],
-                SmoothBasisSpec::ThinPlate { feature_cols, .. }
-                | SmoothBasisSpec::Sphere { feature_cols, .. }
-                | SmoothBasisSpec::Matern { feature_cols, .. }
-                | SmoothBasisSpec::Duchon { feature_cols, .. }
-                | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
-                SmoothBasisSpec::BySmooth { .. } | SmoothBasisSpec::FactorSmooth { .. } => vec![],
-            };
+            let mut cols = smooth_term_feature_cols(&SmoothTermSpec {
+                name: String::new(),
+                basis: *smooth.clone(),
+                shape: gam::smooth::ShapeConstraint::None,
+            });
             match by_kind {
                 gam::smooth::ByVarKind::Numeric { feature_col }
                 | gam::smooth::ByVarKind::Factor { feature_col, .. } => cols.push(*feature_col),
