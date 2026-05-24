@@ -1957,11 +1957,28 @@ impl SurvivalLocationScaleFamily {
         /// surrounding scope.
         #[derive(Clone, Copy)]
         struct SendPtr(*mut f64);
+        // SAFETY: `SendPtr` is only ever constructed below from
+        // `Array1::<f64>::as_mut_ptr()` on buffers of length `n` whose
+        // exclusive mutable borrow is released before the `into_par_iter`
+        // closure runs. The closure writes a unique index `i ∈ 0..n` per
+        // iteration (rayon `(0..n).into_par_iter()`), so the writes are
+        // disjoint and never alias. The pointers do not outlive this function.
         unsafe impl Send for SendPtr {}
+        // SAFETY: Sync is sound for the same disjoint-index reason — every
+        // thread that observes `&SendPtr` only writes a unique row index
+        // owned by that rayon iteration, so no two threads ever touch the
+        // same `*mut f64` slot.
         unsafe impl Sync for SendPtr {}
         impl SendPtr {
             #[inline(always)]
+            // SAFETY: caller must pass `i < n` (the length of the underlying
+            // `Array1<f64>` buffer from which `self.0` was taken); the rayon
+            // `(0..n).into_par_iter()` driver guarantees this, and each `i`
+            // is visited by exactly one thread so the write is unaliased.
             unsafe fn write(self, i: usize, v: f64) {
+                // SAFETY: `self.0.add(i)` is in bounds (`i < n`) and the
+                // disjoint-index invariant from the par_iter driver above
+                // means no other thread is reading or writing this slot.
                 unsafe { *self.0.add(i) = v };
             }
         }

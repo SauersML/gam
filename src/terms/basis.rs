@@ -3312,11 +3312,10 @@ impl StreamingRadialState {
             for j in 0..n_knots {
                 let mut r2 = 0.0_f64;
                 for a in 0..dim {
-                    // SAFETY: i < n ≤ data.nrows(), j < n_knots ≤
-                    // centers.nrows(), and a < dim ≤ min(data.ncols(),
-                    // centers.ncols()) per the debug_assert above; the
-                    // uget reads stay in-bounds.
-                    let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) };
+                    // i < n ≤ data.nrows(), j < n_knots ≤ centers.nrows(), and
+                    // a < dim ≤ min(data.ncols(), centers.ncols()) per the
+                    // debug_assert above, so both uget reads stay in-bounds.
+                    let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) }; // SAFETY: bounds per the comment immediately above
                     r2 += metric_weights[a] * h * h;
                 }
                 match self.radial_kind.eval_design_triplet(r2.sqrt()) {
@@ -4489,6 +4488,9 @@ impl ImplicitDesignPsiDerivative {
                 for i in s..e {
                     for j in 0..k {
                         match st.compute_pair(i, j, &mut sb) {
+                            // SAFETY: chunk ci owns rows [s..e) of the raw n×k buffer,
+                            // so offsets i*k+j for i ∈ [s,e), j ∈ [0,k) are pairwise
+                            // disjoint across workers and stay within n*k = raw.len().
                             Ok((phi, q, t)) => unsafe {
                                 *rp.add(i * k + j) = deriv_fn(phi, q, t, &sb);
                             },
@@ -5860,6 +5862,9 @@ fn build_aniso_design_psi_derivatives_shared(
                         }
                     };
                     let flat = i * k + j;
+                    // SAFETY: chunk owns rows [start..end) of preallocated
+                    // nk-long phi/q/t buffers (and nk×dim axis_components); flat = i*k+j
+                    // and flat*dim+a stay in-bounds and per-chunk writes are disjoint.
                     unsafe {
                         *pp.add(flat) = phi;
                         *qp.add(flat) = q;
@@ -6028,6 +6033,9 @@ fn build_scalar_design_psi_derivatives_shared(
                         }
                     };
                     let flat = i * k + j;
+                    // SAFETY: per-chunk row ownership ensures the flat =
+                    // i*k+j offsets are pairwise disjoint across workers
+                    // and stay within the nk-long phi/q/t/axis buffers.
                     unsafe {
                         *pp.add(flat) = phi;
                         *qp.add(flat) = q;
@@ -10307,6 +10315,9 @@ pub fn closed_form_anisotropic_pair_block(
             let value = closed_form_anisotropic_pair_value_with_powers(
                 q, m, s, kappa, eta_raw, &powers, &r_buf, r_eps,
             );
+            // SAFETY: parallel iter owns row i of the lower-triangular table;
+            // row_ptr = base + lower_triangular_offset(i) and j ∈ 0..=i make
+            // the write land within row i, disjoint from any other worker.
             unsafe {
                 *row_ptr.add(j) = value;
             }
@@ -10409,6 +10420,9 @@ pub fn closed_form_anisotropic_pair_block_pure(
                         q, m, s, 0.0, eta_slice, &powers, &r_buf,
                     )
             };
+            // SAFETY: per-row ownership in the parallel iter — row_ptr
+            // points to the lower_triangular_offset(i) slot, and j ∈ 0..=i
+            // stays in row i, disjoint from every other worker.
             unsafe {
                 *row_ptr.add(j) = value;
             }
@@ -10616,6 +10630,8 @@ pub fn closed_form_matern_pair_block(
                 acc +=
                     binom_coeffs[jj] * closed_form_penalty::matern_kernel_value(d, order, kappa, r);
             }
+            // SAFETY: row_ptr points at the offset for row i and j ∈ 0..=i
+            // stays inside that row, disjoint from other parallel rows.
             unsafe {
                 *row_ptr.add(j) = acc;
             }
@@ -10779,6 +10795,10 @@ pub fn closed_form_psi_derivatives_in_total_basis(
                     q, p_order, s_order, kappa, eta_raw, &powers, &r_buf,
                 )
             };
+            // SAFETY: g_row / g_psi_row / g_psi_psi_row each point at
+            // lower_triangular_offset(i) of their respective k(k+1)/2
+            // buffers; j ∈ 0..=i confines the writes to row i, owned
+            // exclusively by this parallel iteration.
             unsafe {
                 *g_row.add(j) = bundle.value;
                 *g_psi_row.add(j) = kappa * bundle.d_kappa;
@@ -25537,12 +25557,18 @@ pub mod closed_form_penalty {
         let s2 = (d as f64) * b * b;
         let u1 = b * big_r2;
         let u2 = b * b * big_r2;
-        Some(match q {
-            0 => fr[0],
-            1 => -anisotropic_laplacian_of_radial_first(big_r, s1, u1, &fr),
-            2 => anisotropic_laplacian_of_radial_second(big_r, s1, s2, u1, u2, &fr),
-            _ => unreachable!(),
-        })
+        // `q > 2` has no closed-form analytic chart in this routine; signal
+        // that to callers via `None` rather than panicking.
+        let value = if q == 0 {
+            fr[0]
+        } else if q == 1 {
+            -anisotropic_laplacian_of_radial_first(big_r, s1, u1, &fr)
+        } else if q == 2 {
+            anisotropic_laplacian_of_radial_second(big_r, s1, s2, u1, u2, &fr)
+        } else {
+            return None;
+        };
+        Some(value)
     }
 
     fn uniform_eta_value(eta: &[f64]) -> Option<f64> {
@@ -32017,7 +32043,7 @@ mod tests {
         };
         let centers = match &base.metadata {
             BasisMetadata::Duchon { centers, .. } => centers.clone(),
-            _ => unreachable!(),
+            _ => panic!("expected Duchon metadata for centers extraction"),
         };
         spec.center_strategy = CenterStrategy::UserProvided(centers);
         spec.identifiability = match z_frozen {
@@ -32101,7 +32127,7 @@ mod tests {
         // is reproducible across length_scale shifts.
         let centers = match &base.metadata {
             BasisMetadata::Duchon { centers, .. } => centers.clone(),
-            _ => unreachable!(),
+            _ => panic!("expected Duchon metadata for centers extraction"),
         };
         spec.center_strategy = CenterStrategy::UserProvided(centers);
         spec.identifiability = match z_frozen {
@@ -34276,7 +34302,9 @@ mod tests {
                 MaternNu::FiveHalves => 5.0_f64.sqrt() * r / length_scale,
                 MaternNu::SevenHalves => 7.0_f64.sqrt() * r / length_scale,
                 MaternNu::NineHalves => 3.0 * r / length_scale,
-                _ => unreachable!("test only covers nu >= 5/2"),
+                MaternNu::Half | MaternNu::ThreeHalves => {
+                    panic!("test only covers nu >= 5/2; got {nu:?}")
+                }
             };
             let (expected_ratio, expected_lap) = match nu {
                 MaternNu::FiveHalves => (
@@ -34293,7 +34321,9 @@ mod tests {
                         * (-a).exp()
                         * (a.powi(4) + 2.0 * a.powi(3) - 3.0 * a * a - 15.0 * a - 15.0),
                 ),
-                _ => unreachable!("test only covers nu >= 5/2"),
+                MaternNu::Half | MaternNu::ThreeHalves => {
+                    panic!("test only covers nu >= 5/2; got {nu:?}")
+                }
             };
             let triplet =
                 matern_operator_psi_triplet(r, length_scale, nu, 1).expect("operator psi triplet");
@@ -34336,7 +34366,9 @@ mod tests {
                 MaternNu::FiveHalves => 5.0_f64.sqrt() * r / length_scale,
                 MaternNu::SevenHalves => 7.0_f64.sqrt() * r / length_scale,
                 MaternNu::NineHalves => 3.0 * r / length_scale,
-                _ => unreachable!("test only covers nu >= 5/2"),
+                MaternNu::Half | MaternNu::ThreeHalves => {
+                    panic!("test only covers nu >= 5/2; got {nu:?}")
+                }
             };
             let (expected_phi, expected_ratio, expected_second) = match nu {
                 MaternNu::FiveHalves => (
@@ -34360,7 +34392,9 @@ mod tests {
                         * (-a).exp()
                         * (a.powi(4) + 2.0 * a.powi(3) - 3.0 * a * a - 15.0 * a - 15.0),
                 ),
-                _ => unreachable!("test only covers nu >= 5/2"),
+                MaternNu::Half | MaternNu::ThreeHalves => {
+                    panic!("test only covers nu >= 5/2; got {nu:?}")
+                }
             };
 
             assert!(
