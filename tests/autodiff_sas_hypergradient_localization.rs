@@ -245,7 +245,11 @@ impl<T: AD> DifferentiableFunctionTrait<T> for SasD1Fn<T> {
     const NAME: &'static str = "SasD1Fn";
 
     fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
-        vec![sas_eta_d1_ad(self.eta, inputs[0], self.log_delta)]
+        if freeze {
+            vec![sas_eta_d1_ad(self.eta, inputs[0], self.log_delta)]
+        } else {
+            vec![sas_eta_d1_ad(self.eta, inputs[0], self.log_delta)]
+        }
     }
 
     fn num_inputs(&self) -> usize {
@@ -282,7 +286,11 @@ impl<T: AD> DifferentiableFunctionTrait<T> for SasD2Fn<T> {
     const NAME: &'static str = "SasD2Fn";
 
     fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
-        vec![sas_eta_d2_ad(self.eta, inputs[0], self.log_delta)]
+        if freeze {
+            vec![sas_eta_d2_ad(self.eta, inputs[0], self.log_delta)]
+        } else {
+            vec![sas_eta_d2_ad(self.eta, inputs[0], self.log_delta)]
+        }
     }
 
     fn num_inputs(&self) -> usize {

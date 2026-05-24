@@ -4274,30 +4274,6 @@ fn strip_leading_terminator_method(s: &str) -> Option<&str> {
     None
 }
 
-/// Count semicolons in `s` that are at brace/paren/bracket depth zero.
-/// Used by the if-return stripper to enforce "the gated block is a
-/// single statement" — a block containing more than one top-level `;`
-/// could be doing real work and must not be stripped as fake validation.
-fn count_top_level_semicolons(s: &str) -> usize {
-    let mut paren: i32 = 0;
-    let mut brack: i32 = 0;
-    let mut brace: i32 = 0;
-    let mut count = 0usize;
-    for &b in s.as_bytes() {
-        match b {
-            b'(' => paren += 1,
-            b')' => paren -= 1,
-            b'[' => brack += 1,
-            b']' => brack -= 1,
-            b'{' => brace += 1,
-            b'}' => brace -= 1,
-            b';' if paren == 0 && brack == 0 && brace == 0 => count += 1,
-            _ => {}
-        }
-    }
-    count
-}
-
 /// True when `segment` syntactically ends with a method call whose
 /// dotted-method portion is exactly `method`. Walks parens backward
 /// from the trailing `)` to find its matching `(`, then checks the
