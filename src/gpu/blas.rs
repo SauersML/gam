@@ -16,7 +16,6 @@
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendStatus {
-    CpuFallback,
     CudaUnavailable,
     CudaReady,
 }
@@ -52,14 +51,8 @@ mod cuda_impl {
     }
 
     #[inline]
-    fn vector_slice<'a>(v: ArrayView1<'a, f64>, storage: &'a mut Vec<f64>) -> &'a [f64] {
-        match v.as_slice() {
-            Some(slice) => slice,
-            None => {
-                storage.extend(v.iter().copied());
-                storage.as_slice()
-            }
-        }
+    fn vector_values(v: ArrayView1<'_, f64>) -> Vec<f64> {
+        v.iter().copied().collect()
     }
 
     #[inline]
@@ -123,11 +116,10 @@ mod cuda_impl {
         let (stream, blas) = stream_and_blas(runtime)?;
         let left_col = to_col_major(&left);
         let right_col = to_col_major(&right);
-        let mut weights_storage = Vec::new();
-        let weights_slice = vector_slice(weights, &mut weights_storage);
+        let weights_host = vector_values(weights);
         let left_dev = stream.clone_htod(&*left_col).ok()?;
         let right_dev = stream.clone_htod(&*right_col).ok()?;
-        let weights_dev = stream.clone_htod(weights_slice).ok()?;
+        let weights_dev = stream.clone_htod(&weights_host).ok()?;
         let mut weighted_right_dev = stream
             .alloc_zeros::<f64>(rows.checked_mul(right_cols)?)
             .ok()?;
@@ -259,9 +251,8 @@ mod cuda_impl {
         let (stream, blas) = stream_and_blas(runtime)?;
         let a_col = to_col_major(&a);
         let a_dev = stream.clone_htod(&*a_col).ok()?;
-        let mut v_storage = Vec::new();
-        let v_slice = vector_slice(v, &mut v_storage);
-        let v_dev = stream.clone_htod(v_slice).ok()?;
+        let v_host = vector_values(v);
+        let v_dev = stream.clone_htod(&v_host).ok()?;
         let mut out_dev = stream.alloc_zeros::<f64>(out_len).ok()?;
         let cfg = GemvConfig::<f64> {
             trans: if trans_a {

@@ -86,6 +86,24 @@ fn main() {
     let mut dead_cfg_gate_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_dead_cfg_gates(&manifest_dir, &manifest_dir, &mut dead_cfg_gate_offenders);
 
+    // Cargo features ban. Any `#[cfg(feature = "...")]` /
+    // `#[cfg_attr(feature = "...", ...)]` (at any nesting depth — `all`,
+    // `any`, `not`) carves the codebase into conditionally-compiled
+    // forks: rustc's `dead_code` lint sees only one fork at a time, the
+    // test suite has to enumerate the buildable configurations, and the
+    // gate itself is the same "make the lint shut up depending on
+    // context" family this scanner exists to ban. Autoderive paths
+    // (e.g. GPU vs CPU) from problem characteristics instead.
+    let mut feature_cfg_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_feature_cfg_gates(&manifest_dir, &manifest_dir, &mut feature_cfg_offenders);
+
+    // Cargo.toml `[features]` entries are banned for the same reason as
+    // the `cfg(feature = ...)` attributes that consume them: without an
+    // entry, the gate has nothing to reference. Delete the `[features]`
+    // section (and the corresponding gates) rather than papering over.
+    let mut cargo_feature_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_cargo_feature_entries(&manifest_dir, &manifest_dir, &mut cargo_feature_offenders);
+
     // `#[should_panic]` without `expected = "..."` catches any panic and
     // masks unrelated bugs. Require an `expected` string.
     let mut should_panic_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
@@ -409,6 +427,18 @@ fn main() {
                 .map(|(file, line, sig, reason)| {
                     (file.clone(), *line, Some(reason.clone()), sig.clone())
                 })
+                .collect(),
+        });
+    }
+
+    if !src_test_only_offenders.is_empty() {
+        sections.push(Section {
+            title:
+                "src/ item referenced only by tests (production code with no production consumers — implement a real caller, delete the item, or move it into a `#[cfg(test)]` private mod if it's genuinely test-support)"
+                    .to_string(),
+            rows: src_test_only_offenders
+                .iter()
+                .map(|(r, l, hint, s)| (r.clone(), *l, Some(hint.clone()), s.clone()))
                 .collect(),
         });
     }
@@ -1142,6 +1172,151 @@ fn scan_for_dead_cfg_gates(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf
                 continue;
             }
             if line_has_empty_cfg_gate(&stripped) {
+                offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+            }
+        }
+    });
+}
+
+/// Flags any `#[cfg(...)]` / `#![cfg(...)]` / `#[cfg_attr(...)]` /
+/// `#![cfg_attr(...)]` attribute whose argument list mentions a
+/// `feature = "..."` predicate at any nesting depth. Cargo features
+/// carve the codebase into conditionally-compiled forks: they multiply
+/// the number of buildable configurations the test suite has to cover,
+/// hide dead-code branches from one build's `dead_code` lint while
+/// keeping them alive in another, and are the same "make this lint shut
+/// up depending on context" family as `#[cfg(test)]` on pub items. The
+/// project's autoderived behavior selects paths (e.g. GPU vs CPU) from
+/// problem characteristics, not opt-in flags. Build.rs is exempt;
+/// strict everywhere else (not test-aware — features are equally bad
+/// in tests and benches).
+fn scan_for_feature_cfg_gates(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("feature") {
+            return;
+        }
+        let stripped_lines = strip_file_lines(content);
+        for (idx, line) in content.lines().enumerate() {
+            let stripped = stripped_lines.get(idx).map(String::as_str).unwrap_or(line);
+            // Must be an attribute line (`#[...]` or `#![...]`) and
+            // contain a `cfg(`/`cfg_attr(` invocation.
+            if !(stripped.contains("#[") || stripped.contains("#![")) {
+                continue;
+            }
+            if !(stripped.contains("cfg(") || stripped.contains("cfg_attr(")) {
+                continue;
+            }
+            if line_has_feature_predicate(stripped) {
+                offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+            }
+        }
+    });
+}
+
+/// True when `stripped` contains a `feature` identifier immediately
+/// followed by optional whitespace and `=` — the shape of the
+/// `feature = "..."` predicate Cargo expects inside `cfg(...)`. The
+/// check is whole-word on the `feature` token so identifiers like
+/// `featureset` or `not_a_feature` don't false-fire.
+fn line_has_feature_predicate(stripped: &str) -> bool {
+    let bytes = stripped.as_bytes();
+    let kw = b"feature";
+    let mut i = 0usize;
+    while i + kw.len() <= bytes.len() {
+        if &bytes[i..i + kw.len()] == kw {
+            let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+            let after_pos = i + kw.len();
+            let after_ok = after_pos == bytes.len() || !is_ident_byte(bytes[after_pos]);
+            if before_ok && after_ok {
+                // Skip whitespace, then require `=`.
+                let mut j = after_pos;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'=' {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Flags entries inside any `[features]` (or `[features.<sub>]`) table
+/// in `Cargo.toml` files. A feature definition is itself banned —
+/// without entries there is nothing for `cfg(feature = "...")` gates to
+/// reference. Walks the manifest section-by-section, treating the
+/// header line itself as exempt and flagging any `<ident> = <rhs>`
+/// assignment underneath. Build.rs is exempt; the scanner only acts on
+/// files whose basename is `Cargo.toml`.
+fn scan_for_cargo_feature_entries(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let basename = rel
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("");
+        if basename != "Cargo.toml" {
+            return;
+        }
+        let mut in_features = false;
+        for (idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            // Strip TOML `#` comments (TOML has no string-literal `#`
+            // confusion at line scope worth handling here).
+            let code_part = match trimmed.find('#') {
+                Some(p) => trimmed[..p].trim_end(),
+                None => trimmed,
+            };
+            if code_part.starts_with('[') && code_part.ends_with(']') {
+                let header = code_part
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .trim();
+                in_features = header == "features"
+                    || header.starts_with("features.")
+                    || header == "workspace.features"
+                    || header.starts_with("workspace.features.");
+                continue;
+            }
+            if !in_features {
+                continue;
+            }
+            if code_part.is_empty() {
+                continue;
+            }
+            // Need a `<ident> = ...` shape. Identifier characters per
+            // TOML bare-key rules: letters, digits, `_`, `-`.
+            let bytes = code_part.as_bytes();
+            let mut j = 0usize;
+            while j < bytes.len()
+                && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
+            {
+                j += 1;
+            }
+            if j == 0 {
+                continue;
+            }
+            let mut k = j;
+            while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < bytes.len() && bytes[k] == b'=' {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }
         }

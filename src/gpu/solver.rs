@@ -244,8 +244,7 @@ mod cuda {
 
 #[cfg(feature = "cuda")]
 pub(crate) use cuda::{
-    cholesky_logdet_from_col_major, context_and_stream, pinned_htod, potrf_in_place,
-    potrs_in_place,
+    cholesky_logdet_from_col_major, context_and_stream, pinned_htod, potrf_in_place, potrs_in_place,
 };
 
 #[cfg(feature = "cuda")]

@@ -1,6 +1,7 @@
 use gam::estimate::{FitOptions, fit_gam};
 use gam::gaussian_reml::{
-    GaussianRemlMultiBatchProblem, GaussianRemlScalarBatchProblem, gaussian_reml_closed_form,
+    GaussianRemlEigenCache, GaussianRemlMultiBatchProblem, GaussianRemlMultiResult,
+    GaussianRemlResult, GaussianRemlScalarBatchProblem, gaussian_reml_closed_form,
     gaussian_reml_closed_form_batch, gaussian_reml_closed_form_with_nullspace_dim,
     gaussian_reml_multi_closed_form, gaussian_reml_multi_closed_form_batch,
 };
@@ -59,6 +60,243 @@ fn fixture() -> (Array2<f64>, Array1<f64>, Array2<f64>) {
         s[[j, j]] = 1.0;
     }
     (x, y, s)
+}
+
+fn assert_close(label: &str, batched: f64, individual: f64, tolerance: f64) {
+    let diff = (batched - individual).abs();
+    assert!(
+        diff <= tolerance,
+        "{label} mismatch: batched={batched:.16e} individual={individual:.16e} diff={diff:.3e} tolerance={tolerance:.3e}"
+    );
+}
+
+fn assert_array1_close(
+    label: &str,
+    batched: &Array1<f64>,
+    individual: &Array1<f64>,
+    tolerance: f64,
+) {
+    assert_eq!(
+        batched.len(),
+        individual.len(),
+        "{label} length mismatch: batched={} individual={}",
+        batched.len(),
+        individual.len()
+    );
+    for (idx, (&batch_value, &individual_value)) in
+        batched.iter().zip(individual.iter()).enumerate()
+    {
+        assert_close(
+            &format!("{label}[{idx}]"),
+            batch_value,
+            individual_value,
+            tolerance,
+        );
+    }
+}
+
+fn assert_array2_close(
+    label: &str,
+    batched: &Array2<f64>,
+    individual: &Array2<f64>,
+    tolerance: f64,
+) {
+    assert_eq!(
+        batched.dim(),
+        individual.dim(),
+        "{label} shape mismatch: batched={:?} individual={:?}",
+        batched.dim(),
+        individual.dim()
+    );
+    for ((row, col), &batch_value) in batched.indexed_iter() {
+        assert_close(
+            &format!("{label}[{row},{col}]"),
+            batch_value,
+            individual[[row, col]],
+            tolerance,
+        );
+    }
+}
+
+fn assert_cache_matches(
+    label: &str,
+    batched: &GaussianRemlEigenCache,
+    individual: &GaussianRemlEigenCache,
+) {
+    assert_eq!(
+        batched.xtwx_fingerprint, individual.xtwx_fingerprint,
+        "{label} xtwx_fingerprint mismatch"
+    );
+    assert_eq!(
+        batched.penalty_fingerprint, individual.penalty_fingerprint,
+        "{label} penalty_fingerprint mismatch"
+    );
+    assert_eq!(
+        batched.penalty_rank, individual.penalty_rank,
+        "{label} penalty_rank mismatch"
+    );
+    assert_eq!(
+        batched.nullity, individual.nullity,
+        "{label} nullity mismatch"
+    );
+    assert_close(
+        &format!("{label}.logdet_xtwx"),
+        batched.logdet_xtwx,
+        individual.logdet_xtwx,
+        1e-10,
+    );
+    assert_close(
+        &format!("{label}.logdet_penalty_positive"),
+        batched.logdet_penalty_positive,
+        individual.logdet_penalty_positive,
+        1e-10,
+    );
+    assert_array1_close(
+        &format!("{label}.penalty_eigenvalues"),
+        &batched.penalty_eigenvalues,
+        &individual.penalty_eigenvalues,
+        1e-10,
+    );
+    assert_array2_close(
+        &format!("{label}.eigenvectors_abs"),
+        &batched.eigenvectors.mapv(f64::abs),
+        &individual.eigenvectors.mapv(f64::abs),
+        1e-10,
+    );
+    assert_array2_close(
+        &format!("{label}.coefficient_basis_abs"),
+        &batched.coefficient_basis.mapv(f64::abs),
+        &individual.coefficient_basis.mapv(f64::abs),
+        1e-10,
+    );
+}
+
+fn assert_scalar_batch_result_matches(
+    label: &str,
+    batched: &GaussianRemlResult,
+    individual: &GaussianRemlResult,
+) {
+    assert_close(
+        &format!("{label}.lambda"),
+        batched.lambda,
+        individual.lambda,
+        1e-10,
+    );
+    assert_close(&format!("{label}.rho"), batched.rho, individual.rho, 1e-10);
+    assert_array1_close(
+        &format!("{label}.coefficients"),
+        &batched.coefficients,
+        &individual.coefficients,
+        1e-9,
+    );
+    assert_array1_close(
+        &format!("{label}.fitted"),
+        &batched.fitted,
+        &individual.fitted,
+        1e-9,
+    );
+    assert_close(
+        &format!("{label}.reml_score"),
+        batched.reml_score,
+        individual.reml_score,
+        1e-9,
+    );
+    assert_close(
+        &format!("{label}.reml_grad_lambda"),
+        batched.reml_grad_lambda,
+        individual.reml_grad_lambda,
+        1e-9,
+    );
+    assert_close(
+        &format!("{label}.reml_hess_lambda"),
+        batched.reml_hess_lambda,
+        individual.reml_hess_lambda,
+        1e-9,
+    );
+    assert_close(
+        &format!("{label}.reml_grad_rho"),
+        batched.reml_grad_rho,
+        individual.reml_grad_rho,
+        1e-9,
+    );
+    assert_close(
+        &format!("{label}.reml_hess_rho"),
+        batched.reml_hess_rho,
+        individual.reml_hess_rho,
+        1e-9,
+    );
+    assert_close(&format!("{label}.edf"), batched.edf, individual.edf, 1e-9);
+    assert_close(
+        &format!("{label}.sigma2"),
+        batched.sigma2,
+        individual.sigma2,
+        1e-9,
+    );
+    assert_cache_matches(&format!("{label}.cache"), &batched.cache, &individual.cache);
+}
+
+fn assert_multi_batch_result_matches(
+    label: &str,
+    batched: &GaussianRemlMultiResult,
+    individual: &GaussianRemlMultiResult,
+) {
+    assert_close(
+        &format!("{label}.lambda"),
+        batched.lambda,
+        individual.lambda,
+        1e-10,
+    );
+    assert_close(&format!("{label}.rho"), batched.rho, individual.rho, 1e-10);
+    assert_array2_close(
+        &format!("{label}.coefficients"),
+        &batched.coefficients,
+        &individual.coefficients,
+        1e-9,
+    );
+    assert_array2_close(
+        &format!("{label}.fitted"),
+        &batched.fitted,
+        &individual.fitted,
+        1e-9,
+    );
+    assert_close(
+        &format!("{label}.reml_score"),
+        batched.reml_score,
+        individual.reml_score,
+        1e-9,
+    );
+    assert_close(
+        &format!("{label}.reml_grad_lambda"),
+        batched.reml_grad_lambda,
+        individual.reml_grad_lambda,
+        1e-9,
+    );
+    assert_close(
+        &format!("{label}.reml_hess_lambda"),
+        batched.reml_hess_lambda,
+        individual.reml_hess_lambda,
+        1e-9,
+    );
+    assert_close(
+        &format!("{label}.reml_grad_rho"),
+        batched.reml_grad_rho,
+        individual.reml_grad_rho,
+        1e-9,
+    );
+    assert_close(
+        &format!("{label}.reml_hess_rho"),
+        batched.reml_hess_rho,
+        individual.reml_hess_rho,
+        1e-9,
+    );
+    assert_close(&format!("{label}.edf"), batched.edf, individual.edf, 1e-9);
+    assert_array1_close(
+        &format!("{label}.sigma2"),
+        &batched.sigma2,
+        &individual.sigma2,
+        1e-9,
+    );
+    assert_cache_matches(&format!("{label}.cache"), &batched.cache, &individual.cache);
 }
 
 #[test]
@@ -192,6 +430,19 @@ fn closed_form_batches_ragged_scalar_and_multi_problems() {
     let y_short = y.slice(ndarray::s![..48]);
     let weights = Array1::from_iter((0..x.nrows()).map(|i| 0.75 + 0.01 * (i as f64)));
     let weights_short = weights.slice(ndarray::s![..48]);
+    let weights_alt = Array1::from_iter((0..x.nrows()).map(|i| 1.2 + 0.005 * (i as f64).cos()));
+    let mut x_alt = x.clone();
+    for i in 0..x_alt.nrows() {
+        let t = -1.0 + 2.0 * (i as f64) / ((x_alt.nrows() - 1) as f64);
+        x_alt[[i, 1]] = 0.75 * t + 0.15 * (7.0 * t).sin();
+        x_alt[[i, 2]] = 0.5 * t * t + 0.2 * (2.0 * t).cos();
+        x_alt[[i, 3]] = (4.0 * t + 0.3).sin();
+        x_alt[[i, 4]] = (6.0 * t - 0.2).cos();
+    }
+    let y_alt = Array1::from_iter((0..x_alt.nrows()).map(|i| {
+        let t = -1.0 + 2.0 * (i as f64) / ((x_alt.nrows() - 1) as f64);
+        -0.2 + 0.6 * t + 0.45 * (4.0 * t + 0.3).sin() + 0.08 * (11.0 * t).cos()
+    }));
 
     let scalar_problems = vec![
         GaussianRemlScalarBatchProblem {
@@ -206,10 +457,17 @@ fn closed_form_batches_ragged_scalar_and_multi_problems() {
             weights: Some(weights_short),
             init_rho: None,
         },
+        GaussianRemlScalarBatchProblem {
+            x: x_alt.view(),
+            y: y_alt.view(),
+            weights: Some(weights_alt.view()),
+            init_rho: Some(-0.35),
+        },
     ];
     let scalar_batch =
         gaussian_reml_closed_form_batch(&scalar_problems, s.view(), Some(0)).expect("scalar batch");
-    for (problem, batched) in scalar_problems.iter().zip(scalar_batch.iter()) {
+    assert_eq!(scalar_batch.len(), scalar_problems.len());
+    for (idx, (problem, batched)) in scalar_problems.iter().zip(scalar_batch.iter()).enumerate() {
         let individual = gaussian_reml_closed_form(
             problem.x.view(),
             problem.y.view(),
@@ -221,19 +479,27 @@ fn closed_form_batches_ragged_scalar_and_multi_problems() {
             problem.init_rho,
         )
         .expect("individual scalar fit");
-        assert!((batched.lambda - individual.lambda).abs() < 1e-10);
-        assert!(
-            (&batched.coefficients - &individual.coefficients)
-                .mapv(f64::abs)
-                .sum()
-                < 1e-9
-        );
+        assert_scalar_batch_result_matches(&format!("scalar_batch[{idx}]"), batched, &individual);
     }
 
-    let mut y_multi = Array2::<f64>::zeros((x.nrows(), 2));
+    let mut y_multi = Array2::<f64>::zeros((x.nrows(), 3));
     y_multi.column_mut(0).assign(&y);
     y_multi.column_mut(1).assign(&y.mapv(|value| -1.5 * value));
+    y_multi.column_mut(2).assign(&Array1::from_iter(
+        (0..x.nrows()).map(|i| 0.3 * y[i] + 0.12 * ((i as f64) * 0.47).sin()),
+    ));
     let y_multi_short = y_multi.slice(ndarray::s![..48, ..]);
+    let mut y_multi_alt = Array2::<f64>::zeros((x_alt.nrows(), 3));
+    y_multi_alt.column_mut(0).assign(&y_alt);
+    y_multi_alt
+        .column_mut(1)
+        .assign(&y_alt.mapv(|value| 0.4 - 0.8 * value));
+    y_multi_alt
+        .column_mut(2)
+        .assign(&Array1::from_iter((0..x_alt.nrows()).map(|i| {
+            let t = -1.0 + 2.0 * (i as f64) / ((x_alt.nrows() - 1) as f64);
+            0.25 + 0.3 * t - 0.2 * (5.0 * t).cos()
+        })));
     let multi_problems = vec![
         GaussianRemlMultiBatchProblem {
             x: x.view(),
@@ -247,10 +513,17 @@ fn closed_form_batches_ragged_scalar_and_multi_problems() {
             weights: Some(weights.slice(ndarray::s![..48])),
             init_rho: None,
         },
+        GaussianRemlMultiBatchProblem {
+            x: x_alt.view(),
+            y: y_multi_alt.view(),
+            weights: Some(weights_alt.view()),
+            init_rho: Some(-0.35),
+        },
     ];
     let multi_batch = gaussian_reml_multi_closed_form_batch(&multi_problems, s.view(), Some(0))
         .expect("multi batch");
-    for (problem, batched) in multi_problems.iter().zip(multi_batch.iter()) {
+    assert_eq!(multi_batch.len(), multi_problems.len());
+    for (idx, (problem, batched)) in multi_problems.iter().zip(multi_batch.iter()).enumerate() {
         let individual = gaussian_reml_multi_closed_form(
             problem.x.view(),
             problem.y.view(),
@@ -262,12 +535,6 @@ fn closed_form_batches_ragged_scalar_and_multi_problems() {
             problem.init_rho,
         )
         .expect("individual multi fit");
-        assert!((batched.lambda - individual.lambda).abs() < 1e-10);
-        assert!(
-            (&batched.coefficients - &individual.coefficients)
-                .mapv(f64::abs)
-                .sum()
-                < 1e-9
-        );
+        assert_multi_batch_result_matches(&format!("multi_batch[{idx}]"), batched, &individual);
     }
 }

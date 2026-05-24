@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use super::diagnostics;
 use super::device::GpuDeviceInfo;
 use super::policy::GpuDispatchPolicy;
 use cudarc::driver::{CudaContext, result, sys};
@@ -17,25 +18,51 @@ pub enum GpuProbeError {
 #[derive(Clone, Debug)]
 #[must_use]
 pub struct GpuRuntime {
+    /// Highest-scoring probed CUDA device. Existing dispatch code routes
+    /// one-shot kernels through this device.
     pub device: GpuDeviceInfo,
+    /// All usable CUDA devices discovered at probe time, ordered by score.
+    pub devices: Vec<GpuDeviceInfo>,
     pub policy: GpuDispatchPolicy,
     pub memory_budget_bytes: usize,
 }
 
 impl GpuRuntime {
     pub fn probe() -> Result<Option<Self>, GpuProbeError> {
-        let ordinal = 0;
-        let ctx = match cuda_context_for(ordinal) {
-            Some(ctx) => ctx,
-            None => return Ok(None),
+        let device_count =
+            CudaContext::device_count().map_err(|err| GpuProbeError::Driver(err.to_string()))?;
+        if device_count <= 0 {
+            diagnostics::log_cuda_disabled("CUDA driver reported no devices");
+            return Ok(None);
+        }
+
+        let mut devices = Vec::new();
+        for ordinal in 0..usize::try_from(device_count)
+            .map_err(|_| GpuProbeError::Driver("negative CUDA device count".into()))?
+        {
+            let ctx = cuda_context_for(ordinal).ok_or_else(|| {
+                GpuProbeError::Driver(format!("failed to create CUDA context for device {ordinal}"))
+            })?;
+            ctx.bind_to_thread()
+                .map_err(|err| GpuProbeError::Driver(err.to_string()))?;
+            devices.push(cuda_device_info(ordinal, &ctx)?);
+        }
+
+        devices.sort_by(|a, b| b.score().total_cmp(&a.score()));
+        let Some(device) = devices.first().cloned() else {
+            diagnostics::log_cuda_disabled("CUDA driver reported no usable devices");
+            return Ok(None);
         };
-        ctx.bind_to_thread()
-            .map_err(|err| GpuProbeError::Driver(err.to_string()))?;
-        let device = cuda_device_info(ordinal)?;
-        let memory_budget_bytes = device.free_mem_bytes.max(device.total_mem_bytes / 2);
+
+        let policy = GpuDispatchPolicy::default();
+        let memory_budget_bytes = device.free_mem_bytes.min(device.total_mem_bytes / 2);
+        diagnostics::log_cuda_enabled(&device, &policy);
+        diagnostics::log_cuda_pool(&devices);
+
         Ok(Some(Self {
             device,
-            policy: GpuDispatchPolicy::default(),
+            devices,
+            policy,
             memory_budget_bytes,
         }))
     }
@@ -59,8 +86,13 @@ impl GpuRuntime {
     }
 
     #[must_use]
-    pub fn selected_device(&self) -> Option<&GpuDeviceInfo> {
-        Some(&self.device)
+    pub fn selected_device(&self) -> &GpuDeviceInfo {
+        &self.device
+    }
+
+    #[must_use]
+    pub fn devices(&self) -> &[GpuDeviceInfo] {
+        &self.devices
     }
 
     #[must_use]
@@ -84,7 +116,7 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
     Some(guard.entry(ordinal).or_insert_with(|| ctx.clone()).clone())
 }
 
-fn cuda_device_info(ordinal: usize) -> Result<GpuDeviceInfo, GpuProbeError> {
+fn cuda_device_info(ordinal: usize, ctx: &CudaContext) -> Result<GpuDeviceInfo, GpuProbeError> {
     result::init().map_err(|err| GpuProbeError::Driver(err.to_string()))?;
     let device = result::device::get(
         i32::try_from(ordinal)
@@ -96,11 +128,9 @@ fn cuda_device_info(ordinal: usize) -> Result<GpuDeviceInfo, GpuProbeError> {
         unsafe { result::device::get_attribute(device, attribute) }
             .map_err(|err| GpuProbeError::Driver(err.to_string()))
     };
-    let total_mem_bytes = {
-        // SAFETY: device comes from cudarc's validated device::get.
-        unsafe { result::device::total_mem(device) }
-            .map_err(|err| GpuProbeError::Driver(err.to_string()))?
-    };
+    let (free_mem_bytes, total_mem_bytes) = ctx
+        .mem_get_info()
+        .map_err(|err| GpuProbeError::Driver(err.to_string()))?;
     let major = attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
     let minor = attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
     Ok(GpuDeviceInfo {
@@ -118,7 +148,7 @@ fn cuda_device_info(ordinal: usize) -> Result<GpuDeviceInfo, GpuProbeError> {
         l2_cache_bytes: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)
             .unwrap_or(0) as usize,
         total_mem_bytes,
-        free_mem_bytes: total_mem_bytes,
+        free_mem_bytes,
         ecc_enabled: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_ECC_ENABLED)
             .unwrap_or(0)
             != 0,
