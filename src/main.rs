@@ -58,7 +58,7 @@ use gam::predict::{
 use gam::probability::{normal_cdf, standard_normal_quantile};
 use gam::report;
 use gam::smooth::{
-    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
+    BoundedCoefficientPriorSpec, ByVarKind, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
     SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
     build_term_collection_design, freeze_term_collection_from_design,
 };
@@ -9117,13 +9117,13 @@ fn build_model_summary(
         // a naive coefficient Wald χ² p-value is anti-conservative, so only EDF is reported.
         let chi_sq_opt: Option<f64> = None;
         let ref_df = edf.max(0.0);
-        let pvalue = None;
+        let pvalue: Option<f64> = None;
         smooth_terms.push(SmoothTermSummary {
             name: name.clone(),
             edf,
-            ref_df: edf.max(0.0),
-            chi_sq: None,
-            pvalue: None,
+            ref_df,
+            chi_sq: chi_sq_opt,
+            pvalue,
             continuous_order: None,
         });
     }
