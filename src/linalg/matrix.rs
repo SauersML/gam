@@ -4996,8 +4996,10 @@ impl SparseHessianAccumulator {
                     return;
                 }
             }
-            #[cfg(debug_assertions)]
-            unreachable!("SparseHessianAccumulator::add_upper: ({r}, {c}) not in pattern");
+            debug_assert!(
+                false,
+                "SparseHessianAccumulator::add_upper: ({r}, {c}) not in pattern"
+            );
         }
     }
 
@@ -6298,9 +6300,11 @@ impl DesignMatrix {
                 // conversion fails on a well-formed sparse matrix, which is
                 // impossible — `SparseDesignMatrix`'s validation invariants
                 // upstream guarantee both inputs round-trip to CSR.
+                // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
                 let lhs_csr = lhs.to_csr_arc().unwrap_or_else(|| {
                     panic!("crossdiag_axpy_row_into: failed to obtain lhs CSR view")
                 });
+                // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
                 let rhs_csr = rhs.to_csr_arc().unwrap_or_else(|| {
                     panic!("crossdiag_axpy_row_into: failed to obtain rhs CSR view")
                 });
@@ -6341,6 +6345,7 @@ impl DesignMatrix {
                 // SAFETY: same CSR conversion invariant as above — only fails
                 // on a malformed sparse matrix, which the SparseDesignMatrix
                 // invariants forbid.
+                // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
                 let csr = sparse_mat.to_csr_arc().unwrap_or_else(|| {
                     panic!("crossdiag_axpy_row_into: failed to obtain CSR view")
                 });
@@ -6428,6 +6433,7 @@ impl DesignMatrix {
                 // SAFETY: `to_csr_arc` returns `None` only on csc→csr conversion
                 // failure for a malformed sparse matrix; `SparseDesignMatrix`
                 // invariants forbid that case.
+                // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
                 let csr = matrix.to_csr_arc().unwrap_or_else(|| {
                     panic!("DesignMatrix::syr_row_into: failed to obtain CSR view")
                 });
@@ -6517,9 +6523,11 @@ impl DesignMatrix {
                 // SAFETY: both `to_csr_arc` calls only fail on csc→csr conversion
                 // of a malformed sparse matrix; `SparseDesignMatrix` invariants
                 // upstream guarantee both inputs round-trip to CSR.
+                // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
                 let lhs_csr = lhs
                     .to_csr_arc()
                     .unwrap_or_else(|| panic!("row_outer_into: failed to obtain lhs CSR view"));
+                // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
                 let rhs_csr = rhs
                     .to_csr_arc()
                     .unwrap_or_else(|| panic!("row_outer_into: failed to obtain rhs CSR view"));
@@ -6597,6 +6605,7 @@ impl DesignMatrix {
                 // densification failure here means the sparse matrix exceeds
                 // the conservative byte budget, which `DesignMatrix::get`
                 // contractually forbids.
+                // SAFETY: `get` is an infallible scalar accessor; caller has accepted dense materialization budget.
                 let dense = sp
                     .try_to_dense_arc("DesignMatrix::get")
                     .unwrap_or_else(|msg| panic!("{msg}"));
@@ -6702,6 +6711,7 @@ impl DesignMatrix {
                 // a pre-materialized dense view. A caller that reached this
                 // arm used the borrow API on an operator representation it
                 // should have streamed through row chunks instead.
+                // SAFETY: as_dense_cow's zero-copy contract forbids operator-backed designs without a materialized view.
                 None => panic!(
                     "DesignMatrix::as_dense_cow called on operator-backed design ({}x{}); use row chunks or matrix-vector products",
                     op.nrows(),
@@ -6715,6 +6725,7 @@ impl DesignMatrix {
                     // materialization; densification failure here means the
                     // sparse matrix exceeds the byte-cap that this accessor
                     // contractually forbids.
+                    // SAFETY: caller of as_dense_cow has accepted dense materialization budget.
                     .unwrap_or_else(|msg| panic!("{msg}"))
                     .as_ref()
                     .clone(),
@@ -6746,6 +6757,7 @@ impl DesignMatrix {
                             // consumers; the row-chunk path has no byte cap
                             // and only fails on operator implementation bugs,
                             // which the operator trait contract forbids.
+                            // SAFETY: row_chunk_into is infallible-by-contract for valid operators.
                             panic!(
                                 "DesignMatrix::to_dense_cow: failed to materialize {}x{} \
                                  operator-backed design via row chunks: {err}",
@@ -6763,6 +6775,7 @@ impl DesignMatrix {
                     // dense `Array2<f64>` consumer; densification failure
                     // would mean the sparse matrix exceeds the conservative
                     // byte cap which this accessor's contract forbids.
+                    // SAFETY: caller of to_dense_cow has accepted dense materialization budget.
                     .unwrap_or_else(|msg| panic!("{msg}"))
                     .as_ref()
                     .clone(),
@@ -6803,6 +6816,7 @@ impl DesignMatrix {
                 // honours `MAX_SPARSE_TO_DENSE_BYTES` internally; failure
                 // means the matrix exceeded that hard limit which callers of
                 // `to_dense` are forbidden from triggering.
+                // SAFETY: dense-by-contract accessor; failure means caller broke MAX_SPARSE_TO_DENSE_BYTES contract.
                 .unwrap_or_else(|msg| panic!("{msg}"))
                 .as_ref()
                 .clone(),
@@ -6821,6 +6835,7 @@ impl DesignMatrix {
                 // densification failure would mean the sparse matrix exceeded
                 // `MAX_SPARSE_TO_DENSE_BYTES`, which this method's contract
                 // forbids.
+                // SAFETY: dense-by-contract accessor; failure means caller broke MAX_SPARSE_TO_DENSE_BYTES contract.
                 .unwrap_or_else(|msg| panic!("{msg}")),
         }
     }
@@ -7268,6 +7283,7 @@ mod tests {
         }
 
         fn to_dense(&self) -> Array2<f64> {
+            // SAFETY: test-only mock asserting row_chunk_into is exercised; reaching to_dense indicates a routing regression.
             panic!("ChunkOnlyOperator::to_dense fallback must not be used")
         }
     }
@@ -7522,6 +7538,7 @@ mod tests {
             Some(bad_constraint),
             None,
         ) {
+            // SAFETY: test asserting validation rejects mismatched constraint rows; Ok means the validator regressed.
             Ok(_) => panic!("constraint rows should match centers rows"),
             Err(err) => err,
         };
@@ -7529,6 +7546,7 @@ mod tests {
 
         let poly_err =
             match ChunkedKernelDesignOperator::new(data, centers, kernel, None, Some(bad_poly)) {
+                // SAFETY: test asserting validation rejects mismatched poly rows; Ok means the validator regressed.
                 Ok(_) => panic!("poly rows should match data rows"),
                 Err(err) => err,
             };
