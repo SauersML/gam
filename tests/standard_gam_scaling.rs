@@ -25,7 +25,7 @@ use rand::{RngExt, SeedableRng};
 use std::time::Instant;
 
 mod power_law_common;
-use power_law_common::report_power_law as fit_and_report_power_law_inner;
+use power_law_common::report_power_law_full as fit_and_report_power_law_inner;
 
 const K: usize = 8;
 const SEED: u64 = 0x5CA1_AB1E;
