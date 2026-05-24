@@ -15,8 +15,7 @@ use crate::basis::{
     center_strategy_num_centers, center_strategy_with_num_centers, estimate_penalty_nullity,
     filter_active_penalty_candidates, filter_active_penalty_candidates_with_ops,
     initial_aniso_contrasts, orthogonality_transform_for_design, pairwise_distance_bounds,
-    pairwise_distance_bounds_sampled, pca_center_mean, points_in_aniso_y_space,
-    select_centers_by_strategy,
+    pairwise_distance_bounds_sampled, points_in_aniso_y_space, select_centers_by_strategy,
 };
 use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
@@ -721,9 +720,10 @@ impl TermCollectionSpec {
                 SmoothBasisSpec::Pca {
                     centered,
                     center_mean,
+                    pca_basis_path,
                     ..
                 } => {
-                    if *centered && center_mean.is_none() {
+                    if *centered && center_mean.is_none() && pca_basis_path.is_none() {
                         return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: centered Pca missing center_mean",
                             st.name
@@ -5777,6 +5777,466 @@ struct LocalSmoothTermBuild {
     kronecker_factored: Option<KroneckerFactoredBasis>,
 }
 
+#[derive(Clone)]
+struct PcaScoresMemmapDesignOperator {
+    mmap: Arc<memmap2::Mmap>,
+    path: PathBuf,
+    data_offset: usize,
+    nrows: usize,
+    ncols: usize,
+    chunk_size: usize,
+}
+
+impl PcaScoresMemmapDesignOperator {
+    fn open(path: PathBuf, chunk_size: usize) -> Result<Self, BasisError> {
+        let file = File::open(&path).map_err(|err| {
+            BasisError::InvalidInput(format!(
+                "failed to open lazy Pca .npy scores '{}': {err}",
+                path.display()
+            ))
+        })?;
+        let mmap = unsafe {
+            memmap2::Mmap::map(&file).map_err(|err| {
+                BasisError::InvalidInput(format!(
+                    "failed to memmap lazy Pca .npy scores '{}': {err}",
+                    path.display()
+                ))
+            })?
+        };
+        let (data_offset, nrows, ncols) = parse_f64_2d_npy_header(&mmap, &path)?;
+        let expected = data_offset
+            .checked_add(nrows.saturating_mul(ncols).saturating_mul(8))
+            .ok_or_else(|| {
+                BasisError::InvalidInput(format!(
+                    "lazy Pca .npy scores '{}' shape is too large",
+                    path.display()
+                ))
+            })?;
+        if mmap.len() < expected {
+            return Err(BasisError::InvalidInput(format!(
+                "lazy Pca .npy scores '{}' is truncated: header expects {} bytes, file has {}",
+                path.display(),
+                expected,
+                mmap.len()
+            )));
+        }
+        Ok(Self {
+            mmap: Arc::new(mmap),
+            path,
+            data_offset,
+            nrows,
+            ncols,
+            chunk_size: chunk_size.max(1),
+        })
+    }
+
+    fn value(&self, row: usize, col: usize) -> f64 {
+        let offset = self.data_offset + (row * self.ncols + col) * 8;
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&self.mmap[offset..offset + 8]);
+        f64::from_le_bytes(bytes)
+    }
+
+    fn chunk_rows(&self) -> usize {
+        self.chunk_size.min(self.nrows.max(1))
+    }
+}
+
+impl LinearOperator for PcaScoresMemmapDesignOperator {
+    fn nrows(&self) -> usize {
+        self.nrows
+    }
+
+    fn ncols(&self) -> usize {
+        self.ncols
+    }
+
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        assert_eq!(vector.len(), self.ncols, "lazy Pca apply vector length mismatch");
+        let mut out = Array1::<f64>::zeros(self.nrows);
+        for start in (0..self.nrows).step_by(self.chunk_rows()) {
+            let end = (start + self.chunk_rows()).min(self.nrows);
+            for row in start..end {
+                let mut acc = 0.0;
+                for col in 0..self.ncols {
+                    acc += self.value(row, col) * vector[col];
+                }
+                out[row] = acc;
+            }
+        }
+        out
+    }
+
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        assert_eq!(
+            vector.len(),
+            self.nrows,
+            "lazy Pca apply_transpose vector length mismatch"
+        );
+        let mut out = Array1::<f64>::zeros(self.ncols);
+        for start in (0..self.nrows).step_by(self.chunk_rows()) {
+            let end = (start + self.chunk_rows()).min(self.nrows);
+            for row in start..end {
+                let scale = vector[row];
+                if scale == 0.0 {
+                    continue;
+                }
+                for col in 0..self.ncols {
+                    out[col] += scale * self.value(row, col);
+                }
+            }
+        }
+        out
+    }
+
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if weights.len() != self.nrows {
+            return Err(format!(
+                "lazy Pca diag_xtw_x weight length mismatch: weights={}, nrows={}",
+                weights.len(),
+                self.nrows
+            ));
+        }
+        let mut gram = Array2::<f64>::zeros((self.ncols, self.ncols));
+        for start in (0..self.nrows).step_by(self.chunk_rows()) {
+            let end = (start + self.chunk_rows()).min(self.nrows);
+            for row in start..end {
+                let w = weights[row];
+                if w == 0.0 {
+                    continue;
+                }
+                for a in 0..self.ncols {
+                    let xa = self.value(row, a);
+                    if xa == 0.0 {
+                        continue;
+                    }
+                    for b in a..self.ncols {
+                        gram[[a, b]] += w * xa * self.value(row, b);
+                    }
+                }
+            }
+        }
+        for a in 0..self.ncols {
+            for b in 0..a {
+                gram[[a, b]] = gram[[b, a]];
+            }
+        }
+        Ok(gram)
+    }
+
+    fn apply_weighted_normal(
+        &self,
+        weights: &Array1<f64>,
+        vector: &Array1<f64>,
+        penalty: Option<&Array2<f64>>,
+        ridge: f64,
+    ) -> Array1<f64> {
+        assert_eq!(weights.len(), self.nrows, "lazy Pca weighted-normal weight mismatch");
+        assert_eq!(vector.len(), self.ncols, "lazy Pca weighted-normal vector mismatch");
+        let mut out = Array1::<f64>::zeros(self.ncols);
+        for start in (0..self.nrows).step_by(self.chunk_rows()) {
+            let end = (start + self.chunk_rows()).min(self.nrows);
+            for row in start..end {
+                let w = weights[row].max(0.0);
+                if w == 0.0 {
+                    continue;
+                }
+                let mut row_dot = 0.0;
+                for col in 0..self.ncols {
+                    row_dot += self.value(row, col) * vector[col];
+                }
+                if row_dot == 0.0 {
+                    continue;
+                }
+                let scaled = w * row_dot;
+                for col in 0..self.ncols {
+                    out[col] += scaled * self.value(row, col);
+                }
+            }
+        }
+        if let Some(pen) = penalty {
+            out += &pen.dot(vector);
+        }
+        if ridge > 0.0 {
+            out += &vector.mapv(|x| ridge * x);
+        }
+        out
+    }
+}
+
+impl DenseDesignOperator for PcaScoresMemmapDesignOperator {
+    fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if weights.len() != self.nrows || y.len() != self.nrows {
+            return Err(format!(
+                "lazy Pca compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
+                weights.len(),
+                y.len(),
+                self.nrows
+            ));
+        }
+        let mut out = Array1::<f64>::zeros(self.ncols);
+        for start in (0..self.nrows).step_by(self.chunk_rows()) {
+            let end = (start + self.chunk_rows()).min(self.nrows);
+            for row in start..end {
+                let scale = weights[row] * y[row];
+                if scale == 0.0 {
+                    continue;
+                }
+                for col in 0..self.ncols {
+                    out[col] += scale * self.value(row, col);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if rows.end > self.nrows || rows.start > rows.end {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "lazy Pca row range out of bounds",
+            });
+        }
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "lazy Pca row_chunk_into shape mismatch",
+            });
+        }
+        for (local, row) in (rows.start..rows.end).enumerate() {
+            for col in 0..self.ncols {
+                out[[local, col]] = self.value(row, col);
+            }
+        }
+        Ok(())
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.nrows, self.ncols));
+        self.row_chunk_into(0..self.nrows, out.view_mut())
+            .expect("lazy Pca full materialization failed");
+        out
+    }
+}
+
+fn parse_f64_2d_npy_header(
+    bytes: &[u8],
+    path: &PathBuf,
+) -> Result<(usize, usize, usize), BasisError> {
+    if bytes.len() < 10 || &bytes[0..6] != b"\x93NUMPY" {
+        return Err(BasisError::InvalidInput(format!(
+            "lazy Pca scores '{}' is not a .npy file",
+            path.display()
+        )));
+    }
+    let major = bytes[6];
+    let header_len = match major {
+        1 => u16::from_le_bytes([bytes[8], bytes[9]]) as usize,
+        2 | 3 => {
+            if bytes.len() < 12 {
+                return Err(BasisError::InvalidInput(format!(
+                    "lazy Pca scores '{}' has a truncated .npy header",
+                    path.display()
+                )));
+            }
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize
+        }
+        other => {
+            return Err(BasisError::InvalidInput(format!(
+                "lazy Pca scores '{}' uses unsupported .npy version {}",
+                path.display(),
+                other
+            )));
+        }
+    };
+    let header_start = if major == 1 { 10 } else { 12 };
+    let data_offset = header_start + header_len;
+    if bytes.len() < data_offset {
+        return Err(BasisError::InvalidInput(format!(
+            "lazy Pca scores '{}' has a truncated .npy header",
+            path.display()
+        )));
+    }
+    let header = std::str::from_utf8(&bytes[header_start..data_offset]).map_err(|err| {
+        BasisError::InvalidInput(format!(
+            "lazy Pca scores '{}' has a non-UTF8 .npy header: {err}",
+            path.display()
+        ))
+    })?;
+    if !(header.contains("'descr': '<f8'")
+        || header.contains("\"descr\": \"<f8\"")
+        || header.contains("'descr': '|f8'")
+        || header.contains("\"descr\": \"|f8\""))
+    {
+        return Err(BasisError::InvalidInput(format!(
+            "lazy Pca scores '{}' must be float64 little-endian .npy",
+            path.display()
+        )));
+    }
+    if header.contains("True") {
+        return Err(BasisError::InvalidInput(format!(
+            "lazy Pca scores '{}' must be C-contiguous, not Fortran-ordered",
+            path.display()
+        )));
+    }
+    let shape_pos = header.find("shape").ok_or_else(|| {
+        BasisError::InvalidInput(format!(
+            "lazy Pca scores '{}' .npy header is missing shape",
+            path.display()
+        ))
+    })?;
+    let open = header[shape_pos..].find('(').ok_or_else(|| {
+        BasisError::InvalidInput(format!(
+            "lazy Pca scores '{}' .npy header has malformed shape",
+            path.display()
+        ))
+    })? + shape_pos;
+    let close = header[open..].find(')').ok_or_else(|| {
+        BasisError::InvalidInput(format!(
+            "lazy Pca scores '{}' .npy header has malformed shape",
+            path.display()
+        ))
+    })? + open;
+    let dims = header[open + 1..close]
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse::<usize>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| {
+            BasisError::InvalidInput(format!(
+                "lazy Pca scores '{}' .npy shape is not integral: {err}",
+                path.display()
+            ))
+        })?;
+    if dims.len() != 2 {
+        return Err(BasisError::InvalidInput(format!(
+            "lazy Pca scores '{}' must have shape (N, K), got {:?}",
+            path.display(),
+            dims
+        )));
+    }
+    Ok((data_offset, dims[0], dims[1]))
+}
+
+fn pca_center_mean(x: ArrayView2<'_, f64>) -> Result<Array1<f64>, BasisError> {
+    if x.nrows() == 0 {
+        return Err(BasisError::InvalidInput(
+            "Pca basis requires at least one row to compute center mean".to_string(),
+        ));
+    }
+    let mut mean = Array1::<f64>::zeros(x.ncols());
+    for row in x.rows() {
+        mean += &row;
+    }
+    mean.mapv_inplace(|v| v / x.nrows() as f64);
+    Ok(mean)
+}
+
+fn build_pca_smooth_basis(
+    data: ArrayView2<'_, f64>,
+    feature_cols: &[usize],
+    basis_matrix: &Array2<f64>,
+    centered: bool,
+    smooth_penalty: f64,
+    center_mean: Option<&Array1<f64>>,
+    pca_basis_path: Option<&PathBuf>,
+    chunk_size: usize,
+) -> Result<BasisBuildResult, BasisError> {
+    if let Some(path) = pca_basis_path {
+        let op = PcaScoresMemmapDesignOperator::open(path.clone(), chunk_size)?;
+        if op.nrows != data.nrows() {
+            return Err(BasisError::DimensionMismatch(format!(
+                "lazy Pca scores row mismatch: .npy has {}, data has {}",
+                op.nrows,
+                data.nrows()
+            )));
+        }
+        let k = op.ncols;
+        let mut penalty = Array2::<f64>::eye(k);
+        penalty.mapv_inplace(|v| v * smooth_penalty);
+        let (penalties, nullspace_dims, penaltyinfo, ops) =
+            filter_active_penalty_candidates_with_ops(vec![PenaltyCandidate {
+                matrix: penalty,
+                nullspace_dim_hint: 0,
+                source: PenaltySource::Other("PcaRidge".to_string()),
+                normalization_scale: 1.0,
+                kronecker_factors: None,
+                op: None,
+            }])?;
+        return Ok(BasisBuildResult {
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op))),
+            penalties,
+            nullspace_dims,
+            penaltyinfo,
+            ops,
+            metadata: BasisMetadata::Pca {
+                feature_cols: feature_cols.to_vec(),
+                basis_matrix: basis_matrix.clone(),
+                centered,
+                smooth_penalty,
+                center_mean: center_mean.cloned(),
+                pca_basis_path: Some(path.clone()),
+                chunk_size: chunk_size.max(1),
+            },
+            kronecker_factored: None,
+        });
+    }
+    if basis_matrix.nrows() != feature_cols.len() {
+        return Err(BasisError::DimensionMismatch(format!(
+            "Pca basis row mismatch: basis rows={}, feature columns={}",
+            basis_matrix.nrows(),
+            feature_cols.len()
+        )));
+    }
+    let mut x = select_columns(data, feature_cols)?;
+    let mean = if centered {
+        match center_mean {
+            Some(mean) => mean.clone(),
+            None => pca_center_mean(x.view())?,
+        }
+    } else {
+        Array1::<f64>::zeros(feature_cols.len())
+    };
+    if centered {
+        for mut row in x.rows_mut() {
+            row -= &mean;
+        }
+    }
+    let design = fast_ab(&x, basis_matrix);
+    let k = basis_matrix.ncols();
+    let mut penalty = Array2::<f64>::eye(k);
+    penalty.mapv_inplace(|v| v * smooth_penalty);
+    let (penalties, nullspace_dims, penaltyinfo, ops) =
+        filter_active_penalty_candidates_with_ops(vec![PenaltyCandidate {
+            matrix: penalty,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::Other("PcaRidge".to_string()),
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+            op: None,
+        }])?;
+    Ok(BasisBuildResult {
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+        penalties,
+        nullspace_dims,
+        penaltyinfo,
+        ops,
+        metadata: BasisMetadata::Pca {
+            feature_cols: feature_cols.to_vec(),
+            basis_matrix: basis_matrix.clone(),
+            centered,
+            smooth_penalty,
+            center_mean: centered.then_some(mean),
+            pca_basis_path: None,
+            chunk_size: chunk_size.max(1),
+        },
+        kronecker_factored: None,
+    })
+}
+
 fn apply_by_variable_to_local_build(
     mut built: LocalSmoothTermBuild,
     data: ArrayView2<'_, f64>,
@@ -6186,6 +6646,8 @@ fn build_single_local_smooth_term(
             centered,
             smooth_penalty,
             center_mean,
+            pca_basis_path,
+            chunk_size,
         } => {
             if term.shape != ShapeConstraint::None {
                 return Err(BasisError::InvalidInput(format!(
@@ -6200,6 +6662,8 @@ fn build_single_local_smooth_term(
                 *centered,
                 *smooth_penalty,
                 center_mean.as_ref(),
+                pca_basis_path.as_ref(),
+                *chunk_size,
             )?
         }
         SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {

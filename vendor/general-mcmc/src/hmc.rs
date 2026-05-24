@@ -285,7 +285,7 @@ where
                 let data = current.to_data();
                 if let Ok(slice) = data.as_slice::<T>() {
                     if let Err(e) = tracker.step(slice) {
-                        eprintln!("HMC tracker update failed: {e}");
+                        crate::__vmc_err!("HMC tracker update failed: {e}");
                     }
                     if let Ok(max_rhat) = tracker.max_rhat() {
                         pb.set_message(format!(

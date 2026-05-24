@@ -565,27 +565,11 @@ fn fast_atv_into_impl<S: Data<Elem = f64>>(
     use faer::linalg::matmul::matmul;
 
     let (n, p) = a.dim();
-    let (profile_op, profile_start) =
-        gpu_profile_start(crate::gpu::GpuOperation::Gemv { m: n, k: p });
     debug_assert_eq!(v.len(), n, "vector length must match A rows");
     debug_assert_eq!(out.len(), p, "output length must match A cols");
-    crate::gpu::record_cpu_fallback(
-        "linalg.fast_atv_into",
-        crate::gpu::profile::OperationKind::GemvTranspose,
-        n,
-        p,
-        1,
-        0,
-    );
-
-    if let Some(result) = crate::gpu::try_fast_atv(a, v) {
-        out.assign(&result);
-        return;
-    }
 
     if !should_use_faer_matmul(p, 1, n) {
         out.assign(&a.t().dot(v));
-        gpu_profile_finish(profile_op, profile_start);
         return;
     }
 
@@ -604,7 +588,6 @@ fn fast_atv_into_impl<S: Data<Elem = f64>>(
         1.0,
         par,
     );
-    gpu_profile_finish(profile_op, profile_start);
 }
 
 /// Compute A^T * diag(W) * A using streaming chunks to avoid O(n*p) allocation.
@@ -618,15 +601,8 @@ pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         w.len(),
         "fast_xt_diag_x row/weight length mismatch"
     );
-    let (_, p) = x.dim();
-    crate::gpu::profile::cpu_scope(
-        "fast_xt_diag_x",
-        p,
-        p,
-        x.nrows(),
-        x.nrows().saturating_mul(p).saturating_mul(16),
-        || fast_xt_diag_x_with_parallelism(x, w, matmul_parallelism(p, p, x.nrows())),
-    )
+    let p = x.ncols();
+    fast_xt_diag_x_with_parallelism(x, w, matmul_parallelism(p, p, x.nrows()))
 }
 
 /// Compute A^T * diag(W) * A with an explicit faer parallelism policy for
@@ -642,15 +618,7 @@ pub fn fast_xt_diag_x_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64
         w.len(),
         "fast_xt_diag_x_with_parallelism row/weight length mismatch"
     );
-    let (n, p) = x.dim();
-    crate::gpu::profile::cpu_scope(
-        "fast_xt_diag_x_with_parallelism",
-        p,
-        p,
-        n,
-        n.saturating_mul(p).saturating_mul(16),
-        || fast_xt_diag_x_with_parallelism_impl(x, w, par),
-    )
+    fast_xt_diag_x_with_parallelism_impl(x, w, par)
 }
 
 #[inline]
@@ -664,35 +632,13 @@ fn fast_xt_diag_x_with_parallelism_impl<S1: Data<Elem = f64>, S2: Data<Elem = f6
     use ndarray::{ShapeBuilder, s};
 
     let (n, p) = x.dim();
-    let (profile_op, profile_start) = gpu_profile_start(crate::gpu::GpuOperation::XtDiagX {
-        rows: n,
-        cols: p,
-        resident: false,
-    });
     debug_assert_eq!(n, w.len(), "X rows must match W length");
-    crate::gpu::record_cpu_fallback(
-        "linalg.fast_xt_diag_x",
-        crate::gpu::profile::OperationKind::XtDiagX,
-        n,
-        p,
-        p,
-        0,
-    );
     if n == 0 || p == 0 {
-        let out = Array2::<f64>::zeros((p, p));
-        gpu_profile_finish(profile_op, profile_start);
-        return out;
-    }
-    if crate::gpu::linalg::should_dispatch_xt_diag_x(n, p) {
-        if let Some(out) = crate::gpu::linalg::try_fast_xt_diag_x(x, w) {
-            return out;
-        }
+        return Array2::<f64>::zeros((p, p));
     }
     if !should_use_faer_matmul(p, p, n) {
         let w_x = Array2::from_shape_fn((n, p), |(i, j)| w[i] * x[[i, j]]);
-        let out = x.t().dot(&w_x);
-        gpu_profile_finish(profile_op, profile_start);
-        return out;
+        return x.t().dot(&w_x);
     }
 
     // Streaming chunked: peak allocation is chunk_rows × p instead of n × p.
@@ -776,7 +722,12 @@ fn fast_xt_diag_x_with_parallelism_impl<S1: Data<Elem = f64>, S2: Data<Elem = f6
         }
     }
 
-    gpu_profile_finish(profile_op, profile_start);
+    // Mirror lower triangle to upper for a full symmetric output.
+    for i in 0..p {
+        for j in (i + 1)..p {
+            result[[i, j]] = result[[j, i]];
+        }
+    }
     result
 }
 
@@ -797,17 +748,7 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
         w.len(),
         "fast_xt_diag_y row/weight length mismatch"
     );
-    let n = x.nrows();
-    let px = x.ncols();
-    let q = y.ncols();
-    crate::gpu::profile::cpu_scope(
-        "fast_xt_diag_y",
-        px,
-        q,
-        n,
-        n.saturating_mul(px + q).saturating_mul(16),
-        || fast_xt_diag_y_impl(x, w, y),
-    )
+    fast_xt_diag_y_impl(x, w, y)
 }
 
 #[inline]
@@ -822,37 +763,14 @@ fn fast_xt_diag_y_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem
 
     let (n, q) = y.dim();
     let px = x.ncols();
-    let (profile_op, profile_start) = gpu_profile_start(crate::gpu::GpuOperation::XtDiagY {
-        rows: n,
-        x_cols: px,
-        y_cols: q,
-        resident: false,
-    });
     debug_assert_eq!(n, w.len(), "Y rows must match W length");
-    crate::gpu::record_cpu_fallback(
-        "linalg.fast_xt_diag_y",
-        crate::gpu::profile::OperationKind::XtDiagY,
-        n,
-        px,
-        q,
-        0,
-    );
     debug_assert_eq!(n, x.nrows(), "X rows must match Y rows");
     if n == 0 || px == 0 || q == 0 {
-        let out = Array2::<f64>::zeros((px, q));
-        gpu_profile_finish(profile_op, profile_start);
-        return out;
-    }
-    if crate::gpu::linalg::should_dispatch_xt_diag_y(n, px, q) {
-        if let Some(out) = crate::gpu::linalg::try_fast_xt_diag_y(x, w, y) {
-            return out;
-        }
+        return Array2::<f64>::zeros((px, q));
     }
     if !should_use_faer_matmul(px, q, n) {
         let w_y = Array2::from_shape_fn((n, q), |(i, j)| w[i] * y[[i, j]]);
-        let out = x.t().dot(&w_y);
-        gpu_profile_finish(profile_op, profile_start);
-        return out;
+        return x.t().dot(&w_y);
     }
 
     // Streaming: only allocate chunk_rows × q for the weighted Y slice.
@@ -922,7 +840,6 @@ fn fast_xt_diag_y_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem
         }
     }
 
-    gpu_profile_finish(profile_op, profile_start);
     result
 }
 
@@ -944,16 +861,7 @@ pub fn fast_joint_hessian_2x2<
     w_ab: &ArrayBase<S4, Ix1>,
     w_bb: &ArrayBase<S5, Ix1>,
 ) -> Array2<f64> {
-    let n = x_a.nrows();
-    let total = x_a.ncols() + x_b.ncols();
-    crate::gpu::profile::cpu_scope(
-        "fast_joint_hessian_2x2",
-        total,
-        total,
-        n,
-        n.saturating_mul(total).saturating_mul(24),
-        || fast_joint_hessian_2x2_impl(x_a, x_b, w_aa, w_ab, w_bb),
-    )
+    fast_joint_hessian_2x2_impl(x_a, x_b, w_aa, w_ab, w_bb)
 }
 
 #[inline]
@@ -978,26 +886,14 @@ fn fast_joint_hessian_2x2_impl<
     let pa = x_a.ncols();
     let pb = x_b.ncols();
     let total = pa + pb;
-    crate::gpu::record_cpu_fallback(
-        "linalg.fast_joint_hessian_2x2",
-        crate::gpu::profile::OperationKind::JointHessian2x2,
-        n,
-        pa,
-        pb,
-        0,
-    );
     debug_assert_eq!(n, x_b.nrows());
     debug_assert_eq!(n, w_aa.len());
     debug_assert_eq!(n, w_ab.len());
     debug_assert_eq!(n, w_bb.len());
 
     if n == 0 || total == 0 {
-        let out = Array2::<f64>::zeros((total, total));
-        gpu_profile_finish(profile_op, profile_start);
-        return out;
+        return Array2::<f64>::zeros((total, total));
     }
-
-    drop(crate::gpu::linalg::should_dispatch_joint_hessian(n, pa, pb));
 
     // For small problems, fall back to separate computations
     if !should_use_faer_matmul(pa.max(pb), pa.max(pb), n) {
