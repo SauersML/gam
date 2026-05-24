@@ -4283,6 +4283,7 @@ pub enum AnalyticPenaltyKind {
     NuclearNorm(Arc<NuclearNormPenalty>),
     BlockSparsity(Arc<BlockSparsityPenalty>),
     AuxConditionalPrior(Arc<AuxConditionalPriorPenalty>),
+    ParametricAuxConditionalPrior(Arc<ParametricAuxConditionalPriorPenalty>),
     Orthogonality(Arc<OrthogonalityPenalty>),
 }
 
@@ -4298,6 +4299,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.tier(),
             AnalyticPenaltyKind::BlockSparsity(p) => p.tier(),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.tier(),
+            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.tier(),
             AnalyticPenaltyKind::Orthogonality(p) => p.tier(),
         }
     }
@@ -4313,6 +4315,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.rho_count(),
             AnalyticPenaltyKind::BlockSparsity(p) => p.rho_count(),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.rho_count(),
+            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.rho_count(),
             AnalyticPenaltyKind::Orthogonality(p) => p.rho_count(),
         }
     }
@@ -4328,6 +4331,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.name(),
             AnalyticPenaltyKind::BlockSparsity(p) => p.name(),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.name(),
+            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.name(),
             AnalyticPenaltyKind::Orthogonality(p) => p.name(),
         }
     }
@@ -4343,6 +4347,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.value(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.value(target, rho),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.value(target, rho),
+            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.value(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.value(target, rho),
         }
     }
@@ -4362,6 +4367,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_target(target, rho),
         }
     }
@@ -4381,6 +4387,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_rho(target, rho),
         }
     }
@@ -4400,6 +4407,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.hessian_diag(target, rho),
         }
     }
@@ -4427,6 +4435,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::BlockSparsity(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Orthogonality(p) => p.hvp(target, rho, v),
         }
     }
@@ -4570,6 +4579,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::AuxConditionalPrior(p) => {
                 p.diag_target(self.target.view(), self.rho.view())
             }
+            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => {
+                p.diag_target(self.target.view(), self.rho.view())
+            }
             AnalyticPenaltyKind::IBPAssignment(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
                 .expect("IBP assignment diag"),
@@ -4652,6 +4664,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::AuxConditionalPrior(p) => {
                 p.log_det_plus_lambda_i(self.rho.view(), lambda)
             }
+            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => {
+                p.log_det_plus_lambda_i(self.rho.view(), lambda)
+            }
             AnalyticPenaltyKind::BlockSparsity(_)
                 if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
             {
@@ -4677,6 +4692,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 return p.as_dense(self.target.view(), self.rho.view());
             }
             AnalyticPenaltyKind::AuxConditionalPrior(p) => {
+                return p.as_dense(self.target.view(), self.rho.view());
+            }
+            AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => {
                 return p.as_dense(self.target.view(), self.rho.view());
             }
             AnalyticPenaltyKind::Orthogonality(p) => {
