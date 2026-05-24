@@ -51,8 +51,14 @@ pub fn exp_sigma_inverse_from_eta_scalar(eta: f64) -> f64 {
 
 #[inline]
 pub fn exp_sigma_eta_for_sigma_scalar(sigma: f64) -> f64 {
-    assert!(sigma.is_finite(), "sigma must be finite");
-    assert!(sigma > 0.0, "sigma must be positive");
+    assert!(
+        sigma.is_finite(),
+        "exp sigma inverse link requires finite sigma: sigma={sigma}"
+    );
+    assert!(
+        sigma > 0.0,
+        "exp sigma inverse link requires positive sigma: sigma={sigma}"
+    );
     sigma.ln()
 }
 
@@ -203,10 +209,13 @@ pub fn logb_sigma_from_eta_scalar(eta: f64) -> f64 {
 
 #[inline]
 pub fn logb_sigma_eta_for_sigma_scalar(sigma: f64) -> f64 {
-    assert!(sigma.is_finite(), "sigma must be finite");
+    assert!(
+        sigma.is_finite(),
+        "logb sigma inverse link requires finite sigma: sigma={sigma}"
+    );
     assert!(
         sigma > LOGB_SIGMA_FLOOR,
-        "sigma must exceed LOGB_SIGMA_FLOOR for the logb inverse link"
+        "logb sigma inverse link requires sigma above floor: sigma={sigma}, floor={LOGB_SIGMA_FLOOR}"
     );
     (sigma - LOGB_SIGMA_FLOOR).ln()
 }

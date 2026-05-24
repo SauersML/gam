@@ -1546,7 +1546,11 @@ impl SurvivalLocationScaleFamily {
 
     #[inline]
     fn time_derivative_lower_bound(&self) -> f64 {
-        assert!(self.derivative_guard.is_finite() && self.derivative_guard > 0.0);
+        assert!(
+            self.derivative_guard.is_finite() && self.derivative_guard > 0.0,
+            "survival location-scale derivative guard must be finite and positive: derivative_guard={}",
+            self.derivative_guard
+        );
         self.derivative_guard
     }
 
@@ -2612,7 +2616,10 @@ impl SurvivalLocationScaleFamily {
 
     /// Exact `log(x)` value and first four derivatives on the positive domain.
     fn logwith_derivatives_positive(x: f64) -> (f64, f64, f64, f64, f64) {
-        assert!(x.is_finite() && x > 0.0);
+        assert!(
+            x.is_finite() && x > 0.0,
+            "log derivative kernel requires finite positive x: x={x}"
+        );
         let inv = 1.0 / x;
         (
             x.ln(),
