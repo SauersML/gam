@@ -1651,8 +1651,8 @@ mod tests {
     use crate::matrix::DesignMatrix;
     use crate::survival::{MonotonicityPenalty, PenaltyBlocks, SurvivalSpec};
     use crate::types::{
-        InverseLink, LikelihoodFamily, LikelihoodScaleMetadata, LinkFunction,
-        LogLikelihoodNormalization, RhoPrior,
+        InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction,
+        LogLikelihoodNormalization, ResponseFamily, RhoPrior,
     };
     use general_mcmc::generic_hmc::HamiltonianTarget;
     use ndarray::{Array1, Array2, array};
@@ -1701,7 +1701,10 @@ mod tests {
             blocks,
             log_lambdas: lambdas.clone(),
             lambdas,
-            likelihood_family: Some(LikelihoodFamily::GaussianIdentity),
+            likelihood_family: Some(LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            )),
             likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
             log_likelihood_normalization: LogLikelihoodNormalization::Full,
             log_likelihood: -1.0,
@@ -1824,7 +1827,10 @@ mod tests {
             }],
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
-            likelihood_family: Some(LikelihoodFamily::GaussianIdentity),
+            likelihood_family: Some(LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            )),
             likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
             log_likelihood_normalization: LogLikelihoodNormalization::Full,
             log_likelihood: -1.0,
@@ -2631,7 +2637,7 @@ mod tests {
         );
     }
 
-    /// Verify the family-gating invariant: every LikelihoodFamily that
+    /// Verify the family-gating invariant: every LikelihoodSpec that
     /// joint_family_logp_and_grad accepts produces a result (not an error
     /// about missing implementation). Every family it rejects returns an
     /// explicit error. No family is silently remapped to a different one.

@@ -9,8 +9,8 @@ use gam::mixture_link::{
 };
 use gam::smooth::BlockwisePenalty;
 use gam::types::{
-    InverseLink, LikelihoodFamily, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec,
-    ResponseFamily, SasLinkSpec,
+    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec, ResponseFamily,
+    SasLinkSpec,
 };
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
@@ -120,7 +120,7 @@ fn sas_fit_recovery_and_calibration_system() {
         w.view(),
         offset.view(),
         &s_list,
-        family,
+        family.clone(),
         &opts,
     )
     .expect("SAS fit");
@@ -142,7 +142,7 @@ fn sas_fit_recovery_and_calibration_system() {
         x.view(),
         fit.beta.view(),
         offset.view(),
-        LikelihoodFamily::BinomialSas,
+        family,
         &fit,
         &PredictUncertaintyOptions::default(),
     )
@@ -191,7 +191,7 @@ fn mixture_recovery_and_prediction_alignment_system() {
         w.view(),
         offset.view(),
         &s_list,
-        family,
+        family.clone(),
         &opts,
     )
     .expect("mixture fit");
@@ -210,7 +210,7 @@ fn mixture_recovery_and_prediction_alignment_system() {
         x.view(),
         fit.beta.view(),
         offset.view(),
-        LikelihoodFamily::BinomialMixture,
+        family,
         &fit,
         &PredictUncertaintyOptions::default(),
     )
@@ -246,25 +246,27 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
     let s_list = one_penalty_for_non_intercept(x_train.ncols());
 
     let opts_logit = base_fit_options();
+    let logit_family = binomial_likelihood(LinkFunction::Logit);
     let fit_logit = fit_gam(
         x_train.view(),
         y_train.view(),
         w.view(),
         offset_train.view(),
         &s_list,
-        binomial_likelihood(LinkFunction::Logit),
+        logit_family.clone(),
         &opts_logit,
     )
     .expect("logit fit");
 
     let opts_probit = base_fit_options();
+    let probit_family = binomial_likelihood(LinkFunction::Probit);
     let fit_probit = fit_gam(
         x_train.view(),
         y_train.view(),
         w.view(),
         offset_train.view(),
         &s_list,
-        binomial_likelihood(LinkFunction::Probit),
+        probit_family.clone(),
         &opts_probit,
     )
     .expect("probit fit");
@@ -284,7 +286,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         w.view(),
         offset_train.view(),
         &s_list,
-        sas_family,
+        sas_family.clone(),
         &opts_sas,
     )
     .expect("sas fit");
@@ -306,7 +308,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         w.view(),
         offset_train.view(),
         &s_list,
-        mixture_family,
+        mixture_family.clone(),
         &opts_mix,
     )
     .expect("mixture fit");
@@ -324,7 +326,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         x_test.view(),
         fit_logit.beta.view(),
         offset_test.view(),
-        LikelihoodFamily::BinomialLogit,
+        logit_family,
         &fit_logit,
         &options,
     )
@@ -333,7 +335,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         x_test.view(),
         fit_probit.beta.view(),
         offset_test.view(),
-        LikelihoodFamily::BinomialProbit,
+        probit_family,
         &fit_probit,
         &options,
     )
@@ -342,7 +344,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         x_test.view(),
         fit_sas.beta.view(),
         offset_test.view(),
-        LikelihoodFamily::BinomialSas,
+        sas_family,
         &fit_sas,
         &options,
     )
@@ -351,7 +353,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         x_test.view(),
         fit_mix.beta.view(),
         offset_test.view(),
-        LikelihoodFamily::BinomialMixture,
+        mixture_family,
         &fit_mix,
         &options,
     )
