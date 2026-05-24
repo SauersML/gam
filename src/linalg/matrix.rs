@@ -3435,7 +3435,7 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
             }
             _ => None,
         };
-        let _ = self.materialized.set(computed);
+        drop(self.materialized.set(computed));
         self.materialized
             .get()
             .and_then(|opt| opt.as_ref().map(|a| a.as_ref()))
@@ -3754,7 +3754,7 @@ impl CoefficientTransformOperator {
             }
             _ => None,
         };
-        let _ = self.materialized.set(computed);
+        drop(self.materialized.set(computed));
         self.materialized
             .get()
             .and_then(|opt| opt.as_ref().map(|a| a.as_ref()))
@@ -4938,6 +4938,8 @@ impl SparseHessianAccumulator {
             // integers starting at first_row[c], so the offset is arithmetic.
             let idx = s.col_ptrs[c] + (r - s.first_row[c]);
             assert!(idx < s.col_ptrs[c + 1], "add_upper contiguous OOB");
+            // SAFETY: the assert! immediately above proves idx < col_ptrs[c+1]
+            // ≤ values.len(); get_unchecked_mut therefore stays in-bounds.
             unsafe {
                 *self.values.get_unchecked_mut(idx) += val;
             }
@@ -4948,6 +4950,9 @@ impl SparseHessianAccumulator {
             let slice = &s.row_indices[start..end];
             for (off, &ri) in slice.iter().enumerate() {
                 if ri == r {
+                    // SAFETY: off ∈ 0..(end-start) since it comes from
+                    // slice = row_indices[start..end], so start+off < end
+                    // ≤ values.len(); the indexed slot exists.
                     unsafe {
                         *self.values.get_unchecked_mut(start + off) += val;
                     }
@@ -4996,7 +5001,7 @@ impl SparseHessianAccumulator {
                 shared.dim,
             ),
         };
-        // Safety: col_ptrs and row_indices were built from a valid BTreeSet
+        // SAFETY: col_ptrs and row_indices were built from a valid BTreeSet
         // enumeration → sorted row indices per column, no duplicates, all
         // indices in [0, dim).
         let symbolic =
@@ -7214,6 +7219,10 @@ mod tests {
     fn sparse_to_dense_accumulates_duplicate_entries() {
         // Build a non-canonical CSC with duplicate row index in the same column.
         // This can happen if a caller bypasses canonical constructors.
+        // SAFETY: col_ptrs = [0,2,3] is sorted ascending and ends at nnz=3;
+        // row indices {1,1,0} all lie in [0, nrows=3). Per-column sortedness
+        // and duplicate-row tolerance is exactly what this test is exercising
+        // (the documented non-canonical bypass path); new_unchecked accepts it.
         let symbolic = unsafe {
             SymbolicSparseColMat::new_unchecked(
                 3,

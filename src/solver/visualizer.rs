@@ -53,7 +53,7 @@ impl Log for ProgressLogger {
                 }
             }
         }
-        let _guard = LOG_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let log_lock_guard = LOG_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let mut stderr = io::stderr().lock();
         for line in lines {
             writeln!(stderr, "{line}").ok();
@@ -447,30 +447,30 @@ fn install_panic_hook() {
             if let Ok(mut guard) = tty_handle_slot().try_lock()
                 && let Some(file) = guard.as_mut()
             {
-                let _ = execute!(file, LeaveAlternateScreen);
-                let _ = file.flush();
+                drop(execute!(file, LeaveAlternateScreen));
+                drop(file.flush());
             }
             // Replay recent log tail so the tee'd run file ends with
             // real context, not just a bare panic message. Same
             // try_lock discipline as above.
-            let _ = writeln!(io::stderr(), "\n=== visualizer crash ===");
+            drop(writeln!(io::stderr(), "\n=== visualizer crash ==="));
             let mut dumped = false;
             if let Some(slot) = ACTIVE_FEED.get()
                 && let Ok(guard) = slot.try_lock()
                 && let Some(feed) = guard.as_ref()
                 && let Ok(model) = feed.model.try_lock()
             {
-                let _ = writeln!(io::stderr(), "last {} log line(s):", model.log_tail.len());
+                drop(writeln!(io::stderr(), "last {} log line(s):", model.log_tail.len()));
                 for line in &model.log_tail {
-                    let _ = writeln!(io::stderr(), "{line}");
+                    drop(writeln!(io::stderr(), "{line}"));
                 }
                 dumped = true;
             }
             if !dumped {
-                let _ = writeln!(
+                drop(writeln!(
                     io::stderr(),
                     "(log tail unavailable — visualizer locks contended)"
-                );
+                ));
             }
             let _ = writeln!(io::stderr(), "=== end crash report ===\n");
             prev(info);

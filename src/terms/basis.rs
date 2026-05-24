@@ -30,12 +30,18 @@ use thiserror::Error;
 /// SAFETY: the caller must ensure the pointer targets disjoint memory per thread.
 #[derive(Clone, Copy)]
 struct SendPtr(*mut f64);
+// SAFETY: the pointer is only ever dereferenced through SendPtr::add at
+// per-thread-disjoint offsets, as enforced by the par_iter callers.
 unsafe impl Send for SendPtr {}
+// SAFETY: same disjoint-offset rationale as the Send impl above.
 unsafe impl Sync for SendPtr {}
 
 impl SendPtr {
     #[inline(always)]
     fn add(self, offset: usize) -> *mut f64 {
+        // SAFETY: callers add offsets within the bounds of the buffer the
+        // raw pointer was constructed from; the worker partitioning at the
+        // top of each par_iter ensures distinct workers use distinct ranges.
         unsafe { self.0.add(offset) }
     }
 }
@@ -3306,6 +3312,10 @@ impl StreamingRadialState {
             for j in 0..n_knots {
                 let mut r2 = 0.0_f64;
                 for a in 0..dim {
+                    // SAFETY: i < n ≤ data.nrows(), j < n_knots ≤
+                    // centers.nrows(), and a < dim ≤ min(data.ncols(),
+                    // centers.ncols()) per the debug_assert above; the
+                    // uget reads stay in-bounds.
                     let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) };
                     r2 += metric_weights[a] * h * h;
                 }
@@ -3329,6 +3339,9 @@ impl StreamingRadialState {
                 let dim = metric_weights.len();
                 debug_assert_eq!(s_buf.len(), dim);
                 for a in 0..dim {
+                    // SAFETY: callers pass i < data.nrows() and j <
+                    // centers.nrows() (per ensure_triplet_cache's outer
+                    // bounds); a < dim ≤ min(data.ncols(), centers.ncols()).
                     let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) };
                     s_buf[a] = metric_weights[a] * h * h;
                 }
@@ -3338,6 +3351,7 @@ impl StreamingRadialState {
                 let dim = metric_weights.len();
                 let mut r2 = 0.0;
                 for a in 0..dim {
+                    // SAFETY: same bounds rationale as the PerAxis arm.
                     let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) };
                     r2 += metric_weights[a] * h * h;
                 }
@@ -23055,21 +23069,25 @@ pub fn create_ispline_derivative_dense(
     }
     let num_bspline_cols = knot_vector.len().saturating_sub(bs_degree + 1);
     let db = match derivative_order {
-        1 | 2 => {
-            let bspline_options = match derivative_order {
-                1 => BasisOptions::first_derivative(),
-                2 => BasisOptions::second_derivative(),
-                _ => unreachable!(),
-            };
+        1 => {
             let (db_arc, _) = create_basis::<Dense>(
                 data,
                 KnotSource::Provided(knot_vector.view()),
                 bs_degree,
-                bspline_options,
+                BasisOptions::first_derivative(),
             )?;
             db_arc.as_ref().clone()
         }
-        3 | 4 => {
+        2 => {
+            let (db_arc, _) = create_basis::<Dense>(
+                data,
+                KnotSource::Provided(knot_vector.view()),
+                bs_degree,
+                BasisOptions::second_derivative(),
+            )?;
+            db_arc.as_ref().clone()
+        }
+        3 => {
             let mut db = Array2::<f64>::zeros((data.len(), num_bspline_cols));
             for (row_idx, &x) in data.iter().enumerate() {
                 let row = db.slice_mut(s![row_idx, ..]).into_slice().ok_or_else(|| {
@@ -23077,25 +23095,32 @@ pub fn create_ispline_derivative_dense(
                         "I-spline derivative row is not contiguous".to_string(),
                     )
                 })?;
-                match derivative_order {
-                    3 => evaluate_bsplinethird_derivative_scalar(
-                        x,
-                        knot_vector.view(),
-                        bs_degree,
-                        row,
-                    )?,
-                    4 => evaluate_bspline_fourth_derivative_scalar(
-                        x,
-                        knot_vector.view(),
-                        bs_degree,
-                        row,
-                    )?,
-                    _ => unreachable!(),
-                }
+                evaluate_bsplinethird_derivative_scalar(x, knot_vector.view(), bs_degree, row)?;
             }
             db
         }
-        _ => unreachable!(),
+        4 => {
+            let mut db = Array2::<f64>::zeros((data.len(), num_bspline_cols));
+            for (row_idx, &x) in data.iter().enumerate() {
+                let row = db.slice_mut(s![row_idx, ..]).into_slice().ok_or_else(|| {
+                    BasisError::InvalidInput(
+                        "I-spline derivative row is not contiguous".to_string(),
+                    )
+                })?;
+                evaluate_bspline_fourth_derivative_scalar(
+                    x,
+                    knot_vector.view(),
+                    bs_degree,
+                    row,
+                )?;
+            }
+            db
+        }
+        other => {
+            return Err(BasisError::InvalidInput(format!(
+                "I-spline derivative supports orders 1..=4; got order={other}"
+            )));
+        }
     };
     let num_ispline_cols = num_bspline_cols.saturating_sub(1);
     if num_ispline_cols == 0 {
@@ -24348,24 +24373,25 @@ pub mod closed_form_penalty {
         let mut prev_term_norm = f64::INFINITY;
         let mut saw_nonzero_term = false;
         for n in 0..DUCHON_SMALL_CHI_SERIES_MAX_TERMS {
-            let kappa_factor = match kappa_derivative_order {
-                0 => 1.0,
-                1 => {
-                    if n == 0 {
-                        0.0
-                    } else {
-                        2.0 * n as f64 / kappa
-                    }
+            // Closed-form k-th derivative w.r.t. kappa of the term
+            // (kappa^2)^n in the Riesz small-chi series. We only ever invoke
+            // this function with kappa_derivative_order ∈ {0, 1, 2} (asserted
+            // above); the formula generalizes uniformly so a future caller
+            // requesting order k computes (2n)·(2n−1)·…·(2n−k+1) / kappa^k.
+            // For k=2 this collapses to p·(p−1)/kappa², matching the
+            // pre-refactor explicit branch (kappa_sq = kappa·kappa).
+            let kappa_factor = if kappa_derivative_order == 0 {
+                1.0
+            } else if n == 0 {
+                0.0
+            } else {
+                let p = 2.0 * n as f64;
+                let mut numerator = 1.0_f64;
+                for j in 0..kappa_derivative_order {
+                    numerator *= p - j as f64;
                 }
-                2 => {
-                    if n == 0 {
-                        0.0
-                    } else {
-                        let p = 2.0 * n as f64;
-                        p * (p - 1.0) / kappa_sq
-                    }
-                }
-                _ => unreachable!(),
+                let denom = kappa.powi(kappa_derivative_order as i32);
+                numerator / denom
             };
 
             let scale = coeff * kappa_factor;
@@ -24670,7 +24696,10 @@ pub mod closed_form_penalty {
                 }
                 (0.25 * (s1 * s1 + 2.0 * s2), grad, hess)
             }
-            _ => unreachable!(),
+            // `q > 2` is rejected by the early guard above; this arm
+            // therefore cannot run. Returning `None` keeps the typed
+            // contract intact rather than panicking.
+            _ => return None,
         };
         if c_eta == 0.0 || !c_eta.is_finite() {
             return None;
@@ -25334,7 +25363,10 @@ pub mod closed_form_penalty {
         let value = match q {
             1 => -s_1 * f_2q_0,
             2 => (f_2q_0 / 3.0) * (s_1 * s_1 + 2.0 * s_2),
-            _ => unreachable!(),
+            // `q ∉ {1, 2}` is rejected by the early guard above; this arm
+            // therefore cannot run. Returning `None` keeps the typed
+            // contract intact rather than panicking.
+            _ => return None,
         };
         Some(value)
     }
@@ -25467,11 +25499,15 @@ pub mod closed_form_penalty {
         let max_order = if q == 0 { 0 } else { (2 * q + 2).min(6) };
         let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
 
-        match q {
-            0 => fr[0],
-            1 => -anisotropic_laplacian_of_radial_first(big_r, s1, u1, &fr),
-            2 => anisotropic_laplacian_of_radial_second(big_r, s1, s2, u1, u2, &fr),
-            _ => unreachable!(),
+        // `q ∈ {0, 1, 2}` is enforced by the `assert!(q <= 2)` at the top of
+        // this function; the explicit arms below cover all admissible values
+        // without a wildcard.
+        if q == 0 {
+            fr[0]
+        } else if q == 1 {
+            -anisotropic_laplacian_of_radial_first(big_r, s1, u1, &fr)
+        } else {
+            anisotropic_laplacian_of_radial_second(big_r, s1, s2, u1, u2, &fr)
         }
     }
 

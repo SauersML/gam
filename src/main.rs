@@ -752,8 +752,8 @@ fn main() {
         if let Some(advice) = e.advice() {
             eprintln!("help: {advice}");
         }
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        let _ = std::io::Write::flush(&mut std::io::stderr());
+        drop(std::io::Write::flush(&mut std::io::stdout()));
+        drop(std::io::Write::flush(&mut std::io::stderr()));
         std::process::exit(1);
     }
     // Every output artifact has been written and flushed by `run()`. Skip the
@@ -764,8 +764,8 @@ fn main() {
     // non-zero exit in any wrapper (Python `subprocess.run(..., check=True)`,
     // `set -e` shells, CI). The kernel reclaims GPU memory, pinned host
     // buffers, memmaps, and the rayon thread-pool at process exit.
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-    let _ = std::io::Write::flush(&mut std::io::stderr());
+    drop(std::io::Write::flush(&mut std::io::stdout()));
+    drop(std::io::Write::flush(&mut std::io::stderr()));
     std::process::exit(0);
 }
 
@@ -3731,7 +3731,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // useful default and matches user expectation that `gam diagnose` does
     // SOMETHING (a smoke-test for the most common workflow). If/when more
     // diagnostics land, this path can route based on explicit flags.
-    let _ = args.alo;
+    drop(args.alo);
 
     progress.set_stage("diagnose", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
