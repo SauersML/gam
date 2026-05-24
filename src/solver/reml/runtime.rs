@@ -4819,6 +4819,7 @@ impl<'a> RemlState<'a> {
     ///
     /// Uses the exact pseudoinverse S⁺ restricted to the positive eigenspace.
     /// Only eigenvectors in the canonical structural rank participate.
+    #[cfg(test)]
     pub(super) fn fixed_subspace_penalty_trace(
         &self,
         e_transformed: &Array2<f64>,
