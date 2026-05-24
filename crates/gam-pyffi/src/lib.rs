@@ -71,10 +71,10 @@ use gam::terms::sae_manifold::{
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, AuxConditionalPriorPenalty,
-    DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty, NuclearNormPenalty,
-    OrthogonalityPenalty, ParametricAuxConditionalPriorPenalty, PenaltyConcavity, PenaltyTier,
-    PsiSlice, ScadMcpPenalty, SoftmaxAssignmentSparsityPenalty, SparsityPenalty,
-    TotalVariationPenalty,
+    BlockOrthogonalityPenalty, DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty,
+    NuclearNormPenalty, OrthogonalityPenalty, ParametricAuxConditionalPriorPenalty,
+    PenaltyConcavity, PenaltyTier, PsiSlice, ScalarWeightSchedule, ScadMcpPenalty,
+    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TotalVariationPenalty,
 };
 use gam::terms::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
@@ -10282,15 +10282,28 @@ fn descriptor_usize(
     Ok(value)
 }
 
-fn descriptor_weight_value(
+fn descriptor_no_unknown_keys(
     descriptor: &serde_json::Map<String, serde_json::Value>,
     context: &str,
+    allowed: &[&str],
 ) -> Result<(), String> {
+    for key in descriptor.keys() {
+        if !allowed.iter().any(|allowed_key| allowed_key == key) {
+            return Err(format!("{context}.{key} is not consumed by the {context} pyffi arm"));
+        }
+    }
+    Ok(())
+}
+
+fn descriptor_weight_scalar(
+    descriptor: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<f64, String> {
     let Some(value) = descriptor.get("weight") else {
-        return Ok(());
+        return Ok(1.0);
     };
     if value.as_str() == Some("auto") {
-        return Ok(());
+        return Ok(1.0);
     }
     let Some(weight) = value.as_f64() else {
         return Err(format!(
@@ -10300,34 +10313,72 @@ fn descriptor_weight_value(
     if !(weight.is_finite() && weight > 0.0) {
         return Err(format!("{context}.weight must be finite and > 0"));
     }
-    Ok(())
+    Ok(weight)
 }
 
-fn descriptor_weight_sequence(
+fn descriptor_weight_schedule(
     descriptor: &serde_json::Map<String, serde_json::Value>,
     context: &str,
-) -> Result<(), String> {
-    let Some(value) = descriptor.get("weight") else {
-        return Ok(());
+) -> Result<Option<ScalarWeightSchedule>, String> {
+    let Some(raw_schedule) = descriptor.get("weight_schedule") else {
+        return Ok(None);
     };
-    if value.as_str() == Some("auto") {
-        return Ok(());
+    if raw_schedule.is_null() {
+        return Ok(None);
     }
-    let values = value
-        .as_array()
-        .ok_or_else(|| format!("{context}.weight must be 'auto' or a list of positive floats"))?;
-    if values.is_empty() {
-        return Err(format!("{context}.weight must have at least one entry"));
-    }
-    for (idx, raw) in values.iter().enumerate() {
-        let Some(weight) = raw.as_f64() else {
-            return Err(format!("{context}.weight[{idx}] must be a finite positive float"));
-        };
-        if !(weight.is_finite() && weight > 0.0) {
-            return Err(format!("{context}.weight[{idx}] must be finite and > 0"));
+    let schedule = raw_schedule
+        .as_object()
+        .ok_or_else(|| format!("{context}.weight_schedule must be an object"))?;
+    let w_start = schedule
+        .get("w_start")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| format!("{context}.weight_schedule.w_start must be a finite number"))?;
+    let w_end = schedule
+        .get("w_end")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| format!("{context}.weight_schedule.w_end must be a finite number"))?;
+    let kind_name = schedule
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{context}.weight_schedule.kind is required"))?
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    let kind = match kind_name.as_str() {
+        "geometric" => {
+            let rate = schedule
+                .get("rate")
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| {
+                    format!("{context}.weight_schedule.rate is required for geometric")
+                })?;
+            ScheduleKind::Geometric { rate }
         }
+        "linear" => {
+            let steps = schedule
+                .get("steps")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    format!("{context}.weight_schedule.steps is required for linear")
+                })?;
+            ScheduleKind::Linear {
+                steps: steps as usize,
+            }
+        }
+        "reciprocal_iter" => ScheduleKind::ReciprocalIter,
+        other => {
+            return Err(format!(
+                "{context}.weight_schedule.kind must be geometric, linear, or reciprocal_iter; got {other:?}"
+            ));
+        }
+    };
+    let mut parsed = ScalarWeightSchedule::new(w_start, w_end, kind)
+        .map_err(|err| format!("{context}.weight_schedule: {err}"))?;
+    if let Some(iter_count) = schedule.get("iter_count") {
+        parsed.iter_count = iter_count.as_u64().ok_or_else(|| {
+            format!("{context}.weight_schedule.iter_count must be a non-negative integer")
+        })? as usize;
     }
-    Ok(())
+    Ok(Some(parsed))
 }
 
 fn descriptor_difference_op(
@@ -10531,17 +10582,38 @@ fn build_analytic_penalty_registry_from_json(
             .ok_or_else(|| format!("{context}.kind is required"))?
             .to_ascii_lowercase()
             .replace('-', "_");
+        let weight_schedule = descriptor_weight_schedule(descriptor, &context)?;
         match kind.as_str() {
             "isometry" => {
-                descriptor_weight_value(descriptor, &context)?;
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &["kind", "target", "weight", "weight_schedule"],
+                )?;
+                let weight = descriptor_weight_scalar(descriptor, &context)?;
+                let mut penalty = IsometryPenalty::new_euclidean(slice, target.d);
+                penalty.scalar_weight = weight;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
                 registry.push(gam::terms::AnalyticPenaltyKind::Isometry(std::sync::Arc::new(
-                    IsometryPenalty::new_euclidean(slice, target.d),
+                    penalty,
                 )));
             }
             "ard" => {
-                descriptor_weight_sequence(descriptor, &context)?;
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &["kind", "target", "weight_schedule"],
+                )?;
+                let penalty = ARDPenalty::new(slice, target.d);
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
                 registry.push(gam::terms::AnalyticPenaltyKind::Ard(std::sync::Arc::new(
-                    ARDPenalty::new(slice, target.d),
+                    penalty,
                 )));
             }
             "orthogonality" => {
@@ -10617,6 +10689,40 @@ fn build_analytic_penalty_registry_from_json(
                             learnable,
                         )
                         .map_err(|err| format!("{context}: {err}"))?,
+                    ),
+                ));
+            }
+            "block_orthogonality" => {
+                let raw_groups = descriptor
+                    .get("groups")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| format!("{context}.groups is required"))?;
+                let mut groups = Vec::with_capacity(raw_groups.len());
+                for (group_idx, raw_group) in raw_groups.iter().enumerate() {
+                    let raw_axes = raw_group.as_array().ok_or_else(|| {
+                        format!("{context}.groups[{group_idx}] must be a list of latent axes")
+                    })?;
+                    let mut group = Vec::with_capacity(raw_axes.len());
+                    for (axis_idx, raw_axis) in raw_axes.iter().enumerate() {
+                        let axis = raw_axis.as_u64().ok_or_else(|| {
+                            format!(
+                                "{context}.groups[{group_idx}][{axis_idx}] must be a non-negative integer"
+                            )
+                        })? as usize;
+                        group.push(axis);
+                    }
+                    groups.push(group);
+                }
+                let weight = descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                registry.push(gam::terms::AnalyticPenaltyKind::BlockOrthogonality(
+                    std::sync::Arc::new(
+                        BlockOrthogonalityPenalty::new(slice, groups, weight, n_eff, learnable)
+                            .map_err(|err| format!("{context}: {err}"))?,
                     ),
                 ));
             }

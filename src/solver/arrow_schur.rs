@@ -900,45 +900,28 @@ impl ArrowSchurSystem {
     ) {
         let d = self.d;
         let n = self.rows.len();
-        debug_assert_eq!(target_t.len(), n * d);
-        // Gradient: per-row `d`-slice added to `g_t^(i)`.
-        let grad = penalty.grad_target(target_t, rho_local);
-        for i in 0..n {
-            for a in 0..d {
-                self.rows[i].gt[a] += grad[i * d + a];
-            }
-        }
-        // Hessian: inject diagonal penalties directly. This avoids O(d)
-        // full-length HVP probes for ARD/sparsity on the Psi tier.
-        if let Some(diag) = penalty.hessian_diag(target_t, rho_local) {
-            debug_assert_eq!(diag.len(), n * d);
-            for i in 0..n {
-                for a in 0..d {
-                    self.rows[i].htt[[a, a]] += diag[i * d + a];
+        apply_analytic_penalty(
+            penalty,
+            target_t,
+            rho_local,
+            n * d,
+            d,
+            self,
+            |sys, flat, value| sys.rows[flat / d].gt[flat % d] += value,
+            |sys, flat, value| sys.rows[flat / d].htt[[flat % d, flat % d]] += value,
+            |a, probe| {
+                for i in 0..n {
+                    probe[i * d + a] = 1.0;
                 }
-            }
-            return;
-        }
-
-        // Dense row-block Hessian: probe via HVP against each unit-`d`-vector
-        // for each row. The public registry entry rejects Psi-tier penalties
-        // with off-row Hessian blocks before this point.
-        let mut probe = Array1::<f64>::zeros(n * d);
-        for a in 0..d {
-            // One probe per latent axis: set the `a`-th column of each
-            // row simultaneously to 1, HVP once, extract the column-`a`
-            // entries of `H_tt^(i)` for every row.
-            probe.fill(0.0);
-            for i in 0..n {
-                probe[i * d + a] = 1.0;
-            }
-            let hv = penalty.hvp(target_t, rho_local, probe.view());
-            for i in 0..n {
-                for b in 0..d {
-                    self.rows[i].htt[[b, a]] += hv[i * d + b];
+            },
+            |sys, a, hv| {
+                for i in 0..n {
+                    for b in 0..d {
+                        sys.rows[i].htt[[b, a]] += hv[i * d + b];
+                    }
                 }
-            }
-        }
+            },
+        );
     }
 
     fn add_beta_penalty(
@@ -948,40 +931,30 @@ impl ArrowSchurSystem {
         rho_local: ArrayView1<'_, f64>,
     ) {
         let k = self.k;
-        debug_assert_eq!(target_beta.len(), k);
-        let grad = penalty.grad_target(target_beta, rho_local);
-        for j in 0..k {
-            self.gb[j] += grad[j];
-        }
-        // Hessian: inject diagonal penalties directly. K may be large
-        // (~100K for production SAE), so this is the hot path for β-tier
-        // sparsity/ARD-style penalties.
-        if let Some(diag) = penalty.hessian_diag(target_beta, rho_local) {
-            debug_assert_eq!(diag.len(), k);
-            for j in 0..k {
-                if self.hbb.dim() == (k, k) {
-                    self.hbb[[j, j]] += diag[j];
+        let hvp_columns = if self.hbb.dim() == (k, k) { k } else { 0 };
+        apply_analytic_penalty(
+            penalty,
+            target_beta,
+            rho_local,
+            k,
+            hvp_columns,
+            self,
+            |sys, j, value| sys.gb[j] += value,
+            |sys, j, value| {
+                if sys.hbb.dim() == (k, k) {
+                    sys.hbb[[j, j]] += value;
                 }
-                if let Some(hbb_diag) = self.hbb_diag.as_mut() {
-                    hbb_diag[j] += diag[j];
+                if let Some(hbb_diag) = sys.hbb_diag.as_mut() {
+                    hbb_diag[j] += value;
                 }
-            }
-            return;
-        }
-
-        // Dense Hessian: probe with unit β-vectors.
-        if self.hbb.dim() != (k, k) {
-            return;
-        }
-        let mut probe = Array1::<f64>::zeros(k);
-        for j in 0..k {
-            probe.fill(0.0);
-            probe[j] = 1.0;
-            let hv = penalty.hvp(target_beta, rho_local, probe.view());
-            for i in 0..k {
-                self.hbb[[i, j]] += hv[i];
-            }
-        }
+            },
+            |j, probe| probe[j] = 1.0,
+            |sys, j, hv| {
+                for i in 0..k {
+                    sys.hbb[[i, j]] += hv[i];
+                }
+            },
+        );
     }
 
     /// Schur-eliminate the per-row latent block and solve for `(Δt, Δβ)`.
@@ -1026,6 +999,47 @@ impl ArrowSchurSystem {
         options: &ArrowSolveOptions,
     ) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
         solve_arrow_newton_step_core(self, ridge_t, ridge_beta, options)
+    }
+}
+
+fn apply_analytic_penalty<S, G, D, P, H>(
+    penalty: &AnalyticPenaltyKind,
+    target: ArrayView1<'_, f64>,
+    rho_local: ArrayView1<'_, f64>,
+    expected_target_len: usize,
+    hvp_columns: usize,
+    scatter_target: &mut S,
+    mut grad_scatter: G,
+    mut diag_scatter: D,
+    seed_hvp_probe: P,
+    mut hvp_column_scatter: H,
+) where
+    G: FnMut(&mut S, usize, f64),
+    D: FnMut(&mut S, usize, f64),
+    P: Fn(usize, &mut Array1<f64>),
+    H: for<'a> FnMut(&mut S, usize, ArrayView1<'a, f64>),
+{
+    debug_assert_eq!(target.len(), expected_target_len);
+
+    let grad = penalty.grad_target(target, rho_local);
+    for index in 0..expected_target_len {
+        grad_scatter(scatter_target, index, grad[index]);
+    }
+
+    if let Some(diag) = penalty.hessian_diag(target, rho_local) {
+        debug_assert_eq!(diag.len(), expected_target_len);
+        for index in 0..expected_target_len {
+            diag_scatter(scatter_target, index, diag[index]);
+        }
+        return;
+    }
+
+    let mut probe = Array1::<f64>::zeros(expected_target_len);
+    for column in 0..hvp_columns {
+        probe.fill(0.0);
+        seed_hvp_probe(column, &mut probe);
+        let hv = penalty.hvp(target, rho_local, probe.view());
+        hvp_column_scatter(scatter_target, column, hv.view());
     }
 }
 

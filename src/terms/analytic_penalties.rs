@@ -4631,6 +4631,396 @@ impl AnalyticPenalty for ScadMcpPenalty {
 }
 
 // ---------------------------------------------------------------------------
+// Block-orthogonality penalty
+// ---------------------------------------------------------------------------
+
+/// Between-block-only orthogonality; leaves within-block structure free.
+/// Codifies the auto_exp_38 gauge-fix-companion pattern: supervise one block
+/// via AuxConditional, leave the other free, pair with BlockOrthogonality to
+/// force the supervised gauge to anchor the free axes.
+///
+/// The `auto_exp_38` memory `project_cogito_recovery_at_d_aux_3.md`
+/// records the motivation: cogito-L40's name-semantic subspace emerged
+/// unsupervisedly when HSV was locked down on a companion 3-axis block, and
+/// the supervised block plus free block had to be orthogonal for gauge
+/// transfer.
+#[derive(Debug, Clone)]
+pub struct BlockOrthogonalityPenalty {
+    pub target: PsiSlice,
+    pub groups: Vec<Vec<usize>>,
+    /// Base strength. If `learnable_weight` is true, the resolved strength is
+    /// `weight * exp(rho[rho_index])`; otherwise it is fixed at `weight`.
+    pub weight: f64,
+    /// Number of rows in the row-major matrix-valued latent block.
+    pub n_eff: usize,
+    pub learnable_weight: bool,
+    pub rho_index: usize,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
+}
+
+impl BlockOrthogonalityPenalty {
+    #[must_use = "build error must be handled"]
+    pub fn new(
+        target: PsiSlice,
+        groups: Vec<Vec<usize>>,
+        weight: f64,
+        n_eff: usize,
+        learnable_weight: bool,
+    ) -> Result<Self, String> {
+        if target.is_empty() {
+            return Err("BlockOrthogonalityPenalty::new requires a non-empty target".to_string());
+        }
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!(
+                "BlockOrthogonalityPenalty::new requires finite weight > 0, got {weight}"
+            ));
+        }
+        if n_eff == 0 {
+            return Err("BlockOrthogonalityPenalty::new requires n_eff > 0".to_string());
+        }
+        if target.len() % n_eff != 0 {
+            return Err(format!(
+                "BlockOrthogonalityPenalty::new target length {} is not divisible by n_eff {}",
+                target.len(),
+                n_eff
+            ));
+        }
+        let latent_dim = target.len() / n_eff;
+        if let Some(expected_dim) = target.latent_dim {
+            let expected = n_eff.checked_mul(expected_dim).ok_or_else(|| {
+                "BlockOrthogonalityPenalty::new target shape overflows usize".to_string()
+            })?;
+            if expected != target.len() {
+                return Err(format!(
+                    "BlockOrthogonalityPenalty::new target length {} does not match n_eff {} × latent_dim {}",
+                    target.len(),
+                    n_eff,
+                    expected_dim
+                ));
+            }
+        }
+        if groups.len() < 2 {
+            return Err(
+                "BlockOrthogonalityPenalty::new requires at least two groups".to_string(),
+            );
+        }
+        let mut seen = vec![false; latent_dim];
+        for (group_idx, group) in groups.iter().enumerate() {
+            if group.is_empty() {
+                return Err(format!(
+                    "BlockOrthogonalityPenalty::new groups[{group_idx}] must not be empty"
+                ));
+            }
+            for &axis in group {
+                if axis >= latent_dim {
+                    return Err(format!(
+                        "BlockOrthogonalityPenalty::new groups[{group_idx}] axis {axis} exceeds latent_dim {latent_dim}"
+                    ));
+                }
+                if seen[axis] {
+                    return Err(format!(
+                        "BlockOrthogonalityPenalty::new axis {axis} appears in more than one group"
+                    ));
+                }
+                seen[axis] = true;
+            }
+        }
+        for (axis, present) in seen.iter().copied().enumerate() {
+            if !present {
+                return Err(format!(
+                    "BlockOrthogonalityPenalty::new groups must partition latent axes; missing axis {axis}"
+                ));
+            }
+        }
+        Ok(Self {
+            target,
+            groups,
+            weight,
+            n_eff,
+            learnable_weight,
+            rho_index: 0,
+            weight_schedule: None,
+        })
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
+    }
+
+    fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
+        if self.learnable_weight {
+            self.weight * rho[self.rho_index].exp()
+        } else {
+            self.weight
+        }
+    }
+
+    fn latent_dim(&self, target_len: usize) -> Option<usize> {
+        if self.n_eff == 0 || target_len % self.n_eff != 0 {
+            debug_assert_eq!(
+                target_len % self.n_eff.max(1),
+                0,
+                "target length must be divisible by n_eff"
+            );
+            return None;
+        }
+        Some(target_len / self.n_eff)
+    }
+
+    fn target_matrix<'a>(&self, target: ArrayView1<'a, f64>) -> Option<ArrayView2<'a, f64>> {
+        let d = self.latent_dim(target.len())?;
+        target.into_shape_with_order((self.n_eff, d)).ok()
+    }
+
+    fn flatten_matrix(m: &Array2<f64>) -> Array1<f64> {
+        let n_obs = m.nrows();
+        let d = m.ncols();
+        let mut out = Array1::<f64>::zeros(n_obs * d);
+        for n in 0..n_obs {
+            for a in 0..d {
+                out[n * d + a] = m[[n, a]];
+            }
+        }
+        out
+    }
+
+    fn cross_gram(
+        t: ArrayView2<'_, f64>,
+        left: &[usize],
+        right: &[usize],
+    ) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((left.len(), right.len()));
+        for (li, &a) in left.iter().enumerate() {
+            for (ri, &b) in right.iter().enumerate() {
+                let mut s = 0.0;
+                for n in 0..t.nrows() {
+                    s += t[[n, a]] * t[[n, b]];
+                }
+                out[[li, ri]] = s;
+            }
+        }
+        out
+    }
+
+    fn add_right_times_cross(
+        out: &mut Array2<f64>,
+        right: ArrayView2<'_, f64>,
+        left_axes: &[usize],
+        right_axes: &[usize],
+        cross_right_left: ArrayView2<'_, f64>,
+        factor: f64,
+    ) {
+        debug_assert_eq!(cross_right_left.dim(), (right_axes.len(), left_axes.len()));
+        for n in 0..out.nrows() {
+            for (li, &left_axis) in left_axes.iter().enumerate() {
+                let mut s = 0.0;
+                for (ri, &right_axis) in right_axes.iter().enumerate() {
+                    s += right[[n, right_axis]] * cross_right_left[[ri, li]];
+                }
+                out[[n, left_axis]] += factor * s;
+            }
+        }
+    }
+
+    fn hvp_with_precomputed_cross(
+        &self,
+        t: ArrayView2<'_, f64>,
+        cross: &[Vec<Option<Array2<f64>>>],
+        v: ArrayView2<'_, f64>,
+        weight: f64,
+    ) -> Array2<f64> {
+        debug_assert_eq!(v.dim(), t.dim(), "hvp matrix dimension mismatch");
+        if v.dim() != t.dim() {
+            return Array2::<f64>::zeros(t.dim());
+        }
+        let mut out = Array2::<f64>::zeros(t.dim());
+        for g in 0..self.groups.len() {
+            let group_g = &self.groups[g];
+            for h in 0..self.groups.len() {
+                if g == h {
+                    continue;
+                }
+                let group_h = &self.groups[h];
+                let c_hg = cross[h][g]
+                    .as_ref()
+                    .expect("between-block cross Gram must be precomputed");
+                Self::add_right_times_cross(
+                    &mut out,
+                    v,
+                    group_g,
+                    group_h,
+                    c_hg.view(),
+                    weight,
+                );
+
+                let v_h_t_g = Self::cross_gram(v, group_h, group_g);
+                let t_h_v_g = Self::cross_gram(t, group_h, group_g);
+                let mut d_c_hg = v_h_t_g;
+                d_c_hg += &t_h_v_g;
+                Self::add_right_times_cross(
+                    &mut out,
+                    t,
+                    group_g,
+                    group_h,
+                    d_c_hg.view(),
+                    weight,
+                );
+            }
+        }
+        out
+    }
+
+    fn precompute_cross(&self, t: ArrayView2<'_, f64>) -> Vec<Vec<Option<Array2<f64>>>> {
+        let mut cross = vec![vec![None; self.groups.len()]; self.groups.len()];
+        for g in 0..self.groups.len() {
+            for h in 0..self.groups.len() {
+                if g != h {
+                    cross[g][h] = Some(Self::cross_gram(t, &self.groups[g], &self.groups[h]));
+                }
+            }
+        }
+        cross
+    }
+
+    /// Materialize the between-block orthogonality Hessian for small-block
+    /// spectral paths.
+    pub fn as_dense(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array2<f64> {
+        let n = target.len();
+        let Some(t) = self.target_matrix(target) else {
+            return Array2::<f64>::zeros((n, n));
+        };
+        let cross = self.precompute_cross(t.view());
+        let weight = self.resolved_weight(rho);
+        let mut dense = Array2::<f64>::zeros((n, n));
+        let mut e = Array1::<f64>::zeros(n);
+        for j in 0..n {
+            e[j] = 1.0;
+            let Some(e_mat) = self.target_matrix(e.view()) else {
+                return Array2::<f64>::zeros((n, n));
+            };
+            let col = self.hvp_with_precomputed_cross(t.view(), &cross, e_mat, weight);
+            for i in 0..n {
+                dense[[i, j]] = col[[i / t.ncols(), i % t.ncols()]];
+            }
+            e[j] = 0.0;
+        }
+        dense
+    }
+}
+
+impl AnalyticPenalty for BlockOrthogonalityPenalty {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Psi
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        let Some(t) = self.target_matrix(target) else {
+            return 0.0;
+        };
+        let mut acc = 0.0;
+        for g in 0..self.groups.len() {
+            for h in (g + 1)..self.groups.len() {
+                let c = Self::cross_gram(t.view(), &self.groups[g], &self.groups[h]);
+                for &v in c.iter() {
+                    acc += v * v;
+                }
+            }
+        }
+        0.5 * self.resolved_weight(rho) * acc
+    }
+
+    fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let cross = self.precompute_cross(t.view());
+        let weight = self.resolved_weight(rho);
+        let mut grad = Array2::<f64>::zeros(t.dim());
+        for g in 0..self.groups.len() {
+            for h in 0..self.groups.len() {
+                if g == h {
+                    continue;
+                }
+                let c_hg = cross[h][g]
+                    .as_ref()
+                    .expect("between-block cross Gram must be precomputed");
+                Self::add_right_times_cross(
+                    &mut grad,
+                    t.view(),
+                    &self.groups[g],
+                    &self.groups[h],
+                    c_hg.view(),
+                    weight,
+                );
+            }
+        }
+        Self::flatten_matrix(&grad)
+    }
+
+    fn hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        if target.len() != v.len() {
+            return Array1::<f64>::zeros(target.len());
+        }
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let Some(v_mat) = self.target_matrix(v) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let cross = self.precompute_cross(t.view());
+        let hv = self.hvp_with_precomputed_cross(
+            t.view(),
+            &cross,
+            v_mat.view(),
+            self.resolved_weight(rho),
+        );
+        Self::flatten_matrix(&hv)
+    }
+
+    fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        if !self.learnable_weight {
+            return Array1::<f64>::zeros(0);
+        }
+        let mut out = Array1::<f64>::zeros(1);
+        out[self.rho_index] = self.value(target, rho);
+        out
+    }
+
+    fn rho_count(&self) -> usize {
+        usize::from(self.learnable_weight)
+    }
+
+    fn name(&self) -> &str {
+        "block_orthogonality"
+    }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Orthogonality penalty
 // ---------------------------------------------------------------------------
 
@@ -4987,6 +5377,7 @@ pub enum AnalyticPenaltyKind {
     RowPrecisionPrior(Arc<RowPrecisionPriorPenalty>),
     ParametricRowPrecisionPrior(Arc<ParametricRowPrecisionPriorPenalty>),
     ScadMcp(Arc<ScadMcpPenalty>),
+    BlockOrthogonality(Arc<BlockOrthogonalityPenalty>),
     Orthogonality(Arc<OrthogonalityPenalty>),
 }
 
@@ -5008,6 +5399,7 @@ impl AnalyticPenaltyKind {
                 Arc::make_mut(p).apply_schedule(iter)
             }
             AnalyticPenaltyKind::ScadMcp(p) => Arc::make_mut(p).apply_schedule(iter),
+            AnalyticPenaltyKind::BlockOrthogonality(p) => Arc::make_mut(p).apply_schedule(iter),
             AnalyticPenaltyKind::Orthogonality(p) => Arc::make_mut(p).apply_schedule(iter),
         }
     }
@@ -5025,6 +5417,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.tier(),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.tier(),
             AnalyticPenaltyKind::ScadMcp(p) => p.tier(),
+            AnalyticPenaltyKind::BlockOrthogonality(p) => p.tier(),
             AnalyticPenaltyKind::Orthogonality(p) => p.tier(),
         }
     }
@@ -5042,6 +5435,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.rho_count(),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.rho_count(),
             AnalyticPenaltyKind::ScadMcp(p) => p.rho_count(),
+            AnalyticPenaltyKind::BlockOrthogonality(p) => p.rho_count(),
             AnalyticPenaltyKind::Orthogonality(p) => p.rho_count(),
         }
     }
@@ -5059,6 +5453,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.name(),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.name(),
             AnalyticPenaltyKind::ScadMcp(p) => p.name(),
+            AnalyticPenaltyKind::BlockOrthogonality(p) => p.name(),
             AnalyticPenaltyKind::Orthogonality(p) => p.name(),
         }
     }
@@ -5076,6 +5471,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.value(target, rho),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.value(target, rho),
             AnalyticPenaltyKind::ScadMcp(p) => p.value(target, rho),
+            AnalyticPenaltyKind::BlockOrthogonality(p) => p.value(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.value(target, rho),
         }
     }
@@ -5097,6 +5493,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::ScadMcp(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::BlockOrthogonality(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_target(target, rho),
         }
     }
@@ -5118,6 +5515,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::ScadMcp(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::BlockOrthogonality(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_rho(target, rho),
         }
     }
@@ -5139,6 +5537,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::ScadMcp(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::BlockOrthogonality(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.hessian_diag(target, rho),
         }
     }
@@ -5168,6 +5567,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::ScadMcp(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::BlockOrthogonality(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Orthogonality(p) => p.hvp(target, rho, v),
         }
     }
@@ -5287,6 +5687,12 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::TotalVariation(p) => {
                 p.diag_target(self.target.view(), self.rho.view())
             }
+            AnalyticPenaltyKind::BlockOrthogonality(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_diag_via_matvec()
+            }
+            AnalyticPenaltyKind::BlockOrthogonality(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::Orthogonality(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::NuclearNorm(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::BlockSparsity(_)
@@ -5399,11 +5805,18 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             {
                 self.stochastic_log_det_plus_lambda_i(lambda)
             }
+            AnalyticPenaltyKind::BlockOrthogonality(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_log_det_plus_lambda_i(lambda)
+            }
             AnalyticPenaltyKind::Isometry(_) => {
                 let dense = self.as_dense();
                 <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
             }
-            AnalyticPenaltyKind::NuclearNorm(_) | AnalyticPenaltyKind::BlockSparsity(_) => {
+            AnalyticPenaltyKind::NuclearNorm(_)
+            | AnalyticPenaltyKind::BlockSparsity(_)
+            | AnalyticPenaltyKind::BlockOrthogonality(_) => {
                 let dense = self.as_dense();
                 <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
             }
@@ -5416,6 +5829,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 return p.as_dense(self.target.view(), self.rho.view());
             }
             AnalyticPenaltyKind::BlockSparsity(p) => {
+                return p.as_dense(self.target.view(), self.rho.view());
+            }
+            AnalyticPenaltyKind::BlockOrthogonality(p) => {
                 return p.as_dense(self.target.view(), self.rho.view());
             }
             AnalyticPenaltyKind::RowPrecisionPrior(p) => {
