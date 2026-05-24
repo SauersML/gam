@@ -11,8 +11,3 @@
 # Concurrent branches that both remove markers will produce additive
 # line-level diff conflicts that resolve by union — the next build
 # then re-validates each surviving entry.
-src/terms/basis.rs	fn isotropic_radial_laplacian_power_from_q0( q: usize, d: usize, m: usize, s: usize, kappa: f64, big_r: f64, ) -> f64	unreachable!
-src/terms/basis.rs	fn matern_collocation_operator_matrices_should_match_closed_forms_in_1d()	unreachable!
-src/terms/basis.rs	fn matern_operator_psi_triplet_should_match_closed_form_polynomials()	unreachable!
-src/terms/basis.rs	fn test_duchon_design_log_kappa_derivative_matchesfd_dim1_power1_frozen()	unreachable!
-src/terms/basis.rs	fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_frozen()	unreachable!
