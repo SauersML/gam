@@ -1174,91 +1174,15 @@ fn royston_parmar_inverse_link_jet(eta: f64) -> InverseLinkJet {
 }
 
 pub fn inverse_link_jet_for_family(
-    family: LikelihoodFamily,
+    spec: &LikelihoodSpec,
     eta: f64,
-    mixture_link_state: Option<&MixtureLinkState>,
-    sas_link_state: Option<&SasLinkState>,
 ) -> Result<InverseLinkJet, EstimationError> {
-    match family {
-        LikelihoodFamily::GaussianIdentity => inverse_link_jet_for_link_function(
-            LinkFunction::Identity,
-            eta,
-            mixture_link_state,
-            sas_link_state,
-        ),
-        LikelihoodFamily::BinomialLogit => inverse_link_jet_for_link_function(
-            LinkFunction::Logit,
-            eta,
-            mixture_link_state,
-            sas_link_state,
-        ),
-        LikelihoodFamily::BinomialProbit => inverse_link_jet_for_link_function(
-            LinkFunction::Probit,
-            eta,
-            mixture_link_state,
-            sas_link_state,
-        ),
-        LikelihoodFamily::BinomialCLogLog => inverse_link_jet_for_link_function(
-            LinkFunction::CLogLog,
-            eta,
-            mixture_link_state,
-            sas_link_state,
-        ),
-        LikelihoodFamily::BinomialLatentCLogLog => Err(EstimationError::InvalidInput(
-            "BinomialLatentCLogLog inverse-link requires explicit latent cloglog state".to_string(),
-        )),
-        LikelihoodFamily::BinomialSas => inverse_link_jet_for_link_function(
-            LinkFunction::Sas,
-            eta,
-            mixture_link_state,
-            sas_link_state,
-        )
-        .map_err(|_| {
-            EstimationError::InvalidInput(
-                "BinomialSas inverse-link requires SAS link state".to_string(),
-            )
-        }),
-        LikelihoodFamily::BinomialBetaLogistic => inverse_link_jet_for_link_function(
-            LinkFunction::BetaLogistic,
-            eta,
-            mixture_link_state,
-            sas_link_state,
-        )
-        .map_err(|_| {
-            EstimationError::InvalidInput(
-                "BinomialBetaLogistic inverse-link requires Beta-Logistic link state".to_string(),
-            )
-        }),
-        LikelihoodFamily::BinomialMixture => {
-            let state = mixture_link_state.ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "BinomialMixture inverse-link requires mixture link state".to_string(),
-                )
-            })?;
-            inverse_link_jet_for_link_function(
-                LinkFunction::Logit,
-                eta,
-                Some(state),
-                sas_link_state,
-            )
-        }
-        LikelihoodFamily::PoissonLog
-        | LikelihoodFamily::Tweedie { .. }
-        | LikelihoodFamily::NegativeBinomial { .. }
-        | LikelihoodFamily::GammaLog => inverse_link_jet_for_link_function(
-            LinkFunction::Log,
-            eta,
-            mixture_link_state,
-            sas_link_state,
-        ),
-        LikelihoodFamily::BetaLogit { .. } => inverse_link_jet_for_link_function(
-            LinkFunction::Logit,
-            eta,
-            mixture_link_state,
-            sas_link_state,
-        ),
-        LikelihoodFamily::RoystonParmar => Ok(royston_parmar_inverse_link_jet(eta)),
+    // RoystonParmar uses its own analytic survival inverse link irrespective of
+    // the (nominal `Identity`) link slot carried in the spec.
+    if matches!(spec.response, ResponseFamily::RoystonParmar) {
+        return Ok(royston_parmar_inverse_link_jet(eta));
     }
+    spec.link.jet(eta)
 }
 
 #[inline]
