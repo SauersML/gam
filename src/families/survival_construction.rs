@@ -1121,6 +1121,7 @@ pub fn build_survival_time_basis(
                         identifiability: BSplineIdentifiability::None,
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                     },
                 )
                 .map_err(|e| format!("failed to infer survival time knots: {e}"))?;
@@ -1217,6 +1218,7 @@ pub fn build_survival_time_basis(
                     identifiability: BSplineIdentifiability::None,
                     boundary: OneDimensionalBoundary::Open,
                     boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                 },
             )
             .map_err(|e| format!("failed to build bspline entry basis: {e}"))?;
@@ -1230,6 +1232,7 @@ pub fn build_survival_time_basis(
                     identifiability: BSplineIdentifiability::None,
                     boundary: OneDimensionalBoundary::Open,
                     boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                 },
             )
             .map_err(|e| format!("failed to build bspline exit basis: {e}"))?;
@@ -1463,6 +1466,7 @@ pub fn build_survival_time_basis(
                     identifiability: BSplineIdentifiability::None,
                     boundary: OneDimensionalBoundary::Open,
                     boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                 },
             )
             .map_err(|e| format!("failed to build ispline smoothing penalty: {e}"))?;
@@ -1613,6 +1617,7 @@ pub fn evaluate_survival_time_basis_row(
                     identifiability: BSplineIdentifiability::None,
                     boundary: OneDimensionalBoundary::Open,
                     boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                 },
             )
             .map_err(|e| format!("failed to evaluate survival bspline anchor row: {e}"))?;
@@ -3039,6 +3044,7 @@ pub fn build_time_varying_survival_covariate_template(
         identifiability: BSplineIdentifiability::None,
         boundary: OneDimensionalBoundary::Open,
         boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
     };
 
     let time_build = build_bspline_basis_1d(log_exit.view(), &time_spec)
@@ -3064,6 +3070,7 @@ pub fn build_time_varying_survival_covariate_template(
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
         },
     )
     .map_err(|e| format!("failed to evaluate {block_name} time-margin basis at entry: {e}"))?;

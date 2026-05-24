@@ -5281,7 +5281,6 @@ impl JointBetaRhoPosterior {
         let n_beta = self.n_beta;
         let n_rho = self.n_rho;
         let n_link_params = self.n_link_params;
-        let total_dim = n_beta + n_rho + n_link_params;
 
         // Split parameter vector — keep as views to avoid two per-step
         // `to_owned()` allocations of size n_beta and n_rho.
@@ -5795,13 +5794,6 @@ mod survival_hmc {
             };
 
             Ok(Self { data, chol, chol_t })
-        }
-
-        /// Compute log-posterior and gradient analytically.
-        fn compute_logp_and_grad(&self, z: &Array1<f64>) -> Result<(f64, Array1<f64>), String> {
-            let mut grad = Array1::<f64>::zeros(z.len());
-            let logp = self.compute_logp_and_grad_into(z, &mut grad)?;
-            Ok((logp, grad))
         }
 
         fn compute_logp_and_grad_into(
