@@ -2510,10 +2510,6 @@ mod tests_diagnostics {
         self.reml_state.compute_cost(&rho)
     }
 
-    }
-}
-
-impl<'a> ExternalJointHyperEvaluator<'a> {
     /// DEBUG ONLY: run PIRLS at `theta` (cost-only path) and return the dense
     /// effective Hessian `H_total = X' W_F X + S_λ + ridge I` in the
     /// transformed basis. This is the same matrix the analytic operator
@@ -2612,6 +2608,8 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         let rho = theta.slice(s![..rho_dim]).to_owned();
         self.reml_state.compute_cost(&rho)?;
         self.reml_state.debug_eta_w_c(&rho)
+    }
+
     }
 }
 
