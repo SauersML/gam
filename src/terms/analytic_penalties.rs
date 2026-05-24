@@ -37,6 +37,9 @@
 //!     matrix per row; when ARD/Ortho fail to break the gauge, it adds the
 //!     missing supervision signal (memory `project_ard_gauge_fix_doesnt_help_cogito`,
 //!     `proposals/composition_engine.md` §4(c)).
+//!   * [`ParametricAuxConditionalPriorPenalty`] — iVAE-style aux-conditional
+//!     prior with a learnable distance-kernel map from auxiliary rows to
+//!     diagonal per-row precision.
 //!   * [`OrthogonalityPenalty`] — fixes the rotation gauge inside a latent
 //!     block by penalizing cross-axis correlations. Pair with ARD when
 //!     intrinsic dimension should be identifiable.
@@ -67,7 +70,9 @@
 //! SparsityPenalty owns either zero (`ε` fixed) or one (`ε` REML-selected) plus
 //! one strength; the ARDPenalty owns `d` (one per latent axis);
 //! NuclearNorm, BlockSparsity, AuxConditionalPrior, and Orthogonality each own
-//! one strength only when their weight is learnable.
+//! one strength only when their weight is learnable. ParametricAuxConditional
+//! owns its log-baseline precision, raw distance sensitivity, and reference
+//! point coordinates, plus one strength axis when requested.
 //!
 //! ## Three-tier landings
 //!
@@ -81,6 +86,7 @@
 //! | NuclearNorm | ext-coord (latent t) | 0 or 1 (log μ_nuc)  |
 //! | BlockSparsity | ext-coord (latent t) | 0 or 1 (log μ_group) |
 //! | AuxConditionalPrior | ext-coord (latent t) | 0 or 1 (log μ_aux) |
+//! | ParametricAuxConditionalPrior | ext-coord (latent t) | d + d + d·du [+1 log μ_aux] |
 //! | Orthogonality | ext-coord (latent t) | 0 or 1 (log μ_orth) |
 
 use faer::Side;
@@ -142,6 +148,26 @@ impl PsiSlice {
 
     pub fn is_empty(&self) -> bool {
         self.range.is_empty()
+    }
+}
+
+fn stable_softplus(x: f64) -> f64 {
+    if x > 30.0 {
+        x
+    } else if x < -30.0 {
+        x.exp()
+    } else {
+        (1.0 + x.exp()).ln()
+    }
+}
+
+fn logistic(x: f64) -> f64 {
+    if x >= 0.0 {
+        let z = (-x).exp();
+        1.0 / (1.0 + z)
+    } else {
+        let z = x.exp();
+        z / (1.0 + z)
     }
 }
 
@@ -3500,6 +3526,431 @@ impl AnalyticPenalty for AuxConditionalPriorPenalty {
 
     fn name(&self) -> &str {
         "aux_conditional_prior"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parametric auxiliary-conditional prior penalty
+// ---------------------------------------------------------------------------
+
+/// Parametric iVAE auxiliary-conditional prior on the latent block.
+///
+/// Distance-kernel variant of `p(t_n | u_n) ∝ exp(-½ t_nᵀ Λ(u_n)t_n)` with
+/// diagonal precision `λ_k(u_n) = exp(log_alpha_k) + softplus(raw_beta_k)
+/// ||u_n - μ_k||²`. Use the FIXED variant when Λ is known per row; use this
+/// PARAMETRIC variant when REML should learn the aux-to-Λ mapping.
+///
+/// Motivation: `examples/aux_conditional_prior_demo.py` (b31w36m23) showed
+/// that AuxConditional + ARD recovers iVAE §4(c) identifiability on synthetic
+/// data with `axes_kept = [4, 4, 2]`; ML workflows such as cogito steering and
+/// gene-expression iVAE need learnable `Λ(u_n) = f(u_n; ψ)` rather than
+/// externally precomputed row inverses.
+#[derive(Debug, Clone)]
+pub struct ParametricAuxConditionalPriorPenalty {
+    pub aux: Array2<f64>,
+    pub log_alpha: Array1<f64>,
+    pub raw_beta: Array1<f64>,
+    pub mu: Array2<f64>,
+    /// Base strength. If `learnable_weight` is true, the resolved strength is
+    /// `weight * exp(rho[weight_rho_index])`; otherwise it is fixed at `weight`.
+    pub weight: f64,
+    /// Number of rows in the row-major matrix-valued latent block.
+    pub n_eff: usize,
+    pub learnable_weight: bool,
+    pub target: PsiSlice,
+}
+
+impl ParametricAuxConditionalPriorPenalty {
+    #[must_use = "build error must be handled"]
+    pub fn new(
+        target: PsiSlice,
+        aux: Array2<f64>,
+        log_alpha: Array1<f64>,
+        raw_beta: Array1<f64>,
+        mu: Array2<f64>,
+        weight: f64,
+        n_eff: usize,
+        learnable_weight: bool,
+    ) -> Result<Self, String> {
+        if target.is_empty() {
+            return Err(
+                "ParametricAuxConditionalPriorPenalty::new requires a non-empty target".to_string(),
+            );
+        }
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!(
+                "ParametricAuxConditionalPriorPenalty::new requires finite weight > 0, got {weight}"
+            ));
+        }
+        if n_eff == 0 {
+            return Err(
+                "ParametricAuxConditionalPriorPenalty::new requires n_eff > 0".to_string(),
+            );
+        }
+        if target.len() % n_eff != 0 {
+            return Err(format!(
+                "ParametricAuxConditionalPriorPenalty::new target length {} is not divisible by n_eff {}",
+                target.len(),
+                n_eff
+            ));
+        }
+        let latent_dim = target.len() / n_eff;
+        if latent_dim == 0 {
+            return Err(
+                "ParametricAuxConditionalPriorPenalty::new requires latent_dim > 0".to_string(),
+            );
+        }
+        if let Some(expected_dim) = target.latent_dim {
+            let expected = n_eff.checked_mul(expected_dim).ok_or_else(|| {
+                "ParametricAuxConditionalPriorPenalty::new target shape overflows usize".to_string()
+            })?;
+            if expected != target.len() {
+                return Err(format!(
+                    "ParametricAuxConditionalPriorPenalty::new target length {} does not match n_eff {} × latent_dim {}",
+                    target.len(),
+                    n_eff,
+                    expected_dim
+                ));
+            }
+            if expected_dim != latent_dim {
+                return Err(format!(
+                    "ParametricAuxConditionalPriorPenalty::new inferred latent_dim {latent_dim} does not match target latent_dim {expected_dim}"
+                ));
+            }
+        }
+        let (aux_n, aux_dim) = aux.dim();
+        if aux_n != n_eff {
+            return Err(format!(
+                "ParametricAuxConditionalPriorPenalty::new aux rows must equal n_eff {n_eff}, got {aux_n}"
+            ));
+        }
+        if aux_dim == 0 {
+            return Err(
+                "ParametricAuxConditionalPriorPenalty::new requires aux dimension > 0".to_string(),
+            );
+        }
+        if log_alpha.len() != latent_dim {
+            return Err(format!(
+                "ParametricAuxConditionalPriorPenalty::new log_alpha length must equal latent_dim {latent_dim}, got {}",
+                log_alpha.len()
+            ));
+        }
+        if raw_beta.len() != latent_dim {
+            return Err(format!(
+                "ParametricAuxConditionalPriorPenalty::new raw_beta length must equal latent_dim {latent_dim}, got {}",
+                raw_beta.len()
+            ));
+        }
+        let (mu_rows, mu_cols) = mu.dim();
+        if mu_rows != latent_dim || mu_cols != aux_dim {
+            return Err(format!(
+                "ParametricAuxConditionalPriorPenalty::new mu shape must be ({latent_dim}, {aux_dim}), got ({mu_rows}, {mu_cols})"
+            ));
+        }
+        for (idx, &value) in aux.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(format!(
+                    "ParametricAuxConditionalPriorPenalty::new aux[{idx}] must be finite"
+                ));
+            }
+        }
+        for k in 0..latent_dim {
+            let log_alpha_k = log_alpha[k];
+            if !log_alpha_k.is_finite() {
+                return Err(format!(
+                    "ParametricAuxConditionalPriorPenalty::new log_alpha[{k}] must be finite"
+                ));
+            }
+            let alpha_k = log_alpha_k.exp();
+            if !(alpha_k.is_finite() && alpha_k > 0.0) {
+                return Err(format!(
+                    "ParametricAuxConditionalPriorPenalty::new exp(log_alpha[{k}]) must be finite and > 0"
+                ));
+            }
+            let raw_beta_k = raw_beta[k];
+            if !raw_beta_k.is_finite() {
+                return Err(format!(
+                    "ParametricAuxConditionalPriorPenalty::new raw_beta[{k}] must be finite"
+                ));
+            }
+            let beta_k = stable_softplus(raw_beta_k);
+            if !(beta_k.is_finite() && beta_k >= 0.0) {
+                return Err(format!(
+                    "ParametricAuxConditionalPriorPenalty::new softplus(raw_beta[{k}]) must be finite and >= 0"
+                ));
+            }
+        }
+        for (idx, &value) in mu.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(format!(
+                    "ParametricAuxConditionalPriorPenalty::new mu[{idx}] must be finite"
+                ));
+            }
+        }
+        Ok(Self {
+            aux,
+            log_alpha,
+            raw_beta,
+            mu,
+            weight,
+            n_eff,
+            learnable_weight,
+            target,
+        })
+    }
+
+    fn latent_dim(&self, target_len: usize) -> Option<usize> {
+        if self.n_eff == 0 || target_len % self.n_eff != 0 {
+            debug_assert_eq!(
+                target_len % self.n_eff.max(1),
+                0,
+                "target length must be divisible by n_eff"
+            );
+            return None;
+        }
+        Some(target_len / self.n_eff)
+    }
+
+    fn target_matrix<'a>(&self, target: ArrayView1<'a, f64>) -> Option<ArrayView2<'a, f64>> {
+        let d = self.latent_dim(target.len())?;
+        target.into_shape_with_order((self.n_eff, d)).ok()
+    }
+
+    fn flatten_matrix(m: &Array2<f64>) -> Array1<f64> {
+        let n_obs = m.nrows();
+        let d = m.ncols();
+        let mut out = Array1::<f64>::zeros(n_obs * d);
+        for n in 0..n_obs {
+            for a in 0..d {
+                out[n * d + a] = m[[n, a]];
+            }
+        }
+        out
+    }
+
+    fn log_alpha_offset(&self) -> usize {
+        0
+    }
+
+    fn raw_beta_offset(&self) -> usize {
+        self.log_alpha.len()
+    }
+
+    fn mu_offset(&self) -> usize {
+        self.log_alpha.len() + self.raw_beta.len()
+    }
+
+    fn weight_offset(&self) -> usize {
+        self.mu_offset() + self.mu.len()
+    }
+
+    fn active_log_alpha(&self, k: usize, rho: ArrayView1<'_, f64>) -> f64 {
+        self.log_alpha[k] + rho[self.log_alpha_offset() + k]
+    }
+
+    fn active_raw_beta(&self, k: usize, rho: ArrayView1<'_, f64>) -> f64 {
+        self.raw_beta[k] + rho[self.raw_beta_offset() + k]
+    }
+
+    fn active_mu(&self, k: usize, a: usize, rho: ArrayView1<'_, f64>) -> f64 {
+        self.mu[[k, a]] + rho[self.mu_offset() + k * self.aux.ncols() + a]
+    }
+
+    fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
+        if self.learnable_weight {
+            self.weight * rho[self.weight_offset()].exp()
+        } else {
+            self.weight
+        }
+    }
+
+    fn lambda_at(&self, n: usize, k: usize, rho: ArrayView1<'_, f64>) -> f64 {
+        let alpha = self.active_log_alpha(k, rho).exp();
+        let beta = stable_softplus(self.active_raw_beta(k, rho));
+        alpha + beta * self.dist2(n, k, rho)
+    }
+
+    fn dist2(&self, n: usize, k: usize, rho: ArrayView1<'_, f64>) -> f64 {
+        let mut r2 = 0.0;
+        for a in 0..self.aux.ncols() {
+            let delta = self.aux[[n, a]] - self.active_mu(k, a, rho);
+            r2 += delta * delta;
+        }
+        r2
+    }
+
+    pub fn diag_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let weight = self.resolved_weight(rho);
+        let mut out = Array1::<f64>::zeros(target.len());
+        for n in 0..t.nrows() {
+            for k in 0..t.ncols() {
+                out[n * t.ncols() + k] = weight * self.lambda_at(n, k, rho);
+            }
+        }
+        out
+    }
+
+    /// Materialize the row-block-diagonal Hessian for exact spectral paths.
+    pub fn as_dense(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array2<f64> {
+        let n_total = target.len();
+        let diag = self.diag_target(target, rho);
+        let mut dense = Array2::<f64>::zeros((n_total, n_total));
+        for i in 0..n_total {
+            dense[[i, i]] = diag[i];
+        }
+        dense
+    }
+
+    pub fn log_det_plus_lambda_i(
+        &self,
+        rho: ArrayView1<'_, f64>,
+        lambda: f64,
+    ) -> Result<f64, String> {
+        if !(lambda.is_finite() && lambda > 0.0) {
+            return Err(format!(
+                "ParametricAuxConditionalPriorPenalty::log_det_plus_lambda_i requires finite λ > 0; got {lambda}"
+            ));
+        }
+        let weight = self.resolved_weight(rho);
+        let mut sum = 0.0;
+        for n in 0..self.n_eff {
+            for k in 0..self.log_alpha.len() {
+                let shifted = lambda + weight * self.lambda_at(n, k, rho);
+                if !(shifted.is_finite() && shifted > 0.0) {
+                    return Err(format!(
+                        "ParametricAuxConditionalPriorPenalty::log_det_plus_lambda_i non-positive shifted diagonal {shifted:.3e}"
+                    ));
+                }
+                sum += shifted.ln();
+            }
+        }
+        Ok(sum)
+    }
+}
+
+impl AnalyticPenalty for ParametricAuxConditionalPriorPenalty {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Psi
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        let Some(t) = self.target_matrix(target) else {
+            return 0.0;
+        };
+        let mut acc = 0.0;
+        for n in 0..t.nrows() {
+            for k in 0..t.ncols() {
+                acc += self.lambda_at(n, k, rho) * t[[n, k]] * t[[n, k]];
+            }
+        }
+        0.5 * self.resolved_weight(rho) * acc
+    }
+
+    fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let weight = self.resolved_weight(rho);
+        let mut grad = Array2::<f64>::zeros(t.dim());
+        for n in 0..t.nrows() {
+            for k in 0..t.ncols() {
+                grad[[n, k]] = weight * self.lambda_at(n, k, rho) * t[[n, k]];
+            }
+        }
+        Self::flatten_matrix(&grad)
+    }
+
+    fn hessian_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        Some(self.diag_target(target, rho))
+    }
+
+    fn hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        if target.len() != v.len() {
+            return Array1::<f64>::zeros(target.len());
+        }
+        let diag = self.diag_target(target, rho);
+        let mut out = Array1::<f64>::zeros(v.len());
+        for i in 0..v.len() {
+            out[i] = diag[i] * v[i];
+        }
+        out
+    }
+
+    fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(self.rho_count());
+        };
+        let weight = self.resolved_weight(rho);
+        let mut out = Array1::<f64>::zeros(self.rho_count());
+        let d = t.ncols();
+        let du = self.aux.ncols();
+        for k in 0..d {
+            let log_alpha = self.active_log_alpha(k, rho);
+            let alpha = log_alpha.exp();
+            let raw_beta = self.active_raw_beta(k, rho);
+            let beta = stable_softplus(raw_beta);
+            let beta_jac = logistic(raw_beta);
+            let mut grad_alpha_direct = 0.0;
+            let mut grad_beta_direct = 0.0;
+            let mut grad_mu_direct = vec![0.0_f64; du];
+            for n in 0..t.nrows() {
+                let tk = t[[n, k]];
+                let sq = tk * tk;
+                let r2 = self.dist2(n, k, rho);
+                grad_alpha_direct += 0.5 * weight * sq;
+                grad_beta_direct += 0.5 * weight * sq * r2;
+                for a in 0..du {
+                    let delta = self.aux[[n, a]] - self.active_mu(k, a, rho);
+                    grad_mu_direct[a] += -weight * sq * beta * delta;
+                }
+            }
+            out[self.log_alpha_offset() + k] = grad_alpha_direct * alpha;
+            out[self.raw_beta_offset() + k] = grad_beta_direct * beta_jac;
+            for a in 0..du {
+                out[self.mu_offset() + k * du + a] = grad_mu_direct[a];
+            }
+        }
+        if self.learnable_weight {
+            out[self.weight_offset()] = self.value(target, rho);
+        }
+        out
+    }
+
+    fn rho_count(&self) -> usize {
+        self.log_alpha.len() + self.raw_beta.len() + self.mu.len() + usize::from(self.learnable_weight)
+    }
+
+    fn name(&self) -> &str {
+        "parametric_aux_conditional_prior"
     }
 }
 
