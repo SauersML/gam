@@ -5888,11 +5888,9 @@ fn build_aniso_design_psi_derivatives_shared(
                         }
                     };
                     let flat = i * k + j;
-                    // SAFETY: nk=n*k and nk*dim were checked above, the Array1/Array2
-                    // buffers are owned and contiguous, and each Rayon chunk owns a
-                    // disjoint i-row range. Thus flat=i*k+j is in-bounds for phi/q/t,
-                    // flat*dim+a is in-bounds for axis_components, and no two workers
-                    // write the same offset.
+                    // SAFETY: each Rayon chunk owns a disjoint i-row range,
+                    // so flat=i*k+j stays in 0..nk for phi/q/t and
+                    // flat*dim+a stays in 0..nk*dim for axis_components.
                     unsafe {
                         *pp.add(flat) = phi;
                         *qp.add(flat) = q;
@@ -35038,8 +35036,6 @@ mod tests {
         idx.sort_by(|&a, &b| d[a].partial_cmp(&d[b]).unwrap());
         let nodes: Vec<f64> = idx.iter().map(|&i| d[i]).collect();
         let weights: Vec<f64> = idx.iter().map(|&i| 2.0 * z[0][i] * z[0][i]).collect();
-        let _ = diag;
-        let _ = sub;
         (nodes, weights)
     }
 
@@ -35142,11 +35138,6 @@ mod tests {
         let mut a_coeffs: Vec<(usize, f64)> = Vec::new();
         for j in 1..=a {
             let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
-            let binom_num = (1..=(a + b - j - 1) as u64).product::<u64>() as f64;
-            let binom_den_1 = (1..=(a - j) as u64).product::<u64>() as f64;
-            let binom_den_2 = (1..=(b - 1 + j) as u64).product::<u64>() as f64; // (a+b-j-1)-(a-j) = b-1+j
-            // Use the canonical helper instead — simpler:
-            let _ = (binom_num, binom_den_1, binom_den_2);
             let binom = {
                 // C(n,k) for small n,k
                 fn c(n: usize, k: usize) -> f64 {

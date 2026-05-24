@@ -196,10 +196,9 @@ pub fn check_cuda(result: CuResult, name: &str) -> Result<(), GpuError> {
 
 fn load_library(candidates: &[&str]) -> Result<Library, GpuError> {
     for candidate in candidates {
-        // SAFETY: `Library::new` may execute library initializers. This
-        // loading path is only used with the fixed CUDA driver names from
-        // `cuda_library_candidates()`, so we intentionally trust the platform
-        // dynamic loader's CUDA driver resolution and vendor startup code.
+        // SAFETY: Library::new runs the library's loader initializer; we
+        // only ever pass canonical libcuda names from
+        // cuda_library_candidates(), trusting the platform CUDA driver.
         if let Ok(library) = unsafe { Library::new(*candidate) } {
             return Ok(library);
         }

@@ -18303,7 +18303,7 @@ where
                 // gradient construction (≈ 6.5·10⁹ FLOPs per CTN step at
                 // n=320 000, n_grid=293, p_resp=32, p_cov=23) is now paid only
                 // when the outer evaluator actually requests it.
-                let _t0 = std::time::Instant::now();
+                let t0 = std::time::Instant::now();
                 let row_set_borrow = current_row_set.borrow();
                 let result = (&mut *exact_fn_cell.borrow_mut())(
                     theta,
@@ -18313,7 +18313,7 @@ where
                     &*row_set_borrow,
                 );
                 drop(row_set_borrow);
-                let elapsed_s = _t0.elapsed().as_secs_f64();
+                let elapsed_s = t0.elapsed().as_secs_f64();
                 kphase_cost_calls.set(kphase_cost_calls.get() + 1);
                 kphase_cost_total_s.set(kphase_cost_total_s.get() + elapsed_s);
                 let (theta_norm, log_kappa_norm) = kphase_log_norms(theta);
@@ -18366,13 +18366,13 @@ where
                     let design_revision = Some(ctx.cache.design_revision());
                     let specs = collect_specs(&ctx.cache);
                     let designs = collect_designs(&ctx.cache);
-                    let _t0 = std::time::Instant::now();
+                    let t0 = std::time::Instant::now();
                     let eval_result = (&mut *exact_efs_fn_cell.borrow_mut())(
                         theta,
                         &specs,
                         &designs,
                     );
-                    let elapsed_s = _t0.elapsed().as_secs_f64();
+                    let elapsed_s = t0.elapsed().as_secs_f64();
                     kphase_efs_calls.set(kphase_efs_calls.get() + 1);
                     kphase_efs_total_s.set(kphase_efs_total_s.get() + elapsed_s);
                     let (theta_norm, log_kappa_norm) = kphase_log_norms(theta);
@@ -18455,13 +18455,13 @@ where
             let specs = collect_specs(&state.cache);
             let designs = collect_designs(&state.cache);
             let row_set_borrow = current_row_set.borrow();
-            let _polish_eval = exact_fn(
+            drop(exact_fn(
                 &theta_star,
                 &specs,
                 &designs,
                 crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient,
                 &*row_set_borrow,
-            );
+            ));
         }
     }
     *current_row_set.borrow_mut() = crate::families::row_kernel::RowSet::All;
