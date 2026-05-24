@@ -335,6 +335,7 @@ fn te_xh_design_spec(
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
         boundary_conditions: Default::default(),
+        boundary: gam::basis::OneDimensionalBoundary::Open,
     };
     let spec_h = BSplineBasisSpec {
         degree: 3,
@@ -346,6 +347,7 @@ fn te_xh_design_spec(
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
         boundary_conditions: Default::default(),
+        boundary: gam::basis::OneDimensionalBoundary::Open,
     };
     TermCollectionSpec {
         linear_terms: vec![],
@@ -356,6 +358,7 @@ fn te_xh_design_spec(
                 feature_cols: vec![0, 1],
                 spec: TensorBSplineSpec {
                     marginalspecs: vec![spec_x, spec_h],
+                    periods: vec![None, None],
                     double_penalty: false,
                     identifiability,
                 },
