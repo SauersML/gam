@@ -390,6 +390,8 @@ def _topology_term(candidate: _Candidate, option_keys: set[str]) -> _TopologyTer
             options.append(f"kernel={_quote(topo.kernel)}")
         if topo.radians:
             options.append("radians=true")
+        if topo.streaming_chunk_size is not None:
+            options.append(f"streaming_chunk_size={int(topo.streaming_chunk_size)}")
         return _TopologyTerm("s", tuple(options), 2)
     if isinstance(topo, TensorBSpline):
         options: list[str] = []
