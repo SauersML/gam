@@ -432,15 +432,13 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 }
                 Ok(NoiseModel::Beta { phi })
             }
-            LikelihoodFamily::GammaLog => {
-                Ok(NoiseModel::Gamma {
-                    shape: require_positive_noise_parameter(
-                        self.family,
-                        "Gamma shape",
-                        gaussian_scale,
-                    )?,
-                })
-            }
+            LikelihoodFamily::GammaLog => Ok(NoiseModel::Gamma {
+                shape: require_positive_noise_parameter(
+                    self.family,
+                    "Gamma shape",
+                    gaussian_scale,
+                )?,
+            }),
             LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "RoystonParmar generative sampling is not exposed via generic family strategy"
                     .to_string(),
