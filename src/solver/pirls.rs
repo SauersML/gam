@@ -11448,7 +11448,7 @@ mod low_rank_weight_pirls_tests {
         DesignMatrix, LowRankWeight, PirlsWorkspace, compute_xtwx_low_rank, compute_xtwy_low_rank,
         woodbury_gram_capacitance,
     };
-    use ndarray::{Array1, Array2, array};
+    use ndarray::{Array2, array};
 
     fn tiny_design() -> DesignMatrix {
         let x = array![
