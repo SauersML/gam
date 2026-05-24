@@ -1308,12 +1308,14 @@ impl ArrowFactorCache {
         }
         let mut out = Array1::<f64>::zeros(n * d);
         let mut rhs = Array1::<f64>::zeros(d);
+        // Hoist per-row scratch outside the loop; cleared each iteration.
+        let mut htbeta_delta = Array1::<f64>::zeros(d);
         for i in 0..n {
             for c in 0..d {
                 rhs[c] = 0.0;
             }
             if let Some(db) = delta_beta.as_ref() {
-                let mut htbeta_delta = Array1::<f64>::zeros(d);
+                htbeta_delta.fill(0.0);
                 if !self.apply_htbeta_row(i, db.view(), &mut htbeta_delta) {
                     return Array1::<f64>::zeros(n * d);
                 }
