@@ -2,9 +2,8 @@ use gam::basis::create_thin_plate_spline_basis_with_knot_count;
 use gam::construction::canonicalize_penalty_spec;
 use gam::estimate::PenaltySpec;
 use gam::estimate::{FitOptions, fit_gam};
-use gam::predict::predict_gam;
 use gam::smooth::BlockwisePenalty;
-use gam::types::LikelihoodFamily;
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -48,7 +47,10 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
         weights.view(),
         offset.view(),
         &s_list,
-        LikelihoodFamily::GaussianIdentity,
+        LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(LinkFunction::Identity),
+        ),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -74,15 +76,9 @@ fn thin_plate_fit_gam_gaussian_fast_integration() {
     assert_eq!(fit.beta.len(), tps.basis.ncols());
     assert!(fit.edf_total().is_some_and(f64::is_finite));
 
-    let pred = predict_gam(
-        tps.basis.clone(),
-        fit.beta.view(),
-        offset.view(),
-        LikelihoodFamily::GaussianIdentity,
-    )
-    .expect("predict_gam should succeed");
+    let pred_mean = tps.basis.dot(&fit.beta) + &offset;
 
-    let mse = (&pred.mean - &y)
+    let mse = (&pred_mean - &y)
         .mapv(|v| v * v)
         .mean()
         .unwrap_or(f64::INFINITY);
@@ -138,7 +134,10 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
         weights.view(),
         offset.view(),
         &s_list,
-        LikelihoodFamily::GaussianIdentity,
+        LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(LinkFunction::Identity),
+        ),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -182,15 +181,9 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
     }
     let tps_test = gam::basis::create_thin_plate_spline_basis(x_test.view(), knots.view())
         .expect("TPS test basis");
-    let pred = predict_gam(
-        tps_test.basis.clone(),
-        fit.beta.view(),
-        Array1::zeros(n_test).view(),
-        LikelihoodFamily::GaussianIdentity,
-    )
-    .expect("predict_gam should succeed");
+    let pred_mean = tps_test.basis.dot(&fit.beta);
 
-    let mse_test = (&pred.mean - &y_test_true)
+    let mse_test = (&pred_mean - &y_test_true)
         .mapv(|v| v * v)
         .mean()
         .unwrap_or(f64::INFINITY);
@@ -229,16 +222,10 @@ fn thin_plate_fit_gam_gaussian_simulated_train_test() {
         .expect("probe matrix shape");
     let probe_basis = gam::basis::create_thin_plate_spline_basis(probe.view(), knots.view())
         .expect("TPS probe basis");
-    let probe_pred = predict_gam(
-        probe_basis.basis.clone(),
-        fit.beta.view(),
-        Array1::zeros(3).view(),
-        LikelihoodFamily::GaussianIdentity,
-    )
-    .expect("predict_gam should succeed for probe");
-    let center_pred = probe_pred.mean[0];
-    let corner_pred_a = probe_pred.mean[1];
-    let corner_pred_b = probe_pred.mean[2];
+    let probe_pred_mean = probe_basis.basis.dot(&fit.beta);
+    let center_pred = probe_pred_mean[0];
+    let corner_pred_a = probe_pred_mean[1];
+    let corner_pred_b = probe_pred_mean[2];
     assert!(
         center_pred > corner_pred_a && center_pred > corner_pred_b,
         "TPS fit failed to learn the bump structure: center={center_pred:.4}, \
@@ -312,7 +299,10 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
         weights.view(),
         offset.view(),
         &s_list,
-        LikelihoodFamily::GaussianIdentity,
+        LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(LinkFunction::Identity),
+        ),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -357,15 +347,9 @@ fn thin_plate_fit_gam_gaussian_3d_simulated_train_test() {
 
     let tps_test = gam::basis::create_thin_plate_spline_basis(x_test.view(), knots.view())
         .expect("3D test basis");
-    let pred = predict_gam(
-        tps_test.basis.clone(),
-        fit.beta.view(),
-        Array1::zeros(n_test).view(),
-        LikelihoodFamily::GaussianIdentity,
-    )
-    .expect("3D predict_gam should succeed");
+    let pred_mean = tps_test.basis.dot(&fit.beta);
 
-    let mse_test = (&pred.mean - &y_test_true)
+    let mse_test = (&pred_mean - &y_test_true)
         .mapv(|v| v * v)
         .mean()
         .unwrap_or(f64::INFINITY);

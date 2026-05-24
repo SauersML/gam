@@ -27105,7 +27105,10 @@ mod tests {
                 ResponseFamily::Binomial,
                 InverseLink::Standard(LinkFunction::Probit),
             ),
-            LikelihoodFamily::BinomialCLogLog,
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::CLogLog),
+            ),
         ] {
             let obs =
                 evaluate_standard_familyobservations(family, None, None, None, &y, &weights, &eta)

@@ -4,9 +4,14 @@ use gam::inference::predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
 };
-use gam::mixture_link::{mixture_inverse_link_jet, sas_inverse_link_jet, state_fromspec};
+use gam::mixture_link::{
+    mixture_inverse_link_jet, sas_inverse_link_jet, state_from_sasspec, state_fromspec,
+};
 use gam::smooth::BlockwisePenalty;
-use gam::types::{LikelihoodFamily, LinkComponent, MixtureLinkSpec, SasLinkSpec};
+use gam::types::{
+    InverseLink, LikelihoodFamily, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec,
+    ResponseFamily, SasLinkSpec,
+};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -67,6 +72,24 @@ fn coverage(true_p: &Array1<f64>, lo: &Array1<f64>, hi: &Array1<f64>) -> f64 {
     hit as f64 / true_p.len() as f64
 }
 
+fn binomial_likelihood(link: LinkFunction) -> LikelihoodSpec {
+    LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(link))
+}
+
+fn sas_likelihood(spec: SasLinkSpec) -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::Sas(state_from_sasspec(spec).expect("initial SAS state")),
+    )
+}
+
+fn mixture_likelihood(spec: &MixtureLinkSpec) -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::Mixture(state_fromspec(spec).expect("initial mixture state")),
+    )
+}
+
 #[test]
 fn sas_fit_recovery_and_calibration_system() {
     let n = 3000usize;
@@ -90,13 +113,14 @@ fn sas_fit_recovery_and_calibration_system() {
         initial_log_delta: 0.0,
     });
     opts.optimize_sas = true;
+    let family = sas_likelihood(opts.sas_link.expect("SAS fit spec"));
     let fit = fit_gam(
         x.view(),
         y.view(),
         w.view(),
         offset.view(),
         &s_list,
-        LikelihoodFamily::BinomialSas,
+        family,
         &opts,
     )
     .expect("SAS fit");
@@ -160,13 +184,14 @@ fn mixture_recovery_and_prediction_alignment_system() {
         initial_rho: Array1::zeros(2),
     });
     opts.optimize_mixture = true;
+    let family = mixture_likelihood(opts.mixture_link.as_ref().expect("mixture fit spec"));
     let fit = fit_gam(
         x.view(),
         y.view(),
         w.view(),
         offset.view(),
         &s_list,
-        LikelihoodFamily::BinomialMixture,
+        family,
         &opts,
     )
     .expect("mixture fit");
@@ -227,7 +252,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         w.view(),
         offset_train.view(),
         &s_list,
-        LikelihoodFamily::BinomialLogit,
+        binomial_likelihood(LinkFunction::Logit),
         &opts_logit,
     )
     .expect("logit fit");
@@ -239,7 +264,7 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         w.view(),
         offset_train.view(),
         &s_list,
-        LikelihoodFamily::BinomialProbit,
+        binomial_likelihood(LinkFunction::Probit),
         &opts_probit,
     )
     .expect("probit fit");
@@ -252,13 +277,14 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
     opts_sas.optimize_sas = true;
     opts_sas.max_iter = 120;
     opts_sas.tol = 1e-8;
+    let sas_family = sas_likelihood(opts_sas.sas_link.expect("SAS fit spec"));
     let fit_sas = fit_gam(
         x_train.view(),
         y_train.view(),
         w.view(),
         offset_train.view(),
         &s_list,
-        LikelihoodFamily::BinomialSas,
+        sas_family,
         &opts_sas,
     )
     .expect("sas fit");
@@ -273,13 +299,14 @@ fn posterior_mean_coverage_includes_sas_and_mixture() {
         initial_rho: Array1::zeros(2),
     });
     opts_mix.optimize_mixture = true;
+    let mixture_family = mixture_likelihood(opts_mix.mixture_link.as_ref().expect("mixture spec"));
     let fit_mix = fit_gam(
         x_train.view(),
         y_train.view(),
         w.view(),
         offset_train.view(),
         &s_list,
-        LikelihoodFamily::BinomialMixture,
+        mixture_family,
         &opts_mix,
     )
     .expect("mixture fit");
