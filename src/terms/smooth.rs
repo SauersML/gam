@@ -5247,6 +5247,7 @@ fn bspline_boundary_linear_constraints(
         knots,
         identifiability_transform,
         periodic: _,
+        ..
     } = metadata
     else {
         return Err(BasisError::InvalidInput(
@@ -14848,7 +14849,10 @@ impl SingleBlockLatentCoordDesignCache {
             (
                 SmoothBasisSpec::BSpline1D { spec, .. },
                 BasisMetadata::BSpline1D {
-                    knots, periodic, ..
+                    knots,
+                    periodic,
+                    streaming_chunk_size,
+                    ..
                 },
             ) => {
                 if let Some((domain_start, period, num_basis)) = periodic {
@@ -14857,11 +14861,13 @@ impl SingleBlockLatentCoordDesignCache {
                         period: *period,
                         degree: spec.degree,
                         num_basis: *num_basis,
+                        chunk_size: *streaming_chunk_size,
                     })
                 } else {
                     Ok(crate::solver::latent_cache::LatentBasisKind::TensorBspline {
                         knots: vec![knots.clone()],
                         degrees: vec![spec.degree],
+                        chunk_size: *streaming_chunk_size,
                     })
                 }
             }
@@ -14871,6 +14877,7 @@ impl SingleBlockLatentCoordDesignCache {
             ) => Ok(crate::solver::latent_cache::LatentBasisKind::TensorBspline {
                 knots: knots.clone(),
                 degrees: degrees.clone(),
+                chunk_size: None,
             }),
             (
                 SmoothBasisSpec::Pca { .. },
@@ -16137,6 +16144,7 @@ fn freeze_inner_smooth_basis_from_metadata(
                 knots,
                 identifiability_transform,
                 periodic,
+                streaming_chunk_size,
             },
         ) => {
             s.knotspec = periodic
@@ -16153,6 +16161,7 @@ fn freeze_inner_smooth_basis_from_metadata(
                     transform: z.clone(),
                 })
                 .unwrap_or(BSplineIdentifiability::None);
+            s.streaming_chunk_size = *streaming_chunk_size;
             s.boundary_conditions = Default::default();
             Ok(())
         }
@@ -16535,6 +16544,7 @@ pub fn freeze_term_collection_from_design(
                         knots,
                         periodic,
                         identifiability_transform,
+                        streaming_chunk_size,
                     } = metadata
                 {
                     inner.knotspec = periodic
@@ -16551,6 +16561,7 @@ pub fn freeze_term_collection_from_design(
                         },
                         None => BSplineIdentifiability::None,
                     };
+                    inner.streaming_chunk_size = *streaming_chunk_size;
                 }
             }
             _ => {
@@ -19148,6 +19159,7 @@ mod tests {
                         right: BSplineEndpointBoundaryCondition::Clamped,
                     },
                     boundary: OneDimensionalBoundary::Open,
+                    streaming_chunk_size: None,
                 },
             },
             shape: ShapeConstraint::None,
@@ -19217,6 +19229,7 @@ mod tests {
                         right: BSplineEndpointBoundaryCondition::Free,
                     },
                     boundary: OneDimensionalBoundary::Open,
+                    streaming_chunk_size: None,
                 },
             },
             shape: ShapeConstraint::None,
@@ -19633,6 +19646,7 @@ mod tests {
                         identifiability: BSplineIdentifiability::default(),
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -19948,6 +19962,7 @@ mod tests {
                     identifiability: BSplineIdentifiability::default(),
                     boundary: OneDimensionalBoundary::Open,
                     boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                 },
             },
             shape: ShapeConstraint::MonotoneIncreasing,
@@ -20042,6 +20057,7 @@ mod tests {
                         identifiability: BSplineIdentifiability::default(),
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -20413,6 +20429,7 @@ mod tests {
                         identifiability: BSplineIdentifiability::default(),
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -20540,6 +20557,7 @@ mod tests {
                     identifiability: BSplineIdentifiability::default(),
                     boundary: OneDimensionalBoundary::Open,
                     boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                 },
             },
             shape: ShapeConstraint::None,
@@ -20690,6 +20708,7 @@ mod tests {
                             identifiability: BSplineIdentifiability::default(),
                             boundary: OneDimensionalBoundary::Open,
                             boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                         },
                     },
                     shape: ShapeConstraint::None,
@@ -21345,6 +21364,7 @@ mod tests {
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
         };
         let spec_y = BSplineBasisSpec {
             degree: 3,
@@ -21357,6 +21377,7 @@ mod tests {
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
         };
 
         let terms = vec![SmoothTermSpec {
@@ -21417,6 +21438,7 @@ mod tests {
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::default(),
                             boundary_conditions: Default::default(),
+            streaming_chunk_size: None,
                             boundary: OneDimensionalBoundary::Open,
                         },
                         BSplineBasisSpec {
@@ -21429,6 +21451,7 @@ mod tests {
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::default(),
                             boundary_conditions: Default::default(),
+            streaming_chunk_size: None,
                             boundary: OneDimensionalBoundary::Open,
                         },
                     ],
@@ -21476,6 +21499,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
+            streaming_chunk_size: None,
             boundary: OneDimensionalBoundary::Open,
         };
         let built = build_bspline_basis_1d(x.view(), &spec).expect("periodic bspline");
@@ -21514,6 +21538,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
+            streaming_chunk_size: None,
             boundary: OneDimensionalBoundary::Open,
         };
         let spec_hour = BSplineBasisSpec {
@@ -21526,6 +21551,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
+            streaming_chunk_size: None,
             boundary: OneDimensionalBoundary::Open,
         };
         let spec_collection = TermCollectionSpec {
@@ -21590,6 +21616,7 @@ mod tests {
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
         };
         let spec_y = BSplineBasisSpec {
             degree: 3,
@@ -21602,6 +21629,7 @@ mod tests {
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
         };
         let mx = build_bspline_basis_1d(data.column(0), &spec_x)
             .unwrap()
@@ -21654,6 +21682,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
             boundary: OneDimensionalBoundary::Cyclic {
                 start: 0.0,
                 end: 7.0,
@@ -21669,6 +21698,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
             boundary: OneDimensionalBoundary::Cyclic {
                 start: 0.0,
                 end: 24.0,
@@ -21728,6 +21758,7 @@ mod tests {
                             identifiability: BSplineIdentifiability::default(),
                             boundary: OneDimensionalBoundary::Open,
                             boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                         },
                         BSplineBasisSpec {
                             degree: 3,
@@ -21740,6 +21771,7 @@ mod tests {
                             identifiability: BSplineIdentifiability::default(),
                             boundary: OneDimensionalBoundary::Open,
                             boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                         },
                     ],
                     double_penalty: false,
@@ -23421,6 +23453,7 @@ mod tests {
                         identifiability: BSplineIdentifiability::default(),
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -23696,6 +23729,7 @@ mod tests {
                     identifiability: BSplineIdentifiability::None,
                     boundary: OneDimensionalBoundary::Open,
                     boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                 },
             },
             shape: ShapeConstraint::None,
@@ -23876,6 +23910,7 @@ mod tests {
                             identifiability: BSplineIdentifiability::None,
                             boundary: OneDimensionalBoundary::Open,
                             boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                         },
                     },
                     shape: ShapeConstraint::MonotoneIncreasing,
@@ -24233,6 +24268,7 @@ mod tests {
                             weights: None,
                         },
                         boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                         boundary: OneDimensionalBoundary::Open,
                     },
                 },
@@ -25729,6 +25765,7 @@ mod tests {
                         identifiability: BSplineIdentifiability::None,
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
+            streaming_chunk_size: None,
                     },
                 },
                 shape: ShapeConstraint::None,
