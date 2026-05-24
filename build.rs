@@ -1255,7 +1255,8 @@ fn strip_strings_and_comments_stateful(
         out.push(c);
         i += 1;
     }
-    String::from_utf8(out).unwrap_or_else(|_| line.to_string())
+    let s = String::from_utf8(out).unwrap_or_else(|_| line.to_string());
+    (s, in_str, str_quote)
 }
 
 /// True if `line` contains `kw` as a whole word (boundaries on both sides

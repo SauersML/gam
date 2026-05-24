@@ -8257,22 +8257,15 @@ fn ensure_exact_joint_hessian_dense_budget(total: usize, context: &str) -> Resul
 struct JointHessianBundle<'a> {
     source: JointHessianSource,
     beta_flat: Array1<f64>,
-    compute_dh: Box<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a>,
-    compute_dh_many:
-        Option<Box<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + 'a>>,
-    compute_d2h:
-        Box<dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a>,
+    compute_dh: Box<DriftDerivFn<'a>>,
+    compute_dh_many: Option<Box<DriftDerivManyFn<'a>>>,
+    compute_d2h: Box<DriftSecondDerivFn<'a>>,
     /// Optional batched second-derivative callback. The unified evaluator's
     /// outer-Hessian ρ-ρ pair loop forwards the K(K+1)/2 (v_k, v_l) pairs
     /// here in one call when set, so families that fuse the per-row D²H walk
     /// (e.g. survival marginal-slope scanning n rows once per outer eval)
     /// amortise the row-walk across all pairs instead of paying it per pair.
-    compute_d2h_many: Option<
-        Box<
-            dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>
-                + 'a,
-        >,
-    >,
+    compute_d2h_many: Option<Box<DriftSecondDerivManyFn<'a>>>,
     owned_compute_dh:
         Option<Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>>,
     owned_compute_dh_many: Option<
@@ -8299,6 +8292,24 @@ struct JointHessianBundle<'a> {
     rho_curvature_scale: f64,
     hessian_logdet_correction: f64,
 }
+
+type DriftDerivFn<'a> =
+    dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync + 'a;
+type DriftDerivManyFn<'a> =
+    dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + Send + Sync + 'a;
+type DriftSecondDerivFn<'a> = dyn Fn(
+        &Array1<f64>,
+        &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, String>
+    + Send
+    + Sync
+    + 'a;
+type DriftSecondDerivManyFn<'a> = dyn Fn(
+        &[(Array1<f64>, Array1<f64>)],
+    ) -> Result<Vec<Option<DriftDerivResult>>, String>
+    + Send
+    + Sync
+    + 'a;
 
 fn materialize_joint_hessian_source(
     source: &JointHessianSource,
@@ -8852,7 +8863,7 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
 
 /// Build a closure computing dH[v] using exact Newton derivatives on synced states.
 /// Non-finite derivative output is treated as a hard error.
-fn exact_newton_dh_closure<'a, F: CustomFamily>(
+fn exact_newton_dh_closure<'a, F: CustomFamily + Sync>(
     family: &'a F,
     synced_states: Arc<Vec<ParameterBlockState>>,
     specs: &'a [ParameterBlockSpec],
@@ -8860,7 +8871,7 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
     use_outer_curvature_derivatives: bool,
     scale: f64,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-) -> impl Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a {
+) -> impl Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync + 'a {
     move |v_k: &Array1<f64>| {
         if use_outer_curvature_derivatives {
             let h_rho = family.exact_newton_outer_curvature_directional_derivative_with_specs(
@@ -8938,7 +8949,7 @@ fn exact_newton_dh_closure<'a, F: CustomFamily>(
 fn exact_newton_dh_many_closure<'a>(
     scale: f64,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-) -> Option<Box<dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + 'a>> {
+) -> Option<Box<DriftDerivManyFn<'a>>> {
     let workspace = workspace?;
     Some(Box::new(move |directions: &[Array1<f64>]| {
         workspace
@@ -8954,7 +8965,7 @@ fn exact_newton_dh_many_closure<'a>(
 }
 
 /// Build a closure computing d²H[u,v] using exact Newton derivatives on synced states.
-fn exact_newton_d2h_closure<'a, F: CustomFamily>(
+fn exact_newton_d2h_closure<'a, F: CustomFamily + Sync>(
     family: &'a F,
     synced_states: Arc<Vec<ParameterBlockState>>,
     specs: &'a [ParameterBlockSpec],
@@ -8962,7 +8973,7 @@ fn exact_newton_d2h_closure<'a, F: CustomFamily>(
     use_outer_curvature_derivatives: bool,
     scale: f64,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-) -> impl Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String> + 'a {
+) -> impl Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync + 'a {
     move |u: &Array1<f64>, v: &Array1<f64>| {
         if use_outer_curvature_derivatives {
             return match family
@@ -13242,10 +13253,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// By the implicit function theorem, `dβ̂/dρ_k = −v_k`. The stored `compute_dh`
 /// expects the actual perturbation direction `δβ`, so we negate `v_k` before calling it.
 struct BorrowedJointDerivProvider<'a> {
-    compute_dh: &'a dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
-    compute_dh_many:
-        Option<&'a dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String>>,
-    compute_d2h: &'a dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
+    compute_dh: &'a DriftDerivFn<'a>,
+    compute_dh_many: Option<&'a DriftDerivManyFn<'a>>,
+    compute_d2h: &'a DriftSecondDerivFn<'a>,
     /// Optional batched second-derivative callback. The unified evaluator's
     /// outer-Hessian ρ-ρ pair loop precomputes all K(K+1)/2 (v_k, v_l, u_kl)
     /// triples and calls this once per outer Hessian assembly when set, so
@@ -13254,27 +13264,10 @@ struct BorrowedJointDerivProvider<'a> {
     /// K(K+1)/2 separate row-walks with one. The default `None` falls back
     /// to the per-pair `compute_d2h` dispatch and preserves the historical
     /// dispatch cost.
-    compute_d2h_many: Option<
-        &'a dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>,
-    >,
+    compute_d2h_many: Option<&'a DriftSecondDerivManyFn<'a>>,
     family_outer_hessian_operator:
         Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
 }
-
-// SAFETY: `BorrowedJointDerivProvider<'a>` only holds shared borrows of
-// `dyn Fn(..) -> Result<.., String>` closures plus an `Arc<dyn OuterHessianOperator>`.
-// Function pointers / `&dyn Fn` to Send+Sync closures are themselves Send+Sync,
-// and `Arc<dyn Trait>` is Send+Sync when the trait object is. The provider is
-// constructed, boxed, passed to `unified_joint_cost_gradient`, consumed by the
-// unified evaluator, and dropped — all within a single call to
-// `joint_outer_evaluate`, so the borrowed lifetime is preserved across any
-// internal rayon parallelism the evaluator performs.
-unsafe impl Send for BorrowedJointDerivProvider<'_> {}
-// SAFETY: see the Send impl above — all fields are `&dyn Fn(..)` shared
-// references plus an `Arc<dyn OuterHessianOperator>`; sharing across threads is
-// sound because `&T: Sync` whenever `T: Sync`, and the trait-object closures
-// stored here are themselves Sync (they are produced by the unified evaluator).
-unsafe impl Sync for BorrowedJointDerivProvider<'_> {}
 
 impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
     fn hessian_derivative_correction(
@@ -14385,14 +14378,10 @@ fn joint_outer_evaluate(
     options: &BlockwiseFitOptions,
     rho_prior: crate::types::RhoPrior,
     pseudo_logdet_mode: PseudoLogdetMode,
-    compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
-    compute_dh_many: Option<
-        &dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String>,
-    >,
-    compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
-    compute_d2h_many: Option<
-        &dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>,
-    >,
+    compute_dh: &DriftDerivFn<'_>,
+    compute_dh_many: Option<&DriftDerivManyFn<'_>>,
+    compute_d2h: &DriftSecondDerivFn<'_>,
+    compute_d2h_many: Option<&DriftSecondDerivManyFn<'_>>,
     owned_compute_dh: Option<
         Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
     >,
@@ -14717,14 +14706,10 @@ fn joint_outer_evaluate_efs(
     options: &BlockwiseFitOptions,
     rho_prior: crate::types::RhoPrior,
     pseudo_logdet_mode: PseudoLogdetMode,
-    compute_dh: &dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
-    compute_dh_many: Option<
-        &dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String>,
-    >,
-    compute_d2h: &dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>,
-    compute_d2h_many: Option<
-        &dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>,
-    >,
+    compute_dh: &DriftDerivFn<'_>,
+    compute_dh_many: Option<&DriftDerivManyFn<'_>>,
+    compute_d2h: &DriftSecondDerivFn<'_>,
+    compute_d2h_many: Option<&DriftSecondDerivManyFn<'_>>,
     owned_compute_dh: Option<
         Arc<dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync>,
     >,
