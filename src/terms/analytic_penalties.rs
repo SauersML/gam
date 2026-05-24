@@ -2440,9 +2440,8 @@ impl AnalyticPenalty for TopKActivationPenalty {
     fn hessian_diag(
         &self,
         target: ArrayView1<'_, f64>,
-        rho: ArrayView1<'_, f64>,
+        _rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
-        std::hint::black_box(rho);
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut mask = vec![false; d];
@@ -2459,9 +2458,7 @@ impl AnalyticPenalty for TopKActivationPenalty {
         Some(diag)
     }
 
-    fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        std::hint::black_box(target);
-        std::hint::black_box(rho);
+    fn grad_rho(&self, _target: ArrayView1<'_, f64>, _rho: ArrayView1<'_, f64>) -> Array1<f64> {
         Array1::<f64>::zeros(0)
     }
 
@@ -6216,8 +6213,7 @@ impl OrthogonalityPenalty {
 
     /// Dense cross-axis Hessian; no blockwise reduction preserves the
     /// rotation-gauge term.
-    pub fn as_blockwise(&self, global_offset: usize) -> Option<Vec<BlockwisePenalty>> {
-        std::hint::black_box(global_offset);
+    pub fn as_blockwise(&self, _global_offset: usize) -> Option<Vec<BlockwisePenalty>> {
         None
     }
 }

@@ -465,6 +465,9 @@ mod cuda_backend {
         let mut lwork = 0_i32;
         {
             let (a_ptr, _a_record) = a.device_ptr_mut(stream);
+            // SAFETY: `a_ptr` addresses a live p-by-p column-major device buffer,
+            // `lwork` is a valid host out-parameter, and `solver` is initialized
+            // on the stream that owns the allocation.
             let status = unsafe {
                 cusolver_sys::cusolverDnDpotrf_bufferSize(
                     solver.cu(),
@@ -484,6 +487,9 @@ mod cuda_backend {
             let (a_ptr, _a_record) = a.device_ptr_mut(stream);
             let (work_ptr, _work_record) = workspace.device_ptr_mut(stream);
             let (info_ptr, _info_record) = info.device_ptr_mut(stream);
+            // SAFETY: `a`, `workspace`, and `info` are live device allocations
+            // on this stream. Workspace length comes from the matching cuSOLVER
+            // buffer-size query above and leading dimensions are p.
             let status = unsafe {
                 cusolver_sys::cusolverDnDpotrf(
                     solver.cu(),
