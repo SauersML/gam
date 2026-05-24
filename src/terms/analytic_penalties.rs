@@ -2345,6 +2345,339 @@ impl AnalyticPenalty for ARDPenalty {
 }
 
 // ---------------------------------------------------------------------------
+// TopK activation penalty
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct TopKActivationPenalty {
+    pub target: PsiSlice,
+    pub k: usize,
+    pub latent_dim: usize,
+    pub weight: f64,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
+}
+
+impl TopKActivationPenalty {
+    #[must_use = "build error must be handled"]
+    pub fn new(target: PsiSlice, k: usize, weight: f64) -> Result<Self, String> {
+        let latent_dim = target
+            .latent_dim
+            .ok_or_else(|| "TopKActivationPenalty::new requires target.latent_dim".to_string())?;
+        if latent_dim == 0 {
+            return Err("TopKActivationPenalty::new requires latent_dim > 0".to_string());
+        }
+        if k == 0 || k > latent_dim {
+            return Err(format!(
+                "TopKActivationPenalty::new requires 0 < k <= latent_dim; got k={k}, latent_dim={latent_dim}"
+            ));
+        }
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!(
+                "TopKActivationPenalty::new requires finite weight > 0, got {weight}"
+            ));
+        }
+        Ok(Self {
+            target,
+            k,
+            latent_dim,
+            weight,
+            weight_schedule: None,
+        })
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
+    }
+
+    fn topk_mask_row(&self, target: ArrayView1<'_, f64>, row: usize, mask: &mut [bool]) {
+        mask.fill(false);
+        let d = self.latent_dim;
+        let base = row * d;
+        let mut order = (0..d).collect::<Vec<_>>();
+        order.sort_by(|&a, &b| {
+            target[base + b]
+                .abs()
+                .total_cmp(&target[base + a].abs())
+                .then_with(|| a.cmp(&b))
+        });
+        for &axis in order.iter().take(self.k) {
+            mask[axis] = true;
+        }
+    }
+}
+
+impl AnalyticPenalty for TopKActivationPenalty {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Psi
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        drop(rho);
+        let d = self.latent_dim;
+        let n_obs = target.len() / d;
+        let mut mask = vec![false; d];
+        let mut acc = 0.0;
+        for row in 0..n_obs {
+            self.topk_mask_row(target, row, &mut mask);
+            let base = row * d;
+            for axis in 0..d {
+                if mask[axis] {
+                    let v = target[base + axis];
+                    acc += 0.5 * self.weight * v * v;
+                }
+            }
+        }
+        acc
+    }
+
+    fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        drop(rho);
+        let d = self.latent_dim;
+        let n_obs = target.len() / d;
+        let mut mask = vec![false; d];
+        let mut grad = Array1::<f64>::zeros(target.len());
+        for row in 0..n_obs {
+            self.topk_mask_row(target, row, &mut mask);
+            let base = row * d;
+            for axis in 0..d {
+                if mask[axis] {
+                    grad[base + axis] = self.weight * target[base + axis];
+                }
+            }
+        }
+        grad
+    }
+
+    fn hessian_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        drop(rho);
+        let d = self.latent_dim;
+        let n_obs = target.len() / d;
+        let mut mask = vec![false; d];
+        let mut diag = Array1::<f64>::zeros(target.len());
+        for row in 0..n_obs {
+            self.topk_mask_row(target, row, &mut mask);
+            let base = row * d;
+            for axis in 0..d {
+                if mask[axis] {
+                    diag[base + axis] = self.weight;
+                }
+            }
+        }
+        Some(diag)
+    }
+
+    fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        drop(target);
+        drop(rho);
+        Array1::<f64>::zeros(0)
+    }
+
+    fn rho_count(&self) -> usize {
+        0
+    }
+
+    fn name(&self) -> &str {
+        "topk_activation"
+    }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JumpReLU penalty
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct JumpReLUPenalty {
+    pub target: PsiSlice,
+    pub latent_dim: usize,
+    pub thresholds: Array1<f64>,
+    pub weight: f64,
+    pub smoothing_eps: f64,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
+}
+
+impl JumpReLUPenalty {
+    #[must_use = "build error must be handled"]
+    pub fn new(
+        target: PsiSlice,
+        thresholds: Array1<f64>,
+        weight: f64,
+        smoothing_eps: f64,
+    ) -> Result<Self, String> {
+        let latent_dim = target
+            .latent_dim
+            .ok_or_else(|| "JumpReLUPenalty::new requires target.latent_dim".to_string())?;
+        if latent_dim == 0 {
+            return Err("JumpReLUPenalty::new requires latent_dim > 0".to_string());
+        }
+        if thresholds.len() != latent_dim {
+            return Err(format!(
+                "JumpReLUPenalty::new thresholds length {} does not match latent_dim {latent_dim}",
+                thresholds.len()
+            ));
+        }
+        for (idx, &tau) in thresholds.iter().enumerate() {
+            if !(tau.is_finite() && tau > 0.0) {
+                return Err(format!(
+                    "JumpReLUPenalty::new thresholds[{idx}] must be finite and > 0, got {tau}"
+                ));
+            }
+        }
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!(
+                "JumpReLUPenalty::new requires finite weight > 0, got {weight}"
+            ));
+        }
+        if !(smoothing_eps.is_finite() && smoothing_eps > 0.0) {
+            return Err(format!(
+                "JumpReLUPenalty::new requires finite smoothing_eps > 0, got {smoothing_eps}"
+            ));
+        }
+        Ok(Self {
+            target,
+            latent_dim,
+            thresholds,
+            weight,
+            smoothing_eps,
+            weight_schedule: None,
+        })
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
+    }
+
+    fn threshold(&self, axis: usize, rho: ArrayView1<'_, f64>) -> f64 {
+        self.thresholds[axis] * rho[axis].exp()
+    }
+
+    fn sigmoid_gate(&self, x: f64) -> f64 {
+        if x >= 0.0 {
+            1.0 / (1.0 + (-x).exp())
+        } else {
+            let ex = x.exp();
+            ex / (1.0 + ex)
+        }
+    }
+}
+
+impl AnalyticPenalty for JumpReLUPenalty {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Psi
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        let d = self.latent_dim;
+        let n_obs = target.len() / d;
+        let mut acc = 0.0;
+        for row in 0..n_obs {
+            let base = row * d;
+            for axis in 0..d {
+                let tau = self.threshold(axis, rho);
+                let gate = self.sigmoid_gate((target[base + axis] - tau) / self.smoothing_eps);
+                acc += self.weight * tau * gate;
+            }
+        }
+        acc
+    }
+
+    fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let d = self.latent_dim;
+        let n_obs = target.len() / d;
+        let mut grad = Array1::<f64>::zeros(target.len());
+        for row in 0..n_obs {
+            let base = row * d;
+            for axis in 0..d {
+                let tau = self.threshold(axis, rho);
+                let gate = self.sigmoid_gate((target[base + axis] - tau) / self.smoothing_eps);
+                grad[base + axis] =
+                    self.weight * tau * gate * (1.0 - gate) / self.smoothing_eps;
+            }
+        }
+        grad
+    }
+
+    fn hessian_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        let d = self.latent_dim;
+        let n_obs = target.len() / d;
+        let mut diag = Array1::<f64>::zeros(target.len());
+        for row in 0..n_obs {
+            let base = row * d;
+            for axis in 0..d {
+                let tau = self.threshold(axis, rho);
+                let gate = self.sigmoid_gate((target[base + axis] - tau) / self.smoothing_eps);
+                diag[base + axis] = self.weight * tau * gate * (1.0 - gate)
+                    * (1.0 - 2.0 * gate)
+                    / (self.smoothing_eps * self.smoothing_eps);
+            }
+        }
+        Some(diag)
+    }
+
+    fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let d = self.latent_dim;
+        let n_obs = target.len() / d;
+        let mut out = Array1::<f64>::zeros(d);
+        for axis in 0..d {
+            let tau = self.threshold(axis, rho);
+            let mut g_tau = 0.0;
+            for row in 0..n_obs {
+                let x = target[row * d + axis];
+                let gate = self.sigmoid_gate((x - tau) / self.smoothing_eps);
+                g_tau += gate - tau * gate * (1.0 - gate) / self.smoothing_eps;
+            }
+            out[axis] = self.weight * tau * g_tau;
+        }
+        out
+    }
+
+    fn rho_count(&self) -> usize {
+        self.latent_dim
+    }
+
+    fn name(&self) -> &str {
+        "jumprelu"
+    }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Total variation penalty
 // ---------------------------------------------------------------------------
 
@@ -6163,6 +6496,8 @@ pub enum AnalyticPenaltyKind {
     SoftmaxAssignmentSparsity(Arc<SoftmaxAssignmentSparsityPenalty>),
     IBPAssignment(Arc<IBPAssignmentPenalty>),
     Ard(Arc<ARDPenalty>),
+    TopKActivation(Arc<TopKActivationPenalty>),
+    JumpReLU(Arc<JumpReLUPenalty>),
     TotalVariation(Arc<TotalVariationPenalty>),
     NuclearNorm(Arc<NuclearNormPenalty>),
     BlockSparsity(Arc<BlockSparsityPenalty>),
@@ -6185,6 +6520,8 @@ impl AnalyticPenaltyKind {
             }
             AnalyticPenaltyKind::IBPAssignment(p) => Arc::make_mut(p).apply_schedule(iter),
             AnalyticPenaltyKind::Ard(p) => Arc::make_mut(p).apply_schedule(iter),
+            AnalyticPenaltyKind::TopKActivation(p) => Arc::make_mut(p).apply_schedule(iter),
+            AnalyticPenaltyKind::JumpReLU(p) => Arc::make_mut(p).apply_schedule(iter),
             AnalyticPenaltyKind::TotalVariation(p) => Arc::make_mut(p).apply_schedule(iter),
             AnalyticPenaltyKind::NuclearNorm(p) => Arc::make_mut(p).apply_schedule(iter),
             AnalyticPenaltyKind::BlockSparsity(p) => Arc::make_mut(p).apply_schedule(iter),
@@ -6207,6 +6544,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.tier(),
             AnalyticPenaltyKind::IBPAssignment(p) => p.tier(),
             AnalyticPenaltyKind::Ard(p) => p.tier(),
+            AnalyticPenaltyKind::TopKActivation(p) => p.tier(),
+            AnalyticPenaltyKind::JumpReLU(p) => p.tier(),
             AnalyticPenaltyKind::TotalVariation(p) => p.tier(),
             AnalyticPenaltyKind::NuclearNorm(p) => p.tier(),
             AnalyticPenaltyKind::BlockSparsity(p) => p.tier(),
@@ -6227,6 +6566,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.rho_count(),
             AnalyticPenaltyKind::IBPAssignment(p) => p.rho_count(),
             AnalyticPenaltyKind::Ard(p) => p.rho_count(),
+            AnalyticPenaltyKind::TopKActivation(p) => p.rho_count(),
+            AnalyticPenaltyKind::JumpReLU(p) => p.rho_count(),
             AnalyticPenaltyKind::TotalVariation(p) => p.rho_count(),
             AnalyticPenaltyKind::NuclearNorm(p) => p.rho_count(),
             AnalyticPenaltyKind::BlockSparsity(p) => p.rho_count(),
@@ -6247,6 +6588,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.name(),
             AnalyticPenaltyKind::IBPAssignment(p) => p.name(),
             AnalyticPenaltyKind::Ard(p) => p.name(),
+            AnalyticPenaltyKind::TopKActivation(p) => p.name(),
+            AnalyticPenaltyKind::JumpReLU(p) => p.name(),
             AnalyticPenaltyKind::TotalVariation(p) => p.name(),
             AnalyticPenaltyKind::NuclearNorm(p) => p.name(),
             AnalyticPenaltyKind::BlockSparsity(p) => p.name(),
@@ -6267,6 +6610,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.value(target, rho),
             AnalyticPenaltyKind::IBPAssignment(p) => p.value(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.value(target, rho),
+            AnalyticPenaltyKind::TopKActivation(p) => p.value(target, rho),
+            AnalyticPenaltyKind::JumpReLU(p) => p.value(target, rho),
             AnalyticPenaltyKind::TotalVariation(p) => p.value(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.value(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.value(target, rho),
@@ -6291,6 +6636,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::IBPAssignment(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::TopKActivation(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::JumpReLU(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::TotalVariation(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.grad_target(target, rho),
@@ -6315,6 +6662,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::IBPAssignment(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::TopKActivation(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::JumpReLU(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::TotalVariation(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.grad_rho(target, rho),
@@ -6339,6 +6688,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::IBPAssignment(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Ard(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::TopKActivation(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::JumpReLU(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::TotalVariation(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.hessian_diag(target, rho),
@@ -6371,6 +6722,8 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::IBPAssignment(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Ard(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::TopKActivation(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::JumpReLU(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::TotalVariation(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::NuclearNorm(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::BlockSparsity(p) => p.hvp(target, rho, v),
@@ -6496,6 +6849,12 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::Ard(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
                 .expect("ARD diag"),
+            AnalyticPenaltyKind::TopKActivation(p) => p
+                .hessian_diag(self.target.view(), self.rho.view())
+                .expect("TopK activation diag"),
+            AnalyticPenaltyKind::JumpReLU(p) => p
+                .hessian_diag(self.target.view(), self.rho.view())
+                .expect("JumpReLU diag"),
             AnalyticPenaltyKind::TotalVariation(p) => {
                 p.diag_target(self.target.view(), self.rho.view())
             }
@@ -6572,6 +6931,8 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
         // Orthogonality is excluded because its exact Hessian is indefinite.
         match &self.penalty {
             AnalyticPenaltyKind::Ard(_)
+            | AnalyticPenaltyKind::TopKActivation(_)
+            | AnalyticPenaltyKind::JumpReLU(_)
             | AnalyticPenaltyKind::Sparsity(_)
             | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
             | AnalyticPenaltyKind::IBPAssignment(_) => {

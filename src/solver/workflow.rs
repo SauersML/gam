@@ -56,11 +56,11 @@ use crate::terms::latent_coord::{
 use crate::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, RowPrecisionPriorPenalty,
     BlockOrthogonalityPenalty, BlockSparsityPenalty, DifferenceOpKind, GumbelTemperatureSchedule,
-    IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge, MechanismSparsityPenalty,
-    NuclearNormPenalty, OrthogonalityPenalty,
+    IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty,
+    MechanismSparsityPenalty, NuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice, ScadMcpPenalty,
     SoftmaxAssignmentSparsityPenalty, ScalarWeightSchedule, ScheduleKind, SparsityPenalty,
-    TotalVariationPenalty,
+    TopKActivationPenalty, TotalVariationPenalty,
 };
 use crate::survival::PenaltyBlock;
 use crate::types::{

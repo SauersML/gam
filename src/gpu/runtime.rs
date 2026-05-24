@@ -22,14 +22,7 @@ pub struct GpuRuntime {
 
 impl GpuRuntime {
     pub fn probe() -> Result<Option<Self>, GpuProbeError> {
-        #[cfg(feature = "cuda")]
-        {
-            Ok(None)
-        }
-        #[cfg(not(feature = "cuda"))]
-        {
-            Ok(None)
-        }
+        Ok(None)
     }
 
     #[must_use]

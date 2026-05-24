@@ -447,6 +447,136 @@ def _legacy_sae_manifold_fit(
     return chosen
 
 
+def _resolve_public_topology(
+    atom_topology: str,
+    selector: TopologyAutoSelector | None,
+) -> Literal["circle", "sphere", "euclidean"]:
+    key = str(atom_topology).lower().replace("-", "_")
+    if key == "auto":
+        if selector is None:
+            return "circle"
+        candidates = selector.candidates or ("circle", "sphere", "euclidean")
+        first = candidates[0]
+        if isinstance(first, tuple):
+            first = first[0]
+        key = str(first).lower().replace("-", "_")
+    if key in {"circle", "periodic"}:
+        return "circle"
+    if key in {"sphere", "s2"}:
+        return "sphere"
+    if key in {"euclidean", "euclidean_patch", "duchon"}:
+        return "euclidean"
+    raise ValueError("atom_topology must be 'circle', 'sphere', or 'euclidean'")
+
+
+def _basis_for_public_topology(topology_name: str, d_atom: int) -> Smooth:
+    if topology_name == "circle":
+        return Circle(n_knots=24)
+    if topology_name == "sphere":
+        if d_atom != 2:
+            raise ValueError("atom_topology='sphere' requires d_atom=2")
+        return Sphere(n_centers=16)
+    return EuclideanPatch(d=max(1, d_atom), centers=None)
+
+
+def _retraction_for_public_topology(topology_name: str, d_atom: int) -> Any:
+    if topology_name == "circle":
+        return "circle"
+    if topology_name == "sphere":
+        return "sphere"
+    if d_atom <= 1:
+        return "euclidean"
+    return {"type": "product", "parts": ["euclidean" for _ in range(d_atom)]}
+
+
+def _build_manifold_sae(
+    *,
+    x: np.ndarray,
+    low_level: SaeManifoldFitResult,
+    atom_topology: str,
+    assignment: Literal["ibp", "softmax"],
+    latent: LatentCoord,
+    penalties: list[Any],
+) -> ManifoldSAE:
+    mean = x.mean(axis=0)
+    centered = x - mean[None, :]
+    basis_specs = [
+        _freeze_basis_spec(atom.basis, coord) for atom, coord in zip(low_level.atoms, low_level.coords)
+    ]
+    latent_encoders = [_linear_encoder(centered, coord) for coord in low_level.coords]
+    assignment_logits = _assignment_targets(low_level.assignments, assignment)
+    assignment_intercept = assignment_logits.mean(axis=0)
+    assignment_encoder = _linear_encoder(centered, assignment_logits - assignment_intercept[None, :])
+    decoder_blocks = [atom.decoder_coefficients.copy() for atom in low_level.atoms]
+    anchors = [_anchors_for_atom(spec, coord) for spec, coord in zip(basis_specs, low_level.coords)]
+    r2 = _reconstruction_r2(x, low_level.fitted)
+    primitives = ["LatentCoord", "RiemannianRetraction", "gaussian_reml_fit"]
+    primitives.extend(type(p).__name__ for p in penalties)
+    primitives.extend(_basis_kind_name(spec) for spec in basis_specs)
+    return ManifoldSAE(
+        atoms=low_level.atoms,
+        atom_topology=atom_topology,
+        assignment=assignment,
+        latent=latent,
+        penalties=list(penalties),
+        primitive_names=primitives,
+        fitted=low_level.fitted.copy(),
+        assignments=low_level.assignments.copy(),
+        coords=[_retract_coords(spec, coord.copy()) for spec, coord in zip(basis_specs, low_level.coords)],
+        decoder_blocks=decoder_blocks,
+        basis_specs=basis_specs,
+        reml_score=float(low_level.reml_score),
+        reconstruction_r2=r2,
+        training_mean=mean,
+        training_data=x.copy(),
+        latent_encoders=latent_encoders,
+        assignment_encoder=assignment_encoder,
+        assignment_intercept=assignment_intercept,
+        anchors=anchors,
+        low_level=low_level,
+    )
+
+
+def _linear_encoder(centered_x: np.ndarray, target: np.ndarray) -> np.ndarray:
+    if target.size == 0:
+        return np.zeros((centered_x.shape[1], target.shape[1]), dtype=float)
+    scale = float(np.trace(centered_x.T @ centered_x)) / max(1, centered_x.shape[1])
+    ridge = max(scale, 1.0) * 1e-8
+    lhs = centered_x.T @ centered_x + ridge * np.eye(centered_x.shape[1])
+    rhs = centered_x.T @ target
+    return np.linalg.solve(lhs, rhs)
+
+
+def _assignment_targets(assignments: np.ndarray, assignment: str) -> np.ndarray:
+    z = np.clip(assignments, 1e-6, 1.0 - 1e-6)
+    if assignment == "ibp":
+        return np.log(z / (1.0 - z))
+    return np.log(np.clip(assignments, 1e-12, 1.0))
+
+
+def _reconstruction_r2(x: np.ndarray, fitted: np.ndarray) -> float:
+    ss_res = float(np.sum((x - fitted) ** 2))
+    ss_tot = float(np.sum((x - x.mean(axis=0, keepdims=True)) ** 2))
+    return 1.0 - ss_res / max(ss_tot, 1e-12)
+
+
+def _freeze_basis_spec(spec: str | Smooth, coords: np.ndarray) -> str | Smooth:
+    if isinstance(spec, PeriodicSplineCurve) or isinstance(spec, Sphere):
+        return spec
+    if isinstance(spec, Duchon):
+        centers = None if coords.shape[1] == 0 else _latent_grid_centers(coords, 12)
+        return Duchon(centers=centers, m=spec.m, name=spec.name)
+    return spec
+
+
+def _anchors_for_atom(spec: str | Smooth, coords: np.ndarray) -> np.ndarray:
+    if coords.shape[1] == 0:
+        return np.zeros((1, 0), dtype=float)
+    if isinstance(spec, Duchon) and spec.centers is not None and not isinstance(spec.centers, int):
+        return np.asarray(spec.centers, dtype=float).copy()
+    return _latent_grid_centers(coords, min(16, max(1, coords.shape[0])))
+
+
 def _fit_fixed_k(
     z: np.ndarray,
     k_atoms: int,
