@@ -9,11 +9,10 @@ use std::collections::{BTreeMap, HashMap};
 use ndarray::{ArrayView1, Axis};
 
 use crate::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-    BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy, DuchonBasisSpec,
-    DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
-    MaternNu, SpatialIdentifiability, SphericalSplineBasisSpec, ThinPlateBasisSpec,
-    auto_spatial_center_strategy, compute_pca_basis_matrix, default_num_centers,
+    BSplineBasisSpec, BSplineBoundaryCondition, BSplineIdentifiability, BSplineKnotSpec,
+    CenterCountRequest, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
+    DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability, MaternNu,
+    SpatialIdentifiability, ThinPlateBasisSpec, auto_spatial_center_strategy, default_num_centers,
     default_spatial_center_strategy, plan_spatial_basis, resolve_duchon_orders,
 };
 use crate::inference::data::{EncodedDataset as Dataset, missing_column_message};
@@ -495,141 +494,84 @@ fn parse_bc_periods_option(
 // Smooth basis spec construction
 // ---------------------------------------------------------------------------
 
-fn sorted_levels_for_column(col: ArrayView1<'_, f64>) -> Result<Vec<u64>, String> {
-    let mut levels = std::collections::BTreeSet::<u64>::new();
-    for &v in col.iter() {
-        if !v.is_finite() {
-            return Err("categorical column contains non-finite values".to_string());
-        }
-        levels.insert(v.to_bits());
-    }
-    Ok(levels.into_iter().collect())
-}
-
-/// Look up a per-side boundary-condition key under any of several names that
-/// users intuitively reach for, picking the first present. Aliases:
-///   - left  → bc_left, left_bc, start_bc
-///   - right → bc_right, right_bc, end_bc
-fn endpoint_bc_raw<'a>(options: &'a BTreeMap<String, String>, side: &str) -> Option<&'a String> {
-    let aliases: &[&str] = match side {
-        "left" => &["bc_left", "left_bc", "start_bc"],
-        "right" => &["bc_right", "right_bc", "end_bc"],
-        _ => &[],
-    };
-    aliases.iter().find_map(|k| options.get(*k))
-}
-
-/// Anchor lookup: per-side `anchor_<side>`/`<side>_anchor`, else global
-/// `anchor`/`anchor_value`/`value`.
-fn endpoint_anchor_value(options: &BTreeMap<String, String>, side: &str) -> Option<f64> {
-    let side_keys: &[&str] = match side {
-        "left" => &["anchor_left", "left_anchor"],
-        "right" => &["anchor_right", "right_anchor"],
-        _ => &[],
-    };
-    for k in side_keys {
-        if let Some(v) = option_f64(options, k) {
-            return Some(v);
-        }
-    }
-    for k in &["anchor", "anchor_value", "value"] {
-        if let Some(v) = option_f64(options, k) {
-            return Some(v);
-        }
-    }
-    None
-}
-
-#[derive(Clone, Copy)]
-enum SideFilter {
-    Both,
-    Left,
-    Right,
-}
-
-fn parse_bspline_endpoint_condition(
-    options: &BTreeMap<String, String>,
-    side: &str,
-    global_bc: Option<&str>,
-    side_filter: SideFilter,
-) -> Result<BSplineEndpointBoundaryCondition, TermBuilderError> {
-    let applies_global = matches!(
-        (side, side_filter),
-        (_, SideFilter::Both) | ("left", SideFilter::Left) | ("right", SideFilter::Right)
-    );
-    let raw = endpoint_bc_raw(options, side)
-        .map(String::as_str)
-        .or_else(|| if applies_global { global_bc } else { None })
-        .unwrap_or("free")
-        .trim()
-        .to_ascii_lowercase();
-    match raw.as_str() {
-        "free" | "none" | "open" => Ok(BSplineEndpointBoundaryCondition::Free),
-        "clamped" | "clamp" | "zero_derivative" | "zero-derivative" => {
-            Ok(BSplineEndpointBoundaryCondition::Clamped)
-        }
-        "anchored" | "anchor" | "zero" | "zero_value" | "zero-value" => {
-            let value = endpoint_anchor_value(options, side).unwrap_or(0.0);
-            // Nonzero anchor values aren't supported by the basis builder yet
-            // (it would need an affine offset term). Reject upfront with a
-            // clear actionable message instead of letting the user see a
-            // generic "Matrix conditioning issue / basis function generation
-            // failed" wrapped error during fit.
-            if value != 0.0 {
-                return Err(TermBuilderError::unsupported_feature(format!(
-                    "anchored {side} endpoint with non-zero value {value} is not supported yet; \
-                     pass anchor value 0 (or omit `anchor_{side}=`) and subtract the offset from \
-                     `y` before fitting if you need to pin the boundary at a non-zero level."
-                )));
-            }
-            Ok(BSplineEndpointBoundaryCondition::Anchored { value })
-        }
-        other => Err(TermBuilderError::unsupported_feature(format!(
-            "unsupported B-spline boundary condition '{other}' for {side} endpoint; use free|clamped|anchored"
-        ))),
-    }
-}
-
-fn parse_bspline_boundary_conditions(
-    options: &BTreeMap<String, String>,
-) -> Result<BSplineBoundaryConditions, TermBuilderError> {
-    let global_bc = options.get("bc").map(String::as_str);
-    let side_filter = match options
-        .get("side")
-        .map(|s| s.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        None | Some("both") => SideFilter::Both,
-        Some("left") | Some("start") => SideFilter::Left,
-        Some("right") | Some("end") => SideFilter::Right,
-        Some(other) => {
-            return Err(TermBuilderError::unsupported_feature(format!(
-                "unsupported B-spline boundary side '{other}'; use left|right|both"
-            )));
-        }
-    };
-    Ok(BSplineBoundaryConditions {
-        left: parse_bspline_endpoint_condition(options, "left", global_bc, side_filter)?,
-        right: parse_bspline_endpoint_condition(options, "right", global_bc, side_filter)?,
-    })
-}
-
-fn bspline_bc_declares_periodic_axis(options: &BTreeMap<String, String>) -> bool {
-    options
-        .get("bc")
-        .map(|raw| {
-            let vals = split_list_option(raw);
-            vals.len() == 1
-                && matches!(
-                    vals[0]
-                        .trim_matches('"')
-                        .trim_matches('\'')
-                        .to_ascii_lowercase()
-                        .as_str(),
-                    "periodic" | "cyclic" | "cc"
-                )
+fn parse_option_list(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    let inner = trimmed
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    inner
+        .split(',')
+        .map(|v| {
+            v.trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_ascii_lowercase()
         })
-        .unwrap_or(false)
+        .filter(|v| !v.is_empty())
+        .collect()
+}
+
+fn parse_f64_option_list(raw: &str) -> Vec<f64> {
+    parse_option_list(raw)
+        .into_iter()
+        .filter_map(|v| v.parse::<f64>().ok())
+        .collect()
+}
+
+fn tensor_margin_boundary_conditions(
+    options: &BTreeMap<String, String>,
+    cols: &[usize],
+    ds: &Dataset,
+) -> Result<Vec<BSplineBoundaryCondition>, String> {
+    let mut out = vec![BSplineBoundaryCondition::Open; cols.len()];
+    let Some(raw_bc) = options.get("bc").or_else(|| options.get("boundary")) else {
+        return Ok(out);
+    };
+    let bc = parse_option_list(raw_bc);
+    if bc.len() != cols.len() {
+        return Err(format!(
+            "te()/tensor() bc must have one entry per margin: got {} for {} variables",
+            bc.len(),
+            cols.len()
+        ));
+    }
+    let periods = options
+        .get("period")
+        .or_else(|| options.get("periods"))
+        .map(|raw| parse_f64_option_list(raw))
+        .unwrap_or_default();
+    let origins = options
+        .get("origin")
+        .or_else(|| options.get("origins"))
+        .map(|raw| parse_f64_option_list(raw))
+        .unwrap_or_default();
+    for (i, boundary) in bc.iter().enumerate() {
+        match boundary.as_str() {
+            "periodic" | "cyclic" | "cc" => {
+                let origin = origins.get(i).copied().map(Ok).unwrap_or_else(|| {
+                    col_minmax(ds.values.column(cols[i])).map(|(minv, _)| minv)
+                })?;
+                let period = periods.get(i).copied().ok_or_else(|| {
+                    "te()/tensor() periodic margins require period=[...] with one positive period per margin".to_string()
+                })?;
+                if !period.is_finite() || period <= 0.0 {
+                    return Err(format!(
+                        "te()/tensor() period for margin {} must be finite and positive, got {}",
+                        i, period
+                    ));
+                }
+                out[i] = BSplineBoundaryCondition::Periodic { period, origin };
+            }
+            "open" | "none" | "natural" => {}
+            other => {
+                return Err(format!(
+                    "unsupported te()/tensor() boundary condition '{other}'; supported values are open and periodic"
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub fn build_smooth_basis(
@@ -864,27 +806,36 @@ pub fn build_smooth_basis(
                     type_opt
                 ));
             }
-            let c = cont[0].1;
-            let (minv, maxv) = col_minmax(ds.values.column(c))?;
-            let degree = if type_opt == "re" {
-                1
-            } else {
-                option_usize(options, "degree").unwrap_or(3)
-            };
-            let default_internal = heuristic_knots_for_column(ds.values.column(c));
-            let (n_knots, _) = parse_ps_internal_knots(options, degree, default_internal)?;
-            let flavour = match type_opt.as_str() {
-                "fs" => FactorSmoothFlavour::Fs {
-                    m_null_penalty_orders: (0..option_usize(options, "m").unwrap_or(2)).collect(),
-                },
-                "sz" => FactorSmoothFlavour::Sz,
-                _ => FactorSmoothFlavour::Re,
-            };
-            Ok(SmoothBasisSpec::FactorSmooth {
-                spec: FactorSmoothSpec {
-                    continuous_cols: vec![c],
-                    group_col: cols[group_i],
-                    marginal: BSplineBasisSpec {
+            let degree = 3usize;
+            let default_internal = cols
+                .iter()
+                .map(|&c| heuristic_knots_for_column(ds.values.column(c)))
+                .max()
+                .unwrap_or_else(|| heuristic_knots(ds.values.nrows()));
+            let (mut n_knots, inferred) =
+                parse_ps_internal_knots(options, degree, default_internal)?;
+            if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
+                n_knots = n_knots.min(1);
+            }
+            if inferred {
+                inference_notes.push(format!(
+                    "Automatically set {} internal knots per margin for tensor smooth '{}' (max unique/4 rule across margins, clamped to [4,20]). Override with knots=... or k=....",
+                    n_knots,
+                    vars.join(",")
+                ));
+            }
+            let boundary_conditions = tensor_margin_boundary_conditions(options, cols, ds)?;
+            let specs = cols
+                .iter()
+                .enumerate()
+                .map(|(i, &c)| {
+                    let (minv, maxv) = match boundary_conditions[i] {
+                        BSplineBoundaryCondition::Periodic { period, origin } => {
+                            (origin, origin + period)
+                        }
+                        BSplineBoundaryCondition::Open => col_minmax(ds.values.column(c))?,
+                    };
+                    Ok(BSplineBasisSpec {
                         degree,
                         penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
                         knotspec: BSplineKnotSpec::Generate {
@@ -893,354 +844,7 @@ pub fn build_smooth_basis(
                         },
                         double_penalty: false,
                         identifiability: BSplineIdentifiability::None,
-                        boundary_conditions: Default::default(),
-                    },
-                    flavour,
-                    group_frozen_levels: None,
-                },
-            })
-        }
-        "tensor" | "te" | "tensor-bspline" => {
-            validate_known_options(
-                type_opt.as_str(),
-                options,
-                &[
-                    "type",
-                    "bs",
-                    "k",
-                    "basis_dim",
-                    "basis-dim",
-                    "basisdim",
-                    "knots",
-                    "degree",
-                    "penalty_order",
-                    "m",
-                    "double_penalty",
-                ],
-            )?;
-            if cols.len() != 2 {
-                return Err(format!(
-                    "{} smooth currently expects exactly two variables: one continuous and one categorical/group variable",
-                    type_opt
-                ));
-            }
-            let k0 = ds
-                .column_kinds
-                .get(cols[0])
-                .copied()
-                .ok_or_else(|| "column-kind lookup failed".to_string())?;
-            let k1 = ds
-                .column_kinds
-                .get(cols[1])
-                .copied()
-                .ok_or_else(|| "column-kind lookup failed".to_string())?;
-            let (group_idx, cont_idx) = match (k0, k1) {
-                (ColumnKindTag::Categorical, ColumnKindTag::Continuous | ColumnKindTag::Binary) => {
-                    (0usize, 1usize)
-                }
-                (ColumnKindTag::Continuous | ColumnKindTag::Binary, ColumnKindTag::Categorical) => {
-                    (1usize, 0usize)
-                }
-                _ => {
-                    return Err(format!(
-                        "{} smooth requires one categorical and one numeric variable",
-                        type_opt
-                    ));
-                }
-            };
-            let group_col = cols[group_idx];
-            let cont_col = cols[cont_idx];
-            let levels = sorted_levels_for_column(ds.values.column(group_col))?;
-            let degree = option_usize(options, "degree").unwrap_or(3);
-            let (minv, maxv) = col_minmax(ds.values.column(cont_col))?;
-            let default_internal = heuristic_knots_for_column(ds.values.column(cont_col));
-            let k = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
-            let n_knots = if let Some(k) = k {
-                if k < degree + 1 {
-                    return Err(format!(
-                        "factor smooth: k={} too small for degree {}; expected k >= {}",
-                        k,
-                        degree,
-                        degree + 1
-                    ));
-                }
-                k - degree - 1
-            } else {
-                default_internal
-            };
-            let marginal = BSplineBasisSpec {
-                degree,
-                penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
-                knotspec: BSplineKnotSpec::Generate {
-                    data_range: (minv, maxv),
-                    num_internal_knots: n_knots,
-                },
-                double_penalty: true,
-                identifiability: BSplineIdentifiability::None,
-                boundary_conditions: Default::default(),
-            };
-            let flavour = match type_opt.as_str() {
-                "fs" | "factor-smooth" | "factor_smooth" => {
-                    let m = option_usize(options, "m").unwrap_or(2);
-                    FactorSmoothFlavour::Fs {
-                        m_null_penalty_orders: vec![m],
-                    }
-                }
-                "sz" => FactorSmoothFlavour::Sz,
-                "re" => FactorSmoothFlavour::Re,
-                _ => unreachable!(),
-            };
-            Ok(SmoothBasisSpec::FactorSmooth {
-                spec: FactorSmoothSpec {
-                    continuous_cols: vec![cont_col],
-                    group_col,
-                    marginal,
-                    flavour,
-                    group_frozen_levels: Some(levels),
-                },
-            })
-        }
-        "tensor" | "te" | "tensor-bspline" => {
-            validate_known_options(
-                type_opt.as_str(),
-                options,
-                &[
-                    "type",
-                    "bs",
-                    "by",
-                    "k",
-                    "basis_dim",
-                    "basis-dim",
-                    "basisdim",
-                    "knots",
-                    "degree",
-                    "penalty_order",
-                    "m",
-                    "double_penalty",
-                ],
-            )?;
-            if cols.len() != 2 {
-                return Err(TermBuilderError::incompatible_config(format!(
-                    "{} smooth currently expects exactly two variables: one continuous and one categorical/group variable",
-                    type_opt
-                ))
-                .to_string());
-            }
-            let k0 = ds.column_kinds.get(cols[0]).copied().ok_or_else(|| {
-                TermBuilderError::missing_column("column-kind lookup failed").to_string()
-            })?;
-            let k1 = ds.column_kinds.get(cols[1]).copied().ok_or_else(|| {
-                TermBuilderError::missing_column("column-kind lookup failed").to_string()
-            })?;
-            // Binary columns are 2-level discrete variables and are valid as
-            // the grouping factor here. We require one column to be a discrete
-            // grouping variable (Categorical or Binary) and the other to be
-            // numeric (Continuous or Binary used as 0/1).
-            let (group_idx, cont_idx) = match (k0, k1) {
-                (ColumnKindTag::Categorical, _) => (0usize, 1usize),
-                (_, ColumnKindTag::Categorical) => (1usize, 0usize),
-                (ColumnKindTag::Binary, ColumnKindTag::Continuous) => (0usize, 1usize),
-                (ColumnKindTag::Continuous, ColumnKindTag::Binary) => (1usize, 0usize),
-                _ => {
-                    return Err(TermBuilderError::incompatible_config(format!(
-                        "{} smooth requires one categorical/binary grouping variable and one numeric variable, got kinds {:?} and {:?}",
-                        type_opt, k0, k1
-                    ))
-                    .to_string());
-                }
-            };
-            let group_col = cols[group_idx];
-            let cont_col = cols[cont_idx];
-            let levels =
-                sorted_levels_for_column(ds.values.column(group_col)).map_err(|e| e.to_string())?;
-            let degree = option_usize(options, "degree").unwrap_or(3);
-            let (minv, maxv) = col_minmax(ds.values.column(cont_col))?;
-            let default_internal = heuristic_knots_for_column(ds.values.column(cont_col));
-            let k = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
-            let n_knots = if let Some(k) = k {
-                if k < degree + 1 {
-                    return Err(TermBuilderError::invalid_option(format!(
-                        "factor smooth: k={} too small for degree {}; expected k >= {}",
-                        k,
-                        degree,
-                        degree + 1
-                    ))
-                    .to_string());
-                }
-                k - degree - 1
-            } else {
-                default_internal
-            };
-            let marginal = BSplineBasisSpec {
-                degree,
-                penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
-                knotspec: BSplineKnotSpec::Generate {
-                    data_range: (minv, maxv),
-                    num_internal_knots: n_knots,
-                },
-                double_penalty: true,
-                identifiability: BSplineIdentifiability::None,
-                boundary_conditions: Default::default(),
-            };
-            let flavour = match type_opt.as_str() {
-                "fs" | "factor-smooth" | "factor_smooth" => {
-                    let m = option_usize(options, "m").unwrap_or(2);
-                    FactorSmoothFlavour::Fs {
-                        m_null_penalty_orders: vec![m],
-                    }
-                }
-                "sz" => FactorSmoothFlavour::Sz,
-                "re" => FactorSmoothFlavour::Re,
-                _ => unreachable!(),
-            };
-            Ok(SmoothBasisSpec::FactorSmooth {
-                spec: FactorSmoothSpec {
-                    continuous_cols: vec![cont_col],
-                    group_col,
-                    marginal,
-                    flavour,
-                    group_frozen_levels: Some(levels),
-                },
-            })
-        }
-        "tensor" | "te" | "tensor-bspline" => {
-            validate_known_options(
-                "te",
-                options,
-                &[
-                    "type",
-                    "bs",
-                    "by",
-                    "k",
-                    "basis_dim",
-                    "basis-dim",
-                    "basisdim",
-                    "knots",
-                    "degree",
-                    "penalty_order",
-                    "bc",
-                    "periodic",
-                    "cyclic",
-                    "period",
-                    "periods",
-                    "period_start",
-                    "period_end",
-                    "origin",
-                    "origins",
-                    "period_origin",
-                    "period-origin",
-                    "domain_origin",
-                    "double_penalty",
-                    "by",
-                    "id",
-                    "__by_col",
-                    "identifiability",
-                ],
-            )?;
-            if cols.len() < 2 {
-                return Err(TermBuilderError::incompatible_config(format!(
-                    "tensor smooth requires >=2 variables: {}",
-                    vars.join(", ")
-                ))
-                .to_string());
-            }
-            let tensor_double_penalty = option_bool(options, "double_penalty").unwrap_or(false);
-            let degree = 3usize;
-            let knots_internal = option_usize_list_any(options, &["knots"])
-                .map_err(|e| e.to_string())?
-                .map(|v| expand_margin_usize_option("knots", v, cols.len()))
-                .transpose()
-                .map_err(|e| e.to_string())?;
-            let basis_dim =
-                option_usize_list_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
-                    .map_err(|e| e.to_string())?
-                    .map(|v| expand_margin_usize_option("k", v, cols.len()))
-                    .transpose()
-                    .map_err(|e| e.to_string())?;
-            if knots_internal.is_some() && basis_dim.is_some() {
-                return Err(TermBuilderError::incompatible_config(
-                    "tensor smooth: specify either knots=<internal_knots> or k=<basis_dim> (not both)",
-                )
-                .to_string());
-            }
-            let inferred = knots_internal.is_none() && basis_dim.is_none();
-            let mut internal_knots_by_dim = if let Some(k_values) = basis_dim {
-                let min_k = degree + 1;
-                for &k in &k_values {
-                    if k < min_k {
-                        return Err(TermBuilderError::invalid_option(format!(
-                            "tensor smooth: k={} too small for degree {}; expected k >= {}",
-                            k, degree, min_k
-                        ))
-                        .to_string());
-                    }
-                }
-                k_values.into_iter().map(|k| k - min_k).collect()
-            } else if let Some(knots) = knots_internal {
-                knots
-            } else {
-                cols.iter()
-                    .map(|&c| heuristic_knots_for_column(ds.values.column(c)))
-                    .collect()
-            };
-            if inferred {
-                let effective_n = tensor_effective_support_count(ds, cols);
-                cap_inferred_tensor_internal_knots(&mut internal_knots_by_dim, degree, effective_n);
-            }
-            if inferred && ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
-                for n_knots in &mut internal_knots_by_dim {
-                    *n_knots = (*n_knots).min(1);
-                }
-            }
-            if inferred {
-                inference_notes.push(format!(
-                    "Automatically set tensor smooth '{}' internal knots per margin to [{}] from per-axis cardinality and rank-product limits. Override with knots=... or k=....",
-                    vars.join(","),
-                    internal_knots_by_dim
-                        .iter()
-                        .map(|v| v.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            validate_tensor_bc_entries(options, cols.len()).map_err(|e| e.to_string())?;
-            let periodic_axes =
-                parse_periodic_axes(options, cols.len()).map_err(|e| e.to_string())?;
-            let periods = parse_periods(options, &periodic_axes).map_err(|e| e.to_string())?;
-            let origins =
-                parse_period_origins(options, &periodic_axes).map_err(|e| e.to_string())?;
-            let specs = cols
-                .iter()
-                .enumerate()
-                .map(|(dim, &c)| {
-                    let (minv, maxv) = col_minmax(ds.values.column(c))?;
-                    let n_knots = internal_knots_by_dim[dim];
-                    let knotspec = if periodic_axes[dim] {
-                        let period = periods[dim].ok_or_else(|| {
-                            TermBuilderError::incompatible_config(format!(
-                                "periodic tensor margin {} ('{}') requires period=[...] entry",
-                                dim, vars[dim]
-                            ))
-                            .to_string()
-                        })?;
-                        let domain_start = origins[dim].unwrap_or(minv);
-                        BSplineKnotSpec::PeriodicUniform {
-                            data_range: (domain_start, domain_start + period),
-                            num_basis: n_knots + degree + 1,
-                        }
-                    } else {
-                        BSplineKnotSpec::Generate {
-                            data_range: (minv, maxv),
-                            num_internal_knots: n_knots,
-                        }
-                    };
-                    Ok(BSplineBasisSpec {
-                        degree,
-                        penalty_order: 2,
-                        knotspec,
-                        double_penalty: tensor_double_penalty,
-                        identifiability: BSplineIdentifiability::None,
-                        boundary_conditions: Default::default(),
+                        boundary_condition: boundary_conditions[i].clone(),
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -1432,7 +1036,7 @@ pub fn build_smooth_basis(
                     knotspec,
                     double_penalty: smooth_double_penalty,
                     identifiability: BSplineIdentifiability::default(),
-                    boundary_conditions,
+                    boundary_condition: Default::default(),
                 },
             })
         }
