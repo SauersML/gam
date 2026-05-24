@@ -1,123 +1,79 @@
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OperationKind {
-    Gemv,
-    GemvTranspose,
-    Gemm,
-    XtDiagX,
-    XtDiagY,
-    JointHessian2x2,
-    LinkKernel,
-    CandidateScreen,
-    Cholesky,
-    Syevd,
-    SparseXtWx,
-    Pcg,
-    SpatialKernel,
-    RemlTrace,
-    FamilyKernel,
-    CudaGraph,
-    MultiGpuReduce,
-}
+const MAX_STATS: usize = 1024;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct KernelStat {
     pub name: &'static str,
-    pub kind: OperationKind,
     pub n: usize,
     pub p: usize,
     pub k: usize,
     pub nnz: usize,
-    pub flops_est: f64,
+    pub flops_est: usize,
     pub bytes_est: usize,
-    pub cpu_ms: Option<f64>,
+    pub cpu_ms: f64,
     pub gpu_ms: Option<f64>,
-    pub target: &'static str,
 }
 
-pub struct KernelStatRing {
-    capacity: usize,
-    entries: VecDeque<KernelStat>,
+#[derive(Clone, Debug, Default)]
+pub struct KernelStatsSnapshot {
+    pub stats: Vec<KernelStat>,
 }
 
-impl KernelStatRing {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            capacity,
-            entries: VecDeque::with_capacity(capacity),
+static STATS: OnceLock<Mutex<VecDeque<KernelStat>>> = OnceLock::new();
+
+fn stats() -> &'static Mutex<VecDeque<KernelStat>> {
+    STATS.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_STATS)))
+}
+
+pub fn record(stat: KernelStat) {
+    if let Ok(mut guard) = stats().lock() {
+        if guard.len() == MAX_STATS {
+            guard.pop_front();
         }
+        guard.push_back(stat);
     }
+}
 
-    pub fn push(&mut self, stat: KernelStat) {
-        if self.entries.len() == self.capacity {
-            self.entries.pop_front();
+pub fn snapshot() -> KernelStatsSnapshot {
+    if let Ok(guard) = stats().lock() {
+        KernelStatsSnapshot {
+            stats: guard.iter().cloned().collect(),
         }
-        self.entries.push_back(stat);
-    }
-
-    pub fn snapshot(&self) -> Vec<KernelStat> {
-        self.entries.iter().cloned().collect()
+    } else {
+        KernelStatsSnapshot::default()
     }
 }
 
-pub fn global_kernel_stats() -> &'static Mutex<KernelStatRing> {
-    static STATS: OnceLock<Mutex<KernelStatRing>> = OnceLock::new();
-    STATS.get_or_init(|| Mutex::new(KernelStatRing::new(1024)))
+pub fn clear() {
+    if let Ok(mut guard) = stats().lock() {
+        guard.clear();
+    }
 }
 
-pub fn record_cpu_fallback(
+pub fn cpu_scope<R>(
     name: &'static str,
-    kind: OperationKind,
     n: usize,
     p: usize,
     k: usize,
-    nnz: usize,
-) {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var("GAM_GPU_PROFILE").is_ok_and(|v| v == "1")) {
-        return;
-    }
-    if let Ok(mut stats) = global_kernel_stats().lock() {
-        stats.push(KernelStat {
-            name,
-            kind,
-            n,
-            p,
-            k,
-            nnz,
-            flops_est: estimate_flops(kind, n, p, k, nnz),
-            bytes_est: estimate_bytes(n, p, k, nnz),
-            cpu_ms: None,
-            gpu_ms: None,
-            target: "cpu-fallback",
-        });
-    }
-}
-
-pub fn kernel_stats_snapshot() -> Vec<KernelStat> {
-    global_kernel_stats()
-        .lock()
-        .map(|stats| stats.snapshot())
-        .unwrap_or_default()
-}
-
-pub fn estimate_flops(kind: OperationKind, n: usize, p: usize, k: usize, nnz: usize) -> f64 {
-    match kind {
-        OperationKind::Gemv | OperationKind::GemvTranspose => 2.0 * n as f64 * p as f64,
-        OperationKind::Gemm => 2.0 * n as f64 * p as f64 * k as f64,
-        OperationKind::XtDiagX => n as f64 * p as f64 * p as f64,
-        OperationKind::XtDiagY => 2.0 * n as f64 * p as f64 * k as f64,
-        OperationKind::JointHessian2x2 => n as f64 * (p + k) as f64 * (p + k) as f64,
-        OperationKind::SparseXtWx | OperationKind::Pcg => 2.0 * nnz as f64,
-        _ => 0.0,
-    }
-}
-
-pub fn estimate_bytes(n: usize, p: usize, k: usize, nnz: usize) -> usize {
-    (n.saturating_mul(p)
-        .saturating_add(n.saturating_mul(k))
-        .saturating_add(nnz))
-    .saturating_mul(8)
+    bytes_est: usize,
+    op: impl FnOnce() -> R,
+) -> R {
+    let start = Instant::now();
+    let out = op();
+    let cpu_ms = start.elapsed().as_secs_f64() * 1_000.0;
+    record(KernelStat {
+        name,
+        n,
+        p,
+        k,
+        nnz: 0,
+        flops_est: n.saturating_mul(p).saturating_mul(k).saturating_mul(2),
+        bytes_est,
+        cpu_ms,
+        gpu_ms: None,
+    });
+    out
 }

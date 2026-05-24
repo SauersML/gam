@@ -1,25 +1,16 @@
-#[derive(Clone, Debug)]
-pub enum SpatialKernel {
-    ThinPlate {
-        length_scale_sq: f64,
-        dim: usize,
-    },
-    Polyharmonic {
-        m: usize,
-        k_dim: usize,
-        c: f64,
-        power: f64,
-        is_log_case: bool,
-    },
-    Matern {
-        length_scale_sq: f64,
-        nu: f64,
-        dim: usize,
-    },
-    DuchonAnisotropic {
-        aniso_log_scales: Vec<f64>,
-        m: usize,
-        dim: usize,
-    },
-    GenericCpuOnly,
+//! Placeholder module for the CUDA backend phase described in the GPU HAL.
+//!
+//! The public HAL is present so solver call sites can be routed without CUDA
+//! types. Concrete cudarc kernels are intentionally isolated here in follow-up
+//! implementations and unavailable backends fall back to CPU numerics.
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendStatus {
+    CpuFallback,
+    CudaUnavailable,
+    CudaReady,
+}
+
+pub fn backend_status() -> BackendStatus {
+    BackendStatus::CpuFallback
 }
