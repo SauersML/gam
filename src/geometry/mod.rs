@@ -1,0 +1,23 @@
+pub mod circle;
+pub mod euclidean;
+pub mod grassmann;
+pub mod integrator;
+pub mod manifold;
+pub mod optimizer;
+pub mod product;
+pub mod spd;
+pub mod sphere;
+pub mod stiefel;
+pub mod torus;
+
+pub use circle::CircleManifold;
+pub use euclidean::EuclideanManifold;
+pub use grassmann::GrassmannManifold;
+pub use integrator::GeodesicIntegrator;
+pub use manifold::{GeometryError, GeometryResult, ManifoldSpec, RiemannianManifold};
+pub use optimizer::{RiemannianLBFGS, RiemannianObjective, RiemannianTrustRegion};
+pub use product::ProductManifold;
+pub use spd::SpdManifold;
+pub use sphere::SphereManifold;
+pub use stiefel::StiefelManifold;
+pub use torus::TorusManifold;

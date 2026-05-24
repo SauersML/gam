@@ -1960,6 +1960,13 @@ impl<'a> GamWorkingModel<'a> {
                     .require_supported()
                     .map_err(EstimationError::InvalidInput)?;
                 gpu_decision.log();
+                if crate::solver::gpu::cuda_selected() {
+                    return crate::solver::gpu::pirls_gpu::weighted_crossprod_gpu(
+                        x_dense.view(),
+                        weights.view(),
+                    )
+                    .map_err(EstimationError::InvalidInput);
+                }
                 if weights.iter().any(|&w| w < 0.0) {
                     // Observed-information assembly may have signed row
                     // weights.  Use Xᵀ(WX) exactly; never sqrt/clip.
@@ -3089,9 +3096,27 @@ fn solve_newton_direction_dense_with_factor(
         *direction_out = Array1::zeros(gradient.len());
     }
 
-    // No device Cholesky backend is registered in this build, so this routine
-    // executes entirely on the CPU stable solver path.
-    let cpu_route = String::from("CPU stable solver (no device Cholesky backend registered)");
+    if crate::solver::gpu::cuda_selected() {
+        let rhs = Array2::from_shape_vec((p, 1), gradient.to_vec()).map_err(|e| {
+            EstimationError::InvalidInput(format!("CUDA PIRLS RHS layout failed: {e}"))
+        })?;
+        let (solved, _) =
+            crate::solver::gpu::pirls_gpu::cholesky_solve_gpu(hessian.view(), rhs.view())
+                .map_err(EstimationError::InvalidInput)?;
+        direction_out.assign(&solved.column(0));
+        direction_out.mapv_inplace(|v| -v);
+        if array1_is_finite(direction_out) {
+            log::info!(
+                "[STAGE] PIRLS dense newton solve backend=CUDA p={} flops~{} elapsed={:.3}s route=\"cuSOLVER potrf/potrs\"",
+                p,
+                (p as u64).saturating_mul((p as u64).saturating_mul(p as u64)) / 3,
+                dense_solve_start.elapsed().as_secs_f64(),
+            );
+            return Ok(None);
+        }
+    }
+
+    let cpu_route = String::from("CPU stable solver");
 
     let factor = StableSolver::new("pirls newton direction")
         .factorize(hessian)
@@ -5008,8 +5033,16 @@ where
                             solve_options.streaming_chunk_size = arrow_cfg.streaming_chunk_size;
                             solve_options.trust_region.radius = arrow_cfg.trust_region_radius;
                             let latent_snapshot = arrow_cfg.snapshot_t.as_ref()();
-                            match arrow_system.solve_with_options(0.0, loop_lambda, &solve_options)
-                            {
+                            let arrow_solve_result = if crate::solver::gpu::cuda_selected() {
+                                crate::solver::gpu::arrow_schur_gpu::solve_arrow_newton_step_gpu(
+                                    &arrow_system,
+                                    0.0,
+                                    loop_lambda,
+                                )
+                            } else {
+                                arrow_system.solve_with_options(0.0, loop_lambda, &solve_options)
+                            };
+                            match arrow_solve_result {
                                 Ok((delta_t, delta_beta)) => {
                                     // Apply the latent half of the joint
                                     // trial before screening β + Δβ so the

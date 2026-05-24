@@ -266,6 +266,8 @@ def sae_manifold_fit(
         raise ValueError(f"d_atom must be non-negative, got {d_atom}")
     if assignment not in {"ibp", "softmax", "topk", "jumprelu", "gated"}:
         raise ValueError("assignment must be 'ibp', 'softmax', 'topk', 'jumprelu', or 'gated'")
+    if top_k is not None and (top_k <= 0 or top_k > K):
+        raise ValueError(f"top_k must be in [1, K]; got top_k={top_k}, K={K}")
     topology_name = _resolve_public_topology(atom_topology, topology_selector)
     basis = _basis_for_public_topology(topology_name, d_atom)
     retraction = _retraction_for_public_topology(topology_name, d_atom)
