@@ -9,8 +9,9 @@
 
 use gam::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-    BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, PeriodicBSplineBasisSpec,
-    SphereMethod, SphericalSplineBasisSpec, build_bspline_basis_1d, build_spherical_spline_basis,
+    BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, OneDimensionalBoundary,
+    PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec, build_bspline_basis_1d,
+    build_spherical_spline_basis,
     create_cyclic_bspline_basis_dense, create_cyclic_difference_penalty_matrix,
     fit_periodic_bspline_curve, periodic_bspline_first_derivative_nd,
     spherical_wahba_kernel_matrix,
@@ -250,6 +251,7 @@ fn boundary_conditioned_bspline_drops_dimension_correctly_and_scales() {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions {
                 left: BSplineEndpointBoundaryCondition::Anchored { value: 0.0 },
                 right: BSplineEndpointBoundaryCondition::Clamped,

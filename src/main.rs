@@ -8109,12 +8109,8 @@ fn smooth_basiswarning_family_rank(term: &SmoothTermSpec) -> u8 {
         SmoothBasisSpec::Matern { .. } => 4,
         SmoothBasisSpec::Duchon { .. } => 5,
         SmoothBasisSpec::Pca { .. } => 6,
-        SmoothBasisSpec::ByVariable { inner, .. } => {
-            smooth_basiswarning_family_rank(&SmoothTermSpec {
-                name: term.name.clone(),
-                basis: (**inner).clone(),
-                shape: term.shape,
-            })
+        SmoothBasisSpec::BySmooth { .. } | SmoothBasisSpec::FactorSmooth { .. } => {
+            panic!("BySmooth/FactorSmooth not handled here yet")
         }
     }
 }
