@@ -253,6 +253,16 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     fn warm_up_directional_caches(&self) -> Result<(), String> {
         Ok(())
     }
+
+    /// Optional BLAS-3 Jacobian-action fast path: returns `Jᵢ · F` as an
+    /// `(n_rows × stride)` dense matrix when the kernel can produce one
+    /// (typically when the underlying design exposes a contiguous dense
+    /// `Array2`). The default returns `None`, in which case generic
+    /// per-row `jacobian_action` is used.
+    fn jacobian_action_matrix(&self, factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
+        drop(factor);
+        None
+    }
 }
 
 // ── Cache ────────────────────────────────────────────────────────────
