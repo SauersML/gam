@@ -292,7 +292,10 @@ pub trait AnalyticPenalty: Send + Sync {
 
     /// Diagonal of the Hessian `diag(∂²P/∂target²)` when the Hessian is
     /// block-diagonal. Returns `None` for penalties whose Hessian is dense
-    /// (Isometry); those implement [`Self::hvp`] instead.
+    /// (Isometry); those implement [`Self::hvp`] instead. The default
+    /// signals "no closed-form diagonal" by returning `None` for any
+    /// non-empty target — concrete penalties either override with their
+    /// own analytic diagonal or rely on the matrix-free `hvp` path.
     fn hessian_diag(
         &self,
         target: ArrayView1<'_, f64>,
@@ -302,7 +305,11 @@ pub trait AnalyticPenalty: Send + Sync {
             rho.iter().all(|value| value.is_finite()),
             "analytic-penalty rho must be finite"
         );
-        unavailable_hessian_diag(target.len())
+        if target.is_empty() {
+            Some(Array1::zeros(0))
+        } else {
+            None
+        }
     }
 
     /// Hessian-vector product `H v = (∂²P/∂target²) v`. Default implementation
@@ -374,14 +381,6 @@ pub trait AnalyticPenalty: Send + Sync {
             iter < 1_000_000,
             "apply_schedule received implausible outer iteration {iter}",
         );
-    }
-}
-
-fn unavailable_hessian_diag(len: usize) -> Option<Array1<f64>> {
-    if len == 0 {
-        Some(Array1::zeros(0))
-    } else {
-        None
     }
 }
 
@@ -1532,7 +1531,15 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
             0,
             "softmax entropy target length must be divisible by k_atoms"
         );
-        unavailable_hessian_diag(target.len())
+        // Softmax entropy is dense-Hessian: no closed-form diagonal —
+        // callers route through `hvp` instead. Signal that with `None`
+        // for any non-empty target; size-0 target still returns the
+        // canonical empty diagonal so callers can short-circuit.
+        if target.is_empty() {
+            Some(Array1::zeros(0))
+        } else {
+            None
+        }
     }
 
     fn hvp(
