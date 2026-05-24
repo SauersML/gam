@@ -103,8 +103,7 @@ use gam::term_builder::{
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{
     InverseLink, LikelihoodFamily, LikelihoodScaleMetadata, LikelihoodSpec, LinkComponent,
-    LinkFunction, LogLikelihoodNormalization, MixtureLinkSpec, ResponseFamily, SasLinkSpec,
-    WigglePenaltyConfig,
+    LinkFunction, LogLikelihoodNormalization, MixtureLinkSpec, SasLinkSpec, WigglePenaltyConfig,
 };
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
@@ -728,34 +727,6 @@ fn legacy_family_to_spec(family: LikelihoodFamily) -> LikelihoodSpec {
              callers must source InverseLink state explicitly"
         )
     })
-}
-
-/// Total mapping `LikelihoodSpec -> LikelihoodFamily` for the saved-model and
-/// downstream-API boundaries that still consume the flat legacy enum. Mirrors
-/// `inference::model::likelihood_family_from_spec`. Every `(response, link)`
-/// combination produced by fitting corresponds to exactly one legacy variant.
-fn spec_to_legacy_family(spec: &LikelihoodSpec) -> LikelihoodFamily {
-    match (&spec.response, &spec.link) {
-        (ResponseFamily::Gaussian, _) => LikelihoodFamily::GaussianIdentity,
-        (ResponseFamily::Poisson, _) => LikelihoodFamily::PoissonLog,
-        (ResponseFamily::Tweedie { p }, _) => LikelihoodFamily::Tweedie { p: *p },
-        (ResponseFamily::NegativeBinomial { theta }, _) => {
-            LikelihoodFamily::NegativeBinomial { theta: *theta }
-        }
-        (ResponseFamily::Beta { phi }, _) => LikelihoodFamily::BetaLogit { phi: *phi },
-        (ResponseFamily::Gamma, _) => LikelihoodFamily::GammaLog,
-        (ResponseFamily::RoystonParmar, _) => LikelihoodFamily::RoystonParmar,
-        (ResponseFamily::Binomial, link) => match link {
-            InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
-            InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
-            InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
-            InverseLink::Standard(_) => LikelihoodFamily::BinomialLogit,
-            InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
-            InverseLink::Sas(_) => LikelihoodFamily::BinomialSas,
-            InverseLink::BetaLogistic(_) => LikelihoodFamily::BinomialBetaLogistic,
-            InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
-        },
-    }
 }
 
 struct CliFirthValidation<'a> {
