@@ -4541,6 +4541,171 @@ fn build_factor_smooth_basis(
     })
 }
 
+fn build_periodic_fourier_margin(
+    x: ArrayView1<'_, f64>,
+    period: f64,
+    requested_cols: usize,
+    penalty_order: usize,
+) -> Result<(Array2<f64>, Array2<f64>, Array1<f64>), BasisError> {
+    if !period.is_finite() || period <= 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic tensor margin requires finite positive period, got {period}"
+        )));
+    }
+    let q = requested_cols.max(3);
+    let harmonics = q / 2;
+    let has_nyquist_cos = q % 2 == 0;
+    let mut basis = Array2::<f64>::zeros((x.len(), q));
+    basis.column_mut(0).fill(1.0);
+    for (i, &xi) in x.iter().enumerate() {
+        let angle = 2.0 * std::f64::consts::PI * xi / period;
+        let mut col = 1usize;
+        for h in 1..=harmonics {
+            if col >= q {
+                break;
+            }
+            basis[[i, col]] = (h as f64 * angle).cos();
+            col += 1;
+            if col >= q {
+                break;
+            }
+            basis[[i, col]] = (h as f64 * angle).sin();
+            col += 1;
+        }
+        if has_nyquist_cos && q > 1 {
+            basis[[i, q - 1]] = (harmonics as f64 * angle).cos();
+        }
+    }
+    let mut penalty = Array2::<f64>::zeros((q, q));
+    let order = penalty_order.max(1) as i32;
+    let mut col = 1usize;
+    for h in 1..=harmonics {
+        let w = (h as f64).powi(2 * order);
+        if col < q {
+            penalty[[col, col]] = w;
+            col += 1;
+        }
+        if col < q {
+            penalty[[col, col]] = w;
+            col += 1;
+        }
+    }
+    if has_nyquist_cos && q > 1 {
+        penalty[[q - 1, q - 1]] = (harmonics as f64).powi(2 * order);
+    }
+    let knots = Array1::linspace(0.0, period, q + 1);
+    Ok((basis, penalty, knots))
+}
+
+fn tensor_product_design_from_sparse_marginals(
+    marginal_sparse: &[&SparseColMat<usize, f64>],
+) -> Result<SparseColMat<usize, f64>, BasisError> {
+    if marginal_sparse.is_empty() {
+        return Err(BasisError::InvalidInput(
+            "TensorBSpline requires at least one marginal basis".to_string(),
+        ));
+    }
+    let n = marginal_sparse[0].nrows();
+    for (i, m) in marginal_sparse.iter().enumerate().skip(1) {
+        if m.nrows() != n {
+            return Err(BasisError::DimensionMismatch(format!(
+                "tensor sparse marginal row mismatch at dim {i}: expected {n}, got {}",
+                m.nrows()
+            )));
+        }
+    }
+    let dims: Vec<usize> = marginal_sparse.iter().map(|m| m.ncols()).collect();
+    let total_cols = dims.iter().try_fold(1usize, |acc, &q| {
+        acc.checked_mul(q)
+            .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))
+    })?;
+    let mut strides = vec![1usize; dims.len()];
+    for d in (0..dims.len().saturating_sub(1)).rev() {
+        strides[d] = strides[d + 1]
+            .checked_mul(dims[d + 1])
+            .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))?;
+    }
+
+    use faer::sparse::SparseRowMat;
+    let csrs: Vec<SparseRowMat<usize, f64>> = marginal_sparse
+        .iter()
+        .enumerate()
+        .map(|(d, m)| {
+            m.as_ref().to_row_major().map_err(|e| {
+                BasisError::SparseCreation(format!(
+                    "tensor sparse marginal {d} CSR conversion failed: {e:?}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let row_ptrs: Vec<&[usize]> = csrs.iter().map(|c| c.symbolic().row_ptr()).collect();
+    let col_idxs: Vec<&[usize]> = csrs.iter().map(|c| c.symbolic().col_idx()).collect();
+    let vals: Vec<&[f64]> = csrs.iter().map(|c| c.val()).collect();
+
+    use rayon::prelude::*;
+    const CHUNK: usize = 1024;
+    let num_chunks = n.div_ceil(CHUNK);
+    let per_chunk: Vec<Vec<Triplet<usize, usize, f64>>> = (0..num_chunks)
+        .into_par_iter()
+        .map(|chunk_idx| {
+            let row_start = chunk_idx * CHUNK;
+            let row_end = (row_start + CHUNK).min(n);
+            let mut chunk_triplets = Vec::<Triplet<usize, usize, f64>>::new();
+            let mut cur_cols = Vec::<usize>::with_capacity(64);
+            let mut cur_vals = Vec::<f64>::with_capacity(64);
+            let mut next_cols = Vec::<usize>::with_capacity(64);
+            let mut next_vals = Vec::<f64>::with_capacity(64);
+            for i in row_start..row_end {
+                cur_cols.clear();
+                cur_vals.clear();
+                cur_cols.push(0);
+                cur_vals.push(1.0);
+                let mut row_is_zero = false;
+                for d in 0..dims.len() {
+                    let row_start_d = row_ptrs[d][i];
+                    let row_end_d = row_ptrs[d][i + 1];
+                    if row_start_d == row_end_d {
+                        row_is_zero = true;
+                        break;
+                    }
+                    let stride = strides[d];
+                    next_cols.clear();
+                    next_vals.clear();
+                    next_cols.reserve(cur_cols.len() * (row_end_d - row_start_d));
+                    next_vals.reserve(cur_vals.len() * (row_end_d - row_start_d));
+                    for (&prev_col, &prev_val) in cur_cols.iter().zip(cur_vals.iter()) {
+                        for ptr in row_start_d..row_end_d {
+                            let cj = col_idxs[d][ptr];
+                            let vj = vals[d][ptr];
+                            next_cols.push(prev_col + cj * stride);
+                            next_vals.push(prev_val * vj);
+                        }
+                    }
+                    std::mem::swap(&mut cur_cols, &mut next_cols);
+                    std::mem::swap(&mut cur_vals, &mut next_vals);
+                }
+                if row_is_zero {
+                    continue;
+                }
+                for (&col, &val) in cur_cols.iter().zip(cur_vals.iter()) {
+                    chunk_triplets.push(Triplet::new(i, col, val));
+                }
+            }
+            chunk_triplets
+        })
+        .collect();
+    let total_nnz: usize = per_chunk.iter().map(Vec::len).sum();
+    let mut triplets = Vec::<Triplet<usize, usize, f64>>::with_capacity(total_nnz);
+    for chunk in per_chunk {
+        triplets.extend(chunk);
+    }
+    SparseColMat::try_new_from_triplets(n, total_cols, &triplets).map_err(|e| {
+        BasisError::SparseCreation(format!(
+            "failed to assemble sparse tensor product design: {e:?}"
+        ))
+    })
+}
+
 fn build_tensor_bspline_basis(
     data: ArrayView2<'_, f64>,
     feature_cols: &[usize],
@@ -8993,7 +9158,7 @@ fn extract_spatial_operator_runtime_caches(
                             centers.view(),
                             None,
                             *length_scale,
-                            *power,
+                            *power as f64,
                             *nullspace_order,
                             aniso_log_scales.as_deref(),
                             identifiability_transform.as_ref().map(|z| z.view()),
@@ -13717,7 +13882,7 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
             latent.clone(),
             std::sync::Arc::new(centers.clone()),
             *length_scale,
-            *power,
+            *power as f64,
             *nullspace_order,
             identifiability_transform.clone(),
         )

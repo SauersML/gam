@@ -1348,7 +1348,7 @@ impl ArrowFactorCache {
     /// `2 Σ log L_ii`.
     pub fn arrow_log_det(&self) -> (f64, Option<f64>) {
         let mut log_det_tt = 0.0_f64;
-        for l in &self.htt_factors {
+        for l in self.htt_factors.iter() {
             for i in 0..l.nrows() {
                 log_det_tt += l[[i, i]].ln();
             }
