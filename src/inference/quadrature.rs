@@ -236,7 +236,7 @@ impl IntegratedExpectationMode {
     /// form. Lets callers fold over a stream of modes and keep the *worst*
     /// one with `a.rank().max(b.rank())`.
     #[inline]
-    pub fn rank(self) -> u8 {
+    pub const fn rank(self) -> u8 {
         match self {
             Self::ExactClosedForm => 0,
             Self::ExactSpecialFunction => 1,

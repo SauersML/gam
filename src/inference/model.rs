@@ -200,7 +200,7 @@ pub struct TransformationScoreCalibration {
     pub clip_eps: f64,
 }
 
-fn default_transformation_score_pit_clip_eps() -> f64 {
+const fn default_transformation_score_pit_clip_eps() -> f64 {
     TRANSFORMATION_SCORE_PIT_CLIP_EPS
 }
 

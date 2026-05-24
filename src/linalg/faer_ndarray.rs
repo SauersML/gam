@@ -1435,6 +1435,7 @@ pub struct FaerArrayView<'a> {
 }
 
 impl<'a> FaerArrayView<'a> {
+    #[inline]
     pub fn new<S: Data<Elem = f64>>(array: &'a ArrayBase<S, Ix2>) -> Self {
         let (rows, cols) = array.dim();
         let strides = array.strides();
@@ -1502,6 +1503,7 @@ pub struct FaerColView<'a> {
 }
 
 impl<'a> FaerColView<'a> {
+    #[inline]
     pub fn new<S: Data<Elem = f64>>(array: &'a ArrayBase<S, Ix1>) -> Self {
         let len = array.len();
         let stride = array.strides()[0];

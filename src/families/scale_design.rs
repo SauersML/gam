@@ -167,6 +167,7 @@ enum ScaleDesignMatrixRef<'a> {
 }
 
 impl ScaleDesignMatrixRef<'_> {
+    #[inline]
     fn nrows(self) -> usize {
         match self {
             Self::Dense(matrix) => matrix.nrows(),
@@ -174,6 +175,7 @@ impl ScaleDesignMatrixRef<'_> {
         }
     }
 
+    #[inline]
     fn ncols(self) -> usize {
         match self {
             Self::Dense(matrix) => matrix.ncols(),

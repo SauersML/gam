@@ -74,16 +74,6 @@ pub(crate) fn clear_outer_ift_residual_energy_for_fit() {
     OUTER_IFT_RESIDUAL_ENERGY_ITER.store(0, Ordering::Relaxed);
 }
 
-pub(crate) fn cached_ift_residual_energy_for_outer_theta(
-    theta: &Array1<f64>,
-) -> Option<(f64, u64)> {
-    let key = super::cache::sanitized_rhokey(theta)?;
-    let (energy, iter) = *outer_ift_residual_energy_cache().lock().ok()?.get(&key)?;
-    (energy.is_finite() && energy >= 0.0)
-        .then_some(energy)
-        .map(|energy| (energy, iter))
-}
-
 fn store_ift_residual_energy_for_outer_theta(theta: &Array1<f64>, energy: Option<f64>) {
     let Some(key) = super::cache::sanitized_rhokey(theta) else {
         return;
