@@ -8508,6 +8508,7 @@ impl CustomFamily for TransformationNormalFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        drop(specs);
         if block_states.len() != 1 {
             return Err(TransformationNormalError::InvalidInput {
                 reason: format!(
