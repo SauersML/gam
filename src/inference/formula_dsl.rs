@@ -1736,7 +1736,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
-            "smooth" | "s" | "cyclic" | "periodic" | "cc" | "cp" => {
+            "smooth" | "s" | "cyclic" | "periodic" | "cc" | "cp" | "fs" | "sz" => {
                 if vars.is_empty() {
                     return Err(FormulaDslError::InvalidArgument {
                         reason: format!("smooth()/s() requires at least one variable: {raw}"),
@@ -1745,6 +1745,9 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 }
                 if matches!(name.as_str(), "cyclic" | "periodic" | "cc" | "cp") {
                     options.insert("type".to_string(), "cyclic".to_string());
+                }
+                if matches!(name.as_str(), "fs" | "sz") {
+                    options.insert("bs".to_string(), name.clone());
                 }
                 return Ok(ParsedTerm::Smooth {
                     label: raw.to_string(),
@@ -1918,12 +1921,9 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                 });
             }
             _ => {
-                return Err(FormulaDslError::UnknownIdentifier {
-                    reason: format!(
-                        "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth() / s(), cyclic() / periodic() / cc() / cp(), thinplate() / tps(), tensor() / te(), group() / re(), sphere() / sos() / spherical(), matern(), duchon(), pca(), bc() / boundary(), fs(), sz(), linkwiggle(), timewiggle(), link(), survmodel(), logslope()"
-                    ),
-                }
-                .into());
+                return Err(format!(
+                    "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth() / s(), fs(), sz(), cyclic() / periodic() / cc() / cp(), thinplate() / tps(), tensor() / te(), group() / re(), sphere() / sos() / spherical(), matern(), duchon(), linkwiggle(), timewiggle(), link(), survmodel()"
+                ));
             }
         }
     }
