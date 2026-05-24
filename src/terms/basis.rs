@@ -3981,8 +3981,16 @@ impl LatentCoordDesignDerivative {
         flat_axis: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, BasisError> {
-        assert!(flat_axis < self.n_axes());
-        assert_eq!(u.len(), self.p_out());
+        assert!(
+            flat_axis < self.n_axes(),
+            "latent-coordinate derivative flat axis out of bounds in forward_mul_axis: flat_axis={flat_axis}, n_axes={}",
+            self.n_axes()
+        );
+        assert_eq!(
+            u.len(),
+            self.p_out(),
+            "latent-coordinate derivative coefficient length mismatch in forward_mul_axis"
+        );
         let (row, axis) = self.row_axis(flat_axis);
         let value = match &self.basis {
             LatentCoordDesignDerivativeBasis::Radial { centers, .. } => {
@@ -4014,8 +4022,16 @@ impl LatentCoordDesignDerivative {
         flat_axis: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, BasisError> {
-        assert!(flat_axis < self.n_axes());
-        assert_eq!(v.len(), self.n_data());
+        assert!(
+            flat_axis < self.n_axes(),
+            "latent-coordinate derivative flat axis out of bounds in transpose_mul_axis: flat_axis={flat_axis}, n_axes={}",
+            self.n_axes()
+        );
+        assert_eq!(
+            v.len(),
+            self.n_data(),
+            "latent-coordinate derivative row-adjoint length mismatch in transpose_mul_axis"
+        );
         let (row, axis) = self.row_axis(flat_axis);
         let scale = v[row];
         match &self.basis {
@@ -4042,7 +4058,11 @@ impl LatentCoordDesignDerivative {
     }
 
     pub(crate) fn materialize_axis(&self, flat_axis: usize) -> Result<Array2<f64>, BasisError> {
-        assert!(flat_axis < self.n_axes());
+        assert!(
+            flat_axis < self.n_axes(),
+            "latent-coordinate derivative flat axis out of bounds in materialize_axis: flat_axis={flat_axis}, n_axes={}",
+            self.n_axes()
+        );
         let (row, axis) = self.row_axis(flat_axis);
         let projected = match &self.basis {
             LatentCoordDesignDerivativeBasis::Radial { centers, .. } => {
@@ -4092,11 +4112,48 @@ impl ImplicitDesignPsiDerivative {
         n_poly: usize,
         n_axes: usize,
     ) -> Self {
-        assert_eq!(phi_values.len(), n * n_knots);
-        assert_eq!(q_values.len(), n * n_knots);
-        assert_eq!(t_values.len(), n * n_knots);
-        assert_eq!(axis_components.nrows(), n * n_knots);
-        assert_eq!(axis_components.ncols(), n_axes);
+        assert_eq!(
+            phi_values.len(),
+            n * n_knots,
+            "implicit psi derivative phi length mismatch: expected n*n_knots={}*{}={}, got {}",
+            n,
+            n_knots,
+            n * n_knots,
+            phi_values.len()
+        );
+        assert_eq!(
+            q_values.len(),
+            n * n_knots,
+            "implicit psi derivative q length mismatch: expected n*n_knots={}*{}={}, got {}",
+            n,
+            n_knots,
+            n * n_knots,
+            q_values.len()
+        );
+        assert_eq!(
+            t_values.len(),
+            n * n_knots,
+            "implicit psi derivative t length mismatch: expected n*n_knots={}*{}={}, got {}",
+            n,
+            n_knots,
+            n * n_knots,
+            t_values.len()
+        );
+        assert_eq!(
+            axis_components.nrows(),
+            n * n_knots,
+            "implicit psi derivative axis-component row mismatch: expected n*n_knots={}*{}={}, got {}",
+            n,
+            n_knots,
+            n * n_knots,
+            axis_components.nrows()
+        );
+        assert_eq!(
+            axis_components.ncols(),
+            n_axes,
+            "implicit psi derivative axis-component column mismatch: expected n_axes={n_axes}, got {}",
+            axis_components.ncols()
+        );
         Self {
             phi_values,
             axis_components,
@@ -4122,7 +4179,11 @@ impl ImplicitDesignPsiDerivative {
     fn with_axis_combinations(mut self, axis_combinations: Vec<Vec<(usize, f64)>>) -> Self {
         for combo in &axis_combinations {
             for &(raw_axis, _) in combo {
-                assert!(raw_axis < self.n_axes);
+                assert!(
+                    raw_axis < self.n_axes,
+                    "transformed psi-axis combination references raw axis out of bounds: raw_axis={raw_axis}, n_axes={}",
+                    self.n_axes
+                );
             }
         }
         self.axis_combinations = Some(axis_combinations);
@@ -4624,8 +4685,16 @@ impl ImplicitDesignPsiDerivative {
         axis: usize,
         v: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
-        assert!(axis < self.n_axes());
-        assert_eq!(v.len(), self.n);
+        assert!(
+            axis < self.n_axes(),
+            "implicit psi first transpose axis out of bounds: axis={axis}, n_axes={}",
+            self.n_axes()
+        );
+        assert_eq!(
+            v.len(),
+            self.n,
+            "implicit psi first transpose row-adjoint length mismatch"
+        );
         if self.axis_combinations.is_some() {
             let combo = self.transformed_axis_combination(axis);
             let combo_sum = Self::transformed_combo_sum(combo);
@@ -4675,8 +4744,16 @@ impl ImplicitDesignPsiDerivative {
     ///   result_i = Σ_j q_{ij} · s_{d,ij} · u_knot_j
     /// where u_knot = Z · u_smooth (unprojected back to knot space).
     pub fn forward_mul(&self, axis: usize, u: &ArrayView1<f64>) -> Result<Array1<f64>, BasisError> {
-        assert!(axis < self.n_axes());
-        assert_eq!(u.len(), self.p_out());
+        assert!(
+            axis < self.n_axes(),
+            "implicit psi first forward axis out of bounds: axis={axis}, n_axes={}",
+            self.n_axes()
+        );
+        assert_eq!(
+            u.len(),
+            self.p_out(),
+            "implicit psi first forward coefficient length mismatch"
+        );
         let u_knot = self.unproject(u);
         if self.axis_combinations.is_some() {
             let combo = self.transformed_axis_combination(axis);
@@ -4811,8 +4888,16 @@ impl ImplicitDesignPsiDerivative {
         axis: usize,
         v: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
-        assert!(axis < self.n_axes());
-        assert_eq!(v.len(), self.n);
+        assert!(
+            axis < self.n_axes(),
+            "implicit psi second diagonal transpose axis out of bounds: axis={axis}, n_axes={}",
+            self.n_axes()
+        );
+        assert_eq!(
+            v.len(),
+            self.n,
+            "implicit psi second diagonal transpose row-adjoint length mismatch"
+        );
         if self.axis_combinations.is_some() {
             let combo = self.transformed_axis_combination(axis);
             let combo_sum = Self::transformed_combo_sum(combo);
@@ -4875,10 +4960,25 @@ impl ImplicitDesignPsiDerivative {
         axis_e: usize,
         v: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
-        assert!(axis_d < self.n_axes());
-        assert!(axis_e < self.n_axes());
-        assert_ne!(axis_d, axis_e);
-        assert_eq!(v.len(), self.n);
+        assert!(
+            axis_d < self.n_axes(),
+            "implicit psi second cross transpose first axis out of bounds: axis_d={axis_d}, n_axes={}",
+            self.n_axes()
+        );
+        assert!(
+            axis_e < self.n_axes(),
+            "implicit psi second cross transpose second axis out of bounds: axis_e={axis_e}, n_axes={}",
+            self.n_axes()
+        );
+        assert_ne!(
+            axis_d, axis_e,
+            "implicit psi second cross transpose requires distinct axes: axis_d={axis_d}, axis_e={axis_e}"
+        );
+        assert_eq!(
+            v.len(),
+            self.n,
+            "implicit psi second cross transpose row-adjoint length mismatch"
+        );
         if self.axis_combinations.is_some() {
             let combo_d = self.transformed_axis_combination(axis_d);
             let combo_e = self.transformed_axis_combination(axis_e);
@@ -4947,8 +5047,16 @@ impl ImplicitDesignPsiDerivative {
         axis: usize,
         u: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
-        assert!(axis < self.n_axes());
-        assert_eq!(u.len(), self.p_out());
+        assert!(
+            axis < self.n_axes(),
+            "implicit psi second diagonal forward axis out of bounds: axis={axis}, n_axes={}",
+            self.n_axes()
+        );
+        assert_eq!(
+            u.len(),
+            self.p_out(),
+            "implicit psi second diagonal forward coefficient length mismatch"
+        );
         let u_knot = self.unproject(u);
         if self.axis_combinations.is_some() {
             let combo = self.transformed_axis_combination(axis);
@@ -5069,10 +5177,25 @@ impl ImplicitDesignPsiDerivative {
         axis_e: usize,
         u: &ArrayView1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
-        assert!(axis_d < self.n_axes());
-        assert!(axis_e < self.n_axes());
-        assert_ne!(axis_d, axis_e);
-        assert_eq!(u.len(), self.p_out());
+        assert!(
+            axis_d < self.n_axes(),
+            "implicit psi second cross forward first axis out of bounds: axis_d={axis_d}, n_axes={}",
+            self.n_axes()
+        );
+        assert!(
+            axis_e < self.n_axes(),
+            "implicit psi second cross forward second axis out of bounds: axis_e={axis_e}, n_axes={}",
+            self.n_axes()
+        );
+        assert_ne!(
+            axis_d, axis_e,
+            "implicit psi second cross forward requires distinct axes: axis_d={axis_d}, axis_e={axis_e}"
+        );
+        assert_eq!(
+            u.len(),
+            self.p_out(),
+            "implicit psi second cross forward coefficient length mismatch"
+        );
         let u_knot = self.unproject(u);
         if self.axis_combinations.is_some() {
             let combo_d = self.transformed_axis_combination(axis_d);
@@ -5198,7 +5321,11 @@ impl ImplicitDesignPsiDerivative {
     /// This is used when the dense matrix is needed temporarily (e.g., for
     /// HyperCoord construction) while avoiding simultaneous storage of all D axes.
     pub fn materialize_first(&self, axis: usize) -> Result<Array2<f64>, BasisError> {
-        assert!(axis < self.n_axes());
+        assert!(
+            axis < self.n_axes(),
+            "implicit psi first materialization axis out of bounds: axis={axis}, n_axes={}",
+            self.n_axes()
+        );
         if self.enforces_dense_materialization_budget() {
             assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes());
         }
@@ -5255,7 +5382,11 @@ impl ImplicitDesignPsiDerivative {
 
     /// Materialize the full (n × p_out) second diagonal derivative matrix for axis d.
     pub fn materialize_second_diag(&self, axis: usize) -> Result<Array2<f64>, BasisError> {
-        assert!(axis < self.n_axes());
+        assert!(
+            axis < self.n_axes(),
+            "implicit psi second diagonal materialization axis out of bounds: axis={axis}, n_axes={}",
+            self.n_axes()
+        );
         if self.enforces_dense_materialization_budget() {
             assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes());
         }
@@ -5332,9 +5463,20 @@ impl ImplicitDesignPsiDerivative {
         axis_d: usize,
         axis_e: usize,
     ) -> Result<Array2<f64>, BasisError> {
-        assert!(axis_d < self.n_axes());
-        assert!(axis_e < self.n_axes());
-        assert_ne!(axis_d, axis_e);
+        assert!(
+            axis_d < self.n_axes(),
+            "implicit psi second cross materialization first axis out of bounds: axis_d={axis_d}, n_axes={}",
+            self.n_axes()
+        );
+        assert!(
+            axis_e < self.n_axes(),
+            "implicit psi second cross materialization second axis out of bounds: axis_e={axis_e}, n_axes={}",
+            self.n_axes()
+        );
+        assert_ne!(
+            axis_d, axis_e,
+            "implicit psi second cross materialization requires distinct axes: axis_d={axis_d}, axis_e={axis_e}"
+        );
         if self.enforces_dense_materialization_budget() {
             assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes());
         }
@@ -5527,7 +5669,11 @@ impl ImplicitDesignPsiDerivative {
         axis: usize,
         rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, BasisError> {
-        assert!(axis < self.n_axes());
+        assert!(
+            axis < self.n_axes(),
+            "implicit psi first row chunk axis out of bounds: axis={axis}, n_axes={}",
+            self.n_axes()
+        );
         let c = self.psi_scale_share;
         if self.axis_combinations.is_some() {
             let combo = self.transformed_axis_combination(axis);
@@ -5565,7 +5711,11 @@ impl ImplicitDesignPsiDerivative {
         axis: usize,
         rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, BasisError> {
-        assert!(axis < self.n_axes());
+        assert!(
+            axis < self.n_axes(),
+            "implicit psi first raw row chunk axis out of bounds: axis={axis}, n_axes={}",
+            self.n_axes()
+        );
         let c = self.psi_scale_share;
         if self.axis_combinations.is_some() {
             let combo = self.transformed_axis_combination(axis);
@@ -5597,7 +5747,11 @@ impl ImplicitDesignPsiDerivative {
         axis: usize,
         rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, BasisError> {
-        assert!(axis < self.n_axes());
+        assert!(
+            axis < self.n_axes(),
+            "implicit psi second diagonal row chunk axis out of bounds: axis={axis}, n_axes={}",
+            self.n_axes()
+        );
         let c = self.psi_scale_share;
         if self.axis_combinations.is_some() {
             let combo = self.transformed_axis_combination(axis);
@@ -5637,9 +5791,20 @@ impl ImplicitDesignPsiDerivative {
         axis_e: usize,
         rows: std::ops::Range<usize>,
     ) -> Result<Array2<f64>, BasisError> {
-        assert!(axis_d < self.n_axes());
-        assert!(axis_e < self.n_axes());
-        assert_ne!(axis_d, axis_e);
+        assert!(
+            axis_d < self.n_axes(),
+            "implicit psi second cross row chunk first axis out of bounds: axis_d={axis_d}, n_axes={}",
+            self.n_axes()
+        );
+        assert!(
+            axis_e < self.n_axes(),
+            "implicit psi second cross row chunk second axis out of bounds: axis_e={axis_e}, n_axes={}",
+            self.n_axes()
+        );
+        assert_ne!(
+            axis_d, axis_e,
+            "implicit psi second cross row chunk requires distinct axes: axis_d={axis_d}, axis_e={axis_e}"
+        );
         let c = self.psi_scale_share;
         if self.axis_combinations.is_some() {
             let combo_d = self.transformed_axis_combination(axis_d);
@@ -5699,8 +5864,16 @@ impl ImplicitDesignPsiDerivative {
         row: usize,
         mut out: ArrayViewMut1<'_, f64>,
     ) -> Result<(), BasisError> {
-        assert!(row < self.n);
-        assert_eq!(out.len(), self.p_out());
+        assert!(
+            row < self.n,
+            "implicit psi row-vector request out of bounds: row={row}, n={}",
+            self.n
+        );
+        assert_eq!(
+            out.len(),
+            self.p_out(),
+            "implicit psi row-vector output length mismatch"
+        );
         let chunk = self.row_chunk_first(axis, row..row + 1)?;
         out.assign(&chunk.row(0));
         Ok(())
@@ -12452,7 +12625,10 @@ fn log_power_origin_limit(coeff: f64, exponent: f64, log_coeff: f64, pure_coeff:
 
 #[inline(always)]
 fn polyharmonic_log_sign(m: usize, k_dim: usize) -> f64 {
-    assert!(k_dim % 2 == 0);
+    assert!(
+        k_dim % 2 == 0,
+        "polyharmonic_log_sign requires even kernel dimension: k_dim={k_dim}, m={m}"
+    );
     (-1.0_f64).powi(m as i32 - (k_dim as i32 / 2) + 1)
 }
 
@@ -17612,7 +17788,7 @@ const EULER_MASCHERONI: f64 = 0.577_215_664_901_532_9;
 /// ψ(1) = −γ, ψ(n+1) = −γ + H_n where H_n = Σ_{j=1}^{n} 1/j.
 #[inline(always)]
 fn digamma_pos_int(n: usize) -> f64 {
-    assert!(n >= 1);
+    assert!(n >= 1, "digamma_pos_int requires n >= 1: n={n}");
     let mut h = 0.0_f64;
     for j in 1..n {
         h += 1.0 / j as f64;
@@ -21109,9 +21285,23 @@ fn create_thin_plate_spline_basis_scaledwithworkspace(
         &format!("thin_plate bending penalty (dimension={d})"),
         "thin-plate kernel and side-constraint assembly must yield a PSD penalty on the constrained subspace",
     )?;
-    assert!(omega_psd.min_eigenvalue >= -omega_psd.tolerance);
-    assert!(omega_psd.max_abs_eigenvalue.is_finite());
-    assert!(omega_psd.effective_rank <= omega_constrained.nrows());
+    assert!(
+        omega_psd.min_eigenvalue >= -omega_psd.tolerance,
+        "thin-plate constrained penalty PSD validation violated tolerance after validation: min_eigenvalue={}, tolerance={}",
+        omega_psd.min_eigenvalue,
+        omega_psd.tolerance
+    );
+    assert!(
+        omega_psd.max_abs_eigenvalue.is_finite(),
+        "thin-plate constrained penalty has non-finite max eigenvalue after validation: max_abs_eigenvalue={}",
+        omega_psd.max_abs_eigenvalue
+    );
+    assert!(
+        omega_psd.effective_rank <= omega_constrained.nrows(),
+        "thin-plate constrained penalty rank exceeds constrained rows: effective_rank={}, rows={}",
+        omega_psd.effective_rank,
+        omega_constrained.nrows()
+    );
 
     let kernel_cols = kernel_constrained.ncols();
     let total_cols = kernel_cols + poly_cols;
@@ -23915,7 +24105,10 @@ pub mod closed_form_penalty {
         debug_assert!(s >= 1, "stable_hybrid_duchon_radial: s ≥ 1");
         debug_assert!(kappa > 0.0, "stable_hybrid_duchon_radial: κ > 0");
         debug_assert!(r > 0.0, "stable_hybrid_duchon_radial: r > 0");
-        debug_assert!(max_order <= 6);
+        debug_assert!(
+            max_order <= 6,
+            "stable_hybrid_duchon_radial requires max_order <= 6: max_order={max_order}"
+        );
         debug_assert!(
             schwinger_radial_is_convergent(d, m, s),
             "stable_hybrid_duchon_radial: requires d > 4m"
@@ -24286,9 +24479,12 @@ pub mod closed_form_penalty {
         kappa_derivative_order: usize,
     ) -> Vec<f64> {
         debug_assert!(b >= 1);
-        debug_assert!(kappa > 0.0);
-        debug_assert!(r > 0.0);
-        debug_assert!(kappa_derivative_order <= 2);
+        debug_assert!(kappa > 0.0, "matern kernel derivative requires kappa > 0: kappa={kappa}");
+        debug_assert!(r > 0.0, "matern kernel derivative requires r > 0: r={r}");
+        debug_assert!(
+            kappa_derivative_order <= 2,
+            "matern kernel derivative supports kappa_derivative_order <= 2: order={kappa_derivative_order}"
+        );
 
         let mut total = vec![KahanSum::default(); max_order + 1];
         let mut coeff = 1.0_f64;
@@ -24907,10 +25103,10 @@ pub mod closed_form_penalty {
         r: f64,
         max_order: usize,
     ) -> Vec<f64> {
-        assert!(d >= 1);
-        assert!(ell >= 1);
-        assert!(kappa > 0.0);
-        assert!(r > 0.0);
+        assert!(d >= 1, "matern block requires dimension >= 1: d={d}");
+        assert!(ell >= 1, "matern block requires ell >= 1: ell={ell}");
+        assert!(kappa > 0.0, "matern block requires kappa > 0: kappa={kappa}");
+        assert!(r > 0.0, "matern block requires r > 0: r={r}");
         assert!(
             max_order <= 6,
             "matern_block_radial_derivatives: max_order ≤ 6"
@@ -25019,12 +25215,12 @@ pub mod closed_form_penalty {
     /// Riesz block `R_j^d(r) = c · r^{2j-d}` (non-log) or
     /// `c · r^{2n} · ln r` (log case `2j = d + 2n`).
     fn riesz_block_radial_derivatives(d: usize, j: f64, r: f64, max_order: usize) -> Vec<f64> {
-        assert!(d >= 1);
+        assert!(d >= 1, "riesz block requires dimension >= 1: d={d}");
         assert!(
             j.is_finite() && j >= 1.0,
             "riesz_block: need j ≥ 1, got {j}"
         );
-        assert!(r > 0.0);
+        assert!(r > 0.0, "riesz block requires r > 0: r={r}");
 
         let two_j = 2.0 * j;
         let half_d = d as f64 / 2.0;
@@ -25691,8 +25887,14 @@ pub mod closed_form_penalty {
         r: f64,
         max_order: usize,
     ) -> Vec<f64> {
-        assert!(r > 0.0);
-        assert!(max_order <= 6);
+        assert!(
+            r > 0.0,
+            "Duchon kappa partial requires positive radius: r={r}, d={d}, m={m}, s={s}, kappa={kappa}"
+        );
+        assert!(
+            max_order <= 6,
+            "Duchon kappa partial supports max_order <= 6: max_order={max_order}, d={d}, m={m}, s={s}"
+        );
         if s == 0 || kappa == 0.0 {
             // No Matérn or κ → 0 limit (Riesz pure) — both κ-independent.
             return vec![0.0_f64; max_order + 1];
@@ -25760,8 +25962,14 @@ pub mod closed_form_penalty {
         r: f64,
         max_order: usize,
     ) -> Vec<f64> {
-        assert!(r > 0.0);
-        assert!(max_order <= 6);
+        assert!(
+            r > 0.0,
+            "Duchon second kappa partial requires positive radius: r={r}, d={d}, m={m}, s={s}, kappa={kappa}"
+        );
+        assert!(
+            max_order <= 6,
+            "Duchon second kappa partial supports max_order <= 6: max_order={max_order}, d={d}, m={m}, s={s}"
+        );
         if s == 0 || kappa == 0.0 {
             return vec![0.0_f64; max_order + 1];
         }
@@ -25919,7 +26127,7 @@ pub mod closed_form_penalty {
             // SAFETY: `q` is statically restricted to `{0, 1, 2}` by the
             // public radial-kernel API (value/gradient/laplacian); this
             // arm is unreachable for in-contract callers.
-            _ => panic!("radial_g_q_partials: q must be in {{0, 1, 2}}"),
+            _ => panic!("radial_g_q_partials requires q in {{0, 1, 2}}: q={q}"),
         }
     }
 
@@ -26082,7 +26290,7 @@ pub mod closed_form_penalty {
             // SAFETY: companion to `radial_g_q_partials` — `q` is
             // statically restricted to `{0, 1, 2}` by the public radial
             // kernel API; this arm is unreachable for in-contract callers.
-            _ => panic!("radial_g_q_hessian: q must be in {{0, 1, 2}}"),
+            _ => panic!("radial_g_q_hessian requires q in {{0, 1, 2}}: q={q}"),
         }
     }
 
