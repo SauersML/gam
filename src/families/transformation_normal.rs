@@ -8106,7 +8106,8 @@ impl CustomFamily for TransformationNormalFamily {
         true
     }
 
-    fn coefficient_hessian_cost(&self, _specs: &[ParameterBlockSpec]) -> u64 {
+    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
+        drop(specs);
         // Khatri–Rao tensor design: the coefficient block is X = R ⊙ C with
         // rows length p_resp · p_cov. Two regimes:
         //
@@ -8526,9 +8527,10 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_psi_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        drop(specs);
         Ok(Some(Arc::new(TransformationNormalPsiWorkspace::new(
             self.clone(),
             block_states.to_vec(),
@@ -8558,10 +8560,11 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_psi_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        drop(specs);
         // Route through a mask-aware family clone when an outer-score
         // subsample is active. Every CTN ψ assembly site — including the
         // workspace's `compute_all_axes` (per-row reduction near line ~13916)
@@ -8594,17 +8597,20 @@ impl CustomFamily for TransformationNormalFamily {
         true
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        drop(specs);
         // CTN's SCOP coefficient-space joint Hessian is supplied as a
         // row-streaming matrix-free Hv operator.
         true
     }
 
-    fn outer_hyper_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        drop(specs);
         true
     }
 
-    fn outer_hyper_hessian_dense_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn outer_hyper_hessian_dense_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        drop(specs);
         // Dense materialization remains mathematically available through the
         // outer-HVP operator, but SCOP's primary production path is the
         // matrix-free θθ operator above.

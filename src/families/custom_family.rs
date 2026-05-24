@@ -948,9 +948,11 @@ impl ExactOuterDerivativeOrder {
 /// representation choices (dense vs operator) belong below this declaration,
 /// not in a first-order downgrade.
 pub fn exact_outer_order_from_capability(
-    _specs: &[ParameterBlockSpec],
-    _coefficient_cost: u64,
+    specs: &[ParameterBlockSpec],
+    coefficient_cost: u64,
 ) -> ExactOuterDerivativeOrder {
+    drop(specs);
+    drop(coefficient_cost);
     ExactOuterDerivativeOrder::Second
 }
 
@@ -962,8 +964,9 @@ pub fn exact_outer_order_from_capability(
 pub fn exact_outer_order_with_outer_hvp(
     specs: &[ParameterBlockSpec],
     coefficient_cost: u64,
-    _outer_hyper_hessian_hvp_available: bool,
+    outer_hyper_hessian_hvp_available: bool,
 ) -> ExactOuterDerivativeOrder {
+    drop(outer_hyper_hessian_hvp_available);
     exact_outer_order_from_capability(specs, coefficient_cost)
 }
 
@@ -1296,9 +1299,11 @@ pub trait CustomFamily {
     /// independently through `BlockwiseFitOptions::cache_session`.
     fn persistent_warm_start_fingerprint(
         &self,
-        _specs: &[ParameterBlockSpec],
-        _options: &BlockwiseFitOptions,
+        specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
     ) -> Option<String> {
+        drop(specs);
+        drop(options);
         None
     }
 
@@ -1331,8 +1336,9 @@ pub trait CustomFamily {
     fn log_likelihood_only_with_options(
         &self,
         block_states: &[ParameterBlockState],
-        _options: &BlockwiseFitOptions,
+        options: &BlockwiseFitOptions,
     ) -> Result<f64, String> {
+        drop(options);
         self.log_likelihood_only(block_states)
     }
 
@@ -1801,8 +1807,9 @@ pub trait CustomFamily {
         &self,
         states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        _options: &BlockwiseFitOptions,
+        options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        drop(options);
         self.exact_newton_joint_hessian_workspace(states, specs)
     }
 
@@ -1815,10 +1822,13 @@ pub trait CustomFamily {
     /// log-likelihood was evaluated at the same coefficient state.
     fn joint_line_search_log_likelihood_workspace(
         &self,
-        _states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
-        _options: &BlockwiseFitOptions,
+        states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
     ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
+        drop(states);
+        drop(specs);
+        drop(options);
         Ok(None)
     }
 
@@ -1851,13 +1861,19 @@ pub trait CustomFamily {
     /// the generic path handle those cases.
     fn batched_outer_gradient_terms(
         &self,
-        _block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
-        _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        _rho: &Array1<f64>,
-        _options: &BlockwiseFitOptions,
-        _hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        rho: &Array1<f64>,
+        options: &BlockwiseFitOptions,
+        hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
+        drop(block_states);
+        drop(specs);
+        drop(derivative_blocks);
+        drop(rho);
+        drop(options);
+        drop(hessian_workspace);
         Ok(None)
     }
 
@@ -1872,12 +1888,16 @@ pub trait CustomFamily {
     /// `None` leaves unsupported families on their existing exact path.
     fn batched_outer_hessian_terms(
         &self,
-        _block_states: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        _rho: &Array1<f64>,
-        _hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        rho: &Array1<f64>,
+        hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterHessianTerms>, String> {
+        drop(block_states);
+        drop(derivative_blocks);
+        drop(rho);
+        drop(hessian_workspace);
         Ok(self
             .outer_hyper_hessian_operator(specs)
             .map(|operator| BatchedOuterHessianTerms {
@@ -1889,24 +1909,28 @@ pub trait CustomFamily {
     ///
     /// Kept separate from outer hyper-Hessian capabilities so CTN/GAMLSS row
     /// operators do not accidentally advertise pairwise θθ calculus as cheap.
-    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        drop(specs);
         false
     }
 
-    fn inner_joint_workspace_gradient_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        drop(specs);
         false
     }
 
     fn inner_joint_workspace_log_likelihood_available(
         &self,
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
     ) -> bool {
+        drop(specs);
         false
     }
 
     /// True only when the family has a real profiled outer Hessian-vector
     /// product over θ = (ρ, ψ), without enumerating all θ_i θ_j pairs.
-    fn outer_hyper_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        drop(specs);
         false
     }
 
@@ -1914,7 +1938,8 @@ pub trait CustomFamily {
     /// Generic custom-family pairwise derivative paths default to dense
     /// availability; families with only inner HVP support should override this
     /// if dense θθ assembly is not a valid capability for their path.
-    fn outer_hyper_hessian_dense_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn outer_hyper_hessian_dense_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        drop(specs);
         true
     }
 
@@ -1937,8 +1962,9 @@ pub trait CustomFamily {
     /// outer-HVP operators into the same surface.
     fn outer_hyper_hessian_operator(
         &self,
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
     ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+        drop(specs);
         None
     }
 
@@ -2456,8 +2482,9 @@ pub trait CustomFamily {
         states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
         derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
-        _options: &BlockwiseFitOptions,
+        options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        drop(options);
         self.exact_newton_joint_psi_workspace(states, specs, derivs)
     }
 
@@ -3647,92 +3674,106 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn transpose_mul(
         &self,
-        _axis: usize,
+        axis: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        drop(axis);
         debug_assert_eq!(v.len(), self.n);
         Ok(Array1::<f64>::zeros(self.p))
     }
 
     fn forward_mul(
         &self,
-        _axis: usize,
+        axis: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        drop(axis);
         debug_assert_eq!(u.len(), self.p);
         Ok(Array1::<f64>::zeros(self.n))
     }
 
     fn transpose_mul_second_diag(
         &self,
-        _axis: usize,
+        axis: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        drop(axis);
         debug_assert_eq!(v.len(), self.n);
         Ok(Array1::<f64>::zeros(self.p))
     }
 
     fn transpose_mul_second_cross(
         &self,
-        _axis_d: usize,
-        _axis_e: usize,
+        axis_d: usize,
+        axis_e: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        drop(axis_d);
+        drop(axis_e);
         debug_assert_eq!(v.len(), self.n);
         Ok(Array1::<f64>::zeros(self.p))
     }
 
     fn forward_mul_second_diag(
         &self,
-        _axis: usize,
+        axis: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        drop(axis);
         debug_assert_eq!(u.len(), self.p);
         Ok(Array1::<f64>::zeros(self.n))
     }
 
     fn forward_mul_second_cross(
         &self,
-        _axis_d: usize,
-        _axis_e: usize,
+        axis_d: usize,
+        axis_e: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        drop(axis_d);
+        drop(axis_e);
         debug_assert_eq!(u.len(), self.p);
         Ok(Array1::<f64>::zeros(self.n))
     }
 
     fn row_chunk_first(
         &self,
-        _axis: usize,
+        axis: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        drop(axis);
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 
     fn row_vector_first_into(
         &self,
-        _axis: usize,
-        _row: usize,
+        axis: usize,
+        row: usize,
         mut out: ArrayViewMut1<'_, f64>,
     ) -> Result<(), crate::terms::basis::BasisError> {
+        drop(axis);
+        drop(row);
         out.fill(0.0);
         Ok(())
     }
 
     fn row_chunk_second_diag(
         &self,
-        _axis: usize,
+        axis: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        drop(axis);
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 
     fn row_chunk_second_cross(
         &self,
-        _axis_d: usize,
-        _axis_e: usize,
+        axis_d: usize,
+        axis_e: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        drop(axis_d);
+        drop(axis_e);
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 }
@@ -5680,9 +5721,11 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// trace against the fixed logdet factor `F`.
     fn projected_directional_derivative_traces(
         &self,
-        _factor: &Array2<f64>,
-        _directions: &Array2<f64>,
+        factor: &Array2<f64>,
+        directions: &Array2<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
+        drop(factor);
+        drop(directions);
         Ok(None)
     }
 

@@ -1454,9 +1454,10 @@ pub(crate) fn build_score_warp_deviation_block_from_seed(
 
 pub(crate) fn build_score_warp_deviation_block_from_seed_empirical_anchor(
     seed: &Array1<f64>,
-    _weights: &Array1<f64>,
+    weights: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
+    drop(weights);
     // The `weights` argument is retained for caller-API stability but no
     // longer participates in basis construction: identifiability now comes
     // from the smoothness-penalty null-space drop (β-independent), not from a
@@ -1611,9 +1612,10 @@ fn require_probit_marginal_slope_link(
 pub(crate) fn build_link_deviation_block_from_knots_design_seed_and_weights(
     knot_seed: &Array1<f64>,
     design_seed: &Array1<f64>,
-    _anchor_weights: &Array1<f64>,
+    anchor_weights: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
+    drop(anchor_weights);
     // The `anchor_weights` argument is retained for caller-API stability but
     // no longer participates in basis construction (see
     // `build_score_warp_deviation_block_from_seed_empirical_anchor` for the
@@ -7202,9 +7204,10 @@ impl BernoulliMarginalSlopeFamily {
     pub(crate) fn sigma_exact_joint_psi_terms_with_options(
         &self,
         block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        drop(specs);
         if self.effective_flex_active(block_states)? {
             return Err(BernoulliMarginalSlopeError::UnsupportedConfiguration {
                 reason:
@@ -16427,7 +16430,8 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        drop(specs);
         // The workspace impl above unconditionally returns `Some(workspace)`
         // — the rigid path produces a `RowKernelHessianWorkspace` and the
         // flex path produces a
@@ -16438,14 +16442,16 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         true
     }
 
-    fn inner_joint_workspace_gradient_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        drop(specs);
         true
     }
 
     fn inner_joint_workspace_log_likelihood_available(
         &self,
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
     ) -> bool {
+        drop(specs);
         true
     }
 

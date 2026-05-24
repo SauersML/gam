@@ -360,7 +360,8 @@ pub trait HessianOperator: Send + Sync {
     /// Exact backends use the normal solve. Matrix-free backends may override
     /// this to use a looser PCG tolerance when the caller's Monte Carlo error
     /// dominates the linear-solve error.
-    fn stochastic_trace_solve(&self, rhs: &Array1<f64>, _rel_tol: f64) -> Array1<f64> {
+    fn stochastic_trace_solve(&self, rhs: &Array1<f64>, rel_tol: f64) -> Array1<f64> {
+        drop(rel_tol);
         self.solve(rhs)
     }
 
@@ -381,7 +382,8 @@ pub trait HessianOperator: Send + Sync {
     }
 
     /// H⁻¹ M for stochastic trace probes.
-    fn stochastic_trace_solve_multi(&self, rhs: &Array2<f64>, _rel_tol: f64) -> Array2<f64> {
+    fn stochastic_trace_solve_multi(&self, rhs: &Array2<f64>, rel_tol: f64) -> Array2<f64> {
+        drop(rel_tol);
         self.solve_multi(rhs)
     }
 
@@ -1918,8 +1920,9 @@ pub trait HyperOperator: Send + Sync {
     fn trace_projected_factor_cached(
         &self,
         factor: &Array2<f64>,
-        _cache: &ProjectedFactorCache,
+        cache: &ProjectedFactorCache,
     ) -> f64 {
+        drop(cache);
         self.trace_projected_factor(factor)
     }
 
@@ -1939,8 +1942,9 @@ pub trait HyperOperator: Send + Sync {
     fn projected_matrix_cached(
         &self,
         factor: &Array2<f64>,
-        _cache: &ProjectedFactorCache,
+        cache: &ProjectedFactorCache,
     ) -> Array2<f64> {
+        drop(cache);
         self.projected_matrix(factor)
     }
 

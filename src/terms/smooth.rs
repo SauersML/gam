@@ -13261,9 +13261,11 @@ fn evaluate_joint_reml_efs_at_theta(
 }
 
 fn exact_joint_spatial_outer_hessian_available(
-    _family: LikelihoodFamily,
-    _design: &TermCollectionDesign,
+    family: LikelihoodFamily,
+    design: &TermCollectionDesign,
 ) -> bool {
+    drop(family);
+    drop(design);
     // Every `LikelihoodFamily` variant (Gaussian, Binomial-*, Poisson, Gamma,
     // Royston-Parmar) routes through the unified evaluator's outer-Hessian
     // path: Gaussian Identity uses the no-correction dense form, all GLM
