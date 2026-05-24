@@ -270,12 +270,14 @@ class Sphere(Smooth):
         ``m=2`` is the canonical TPS-on-sphere analogue (curvature).
     kernel : one of ``"sobolev"`` (default), ``"pseudo"``, ``"harmonic"``.
     radians : default ``False`` (degrees, Earth/data-frame convention).
+    streaming_chunk_size : optional row chunk size for streaming design evaluation.
     """
 
     n_centers: int = 50
     penalty_order: int = 2
     kernel: str = "sobolev"
     radians: bool = False
+    streaming_chunk_size: int | None = None
 
 
 @dataclass(slots=True)
