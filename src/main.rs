@@ -62,9 +62,8 @@ use gam::smooth::{
     SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
     build_term_collection_design, freeze_term_collection_from_design,
 };
-use gam::survival::{
-    MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec, survival_event_code_from_value,
-};
+use gam::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
+use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_construction::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset,
@@ -8437,8 +8436,9 @@ fn chi_square_survival_approx(chi_sq: f64, df: f64) -> Option<f64> {
     if !chi_sq.is_finite() || !df.is_finite() || chi_sq < 0.0 || df <= 0.0 {
         return None;
     }
-    let dist = ChiSquared::new(df.max(1e-8)).ok()?;
-    Some((1.0 - dist.cdf(chi_sq)).clamp(0.0, 1.0))
+    let dist = ChiSquared::new(df).ok()?;
+    let p = 1.0 - dist.cdf(chi_sq);
+    p.is_finite().then_some(p)
 }
 
 fn build_model_summary(
@@ -8454,18 +8454,27 @@ fn build_model_summary(
         .beta_standard_errors_corrected()
         .or(fit.beta_standard_errors());
     let cov_forwald = fit.beta_covariance_corrected().or(fit.beta_covariance());
-    let scale_is_estimated = fit.dispersion().is_some_and(|d| d.is_estimated());
-    let residual_df = fit
-        .edf_total()
-        .map(|edf_total| (y.len() as f64 - edf_total).max(1.0))
-        .unwrap_or(1.0);
-    let parametric_two_sided_p = |z: f64| -> Option<f64> {
+    let scale_is_estimated = matches!(
+        family,
+        LikelihoodFamily::GaussianIdentity | LikelihoodFamily::GammaLog
+    );
+    let residual_df = (y.len() as f64 - fit.edf_total().unwrap_or(fit.beta.len() as f64)).max(1.0);
+    let dispersion_phi = match family {
+        LikelihoodFamily::GaussianIdentity => fit.standard_deviation * fit.standard_deviation,
+        LikelihoodFamily::GammaLog => fit.likelihood_scale.fixed_phi().unwrap_or_else(|| {
+            if fit.standard_deviation.is_finite() && fit.standard_deviation > 0.0 {
+                1.0 / fit.standard_deviation
+            } else {
+                1.0
+            }
+        }),
+        _ => 1.0,
+    };
+    let two_sided_parametric_p = |z: f64| -> Option<f64> {
         if !z.is_finite() {
             return None;
         }
         if scale_is_estimated {
-            // Estimated scale (Gaussian / Gamma) calibrates two-sided Wald
-            // coefficient p-values against a Student-t with the residual EDF.
             let dist = StudentsT::new(0.0, 1.0, residual_df).ok()?;
             Some((2.0 * (1.0 - dist.cdf(z.abs()))).clamp(0.0, 1.0))
         } else {
@@ -8554,7 +8563,7 @@ fn build_model_summary(
     let intercept_beta = fit.beta.get(intercept_idx).copied().unwrap_or(0.0);
     let intercept_se = se.and_then(|s| s.get(intercept_idx).copied());
     let interceptz = intercept_se.and_then(|s| (s > 0.0).then_some(intercept_beta / s));
-    let intercept_p = interceptz.and_then(parametric_two_sided_p);
+    let intercept_p = interceptz.and_then(two_sided_parametric_p);
     parametric_terms.push(ParametricTermSummary {
         name: "Intercept".to_string(),
         estimate: intercept_beta,
@@ -8603,7 +8612,7 @@ fn build_model_summary(
             let beta = fit.beta.get(idx).copied().unwrap_or(0.0);
             let se_i = se.and_then(|s| s.get(idx).copied());
             let z = se_i.and_then(|s| (s > 0.0).then_some(beta / s));
-            let p = z.and_then(parametric_two_sided_p);
+            let p = z.and_then(two_sided_parametric_p);
             let label = if range.end - range.start > 1 {
                 format!("{geometry_label}[{}]", idx - range.start)
             } else {
@@ -8629,8 +8638,10 @@ fn build_model_summary(
             .unwrap_or(0.0);
         penalty_cursor += 1;
         // Random-effect smooths are variance-component tests on the boundary;
-        // a naive coefficient Wald χ² p-value is anti-conservative, so only
-        // EDF is reported.
+        // a naive coefficient Wald χ² p-value is anti-conservative, so only EDF is reported.
+        let chi_sq_opt = None;
+        let ref_df = edf.max(0.0);
+        let pvalue = None;
         smooth_terms.push(SmoothTermSummary {
             name: name.clone(),
             edf,
@@ -8649,34 +8660,33 @@ fn build_model_summary(
             .map(|block| block.iter().sum::<f64>())
             .unwrap_or(0.0);
         penalty_cursor += k;
-        let smooth_test = cov_forwald.map(|cov| {
-            let beta_block = fit
-                .beta
-                .slice(s![term.coeff_range.start..term.coeff_range.end]);
-            let nullspace_dim = term.nullspace_dims.iter().copied().max().unwrap_or(0);
-            wood_smooth_test(SmoothTestInput {
-                beta: beta_block,
-                covariance: cov,
-                coefficient_influence: fit.coefficient_influence(),
-                coeff_range: term.coeff_range.start..term.coeff_range.end,
-                edf,
-                nullspace_dim,
-                dispersion: fit.dispersion().unwrap_or_default(),
-                residual_df: fit
-                    .edf_total()
-                    .map(|edf_total| (y.len() as f64 - edf_total).max(1.0)),
-                constrained: term.shape != ShapeConstraint::None,
+        let smooth_test = if term.shape == gam::smooth::ShapeConstraint::None {
+            cov_forwald.and_then(|cov| {
+                wood_smooth_test(SmoothTestInput {
+                    beta: fit.beta.view(),
+                    covariance: cov,
+                    influence_matrix: fit.influence_matrix(),
+                    coeff_range: term.coeff_range.clone(),
+                    edf,
+                    nullspace_dim: term.nullspace_dims.iter().copied().sum::<usize>(),
+                    dispersion: dispersion_phi,
+                    residual_df,
+                    scale: if scale_is_estimated {
+                        SmoothTestScale::Estimated
+                    } else {
+                        SmoothTestScale::Known
+                    },
+                })
             })
-        });
-        let chi_sq_opt = smooth_test
-            .as_ref()
-            .filter(|t| t.valid)
-            .map(|t| t.statistic);
+        } else {
+            None
+        };
+        let chi_sq_opt = smooth_test.as_ref().map(|test| test.statistic);
         let ref_df = smooth_test
             .as_ref()
-            .map(|t| t.ref_df)
-            .unwrap_or_else(|| (term.coeff_range.end - term.coeff_range.start).max(1) as f64);
-        let pvalue = smooth_test.and_then(|t| t.p_value.map(|p| p.clamp(0.0, 1.0)));
+            .map(|test| test.ref_df)
+            .unwrap_or(edf.max(0.0));
+        let pvalue = smooth_test.as_ref().map(|test| test.p_value);
         let continuous_order = if k == 3
             && term_penalty_start + 2 < fit.lambdas.len()
             && term_penalty_start + 2 < design.penaltyinfo.len()
@@ -11375,7 +11385,7 @@ mod tests {
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
                 beta_covariance_frequentist: None,
-                coefficient_influence: None,
+                influence_matrix: None,
                 covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             }),
