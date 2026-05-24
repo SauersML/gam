@@ -7914,7 +7914,10 @@ impl SavedFitSummary {
     ) -> Result<Self, String> {
         let reml_score = 0.5 * (state.deviance + state.penalty_term);
         Self {
-            likelihood_family: Some(LikelihoodFamily::RoystonParmar),
+            likelihood_family: Some(LikelihoodSpec::new(
+                ResponseFamily::RoystonParmar,
+                InverseLink::Standard(LinkFunction::Identity),
+            )),
             likelihood_scale: LikelihoodScaleMetadata::Unspecified,
             log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
             log_likelihood: state.log_likelihood,
@@ -10042,7 +10045,10 @@ mod tests {
         let ext = ExternalOptimResult {
             beta: array![0.0],
             lambdas: Array1::zeros(0),
-            likelihood_family: LikelihoodFamily::GaussianIdentity,
+            likelihood_family: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
             log_likelihood_normalization: LogLikelihoodNormalization::Full,
             log_likelihood: -1.0,
@@ -11059,7 +11065,10 @@ mod tests {
             None,
             None,
             SavedFitSummary {
-                likelihood_family: Some(LikelihoodFamily::BinomialProbit),
+                likelihood_family: Some(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Probit),
+            )),
                 likelihood_scale: LikelihoodScaleMetadata::Unspecified,
                 log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
                 ..saved_fit_summary_fixture()
@@ -11126,7 +11135,10 @@ mod tests {
             }],
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
-            likelihood_family: Some(LikelihoodFamily::BinomialLogit),
+            likelihood_family: Some(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Logit),
+            )),
             likelihood_scale: LikelihoodScaleMetadata::Unspecified,
             log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
             log_likelihood: -1.0,
@@ -11866,7 +11878,10 @@ mod tests {
             }],
             log_lambdas: lambdas.mapv(f64::ln),
             lambdas,
-            likelihood_family: Some(LikelihoodFamily::BinomialLogit),
+            likelihood_family: Some(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Logit),
+            )),
             likelihood_scale: LikelihoodScaleMetadata::Unspecified,
             log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
             log_likelihood: -2.0,
@@ -11935,7 +11950,10 @@ mod tests {
             None,
             None,
             SavedFitSummary {
-                likelihood_family: Some(LikelihoodFamily::GaussianIdentity),
+                likelihood_family: Some(LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            )),
                 likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
                 log_likelihood_normalization: LogLikelihoodNormalization::Full,
                 log_likelihood: -0.75,
@@ -12683,7 +12701,10 @@ mod tests {
             None,
             None,
             SavedFitSummary {
-                likelihood_family: Some(LikelihoodFamily::BinomialProbit),
+                likelihood_family: Some(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Probit),
+            )),
                 likelihood_scale: LikelihoodScaleMetadata::Unspecified,
                 log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
                 ..saved_fit_summary_fixture()
