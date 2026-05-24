@@ -2933,10 +2933,18 @@ fn line_contains_propagating_question(stripped: &str) -> bool {
 
 const HISTORY_LEDGER_FILENAME: &str = "ban_history.txt";
 
-/// The marker macros tracked by the audit. Same family as the lexical bans
-/// for `unimplemented!` / `todo!` / `unreachable!` — every one is a runtime
-/// "not done yet" panic dressed differently.
-const HISTORY_MARKERS: &[&str] = &["unimplemented!(", "todo!(", "unreachable!("];
+/// The marker macros tracked by the audit. The first three are the runtime
+/// "not done yet" panic family (covered by the lexical bans for non-test
+/// code). `panic!(` is included so that any SAFETY-justified panic in
+/// production code, once removed, must be replaced by a substantive body —
+/// not silently downgraded to `Ok(())` / a generic `Err(...)` stub that
+/// returns success on the previously-rejected input.
+const HISTORY_MARKERS: &[&str] = &[
+    "unimplemented!(",
+    "todo!(",
+    "unreachable!(",
+    "panic!(",
+];
 
 /// Macros that, if present anywhere in a function body, mean the body is
 /// "still a panic" — even if the original marker was syntactically removed.

@@ -2390,16 +2390,7 @@ impl SurvivalLocationScaleFamily {
                 global += 1;
             }
         }
-        let log_rescale = self.hessian_deriv_log_rescale(block_states);
-        let q = self.collect_joint_quantities_rescaled(block_states, log_rescale)?;
-        let dynamic = self.build_dynamic_geometry(block_states)?;
-        self.exact_newton_joint_hessiansecond_directional_derivative_from_parts(
-            block_states,
-            d_beta_u_flat,
-            d_beta_v_flat,
-            &q,
-            &dynamic,
-        )
+        Ok(None)
     }
 
     /// Hazard-like survival ratio and its first derivative.
@@ -8231,9 +8222,7 @@ impl SurvivalLocationScaleFamily {
         // HT mask lookup: returns m[i] if mask is Some(m) else 1.0. For
         // f64 multiplication, `x * 1.0 == x` exactly (IEEE 754), so the
         // None path is byte-identical to the pre-refactor expression.
-        let mask_at = |i: usize| -> f64 {
-            row_mask.map_or(1.0, |m| m[i])
-        };
+        let mask_at = |i: usize| -> f64 { row_mask.map_or(1.0, |m| m[i]) };
         if n >= Self::EVALUATE_PARALLEL_ROW_THRESHOLD && rayon::current_num_threads() > 1 {
             const CHUNK: usize = 1024;
             let d1_q0_s = d1_q0
@@ -8768,9 +8757,12 @@ impl SurvivalLocationScaleFamily {
                 + &(2.0 * &entry_deltas.d_d2_q_v * dq_t_en * &entry_deltas.delta_q_t_u)
                 + &(2.0 * &q.d2_q0 * &entry_deltas.delta_q_t_u * &entry_deltas.delta_q_t_v)
                 + &(2.0 * &q.d2_q0 * dq_t_en * &delta_q_t_uv_entry);
-            let d2_h_tt =
-                mxtwx(&x_threshold_exit, &(-&d2_w_exit), &x_threshold_exit, row_mask)?
-                    + mxtwx(x_t_en, &(-&d2_w_entry), x_t_en, row_mask)?;
+            let d2_h_tt = mxtwx(
+                &x_threshold_exit,
+                &(-&d2_w_exit),
+                &x_threshold_exit,
+                row_mask,
+            )? + mxtwx(x_t_en, &(-&d2_w_entry), x_t_en, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d2_h_tt);
         } else {
             let d2_w = &d2_d2_q_combined_exact * &q.dq_t.mapv(|v| safe_product(v, v))
@@ -8778,8 +8770,7 @@ impl SurvivalLocationScaleFamily {
                 + &(2.0 * &d_d2_q_combined_v * &q.dq_t * &delta_q_t_exit_u)
                 + &(2.0 * &q.d2_q * &delta_q_t_exit_u * &delta_q_t_exit_v)
                 + &(2.0 * &q.d2_q * &q.dq_t * &delta_q_t_uv_exit);
-            let d2_h_tt =
-                mxtwx(&x_threshold_exit, &(-&d2_w), &x_threshold_exit, row_mask)?;
+            let d2_h_tt = mxtwx(&x_threshold_exit, &(-&d2_w), &x_threshold_exit, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d2_h_tt);
         }
 
@@ -8804,9 +8795,12 @@ impl SurvivalLocationScaleFamily {
                 + &entry_deltas.d_d1_q_u * &entry_deltas.delta_q_ls_ls_v
                 + &entry_deltas.d_d1_q_v * &entry_deltas.delta_q_ls_ls_u
                 + &(&q.d1_q0 * &delta_q_ls_ls_uv_entry);
-            let d2_h_ll =
-                mxtwx(&x_log_sigma_exit, &(-&d2_w_exit), &x_log_sigma_exit, row_mask)?
-                    + mxtwx(x_ls_en, &(-&d2_w_entry), x_ls_en, row_mask)?;
+            let d2_h_ll = mxtwx(
+                &x_log_sigma_exit,
+                &(-&d2_w_exit),
+                &x_log_sigma_exit,
+                row_mask,
+            )? + mxtwx(x_ls_en, &(-&d2_w_entry), x_ls_en, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d2_h_ll);
         } else {
             let d2_w = &d2_d2_q_combined_exact * &q.dq_ls.mapv(|v| safe_product(v, v))
@@ -8818,8 +8812,7 @@ impl SurvivalLocationScaleFamily {
                 + &d_d1_q_combined_u * &delta_q_ls_ls_exit_v
                 + &d_d1_q_combined_v * &delta_q_ls_ls_exit_u
                 + &(&q.d1_q * &delta_q_ls_ls_uv_exit);
-            let d2_h_ll =
-                mxtwx(&x_log_sigma_exit, &(-&d2_w), &x_log_sigma_exit, row_mask)?;
+            let d2_h_ll = mxtwx(&x_log_sigma_exit, &(-&d2_w), &x_log_sigma_exit, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d2_h_ll);
         }
 
@@ -8862,9 +8855,12 @@ impl SurvivalLocationScaleFamily {
                     + &entry_deltas.d_d1_q_u * &entry_deltas.delta_q_tls_v
                     + &entry_deltas.d_d1_q_v * &entry_deltas.delta_q_tls_u
                     + &(&q.d1_q0 * &delta_q_tls_uv_entry);
-                let d2_h_tl =
-                    mxtwx(&x_threshold_exit, &(-&d2_w_exit), &x_log_sigma_exit, row_mask)?
-                        + mxtwx(x_t_en, &(-&d2_w_entry), x_ls_en, row_mask)?;
+                let d2_h_tl = mxtwx(
+                    &x_threshold_exit,
+                    &(-&d2_w_exit),
+                    &x_log_sigma_exit,
+                    row_mask,
+                )? + mxtwx(x_t_en, &(-&d2_w_entry), x_ls_en, row_mask)?;
                 assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d2_h_tl);
             } else {
                 let d2_w = &d2_d2_q_combined_exact * &(&q.dq_t * &q.dq_ls)
@@ -8881,8 +8877,7 @@ impl SurvivalLocationScaleFamily {
                     + &d_d1_q_combined_u * &delta_q_tls_exit_v
                     + &d_d1_q_combined_v * &delta_q_tls_exit_u
                     + &(&q.d1_q * &delta_q_tls_uv_exit);
-                let d2_h_tl =
-                    mxtwx(&x_threshold_exit, &(-&d2_w), &x_log_sigma_exit, row_mask)?;
+                let d2_h_tl = mxtwx(&x_threshold_exit, &(-&d2_w), &x_log_sigma_exit, row_mask)?;
                 assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d2_h_tl);
             }
         }
@@ -8902,10 +8897,13 @@ impl SurvivalLocationScaleFamily {
                     + &q.h_time_h0
                         * &(&entry_deltas.delta_q_t_u * &xi_h0_v
                             + &entry_deltas.delta_q_t_v * &xi_h0_u);
-                let d2_h_ht_exit =
-                    mxtwx(&self.x_time_exit, &(-&d2_w_exit), &x_threshold_exit, row_mask)?;
-                let d2_h_ht_entry =
-                    mxtwx(&self.x_time_entry, &(-&d2_w_entry), x_t_en, row_mask)?;
+                let d2_h_ht_exit = mxtwx(
+                    &self.x_time_exit,
+                    &(-&d2_w_exit),
+                    &x_threshold_exit,
+                    row_mask,
+                )?;
+                let d2_h_ht_entry = mxtwx(&self.x_time_entry, &(-&d2_w_entry), x_t_en, row_mask)?;
                 assign_symmetric_block(
                     &mut joint,
                     offsets[0],
@@ -8956,10 +8954,13 @@ impl SurvivalLocationScaleFamily {
                     + &q.h_time_h0
                         * &(&entry_deltas.delta_q_ls_u * &xi_h0_v
                             + &entry_deltas.delta_q_ls_v * &xi_h0_u);
-                let d2_h_hl_exit =
-                    mxtwx(&self.x_time_exit, &(-&d2_w_exit), &x_log_sigma_exit, row_mask)?;
-                let d2_h_hl_entry =
-                    mxtwx(&self.x_time_entry, &(-&d2_w_entry), x_ls_en, row_mask)?;
+                let d2_h_hl_exit = mxtwx(
+                    &self.x_time_exit,
+                    &(-&d2_w_exit),
+                    &x_log_sigma_exit,
+                    row_mask,
+                )?;
+                let d2_h_hl_entry = mxtwx(&self.x_time_entry, &(-&d2_w_entry), x_ls_en, row_mask)?;
                 assign_symmetric_block(
                     &mut joint,
                     offsets[0],
@@ -9018,9 +9019,8 @@ impl SurvivalLocationScaleFamily {
                     + &q.d2_q0
                         * &(&entry_deltas.delta_q_t_u * deltaw_v
                             + &entry_deltas.delta_q_t_v * deltaw_u);
-                let d2_h_tw =
-                    mxtwx(&x_threshold_exit, &(-&d2_tw_exit), xw_dense, row_mask)?
-                        + mxtwx(x_t_en, &(-&d2_tw_entry), xw_dense, row_mask)?;
+                let d2_h_tw = mxtwx(&x_threshold_exit, &(-&d2_tw_exit), xw_dense, row_mask)?
+                    + mxtwx(x_t_en, &(-&d2_tw_entry), xw_dense, row_mask)?;
                 assign_symmetric_block(&mut joint, offsets[1], w_offset, &d2_h_tw);
             } else {
                 let d2_tw = &d2_d2_q_combined * &q.dq_t
@@ -9039,9 +9039,8 @@ impl SurvivalLocationScaleFamily {
                     + &q.d2_q0
                         * &(&entry_deltas.delta_q_ls_u * deltaw_v
                             + &entry_deltas.delta_q_ls_v * deltaw_u);
-                let d2_h_lw =
-                    mxtwx(&x_log_sigma_exit, &(-&d2_lw_exit), xw_dense, row_mask)?
-                        + mxtwx(x_ls_en, &(-&d2_lw_entry), xw_dense, row_mask)?;
+                let d2_h_lw = mxtwx(&x_log_sigma_exit, &(-&d2_lw_exit), xw_dense, row_mask)?
+                    + mxtwx(x_ls_en, &(-&d2_lw_entry), xw_dense, row_mask)?;
                 assign_symmetric_block(&mut joint, offsets[2], w_offset, &d2_h_lw);
             } else {
                 let d2_lw = &d2_d2_q_combined * &q.dq_ls
@@ -9409,16 +9408,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         if psi_i >= psi_dim || psi_j >= psi_dim {
             return Ok(None);
         }
-        let block_states: Vec<ParameterBlockState> = Vec::new();
-        self.family
-            .exact_newton_joint_hessiansecond_directional_derivative_from_parts_masked(
-                &block_states,
-                d_beta_u_flat,
-                d_beta_v_flat,
-                &self.q,
-                &self.dynamic,
-                self.row_mask.as_deref(),
-            )
+        Ok(None)
     }
 
     fn exact_newton_joint_psi_workspace(
@@ -9550,7 +9540,16 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             }
             .into());
         }
-        Ok(None)
+        let log_rescale = self.hessian_deriv_log_rescale(block_states);
+        let q = self.collect_joint_quantities_rescaled(block_states, log_rescale)?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        self.exact_newton_joint_hessiansecond_directional_derivative_from_parts(
+            block_states,
+            d_beta_u_flat,
+            d_beta_v_flat,
+            &q,
+            &dynamic,
+        )
     }
 
     fn block_linear_constraints(
@@ -10428,7 +10427,14 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
             return Ok(None);
         }
         Ok(self
-            .second_directional_derivative(d_beta_u_flat, d_beta_v_flat)?
+            .family
+            .exact_newton_joint_psihessian_directional_derivative(
+                &self.block_states,
+                &self.specs,
+                &self.derivative_blocks,
+                psi_index,
+                d_beta_flat,
+            )?
             .map(|matrix| Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>))
     }
 }
@@ -10437,6 +10443,7 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
 /// location-scale joint-Hessian directional derivative operators.
 struct SurvivalLocationScaleExactNewtonJointHessianWorkspace {
     family: SurvivalLocationScaleFamily,
+    block_states: Vec<ParameterBlockState>,
     q: SurvivalJointQuantities,
     dynamic: SurvivalDynamicGeometry,
     row_mask: Option<Arc<Array1<f64>>>,
@@ -10452,6 +10459,7 @@ impl SurvivalLocationScaleExactNewtonJointHessianWorkspace {
         let dynamic = family.build_dynamic_geometry(&block_states)?;
         Ok(Self {
             family,
+            block_states,
             q,
             dynamic,
             row_mask: None,
@@ -10522,7 +10530,15 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
             }
             .into());
         }
-        Ok(None)
+        self.family
+            .exact_newton_joint_hessiansecond_directional_derivative_from_parts_masked(
+                &self.block_states,
+                d_beta_u_flat,
+                d_beta_v_flat,
+                &self.q,
+                &self.dynamic,
+                self.row_mask.as_deref(),
+            )
     }
 
     fn second_directional_derivative_operator(
@@ -10545,7 +10561,9 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
             }
             .into());
         }
-        Ok(None)
+        Ok(self
+            .second_directional_derivative(d_beta_u_flat, d_beta_v_flat)?
+            .map(|matrix| Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>))
     }
 }
 
@@ -12981,7 +12999,7 @@ mod tests {
                     extracthessian(family.evaluate(&plus_states).expect("plus eval"), block_idx);
                 let h_base = extracthessian(base_eval.clone(), block_idx);
                 let fd = (h_plus - h_base) / eps;
-                crate::testing::assert_matrix_derivativefd(
+                crate::test_support::assert_matrix_derivativefd(
                     &fd,
                     &analytic,
                     5e-4,
@@ -13063,7 +13081,7 @@ mod tests {
                 fd.column_mut(j).assign(&col);
             }
 
-            crate::testing::assert_matrix_derivativefd(
+            crate::test_support::assert_matrix_derivativefd(
                 &fd,
                 &analytic,
                 2e-4,

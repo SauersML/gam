@@ -5318,8 +5318,6 @@ impl SurvivalMarginalSlopeFamily {
         }
         Ok((f, f_a, f_aa))
     }
-
-    #[cfg(test)]
     fn solve_row_survival_intercept(
         &self,
         q: f64,
@@ -6906,7 +6904,6 @@ impl SurvivalMarginalSlopeFamily {
     /// jet construction across the 10 upper-triangular (a, b) cells. This
     /// per-cell variant is retained as a regression baseline for the
     /// batched-vs-legacy equivalence test below.
-    #[cfg(test)]
     fn row_neglog_directional_refs(
         &self,
         row: usize,
@@ -18121,7 +18118,12 @@ pub fn fit_survival_marginal_slope_terms(
         true,
         None,
         outer_policy,
-        |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            assert_eq!(
+                specs.len(),
+                designs.len(),
+                "survival-marginal-slope outer-inner-fit: specs/designs length mismatch",
+            );
             let eval_started = std::time::Instant::now();
             log::info!(
                 "[survival-marginal-slope/outer-inner-fit] start theta_dim={}",
@@ -18301,7 +18303,6 @@ pub fn fit_survival_marginal_slope_terms(
 /// of `evaluate_denested_survival_calibration` calls. Compiled into the
 /// `solve_row_survival_intercept_with_slot` evaluator only under `cfg(test)`,
 /// so the production hot path is byte-identical.
-#[cfg(test)]
 mod survival_intercept_test_counter {
     use std::cell::Cell;
     thread_local! {

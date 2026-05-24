@@ -2513,7 +2513,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// transformed basis. This is the same matrix the analytic operator
     /// differentiates, so centered finite-difference probes of this H w.r.t.
     /// ψ should match the analytic `B_i + correction`.
-    #[cfg(test)]
     pub(crate) fn debug_full_h(
         &mut self,
         x: &DesignMatrix,
@@ -2553,7 +2552,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// finite difference of it along ψ gives the analytic `d/dψ log|H_proj|`
     /// that the production trace formula computes — i.e. the correct
     /// finite-difference reference for the penalty-subspace projection invariant.
-    #[cfg(test)]
     pub(crate) fn debug_logdet_h_proj(
         &mut self,
         x: &DesignMatrix,
@@ -2586,7 +2584,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     }
 
     /// Debug-only: return `(η, finalweights, solve_c_array)` at this theta.
-    #[cfg(test)]
     pub(crate) fn debug_full_eta_w_c(
         &mut self,
         x: &DesignMatrix,
@@ -4932,8 +4929,6 @@ impl UnifiedFitResult {
             inner_cycles,
         })
     }
-
-    #[cfg(test)]
     pub(crate) fn new_for_test_unchecked(parts: UnifiedFitResultParts) -> Self {
         let beta = flatten_block_betas(&parts.blocks);
         Self {
@@ -5643,7 +5638,6 @@ pub fn compute_continuous_smoothness_order(
     }
 }
 
-#[cfg(test)]
 pub(crate) fn try_compute_continuous_smoothness_order(
     lambda_tilde: &[f64],
     normalization_scale: &[f64],
@@ -6979,7 +6973,7 @@ mod estimate_policy_tests {
         let score_m = score_at(theta[1] - 1e-4 * (1.0 + theta[1].abs()));
         let fd_du_raw = (&score_p - &score_m).mapv(|v| v / (2.0 * 1e-4 * (1.0 + theta[1].abs())));
         let du_raw = du_by_eps.mapv(|v| v * d_eps_d_raw);
-        crate::testing::assert_matrix_derivativefd(
+        crate::test_support::assert_matrix_derivativefd(
             &fd_du_raw.insert_axis(Axis(1)),
             &du_raw.insert_axis(Axis(1)),
             2e-3,
@@ -7060,7 +7054,7 @@ mod estimate_policy_tests {
         let beta_m = beta_at(theta[1] - fd_h);
         let fd_beta = (&beta_p - &beta_m).mapv(|v| v / (2.0 * fd_h));
 
-        crate::testing::assert_matrix_derivativefd(
+        crate::test_support::assert_matrix_derivativefd(
             &fd_beta.insert_axis(Axis(1)),
             &dbeta_exact.insert_axis(Axis(1)),
             2e-3,
@@ -7219,7 +7213,7 @@ mod estimate_policy_tests {
             fd_j.column_mut(j).assign(&fd_col);
         }
 
-        crate::testing::assert_matrix_derivativefd(
+        crate::test_support::assert_matrix_derivativefd(
             &fd_j,
             &analytic_j,
             2e-3,

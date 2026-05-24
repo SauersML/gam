@@ -75,7 +75,7 @@ pub mod solver;
 mod span;
 pub mod terms;
 #[cfg(test)]
-pub mod testing;
+mod test_support;
 pub mod types;
 
 pub use data::{

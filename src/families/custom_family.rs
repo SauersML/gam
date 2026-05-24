@@ -11419,8 +11419,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut best_residual_seen: f64 = f64::INFINITY;
         let mut cycles_since_residual_improved: usize = 0;
         let mut tr_clamped_during_stall: bool = false;
-        let last_joint_math: Option<JointNewtonMathDiagnostic> = None;
-        let prev_kkt_norm: Option<f64> = None;
+        let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
+        let mut prev_kkt_norm: Option<f64> = None;
         // Plateau detector: count consecutive cycles whose |Δobj| sits
         // below `objective_tol`; when the streak hits the threshold
         // the linearized stall exit fires.
@@ -11441,31 +11441,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         const GEOMETRIC_TAIL_WINDOW: usize = 5;
         let mut geometric_tail_history: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(GEOMETRIC_TAIL_WINDOW);
-
-        // Linearized-rate stall early-exit. Companion to the
-        // constrained-stationary certificate for the case where the
-        // certificate cannot fire (e.g. the multiplier interpretation does
-        // not hold) yet `linearized_rel = ‖g+Hδ‖∞ / (1+‖g‖∞)` stays close
-        // to 1 cycle after cycle — every Newton step reduces the predicted
-        // next-gradient norm by only a small fraction of `‖g‖∞`. Newton
-        // then decays the KKT residual at a geometric rate of roughly
-        // `linearized_rel` per cycle, so reaching `residual_tol` from
-        // `residual = R · residual_tol` takes about
-        // `log(R) / log(1 / linearized_rel)` cycles — ~75 at
-        // `linearized_rel = 0.95, R = 50` and ~700 at
-        // `linearized_rel = 0.99, R = 10³`. At biobank scale this signature
-        // held for the full 300-cycle budget, burning ~130 s per outer
-        // eval. The earlier residual-stall detector does not catch it
-        // because the residual *does* keep dropping (resetting
-        // `cycles_since_residual_improved` every ~4 cycles via 10 % drops
-        // in the geometric tail) and `step_inf ≪ joint_trust_radius` (so
-        // `tr_clamped_during_stall` stays false). After
-        // `LINEARIZED_STALL_CYCLES` consecutive cycles with
-        // `linearized_rel ≥ LINEARIZED_STALL_REL_THRESHOLD` and
-        // `residual ≥ LINEARIZED_STALL_RESIDUAL_FACTOR · residual_tol`,
-        // exit `converged = false` so the outer optimizer rejects this
-        // ρ evaluation immediately instead of riding the geometric tail
-        // to `inner_max_cycles`.
 
         // The exact joint-Hessian route solves the penalized Newton system
         // directly. Extra damping must be wired through an accepted/rejected
@@ -11839,9 +11814,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // 2-norm. Bumping the radius up to the post-barrier Newton-step
             // norm on cycle 0 preserves quadratic convergence on
             // well-conditioned problems while leaving the standard adaptive
-            // shrink/expand for subsequent cycles. The MAX_JOINT_STEP cap on
-            // |delta|_inf above remains the actual safeguard against runaway
-            // proposals.
+            // shrink/expand for subsequent cycles. Family feasibility
+            // constraints and the adaptive trust radius remain the safeguards
+            // against runaway proposals.
             if cycle == 0 {
                 let initial_step_norm = joint_trust_region_step_norm(&delta);
                 if initial_step_norm.is_finite() && initial_step_norm > joint_trust_radius {
@@ -11986,6 +11961,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
                 let predicted_reduction =
                     joint_quadratic_predicted_reduction(&rhs, &hpen_delta, &trial_delta);
+                let linearized_next_kkt_inf = hpen_delta
+                    .iter()
+                    .zip(rhs.iter())
+                    .map(|(hpen, rhs)| (hpen - rhs).abs())
+                    .fold(0.0_f64, f64::max);
                 // Reject only non-descent directions on the quadratic model.
                 // A small-but-positive predicted reduction is what Newton
                 // *should* produce near the optimum of a large-magnitude
@@ -12105,6 +12085,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 };
                 let radius_held =
                     (joint_trust_radius - old_radius).abs() <= 1e-12 * old_radius.abs().max(1.0);
+                let joint_math = JointNewtonMathDiagnostic {
+                    old_kkt_inf: current_kkt_norm,
+                    linearized_next_kkt_inf,
+                    predicted_reduction,
+                    actual_reduction,
+                    trust_ratio: trust_update.rho,
+                    step_inf: trial_step_inf,
+                    proposal_inf: step_inf,
+                };
                 let radius_field = if radius_held {
                     format!("r={:.3e} (held)", old_radius)
                 } else {
@@ -12169,6 +12158,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         states[b].beta.assign(old);
                     }
                     refresh_all_block_etas(family, specs, &mut states)?;
+                    last_joint_math = Some(joint_math);
                     accepted = true;
                     converged = true;
                     break;
@@ -12179,6 +12169,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         cached_active_sets =
                             scatter_joint_active_set(joint_active_set, &block_constraints);
                     }
+                    last_joint_math = Some(joint_math);
                     accepted = true;
                     break;
                 }
@@ -12309,6 +12300,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 &block_constraints,
                 Some(cached_active_sets.as_slice()),
             )?;
+            prev_kkt_norm = Some(residual);
 
             // Scale-aware tolerances. The objective check was already
             // relative (`inner_tol * (1 + |obj|)`), but the step and
@@ -15515,61 +15507,6 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily + Clone + Send + Sync 
         eval_mode,
     )
     .map_err(String::from)
-}
-
-#[cfg(test)]
-fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Sync + 'static>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    penalty_counts: &[usize],
-    rho: &Array1<f64>,
-    warm_start: Option<&ConstrainedWarmStart>,
-    eval_mode: EvalMode,
-) -> Result<(f64, Array1<f64>, Option<Array2<f64>>, ConstrainedWarmStart), String> {
-    let result = outerobjectivegradienthessian_internal(
-        family,
-        specs,
-        options,
-        penalty_counts,
-        rho,
-        warm_start,
-        crate::types::RhoPrior::Flat,
-        eval_mode,
-    )?;
-    Ok((
-        result.objective,
-        result.gradient,
-        result.outer_hessian.materialize_dense()?,
-        result.warm_start,
-    ))
-}
-
-/// Test-only helper exposing the value+gradient outer evaluation entry point
-/// to other modules' test code.  Used by
-/// the batched-gradient tests in `families/gamlss.rs` to pin the batched
-/// override against a test oracle
-/// without re-implementing the inner-fit / penalty-pseudo-logdet plumbing.
-/// Returns only `(value, gradient)`; the warm-start is internal state with a
-/// private type and is dropped at the boundary.
-#[cfg(test)]
-pub(crate) fn test_outerobjective_andgradient<F: CustomFamily + Clone + Send + Sync + 'static>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    penalty_counts: &[usize],
-    rho: &Array1<f64>,
-) -> Result<(f64, Array1<f64>), String> {
-    let (obj, grad, _, _) = outerobjectivegradienthessian(
-        family,
-        specs,
-        options,
-        penalty_counts,
-        rho,
-        None,
-        EvalMode::ValueAndGradient,
-    )?;
-    Ok((obj, grad))
 }
 
 fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -20236,10 +20173,96 @@ mod tests {
         build_term_collection_design, freeze_term_collection_from_design,
         spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
     };
-    use crate::testing::binomial_location_scale_base_fixture;
+    use crate::test_support::binomial_location_scale_base_fixture;
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
+
+    pub(crate) fn outerobjectivegradienthessian<
+        F: CustomFamily + Clone + Send + Sync + 'static,
+    >(
+        family: &F,
+        specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
+        penalty_counts: &[usize],
+        rho: &Array1<f64>,
+        warm_start: Option<&ConstrainedWarmStart>,
+        eval_mode: EvalMode,
+    ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>, ConstrainedWarmStart), String> {
+        let result = super::outerobjectivegradienthessian_internal(
+            family,
+            specs,
+            options,
+            penalty_counts,
+            rho,
+            warm_start,
+            crate::types::RhoPrior::Flat,
+            eval_mode,
+        )?;
+        Ok((
+            result.objective,
+            result.gradient,
+            result.outer_hessian.materialize_dense()?,
+            result.warm_start,
+        ))
+    }
+
+    /// Test-only helper exposing the value+gradient outer evaluation entry point
+    /// to other modules' test code.  Used by
+    /// the batched-gradient tests in `families/gamlss.rs` to pin the batched
+    /// override against a test oracle
+    /// without re-implementing the inner-fit / penalty-pseudo-logdet plumbing.
+    /// Returns only `(value, gradient)`; the warm-start is internal state with a
+    /// private type and is dropped at the boundary.
+    pub(crate) fn test_outerobjective_andgradient<
+        F: CustomFamily + Clone + Send + Sync + 'static,
+    >(
+        family: &F,
+        specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
+        penalty_counts: &[usize],
+        rho: &Array1<f64>,
+    ) -> Result<(f64, Array1<f64>), String> {
+        let (obj, grad, hess, warm) = outerobjectivegradienthessian(
+            family,
+            specs,
+            options,
+            penalty_counts,
+            rho,
+            None,
+            EvalMode::ValueAndGradient,
+        )?;
+        assert!(
+            hess.as_ref().is_none_or(|h| h.nrows() == h.ncols()),
+            "outer Hessian must be square when materialised"
+        );
+        assert_eq!(
+            warm.block_beta.len(),
+            specs.len(),
+            "warm-start block_beta length must match specs"
+        );
+        Ok((obj, grad))
+    }
+
+    fn solve_blockweighted_system(
+        x: &DesignMatrix,
+        y_star: &Array1<f64>,
+        w: &Array1<f64>,
+        s_lambda: &Array2<f64>,
+        ridge_floor: f64,
+        ridge_policy: RidgePolicy,
+    ) -> Result<Array1<f64>, String> {
+        let n = x.nrows();
+        if y_star.len() != n || w.len() != n {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: "weighted-system dimension mismatch".to_string(),
+            }
+            .into());
+        }
+        let xtwy = x.compute_xtwy(w, y_star)?;
+        x.solve_systemwith_policy(w, &xtwy, Some(s_lambda), ridge_floor, ridge_policy)
+            .map_err(|_| "block solve failed after ridge retries".to_string())
+    }
 
     #[test]
     fn default_inner_cycle_budget_covers_biobank_joint_newton_tail() {
