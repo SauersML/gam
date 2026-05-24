@@ -3666,12 +3666,12 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
         for start in (0..self.n).step_by(KERNEL_OPERATOR_ROW_CHUNK_SIZE) {
             let end = (start + KERNEL_OPERATOR_ROW_CHUNK_SIZE).min(self.n);
             let chunk = self.kernel_chunk(start..end);
-            let partial = chunk.dot(&v_kernel);
+            let partial = fast_av(&chunk, &v_kernel);
             result.slice_mut(s![start..end]).assign(&partial);
         }
         if let Some(poly) = self.poly_basis.as_ref() {
             let v_poly = vector.slice(s![k_eff..]);
-            let poly_part = poly.dot(&v_poly);
+            let poly_part = fast_av(poly, &v_poly);
             result += &poly_part;
         }
         result
@@ -3690,12 +3690,12 @@ impl<K: SpatialKernelEvaluator> LinearOperator for ChunkedKernelDesignOperator<K
             let end = (start + KERNEL_OPERATOR_ROW_CHUNK_SIZE).min(self.n);
             let chunk = self.kernel_chunk(start..end);
             let v_slice = vector.slice(s![start..end]);
-            let partial = chunk.t().dot(&v_slice);
+            let partial = fast_atv(&chunk, &v_slice);
             result.slice_mut(s![..k_eff]).scaled_add(1.0, &partial);
         }
         // Poly part.
         if let Some(poly) = self.poly_basis.as_ref() {
-            let poly_part = poly.t().dot(vector);
+            let poly_part = fast_atv(poly, vector);
             result.slice_mut(s![k_eff..]).assign(&poly_part);
         }
         result
@@ -3939,7 +3939,7 @@ impl LinearOperator for CoefficientTransformOperator {
         if let Some(combined) = self.materialized_combined() {
             return dense_matvec(combined, vector);
         }
-        let tv = self.transform.dot(vector);
+        let tv = fast_av(&self.transform, vector);
         self.inner.apply(&tv)
     }
     fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
@@ -3947,7 +3947,7 @@ impl LinearOperator for CoefficientTransformOperator {
             return dense_transpose_matvec(combined, vector);
         }
         let xtv = self.inner.apply_transpose(vector);
-        self.transform.t().dot(&xtv)
+        fast_atv(&self.transform, &xtv)
     }
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         if let Some(combined) = self.materialized_combined() {
@@ -4667,7 +4667,7 @@ impl SymmetricMatrix {
 
     pub fn dot(&self, rhs: &Array1<f64>) -> Array1<f64> {
         match self {
-            Self::Dense(mat) => mat.dot(rhs),
+            Self::Dense(mat) => fast_av(mat, rhs),
             Self::Sparse(mat) => {
                 let mut out = Array1::<f64>::zeros(mat.nrows());
                 let (symbolic, values) = mat.parts();
@@ -4721,7 +4721,7 @@ impl SymmetricMatrix {
     /// Returns a dense Array2.
     pub fn dot_matrix(&self, rhs: &Array2<f64>) -> Array2<f64> {
         match self {
-            Self::Dense(mat) => mat.dot(rhs),
+            Self::Dense(mat) => fast_ab(mat, rhs),
             Self::Sparse(mat) => {
                 let n = mat.nrows();
                 let k = rhs.ncols();

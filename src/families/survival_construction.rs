@@ -2004,37 +2004,53 @@ pub fn marginal_slope_baseline_chain_rule_gradient(
         }
     };
 
-    let mut grad = Array1::<f64>::zeros(theta_dim);
-    for i in 0..n {
-        let partials_exit = marginal_slope_baseline_offset_theta_partials(age_exit[i], cfg)?
-            .ok_or_else(|| {
-                "unexpected None from marginal-slope baseline partials at exit".to_string()
-            })?;
-        if partials_exit.len() != theta_dim {
-            return Err(format!(
-                "marginal_slope_baseline_chain_rule_gradient: theta_dim drifted ({} != {})",
-                partials_exit.len(),
-                theta_dim
-            ));
-        }
-        let r_x = residuals.exit[i];
-        let r_d = residuals.derivative[i];
-        for k in 0..theta_dim {
-            let (d_q_dk, d_qt_dk) = partials_exit[k];
-            grad[k] += r_x * d_q_dk + r_d * d_qt_dk;
-        }
+    // Per-row residual·partial contraction; rows are independent. Parallel
+    // try_fold/try_reduce sums the per-row Array1 increments and short-circuits
+    // on the first Err propagated by the partials helpers.
+    let grad = (0..n)
+        .into_par_iter()
+        .try_fold(
+            || Array1::<f64>::zeros(theta_dim),
+            |mut acc, i| -> Result<Array1<f64>, String> {
+                let partials_exit =
+                    marginal_slope_baseline_offset_theta_partials(age_exit[i], cfg)?
+                        .ok_or_else(|| {
+                            "unexpected None from marginal-slope baseline partials at exit"
+                                .to_string()
+                        })?;
+                if partials_exit.len() != theta_dim {
+                    return Err(format!(
+                        "marginal_slope_baseline_chain_rule_gradient: theta_dim drifted ({} != {})",
+                        partials_exit.len(),
+                        theta_dim
+                    ));
+                }
+                let r_x = residuals.exit[i];
+                let r_d = residuals.derivative[i];
+                for k in 0..theta_dim {
+                    let (d_q_dk, d_qt_dk) = partials_exit[k];
+                    acc[k] += r_x * d_q_dk + r_d * d_qt_dk;
+                }
 
-        let r_e = residuals.entry[i];
-        if r_e != 0.0 {
-            let partials_entry = marginal_slope_baseline_offset_theta_partials(age_entry[i], cfg)?
-                .ok_or_else(|| {
-                    "unexpected None from marginal-slope baseline partials at entry".to_string()
-                })?;
-            for k in 0..theta_dim {
-                grad[k] += r_e * partials_entry[k].0;
-            }
-        }
-    }
+                let r_e = residuals.entry[i];
+                if r_e != 0.0 {
+                    let partials_entry =
+                        marginal_slope_baseline_offset_theta_partials(age_entry[i], cfg)?
+                            .ok_or_else(|| {
+                                "unexpected None from marginal-slope baseline partials at entry"
+                                    .to_string()
+                            })?;
+                    for k in 0..theta_dim {
+                        acc[k] += r_e * partials_entry[k].0;
+                    }
+                }
+                Ok(acc)
+            },
+        )
+        .try_reduce(
+            || Array1::<f64>::zeros(theta_dim),
+            |a, b| Ok(a + b),
+        )?;
     Ok(Some(grad))
 }
 
@@ -2477,51 +2493,70 @@ pub fn marginal_slope_baseline_chain_rule_hessian(
             );
         }
     };
-    let mut hessian = Array2::<f64>::zeros((dim, dim));
-    for i in 0..n {
-        let exit_parts = marginal_slope_baseline_offset_theta_second_partials(age_exit[i], cfg)?
-            .ok_or_else(|| {
-                "unexpected None from marginal-slope second partials at exit".to_string()
-            })?;
-        if exit_parts.first.len() != dim {
-            return Err(
-                "marginal_slope_baseline_chain_rule_hessian: theta_dim drifted".to_string(),
-            );
-        }
-        let mut entry_parts = None;
-        if residuals.entry[i] != 0.0 {
-            entry_parts = Some(
-                marginal_slope_baseline_offset_theta_second_partials(age_entry[i], cfg)?
-                    .ok_or_else(|| {
-                        "unexpected None from marginal-slope second partials at entry".to_string()
-                    })?,
-            );
-        }
-        for a in 0..dim {
-            for b in 0..dim {
-                let j_exit_a = exit_parts.first[a].0;
-                let j_exit_b = exit_parts.first[b].0;
-                let j_deriv_a = exit_parts.first[a].1;
-                let j_deriv_b = exit_parts.first[b].1;
-                let mut value = residuals.exit[i] * exit_parts.second[a][b].0
-                    + residuals.derivative[i] * exit_parts.second[a][b].1;
-                if let Some(parts) = entry_parts.as_ref() {
-                    value += residuals.entry[i] * parts.second[a][b].0;
+    // Per-row Hessian contractions are independent. Each row contributes a
+    // dim×dim increment combining second partials (exit/entry channels) with
+    // the curvature-weighted outer product of the (entry, exit, derivative)
+    // first-partial Jacobians. Parallel try_fold/try_reduce accumulates them.
+    let hessian = (0..n)
+        .into_par_iter()
+        .try_fold(
+            || Array2::<f64>::zeros((dim, dim)),
+            |mut acc, i| -> Result<Array2<f64>, String> {
+                let exit_parts =
+                    marginal_slope_baseline_offset_theta_second_partials(age_exit[i], cfg)?
+                        .ok_or_else(|| {
+                            "unexpected None from marginal-slope second partials at exit"
+                                .to_string()
+                        })?;
+                if exit_parts.first.len() != dim {
+                    return Err(
+                        "marginal_slope_baseline_chain_rule_hessian: theta_dim drifted"
+                            .to_string(),
+                    );
                 }
-                let curv = curvatures.rows[i];
-                let j_entry_a = entry_parts.as_ref().map_or(0.0, |parts| parts.first[a].0);
-                let j_entry_b = entry_parts.as_ref().map_or(0.0, |parts| parts.first[b].0);
-                let ja = [j_entry_a, j_exit_a, j_deriv_a];
-                let jb = [j_entry_b, j_exit_b, j_deriv_b];
-                for u in 0..3 {
-                    for v in 0..3 {
-                        value += ja[u] * curv[u][v] * jb[v];
+                let mut entry_parts = None;
+                if residuals.entry[i] != 0.0 {
+                    entry_parts = Some(
+                        marginal_slope_baseline_offset_theta_second_partials(age_entry[i], cfg)?
+                            .ok_or_else(|| {
+                                "unexpected None from marginal-slope second partials at entry"
+                                    .to_string()
+                            })?,
+                    );
+                }
+                for a in 0..dim {
+                    for b in 0..dim {
+                        let j_exit_a = exit_parts.first[a].0;
+                        let j_exit_b = exit_parts.first[b].0;
+                        let j_deriv_a = exit_parts.first[a].1;
+                        let j_deriv_b = exit_parts.first[b].1;
+                        let mut value = residuals.exit[i] * exit_parts.second[a][b].0
+                            + residuals.derivative[i] * exit_parts.second[a][b].1;
+                        if let Some(parts) = entry_parts.as_ref() {
+                            value += residuals.entry[i] * parts.second[a][b].0;
+                        }
+                        let curv = curvatures.rows[i];
+                        let j_entry_a =
+                            entry_parts.as_ref().map_or(0.0, |parts| parts.first[a].0);
+                        let j_entry_b =
+                            entry_parts.as_ref().map_or(0.0, |parts| parts.first[b].0);
+                        let ja = [j_entry_a, j_exit_a, j_deriv_a];
+                        let jb = [j_entry_b, j_exit_b, j_deriv_b];
+                        for u in 0..3 {
+                            for v in 0..3 {
+                                value += ja[u] * curv[u][v] * jb[v];
+                            }
+                        }
+                        acc[[a, b]] += value;
                     }
                 }
-                hessian[[a, b]] += value;
-            }
-        }
-    }
+                Ok(acc)
+            },
+        )
+        .try_reduce(
+            || Array2::<f64>::zeros((dim, dim)),
+            |a, b| Ok(a + b),
+        )?;
     Ok(Some(hessian))
 }
 
@@ -2675,18 +2710,26 @@ pub fn build_survival_baseline_offsets(
         .into());
     }
     let n = age_entry.len();
+    // Each row's three offsets are independent across i. Compute the triplets
+    // in parallel, then unpack into three Array1 outputs preserving order.
+    let triples: Vec<(f64, f64, f64)> = (0..n)
+        .into_par_iter()
+        .map(|i| -> Result<(f64, f64, f64), String> {
+            let (e0, _) = evaluate_survival_baseline(age_entry[i], cfg)?;
+            let (e1, d1) = evaluate_survival_baseline(age_exit[i], cfg)?;
+            if !e0.is_finite() || !e1.is_finite() || !d1.is_finite() {
+                return Err(SurvivalConstructionError::DataValidationFailed {
+                    reason: "non-finite survival baseline offsets computed".to_string(),
+                }
+                .into());
+            }
+            Ok((e0, e1, d1))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let mut eta_entry = Array1::<f64>::zeros(n);
     let mut eta_exit = Array1::<f64>::zeros(n);
     let mut derivative_exit = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let (e0, _) = evaluate_survival_baseline(age_entry[i], cfg)?;
-        let (e1, d1) = evaluate_survival_baseline(age_exit[i], cfg)?;
-        if !e0.is_finite() || !e1.is_finite() || !d1.is_finite() {
-            return Err(SurvivalConstructionError::DataValidationFailed {
-                reason: "non-finite survival baseline offsets computed".to_string(),
-            }
-            .into());
-        }
+    for (i, (e0, e1, d1)) in triples.into_iter().enumerate() {
         eta_entry[i] = e0;
         eta_exit[i] = e1;
         derivative_exit[i] = d1;
@@ -2707,18 +2750,26 @@ pub fn build_survival_marginal_slope_baseline_offsets(
         );
     }
     let n = age_entry.len();
+    // Per-row marginal-slope baseline triplets are independent: evaluate in
+    // parallel, then materialize the three Array1 outputs in order.
+    let triples: Vec<(f64, f64, f64)> = (0..n)
+        .into_par_iter()
+        .map(|i| -> Result<(f64, f64, f64), String> {
+            let (e0, _) = evaluate_survival_marginal_slope_baseline(age_entry[i], cfg)?;
+            let (e1, d1) = evaluate_survival_marginal_slope_baseline(age_exit[i], cfg)?;
+            if !e0.is_finite() || !e1.is_finite() || !d1.is_finite() {
+                return Err(SurvivalConstructionError::DataValidationFailed {
+                    reason: "non-finite survival probit baseline offsets computed".to_string(),
+                }
+                .into());
+            }
+            Ok((e0, e1, d1))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let mut eta_entry = Array1::<f64>::zeros(n);
     let mut eta_exit = Array1::<f64>::zeros(n);
     let mut derivative_exit = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let (e0, _) = evaluate_survival_marginal_slope_baseline(age_entry[i], cfg)?;
-        let (e1, d1) = evaluate_survival_marginal_slope_baseline(age_exit[i], cfg)?;
-        if !e0.is_finite() || !e1.is_finite() || !d1.is_finite() {
-            return Err(SurvivalConstructionError::DataValidationFailed {
-                reason: "non-finite survival probit baseline offsets computed".to_string(),
-            }
-            .into());
-        }
+    for (i, (e0, e1, d1)) in triples.into_iter().enumerate() {
         eta_entry[i] = e0;
         eta_exit[i] = e1;
         derivative_exit[i] = d1;
