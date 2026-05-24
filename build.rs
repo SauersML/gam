@@ -542,8 +542,16 @@ fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
         // path) commonly used to satisfy `scan_for_useless_tests` without
         // actually asserting anything about the unit under test. Strict
         // everywhere — tests must verify a real property.
-        ("file!().ends_with(\".rs\")", "file!().ends_with(\".rs\")", false),
-        ("file!().ends_with(\".rs\"", "file!().ends_with(\".rs\"", false),
+        (
+            "file!().ends_with(\".rs\")",
+            "file!().ends_with(\".rs\")",
+            false,
+        ),
+        (
+            "file!().ends_with(\".rs\"",
+            "file!().ends_with(\".rs\"",
+            false,
+        ),
         // Process termination bypasses `Drop`. Build.rs uses
         // `std::process::exit(1)` legitimately at end-of-report and is
         // already exempt from every scanner.
@@ -1744,10 +1752,7 @@ fn scan_for_vendor_directories(
             continue;
         }
         if name == "vendor" {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_path_buf();
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
             offenders.push((
                 rel,
                 1,
@@ -1904,7 +1909,8 @@ fn scan_for_underscore_fn_args(
             };
             let mut sig_text = String::new();
             let mut line_offsets: Vec<(usize, usize)> = Vec::new();
-            for (rel, stripped_line) in stripped_lines[sig_start..=sig_end_line].iter().enumerate() {
+            for (rel, stripped_line) in stripped_lines[sig_start..=sig_end_line].iter().enumerate()
+            {
                 let j = sig_start + rel;
                 let part = if j == sig_end_line {
                     &stripped_line[..sig_end_col_excl]
