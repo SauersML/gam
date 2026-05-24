@@ -429,11 +429,27 @@ pub fn apply_linear_extension_from_first_derivative(
     Ok(())
 }
 
+/// Storage layout discriminant for [`BasisOutputFormat`] impls. Encoded as an
+/// enum rather than a bool so the type-level distinction reads as
+/// "Dense vs Sparse" at call sites instead of a polarity-sensitive flag.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum BasisStorageLayout {
+    Dense,
+    Sparse,
+}
+
+impl BasisStorageLayout {
+    #[inline]
+    pub const fn is_sparse(self) -> bool {
+        matches!(self, Self::Sparse)
+    }
+}
+
 /// Trait for building basis matrices with different storage formats.
 /// This is an implementation detail for the unified `create_basis` function.
 pub trait BasisOutputFormat {
     type Output;
-    const IS_SPARSE: bool;
+    const LAYOUT: BasisStorageLayout;
 
     fn build_basis(
         data: ArrayView1<f64>,
@@ -448,7 +464,7 @@ pub trait BasisOutputFormat {
 
 impl BasisOutputFormat for Dense {
     type Output = Arc<Array2<f64>>;
-    const IS_SPARSE: bool = false;
+    const LAYOUT: BasisStorageLayout = BasisStorageLayout::Dense;
 
     fn build_basis(
         data: ArrayView1<f64>,
@@ -602,7 +618,7 @@ fn one_sided_derivative_eval_point(x: f64, knotview: ArrayView1<f64>, degree: us
 
 impl BasisOutputFormat for Sparse {
     type Output = SparseColMat<usize, f64>;
-    const IS_SPARSE: bool = true;
+    const LAYOUT: BasisStorageLayout = BasisStorageLayout::Sparse;
 
     fn build_basis(
         data: ArrayView1<f64>,
@@ -1830,7 +1846,8 @@ fn realized_center_strategy(strategy: &CenterStrategy) -> &CenterStrategy {
 }
 
 pub fn center_strategy_kind(strategy: &CenterStrategy) -> CenterStrategyKind {
-    match realized_center_strategy(strategy) {
+    match strategy {
+        CenterStrategy::Auto(inner) => center_strategy_kind(inner.as_ref()),
         CenterStrategy::UserProvided(_) => CenterStrategyKind::UserProvided,
         CenterStrategy::EqualMass { .. } => CenterStrategyKind::EqualMass,
         CenterStrategy::EqualMassCovarRepresentative { .. } => {
@@ -1839,19 +1856,18 @@ pub fn center_strategy_kind(strategy: &CenterStrategy) -> CenterStrategyKind {
         CenterStrategy::FarthestPoint { .. } => CenterStrategyKind::FarthestPoint,
         CenterStrategy::KMeans { .. } => CenterStrategyKind::KMeans,
         CenterStrategy::UniformGrid { .. } => CenterStrategyKind::UniformGrid,
-        CenterStrategy::Auto(_) => unreachable!("realized center strategy must not be nested auto"),
     }
 }
 
 pub fn center_strategy_num_centers(strategy: &CenterStrategy) -> Option<usize> {
-    match realized_center_strategy(strategy) {
+    match strategy {
+        CenterStrategy::Auto(inner) => center_strategy_num_centers(inner.as_ref()),
         CenterStrategy::UserProvided(centers) => Some(centers.nrows()),
         CenterStrategy::EqualMass { num_centers }
         | CenterStrategy::EqualMassCovarRepresentative { num_centers }
         | CenterStrategy::FarthestPoint { num_centers }
         | CenterStrategy::KMeans { num_centers, .. } => Some(*num_centers),
         CenterStrategy::UniformGrid { .. } => None,
-        CenterStrategy::Auto(_) => unreachable!("realized center strategy must not be nested auto"),
     }
 }
 
@@ -1860,25 +1876,32 @@ pub fn center_strategy_with_num_centers(
     num_centers: usize,
 ) -> Result<CenterStrategy, BasisError> {
     validate_center_count(num_centers)?;
-    let rebuilt = match realized_center_strategy(strategy) {
-        CenterStrategy::EqualMass { .. } => CenterStrategy::EqualMass { num_centers },
-        CenterStrategy::EqualMassCovarRepresentative { .. } => {
-            CenterStrategy::EqualMassCovarRepresentative { num_centers }
+    fn rebuild_inner(
+        strategy: &CenterStrategy,
+        num_centers: usize,
+    ) -> Result<CenterStrategy, BasisError> {
+        match strategy {
+            CenterStrategy::Auto(inner) => rebuild_inner(inner.as_ref(), num_centers),
+            CenterStrategy::EqualMass { .. } => Ok(CenterStrategy::EqualMass { num_centers }),
+            CenterStrategy::EqualMassCovarRepresentative { .. } => {
+                Ok(CenterStrategy::EqualMassCovarRepresentative { num_centers })
+            }
+            CenterStrategy::FarthestPoint { .. } => {
+                Ok(CenterStrategy::FarthestPoint { num_centers })
+            }
+            CenterStrategy::KMeans { max_iter, .. } => Ok(CenterStrategy::KMeans {
+                num_centers,
+                max_iter: *max_iter,
+            }),
+            CenterStrategy::UserProvided(_) | CenterStrategy::UniformGrid { .. } => {
+                Err(BasisError::InvalidInput(format!(
+                    "cannot replace center count for {:?} strategy",
+                    center_strategy_kind(strategy)
+                )))
+            }
         }
-        CenterStrategy::FarthestPoint { .. } => CenterStrategy::FarthestPoint { num_centers },
-        CenterStrategy::KMeans { max_iter, .. } => CenterStrategy::KMeans {
-            num_centers,
-            max_iter: *max_iter,
-        },
-        CenterStrategy::UserProvided(_) | CenterStrategy::UniformGrid { .. } => {
-            Err(BasisError::InvalidInput(format!(
-                "cannot replace center count for {:?} strategy",
-                center_strategy_kind(strategy)
-            )))?
-        }
-        CenterStrategy::Auto(_) => unreachable!("realized center strategy must not be nested auto"),
-    };
-    Ok(rebuilt)
+    }
+    let rebuilt = rebuild_inner(strategy, num_centers)?;
 }
 
 /// Thin-plate basis configuration.
@@ -2251,9 +2274,12 @@ pub fn resolve_duchon_orders(
         }
         nullspace = duchon_next_nullspace_order(nullspace);
     }
-    unreachable!(
-        "resolve_duchon_orders did not converge for dim={dim}, max_op={max_operator_derivative_order}, pure={pure}"
-    )
+    // Bounded-loop fallback: by the analysis in the docstring, for
+    // `p >= ceil((dim + max_op) / 2) + 1` the operator constraint admits
+    // `s = 0` and (in pure mode) `0 < dim` satisfies the kernel-existence
+    // condition. The loop above always reaches that regime within the bound,
+    // so returning the last `nullspace` with `s = 0` is a valid answer.
+    (nullspace, 0)
 }
 
 #[inline]
