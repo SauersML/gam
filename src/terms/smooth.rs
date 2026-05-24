@@ -21439,7 +21439,10 @@ mod tests {
             weights.view(),
             offset.view(),
             &spec,
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &fit_opts,
         )
         .expect("baseline fit should succeed");
@@ -21451,7 +21454,10 @@ mod tests {
             weights.clone(),
             offset.clone(),
             &spec,
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions {
                 enabled: true,
@@ -21654,7 +21660,10 @@ mod tests {
             &design,
         ));
         assert!(exact_joint_spatial_outer_hessian_available(
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &design,
         ));
     }
@@ -22287,7 +22296,10 @@ mod tests {
         let (pass, worst, violations) = iso_kappa_fd_variant_driver(
             "duchon_gaussian",
             80,
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             false,
             false,
         );
@@ -24024,7 +24036,10 @@ mod tests {
                 .expect("reused eval");
 
                 let fresh_opts = external_opts_for_design(
-                    LikelihoodFamily::GaussianIdentity,
+                    LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
                     cache.design(),
                     &fit_opts,
                 );
@@ -24471,7 +24486,10 @@ mod tests {
             weights.view(),
             offset.view(),
             &spec,
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &fit_opts,
         )
         .expect("baseline fit should succeed");
@@ -24483,7 +24501,10 @@ mod tests {
             weights.clone(),
             offset.clone(),
             &spec,
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions {
                 enabled: true,
@@ -24715,7 +24736,10 @@ mod tests {
             weights,
             offset,
             &spec,
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions::default(),
         )
@@ -25075,7 +25099,10 @@ mod tests {
             Array1::ones(data.nrows()),
             Array1::zeros(data.nrows()),
             &spec,
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions::default(),
         )
@@ -25344,7 +25371,10 @@ mod tests {
             Array1::ones(n),
             Array1::zeros(n),
             &spec,
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions::default(),
         )
@@ -25706,7 +25736,10 @@ mod tests {
             Array1::ones(n),
             Array1::zeros(n),
             &spec,
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &FitOptions {
                 latent_cloglog: None,
                 mixture_link: None,
@@ -26210,7 +26243,10 @@ mod tests {
             Array1::ones(n).view(),
             Array1::zeros(n).view(),
             &spec,
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &FitOptions {
                 latent_cloglog: None,
                 mixture_link: None,
@@ -26296,7 +26332,10 @@ mod tests {
             Array1::ones(n).view(),
             Array1::zeros(n).view(),
             &spec,
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &FitOptions {
                 latent_cloglog: None,
                 mixture_link: None,
@@ -26479,7 +26518,10 @@ mod tests {
             Array1::ones(n).view(),
             Array1::zeros(n).view(),
             &spec,
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &FitOptions {
                 latent_cloglog: None,
                 mixture_link: None,
@@ -26705,7 +26747,10 @@ mod tests {
             Array1::ones(n).view(),
             Array1::zeros(n).view(),
             &spec,
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &FitOptions {
                 latent_cloglog: None,
                 mixture_link: None,
@@ -26888,7 +26933,10 @@ mod tests {
             Array1::ones(n).view(),
             Array1::zeros(n).view(),
             &spec,
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &FitOptions {
                 latent_cloglog: None,
                 mixture_link: None,
