@@ -742,7 +742,10 @@ pub fn assemble_and_factor_sparse_penalized_system(
 }
 
 #[cfg(test)]
-fn build_sparse_penalty_blocks(
+mod tests_blocks {
+    use super::*;
+
+pub(super) fn build_sparse_penalty_blocks(
     s_list: &[Array2<f64>],
 ) -> Result<Option<Vec<SparsePenaltyBlock>>, EstimationError> {
     use crate::faer_ndarray::FaerEigh;
@@ -838,6 +841,7 @@ fn build_sparse_penalty_blocks(
         });
     }
     Ok(Some(blocks))
+}
 }
 
 /// Build sparse penalty blocks from canonical penalties, avoiding redundant
@@ -1577,7 +1581,7 @@ mod tests {
         let mut s = Array2::<f64>::zeros((4, 4));
         s[[1, 1]] = 2.0;
         s[[2, 2]] = 3.0;
-        let blocks = build_sparse_penalty_blocks(&[s])
+        let blocks = super::tests_blocks::build_sparse_penalty_blocks(&[s])
             .unwrap()
             .expect("single local block expected");
 
