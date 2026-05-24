@@ -3362,32 +3362,6 @@ fn build_standard_latent_analytic_penalty_registry(
                     .map_err(|err| format!("{context}: {err}"))?,
                 )));
             }
-            "parametric_aux_conditional_prior" => {
-                let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
-                let n_eff = analytic_descriptor_usize(descriptor, "n_eff", target.n)?;
-                let learnable = descriptor
-                    .get("learnable")
-                    .and_then(JsonValue::as_bool)
-                    .unwrap_or(false);
-                let aux =
-                    analytic_descriptor_array2_flat(descriptor, "aux", "aux_shape", &context)?;
-                let log_alpha = analytic_descriptor_array1_flat(descriptor, "log_alpha", &context)?;
-                let raw_beta = analytic_descriptor_array1_flat(descriptor, "raw_beta", &context)?;
-                let mu = analytic_descriptor_array2_flat(descriptor, "mu", "mu_shape", &context)?;
-                registry.push(AnalyticPenaltyKind::ParametricAuxConditionalPrior(Arc::new(
-                    ParametricAuxConditionalPriorPenalty::new(
-                        slice,
-                        aux,
-                        log_alpha,
-                        raw_beta,
-                        mu,
-                        weight,
-                        n_eff,
-                        learnable,
-                    )
-                    .map_err(|err| format!("{context}: {err}"))?,
-                )));
-            }
             other => return Err(format!("{context}.kind has unsupported analytic penalty {other:?}")),
         }
     }
@@ -3444,83 +3418,6 @@ fn analytic_descriptor_array3_flat(
         flat.push(value);
     }
     Array3::from_shape_vec((shape[0], shape[1], shape[2]), flat)
-        .map_err(|err| format!("{context}.{data_key} shape reconstruction failed: {err}"))
-}
-
-fn analytic_descriptor_array1_flat(
-    descriptor: &serde_json::Map<String, JsonValue>,
-    data_key: &str,
-    context: &str,
-) -> Result<Array1<f64>, String> {
-    let values = descriptor
-        .get(data_key)
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| format!("{context}.{data_key} must be a flattened numeric array"))?;
-    if values.is_empty() {
-        return Err(format!("{context}.{data_key} must be non-empty"));
-    }
-    let mut flat = Vec::with_capacity(values.len());
-    for (idx, cell) in values.iter().enumerate() {
-        let value = cell
-            .as_f64()
-            .ok_or_else(|| format!("{context}.{data_key}[{idx}] must be a finite number"))?;
-        if !value.is_finite() {
-            return Err(format!("{context}.{data_key}[{idx}] must be finite"));
-        }
-        flat.push(value);
-    }
-    Ok(Array1::from(flat))
-}
-
-fn analytic_descriptor_array2_flat(
-    descriptor: &serde_json::Map<String, JsonValue>,
-    data_key: &str,
-    shape_key: &str,
-    context: &str,
-) -> Result<Array2<f64>, String> {
-    let shape_values = descriptor
-        .get(shape_key)
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| format!("{context}.{shape_key} must be a two-item shape list"))?;
-    if shape_values.len() != 2 {
-        return Err(format!(
-            "{context}.{shape_key} must contain exactly two dimensions"
-        ));
-    }
-    let mut shape = [0usize; 2];
-    for (idx, raw_dim) in shape_values.iter().enumerate() {
-        let dim = raw_dim.as_u64().ok_or_else(|| {
-            format!("{context}.{shape_key}[{idx}] must be a positive integer")
-        })?;
-        if dim == 0 {
-            return Err(format!("{context}.{shape_key}[{idx}] must be > 0"));
-        }
-        shape[idx] = dim as usize;
-    }
-    let expected_len = shape[0]
-        .checked_mul(shape[1])
-        .ok_or_else(|| format!("{context}.{shape_key} overflows usize"))?;
-    let values = descriptor
-        .get(data_key)
-        .and_then(JsonValue::as_array)
-        .ok_or_else(|| format!("{context}.{data_key} must be a flattened numeric array"))?;
-    if values.len() != expected_len {
-        return Err(format!(
-            "{context}.{data_key} length {} does not match {shape_key} product {expected_len}",
-            values.len()
-        ));
-    }
-    let mut flat = Vec::with_capacity(expected_len);
-    for (idx, cell) in values.iter().enumerate() {
-        let value = cell
-            .as_f64()
-            .ok_or_else(|| format!("{context}.{data_key}[{idx}] must be a finite number"))?;
-        if !value.is_finite() {
-            return Err(format!("{context}.{data_key}[{idx}] must be finite"));
-        }
-        flat.push(value);
-    }
-    Array2::from_shape_vec((shape[0], shape[1]), flat)
         .map_err(|err| format!("{context}.{data_key} shape reconstruction failed: {err}"))
 }
 
