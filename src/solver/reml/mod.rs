@@ -6,7 +6,8 @@ use crate::linalg::sparse_exact::{
 };
 use crate::solver::outer_strategy::OuterEval;
 use crate::types::SasLinkState;
-use ndarray::s;
+use ndarray::{Array2, s};
+use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
@@ -27,6 +28,57 @@ const FIRTH_MAX_OBSERVATIONS: usize = 20_000;
 const FIRTH_MAX_COEFFICIENTS: usize = 256;
 const FIRTH_MAX_LINEAR_WORK: usize = 2_000_000;
 const FIRTH_MAX_QUADRATIC_WORK: usize = 100_000_000;
+const PERSISTENT_LATENT_VALUES_CACHE_CAPACITY: usize = 8;
+
+#[derive(Debug)]
+pub(crate) struct PersistentLatentValuesCache {
+    entries: HashMap<String, Array2<f64>>,
+    lru: VecDeque<String>,
+    capacity: usize,
+}
+
+impl Default for PersistentLatentValuesCache {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru: VecDeque::new(),
+            capacity: PERSISTENT_LATENT_VALUES_CACHE_CAPACITY,
+        }
+    }
+}
+
+impl PersistentLatentValuesCache {
+    pub(crate) fn lookup(&mut self, key: &str, n_obs: usize, latent_dim: usize) -> Option<Array2<f64>> {
+        let values = self.entries.get(key)?;
+        if values.dim() != (n_obs, latent_dim) {
+            return None;
+        }
+        let values = values.clone();
+        self.touch(key.to_string());
+        Some(values)
+    }
+
+    pub(crate) fn insert(&mut self, key: String, values: Array2<f64>) {
+        if values.iter().any(|value| !value.is_finite()) {
+            return;
+        }
+        self.entries.insert(key.clone(), values);
+        self.touch(key);
+        while self.entries.len() > self.capacity {
+            let Some(evicted) = self.lru.pop_front() else {
+                break;
+            };
+            self.entries.remove(&evicted);
+        }
+    }
+
+    fn touch(&mut self, key: String) {
+        if let Some(index) = self.lru.iter().position(|queued| queued == &key) {
+            self.lru.remove(index);
+        }
+        self.lru.push_back(key);
+    }
+}
 
 /// Cached state from the most recent successful PIRLS solve, populated by
 /// `updatewarm_start_from` and consumed by the IFT-based warm-start
@@ -4182,6 +4234,7 @@ pub(crate) struct RemlState<'a> {
     /// Stable disk-cache key for the current realized REML surface. Computed
     /// lazily because it hashes the row-chunked design and data vectors.
     pub(crate) persistent_warm_start_key: RwLock<Option<String>>,
+    pub(crate) persistent_latent_values_cache: RwLock<PersistentLatentValuesCache>,
     pub(crate) analytic_penalty_registry_fingerprint: u64,
     /// Ensures the process attempts at most one disk restore per surface.
     pub(crate) persistent_warm_start_loaded: AtomicBool,

@@ -34407,40 +34407,41 @@ mod tests {
         let r = 1.0_f64;
         let length_scale = 1.0_f64;
 
-        for &nu in &[
-            MaternNu::FiveHalves,
-            MaternNu::SevenHalves,
-            MaternNu::NineHalves,
-        ] {
-            let a = match nu {
-                MaternNu::FiveHalves => 5.0_f64.sqrt() * r / length_scale,
-                MaternNu::SevenHalves => 7.0_f64.sqrt() * r / length_scale,
-                MaternNu::NineHalves => 3.0 * r / length_scale,
-                MaternNu::Half | MaternNu::ThreeHalves => {
-                    panic!("test only covers nu >= 5/2; got {nu:?}")
-                }
-            };
-            let (expected_ratio, expected_lap) = match nu {
-                MaternNu::FiveHalves => (
-                    -(5.0 / 3.0) * (-a).exp() * (a + 1.0),
-                    (5.0 / 3.0) * (-a).exp() * (a * a - a - 1.0),
-                ),
-                MaternNu::SevenHalves => (
-                    -(7.0 / 15.0) * (-a).exp() * (a * a + 3.0 * a + 3.0),
-                    (7.0 / 15.0) * (-a).exp() * (a.powi(3) - 3.0 * a - 3.0),
-                ),
-                MaternNu::NineHalves => (
-                    -(3.0 / 35.0) * (-a).exp() * (a.powi(3) + 6.0 * a * a + 15.0 * a + 15.0),
-                    (3.0 / 35.0)
-                        * (-a).exp()
-                        * (a.powi(4) + 2.0 * a.powi(3) - 3.0 * a * a - 15.0 * a - 15.0),
-                ),
-                MaternNu::Half | MaternNu::ThreeHalves => {
-                    panic!("test only covers nu >= 5/2; got {nu:?}")
-                }
-            };
-            let triplet =
-                matern_operator_psi_triplet(r, length_scale, nu, 1).expect("operator psi triplet");
+        // Pre-baked closed-form `(nu, a, expected_ratio, expected_lap)`
+        // tuples for the three supported smoothnesses; eliminates any
+        // need to match the broader `MaternNu` enum (which has variants
+        // — `Half`, `ThreeHalves` — that this closed-form test does not
+        // cover).
+        let a52 = 5.0_f64.sqrt() * r / length_scale;
+        let a72 = 7.0_f64.sqrt() * r / length_scale;
+        let a92 = 3.0 * r / length_scale;
+        let cases: [(MaternNu, f64, f64, f64); 3] = [
+            (
+                MaternNu::FiveHalves,
+                a52,
+                -(5.0 / 3.0) * (-a52).exp() * (a52 + 1.0),
+                (5.0 / 3.0) * (-a52).exp() * (a52 * a52 - a52 - 1.0),
+            ),
+            (
+                MaternNu::SevenHalves,
+                a72,
+                -(7.0 / 15.0) * (-a72).exp() * (a72 * a72 + 3.0 * a72 + 3.0),
+                (7.0 / 15.0) * (-a72).exp() * (a72.powi(3) - 3.0 * a72 - 3.0),
+            ),
+            (
+                MaternNu::NineHalves,
+                a92,
+                -(3.0 / 35.0)
+                    * (-a92).exp()
+                    * (a92.powi(3) + 6.0 * a92 * a92 + 15.0 * a92 + 15.0),
+                (3.0 / 35.0)
+                    * (-a92).exp()
+                    * (a92.powi(4) + 2.0 * a92.powi(3) - 3.0 * a92 * a92 - 15.0 * a92 - 15.0),
+            ),
+        ];
+        for (nu, _a, expected_ratio, expected_lap) in cases {
+            let triplet = matern_operator_psi_triplet(r, length_scale, nu, 1)
+                .expect("operator psi triplet");
             let ratio = triplet.3;
             let lap = triplet.6;
             assert!(
@@ -34459,11 +34460,43 @@ mod tests {
         let centers = array![[0.0], [1.0]];
         let length_scale = 1.0_f64;
 
-        for &nu in &[
-            MaternNu::FiveHalves,
-            MaternNu::SevenHalves,
-            MaternNu::NineHalves,
-        ] {
+        // Pre-baked `(nu, expected_phi, expected_ratio, expected_second)`
+        // tuples for the three supported smoothnesses; eliminates the
+        // need to match the wider `MaternNu` enum (which has `Half` and
+        // `ThreeHalves` variants this closed-form test does not cover).
+        let r = 1.0_f64;
+        let a52 = 5.0_f64.sqrt() * r / length_scale;
+        let a72 = 7.0_f64.sqrt() * r / length_scale;
+        let a92 = 3.0 * r / length_scale;
+        let cases: [(MaternNu, f64, f64, f64); 3] = [
+            (
+                MaternNu::FiveHalves,
+                (1.0 + a52 + a52 * a52 / 3.0) * (-a52).exp(),
+                -(5.0 / 3.0) * (-a52).exp() * (a52 + 1.0),
+                (5.0 / 3.0) * (-a52).exp() * (a52 * a52 - a52 - 1.0),
+            ),
+            (
+                MaternNu::SevenHalves,
+                (1.0 + a72 + (2.0 / 5.0) * a72 * a72 + (1.0 / 15.0) * a72.powi(3)) * (-a72).exp(),
+                -(7.0 / 15.0) * (-a72).exp() * (a72 * a72 + 3.0 * a72 + 3.0),
+                (7.0 / 15.0) * (-a72).exp() * (a72.powi(3) - 3.0 * a72 - 3.0),
+            ),
+            (
+                MaternNu::NineHalves,
+                (1.0 + a92
+                    + (3.0 / 7.0) * a92 * a92
+                    + (2.0 / 21.0) * a92.powi(3)
+                    + (1.0 / 105.0) * a92.powi(4))
+                    * (-a92).exp(),
+                -(3.0 / 35.0)
+                    * (-a92).exp()
+                    * (a92.powi(3) + 6.0 * a92 * a92 + 15.0 * a92 + 15.0),
+                (3.0 / 35.0)
+                    * (-a92).exp()
+                    * (a92.powi(4) + 2.0 * a92.powi(3) - 3.0 * a92 * a92 - 15.0 * a92 - 15.0),
+            ),
+        ];
+        for (nu, expected_phi, expected_ratio, expected_second) in cases {
             let ops = build_matern_collocation_operator_matrices(
                 centers.view(),
                 None,
@@ -34474,42 +34507,6 @@ mod tests {
                 None,
             )
             .expect("matern collocation operators");
-
-            let r = 1.0_f64;
-            let a = match nu {
-                MaternNu::FiveHalves => 5.0_f64.sqrt() * r / length_scale,
-                MaternNu::SevenHalves => 7.0_f64.sqrt() * r / length_scale,
-                MaternNu::NineHalves => 3.0 * r / length_scale,
-                MaternNu::Half | MaternNu::ThreeHalves => {
-                    panic!("test only covers nu >= 5/2; got {nu:?}")
-                }
-            };
-            let (expected_phi, expected_ratio, expected_second) = match nu {
-                MaternNu::FiveHalves => (
-                    (1.0 + a + a * a / 3.0) * (-a).exp(),
-                    -(5.0 / 3.0) * (-a).exp() * (a + 1.0),
-                    (5.0 / 3.0) * (-a).exp() * (a * a - a - 1.0),
-                ),
-                MaternNu::SevenHalves => (
-                    (1.0 + a + (2.0 / 5.0) * a * a + (1.0 / 15.0) * a.powi(3)) * (-a).exp(),
-                    -(7.0 / 15.0) * (-a).exp() * (a * a + 3.0 * a + 3.0),
-                    (7.0 / 15.0) * (-a).exp() * (a.powi(3) - 3.0 * a - 3.0),
-                ),
-                MaternNu::NineHalves => (
-                    (1.0 + a
-                        + (3.0 / 7.0) * a * a
-                        + (2.0 / 21.0) * a.powi(3)
-                        + (1.0 / 105.0) * a.powi(4))
-                        * (-a).exp(),
-                    -(3.0 / 35.0) * (-a).exp() * (a.powi(3) + 6.0 * a * a + 15.0 * a + 15.0),
-                    (3.0 / 35.0)
-                        * (-a).exp()
-                        * (a.powi(4) + 2.0 * a.powi(3) - 3.0 * a * a - 15.0 * a - 15.0),
-                ),
-                MaternNu::Half | MaternNu::ThreeHalves => {
-                    panic!("test only covers nu >= 5/2; got {nu:?}")
-                }
-            };
 
             assert!(
                 (ops.d0[[1, 0]] - expected_phi).abs() < 1e-14,

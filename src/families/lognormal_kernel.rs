@@ -155,10 +155,22 @@ pub struct ProbitFrailtyScale {
 
 impl ProbitFrailtyScale {
     pub fn new(sigma: f64) -> Self {
+        let (s, _) = probit_frailty_scale_components(sigma);
+        Self { s }
+    }
+}
+
+#[inline]
+fn probit_frailty_scale_components(sigma: f64) -> (f64, f64) {
+    let abs_sigma = sigma.abs();
+    if abs_sigma > 1.0 {
+        let inv = 1.0 / abs_sigma;
+        let denom = 1.0 + inv * inv;
+        (inv / denom.sqrt(), 1.0 / denom)
+    } else {
         let sigma2 = sigma * sigma;
-        Self {
-            s: 1.0 / (1.0 + sigma2).sqrt(),
-        }
+        let denom = 1.0 + sigma2;
+        (1.0 / denom.sqrt(), sigma2 / denom)
     }
 }
 
@@ -187,10 +199,7 @@ impl ProbitFrailtyScaleJet {
     /// At σ = 0 the jet degenerates to (s=1, α=0, ds=0, d2s=0), which is
     /// correct: zero frailty means s ≡ 1 independent of t.
     pub fn new(sigma: f64) -> Self {
-        let sigma2 = sigma * sigma;
-        let one_plus_sigma2 = 1.0 + sigma2;
-        let s = 1.0 / one_plus_sigma2.sqrt();
-        let alpha = sigma2 / one_plus_sigma2;
+        let (s, alpha) = probit_frailty_scale_components(sigma);
         Self {
             s,
             alpha,

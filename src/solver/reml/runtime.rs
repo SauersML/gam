@@ -3457,6 +3457,21 @@ impl<'a> RemlState<'a> {
         ))
     }
 
+    fn hessian_surface_arrays(
+        &self,
+        pirls_result: &PirlsResult,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+        let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
+        Ok(crate::pirls::outer_hessian_curvature_arrays(
+            &pirls_result.finalweights,
+            &pirls_result.solveweights,
+            &c_array,
+            &d_array,
+            &pirls_result.final_eta,
+            &self.config.link_kind,
+        ))
+    }
+
     /// Returns the (c, d, e) per-row mode-curvature carriers required for
     /// the analytic Tierney–Kadane c/d derivative propagation.
     ///
@@ -4079,6 +4094,7 @@ impl<'a> RemlState<'a> {
             penalty_block_structural_nullities: RwLock::new(None),
             gaussian_fixed_cache: RwLock::new(None),
             persistent_warm_start_key: RwLock::new(None),
+            persistent_latent_values_cache: RwLock::new(PersistentLatentValuesCache::default()),
             analytic_penalty_registry_fingerprint: 0,
             persistent_warm_start_loaded: AtomicBool::new(false),
         })
@@ -4890,6 +4906,39 @@ impl<'a> RemlState<'a> {
             .unwrap()
             .replace(key.clone());
         Some(key)
+    }
+
+    fn persistent_latent_values_cache_key(&self) -> Option<String> {
+        self.persistent_warm_start_cache_key()
+            .map(|key| format!("persistent-latent-values-v1:{key}"))
+    }
+
+    pub(crate) fn load_persistent_latent_values(
+        &self,
+        n_obs: usize,
+        latent_dim: usize,
+    ) -> Option<Array2<f64>> {
+        if !self.warm_start_enabled.load(Ordering::Relaxed) {
+            return None;
+        }
+        let key = self.persistent_latent_values_cache_key()?;
+        self.persistent_latent_values_cache
+            .write()
+            .unwrap()
+            .lookup(&key, n_obs, latent_dim)
+    }
+
+    pub(crate) fn store_persistent_latent_values(&self, values: &Array2<f64>) {
+        if !self.warm_start_enabled.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(key) = self.persistent_latent_values_cache_key() else {
+            return;
+        };
+        self.persistent_latent_values_cache
+            .write()
+            .unwrap()
+            .insert(key, values.clone());
     }
 
     fn load_persistent_warm_start_once(&self) {
@@ -5824,10 +5873,11 @@ impl<'a> RemlState<'a> {
         let precomputed_xtwx = gaussian_cache
             .as_ref()
             .and_then(|c| c.xtwx_sparse_orig.as_ref().map(|arc| arc.as_ref()));
+        let (hessian_weights, _, _) = self.hessian_surface_arrays(pirls_result.as_ref())?;
         let sparse_system = assemble_and_factor_sparse_penalized_system(
             &mut workspace,
             x_sparse,
-            &pirls_result.finalweights,
+            &hessian_weights,
             &s_lambda,
             ridge_passport.delta,
             precomputed_xtwx,
@@ -7555,7 +7605,8 @@ impl<'a> RemlState<'a> {
             if is_gaussian_identity || pirls_result.derivatives_unsupported {
                 Box::new(GaussianDerivatives)
             } else {
-                let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
+                let (hessian_weights, c_array, d_array) =
+                    self.hessian_surface_arrays(pirls_result)?;
                 let x_transformed = if let Some(z) = free_basis_opt.as_ref() {
                     // Project the design: X_proj = X Z
                     let x_dense = pirls_result.x_transformed.to_dense();
@@ -7568,7 +7619,7 @@ impl<'a> RemlState<'a> {
                 let base = SinglePredictorGlmDerivatives {
                     c_array,
                     d_array: Some(d_array),
-                    hessian_weights: pirls_result.finalweights.clone(),
+                    hessian_weights,
                     x_transformed,
                 };
                 if firth_active_for_derivs {
@@ -7681,7 +7732,8 @@ impl<'a> RemlState<'a> {
                     Box::new(GaussianDerivatives),
                 )
             } else {
-                let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
+                let (hessian_weights, c_array, d_array) =
+                    self.hessian_surface_arrays(pirls_result)?;
                 (
                     DispersionHandling::Fixed {
                         phi: reml_fixed_glm_dispersion(pirls_result.likelihood),
@@ -7692,7 +7744,7 @@ impl<'a> RemlState<'a> {
                         let base = SinglePredictorGlmDerivatives {
                             c_array,
                             d_array: Some(d_array),
-                            hessian_weights: pirls_result.finalweights.clone(),
+                            hessian_weights,
                             x_transformed: self.x().clone(),
                         };
                         // Match the dense exact path: when Firth-logit is
