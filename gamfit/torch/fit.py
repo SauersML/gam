@@ -36,6 +36,7 @@ from ..smooth import (
     Categorical,
     Duchon,
     Matern,
+    Pca,
     PeriodicSplineCurve,
     Sphere,
     Smooth,
@@ -223,6 +224,32 @@ def _build_design_penalty(
             penalty_order=smooth.penalty_order,
         )
         return design.to(torch.float64), penalty.to(torch.float64)
+
+    if isinstance(smooth, Pca):
+        if smooth.basis is None:
+            if smooth.K is None:
+                raise ValueError("Pca requires K when basis is None")
+            x_for_pca = points - points.mean(dim=0, keepdim=True) if smooth.centered else points
+            _u, _s, vh = torch.linalg.svd(x_for_pca.to(torch.float64), full_matrices=False)
+            basis = vh[: int(smooth.K)].T.contiguous()
+        else:
+            basis = _to_tensor(smooth.basis, points).to(torch.float64)
+            if basis.dim() != 2:
+                raise ValueError(f"Pca.basis must be 2D, got shape {tuple(basis.shape)}")
+            if smooth.K is not None:
+                basis = basis[:, : int(smooth.K)]
+        if basis.shape[0] != points.shape[1]:
+            raise ValueError(
+                f"Pca: points d={points.shape[1]} but basis has {basis.shape[0]} rows"
+            )
+        design_points = points.to(torch.float64)
+        if smooth.centered:
+            design_points = design_points - design_points.mean(dim=0, keepdim=True)
+        design = design_points @ basis
+        penalty = torch.eye(
+            basis.shape[1], dtype=torch.float64, device=points.device
+        ) * float(smooth.smooth_penalty)
+        return design, penalty
 
     if isinstance(smooth, (TensorBSpline, Matern, Categorical)):
         raise NotImplementedError(
