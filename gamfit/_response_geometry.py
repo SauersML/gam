@@ -307,6 +307,41 @@ def _normalized_weights(n: int, weights: Any | None) -> Any:
     return w / float(w.sum())
 
 
+def _normalize_fisher_rao_w(value: Any, *, n_rows: int, dim: int) -> Any:
+    import numpy as np
+
+    w = np.asarray(value, dtype=float)
+    if w.ndim == 1:
+        if w.shape[0] != n_rows:
+            raise ValueError(
+                f"fisher_rao_w vector must have length {n_rows}; got {w.shape[0]}"
+            )
+        out = np.zeros((n_rows, dim, dim), dtype=float)
+        idx = np.arange(dim)
+        out[:, idx, idx] = w[:, None]
+    elif w.ndim == 2:
+        if w.shape != (dim, dim):
+            raise ValueError(
+                f"fisher_rao_w matrix must have shape ({dim}, {dim}); got {w.shape}"
+            )
+        out = np.broadcast_to(w, (n_rows, dim, dim)).copy()
+    elif w.ndim == 3:
+        if w.shape != (n_rows, dim, dim):
+            raise ValueError(
+                f"fisher_rao_w must have shape ({n_rows}, {dim}, {dim}); got {w.shape}"
+            )
+        out = np.ascontiguousarray(w, dtype=float)
+    else:
+        raise ValueError("fisher_rao_w must be a 1-D, 2-D, or 3-D numeric array")
+    if not np.all(np.isfinite(out)):
+        raise ValueError("fisher_rao_w must contain only finite values")
+    if not np.allclose(out, np.swapaxes(out, 1, 2), rtol=1e-10, atol=1e-10):
+        raise ValueError("fisher_rao_w must be symmetric in every row block")
+    if np.any(np.diagonal(out, axis1=1, axis2=2) < 0.0):
+        raise ValueError("fisher_rao_w diagonal entries must be non-negative")
+    return out
+
+
 def response_matrix_from_table(data: Any, response_columns: Sequence[str]) -> Any:
     columns, _kind = table_columns(data)
     missing = [name for name in response_columns if name not in columns]
@@ -491,6 +526,7 @@ def fit_response_geometry(
     coordinates: str | None = None,
     reference: int = -1,
     weights: str | None = None,
+    fisher_rao_w: Any | None = None,
     fit_kwargs: dict[str, Any] | None = None,
 ) -> ResponseGeometryModel:
     columns, table_kind = table_columns(data)
@@ -512,6 +548,12 @@ def fit_response_geometry(
     kwargs["frailty_kind"] = None
     kwargs["frailty_sd"] = None
     kwargs["hazard_loading"] = None
+    fisher_w = None
+    if fisher_rao_w is not None:
+        fisher_w = _normalize_fisher_rao_w(
+            fisher_rao_w, n_rows=tangent.shape[0], dim=tangent.shape[1]
+        )
+    kwargs.pop("fisher_rao_w", None)
     target = "__gamfit_response_geometry_shared"
     if target in columns:
         raise ValueError(f"response geometry reserved column already exists: {target}")
@@ -519,7 +561,9 @@ def fit_response_geometry(
     augmented[target] = tangent[:, 0].tolist()
     template_formula = f"{target} ~ {rhs}"
     template_model = fit_func(augmented, template_formula, **kwargs)
-    shared_fit = _fit_shared_tangent_reml(augmented, template_formula, tangent, kwargs)
+    shared_fit = _fit_shared_tangent_reml(
+        augmented, template_formula, tangent, kwargs, fisher_w
+    )
     return ResponseGeometryModel(
         models=(),
         response_geometry=response_geometry.lower(),
@@ -550,6 +594,7 @@ def _fit_shared_tangent_reml(
     formula: str,
     tangent: Any,
     fit_kwargs: dict[str, Any],
+    fisher_rao_w: Any | None = None,
 ) -> dict[str, Any]:
     import json
     import numpy as np
@@ -570,6 +615,7 @@ def _fit_shared_tangent_reml(
             formula,
             y,
             json.dumps(config),
+            fisher_rao_w,
         )
     except Exception as exc:
         raise map_exception(exc) from exc
