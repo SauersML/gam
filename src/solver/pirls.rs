@@ -1013,9 +1013,6 @@ pub struct PirlsWorkspace {
     pub hessian_buf: Array2<f64>,
     // Reusable n-length buffer for X*β matvec (avoids per-iteration allocation in update).
     pub matvec_buf: Array1<f64>,
-    // Cached √w buffer recomputed at IRLS reweight; consumed by sparse weighted
-    // assembly so we don't repeatedly square-root the per-row weights.
-    pub sqrtw: Array1<f64>,
 }
 
 impl PirlsWorkspace {
@@ -1054,7 +1051,6 @@ impl PirlsWorkspace {
             weighted_x_chunk: Array2::zeros((0, 0).f()),
             hessian_buf: Array2::zeros((0, 0).f()),
             matvec_buf: Array1::zeros(n),
-            sqrtw: Array1::zeros(n),
         }
     }
 
