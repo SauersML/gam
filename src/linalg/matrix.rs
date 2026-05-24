@@ -6296,18 +6296,17 @@ impl DesignMatrix {
                 }
             }
             (Self::Sparse(lhs), Self::Sparse(rhs)) => {
-                // SAFETY: both `to_csr_arc` calls only return `None` if csc→csr
-                // conversion fails on a well-formed sparse matrix, which is
-                // impossible — `SparseDesignMatrix`'s validation invariants
-                // upstream guarantee both inputs round-trip to CSR.
-                // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
-                let lhs_csr = lhs.to_csr_arc().unwrap_or_else(|| {
-                    panic!("crossdiag_axpy_row_into: failed to obtain lhs CSR view")
-                });
-                // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
-                let rhs_csr = rhs.to_csr_arc().unwrap_or_else(|| {
-                    panic!("crossdiag_axpy_row_into: failed to obtain rhs CSR view")
-                });
+                // `to_csr_arc` returns `None` only if csc→csr conversion fails;
+                // `SparseDesignMatrix`'s validation invariants make that
+                // structurally impossible, but the function returns `Result`
+                // so propagate rather than panic if a future invariant break
+                // surfaces here.
+                let lhs_csr = lhs.to_csr_arc().ok_or_else(|| {
+                    "crossdiag_axpy_row_into: failed to obtain lhs CSR view".to_string()
+                })?;
+                let rhs_csr = rhs.to_csr_arc().ok_or_else(|| {
+                    "crossdiag_axpy_row_into: failed to obtain rhs CSR view".to_string()
+                })?;
                 let lhs_sym = lhs_csr.symbolic();
                 let rhs_sym = rhs_csr.symbolic();
                 let lhs_rp = lhs_sym.row_ptr();
@@ -6349,13 +6348,12 @@ impl DesignMatrix {
                         );
                     }
                 };
-                // SAFETY: same CSR conversion invariant as above — only fails
-                // on a malformed sparse matrix, which the SparseDesignMatrix
-                // invariants forbid.
-                // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
-                let csr = sparse_mat.to_csr_arc().unwrap_or_else(|| {
-                    panic!("crossdiag_axpy_row_into: failed to obtain CSR view")
-                });
+                // Same CSR conversion contract as the (Sparse, Sparse) arm
+                // above — propagate the (structurally impossible) failure
+                // through this fn's `Result` rather than panicking.
+                let csr = sparse_mat.to_csr_arc().ok_or_else(|| {
+                    "crossdiag_axpy_row_into: failed to obtain CSR view".to_string()
+                })?;
                 let sym = csr.symbolic();
                 let row_ptr = sym.row_ptr();
                 let col_idx = sym.col_idx();

@@ -370,7 +370,9 @@ pub trait AnalyticPenalty: Send + Sync {
 
     /// Update any attached scalar weight schedule at the given REML outer
     /// iteration. Penalties without schedules keep their stored weight.
-    fn apply_schedule(&mut self, _iter: usize) {}
+    fn apply_schedule(&mut self, iter: usize) {
+        drop(iter);
+    }
 }
 
 fn advance_scalar_weight(
@@ -5653,7 +5655,8 @@ impl OrthogonalityPenalty {
 
     /// Dense cross-axis Hessian; no blockwise reduction preserves the
     /// rotation-gauge term.
-    pub fn as_blockwise(&self, _global_offset: usize) -> Option<Vec<BlockwisePenalty>> {
+    pub fn as_blockwise(&self, global_offset: usize) -> Option<Vec<BlockwisePenalty>> {
+        drop(global_offset);
         None
     }
 }

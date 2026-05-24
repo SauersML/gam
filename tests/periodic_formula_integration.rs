@@ -19,7 +19,10 @@ fn periodic_dataset() -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode periodic dataset")
 }
 
-fn assert_standard_fit_has_finite_coefficients(formula: &str, expected_smooth_terms: usize) {
+fn assert_standard_fit_has_finite_coefficients(
+    formula: &str,
+    expected_smooth_terms: usize,
+) -> usize {
     init_parallelism();
     let data = periodic_dataset();
     let config = FitConfig {
@@ -39,33 +42,38 @@ fn assert_standard_fit_has_finite_coefficients(formula: &str, expected_smooth_te
             .iter()
             .all(|term| !term.coeff_range.is_empty())
     );
+    fit.fit.beta.len()
 }
 
 #[test]
 fn fit_from_formula_accepts_cyclic_1d_bspline_smooth() {
-    assert_standard_fit_has_finite_coefficients(
+    let ncoef = assert_standard_fit_has_finite_coefficients(
         "y ~ cyclic(theta, k=8, period_start=0, period_end=6.283185307179586)",
         1,
     );
+    assert!(ncoef > 0);
 }
 
 #[test]
 fn fit_from_formula_accepts_tensor_cylinder_periodic_margin() {
-    assert_standard_fit_has_finite_coefficients(
+    let ncoef = assert_standard_fit_has_finite_coefficients(
         "y ~ s(theta, h, periodic=[0], period=[2*pi, None], k=5)",
         1,
     );
+    assert!(ncoef > 0);
 }
 
 #[test]
 fn fit_from_formula_accepts_tensor_period_origin_aliases() {
-    assert_standard_fit_has_finite_coefficients(
+    let ncoef = assert_standard_fit_has_finite_coefficients(
         "y ~ te(theta, h, bc=['periodic', 'natural'], periods=[2*pi, None], origins=[0, None], k=5)",
         1,
     );
+    assert!(ncoef > 0);
 }
 
 #[test]
 fn fit_from_formula_accepts_cyclic_duchon() {
-    assert_standard_fit_has_finite_coefficients("y ~ duchon(theta, periodic=true, k=8)", 1);
+    let ncoef = assert_standard_fit_has_finite_coefficients("y ~ duchon(theta, periodic=true, k=8)", 1);
+    assert!(ncoef > 0);
 }

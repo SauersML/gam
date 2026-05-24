@@ -1942,10 +1942,9 @@ impl<'a> RemlState<'a> {
                 } else {
                     0.0
                 };
-                eprintln!(
-                    "[A_J-ORIG] a_j={:+.6e} term_u_x={:+.6e} term_beta_s={:+.6e} \
-                     |x_tau_beta|={:.3e} |beta|={:.3e} |u|={:.3e} p_dim={} xtb0={:+.3e} xtb_last={:+.3e}",
-                    a_j, term_u_x, term_beta_s, xtb_norm, beta_norm, u_norm, p_dim, xtb0, xtb_last
+                log::debug!(
+                    "[A_J-ORIG] a_j={a_j:+.6e} term_u_x={term_u_x:+.6e} term_beta_s={term_beta_s:+.6e} \
+                     |x_tau_beta|={xtb_norm:.3e} |beta|={beta_norm:.3e} |u|={u_norm:.3e} p_dim={p_dim} xtb0={xtb0:+.3e} xtb_last={xtb_last:+.3e}"
                 );
             }
             let mut g_j = dir.x_tau_original.transpose_mul_original(&u)?

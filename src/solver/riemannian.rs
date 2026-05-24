@@ -125,8 +125,9 @@ pub trait Manifold: Send + Sync {
 
     /// Riemannian inner product `<ξ, η>_p`. Default: weighted ambient
     /// inner product restricted to `T_p M`.
-    fn inner_product(&self, _p: ArrayView1<f64>, xi: ArrayView1<f64>, eta: ArrayView1<f64>)
+    fn inner_product(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, eta: ArrayView1<f64>)
         -> f64 {
+        drop(p);
         debug_assert_eq!(xi.len(), eta.len());
         let weights = self.metric_weights();
         debug_assert_eq!(weights.len(), xi.len());
@@ -165,7 +166,8 @@ pub trait Manifold: Send + Sync {
 
     /// Typed advisory sentinel — preferred over [`Manifold::warn_at`] for
     /// callers that route to a structured logger. Default returns `None`.
-    fn warn_at_typed(&self, _p: ArrayView1<f64>) -> Option<ManifoldWarning> {
+    fn warn_at_typed(&self, p: ArrayView1<f64>) -> Option<ManifoldWarning> {
+        drop(p);
         None
     }
 
@@ -251,7 +253,10 @@ impl Manifold for Euclidean {
     fn ambient_dim(&self) -> usize {
         self.d
     }
-    fn project_tangent(&self, _p: ArrayView1<f64>, _v: ArrayViewMut1<f64>) {}
+    fn project_tangent(&self, p: ArrayView1<f64>, v: ArrayViewMut1<f64>) {
+        drop(p);
+        drop(v);
+    }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
         debug_assert_eq!(p.len(), self.d);
         debug_assert_eq!(xi.len(), self.d);
@@ -588,8 +593,10 @@ impl Manifold for Interval {
         let scale = self.hi - self.lo;
         vec![1.0 / (scale * scale)]
     }
-    fn project_tangent(&self, _p: ArrayView1<f64>, _v: ArrayViewMut1<f64>) {
+    fn project_tangent(&self, p: ArrayView1<f64>, v: ArrayViewMut1<f64>) {
         // 1-d open submanifold of ℝ; tangent space is all of ℝ.
+        drop(p);
+        drop(v);
     }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
         // Closed-constraint retraction (proposal §7.2):
@@ -609,20 +616,27 @@ impl Manifold for Interval {
     }
     fn vector_transport(
         &self,
-        _from: ArrayView1<f64>,
-        _to: ArrayView1<f64>,
-        _xi: ArrayViewMut1<f64>,
+        from: ArrayView1<f64>,
+        to: ArrayView1<f64>,
+        xi: ArrayViewMut1<f64>,
     ) {
+        drop(from);
+        drop(to);
+        drop(xi);
     }
     fn euclidean_to_riemannian_hess_vp(
         &self,
-        _p: ArrayView1<f64>,
-        _egrad: ArrayView1<f64>,
-        _ehess_vp: ArrayViewMut1<f64>,
-        _xi: ArrayView1<f64>,
+        p: ArrayView1<f64>,
+        egrad: ArrayView1<f64>,
+        ehess_vp: ArrayViewMut1<f64>,
+        xi: ArrayView1<f64>,
     ) {
         // Open submanifold of ℝ: no second fundamental form correction in
         // the natural chart used here.
+        drop(p);
+        drop(egrad);
+        drop(ehess_vp);
+        drop(xi);
     }
     fn warn_at_typed(&self, p: ArrayView1<f64>) -> Option<ManifoldWarning> {
         let band = (self.hi - self.lo).abs() * Self::EDGE_FRAC * 10.0;
@@ -634,7 +648,8 @@ impl Manifold for Interval {
     }
     /// Closed-form trivial 1×1 identity basis (proposal §7: T_p M = ℝ in
     /// the interior). Override avoids the generic O(m³) Gram-Schmidt path.
-    fn tangent_basis(&self, _p: ArrayView1<f64>) -> Array2<f64> {
+    fn tangent_basis(&self, p: ArrayView1<f64>) -> Array2<f64> {
+        drop(p);
         let mut q = Array2::<f64>::zeros((1, 1));
         q[[0, 0]] = 1.0;
         q

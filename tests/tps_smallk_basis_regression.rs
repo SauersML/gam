@@ -475,16 +475,7 @@ fn tps_reml_fit_must_not_oversmooth_seed118_style_additive_signal() {
     );
 }
 
-/// **TEST F — REML must find an interior optimum, not the upper boundary.**
-///
-/// This test will be added in a follow-up once the rust API for fitting a
-/// TPS smooth via fit_gam is reconciled with the current PenaltySpec /
-/// FitOptions surface. The intended assertion: when fitting a smooth 2D
-/// target with TPS k=18 on n=120, the converged log-λ is strictly below
-/// the upper rho bound (e.g. < 10) — i.e. REML finds an interior optimum
-/// rather than driving smoothing to maximum. Failure indicates the REML
-/// surface is monotone-toward-over-smoothing on this basis.
-///
-/// Placeholder kept here to document the intended coverage.
-#[test]
-fn tps_reml_must_find_interior_optimum_on_smooth_bivariate() {}
+// Placeholder for "REML must find an interior optimum, not the upper boundary"
+// was removed: the empty `#[test]` body asserted nothing and was caught by the
+// build-time ban on assertion-less tests. Reintroduce with a real fit + bound
+// check once the TPS fit API is reconciled.
