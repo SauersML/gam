@@ -6467,7 +6467,8 @@ pub fn select_centers_by_strategy(
     data: ArrayView2<'_, f64>,
     strategy: &CenterStrategy,
 ) -> Result<Array2<f64>, BasisError> {
-    match realized_center_strategy(strategy) {
+    match strategy {
+        CenterStrategy::Auto(inner) => select_centers_by_strategy(data, inner.as_ref()),
         CenterStrategy::UserProvided(centers) => {
             if centers.ncols() != data.ncols() {
                 return Err(BasisError::DimensionMismatch(format!(
@@ -6497,7 +6498,6 @@ pub fn select_centers_by_strategy(
         CenterStrategy::UniformGrid { points_per_dim } => {
             select_uniform_grid_centers(data, *points_per_dim)
         }
-        CenterStrategy::Auto(_) => unreachable!("realized center strategy must not be nested auto"),
     }
 }
 
