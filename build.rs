@@ -24,17 +24,17 @@ fn main() {
     let mut todo_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_banned_marker(&manifest_dir, &manifest_dir, needle, &mut todo_offenders);
 
-    // `#[allow(unused_*/dead_code)]` and `#[expect(unused_*/dead_code)]`
-    // ban. Unused-* lints (unused_assignments, unused_variables,
-    // unused_imports, unused_mut, unused_must_use, unused_macros,
-    // unused_doc_comments, unused_attributes, unused_parens,
-    // unused_braces, ...) catch dead code or dead writes that signal a
-    // logic error. `dead_code` is the same story for unused items.
-    // `#[expect(...)]` is the promotion form of `#[allow(...)]` — it
+    // `#[allow(...)]` / `#![allow(...)]` / `#[expect(...)]` /
+    // `#![expect(...)]` ban — any lint, anywhere. Every file-level allow
+    // or expect is an admission that some lint flagged real code and the
+    // author chose to hide it instead of fix it. Build.rs is the single
+    // source of "we accept this category"; individual file-level allows
+    // are forbidden. `expect` is the promotion form of `allow` — it
     // silences the lint exactly the same way (and additionally errors
-    // when the lint does NOT fire), so it has the same "hide the
-    // signal" failure mode and is banned identically. Use the item or
-    // delete it instead.
+    // when the lint does NOT fire), so it has the same "hide the signal"
+    // failure mode and is banned identically. Fix the underlying code:
+    // rename, restructure, delete, or — if the lint truly is the wrong
+    // call site-wide — edit this build.rs to encode the policy here.
     let mut allow_offenders: Vec<(PathBuf, usize, String, String)> = Vec::new();
     scan_for_banned_allow(&manifest_dir, &manifest_dir, &mut allow_offenders);
 
@@ -1712,25 +1712,27 @@ fn scan_for_banned_marker(
     });
 }
 
-/// Scan for `#[allow(<lint>)]` / `#![allow(<lint>)]` where `<lint>` is in the
-/// banned set: any token starting with `unused` (covers `unused_assignments`,
-/// `unused_variables`, `unused_imports`, `unused_mut`, `unused_must_use`,
-/// `unused_macros`, `unused_doc_comments`, `unused_attributes`, etc.) or
-/// exactly `dead_code`. Lint names are matched as whole comma-delimited
-/// tokens inside the `allow(...)` parenthesized list, so identifiers that
-/// merely contain the substring are not flagged. The leading `clippy::`
-/// path prefix is tolerated. Build.rs itself is exempt (it names the lints
-/// as part of this scanner's own contract).
+/// Scan for `#[allow(...)]` / `#![allow(...)]` / `#[expect(...)]` /
+/// `#![expect(...)]` — any lint, anywhere. Every such attribute is an
+/// admission that some lint flagged real code and the author chose to hide
+/// it instead of fix it. The single source of "we accept this category" is
+/// `build.rs`; file-level allows/expects are forbidden. The leading
+/// `clippy::` / `rustc::` / `rustdoc::` path prefix is tolerated when
+/// labelling the first lint in the report row, but every lint token in the
+/// parenthesized list triggers the ban regardless of name. Build.rs itself
+/// is exempt (it names the attribute syntax as part of this scanner's own
+/// contract). String / line-comment contents are masked via
+/// `strip_file_lines` so attributes inside `"..."` or `//` text do not
+/// false-fire.
 fn scan_for_banned_allow(
     root: &Path,
     dir: &Path,
     offenders: &mut Vec<(PathBuf, usize, String, String)>,
 ) {
-    // Attribute prefixes that silence the unused-* / dead-code lints. Both
-    // `allow` and `expect` defeat the lint's signal — `expect` is the
-    // promotion form ("error if the lint does NOT fire") which is just
-    // as load-bearing as `allow` for hiding dead/unused code. Treat them
-    // identically.
+    // Attribute prefixes that silence a lint. Both `allow` and `expect`
+    // defeat the lint's signal — `expect` is the promotion form ("error if
+    // the lint does NOT fire") which is just as load-bearing as `allow` for
+    // hiding lint output. Treat them identically.
     const SILENCERS: &[&str] = &["allow(", "expect("];
     visit_files(root, dir, &mut |rel, content| {
         let rel_str = rel.to_string_lossy().replace('\\', "/");
@@ -1743,42 +1745,71 @@ fn scan_for_banned_allow(
         if !SILENCERS.iter().any(|s| content.contains(s)) {
             return;
         }
+        let stripped_lines = strip_file_lines(content);
         for (idx, line) in content.lines().enumerate() {
-            // Strip line comments (`//`, `///`, `//!`) so that doc/comment
-            // text mentioning the attribute syntax is not flagged. String
-            // literals containing `allow(`/`expect(` would still be
-            // matched, but the codebase does not embed such literals.
-            let code = match line.find("//") {
-                Some(pos) => &line[..pos],
-                None => line,
-            };
+            let code = stripped_lines.get(idx).map(String::as_str).unwrap_or(line);
             // Only match when the silencer is part of an attribute on this
-            // line: preceded somewhere by `#[` or `#![`.
-            if !code.contains("#[") && !code.contains("#![") {
+            // line: preceded somewhere by `#[` or `#![`. (The inner-attribute
+            // form `#![` already contains `#[` as a substring, so a single
+            // check covers both.)
+            if !code.contains("#[") {
                 continue;
             }
             for silencer in SILENCERS {
                 let mut search_from = 0usize;
                 while let Some(rel_idx) = code[search_from..].find(silencer) {
-                    let start = search_from + rel_idx + silencer.len();
+                    let abs_match = search_from + rel_idx;
+                    // Require an attribute context: the silencer must be
+                    // preceded (after optional whitespace) by `#[` or `#![`.
+                    // Scan backwards over whitespace, then check the prefix
+                    // ending — `#[` or `#![` — at that point.
+                    let mut k = abs_match;
+                    while k > 0 && code.as_bytes()[k - 1].is_ascii_whitespace() {
+                        k -= 1;
+                    }
+                    let prefix = &code[..k];
+                    let is_attr = prefix.ends_with("#[") || prefix.ends_with("#![");
+                    let start = abs_match + silencer.len();
+                    if !is_attr {
+                        search_from = start;
+                        continue;
+                    }
                     let Some(end_rel) = code[start..].find(')') else {
                         break;
                     };
                     let inside = &code[start..start + end_rel];
+                    // Collect lint tokens (split on `,`), respecting that
+                    // nested parentheses won't appear at this level (a lint
+                    // path like `clippy::foo` carries no parens; tool-lint
+                    // configs that DO nest, e.g. `reason = "..."`, are not
+                    // valid inside allow/expect anyway). Strip the known
+                    // tool prefixes (`clippy::`, `rustc::`, `rustdoc::`) when
+                    // labelling so the report shows the bare lint name.
+                    let mut first_label: Option<String> = None;
+                    let mut any_token = false;
                     for tok in inside.split(',') {
-                        let t = tok.trim().trim_start_matches("clippy::");
-                        if t.starts_with("unused") || t == "dead_code" {
-                            // Label includes which attribute fired so the
-                            // report distinguishes `allow(...)` from
-                            // `expect(...)`.
-                            let attr = silencer.trim_end_matches('(');
-                            offenders.push((
-                                rel.to_path_buf(),
-                                idx + 1,
-                                format!("{attr}({t})"),
-                                line.to_string(),
-                            ));
+                        let trimmed = tok.trim();
+                        if trimmed.is_empty() {
+                            continue;
                         }
+                        any_token = true;
+                        if first_label.is_none() {
+                            let bare = trimmed
+                                .trim_start_matches("clippy::")
+                                .trim_start_matches("rustc::")
+                                .trim_start_matches("rustdoc::");
+                            first_label = Some(bare.to_string());
+                        }
+                    }
+                    if any_token {
+                        let attr = silencer.trim_end_matches('(');
+                        let label = first_label.unwrap_or_else(|| "<empty>".to_string());
+                        offenders.push((
+                            rel.to_path_buf(),
+                            idx + 1,
+                            format!("{attr}({label})"),
+                            line.to_string(),
+                        ));
                     }
                     search_from = start + end_rel + 1;
                     if search_from >= code.len() {
