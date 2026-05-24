@@ -527,55 +527,6 @@ fn analytic_penalty_row_hessian_fingerprint(
                 hasher.write_f64(p.weight * rho_local[weight_offset].exp());
             }
         }
-        AnalyticPenaltyKind::MechanismSparsity(p) => {
-            hasher.write_str("mechanism-sparsity");
-            hasher.write_usize(p.target.range.start);
-            hasher.write_usize(p.target.range.end);
-            match p.target.latent_dim {
-                Some(latent_dim) => {
-                    hasher.write_bool(true);
-                    hasher.write_usize(latent_dim);
-                }
-                None => hasher.write_bool(false),
-            }
-            hasher.write_usize(p.feature_groups.len());
-            for group in &p.feature_groups {
-                hasher.write_usize(group.len());
-                for &feature in group {
-                    hasher.write_usize(feature);
-                }
-            }
-            hasher.write_f64(p.weight);
-            hasher.write_f64(p.smoothing_eps);
-            hasher.write_f64(p.n_eff);
-            hasher.write_bool(p.learnable_weight);
-            hasher.write_usize(p.rho_index);
-            if p.learnable_weight {
-                hasher.write_f64(p.weight * rho_local[p.rho_index].exp());
-            }
-            match &p.weight_schedule {
-                Some(schedule) => {
-                    hasher.write_bool(true);
-                    hasher.write_f64(schedule.w_start);
-                    hasher.write_f64(schedule.w_end);
-                    hasher.write_usize(schedule.iter_count);
-                    match &schedule.kind {
-                        crate::terms::sae_manifold::ScheduleKind::Geometric { rate } => {
-                            hasher.write_str("geometric");
-                            hasher.write_f64(*rate);
-                        }
-                        crate::terms::sae_manifold::ScheduleKind::Linear { steps } => {
-                            hasher.write_str("linear");
-                            hasher.write_usize(*steps);
-                        }
-                        crate::terms::sae_manifold::ScheduleKind::ReciprocalIter => {
-                            hasher.write_str("reciprocal-iter");
-                        }
-                    }
-                }
-                None => hasher.write_bool(false),
-            }
-        }
         _ => {
             hasher.write_str("row-block-diagonal");
             if let Some(diag) = penalty.hessian_diag(target_t, rho_local) {
@@ -1123,7 +1074,6 @@ fn analytic_penalty_is_row_block_diagonal(penalty: &AnalyticPenaltyKind) -> bool
             | AnalyticPenaltyKind::Sparsity(_)
             | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
             | AnalyticPenaltyKind::IBPAssignment(_)
-            | AnalyticPenaltyKind::MechanismSparsity(_)
             | AnalyticPenaltyKind::RowPrecisionPrior(_)
             | AnalyticPenaltyKind::ParametricRowPrecisionPrior(_)
             | AnalyticPenaltyKind::ScadMcp(_)
