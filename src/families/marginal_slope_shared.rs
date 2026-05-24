@@ -1101,7 +1101,7 @@ pub fn build_outer_score_subsample(
         // Deterministic key from (seed, stratum_id).
         let mut state = seed ^ (stratum_id as u64).wrapping_mul(0x9E3779B97F4A7C15);
         // Mix once so even seed=0, stratum_id=0 produces a non-trivial state.
-        let _ = splitmix64(&mut state);
+        drop(splitmix64(&mut state));
 
         if take == rows.len() {
             for &index in rows.iter() {
