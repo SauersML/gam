@@ -1566,6 +1566,10 @@ fn dense_xt_diag_y(
     fast_xt_diag_y(&x, &w, &y)
 }
 
+fn dense_xt_diag_x(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Array2<f64> {
+    fast_xt_diag_y(&x, &w, &x)
+}
+
 fn matrix_fingerprint(matrix: ArrayView2<'_, f64>) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     hash = fnv1a_mix(hash, matrix.nrows() as u64);
