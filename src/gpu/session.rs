@@ -539,7 +539,7 @@ mod tests {
         let mut keepalives = Vec::new();
         for _ in 0..(MAX_CACHE_ENTRIES + 2) {
             let x = Arc::new(Array2::<f64>::zeros((1024, 16)));
-            let _ = cache.get_or_upload(&x);
+            assert!(cache.get_or_upload(&x).is_some());
             keepalives.push(x);
         }
         let guard = cache.entries.lock().unwrap();

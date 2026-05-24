@@ -228,7 +228,13 @@ pub fn try_dispatch_dense(op: GpuOperation) -> linalg::GpuDispatch {
         GpuOperation::XtDiagX { n, p } => linalg::DispatchOp::XtDiagX { n, p },
         GpuOperation::XtDiagY { n, px, q } => linalg::DispatchOp::XtDiagY { n, px, q },
     };
-    std::hint::black_box(linalg::route_through_gpu(dispatch_op));
+    let admitted_by_gpu_policy = linalg::route_through_gpu(dispatch_op).is_some();
+    if admitted_by_gpu_policy {
+        log::trace!(
+            "GPU dispatch policy admitted {}, but no erased result is available",
+            op_label(op)
+        );
+    }
     linalg::GpuDispatch::Cpu
 }
 
@@ -291,12 +297,26 @@ pub fn try_solve_upper_triangular_matrix(
 }
 #[inline]
 pub fn try_syevd_inplace(a: &mut ndarray::Array2<f64>) -> Option<ndarray::Array1<f64>> {
-    std::hint::black_box(a);
+    let (rows, cols) = a.dim();
+    if rows == 0 || rows != cols {
+        return None;
+    }
     None
 }
 #[inline]
 pub fn record_cpu_kernel(op: GpuOperation, elapsed: std::time::Duration) {
-    std::hint::black_box((op, elapsed));
+    let (name, n, p, k, flops_est) = op_profile(op);
+    profile::record(profile::KernelStat {
+        name,
+        n,
+        p,
+        k,
+        nnz: 0,
+        flops_est,
+        bytes_est: 0,
+        cpu_ms: elapsed.as_secs_f64() * 1_000.0,
+        gpu_ms: None,
+    });
 }
 #[inline]
 pub fn record_cpu_fallback(
@@ -307,7 +327,71 @@ pub fn record_cpu_fallback(
     q: usize,
     flops: usize,
 ) {
-    std::hint::black_box((name, kind, n, p, q, flops));
+    let profile_name = operation_kind_name(kind);
+    if name != profile_name {
+        log::trace!("CPU fallback {name} recorded as {profile_name}");
+    }
+    profile::record(profile::KernelStat {
+        name: profile_name,
+        n,
+        p,
+        k: q,
+        nnz: 0,
+        flops_est: flops,
+        bytes_est: 0,
+        cpu_ms: 0.0,
+        gpu_ms: None,
+    });
+}
+
+#[inline]
+const fn op_label(op: GpuOperation) -> &'static str {
+    match op {
+        GpuOperation::Gemm { .. } => "gemm",
+        GpuOperation::Gemv { .. } => "gemv",
+        GpuOperation::XtDiagX { .. } => "xt_diag_x",
+        GpuOperation::XtDiagY { .. } => "xt_diag_y",
+    }
+}
+
+#[inline]
+const fn op_profile(op: GpuOperation) -> (&'static str, usize, usize, usize, usize) {
+    match op {
+        GpuOperation::Gemm { m, n, k } => (
+            "gemm",
+            m,
+            n,
+            k,
+            m.saturating_mul(n).saturating_mul(k).saturating_mul(2),
+        ),
+        GpuOperation::Gemv { m, k } => ("gemv", m, k, 1, m.saturating_mul(k).saturating_mul(2)),
+        GpuOperation::XtDiagX { n, p } => (
+            "xt_diag_x",
+            n,
+            p,
+            p,
+            n.saturating_mul(p).saturating_mul(p).saturating_mul(2),
+        ),
+        GpuOperation::XtDiagY { n, px, q } => (
+            "xt_diag_y",
+            n,
+            px,
+            q,
+            n.saturating_mul(px).saturating_mul(q).saturating_mul(2),
+        ),
+    }
+}
+
+#[inline]
+const fn operation_kind_name(kind: profile::OperationKind) -> &'static str {
+    match kind {
+        profile::OperationKind::Gemv => "gemv",
+        profile::OperationKind::GemvTranspose => "gemv_transpose",
+        profile::OperationKind::JointHessian => "joint_hessian",
+        profile::OperationKind::JointHessian2x2 => "joint_hessian_2x2",
+        profile::OperationKind::XtDiagX => "xt_diag_x",
+        profile::OperationKind::XtDiagY => "xt_diag_y",
+    }
 }
 
 #[cfg(test)]

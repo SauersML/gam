@@ -295,8 +295,11 @@ pub fn weighted_crossprod_gpu(
     x: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
 ) -> Result<Array2<f64>, String> {
-    std::hint::black_box((x, weights));
-    Err("cuda feature is not enabled".to_string())
+    let (rows, cols) = x.dim();
+    Err(format!(
+        "cuda feature is not enabled for weighted cross-product; x={rows}x{cols}, weights={}",
+        weights.len()
+    ))
 }
 
 #[cfg(feature = "cuda")]
