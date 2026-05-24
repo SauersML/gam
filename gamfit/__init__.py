@@ -210,6 +210,7 @@ __all__ = [
     "BasisSpec",
     "ARDPenalty",
     "AuxConditionalPriorPenalty",
+    "BlockOrthogonalityPenalty",
     "BlockSparsityPenalty",
     "IBPAssignmentPenalty",
     "IsometryPenalty",
