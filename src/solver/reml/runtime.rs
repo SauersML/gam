@@ -97,6 +97,12 @@ fn store_ift_residual_energy_for_outer_theta(theta: &Array1<f64>, energy: Option
     }
 }
 
+pub(super) struct PenaltySubspace {
+    evals: Array1<f64>,
+    evecs: Array2<f64>,
+    rank: usize,
+}
+
 pub(crate) struct HyperGradHistoryEntry {
     pub(crate) rho: Array1<f64>,
     pub(crate) g_outer: Array1<f64>,
@@ -4088,6 +4094,69 @@ impl<'a> RemlState<'a> {
         crate::faer_ndarray::fast_ab(&zt_m, z)
     }
 
+    pub(super) fn compute_penalty_subspace(
+        &self,
+        e_transformed: &Array2<f64>,
+        ridge_passport: RidgePassport,
+    ) -> Result<PenaltySubspace, EstimationError> {
+        let p = e_transformed.ncols();
+        if e_transformed.nrows() == 0 || p == 0 {
+            return Ok(PenaltySubspace {
+                evals: Array1::zeros(p),
+                evecs: Array2::zeros((p, p)),
+                rank: 0,
+            });
+        }
+
+        let mut s_lambda = e_transformed.t().dot(e_transformed);
+        let ridge = ridge_passport.penalty_logdet_ridge();
+        if ridge > 0.0 {
+            for i in 0..p {
+                s_lambda[[i, i]] += ridge;
+            }
+        }
+        let (evals, evecs) = s_lambda
+            .eigh(Side::Lower)
+            .map_err(EstimationError::EigendecompositionFailed)?;
+        let rank = if self.canonical_penalties.is_empty() {
+            positive_penalty_rank_and_logdet(evals.as_slice().unwrap()).0
+        } else {
+            self.canonical_penalties
+                .iter()
+                .map(crate::construction::CanonicalPenalty::rank)
+                .sum::<usize>()
+                .min(p)
+        };
+
+        Ok(PenaltySubspace { evals, evecs, rank })
+    }
+
+    fn fixed_subspace_penalty_rank_and_logdet_from_subspace(
+        &self,
+        penalty_subspace: &PenaltySubspace,
+    ) -> (usize, f64) {
+        if penalty_subspace.rank == 0 || penalty_subspace.evals.is_empty() {
+            return (0, 0.0);
+        }
+
+        if self.canonical_penalties.is_empty() {
+            return positive_penalty_rank_and_logdet(penalty_subspace.evals.as_slice().unwrap());
+        }
+
+        // eigh returns eigenvalues sorted ascending; the structural null
+        // directions live at the bottom of the spectrum. Sum the top
+        // `structural_rank` log-eigenvalues for log|S|+.
+        let p = penalty_subspace.evals.len();
+        let evals_slice = penalty_subspace.evals.as_slice().unwrap();
+        let log_det: f64 = evals_slice
+            .iter()
+            .skip(p.saturating_sub(penalty_subspace.rank))
+            .filter_map(|&ev| if ev > 0.0 { Some(ev.ln()) } else { None })
+            .sum();
+
+        (penalty_subspace.rank, log_det)
+    }
+
     /// Compute the structural penalty rank and exact pseudo-logdet log|S|₊.
     ///
     /// Uses the exact pseudo-logdet on the positive eigenspace:
@@ -4104,21 +4173,6 @@ impl<'a> RemlState<'a> {
         e_transformed: &Array2<f64>,
         ridge_passport: RidgePassport,
     ) -> Result<(usize, f64), EstimationError> {
-        if e_transformed.nrows() == 0 || e_transformed.ncols() == 0 {
-            return Ok((0, 0.0));
-        }
-
-        let mut s_lambda = e_transformed.t().dot(e_transformed);
-        let ridge = ridge_passport.penalty_logdet_ridge();
-        if ridge > 0.0 {
-            for i in 0..s_lambda.nrows() {
-                s_lambda[[i, i]] += ridge;
-            }
-        }
-        let (evals, _) = s_lambda
-            .eigh(Side::Lower)
-            .map_err(EstimationError::EigendecompositionFailed)?;
-
         // Use the STRUCTURAL penalty rank from the canonical-penalty
         // decomposition rather than a numerical-threshold rank assessment.
         //
@@ -4142,29 +4196,8 @@ impl<'a> RemlState<'a> {
         // pivot at construction) gets the same numerical log|S|+ as
         // before — the only change is which eigenvalues count as
         // "active", and that count is now anchored to the basis.
-        let p = e_transformed.ncols();
-        let structural_rank = if self.canonical_penalties.is_empty() {
-            let (rank, log_det) = positive_penalty_rank_and_logdet(evals.as_slice().unwrap());
-            return Ok((rank, log_det));
-        } else {
-            self.canonical_penalties
-                .iter()
-                .map(crate::construction::CanonicalPenalty::rank)
-                .sum::<usize>()
-                .min(p)
-        };
-
-        // eigh returns eigenvalues sorted ascending; the structural null
-        // directions live at the bottom of the spectrum. Sum the top
-        // `structural_rank` log-eigenvalues for log|S|+.
-        let evals_slice = evals.as_slice().unwrap();
-        let log_det: f64 = evals_slice
-            .iter()
-            .skip(p.saturating_sub(structural_rank))
-            .filter_map(|&ev| if ev > 0.0 { Some(ev.ln()) } else { None })
-            .sum();
-
-        Ok((structural_rank, log_det))
+        let penalty_subspace = self.compute_penalty_subspace(e_transformed, ridge_passport)?;
+        Ok(self.fixed_subspace_penalty_rank_and_logdet_from_subspace(&penalty_subspace))
     }
 
     /// Compute the projected logdet `log|U_Sᵀ H U_S|_+` together with the
@@ -4183,8 +4216,7 @@ impl<'a> RemlState<'a> {
     pub(super) fn fixed_subspace_hessian_projected_parts(
         &self,
         h_total: &Array2<f64>,
-        e_transformed: &Array2<f64>,
-        ridge_passport: RidgePassport,
+        penalty_subspace: &PenaltySubspace,
     ) -> Result<(f64, Option<super::unified::PenaltySubspaceTrace>), EstimationError> {
         let p = h_total.ncols();
         if p == 0 {
@@ -4197,27 +4229,20 @@ impl<'a> RemlState<'a> {
                 p
             )));
         }
-        if e_transformed.ncols() != p {
+        if penalty_subspace.evecs.nrows() != p || penalty_subspace.evecs.ncols() != p {
             return Err(EstimationError::InvalidInput(format!(
-                "fixed_subspace_hessian_projected_parts: E cols {} do not match H dim {}",
-                e_transformed.ncols(),
+                "fixed_subspace_hessian_projected_parts: penalty eigenspace dim {}x{} does not match H dim {}",
+                penalty_subspace.evecs.nrows(),
+                penalty_subspace.evecs.ncols(),
                 p
             )));
         }
 
-        let mut s_lambda = e_transformed.t().dot(e_transformed);
-        let ridge = ridge_passport.penalty_logdet_ridge();
-        if ridge > 0.0 {
-            for i in 0..p {
-                s_lambda[[i, i]] += ridge;
-            }
-        }
-        let (s_evals, s_evecs) = s_lambda
-            .eigh(Side::Lower)
-            .map_err(EstimationError::EigendecompositionFailed)?;
-
-        let s_thr = super::unified::positive_eigenvalue_threshold(s_evals.as_slice().unwrap());
-        let positive_cols: Vec<usize> = (0..p).filter(|&j| s_evals[j] > s_thr).collect();
+        let s_thr =
+            super::unified::positive_eigenvalue_threshold(penalty_subspace.evals.as_slice().unwrap());
+        let positive_cols: Vec<usize> = (0..p)
+            .filter(|&j| penalty_subspace.evals[j] > s_thr)
+            .collect();
         let r = positive_cols.len();
         if r == 0 {
             // Penalty is structurally null → there is no identified
@@ -4231,7 +4256,7 @@ impl<'a> RemlState<'a> {
         let mut u_s = Array2::<f64>::zeros((p, r));
         for (out_col, &src_col) in positive_cols.iter().enumerate() {
             for row in 0..p {
-                u_s[[row, out_col]] = s_evecs[[row, src_col]];
+                u_s[[row, out_col]] = penalty_subspace.evecs[[row, src_col]];
             }
         }
 
