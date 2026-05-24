@@ -244,11 +244,7 @@ impl ClosedFormPenaltyOperator {
         // T^T diag(Z, I)^T S_raw diag(Z, I) T, but extracting the diagonal
         // here is O(n) instead of O(n * K^2).
         let dense = self.ensure_dense();
-        let mut out = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            out[i] = dense[[i, i]];
-        }
-        out
+        Array1::<f64>::from_iter((0..n).map(|i| dense[[i, i]]))
     }
 
     /// Trace `tr(S')`. In raw layout this is K times the analytic self-pair;

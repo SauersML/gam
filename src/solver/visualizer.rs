@@ -1654,7 +1654,7 @@ mod tests {
         session.start_workflow("Survival Fit", 5);
         session.advance_workflow(1);
         let lines = dumb_render_lines(&snapshot(&session));
-        assert!(lines.iter().all(|line| !line.contains("n/a")));
+        assert!(!lines.iter().any(|line| line.contains("n/a")));
         assert!(
             lines
                 .iter()

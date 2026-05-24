@@ -73,11 +73,13 @@ try:
         IBPAssignmentPenalty,
         IsometryPenalty,
         IvaeRidgeMeanGauge,
+        JumpReLUPenalty,
         LazyPcaBasis,
         MechanismSparsityPenalty,
         RiemannianRetraction,
         TopologyAutoSelector,
     )
+    from .skip_transcoder import SkipAffineSmooth, skip_transcoder, SkipTranscoderResult
     # New unified Smooth/fit API — the recommended user-facing surface.
     from ..smooth import (
         BSpline,
@@ -112,7 +114,11 @@ __all__ = [
     "IBPAssignmentPenalty",
     "IsometryPenalty",
     "IvaeRidgeMeanGauge",
+    "JumpReLUPenalty",
     "LazyPcaBasis",
+    "SkipAffineSmooth",
+    "SkipTranscoderResult",
+    "skip_transcoder",
     "MechanismSparsityPenalty",
     "RiemannianRetraction",
     "TopologyAutoSelector",

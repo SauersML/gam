@@ -12,6 +12,7 @@ fn main() {
         .as_secs();
     println!("cargo:rustc-env=GAM_BUILD_TIMESTAMP={timestamp}");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/terms/penalties");
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"));
