@@ -12703,7 +12703,7 @@ fn external_opts_for_design(
     options: &FitOptions,
 ) -> ExternalOptimOptions {
     ExternalOptimOptions {
-        family,
+        family: spec_to_family(&family),
         latent_cloglog: options.latent_cloglog,
         mixture_link: options.mixture_link.clone(),
         optimize_mixture: options.optimize_mixture,
