@@ -1,14 +1,11 @@
-#[cfg(feature = "cuda")]
 use gam::solver::gpu::{Device, configure_device};
 use ndarray::{Array1, Array2};
 
-#[cfg(feature = "cuda")]
 fn close(a: f64, b: f64, tol: f64) -> bool {
     let scale = 1.0_f64.max(a.abs()).max(b.abs());
     (a - b).abs() <= tol * scale
 }
 
-#[cfg(feature = "cuda")]
 fn assert_arrays_close(a: &Array2<f64>, b: &Array2<f64>, tol: f64) {
     assert_eq!(a.dim(), b.dim());
     for i in 0..a.nrows() {
@@ -23,7 +20,6 @@ fn assert_arrays_close(a: &Array2<f64>, b: &Array2<f64>, tol: f64) {
     }
 }
 
-#[cfg(feature = "cuda")]
 fn assert_vec_close(a: &Array1<f64>, b: &Array1<f64>, tol: f64) {
     assert_eq!(a.len(), b.len());
     for i in 0..a.len() {
@@ -57,7 +53,6 @@ fn synthetic_case(
     (x, weights, penalty, gradient)
 }
 
-#[cfg(feature = "cuda")]
 fn cpu_xtwx(x: &Array2<f64>, weights: &Array1<f64>) -> Array2<f64> {
     let mut out = Array2::<f64>::zeros((x.ncols(), x.ncols()));
     for i in 0..x.nrows() {
@@ -71,7 +66,6 @@ fn cpu_xtwx(x: &Array2<f64>, weights: &Array1<f64>) -> Array2<f64> {
     out
 }
 
-#[cfg(feature = "cuda")]
 fn cpu_cholesky_solve(h: &Array2<f64>, rhs: &Array2<f64>) -> (Array2<f64>, f64) {
     let n = h.nrows();
     let nrhs = rhs.ncols();
@@ -114,9 +108,15 @@ fn cpu_cholesky_solve(h: &Array2<f64>, rhs: &Array2<f64>) -> (Array2<f64>, f64) 
     (y, 2.0 * logdet)
 }
 
-#[cfg(feature = "cuda")]
+fn cuda_available() -> bool {
+    gam::gpu::runtime::GpuRuntime::global().is_some()
+}
+
 #[test]
 fn pirls_gpu_matches_cpu_across_stability_grid() {
+    if !cuda_available() {
+        return;
+    }
     configure_device(Device::Cuda);
     let mut cases = 0;
     for n in [8_usize, 13, 21, 34] {
@@ -153,9 +153,11 @@ fn pirls_gpu_matches_cpu_across_stability_grid() {
     assert!(cases >= 20);
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 fn reml_gpu_logdet_and_score_match_cpu() {
+    if !cuda_available() {
+        return;
+    }
     configure_device(Device::Cuda);
     for p in [2_usize, 4, 7, 11] {
         let mut h = Array2::from_shape_fn((p, p), |(i, j)| {
@@ -197,13 +199,4 @@ fn reml_gpu_logdet_and_score_match_cpu() {
             assert!(close(evidence.gradient_rho[a], 0.5 * trace, 1e-8));
         }
     }
-}
-
-#[cfg(not(feature = "cuda"))]
-#[test]
-fn gpu_stability_tests_are_feature_gated() {
-    let (x, weights, _, _) = synthetic_case(4, 2, 1.0);
-    let err = gam::solver::gpu::pirls_gpu::weighted_crossprod_gpu(x.view(), weights.view())
-        .expect_err("CUDA helper should be feature-gated");
-    assert!(err.contains("cuda feature"));
 }

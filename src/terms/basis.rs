@@ -27730,7 +27730,6 @@ pub mod closed_form_penalty {
     ///     g_u2u2)`
     /// All cross terms not involving `R` vanish for q ≤ 2 except
     /// `g_s1s1 = 2 F3`, `g_s1u1 = F2`, `g_u1u1 = 2 F1` at q = 2.
-    #[allow(clippy::too_many_arguments)]
     fn radial_g_q_hessian(
         q: usize,
         big_r: f64,
@@ -28199,7 +28198,6 @@ pub mod closed_form_penalty {
     }
 
     /// Bare-kernel second derivative ∂²g_q/∂η_k∂η_l.
-    #[allow(clippy::too_many_arguments)]
     pub fn psi_second_derivative(
         q: usize,
         m: usize,

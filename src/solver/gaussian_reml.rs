@@ -736,7 +736,6 @@ pub fn gaussian_reml_multi_closed_form_backward(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn gaussian_reml_multi_closed_form_backward_from_fit(
     x: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,
@@ -800,7 +799,6 @@ pub fn gaussian_reml_multi_closed_form_backward_from_fit(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
     x: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,
@@ -847,7 +845,7 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
         // cannot use the REML envelope shortcut.  Route those seeds through
         // the fixed-rho KKT adjoint M u = upstream_beta, then differentiate
         // X, y, weights, and S through the ridge solve.
-        lambda_adjoint += add_ridge_profile_vjp(
+        add_ridge_profile_vjp_with_lambda_grad(
             1.0,
             x,
             y,
@@ -861,6 +859,7 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
             &mut grad_y,
             &mut grad_penalty,
             &mut grad_weights,
+            &mut lambda_adjoint,
         );
     }
 
@@ -1455,7 +1454,7 @@ fn add_reml_rho_gradient_vjp(
     }
     // The implicit-root VJP holds lambda fixed inside this partial; only the
     // data, penalty, and weight side effects from the ridge solve are needed.
-    add_ridge_profile_vjp(
+    add_ridge_profile_vjp_fixed_lambda(
         1.0,
         x,
         y,
@@ -2388,7 +2387,6 @@ fn consider_rho_no_alloc(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn refine_stationary_rho_no_alloc(
     cache: &GaussianRemlEigenCache,
     ywy: ArrayView1<'_, f64>,

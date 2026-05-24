@@ -1817,7 +1817,6 @@ fn trace_product(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) -> f64 {
     value
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_blocks_backward_analytic(
     designs: &[Array2<f64>],
     penalties_raw: &[Array2<f64>],
@@ -2326,7 +2325,6 @@ fn gaussian_reml_fit_blocks_backward_analytic(
     grad_reml_score = 0.0,
     grad_edf = None,
 ))]
-#[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_blocks_backward<'py>(
     py: Python<'py>,
     designs: Vec<PyReadonlyArray2<'py, f64>>,
@@ -2752,7 +2750,6 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
     grad_reml_score = 0.0,
     grad_edf = 0.0,
 ))]
-#[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_with_constraints_backward<'py>(
     py: Python<'py>,
     x: PyReadonlyArray2<'py, f64>,
@@ -3442,7 +3439,6 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
 // the inner solver. This is exactly the iVAE / ARD recasting from the
 // proposal §4(c), §4(d).
 
-#[allow(clippy::too_many_arguments)]
 fn build_latent_duchon_design(
     t_flat: ArrayView1<'_, f64>,
     n_obs: usize,
@@ -3662,7 +3658,6 @@ fn project_latent_jet_columns(
     Ok(out)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_latent_forward_design(
     basis_kind: &str,
     t_flat: ArrayView1<'_, f64>,
@@ -4241,7 +4236,6 @@ fn latent_prior_score_and_aux_state_for_t(
     Ok((latent_prior_score, aux_strength_state))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn dense_fisher_gaussian_fit_to_pydict<'py>(
     py: Python<'py>,
     design: ArrayView2<'_, f64>,
@@ -4367,7 +4361,6 @@ fn softmax_with_baseline(eta_active: &[f64], out: &mut [f64]) {
     out[eta_active.len()] = (-max_eta).exp() / denom;
 }
 
-#[allow(clippy::too_many_arguments)]
 fn dense_fisher_glm_fit_to_pydict<'py>(
     py: Python<'py>,
     design: ArrayView2<'_, f64>,
@@ -4651,7 +4644,6 @@ fn latent_augmented_hessian_factor(
 /// add the standard `β^T S_{i,a} β`, `tr(K_H S_{i,a})`, and
 /// `tr(S_+ S_{i,a})` terms from the derivation when coefficient penalties
 /// become input-location dependent.
-#[allow(clippy::too_many_arguments)]
 fn add_latent_outer_reml_score_gradient(
     grad_t: &mut Array1<f64>,
     scale: f64,
@@ -4751,7 +4743,6 @@ fn add_latent_outer_reml_score_gradient(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn analytic_penalty_value_for_targets(
     registry: &AnalyticPenaltyRegistry,
     target_t: ArrayView1<'_, f64>,
@@ -4778,7 +4769,6 @@ fn analytic_penalty_value_for_targets(
     Ok(value)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_latent_impl(
     t_flat: ArrayView1<'_, f64>,
     y: ArrayView2<'_, f64>,
@@ -4904,7 +4894,6 @@ fn gaussian_reml_fit_latent_impl(
     tensor_knot_offsets = None,
     tensor_degrees = None,
 ))]
-#[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_latent<'py>(
     py: Python<'py>,
     t: PyReadonlyArray1<'py, f64>,
@@ -5136,7 +5125,6 @@ fn gumbel_temperature_schedule_from_pydict(
     gumbel_schedule = None,
     analytic_penalties = None,
 ))]
-#[allow(clippy::too_many_arguments)]
 fn sae_manifold_fit_ibp<'py>(
     py: Python<'py>,
     z: PyReadonlyArray2<'py, f64>,
@@ -5440,7 +5428,6 @@ fn gated_sae_decode<'py>(
     tensor_knot_offsets = None,
     tensor_degrees = None,
 ))]
-#[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_latent_backward<'py>(
     py: Python<'py>,
     t: PyReadonlyArray1<'py, f64>,
@@ -5690,7 +5677,6 @@ fn latent_glm_family_from_str(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn glm_reml_fit_latent_impl(
     t_flat: ArrayView1<'_, f64>,
     y: ArrayView2<'_, f64>,
@@ -5893,7 +5879,6 @@ fn set_ok_glm_latent_items<'py>(
     dim_selection_log_precision = None,
     analytic_penalties = None,
 ))]
-#[allow(clippy::too_many_arguments)]
 fn glm_reml_fit_latent<'py>(
     py: Python<'py>,
     t: PyReadonlyArray1<'py, f64>,
@@ -6044,7 +6029,6 @@ fn glm_reml_fit_latent<'py>(
     beta_phi = 1.0,
     basis_kind = "duchon".to_string(),
 ))]
-#[allow(clippy::too_many_arguments)]
 fn glm_reml_fit_latent_backward<'py>(
     py: Python<'py>,
     t: PyReadonlyArray1<'py, f64>,
@@ -7247,7 +7231,6 @@ fn gaussian_reml_fit_batched_impl(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_batched_backward_impl(
     x: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,
@@ -7560,7 +7543,6 @@ fn validate_batched_reml_upstreams(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_positions_backward_impl(
     t: ArrayView1<'_, f64>,
     y: ArrayView2<'_, f64>,
@@ -7778,7 +7760,6 @@ fn validate_position_batched_reml_common(
     Ok((row_offsets.len() - 1, penalty.nrows(), y.ncols()))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn position_fit_design_for_slice(
     t: ArrayView1<'_, f64>,
     knots_or_centers: ArrayView1<'_, f64>,
@@ -7812,7 +7793,6 @@ fn position_fit_design_for_slice(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_positions_batched_streaming_impl(
     t: ArrayView1<'_, f64>,
     y: ArrayView2<'_, f64>,
