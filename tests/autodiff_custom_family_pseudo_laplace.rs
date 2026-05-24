@@ -39,25 +39,31 @@ impl CustomFamily for ScalarPseudoLaplaceRhoFamily {
 
     fn exact_newton_joint_hessian(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
+        drop(block_states);
         Ok(Some(array![[2.0]]))
     }
 
     fn exact_newton_hessian_directional_derivative(
         &self,
-        _: &[ParameterBlockState],
-        _: usize,
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        drop(block_states);
+        drop(block_idx);
+        drop(direction);
         Ok(Some(array![[0.0]]))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
-        _: &[ParameterBlockState],
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        drop(block_states);
+        drop(direction);
         Ok(Some(array![[0.0]]))
     }
 }
@@ -89,35 +95,44 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
 
     fn exact_newton_hessian_directional_derivative(
         &self,
-        _: &[ParameterBlockState],
-        _: usize,
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        drop(block_states);
+        drop(block_idx);
+        drop(direction);
         Ok(Some(array![[0.0]]))
     }
 
     fn exact_newton_joint_hessian(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
+        drop(block_states);
         Ok(Some(array![[2.0]]))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
-        _: &[ParameterBlockState],
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        drop(block_states);
+        drop(direction);
         Ok(Some(array![[0.0]]))
     }
 
     fn exact_newton_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
-        _: &[Vec<CustomFamilyBlockPsiDerivative>],
-        _: usize,
+        block_specs: &[ParameterBlockSpec],
+        block_derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
+        psi_idx: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        drop(block_specs);
+        drop(block_derivs);
+        drop(psi_idx);
         let beta = block_states
             .first()
             .ok_or_else(|| "missing block 0".to_string())?
