@@ -244,6 +244,7 @@ pub(crate) struct CtnDenseHessianKey {
 }
 
 impl CtnDenseHessianKey {
+    #[expect(dead_code)]
     fn from(
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,

@@ -21,7 +21,7 @@ pub struct GpuRuntime {
 }
 
 impl GpuRuntime {
-    pub fn probe() -> Result<Option<Self>, GpuProbeError> {
+    pub const fn probe() -> Result<Option<Self>, GpuProbeError> {
         Ok(None)
     }
 
