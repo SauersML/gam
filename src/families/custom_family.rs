@@ -20090,34 +20090,6 @@ mod test_support {
         ))
     }
 
-    /// Test-only helper exposing the value+gradient outer evaluation entry point
-    /// to other modules' test code.  Used by
-    /// the batched-gradient tests in `families/gamlss.rs` to pin the batched
-    /// override against a test oracle
-    /// without re-implementing the inner-fit / penalty-pseudo-logdet plumbing.
-    /// Returns only `(value, gradient)`; the warm-start is internal state with a
-    /// private type and is dropped at the boundary.
-    pub(crate) fn test_outerobjective_andgradient<
-        F: CustomFamily + Clone + Send + Sync + 'static,
-    >(
-        family: &F,
-        specs: &[ParameterBlockSpec],
-        options: &BlockwiseFitOptions,
-        penalty_counts: &[usize],
-        rho: &Array1<f64>,
-    ) -> Result<(f64, Array1<f64>), String> {
-        let result = super::outerobjectivegradienthessian_internal(
-            family,
-            specs,
-            options,
-            penalty_counts,
-            rho,
-            None,
-            crate::types::RhoPrior::Flat,
-            EvalMode::ValueAndGradient,
-        )?;
-        Ok((result.objective, result.gradient))
-    }
 }
 
 #[cfg(test)]
