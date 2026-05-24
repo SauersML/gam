@@ -12834,11 +12834,9 @@ fn evaluate_joint_reml_efs_at_theta(
 }
 
 fn exact_joint_spatial_outer_hessian_available(
-    family: LikelihoodFamily,
-    design: &TermCollectionDesign,
+    _family: LikelihoodFamily,
+    _design: &TermCollectionDesign,
 ) -> bool {
-    std::hint::black_box(family);
-    std::hint::black_box(design);
     // Every `LikelihoodFamily` variant (Gaussian, Binomial-*, Poisson, Gamma,
     // Royston-Parmar) routes through the unified evaluator's outer-Hessian
     // path: Gaussian Identity uses the no-correction dense form, all GLM
@@ -17667,14 +17665,12 @@ where
     //
     // At `n < STAGED_KAPPA_TRIGGER_N` the schedule collapses to one
     // full-data stage — identical to the pre-P7 behaviour.
-    const KAPPA_SUBSAMPLE_PILOT_TRIGGER_N: usize = 30_000;
+    // Note: the n≥30_000 pilot trigger lives in
+    // `outer_derivative_policy.should_use_staged_kappa(n_total)`; this fn
+    // only carries the constants it consumes directly.
     const KAPPA_PILOT_K: usize = 5_000;
     const KAPPA_POLISH_K: usize = 25_000;
     const KAPPA_POLISH_TRIGGER_N: usize = 100_000;
-    std::hint::black_box(KAPPA_SUBSAMPLE_PILOT_TRIGGER_N); // Documented threshold; engaged via policy.
-    std::hint::black_box(KAPPA_POLISH_TRIGGER_N);
-    std::hint::black_box(KAPPA_POLISH_K);
-    std::hint::black_box(KAPPA_PILOT_K);
 
     let n_total = data.nrows();
     let use_staged_kappa = outer_derivative_policy.should_use_staged_kappa(n_total);

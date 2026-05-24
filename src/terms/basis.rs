@@ -2916,11 +2916,10 @@ pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usiz
 }
 
 pub fn assert_spatial_centers_below_biobank_cap(
-    n: usize,
+    _n: usize,
     d_pc: usize,
     centers: ArrayView2<'_, f64>,
 ) -> Result<(), BasisError> {
-    std::hint::black_box(n);
     if centers.ncols() != d_pc {
         return Err(BasisError::DimensionMismatch(format!(
             "spatial PC center dimension mismatch: centers have {} columns, expected {d_pc}",
@@ -10037,7 +10036,7 @@ fn hessian_operator_eta2_entry(
 
 #[inline(always)]
 fn hessian_operator_eta_cross_entry(
-    q: f64,
+    _q: f64,
     t: f64,
     t_r: f64,
     t_rr: f64,
@@ -10053,7 +10052,6 @@ fn hessian_operator_eta_cross_entry(
     axis_b: usize,
     axis_c: usize,
 ) -> f64 {
-    std::hint::black_box(q);
     debug_assert_ne!(axis_i, axis_j);
     let i_is_b = usize::from(axis_i == axis_b) as f64;
     let i_is_c = usize::from(axis_i == axis_c) as f64;
