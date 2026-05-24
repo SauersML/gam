@@ -433,7 +433,6 @@ impl Manifold for Sphere {
             (n2 - 1.0).abs() < 1.0e-9,
             "Sphere::retract output not on S^n"
         );
-        }
     }
     fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
         // Projection transport (proposal §6.4). Cheap, stable, not exactly
@@ -693,10 +692,8 @@ impl Manifold for Torus {
             let norm = s2.sqrt().max(1.0e-300);
             out[2 * k] = x / norm;
             out[2 * k + 1] = y / norm;
-            if cfg!(debug_assertions) {
-                let n2 = out[2 * k] * out[2 * k] + out[2 * k + 1] * out[2 * k + 1];
-                assert!((n2 - 1.0).abs() < 1.0e-9);
-            }
+            let n2 = out[2 * k] * out[2 * k] + out[2 * k + 1] * out[2 * k + 1];
+            assert!((n2 - 1.0).abs() < 1.0e-9);
         }
     }
     fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {

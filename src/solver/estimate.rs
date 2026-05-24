@@ -2510,7 +2510,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
 
 }
 
-#[cfg(test)]
 impl<'a> ExternalJointHyperEvaluator<'a> {
     /// DEBUG ONLY: run PIRLS at `theta` (cost-only path) and return the dense
     /// effective Hessian `H_total = X' W_F X + S_λ + ridge I` in the
@@ -2556,7 +2555,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// finite difference of it along ψ gives the analytic `d/dψ log|H_proj|`
     /// that the production trace formula computes — i.e. the correct
     /// finite-difference reference for the penalty-subspace projection invariant.
-    #[cfg(test)]
     pub fn debug_logdet_h_proj(
         &mut self,
         x: &DesignMatrix,
@@ -2589,7 +2587,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     }
 
     /// Debug-only: return `(η, finalweights, solve_c_array)` at this theta.
-    #[cfg(test)]
     pub fn debug_full_eta_w_c(
         &mut self,
         x: &DesignMatrix,
@@ -4975,7 +4972,6 @@ impl UnifiedFitResult {
     }
 }
 
-#[cfg(test)]
 impl UnifiedFitResult {
     pub fn new_for_test_unchecked(parts: UnifiedFitResultParts) -> Self {
         let beta = flatten_block_betas(&parts.blocks);
