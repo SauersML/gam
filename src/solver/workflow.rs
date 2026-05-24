@@ -54,7 +54,7 @@ use crate::terms::latent_coord::{
 use crate::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, RowPrecisionPriorPenalty,
     BlockOrthogonalityPenalty, BlockSparsityPenalty, DifferenceOpKind, IBPAssignmentPenalty,
-    IsometryPenalty, NuclearNormPenalty, OrthogonalityPenalty,
+    IsometryPenalty, IvaeRidgeMeanGauge, NuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice, ScadMcpPenalty,
     SoftmaxAssignmentSparsityPenalty, ScalarWeightSchedule, ScheduleKind, SparsityPenalty,
     TotalVariationPenalty,
@@ -3503,6 +3503,25 @@ fn build_standard_latent_analytic_penalty_registry(
                     None => penalty,
                 };
                 registry.push(AnalyticPenaltyKind::RowPrecisionPrior(Arc::new(penalty)));
+            }
+            "ivae_ridge_mean_gauge" => {
+                let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = analytic_descriptor_usize(descriptor, "n_eff", target.n)?;
+                let ridge_eps = analytic_descriptor_f64(descriptor, "ridge_eps", 1.0e-6)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                let aux =
+                    analytic_descriptor_array2_flat(descriptor, "aux", "aux_shape", &context)?;
+                let penalty =
+                    IvaeRidgeMeanGauge::new(slice, aux, ridge_eps, weight, n_eff, learnable)
+                        .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(AnalyticPenaltyKind::IvaeRidgeMeanGauge(Arc::new(penalty)));
             }
             "parametric_row_precision_prior" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;

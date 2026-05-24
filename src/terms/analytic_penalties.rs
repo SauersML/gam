@@ -38,6 +38,9 @@
 //!     prior on latent rows. This fixed-precomputed variant accepts one
 //!     precision matrix per row. It is not an iVAE conditional-mean gauge;
 //!     use `LatentIdMode::AuxPrior` for the ridge/linear projection residual.
+//!   * [`IvaeRidgeMeanGauge`] — iVAE-style conditional-mean gauge fixing:
+//!     penalizes the component of the latent field not explained by auxiliary
+//!     covariates via the ridge projection `U(UᵀU + εI)⁻¹Uᵀ`.
 //!   * [`ParametricRowPrecisionPriorPenalty`] — zero-mean Gaussian
 //!     row-precision prior with a learnable distance-kernel map from auxiliary
 //!     rows to diagonal per-row precision. It changes shrinkage strength, not
@@ -75,6 +78,7 @@
 //! one strength; the ARDPenalty owns `d` (one per latent axis);
 //! NuclearNorm, BlockSparsity, BlockOrthogonality, RowPrecisionPrior, and
 //! Orthogonality each own one strength only when their weight is learnable.
+//! IvaeRidgeMeanGauge owns one strength only when its weight is learnable.
 //! ParametricRowPrecisionPrior owns its log-baseline precision, raw distance
 //! sensitivity, and reference point coordinates, plus one strength axis when
 //! requested.
@@ -91,6 +95,7 @@
 //! | NuclearNorm | ext-coord (latent t) | 0 or 1 (log μ_nuc)  |
 //! | BlockSparsity | ext-coord (latent t) | 0 or 1 (log μ_group) |
 //! | RowPrecisionPrior | ext-coord (latent t) | 0 or 1 (log μ_aux) |
+//! | IvaeRidgeMeanGauge | ext-coord (latent t) | 0 or 1 (log μ_ivae_mean) |
 //! | ParametricRowPrecisionPrior | ext-coord (latent t) | d + d + d·du [+1 log μ_aux] |
 //! | Orthogonality | ext-coord (latent t) | 0 or 1 (log μ_orth) |
 //! | BlockOrthogonality | ext-coord (latent t) | 0 or 1 (log μ_block_orth) |
@@ -3827,6 +3832,373 @@ impl AnalyticPenalty for RowPrecisionPriorPenalty {
 }
 
 // ---------------------------------------------------------------------------
+// iVAE ridge conditional-mean gauge penalty
+// ---------------------------------------------------------------------------
+
+/// iVAE conditional-mean gauge penalty on the latent block.
+///
+/// Khemakhem et al. (2020) identify nonlinear ICA/iVAE latent factors from
+/// auxiliary-variable variation up to an affine transform under sufficient
+/// variation in `u`. This penalty implements the conditional-mean side of that
+/// signal as `0.5 * μ * ||t - U(UᵀU + εI)⁻¹Uᵀt||²`, penalizing only the
+/// component of each latent axis not explained by a ridge linear fit to `u`.
+#[derive(Debug, Clone)]
+pub struct IvaeRidgeMeanGauge {
+    pub aux: Array2<f64>,
+    pub ridge_inv: Array2<f64>,
+    pub ridge_eps: f64,
+    /// Base strength. If `learnable_weight` is true, the resolved strength is
+    /// `weight * exp(rho[rho_index])`; otherwise it is fixed at `weight`.
+    pub weight: f64,
+    /// Number of rows in the row-major matrix-valued latent block.
+    pub n_eff: usize,
+    pub learnable_weight: bool,
+    pub rho_index: usize,
+    pub target: PsiSlice,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
+}
+
+impl IvaeRidgeMeanGauge {
+    #[must_use = "build error must be handled"]
+    pub fn new(
+        target: PsiSlice,
+        aux: Array2<f64>,
+        ridge_eps: f64,
+        weight: f64,
+        n_eff: usize,
+        learnable_weight: bool,
+    ) -> Result<Self, String> {
+        if target.is_empty() {
+            return Err("IvaeRidgeMeanGauge::new requires a non-empty target".to_string());
+        }
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!(
+                "IvaeRidgeMeanGauge::new requires finite weight > 0, got {weight}"
+            ));
+        }
+        if !(ridge_eps.is_finite() && ridge_eps > 0.0) {
+            return Err(format!(
+                "IvaeRidgeMeanGauge::new requires finite ridge_eps > 0, got {ridge_eps}"
+            ));
+        }
+        if n_eff == 0 {
+            return Err("IvaeRidgeMeanGauge::new requires n_eff > 0".to_string());
+        }
+        if target.len() % n_eff != 0 {
+            return Err(format!(
+                "IvaeRidgeMeanGauge::new target length {} is not divisible by n_eff {}",
+                target.len(),
+                n_eff
+            ));
+        }
+        let latent_dim = target.len() / n_eff;
+        if let Some(expected_dim) = target.latent_dim {
+            let expected = n_eff.checked_mul(expected_dim).ok_or_else(|| {
+                "IvaeRidgeMeanGauge::new target shape overflows usize".to_string()
+            })?;
+            if expected != target.len() {
+                return Err(format!(
+                    "IvaeRidgeMeanGauge::new target length {} does not match n_eff {} × latent_dim {}",
+                    target.len(),
+                    n_eff,
+                    expected_dim
+                ));
+            }
+            if expected_dim != latent_dim {
+                return Err(format!(
+                    "IvaeRidgeMeanGauge::new inferred latent_dim {latent_dim} does not match target latent_dim {expected_dim}"
+                ));
+            }
+        }
+        let (aux_n, aux_dim) = aux.dim();
+        if aux_n != n_eff {
+            return Err(format!(
+                "IvaeRidgeMeanGauge::new aux rows must equal n_eff {n_eff}, got {aux_n}"
+            ));
+        }
+        if aux_dim == 0 {
+            return Err("IvaeRidgeMeanGauge::new requires aux dimension > 0".to_string());
+        }
+        for (idx, &value) in aux.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(format!("IvaeRidgeMeanGauge::new aux[{idx}] must be finite"));
+            }
+        }
+        let mut gram = Array2::<f64>::zeros((aux_dim, aux_dim));
+        for n in 0..n_eff {
+            for i in 0..aux_dim {
+                for j in 0..aux_dim {
+                    gram[[i, j]] += aux[[n, i]] * aux[[n, j]];
+                }
+            }
+        }
+        for i in 0..aux_dim {
+            gram[[i, i]] += ridge_eps;
+        }
+        let ridge_inv = Self::invert_spd_gram(gram)?;
+        Ok(Self {
+            aux,
+            ridge_inv,
+            ridge_eps,
+            weight,
+            n_eff,
+            learnable_weight,
+            rho_index: 0,
+            target,
+            weight_schedule: None,
+        })
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
+        self
+    }
+
+    fn invert_spd_gram(gram: Array2<f64>) -> Result<Array2<f64>, String> {
+        let q = gram.nrows();
+        let (evals, evecs) = gram.eigh(Side::Lower).map_err(|err| {
+            format!("IvaeRidgeMeanGauge::new ridge Gram eigendecomposition failed: {err}")
+        })?;
+        let mut inv = Array2::<f64>::zeros((q, q));
+        for k in 0..q {
+            let eval = evals[k];
+            if !(eval.is_finite() && eval > 0.0) {
+                return Err(format!(
+                    "IvaeRidgeMeanGauge::new ridge Gram must be positive definite; eigenvalue {k} is {eval:.3e}"
+                ));
+            }
+            let inv_eval = 1.0 / eval;
+            for i in 0..q {
+                for j in 0..q {
+                    inv[[i, j]] += evecs[[i, k]] * evecs[[j, k]] * inv_eval;
+                }
+            }
+        }
+        Ok(inv)
+    }
+
+    fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
+        if self.learnable_weight {
+            self.weight * rho[self.rho_index].exp()
+        } else {
+            self.weight
+        }
+    }
+
+    fn latent_dim(&self, target_len: usize) -> Option<usize> {
+        if self.n_eff == 0 || target_len % self.n_eff != 0 {
+            debug_assert_eq!(
+                target_len % self.n_eff.max(1),
+                0,
+                "target length must be divisible by n_eff"
+            );
+            return None;
+        }
+        Some(target_len / self.n_eff)
+    }
+
+    fn target_matrix<'a>(&self, target: ArrayView1<'a, f64>) -> Option<ArrayView2<'a, f64>> {
+        let d = self.latent_dim(target.len())?;
+        target.into_shape_with_order((self.n_eff, d)).ok()
+    }
+
+    fn flatten_matrix(m: &Array2<f64>) -> Array1<f64> {
+        let n_obs = m.nrows();
+        let d = m.ncols();
+        let mut out = Array1::<f64>::zeros(n_obs * d);
+        for n in 0..n_obs {
+            for a in 0..d {
+                out[n * d + a] = m[[n, a]];
+            }
+        }
+        out
+    }
+
+    fn projected_matrix(&self, x: ArrayView2<'_, f64>) -> Array2<f64> {
+        let q = self.aux.ncols();
+        let d = x.ncols();
+        let mut u_t_x = Array2::<f64>::zeros((q, d));
+        for n in 0..x.nrows() {
+            for i in 0..q {
+                let u_ni = self.aux[[n, i]];
+                for a in 0..d {
+                    u_t_x[[i, a]] += u_ni * x[[n, a]];
+                }
+            }
+        }
+        let mut coeff = Array2::<f64>::zeros((q, d));
+        for i in 0..q {
+            for j in 0..q {
+                let inv_ij = self.ridge_inv[[i, j]];
+                for a in 0..d {
+                    coeff[[i, a]] += inv_ij * u_t_x[[j, a]];
+                }
+            }
+        }
+        let mut projected = Array2::<f64>::zeros(x.dim());
+        for n in 0..x.nrows() {
+            for i in 0..q {
+                let u_ni = self.aux[[n, i]];
+                for a in 0..d {
+                    projected[[n, a]] += u_ni * coeff[[i, a]];
+                }
+            }
+        }
+        projected
+    }
+
+    fn residual_matrix(&self, x: ArrayView2<'_, f64>) -> Array2<f64> {
+        let projected = self.projected_matrix(x);
+        let mut residual = Array2::<f64>::zeros(x.dim());
+        for n in 0..x.nrows() {
+            for a in 0..x.ncols() {
+                residual[[n, a]] = x[[n, a]] - projected[[n, a]];
+            }
+        }
+        residual
+    }
+
+    pub fn diag_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let weight = self.resolved_weight(rho);
+        let mut out = Array1::<f64>::zeros(target.len());
+        for n in 0..t.nrows() {
+            let mut p_nn = 0.0;
+            for i in 0..self.aux.ncols() {
+                for j in 0..self.aux.ncols() {
+                    p_nn += self.aux[[n, i]] * self.ridge_inv[[i, j]] * self.aux[[n, j]];
+                }
+            }
+            let diag = weight * (1.0 - p_nn);
+            for a in 0..t.ncols() {
+                out[n * t.ncols() + a] = diag;
+            }
+        }
+        out
+    }
+
+    /// Materialize `μ(I - U(UᵀU + εI)⁻¹Uᵀ)` repeated per latent axis.
+    pub fn as_dense(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array2<f64> {
+        let n_total = target.len();
+        let Some(t) = self.target_matrix(target) else {
+            return Array2::<f64>::zeros((n_total, n_total));
+        };
+        let d = t.ncols();
+        let weight = self.resolved_weight(rho);
+        let mut dense = Array2::<f64>::zeros((n_total, n_total));
+        for n in 0..t.nrows() {
+            for m in 0..t.nrows() {
+                let mut p_nm = 0.0;
+                for i in 0..self.aux.ncols() {
+                    for j in 0..self.aux.ncols() {
+                        p_nm += self.aux[[n, i]] * self.ridge_inv[[i, j]] * self.aux[[m, j]];
+                    }
+                }
+                let entry = weight * (if n == m { 1.0 } else { 0.0 } - p_nm);
+                for a in 0..d {
+                    dense[[n * d + a, m * d + a]] = entry;
+                }
+            }
+        }
+        dense
+    }
+}
+
+impl AnalyticPenalty for IvaeRidgeMeanGauge {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Psi
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        let Some(t) = self.target_matrix(target) else {
+            return 0.0;
+        };
+        let residual = self.residual_matrix(t.view());
+        let mut acc = 0.0;
+        for n in 0..t.nrows() {
+            for a in 0..t.ncols() {
+                acc += t[[n, a]] * residual[[n, a]];
+            }
+        }
+        0.5 * self.resolved_weight(rho) * acc
+    }
+
+    fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let weight = self.resolved_weight(rho);
+        let mut grad = self.residual_matrix(t.view());
+        for value in grad.iter_mut() {
+            *value *= weight;
+        }
+        Self::flatten_matrix(&grad)
+    }
+
+    fn hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        if target.len() != v.len() {
+            return Array1::<f64>::zeros(target.len());
+        }
+        let Some(v_mat) = self.target_matrix(v) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let weight = self.resolved_weight(rho);
+        let mut hv = self.residual_matrix(v_mat.view());
+        for value in hv.iter_mut() {
+            *value *= weight;
+        }
+        Self::flatten_matrix(&hv)
+    }
+
+    fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        if !self.learnable_weight {
+            return Array1::<f64>::zeros(0);
+        }
+        let mut out = Array1::<f64>::zeros(1);
+        out[self.rho_index] = self.value(target, rho);
+        out
+    }
+
+    fn rho_count(&self) -> usize {
+        usize::from(self.learnable_weight)
+    }
+
+    fn name(&self) -> &str {
+        "ivae_ridge_mean_gauge"
+    }
+
+    fn apply_schedule(&mut self, iter: usize) {
+        advance_scalar_weight(&mut self.weight, &mut self.weight_schedule, iter);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parametric row-precision prior penalty
 // ---------------------------------------------------------------------------
 
@@ -4851,20 +5223,20 @@ impl BlockOrthogonalityPenalty {
                     .expect("between-block cross Gram must be precomputed");
                 Self::add_right_times_cross(
                     &mut out,
-                    v.view(),
+                    v,
                     group_g,
                     group_h,
                     c_hg.view(),
                     weight,
                 );
 
-                let v_h_t_g = Self::cross_gram(v.view(), group_h, group_g);
-                let t_h_v_g = Self::cross_gram(t.view(), group_h, group_g);
+                let v_h_t_g = Self::cross_gram(v, group_h, group_g);
+                let t_h_v_g = Self::cross_gram(t, group_h, group_g);
                 let mut d_c_hg = v_h_t_g;
                 d_c_hg += &t_h_v_g;
                 Self::add_right_times_cross(
                     &mut out,
-                    t.view(),
+                    t,
                     group_g,
                     group_h,
                     d_c_hg.view(),
@@ -5377,6 +5749,7 @@ pub enum AnalyticPenaltyKind {
     NuclearNorm(Arc<NuclearNormPenalty>),
     BlockSparsity(Arc<BlockSparsityPenalty>),
     RowPrecisionPrior(Arc<RowPrecisionPriorPenalty>),
+    IvaeRidgeMeanGauge(Arc<IvaeRidgeMeanGauge>),
     ParametricRowPrecisionPrior(Arc<ParametricRowPrecisionPriorPenalty>),
     ScadMcp(Arc<ScadMcpPenalty>),
     BlockOrthogonality(Arc<BlockOrthogonalityPenalty>),
@@ -5397,6 +5770,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => Arc::make_mut(p).apply_schedule(iter),
             AnalyticPenaltyKind::BlockSparsity(p) => Arc::make_mut(p).apply_schedule(iter),
             AnalyticPenaltyKind::RowPrecisionPrior(p) => Arc::make_mut(p).apply_schedule(iter),
+            AnalyticPenaltyKind::IvaeRidgeMeanGauge(p) => Arc::make_mut(p).apply_schedule(iter),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => {
                 Arc::make_mut(p).apply_schedule(iter)
             }
@@ -5417,6 +5791,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.tier(),
             AnalyticPenaltyKind::BlockSparsity(p) => p.tier(),
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.tier(),
+            AnalyticPenaltyKind::IvaeRidgeMeanGauge(p) => p.tier(),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.tier(),
             AnalyticPenaltyKind::ScadMcp(p) => p.tier(),
             AnalyticPenaltyKind::BlockOrthogonality(p) => p.tier(),
@@ -5435,6 +5810,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.rho_count(),
             AnalyticPenaltyKind::BlockSparsity(p) => p.rho_count(),
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.rho_count(),
+            AnalyticPenaltyKind::IvaeRidgeMeanGauge(p) => p.rho_count(),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.rho_count(),
             AnalyticPenaltyKind::ScadMcp(p) => p.rho_count(),
             AnalyticPenaltyKind::BlockOrthogonality(p) => p.rho_count(),
@@ -5453,6 +5829,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.name(),
             AnalyticPenaltyKind::BlockSparsity(p) => p.name(),
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.name(),
+            AnalyticPenaltyKind::IvaeRidgeMeanGauge(p) => p.name(),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.name(),
             AnalyticPenaltyKind::ScadMcp(p) => p.name(),
             AnalyticPenaltyKind::BlockOrthogonality(p) => p.name(),
@@ -5471,6 +5848,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.value(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.value(target, rho),
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.value(target, rho),
+            AnalyticPenaltyKind::IvaeRidgeMeanGauge(p) => p.value(target, rho),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.value(target, rho),
             AnalyticPenaltyKind::ScadMcp(p) => p.value(target, rho),
             AnalyticPenaltyKind::BlockOrthogonality(p) => p.value(target, rho),
@@ -5493,6 +5871,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::IvaeRidgeMeanGauge(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::ScadMcp(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::BlockOrthogonality(p) => p.grad_target(target, rho),
@@ -5515,6 +5894,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::IvaeRidgeMeanGauge(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::ScadMcp(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::BlockOrthogonality(p) => p.grad_rho(target, rho),
@@ -5537,6 +5917,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::IvaeRidgeMeanGauge(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::ScadMcp(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::BlockOrthogonality(p) => p.hessian_diag(target, rho),
@@ -5567,6 +5948,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::NuclearNorm(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::BlockSparsity(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::RowPrecisionPrior(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::IvaeRidgeMeanGauge(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::ScadMcp(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::BlockOrthogonality(p) => p.hvp(target, rho, v),
@@ -5708,6 +6090,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::RowPrecisionPrior(p) => {
                 p.diag_target(self.target.view(), self.rho.view())
             }
+            AnalyticPenaltyKind::IvaeRidgeMeanGauge(p) => {
+                p.diag_target(self.target.view(), self.rho.view())
+            }
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => {
                 p.diag_target(self.target.view(), self.rho.view())
             }
@@ -5745,9 +6130,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
         // For the diagonal-Hessian penalties (ARD, smoothed-L¹ and Log) the
         // closed form is `Σ_i log(d_i + λ)`. Forward-difference TV uses the
         // tridiagonal path-graph structure. Graph TV, NuclearNorm,
-        // BlockSparsity, and BlockOrthogonality keep the exact dense
-        // eigensolve only below the small-block threshold; large blocks use
-        // SLQ against the analytic HVP.
+        // BlockSparsity, BlockOrthogonality, and IvaeRidgeMeanGauge keep the
+        // exact dense eigensolve only below the small-block threshold; large
+        // blocks use SLQ against the analytic HVP.
         // Orthogonality is excluded because its exact Hessian is indefinite.
         match &self.penalty {
             AnalyticPenaltyKind::Ard(_)
@@ -5794,6 +6179,11 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             {
                 self.stochastic_log_det_plus_lambda_i(lambda)
             }
+            AnalyticPenaltyKind::IvaeRidgeMeanGauge(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_log_det_plus_lambda_i(lambda)
+            }
             AnalyticPenaltyKind::RowPrecisionPrior(p) => {
                 p.log_det_plus_lambda_i(self.rho.view(), lambda)
             }
@@ -5819,6 +6209,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             }
             AnalyticPenaltyKind::NuclearNorm(_)
             | AnalyticPenaltyKind::BlockSparsity(_)
+            | AnalyticPenaltyKind::IvaeRidgeMeanGauge(_)
             | AnalyticPenaltyKind::BlockOrthogonality(_) => {
                 let dense = self.as_dense();
                 <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
@@ -5838,6 +6229,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 return p.as_dense(self.target.view(), self.rho.view());
             }
             AnalyticPenaltyKind::RowPrecisionPrior(p) => {
+                return p.as_dense(self.target.view(), self.rho.view());
+            }
+            AnalyticPenaltyKind::IvaeRidgeMeanGauge(p) => {
                 return p.as_dense(self.target.view(), self.rho.view());
             }
             AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => {

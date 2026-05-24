@@ -16868,13 +16868,17 @@ mod tests {
         let cache = Arc::new(ProjectedFactorCache::with_budget(0));
         let key = make_factor_key(42);
         let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
 
         let producer_cache = Arc::clone(&cache);
         let producer = std::thread::spawn(move || {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 producer_cache.get_or_insert_with(key, || {
                     started_tx.send(()).expect("send producer-start signal");
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    // Block until the waiter has subscribed to the slot.
+                    release_rx
+                        .recv()
+                        .expect("waiter subscribe signal");
                     panic!("simulated projected-factor panic");
                 });
             }))
@@ -16887,6 +16891,10 @@ mod tests {
 
         let waiter_cache = Arc::clone(&cache);
         let waiter = std::thread::spawn(move || {
+            // Signal the producer to proceed (the slot is published before
+            // the producing closure runs, so by the time we call
+            // get_or_insert_with we are guaranteed to subscribe as a waiter).
+            release_tx.send(()).expect("release producer");
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 waiter_cache.get_or_insert_with(key, || Array2::from_elem((1, 1), 7.0));
             }))

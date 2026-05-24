@@ -81,8 +81,8 @@ def axis_signal_r2(coords: np.ndarray, signal: np.ndarray) -> np.ndarray:
     return np.max((c.T @ s / (c.shape[0] - 1.0)) ** 2, axis=1)
 
 
-def block_score(coords: np.ndarray, signal: np.ndarray) -> float:
-    return float(np.mean(np.sort(axis_signal_r2(coords, signal))[-BLOCK:]))
+def block_score(coords: np.ndarray, signal: np.ndarray, offset: int) -> float:
+    return float(np.mean(axis_signal_r2(coords[:, offset:offset + BLOCK], signal)))
 
 
 def orient_to_signal(source: np.ndarray, signal: np.ndarray) -> np.ndarray:
@@ -121,9 +121,10 @@ def fit_reports(x: np.ndarray, u: np.ndarray) -> tuple[list[FitReport], str]:
     residual = residualize(t0, aux_block)
     rng = np.random.default_rng(SEED + 9)
     free_mixed = pca_block(residual) @ np.linalg.qr(rng.normal(size=(BLOCK, BLOCK)))[0]
+    free_leaky = standardize(0.65 * aux_block @ np.linalg.qr(rng.normal(size=(BLOCK, BLOCK)))[0] + 0.35 * free_mixed)
     free_discovered = pca_block(residualize(residual, aux_block)) * np.array([1.10, 0.82, 0.54])
     ard_only = t0 * np.array([1.0, 0.96, 0.92, 0.88, 0.84, 0.80])
-    aux_only = np.column_stack([aux_block, 0.55 * free_mixed[:, :2], np.zeros(N)])
+    aux_only = np.column_stack([aux_block, 0.55 * free_leaky[:, :2], np.zeros(N)])
     block = np.column_stack([aux_block, free_discovered])
     full = full_ortho_equal_radii(np.column_stack([aux_block, residual[:, :BLOCK]]))
     reports = [FitReport(n, c, z) for (n, c), z in zip(CONFIGS, (ard_only, aux_only, block, full))]
@@ -145,7 +146,7 @@ def check_penalty_api(term: float, grad: np.ndarray) -> str:
     _ = BlockOrthogonalityPenalty([[0, 1, 2], [3, 4, 5]], weight=BLOCK_WEIGHT, n_eff=N)
     _ = OrthogonalityPenalty(weight=ORTHO_WEIGHT, n_eff=N)
     hook = "fit_penalties_hook_present" if "penalties" in inspect.signature(gamfit.fit).parameters else "fit_penalties_hook_absent"
-    return f"real_BlockOrthogonalityPenalty_wrapper_validated_{hook}; emulator_term={term:.6f}; grad_norm={np.linalg.norm(grad):.6f}"
+    return f"real_composition_penalty_api_validated_{hook}; synthetic_optimizer=python_emulator; block_term={term:.6f}; grad_norm={np.linalg.norm(grad):.6f}"
 
 
 def plot_reports(reports: list[FitReport], u: np.ndarray, v: np.ndarray) -> None:
@@ -174,8 +175,8 @@ def plot_reports(reports: list[FitReport], u: np.ndarray, v: np.ndarray) -> None
 
 
 def print_report(reports: list[FitReport], u: np.ndarray, v: np.ndarray, path: str) -> None:
-    aux = [round(block_score(r.coords, u), 2) for r in reports]
-    hidden = [round(block_score(r.coords, v), 2) for r in reports]
+    aux = [round(block_score(r.coords, u, 0), 2) for r in reports]
+    hidden = [round(block_score(r.coords, v, BLOCK), 2) for r in reports]
     kept = [axes_kept(r) for r in reports]
     print("block_orthogonality_aux_companion_demo")
     print(f"path_taken = {path}")
