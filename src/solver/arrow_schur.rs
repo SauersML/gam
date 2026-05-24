@@ -421,6 +421,142 @@ fn manifold_mode_fingerprint(latent: &LatentCoordValues) -> u64 {
     hasher.finish_u64()
 }
 
+fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 {
+    let mut hasher = StableHasher::new();
+    hasher.write_str("arrow-schur-row-hessian-v1");
+    hasher.write_usize(sys.rows.len());
+    hasher.write_usize(sys.d);
+    hasher.write_usize(sys.k);
+    for row in sys.rows.iter() {
+        write_array2_fingerprint(&mut hasher, &row.htt);
+        write_array2_fingerprint(&mut hasher, &row.htbeta);
+    }
+    hasher.write_usize(sys.hbb.nrows());
+    hasher.write_usize(sys.hbb.ncols());
+    let hbb_diag_len = sys.hbb.nrows().min(sys.hbb.ncols());
+    hasher.write_usize(hbb_diag_len);
+    for j in 0..hbb_diag_len {
+        hasher.write_f64(sys.hbb[[j, j]]);
+    }
+    match sys.hbb_diag.as_ref() {
+        Some(diag) => {
+            hasher.write_bool(true);
+            hasher.write_usize(diag.len());
+            for &value in diag.iter() {
+                hasher.write_f64(value);
+            }
+        }
+        None => hasher.write_bool(false),
+    }
+    hasher.finish_u64()
+}
+
+fn combine_row_and_registry_fingerprints(row: u64, registry: u64) -> u64 {
+    if registry == 0 {
+        return row;
+    }
+    let mut hasher = StableHasher::new();
+    hasher.write_str("arrow-schur-row-hessian-with-penalties-v1");
+    hasher.write_u64(row);
+    hasher.write_u64(registry);
+    hasher.finish_u64()
+}
+
+fn write_array2_fingerprint(hasher: &mut StableHasher, values: &Array2<f64>) {
+    hasher.write_usize(values.nrows());
+    hasher.write_usize(values.ncols());
+    for &value in values.iter() {
+        hasher.write_f64(value);
+    }
+}
+
+fn analytic_penalty_row_hessian_fingerprint(
+    penalty: &AnalyticPenaltyKind,
+    target_t: ArrayView1<'_, f64>,
+    rho_local: ArrayView1<'_, f64>,
+) -> Option<u64> {
+    if penalty.tier() != PenaltyTier::Psi || !analytic_penalty_is_row_block_diagonal(penalty) {
+        return None;
+    }
+
+    let mut hasher = StableHasher::new();
+    hasher.write_str("arrow-schur-analytic-row-hessian-v1");
+    hasher.write_str(penalty.name());
+    hasher.write_usize(target_t.len());
+    hasher.write_usize(rho_local.len());
+    for &rho in rho_local.iter() {
+        hasher.write_f64(rho);
+    }
+
+    match penalty {
+        AnalyticPenaltyKind::AuxConditionalPrior(p) => {
+            let (n, rows, cols) = p.lambda_per_row.dim();
+            hasher.write_str("aux-conditional-fixed");
+            hasher.write_usize(n);
+            hasher.write_usize(rows);
+            hasher.write_usize(cols);
+            hasher.write_f64(p.weight);
+            hasher.write_bool(p.learnable_weight);
+            if p.learnable_weight {
+                hasher.write_usize(p.rho_index);
+                hasher.write_f64(p.weight * rho_local[p.rho_index].exp());
+            }
+            for &value in p.lambda_per_row.iter() {
+                hasher.write_f64(value);
+            }
+        }
+        AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => {
+            let (aux_n, aux_dim) = p.aux.dim();
+            let (mu_rows, mu_cols) = p.mu.dim();
+            let weight_offset = p.log_alpha.len() + p.raw_beta.len() + p.mu.len();
+            hasher.write_str("aux-conditional-parametric");
+            hasher.write_usize(aux_n);
+            hasher.write_usize(aux_dim);
+            hasher.write_usize(mu_rows);
+            hasher.write_usize(mu_cols);
+            hasher.write_f64(p.weight);
+            hasher.write_bool(p.learnable_weight);
+            for &value in p.aux.iter() {
+                hasher.write_f64(value);
+            }
+            for k in 0..p.log_alpha.len() {
+                hasher.write_f64(p.log_alpha[k]);
+                hasher.write_f64(p.log_alpha[k] + rho_local[k]);
+            }
+            let raw_beta_offset = p.log_alpha.len();
+            for k in 0..p.raw_beta.len() {
+                hasher.write_f64(p.raw_beta[k]);
+                hasher.write_f64(p.raw_beta[k] + rho_local[raw_beta_offset + k]);
+            }
+            let mu_offset = p.log_alpha.len() + p.raw_beta.len();
+            for k in 0..p.mu.nrows() {
+                for a in 0..p.mu.ncols() {
+                    let idx = mu_offset + k * p.aux.ncols() + a;
+                    hasher.write_f64(p.mu[[k, a]]);
+                    hasher.write_f64(p.mu[[k, a]] + rho_local[idx]);
+                }
+            }
+            if p.learnable_weight {
+                hasher.write_usize(weight_offset);
+                hasher.write_f64(p.weight * rho_local[weight_offset].exp());
+            }
+        }
+        _ => {
+            hasher.write_str("row-block-diagonal");
+            if let Some(diag) = penalty.hessian_diag(target_t, rho_local) {
+                hasher.write_usize(diag.len());
+                for &value in diag.iter() {
+                    hasher.write_f64(value);
+                }
+            } else {
+                hasher.write_usize(0);
+            }
+        }
+    }
+
+    Some(hasher.finish_u64())
+}
+
 fn write_latent_manifold(hasher: &mut StableHasher, manifold: &LatentManifold) {
     match manifold {
         LatentManifold::Euclidean => {
@@ -562,6 +698,14 @@ pub struct ArrowSchurSystem {
     /// Geometry tag for the row-local latent blocks after optional
     /// Riemannian projection. Euclidean/no-op geometry uses the sentinel.
     pub manifold_mode_fingerprint: u64,
+    /// Structural/value tag for row-local Hessian factors and their Schur
+    /// inputs. Stale caches must be rejected when row-dependent Hessian
+    /// penalties or cross-blocks change.
+    pub row_hessian_fingerprint: u64,
+    /// Registry-side tag for row-dependent analytic-penalty Hessian inputs.
+    /// Combined with the materialized row blocks in
+    /// [`Self::current_row_hessian_fingerprint`].
+    pub analytic_row_hessian_fingerprint: u64,
 }
 
 impl ArrowSchurSystem {
@@ -569,7 +713,7 @@ impl ArrowSchurSystem {
     /// `(N point/latent rows × d, K shared decoder parameters)`.
     pub fn new(n: usize, d: usize, k: usize) -> Self {
         let rows = (0..n).map(|_| ArrowRowBlock::new(d, k)).collect();
-        Self {
+        let mut sys = Self {
             rows,
             hbb: Array2::<f64>::zeros((k, k)),
             hbb_matvec: None,
@@ -578,7 +722,11 @@ impl ArrowSchurSystem {
             d,
             k,
             manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
-        }
+            row_hessian_fingerprint: 0,
+            analytic_row_hessian_fingerprint: 0,
+        };
+        sys.refresh_row_hessian_fingerprint();
+        sys
     }
 
     /// Allocate an arrow system whose shared `H_ββ` block is supplied only as
@@ -600,7 +748,7 @@ impl ArrowSchurSystem {
     {
         debug_assert_eq!(diag.len(), k);
         let rows = (0..n).map(|_| ArrowRowBlock::new(d, k)).collect();
-        Self {
+        let mut sys = Self {
             rows,
             hbb: Array2::<f64>::zeros((0, 0)),
             hbb_matvec: Some(Arc::new(matvec)),
@@ -609,12 +757,37 @@ impl ArrowSchurSystem {
             d,
             k,
             manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
-        }
+            row_hessian_fingerprint: 0,
+            analytic_row_hessian_fingerprint: 0,
+        };
+        sys.refresh_row_hessian_fingerprint();
+        sys
     }
 
     /// Number of BA point/latent rows `N`.
     pub fn n(&self) -> usize {
         self.rows.len()
+    }
+
+    /// Recompute the row-system fingerprint from the currently materialized
+    /// row blocks, cross-blocks, and shared-block diagonal.
+    pub fn compute_row_hessian_fingerprint(&self) -> u64 {
+        row_hessian_fingerprint_for_system(self)
+    }
+
+    /// Current effective row-system fingerprint, including the materialized
+    /// row blocks and any registry metadata captured while folding analytic
+    /// penalties into the system.
+    pub fn current_row_hessian_fingerprint(&self) -> u64 {
+        combine_row_and_registry_fingerprints(
+            self.compute_row_hessian_fingerprint(),
+            self.analytic_row_hessian_fingerprint,
+        )
+    }
+
+    /// Store the current row-system fingerprint on the system.
+    pub fn refresh_row_hessian_fingerprint(&mut self) {
+        self.row_hessian_fingerprint = self.current_row_hessian_fingerprint();
     }
 
     /// Install a matrix-free shared-block operator for Agarwal-style
@@ -630,6 +803,7 @@ impl ArrowSchurSystem {
         debug_assert_eq!(diag.len(), self.k);
         self.hbb_matvec = Some(Arc::new(matvec));
         self.hbb_diag = Some(diag);
+        self.refresh_row_hessian_fingerprint();
     }
 
     /// Fold analytic-penalty contributions into the appropriate blocks.
@@ -662,6 +836,7 @@ impl ArrowSchurSystem {
         rho_global: ArrayView1<'_, f64>,
     ) -> Result<(), ArrowSchurError> {
         let layout = registry.rho_layout();
+        let mut penalty_fingerprints = Vec::new();
         for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(layout.iter()) {
             let rho_local = rho_global.slice(ndarray::s![rho_slice.clone()]);
             match tier {
@@ -674,6 +849,11 @@ impl ArrowSchurSystem {
                         });
                     }
                     self.add_ext_coord_penalty(penalty, target_t, rho_local);
+                    if let Some(fingerprint) =
+                        analytic_penalty_row_hessian_fingerprint(penalty, target_t, rho_local)
+                    {
+                        penalty_fingerprints.push(fingerprint);
+                    }
                 }
                 PenaltyTier::Beta => {
                     self.add_beta_penalty(penalty, target_beta, rho_local);
@@ -685,6 +865,14 @@ impl ArrowSchurSystem {
                 }
             }
         }
+        let mut hasher = StableHasher::new();
+        hasher.write_str("arrow-schur-row-hessian-registry-v1");
+        hasher.write_usize(penalty_fingerprints.len());
+        for fingerprint in penalty_fingerprints {
+            hasher.write_u64(fingerprint);
+        }
+        self.analytic_row_hessian_fingerprint = hasher.finish_u64();
+        self.refresh_row_hessian_fingerprint();
         Ok(())
     }
 
@@ -700,6 +888,7 @@ impl ArrowSchurSystem {
         let manifold = latent.manifold();
         self.manifold_mode_fingerprint = manifold_mode_fingerprint(latent);
         if manifold.is_euclidean() {
+            self.refresh_row_hessian_fingerprint();
             return;
         }
         debug_assert_eq!(latent.n_obs(), self.rows.len());
@@ -713,6 +902,7 @@ impl ArrowSchurSystem {
             row.htt = manifold.riemannian_hessian_matrix(t_i.clone(), gt_e.view(), htt_e.view());
             row.htbeta = manifold.project_matrix_columns_to_tangent(t_i, htbeta_e.view());
         }
+        self.refresh_row_hessian_fingerprint();
     }
 
     fn add_ext_coord_penalty(
@@ -912,6 +1102,9 @@ pub struct ArrowFactorCache {
     pub k: usize,
     /// Geometry tag for the row-local factors and cross-blocks.
     pub manifold_mode_fingerprint: u64,
+    /// Row-system tag for the cached per-row factors, cross-blocks, and
+    /// shared-block diagonal used to build the Schur factor.
+    pub row_hessian_fingerprint: u64,
 }
 
 impl ArrowFactorCache {
@@ -1126,6 +1319,7 @@ pub fn solve_arrow_newton_step_with_options(
         d: sys.d,
         k: sys.k,
         manifold_mode_fingerprint: sys.manifold_mode_fingerprint,
+        row_hessian_fingerprint: sys.current_row_hessian_fingerprint(),
     };
     Ok((step.delta_t, step.delta_beta, cache))
 }
