@@ -29991,13 +29991,17 @@ mod tests {
             boundary: OneDimensionalBoundary::Open,
         };
         let out = build_duchon_basis(data.view(), &spec).unwrap();
-        match &out.metadata {
-            BasisMetadata::Duchon {
-                identifiability_transform,
-                ..
-            } => assert!(identifiability_transform.is_some()),
-            other => panic!("expected Duchon metadata, got {other:?}"),
-        }
+        let BasisMetadata::Duchon {
+            identifiability_transform,
+            ..
+        } = &out.metadata
+        else {
+            panic!("expected Duchon metadata, got {:?}", out.metadata);
+        };
+        assert!(
+            identifiability_transform.is_some(),
+            "default spatial identifiability must materialize a transform"
+        );
     }
 
     #[test]
