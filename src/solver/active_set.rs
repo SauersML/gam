@@ -5,6 +5,7 @@ use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use faer::{Side, Unbind};
 use ndarray::{Array1, Array2, s};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 #[derive(Clone, Debug)]
 pub struct LinearInequalityConstraints {
@@ -382,13 +383,35 @@ pub(crate) fn solve_kkt_direction(
 pub(crate) struct CompressedActiveWorkingSet {
     pub(crate) constraints: LinearInequalityConstraints,
     pub(crate) groups: Vec<Vec<usize>>,
+    multiplier_dependence: Vec<Vec<ActiveRowDependence>>,
     pub(crate) original_active_count: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ActiveRowDependence {
+    active_pos: usize,
+    coeff: f64,
 }
 
 impl CompressedActiveWorkingSet {
     fn is_degenerate_face(&self) -> bool {
         self.constraints.a.nrows() < self.original_active_count
             || self.groups.iter().any(|group| group.len() > 1)
+    }
+
+    fn reconstructed_active_multipliers(&self, lambda_system: &Array1<f64>) -> Vec<(usize, f64)> {
+        let mut multipliers = Vec::new();
+        for (group_pos, &lambda_system_value) in lambda_system.iter().enumerate() {
+            let lambda_true = -lambda_system_value;
+            if let Some(dependencies) = self.multiplier_dependence.get(group_pos) {
+                for dependency in dependencies {
+                    if dependency.coeff.abs() > f64::EPSILON {
+                        multipliers.push((dependency.active_pos, lambda_true / dependency.coeff));
+                    }
+                }
+            }
+        }
+        multipliers
     }
 }
 
@@ -420,13 +443,31 @@ pub(crate) fn compress_active_working_set(
         groups_out.push(vec![pos]);
     }
 
-    let (a_out, b_out, groups_out) = rank_reduce_rows_pivoted_qr(a_out, b_out, groups_out);
+    let (a_out, b_out, groups_out, multiplier_dependence) =
+        rank_reduce_rows_pivoted_qr_with_dependence(a_out, b_out, groups_out);
 
     Ok(CompressedActiveWorkingSet {
         constraints: LinearInequalityConstraints::from_paired(a_out, b_out),
         groups: groups_out,
+        multiplier_dependence,
         original_active_count: active.len(),
     })
+}
+
+fn identity_multiplier_dependence(groups: &[Vec<usize>]) -> Vec<Vec<ActiveRowDependence>> {
+    groups
+        .iter()
+        .map(|group| {
+            group
+                .iter()
+                .copied()
+                .map(|active_pos| ActiveRowDependence {
+                    active_pos,
+                    coeff: 1.0,
+                })
+                .collect()
+        })
+        .collect()
 }
 
 pub(crate) fn rank_reduce_rows_pivoted_qr(
@@ -434,10 +475,25 @@ pub(crate) fn rank_reduce_rows_pivoted_qr(
     b: Array1<f64>,
     groups: Vec<Vec<usize>>,
 ) -> (Array2<f64>, Array1<f64>, Vec<Vec<usize>>) {
+    let (a, b, groups, _) = rank_reduce_rows_pivoted_qr_with_dependence(a, b, groups);
+    (a, b, groups)
+}
+
+fn rank_reduce_rows_pivoted_qr_with_dependence(
+    a: Array2<f64>,
+    b: Array1<f64>,
+    groups: Vec<Vec<usize>>,
+) -> (
+    Array2<f64>,
+    Array1<f64>,
+    Vec<Vec<usize>>,
+    Vec<Vec<ActiveRowDependence>>,
+) {
     let k = a.nrows();
     let p = a.ncols();
     if k <= 1 {
-        return (a, b, groups);
+        let multiplier_dependence = identity_multiplier_dependence(&groups);
+        return (a, b, groups, multiplier_dependence);
     }
 
     let mut at_faer = faer::Mat::<f64>::zeros(p, k);
@@ -461,7 +517,8 @@ pub(crate) fn rank_reduce_rows_pivoted_qr(
 
     let rank = (0..diag_len).filter(|&i| r_mat[(i, i)].abs() > tol).count();
     if rank >= k {
-        return (a, b, groups);
+        let multiplier_dependence = identity_multiplier_dependence(&groups);
+        return (a, b, groups, multiplier_dependence);
     }
     if rank == 0 {
         log::debug!(
@@ -471,6 +528,7 @@ pub(crate) fn rank_reduce_rows_pivoted_qr(
         return (
             Array2::<f64>::zeros((0, p)),
             Array1::<f64>::zeros(0),
+            Vec::new(),
             Vec::new(),
         );
     }
@@ -483,41 +541,73 @@ pub(crate) fn rank_reduce_rows_pivoted_qr(
     let mut a_out = Array2::<f64>::zeros((rank, p));
     let mut b_out = Array1::<f64>::zeros(rank);
     let mut groups_out: Vec<Vec<usize>> = Vec::with_capacity(rank);
+    let mut multiplier_dependence: Vec<Vec<ActiveRowDependence>> = Vec::with_capacity(rank);
     for (out_idx, &orig_idx) in kept_orig.iter().enumerate() {
         a_out.row_mut(out_idx).assign(&a.row(orig_idx));
         b_out[out_idx] = b[orig_idx];
         groups_out.push(groups[orig_idx].clone());
+        multiplier_dependence.push(
+            groups[orig_idx]
+                .iter()
+                .copied()
+                .map(|active_pos| ActiveRowDependence {
+                    active_pos,
+                    coeff: 1.0,
+                })
+                .collect(),
+        );
         orig_to_out.insert(orig_idx, out_idx);
     }
 
     for &dropped_idx in &dropped_orig {
         let dropped_row = a.row(dropped_idx);
         let dropped_norm = dropped_row.dot(&dropped_row).sqrt();
-        let mut best_align = -1.0_f64;
-        let mut best_target = kept_orig[0];
+        let mut best_positive_align = -1.0_f64;
+        let mut best_positive_target: Option<(usize, f64)> = None;
+        let mut best_abs_align = -1.0_f64;
+        let mut best_signed_target = (kept_orig[0], 1.0_f64);
         for &kept_idx in &kept_orig {
             let kept_row = a.row(kept_idx);
             let kept_norm = kept_row.dot(&kept_row).sqrt();
-            let dot = kept_row.dot(&dropped_row).abs();
+            let dot = kept_row.dot(&dropped_row);
             let align = if kept_norm > 0.0 && dropped_norm > 0.0 {
                 dot / (kept_norm * dropped_norm)
             } else {
                 dot
             };
-            if align > best_align {
-                best_align = align;
-                best_target = kept_idx;
+            let coeff = if kept_norm > 0.0 {
+                dot / (kept_norm * kept_norm)
+            } else {
+                0.0
+            };
+            if align.abs() > best_abs_align {
+                best_abs_align = align.abs();
+                best_signed_target = (kept_idx, coeff);
+            }
+            if coeff > 0.0 && align > best_positive_align {
+                best_positive_align = align;
+                best_positive_target = Some((kept_idx, coeff));
             }
         }
+        let (best_target, coeff) = best_positive_target.unwrap_or(best_signed_target);
         let &out_idx = orig_to_out
             .get(&best_target)
             .expect("merge target must be a kept row");
-        groups_out[out_idx].extend_from_slice(&groups[dropped_idx]);
+        for &active_pos in &groups[dropped_idx] {
+            multiplier_dependence[out_idx].push(ActiveRowDependence { active_pos, coeff });
+        }
+        if coeff > 0.0 {
+            groups_out[out_idx].extend_from_slice(&groups[dropped_idx]);
+        }
     }
 
     for group in &mut groups_out {
         group.sort_unstable();
         group.dedup();
+    }
+    for dependencies in &mut multiplier_dependence {
+        dependencies.sort_unstable_by_key(|dependency| dependency.active_pos);
+        dependencies.dedup_by_key(|dependency| dependency.active_pos);
     }
 
     let mut row_order: Vec<usize> = (0..groups_out.len()).collect();
@@ -526,14 +616,17 @@ pub(crate) fn rank_reduce_rows_pivoted_qr(
         let mut a_sorted = Array2::<f64>::zeros((rank, p));
         let mut b_sorted = Array1::<f64>::zeros(rank);
         let mut groups_sorted = Vec::with_capacity(rank);
+        let mut dependence_sorted = Vec::with_capacity(rank);
         for (out_idx, orig_idx) in row_order.into_iter().enumerate() {
             a_sorted.row_mut(out_idx).assign(&a_out.row(orig_idx));
             b_sorted[out_idx] = b_out[orig_idx];
             groups_sorted.push(groups_out[orig_idx].clone());
+            dependence_sorted.push(multiplier_dependence[orig_idx].clone());
         }
         a_out = a_sorted;
         b_out = b_sorted;
         groups_out = groups_sorted;
+        multiplier_dependence = dependence_sorted;
     }
 
     if rank < k {
@@ -545,7 +638,7 @@ pub(crate) fn rank_reduce_rows_pivoted_qr(
         );
     }
 
-    (a_out, b_out, groups_out)
+    (a_out, b_out, groups_out, multiplier_dependence)
 }
 
 pub(crate) fn working_set_kkt_diagnostics_from_multipliers(
@@ -704,6 +797,21 @@ fn log_active_set_transition(
     );
 }
 
+fn record_active_working_set(
+    visited: &mut HashSet<Vec<usize>>,
+    active: &[usize],
+    iteration: usize,
+) -> Result<(), EstimationError> {
+    let mut key = active.to_vec();
+    key.sort_unstable();
+    if visited.insert(key.clone()) {
+        return Ok(());
+    }
+    Err(EstimationError::ParameterConstraintViolation(format!(
+        "linear-constrained Newton active-set cycled at iteration {iteration}; repeated active set {key:?}"
+    )))
+}
+
 fn solve_newton_direction_with_linear_constraints_impl(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
@@ -773,6 +881,8 @@ fn solve_newton_direction_with_linear_constraints_impl(
             log_active_set_transition("initial-boundary-add", 0, active.len(), Some(i));
         }
     }
+    let mut visited_working_sets: HashSet<Vec<usize>> = HashSet::new();
+    record_active_working_set(&mut visited_working_sets, &active, 0)?;
 
     for iteration in 0..max_iterations {
         let compressed_working = compress_active_working_set(&x, constraints, &active)?;
@@ -793,28 +903,22 @@ fn solve_newton_direction_with_linear_constraints_impl(
                 direction_out.assign(&d_total);
                 return Ok(());
             }
-            let mut remove_pos: Option<usize> = None;
-            let mut most_negative_true = -tol_dual;
-            for (group_pos, &lam_sys) in lambdaw.iter().enumerate() {
-                let lam_true = -lam_sys;
-                if lam_true < most_negative_true {
-                    most_negative_true = lam_true;
-                    remove_pos = Some(group_pos);
-                }
-            }
-            if let Some(group_pos) = remove_pos {
-                let mut removal_positions = compressed_working.groups[group_pos].clone();
-                removal_positions.sort_unstable_by(|left, right| right.cmp(left));
-                for active_pos in removal_positions {
-                    let idx = active.remove(active_pos);
-                    is_active[idx] = false;
-                    log_active_set_transition(
-                        "remove-negative-dual",
-                        iteration,
-                        active.len(),
-                        Some(idx),
-                    );
-                }
+            let remove_pos = compressed_working
+                .reconstructed_active_multipliers(&lambdaw)
+                .into_iter()
+                .filter(|&(_, lambda_true)| lambda_true < -tol_dual)
+                .min_by_key(|(active_pos, _)| (active[*active_pos], *active_pos))
+                .map(|(active_pos, _)| active_pos);
+            if let Some(active_pos) = remove_pos {
+                let idx = active.remove(active_pos);
+                is_active[idx] = false;
+                log_active_set_transition(
+                    "remove-negative-dual",
+                    iteration,
+                    active.len(),
+                    Some(idx),
+                );
+                record_active_working_set(&mut visited_working_sets, &active, iteration)?;
                 continue;
             }
             if let Some(hint) = active_hint {
@@ -863,6 +967,8 @@ fn solve_newton_direction_with_linear_constraints_impl(
                 is_active[i] = true;
                 added_new_active = true;
                 log_active_set_transition("blocking-add", iteration, active.len(), Some(i));
+                record_active_working_set(&mut visited_working_sets, &active, iteration)?;
+                break;
             }
         }
 
