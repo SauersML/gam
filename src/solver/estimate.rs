@@ -3929,6 +3929,8 @@ pub struct FitArtifacts {
     #[serde(default)]
     pub null_space_logdet: Option<f64>,
     #[serde(default)]
+    pub null_space_dim: Option<usize>,
+    #[serde(default)]
     pub survival_link_wiggle_knots: Option<Array1<f64>>,
     #[serde(default)]
     pub survival_link_wiggle_degree: Option<usize>,
@@ -3939,6 +3941,7 @@ impl std::fmt::Debug for FitArtifacts {
         f.debug_struct("FitArtifacts")
             .field("pirls", &self.pirls.as_ref().map(|_| "..."))
             .field("null_space_logdet", &self.null_space_logdet)
+            .field("null_space_dim", &self.null_space_dim)
             .field(
                 "survival_link_wiggle_knots",
                 &self
