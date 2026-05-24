@@ -722,6 +722,11 @@ const MODEL_VERSION: u32 = MODEL_PAYLOAD_VERSION;
 /// `inverse_link_to_binomial_spec` (or equivalent).
 fn legacy_family_to_spec(family: LikelihoodFamily) -> LikelihoodSpec {
     LikelihoodSpec::from_non_parameterized(family).unwrap_or_else(|| {
+        // SAFETY: all `FittedFamily` construction sites in main.rs build
+        // saved models from non-parameterized variants only (RoystonParmar,
+        // GaussianIdentity, BinomialLogit, BinomialProbit). Parameterized
+        // binomial variants (Sas/BetaLogistic/Mixture/LatentCLogLog) flow
+        // through `inverse_link_to_binomial_spec` and never reach this helper.
         panic!(
             "legacy_family_to_spec called with parameterized binomial variant {family:?}; \
              callers must source InverseLink state explicitly"
