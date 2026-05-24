@@ -1,16 +1,16 @@
-#[derive(Clone, Debug)]
-pub struct FusedXtWxConfig {
-    pub tile_p: usize,
-    pub chunk_rows: usize,
-    pub signed_weights: bool,
+//! Placeholder module for the CUDA backend phase described in the GPU HAL.
+//!
+//! The public HAL is present so solver call sites can be routed without CUDA
+//! types. Concrete cudarc kernels are intentionally isolated here in follow-up
+//! implementations and unavailable backends fall back to CPU numerics.
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendStatus {
+    CpuFallback,
+    CudaUnavailable,
+    CudaReady,
 }
 
-impl Default for FusedXtWxConfig {
-    fn default() -> Self {
-        Self {
-            tile_p: 32,
-            chunk_rows: 32_768,
-            signed_weights: true,
-        }
-    }
+pub fn backend_status() -> BackendStatus {
+    BackendStatus::CpuFallback
 }

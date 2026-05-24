@@ -1,26 +1,16 @@
-use super::memory::DeviceCsrMatrix;
-use super::profile::{OperationKind, record_cpu_fallback};
+//! Placeholder module for the CUDA backend phase described in the GPU HAL.
+//!
+//! The public HAL is present so solver call sites can be routed without CUDA
+//! types. Concrete cudarc kernels are intentionally isolated here in follow-up
+//! implementations and unavailable backends fall back to CPU numerics.
 
-#[derive(Clone, Debug)]
-pub enum SparseGpuMode {
-    DenseOuterProduct,
-    CusparseSpGemm,
-    MatrixFreePcg,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendStatus {
+    CpuFallback,
+    CudaUnavailable,
+    CudaReady,
 }
 
-pub fn try_sparse_xtwx(
-    csr: &DeviceCsrMatrix,
-    weights_len: usize,
-    mode: SparseGpuMode,
-) -> Option<super::memory::DeviceMatrix> {
-    let _ = (weights_len, mode);
-    record_cpu_fallback(
-        "gpu.sparse.xtwx",
-        OperationKind::SparseXtWx,
-        csr.rows,
-        csr.cols,
-        0,
-        csr.values.len(),
-    );
-    None
+pub fn backend_status() -> BackendStatus {
+    BackendStatus::CpuFallback
 }

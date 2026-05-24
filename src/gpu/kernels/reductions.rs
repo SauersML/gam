@@ -1,12 +1,16 @@
-pub const DETERMINISTIC_TILE_SIZE: usize = 256;
+//! Placeholder module for the CUDA backend phase described in the GPU HAL.
+//!
+//! The public HAL is present so solver call sites can be routed without CUDA
+//! types. Concrete cudarc kernels are intentionally isolated here in follow-up
+//! implementations and unavailable backends fall back to CPU numerics.
 
-pub fn pairwise_sum_host(values: &[f64]) -> f64 {
-    if values.len() <= DETERMINISTIC_TILE_SIZE {
-        values.iter().copied().sum()
-    } else {
-        values
-            .chunks(DETERMINISTIC_TILE_SIZE)
-            .map(pairwise_sum_host)
-            .sum()
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendStatus {
+    CpuFallback,
+    CudaUnavailable,
+    CudaReady,
+}
+
+pub fn backend_status() -> BackendStatus {
+    BackendStatus::CpuFallback
 }
