@@ -1,4 +1,4 @@
-"""Analytic structured penalties: isometry, sparsity, SCAD/MCP, ARD, TV, nuclear norm, block sparsity, block orthogonality, orthogonality.
+"""Analytic structured penalties: isometry, sparsity, SCAD/MCP, ARD, TV, nuclear norm, block sparsity, mechanism sparsity, block orthogonality, orthogonality.
 
 Thin Python configuration wrappers around the analytic primitives
 implemented in `src/terms/analytic_penalties.rs`. Each wrapper is a
@@ -33,6 +33,8 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
 * `BlockSparsityPenalty` lives on t. Group-lasso smoothed L¹ on predefined
   latent-axis blocks, shrinking whole groups rather than individual entries
   or single ARD axes.
+* `MechanismSparsityPenalty` lives on decoder W. Per-latent group-lasso
+  smoothed L¹ over feature groups.
 * `BlockOrthogonalityPenalty` lives on t. Penalizes only between-block
   cross-products, leaving each block internally free; this is the
   auto_exp_38 supervised gauge-fix block plus free discovery block pattern.
@@ -72,6 +74,7 @@ __all__ = [
     "TotalVariationPenalty",
     "NuclearNormPenalty",
     "BlockSparsityPenalty",
+    "MechanismSparsityPenalty",
     "BlockOrthogonalityPenalty",
     "AuxConditionalPriorPenalty",
     "IvaeRidgeMeanGauge",
@@ -879,6 +882,100 @@ class BlockSparsityPenalty:
 
 
 @dataclass(init=False, slots=True)
+class MechanismSparsityPenalty:
+    """Per-latent group-lasso sparsity over decoder feature groups."""
+
+    target: TargetSpec
+    feature_groups: list[list[int]]
+    weight: float
+    smoothing_eps: float
+    n_eff: float
+    learnable: bool
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
+
+    def __init__(
+        self,
+        feature_groups: Any,
+        weight: float,
+        n_eff: float,
+        smoothing_eps: float = 1e-6,
+        learnable: bool = False,
+        *,
+        target: TargetSpec = "t",
+    ) -> None:
+        self.target = target
+        self.feature_groups = self._coerce_feature_groups(feature_groups)
+        self.weight = float(weight)
+        self.smoothing_eps = float(smoothing_eps)
+        self.n_eff = float(n_eff)
+        self.learnable = bool(learnable)
+        self.weight_schedule = None
+        self.__post_init__()
+
+    @staticmethod
+    def _coerce_feature_groups(feature_groups: Any) -> list[list[int]]:
+        try:
+            coerced = [[index(feature) for feature in group] for group in feature_groups]
+        except TypeError as exc:
+            raise TypeError(
+                "MechanismSparsityPenalty.feature_groups must be a sequence of integer sequences"
+            ) from exc
+        if not coerced:
+            raise ValueError("MechanismSparsityPenalty.feature_groups must not be empty")
+        seen: set[int] = set()
+        for group_idx, group in enumerate(coerced):
+            if not group:
+                raise ValueError(
+                    f"MechanismSparsityPenalty.feature_groups[{group_idx}] must not be empty"
+                )
+            for feature in group:
+                if feature < 0:
+                    raise ValueError(
+                        "MechanismSparsityPenalty.feature_groups entries must be non-negative; "
+                        f"got {feature}"
+                    )
+                if feature in seen:
+                    raise ValueError(
+                        "MechanismSparsityPenalty.feature_groups feature "
+                        f"{feature} appears more than once"
+                    )
+                seen.add(feature)
+        missing = set(range(max(seen) + 1)) - seen
+        if missing:
+            first = min(missing)
+            raise ValueError(
+                "MechanismSparsityPenalty.feature_groups must partition contiguous features from 0; "
+                f"missing feature {first}"
+            )
+        return coerced
+
+    def __post_init__(self) -> None:
+        if not self.weight > 0.0:
+            raise ValueError(f"MechanismSparsityPenalty.weight must be > 0, got {self.weight}")
+        if not self.smoothing_eps > 0.0:
+            raise ValueError(
+                "MechanismSparsityPenalty.smoothing_eps must be > 0, "
+                f"got {self.smoothing_eps}"
+            )
+        if not np.isfinite(self.n_eff) or self.n_eff <= 0.0:
+            raise ValueError(f"MechanismSparsityPenalty.n_eff must be > 0, got {self.n_eff}")
+
+    def _to_rust_payload(self) -> dict[str, Any]:
+        return _add_weight_schedule({
+            "kind": "mechanism_sparsity",
+            "target": _target_descriptor(self.target),
+            "feature_groups": self.feature_groups,
+            "weight": self.weight,
+            "smoothing_eps": self.smoothing_eps,
+            "n_eff": self.n_eff,
+            "learnable": self.learnable,
+        }, self)
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
+
+
+@dataclass(init=False, slots=True)
 class BlockOrthogonalityPenalty:
     """Between-block-only orthogonality over latent-axis groups.
 
@@ -1510,6 +1607,7 @@ for _penalty_cls in (
     TotalVariationPenalty,
     NuclearNormPenalty,
     BlockSparsityPenalty,
+    MechanismSparsityPenalty,
     AuxConditionalPriorPenalty,
     IvaeRidgeMeanGauge,
     ParametricAuxConditionalPriorPenalty,
@@ -1524,6 +1622,7 @@ for _penalty_cls in (
 Penalty = (
     "IsometryPenalty | SparsityPenalty | ScadMcpPenalty | ARDPenalty | "
     "TotalVariationPenalty | NuclearNormPenalty | BlockSparsityPenalty | "
-    "AuxConditionalPriorPenalty | IvaeRidgeMeanGauge | ParametricAuxConditionalPriorPenalty | "
-    "OrthogonalityPenalty | IBPAssignmentPenalty | SoftmaxAssignmentSparsityPenalty"
+    "MechanismSparsityPenalty | AuxConditionalPriorPenalty | IvaeRidgeMeanGauge | "
+    "ParametricAuxConditionalPriorPenalty | OrthogonalityPenalty | IBPAssignmentPenalty | "
+    "SoftmaxAssignmentSparsityPenalty"
 )
