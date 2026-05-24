@@ -639,7 +639,18 @@ impl TermCollectionSpec {
         for st in &self.smooth_terms {
             match &st.basis {
                 SmoothBasisSpec::ByVariable { inner, .. } => {
-                    validate_smooth_basis_frozen(inner, label, &st.name)?
+                    validate_smooth_basis_frozen(inner, label, &st.name)?;
+                    let nested = SmoothTermSpec {
+                        name: st.name.clone(),
+                        basis: (**inner).clone(),
+                        shape: st.shape,
+                    };
+                    TermCollectionSpec {
+                        linear_terms: Vec::new(),
+                        random_effect_terms: Vec::new(),
+                        smooth_terms: vec![nested],
+                    }
+                    .validate_frozen(label)?;
                 }
                 SmoothBasisSpec::FactorSumToZero { inner, levels, .. } => {
                     if levels.len() < 2 {
@@ -689,6 +700,14 @@ impl TermCollectionSpec {
                         ))
                         .into());
                     }
+                    if matches!(spec.method, crate::basis::SphereMethod::Harmonic)
+                        && spec.max_degree.is_none_or(|d| d == 0)
+                    {
+                        return Err(format!(
+                            "{label} term '{}' is not frozen: sphere max_degree must be positive",
+                            st.name
+                        ));
+                    }
                 }
                 SmoothBasisSpec::Matern { spec, .. } => {
                     if !matches!(spec.center_strategy, CenterStrategy::UserProvided(_)) {
@@ -737,14 +756,25 @@ impl TermCollectionSpec {
                         return Err(format!("{label} term '{}' has nested by-smooths", st.name));
                     }
                     match by_kind {
+                        ByVarKind::Numeric { .. } => {}
                         ByVarKind::Factor { frozen_levels, .. } if frozen_levels.is_none() => {
                             return Err(format!(
                                 "{label} term '{}' is not frozen: by-factor levels missing",
                                 st.name
                             ));
                         }
-                        _ => {}
+                        ByVarKind::Factor { .. } => {}
                     }
+                    let nested = TermCollectionSpec {
+                        linear_terms: vec![],
+                        random_effect_terms: vec![],
+                        smooth_terms: vec![SmoothTermSpec {
+                            name: st.name.clone(),
+                            basis: (**smooth).clone(),
+                            shape: st.shape,
+                        }],
+                    };
+                    nested.validate_frozen(label)?;
                 }
                 SmoothBasisSpec::FactorSmooth { spec } => {
                     if spec.group_frozen_levels.is_none() {
@@ -762,29 +792,6 @@ impl TermCollectionSpec {
                             st.name
                         ));
                     }
-                }
-                SmoothBasisSpec::Sphere { spec, .. } => {
-                    if matches!(spec.method, crate::basis::SphereMethod::Harmonic)
-                        && spec.max_degree.is_none_or(|d| d == 0)
-                    {
-                        return Err(format!(
-                            "{label} term '{}' is not frozen: sphere max_degree must be positive",
-                            st.name
-                        ));
-                    }
-                }
-                SmoothBasisSpec::ByVariable { inner, .. } => {
-                    let nested = SmoothTermSpec {
-                        name: st.name.clone(),
-                        basis: (**inner).clone(),
-                        shape: st.shape,
-                    };
-                    TermCollectionSpec {
-                        linear_terms: Vec::new(),
-                        random_effect_terms: Vec::new(),
-                        smooth_terms: vec![nested],
-                    }
-                    .validate_frozen(label)?;
                 }
                 SmoothBasisSpec::TensorBSpline { spec, .. } => {
                     for (dim, marginal) in spec.marginalspecs.iter().enumerate() {
@@ -808,82 +815,6 @@ impl TermCollectionSpec {
                             st.name
                         ))
                         .into());
-                    }
-                }
-                SmoothBasisSpec::FactorSmooth { spec } => {
-                    if !matches!(
-                        spec.marginal.knotspec,
-                        BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. }
-                    ) {
-                        return Err(format!(
-                            "{label} term '{}' is not frozen: factor-smooth marginal knotspec must be Provided or PeriodicUniform",
-                            st.name
-                        ));
-                    }
-                    if spec.group_frozen_levels.is_none() {
-                        return Err(format!(
-                            "{label} term '{}' is not frozen: factor smooth missing group_frozen_levels",
-                            st.name
-                        ));
-                    }
-                }
-                SmoothBasisSpec::BySmooth { smooth, by_kind } => {
-                    if let ByVarKind::Factor { frozen_levels, .. } = by_kind
-                        && frozen_levels.is_none()
-                    {
-                        return Err(format!(
-                            "{label} term '{}' is not frozen: factor by-smooth missing frozen_levels",
-                            st.name
-                        ));
-                    }
-                    let nested = TermCollectionSpec {
-                        linear_terms: vec![],
-                        random_effect_terms: vec![],
-                        smooth_terms: vec![SmoothTermSpec {
-                            name: st.name.clone(),
-                            basis: (**smooth).clone(),
-                            shape: st.shape,
-                        }],
-                    };
-                    nested.validate_frozen(label)?;
-                }
-                SmoothBasisSpec::BySmooth { smooth, by_kind } => {
-                    match by_kind {
-                        ByVarKind::Numeric { .. } => {}
-                        ByVarKind::Factor { frozen_levels, .. } if frozen_levels.is_none() => {
-                            return Err(format!(
-                                "{label} term '{}' is not frozen: by-factor levels must be frozen",
-                                st.name
-                            ));
-                        }
-                        ByVarKind::Factor { .. } => {}
-                    }
-                    let nested = TermCollectionSpec {
-                        linear_terms: vec![],
-                        random_effect_terms: vec![],
-                        smooth_terms: vec![SmoothTermSpec {
-                            name: st.name.clone(),
-                            basis: (**smooth).clone(),
-                            shape: st.shape,
-                        }],
-                    };
-                    nested.validate_frozen(label)?;
-                }
-                SmoothBasisSpec::FactorSmooth { spec } => {
-                    if spec.group_frozen_levels.is_none() {
-                        return Err(format!(
-                            "{label} term '{}' is not frozen: factor-smooth group levels must be frozen",
-                            st.name
-                        ));
-                    }
-                    if !matches!(
-                        spec.marginal.knotspec,
-                        BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. }
-                    ) {
-                        return Err(format!(
-                            "{label} term '{}' is not frozen: factor-smooth marginal knotspec must be Provided or PeriodicUniform",
-                            st.name
-                        ));
                     }
                 }
             }

@@ -14449,7 +14449,7 @@ impl<F: BinomialLocationScaleJointPsiFamily> BinomialLocationScaleJointPsiWorksp
                 psi_index,
                 self.x_t.as_ref(),
                 self.x_ls.as_ref(),
-                &self.family.policy,
+                self.family.ws_policy(),
             )
         })
     }
@@ -14472,7 +14472,7 @@ where
         };
         Ok(Some(
             self.family
-                .exact_newton_joint_psisecond_order_terms_from_parts(
+                .ws_psi_second_order_terms_from_parts(
                     &self.block_states,
                     &self.derivative_blocks,
                     dir_i.as_ref(),
@@ -14494,7 +14494,7 @@ where
         Ok(Some(
             crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
                 self.family
-                    .exact_newton_joint_psihessian_directional_derivative_from_parts(
+                    .ws_psi_hessian_directional_from_parts(
                         &self.block_states,
                         dir.as_ref(),
                         d_beta_flat,
@@ -17740,6 +17740,33 @@ impl BinomialLocationScaleHessianWorkspace {
             tl: Arc::new(tl),
             ll: Arc::new(ll),
         }))
+    }
+
+    /// Apply a Horvitz–Thompson outer-row subsample mask to the precomputed
+    /// per-row coefficient arrays in place. Each sampled row's `coeff_*[i]`
+    /// is multiplied by its `WeightedOuterRow.weight` (the HT inverse-
+    /// inclusion factor 1/π_i); non-sampled rows are zeroed. Because every
+    /// downstream assembly (`hessian_dense`, `hessian_matvec`,
+    /// `hessian_diagonal`) is row-linear in these arrays via `Xᵀ diag(W) X`,
+    /// the resulting joint-Hessian is an unbiased estimator of the full-data
+    /// joint Hessian.
+    fn apply_outer_subsample(
+        &mut self,
+        rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
+    ) {
+        let n = self.coeff_tt.len();
+        let mut mask_tt = Array1::<f64>::zeros(n);
+        let mut mask_tl = Array1::<f64>::zeros(n);
+        let mut mask_ll = Array1::<f64>::zeros(n);
+        for r in rows {
+            let i = r.index;
+            mask_tt[i] = self.coeff_tt[i] * r.weight;
+            mask_tl[i] = self.coeff_tl[i] * r.weight;
+            mask_ll[i] = self.coeff_ll[i] * r.weight;
+        }
+        self.coeff_tt = mask_tt;
+        self.coeff_tl = mask_tl;
+        self.coeff_ll = mask_ll;
     }
 }
 

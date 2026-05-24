@@ -1708,8 +1708,6 @@ pub fn build_smooth_basis(
                 None
             };
             let operator_penalties = DuchonOperatorPenaltySpec::default();
-            let periodic = option_bool(options, "cyclic").unwrap_or(false)
-                || option_bool(options, "periodic").unwrap_or(false);
             Ok(SmoothBasisSpec::Duchon {
                 feature_cols: cols.to_vec(),
                 spec: DuchonBasisSpec {
