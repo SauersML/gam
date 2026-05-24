@@ -9608,7 +9608,7 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
         )
     }
 
-    fn second_order_terms(
+    fn block_linear_constraints(
         &self,
         _psi_i: usize,
         _psi_j: usize,
@@ -9711,7 +9711,16 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
         _d_beta_u_flat: &Array1<f64>,
         _d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
-        Ok(None)
+        Ok(self
+            .family
+            .exact_newton_joint_hessiansecond_directional_derivative_from_parts(
+                &self.block_states,
+                d_beta_u_flat,
+                d_beta_v_flat,
+                &self.q,
+                &self.dynamic,
+            )?
+            .map(|matrix| Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>))
     }
 }
 

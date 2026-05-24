@@ -6010,13 +6010,45 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
 
     progress.set_stage("sample", "running posterior sampling");
     progress.teardown();
-    let nuts = gam::sample::sample_saved_model(
-        &model,
-        ds.values.view(),
-        &col_map,
-        training_headers,
-        &cfg,
-    )?;
+    // Collapsing this dispatch requires SurvivalPredictor and
+    // LocationScalePredictor implementations of PredictableModel.
+    let nuts = match model.predict_model_class() {
+        PredictModelClass::Survival => run_sample_survival(
+            &mut progress,
+            &model,
+            ds.values.view(),
+            &col_map,
+            training_headers,
+            &cfg,
+        )?,
+        PredictModelClass::GaussianLocationScale => gam::sample::laplace_gaussian_fallback(
+            &model,
+            &cfg,
+            "gaussian location-scale posterior",
+        )?,
+        PredictModelClass::BinomialLocationScale => gam::sample::laplace_gaussian_fallback(
+            &model,
+            &cfg,
+            "binomial location-scale posterior",
+        )?,
+        PredictModelClass::BernoulliMarginalSlope => gam::sample::laplace_gaussian_fallback(
+            &model,
+            &cfg,
+            "bernoulli marginal-slope posterior",
+        )?,
+        PredictModelClass::TransformationNormal => {
+            gam::sample::laplace_gaussian_fallback(&model, &cfg, "transformation-normal posterior")?
+        }
+        PredictModelClass::Standard => run_sample_standard(
+            &mut progress,
+            &model,
+            ds.values.view(),
+            &col_map,
+            training_headers,
+            family,
+            &cfg,
+        )?,
+    };
 
     let out = args
         .out

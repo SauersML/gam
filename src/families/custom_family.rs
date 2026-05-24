@@ -13172,45 +13172,60 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 converged = false;
                 break;
             }
-
-            // Linearized-rate stall update + early-exit. See the
-            // `LINEARIZED_STALL_*` constants near the top of this function
-            // for the mathematical rationale. We use the same
-            // `last_joint_math` snapshot as the certificates above so the
-            // signal we react to is the *accepted* step's Newton identity,
-            // not an attempt-level intermediate that the trust-region loop
-            // may have rejected.
-            if let Some(math) = last_joint_math.as_ref() {
-                let linearized_rel_now = math.linearized_rel();
-                if joint_linearized_rate_stall_candidate(linearized_rel_now, residual, residual_tol)
-                {
-                    linearized_stall_streak = linearized_stall_streak.saturating_add(1);
-                } else {
-                    linearized_stall_streak = 0;
-                }
-                if linearized_stall_streak >= LINEARIZED_STALL_CYCLES {
-                    // Projected cycles needed to reach residual_tol at the
-                    // observed geometric rate; logged so callers can verify
-                    // the bail-out is consistent with the budget.
-                    let projected_cycles_to_tol = projected_cycles_to_residual_tol(
-                        linearized_rel_now,
-                        residual,
-                        residual_tol,
-                    );
-                    log::warn!(
-                        "[PIRLS/joint-Newton convergence] cycle {:>3} | linearized-rate stall early-exit: linearized_rel={:.3e} >= {:.3e} for {} consecutive cycles, residual={:.3e} (tol={:.3e}, factor>={:.3e}), projected_cycles_to_tol={:.1}; returning unconverged with finite β so the outer optimizer rejects this ρ evaluation before inner_max_cycles burns the geometric tail.",
-                        cycle,
-                        linearized_rel_now,
-                        LINEARIZED_STALL_REL_THRESHOLD,
-                        linearized_stall_streak,
-                        residual,
-                        residual_tol,
-                        LINEARIZED_STALL_RESIDUAL_FACTOR,
-                        projected_cycles_to_tol,
-                    );
-                    converged = false;
-                    break;
-                }
+            // Plateau-flat-objective convergence certificate.
+            //
+            // When all three recent residual ratios sit above 0.95,
+            // Newton has stopped reducing the gradient residual along
+            // any direction the penalized Hessian can resolve — the
+            // remaining residual is locked into a curvature-bounded
+            // floor along null / ill-conditioned directions. If the
+            // objective has *also* been below `objective_tol` for the
+            // last three accepted cycles, the iterate is at a
+            // stationary point of the objective on the identifiable
+            // subspace, and the raw `‖∇L − Sβ‖∞` residual will not
+            // drop because there is no descent direction available.
+            //
+            // Operationally this is the projected-KKT certificate the
+            // raw residual gate cannot express: stalled descent ratios
+            // are the no-descent observation, and a Cauchy-on-
+            // objective tail is the convergence observation. Neither
+            // is sufficient alone — a stalled ratio with a still-
+            // shrinking objective means Newton is making small but
+            // real progress, and a flat objective with shrinking
+            // ratios means Newton is closing in fast and the residual
+            // gate will fire on its own. Their conjunction is the
+            // signal that further iteration is wall-clock waste.
+            //
+            // The `cycles_done >= 2` guard mirrors every other relaxed
+            // certificate in this function; it prevents certification
+            // on a degenerate cycle-0 stall (initial β at a barrier or
+            // machine-zero gradient that nonetheless is not optimal).
+            if descent_ratio_window.len() == 3
+                && descent_ratio_window.iter().all(|r| *r > 0.95)
+                && consecutive_obj_flat_cycles >= 3
+                && residual.is_finite()
+                && cycles_done >= 2
+            {
+                eprintln!(
+                    "[JN-EXIT] cycle={cycle} reason=plateau_objective_flat residual={residual:.3e} residual_tol={residual_tol:.3e} obj_change={objective_change:.3e} objective_tol={objective_tol:.3e} ratios=[{:.3},{:.3},{:.3}] consecutive_flat={consecutive_obj_flat_cycles} accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e}",
+                    descent_ratio_window[0], descent_ratio_window[1], descent_ratio_window[2],
+                );
+                converged = true;
+                break;
+            }
+            // Carry the objective-stagnation signal into the next
+            // cycle so the line-search-failure path above can pair it
+            // with trust-region collapse to certify a KKT optimum on a
+            // rank-deficient null mode. The residual signal does not
+            // need a carry-over: by the time we reach this assignment
+            // the end-of-cycle test has already confirmed residual is
+            // above its tolerance, so a "previous cycle had small
+            // residual" branch in the failure path could never fire.
+            last_cycle_obj_change_below_tol = objective_change <= objective_tol;
+            if objective_change <= objective_tol {
+                consecutive_obj_flat_cycles = consecutive_obj_flat_cycles.saturating_add(1);
+            } else {
+                consecutive_obj_flat_cycles = 0;
             }
             prev_kkt_norm = Some(current_kkt_norm);
         }
@@ -17580,10 +17595,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     // replaced. See `BatchedOuterGradientTerms`.
     let has_configured_rho_prior = !matches!(rho_prior, crate::types::RhoPrior::Flat);
     let mut batched_gradient_override: Option<Array1<f64>> = None;
-    let mut batched_first_order_trace_skip: Option<Array1<f64>> = None;
-    if !has_configured_rho_prior
-        && (eval_mode == EvalMode::ValueAndGradient || eval_mode == EvalMode::ValueGradientHessian)
-    {
+    if eval_mode == EvalMode::ValueAndGradient || eval_mode == EvalMode::ValueGradientHessian {
         let beta_flat_for_batch = flatten_state_betas(&inner.block_states, specs);
         let synced_states_for_batch = synchronized_states_from_flat_beta(
             family,

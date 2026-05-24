@@ -2061,13 +2061,11 @@ fn remap_term_collectionspec_columns(
 /// Canonical saved fit result for prediction.
 pub fn fit_result_from_saved_model_for_prediction(
     model: &SavedModel,
-) -> Result<UnifiedFitResult, SurvivalPredictError> {
+) -> Result<UnifiedFitResult, String> {
     model
         .fit_result
         .clone()
-        .ok_or_else(|| SurvivalPredictError::MissingFitMetadata {
-            reason: "model is missing canonical fit_result payload; refit".to_string(),
-        })
+        .ok_or_else(|| "model is missing canonical fit_result payload; refit".to_string())
 }
 
 /// Resolve the saved survival location-scale fit result.
