@@ -243,26 +243,6 @@ pub(crate) struct CtnDenseHessianKey {
     pub outer_subsample_hash: Option<u64>,
 }
 
-impl CtnDenseHessianKey {
-    fn from(
-        beta: &Array1<f64>,
-        row_quantities: &TransformationNormalRowQuantityCache,
-        outer_subsample_hash: Option<u64>,
-    ) -> Self {
-        let mut hasher = DefaultHasher::new();
-        beta.len().hash(&mut hasher);
-        for value in beta.iter() {
-            value.to_bits().hash(&mut hasher);
-        }
-        let beta_hash = hasher.finish();
-        CtnDenseHessianKey {
-            beta_hash,
-            row_quantities_version: row_quantities.version,
-            outer_subsample_hash,
-        }
-    }
-}
-
 /// Process-local persistent dense-Hessian cache shared across workspace
 /// re-creations.
 ///
@@ -276,35 +256,6 @@ impl CtnDenseHessianKey {
 /// inner `OnceLock` only amortizes within a single workspace lifetime; that
 /// is the source of the ~310× CTN dense Hessian rebuild storm at biobank
 /// scale.
-#[derive(Default)]
-pub(crate) struct CtnPersistentDenseHessianCache {
-    slot: Mutex<Option<(CtnDenseHessianKey, Arc<Array2<f64>>)>>,
-}
-
-impl CtnPersistentDenseHessianCache {
-    fn get(&self, key: &CtnDenseHessianKey) -> Option<Arc<Array2<f64>>> {
-        let slot = self
-            .slot
-            .lock()
-            .expect("CTN persistent dense Hessian cache mutex poisoned");
-        slot.as_ref().and_then(|(cached_key, cached)| {
-            if cached_key == key {
-                Some(Arc::clone(cached))
-            } else {
-                None
-            }
-        })
-    }
-
-    fn install(&self, key: CtnDenseHessianKey, hessian: Arc<Array2<f64>>) {
-        let mut slot = self
-            .slot
-            .lock()
-            .expect("CTN persistent dense Hessian cache mutex poisoned");
-        *slot = Some((key, hessian));
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The family
 // ---------------------------------------------------------------------------
