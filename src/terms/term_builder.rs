@@ -1302,6 +1302,8 @@ pub fn build_smooth_basis(
                     "identifiability",
                     "by",
                     "scale_dims",
+                    "streaming_chunk_size",
+                    "chunk_size",
                 ],
             )?;
             let plan = plan_spatial_basis(
@@ -1449,6 +1451,8 @@ pub fn build_smooth_basis(
                     identifiability: parse_matern_identifiability(options)
                         .map_err(|e| e.to_string())?,
                     aniso_log_scales,
+                    streaming_chunk_size: option_usize(options, "streaming_chunk_size")
+                        .or_else(|| option_usize(options, "chunk_size")),
                 },
                 input_scales: None,
             })
