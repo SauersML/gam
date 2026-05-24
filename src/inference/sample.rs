@@ -45,79 +45,6 @@ use crate::survival_construction::{
 use crate::term_builder::resolve_role_col;
 use crate::types::LikelihoodFamily;
 
-/// Typed errors emitted by the NUTS sampling orchestrator.
-///
-/// Each variant carries a pre-formatted `reason` string so `Display` is
-/// byte-equivalent to the original `format!(...)` outputs the module used
-/// before the typed-error migration. The category split lets callers
-/// pattern-match on the failure kind without dragging the string apart.
-#[derive(Debug, Clone)]
-pub enum SampleError {
-    /// The requested likelihood family / saved survival spec has no NUTS
-    /// implementation behind this entry point.
-    UnsupportedFamily { reason: String },
-    /// Config-level precondition for sampling is unmet (e.g. zero penalty
-    /// blocks supplied to the weighted-sum builder).
-    InvalidConfig { reason: String },
-    /// Sampler setup failed: shape / dimension mismatches between saved
-    /// fit artifacts and the rebuilt design, Hessian factorisation, or
-    /// pass-through errors from inner builders / refit / NUTS engine.
-    SamplerSetupFailed { reason: String },
-}
-
-impl std::fmt::Display for SampleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SampleError::UnsupportedFamily { reason }
-            | SampleError::InvalidConfig { reason }
-            | SampleError::SamplerSetupFailed { reason } => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for SampleError {}
-
-impl From<SampleError> for String {
-    fn from(err: SampleError) -> String {
-        err.to_string()
-    }
-}
-
-impl From<String> for SampleError {
-    /// Inbound conversion from the many `Result<_, String>` helpers this
-    /// module calls into (parse_formula, fit_gam, basis builders, saved-model
-    /// metadata accessors). The text is preserved verbatim; we pick
-    /// `SamplerSetupFailed` so external messages flow through `?` without
-    /// per-callsite `.map_err`.
-    fn from(reason: String) -> SampleError {
-        SampleError::SamplerSetupFailed { reason }
-    }
-}
-
-impl From<crate::families::survival_predict::SurvivalPredictError> for SampleError {
-    fn from(err: crate::families::survival_predict::SurvivalPredictError) -> SampleError {
-        SampleError::SamplerSetupFailed {
-            reason: String::from(err),
-        }
-    }
-}
-
-impl From<crate::inference::model::FittedModelError> for SampleError {
-    fn from(err: crate::inference::model::FittedModelError) -> SampleError {
-        SampleError::SamplerSetupFailed {
-            reason: String::from(err),
-        }
-    }
-}
-
-impl From<crate::inference::formula_dsl::FormulaDslError> for SampleError {
-    fn from(err: crate::inference::formula_dsl::FormulaDslError) -> SampleError {
-        SampleError::SamplerSetupFailed {
-            reason: String::from(err),
-        }
-    }
-}
-
 /// Reconstruct the `LinkWiggleFormulaSpec` from a saved model's
 /// baseline-time-wiggle runtime, returning `None` when the model has no
 /// time-wiggle component. Re-exported because the survival fitter's tests
@@ -362,13 +289,9 @@ pub fn laplace_gaussian_fallback(
             ),
         });
     }
-    let chol = h
-        .cholesky(Side::Lower)
-        .map_err(|err| SampleError::SamplerSetupFailed {
-            reason: format!(
-                "{rationale}: Cholesky factorisation of the penalised Hessian failed: {err:?}"
-            ),
-        })?;
+    let chol = h.cholesky(Side::Lower).map_err(|err| {
+        format!("{rationale}: Cholesky factorisation of the penalised Hessian failed: {err:?}")
+    })?;
     let l = chol.lower_triangular();
 
     let n_total = cfg.n_samples.saturating_mul(cfg.n_chains).max(1);
