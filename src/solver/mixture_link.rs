@@ -5,8 +5,8 @@ use crate::probability::{
     stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg,
 };
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodFamily, LinkComponent, LinkFunction,
-    MixtureLinkSpec, MixtureLinkState, SasLinkSpec, SasLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec,
+    MixtureLinkState, ResponseFamily, SasLinkSpec, SasLinkState,
 };
 use ndarray::Array1;
 use statrs::function::beta::{beta_reg, ln_beta};
