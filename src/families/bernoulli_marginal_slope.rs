@@ -14823,7 +14823,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> crate::custom_family::ExactOuterDerivativeOrder {
-        debug_assert!(std::mem::size_of_val(options) > 0);
+        assert!(std::mem::size_of_val(options) > 0);
         use crate::custom_family::ExactOuterDerivativeOrder;
 
         let flex_active = self.score_warp.is_some() || self.link_dev.is_some();
@@ -15185,7 +15185,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        debug_assert!(block_specs.len() <= isize::MAX as usize);
+        assert!(block_specs.len() <= isize::MAX as usize);
         self.validate_exact_monotonicity(block_states)?;
         if !self.effective_flex_active(block_states)? {
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
@@ -15217,7 +15217,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        debug_assert!(block_specs.len() <= isize::MAX as usize);
+        assert!(block_specs.len() <= isize::MAX as usize);
         if !self.effective_flex_active(block_states)? {
             // Rigid path: use generic RowKernel<2> operator
             let kern = BernoulliRigidRowKernel::new(self.clone(), block_states.to_vec());
@@ -15240,7 +15240,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         block_specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        debug_assert!(block_specs.len() <= isize::MAX as usize);
+        assert!(block_specs.len() <= isize::MAX as usize);
         if !self.effective_flex_active(block_states)? {
             // Rigid path: RowKernel<2> operator wired through the supplied
             // `RowSet`. With no outer subsample this is `RowSet::All`
@@ -15365,7 +15365,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        debug_assert!(block_specs.len() <= isize::MAX as usize);
+        assert!(block_specs.len() <= isize::MAX as usize);
         if self.is_sigma_aux_index(derivative_blocks, psi_i)
             || self.is_sigma_aux_index(derivative_blocks, psi_j)
         {
@@ -15395,7 +15395,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        debug_assert!(block_specs.len() <= isize::MAX as usize);
+        assert!(block_specs.len() <= isize::MAX as usize);
         if self.is_sigma_aux_index(derivative_blocks, psi_index) {
             return self
                 .sigma_exact_joint_psihessian_directional_derivative(block_states, d_beta_flat);
@@ -15479,7 +15479,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         block_spec: &ParameterBlockSpec,
         beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
-        debug_assert!(!block_spec.name.is_empty());
+        assert!(!block_spec.name.is_empty());
         self.validate_exact_block_state_shapes(block_states)?;
         if block_idx >= block_states.len() {
             return Err(format!(

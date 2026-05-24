@@ -866,9 +866,9 @@ pub trait HessianDerivativeProvider: Send + Sync {
         arr2: &Array1<f64>,
         arr3: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        debug_assert!(arr.iter().all(|v| !v.is_nan()));
-        debug_assert!(arr2.iter().all(|v| !v.is_nan()));
-        debug_assert!(arr3.iter().all(|v| !v.is_nan()));
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        assert!(arr2.iter().all(|v| !v.is_nan()));
+        assert!(arr3.iter().all(|v| !v.is_nan()));
         if self.has_corrections() {
             Err(
                 "HessianDerivativeProvider reports first-order corrections but does not implement second-order correction"
@@ -1038,7 +1038,7 @@ impl HessianDerivativeProvider for GaussianDerivatives {
         &self,
         arr: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        debug_assert!(arr.iter().all(|v| !v.is_nan()));
+        assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
     fn has_corrections(&self) -> bool {
@@ -1953,7 +1953,7 @@ pub trait HyperOperator: Send + Sync {
     }
 
     fn trace_projected_factor_cached(&self, factor: &Array2<f64>, factor_cache: &ProjectedFactorCache) -> f64 {
-        debug_assert!(std::mem::size_of_val(factor_cache) > 0);
+        assert!(std::mem::size_of_val(factor_cache) > 0);
         self.trace_projected_factor(factor)
     }
 
@@ -1975,7 +1975,7 @@ pub trait HyperOperator: Send + Sync {
         factor: &Array2<f64>,
         factor_cache: &ProjectedFactorCache,
     ) -> Array2<f64> {
-        debug_assert!(std::mem::size_of_val(factor_cache) > 0);
+        assert!(std::mem::size_of_val(factor_cache) > 0);
         self.projected_matrix(factor)
     }
 
@@ -17648,7 +17648,7 @@ mod tests {
             &self,
             arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
-            debug_assert!(arr.iter().all(|v| !v.is_nan()));
+            assert!(arr.iter().all(|v| !v.is_nan()));
             Ok(None)
         }
 
@@ -19538,7 +19538,7 @@ mod tests {
             &self,
             arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
-            debug_assert!(arr.iter().all(|v| !v.is_nan()));
+            assert!(arr.iter().all(|v| !v.is_nan()));
             panic!("family operator dispatch should not request pairwise first derivatives")
         }
 
@@ -19548,9 +19548,9 @@ mod tests {
             arr2: &Array1<f64>,
             arr3: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
-            debug_assert!(arr.iter().all(|v| !v.is_nan()));
-            debug_assert!(arr2.iter().all(|v| !v.is_nan()));
-            debug_assert!(arr3.iter().all(|v| !v.is_nan()));
+            assert!(arr.iter().all(|v| !v.is_nan()));
+            assert!(arr2.iter().all(|v| !v.is_nan()));
+            assert!(arr3.iter().all(|v| !v.is_nan()));
             panic!("family operator dispatch should not request pairwise second derivatives")
         }
 
@@ -19629,7 +19629,7 @@ mod tests {
             &self,
             arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
-            debug_assert!(arr.iter().all(|v| !v.is_nan()));
+            assert!(arr.iter().all(|v| !v.is_nan()));
             Ok(Some(self.correction.clone()))
         }
 
