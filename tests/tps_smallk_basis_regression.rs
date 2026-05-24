@@ -304,7 +304,7 @@ fn seed118_basis_oracle_r2() -> (Array2<f64>, Array1<f64>, Array1<f64>, f64) {
 /// Threshold rationale: the target is C^∞ and easily representable by 18
 /// well-placed basis functions in 2D. mgcv's `bs='tp', k=18` reaches R²
 /// > 0.95 on this kind of problem; rust's basis should clear 0.85 with
-/// margin if it spans low-frequency space adequately.
+/// > margin if it spans low-frequency space adequately.
 #[test]
 fn tps_k18_basis_must_span_smooth_bivariate_function() {
     let mut rng = StdRng::seed_from_u64(0xBA51_C046_E2A6E);

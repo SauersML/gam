@@ -78,8 +78,8 @@ fn assert_seam_continuity(formula: &str, tol: f64) {
     let data = cylinder_dataset(20, 6);
     // For each of several h values, compare prediction at θ = 0 vs θ = 2π.
     let hs: Vec<f64> = vec![-0.9, -0.5, -0.1, 0.0, 0.1, 0.5, 0.9];
-    let theta_zero: Vec<f64> = std::iter::repeat(0.0).take(hs.len()).collect();
-    let theta_tau: Vec<f64> = std::iter::repeat(TAU).take(hs.len()).collect();
+    let theta_zero: Vec<f64> = std::iter::repeat_n(0.0, hs.len()).collect();
+    let theta_tau: Vec<f64> = std::iter::repeat_n(TAU, hs.len()).collect();
 
     let pred_zero = predict(formula, &data, &theta_zero, &hs);
     let pred_tau = predict(formula, &data, &theta_tau, &hs);

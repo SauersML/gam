@@ -5432,7 +5432,7 @@ mod tests {
         for &mu in &[-5.0, -2.0, 0.0, 1.0, 3.0, 10.0] {
             for &sigma in &[0.1, 0.5, 1.0, 2.0, 5.0] {
                 let val = cloglog_ghq_value(&ctx, mu, sigma, 31);
-                assert!(val >= 0.0 && val <= 1.0, "L({mu},{sigma}) = {val}");
+                assert!((0.0..=1.0).contains(&val), "L({mu},{sigma}) = {val}");
             }
         }
     }
@@ -5687,7 +5687,7 @@ mod tests {
         ];
         for cov in cases {
             let stack = cholesky_static_with_jitter::<2>(cov).expect("stack cholesky");
-            let heap_in: Vec<Vec<f64>> = cov.iter().map(|r| r.iter().copied().collect()).collect();
+            let heap_in: Vec<Vec<f64>> = cov.iter().map(|r| r.to_vec()).collect();
             let heap = ref_cholesky_heap(&heap_in).expect("heap cholesky");
             for i in 0..2 {
                 for j in 0..2 {
@@ -5710,7 +5710,7 @@ mod tests {
         ];
         for cov in cases {
             let stack = cholesky_static_with_jitter::<3>(cov).expect("stack cholesky");
-            let heap_in: Vec<Vec<f64>> = cov.iter().map(|r| r.iter().copied().collect()).collect();
+            let heap_in: Vec<Vec<f64>> = cov.iter().map(|r| r.to_vec()).collect();
             let heap = ref_cholesky_heap(&heap_in).expect("heap cholesky");
             for i in 0..3 {
                 for j in 0..3 {

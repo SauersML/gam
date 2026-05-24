@@ -64,7 +64,7 @@ fn run(formula: &str) -> Result<(f64, f64, f64), String> {
         .map_err(|e| format!("design: {e:?}"))?;
     let pred = design.design.apply(&fit.fit.beta).to_vec();
     if !pred.iter().all(|v| v.is_finite()) {
-        return Err(format!("non-finite: range"));
+        return Err("non-finite: range".to_string());
     }
     let truth: Vec<f64> = pts
         .iter()

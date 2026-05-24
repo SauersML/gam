@@ -7593,7 +7593,7 @@ mod tests {
 
         let weights = array![1.0, -0.5, 0.75, 2.0, 0.25, 1.5];
         let w_pos = weights.mapv(|w: f64| w.max(0.0));
-        let weighted = stacked.clone() * &w_pos.view().insert_axis(Axis(1));
+        let weighted = stacked.clone() * w_pos.view().insert_axis(Axis(1));
         let expected_xtwx = stacked.t().dot(&weighted);
         let got_xtwx = op.diag_xtw_x(&weights).expect("multi-channel xtwx");
         for i in 0..expected_xtwx.nrows() {
@@ -7900,7 +7900,7 @@ mod tests {
         }
         let mut h = x
             .t()
-            .dot(&(x.clone() * &weights.view().insert_axis(Axis(1))));
+            .dot(&(x.clone() * weights.view().insert_axis(Axis(1))));
         h += &penalty;
         for i in 0..p {
             h[[i, i]] += ridge;

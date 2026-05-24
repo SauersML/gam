@@ -1774,8 +1774,8 @@ mod tests {
     fn sigmoid_stable_behaves_at_extremes() {
         let hi = NutsPosterior::sigmoid_stable(1000.0);
         let lo = NutsPosterior::sigmoid_stable(-1000.0);
-        assert!(hi <= 1.0 && hi >= 1.0 - 1e-12);
-        assert!(lo >= 0.0 && lo <= 1e-12);
+        assert!((1.0 - 1e-12..=1.0).contains(&hi));
+        assert!((0.0..=1e-12).contains(&lo));
     }
 
     #[test]
@@ -2880,7 +2880,7 @@ mod tests {
             None,
             Some(array![0.0].view()),
             penalties.clone(),
-            monotonicity.clone(),
+            monotonicity,
             SurvivalSpec::Net,
             false,
             0,
@@ -2952,7 +2952,7 @@ mod tests {
             None,
             Some(array![2.0].view()),
             penalties.clone(),
-            monotonicity.clone(),
+            monotonicity,
             SurvivalSpec::Net,
             false,
             0,

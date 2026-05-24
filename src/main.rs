@@ -1352,8 +1352,8 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let weights = resolve_weight_column(&ds, &col_map, args.weights_column.as_deref())?;
     let offset = resolve_offset_column(&ds, &col_map, args.offset_column.as_deref())?;
     let frailty = fit_frailty_spec_from_args(&args, "fit")?;
-    if let Some(choice) = link_choice.as_ref() {
-        if matches!(choice.mode, LinkMode::Flexible) {
+    if let Some(choice) = link_choice.as_ref()
+        && matches!(choice.mode, LinkMode::Flexible) {
             if choice.mixture_components.is_some() {
                 return Err(
                     "flexible(blended(...)/mixture(...)) is currently supported only with --predict-noise binomial location-scale fitting or --survival-likelihood=location-scale"
@@ -1372,7 +1372,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 );
             }
         }
-    }
     progress.advance_workflow(3);
     let adaptive_opts = if args.adaptive_regularization {
         Some(AdaptiveRegularizationOptions {
@@ -2498,7 +2497,7 @@ fn pretty_predict_model_class(class: PredictModelClass) -> &'static str {
     }
 }
 
-fn saved_offset_columns<'a>(model: &'a SavedModel) -> (Option<&'a str>, Option<&'a str>) {
+fn saved_offset_columns(model: &SavedModel) -> (Option<&str>, Option<&str>) {
     (
         model.offset_column.as_deref(),
         model.noise_offset_column.as_deref(),
@@ -3513,7 +3512,7 @@ fn run_predict_survival(
             .map(|k| Array1::from_vec(k.clone()));
         let link_wiggle_degree = model.linkwiggle_degree;
         let pred_input = SurvivalLocationScalePredictInput {
-            x_time_exit: x_time_exit,
+            x_time_exit,
             eta_time_offset_exit: eta_offset_exit.clone(),
             time_wiggle_knots: saved_timewiggle_runtime
                 .as_ref()
@@ -3640,8 +3639,8 @@ fn run_predict_survival(
             &eta_offset_entry,
             &eta_offset_exit,
             &derivative_offset_exit,
-            &primary_offset,
-            &noise_offset,
+            primary_offset,
+            noise_offset,
         )?;
 
         let (eta, mean, eta_se_opt, mean_lo, mean_hi): (
@@ -3759,13 +3758,12 @@ fn run_predict_survival(
     // covariate offset is added. The location-scale branch handles its own
     // dynamic timewiggle geometry above; this branch uses the saved fixed
     // basis reconstruction for `predict_gam`.
-    if let Some((_, exit_w, _)) = saved_timewiggle.as_ref() {
-        if p_timewiggle > 0 {
+    if let Some((_, exit_w, _)) = saved_timewiggle.as_ref()
+        && p_timewiggle > 0 {
             x_exit
                 .slice_mut(s![.., p_time..(p_time + p_timewiggle)])
                 .assign(exit_w);
         }
-    }
     if p_cov > 0 {
         let cov_start = p_time + p_timewiggle;
         let chunk_rows = (8 * 1024 * 1024 / (p_cov.max(1) * std::mem::size_of::<f64>()))
@@ -5875,12 +5873,12 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     )
                     .map_err(|e| format!("survival PIRLS failed: {e}"))?;
                     let beta = summary.beta.as_ref().to_owned();
-                    let state = model.update_state(&beta).map_err(|e| {
+                    
+                    model.update_state(&beta).map_err(|e| {
                         format!(
                             "failed to evaluate survival optimum in coefficient coordinates: {e}"
                         )
-                    })?;
-                    state
+                    })?
                 } else {
                     let constrained_opts = gam::pirls::WorkingModelPirlsOptions {
                         coefficient_lower_bounds: structural_lower_bounds,
@@ -5894,10 +5892,10 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     )
                     .map_err(|e| format!("survival constrained PIRLS failed: {e}"))?;
                     let beta = summary.beta.as_ref().to_owned();
-                    let state = model.update_state(&beta).map_err(|e| {
+                    
+                    model.update_state(&beta).map_err(|e| {
                         format!("failed to evaluate structural survival optimum in spline coordinates: {e}")
-                    })?;
-                    state
+                    })?
                 };
                 Ok(survival_working_reml_score(&state))
             },
@@ -6225,7 +6223,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
 
     // Write raw posterior samples CSV with appropriate column headers.
     {
-        let headers: Vec<String> = (0..n_coeffs).map(|j| coeff_name(j)).collect();
+        let headers: Vec<String> = (0..n_coeffs).map(&coeff_name).collect();
         let mut wtr = csv::WriterBuilder::new()
             .has_headers(true)
             .from_path(&out)
@@ -6793,9 +6791,9 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
 
                 // Smooth term partial-effect plots
                 for st in &spec.smooth_terms {
-                    if let Some(col) = smooth_term_primary_column(st) {
-                        if col < ds.values.ncols() {
-                            if let Some(dt) = design.smooth.terms.iter().find(|t| t.name == st.name)
+                    if let Some(col) = smooth_term_primary_column(st)
+                        && col < ds.values.ncols()
+                            && let Some(dt) = design.smooth.terms.iter().find(|t| t.name == st.name)
                             {
                                 let x_col = ds.values.column(col);
                                 let dense_for_smooth = design.design.to_dense();
@@ -6813,8 +6811,6 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                                     y: pairs.iter().map(|p| p.1).collect(),
                                 });
                             }
-                        }
-                    }
                 }
             }
         }
@@ -11838,8 +11834,8 @@ mod tests {
         let p_small = chi_square_survival_approx(0.5, 4.0).expect("p_small");
         let p_large = chi_square_survival_approx(12.0, 4.0).expect("p_large");
         assert!(p_large < p_small);
-        assert!(p_small <= 1.0 && p_small >= 0.0);
-        assert!(p_large <= 1.0 && p_large >= 0.0);
+        assert!((0.0..=1.0).contains(&p_small));
+        assert!((0.0..=1.0).contains(&p_large));
     }
 
     #[test]

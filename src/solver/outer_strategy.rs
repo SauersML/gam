@@ -7452,7 +7452,7 @@ mod tests {
             {
                 let valid_seed = valid_seed.clone();
                 move |_: &mut (), theta: &Array1<f64>| {
-                    if theta == &valid_seed {
+                    if theta == valid_seed {
                         Ok(0.0)
                     } else {
                         Ok(f64::INFINITY)
@@ -7460,7 +7460,7 @@ mod tests {
                 }
             },
             move |_: &mut (), theta: &Array1<f64>| {
-                if theta == &valid_seed {
+                if theta == valid_seed {
                     Ok(OuterEval {
                         cost: 0.0,
                         gradient: Array1::zeros(1),
@@ -7801,7 +7801,7 @@ mod tests {
             {
                 let valid_seed = valid_seed.clone();
                 move |_: &mut (), theta: &Array1<f64>| {
-                    if theta == &valid_seed {
+                    if theta == valid_seed {
                         Ok(0.0)
                     } else {
                         Ok(1000.0)
@@ -7813,7 +7813,7 @@ mod tests {
                 let started = Arc::clone(&started);
                 move |_: &mut (), theta: &Array1<f64>| {
                     started.lock().unwrap().push(theta.clone());
-                    if theta == &valid_seed {
+                    if theta == valid_seed {
                         Ok(OuterEval {
                             cost: 0.0,
                             gradient: array![0.0],
@@ -7871,7 +7871,7 @@ mod tests {
                 let initial_seed = initial_seed.clone();
                 move |_: &mut (), theta: &Array1<f64>| {
                     started.lock().unwrap().push(theta.clone());
-                    if theta == &initial_seed {
+                    if theta == initial_seed {
                         Ok(OuterEval {
                             cost: 0.0,
                             gradient: array![0.0],
@@ -7931,7 +7931,7 @@ mod tests {
                 let screening_calls = Arc::clone(&screening_calls);
                 move |_: &mut (), theta: &Array1<f64>| {
                     screening_calls.fetch_add(1, Ordering::Relaxed);
-                    if theta == &valid_seed {
+                    if theta == valid_seed {
                         Ok(0.0)
                     } else {
                         Ok(1000.0)
@@ -7943,7 +7943,7 @@ mod tests {
                 let started = Arc::clone(&started);
                 move |_: &mut (), theta: &Array1<f64>| {
                     started.lock().unwrap().push(theta.clone());
-                    if theta == &valid_seed {
+                    if theta == valid_seed {
                         Ok(OuterEval {
                             cost: 0.0,
                             gradient: array![0.0],
@@ -8085,7 +8085,7 @@ mod tests {
                     if cap > 0 && cap < 12 {
                         return Ok(f64::NAN);
                     }
-                    if theta == &valid_seed {
+                    if theta == valid_seed {
                         Ok(0.0)
                     } else {
                         Ok(1000.0)
@@ -8095,7 +8095,7 @@ mod tests {
             {
                 let valid_seed = valid_seed.clone();
                 move |_: &mut (), theta: &Array1<f64>| {
-                    if theta == &valid_seed {
+                    if theta == valid_seed {
                         Ok(OuterEval {
                             cost: 0.0,
                             gradient: array![0.0],
@@ -8202,7 +8202,7 @@ mod tests {
             {
                 let valid_seed = valid_seed.clone();
                 Some(move |_: &mut (), theta: &Array1<f64>| {
-                    if theta == &valid_seed {
+                    if theta == valid_seed {
                         Ok(EfsEval {
                             cost: 0.0,
                             steps: vec![0.0; theta.len()],
@@ -9211,7 +9211,7 @@ mod tests {
         drop(problem.run(&mut obj, "all-saturated-honored"));
         let evals = seen.lock().unwrap();
         assert!(
-            evals.iter().any(|rho| rho == &array![10.0, -10.0]),
+            evals.iter().any(|rho| rho == array![10.0, -10.0]),
             "cached saturated ρ must be evaluated unchanged under v2 (ρ, β) invariant; saw {:?}",
             *evals
         );

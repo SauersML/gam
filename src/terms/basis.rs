@@ -28774,7 +28774,7 @@ mod tests {
             if x >= knots[i] && x < knots[i + 1] {
                 return 1.0;
             }
-            return 0.0;
+            0.0
         } else {
             // Recursion for degree > 0
             let mut result = 0.0;
@@ -32206,7 +32206,7 @@ mod tests {
             &d2,
             &DuchonOperatorPenaltySpec::default(),
             p_order,
-            s_order as f64 as f64,
+            s_order as f64 ,
             None,
             None,
             0,
@@ -33102,7 +33102,7 @@ mod tests {
         let s_order = 1usize;
         let dim = 3usize;
         let length_scale = 1.0;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
         let got = duchon_matern_kernel_general_from_distance(
             0.0,
             Some(length_scale),
@@ -33174,7 +33174,7 @@ mod tests {
         let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
         let s_order = 2usize;
         let dim = 2usize;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0);
         let weights = [4.0, 0.25];
         let sum_weights = weights.iter().sum::<f64>();
 
@@ -33655,7 +33655,7 @@ mod tests {
         let p_order = 2usize;
         let s_order = duchon_power_to_usize(power);
         let d = 1usize;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
         let z_kernel =
             kernel_constraint_nullspace(centers.view(), nullspace_order, &mut workspace.cache)
                 .expect("z kernel");
@@ -34440,8 +34440,8 @@ mod tests {
         let scaled_r = scale * r;
         let delta = duchon_scaling_exponent(p_order, s_order, k_dim);
 
-        let coeffs_1 = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa_1);
-        let coeffs_2 = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa_2);
+        let coeffs_1 = duchon_partial_fraction_coeffs(p_order, s_order, kappa_1);
+        let coeffs_2 = duchon_partial_fraction_coeffs(p_order, s_order, kappa_2);
 
         let phi_1 = duchon_matern_kernel_general_from_distance(
             scaled_r,
@@ -34522,7 +34522,7 @@ mod tests {
         let k_dim = 4usize;
         let length_scale = 0.85;
         let kappa = 1.0 / length_scale;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
 
         let core =
             duchon_radial_core_psi_triplet(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
@@ -34545,9 +34545,9 @@ mod tests {
         let eps = 2e-5_f64;
         let ls_plus = 1.0 / (kappa * eps.exp());
         let ls_minus = 1.0 / (kappa * (-eps).exp());
-        let coeffs_plus = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / ls_plus);
+        let coeffs_plus = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls_plus);
         let coeffs_minus =
-            duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / ls_minus);
+            duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls_minus);
         let (phi_rr_plus, _, _) =
             duchonphi_rr_collision_psi_triplet(ls_plus, p_order, s_order, k_dim, &coeffs_plus)
                 .expect("plus collision phi_rr");
@@ -34572,7 +34572,7 @@ mod tests {
         let k_dim = 2usize;
         let length_scale = 0.9_f64;
         let kappa = 1.0 / length_scale;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
         let (phi_rr, phi_rr_psi, phi_rr_psi_psi) =
             duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("collision phi_rr triplet");
@@ -34580,7 +34580,7 @@ mod tests {
         let eps = 2.0e-5_f64;
         let at = |psi_step: f64| -> f64 {
             let ls = 1.0 / (kappa * psi_step.exp());
-            let coeffs_step = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / ls);
+            let coeffs_step = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls);
             duchonphi_rr_collision_psi_triplet(ls, p_order, s_order, k_dim, &coeffs_step)
                 .expect("collision phi_rr at perturbed kappa")
                 .0
@@ -34608,7 +34608,7 @@ mod tests {
         let s_order = 4usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
         let jets = duchon_radial_jets(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
             .expect("jets at origin");
         let (phi_rr, _, _) =
@@ -34636,7 +34636,7 @@ mod tests {
         let s_order = 3usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
         let jets = duchon_radial_jets(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
             .expect("jets at origin");
         let (phi_rr, _, _) =
@@ -34657,7 +34657,7 @@ mod tests {
         let s_order = 3usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
 
         for &r in &[0.01, 0.1, 0.5, 1.0, 2.0] {
             let jets = duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, &coeffs)
@@ -34688,7 +34688,7 @@ mod tests {
         let s_order = 3usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
 
         for &r in &[0.1, 0.5, 1.0, 2.0] {
             let eps = 1e-3 * r;
@@ -34744,7 +34744,7 @@ mod tests {
         let s_order = 3usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
 
         for &r in &[0.1_f64, 0.5, 1.0, 2.0] {
             let h = 1e-2 * r.max(1e-6);
@@ -34785,7 +34785,7 @@ mod tests {
         let s_order = 4usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
 
         let jets_0 = duchon_radial_jets(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
             .expect("jets at origin");
@@ -34814,7 +34814,7 @@ mod tests {
         let s_order = 5usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
         let t_rr_collision =
             duchon_phi_rrrrrr_collision(length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("collision phi''''''")
@@ -34842,7 +34842,7 @@ mod tests {
         let k_dim = 16usize;
         let length_scale = 1.0;
         let kappa = 1.0 / length_scale;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, kappa);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
         let r = 1e-5;
 
         let jets =
@@ -34869,7 +34869,7 @@ mod tests {
         let s_order = 1usize;
         let k_dim = 16usize;
         let length_scale = 1.0;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
         let r_floor = DUCHON_DERIVATIVE_R_FLOOR_REL * length_scale;
         let r_small = 0.25 * r_floor;
 
@@ -34894,7 +34894,7 @@ mod tests {
         let s_order = 4usize;
         let k_dim = 16usize;
         let length_scale = 1.0;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
         let r = 1e-5;
 
         let jets =
@@ -34919,7 +34919,7 @@ mod tests {
         let s_order = 3usize;
         let k_dim = 4usize;
         let length_scale = 0.85;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
         let (_, phi_r, phi_rr) = duchon_kernel_radial_triplet(
             0.0,
             Some(length_scale),
@@ -35834,7 +35834,7 @@ mod tests {
         let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
         let s_order = 3usize;
         let dim = 4usize;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
         let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
             r,
             Some(length_scale),
@@ -35879,7 +35879,7 @@ mod tests {
         let p_order = 1usize;
         let s_order = 4usize;
         let dim = 10usize;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
         let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
             r,
             Some(length_scale),
@@ -35924,7 +35924,7 @@ mod tests {
         let p_order = 1usize;
         let s_order = 0usize;
         let dim = 3usize;
-        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order as usize, 1.0 / length_scale);
+        let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
         let (phi, phi_r, phi_rr) = duchon_kernel_radial_triplet(
             r,
             Some(length_scale),
@@ -36923,7 +36923,7 @@ mod tests {
         // Compute A_j coefficients
         let mut a_coeffs: Vec<(usize, f64)> = Vec::new();
         for j in 1..=a {
-            let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
+            let sign = if (a - j).is_multiple_of(2) { 1.0 } else { -1.0 };
             let binom = {
                 // C(n,k) for small n,k
                 fn c(n: usize, k: usize) -> f64 {
@@ -37129,7 +37129,8 @@ mod tests {
             }
         }
 
-        for q in [1usize] {
+        {
+            let q = 1usize;
             let analytic = build_closed_form_operator_penalty(
                 centers.view(),
                 q,
@@ -37409,12 +37410,12 @@ mod tests {
         for &r in &[0.4_f64, 0.9, 1.5, 2.5, 5.0] {
             let mut expected = 0.0_f64;
             for j in 1..=a {
-                let sign = if (a - j) % 2 == 0 { 1.0 } else { -1.0 };
+                let sign = if (a - j).is_multiple_of(2) { 1.0 } else { -1.0 };
                 let coeff =
                     sign * binom(a + b - j - 1, a - j) * kappa_sq.powi(-((a + b - j) as i32));
                 expected += coeff * riesz_kernel_value(d, (j) as f64, r);
             }
-            let sign_a = if a % 2 == 0 { 1.0 } else { -1.0 };
+            let sign_a = if a.is_multiple_of(2) { 1.0 } else { -1.0 };
             for ell in 1..=b {
                 let coeff = sign_a
                     * binom(a + b - ell - 1, b - ell)
@@ -37810,7 +37811,7 @@ mod tests {
                 let eta = vec![0.0_f64; d];
                 let mut r = vec![0.0_f64; d];
                 r[0] = big_r;
-                let aniso = anisotropic_duchon_penalty(q, m, (s) as f64, (kappa) as f64, &eta, &r);
+                let aniso = anisotropic_duchon_penalty(q, m, (s) as f64, kappa , &eta, &r);
                 let expected = isotropic_radial_laplacian_power_from_q0(q, d, m, s, kappa, big_r);
                 let rel = (aniso - expected).abs() / expected.abs().max(aniso.abs()).max(1e-300);
                 assert!(
@@ -37834,7 +37835,7 @@ mod tests {
             let eta = vec![0.0_f64; d];
             let mut r = vec![0.0_f64; d];
             r[0] = big_r;
-            let aniso = anisotropic_duchon_penalty(q, m, (s) as f64, (kappa) as f64, &eta, &r);
+            let aniso = anisotropic_duchon_penalty(q, m, (s) as f64, kappa , &eta, &r);
             let expected = isotropic_radial_laplacian_power_from_q0(q, d, m, s, kappa, big_r);
             let rel = (aniso - expected).abs() / expected.abs().max(aniso.abs()).max(1e-300);
             assert!(
@@ -37905,7 +37906,7 @@ mod tests {
         let eta = vec![c, 0.0_f64, 0.0_f64];
         let r = vec![1.0_f64, 0.0_f64, 0.0_f64];
 
-        let aniso_bare = anisotropic_duchon_penalty(q, m, (s) as f64, (kappa) as f64, &eta, &r);
+        let aniso_bare = anisotropic_duchon_penalty(q, m, (s) as f64, kappa , &eta, &r);
         let z_norm = (-c).exp();
         let iso_at_z = isotropic_duchon_penalty(q, d, m, s as f64, kappa, z_norm);
 
@@ -37978,7 +37979,7 @@ mod tests {
                 for eta in eta_choices {
                     let radial = anisotropic_duchon_penalty_radial(q, m, (s) as f64, kappa, eta, r);
                     let wrapped =
-                        anisotropic_duchon_penalty(q, m, (s) as f64, (kappa) as f64, eta, r);
+                        anisotropic_duchon_penalty(q, m, (s) as f64, kappa , eta, r);
                     let rel =
                         (radial - wrapped).abs() / wrapped.abs().max(radial.abs()).max(1e-300);
                     assert!(
