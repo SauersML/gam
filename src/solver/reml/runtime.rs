@@ -8064,7 +8064,13 @@ impl<'a> RemlState<'a> {
         let gradient = cost_result
             .gradient
             .as_ref()
-            .expect("EFS requires gradient (ValueAndGradient mode should have computed it)");
+            .ok_or_else(|| EstimationError::GradientUnavailable {
+                context: concat!(
+                    "[outer-efs-first-order-fallback] EFS needs gradient; ",
+                    "switch to BFGS or compass search"
+                ),
+                mode: "ValueAndGradient",
+            })?;
 
         let efs_eval = if has_psi {
             let hybrid = compute_hybrid_efs_update(
@@ -8416,7 +8422,12 @@ impl<'a> RemlState<'a> {
             )?;
             let ift_residual_energy = result.ift_residual_energy;
             store_ift_residual_energy_for_outer_theta(p, ift_residual_energy);
-            let grad = result.gradient.unwrap();
+            let grad = result
+                .gradient
+                .ok_or_else(|| EstimationError::GradientUnavailable {
+                    context: "REML sparse gradient evaluation requires gradient",
+                    mode: "ValueAndGradient",
+                })?;
             let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
             log::debug!(
                 "[REML] grad-only sparse done | |g| {:.3e} | assemble {:.1}ms | total {:.1}ms",
@@ -8431,7 +8442,12 @@ impl<'a> RemlState<'a> {
             self.evaluate_unified(p, &bundle, super::unified::EvalMode::ValueAndGradient)?;
         let ift_residual_energy = result.ift_residual_energy;
         store_ift_residual_energy_for_outer_theta(p, ift_residual_energy);
-        let grad = result.gradient.unwrap();
+        let grad = result
+            .gradient
+            .ok_or_else(|| EstimationError::GradientUnavailable {
+                context: "REML dense gradient evaluation requires gradient",
+                mode: "ValueAndGradient",
+            })?;
         let gnorm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
         log::debug!(
             "[REML] grad-only dense done | |g| {:.3e} | assemble {:.1}ms | total {:.1}ms",
