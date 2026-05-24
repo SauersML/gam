@@ -5184,7 +5184,8 @@ fn build_factor_smooth_basis(
             group_col,
             knots,
             degree,
-            levels,
+            periodic: None,
+            group_levels: levels,
             flavour,
         },
         kronecker_factored: None,
@@ -5696,6 +5697,7 @@ fn bspline_boundary_linear_constraints(
     let BasisMetadata::BSpline1D {
         knots,
         identifiability_transform,
+        periodic: _,
     } = metadata
     else {
         return Err(BasisError::InvalidInput(
@@ -19008,6 +19010,7 @@ mod tests {
                         left: BSplineEndpointBoundaryCondition::Anchored { value: 2.0 },
                         right: BSplineEndpointBoundaryCondition::Clamped,
                     },
+                    boundary: OneDimensionalBoundary::Open,
                 },
             },
             shape: ShapeConstraint::None,
@@ -19076,6 +19079,7 @@ mod tests {
                         left: BSplineEndpointBoundaryCondition::Anchored { value: 0.0 },
                         right: BSplineEndpointBoundaryCondition::Free,
                     },
+                    boundary: OneDimensionalBoundary::Open,
                 },
             },
             shape: ShapeConstraint::None,
@@ -21272,6 +21276,7 @@ mod tests {
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::default(),
                             boundary_conditions: Default::default(),
+                            boundary: OneDimensionalBoundary::Open,
                         },
                         BSplineBasisSpec {
                             degree: 3,
@@ -21283,6 +21288,7 @@ mod tests {
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::default(),
                             boundary_conditions: Default::default(),
+                            boundary: OneDimensionalBoundary::Open,
                         },
                     ],
                     double_penalty: false,
@@ -21329,6 +21335,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
         let built = build_bspline_basis_1d(x.view(), &spec).expect("periodic bspline");
         let dense = built.design.to_dense();
@@ -21366,6 +21373,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
         let spec_hour = BSplineBasisSpec {
             degree: 3,
@@ -21377,6 +21385,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
         let spec_collection = TermCollectionSpec {
             linear_terms: vec![],
@@ -21503,11 +21512,11 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
-            boundary_condition: crate::basis::BSplineBoundaryCondition::Periodic {
-                period: 7.0,
-                origin: 0.0,
-            },
             boundary_conditions: BSplineBoundaryConditions::default(),
+            boundary: OneDimensionalBoundary::Cyclic {
+                start: 0.0,
+                end: 7.0,
+            },
         };
         let periodic_hour = BSplineBasisSpec {
             degree: 3,
@@ -21518,11 +21527,11 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
-            boundary_condition: crate::basis::BSplineBoundaryCondition::Periodic {
-                period: 24.0,
-                origin: 0.0,
-            },
             boundary_conditions: BSplineBoundaryConditions::default(),
+            boundary: OneDimensionalBoundary::Cyclic {
+                start: 0.0,
+                end: 24.0,
+            },
         };
         let term = SmoothTermSpec {
             name: "te_day_hour".to_string(),
@@ -24079,11 +24088,8 @@ mod tests {
                         identifiability: BSplineIdentifiability::WeightedSumToZero {
                             weights: None,
                         },
-                        boundary_condition: BSplineBoundaryCondition {
-                            left: BSplineEndpointCondition::None,
-                            right: BSplineEndpointCondition::None,
-                        },
                         boundary_conditions: BSplineBoundaryConditions::default(),
+                        boundary: OneDimensionalBoundary::Open,
                     },
                 },
                 shape: ShapeConstraint::None,
