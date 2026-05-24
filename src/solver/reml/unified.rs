@@ -7950,12 +7950,6 @@ pub fn reml_laml_evaluate(
                     per_mode.push((sigma, proj[[j, j]], contrib));
                     unprojected_tr += contrib;
                 }
-                let projection_active = solution.penalty_subspace_trace.is_some();
-                eprintln!(
-                    "[EIG-DECOMP ext_idx={}] unprojected_tr={:+.4e} \
-                     production_tr={:+.4e} (projection_active={}) per_mode={:?}",
-                    ext_idx, unprojected_tr, trace_logdet_i, projection_active, per_mode
-                );
                 if ext_idx == 0 {
                     let mut stash = debug_stash::TermStash {
                         unprojected_tr: Some(unprojected_tr),

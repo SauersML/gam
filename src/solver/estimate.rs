@@ -2541,7 +2541,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         )?;
         let rho = theta.slice(s![..rho_dim]).to_owned();
         // Drive PIRLS at this theta (populates eval bundle cache).
-        let _ = self.reml_state.compute_cost(&rho)?;
+        self.reml_state.compute_cost(&rho)?;
         self.reml_state.objective_innerhessian(&rho)
     }
 
@@ -2579,7 +2579,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             None,
         )?;
         let rho = theta.slice(s![..rho_dim]).to_owned();
-        let _ = self.reml_state.compute_cost(&rho)?;
+        self.reml_state.compute_cost(&rho)?;
         self.reml_state.objective_logdet_h_proj(&rho)
     }
 
@@ -2604,7 +2604,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             None,
         )?;
         let rho = theta.slice(s![..rho_dim]).to_owned();
-        let _ = self.reml_state.compute_cost(&rho)?;
+        self.reml_state.compute_cost(&rho)?;
         self.reml_state.debug_eta_w_c(&rho)
     }
 }

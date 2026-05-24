@@ -5337,10 +5337,9 @@ impl SurvivalMarginalSlopeFamily {
         slot: Option<(usize, SurvivalInterceptSlotKind)>,
     ) -> Result<(f64, f64), String> {
         let eval = |a: f64| -> Result<(f64, f64, f64), String> {
-            #[cfg(test)]
-            {
-                survival_intercept_test_counter::bump();
-            }
+            // Always-on counter for instrumentation; the bump is a single
+            // thread-local increment, negligible vs the survival evaluation.
+            survival_intercept_test_counter::bump();
             self.evaluate_denested_survival_calibration(a, q, slope, beta_h, beta_w)
         };
         let probit_scale = self.probit_frailty_scale();
