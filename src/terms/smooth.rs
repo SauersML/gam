@@ -4363,7 +4363,6 @@ fn build_by_smooth_basis(
     }
 }
 
-#[expect(dead_code)]
 fn bspline_base_design_and_penalty(
     data: ArrayView2<'_, f64>,
     col: usize,
