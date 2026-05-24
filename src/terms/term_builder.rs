@@ -728,86 +728,6 @@ fn bspline_boundary_declares_periodic_axis(options: &BTreeMap<String, String>) -
         .unwrap_or(false)
 }
 
-fn parse_f64_option_list(raw: &str) -> Result<Vec<Option<f64>>, String> {
-    parse_option_list(raw)
-        .into_iter()
-        .map(|v| {
-            if v.eq_ignore_ascii_case("none") {
-                Ok(None)
-            } else {
-                parse_numeric_expr(&v)
-                    .map(Some)
-                    .map_err(|err| format!("invalid numeric option list value '{v}': {err}"))
-            }
-        })
-        .collect()
-}
-
-fn tensor_margin_boundaries(
-    options: &BTreeMap<String, String>,
-    cols: &[usize],
-    ds: &Dataset,
-) -> Result<Vec<OneDimensionalBoundary>, String> {
-    let mut out = vec![OneDimensionalBoundary::Open; cols.len()];
-    let Some(raw_boundary) = options.get("boundary").or_else(|| options.get("bc")) else {
-        return Ok(out);
-    };
-    let boundaries = parse_option_list(raw_boundary);
-    if boundaries.len() != cols.len() {
-        return Err(format!(
-            "te()/tensor() boundary must have one entry per margin: got {} for {} variables",
-            boundaries.len(),
-            cols.len()
-        ));
-    }
-    let periods = options
-        .get("period")
-        .or_else(|| options.get("periods"))
-        .map(|raw| parse_f64_option_list(raw))
-        .transpose()?
-        .unwrap_or_default();
-    let origins = options
-        .get("origin")
-        .or_else(|| options.get("origins"))
-        .map(|raw| parse_f64_option_list(raw))
-        .transpose()?
-        .unwrap_or_default();
-    for (i, boundary) in boundaries.iter().enumerate() {
-        match boundary.as_str() {
-            "periodic" | "cyclic" | "cc" => {
-                let origin = origins
-                    .get(i)
-                    .copied()
-                    .flatten()
-                    .map(Ok)
-                    .unwrap_or_else(|| {
-                        col_minmax(ds.values.column(cols[i])).map(|(minv, _)| minv)
-                    })?;
-                let period = periods.get(i).copied().flatten().ok_or_else(|| {
-                    "te()/tensor() periodic margins require period=[...] with one positive period per margin".to_string()
-                })?;
-                if !period.is_finite() || period <= 0.0 {
-                    return Err(format!(
-                        "te()/tensor() period for margin {} must be finite and positive, got {}",
-                        i, period
-                    ));
-                }
-                out[i] = OneDimensionalBoundary::Cyclic {
-                    start: origin,
-                    end: origin + period,
-                };
-            }
-            "open" | "none" | "natural" => {}
-            other => {
-                return Err(format!(
-                    "unsupported te()/tensor() boundary '{other}'; supported values are open and periodic"
-                ));
-            }
-        }
-    }
-    Ok(out)
-}
-
 pub fn build_smooth_basis(
     kind: SmoothKind,
     vars: &[String],
@@ -2187,26 +2107,6 @@ fn parse_spatial_identifiability(
         )),
         other => Err(TermBuilderError::unsupported_feature(format!(
             "invalid spatial identifiability '{other}'; expected one of: none, orthogonal_to_parametric"
-        ))),
-    }
-}
-
-fn parse_tensor_identifiability(
-    options: &BTreeMap<String, String>,
-) -> Result<TensorBSplineIdentifiability, TermBuilderError> {
-    let Some(raw) = options.get("identifiability").map(String::as_str) else {
-        return Ok(TensorBSplineIdentifiability::default());
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "none" => Ok(TensorBSplineIdentifiability::None),
-        "sum_tozero" | "sum-to-zero" | "centered" => Ok(TensorBSplineIdentifiability::SumToZero),
-        "frozen" | "frozen_transform" | "frozen-transform" => {
-            Err(TermBuilderError::unsupported_feature(
-                "tensor identifiability 'frozen' is internal-only; use none or sum_tozero",
-            ))
-        }
-        other => Err(TermBuilderError::unsupported_feature(format!(
-            "invalid tensor identifiability '{other}'; expected one of: none, sum_tozero"
         ))),
     }
 }
