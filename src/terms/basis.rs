@@ -2759,29 +2759,32 @@ pub fn assert_spatial_centers_below_biobank_cap(
     n: usize,
     d_pc: usize,
     centers: ArrayView2<'_, f64>,
-) {
+) -> Result<(), BasisError> {
     drop(n);
-    assert_eq!(
-        centers.ncols(),
-        d_pc,
-        "spatial PC center dimension mismatch: centers have {} columns, expected {d_pc}",
-        centers.ncols()
-    );
+    if centers.ncols() != d_pc {
+        return Err(BasisError::DimensionMismatch(format!(
+            "spatial PC center dimension mismatch: centers have {} columns, expected {d_pc}",
+            centers.ncols()
+        )));
+    }
     let k = centers.nrows();
     let centers_bytes = dense_design_bytes(k, d_pc);
     let center_center_bytes = dense_design_bytes(k, k);
-    assert!(
-        centers_bytes <= SPATIAL_CENTER_CENTER_MAX_BYTES,
-        "spatial PC centers exceed center storage cap: K={k}, d_pc={d_pc}, centers={:.1} MiB, cap={:.1} MiB",
-        centers_bytes as f64 / (1024.0 * 1024.0),
-        SPATIAL_CENTER_CENTER_MAX_BYTES as f64 / (1024.0 * 1024.0),
-    );
-    assert!(
-        center_center_bytes <= SPATIAL_CENTER_CENTER_MAX_BYTES,
-        "spatial PC centers exceed center-center biobank cap: K={k}, d_pc={d_pc}, KxK={:.1} MiB, cap={:.1} MiB",
-        center_center_bytes as f64 / (1024.0 * 1024.0),
-        SPATIAL_CENTER_CENTER_MAX_BYTES as f64 / (1024.0 * 1024.0),
-    );
+    if centers_bytes > SPATIAL_CENTER_CENTER_MAX_BYTES {
+        return Err(BasisError::InvalidInput(format!(
+            "spatial PC centers exceed center storage cap: K={k}, d_pc={d_pc}, centers={:.1} MiB, cap={:.1} MiB",
+            centers_bytes as f64 / (1024.0 * 1024.0),
+            SPATIAL_CENTER_CENTER_MAX_BYTES as f64 / (1024.0 * 1024.0),
+        )));
+    }
+    if center_center_bytes > SPATIAL_CENTER_CENTER_MAX_BYTES {
+        return Err(BasisError::InvalidInput(format!(
+            "spatial PC centers exceed center-center biobank cap: K={k}, d_pc={d_pc}, KxK={:.1} MiB, cap={:.1} MiB",
+            center_center_bytes as f64 / (1024.0 * 1024.0),
+            SPATIAL_CENTER_CENTER_MAX_BYTES as f64 / (1024.0 * 1024.0),
+        )));
+    }
+    Ok(())
 }
 
 fn dense_design_bytes(n: usize, p: usize) -> usize {
@@ -16128,7 +16131,7 @@ fn prepare_duchon_derivative_contextwithworkspace(
 ) -> Result<(Array2<f64>, Option<Array2<f64>>), BasisError> {
     let original_centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let centers = expand_periodic_centers(&original_centers, spec.periodic.as_deref())?;
-    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view());
+    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view())?;
     let raw_design = build_duchon_basis_designwithworkspace(
         data,
         centers.view(),
@@ -16248,7 +16251,7 @@ fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
         )
     })?;
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view());
+    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view())?;
     let (centers, left, period) = prepare_periodic_duchon_centers_1d(centers)?;
     let effective_nullspace_order = DuchonNullspaceOrder::Zero;
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
@@ -20421,7 +20424,7 @@ pub fn build_duchon_basis_mixed_periodicity_auto(
 ) -> Result<BasisBuildResult, BasisError> {
     let mut workspace = BasisWorkspace::default();
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view());
+    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view())?;
     let d = data.ncols();
     if periodic_per_axis.len() != d {
         return Err(BasisError::InvalidInput(format!(
@@ -20476,7 +20479,7 @@ pub fn build_duchon_basiswithworkspace(
         return build_cyclic_duchon_basis_1dwithworkspace(data, spec, start, end, workspace);
     }
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view());
+    assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view())?;
     if spec.periodic {
         return build_periodic_duchon_basis_1d(data, spec, centers, workspace);
     }

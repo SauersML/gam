@@ -810,6 +810,9 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
         mu: &Array1<f64>,
         priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError> {
+        if let GlmLikelihoodFamily::Tweedie { .. } = self.family {
+            validate_tweedie_responses(&y, &priorweights)?;
+        }
         Ok(calculate_deviance(y, mu, *self, priorweights))
     }
 }
@@ -8758,6 +8761,25 @@ fn validate_beta_responses(
 }
 
 #[inline]
+fn valid_tweedie_response(y: f64) -> bool {
+    y.is_finite() && y >= 0.0
+}
+
+fn validate_tweedie_responses(
+    y: &ArrayView1<'_, f64>,
+    priorweights: &ArrayView1<'_, f64>,
+) -> Result<(), EstimationError> {
+    for (i, (&yi, &wi)) in y.iter().zip(priorweights.iter()).enumerate() {
+        if wi > 0.0 && !valid_tweedie_response(yi) {
+            return Err(EstimationError::InvalidInput(format!(
+                "Tweedie response must be finite and non-negative at positive-weight row {i}; got {yi}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[inline]
 fn safe_beta_mu(mu: f64) -> f64 {
     mu.clamp(BETA_MU_EPS, 1.0 - BETA_MU_EPS)
 }
@@ -8882,6 +8904,7 @@ fn write_tweedie_log_working_state(
             "Tweedie dispersion phi must be finite and > 0; got {phi}"
         )));
     }
+    validate_tweedie_responses(&y, &priorweights)?;
     let exponent = 2.0 - p;
     if let Some(derivs) = derivatives {
         let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
@@ -11020,6 +11043,8 @@ fn gamma_unit_deviance(yi_c: f64, mui_c: f64) -> f64 {
 fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
     if !is_valid_tweedie_power(p) {
         f64::NAN
+    } else if !valid_tweedie_response(yi) {
+        f64::NAN
     } else if yi == 0.0 {
         mui_c.powf(2.0 - p) / (2.0 - p)
     } else {
@@ -11124,6 +11149,9 @@ pub fn calculate_deviance(
         GlmLikelihoodFamily::Tweedie { p } => {
             let phi = fixed_glm_dispersion(likelihood);
             if !is_valid_tweedie_power(p) || !(phi.is_finite() && phi > 0.0) {
+                return f64::NAN;
+            }
+            if validate_tweedie_responses(&y, &priorweights).is_err() {
                 return f64::NAN;
             }
             use rayon::iter::{IntoParallelIterator, ParallelIterator};

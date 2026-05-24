@@ -1363,7 +1363,8 @@ mod gram_inner_contraction_tests {
         fn n_coefficients(&self) -> usize {
             self.p
         }
-        fn row_kernel(&self, _row: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
+        fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
+            drop(row);
             Ok((0.0, [0.0; 4], [[0.0; 4]; 4]))
         }
         fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 4] {
@@ -1386,11 +1387,15 @@ mod gram_inner_contraction_tests {
                 }
             }
         }
-        fn add_pullback_hessian(&self, _row: usize, _h: &[[f64; 4]; 4], _target: &mut Array2<f64>) {
-            unreachable!("not used in this regression test")
+        fn add_pullback_hessian(&self, row: usize, h: &[[f64; 4]; 4], target: &mut Array2<f64>) {
+            // Stub: this regression test exercises only Jacobian-side paths;
+            // pullback Hessian is not consumed. Drop args to satisfy the
+            // unused-variables deny while keeping the trait signature.
+            drop((row, h, target));
         }
-        fn add_diagonal_quadratic(&self, _row: usize, _h: &[[f64; 4]; 4], _diag: &mut [f64]) {
-            unreachable!("not used in this regression test")
+        fn add_diagonal_quadratic(&self, row: usize, h: &[[f64; 4]; 4], diag: &mut [f64]) {
+            // Same as above — diagonal quadratic accumulation is unused here.
+            drop((row, h, diag));
         }
         fn row_third_contracted(
             &self,

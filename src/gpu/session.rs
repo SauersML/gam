@@ -112,7 +112,7 @@ impl DeviceXSession {
         };
         let w_slice: &[f64] = match w_owned_storage.as_ref() {
             Some(buf) => buf.as_slice(),
-            None => w.as_slice().expect("contiguous slice"),
+            None => w.as_slice()?,
         };
         let mut inner = self.inner.lock().ok()?;
         let stream = inner.stream.clone();
@@ -204,7 +204,7 @@ impl DeviceXSession {
         // slice into it, return it. The call inserts a stream sync
         // before returning so the host vec is safe to consume.
         let out_host: Vec<f64> = stream.clone_dtoh(&inner.out_pp_dev).ok()?;
-        Some(from_col_major(&out_host, p, p))
+        Some(from_col_major(&out_host, p, p)?)
     }
 
     /// Compute `y = X · v` using the resident X. Uploads `v` (8·p bytes,
@@ -221,7 +221,7 @@ impl DeviceXSession {
         };
         let v_slice: &[f64] = match v_owned.as_ref() {
             Some(buf) => buf.as_slice(),
-            None => v.as_slice().expect("contiguous slice"),
+            None => v.as_slice()?,
         };
         let mut inner = self.inner.lock().ok()?;
         let stream = inner.stream.clone();
@@ -394,7 +394,7 @@ impl SessionCache {
                 // A peer thread beat us to the insert during our upload.
                 // Use their entry — our `our_outcome` Arc just drops via
                 // RAII, releasing whatever device memory we allocated.
-                let entry = guard.remove(pos).expect("position just queried");
+                let entry = guard.remove(pos)?;
                 let peer = entry.outcome.clone();
                 guard.push_back(entry);
                 peer
