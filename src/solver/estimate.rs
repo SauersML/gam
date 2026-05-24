@@ -720,7 +720,6 @@ fn dispersion_from_likelihood(
     }
 }
 
-#[expect(dead_code)]
 fn scaled_covariance(mut cov: Array2<f64>, phi: f64) -> Array2<f64> {
     if (phi - 1.0).abs() > f64::EPSILON {
         cov.mapv_inplace(|v| v * phi);

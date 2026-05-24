@@ -10890,11 +10890,9 @@ fn require_projected_kkt_residual(
 }
 
 const LINEARIZED_STALL_REL_THRESHOLD: f64 = 0.9;
-#[expect(dead_code)]
 const LINEARIZED_STALL_CYCLES: usize = 15;
 const LINEARIZED_STALL_RESIDUAL_FACTOR: f64 = 50.0;
 
-#[expect(dead_code)]
 fn joint_linearized_rate_stall_candidate(
     linearized_rel: f64,
     residual: f64,
@@ -10907,7 +10905,6 @@ fn joint_linearized_rate_stall_candidate(
         && residual > LINEARIZED_STALL_RESIDUAL_FACTOR * residual_tol.max(0.0)
 }
 
-#[expect(dead_code)]
 fn projected_cycles_to_residual_tol(linearized_rel: f64, residual: f64, residual_tol: f64) -> f64 {
     if linearized_rel > 0.0 && linearized_rel < 1.0 && residual_tol > 0.0 && residual > residual_tol
     {
@@ -10951,7 +10948,6 @@ impl JointNewtonMathDiagnostic {
         self.linearized_next_kkt_inf / (1.0 + self.old_kkt_inf)
     }
 
-    #[expect(dead_code)]
     fn quadratic_defect_ratio(&self, new_kkt_inf: f64) -> f64 {
         new_kkt_inf / self.step_inf.powi(2).max(f64::EPSILON)
     }
@@ -11286,7 +11282,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // Family-side cap on the inf-norm of a single Newton proposal.
         // Mirrors the rescale in the legacy implementation (see commit
         // 4bb663ab, "Perf: add joint Newton fast path for GAMLSS").
-        #[expect(dead_code)]
         const MAX_JOINT_STEP: f64 = 20.0;
 
         // Per-cycle |Δobjective| history for the geometric-tail trigger of
@@ -20041,16 +20036,14 @@ mod tests {
             })
         }
 
-        fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-            drop(specs);
+        fn outer_hyper_hessian_hvp_available(&self, _: &[ParameterBlockSpec]) -> bool {
             true
         }
 
         fn outer_hyper_hessian_operator(
             &self,
-            specs: &[ParameterBlockSpec],
+            _: &[ParameterBlockSpec],
         ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
-            drop(specs);
             Some(Arc::new(TestOuterHessianOperator {
                 matrix: self.matrix.clone(),
             }))

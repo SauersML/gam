@@ -74,7 +74,6 @@ pub(crate) fn clear_outer_ift_residual_energy_for_fit() {
     OUTER_IFT_RESIDUAL_ENERGY_ITER.store(0, Ordering::Relaxed);
 }
 
-#[expect(dead_code)]
 pub(crate) fn cached_ift_residual_energy_for_outer_theta(
     theta: &Array1<f64>,
 ) -> Option<(f64, u64)> {
@@ -4823,7 +4822,6 @@ impl<'a> RemlState<'a> {
     ///
     /// Uses the exact pseudoinverse S⁺ restricted to the positive eigenspace.
     /// Only eigenvectors in the canonical structural rank participate.
-    #[expect(dead_code)]
     pub(super) fn fixed_subspace_penalty_trace(
         &self,
         e_transformed: &Array2<f64>,

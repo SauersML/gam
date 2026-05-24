@@ -1234,27 +1234,6 @@ pub fn tail_cell_moment_cache_stats() -> TailCellMomentCacheStats {
     cache.stats()
 }
 
-#[cfg(test)]
-fn evaluate_cell_moments_with_locked_tail_cache(
-    cache: &mut TailCellMomentCache,
-    cell: DenestedCubicCell,
-    max_degree: usize,
-) -> Result<CellMomentState, String> {
-    if TAIL_CELL_MOMENT_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
-        && let Some(key) = tail_cell_cache_key(cell, max_degree)
-    {
-        if let Some(state) = cache.moments.get(&key) {
-            cache.hits += 1;
-            return Ok(state);
-        }
-        cache.misses += 1;
-        let state = evaluate_cell_moments_uncached(cell, max_degree)?;
-        cache.moments.insert(key, state.clone());
-        return Ok(state);
-    }
-    evaluate_cell_moments_uncached(cell, max_degree)
-}
-
 #[derive(Clone, Copy, Debug, Eq)]
 pub struct CellFingerprint {
     c0: u64,

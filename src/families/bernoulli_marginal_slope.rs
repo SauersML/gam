@@ -1206,7 +1206,6 @@ struct CacheFingerprint {
 }
 
 impl CacheFingerprint {
-    #[expect(dead_code)]
     fn compute(
         block_states: &[ParameterBlockState],
         subsample_mask: Option<&[usize]>,
@@ -1359,7 +1358,6 @@ pub(crate) fn build_score_warp_deviation_block_from_seed(
     build_deviation_block_from_knots_and_design_seed(seed, seed, cfg)
 }
 
-#[expect(dead_code)]
 pub(crate) fn build_score_warp_deviation_block_from_seed_empirical_anchor(
     seed: &Array1<f64>,
     weights: &Array1<f64>,
@@ -4675,7 +4673,6 @@ struct EmpiricalFlexDirectionScratch {
 }
 
 impl EmpiricalFlexDirectionScratch {
-    #[expect(dead_code)]
     fn new(primary_dim: usize) -> Self {
         Self {
             basis_u: Array1::zeros(primary_dim),
@@ -4683,7 +4680,6 @@ impl EmpiricalFlexDirectionScratch {
         }
     }
 
-    #[expect(dead_code)]
     fn ensure_dim(&mut self, primary_dim: usize) {
         if self.basis_u.len() != primary_dim {
             self.basis_u = Array1::zeros(primary_dim);
@@ -6384,7 +6380,6 @@ impl BernoulliMarginalSlopeFamily {
         total
     }
 
-    #[expect(dead_code)]
     fn line_search_log_likelihood_workspace(
         &self,
         block_states: &[ParameterBlockState],
@@ -7132,7 +7127,6 @@ impl BernoulliMarginalSlopeFamily {
     /// `build_exact_eval_cache_with_options`, so the partition + dedup +
     /// LRU pipeline is expressed once and the two call sites stay
     /// bit-identical.
-    #[expect(dead_code)]
     fn compute_row_degree9_cells(
         &self,
         intercept: f64,
@@ -8336,7 +8330,6 @@ impl BernoulliMarginalSlopeFamily {
     /// path the per-row third/fourth uncontracted tensors). Subsequent
     /// requests with a byte-equal β snapshot and matching subsample Arc
     /// pointer return the same `Arc<_>` without any rebuild work.
-    #[expect(dead_code)]
     fn build_shared_eval_cache_with_options(
         &self,
         block_states: &[ParameterBlockState],
