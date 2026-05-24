@@ -60,9 +60,7 @@ use crate::solver::estimate::reml::unified::{
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -223,40 +221,6 @@ pub struct TransformationWarmStart {
 }
 
 // ---------------------------------------------------------------------------
-// Persistent dense-Hessian cache (P2.1)
-// ---------------------------------------------------------------------------
-
-/// Cache key for the SCOP-CTN dense joint Hessian.
-///
-/// The Hessian depends on `(β, row_quantities(β))`; row_quantities is keyed
-/// on β by exact f64 bits, so a `(beta_hash, row_quantities_version)` pair
-/// uniquely identifies a build. We hash β bits (not values) so the key is
-/// bit-exact and avoids f64-Hash issues.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct CtnDenseHessianKey {
-    pub beta_hash: u64,
-    pub row_quantities_version: u64,
-    /// Outer-score subsample identity tag. `None` for full-data builds;
-    /// `Some(hash)` for subsampled fits. Including this in the key prevents
-    /// a subsampled Hessian (which is the HT estimator at this β) from
-    /// aliasing a later full-data probe at the same β.
-    pub outer_subsample_hash: Option<u64>,
-}
-
-/// Process-local persistent dense-Hessian cache shared across workspace
-/// re-creations.
-///
-/// **Single-slot, not LRU.** The access pattern inside the SCOP joint Newton
-/// inner solve is "many HVP probes share the same β within one trust-region
-/// step; β advances between steps." A 1-entry slot therefore hits exactly
-/// when it should (consecutive probes at the same β) and misses on every β
-/// advance — no eviction policy is needed. Without this persistent slot a
-/// fresh `TransformationNormalJointHessianWorkspace` is built every time the
-/// outer evaluator calls `exact_newton_joint_hessian_workspace`, and its
-/// inner `OnceLock` only amortizes within a single workspace lifetime; that
-/// is the source of the ~310× CTN dense Hessian rebuild storm at biobank
-/// scale.
-// ---------------------------------------------------------------------------
 // The family
 // ---------------------------------------------------------------------------
 
@@ -334,11 +298,6 @@ pub struct TransformationNormalFamily {
     /// clones its `Arc<...>` interior state — version counts must be shared
     /// across the same logical family instance).
     row_quantity_version: Arc<AtomicU64>,
-    /// Persistent dense Hessian cache (P2.1). Survives workspace
-    /// re-creation; keyed on the exact `(β bits, row_quantities version)`
-    /// pair. See [`CtnPersistentDenseHessianCache`] for the access-pattern
-    /// rationale (single-slot, not LRU).
-    persistent_dense_hessian: Arc<CtnPersistentDenseHessianCache>,
     /// Optional outer-score Horvitz-Thompson per-row weights.
     ///
     /// When present, this is an `n`-vector equal to the original `weights`
@@ -354,12 +313,6 @@ pub struct TransformationNormalFamily {
     /// `None` preserves byte-identical legacy behavior (`effective_weights`
     /// returns the original `weights` array).
     outer_subsample_weights: Option<Arc<Array1<f64>>>,
-    /// Subsample-identity tag used to key the row-quantity and persistent
-    /// dense-Hessian caches when an outer-score subsample is active. `None`
-    /// for the full-data family; `Some(hash)` for subsampled clones. The hash
-    /// is over the HT mask + per-row weight bits so that two subsamples with
-    /// the same β never alias each other's caches.
-    outer_subsample_hash: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -372,9 +325,6 @@ struct TransformationNormalRowQuantityCache {
     h_upper: Arc<Array1<f64>>,
     endpoint_q: Arc<Vec<LogNormalCdfDiffDerivatives>>,
     log_likelihood: f64,
-    /// Monotonic version tag set at construction time. Used by the
-    /// persistent dense-Hessian cache key.
-    version: u64,
 }
 
 #[derive(Debug)]
@@ -1029,9 +979,7 @@ impl TransformationNormalFamily {
             covariate_dense_cache: Arc::new(Mutex::new(None)),
             row_quantity_cache: Arc::new(Mutex::new(None)),
             row_quantity_version: Arc::new(AtomicU64::new(0)),
-            persistent_dense_hessian: Arc::new(CtnPersistentDenseHessianCache::default()),
             outer_subsample_weights: None,
-            outer_subsample_hash: None,
         })
     }
 
@@ -1226,9 +1174,7 @@ impl TransformationNormalFamily {
             covariate_dense_cache: Arc::new(Mutex::new(None)),
             row_quantity_cache: Arc::new(Mutex::new(None)),
             row_quantity_version: Arc::new(AtomicU64::new(0)),
-            persistent_dense_hessian: Arc::new(CtnPersistentDenseHessianCache::default()),
             outer_subsample_weights: None,
-            outer_subsample_hash: None,
         })
     }
 
@@ -1290,13 +1236,6 @@ impl TransformationNormalFamily {
         }
     }
 
-    /// Subsample-identity tag (`None` for full-data) used to key the
-    /// row-quantity cache and `CtnDenseHessianKey`.
-    #[inline]
-    pub(crate) fn outer_subsample_tag(&self) -> Option<u64> {
-        self.outer_subsample_hash
-    }
-
     /// Clone the family with an outer-score Horvitz-Thompson mask installed.
     ///
     /// The mask `m` (length `n`) is `1/πᵢ` for sampled rows and `0.0` for
@@ -1330,12 +1269,6 @@ impl TransformationNormalFamily {
             }
             effective[i] = self.weights[i] * m;
         }
-        let mut hasher = DefaultHasher::new();
-        n.hash(&mut hasher);
-        for value in mask.iter() {
-            value.to_bits().hash(&mut hasher);
-        }
-        let subsample_hash = hasher.finish();
         Ok(Self {
             // Inherit immutable design / response state cheaply via Arc / clone.
             x_val_kron: self.x_val_kron.clone(),
@@ -1364,9 +1297,7 @@ impl TransformationNormalFamily {
             // and the persistent dense Hessian is keyed on β alone.
             row_quantity_cache: Arc::new(Mutex::new(None)),
             row_quantity_version: Arc::new(AtomicU64::new(0)),
-            persistent_dense_hessian: Arc::new(CtnPersistentDenseHessianCache::default()),
             outer_subsample_weights: Some(Arc::new(effective)),
-            outer_subsample_hash: Some(subsample_hash),
         })
     }
 
@@ -1583,15 +1514,6 @@ impl TransformationNormalFamily {
             &h_upper,
             self.effective_weights(),
         )?;
-        // Stamp this build with a fresh monotonic version so the persistent
-        // dense-Hessian cache key advances exactly once per row_quantity
-        // rebuild. `fetch_add` returns the *previous* value; +1 keeps the
-        // first installed cache at version 1 (0 is reserved for "never
-        // built").
-        let version = self
-            .row_quantity_version
-            .fetch_add(1, AtomicOrdering::Relaxed)
-            .saturating_add(1);
         let row_quantities = TransformationNormalRowQuantityCache {
             beta: Arc::new(beta.clone()),
             gamma: Arc::new(gamma),
@@ -1601,7 +1523,6 @@ impl TransformationNormalFamily {
             h_upper: Arc::new(h_upper),
             endpoint_q: Arc::new(derived.endpoint_q),
             log_likelihood: derived.log_likelihood,
-            version,
         };
 
         let mut cache = self
@@ -9057,13 +8978,6 @@ impl TransformationNormalPsiHessianOperator {
                 h_prime: row_h_prime,
                 endpoint_q,
                 log_likelihood,
-                // Synthetic row-quantity instance built from materialized
-                // pieces (psi/psi second-order test path); not connected to
-                // the family's version counter. Version 0 is reserved as
-                // "never installed" — the persistent dense-Hessian slot
-                // built from this entry will key on version=0 and is
-                // therefore distinct from any production build.
-                version: 0,
             },
         }
     }
@@ -14649,11 +14563,6 @@ impl ExactNewtonJointPsiWorkspace for TransformationNormalPsiWorkspace {
             h_upper: Arc::new(Array1::zeros(entry.row_h.len())),
             endpoint_q: Arc::clone(&entry.endpoint_q),
             log_likelihood: 0.0,
-            // Reconstructed from psi-cached row jets; not derived from the
-            // family's `row_quantities` builder. Version 0 (the
-            // "never built" sentinel) keeps any persistent-dense-Hessian
-            // entry built from this instance distinct from production builds.
-            version: 0,
         };
         let op = TransformationNormalPsiDhMatrixFreeOperator::new(
             Arc::new(self.family.clone()),

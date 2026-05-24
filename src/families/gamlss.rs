@@ -14498,15 +14498,6 @@ where
     }
 }
 
-struct BinomialLocationScaleWiggleJointPsiDirection {
-    block_idx: usize,
-    local_idx: usize,
-    x_t_psi: PsiDesignMap,
-    x_ls_psi: PsiDesignMap,
-    z_t_psi: Array1<f64>,
-    z_ls_psi: Array1<f64>,
-}
-
 type BinomialLocationScaleExactNewtonJointPsiWorkspace =
     BinomialLocationScaleJointPsiWorkspace<BinomialLocationScaleFamily>;
 type BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace =

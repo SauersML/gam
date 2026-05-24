@@ -3927,6 +3927,43 @@ impl PenaltySubspaceCache {
     }
 }
 
+impl PenaltySubspaceCacheKey {
+    /// Build a cache key from the transformed-E matrix and ridge passport.
+    /// `E` is hashed by exact f64 bits (column-major), so the key is bit-exact
+    /// and avoids float-Hash issues; the ridge passport is hashed via its
+    /// `Hash` impl. Two calls at the same `(E, ridge)` yield equal keys.
+    fn from_inputs(
+        e_transformed: &ndarray::Array2<f64>,
+        ridge_passport: &crate::types::RidgePassport,
+    ) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        e_transformed.nrows().hash(&mut hasher);
+        e_transformed.ncols().hash(&mut hasher);
+        for value in e_transformed.iter() {
+            value.to_bits().hash(&mut hasher);
+        }
+        let penalty_matrix_fingerprint = hasher.finish();
+        let mut ridge_hasher = DefaultHasher::new();
+        ridge_passport.delta.to_bits().hash(&mut ridge_hasher);
+        (ridge_passport.matrix_form as u8).hash(&mut ridge_hasher);
+        ridge_passport
+            .policy
+            .include_penalty_logdet
+            .hash(&mut ridge_hasher);
+        ridge_passport
+            .policy
+            .include_laplacehessian
+            .hash(&mut ridge_hasher);
+        let ridge_passport_signature = ridge_hasher.finish();
+        Self {
+            penalty_matrix_fingerprint,
+            ridge_passport_signature,
+        }
+    }
+}
+
 /// Estimate the in-cache footprint of a (compacted) PIRLS result.
 ///
 /// Mirrors what `compact_for_reml_cache` keeps:
