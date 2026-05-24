@@ -5243,14 +5243,13 @@ impl JointBetaRhoPosterior {
             n_samples,
             dim: n_beta,
         };
-        let link_param_mode = Self::link_param_mode(&inverse_link);
+        let link_param_mode = Self::link_param_mode(&likelihood.link);
 
         Ok(Self {
             data,
             chol,
             chol_t,
-            likelihood_family,
-            inverse_link,
+            likelihood,
             n_beta,
             n_rho,
             n_link_params: link_param_mode.len(),

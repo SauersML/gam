@@ -70,9 +70,8 @@ use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 // change. Until that companion change lands, the file keeps the existing
 // `GlmLikelihoodSpec` parameterization.
 use crate::types::{
-    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
-    MixtureLinkState, ResponseFamily, RidgePassport, RidgePolicy, SasLinkState,
-    is_valid_tweedie_power,
+    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LinkFunction, MixtureLinkState,
+    RidgePassport, RidgePolicy, SasLinkState, is_valid_tweedie_power,
 };
 use dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::matmul::matmul;
@@ -1799,7 +1798,7 @@ impl<'a> GamWorkingModel<'a> {
         priorweights: ArrayView1<'a, f64>,
         penalty: PirlsPenalty,
         workspace: PirlsWorkspace,
-        likelihood: LikelihoodSpec,
+        likelihood: GlmLikelihoodSpec,
         link_kind: InverseLink,
         firth_bias_reduction: bool,
         transform: Option<WorkingReparamTransform>,
