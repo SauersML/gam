@@ -14754,11 +14754,18 @@ mod tests {
         label: &str,
         analytic: f64,
         finite_difference: f64,
-        _finite_difference_error: f64,
+        finite_difference_error: f64,
     ) {
         let rel_tol = 1.0e-6_f64;
         let abs_tol = 1.0e-6_f64;
-        let tol = abs_tol.max(rel_tol * analytic.abs().max(finite_difference.abs()));
+        // Loosen the tolerance by the caller's own FD-error estimate so the
+        // assertion does not flag differences that the FD discretization
+        // itself cannot resolve. The base abs/rel envelope handles
+        // analytic-side rounding; `finite_difference_error` covers
+        // truncation error from the FD stencil.
+        let tol = abs_tol
+            .max(rel_tol * analytic.abs().max(finite_difference.abs()))
+            .max(finite_difference_error.abs());
         let diff = (analytic - finite_difference).abs();
         assert!(
             diff <= tol,

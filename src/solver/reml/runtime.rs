@@ -1443,9 +1443,8 @@ impl<'a> RemlState<'a> {
             .write()
             .unwrap()
             .replace(Coefficients::new(beta_original.clone()));
-        if let Some(cache) = self.ift_warm_start_cache.write().unwrap().as_mut() {
-            cache.beta_original = beta_original.clone();
-            cache.lambda_s_beta_blocks = {
+        if self.ift_warm_start_cache.read().unwrap().is_some() {
+            let lambda_s_beta_blocks = {
                 use rayon::prelude::*;
                 let blocks: Vec<ndarray::Array1<f64>> = self
                     .canonical_penalties
@@ -1459,6 +1458,10 @@ impl<'a> RemlState<'a> {
                     .collect();
                 (!blocks.is_empty()).then_some(blocks)
             };
+            if let Some(cache) = self.ift_warm_start_cache.write().unwrap().as_mut() {
+                cache.beta_original = beta_original.clone();
+                cache.lambda_s_beta_blocks = lambda_s_beta_blocks;
+            }
         }
     }
 

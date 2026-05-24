@@ -280,17 +280,20 @@ pub fn to_col_major<'a, S: Data<Elem = f64>>(a: &'a ArrayBase<S, Ix2>) -> Cow<'a
 }
 
 /// Convert a column-major flat buffer back into row-major `Array2<f64>`.
-pub fn from_col_major_inplace(values: &[f64], out: &mut Array2<f64>) {
+pub fn from_col_major_inplace(values: &[f64], out: &mut Array2<f64>) -> Option<()> {
     let (rows, cols) = out.dim();
-    debug_assert_eq!(values.len(), rows.saturating_mul(cols));
+    if values.len() != rows.checked_mul(cols)? {
+        return None;
+    }
     for col in 0..cols {
         let src = ndarray::ArrayView1::from(&values[col * rows..(col + 1) * rows]);
         out.column_mut(col).assign(&src);
     }
+    Some(())
 }
 
-pub fn from_col_major(values: &[f64], rows: usize, cols: usize) -> Array2<f64> {
+pub fn from_col_major(values: &[f64], rows: usize, cols: usize) -> Option<Array2<f64>> {
     let mut out = Array2::<f64>::zeros((rows, cols));
-    from_col_major_inplace(values, &mut out);
-    out
+    from_col_major_inplace(values, &mut out)?;
+    Some(out)
 }

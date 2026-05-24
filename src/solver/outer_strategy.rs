@@ -8835,7 +8835,8 @@ mod tests {
                 })
             }
             fn reset(&mut self) {}
-            fn seed_inner_state(&mut self, _beta: &Array1<f64>) -> Result<(), EstimationError> {
+            fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
+                drop(beta);
                 *self.seed_calls.lock().unwrap() += 1;
                 Ok(())
             }
