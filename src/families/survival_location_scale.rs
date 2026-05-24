@@ -1971,15 +1971,13 @@ impl SurvivalLocationScaleFamily {
         unsafe impl Sync for SendPtr {}
         impl SendPtr {
             #[inline(always)]
-            // SAFETY: caller must pass `i < n` (the length of the underlying
-            // live `Array1<f64>` buffer from which `self.0` was taken); the
-            // rayon `(0..n).into_par_iter()` driver guarantees this, and each
-            // `i` is visited by exactly one thread so the write is unaliased.
+            // SAFETY: caller passes `i < n` (the buffer length used to take
+            // `self.0`); rayon's `(0..n).into_par_iter()` driver guarantees
+            // exclusive ownership of `i` per thread, so the write is unaliased.
             unsafe fn write(self, i: usize, v: f64) {
-                // SAFETY: `self.0.add(i)` is in bounds for the live,
-                // properly aligned `Array1<f64>` allocation (`i < n`) and
-                // the disjoint-index invariant from the par_iter driver
-                // above means no other thread is reading or writing this slot.
+                // SAFETY: `i < n` from the function contract; `self.0.add(i)`
+                // is in-bounds and the disjoint-index invariant means no other
+                // thread accesses this slot.
                 unsafe { *self.0.add(i) = v };
             }
         }
@@ -2017,10 +2015,9 @@ impl SurvivalLocationScaleFamily {
                 let Some(row) = self.row_derivatives_rescaled(i, state, deriv_log_scale)? else {
                     return Ok(());
                 };
-                // SAFETY: `(0..n).into_par_iter()` yields each `i < n`
-                // exactly once; each pointer targets a distinct live
-                // preallocated `Array1<f64>` buffer of length `n`, and the
-                // result arrays are not read until the parallel loop completes.
+                // SAFETY: rayon `(0..n).into_par_iter()` yields each `i < n`
+                // exactly once; pointers target distinct length-`n` `Array1`
+                // buffers not read until the parallel loop completes.
                 unsafe {
                     p_d1_q.write(i, row.d1_q);
                     p_d2_q.write(i, row.d2_q);

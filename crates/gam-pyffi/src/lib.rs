@@ -418,33 +418,50 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
     Ok(info.unbind())
 }
 
-#[pyfunction]
+#[pyfunction(signature = (headers, rows, formula, config_json = None, fisher_rao_w = None))]
 fn fit_table(
     py: Python<'_>,
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
     formula: String,
     config_json: Option<String>,
+    fisher_rao_w: Option<PyReadonlyArray3<'_, f64>>,
 ) -> PyResult<Py<PyBytes>> {
     // PyO3 0.28 names the old `allow_threads` API `detach`: the closure
     // runs without the GIL, so Python signal handling (KeyboardInterrupt,
     // SIGALRM handlers, etc.) can run while the Rust solver is in progress.
+    let fisher_values = fisher_rao_w.as_ref().map(|w| w.as_array().to_owned());
     let model_bytes = py
-        .detach(move || fit_table_impl(headers, rows, formula, config_json.as_deref()))
+        .detach(move || {
+            fit_table_impl(
+                headers,
+                rows,
+                formula,
+                config_json.as_deref(),
+                fisher_values.as_ref().map(|w| w.view()),
+            )
+        })
         .map_err(py_value_error)?;
     Ok(PyBytes::new(py, &model_bytes).unbind())
 }
 
-#[pyfunction]
+#[pyfunction(signature = (x, y, formula, config_json = None, fisher_rao_w = None))]
 fn fit_array(
     py: Python<'_>,
     x: PyReadonlyArray2<'_, f64>,
     y: PyReadonlyArray2<'_, f64>,
     formula: String,
     config_json: Option<String>,
+    fisher_rao_w: Option<PyReadonlyArray3<'_, f64>>,
 ) -> PyResult<Py<PyBytes>> {
-    let model_bytes = fit_array_impl(x.as_array(), y.as_array(), formula, config_json.as_deref())
-        .map_err(py_value_error)?;
+    let model_bytes = fit_array_impl(
+        x.as_array(),
+        y.as_array(),
+        formula,
+        config_json.as_deref(),
+        fisher_rao_w.as_ref().map(|w| w.as_array()),
+    )
+    .map_err(py_value_error)?;
     Ok(PyBytes::new(py, &model_bytes).unbind())
 }
 
@@ -8545,9 +8562,10 @@ fn fit_table_impl(
     rows: Vec<Vec<String>>,
     formula: String,
     config_json: Option<&str>,
+    fisher_rao_w: Option<ArrayView3<'_, f64>>,
 ) -> Result<Vec<u8>, String> {
     let dataset = dataset_with_inferred_schema(headers, rows)?;
-    fit_dataset_impl(dataset, formula, config_json)
+    fit_dataset_impl(dataset, formula, config_json, fisher_rao_w)
 }
 
 fn fit_array_impl(
@@ -8555,15 +8573,77 @@ fn fit_array_impl(
     y: ArrayView2<'_, f64>,
     formula: String,
     config_json: Option<&str>,
+    fisher_rao_w: Option<ArrayView3<'_, f64>>,
 ) -> Result<Vec<u8>, String> {
     let dataset = dataset_from_xy_arrays(x, y, &formula)?;
-    fit_dataset_impl(dataset, formula, config_json)
+    fit_dataset_impl(dataset, formula, config_json, fisher_rao_w)
+}
+
+fn inject_scalar_fisher_rao_weight(
+    dataset: &mut EncodedDataset,
+    fit_config: &mut FitConfig,
+    fisher_rao_w: ArrayView3<'_, f64>,
+) -> Result<(), String> {
+    let n = dataset.values.nrows();
+    if fisher_rao_w.shape() != [n, 1, 1] {
+        return Err(format!(
+            "fit_table fisher_rao_w requires scalar blocks of shape ({n}, 1, 1); got {:?}",
+            fisher_rao_w.shape()
+        ));
+    }
+    let weight_name = "__gamfit_fisher_rao_weight".to_string();
+    if dataset.headers.iter().any(|name| name == &weight_name) {
+        return Err(format!(
+            "reserved fisher_rao_w column already exists: {weight_name}"
+        ));
+    }
+    let col_map = dataset.column_map();
+    let base_weight_col = fit_config
+        .weight_column
+        .as_ref()
+        .map(|name| {
+            col_map
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("weights column {name:?} is not present"))
+        })
+        .transpose()?;
+    let mut combined = Array1::<f64>::zeros(n);
+    for row in 0..n {
+        let mut value = fisher_rao_w[[row, 0, 0]];
+        if let Some(col) = base_weight_col {
+            value *= dataset.values[[row, col]];
+        }
+        if !(value.is_finite() && value >= 0.0) {
+            return Err(format!(
+                "fisher_rao_w scalar row {row} produced invalid non-negative weight {value}"
+            ));
+        }
+        combined[row] = value;
+    }
+    let old_cols = dataset.values.ncols();
+    let mut values = Array2::<f64>::zeros((n, old_cols + 1));
+    values
+        .slice_mut(s![.., ..old_cols])
+        .assign(&dataset.values);
+    values.column_mut(old_cols).assign(&combined);
+    dataset.values = values;
+    dataset.headers.push(weight_name.clone());
+    dataset.schema.columns.push(SchemaColumn {
+        name: weight_name.clone(),
+        kind: ColumnKindTag::Continuous,
+        levels: Vec::new(),
+    });
+    dataset.column_kinds.push(ColumnKindTag::Continuous);
+    fit_config.weight_column = Some(weight_name);
+    Ok(())
 }
 
 fn fit_dataset_impl(
-    dataset: EncodedDataset,
+    mut dataset: EncodedDataset,
     formula: String,
     config_json: Option<&str>,
+    fisher_rao_w: Option<ArrayView3<'_, f64>>,
 ) -> Result<Vec<u8>, String> {
     // Always-on progress for the Python bindings: every gamfit fit call
     // installs a visualizer session so the [OUTER step] log stream is
@@ -8577,7 +8657,10 @@ fn fit_dataset_impl(
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.set_stage("fit", "optimizing penalized likelihood");
     progress.start_workflow_open_ended("Fit");
-    let fit_config = parse_fit_config(config_json)?;
+    let mut fit_config = parse_fit_config(config_json)?;
+    if let Some(w) = fisher_rao_w {
+        inject_scalar_fisher_rao_weight(&mut dataset, &mut fit_config, w)?;
+    }
     let materialized = materialize(&formula, &dataset, &fit_config)?;
     let request = materialized.request;
 
