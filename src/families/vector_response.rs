@@ -124,13 +124,8 @@ impl VectorResponseTarget {
     }
 
     pub fn with_row_weights(mut self, w: Array1<f64>) -> Result<Self, EstimationError> {
-        if w.len() != self.y.nrows() {
-            return Err(EstimationError::InvalidInput(format!(
-                "row_weights length {} ≠ N={}",
-                w.len(),
-                self.y.nrows()
-            )));
-        }
+        // TODO(coverage): add test exercising non-finite and negative row-weight rejection
+        validate_row_weights(&w, self.y.nrows())?;
         self.row_weights = Some(w);
         Ok(self)
     }
@@ -141,6 +136,23 @@ impl VectorResponseTarget {
     pub fn m(&self) -> usize {
         self.y.ncols()
     }
+}
+
+fn validate_row_weights(weights: &Array1<f64>, n: usize) -> Result<(), EstimationError> {
+    if weights.len() != n {
+        return Err(EstimationError::InvalidInput(format!(
+            "row_weights length {} ≠ N={n}",
+            weights.len()
+        )));
+    }
+    for (idx, weight) in weights.iter().copied().enumerate() {
+        if !(weight.is_finite() && weight >= 0.0) {
+            return Err(EstimationError::InvalidInput(format!(
+                "row_weights[{idx}] must be finite and non-negative (got {weight})"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Connector trait the inner solver (Piece 1) plugs into.
@@ -187,6 +199,10 @@ pub struct GaussianVectorLikelihood {
 
 impl GaussianVectorLikelihood {
     pub fn from_target(target: &VectorResponseTarget) -> Result<Self, EstimationError> {
+        // TODO(coverage): add test exercising low-rank factor shape and non-finite entries
+        if let Some(weights) = target.row_weights.as_ref() {
+            validate_row_weights(weights, target.n())?;
+        }
         let precision = target.noise.diag_precision(target.m())?;
         let factor = match &target.noise {
             VectorNoise::LowRank { factor, .. } => {
@@ -196,6 +212,13 @@ impl GaussianVectorLikelihood {
                         factor.nrows(),
                         target.m()
                     )));
+                }
+                for ((row, col), value) in factor.indexed_iter() {
+                    if !value.is_finite() {
+                        return Err(EstimationError::InvalidInput(format!(
+                            "VectorNoise::LowRank: factor[{row},{col}] must be finite (got {value})"
+                        )));
+                    }
                 }
                 Some(factor.clone())
             }
@@ -327,4 +350,3 @@ impl VectorLikelihood for GaussianVectorLikelihood {
 // ─────────────────────────────────────────────────────────────────────────────
 // Piece 5 / Piece 1 row-block support
 // ─────────────────────────────────────────────────────────────────────────────
-

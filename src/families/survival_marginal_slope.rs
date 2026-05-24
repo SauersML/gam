@@ -5155,7 +5155,11 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     fn time_derivative_lower_bound(&self) -> f64 {
-        assert!(self.derivative_guard.is_finite() && self.derivative_guard > 0.0);
+        assert!(
+            self.derivative_guard.is_finite() && self.derivative_guard > 0.0,
+            "survival marginal-slope derivative guard must be finite and positive: derivative_guard={}",
+            self.derivative_guard
+        );
         self.derivative_guard
     }
 

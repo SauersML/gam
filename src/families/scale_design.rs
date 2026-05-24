@@ -18,7 +18,7 @@ pub enum ScaleDesignError {
     /// Dimensions of the supplied matrices/vectors are inconsistent.
     IncompatibleDimensions { reason: String },
     /// Input value is not finite where finiteness is required (e.g. saved
-    /// projection ridge alpha).
+    /// projection cutoff alpha).
     NonFiniteInput { reason: String },
     /// Saved payload is partially populated or the projection is degenerate
     /// (e.g. zero rows with non-empty columns).
@@ -74,9 +74,9 @@ pub struct ScaleDeviationTransform {
     pub weighted_column_mean: Array1<f64>,
     pub rescale: Array1<f64>,
     pub non_intercept_start: usize,
-    /// Tikhonov regularization parameter actually used when fitting
-    /// `projection_coef`.  Stored so prediction-time replay is
-    /// reproducible without re-deriving alpha from heuristics.
+    /// Squared SVD truncation cutoff used when fitting `projection_coef`.
+    /// Stored so prediction-time replay is reproducible without re-deriving
+    /// the cutoff from heuristics.
     pub projection_ridge_alpha: f64,
 }
 
@@ -135,9 +135,9 @@ fn scale_transform_from_payload_typed(
                     projection_coef[[i, j]] = value;
                 }
             }
-            // Older saved payloads (pre-Tikhonov) did not record alpha.  Treat
-            // them as alpha=0: replay then matches the original least-squares
-            // coefficients exactly, which is the previous behavior.
+            // Older saved payloads did not record the squared truncation
+            // cutoff. Treat them as cutoff=0: replay then matches the
+            // original least-squares coefficients exactly.
             let projection_ridge_alpha = projection_ridge_alpha.unwrap_or(0.0);
             if !projection_ridge_alpha.is_finite() || projection_ridge_alpha < 0.0 {
                 return Err(ScaleDesignError::NonFiniteInput {
@@ -515,16 +515,14 @@ fn build_weighted_primary_design(
     Ok(wx)
 }
 
-/// Pick the Tikhonov regularization parameter alpha for the replay solve.
+/// Pick the squared singular-value cutoff for the replay solve.
 ///
-/// Filter factors `f_k = sigma_k / (sigma_k^2 + alpha)` are bounded above by
-/// `1 / (2 * sqrt(alpha))` (achieved at sigma_k = sqrt(alpha)).  We want the
-/// worst-case prediction-row leverage amplification — a unit-norm new row
-/// transformed by the saved coefficients — to be at most
-/// `SCALE_PROJECTION_LEVERAGE_AMPLIFICATION` times what a sigma_max-scale
-/// direction sees in the un-regularized solve.  Solving for alpha gives the
-/// dimensionless tolerance below; we add an absolute floor so even a pristine
-/// design retains a sub-epsilon ridge that prevents catastrophic cancellation.
+/// Retained directions use the exact inverse `1 / sigma_k`; directions at or
+/// below `sqrt(alpha)` are dropped. We want the worst-case prediction-row
+/// leverage amplification — a unit-norm new row transformed by the saved
+/// coefficients — to be at most `SCALE_PROJECTION_LEVERAGE_AMPLIFICATION`
+/// times what a sigma_max-scale direction sees in the un-regularized solve.
+/// The rcond floor supplies the minimum cutoff for numerical conditioning.
 fn choose_scale_projection_ridge_alpha(singular: &[f64]) -> f64 {
     if singular.is_empty() {
         return 0.0;
@@ -558,8 +556,8 @@ fn solve_scale_projection(
     let sqrtw = weights.mapv(f64::sqrt);
     let wx = build_weighted_primary_design(primary_design, &sqrtw, chunk_rows)?;
     // Thin SVD of W^{1/2} X_primary: replay reduces to V * diag(filter) * U^T
-    // applied to the weighted noise RHS.  Tikhonov filter factors are the
-    // smooth alternative to RRQR rank truncation + coefficient cap.
+    // applied to the weighted noise RHS. Retained singular directions use the
+    // exact inverse; unresolved directions are dropped by the cutoff below.
     let (u_opt, singular, vt_opt) =
         wx.svd(true, true)
             .map_err(|e| ScaleDesignError::SvdFailed {
@@ -578,7 +576,7 @@ fn solve_scale_projection(
     // Truncated SVD with leverage-bound cutoff: directions resolved well
     // enough to keep coefficient amplification under
     // SCALE_PROJECTION_LEVERAGE_AMPLIFICATION are inverted exactly (no
-    // Tikhonov bias on the dominant components), and weaker directions are
+    // damping on the dominant components), and weaker directions are
     // dropped. The primary design is fixed across any single replay, so no
     // threshold-crossings occur within a call: the projection is a linear
     // function of the noise RHS, which is the continuity property the audit
@@ -612,7 +610,7 @@ fn solve_scale_projection(
 
         // U^T (rank x n) * rhs (n x width) -> (rank x width)
         let mut t = u.t().dot(&rhs);
-        // Apply filter rowwise: t_k *= sigma_k / (sigma_k^2 + alpha).
+        // Apply filter rowwise: t_k *= 1 / sigma_k for retained directions.
         for k in 0..rank {
             let f = filter[k];
             for col in 0..width {
@@ -1103,8 +1101,8 @@ mod tests {
     fn ridge_replay_continuous_under_input_sweep() {
         // A near-collinear primary design plus a sweepable perturbation column
         // would, under the old hard coefficient cap, jump discontinuously when
-        // the cap kicks in.  With the Tikhonov filter the replayed coefficient
-        // must be a smooth function of the input perturbation.
+        // the cap kicks in. With a fixed SVD cutoff, the replayed coefficient
+        // is a linear function of the input perturbation.
         let n = 64;
         let mut primary = Array2::<f64>::zeros((n, 3));
         let mut noise = Array2::<f64>::zeros((n, 2));
@@ -1120,8 +1118,8 @@ mod tests {
         }
 
         // Sweep: gradually scale one noise entry; record the corresponding
-        // projected coefficient cell.  Numerical first differences should be
-        // bounded — the ridge guarantees Lipschitz continuity in the input.
+        // projected coefficient cell. Numerical first differences should be
+        // bounded because the fixed projection operator is linear in the input.
         let mut last: Option<f64> = None;
         let mut max_step: f64 = 0.0;
         for k in 0..50 {
@@ -1151,9 +1149,9 @@ mod tests {
     #[test]
     fn ridge_replay_noise_free_is_near_identity() {
         // When the noise design lives in the column span of the primary
-        // design and W^{1/2} X is well-conditioned, the Tikhonov ridge is
-        // tiny and the residual after subtracting the projected fit is at
-        // numerical zero.
+        // design and W^{1/2} X is well-conditioned, the retained singular
+        // directions use the exact inverse and the residual after subtracting
+        // the projected fit is at numerical zero.
         let n = 128;
         let p_primary = 4;
         let p_noise = 3;
@@ -1168,7 +1166,7 @@ mod tests {
             primary[[i, 3]] = (2.0 * t - 0.4).powi(2);
             noise[[i, 0]] = 1.0;
             // Linear combinations of primary cols so the projection should
-            // recover them exactly modulo a vanishing ridge.
+            // recover them through the retained exact-inverse directions.
             noise[[i, 1]] = 0.7 * primary[[i, 1]] - 0.3 * primary[[i, 2]];
             noise[[i, 2]] = 0.2 * primary[[i, 3]] + 0.1 * primary[[i, 1]];
         }
@@ -1182,9 +1180,9 @@ mod tests {
         for i in 0..n {
             assert_eq!(transformed[[i, 0]], 1.0);
         }
-        // Active columns: residuals should be near zero up to the ridge bias.
-        // The ridge bias here is bounded by alpha / sigma_min and the design is
-        // well-conditioned, so 1e-6 is a safe envelope.
+        // Active columns: residuals should be near zero because the relevant
+        // singular directions are retained and inverted exactly. The design is
+        // well-conditioned, so 1e-6 is a safe envelope for roundoff.
         for j in 1..p_noise {
             for i in 0..n {
                 assert!(
