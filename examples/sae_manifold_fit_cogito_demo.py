@@ -1,4 +1,9 @@
-"""Cogito-style manifold SAE fit demo."""
+"""Manifold SAE fit demo on a high-dimensional embedding-like dataset.
+
+If a local ``X_L40.npy`` file is present next to this script (or in the project
+root), it is loaded as the input matrix. Otherwise the demo falls back to a
+synthetic circle-mixture generator so it remains fully self-contained.
+"""
 
 from __future__ import annotations
 
@@ -9,11 +14,10 @@ import numpy as np
 import gamfit
 
 
-def load_cogito_or_synthetic() -> np.ndarray:
+def load_local_or_synthetic() -> np.ndarray:
     here = Path(__file__).resolve()
     candidates = [
-        here.parents[2] / "Manifold-SAE" / "X_L40.npy",
-        here.parents[2] / "Manifold-SAE" / "data" / "X_L40.npy",
+        here.parent / "X_L40.npy",
         here.parents[1] / "X_L40.npy",
     ]
     for path in candidates:
@@ -50,7 +54,7 @@ def r2_score(x: np.ndarray, fitted: np.ndarray) -> float:
 
 
 def main() -> None:
-    x = load_cogito_or_synthetic()
+    x = load_local_or_synthetic()
     if x.ndim != 2:
         x = x.reshape(x.shape[0], -1)
     schedule = gamfit.GumbelTemperatureSchedule(

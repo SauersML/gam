@@ -9685,31 +9685,35 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         inv_lapweight: w.inv_lapweight,
     })
     .collect::<Vec<_>>();
-    let fitted_link = match family {
-        LikelihoodFamily::BinomialLatentCLogLog => FittedLinkState::LatentCLogLog {
+    let fitted_link = if family.is_latent_cloglog() {
+        FittedLinkState::LatentCLogLog {
             state: latent_cloglog_state
                 .expect("BinomialLatentCLogLog requires an explicit latent-cloglog state"),
-        },
-        LikelihoodFamily::BinomialMixture => mixture_link_state
+        }
+    } else if family.is_binomial_mixture() {
+        mixture_link_state
             .clone()
             .map(|state| FittedLinkState::Mixture {
                 state,
                 covariance: None,
             })
-            .unwrap_or(FittedLinkState::Standard(None)),
-        LikelihoodFamily::BinomialSas => sas_link_state
+            .unwrap_or(FittedLinkState::Standard(None))
+    } else if family.is_binomial_sas() {
+        sas_link_state
             .map(|state| FittedLinkState::Sas {
                 state,
                 covariance: None,
             })
-            .unwrap_or(FittedLinkState::Standard(None)),
-        LikelihoodFamily::BinomialBetaLogistic => sas_link_state
+            .unwrap_or(FittedLinkState::Standard(None))
+    } else if family.is_binomial_beta_logistic() {
+        sas_link_state
             .map(|state| FittedLinkState::BetaLogistic {
                 state,
                 covariance: None,
             })
-            .unwrap_or(FittedLinkState::Standard(None)),
-        _ => FittedLinkState::Standard(None),
+            .unwrap_or(FittedLinkState::Standard(None))
+    } else {
+        FittedLinkState::Standard(None)
     };
     let max_abs_eta = final_eval
         .obs

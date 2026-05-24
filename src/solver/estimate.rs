@@ -5366,22 +5366,22 @@ impl UnifiedFitResult {
     /// validates that the stored state matches the family and clones it out.
     pub fn fitted_link_state(
         &self,
-        family: crate::types::LikelihoodFamily,
+        family: &crate::types::LikelihoodSpec,
     ) -> Result<FittedLinkState, EstimationError> {
-        match family {
-            crate::types::LikelihoodFamily::GaussianIdentity => {
+        match (&family.response, &family.link) {
+            (ResponseFamily::Gaussian, _) => {
                 Ok(FittedLinkState::Standard(Some(LinkFunction::Identity)))
             }
-            crate::types::LikelihoodFamily::BinomialLogit => {
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
                 Ok(FittedLinkState::Standard(Some(LinkFunction::Logit)))
             }
-            crate::types::LikelihoodFamily::BinomialProbit => {
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
                 Ok(FittedLinkState::Standard(Some(LinkFunction::Probit)))
             }
-            crate::types::LikelihoodFamily::BinomialCLogLog => {
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
                 Ok(FittedLinkState::Standard(Some(LinkFunction::CLogLog)))
             }
-            crate::types::LikelihoodFamily::BinomialLatentCLogLog => match &self.fitted_link {
+            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => match &self.fitted_link {
                 FittedLinkState::LatentCLogLog { state } => {
                     Ok(FittedLinkState::LatentCLogLog { state: *state })
                 }
@@ -5389,7 +5389,7 @@ impl UnifiedFitResult {
                     "BinomialLatentCLogLog requires fixed latent cloglog state".to_string(),
                 )),
             },
-            crate::types::LikelihoodFamily::BinomialSas => match &self.fitted_link {
+            (ResponseFamily::Binomial, InverseLink::Sas(_)) => match &self.fitted_link {
                 FittedLinkState::Sas { state, covariance } => Ok(FittedLinkState::Sas {
                     state: *state,
                     covariance: covariance.clone(),
@@ -5398,7 +5398,7 @@ impl UnifiedFitResult {
                     "BinomialSas requires fitted SAS link parameters".to_string(),
                 )),
             },
-            crate::types::LikelihoodFamily::BinomialBetaLogistic => match &self.fitted_link {
+            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => match &self.fitted_link {
                 FittedLinkState::BetaLogistic { state, covariance } => {
                     Ok(FittedLinkState::BetaLogistic {
                         state: *state,
@@ -5410,7 +5410,7 @@ impl UnifiedFitResult {
                         .to_string(),
                 )),
             },
-            crate::types::LikelihoodFamily::BinomialMixture => match &self.fitted_link {
+            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => match &self.fitted_link {
                 FittedLinkState::Mixture { state, covariance } => Ok(FittedLinkState::Mixture {
                     state: state.clone(),
                     covariance: covariance.clone(),
@@ -5419,16 +5419,19 @@ impl UnifiedFitResult {
                     "BinomialMixture requires fitted mixture link parameters".to_string(),
                 )),
             },
-            crate::types::LikelihoodFamily::PoissonLog
-            | crate::types::LikelihoodFamily::Tweedie { .. }
-            | crate::types::LikelihoodFamily::NegativeBinomial { .. }
-            | crate::types::LikelihoodFamily::GammaLog => {
+            (ResponseFamily::Binomial, _) => Err(EstimationError::InvalidInput(
+                "unsupported (binomial, link) combination".to_string(),
+            )),
+            (ResponseFamily::Poisson, _)
+            | (ResponseFamily::Tweedie { .. }, _)
+            | (ResponseFamily::NegativeBinomial { .. }, _)
+            | (ResponseFamily::Gamma, _) => {
                 Ok(FittedLinkState::Standard(Some(LinkFunction::Log)))
             }
-            crate::types::LikelihoodFamily::BetaLogit { .. } => {
+            (ResponseFamily::Beta { .. }, _) => {
                 Ok(FittedLinkState::Standard(Some(LinkFunction::Logit)))
             }
-            crate::types::LikelihoodFamily::RoystonParmar => Ok(FittedLinkState::Standard(None)),
+            (ResponseFamily::RoystonParmar, _) => Ok(FittedLinkState::Standard(None)),
         }
     }
 }
@@ -5961,7 +5964,7 @@ pub fn fit_gamwith_heuristic_lambdas<X>(
     offset: ArrayView1<'_, f64>,
     s_list: &[BlockwisePenalty],
     heuristic_lambdas: Option<&[f64]>,
-    family: crate::types::LikelihoodFamily,
+    family: crate::types::LikelihoodSpec,
     opts: &FitOptions,
 ) -> Result<UnifiedFitResult, EstimationError>
 where
@@ -5988,7 +5991,7 @@ pub(crate) fn fit_gamwith_heuristic_lambdas_andwarm_start<X>(
     s_list: &[BlockwisePenalty],
     heuristic_lambdas: Option<&[f64]>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
-    family: crate::types::LikelihoodFamily,
+    family: crate::types::LikelihoodSpec,
     opts: &FitOptions,
 ) -> Result<UnifiedFitResult, EstimationError>
 where
@@ -6016,7 +6019,7 @@ pub fn fit_gam_with_penalty_specs<X>(
     offset: ArrayView1<'_, f64>,
     penalty_specs: Vec<PenaltySpec>,
     nullspace_dims: Vec<usize>,
-    family: crate::types::LikelihoodFamily,
+    family: crate::types::LikelihoodSpec,
     opts: &FitOptions,
 ) -> Result<UnifiedFitResult, EstimationError>
 where
@@ -6045,7 +6048,7 @@ fn fit_gamwith_penalty_specs_andwarm_start<X>(
     nullspace_dims: Vec<usize>,
     heuristic_lambdas: Option<&[f64]>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
-    family: crate::types::LikelihoodFamily,
+    family: crate::types::LikelihoodSpec,
     opts: &FitOptions,
 ) -> Result<UnifiedFitResult, EstimationError>
 where
@@ -6203,7 +6206,7 @@ pub fn fit_gam<X>(
     weights: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
     s_list: &[BlockwisePenalty],
-    family: crate::types::LikelihoodFamily,
+    family: crate::types::LikelihoodSpec,
     opts: &FitOptions,
 ) -> Result<UnifiedFitResult, EstimationError>
 where

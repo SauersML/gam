@@ -2635,31 +2635,58 @@ pub fn resolve_family(
     negative_binomial_theta: Option<f64>,
     link_choice: Option<&LinkChoice>,
     y: ArrayView1<'_, f64>,
-) -> Result<LikelihoodFamily, String> {
+) -> Result<LikelihoodSpec, String> {
     let nb_theta = negative_binomial_theta.unwrap_or(1.0);
     if !nb_theta.is_finite() || nb_theta <= 0.0 {
         return Err(format!(
             "negative-binomial theta must be finite and > 0; got {nb_theta}"
         ));
     }
-    let explicit = match family {
+    let explicit: Option<LikelihoodSpec> = match family {
         Some(name) => {
             let resolved = match name.to_ascii_lowercase().as_str() {
-                "gaussian" => LikelihoodFamily::GaussianIdentity,
-                "binomial" | "binomial-logit" => LikelihoodFamily::BinomialLogit,
-                "binomial-probit" => LikelihoodFamily::BinomialProbit,
-                "binomial-cloglog" => LikelihoodFamily::BinomialCLogLog,
-                "latent-cloglog-binomial" => LikelihoodFamily::BinomialLatentCLogLog,
-                "poisson" => LikelihoodFamily::PoissonLog,
+                "gaussian" => LikelihoodSpec::new(
+                    ResponseFamily::Gaussian,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
+                "binomial" | "binomial-logit" => LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Logit),
+                ),
+                "binomial-probit" => LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Probit),
+                ),
+                "binomial-cloglog" => LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::CLogLog),
+                ),
+                "latent-cloglog-binomial" => LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::LatentCLogLog(LatentCLogLogState::default()),
+                ),
+                "poisson" => LikelihoodSpec::new(
+                    ResponseFamily::Poisson,
+                    InverseLink::Standard(LinkFunction::Log),
+                ),
                 "nb"
                 | "negbin"
                 | "negative_binomial"
                 | "negative-binomial"
-                | "negative-binomial-log" => LikelihoodFamily::NegativeBinomial { theta: nb_theta },
+                | "negative-binomial-log" => LikelihoodSpec::new(
+                    ResponseFamily::NegativeBinomial { theta: nb_theta },
+                    InverseLink::Standard(LinkFunction::Log),
+                ),
                 "beta" | "beta-logit" | "beta-regression" | "beta-regression-logit" => {
-                    LikelihoodFamily::BetaLogit { phi: 1.0 }
+                    LikelihoodSpec::new(
+                        ResponseFamily::Beta { phi: 1.0 },
+                        InverseLink::Standard(LinkFunction::Logit),
+                    )
                 }
-                "gamma" => LikelihoodFamily::GammaLog,
+                "gamma" => LikelihoodSpec::new(
+                    ResponseFamily::Gamma,
+                    InverseLink::Standard(LinkFunction::Log),
+                ),
                 other => {
                     return Err(WorkflowError::InvalidConfig {
                         reason: format!("unknown family '{other}'"),
@@ -2682,43 +2709,73 @@ pub fn resolve_family(
     };
 
     if let Some(choice) = link_choice {
-        let from_link = if choice.mixture_components.is_some() {
-            LikelihoodFamily::BinomialMixture
+        let from_link: LikelihoodSpec = if let Some(components) = choice.mixture_components.as_ref()
+        {
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Mixture(MixtureLinkSpec::initial_state(components)),
+            )
         } else {
             match choice.link {
-                LinkFunction::Identity => LikelihoodFamily::GaussianIdentity,
+                LinkFunction::Identity => LikelihoodSpec::new(
+                    ResponseFamily::Gaussian,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
                 LinkFunction::Log => {
                     if y.iter()
                         .all(|&yi| yi.is_finite() && yi >= 0.0 && (yi - yi.round()).abs() <= 1e-9)
                     {
-                        LikelihoodFamily::PoissonLog
+                        LikelihoodSpec::new(
+                            ResponseFamily::Poisson,
+                            InverseLink::Standard(LinkFunction::Log),
+                        )
                     } else {
-                        LikelihoodFamily::GammaLog
+                        LikelihoodSpec::new(
+                            ResponseFamily::Gamma,
+                            InverseLink::Standard(LinkFunction::Log),
+                        )
                     }
                 }
-                LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
-                LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
-                LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
-                LinkFunction::Sas => LikelihoodFamily::BinomialSas,
-                LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
+                LinkFunction::Logit => LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Logit),
+                ),
+                LinkFunction::Probit => LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Probit),
+                ),
+                LinkFunction::CLogLog => LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::CLogLog),
+                ),
+                LinkFunction::Sas => LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Sas(SasLinkSpec::default_initial_state()),
+                ),
+                LinkFunction::BetaLogistic => LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::BetaLogistic(SasLinkSpec::default_beta_logistic_state()),
+                ),
             }
         };
-        if let Some(explicit_family) = explicit {
+        if let Some(explicit_spec) = explicit.as_ref() {
             let compatible_log_nb = matches!(
                 (
-                    explicit_family,
+                    &explicit_spec.response,
                     choice.link,
-                    choice.mixture_components.as_ref()
+                    choice.mixture_components.as_ref(),
                 ),
                 (
-                    LikelihoodFamily::NegativeBinomial { .. },
+                    ResponseFamily::NegativeBinomial { .. },
                     LinkFunction::Log,
-                    None
+                    None,
                 )
             );
-            if explicit_family != from_link && !compatible_log_nb {
+            let explicit_legacy = legacy_family_from_spec(explicit_spec);
+            let from_link_legacy = legacy_family_from_spec(&from_link);
+            if explicit_legacy != from_link_legacy && !compatible_log_nb {
                 return Err(WorkflowError::InvalidConfig {
-                    reason: format!("family '{}' conflicts with link", explicit_family.name()),
+                    reason: format!("family '{}' conflicts with link", explicit_legacy.name()),
                 }
                 .into());
             }
@@ -2726,15 +2783,21 @@ pub fn resolve_family(
         return Ok(explicit.unwrap_or(from_link));
     }
 
-    if let Some(f) = explicit {
-        return Ok(f);
+    if let Some(spec) = explicit {
+        return Ok(spec);
     }
 
     // Auto-detect
     if is_binary_response(y) {
-        Ok(LikelihoodFamily::BinomialLogit)
+        Ok(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        ))
     } else {
-        Ok(LikelihoodFamily::GaussianIdentity)
+        Ok(LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(LinkFunction::Identity),
+        ))
     }
 }
 
