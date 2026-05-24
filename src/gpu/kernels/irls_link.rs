@@ -1,7 +1,19 @@
-//! Phase-specific GPU backend placeholder.
-//!
-//! The public marker keeps the HAL surface explicit while the default build and
-//! unsupported CUDA configurations use CPU fallback through dispatch policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuLinkKernel {
+    Logit,
+    Probit,
+    CLogLog,
+    Identity,
+    Log,
+    Sas,
+    BetaLogistic,
+}
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BackendPhaseMarker;
+#[derive(Clone, Debug, Default)]
+pub struct LinkKernelOutputs {
+    pub emits_mu: bool,
+    pub emits_w: bool,
+    pub emits_z: bool,
+    pub emits_derivative_jets: bool,
+    pub emits_deviance_loglik: bool,
+}

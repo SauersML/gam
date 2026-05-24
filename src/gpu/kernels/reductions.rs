@@ -1,7 +1,12 @@
-//! Phase-specific GPU backend placeholder.
-//!
-//! The public marker keeps the HAL surface explicit while the default build and
-//! unsupported CUDA configurations use CPU fallback through dispatch policy.
+pub const DETERMINISTIC_TILE_SIZE: usize = 256;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BackendPhaseMarker;
+pub fn pairwise_sum_host(values: &[f64]) -> f64 {
+    if values.len() <= DETERMINISTIC_TILE_SIZE {
+        values.iter().copied().sum()
+    } else {
+        values
+            .chunks(DETERMINISTIC_TILE_SIZE)
+            .map(pairwise_sum_host)
+            .sum()
+    }
+}

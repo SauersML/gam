@@ -1,7 +1,25 @@
-//! Phase-specific GPU backend placeholder.
-//!
-//! The public marker keeps the HAL surface explicit while the default build and
-//! unsupported CUDA configurations use CPU fallback through dispatch policy.
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BackendPhaseMarker;
+#[derive(Clone, Debug)]
+pub enum SpatialKernel {
+    ThinPlate {
+        length_scale_sq: f64,
+        dim: usize,
+    },
+    Polyharmonic {
+        m: usize,
+        k_dim: usize,
+        c: f64,
+        power: f64,
+        is_log_case: bool,
+    },
+    Matern {
+        length_scale_sq: f64,
+        nu: f64,
+        dim: usize,
+    },
+    DuchonAnisotropic {
+        aniso_log_scales: Vec<f64>,
+        m: usize,
+        dim: usize,
+    },
+    GenericCpuOnly,
+}
