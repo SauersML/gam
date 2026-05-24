@@ -25530,6 +25530,7 @@ mod tests {
                         double_penalty: false,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
+                    }
                     },
                     input_scales: None,
                 },

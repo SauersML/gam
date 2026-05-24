@@ -21980,6 +21980,7 @@ mod tests {
                         double_penalty: false,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: Some(vec![0.0, 0.0]),
+                    }
                     },
                     input_scales: None,
                 },
@@ -22196,6 +22197,7 @@ mod tests {
                         double_penalty: false,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: Some(vec![0.0, 0.0, 0.0]),
+                    }
                     },
                     input_scales: None,
                 },
