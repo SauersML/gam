@@ -15101,13 +15101,13 @@ impl BernoulliMarginalSlopeFamily {
         // Mirrors the same discipline applied in
         // `exact_newton_joint_hessiansecond_directional_derivative_from_cache_with_options`.
         if !flex_active && n > 0 {
-            let _ = self.rigid_third_full_cached(block_states, cache, 0)?;
+            drop(self.rigid_third_full_cached(block_states, cache, 0)?);
         }
         if n > 0 {
             let warm_marg = Array1::<f64>::zeros(slices.marginal.end - slices.marginal.start);
-            let _ = self.marginal_design.dot_row_view(0, warm_marg.view());
+            drop(self.marginal_design.dot_row_view(0, warm_marg.view()));
             let warm_log = Array1::<f64>::zeros(slices.logslope.end - slices.logslope.start);
-            let _ = self.logslope_design.dot_row_view(0, warm_log.view());
+            drop(self.logslope_design.dot_row_view(0, warm_log.view()));
         }
         // Even with the warm-up above, fall back to a serial row loop when the
         // par_iter cannot pay for its own dispatch overhead, or when we are
