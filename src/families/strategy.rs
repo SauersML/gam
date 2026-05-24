@@ -9,7 +9,7 @@ use crate::quadrature::{
     normal_expectation_1d_adaptive, normal_expectation_1d_adaptive_pair,
     probit_posterior_meanvariance, survival_posterior_mean, survival_posterior_meanvariance,
 };
-use crate::types::{InverseLink, LikelihoodFamily, LinkFunction};
+use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, is_valid_tweedie_power};
 use ndarray::{Array1, ArrayView1};
 
 /// Runtime family behavior carrier built from a stable family identifier plus
@@ -156,6 +156,45 @@ where
         (p, p * p)
     });
     (m1, (m2 - m1 * m1).max(0.0))
+}
+
+#[inline]
+fn require_noise_parameter(
+    family: LikelihoodFamily,
+    parameter_name: &str,
+    value: Option<f64>,
+) -> Result<f64, EstimationError> {
+    let value = value.ok_or_else(|| {
+        EstimationError::InvalidInput(format!(
+            "{} generative sampling requires fitted {parameter_name}",
+            family.pretty_name()
+        ))
+    })?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(EstimationError::InvalidInput(format!(
+            "{} generative sampling requires finite {parameter_name}; got {value}",
+            family.pretty_name()
+        )))
+    }
+}
+
+#[inline]
+fn require_positive_noise_parameter(
+    family: LikelihoodFamily,
+    parameter_name: &str,
+    value: Option<f64>,
+) -> Result<f64, EstimationError> {
+    let value = require_noise_parameter(family, parameter_name, value)?;
+    if value > 0.0 {
+        Ok(value)
+    } else {
+        Err(EstimationError::InvalidInput(format!(
+            "{} generative sampling requires {parameter_name} > 0; got {value}",
+            family.pretty_name()
+        )))
+    }
 }
 
 impl FamilyStrategy for ResolvedFamilyStrategy {
@@ -344,7 +383,12 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
     ) -> Result<NoiseModel, EstimationError> {
         match self.family {
             LikelihoodFamily::GaussianIdentity => {
-                let sigma = gaussian_scale.unwrap_or(1.0).max(0.0);
+                let sigma = require_noise_parameter(self.family, "Gaussian sigma", gaussian_scale)?;
+                if sigma < 0.0 {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "Gaussian Identity generative sampling requires Gaussian sigma >= 0; got {sigma}"
+                    )));
+                }
                 Ok(NoiseModel::Gaussian {
                     sigma: Array1::from_elem(mean.len(), sigma),
                 })
@@ -357,10 +401,21 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             | LikelihoodFamily::BinomialBetaLogistic
             | LikelihoodFamily::BinomialMixture => Ok(NoiseModel::Bernoulli),
             LikelihoodFamily::PoissonLog => Ok(NoiseModel::Poisson),
-            LikelihoodFamily::Tweedie { p } => Ok(NoiseModel::Tweedie {
-                p,
-                phi: gaussian_scale.unwrap_or(1.0).max(1e-12),
-            }),
+            LikelihoodFamily::Tweedie { p } => {
+                if !is_valid_tweedie_power(p) {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
+                    )));
+                }
+                Ok(NoiseModel::Tweedie {
+                    p,
+                    phi: require_positive_noise_parameter(
+                        self.family,
+                        "Tweedie dispersion phi",
+                        gaussian_scale,
+                    )?,
+                })
+            }
             LikelihoodFamily::NegativeBinomial { theta } => {
                 if !(theta.is_finite() && theta > 0.0) {
                     return Err(EstimationError::InvalidInput(format!(
@@ -378,10 +433,12 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 Ok(NoiseModel::Beta { phi })
             }
             LikelihoodFamily::GammaLog => {
-                // Callers should pass the fitted Gamma shape; default to 1 only
-                // when older metadata does not expose it.
                 Ok(NoiseModel::Gamma {
-                    shape: gaussian_scale.unwrap_or(1.0).max(1e-6),
+                    shape: require_positive_noise_parameter(
+                        self.family,
+                        "Gamma shape",
+                        gaussian_scale,
+                    )?,
                 })
             }
             LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(

@@ -1164,10 +1164,27 @@ class SoftmaxAssignmentSparsityPenalty:
         return self._to_rust_payload()
 
 
+for _penalty_cls in (
+    IsometryPenalty,
+    SparsityPenalty,
+    ScadMcpPenalty,
+    ARDPenalty,
+    TotalVariationPenalty,
+    NuclearNormPenalty,
+    BlockSparsityPenalty,
+    AuxConditionalPriorPenalty,
+    ParametricAuxConditionalPriorPenalty,
+    OrthogonalityPenalty,
+    IBPAssignmentPenalty,
+    SoftmaxAssignmentSparsityPenalty,
+):
+    _penalty_cls.set_weight_schedule = _set_weight_schedule
+
+
 # Sum type for type hints on `gamfit.fit(..., penalties=...)` and similar.
 Penalty = (
     "IsometryPenalty | SparsityPenalty | ScadMcpPenalty | ARDPenalty | "
     "TotalVariationPenalty | NuclearNormPenalty | BlockSparsityPenalty | "
-    "AuxConditionalPriorPenalty | ParametricAuxConditionalPriorPenalty | "
+    "AuxConditionalPriorPenalty | ParametricAuxConditionalPriorPenalty | ScalarWeightSchedule | "
     "OrthogonalityPenalty | IBPAssignmentPenalty | SoftmaxAssignmentSparsityPenalty"
 )
