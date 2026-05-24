@@ -9580,14 +9580,14 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         full_lambdas[cache.stiffness_penalty_global_idx] = adaptive_params[cache_idx].lambda[2];
     }
 
-    let deviance = match family {
-        LikelihoodFamily::GaussianIdentity => y
-            .iter()
+    let deviance = if family.is_gaussian_identity() {
+        y.iter()
             .zip(final_eval.obs.mu.iter())
             .zip(weights.iter())
             .map(|((&yy, &mu), &w)| w.max(0.0) * (yy - mu) * (yy - mu))
-            .sum(),
-        _ => -2.0 * final_eval.obs.log_likelihood,
+            .sum()
+    } else {
+        -2.0 * final_eval.obs.log_likelihood
     };
     let mut local_penalty_blocks =
         Vec::<PenaltySpec>::with_capacity(baseline.design.penalties.len());
@@ -9659,12 +9659,11 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     };
     let stable_penalty_term =
         2.0 * final_eval.adaptive_penalty_value + beta.dot(&fixed_total.dot(&beta));
-    let standard_deviation = match family {
-        LikelihoodFamily::GaussianIdentity => {
-            let denom = (y.len() as f64 - edf_total).max(1.0);
-            (deviance / denom).sqrt()
-        }
-        _ => 1.0,
+    let standard_deviation = if family.is_gaussian_identity() {
+        let denom = (y.len() as f64 - edf_total).max(1.0);
+        (deviance / denom).sqrt()
+    } else {
+        1.0
     };
     let maps = compute_spatial_adaptiveweights_for_beta(
         &beta,
