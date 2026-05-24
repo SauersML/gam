@@ -17614,7 +17614,6 @@ pub fn fit_survival_marginal_slope_terms(
             build_link_deviation_block_from_knots_design_seed_and_weights(
                 &padded_seed,
                 &q0_seed,
-                &spec.weights,
                 cfg,
             )
         })

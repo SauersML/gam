@@ -369,7 +369,7 @@ pub trait AnalyticPenalty: Send + Sync {
 
     /// Update any attached scalar weight schedule at the given REML outer
     /// iteration. Penalties without schedules keep their stored weight.
-    fn apply_schedule(&mut self, _iter: usize) {}
+    fn apply_schedule(&mut self, _: usize) {}
 }
 
 fn advance_scalar_weight(
@@ -2402,7 +2402,8 @@ impl AnalyticPenalty for TopKActivationPenalty {
         PenaltyTier::Psi
     }
 
-    fn value(&self, target: ArrayView1<'_, f64>, _rho: ArrayView1<'_, f64>) -> f64 {
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        debug_assert_eq!(rho.len(), 0);
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut mask = vec![false; d];
@@ -2420,7 +2421,8 @@ impl AnalyticPenalty for TopKActivationPenalty {
         acc
     }
 
-    fn grad_target(&self, target: ArrayView1<'_, f64>, _rho: ArrayView1<'_, f64>) -> Array1<f64> {
+    fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
+        debug_assert_eq!(rho.len(), 0);
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut mask = vec![false; d];
@@ -2440,8 +2442,9 @@ impl AnalyticPenalty for TopKActivationPenalty {
     fn hessian_diag(
         &self,
         target: ArrayView1<'_, f64>,
-        _rho: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
+        debug_assert_eq!(rho.len(), 0);
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut mask = vec![false; d];
@@ -2458,7 +2461,9 @@ impl AnalyticPenalty for TopKActivationPenalty {
         Some(diag)
     }
 
-    fn grad_rho(&self, _target: ArrayView1<'_, f64>, _rho: ArrayView1<'_, f64>) -> Array1<f64> {
+    fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
+        debug_assert_eq!(rho.len(), 0);
+        debug_assert_eq!(target.len() % self.latent_dim, 0);
         Array1::<f64>::zeros(0)
     }
 
@@ -6213,7 +6218,7 @@ impl OrthogonalityPenalty {
 
     /// Dense cross-axis Hessian; no blockwise reduction preserves the
     /// rotation-gauge term.
-    pub fn as_blockwise(&self, _global_offset: usize) -> Option<Vec<BlockwisePenalty>> {
+    pub fn as_blockwise(&self, _: usize) -> Option<Vec<BlockwisePenalty>> {
         None
     }
 }

@@ -645,8 +645,7 @@ impl LatentZRankIntCalibration {
         // sample, weighted by the original weights.
         let mut sum_wz = 0.0_f64;
         let mut sum_w = 0.0_f64;
-        for (i, &idx) in order.iter().enumerate() {
-            std::hint::black_box(i);
+        for &idx in &order {
             let zi = z[idx];
             let calibrated = Self::apply_with_knots(zi, &sorted_z, &weighted_cdf);
             sum_wz += weights[idx] * calibrated;
@@ -754,8 +753,6 @@ fn build_latent_measure_with_geometry(
     z: &Array1<f64>,
     weights: &Array1<f64>,
     policy: &LatentZPolicy,
-    data: Option<ArrayView2<'_, f64>>,
-    specs: &[&TermCollectionSpec],
 ) -> Result<(LatentMeasureKind, LatentMeasureCalibration), String> {
     match policy.latent_measure {
         LatentMeasureSpec::Auto { grid_size: _ } => {
@@ -780,8 +777,6 @@ fn build_latent_measure_with_geometry(
                     calibration.post_sd,
                     calibration.sorted_z.len(),
                 );
-                std::hint::black_box(data);
-                std::hint::black_box(specs);
                 Ok((
                     LatentMeasureKind::StandardNormal,
                     LatentMeasureCalibration::RankInverseNormal(calibration),
@@ -1370,14 +1365,8 @@ fn require_probit_marginal_slope_link(
 pub(crate) fn build_link_deviation_block_from_knots_design_seed_and_weights(
     knot_seed: &Array1<f64>,
     design_seed: &Array1<f64>,
-    anchor_weights: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    std::hint::black_box(anchor_weights);
-    // The `anchor_weights` argument is retained for caller-API stability but
-    // no longer participates in basis construction (see
-    // `build_score_warp_deviation_block_from_seed_empirical_anchor` for the
-    // rationale: identifiability is now β-independent).
     build_deviation_block_from_knots_and_design_seed(knot_seed, design_seed, cfg)
 }
 
@@ -3695,6 +3684,33 @@ fn contract_fourth_full(
     out
 }
 
+fn ensure_finite_third_full_cache_row(
+    t: &[[[f64; 2]; 2]; 2],
+    context: &str,
+) -> Result<(), String> {
+    if t.iter().flatten().flatten().all(|value| value.is_finite()) {
+        Ok(())
+    } else {
+        Err(format!("{context}: warmed third-derivative cache row contains a non-finite value"))
+    }
+}
+
+fn ensure_finite_fourth_full_cache_row(
+    t: &[[[[f64; 2]; 2]; 2]; 2],
+    context: &str,
+) -> Result<(), String> {
+    if t.iter()
+        .flatten()
+        .flatten()
+        .flatten()
+        .all(|value| value.is_finite())
+    {
+        Ok(())
+    } else {
+        Err(format!("{context}: warmed fourth-derivative cache row contains a non-finite value"))
+    }
+}
+
 pub(crate) fn unary_derivatives_sqrt(x: f64) -> [f64; 5] {
     let s = x.max(1e-300).sqrt();
     let x1 = x.max(1e-300);
@@ -5027,8 +5043,14 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         // Touch both caches so their parallel builds run here, not later
         // (nested inside the outer ext-idx par_iter where the lock-holder
         // thread would have to do each row pass alone).
-        std::hint::black_box(self.third_full_cache());
-        std::hint::black_box(self.fourth_full_cache());
+        let third_cache_len = self.third_full_cache().len();
+        let fourth_cache_len = self.fourth_full_cache().len();
+        let expected_len = self.family.y.len();
+        if third_cache_len != expected_len || fourth_cache_len != expected_len {
+            return Err(format!(
+                "bernoulli rigid row-kernel cache warm-up length mismatch: third={third_cache_len} fourth={fourth_cache_len} expected={expected_len}"
+            ));
+        }
         Ok(())
     }
 
@@ -6384,10 +6406,9 @@ impl BernoulliMarginalSlopeFamily {
     pub(crate) fn sigma_exact_joint_psi_terms_with_options(
         &self,
         block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
+        _specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        std::hint::black_box(specs);
         if self.effective_flex_active(block_states)? {
             return Err("bernoulli marginal-slope log-sigma hyperderivatives are implemented for the rigid probit marginal-slope kernel; flexible score/link kernels require the analytic denested cell-tensor sigma path"
                         .to_string());
@@ -12863,7 +12884,11 @@ impl BernoulliMarginalSlopeFamily {
         // on the FLEX path because that branch routes through the flex jet
         // machinery, which has its own row-cell-moments cache.
         if !self.effective_flex_active(block_states)? {
-            std::hint::black_box(self.rigid_third_full_cached(block_states, cache, 0)?);
+            let warmed = self.rigid_third_full_cached(block_states, cache, 0)?;
+            ensure_finite_third_full_cache_row(
+                warmed,
+                "run_psi_row_pass_for_axes rigid third-cache warm-up",
+            )?;
         }
 
         // Block-local accumulator path: avoids O(n p^2) dense Hessian
@@ -13892,13 +13917,29 @@ impl BernoulliMarginalSlopeFamily {
         // Mirrors the same discipline applied in
         // `exact_newton_joint_hessiansecond_directional_derivative_from_cache_with_options`.
         if !flex_active && n > 0 {
-            std::hint::black_box(self.rigid_third_full_cached(block_states, cache, 0)?);
+            let warmed = self.rigid_third_full_cached(block_states, cache, 0)?;
+            ensure_finite_third_full_cache_row(
+                warmed,
+                "compute_gradient_and_hessian_via_psi_axes rigid third-cache warm-up",
+            )?;
         }
         if n > 0 {
             let warm_marg = Array1::<f64>::zeros(slices.marginal.end - slices.marginal.start);
-            std::hint::black_box(self.marginal_design.dot_row_view(0, warm_marg.view()));
+            let marginal_probe = self.marginal_design.dot_row_view(0, warm_marg.view());
+            if !marginal_probe.is_finite() {
+                return Err(
+                    "compute_gradient_and_hessian_via_psi_axes marginal design warm-up produced a non-finite value"
+                        .to_string(),
+                );
+            }
             let warm_log = Array1::<f64>::zeros(slices.logslope.end - slices.logslope.start);
-            std::hint::black_box(self.logslope_design.dot_row_view(0, warm_log.view()));
+            let logslope_probe = self.logslope_design.dot_row_view(0, warm_log.view());
+            if !logslope_probe.is_finite() {
+                return Err(
+                    "compute_gradient_and_hessian_via_psi_axes logslope design warm-up produced a non-finite value"
+                        .to_string(),
+                );
+            }
         }
         // Even with the warm-up above, fall back to a serial row loop when the
         // par_iter cannot pay for its own dispatch overhead, or when we are
@@ -14189,7 +14230,11 @@ impl BernoulliMarginalSlopeFamily {
         // path because that branch routes through the flex jet machinery
         // instead of `rigid_fourth_full_cached`.
         if !self.effective_flex_active(block_states)? {
-            std::hint::black_box(self.rigid_fourth_full_cached(block_states, cache, 0)?);
+            let warmed = self.rigid_fourth_full_cached(block_states, cache, 0)?;
+            ensure_finite_fourth_full_cache_row(
+                warmed,
+                "exact_newton_joint_hessiansecond_directional_derivative_from_cache rigid fourth-cache warm-up",
+            )?;
         }
 
         // ── Rigid closed-form: 4th-order scalar kernel ───────────────
@@ -14282,7 +14327,11 @@ impl BernoulliMarginalSlopeFamily {
         // entering the per-row `par_iter` to avoid the OnceLock-under-rayon
         // deadlock — see `feedback_oncelock_rayon_deadlock`.
         if !self.effective_flex_active(block_states)? {
-            std::hint::black_box(self.rigid_fourth_full_cached(block_states, cache, 0)?);
+            let warmed = self.rigid_fourth_full_cached(block_states, cache, 0)?;
+            ensure_finite_fourth_full_cache_row(
+                warmed,
+                "exact_newton_joint_hessiansecond_directional_derivative_operator_from_cache rigid fourth-cache warm-up",
+            )?;
         }
 
         if !self.effective_flex_active(block_states)? {
@@ -15199,8 +15248,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        std::hint::black_box(specs);
+    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // The workspace impl above unconditionally returns `Some(workspace)`
         // — the rigid path produces a `RowKernelHessianWorkspace` and the
         // flex path produces a
@@ -15211,13 +15259,11 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         true
     }
 
-    fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        std::hint::black_box(specs);
+    fn inner_joint_workspace_gradient_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         true
     }
 
-    fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        std::hint::black_box(specs);
+    fn inner_joint_workspace_log_likelihood_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         true
     }
 
@@ -16633,12 +16679,20 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
         // parallel — but priming here lifts the first-axis cost out of the
         // workspace's `first_order_terms` measurement.
         if !family.effective_flex_active(&block_states)? {
-            std::hint::black_box(family.rigid_third_full_cached(&block_states, &cache, 0)?);
+            let warmed_third = family.rigid_third_full_cached(&block_states, &cache, 0)?;
+            ensure_finite_third_full_cache_row(
+                warmed_third,
+                "BernoulliMarginalSlopeExactNewtonJointPsiWorkspace third-cache warm-up",
+            )?;
             // Outer-Hessian path consumes per-row fourth-tensor over every
             // (ψ-axis-i, ψ-axis-j) pair — prime here too so the 528-pair
             // sweep reads a populated cache instead of triggering the
             // 8-direction empirical jet on its first per-pair call.
-            std::hint::black_box(family.rigid_fourth_full_cached(&block_states, &cache, 0)?);
+            let warmed_fourth = family.rigid_fourth_full_cached(&block_states, &cache, 0)?;
+            ensure_finite_fourth_full_cache_row(
+                warmed_fourth,
+                "BernoulliMarginalSlopeExactNewtonJointPsiWorkspace fourth-cache warm-up",
+            )?;
         }
         Ok(Self {
             family,
@@ -16960,8 +17014,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
         &spec.z,
         &spec.weights,
         &spec.latent_z_policy,
-        Some(data_view),
-        &[&marginalspec_boot, &logslopespec_boot],
     )?;
     if latent_measure.is_empirical() && sigma_learnable {
         return Err("empirical latent-measure marginal-slope calibration requires fixed GaussianShift sigma; learnable sigma derivatives must be fit under the standard-normal latent measure"
@@ -17122,7 +17174,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
         let mut prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
             &link_dev_seed,
             &eta_pilot,
-            &spec.weights,
             cfg,
         )?;
         // Cross-block identifiability for the link-deviation basis. The
@@ -17490,8 +17541,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
          specs: &[TermCollectionSpec],
          designs: &[TermCollectionDesign],
          eval_mode,
-         row_set: &crate::families::row_kernel::RowSet| {
-            std::hint::black_box(row_set);
+         _row_set: &crate::families::row_kernel::RowSet| {
             use crate::solver::estimate::reml::unified::EvalMode;
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
@@ -17657,9 +17707,8 @@ mod tests {
         let score_prepared = build_score_warp_deviation_block_from_seed(&z, &cfg)?;
         let q_seed = Array1::from_iter(z.iter().map(|zi| 0.05 + 0.2 * zi));
         let link_seed = padded_deviation_seed(&q_seed, 1.0, 0.5);
-        let link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
-            &link_seed, &q_seed, &weights, &cfg,
-        )?;
+        let link_prepared =
+            build_link_deviation_block_from_knots_design_seed_and_weights(&link_seed, &q_seed, &cfg)?;
         let family = BernoulliMarginalSlopeFamily {
             y: Arc::new(y),
             weights: Arc::new(weights),
@@ -17754,10 +17803,11 @@ mod tests {
         // to functions strongly correlated with score-warp evaluations.
         let q0_seed = Array1::from_iter(z.iter().map(|zi| 0.1 + 0.45 * zi));
         let link_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
-        let mut link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
-            &link_seed, &q0_seed, &weights, &link_cfg,
-        )
-        .expect("link-deviation fixture");
+        let mut link_prepared =
+            build_link_deviation_block_from_knots_design_seed_and_weights(
+                &link_seed, &q0_seed, &link_cfg,
+            )
+            .expect("link-deviation fixture");
         let p_link_before = link_prepared.runtime.basis_dim();
         let _ = link_seed; // padded knot-seed retained only for knot construction
         let anchor_design_for_test = score_prepared
@@ -17839,10 +17889,11 @@ mod tests {
         };
         let q0_seed = Array1::from_iter(z.iter().map(|zi| 0.05 + 0.4 * zi));
         let link_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
-        let mut link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
-            &link_seed, &q0_seed, &weights, &link_cfg,
-        )
-        .expect("link-dev fixture");
+        let mut link_prepared =
+            build_link_deviation_block_from_knots_design_seed_and_weights(
+                &link_seed, &q0_seed, &link_cfg,
+            )
+            .expect("link-dev fixture");
         let _ = link_seed;
         let p_before = link_prepared.runtime.basis_dim();
         assert!(p_before > 0, "fixture must have positive basis_dim");
@@ -17902,10 +17953,11 @@ mod tests {
         };
         let q0_seed = Array1::from_iter(z.iter().map(|zi| 0.05 + 0.4 * zi));
         let link_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
-        let mut link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
-            &link_seed, &q0_seed, &weights, &link_cfg,
-        )
-        .expect("link-dev fixture");
+        let mut link_prepared =
+            build_link_deviation_block_from_knots_design_seed_and_weights(
+                &link_seed, &q0_seed, &link_cfg,
+            )
+            .expect("link-dev fixture");
         let _ = link_seed;
         let p_before = link_prepared.runtime.basis_dim();
         assert!(
@@ -17987,10 +18039,11 @@ mod tests {
         };
         let q0_seed = Array1::from_iter(z.iter().map(|zi| 0.05 + 0.4 * zi));
         let link_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
-        let mut link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
-            &link_seed, &q0_seed, &weights, &link_cfg,
-        )
-        .expect("link-dev fixture");
+        let mut link_prepared =
+            build_link_deviation_block_from_knots_design_seed_and_weights(
+                &link_seed, &q0_seed, &link_cfg,
+            )
+            .expect("link-dev fixture");
         let _ = link_seed;
         let candidate_design = link_prepared
             .runtime
@@ -18064,10 +18117,11 @@ mod tests {
         };
         let q0_seed = Array1::from_iter(z.iter().map(|zi| 0.03 + 0.42 * zi));
         let link_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
-        let mut link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
-            &link_seed, &q0_seed, &weights, &link_cfg,
-        )
-        .expect("link-dev fixture");
+        let mut link_prepared =
+            build_link_deviation_block_from_knots_design_seed_and_weights(
+                &link_seed, &q0_seed, &link_cfg,
+            )
+            .expect("link-dev fixture");
         let _ = link_seed;
         let candidate_design = link_prepared
             .runtime
@@ -18230,10 +18284,9 @@ mod tests {
             .expect("score-warp deviation block");
         let q_seed = Array1::from_iter(z.iter().map(|zi| 0.1 + 0.25 * zi));
         let link_seed = padded_deviation_seed(&q_seed, 1.0, 0.5);
-        let link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
-            &link_seed, &q_seed, &weights, &cfg,
-        )
-        .expect("link-wiggle deviation block");
+        let link_prepared =
+            build_link_deviation_block_from_knots_design_seed_and_weights(&link_seed, &q_seed, &cfg)
+                .expect("link-wiggle deviation block");
 
         let cache = new_intercept_warm_start_cache(n);
         let make_family =
@@ -18333,10 +18386,9 @@ mod tests {
             .expect("score-warp deviation block");
         let q_seed = Array1::from_iter(z.iter().map(|zi| 0.1 + 0.2 * zi));
         let link_seed = padded_deviation_seed(&q_seed, 1.0, 0.5);
-        let link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
-            &link_seed, &q_seed, &weights, &cfg,
-        )
-        .expect("link-wiggle deviation block");
+        let link_prepared =
+            build_link_deviation_block_from_knots_design_seed_and_weights(&link_seed, &q_seed, &cfg)
+                .expect("link-wiggle deviation block");
         let family = BernoulliMarginalSlopeFamily {
             y: Arc::new(y),
             weights: Arc::new(weights),
@@ -19081,12 +19133,7 @@ mod tests {
         seed: &Array1<f64>,
         cfg: &DeviationBlockConfig,
     ) -> Result<DeviationPrepared, String> {
-        build_link_deviation_block_from_knots_design_seed_and_weights(
-            seed,
-            seed,
-            &Array1::ones(seed.len()),
-            cfg,
-        )
+        build_link_deviation_block_from_knots_design_seed_and_weights(seed, seed, cfg)
     }
 
     #[test]
@@ -19147,19 +19194,14 @@ mod tests {
         // Mirror of `score_warp_basis_smoothness_penalty_is_full_rank` for
         // the link-deviation entry point. Same property, same proof: full
         // rank of the integrated derivative penalty on the transformed
-        // basis. The `_anchor_weights` argument is now a no-op (the
-        // construction is β-independent) but the test still passes the
-        // weights to verify the entry-point signature continues to accept
-        // them.
+        // basis.
         let q = array![-2.0, -0.8, -0.1, 0.4, 1.3, 2.1];
-        let weights = array![0.2, 1.7, 0.5, 2.3, 0.8, 1.1];
         let cfg = DeviationBlockConfig {
             num_internal_knots: 5,
             ..DeviationBlockConfig::default()
         };
-        let prepared =
-            build_link_deviation_block_from_knots_design_seed_and_weights(&q, &q, &weights, &cfg)
-                .expect("build smoothness-null-space-drop link-deviation");
+        let prepared = build_link_deviation_block_from_knots_design_seed_and_weights(&q, &q, &cfg)
+            .expect("build smoothness-null-space-drop link-deviation");
         let max_order = cfg
             .penalty_orders
             .iter()
@@ -25337,8 +25379,7 @@ mod tests {
             ..LatentZPolicy::default()
         };
         let (measure, calibration) =
-            build_latent_measure_with_geometry(&z, &weights, &policy, None, &[])
-                .expect("auto latent measure");
+            build_latent_measure_with_geometry(&z, &weights, &policy).expect("auto latent measure");
         assert!(
             matches!(measure, LatentMeasureKind::StandardNormal),
             "bad-normal latent z must route through rank-INT to the standard-normal kernel"
@@ -25553,7 +25594,7 @@ mod tests {
             ..LatentZPolicy::default()
         };
         let (measure, calibration) =
-            build_latent_measure_with_geometry(&z, &weights, &policy, None, &[]).expect("measure");
+            build_latent_measure_with_geometry(&z, &weights, &policy).expect("measure");
 
         assert!(matches!(measure, LatentMeasureKind::StandardNormal));
         assert!(

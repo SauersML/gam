@@ -1150,7 +1150,7 @@ fn compute_multiblock_alo_chunk(
             for d in 0..b {
                 scratch.imwa[d * b + d] += ALO_LOCAL_BLOCK_RIDGE;
             }
-            std::hint::black_box(lu_factor_in_place(
+            debug_assert!(lu_factor_in_place(
                 &mut scratch.imwa,
                 &mut scratch.perm_imwa,
                 b,
@@ -1167,7 +1167,7 @@ fn compute_multiblock_alo_chunk(
             for d in 0..b {
                 scratch.imaw[d * b + d] += ALO_LOCAL_BLOCK_RIDGE;
             }
-            std::hint::black_box(lu_factor_in_place(
+            debug_assert!(lu_factor_in_place(
                 &mut scratch.imaw,
                 &mut scratch.perm_imaw,
                 b,

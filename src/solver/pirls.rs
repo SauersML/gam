@@ -6519,7 +6519,7 @@ fn assemble_pirls_result(
         solve_d3mu_deta3: final_d3mu_deta3.clone(),
         solve_c_array: final_c.clone(),
         solve_d_array: final_d.clone(),
-        derivatives_unsupported: working_derivatives_unsupported(likelihood),
+        derivatives_unsupported: false,
         status,
         iteration: working_summary.iterations,
         max_abs_eta: working_summary.max_abs_eta,
@@ -7377,7 +7377,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             solve_d3mu_deta3,
             solve_c_array,
             solve_d_array,
-            derivatives_unsupported: working_derivatives_unsupported(config.likelihood),
+            derivatives_unsupported: false,
             status: PirlsStatus::Converged,
             iteration: 1,
             max_abs_eta,
@@ -8511,12 +8511,6 @@ fn validate_tweedie_responses(
 #[inline]
 fn safe_beta_mu(mu: f64) -> f64 {
     mu.clamp(BETA_MU_EPS, 1.0 - BETA_MU_EPS)
-}
-
-#[inline]
-fn working_derivatives_unsupported(likelihood: GlmLikelihoodSpec) -> bool {
-    std::hint::black_box(likelihood);
-    false
 }
 
 #[inline]

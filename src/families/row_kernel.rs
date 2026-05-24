@@ -270,8 +270,7 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     /// (typically when the underlying design exposes a contiguous dense
     /// `Array2`). The default returns `None`, in which case generic
     /// per-row `jacobian_action` is used.
-    fn jacobian_action_matrix(&self, factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
-        std::hint::black_box(factor);
+    fn jacobian_action_matrix(&self, _factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
         None
     }
 }
