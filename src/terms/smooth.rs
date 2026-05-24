@@ -10214,7 +10214,7 @@ impl SpatialAdaptiveExactFamily {
         fixed_quadratichessian: Arc<Array2<f64>>,
     ) -> Self {
         Self {
-            family: self.family,
+            family: self.family.clone(),
             latent_cloglog_state: self.latent_cloglog_state,
             mixture_link_state: self.mixture_link_state.clone(),
             sas_link_state: self.sas_link_state,
