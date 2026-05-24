@@ -29,6 +29,7 @@ use crate::terms::smooth::TermCollectionDesign;
 
 const DEFAULT_LATENT_CACHE_CAPACITY: usize = 4;
 const DEFAULT_PERSISTENT_LATENT_CACHE_CAPACITY: usize = 16;
+const DEFAULT_PERSISTENT_LATENT_CACHE_BYTE_BUDGET: usize = 1024 * 1024 * 1024;
 
 static PERSISTENT_LATENT_DESIGN_CACHE: OnceLock<Mutex<PersistentLatentDesignCache>> =
     OnceLock::new();
@@ -38,11 +39,10 @@ static PERSISTENT_LATENT_DESIGN_CACHE: OnceLock<Mutex<PersistentLatentDesignCach
 pub(crate) struct LatentFingerprint {
     pub(crate) hash: u64,
     pub(crate) len: usize,
-    pub(crate) iteration: u64,
 }
 
 impl LatentFingerprint {
-    pub(crate) fn from_flat(flat: &[f64], iteration: u64) -> Self {
+    pub(crate) fn from_flat(flat: &[f64]) -> Self {
         let mut hasher = DefaultHasher::new();
         flat.len().hash(&mut hasher);
         for &value in flat {
@@ -51,7 +51,6 @@ impl LatentFingerprint {
         Self {
             hash: hasher.finish(),
             len: flat.len(),
-            iteration,
         }
     }
 }
@@ -449,7 +448,6 @@ impl BasisDerivativeJets {
 
 #[derive(Clone)]
 pub(crate) struct CachedDesign {
-    pub(crate) id: u64,
     pub(crate) latent_id: u64,
     pub(crate) fingerprint: LatentFingerprint,
     basis_digest: CacheDigest,
@@ -460,7 +458,6 @@ pub(crate) struct CachedDesign {
     pub(crate) hyper_dirs: Vec<DirectionalHyperParam>,
     pub(crate) radial_distances: RadialDistanceMatrices,
     pub(crate) basis_derivative_jets: BasisDerivativeJets,
-    last_used: u64,
 }
 
 pub(crate) struct ComputedLatentDesign {
@@ -470,6 +467,7 @@ pub(crate) struct ComputedLatentDesign {
 
 pub(crate) struct LatentDesignLookup<'a> {
     pub(crate) cached: &'a CachedDesign,
+    pub(crate) entry_id: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -483,12 +481,15 @@ struct PersistentLatentDesignKey {
 struct PersistentLatentDesignEntry {
     fingerprint: LatentFingerprint,
     cached: Arc<CachedDesign>,
+    bytes: usize,
 }
 
 pub(crate) struct PersistentLatentDesignCache {
     entries: HashMap<PersistentLatentDesignKey, PersistentLatentDesignEntry>,
     lru: VecDeque<PersistentLatentDesignKey>,
     capacity: usize,
+    byte_budget: usize,
+    cache_bytes: usize,
 }
 
 impl Default for PersistentLatentDesignCache {
@@ -503,6 +504,8 @@ impl PersistentLatentDesignCache {
             entries: HashMap::new(),
             lru: VecDeque::new(),
             capacity: capacity.max(1),
+            byte_budget: DEFAULT_PERSISTENT_LATENT_CACHE_BYTE_BUDGET,
+            cache_bytes: 0,
         }
     }
 
@@ -543,6 +546,10 @@ impl PersistentLatentDesignCache {
         if !cached.cacheable {
             return;
         }
+        let bytes = cached.resident_byte_count();
+        if bytes > self.byte_budget {
+            return;
+        }
         let key = PersistentLatentDesignKey {
             latent_id: cached.latent_id,
             flat_hash: cached.fingerprint.hash,
@@ -552,14 +559,24 @@ impl PersistentLatentDesignCache {
         let entry = PersistentLatentDesignEntry {
             fingerprint: cached.fingerprint.clone(),
             cached,
+            bytes,
         };
-        self.entries.insert(key, entry);
+        if let Some(old) = self.entries.insert(key, entry) {
+            self.cache_bytes = self.cache_bytes.saturating_sub(old.bytes);
+        }
+        self.cache_bytes = self.cache_bytes.saturating_add(bytes);
         self.touch(key);
-        while self.entries.len() > self.capacity {
+        self.evict_to_limits();
+    }
+
+    fn evict_to_limits(&mut self) {
+        while self.entries.len() > self.capacity || self.cache_bytes > self.byte_budget {
             let Some(evicted) = self.lru.pop_front() else {
                 break;
             };
-            self.entries.remove(&evicted);
+            if let Some(entry) = self.entries.remove(&evicted) {
+                self.cache_bytes = self.cache_bytes.saturating_sub(entry.bytes);
+            }
         }
     }
 
@@ -572,11 +589,18 @@ impl PersistentLatentDesignCache {
 }
 
 pub(crate) struct LatentDesignCache {
-    entries: Vec<CachedDesign>,
+    entries: Vec<LatentDesignCacheEntry>,
     capacity: usize,
     clock: u64,
     iteration: u64,
     next_entry_id: u64,
+}
+
+struct LatentDesignCacheEntry {
+    id: u64,
+    cached: Arc<CachedDesign>,
+    last_used: u64,
+    iteration: u64,
 }
 
 impl Default for LatentDesignCache {
@@ -621,7 +645,7 @@ impl LatentDesignCache {
         let flat_slice = flat
             .as_slice()
             .expect("LatentCoordValues flat storage must be contiguous");
-        let fingerprint = LatentFingerprint::from_flat(flat_slice, self.iteration);
+        let fingerprint = LatentFingerprint::from_flat(flat_slice);
         let basis_digest = basis_kind.cache_digest();
         let latent_metadata_digest = latent_metadata_cache_digest(&latent);
         let cacheable = flat_slice.iter().all(|value| value.is_finite());
@@ -629,7 +653,8 @@ impl LatentDesignCache {
             if let Some(index) = self.find_entry(&latent, basis_digest, latent_metadata_digest) {
                 self.entries[index].last_used = self.clock;
                 return Ok(LatentDesignLookup {
-                    cached: &self.entries[index],
+                    cached: self.entries[index].cached.as_ref(),
+                    entry_id: self.entries[index].id,
                 });
             }
         }
@@ -642,11 +667,7 @@ impl LatentDesignCache {
             )? {
                 let id = self.next_entry_id;
                 self.next_entry_id = self.next_entry_id.wrapping_add(1);
-                let mut entry = (*cached).clone();
-                entry.id = id;
-                entry.fingerprint.iteration = self.iteration;
-                entry.last_used = self.clock;
-                self.insert(entry);
+                self.insert(cached, id);
                 return self.lookup_inserted(id);
             }
         }
@@ -663,8 +684,7 @@ impl LatentDesignCache {
             build_basis_derivative_jets(&latent, &basis_kind, &radial_distances)?;
         let id = self.next_entry_id;
         self.next_entry_id = self.next_entry_id.wrapping_add(1);
-        let entry = CachedDesign {
-            id,
+        let entry = Arc::new(CachedDesign {
             latent_id: latent.latent_id(),
             fingerprint,
             basis_digest,
@@ -675,13 +695,11 @@ impl LatentDesignCache {
             hyper_dirs: computed.hyper_dirs,
             radial_distances,
             basis_derivative_jets,
-            last_used: self.clock,
-        };
-        let _resident_scalars = entry.resident_scalar_count();
+        });
         if cacheable {
-            insert_persistent_latent_design(Arc::new(entry.clone()))?;
+            insert_persistent_latent_design(Arc::clone(&entry))?;
         }
-        self.insert(entry);
+        self.insert(entry, id);
         self.lookup_inserted(id)
     }
 
@@ -692,11 +710,11 @@ impl LatentDesignCache {
         latent_metadata_digest: CacheDigest,
     ) -> Option<usize> {
         self.entries.iter().position(|entry| {
-            entry.cacheable
-                && entry.basis_digest == basis_digest
-                && entry.latent_metadata_digest == latent_metadata_digest
-                && entry.latent_id == latent.latent_id()
-                && latent_bits_match(latent, &entry.latent_bits)
+            entry.cached.cacheable
+                && entry.cached.basis_digest == basis_digest
+                && entry.cached.latent_metadata_digest == latent_metadata_digest
+                && entry.cached.latent_id == latent.latent_id()
+                && latent_bits_match(latent, &entry.cached.latent_bits)
         })
     }
 
@@ -707,18 +725,24 @@ impl LatentDesignCache {
             ));
         };
         Ok(LatentDesignLookup {
-            cached: &self.entries[index],
+            cached: self.entries[index].cached.as_ref(),
+            entry_id: self.entries[index].id,
         })
     }
 
-    fn insert(&mut self, entry: CachedDesign) {
-        self.entries.push(entry);
+    fn insert(&mut self, cached: Arc<CachedDesign>, id: u64) {
+        self.entries.push(LatentDesignCacheEntry {
+            id,
+            cached,
+            last_used: self.clock,
+            iteration: self.iteration,
+        });
         while self.entries.len() > self.capacity {
             if let Some(evict_index) = self
                 .entries
                 .iter()
                 .enumerate()
-                .min_by_key(|(_, entry)| (entry.last_used, entry.fingerprint.iteration))
+                .min_by_key(|(_, entry)| (entry.last_used, entry.iteration))
                 .map(|(index, _)| index)
             {
                 self.entries.remove(evict_index);
@@ -730,35 +754,62 @@ impl LatentDesignCache {
 }
 
 impl CachedDesign {
+    fn resident_byte_count(&self) -> usize {
+        self.resident_scalar_count()
+            .saturating_mul(std::mem::size_of::<f64>())
+            .saturating_add(
+                self.hyper_dirs
+                    .iter()
+                    .map(DirectionalHyperParam::resident_byte_count)
+                    .sum::<usize>(),
+            )
+    }
+
     fn resident_scalar_count(&self) -> usize {
-        self.radial_distances.squared.len()
-            + self.radial_distances.distance.len()
-            + self
-                .basis_derivative_jets
+        let mut count = self
+            .design
+            .design
+            .nrows()
+            .saturating_mul(self.design.design.ncols());
+        count = count.saturating_add(
+            self.design
+                .coefficient_lower_bounds
+                .as_ref()
+                .map_or(0, |values| values.len()),
+        );
+        count = count.saturating_add(self.radial_distances.squared.len());
+        count = count.saturating_add(self.radial_distances.distance.len());
+        count = count.saturating_add(
+            self.basis_derivative_jets
                 .phi
                 .as_ref()
-                .map_or(0, |values| values.len())
-            + self
-                .basis_derivative_jets
+                .map_or(0, |values| values.len()),
+        );
+        count = count.saturating_add(
+            self.basis_derivative_jets
                 .q
                 .as_ref()
-                .map_or(0, |values| values.len())
-            + self
-                .basis_derivative_jets
+                .map_or(0, |values| values.len()),
+        );
+        count = count.saturating_add(
+            self.basis_derivative_jets
                 .t
                 .as_ref()
-                .map_or(0, |values| values.len())
-            + self
-                .basis_derivative_jets
+                .map_or(0, |values| values.len()),
+        );
+        count = count.saturating_add(
+            self.basis_derivative_jets
                 .phi_r
                 .as_ref()
-                .map_or(0, |values| values.len())
-            + self
-                .basis_derivative_jets
+                .map_or(0, |values| values.len()),
+        );
+        count = count.saturating_add(
+            self.basis_derivative_jets
                 .phi_rr
                 .as_ref()
-                .map_or(0, |values| values.len())
-            + usize::from(self.basis_derivative_jets.operator_resident)
+                .map_or(0, |values| values.len()),
+        );
+        count.saturating_add(usize::from(self.basis_derivative_jets.operator_resident))
     }
 }
 

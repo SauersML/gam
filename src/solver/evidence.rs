@@ -546,7 +546,7 @@ pub fn arrow_log_det_from_cache(cache: &ArrowFactorCache) -> Option<f64> {
 
     let mut acc = 0.0_f64;
     // Per-row arrow blocks: log|H_uu_i| = 2 Σ log diag(L_i).
-    for l in cache.htt_factors_undamped.iter() {
+    for l in cache.undamped_factors_iter() {
         acc += 2.0 * log_det_from_chol_lower(l);
     }
     // Schur block: log|A| = 2 Σ log diag(L_schur).
@@ -581,18 +581,24 @@ fn log_det_from_chol_lower(l: &Array2<f64>) -> f64 {
 /// row block is solved with the **undamped** Cholesky factor. Proposal
 /// §2.2 / §7.
 pub fn ift_du_dbeta(cache: &ArrowFactorCache) -> Array2<f64> {
-    let n = cache.htt_factors_undamped.len();
+    assert!(
+        cache.htbeta_available(),
+        "IFT du/dbeta requires cached H_tβ row products"
+    );
+    let n = cache.undamped_factor_count();
     let d = cache.d;
     let k = cache.k;
     let mut out = Array2::<f64>::zeros((n * d, k));
+    let mut beta_basis = Array1::<f64>::zeros(k);
+    let mut rhs = Array1::<f64>::zeros(d);
     for i in 0..n {
-        let factor = &cache.htt_factors_undamped[i];
-        let htb = &cache.htbeta[i];
+        let factor = cache.undamped_factor(i);
         // Solve H_uu_i Y = H_uβ_i column by column.
         for col in 0..k {
-            let mut rhs = Array1::<f64>::zeros(d);
-            for c in 0..d {
-                rhs[c] = htb[[c, col]];
+            beta_basis.fill(0.0);
+            beta_basis[col] = 1.0;
+            if !cache.apply_htbeta_row(i, beta_basis.view(), &mut rhs) {
+                panic!("IFT du/dbeta requires cached H_tβ row products");
             }
             let y = chol_lower_solve_vector(factor, &rhs);
             for c in 0..d {
@@ -651,7 +657,11 @@ pub fn ift_du_drho(
     gu_rho: ArrayView2<'_, f64>,
     dbeta_drho: ArrayView2<'_, f64>,
 ) -> Array2<f64> {
-    let n = cache.htt_factors_undamped.len();
+    assert!(
+        cache.htbeta_available(),
+        "IFT du/drho requires cached H_tβ row products"
+    );
+    let n = cache.undamped_factor_count();
     let d = cache.d;
     let k = cache.k;
     let r = dbeta_drho.ncols();
@@ -660,18 +670,18 @@ pub fn ift_du_drho(
 
     let mut out = Array2::<f64>::zeros((n * d, r));
     let mut rhs = Array1::<f64>::zeros(d);
+    let mut htbeta_delta = Array1::<f64>::zeros(d);
     for a in 0..r {
         // Per-row: rhs_i = G_{u_i,ρ_a} + H_uβ_i · ∂β*/∂ρ_a.
         for i in 0..n {
+            if !cache.apply_htbeta_row(i, dbeta_drho.column(a), &mut htbeta_delta) {
+                panic!("IFT du/drho requires cached H_tβ row products");
+            }
             for c in 0..d {
-                let mut acc = gu_rho[[i * d + c, a]];
-                for j in 0..k {
-                    acc += cache.htbeta[i][[c, j]] * dbeta_drho[[j, a]];
-                }
-                rhs[c] = acc;
+                rhs[c] = gu_rho[[i * d + c, a]] + htbeta_delta[c];
             }
             // u_ρ_i = -H_uu_i⁻¹ rhs_i, undamped factor.
-            let v = chol_lower_solve_vector(&cache.htt_factors_undamped[i], &rhs);
+            let v = chol_lower_solve_vector(cache.undamped_factor(i), &rhs);
             for c in 0..d {
                 out[[i * d + c, a]] = -v[c];
             }
@@ -776,7 +786,11 @@ pub fn evidence_grad_rho(
     ift_terms: EvidenceIftGradientTerms<'_>,
 ) -> Array1<f64> {
     let r = value_rho.len();
-    let n = cache.htt_factors_undamped.len();
+    assert!(
+        cache.htbeta_available(),
+        "evidence gradient requires cached H_tβ row products"
+    );
+    let n = cache.undamped_factor_count();
     let d = cache.d;
     let k = cache.k;
     let mut out = Array1::<f64>::zeros(r);
@@ -796,13 +810,16 @@ pub fn evidence_grad_rho(
     // Precompute Y_i = H_uu_i⁻¹ H_uβ_i (d × K). Used by both the Schur
     // derivative formula (§3.5) and the row trace `tr(H_uu_i⁻¹ ∂H_uu_i)`.
     let mut y_blocks: Vec<Array2<f64>> = Vec::with_capacity(n);
+    let mut beta_basis = Array1::<f64>::zeros(k);
+    let mut rhs = Array1::<f64>::zeros(d);
     for i in 0..n {
-        let factor = &cache.htt_factors_undamped[i];
+        let factor = cache.undamped_factor(i);
         let mut yi = Array2::<f64>::zeros((d, k));
-        let mut rhs = Array1::<f64>::zeros(d);
         for col in 0..k {
-            for c in 0..d {
-                rhs[c] = cache.htbeta[i][[c, col]];
+            beta_basis.fill(0.0);
+            beta_basis[col] = 1.0;
+            if !cache.apply_htbeta_row(i, beta_basis.view(), &mut rhs) {
+                panic!("evidence gradient requires cached H_tβ row products");
             }
             let v = chol_lower_solve_vector(factor, &rhs);
             for c in 0..d {
@@ -831,7 +848,7 @@ pub fn evidence_grad_rho(
                 for r0 in 0..d {
                     rhs[r0] = m_i[[r0, col]];
                 }
-                let v = chol_lower_solve_vector(&cache.htt_factors_undamped[i], &rhs);
+                let v = chol_lower_solve_vector(cache.undamped_factor(i), &rhs);
                 row_trace_acc += v[col];
             }
         }
@@ -1038,7 +1055,10 @@ fn topology_selection_score(candidate: &TopologyCandidate, scale: TopologyScoreS
 /// Matrix-free callers can instead pass an HVP fallback to
 /// [`laplace_evidence`].
 pub fn cache_supports_exact_evidence(cache: &ArrowFactorCache) -> bool {
-    cache.ridge_t == 0.0 && cache.ridge_beta == 0.0 && cache.schur_factor.is_some()
+    cache.ridge_t == 0.0
+        && cache.ridge_beta == 0.0
+        && cache.schur_factor.is_some()
+        && cache.htbeta_available()
 }
 
 /// Verifies the `ArrowSchurSystem` dimensions match the cache. Used as
@@ -1047,8 +1067,8 @@ pub fn cache_supports_exact_evidence(cache: &ArrowFactorCache) -> bool {
 pub fn cache_matches_system(cache: &ArrowFactorCache, sys: &ArrowSchurSystem) -> bool {
     cache.d == sys.d
         && cache.k == sys.k
-        && cache.htbeta.len() == sys.rows.len()
-        && cache.htt_factors_undamped.len() == sys.rows.len()
+        && cache.n_rows() == sys.rows.len()
+        && cache.undamped_factor_count() == sys.rows.len()
         && cache.manifold_mode_fingerprint == sys.manifold_mode_fingerprint
         && cache.row_hessian_fingerprint == sys.current_row_hessian_fingerprint()
 }
@@ -1101,15 +1121,18 @@ mod tests {
         // H_uβ_1 = [[0.5]], A = 2 - 0.5 * 0.5 / 2 = 1.875.
         let l_huu = Array2::from_shape_vec((1, 1), vec![std::f64::consts::SQRT_2]).unwrap();
         let l_schur = Array2::from_shape_vec((1, 1), vec![(1.875_f64).sqrt()]).unwrap();
-        let htbeta = vec![Array2::from_shape_vec((1, 1), vec![0.5]).unwrap()];
+        let htbeta = Array2::from_shape_vec((1, 1), vec![0.5]).unwrap();
         ArrowFactorCache {
-            htt_factors: vec![l_huu.clone()],
-            htt_factors_undamped: vec![l_huu],
+            htt_factors: std::sync::Arc::from(vec![l_huu]),
+            htt_factors_undamped: crate::solver::arrow_schur::ArrowUndampedFactors::SameAsDamped,
             schur_factor: Some(l_schur),
             solver_mode: crate::solver::arrow_schur::ArrowSolverMode::Direct,
             ridge_t: 0.0,
             ridge_beta: 0.0,
-            htbeta,
+            htbeta: crate::solver::arrow_schur::ArrowHtbetaCache::Dense {
+                blocks: std::sync::Arc::from(vec![htbeta]),
+                estimated_bytes: std::mem::size_of::<f64>(),
+            },
             d: 1,
             k: 1,
             manifold_mode_fingerprint: 0,

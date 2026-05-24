@@ -6210,6 +6210,8 @@ fn gaussian_joint_psisecondweights(
                 + (2.0 * ki * kpi * ni + kdpi * amn) * eab,
         );
     }
+    // SAFETY: every `MaybeUninit` slot in each field array was written
+    // exactly once inside the `for i in 0..nobs` loop above.
     unsafe {
         GaussianJointPsiSecondWeights {
             objective_psi_psirow: objective_psi_psirow.assume_init(),
@@ -6301,6 +6303,8 @@ fn gaussian_joint_psi_mixed_driftweights(
                 + (2.0 * ki * kpi * ni + kdpi * amn) * dea,
         );
     }
+    // SAFETY: every `MaybeUninit` slot in each field array was written
+    // exactly once inside the `for i in 0..nobs` loop above.
     unsafe {
         GaussianJointPsiMixedDriftWeights {
             dhmumu_u: dhmumu_u.assume_init(),

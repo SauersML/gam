@@ -2689,6 +2689,19 @@ pub(crate) struct HyperDesignDerivative {
 }
 
 impl HyperDesignDerivative {
+    pub(crate) fn resident_byte_count(&self) -> usize {
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => dense
+                .len()
+                .saturating_mul(std::mem::size_of::<f64>()),
+            DerivativeMatrixStorage::Embedded(embedded) => embedded
+                .local
+                .len()
+                .saturating_mul(std::mem::size_of::<f64>()),
+            DerivativeMatrixStorage::Implicit(_) | DerivativeMatrixStorage::LatentCoord(_) => 0,
+        }
+    }
+
     pub(crate) fn from_embedded(
         local: Array2<f64>,
         global_range: Range<usize>,
@@ -3029,6 +3042,19 @@ pub(crate) struct HyperPenaltyDerivative {
 }
 
 impl HyperPenaltyDerivative {
+    pub(crate) fn resident_byte_count(&self) -> usize {
+        match &self.storage {
+            DerivativeMatrixStorage::Dense(dense) => dense
+                .len()
+                .saturating_mul(std::mem::size_of::<f64>()),
+            DerivativeMatrixStorage::Embedded(embedded) => embedded
+                .local
+                .len()
+                .saturating_mul(std::mem::size_of::<f64>()),
+            DerivativeMatrixStorage::Implicit(_) | DerivativeMatrixStorage::LatentCoord(_) => 0,
+        }
+    }
+
     pub(crate) fn from_embedded(
         local: Array2<f64>,
         global_range: Range<usize>,
@@ -3219,6 +3245,26 @@ pub(crate) struct DirectionalHyperParam {
 }
 
 impl DirectionalHyperParam {
+    pub(crate) fn resident_byte_count(&self) -> usize {
+        let mut bytes = self.x_tau_original.resident_byte_count();
+        for component in &self.penalty_first_components {
+            bytes = bytes.saturating_add(component.matrix.resident_byte_count());
+        }
+        if let Some(entries) = self.x_tau_tau_original.as_ref() {
+            for entry in entries.iter().flatten() {
+                bytes = bytes.saturating_add(entry.resident_byte_count());
+            }
+        }
+        if let Some(rows) = self.penaltysecond_components.as_ref() {
+            for components in rows.iter().flatten() {
+                for component in components {
+                    bytes = bytes.saturating_add(component.matrix.resident_byte_count());
+                }
+            }
+        }
+        bytes
+    }
+
     fn canonicalize_penalty_components(
         components: Vec<(usize, HyperPenaltyDerivative)>,
     ) -> Result<Vec<PenaltyDerivativeComponent>, EstimationError> {
