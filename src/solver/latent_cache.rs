@@ -170,6 +170,7 @@ pub(crate) enum LatentBasisKind {
         length_scale: f64,
         nu: MaternNu,
         aniso_log_scales: Vec<f64>,
+        chunk_size: Option<usize>,
     },
     Duchon {
         centers: Array2<f64>,
@@ -213,6 +214,16 @@ impl LatentBasisKind {
         }
     }
 
+    fn streams_radial_cache(&self) -> bool {
+        matches!(
+            self,
+            Self::Matern {
+                chunk_size: Some(_),
+                ..
+            }
+        )
+    }
+
     fn cache_digest(&self) -> CacheDigest {
         let mut hasher = CacheDigestBuilder::new("latent-basis-v1");
         match self {
@@ -221,6 +232,7 @@ impl LatentBasisKind {
                 length_scale,
                 nu,
                 aniso_log_scales,
+                chunk_size,
             } => {
                 hasher.write_usize(0);
                 hasher.write_usize(centers.nrows());
@@ -228,6 +240,7 @@ impl LatentBasisKind {
                 hasher.write_f64(*length_scale);
                 hasher.write_usize(matern_nu_signature(*nu));
                 hash_f64_slice(aniso_log_scales, &mut hasher);
+                hash_optional_usize(*chunk_size, &mut hasher);
                 hash_matrix(centers, &mut hasher);
             }
             Self::Duchon {
@@ -358,6 +371,18 @@ fn hash_optional_f64(value: Option<f64>, hasher: &mut CacheDigestBuilder) {
         Some(value) => {
             hasher.write_bool(true);
             hasher.write_f64(value);
+        }
+        None => {
+            hasher.write_bool(false);
+        }
+    }
+}
+
+fn hash_optional_usize(value: Option<usize>, hasher: &mut CacheDigestBuilder) {
+    match value {
+        Some(value) => {
+            hasher.write_bool(true);
+            hasher.write_usize(value);
         }
         None => {
             hasher.write_bool(false);
@@ -752,12 +777,19 @@ impl LatentDesignCache {
         }
 
         let computed = compute()?;
-        let radial_distances = match basis_kind.centers() {
-            Some(centers) => build_radial_distances(&latent, centers)?,
-            None => RadialDistanceMatrices {
+        let radial_distances = if basis_kind.streams_radial_cache() {
+            RadialDistanceMatrices {
                 squared: Array2::<f64>::zeros((0, 0)),
                 distance: Array2::<f64>::zeros((0, 0)),
-            },
+            }
+        } else {
+            match basis_kind.centers() {
+                Some(centers) => build_radial_distances(&latent, centers)?,
+                None => RadialDistanceMatrices {
+                    squared: Array2::<f64>::zeros((0, 0)),
+                    distance: Array2::<f64>::zeros((0, 0)),
+                },
+            }
         };
         let basis_derivative_jets =
             build_basis_derivative_jets(&latent, &basis_kind, &radial_distances)?;
@@ -969,8 +1001,19 @@ fn build_basis_derivative_jets(
 ) -> Result<BasisDerivativeJets, EstimationError> {
     match basis_kind {
         LatentBasisKind::Matern {
-            length_scale, nu, ..
+            length_scale,
+            nu,
+            chunk_size,
+            ..
         } => {
+            if chunk_size.is_some() {
+                drop(latent);
+                drop(distances);
+                return Ok(BasisDerivativeJets {
+                    operator_resident: true,
+                    ..BasisDerivativeJets::empty()
+                });
+            }
             let radial = RadialScalarKind::Matern {
                 length_scale: *length_scale,
                 nu: *nu,
