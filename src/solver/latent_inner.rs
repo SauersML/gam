@@ -483,9 +483,10 @@ mod tests {
     impl ArrowSystemAssembler for ZeroAssembler {
         fn assemble(
             &mut self,
-            _beta: ArrayView1<'_, f64>,
-            _latent: &LatentCoordValues,
+            beta: ArrayView1<'_, f64>,
+            latent: &LatentCoordValues,
         ) -> Result<ArrowSchurSystem, String> {
+            drop((beta, latent));
             let mut sys = ArrowSchurSystem::new(self.n, self.d, self.k);
             for j in 0..self.k {
                 sys.hbb[[j, j]] = 1.0;
@@ -500,9 +501,10 @@ mod tests {
 
         fn objective(
             &mut self,
-            _beta: ArrayView1<'_, f64>,
-            _latent: &LatentCoordValues,
+            beta: ArrayView1<'_, f64>,
+            latent: &LatentCoordValues,
         ) -> Result<f64, String> {
+            drop((beta, latent));
             Ok(0.0)
         }
     }

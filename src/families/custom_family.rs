@@ -19624,14 +19624,16 @@ mod tests {
             })
         }
 
-        fn outer_hyper_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+        fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+            drop(specs);
             true
         }
 
         fn outer_hyper_hessian_operator(
             &self,
-            _specs: &[ParameterBlockSpec],
+            specs: &[ParameterBlockSpec],
         ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+            drop(specs);
             Some(Arc::new(TestOuterHessianOperator {
                 matrix: self.matrix.clone(),
             }))
