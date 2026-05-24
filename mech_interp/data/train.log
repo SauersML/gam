@@ -1,0 +1,49 @@
+device: mps
+tokens: 5499572, vocab: 1443
+[lm] config: LMConfig(vocab_size=1443, d_model=256, n_layers=4, n_heads=4, d_ff=1024, max_seq_len=256, dropout=0.0)
+[lm] params: 3.59M
+[lm] training windows: torch.Size([42964, 257])
+[lm] step 0/1000  loss 7.348  ppl 1552.8  1s
+[lm] step 100/1000  loss 1.576  ppl 4.8  26s
+[lm] step 200/1000  loss 0.713  ppl 2.0  52s
+[lm] step 300/1000  loss 0.605  ppl 1.8  77s
+[lm] step 400/1000  loss 0.565  ppl 1.8  101s
+[lm] step 500/1000  loss 0.549  ppl 1.7  125s
+[lm] step 600/1000  loss 0.535  ppl 1.7  151s
+[lm] step 700/1000  loss 0.543  ppl 1.7  176s
+[lm] step 800/1000  loss 0.517  ppl 1.7  201s
+[lm] step 900/1000  loss 0.514  ppl 1.7  226s
+[ok] saved LM to data/tok/lm.pt
+[harvest] total positions available: 5499392, capping at 80000
+[sae] config: SAEConfig(d_model=256, dict_size=4096, k=16, dead_feature_threshold_steps=200), acts: (80000, 256)
+[sae] step 0/3000  recon 52.944  expl 0.251  dead 0/4096  2s
+[sae] step 100/3000  recon 7.091  expl 0.900  dead 0/4096  6s
+[sae] step 200/3000  recon 1.362  expl 0.981  dead 0/4096  10s
+[sae] step 300/3000  recon 1.088  expl 0.985  dead 0/4096  13s
+[sae] step 400/3000  recon 0.953  expl 0.987  dead 0/4096  17s
+[sae] step 500/3000  recon 0.875  expl 0.988  dead 0/4096  20s
+[sae] step 600/3000  recon 0.826  expl 0.988  dead 0/4096  24s
+[sae] step 700/3000  recon 0.788  expl 0.989  dead 0/4096  27s
+[sae] step 800/3000  recon 0.754  expl 0.989  dead 0/4096  31s
+[sae] step 900/3000  recon 0.730  expl 0.990  dead 0/4096  34s
+[sae] step 1000/3000  recon 0.714  expl 0.990  dead 745/4096  39s
+[sae] step 1100/3000  recon 0.697  expl 0.990  dead 1089/4096  42s
+[sae] step 1200/3000  recon 0.686  expl 0.990  dead 1453/4096  46s
+[sae] step 1300/3000  recon 0.673  expl 0.990  dead 1711/4096  50s
+[sae] step 1400/3000  recon 0.663  expl 0.991  dead 1935/4096  54s
+[sae] step 1500/3000  recon 0.650  expl 0.991  dead 2105/4096  58s
+[sae] step 1600/3000  recon 0.642  expl 0.991  dead 2234/4096  62s
+[sae] step 1700/3000  recon 0.636  expl 0.991  dead 2366/4096  66s
+[sae] step 1800/3000  recon 0.629  expl 0.991  dead 2531/4096  70s
+[sae] step 1900/3000  recon 0.622  expl 0.991  dead 2691/4096  74s
+[sae] step 2000/3000  recon 0.619  expl 0.991  dead 2806/4096  77s
+[sae] step 2100/3000  recon 0.615  expl 0.991  dead 2918/4096  81s
+[sae] step 2200/3000  recon 0.610  expl 0.991  dead 2980/4096  84s
+[sae] step 2300/3000  recon 0.606  expl 0.991  dead 3073/4096  88s
+[sae] step 2400/3000  recon 0.605  expl 0.991  dead 3130/4096  91s
+[sae] step 2500/3000  recon 0.603  expl 0.991  dead 3191/4096  95s
+[sae] step 2600/3000  recon 0.599  expl 0.992  dead 3268/4096  98s
+[sae] step 2700/3000  recon 0.601  expl 0.992  dead 3345/4096  101s
+[sae] step 2800/3000  recon 0.600  expl 0.992  dead 3381/4096  105s
+[sae] step 2900/3000  recon 0.598  expl 0.992  dead 3416/4096  108s
+[ok] saved SAE to data/tok/sae.pt

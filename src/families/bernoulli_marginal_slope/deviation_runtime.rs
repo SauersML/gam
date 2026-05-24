@@ -174,11 +174,7 @@ fn raw_integrated_derivative_penalty(
         || raw_span_c2.ncols() != raw_dim
         || raw_span_c3.ncols() != raw_dim
     {
-        return Err(DeviationRuntimeError::DimensionMismatch {
-            reason: "raw smoothness penalty: span coefficient column dimensions disagree"
-                .to_string(),
-        }
-        .into());
+        return Err("raw smoothness penalty: span coefficient column dimensions disagree".into());
     }
     let mut penalty = Array2::<f64>::zeros((raw_dim, raw_dim));
     for span_idx in 0..n_spans {
@@ -186,10 +182,9 @@ fn raw_integrated_derivative_penalty(
         let right = endpoint_points[span_idx + 1];
         let width = right - left;
         if !width.is_finite() || width <= 0.0 {
-            return Err(DeviationRuntimeError::InvalidInput {
-                reason: format!("raw smoothness penalty span {span_idx} has invalid width {width}"),
-            }
-            .into());
+            return Err(format!(
+                "raw smoothness penalty span {span_idx} has invalid width {width}"
+            ));
         }
         for i in 0..raw_dim {
             let ci = raw_span_derivative_polynomial_coefficients(
@@ -265,21 +260,14 @@ fn smoothness_nullspace_orthogonal_complement(
 ) -> Result<Array2<f64>, String> {
     let n = raw_penalty.nrows();
     if raw_penalty.ncols() != n {
-        return Err(DeviationRuntimeError::DimensionMismatch {
-            reason: "smoothness penalty matrix must be square for null-space drop".to_string(),
-        }
-        .into());
+        return Err("smoothness penalty matrix must be square for null-space drop".to_string());
     }
-    let (eigenvalues, eigenvectors) = raw_penalty.eigh(faer::Side::Lower).map_err(|e| {
-        String::from(DeviationRuntimeError::NumericalFailure {
-            reason: format!("raw smoothness penalty eigendecomposition failed: {e}"),
-        })
-    })?;
-    let evals = eigenvalues.as_slice().ok_or_else(|| {
-        String::from(DeviationRuntimeError::NumericalFailure {
-            reason: "raw smoothness penalty eigenvalues are not contiguous".to_string(),
-        })
-    })?;
+    let (eigenvalues, eigenvectors) = raw_penalty
+        .eigh(faer::Side::Lower)
+        .map_err(|e| format!("raw smoothness penalty eigendecomposition failed: {e}"))?;
+    let evals = eigenvalues
+        .as_slice()
+        .ok_or_else(|| "raw smoothness penalty eigenvalues are not contiguous".to_string())?;
     let threshold = crate::estimate::reml::unified::positive_eigenvalue_threshold(evals);
     let kept: Vec<usize> = evals
         .iter()
@@ -474,23 +462,18 @@ impl DeviationRuntime {
         let raw_right_boundary_value_row = raw_right_boundary_values.row(0).to_owned();
 
         if max_penalty_derivative_order == 0 {
-            return Err(DeviationRuntimeError::InvalidInput {
-                reason:
-                    "DeviationRuntime requires max_penalty_derivative_order >= 1 so the basis can \
+            return Err(
+                "DeviationRuntime requires max_penalty_derivative_order >= 1 so the basis can \
                  drop the corresponding smoothness null space; an order-0 (mass) penalty alone \
                  has no null space and would not require any drop"
-                        .to_string(),
-            }
-            .into());
+                    .to_string(),
+            );
         }
         if max_penalty_derivative_order > 3 {
-            return Err(DeviationRuntimeError::InvalidInput {
-                reason: format!(
-                    "DeviationRuntime cubic basis supports derivative orders up to 3; got max \
-                     penalty derivative order {max_penalty_derivative_order}"
-                ),
-            }
-            .into());
+            return Err(format!(
+                "DeviationRuntime cubic basis supports derivative orders up to 3; got max \
+                 penalty derivative order {max_penalty_derivative_order}"
+            ));
         }
         let raw_smoothness_penalty = raw_integrated_derivative_penalty(
             &endpoint_points,

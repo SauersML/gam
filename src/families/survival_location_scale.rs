@@ -10162,11 +10162,9 @@ pub(crate) fn fit_survival_location_scale_terms(
             .map_err(|e| e.to_string())?;
             exact_warm_start.replace(Some(eval.warm_start.clone()));
             if !eval.inner_converged {
-                return Err(SurvivalLocationScaleError::InvalidConfiguration {
-                    reason: "survival location-scale exact joint inner solve did not converge"
-                        .to_string(),
-                }
-                .into());
+                return Err(
+                    "survival location-scale exact joint inner solve did not converge".to_string(),
+                );
             }
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
@@ -10207,11 +10205,10 @@ pub(crate) fn fit_survival_location_scale_terms(
             .map_err(|e| e.to_string())?;
             exact_warm_start.replace(Some(eval.warm_start.clone()));
             if !eval.inner_converged {
-                return Err(SurvivalLocationScaleError::InvalidConfiguration {
-                    reason: "survival location-scale exact joint EFS inner solve did not converge"
+                return Err(
+                    "survival location-scale exact joint EFS inner solve did not converge"
                         .to_string(),
-                }
-                .into());
+                );
             }
             Ok(eval.efs_eval)
         },

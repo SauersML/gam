@@ -135,25 +135,6 @@ pub struct SurvivalPredictResult {
     pub eta_se: Option<Array1<f64>>,
 }
 
-/// Joint cause-specific competing-risks prediction result.
-pub struct CompetingRisksPredictResult {
-    pub times: Vec<f64>,
-    pub endpoint_names: Vec<String>,
-    /// Cause-specific instantaneous hazards, shaped endpoint x row x time.
-    pub hazard: Vec<Array2<f64>>,
-    /// Endpoint-specific survival surfaces exp(-H_k(t)), endpoint x row x time.
-    pub survival: Vec<Array2<f64>>,
-    /// Cause-specific cumulative hazards, endpoint x row x time.
-    pub cumulative_hazard: Vec<Array2<f64>>,
-    /// Aalen-Johansen cumulative incidence, endpoint x row x time.
-    pub cif: Vec<Array2<f64>>,
-    /// Overall survival exp(-sum_k H_k(t)), row x time.
-    pub overall_survival: Array2<f64>,
-    /// Per-endpoint linear predictor at each row's own exit time, endpoint x row.
-    pub linear_predictor: Vec<Array1<f64>>,
-    pub likelihood_mode: SurvivalLikelihoodMode,
-}
-
 /// Run the survival prediction pipeline.
 ///
 /// Pure library function: no progress bars, no file I/O, no uncertainty
@@ -260,13 +241,11 @@ pub fn predict_survival(
         );
     }
     if with_uncertainty {
-        return Err(SurvivalPredictError::UnsupportedConfiguration {
-            reason: format!(
-                "predict_survival: with_uncertainty is currently supported only for the \
+        return Err(format!(
+            "predict_survival: with_uncertainty is currently supported only for the \
              location-scale likelihood mode; got {}",
-                survival_likelihood_modename(saved_likelihood_mode)
-            ),
-        });
+            survival_likelihood_modename(saved_likelihood_mode)
+        ));
     }
 
     // Ambient time basis: built once with (age_entry, age_exit) so that
@@ -1366,7 +1345,7 @@ fn predict_survival_location_scale_batch(
     data: ArrayView2<'_, f64>,
     time_grid: Option<&[f64]>,
     with_uncertainty: bool,
-) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+) -> Result<SurvivalPredictResult, String> {
     use crate::families::scale_design::build_scale_deviation_operator;
     use crate::families::survival_construction::evaluate_survival_time_basis_row;
     use crate::families::survival_location_scale::{
@@ -1605,7 +1584,7 @@ fn predict_survival_location_scale_batch(
     ) = if with_uncertainty {
         let cov = saved_fit.beta_covariance().ok_or_else(|| {
             "survival location-scale uncertainty: saved fit is missing the \
-             posterior covariance; refit / library to \
+             posterior covariance; refit with the current CLI / library to \
              populate beta_covariance"
                 .to_string()
         })?;
@@ -1657,24 +1636,6 @@ fn predict_survival_location_scale_batch(
         .map_err(|err| format!("survival location-scale predict failed: {err}"))?;
         (pred.eta, pred.survival_prob, None, None)
     };
-    let x_time_derivative = time_build
-        .x_derivative_time
-        .try_to_dense_by_chunks("survival location-scale prediction time-derivative design")?;
-    let eta_derivative_full = location_scale_eta_derivative_components(
-        &x_time_derivative,
-        &derivative_offset_exit,
-        &pred_input.x_time_exit,
-        &pred_input.eta_time_offset_exit,
-        time_wiggle_knots.as_ref(),
-        time_wiggle_degree,
-        time_wiggle_ncols,
-        &saved_fit,
-    )?;
-    let hazard_full = location_scale_hazard_from_eta_derivative(
-        &eta_full,
-        &eta_derivative_full,
-        &saved_inverse_link,
-    )?;
 
     let mut survival = Array2::<f64>::zeros((n, t_cols));
     let mut cumulative_hazard = Array2::<f64>::zeros((n, t_cols));
@@ -1736,173 +1697,6 @@ fn prepared_sigma_design_view(
     input: &crate::families::survival_location_scale::SurvivalLocationScalePredictInput,
 ) -> &crate::matrix::DesignMatrix {
     &input.x_log_sigma
-}
-
-fn location_scale_eta_derivative_components(
-    x_time_derivative: &Array2<f64>,
-    derivative_offset_exit: &Array1<f64>,
-    x_time_exit: &Array2<f64>,
-    eta_time_offset_exit: &Array1<f64>,
-    time_wiggle_knots: Option<&Array1<f64>>,
-    time_wiggle_degree: Option<usize>,
-    time_wiggle_ncols: usize,
-    fit: &UnifiedFitResult,
-) -> Result<Array1<f64>, SurvivalPredictError> {
-    let n = x_time_exit.nrows();
-    if x_time_derivative.nrows() != n
-        || derivative_offset_exit.len() != n
-        || eta_time_offset_exit.len() != n
-    {
-        return Err(SurvivalPredictError::IncompatibleSchema {
-            reason: "survival location-scale hazard derivative row mismatch across inputs"
-                .to_string(),
-        });
-    }
-    let beta_time = fit.beta_time();
-    let p_time_total = beta_time.len();
-    let p_wiggle = time_wiggle_ncols.min(p_time_total);
-    let p_base = p_time_total - p_wiggle;
-    if x_time_exit.ncols() != p_time_total || x_time_derivative.ncols() != p_base {
-        return Err(SurvivalPredictError::IncompatibleSchema {
-            reason: format!(
-                "survival location-scale hazard derivative design mismatch: x_exit={} beta_time={} x_derivative={} base={}",
-                x_time_exit.ncols(),
-                p_time_total,
-                x_time_derivative.ncols(),
-                p_base
-            ),
-        });
-    }
-
-    let beta_base = beta_time.slice(s![..p_base]).to_owned();
-    let mut eta_derivative = if p_base > 0 {
-        x_time_derivative.dot(&beta_base) + derivative_offset_exit
-    } else {
-        derivative_offset_exit.clone()
-    };
-    if p_wiggle > 0 {
-        let knots = time_wiggle_knots.ok_or_else(|| {
-            "survival location-scale hazard derivative: timewiggle coefficients are missing knot metadata"
-                .to_string()
-        })?;
-        let degree = time_wiggle_degree.ok_or_else(|| {
-            "survival location-scale hazard derivative: timewiggle coefficients are missing degree metadata"
-                .to_string()
-        })?;
-        let beta_w = beta_time.slice(s![p_base..p_time_total]).to_owned();
-        let h_base = if p_base > 0 {
-            x_time_exit.slice(s![.., ..p_base]).dot(&beta_base) + eta_time_offset_exit
-        } else {
-            eta_time_offset_exit.clone()
-        };
-        let basis_d1 = crate::families::gamlss::monotone_wiggle_basis_with_derivative_order(
-            h_base.view(),
-            knots,
-            degree,
-            1,
-        )?;
-        if basis_d1.ncols() != p_wiggle {
-            return Err(SurvivalPredictError::IncompatibleSchema {
-                reason: format!(
-                    "survival location-scale hazard derivative timewiggle mismatch: derivative basis has {} columns but beta has {}",
-                    basis_d1.ncols(),
-                    p_wiggle
-                ),
-            });
-        }
-        eta_derivative *= &(basis_d1.dot(&beta_w) + 1.0);
-    }
-    if eta_derivative
-        .iter()
-        .any(|value| !(value.is_finite() && *value > 0.0))
-    {
-        return Err(SurvivalPredictError::NumericalFailure {
-            reason: "survival location-scale hazard derivative must be finite and positive"
-                .to_string(),
-        });
-    }
-    Ok(eta_derivative)
-}
-
-fn location_scale_hazard_from_eta_derivative(
-    eta: &Array1<f64>,
-    eta_derivative: &Array1<f64>,
-    inverse_link: &InverseLink,
-) -> Result<Array1<f64>, SurvivalPredictError> {
-    if eta.len() != eta_derivative.len() {
-        return Err(SurvivalPredictError::IncompatibleSchema {
-            reason: format!(
-                "survival location-scale hazard row mismatch: eta={} eta_derivative={}",
-                eta.len(),
-                eta_derivative.len()
-            ),
-        });
-    }
-    let values = eta
-        .iter()
-        .zip(eta_derivative.iter())
-        .map(|(&q, &q_t)| location_scale_hazard_component(q, q_t, inverse_link))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Array1::from_vec(values))
-}
-
-fn location_scale_hazard_component(
-    eta: f64,
-    eta_derivative: f64,
-    inverse_link: &InverseLink,
-) -> Result<f64, SurvivalPredictError> {
-    if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative > 0.0) {
-        return Err(SurvivalPredictError::NumericalFailure {
-            reason: format!(
-                "survival location-scale hazard requires finite eta and positive eta_t, got eta={eta}, eta_t={eta_derivative}"
-            ),
-        });
-    }
-    match inverse_link {
-        InverseLink::Standard(LinkFunction::Probit) => {
-            let (_, hazard) = probit_survival_hazard_components(eta, eta_derivative)?;
-            Ok(hazard)
-        }
-        InverseLink::Standard(LinkFunction::CLogLog) => {
-            let (_, hazard) = royston_parmar_survival_hazard_components(eta, eta_derivative)?;
-            Ok(hazard)
-        }
-        InverseLink::Standard(LinkFunction::Logit) => {
-            let failure = if eta >= 0.0 {
-                1.0 / (1.0 + (-eta).exp())
-            } else {
-                let exp_eta = eta.exp();
-                exp_eta / (1.0 + exp_eta)
-            };
-            Ok(failure * eta_derivative)
-        }
-        InverseLink::Standard(LinkFunction::Identity) => {
-            let survival = 1.0 - eta;
-            if !(survival.is_finite() && survival > 0.0) {
-                return Err(SurvivalPredictError::NumericalFailure {
-                    reason: format!(
-                        "survival location-scale identity link produced invalid survival={survival} at eta={eta}"
-                    ),
-                });
-            }
-            Ok(eta_derivative / survival)
-        }
-        _ => {
-            let jet = inverse_link_jet_for_inverse_link(inverse_link, eta)
-                .map_err(|err| format!("survival location-scale inverse-link jet failed: {err}"))?;
-            let survival = 1.0 - jet.mu;
-            let hazard = jet.d1 * eta_derivative / survival;
-            if !(survival.is_finite() && survival > 0.0 && hazard.is_finite() && hazard >= 0.0) {
-                return Err(SurvivalPredictError::NumericalFailure {
-                    reason: format!(
-                        "survival location-scale inverse link produced invalid hazard components: eta={eta}, eta_t={eta_derivative}, failure={}, d_failure={}, survival={survival}, hazard={hazard}",
-                        jet.mu, jet.d1
-                    ),
-                });
-            }
-            Ok(hazard)
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

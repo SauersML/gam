@@ -195,40 +195,18 @@ class SurvivalPrediction:
         ``(n_samples, len(times))`` dense hazard surface from the FFI.
     survival : ndarray or None
         ``(n_samples, len(times))`` dense survival surface from the FFI.
-    cumulative_hazard : ndarray or None
-        ``(n_samples, len(times))`` dense cumulative-hazard surface from
-        the FFI.
-    linear_predictor : ndarray or None
-        ``(n_samples,)`` per-row linear predictor at each row's own exit
-        time.
-    id_column : str or None
-        Optional name of the id column carried through from
-        :meth:`Model.predict` for use by :meth:`write_survival_at_csv`.
-    row_ids : sequence of str or None
-        Per-row identifiers aligned with ``parameters`` rows, populated
-        when ``id_column`` was supplied to :meth:`Model.predict`.
-    survival_se : ndarray or None
+    cumulative_hazard:
+        ``(n_samples, len(times))`` dense cumulative-hazard surface from the FFI.
+    linear_predictor:
+        ``(n_samples,)`` per-row linear predictor at each row's own exit time.
+    survival_se:
         ``(n_samples, len(times))`` delta-method standard errors on the
-        survival surface (response scale). ``None`` unless the
-        prediction was issued with ``with_uncertainty=True``; then
-        populated for location-scale survival models.
-    eta_se : ndarray or None
+        survival surface (response scale).  ``None`` unless the prediction
+        was issued with ``with_uncertainty=True``; then populated for
+        location-scale survival models.
+    eta_se:
         ``(n_samples,)`` delta-method SE on the linear predictor at each
-        row's own exit time, under the same conditions as
-        ``survival_se``.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> pred = model.predict(test_df)        # survival model
-    >>> times = np.linspace(0.0, 10.0, 50)
-    >>> S = pred.survival_at(times)          # (n_rows, 50) ndarray
-    >>> h = pred.hazard_at(times)
-    >>> H = pred.cumulative_hazard_at(times)
-
-    See Also
-    --------
-    Model.predict : Returns a :class:`SurvivalPrediction` for survival models.
+        row's own exit time, under the same conditions as ``survival_se``.
     """
 
     model_class: str
@@ -302,36 +280,8 @@ class SurvivalPrediction:
     def hazard_at(self, times: Any) -> Any:
         """Evaluate the hazard rate ``h(t)`` at each requested time.
 
-        When the FFI produced a dense hazard surface this linearly
-        interpolates against the returned grid; otherwise the hazard is
-        reconstructed from the cumulative-hazard differences. Large
-        requests are evaluated in chunks internally before assembling
-        the dense result.
-
-        Parameters
-        ----------
-        times : array_like
-            1-D sequence of finite, non-negative times at which to
-            evaluate the per-row hazard.
-
-        Returns
-        -------
-        ndarray
-            ``(n_samples, len(times))`` array of non-negative hazard
-            values, one row per prediction sample.
-
-        Examples
-        --------
-        >>> import numpy as np
-        >>> pred = model.predict(test_df)
-        >>> h = pred.hazard_at(np.linspace(0.0, 5.0, 11))
-        >>> h.shape
-        (len(test_df), 11)
-
-        See Also
-        --------
-        SurvivalPrediction.hazard_at_chunks : streaming chunked variant.
-        SurvivalPrediction.cumulative_hazard_at
+        Returns an ``(n_samples, len(times))`` numpy array. Large requests are
+        evaluated in chunks internally before assembling the dense result.
         """
         times_arr = self._coerce_times(times)
         hazard = self._ffi_surface_at("hazard", times_arr, clip=(0.0, None))
@@ -349,36 +299,7 @@ class SurvivalPrediction:
         return self._hazard_from_cumulative(times_arr, cumulative)
 
     def cumulative_hazard_at(self, times: Any) -> Any:
-        """Evaluate the cumulative hazard ``H(t) = -log S(t)``.
-
-        When the FFI provided a dense cumulative-hazard surface this
-        interpolates against it directly; otherwise ``H(t)`` is derived
-        from :meth:`survival_at` via ``-log S(t)`` (clipped away from
-        zero for numerical safety).
-
-        Parameters
-        ----------
-        times : array_like
-            1-D sequence of finite, non-negative times.
-
-        Returns
-        -------
-        ndarray
-            ``(n_samples, len(times))`` array of non-negative cumulative
-            hazard values.
-
-        Examples
-        --------
-        >>> import numpy as np
-        >>> H = pred.cumulative_hazard_at(np.array([1.0, 2.0, 5.0]))
-        >>> np.all(np.diff(H, axis=1) >= 0)   # monotone non-decreasing
-        True
-
-        See Also
-        --------
-        SurvivalPrediction.survival_at
-        SurvivalPrediction.hazard_at
-        """
+        """Cumulative hazard ``H(t) = -log S(t)`` at each requested time."""
         import numpy as np
 
         times_arr = self._coerce_times(times)
@@ -393,38 +314,12 @@ class SurvivalPrediction:
     def survival_at(self, times: Any) -> Any:
         """Evaluate the survival probability ``S(t)`` at each requested time.
 
-        When the FFI produced a dense hazard/survival surface this
-        linearly interpolates against the returned grid. Otherwise it
-        falls back to the plug-in identity ``S(t) = exp(-H(t))`` using
-        a per-row piecewise-constant hazard derived from
-        ``parameters`` (supports bare-dataclass construction). Large
-        requests are evaluated in chunks internally before assembling
-        the dense result.
-
-        Parameters
-        ----------
-        times : array_like
-            1-D sequence of finite, non-negative times.
-
-        Returns
-        -------
-        ndarray
-            ``(n_samples, len(times))`` array of survival probabilities
-            in ``[0, 1]``.
-
-        Examples
-        --------
-        >>> import numpy as np
-        >>> times = np.linspace(0.0, 5.0, 6)
-        >>> S = pred.survival_at(times)
-        >>> S[:, 0]                  # S(0) is 1 for every row
-        array([1., 1., ..., 1.])
-
-        See Also
-        --------
-        SurvivalPrediction.failure_at : returns ``1 - S(t)``.
-        SurvivalPrediction.survival_se_at : delta-method standard error.
-        SurvivalPrediction.survival_at_chunks : streaming chunked variant.
+        When the FFI produced a dense hazard/survival surface we
+        linearly interpolate against the returned grid. Otherwise we
+        fall back to the plug-in identity ``S(t) = exp(-H(t))`` using a
+        per-row piecewise-constant hazard derived from ``parameters``
+        for bare-dataclass construction. Large requests are evaluated in
+        chunks internally before assembling the dense result.
         """
         times_arr = self._coerce_times(times)
         survival = self._ffi_surface_at("survival", times_arr, clip=(0.0, 1.0))
@@ -440,77 +335,14 @@ class SurvivalPrediction:
             )
         return self._survival_block(params, times_arr)
 
-    def failure_at(self, times: Any) -> Any:
-        """Evaluate the failure (event) probability ``F(t) = 1 - S(t)``.
-
-        Convenience wrapper around :meth:`survival_at`; the output is
-        clipped to ``[0, 1]`` to guard against tiny interpolation
-        excursions.
-
-        Parameters
-        ----------
-        times : array_like
-            1-D sequence of finite, non-negative times.
-
-        Returns
-        -------
-        ndarray
-            ``(n_samples, len(times))`` array of failure probabilities
-            in ``[0, 1]``.
-
-        Examples
-        --------
-        >>> F = pred.failure_at([1.0, 5.0, 10.0])
-        >>> F.shape[1]
-        3
-
-        See Also
-        --------
-        SurvivalPrediction.survival_at
-        """
-        import numpy as np
-
-        survival = np.asarray(self.survival_at(times), dtype=float)
-        return np.clip(1.0 - survival, 0.0, 1.0)
-
     def survival_se_at(self, times: Any) -> Any:
         """Delta-method standard error on ``S(t)`` at each requested time.
 
         Returns ``None`` when the prediction was not issued with
         ``with_uncertainty=True`` (or the model class does not yet
-        support response-scale uncertainty). When available, the
+        support response-scale uncertainty).  When available, the
         returned array has shape ``(n_samples, len(times))`` and is
         clipped to be non-negative.
-
-        Parameters
-        ----------
-        times : array_like
-            1-D sequence of finite, non-negative times.
-
-        Returns
-        -------
-        ndarray or None
-            ``(n_samples, len(times))`` array of standard errors on the
-            survival surface, or ``None`` if no uncertainty was
-            requested.
-
-        Notes
-        -----
-        Pair with :meth:`survival_at` for response-scale Wald-style
-        bands: ``S +/- z * SE`` with the standard caveats around the
-        Gaussian approximation near the ``[0, 1]`` boundaries.
-
-        Examples
-        --------
-        >>> pred = model.predict(test_df, with_uncertainty=True)
-        >>> S = pred.survival_at([1.0, 2.0])
-        >>> SE = pred.survival_se_at([1.0, 2.0])
-        >>> lower = (S - 1.96 * SE).clip(0.0, 1.0)
-
-        See Also
-        --------
-        SurvivalPrediction.survival_at
-        Model.predict : pass ``with_uncertainty=True`` to populate this.
         """
         if self.survival_se is None:
             return None
@@ -596,46 +428,7 @@ class SurvivalPrediction:
         people_chunk: int = DEFAULT_SURVIVAL_PEOPLE_CHUNK,
         time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
     ) -> Any:
-        """Yield ``S(t)`` evaluations in row/time blocks.
-
-        Streaming counterpart to :meth:`survival_at` for queries large
-        enough that the dense ``(n_samples, len(times))`` allocation is
-        unwelcome. Each yielded block can be consumed (written to disk,
-        reduced, fed into a metric) and discarded before the next one
-        is produced.
-
-        Parameters
-        ----------
-        times : array_like
-            1-D sequence of finite, non-negative times.
-        people_chunk : int, optional
-            Maximum number of rows per yielded block. Defaults to
-            ``DEFAULT_SURVIVAL_PEOPLE_CHUNK`` (50 000).
-        time_grid_chunk : int, optional
-            Maximum number of time points per yielded block. Defaults
-            to ``DEFAULT_SURVIVAL_TIME_GRID_CHUNK`` (64).
-
-        Yields
-        ------
-        tuple of (slice, slice, ndarray)
-            ``(row_slice, time_slice, block)`` where ``block`` has
-            shape ``(row_slice.stop - row_slice.start,
-            time_slice.stop - time_slice.start)`` and the slices index
-            into the full ``(n_samples, len(times))`` result.
-
-        Examples
-        --------
-        >>> import numpy as np
-        >>> times = np.linspace(0.0, 10.0, 200)
-        >>> total = 0.0
-        >>> for _r, _t, block in pred.survival_at_chunks(times):
-        ...     total += float(block.sum())
-
-        See Also
-        --------
-        SurvivalPrediction.survival_at
-        SurvivalPrediction.write_survival_at_csv
-        """
+        """Yield ``(row_slice, time_slice, survival_block)`` chunks."""
         times_arr = self._coerce_times(times)
         ffi_chunks = self._ffi_surface_at_chunks(
             "survival",
@@ -731,43 +524,7 @@ class SurvivalPrediction:
         people_chunk: int = DEFAULT_SURVIVAL_PEOPLE_CHUNK,
         time_grid_chunk: int = DEFAULT_SURVIVAL_TIME_GRID_CHUNK,
     ) -> Any:
-        """Yield ``h(t)`` evaluations in row/time blocks.
-
-        Streaming counterpart to :meth:`hazard_at`. When the FFI
-        provided a dense hazard surface this iterates that surface
-        directly; otherwise the hazard is derived from successive
-        cumulative-hazard blocks, carrying the previous block's tail
-        forward so the finite-difference at each block boundary stays
-        consistent with the non-chunked :meth:`hazard_at` result.
-
-        Parameters
-        ----------
-        times : array_like
-            1-D sequence of finite, non-negative times.
-        people_chunk : int, optional
-            Maximum number of rows per yielded block. Defaults to
-            ``DEFAULT_SURVIVAL_PEOPLE_CHUNK``.
-        time_grid_chunk : int, optional
-            Maximum number of time points per yielded block. Defaults
-            to ``DEFAULT_SURVIVAL_TIME_GRID_CHUNK``.
-
-        Yields
-        ------
-        tuple of (slice, slice, ndarray)
-            ``(row_slice, time_slice, block)`` of non-negative hazard
-            values with shape matching the slice extents.
-
-        Examples
-        --------
-        >>> peak = 0.0
-        >>> for _r, _t, h_block in pred.hazard_at_chunks(times):
-        ...     peak = max(peak, float(h_block.max()))
-
-        See Also
-        --------
-        SurvivalPrediction.hazard_at
-        SurvivalPrediction.cumulative_hazard_at_chunks
-        """
+        """Yield ``(row_slice, time_slice, hazard_block)`` chunks."""
         times_arr = self._coerce_times(times)
         ffi_chunks = self._ffi_surface_at_chunks(
             "hazard",
@@ -925,36 +682,20 @@ class Model:
           DataFrame, pyarrow Table, ...) matching the training table kind
           with an ``eta`` and ``mean`` column (plus interval columns when
           ``interval`` is given).
-        * Transformation-normal models: a per-row transformed z-score as a
-          1-D numpy array of shape ``(n_samples,)``.
-        * Bernoulli marginal-slope: a calibrated probability vector in
-          ``(0, 1)`` as a 1-D numpy array of shape ``(n_samples,)``.
-        * Survival models: a :class:`SurvivalPrediction` whose
-          ``.hazard_at``, ``.survival_at``, ``.failure_at``, and
-          ``.cumulative_hazard_at`` helpers evaluate the fitted hazard
-          surface on a user-supplied time grid.
-
-        Passing ``id_column`` or ``return_type`` switches the
-        array-returning model classes (transformation-normal and
-        Bernoulli marginal-slope) to the **table form**: a 2-column table
-        ``(id_column, "z" or "mean")`` rather than a bare 1-D array.
-        Naively flattening that table with ``np.asarray(...)`` /
-        ``.to_numpy()`` yields shape ``(n_samples, 2)``, which is a
-        common cause of silent broadcasting bugs in downstream metric
-        code that expects a 1-D probability vector.  When you need the
-        probabilities as an array after asking for an id column, extract
-        the column explicitly, e.g. ``out["mean"]`` /
-        ``np.asarray(out["mean"], dtype=float)``.
+        * Transformation-normal models: returns the per-row transformed
+          z-score as a numpy array of shape ``(n_samples,)``.
+        * Bernoulli marginal-slope: returns a calibrated probability array in
+          ``(0, 1)`` of shape ``(n_samples,)``.
+        * Survival models: returns a :class:`SurvivalPrediction` whose
+          ``.hazard_at``, ``.survival_at``, and ``.cumulative_hazard_at``
+          helpers evaluate the fitted hazard surface on a user-supplied time
+          grid.
 
         ``with_uncertainty`` (survival only): when ``True``, the returned
         :class:`SurvivalPrediction` also carries delta-method standard
         errors on the survival surface (``survival_se``) and the linear
-        predictor (``eta_se``).  Only honored for the location-scale
-        survival likelihood mode; requesting ``with_uncertainty=True``
-        with any other survival likelihood (``"transformation"``,
-        ``"weibull"``, ``"marginal-slope"``, ``"latent"``,
-        ``"latent-binary"``) or with competing-risks survival models
-        raises an error.
+        predictor (``eta_se``).  Currently honored for the location-scale
+        survival likelihood mode.
         """
         headers, rows, table_kind = normalize_table(data)
         row_ids = _extract_row_ids(headers, rows, id_column)
@@ -2176,28 +1917,6 @@ def _survival_prediction_from_ffi_payload(
         row_ids=row_ids,
         survival_se=survival_se,
         eta_se=eta_se if eta_se is not None and eta_se.size else None,
-    )
-
-
-def _competing_risks_prediction_from_ffi_payload(
-    parsed: dict[str, Any],
-) -> CompetingRisksPrediction:
-    """Build a thin Python object from Rust's joint competing-risks payload."""
-    import numpy as np
-
-    columns = parsed.get("columns") or {}
-    return CompetingRisksPrediction(
-        model_class=str(parsed.get("model_class") or "competing risks survival"),
-        likelihood_mode=str(parsed.get("likelihood_mode") or "transformation"),
-        endpoint_names=tuple(str(name) for name in parsed.get("endpoint_names") or ()),
-        times=np.asarray(parsed.get("times") or [], dtype=float).reshape(-1),
-        hazard=np.asarray(parsed.get("hazard") or [], dtype=float),
-        survival=np.asarray(parsed.get("survival") or [], dtype=float),
-        cumulative_hazard=np.asarray(parsed.get("cumulative_hazard") or [], dtype=float),
-        cif=np.asarray(parsed.get("cif") or [], dtype=float),
-        overall_survival=np.asarray(parsed.get("overall_survival") or [], dtype=float),
-        linear_predictor=np.asarray(parsed.get("linear_predictor") or [], dtype=float),
-        columns={str(key): list(value) for key, value in columns.items()},
     )
 
 
