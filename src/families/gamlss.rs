@@ -5060,15 +5060,23 @@ fn binomial_location_scale_core(
     let mut d3mu_dq3 = vec![0.0_f64; n];
 
     /// Wrapper to send raw pointers across threads for disjoint per-row writes.
-    /// SAFETY: each parallel iteration writes to a unique index `i`, and the
-    /// caller ensures the pointers outlive the parallel region.
+    /// Each parallel iteration writes to a unique index `i`, and the caller
+    /// ensures the pointers outlive the parallel region (see SAFETY: notes
+    /// on each `unsafe` site below).
     #[derive(Clone, Copy)]
     struct SendPtr(*mut f64);
+    // SAFETY: pointers are used only for disjoint per-row writes inside a
+    // bounded parallel region; the owning `Vec`s outlive the region.
     unsafe impl Send for SendPtr {}
+    // SAFETY: same disjoint-index invariant as `Send`; no aliasing writes.
     unsafe impl Sync for SendPtr {}
     impl SendPtr {
         #[inline(always)]
+        // SAFETY: `i` is unique per parallel iteration (driven by `par_iter`
+        // over the row index) and within the allocation pointed to by `self.0`.
         unsafe fn write(self, i: usize, v: f64) {
+            // SAFETY: see `write`'s function-level note — `i` is in-bounds
+            // and exclusively owned by this iteration.
             unsafe { *self.0.add(i) = v };
         }
     }
@@ -5912,14 +5920,20 @@ fn gaussian_jointrow_scalars(
         kappa_prime[i].write(kp);
         kappa_dprime[i].write(kdp);
     }
-    // SAFETY: all elements written in the loop above.
-    let obs_weight = unsafe { obs_weight.assume_init() };
-    let w = unsafe { w.assume_init() };
-    let m = unsafe { m.assume_init() };
-    let n = unsafe { n.assume_init() };
-    let kappa = unsafe { kappa.assume_init() };
-    let kappa_prime = unsafe { kappa_prime.assume_init() };
-    let kappa_dprime = unsafe { kappa_dprime.assume_init() };
+    // SAFETY: every `MaybeUninit` slot in each of these arrays was written
+    // exactly once in the `for i in 0..nobs` loop above; no slot is read,
+    // moved, or dropped before this point.
+    let (obs_weight, w, m, n, kappa, kappa_prime, kappa_dprime) = unsafe {
+        (
+            obs_weight.assume_init(),
+            w.assume_init(),
+            m.assume_init(),
+            n.assume_init(),
+            kappa.assume_init(),
+            kappa_prime.assume_init(),
+            kappa_dprime.assume_init(),
+        )
+    };
     Ok(GaussianJointRowScalars {
         obs_weight,
         w,
@@ -5962,9 +5976,9 @@ fn gaussian_joint_first_directionalweights(
                 + (kdpi * amn + 6.0 * ki * kpi * ni) * de,
         );
     }
-    let w_u = unsafe { w_u.assume_init() };
-    let c_u = unsafe { c_u.assume_init() };
-    let d_u = unsafe { d_u.assume_init() };
+    // SAFETY: every slot of `w_u`, `c_u`, `d_u` was written exactly once
+    // inside the loop above (one `.write(...)` per index per array).
+    let (w_u, c_u, d_u) = unsafe { (w_u.assume_init(), c_u.assume_init(), d_u.assume_init()) };
     (w_u, c_u, d_u)
 }
 
@@ -6023,9 +6037,10 @@ fn gaussian_jointsecond_directionalweights(
                 + ktpi * amn * de_eta,
         );
     }
-    let w_uv = unsafe { w_uv.assume_init() };
-    let c_uv = unsafe { c_uv.assume_init() };
-    let d_uv = unsafe { d_uv.assume_init() };
+    // SAFETY: every slot of `w_uv`, `c_uv`, `d_uv` was written exactly once
+    // inside the loop above.
+    let (w_uv, c_uv, d_uv) =
+        unsafe { (w_uv.assume_init(), c_uv.assume_init(), d_uv.assume_init()) };
     (w_uv, c_uv, d_uv)
 }
 
@@ -6081,6 +6096,8 @@ fn gaussian_joint_psi_firstweights(
         );
         objective_psirow[i].write(smu * ma + sls * ea);
     }
+    // SAFETY: every `MaybeUninit` slot in each field array was written
+    // exactly once inside the `for i in 0..nobs` loop above.
     unsafe {
         GaussianJointPsiFirstWeights {
             objective_psirow: objective_psirow.assume_init(),

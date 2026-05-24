@@ -113,7 +113,7 @@ impl Drop for CudaWorkingState {
         // context. Errors are swallowed because the process is on its
         // way out anyway.
         unsafe {
-            let _ = (self.api.cu_ctx_destroy)(self.context);
+            drop((self.api.cu_ctx_destroy)(self.context));
         }
     }
 }
@@ -141,7 +141,7 @@ impl<'a> DeviceAllocation<'a> {
 impl Drop for DeviceAllocation<'_> {
     fn drop(&mut self) {
         unsafe {
-            let _ = (self.driver.cu_mem_free)(self.ptr);
+            drop((self.driver.cu_mem_free)(self.ptr));
         }
     }
 }
