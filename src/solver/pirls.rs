@@ -5,7 +5,6 @@ use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, FaerSymmetricFactor,
     array1_to_col_matmut, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av_into,
 };
-use crate::gpu;
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd, solve_sparse_spd_into,
     sparse_symmetric_upper_matvec_public,

@@ -1191,7 +1191,7 @@ impl<const K: usize, T: RowKernel<K>> RowKernelHessianWorkspace<K, T> {
     /// trait once, at top-level rayon, before the ext-coord `par_iter`.
     pub fn with_rows(kern: T, rows: RowSet) -> Result<Self, String> {
         let kern = Arc::new(kern);
-        let cache = build_row_kernel_cache(&*kern)?;
+        let cache = build_row_kernel_cache(&*kern, &rows)?;
         // Higher-order jet caches (third/fourth contracted) are NOT primed
         // here. PIRLS reuses this same workspace constructor for plain
         // gradient/Hessian evaluations and never touches `row_third_contracted`,
@@ -1199,7 +1199,7 @@ impl<const K: usize, T: RowKernel<K>> RowKernelHessianWorkspace<K, T> {
         // PIRLS cycle for a cache the gradient path never reads. Outer-eval
         // entry points instead call `warm_up_outer_caches` on the workspace
         // trait once, at top-level rayon, before the ext-coord `par_iter`.
-        Ok(Self { kern, cache })
+        Ok(Self { kern, cache, rows })
     }
 }
 
