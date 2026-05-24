@@ -18770,6 +18770,21 @@ fn try_exact_joint_latent_coord_optimization(
             "latent-coordinate-joint",
         )?,
     };
+    let registry_for_key = ctx.cache.analytic_penalties();
+    ctx.evaluator
+        .set_analytic_penalty_registry(registry_for_key.as_deref());
+    if let Some(cached_t) = ctx
+        .evaluator
+        .load_persistent_latent_values(latent.values.n_obs(), latent.values.latent_dim())
+    {
+        for (dst, src) in theta0
+            .slice_mut(s![rho_dim..rho_dim + latent_flat_dim])
+            .iter_mut()
+            .zip(cached_t.iter())
+        {
+            *dst = *src;
+        }
+    }
 
     let problem = exact_joint_multistart_outer_problem(
         &theta0,
@@ -18825,6 +18840,7 @@ fn try_exact_joint_latent_coord_optimization(
                 "latent-coordinate joint optimization failed after exhausting strategy fallbacks: {e}"
             ))
         })?;
+    drop(obj);
     if !result.converged {
         return Err(EstimationError::InvalidInput(format!(
             "latent-coordinate joint optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
@@ -18840,10 +18856,13 @@ fn try_exact_joint_latent_coord_optimization(
     let flat_t = theta_star
         .slice(s![rho_dim..rho_dim + latent_flat_dim])
         .to_owned();
+    let mut fitted_latent_values =
+        Array2::<f64>::zeros((latent.values.n_obs(), latent.values.latent_dim()));
     for n in 0..latent.values.n_obs() {
         for axis in 0..latent.values.latent_dim() {
-            final_data[[n, latent.feature_cols[axis]]] =
-                flat_t[n * latent.values.latent_dim() + axis];
+            let value = flat_t[n * latent.values.latent_dim() + axis];
+            fitted_latent_values[[n, axis]] = value;
+            final_data[[n, latent.feature_cols[axis]]] = value;
         }
     }
     let optimized = fit_term_collection_forspecwith_heuristic_lambdas(
@@ -18856,6 +18875,8 @@ fn try_exact_joint_latent_coord_optimization(
         family,
         options,
     )?;
+    ctx.evaluator
+        .store_persistent_latent_values(&fitted_latent_values);
     let mut fit = optimized.fit;
     fit.reml_score = result.final_value;
     fit.penalized_objective = result.final_value;
