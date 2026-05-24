@@ -2455,6 +2455,7 @@ pub enum BasisMetadata {
         input_scales: Option<Vec<f64>>,
         /// Per-axis anisotropy log-scales η_a, stored for prediction.
         aniso_log_scales: Option<Vec<f64>>,
+    }
     },
     Pca {
         feature_cols: Vec<usize>,
@@ -3310,6 +3311,243 @@ impl RadialScalarKind {
                 | RadialScalarKind::PureDuchon { .. }
                 | RadialScalarKind::ThinPlate { .. }
         )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StreamingMaternEvaluator {
+    data: Arc<Array2<f64>>,
+    centers: Arc<Array2<f64>>,
+    length_scale: f64,
+    nu: MaternNu,
+    metric_weights: Arc<[f64]>,
+    ident_transform: Option<Arc<Array2<f64>>>,
+    include_intercept: bool,
+    chunk_size: usize,
+    total_cols: usize,
+}
+
+impl StreamingMaternEvaluator {
+    pub(crate) fn new(
+        data: Arc<Array2<f64>>,
+        centers: Arc<Array2<f64>>,
+        length_scale: f64,
+        nu: MaternNu,
+        aniso_log_scales: Option<Vec<f64>>,
+        ident_transform: Option<Arc<Array2<f64>>>,
+        include_intercept: bool,
+        chunk_size: Option<usize>,
+    ) -> Result<Self, String> {
+        if data.ncols() != centers.ncols() {
+            return Err(format!(
+                "StreamingMaternEvaluator: data dim {} != centers dim {}",
+                data.ncols(),
+                centers.ncols()
+            ));
+        }
+        let metric_weights = match aniso_log_scales {
+            Some(eta) => {
+                if eta.len() != data.ncols() {
+                    return Err(format!(
+                        "StreamingMaternEvaluator: aniso_log_scales len {} != data dim {}",
+                        eta.len(),
+                        data.ncols()
+                    ));
+                }
+                eta.into_iter().map(|v| (2.0 * v).exp()).collect::<Vec<_>>()
+            }
+            None => vec![1.0; data.ncols()],
+        };
+        if let Some(z) = ident_transform.as_ref() {
+            if z.nrows() != centers.nrows() {
+                return Err(format!(
+                    "StreamingMaternEvaluator: identifiability transform rows {} != centers {}",
+                    z.nrows(),
+                    centers.nrows()
+                ));
+            }
+        }
+        let kernel_cols = ident_transform.as_ref().map_or(centers.nrows(), |z| z.ncols());
+        Ok(Self {
+            data: Arc::new(data.as_standard_layout().to_owned()),
+            centers: Arc::new(centers.as_standard_layout().to_owned()),
+            length_scale,
+            nu,
+            metric_weights: Arc::from(metric_weights),
+            ident_transform,
+            include_intercept,
+            chunk_size: chunk_size.unwrap_or(2048).max(1),
+            total_cols: kernel_cols + usize::from(include_intercept),
+        })
+    }
+
+    fn chunk_rows(&self) -> usize {
+        self.chunk_size.min(self.data.nrows().max(1))
+    }
+
+    fn raw_kernel_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        let chunk_n = rows.end - rows.start;
+        let k_raw = self.centers.nrows();
+        let dim = self.data.ncols();
+        let data = self
+            .data
+            .as_slice()
+            .expect("StreamingMaternEvaluator stores standard-layout data");
+        let centers = self
+            .centers
+            .as_slice()
+            .expect("StreamingMaternEvaluator stores standard-layout centers");
+        let mut values = vec![0.0_f64; chunk_n * k_raw];
+        values
+            .par_chunks_mut(k_raw)
+            .enumerate()
+            .for_each(|(local, out_row)| {
+                let global = rows.start + local;
+                let x = &data[global * dim..(global + 1) * dim];
+                for j in 0..k_raw {
+                    let c = &centers[j * dim..(j + 1) * dim];
+                    let mut r2 = 0.0_f64;
+                    for axis in 0..dim {
+                        let h = x[axis] - c[axis];
+                        r2 += self.metric_weights[axis] * h * h;
+                    }
+                    out_row[j] = matern_kernel_from_distance(r2.sqrt(), self.length_scale, self.nu)
+                        .expect("validated Matérn inputs should not fail");
+                }
+            });
+        Array2::from_shape_vec((chunk_n, k_raw), values)
+            .expect("StreamingMaternEvaluator chunk shape should match generated values")
+    }
+
+    pub(crate) fn for_row_chunk(&self, start: usize, end: usize) -> Array2<f64> {
+        assert!(
+            start <= end && end <= self.data.nrows(),
+            "StreamingMaternEvaluator row chunk out of bounds"
+        );
+        let raw = self.raw_kernel_chunk(start..end);
+        let kernel = match self.ident_transform.as_ref() {
+            Some(z) => fast_ab(&raw, z),
+            None => raw,
+        };
+        if !self.include_intercept {
+            return kernel;
+        }
+        let mut out = Array2::<f64>::ones((end - start, kernel.ncols() + 1));
+        out.slice_mut(s![.., ..kernel.ncols()]).assign(&kernel);
+        out
+    }
+
+    pub(crate) fn gradient_into(&self, theta: ArrayView1<'_, f64>, output: &mut Array1<f64>) {
+        assert_eq!(
+            theta.len(),
+            self.total_cols,
+            "StreamingMaternEvaluator theta width mismatch"
+        );
+        assert_eq!(
+            output.len(),
+            self.data.nrows(),
+            "StreamingMaternEvaluator output length mismatch"
+        );
+        output.fill(0.0);
+        for start in (0..self.data.nrows()).step_by(self.chunk_rows()) {
+            let end = (start + self.chunk_rows()).min(self.data.nrows());
+            let chunk = self.for_row_chunk(start, end);
+            let values = chunk.dot(&theta);
+            output.slice_mut(s![start..end]).assign(&values);
+        }
+    }
+}
+
+impl LinearOperator for StreamingMaternEvaluator {
+    fn nrows(&self) -> usize {
+        self.data.nrows()
+    }
+
+    fn ncols(&self) -> usize {
+        self.total_cols
+    }
+
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.nrows());
+        self.gradient_into(vector.view(), &mut out);
+        out
+    }
+
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        assert_eq!(
+            vector.len(),
+            self.nrows(),
+            "StreamingMaternEvaluator transpose vector length mismatch"
+        );
+        let mut out = Array1::<f64>::zeros(self.ncols());
+        for start in (0..self.nrows()).step_by(self.chunk_rows()) {
+            let end = (start + self.chunk_rows()).min(self.nrows());
+            let chunk = self.for_row_chunk(start, end);
+            let partial = chunk.t().dot(&vector.slice(s![start..end]));
+            out += &partial;
+        }
+        out
+    }
+
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if weights.len() != self.nrows() {
+            return Err(format!(
+                "StreamingMaternEvaluator diag_xtw_x weight length mismatch: weights={}, nrows={}",
+                weights.len(),
+                self.nrows()
+            ));
+        }
+        let p = self.ncols();
+        let chunk_rows = self.chunk_rows();
+        let starts = (0..self.nrows()).step_by(chunk_rows).collect::<Vec<_>>();
+        Ok(starts
+            .into_par_iter()
+            .fold(
+                || Array2::<f64>::zeros((p, p)),
+                |mut acc, start| {
+                    let end = (start + chunk_rows).min(self.nrows());
+                    let chunk = self.for_row_chunk(start, end);
+                    let mut weighted = chunk.clone();
+                    for local in 0..(end - start) {
+                        let w = weights[start + local];
+                        weighted.row_mut(local).mapv_inplace(|v| v * w);
+                    }
+                    acc += &chunk.t().dot(&weighted);
+                    acc
+                },
+            )
+            .reduce(
+                || Array2::<f64>::zeros((p, p)),
+                |mut a, b| {
+                    a += &b;
+                    a
+                },
+            ))
+    }
+}
+
+impl DenseDesignOperator for StreamingMaternEvaluator {
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if rows.end > self.nrows() || rows.start > rows.end {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "StreamingMaternEvaluator row range out of bounds",
+            });
+        }
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "StreamingMaternEvaluator row_chunk_into shape mismatch",
+            });
+        }
+        out.assign(&self.for_row_chunk(rows.start, rows.end));
+        Ok(())
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        self.for_row_chunk(0, self.nrows())
     }
 }
 
@@ -15248,8 +15486,62 @@ pub fn build_matern_basiswithworkspace(
     let design_cols =
         z_opt.as_ref().map_or(centers.nrows(), Array2::ncols) + usize::from(spec.include_intercept);
     let dense_bytes = dense_design_bytes(data.nrows(), design_cols);
-    let use_lazy = should_use_lazy_spatial_design(data.nrows(), design_cols, workspace.policy());
-    let (design, candidates) = if use_lazy {
+    let use_streaming = spec.streaming_chunk_size.is_some();
+    let use_lazy = !use_streaming && should_use_lazy_spatial_design(data.nrows(), design_cols, workspace.policy());
+    let (design, candidates) = if use_streaming {
+        log::info!(
+            "Matérn basis using explicit streaming evaluator: n={} p={} chunk_size={}",
+            data.nrows(),
+            design_cols,
+            spec.streaming_chunk_size.unwrap_or(2048).max(1),
+        );
+        let shared_data = shared_owned_data_matrix(data, &mut workspace.cache);
+        let op = StreamingMaternEvaluator::new(
+            shared_data,
+            Arc::new(centers.clone()),
+            spec.length_scale,
+            spec.nu,
+            aniso.clone(),
+            z_opt.as_ref().map(|z| Arc::new(z.clone())),
+            spec.include_intercept,
+            spec.streaming_chunk_size,
+        )
+        .map_err(BasisError::InvalidInput)?;
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op)));
+        let candidates = if spec.double_penalty {
+            let penalty_kernel = build_matern_kernel_penalty(
+                centers.view(),
+                spec.length_scale,
+                spec.nu,
+                spec.include_intercept,
+                aniso.as_deref(),
+            )?;
+            let primary = project_penalty_matrix(&penalty_kernel, full_transform.as_ref());
+            let mut candidates = vec![normalize_penalty_candidate(
+                primary.clone(),
+                0,
+                PenaltySource::Primary,
+            )];
+            if let Some(shrinkage) = build_nullspace_shrinkage_penalty(&primary)? {
+                candidates.push(normalize_penalty_candidate(
+                    shrinkage.sym_penalty,
+                    0,
+                    PenaltySource::DoublePenaltyNullspace,
+                ));
+            }
+            candidates
+        } else {
+            build_matern_operator_penalty_candidates(
+                centers.view(),
+                spec.length_scale,
+                spec.nu,
+                spec.include_intercept,
+                z_opt.as_ref(),
+                aniso.as_deref(),
+            )?
+        };
+        (design, candidates)
+    } else if use_lazy {
         // log::info! — deliberate memory-saving choice, not an anomaly.
         log::info!(
             "Matérn basis switching to lazy chunked design: n={} p={} ({:.1} MiB dense)",
@@ -15382,6 +15674,7 @@ pub fn build_matern_basiswithworkspace(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: aniso,
+            streaming_chunk_size: spec.streaming_chunk_size,
         },
         kronecker_factored: None,
         ops,
@@ -19232,6 +19525,7 @@ fn build_cyclic_duchon_basis_1dwithworkspace(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: None,
+        }
         },
         kronecker_factored: None,
         ops,
@@ -20403,6 +20697,7 @@ fn build_periodic_duchon_basis_1d(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: None,
+        }
         },
         kronecker_factored: None,
     })
@@ -20661,6 +20956,7 @@ fn build_duchon_basis_mixed_periodicity(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: None,
+        }
         },
         kronecker_factored: None,
     })
@@ -21025,6 +21321,7 @@ pub fn build_duchon_basiswithworkspace(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: aniso,
+        }
         },
         kronecker_factored: None,
     })
@@ -31850,6 +32147,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+        }
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.design.nrows(), data.nrows());
@@ -31884,6 +32182,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+        }
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         // (k-1) constrained kernel cols + explicit intercept.
@@ -31905,6 +32204,7 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+        }
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 1);
@@ -31927,6 +32227,7 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+        }
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 2);
@@ -31953,6 +32254,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+        }
         };
         let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic Matérn derivative should build");
@@ -32023,6 +32325,7 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+        }
         };
         let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic Matérn double-penalty derivative should build");
@@ -33554,6 +33857,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+        }
         };
         let analytic = build_matern_basis_log_kappasecond_derivative(data.view(), &spec)
             .expect("analytic Matérn second derivative should build");
@@ -33615,6 +33919,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: Some(vec![0.1, -0.1]),
+        }
         };
 
         let basis = build_matern_basis(data.view(), &spec).expect("aniso Matérn basis");
