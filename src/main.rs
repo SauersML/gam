@@ -715,6 +715,21 @@ enum PredictModeArg {
 /// whose schema it describes, eliminating drift between writer and reader.
 const MODEL_VERSION: u32 = MODEL_PAYLOAD_VERSION;
 
+/// Lift a non-parameterized `LikelihoodFamily` value into the canonical
+/// `LikelihoodSpec` form expected by `FittedFamily`. Panics for the four
+/// parameterized binomial variants (Sas / BetaLogistic / Mixture /
+/// LatentCLogLog) which need state from the surrounding fit context — those
+/// sites must build `LikelihoodSpec` explicitly via
+/// `inverse_link_to_binomial_spec` (or equivalent).
+fn legacy_family_to_spec(family: LikelihoodFamily) -> LikelihoodSpec {
+    LikelihoodSpec::from_non_parameterized(family).unwrap_or_else(|| {
+        panic!(
+            "legacy_family_to_spec called with parameterized binomial variant {family:?}; \
+             callers must source InverseLink state explicitly"
+        )
+    })
+}
+
 /// Total mapping `LikelihoodSpec -> LikelihoodFamily` for the saved-model and
 /// downstream-API boundaries that still consume the flat legacy enum. Mirrors
 /// `inference::model::likelihood_family_from_spec`. Every `(response, link)`
