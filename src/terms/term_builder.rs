@@ -810,6 +810,7 @@ pub fn build_smooth_basis(
             double_penalty: true,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
         let flavour = match type_opt.as_str() {
             "fs" => FactorSmoothFlavour::Fs {
@@ -980,6 +981,7 @@ pub fn build_smooth_basis(
                     double_penalty: smooth_double_penalty,
                     identifiability: BSplineIdentifiability::default(),
                     boundary_conditions: Default::default(),
+                    boundary: OneDimensionalBoundary::Open,
                 },
             })
         }
