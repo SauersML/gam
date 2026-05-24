@@ -5,6 +5,7 @@ use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, FaerSymmetricFactor,
     array1_to_col_matmut, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av_into,
 };
+use crate::gpu::{self, GpuOperation, GpuStageTimer, GpuWorkload};
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd, solve_sparse_spd_into,
     sparse_symmetric_upper_matvec_public,
@@ -1185,6 +1186,77 @@ impl PirlsWorkspace {
         }
     }
 
+    /// Streaming chunked BLAS computation of Xᵀ·diag(W)·X with signed weights.
+    ///
+    /// Fisher updates with non-negative weights can use the faster Gram form on
+    /// sqrt(W)X. Observed-information updates can contain negative curvature
+    /// weights, so they must use the sign-preserving Xᵀ(WX) form instead of
+    /// clipping through sqrt(max(W, 0)).
+    fn add_dense_xtwx_streaming_signed<S>(
+        weights: &Array1<f64>,
+        weighted_x_chunk: &mut Array2<f64>,
+        x: &ArrayBase<S, Ix2>,
+        out: &mut Array2<f64>,
+        par: Par,
+    ) where
+        S: Data<Elem = f64> + Sync,
+    {
+        let n = x.nrows();
+        let p = x.ncols();
+        if n == 0 || p == 0 {
+            return;
+        }
+        debug_assert_eq!(
+            weights.len(),
+            n,
+            "weights length must match row count for streamed signed XtWX"
+        );
+        let chunkrows = Self::dense_xtwx_chunkrows(p).min(n);
+        if weighted_x_chunk.ncols() != p || weighted_x_chunk.nrows() != chunkrows {
+            *weighted_x_chunk = Array2::zeros((chunkrows, p).f());
+        }
+        let mut outview = array2_to_matmut(out);
+        for start in (0..n).step_by(chunkrows) {
+            let rows = (n - start).min(chunkrows);
+            {
+                let mut chunk = weighted_x_chunk.slice_mut(s![0..rows, ..]);
+                let x_slice = x.slice(s![start..start + rows, ..]);
+                let w_slice = weights.slice(s![start..start + rows]);
+                Zip::from(chunk.rows_mut())
+                    .and(x_slice.rows())
+                    .and(&w_slice)
+                    .par_for_each(|mut dst, src, &w| {
+                        Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
+                    });
+            }
+            let x_slice = x.slice(s![start..start + rows, ..]);
+            let wx_slice = weighted_x_chunk.slice(s![0..rows, ..]);
+            let x_view = FaerArrayView::new(&x_slice);
+            let wx_view = FaerArrayView::new(&wx_slice);
+            matmul(
+                outview.as_mut(),
+                Accum::Add,
+                x_view.as_ref().transpose(),
+                wx_view.as_ref(),
+                1.0,
+                par,
+            );
+        }
+    }
+
+    #[inline]
+    fn fill_sqrtweights<S>(&mut self, weights: &ArrayBase<S, Ix1>)
+    where
+        S: Data<Elem = f64>,
+    {
+        if self.sqrtw.len() != weights.len() {
+            self.sqrtw = Array1::zeros(weights.len());
+        }
+        Zip::from(&mut self.sqrtw)
+            .and(weights)
+            .par_for_each(|sqrtw, &w| *sqrtw = w.max(0.0).sqrt());
+    }
+
     /// Ensure the sparse penalty cache is populated and consistent with `x` and `s_lambda`.
     fn ensure_sparse_penalty_cache(
         &mut self,
@@ -1890,7 +1962,21 @@ impl<'a> GamWorkingModel<'a> {
         match &self.coordinate_design {
             WorkingCoordinateDesign::TransformedExplicit { x_transformed, .. } => {
                 if let Some(dense) = x_transformed.as_dense() {
-                    fast_av_into(dense, beta, out);
+                    let workload = GpuWorkload::dense(dense.nrows(), dense.ncols());
+                    if let Ok(gpu::GpuDispatch::Cpu { reason }) =
+                        gpu::dispatch(GpuOperation::DenseMatvec, workload)
+                    {
+                        log::debug!(
+                            "[gpu-dispatch] op={} backend=cpu reason={} rows={} cols={}",
+                            GpuOperation::DenseMatvec,
+                            reason,
+                            dense.nrows(),
+                            dense.ncols()
+                        );
+                    }
+                    let timer = GpuStageTimer::start(GpuOperation::DenseMatvec, workload, "cpu");
+                    fast_av_into(dense, beta.as_ref(), out);
+                    timer.finish();
                     return;
                 }
                 out.assign(&x_transformed.matrixvectormultiply(beta));
@@ -1900,7 +1986,21 @@ impl<'a> GamWorkingModel<'a> {
                 // then write X·(Qs·beta) directly into out when X is dense.
                 let beta_orig = transform.apply(beta);
                 if let Some(dense) = self.x_original.as_dense() {
+                    let workload = GpuWorkload::dense(dense.nrows(), dense.ncols());
+                    if let Ok(gpu::GpuDispatch::Cpu { reason }) =
+                        gpu::dispatch(GpuOperation::DenseMatvec, workload)
+                    {
+                        log::debug!(
+                            "[gpu-dispatch] op={} backend=cpu reason={} rows={} cols={}",
+                            GpuOperation::DenseMatvec,
+                            reason,
+                            dense.nrows(),
+                            dense.ncols()
+                        );
+                    }
+                    let timer = GpuStageTimer::start(GpuOperation::DenseMatvec, workload, "cpu");
                     fast_av_into(dense, &beta_orig, out);
+                    timer.finish();
                 } else {
                     out.assign(&self.x_original.apply(&beta_orig));
                 }
@@ -1939,20 +2039,30 @@ impl<'a> GamWorkingModel<'a> {
             // cannot be densified; fall through to the operator XᵀWX path.
             DesignMatrix::Dense(x) if x.is_materialized_dense() => {
                 let p = x.ncols();
-                match crate::solver::gpu::dense_pirls_dispatch(
-                    crate::solver::gpu::GpuOperation::DensePirlsXtWX,
-                    x.nrows(),
-                    p,
-                    true,
-                ) {
-                    Ok(crate::solver::gpu::GpuDispatch::UseDevice) => unreachable!(
-                        "dense_pirls_dispatch cannot select a device without a registered backend"
-                    ),
-                    Ok(crate::solver::gpu::GpuDispatch::UseCpu { .. }) => {}
-                    Err(msg) => return Err(EstimationError::InvalidInput(msg)),
+                let n = x.nrows();
+                let has_signed_weights = weights.iter().any(|w| *w < 0.0);
+                let workload = GpuWorkload::dense(n, p).with_signed_weights(has_signed_weights);
+                match gpu::dispatch(GpuOperation::DenseXtDiagX, workload) {
+                    Ok(gpu::GpuDispatch::Gpu) => {
+                        // No native GPU backend is linked in this build yet; dispatch() only
+                        // returns Gpu when a concrete backend reports support. Keep the branch
+                        // explicit so CUDA/HIP/Metal implementations can slot in here without
+                        // changing P-IRLS control flow.
+                        unreachable!("native GPU DenseXtDiagX dispatch without implementation")
+                    }
+                    Ok(gpu::GpuDispatch::Cpu { reason }) => {
+                        log::debug!(
+                            "[gpu-dispatch] op={} backend=cpu reason={} rows={} cols={} signed_weights={}",
+                            GpuOperation::DenseXtDiagX,
+                            reason,
+                            n,
+                            p,
+                            has_signed_weights
+                        );
+                    }
+                    Err(err) => return Err(EstimationError::InvalidInput(err.to_string())),
                 }
-                let _gpu_timer =
-                    crate::solver::gpu::GpuStageTimer::start("pirls.dense_xtwx.cpu_fallback");
+                let timer = GpuStageTimer::start(GpuOperation::DenseXtDiagX, workload, "cpu");
                 let x_dense = x.to_dense_arc();
                 // Reuse workspace hessian buffer to avoid per-iteration allocation.
                 if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
@@ -1960,13 +2070,25 @@ impl<'a> GamWorkingModel<'a> {
                 } else {
                     workspace.hessian_buf.fill(0.0);
                 }
-                PirlsWorkspace::add_dense_xtwx_streaming_signed(
-                    weights,
-                    &mut workspace.weighted_x_chunk,
-                    x_dense.as_ref(),
-                    &mut workspace.hessian_buf,
-                    get_global_parallelism(),
-                );
+                if has_signed_weights {
+                    PirlsWorkspace::add_dense_xtwx_streaming_signed(
+                        weights,
+                        &mut workspace.weighted_x_chunk,
+                        x_dense.as_ref(),
+                        &mut workspace.hessian_buf,
+                        get_global_parallelism(),
+                    );
+                } else {
+                    workspace.fill_sqrtweights(weights);
+                    PirlsWorkspace::add_dense_xtwx_streaming_from_sqrt(
+                        &workspace.sqrtw,
+                        &mut workspace.weighted_x_chunk,
+                        x_dense.as_ref(),
+                        &mut workspace.hessian_buf,
+                        get_global_parallelism(),
+                    );
+                }
+                timer.finish();
                 // Move the buffer out instead of cloning — saves O(p²) memcpy.
                 // Next call will reallocate (same cost as the existing zero-fill).
                 Ok(std::mem::take(&mut workspace.hessian_buf))
@@ -12837,6 +12959,7 @@ mod tests {
 #[cfg(test)]
 mod root_cause_tests {
     use super::*;
+    use approx::assert_relative_eq;
     use ndarray::{Array1, Array2, array};
 
     fn scalar_working_state(
@@ -14215,6 +14338,37 @@ mod root_cause_tests {
              ExpectedInformationSurrogate (no silent ObservedExact relabel), \
              got {:?}",
             summary.exported_laplace_curvature
+        );
+    }
+
+    #[test]
+    fn dense_xtwx_signed_streaming_preserves_negative_weights() {
+        let x = array![[1.0, 2.0], [3.0, -1.0], [0.5, 4.0]];
+        let weights = array![2.0, -3.0, 0.25];
+        let mut chunk = Array2::<f64>::zeros((0, 0));
+        let mut got = Array2::<f64>::zeros((2, 2));
+        PirlsWorkspace::add_dense_xtwx_streaming_signed(
+            &weights,
+            &mut chunk,
+            &x,
+            &mut got,
+            faer::Par::Seq,
+        );
+
+        let mut expected = Array2::<f64>::zeros((2, 2));
+        for i in 0..x.nrows() {
+            for a in 0..x.ncols() {
+                for b in 0..x.ncols() {
+                    expected[[a, b]] += weights[i] * x[[i, a]] * x[[i, b]];
+                }
+            }
+        }
+        for (actual, expected) in got.iter().zip(expected.iter()) {
+            assert_relative_eq!(*actual, *expected, epsilon = 1e-12);
+        }
+        assert!(
+            got[[0, 0]] < 0.0,
+            "negative observed-Hessian weights must not be clipped away"
         );
     }
 }
