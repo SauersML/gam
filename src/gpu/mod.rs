@@ -20,7 +20,7 @@ pub mod runtime;
 pub mod solver;
 
 pub use cpu_traits::{ExecutionTarget, MatrixLocation};
-pub use device::{GpuCapability, GpuDeviceInfo};
+pub use device::GpuDeviceInfo;
 pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector};
 pub use policy::{GpuDispatchPolicy, MixedPrecisionPolicy};
 pub use profile::{KernelStat, KernelStatsSnapshot};
