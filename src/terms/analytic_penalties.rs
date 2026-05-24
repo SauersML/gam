@@ -32,6 +32,11 @@
 //!     shrinks whole semantic groups together; pair with
 //!     `LatentIdMode::AuxPriorDimSelection` when aux classes define the active
 //!     group subset.
+//!   * [`AuxConditionalPriorPenalty`] — iVAE-style auxiliary-conditional
+//!     prior on latent rows. This fixed-precomputed v1 accepts one precision
+//!     matrix per row; when ARD/Ortho fail to break the gauge, it adds the
+//!     missing supervision signal (memory `project_ard_gauge_fix_doesnt_help_cogito`,
+//!     `proposals/composition_engine.md` §4(c)).
 //!   * [`OrthogonalityPenalty`] — fixes the rotation gauge inside a latent
 //!     block by penalizing cross-axis correlations. Pair with ARD when
 //!     intrinsic dimension should be identifiable.
@@ -75,11 +80,12 @@
 //! | TV        | ext-coord (latent t) | 0 or 1 (log μ_tv)    |
 //! | NuclearNorm | ext-coord (latent t) | 0 or 1 (log μ_nuc)  |
 //! | BlockSparsity | ext-coord (latent t) | 0 or 1 (log μ_group) |
+//! | AuxConditionalPrior | ext-coord (latent t) | 0 or 1 (log μ_aux) |
 //! | Orthogonality | ext-coord (latent t) | 0 or 1 (log μ_orth) |
 
 use faer::Side;
 use ndarray::{
-    Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, CowArray, Ix2, Ix3,
+    Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, CowArray, Ix2, Ix3,
 };
 use std::sync::Arc;
 
@@ -3170,6 +3176,334 @@ impl AnalyticPenalty for BlockSparsityPenalty {
 }
 
 // ---------------------------------------------------------------------------
+// Aux-conditional prior penalty
+// ---------------------------------------------------------------------------
+
+/// iVAE-style auxiliary-conditional prior on the latent block.
+///
+/// Fixed-precomputed v1 of `p(t_n | u_n) ∝ exp(-½ t_nᵀ Λ_n t_n)`: callers pass
+/// one positive-definite precision matrix per row. This is the missing sibling
+/// to ARD/Ortho/sparsity from `proposals/composition_engine.md` §4(c); when
+/// ARD/Ortho fail to break the gauge, aux-conditional precision adds the HSV
+/// supervision signal identified in memory `project_ard_gauge_fix_doesnt_help_cogito`.
+#[derive(Debug, Clone)]
+pub struct AuxConditionalPriorPenalty {
+    pub target: PsiSlice,
+    pub lambda_per_row: Array3<f64>,
+    /// Base strength. If `learnable_weight` is true, the resolved strength is
+    /// `weight * exp(rho[rho_index])`; otherwise it is fixed at `weight`.
+    pub weight: f64,
+    /// Number of rows in the row-major matrix-valued latent block.
+    pub n_eff: usize,
+    pub learnable_weight: bool,
+    pub rho_index: usize,
+}
+
+impl AuxConditionalPriorPenalty {
+    #[must_use = "build error must be handled"]
+    pub fn new(
+        target: PsiSlice,
+        lambda_per_row: Array3<f64>,
+        weight: f64,
+        n_eff: usize,
+        learnable_weight: bool,
+    ) -> Result<Self, String> {
+        if target.is_empty() {
+            return Err("AuxConditionalPriorPenalty::new requires a non-empty target".to_string());
+        }
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!(
+                "AuxConditionalPriorPenalty::new requires finite weight > 0, got {weight}"
+            ));
+        }
+        if n_eff == 0 {
+            return Err("AuxConditionalPriorPenalty::new requires n_eff > 0".to_string());
+        }
+        if target.len() % n_eff != 0 {
+            return Err(format!(
+                "AuxConditionalPriorPenalty::new target length {} is not divisible by n_eff {}",
+                target.len(),
+                n_eff
+            ));
+        }
+        let latent_dim = target.len() / n_eff;
+        if let Some(expected_dim) = target.latent_dim {
+            let expected = n_eff.checked_mul(expected_dim).ok_or_else(|| {
+                "AuxConditionalPriorPenalty::new target shape overflows usize".to_string()
+            })?;
+            if expected != target.len() {
+                return Err(format!(
+                    "AuxConditionalPriorPenalty::new target length {} does not match n_eff {} × latent_dim {}",
+                    target.len(),
+                    n_eff,
+                    expected_dim
+                ));
+            }
+            if expected_dim != latent_dim {
+                return Err(format!(
+                    "AuxConditionalPriorPenalty::new inferred latent_dim {latent_dim} does not match target latent_dim {expected_dim}"
+                ));
+            }
+        }
+        let (lambda_n, lambda_rows, lambda_cols) = lambda_per_row.dim();
+        if lambda_n != n_eff || lambda_rows != latent_dim || lambda_cols != latent_dim {
+            return Err(format!(
+                "AuxConditionalPriorPenalty::new lambda_per_row shape must be ({n_eff}, {latent_dim}, {latent_dim}), got ({lambda_n}, {lambda_rows}, {lambda_cols})"
+            ));
+        }
+        for n in 0..n_eff {
+            let mut matrix = Array2::<f64>::zeros((latent_dim, latent_dim));
+            for i in 0..latent_dim {
+                for j in 0..latent_dim {
+                    let value = lambda_per_row[[n, i, j]];
+                    if !value.is_finite() {
+                        return Err(format!(
+                            "AuxConditionalPriorPenalty::new lambda_per_row[{n},{i},{j}] must be finite"
+                        ));
+                    }
+                    let transpose = lambda_per_row[[n, j, i]];
+                    if (value - transpose).abs() >= 1.0e-10 {
+                        return Err(format!(
+                            "AuxConditionalPriorPenalty::new lambda_per_row[{n}] must be symmetric; |Λ[{i},{j}] - Λ[{j},{i}]| = {:.3e}",
+                            (value - transpose).abs()
+                        ));
+                    }
+                    matrix[[i, j]] = value;
+                }
+            }
+            let (evals, _) = matrix.eigh(Side::Lower).map_err(|err| {
+                format!("AuxConditionalPriorPenalty::new lambda_per_row[{n}] eigendecomposition failed: {err}")
+            })?;
+            let min_eval = evals.iter().fold(f64::INFINITY, |acc, &v| acc.min(v));
+            if !(min_eval.is_finite() && min_eval > 0.0) {
+                return Err(format!(
+                    "AuxConditionalPriorPenalty::new lambda_per_row[{n}] must be positive definite; minimum eigenvalue {min_eval:.3e}"
+                ));
+            }
+        }
+        Ok(Self {
+            target,
+            lambda_per_row,
+            weight,
+            n_eff,
+            learnable_weight,
+            rho_index: 0,
+        })
+    }
+
+    fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
+        if self.learnable_weight {
+            self.weight * rho[self.rho_index].exp()
+        } else {
+            self.weight
+        }
+    }
+
+    fn latent_dim(&self, target_len: usize) -> Option<usize> {
+        if self.n_eff == 0 || target_len % self.n_eff != 0 {
+            debug_assert_eq!(
+                target_len % self.n_eff.max(1),
+                0,
+                "target length must be divisible by n_eff"
+            );
+            return None;
+        }
+        Some(target_len / self.n_eff)
+    }
+
+    fn target_matrix<'a>(&self, target: ArrayView1<'a, f64>) -> Option<ArrayView2<'a, f64>> {
+        let d = self.latent_dim(target.len())?;
+        target.into_shape_with_order((self.n_eff, d)).ok()
+    }
+
+    fn flatten_matrix(m: &Array2<f64>) -> Array1<f64> {
+        let n_obs = m.nrows();
+        let d = m.ncols();
+        let mut out = Array1::<f64>::zeros(n_obs * d);
+        for n in 0..n_obs {
+            for a in 0..d {
+                out[n * d + a] = m[[n, a]];
+            }
+        }
+        out
+    }
+
+    pub fn diag_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let weight = self.resolved_weight(rho);
+        let mut out = Array1::<f64>::zeros(target.len());
+        for n in 0..t.nrows() {
+            for i in 0..t.ncols() {
+                out[n * t.ncols() + i] = weight * self.lambda_per_row[[n, i, i]];
+            }
+        }
+        out
+    }
+
+    /// Materialize the row-block-diagonal Hessian for exact spectral paths.
+    pub fn as_dense(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array2<f64> {
+        let n_total = target.len();
+        let Some(t) = self.target_matrix(target) else {
+            return Array2::<f64>::zeros((n_total, n_total));
+        };
+        let d = t.ncols();
+        let weight = self.resolved_weight(rho);
+        let mut dense = Array2::<f64>::zeros((n_total, n_total));
+        for n in 0..t.nrows() {
+            for i in 0..d {
+                let row = n * d + i;
+                for j in 0..d {
+                    dense[[row, n * d + j]] = weight * self.lambda_per_row[[n, i, j]];
+                }
+            }
+        }
+        dense
+    }
+
+    pub fn log_det_plus_lambda_i(
+        &self,
+        rho: ArrayView1<'_, f64>,
+        lambda: f64,
+    ) -> Result<f64, String> {
+        if !(lambda.is_finite() && lambda > 0.0) {
+            return Err(format!(
+                "AuxConditionalPriorPenalty::log_det_plus_lambda_i requires finite λ > 0; got {lambda}"
+            ));
+        }
+        let (n_obs, d, _) = self.lambda_per_row.dim();
+        let weight = self.resolved_weight(rho);
+        let mut sum = 0.0;
+        for n in 0..n_obs {
+            let mut matrix = Array2::<f64>::zeros((d, d));
+            for i in 0..d {
+                for j in 0..d {
+                    matrix[[i, j]] = self.lambda_per_row[[n, i, j]];
+                }
+            }
+            let (evals, _) = matrix.eigh(Side::Lower).map_err(|err| {
+                format!("AuxConditionalPriorPenalty::log_det_plus_lambda_i lambda_per_row[{n}] eigendecomposition failed: {err}")
+            })?;
+            for &eval in evals.iter() {
+                let shifted = weight * eval + lambda;
+                if !(shifted.is_finite() && shifted > 0.0) {
+                    return Err(format!(
+                        "AuxConditionalPriorPenalty::log_det_plus_lambda_i non-positive shifted eigenvalue {shifted:.3e}"
+                    ));
+                }
+                sum += shifted.ln();
+            }
+        }
+        Ok(sum)
+    }
+}
+
+impl AnalyticPenalty for AuxConditionalPriorPenalty {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Psi
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        let Some(t) = self.target_matrix(target) else {
+            return 0.0;
+        };
+        let mut acc = 0.0;
+        for n in 0..t.nrows() {
+            for i in 0..t.ncols() {
+                let mut row_dot = 0.0;
+                for j in 0..t.ncols() {
+                    row_dot += self.lambda_per_row[[n, i, j]] * t[[n, j]];
+                }
+                acc += t[[n, i]] * row_dot;
+            }
+        }
+        0.5 * self.resolved_weight(rho) * acc
+    }
+
+    fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let weight = self.resolved_weight(rho);
+        let mut grad = Array2::<f64>::zeros(t.dim());
+        for n in 0..t.nrows() {
+            for i in 0..t.ncols() {
+                let mut acc = 0.0;
+                for j in 0..t.ncols() {
+                    acc += self.lambda_per_row[[n, i, j]] * t[[n, j]];
+                }
+                grad[[n, i]] = weight * acc;
+            }
+        }
+        Self::flatten_matrix(&grad)
+    }
+
+    fn hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        if target.len() != v.len() {
+            return Array1::<f64>::zeros(target.len());
+        }
+        let Some(t) = self.target_matrix(target) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let Some(v_mat) = self.target_matrix(v) else {
+            return Array1::<f64>::zeros(target.len());
+        };
+        let weight = self.resolved_weight(rho);
+        let mut out = Array2::<f64>::zeros(t.dim());
+        for n in 0..v_mat.nrows() {
+            for i in 0..v_mat.ncols() {
+                let mut acc = 0.0;
+                for j in 0..v_mat.ncols() {
+                    acc += self.lambda_per_row[[n, i, j]] * v_mat[[n, j]];
+                }
+                out[[n, i]] = weight * acc;
+            }
+        }
+        Self::flatten_matrix(&out)
+    }
+
+    fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        if !self.learnable_weight {
+            return Array1::<f64>::zeros(0);
+        }
+        let mut out = Array1::<f64>::zeros(1);
+        out[self.rho_index] = self.value(target, rho);
+        out
+    }
+
+    fn rho_count(&self) -> usize {
+        usize::from(self.learnable_weight)
+    }
+
+    fn name(&self) -> &str {
+        "aux_conditional_prior"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Orthogonality penalty
 // ---------------------------------------------------------------------------
 
@@ -3497,6 +3831,7 @@ pub enum AnalyticPenaltyKind {
     TotalVariation(Arc<TotalVariationPenalty>),
     NuclearNorm(Arc<NuclearNormPenalty>),
     BlockSparsity(Arc<BlockSparsityPenalty>),
+    AuxConditionalPrior(Arc<AuxConditionalPriorPenalty>),
     Orthogonality(Arc<OrthogonalityPenalty>),
 }
 
@@ -3511,6 +3846,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.tier(),
             AnalyticPenaltyKind::NuclearNorm(p) => p.tier(),
             AnalyticPenaltyKind::BlockSparsity(p) => p.tier(),
+            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.tier(),
             AnalyticPenaltyKind::Orthogonality(p) => p.tier(),
         }
     }
@@ -3525,6 +3861,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.rho_count(),
             AnalyticPenaltyKind::NuclearNorm(p) => p.rho_count(),
             AnalyticPenaltyKind::BlockSparsity(p) => p.rho_count(),
+            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.rho_count(),
             AnalyticPenaltyKind::Orthogonality(p) => p.rho_count(),
         }
     }
@@ -3539,6 +3876,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.name(),
             AnalyticPenaltyKind::NuclearNorm(p) => p.name(),
             AnalyticPenaltyKind::BlockSparsity(p) => p.name(),
+            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.name(),
             AnalyticPenaltyKind::Orthogonality(p) => p.name(),
         }
     }
@@ -3553,6 +3891,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.value(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.value(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.value(target, rho),
+            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.value(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.value(target, rho),
         }
     }
@@ -3571,6 +3910,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_target(target, rho),
         }
     }
@@ -3589,6 +3929,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_rho(target, rho),
         }
     }
@@ -3607,6 +3948,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::NuclearNorm(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::BlockSparsity(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.hessian_diag(target, rho),
         }
     }
@@ -3633,6 +3975,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::TotalVariation(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::NuclearNorm(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::BlockSparsity(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::AuxConditionalPrior(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Orthogonality(p) => p.hvp(target, rho, v),
         }
     }
@@ -3773,6 +4116,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::BlockSparsity(p) => {
                 p.diag_target(self.target.view(), self.rho.view())
             }
+            AnalyticPenaltyKind::AuxConditionalPrior(p) => {
+                p.diag_target(self.target.view(), self.rho.view())
+            }
             AnalyticPenaltyKind::IBPAssignment(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
                 .expect("IBP assignment diag"),
@@ -3852,6 +4198,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             {
                 self.stochastic_log_det_plus_lambda_i(lambda)
             }
+            AnalyticPenaltyKind::AuxConditionalPrior(p) => {
+                p.log_det_plus_lambda_i(self.rho.view(), lambda)
+            }
             AnalyticPenaltyKind::BlockSparsity(_)
                 if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
             {
@@ -3874,6 +4223,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 return p.as_dense(self.target.view(), self.rho.view());
             }
             AnalyticPenaltyKind::BlockSparsity(p) => {
+                return p.as_dense(self.target.view(), self.rho.view());
+            }
+            AnalyticPenaltyKind::AuxConditionalPrior(p) => {
                 return p.as_dense(self.target.view(), self.rho.view());
             }
             AnalyticPenaltyKind::Orthogonality(p) => {
