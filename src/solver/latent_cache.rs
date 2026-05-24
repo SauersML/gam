@@ -182,6 +182,7 @@ pub(crate) enum LatentBasisKind {
     Sphere {
         centers: Array2<f64>,
         penalty_order: usize,
+        chunk_size: Option<usize>,
     },
     PeriodicBspline {
         domain_start: f64,
@@ -218,6 +219,10 @@ impl LatentBasisKind {
         matches!(
             self,
             Self::Matern {
+                chunk_size: Some(_),
+                ..
+            }
+            | Self::Sphere {
                 chunk_size: Some(_),
                 ..
             }
@@ -262,11 +267,13 @@ impl LatentBasisKind {
             Self::Sphere {
                 centers,
                 penalty_order,
+                chunk_size,
             } => {
                 hasher.write_usize(2);
                 hasher.write_usize(centers.nrows());
                 hasher.write_usize(centers.ncols());
                 hasher.write_usize(*penalty_order);
+                hash_optional_usize(*chunk_size, &mut hasher);
                 hash_matrix(centers, &mut hasher);
             }
             Self::PeriodicBspline {

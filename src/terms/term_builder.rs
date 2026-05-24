@@ -13,8 +13,9 @@ use crate::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
     BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy, DuchonBasisSpec,
     DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
-    MaternNu, OneDimensionalBoundary, SpatialIdentifiability, ThinPlateBasisSpec,
-    auto_spatial_center_strategy, default_num_centers, default_spatial_center_strategy,
+    MaternNu, OneDimensionalBoundary, SpatialIdentifiability, SphereMethod,
+    SphereWahbaKernel, SphericalSplineBasisSpec, ThinPlateBasisSpec, auto_spatial_center_strategy,
+    default_num_centers, default_spatial_center_strategy, default_spherical_harmonic_degree,
     plan_spatial_basis, resolve_duchon_orders,
 };
 use crate::inference::data::{EncodedDataset as Dataset, missing_column_message};
@@ -1334,26 +1335,40 @@ pub fn build_smooth_basis(
             })
         }
         "sphere" | "s2" | "sos" => {
+            validate_known_options(
+                "sphere",
+                options,
+                &[
+                    "type",
+                    "bs",
+                    "by",
+                    "centers",
+                    "k",
+                    "basis_dim",
+                    "basis-dim",
+                    "basisdim",
+                    "knots",
+                    "penalty_order",
+                    "m",
+                    "double_penalty",
+                    "id",
+                    "__by_col",
+                    "kernel",
+                    "method",
+                    "radians",
+                    "units",
+                    "degree",
+                    "l",
+                    "max_degree",
+                    "max-degree",
+                    "streaming_chunk_size",
+                    "chunk_size",
+                ],
+            )?;
             if cols.len() != 2 {
                 return Err(format!(
                     "sphere smooth expects exactly two variables (lat, lon), got {}",
                     cols.len()
-                ));
-            }
-            let max_degree =
-                option_usize_any(options, &["degree", "l", "max_degree", "max-degree"])
-                    .or_else(|| {
-                        option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
-                            .and_then(|k| (1..=128).find(|&l| l * (l + 2) >= k))
-                    })
-                    .unwrap_or_else(|| default_sphere_degree(ds.values.nrows()));
-            if max_degree == 0 {
-                return Err("sphere smooth requires degree/max_degree >= 1".to_string());
-            }
-            if max_degree > 32 {
-                return Err(format!(
-                    "sphere smooth max_degree={} is too large for the dense harmonic engine (limit 32)",
-                    max_degree
                 ));
             }
             let radians = option_bool(options, "radians").unwrap_or_else(|| {
@@ -1362,12 +1377,76 @@ pub fn build_smooth_basis(
                     .map(|u| u.eq_ignore_ascii_case("radian") || u.eq_ignore_ascii_case("radians"))
                     .unwrap_or(false)
             });
+            let kernel = options
+                .get("kernel")
+                .or_else(|| options.get("method"))
+                .map(|raw| strip_quotes(raw).trim().to_ascii_lowercase())
+                .unwrap_or_else(|| "sobolev".to_string());
+            let (method, wahba_kernel) = match kernel.as_str() {
+                "sobolev" | "wahba" => (SphereMethod::Wahba, SphereWahbaKernel::Sobolev),
+                "pseudo" | "mgcv" | "sos" => (SphereMethod::Wahba, SphereWahbaKernel::Pseudo),
+                "harmonic" | "spherical_harmonic" | "spherical-harmonic" => {
+                    (SphereMethod::Harmonic, SphereWahbaKernel::Sobolev)
+                }
+                other => {
+                    return Err(format!(
+                        "unsupported sphere kernel '{other}'; expected sobolev, pseudo, or harmonic"
+                    ));
+                }
+            };
+            let streaming_chunk_size = option_usize(options, "streaming_chunk_size")
+                .or_else(|| option_usize(options, "chunk_size"));
+            if matches!(method, SphereMethod::Harmonic) && streaming_chunk_size.is_some() {
+                return Err(
+                    "sphere streaming_chunk_size is only supported for Wahba kernels".to_string(),
+                );
+            }
+            let max_degree = if matches!(method, SphereMethod::Harmonic) {
+                let degree = option_usize_any(options, &["degree", "l", "max_degree", "max-degree"])
+                    .or_else(|| option_usize(options, "centers"))
+                    .or_else(|| {
+                        option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
+                            .and_then(|k| (1..=128).find(|&l| l * (l + 2) >= k))
+                    })
+                    .unwrap_or_else(|| default_spherical_harmonic_degree(ds.values.nrows()));
+                if degree == 0 {
+                    return Err("sphere smooth requires degree/max_degree >= 1".to_string());
+                }
+                if degree > 32 {
+                    return Err(format!(
+                        "sphere smooth max_degree={} is too large for the dense harmonic engine (limit 32)",
+                        degree
+                    ));
+                }
+                Some(degree)
+            } else {
+                None
+            };
+            let center_strategy = if matches!(method, SphereMethod::Wahba) {
+                let centers = parse_countwith_basis_alias(
+                    options,
+                    "centers",
+                    default_num_centers(ds.values.nrows(), cols.len()),
+                )?;
+                CenterStrategy::FarthestPoint {
+                    num_centers: centers,
+                }
+            } else {
+                CenterStrategy::FarthestPoint { num_centers: 0 }
+            };
             Ok(SmoothBasisSpec::Sphere {
                 feature_cols: cols.to_vec(),
-                spec: SphereBasisSpec {
-                    max_degree,
-                    radians,
+                spec: SphericalSplineBasisSpec {
+                    center_strategy,
+                    penalty_order: option_usize(options, "penalty_order")
+                        .or_else(|| option_usize(options, "m"))
+                        .unwrap_or(2),
                     double_penalty: smooth_double_penalty,
+                    radians,
+                    method,
+                    max_degree,
+                    wahba_kernel,
+                    streaming_chunk_size,
                 },
             })
         }
@@ -1788,18 +1867,6 @@ pub fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
 
 pub fn heuristic_centers(n: usize, d: usize) -> usize {
     default_num_centers(n, d)
-}
-
-pub fn default_sphere_degree(n: usize) -> usize {
-    // Real spherical harmonics through degree L have L(L+2) non-constant
-    // columns. Keep the default comfortably below n while permitting enough
-    // angular detail for ordinary sample sizes.
-    let target = ((n as f64).sqrt() as usize).clamp(3, 12);
-    let mut l = 1usize;
-    while l < 12 && l * (l + 2) < target {
-        l += 1;
-    }
-    l
 }
 
 // ---------------------------------------------------------------------------

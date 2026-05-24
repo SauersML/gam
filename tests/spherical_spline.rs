@@ -52,6 +52,7 @@ fn spherical_basis_builds_constrained_design_and_penalties() {
         method: gam::basis::SphereMethod::Wahba,
         max_degree: None,
         wahba_kernel: Default::default(),
+        streaming_chunk_size: None,
     };
 
     let built = build_spherical_spline_basis(data.view(), &spec).expect("sphere basis");
@@ -66,12 +67,16 @@ fn spherical_basis_builds_constrained_design_and_penalties() {
             penalty_order,
             method,
             max_degree,
+            wahba_kernel,
             constraint_transform,
+            streaming_chunk_size,
         } => {
             assert_eq!(centers, data);
             assert_eq!(penalty_order, 2);
             assert_eq!(method, gam::basis::SphereMethod::Wahba);
             assert_eq!(max_degree, None);
+            assert_eq!(wahba_kernel, Default::default());
+            assert_eq!(streaming_chunk_size, None);
             let z = constraint_transform.expect("coefficient constraint transform");
             let weights = centers
                 .column(0)
@@ -210,6 +215,7 @@ fn spherical_harmonic_basis_builds_with_correct_width_and_diagonal_penalty() {
         method: SphereMethod::Harmonic,
         max_degree: Some(3),
         wahba_kernel: Default::default(),
+        streaming_chunk_size: None,
     };
     let built = build_spherical_spline_basis(data.view(), &spec).expect("sphere harmonic basis");
     // dim = L(L+2) = 3*5 = 15
@@ -244,6 +250,7 @@ fn spherical_harmonic_penalty_order_changes_penalty_shape() {
         method: SphereMethod::Harmonic,
         max_degree: Some(3),
         wahba_kernel: Default::default(),
+        streaming_chunk_size: None,
     };
     let p1 = build_spherical_spline_basis(data.view(), &spec)
         .expect("m=1 harmonic basis")
@@ -275,6 +282,7 @@ fn spherical_harmonic_rejects_invalid_penalty_order() {
         method: SphereMethod::Harmonic,
         max_degree: Some(2),
         wahba_kernel: Default::default(),
+        streaming_chunk_size: None,
     };
     let err = build_spherical_spline_basis(data.view(), &spec)
         .expect_err("invalid harmonic penalty order");
@@ -304,6 +312,7 @@ fn spherical_harmonic_basis_rotation_invariant_gram_under_longitude_shift() {
         method: SphereMethod::Harmonic,
         max_degree: Some(3),
         wahba_kernel: Default::default(),
+        streaming_chunk_size: None,
     };
     let a = build_spherical_spline_basis(data.view(), &spec).expect("base");
     let b = build_spherical_spline_basis(rotated.view(), &spec).expect("rotated");
@@ -348,6 +357,7 @@ fn spherical_harmonic_basis_accepts_non_contiguous_views() {
         method: SphereMethod::Harmonic,
         max_degree: Some(2),
         wahba_kernel: Default::default(),
+        streaming_chunk_size: None,
     };
     let built = build_spherical_spline_basis(data, &spec)
         .expect("harmonic basis should not require contiguous lat/lon rows");
@@ -368,6 +378,7 @@ fn spherical_basis_rejects_bad_latitudes_and_wrong_dimension() {
         method: gam::basis::SphereMethod::Wahba,
         max_degree: None,
         wahba_kernel: Default::default(),
+        streaming_chunk_size: None,
     };
     let err = build_spherical_spline_basis(bad_lat.view(), &spec).expect_err("invalid latitude");
     assert!(err.to_string().contains("latitude must be in [-90, 90]"));
