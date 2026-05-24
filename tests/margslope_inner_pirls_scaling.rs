@@ -281,7 +281,7 @@ fn margslope_inner_pirls_scaling_law() {
         })
         .collect();
     eprintln!();
-    let _ = report_power_law(
+    report_power_law(
         "[MS-INNER-SCALING-PER-OUTER]",
         &per_outer_pts,
         &[("n=320k", 320_000.0)],
@@ -299,7 +299,7 @@ fn margslope_inner_pirls_scaling_law() {
         })
         .collect();
     eprintln!();
-    let _ = report_power_law(
+    report_power_law(
         "[MS-INNER-SCALING-PER-INNER]",
         &per_inner_pts,
         &[("n=320k", 320_000.0)],
@@ -340,7 +340,7 @@ fn margslope_inner_pirls_flex_scaling_law() {
     // Warm up: a single small fit so the first measured timing isn't
     // dominated by Rayon pool init / faer factorization JIT / page
     // faults on freshly mmap'd allocator pages.
-    let _ = run_fit(300, true);
+    run_fit(300, true);
 
     // FLEXIBLE margslope: score_warp + link_dev cubic deviations engaged.
     // The per-row sextic-kernel intercept root-find runs at every inner-
@@ -404,7 +404,7 @@ fn margslope_inner_pirls_flex_scaling_law() {
         })
         .collect();
     eprintln!();
-    let _ = report_power_law(
+    report_power_law(
         "[MS-INNER-FLEX-SCALING-PER-OUTER]",
         &per_outer_pts,
         &[("n=320k", 320_000.0)],
@@ -422,7 +422,7 @@ fn margslope_inner_pirls_flex_scaling_law() {
         })
         .collect();
     eprintln!();
-    let _ = report_power_law(
+    report_power_law(
         "[MS-INNER-FLEX-SCALING-PER-INNER]",
         &per_inner_pts,
         &[("n=320k", 320_000.0)],

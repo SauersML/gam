@@ -75,7 +75,7 @@ fn bc_option_with_list_value_parses() {
 fn matern_nu_decimal_and_fraction_both_parse() {
     for nu in ["1/2", "0.5", "3/2", "1.5", "5/2", "2.5", "half"] {
         let f = format!("y ~ matern(x, nu={nu})");
-        let _ = parse_formula(&f).unwrap_or_else(|e| panic!("`{f}` parse failed: {e}"));
+        parse_formula(&f).unwrap_or_else(|e| panic!("`{f}` parse failed: {e}"));
     }
 }
 
@@ -88,7 +88,7 @@ fn periodic_period_decimal_and_2pi_expressions_parse() {
         "period=100",
     ] {
         let f = format!("y ~ s(t, periodic=true, {spec})");
-        let _ = parse_formula(&f).unwrap_or_else(|e| panic!("`{f}` parse failed: {e}"));
+        parse_formula(&f).unwrap_or_else(|e| panic!("`{f}` parse failed: {e}"));
     }
 }
 

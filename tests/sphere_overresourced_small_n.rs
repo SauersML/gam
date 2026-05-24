@@ -9,7 +9,6 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 use ndarray::Array2;
-use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -70,7 +69,6 @@ fn try_predict(formula: &str, n: usize) -> Result<(f64, f64), String> {
 #[test]
 fn sphere_wahba_over_resourced_does_not_explode() {
     init_parallelism();
-    let _ = RngExt::random::<f64>(&mut StdRng::seed_from_u64(0));
     let mut failures = Vec::new();
     // 50 centers on 30 obs is heavily over-resourced.
     for (k, n) in [(50usize, 30usize), (50, 50), (100, 50), (100, 100)] {

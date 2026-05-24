@@ -302,10 +302,7 @@ pub trait AnalyticPenalty: Send + Sync {
             rho.iter().all(|value| value.is_finite()),
             "analytic-penalty rho must be finite"
         );
-        if target.is_empty() {
-            return Some(Array1::zeros(0));
-        }
-        None
+        unavailable_hessian_diag(target.len())
     }
 
     /// Hessian-vector product `H v = (∂²P/∂target²) v`. Default implementation
@@ -377,6 +374,14 @@ pub trait AnalyticPenalty: Send + Sync {
             iter < 1_000_000,
             "apply_schedule received implausible outer iteration {iter}",
         );
+    }
+}
+
+fn unavailable_hessian_diag(len: usize) -> Option<Array1<f64>> {
+    if len == 0 {
+        Some(Array1::zeros(0))
+    } else {
+        None
     }
 }
 
@@ -1517,14 +1522,17 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
+        assert_eq!(rho.len(), 1, "softmax entropy expects one rho parameter");
         assert!(
             rho.iter().all(|value| value.is_finite()),
             "softmax entropy rho must be finite"
         );
-        if target.is_empty() {
-            return Some(Array1::zeros(0));
-        }
-        None
+        assert_eq!(
+            target.len() % self.k_atoms,
+            0,
+            "softmax entropy target length must be divisible by k_atoms"
+        );
+        unavailable_hessian_diag(target.len())
     }
 
     fn hvp(

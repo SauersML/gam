@@ -1145,7 +1145,11 @@ fn thin_plate_penalty<'py>(
     m: usize,
     length_scale: f64,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    drop(m);
+    if m != 2 {
+        return Err(py_value_error(
+            "thin_plate_penalty currently supports only the canonical m=2 penalty".to_string(),
+        ));
+    }
     let matrix = build_thin_plate_penalty_matrix(centers.as_array(), length_scale)
         .map_err(|err| py_value_error(err.to_string()))?;
     Ok(matrix.penalty.into_pyarray(py).unbind())
@@ -2773,9 +2777,35 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     grad_reml_score: f64,
     grad_edf: f64,
 ) -> PyResult<Py<PyDict>> {
-    drop(b_inequality);
-    drop(coefficients_at_optimum);
-    drop(fitted_at_optimum);
+    if let Some(b) = b_inequality.as_ref() {
+        if b.as_array().iter().any(|value| value.abs() > 0.0) {
+            return Err(py_value_error(
+                "gaussian_reml_fit_with_constraints_backward supports only zero-bound inequality certificates".to_string(),
+            ));
+        }
+    }
+    if let Some(coefficients) = coefficients_at_optimum.as_ref() {
+        let coeffs = coefficients.as_array();
+        if coeffs.nrows() != x.as_array().ncols() || coeffs.ncols() != y.as_array().ncols() {
+            return Err(py_value_error(format!(
+                "coefficients_at_optimum shape mismatch: expected ({}, {}), got ({}, {})",
+                x.as_array().ncols(),
+                y.as_array().ncols(),
+                coeffs.nrows(),
+                coeffs.ncols()
+            )));
+        }
+    }
+    if let Some(fitted) = fitted_at_optimum.as_ref() {
+        let fit = fitted.as_array();
+        if fit.dim() != y.as_array().dim() {
+            return Err(py_value_error(format!(
+                "fitted_at_optimum shape mismatch: expected {:?}, got {:?}",
+                y.as_array().dim(),
+                fit.dim()
+            )));
+        }
+    }
 
     // Determine whether the active set is empty (interior cert).
     let active_empty = match active_indices.as_ref() {

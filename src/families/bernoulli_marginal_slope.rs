@@ -17171,7 +17171,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
             anchors.push(CrossBlockAnchor::FlexEvaluation(a));
             anchor_tags.push(None);
         }
-        drop(link_dev_seed); // padded knot-seed retained only for knot construction
         // W-metric for link-deviation orthogonalisation: same IRLS-style
         // probit Hessian row weight as the score-warp path, but evaluated at
         // `eta_pilot` (the one-GN-stepped pilot at which the link-dev basis
@@ -17766,7 +17765,6 @@ mod tests {
         )
         .expect("link-deviation fixture");
         let p_link_before = link_prepared.runtime.basis_dim();
-        let _ = link_seed; // padded knot-seed retained only for knot construction
         let anchor_design_for_test = score_prepared
             .runtime
             .design(&z)
@@ -17850,7 +17848,6 @@ mod tests {
             &link_seed, &q0_seed, &link_cfg,
         )
         .expect("link-dev fixture");
-        let _ = link_seed;
         let p_before = link_prepared.runtime.basis_dim();
         assert!(p_before > 0, "fixture must have positive basis_dim");
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
@@ -17913,7 +17910,6 @@ mod tests {
             &link_seed, &q0_seed, &link_cfg,
         )
         .expect("link-dev fixture");
-        let _ = link_seed;
         let p_before = link_prepared.runtime.basis_dim();
         assert!(
             p_before >= 2,
@@ -17998,7 +17994,6 @@ mod tests {
             &link_seed, &q0_seed, &link_cfg,
         )
         .expect("link-dev fixture");
-        let _ = link_seed;
         let candidate_design = link_prepared
             .runtime
             .design(&q0_seed)
@@ -18075,7 +18070,6 @@ mod tests {
             &link_seed, &q0_seed, &link_cfg,
         )
         .expect("link-dev fixture");
-        let _ = link_seed;
         let candidate_design = link_prepared
             .runtime
             .design(&q0_seed)
@@ -18146,19 +18140,18 @@ mod tests {
     }
 
     #[test]
-    fn flex_hessian_matvec_parallel_chunks_match_serial_reference() {
+    fn flex_hessian_matvec_matches_dense_hessian() {
         assert!(file!().ends_with(".rs"));
         let (family, states, cache, direction) =
             flex_hessian_matvec_fixture(96).expect("flex Hv fixture");
-        let serial = family
-            .exact_newton_joint_hessian_matvec_from_cache_serial_reference(
-                &direction, &states, &cache,
-            )
-            .expect("serial reference Hv");
-        let parallel = family
+        let dense = family
+            .exact_newton_joint_hessian_dense_from_cache(&states, &cache)
+            .expect("dense Hessian");
+        let from_matvec = family
             .exact_newton_joint_hessian_matvec_from_cache(&direction, &states, &cache)
             .expect("parallel chunked Hv");
-        assert_allclose_relative(&parallel, &serial, 1.0e-13);
+        let from_dense = dense.dot(&direction);
+        assert_allclose_relative(&from_matvec, &from_dense, 1.0e-13);
     }
 
     #[test]
@@ -18452,7 +18445,7 @@ mod tests {
             .build_exact_eval_cache(&block_states)
             .expect("exact eval cache");
         let row_ctx = family
-            .build_row_exact_context(0, &block_states)
+            .build_row_exact_context_with_stats_and_cell_cache(0, &block_states, None, true)
             .expect("row context");
         let bad_dir = array![1.0];
         let good_dir = array![0.0, 1.0];
@@ -19324,7 +19317,7 @@ mod tests {
             .build_exact_eval_cache(&block_states)
             .expect("eval cache");
         let row_ctx = family
-            .build_row_exact_context(0, &block_states)
+            .build_row_exact_context_with_stats_and_cell_cache(0, &block_states, None, true)
             .expect("row context");
         let (nll, grad, hess) = family
             .compute_row_primary_gradient_hessian(0, &block_states, &primary, &row_ctx)
@@ -20945,7 +20938,7 @@ mod tests {
             .build_exact_eval_cache(&block_states)
             .expect("rigid exact eval cache");
         let row_ctx = family
-            .build_row_exact_context(0, &block_states)
+            .build_row_exact_context_with_stats_and_cell_cache(0, &block_states, None, true)
             .expect("rigid row context");
         let (_, primary_grad, primary_hess) = family
             .compute_row_primary_gradient_hessian(0, &block_states, &cache.primary, &row_ctx)
@@ -21050,7 +21043,7 @@ mod tests {
         // regimes (negative tail, near zero, positive tail).
         for row in 0..seed.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
 
             let (_, grad, hess) = family
@@ -21152,7 +21145,7 @@ mod tests {
 
         for row in 0..seed.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
 
             let (_, grad, hess) = family
@@ -21527,7 +21520,7 @@ mod tests {
         let mut max_abs_fourth = 0.0_f64;
         for row in 0..seed.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third = family
                 .row_primary_third_contracted_recompute(
@@ -21660,7 +21653,7 @@ mod tests {
         let mut max_abs_fourth = 0.0_f64;
         for row in 0..seed.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third = family
                 .row_primary_third_contracted_recompute(
@@ -21816,7 +21809,7 @@ mod tests {
         let mut max_abs_fourth = 0.0_f64;
         for row in 0..z.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third = family
                 .row_primary_third_contracted_recompute(
@@ -21950,7 +21943,7 @@ mod tests {
         let zero = Array1::<f64>::zeros(cache.primary.total);
         for row in 0..z.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third = family
                 .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &zero)
@@ -22036,7 +22029,7 @@ mod tests {
         let zero = Array1::<f64>::zeros(cache.primary.total);
         for row in 0..seed.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third = family
                 .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &zero)
@@ -22122,7 +22115,7 @@ mod tests {
         let zero = Array1::<f64>::zeros(cache.primary.total);
         for row in 0..seed.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third = family
                 .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &zero)
@@ -22453,7 +22446,7 @@ mod tests {
 
         for row in 0..z.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let forward = family
                 .row_primary_fourth_contracted_recompute(
@@ -22586,7 +22579,7 @@ mod tests {
         let neg_dir_u = dir_u.mapv(|value| -value);
         for row in 0..z.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third = family
                 .row_primary_third_contracted_recompute(
@@ -22714,7 +22707,7 @@ mod tests {
 
         for row in 0..seed.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let forward = family
                 .row_primary_fourth_contracted_recompute(
@@ -22820,7 +22813,7 @@ mod tests {
 
         for row in 0..seed.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let forward = family
                 .row_primary_fourth_contracted_recompute(
@@ -22919,7 +22912,7 @@ mod tests {
 
         for row in 0..seed.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third = family
                 .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir)
@@ -23036,7 +23029,7 @@ mod tests {
 
         for row in 0..seed.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third = family
                 .row_primary_third_contracted_recompute(row, &block_states, &cache, &row_ctx, &dir)
@@ -23553,7 +23546,7 @@ mod tests {
         let dir_sum = &dir_u + &dir_v;
         for row in 0..z.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third_u = family
                 .row_primary_third_contracted_recompute(
@@ -23668,7 +23661,7 @@ mod tests {
         let dir_sum = &dir_u + &dir_v;
         for row in 0..seed.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third_u = family
                 .row_primary_third_contracted_recompute(
@@ -23783,7 +23776,7 @@ mod tests {
         let dir_sum = &dir_u + &dir_v;
         for row in 0..seed.len() {
             let row_ctx = family
-                .build_row_exact_context(row, &block_states)
+                .build_row_exact_context_with_stats_and_cell_cache(row, &block_states, None, true)
                 .unwrap_or_else(|e| panic!("row {row}: build_row_exact_context failed: {e}"));
             let third_u = family
                 .row_primary_third_contracted_recompute(

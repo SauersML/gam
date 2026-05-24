@@ -11844,7 +11844,6 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         let workspace = GaussianLocationScaleWiggleHessianWorkspace::new(
             self.clone(),
             block_states.to_vec(),
-            specs.to_vec(),
             xmu.into_owned(),
             x_ls.into_owned(),
         )?;
@@ -11882,7 +11881,6 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         let mut workspace = GaussianLocationScaleWiggleHessianWorkspace::new(
             self.clone(),
             block_states.to_vec(),
-            specs.to_vec(),
             xmu.into_owned(),
             x_ls.into_owned(),
         )?;
@@ -11968,11 +11966,9 @@ impl GaussianLocationScaleWiggleHessianWorkspace {
     fn new(
         family: GaussianLocationScaleWiggleFamily,
         block_states: Vec<ParameterBlockState>,
-        specs: Vec<ParameterBlockSpec>,
         xmu: Array2<f64>,
         x_ls: Array2<f64>,
     ) -> Result<Self, String> {
-        drop(specs);
         let pieces = family.wiggle_hessian_row_pieces(&block_states)?;
         Ok(Self {
             family,
@@ -16955,7 +16951,6 @@ impl CustomFamily for BinomialLocationScaleFamily {
         let workspace = BinomialLocationScaleHessianWorkspace::new(
             self.clone(),
             block_states.to_vec(),
-            specs.to_vec(),
             x_t,
             x_ls,
         )?;
@@ -16987,7 +16982,6 @@ impl CustomFamily for BinomialLocationScaleFamily {
         let mut workspace = BinomialLocationScaleHessianWorkspace::new(
             self.clone(),
             block_states.to_vec(),
-            specs.to_vec(),
             x_t,
             x_ls,
         )?;
@@ -17592,11 +17586,9 @@ impl BinomialLocationScaleHessianWorkspace {
     fn new(
         family: BinomialLocationScaleFamily,
         block_states: Vec<ParameterBlockState>,
-        specs: Vec<ParameterBlockSpec>,
         x_t: DesignMatrix,
         x_ls: DesignMatrix,
     ) -> Result<Self, String> {
-        drop(specs);
         let eta_t = &block_states[BinomialLocationScaleFamily::BLOCK_T].eta;
         let eta_ls = &block_states[BinomialLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
         let core = binomial_location_scale_core(
@@ -21511,7 +21503,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let workspace = BinomialLocationScaleWiggleHessianWorkspace::new(
             self.clone(),
             block_states.to_vec(),
-            specs.to_vec(),
             x_t.into_owned(),
             x_ls.into_owned(),
         )?;
@@ -21545,7 +21536,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let mut workspace = BinomialLocationScaleWiggleHessianWorkspace::new(
             self.clone(),
             block_states.to_vec(),
-            specs.to_vec(),
             x_t.into_owned(),
             x_ls.into_owned(),
         )?;
@@ -22244,11 +22234,9 @@ impl BinomialLocationScaleWiggleHessianWorkspace {
     fn new(
         family: BinomialLocationScaleWiggleFamily,
         block_states: Vec<ParameterBlockState>,
-        specs: Vec<ParameterBlockSpec>,
         x_t: Array2<f64>,
         x_ls: Array2<f64>,
     ) -> Result<Self, String> {
-        drop(specs);
         let pieces = family.wiggle_hessian_row_pieces(&block_states)?;
         Ok(Self {
             family,
@@ -28985,7 +28973,6 @@ mod tests {
         };
 
         let specs = vec![base.threshold_spec, base.log_sigma_spec];
-        let penalty_counts = vec![1usize, 1usize];
         let rho = array![0.05, -0.15];
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -28994,14 +28981,22 @@ mod tests {
             ..BlockwiseFitOptions::default()
         };
 
-        let (f0, g0) = crate::families::custom_family::test_support::test_outerobjective_andgradient(
-            &family,
-            &specs,
-            &options,
-            &penalty_counts,
-            &rho,
-        )
-        .expect("objective+gradient at rho");
+        let eval_outer = |rho: &Array1<f64>| {
+            let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()];
+            let result = evaluate_custom_family_joint_hyper(
+                &family,
+                &specs,
+                &options,
+                rho,
+                &derivative_blocks,
+                None,
+                crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient,
+            )
+            .expect("objective+gradient at rho");
+            (result.objective, result.gradient)
+        };
+
+        let (f0, g0) = eval_outer(&rho);
         assert!(f0.is_finite(), "outer cost must be finite at rho");
         assert_eq!(g0.len(), rho.len());
 
@@ -29018,22 +29013,8 @@ mod tests {
             let mut rho_m = rho.clone();
             rho_p[k] += h;
             rho_m[k] -= h;
-            let (fp, _) = crate::families::custom_family::test_support::test_outerobjective_andgradient(
-                &family,
-                &specs,
-                &options,
-                &penalty_counts,
-                &rho_p,
-            )
-            .expect("objective at rho+h");
-            let (fm, _) = crate::families::custom_family::test_support::test_outerobjective_andgradient(
-                &family,
-                &specs,
-                &options,
-                &penalty_counts,
-                &rho_m,
-            )
-            .expect("objective at rho-h");
+            let (fp, _) = eval_outer(&rho_p);
+            let (fm, _) = eval_outer(&rho_m);
             let gfd = (fp - fm) / (2.0 * h);
             let both_in_noise = g0[k].abs() < noise_floor && gfd.abs() < noise_floor;
             if !both_in_noise {

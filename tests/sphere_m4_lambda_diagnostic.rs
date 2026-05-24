@@ -51,7 +51,6 @@ fn sphere_m_sweep_lambda_diagnostic() {
     };
 
     // Compute response mean for reference (where collapsed fits should land).
-    let n_train = 400usize;
     eprintln!("\n=========================================================");
     eprintln!("[diag] sphere m-sweep, n=400, seed=7, truth peak-to-peak ~1.4");
     eprintln!("=========================================================\n");
@@ -149,7 +148,6 @@ fn sphere_m_sweep_lambda_diagnostic() {
             var_pred / truth_var
         );
         eprintln!();
-        let _ = n_train; // silence unused if cfg shifts
     }
     eprintln!("=========================================================\n");
 }
