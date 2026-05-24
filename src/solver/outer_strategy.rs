@@ -1678,10 +1678,11 @@ pub trait OuterObjective {
     /// Evaluate cost + EFS step vector. Only needed when the plan selects
     /// `Solver::Efs`. The default returns an error indicating EFS is not
     /// supported by this objective.
-    fn eval_efs(&mut self, _: &Array1<f64>) -> Result<EfsEval, EstimationError> {
-        Err(EstimationError::RemlOptimizationFailed(
-            "EFS evaluation not implemented for this objective".to_string(),
-        ))
+    fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
+        Err(EstimationError::RemlOptimizationFailed(format!(
+            "EFS evaluation not implemented for this objective at rho_dim={}",
+            rho.len()
+        )))
     }
 
     /// Restore to a clean baseline for the next multi-start candidate.
@@ -8926,8 +8927,8 @@ mod tests {
                 })
             }
             fn reset(&mut self) {}
-            fn seed_inner_state(&mut self, _: &Array1<f64>) -> Result<(), EstimationError> {
-                *self.seed_calls.lock().unwrap() += 1;
+            fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
+                *self.seed_calls.lock().unwrap() += beta.len().max(1);
                 Ok(())
             }
         }

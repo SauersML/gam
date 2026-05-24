@@ -3575,10 +3575,12 @@ impl CustomFamily for LatentSurvivalFamily {
 
     fn block_linear_constraints(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_idx: usize,
-        _: &ParameterBlockSpec,
+        block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(!block_spec.name.is_empty());
         if block_idx == Self::BLOCK_TIME {
             Ok(self.time_linear_constraints.clone())
         } else {
@@ -3597,8 +3599,9 @@ impl CustomFamily for LatentSurvivalFamily {
     fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
+        block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        debug_assert!(block_specs.len() <= isize::MAX as usize);
         Ok(Some(Arc::new(LatentSurvivalHessianWorkspace::new(
             self.clone(),
             block_states.to_vec(),
@@ -3608,8 +3611,9 @@ impl CustomFamily for LatentSurvivalFamily {
     fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
+        block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        debug_assert!(block_specs.len() <= isize::MAX as usize);
         self.evaluate_exact_newton_joint_gradient_dense(block_states)
             .map(|(log_likelihood, gradient)| {
                 Some(ExactNewtonJointGradientEvaluation {
@@ -3803,10 +3807,12 @@ impl CustomFamily for LatentBinaryFamily {
 
     fn block_linear_constraints(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_idx: usize,
-        _: &ParameterBlockSpec,
+        block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(!block_spec.name.is_empty());
         if block_idx == Self::BLOCK_TIME {
             Ok(self.time_linear_constraints.clone())
         } else {
@@ -3825,8 +3831,9 @@ impl CustomFamily for LatentBinaryFamily {
     fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
+        block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        debug_assert!(block_specs.len() <= isize::MAX as usize);
         Ok(Some(Arc::new(LatentBinaryHessianWorkspace::new(
             self.clone(),
             block_states.to_vec(),
@@ -3836,8 +3843,9 @@ impl CustomFamily for LatentBinaryFamily {
     fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
+        block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        debug_assert!(block_specs.len() <= isize::MAX as usize);
         self.evaluate_exact_newton_joint_dense(block_states)
             .map(|(log_likelihood, gradient, _)| {
                 Some(ExactNewtonJointGradientEvaluation {

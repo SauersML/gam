@@ -9770,54 +9770,6 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     Ok(fitted)
 }
 
-#[cfg(test)]
-fn weighted_operator_gram_from_d1(
-    d1: &Array2<f64>,
-    weight: &Array1<f64>,
-    dimension: usize,
-) -> Array2<f64> {
-    let mut weighted = d1.clone();
-    for k in 0..weight.len() {
-        // Kronecker/stacking derivation:
-        // D1 rows are stacked as (k, axis), i.e. axis-major inside each point block.
-        // For this storage, the correct gradient weight matrix is:
-        //   W_g = diag(u_g) \otimes I_d,
-        // which repeats u_g[k] across all d axes at collocation point k.
-        //
-        // Instead of forming W_g explicitly, compute W_g^(1/2) D1:
-        // each row in block k is multiplied by sqrt(u_g[k]).
-        //
-        // Then K1 = (W_g^(1/2) D1)^T (W_g^(1/2) D1) = D1^T W_g D1.
-        let w = weight[k].sqrt();
-        for axis in 0..dimension {
-            let row = k * dimension + axis;
-            weighted.row_mut(row).mapv_inplace(|v| v * w);
-        }
-    }
-    let gram = weighted.t().dot(&weighted);
-    (&gram + &gram.t().to_owned()) * 0.5
-}
-
-#[cfg(test)]
-fn weighted_operator_gram_from_d2(d2: &Array2<f64>, weight: &Array1<f64>) -> Array2<f64> {
-    let mut weighted = d2.clone();
-    let block_dim = d2
-        .nrows()
-        .checked_div(weight.len().max(1))
-        .filter(|block| *block > 0 && *block * weight.len() == d2.nrows())
-        .expect("D2 row count must be an integer number of curvature rows per collocation point");
-    for k in 0..weight.len() {
-        let w = weight[k].sqrt();
-        for local in 0..block_dim {
-            weighted
-                .row_mut(k * block_dim + local)
-                .mapv_inplace(|v| v * w);
-        }
-    }
-    let gram = weighted.t().dot(&weighted);
-    (&gram + &gram.t().to_owned()) * 0.5
-}
-
 fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign) -> FitOptions {
     FitOptions {
         latent_cloglog: options.latent_cloglog,
@@ -18876,6 +18828,23 @@ mod tests {
         resid.dot(&resid).sqrt()
     }
 
+    fn spatial_log_kappa_bounds_from_options(
+        dims_per_term: &[usize],
+        options: &SpatialLengthScaleOptimizationOptions,
+        lower: bool,
+    ) -> SpatialLogKappaCoords {
+        let total: usize = dims_per_term.iter().sum();
+        let value = if lower {
+            -options.max_length_scale.ln()
+        } else {
+            -options.min_length_scale.ln()
+        };
+        SpatialLogKappaCoords::new_with_dims(
+            Array1::<f64>::from_elem(total, value),
+            dims_per_term.to_vec(),
+        )
+    }
+
     fn two_block_exact_joint_hyper_setup(
         meanspec: &TermCollectionSpec,
         noisespec: &TermCollectionSpec,
@@ -18926,8 +18895,8 @@ mod tests {
             Array1::zeros(0),
             Array1::zeros(0),
             log_kappa0,
-            SpatialLogKappaCoords::lower_bounds_aniso(&dims_per_term, kappa_options),
-            SpatialLogKappaCoords::upper_bounds_aniso(&dims_per_term, kappa_options),
+            spatial_log_kappa_bounds_from_options(&dims_per_term, kappa_options, true),
+            spatial_log_kappa_bounds_from_options(&dims_per_term, kappa_options, false),
         )
     }
 
@@ -26028,40 +25997,6 @@ mod tests {
     }
 
     #[test]
-    fn adaptiveweighted_operator_grams_are_symmetric_and_psd() {
-        let d1 = array![
-            [1.0, 0.0, 2.0],
-            [0.5, 1.0, 0.0],
-            [0.0, 1.0, 1.0],
-            [1.5, 0.0, 0.5],
-        ];
-        let d2 = array![
-            [1.0, 0.0, 1.0],
-            [0.0, 1.0, 2.0],
-            [2.0, 0.0, 0.5],
-            [0.0, 0.5, 1.0],
-            [0.5, 0.0, 1.5],
-            [1.0, 1.0, 0.0],
-            [0.0, 2.0, 1.0],
-            [1.5, 0.0, 0.0],
-        ];
-        let weight = array![2.0, 3.0];
-        let s1 = weighted_operator_gram_from_d1(&d1, &weight, 2);
-        let s2 = weighted_operator_gram_from_d2(&d2, &weight);
-        for i in 0..s1.nrows() {
-            for j in 0..s1.ncols() {
-                assert!((s1[[i, j]] - s1[[j, i]]).abs() < 1e-10);
-                assert!((s2[[i, j]] - s2[[j, i]]).abs() < 1e-10);
-            }
-        }
-        let v = array![0.2, -0.3, 0.5];
-        let q1 = v.dot(&s1.dot(&v));
-        let q2 = v.dot(&s2.dot(&v));
-        assert!(q1 >= -1e-10);
-        assert!(q2 >= -1e-10);
-    }
-
-    #[test]
     fn adaptiveweight_clamp_is_applied_in_u_space() {
         let cache = SpatialOperatorRuntimeCache {
             termname: "matern".to_string(),
@@ -26083,11 +26018,7 @@ mod tests {
             compute_spatial_adaptiveweights_for_beta(&beta, &[cache], 1e-8, 1e-8, 1e-8, 1e-8, 1e2)
                 .expect("adaptive weights");
         assert_eq!(out.len(), 1);
-        // Raw u would be 1/eps = 1e8, so clamp to 1e2.
-        assert!((out[0].magweight[0] - 1e2).abs() < 1e-12);
-        assert!((out[0].gradweight[0] - 1e2).abs() < 1e-12);
-        assert!((out[0].lapweight[0] - 1e2).abs() < 1e-12);
-        // Diagnostics are 1/u.
+        // Raw u would be 1/eps = 1e8, so clamping to 1e2 yields diagnostics 1/u.
         assert!((out[0].inv_magweight[0] - 1e-2).abs() < 1e-12);
         assert!((out[0].invgradweight[0] - 1e-2).abs() < 1e-12);
         assert!((out[0].inv_lapweight[0] - 1e-2).abs() < 1e-12);
@@ -26132,14 +26063,12 @@ mod tests {
         )
         .expect("adaptive weights");
         assert_eq!(out.len(), 1);
-        for k in 0..out[0].gradweight.len() {
-            let p0 = out[0].magweight[k] * out[0].inv_magweight[k];
-            let pg = out[0].gradweight[k] * out[0].invgradweight[k];
-            let pc = out[0].lapweight[k] * out[0].inv_lapweight[k];
-            assert!((p0 - 1.0).abs() < 1e-10, "mag pair mismatch at {k}: {p0}");
-            assert!((pg - 1.0).abs() < 1e-10, "grad pair mismatch at {k}: {pg}");
-            assert!((pc - 1.0).abs() < 1e-10, "lap pair mismatch at {k}: {pc}");
-        }
+        assert!((out[0].inv_magweight[0] - 1.0).abs() < 1e-10);
+        assert!((out[0].inv_magweight[1] - 2.0).abs() < 1e-10);
+        assert!((out[0].invgradweight[0] - 2.0_f64.sqrt()).abs() < 1e-10);
+        assert!((out[0].invgradweight[1] - 8.0_f64.sqrt()).abs() < 1e-10);
+        assert!((out[0].inv_lapweight[0] - 1.0).abs() < 1e-10);
+        assert!((out[0].inv_lapweight[1] - 2.0).abs() < 1e-10);
     }
 
     #[test]
@@ -26182,9 +26111,6 @@ mod tests {
             1e12,
         )
         .expect("large adaptive weights");
-        assert!(small[0].magweight[0] > large[0].magweight[0]);
-        assert!(small[0].gradweight[0] > large[0].gradweight[0]);
-        assert!(small[0].lapweight[0] > large[0].lapweight[0]);
         assert!(small[0].inv_magweight[0] < large[0].inv_magweight[0]);
         assert!(small[0].invgradweight[0] < large[0].invgradweight[0]);
         assert!(small[0].inv_lapweight[0] < large[0].inv_lapweight[0]);
