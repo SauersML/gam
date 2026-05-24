@@ -6089,10 +6089,16 @@ fn outer_efs_result_to_joint_hyper_efs_result(
 
 #[derive(Debug, Clone, Error)]
 pub enum CustomFamilyError {
-    #[error("custom-family invalid input: {0}")]
-    InvalidInput(String),
-    #[error("custom-family optimization error: {0}")]
-    Optimization(String),
+    #[error("custom-family invalid input in {context}: {reason}")]
+    InvalidInput {
+        context: &'static str,
+        reason: String,
+    },
+    #[error("custom-family optimization error in {context}: {reason}")]
+    Optimization {
+        context: &'static str,
+        reason: String,
+    },
     #[error("{reason}")]
     DimensionMismatch { reason: String },
     #[error("{reason}")]
@@ -6107,7 +6113,10 @@ pub enum CustomFamilyError {
 
 impl From<String> for CustomFamilyError {
     fn from(value: String) -> Self {
-        Self::InvalidInput(value)
+        Self::InvalidInput {
+            context: "custom-family string boundary",
+            reason: value,
+        }
     }
 }
 
@@ -17243,9 +17252,10 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     let rho_dim = penalty_counts.iter().sum::<usize>();
     let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
     if psi_dim == 0 {
-        return Err(CustomFamilyError::InvalidInput(
-            "joint hyper EFS requires at least one ψ coordinate".to_string(),
-        ));
+        return Err(CustomFamilyError::InvalidInput {
+            context: "evaluate_custom_family_joint_hyper_efs",
+            reason: "joint hyper EFS requires at least one ψ coordinate".to_string(),
+        });
     }
     if rho_current.len() != rho_dim {
         return Err(CustomFamilyError::DimensionMismatch {
@@ -18718,8 +18728,9 @@ fn compute_joint_covariance_required<F: CustomFamily + Clone + Send + Sync + 'st
     }
     compute_joint_covariance(family, specs, states, per_block_log_lambdas, options)
         .map(Some)
-        .map_err(|e| {
-            CustomFamilyError::InvalidInput(format!("joint covariance computation failed: {e}"))
+        .map_err(|e| CustomFamilyError::InvalidInput {
+            context: "compute_joint_covariance_required",
+            reason: format!("joint covariance computation failed: {e}"),
         })
 }
 
@@ -19297,9 +19308,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         )
     })?;
     if !outer_result.converged {
-        return Err(CustomFamilyError::Optimization(
-            custom_outer_nonconvergence_error(&outer_result, specs, &last_error_detail),
-        ));
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family outer smoothing",
+            reason: custom_outer_nonconvergence_error(&outer_result, specs, &last_error_detail),
+        });
     }
     let outer_grad_norm = outer_result.final_grad_norm;
     let rho_star = outer_result.rho;
@@ -19324,10 +19336,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         )
     })?;
     if !inner.converged {
-        return Err(CustomFamilyError::Optimization(format!(
-            "outer smoothing optimization final inner refit did not converge after {} cycles.{}",
-            inner.cycles, last_error_detail
-        )));
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family final inner refit",
+            reason: format!(
+                "outer smoothing optimization final inner refit did not converge after {} cycles.{}",
+                inner.cycles, last_error_detail
+            ),
+        });
     }
     let final_warm_start = constrained_warm_start_from_inner(&rho_star, &inner);
     store_persistent_custom_family_warm_start(
@@ -19345,7 +19360,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
 
     let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block)
-        .map_err(CustomFamilyError::Optimization)?;
+        .map_err(|reason| CustomFamilyError::Optimization {
+            context: "fit_custom_family joint geometry",
+            reason,
+        })?;
     let penalized_objective = checked_penalizedobjective(
         inner.log_likelihood,
         inner.penalty_value,
@@ -19360,7 +19378,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         },
         "custom-family fit final outer refit",
     )
-    .map_err(CustomFamilyError::Optimization)?;
+    .map_err(|reason| CustomFamilyError::Optimization {
+        context: "fit_custom_family penalized objective",
+        reason,
+    })?;
     let rho_star_physical = expand_labeled_log_lambdas(&rho_star, &label_layout)?;
     let lambdas_final = rho_star_physical.mapv(f64::exp);
     let log_lambdas_final = lambdas_final.mapv(|v| v.max(1e-300).ln());
@@ -19381,7 +19402,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         },
         specs,
     )
-    .map_err(CustomFamilyError::Optimization)
+    .map_err(|reason| CustomFamilyError::Optimization {
+        context: "fit_custom_family result assembly",
+        reason,
+    })
 }
 
 pub(crate) fn fit_custom_family_fixed_log_lambdas<
@@ -19406,16 +19430,22 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
         warm_start.map(|warm| &warm.inner),
     )?;
     if !inner.converged {
-        return Err(CustomFamilyError::Optimization(format!(
-            "fixed-log-lambda inner solve did not converge after {} cycles",
-            inner.cycles
-        )));
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambdas inner solve",
+            reason: format!(
+                "fixed-log-lambda inner solve did not converge after {} cycles",
+                inner.cycles
+            ),
+        });
     }
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let covariance_conditional =
         compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
     let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block)
-        .map_err(CustomFamilyError::Optimization)?;
+        .map_err(|reason| CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambdas joint geometry",
+            reason,
+        })?;
     let penalized_objective = checked_penalizedobjective(
         inner.log_likelihood,
         inner.penalty_value,
@@ -19430,7 +19460,10 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
         },
         "custom-family fixed-log-lambda fit",
     )
-    .map_err(CustomFamilyError::Optimization)?;
+    .map_err(|reason| CustomFamilyError::Optimization {
+        context: "fit_custom_family_fixed_log_lambdas penalized objective",
+        reason,
+    })?;
     let lambdas = rho.mapv(f64::exp);
     let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
     blockwise_fit_from_parts(
@@ -19450,7 +19483,10 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
         },
         specs,
     )
-    .map_err(CustomFamilyError::Optimization)
+    .map_err(|reason| CustomFamilyError::Optimization {
+        context: "fit_custom_family_fixed_log_lambdas result assembly",
+        reason,
+    })
 }
 
 pub(crate) fn fit_custom_family_fixed_log_lambda_warm_start<
@@ -19474,9 +19510,10 @@ pub(crate) fn fit_custom_family_fixed_log_lambda_warm_start<
         .flat_map(|beta| beta.iter())
         .all(|value| value.is_finite())
     {
-        return Err(CustomFamilyError::Optimization(
-            "fixed-log-lambda warm start produced non-finite coefficients".to_string(),
-        ));
+        return Err(CustomFamilyError::Optimization {
+            context: "fit_custom_family_fixed_log_lambda_warm_start",
+            reason: "fixed-log-lambda warm start produced non-finite coefficients".to_string(),
+        });
     }
     Ok((block_beta, inner.converged, inner.cycles))
 }
