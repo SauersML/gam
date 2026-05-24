@@ -260,8 +260,12 @@ pub fn cholesky_solve_gpu(
     hessian: ArrayView2<'_, f64>,
     rhs: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, f64), String> {
-    std::hint::black_box((hessian, rhs));
-    Err("cuda feature is not enabled".to_string())
+    let (rows, cols) = hessian.dim();
+    Err(format!(
+        "cuda feature is not enabled for Cholesky solve; hessian={rows}x{cols}, rhs={}x{}",
+        rhs.nrows(),
+        rhs.ncols()
+    ))
 }
 
 #[cfg(feature = "cuda")]
@@ -271,6 +275,8 @@ pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, S
 
 #[cfg(not(feature = "cuda"))]
 pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    std::hint::black_box(hessian);
-    Err("cuda feature is not enabled".to_string())
+    let (rows, cols) = hessian.dim();
+    Err(format!(
+        "cuda feature is not enabled for Cholesky factorization; hessian={rows}x{cols}"
+    ))
 }
