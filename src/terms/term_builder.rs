@@ -470,8 +470,34 @@ fn parse_numeric_expr(raw: &str) -> Result<f64, String> {
         if factor.is_empty() {
             return Err(format!("invalid numeric expression '{raw}'"));
         }
-        let value = if factor.eq_ignore_ascii_case("pi") {
+        let value = if factor.eq_ignore_ascii_case("pi") || factor == "π" {
             std::f64::consts::PI
+        } else if factor.eq_ignore_ascii_case("tau") || factor == "τ" {
+            std::f64::consts::TAU
+        } else if let Some(prefix) = factor
+            .strip_suffix("pi")
+            .or_else(|| factor.strip_suffix("π"))
+        {
+            let coefficient = if prefix.is_empty() {
+                1.0
+            } else {
+                prefix
+                    .parse::<f64>()
+                    .map_err(|err| format!("invalid numeric expression '{raw}': {err}"))?
+            };
+            coefficient * std::f64::consts::PI
+        } else if let Some(prefix) = factor
+            .strip_suffix("tau")
+            .or_else(|| factor.strip_suffix("τ"))
+        {
+            let coefficient = if prefix.is_empty() {
+                1.0
+            } else {
+                prefix
+                    .parse::<f64>()
+                    .map_err(|err| format!("invalid numeric expression '{raw}': {err}"))?
+            };
+            coefficient * std::f64::consts::TAU
         } else {
             factor
                 .parse::<f64>()
@@ -573,6 +599,126 @@ fn parse_option_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_periodic_axes(
+    options: &BTreeMap<String, String>,
+    dim: usize,
+) -> Result<Vec<bool>, String> {
+    let mut axes = vec![false; dim];
+    if let Some(raw) = options.get("periodic").or_else(|| options.get("cyclic")) {
+        let lowered = raw.trim().to_ascii_lowercase();
+        match lowered.as_str() {
+            "true" | "yes" | "y" => {
+                axes.fill(true);
+                return Ok(axes);
+            }
+            "false" | "no" | "n" => return Ok(axes),
+            _ => {}
+        }
+        for axis_raw in parse_option_list(raw) {
+            let axis = axis_raw
+                .parse::<usize>()
+                .map_err(|err| format!("invalid periodic axis '{axis_raw}': {err}"))?;
+            if axis >= dim {
+                return Err(format!(
+                    "periodic axis {axis} out of range for {dim}D smooth"
+                ));
+            }
+            axes[axis] = true;
+        }
+    }
+    if let Some(raw) = options.get("boundary").or_else(|| options.get("bc")) {
+        let boundary = parse_option_list(raw);
+        if boundary.len() == dim {
+            for (axis, value) in boundary.iter().enumerate() {
+                if matches!(value.as_str(), "periodic" | "cyclic" | "cc") {
+                    axes[axis] = true;
+                }
+            }
+        } else if dim == 1 && matches!(boundary.first().map(String::as_str), Some("periodic" | "cyclic" | "cc")) {
+            axes[0] = true;
+        }
+    }
+    Ok(axes)
+}
+
+fn parse_optional_numeric_list(
+    options: &BTreeMap<String, String>,
+    keys: &[&str],
+    dim: usize,
+) -> Result<Vec<Option<f64>>, String> {
+    let Some(raw) = keys.iter().find_map(|key| options.get(*key)) else {
+        return Ok(vec![None; dim]);
+    };
+    let values = split_list_option(raw);
+    let mut out = vec![None; dim];
+    if values.len() == 1 && dim == 1 {
+        if !values[0].eq_ignore_ascii_case("none") {
+            out[0] = Some(parse_numeric_expr(&values[0])?);
+        }
+        return Ok(out);
+    }
+    if values.len() != dim {
+        return Err(format!(
+            "numeric option list length {} must match smooth dimension {}",
+            values.len(),
+            dim
+        ));
+    }
+    for (i, value) in values.iter().enumerate() {
+        if !value.eq_ignore_ascii_case("none") {
+            out[i] = Some(parse_numeric_expr(value)?);
+        }
+    }
+    Ok(out)
+}
+
+fn parse_periods(
+    options: &BTreeMap<String, String>,
+    periodic_axes: &[bool],
+) -> Result<Vec<Option<f64>>, String> {
+    let periods = parse_optional_numeric_list(options, &["period", "periods"], periodic_axes.len())?;
+    for (axis, (periodic, period)) in periodic_axes.iter().zip(periods.iter()).enumerate() {
+        if *periodic
+            && let Some(value) = period
+            && (!value.is_finite() || *value <= 0.0)
+        {
+            return Err(format!(
+                "period for periodic axis {axis} must be finite and positive, got {value}"
+            ));
+        }
+    }
+    Ok(periods)
+}
+
+fn parse_period_origins(
+    options: &BTreeMap<String, String>,
+    periodic_axes: &[bool],
+) -> Result<Vec<Option<f64>>, String> {
+    parse_optional_numeric_list(
+        options,
+        &[
+            "origin",
+            "origins",
+            "period_origin",
+            "period-origin",
+            "domain_origin",
+        ],
+        periodic_axes.len(),
+    )
+}
+
+fn bspline_bc_declares_periodic_axis(options: &BTreeMap<String, String>) -> bool {
+    options
+        .get("boundary")
+        .or_else(|| options.get("bc"))
+        .map(|raw| {
+            parse_option_list(raw)
+                .into_iter()
+                .any(|value| matches!(value.as_str(), "periodic" | "cyclic" | "cc"))
+        })
+        .unwrap_or(false)
+}
+
 fn parse_f64_option_list(raw: &str) -> Result<Vec<f64>, String> {
     parse_option_list(raw)
         .into_iter()
@@ -592,11 +738,11 @@ fn tensor_margin_boundaries(
     let Some(raw_bc) = options.get("bc").or_else(|| options.get("boundary")) else {
         return Ok(out);
     };
-    let bc = parse_option_list(raw_bc);
-    if bc.len() != cols.len() {
+    let boundaries = parse_option_list(raw_bc);
+    if boundaries.len() != cols.len() {
         return Err(format!(
-            "te()/tensor() bc must have one entry per margin: got {} for {} variables",
-            bc.len(),
+            "te()/tensor() boundary must have one entry per margin: got {} for {} variables",
+            boundaries.len(),
             cols.len()
         ));
     }
@@ -612,7 +758,7 @@ fn tensor_margin_boundaries(
         .map(|raw| parse_f64_option_list(raw))
         .transpose()?
         .unwrap_or_default();
-    for (i, boundary) in bc.iter().enumerate() {
+    for (i, boundary) in boundaries.iter().enumerate() {
         match boundary.as_str() {
             "periodic" | "cyclic" | "cc" => {
                 let origin = origins.get(i).copied().map(Ok).unwrap_or_else(|| {
@@ -853,6 +999,7 @@ pub fn build_smooth_basis(
                     "knots",
                     "degree",
                     "penalty_order",
+                    "boundary",
                     "bc",
                     "periodic",
                     "period",
@@ -1001,13 +1148,16 @@ pub fn build_smooth_basis(
                     "knots",
                     "degree",
                     "penalty_order",
+                    "boundary",
                     "bc",
+                    "boundary_conditions",
                     "bc_left",
                     "bc_right",
                     "left_bc",
                     "right_bc",
                     "start_bc",
                     "end_bc",
+                    "side",
                     "anchor",
                     "anchor_value",
                     "value",
@@ -1595,7 +1745,9 @@ fn parse_endpoint_side(
         "clamped" | "clamp" | "zero_derivative" | "zero-derivative" => {
             Ok(BSplineEndpointBoundaryCondition::Clamped)
         }
-        "anchored" | "anchor" => Ok(BSplineEndpointBoundaryCondition::Anchored { value: 0.0 }),
+        "anchored" | "anchor" | "zero" | "zero_value" | "zero-value" => {
+            Ok(BSplineEndpointBoundaryCondition::Anchored { value: 0.0 })
+        }
         other => Err(format!(
             "unsupported {context} boundary condition '{other}'; expected none, clamped, or anchored"
         )),
@@ -1639,14 +1791,13 @@ fn parse_bspline_boundary_conditions(
         .or_else(|| option_f64(options, "value"));
     let global_bc = options
         .get("bc")
-        .or_else(|| options.get("boundary_condition"));
+        .or_else(|| options.get("boundary_conditions"));
     let mut boundary_conditions = BSplineBoundaryConditions::default();
 
     if let Some(raw_bc) = global_bc {
         let cond = parse_endpoint_side(raw_bc, "bc")?;
         let side = options
             .get("side")
-            .or_else(|| options.get("boundary"))
             .map(|s| s.trim().to_ascii_lowercase())
             .unwrap_or_else(|| "both".to_string());
         match side.as_str() {

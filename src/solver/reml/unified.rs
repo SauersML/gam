@@ -12516,7 +12516,10 @@ pub fn compute_corrected_covariance_diagonal_with_constraints(
     // Symmetric square root of V_θ via eigendecomposition (PSD by construction).
     let (sym_evals, sym_evecs) = v_theta_full
         .eigh(faer::Side::Lower)
-        .map_err(|e| CorrectedCovarianceError::EigendecompositionFailed(e.to_string()))?;
+        .map_err(|e| CorrectedCovarianceError::EigendecompositionFailed {
+            context: "corrected covariance hyperparameter covariance",
+            reason: e.to_string(),
+        })?;
     let mut v_theta_sqrt = Array2::<f64>::zeros((q, q));
     for j in 0..q {
         let s = sym_evals[j];
@@ -16706,7 +16709,7 @@ mod tests {
         // amplified noise direction never sees a multiplier from a_k).
         // Switch to a configuration where a_k DOES have e_4 alignment
         // to expose the full-H pathology.
-        let _ = corr_full;
+        assert_relative_eq!(corr_full, corr_honest, max_relative = 1e-12);
     }
 
     /// **Mechanism test, line of evidence 2** — the failure mode itself:
@@ -17149,9 +17152,11 @@ mod tests {
     fn projected_factor_cache_zero_budget_disables_eviction() {
         let cache = ProjectedFactorCache::with_budget(0);
         for seed in 0..16 {
-            let _ = cache.get_or_insert_with(make_factor_key(seed), || {
-                Array2::from_elem((8, 8), seed as f64)
-            });
+            drop(
+                cache.get_or_insert_with(make_factor_key(seed), || {
+                    Array2::from_elem((8, 8), seed as f64)
+                }),
+            );
         }
         assert_eq!(cache.len(), 16);
     }
@@ -17512,7 +17517,7 @@ mod tests {
         let beta_unconstrained = op.solve(&xty);
         // Force β₂ = 0.5 (active bound) and recover β₀, β₁ minimising the
         // remaining quadratic — i.e. β̂ is the *constrained* solution.
-        let _ = beta_unconstrained;
+        assert!(beta_unconstrained[2] < 0.5);
         let beta_hat = array![xty[0] / h_mat[[0, 0]], xty[1] / h_mat[[1, 1]], 0.5];
 
         let a_act = array![[0.0, 0.0, 1.0]];

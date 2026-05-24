@@ -117,7 +117,9 @@ fn solve_newton_direction_dense(
         return Ok(());
     }
     Err(EstimationError::LinearSystemSolveFailed(
-        FaerLinalgError::FactorizationFailed,
+        FaerLinalgError::FactorizationFailed {
+            context: "active-set newton direction non-finite solve",
+        },
     ))
 }
 

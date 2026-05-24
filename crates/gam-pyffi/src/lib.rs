@@ -4903,14 +4903,25 @@ fn gumbel_temperature_schedule_from_pydict(
     let tau_start = get(schedule, "tau_start")?
         .extract::<f64>()
         .map_err(|err| err.to_string())?;
-    let tau_min = get(schedule, "tau_min")?
-        .extract::<f64>()
-        .map_err(|err| err.to_string())?;
+    let tau_min = match schedule
+        .get_item("tau_min")
+        .map_err(|err| err.to_string())?
+        .or(schedule
+            .get_item("tau_end")
+            .map_err(|err| err.to_string())?)
+    {
+        Some(value) => value.extract::<f64>().map_err(|err| err.to_string())?,
+        None => return Err("gumbel_schedule is missing key \"tau_min\"".to_string()),
+    };
     let decay = match decay_name.as_str() {
-        "geometric" => {
-            let rate = get(schedule, "rate")?
-                .extract::<f64>()
-                .map_err(|err| err.to_string())?;
+        "geometric" | "exponential" => {
+            let rate = match schedule
+                .get_item("rate")
+                .map_err(|err| err.to_string())?
+            {
+                Some(value) => value.extract::<f64>().map_err(|err| err.to_string())?,
+                None => 0.9,
+            };
             ScheduleKind::Geometric { rate }
         }
         "linear" => {
@@ -4922,7 +4933,7 @@ fn gumbel_temperature_schedule_from_pydict(
         "reciprocal_iter" => ScheduleKind::ReciprocalIter,
         other => {
             return Err(format!(
-                "gumbel_schedule decay must be 'geometric', 'linear', or 'reciprocal_iter'; got {other:?}"
+                "gumbel_schedule decay must be 'geometric', 'exponential', 'linear', or 'reciprocal_iter'; got {other:?}"
             ));
         }
     };
@@ -10612,6 +10623,82 @@ fn descriptor_weight_schedule(
     Ok(Some(parsed))
 }
 
+fn descriptor_temperature_schedule(
+    descriptor: &serde_json::Map<String, serde_json::Value>,
+    context: &str,
+) -> Result<Option<GumbelTemperatureSchedule>, String> {
+    let Some(raw_schedule) = descriptor.get("temperature_schedule") else {
+        return Ok(None);
+    };
+    if raw_schedule.is_null() {
+        return Ok(None);
+    }
+    let schedule = raw_schedule
+        .as_object()
+        .ok_or_else(|| format!("{context}.temperature_schedule must be an object"))?;
+    let tau_start = schedule
+        .get("tau_start")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| format!("{context}.temperature_schedule.tau_start must be a finite number"))?;
+    let tau_min = schedule
+        .get("tau_min")
+        .or_else(|| schedule.get("tau_end"))
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| {
+            format!("{context}.temperature_schedule.tau_min must be a finite number")
+        })?;
+    let decay_name = schedule
+        .get("decay")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{context}.temperature_schedule.decay is required"))?
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    let decay = match decay_name.as_str() {
+        "geometric" | "exponential" => {
+            let rate = schedule
+                .get("rate")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.9);
+            ScheduleKind::Geometric { rate }
+        }
+        "linear" => {
+            let steps = schedule
+                .get("steps")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    format!("{context}.temperature_schedule.steps is required for linear")
+                })?;
+            ScheduleKind::Linear {
+                steps: json_u64_to_usize(
+                    steps,
+                    &format!("{context}.temperature_schedule.steps"),
+                )?,
+            }
+        }
+        "reciprocal_iter" => ScheduleKind::ReciprocalIter,
+        other => {
+            return Err(format!(
+                "{context}.temperature_schedule.decay must be geometric, exponential, linear, or reciprocal_iter; got {other:?}"
+            ));
+        }
+    };
+    let mut parsed = GumbelTemperatureSchedule::new(tau_start, tau_min, decay)
+        .map_err(|err| format!("{context}.temperature_schedule: {err}"))?;
+    if let Some(iter_count) = schedule.get("iter_count") {
+        let raw_iter_count = iter_count.as_u64().ok_or_else(|| {
+            format!("{context}.temperature_schedule.iter_count must be a non-negative integer")
+        })?;
+        parsed.iter_count = json_u64_to_usize(
+            raw_iter_count,
+            &format!("{context}.temperature_schedule.iter_count"),
+        )?;
+        parsed
+            .validate()
+            .map_err(|err| format!("{context}.temperature_schedule: {err}"))?;
+    }
+    Ok(Some(parsed))
+}
+
 fn descriptor_difference_op(
     descriptor: &serde_json::Map<String, serde_json::Value>,
     context: &str,
@@ -11048,16 +11135,30 @@ fn build_analytic_penalty_registry_from_json(
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,
-                    &["kind", "target", "k_max", "alpha", "tau", "learnable", "weight_schedule"],
+                    &[
+                        "kind",
+                        "target",
+                        "k_max",
+                        "alpha",
+                        "tau",
+                        "learnable",
+                        "temperature_schedule",
+                        "weight_schedule",
+                    ],
                 )?;
                 let k_max = descriptor_usize(descriptor, "k_max", target.d)?;
                 let alpha = descriptor_f64(descriptor, "alpha", 1.0)?;
                 let tau = descriptor_f64(descriptor, "tau", 1.0)?;
+                let temperature_schedule = descriptor_temperature_schedule(descriptor, &context)?;
                 let learnable = descriptor
                     .get("learnable")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 let penalty = IBPAssignmentPenalty::new(k_max, alpha, tau, learnable);
+                let penalty = match temperature_schedule {
+                    Some(schedule) => penalty.with_temperature_schedule(schedule),
+                    None => penalty,
+                };
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,

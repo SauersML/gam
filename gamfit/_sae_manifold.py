@@ -52,16 +52,58 @@ class SaeManifoldFitResult:
     reml_score: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class GumbelTemperatureSchedule:
     """Deterministic temperature schedule for SAE assignment relaxations."""
 
     tau_start: float
     tau_min: float
-    decay: Literal["geometric", "linear", "reciprocal_iter"]
+    decay: Literal["geometric", "exponential", "linear", "reciprocal_iter"]
     rate: float | None = None
     steps: int | None = None
     iter_count: int = 0
+
+    def __init__(
+        self,
+        tau_start: float,
+        tau_min: float | None = None,
+        decay: Literal["geometric", "exponential", "linear", "reciprocal_iter"] = "geometric",
+        rate: float | None = None,
+        steps: int | None = None,
+        iter_count: int = 0,
+        *,
+        tau_end: float | None = None,
+    ) -> None:
+        if tau_min is None:
+            if tau_end is None:
+                raise TypeError("GumbelTemperatureSchedule requires tau_min or tau_end")
+            tau_min = tau_end
+        elif tau_end is not None and float(tau_end) != float(tau_min):
+            raise ValueError("GumbelTemperatureSchedule tau_min and tau_end disagree")
+        decay_name = str(decay).lower().replace("-", "_")
+        if decay_name == "exponential":
+            decay_name = "geometric"
+        if decay_name == "geometric" and rate is None:
+            rate = 0.9
+        object.__setattr__(self, "tau_start", float(tau_start))
+        object.__setattr__(self, "tau_min", float(tau_min))
+        object.__setattr__(self, "decay", decay_name)
+        object.__setattr__(self, "rate", rate)
+        object.__setattr__(self, "steps", steps)
+        object.__setattr__(self, "iter_count", int(iter_count))
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "tau_start": float(self.tau_start),
+            "tau_min": float(self.tau_min),
+            "decay": self.decay,
+            "iter_count": int(self.iter_count),
+        }
+        if self.decay == "geometric":
+            payload["rate"] = float(0.9 if self.rate is None else self.rate)
+        if self.decay == "linear":
+            payload["steps"] = int(self.steps)
+        return payload
 
 
 def gumbel_geometric_schedule(
@@ -772,13 +814,17 @@ def _normalize_gumbel_schedule(
 ) -> dict[str, Any] | None:
     if schedule is None:
         return None
+    if hasattr(schedule, "to_rust_descriptor"):
+        schedule = schedule.to_rust_descriptor()
     if isinstance(schedule, GumbelTemperatureSchedule):
         schedule = asdict(schedule)
     if not isinstance(schedule, Mapping):
         raise ValueError("gumbel_schedule must be GumbelTemperatureSchedule, a mapping, or None")
     decay = str(_require_schedule_key(schedule, "decay")).lower().replace("-", "_")
+    if decay == "exponential":
+        decay = "geometric"
     tau_start = float(_require_schedule_key(schedule, "tau_start"))
-    tau_min = float(_require_schedule_key(schedule, "tau_min"))
+    tau_min = float(schedule.get("tau_min", schedule.get("tau_end")))
     if not np.isfinite(tau_start) or tau_start <= 0.0:
         raise ValueError("gumbel_schedule['tau_start'] must be finite and positive")
     if not np.isfinite(tau_min) or tau_min <= 0.0:
@@ -795,7 +841,7 @@ def _normalize_gumbel_schedule(
         "iter_count": iter_count,
     }
     if decay == "geometric":
-        rate = float(_require_schedule_key(schedule, "rate"))
+        rate = float(schedule.get("rate", 0.9))
         if not np.isfinite(rate) or rate <= 0.0 or rate >= 1.0:
             raise ValueError("gumbel_schedule['rate'] must be in (0, 1)")
         out["rate"] = rate

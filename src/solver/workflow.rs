@@ -55,8 +55,8 @@ use crate::terms::latent_coord::{
 };
 use crate::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, RowPrecisionPriorPenalty,
-    BlockOrthogonalityPenalty, BlockSparsityPenalty, DifferenceOpKind, IBPAssignmentPenalty,
-    IsometryPenalty, IvaeRidgeMeanGauge, NuclearNormPenalty, OrthogonalityPenalty,
+    BlockOrthogonalityPenalty, BlockSparsityPenalty, DifferenceOpKind, GumbelTemperatureSchedule,
+    IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge, NuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice, ScadMcpPenalty,
     SoftmaxAssignmentSparsityPenalty, ScalarWeightSchedule, ScheduleKind, SparsityPenalty,
     TotalVariationPenalty,
@@ -158,8 +158,8 @@ impl From<WorkflowError> for String {
 
 /// Cross-module cascade: a `FormulaDslError` raised inside `materialize` /
 /// `fit_from_formula` (via `parse_formula`, `parse_surv_response`, etc.) flows
-/// up as a `WorkflowError::InvalidConfig` so the typed error survives the
-/// boundary instead of stringifying immediately.
+/// up with its parser-layer source attached instead of stringifying into a
+/// generic workflow configuration bucket.
 impl From<crate::inference::formula_dsl::FormulaDslError> for WorkflowError {
     fn from(err: crate::inference::formula_dsl::FormulaDslError) -> Self {
         Self::FormulaDsl {
@@ -3210,6 +3210,75 @@ fn analytic_descriptor_weight_schedule(
     Ok(Some(parsed))
 }
 
+fn analytic_descriptor_temperature_schedule(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    context: &str,
+) -> Result<Option<GumbelTemperatureSchedule>, String> {
+    let Some(raw_schedule) = descriptor.get("temperature_schedule") else {
+        return Ok(None);
+    };
+    if raw_schedule.is_null() {
+        return Ok(None);
+    }
+    let schedule = raw_schedule
+        .as_object()
+        .ok_or_else(|| format!("{context}.temperature_schedule must be an object"))?;
+    let tau_start = schedule
+        .get("tau_start")
+        .and_then(JsonValue::as_f64)
+        .ok_or_else(|| format!("{context}.temperature_schedule.tau_start must be a finite number"))?;
+    let tau_min = schedule
+        .get("tau_min")
+        .or_else(|| schedule.get("tau_end"))
+        .and_then(JsonValue::as_f64)
+        .ok_or_else(|| {
+            format!("{context}.temperature_schedule.tau_min must be a finite number")
+        })?;
+    let decay_name = schedule
+        .get("decay")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| format!("{context}.temperature_schedule.decay is required"))?
+        .to_ascii_lowercase()
+        .replace('-', "_");
+    let decay = match decay_name.as_str() {
+        "geometric" | "exponential" => {
+            let rate = schedule
+                .get("rate")
+                .and_then(JsonValue::as_f64)
+                .unwrap_or(0.9);
+            ScheduleKind::Geometric { rate }
+        }
+        "linear" => {
+            let steps = schedule
+                .get("steps")
+                .and_then(JsonValue::as_u64)
+                .ok_or_else(|| {
+                    format!("{context}.temperature_schedule.steps is required for linear")
+                })?;
+            ScheduleKind::Linear {
+                steps: steps as usize,
+            }
+        }
+        "reciprocal_iter" => ScheduleKind::ReciprocalIter,
+        other => {
+            return Err(format!(
+                "{context}.temperature_schedule.decay must be geometric, exponential, linear, or reciprocal_iter; got {other:?}"
+            ));
+        }
+    };
+    let mut parsed = GumbelTemperatureSchedule::new(tau_start, tau_min, decay)
+        .map_err(|err| format!("{context}.temperature_schedule: {err}"))?;
+    if let Some(iter_count) = schedule.get("iter_count") {
+        parsed.iter_count = iter_count.as_u64().ok_or_else(|| {
+            format!("{context}.temperature_schedule.iter_count must be a non-negative integer")
+        })? as usize;
+        parsed
+            .validate()
+            .map_err(|err| format!("{context}.temperature_schedule: {err}"))?;
+    }
+    Ok(Some(parsed))
+}
+
 fn build_standard_latent_analytic_penalty_registry(
     latents: Option<&JsonValue>,
     penalties: Option<&JsonValue>,
@@ -3380,11 +3449,17 @@ fn build_standard_latent_analytic_penalty_registry(
                 let k_max = analytic_descriptor_usize(descriptor, "k_max", target.d)?;
                 let alpha = analytic_descriptor_f64(descriptor, "alpha", 1.0)?;
                 let tau = analytic_descriptor_f64(descriptor, "tau", 1.0)?;
+                let temperature_schedule =
+                    analytic_descriptor_temperature_schedule(descriptor, &context)?;
                 let learnable_alpha = descriptor
                     .get("learnable_alpha")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
                 let penalty = IBPAssignmentPenalty::new(k_max, alpha, tau, learnable_alpha);
+                let penalty = match temperature_schedule {
+                    Some(schedule) => penalty.with_temperature_schedule(schedule),
+                    None => penalty,
+                };
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,

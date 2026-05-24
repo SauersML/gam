@@ -3415,7 +3415,9 @@ fn solve_newton_direction_dense_with_factor(
         return Ok(Some(factor));
     }
     Err(EstimationError::LinearSystemSolveFailed(
-        FaerLinalgError::FactorizationFailed,
+        FaerLinalgError::FactorizationFailed {
+            context: "PIRLS dense newton solve exhausted",
+        },
     ))
 }
 
@@ -3535,14 +3537,18 @@ where
     let solution =
         crate::linalg::utils::solve_spd_pcg(apply_h, gradient, &precond_diag, rel_tol, max_iter)
             .ok_or(EstimationError::LinearSystemSolveFailed(
-                FaerLinalgError::FactorizationFailed,
+                FaerLinalgError::FactorizationFailed {
+                    context: "PIRLS implicit PCG solve exhausted",
+                },
             ))?;
 
     direction_out.assign(&solution);
     direction_out.mapv_inplace(|v| -v);
     if !array1_is_finite(direction_out) {
         return Err(EstimationError::LinearSystemSolveFailed(
-            FaerLinalgError::FactorizationFailed,
+            FaerLinalgError::FactorizationFailed {
+                context: "PIRLS implicit PCG non-finite direction",
+            },
         ));
     }
     log::info!(
@@ -8224,7 +8230,9 @@ fn solve_penalized_least_squares_implicit(
     factor.solve_in_place(rhsview.as_mut());
     if !array1_is_finite(&workspace.rhs_full) {
         return Err(EstimationError::LinearSystemSolveFailed(
-            FaerLinalgError::FactorizationFailed,
+            FaerLinalgError::FactorizationFailed {
+                context: "PIRLS implicit PLS non-finite solve",
+            },
         ));
     }
     let betavec = workspace.rhs_full.clone();
