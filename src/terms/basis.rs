@@ -19407,7 +19407,6 @@ fn build_cyclic_duchon_basis_1dwithworkspace(
     spec: &DuchonBasisSpec,
     start: f64,
     end: f64,
-    workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     if data.ncols() != 1 {
         return Err(BasisError::InvalidInput(
@@ -21026,7 +21025,7 @@ pub fn build_duchon_basiswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     if let Some((start, end, _period)) = spec.boundary.period() {
-        return build_cyclic_duchon_basis_1dwithworkspace(data, spec, start, end, workspace);
+        return build_cyclic_duchon_basis_1dwithworkspace(data, spec, start, end);
     }
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     assert_spatial_centers_below_biobank_cap(data.nrows(), data.ncols(), centers.view())?;

@@ -17,7 +17,7 @@ use crate::families::marginal_slope_shared::{
     build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
     eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
-    outer_score_scale, outer_weighted_rows, probit_frailty_scale,
+    outer_weighted_rows, probit_frailty_scale,
     probit_frailty_scale_multi_dir_jet, psi_derivative_location, scale_coeff4,
 };
 use crate::families::row_kernel::{
@@ -5381,6 +5381,13 @@ impl BernoulliMarginalSlopeFamily {
         probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
+    #[inline]
+    fn unit_primary_direction(r: usize, idx: usize) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(r);
+        out[idx] = 1.0;
+        out
+    }
+
     fn empirical_rigid_intercept_for_row(
         &self,
         row: usize,
@@ -5785,10 +5792,10 @@ impl BernoulliMarginalSlopeFamily {
         let mut out = Array2::<f64>::zeros((r, r));
         for u in 0..r {
             for v in u..r {
-                let directions = vec![
-                    basis_dirs[u].clone(),
-                    basis_dirs[v].clone(),
-                    dir_owned.clone(),
+                let directions = [
+                    basis_dirs[u].view(),
+                    basis_dirs[v].view(),
+                    dir_owned.view(),
                 ];
                 let jet = self.empirical_flex_neglog_jet(
                     row,
@@ -5841,11 +5848,11 @@ impl BernoulliMarginalSlopeFamily {
         let mut out = Array2::<f64>::zeros((r, r));
         for p in 0..r {
             for q_idx in p..r {
-                let directions = vec![
-                    basis_dirs[p].clone(),
-                    basis_dirs[q_idx].clone(),
-                    dir_u_owned.clone(),
-                    dir_v_owned.clone(),
+                let directions = [
+                    basis_dirs[p].view(),
+                    basis_dirs[q_idx].view(),
+                    dir_u_owned.view(),
+                    dir_v_owned.view(),
                 ];
                 let jet = self.empirical_flex_neglog_jet(
                     row,
@@ -7921,15 +7928,14 @@ impl BernoulliMarginalSlopeFamily {
             // skips redundant work. The dedup is purely intra-row, so it is
             // orthogonal to the per-family LRU (which is keyed across rows)
             // and the affine tail-cell memo (a separate mechanism).
-            let dedup_enabled = cell_moment_per_row_dedup_enabled();
             let mut dedup: HashMap<
                 exact_kernel::CellFingerprint,
                 exact_kernel::CellDerivativeMomentState,
             > = HashMap::new();
             let mut out: Vec<CachedDenestedCellMoments> = Vec::with_capacity(cells.len());
             for partition_cell in cells.into_iter() {
-                let state: exact_kernel::CellDerivativeMomentState = if dedup_enabled {
-                    let key = exact_kernel::CellFingerprint::new(partition_cell.cell);
+                let key = exact_kernel::CellFingerprint::new(partition_cell.cell);
+                let state: exact_kernel::CellDerivativeMomentState =
                     if let Some(existing) = dedup.get(&key) {
                         existing.clone()
                     } else {
@@ -7937,10 +7943,7 @@ impl BernoulliMarginalSlopeFamily {
                             self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 9)?;
                         dedup.insert(key, computed.clone());
                         computed
-                    }
-                } else {
-                    self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 9)?
-                };
+                    };
                 out.push(CachedDenestedCellMoments {
                     partition_cell,
                     state,
@@ -8095,7 +8098,7 @@ impl BernoulliMarginalSlopeFamily {
             row_cell_moments,
             row_primary_hessians: None,
             rigid_third_full: OnceLock::new(),
-            rigid_fourth_full: OnceLock::new(),
+            rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
         })
     }
 
@@ -8398,75 +8401,16 @@ impl BernoulliMarginalSlopeFamily {
         out
     }
 
-    fn batched_directional_derivative_chunk_rows(
-        n: usize,
-        slices: &BlockSlices,
-        n_dirs: usize,
-    ) -> (usize, bool) {
+    fn batched_directional_derivative_chunk_rows(n: usize, n_dirs: usize) -> (usize, bool) {
+        // CPU-only path: chunk by a fixed float-count budget so each chunk is
+        // small enough to keep the per-row workspaces in L2/L3 across the
+        // directional sweep. The GPU dispatch path was removed when the
+        // dense-PIRLS routing helpers were retired (no live device backend
+        // in this build); revisit when a runtime device backend is
+        // reintroduced.
         const CPU_TARGET_CHUNK_FLOATS: usize = 1 << 17;
-        const GPU_MEMORY_BUDGET_BYTES: usize = 512 * 1024 * 1024;
-
         let cpu_rows = (CPU_TARGET_CHUNK_FLOATS / (3 * n_dirs).max(1)).clamp(1024, n.max(1));
-        let runtime = crate::gpu::GpuRuntime::global();
-        if !runtime.is_available() || n == 0 || n_dirs == 0 {
-            return (cpu_rows.min(n.max(1)), false);
-        }
-
-        let p_m = slices.marginal.len();
-        let p_g = slices.logslope.len();
-        let policy = runtime.policy();
-        let full_work_reaches_device = policy.route_gemm(n, n_dirs, p_m)
-            || policy.route_gemm(n, n_dirs, p_g)
-            || policy.route_xt_diag_y(n, p_m, p_m)
-            || policy.route_xt_diag_y(n, p_m, p_g)
-            || policy.route_xt_diag_y(n, p_g, p_g);
-        if !full_work_reaches_device {
-            return (cpu_rows.min(n.max(1)), false);
-        }
-
-        let rows_for_flops = |min_flops: u64, flops_per_row: usize| -> usize {
-            if flops_per_row == 0 || min_flops == 0 {
-                1
-            } else {
-                min_flops.div_ceil(flops_per_row as u64) as usize
-            }
-        };
-        let projection_rows = rows_for_flops(
-            policy.gemm_min_flops,
-            2usize.saturating_mul(p_m.max(p_g)).saturating_mul(n_dirs),
-        );
-        let gram_rows = rows_for_flops(
-            policy.gemm_min_flops,
-            2usize.saturating_mul(p_m.max(p_g).saturating_pow(2)),
-        );
-        let min_gpu_rows = policy
-            .xtwx_min_rows
-            .max(projection_rows.min(n))
-            .max(gram_rows.min(n))
-            .max(1024);
-
-        // Per chunk we hold X_m, X_g, two projection matrices, and three
-        // direction-weight columns. Keep one GPU-fed chunk comfortably bounded.
-        let scratch_cols = slices
-            .marginal
-            .len()
-            .saturating_add(slices.logslope.len())
-            .saturating_add(5usize.saturating_mul(n_dirs))
-            .max(1);
-        let max_rows_by_memory = (GPU_MEMORY_BUDGET_BYTES / (scratch_cols * 8))
-            .max(1024)
-            .min(n.max(1));
-        let chunk_rows = max_rows_by_memory.min(n.max(1));
-        let chunk_reaches_device = chunk_rows >= min_gpu_rows
-            && (policy.route_gemm(chunk_rows, n_dirs, p_m)
-                || policy.route_gemm(chunk_rows, n_dirs, p_g)
-                || policy.route_xt_diag_y(chunk_rows, p_m, p_m)
-                || policy.route_xt_diag_y(chunk_rows, p_m, p_g)
-                || policy.route_xt_diag_y(chunk_rows, p_g, p_g));
-        if !chunk_reaches_device {
-            return (cpu_rows.min(n.max(1)), false);
-        }
-        (chunk_rows, true)
+        (cpu_rows.min(n.max(1)), false)
     }
 
     fn row_primary_psi_direction_from_map(
@@ -9084,29 +9028,6 @@ impl BernoulliMarginalSlopeFamily {
                             }
                         }
                     }
-                }
-                Ok(())
-            };
-
-            if let Some(cached) = row_cell_moments {
-                debug_assert!(
-                    !cached.is_empty(),
-                    "row cell moments bundle was selected but row {row} has no cells"
-                );
-                for entry in cached.iter() {
-                    process_cell(entry.partition_cell, &entry.state)?;
-                }
-            } else if let Some(cached) = row_ctx.degree9_cells.as_ref() {
-                for entry in cached.iter() {
-                    process_cell(entry.partition_cell, &entry.state)?;
-                }
-            } else {
-                let owned_cells = self.denested_partition_cells(a, b, beta_h, beta_w)?;
-                let degree = if need_hessian { 9 } else { 3 };
-                for partition_cell in owned_cells {
-                    let state =
-                        self.evaluate_cell_derivative_moments_lru(partition_cell.cell, degree)?;
-                    process_cell(partition_cell, &state)?;
                 }
             }
         }
@@ -14447,7 +14368,7 @@ impl BernoulliMarginalSlopeFamily {
             let logslope_dirs =
                 Self::stacked_direction_block(d_beta_flats, slices.logslope.clone());
             let (chunk_rows, gpu_sized_chunks) =
-                Self::batched_directional_derivative_chunk_rows(n, slices, d_beta_flats.len());
+                Self::batched_directional_derivative_chunk_rows(n, d_beta_flats.len());
             let chunks = (0..n)
                 .step_by(chunk_rows)
                 .map(|start| (start, (start + chunk_rows).min(n)))
@@ -14660,7 +14581,9 @@ impl BernoulliMarginalSlopeFamily {
         if !self.effective_flex_active(block_states)? {
             let block_acc = weighted_rows
                 .into_par_iter()
-                .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+                .try_fold(make_acc, |mut acc, wr| -> Result<_, String> {
+                    let row = wr.index;
+                    let w = wr.weight;
                     let uq = self
                         .marginal_design
                         .dot_row_view(row, d_beta_u_flat.slice(s![slices.marginal.clone()]));
@@ -14675,7 +14598,10 @@ impl BernoulliMarginalSlopeFamily {
                         .dot_row_view(row, d_beta_v_flat.slice(s![slices.logslope.clone()]));
                     let t = self.rigid_fourth_full_cached(block_states, cache, row)?;
                     let f = contract_fourth_full(t, uq, ug, vq, vg);
-                    let f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
+                    let mut f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
+                    if w != 1.0 {
+                        f_arr.mapv_inplace(|v| v * w);
+                    }
                     acc.add_pullback(self, row, slices, primary, &f_arr);
                     Ok(acc)
                 })
@@ -14747,7 +14673,9 @@ impl BernoulliMarginalSlopeFamily {
         if !self.effective_flex_active(block_states)? {
             let block_acc = weighted_rows
                 .into_par_iter()
-                .try_fold(make_acc, |mut acc, row| -> Result<_, String> {
+                .try_fold(make_acc, |mut acc, wr| -> Result<_, String> {
+                    let row = wr.index;
+                    let w = wr.weight;
                     let uq = self
                         .marginal_design
                         .dot_row_view(row, d_beta_u_flat.slice(s![slices.marginal.clone()]));
@@ -14762,7 +14690,10 @@ impl BernoulliMarginalSlopeFamily {
                         .dot_row_view(row, d_beta_v_flat.slice(s![slices.logslope.clone()]));
                     let t = self.rigid_fourth_full_cached(block_states, cache, row)?;
                     let f = contract_fourth_full(t, uq, ug, vq, vg);
-                    let f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
+                    let mut f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
+                    if w != 1.0 {
+                        f_arr.mapv_inplace(|v| v * w);
+                    }
                     acc.add_pullback(self, row, slices, primary, &f_arr);
                     Ok(acc)
                 })
@@ -15962,10 +15893,10 @@ impl BernoulliMarginalSlopeLineSearchWorkspace {
                 )?,
                 None => None,
             };
-            BernoulliMarginalSlopeExactNewtonJointHessianWorkspace::from_cache(
+            BernoulliMarginalSlopeExactNewtonJointHessianWorkspace::from_arc_cache(
                 self.family.clone(),
                 self.block_states.clone(),
-                cache,
+                Arc::new(cache),
                 self.options.clone(),
             )
             .map(Arc::new)

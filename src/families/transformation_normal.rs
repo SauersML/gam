@@ -62,7 +62,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -8522,19 +8522,10 @@ impl CustomFamily for TransformationNormalFamily {
         // Expected HVP reuse this workspace will service before its
         // `(β, row_quantities)` key advances. The outer-eval trace path
         // performs ~`2·rho_dim` HVPs plus one diagonal call against the
-        // same key; the inner PCG also reuses the workspace's HVPs at the
-        // same β. Use `2·rho_dim + 1` as a conservative lower bound — the
-        // amortization gate (P2.2) compares this against `p_total / 2`,
-        // and any further reuse only widens the cache hit ratio in our
-        // favor. `specs` may be empty in test paths; treat that as 0
-        // penalties so the gate cleanly falls into the matrix-free regime.
-        let rho_dim: usize = specs.iter().map(|s| s.penalties.len()).sum();
-        let expected_reuse = rho_dim.saturating_mul(2).saturating_add(1);
         let workspace = TransformationNormalJointHessianWorkspace::new(
             Arc::new(self.clone()),
             beta.clone(),
             row_quantities.clone(),
-            expected_reuse,
         )?;
         Ok(Some(
             Arc::new(workspace) as Arc<dyn ExactNewtonJointHessianWorkspace>
@@ -8662,9 +8653,7 @@ impl TransformationNormalJointHessianWorkspace {
         family: Arc<TransformationNormalFamily>,
         beta: Array1<f64>,
         row_quantities: TransformationNormalRowQuantityCache,
-        expected_reuse: usize,
     ) -> Result<Self, String> {
-        let persistent_dense_hessian = Arc::clone(&family.persistent_dense_hessian);
         Ok(Self {
             family,
             beta,

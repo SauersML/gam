@@ -58,6 +58,7 @@ impl Log for ProgressLogger {
         for line in lines {
             writeln!(stderr, "{line}").ok();
         }
+        drop(log_lock_guard);
     }
 
     fn flush(&self) {}
@@ -140,13 +141,10 @@ pub fn init_logging() {
     if log::set_logger(&LOGGER).is_ok() {
         log::set_max_level(LevelFilter::Info);
     }
-    // Probe + calibrate GPU once, up front. Without this the [GPU] banner
-    // wouldn't surface until the first dispatch site lazily woke the
-    // runtime — typically deep inside a fit, where it scrolls past
-    // unnoticed. Eager warm pays the ~hundreds-of-ms calibration once and
-    // makes the runtime's "are GPUs being used?" answer visible at the
-    // top of the log.
-    crate::gpu::warm();
+    // Log the GPU backend inventory once at startup so the "are GPUs being
+    // used?" answer is visible at the top of the log, before any solver
+    // dispatch site lazily checks for device support.
+    crate::gpu::log_backend_inventory_once();
 }
 
 #[derive(Clone, Debug, Default)]
