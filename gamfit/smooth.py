@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, Sequence
 
 
@@ -214,12 +215,15 @@ class Pca(Smooth):
         basis width when ``basis`` is supplied.
     basis : optional array-like of shape ``(D, K)``. A fixed precomputed
         projection matrix, e.g. ``_pca_basis.load_pc_basis(K=64)``.
+    lazy_path : optional path to a memmap-able ``.npy`` scores matrix ``(N, K)``.
     centered : if True, subtract the training feature mean before projection.
     smooth_penalty : ridge multiplier for PCA coefficients.
     """
 
     K: int | None = None
     basis: Any | None = None
+    lazy_path: Path | None = None
+    chunk_size: int = 4096
     centered: bool = True
     smooth_penalty: float = 1.0
 
@@ -227,6 +231,8 @@ class Pca(Smooth):
         self,
         K: int | None = None,
         basis: Any | None = None,
+        lazy_path: Path | None = None,
+        chunk_size: int = 4096,
         centered: bool = True,
         name: str | None = None,
         smooth_penalty: float = 1.0,
@@ -240,6 +246,8 @@ class Pca(Smooth):
         self.shape_constraint = shape_constraint
         self.K = K
         self.basis = basis
+        self.lazy_path = None if lazy_path is None else Path(lazy_path)
+        self.chunk_size = int(chunk_size)
         self.centered = centered
         self.smooth_penalty = smooth_penalty
 

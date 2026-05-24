@@ -2785,6 +2785,329 @@ fn cached_inner_mode_from_result(result: &BlockwiseInnerResult) -> CachedInnerMo
     }
 }
 
+fn constrained_warm_start_from_inner(
+    rho: &Array1<f64>,
+    inner: &BlockwiseInnerResult,
+) -> ConstrainedWarmStart {
+    ConstrainedWarmStart {
+        rho: rho.clone(),
+        block_beta: inner
+            .block_states
+            .iter()
+            .map(|state| state.beta.clone())
+            .collect(),
+        active_sets: inner.active_sets.clone(),
+        cached_inner: Some(cached_inner_mode_from_result(inner)),
+    }
+}
+
+fn inner_penalized_objective(
+    inner: &BlockwiseInnerResult,
+    include_logdet_h: bool,
+    include_logdet_s: bool,
+    context: &str,
+) -> Result<f64, String> {
+    let reml_term = if include_logdet_h {
+        0.5 * inner.block_logdet_h
+    } else {
+        0.0
+    } - if include_logdet_s {
+        0.5 * inner.block_logdet_s
+    } else {
+        0.0
+    };
+    checked_penalizedobjective(
+        inner.log_likelihood,
+        inner.penalty_value,
+        reml_term,
+        context,
+    )
+}
+
+fn nonconverged_outer_efs_result(
+    inner: &BlockwiseInnerResult,
+    rho: &Array1<f64>,
+    theta_dim: usize,
+    include_logdet_h: bool,
+    include_logdet_s: bool,
+    context: &str,
+) -> Result<
+    (
+        crate::solver::outer_strategy::EfsEval,
+        ConstrainedWarmStart,
+        bool,
+    ),
+    String,
+> {
+    Ok((
+        crate::solver::outer_strategy::EfsEval {
+            cost: inner_penalized_objective(inner, include_logdet_h, include_logdet_s, context)?,
+            steps: vec![0.0; theta_dim],
+            beta: None,
+            psi_gradient: None,
+            psi_indices: None,
+            inner_hessian_scale: None,
+        },
+        constrained_warm_start_from_inner(rho, inner),
+        false,
+    ))
+}
+
+fn warm_start_without_cached_inner_for_psi_derivatives(
+    warm_start: Option<&ConstrainedWarmStart>,
+    has_psi_derivatives: bool,
+) -> Option<ConstrainedWarmStart> {
+    if !has_psi_derivatives {
+        return None;
+    }
+    warm_start.cloned().map(|mut warm| {
+        warm.cached_inner = None;
+        warm
+    })
+}
+
+fn hash_cf_array_view(hasher: &mut StableHasher, values: ndarray::ArrayView1<'_, f64>) {
+    hasher.write_usize(values.len());
+    for &value in values {
+        hasher.write_f64(value);
+    }
+}
+
+fn hash_cf_array2(hasher: &mut StableHasher, values: &Array2<f64>) {
+    hasher.write_usize(values.nrows());
+    hasher.write_usize(values.ncols());
+    for &value in values {
+        hasher.write_f64(value);
+    }
+}
+
+fn hash_cf_design_matrix(hasher: &mut StableHasher, design: &DesignMatrix) -> Result<(), String> {
+    let n = design.nrows();
+    let p = design.ncols();
+    hasher.write_usize(n);
+    hasher.write_usize(p);
+    let bytes_per_row = p.saturating_mul(std::mem::size_of::<f64>()).max(1);
+    let chunk_rows = ((8 * 1024 * 1024) / bytes_per_row).clamp(1, 4096);
+    for start in (0..n).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(n);
+        let chunk = design
+            .try_row_chunk(start..end)
+            .map_err(|e| format!("custom-family persistent warm-start design hash failed: {e}"))?;
+        hash_cf_array2(hasher, &chunk);
+    }
+    Ok(())
+}
+
+fn hash_cf_penalty(hasher: &mut StableHasher, penalty: &PenaltyMatrix) {
+    match penalty {
+        PenaltyMatrix::Dense(matrix) => {
+            hasher.write_str("dense");
+            hash_cf_array2(hasher, matrix);
+        }
+        PenaltyMatrix::KroneckerFactored { left, right } => {
+            hasher.write_str("kron");
+            hash_cf_array2(hasher, left);
+            hash_cf_array2(hasher, right);
+        }
+        PenaltyMatrix::Blockwise {
+            local,
+            col_range,
+            total_dim,
+        } => {
+            hasher.write_str("blockwise");
+            hasher.write_usize(col_range.start);
+            hasher.write_usize(col_range.end);
+            hasher.write_usize(*total_dim);
+            hash_cf_array2(hasher, local);
+        }
+        PenaltyMatrix::Labeled { label, inner } => {
+            hasher.write_str("labeled");
+            hasher.write_str(label);
+            hash_cf_penalty(hasher, inner);
+        }
+    }
+}
+
+fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+) -> Option<String> {
+    let mut hasher = StableHasher::new();
+    hasher.write_str("gamfit-persistent-block-warm-start");
+    hasher.write_str(&crate::solver::persistent_warm_start::cache_schema_tag());
+    hasher.write_str(type_name::<F>());
+    hasher.write_str(&family.persistent_warm_start_fingerprint(specs, options)?);
+    hasher.write_usize(specs.len());
+    for spec in specs {
+        hasher.write_str(&spec.name);
+        hash_cf_design_matrix(&mut hasher, &spec.design).ok()?;
+        hash_cf_array_view(&mut hasher, spec.offset.view());
+        hasher.write_usize(spec.penalties.len());
+        for penalty in &spec.penalties {
+            hash_cf_penalty(&mut hasher, penalty);
+        }
+        hasher.write_usize(spec.nullspace_dims.len());
+        for &dim in &spec.nullspace_dims {
+            hasher.write_usize(dim);
+        }
+        hash_cf_array_view(&mut hasher, spec.initial_log_lambdas.view());
+    }
+    hasher.write_usize(options.inner_max_cycles);
+    hasher.write_f64(options.inner_tol);
+    hasher.write_usize(options.outer_max_iter);
+    hasher.write_f64(options.outer_tol);
+    hasher.write_f64(options.minweight);
+    hasher.write_f64(options.ridge_floor);
+    hasher.write_str(&format!("{:?}", options.ridge_policy));
+    hasher.write_bool(options.use_remlobjective);
+    hasher.write_bool(options.use_outer_hessian);
+    hasher.write_bool(options.compute_covariance);
+    hasher.write_bool(options.line_search_prefer_workspace);
+    hasher.write_bool(options.early_exit_threshold.is_some());
+    if let Some(value) = options.early_exit_threshold {
+        hasher.write_f64(value);
+    }
+    hasher.write_bool(options.outer_score_subsample.is_some());
+    hasher.write_bool(options.auto_outer_subsample);
+    Some(format!("cf-{}", hasher.finish_hex()))
+}
+
+fn custom_family_cache_shape(specs: &[ParameterBlockSpec]) -> (usize, Vec<String>, Vec<usize>) {
+    let n_rows = specs.first().map(|spec| spec.design.nrows()).unwrap_or(0);
+    let block_names = specs.iter().map(|spec| spec.name.clone()).collect();
+    let block_dims = specs.iter().map(|spec| spec.design.ncols()).collect();
+    (n_rows, block_names, block_dims)
+}
+
+fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+    options: &BlockwiseFitOptions,
+    rho_len: usize,
+) -> (Option<String>, Option<ConstrainedWarmStart>) {
+    let Some(key) = persistent_custom_family_key::<F>(family, specs, options) else {
+        return (None, None);
+    };
+    let (n_rows, block_names, block_dims) = custom_family_cache_shape(specs);
+    let Some(record) = load_block_record(&key) else {
+        return (Some(key), None);
+    };
+    if !record.is_compatible(&key, n_rows, &block_names, &block_dims, rho_len) {
+        return (Some(key), None);
+    }
+    let active_sets = normalize_active_sets(record.active_sets);
+    let cached_inner = record.inner.map(|inner| CachedInnerMode {
+        log_likelihood: inner.log_likelihood,
+        penalty_value: inner.penalty_value,
+        cycles: inner.cycles,
+        converged: inner.converged,
+        block_logdet_h: inner.block_logdet_h,
+        block_logdet_s: inner.block_logdet_s,
+        joint_workspace: None,
+    });
+    let inner_status = cached_inner.as_ref().map_or("missing", |inner| {
+        if inner.converged {
+            "converged"
+        } else {
+            "partial"
+        }
+    });
+    log::info!(
+        "[warm-start-cache] restored custom-family persistent warm start key={key} inner={inner_status}"
+    );
+    (
+        Some(key),
+        Some(ConstrainedWarmStart {
+            rho: Array1::from_vec(record.rho),
+            block_beta: record
+                .block_beta
+                .into_iter()
+                .map(Array1::from_vec)
+                .collect(),
+            active_sets,
+            cached_inner,
+        }),
+    )
+}
+
+fn persistent_block_inner_summary(
+    warm_start: &ConstrainedWarmStart,
+) -> Option<PersistentBlockInnerSummary> {
+    warm_start.cached_inner.as_ref().and_then(|cached| {
+        (cached.log_likelihood.is_finite()
+            && cached.penalty_value.is_finite()
+            && cached.block_logdet_h.is_finite()
+            && cached.block_logdet_s.is_finite())
+        .then(|| PersistentBlockInnerSummary {
+            log_likelihood: cached.log_likelihood,
+            penalty_value: cached.penalty_value,
+            cycles: cached.cycles,
+            converged: cached.converged,
+            block_logdet_h: cached.block_logdet_h,
+            block_logdet_s: cached.block_logdet_s,
+        })
+    })
+}
+
+fn store_persistent_custom_family_warm_start(
+    key: Option<&str>,
+    specs: &[ParameterBlockSpec],
+    warm_start: &ConstrainedWarmStart,
+) {
+    let Some(key) = key else {
+        return;
+    };
+    let (n_rows, block_names, block_dims) = custom_family_cache_shape(specs);
+    if warm_start.block_beta.len() != block_dims.len()
+        || warm_start
+            .block_beta
+            .iter()
+            .zip(block_dims.iter())
+            .any(|(beta, dim)| beta.len() != *dim || beta.iter().any(|v| !v.is_finite()))
+        || warm_start.rho.iter().any(|v| !v.is_finite())
+    {
+        return;
+    }
+    // Saturation gate: never persist ρ that hit the outer optimizer's
+    // box (|ρ_i| ≥ 9). Those iterates are either at a legitimate active
+    // bound or a non-converged intermediate; either way they make poor
+    // seed material because the load-side clamp pulls them back into
+    // the interior anyway (see `outer_strategy.rs` `[CACHE] hit-clamp`).
+    const SATURATION_THRESHOLD: f64 = 9.0;
+    if warm_start
+        .rho
+        .iter()
+        .any(|&v| v.abs() >= SATURATION_THRESHOLD)
+    {
+        log::debug!(
+            "[warm-start-cache] skip persist custom-family key={} \
+             reason=rho-saturated threshold=±{:.1} rho_inf_norm={:.3e}",
+            key,
+            SATURATION_THRESHOLD,
+            warm_start
+                .rho
+                .iter()
+                .fold(0.0_f64, |acc, &v| acc.max(v.abs())),
+        );
+        return;
+    }
+    let mut record =
+        PersistentBlockWarmStartRecord::new(key.to_string(), n_rows, block_names, block_dims);
+    record.updated_unix_secs = record.created_unix_secs;
+    record.rho = warm_start.rho.to_vec();
+    record.block_beta = warm_start
+        .block_beta
+        .iter()
+        .map(|beta| beta.to_vec())
+        .collect();
+    record.active_sets = warm_start.active_sets.clone();
+    record.inner = persistent_block_inner_summary(warm_start);
+    if let Err(err) = store_block_record(&record) {
+        log::warn!("[warm-start-cache] failed to persist custom-family warm start: {err}");
+    }
+}
+
 const CUSTOM_OUTER_INNER_CAP_MARGIN: usize = 5;
 
 fn update_custom_outer_inner_cap_from_warm_start(
@@ -10328,6 +10651,35 @@ fn joint_inner_kkt_converged(residual: f64, residual_tol: f64) -> bool {
     residual.is_finite() && residual_tol.is_finite() && residual <= residual_tol
 }
 
+const JOINT_PCG_REL_TOL: f64 = 1e-8;
+const PCG_ETA_MAX: f64 = 1.0e-1;
+const PCG_ETA_MIN: f64 = 1.0e-8;
+const PCG_GAMMA: f64 = 0.9;
+const PCG_ALPHA: f64 = 1.6180339887498949;
+
+/// Eisenstat–Walker adaptive forcing term for the inner PCG tolerance:
+/// when the previous outer KKT residual is known, scale the next inner
+/// solve's relative tolerance by `γ·(‖r_cur‖/‖r_prev‖)^α`, clamped to
+/// `[PCG_ETA_MIN, PCG_ETA_MAX]`. On the first cycle (no previous
+/// residual) we use the loose `PCG_ETA_MAX` to avoid over-solving when
+/// the iterate is far from the optimum.
+fn joint_pcg_eisenstat_walker_forcing(prev_kkt_norm: Option<f64>, current_kkt_norm: f64) -> f64 {
+    if !current_kkt_norm.is_finite() || current_kkt_norm < 0.0 {
+        return JOINT_PCG_REL_TOL;
+    }
+    let Some(prev_kkt_norm) = prev_kkt_norm else {
+        return PCG_ETA_MAX;
+    };
+    if !prev_kkt_norm.is_finite() || prev_kkt_norm <= 0.0 {
+        return JOINT_PCG_REL_TOL;
+    }
+    let ratio = current_kkt_norm / prev_kkt_norm;
+    if !ratio.is_finite() || ratio < 0.0 {
+        return JOINT_PCG_REL_TOL;
+    }
+    (PCG_GAMMA * ratio.powf(PCG_ALPHA)).clamp(PCG_ETA_MIN, PCG_ETA_MAX)
+}
+
 fn apply_joint_penalized_hessian_into(
     source: &JointHessianSource,
     ranges: &[(usize, usize)],
@@ -10906,6 +11258,24 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
         let mut prev_kkt_norm: Option<f64> = None;
         let mut ew_pcg_log_emitted = false;
+        // Divergence early-exit: a joint-Newton iterate whose
+        // log-likelihood is frozen for several consecutive cycles while
+        // |δ|∞ is clamped at the family safeguard is moving but not
+        // making progress; bail out rather than burn the cycle budget.
+        let mut prev_log_likelihood_for_joint_divergence_check: f64 = current_log_likelihood;
+        let mut consecutive_joint_frozen_loglik_cycles: usize = 0;
+        const JOINT_DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
+        // Plateau detector: count consecutive cycles whose |Δobj| sits
+        // below `objective_tol`; when the streak hits the threshold
+        // the linearized stall exit fires.
+        let mut consecutive_obj_flat_cycles: usize = 0;
+        // Total descent budget across the joint-Newton loop, used by
+        // the end-of-loop summary to report `descent_total`.
+        let initial_joint_objective: f64 = lastobjective;
+        // Family-side cap on the inf-norm of a single Newton proposal.
+        // Mirrors the rescale in the legacy implementation (see commit
+        // 4bb663ab, "Perf: add joint Newton fast path for GAMLSS").
+        const MAX_JOINT_STEP: f64 = 20.0;
 
         // Per-cycle |Δobjective| history for the geometric-tail trigger of
         // the constrained-stationary certificate below. When the cycles
@@ -11040,6 +11410,25 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
             let joint_hessian_is_dense =
                 matches!(&joint_hessian_source, JointHessianSource::Dense(_));
+            let joint_solver_diagonal_ridge = stabilized_joint_solver_diagonal_ridge(
+                family,
+                &joint_hessian_source,
+                &ranges,
+                &s_lambdas,
+                trace_diagonal_ridge,
+                options.ridge_floor,
+            );
+            let current_kkt_norm = exact_newton_joint_stationarity_inf_norm_from_gradient(
+                &grad_joint,
+                &states,
+                specs,
+                &s_lambdas,
+                ridge,
+                options.ridge_policy,
+                &block_constraints,
+                Some(cached_active_sets.as_slice()),
+            )?;
+            let pcg_rel_tol = joint_pcg_eisenstat_walker_forcing(prev_kkt_norm, current_kkt_norm);
 
             let solve_joint_constraints_dense =
                 !matrix_free_joint_requested || joint_hessian_is_dense;
@@ -11373,16 +11762,30 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // the same exact full-objective accept/reject test.
             const JOINT_TRUST_MAX_ATTEMPTS: usize = 24;
             let mut search_delta = delta.clone();
+            let mut search_joint_active_set: Option<Vec<usize>> = joint_active_set.clone();
             let mut tried_preconditioned_descent = false;
             let mut model_rejects = 0usize;
             let mut likelihood_rejects = 0usize;
             let mut objective_rejects = 0usize;
             let mut first_likelihood_reject: Option<String> = None;
+            // Coalesce consecutive trust-region attempts whose accept/reject
+            // outcome and numeric signature round to the same values, so a long
+            // run of identical retries collapses into a single "attempts a..b
+            // (×N)" line at flush time instead of spamming one line per try.
+            let mut tr_log_sig: Option<String> = None;
+            let mut tr_log_first: usize = 0;
+            let mut tr_log_last: usize = 0;
+            let mut accepted_math_diag: Option<JointNewtonMathDiagnostic> = None;
             for trust_attempt in 0..JOINT_TRUST_MAX_ATTEMPTS {
                 line_search_attempts = trust_attempt + 1;
                 accepted_joint_workspace = None;
                 let mut trial_delta = search_delta.clone();
                 truncate_joint_step_to_radius(&mut trial_delta, joint_trust_radius);
+                let trial_step_inf = trial_delta
+                    .iter()
+                    .copied()
+                    .map(f64::abs)
+                    .fold(0.0_f64, f64::max);
                 let mut barrier_ceiling = 1.0_f64;
                 for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
                     let block_delta = trial_delta.slice(s![start..end]).to_owned();
@@ -11854,6 +12257,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     .fold(0.0_f64, f64::max)
             };
             let residual_tol = inner_tol * (1.0 + grad_inf.max(pen_inf));
+            let near_convergence = residual <= 10.0 * residual_tol;
+            let signed_obj_change = lastobjective - old_objective;
+            let objective_change = signed_obj_change.abs();
 
             // Per-cycle observability for the convergence test. Surfaces
             // WHICH criterion is binding (proposed step, accepted step,
@@ -15076,6 +15482,7 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     penalty_counts: &[usize],
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
+    rho_prior: crate::types::RhoPrior,
 ) -> Result<
     (
         crate::solver::outer_strategy::EfsEval,

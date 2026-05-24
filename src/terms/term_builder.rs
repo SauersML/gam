@@ -5,8 +5,9 @@
 //! and produces a `TermCollectionSpec` ready for `build_term_collection_design`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::PathBuf;
 
-use ndarray::{ArrayView1, Axis};
+use ndarray::{Array2, ArrayView1, Axis};
 
 use crate::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
@@ -1633,6 +1634,53 @@ pub fn build_smooth_basis(
                 input_scales: None,
             })
         }
+        "pca" => {
+            validate_known_options(
+                "pca",
+                options,
+                &[
+                    "type",
+                    "bs",
+                    "by",
+                    "k",
+                    "basis_dim",
+                    "basis-dim",
+                    "basisdim",
+                    "lazy_path",
+                    "path",
+                    "pca_basis_path",
+                    "chunk_size",
+                    "smooth_penalty",
+                    "centered",
+                    "double_penalty",
+                    "id",
+                    "__by_col",
+                ],
+            )?;
+            let path = options
+                .get("lazy_path")
+                .or_else(|| options.get("pca_basis_path"))
+                .or_else(|| options.get("path"))
+                .map(|raw| PathBuf::from(strip_quotes(raw)));
+            let Some(path) = path else {
+                return Err(TermBuilderError::incompatible_config(
+                    "pca smooth requires lazy_path=... on the formula path",
+                )
+                .to_string());
+            };
+            let k = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
+                .unwrap_or(0);
+            let chunk_size = option_usize(options, "chunk_size").unwrap_or(4096);
+            Ok(SmoothBasisSpec::Pca {
+                feature_cols: cols.to_vec(),
+                basis_matrix: Array2::<f64>::zeros((cols.len(), k)),
+                centered: option_bool(options, "centered").unwrap_or(true),
+                smooth_penalty: option_f64(options, "smooth_penalty").unwrap_or(1.0),
+                center_mean: None,
+                pca_basis_path: Some(path),
+                chunk_size,
+            })
+        }
         other => Err(TermBuilderError::unsupported_feature(format!(
             "unsupported smooth type '{other}'"
         ))
@@ -2688,41 +2736,5 @@ mod tests {
             parsed.right,
             BSplineEndpointBoundaryCondition::Anchored { value } if value.abs() < 1e-12
         ));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_half_open_anchored_boundary_options() {
-        let mut options = BTreeMap::new();
-        options.insert("bc_left".to_string(), "anchored".to_string());
-        options.insert("anchor_left".to_string(), "1.5".to_string());
-        options.insert("bc_right".to_string(), "none".to_string());
-        let parsed = parse_bspline_boundary_conditions(&options).expect("boundary options");
-        assert_eq!(
-            parsed,
-            BSplineBoundaryConditions {
-                left: BSplineEndpointBoundaryCondition::Anchored { value: 1.5 },
-                right: BSplineEndpointBoundaryCondition::Free,
-            }
-        );
-    }
-
-    #[test]
-    fn parses_global_clamped_with_side_selector() {
-        let mut options = BTreeMap::new();
-        options.insert("boundary_conditions".to_string(), "clamped".to_string());
-        options.insert("side".to_string(), "right".to_string());
-        let parsed = parse_bspline_boundary_conditions(&options).expect("boundary options");
-        assert_eq!(
-            parsed,
-            BSplineBoundaryConditions {
-                left: BSplineEndpointBoundaryCondition::Free,
-                right: BSplineEndpointBoundaryCondition::Clamped,
-            }
-        );
     }
 }
