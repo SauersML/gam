@@ -13,8 +13,8 @@ use crate::solver::persistent_warm_start::{
     PersistentWarmStartRecord, StableHasher, load_record, store_record,
 };
 use crate::types::{
-    GlmFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
-    MixtureLinkState, ResponseFamily, RhoPrior, SasLinkState,
+    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior,
+    SasLinkState,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1237,102 +1237,26 @@ struct DerivativeContext {
 
 /// Project a `GlmLikelihoodSpec` onto a `LikelihoodSpec` for pattern matching
 /// on the `(response, link)` form used elsewhere in the codebase.
-///
-/// Mapping per migration spec:
-///   GaussianIdentity              -> { Gaussian,         Standard(Identity) }
-///   BinomialLogit                 -> { Binomial,         Standard(Logit)    }
-///   BinomialProbit                -> { Binomial,         Standard(Probit)   }
-///   BinomialCLogLog               -> { Binomial,         Standard(CLogLog)  }
-///   BinomialSas                   -> { Binomial,         Sas(placeholder)         }
-///   BinomialBetaLogistic          -> { Binomial,         BetaLogistic(placeholder) }
-///   BinomialMixture               -> { Binomial,         Mixture(placeholder)      }
-///   PoissonLog                    -> { Poisson,          Standard(Log)      }
-///   Tweedie { p }                 -> { Tweedie { p },    Standard(Log)      }
-///   NegativeBinomial { theta }    -> { NegativeBinomial { theta }, Standard(Log) }
-///   BetaLogit { phi }             -> { Beta { phi },     Standard(Logit)    }
-///   GammaLog                      -> { Gamma,            Standard(Log)      }
-///
-/// `GlmLikelihoodSpec` does not carry the parameterized link state for the
-/// SAS / BetaLogistic / Mixture binomial variants, so placeholder states are
-/// substituted. The REML helpers below only consult variant kinds (not link
-/// payloads), which keeps the substitution sound.
 #[inline]
-fn reml_spec(likelihood: GlmLikelihoodSpec) -> LikelihoodSpec {
-    let placeholder_sas = SasLinkState {
-        epsilon: 0.0,
-        log_delta: 0.0,
-        delta: 1.0,
-    };
-    match likelihood.family {
-        GlmFamily::GaussianIdentity => LikelihoodSpec::new(
-            ResponseFamily::Gaussian,
-            InverseLink::Standard(LinkFunction::Identity),
-        ),
-        GlmFamily::BinomialLogit => LikelihoodSpec::new(
-            ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Logit),
-        ),
-        GlmFamily::BinomialProbit => LikelihoodSpec::new(
-            ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::Probit),
-        ),
-        GlmFamily::BinomialCLogLog => LikelihoodSpec::new(
-            ResponseFamily::Binomial,
-            InverseLink::Standard(LinkFunction::CLogLog),
-        ),
-        GlmFamily::BinomialSas => {
-            LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(placeholder_sas))
-        }
-        GlmFamily::BinomialBetaLogistic => LikelihoodSpec::new(
-            ResponseFamily::Binomial,
-            InverseLink::BetaLogistic(placeholder_sas),
-        ),
-        GlmFamily::BinomialMixture => LikelihoodSpec::new(
-            ResponseFamily::Binomial,
-            InverseLink::Mixture(MixtureLinkState {
-                components: Vec::new(),
-                rho: ndarray::Array1::<f64>::zeros(0),
-                pi: ndarray::Array1::<f64>::zeros(0),
-            }),
-        ),
-        GlmFamily::PoissonLog => LikelihoodSpec::new(
-            ResponseFamily::Poisson,
-            InverseLink::Standard(LinkFunction::Log),
-        ),
-        GlmFamily::Tweedie { p } => LikelihoodSpec::new(
-            ResponseFamily::Tweedie { p },
-            InverseLink::Standard(LinkFunction::Log),
-        ),
-        GlmFamily::NegativeBinomial { theta } => LikelihoodSpec::new(
-            ResponseFamily::NegativeBinomial { theta },
-            InverseLink::Standard(LinkFunction::Log),
-        ),
-        GlmFamily::BetaLogit { phi } => LikelihoodSpec::new(
-            ResponseFamily::Beta { phi },
-            InverseLink::Standard(LinkFunction::Logit),
-        ),
-        GlmFamily::GammaLog => LikelihoodSpec::new(
-            ResponseFamily::Gamma,
-            InverseLink::Standard(LinkFunction::Log),
-        ),
-    }
+fn reml_spec(likelihood: &GlmLikelihoodSpec) -> LikelihoodSpec {
+    likelihood.spec.clone()
 }
 
 #[inline]
-fn reml_is_gaussian_identity(likelihood: GlmLikelihoodSpec) -> bool {
+fn reml_is_gaussian_identity(likelihood: &GlmLikelihoodSpec) -> bool {
     reml_spec(likelihood).is_gaussian_identity()
 }
 
 #[inline]
-fn reml_supports_firth(likelihood: GlmLikelihoodSpec) -> bool {
+fn reml_supports_firth(likelihood: &GlmLikelihoodSpec) -> bool {
     let spec = reml_spec(likelihood);
     matches!(spec.response, ResponseFamily::Binomial)
         && matches!(spec.link, InverseLink::Standard(LinkFunction::Logit))
 }
 
 #[inline]
-fn reml_fixed_glm_dispersion(likelihood: GlmLikelihoodSpec) -> f64 {
-    let spec = reml_spec(likelihood.clone());
+fn reml_fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
+    let spec = reml_spec(likelihood);
     match (&spec.response, &spec.link) {
         // Beta carries phi inside the response variant under the LikelihoodSpec form.
         (ResponseFamily::Beta { phi }, _) => *phi,
@@ -2935,7 +2859,7 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         ext_coords: &[super::unified::HyperCoord],
     ) -> Result<TkCorrectionTerms, EstimationError> {
-        if reml_is_gaussian_identity(self.config.likelihood.clone()) {
+        if reml_is_gaussian_identity(self.config.likelihood.as_ref()) {
             return Ok(TkCorrectionTerms {
                 value: 0.0,
                 gradient: None,
@@ -3009,7 +2933,7 @@ impl<'a> RemlState<'a> {
             let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
             let beta = self.sparse_exact_beta_original(pirls_result);
             let firth_op = if self.config.firth_bias_reduction
-                && reml_supports_firth(self.config.likelihood.clone())
+                && reml_supports_firth(self.config.likelihood.as_ref())
             {
                 if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
                     Some(cached.clone())
@@ -3157,7 +3081,7 @@ impl<'a> RemlState<'a> {
             pirls_result.beta_transformed.as_ref().clone()
         };
         let firth_op =
-            if self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood.clone()) {
+            if self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood.as_ref()) {
                 Some(std::sync::Arc::new(Self::build_firth_dense_operator(
                     &x_eff_dense,
                     &pirls_result.final_eta,
@@ -3190,7 +3114,7 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         ext_coords: &[super::unified::HyperCoord],
     ) -> Result<(), EstimationError> {
-        if reml_is_gaussian_identity(self.config.likelihood.clone())
+        if reml_is_gaussian_identity(self.config.likelihood.as_ref())
             || !self.config.firth_bias_reduction
             || !compute_gradient_for_tk(mode)
         {
@@ -3757,7 +3681,7 @@ impl<'a> RemlState<'a> {
         // Mixture links advertise `link_function() == Logit` but are
         // non-canonical; route them through the general path below.
         let canonical_logit = {
-            let spec = reml_spec(pirls_result.likelihood.clone());
+            let spec = reml_spec(&pirls_result.likelihood);
             matches!(spec.response, ResponseFamily::Binomial)
                 && matches!(spec.link, InverseLink::Standard(LinkFunction::Logit))
         } && self.runtime_mixture_link_state.is_none();
@@ -3785,9 +3709,9 @@ impl<'a> RemlState<'a> {
         // General observed-information path for non-canonical Bernoulli
         // links and other GLM families that support the observed Hessian
         // surface (Probit, CLogLog, SAS, BetaLogistic, Mixture, GammaLog).
-        let likelihood = pirls_result.likelihood.clone();
+        let likelihood = &pirls_result.likelihood;
         let weight_family = pirls::weight_family_for_glm_likelihood(&likelihood);
-        let phi = reml_fixed_glm_dispersion(likelihood.clone());
+        let phi = reml_fixed_glm_dispersion(likelihood);
         let dmu_deta = &pirls_result.solve_dmu_deta;
         let d2mu_deta2 = &pirls_result.solve_d2mu_deta2;
         let d3mu_deta3 = &pirls_result.solve_d3mu_deta3;
@@ -3869,7 +3793,7 @@ impl<'a> RemlState<'a> {
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
         let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
         let canonical_logit = {
-            let spec = reml_spec(pirls_result.likelihood.clone());
+            let spec = reml_spec(&pirls_result.likelihood);
             matches!(spec.response, ResponseFamily::Binomial)
                 && matches!(spec.link, InverseLink::Standard(LinkFunction::Logit))
         } && self.runtime_mixture_link_state.is_none();
@@ -5791,7 +5715,7 @@ impl<'a> RemlState<'a> {
     ) -> Option<Arc<crate::pirls::GaussianFixedCache>> {
         // Static eligibility — these only depend on data the outer loop
         // never mutates, so the gate is correct once and stays correct.
-        let spec = reml_spec(self.config.likelihood);
+        let spec = reml_spec(self.config.likelihood.as_ref());
         let family_ok = matches!(spec.response, ResponseFamily::Gaussian);
         let link_ok = matches!(
             self.config.link_kind,
@@ -5929,7 +5853,7 @@ impl<'a> RemlState<'a> {
         let pirls_result = self.execute_pirls_if_needed(rho)?;
         let (mut h_total, ridge_passport) = self.effectivehessian(pirls_result.as_ref())?;
         let mut firth_dense_operator: Option<Arc<FirthDenseOperator>> = None;
-        if self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood) {
+        if self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood.as_ref()) {
             let firth_n = pirls_result.x_transformed.nrows();
             let firth_p = pirls_result.x_transformed.ncols();
             if !super::firth_problem_scale_allows(firth_n, firth_p) {
@@ -6085,7 +6009,7 @@ impl<'a> RemlState<'a> {
         let (penalty_rank, logdet_s_pos, det1_values) =
             self.sparse_penalty_logdet_runtime(rho, penalty_blocks.as_ref());
         let firth_dense_operator_original = if self.config.firth_bias_reduction
-            && reml_supports_firth(self.config.likelihood)
+            && reml_supports_firth(self.config.likelihood.as_ref())
         {
             let firth_n = self.x().nrows();
             let firth_p = self.x().ncols();
@@ -7702,7 +7626,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         free_basis_opt: &Option<Array2<f64>>,
     ) -> Result<Option<std::sync::Arc<super::FirthDenseOperator>>, EstimationError> {
-        if !(self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood)) {
+        if !(self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood.as_ref())) {
             return Ok(None);
         }
 
@@ -7766,7 +7690,7 @@ impl<'a> RemlState<'a> {
             DispersionHandling, GaussianDerivatives, SinglePredictorGlmDerivatives,
         };
 
-        let is_gaussian_identity = reml_is_gaussian_identity(pirls_result.likelihood);
+        let is_gaussian_identity = reml_is_gaussian_identity(&pirls_result.likelihood);
         let firth_op =
             self.build_dense_firth_operator_for_outer_basis(pirls_result, bundle, free_basis_opt)?;
 
@@ -7809,7 +7733,7 @@ impl<'a> RemlState<'a> {
             DispersionHandling::ProfiledGaussian
         } else {
             DispersionHandling::Fixed {
-                phi: reml_fixed_glm_dispersion(pirls_result.likelihood),
+                phi: reml_fixed_glm_dispersion(&pirls_result.likelihood),
                 include_logdet_h: true,
                 include_logdet_s: true,
             }
@@ -7818,7 +7742,7 @@ impl<'a> RemlState<'a> {
         let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
             self.y,
             &pirls_result.finalmu,
-            pirls_result.likelihood,
+            &pirls_result.likelihood,
             self.weights,
         );
 
@@ -7860,12 +7784,12 @@ impl<'a> RemlState<'a> {
             SinglePredictorGlmDerivatives,
         };
 
-        let is_gaussian_identity = reml_is_gaussian_identity(pirls_result.likelihood);
+        let is_gaussian_identity = reml_is_gaussian_identity(&pirls_result.likelihood);
 
         // Sparse exact still uses the same dense Jeffreys operator; only the
         // H^{-1} applications move to the sparse Cholesky operator.
         let firth_op =
-            if self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood) {
+            if self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood.as_ref()) {
                 if let Some(cached) = bundle.firth_dense_operator_original.clone() {
                     Some(cached)
                 } else {
@@ -7895,7 +7819,7 @@ impl<'a> RemlState<'a> {
             } else if pirls_result.derivatives_unsupported {
                 (
                     DispersionHandling::Fixed {
-                        phi: reml_fixed_glm_dispersion(pirls_result.likelihood),
+                        phi: reml_fixed_glm_dispersion(&pirls_result.likelihood),
                         include_logdet_h: true,
                         include_logdet_s: true,
                     },
@@ -7906,7 +7830,7 @@ impl<'a> RemlState<'a> {
                     self.hessian_surface_arrays(pirls_result)?;
                 (
                     DispersionHandling::Fixed {
-                        phi: reml_fixed_glm_dispersion(pirls_result.likelihood),
+                        phi: reml_fixed_glm_dispersion(&pirls_result.likelihood),
                         include_logdet_h: true,
                         include_logdet_s: true,
                     },
@@ -7933,7 +7857,7 @@ impl<'a> RemlState<'a> {
         let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
             self.y,
             &pirls_result.finalmu,
-            pirls_result.likelihood,
+            &pirls_result.likelihood,
             self.weights,
         );
 

@@ -7396,7 +7396,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         priorweights,
         penalty_active.clone(),
         workspace,
-        likelihood.clone(),
+        config.likelihood.clone(),
         config.link_kind.clone(),
         config.firth_bias_reduction
             && matches!(
