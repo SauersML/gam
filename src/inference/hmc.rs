@@ -1285,8 +1285,8 @@ fn cloglog_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f
         .map(|(i, slot)| {
             let y_i = data.y[i];
             let w_i = data.weights[i];
-            let (ll_i, residual_i) =
-                cloglog_bernoulli_logp_and_residual(eta[i], y_i).expect("validated cloglog eta");
+            let (ll_i, residual_i) = cloglog_bernoulli_logp_and_residual(eta[i], y_i)
+                .expect("validated cloglog eta");
             *slot = w_i * residual_i;
             w_i * ll_i
         })
@@ -1716,8 +1716,10 @@ mod tests {
         assert!((ll_y1 - wrong_log_one_minus_exp_eta).abs() > 0.5);
 
         let eps = 1e-6;
-        let (lp, _) = cloglog_bernoulli_logp_and_residual(eta + eps, 1.0).expect("valid eta");
-        let (lm, _) = cloglog_bernoulli_logp_and_residual(eta - eps, 1.0).expect("valid eta");
+        let (lp, _) =
+            cloglog_bernoulli_logp_and_residual(eta + eps, 1.0).expect("valid eta");
+        let (lm, _) =
+            cloglog_bernoulli_logp_and_residual(eta - eps, 1.0).expect("valid eta");
         let fd = (lp - lm) / (2.0 * eps);
         assert!(
             (residual_y1 - fd).abs() < 1e-9,

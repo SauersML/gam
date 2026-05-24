@@ -12693,11 +12693,10 @@ fn stratified_spatial_subsample(
             _ => None,
         });
 
-    let mut rng = StdRng::seed_from_u64(42);
-
     let cols = match spatial_cols {
         Some(c) if !c.is_empty() => c,
         _ => {
+            let mut rng = StdRng::seed_from_u64(spatial_subsample_seed(data, &[], target_size));
             let mut indices: Vec<usize> = (0..n).collect();
             indices.shuffle(&mut rng);
             indices.truncate(target_size);
@@ -12705,6 +12704,7 @@ fn stratified_spatial_subsample(
             return indices;
         }
     };
+    let mut rng = StdRng::seed_from_u64(spatial_subsample_seed(data, &cols, target_size));
 
     let d = cols.len();
     let mut mins = vec![f64::INFINITY; d];
@@ -12769,6 +12769,44 @@ fn stratified_spatial_subsample(
 
     selected.sort_unstable();
     selected
+}
+
+fn spatial_subsample_seed(
+    data: ArrayView2<'_, f64>,
+    spatial_cols: &[usize],
+    target_size: usize,
+) -> u64 {
+    let mut state = 0x5350_4154_4941_4C53_u64;
+    spatial_seed_mix(&mut state, data.nrows() as u64);
+    spatial_seed_mix(&mut state, data.ncols() as u64);
+    spatial_seed_mix(&mut state, target_size as u64);
+    spatial_seed_mix(&mut state, spatial_cols.len() as u64);
+    for &col in spatial_cols {
+        spatial_seed_mix(&mut state, col as u64);
+    }
+
+    if data.nrows() > 0 {
+        let mid = data.nrows() / 2;
+        let last = data.nrows() - 1;
+        for &row in &[0usize, mid, last] {
+            for &col in spatial_cols {
+                let value = data[[row, col]];
+                spatial_seed_mix(&mut state, value.to_bits());
+            }
+        }
+    }
+    state
+}
+
+#[inline]
+fn spatial_seed_mix(state: &mut u64, value: u64) {
+    let mut z = value.wrapping_add(0x9E37_79B9_7F4A_7C15).wrapping_add(*state);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    *state ^= z ^ (z >> 31);
+    *state = (*state)
+        .rotate_left(27)
+        .wrapping_mul(0x3C79_AC49_2BA7_B653);
 }
 
 fn sampled_rows(data: ArrayView2<'_, f64>, indices: &[usize]) -> Array2<f64> {

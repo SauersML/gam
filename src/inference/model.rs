@@ -124,12 +124,10 @@ impl From<FittedModelError> for String {
     }
 }
 
-// Boundary conversions so that external `Result<_, EstimationError>` /
-// `Result<_, SurvivalPredictError>` call sites continue to propagate via
-// `?` without per-callsite `.map_err`. The category mapping below mirrors
-// the pre-refactor `String` → `EstimationError::InvalidInput(s)` /
-// `SurvivalPredictError::from(s)` defaults: a typed `FittedModelError`
-// flowing across the boundary is recategorised with the same Display text.
+// Boundary conversions so external `Result<_, EstimationError>` /
+// `Result<_, SurvivalPredictError>` call sites can propagate with `?`.
+// Survival prediction keeps the model-layer source so the chain identifies
+// the payload/schema failure that triggered the prediction error.
 impl From<FittedModelError> for crate::solver::estimate::EstimationError {
     fn from(err: FittedModelError) -> Self {
         crate::solver::estimate::EstimationError::InvalidInput(err.to_string())
@@ -138,32 +136,9 @@ impl From<FittedModelError> for crate::solver::estimate::EstimationError {
 
 impl From<FittedModelError> for crate::families::survival_predict::SurvivalPredictError {
     fn from(err: FittedModelError) -> Self {
-        // Route by saved-model category so the boundary preserves the
-        // categorical information the load path already discovered while
-        // keeping the human-readable Display text byte-equivalent.
-        let reason = err.to_string();
-        match err {
-            FittedModelError::SchemaMismatch { .. } => {
-                crate::families::survival_predict::SurvivalPredictError::IncompatibleSchema {
-                    reason,
-                }
-            }
-            FittedModelError::PayloadCorrupt { .. } => {
-                crate::families::survival_predict::SurvivalPredictError::InvalidInput { reason }
-            }
-            FittedModelError::MissingField { .. } => {
-                crate::families::survival_predict::SurvivalPredictError::MissingFitMetadata {
-                    reason,
-                }
-            }
-            FittedModelError::IncompatibleConfig { .. } => {
-                crate::families::survival_predict::SurvivalPredictError::UnsupportedConfiguration {
-                    reason,
-                }
-            }
-            FittedModelError::InvalidInput { .. } => {
-                crate::families::survival_predict::SurvivalPredictError::InvalidInput { reason }
-            }
+        crate::families::survival_predict::SurvivalPredictError::ModelPayload {
+            context: "saved-model survival prediction payload",
+            source: err,
         }
     }
 }

@@ -9,11 +9,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use ndarray::{ArrayView1, Axis};
 
 use crate::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy,
-    DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec,
-    MaternIdentifiability, MaternNu, OneDimensionalBoundary, SpatialIdentifiability,
-    ThinPlateBasisSpec, auto_spatial_center_strategy, default_num_centers,
-    default_spatial_center_strategy, plan_spatial_basis, resolve_duchon_orders,
+    BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
+    BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy, DuchonBasisSpec,
+    DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
+    MaternNu, OneDimensionalBoundary, SpatialIdentifiability, ThinPlateBasisSpec,
+    auto_spatial_center_strategy, default_num_centers, default_spatial_center_strategy,
+    plan_spatial_basis, resolve_duchon_orders,
 };
 use crate::inference::data::{EncodedDataset as Dataset, missing_column_message};
 use crate::inference::formula_dsl::{
@@ -582,7 +583,7 @@ fn parse_f64_option_list(raw: &str) -> Result<Vec<f64>, String> {
         .collect()
 }
 
-fn tensor_margin_boundary_conditions(
+fn tensor_margin_boundaries(
     options: &BTreeMap<String, String>,
     cols: &[usize],
     ds: &Dataset,
@@ -634,7 +635,7 @@ fn tensor_margin_boundary_conditions(
             "open" | "none" | "natural" => {}
             other => {
                 return Err(format!(
-                    "unsupported te()/tensor() boundary condition '{other}'; supported values are open and periodic"
+                    "unsupported te()/tensor() boundary '{other}'; supported values are open and periodic"
                 ));
             }
         }
@@ -911,12 +912,12 @@ pub fn build_smooth_basis(
                     vars.join(",")
                 ));
             }
-            let boundary_conditions = tensor_margin_boundary_conditions(options, cols, ds)?;
+            let boundaries = tensor_margin_boundaries(options, cols, ds)?;
             let specs = cols
                 .iter()
                 .enumerate()
                 .map(|(i, &c)| {
-                    let (minv, maxv) = match boundary_conditions[i] {
+                    let (minv, maxv) = match boundaries[i] {
                         OneDimensionalBoundary::Cyclic { start, end } => (start, end),
                         OneDimensionalBoundary::Open => col_minmax(ds.values.column(c))?,
                     };
@@ -929,7 +930,7 @@ pub fn build_smooth_basis(
                         },
                         double_penalty: false,
                         identifiability: BSplineIdentifiability::None,
-                        boundary: OneDimensionalBoundary::Open,
+                        boundary: boundaries[i].clone(),
                         boundary_conditions: BSplineBoundaryConditions::default(),
                     })
                 })
@@ -1105,7 +1106,7 @@ pub fn build_smooth_basis(
                     } else {
                         parse_cyclic_boundary(options, minv, maxv)?
                     },
-                    boundary_conditions: BSplineBoundaryConditions::default(),
+                    boundary_conditions,
                 },
             })
         }
@@ -1585,13 +1586,16 @@ pub fn default_sphere_degree(n: usize) -> usize {
 // Smooth option parsers
 // ---------------------------------------------------------------------------
 
-fn parse_endpoint_side(value: &str, context: &str) -> Result<BSplineEndpointCondition, String> {
+fn parse_endpoint_side(
+    value: &str,
+    context: &str,
+) -> Result<BSplineEndpointBoundaryCondition, String> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "" | "none" | "open" | "unconstrained" => Ok(BSplineEndpointCondition::None),
+        "" | "none" | "open" | "unconstrained" => Ok(BSplineEndpointBoundaryCondition::Free),
         "clamped" | "clamp" | "zero_derivative" | "zero-derivative" => {
-            Ok(BSplineEndpointCondition::Clamped)
+            Ok(BSplineEndpointBoundaryCondition::Clamped)
         }
-        "anchored" | "anchor" => Ok(BSplineEndpointCondition::Anchored { value: 0.0 }),
+        "anchored" | "anchor" => Ok(BSplineEndpointBoundaryCondition::Anchored { value: 0.0 }),
         other => Err(format!(
             "unsupported {context} boundary condition '{other}'; expected none, clamped, or anchored"
         )),
@@ -1614,27 +1618,29 @@ fn boundary_anchor_value(
 }
 
 fn apply_anchor_value(
-    cond: BSplineEndpointCondition,
+    cond: BSplineEndpointBoundaryCondition,
     value: Option<f64>,
-) -> BSplineEndpointCondition {
+) -> BSplineEndpointBoundaryCondition {
     match cond {
-        BSplineEndpointCondition::Anchored { .. } => BSplineEndpointCondition::Anchored {
-            value: value.unwrap_or(0.0),
-        },
+        BSplineEndpointBoundaryCondition::Anchored { .. } => {
+            BSplineEndpointBoundaryCondition::Anchored {
+                value: value.unwrap_or(0.0),
+            }
+        }
         other => other,
     }
 }
 
-fn parse_bspline_boundary_condition(
+fn parse_bspline_boundary_conditions(
     options: &BTreeMap<String, String>,
-) -> Result<BSplineBoundaryCondition, String> {
+) -> Result<BSplineBoundaryConditions, String> {
     let fallback_anchor = option_f64(options, "anchor")
         .or_else(|| option_f64(options, "anchor_value"))
         .or_else(|| option_f64(options, "value"));
     let global_bc = options
         .get("bc")
         .or_else(|| options.get("boundary_condition"));
-    let mut boundary = BSplineBoundaryCondition::default();
+    let mut boundary_conditions = BSplineBoundaryConditions::default();
 
     if let Some(raw_bc) = global_bc {
         let cond = parse_endpoint_side(raw_bc, "bc")?;
@@ -1645,11 +1651,11 @@ fn parse_bspline_boundary_condition(
             .unwrap_or_else(|| "both".to_string());
         match side.as_str() {
             "both" | "all" | "endpoints" => {
-                boundary.left = cond;
-                boundary.right = cond;
+                boundary_conditions.left = cond;
+                boundary_conditions.right = cond;
             }
-            "left" | "start" | "lower" => boundary.left = cond,
-            "right" | "end" | "upper" => boundary.right = cond,
+            "left" | "start" | "lower" => boundary_conditions.left = cond,
+            "right" | "end" | "upper" => boundary_conditions.right = cond,
             other => {
                 return Err(format!(
                     "unsupported B-spline boundary side '{other}'; expected left, right, or both"
@@ -1664,7 +1670,7 @@ fn parse_bspline_boundary_condition(
         .or_else(|| options.get("bc_start"))
         .or_else(|| options.get("start_bc"))
     {
-        boundary.left = parse_endpoint_side(raw, "left endpoint")?;
+        boundary_conditions.left = parse_endpoint_side(raw, "left endpoint")?;
     }
     if let Some(raw) = options
         .get("bc_right")
@@ -1672,19 +1678,19 @@ fn parse_bspline_boundary_condition(
         .or_else(|| options.get("bc_end"))
         .or_else(|| options.get("end_bc"))
     {
-        boundary.right = parse_endpoint_side(raw, "right endpoint")?;
+        boundary_conditions.right = parse_endpoint_side(raw, "right endpoint")?;
     }
 
-    boundary.left = apply_anchor_value(
-        boundary.left,
+    boundary_conditions.left = apply_anchor_value(
+        boundary_conditions.left,
         boundary_anchor_value(options, "left", fallback_anchor),
     );
-    boundary.right = apply_anchor_value(
-        boundary.right,
+    boundary_conditions.right = apply_anchor_value(
+        boundary_conditions.right,
         boundary_anchor_value(options, "right", fallback_anchor),
     );
 
-    Ok(boundary)
+    Ok(boundary_conditions)
 }
 
 pub fn parse_ps_internal_knots(
@@ -2522,12 +2528,12 @@ mod tests {
         options.insert("bc_left".to_string(), "anchored".to_string());
         options.insert("anchor_left".to_string(), "1.5".to_string());
         options.insert("bc_right".to_string(), "none".to_string());
-        let parsed = parse_bspline_boundary_condition(&options).expect("boundary options");
+        let parsed = parse_bspline_boundary_conditions(&options).expect("boundary options");
         assert_eq!(
             parsed,
-            BSplineBoundaryCondition {
-                left: BSplineEndpointCondition::Anchored { value: 1.5 },
-                right: BSplineEndpointCondition::None,
+            BSplineBoundaryConditions {
+                left: BSplineEndpointBoundaryCondition::Anchored { value: 1.5 },
+                right: BSplineEndpointBoundaryCondition::Free,
             }
         );
     }
@@ -2537,12 +2543,12 @@ mod tests {
         let mut options = BTreeMap::new();
         options.insert("bc".to_string(), "clamped".to_string());
         options.insert("side".to_string(), "right".to_string());
-        let parsed = parse_bspline_boundary_condition(&options).expect("boundary options");
+        let parsed = parse_bspline_boundary_conditions(&options).expect("boundary options");
         assert_eq!(
             parsed,
-            BSplineBoundaryCondition {
-                left: BSplineEndpointCondition::None,
-                right: BSplineEndpointCondition::Clamped,
+            BSplineBoundaryConditions {
+                left: BSplineEndpointBoundaryCondition::Free,
+                right: BSplineEndpointBoundaryCondition::Clamped,
             }
         );
     }

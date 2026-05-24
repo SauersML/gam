@@ -636,6 +636,11 @@ struct GenerateArgs {
     )]
     n_draws: usize,
     #[arg(
+        long = "seed",
+        help = "RNG seed for deterministic synthetic response generation (default: 42)"
+    )]
+    seed: Option<u64>,
+    #[arg(
         long = "out",
         help = "Output CSV path; default: <model_stem>.generated.csv"
     )]
@@ -6262,7 +6267,7 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
     )?;
     progress.advance_workflow(3);
 
-    let mut rng = StdRng::seed_from_u64(42);
+    let mut rng = StdRng::seed_from_u64(args.seed.unwrap_or(42));
     progress.set_stage("generate", "sampling synthetic observations");
     let draws = sampleobservation_replicates(&spec, args.n_draws, &mut rng)
         .map_err(|e| format!("failed to sample synthetic observations: {e}"))?;

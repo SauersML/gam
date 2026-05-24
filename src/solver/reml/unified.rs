@@ -12085,10 +12085,16 @@ impl OuterHessianIndefinite {
 /// Errors that can arise while building the corrected covariance.
 #[derive(Debug, Clone)]
 pub enum CorrectedCovarianceError {
-    /// Argument shapes do not agree (with explanatory message).
-    ShapeMismatch(String),
-    /// The eigendecomposition failed numerically (with the underlying message).
-    EigendecompositionFailed(String),
+    /// Argument shapes do not agree at a named corrected-covariance stage.
+    ShapeMismatch {
+        context: &'static str,
+        reason: String,
+    },
+    /// The eigendecomposition failed numerically at a named matrix stage.
+    EigendecompositionFailed {
+        context: &'static str,
+        reason: String,
+    },
     /// The projected outer Hessian is indefinite — see diagnostic.
     Indefinite(OuterHessianIndefinite),
 }
@@ -12096,8 +12102,12 @@ pub enum CorrectedCovarianceError {
 impl core::fmt::Display for CorrectedCovarianceError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::ShapeMismatch(msg) => write!(f, "shape mismatch: {msg}"),
-            Self::EigendecompositionFailed(msg) => write!(f, "eigendecomposition failed: {msg}"),
+            Self::ShapeMismatch { context, reason } => {
+                write!(f, "shape mismatch in {context}: {reason}")
+            }
+            Self::EigendecompositionFailed { context, reason } => {
+                write!(f, "eigendecomposition failed in {context}: {reason}")
+            }
             Self::Indefinite(d) => write!(
                 f,
                 "outer Hessian indefinite on free subspace (min eigenvalue = {:.3e}, \
@@ -12211,9 +12221,12 @@ fn projected_inverse_with_inertia_gate(
         }
     }
 
-    let (evals, evecs) = h_ff.eigh(faer::Side::Lower).map_err(|e| {
-        CorrectedCovarianceError::EigendecompositionFailed(format!("projected outer Hessian: {e}"))
-    })?;
+    let (evals, evecs) =
+        h_ff.eigh(faer::Side::Lower)
+            .map_err(|e| CorrectedCovarianceError::EigendecompositionFailed {
+                context: "projected outer Hessian",
+                reason: e.to_string(),
+            })?;
 
     let eps = f64::EPSILON;
     let neg_tol = 8.0 * eps * (q.max(1) as f64) * h_norm.max(1.0);
@@ -12340,15 +12353,17 @@ pub fn compute_corrected_covariance_with_constraints(
     }
 
     if outer_hessian.nrows() != q || outer_hessian.ncols() != q {
-        return Err(CorrectedCovarianceError::ShapeMismatch(format!(
-            "compute_corrected_covariance: outer Hessian dimension ({}, {}) does not match \
-             total hyperparameter count q = {} (rho: {}, ext: {})",
-            outer_hessian.nrows(),
-            outer_hessian.ncols(),
-            q,
-            v_ks.len(),
-            ext_v.len(),
-        )));
+        return Err(CorrectedCovarianceError::ShapeMismatch {
+            context: "compute_corrected_covariance outer Hessian",
+            reason: format!(
+                "dimension ({}, {}) does not match total hyperparameter count q = {} (rho: {}, ext: {})",
+                outer_hessian.nrows(),
+                outer_hessian.ncols(),
+                q,
+                v_ks.len(),
+                ext_v.len(),
+            ),
+        });
     }
 
     let mut j_alpha = Array2::zeros((p, q));
@@ -12479,13 +12494,15 @@ pub fn compute_corrected_covariance_diagonal_with_constraints(
     }
 
     if outer_hessian.nrows() != q || outer_hessian.ncols() != q {
-        return Err(CorrectedCovarianceError::ShapeMismatch(format!(
-            "compute_corrected_covariance_diagonal: outer Hessian dimension ({}, {}) \
-             does not match q = {}",
-            outer_hessian.nrows(),
-            outer_hessian.ncols(),
-            q,
-        )));
+        return Err(CorrectedCovarianceError::ShapeMismatch {
+            context: "compute_corrected_covariance_diagonal outer Hessian",
+            reason: format!(
+                "dimension ({}, {}) does not match q = {}",
+                outer_hessian.nrows(),
+                outer_hessian.ncols(),
+                q,
+            ),
+        });
     }
 
     let active = active_bound_indices_for_theta(theta_at_optimum, v_ks.len(), ext_v.len());
