@@ -2355,8 +2355,8 @@ impl<'a> RemlState<'a> {
                         let gij = gram[[bi, bj]];
                         let cpj = c_prime[jj];
                         let c_direct = (cpi * cj + ci * cpj) * gij * gij * gij / 12.0;
-                        let k_direct = if let Some((forward, reverse)) = design_gram.as_ref() {
-                            let kp = forward[[bi, bj]] + reverse[[bj, bi]];
+                        let k_direct = if design_gram.is_some() {
+                            let kp = block_scratch[[bi, bj]] + reverse_scratch[[bj, bi]];
                             0.25 * ci * cj * gij * gij * kp
                         } else if let Some(x_theta) = x_fixed {
                             let kp = (0..x_dense.ncols())
