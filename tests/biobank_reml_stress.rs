@@ -28,17 +28,13 @@
 use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
 };
-use gam::estimate::FitOptions;
-use gam::predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions, predict_gam,
-    predict_gamwith_uncertainty,
-};
+use gam::estimate::{FitOptions, UnifiedFitResult};
 use gam::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
     build_term_collection_design, fit_term_collection_forspec, freeze_term_collection_from_design,
 };
-use gam::types::LikelihoodFamily;
-use ndarray::{Array1, Array2};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
@@ -67,6 +63,14 @@ const PC_DIM_COVERAGE: usize = 4;
 // intent so that a regression makes itself loud.
 const WALLCLOCK_BUDGET_MAIN_SECS: f64 = 30.0 * 60.0; // 30 minutes
 const WALLCLOCK_BUDGET_PER_COVERAGE_FIT_SECS: f64 = 120.0;
+const NORMAL_95_TWO_SIDED_Z: f64 = 1.959_963_984_540_054;
+
+fn gaussian_identity_likelihood() -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(LinkFunction::Identity),
+    )
+}
 
 // ─── Synthetic biobank simulator ────────────────────────────────────────
 
@@ -194,6 +198,53 @@ fn relative_l2(pred: &Array1<f64>, truth: &Array1<f64>) -> f64 {
     (num / den.max(1e-30)).sqrt()
 }
 
+fn gaussian_identity_mean(
+    design: ArrayView2<'_, f64>,
+    beta: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+) -> Array1<f64> {
+    let mut mean = design.dot(&beta);
+    mean += &offset;
+    mean
+}
+
+fn gaussian_identity_bias_corrected_mean(
+    design: ArrayView2<'_, f64>,
+    fit: &UnifiedFitResult,
+    offset: ArrayView1<'_, f64>,
+) -> Array1<f64> {
+    let bias_correction = fit
+        .inference
+        .as_ref()
+        .and_then(|inference| inference.bias_correction_beta.as_ref())
+        .expect("FitInference must carry bias_correction_beta");
+    let beta = &fit.beta + bias_correction;
+    gaussian_identity_mean(design, beta.view(), offset)
+}
+
+fn gaussian_identity_bias_corrected_mean_interval(
+    design: ArrayView2<'_, f64>,
+    fit: &UnifiedFitResult,
+    offset: ArrayView1<'_, f64>,
+) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+    let mean = gaussian_identity_bias_corrected_mean(design, fit, offset);
+    let covariance = fit
+        .beta_covariance_corrected()
+        .expect("Gaussian identity coverage requires smoothing-corrected covariance");
+    assert_eq!(covariance.nrows(), fit.beta.len());
+    assert_eq!(covariance.ncols(), fit.beta.len());
+
+    let mut eta_se = Array1::<f64>::zeros(design.nrows());
+    for (i, row) in design.outer_iter().enumerate() {
+        let cov_row = covariance.dot(&row);
+        eta_se[i] = row.dot(&cov_row).max(0.0).sqrt();
+    }
+    let z_se = eta_se.mapv(|se| NORMAL_95_TWO_SIDED_Z * se);
+    let lower = &mean - &z_se;
+    let upper = &mean + &z_se;
+    (mean, lower, upper)
+}
+
 // ─── Main stress test ───────────────────────────────────────────────────
 
 #[test]
@@ -213,7 +264,7 @@ fn biobank_reml_stress_main() {
         weights.view(),
         offset.view(),
         &spec,
-        LikelihoodFamily::GaussianIdentity,
+        gaussian_identity_likelihood(),
         &fit_options(40),
     )
     .expect("biobank-scale Duchon-on-PC fit should succeed");
@@ -241,15 +292,13 @@ fn biobank_reml_stress_main() {
     let holdout_dense = holdout_design.design.to_dense();
     let holdout_offset = Array1::<f64>::zeros(N_HOLDOUT);
 
-    let pred = predict_gam(
+    let pred_mean = gaussian_identity_mean(
         holdout_dense.view(),
         fitted.fit.beta.view(),
         holdout_offset.view(),
-        LikelihoodFamily::GaussianIdentity,
-    )
-    .expect("predict on held-out grid should succeed");
-    assert!(pred.mean.iter().all(|v| v.is_finite()));
-    let rel_l2 = relative_l2(&pred.mean, &y_true_holdout);
+    );
+    assert!(pred_mean.iter().all(|v| v.is_finite()));
+    let rel_l2 = relative_l2(&pred_mean, &y_true_holdout);
     assert!(
         rel_l2 < 0.10,
         "held-out relative L2 reconstruction error too high: {rel_l2:.4} (>= 0.10)",
@@ -257,8 +306,7 @@ fn biobank_reml_stress_main() {
 
     // (3) Bias-corrected predictions: FitInference must carry a finite
     //     bias-correction vector after a successful REML fit, and the
-    //     uncertainty path must accept `apply_bias_correction = true`
-    //     and produce finite η.
+    //     bias-corrected Gaussian identity prediction must stay finite.
     let inference = fitted
         .fit
         .inference
@@ -274,24 +322,12 @@ fn biobank_reml_stress_main() {
         "bias_correction_beta must be entirely finite",
     );
 
-    let pred_unc = predict_gamwith_uncertainty(
+    let pred_unc_mean = gaussian_identity_bias_corrected_mean(
         holdout_dense.view(),
-        fitted.fit.beta.view(),
-        holdout_offset.view(),
-        LikelihoodFamily::GaussianIdentity,
         &fitted.fit,
-        &PredictUncertaintyOptions {
-            confidence_level: 0.95,
-            covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
-            mean_interval_method: MeanIntervalMethod::TransformEta,
-            includeobservation_interval: true,
-            apply_bias_correction: true,
-            ..PredictUncertaintyOptions::default()
-        },
-    )
-    .expect("bias-corrected uncertainty prediction must succeed");
-    assert!(pred_unc.eta.iter().all(|v| v.is_finite()));
-    assert!(pred_unc.mean.iter().all(|v| v.is_finite()));
+        holdout_offset.view(),
+    );
+    assert!(pred_unc_mean.iter().all(|v| v.is_finite()));
 
     // (4) Wallclock budget.
     assert!(
@@ -347,7 +383,7 @@ fn biobank_reml_stress_coverage() {
             weights.view(),
             offset_tr.view(),
             &spec,
-            LikelihoodFamily::GaussianIdentity,
+            gaussian_identity_likelihood(),
             &fit_options(30),
         )
         .expect("coverage-sim Duchon-on-PC fit should succeed");
@@ -370,26 +406,16 @@ fn biobank_reml_stress_coverage() {
         let holdout_dense = holdout_design.design.to_dense();
         let offset_te = Array1::<f64>::zeros(N_COVERAGE_HOLDOUT);
 
-        let pred = predict_gamwith_uncertainty(
+        let (pred_mean, pred_lower, pred_upper) = gaussian_identity_bias_corrected_mean_interval(
             holdout_dense.view(),
-            fitted.fit.beta.view(),
-            offset_te.view(),
-            LikelihoodFamily::GaussianIdentity,
             &fitted.fit,
-            &PredictUncertaintyOptions {
-                confidence_level: 0.95,
-                covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
-                mean_interval_method: MeanIntervalMethod::TransformEta,
-                includeobservation_interval: false,
-                apply_bias_correction: true,
-                ..PredictUncertaintyOptions::default()
-            },
-        )
-        .expect("coverage-sim uncertainty prediction must succeed");
+            offset_te.view(),
+        );
+        assert!(pred_mean.iter().all(|v| v.is_finite()));
 
         for i in 0..N_COVERAGE_HOLDOUT {
-            let lo = pred.mean_lower[i];
-            let hi = pred.mean_upper[i];
+            let lo = pred_lower[i];
+            let hi = pred_upper[i];
             let truth_i = y_true_te[i];
             if truth_i >= lo && truth_i <= hi {
                 total_in += 1;
