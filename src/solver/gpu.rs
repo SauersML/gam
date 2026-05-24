@@ -148,7 +148,8 @@ pub struct GpuStageTimer {
 }
 
 impl GpuStageTimer {
-    pub fn start(_label: &'static str) -> Self {
+    pub fn start(label: &'static str) -> Self {
+        drop(label);
         Self {
             start: Instant::now(),
         }

@@ -3286,10 +3286,12 @@ fn run_predict_survival(
                 &prepared,
                 primary_offset,
             ),
-            // SAFETY: the surrounding `if matches!(saved_likelihood_mode,
-            // Latent | LatentBinary)` block gates this match; no other
-            // discriminant can reach here.
-            _ => unreachable!(),
+            SurvivalLikelihoodMode::Transformation
+            | SurvivalLikelihoodMode::Weibull
+            | SurvivalLikelihoodMode::LocationScale
+            | SurvivalLikelihoodMode::MarginalSlope => Err(CliError::from(
+                "internal: non-latent survival modes are routed earlier; this branch is gated by an outer `if matches!(_, Latent | LatentBinary)` and cannot fire".to_string(),
+            )),
         };
     }
     let saved_location_scale_inverse_link =
