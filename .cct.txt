@@ -1,2 +1,9 @@
    Compiling gam v0.2.1 (/Users/user/gam)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 03s
+error[E0425]: cannot find function `scan_for_noop_self_consuming_fns` in this scope
+   --> build.rs:144:5
+    |
+144 |     scan_for_noop_self_consuming_fns(
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `gam` (build script) due to 1 previous error
