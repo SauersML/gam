@@ -1260,6 +1260,8 @@ pub fn survival_fit_from_parts(
         constraint_kkt: None,
         artifacts: crate::solver::estimate::FitArtifacts {
             pirls: None,
+            null_space_logdet: None,
+            null_space_dim: None,
             survival_link_wiggle_knots: link_wiggle_knots,
             survival_link_wiggle_degree: link_wiggle_degree,
         },
@@ -9631,7 +9633,7 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
         )
     }
 
-    fn block_linear_constraints(
+    fn second_order_terms(
         &self,
         psi_i: usize,
         psi_j: usize,

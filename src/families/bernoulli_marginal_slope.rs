@@ -8024,7 +8024,7 @@ impl BernoulliMarginalSlopeFamily {
                 )
             })
             .collect();
-        let mut row_contexts = row_contexts?;
+        let row_contexts = row_contexts?;
         let fast_path_rows = row_contexts
             .iter()
             .filter(|ctx| ctx.intercept_fast_path)
