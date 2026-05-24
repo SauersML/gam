@@ -6,7 +6,7 @@
 
 use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
-    SpatialIdentifiability,
+    OneDimensionalBoundary, SpatialIdentifiability,
 };
 use gam::smooth::{
     LinearTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
@@ -132,7 +132,8 @@ fn local_synth_copd_like_duchon_orth_to_parametric() {
                 identifiability: SpatialIdentifiability::default(),
                 aniso_log_scales: None,
                 operator_penalties: DuchonOperatorPenaltySpec::default(),
-                periodic: false,
+                periodic: None,
+                boundary: OneDimensionalBoundary::Open,
             },
             input_scales: None,
         },
