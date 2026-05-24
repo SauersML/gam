@@ -10703,6 +10703,21 @@ fn build_analytic_penalty_registry_from_json(
                 )));
             }
             "scad_mcp" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &[
+                        "kind",
+                        "target",
+                        "weight",
+                        "n_eff",
+                        "gamma",
+                        "variant",
+                        "smoothing_eps",
+                        "learnable",
+                        "weight_schedule",
+                    ],
+                )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
                 let variant = descriptor
@@ -10726,22 +10741,37 @@ fn build_analytic_penalty_registry_from_json(
                     .get("learnable")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
+                let penalty = ScadMcpPenalty::new(
+                    slice,
+                    weight,
+                    n_eff,
+                    gamma,
+                    smoothing_eps,
+                    variant,
+                    learnable,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
                 registry.push(gam::terms::AnalyticPenaltyKind::ScadMcp(
-                    std::sync::Arc::new(
-                        ScadMcpPenalty::new(
-                            slice,
-                            weight,
-                            n_eff,
-                            gamma,
-                            smoothing_eps,
-                            variant,
-                            learnable,
-                        )
-                        .map_err(|err| format!("{context}: {err}"))?,
-                    ),
+                    std::sync::Arc::new(penalty),
                 ));
             }
             "block_orthogonality" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &[
+                        "kind",
+                        "target",
+                        "groups",
+                        "weight",
+                        "n_eff",
+                        "learnable",
+                    ],
+                )?;
                 let raw_groups = descriptor
                     .get("groups")
                     .and_then(serde_json::Value::as_array)
@@ -10776,33 +10806,60 @@ fn build_analytic_penalty_registry_from_json(
                 ));
             }
             "ibp_assignment" | "ibp_assignment_penalty" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &["kind", "target", "k_max", "alpha", "tau", "learnable", "weight_schedule"],
+                )?;
                 let k_max = descriptor_usize(descriptor, "k_max", target.d)?;
                 let alpha = descriptor_f64(descriptor, "alpha", 1.0)?;
                 let tau = descriptor_f64(descriptor, "tau", 1.0)?;
-                let learnable_alpha = descriptor
-                    .get("learnable_alpha")
+                let learnable = descriptor
+                    .get("learnable")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
+                let penalty = IBPAssignmentPenalty::new(k_max, alpha, tau, learnable);
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
                 registry.push(gam::terms::AnalyticPenaltyKind::IBPAssignment(
-                    std::sync::Arc::new(IBPAssignmentPenalty::new(
-                        k_max,
-                        alpha,
-                        tau,
-                        learnable_alpha,
-                    )),
+                    std::sync::Arc::new(penalty),
                 ));
             }
             "softmax_assignment_sparsity" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &["kind", "target", "k_atoms", "temperature", "weight_schedule"],
+                )?;
                 let k_atoms = descriptor_usize(descriptor, "k_atoms", target.d)?;
                 let temperature = descriptor_f64(descriptor, "temperature", 1.0)?;
+                let penalty = SoftmaxAssignmentSparsityPenalty::new(k_atoms, temperature);
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
                 registry.push(gam::terms::AnalyticPenaltyKind::SoftmaxAssignmentSparsity(
-                    std::sync::Arc::new(SoftmaxAssignmentSparsityPenalty::new(
-                        k_atoms,
-                        temperature,
-                    )),
+                    std::sync::Arc::new(penalty),
                 ));
             }
             "total_variation" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &[
+                        "kind",
+                        "target",
+                        "weight",
+                        "n_eff",
+                        "difference_op",
+                        "edges",
+                        "smoothing_eps",
+                        "learnable",
+                        "weight_schedule",
+                    ],
+                )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
                 let difference_op = descriptor_difference_op(descriptor, &context)?;
@@ -10811,20 +10868,37 @@ fn build_analytic_penalty_registry_from_json(
                     .get("learnable")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
+                let penalty = TotalVariationPenalty::new(
+                    weight,
+                    n_eff,
+                    difference_op,
+                    smoothing_eps,
+                    learnable,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
                 registry.push(gam::terms::AnalyticPenaltyKind::TotalVariation(
-                    std::sync::Arc::new(
-                        TotalVariationPenalty::new(
-                            weight,
-                            n_eff,
-                            difference_op,
-                            smoothing_eps,
-                            learnable,
-                        )
-                        .map_err(|err| format!("{context}: {err}"))?,
-                    ),
+                    std::sync::Arc::new(penalty),
                 ));
             }
             "nuclear_norm" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &[
+                        "kind",
+                        "target",
+                        "weight",
+                        "n_eff",
+                        "smoothing_eps",
+                        "max_rank",
+                        "learnable",
+                        "weight_schedule",
+                    ],
+                )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
                 let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
@@ -10844,21 +10918,32 @@ fn build_analytic_penalty_registry_from_json(
                     .get("learnable")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
+                let penalty =
+                    NuclearNormPenalty::new(slice, weight, n_eff, smoothing_eps, max_rank, learnable)
+                        .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
                 registry.push(gam::terms::AnalyticPenaltyKind::NuclearNorm(
-                    std::sync::Arc::new(
-                        NuclearNormPenalty::new(
-                            slice,
-                            weight,
-                            n_eff,
-                            smoothing_eps,
-                            max_rank,
-                            learnable,
-                        )
-                        .map_err(|err| format!("{context}: {err}"))?,
-                    ),
+                    std::sync::Arc::new(penalty),
                 ));
             }
             "block_sparsity" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &[
+                        "kind",
+                        "target",
+                        "groups",
+                        "weight",
+                        "n_eff",
+                        "smoothing_eps",
+                        "learnable",
+                        "weight_schedule",
+                    ],
+                )?;
                 let raw_groups = descriptor
                     .get("groups")
                     .and_then(serde_json::Value::as_array)
@@ -10886,21 +10971,38 @@ fn build_analytic_penalty_registry_from_json(
                     .get("learnable")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
+                let penalty = gam::terms::BlockSparsityPenalty::new(
+                    slice,
+                    groups,
+                    weight,
+                    n_eff,
+                    smoothing_eps,
+                    learnable,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
                 registry.push(gam::terms::AnalyticPenaltyKind::BlockSparsity(
-                    std::sync::Arc::new(
-                        gam::terms::BlockSparsityPenalty::new(
-                            slice,
-                            groups,
-                            weight,
-                            n_eff,
-                            smoothing_eps,
-                            learnable,
-                        )
-                        .map_err(|err| format!("{context}: {err}"))?,
-                    ),
+                    std::sync::Arc::new(penalty),
                 ));
             }
             "aux_conditional_prior" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &[
+                        "kind",
+                        "target",
+                        "lambda_per_row",
+                        "lambda_per_row_shape",
+                        "weight",
+                        "n_eff",
+                        "learnable",
+                        "weight_schedule",
+                    ],
+                )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
                 let learnable = descriptor
@@ -10913,20 +11015,41 @@ fn build_analytic_penalty_registry_from_json(
                     "lambda_per_row_shape",
                     &context,
                 )?;
+                let penalty = AuxConditionalPriorPenalty::new(
+                    slice,
+                    lambda_per_row,
+                    weight,
+                    n_eff,
+                    learnable,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
                 registry.push(gam::terms::AnalyticPenaltyKind::AuxConditionalPrior(
-                    std::sync::Arc::new(
-                        AuxConditionalPriorPenalty::new(
-                            slice,
-                            lambda_per_row,
-                            weight,
-                            n_eff,
-                            learnable,
-                        )
-                        .map_err(|err| format!("{context}: {err}"))?,
-                    ),
+                    std::sync::Arc::new(penalty),
                 ));
             }
             "parametric_aux_conditional_prior" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &[
+                        "kind",
+                        "target",
+                        "aux",
+                        "aux_shape",
+                        "log_alpha",
+                        "raw_beta",
+                        "mu",
+                        "mu_shape",
+                        "weight",
+                        "n_eff",
+                        "learnable",
+                        "weight_schedule",
+                    ],
+                )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
                 let learnable = descriptor
@@ -10937,20 +11060,23 @@ fn build_analytic_penalty_registry_from_json(
                 let log_alpha = descriptor_array1_flat(descriptor, "log_alpha", &context)?;
                 let raw_beta = descriptor_array1_flat(descriptor, "raw_beta", &context)?;
                 let mu = descriptor_array2_flat(descriptor, "mu", "mu_shape", &context)?;
+                let penalty = ParametricAuxConditionalPriorPenalty::new(
+                    slice,
+                    aux,
+                    log_alpha,
+                    raw_beta,
+                    mu,
+                    weight,
+                    n_eff,
+                    learnable,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
                 registry.push(gam::terms::AnalyticPenaltyKind::ParametricAuxConditionalPrior(
-                    std::sync::Arc::new(
-                        ParametricAuxConditionalPriorPenalty::new(
-                            slice,
-                            aux,
-                            log_alpha,
-                            raw_beta,
-                            mu,
-                            weight,
-                            n_eff,
-                            learnable,
-                        )
-                        .map_err(|err| format!("{context}: {err}"))?,
-                    ),
+                    std::sync::Arc::new(penalty),
                 ));
             }
             other => return Err(format!("{context}.kind has unsupported analytic penalty {other:?}")),
