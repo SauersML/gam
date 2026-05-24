@@ -137,10 +137,9 @@ impl DeviceXSession {
                 ref mut wy_dev,
                 ..
             } = *inner;
-            // SAFETY: shapes/strides match the col-major X layout we
-            // uploaded above; n_i, p_i are i32-checked; pointers come
-            // from valid `CudaSlice<f64>`s living for the duration of
-            // this call.
+            // SAFETY: shapes/strides match the col-major X layout uploaded
+            // above; n_i, p_i are i32-checked; pointers come from valid
+            // CudaSlice<f64>s living for the duration of this call.
             unsafe {
                 let (x_ptr, _record_x) = x_dev.device_ptr(&stream);
                 let (w_ptr, _record_w) = w_dev.device_ptr(&stream);

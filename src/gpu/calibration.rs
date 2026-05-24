@@ -205,12 +205,9 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, GpuErr
 
     // Two warmup runs so kernel JIT + boost clock settle.
     for i in 0..2 {
-        // SAFETY: cfg is filled with shape/leading-dimension values
-        // consistent with the just-allocated a_dev/b_dev/c_dev slices
-        // (M*K, K*N, M*N elements, column-major leading dims m, k, m).
-        // gemm is unsafe in cudarc 0.19 because invalid shapes would
-        // map to invalid device memory accesses; the shapes here are
-        // statically known and match the allocations.
+        // SAFETY: cfg shapes/leading dims match the just-allocated
+        // a_dev/b_dev/c_dev (M*K, K*N, M*N elements, column-major lda=m,
+        // ldb=k, ldc=m), so the cudarc 0.19 gemm stays in-bounds.
         unsafe { blas.gemm(cfg, &a_dev, &b_dev, &mut c_dev) }
             .map_err(|e| driver_err(format!("dgemm warmup {i}: {e}")))?;
         stream
