@@ -3,39 +3,45 @@
 //!
 //! The benchmark models the observed cycle-0 pattern where alpha attempts
 //! 1.0, 0.5, 0.25, and 0.125 reject and alpha 0.0625 accepts.  Each simulated
-//! likelihood evaluation sleeps for `BENCH_SLEEP_MS`, so the sequential
-//! baseline performs five sleeps while the speculative launcher evaluates the
-//! first three attempts concurrently and then falls back to sequential
-//! halving.
+//! likelihood evaluation busy-spins for `BENCH_WORK_MS`, so the sequential
+//! baseline performs five evaluations while the speculative launcher
+//! evaluates the first three attempts concurrently and then falls back to
+//! sequential halving.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::time::Duration;
 
 const RUN_BENCH: bool = false;
-const BENCH_SLEEP_MS: u64 = 25;
+const BENCH_WORK_MS: u64 = 25;
 const ACCEPT_BT: usize = 4;
 const MAX_ATTEMPTS: usize = 8;
 const SPECULATIVE_ATTEMPTS: usize = 3;
 
-fn simulated_objective(bt: usize, sleep: Duration) -> f64 {
-    std::thread::sleep(sleep);
+fn simulated_objective(bt: usize, work: Duration) -> f64 {
+    // Spin instead of sleeping to occupy a worker thread for the duration —
+    // the bench measures wall-clock under contention, so an actual CPU-bound
+    // load is a more faithful proxy than `thread::sleep` (which parks).
+    let until = std::time::Instant::now() + work;
+    while std::time::Instant::now() < until {
+        std::hint::spin_loop();
+    }
     if bt >= ACCEPT_BT { 0.0 } else { 2.0 }
 }
 
-fn sequential_backtracking(sleep: Duration) -> usize {
+fn sequential_backtracking(work: Duration) -> usize {
     for bt in 0..MAX_ATTEMPTS {
-        if simulated_objective(bt, sleep) <= 1.0 {
+        if simulated_objective(bt, work) <= 1.0 {
             return bt;
         }
     }
     MAX_ATTEMPTS
 }
 
-fn speculative_backtracking(sleep: Duration) -> usize {
+fn speculative_backtracking(work: Duration) -> usize {
     let first_wave: Vec<(usize, f64)> = (0..SPECULATIVE_ATTEMPTS)
         .into_par_iter()
-        .map(|bt| (bt, simulated_objective(bt, sleep)))
+        .map(|bt| (bt, simulated_objective(bt, work)))
         .collect();
     if let Some((bt, _)) = first_wave
         .iter()
@@ -44,7 +50,7 @@ fn speculative_backtracking(sleep: Duration) -> usize {
         return *bt;
     }
     for bt in SPECULATIVE_ATTEMPTS..MAX_ATTEMPTS {
-        if simulated_objective(bt, sleep) <= 1.0 {
+        if simulated_objective(bt, work) <= 1.0 {
             return bt;
         }
     }
@@ -60,14 +66,14 @@ fn bench_joint_line_search_speculative(c: &mut Criterion) {
         return;
     }
     gam::init_parallelism();
-    let sleep = Duration::from_millis(BENCH_SLEEP_MS);
+    let work = Duration::from_millis(BENCH_WORK_MS);
 
     let mut group = c.benchmark_group("joint_line_search_biobank_pattern");
     group.bench_function("sequential_5_attempts", |b| {
-        b.iter(|| assert_eq!(sequential_backtracking(sleep), ACCEPT_BT));
+        b.iter(|| assert_eq!(sequential_backtracking(work), ACCEPT_BT));
     });
     group.bench_function("speculative_3_then_fallback", |b| {
-        b.iter(|| assert_eq!(speculative_backtracking(sleep), ACCEPT_BT));
+        b.iter(|| assert_eq!(speculative_backtracking(work), ACCEPT_BT));
     });
     group.finish();
 }
