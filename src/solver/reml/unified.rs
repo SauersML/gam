@@ -13837,6 +13837,10 @@ impl SparseCholeskyOperator {
                     left_end,
                 )
                 .unwrap_or_else(|e| {
+                    // SAFETY: mirrors the left-solve invariant above —
+                    // `self.factor` is validated SPD and the column range
+                    // is taken from `right`'s own `block_local_data`,
+                    // so failure indicates factor corruption.
                     panic!("SparseCholeskyOperator exact operator cross right solve failed: {e}")
                 }),
             )
@@ -13898,6 +13902,11 @@ impl HessianOperator for SparseCholeskyOperator {
         }
         crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, a)
             .unwrap_or_else(|e| {
+                // SAFETY: `self.factor` is the validated SPD Cholesky factor
+                // (created by `SparseCholeskyOperator::new` only after a
+                // successful factorization); a single-square multi-RHS solve
+                // here can only fail on factor corruption, which the
+                // construction invariant forbids.
                 panic!("SparseCholeskyOperator exact trace_hinv_product solve failed: {e}")
             })
             .diag()
@@ -13953,11 +13962,18 @@ impl HessianOperator for SparseCholeskyOperator {
     }
 
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
+        // SAFETY: `self.factor` is the validated SPD Cholesky factor stored
+        // at construction time; a triangular solve against an already-built
+        // factor can only fail on factor corruption, which the
+        // `SparseCholeskyOperator` construction invariant forbids.
         crate::linalg::sparse_exact::solve_sparse_spd(&self.factor, rhs)
             .unwrap_or_else(|e| panic!("SparseCholeskyOperator exact solve failed: {e}"))
     }
 
     fn solve_multi(&self, rhs: &Array2<f64>) -> Array2<f64> {
+        // SAFETY: same SPD-factor invariant as `solve` above — `self.factor`
+        // was created from a successful Cholesky factorization, so a
+        // multi-RHS solve can only fail on factor corruption.
         crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, rhs)
             .unwrap_or_else(|e| panic!("SparseCholeskyOperator exact multi-solve failed: {e}"))
     }
