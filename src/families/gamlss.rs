@@ -14492,15 +14492,6 @@ struct BinomialLocationScaleWiggleJointPsiDirection {
     z_ls_psi: Array1<f64>,
 }
 
-struct BinomialLocationScaleWiggleJointPsiSecondDrifts {
-    x_t_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
-    x_ls_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
-    x_t_ab: Option<Array2<f64>>,
-    x_ls_ab: Option<Array2<f64>>,
-    z_t_ab: Array1<f64>,
-    z_ls_ab: Array1<f64>,
-}
-
 struct BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
     family: BinomialLocationScaleWiggleFamily,
     block_states: Vec<ParameterBlockState>,

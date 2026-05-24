@@ -2109,6 +2109,14 @@ impl LinearOperator for RandomEffectOperator {
 
 impl DenseDesignOperator for RandomEffectOperator {
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if weights.len() != self.n || y.len() != self.n {
+            return Err(format!(
+                "RandomEffectOperator::compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
+                weights.len(),
+                y.len(),
+                self.n
+            ));
+        }
         let mut out = Array1::<f64>::zeros(self.num_groups);
         for i in 0..self.n {
             if let Some(g) = self.group_ids[i] {
