@@ -4127,6 +4127,43 @@ fn strip_leading_if_return_guard(s: &str) -> Option<&str> {
     None
 }
 
+/// Count top-level `;` characters in `s` — `;` that lie outside any
+/// balanced `()` / `[]` / `{}` / `<...>` group. Used by the early-
+/// return guard matcher to confirm that a gated block is a single
+/// statement (`return <expr>;`) and not a multi-statement block that
+/// happens to start with `return ...; <real work>;`.
+fn count_top_level_semicolons(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut paren: i32 = 0;
+    let mut brack: i32 = 0;
+    let mut brace: i32 = 0;
+    let mut angle: i32 = 0;
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren -= 1,
+            b'[' => brack += 1,
+            b']' => brack -= 1,
+            b'{' => brace += 1,
+            b'}' => brace -= 1,
+            b'<' => angle += 1,
+            b'>' => {
+                if angle > 0 {
+                    angle -= 1;
+                }
+            }
+            b';' if paren == 0 && brack == 0 && brace == 0 && angle == 0 => {
+                count += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    count
+}
+
 /// Match a leading `drop(<expr>);` statement (any expression) and
 /// return the remainder past the `;`. `drop` is a legitimate primitive,
 /// but as a leading no-op consumer that produces nothing it has the
