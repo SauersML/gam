@@ -2278,44 +2278,44 @@ impl FittedModel {
         match (&mut payload.family_state, &fit.fitted_link) {
             (
                 FittedFamily::Standard {
-                    likelihood: LikelihoodFamily::BinomialLatentCLogLog,
+                    likelihood,
                     latent_cloglog_state,
                     ..
                 },
                 FittedLinkState::LatentCLogLog { state },
-            ) => {
+            ) if likelihood.is_latent_cloglog() => {
                 *latent_cloglog_state = Some(*state);
             }
             (
                 FittedFamily::Standard {
-                    likelihood: LikelihoodFamily::BinomialSas,
+                    likelihood,
                     sas_state,
                     ..
                 },
                 FittedLinkState::Sas { state, covariance },
-            ) => {
+            ) if likelihood.is_binomial_sas() => {
                 *sas_state = Some(*state);
                 payload.sas_param_covariance = covariance.as_ref().map(array2_to_nestedvec);
             }
             (
                 FittedFamily::Standard {
-                    likelihood: LikelihoodFamily::BinomialBetaLogistic,
+                    likelihood,
                     sas_state,
                     ..
                 },
                 FittedLinkState::BetaLogistic { state, covariance },
-            ) => {
+            ) if likelihood.is_binomial_beta_logistic() => {
                 *sas_state = Some(*state);
                 payload.sas_param_covariance = covariance.as_ref().map(array2_to_nestedvec);
             }
             (
                 FittedFamily::Standard {
-                    likelihood: LikelihoodFamily::BinomialMixture,
+                    likelihood,
                     mixture_state,
                     ..
                 },
                 FittedLinkState::Mixture { state, covariance },
-            ) => {
+            ) if likelihood.is_binomial_mixture() => {
                 *mixture_state = Some(state.clone());
                 payload.mixture_link_param_covariance =
                     covariance.as_ref().map(array2_to_nestedvec);
@@ -2337,10 +2337,11 @@ impl FittedModel {
             | FittedFamily::LatentBinary { .. } => PredictModelClass::Survival,
             FittedFamily::MarginalSlope { .. } => PredictModelClass::BernoulliMarginalSlope,
             FittedFamily::TransformationNormal { .. } => PredictModelClass::TransformationNormal,
-            FittedFamily::LocationScale {
-                likelihood: LikelihoodFamily::GaussianIdentity,
-                ..
-            } => PredictModelClass::GaussianLocationScale,
+            FittedFamily::LocationScale { likelihood, .. }
+                if likelihood.is_gaussian_identity() =>
+            {
+                PredictModelClass::GaussianLocationScale
+            }
             FittedFamily::LocationScale { .. } => PredictModelClass::BinomialLocationScale,
             FittedFamily::Standard { .. } => PredictModelClass::Standard,
         }
@@ -2596,16 +2597,19 @@ impl FittedModel {
         let payload = self.payload();
         let raw = match &payload.family_state {
             FittedFamily::Standard {
-                likelihood: LikelihoodFamily::BinomialSas,
+                likelihood,
                 sas_state,
                 ..
-            } => (*sas_state).ok_or_else(|| FittedModelError::MissingField {
-                reason: "binomial-sas model is missing state in family_state.sas_state".to_string(),
-            })?,
+            } if likelihood.is_binomial_sas() => {
+                (*sas_state).ok_or_else(|| FittedModelError::MissingField {
+                    reason: "binomial-sas model is missing state in family_state.sas_state"
+                        .to_string(),
+                })?
+            }
             FittedFamily::LocationScale {
-                likelihood: LikelihoodFamily::BinomialSas,
+                likelihood,
                 base_link,
-            } => match base_link {
+            } if likelihood.is_binomial_sas() => match base_link {
                 Some(InverseLink::Sas(state)) => *state,
                 _ => {
                     return Err(FittedModelError::MissingField {
@@ -2630,17 +2634,20 @@ impl FittedModel {
         let payload = self.payload();
         let raw = match &payload.family_state {
             FittedFamily::Standard {
-                likelihood: LikelihoodFamily::BinomialBetaLogistic,
+                likelihood,
                 sas_state,
                 ..
-            } => (*sas_state).ok_or_else(|| FittedModelError::MissingField {
-                reason: "binomial-beta-logistic model is missing state in family_state.sas_state"
-                    .to_string(),
-            })?,
+            } if likelihood.is_binomial_beta_logistic() => {
+                (*sas_state).ok_or_else(|| FittedModelError::MissingField {
+                    reason:
+                        "binomial-beta-logistic model is missing state in family_state.sas_state"
+                            .to_string(),
+                })?
+            }
             FittedFamily::LocationScale {
-                likelihood: LikelihoodFamily::BinomialBetaLogistic,
+                likelihood,
                 base_link,
-            } => match base_link {
+            } if likelihood.is_binomial_beta_logistic() => match base_link {
                 Some(InverseLink::BetaLogistic(state)) => *state,
                 _ => {
                     return Err(FittedModelError::MissingField {
@@ -2666,10 +2673,10 @@ impl FittedModel {
         let payload = self.payload();
         match &payload.family_state {
             FittedFamily::Standard {
-                likelihood: LikelihoodFamily::BinomialMixture,
+                likelihood,
                 mixture_state,
                 ..
-            } => mixture_state
+            } if likelihood.is_binomial_mixture() => mixture_state
                 .clone()
                 .ok_or_else(|| FittedModelError::MissingField {
                     reason: "binomial-mixture model is missing state in family_state.mixture_state"
@@ -2677,9 +2684,9 @@ impl FittedModel {
                 })
                 .map(Some),
             FittedFamily::LocationScale {
-                likelihood: LikelihoodFamily::BinomialMixture,
+                likelihood,
                 base_link,
-            } => match base_link {
+            } if likelihood.is_binomial_mixture() => match base_link {
                 Some(InverseLink::Mixture(state)) => Ok(Some(state.clone())),
                 _ => Err(FittedModelError::MissingField {
                     reason:
@@ -2697,10 +2704,10 @@ impl FittedModel {
         let payload = self.payload();
         match &payload.family_state {
             FittedFamily::Standard {
-                likelihood: LikelihoodFamily::BinomialLatentCLogLog,
+                likelihood,
                 latent_cloglog_state,
                 ..
-            } => latent_cloglog_state
+            } if likelihood.is_latent_cloglog() => latent_cloglog_state
                 .ok_or_else(|| FittedModelError::MissingField {
                     reason:
                         "latent-cloglog-binomial model is missing state in family_state.latent_cloglog_state"

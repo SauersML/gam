@@ -180,7 +180,10 @@ use crate::mixture_link::{
 use crate::probability::{
     erfcx_nonnegative, stable_polynomial_times_exp_neg as cloglog_stable_poly_times_exp_neg,
 };
-use crate::types::{LikelihoodFamily, LinkComponent, LinkFunction, MixtureLinkState, SasLinkState};
+use crate::types::{
+    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkState, ResponseFamily,
+    SasLinkState,
+};
 use statrs::function::erf::erfc;
 
 /// Number of quadrature points (7-point rule is exact for polynomials up to degree 13)
