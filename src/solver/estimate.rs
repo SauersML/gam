@@ -2555,7 +2555,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// finite difference of it along ψ gives the analytic `d/dψ log|H_proj|`
     /// that the production trace formula computes — i.e. the correct
     /// finite-difference reference for the penalty-subspace projection invariant.
-    #[cfg(test)]
     pub fn debug_logdet_h_proj(
         &mut self,
         x: &DesignMatrix,
@@ -2588,7 +2587,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     }
 
     /// Debug-only: return `(η, finalweights, solve_c_array)` at this theta.
-    #[cfg(test)]
     pub fn debug_full_eta_w_c(
         &mut self,
         x: &DesignMatrix,
