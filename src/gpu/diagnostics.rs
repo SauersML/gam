@@ -180,26 +180,26 @@ fn log_route(signature: String) {
     }
 }
 
-pub(crate) fn bytes_for_f64(len: usize) -> usize {
+pub(crate) const fn bytes_for_f64(len: usize) -> usize {
     len.saturating_mul(std::mem::size_of::<f64>())
 }
 
-pub(crate) fn bytes_for_i32(len: usize) -> usize {
+pub(crate) const fn bytes_for_i32(len: usize) -> usize {
     len.saturating_mul(std::mem::size_of::<i32>())
 }
 
-pub(crate) fn gemm_flops(m: usize, n: usize, k: usize) -> u64 {
+pub(crate) const fn gemm_flops(m: usize, n: usize, k: usize) -> u64 {
     (m as u64)
         .saturating_mul(n as u64)
         .saturating_mul(k.max(1) as u64)
         .saturating_mul(2)
 }
 
-pub(crate) fn gemv_flops(rows: usize, cols: usize) -> u64 {
+pub(crate) const fn gemv_flops(rows: usize, cols: usize) -> u64 {
     (rows as u64).saturating_mul(cols as u64).saturating_mul(2)
 }
 
-pub(crate) fn chol_flops(p: usize) -> u64 {
+pub(crate) const fn chol_flops(p: usize) -> u64 {
     let p64 = p as u64;
     p64.saturating_mul(p64).saturating_mul(p64) / 3
 }

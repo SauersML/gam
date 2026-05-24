@@ -6394,6 +6394,7 @@ impl BernoulliMarginalSlopeFamily {
         total
     }
 
+    #[expect(dead_code)]
     fn line_search_log_likelihood_workspace(
         &self,
         block_states: &[ParameterBlockState],
@@ -7141,6 +7142,7 @@ impl BernoulliMarginalSlopeFamily {
     /// `build_exact_eval_cache_with_options`, so the partition + dedup +
     /// LRU pipeline is expressed once and the two call sites stay
     /// bit-identical.
+    #[expect(dead_code)]
     fn compute_row_degree9_cells(
         &self,
         intercept: f64,
@@ -8344,6 +8346,7 @@ impl BernoulliMarginalSlopeFamily {
     /// path the per-row third/fourth uncontracted tensors). Subsequent
     /// requests with a byte-equal β snapshot and matching subsample Arc
     /// pointer return the same `Arc<_>` without any rebuild work.
+    #[expect(dead_code)]
     fn build_shared_eval_cache_with_options(
         &self,
         block_states: &[ParameterBlockState],
@@ -15929,6 +15932,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
 }
 
 impl BernoulliMarginalSlopeLineSearchWorkspace {
+    #[expect(dead_code)]
     fn materialized(
         &self,
     ) -> Result<&Arc<BernoulliMarginalSlopeExactNewtonJointHessianWorkspace>, String> {

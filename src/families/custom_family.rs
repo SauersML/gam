@@ -10889,10 +10889,14 @@ fn require_projected_kkt_residual(
     }
 }
 
+#[expect(dead_code)]
 const LINEARIZED_STALL_REL_THRESHOLD: f64 = 0.9;
+#[expect(dead_code)]
 const LINEARIZED_STALL_CYCLES: usize = 15;
+#[expect(dead_code)]
 const LINEARIZED_STALL_RESIDUAL_FACTOR: f64 = 50.0;
 
+#[expect(dead_code)]
 fn joint_linearized_rate_stall_candidate(
     linearized_rel: f64,
     residual: f64,
