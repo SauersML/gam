@@ -3911,6 +3911,7 @@ impl PenaltySubspaceCache {
         Self { entry: None }
     }
 
+    #[expect(dead_code)]
     fn get(&self, key: &PenaltySubspaceCacheKey) -> Option<Arc<runtime::PenaltySubspace>> {
         self.entry
             .as_ref()

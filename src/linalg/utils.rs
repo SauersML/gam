@@ -28,7 +28,7 @@ pub(crate) const fn splitmix64(state: &mut u64) -> u64 {
 /// returns a mixed value without persisting state. Equivalent to
 /// `{ let mut s = x; splitmix64(&mut s) }`.
 #[inline]
-pub(crate) fn splitmix64_hash(x: u64) -> u64 {
+pub(crate) const fn splitmix64_hash(x: u64) -> u64 {
     let mut state = x;
     splitmix64(&mut state)
 }
