@@ -15,9 +15,10 @@ pub mod term_builder;
 
 pub use analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyOp,
-    AnalyticPenaltyRegistry, RowPrecisionPriorPenalty, BlockSparsityPenalty, DifferenceOpKind,
-    FrozenAnalyticPenaltyOp, IBPAssignmentPenalty, IsometryPenalty, IsometryDuchonRadialSource,
-    IsometryReference, NuclearNormPenalty, OrthogonalityPenalty,
+    AnalyticPenaltyRegistry, RowPrecisionPriorPenalty, BlockOrthogonalityPenalty,
+    BlockSparsityPenalty, DifferenceOpKind, FrozenAnalyticPenaltyOp, IBPAssignmentPenalty,
+    IsometryPenalty, IsometryDuchonRadialSource, IsometryReference, NuclearNormPenalty,
+    OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     ScalarWeightSchedule, ScadMcpPenalty, SoftmaxAssignmentSparsityPenalty, SparsityKind,
     SparsityPenalty, TotalVariationPenalty, WeightField,
