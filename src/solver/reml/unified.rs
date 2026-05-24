@@ -13637,6 +13637,10 @@ impl SparseCholeskyOperator {
         let t_start = std::time::Instant::now();
         let solved = self
             .solve_block_local_rows_exact(block, scale, start, end)
+            // SAFETY: same SPD-factor invariant as the trace solves above
+            // — `self.factor` is the validated SPD factorization;
+            // failure here means factor corruption, forbidden by the
+            // `SparseCholeskyOperator` construction invariant.
             .unwrap_or_else(|e| {
                 panic!("SparseCholeskyOperator exact block-local cross solve failed: {e}")
             });
@@ -13692,6 +13696,11 @@ impl SparseCholeskyOperator {
             };
 
             let solved_op = solved_op.unwrap_or_else(|e| {
+                // SAFETY: `self.factor` is the validated SPD Cholesky factor
+                // (set only after successful factorization); the RHS shape
+                // is `n_dim × cols` by construction. A sparse-SPD multi-RHS
+                // failure here would mean factor corruption, which the
+                // construction invariant forbids.
                 panic!("SparseCholeskyOperator exact matrix/operator cross solve failed: {e}")
             });
 
@@ -13738,6 +13747,10 @@ impl SparseCholeskyOperator {
                 crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view)
             };
             let solved_op = solved_op.unwrap_or_else(|e| {
+                // SAFETY: same invariant — `self.factor` is the validated
+                // SPD factor and `op_rhs_block` is allocated as
+                // `n_dim × chunk`, so dimensions are compatible by
+                // construction. Any failure indicates factor corruption.
                 panic!(
                     "SparseCholeskyOperator exact matrix/block-operator cross operator solve failed: {e}"
                 )
@@ -13750,6 +13763,10 @@ impl SparseCholeskyOperator {
                 crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, &rhs_view)
             };
             let solved_eye = solved_eye.unwrap_or_else(|e| {
+                // SAFETY: same invariant — `self.factor` is validated SPD
+                // and `eye_rhs_block` was just filled as an identity-block
+                // RHS sized `n_dim × chunk`. Failure indicates factor
+                // corruption, forbidden by the construction invariant.
                 panic!(
                     "SparseCholeskyOperator exact matrix/block-operator cross identity solve failed: {e}"
                 )
@@ -13799,6 +13816,11 @@ impl SparseCholeskyOperator {
                 right_end,
             )
             .unwrap_or_else(|e| {
+                // SAFETY: `solve_operator_column_range_rows_exact` only
+                // forwards `solve_sparse_spdmulti` errors. `self.factor` is
+                // the validated SPD Cholesky factor; column ranges come
+                // from the operator's own `block_local_data` (or fall back
+                // to `0..n_dim`), so failure indicates factor corruption.
                 panic!("SparseCholeskyOperator exact operator cross left solve failed: {e}")
             });
         let same_operator =
