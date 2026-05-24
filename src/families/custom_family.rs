@@ -10889,37 +10889,6 @@ fn require_projected_kkt_residual(
     }
 }
 
-const LINEARIZED_STALL_REL_THRESHOLD: f64 = 0.9;
-const LINEARIZED_STALL_CYCLES: usize = 15;
-const LINEARIZED_STALL_RESIDUAL_FACTOR: f64 = 50.0;
-
-fn joint_linearized_rate_stall_candidate(
-    linearized_rel: f64,
-    residual: f64,
-    residual_tol: f64,
-) -> bool {
-    linearized_rel.is_finite()
-        && linearized_rel >= LINEARIZED_STALL_REL_THRESHOLD
-        && residual.is_finite()
-        && residual_tol.is_finite()
-        && residual > LINEARIZED_STALL_RESIDUAL_FACTOR * residual_tol.max(0.0)
-}
-
-fn projected_cycles_to_residual_tol(linearized_rel: f64, residual: f64, residual_tol: f64) -> f64 {
-    if linearized_rel > 0.0 && linearized_rel < 1.0 && residual_tol > 0.0 && residual > residual_tol
-    {
-        let ratio_log = linearized_rel.ln();
-        let r_log = (residual / residual_tol).ln();
-        if ratio_log < 0.0 && r_log.is_finite() {
-            (r_log / -ratio_log).max(0.0)
-        } else {
-            f64::INFINITY
-        }
-    } else {
-        f64::INFINITY
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConstrainedStationaryCertificate {
     NotCandidate,
@@ -10946,10 +10915,6 @@ impl JointNewtonMathDiagnostic {
 
     fn linearized_rel(&self) -> f64 {
         self.linearized_next_kkt_inf / (1.0 + self.old_kkt_inf)
-    }
-
-    fn quadratic_defect_ratio(&self, new_kkt_inf: f64) -> f64 {
-        new_kkt_inf / self.step_inf.powi(2).max(f64::EPSILON)
     }
 }
 
@@ -11279,11 +11244,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // Total descent budget across the joint-Newton loop, used by
         // the end-of-loop summary to report `descent_total`.
         let initial_joint_objective: f64 = lastobjective;
-        // Family-side cap on the inf-norm of a single Newton proposal.
-        // Mirrors the rescale in the legacy implementation (see commit
-        // 4bb663ab, "Perf: add joint Newton fast path for GAMLSS").
-        const MAX_JOINT_STEP: f64 = 20.0;
-
         // Per-cycle |Δobjective| history for the geometric-tail trigger of
         // the constrained-stationary certificate below. When the cycles
         // settle into a linear-rate plateau (|Δobj_next| / |Δobj_prev|
@@ -25802,36 +25762,6 @@ mod tests {
             linearized_rel < 0.5,
             "unconstrained Newton must have linearized_rel < 0.5 (was {:.3e})",
             linearized_rel,
-        );
-    }
-
-    #[test]
-    fn joint_linearized_rate_stall_detects_biobank_tail() {
-        // Pasted AoU cycle 49: rel≈0.9839, residual=1.712e4, tol=5.994.
-        // That is not a constrained-stationary certificate; it is a geometric
-        // KKT tail that would need hundreds more cycles to reach tol.
-        let math = JointNewtonMathDiagnostic {
-            old_kkt_inf: 6.093e6,
-            linearized_next_kkt_inf: 5.995e6,
-            predicted_reduction: 5.552e-1,
-            actual_reduction: 5.571e-1,
-            trust_ratio: 1.003,
-            step_inf: 1.423e-1,
-            proposal_inf: 1.423e-1,
-        };
-        let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
-        let residual = 1.712e4;
-        let residual_tol = 5.994;
-
-        assert!(joint_linearized_rate_stall_candidate(
-            linearized_rel,
-            residual,
-            residual_tol
-        ));
-        let projected = projected_cycles_to_residual_tol(linearized_rel, residual, residual_tol);
-        assert!(
-            projected > 400.0,
-            "biobank tail should be rejected instead of spending projected_cycles={projected:.1}"
         );
     }
 
