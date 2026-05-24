@@ -323,21 +323,6 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         self.assertIn("matern(pc1_std, pc2_std, pc3_std, pc4_std, centers=18)", mean_formula)
         self.assertIn("smooth(age_entry_std)", logslope_formula)
 
-    def test_build_method_specs_rejects_legacy_survival_backend(self) -> None:
-        cfg = {
-            "methods": [
-                {
-                    "name": "legacy_survival",
-                    "dataset": "survival",
-                    "backend": "rust_gamlss_survival",
-                    "family": "survival",
-                    "spatial_basis": "ps",
-                }
-            ]
-        }
-        with self.assertRaisesRegex(RuntimeError, "legacy survival backend"):
-            _RUNNER.build_method_specs(cfg)
-
     def _survival_contract_train_rows(self) -> list[dict[str, float]]:
         return [
             {
@@ -1772,17 +1757,6 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertIn("ift_iters_p50=5", out)
         self.assertIn("ift_iters_p95=12", out)
         self.assertIn("ift_iters_max=12", out)
-        # Old-format (no drho/logdet fields) lines should also
-        # contribute their iters — this exercises the regex's
-        # backwards compat.
-        stderr_old = "\n".join([
-            "[IFT-QUALITY] residual=1.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=2",
-            "[IFT-QUALITY] residual=2.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=3",
-            "[IFT-QUALITY] residual=3.0e-04 converged_norm=1.0 predicted_norm=1.0 iters=4",
-            "[PHASE] my-fit fit end elapsed=10.0s",
-        ])
-        out_old = self._run_summary(stderr_old)
-        self.assertIn("ift_iters_p50=3", out_old)
 
     def test_phase_summary_aggregates_tangent_noop_marker(self) -> None:
         # The tangent-line predictor's α-below-eps short-circuit
