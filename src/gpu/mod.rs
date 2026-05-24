@@ -1,11 +1,10 @@
-//! GPU acceleration facade.
+//! GPU acceleration backend facade.
 //!
-//! The public fitting API remains CPU-first and unchanged.  This module owns
-//! all CUDA probing, policy, profiling, and dispatch plumbing so hot paths can
-//! ask for an operation-specific acceleration decision without depending on a
-//! concrete CUDA installation.  CPU-only builds compile without CUDA libraries;
-//! `--features cuda` enables the optional CUDA dependency boundary for future
-//! device kernels while preserving the same safe fallback behaviour.
+//! The CPU implementation remains the reference path. This module provides the
+//! runtime probe, dispatch policy, device-memory descriptors, and profiling
+//! hooks that hot kernels use to decide when a CUDA implementation may be used.
+//! When the `cuda` feature is disabled, or CUDA cannot be loaded at runtime,
+//! every operation deterministically falls back to the existing CPU kernels.
 
 pub mod device;
 pub mod kernels;
@@ -19,19 +18,7 @@ pub mod sparse;
 pub mod stream;
 
 pub use device::{GpuCapability, GpuDeviceInfo};
-pub use policy::{AccelPolicy, GpuDispatchPolicy, Operation};
-pub use profile::{KernelStat, ProfileSnapshot};
-pub use runtime::{GpuRuntime, selected_gpu_info};
-
-/// Returns true when GPU execution is both requested and a CUDA-capable device
-/// has been discovered.
-#[inline]
-pub fn gpu_available() -> bool {
-    runtime::global_runtime().is_gpu_enabled()
-}
-
-/// Returns true when profiling is enabled through `GAM_GPU_PROFILE=1`.
-#[inline]
-pub fn profiling_enabled() -> bool {
-    runtime::global_runtime().profile_enabled()
-}
+pub use linalg::{GpuDenseKernel, try_dispatch_dense};
+pub use policy::{AccelPolicy, GpuDispatchDecision, GpuDispatchPolicy, GpuOperation};
+pub use profile::{KernelStat, record_cpu_kernel};
+pub use runtime::{ExecutionTarget, GpuContext, GpuRuntime, gpu_available, selected_gpu_info};
