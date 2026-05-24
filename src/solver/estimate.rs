@@ -3911,6 +3911,8 @@ pub struct FitArtifacts {
     #[serde(default, skip_serializing, skip_deserializing)]
     pub pirls: Option<crate::pirls::PirlsResult>,
     #[serde(default)]
+    pub null_space_logdet: Option<f64>,
+    #[serde(default)]
     pub survival_link_wiggle_knots: Option<Array1<f64>>,
     #[serde(default)]
     pub survival_link_wiggle_degree: Option<usize>,
@@ -3920,6 +3922,7 @@ impl std::fmt::Debug for FitArtifacts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FitArtifacts")
             .field("pirls", &self.pirls.as_ref().map(|_| "..."))
+            .field("null_space_logdet", &self.null_space_logdet)
             .field(
                 "survival_link_wiggle_knots",
                 &self
