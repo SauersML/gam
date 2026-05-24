@@ -23,12 +23,6 @@ fn trust_region_pattern(radius: f64, newton_step: &Array1<f64>) -> (usize, f64) 
 }
 
 fn bench_biobank_shape_line_search_pattern(c: &mut Criterion) {
-    if std::env::var_os("GAM_RUN_IGNORED_BENCH").is_none() {
-        eprintln!(
-            "skipping ignored biobank-shape trust-region benchmark; set GAM_RUN_IGNORED_BENCH=1 to run"
-        );
-        return;
-    }
     let p = 256usize;
     let newton_step = Array1::from_iter((0..p).map(|i| 0.25 + (i as f64 % 17.0) / 17.0));
     let radius = newton_step.iter().map(|v| v * v).sum::<f64>().sqrt() / 16.0;

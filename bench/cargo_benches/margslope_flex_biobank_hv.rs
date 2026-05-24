@@ -1,19 +1,10 @@
-//! Opt-in Criterion workload for the biobank-shape bernoulli marginal-slope
-//! FLEX joint-Newton/Hv path.
-//!
-//! This benchmark is intentionally environment-gated so normal `cargo bench`
-//! invocations do not launch a multi-minute fit.  Run it explicitly with:
+//! Criterion workload for the biobank-shape bernoulli marginal-slope
+//! FLEX joint-Newton/Hv path. Multi-minute fit — run explicitly with:
 //!
 //! ```text
-//! GAM_RUN_MARGSLOPE_FLEX_BIOBANK_BENCH=1 \
-//! GAM_MARGSLOPE_BENCH_N=50000 \
 //! cargo bench --bench margslope_flex_biobank_hv
 //! ```
-//!
-//! The measured routine performs a full synthetic fit capped at
-//! `inner_max_cycles=1`, matching the local ignored repro test.
 
-#[allow(dead_code)]
 #[path = "../../tests/test_support/margslope_flex_equivalence.rs"]
 mod margslope_flex_equivalence;
 
@@ -24,27 +15,12 @@ use margslope_flex_equivalence::{
 use std::hint::black_box;
 use std::time::Duration;
 
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(default)
-}
+const BENCH_INNER_CYCLES: usize = 1;
 
 fn bench_margslope_flex_biobank_cycle0(c: &mut Criterion) {
-    if std::env::var("GAM_RUN_MARGSLOPE_FLEX_BIOBANK_BENCH").as_deref() != Ok("1") {
-        c.bench_function("margslope_flex_biobank_cycle0_ignored", |b| {
-            b.iter(|| black_box(0usize));
-        });
-        eprintln!(
-            "[MS-FLEX-BIOBANK-BENCH] skipped; set GAM_RUN_MARGSLOPE_FLEX_BIOBANK_BENCH=1 to run the multi-minute Hv-pattern benchmark"
-        );
-        return;
-    }
-
     gam::init_parallelism();
-    let n = env_usize("GAM_MARGSLOPE_BENCH_N", DEFAULT_REPRO_N);
-    let inner_cycles = env_usize("GAM_MARGSLOPE_BENCH_INNER_CYCLES", 1);
+    let n = DEFAULT_REPRO_N;
+    let inner_cycles = BENCH_INNER_CYCLES;
     let mut group = c.benchmark_group("margslope_flex_biobank_hv_pattern");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(30));
