@@ -1529,68 +1529,6 @@ fn stripped_line_has_let_underscore(line: &str) -> bool {
     false
 }
 
-/// Returns true when `line` contains a `let` (optionally followed by `mut`)
-/// whose pattern starts with `_`. Lexer-lite: tracks `//` line comments and
-/// string literals so the keyword check does not false-fire on commentary
-/// or string content.
-fn line_has_let_underscore(line: &str) -> bool {
-    let bytes = line.as_bytes();
-    let mut i = 0usize;
-    let mut in_str = false;
-    let mut str_quote: u8 = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if in_str {
-            if c == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-            if c == str_quote {
-                in_str = false;
-            }
-            i += 1;
-            continue;
-        }
-        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            return false;
-        }
-        if c == b'"' || c == b'\'' {
-            in_str = true;
-            str_quote = c;
-            i += 1;
-            continue;
-        }
-        if c == b'l'
-            && i + 3 <= bytes.len()
-            && &bytes[i..i + 3] == b"let"
-            && (i == 0 || !is_ident_byte(bytes[i - 1]))
-            && i + 3 < bytes.len()
-            && bytes[i + 3].is_ascii_whitespace()
-        {
-            let mut j = i + 3;
-            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                j += 1;
-            }
-            if j + 4 <= bytes.len()
-                && &bytes[j..j + 3] == b"mut"
-                && bytes[j + 3].is_ascii_whitespace()
-            {
-                j += 3;
-                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                    j += 1;
-                }
-            }
-            if j < bytes.len() && bytes[j] == b'_' {
-                return true;
-            }
-            i = j;
-            continue;
-        }
-        i += 1;
-    }
-    false
-}
-
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -1674,6 +1612,359 @@ fn visit_files(root: &Path, dir: &Path, visitor: &mut dyn FnMut(&Path, &str)) {
         let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
         visitor(&rel, &content);
     }
+}
+
+/// Flags function definitions whose parameter list contains an
+/// underscore-prefixed name (e.g. `fn foo(_x: i32)`). Bare `_` placeholders
+/// are allowed; only `_<ident>` is banned. Skips closures and `fn(...)`
+/// type positions (the `fn` is not followed by an identifier). Handles
+/// both `{ ... }` bodies and bodyless trait-method signatures
+/// (`fn foo(_x: i32);`). Build.rs is exempt.
+fn scan_for_underscore_fn_args(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("fn ") {
+            return;
+        }
+        let lines: Vec<&str> = content.lines().collect();
+        let stripped_lines = strip_file_lines(content);
+        let n = lines.len();
+        let mut idx = 0usize;
+        while idx < n {
+            let stripped = stripped_lines
+                .get(idx)
+                .map(String::as_str)
+                .unwrap_or(lines[idx]);
+            if !line_has_keyword(stripped, "fn") {
+                idx += 1;
+                continue;
+            }
+            let Some(fn_pos) = locate_fn_keyword(stripped) else {
+                idx += 1;
+                continue;
+            };
+            let after_fn = &stripped[fn_pos + 2..];
+            let trimmed_after = after_fn.trim_start();
+            let first_byte = trimmed_after.as_bytes().first().copied();
+            let is_definition =
+                matches!(first_byte, Some(b) if b.is_ascii_alphabetic() || b == b'_');
+            if !is_definition {
+                idx += 1;
+                continue;
+            }
+            let (sig_start, sig_end_line, sig_end_col_excl) =
+                match find_fn_body_at(&lines, idx) {
+                    Some((_, (open, _close))) => {
+                        let open_line = &stripped_lines[open];
+                        let col = open_line.find('{').unwrap_or(open_line.len());
+                        (idx, open, col)
+                    }
+                    None => {
+                        let mut paren: i32 = 0;
+                        let mut brack: i32 = 0;
+                        let mut found: Option<(usize, usize)> = None;
+                        let limit = (idx + 64).min(n);
+                        'outer: for j in idx..limit {
+                            let sj = &stripped_lines[j];
+                            for (k, b) in sj.as_bytes().iter().enumerate() {
+                                match *b {
+                                    b'(' => paren += 1,
+                                    b')' => paren -= 1,
+                                    b'[' => brack += 1,
+                                    b']' => brack -= 1,
+                                    b';' if paren == 0 && brack == 0 => {
+                                        found = Some((j, k));
+                                        break 'outer;
+                                    }
+                                    b'{' if paren == 0 && brack == 0 => {
+                                        break 'outer;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        match found {
+                            Some((j, k)) => (idx, j, k),
+                            None => {
+                                idx += 1;
+                                continue;
+                            }
+                        }
+                    }
+                };
+            let mut sig_text = String::new();
+            let mut line_offsets: Vec<(usize, usize)> = Vec::new();
+            for j in sig_start..=sig_end_line {
+                let part = if j == sig_end_line {
+                    &stripped_lines[j][..sig_end_col_excl]
+                } else {
+                    &stripped_lines[j]
+                };
+                line_offsets.push((sig_text.len(), j));
+                sig_text.push_str(part);
+                sig_text.push('\n');
+            }
+            let sig_bytes = sig_text.as_bytes();
+            let Some(paren_open) = sig_text.find('(') else {
+                idx = sig_end_line + 1;
+                continue;
+            };
+            let Some(close_rel) =
+                find_matching_paren(&sig_bytes[paren_open + 1..])
+            else {
+                idx = sig_end_line + 1;
+                continue;
+            };
+            let params_inner = &sig_text[paren_open + 1..paren_open + 1 + close_rel];
+            let inner_bytes = params_inner.as_bytes();
+            let mut angle: i32 = 0;
+            let mut paren_d: i32 = 0;
+            let mut brack_d: i32 = 0;
+            let mut start_byte: usize = 0;
+            let mut params: Vec<(usize, usize)> = Vec::new();
+            let mut k = 0usize;
+            while k < inner_bytes.len() {
+                let b = inner_bytes[k];
+                match b {
+                    b'(' => paren_d += 1,
+                    b')' => paren_d -= 1,
+                    b'[' => brack_d += 1,
+                    b']' => brack_d -= 1,
+                    b'<' => angle += 1,
+                    b'>' => {
+                        if angle > 0 {
+                            angle -= 1;
+                        }
+                    }
+                    b',' if angle == 0 && paren_d == 0 && brack_d == 0 => {
+                        params.push((start_byte, k));
+                        start_byte = k + 1;
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            if start_byte <= inner_bytes.len() {
+                params.push((start_byte, inner_bytes.len()));
+            }
+            for (ps, pe) in params {
+                let raw_param = &params_inner[ps..pe];
+                let mut p = raw_param.trim_start();
+                while p.starts_with("#[") {
+                    if let Some(close) = p.find(']') {
+                        p = p[close + 1..].trim_start();
+                    } else {
+                        break;
+                    }
+                }
+                loop {
+                    let before = p;
+                    if p.starts_with("&mut ") {
+                        p = p[5..].trim_start();
+                    } else if p.starts_with('&') {
+                        p = p[1..].trim_start();
+                    } else if p.starts_with("mut ") {
+                        p = p[4..].trim_start();
+                    }
+                    if p == before {
+                        break;
+                    }
+                }
+                let pb = p.as_bytes();
+                if pb.is_empty() {
+                    continue;
+                }
+                if pb.iter().all(|c| c.is_ascii_whitespace()) {
+                    continue;
+                }
+                let mut end = 0usize;
+                while end < pb.len()
+                    && (pb[end] == b'_' || pb[end].is_ascii_alphanumeric())
+                {
+                    end += 1;
+                }
+                if end == 0 {
+                    continue;
+                }
+                let name = &p[..end];
+                let rest = p[end..].trim_start();
+                if !rest.starts_with(':') {
+                    continue;
+                }
+                if name.starts_with('_') && name.len() >= 2 {
+                    let abs = paren_open + 1 + ps;
+                    let mut hit_line = sig_start;
+                    for (off, ln) in &line_offsets {
+                        if *off <= abs {
+                            hit_line = *ln;
+                        } else {
+                            break;
+                        }
+                    }
+                    let raw = lines.get(hit_line).copied().unwrap_or("");
+                    offenders.push((rel.to_path_buf(), hit_line + 1, raw.to_string()));
+                }
+            }
+            idx = sig_end_line + 1;
+        }
+    });
+}
+
+/// Find the byte position of the `fn` keyword in `stripped` (whole-word).
+fn locate_fn_keyword(stripped: &str) -> Option<usize> {
+    let bytes = stripped.as_bytes();
+    let mut i = 0usize;
+    while i + 2 <= bytes.len() {
+        if &bytes[i..i + 2] == b"fn" {
+            let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+            let after_ok = i + 2 == bytes.len() || !is_ident_byte(bytes[i + 2]);
+            if before_ok && after_ok {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Flags `#[test]` functions whose bodies contain no assertion-shaped
+/// construct. Recognizes assert/debug_assert macros, panic-shape macros,
+/// and `?` propagation. Tests carrying `#[should_panic]` are excluded.
+/// Build.rs is exempt.
+fn scan_for_useless_tests(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("#[test]") {
+            return;
+        }
+        let lines: Vec<&str> = content.lines().collect();
+        let stripped_lines = strip_file_lines(content);
+        let n = lines.len();
+        let mut i = 0usize;
+        while i < n {
+            let s = stripped_lines
+                .get(i)
+                .map(String::as_str)
+                .unwrap_or(lines[i]);
+            if !s.contains("#[test]") {
+                i += 1;
+                continue;
+            }
+            let mut has_should_panic = s.contains("#[should_panic");
+            let mut j = i + 1;
+            while j < n {
+                let sj = stripped_lines
+                    .get(j)
+                    .map(String::as_str)
+                    .unwrap_or(lines[j]);
+                let t = sj.trim();
+                if t.is_empty() {
+                    j += 1;
+                    continue;
+                }
+                if t.starts_with("//") {
+                    j += 1;
+                    continue;
+                }
+                if t.starts_with("#[") || t.starts_with("#![") {
+                    if sj.contains("#[should_panic") {
+                        has_should_panic = true;
+                    }
+                    j += 1;
+                    continue;
+                }
+                if line_has_keyword(sj, "fn") {
+                    break;
+                }
+                j = n;
+                break;
+            }
+            if j >= n {
+                i += 1;
+                continue;
+            }
+            if has_should_panic {
+                i = j + 1;
+                continue;
+            }
+            let Some((_sig, (open, close))) = find_fn_body_at(&lines, j) else {
+                i = j + 1;
+                continue;
+            };
+            let mut found = false;
+            for k in open..=close {
+                let line_s = stripped_lines
+                    .get(k)
+                    .map(String::as_str)
+                    .unwrap_or(lines[k]);
+                if line_s.contains("assert!(")
+                    || line_s.contains("assert_eq!(")
+                    || line_s.contains("assert_ne!(")
+                    || line_s.contains("debug_assert!(")
+                    || line_s.contains("debug_assert_eq!(")
+                    || line_s.contains("debug_assert_ne!(")
+                    || line_s.contains("panic!(")
+                    || line_s.contains("unreachable!(")
+                    || line_s.contains("unimplemented!(")
+                    || line_s.contains("todo!(")
+                    || line_contains_propagating_question(line_s)
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                let raw = lines.get(i).copied().unwrap_or("");
+                offenders.push((rel.to_path_buf(), i + 1, raw.to_string()));
+            }
+            i = close + 1;
+        }
+    });
+}
+
+/// True when `stripped` contains a `?` followed by `;`, `,`, `.`, `)`,
+/// or end-of-line. Heuristic for `?`-propagation in a test body.
+fn line_contains_propagating_question(stripped: &str) -> bool {
+    let bytes = stripped.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    while i < n {
+        if bytes[i] == b'?' {
+            let mut k = i + 1;
+            while k < n && bytes[k] == b' ' {
+                k += 1;
+            }
+            if k == n {
+                return true;
+            }
+            let c = bytes[k];
+            if matches!(c, b';' | b',' | b'.' | b')') {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

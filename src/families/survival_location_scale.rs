@@ -5415,6 +5415,11 @@ fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f64) -> f64 
         InverseLink::Standard(LinkFunction::CLogLog) => (-(eta.exp())).exp(),
         InverseLink::Standard(LinkFunction::Identity) => 1.0 - eta,
         InverseLink::Standard(LinkFunction::Log) => {
+            // Survival families register only Probit/Logit/CLogLog/Identity/
+            // LatentCLogLog/Sas/BetaLogistic/Mixture inverse links; the bare
+            // `Log` arm here is unreachable on a validated survival model.
+            // SAFETY: the match must stay exhaustive over `LinkFunction`,
+            // and reaching this arm means the family validator was bypassed.
             panic!("state-less log inverse link is invalid for survival prediction")
         }
         InverseLink::LatentCLogLog(_)
@@ -5424,6 +5429,11 @@ fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f64) -> f64 
             .expect("validated inverse link should evaluate during prediction"),
         InverseLink::Standard(LinkFunction::Sas)
         | InverseLink::Standard(LinkFunction::BetaLogistic) => {
+            // SAS/BetaLogistic are state-bearing inverse links; valid models
+            // always wrap their parameter state in `InverseLink::Sas(_)` /
+            // `InverseLink::BetaLogistic(_)`, never `Standard(...)`.
+            // SAFETY: reaching this arm means a deserializer dropped link
+            // state — a contract the loader is required to reject upstream.
             panic!("state-less SAS/Beta-Logistic inverse link is invalid for prediction")
         }
     }
