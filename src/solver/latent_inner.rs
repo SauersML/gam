@@ -131,6 +131,17 @@ pub trait ArrowSystemAssembler {
         beta: ArrayView1<'_, f64>,
         latent: &LatentCoordValues,
     ) -> Result<ArrowSchurSystem, String>;
+
+    /// Evaluate the true joint merit/objective at the current `(β, t)`.
+    ///
+    /// This is deliberately separate from [`Self::assemble`]: the Schur system
+    /// is a local quadratic model, but nonlinear latent retractions must be
+    /// accepted against the objective they actually change.
+    fn objective(
+        &mut self,
+        beta: ArrayView1<'_, f64>,
+        latent: &LatentCoordValues,
+    ) -> Result<f64, String>;
 }
 
 /// Joint `(t, β)` inner Newton solver exploiting arrow structure.
@@ -191,6 +202,13 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
         let mut last_cache: Option<ArrowFactorCache> = None;
         let mut converged = false;
         let mut iter = 0_usize;
+        let mut current_objective = self
+            .assembler
+            .objective(self.beta.view(), self.latent)
+            .map_err(|e| format!("LatentInnerSolver: objective failed at start: {e}"))?;
+        if !current_objective.is_finite() {
+            return Err("LatentInnerSolver: non-finite objective at start".to_string());
+        }
 
         while iter < opts.max_iterations {
             let mut system = self
@@ -232,15 +250,65 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                 solve_arrow_newton_step_with_options(&system, ridge_t, ridge_beta, &solve_options);
             match step_result {
                 Ok((delta_t, delta_beta, cache)) => {
-                    // Accept step and shrink ridges.
+                    let predicted_reduction = arrow_predicted_reduction(
+                        &system,
+                        delta_t.view(),
+                        delta_beta.view(),
+                        ridge_t,
+                        ridge_beta,
+                    );
+                    let beta_before = self.beta.clone();
+                    let t_before = self.latent.as_flat().clone();
                     for (b, db) in self.beta.iter_mut().zip(delta_beta.iter()) {
                         *b += *db;
                     }
                     self.latent.retract_flat_delta(delta_t.view());
-                    ridge_t = (ridge_t * opts.lm_shrink).max(0.0);
-                    ridge_beta = (ridge_beta * opts.lm_shrink).max(0.0);
-                    last_cache = Some(cache);
-                    iter += 1;
+                    let trial_objective = self
+                        .assembler
+                        .objective(self.beta.view(), self.latent)
+                        .map_err(|e| {
+                            format!("LatentInnerSolver: objective failed at trial iter {iter}: {e}")
+                        })?;
+                    let objective_scale = current_objective.abs().max(1.0);
+                    let noise_floor = objective_scale * 1e-14;
+                    let actual_reduction = current_objective - trial_objective;
+                    let rho = if predicted_reduction > noise_floor {
+                        actual_reduction / predicted_reduction
+                    } else if actual_reduction >= -noise_floor {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    if rho > 0.0 && trial_objective.is_finite() {
+                        current_objective = trial_objective;
+                        ridge_t = (ridge_t * opts.lm_shrink).max(0.0);
+                        ridge_beta = (ridge_beta * opts.lm_shrink).max(0.0);
+                        last_cache = Some(cache);
+                        iter += 1;
+                    } else {
+                        self.beta = beta_before;
+                        self.latent.set_flat(t_before.view());
+                        ridge_t = if ridge_t == 0.0 {
+                            1e-6
+                        } else {
+                            ridge_t * opts.lm_grow
+                        };
+                        ridge_beta = if ridge_beta == 0.0 {
+                            1e-6
+                        } else {
+                            ridge_beta * opts.lm_grow
+                        };
+                        if ridge_t > opts.max_ridge || ridge_beta > opts.max_ridge {
+                            return Err(format!(
+                                "LatentInnerSolver: LM rejected nonlinear step until ridge \
+                                 exceeded max ({}) at iter {} \
+                                 (ridge_t={ridge_t:.3e}, ridge_beta={ridge_beta:.3e}, \
+                                 rho={rho:.3e}, predicted_reduction={predicted_reduction:.3e}, \
+                                 actual_reduction={actual_reduction:.3e})",
+                                opts.max_ridge, iter,
+                            ));
+                        }
+                    }
                 }
                 Err(err @ ArrowSchurError::PerRowFactorFailed { .. })
                 | Err(err @ ArrowSchurError::SchurFactorFailed { .. })
@@ -324,6 +392,46 @@ fn iterate_norm(beta: ArrayView1<'_, f64>, t: ArrayView1<'_, f64>) -> f64 {
     acc.sqrt()
 }
 
+fn arrow_predicted_reduction(
+    sys: &ArrowSchurSystem,
+    delta_t: ArrayView1<'_, f64>,
+    delta_beta: ArrayView1<'_, f64>,
+    ridge_t: f64,
+    ridge_beta: f64,
+) -> f64 {
+    debug_assert_eq!(delta_t.len(), sys.rows.len() * sys.d);
+    debug_assert_eq!(delta_beta.len(), sys.k);
+    let mut lin = sys.gb.dot(&delta_beta);
+    let mut quad = ridge_beta * delta_beta.dot(&delta_beta);
+
+    let mut hbb_delta = Array1::<f64>::zeros(sys.k);
+    if let Some(hbb_matvec) = sys.hbb_matvec.as_ref() {
+        hbb_matvec(delta_beta, &mut hbb_delta);
+    } else if sys.hbb.dim() == (sys.k, sys.k) {
+        hbb_delta.assign(&sys.hbb.dot(&delta_beta));
+    } else {
+        return f64::NAN;
+    }
+    quad += delta_beta.dot(&hbb_delta);
+
+    for (i, row) in sys.rows.iter().enumerate() {
+        let base = i * sys.d;
+        for c in 0..sys.d {
+            let dt_c = delta_t[base + c];
+            lin += row.gt[c] * dt_c;
+            quad += ridge_t * dt_c * dt_c;
+            for r in 0..sys.d {
+                quad += dt_c * row.htt[[c, r]] * delta_t[base + r];
+            }
+            for b in 0..sys.k {
+                quad += 2.0 * dt_c * row.htbeta[[c, b]] * delta_beta[b];
+            }
+        }
+    }
+
+    -(lin + 0.5 * quad)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +460,14 @@ mod tests {
                 }
             }
             Ok(sys)
+        }
+
+        fn objective(
+            &mut self,
+            _beta: ArrayView1<'_, f64>,
+            _latent: &LatentCoordValues,
+        ) -> Result<f64, String> {
+            Ok(0.0)
         }
     }
 
