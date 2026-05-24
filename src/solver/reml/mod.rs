@@ -3490,6 +3490,7 @@ struct SparseExactEvalData {
     takahashi: Option<Arc<crate::linalg::sparse_exact::TakahashiInverse>>,
     logdet_h: f64,
     logdet_s_pos: f64,
+    penalty_rank: usize,
     det1_values: Arc<Array1<f64>>,
 }
 

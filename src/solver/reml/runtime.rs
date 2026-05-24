@@ -5314,9 +5314,10 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         blocks: &[SparsePenaltyBlock],
-    ) -> (f64, Array1<f64>) {
+    ) -> (usize, f64, Array1<f64>) {
         let mut logdet = 0.0_f64;
         let mut det1 = Array1::<f64>::zeros(rho.len());
+        let mut penalty_rank = 0usize;
         for block in blocks {
             let lambda_k = rho[block.term_index].exp();
 
@@ -5325,13 +5326,14 @@ impl<'a> RemlState<'a> {
                 logdet += (lambda_k * eig).ln();
             }
 
+            penalty_rank += block.positive_eigenvalues.len();
             // ∂/∂ρ_k L = rank (number of positive eigenvalues).
             // Since ∂/∂ρ_k log(λ_k σ_i) = ∂/∂ρ_k (ρ_k + log σ_i) = 1.
             if block.term_index < det1.len() {
                 det1[block.term_index] = block.positive_eigenvalues.len() as f64;
             }
         }
-        (logdet, det1)
+        (penalty_rank.min(self.p), logdet, det1)
     }
 
     pub(super) fn prepare_dense_eval_bundlewithkey(
@@ -5497,7 +5499,7 @@ impl<'a> RemlState<'a> {
             ridge_passport.delta,
             precomputed_xtwx,
         )?;
-        let (logdet_s_pos, det1_values) =
+        let (penalty_rank, logdet_s_pos, det1_values) =
             self.sparse_penalty_logdet_runtime(rho, penalty_blocks.as_ref());
         let firth_dense_operator_original = if self.config.firth_bias_reduction
             && reml_supports_firth(self.config.likelihood)
@@ -5552,6 +5554,7 @@ impl<'a> RemlState<'a> {
                     takahashi,
                     logdet_h: sparse_system.logdet_h,
                     logdet_s_pos,
+                    penalty_rank,
                     det1_values: Arc::new(det1_values),
                 }
             })),
@@ -7700,7 +7703,7 @@ impl<'a> RemlState<'a> {
             hessian_op.active_rank()
         );
 
-        let mp = self.nullspace_dims.iter().copied().sum::<usize>() as f64;
+        let nullspace_dim = p_dim.saturating_sub(sparse.penalty_rank) as f64;
         let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
             let lambdas = rho.mapv(f64::exp);
             let (_, det2) = self.structural_penalty_logdet_derivatives_block_local(
@@ -7754,7 +7757,7 @@ impl<'a> RemlState<'a> {
             hessian_op,
             beta,
             penalty_logdet,
-            mp,
+            nullspace_dim,
             0.0,
             None,
         ))
