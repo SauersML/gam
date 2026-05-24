@@ -63,6 +63,7 @@ fn mixed_term_spec() -> TermCollectionSpec {
             name: "re_g".to_string(),
             feature_col: 2,
             drop_first_level: false,
+            penalized: true,
             frozen_levels: None,
         }],
         smooth_terms: Vec::new(),

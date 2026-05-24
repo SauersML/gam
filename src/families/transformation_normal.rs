@@ -12996,12 +12996,15 @@ mod tests {
         // a future regression that broke the cost crossover (e.g. flipped
         // a `>=` to `>`) would still be caught here.
         assert!(
-            crate::solver::estimate::reml::unified::use_outer_hessian_operator_path(
+            crate::solver::estimate::reml::unified::outer_hessian_route_plan(
                 crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
                 crate::solver::estimate::reml::unified::MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N,
                 k_outer,
+                true,
+                false,
                 false,
             )
+            .use_operator
         );
 
         let options = BlockwiseFitOptions {
