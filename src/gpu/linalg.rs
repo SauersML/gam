@@ -96,9 +96,7 @@ pub fn route_through_gpu(op: DispatchOp) -> Option<&'static GpuRuntime> {
             op.flops() >= (policy.gemm_min_flops as u128) && m > 0 && n > 0
         }
         DispatchOp::XtDiagX { n, p } => {
-            n >= policy.xtwx_n_min
-                && op.flops() >= (policy.xtwx_flops_min as u128)
-                && p > 0
+            n >= policy.xtwx_n_min && op.flops() >= (policy.xtwx_flops_min as u128) && p > 0
         }
         DispatchOp::XtDiagY { n, px, q } => {
             n >= policy.xtwx_n_min
@@ -297,8 +295,8 @@ pub fn try_cholesky_lower_inplace(a: &mut Array2<f64>) -> Option<()> {
     if p != a.ncols() {
         return None;
     }
-    route_through_gpu(DispatchOp::Potrf { p, batch: 1 })?;
-    let lower = crate::solver::gpu::pirls_gpu::cholesky_lower_gpu(a.view()).ok()?;
+    let runtime = route_through_gpu(DispatchOp::Potrf { p, batch: 1 })?;
+    let lower = cuda_backend::cholesky_lower(runtime, a.view())?;
     *a = lower;
     Some(())
 }
@@ -311,12 +309,12 @@ pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Optio
     if p == 0 || first.ncols() != p || matrices.iter().any(|matrix| matrix.dim() != (p, p)) {
         return None;
     }
-    route_through_gpu(DispatchOp::Potrf {
+    let runtime = route_through_gpu(DispatchOp::Potrf {
         p,
         batch: matrices.len(),
     })?;
     for matrix in matrices {
-        let lower = crate::solver::gpu::pirls_gpu::cholesky_lower_gpu(matrix.view()).ok()?;
+        let lower = cuda_backend::cholesky_lower(runtime, matrix.view())?;
         *matrix = lower;
     }
     Some(())
@@ -364,6 +362,9 @@ mod cuda_backend {
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
     use super::super::runtime::GpuRuntime;
+    use crate::gpu::driver::{from_col_major, to_col_major, to_i32};
+    use cudarc::cusolver::{DnHandle, sys as cusolver_sys};
+    use cudarc::driver::DevicePtrMut;
 
     #[inline]
     pub(super) fn gemm(
@@ -425,5 +426,88 @@ mod cuda_backend {
         upper: bool,
     ) -> Option<Array2<f64>> {
         super::super::blas::trsm_cuda(runtime, triangular, rhs, upper)
+    }
+
+    #[inline]
+    pub(super) fn cholesky_lower(
+        runtime: &GpuRuntime,
+        a: ArrayView2<'_, f64>,
+    ) -> Option<Array2<f64>> {
+        let (p, p2) = a.dim();
+        if p == 0 || p != p2 {
+            return None;
+        }
+        let stream = super::super::runtime::cuda_context_for(runtime.device.ordinal)?
+            .new_stream()
+            .ok()?;
+        let solver = DnHandle::new(stream.clone()).ok()?;
+        let a_col = to_col_major(&a);
+        let mut a_dev = stream.clone_htod(&*a_col).ok()?;
+        potrf_lower_in_place(&solver, &stream, p, &mut a_dev)?;
+        let factor_col = stream.clone_dtoh(&a_dev).ok()?;
+        let mut lower = from_col_major(&factor_col, p, p)?;
+        for row in 0..p {
+            for col in (row + 1)..p {
+                lower[[row, col]] = 0.0;
+            }
+        }
+        Some(lower)
+    }
+
+    fn potrf_lower_in_place(
+        solver: &DnHandle,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        p: usize,
+        a: &mut cudarc::driver::CudaSlice<f64>,
+    ) -> Option<()> {
+        let p_i = to_i32(p)?;
+        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
+        let mut lwork = 0_i32;
+        {
+            let (a_ptr, _a_record) = a.device_ptr_mut(stream);
+            let status = unsafe {
+                cusolver_sys::cusolverDnDpotrf_bufferSize(
+                    solver.cu(),
+                    uplo,
+                    p_i,
+                    a_ptr as *mut f64,
+                    p_i,
+                    &mut lwork,
+                )
+            };
+            check_cusolver(status)?;
+        }
+        let lwork = usize::try_from(lwork).ok()?;
+        let mut workspace = stream.alloc_zeros::<f64>(lwork).ok()?;
+        let mut info = stream.alloc_zeros::<i32>(1).ok()?;
+        {
+            let (a_ptr, _a_record) = a.device_ptr_mut(stream);
+            let (work_ptr, _work_record) = workspace.device_ptr_mut(stream);
+            let (info_ptr, _info_record) = info.device_ptr_mut(stream);
+            let status = unsafe {
+                cusolver_sys::cusolverDnDpotrf(
+                    solver.cu(),
+                    uplo,
+                    p_i,
+                    a_ptr as *mut f64,
+                    p_i,
+                    work_ptr as *mut f64,
+                    i32::try_from(lwork).ok()?,
+                    info_ptr as *mut i32,
+                )
+            };
+            check_cusolver(status)?;
+        }
+        let info_host = stream.clone_dtoh(&info).ok()?;
+        if info_host[0] == 0 { Some(()) } else { None }
+    }
+
+    #[inline]
+    fn check_cusolver(status: cusolver_sys::cusolverStatus_t) -> Option<()> {
+        if status == cusolver_sys::cusolverStatus_t::CUSOLVER_STATUS_SUCCESS {
+            Some(())
+        } else {
+            None
+        }
     }
 }

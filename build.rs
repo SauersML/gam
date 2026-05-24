@@ -179,6 +179,17 @@ fn main() {
     let mut history_violations: Vec<(PathBuf, usize, String, String)> = Vec::new();
     run_unimplemented_history_audit(&manifest_dir, &mut history_violations);
 
+    // Cross-file scanner: items defined in `src/` whose identifier is
+    // referenced by a test/bench file but by NO other production `src/`
+    // file (excluding the defining file and `#[cfg(test)]` regions). This
+    // catches the deeper version of the `#[cfg(test)]` dodge: a
+    // `pub(crate)` / `pub(super)` / private item in `src/` kept alive only
+    // because a test names it. Rustc's `dead_code` lint can't see this —
+    // the test target counts as a consumer — but lexically it is dead
+    // production code. The scan is heuristic and biased toward flagging.
+    let mut src_test_only_offenders: Vec<(PathBuf, usize, String, String)> = Vec::new();
+    scan_for_src_items_used_only_by_tests(&manifest_dir, &mut src_test_only_offenders);
+
     let mut sections: Vec<Section> = Vec::new();
 
     if !todo_offenders.is_empty() {
@@ -1261,6 +1272,13 @@ fn scan_for_cfg_test_on_pub_items(
             ));
         }
     });
+}
+
+fn is_exempt_test_submodule_name(name: &str) -> bool {
+    name == "tests"
+        || name == "test_support"
+        || name.starts_with("tests_")
+        || name.ends_with("_tests")
 }
 
 /// True when `stripped` contains `cfg(any(...))` or `cfg(all(...))` with

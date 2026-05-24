@@ -39,7 +39,154 @@ mod cuda_impl {
         cublasDiagType_t, cublasFillMode_t, cublasOperation_t, cublasSideMode_t, cublasStatus_t,
     };
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, Gemv, GemvConfig};
-    use cudarc::driver::{DevicePtr, DevicePtrMut};
+    use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+    use std::sync::Arc;
+
+    #[inline]
+    fn stream_and_blas(runtime: &GpuRuntime) -> Option<(Arc<CudaStream>, CudaBlas)> {
+        let stream = super::super::runtime::cuda_context_for(runtime.device.ordinal)?
+            .new_stream()
+            .ok()?;
+        let blas = CudaBlas::new(stream.clone()).ok()?;
+        Some((stream, blas))
+    }
+
+    #[inline]
+    fn vector_slice<'a>(v: ArrayView1<'a, f64>, storage: &'a mut Vec<f64>) -> &'a [f64] {
+        match v.as_slice() {
+            Some(slice) => slice,
+            None => {
+                storage.extend(v.iter().copied());
+                storage.as_slice()
+            }
+        }
+    }
+
+    #[inline]
+    fn row_scale_device(
+        blas: &CudaBlas,
+        stream: &Arc<CudaStream>,
+        matrix_dev: &CudaSlice<f64>,
+        weights_dev: &CudaSlice<f64>,
+        scaled_dev: &mut CudaSlice<f64>,
+        rows: usize,
+        cols: usize,
+    ) -> Option<()> {
+        let rows_i = to_i32(rows)?;
+        let cols_i = to_i32(cols)?;
+        let handle = *blas.handle();
+        let (matrix_ptr, _matrix_record) = matrix_dev.device_ptr(stream);
+        let (weights_ptr, _weights_record) = weights_dev.device_ptr(stream);
+        let (scaled_ptr, _scaled_record) = scaled_dev.device_ptr_mut(stream);
+        // SAFETY: all device slices are on this stream/context. `matrix_dev`
+        // and `scaled_dev` are rows×cols column-major matrices with lda/ldc
+        // equal to rows; `weights_dev` has one contiguous value per row.
+        let status = unsafe {
+            cudarc::cublas::sys::cublasDdgmm(
+                handle,
+                cublasSideMode_t::CUBLAS_SIDE_LEFT,
+                rows_i,
+                cols_i,
+                matrix_ptr as *const f64,
+                rows_i,
+                weights_ptr as *const f64,
+                1,
+                scaled_ptr as *mut f64,
+                rows_i,
+            )
+        };
+        if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn weighted_crossprod(
+        runtime: &GpuRuntime,
+        left: ArrayView2<'_, f64>,
+        weights: ArrayView1<'_, f64>,
+        right: ArrayView2<'_, f64>,
+    ) -> Option<Array2<f64>> {
+        let (rows, left_cols) = left.dim();
+        let (right_rows, right_cols) = right.dim();
+        if rows == 0
+            || left_cols == 0
+            || right_cols == 0
+            || rows != right_rows
+            || rows != weights.len()
+        {
+            return None;
+        }
+
+        let (stream, blas) = stream_and_blas(runtime)?;
+        let left_col = to_col_major(&left);
+        let right_col = to_col_major(&right);
+        let mut weights_storage = Vec::new();
+        let weights_slice = vector_slice(weights, &mut weights_storage);
+        let left_dev = stream.clone_htod(&*left_col).ok()?;
+        let right_dev = stream.clone_htod(&*right_col).ok()?;
+        let weights_dev = stream.clone_htod(weights_slice).ok()?;
+        let mut weighted_right_dev = stream
+            .alloc_zeros::<f64>(rows.checked_mul(right_cols)?)
+            .ok()?;
+        row_scale_device(
+            &blas,
+            &stream,
+            &right_dev,
+            &weights_dev,
+            &mut weighted_right_dev,
+            rows,
+            right_cols,
+        )?;
+
+        let mut out_dev = stream
+            .alloc_zeros::<f64>(left_cols.checked_mul(right_cols)?)
+            .ok()?;
+        let cfg = GemmConfig::<f64> {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: to_i32(left_cols)?,
+            n: to_i32(right_cols)?,
+            k: to_i32(rows)?,
+            alpha: 1.0,
+            lda: to_i32(rows)?,
+            ldb: to_i32(rows)?,
+            beta: 0.0,
+            ldc: to_i32(left_cols)?,
+        };
+        // SAFETY: cfg computes leftᵀ (left_cols×rows) times weighted_right
+        // (rows×right_cols) into a left_cols×right_cols column-major output.
+        unsafe { blas.gemm(cfg, &left_dev, &weighted_right_dev, &mut out_dev) }.ok()?;
+        let out_col = stream.clone_dtoh(&out_dev).ok()?;
+        from_col_major(&out_col, left_cols, right_cols)
+    }
+
+    #[inline]
+    fn assign_block(
+        out: &mut Array2<f64>,
+        row_offset: usize,
+        col_offset: usize,
+        block: &Array2<f64>,
+    ) {
+        let (rows, cols) = block.dim();
+        for col in 0..cols {
+            for row in 0..rows {
+                out[[row_offset + row, col_offset + col]] = block[[row, col]];
+            }
+        }
+    }
+
+    #[inline]
+    fn mirror_upper_to_lower(out: &mut Array2<f64>) {
+        let n = out.nrows();
+        for row in 0..n {
+            for col in 0..row {
+                out[[row, col]] = out[[col, row]];
+            }
+        }
+    }
 
     #[inline]
     pub(crate) fn gemm_cuda(
@@ -64,10 +211,7 @@ mod cuda_impl {
         if m == 0 || n == 0 || k_a == 0 || k_a != k_b {
             return None;
         }
-        let stream = super::super::runtime::cuda_context_for(runtime.device.ordinal)?
-            .new_stream()
-            .ok()?;
-        let blas = CudaBlas::new(stream.clone()).ok()?;
+        let (stream, blas) = stream_and_blas(runtime)?;
         let a_col = to_col_major(&a);
         let b_col = to_col_major(&b);
         let a_dev = stream.clone_htod(&*a_col).ok()?;
@@ -112,20 +256,11 @@ mod cuda_impl {
         if out_len == 0 || needed == 0 || v.len() != needed {
             return None;
         }
-        let stream = super::super::runtime::cuda_context_for(runtime.device.ordinal)?
-            .new_stream()
-            .ok()?;
-        let blas = CudaBlas::new(stream.clone()).ok()?;
+        let (stream, blas) = stream_and_blas(runtime)?;
         let a_col = to_col_major(&a);
         let a_dev = stream.clone_htod(&*a_col).ok()?;
-        let v_storage;
-        let v_slice = match v.as_slice() {
-            Some(slice) => slice,
-            None => {
-                v_storage = v.iter().copied().collect::<Vec<_>>();
-                v_storage.as_slice()
-            }
-        };
+        let mut v_storage = Vec::new();
+        let v_slice = vector_slice(v, &mut v_storage);
         let v_dev = stream.clone_htod(v_slice).ok()?;
         let mut out_dev = stream.alloc_zeros::<f64>(out_len).ok()?;
         let cfg = GemvConfig::<f64> {
@@ -153,8 +288,11 @@ mod cuda_impl {
         x: ArrayView2<'_, f64>,
         w: ArrayView1<'_, f64>,
     ) -> Option<Array2<f64>> {
-        std::hint::black_box((runtime, x, w));
-        None
+        let (rows, cols) = x.dim();
+        if rows == 0 || cols == 0 || rows != w.len() {
+            return None;
+        }
+        weighted_crossprod(runtime, x, w, x)
     }
 
     #[inline]
@@ -164,8 +302,7 @@ mod cuda_impl {
         w: ArrayView1<'_, f64>,
         y: ArrayView2<'_, f64>,
     ) -> Option<Array2<f64>> {
-        std::hint::black_box((runtime, x, w, y));
-        None
+        weighted_crossprod(runtime, x, w, y)
     }
 
     #[inline]
@@ -177,8 +314,34 @@ mod cuda_impl {
         w_ab: ArrayView1<'_, f64>,
         w_bb: ArrayView1<'_, f64>,
     ) -> Option<Array2<f64>> {
-        std::hint::black_box((runtime, x_a, x_b, w_aa, w_ab, w_bb));
-        None
+        let (rows, pa) = x_a.dim();
+        let (rows_b, pb) = x_b.dim();
+        let total = pa.checked_add(pb)?;
+        if rows == 0
+            || total == 0
+            || rows != rows_b
+            || rows != w_aa.len()
+            || rows != w_ab.len()
+            || rows != w_bb.len()
+        {
+            return None;
+        }
+
+        let mut out = Array2::<f64>::zeros((total, total));
+        if pa > 0 {
+            let aa = weighted_crossprod(runtime, x_a, w_aa, x_a)?;
+            assign_block(&mut out, 0, 0, &aa);
+        }
+        if pa > 0 && pb > 0 {
+            let ab = weighted_crossprod(runtime, x_a, w_ab, x_b)?;
+            assign_block(&mut out, 0, pa, &ab);
+        }
+        if pb > 0 {
+            let bb = weighted_crossprod(runtime, x_b, w_bb, x_b)?;
+            assign_block(&mut out, pa, pa, &bb);
+        }
+        mirror_upper_to_lower(&mut out);
+        Some(out)
     }
 
     #[inline]
@@ -193,10 +356,7 @@ mod cuda_impl {
             return None;
         }
         let nrhs = rhs.ncols();
-        let stream = super::super::runtime::cuda_context_for(runtime.device.ordinal)?
-            .new_stream()
-            .ok()?;
-        let blas = CudaBlas::new(stream.clone()).ok()?;
+        let (stream, blas) = stream_and_blas(runtime)?;
         let tri_col = to_col_major(&triangular);
         let rhs_col = to_col_major(&rhs);
         let tri_dev = stream.clone_htod(&*tri_col).ok()?;
