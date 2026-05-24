@@ -70,10 +70,10 @@ use gam::terms::sae_manifold::{
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::terms::{
-    ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, AuxConditionalPriorPenalty,
-    BlockOrthogonalityPenalty, DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty,
-    NuclearNormPenalty, OrthogonalityPenalty, ParametricAuxConditionalPriorPenalty,
-    PenaltyConcavity, PenaltyTier, PsiSlice, ScalarWeightSchedule, ScadMcpPenalty,
+    ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
+    DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty, NuclearNormPenalty,
+    OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier,
+    PsiSlice, RowPrecisionPriorPenalty, ScalarWeightSchedule, ScadMcpPenalty,
     SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TotalVariationPenalty,
 };
 use gam::terms::smooth::BlockwisePenalty;
@@ -11542,7 +11542,7 @@ fn build_analytic_penalty_registry_from_json(
                     "lambda_per_row_shape",
                     &context,
                 )?;
-                let penalty = AuxConditionalPriorPenalty::new(
+                let penalty = RowPrecisionPriorPenalty::new(
                     slice,
                     lambda_per_row,
                     weight,
@@ -11554,7 +11554,7 @@ fn build_analytic_penalty_registry_from_json(
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
                 };
-                registry.push(gam::terms::AnalyticPenaltyKind::AuxConditionalPrior(
+                registry.push(gam::terms::AnalyticPenaltyKind::RowPrecisionPrior(
                     std::sync::Arc::new(penalty),
                 ));
             }
@@ -11587,7 +11587,7 @@ fn build_analytic_penalty_registry_from_json(
                 let log_alpha = descriptor_array1_flat(descriptor, "log_alpha", &context)?;
                 let raw_beta = descriptor_array1_flat(descriptor, "raw_beta", &context)?;
                 let mu = descriptor_array2_flat(descriptor, "mu", "mu_shape", &context)?;
-                let penalty = ParametricAuxConditionalPriorPenalty::new(
+                let penalty = ParametricRowPrecisionPriorPenalty::new(
                     slice,
                     aux,
                     log_alpha,
@@ -11602,7 +11602,7 @@ fn build_analytic_penalty_registry_from_json(
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
                 };
-                registry.push(gam::terms::AnalyticPenaltyKind::ParametricAuxConditionalPrior(
+                registry.push(gam::terms::AnalyticPenaltyKind::ParametricRowPrecisionPrior(
                     std::sync::Arc::new(penalty),
                 ));
             }
