@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi import _rate_limit_exceeded_handler
@@ -48,5 +48,5 @@ def healthz() -> dict[str, str]:
 
 
 @app.get("/metrics", include_in_schema=False)
-def metrics():
+def metrics() -> Response:
     return metrics_response()

@@ -134,10 +134,9 @@ extern "C" __global__ void row_scale_kernel(
         beta: 0.0,
         ldc: p as i32,
     };
-    // SAFETY: cuBLAS gemm requires column-major device buffers of declared
-    // dimensions; dx is n×p column-major (caller contract), dwx is the n×p
-    // intermediate just written by scale_fn, dout is the p×p zero-initialized
-    // target. trans flags + leading-dim values match exactly.
+    // dx n×p col-major (caller); dwx n×p (just written by scale_fn);
+    // dout p×p zeroed. Trans flags + lda/ldb/ldc match dims.
+    // SAFETY: cuBLAS dim contract enforced via gemm config above.
     unsafe { blas.gemm(gemm, &dx, &dwx, &mut dout) }.map_err(|e| GpuError::DriverCallFailed {
         reason: format!("xtwx cublas gemm failed: {e}"),
     })?;

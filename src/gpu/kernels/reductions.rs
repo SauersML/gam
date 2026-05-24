@@ -153,10 +153,9 @@ extern "C" __global__ void reduce_kernel(
         .arg(&mut dpart)
         .arg(&nn)
         .arg(&op_code);
-    // SAFETY: func loaded from a freshly NVRTC-compiled module on this
-    // context; dx is the length-n device input, dpart is the per-block
-    // partial-sum buffer matching blocks. cfg grid covers exactly the
-    // kernel's bounded tid range.
+    // NVRTC func fresh; dx len-n; dpart per-block partial sums.
+    // Grid covers exactly the kernel's bounded tid range.
+    // SAFETY: all kernel-arg lifetimes + bounds checked above.
     unsafe { builder.launch(cfg) }.map_err(map_drv)?;
 
     let host_part = stream.memcpy_dtov(&dpart).map_err(map_drv)?;
