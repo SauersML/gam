@@ -27,7 +27,9 @@ use super::polya_gamma::PolyaGamma;
 use crate::construction::CanonicalPenalty;
 use crate::estimate::reml::FirthDenseOperator;
 use crate::estimate::reml::penalty_logdet::PenaltyPseudologdet;
-use crate::estimate::{UnifiedFitResult, validate_explicit_dense_hessian_for_whitening};
+use crate::estimate::{
+    EstimationError, UnifiedFitResult, validate_explicit_dense_hessian_for_whitening,
+};
 use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv};
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::matrix::DesignMatrix;
@@ -1243,7 +1245,15 @@ fn probit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f6
 /// log p(y|η) = Σ [y·log(1−exp(−exp(η))) + (1−y)·(−exp(η))]
 /// gradient_i = w_i · [y_i · exp(η_i)·exp(−exp(η_i)) / (1−exp(−exp(η_i))) − (1−y_i)·exp(η_i)]
 #[inline]
-fn cloglog_bernoulli_logp_and_residual(eta: f64, y: f64) -> (f64, f64) {
+fn cloglog_bernoulli_logp_and_residual(
+    eta: f64,
+    y: f64,
+) -> Result<(f64, f64), EstimationError> {
+    if !(eta.is_finite() && (-700.0..=700.0).contains(&eta)) {
+        return Err(EstimationError::InvalidInput(format!(
+            "cloglog eta must be finite and within [-700, 700]; got {eta}"
+        )));
+    }
     let exp_eta = eta.exp();
     let log_mu = if exp_eta <= std::f64::consts::LN_2 {
         (-(-exp_eta).exp_m1()).ln()
@@ -1254,7 +1264,7 @@ fn cloglog_bernoulli_logp_and_residual(eta: f64, y: f64) -> (f64, f64) {
     let grad_log_mu = (eta - exp_eta - log_mu).exp();
     let ll_i = y * log_mu + (1.0 - y) * log_one_minus_mu;
     let residual_i = y * grad_log_mu - (1.0 - y) * exp_eta;
-    (ll_i, residual_i)
+    Ok((ll_i, residual_i))
 }
 
 fn cloglog_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
@@ -1275,7 +1285,8 @@ fn cloglog_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f
         .map(|(i, slot)| {
             let y_i = data.y[i];
             let w_i = data.weights[i];
-            let (ll_i, residual_i) = cloglog_bernoulli_logp_and_residual(eta[i], y_i);
+            let (ll_i, residual_i) =
+                cloglog_bernoulli_logp_and_residual(eta[i], y_i).expect("validated cloglog eta");
             *slot = w_i * residual_i;
             w_i * ll_i
         })
@@ -1696,7 +1707,8 @@ mod tests {
     #[test]
     fn cloglog_log_mu_uses_complementary_loglog_inverse_link() {
         let eta = -1.0_f64;
-        let (ll_y1, residual_y1) = cloglog_bernoulli_logp_and_residual(eta, 1.0);
+        let (ll_y1, residual_y1) =
+            cloglog_bernoulli_logp_and_residual(eta, 1.0).expect("valid eta");
         let expected = (1.0 - (-eta.exp()).exp()).ln();
         let wrong_log_one_minus_exp_eta = (1.0 - eta.exp()).ln();
 
@@ -1704,8 +1716,8 @@ mod tests {
         assert!((ll_y1 - wrong_log_one_minus_exp_eta).abs() > 0.5);
 
         let eps = 1e-6;
-        let (lp, _) = cloglog_bernoulli_logp_and_residual(eta + eps, 1.0);
-        let (lm, _) = cloglog_bernoulli_logp_and_residual(eta - eps, 1.0);
+        let (lp, _) = cloglog_bernoulli_logp_and_residual(eta + eps, 1.0).expect("valid eta");
+        let (lm, _) = cloglog_bernoulli_logp_and_residual(eta - eps, 1.0).expect("valid eta");
         let fd = (lp - lm) / (2.0 * eps);
         assert!(
             (residual_y1 - fd).abs() < 1e-9,
@@ -4206,7 +4218,11 @@ impl LinkWigglePosterior {
                         return (f64::NEG_INFINITY, Array1::zeros(dim));
                     }
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
-                    let (ll_i, residual_i) = cloglog_bernoulli_logp_and_residual(eta_i, y_i);
+                    let (ll_i, residual_i) =
+                        match cloglog_bernoulli_logp_and_residual(eta_i, y_i) {
+                            Ok(values) => values,
+                            Err(_) => return (f64::NEG_INFINITY, Array1::zeros(dim)),
+                        };
                     ll_acc += w_i * ll_i;
                     residual[i] = w_i * residual_i;
                 }

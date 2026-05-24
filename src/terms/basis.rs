@@ -1620,57 +1620,6 @@ impl BSplineBoundaryConditions {
     }
 }
 
-/// User-facing endpoint condition tag parsed from formula DSL (`bc=...`).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum BSplineEndpointCondition {
-    None,
-    Clamped,
-    Anchored { value: f64 },
-}
-
-impl Default for BSplineEndpointCondition {
-    fn default() -> Self {
-        Self::None
-    }
-}
-
-impl From<BSplineEndpointCondition> for BSplineEndpointBoundaryCondition {
-    fn from(value: BSplineEndpointCondition) -> Self {
-        match value {
-            BSplineEndpointCondition::None => Self::Free,
-            BSplineEndpointCondition::Clamped => Self::Clamped,
-            BSplineEndpointCondition::Anchored { value } => Self::Anchored { value },
-        }
-    }
-}
-
-/// Singular boundary-condition struct used by parser callers; carries the same
-/// left/right pair as [`BSplineBoundaryConditions`] but in the user-facing
-/// `BSplineEndpointCondition` vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
-pub struct BSplineBoundaryCondition {
-    #[serde(default)]
-    pub left: BSplineEndpointCondition,
-    #[serde(default)]
-    pub right: BSplineEndpointCondition,
-}
-
-impl From<BSplineBoundaryCondition> for BSplineBoundaryConditions {
-    fn from(value: BSplineBoundaryCondition) -> Self {
-        Self {
-            left: value.left.into(),
-            right: value.right.into(),
-        }
-    }
-}
-
-impl BSplineBoundaryCondition {
-    pub fn is_unconstrained(&self) -> bool {
-        matches!(self.left, BSplineEndpointCondition::None)
-            && matches!(self.right, BSplineEndpointCondition::None)
-    }
-}
-
 /// Per-smooth identifiability policy for 1D B-spline bases.
 ///
 /// These constraints are applied directly in the builder via a reparameterization
@@ -2276,6 +2225,29 @@ pub struct DuchonBasisSpec {
     pub operator_penalties: DuchonOperatorPenaltySpec,
     #[serde(default)]
     pub boundary: OneDimensionalBoundary,
+}
+
+impl DuchonBasisSpec {
+    /// Integer view of `power` for the existing integer-only downstream chain.
+    /// Non-finite or non-integer values fall back to `0` (the integer-only
+    /// validators downstream already reject this case with a clear message).
+    pub fn power_as_usize(&self) -> usize {
+        duchon_power_to_usize(self.power)
+    }
+}
+
+/// Convert a Duchon spectral-power `f64` into the integer view used by the
+/// closed-form code paths. Non-finite, negative, or fractional values clamp to
+/// `0` so the validator downstream emits the canonical error.
+pub fn duchon_power_to_usize(power: f64) -> usize {
+    if !power.is_finite() || power < 0.0 {
+        return 0;
+    }
+    let rounded = power.round();
+    if (rounded - power).abs() > 1e-9 {
+        return 0;
+    }
+    rounded as usize
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
