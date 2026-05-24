@@ -6,9 +6,9 @@ Every model in `gamfit` uses a Wilkinson-style formula:
 response ~ term + term + ... + option(...)
 ```
 
-Terms are joined with `+`. `*` and `:` are not supported; interactions
-come from multivariate smooths (`s(x1, x2)`, `te(x1, x2)`,
-`matern(...)`, `duchon(...)`).
+Terms are joined with `+`. `*` and `:` are not supported — interactions come
+from multivariate smooths (`s(x1, x2)`, `te(x1, x2)`, `matern(...)`,
+`duchon(...)`), and intrinsic sphere smooths (`sphere(lat, lon)`).
 
 This page lists each right-hand-side term, its options, and the
 formula-level configuration terms (`link(...)`, `linkwiggle(...)`,
@@ -118,8 +118,8 @@ second-order difference penalty.
 | `k` (`basis_dim`) | from data | Total basis dimension. |
 | `knots` | from data | Number of interior knots. Cannot combine with `k`. |
 | `degree` | 3 | Polynomial degree of the B-spline. |
-| `penalty_order` | 2 | Order of the difference penalty. |
-| `type` | B-spline (1-D), `tps` (≥2-D) | One of `tps`, `matern`, `duchon`, `sphere`, `cyclic`. `ps` and the bare default both produce the 1-D B-spline; there is no separate `ps` dispatch. |
+| `penalty_order` | 2 | Derivative order penalised (1 = slope, 2 = curvature). |
+| `type` | `ps` (1-D), `tps` (2+D) | `ps`, `tps`, `matern`, `duchon`, `sphere`. |
 | `double_penalty` | `true` | Add a ridge penalty alongside the difference penalty. |
 | `bc` | `free` | Same boundary condition on both ends: `free`, `clamped`, or `anchored`. |
 | `bc_left`, `bc_right` | `free` | Per-endpoint boundary condition. Aliases: `left_bc`/`right_bc`, `start_bc`/`end_bc`. |
@@ -163,9 +163,9 @@ y ~ thinplate(x1, x2)        # alias
 y ~ thin_plate(x1, x2)       # alias
 y ~ matern(x1, x2, x3)
 y ~ duchon(x1, x2, x3)
-y ~ te(x, z)                 # tensor product
-y ~ tensor(x, z)             # alias
-y ~ interaction(x, z)        # alias of te()
+y ~ sphere(lat, lon)                # intrinsic S² smooth
+y ~ te(x, z)                        # tensor product
+y ~ tensor(x, z)                    # alias
 ```
 
 ### Thin-plate (`tps`, `thinplate`, multivariate `s(...)`)
@@ -216,11 +216,23 @@ stiffness). Scale-free unless `length_scale` is given.
 (mass, tension, stiffness) each get their own smoothing parameter
 under REML.
 
-Duchon is not TPS. TPS forces `m = ⌊d/2⌋+1`, so its polynomial
-nullspace `C(d+m-1, d)` grows combinatorially with `d` (e.g. 735,471
-columns at `d=16`). Duchon keeps `p` small (typically `Linear`, giving
-`d+1` polynomial columns) and grows the Riesz power `s` instead, so
-the polynomial block stays linear in `d` at any ambient dimension.
+### Sphere (`sphere`, `s2`, `sos`)
+
+Intrinsic S² smooth for latitude/longitude data on a sphere. The implementation
+uses real spherical harmonics through degree `L`, drops the global constant so
+the ordinary model intercept remains identifiable, and applies a diagonal
+curvature penalty proportional to `[l(l+1)]²` by harmonic degree. This makes the
+longitude seam periodic and removes artificial boundary conditions at the poles.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `degree` / `max_degree` | auto | Maximum spherical harmonic degree `L`; basis width is `L(L+2)`. |
+| `k` / `basis_dim` | auto | Alternative target basis dimension; resolved to the smallest `L` with `L(L+2) >= k`. |
+| `radians` | `false` | Treat latitude/longitude as radians instead of degrees. |
+| `units` | `degrees` | Set `units=radians` as an alias for `radians=true`. |
+| `double_penalty` | `true` | Add a ridge penalty alongside the curvature penalty. |
+
+### Tensor product (`te`, `tensor`)
 
 ### Tensor product (`te`, `tensor`, `interaction`)
 
@@ -254,68 +266,15 @@ value are broadcast across all margins.
 
 ![four smooth families on the same dataset](images/smooth_zoo.png)
 
-### Periodic and cyclic smooths {#periodic-cyclic-smooths}
-
-```
-y ~ s(theta, periodic=true, period=6.283)             # cyclic 1-D B-spline
-y ~ cyclic(theta, period_start=0, period_end=6.283)   # alias of s(..., periodic=true)
-y ~ periodic(theta, period=6.283)                     # alias
-y ~ cp(theta, period=6.283)                           # alias
-y ~ cc(day_of_week, period=7)                         # mgcv-style alias
-
-# Tensor with one or more periodic margins
-y ~ te(theta, h,  periodic=[0], period=[2*pi, None])
-y ~ te(theta, phi, periodic=[0, 1], period=[2*pi, 2*pi])
-y ~ te(day, hour, bc=['periodic','periodic'], periods=[7, 24], origins=[0, 0])
-```
-
-`cyclic`, `periodic`, `cc`, `cp` are aliases of `s(..., type=cyclic)`.
-
-`periodic=[axes]` lists zero-based axis indices that wrap. `period=` or
-`periods=` holds one positive period per margin (`None` for
-non-periodic margins). `origin=` / `origins=` fixes the half-open
-cyclic domain start when the sample does not contain the boundary.
-`period_start`/`period_end` (1-D) override the data range when the
-angular domain is wider than the observed sample.
-
-Period values can be plain numbers (e.g. `6.283185307`) or the
-symbolic constants `pi` / `PI` / `tau` / `TAU` (case-insensitive),
-optionally multiplied by a single numeric literal: `pi`, `2*pi`,
-`pi*2`, `.5*pi`, and `tau` are all accepted. `pi/2` and `2*3.14`
-(number × number) are not. The same rule applies inside list syntax
-(`period=[2*pi, None]`).
-
-`duchon()` accepts `periodic` only for 1-D inputs. Formula-level
-multivariate `duchon(..., periodic=true)` is rejected.
-
-### Intrinsic S² (sphere) smooth
-
-```
-y ~ sphere(lat, lon)                                    # Wahba kernel, m=2
-y ~ sos(lat, lon)                                       # alias
-y ~ spherical(lat, lon)                                 # alias
-y ~ s(lat, lon, type=sphere)                            # equivalent
-y ~ s(lat, lon, bs=sos)                                 # mgcv-style alias
-y ~ sphere(lat, lon, m=3, radians=true, k=64)
-y ~ sphere(lat, lon, method=harmonic, max_degree=6)
-```
-
-`sphere()`, `sos()`, and `spherical()` require exactly two columns
-(latitude, longitude).
-
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `method` | `wahba` | `wahba` (reproducing kernel) or `harmonic` (spherical harmonics). Aliases: `wahba_sobolev`, `wahba_pseudo`/`mgcv`/`sos`, `sh`. |
-| `m` (`order`, `penalty_order`) | 2 | Wahba pseudo-spline order, integer in `{1, 2, 3, 4}`. |
-| `max_degree` (`max_l`, `harmonic_degree`, `l`) | auto | Maximum harmonic degree L; basis dim = `L(L+2)`. |
-| `centers` (`k`, `basis_dim`) | auto | Wahba centre count. |
-| `radians` / `units=radians` | `false` | Treat lat/lon as radians (default: degrees). |
-| `double_penalty` | `true` | Add a ridge-like null-space shrinkage penalty. |
-| `kernel` (`wahba_kernel`) | `sobolev` | `sobolev` (default) or `pseudo`/`mgcv`/`sos`. |
-
-Both Wahba and harmonic constructions are rotation-invariant. The
-harmonic basis is fixed-rank with a diagonal Laplace-Beltrami squared
-penalty; Wahba uses centres via a closed-form reproducing kernel.
+| You have... | Use... |
+| --- | --- |
+| One covariate | `s(x)` (P-spline). |
+| Two coordinates on a sphere (lat, lon) | `sphere(lat, lon)`. |
+| Two Euclidean coordinates in the same units | `s(x, y)` (thin-plate) or `matern(x, y)`. |
+| Coordinates in different units (space × time) | `te(x, t)`. |
+| 3+ coordinates, especially in different units | `duchon(...)` with `scale_dims=true`, or `matern(...)`. |
+| You want to control wiggliness directly | `matern(...)` with `nu`. |
+| You want scale-free behaviour | `duchon(...)` without `length_scale`. |
 
 ## Adaptive anisotropy
 

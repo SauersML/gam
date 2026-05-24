@@ -22,9 +22,9 @@ use crate::inference::formula_dsl::{
 use crate::inference::model::ColumnKindTag;
 use crate::resource::ResourcePolicy;
 use crate::smooth::{
-    ByVarKind, FactorSmoothFlavour, FactorSmoothSpec, LinearCoefficientGeometry, LinearTermSpec,
-    RandomEffectTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
-    TensorBSplineIdentifiability, TensorBSplineSpec, TermCollectionSpec,
+    LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
+    SmoothBasisSpec, SmoothTermSpec, SphereBasisSpec, TensorBSplineIdentifiability,
+    TensorBSplineSpec, TermCollectionSpec,
 };
 
 // ---------------------------------------------------------------------------
@@ -1093,212 +1093,41 @@ pub fn build_smooth_basis(
                 input_scales: None,
             })
         }
-        "pca" | "pc" | "principal-components" | "principal_components" => {
-            validate_known_options(
-                "pca",
-                options,
-                &[
-                    "type",
-                    "bs",
-                    "by",
-                    "k",
-                    "basis_dim",
-                    "basis-dim",
-                    "basisdim",
-                    "centered",
-                    "center",
-                    "double_penalty",
-                    "smooth_penalty",
-                ],
-            )?;
-            let k_pca = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
-                .unwrap_or_else(|| cols.len().min(64).max(1));
-            let centered = option_bool(options, "centered")
-                .or_else(|| option_bool(options, "center"))
-                .unwrap_or(true);
-            let smooth_penalty =
-                option_f64_strict(options, "smooth_penalty")?.unwrap_or(1.0);
-            if !smooth_penalty.is_finite() || smooth_penalty <= 0.0 {
-                return Err(TermBuilderError::invalid_option(format!(
-                    "pca() smooth_penalty must be finite and positive; got {smooth_penalty}"
-                ))
-                .to_string());
-            }
-            let x = ds.values.select(Axis(1), cols);
-            let basis_matrix =
-                compute_pca_basis_matrix(x.view(), k_pca, centered).map_err(|e| e.to_string())?;
-            Ok(SmoothBasisSpec::Pca {
-                feature_cols: cols.to_vec(),
-                basis_matrix,
-                centered,
-                smooth_penalty,
-                center_mean: None,
-            })
-        }
-        "sphere" | "sos" | "spherical" => {
-            validate_known_options(
-                "sphere",
-                options,
-                &[
-                    "type",
-                    "bs",
-                    "by",
-                    "method",
-                    "m",
-                    "order",
-                    "penalty_order",
-                    "radians",
-                    "units",
-                    "max_degree",
-                    "max-degree",
-                    "max_l",
-                    "max-l",
-                    "harmonic_degree",
-                    "l",
-                    "centers",
-                    "k",
-                    "basis_dim",
-                    "basis-dim",
-                    "basisdim",
-                    "knots",
-                    "double_penalty",
-                    // Wahba-kernel selector: pick Sobolev (default) or
-                    // pseudo-spline (mgcv-compat). `kernel=sobolev|pseudo|mgcv|sos`.
-                    "kernel",
-                    "wahba_kernel",
-                    "wahba-kernel",
-                ],
-            )?;
+        "sphere" | "s2" | "sos" => {
             if cols.len() != 2 {
-                return Err(TermBuilderError::incompatible_config(format!(
-                    "sphere smooth expects exactly two variables (latitude, longitude), got {}",
+                return Err(format!(
+                    "sphere smooth expects exactly two variables (lat, lon), got {}",
                     cols.len()
-                ))
-                .to_string());
+                ));
             }
-            let plan = plan_spatial_basis(
-                ds.values.nrows(),
-                2,
-                CenterCountRequest::Default,
-                DuchonNullspaceOrder::Zero,
-                false,
-                policy,
-            )
-            .map_err(|e| e.to_string())?;
-            let centers = parse_countwith_basis_alias(options, "centers", plan.centers)?;
-            let center_strategy = CenterStrategy::FarthestPoint {
-                num_centers: centers,
-            };
-            let penalty_order = option_usize(options, "m")
-                .or_else(|| option_usize(options, "order"))
-                .or_else(|| option_usize(options, "penalty_order"))
-                .unwrap_or(2);
-            if !(1..=4).contains(&penalty_order) {
-                return Err(TermBuilderError::invalid_option(format!(
-                    "sphere smooth penalty order must be one of 1, 2, 3, 4; got {penalty_order}"
-                ))
-                .to_string());
+            let max_degree =
+                option_usize_any(options, &["degree", "l", "max_degree", "max-degree"])
+                    .or_else(|| {
+                        option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
+                            .and_then(|k| (1..=128).find(|&l| l * (l + 2) >= k))
+                    })
+                    .unwrap_or_else(|| default_sphere_degree(ds.values.nrows()));
+            if max_degree == 0 {
+                return Err("sphere smooth requires degree/max_degree >= 1".to_string());
+            }
+            if max_degree > 32 {
+                return Err(format!(
+                    "sphere smooth max_degree={} is too large for the dense harmonic engine (limit 32)",
+                    max_degree
+                ));
             }
             let radians = option_bool(options, "radians").unwrap_or_else(|| {
                 options
                     .get("units")
-                    .map(|u| {
-                        u.trim().to_ascii_lowercase() == "radians"
-                            || u.trim().to_ascii_lowercase() == "rad"
-                    })
+                    .map(|u| u.eq_ignore_ascii_case("radian") || u.eq_ignore_ascii_case("radians"))
                     .unwrap_or(false)
             });
-            // Parse `method=`. The Wahba-family kernel choice (Sobolev vs
-            // pseudo-spline) is also accepted via `method=`: passing
-            // `wahba_sobolev` / `wahba_pseudo` is equivalent to
-            // `method=wahba, kernel=sobolev` / `method=wahba, kernel=pseudo`.
-            // Plain `wahba` defaults to the Sobolev kernel (more correct).
-            let (method, method_kernel) = match options
-                .get("method")
-                .map(|s| s.trim().to_ascii_lowercase())
-                .as_deref()
-            {
-                None | Some("wahba") | Some("kernel") => (
-                    crate::basis::SphereMethod::Wahba,
-                    Option::<crate::basis::SphereWahbaKernel>::None,
-                ),
-                Some("wahba_sobolev")
-                | Some("wahba-sobolev")
-                | Some("sobolev")
-                | Some("sobolev_wahba")
-                | Some("sobolev-wahba") => (
-                    crate::basis::SphereMethod::Wahba,
-                    Some(crate::basis::SphereWahbaKernel::Sobolev),
-                ),
-                Some("wahba_pseudo") | Some("wahba-pseudo") | Some("pseudo")
-                | Some("pseudo_wahba") | Some("pseudo-wahba") | Some("mgcv") | Some("sos") => (
-                    crate::basis::SphereMethod::Wahba,
-                    Some(crate::basis::SphereWahbaKernel::Pseudo),
-                ),
-                Some("harmonic")
-                | Some("harmonics")
-                | Some("spherical_harmonics")
-                | Some("spherical-harmonics")
-                | Some("sh") => (crate::basis::SphereMethod::Harmonic, None),
-                Some(other) => {
-                    return Err(TermBuilderError::unsupported_feature(format!(
-                        "unsupported sphere method '{other}'; use one of: \
-                         wahba | wahba_sobolev (default Wahba) | wahba_pseudo (mgcv `bs=\"sos\"` compatible) | harmonic"
-                    ))
-                    .to_string());
-                }
-            };
-            // Also accept an explicit `kernel=` option for users who set
-            // `method=wahba` and want to pick the underlying kernel
-            // separately. `kernel=` overrides any implicit choice from
-            // `method=wahba_<kind>`. Defaults to Sobolev.
-            let explicit_kernel = match options
-                .get("kernel")
-                .or_else(|| options.get("wahba_kernel"))
-                .or_else(|| options.get("wahba-kernel"))
-                .map(|s| s.trim().to_ascii_lowercase())
-                .as_deref()
-            {
-                None => None,
-                Some("sobolev") | Some("true") | Some("h") | Some("hm") => {
-                    Some(crate::basis::SphereWahbaKernel::Sobolev)
-                }
-                Some("pseudo")
-                | Some("pseudo_spline")
-                | Some("pseudo-spline")
-                | Some("mgcv")
-                | Some("sos") => Some(crate::basis::SphereWahbaKernel::Pseudo),
-                Some(other) => {
-                    return Err(TermBuilderError::unsupported_feature(format!(
-                        "unsupported sphere kernel '{other}'; use one of: sobolev | pseudo"
-                    ))
-                    .to_string());
-                }
-            };
-            let wahba_kernel = explicit_kernel
-                .or(method_kernel)
-                .unwrap_or(crate::basis::SphereWahbaKernel::Sobolev);
-            let max_degree = option_usize_any(
-                options,
-                &[
-                    "max_degree",
-                    "max-degree",
-                    "max_l",
-                    "max-l",
-                    "harmonic_degree",
-                    "l",
-                ],
-            );
             Ok(SmoothBasisSpec::Sphere {
                 feature_cols: cols.to_vec(),
-                spec: SphericalSplineBasisSpec {
-                    center_strategy,
-                    penalty_order,
-                    double_penalty: smooth_double_penalty,
-                    radians,
-                    method,
+                spec: SphereBasisSpec {
                     max_degree,
-                    wahba_kernel,
+                    radians,
+                    double_penalty: smooth_double_penalty,
                 },
             })
         }
@@ -1701,333 +1530,16 @@ pub fn heuristic_centers(n: usize, d: usize) -> usize {
     default_num_centers(n, d)
 }
 
-fn parse_math_f64(raw: &str) -> Result<f64, TermBuilderError> {
-    let t = raw.trim().trim_matches('"').trim_matches('\'').trim();
-    if t.eq_ignore_ascii_case("none") || t.eq_ignore_ascii_case("null") {
-        return Err(TermBuilderError::invalid_option(
-            "None/null is not a number",
-        ));
+pub fn default_sphere_degree(n: usize) -> usize {
+    // Real spherical harmonics through degree L have L(L+2) non-constant
+    // columns. Keep the default comfortably below n while permitting enough
+    // angular detail for ordinary sample sizes.
+    let target = ((n as f64).sqrt() as usize).clamp(3, 12);
+    let mut l = 1usize;
+    while l < 12 && l * (l + 2) < target {
+        l += 1;
     }
-    let lower = t
-        .to_ascii_lowercase()
-        .replace(' ', "")
-        .replace('π', "pi")
-        .replace('τ', "tau");
-    match lower.as_str() {
-        "pi" => return Ok(std::f64::consts::PI),
-        "tau" | "2pi" | "2*pi" => return Ok(2.0 * std::f64::consts::PI),
-        _ => {}
-    }
-    if let Some(rest) = lower.strip_suffix("*pi") {
-        let coef = if rest.is_empty() {
-            1.0
-        } else {
-            rest.parse::<f64>().map_err(|_| {
-                TermBuilderError::invalid_option(format!("invalid numeric expression '{raw}'"))
-            })?
-        };
-        return Ok(coef * std::f64::consts::PI);
-    }
-    if let Some(rest) = lower.strip_prefix("pi*") {
-        let coef = rest.parse::<f64>().map_err(|_| {
-            TermBuilderError::invalid_option(format!("invalid numeric expression '{raw}'"))
-        })?;
-        return Ok(coef * std::f64::consts::PI);
-    }
-    lower.parse::<f64>().map_err(|_| {
-        TermBuilderError::invalid_option(format!("invalid numeric expression '{raw}'"))
-    })
-}
-
-fn split_list_option(raw: &str) -> Vec<String> {
-    let t = raw.trim();
-    let inner = t
-        .strip_prefix('[')
-        .and_then(|u| u.strip_suffix(']'))
-        .unwrap_or(t);
-    inner.split(',').map(|v| v.trim().to_string()).collect()
-}
-
-fn option_usize_list_any(
-    options: &BTreeMap<String, String>,
-    keys: &[&str],
-) -> Result<Option<Vec<usize>>, TermBuilderError> {
-    for key in keys {
-        if let Some(raw) = options.get(*key) {
-            let vals = split_list_option(raw);
-            if vals.is_empty() {
-                return Err(TermBuilderError::invalid_option(format!(
-                    "{key} must contain at least one integer"
-                )));
-            }
-            let parsed = vals
-                .iter()
-                .map(|v| {
-                    v.parse::<usize>().map_err(|_| {
-                        TermBuilderError::invalid_option(format!(
-                            "{key} entries must be non-negative integers, got '{v}'"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            return Ok(Some(parsed));
-        }
-    }
-    Ok(None)
-}
-
-fn expand_margin_usize_option(
-    name: &str,
-    values: Vec<usize>,
-    ndim: usize,
-) -> Result<Vec<usize>, TermBuilderError> {
-    match values.len() {
-        1 => Ok(vec![values[0]; ndim]),
-        n if n == ndim => Ok(values),
-        n => Err(TermBuilderError::invalid_option(format!(
-            "{name} must be scalar or have one entry per margin ({ndim}), got {n}"
-        ))),
-    }
-}
-
-fn parse_periodic_axes(
-    options: &BTreeMap<String, String>,
-    ndim: usize,
-) -> Result<Vec<bool>, TermBuilderError> {
-    let mut out = vec![false; ndim];
-    let Some(raw) = options.get("periodic").or_else(|| options.get("cyclic")) else {
-        if let Some(raw_bc) = options.get("bc") {
-            let vals = split_list_option(raw_bc);
-            if vals.len() != ndim {
-                return Err(TermBuilderError::invalid_option(format!(
-                    "bc must have one entry per margin ({ndim}), got {}",
-                    vals.len()
-                )));
-            }
-            for (i, v) in vals.iter().enumerate() {
-                let l = v.trim_matches('"').trim_matches('\'').to_ascii_lowercase();
-                out[i] = matches!(l.as_str(), "periodic" | "cyclic" | "cc");
-            }
-        }
-        return Ok(out);
-    };
-    let vals = split_list_option(raw);
-    if vals.len() == ndim
-        && vals.iter().all(|v| {
-            matches!(
-                v.to_ascii_lowercase().as_str(),
-                "true" | "false" | "yes" | "no"
-            )
-        })
-    {
-        for (i, v) in vals.iter().enumerate() {
-            out[i] = matches!(v.to_ascii_lowercase().as_str(), "true" | "yes");
-        }
-    } else {
-        for v in vals {
-            if v.is_empty() {
-                continue;
-            }
-            let axis = v.parse::<usize>().map_err(|_| {
-                TermBuilderError::invalid_option(format!(
-                    "periodic axes must be zero-based integers, got '{v}'"
-                ))
-            })?;
-            if axis >= ndim {
-                return Err(TermBuilderError::invalid_option(format!(
-                    "periodic axis {axis} out of range for {ndim}D smooth"
-                )));
-            }
-            out[axis] = true;
-        }
-    }
-    Ok(out)
-}
-
-fn validate_tensor_bc_entries(
-    options: &BTreeMap<String, String>,
-    ndim: usize,
-) -> Result<(), TermBuilderError> {
-    let Some(raw_bc) = options.get("bc") else {
-        return Ok(());
-    };
-    let vals = split_list_option(raw_bc);
-    if vals.len() != ndim {
-        return Err(TermBuilderError::invalid_option(format!(
-            "bc must have one entry per margin ({ndim}), got {}",
-            vals.len()
-        )));
-    }
-    for (dim, value) in vals.iter().enumerate() {
-        let l = value
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_ascii_lowercase();
-        if matches!(
-            l.as_str(),
-            "periodic" | "cyclic" | "cc" | "natural" | "free" | "none"
-        ) {
-            continue;
-        }
-        return Err(TermBuilderError::unsupported_feature(format!(
-            "tensor smooth bc entry {dim}={value:?} is not supported. Tensor margins currently support only periodic/cyclic/cc or natural/free/none; use separate s(..., bc=...) terms for endpoint clamped/anchored 1D boundary conditions."
-        )));
-    }
-    Ok(())
-}
-
-fn parse_periods(
-    options: &BTreeMap<String, String>,
-    periodic: &[bool],
-) -> Result<Vec<Option<f64>>, TermBuilderError> {
-    let ndim = periodic.len();
-    let mut out = vec![None; ndim];
-    let Some(raw) = options.get("period").or_else(|| options.get("periods")) else {
-        return Ok(out);
-    };
-    let vals = split_list_option(raw);
-    if vals.len() == 1 && periodic.iter().filter(|&&b| b).count() == 1 {
-        let value = parse_math_f64(&vals[0])?;
-        if value <= 0.0 || !value.is_finite() {
-            return Err(TermBuilderError::invalid_option(
-                "period entries must be positive finite values",
-            ));
-        }
-        if let Some(axis) = periodic.iter().position(|&b| b) {
-            out[axis] = Some(value);
-        }
-        return Ok(out);
-    }
-    if vals.len() != ndim {
-        return Err(TermBuilderError::invalid_option(format!(
-            "period must have one entry per margin ({ndim}), got {}",
-            vals.len()
-        )));
-    }
-    for (i, v) in vals.iter().enumerate() {
-        let l = v.to_ascii_lowercase();
-        if matches!(l.as_str(), "none" | "null" | "na" | "") {
-            continue;
-        }
-        let value = parse_math_f64(v)?;
-        if value <= 0.0 || !value.is_finite() {
-            return Err(TermBuilderError::invalid_option(
-                "period entries must be positive finite values",
-            ));
-        }
-        out[i] = Some(value);
-    }
-    Ok(out)
-}
-
-fn parse_period_origins(
-    options: &BTreeMap<String, String>,
-    periodic: &[bool],
-) -> Result<Vec<Option<f64>>, TermBuilderError> {
-    let ndim = periodic.len();
-    let mut out = vec![None; ndim];
-    let Some(raw) = options.get("origin").or_else(|| options.get("origins")) else {
-        return Ok(out);
-    };
-    let vals = split_list_option(raw);
-    if vals.len() == 1 && periodic.iter().filter(|&&b| b).count() == 1 {
-        if let Some(axis) = periodic.iter().position(|&b| b) {
-            out[axis] = Some(parse_math_f64(&vals[0])?);
-        }
-        return Ok(out);
-    }
-    if vals.len() != ndim {
-        return Err(TermBuilderError::invalid_option(format!(
-            "origin must have one entry per margin ({ndim}), got {}",
-            vals.len()
-        )));
-    }
-    for (i, v) in vals.iter().enumerate() {
-        let l = v.to_ascii_lowercase();
-        if matches!(l.as_str(), "none" | "null" | "na" | "") {
-            continue;
-        }
-        out[i] = Some(parse_math_f64(v)?);
-    }
-    Ok(out)
-}
-
-fn option_math_f64_any(
-    options: &BTreeMap<String, String>,
-    keys: &[&str],
-) -> Result<Option<f64>, TermBuilderError> {
-    for key in keys {
-        if let Some(raw) = options.get(*key) {
-            return parse_math_f64(raw).map(Some);
-        }
-    }
-    Ok(None)
-}
-
-fn parse_periodic_domain_1d(
-    options: &BTreeMap<String, String>,
-    data_min: f64,
-    _data_max: f64,
-) -> Result<(f64, f64), TermBuilderError> {
-    let start = option_math_f64_any(
-        options,
-        &[
-            "period_start",
-            "period-start",
-            "domain_start",
-            "domain-start",
-            "start",
-        ],
-    )?;
-    let end = option_math_f64_any(
-        options,
-        &[
-            "period_end",
-            "period-end",
-            "domain_end",
-            "domain-end",
-            "end",
-        ],
-    )?;
-    match (start, end) {
-        (Some(domain_start), Some(domain_end)) => {
-            let period = domain_end - domain_start;
-            if !period.is_finite() || period <= 0.0 {
-                return Err(TermBuilderError::invalid_option(format!(
-                    "period_end must be greater than period_start for periodic smooths, got start={domain_start}, end={domain_end}"
-                )));
-            }
-            Ok((domain_start, period))
-        }
-        (Some(_), None) | (None, Some(_)) => Err(TermBuilderError::invalid_option(
-            "periodic smooths require both period_start and period_end when either is provided",
-        )),
-        (None, None) => {
-            let explicit_period = parse_periods(options, &[true])?[0];
-            let explicit_origin = option_math_f64_any(
-                options,
-                &["origin", "period_origin", "period-origin", "domain_origin"],
-            )?;
-            match (explicit_period, explicit_origin) {
-                (Some(period), origin) => Ok((origin.unwrap_or(data_min), period)),
-                (None, _) => {
-                    // Silently inferring period from data range is a user-facing
-                    // footgun: if data on [0, 2π] is sampled uniformly the empirical
-                    // range is [ε, 2π−ε], so the inferred period is slightly less
-                    // than 2π and predictions at t=0 vs t=2π reach different points
-                    // on the inferred circle. Force the user to be explicit.
-                    Err(TermBuilderError::invalid_option(
-                        "periodic=true requires an explicit `period=<value>` (or \
-                         `period_start=<lo>, period_end=<hi>`). Silent inference \
-                         from data range would set period = data_max − data_min, \
-                         which is sample-dependent and rarely what users mean \
-                         (e.g. uniform draws on [0, 2π] give period ≈ 2π − 2ε, \
-                         not 2π, leading to off-by-ε wrap discontinuities).",
-                    ))
-                }
-            }
-        }
-    }
+    l
 }
 
 // ---------------------------------------------------------------------------

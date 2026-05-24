@@ -6711,8 +6711,8 @@ fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
         | SmoothBasisSpec::Sphere { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
-        | SmoothBasisSpec::Pca { feature_cols, .. }
-        | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
+        | SmoothBasisSpec::TensorBSpline { feature_cols, .. }
+        | SmoothBasisSpec::Sphere { feature_cols, .. } => {
             if feature_cols.len() == 1 {
                 Some(feature_cols[0])
             } else {
@@ -7520,8 +7520,7 @@ fn spatial_basiswarning_family_and_cols(term: &SmoothTermSpec) -> Option<(&'stat
         SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
         SmoothBasisSpec::BSpline1D { .. }
         | SmoothBasisSpec::TensorBSpline { .. }
-        | SmoothBasisSpec::BySmooth { .. }
-        | SmoothBasisSpec::FactorSmooth { .. } => None,
+        | SmoothBasisSpec::Sphere { .. } => None,
     }
 }
 
@@ -7592,25 +7591,8 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
         | SmoothBasisSpec::Sphere { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
-        | SmoothBasisSpec::Pca { feature_cols, .. }
-        | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
-        SmoothBasisSpec::BySmooth { smooth, by_kind } => {
-            let mut cols = smooth_term_feature_cols(&SmoothTermSpec {
-                name: String::new(),
-                basis: *smooth.clone(),
-                shape: gam::smooth::ShapeConstraint::None,
-            });
-            match by_kind {
-                gam::smooth::ByVarKind::Numeric { feature_col }
-                | gam::smooth::ByVarKind::Factor { feature_col, .. } => cols.push(*feature_col),
-            }
-            cols
-        }
-        SmoothBasisSpec::FactorSmooth { spec } => {
-            let mut cols = spec.continuous_cols.clone();
-            cols.push(spec.group_col);
-            cols
-        }
+        | SmoothBasisSpec::TensorBSpline { feature_cols, .. }
+        | SmoothBasisSpec::Sphere { feature_cols, .. } => feature_cols.clone(),
     }
 }
 
@@ -7664,11 +7646,9 @@ fn smooth_basiswarning_family_rank(term: &SmoothTermSpec) -> u8 {
         SmoothBasisSpec::BSpline1D { .. } => 0,
         SmoothBasisSpec::TensorBSpline { .. } => 1,
         SmoothBasisSpec::ThinPlate { .. } => 2,
-        SmoothBasisSpec::Sphere { .. } => 3,
-        SmoothBasisSpec::Matern { .. } => 4,
-        SmoothBasisSpec::Duchon { .. } => 5,
-        SmoothBasisSpec::BySmooth { .. } => 6,
-        SmoothBasisSpec::FactorSmooth { .. } => 7,
+        SmoothBasisSpec::Matern { .. } => 3,
+        SmoothBasisSpec::Duchon { .. } => 4,
+        SmoothBasisSpec::Sphere { .. } => 5,
     }
 }
 

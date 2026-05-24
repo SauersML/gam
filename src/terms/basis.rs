@@ -2902,19 +2902,9 @@ pub enum BasisMetadata {
         periods: Vec<Option<f64>>,
         identifiability_transform: Option<Array2<f64>>,
     },
-    BySmooth {
-        inner: Box<BasisMetadata>,
-        by_col: usize,
-        levels: Option<Vec<u64>>,
-        ordered: bool,
-    },
-    FactorSmooth {
-        continuous_cols: Vec<usize>,
-        group_col: usize,
-        knots: Array1<f64>,
-        degree: usize,
-        levels: Vec<u64>,
-        flavour: String,
+    Sphere {
+        max_degree: usize,
+        radians: bool,
     },
 }
 
