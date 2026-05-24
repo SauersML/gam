@@ -509,6 +509,7 @@ pub fn row_kernel_directional_derivative<const K: usize>(
 ) -> Result<Array2<f64>, String> {
     let n = kern.n_rows();
     let p = kern.n_coefficients();
+    kern.warm_up_directional_caches()?;
     rows.par_try_reduce_fold(
         n,
         || Array2::<f64>::zeros((p, p)),
@@ -546,6 +547,7 @@ pub fn row_kernel_second_directional_derivative<const K: usize>(
 ) -> Result<Array2<f64>, String> {
     let n = kern.n_rows();
     let p = kern.n_coefficients();
+    kern.warm_up_directional_caches()?;
     rows.par_try_reduce_fold(
         n,
         || Array2::<f64>::zeros((p, p)),
