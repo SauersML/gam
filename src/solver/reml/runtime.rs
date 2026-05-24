@@ -4814,22 +4814,6 @@ impl<'a> RemlState<'a> {
         ))
     }
 
-    /// Compute tr(S⁺ S_direction) — the first derivative of log|S|₊
-    /// in the direction S_direction.
-    ///
-    /// Uses the exact pseudoinverse S⁺ restricted to the positive eigenspace.
-    /// Only eigenvectors in the canonical structural rank participate.
-    #[cfg(test)]
-    pub(super) fn fixed_subspace_penalty_trace(
-        &self,
-        e_transformed: &Array2<f64>,
-        s_direction: &Array2<f64>,
-        ridge_passport: RidgePassport,
-    ) -> Result<f64, EstimationError> {
-        let penalty_subspace = self.compute_penalty_subspace(e_transformed, ridge_passport)?;
-        self.fixed_subspace_penalty_trace_from_subspace(&penalty_subspace, s_direction)
-    }
-
     pub(super) fn fixed_subspace_penalty_trace_from_subspace(
         &self,
         penalty_subspace: &PenaltySubspace,

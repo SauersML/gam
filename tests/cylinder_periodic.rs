@@ -33,6 +33,8 @@ fn tensor_periodic_margin_is_exactly_cyclic_at_period_boundary() {
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
+        boundary: Default::default(),
+        boundary_conditions: Default::default(),
     };
     let spec = TermCollectionSpec {
         linear_terms: vec![],
