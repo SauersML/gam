@@ -187,13 +187,20 @@ pub enum BySmoothKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SmoothBasisSpec {
-    /// Multiply an inner smooth basis row-by-row by a numeric by-variable or by
-    /// a single categorical level indicator.  This is the building block for
-    /// mgcv-style `s(x, by=...)` smooths.
+    /// Row-gated wrapper used for mgcv-style ``by=`` smooths.
+    ///
+    /// ``ByNumeric`` multiplies the inner smooth by a numeric column.
+    /// ``ByLevel`` keeps the inner smooth active only for rows whose encoded
+    /// categorical value has the stored bit pattern.  Unordered factor-by
+    /// smooths are represented as one independent ``ByLevel`` term per level.
+    ///
+    /// `kind` preserves the compact structural discriminator, while `by`
+    /// carries the full row-gating spec used to build the local design.
     ByVariable {
         inner: Box<SmoothBasisSpec>,
         by_col: usize,
         kind: BySmoothKind,
+        by: ByVariableSpec,
     },
     /// Sum-to-zero factor smooth (`bs="sz"`): with L levels, estimate L-1
     /// deviation coefficient blocks and use the final level as the negative
@@ -257,17 +264,6 @@ pub enum SmoothBasisSpec {
     TensorBSpline {
         feature_cols: Vec<usize>,
         spec: TensorBSplineSpec,
-    },
-    /// Row-gated wrapper used for mgcv-style ``by=`` smooths.
-    ///
-    /// ``ByNumeric`` multiplies the inner smooth by a numeric column.
-    /// ``ByLevel`` keeps the inner smooth active only for rows whose encoded
-    /// categorical value has the stored bit pattern.  Unordered factor-by
-    /// smooths are represented as one independent ``ByLevel`` term per level.
-    ByVariable {
-        inner: Box<SmoothBasisSpec>,
-        by_col: usize,
-        by: ByVariableSpec,
     },
 }
 
@@ -5938,6 +5934,23 @@ fn apply_by_variable_to_local_build(
     Ok(built)
 }
 
+fn ensure_by_variable_specs_match(
+    kind: &BySmoothKind,
+    by: &ByVariableSpec,
+    term_name: &str,
+) -> Result<(), BasisError> {
+    match (kind, by) {
+        (BySmoothKind::Numeric, ByVariableSpec::Numeric) => Ok(()),
+        (
+            BySmoothKind::Level { level_bits },
+            ByVariableSpec::Level { value_bits, .. },
+        ) if level_bits == value_bits => Ok(()),
+        _ => Err(BasisError::InvalidInput(format!(
+            "by-variable smooth term '{term_name}' has inconsistent by-variable specifications"
+        ))),
+    }
+}
+
 fn build_single_local_smooth_term(
     data: ArrayView2<'_, f64>,
     term: &SmoothTermSpec,
@@ -5949,7 +5962,14 @@ fn build_single_local_smooth_term(
             term.shape, term.name
         )));
     }
-    if let SmoothBasisSpec::ByVariable { inner, by_col, by } = &term.basis {
+    if let SmoothBasisSpec::ByVariable {
+        inner,
+        by_col,
+        kind,
+        by,
+    } = &term.basis
+    {
+        ensure_by_variable_specs_match(kind, by, &term.name)?;
         let inner_term = SmoothTermSpec {
             name: term.name.clone(),
             basis: (**inner).clone(),
@@ -5961,57 +5981,6 @@ fn build_single_local_smooth_term(
 
     let mut shape_axis_col: Option<usize> = None;
     let mut built: BasisBuildResult = match &term.basis {
-        SmoothBasisSpec::ByVariable {
-            inner,
-            by_col,
-            kind,
-        } => {
-            if *by_col >= data.ncols() {
-                return Err(BasisError::DimensionMismatch(format!(
-                    "term '{}' by column {} out of bounds for {} columns",
-                    term.name,
-                    by_col,
-                    data.ncols()
-                )));
-            }
-            if term.shape != ShapeConstraint::None {
-                return Err(BasisError::InvalidInput(format!(
-                    "ShapeConstraint::{:?} is unsupported for by-variable smooth term '{}'",
-                    term.shape, term.name
-                )));
-            }
-            let inner_term = SmoothTermSpec {
-                name: format!("{}::inner", term.name),
-                basis: (**inner).clone(),
-                shape: ShapeConstraint::None,
-            };
-            let mut inner_built = build_single_local_smooth_term(data, &inner_term, workspace)?;
-            let mut dense = inner_built
-                .design
-                .try_to_dense_by_chunks("by-variable smooth")
-                .map_err(BasisError::InvalidInput)?;
-            for i in 0..dense.nrows() {
-                let by_value = data[[i, *by_col]];
-                let multiplier = match kind {
-                    BySmoothKind::Numeric => by_value,
-                    BySmoothKind::Level { level_bits } => {
-                        if by_value.to_bits() == *level_bits {
-                            1.0
-                        } else {
-                            0.0
-                        }
-                    }
-                };
-                if multiplier == 0.0 {
-                    dense.row_mut(i).fill(0.0);
-                } else if multiplier != 1.0 {
-                    dense.row_mut(i).mapv_inplace(|v| v * multiplier);
-                }
-            }
-            inner_built.design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(dense));
-            inner_built.kronecker_factored = None;
-            return Ok(inner_built);
-        }
         SmoothBasisSpec::FactorSumToZero {
             inner,
             by_col,
