@@ -8587,7 +8587,6 @@ pub(crate) fn prefer_outer_hessian_operator(n: usize, p: usize, k: usize) -> boo
 /// Real fast HVP capability (a family-supplied directional θθ operator) is
 /// routed separately through `HessianDerivativeProvider::family_outer_hessian_operator`,
 /// which short-circuits this function entirely at the call site.
-#[expect(dead_code)]
 pub(crate) fn use_outer_hessian_operator_path(
     n: usize,
     p: usize,

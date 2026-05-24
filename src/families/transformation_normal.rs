@@ -244,7 +244,6 @@ pub(crate) struct CtnDenseHessianKey {
 }
 
 impl CtnDenseHessianKey {
-    #[expect(dead_code)]
     fn from(
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,
@@ -283,7 +282,6 @@ pub(crate) struct CtnPersistentDenseHessianCache {
 }
 
 impl CtnPersistentDenseHessianCache {
-    #[expect(dead_code)]
     fn get(&self, key: &CtnDenseHessianKey) -> Option<Arc<Array2<f64>>> {
         let slot = self
             .slot
@@ -298,7 +296,6 @@ impl CtnPersistentDenseHessianCache {
         })
     }
 
-    #[expect(dead_code)]
     fn install(&self, key: CtnDenseHessianKey, hessian: Arc<Array2<f64>>) {
         let mut slot = self
             .slot
@@ -390,7 +387,6 @@ pub struct TransformationNormalFamily {
     /// re-creation; keyed on the exact `(β bits, row_quantities version)`
     /// pair. See [`CtnPersistentDenseHessianCache`] for the access-pattern
     /// rationale (single-slot, not LRU).
-    #[expect(dead_code)]
     persistent_dense_hessian: Arc<CtnPersistentDenseHessianCache>,
     /// Optional outer-score Horvitz-Thompson per-row weights.
     ///
@@ -1346,7 +1342,6 @@ impl TransformationNormalFamily {
     /// Subsample-identity tag (`None` for full-data) used to key the
     /// row-quantity cache and `CtnDenseHessianKey`.
     #[inline]
-    #[expect(dead_code)]
     pub(crate) fn outer_subsample_tag(&self) -> Option<u64> {
         self.outer_subsample_hash
     }

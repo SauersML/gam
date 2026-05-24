@@ -682,7 +682,6 @@ impl NutsPosterior {
     ///
     /// Returns (log_posterior, gradientz) where gradientz is the gradient
     /// with respect to the whitened parameters z.
-    #[expect(dead_code)]
     fn compute_logp_and_grad_nd(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
         let mut residual = Array1::<f64>::zeros(self.data.n_samples);
         let mut grad = Array1::<f64>::zeros(z.len());
@@ -4255,7 +4254,6 @@ impl LinkWigglePosterior {
     }
 
     /// Compute log-posterior and gradient in whitened coordinates.
-    #[expect(dead_code)]
     fn compute_logp_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
         let dim = self.p_base + self.p_link;
         let mut grad = Array1::<f64>::zeros(dim);
@@ -5268,7 +5266,6 @@ impl JointBetaRhoPosterior {
     ///
     /// Parameter vector layout: [z_β (whitened, length n_beta); ρ (length n_rho);
     /// adaptive inverse-link params (length n_link_params)]
-    #[expect(dead_code)]
     fn compute_joint_logp_and_grad(&self, params: &Array1<f64>) -> (f64, Array1<f64>) {
         let total_dim = self.n_beta + self.n_rho + self.n_link_params;
         let mut grad = Array1::<f64>::zeros(total_dim);
