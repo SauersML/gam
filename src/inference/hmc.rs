@@ -30,7 +30,7 @@ use crate::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::estimate::{
     EstimationError, UnifiedFitResult, validate_explicit_dense_hessian_for_whitening,
 };
-use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv};
+use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv, fast_av_into};
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::matrix::DesignMatrix;
 use crate::solver::mixture_link::{
@@ -672,14 +672,17 @@ impl NutsPosterior {
     /// with respect to the whitened parameters z.
     fn compute_logp_and_grad_nd(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
         let mut residual = Array1::<f64>::zeros(self.data.n_samples);
-        self.compute_logp_and_grad_nd_into(z, &mut residual)
+        let mut grad = Array1::<f64>::zeros(z.len());
+        let logp = self.compute_logp_and_grad_nd_into(z, &mut residual, &mut grad);
+        (logp, grad)
     }
 
     fn compute_logp_and_grad_nd_into(
         &self,
         z: &Array1<f64>,
         residual: &mut Array1<f64>,
-    ) -> (f64, Array1<f64>) {
+        grad: &mut Array1<f64>,
+    ) -> f64 {
         // === Step 1: Transform z (whitened) -> β (original) ===
         // β = μ + L @ z
         let beta = self.data.mode.as_ref() + &self.chol.dot(z);
@@ -702,7 +705,8 @@ impl NutsPosterior {
                         "[NUTS/Firth] Jeffreys target became invalid at the current state: {}",
                         err
                     );
-                    return (f64::NEG_INFINITY, Array1::zeros(z.len()));
+                    grad.fill(0.0);
+                    return f64::NEG_INFINITY;
                 }
             }
         }
@@ -733,10 +737,10 @@ impl NutsPosterior {
 
         // === Step 5: z-space gradient ===
         // ∇z log p = L^T ∇_β ℓ  −  penalty_scale · (l + M z)
-        let mut gradz = self.chol_t.dot(&grad_ll_beta);
+        fast_av_into(&self.chol_t, &grad_ll_beta, grad);
         // gradz -= penalty_scale · (penalty_z_lin + M z); fused parallel update.
         let lin_view = self.penalty_z_lin.view();
-        ndarray::Zip::from(&mut gradz)
+        ndarray::Zip::from(grad)
             .and(&lin_view)
             .and(&mz)
             .par_for_each(|g, &l, &m| {
@@ -745,7 +749,7 @@ impl NutsPosterior {
 
         let logp = ll + firth_logdet - penalty;
 
-        (logp, gradz)
+        logp
     }
 
     fn family_logp_and_grad_into(
@@ -3029,9 +3033,7 @@ impl HamiltonianTarget<Array1<f64>> for NutsPosterior {
             if residual.len() != self.data.n_samples {
                 *residual = Array1::<f64>::zeros(self.data.n_samples);
             }
-            let (logp, gradz) = self.compute_logp_and_grad_nd_into(position, &mut *residual);
-            grad.assign(&gradz);
-            logp
+            self.compute_logp_and_grad_nd_into(position, &mut *residual, grad)
         })
     }
 }
@@ -4258,6 +4260,13 @@ impl LinkWigglePosterior {
     /// Compute log-posterior and gradient in whitened coordinates.
     fn compute_logp_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
         let dim = self.p_base + self.p_link;
+        let mut grad = Array1::<f64>::zeros(dim);
+        let logp = self.compute_logp_and_grad_into(z, &mut grad);
+        (logp, grad)
+    }
+
+    fn compute_logp_and_grad_into(&self, z: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
+        let dim = self.p_base + self.p_link;
 
         // Un-whiten: q = mode + L·z
         let mut mode = Array1::<f64>::zeros(dim);
@@ -4319,13 +4328,17 @@ impl LinkWigglePosterior {
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
                     if !(eta_i.is_finite() && (-700.0..=700.0).contains(&eta_i)) {
-                        return (f64::NEG_INFINITY, Array1::zeros(dim));
+                        grad.fill(0.0);
+                        return f64::NEG_INFINITY;
                     }
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
                     let (ll_i, residual_i) =
                         match cloglog_bernoulli_logp_and_residual(eta_i, y_i) {
                             Ok(values) => values,
-                            Err(_) => return (f64::NEG_INFINITY, Array1::zeros(dim)),
+                            Err(_) => {
+                                grad.fill(0.0);
+                                return f64::NEG_INFINITY;
+                            }
                         };
                     ll_acc += w_i * ll_i;
                     residual[i] = w_i * residual_i;
@@ -4337,7 +4350,8 @@ impl LinkWigglePosterior {
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
                     if !(eta_i.is_finite() && (-30.0..=30.0).contains(&eta_i)) {
-                        return (f64::NEG_INFINITY, Array1::zeros(dim));
+                        grad.fill(0.0);
+                        return f64::NEG_INFINITY;
                     }
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
                     let mu = eta_i.exp();
@@ -4351,13 +4365,15 @@ impl LinkWigglePosterior {
                 // Family mapping: Tweedie scale carries payload p; phi is not stored here.
                 // Invalid p makes the link-wiggle target invalid instead of defaulting.
                 if !is_valid_tweedie_power(self.scale) {
-                    return (f64::NEG_INFINITY, Array1::zeros(dim));
+                    grad.fill(0.0);
+                    return f64::NEG_INFINITY;
                 }
                 let p = self.scale;
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
                     if !(eta_i.is_finite() && (-30.0..=30.0).contains(&eta_i)) {
-                        return (f64::NEG_INFINITY, Array1::zeros(dim));
+                        grad.fill(0.0);
+                        return f64::NEG_INFINITY;
                     }
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
                     let mu = eta_i.exp().max(1e-300);
@@ -4373,13 +4389,15 @@ impl LinkWigglePosterior {
                 // Family mapping: NegativeBinomial scale carries payload theta.
                 // Invalid theta makes the link-wiggle target invalid instead of clamping.
                 if !(self.scale.is_finite() && self.scale > 0.0) {
-                    return (f64::NEG_INFINITY, Array1::zeros(dim));
+                    grad.fill(0.0);
+                    return f64::NEG_INFINITY;
                 }
                 let theta = self.scale;
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
                     if !(eta_i.is_finite() && (-30.0..=30.0).contains(&eta_i)) {
-                        return (f64::NEG_INFINITY, Array1::zeros(dim));
+                        grad.fill(0.0);
+                        return f64::NEG_INFINITY;
                     }
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
                     if w_i <= 0.0 {
@@ -4405,7 +4423,8 @@ impl LinkWigglePosterior {
                 for i in 0..self.n_samples {
                     let eta_i = eta[i];
                     if !(eta_i.is_finite() && (-30.0..=30.0).contains(&eta_i)) {
-                        return (f64::NEG_INFINITY, Array1::zeros(dim));
+                        grad.fill(0.0);
+                        return f64::NEG_INFINITY;
                     }
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
                     let mu = eta_i.exp();
@@ -4468,7 +4487,8 @@ impl LinkWigglePosterior {
         grad_q
             .slice_mut(ndarray::s![self.p_base..])
             .assign(&grad_theta);
-        (ll - penalty, self.chol_t.dot(&grad_q))
+        fast_av_into(&self.chol_t, &grad_q, grad);
+        ll - penalty
     }
 
     /// Get the Cholesky factor L for un-whitening samples.
@@ -4490,9 +4510,7 @@ impl LinkWigglePosterior {
 
 impl HamiltonianTarget<Array1<f64>> for LinkWigglePosterior {
     fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
-        let (logp, g) = self.compute_logp_and_grad(position);
-        grad.assign(&g);
-        logp
+        self.compute_logp_and_grad_into(position, grad)
     }
 }
 
@@ -5249,6 +5267,17 @@ impl JointBetaRhoPosterior {
     /// Parameter vector layout: [z_β (whitened, length n_beta); ρ (length n_rho);
     /// adaptive inverse-link params (length n_link_params)]
     fn compute_joint_logp_and_grad(&self, params: &Array1<f64>) -> (f64, Array1<f64>) {
+        let total_dim = self.n_beta + self.n_rho + self.n_link_params;
+        let mut grad = Array1::<f64>::zeros(total_dim);
+        let logp = self.compute_joint_logp_and_grad_into(params, &mut grad);
+        (logp, grad)
+    }
+
+    fn compute_joint_logp_and_grad_into(
+        &self,
+        params: &Array1<f64>,
+        out_grad: &mut Array1<f64>,
+    ) -> f64 {
         let n_beta = self.n_beta;
         let n_rho = self.n_rho;
         let n_link_params = self.n_link_params;
@@ -5265,7 +5294,8 @@ impl JointBetaRhoPosterior {
             Ok(link) => link,
             Err(err) => {
                 log::warn!("[Joint HMC] adaptive inverse-link parameters are invalid: {}", err);
-                return (f64::NEG_INFINITY, Array1::zeros(total_dim));
+                out_grad.fill(0.0);
+                return f64::NEG_INFINITY;
             }
         };
 
@@ -5289,7 +5319,8 @@ impl JointBetaRhoPosterior {
                     "[Joint HMC] likelihood target became invalid at the current state: {}",
                     err
                 );
-                return (f64::NEG_INFINITY, Array1::zeros(total_dim));
+                out_grad.fill(0.0);
+                return f64::NEG_INFINITY;
             }
         };
 
@@ -5305,7 +5336,8 @@ impl JointBetaRhoPosterior {
                         "[Joint HMC/Firth] Jeffreys target became invalid at the current state: {}",
                         err
                     );
-                    return (f64::NEG_INFINITY, Array1::zeros(total_dim));
+                    out_grad.fill(0.0);
+                    return f64::NEG_INFINITY;
                 }
             }
         }
@@ -5397,7 +5429,8 @@ impl JointBetaRhoPosterior {
                             "[Joint HMC] structural penalty logdet became invalid at the current state: {}",
                             err
                         );
-                        return (f64::NEG_INFINITY, Array1::zeros(total_dim));
+                        out_grad.fill(0.0);
+                        return f64::NEG_INFINITY;
                     }
                 }
             }
@@ -5428,7 +5461,8 @@ impl JointBetaRhoPosterior {
             }
             RhoPrior::Independent(priors) => {
                 if priors.len() != n_rho {
-                    return (f64::NEG_INFINITY, Array1::zeros(total_dim));
+                    out_grad.fill(0.0);
+                    return f64::NEG_INFINITY;
                 }
                 for k in 0..n_rho {
                     match &priors[k] {
@@ -5445,7 +5479,8 @@ impl JointBetaRhoPosterior {
                             grad_rho[k] += (*shape - 1.0) - *rate * lambda;
                         }
                         RhoPrior::Independent(_) => {
-                            return (f64::NEG_INFINITY, Array1::zeros(total_dim));
+                            out_grad.fill(0.0);
+                            return f64::NEG_INFINITY;
                         }
                     }
                 }
@@ -5458,24 +5493,26 @@ impl JointBetaRhoPosterior {
         // β-gradient in original space: ∇_β ℓ - S(ρ)β
         let grad_beta = &grad_ll_beta - &s_beta;
 
-        // Chain rule to whitened space: ∇_z = L' ∇_β
-        let grad_z = self.chol_t.dot(&grad_beta);
-
         // Combined gradient: [∇_z; ∇_ρ; ∇_link]
-        let mut grad = Array1::<f64>::zeros(total_dim);
-        grad.slice_mut(ndarray::s![..n_beta]).assign(&grad_z);
-        grad.slice_mut(ndarray::s![n_beta..n_beta + n_rho]).assign(&grad_rho);
-        grad.slice_mut(ndarray::s![n_beta + n_rho..]).assign(&grad_link);
+        crate::faer_ndarray::fast_av_view_into(
+            &self.chol_t,
+            &grad_beta,
+            out_grad.slice_mut(ndarray::s![..n_beta]),
+        );
+        out_grad
+            .slice_mut(ndarray::s![n_beta..n_beta + n_rho])
+            .assign(&grad_rho);
+        out_grad
+            .slice_mut(ndarray::s![n_beta + n_rho..])
+            .assign(&grad_link);
 
-        (logp, grad)
+        logp
     }
 }
 
 impl HamiltonianTarget<Array1<f64>> for JointBetaRhoPosterior {
     fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
-        let (logp, g) = self.compute_joint_logp_and_grad(position);
-        grad.assign(&g);
-        logp
+        self.compute_joint_logp_and_grad_into(position, grad)
     }
 }
 
@@ -5762,6 +5799,16 @@ mod survival_hmc {
 
         /// Compute log-posterior and gradient analytically.
         fn compute_logp_and_grad(&self, z: &Array1<f64>) -> Result<(f64, Array1<f64>), String> {
+            let mut grad = Array1::<f64>::zeros(z.len());
+            let logp = self.compute_logp_and_grad_into(z, &mut grad)?;
+            Ok((logp, grad))
+        }
+
+        fn compute_logp_and_grad_into(
+            &self,
+            z: &Array1<f64>,
+            grad: &mut Array1<f64>,
+        ) -> Result<f64, String> {
             let sampler_position = self.data.mode.as_ref() + &self.chol.dot(z);
             let state = self
                 .data
@@ -5770,8 +5817,8 @@ mod survival_hmc {
                 .map_err(|e| format!("Survival state update failed: {:?}", e))?;
             let logp = state.log_likelihood - state.penalty_term;
             let grad_beta = state.gradient.mapv(|g| -g);
-            let gradz = self.chol_t.dot(&grad_beta);
-            Ok((logp, gradz))
+            fast_av_into(&self.chol_t, &grad_beta, grad);
+            Ok(logp)
         }
 
         /// Get the Cholesky factor L for un-whitening samples
@@ -5787,11 +5834,8 @@ mod survival_hmc {
 
     impl HamiltonianTarget<Array1<f64>> for SurvivalPosterior {
         fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
-            match self.compute_logp_and_grad(position) {
-                Ok((logp, gradz)) => {
-                    grad.assign(&gradz);
-                    logp
-                }
+            match self.compute_logp_and_grad_into(position, grad) {
+                Ok(logp) => logp,
                 Err(e) => {
                     log::warn!("Survival posterior evaluation failed: {}", e);
                     grad.fill(0.0);
