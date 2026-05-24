@@ -266,18 +266,25 @@ impl Manifold for Euclidean {
     }
     fn vector_transport(
         &self,
-        _from: ArrayView1<f64>,
-        _to: ArrayView1<f64>,
-        _xi: ArrayViewMut1<f64>,
+        from: ArrayView1<f64>,
+        to: ArrayView1<f64>,
+        xi: ArrayViewMut1<f64>,
     ) {
+        drop(from);
+        drop(to);
+        drop(xi);
     }
     fn euclidean_to_riemannian_hess_vp(
         &self,
-        _p: ArrayView1<f64>,
-        _egrad: ArrayView1<f64>,
-        _ehess_vp: ArrayViewMut1<f64>,
-        _xi: ArrayView1<f64>,
+        p: ArrayView1<f64>,
+        egrad: ArrayView1<f64>,
+        ehess_vp: ArrayViewMut1<f64>,
+        xi: ArrayView1<f64>,
     ) {
+        drop(p);
+        drop(egrad);
+        drop(ehess_vp);
+        drop(xi);
         // Identity: no Weingarten correction in flat space.
     }
     fn name(&self) -> &str {
@@ -328,10 +335,11 @@ impl Manifold for Circle {
     }
     fn vector_transport(
         &self,
-        _from: ArrayView1<f64>,
+        from: ArrayView1<f64>,
         to: ArrayView1<f64>,
         xi: ArrayViewMut1<f64>,
     ) {
+        drop(from);
         // Projection approximation τ_{p→q}(ξ) = P_q(ξ) (proposal §4.4).
         // Safe even at antipodal endpoints since it does not divide by 1+<p,q>.
         self.project_tangent(to, xi);
@@ -438,10 +446,11 @@ impl Manifold for Sphere {
     }
     fn vector_transport(
         &self,
-        _from: ArrayView1<f64>,
+        from: ArrayView1<f64>,
         to: ArrayView1<f64>,
         xi: ArrayViewMut1<f64>,
     ) {
+        drop(from);
         // Projection transport (proposal §6.4). Cheap, stable, not exactly
         // isometric. Antipodal case (to ≈ -from) does not divide by zero
         // here — unlike exact geodesic transport which has a 1+<p,q>
@@ -707,10 +716,11 @@ impl Manifold for Torus {
     }
     fn vector_transport(
         &self,
-        _from: ArrayView1<f64>,
+        from: ArrayView1<f64>,
         to: ArrayView1<f64>,
         xi: ArrayViewMut1<f64>,
     ) {
+        drop(from);
         self.project_tangent(to, xi);
     }
     fn euclidean_to_riemannian_hess_vp(

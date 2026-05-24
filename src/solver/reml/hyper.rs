@@ -369,8 +369,9 @@ impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
     fn trace_projected_factor_cached(
         &self,
         factor: &Array2<f64>,
-        _cache: &super::unified::ProjectedFactorCache,
+        cache: &super::unified::ProjectedFactorCache,
     ) -> f64 {
+        drop(cache);
         // Forward: the wrapper's compute is the base op's GEMM trace plus
         // a single batched Firth correction; both already amortize work.
         self.trace_projected_factor(factor)

@@ -8763,7 +8763,8 @@ fn safe_beta_mu(mu: f64) -> f64 {
 }
 
 #[inline]
-fn working_derivatives_unsupported(_likelihood: GlmLikelihoodSpec) -> bool {
+fn working_derivatives_unsupported(likelihood: GlmLikelihoodSpec) -> bool {
+    drop(likelihood);
     false
 }
 

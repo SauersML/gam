@@ -488,9 +488,10 @@ impl AtomSelectionStrategy for EntropicSoftmax {
     fn backward(
         &self,
         free_amplitudes_row: ArrayView1<'_, f64>,
-        _code: &SparseAtomCode,
+        code: &SparseAtomCode,
         grad_a_row: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
+        drop(code);
         // Recompute softmax (cheap; alternative is to cache it in the code,
         // but that conflates the masked weights with the *unmasked* softmax
         // needed by the Jacobian).
@@ -502,10 +503,12 @@ impl AtomSelectionStrategy for EntropicSoftmax {
 impl AssignmentSparsityCoupling for EntropicSoftmax {
     fn penalty_value_and_grad(
         &self,
-        _penalty: &SparsityPenalty,
+        penalty: &SparsityPenalty,
         free_amplitudes_row: ArrayView1<'_, f64>,
-        _rho: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
     ) -> (f64, Array1<f64>) {
+        drop(penalty);
+        drop(rho);
         // Entropic-softmax does not consume the L¹ sparsity penalty
         // directly; the entropy regularisation lives inside the strategy
         // itself. We return zero contribution here (Piece 4 sees nothing
@@ -600,10 +603,11 @@ impl AtomSelectionStrategy for TopK {
 
     fn backward(
         &self,
-        _free_amplitudes_row: ArrayView1<'_, f64>,
+        free_amplitudes_row: ArrayView1<'_, f64>,
         code: &SparseAtomCode,
         grad_a_row: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
+        drop(free_amplitudes_row);
         self.backward_straight_through(code, grad_a_row)
     }
 }
@@ -611,10 +615,12 @@ impl AtomSelectionStrategy for TopK {
 impl AssignmentSparsityCoupling for TopK {
     fn penalty_value_and_grad(
         &self,
-        _penalty: &SparsityPenalty,
+        penalty: &SparsityPenalty,
         free_amplitudes_row: ArrayView1<'_, f64>,
-        _rho: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
     ) -> (f64, Array1<f64>) {
+        drop(penalty);
+        drop(rho);
         // Cardinality is enforced structurally; no smooth penalty consumed.
         let k = free_amplitudes_row.len();
         (0.0, Array1::<f64>::zeros(k))

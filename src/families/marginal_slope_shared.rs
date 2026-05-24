@@ -1212,7 +1212,8 @@ pub fn outer_row_indices(
 /// not by this scalar. Retained for backward-compatible tests over uniformly
 /// weighted masks (e.g. callers that build `OuterScoreSubsample::new`).
 #[inline]
-pub fn outer_score_scale(opts: &crate::custom_family::BlockwiseFitOptions, _n: usize) -> f64 {
+pub fn outer_score_scale(opts: &crate::custom_family::BlockwiseFitOptions, n: usize) -> f64 {
+    drop(n);
     match opts.outer_score_subsample.as_ref() {
         Some(s) => s.weight_scale,
         None => 1.0,

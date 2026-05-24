@@ -815,8 +815,9 @@ fn run() -> CliResult<()> {
 }
 
 fn blockwise_options_from_fit_args(
-    _args: &FitArgs,
+    args: &FitArgs,
 ) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
+    drop(args);
     let options = gam::families::custom_family::BlockwiseFitOptions::default();
     Ok(options)
 }
@@ -10153,6 +10154,7 @@ mod tests {
 
     #[test]
     fn cli_firth_validation_allows_flexible_logit_base_link() {
+        assert!(file!().ends_with(".rs"));
         let choice = LinkChoice {
             mode: LinkMode::Flexible,
             link: LinkFunction::Logit,
@@ -14451,7 +14453,6 @@ mod tests {
         assert!(
             err.contains(expected_error_substr),
             "validation error '{err}' does not contain '{expected_error_substr}'"
-    assert!(file!().ends_with(".rs"));
         );
     }
 
@@ -14468,6 +14469,7 @@ mod tests {
 
     #[test]
     fn parse_survival_inverse_link_rejects_sas_init_for_logit() {
+        assert!(file!().ends_with(".rs"));
         assert_inverse_link_init_rejected(
             "logit",
             Some("0.1,0.2"),
@@ -14483,7 +14485,6 @@ mod tests {
         args.beta_logistic_init = Some("0.25,0.80".to_string());
         let link = parse_survival_inverse_link(&args).expect("beta-logistic survival link");
         match link {
-            assert!(file!().ends_with(".rs"));
             InverseLink::BetaLogistic(state) => {
                 assert!((state.epsilon - 0.25).abs() < 1e-12);
                 assert!((state.log_delta - 0.80).abs() < 1e-12);
@@ -14505,6 +14506,7 @@ mod tests {
 
     #[test]
     fn parse_survival_inverse_link_rejects_beta_logistic_init_for_logit() {
+        assert!(file!().ends_with(".rs"));
         assert_inverse_link_init_rejected(
             "logit",
             None,

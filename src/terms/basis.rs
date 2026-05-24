@@ -2756,10 +2756,11 @@ pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usiz
 }
 
 pub fn assert_spatial_centers_below_biobank_cap(
-    _n: usize,
+    n: usize,
     d_pc: usize,
     centers: ArrayView2<'_, f64>,
 ) {
+    drop(n);
     assert_eq!(
         centers.ncols(),
         d_pc,
@@ -8632,7 +8633,7 @@ fn hessian_operator_eta2_entry(
 
 #[inline(always)]
 fn hessian_operator_eta_cross_entry(
-    _q: f64,
+    q: f64,
     t: f64,
     t_r: f64,
     t_rr: f64,
@@ -8648,6 +8649,7 @@ fn hessian_operator_eta_cross_entry(
     axis_b: usize,
     axis_c: usize,
 ) -> f64 {
+    drop(q);
     debug_assert_ne!(axis_i, axis_j);
     let i_is_b = usize::from(axis_i == axis_b) as f64;
     let i_is_c = usize::from(axis_i == axis_c) as f64;
@@ -13999,8 +14001,9 @@ pub fn create_matern_spline_basiswithworkspace(
     nu: MaternNu,
     include_intercept: bool,
     aniso_log_scales: Option<&[f64]>,
-    _workspace: &mut BasisWorkspace,
+    workspace: &mut BasisWorkspace,
 ) -> Result<MaternSplineBasis, BasisError> {
+    drop(workspace);
     let n = data.nrows();
     let d = data.ncols();
     let k = centers.nrows();
@@ -16943,7 +16946,7 @@ fn pure_duchon_axis_combinations(dim: usize) -> Vec<Vec<(usize, f64)>> {
 
 fn pure_duchon_reparameterize_penalty_axes(
     per_axis: Vec<(Vec<Array2<f64>>, Vec<Array2<f64>>)>,
-    _cross_pairs: Vec<(usize, usize)>,
+    cross_pairs: Vec<(usize, usize)>,
     cross_provider: AnisoPenaltyCrossProvider,
     dim: usize,
 ) -> (
@@ -16952,6 +16955,7 @@ fn pure_duchon_reparameterize_penalty_axes(
     Vec<(usize, usize)>,
     Option<AnisoPenaltyCrossProvider>,
 ) {
+    drop(cross_pairs);
     let free_dim = dim.saturating_sub(1).max(1);
     if dim <= 1 {
         let mut per_axis_iter = per_axis.into_iter();
@@ -24015,7 +24019,8 @@ pub mod closed_form_penalty {
     /// or `4(m+s) ≤ d`. The latter never coincides with the convergent
     /// regime of canonical TPS, so we use `d > 4m` as the dispatch gate.
     #[inline]
-    fn schwinger_radial_is_convergent(d: usize, m: usize, _s: usize) -> bool {
+    fn schwinger_radial_is_convergent(d: usize, m: usize, s: usize) -> bool {
+        drop(s);
         d > 4 * m
     }
 
