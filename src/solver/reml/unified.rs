@@ -7800,7 +7800,8 @@ pub fn reml_laml_evaluate(
                  projected-KKT residual the inner solver hands over), dispersion={} (must be \
                  `Fixed` for the LAML IFT identity to hold), penalty_subspace_trace.is_some()={} \
                  (when true the cost IFT uses bilinear_pseudo_inverse on range(S₊); when false \
-                 the full H⁻¹·r solve is the only path and is unsafe on near-singular H). \
+                 the full H⁻¹·r solve is the only path and is numerically unreliable on \
+                 near-singular H). \
                  If kkt_residual.is_some()=false under fixed dispersion, the convergent inner \
                  path forgot to populate `BlockwiseInnerResult::kkt_residual` (call \
                  `exact_newton_joint_kkt_residual_for_ift(..., Some(active_sets))` on return) \

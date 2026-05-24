@@ -472,7 +472,7 @@ fn install_panic_hook() {
                     "(log tail unavailable — visualizer locks contended)"
                 ));
             }
-            let _ = writeln!(io::stderr(), "=== end crash report ===\n");
+            drop(writeln!(io::stderr(), "=== end crash report ===\n"));
             prev(info);
         }));
     });
@@ -868,7 +868,7 @@ impl InteractiveVisualizer {
         self.maybe_draw(model, true);
         disable_raw_mode().ok();
         execute!(self.tty_for_teardown, LeaveAlternateScreen).ok();
-        let _ = self.tty_for_teardown.flush();
+        drop(self.tty_for_teardown.flush());
         clear_tty_handle();
     }
 }
@@ -903,7 +903,7 @@ impl DumbVisualizer {
             return;
         }
         self.last_lines = lines.clone();
-        let _ = lines;
+        drop(lines);
     }
 
     fn teardown(&mut self, model: &VisualizerModel) {
