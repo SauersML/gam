@@ -1,9 +1,9 @@
-//! GPU acceleration backend entry points.
+//! GPU acceleration facade.
 //!
-//! This module is deliberately available in CPU-only builds. CUDA discovery is
-//! dynamic and policy-gated, so the public fitting API can keep using the
-//! existing CPU implementation when CUDA is unavailable, disabled, too small
-//! for a kernel, or numerically unsuitable.
+//! The module is intentionally always compiled so CPU-only builds can expose a
+//! stable API and deterministic fallback behavior. CUDA-specific crates remain
+//! behind the optional `cuda` Cargo feature and runtime policy defaults to CPU
+//! unless a usable device is detected and the operation is large enough.
 
 pub mod device;
 pub mod kernels;
@@ -16,6 +16,6 @@ pub mod solver;
 pub mod sparse;
 pub mod stream;
 
-pub use device::{GpuCapability, GpuDeviceInfo, GpuSelection};
-pub use policy::{AccelPolicy, GpuDispatchPolicy, Operation};
-pub use runtime::{GpuRuntime, gpu_available, selected_gpu_info};
+pub use device::{GpuCapability, GpuDeviceInfo};
+pub use policy::{AccelPolicy, GpuDispatchPolicy, Operation, OperationDecision};
+pub use runtime::{ExecutionTarget, GpuContext, GpuRuntime, gpu_available, selected_gpu_info};

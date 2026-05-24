@@ -358,8 +358,10 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
-    if let Some(out) = crate::gpu::linalg::try_fast_ab(a, b) {
-        return out;
+    if crate::gpu::linalg::should_dispatch_gemm(a, b) {
+        if let Some(out) = crate::gpu::linalg::try_fast_ab(a, b) {
+            return out;
+        }
     }
     let (n, _) = a.dim();
     let (_, q) = b.dim();
@@ -387,6 +389,12 @@ pub fn fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let (n, p) = a.dim();
     debug_assert_eq!(p, v.len(), "A cols must match v length");
+
+    if crate::gpu::linalg::should_dispatch_gemv(a, v, false) {
+        if let Some(out) = crate::gpu::linalg::try_fast_av(a, v) {
+            return out;
+        }
+    }
 
     if !should_use_faer_matmul(n, 1, p) {
         return a.dot(v);
@@ -518,6 +526,12 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let (n, p) = a.dim();
     debug_assert_eq!(n, v.len(), "A rows must match v length");
 
+    if crate::gpu::linalg::should_dispatch_gemv(a, v, true) {
+        if let Some(out) = crate::gpu::linalg::try_fast_atv(a, v) {
+            return out;
+        }
+    }
+
     // For very small arrays, ndarray might be faster
     if !should_use_faer_matmul(p, 1, n) {
         return a.t().dot(v);
@@ -624,8 +638,10 @@ pub fn fast_xt_diag_x_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64
     if n == 0 || p == 0 {
         return Array2::<f64>::zeros((p, p));
     }
-    if let Some(out) = crate::gpu::try_fast_xt_diag_x(x, w) {
-        return out;
+    if crate::gpu::linalg::should_dispatch_xt_diag_x(n, p) {
+        if let Some(out) = crate::gpu::linalg::try_fast_xt_diag_x(x, w) {
+            return out;
+        }
     }
     if !should_use_faer_matmul(p, p, n) {
         let w_x = Array2::from_shape_fn((n, p), |(i, j)| w[i] * x[[i, j]]);
@@ -740,8 +756,10 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
     if n == 0 || px == 0 || q == 0 {
         return Array2::<f64>::zeros((px, q));
     }
-    if let Some(out) = crate::gpu::try_fast_xt_diag_y(x, w, y) {
-        return out;
+    if crate::gpu::linalg::should_dispatch_xt_diag_y(n, px, q) {
+        if let Some(out) = crate::gpu::linalg::try_fast_xt_diag_y(x, w, y) {
+            return out;
+        }
     }
     if !should_use_faer_matmul(px, q, n) {
         let w_y = Array2::from_shape_fn((n, q), |(i, j)| w[i] * y[[i, j]]);
@@ -852,6 +870,8 @@ pub fn fast_joint_hessian_2x2<
     if n == 0 || total == 0 {
         return Array2::<f64>::zeros((total, total));
     }
+
+    let _gpu_preferred = crate::gpu::linalg::should_dispatch_joint_hessian(n, pa, pb);
 
     // For small problems, fall back to separate computations
     if !should_use_faer_matmul(pa.max(pb), pa.max(pb), n) {
