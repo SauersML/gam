@@ -87,12 +87,11 @@ fn fit_predict_sparse(formula: &str) -> f64 {
         .map(|&t| (2.0 * PI * t).sin() + 0.3 * t)
         .collect();
     let mut worst = 0.0_f64;
-    for (i, &t) in probes.iter().enumerate() {
+    for i in 0..probes.len() {
         let dev = (pred[i] - truth[i]).abs();
         if dev > worst {
             worst = dev;
         }
-        let _ = t;
     }
     let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
     let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);

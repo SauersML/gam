@@ -87,6 +87,17 @@ impl ManifoldWarning {
     }
 }
 
+fn no_manifold_warning(p: ArrayView1<'_, f64>, ambient_dim: usize) -> Option<ManifoldWarning> {
+    match p.len().cmp(&ambient_dim) {
+        std::cmp::Ordering::Equal => None,
+        _ => panic!(
+            "manifold warning point dimension {} does not match ambient dimension {}",
+            p.len(),
+            ambient_dim
+        ),
+    }
+}
+
 /// Trait for a smooth manifold on which a per-point latent coordinate lives.
 ///
 /// Conventions:
@@ -162,8 +173,7 @@ pub trait Manifold: Send + Sync {
     /// Typed advisory sentinel — preferred over [`Manifold::warn_at`] for
     /// callers that route to a structured logger. Default returns `None`.
     fn warn_at_typed(&self, p: ArrayView1<f64>) -> Option<ManifoldWarning> {
-        assert_eq!(p.len(), self.ambient_dim());
-        None
+        no_manifold_warning(p, self.ambient_dim())
     }
 
     /// Orthonormal basis `Q ∈ ℝ^{m × d}` for the tangent space `T_p M`,

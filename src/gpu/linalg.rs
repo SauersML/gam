@@ -146,12 +146,9 @@ pub fn try_fast_abt_strided_batched(
 // free and returns Some(result) iff the GPU actually produced one. The CPU
 // fast path resumes on None.
 //
-// Under the default feature set there is no compiled backend, so every entry
-// point short-circuits to None after running the policy check (which itself
-// returns None today because `GpuRuntime::probe()` reports no device). The
-// architecture is in place so that wiring up cudarc inside `#[cfg(feature =
-// "cuda")]` blocks immediately accelerates every fast_* call site without
-// touching solver code.
+// CUDA kernels are compiled into the runtime through cudarc's dynamic loader.
+// Each entry point admits only profitable workloads, then returns `None` when
+// no CUDA runtime path is available or the backend reports failure.
 // ---------------------------------------------------------------------------
 
 #[inline]
@@ -245,15 +242,6 @@ pub fn try_fast_joint_hessian_2x2(
     cuda_backend::joint_hessian_2x2(runtime, x_a, x_b, w_aa, w_ab, w_bb)
 }
 
-// Per-call latency hint kept for future profile-driven decisions.
-#[derive(Clone, Debug)]
-pub enum GpuDispatch {
-    /// Caller should fall back to the CPU implementation.
-    Cpu,
-    /// A GPU dispatch executed; the result is carried by the variant.
-    Executed(Array2<f64>),
-}
-
 #[inline]
 #[must_use]
 pub fn should_dispatch_xt_diag_x(n: usize, p: usize) -> bool {
@@ -297,11 +285,7 @@ pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Optio
         p,
         batch: matrices.len(),
     })?;
-    for matrix in matrices {
-        let lower = cuda_backend::cholesky_lower(runtime, matrix.view())?;
-        *matrix = lower;
-    }
-    Some(())
+    cuda_backend::cholesky_batched_lower(runtime, matrices)
 }
 
 #[inline]
@@ -327,10 +311,8 @@ pub fn try_solve_upper_triangular_matrix(
 }
 
 // ---------------------------------------------------------------------------
-// Backend selection. Each fn below is either a stub (no cuda feature) or a
-// thin wrapper around cudarc-backed kernels (when cuda is enabled). The CPU
-// stub variant intentionally avoids touching its arguments so the call site
-// is dead-code-eliminated.
+// Backend selection. The wrappers keep CUDA types out of solver modules while
+// delegating to cudarc-backed BLAS, solver, and custom kernel implementations.
 // ---------------------------------------------------------------------------
 
 mod cuda_backend {
@@ -348,7 +330,7 @@ mod cuda_backend {
     use super::super::runtime::GpuRuntime;
     use crate::gpu::driver::{from_col_major, to_col_major, to_i32};
     use cudarc::cusolver::{DnHandle, sys as cusolver_sys};
-    use cudarc::driver::DevicePtrMut;
+    use cudarc::driver::{DevicePtrMut, sys as driver_sys};
 
     #[inline]
     pub(super) fn gemm(
@@ -454,6 +436,82 @@ mod cuda_backend {
             }
         }
         Some(lower)
+    }
+
+    #[inline]
+    pub(super) fn cholesky_batched_lower(
+        runtime: &GpuRuntime,
+        matrices: &mut [Array2<f64>],
+    ) -> Option<()> {
+        let first = matrices.first()?;
+        let p = first.nrows();
+        if p == 0 || first.ncols() != p || matrices.iter().any(|matrix| matrix.dim() != (p, p)) {
+            return None;
+        }
+
+        let stream = super::super::runtime::cuda_context_for(runtime.device.ordinal)?
+            .new_stream()
+            .ok()?;
+        let solver = DnHandle::new(stream.clone()).ok()?;
+        let matrix_len = p.checked_mul(p)?;
+        let mut batch_col = Vec::with_capacity(matrices.len().checked_mul(matrix_len)?);
+        for matrix in matrices.iter() {
+            batch_col.extend(to_col_major(&matrix.view()).iter().copied());
+        }
+        let mut matrices_dev = stream.clone_htod(&batch_col).ok()?;
+        let matrix_ptrs = {
+            let (base_ptr, _matrix_record) = matrices_dev.device_ptr_mut(&stream);
+            let bytes_per_matrix = driver_sys::CUdeviceptr::try_from(
+                matrix_len.checked_mul(std::mem::size_of::<f64>())?,
+            )
+            .ok()?;
+            let mut matrix_ptrs = Vec::with_capacity(matrices.len());
+            for idx in 0..matrices.len() {
+                let offset = driver_sys::CUdeviceptr::try_from(idx).ok()? * bytes_per_matrix;
+                matrix_ptrs.push(base_ptr + offset);
+            }
+            matrix_ptrs
+        };
+        let mut matrix_ptrs_dev = stream.clone_htod(&matrix_ptrs).ok()?;
+        let mut info_dev = stream.alloc_zeros::<i32>(matrices.len()).ok()?;
+        let p_i = to_i32(p)?;
+        let batch_i = to_i32(matrices.len())?;
+        {
+            let (ptrs_ptr, _ptrs_record) = matrix_ptrs_dev.device_ptr_mut(&stream);
+            let (info_ptr, _info_record) = info_dev.device_ptr_mut(&stream);
+            // SAFETY: `ptrs_ptr` points to a device array of batch pointers,
+            // each pointer targets a live p×p column-major matrix in
+            // `matrices_dev`, and `info_dev` has one entry per batch item.
+            let status = unsafe {
+                cusolver_sys::cusolverDnDpotrfBatched(
+                    solver.cu(),
+                    cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER,
+                    p_i,
+                    ptrs_ptr as *mut *mut f64,
+                    p_i,
+                    info_ptr as *mut i32,
+                    batch_i,
+                )
+            };
+            check_cusolver(status)?;
+        }
+        let info_host = stream.clone_dtoh(&info_dev).ok()?;
+        if info_host.iter().any(|info| *info != 0) {
+            return None;
+        }
+        let factored_col = stream.clone_dtoh(&matrices_dev).ok()?;
+        for (idx, matrix) in matrices.iter_mut().enumerate() {
+            let start = idx.checked_mul(matrix_len)?;
+            let end = start.checked_add(matrix_len)?;
+            let mut lower = from_col_major(&factored_col[start..end], p, p)?;
+            for row in 0..p {
+                for col in (row + 1)..p {
+                    lower[[row, col]] = 0.0;
+                }
+            }
+            *matrix = lower;
+        }
+        Some(())
     }
 
     fn potrf_lower_in_place(

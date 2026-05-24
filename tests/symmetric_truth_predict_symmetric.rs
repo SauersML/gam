@@ -19,8 +19,7 @@ use ndarray::Array2;
 
 fn build_symmetric_data(n_pairs: usize) -> gam::data::EncodedDataset {
     let f = |t: f64| (2.0 * std::f64::consts::PI * t).cos();
-    let mut headers: Vec<String> = vec!["x".into(), "y".into()];
-    let _ = &mut headers; // keep allocator quiet
+    let headers: Vec<String> = vec!["x".into(), "y".into()];
     let mut rows: Vec<StringRecord> = Vec::with_capacity(2 * n_pairs);
     for i in 0..n_pairs {
         let d = 0.001 + 0.498 * i as f64 / (n_pairs as f64 - 1.0);
@@ -76,14 +75,13 @@ fn symmetric_data_yields_symmetric_predictions() {
     for (label, body) in cases {
         let yhat = fit_predict(&format!("y ~ {body}"), &data, &x_test);
         let mut max_asym = 0.0_f64;
-        for (i, &d) in probes.iter().enumerate() {
+        for i in 0..probes.len() {
             let lhs = yhat[2 * i];
             let rhs = yhat[2 * i + 1];
             let asym = (lhs - rhs).abs();
             if asym > max_asym {
                 max_asym = asym;
             }
-            let _ = d;
         }
         eprintln!("[symmetric] {label:8} max_asym={max_asym:.4}");
         if max_asym > 0.02 {

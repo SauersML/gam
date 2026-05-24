@@ -131,7 +131,7 @@ fn sphere_lat_exactly_at_pole_accepts() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let _ = fit_from_formula("y ~ sphere(lat, lon, k=10)", &data, &cfg)
+    fit_from_formula("y ~ sphere(lat, lon, k=10)", &data, &cfg)
         .expect("lat=±90 exactly must be accepted as the pole");
 }
 

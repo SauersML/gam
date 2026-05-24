@@ -139,7 +139,7 @@ fn cross_check_designs(label: &str, candidate: &DesignMatrix, reference: &Array2
     eprintln!("[{label}] XᵀWX worst rel = {worst_gram:.3e}");
 }
 
-fn build_non_periodic_design(n: usize, seed: u64) -> (DesignMatrix, Array2<f64>) {
+fn build_non_periodic_design(n: usize) -> (DesignMatrix, Array2<f64>) {
     // Quasi-random x, h on [0, 1]² so each row's marginal supports differ.
     let mut data = Array2::<f64>::zeros((n, 2));
     let phi1: f64 = 0.6180339887498949;
@@ -210,7 +210,6 @@ fn build_non_periodic_design(n: usize, seed: u64) -> (DesignMatrix, Array2<f64>)
         .to_dense();
     let reference = khatri_rao_dense(&[x_basis, h_basis]);
 
-    let _ = seed;
     (candidate, reference)
 }
 
@@ -309,7 +308,7 @@ fn khatri_rao_dense(marginals: &[Array2<f64>]) -> Array2<f64> {
 fn sparse_tensor_design_matches_dense_non_periodic() {
     assert!(file!().ends_with(".rs"));
     let n = 1000;
-    let (candidate, reference) = build_non_periodic_design(n, 0xA5A5_5A5A_DEAD_BEEF);
+    let (candidate, reference) = build_non_periodic_design(n);
     cross_check_designs(
         "non-periodic te(x, h) sparse path",
         &candidate,
