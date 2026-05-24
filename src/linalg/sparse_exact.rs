@@ -987,6 +987,9 @@ fn factorize_simplicial_canonical_upper(
         })?;
     }
 
+    // SAFETY: perm_fwd and perm_inv were just populated by amd::order_maybe_unsorted
+    // above for a symmetric n×n matrix, so they form a valid mutually inverse
+    // permutation of 0..n required by PermRef::new_unchecked.
     let perm = unsafe { faer::perm::PermRef::new_unchecked(&perm_fwd, &perm_inv, n) };
 
     // 2. Permute to P A Pᵀ (upper-triangular, unsorted)
@@ -1008,6 +1011,11 @@ fn factorize_simplicial_canonical_upper(
             MemStack::new(&mut mem),
         );
         SparseColMat::<usize, f64>::new(
+            // SAFETY: col_ptrs and row_indices were just produced by
+            // faer::sparse::utils::permute_self_adjoint_to_unsorted from a
+            // valid n×n symbolic CSC, so they satisfy the CSC invariants
+            // (monotone col_ptrs in 0..=a_nnz, row indices in 0..n) that
+            // new_unchecked skips re-checking.
             unsafe { SymbolicSparseColMat::new_unchecked(n, n, col_ptrs, None, row_indices) },
             values,
         )
