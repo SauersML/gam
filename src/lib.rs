@@ -79,7 +79,7 @@ pub mod types;
 pub use data::{
     encode_recordswith_inferred_schema, load_csvwith_inferred_schema, load_csvwith_schema,
 };
-pub use gpu::{gpu_available, selected_gpu_info};
+pub use gpu::{GpuDecision, GpuPolicy, GpuWorkloadKind, GpuWorkloadShape};
 pub use inference::{
     alo, data, diagnostics, generative, hmc, predict, probability, quadrature, sample, smooth_test,
 };
