@@ -4658,28 +4658,37 @@ impl<'a> RemlState<'a> {
                 rank: 0,
             });
         }
-
-        let mut s_lambda = e_transformed.t().dot(e_transformed);
-        let ridge = ridge_passport.penalty_logdet_ridge();
-        if ridge > 0.0 {
-            for i in 0..p {
-                s_lambda[[i, i]] += ridge;
-            }
-        }
-        let (evals, evecs) = s_lambda
-            .eigh(Side::Lower)
-            .map_err(EstimationError::EigendecompositionFailed)?;
-        let rank = if self.canonical_penalties.is_empty() {
-            positive_penalty_rank_and_logdet(evals.as_slice().unwrap()).0
-        } else {
-            self.canonical_penalties
-                .iter()
-                .map(crate::construction::CanonicalPenalty::rank)
-                .sum::<usize>()
-                .min(p)
-        };
-
-        Ok(PenaltySubspace { evals, evecs, rank })
+        let cached = self.cache_manager.cached_penalty_subspace(
+            e_transformed,
+            &ridge_passport,
+            || {
+                let mut s_lambda = e_transformed.t().dot(e_transformed);
+                let ridge = ridge_passport.penalty_logdet_ridge();
+                if ridge > 0.0 {
+                    for i in 0..p {
+                        s_lambda[[i, i]] += ridge;
+                    }
+                }
+                let (evals, evecs) = s_lambda
+                    .eigh(Side::Lower)
+                    .map_err(EstimationError::EigendecompositionFailed)?;
+                let rank = if self.canonical_penalties.is_empty() {
+                    positive_penalty_rank_and_logdet(evals.as_slice().unwrap()).0
+                } else {
+                    self.canonical_penalties
+                        .iter()
+                        .map(crate::construction::CanonicalPenalty::rank)
+                        .sum::<usize>()
+                        .min(p)
+                };
+                Ok(PenaltySubspace { evals, evecs, rank })
+            },
+        )?;
+        Ok(PenaltySubspace {
+            evals: cached.evals.clone(),
+            evecs: cached.evecs.clone(),
+            rank: cached.rank,
+        })
     }
 
     fn fixed_subspace_penalty_rank_and_logdet_from_subspace(

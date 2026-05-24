@@ -60,7 +60,6 @@ use crate::solver::estimate::reml::unified::{
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use std::cell::RefCell;
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -289,15 +288,6 @@ pub struct TransformationNormalFamily {
     /// and reciprocal powers behind a single exact-keyed entry instead of
     /// recomputing `h`, `h'`, `1/h'`, and derivative powers per call.
     row_quantity_cache: Arc<Mutex<Option<TransformationNormalRowQuantityCache>>>,
-    /// Monotonic counter bumped each time a fresh row_quantity build is
-    /// installed. The value tags every freshly built
-    /// `TransformationNormalRowQuantityCache.version` so downstream caches
-    /// (the persistent dense-Hessian slot) can key on
-    /// `(beta_bits, row_quantities_version)` without re-hashing every row
-    /// quantity. Atomic so the counter survives `Family::clone` (the family
-    /// clones its `Arc<...>` interior state — version counts must be shared
-    /// across the same logical family instance).
-    row_quantity_version: Arc<AtomicU64>,
     /// Optional outer-score Horvitz-Thompson per-row weights.
     ///
     /// When present, this is an `n`-vector equal to the original `weights`
@@ -978,7 +968,6 @@ impl TransformationNormalFamily {
             response_upper_floor_offset,
             covariate_dense_cache: Arc::new(Mutex::new(None)),
             row_quantity_cache: Arc::new(Mutex::new(None)),
-            row_quantity_version: Arc::new(AtomicU64::new(0)),
             outer_subsample_weights: None,
         })
     }
@@ -1173,7 +1162,6 @@ impl TransformationNormalFamily {
             response_upper_floor_offset,
             covariate_dense_cache: Arc::new(Mutex::new(None)),
             row_quantity_cache: Arc::new(Mutex::new(None)),
-            row_quantity_version: Arc::new(AtomicU64::new(0)),
             outer_subsample_weights: None,
         })
     }
@@ -1296,7 +1284,6 @@ impl TransformationNormalFamily {
             // families: the row-quantity cache stores the LL (mask-dependent),
             // and the persistent dense Hessian is keyed on β alone.
             row_quantity_cache: Arc::new(Mutex::new(None)),
-            row_quantity_version: Arc::new(AtomicU64::new(0)),
             outer_subsample_weights: Some(Arc::new(effective)),
         })
     }
