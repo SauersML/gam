@@ -7770,16 +7770,20 @@ fn with_identifiability_transform(
             penalty_order,
             method,
             max_degree,
+            wahba_kernel,
             constraint_transform,
+            streaming_chunk_size,
         } => Ok(BasisMetadata::Sphere {
             centers: centers.clone(),
             penalty_order: *penalty_order,
             method: *method,
             max_degree: *max_degree,
+            wahba_kernel: *wahba_kernel,
             constraint_transform: compose_identifiability_transforms(
                 constraint_transform.as_ref(),
                 transform,
             )?,
+            streaming_chunk_size: *streaming_chunk_size,
         }),
         BasisMetadata::Matern {
             centers,
@@ -14785,12 +14789,14 @@ impl SingleBlockLatentCoordDesignCache {
                     centers,
                     penalty_order,
                     method,
+                    streaming_chunk_size,
                     ..
                 },
             ) if matches!(*method, crate::basis::SphereMethod::Wahba) => {
                 Ok(crate::solver::latent_cache::LatentBasisKind::Sphere {
                     centers: centers.clone(),
                     penalty_order: *penalty_order,
+                    chunk_size: *streaming_chunk_size,
                 })
             }
             (
@@ -16289,6 +16295,8 @@ pub fn freeze_term_collection_from_design(
                     penalty_order,
                     method,
                     max_degree,
+                    wahba_kernel,
+                    streaming_chunk_size,
                     ..
                 },
             ) => {
@@ -16296,6 +16304,8 @@ pub fn freeze_term_collection_from_design(
                 s.penalty_order = *penalty_order;
                 s.method = *method;
                 s.max_degree = *max_degree;
+                s.wahba_kernel = *wahba_kernel;
+                s.streaming_chunk_size = *streaming_chunk_size;
             }
             (
                 SmoothBasisSpec::Matern {

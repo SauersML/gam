@@ -3555,6 +3555,292 @@ impl DenseDesignOperator for StreamingMaternEvaluator {
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct StreamingSphereEvaluator {
+    data: Arc<Array2<f64>>,
+    centers: Arc<Array2<f64>>,
+    penalty_order: usize,
+    radians: bool,
+    wahba_kernel: SphereWahbaKernel,
+    constraint_transform: Option<Arc<Array2<f64>>>,
+    sin_lat_c: Arc<[f64]>,
+    cos_lat_c: Arc<[f64]>,
+    sin_lon_c: Arc<[f64]>,
+    cos_lon_c: Arc<[f64]>,
+    chunk_size: usize,
+    total_cols: usize,
+}
+
+impl StreamingSphereEvaluator {
+    pub(crate) fn new(
+        data: Arc<Array2<f64>>,
+        centers: Arc<Array2<f64>>,
+        penalty_order: usize,
+        radians: bool,
+        wahba_kernel: SphereWahbaKernel,
+        constraint_transform: Option<Arc<Array2<f64>>>,
+        chunk_size: Option<usize>,
+    ) -> Result<Self, String> {
+        validate_lat_lon_matrix(data.view(), "StreamingSphereEvaluator data", radians)
+            .map_err(|e| e.to_string())?;
+        validate_lat_lon_matrix(centers.view(), "StreamingSphereEvaluator centers", radians)
+            .map_err(|e| e.to_string())?;
+        if !(1..=4).contains(&penalty_order) {
+            return Err(format!(
+                "StreamingSphereEvaluator: penalty_order must be one of 1, 2, 3, 4; got {penalty_order}"
+            ));
+        }
+        if let Some(z) = constraint_transform.as_ref() {
+            if z.nrows() != centers.nrows() {
+                return Err(format!(
+                    "StreamingSphereEvaluator: constraint transform rows {} != centers {}",
+                    z.nrows(),
+                    centers.nrows()
+                ));
+            }
+        }
+        let deg = if radians {
+            1.0
+        } else {
+            std::f64::consts::PI / 180.0
+        };
+        let mut sin_lat_c = Vec::<f64>::with_capacity(centers.nrows());
+        let mut cos_lat_c = Vec::<f64>::with_capacity(centers.nrows());
+        let mut sin_lon_c = Vec::<f64>::with_capacity(centers.nrows());
+        let mut cos_lon_c = Vec::<f64>::with_capacity(centers.nrows());
+        for c in centers.outer_iter() {
+            let (s_lat, c_lat) = (c[0] * deg).sin_cos();
+            let (s_lon, c_lon) = (c[1] * deg).sin_cos();
+            sin_lat_c.push(s_lat);
+            cos_lat_c.push(c_lat);
+            sin_lon_c.push(s_lon);
+            cos_lon_c.push(c_lon);
+        }
+        let total_cols = constraint_transform
+            .as_ref()
+            .map_or(centers.nrows(), |z| z.ncols());
+        Ok(Self {
+            data: Arc::new(data.as_standard_layout().to_owned()),
+            centers: Arc::new(centers.as_standard_layout().to_owned()),
+            penalty_order,
+            radians,
+            wahba_kernel,
+            constraint_transform,
+            sin_lat_c: Arc::from(sin_lat_c),
+            cos_lat_c: Arc::from(cos_lat_c),
+            sin_lon_c: Arc::from(sin_lon_c),
+            cos_lon_c: Arc::from(cos_lon_c),
+            chunk_size: chunk_size.unwrap_or(2048).max(1),
+            total_cols,
+        })
+    }
+
+    fn chunk_rows(&self) -> usize {
+        self.chunk_size.min(self.data.nrows().max(1))
+    }
+
+    fn raw_kernel_chunk(&self, rows: Range<usize>) -> Array2<f64> {
+        let chunk_n = rows.end - rows.start;
+        let k = self.centers.nrows();
+        let deg = if self.radians {
+            1.0
+        } else {
+            std::f64::consts::PI / 180.0
+        };
+        let mut values = vec![0.0_f64; chunk_n * k];
+        values
+            .par_chunks_mut(k)
+            .enumerate()
+            .for_each(|(local, out_row)| {
+                use wide::f64x4;
+                let row = rows.start + local;
+                let lat = self.data[[row, 0]] * deg;
+                let lon = self.data[[row, 1]] * deg;
+                let (sin_lat, cos_lat) = lat.sin_cos();
+                let (sin_lon, cos_lon) = lon.sin_cos();
+                let sin_lat_v = f64x4::from(sin_lat);
+                let cos_lat_v = f64x4::from(cos_lat);
+                let sin_lon_v = f64x4::from(sin_lon);
+                let cos_lon_v = f64x4::from(cos_lon);
+                for cidx in 0..(k / 4) {
+                    let base = cidx * 4;
+                    let sl_c = f64x4::from([
+                        self.sin_lat_c[base],
+                        self.sin_lat_c[base + 1],
+                        self.sin_lat_c[base + 2],
+                        self.sin_lat_c[base + 3],
+                    ]);
+                    let cl_c = f64x4::from([
+                        self.cos_lat_c[base],
+                        self.cos_lat_c[base + 1],
+                        self.cos_lat_c[base + 2],
+                        self.cos_lat_c[base + 3],
+                    ]);
+                    let sn_c = f64x4::from([
+                        self.sin_lon_c[base],
+                        self.sin_lon_c[base + 1],
+                        self.sin_lon_c[base + 2],
+                        self.sin_lon_c[base + 3],
+                    ]);
+                    let cn_c = f64x4::from([
+                        self.cos_lon_c[base],
+                        self.cos_lon_c[base + 1],
+                        self.cos_lon_c[base + 2],
+                        self.cos_lon_c[base + 3],
+                    ]);
+                    let dlon_cos = cos_lon_v * cn_c + sin_lon_v * sn_c;
+                    let cos_gamma = sin_lat_v * sl_c + cos_lat_v * cl_c * dlon_cos;
+                    let arr = wahba_sphere_kernel_from_cos_simd_kind(
+                        cos_gamma,
+                        self.penalty_order,
+                        self.wahba_kernel,
+                    )
+                    .to_array();
+                    out_row[base..base + 4].copy_from_slice(&arr);
+                }
+                let tail_start = (k / 4) * 4;
+                for j in tail_start..k {
+                    let dlon_cos = cos_lon * self.cos_lon_c[j] + sin_lon * self.sin_lon_c[j];
+                    let cos_gamma =
+                        sin_lat * self.sin_lat_c[j] + cos_lat * self.cos_lat_c[j] * dlon_cos;
+                    out_row[j] = wahba_sphere_kernel_from_cos_kind(
+                        cos_gamma,
+                        self.penalty_order,
+                        self.wahba_kernel,
+                    )
+                    .expect("validated sphere kernel inputs should not fail");
+                }
+            });
+        Array2::from_shape_vec((chunk_n, k), values)
+            .expect("StreamingSphereEvaluator chunk shape should match generated values")
+    }
+
+    pub(crate) fn for_row_chunk(&self, start: usize, end: usize) -> Array2<f64> {
+        assert!(
+            start <= end && end <= self.data.nrows(),
+            "StreamingSphereEvaluator row chunk out of bounds"
+        );
+        let raw = self.raw_kernel_chunk(start..end);
+        match self.constraint_transform.as_ref() {
+            Some(z) => fast_ab(&raw, z),
+            None => raw,
+        }
+    }
+
+    pub(crate) fn gradient_into(&self, theta: ArrayView1<'_, f64>, output: &mut Array1<f64>) {
+        assert_eq!(
+            theta.len(),
+            self.total_cols,
+            "StreamingSphereEvaluator theta width mismatch"
+        );
+        assert_eq!(
+            output.len(),
+            self.data.nrows(),
+            "StreamingSphereEvaluator output length mismatch"
+        );
+        output.fill(0.0);
+        for start in (0..self.data.nrows()).step_by(self.chunk_rows()) {
+            let end = (start + self.chunk_rows()).min(self.data.nrows());
+            let chunk = self.for_row_chunk(start, end);
+            let values = chunk.dot(&theta);
+            output.slice_mut(s![start..end]).assign(&values);
+        }
+    }
+}
+
+impl LinearOperator for StreamingSphereEvaluator {
+    fn nrows(&self) -> usize {
+        self.data.nrows()
+    }
+
+    fn ncols(&self) -> usize {
+        self.total_cols
+    }
+
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.nrows());
+        self.gradient_into(vector.view(), &mut out);
+        out
+    }
+
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        assert_eq!(
+            vector.len(),
+            self.nrows(),
+            "StreamingSphereEvaluator transpose vector length mismatch"
+        );
+        let mut out = Array1::<f64>::zeros(self.ncols());
+        for start in (0..self.nrows()).step_by(self.chunk_rows()) {
+            let end = (start + self.chunk_rows()).min(self.nrows());
+            let chunk = self.for_row_chunk(start, end);
+            let partial = chunk.t().dot(&vector.slice(s![start..end]));
+            out += &partial;
+        }
+        out
+    }
+
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if weights.len() != self.nrows() {
+            return Err(format!(
+                "StreamingSphereEvaluator diag_xtw_x weight length mismatch: weights={}, nrows={}",
+                weights.len(),
+                self.nrows()
+            ));
+        }
+        let p = self.ncols();
+        let chunk_rows = self.chunk_rows();
+        let starts = (0..self.nrows()).step_by(chunk_rows).collect::<Vec<_>>();
+        Ok(starts
+            .into_par_iter()
+            .fold(
+                || Array2::<f64>::zeros((p, p)),
+                |mut acc, start| {
+                    let end = (start + chunk_rows).min(self.nrows());
+                    let chunk = self.for_row_chunk(start, end);
+                    let mut weighted = chunk.clone();
+                    for local in 0..(end - start) {
+                        let w = weights[start + local];
+                        weighted.row_mut(local).mapv_inplace(|v| v * w);
+                    }
+                    acc += &chunk.t().dot(&weighted);
+                    acc
+                },
+            )
+            .reduce(
+                || Array2::<f64>::zeros((p, p)),
+                |mut a, b| {
+                    a += &b;
+                    a
+                },
+            ))
+    }
+}
+
+impl DenseDesignOperator for StreamingSphereEvaluator {
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if rows.end > self.nrows() || rows.start > rows.end {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "StreamingSphereEvaluator row range out of bounds",
+            });
+        }
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "StreamingSphereEvaluator row_chunk_into shape mismatch",
+            });
+        }
+        out.assign(&self.for_row_chunk(rows.start, rows.end));
+        Ok(())
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        self.for_row_chunk(0, self.nrows())
+    }
+}
+
 /// Data stored for streaming (on-the-fly) recomputation of radial jet scalars.
 /// Instead of persisting O(n*k*(d+2)) arrays, the operator stores the original
 /// data/centers/eta and recomputes q/t/s per chunk during matvec operations.
@@ -15147,6 +15433,11 @@ pub fn build_spherical_spline_basis(
     spec: &SphericalSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
     if matches!(spec.method, SphereMethod::Harmonic) {
+        if spec.streaming_chunk_size.is_some() {
+            return Err(BasisError::InvalidInput(
+                "streaming_chunk_size is only supported for Wahba sphere bases".to_string(),
+            ));
+        }
         return build_spherical_harmonic_basis(data, spec);
     }
     validate_lat_lon_matrix(data, "spherical spline", spec.radians)?;
@@ -15168,18 +15459,44 @@ pub fn build_spherical_spline_basis(
             found: centers.nrows(),
         });
     }
-    let raw_design =
-        spherical_wahba_kernel_matrix(data, centers.view(), spec.penalty_order, spec.radians)?;
-    let raw_penalty = spherical_wahba_kernel_matrix(
+    let raw_penalty = spherical_wahba_kernel_matrix_with_kind(
         centers.view(),
         centers.view(),
         spec.penalty_order,
         spec.radians,
+        spec.wahba_kernel,
     )?;
     let weights = sphere_area_weights(centers.view(), spec.radians);
     let z = weighted_coefficient_sum_to_zero_transform(weights.view())?;
-    let design = raw_design.dot(&z);
     let penalty = z.t().dot(&raw_penalty).dot(&z);
+    let design = if spec.streaming_chunk_size.is_some() {
+        log::info!(
+            "Sphere basis using explicit streaming evaluator: n={} p={} chunk_size={}",
+            data.nrows(),
+            z.ncols(),
+            spec.streaming_chunk_size.unwrap_or(2048).max(1),
+        );
+        let op = StreamingSphereEvaluator::new(
+            Arc::new(data.as_standard_layout().to_owned()),
+            Arc::new(centers.clone()),
+            spec.penalty_order,
+            spec.radians,
+            spec.wahba_kernel,
+            Some(Arc::new(z.clone())),
+            spec.streaming_chunk_size,
+        )
+        .map_err(BasisError::InvalidInput)?;
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op)))
+    } else {
+        let raw_design = spherical_wahba_kernel_matrix_with_kind(
+            data,
+            centers.view(),
+            spec.penalty_order,
+            spec.radians,
+            spec.wahba_kernel,
+        )?;
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(raw_design.dot(&z)))
+    };
     let (penalty_norm, c_primary) = normalize_penalty(&((&penalty + &penalty.t()) * 0.5));
     let mut candidates = vec![PenaltyCandidate {
         matrix: penalty_norm,
@@ -15204,7 +15521,7 @@ pub fn build_spherical_spline_basis(
     let (penalties, nullspace_dims, penaltyinfo, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
-        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+        design,
         penalties,
         nullspace_dims,
         penaltyinfo,
@@ -15213,7 +15530,9 @@ pub fn build_spherical_spline_basis(
             penalty_order: spec.penalty_order,
             method: SphereMethod::Wahba,
             max_degree: None,
+            wahba_kernel: spec.wahba_kernel,
             constraint_transform: Some(z),
+            streaming_chunk_size: spec.streaming_chunk_size,
         },
         kronecker_factored: None,
         ops,
@@ -15453,7 +15772,9 @@ fn build_spherical_harmonic_basis(
             penalty_order: spec.penalty_order,
             method: SphereMethod::Harmonic,
             max_degree: Some(l_max),
+            wahba_kernel: spec.wahba_kernel,
             constraint_transform: None,
+            streaming_chunk_size: None,
         },
         kronecker_factored: None,
         ops,
