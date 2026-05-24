@@ -3282,6 +3282,15 @@ pub enum BasisMetadata {
         periods: Vec<Option<f64>>,
         identifiability_transform: Option<Array2<f64>>,
     },
+    FactorSmooth {
+        continuous_cols: Vec<usize>,
+        group_col: usize,
+        knots: Array1<f64>,
+        degree: usize,
+        periodic: Option<(f64, f64, usize)>,
+        group_levels: Vec<u64>,
+        flavour: String,
+    },
 }
 
 pub fn pca_center_mean(data: ArrayView2<'_, f64>) -> Result<Array1<f64>, BasisError> {
