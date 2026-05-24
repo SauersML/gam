@@ -80,6 +80,7 @@ pub(crate) struct KahanSum {
 }
 
 impl KahanSum {
+    #[inline]
     pub(crate) fn add(&mut self, value: f64) {
         let y = value - self.c;
         let t = self.sum + y;
@@ -87,6 +88,7 @@ impl KahanSum {
         self.sum = t;
     }
 
+    #[inline]
     pub(crate) fn sum(self) -> f64 {
         self.sum
     }
