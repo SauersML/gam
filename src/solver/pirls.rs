@@ -13743,7 +13743,7 @@ mod root_cause_tests {
             arrow_schur: None,
         };
 
-        let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
+        let (result, trace) = capture_pirls_penalized_deviance(|| {
             fit_model_for_fixed_rho(
                 LogSmoothingParamsView::new(rho.view()),
                 PirlsProblem {
@@ -13826,7 +13826,7 @@ mod root_cause_tests {
             arrow_schur: None,
         };
 
-        let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
+        let (result, trace) = capture_pirls_penalized_deviance(|| {
             fit_model_for_fixed_rho(
                 LogSmoothingParamsView::new(rho.view()),
                 PirlsProblem {
@@ -13928,7 +13928,7 @@ mod root_cause_tests {
                 arrow_schur: None,
             };
 
-            let (result, trace) = super::test_support::capture_pirls_penalized_deviance(|| {
+            let (result, trace) = capture_pirls_penalized_deviance(|| {
                 fit_model_for_fixed_rho(
                     LogSmoothingParamsView::new(rho.view()),
                     PirlsProblem {
