@@ -9537,7 +9537,7 @@ fn computeworkingweight_derivatives_from_eta(
         ResponseFamily::Gaussian => {
             dmu_deta.fill(1.0);
         }
-        GlmFamily::PoissonLog => {
+        ResponseFamily::Poisson => {
             const MIN_WEIGHT: f64 = 1e-12;
             // Per-row independent: jet/weight depend only on eta[i] and
             // priorweights[i]. Parallel write into the five output slices
@@ -9580,7 +9580,8 @@ fn computeworkingweight_derivatives_from_eta(
                     },
                 )?;
         }
-        GlmFamily::Tweedie { p } => {
+        ResponseFamily::Tweedie { p } => {
+            let p = *p;
             const MIN_WEIGHT: f64 = 1e-12;
             if !is_valid_tweedie_power(p) {
                 return Err(EstimationError::InvalidInput(format!(
@@ -9640,7 +9641,8 @@ fn computeworkingweight_derivatives_from_eta(
                     },
                 )?;
         }
-        GlmFamily::NegativeBinomial { theta } => {
+        ResponseFamily::NegativeBinomial { theta } => {
+            let theta = *theta;
             const MIN_WEIGHT: f64 = 1e-12;
             if !valid_negbin_theta(theta) {
                 return Err(EstimationError::InvalidInput(format!(
@@ -9691,7 +9693,8 @@ fn computeworkingweight_derivatives_from_eta(
                     },
                 )?;
         }
-        GlmFamily::BetaLogit { phi } => {
+        ResponseFamily::Beta { phi } => {
+            let phi = *phi;
             const MIN_WEIGHT: f64 = 1e-12;
             if !valid_beta_phi(phi) {
                 return Err(EstimationError::InvalidInput(format!(
@@ -9748,7 +9751,7 @@ fn computeworkingweight_derivatives_from_eta(
                     *d3_o = q * (1.0 - 6.0 * q);
                 });
         }
-        GlmFamily::GammaLog => {
+        ResponseFamily::Gamma => {
             let dmu_s = dmu_deta
                 .as_slice_mut()
                 .expect("dmu_deta must be contiguous");
@@ -9774,12 +9777,7 @@ fn computeworkingweight_derivatives_from_eta(
                     },
                 )?;
         }
-        GlmFamily::BinomialLogit
-        | GlmFamily::BinomialProbit
-        | GlmFamily::BinomialCLogLog
-        | GlmFamily::BinomialSas
-        | GlmFamily::BinomialBetaLogistic
-        | GlmFamily::BinomialMixture => {
+        ResponseFamily::Binomial => {
             let link = inverse_link.link_function();
             // On logit geometry, freeze higher η-derivatives in nonsmooth
             // regions so PIRLS and outer derivative code differentiate the
@@ -9851,6 +9849,11 @@ fn computeworkingweight_derivatives_from_eta(
                         Ok(())
                     },
                 )?;
+        }
+        ResponseFamily::RoystonParmar => {
+            return Err(EstimationError::InvalidInput(
+                "RoystonParmar is survival-specific and not a GLM IRLS family".to_string(),
+            ));
         }
     }
     Ok((c, d, dmu_deta, d2mu_deta2, d3mu_deta3))
