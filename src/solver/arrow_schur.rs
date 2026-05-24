@@ -645,9 +645,10 @@ impl ArrowSchurSystem {
     /// off-row Hessian blocks are rejected because the arrow representation
     /// has no place to store them. The supported row-block-only Psi-tier
     /// penalties are `ARDPenalty`, `SparsityPenalty`,
-    /// `SoftmaxAssignmentSparsity`, and `IBPAssignment`. Dense Beta-tier
-    /// penalties still fall back to `hvp` probes against the canonical basis
-    /// vectors for `β`.
+    /// `SoftmaxAssignmentSparsity`, `IBPAssignment`,
+    /// `AuxConditionalPrior`, `ParametricAuxConditionalPrior`, and
+    /// `ScadMcpPenalty`. Dense Beta-tier penalties still fall back to `hvp`
+    /// probes against the canonical basis vectors for `β`.
     ///
     /// `target_t` is the full flat latent-coordinate vector (row-major, `N·d` entries)
     /// at the current iterate; `target_beta` is the current `β`. `rho`
