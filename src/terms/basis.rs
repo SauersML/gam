@@ -6927,7 +6927,17 @@ pub fn build_bspline_basis_1d(
                     Some(z),
                 )
             }
-            _ => unreachable!("sparse B-spline identifiability only supports sum-to-zero"),
+            BSplineIdentifiability::RemoveLinearTrend
+            | BSplineIdentifiability::OrthogonalToDesignColumns { .. }
+            | BSplineIdentifiability::FrozenTransform { .. } => {
+                return Err(BasisError::InvalidInput(
+                    "sparse B-spline identifiability only supports None or \
+                     WeightedSumToZero; RemoveLinearTrend, \
+                     OrthogonalToDesignColumns, and FrozenTransform require \
+                     the dense path"
+                        .to_string(),
+                ));
+            }
         }
     } else {
         if !spec.boundary_conditions.is_free()
@@ -16121,7 +16131,10 @@ fn periodic_duchon_identifiability_transformwithworkspace(
             identifiability_transform,
             ..
         } => Ok(identifiability_transform),
-        _ => unreachable!("periodic Duchon builder returns Duchon metadata"),
+        other => Err(BasisError::InvalidInput(format!(
+            "periodic Duchon builder must return Duchon metadata, got {:?}",
+            std::mem::discriminant(&other)
+        ))),
     }
 }
 
