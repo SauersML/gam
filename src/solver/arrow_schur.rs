@@ -2017,6 +2017,12 @@ fn cholesky_lower(a: &Array2<f64>) -> Result<Array2<f64>, String> {
     if a.ncols() != n {
         return Err(format!("cholesky_lower: non-square {}×{}", n, a.ncols()));
     }
+    if let Some((idx, _)) = a.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+        return Err(format!(
+            "cholesky_lower: non-finite entry at linear index {idx}"
+        ));
+    }
+
     let mut l = Array2::<f64>::zeros((n, n));
     for i in 0..n {
         for j in 0..=i {
@@ -2025,7 +2031,7 @@ fn cholesky_lower(a: &Array2<f64>) -> Result<Array2<f64>, String> {
                 sum -= l[[i, kk]] * l[[j, kk]];
             }
             if i == j {
-                if sum <= 0.0 {
+                if !sum.is_finite() || sum <= 0.0 {
                     return Err(format!(
                         "non-PD pivot {sum} at index {i} (matrix is not positive definite)"
                     ));
@@ -2158,10 +2164,21 @@ pub struct PerPointDataHessianOptions {
 impl Default for PerPointDataHessianOptions {
     fn default() -> Self {
         Self {
-            include_residual_curvature: true,
+            include_residual_curvature: false,
             symmetrize_output: true,
         }
     }
+}
+
+fn ensure_finite_values<'a>(
+    caller: &str,
+    name: &str,
+    mut values: impl Iterator<Item = &'a f64>,
+) -> Result<(), String> {
+    if values.any(|v| !v.is_finite()) {
+        return Err(format!("{caller}: {name} contains non-finite value"));
+    }
+    Ok(())
 }
 
 /// Flatten a `(block, basis_col α, output_col s)` triple into the shared
@@ -2235,6 +2252,12 @@ pub fn assemble_per_point_data_hessian_block(
             out.dim()
         ));
     }
+    ensure_finite_values("assemble_per_point_data_hessian_block", "phi_jacobian", phi_jacobian.iter())?;
+    ensure_finite_values("assemble_per_point_data_hessian_block", "phi_hessian", phi_hessian.iter())?;
+    ensure_finite_values("assemble_per_point_data_hessian_block", "beta", beta.iter())?;
+    ensure_finite_values("assemble_per_point_data_hessian_block", "residual", residual.iter())?;
+    ensure_finite_values("assemble_per_point_data_hessian_block", "weight_u", weight_u.iter())?;
+    ensure_finite_values("assemble_per_point_data_hessian_block", "out", out.iter())?;
 
     // Gauss-Newton: A then B then BBᵀ.
     if q_i > 0 {
@@ -2415,6 +2438,12 @@ pub fn assemble_t_beta_cross_tensor_same_block(
             out.dim()
         ));
     }
+    ensure_finite_values("assemble_t_beta_cross_tensor_same_block", "phi", phi.iter())?;
+    ensure_finite_values("assemble_t_beta_cross_tensor_same_block", "phi_jacobian", phi_jacobian.iter())?;
+    ensure_finite_values("assemble_t_beta_cross_tensor_same_block", "beta", beta.iter())?;
+    ensure_finite_values("assemble_t_beta_cross_tensor_same_block", "residual", residual.iter())?;
+    ensure_finite_values("assemble_t_beta_cross_tensor_same_block", "weight_u", weight_u.iter())?;
+    ensure_finite_values("assemble_t_beta_cross_tensor_same_block", "out", out.iter())?;
 
     if q_i == 0 {
         // No data-fit weight: cross tensor identically zero for the
@@ -2492,6 +2521,183 @@ pub fn assemble_t_beta_cross_tensor_same_block(
     Ok(())
 }
 
+/// Assemble the full per-point `H_tβ` slab for one active latent block and
+/// all shared β blocks.
+///
+/// For active decoder block `k`, this increments
+///
+/// ```text
+/// H_{t_{ik,a},β_{mγv}} =
+///     φ_{imγ} (W_i A_{ik,a})_v - 1_{m=k} J_{ikγa} (W_i r_i)_v
+/// ```
+///
+/// where `A_{ik,a,s} = Σ_α J_{ikαa} β_{kαs}` and `W_i = U_i U_iᵀ`.
+/// Unlike [`assemble_t_beta_cross_tensor_same_block`], this fills every
+/// β block in the shared slab because every decoder block changes the same
+/// residual.
+pub fn assemble_t_beta_cross_slab(
+    active_phi_jacobian: ndarray::ArrayView2<'_, f64>,
+    active_beta: ndarray::ArrayView2<'_, f64>,
+    all_phi_rows: &[ndarray::ArrayView1<'_, f64>],
+    residual: ndarray::ArrayView1<'_, f64>,
+    weight_u: ndarray::ArrayView2<'_, f64>,
+    beta_block_offsets: &[usize],
+    active_block: usize,
+    mut out_htbeta: ndarray::ArrayViewMut2<'_, f64>,
+) -> Result<(), String> {
+    let (b_k, d_k) = active_phi_jacobian.dim();
+    let (p_out, q_i) = weight_u.dim();
+    if active_beta.dim() != (b_k, p_out) {
+        return Err(format!(
+            "assemble_t_beta_cross_slab: active_beta shape {:?} ≠ ({b_k}, {p_out})",
+            active_beta.dim()
+        ));
+    }
+    if residual.len() != p_out {
+        return Err(format!(
+            "assemble_t_beta_cross_slab: residual length {} ≠ p_out={p_out}",
+            residual.len()
+        ));
+    }
+    if beta_block_offsets.len() != all_phi_rows.len() {
+        return Err(format!(
+            "assemble_t_beta_cross_slab: offset/block mismatch (offsets={}, phi={})",
+            beta_block_offsets.len(),
+            all_phi_rows.len()
+        ));
+    }
+    if active_block >= all_phi_rows.len() {
+        return Err(format!(
+            "assemble_t_beta_cross_slab: active_block {active_block} out of range for {} blocks",
+            all_phi_rows.len()
+        ));
+    }
+    if all_phi_rows[active_block].len() != b_k {
+        return Err(format!(
+            "assemble_t_beta_cross_slab: active phi length {} ≠ b_k={b_k}",
+            all_phi_rows[active_block].len()
+        ));
+    }
+    if out_htbeta.nrows() != d_k {
+        return Err(format!(
+            "assemble_t_beta_cross_slab: out rows {} ≠ d_k={d_k}",
+            out_htbeta.nrows()
+        ));
+    }
+    for (m, phi_m) in all_phi_rows.iter().enumerate() {
+        let needed = beta_block_offsets[m] + phi_m.len() * p_out;
+        if out_htbeta.ncols() < needed {
+            return Err(format!(
+                "assemble_t_beta_cross_slab: out has {} cols, need ≥ {needed} for block {m}",
+                out_htbeta.ncols()
+            ));
+        }
+        ensure_finite_values("assemble_t_beta_cross_slab", "all_phi_rows", phi_m.iter())?;
+    }
+    ensure_finite_values(
+        "assemble_t_beta_cross_slab",
+        "active_phi_jacobian",
+        active_phi_jacobian.iter(),
+    )?;
+    ensure_finite_values("assemble_t_beta_cross_slab", "active_beta", active_beta.iter())?;
+    ensure_finite_values("assemble_t_beta_cross_slab", "residual", residual.iter())?;
+    ensure_finite_values("assemble_t_beta_cross_slab", "weight_u", weight_u.iter())?;
+    ensure_finite_values("assemble_t_beta_cross_slab", "out_htbeta", out_htbeta.iter())?;
+
+    if q_i == 0 {
+        return Ok(());
+    }
+
+    // h[v] = (W_i r_i)[v] = U[v, ℓ] U[s, ℓ] r[s].
+    let mut c_vec = ndarray::Array1::<f64>::zeros(q_i);
+    for l in 0..q_i {
+        let mut acc = 0.0_f64;
+        for s in 0..p_out {
+            acc += weight_u[[s, l]] * residual[s];
+        }
+        c_vec[l] = acc;
+    }
+    let mut h_vec = ndarray::Array1::<f64>::zeros(p_out);
+    for v in 0..p_out {
+        let mut acc = 0.0_f64;
+        for l in 0..q_i {
+            acc += weight_u[[v, l]] * c_vec[l];
+        }
+        h_vec[v] = acc;
+    }
+
+    // A[a, s] = Σ_α J[α, a] β[α, s].
+    let mut a_mat = ndarray::Array2::<f64>::zeros((d_k, p_out));
+    for alpha in 0..b_k {
+        for a in 0..d_k {
+            let jaa = active_phi_jacobian[[alpha, a]];
+            if jaa == 0.0 {
+                continue;
+            }
+            for s in 0..p_out {
+                a_mat[[a, s]] += jaa * active_beta[[alpha, s]];
+            }
+        }
+    }
+    // B[a, ℓ] = Σ_s A[a, s] U[s, ℓ].
+    let mut b_mat = ndarray::Array2::<f64>::zeros((d_k, q_i));
+    for a in 0..d_k {
+        for s in 0..p_out {
+            let aas = a_mat[[a, s]];
+            if aas == 0.0 {
+                continue;
+            }
+            for l in 0..q_i {
+                b_mat[[a, l]] += aas * weight_u[[s, l]];
+            }
+        }
+    }
+    // ga[a, v] = (W_i A[a, ·])[v].
+    let mut ga = ndarray::Array2::<f64>::zeros((d_k, p_out));
+    for a in 0..d_k {
+        for l in 0..q_i {
+            let bal = b_mat[[a, l]];
+            if bal == 0.0 {
+                continue;
+            }
+            for v in 0..p_out {
+                ga[[a, v]] += weight_u[[v, l]] * bal;
+            }
+        }
+    }
+
+    // All β blocks receive φ_{mγ} · ga[a, v].
+    for (m, phi_m) in all_phi_rows.iter().enumerate() {
+        for gamma in 0..phi_m.len() {
+            let pg = phi_m[gamma];
+            if pg == 0.0 {
+                continue;
+            }
+            let col_base = beta_block_offsets[m] + gamma * p_out;
+            for a in 0..d_k {
+                for v in 0..p_out {
+                    out_htbeta[[a, col_base + v]] += pg * ga[[a, v]];
+                }
+            }
+        }
+    }
+    // Only the active block receives the -J_{γa} · h[v] residual term.
+    let active_offset = beta_block_offsets[active_block];
+    for gamma in 0..b_k {
+        let col_base = active_offset + gamma * p_out;
+        for a in 0..d_k {
+            let jga = active_phi_jacobian[[gamma, a]];
+            if jga == 0.0 {
+                continue;
+            }
+            for v in 0..p_out {
+                out_htbeta[[a, col_base + v]] -= jga * h_vec[v];
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Scatter a per-block cross tensor `(d_k, b_k, p_out)` into the shared
 /// `htbeta` slab `(d_k, total_beta_dim)` using
 /// `flatten_beta_index(beta_block_offset, γ, v)`. The output is
@@ -2521,6 +2727,8 @@ pub fn scatter_t_beta_cross_tensor(
             out_htbeta.ncols()
         ));
     }
+    ensure_finite_values("scatter_t_beta_cross_tensor", "cross", cross.iter())?;
+    ensure_finite_values("scatter_t_beta_cross_tensor", "out_htbeta", out_htbeta.iter())?;
     for a in 0..d_k {
         for gamma in 0..b_k {
             let col_base = beta_block_offset + gamma * p_out;
@@ -2536,26 +2744,24 @@ pub fn scatter_t_beta_cross_tensor(
 /// `(H_ββ^{data} δβ)_{kαs} = Σ_i φ_{ikα} (U_i (U_iᵀ Σ_k φ_{ikα'} δβ_{kα's}))_s`
 /// per the proposal §3 contraction order.
 ///
-/// `phi_rows_by_block[i][k][α]` is supplied via the slice convention
-/// `phi_rows_by_block.len() == n_obs * n_blocks` flattened row-major:
-/// entry `i * n_blocks + k` is the φ-row for `(i, k)`. The
-/// `delta_beta_blocks` slice carries one `Array2<f64>` per block of
-/// shape `(b_k, p_out)`, and `out_blocks` mirrors that shape. `weight_u`
-/// is the per-row factor `U_i` for the single observation `i` consumed
-/// by this matvec; callers iterating across rows should invoke once per
-/// row and accumulate into `out_blocks`.
+/// `phi_row_by_block[k][α]` supplies the φ-row for block `k` at the
+/// single observation consumed by this matvec. The `delta_beta_blocks`
+/// slice carries one `Array2<f64>` per block of shape `(b_k, p_out)`,
+/// and `out_blocks` mirrors that shape. `weight_u` is the per-row factor
+/// `U_i`; callers iterating across rows should invoke once per row and
+/// accumulate into `out_blocks`.
 ///
 /// This is the per-row contribution; the full `H_ββ δβ` is obtained by
 /// summing over `i`. Operating per-row keeps the inner contractions in
 /// `O(q_i · max(K_φ, p_out))` and matches the
 /// `set_shared_beta_operator` shape expected by the InexactPCG path.
 pub fn beta_beta_low_rank_matvec_row(
-    phi_rows_by_block: &[ndarray::ArrayView1<'_, f64>],
+    phi_row_by_block: &[ndarray::ArrayView1<'_, f64>],
     delta_beta_blocks: &[ndarray::ArrayView2<'_, f64>],
     weight_u: ndarray::ArrayView2<'_, f64>,
     out_blocks: &mut [ndarray::ArrayViewMut2<'_, f64>],
 ) -> Result<(), String> {
-    let n_blocks = phi_rows_by_block.len();
+    let n_blocks = phi_row_by_block.len();
     if delta_beta_blocks.len() != n_blocks || out_blocks.len() != n_blocks {
         return Err(format!(
             "beta_beta_low_rank_matvec_row: block-count mismatch \
@@ -2565,14 +2771,16 @@ pub fn beta_beta_low_rank_matvec_row(
         ));
     }
     let (p_out, q_i) = weight_u.dim();
-    if p_out == 0 || q_i == 0 {
-        return Ok(());
-    }
-    // δy[s] = Σ_k Σ_α φ_{kα} δβ_{kαs}
-    let mut delta_y = ndarray::Array1::<f64>::zeros(p_out);
+    ensure_finite_values("beta_beta_low_rank_matvec_row", "weight_u", weight_u.iter())?;
     for k in 0..n_blocks {
-        let phi_k = phi_rows_by_block[k];
+        let phi_k = phi_row_by_block[k];
         let db_k = delta_beta_blocks[k];
+        ensure_finite_values("beta_beta_low_rank_matvec_row", "phi_row_by_block", phi_k.iter())?;
+        ensure_finite_values(
+            "beta_beta_low_rank_matvec_row",
+            "delta_beta_blocks",
+            db_k.iter(),
+        )?;
         if db_k.ncols() != p_out {
             return Err(format!(
                 "beta_beta_low_rank_matvec_row: block {k} dβ p_out={} ≠ {p_out}",
@@ -2586,6 +2794,27 @@ pub fn beta_beta_low_rank_matvec_row(
                 db_k.nrows()
             ));
         }
+    }
+    for k in 0..n_blocks {
+        let b_k = phi_row_by_block[k].len();
+        let out_k = &out_blocks[k];
+        if out_k.dim() != (b_k, p_out) {
+            return Err(format!(
+                "beta_beta_low_rank_matvec_row: out block {k} shape {:?} ≠ ({b_k}, {p_out})",
+                out_k.dim()
+            ));
+        }
+        ensure_finite_values("beta_beta_low_rank_matvec_row", "out_blocks", out_k.iter())?;
+    }
+    if p_out == 0 || q_i == 0 {
+        return Ok(());
+    }
+    // δy[s] = Σ_k Σ_α φ_{kα} δβ_{kαs}
+    let mut delta_y = ndarray::Array1::<f64>::zeros(p_out);
+    for k in 0..n_blocks {
+        let phi_k = phi_row_by_block[k];
+        let db_k = delta_beta_blocks[k];
+        let b_k = phi_k.len();
         for alpha in 0..b_k {
             let pa = phi_k[alpha];
             if pa == 0.0 {
@@ -2616,15 +2845,9 @@ pub fn beta_beta_low_rank_matvec_row(
     }
     // out_kαs += φ_{kα} · w δy[s]
     for k in 0..n_blocks {
-        let phi_k = phi_rows_by_block[k];
+        let phi_k = phi_row_by_block[k];
         let b_k = phi_k.len();
         let out_k = &mut out_blocks[k];
-        if out_k.dim() != (b_k, p_out) {
-            return Err(format!(
-                "beta_beta_low_rank_matvec_row: out block {k} shape {:?} ≠ ({b_k}, {p_out})",
-                out_k.dim()
-            ));
-        }
         for alpha in 0..b_k {
             let pa = phi_k[alpha];
             if pa == 0.0 {
