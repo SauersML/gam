@@ -11114,7 +11114,7 @@ mod tests {
                 .to_string(),
             ModelKind::MarginalSlope,
             FittedFamily::MarginalSlope {
-                likelihood: LikelihoodFamily::BinomialProbit,
+                likelihood: legacy_family_to_spec(LikelihoodFamily::BinomialProbit),
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
@@ -11533,7 +11533,7 @@ mod tests {
             "y ~ 1",
             ModelKind::LocationScale,
             FittedFamily::LocationScale {
-                likelihood: LikelihoodFamily::BinomialProbit,
+                likelihood: legacy_family_to_spec(LikelihoodFamily::BinomialProbit),
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
             "binomial-location-scale",
@@ -16120,7 +16120,7 @@ mod tests {
             "y ~ x",
             ModelKind::LocationScale,
             FittedFamily::LocationScale {
-                likelihood: LikelihoodFamily::BinomialProbit,
+                likelihood: legacy_family_to_spec(LikelihoodFamily::BinomialProbit),
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
             "binomial-location-scale",
@@ -16312,7 +16312,7 @@ mod tests {
             "y ~ x",
             ModelKind::LocationScale,
             FittedFamily::LocationScale {
-                likelihood: LikelihoodFamily::BinomialProbit,
+                likelihood: legacy_family_to_spec(LikelihoodFamily::BinomialProbit),
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
             "binomial-location-scale",
@@ -16329,7 +16329,7 @@ mod tests {
             "y ~ x",
             ModelKind::LocationScale,
             FittedFamily::LocationScale {
-                likelihood: LikelihoodFamily::BinomialProbit,
+                likelihood: legacy_family_to_spec(LikelihoodFamily::BinomialProbit),
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
             },
             "binomial-location-scale",
