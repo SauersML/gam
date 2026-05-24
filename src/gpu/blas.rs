@@ -354,33 +354,35 @@ mod cuda_impl {
         let mut rhs_dev = stream.clone_htod(&*rhs_col).ok()?;
         let alpha = 1.0_f64;
         let handle = *blas.handle();
-        let (tri_ptr, _tri_record) = tri_dev.device_ptr(&stream);
-        let (rhs_ptr, _rhs_record) = rhs_dev.device_ptr_mut(&stream);
-        // SAFETY: triangular is n×n and rhs is n×nrhs in column-major device
-        // buffers. cublasDtrsm overwrites rhs with A^{-1} rhs.
-        let status = unsafe {
-            cudarc::cublas::sys::cublasDtrsm_v2(
-                handle,
-                cublasSideMode_t::CUBLAS_SIDE_LEFT,
-                if upper {
-                    cublasFillMode_t::CUBLAS_FILL_MODE_UPPER
-                } else {
-                    cublasFillMode_t::CUBLAS_FILL_MODE_LOWER
-                },
-                cublasOperation_t::CUBLAS_OP_N,
-                cublasDiagType_t::CUBLAS_DIAG_NON_UNIT,
-                to_i32(n)?,
-                to_i32(nrhs)?,
-                &alpha,
-                tri_ptr as *const f64,
-                to_i32(n)?,
-                rhs_ptr as *mut f64,
-                to_i32(n)?,
-            )
+        {
+            let (tri_ptr, _tri_record) = tri_dev.device_ptr(&stream);
+            let (rhs_ptr, _rhs_record) = rhs_dev.device_ptr_mut(&stream);
+            // SAFETY: triangular is n×n and rhs is n×nrhs in column-major device
+            // buffers. cublasDtrsm overwrites rhs with A^{-1} rhs.
+            let status = unsafe {
+                cudarc::cublas::sys::cublasDtrsm_v2(
+                    handle,
+                    cublasSideMode_t::CUBLAS_SIDE_LEFT,
+                    if upper {
+                        cublasFillMode_t::CUBLAS_FILL_MODE_UPPER
+                    } else {
+                        cublasFillMode_t::CUBLAS_FILL_MODE_LOWER
+                    },
+                    cublasOperation_t::CUBLAS_OP_N,
+                    cublasDiagType_t::CUBLAS_DIAG_NON_UNIT,
+                    to_i32(n)?,
+                    to_i32(nrhs)?,
+                    &alpha,
+                    tri_ptr as *const f64,
+                    to_i32(n)?,
+                    rhs_ptr as *mut f64,
+                    to_i32(n)?,
+                )
+            };
+            if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return None;
+            }
         };
-        if status != cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-            return None;
-        }
         let out_col = stream.clone_dtoh(&rhs_dev).ok()?;
         from_col_major(&out_col, n, nrhs)
     }

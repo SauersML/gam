@@ -17859,7 +17859,6 @@ pub fn fit_survival_marginal_slope_terms(
             crate::solver::outer_strategy::cache_entry_would_help_outer(
                 &loaded,
                 setup.rho_dim(),
-                CUSTOM_FAMILY_RHO_BOUND,
             )
         });
     if outer_cache_seed_available {

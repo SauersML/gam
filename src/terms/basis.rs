@@ -15320,7 +15320,7 @@ pub fn create_matern_spline_basiswithworkspace(
         penalty_kernel,
         penalty_ridge,
         num_kernel_basis: k,
-        num_polynomial_basis: poly_cols,
+        num_polynomial_basis: usize::from(include_intercept),
         dimension: d,
     })
 }
@@ -18711,6 +18711,23 @@ fn scaled_log_kappa_derivatives(
         + (2.0 * exponent + 1.0) * r * radial_first
         + r * r * radialsecond;
     (first, second)
+}
+
+#[inline(always)]
+fn duchon_q_psi_triplet_from_jets(
+    jets: &DuchonRadialJets,
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+    r: f64,
+) -> (f64, f64) {
+    scaled_log_kappa_derivatives(
+        jets.q,
+        jets.q_r,
+        jets.q_rr,
+        duchon_operator_scaling_exponent(p_order, s_order, k_dim),
+        r,
+    )
 }
 
 #[inline(always)]
