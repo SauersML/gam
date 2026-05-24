@@ -25,14 +25,6 @@ pub enum GpuPolicy {
 }
 
 impl GpuPolicy {
-    #[inline]
-    pub fn from_env() -> Self {
-        match std::env::var("GAM_GPU") {
-            Ok(raw) => Self::parse(&raw).unwrap_or(Self::Auto),
-            Err(_) => Self::Auto,
-        }
-    }
-
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "auto" | "" => Some(Self::Auto),
@@ -98,14 +90,15 @@ static POLICY: OnceLock<GpuPolicy> = OnceLock::new();
 
 #[inline]
 pub fn global_policy() -> GpuPolicy {
-    *POLICY.get_or_init(GpuPolicy::from_env)
+    *POLICY.get_or_init(|| GpuPolicy::Auto)
 }
 
 /// Configure the process-wide policy before solver kernels are selected.
-/// If a kernel already initialized the policy (for example via `GAM_GPU`),
-/// the first value wins so concurrent fits cannot race policy changes.
+/// If a kernel already initialized the policy, the first value wins so
+/// concurrent fits cannot race policy changes.
 pub fn configure_global_policy(policy: GpuPolicy) {
-    let _ = POLICY.set(policy);
+    // First-writer-wins semantics; ignore a redundant late call.
+    drop(POLICY.set(policy));
 }
 
 /// Decide whether a GPU kernel may run.  This is deliberately conservative:
