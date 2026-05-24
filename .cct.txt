@@ -1,57 +1,24 @@
    Compiling gam v0.2.1 (/Users/user/gam)
-error: unused variable: `d`
-  --> tests/equivariant_lie_atom.rs:59:19
+error[E0432]: unresolved import `power_law_common::report_power_law`
+  --> tests/standard_gam_scaling.rs:28:5
    |
-59 |     let (n_atoms, d, r) = (W.shape()[0], W.shape()[1], W.shape()[2]);
-   |                   ^ help: if this is intentional, prefix it with an underscore: `_d`
-   |
-   = note: `-D unused-variables` implied by `-D warnings`
-   = help: to override `-D warnings` add `#[allow(unused_variables)]`
+28 | use power_law_common::report_power_law as fit_and_report_power_law_inner;
+   |     ^^^^^^^^^^^^^^^^^^----------------^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |     |                 |
+   |     |                 help: a similar name exists in the module: `fit_power_law`
+   |     no `report_power_law` in `power_law_common`
 
-error: variable `W` should have a snake case name
-  --> tests/equivariant_lie_atom.rs:58:28
-   |
-58 | fn commutator_residual_so2(W: &Array3<f64>, theta: &Array2<f64>, z: &Array2<f64>) -> f64 {
-   |                            ^ help: convert the identifier to snake case (notice the capitalization): `w`
-   |
-   = note: `-D non-snake-case` implied by `-D warnings`
-   = help: to override `-D warnings` add `#[allow(non_snake_case)]`
+error[E0432]: unresolved imports `gam::basis::PeriodicSpline1DOptions`, `gam::basis::fit_periodic_spline_1d`
+ --> tests/periodic_spline_1d.rs:1:18
+  |
+1 | use gam::basis::{PeriodicSpline1DOptions, fit_periodic_spline_1d};
+  |                  ^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^
+  |                  |                        |
+  |                  |                        no `fit_periodic_spline_1d` in `terms::basis`
+  |                  |                        help: a similar name exists in the module: `fit_periodic_bspline_curve`
+  |                  no `PeriodicSpline1DOptions` in `terms::basis`
 
-error: variable `R` should have a snake case name
-  --> tests/equivariant_lie_atom.rs:98:13
-   |
-98 |         let R = rho_so2(theta);
-   |             ^ help: convert the identifier to snake case: `r`
-
-error: variable `RtR` should have a snake case name
-  --> tests/equivariant_lie_atom.rs:99:13
-   |
-99 |         let RtR = R.t().dot(&R);
-   |             ^^^ help: convert the identifier to snake case: `rt_r`
-
-error: variable `R` should have a snake case name
-   --> tests/equivariant_lie_atom.rs:120:13
-    |
-120 |         let R = rho_so3(omega);
-    |             ^ help: convert the identifier to snake case: `r`
-
-error: variable `RtR` should have a snake case name
-   --> tests/equivariant_lie_atom.rs:121:13
-    |
-121 |         let RtR = R.t().dot(&R);
-    |             ^^^ help: convert the identifier to snake case: `rt_r`
-
-error: variable `W` should have a snake case name
-   --> tests/equivariant_lie_atom.rs:143:13
-    |
-143 |     let mut W = Array3::<f64>::zeros((1, 4, 2));
-    |             ^ help: convert the identifier to snake case (notice the capitalization): `w`
-
-error: variable `W` should have a snake case name
-   --> tests/equivariant_lie_atom.rs:207:13
-    |
-207 |     let mut W = Array3::<f64>::zeros((1, 4, 2));
-    |             ^ help: convert the identifier to snake case (notice the capitalization): `w`
-
-error: could not compile `gam` (test "equivariant_lie_atom") due to 8 previous errors
+For more information about this error, try `rustc --explain E0432`.
+error: could not compile `gam` (test "periodic_spline_1d") due to 1 previous error
 warning: build failed, waiting for other jobs to finish...
+error: could not compile `gam` (test "standard_gam_scaling") due to 1 previous error
