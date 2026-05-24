@@ -8709,7 +8709,9 @@ mod tests {
     #[test]
     fn note_rejects_nonfinite_inner_beta() {
         // A divergent inner state must NOT poison the cache: persisting a
-        // non-finite β would re-create the failure mode the schema bump fixed.
+        // non-finite β would re-create the inner-PIRLS budget-exhaustion
+        // failure mode at boundary ρ where the cached β is supposed to
+        // place the resume inside Newton's quadratic basin.
         let (_d, session) = tmp_cache_session("note-rejects-bad-beta");
         let problem = OuterProblem::new(1).with_gradient(Derivative::Unavailable);
         let mut inner: ClosureObjective<_, _, _> = problem.build_objective(
@@ -8975,10 +8977,9 @@ mod tests {
     fn cache_entry_classifier_rejects_only_structural_failures() {
         // Only structural failures discard: payload shape (wrong rho_dim,
         // non-finite payload internals → decode None → "payload-shape-mismatch")
-        // and non-finite cache metadata → "non-finite-payload". Saturation,
-        // β presence, and schema-1 mismatches are NOT discards here:
-        // saturation is honored under v2; schema-1 returns None from decode
-        // and surfaces as "payload-shape-mismatch" via the decode rejection.
+        // and non-finite cache metadata → "non-finite-payload". Saturation
+        // and β presence are NOT discards here: saturation is honored, and
+        // ρ-only payloads decode cleanly with an empty β slot.
 
         // Non-finite metadata objective: decode succeeds (finite payload
         // cost), but the entry-level objective is NaN — discard as
