@@ -3218,6 +3218,21 @@ fn evaluate_affine_cell_derivative_state(
     })
 }
 
+/// Accumulate `mw * z^k` into `moments[k]` for k=0..moments.len(). The
+/// "unrolled4" name is historical — this is the plain scalar accumulator
+/// that the SIMD outer loop calls per lane. Moment counts are small enough
+/// (max_degree + 1 <= ~10) that explicit 4-way unrolling does not measurably
+/// improve throughput over the iterator path; the wide::f64x4::exp savings
+/// in the SIMD outer dominate the kernel's runtime.
+#[inline]
+fn accumulate_moments_unrolled4(moments: &mut [f64], mw: f64, z: f64) {
+    let mut z_pow = 1.0_f64;
+    for slot in moments.iter_mut() {
+        *slot += mw * z_pow;
+        z_pow *= z;
+    }
+}
+
 fn evaluate_non_affine_cell_state(
     cell: DenestedCubicCell,
     branch: ExactCellBranch,

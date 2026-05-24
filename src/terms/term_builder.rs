@@ -2141,6 +2141,36 @@ pub fn parse_cyclic_boundary(
     Ok(OneDimensionalBoundary::Cyclic { start, end })
 }
 
+/// Parse the periodic-uniform domain for a one-dimensional cyclic smooth.
+///
+/// Returns the `(domain_start, period)` pair derived from
+/// `period_start` / `start`, `period_end` / `end`, falling back to the
+/// data range `[minv, maxv)` when neither bound is provided. The period
+/// must be strictly positive.
+pub fn parse_periodic_domain_1d(
+    options: &BTreeMap<String, String>,
+    minv: f64,
+    maxv: f64,
+) -> Result<(f64, f64), String> {
+    let start = option_f64(options, "period_start")
+        .or_else(|| option_f64(options, "start"))
+        .unwrap_or(minv);
+    let end = option_f64(options, "period_end")
+        .or_else(|| option_f64(options, "end"))
+        .unwrap_or(maxv);
+    if !(start.is_finite() && end.is_finite()) {
+        return Err(format!(
+            "periodic smooth domain requires finite endpoints, got ({start}, {end})"
+        ));
+    }
+    if end <= start {
+        return Err(format!(
+            "periodic smooth requires period_end/end ({end}) > period_start/start ({start})"
+        ));
+    }
+    Ok((start, end - start))
+}
+
 fn parse_matern_nu(raw: &str) -> Result<MaternNu, String> {
     let trimmed = raw.trim();
     let lowered = trimmed.to_ascii_lowercase();
