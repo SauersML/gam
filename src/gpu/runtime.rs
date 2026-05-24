@@ -87,7 +87,8 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
 fn cuda_device_info(ordinal: usize) -> Result<GpuDeviceInfo, GpuProbeError> {
     result::init().map_err(|err| GpuProbeError::Driver(err.to_string()))?;
     let device = result::device::get(
-        i32::try_from(ordinal).map_err(|_| GpuProbeError::Driver("device ordinal overflow".into()))?,
+        i32::try_from(ordinal)
+            .map_err(|_| GpuProbeError::Driver("device ordinal overflow".into()))?,
     )
     .map_err(|err| GpuProbeError::Driver(err.to_string()))?;
     let attr = |attribute| -> Result<i32, GpuProbeError> {
@@ -104,8 +105,7 @@ fn cuda_device_info(ordinal: usize) -> Result<GpuDeviceInfo, GpuProbeError> {
     let minor = attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
     Ok(GpuDeviceInfo {
         ordinal,
-        name: result::device::get_name(device)
-            .unwrap_or_else(|_| format!("CUDA device {ordinal}")),
+        name: result::device::get_name(device).unwrap_or_else(|_| format!("CUDA device {ordinal}")),
         capability: super::device::GpuCapability::from_compute_capability(major, minor),
         sm_count: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
         max_threads_per_sm: attr(
@@ -122,8 +122,7 @@ fn cuda_device_info(ordinal: usize) -> Result<GpuDeviceInfo, GpuProbeError> {
         ecc_enabled: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_ECC_ENABLED)
             .unwrap_or(0)
             != 0,
-        integrated: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_INTEGRATED)
-            .unwrap_or(0)
+        integrated: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_INTEGRATED).unwrap_or(0)
             != 0,
         mig_mode: false,
     })
