@@ -697,6 +697,7 @@ impl LatentCoordValues {
         )
     }
 
+    #[expect(dead_code)]
     pub(crate) fn from_flat_with_manifold_and_id(
         values: Array1<f64>,
         n_obs: usize,
@@ -794,6 +795,7 @@ impl LatentCoordValues {
         )
     }
 
+    #[expect(dead_code)]
     pub(crate) fn with_retraction_registry(
         &self,
         retraction_registry: LatentRetractionRegistry,
@@ -986,6 +988,7 @@ impl LatentCoordValues {
     /// This is the N-D generalization of
     /// `gam_pyffi::contract_position_gradient` (1-D), used inside the
     /// `_backward` pyffi entry point.
+    #[expect(dead_code)]
     pub(crate) fn contract_gradient(
         grad_phi: ArrayView2<'_, f64>,
         jet: &Array3<f64>,
@@ -1013,6 +1016,7 @@ impl LatentCoordValues {
     /// `contract_gradient(grad_phi, design_gradient_wrt_t(...))`, but never
     /// materializes the dense `(n_obs, n_centers, latent_dim)` jet. Peak
     /// storage is therefore `O(n_obs * latent_dim)`.
+    #[expect(dead_code)]
     pub(crate) fn contract_gradient_radial_streaming(
         &self,
         grad_phi: ArrayView2<'_, f64>,
@@ -1043,6 +1047,7 @@ impl LatentCoordValues {
     /// `grad_phi_row[k]` is the downstream adjoint for `Φ[n,k]`. The
     /// contribution is accumulated into `grad_t[n, :]` with an optional scalar
     /// multiplier.
+    #[expect(dead_code)]
     pub(crate) fn contract_row_radial_gradient_into(
         &self,
         n: usize,

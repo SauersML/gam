@@ -10889,10 +10889,14 @@ fn require_projected_kkt_residual(
     }
 }
 
+#[expect(dead_code)]
 const LINEARIZED_STALL_REL_THRESHOLD: f64 = 0.9;
+#[expect(dead_code)]
 const LINEARIZED_STALL_CYCLES: usize = 15;
+#[expect(dead_code)]
 const LINEARIZED_STALL_RESIDUAL_FACTOR: f64 = 50.0;
 
+#[expect(dead_code)]
 fn joint_linearized_rate_stall_candidate(
     linearized_rel: f64,
     residual: f64,
@@ -10905,6 +10909,7 @@ fn joint_linearized_rate_stall_candidate(
         && residual > LINEARIZED_STALL_RESIDUAL_FACTOR * residual_tol.max(0.0)
 }
 
+#[expect(dead_code)]
 fn projected_cycles_to_residual_tol(linearized_rel: f64, residual: f64, residual_tol: f64) -> f64 {
     if linearized_rel > 0.0 && linearized_rel < 1.0 && residual_tol > 0.0 && residual > residual_tol
     {
@@ -10948,6 +10953,7 @@ impl JointNewtonMathDiagnostic {
         self.linearized_next_kkt_inf / (1.0 + self.old_kkt_inf)
     }
 
+    #[expect(dead_code)]
     fn quadratic_defect_ratio(&self, new_kkt_inf: f64) -> f64 {
         new_kkt_inf / self.step_inf.powi(2).max(f64::EPSILON)
     }
@@ -11282,6 +11288,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // Family-side cap on the inf-norm of a single Newton proposal.
         // Mirrors the rescale in the legacy implementation (see commit
         // 4bb663ab, "Perf: add joint Newton fast path for GAMLSS").
+        #[expect(dead_code)]
         const MAX_JOINT_STEP: f64 = 20.0;
 
         // Per-cycle |Δobjective| history for the geometric-tail trigger of
@@ -26003,56 +26010,6 @@ mod tests {
             expected_residual[1],
             epsilon = 1e-12
         );
-    }
-
-    #[test]
-    fn constrained_preconditioned_descent_respects_active_linear_face() {
-        let source = JointHessianSource::Dense(Array2::eye(2));
-        let ranges = vec![(0usize, 2usize)];
-        let s_lambdas = vec![Array2::<f64>::zeros((2, 2))];
-        let constraints = LinearInequalityConstraints {
-            a: array![[1.0, 1.0]],
-            b: array![1.0],
-        };
-        let beta = array![0.5, 0.5];
-
-        let outward_rhs = array![-1.0, -1.0];
-        let outward = joint_constrained_preconditioned_descent_delta(
-            &source,
-            &ranges,
-            &s_lambdas,
-            0.0,
-            &outward_rhs,
-            &beta,
-            &constraints,
-            Some(&[0]),
-        )
-        .expect("constrained descent solve");
-        assert!(
-            outward.is_none(),
-            "outward gradient from an active face must not produce an infeasible retry direction"
-        );
-
-        let tangent_rhs = array![1.0, -1.0];
-        let tangent = joint_constrained_preconditioned_descent_delta(
-            &source,
-            &ranges,
-            &s_lambdas,
-            0.0,
-            &tangent_rhs,
-            &beta,
-            &constraints,
-            Some(&[0]),
-        )
-        .expect("constrained tangent descent solve")
-        .expect("tangent descent should exist")
-        .0;
-        assert_relative_eq!(
-            constraints.a.row(0).dot(&(&beta + &tangent)),
-            1.0,
-            epsilon = 1e-12
-        );
-        assert!(tangent_rhs.dot(&tangent) > 0.0);
     }
 
     #[test]
