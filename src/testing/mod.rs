@@ -100,12 +100,11 @@ impl DenseDesignOperator for NoDensifyOperator {
     }
 
     fn to_dense(&self) -> Array2<f64> {
-        // SAFETY: `NoDensifyOperator` is a test fixture whose entire purpose
-        // is asserting that operator-aware code paths never reach the
-        // `to_dense` fallback. Any call here means a code path under test
-        // bypassed `row_chunk_into` and tried to materialize a dense
-        // matrix that the fixture forbids — exactly the regression this
-        // operator is designed to detect.
+        // `NoDensifyOperator` is a test fixture asserting that
+        // operator-aware code paths never densify.
+        // SAFETY: a call here means a code path under test bypassed
+        // `row_chunk_into` and tried to materialize — the regression
+        // this fixture is designed to catch.
         panic!("NoDensifyOperator must stay lazy")
     }
 }

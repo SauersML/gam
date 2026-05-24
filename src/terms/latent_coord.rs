@@ -524,11 +524,10 @@ impl LatentIdMode {
 
     fn reject_dim_selection_alone(&self) {
         if matches!(self, Self::DimSelection { .. }) {
-            // SAFETY: documented audit-finding contract — `DimSelection`
-            // alone is rotation-symmetric and therefore an invalid gauge
-            // fix; callers must pair ARD with `AuxPrior` or `Isometry`.
-            // Reaching this point means the builder accepted an unpaired
-            // `DimSelection` value, violating the identifiability contract.
+            // `DimSelection` alone is rotation-symmetric — not a valid
+            // gauge fix; callers must pair ARD with `AuxPrior`/`Isometry`.
+            // SAFETY: reaching this panic means the builder accepted an
+            // unpaired `DimSelection`, violating the identifiability gate.
             panic!(
                 "LatentIdMode::DimSelection is not a standalone gauge fix; pair ARD with AuxPrior or Isometry"
             );
@@ -1014,11 +1013,10 @@ fn normalize_or_axis(v: ArrayView1<'_, f64>, dim: usize) -> Array1<f64> {
         norm_sq += v[a] * v[a];
     }
     if norm_sq <= 0.0 || !norm_sq.is_finite() {
-        // SAFETY: `LatentManifold::Sphere` carries a contract that ambient
-        // vectors are well-defined unit-projectable points; the term
-        // builder validates input coordinates upstream, so a zero or
-        // non-finite norm here means the contract was broken at the
-        // caller boundary.
+        // `LatentManifold::Sphere` requires unit-projectable ambient
+        // vectors; the term builder validates this upstream.
+        // SAFETY: a zero/non-finite norm means the upstream contract
+        // was broken at the caller boundary.
         panic!(
             "LatentManifold::Sphere cannot normalize a zero or non-finite ambient vector"
         );
