@@ -12,13 +12,14 @@ from . import topology
 from ._api import fit
 from ._compare import (
     _extract_edf,
-    _extract_reml_score,
+    _extract_null_dim,
+    _extract_null_hessian_logdet,
     _extract_reml_score_raw,
     _tierney_kadane_normalizer_from_null_dim,
     compare_models,
 )
 from ._tables import table_columns
-from .smooth import Duchon, PeriodicSplineCurve, Smooth, Sphere
+from .smooth import BSpline, Duchon, PeriodicSplineCurve, Smooth, Sphere, TensorBSpline
 
 
 _AUTO_RE = re.compile(r"\btype\s*=\s*(['\"]?)AUTO\1(?=\s*(?:,|\)))", re.IGNORECASE)
@@ -92,7 +93,7 @@ def select_topology(
         if candidate_formula is None:  # defensive; strict_dimension=True raises.
             raise ValueError(f"candidate {candidate.name!r} is not constructible")
         model = fit(data, candidate_formula, **fit_kwargs)
-        reml_score = _extract_reml_score(model)
+        reml_score = _extract_reml_score_raw(model)
         if not math.isfinite(reml_score):
             raise ValueError(
                 f"select_topology: candidate {candidate.name!r} produced "
@@ -109,7 +110,11 @@ def select_topology(
     }
     n_obs_by_candidate = {name: n_obs for name in fits}
     null_dims = {
-        candidate.name: _candidate_null_dim(candidate, basis_sizes[candidate.name])
+        candidate.name: _fitted_or_candidate_null_dim(
+            fits[candidate.name],
+            candidate,
+            basis_sizes[candidate.name],
+        )
         for candidate in normalized
         if candidate.name in fits
     }
@@ -211,7 +216,7 @@ def _default_candidates(feature_dim: int) -> list[_Candidate]:
         _Candidate("euclidean", topology.EuclideanPatch(d=feature_dim, name="x")),
         _Candidate("circle", topology.Circle(name="theta")),
         _Candidate("sphere", topology.Sphere(dim=2, name="omega")),
-        _Candidate("torus", topology.Torus(centers=12, name="theta_phi")),
+        _Candidate("torus", topology.Torus(n_knots=(12, 12), name="theta_phi")),
         _Candidate("cylinder", topology.Cylinder(name="cyl")),
     ]
     return [
@@ -381,21 +386,31 @@ def _topology_term(candidate: _Candidate, option_keys: set[str]) -> _TopologyTer
         if topo.radians:
             options.append("radians=true")
         return _TopologyTerm("s", tuple(options), 2)
+    if isinstance(topo, TensorBSpline):
+        options: list[str] = []
+        k = getattr(topo, "_gamfit_tensor_k", None)
+        if not has_size and k is not None:
+            options.append(f"k={_format_int_list(k)}")
+        periodic = tuple(bool(marginal.periodic) for marginal in topo.marginals)
+        if any(periodic):
+            options.append(f"periodic={_format_bool_list(periodic)}")
+            periods = getattr(
+                topo,
+                "_gamfit_tensor_periods",
+                tuple("2*pi" if value else None for value in periodic),
+            )
+            options.append(f"period={_format_period_list(periods)}")
+        options.append("identifiability=sum_tozero")
+        return _TopologyTerm("te", tuple(options), len(topo.marginals))
     if isinstance(topo, Duchon):
         periodic = tuple(bool(v) for v in topo.periodic_per_axis or ())
-        if periodic == (True, False):
-            return _TopologyTerm(
-                "te",
-                ("bc=['periodic','natural']", "period=[2*pi, None]"),
-                2,
+        if periodic:
+            raise ValueError(
+                "select_topology cannot fit per-axis periodic Duchon candidates "
+                "through the formula AUTO path; use topology.Cylinder or "
+                "topology.Torus tensor candidates"
             )
-        if periodic == (True, True):
-            return _TopologyTerm(
-                "te",
-                ("bc=['periodic','periodic']", "period=[2*pi, 2*pi]"),
-                2,
-            )
-        options = ["type=duchon"]
+        options = ["type=duchon", f"order={_duchon_formula_order(topo)}"]
         if not has_size and isinstance(topo.centers, int):
             options.append(f"centers={topo.centers}")
         if topo.length_scale is not None:
@@ -403,6 +418,19 @@ def _topology_term(candidate: _Candidate, option_keys: set[str]) -> _TopologyTer
         required_dim = _candidate_required_dim(topo)
         return _TopologyTerm("s", tuple(options), required_dim)
     raise TypeError(f"unsupported topology candidate {type(topo).__name__}")
+
+
+def _format_int_list(values: Sequence[Any]) -> str:
+    return "[" + ", ".join(str(int(value)) for value in values) + "]"
+
+
+def _format_bool_list(values: Sequence[bool]) -> str:
+    return "[" + ", ".join("true" if value else "false" for value in values) + "]"
+
+
+def _format_period_list(values: Sequence[Any]) -> str:
+    parts = ["None" if value is None else str(value) for value in values]
+    return "[" + ", ".join(parts) + "]"
 
 
 def _candidate_required_dim(topo: Smooth) -> int | None:
@@ -413,12 +441,23 @@ def _candidate_required_dim(topo: Smooth) -> int | None:
         return 1
     if isinstance(topo, Sphere):
         return 2
+    if isinstance(topo, TensorBSpline):
+        return len(topo.marginals)
     if isinstance(topo, Duchon):
         periodic = tuple(bool(v) for v in topo.periodic_per_axis or ())
         if periodic in {(True, False), (True, True)}:
             return 2
         return _centers_dim(topo.centers)
     return None
+
+
+def _fitted_or_candidate_null_dim(
+    fit_obj: Any, candidate: _Candidate, basis_size: int
+) -> float:
+    null_dim = _extract_null_dim(fit_obj)
+    if null_dim is not None:
+        return null_dim
+    return _candidate_null_dim(candidate, basis_size)
 
 
 def _candidate_null_dim(candidate: _Candidate, basis_size: int) -> float:
@@ -429,6 +468,14 @@ def _candidate_null_dim(candidate: _Candidate, basis_size: int) -> float:
         return 1.0
     if isinstance(topo, Sphere):
         return 1.0
+    if isinstance(topo, TensorBSpline):
+        null_dim = 1
+        for marginal in topo.marginals:
+            null_dim *= _bspline_marginal_nullity(marginal)
+        identifiability = str(getattr(topo, "_gamfit_tensor_identifiability", "sum_tozero"))
+        if identifiability.lower().replace("-", "_") != "none":
+            null_dim = max(null_dim - 1, 0)
+        return float(min(max(null_dim, 0), basis_size))
     if isinstance(topo, Duchon):
         periodic = tuple(bool(v) for v in topo.periodic_per_axis or ())
         if periodic and all(periodic):
@@ -439,9 +486,20 @@ def _candidate_null_dim(candidate: _Candidate, basis_size: int) -> float:
         if dim is None:
             dim = 1
         nonperiodic_dim = sum(1 for value in periodic if not value) if periodic else dim
-        null_dim = math.comb(nonperiodic_dim + int(topo.m) - 1, nonperiodic_dim)
+        null_dim = math.comb(
+            nonperiodic_dim + _duchon_formula_order(topo),
+            nonperiodic_dim,
+        )
         return float(min(max(null_dim, 0), basis_size))
     return 0.0
+
+
+def _bspline_marginal_nullity(marginal: BSpline) -> int:
+    return 1 if marginal.periodic else max(0, int(marginal.penalty_order))
+
+
+def _duchon_formula_order(topo: Duchon) -> int:
+    return max(0, int(topo.m) - 1)
 
 
 def _centers_dim(centers: Any) -> int | None:
@@ -459,6 +517,12 @@ def _infer_candidate_name(topo: Smooth) -> str | None:
         return "Circle"
     if isinstance(topo, Sphere):
         return "Sphere"
+    if isinstance(topo, TensorBSpline):
+        periodic = tuple(bool(marginal.periodic) for marginal in topo.marginals)
+        if periodic == (True, False):
+            return "Cylinder"
+        if periodic == (True, True):
+            return "Torus"
     if isinstance(topo, Duchon):
         periodic = tuple(bool(v) for v in topo.periodic_per_axis or ())
         if periodic == (True, False):
@@ -501,12 +565,19 @@ def _score_for_kind(
     if score_kind == "reml":
         return _extract_reml_score_raw(
             fit_obj
-        ) + _tierney_kadane_normalizer_from_null_dim(null_dim)
+        ) + _tk_normalizer_for_fit(fit_obj, null_dim)
     if score_kind == "laml":
         return _extract_laml_score(
             fit_obj
-        ) + _tierney_kadane_normalizer_from_null_dim(null_dim)
+        ) + _tk_normalizer_for_fit(fit_obj, null_dim)
     return _bic_value(fit_obj, n_obs, basis_size)
+
+
+def _tk_normalizer_for_fit(fit_obj: Any, null_dim: float) -> float:
+    return _tierney_kadane_normalizer_from_null_dim(
+        null_dim,
+        _extract_null_hessian_logdet(fit_obj),
+    )
 
 
 def _comparison_score(score: float, score_kind: ScoreKind) -> float:
@@ -543,7 +614,10 @@ def _extract_laml_score(fit_obj: Any) -> float:
         value = fit_obj.get("laml")
         if value is not None:
             return float(value)
-    return _extract_reml_score_raw(fit_obj)
+    raise ValueError(
+        "score='laml' requires a real 'laml' field on the fitted result; "
+        "REML/evidence must be requested with score='reml'"
+    )
 
 
 def _bic_value(fit_obj: Any, n_obs: int, basis_size: int) -> float:
@@ -661,27 +735,34 @@ def _score_disagreement_warnings(
 ) -> list[str]:
     orders: dict[str, tuple[str, ...]] = {}
     for kind in ("reml", "laml", "bic"):
-        scores = {
-            name: _scale_score(
-                _score_for_kind(
-                    fit_obj,
-                    kind,
+        try:
+            scores = {
+                name: _scale_score(
+                    _score_for_kind(
+                        fit_obj,
+                        kind,
+                        n_obs,
+                        basis_sizes[name],
+                        null_dims[name],
+                    ),
+                    score_scale,
                     n_obs,
-                    basis_sizes[name],
-                    null_dims[name],
-                ),
-                score_scale,
-                n_obs,
-                effective_dim[name],
-            )
-            for name, fit_obj in fits.items()
-        }
+                    effective_dim[name],
+                )
+                for name, fit_obj in fits.items()
+            }
+        except (NotImplementedError, ValueError):
+            if kind in {"reml", "laml"}:
+                continue
+            raise
         comparison = compare_models(
             [{"reml_score": _comparison_score(scores[name], kind)}
              for name in fits],
             names=list(fits),
         )
         orders[kind] = tuple(name for name, *_ in comparison["ranking"])
+    if len(orders) < 2:
+        return []
     if len(set(orders.values())) == 1:
         return []
     detail = "; ".join(
