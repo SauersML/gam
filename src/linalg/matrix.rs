@@ -1543,7 +1543,7 @@ impl LinearOperator for DenseDesignMatrix {
                         )
                 };
                 if let Some(pen) = penalty {
-                    out += &pen.dot(vector);
+                    out += &fast_av(pen, vector);
                 }
                 if ridge > 0.0 {
                     for j in 0..p {
@@ -1782,7 +1782,7 @@ impl LinearOperator for ReparamOperator {
         let xtw = self.x_original.apply_transpose(&wxqv);
         let mut out = fast_atv(&self.qs, &xtw);
         if let Some(pen) = penalty {
-            out += &pen.dot(vector);
+            out += &fast_av(pen, vector);
         }
         if ridge > 0.0 {
             out += &vector.mapv(|x| ridge * x);
