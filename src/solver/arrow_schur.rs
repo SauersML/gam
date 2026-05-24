@@ -643,8 +643,11 @@ impl ArrowSchurSystem {
     /// `hessian_diag` first. Diagonal penalties (ARD and the shipped
     /// sparsity kernels) are injected directly. Psi-tier penalties with
     /// off-row Hessian blocks are rejected because the arrow representation
-    /// has no place to store them. Dense Beta-tier penalties still fall back
-    /// to `hvp` probes against the canonical basis vectors for `β`.
+    /// has no place to store them. The supported row-block-only Psi-tier
+    /// penalties are `ARDPenalty`, `SparsityPenalty`,
+    /// `SoftmaxAssignmentSparsity`, and `IBPAssignment`. Dense Beta-tier
+    /// penalties still fall back to `hvp` probes against the canonical basis
+    /// vectors for `β`.
     ///
     /// `target_t` is the full flat latent-coordinate vector (row-major, `N·d` entries)
     /// at the current iterate; `target_beta` is the current `β`. `rho`
@@ -665,7 +668,7 @@ impl ArrowSchurSystem {
                     if !analytic_penalty_is_row_block_diagonal(penalty) {
                         return Err(ArrowSchurError::SchurFactorFailed {
                             reason: format!(
-                                "analytic penalty {name:?} couples latent rows; this penalty requires the dense Schur path, use solver_mode=DenseSchur"
+                                "analytic penalty {name:?} couples latent rows; cross-row Hessian contributions are not yet supported on any production solver path. Consider using a row-block-only penalty (ARDPenalty, SparsityPenalty, SoftmaxAssignmentSparsity, IBPAssignment) or filing an issue requesting cross-row Hessian support."
                             ),
                         });
                     }
