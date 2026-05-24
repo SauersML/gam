@@ -4730,7 +4730,9 @@ fn analytic_penalty_value_for_targets(
 ) -> Result<f64, String> {
     let rho = Array1::<f64>::zeros(registry.total_rho_count());
     let mut value = 0.0_f64;
-    for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout()) {
+    for (penalty, (rho_slice, tier, _name)) in
+        registry.penalties.iter().zip(registry.rho_layout())
+    {
         let rho_local = rho.slice(s![rho_slice]);
         let target = match tier {
             PenaltyTier::Psi => target_t.view(),
