@@ -183,6 +183,36 @@ class Matern(Smooth):
 
 
 @dataclass
+class Pca(Smooth):
+    """Precomputed-PCA linear feature projection as a first-class smooth.
+
+    In every cogito experiment (auto_exp_17..35), the user manually does
+    ``from _pca_basis import load_pc_basis; basis = load_pc_basis(K=64);
+    X_proj = X @ basis`` and then fits gamfit on the projected ``(N, K)``
+    data. Pca makes that recurring projection a GAM basis. It also captures
+    the Schur elimination benefit: when ``D >> K_pca`` (for example
+    ``D=7168, K=64``), gamfit projects through the cached ``(D, K_pca)``
+    basis once and fits the smaller ``(N, K_pca)`` design with a ridge
+    penalty on PCA coefficients, rather than materializing a full ``(N, D)``
+    smooth and ``(D, D)`` penalty.
+
+    Parameters
+    ----------
+    K : latent rank. Required by formula use; defaults to the provided
+        basis width when ``basis`` is supplied.
+    basis : optional array-like of shape ``(D, K)``. A fixed precomputed
+        projection matrix, e.g. ``_pca_basis.load_pc_basis(K=64)``.
+    centered : if True, subtract the training feature mean before projection.
+    smooth_penalty : ridge multiplier for PCA coefficients.
+    """
+
+    K: int | None = None
+    basis: Any | None = None
+    centered: bool = True
+    smooth_penalty: float = 1.0
+
+
+@dataclass
 class Sphere(Smooth):
     """Spherical-harmonic basis on the unit sphere S².
 
@@ -342,6 +372,7 @@ __all__ = [
     "BSpline",
     "TensorBSpline",
     "Matern",
+    "Pca",
     "Sphere",
     "Categorical",
     "LatentCoord",

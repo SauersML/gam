@@ -1842,6 +1842,21 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                     options,
                 });
             }
+            "pca" => {
+                if vars.is_empty() {
+                    return Err(FormulaDslError::InvalidArgument {
+                        reason: format!("pca() requires at least one variable: {raw}"),
+                    }
+                    .into());
+                }
+                options.insert("type".to_string(), "pca".to_string());
+                return Ok(ParsedTerm::Smooth {
+                    label: raw.to_string(),
+                    vars,
+                    kind: SmoothKind::S,
+                    options,
+                });
+            }
             "linkwiggle" => {
                 if !vars.is_empty() {
                     return Err(FormulaDslError::InvalidArgument {
@@ -1946,7 +1961,7 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
             _ => {
                 return Err(FormulaDslError::UnknownIdentifier {
                     reason: format!(
-                        "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth() / s(), cyclic() / periodic() / cc() / cp(), thinplate() / tps(), tensor() / te(), group() / re(), sphere() / sos() / spherical(), matern(), duchon(), bc() / boundary(), fs(), sz(), linkwiggle(), timewiggle(), link(), survmodel(), logslope()"
+                        "unknown term function in '{raw}'. Supported: bounded(), linear(), constrain(), nonnegative(), nonpositive(), smooth() / s(), cyclic() / periodic() / cc() / cp(), thinplate() / tps(), tensor() / te(), group() / re(), sphere() / sos() / spherical(), matern(), duchon(), pca(), bc() / boundary(), fs(), sz(), linkwiggle(), timewiggle(), link(), survmodel(), logslope()"
                     ),
                 }
                 .into());

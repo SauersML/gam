@@ -6156,6 +6156,7 @@ fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
             spec.identifiability,
             SpatialIdentifiability::FrozenTransform { .. }
         ),
+        SmoothBasisSpec::Pca { centered, center_mean, .. } => !*centered || center_mean.is_some(),
         SmoothBasisSpec::TensorBSpline { spec, .. } => matches!(
             spec.identifiability,
             TensorBSplineIdentifiability::FrozenTransform { .. }
@@ -12822,6 +12823,14 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
             identifiability_transform.clone(),
         )
         .map_err(EstimationError::from)?,
+        (
+            SmoothBasisSpec::Pca { .. },
+            BasisMetadata::Pca { basis_matrix, .. },
+        ) => crate::terms::basis::LatentCoordDesignDerivative::new_pca(
+            latent.clone(),
+            std::sync::Arc::new(basis_matrix.clone()),
+        )
+        .map_err(EstimationError::from)?,
         _ => return Ok(None),
     };
     if operator.p_out() != global_range.len() {
@@ -15251,6 +15260,25 @@ pub fn freeze_term_collection_from_design(
                 *input_scales = meta_scales.clone();
             }
             (
+                SmoothBasisSpec::Pca {
+                    feature_cols,
+                    basis_matrix,
+                    centered,
+                    center_mean,
+                },
+                BasisMetadata::Pca {
+                    feature_cols: fitted_cols,
+                    basis_matrix: fitted_basis,
+                    centered: fitted_centered,
+                    center_mean: fitted_mean,
+                },
+            ) => {
+                *feature_cols = fitted_cols.clone();
+                *basis_matrix = fitted_basis.clone();
+                *centered = *fitted_centered;
+                *center_mean = fitted_mean.clone();
+            }
+            (
                 SmoothBasisSpec::TensorBSpline {
                     feature_cols,
                     spec: s,
@@ -15368,6 +15396,25 @@ pub fn freeze_term_collection_from_design(
                             },
                             None => TensorBSplineIdentifiability::None,
                         };
+                    }
+                    (
+                        SmoothBasisSpec::Pca {
+                            feature_cols,
+                            basis_matrix,
+                            centered,
+                            center_mean,
+                        },
+                        BasisMetadata::Pca {
+                            feature_cols: fitted_cols,
+                            basis_matrix: fitted_basis,
+                            centered: fitted_centered,
+                            center_mean: fitted_mean,
+                        },
+                    ) => {
+                        *feature_cols = fitted_cols.clone();
+                        *basis_matrix = fitted_basis.clone();
+                        *centered = *fitted_centered;
+                        *center_mean = fitted_mean.clone();
                     }
                     _ => {}
                 }

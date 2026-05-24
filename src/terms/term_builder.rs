@@ -6,15 +6,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use ndarray::ArrayView1;
+use ndarray::{ArrayView1, Axis};
 
 use crate::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
     BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy, DuchonBasisSpec,
     DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
     MaternNu, SpatialIdentifiability, SphericalSplineBasisSpec, ThinPlateBasisSpec,
-    auto_spatial_center_strategy, default_num_centers, default_spatial_center_strategy,
-    plan_spatial_basis, resolve_duchon_orders,
+    auto_spatial_center_strategy, build_pca_basis_matrix, default_num_centers,
+    default_spatial_center_strategy, plan_spatial_basis, resolve_duchon_orders,
 };
 use crate::inference::data::{EncodedDataset as Dataset, missing_column_message};
 use crate::inference::formula_dsl::{
@@ -1070,6 +1070,39 @@ pub fn build_smooth_basis(
                     radial_reparam: None,
                 },
                 input_scales: None,
+            })
+        }
+        "pca" | "pc" | "principal-components" | "principal_components" => {
+            validate_known_options(
+                "pca",
+                options,
+                &[
+                    "type",
+                    "bs",
+                    "by",
+                    "k",
+                    "basis_dim",
+                    "basis-dim",
+                    "basisdim",
+                    "centered",
+                    "center",
+                    "double_penalty",
+                    "smooth_penalty",
+                ],
+            )?;
+            let k_pca = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
+                .unwrap_or_else(|| cols.len().min(64).max(1));
+            let centered = option_bool(options, "centered")
+                .or_else(|| option_bool(options, "center"))
+                .unwrap_or(true);
+            let x = ds.values.select(Axis(1), cols);
+            let basis_matrix =
+                build_pca_basis_matrix(x.view(), k_pca, centered).map_err(|e| e.to_string())?;
+            Ok(SmoothBasisSpec::Pca {
+                feature_cols: cols.to_vec(),
+                basis_matrix,
+                centered,
+                center_mean: None,
             })
         }
         "sphere" | "sos" | "spherical" => {
