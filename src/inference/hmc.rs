@@ -2652,37 +2652,37 @@ mod tests {
 
         // These families must succeed with their own inverse link.
         let accepted = [
-            (
-                LikelihoodFamily::BinomialLogit,
-                InverseLink::Standard(LinkFunction::Logit),
-            ),
-            (
-                LikelihoodFamily::BinomialProbit,
-                InverseLink::Standard(LinkFunction::Probit),
-            ),
-            (
-                LikelihoodFamily::BinomialCLogLog,
-                InverseLink::Standard(LinkFunction::CLogLog),
-            ),
-            (
-                LikelihoodFamily::GaussianIdentity,
-                InverseLink::Standard(LinkFunction::Identity),
-            ),
-            (
-                LikelihoodFamily::PoissonLog,
-                InverseLink::Standard(LinkFunction::Log),
-            ),
-            (
-                LikelihoodFamily::GammaLog,
-                InverseLink::Standard(LinkFunction::Log),
-            ),
+            LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Standard(LinkFunction::Logit),
+            },
+            LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Standard(LinkFunction::Probit),
+            },
+            LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Standard(LinkFunction::CLogLog),
+            },
+            LikelihoodSpec {
+                response: ResponseFamily::Gaussian,
+                link: InverseLink::Standard(LinkFunction::Identity),
+            },
+            LikelihoodSpec {
+                response: ResponseFamily::Poisson,
+                link: InverseLink::Standard(LinkFunction::Log),
+            },
+            LikelihoodSpec {
+                response: ResponseFamily::Gamma,
+                link: InverseLink::Standard(LinkFunction::Log),
+            },
         ];
-        for (family, link) in &accepted {
-            let result = joint_family_logp_and_grad(*family, link, &data, &eta);
+        for spec in &accepted {
+            let result = joint_family_logp_and_grad(spec, &data, &eta);
             assert!(
                 result.is_ok(),
-                "family {:?} should be accepted but got error: {:?}",
-                family,
+                "spec {:?} should be accepted but got error: {:?}",
+                spec,
                 result.err(),
             );
         }
@@ -2695,31 +2695,36 @@ mod tests {
         })
         .expect("sas state");
         let adaptive = [
-            (LikelihoodFamily::BinomialSas, InverseLink::Sas(sas_state)),
-            (
-                LikelihoodFamily::BinomialBetaLogistic,
-                InverseLink::BetaLogistic(
+            LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Sas(sas_state),
+            },
+            LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::BetaLogistic(
                     crate::mixture_link::state_from_sasspec(crate::types::SasLinkSpec {
                         initial_epsilon: 0.0,
                         initial_log_delta: 0.0,
                     })
                     .expect("bl state"),
                 ),
-            ),
+            },
         ];
-        for (family, link) in &adaptive {
-            let result = joint_family_logp_and_grad(*family, link, &data, &eta);
+        for spec in &adaptive {
+            let result = joint_family_logp_and_grad(spec, &data, &eta);
             assert!(
                 result.is_ok(),
-                "adaptive family {:?} should be accepted with its real link",
-                family,
+                "adaptive spec {:?} should be accepted with its real link",
+                spec,
             );
         }
 
         // RoystonParmar must be explicitly rejected (not silently remapped).
         let rp_result = joint_family_logp_and_grad(
-            LikelihoodFamily::RoystonParmar,
-            &InverseLink::Standard(LinkFunction::Logit),
+            &LikelihoodSpec {
+                response: ResponseFamily::RoystonParmar,
+                link: InverseLink::Standard(LinkFunction::Logit),
+            },
             &data,
             &eta,
         );
