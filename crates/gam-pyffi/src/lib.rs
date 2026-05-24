@@ -14395,15 +14395,12 @@ fn build_binomial_location_scale_ffi_payload(
         _ => None,
     };
 
-    let location_scale_likelihood_spec =
-        inverse_link_to_binomial_spec(&link_kind).map_err(|e| e.to_string())?;
-    let location_scale_likelihood = LikelihoodFamily::try_from(location_scale_likelihood_spec)
-        .map_err(|e| {
-            format!(
-                "failed to resolve LikelihoodFamily for binomial location-scale link {:?}: {e}",
-                link_kind
-            )
-        })?;
+    let location_scale_likelihood = inverse_link_to_binomial_spec(&link_kind).map_err(|e| {
+        format!(
+            "failed to resolve LikelihoodSpec for binomial location-scale link {:?}: {e}",
+            link_kind
+        )
+    })?;
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
         formula,
