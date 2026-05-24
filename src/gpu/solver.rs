@@ -1,11 +1,16 @@
-use crate::gpu::memory::DeviceMatrix;
-
-#[derive(Clone, Debug)]
-pub struct GpuFactor {
-    pub dim: usize,
-}
+use crate::gpu::memory::MatrixLocationMut;
 
 pub trait DenseSpdSolver {
-    fn potrf(&self, a: &mut DeviceMatrix<f64>) -> Result<GpuFactor, &'static str>;
-    fn potrs(&self, factor: &GpuFactor, rhs: &mut DeviceMatrix<f64>) -> Result<(), &'static str>;
+    type Factor;
+    type Error;
+
+    fn potrf(&self, matrix: MatrixLocationMut<'_, f64>) -> Result<Self::Factor, Self::Error>;
+    fn potrs(
+        &self,
+        factor: &Self::Factor,
+        rhs: MatrixLocationMut<'_, f64>,
+    ) -> Result<(), Self::Error>;
 }
+
+#[derive(Clone, Debug)]
+pub struct GpuSolverUnavailable;

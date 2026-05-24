@@ -1,16 +1,12 @@
 use std::marker::PhantomData;
 
-/// Matrix layout used by host/device interop.  GPU kernels prefer explicit
-/// leading dimensions rather than relying on ndarray stride inference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MatrixLayout {
     RowMajor,
     ColumnMajor,
 }
 
-/// Logical device buffer handle.  CPU-only builds cannot own actual device
-/// memory, but the type lets resident-state plumbing and policies compile in
-/// all configurations.
+/// Host-side descriptor for a future device buffer allocation.
 #[derive(Clone, Debug)]
 pub struct DeviceBuffer<T> {
     len: usize,
@@ -19,7 +15,7 @@ pub struct DeviceBuffer<T> {
 
 impl<T> DeviceBuffer<T> {
     #[must_use]
-    pub fn unavailable(len: usize) -> Self {
+    pub fn new_unallocated(len: usize) -> Self {
         Self {
             len,
             _marker: PhantomData,
@@ -39,26 +35,36 @@ impl<T> DeviceBuffer<T> {
 
 #[derive(Clone, Debug)]
 pub struct DeviceMatrix<T> {
-    pub buffer: DeviceBuffer<T>,
     pub rows: usize,
     pub cols: usize,
     pub ld: usize,
     pub layout: MatrixLayout,
+    pub buffer: DeviceBuffer<T>,
 }
 
 impl<T> DeviceMatrix<T> {
     #[must_use]
-    pub fn unavailable(rows: usize, cols: usize, layout: MatrixLayout) -> Self {
+    pub fn descriptor(rows: usize, cols: usize, layout: MatrixLayout) -> Self {
         let ld = match layout {
             MatrixLayout::RowMajor => cols,
             MatrixLayout::ColumnMajor => rows,
         };
         Self {
-            buffer: DeviceBuffer::unavailable(rows.saturating_mul(cols)),
             rows,
             cols,
             ld,
             layout,
+            buffer: DeviceBuffer::new_unallocated(rows * cols),
         }
     }
+}
+
+pub enum MatrixLocation<'a, T> {
+    Host(&'a ndarray::Array2<T>),
+    Device(&'a DeviceMatrix<T>),
+}
+
+pub enum MatrixLocationMut<'a, T> {
+    Host(&'a mut ndarray::Array2<T>),
+    Device(&'a mut DeviceMatrix<T>),
 }
