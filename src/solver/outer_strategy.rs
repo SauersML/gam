@@ -1337,21 +1337,6 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
     attempts
 }
 
-/// Effective absolute-gradient floor: the scalar tolerance, widened
-/// to `objective_scale · 1e-9` when the caller has declared the
-/// objective's natural magnitude. Used both as opt's gradient
-/// tolerance and as the shared cross-check elsewhere in the runner.
-fn outer_gradient_absolute_floor(tolerance: f64, objective_scale: Option<f64>) -> f64 {
-    let mut abs = tolerance;
-    if let Some(scale) = objective_scale {
-        let scaled_floor = scale * 1.0e-9;
-        if scaled_floor > abs {
-            abs = scaled_floor;
-        }
-    }
-    abs
-}
-
 fn disabled_fallback_hybrid_efs_has_standalone_bfgs_primary(
     cap: &OuterCapability,
     config: &OuterConfig,
