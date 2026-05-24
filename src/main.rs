@@ -62,7 +62,7 @@ use gam::smooth::{
     SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
     build_term_collection_design, freeze_term_collection_from_design,
 };
-use gam::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
+use gam::smooth_test::SmoothTestScale;
 use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use gam::survival_construction::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,

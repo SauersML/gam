@@ -54,7 +54,7 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::time::Instant;
 
-mod common;
+mod power_law_common;
 
 const SEED: u64 = 0x5CA1_AB1E_5C0F_E5A1;
 
@@ -464,8 +464,8 @@ fn report_power_law(
     extrapolate: &[(&str, f64)],
     budget_y: f64,
 ) -> Option<(f64, f64, f64)> {
-    // Thin wrapper around the shared analyzer in tests/common; preserves
+    // Thin wrapper around the shared analyzer; preserves
     // the (alpha, a, r²) return tuple this probe's caller expects.
-    let fit = common::report_power_law(tag, points, extrapolate, budget_y)?;
+    let fit = power_law_common::report_power_law(tag, points, extrapolate, budget_y)?;
     Some((fit.alpha, fit.a, fit.r2))
 }
