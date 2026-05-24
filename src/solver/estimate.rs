@@ -43,8 +43,8 @@ use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::terms::smooth::BlockwisePenalty;
 use crate::types::{
     Coefficients, GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LatentCLogLogState,
-    LikelihoodFamily, LikelihoodScaleMetadata, LinkFunction, LogLikelihoodNormalization,
-    LogSmoothingParamsView, MixtureLinkState, RidgePassport, SasLinkState,
+    LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction, LogLikelihoodNormalization,
+    LogSmoothingParamsView, MixtureLinkState, ResponseFamily, RidgePassport, SasLinkState,
 };
 use crate::types::{MixtureLinkSpec, SasLinkSpec};
 
@@ -1755,7 +1755,7 @@ impl core::fmt::Debug for EstimationError {
 pub struct ExternalOptimResult {
     pub beta: Array1<f64>,
     pub lambdas: Array1<f64>,
-    pub likelihood_family: LikelihoodFamily,
+    pub likelihood_family: LikelihoodSpec,
     pub likelihood_scale: LikelihoodScaleMetadata,
     pub log_likelihood_normalization: LogLikelihoodNormalization,
     pub log_likelihood: f64,
@@ -1790,7 +1790,7 @@ pub struct ExternalOptimResult {
 
 #[derive(Clone)]
 pub struct ExternalOptimOptions {
-    pub family: crate::types::LikelihoodFamily,
+    pub family: crate::types::LikelihoodSpec,
     pub latent_cloglog: Option<LatentCLogLogState>,
     pub mixture_link: Option<MixtureLinkSpec>,
     pub optimize_mixture: bool,

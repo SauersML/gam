@@ -4,11 +4,6 @@ This script is intentionally small and deterministic. It builds one curved
 feature in a high-dimensional observation space, fits the gamfit SAE-manifold
 configuration, and compares the REML evidence of a single curved atom against
 ten linear shards.
-
-Intended target path from the task:
-``/Users/user/Manifold-SAE/experiments/sae_manifold_demo.py``.
-The current sandbox only permits writes under ``/Users/user/gam``, so this
-repo-local copy carries the same demo content.
 """
 
 from __future__ import annotations
