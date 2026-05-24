@@ -1946,26 +1946,6 @@ fn resolved_external_config(
     Ok((cfg, effective_sas_link))
 }
 
-#[inline]
-fn ensure_exact_directional_hyper_supported(
-    _: LinkFunction,
-    _: bool,
-    _: bool,
-    _: &str,
-) -> Result<(), EstimationError> {
-    // Kept as a central compatibility hook for API-level validation.
-    //
-    // Current status:
-    // - Dense exact path supports Firth-logit directional hyper-gradients for
-    //   both penalty-only and design-moving directions.
-    // - Sparse exact path supports the same Firth-logit directional
-    //   hyper-gradients via sparse Cholesky solves plus the shared dense
-    //   Fisher-information reduction.
-    //
-    // No additional API-level restrictions are needed here.
-    Ok(())
-}
-
 fn validate_penalty_specs(
     specs: &[PenaltySpec],
     p: usize,
@@ -2271,16 +2251,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 }
             }
 
-            let has_design_drift = hyper_dirs
-                .iter()
-                .any(|dir| dir.x_tau_original.any_nonzero());
-            ensure_exact_directional_hyper_supported(
-                self.config.link_function(),
-                self.config.firth_bias_reduction,
-                has_design_drift,
-                context,
-            )?;
-
             self.reml_state
                 .set_penalty_shrinkage_floor(self.penalty_shrinkage_floor);
             self.reml_state.setwarm_start_original_beta(warm_start_beta);
@@ -2312,16 +2282,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
                 }
             }
         }
-
-        let has_design_drift = hyper_dirs
-            .iter()
-            .any(|dir| dir.x_tau_original.any_nonzero());
-        ensure_exact_directional_hyper_supported(
-            self.config.link_function(),
-            self.config.firth_bias_reduction,
-            has_design_drift,
-            context,
-        )?;
 
         self.reml_state.reset_surface(
             x_fit,
