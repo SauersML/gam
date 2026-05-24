@@ -4,7 +4,7 @@ use gam::smooth::{
     fit_term_collection_with_penalty_block_gamma_prior_callback,
     fit_term_collection_with_penalty_block_gamma_priors,
 };
-use gam::types::{LikelihoodFamily, RhoPrior};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior};
 use ndarray::{Array1, Array2};
 
 fn fit_options() -> FitOptions {
@@ -64,13 +64,17 @@ fn linear_fixture() -> (
 fn flat_gamma_precision_prior_matches_uninformed_fit_bitwise() {
     let (data, y, weights, offset, spec) = linear_fixture();
     let opts = fit_options();
+    let likelihood = LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(LinkFunction::Identity),
+    );
     let base = fit_term_collection_forspec(
         data.view(),
         y.view(),
         weights.view(),
         offset.view(),
         &spec,
-        LikelihoodFamily::GaussianIdentity,
+        likelihood.clone(),
         &opts,
     )
     .expect("base fit");
@@ -81,7 +85,7 @@ fn flat_gamma_precision_prior_matches_uninformed_fit_bitwise() {
         offset.view(),
         &spec,
         &[("linear".to_string(), 1.0, 0.0)],
-        LikelihoodFamily::GaussianIdentity,
+        likelihood,
         &opts,
     )
     .expect("flat gamma fit");
@@ -95,6 +99,10 @@ fn flat_gamma_precision_prior_matches_uninformed_fit_bitwise() {
 fn informative_gamma_precision_prior_shrinks_by_map_update() {
     let (data, y, weights, offset, spec) = linear_fixture();
     let opts = fit_options();
+    let likelihood = LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(LinkFunction::Identity),
+    );
     let fit = fit_term_collection_with_penalty_block_gamma_priors(
         data.view(),
         y.view(),
@@ -102,7 +110,7 @@ fn informative_gamma_precision_prior_shrinks_by_map_update() {
         offset.view(),
         &spec,
         &[("linear".to_string(), 100_001.0, 100.0)],
-        LikelihoodFamily::GaussianIdentity,
+        likelihood,
         &opts,
     )
     .expect("informative gamma fit");
@@ -132,6 +140,10 @@ fn informative_gamma_precision_prior_shrinks_by_map_update() {
 fn gamma_precision_prior_callback_is_invoked_once_per_penalty_block() {
     let (data, y, weights, offset, spec) = linear_fixture();
     let opts = fit_options();
+    let likelihood = LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(LinkFunction::Identity),
+    );
     let mut seen = Vec::new();
     let callback_fit = fit_term_collection_with_penalty_block_gamma_prior_callback(
         data.view(),
@@ -147,7 +159,7 @@ fn gamma_precision_prior_callback_is_invoked_once_per_penalty_block() {
             ));
             Some((13.0, 0.25))
         },
-        LikelihoodFamily::GaussianIdentity,
+        likelihood.clone(),
         &opts,
     )
     .expect("callback gamma fit");
@@ -158,7 +170,7 @@ fn gamma_precision_prior_callback_is_invoked_once_per_penalty_block() {
         offset.view(),
         &spec,
         &[("linear".to_string(), 13.0, 0.25)],
-        LikelihoodFamily::GaussianIdentity,
+        likelihood,
         &opts,
     )
     .expect("keyed gamma fit");

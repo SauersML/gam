@@ -2500,9 +2500,8 @@ fn run_fitwith_predict_noise(
         model.noise_offset_column = args.noise_offset_column.clone();
         let location_scale_likelihood_spec =
             inverse_link_to_binomial_spec(&location_scale_link_kind).map_err(|e| e.to_string())?;
-        let location_scale_likelihood = spec_to_legacy_family(&location_scale_likelihood_spec);
         model.family_state = FittedFamily::LocationScale {
-            likelihood: location_scale_likelihood,
+            likelihood: location_scale_likelihood_spec,
             base_link: Some(location_scale_link_kind.clone()),
         };
         if let Some((knots, degree, beta_link_wiggle)) = wiggle_meta {

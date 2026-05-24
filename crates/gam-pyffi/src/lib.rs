@@ -9992,7 +9992,7 @@ fn design_matrix_dataset_impl(
         x_flat,
         n_rows,
         n_cols,
-        family_kind: family_link_kind(model.likelihood()).to_string(),
+        family_kind: family_link_kind(&model_likelihood_spec(model)).to_string(),
         model_class: prediction_model_class_label(model),
         beta: Some(fit.beta.to_vec()),
         covariance_flat,
@@ -10134,7 +10134,7 @@ fn posterior_predict_table_impl(
         n_draws,
         n_rows,
         model_class: prediction_model_class_label(&model),
-        family_kind: family_link_kind(model.likelihood()).to_string(),
+        family_kind: family_link_kind(&model_likelihood_spec(model)).to_string(),
     };
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize posterior_predict payload: {err}"))
@@ -10167,28 +10167,50 @@ fn sample_table_impl(
 /// Returns the inverse-link kind tag emitted to the Python wrapper.
 ///
 /// The tag is intentionally lower-kebab-case so it can be matched as a
-/// plain string on the Python side (the Rust `LikelihoodFamily` enum
-/// itself is not part of the FFI surface). Families that don't have a
-/// closed-form scalar inverse link (`royston-parmar`, `binomial-sas`,
+/// plain string on the Python side (the Rust `LikelihoodSpec` itself is
+/// not part of the FFI surface). Families that don't have a closed-form
+/// scalar inverse link (`royston-parmar`, `binomial-sas`,
 /// `binomial-beta-logistic`) get their own tags so the Python side can
 /// refuse to compute a response-scale prediction by string-compare
 /// instead of by guessing.
-fn family_link_kind(family: LikelihoodFamily) -> &'static str {
-    match family {
-        LikelihoodFamily::GaussianIdentity => "identity",
-        LikelihoodFamily::BinomialLogit => "logit",
-        LikelihoodFamily::BinomialProbit => "probit",
-        LikelihoodFamily::BinomialCLogLog => "cloglog",
-        LikelihoodFamily::BinomialLatentCLogLog => "cloglog",
-        LikelihoodFamily::PoissonLog => "log",
-        LikelihoodFamily::Tweedie { .. } => "log",
-        LikelihoodFamily::NegativeBinomial { .. } => "log",
-        LikelihoodFamily::BetaLogit { .. } => "logit",
-        LikelihoodFamily::GammaLog => "log",
-        LikelihoodFamily::BinomialMixture => "logit",
-        LikelihoodFamily::BinomialSas => "sas",
-        LikelihoodFamily::BinomialBetaLogistic => "beta-logistic",
-        LikelihoodFamily::RoystonParmar => "royston-parmar",
+fn family_link_kind(family: &LikelihoodSpec) -> &'static str {
+    match (&family.response, &family.link) {
+        (ResponseFamily::RoystonParmar, _) => "royston-parmar",
+        (ResponseFamily::Binomial, InverseLink::Sas(_)) => "sas",
+        (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => "beta-logistic",
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Sas)) => "sas",
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::BetaLogistic)) => {
+            "beta-logistic"
+        }
+        _ => match family.link_function() {
+            LinkFunction::Identity => "identity",
+            LinkFunction::Logit => "logit",
+            LinkFunction::Probit => "probit",
+            LinkFunction::CLogLog => "cloglog",
+            LinkFunction::Log => "log",
+            LinkFunction::Sas => "sas",
+            LinkFunction::BetaLogistic => "beta-logistic",
+        },
+    }
+}
+
+/// Extract the `LikelihoodSpec` carried by the saved model's `family_state`.
+/// Latent-survival / latent-binary states have no GLM-style likelihood; they
+/// map to `RoystonParmar` with an identity link for the response-scale tag.
+fn model_likelihood_spec(model: &FittedModel) -> LikelihoodSpec {
+    match &model.payload().family_state {
+        gam::inference::model::FittedFamily::Standard { likelihood, .. }
+        | gam::inference::model::FittedFamily::LocationScale { likelihood, .. }
+        | gam::inference::model::FittedFamily::MarginalSlope { likelihood, .. }
+        | gam::inference::model::FittedFamily::Survival { likelihood, .. }
+        | gam::inference::model::FittedFamily::TransformationNormal { likelihood, .. } => {
+            likelihood.clone()
+        }
+        gam::inference::model::FittedFamily::LatentSurvival { .. }
+        | gam::inference::model::FittedFamily::LatentBinary { .. } => LikelihoodSpec::new(
+            ResponseFamily::RoystonParmar,
+            InverseLink::Standard(LinkFunction::Identity),
+        ),
     }
 }
 
@@ -10256,7 +10278,7 @@ fn build_sample_payload(model: &FittedModel, nuts: &NutsResult, cfg: &NutsConfig
             seed: cfg.seed,
         },
         model_class: prediction_model_class_label(model),
-        family_kind: family_link_kind(model.likelihood()).to_string(),
+        family_kind: family_link_kind(&model_likelihood_spec(model)).to_string(),
         method: nuts_method_label(model).to_string(),
     }
 }

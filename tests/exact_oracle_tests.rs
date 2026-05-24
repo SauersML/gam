@@ -4,7 +4,7 @@ use gam::estimate::{
     ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
 };
 use gam::smooth::BlockwisePenalty;
-use gam::types::LikelihoodFamily;
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 
 // LAML-vs-quadrature-oracle gradient comparisons were removed: the impl
 // returns dV_LAML/dρ for the standard mgcv Bayesian Laplace ML score
@@ -30,9 +30,9 @@ use gam::types::LikelihoodFamily;
 ///
 /// Note that `firth_bias_reduction: Some(firth)` is set EXPLICITLY in both
 /// branches.  Passing `None` here would silently route through the
-/// `resolve_external_family` default — `family.supports_firth()` is `true`
-/// for `BinomialLogit`, so `logit_opts(false)` would otherwise still run
-/// the Firth path and the "non-Firth" test name would be a lie.
+/// `resolve_external_family` default — standard binomial logit supports
+/// Firth correction, so `logit_opts(false)` would otherwise still run the
+/// Firth path and the "non-Firth" test name would be a lie.
 fn logit_opts(firth: bool) -> ExternalOptimOptions {
     ExternalOptimOptions {
         latent_cloglog: None,
@@ -40,7 +40,10 @@ fn logit_opts(firth: bool) -> ExternalOptimOptions {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        family: LikelihoodFamily::BinomialLogit,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        ),
         compute_inference: true,
         max_iter: 200,
         // Inner P-IRLS must converge tightly so cost(ρ ± δ) and grad(ρ) are
