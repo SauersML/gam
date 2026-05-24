@@ -19172,7 +19172,7 @@ fn build_cyclic_duchon_basis_1dwithworkspace(
                     r,
                     spec.length_scale,
                     p_order,
-                    spec.power,
+                    s_order_usize,
                     1,
                     coeffs.as_ref(),
                 )?
@@ -19196,7 +19196,7 @@ fn build_cyclic_duchon_basis_1dwithworkspace(
     };
 
     let mut s_kernel = Array2::<f64>::zeros((k + 1, k + 1));
-    let s_cyclic = create_cyclic_difference_penalty_matrix(k, spec.power.max(1).min(k - 1))?;
+    let s_cyclic = create_cyclic_difference_penalty_matrix(k, s_order_usize.max(1).min(k - 1))?;
     s_kernel.slice_mut(s![..k, ..k]).assign(&s_cyclic);
     let s_final = if let Some(z) = transform_for_penalty {
         fast_ab(&fast_atb(z, &s_kernel), z)
@@ -19222,7 +19222,7 @@ fn build_cyclic_duchon_basis_1dwithworkspace(
             centers,
             length_scale: spec.length_scale,
             periodic: Some(vec![Some(period)]),
-            power: spec.power,
+            power: s_order_usize,
             nullspace_order: DuchonNullspaceOrder::Zero,
             identifiability_transform,
             input_scales: None,
