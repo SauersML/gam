@@ -2236,7 +2236,7 @@ impl SurvivalLocationScaleFamily {
         let pls = self.x_log_sigma.ncols();
         let beta_t = &block_states[Self::BLOCK_THRESHOLD].beta;
         let beta_ls = &block_states[Self::BLOCK_LOG_SIGMA].beta;
-        let _row_chunk_target_bytes = self.policy.row_chunk_target_bytes;
+        drop(self.policy.row_chunk_target_bytes);
         let t_time_varying = self.x_threshold_entry.is_some();
         let ls_time_varying = self.x_log_sigma_entry.is_some();
 
@@ -6930,20 +6930,20 @@ fn exact_survival_response_moments(
     let quadctx = crate::quadrature::QuadratureContext::new();
     {
         // Warm GH rule caches on the calling thread with cheap probes.
-        let _ = crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, String>(
+        drop(crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, String>(
             &quadctx,
             [0.0_f64],
             [[1.0_f64]],
             21,
             |_x: [f64; 1]| Ok((0.0_f64, 0.0_f64)),
-        );
-        let _ = crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, String>(
+        ));
+        drop(crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, String>(
             &quadctx,
             [0.0_f64],
             [[1.0_f64]],
             15,
             |_x: [f64; 1]| Ok((0.0_f64, 0.0_f64)),
-        );
+        ));
     }
     if n >= SURVIVAL_ROW_PARALLEL_THRESHOLD {
         let first_slice = first
@@ -7756,7 +7756,7 @@ impl SurvivalLocationScaleFamily {
             }
             .into());
         }
-        let _ = block_states;
+        drop(block_states);
 
         let time_dir = d_beta_flat.slice(s![offsets[0]..offsets[1]]).to_owned();
         let threshold_dir = d_beta_flat.slice(s![offsets[1]..offsets[2]]).to_owned();
@@ -8388,7 +8388,7 @@ impl SurvivalLocationScaleFamily {
         dynamic: &SurvivalDynamicGeometry,
         row_mask: Option<&Array1<f64>>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let _ = block_states;
+        drop(block_states);
         let offsets = self.joint_block_offsets();
         let p_total = *offsets
             .last()

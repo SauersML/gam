@@ -39,7 +39,6 @@ src/solver/pirls.rs	fn default_beta_guess_external( p: usize, link_function: Lin
 src/solver/pirls.rs	fn solve_penalized_least_squares_implicit( x_original: &DesignMatrix, transform: Option<&WorkingReparamTransform>, z: ArrayView1<f64>, weights: ArrayView1<f64>, offset: ArrayView1<f64>, penalty: &PirlsPenalty, workspace: &mut PirlsWorkspace, y: ArrayView1<f64>, link_function: LinkFunction, gaussian_fixed_cache: Option<&GaussianFixedCache>, ) -> Result<(StablePLSResult, usize), EstimationError>	unreachable!
 src/solver/reml/unified.rs	pub fn scaled_add_penalty_view( &self, beta: ArrayView1<'_, f64>, scale: f64, mut out: ArrayViewMut1<'_, f64>, )	unreachable!
 src/solver/workflow.rs	fn materialize_survival<'a>( parsed: &ParsedFormula, data: &'a Dataset, col_map: &HashMap<String, usize>, config: &FitConfig, entry_col: &str, exit_col: &str, event_col: &str, ) -> Result<MaterializedModel<'a>, String>	unreachable!
-src/terms/basis.rs	fn finite_part_series( d: usize, a: usize, b: usize, kappa: f64, r: f64, max_order: usize, kappa_derivative_order: usize, ) -> Vec<f64>	unreachable!
 src/terms/basis.rs	fn isotropic_radial_laplacian_power_from_q0( q: usize, d: usize, m: usize, s: usize, kappa: f64, big_r: f64, ) -> f64	unreachable!
 src/terms/basis.rs	fn matern_collocation_operator_matrices_should_match_closed_forms_in_1d()	unreachable!
 src/terms/basis.rs	fn matern_operator_psi_triplet_should_match_closed_form_polynomials()	unreachable!
