@@ -5318,16 +5318,6 @@ impl SurvivalMarginalSlopeFamily {
         }
         Ok((f, f_a, f_aa))
     }
-    fn solve_row_survival_intercept(
-        &self,
-        q: f64,
-        slope: f64,
-        beta_h: Option<&Array1<f64>>,
-        beta_w: Option<&Array1<f64>>,
-    ) -> Result<(f64, f64), String> {
-        self.solve_row_survival_intercept_with_slot(q, slope, beta_h, beta_w, None)
-    }
-
     fn solve_row_survival_intercept_with_slot(
         &self,
         q: f64,

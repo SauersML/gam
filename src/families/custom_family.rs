@@ -20059,6 +20059,68 @@ pub(crate) fn fit_custom_family_fixed_log_lambda_warm_start<
 }
 
 #[cfg(test)]
+mod test_support {
+    use super::*;
+    use ndarray::{Array1, Array2};
+
+    pub(crate) fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Sync + 'static>(
+        family: &F,
+        specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
+        penalty_counts: &[usize],
+        rho: &Array1<f64>,
+        warm_start: Option<&ConstrainedWarmStart>,
+        eval_mode: EvalMode,
+    ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>, ConstrainedWarmStart), String> {
+        let result = super::outerobjectivegradienthessian_internal(
+            family,
+            specs,
+            options,
+            penalty_counts,
+            rho,
+            warm_start,
+            crate::types::RhoPrior::Flat,
+            eval_mode,
+        )?;
+        Ok((
+            result.objective,
+            result.gradient,
+            result.outer_hessian.materialize_dense()?,
+            result.warm_start,
+        ))
+    }
+
+    /// Test-only helper exposing the value+gradient outer evaluation entry point
+    /// to other modules' test code.  Used by
+    /// the batched-gradient tests in `families/gamlss.rs` to pin the batched
+    /// override against a test oracle
+    /// without re-implementing the inner-fit / penalty-pseudo-logdet plumbing.
+    /// Returns only `(value, gradient)`; the warm-start is internal state with a
+    /// private type and is dropped at the boundary.
+    pub(crate) fn test_outerobjective_andgradient<
+        F: CustomFamily + Clone + Send + Sync + 'static,
+    >(
+        family: &F,
+        specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
+        penalty_counts: &[usize],
+        rho: &Array1<f64>,
+    ) -> Result<(f64, Array1<f64>), String> {
+        let result = super::outerobjectivegradienthessian_internal(
+            family,
+            specs,
+            options,
+            penalty_counts,
+            rho,
+            None,
+            crate::types::RhoPrior::Flat,
+            EvalMode::ValueAndGradient,
+        )?;
+        Ok((result.objective, result.gradient))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #[derive(Clone)]
     struct BatchedOuterHessianTestFamily {
@@ -20180,62 +20242,6 @@ mod tests {
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
-
-    pub(crate) fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Sync + 'static>(
-        family: &F,
-        specs: &[ParameterBlockSpec],
-        options: &BlockwiseFitOptions,
-        penalty_counts: &[usize],
-        rho: &Array1<f64>,
-        warm_start: Option<&ConstrainedWarmStart>,
-        eval_mode: EvalMode,
-    ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>, ConstrainedWarmStart), String> {
-        let result = super::outerobjectivegradienthessian_internal(
-            family,
-            specs,
-            options,
-            penalty_counts,
-            rho,
-            warm_start,
-            crate::types::RhoPrior::Flat,
-            eval_mode,
-        )?;
-        Ok((
-            result.objective,
-            result.gradient,
-            result.outer_hessian.materialize_dense()?,
-            result.warm_start,
-        ))
-    }
-
-    /// Test-only helper exposing the value+gradient outer evaluation entry point
-    /// to other modules' test code.  Used by
-    /// the batched-gradient tests in `families/gamlss.rs` to pin the batched
-    /// override against a test oracle
-    /// without re-implementing the inner-fit / penalty-pseudo-logdet plumbing.
-    /// Returns only `(value, gradient)`; the warm-start is internal state with a
-    /// private type and is dropped at the boundary.
-    pub(crate) fn test_outerobjective_andgradient<
-        F: CustomFamily + Clone + Send + Sync + 'static,
-    >(
-        family: &F,
-        specs: &[ParameterBlockSpec],
-        options: &BlockwiseFitOptions,
-        penalty_counts: &[usize],
-        rho: &Array1<f64>,
-    ) -> Result<(f64, Array1<f64>), String> {
-        let result = super::outerobjectivegradienthessian_internal(
-            family,
-            specs,
-            options,
-            penalty_counts,
-            rho,
-            None,
-            crate::types::RhoPrior::Flat,
-            EvalMode::ValueAndGradient,
-        )?;
-        Ok((result.objective, result.gradient))
-    }
 
     fn solve_blockweighted_system(
         x: &DesignMatrix,
@@ -21105,7 +21111,7 @@ mod tests {
         rho: &Array1<f64>,
         warm_start: Option<&ConstrainedWarmStart>,
     ) -> Result<(f64, Array1<f64>, ConstrainedWarmStart), String> {
-        let (obj, grad, _, warm) = outerobjectivegradienthessian(
+        let (obj, grad, _, warm) = super::test_support::outerobjectivegradienthessian(
             family,
             specs,
             options,
@@ -23918,7 +23924,7 @@ mod tests {
             options,
         } = binomial_location_scale_wiggle_outer_fixture();
 
-        let (outer_obj, outer_grad, outer_hessian, _) = outerobjectivegradienthessian(
+        let (outer_obj, outer_grad, outer_hessian, _) = super::test_support::outerobjectivegradienthessian(
             &family,
             &specs,
             &options,
@@ -24242,7 +24248,7 @@ mod tests {
             ..BlockwiseFitOptions::default()
         };
 
-        let (_, _, h0_opt, _) = outerobjectivegradienthessian(
+        let (_, _, h0_opt, _) = super::test_support::outerobjectivegradienthessian(
             &family,
             &specs,
             &options,
@@ -24262,7 +24268,7 @@ mod tests {
             let mut rho_m = rho.clone();
             rho_p[l] += h;
             rho_m[l] -= h;
-            let (_, gp, _, _) = outerobjectivegradienthessian(
+            let (_, gp, _, _) = super::test_support::outerobjectivegradienthessian(
                 &family,
                 &specs,
                 &options,
@@ -24272,7 +24278,7 @@ mod tests {
                 EvalMode::ValueAndGradient,
             )
             .expect("objective/gradient +");
-            let (_, gm, _, _) = outerobjectivegradienthessian(
+            let (_, gm, _, _) = super::test_support::outerobjectivegradienthessian(
                 &family,
                 &specs,
                 &options,
@@ -24422,7 +24428,7 @@ mod tests {
             ..BlockwiseFitOptions::default()
         };
 
-        let (_, _, h0_opt, _) = outerobjectivegradienthessian(
+        let (_, _, h0_opt, _) = super::test_support::outerobjectivegradienthessian(
             &family,
             &specs,
             &options,
@@ -24442,7 +24448,7 @@ mod tests {
             let mut rho_m = rho.clone();
             rho_p[l] += h;
             rho_m[l] -= h;
-            let (_, gp, _, _) = outerobjectivegradienthessian(
+            let (_, gp, _, _) = super::test_support::outerobjectivegradienthessian(
                 &family,
                 &specs,
                 &options,
@@ -24452,7 +24458,7 @@ mod tests {
                 EvalMode::ValueAndGradient,
             )
             .expect("objective/gradient +");
-            let (_, gm, _, _) = outerobjectivegradienthessian(
+            let (_, gm, _, _) = super::test_support::outerobjectivegradienthessian(
                 &family,
                 &specs,
                 &options,
@@ -25278,7 +25284,7 @@ mod tests {
         };
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            outerobjectivegradienthessian(
+            super::test_support::outerobjectivegradienthessian(
                 &family,
                 &specs,
                 &options,

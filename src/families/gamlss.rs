@@ -28994,7 +28994,7 @@ mod tests {
             ..BlockwiseFitOptions::default()
         };
 
-        let (f0, g0) = crate::families::custom_family::tests::test_outerobjective_andgradient(
+        let (f0, g0) = crate::families::custom_family::test_support::test_outerobjective_andgradient(
             &family,
             &specs,
             &options,
@@ -29018,7 +29018,7 @@ mod tests {
             let mut rho_m = rho.clone();
             rho_p[k] += h;
             rho_m[k] -= h;
-            let (fp, _) = crate::families::custom_family::tests::test_outerobjective_andgradient(
+            let (fp, _) = crate::families::custom_family::test_support::test_outerobjective_andgradient(
                 &family,
                 &specs,
                 &options,
@@ -29026,7 +29026,7 @@ mod tests {
                 &rho_p,
             )
             .expect("objective at rho+h");
-            let (fm, _) = crate::families::custom_family::tests::test_outerobjective_andgradient(
+            let (fm, _) = crate::families::custom_family::test_support::test_outerobjective_andgradient(
                 &family,
                 &specs,
                 &options,
