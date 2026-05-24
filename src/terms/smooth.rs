@@ -14977,6 +14977,7 @@ impl SingleBlockLatentCoordDesignCache {
                 data,
                 &spec,
                 term_index,
+                analytic_rho_count,
                 &self.feature_cols,
             )
             .map_err(|e| e.to_string())?;
