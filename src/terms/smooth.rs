@@ -3916,7 +3916,6 @@ fn build_shape_constraint_design_1d(
                     .unwrap_or(BSplineIdentifiability::None),
                 boundary: spec.boundary.clone(),
                 boundary_conditions: BSplineBoundaryConditions::default(),
-                streaming_chunk_size: spec.streaming_chunk_size,
             };
             build_bspline_basis_1d(x_grid.view(), &evalspec)?
                 .design
@@ -7845,7 +7844,6 @@ fn with_identifiability_transform(
             knots,
             identifiability_transform,
             periodic,
-            streaming_chunk_size,
         } => Ok(BasisMetadata::BSpline1D {
             knots: knots.clone(),
             periodic: *periodic,
@@ -7853,7 +7851,6 @@ fn with_identifiability_transform(
                 identifiability_transform.as_ref(),
                 transform,
             )?,
-            streaming_chunk_size: *streaming_chunk_size,
         }),
         BasisMetadata::ThinPlate {
             centers,
@@ -7880,7 +7877,6 @@ fn with_identifiability_transform(
             max_degree,
             wahba_kernel,
             constraint_transform,
-            streaming_chunk_size,
         } => Ok(BasisMetadata::Sphere {
             centers: centers.clone(),
             penalty_order: *penalty_order,
@@ -7891,7 +7887,6 @@ fn with_identifiability_transform(
                 constraint_transform.as_ref(),
                 transform,
             )?,
-            streaming_chunk_size: *streaming_chunk_size,
         }),
         BasisMetadata::Matern {
             centers,
@@ -7902,7 +7897,6 @@ fn with_identifiability_transform(
             identifiability_transform,
             input_scales,
             aniso_log_scales,
-            streaming_chunk_size,
         } => Ok(BasisMetadata::Matern {
             centers: centers.clone(),
             length_scale: *length_scale,
@@ -7915,7 +7909,6 @@ fn with_identifiability_transform(
             )?,
             input_scales: input_scales.clone(),
             aniso_log_scales: aniso_log_scales.clone(),
-            streaming_chunk_size: *streaming_chunk_size,
         }),
         BasisMetadata::Duchon {
             centers,
@@ -14879,7 +14872,7 @@ impl SingleBlockLatentCoordDesignCache {
         })?;
         match (&termspec.basis, &smooth_term.metadata) {
             (
-                SmoothBasisSpec::Matern { spec, .. },
+                SmoothBasisSpec::Matern { .. },
                 BasisMetadata::Matern {
                     centers,
                     length_scale,
@@ -14894,7 +14887,10 @@ impl SingleBlockLatentCoordDesignCache {
                 aniso_log_scales: aniso_log_scales
                     .clone()
                     .unwrap_or_else(|| vec![0.0; centers.ncols()]),
-                chunk_size: spec.streaming_chunk_size,
+                chunk_size: crate::basis::auto_streaming_chunk_size_for_dense(
+                    self.n_obs,
+                    centers.nrows(),
+                ),
             }),
             (
                 SmoothBasisSpec::Duchon { .. },
@@ -14923,14 +14919,16 @@ impl SingleBlockLatentCoordDesignCache {
                     centers,
                     penalty_order,
                     method,
-                    streaming_chunk_size,
                     ..
                 },
             ) if matches!(*method, crate::basis::SphereMethod::Wahba) => {
                 Ok(crate::solver::latent_cache::LatentBasisKind::Sphere {
                     centers: centers.clone(),
                     penalty_order: *penalty_order,
-                    chunk_size: *streaming_chunk_size,
+                    chunk_size: crate::basis::auto_streaming_chunk_size_for_dense(
+                        self.n_obs,
+                        centers.nrows(),
+                    ),
                 })
             }
             (
@@ -14938,7 +14936,6 @@ impl SingleBlockLatentCoordDesignCache {
                 BasisMetadata::BSpline1D {
                     knots,
                     periodic,
-                    streaming_chunk_size,
                     ..
                 },
             ) => {
@@ -14948,13 +14945,20 @@ impl SingleBlockLatentCoordDesignCache {
                         period: *period,
                         degree: spec.degree,
                         num_basis: *num_basis,
-                        chunk_size: *streaming_chunk_size,
+                        chunk_size: crate::basis::auto_streaming_chunk_size_for_dense(
+                            self.n_obs,
+                            *num_basis,
+                        ),
                     })
                 } else {
+                    let num_basis_est = knots.len().saturating_sub(spec.degree + 1);
                     Ok(crate::solver::latent_cache::LatentBasisKind::TensorBspline {
                         knots: vec![knots.clone()],
                         degrees: vec![spec.degree],
-                        chunk_size: *streaming_chunk_size,
+                        chunk_size: crate::basis::auto_streaming_chunk_size_for_dense(
+                            self.n_obs,
+                            num_basis_est,
+                        ),
                     })
                 }
             }

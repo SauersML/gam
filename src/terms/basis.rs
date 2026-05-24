@@ -4475,7 +4475,7 @@ impl LatentCoordDesignDerivative {
         latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
         centers: Arc<Array2<f64>>,
         length_scale: Option<f64>,
-        power: usize,
+        power: f64,
         nullspace_order: DuchonNullspaceOrder,
         full_ident_transform: Option<Array2<f64>>,
     ) -> Result<Self, BasisError> {
@@ -4488,7 +4488,7 @@ impl LatentCoordDesignDerivative {
         }
         let effective_order = duchon_effective_nullspace_order(centers.view(), nullspace_order);
         let p_order = duchon_p_from_nullspace_order(effective_order);
-        let s_order = power;
+        let s_order = power.max(0.0).round() as usize;
         let radial_kind = if let Some(length_scale) = length_scale {
             RadialScalarKind::Duchon {
                 length_scale,
@@ -4503,7 +4503,7 @@ impl LatentCoordDesignDerivative {
             }
         } else {
             RadialScalarKind::PureDuchon {
-                block_order: pure_duchon_block_order(p_order, power as f64).max(1.0) as usize,
+                block_order: pure_duchon_block_order(p_order, power).max(1.0) as usize,
                 p_order,
                 s_order,
                 dim: centers.ncols(),

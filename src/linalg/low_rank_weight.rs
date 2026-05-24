@@ -37,7 +37,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 
-use crate::faer_ndarray::{fast_ab, fast_atb, fast_atv};
+use crate::faer_ndarray::{fast_ab, fast_atb, fast_atv, fast_av};
 use crate::matrix::DesignMatrix;
 
 /// `W = diag(diag) + u · vᵀ`. Rows: `n`. Rank of correction: `u.ncols()`.
@@ -130,7 +130,7 @@ impl<'a> LowRankWeight<'a> {
         }
         // U (Vᵀ x): Vᵀ x is r-dim, then U times r-vector.
         let vtx = fast_atv(&self.v.to_owned(), &x.to_owned());
-        let uvtx = self.u.dot(&vtx);
+        let uvtx = fast_av(&self.u, &vtx);
         out += &uvtx;
         out
     }
