@@ -15285,7 +15285,7 @@ pub fn fit_transformation_normal(
         // but do not expose CTN's analytic Hessian to ARC: its callback
         // trace route applies full-rank logdet operators at biobank shape.
         true,
-        Some(Arc::clone(&exact_screening_cap)),
+        None,
         outer_derivative_policy,
         // fit_fn
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
@@ -15355,7 +15355,7 @@ pub fn fit_transformation_normal(
             let eval = evaluate_custom_family_joint_hyper(
                 &geometry.family,
                 &geometry.blocks,
-                &exact_options,
+                options,
                 &rho,
                 &geometry.derivative_blocks,
                 warm_start.as_ref(),
@@ -15395,7 +15395,7 @@ pub fn fit_transformation_normal(
             let eval = evaluate_custom_family_joint_hyper_efs(
                 &geometry.family,
                 &geometry.blocks,
-                &exact_options,
+                options,
                 &rho,
                 &geometry.derivative_blocks,
                 warm_start.as_ref(),
