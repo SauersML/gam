@@ -48,18 +48,21 @@ use gam::smooth::{
 };
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
+    BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec,
-    MaternIdentifiability, MaternNu, OneDimensionalBoundary, PeriodicBSplineBasisSpec, SpatialIdentifiability,
-    SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SplineScratch,
-    auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile, bspline_tensor_first_derivative,
-    build_duchon_basis, build_duchon_basis_mixed_periodicity_auto,
-    build_duchon_operator_penalty_matrices, build_matern_basis, build_periodic_bspline_basis_1d,
-    build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
-    create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
-    duchon_polynomial_first_derivative_nd, duchon_radial_first_derivative_nd,
-    evaluate_bspline_basis_scalar, matern_radial_first_derivative_nd,
-    periodic_bspline_first_derivative_nd, resolve_duchon_orders, sphere_first_derivative_nd,
+    MaternIdentifiability, MaternNu, OneDimensionalBoundary, PeriodicBSplineBasisSpec,
+    SpatialIdentifiability, SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec,
+    SplineScratch, auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,
+    bspline_tensor_first_derivative, build_bspline_basis_1d, build_duchon_basis,
+    build_duchon_basis_mixed_periodicity_auto, build_duchon_operator_penalty_matrices,
+    build_matern_basis, build_periodic_bspline_basis_1d, build_spherical_spline_basis,
+    build_thin_plate_penalty_matrix, create_basis, create_cyclic_difference_penalty_matrix,
+    create_difference_penalty_matrix, duchon_polynomial_first_derivative_nd,
+    duchon_radial_first_derivative_nd, evaluate_bspline_basis_scalar,
+    matern_radial_first_derivative_nd, periodic_bspline_first_derivative_nd,
+    resolve_duchon_orders, sphere_first_derivative_nd,
 };
+use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
 use gam::terms::latent_coord::{
     AuxPriorFamily, InputLocationDerivative, LatentCoordValues, LatentIdMode, aux_prior_targets,
 };
@@ -748,7 +751,8 @@ fn duchon_basis<'py>(
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: Default::default(),
-            periodic: false,
+            periodic: None,
+            boundary: OneDimensionalBoundary::Open,
         };
         let built = build_duchon_basis_mixed_periodicity_auto(pts, &spec, &periodic_flags, None)
             .map_err(|err| py_value_error(err.to_string()))?;
@@ -762,7 +766,8 @@ fn duchon_basis<'py>(
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
         operator_penalties: Default::default(),
-        periodic: any_periodic,
+        periodic: if any_periodic { Some(vec![None; d]) } else { None },
+        boundary: OneDimensionalBoundary::Open,
     };
     let built = build_duchon_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
     Ok(built.design.to_dense().into_pyarray(py).unbind())
@@ -8300,8 +8305,7 @@ fn bspline_position_basis_impl(
     }
     let (left, right, num_basis) = periodic_position_domain(knots, period)?;
     validate_vector("t", t)?;
-    create_periodic_bspline_basis_dense(t, (left, right), degree, num_basis)
-        .map_err(|err| format!("failed to evaluate periodic B-spline basis: {err}"))
+    periodic_bspline_basis_dense_via_spec(t, (left, right), degree, num_basis)
 }
 
 fn bspline_position_derivative_impl(
@@ -8321,10 +8325,13 @@ fn bspline_position_derivative_impl(
             "periodic B-spline derivative supports order=1; got order={order}"
         ));
     }
-    let (left, right, num_basis) = periodic_position_domain(knots, period)?;
+    let _ = periodic_position_domain(knots, period)?;
     validate_vector("t", t)?;
-    create_periodic_bspline_derivative_dense(t, (left, right), degree, num_basis)
-        .map_err(|err| format!("failed to evaluate periodic B-spline derivative: {err}"))
+    Err(
+        "periodic B-spline first-derivative as a dense (N, K) matrix is no longer exposed; \
+         use periodic_bspline_input_location_first_derivative for the (N, K, 1) jet"
+            .to_string(),
+    )
 }
 
 fn periodic_position_domain(
