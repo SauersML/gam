@@ -222,7 +222,16 @@ fn fit_and_report_power_law(
     extrapolate: &[(&str, f64)],
     budget_y: f64,
 ) {
-    std::hint::black_box(report_power_law_full(tag, &points, extrapolate, budget_y));
+    let n = points.len();
+    let fit = report_power_law_full(tag, &points, extrapolate, budget_y);
+    // `report_power_law_full` only returns `None` if it has fewer than 3 points
+    // or the fit quality is too poor to honestly extrapolate. The fewer-than-3
+    // branch is a contract; gate it so a regression in the fitter (returning
+    // `None` despite plenty of clean data) surfaces here.
+    assert!(
+        fit.is_some() || n < 3,
+        "{tag}: power-law fit returned None despite {n} data points"
+    );
 }
 
 #[test]
