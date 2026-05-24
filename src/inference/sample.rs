@@ -43,9 +43,7 @@ use crate::survival_construction::{
     resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
 };
 use crate::term_builder::resolve_role_col;
-use crate::types::{
-    InverseLink, LikelihoodSpec, LikelihoodSpec, LinkFunction, ResponseFamily,
-};
+use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 
 /// Reconstruct the `LinkWiggleFormulaSpec` from a saved model's
 /// baseline-time-wiggle runtime, returning `None` when the model has no
@@ -154,73 +152,11 @@ fn family_noise_parameter(fit: &UnifiedFitResult, likelihood: &LikelihoodSpec) -
     }
 }
 
-/// Build a `LikelihoodSpec` for a saved model. Combines the legacy
-/// `LikelihoodSpec` selector returned by `model.likelihood()` with any
-/// parameterized link state (`MixtureLinkState`, `SasLinkState`,
-/// `LatentCLogLogState`) the saved model carries so downstream sampling code
-/// can dispatch directly on the (response, link) pair.
+/// Build a `LikelihoodSpec` for a saved model. Saved models already carry the
+/// response distribution and parameterized link state together, so sampling can
+/// dispatch directly on the cloned spec.
 fn likelihood_spec_for_saved_model(model: &SavedModel) -> Result<LikelihoodSpec, String> {
-    let family = model.likelihood();
-    if let Some(spec) = LikelihoodSpec::from_non_parameterized(family) {
-        return Ok(spec);
-    }
-    match family {
-        LikelihoodSpec::binomial_link(LinkFunction::Logit) => {
-            let state = model
-                .saved_mixture_state()
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| {
-                    "binomial-mixture saved model is missing mixture link state".to_string()
-                })?;
-            Ok(LikelihoodSpec {
-                response: ResponseFamily::Binomial,
-                link: InverseLink::Mixture(state),
-            })
-        }
-        LikelihoodSpec::binomial_link(LinkFunction::Sas) => {
-            let state = model
-                .saved_sas_state()
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| {
-                    "binomial-sas saved model is missing SAS link state".to_string()
-                })?;
-            Ok(LikelihoodSpec {
-                response: ResponseFamily::Binomial,
-                link: InverseLink::Sas(state),
-            })
-        }
-        LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic) => {
-            let state = model
-                .saved_beta_logistic_state()
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| {
-                    "binomial-beta-logistic saved model is missing beta-logistic link state"
-                        .to_string()
-                })?;
-            Ok(LikelihoodSpec {
-                response: ResponseFamily::Binomial,
-                link: InverseLink::BetaLogistic(state),
-            })
-        }
-        LikelihoodSpec::binomial_link(LinkFunction::CLogLog) => {
-            let state = model
-                .saved_latent_cloglog_state()
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| {
-                    "latent-cloglog binomial saved model is missing latent cloglog state"
-                        .to_string()
-                })?;
-            Ok(LikelihoodSpec {
-                response: ResponseFamily::Binomial,
-                link: InverseLink::LatentCLogLog(state),
-            })
-        }
-        _ => Err(format!(
-            "internal: likelihood family {} is non-parameterized but \
-             LikelihoodSpec::from_non_parameterized did not map it",
-            family.pretty_name()
-        )),
-    }
+    Ok(model.likelihood())
 }
 
 #[inline]

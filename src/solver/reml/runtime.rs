@@ -2859,7 +2859,7 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         ext_coords: &[super::unified::HyperCoord],
     ) -> Result<TkCorrectionTerms, EstimationError> {
-        if reml_is_gaussian_identity(self.config.likelihood.as_ref()) {
+        if reml_is_gaussian_identity(&self.config.likelihood) {
             return Ok(TkCorrectionTerms {
                 value: 0.0,
                 gradient: None,
@@ -2933,7 +2933,7 @@ impl<'a> RemlState<'a> {
             let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
             let beta = self.sparse_exact_beta_original(pirls_result);
             let firth_op = if self.config.firth_bias_reduction
-                && reml_supports_firth(self.config.likelihood.as_ref())
+                && reml_supports_firth(&self.config.likelihood)
             {
                 if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
                     Some(cached.clone())
@@ -3081,7 +3081,7 @@ impl<'a> RemlState<'a> {
             pirls_result.beta_transformed.as_ref().clone()
         };
         let firth_op =
-            if self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood.as_ref()) {
+            if self.config.firth_bias_reduction && reml_supports_firth(&self.config.likelihood) {
                 Some(std::sync::Arc::new(Self::build_firth_dense_operator(
                     &x_eff_dense,
                     &pirls_result.final_eta,
@@ -3114,7 +3114,7 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         ext_coords: &[super::unified::HyperCoord],
     ) -> Result<(), EstimationError> {
-        if reml_is_gaussian_identity(self.config.likelihood.as_ref())
+        if reml_is_gaussian_identity(&self.config.likelihood)
             || !self.config.firth_bias_reduction
             || !compute_gradient_for_tk(mode)
         {
@@ -3710,7 +3710,7 @@ impl<'a> RemlState<'a> {
         // links and other GLM families that support the observed Hessian
         // surface (Probit, CLogLog, SAS, BetaLogistic, Mixture, GammaLog).
         let likelihood = &pirls_result.likelihood;
-        let weight_family = pirls::weight_family_for_glm_likelihood(&likelihood);
+        let weight_family = pirls::weight_family_for_glm_likelihood(likelihood);
         let phi = reml_fixed_glm_dispersion(likelihood);
         let dmu_deta = &pirls_result.solve_dmu_deta;
         let d2mu_deta2 = &pirls_result.solve_d2mu_deta2;
@@ -5715,7 +5715,7 @@ impl<'a> RemlState<'a> {
     ) -> Option<Arc<crate::pirls::GaussianFixedCache>> {
         // Static eligibility — these only depend on data the outer loop
         // never mutates, so the gate is correct once and stays correct.
-        let spec = reml_spec(self.config.likelihood.as_ref());
+        let spec = reml_spec(&self.config.likelihood);
         let family_ok = matches!(spec.response, ResponseFamily::Gaussian);
         let link_ok = matches!(
             self.config.link_kind,
@@ -5853,7 +5853,7 @@ impl<'a> RemlState<'a> {
         let pirls_result = self.execute_pirls_if_needed(rho)?;
         let (mut h_total, ridge_passport) = self.effectivehessian(pirls_result.as_ref())?;
         let mut firth_dense_operator: Option<Arc<FirthDenseOperator>> = None;
-        if self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood.as_ref()) {
+        if self.config.firth_bias_reduction && reml_supports_firth(&self.config.likelihood) {
             let firth_n = pirls_result.x_transformed.nrows();
             let firth_p = pirls_result.x_transformed.ncols();
             if !super::firth_problem_scale_allows(firth_n, firth_p) {
@@ -6009,7 +6009,7 @@ impl<'a> RemlState<'a> {
         let (penalty_rank, logdet_s_pos, det1_values) =
             self.sparse_penalty_logdet_runtime(rho, penalty_blocks.as_ref());
         let firth_dense_operator_original = if self.config.firth_bias_reduction
-            && reml_supports_firth(self.config.likelihood.as_ref())
+            && reml_supports_firth(&self.config.likelihood)
         {
             let firth_n = self.x().nrows();
             let firth_p = self.x().ncols();
@@ -7626,7 +7626,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         free_basis_opt: &Option<Array2<f64>>,
     ) -> Result<Option<std::sync::Arc<super::FirthDenseOperator>>, EstimationError> {
-        if !(self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood.as_ref())) {
+        if !(self.config.firth_bias_reduction && reml_supports_firth(&self.config.likelihood)) {
             return Ok(None);
         }
 
@@ -7789,7 +7789,7 @@ impl<'a> RemlState<'a> {
         // Sparse exact still uses the same dense Jeffreys operator; only the
         // H^{-1} applications move to the sparse Cholesky operator.
         let firth_op =
-            if self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood.as_ref()) {
+            if self.config.firth_bias_reduction && reml_supports_firth(&self.config.likelihood) {
                 if let Some(cached) = bundle.firth_dense_operator_original.clone() {
                     Some(cached)
                 } else {
