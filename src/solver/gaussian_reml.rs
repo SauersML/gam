@@ -3,9 +3,7 @@ use crate::faer_ndarray::{
     FaerCholesky, FaerEigh, fast_ab, fast_atb, fast_xt_diag_x, fast_xt_diag_y,
 };
 use faer::Side;
-use ndarray::{
-    Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s,
-};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s};
 use rayon::prelude::*;
 use std::sync::Once;
 
@@ -1018,64 +1016,14 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
     results
 }
 
-/// Compute K inverse Hessian matrices `(X'WX_b + λ_b S)⁻¹` for the batched
-/// backward path via one cuBLAS strided-batched `A · Bᵀ` call. Each problem
-/// shares the same eigen-cache layout (uniform `p`), so the scaled
-/// coefficient bases form a fixed-shape stack. Returns `None` when shapes
-/// disagree, the policy declines (small aggregate FLOPs), or the device
-/// path fails — caller then falls back to per-fit
-/// `gaussian_reml_inverse_hessian_from_cache` calls.
+/// The current GPU runtime does not expose a batched GEMM primitive for this
+/// path. Returning `None` keeps the backward pass on the ordinary per-fit
+/// inverse-Hessian route, which uses the same eigen-cache representation and
+/// numerical checks.
 fn batched_inverse_hessians_from_caches<'a>(
-    problems: &[GaussianRemlMultiBackwardProblem<'a>],
+    _problems: &[GaussianRemlMultiBackwardProblem<'a>],
 ) -> Option<Vec<Array2<f64>>> {
-    if problems.is_empty() {
-        return None;
-    }
-    let p = problems[0].fit.cache.penalty_eigenvalues.len();
-    if p == 0 {
-        return None;
-    }
-    if !problems
-        .iter()
-        .all(|prob| prob.fit.cache.coefficient_basis.dim() == (p, p))
-    {
-        return None;
-    }
-    if !crate::gpu::GpuRuntime::global()
-        .policy()
-        .route_gemm(p, p, p)
-    {
-        return None;
-    }
-    let k = problems.len();
-    let mut scaled_stack = Array3::<f64>::zeros((k, p, p));
-    let mut basis_stack = Array3::<f64>::zeros((k, p, p));
-    for (b, problem) in problems.iter().enumerate() {
-        let cache = &problem.fit.cache;
-        let lambda = problem.fit.lambda;
-        let mut scaled = cache.coefficient_basis.clone();
-        for eig in 0..p {
-            let denom = 1.0 + lambda * cache.penalty_eigenvalues[eig];
-            if !denom.is_finite() || denom.abs() <= 0.0 {
-                return None;
-            }
-            let scale = 1.0 / denom;
-            for row in 0..p {
-                scaled[[row, eig]] *= scale;
-            }
-        }
-        scaled_stack.slice_mut(s![b, .., ..]).assign(&scaled);
-        basis_stack
-            .slice_mut(s![b, .., ..])
-            .assign(&cache.coefficient_basis);
-    }
-    let result_stack =
-        crate::gpu::try_fast_abt_strided_batched(scaled_stack.view(), basis_stack.view())?;
-    let mut per_fit = Vec::with_capacity(k);
-    for b in 0..k {
-        per_fit.push(result_stack.slice(s![b, .., ..]).to_owned());
-    }
-    Some(per_fit)
+    None
 }
 
 fn rho_derivatives_to_lambda(lambda: f64, grad_rho: f64, hess_rho: f64) -> (f64, f64) {
@@ -1566,10 +1514,6 @@ fn dense_xt_diag_y(
     fast_xt_diag_y(&x, &w, &y)
 }
 
-fn dense_xt_diag_x(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Array2<f64> {
-    fast_xt_diag_y(&x, &w, &x)
-}
-
 fn matrix_fingerprint(matrix: ArrayView2<'_, f64>) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     hash = fnv1a_mix(hash, matrix.nrows() as u64);
@@ -1611,94 +1555,23 @@ pub fn build_gaussian_reml_eigen_cache_batched(
         .iter()
         .map(|m| matrix_fingerprint(m.view()))
         .collect();
-    // Only allocate the batched device-input clone when the policy is going
-    // to attempt the GPU dispatch; for large `p` (where per-fit X'WX is
-    // already O(p²) per matrix) the duplicate buffer is the dominant
-    // memory overhead, so we let `route_chol_batched` veto upfront.
-    let policy_routes_batched = uniform_shape
-        && crate::gpu::GpuRuntime::global()
-            .policy()
-            .route_chol_batched(p, k);
-    let mut batched_lowers: Option<Vec<Array2<f64>>> = if policy_routes_batched {
-        let mut buffer: Vec<Array2<f64>> = xtwx_matrices.iter().cloned().collect();
-        let ok = crate::gpu::try_cholesky_batched_lower_inplace(&mut buffer).is_some()
-            && buffer
-                .iter()
-                .all(|m| m.iter().all(|v| v.is_finite()) && m.diag().iter().all(|v| *v > 0.0));
-        if ok { Some(buffer) } else { None }
-    } else {
-        None
-    };
-    // When batched Cholesky succeeded AND the policy approves the K-way
-    // whitening (`L_b⁻¹ · S · L_b⁻ᵀ`), pre-compute every transformed-penalty
-    // matrix via two batched cuBLAS dispatches (one broadcast B, one
-    // strided AB-with-transpose) instead of K pairs of per-fit gemms. The
-    // per-fit inverse `L_b⁻¹` is computed serially with `invert_lower_triangular`
-    // — it is `O(p²)` work that does not justify a batched TRSM at typical
-    // biobank `p`, but the two gemms are `O(p³)` and benefit at higher p.
-    let batched_transforms: Option<Vec<Array2<f64>>> = if let Some(ref lowers) = batched_lowers {
-        let mut l_inverses = Vec::with_capacity(k);
-        let mut all_ok = true;
-        for lower in lowers.iter() {
-            match invert_lower_triangular(lower) {
-                Ok(l_inv) => l_inverses.push(l_inv),
-                Err(_) => {
-                    all_ok = false;
-                    break;
-                }
-            }
-        }
-        if !all_ok {
-            None
-        } else {
-            let mut linv_stack = Array3::<f64>::zeros((k, p, p));
-            for (b, l_inv) in l_inverses.iter().enumerate() {
-                linv_stack.slice_mut(s![b, .., ..]).assign(l_inv);
-            }
-            if let Some(m_stack) =
-                crate::gpu::try_fast_ab_broadcast_b_batched(linv_stack.view(), penalty)
-            {
-                if let Some(t_stack) =
-                    crate::gpu::try_fast_abt_strided_batched(m_stack.view(), linv_stack.view())
-                {
-                    let mut out = Vec::with_capacity(k);
-                    for b in 0..k {
-                        out.push(t_stack.slice(s![b, .., ..]).to_owned());
-                    }
-                    Some(out)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let _ = (uniform_shape, p);
 
     let mut results = Vec::with_capacity(k);
     for (b, xtwx) in xtwx_matrices.into_iter().enumerate() {
-        let lower = if let Some(ref mut lowers) = batched_lowers {
-            std::mem::replace(&mut lowers[b], Array2::zeros((0, 0)))
-        } else {
-            match gaussian_reml_cholesky_lower(xtwx) {
-                Ok(l) => l,
-                Err(err) => {
-                    results.push(Err(err));
-                    continue;
-                }
+        let lower = match gaussian_reml_cholesky_lower(xtwx) {
+            Ok(l) => l,
+            Err(err) => {
+                results.push(Err(err));
+                continue;
             }
         };
-        let precomputed = batched_transforms
-            .as_ref()
-            .map(|transforms| transforms[b].clone());
         results.push(gaussian_reml_eigen_cache_from_lower_with_transform(
             lower,
             penalty,
             nullspace_dim,
             fingerprints[b],
-            precomputed,
+            None,
         ));
     }
     results
@@ -1902,18 +1775,6 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
 }
 
 fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, EstimationError> {
-    if crate::gpu::GpuRuntime::global()
-        .policy()
-        .route_chol_solve(xtwx.nrows())
-    {
-        let mut gpu_xtwx = xtwx.clone();
-        if crate::gpu::try_cholesky_lower_inplace(&mut gpu_xtwx).is_some()
-            && gpu_xtwx.iter().all(|value| value.is_finite())
-            && gpu_xtwx.diag().iter().all(|value| *value > 0.0)
-        {
-            return Ok(gpu_xtwx);
-        }
-    }
     // Attempt Cholesky directly; on failure, retry with a tiny diagonal jitter
     // proportional to the matrix trace. X'WX is symmetric positive semidefinite
     // by construction, but FP noise (e.g. in a basis whose kernel block is only
@@ -2613,11 +2474,6 @@ fn solve_lower_triangular_matrix(
             "lower-triangular solve dimension mismatch".to_string(),
         ));
     }
-    if let Some(out) = crate::gpu::try_solve_lower_triangular_matrix(lower, rhs)
-        && out.iter().all(|value| value.is_finite())
-    {
-        return Ok(out);
-    }
     let mut out = Array2::<f64>::zeros(rhs.dim());
     for col in 0..rhs.ncols() {
         for i in 0..n {
@@ -2646,11 +2502,6 @@ fn solve_upper_triangular_matrix(
         return Err(EstimationError::InvalidInput(
             "upper-triangular solve dimension mismatch".to_string(),
         ));
-    }
-    if let Some(out) = crate::gpu::try_solve_upper_triangular_matrix(upper, rhs)
-        && out.iter().all(|value| value.is_finite())
-    {
-        return Ok(out);
     }
     let mut out = Array2::<f64>::zeros(rhs.dim());
     for col in 0..rhs.ncols() {
