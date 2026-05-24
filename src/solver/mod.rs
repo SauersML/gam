@@ -1,7 +1,7 @@
 pub(crate) mod active_set;
 pub mod arrow_schur;
 pub mod estimate;
-pub mod gaussian_reml;
+pub mod gpu;
 pub mod mixture_link;
 pub mod outer_strategy;
 pub(crate) mod latent_cache;
