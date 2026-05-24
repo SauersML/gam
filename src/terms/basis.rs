@@ -6751,7 +6751,11 @@ pub fn build_bspline_basis_1d(
                 (Some(basis), None, knots)
             }
             BSplineKnotSpec::PeriodicUniform { .. } => {
-                unreachable!("periodic B-spline handled before storage selection")
+                return Err(BasisError::InvalidInput(
+                    "periodic B-spline must be handled before storage selection; \
+                     this branch is reserved for non-periodic knot specs"
+                        .to_string(),
+                ));
             }
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
@@ -6805,7 +6809,11 @@ pub fn build_bspline_basis_1d(
                 (None, Some((*basis).clone()), knots)
             }
             BSplineKnotSpec::PeriodicUniform { .. } => {
-                unreachable!("periodic B-spline handled before storage selection")
+                return Err(BasisError::InvalidInput(
+                    "periodic B-spline must be handled before storage selection; \
+                     this branch is reserved for non-periodic knot specs"
+                        .to_string(),
+                ));
             }
             BSplineKnotSpec::Automatic {
                 num_internal_knots,
