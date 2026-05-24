@@ -341,10 +341,10 @@ pub trait AnalyticPenalty: Send + Sync {
             return Array1::<f64>::zeros(n);
         }
         let eps: f64 = 1e-7_f64.max(v_inf * 1e-7);
-        let v_scaled = &v.to_owned() * eps;
-        let target_owned = target.to_owned();
-        let t_plus = &target_owned + &v_scaled;
-        let t_minus = &target_owned - &v_scaled;
+        let mut t_plus = target.to_owned();
+        t_plus.scaled_add(eps, &v);
+        let mut t_minus = target.to_owned();
+        t_minus.scaled_add(-eps, &v);
         let g_plus = self.grad_target(t_plus.view(), rho);
         let g_minus = self.grad_target(t_minus.view(), rho);
         let mut out = Array1::<f64>::zeros(n);
