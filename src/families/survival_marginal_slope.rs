@@ -17850,7 +17850,6 @@ pub fn fit_survival_marginal_slope_terms(
     // skipping the pilot for such an entry leaves the subsequent cold seed
     // validation without coefficient hints, which is exactly the failure mode
     // this pilot exists to prevent.
-    const CUSTOM_FAMILY_RHO_BOUND: f64 = 10.0;
     let outer_cache_seed_available = options
         .cache_session
         .as_ref()
