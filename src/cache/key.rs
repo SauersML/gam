@@ -14,7 +14,7 @@ use std::fmt;
 pub struct Fingerprint([u8; 32]);
 
 impl Fingerprint {
-    pub fn as_bytes(&self) -> &[u8; 32] {
+    pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
 
@@ -42,7 +42,7 @@ impl Fingerprint {
     }
 }
 
-fn from_hex_nibble(c: u8) -> Option<u8> {
+const fn from_hex_nibble(c: u8) -> Option<u8> {
     match c {
         b'0'..=b'9' => Some(c - b'0'),
         b'a'..=b'f' => Some(c - b'a' + 10),
