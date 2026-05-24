@@ -48,24 +48,20 @@ use gam::smooth::{
 };
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
-    BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec,
     MaternIdentifiability, MaternNu, OneDimensionalBoundary, PeriodicBSplineBasisSpec,
     SpatialIdentifiability, SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec,
     SplineScratch, auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,
-    bspline_tensor_first_derivative, build_bspline_basis_1d, build_duchon_basis,
-    build_duchon_basis_mixed_periodicity_auto, build_duchon_operator_penalty_matrices,
-    build_matern_basis, build_periodic_bspline_basis_1d, build_spherical_spline_basis,
-    build_thin_plate_penalty_matrix, create_basis, create_cyclic_difference_penalty_matrix,
+    bspline_tensor_first_derivative, build_duchon_basis, build_duchon_basis_mixed_periodicity_auto,
+    build_duchon_operator_penalty_matrices, build_matern_basis, build_periodic_bspline_basis_1d,
+    build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
     create_difference_penalty_matrix, duchon_polynomial_first_derivative_nd,
     duchon_radial_first_derivative_nd, evaluate_bspline_basis_scalar,
     matern_radial_first_derivative_nd, periodic_bspline_first_derivative_nd, resolve_duchon_orders,
     sphere_first_derivative_nd,
 };
 use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
-use gam::terms::latent_coord::{
-    AuxPriorFamily, LatentCoordValues, LatentIdMode, aux_prior_targets,
-};
+use gam::terms::latent_coord::{AuxPriorFamily, aux_prior_targets};
 use gam::terms::sae_manifold::{
     AssignmentMode, GumbelTemperatureSchedule, SaeAtomBasisKind, SaeManifoldRho, ScheduleKind,
     term_from_padded_blocks_with_mode,
@@ -310,30 +306,6 @@ struct SampleConfigPayload {
     n_chains: usize,
     target_accept: f64,
     seed: u64,
-}
-
-#[derive(Serialize)]
-struct CompetingRisksPredictionPayload {
-    class: &'static str,
-    model_class: String,
-    likelihood_mode: String,
-    endpoint_names: Vec<String>,
-    times: Vec<f64>,
-    /// Per-endpoint hazard surface, shape `[n_endpoints][n_rows][n_times]`.
-    hazard: Vec<Vec<Vec<f64>>>,
-    /// Per-endpoint cause-specific survival, same shape as `hazard`.
-    survival: Vec<Vec<Vec<f64>>>,
-    /// Per-endpoint cumulative hazard, same shape as `hazard`.
-    cumulative_hazard: Vec<Vec<Vec<f64>>>,
-    /// Per-endpoint cumulative incidence function, same shape as `hazard`.
-    cif: Vec<Vec<Vec<f64>>>,
-    /// Overall survival across all endpoints, shape `[n_rows][n_times]`.
-    overall_survival: Vec<Vec<f64>>,
-    /// Per-endpoint linear predictor, shape `[n_endpoints][n_rows]`.
-    linear_predictor: Vec<Vec<f64>>,
-    /// Flattened scalar columns indexed by name (e.g. `eta_<endpoint>`,
-    /// `failure_prob_<endpoint>`, `overall_survival`).
-    columns: BTreeMap<String, Vec<f64>>,
 }
 
 #[derive(Serialize)]
