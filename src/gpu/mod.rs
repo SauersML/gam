@@ -16,10 +16,8 @@ pub mod linalg;
 pub mod memory;
 pub mod policy;
 pub mod profile;
-pub mod rand;
 pub mod runtime;
 pub mod solver;
-pub mod sparse;
 
 pub use cpu_traits::{
     DeviceBlas, DeviceDesignOperator, DeviceSolver, ExecutionTarget, MatrixLocation,

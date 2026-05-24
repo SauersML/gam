@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
 
 const MAX_STATS: usize = 1024;
 
@@ -51,44 +50,4 @@ pub fn clear() {
     if let Ok(mut guard) = stats().lock() {
         guard.clear();
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum OperationKind {
-    Gemv,
-    GemvTranspose,
-    JointHessian,
-    JointHessian2x2,
-    XtDiagX,
-    XtDiagY,
-}
-
-#[inline]
-pub const fn profiling_enabled() -> bool {
-    false
-}
-
-pub fn cpu_scope<R>(
-    name: &'static str,
-    n: usize,
-    p: usize,
-    k: usize,
-    bytes_est: usize,
-    op: impl FnOnce() -> R,
-) -> R {
-    let start = Instant::now();
-    let out = op();
-    let cpu_ms = start.elapsed().as_secs_f64() * 1_000.0;
-    record(KernelStat {
-        name,
-        n,
-        p,
-        k,
-        nnz: 0,
-        flops_est: n.saturating_mul(p).saturating_mul(k).saturating_mul(2),
-        bytes_est,
-        cpu_ms,
-        gpu_ms: None,
-    });
-    out
 }
