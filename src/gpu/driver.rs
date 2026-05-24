@@ -18,6 +18,10 @@ use std::borrow::Cow;
 use super::error::GpuError;
 
 pub type CuResult = i32;
+// SAFETY: these are FFI fn-pointer type aliases for libcuda driver entry
+// points; `unsafe extern "C"` matches the C ABI of the cu* functions we
+// resolve via dlsym below. The `unsafe` qualifier propagates the call-site
+// obligation (valid context, in-range pointers/sizes) up to each invoker.
 type CuInit = unsafe extern "C" fn(u32) -> CuResult;
 type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> CuResult;
 type CuCtxCreate = unsafe extern "C" fn(*mut usize, u32, i32) -> CuResult;
