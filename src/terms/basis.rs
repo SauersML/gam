@@ -3822,7 +3822,7 @@ impl RadialScalarKind {
     /// in this file and the comments on `eval_design_triplet`):
     ///   - Matérn ν = 1/2: `q = -s·E/r → -∞`, not smooth.
     ///   - Matérn ν = 3/2: `q` finite but `t = s³E/r → ∞`, not smooth.
-    ///   - Matérn ν = 5/2: both finite, smooth.
+    ///   - Matérn ν = 5/2, 7/2, 9/2: both finite, smooth.
     ///   - Duchon hybrid (`Duchon`): finite via the hybrid PFD identity;
     ///     the radial-jets routine produces a finite limit, so smooth.
     ///   - PureDuchon (raw polyharmonic block, exponent α = 2m − d):
@@ -3837,7 +3837,10 @@ impl RadialScalarKind {
     #[inline]
     pub(crate) fn is_smooth_at_collision(&self) -> bool {
         match self {
-            RadialScalarKind::Matern { nu, .. } => matches!(nu, MaternNu::FiveHalves),
+            RadialScalarKind::Matern { nu, .. } => matches!(
+                nu,
+                MaternNu::FiveHalves | MaternNu::SevenHalves | MaternNu::NineHalves
+            ),
             RadialScalarKind::Duchon { .. } => true,
             RadialScalarKind::PureDuchon {
                 p_order,
@@ -4432,7 +4435,7 @@ impl LatentCoordDesignDerivative {
         )?;
         let jet = latent.design_gradient_wrt_t_dispatch(
             crate::terms::latent_coord::InputLocationDerivative::Jet(raw_jet.view()),
-        );
+        )?;
         Self::from_jet(latent, jet, ident_transform)
     }
 
@@ -4451,7 +4454,7 @@ impl LatentCoordDesignDerivative {
         )?;
         let jet = latent.design_gradient_wrt_t_dispatch(
             crate::terms::latent_coord::InputLocationDerivative::Jet(raw_jet.view()),
-        );
+        )?;
         Self::from_jet(latent, jet, ident_transform)
     }
 
@@ -4469,7 +4472,7 @@ impl LatentCoordDesignDerivative {
             bspline_tensor_first_derivative(latent.as_matrix().view(), &knot_views, &degrees)?;
         let jet = latent.design_gradient_wrt_t_dispatch(
             crate::terms::latent_coord::InputLocationDerivative::Jet(raw_jet.view()),
-        );
+        )?;
         Self::from_jet(latent, jet, ident_transform)
     }
 
