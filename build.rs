@@ -4115,7 +4115,17 @@ fn strip_leading_if_return_guard(s: &str) -> Option<&str> {
                         && inside.ends_with(';')
                         && count_top_level_semicolons(inside) == 1
                     {
-                        return Some(&rest_after_brace[i + 1..]);
+                        // Only strip the guard when the returned expression is
+                        // itself a trivial sentinel. A return that carries a
+                        // computed Err (e.g. `Err(format!(...))`,
+                        // `Err(SomeError::Variant(...))`) is real validation —
+                        // peeling it would turn a multi-check validator into
+                        // a stub-shaped residual `Ok(())` / `None` and produce
+                        // a false positive in the stub-body lint.
+                        let ret_expr = inside["return ".len()..inside.len() - 1].trim();
+                        if return_expr_is_trivial_sentinel(ret_expr) {
+                            return Some(&rest_after_brace[i + 1..]);
+                        }
                     }
                     return None;
                 }
@@ -4162,6 +4172,60 @@ fn count_top_level_semicolons(s: &str) -> usize {
         i += 1;
     }
     count
+}
+
+/// Classify an early-return expression as "trivial sentinel" — the kinds of
+/// values a fake-validation guard would return to cheaply consume a param.
+/// Real validators return `Err(format!(...))` / `Err(SomeError::Variant(...))`
+/// / other computed values, which are NOT trivial and must NOT match.
+///
+/// Kept in sync with the literal-match set in `body_is_trivial_sentinel`.
+fn return_expr_is_trivial_sentinel(expr: &str) -> bool {
+    let s = expr.trim();
+    if matches!(
+        s,
+        "None"
+            | "Ok(())"
+            | "Default::default()"
+            | "Vec::new()"
+            | "vec![]"
+            | "()"
+            | "HashMap::new()"
+            | "BTreeMap::new()"
+            | "HashSet::new()"
+            | "BTreeSet::new()"
+            | "VecDeque::new()"
+            | "String::new()"
+            | "Some(Default::default())"
+            | "true"
+            | "false"
+            | "\"\""
+            | "Array1::zeros(0)"
+            | "Array2::zeros((0, 0))"
+            | "Array3::zeros((0, 0, 0))"
+    ) {
+        return true;
+    }
+    if let Some(prefix) = s.strip_suffix("::default()")
+        && is_path_like(prefix)
+    {
+        return true;
+    }
+    if let Some(inner) = s.strip_prefix("Some(").and_then(|r| r.strip_suffix(')'))
+        && let Some(prefix) = inner.strip_suffix("::default()")
+        && is_path_like(prefix)
+    {
+        return true;
+    }
+    if let Some(inner) = s.strip_prefix("Ok(").and_then(|r| r.strip_suffix(')'))
+        && matches!(
+            inner.trim(),
+            "" | "Array1::zeros(0)" | "Array2::zeros((0, 0))" | "Array3::zeros((0, 0, 0))"
+        )
+    {
+        return true;
+    }
+    is_bare_numeric_literal(s)
 }
 
 /// Match a leading `drop(<expr>);` statement (any expression) and
