@@ -18083,7 +18083,7 @@ mod tests {
         // k_alias < p_c so partial (not full) alias.
         let k_alias = (p_c / 2).max(1);
         assert!(
-            k_alias + 1 <= p_c,
+            k_alias < p_c,
             "partial-alias test needs p_c > k_alias + 1, got p_c={p_c}, k_alias={k_alias}",
         );
         let p_a = k_alias + 1;
@@ -25230,12 +25230,10 @@ mod tests {
             .expect("joint gradient result")
             .expect("joint gradient");
         let slices = block_slices(&family);
-        let ranges = vec![
-            slices.marginal.clone(),
+        let ranges = [slices.marginal.clone(),
             slices.logslope.clone(),
             slices.h.clone().expect("score-warp block"),
-            slices.w.clone().expect("link-deviation block"),
-        ];
+            slices.w.clone().expect("link-deviation block")];
 
         assert!((eval.log_likelihood - joint_gradient.log_likelihood).abs() < 2e-12);
         assert!(

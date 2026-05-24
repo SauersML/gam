@@ -13263,8 +13263,7 @@ mod tests {
         };
 
         let err = predict_survival_location_scale(&input, &fit)
-            .err()
-            .expect("should reject");
+            .expect_err("should reject");
         assert!(err.contains("state-less Standard(BetaLogistic)"));
     }
 

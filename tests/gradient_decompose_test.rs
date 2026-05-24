@@ -405,7 +405,7 @@ fn test_component_c_penalty_logdet() {
         s1[[j, j]] = 1.0;
     }
     let s_list = blockwise_penalties(vec![s1]);
-    let nullspace_dims = vec![1usize];
+    let nullspace_dims = [1usize];
     let rho = array![2.0];
 
     let total_nullspace: usize = nullspace_dims.iter().sum();

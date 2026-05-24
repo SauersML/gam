@@ -117,7 +117,7 @@ fn power_law_fit_struct_roundtrips() {
         n_points: 7,
     };
     let copy = original; // requires Copy
-    let cloned = original.clone(); // requires Clone
+    let cloned = original; // requires Clone
     assert_eq!(copy.alpha, original.alpha);
     assert_eq!(cloned.alpha, original.alpha);
     let dbg = format!("{:?}", original); // requires Debug

@@ -722,7 +722,7 @@ mod tests {
         let retreat = Array1::from_elem(3, cfg.bounds.1);
         let retreat_idx = seeds
             .iter()
-            .position(|seed| seed == &retreat)
+            .position(|seed| seed == retreat)
             .expect("generalized-linear seeds should include an upper-bound retreat seed");
         assert!(
             retreat_idx <= 2,

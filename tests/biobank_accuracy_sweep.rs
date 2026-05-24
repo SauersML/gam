@@ -371,8 +371,8 @@ fn boundary_cyclic_seam_continuity_zero_vs_tau() {
     // Predict at seam: theta = 0 and theta = 2π must agree to numerical precision.
     let theta_zero = vec![0.0_f64; 4];
     let theta_tau = vec![TAU; 4];
-    let test_zero = predict_matrix(2, &[&theta_zero, &vec![0.0; 4]]);
-    let test_tau = predict_matrix(2, &[&theta_tau, &vec![0.0; 4]]);
+    let test_zero = predict_matrix(2, &[&theta_zero, &[0.0; 4]]);
+    let test_tau = predict_matrix(2, &[&theta_tau, &[0.0; 4]]);
     let pred_zero = fit_and_predict_eta(
         "y ~ cyclic(theta, period_start=0, period_end=6.283185307179586)",
         &data,

@@ -79,8 +79,8 @@ fn sphere_radians_seam_at_zero_and_two_pi_predict_equal() {
     let data = make_sphere_radians(800, 2025);
     // Five latitudes; at each, compare f(lat, 0) vs f(lat, 2π).
     let lats = vec![-1.2, -0.6, 0.0, 0.6, 1.2];
-    let zeros: Vec<f64> = std::iter::repeat(0.0).take(lats.len()).collect();
-    let taus: Vec<f64> = std::iter::repeat(TAU).take(lats.len()).collect();
+    let zeros: Vec<f64> = std::iter::repeat_n(0.0, lats.len()).collect();
+    let taus: Vec<f64> = std::iter::repeat_n(TAU, lats.len()).collect();
 
     for (label, formula) in &[
         ("wahba", "y ~ sphere(lat, lon, radians=true, k=80)"),

@@ -128,7 +128,7 @@ fn solve_eta_numdual<D: DualNum<f64> + Copy>(
     for _ in 0..20 {
         let f = eta - c + a * eta * eta * eta + coupling * eta;
         let fp = D::one() + D::from(3.0) * a * eta * eta + coupling;
-        eta = eta - f / fp;
+        eta -= f / fp;
     }
     eta
 }
@@ -174,7 +174,7 @@ fn coupled_quarticobjective_f1(rho: F1, center: f64, quartic: f64, beta2ridge: f
     for _ in 0..20 {
         let f = eta - c + a * eta * eta * eta + coupling * eta;
         let fp = F1::cst(1.0) + F1::cst(3.0) * a * eta * eta + coupling;
-        eta = eta - f / fp;
+        eta -= f / fp;
     }
     let beta1 = eta * d / (d + lambda);
     let beta2 = eta * lambda / (d + lambda);
@@ -223,7 +223,7 @@ impl<T: AD> DifferentiableFunctionTrait<T> for CoupledQuarticObjectiveFn<T> {
         for _ in 0..20 {
             let f = eta - c + a * eta * eta * eta + coupling * eta;
             let fp = T::one() + T::constant(3.0) * a * eta * eta + coupling;
-            eta = eta - f / fp;
+            eta -= f / fp;
         }
         let beta1 = eta * d / (d + lambda);
         let beta2 = eta * lambda / (d + lambda);

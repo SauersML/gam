@@ -27,7 +27,7 @@ fn make_uniform_loop(n: usize, period: f64) -> Array1<f64> {
 
 fn make_sphere_grid(n_total: usize) -> Array2<f64> {
     let nrow = (n_total as f64).sqrt().ceil() as usize;
-    let ncol = (n_total + nrow - 1) / nrow;
+    let ncol = n_total.div_ceil(nrow);
     let mut out = Array2::<f64>::zeros((nrow * ncol, 2));
     for i in 0..nrow {
         for j in 0..ncol {

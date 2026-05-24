@@ -1433,7 +1433,7 @@ mod tests {
             decile[row] = ((rank * 100) / n).min(99);
         }
         // For each (sec, dec), is there at least one row in mask?
-        let mut covered = vec![false; 200];
+        let mut covered = [false; 200];
         for &row in s.mask.iter() {
             let stratum = secondary[row] as usize * 100 + decile[row];
             covered[stratum] = true;

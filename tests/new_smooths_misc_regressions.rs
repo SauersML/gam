@@ -139,7 +139,7 @@ fn sphere_rejects_nan_y_clearly_at_encode() {
         ]));
     }
     let r = encode_recordswith_inferred_schema(headers, rows);
-    let err = r.err().expect("encoder must reject NaN in y column");
+    let err = r.expect_err("encoder must reject NaN in y column");
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("non-finite") || msg.contains("nan") || msg.contains("finite"),

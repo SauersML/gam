@@ -77,7 +77,7 @@ fn cycle_51_nan_lat_rejected_at_encode() {
         ]),
     ];
     let r = encode_recordswith_inferred_schema(headers, rows);
-    let err = r.err().expect("encoder must reject NaN lat");
+    let err = r.expect_err("encoder must reject NaN lat");
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("nan") || msg.contains("non-finite"),

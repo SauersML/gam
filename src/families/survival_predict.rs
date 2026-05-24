@@ -2641,7 +2641,7 @@ mod tests {
         let (cum, hazard) =
             probit_survival_hazard_components(eta, eta_t).expect("left tail must remain valid");
         assert!(
-            cum >= 0.0 && cum < 1e-300,
+            (0.0..1e-300).contains(&cum),
             "left-tail cum should be ~0, got {cum}"
         );
         assert_eq!(

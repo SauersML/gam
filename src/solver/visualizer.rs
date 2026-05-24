@@ -494,10 +494,9 @@ impl InteractiveVisualizer {
         // invariants without needing to fake a tty.
         #[cfg(test)]
         {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            Err(io::Error::other(
                 "interactive visualizer disabled under cfg(test)",
-            ));
+            ))
         }
         #[cfg(not(test))]
         {

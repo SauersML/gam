@@ -26566,8 +26566,8 @@ mod tests {
         let derivative_blocks = vec![
             hyperspecs
                 .iter()
-                .enumerate()
-                .map(|(_, _)| CustomFamilyBlockPsiDerivative {
+                
+                .map(|_| CustomFamilyBlockPsiDerivative {
                     penalty_index: None,
                     x_psi: Array2::<f64>::zeros((0, 0)),
                     s_psi: Array2::<f64>::zeros((0, 0)),
@@ -26785,8 +26785,8 @@ mod tests {
         let derivative_blocks = vec![
             hyperspecs
                 .iter()
-                .enumerate()
-                .map(|(_, _)| CustomFamilyBlockPsiDerivative {
+                
+                .map(|_| CustomFamilyBlockPsiDerivative {
                     penalty_index: None,
                     x_psi: Array2::<f64>::zeros((0, 0)),
                     s_psi: Array2::<f64>::zeros((0, 0)),

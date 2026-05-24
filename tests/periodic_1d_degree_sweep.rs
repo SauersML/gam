@@ -58,7 +58,7 @@ fn try_fit(degree: usize) -> Result<f64, String> {
         .map_err(|e| format!("design: {e:?}"))?;
     let pred = design.design.apply(&fit.fit.beta).to_vec();
     if !pred.iter().all(|v| v.is_finite()) {
-        return Err(format!("non-finite"));
+        return Err("non-finite".to_string());
     }
     let truth: Vec<f64> = probes
         .iter()

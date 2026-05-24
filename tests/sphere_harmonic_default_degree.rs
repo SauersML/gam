@@ -16,7 +16,7 @@ use gam::basis::default_spherical_harmonic_degree;
 fn default_degree_small_n_does_not_overfit() {
     // n=8: target ≈ 2 → floored at 3 → L=1 with 1*3=3>=3 → returns max(1,2)=2.
     let l = default_spherical_harmonic_degree(8);
-    assert!(l >= 2 && l <= 3, "n=8 expected L in {{2,3}}, got {l}");
+    assert!((2..=3).contains(&l), "n=8 expected L in {{2,3}}, got {l}");
     let cols = l * (l + 2);
     assert!(
         cols <= 16,
@@ -31,7 +31,7 @@ fn default_degree_medium_n_targets_around_50_cols() {
         let l = default_spherical_harmonic_degree(n);
         let cols = l * (l + 2);
         assert!(
-            cols >= 24 && cols <= 80,
+            (24..=80).contains(&cols),
             "n={n} expected ~24–80 default cols (mgcv ~50), got L={l} → {cols} cols",
         );
     }
