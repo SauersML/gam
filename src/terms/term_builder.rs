@@ -13,7 +13,7 @@ use crate::basis::{
     BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy, DuchonBasisSpec,
     DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
     MaternNu, SpatialIdentifiability, SphericalSplineBasisSpec, ThinPlateBasisSpec,
-    auto_spatial_center_strategy, build_pca_basis_matrix, default_num_centers,
+    auto_spatial_center_strategy, compute_pca_basis_matrix, default_num_centers,
     default_spatial_center_strategy, plan_spatial_basis, resolve_duchon_orders,
 };
 use crate::inference::data::{EncodedDataset as Dataset, missing_column_message};
@@ -1105,7 +1105,7 @@ pub fn build_smooth_basis(
             }
             let x = ds.values.select(Axis(1), cols);
             let basis_matrix =
-                build_pca_basis_matrix(x.view(), k_pca, centered).map_err(|e| e.to_string())?;
+                compute_pca_basis_matrix(x.view(), k_pca, centered).map_err(|e| e.to_string())?;
             Ok(SmoothBasisSpec::Pca {
                 feature_cols: cols.to_vec(),
                 basis_matrix,
