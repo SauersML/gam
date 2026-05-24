@@ -1185,6 +1185,6 @@ for _penalty_cls in (
 Penalty = (
     "IsometryPenalty | SparsityPenalty | ScadMcpPenalty | ARDPenalty | "
     "TotalVariationPenalty | NuclearNormPenalty | BlockSparsityPenalty | "
-    "AuxConditionalPriorPenalty | ParametricAuxConditionalPriorPenalty | ScalarWeightSchedule | "
+    "AuxConditionalPriorPenalty | ParametricAuxConditionalPriorPenalty | "
     "OrthogonalityPenalty | IBPAssignmentPenalty | SoftmaxAssignmentSparsityPenalty"
 )

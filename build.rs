@@ -38,23 +38,54 @@ fn main() {
         std::process::exit(1);
     }
 
-    // `#[allow(unused_assignments)]` ban. The lint catches dead writes that
-    // signal a logic error (a value computed and then overwritten without
-    // being read). Silencing it locally hides those bugs; rewrite the code
-    // so the initial value is actually read (e.g. via `debug_assert`) or
-    // restructure to assign only on the path that needs the value.
-    let mut allow_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
-    scan_for_banned_allow(&manifest_dir, &manifest_dir, "unused_assignments", &mut allow_offenders);
+    // `#[allow(unused_*)]` and `#[allow(dead_code)]` ban. Unused-* lints
+    // (unused_assignments, unused_variables, unused_imports, unused_mut,
+    // unused_must_use, unused_macros, unused_doc_comments, unused_attributes,
+    // unused_parens, unused_braces, ...) catch dead code or dead writes that
+    // signal a logic error. `dead_code` is the same story for unused items.
+    // Silencing them locally hides bugs — use or delete instead. Rewrite the
+    // code so the offending binding is actually read, or remove it.
+    let mut allow_offenders: Vec<(PathBuf, usize, String, String)> = Vec::new();
+    scan_for_banned_allow(&manifest_dir, &manifest_dir, &mut allow_offenders);
     if !allow_offenders.is_empty() {
         eprintln!();
         eprintln!(
-            "error: {} `#[allow(unused_assignments)]` attribute(s) found. \
-             Rewrite so the initial assignment is read, or restructure the \
-             control flow — do not silence the lint.",
+            "error: {} banned `#[allow(...)]` attribute(s) found. \
+             `unused_*` and `dead_code` are not allowed to be silenced — \
+             use the value or delete the binding.",
             allow_offenders.len()
         );
         eprintln!();
-        for (rel, line_no, line) in &allow_offenders {
+        for (rel, line_no, lint, line) in &allow_offenders {
+            let trimmed = line.trim();
+            let snippet: String = trimmed.chars().take(160).collect();
+            eprintln!("  {}:{}: [allow({})] {}", rel.display(), line_no, lint, snippet);
+        }
+        eprintln!();
+        std::process::exit(1);
+    }
+
+    // `let _name = ...` ban (underscore-prefixed binding with a non-empty
+    // suffix). Such bindings silence `unused_variables` without naming the
+    // intent. Explicit alternatives exist for every legitimate case:
+    //   - drop result:        `let _ = expr;` or `drop(expr);`
+    //   - RAII guard scope:   `{ let g = lock(); ...use g... }` or
+    //                         `let g = lock(); std::mem::drop(g);` at exit
+    //   - keep alive to end:  bind with a real name and read it
+    // The bare `_` pattern (`let _ = ...`, `let _: T = ...`) is fine and
+    // not flagged here.
+    let mut underscore_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_let_underscore_binding(&manifest_dir, &manifest_dir, &mut underscore_offenders);
+    if !underscore_offenders.is_empty() {
+        eprintln!();
+        eprintln!(
+            "error: {} `let _name = ...` binding(s) found. \
+             Underscore-prefixed names silence unused-variable warnings — \
+             use a real name and read it, or use `let _ = ...` / `drop(...)`.",
+            underscore_offenders.len()
+        );
+        eprintln!();
+        for (rel, line_no, line) in &underscore_offenders {
             let trimmed = line.trim();
             let snippet: String = trimmed.chars().take(160).collect();
             eprintln!("  {}:{}: {}", rel.display(), line_no, snippet);
