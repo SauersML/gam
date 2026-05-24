@@ -2158,7 +2158,10 @@ mod tests {
             seed: 456,
         };
         let out = run_nuts_sampling_flattened_family(
-            LikelihoodFamily::BinomialLogit,
+            LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Standard(LinkFunction::Logit),
+            },
             FamilyNutsInputs::Glm(GlmFlatInputs {
                 x: x.view(),
                 y: y.view(),
@@ -2194,7 +2197,10 @@ mod tests {
         };
 
         let err = match run_nuts_sampling_flattened_family(
-            LikelihoodFamily::BinomialProbit,
+            LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Standard(LinkFunction::Probit),
+            },
             FamilyNutsInputs::Glm(GlmFlatInputs {
                 x: x.view(),
                 y: y.view(),
@@ -2235,7 +2241,10 @@ mod tests {
         };
 
         let err = match run_nuts_sampling_flattened_family(
-            LikelihoodFamily::PoissonLog,
+            LikelihoodSpec {
+                response: ResponseFamily::Poisson,
+                link: InverseLink::Standard(LinkFunction::Log),
+            },
             FamilyNutsInputs::Glm(GlmFlatInputs {
                 x: x.view(),
                 y: y.view(),

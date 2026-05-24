@@ -2,7 +2,7 @@ use gam::estimate::{
     ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
 };
 use gam::smooth::BlockwisePenalty;
-use gam::types::LikelihoodFamily;
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -25,6 +25,20 @@ fn one_penalty(p: usize) -> Vec<BlockwisePenalty> {
         s[[j, j]] = 1.0;
     }
     vec![BlockwisePenalty::new(0..p, s)]
+}
+
+fn gaussian_identity_spec() -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(LinkFunction::Identity),
+    )
+}
+
+fn binomial_logit_spec() -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::Standard(LinkFunction::Logit),
+    )
 }
 
 /// Central finite-difference gradient at a single step size.
@@ -176,7 +190,7 @@ fn test_lamlgradient_nonfirthwell_conditioned() {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        family: LikelihoodFamily::GaussianIdentity,
+        family: gaussian_identity_spec(),
         compute_inference: true,
         max_iter: 200,
         tol: 1e-10,
@@ -250,7 +264,7 @@ fn test_lamlgradient_logitwith_firthwell_conditioned() {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        family: LikelihoodFamily::BinomialLogit,
+        family: binomial_logit_spec(),
         compute_inference: true,
         max_iter: 200,
         tol: 1e-10,
@@ -325,7 +339,7 @@ fn stress_test_firthgradientvs_conditioning() {
             optimize_mixture: false,
             sas_link: None,
             optimize_sas: false,
-            family: LikelihoodFamily::BinomialLogit,
+            family: binomial_logit_spec(),
             compute_inference: true,
             max_iter: 150,
             tol: 1e-8,
