@@ -1582,6 +1582,39 @@ mod tests {
     use ndarray::{Array1, Array2, array};
     use std::sync::Arc;
 
+    impl NutsPosterior {
+        /// Test-only allocation wrapper around `compute_logp_and_grad_nd_into`.
+        pub(super) fn compute_logp_and_grad_nd(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
+            let mut residual = Array1::<f64>::zeros(self.data.n_samples);
+            let mut grad = Array1::<f64>::zeros(z.len());
+            let logp = self.compute_logp_and_grad_nd_into(z, &mut residual, &mut grad);
+            (logp, grad)
+        }
+    }
+
+    impl LinkWigglePosterior {
+        /// Test-only allocation wrapper around `compute_logp_and_grad_into`.
+        pub(super) fn compute_logp_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
+            let dim = self.p_base + self.p_link;
+            let mut grad = Array1::<f64>::zeros(dim);
+            let logp = self.compute_logp_and_grad_into(z, &mut grad);
+            (logp, grad)
+        }
+    }
+
+    impl JointBetaRhoPosterior {
+        /// Test-only allocation wrapper around `compute_joint_logp_and_grad_into`.
+        pub(super) fn compute_joint_logp_and_grad(
+            &self,
+            params: &Array1<f64>,
+        ) -> (f64, Array1<f64>) {
+            let total_dim = self.n_beta + self.n_rho + self.n_link_params;
+            let mut grad = Array1::<f64>::zeros(total_dim);
+            let logp = self.compute_joint_logp_and_grad_into(params, &mut grad);
+            (logp, grad)
+        }
+    }
+
     fn hmc_test_fit(
         blocks: Vec<FittedBlock>,
         inference: Option<FitInference>,
