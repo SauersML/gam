@@ -10167,6 +10167,34 @@ fn sample_table_impl(
 /// Returns the inverse-link kind tag emitted to the Python wrapper.
 ///
 /// The tag is intentionally lower-kebab-case so it can be matched as a
+/// Stable lower-kebab-case name of a `LikelihoodSpec`, matching the strings
+/// the saved-model payload's `family` field used to carry from the legacy
+/// `LikelihoodFamily::name()` enum. Used in the `FittedModelPayload::new`
+/// third argument and in user-visible error messages.
+fn likelihood_spec_legacy_name(family: &LikelihoodSpec) -> &'static str {
+    match (&family.response, &family.link) {
+        (ResponseFamily::Gaussian, _) => "gaussian",
+        (ResponseFamily::Poisson, _) => "poisson-log",
+        (ResponseFamily::Tweedie { .. }, _) => "tweedie-log",
+        (ResponseFamily::NegativeBinomial { .. }, _) => "negative-binomial-log",
+        (ResponseFamily::Beta { .. }, _) => "beta-regression-logit",
+        (ResponseFamily::Gamma, _) => "gamma-log",
+        (ResponseFamily::RoystonParmar, _) => "royston-parmar",
+        (ResponseFamily::Binomial, link) => match link {
+            InverseLink::Standard(LinkFunction::Logit) => "binomial-logit",
+            InverseLink::Standard(LinkFunction::Probit) => "binomial-probit",
+            InverseLink::Standard(LinkFunction::CLogLog) => "binomial-cloglog",
+            InverseLink::Standard(LinkFunction::Sas) => "binomial-sas",
+            InverseLink::Standard(LinkFunction::BetaLogistic) => "binomial-beta-logistic",
+            InverseLink::Standard(_) => "binomial-logit",
+            InverseLink::LatentCLogLog(_) => "latent-cloglog-binomial",
+            InverseLink::Sas(_) => "binomial-sas",
+            InverseLink::BetaLogistic(_) => "binomial-beta-logistic",
+            InverseLink::Mixture(_) => "binomial-blended-inverse-link",
+        },
+    }
+}
+
 /// plain string on the Python side (the Rust `LikelihoodSpec` itself is
 /// not part of the FFI surface). Families that don't have a closed-form
 /// scalar inverse link (`royston-parmar`, `binomial-sas`,
@@ -13819,7 +13847,7 @@ fn build_standard_payload(
     formula: String,
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     saved_fit: &gam::estimate::UnifiedFitResult,
     design: &TermCollectionDesign,
     resolved_termspec: TermCollectionSpec,
@@ -13828,31 +13856,35 @@ fn build_standard_payload(
     wiggle_degree: Option<usize>,
 ) -> Result<FittedModelPayload, String> {
     let saved_fit = fit_with_null_space_logdet(design, saved_fit)?;
-    let latent_cloglog_state =
-        if matches!(family, LikelihoodFamily::BinomialLatentCLogLog) {
-            Some(saved_latent_cloglog_state_from_fit(&saved_fit).expect(
-                "latent-cloglog-binomial fit must produce an explicit latent-cloglog state",
-            ))
-        } else {
-            saved_latent_cloglog_state_from_fit(&saved_fit)
-        };
+    let latent_cloglog_state = if matches!(
+        (&family.response, &family.link),
+        (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_))
+    ) {
+        Some(saved_latent_cloglog_state_from_fit(&saved_fit).expect(
+            "latent-cloglog-binomial fit must produce an explicit latent-cloglog state",
+        ))
+    } else {
+        saved_latent_cloglog_state_from_fit(&saved_fit)
+    };
+    let family_link = family.link_function();
+    let family_name = likelihood_spec_legacy_name(&family).to_string();
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
         formula,
         ModelKind::Standard,
         FittedFamily::Standard {
             likelihood: family,
-            link: Some(family.link_function()),
+            link: Some(family_link),
             latent_cloglog_state,
             mixture_state: saved_mixture_state_from_fit(&saved_fit),
             sas_state: saved_sas_state_from_fit(&saved_fit),
         },
-        family.name().to_string(),
+        family_name,
     );
     payload.unified = Some(saved_fit.clone());
     payload.fit_result = Some(saved_fit);
     payload.data_schema = Some(dataset.schema.clone());
-    payload.link = Some(InverseLink::Standard(family.link_function()));
+    payload.link = Some(InverseLink::Standard(family_link));
     payload.linkwiggle_knots = wiggle_knots;
     payload.linkwiggle_degree = wiggle_degree;
     payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
@@ -13888,7 +13920,10 @@ fn build_transformation_normal_ffi_payload(
         formula,
         ModelKind::TransformationNormal,
         FittedFamily::TransformationNormal {
-            likelihood: LikelihoodFamily::GaussianIdentity,
+            likelihood: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
         },
         "transformation-normal".to_string(),
     );
@@ -13934,10 +13969,9 @@ fn build_bernoulli_marginal_slope_ffi_payload(
         .clone()
         .ok_or_else(|| "bernoulli marginal-slope requires z_column".to_string())?;
 
-    let likelihood_spec = inverse_link_to_binomial_spec(&base_link).map_err(|e| e.to_string())?;
-    let likelihood = LikelihoodFamily::try_from(likelihood_spec).map_err(|e| {
+    let likelihood = inverse_link_to_binomial_spec(&base_link).map_err(|e| {
         format!(
-            "failed to resolve LikelihoodFamily for bernoulli marginal-slope base link {:?}: {e}",
+            "failed to resolve LikelihoodSpec for bernoulli marginal-slope base link {:?}: {e}",
             base_link
         )
     })?;
@@ -14077,7 +14111,10 @@ fn build_survival_marginal_slope_ffi_payload(
         formula,
         ModelKind::Survival,
         FittedFamily::Survival {
-            likelihood: LikelihoodFamily::RoystonParmar,
+            likelihood: LikelihoodSpec::new(
+                ResponseFamily::RoystonParmar,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             survival_likelihood: Some("marginal-slope".to_string()),
             survival_distribution: Some(ResidualDistribution::Gaussian),
             frailty,
@@ -14151,7 +14188,10 @@ fn build_survival_transformation_ffi_payload(
         formula,
         ModelKind::Survival,
         FittedFamily::Survival {
-            likelihood: LikelihoodFamily::RoystonParmar,
+            likelihood: LikelihoodSpec::new(
+                ResponseFamily::RoystonParmar,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             survival_likelihood: Some(likelihood_label.clone()),
             survival_distribution: None,
             frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -14539,7 +14579,10 @@ fn build_survival_location_scale_ffi_payload(
         formula,
         ModelKind::Survival,
         FittedFamily::Survival {
-            likelihood: LikelihoodFamily::RoystonParmar,
+            likelihood: LikelihoodSpec::new(
+                ResponseFamily::RoystonParmar,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             survival_likelihood: Some(survival_likelihood_modename(likelihood_mode).to_string()),
             survival_distribution: residual_distribution_from_inverse_link(&fitted_inverse_link),
             frailty: gam::families::lognormal_kernel::FrailtySpec::None,
