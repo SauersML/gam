@@ -18,16 +18,9 @@ pub enum BackendStatus {
 
 #[inline]
 pub fn backend_status() -> BackendStatus {
-    #[cfg(feature = "cuda")]
-    {
-        match crate::gpu::runtime::GpuRuntime::global() {
-            Some(_) => BackendStatus::CudaReady,
-            None => BackendStatus::CudaUnavailable,
-        }
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        BackendStatus::CpuFallback
+    match crate::gpu::runtime::GpuRuntime::global() {
+        Some(_) => BackendStatus::CudaReady,
+        None => BackendStatus::CudaUnavailable,
     }
 }
 
@@ -163,21 +156,12 @@ pub fn try_dispatch(
     if eta.is_empty() {
         return None;
     }
-    #[cfg(feature = "cuda")]
-    {
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
-            return None;
-        };
-        Some(cuda_irls_link(eta, link, derivative_order))
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        drop((eta, link, derivative_order));
-        None
-    }
+    let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+        return None;
+    };
+    Some(cuda_irls_link(eta, link, derivative_order))
 }
 
-#[cfg(feature = "cuda")]
 fn cuda_irls_link(
     eta: ArrayView1<'_, f64>,
     link: LinkFunction,
@@ -289,7 +273,6 @@ extern "C" __global__ void irls_link_kernel(
     })
 }
 
-#[cfg(feature = "cuda")]
 fn map_drv(e: cudarc::driver::DriverError) -> GpuError {
     GpuError::DriverCallFailed {
         reason: format!("irls_link cudarc driver error: {e}"),
