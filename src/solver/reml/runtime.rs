@@ -4246,13 +4246,7 @@ impl<'a> RemlState<'a> {
             )));
         }
 
-        let s_thr = super::unified::positive_eigenvalue_threshold(
-            penalty_subspace.evals.as_slice().unwrap(),
-        );
-        let positive_cols: Vec<usize> = (0..p)
-            .filter(|&j| penalty_subspace.evals[j] > s_thr)
-            .collect();
-        let r = positive_cols.len();
+        let r = penalty_subspace.rank;
         if r == 0 {
             // Penalty is structurally null → there is no identified
             // subspace to project onto.  Returning 0.0 lets the caller
@@ -4260,6 +4254,9 @@ impl<'a> RemlState<'a> {
             // no pair to balance in the LAML ratio.
             return Ok((0.0, None));
         }
+        // Use the canonical structural rank, not a threshold on eigenvalues:
+        // ridge-lifted null directions can otherwise enter the active range.
+        let positive_cols: Vec<usize> = (p - r..p).collect();
 
         // Build U_S: p × r basis of range(S_+).
         let mut u_s = Array2::<f64>::zeros((p, r));
@@ -4314,8 +4311,7 @@ impl<'a> RemlState<'a> {
     /// in the direction S_direction.
     ///
     /// Uses the exact pseudoinverse S⁺ restricted to the positive eigenspace.
-    /// Only eigenvectors with eigenvalues above the structural threshold
-    /// participate.
+    /// Only eigenvectors in the canonical structural rank participate.
     pub(super) fn fixed_subspace_penalty_trace(
         &self,
         e_transformed: &Array2<f64>,
@@ -4346,18 +4342,14 @@ impl<'a> RemlState<'a> {
         }
 
         // Exact pseudoinverse trace: tr(S⁺ S_direction) on the positive eigenspace.
-        let threshold = super::unified::positive_eigenvalue_threshold(
-            penalty_subspace.evals.as_slice().unwrap(),
-        );
-
+        // Use structural rank instead of thresholding evals so ridge-lifted
+        // null directions do not contaminate the log|S|+ derivative kernel.
         let mut trace = 0.0;
-        for idx in 0..p_dim {
+        for idx in p_dim - penalty_subspace.rank..p_dim {
             let ev = penalty_subspace.evals[idx];
-            if ev > threshold {
-                let u = penalty_subspace.evecs.column(idx).to_owned();
-                let spsi_u = s_direction.dot(&u);
-                trace += u.dot(&spsi_u) / ev;
-            }
+            let u = penalty_subspace.evecs.column(idx).to_owned();
+            let spsi_u = s_direction.dot(&u);
+            trace += u.dot(&spsi_u) / ev;
         }
         Ok(trace)
     }

@@ -72,8 +72,9 @@ use gam::transformation_normal::TransformationNormalFitResult;
 use gam::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, AuxConditionalPriorPenalty,
     DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty, NuclearNormPenalty,
-    OrthogonalityPenalty, ParametricAuxConditionalPriorPenalty, PenaltyTier, PsiSlice,
-    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TotalVariationPenalty,
+    OrthogonalityPenalty, ParametricAuxConditionalPriorPenalty, PenaltyConcavity, PenaltyTier,
+    PsiSlice, ScadMcpPenalty, SoftmaxAssignmentSparsityPenalty, SparsityPenalty,
+    TotalVariationPenalty,
 };
 use gam::terms::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
@@ -10578,6 +10579,45 @@ fn build_analytic_penalty_registry_from_json(
                 registry.push(gam::terms::AnalyticPenaltyKind::Sparsity(std::sync::Arc::new(
                     penalty,
                 )));
+            }
+            "scad_mcp" => {
+                let weight = descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
+                let gamma = descriptor_f64(descriptor, "gamma", 3.7)?;
+                let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
+                let variant = descriptor
+                    .get("variant")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("mcp")
+                    .to_ascii_lowercase()
+                    .replace('-', "_");
+                let variant = match variant.as_str() {
+                    "mcp" => PenaltyConcavity::Mcp,
+                    "scad" => PenaltyConcavity::Scad,
+                    other => {
+                        return Err(format!(
+                            "{context}.variant must be 'mcp' or 'scad'; got {other:?}"
+                        ));
+                    }
+                };
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                registry.push(gam::terms::AnalyticPenaltyKind::ScadMcp(
+                    std::sync::Arc::new(
+                        ScadMcpPenalty::new(
+                            slice,
+                            weight,
+                            n_eff,
+                            gamma,
+                            smoothing_eps,
+                            variant,
+                            learnable,
+                        )
+                        .map_err(|err| format!("{context}: {err}"))?,
+                    ),
+                ));
             }
             "ibp_assignment" | "ibp_assignment_penalty" => {
                 let k_max = descriptor_usize(descriptor, "k_max", target.d)?;
