@@ -252,7 +252,8 @@ impl<T: AD> PdfFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for PdfFn<T> {
     const NAME: &'static str = "PdfFn";
 
-    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], frozen: bool) -> Vec<T> {
+        drop(frozen);
         vec![normal_pdf_ad(inputs[0])]
     }
 
@@ -285,7 +286,8 @@ impl<T: AD> LogitFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for LogitFn<T> {
     const NAME: &'static str = "LogitFn";
 
-    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], frozen: bool) -> Vec<T> {
+        drop(frozen);
         vec![logistic_ad(inputs[0])]
     }
 
@@ -318,7 +320,8 @@ impl<T: AD> WeightFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for WeightFn<T> {
     const NAME: &'static str = "WeightFn";
 
-    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], frozen: bool) -> Vec<T> {
+        drop(frozen);
         vec![weight_ad(inputs[0])]
     }
 

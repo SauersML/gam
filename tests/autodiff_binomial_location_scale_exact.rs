@@ -215,7 +215,8 @@ impl<T: AD> PsiQuantityFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for PsiQuantityFn<T> {
     const NAME: &'static str = "PsiQuantityFn";
 
-    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], frozen: bool) -> Vec<T> {
+        drop(frozen);
         vec![psi_quantity_ad(inputs[0], &self.params, self.quantity)]
     }
 
@@ -518,7 +519,8 @@ impl<T: AD> EpsHessianPsiFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for EpsHessianPsiFn<T> {
     const NAME: &'static str = "EpsHessianPsiFn";
 
-    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], frozen: bool) -> Vec<T> {
+        drop(frozen);
         vec![epshessian_psi_ad(
             inputs[0],
             self.psi0,
@@ -574,7 +576,8 @@ impl<T: AD> QFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for QFn<T> {
     const NAME: &'static str = "QFn";
 
-    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], frozen: bool) -> Vec<T> {
+        drop(frozen);
         vec![q_ad(inputs[0], self.eta_t)]
     }
 
@@ -633,7 +636,8 @@ impl<T: AD> ScalingPhiFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for ScalingPhiFn<T> {
     const NAME: &'static str = "ScalingPhiFn";
 
-    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], frozen: bool) -> Vec<T> {
+        drop(frozen);
         vec![scalingphi_ad(inputs[0], self.r, self.eta)]
     }
 
