@@ -948,55 +948,55 @@ impl ExactOuterDerivativeOrder {
 /// the outer optimizer should see the exact second-order objective. Runtime
 /// representation choices (dense vs operator) belong below this declaration,
 /// not in a first-order downgrade.
-fn debug_assert_hook_blockspecs(specs: &[ParameterBlockSpec], context: &str) {
-    debug_assert!(
+fn assert_valid_blockspecs(specs: &[ParameterBlockSpec], context: &str) {
+    assert!(
         validate_blockspecs(specs).is_ok(),
         "{context}: invalid parameter block specs"
     );
 }
 
-fn debug_assert_hook_options(options: &BlockwiseFitOptions, context: &str) {
-    debug_assert!(
+fn assert_valid_options(options: &BlockwiseFitOptions, context: &str) {
+    assert!(
         options.inner_tol.is_finite() && options.inner_tol >= 0.0,
         "{context}: inner_tol must be finite and non-negative"
     );
-    debug_assert!(
+    assert!(
         options.outer_tol.is_finite() && options.outer_tol >= 0.0,
         "{context}: outer_tol must be finite and non-negative"
     );
-    debug_assert!(
+    assert!(
         options.minweight.is_finite() && options.minweight >= 0.0,
         "{context}: minweight must be finite and non-negative"
     );
-    debug_assert!(
+    assert!(
         options.ridge_floor.is_finite() && options.ridge_floor >= 0.0,
         "{context}: ridge_floor must be finite and non-negative"
     );
     if let Some(threshold) = options.early_exit_threshold {
-        debug_assert!(
+        assert!(
             threshold.is_finite(),
             "{context}: early_exit_threshold must be finite"
         );
     }
 }
 
-fn debug_assert_hook_states_match_specs(
+fn assert_states_match_specs(
     states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
     context: &str,
 ) {
-    debug_assert_eq!(
+    assert_eq!(
         states.len(),
         specs.len(),
         "{context}: state/spec block count mismatch"
     );
     for (block, (state, spec)) in states.iter().zip(specs).enumerate() {
-        debug_assert_eq!(
+        assert_eq!(
             state.beta.len(),
             spec.design.ncols(),
             "{context}: beta length mismatch in block {block}"
         );
-        debug_assert_eq!(
+        assert_eq!(
             state.eta.len(),
             spec.design.nrows(),
             "{context}: eta length mismatch in block {block}"
@@ -1004,55 +1004,48 @@ fn debug_assert_hook_states_match_specs(
     }
 }
 
-fn debug_assert_hook_derivative_blocks_match_specs(
+fn assert_derivative_blocks_match_specs(
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     specs: &[ParameterBlockSpec],
     context: &str,
 ) {
-    debug_assert_eq!(
+    assert_eq!(
         derivative_blocks.len(),
         specs.len(),
         "{context}: derivative/spec block count mismatch"
     );
 }
 
-fn debug_assert_hook_rho_matches_specs(
+fn assert_rho_matches_specs(
     rho: &Array1<f64>,
     specs: &[ParameterBlockSpec],
     context: &str,
 ) {
     let expected = specs.iter().map(|spec| spec.penalties.len()).sum::<usize>();
-    debug_assert_eq!(
+    assert_eq!(
         rho.len(),
         expected,
         "{context}: rho length does not match penalty count"
     );
 }
 
-fn debug_assert_hook_workspace_arc(
+fn assert_workspace_arc(
     hessian_workspace: &Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     context: &str,
 ) {
     if let Some(workspace) = hessian_workspace.as_ref() {
-        debug_assert!(
+        assert!(
             Arc::strong_count(workspace) > 0,
             "{context}: workspace Arc invariant violated"
         );
     }
 }
 
-fn debug_assert_psi_axis_index(axis: usize, context: &str) {
-    debug_assert!(
-        axis.checked_add(1).is_some(),
-        "{context}: axis index overflow"
-    );
-}
-
 pub fn exact_outer_order_from_capability(
     specs: &[ParameterBlockSpec],
     coefficient_cost: u64,
 ) -> ExactOuterDerivativeOrder {
-    debug_assert_hook_blockspecs(specs, "exact outer derivative order");
+    assert_valid_blockspecs(specs, "exact outer derivative order");
     match coefficient_cost {
         0 => ExactOuterDerivativeOrder::Second,
         _ => ExactOuterDerivativeOrder::Second,
@@ -1070,7 +1063,7 @@ pub fn exact_outer_order_with_outer_hvp(
     outer_hyper_hessian_hvp_available: bool,
 ) -> ExactOuterDerivativeOrder {
     if outer_hyper_hessian_hvp_available {
-        debug_assert_hook_blockspecs(specs, "exact outer derivative order with HVP");
+        assert_valid_blockspecs(specs, "exact outer derivative order with HVP");
         match coefficient_cost {
             0 => ExactOuterDerivativeOrder::Second,
             _ => ExactOuterDerivativeOrder::Second,
@@ -1412,8 +1405,8 @@ pub trait CustomFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Option<String> {
-        debug_assert_hook_blockspecs(specs, "persistent warm-start fingerprint");
-        debug_assert_hook_options(options, "persistent warm-start fingerprint");
+        assert_valid_blockspecs(specs, "persistent warm-start fingerprint");
+        assert_valid_options(options, "persistent warm-start fingerprint");
         None
     }
 
@@ -1448,7 +1441,7 @@ pub trait CustomFamily {
         block_states: &[ParameterBlockState],
         options: &BlockwiseFitOptions,
     ) -> Result<f64, String> {
-        debug_assert_hook_options(options, "log_likelihood_only_with_options");
+        assert_valid_options(options, "log_likelihood_only_with_options");
         self.log_likelihood_only(block_states)
     }
 
@@ -1919,7 +1912,7 @@ pub trait CustomFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        debug_assert_hook_options(options, "exact Newton joint Hessian workspace");
+        assert_valid_options(options, "exact Newton joint Hessian workspace");
         self.exact_newton_joint_hessian_workspace(states, specs)
     }
 
@@ -1936,9 +1929,9 @@ pub trait CustomFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
-        debug_assert_hook_blockspecs(specs, "joint line-search workspace");
-        debug_assert_hook_states_match_specs(states, specs, "joint line-search workspace");
-        debug_assert_hook_options(options, "joint line-search workspace");
+        assert_valid_blockspecs(specs, "joint line-search workspace");
+        assert_states_match_specs(states, specs, "joint line-search workspace");
+        assert_valid_options(options, "joint line-search workspace");
         Ok(None)
     }
 
@@ -1978,16 +1971,16 @@ pub trait CustomFamily {
         options: &BlockwiseFitOptions,
         hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
-        debug_assert_hook_blockspecs(specs, "batched outer gradient terms");
-        debug_assert_hook_states_match_specs(block_states, specs, "batched outer gradient terms");
-        debug_assert_hook_derivative_blocks_match_specs(
+        assert_valid_blockspecs(specs, "batched outer gradient terms");
+        assert_states_match_specs(block_states, specs, "batched outer gradient terms");
+        assert_derivative_blocks_match_specs(
             derivative_blocks,
             specs,
             "batched outer gradient terms",
         );
-        debug_assert_hook_rho_matches_specs(rho, specs, "batched outer gradient terms");
-        debug_assert_hook_options(options, "batched outer gradient terms");
-        debug_assert_hook_workspace_arc(&hessian_workspace, "batched outer gradient terms");
+        assert_rho_matches_specs(rho, specs, "batched outer gradient terms");
+        assert_valid_options(options, "batched outer gradient terms");
+        assert_workspace_arc(&hessian_workspace, "batched outer gradient terms");
         Ok(None)
     }
 
@@ -2008,15 +2001,15 @@ pub trait CustomFamily {
         rho: &Array1<f64>,
         hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterHessianTerms>, String> {
-        debug_assert_hook_blockspecs(specs, "batched outer Hessian terms");
-        debug_assert_hook_states_match_specs(block_states, specs, "batched outer Hessian terms");
-        debug_assert_hook_derivative_blocks_match_specs(
+        assert_valid_blockspecs(specs, "batched outer Hessian terms");
+        assert_states_match_specs(block_states, specs, "batched outer Hessian terms");
+        assert_derivative_blocks_match_specs(
             derivative_blocks,
             specs,
             "batched outer Hessian terms",
         );
-        debug_assert_hook_rho_matches_specs(rho, specs, "batched outer Hessian terms");
-        debug_assert_hook_workspace_arc(&hessian_workspace, "batched outer Hessian terms");
+        assert_rho_matches_specs(rho, specs, "batched outer Hessian terms");
+        assert_workspace_arc(&hessian_workspace, "batched outer Hessian terms");
         Ok(self
             .outer_hyper_hessian_operator(specs)
             .map(|operator| BatchedOuterHessianTerms {
@@ -2029,24 +2022,24 @@ pub trait CustomFamily {
     /// Kept separate from outer hyper-Hessian capabilities so CTN/GAMLSS row
     /// operators do not accidentally advertise pairwise θθ calculus as cheap.
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        debug_assert_hook_blockspecs(specs, "inner coefficient Hessian HVP availability");
+        assert_valid_blockspecs(specs, "inner coefficient Hessian HVP availability");
         false
     }
 
     fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        debug_assert_hook_blockspecs(specs, "inner joint workspace gradient availability");
+        assert_valid_blockspecs(specs, "inner joint workspace gradient availability");
         false
     }
 
     fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        debug_assert_hook_blockspecs(specs, "inner joint workspace log-likelihood availability");
+        assert_valid_blockspecs(specs, "inner joint workspace log-likelihood availability");
         false
     }
 
     /// True only when the family has a real profiled outer Hessian-vector
     /// product over θ = (ρ, ψ), without enumerating all θ_i θ_j pairs.
     fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        debug_assert_hook_blockspecs(specs, "outer hyper-Hessian HVP availability");
+        assert_valid_blockspecs(specs, "outer hyper-Hessian HVP availability");
         false
     }
 
@@ -2055,7 +2048,7 @@ pub trait CustomFamily {
     /// availability; families with only inner HVP support should override this
     /// if dense θθ assembly is not a valid capability for their path.
     fn outer_hyper_hessian_dense_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        debug_assert_hook_blockspecs(specs, "outer hyper-Hessian dense availability");
+        assert_valid_blockspecs(specs, "outer hyper-Hessian dense availability");
         true
     }
 
@@ -2080,7 +2073,7 @@ pub trait CustomFamily {
         &self,
         specs: &[ParameterBlockSpec],
     ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
-        debug_assert_hook_blockspecs(specs, "outer hyper-Hessian operator");
+        assert_valid_blockspecs(specs, "outer hyper-Hessian operator");
         None
     }
 
@@ -2600,7 +2593,7 @@ pub trait CustomFamily {
         derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
-        debug_assert_hook_options(options, "exact Newton joint psi workspace");
+        assert_valid_options(options, "exact Newton joint psi workspace");
         self.exact_newton_joint_psi_workspace(states, specs, derivs)
     }
 
@@ -4101,110 +4094,129 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn transpose_mul(
         &self,
-        axis: usize,
+        _: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        debug_assert_psi_axis_index(axis, "zero psi transpose_mul");
-        debug_assert_eq!(v.len(), self.n);
+        assert_eq!(v.len(), self.n, "zero psi transpose_mul length mismatch");
         Ok(Array1::<f64>::zeros(self.p))
     }
 
     fn forward_mul(
         &self,
-        axis: usize,
+        _: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        debug_assert_psi_axis_index(axis, "zero psi forward_mul");
-        debug_assert_eq!(u.len(), self.p);
+        assert_eq!(u.len(), self.p, "zero psi forward_mul length mismatch");
         Ok(Array1::<f64>::zeros(self.n))
     }
 
     fn transpose_mul_second_diag(
         &self,
-        axis: usize,
+        _: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        debug_assert_psi_axis_index(axis, "zero psi transpose_mul_second_diag");
-        debug_assert_eq!(v.len(), self.n);
+        assert_eq!(
+            v.len(),
+            self.n,
+            "zero psi transpose_mul_second_diag length mismatch"
+        );
         Ok(Array1::<f64>::zeros(self.p))
     }
 
     fn transpose_mul_second_cross(
         &self,
-        axis_d: usize,
-        axis_e: usize,
+        _: usize,
+        _: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        debug_assert_psi_axis_index(axis_d, "zero psi transpose_mul_second_cross lhs");
-        debug_assert_psi_axis_index(axis_e, "zero psi transpose_mul_second_cross rhs");
-        debug_assert_eq!(v.len(), self.n);
+        assert_eq!(
+            v.len(),
+            self.n,
+            "zero psi transpose_mul_second_cross length mismatch"
+        );
         Ok(Array1::<f64>::zeros(self.p))
     }
 
     fn forward_mul_second_diag(
         &self,
-        axis: usize,
+        _: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        debug_assert_psi_axis_index(axis, "zero psi forward_mul_second_diag");
-        debug_assert_eq!(u.len(), self.p);
+        assert_eq!(
+            u.len(),
+            self.p,
+            "zero psi forward_mul_second_diag length mismatch"
+        );
         Ok(Array1::<f64>::zeros(self.n))
     }
 
     fn forward_mul_second_cross(
         &self,
-        axis_d: usize,
-        axis_e: usize,
+        _: usize,
+        _: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        debug_assert_psi_axis_index(axis_d, "zero psi forward_mul_second_cross lhs");
-        debug_assert_psi_axis_index(axis_e, "zero psi forward_mul_second_cross rhs");
-        debug_assert_eq!(u.len(), self.p);
+        assert_eq!(
+            u.len(),
+            self.p,
+            "zero psi forward_mul_second_cross length mismatch"
+        );
         Ok(Array1::<f64>::zeros(self.n))
     }
 
     fn row_chunk_first(
         &self,
-        axis: usize,
+        _: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        debug_assert_psi_axis_index(axis, "zero psi row_chunk_first");
-        debug_assert!(rows.start <= rows.end && rows.end <= self.n);
+        assert!(
+            rows.start <= rows.end && rows.end <= self.n,
+            "zero psi row_chunk_first row range out of bounds"
+        );
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 
     fn row_vector_first_into(
         &self,
-        axis: usize,
+        _: usize,
         row: usize,
         mut out: ArrayViewMut1<'_, f64>,
     ) -> Result<(), crate::terms::basis::BasisError> {
-        debug_assert_psi_axis_index(axis, "zero psi row_vector_first_into");
-        debug_assert!(row < self.n);
-        debug_assert_eq!(out.len(), self.p);
+        assert!(
+            row < self.n,
+            "zero psi row_vector_first_into row out of bounds"
+        );
+        assert_eq!(
+            out.len(),
+            self.p,
+            "zero psi row_vector_first_into output length mismatch"
+        );
         out.fill(0.0);
         Ok(())
     }
 
     fn row_chunk_second_diag(
         &self,
-        axis: usize,
+        _: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        debug_assert_psi_axis_index(axis, "zero psi row_chunk_second_diag");
-        debug_assert!(rows.start <= rows.end && rows.end <= self.n);
+        assert!(
+            rows.start <= rows.end && rows.end <= self.n,
+            "zero psi row_chunk_second_diag row range out of bounds"
+        );
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 
     fn row_chunk_second_cross(
         &self,
-        axis_d: usize,
-        axis_e: usize,
+        _: usize,
+        _: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        debug_assert_psi_axis_index(axis_d, "zero psi row_chunk_second_cross lhs");
-        debug_assert_psi_axis_index(axis_e, "zero psi row_chunk_second_cross rhs");
-        debug_assert!(rows.start <= rows.end && rows.end <= self.n);
+        assert!(
+            rows.start <= rows.end && rows.end <= self.n,
+            "zero psi row_chunk_second_cross row range out of bounds"
+        );
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 }
@@ -8471,15 +8483,12 @@ fn inverse_spdwith_retry(
     let mut sym = matrix.clone();
     symmetrize_dense_in_place(&mut sym);
 
-    let invert_via_chol =
-        |chol: &crate::faer_ndarray::FaerCholeskyFactor, attempt: usize, boost: f64| {
-            debug_assert!(attempt <= max_retry);
-            debug_assert!(boost.is_finite() && boost >= 0.0);
-            let mut ident = Array2::<f64>::eye(sym.nrows());
-            chol.solve_mat_in_place(&mut ident);
-            symmetrize_dense_in_place(&mut ident);
-            Some(ident)
-        };
+    let invert_via_chol = |chol: &crate::faer_ndarray::FaerCholeskyFactor, _: usize, _: f64| {
+        let mut ident = Array2::<f64>::eye(sym.nrows());
+        chol.solve_mat_in_place(&mut ident);
+        symmetrize_dense_in_place(&mut ident);
+        Some(ident)
+    };
 
     // Attempt 0 in the original schedule uses ridge=0 (no diagonal addition).
     // Express this as a single-attempt call with initial_boost=0.
