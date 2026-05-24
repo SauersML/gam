@@ -4911,9 +4911,9 @@ impl SparseHessianSymbolic {
 /// with `O(nnz)` memory instead of `O(p²)`.
 pub struct SparseHessianAccumulator {
     sym: Arc<SparseHessianSymbolic>,
-    /// Values buffer, length `sym.nnz`. Kept private so safe callers cannot
-    /// invalidate the length invariant required by unchecked accumulation.
-    values: Vec<f64>,
+    /// Values buffer, length `sym.nnz`. Crate-visible for reductions; callers
+    /// must not resize it because unchecked accumulation relies on this invariant.
+    pub(crate) values: Vec<f64>,
 }
 
 // Manual Clone: only the values buffer is duplicated; the symbolic pattern is
@@ -4971,8 +4971,8 @@ impl SparseHessianAccumulator {
             );
             let idx = start + offset;
             // SAFETY: the assert! immediately above proves idx is in
-            // start..end, and SparseHessianAccumulator keeps values.len() ==
-            // s.nnz with end <= s.nnz.
+            // start..end, and SparseHessianAccumulator preserves values.len()
+            // == s.nnz with end <= s.nnz.
             unsafe {
                 *self.values.get_unchecked_mut(idx) += val;
             }
@@ -4984,7 +4984,7 @@ impl SparseHessianAccumulator {
             for (off, &ri) in slice.iter().enumerate() {
                 if ri == r {
                     // SAFETY: off comes from row_indices[start..end], so start+off < end.
-                    // The private values.len() == s.nnz invariant and end <= s.nnz make the slot valid.
+                    // The values.len() == s.nnz invariant and end <= s.nnz make the slot valid.
                     unsafe {
                         *self.values.get_unchecked_mut(start + off) += val;
                     }
@@ -6689,6 +6689,11 @@ impl DesignMatrix {
             Self::Dense(DenseDesignMatrix::Materialized(matrix)) => Cow::Borrowed(matrix.as_ref()),
             Self::Dense(DenseDesignMatrix::Lazy(op)) => match op.as_dense_ref() {
                 Some(dense) => Cow::Borrowed(dense),
+                // SAFETY: `as_dense_cow` is the zero-copy view accessor; its
+                // contract forbids operator-backed designs that cannot expose
+                // a pre-materialized dense view. A caller that reached this
+                // arm used the borrow API on an operator representation it
+                // should have streamed through row chunks instead.
                 None => panic!(
                     "DesignMatrix::as_dense_cow called on operator-backed design ({}x{}); use row chunks or matrix-vector products",
                     op.nrows(),
@@ -6698,6 +6703,10 @@ impl DesignMatrix {
             Self::Sparse(matrix) => Cow::Owned(
                 matrix
                     .try_to_dense_arc("DesignMatrix::as_dense_cow")
+                    // SAFETY: callers of `as_dense_cow` have accepted dense
+                    // materialization; densification failure here means the
+                    // sparse matrix exceeds the byte-cap that this accessor
+                    // contractually forbids.
                     .unwrap_or_else(|msg| panic!("{msg}"))
                     .as_ref()
                     .clone(),
@@ -6724,6 +6733,11 @@ impl DesignMatrix {
                     // `to_dense_cow` are committing to a dense consumer.
                     Cow::Owned(
                         dense_operator_to_dense_by_chunks(op.as_ref()).unwrap_or_else(|err| {
+                            // SAFETY: documented bypass — callers of
+                            // `to_dense_cow` are infallible-by-contract dense
+                            // consumers; the row-chunk path has no byte cap
+                            // and only fails on operator implementation bugs,
+                            // which the operator trait contract forbids.
                             panic!(
                                 "DesignMatrix::to_dense_cow: failed to materialize {}x{} \
                                  operator-backed design via row chunks: {err}",
@@ -6737,6 +6751,10 @@ impl DesignMatrix {
             Self::Sparse(matrix) => Cow::Owned(
                 matrix
                     .try_to_dense_arc("DesignMatrix::to_dense_cow")
+                    // SAFETY: callers of `to_dense_cow` have committed to a
+                    // dense `Array2<f64>` consumer; densification failure
+                    // would mean the sparse matrix exceeds the conservative
+                    // byte cap which this accessor's contract forbids.
                     .unwrap_or_else(|msg| panic!("{msg}"))
                     .as_ref()
                     .clone(),
@@ -6772,6 +6790,11 @@ impl DesignMatrix {
             Self::Dense(matrix) => matrix.to_dense(),
             Self::Sparse(matrix) => matrix
                 .try_to_dense_arc("DesignMatrix::to_dense")
+                // SAFETY: `to_dense` is documented as a dense-by-contract
+                // accessor (see the bypass-contract doc above). Sparse path
+                // honours `MAX_SPARSE_TO_DENSE_BYTES` internally; failure
+                // means the matrix exceeded that hard limit which callers of
+                // `to_dense` are forbidden from triggering.
                 .unwrap_or_else(|msg| panic!("{msg}"))
                 .as_ref()
                 .clone(),
@@ -6785,6 +6808,11 @@ impl DesignMatrix {
             Self::Dense(matrix) => matrix.to_dense_arc(),
             Self::Sparse(matrix) => matrix
                 .try_to_dense_arc("DesignMatrix::to_dense_arc")
+                // SAFETY: arc-shared variant of `to_dense` — same bypass
+                // contract; callers have committed to a dense consumer, so a
+                // densification failure would mean the sparse matrix exceeded
+                // `MAX_SPARSE_TO_DENSE_BYTES`, which this method's contract
+                // forbids.
                 .unwrap_or_else(|msg| panic!("{msg}")),
         }
     }
