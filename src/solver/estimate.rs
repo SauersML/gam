@@ -3742,10 +3742,10 @@ where
             beta_covariance_unscaled.as_ref(),
             finalgrad_norm,
         );
-        beta_standard_errors = beta_covariance.as_ref().map(se_from_covariance);
+        beta_standard_errors = beta_covariance.as_ref().map(|c| se_from_covariance(c.as_array()));
         beta_covariance_corrected = match (&beta_covariance, &smoothing_correction) {
-            (Some(base_cov), Some(corr)) if base_cov.dim() == corr.dim() => {
-                let mut corrected = base_cov.clone();
+            (Some(base_cov), Some(corr)) if base_cov.as_array().dim() == corr.dim() => {
+                let mut corrected = base_cov.as_array().clone();
                 corrected += &(corr * dispersion_phi);
                 enforce_symmetry(&mut corrected);
                 Some(corrected)
