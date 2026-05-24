@@ -6192,6 +6192,7 @@ impl BernoulliMarginalSlopeFamily {
         EMPIRICAL_FLEX_DIRECTION_SCRATCH.with(|scratch_cell| -> Result<Array2<f64>, String> {
             let mut scratch = scratch_cell.borrow_mut();
             scratch.ensure_dim(r);
+            let scratch = &mut *scratch;
             let (basis_u, basis_v) = (&mut scratch.basis_u, &mut scratch.basis_v);
             let mut out = Array2::<f64>::zeros((r, r));
             for u in 0..r {
@@ -6251,6 +6252,7 @@ impl BernoulliMarginalSlopeFamily {
         EMPIRICAL_FLEX_DIRECTION_SCRATCH.with(|scratch_cell| -> Result<Array2<f64>, String> {
             let mut scratch = scratch_cell.borrow_mut();
             scratch.ensure_dim(r);
+            let scratch = &mut *scratch;
             let (basis_p, basis_q) = (&mut scratch.basis_u, &mut scratch.basis_v);
             let mut out = Array2::<f64>::zeros((r, r));
             for p in 0..r {
