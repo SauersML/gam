@@ -436,43 +436,29 @@ pub fn ift_warm_start_latent(
     let k = cache.k;
 
     if delta_beta.is_none() && delta_gt.is_none() {
-        return LatentIftOutcome::Noop {
-            reason: "no-perturbation: both delta_beta and delta_gt are None",
-        };
+        return LatentIftOutcome::Noop;
     }
     if let Some(db) = delta_beta.as_ref() {
         if db.len() != k {
-            return LatentIftOutcome::Noop {
-                reason: "delta_beta length mismatch with cached K",
-            };
+            return LatentIftOutcome::Noop;
         }
         if db.iter().any(|v| !v.is_finite()) {
-            return LatentIftOutcome::Noop {
-                reason: "delta_beta contains non-finite entries",
-            };
+            return LatentIftOutcome::Noop;
         }
     }
     if let Some(dg) = delta_gt.as_ref() {
         if dg.len() != n * d {
-            return LatentIftOutcome::Noop {
-                reason: "delta_gt length mismatch with cached N·d",
-            };
+            return LatentIftOutcome::Noop;
         }
         if dg.iter().any(|v| !v.is_finite()) {
-            return LatentIftOutcome::Noop {
-                reason: "delta_gt contains non-finite entries",
-            };
+            return LatentIftOutcome::Noop;
         }
     }
     if cache.undamped_factor_count() != n {
-        return LatentIftOutcome::Noop {
-            reason: "cache block counts mismatch across damped and undamped factors",
-        };
+        return LatentIftOutcome::Noop;
     }
     if delta_beta.is_some() && !cache.htbeta_available() {
-        return LatentIftOutcome::Noop {
-            reason: "cached H_tβ row operator unavailable for delta_beta perturbation",
-        };
+        return LatentIftOutcome::Noop;
     }
     for factor in cache
         .htt_factors
@@ -480,142 +466,12 @@ pub fn ift_warm_start_latent(
         .chain(cache.undamped_factors_iter())
     {
         if factor.dim() != (d, d) {
-            return LatentIftOutcome::Noop {
-                reason: "cached H_tt factor shape mismatch",
-            };
+            return LatentIftOutcome::Noop;
         }
     }
     // Sum the two contributions on the RHS, then per-row solve.
     let delta_t = cache.predict_delta_t_combined(delta_beta, delta_gt);
     LatentIftOutcome::Applied { delta_t }
-}
-
-// ---------------------------------------------------------------------------
-// Riemannian retraction wrapper (additive)
-// ---------------------------------------------------------------------------
-
-/// Apply an IFT-predicted Euclidean tangent `delta_t` through per-row
-/// retractions, returning the *new* latent field as a flat row-major array.
-///
-/// The predicted `δt_i` produced by [`ift_warm_start_latent`] is a tangent
-/// vector at the current `t_i`. When the per-row latent coordinate lives on
-/// a non-trivial manifold (S¹, S², torus, interval), the additive update
-/// `t_i + δt_i` exits the manifold; we must apply the retraction
-/// `R_{t_i}(P_{T_{t_i}}(δt_i))`.
-///
-/// For `manifolds[i] = None` or `Some(ManifoldKind::Euclidean(_))` the
-/// behavior collapses to plain addition (bit-equivalent to the pre-Riemannian
-/// path). The vector-transport-aware Taylor extension for small `Δβ`
-/// reuses the parallel-transport approximation embedded in each
-/// `Manifold::vector_transport` implementation — see
-/// [`crate::solver::riemannian`].
-#[allow(dead_code)]
-pub fn apply_ift_retraction(
-    point_flat: &Array1<f64>,
-    delta_t: &Array1<f64>,
-    row_ambient_dim: usize,
-    manifolds: &[Option<crate::solver::riemannian::ManifoldKind>],
-) -> Array1<f64> {
-    crate::solver::arrow_schur::apply_per_row_retraction(
-        point_flat,
-        delta_t,
-        row_ambient_dim,
-        manifolds,
-    )
-}
-
-// ---------------------------------------------------------------------------
-// IFT cascade through (u, β, ρ) — materialize ∂(β*, u*)/∂ρ from the cache.
-//
-// Per `proposals/arrow_schur_evidence.md` §2.4 / §2.6 / §7:
-//
-//   ∂β*/∂ρ_a = -A⁻¹ q_a               (q_a = ∂g_red/∂ρ_a)
-//   ∂u*/∂ρ_a = -H_uu⁻¹ G_{u,ρ_a} - H_uu⁻¹ H_uβ ∂β*/∂ρ_a.
-//
-// Both per-row solves use the UNDAMPED row factors
-// (`htt_factors_undamped`), per proposal §1.7. The β solve uses the
-// cached Schur Cholesky `schur_factor`. The math is equivalent to two
-// applications of the existing predictors:
-//
-//   ∂u*/∂ρ_a contribution from ∂β*/∂ρ_a -> predict_delta_t_from_delta_beta
-//   ∂u*/∂ρ_a contribution from G_{u,ρ_a} -> predict_delta_t_from_delta_gt
-//
-// and we reuse those predictors verbatim to keep the damping invariant
-// in a single place.
-// ---------------------------------------------------------------------------
-
-/// Sensitivity bundle for one batch of `ρ` perturbations.
-///
-/// `beta_rho[:, a]` is `∂β*/∂ρ_a`; `u_rho[:, a]` is `∂u*/∂ρ_a` flat
-/// row-major. Shapes follow the contract in proposal §5.3.
-#[allow(dead_code)] // INTEGRATION-HOOK(evidence): consumed by solver/evidence::evidence_grad_rho when REML driver routes IFT cascade through this entry point.
-#[derive(Debug, Clone)]
-pub struct ArrowIftCascade {
-    pub beta_rho: ndarray::Array2<f64>,
-    pub u_rho: ndarray::Array2<f64>,
-}
-
-/// Materialize `∂(β*, u*)/∂ρ` from a converged arrow-Schur cache.
-///
-/// `schur_rhs_rho` has shape `K × R`, with column `a` equal to
-/// `q_a = ∂g_red/∂ρ_a`.
-///
-/// `gu_rho` has shape `(N·d) × R`, with column `a` equal to the
-/// per-row `G_{u,ρ_a}` stacked row-major.
-///
-/// Returns `None` if the cache lacks an undamped Schur factor (the
-/// InexactPCG path; see proposal §6.5 — PCG mode cannot supply this
-/// exactly without an explicit estimator).
-///
-/// This function does not mutate the cache and does not rebuild the
-/// design (proposal §5.3 operational contract).
-#[allow(dead_code)] // INTEGRATION-HOOK(evidence): see ArrowIftCascade.
-pub fn ift_cascade_through_rho(
-    cache: &ArrowFactorCache,
-    schur_rhs_rho: ndarray::ArrayView2<'_, f64>,
-    gu_rho: ndarray::ArrayView2<'_, f64>,
-) -> Option<ArrowIftCascade> {
-    let k = cache.k;
-    let n = cache.undamped_factor_count();
-    let d = cache.d;
-    if !cache.htbeta_available() {
-        return None;
-    }
-    debug_assert_eq!(schur_rhs_rho.nrows(), k);
-    debug_assert_eq!(gu_rho.nrows(), n * d);
-    let r = schur_rhs_rho.ncols();
-    debug_assert_eq!(gu_rho.ncols(), r);
-
-    // ∂β*/∂ρ — requires the Schur Cholesky factor. PCG caches fall
-    // through `None` here, which the caller must handle (proposal §6.5).
-    let beta_rho = crate::solver::evidence::ift_dbeta_drho(cache, schur_rhs_rho)?;
-
-    // ∂u*/∂ρ — assemble per-column using the existing predictors.
-    // The predictor sign convention is:
-    //
-    //   predict_delta_t_from_delta_beta(Δβ)  =  -H_uu⁻¹ H_uβ · Δβ
-    //   predict_delta_t_from_delta_gt(δg_t)  =  -H_uu⁻¹ · δg_t
-    //
-    // and `∂u*/∂ρ_a = -H_uu⁻¹ G_{u,ρ_a} - H_uu⁻¹ H_uβ · ∂β*/∂ρ_a`, so
-    // we sum the two predictor outputs directly (no further negation).
-    let mut u_rho = ndarray::Array2::<f64>::zeros((n * d, r));
-    let mut tmp_gu = Array1::<f64>::zeros(n * d);
-    let mut tmp_db = Array1::<f64>::zeros(k);
-    for a in 0..r {
-        for row in 0..n * d {
-            tmp_gu[row] = gu_rho[[row, a]];
-        }
-        for row in 0..k {
-            tmp_db[row] = beta_rho[[row, a]];
-        }
-        let part_db = cache.predict_delta_t_from_delta_beta(tmp_db.view());
-        let part_gu = cache.predict_delta_t_from_delta_gt(tmp_gu.view());
-        for row in 0..n * d {
-            u_rho[[row, a]] = part_db[row] + part_gu[row];
-        }
-    }
-
-    Some(ArrowIftCascade { beta_rho, u_rho })
 }
 
 fn unix_secs_now() -> u64 {

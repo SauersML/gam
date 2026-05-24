@@ -2,15 +2,6 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use gam::families::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_moments};
 use std::hint::black_box;
 
-// Compile-time gate for the multi-second `bms_hv_row_skip` sweep. Flip to
-// `true` locally when you want to time the importance-weighted row-skip
-// threshold sweep against the legacy un-gated path. The bench is committed
-// at `false` so that `cargo bench --bench bms_hv_row_skip` returns
-// immediately in CI / by-default, mirroring the `#[ignore]`-style gating
-// used by the other multi-minute biobank-shape benches in this crate
-// without depending on a process env var.
-const RUN_BMS_HV_ROW_SKIP_BENCH: bool = false;
-
 fn biobank_shape_cells(n: usize) -> Vec<(f64, [DenestedCubicCell; 3])> {
     (0..n)
         .map(|i| {
@@ -72,13 +63,6 @@ fn run_hv_shape(rows: &[(f64, [DenestedCubicCell; 3])], tau: f64) -> f64 {
 }
 
 fn bench_bms_hv_row_skip(c: &mut Criterion) {
-    if !RUN_BMS_HV_ROW_SKIP_BENCH {
-        eprintln!(
-            "ignored: flip RUN_BMS_HV_ROW_SKIP_BENCH=true at the top of \
-             benches/bms_hv_row_skip.rs to run bms_hv_row_skip"
-        );
-        return;
-    }
     let rows = biobank_shape_cells(32_000);
     let mut group = c.benchmark_group("bms_hv_row_skip_biobank_shape");
     for tau in [0.0, 1e-12, 1e-10, 1e-8, 1e-6, 1e-4] {
