@@ -16,12 +16,14 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ndarray::{Array1, Array2};
+use sha2::{Digest, Sha256};
 
 use crate::basis::{DuchonNullspaceOrder, MaternNu, RadialScalarKind};
 use crate::estimate::EstimationError;
 use crate::estimate::reml::DirectionalHyperParam;
-use crate::solver::persistent_warm_start::StableHasher;
-use crate::terms::latent_coord::LatentCoordValues;
+use crate::terms::latent_coord::{
+    AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
+};
 use crate::terms::smooth::TermCollectionDesign;
 
 const DEFAULT_LATENT_CACHE_CAPACITY: usize = 4;
@@ -51,6 +53,47 @@ impl LatentFingerprint {
             len: flat.len(),
             iteration,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CacheDigest([u8; 32]);
+
+struct CacheDigestBuilder {
+    hasher: Sha256,
+}
+
+impl CacheDigestBuilder {
+    fn new(namespace: &str) -> Self {
+        let mut out = Self {
+            hasher: Sha256::new(),
+        };
+        out.write_str(namespace);
+        out
+    }
+
+    fn write_bool(&mut self, value: bool) {
+        self.hasher.update([u8::from(value)]);
+    }
+
+    fn write_f64(&mut self, value: f64) {
+        self.hasher.update(value.to_bits().to_le_bytes());
+    }
+
+    fn write_str(&mut self, value: &str) {
+        self.write_usize(value.len());
+        self.hasher.update(value.as_bytes());
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        self.hasher.update((value as u64).to_le_bytes());
+    }
+
+    fn finish(self) -> CacheDigest {
+        let digest = self.hasher.finalize();
+        let mut out = [0_u8; 32];
+        out.copy_from_slice(&digest);
+        CacheDigest(out)
     }
 }
 
@@ -99,8 +142,8 @@ impl LatentBasisKind {
         }
     }
 
-    fn signature(&self) -> u64 {
-        let mut hasher = StableHasher::new();
+    fn cache_digest(&self) -> CacheDigest {
+        let mut hasher = CacheDigestBuilder::new("latent-basis-v1");
         match self {
             Self::Matern {
                 centers,
@@ -172,7 +215,7 @@ impl LatentBasisKind {
                 hash_matrix(basis_matrix, &mut hasher);
             }
         }
-        hasher.finish_u64()
+        hasher.finish()
     }
 }
 
@@ -186,7 +229,7 @@ fn matern_nu_signature(nu: MaternNu) -> usize {
     }
 }
 
-fn hash_duchon_nullspace_order(order: DuchonNullspaceOrder, hasher: &mut StableHasher) {
+fn hash_duchon_nullspace_order(order: DuchonNullspaceOrder, hasher: &mut CacheDigestBuilder) {
     match order {
         DuchonNullspaceOrder::Zero => {
             hasher.write_usize(0);
@@ -201,7 +244,7 @@ fn hash_duchon_nullspace_order(order: DuchonNullspaceOrder, hasher: &mut StableH
     }
 }
 
-fn hash_optional_f64(value: Option<f64>, hasher: &mut StableHasher) {
+fn hash_optional_f64(value: Option<f64>, hasher: &mut CacheDigestBuilder) {
     match value {
         Some(value) => {
             hasher.write_bool(true);
@@ -213,23 +256,134 @@ fn hash_optional_f64(value: Option<f64>, hasher: &mut StableHasher) {
     }
 }
 
-fn hash_f64_slice(values: &[f64], hasher: &mut StableHasher) {
+fn hash_f64_slice(values: &[f64], hasher: &mut CacheDigestBuilder) {
     hasher.write_usize(values.len());
     for &value in values {
         hasher.write_f64(value);
     }
 }
 
-fn hash_matrix(matrix: &Array2<f64>, hasher: &mut StableHasher) {
+fn hash_matrix(matrix: &Array2<f64>, hasher: &mut CacheDigestBuilder) {
+    hasher.write_usize(matrix.nrows());
+    hasher.write_usize(matrix.ncols());
     for &value in matrix.iter() {
         hasher.write_f64(value);
     }
 }
 
-fn hash_vector(vector: &Array1<f64>, hasher: &mut StableHasher) {
+fn hash_vector(vector: &Array1<f64>, hasher: &mut CacheDigestBuilder) {
     hasher.write_usize(vector.len());
     for &value in vector.iter() {
         hasher.write_f64(value);
+    }
+}
+
+fn latent_metadata_cache_digest(latent: &LatentCoordValues) -> CacheDigest {
+    let mut hasher = CacheDigestBuilder::new("latent-cache-metadata-v1");
+    hasher.write_usize(latent.n_obs());
+    hasher.write_usize(latent.latent_dim());
+    hash_latent_manifold(latent.manifold(), &mut hasher);
+    hash_latent_id_mode(latent.id_mode(), &mut hasher);
+    hasher.finish()
+}
+
+fn hash_latent_id_mode(id_mode: &LatentIdMode, hasher: &mut CacheDigestBuilder) {
+    match id_mode {
+        LatentIdMode::AuxPrior {
+            u,
+            family,
+            strength,
+        } => {
+            hasher.write_usize(0);
+            hash_matrix(u, hasher);
+            hash_aux_prior_family(*family, hasher);
+            hash_aux_prior_strength(*strength, hasher);
+        }
+        LatentIdMode::AuxPriorDimSelection {
+            u,
+            family,
+            strength,
+            init_log_precision,
+        } => {
+            hasher.write_usize(1);
+            hash_matrix(u, hasher);
+            hash_aux_prior_family(*family, hasher);
+            hash_aux_prior_strength(*strength, hasher);
+            hash_optional_vector(init_log_precision.as_ref(), hasher);
+        }
+        LatentIdMode::DimSelection { init_log_precision } => {
+            hasher.write_usize(2);
+            hash_optional_vector(init_log_precision.as_ref(), hasher);
+        }
+        LatentIdMode::None => {
+            hasher.write_usize(3);
+        }
+    }
+}
+
+fn hash_aux_prior_family(family: AuxPriorFamily, hasher: &mut CacheDigestBuilder) {
+    hasher.write_usize(match family {
+        AuxPriorFamily::Ridge => 0,
+        AuxPriorFamily::Linear => 1,
+    });
+}
+
+fn hash_aux_prior_strength(strength: AuxPriorStrength, hasher: &mut CacheDigestBuilder) {
+    match strength {
+        AuxPriorStrength::Auto => {
+            hasher.write_usize(0);
+        }
+        AuxPriorStrength::Fixed(value) => {
+            hasher.write_usize(1);
+            hasher.write_f64(value);
+        }
+    }
+}
+
+fn hash_optional_vector(vector: Option<&Array1<f64>>, hasher: &mut CacheDigestBuilder) {
+    match vector {
+        Some(vector) => {
+            hasher.write_bool(true);
+            hash_vector(vector, hasher);
+        }
+        None => {
+            hasher.write_bool(false);
+        }
+    }
+}
+
+fn hash_latent_manifold(manifold: &LatentManifold, hasher: &mut CacheDigestBuilder) {
+    match manifold {
+        LatentManifold::Euclidean => {
+            hasher.write_usize(0);
+        }
+        LatentManifold::Circle => {
+            hasher.write_usize(1);
+        }
+        LatentManifold::Sphere { dim } => {
+            hasher.write_usize(2);
+            hasher.write_usize(*dim);
+        }
+        LatentManifold::Interval { lo, hi } => {
+            hasher.write_usize(3);
+            hasher.write_f64(*lo);
+            hasher.write_f64(*hi);
+        }
+        LatentManifold::Product(parts) => {
+            hasher.write_usize(4);
+            hasher.write_usize(parts.len());
+            for part in parts {
+                hash_latent_manifold(part, hasher);
+            }
+        }
+        LatentManifold::ProductWithMetric { manifolds, weights } => {
+            hasher.write_usize(5);
+            hasher.write_usize(manifolds.len());
+            for part in manifolds {
+                hash_latent_manifold(part, hasher);
+            }
+            hash_f64_slice(weights, hasher);
+        }
     }
 }
 
@@ -267,8 +421,10 @@ pub(crate) struct CachedDesign {
     pub(crate) id: u64,
     pub(crate) latent_id: u64,
     pub(crate) fingerprint: LatentFingerprint,
-    pub(crate) basis_signature: u64,
+    basis_digest: CacheDigest,
+    latent_metadata_digest: CacheDigest,
     latent_bits: Arc<[u64]>,
+    cacheable: bool,
     pub(crate) design: TermCollectionDesign,
     pub(crate) hyper_dirs: Vec<DirectionalHyperParam>,
     pub(crate) radial_distances: RadialDistanceMatrices,
@@ -289,7 +445,8 @@ pub(crate) struct LatentDesignLookup<'a> {
 struct PersistentLatentDesignKey {
     latent_id: u64,
     flat_hash: u64,
-    basis_signature: u64,
+    basis_digest: CacheDigest,
+    latent_metadata_digest: CacheDigest,
 }
 
 struct PersistentLatentDesignEntry {
@@ -321,13 +478,15 @@ impl PersistentLatentDesignCache {
     pub(crate) fn lookup(
         &mut self,
         latent: &LatentCoordValues,
-        basis_signature: u64,
+        basis_digest: CacheDigest,
+        latent_metadata_digest: CacheDigest,
         fingerprint: &LatentFingerprint,
     ) -> Result<Option<Arc<CachedDesign>>, EstimationError> {
         let key = PersistentLatentDesignKey {
             latent_id: latent.latent_id(),
             flat_hash: fingerprint.hash,
-            basis_signature,
+            basis_digest,
+            latent_metadata_digest,
         };
         let Some(entry) = self.entries.get(&key) else {
             return Ok(None);
@@ -339,6 +498,9 @@ impl PersistentLatentDesignCache {
             return Ok(None);
         }
         if entry_fingerprint.hash == fingerprint.hash
+            && cached.cacheable
+            && cached.basis_digest == basis_digest
+            && cached.latent_metadata_digest == latent_metadata_digest
             && latent_bits_match(latent, &cached.latent_bits)
         {
             return Ok(Some(cached));
@@ -347,10 +509,14 @@ impl PersistentLatentDesignCache {
     }
 
     pub(crate) fn insert(&mut self, cached: Arc<CachedDesign>) {
+        if !cached.cacheable {
+            return;
+        }
         let key = PersistentLatentDesignKey {
             latent_id: cached.latent_id,
             flat_hash: cached.fingerprint.hash,
-            basis_signature: cached.basis_signature,
+            basis_digest: cached.basis_digest,
+            latent_metadata_digest: cached.latent_metadata_digest,
         };
         let entry = PersistentLatentDesignEntry {
             fingerprint: cached.fingerprint.clone(),
@@ -425,23 +591,33 @@ impl LatentDesignCache {
             .as_slice()
             .expect("LatentCoordValues flat storage must be contiguous");
         let fingerprint = LatentFingerprint::from_flat(flat_slice, self.iteration);
-        let basis_signature = basis_kind.signature();
-        if let Some(index) = self.find_entry(&latent, basis_signature) {
-            self.entries[index].last_used = self.clock;
-            return Ok(LatentDesignLookup {
-                cached: &self.entries[index],
-            });
+        let basis_digest = basis_kind.cache_digest();
+        let latent_metadata_digest = latent_metadata_cache_digest(&latent);
+        let cacheable = flat_slice.iter().all(|value| value.is_finite());
+        if cacheable {
+            if let Some(index) = self.find_entry(&latent, basis_digest, latent_metadata_digest) {
+                self.entries[index].last_used = self.clock;
+                return Ok(LatentDesignLookup {
+                    cached: &self.entries[index],
+                });
+            }
         }
-        if let Some(cached) = lookup_persistent_latent_design(&latent, basis_signature, &fingerprint)?
-        {
-            let id = self.next_entry_id;
-            self.next_entry_id = self.next_entry_id.wrapping_add(1);
-            let mut entry = (*cached).clone();
-            entry.id = id;
-            entry.fingerprint.iteration = self.iteration;
-            entry.last_used = self.clock;
-            self.insert(entry);
-            return self.lookup_inserted(id);
+        if cacheable {
+            if let Some(cached) = lookup_persistent_latent_design(
+                &latent,
+                basis_digest,
+                latent_metadata_digest,
+                &fingerprint,
+            )? {
+                let id = self.next_entry_id;
+                self.next_entry_id = self.next_entry_id.wrapping_add(1);
+                let mut entry = (*cached).clone();
+                entry.id = id;
+                entry.fingerprint.iteration = self.iteration;
+                entry.last_used = self.clock;
+                self.insert(entry);
+                return self.lookup_inserted(id);
+            }
         }
 
         let computed = compute()?;
@@ -460,8 +636,10 @@ impl LatentDesignCache {
             id,
             latent_id: latent.latent_id(),
             fingerprint,
-            basis_signature,
+            basis_digest,
+            latent_metadata_digest,
             latent_bits: latent_bits(&latent),
+            cacheable,
             design: computed.design,
             hyper_dirs: computed.hyper_dirs,
             radial_distances,
@@ -469,14 +647,23 @@ impl LatentDesignCache {
             last_used: self.clock,
         };
         let _resident_scalars = entry.resident_scalar_count();
-        insert_persistent_latent_design(Arc::new(entry.clone()))?;
+        if cacheable {
+            insert_persistent_latent_design(Arc::new(entry.clone()))?;
+        }
         self.insert(entry);
         self.lookup_inserted(id)
     }
 
-    fn find_entry(&mut self, latent: &LatentCoordValues, basis_signature: u64) -> Option<usize> {
+    fn find_entry(
+        &mut self,
+        latent: &LatentCoordValues,
+        basis_digest: CacheDigest,
+        latent_metadata_digest: CacheDigest,
+    ) -> Option<usize> {
         self.entries.iter().position(|entry| {
-            entry.basis_signature == basis_signature
+            entry.cacheable
+                && entry.basis_digest == basis_digest
+                && entry.latent_metadata_digest == latent_metadata_digest
                 && entry.latent_id == latent.latent_id()
                 && latent_bits_match(latent, &entry.latent_bits)
         })
@@ -546,7 +733,8 @@ impl CachedDesign {
 
 fn lookup_persistent_latent_design(
     latent: &LatentCoordValues,
-    basis_signature: u64,
+    basis_digest: CacheDigest,
+    latent_metadata_digest: CacheDigest,
     fingerprint: &LatentFingerprint,
 ) -> Result<Option<Arc<CachedDesign>>, EstimationError> {
     if persistent_latent_cache_disabled() {
@@ -557,7 +745,7 @@ fn lookup_persistent_latent_design(
     let mut guard = cache.lock().map_err(|_| {
         EstimationError::InvalidInput("persistent latent design cache mutex poisoned".to_string())
     })?;
-    guard.lookup(latent, basis_signature, fingerprint)
+    guard.lookup(latent, basis_digest, latent_metadata_digest, fingerprint)
 }
 
 fn insert_persistent_latent_design(cached: Arc<CachedDesign>) -> Result<(), EstimationError> {
