@@ -89,6 +89,8 @@ struct SessionInner {
 // only ever access the contents through the lock. The whole
 // DeviceXSession is owned by an Arc shared via the cache, which is
 // itself protected by a Mutex.
+// SAFETY: SessionInner is only ever accessed through the enclosing Mutex,
+// so the !Send raw cublas/cuda handles never cross threads concurrently.
 unsafe impl Send for SessionInner {}
 
 impl DeviceXSession {
