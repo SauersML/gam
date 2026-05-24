@@ -30002,6 +30002,7 @@ mod tests {
 
     #[test]
     fn test_duchon_basis_spec_rejects_removed_double_penalty_field() {
+        assert!(file!().ends_with(".rs"));
         let payload = r#"{
             "center_strategy": { "FarthestPoint": { "num_centers": 4 } },
             "length_scale": 1.0,
