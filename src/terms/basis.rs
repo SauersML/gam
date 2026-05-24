@@ -6061,10 +6061,9 @@ fn build_scalar_design_psi_derivatives_shared(
                         }
                     };
                     let flat = i * k + j;
-                    // SAFETY: nk=n*k was checked above, the owned phi/q/t buffers and
-                    // one-column axis_components buffer are contiguous, and each Rayon
-                    // chunk owns a disjoint i-row range. Thus flat=i*k+j is in-bounds
-                    // for every write below and no two workers write the same offset.
+                    // SAFETY: each Rayon chunk owns a disjoint i-row range
+                    // of the nk-long phi/q/t/axis buffers, so flat=i*k+j is
+                    // in-bounds for every write and never aliases another worker.
                     unsafe {
                         *pp.add(flat) = phi;
                         *qp.add(flat) = q;
