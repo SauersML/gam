@@ -1,6 +1,6 @@
 use crate::faer_ndarray::{
-    FaerEigh, FaerLinalgError, array2_to_matmut, default_rrqr_rank_alpha, fast_ab, fast_ata,
-    fast_atb, rrqr_nullspace_basis,
+    FaerCholesky, FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb,
+    rrqr_nullspace_basis,
 };
 use crate::linalg::utils::{KahanSum, StableSolver};
 use crate::matrix::{
@@ -1249,6 +1249,208 @@ pub fn create_difference_penalty_matrix(
     Ok(s)
 }
 
+fn validate_periodic_spline_curve_spec(spec: &PeriodicSplineCurveSpec) -> Result<(), BasisError> {
+    if spec.degree < 1 {
+        return Err(BasisError::InvalidDegree(spec.degree));
+    }
+    if spec.num_basis <= spec.degree {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic spline requires num_basis > degree, got num_basis={} and degree={}",
+            spec.num_basis, spec.degree
+        )));
+    }
+    if !(spec.period_start.is_finite() && spec.period_end.is_finite())
+        || spec.period_end <= spec.period_start
+    {
+        return Err(BasisError::InvalidRange(spec.period_start, spec.period_end));
+    }
+    if spec.penalty_order == 0 || spec.penalty_order >= spec.num_basis {
+        return Err(BasisError::InvalidPenaltyOrder {
+            order: spec.penalty_order,
+            num_basis: spec.num_basis,
+        });
+    }
+    if !spec.lambda.is_finite() || spec.lambda < 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic spline lambda must be finite and non-negative, got {}",
+            spec.lambda
+        )));
+    }
+    if !spec.ridge.is_finite() || spec.ridge < 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic spline ridge must be finite and non-negative, got {}",
+            spec.ridge
+        )));
+    }
+    Ok(())
+}
+
+#[inline]
+fn wrap_to_period_unit(u: f64, start: f64, period: f64) -> f64 {
+    let mut w = (u - start).rem_euclid(period) / period;
+    // Guard against a platform rem_euclid round-off returning exactly 1.0.
+    if w >= 1.0 {
+        w = 0.0;
+    }
+    w
+}
+
+/// Dense cyclic finite-difference penalty for periodic spline coefficients.
+///
+/// Unlike an ordinary P-spline penalty, this wraps the last coefficient back to
+/// the first before each differencing pass. The resulting null space is the
+/// constant closed-curve offset shared across all ambient dimensions.
+pub fn create_cyclic_difference_penalty_matrix(
+    num_basis_functions: usize,
+    order: usize,
+) -> Result<Array2<f64>, BasisError> {
+    if order == 0 || order >= num_basis_functions {
+        return Err(BasisError::InvalidPenaltyOrder {
+            order,
+            num_basis: num_basis_functions,
+        });
+    }
+
+    let mut d = Array2::<f64>::eye(num_basis_functions);
+    for _ in 0..order {
+        let mut next = Array2::<f64>::zeros((num_basis_functions, num_basis_functions));
+        for i in 0..num_basis_functions {
+            let ip1 = (i + 1) % num_basis_functions;
+            for j in 0..num_basis_functions {
+                next[[i, j]] = d[[ip1, j]] - d[[i, j]];
+            }
+        }
+        d = next;
+    }
+    Ok(fast_ata(&d))
+}
+
+/// Build a dense 1D periodic B-spline basis over `spec`'s period.
+///
+/// Rows are evaluated after modular wrapping, and the extra uniform-cardinal
+/// B-spline columns needed near the seam are folded back modulo
+/// `spec.num_basis`. Therefore `u = period_start` and `u = period_end` produce
+/// identical rows, and the basis can drive a closed multi-output curve.
+pub fn create_periodic_bspline_basis_1d(
+    u: ArrayView1<'_, f64>,
+    spec: &PeriodicSplineCurveSpec,
+) -> Result<Array2<f64>, BasisError> {
+    validate_periodic_spline_curve_spec(spec)?;
+    if u.iter().any(|x| !x.is_finite()) {
+        return Err(BasisError::InvalidInput(
+            "periodic spline coordinates must be finite".to_string(),
+        ));
+    }
+
+    let period = spec.period_end - spec.period_start;
+    let scale = spec.num_basis as f64;
+    let t = u.mapv(|x| wrap_to_period_unit(x, spec.period_start, period) * scale);
+
+    // Uniform cardinal knots from `-degree` through `num_basis + degree` give
+    // enough non-periodic columns to cover both sides of the seam. Folding
+    // those columns modulo `num_basis` turns the open cardinal basis into a
+    // cyclic one.
+    let knot_start = -(spec.degree as isize);
+    let knot_end = spec.num_basis as isize + spec.degree as isize;
+    let knots = Array1::from_iter((knot_start..=knot_end).map(|v| v as f64));
+    let (extended_arc, _) = create_basis::<Dense>(
+        t.view(),
+        KnotSource::Provided(knots.view()),
+        spec.degree,
+        BasisOptions::value(),
+    )?;
+    let extended = extended_arc.as_ref();
+    let mut cyclic = Array2::<f64>::zeros((u.len(), spec.num_basis));
+    for i in 0..extended.nrows() {
+        for j in 0..extended.ncols() {
+            cyclic[[i, j % spec.num_basis]] += extended[[i, j]];
+        }
+    }
+    Ok(cyclic)
+}
+
+/// Fit a penalized multi-output periodic spline curve `u -> R^d_ambient`.
+///
+/// The normal equations are solved once with all ambient output columns as the
+/// right-hand side, so affine stretching, shearing, or embedding in a higher
+/// dimensional ambient space is learned directly from `y` without any unit
+/// circle/ellipsoid special case.
+pub fn fit_periodic_spline_curve(
+    u: ArrayView1<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    spec: &PeriodicSplineCurveSpec,
+) -> Result<PeriodicSplineCurve, BasisError> {
+    validate_periodic_spline_curve_spec(spec)?;
+    if y.nrows() != u.len() {
+        return Err(BasisError::DimensionMismatch(format!(
+            "periodic spline y row count {} does not match u length {}",
+            y.nrows(),
+            u.len()
+        )));
+    }
+    if y.ncols() == 0 {
+        return Err(BasisError::InvalidInput(
+            "periodic spline requires at least one ambient output column".to_string(),
+        ));
+    }
+    if y.iter().any(|v| !v.is_finite()) {
+        return Err(BasisError::InvalidInput(
+            "periodic spline outputs must be finite".to_string(),
+        ));
+    }
+
+    let b = create_periodic_bspline_basis_1d(u, spec)?;
+    let mut normal = fast_ata(&b);
+    if spec.lambda > 0.0 {
+        let penalty = create_cyclic_difference_penalty_matrix(spec.num_basis, spec.penalty_order)?;
+        normal = normal + penalty.mapv(|v| spec.lambda * v);
+    }
+    let ridge = spec.ridge.max(0.0);
+    if ridge > 0.0 {
+        for i in 0..normal.nrows() {
+            normal[[i, i]] += ridge;
+        }
+    }
+    let rhs = fast_atb(&b, &y.to_owned());
+
+    let mut jitter = ridge.max(1e-12);
+    let coefficients = loop {
+        match normal.cholesky(Side::Lower) {
+            Ok(chol) => break chol.solve_mat(&rhs),
+            Err(err) => {
+                if jitter > 1e-4 {
+                    return Err(BasisError::LinalgError(err));
+                }
+                for i in 0..normal.nrows() {
+                    normal[[i, i]] += jitter;
+                }
+                jitter *= 10.0;
+            }
+        }
+    };
+
+    Ok(PeriodicSplineCurve {
+        spec: spec.clone(),
+        coefficients,
+    })
+}
+
+/// Evaluate a fitted multi-output periodic spline curve at arbitrary `u`.
+pub fn evaluate_periodic_spline_curve(
+    u: ArrayView1<'_, f64>,
+    curve: &PeriodicSplineCurve,
+) -> Result<Array2<f64>, BasisError> {
+    if curve.coefficients.nrows() != curve.spec.num_basis {
+        return Err(BasisError::DimensionMismatch(format!(
+            "periodic spline coefficient row count {} does not match num_basis {}",
+            curve.coefficients.nrows(),
+            curve.spec.num_basis
+        )));
+    }
+    let b = create_periodic_bspline_basis_1d(u, &curve.spec)?;
+    Ok(fast_ab(&b, &curve.coefficients))
+}
+
 fn is_effectively_uniform_knot_geometry(knot_vector: &Array1<f64>, degree: usize) -> bool {
     if knot_vector.len() <= degree + 2 {
         return true;
@@ -2182,6 +2384,71 @@ pub fn fit_periodic_spline_curve(
         ));
     }
     Ok(control)
+}
+
+/// Configuration for a single periodic 1D spline curve
+/// `u -> R^d_ambient`.
+///
+/// The same cyclic B-spline basis is shared by every ambient output column;
+/// only the coefficient matrix is multi-output. This is intentionally more
+/// general than a circular parameterization: any affine or nonlinear stretching
+/// present in the observed ambient coordinates is learned in the output
+/// coefficients, so ellipses, ovals, skewed loops, and higher-dimensional
+/// closed curves all use the same 1D periodic domain geometry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeriodicSplineCurveSpec {
+    /// Polynomial degree of the cyclic B-spline basis (3 = cubic).
+    pub degree: usize,
+    /// Number of periodic basis coefficients around one full cycle.
+    pub num_basis: usize,
+    /// Inclusive start of the period domain.
+    pub period_start: f64,
+    /// Exclusive end of the period domain. Values are wrapped modulo
+    /// `period_end - period_start` before evaluation.
+    pub period_end: f64,
+    /// Cyclic finite-difference penalty order applied to coefficients.
+    pub penalty_order: usize,
+    /// Smoothing weight multiplying the cyclic difference penalty.
+    pub lambda: f64,
+    /// Tiny ridge added to the normal matrix for numerical stability.
+    pub ridge: f64,
+}
+
+impl PeriodicSplineCurveSpec {
+    /// Cubic periodic P-spline defaults for a domain `[period_start, period_end)`.
+    pub fn cubic(num_basis: usize, period_start: f64, period_end: f64) -> Self {
+        Self {
+            degree: 3,
+            num_basis,
+            period_start,
+            period_end,
+            penalty_order: 2,
+            lambda: 1e-8,
+            ridge: 1e-10,
+        }
+    }
+}
+
+/// Fitted multi-output periodic spline curve.
+///
+/// `coefficients` has shape `(num_basis, ambient_dim)`. Evaluating the curve
+/// multiplies the cyclic 1D basis row by this full matrix, preserving arbitrary
+/// anisotropic stretching and skew in ambient space instead of projecting to a
+/// unit circle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeriodicSplineCurve {
+    pub spec: PeriodicSplineCurveSpec,
+    pub coefficients: Array2<f64>,
+}
+
+impl PeriodicSplineCurve {
+    pub fn ambient_dim(&self) -> usize {
+        self.coefficients.ncols()
+    }
+
+    pub fn evaluate(&self, u: ArrayView1<'_, f64>) -> Result<Array2<f64>, BasisError> {
+        evaluate_periodic_spline_curve(u, self)
+    }
 }
 
 /// Per-smooth identifiability policy for 1D B-spline bases.
@@ -27146,6 +27413,154 @@ mod tests {
     use ndarray::{Array1, Array2, array};
     use num_dual::{DualNum, second_derivative};
     use std::sync::Arc;
+
+    fn periodic_test_spec(num_basis: usize) -> PeriodicSplineCurveSpec {
+        PeriodicSplineCurveSpec {
+            lambda: 1e-10,
+            ridge: 1e-10,
+            ..PeriodicSplineCurveSpec::cubic(num_basis, 0.0, std::f64::consts::TAU)
+        }
+    }
+
+    #[test]
+    fn periodic_bspline_basis_partitions_unity_and_closes_seam() {
+        let spec = periodic_test_spec(17);
+        let u = array![
+            0.0,
+            1.0e-9,
+            0.25 * std::f64::consts::TAU,
+            std::f64::consts::TAU - 1.0e-9,
+            std::f64::consts::TAU,
+            3.0 * std::f64::consts::TAU,
+            -std::f64::consts::TAU,
+        ];
+
+        let basis = create_periodic_bspline_basis_1d(u.view(), &spec).expect("periodic basis");
+        assert_eq!(basis.dim(), (u.len(), spec.num_basis));
+        for i in 0..basis.nrows() {
+            let rowsum = basis.row(i).sum();
+            assert_abs_diff_eq!(rowsum, 1.0, epsilon = 2e-14);
+        }
+
+        let seam =
+            create_periodic_bspline_basis_1d(array![0.0, std::f64::consts::TAU].view(), &spec)
+                .expect("seam basis");
+        for j in 0..spec.num_basis {
+            assert_abs_diff_eq!(seam[[0, j]], seam[[1, j]], epsilon = 1e-14);
+        }
+    }
+
+    #[test]
+    fn periodic_multioutput_fit_recovers_anisotropic_ellipse_and_oval() {
+        let n = 240;
+        let u = Array1::from_iter((0..n).map(|i| std::f64::consts::TAU * i as f64 / n as f64));
+        let mut y = Array2::<f64>::zeros((n, 3));
+        for (i, &ui) in u.iter().enumerate() {
+            // A deliberately non-circular closed curve: stretched, skewed,
+            // and distorted in an extra ambient dimension.
+            y[[i, 0]] = 3.0 * ui.cos() + 0.35 * (2.0 * ui).sin();
+            y[[i, 1]] = -0.8 * ui.cos() + 1.7 * ui.sin() + 0.15 * (3.0 * ui).cos();
+            y[[i, 2]] = 0.25 * (2.0 * ui).cos() - 0.6 * (3.0 * ui).sin();
+        }
+
+        let spec = periodic_test_spec(48);
+        let curve = fit_periodic_spline_curve(u.view(), y.view(), &spec).expect("fit curve");
+        assert_eq!(curve.ambient_dim(), 3);
+
+        let pred = curve.evaluate(u.view()).expect("predict curve");
+        let rmse = pred
+            .iter()
+            .zip(y.iter())
+            .map(|(p, t)| (p - t).powi(2))
+            .sum::<f64>()
+            .sqrt()
+            / ((n * 3) as f64).sqrt();
+        assert!(rmse < 2e-3, "periodic multi-output RMSE too high: {rmse}");
+
+        // The learned shape is not accidentally normalized to a unit circle.
+        let x_span = pred
+            .column(0)
+            .iter()
+            .fold(f64::NEG_INFINITY, |a, &b| a.max(b))
+            - pred.column(0).iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        let y_span = pred
+            .column(1)
+            .iter()
+            .fold(f64::NEG_INFINITY, |a, &b| a.max(b))
+            - pred.column(1).iter().fold(f64::INFINITY, |a, &b| a.min(b));
+        assert!(
+            x_span > 5.5,
+            "x ambient span should preserve elongation: {x_span}"
+        );
+        assert!(
+            y_span > 3.0,
+            "y ambient span should preserve elongation: {y_span}"
+        );
+    }
+
+    #[test]
+    fn periodic_multioutput_fit_commutes_with_ambient_affine_stretching() {
+        let n = 180;
+        let u = Array1::from_iter((0..n).map(|i| std::f64::consts::TAU * i as f64 / n as f64));
+        let mut circle = Array2::<f64>::zeros((n, 2));
+        for (i, &ui) in u.iter().enumerate() {
+            circle[[i, 0]] = ui.cos();
+            circle[[i, 1]] = ui.sin();
+        }
+        let transform = array![[2.5, -0.4, 0.8], [0.7, 1.9, -1.2]];
+        let stretched = fast_ab(&circle, &transform);
+        let spec = periodic_test_spec(36);
+
+        let base_curve =
+            fit_periodic_spline_curve(u.view(), circle.view(), &spec).expect("fit base circle");
+        let stretched_curve = fit_periodic_spline_curve(u.view(), stretched.view(), &spec)
+            .expect("fit stretched ambient curve");
+
+        let query = Array1::from_iter((0..73).map(|i| -1.3 + 0.17 * i as f64));
+        let base_pred = base_curve.evaluate(query.view()).expect("base predict");
+        let expected_stretched = fast_ab(&base_pred, &transform);
+        let actual_stretched = stretched_curve
+            .evaluate(query.view())
+            .expect("stretched predict");
+        let max_abs = expected_stretched
+            .iter()
+            .zip(actual_stretched.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_abs < 2e-8,
+            "multi-output periodic fit should commute with arbitrary ambient affine stretch: {max_abs}"
+        );
+    }
+
+    #[test]
+    fn periodic_curve_evaluation_wraps_distorted_high_dimensional_loop() {
+        let n = 160;
+        let u = Array1::from_iter((0..n).map(|i| std::f64::consts::TAU * i as f64 / n as f64));
+        let mut y = Array2::<f64>::zeros((n, 5));
+        for (i, &ui) in u.iter().enumerate() {
+            y[[i, 0]] = 1.5 * ui.cos();
+            y[[i, 1]] = 0.3 * ui.sin() + 0.2 * (2.0 * ui).sin();
+            y[[i, 2]] = (2.0 * ui).cos();
+            y[[i, 3]] = 0.4 * (3.0 * ui).sin();
+            y[[i, 4]] = 0.1 * ui.cos() - 2.0 * ui.sin();
+        }
+        let curve = fit_periodic_spline_curve(u.view(), y.view(), &periodic_test_spec(40))
+            .expect("fit high-dimensional loop");
+
+        let q = array![0.17, 1.91, 5.8];
+        let q_wrapped = q.mapv(|v| v + 9.0 * std::f64::consts::TAU);
+        let a = curve.evaluate(q.view()).expect("evaluate q");
+        let b = curve
+            .evaluate(q_wrapped.view())
+            .expect("evaluate wrapped q");
+        let max_abs = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f64, f64::max);
+        assert_abs_diff_eq!(max_abs, 0.0, epsilon = 2e-13);
+    }
 
     #[test]
     fn periodic_bspline_basis_wraps_and_forms_partition_of_unity() {
