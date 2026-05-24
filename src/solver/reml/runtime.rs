@@ -6788,34 +6788,6 @@ pub(crate) fn adaptive_lm_lambda_hint(
     Some(cached_lambda.clamp(floor, ceiling))
 }
 
-/// Variant taking a pre-built `&dyn FactorizedSystem` so the caller can
-/// reuse a cached Cholesky factor across successive predict calls. See
-/// `RemlState::predict_warm_start_beta_ift_with_outcome` for the cache
-/// invalidation invariants. Test-only after the production wrapper was
-/// refactored to call `_inner_with_outcome` directly; retained because
-/// the negative-test at line ~6911 still verifies the factor argument
-/// is actually consumed (vs silently ignored).
-#[cfg(test)]
-pub(crate) fn predict_warm_start_beta_ift_with_factor(
-    cache: &super::IftWarmStartCache,
-    canonical_penalties: &[crate::construction::CanonicalPenalty],
-    new_rho: &Array1<f64>,
-    p: usize,
-    last_ift_residual: Option<f64>,
-    factor_override: &dyn crate::linalg::matrix::FactorizedSystem,
-) -> Option<Coefficients> {
-    predict_warm_start_beta_ift_inner_with_outcome(
-        cache,
-        canonical_penalties,
-        new_rho,
-        p,
-        last_ift_residual,
-        None,
-        Some(factor_override),
-    )
-    .map(|(coef, _outcome)| coef)
-}
-
 fn predict_warm_start_beta_ift_inner_with_outcome(
     cache: &super::IftWarmStartCache,
     canonical_penalties: &[crate::construction::CanonicalPenalty],
@@ -10110,6 +10082,30 @@ mod ift_warm_start_tests {
         .map(|(coef, _outcome)| coef)
     }
 
+    /// Variant taking a pre-built `&dyn FactorizedSystem` so the caller can
+    /// reuse a cached Cholesky factor across successive predict calls. The
+    /// negative-test below verifies the factor argument is actually consumed
+    /// (vs silently ignored) by the inner-with-outcome path.
+    pub(super) fn predict_warm_start_beta_ift_with_factor(
+        cache: &super::IftWarmStartCache,
+        canonical_penalties: &[CanonicalPenalty],
+        new_rho: &Array1<f64>,
+        p: usize,
+        last_ift_residual: Option<f64>,
+        factor_override: &dyn crate::linalg::matrix::FactorizedSystem,
+    ) -> Option<Coefficients> {
+        super::predict_warm_start_beta_ift_inner_with_outcome(
+            cache,
+            canonical_penalties,
+            new_rho,
+            p,
+            last_ift_residual,
+            None,
+            Some(factor_override),
+        )
+        .map(|(coef, _outcome)| coef)
+    }
+
     /// Build a CanonicalPenalty from a dense p×p SPD-ish penalty matrix by
     /// taking its eigendecomposition and packing the positive-eigenvalue
     /// components into the `rank × p` root.
@@ -10850,6 +10846,49 @@ mod ift_warm_start_tests {
                 w[0] >= w[1],
                 "tangent α cap is not monotone non-increasing in residual: {caps:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_diagnostics {
+    //! Test-only inherent-method extensions on `RemlState`. Kept in a child
+    //! `mod tests_diagnostics` (not `#[cfg(test)]` on the methods themselves)
+    //! so the production type carries no test-gated inherent methods.
+    use super::*;
+
+    impl<'a> RemlState<'a> {
+        /// Debug-only: return `log|U_Sᵀ H U_S|_+` — the projected Hessian
+        /// log-determinant on the identified `range(S_+)` subspace,
+        /// evaluated at the PIRLS state driven to convergence at this `rho`.
+        /// Matches production REML/LAML cost's `hop.logdet() +
+        /// hessian_logdet_correction` so centered-differencing across nearby
+        /// `theta` reproduces the analytic projected-logdet trace.
+        pub(crate) fn objective_logdet_h_proj(
+            &self,
+            rho: &Array1<f64>,
+        ) -> Result<f64, EstimationError> {
+            let bundle = self.obtain_eval_bundle(rho)?;
+            let assembly =
+                self.build_auto_assembly(rho, &bundle, super::unified::EvalMode::ValueOnly)?;
+            let logdet = super::unified::HessianOperator::logdet(assembly.hessian_op.as_ref())
+                + assembly.hessian_logdet_correction;
+            Ok(logdet)
+        }
+
+        /// Debug-only: return `(final_eta, finalweights, solve_c_array)` at
+        /// the PIRLS state produced by driving the solver to convergence at
+        /// this `rho`. Used by the iso-κ Duchon FD probe.
+        pub(crate) fn debug_eta_w_c(
+            &self,
+            rho: &Array1<f64>,
+        ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+            let pr = self.execute_pirls_if_needed(rho)?;
+            Ok((
+                pr.final_eta.clone(),
+                pr.finalweights.clone(),
+                pr.solve_c_array.clone(),
+            ))
         }
     }
 }
