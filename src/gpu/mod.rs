@@ -203,20 +203,46 @@ pub enum GpuOperation {
 }
 
 #[inline]
-pub fn try_dispatch_dense(_op: GpuOperation) -> linalg::GpuDispatch { linalg::GpuDispatch::Cpu }
+pub fn try_dispatch_dense(op: GpuOperation) -> linalg::GpuDispatch {
+    drop(op);
+    linalg::GpuDispatch::Cpu
+}
 
 #[inline]
-pub fn try_fast_ab<A, B>(_a: A, _b: B) -> Option<ndarray::Array2<f64>> { None }
+pub fn try_fast_ab<A, B>(a: A, b: B) -> Option<ndarray::Array2<f64>> {
+    drop((a, b));
+    None
+}
 #[inline]
-pub fn try_fast_av<A, V>(_a: A, _v: V) -> Option<ndarray::Array1<f64>> { None }
+pub fn try_fast_av<A, V>(a: A, v: V) -> Option<ndarray::Array1<f64>> {
+    drop((a, v));
+    None
+}
 #[inline]
-pub fn try_fast_atv<A, V>(_a: A, _v: V) -> Option<ndarray::Array1<f64>> { None }
+pub fn try_fast_atv<A, V>(a: A, v: V) -> Option<ndarray::Array1<f64>> {
+    drop((a, v));
+    None
+}
 #[inline]
-pub fn try_syevd_inplace(_a: &mut ndarray::Array2<f64>) -> Option<ndarray::Array1<f64>> { None }
+pub fn try_syevd_inplace(a: &mut ndarray::Array2<f64>) -> Option<ndarray::Array1<f64>> {
+    drop(a);
+    None
+}
 #[inline]
-pub fn record_cpu_kernel(_op: GpuOperation, _elapsed: std::time::Duration) {}
+pub fn record_cpu_kernel(op: GpuOperation, elapsed: std::time::Duration) {
+    drop((op, elapsed));
+}
 #[inline]
-pub fn record_cpu_fallback(_name: &str, _kind: profile::OperationKind, _n: usize, _p: usize, _q: usize, _flops: usize) {}
+pub fn record_cpu_fallback(
+    name: &str,
+    kind: profile::OperationKind,
+    n: usize,
+    p: usize,
+    q: usize,
+    flops: usize,
+) {
+    drop((name, kind, n, p, q, flops));
+}
 
 #[cfg(test)]
 mod policy_tests {
