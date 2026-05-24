@@ -1579,6 +1579,89 @@ pub struct BSplineBasisSpec {
     pub identifiability: BSplineIdentifiability,
     #[serde(default)]
     pub boundary: OneDimensionalBoundary,
+    /// Optional endpoint boundary constraints (Hermite-style pin of value and/or
+    /// derivative at the left/right knot extents). Default = `Free` on both
+    /// sides which is a no-op.
+    #[serde(default)]
+    pub boundary_conditions: BSplineBoundaryConditions,
+}
+
+/// Per-endpoint boundary constraint policy for B-spline 1D bases.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BSplineEndpointBoundaryCondition {
+    /// No endpoint constraint.
+    Free,
+    /// Pin the first derivative to zero at this endpoint.
+    Clamped,
+    /// Pin the value at this endpoint to `value` (currently only `value == 0`
+    /// is accepted in the builder; non-zero anchors require an affine offset).
+    Anchored { value: f64 },
+}
+
+impl Default for BSplineEndpointBoundaryCondition {
+    fn default() -> Self {
+        Self::Free
+    }
+}
+
+/// Left/right pair of B-spline endpoint constraints.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct BSplineBoundaryConditions {
+    #[serde(default)]
+    pub left: BSplineEndpointBoundaryCondition,
+    #[serde(default)]
+    pub right: BSplineEndpointBoundaryCondition,
+}
+
+impl BSplineBoundaryConditions {
+    pub fn is_free(&self) -> bool {
+        matches!(self.left, BSplineEndpointBoundaryCondition::Free)
+            && matches!(self.right, BSplineEndpointBoundaryCondition::Free)
+    }
+}
+
+/// User-facing endpoint condition tag parsed from formula DSL (`bc=...`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BSplineEndpointCondition {
+    None,
+    Clamped,
+    Anchored { value: f64 },
+}
+
+impl Default for BSplineEndpointCondition {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl From<BSplineEndpointCondition> for BSplineEndpointBoundaryCondition {
+    fn from(value: BSplineEndpointCondition) -> Self {
+        match value {
+            BSplineEndpointCondition::None => Self::Free,
+            BSplineEndpointCondition::Clamped => Self::Clamped,
+            BSplineEndpointCondition::Anchored { value } => Self::Anchored { value },
+        }
+    }
+}
+
+/// Singular boundary-condition struct used by parser callers; carries the same
+/// left/right pair as [`BSplineBoundaryConditions`] but in the user-facing
+/// `BSplineEndpointCondition` vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct BSplineBoundaryCondition {
+    #[serde(default)]
+    pub left: BSplineEndpointCondition,
+    #[serde(default)]
+    pub right: BSplineEndpointCondition,
+}
+
+impl From<BSplineBoundaryCondition> for BSplineBoundaryConditions {
+    fn from(value: BSplineBoundaryCondition) -> Self {
+        Self {
+            left: value.left.into(),
+            right: value.right.into(),
+        }
+    }
 }
 
 /// Per-smooth identifiability policy for 1D B-spline bases.
@@ -6740,27 +6823,63 @@ pub fn build_bspline_basis_1d(
     data: ArrayView1<'_, f64>,
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
-    if let Some((start, end, _period)) = spec.boundary.period() {
+    if let OneDimensionalBoundary::Cyclic { start, end } = spec.boundary {
+        if end <= start {
+            return Err(BasisError::InvalidRange(start, end));
+        }
+    }
+
+    let periodic_build = match &spec.knotspec {
+        BSplineKnotSpec::PeriodicUniform {
+            data_range,
+            num_basis,
+        } => {
+            if let Some((boundary_start, boundary_end, _)) = spec.boundary.period() {
+                let scale = (boundary_end - boundary_start).abs().max(1.0);
+                let tol = 1e-12 * scale;
+                if (data_range.0 - boundary_start).abs() > tol
+                    || (data_range.1 - boundary_end).abs() > tol
+                {
+                    return Err(BasisError::InvalidInput(format!(
+                        "periodic B-spline knot range ({}, {}) conflicts with cyclic boundary ({}, {})",
+                        data_range.0, data_range.1, boundary_start, boundary_end
+                    )));
+                }
+            }
+            Some((data_range.0, data_range.1, *num_basis))
+        }
+        _ => spec.boundary.period().map(|(start, end, _)| {
+            let num_basis = match &spec.knotspec {
+                BSplineKnotSpec::Generate {
+                    num_internal_knots, ..
+                } => num_internal_knots + spec.degree + 1,
+                BSplineKnotSpec::Automatic {
+                    num_internal_knots, ..
+                } => {
+                    num_internal_knots.unwrap_or_else(|| {
+                        default_internal_knot_count_for_data(data.len(), spec.degree)
+                    }) + spec.degree
+                        + 1
+                }
+                BSplineKnotSpec::Provided(knots) => knots.len().saturating_sub(spec.degree + 1),
+                BSplineKnotSpec::PeriodicUniform { .. } => unreachable!(),
+            };
+            (start, end, num_basis)
+        }),
+    };
+
+    if let Some((start, end, num_basis)) = periodic_build {
         if spec.degree != 3 {
             return Err(BasisError::InvalidInput(format!(
                 "cyclic P-splines currently require cubic degree=3, got degree={}",
                 spec.degree
             )));
         }
-        let num_basis = match &spec.knotspec {
-            BSplineKnotSpec::Generate {
-                num_internal_knots, ..
-            } => num_internal_knots + spec.degree + 1,
-            BSplineKnotSpec::Automatic {
-                num_internal_knots, ..
-            } => {
-                num_internal_knots.unwrap_or_else(|| {
-                    default_internal_knot_count_for_data(data.len(), spec.degree)
-                }) + spec.degree
-                    + 1
-            }
-            BSplineKnotSpec::Provided(knots) => knots.len().saturating_sub(spec.degree + 1),
-        };
+        if !spec.boundary_conditions.is_free() {
+            return Err(BasisError::InvalidInput(
+                "periodic B-splines cannot also declare endpoint boundary conditions".to_string(),
+            ));
+        }
         let (basis, knots) =
             create_cyclic_bspline_basis_dense(data, start, end, spec.degree, num_basis)?;
         let s_bend_raw = create_cyclic_difference_penalty_matrix(num_basis, spec.penalty_order)?;
@@ -6818,6 +6937,7 @@ pub fn build_bspline_basis_1d(
             metadata: BasisMetadata::BSpline1D {
                 knots,
                 identifiability_transform,
+                periodic: Some((start, end - start, num_basis)),
             },
             kronecker_factored: None,
             ops,
@@ -22648,6 +22768,7 @@ pub struct PeriodicBSplineBasisSpec {
     pub origin: f64,
     /// Cyclic finite-difference order used by curve fitting penalties.
     pub penalty_order: usize,
+    boundary_conditions: BSplineBoundaryConditions::default(),
 }
 
 impl PeriodicBSplineBasisSpec {
@@ -22667,7 +22788,8 @@ impl PeriodicBSplineBasisSpec {
             origin,
             penalty_order,
         }
-    }
+    },
+    boundary_conditions: BSplineBoundaryConditions::default(),
 }
 
 /// Fitted vector-valued periodic spline curve.
@@ -27952,6 +28074,7 @@ mod tests {
             double_penalty: true,
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
         assert_eq!(result.penalties.len(), 2);
@@ -28095,6 +28218,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28120,6 +28244,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28158,6 +28283,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28202,6 +28328,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).expect("build sparse bspline");
@@ -28221,6 +28348,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).expect("build centered sparse bspline");
@@ -28240,6 +28368,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
 
         match build_bspline_basis_1d(x.view(), &spec).unwrap_err() {
@@ -28293,6 +28422,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28347,6 +28477,7 @@ mod tests {
                 weights: Some(weights.clone()),
             },
             boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28374,11 +28505,13 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
         let constrained = BSplineBasisSpec {
             identifiability: BSplineIdentifiability::RemoveLinearTrend,
             boundary_condition: Default::default(),
-            ..raw.clone()
+            ..raw.clone(),
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
 
         let b_raw = build_bspline_basis_1d(x.view(), &raw).unwrap();
@@ -28406,6 +28539,7 @@ mod tests {
                 weights: None,
             },
             boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28457,6 +28591,7 @@ mod tests {
                 start: 0.0,
                 end: 1.0,
             },
+            boundary_conditions: BSplineBoundaryConditions::default(),
         };
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
         let dense = built.design.to_dense();

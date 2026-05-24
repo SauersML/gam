@@ -586,8 +586,8 @@ fn tensor_margin_boundary_conditions(
     options: &BTreeMap<String, String>,
     cols: &[usize],
     ds: &Dataset,
-) -> Result<Vec<BSplineBoundaryCondition>, String> {
-    let mut out = vec![BSplineBoundaryCondition::Open; cols.len()];
+) -> Result<Vec<OneDimensionalBoundary>, String> {
+    let mut out = vec![OneDimensionalBoundary::Open; cols.len()];
     let Some(raw_bc) = options.get("bc").or_else(|| options.get("boundary")) else {
         return Ok(out);
     };
@@ -626,7 +626,10 @@ fn tensor_margin_boundary_conditions(
                         i, period
                     ));
                 }
-                out[i] = BSplineBoundaryCondition::Periodic { period, origin };
+                out[i] = OneDimensionalBoundary::Cyclic {
+                    start: origin,
+                    end: origin + period,
+                };
             }
             "open" | "none" | "natural" => {}
             other => {
@@ -913,10 +916,8 @@ pub fn build_smooth_basis(
                 .enumerate()
                 .map(|(i, &c)| {
                     let (minv, maxv) = match boundary_conditions[i] {
-                        BSplineBoundaryCondition::Periodic { period, origin } => {
-                            (origin, origin + period)
-                        }
-                        BSplineBoundaryCondition::Open => col_minmax(ds.values.column(c))?,
+                        OneDimensionalBoundary::Cyclic { start, end } => (start, end),
+                        OneDimensionalBoundary::Open => col_minmax(ds.values.column(c))?,
                     };
                     Ok(BSplineBasisSpec {
                         degree,
@@ -928,6 +929,7 @@ pub fn build_smooth_basis(
                         double_penalty: false,
                         identifiability: BSplineIdentifiability::None,
                         boundary: OneDimensionalBoundary::Open,
+                        boundary_conditions: BSplineBoundaryConditions::default(),
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -1101,6 +1103,7 @@ pub fn build_smooth_basis(
                     } else {
                         parse_cyclic_boundary(options, minv, maxv)?
                     },
+                    boundary_conditions: BSplineBoundaryConditions::default(),
                 },
             })
         }
