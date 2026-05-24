@@ -331,113 +331,131 @@ impl LikelihoodSpec {
         }
     }
 
-    /// Map this `LikelihoodSpec` back to the flat the flat likelihood enum enum
-    /// still consumed by the lower-level fit/sampling engines. The mapping is
-    /// total because every `(response, link)` combination corresponds to
-    /// exactly one legacy variant.
+    /// Human-readable label derived directly from the `(response, link)` pair.
     #[inline]
-    pub fn as_likelihood_family(&self) -> LikelihoodFamily {
+    pub fn pretty_name(&self) -> &'static str {
         match (&self.response, &self.link) {
-            (ResponseFamily::Gaussian, _) => LikelihoodFamily::GaussianIdentity,
-            (ResponseFamily::Poisson, _) => LikelihoodFamily::PoissonLog,
-            (ResponseFamily::Tweedie { p }, _) => LikelihoodFamily::Tweedie { p: *p },
-            (ResponseFamily::NegativeBinomial { theta }, _) => {
-                LikelihoodFamily::NegativeBinomial { theta: *theta }
+            (ResponseFamily::Gaussian, _) => "Gaussian Identity",
+            (ResponseFamily::Poisson, _) => "Poisson Log",
+            (ResponseFamily::Tweedie { .. }, _) => "Tweedie Log",
+            (ResponseFamily::NegativeBinomial { .. }, _) => "Negative-Binomial Log",
+            (ResponseFamily::Beta { .. }, _) => "Beta Regression Logit",
+            (ResponseFamily::Gamma, _) => "Gamma Log",
+            (ResponseFamily::RoystonParmar, _) => "Royston Parmar",
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+                "Binomial Logit"
             }
-            (ResponseFamily::Beta { phi }, _) => LikelihoodFamily::BetaLogit { phi: *phi },
-            (ResponseFamily::Gamma, _) => LikelihoodFamily::GammaLog,
-            (ResponseFamily::RoystonParmar, _) => LikelihoodFamily::RoystonParmar,
-            (ResponseFamily::Binomial, link) => match link {
-                InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
-                InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
-                InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
-                InverseLink::Standard(_) => LikelihoodFamily::BinomialLogit,
-                InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
-                InverseLink::Sas(_) => LikelihoodFamily::BinomialSas,
-                InverseLink::BetaLogistic(_) => LikelihoodFamily::BinomialBetaLogistic,
-                InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
-            },
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+                "Binomial Probit"
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+                "Binomial CLogLog"
+            }
+            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
+                "Latent CLogLog Binomial"
+            }
+            (ResponseFamily::Binomial, InverseLink::Sas(_)) => "Binomial SAS",
+            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
+                "Binomial Beta-Logistic"
+            }
+            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => {
+                "Binomial Blended Inverse-Link"
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(_)) => "Binomial Logit",
         }
     }
 
-    /// Human-readable label mirroring `LikelihoodFamily::pretty_name`, but
-    /// derived directly from the `(response, link)` pair.
-    #[inline]
-    pub fn pretty_name(&self) -> &'static str {
-        self.as_likelihood_family().pretty_name()
-    }
-
-    /// Short identifier mirroring `LikelihoodFamily::name`, derived directly
-    /// from the `(response, link)` pair.
+    /// Short identifier derived directly from the `(response, link)` pair.
     #[inline]
     pub fn name(&self) -> &'static str {
-        self.as_likelihood_family().name()
+        match (&self.response, &self.link) {
+            (ResponseFamily::Gaussian, _) => "gaussian",
+            (ResponseFamily::Poisson, _) => "poisson-log",
+            (ResponseFamily::Tweedie { .. }, _) => "tweedie-log",
+            (ResponseFamily::NegativeBinomial { .. }, _) => "negative-binomial-log",
+            (ResponseFamily::Beta { .. }, _) => "beta-regression-logit",
+            (ResponseFamily::Gamma, _) => "gamma-log",
+            (ResponseFamily::RoystonParmar, _) => "royston-parmar",
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+                "binomial-logit"
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+                "binomial-probit"
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+                "binomial-cloglog"
+            }
+            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
+                "latent-cloglog-binomial"
+            }
+            (ResponseFamily::Binomial, InverseLink::Sas(_)) => "binomial-sas",
+            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
+                "binomial-beta-logistic"
+            }
+            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => {
+                "binomial-blended-inverse-link"
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(_)) => "binomial-logit",
+        }
     }
 
-    /// Build a `LikelihoodSpec` from a non-parameterized the flat likelihood enum
-    /// variant. Returns `None` for the parameterized binomial variants
-    /// (`Sas`, `BetaLogistic`, `Mixture`, `LatentCLogLog`) whose new
-    /// `InverseLink` form carries extra state that must be sourced from the
-    /// caller's surrounding context.
-    pub fn from_non_parameterized(family: LikelihoodFamily) -> Option<Self> {
-        match family {
-            LikelihoodFamily::GaussianIdentity => Some(Self {
-                response: ResponseFamily::Gaussian,
-                link: InverseLink::Standard(LinkFunction::Identity),
-            }),
-            LikelihoodFamily::BinomialLogit => Some(Self {
-                response: ResponseFamily::Binomial,
-                link: InverseLink::Standard(LinkFunction::Logit),
-            }),
-            LikelihoodFamily::BinomialProbit => Some(Self {
-                response: ResponseFamily::Binomial,
-                link: InverseLink::Standard(LinkFunction::Probit),
-            }),
-            LikelihoodFamily::BinomialCLogLog => Some(Self {
-                response: ResponseFamily::Binomial,
-                link: InverseLink::Standard(LinkFunction::CLogLog),
-            }),
-            LikelihoodFamily::PoissonLog => Some(Self {
-                response: ResponseFamily::Poisson,
-                link: InverseLink::Standard(LinkFunction::Log),
-            }),
-            LikelihoodFamily::Tweedie { p } => Some(Self {
-                response: ResponseFamily::Tweedie { p },
-                link: InverseLink::Standard(LinkFunction::Log),
-            }),
-            LikelihoodFamily::NegativeBinomial { theta } => Some(Self {
-                response: ResponseFamily::NegativeBinomial { theta },
-                link: InverseLink::Standard(LinkFunction::Log),
-            }),
-            LikelihoodFamily::BetaLogit { phi } => Some(Self {
-                response: ResponseFamily::Beta { phi },
-                link: InverseLink::Standard(LinkFunction::Logit),
-            }),
-            LikelihoodFamily::GammaLog => Some(Self {
-                response: ResponseFamily::Gamma,
-                link: InverseLink::Standard(LinkFunction::Log),
-            }),
-            LikelihoodFamily::RoystonParmar => Some(Self {
-                response: ResponseFamily::RoystonParmar,
-                link: InverseLink::Standard(LinkFunction::Identity),
-            }),
-            LikelihoodFamily::BinomialSas
-            | LikelihoodFamily::BinomialBetaLogistic
-            | LikelihoodFamily::BinomialMixture
-            | LikelihoodFamily::BinomialLatentCLogLog => None,
+    #[inline]
+    pub const fn supports_firth(&self) -> bool {
+        matches!(self.response, ResponseFamily::Binomial)
+            && matches!(self.link, InverseLink::Standard(LinkFunction::Logit))
+    }
+
+    #[inline]
+    pub const fn glm_family(&self) -> Result<GlmFamily, &'static str> {
+        match (&self.response, &self.link) {
+            (ResponseFamily::Gaussian, _) => Ok(GlmFamily::GaussianIdentity),
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+                Ok(GlmFamily::BinomialLogit)
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+                Ok(GlmFamily::BinomialProbit)
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog))
+            | (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
+                Ok(GlmFamily::BinomialCLogLog)
+            }
+            (ResponseFamily::Binomial, InverseLink::Sas(_)) => Ok(GlmFamily::BinomialSas),
+            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
+                Ok(GlmFamily::BinomialBetaLogistic)
+            }
+            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => Ok(GlmFamily::BinomialMixture),
+            (ResponseFamily::Binomial, InverseLink::Standard(_)) => Ok(GlmFamily::BinomialLogit),
+            (ResponseFamily::Poisson, _) => Ok(GlmFamily::PoissonLog),
+            (ResponseFamily::Tweedie { p }, _) if is_valid_tweedie_power(*p) => {
+                Ok(GlmFamily::Tweedie { p: *p })
+            }
+            (ResponseFamily::Tweedie { .. }, _) => Err(
+                "Tweedie variance power must be finite and strictly between 1 and 2; use PoissonLog or GammaLog for boundary cases",
+            ),
+            (ResponseFamily::NegativeBinomial { theta }, _) => {
+                Ok(GlmFamily::NegativeBinomial { theta: *theta })
+            }
+            (ResponseFamily::Beta { phi }, _) => Ok(GlmFamily::BetaLogit { phi: *phi }),
+            (ResponseFamily::Gamma, _) => Ok(GlmFamily::GammaLog),
+            (ResponseFamily::RoystonParmar, _) => {
+                Err("RoystonParmar is survival-specific and not a GLM likelihood")
+            }
         }
     }
 }
 
-/// Engine-level likelihood selector used by generic APIs.
-/// Some families remain restricted to domain-specific entrypoints.
+#[inline]
+pub const fn is_valid_tweedie_power(p: f64) -> bool {
+    p.is_finite() && p > 1.0 && p < 2.0
+}
+
+/// GLM-compatible response/link families (survival families excluded by type).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum LikelihoodFamily {
+pub enum GlmFamily {
     GaussianIdentity,
     BinomialLogit,
     BinomialProbit,
     BinomialCLogLog,
-    BinomialLatentCLogLog,
     BinomialSas,
     BinomialBetaLogistic,
     BinomialMixture,
@@ -446,19 +464,13 @@ pub enum LikelihoodFamily {
     NegativeBinomial { theta: f64 },
     BetaLogit { phi: f64 },
     GammaLog,
-    RoystonParmar,
 }
 
-#[inline]
-pub const fn is_valid_tweedie_power(p: f64) -> bool {
-    p.is_finite() && p > 1.0 && p < 2.0
-}
-
-impl LikelihoodFamily {
+impl GlmFamily {
     #[inline]
     pub const fn link_function(self) -> LinkFunction {
         match self {
-            Self::GaussianIdentity | Self::RoystonParmar => LinkFunction::Identity,
+            Self::GaussianIdentity => LinkFunction::Identity,
             Self::PoissonLog
             | Self::Tweedie { .. }
             | Self::NegativeBinomial { .. }
@@ -466,128 +478,20 @@ impl LikelihoodFamily {
             Self::BetaLogit { .. } => LinkFunction::Logit,
             Self::BinomialLogit | Self::BinomialMixture => LinkFunction::Logit,
             Self::BinomialProbit => LinkFunction::Probit,
-            Self::BinomialCLogLog | Self::BinomialLatentCLogLog => LinkFunction::CLogLog,
+            Self::BinomialCLogLog => LinkFunction::CLogLog,
             Self::BinomialSas => LinkFunction::Sas,
             Self::BinomialBetaLogistic => LinkFunction::BetaLogistic,
         }
     }
 
     #[inline]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::GaussianIdentity => "gaussian",
-            Self::BinomialLogit => "binomial-logit",
-            Self::BinomialProbit => "binomial-probit",
-            Self::BinomialCLogLog => "binomial-cloglog",
-            Self::BinomialLatentCLogLog => "latent-cloglog-binomial",
-            Self::BinomialSas => "binomial-sas",
-            Self::BinomialBetaLogistic => "binomial-beta-logistic",
-            Self::BinomialMixture => "binomial-blended-inverse-link",
-            Self::PoissonLog => "poisson-log",
-            Self::Tweedie { .. } => "tweedie-log",
-            Self::NegativeBinomial { .. } => "negative-binomial-log",
-            Self::BetaLogit { .. } => "beta-regression-logit",
-            Self::GammaLog => "gamma-log",
-            Self::RoystonParmar => "royston-parmar",
-        }
-    }
-
-    #[inline]
-    pub const fn pretty_name(self) -> &'static str {
-        match self {
-            Self::GaussianIdentity => "Gaussian Identity",
-            Self::BinomialLogit => "Binomial Logit",
-            Self::BinomialProbit => "Binomial Probit",
-            Self::BinomialCLogLog => "Binomial CLogLog",
-            Self::BinomialLatentCLogLog => "Latent CLogLog Binomial",
-            Self::BinomialSas => "Binomial SAS",
-            Self::BinomialBetaLogistic => "Binomial Beta-Logistic",
-            Self::BinomialMixture => "Binomial Blended Inverse-Link",
-            Self::PoissonLog => "Poisson Log",
-            Self::Tweedie { .. } => "Tweedie Log",
-            Self::NegativeBinomial { .. } => "Negative-Binomial Log",
-            Self::BetaLogit { .. } => "Beta Regression Logit",
-            Self::GammaLog => "Gamma Log",
-            Self::RoystonParmar => "Royston Parmar",
-        }
-    }
-
-    /// Whether the shared Jeffreys/Firth implementation is available for this
-    /// likelihood family.
-    #[inline]
     pub const fn supports_firth(self) -> bool {
         matches!(self, Self::BinomialLogit)
     }
 
-    /// `true` for the latent-cloglog binomial family — checked at many sites
-    /// to short-circuit the latent-Gaussian quadrature path.
-    #[inline]
-    pub const fn is_latent_cloglog(self) -> bool {
-        matches!(self, Self::BinomialLatentCLogLog)
-    }
-
-    /// `true` for the Gaussian-identity family.
     #[inline]
     pub const fn is_gaussian_identity(self) -> bool {
         matches!(self, Self::GaussianIdentity)
-    }
-
-    /// `true` for the Royston-Parmar (flexible parametric survival) family.
-    #[inline]
-    pub const fn is_royston_parmar(self) -> bool {
-        matches!(self, Self::RoystonParmar)
-    }
-
-    /// `true` for the blended/mixture-of-inverse-links binomial family.
-    #[inline]
-    pub const fn is_binomial_mixture(self) -> bool {
-        matches!(self, Self::BinomialMixture)
-    }
-
-    /// `true` for the SAS sinh-arcsinh binomial family.
-    #[inline]
-    pub const fn is_binomial_sas(self) -> bool {
-        matches!(self, Self::BinomialSas)
-    }
-
-    /// `true` for the beta-logistic binomial family.
-    #[inline]
-    pub const fn is_binomial_beta_logistic(self) -> bool {
-        matches!(self, Self::BinomialBetaLogistic)
-    }
-
-    #[inline]
-    pub const fn is_binomial(self) -> bool {
-        matches!(
-            self,
-            Self::BinomialLogit
-                | Self::BinomialProbit
-                | Self::BinomialCLogLog
-                | Self::BinomialLatentCLogLog
-                | Self::BinomialSas
-                | Self::BinomialBetaLogistic
-                | Self::BinomialMixture
-        )
-    }
-
-    #[inline]
-    pub const fn default_scale_metadata(self) -> LikelihoodScaleMetadata {
-        match self {
-            Self::GaussianIdentity => LikelihoodScaleMetadata::ProfiledGaussian,
-            Self::GammaLog => LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 },
-            Self::BinomialLogit
-            | Self::BinomialProbit
-            | Self::BinomialCLogLog
-            | Self::BinomialLatentCLogLog
-            | Self::BinomialSas
-            | Self::BinomialBetaLogistic
-            | Self::BinomialMixture
-            | Self::Tweedie { .. }
-            | Self::NegativeBinomial { .. }
-            | Self::BetaLogit { .. }
-            | Self::PoissonLog => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
-            Self::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
-        }
     }
 }
 
