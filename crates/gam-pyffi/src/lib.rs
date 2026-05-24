@@ -4734,15 +4734,18 @@ fn analytic_penalty_value_for_targets(
         registry.penalties.iter().zip(registry.rho_layout())
     {
         let rho_local = rho.slice(s![rho_slice]);
-        let target = match tier {
-            PenaltyTier::Psi => target_t.view(),
-            PenaltyTier::Beta => {
+        let target = match (tier, penalty) {
+            (PenaltyTier::Psi, _)
+            | (PenaltyTier::Beta, AnalyticPenaltyKind::MechanismSparsity(_)) => {
+                target_t.view()
+            }
+            (PenaltyTier::Beta, _) => {
                 let Some(target_beta) = target_beta.as_ref() else {
                     continue;
                 };
                 target_beta.view()
             }
-            PenaltyTier::Rho => continue,
+            (PenaltyTier::Rho, _) => continue,
         };
         value += penalty.value(target, rho_local);
     }
