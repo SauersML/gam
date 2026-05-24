@@ -1100,10 +1100,9 @@ fn sphere_basis<'py>(
 fn thin_plate_penalty<'py>(
     py: Python<'py>,
     centers: PyReadonlyArray2<'py, f64>,
-    m: usize,
+    _m: usize,
     length_scale: f64,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    let _ = m;
     let matrix = build_thin_plate_penalty_matrix(centers.as_array(), length_scale)
         .map_err(|err| py_value_error(err.to_string()))?;
     Ok(matrix.penalty.into_pyarray(py).unbind())
@@ -2693,10 +2692,14 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     penalty: PyReadonlyArray2<'py, f64>,
     weights: Option<PyReadonlyArray1<'py, f64>>,
     a_inequality: Option<PyReadonlyArray2<'py, f64>>,
-    b_inequality: Option<PyReadonlyArray1<'py, f64>>,
+    _b_inequality: Option<PyReadonlyArray1<'py, f64>>,
     log_lambda_at_optimum: Option<f64>,
-    coefficients_at_optimum: Option<PyReadonlyArray2<'py, f64>>,
-    fitted_at_optimum: Option<PyReadonlyArray2<'py, f64>>,
+    // `coefficients_at_optimum` is part of the documented API surface so
+    // callers can pre-compute or cache it, but the analytic backward
+    // derives the residual `y - X β̂` from the closed-form fit and never
+    // reads this argument back.
+    _coefficients_at_optimum: Option<PyReadonlyArray2<'py, f64>>,
+    _fitted_at_optimum: Option<PyReadonlyArray2<'py, f64>>,
     active_indices: Option<PyReadonlyArray1<'py, u64>>,
     grad_coefficients: Option<PyReadonlyArray2<'py, f64>>,
     grad_fitted: Option<PyReadonlyArray2<'py, f64>>,
@@ -2705,13 +2708,6 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     grad_reml_score: f64,
     grad_edf: f64,
 ) -> PyResult<Py<PyDict>> {
-    // Unused-suppression: `fitted_at_optimum` is part of the documented API
-    // surface so callers can pre-compute or cache it, but the analytic
-    // backward derives the residual `y - X β̂` from `coefficients_at_optimum`
-    // directly via the closed-form fit.
-    let _ = fitted_at_optimum;
-    let _ = coefficients_at_optimum;
-    let _ = b_inequality;
 
     let x_view = x.as_array();
     let y_view = y.as_array();

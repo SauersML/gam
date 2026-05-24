@@ -193,8 +193,9 @@ pub fn array2_to_matmut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
     let s0 = strides[0];
     let s1 = strides[1];
 
-    // SAFETY: We are creating a MatMut from the raw parts of the Array2.
-    // We strictly follow the dimensions and strides provided by ndarray.
+    // SAFETY: array.as_mut_ptr() is ndarray's logical (0, 0) pointer, and
+    // ndarray's dimensions plus signed element strides describe every initialized
+    // element of this uniquely borrowed Array2 for the returned MatMut lifetime.
     unsafe { MatMut::from_raw_parts_mut(array.as_mut_ptr(), rows, cols, s0, s1) }
 }
 
@@ -202,9 +203,9 @@ pub fn array2_to_matmut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
 pub fn array1_to_col_matmut(array: &mut Array1<f64>) -> MatMut<'_, f64> {
     let len = array.len();
     let stride = array.strides()[0];
-    // SAFETY: pointer, length, and row-stride come from the &mut Array1
-    // itself, so they describe a valid len×1 contiguous (in row stride)
-    // f64 buffer borrowed for the returned MatMut's lifetime.
+    // SAFETY: array.as_mut_ptr() is ndarray's logical first-element pointer, and
+    // len plus the signed element stride describe every initialized element of
+    // this uniquely borrowed Array1 for the returned len×1 MatMut lifetime.
     unsafe {
         MatMut::from_raw_parts_mut(
             array.as_mut_ptr(),
@@ -576,9 +577,9 @@ fn fast_av_view_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let len = out.len();
     let stride = out.strides()[0];
-    // SAFETY: out is a uniquely borrowed Array1, so as_mut_ptr +
-    // (len, 1, stride, 0) describes a valid f64 buffer of the same
-    // length and lifetime as the borrowed view.
+    // SAFETY: out.as_mut_ptr() is ndarray's logical first-element pointer, and
+    // len plus the signed element stride describe every initialized element of
+    // this uniquely borrowed view for the returned len×1 MatMut lifetime.
     let outview = unsafe {
         MatMut::from_raw_parts_mut(
             out.as_mut_ptr(),

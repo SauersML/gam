@@ -294,6 +294,10 @@ impl<'a> DenseRightProductView<'a> {
         } else if self.second.is_none() {
             self.second = Some(factor);
         } else {
+            // SAFETY: DenseRightProductView statically carries exactly two optional
+            // factor slots (`first` and `second`); reaching this branch means a
+            // caller invoked `with_factor` a third time, which violates the
+            // type's documented contract of at most two right factors.
             panic!("DenseRightProductView supports at most two right factors");
         }
         self
@@ -962,6 +966,11 @@ impl SparseDesignMatrix {
         self.try_to_dense_arc("SparseDesignMatrix::to_dense_arc")
             .unwrap_or_else(|msg| {
                 let bt = std::backtrace::Backtrace::force_capture();
+                // SAFETY: infallible-style accessor used at sites where the
+                // caller has already established that densifying this sparse
+                // matrix is permitted (size below the densification guard); a
+                // failure here means the caller broke that contract, which
+                // warrants an immediate abort with backtrace for diagnosis.
                 panic!("{msg}\nbacktrace:\n{bt}")
             })
     }
@@ -1235,6 +1244,11 @@ impl DenseDesignMatrix {
             // to get refusal semantics — they explicitly opted into operator-only math.
             Self::Lazy(op) => {
                 dense_operator_to_dense_by_chunks(op.as_ref()).unwrap_or_else(|err| {
+                    // SAFETY: this branch is the infallible-by-contract dense
+                    // materialization noted above; the row-chunk path only
+                    // fails on operator implementation bugs (it does not
+                    // enforce a byte budget), so failure here is a hard
+                    // contract violation rather than a runtime condition.
                     panic!(
                         "DenseDesignMatrix::to_dense: failed to materialize {}x{} \
                          operator-backed design via row chunks: {err}",
@@ -1251,6 +1265,11 @@ impl DenseDesignMatrix {
             Self::Materialized(matrix) => Arc::clone(matrix),
             Self::Lazy(op) => Arc::new(
                 dense_operator_to_dense_by_chunks(op.as_ref()).unwrap_or_else(|err| {
+                    // SAFETY: companion to the `to_dense` arm above — this
+                    // path is infallible-by-contract; row-chunk
+                    // materialization only fails on operator implementation
+                    // bugs, so a non-Ok result here is a hard contract
+                    // violation rather than a runtime budget issue.
                     panic!(
                         "DenseDesignMatrix::to_dense_arc: failed to materialize {}x{} \
                          operator-backed design via row chunks: {err}",

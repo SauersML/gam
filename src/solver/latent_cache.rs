@@ -919,7 +919,7 @@ fn build_basis_derivative_jets(
             })
         }
         LatentBasisKind::Duchon { .. } => {
-            let _ = latent;
+            drop(latent);
             Ok(BasisDerivativeJets {
                 operator_resident: true,
                 ..BasisDerivativeJets::empty()
@@ -929,8 +929,8 @@ fn build_basis_derivative_jets(
         | LatentBasisKind::PeriodicBspline { .. }
         | LatentBasisKind::Pca { .. }
         | LatentBasisKind::TensorBspline { .. } => {
-            let _ = latent;
-            let _ = distances;
+            drop(latent);
+            drop(distances);
             Ok(BasisDerivativeJets {
                 operator_resident: true,
                 ..BasisDerivativeJets::empty()

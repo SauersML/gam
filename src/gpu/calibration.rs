@@ -205,9 +205,9 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, GpuErr
 
     // Two warmup runs so kernel JIT + boost clock settle.
     for i in 0..2 {
-        // SAFETY: cfg shapes/leading dims match the just-allocated
-        // a_dev/b_dev/c_dev (M*K, K*N, M*N elements, column-major lda=m,
-        // ldb=k, ldc=m), so the cudarc 0.19 gemm stays in-bounds.
+        // SAFETY: Positive M/N/K were converted to i32. With OP_N, cfg addresses
+        // A as MxK lda=M, B as KxN ldb=K, and C as MxN ldc=M; the distinct
+        // device buffers have those lengths and stay live until the stream sync.
         unsafe { blas.gemm(cfg, &a_dev, &b_dev, &mut c_dev) }
             .map_err(|e| driver_err(format!("dgemm warmup {i}: {e}")))?;
         stream
@@ -218,8 +218,9 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, GpuErr
     let flops = 2.0_f64 * (M as f64) * (N as f64) * (K as f64);
     let fp64_gflops = best_of_n_transfer(5, || {
         let start = Instant::now();
-        // SAFETY: same as the warmup block above — cfg matches the
-        // allocations and they remain in scope.
+        // SAFETY: Same cfg and distinct A/B/C allocations as the warmup block;
+        // each queued gemm is synchronized before the closure returns, so the
+        // buffers remain live for the full device access.
         unsafe { blas.gemm(cfg, &a_dev, &b_dev, &mut c_dev) }
             .map_err(|e| driver_err(format!("dgemm timed: {e}")))?;
         stream
