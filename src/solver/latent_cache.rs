@@ -13,6 +13,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
@@ -196,6 +197,8 @@ pub(crate) enum LatentBasisKind {
         centered: bool,
         center_mean_fingerprint: Option<u64>,
         smooth_penalty: f64,
+        pca_basis_path: Option<PathBuf>,
+        chunk_size: usize,
     },
 }
 
@@ -281,6 +284,8 @@ impl LatentBasisKind {
                 centered,
                 center_mean_fingerprint,
                 smooth_penalty,
+                pca_basis_path,
+                chunk_size,
             } => {
                 hasher.write_usize(5);
                 hasher.write_u8(*centered as u8);
@@ -288,6 +293,23 @@ impl LatentBasisKind {
                     hasher.write_u64(*fp);
                 }
                 hasher.write_u64(smooth_penalty.to_bits());
+                if let Some(path) = pca_basis_path {
+                    hasher.write_u8(1);
+                    hasher.hasher.update(path.to_string_lossy().as_bytes());
+                    if let Ok(meta) = std::fs::metadata(path) {
+                        hasher.write_u64(meta.len());
+                        if let Ok(modified) = meta.modified()
+                            && let Ok(elapsed) =
+                                modified.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        {
+                            hasher.write_u64(elapsed.as_secs());
+                            hasher.write_u64(elapsed.subsec_nanos() as u64);
+                        }
+                    }
+                } else {
+                    hasher.write_u8(0);
+                }
+                hasher.write_usize(*chunk_size);
                 hasher.write_usize(basis_matrix.nrows());
                 hasher.write_usize(basis_matrix.ncols());
                 hash_matrix(basis_matrix, &mut hasher);

@@ -1602,6 +1602,9 @@ fn visit_files(root: &Path, dir: &Path, visitor: &mut dyn FnMut(&Path, &str)) {
             || name == "dist"
             || name == "build"
             || name == "site"
+            // Vendored upstream crates compile via their own Cargo.toml; the
+            // first-party lint rules in this scanner do not apply to them.
+            || name == "vendor"
         {
             continue;
         }

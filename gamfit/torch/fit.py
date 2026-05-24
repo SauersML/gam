@@ -226,6 +226,8 @@ def _build_design_penalty(
         return design.to(torch.float64), penalty.to(torch.float64)
 
     if isinstance(smooth, Pca):
+        if smooth.lazy_path is not None:
+            raise NotImplementedError("Pca lazy_path is available on the Rust formula path")
         if smooth.basis is None:
             if smooth.K is None:
                 raise ValueError("Pca requires K when basis is None")
