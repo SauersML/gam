@@ -35936,17 +35936,24 @@ mod tests {
         use super::closed_form_penalty::radial_derivatives_of_isotropic_duchon;
 
         let fr = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, 2 * q);
-        match q {
-            0 => fr[0],
-            1 => -(fr[2] + ((d as f64) - 1.0) * fr[1] / big_r),
-            2 => {
-                let r2 = big_r * big_r;
-                let r3 = r2 * big_r;
-                let dm1 = (d as f64) - 1.0;
-                let dm3 = (d as f64) - 3.0;
-                fr[4] + 2.0 * dm1 * fr[3] / big_r + dm1 * dm3 * fr[2] / r2 - dm1 * dm3 * fr[1] / r3
-            }
-            _ => unreachable!(),
+        // Test helper: only `q ∈ {0, 1, 2}` is exercised by the call sites in
+        // this module. Higher `q` would need its own closed-form expansion;
+        // panic to fail loudly if a test ever adds an unsupported value.
+        if q == 0 {
+            fr[0]
+        } else if q == 1 {
+            -(fr[2] + ((d as f64) - 1.0) * fr[1] / big_r)
+        } else if q == 2 {
+            let r2 = big_r * big_r;
+            let r3 = r2 * big_r;
+            let dm1 = (d as f64) - 1.0;
+            let dm3 = (d as f64) - 3.0;
+            fr[4] + 2.0 * dm1 * fr[3] / big_r + dm1 * dm3 * fr[2] / r2 - dm1 * dm3 * fr[1] / r3
+        } else {
+            panic!(
+                "isotropic_radial_laplacian_power_from_q0: test helper only \
+                 covers q ∈ {{0,1,2}}; got q={q}"
+            );
         }
     }
 
