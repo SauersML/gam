@@ -736,7 +736,7 @@ pub enum ModelKind {
 #[serde(tag = "family_kind", rename_all = "kebab-case")]
 pub enum FittedFamily {
     Standard {
-        likelihood: LikelihoodFamily,
+        likelihood: LikelihoodSpec,
         link: Option<LinkFunction>,
         #[serde(default)]
         latent_cloglog_state: Option<LatentCLogLogState>,
@@ -746,17 +746,17 @@ pub enum FittedFamily {
         sas_state: Option<SasLinkState>,
     },
     LocationScale {
-        likelihood: LikelihoodFamily,
+        likelihood: LikelihoodSpec,
         #[serde(default)]
         base_link: Option<InverseLink>,
     },
     MarginalSlope {
-        likelihood: LikelihoodFamily,
+        likelihood: LikelihoodSpec,
         base_link: Option<InverseLink>,
         frailty: FrailtySpec,
     },
     Survival {
-        likelihood: LikelihoodFamily,
+        likelihood: LikelihoodSpec,
         #[serde(default)]
         survival_likelihood: Option<String>,
         #[serde(default)]
@@ -770,7 +770,7 @@ pub enum FittedFamily {
         frailty: FrailtySpec,
     },
     TransformationNormal {
-        likelihood: LikelihoodFamily,
+        likelihood: LikelihoodSpec,
     },
 }
 
