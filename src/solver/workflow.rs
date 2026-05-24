@@ -2387,6 +2387,9 @@ pub struct FitConfig {
     /// large workloads, `Off` pins execution to CPU kernels, and `Force` fails
     /// loudly when a requested GPU kernel has no compiled backend.
     pub gpu_policy: crate::gpu::GpuPolicy,
+    /// Solver device. `Cpu` is the default; `Cuda` routes solver kernels
+    /// through the cudarc cuBLAS/cuSOLVER path when the `cuda` feature is built.
+    pub device: crate::solver::gpu::Device,
 
     /// Optional override of the [`crate::resource::ResourcePolicy`] used when
     /// planning spatial bases (TPS / Matern / Duchon) during term construction.
@@ -2459,6 +2462,7 @@ impl Default for FitConfig {
             transformation_normal: false,
             firth: false,
             gpu_policy: crate::gpu::GpuPolicy::Auto,
+            device: crate::solver::gpu::Device::Cpu,
             resource_policy: None,
             group_metadata: None,
             coefficient_groups: Vec::new(),
@@ -2528,6 +2532,7 @@ pub fn materialize<'a>(
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
     crate::gpu::configure_global_policy(config.gpu_policy);
+    crate::solver::gpu::configure_device(config.device);
     let parsed = parse_formula(formula)?;
     let col_map = data.column_map();
 
