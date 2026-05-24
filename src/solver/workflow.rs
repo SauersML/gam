@@ -56,7 +56,8 @@ use crate::terms::latent_coord::{
 use crate::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, RowPrecisionPriorPenalty,
     BlockOrthogonalityPenalty, BlockSparsityPenalty, DifferenceOpKind, GumbelTemperatureSchedule,
-    IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge, NuclearNormPenalty, OrthogonalityPenalty,
+    IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge, MechanismSparsityPenalty,
+    NuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice, ScadMcpPenalty,
     SoftmaxAssignmentSparsityPenalty, ScalarWeightSchedule, ScheduleKind, SparsityPenalty,
     TotalVariationPenalty,
@@ -3573,6 +3574,59 @@ fn build_standard_latent_analytic_penalty_registry(
                     None => penalty,
                 };
                 registry.push(AnalyticPenaltyKind::BlockSparsity(Arc::new(penalty)));
+            }
+            "mechanism_sparsity" => {
+                let raw_groups = descriptor
+                    .get("feature_groups")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| format!("{context}.feature_groups is required"))?;
+                let mut feature_groups = Vec::with_capacity(raw_groups.len());
+                let mut max_feature = None::<usize>;
+                for (group_idx, raw_group) in raw_groups.iter().enumerate() {
+                    let raw_features = raw_group.as_array().ok_or_else(|| {
+                        format!("{context}.feature_groups[{group_idx}] must be a list of feature indices")
+                    })?;
+                    let mut group = Vec::with_capacity(raw_features.len());
+                    for (feature_idx, raw_feature) in raw_features.iter().enumerate() {
+                        let feature = raw_feature.as_u64().ok_or_else(|| {
+                            format!(
+                                "{context}.feature_groups[{group_idx}][{feature_idx}] must be a non-negative integer"
+                            )
+                        })? as usize;
+                        max_feature =
+                            Some(max_feature.map_or(feature, |current| current.max(feature)));
+                        group.push(feature);
+                    }
+                    feature_groups.push(group);
+                }
+                let feature_count = max_feature
+                    .and_then(|feature| feature.checked_add(1))
+                    .ok_or_else(|| format!("{context}.feature_groups must not be empty"))?;
+                let target_len = target.d.checked_mul(feature_count).ok_or_else(|| {
+                    format!("{context}.target latent_dim × feature_count overflows usize")
+                })?;
+                let mechanism_slice = PsiSlice::full(target_len, Some(target.d));
+                let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
+                let smoothing_eps = analytic_descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
+                let n_eff = analytic_descriptor_f64(descriptor, "n_eff", target.n as f64)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                let penalty = MechanismSparsityPenalty::new(
+                    mechanism_slice,
+                    feature_groups,
+                    weight,
+                    smoothing_eps,
+                    n_eff,
+                    learnable,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(AnalyticPenaltyKind::MechanismSparsity(Arc::new(penalty)));
             }
             "row_precision_prior" | "aux_conditional_prior" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
