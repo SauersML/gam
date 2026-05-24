@@ -8571,32 +8571,6 @@ pub(crate) fn prefer_outer_hessian_operator(n: usize, p: usize, k: usize) -> boo
     generic_outer_hessian_scale_decision(n, p, k).prefers_operator
 }
 
-/// Selects the matrix-free outer-Hessian representation once a Hessian HVP
-/// kernel is available. Decision is cost-driven via the `(n, p, K)` crossover
-/// plus a callback-specific row-pair workload crossover: the operator and
-/// dense paths produce identical math, so they only differ in assembly cost.
-///
-/// Callback-backed kernels deliberately do not inherit the generic
-/// large-`n`, moderate-`p` route. At small coefficient dimension their
-/// operator logdet projections still stream row kernels over all observations
-/// per outer-HVP, while the dense path can assemble the small `K x K` Hessian
-/// directly. The callback path only flips to matrix-free for genuinely wide
-/// bases, many outer coordinates, or enough row-pair work to amortize those
-/// repeated projections.
-///
-/// Real fast HVP capability (a family-supplied directional θθ operator) is
-/// routed separately through `HessianDerivativeProvider::family_outer_hessian_operator`,
-/// which short-circuits this function entirely at the call site.
-#[cfg(test)]
-pub(crate) fn use_outer_hessian_operator_path(
-    n: usize,
-    p: usize,
-    k: usize,
-    callback_kernel: bool,
-) -> bool {
-    outer_hessian_route_plan(n, p, k, true, callback_kernel, false).use_operator
-}
-
 fn is_hessian_unavailable(error: &str) -> bool {
     error.starts_with(HESSIAN_UNAVAILABLE_PREFIX)
 }
@@ -19116,17 +19090,17 @@ mod tests {
     #[test]
     fn callback_outer_hessian_routes_by_row_pair_work_even_at_small_p() {
         assert!(!prefer_outer_hessian_operator(155_980, 19, 23));
-        assert!(use_outer_hessian_operator_path(155_980, 19, 23, true));
-        assert!(!use_outer_hessian_operator_path(155_980, 19, 23, false));
-        assert!(!use_outer_hessian_operator_path(1_000, 19, 23, true));
+        assert!(outer_hessian_route_plan(155_980, 19, 23, true, true, false).use_operator);
+        assert!(!outer_hessian_route_plan(155_980, 19, 23, true, false, false).use_operator);
+        assert!(!outer_hessian_route_plan(1_000, 19, 23, true, true, false).use_operator);
     }
 
     #[test]
     fn callback_outer_hessian_ignores_generic_large_n_small_p_crossover() {
         assert!(prefer_outer_hessian_operator(195_780, 33, 8));
-        assert!(!use_outer_hessian_operator_path(195_780, 33, 8, true));
-        assert!(use_outer_hessian_operator_path(195_780, 512, 8, true));
-        assert!(use_outer_hessian_operator_path(195_780, 33, 32, true));
+        assert!(!outer_hessian_route_plan(195_780, 33, 8, true, true, false).use_operator);
+        assert!(outer_hessian_route_plan(195_780, 512, 8, true, true, false).use_operator);
+        assert!(outer_hessian_route_plan(195_780, 33, 32, true, true, false).use_operator);
 
         let plan = outer_hessian_route_plan(195_780, 33, 8, true, true, false);
         assert!(!plan.use_operator);

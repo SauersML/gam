@@ -12982,7 +12982,7 @@ mod tests {
         let rho_dim = spec.initial_log_lambdas.len();
         let psi_dim = derivative_blocks[0].len();
         let k_outer = rho_dim + psi_dim;
-        // `use_outer_hessian_operator_path` is purely a cost-based crossover
+        // `outer_hessian_route_plan` is purely a cost-based crossover
         // over `(n_obs, p_dim, k_outer)`; commit 7f7705c removed the
         // callback-kernel short-circuit that previously let CTN trip the
         // operator path on its analytic HVP alone.  Per the current
