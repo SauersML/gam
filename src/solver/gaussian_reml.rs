@@ -20,11 +20,11 @@ static ILL_CONDITIONED_BACKWARD_WARNED: Once = Once::new();
 
 fn warn_ill_conditioned_backward_once(p: usize, d: usize, condition_number: f64) {
     ILL_CONDITIONED_BACKWARD_WARNED.call_once(|| {
-        eprintln!(
-            "[gam] gaussian_reml_fit_backward: K = XᵀWX + λS is near-singular \
+        log::warn!(
+            "gaussian_reml_fit_backward: K = XᵀWX + λS is near-singular \
              (p={p}, d={d}, cond≈{condition_number:.2e}); returning zero gradients \
              for this fit (λ has saturated, atom is effectively unused). \
-             Further occurrences are silent.",
+             Further occurrences are silent."
         );
     });
 }
