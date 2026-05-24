@@ -13,11 +13,6 @@ pub enum BudgetVerdict {
     OverBudget,
 }
 
-#[derive(Clone, Debug)]
-pub struct PowerLawReport {
-    pub fit: PowerLawFit,
-}
-
 pub fn fit_power_law(points: &[(f64, f64)]) -> Option<PowerLawFit> {
     if points.len() < 3 {
         return None;
@@ -68,7 +63,7 @@ pub fn report_power_law_full(
     points: &[(f64, f64)],
     extrapolate: &[(&str, f64)],
     budget_y: f64,
-) -> Option<PowerLawReport> {
+) -> Option<PowerLawFit> {
     let Some(fit) = fit_power_law(points) else {
         eprintln!(
             "{tag} INSUFFICIENT DATA: {} points (need >=3 for an honest fit)",
@@ -123,5 +118,5 @@ pub fn report_power_law_full(
             x_target, pred
         );
     }
-    Some(PowerLawReport { fit })
+    Some(fit)
 }
