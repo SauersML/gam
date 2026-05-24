@@ -669,7 +669,7 @@ pub(crate) trait WorkingLikelihood {
     ) -> Result<f64, EstimationError>;
 }
 
-impl WorkingLikelihood for GlmLikelihoodSpec {
+impl WorkingLikelihood for LikelihoodSpec {
     fn irls_update(
         &self,
         y: ArrayView1<f64>,
@@ -681,22 +681,14 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
         integrated: Option<IntegratedWorkingInput<'_>>,
         derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
     ) -> Result<(), EstimationError> {
-        match (self.family, integrated) {
-            (
-                GlmLikelihoodFamily::BinomialLogit
-                | GlmLikelihoodFamily::BinomialProbit
-                | GlmLikelihoodFamily::BinomialCLogLog
-                | GlmLikelihoodFamily::BinomialSas
-                | GlmLikelihoodFamily::BinomialBetaLogistic
-                | GlmLikelihoodFamily::BinomialMixture,
-                Some(integ),
-            ) => {
+        match (&self.response, &self.link, integrated) {
+            (ResponseFamily::Binomial, _, Some(integ)) => {
                 update_glmvectors_integrated_by_family(
                     integ.quadctx,
                     y,
                     eta,
                     integ.se,
-                    self.family,
+                    self,
                     priorweights,
                     mu,
                     weights,
@@ -708,11 +700,12 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 Ok(())
             }
             (
-                GlmLikelihoodFamily::BinomialLogit
-                | GlmLikelihoodFamily::BinomialProbit
-                | GlmLikelihoodFamily::BinomialCLogLog
-                | GlmLikelihoodFamily::BinomialSas
-                | GlmLikelihoodFamily::BinomialBetaLogistic,
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Logit)
+                | InverseLink::Standard(LinkFunction::Probit)
+                | InverseLink::Standard(LinkFunction::CLogLog)
+                | InverseLink::Sas(_)
+                | InverseLink::BetaLogistic(_),
                 None,
             ) => {
                 update_glmvectors(
@@ -727,10 +720,18 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (GlmLikelihoodFamily::BinomialMixture, None) => Err(EstimationError::InvalidInput(
-                "BinomialMixture IRLS update requires explicit mixture link state".to_string(),
-            )),
-            (GlmLikelihoodFamily::GaussianIdentity, _) => {
+            (ResponseFamily::Binomial, InverseLink::Mixture(_), None) => {
+                Err(EstimationError::InvalidInput(
+                    "BinomialMixture IRLS update requires explicit mixture link state".to_string(),
+                ))
+            }
+            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_), _)
+            | (ResponseFamily::Binomial, InverseLink::Standard(_), None) => {
+                Err(EstimationError::InvalidInput(
+                    "Unsupported binomial inverse-link in PIRLS IRLS update".to_string(),
+                ))
+            }
+            (ResponseFamily::Gaussian, _, _) => {
                 update_glmvectors(
                     y,
                     eta,
@@ -743,17 +744,17 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (GlmLikelihoodFamily::PoissonLog, _) => {
+            (ResponseFamily::Poisson, _, _) => {
                 write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives);
                 Ok(())
             }
-            (GlmLikelihoodFamily::Tweedie { p }, _) => {
+            (ResponseFamily::Tweedie { p }, _, _) => {
                 write_tweedie_log_working_state(
                     y,
                     eta,
                     priorweights,
-                    p,
-                    fixed_glm_dispersion(*self),
+                    *p,
+                    fixed_glm_dispersion(self),
                     mu,
                     weights,
                     z,
@@ -761,12 +762,12 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (GlmLikelihoodFamily::NegativeBinomial { theta }, _) => {
+            (ResponseFamily::NegativeBinomial { theta }, _, _) => {
                 write_negative_binomial_log_working_state(
                     y,
                     eta,
                     priorweights,
-                    theta,
+                    *theta,
                     mu,
                     weights,
                     z,
@@ -774,12 +775,12 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (GlmLikelihoodFamily::BetaLogit { phi }, _) => {
+            (ResponseFamily::Beta { phi }, _, _) => {
                 write_beta_logit_working_state(
                     y,
                     eta,
                     priorweights,
-                    phi,
+                    *phi,
                     mu,
                     weights,
                     z,
@@ -787,12 +788,12 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (GlmLikelihoodFamily::GammaLog, _) => {
+            (ResponseFamily::Gamma, _, _) => {
                 write_gamma_log_working_state(
                     y,
                     eta,
                     priorweights,
-                    self.gamma_shape().unwrap_or(1.0),
+                    self.default_scale_metadata().gamma_shape().unwrap_or(1.0),
                     mu,
                     weights,
                     z,
@@ -800,6 +801,10 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 );
                 Ok(())
             }
+            (ResponseFamily::RoystonParmar, _, _) => Err(EstimationError::InvalidInput(
+                "RoystonParmar IRLS update is not handled by the PIRLS GLM working likelihood"
+                    .to_string(),
+            )),
         }
     }
 
@@ -809,10 +814,10 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
         mu: &Array1<f64>,
         priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError> {
-        if let GlmLikelihoodFamily::Tweedie { .. } = self.family {
+        if matches!(self.response, ResponseFamily::Tweedie { .. }) {
             validate_tweedie_responses(&y, &priorweights)?;
         }
-        Ok(calculate_deviance(y, mu, *self, priorweights))
+        Ok(calculate_deviance(y, mu, self, priorweights))
     }
 }
 
@@ -1696,7 +1701,7 @@ struct GamWorkingModel<'a> {
     priorweights: ArrayView1<'a, f64>,
     penalty: PirlsPenalty,
     workspace: PirlsWorkspace,
-    likelihood: GlmLikelihoodSpec,
+    likelihood: LikelihoodSpec,
     link_kind: InverseLink,
     firth_bias_reduction: bool,
     lastmu: Array1<f64>,
@@ -1720,7 +1725,7 @@ struct GamWorkingModel<'a> {
 }
 
 struct GamModelFinalState {
-    likelihood: GlmLikelihoodSpec,
+    likelihood: LikelihoodSpec,
     coordinate_frame: PirlsCoordinateFrame,
     finalmu: Array1<f64>,
     finalweights: Array1<f64>,
@@ -1744,7 +1749,7 @@ impl<'a> GamWorkingModel<'a> {
         priorweights: ArrayView1<'a, f64>,
         penalty: PirlsPenalty,
         workspace: PirlsWorkspace,
-        likelihood: GlmLikelihoodSpec,
+        likelihood: LikelihoodSpec,
         link_kind: InverseLink,
         firth_bias_reduction: bool,
         transform: Option<WorkingReparamTransform>,
