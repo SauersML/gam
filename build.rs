@@ -123,6 +123,28 @@ fn main() {
     let mut useless_test_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_useless_tests(&manifest_dir, &manifest_dir, &mut useless_test_offenders);
 
+    // `#[cfg(test)]` attribute directly on a publicly-visible item
+    // (`pub` / `pub(crate)` / `pub(super)` / `pub(in path)`). Production
+    // API gated on test-only compilation is the dodge: rustc's `dead_code`
+    // lint won't see it under the normal build, yet the item still exists
+    // for the test target. Real test-only public surface lives inside a
+    // private `#[cfg(test)] mod tests { ... }` so the items inside the
+    // module don't each carry their own gate.
+    let mut cfg_test_pub_offenders: Vec<(PathBuf, usize, String, String)> = Vec::new();
+    scan_for_cfg_test_on_pub_items(&manifest_dir, &manifest_dir, &mut cfg_test_pub_offenders);
+
+    // No-op self-consuming function bodies (e.g. `fn discard(self) {}`). The
+    // wrapper-struct launder pattern: a `fn foo(self) {}` exists solely so
+    // callers can write `x.foo()` instead of letting an unused-value warning
+    // fire. By-reference receivers (`&self`, `&mut self`) are NOT flagged
+    // (legitimate empty `Drop::drop(&mut self)` impls live there).
+    let mut noop_self_consuming_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_noop_self_consuming_fns(
+        &manifest_dir,
+        &manifest_dir,
+        &mut noop_self_consuming_offenders,
+    );
+
     // Vendoring ban. Reject any `vendor/` directory under the manifest root
     // (any depth). Vendored upstream crates fork the dependency tree from
     // crates.io / git, hide upstream CVE / fix flow, and bypass the same
@@ -297,6 +319,30 @@ fn main() {
                 "#[test] function without assertions (test must verify something — add assert! / assert_eq! / ? / #[should_panic] or delete the test)"
                     .to_string(),
             rows: useless_test_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !cfg_test_pub_offenders.is_empty() {
+        sections.push(Section {
+            title:
+                "#[cfg(test)] on publicly-visible item (move into a private `#[cfg(test)] mod ...` or delete the unused item — do not hide production API from the dead_code lint)"
+                    .to_string(),
+            rows: cfg_test_pub_offenders
+                .iter()
+                .map(|(r, l, item, s)| (r.clone(), *l, Some(item.clone()), s.clone()))
+                .collect(),
+        });
+    }
+
+    if !noop_self_consuming_offenders.is_empty() {
+        sections.push(Section {
+            title:
+                "no-op self-consuming fn (empty body with by-value `self` — likely a `let _` launderer; use or restructure the return value)"
+                    .to_string(),
+            rows: noop_self_consuming_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
                 .collect(),
@@ -600,6 +646,11 @@ fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
         ("spin_loop()", "spin_loop", false),
         ("thread::yield_now(", "thread::yield_now", false),
         ("std::thread::yield_now(", "std::thread::yield_now", false),
+        // `std::hint::black_box(...)` is a value-discard launderer in non-bench
+        // code (used to silence unused_must_use / unused warnings without naming
+        // the value). Legitimate in criterion benchmarks — test-aware exempts
+        // bench files. Production-side uses must bind and use the value.
+        ("hint::black_box(", "hint::black_box", true),
     ]
 }
 
