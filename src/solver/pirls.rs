@@ -4797,7 +4797,6 @@ where
         if current_penalized.is_finite() && current_penalized < min_penalized_deviance {
             min_penalized_deviance = current_penalized;
         }
-        #[cfg(test)]
         test_support::record_penalized_deviance(current_penalized);
 
         // Capture the initial gradient norm at iter 1 (the first iter
@@ -6077,24 +6076,16 @@ where
     })
 }
 
-#[cfg(test)]
 mod test_support {
+    //! Thread-local diagnostic trace for PIRLS penalized-deviance sequences.
+    //! `record_penalized_deviance` is always on so the per-iteration call site
+    //! in the PIRLS hot loop does not need a `#[cfg(test)]` gate; the trace
+    //! defaults to `None`, so the call is a near-free thread-local read in
+    //! production. The capture entry point lives next to the test that uses
+    //! it.
     thread_local! {
-        static PIRLS_PENALIZED_DEVIANCE_TRACE: std::cell::RefCell<Option<Vec<f64>>> =
+        pub(super) static PIRLS_PENALIZED_DEVIANCE_TRACE: std::cell::RefCell<Option<Vec<f64>>> =
             const { std::cell::RefCell::new(None) };
-    }
-
-    pub(super) fn capture_pirls_penalized_deviance<F, R>(run: F) -> (R, Vec<f64>)
-    where
-        F: FnOnce() -> R,
-    {
-        PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| {
-            *trace.borrow_mut() = Some(Vec::new());
-        });
-        let result = run();
-        let captured =
-            PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| trace.borrow_mut().take().unwrap());
-        (result, captured)
     }
 
     pub(super) fn record_penalized_deviance(value: f64) {
@@ -12823,6 +12814,19 @@ mod root_cause_tests {
     use super::*;
     use approx::assert_relative_eq;
     use ndarray::{Array1, Array2, array};
+
+    fn capture_pirls_penalized_deviance<F, R>(run: F) -> (R, Vec<f64>)
+    where
+        F: FnOnce() -> R,
+    {
+        super::test_support::PIRLS_PENALIZED_DEVIANCE_TRACE.with(|trace| {
+            *trace.borrow_mut() = Some(Vec::new());
+        });
+        let result = run();
+        let captured = super::test_support::PIRLS_PENALIZED_DEVIANCE_TRACE
+            .with(|trace| trace.borrow_mut().take().unwrap());
+        (result, captured)
+    }
 
     fn scalar_working_state(
         beta: &Coefficients,

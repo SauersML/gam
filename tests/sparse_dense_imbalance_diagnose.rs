@@ -139,26 +139,40 @@ fn run(formula: &str) -> (f64, f64, f64) {
 fn diagnose_sparse_dense_imbalance() {
     assert!(file!().ends_with(".rs"));
     init_parallelism();
-    // Free BC (baseline)
-    let _ = run("y ~ s(x, k=20)");
-    let _ = run("y ~ s(x, k=10)");
-    let _ = run("y ~ s(x, k=40)");
-    // BC anchored both
-    let _ = run("y ~ s(x, bc=anchored, k=20)");
-    let _ = run("y ~ s(x, bc=anchored, k=10)");
-    let _ = run("y ~ s(x, bc=anchored, k=40)");
-    // BC clamped both
-    let _ = run("y ~ s(x, bc=clamped, k=20)");
-    // BC anchored ONLY right (where data is)
-    let _ = run("y ~ s(x, bc_right=anchored, k=20)");
-    // BC anchored ONLY left (sparse side)
-    let _ = run("y ~ s(x, bc_left=anchored, k=20)");
-    // TPS
-    let _ = run("y ~ s(x, type=tps, k=20)");
-    // Hypothesis: bc=anchored + 1st-derivative penalty (penalty_order=1)
-    // damps the slope at the pin and should prevent the oscillation.
-    std::hint::black_box(run("y ~ s(x, bc=anchored, k=20, penalty_order=1)"));
-    std::hint::black_box(run("y ~ s(x, bc_left=anchored, k=20, penalty_order=1)"));
-    // Higher-order penalty
-    std::hint::black_box(run("y ~ s(x, bc=anchored, k=20, penalty_order=3)"));
+    // Each `run` call exercises a different basis/BC variant; the diagnose
+    // harness eprintln!s its detailed metrics. The asserts here guarantee that
+    // every variant returned finite numbers so a future regression (NaN/Inf
+    // sneaking through a code path) trips a test failure instead of vanishing
+    // into the diagnostic log.
+    let variants = [
+        // Free BC (baseline)
+        "y ~ s(x, k=20)",
+        "y ~ s(x, k=10)",
+        "y ~ s(x, k=40)",
+        // BC anchored both
+        "y ~ s(x, bc=anchored, k=20)",
+        "y ~ s(x, bc=anchored, k=10)",
+        "y ~ s(x, bc=anchored, k=40)",
+        // BC clamped both
+        "y ~ s(x, bc=clamped, k=20)",
+        // BC anchored ONLY right (where data is)
+        "y ~ s(x, bc_right=anchored, k=20)",
+        // BC anchored ONLY left (sparse side)
+        "y ~ s(x, bc_left=anchored, k=20)",
+        // TPS
+        "y ~ s(x, type=tps, k=20)",
+        // Hypothesis: bc=anchored + 1st-derivative penalty (penalty_order=1)
+        // damps the slope at the pin and should prevent the oscillation.
+        "y ~ s(x, bc=anchored, k=20, penalty_order=1)",
+        "y ~ s(x, bc_left=anchored, k=20, penalty_order=1)",
+        // Higher-order penalty
+        "y ~ s(x, bc=anchored, k=20, penalty_order=3)",
+    ];
+    for formula in variants {
+        let (rmse_sparse, rmse_dense, pred_span) = run(formula);
+        assert!(
+            rmse_sparse.is_finite() && rmse_dense.is_finite() && pred_span.is_finite(),
+            "non-finite diagnose metrics for `{formula}`: rmse_sparse={rmse_sparse} rmse_dense={rmse_dense} pred_span={pred_span}",
+        );
+    }
 }
