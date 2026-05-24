@@ -29525,7 +29525,6 @@ mod tests {
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
         assert_eq!(result.penalties.len(), 2);
@@ -29567,7 +29566,6 @@ mod tests {
                 right: BSplineEndpointBoundaryCondition::Free,
             },
             boundary: OneDimensionalBoundary::Open,
-            streaming_chunk_size: None,
         };
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
         let z = bspline_transform_from_result(&result);
@@ -29608,7 +29606,6 @@ mod tests {
                 right: BSplineEndpointBoundaryCondition::Clamped,
             },
             boundary: OneDimensionalBoundary::Open,
-            streaming_chunk_size: None,
         };
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
         assert_eq!(
@@ -29656,7 +29653,6 @@ mod tests {
                 right: BSplineEndpointBoundaryCondition::Free,
             },
             boundary: OneDimensionalBoundary::Open,
-            streaming_chunk_size: None,
         };
         let err = build_bspline_basis_1d(x.view(), &spec).unwrap_err();
         assert!(err.to_string().contains("non-zero B-spline left anchor"));
@@ -29676,7 +29672,6 @@ mod tests {
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -29703,7 +29698,6 @@ mod tests {
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -29743,7 +29737,6 @@ mod tests {
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -29789,7 +29782,6 @@ mod tests {
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).expect("build sparse bspline");
@@ -29810,7 +29802,6 @@ mod tests {
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).expect("build centered sparse bspline");
@@ -29831,7 +29822,6 @@ mod tests {
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
 
         match build_bspline_basis_1d(x.view(), &spec).unwrap_err() {
@@ -29886,7 +29876,6 @@ mod tests {
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -29942,7 +29931,6 @@ mod tests {
             },
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -29971,7 +29959,6 @@ mod tests {
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
         let constrained = BSplineBasisSpec {
             identifiability: BSplineIdentifiability::RemoveLinearTrend,
@@ -30004,7 +29991,6 @@ mod tests {
             },
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -30057,7 +30043,6 @@ mod tests {
                 end: 1.0,
             },
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
         let dense = built.design.to_dense();
@@ -33245,7 +33230,6 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-            streaming_chunk_size: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.design.nrows(), data.nrows());
@@ -33280,7 +33264,6 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-            streaming_chunk_size: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         // (k-1) constrained kernel cols + explicit intercept.
@@ -33302,7 +33285,6 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-            streaming_chunk_size: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 1);
@@ -33325,7 +33307,6 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-            streaming_chunk_size: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 2);
@@ -33352,7 +33333,6 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-            streaming_chunk_size: None,
         };
         let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic Matérn derivative should build");
@@ -33423,7 +33403,6 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-            streaming_chunk_size: None,
         };
         let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic Matérn double-penalty derivative should build");
@@ -34955,7 +34934,6 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
-            streaming_chunk_size: None,
         };
         let analytic = build_matern_basis_log_kappasecond_derivative(data.view(), &spec)
             .expect("analytic Matérn second derivative should build");
@@ -35017,7 +34995,6 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: Some(vec![0.1, -0.1]),
-            streaming_chunk_size: None,
         };
 
         let basis = build_matern_basis(data.view(), &spec).expect("aniso Matérn basis");
@@ -38941,7 +38918,6 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
-            streaming_chunk_size: None,
             boundary: OneDimensionalBoundary::Open,
         };
         let built = build_bspline_basis_1d(x.view(), &spec).expect("periodic basis");
@@ -38970,7 +38946,6 @@ mod tests {
             double_penalty: true,
             identifiability: BSplineIdentifiability::WeightedSumToZero { weights: None },
             boundary_conditions: Default::default(),
-            streaming_chunk_size: None,
             boundary: OneDimensionalBoundary::Open,
         };
         let built = build_bspline_basis_1d(x.view(), &spec).expect("periodic centered basis");
