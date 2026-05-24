@@ -33,7 +33,9 @@ use std::time::{Duration, Instant};
 pub const BIOBANK_SHAPE_SEED: u64 = 0xB10B_AA1C_F13E_2026;
 pub const BIOBANK_SHAPE_PC_DIM: usize = 16;
 pub const DEFAULT_REPRO_N: usize = 50_000;
+#[cfg(test)]
 pub const DEFAULT_SMOKE_N: usize = 2_000;
+#[cfg(test)]
 pub const DEFAULT_WALL_BOUND: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
@@ -45,11 +47,14 @@ pub struct BiobankShapeProblem {
 #[derive(Clone, Debug)]
 pub struct FitTiming {
     pub elapsed: Duration,
+    #[cfg(test)]
     pub outer_iterations: usize,
     pub inner_cycles: usize,
+    #[cfg(test)]
     pub outer_converged: bool,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct BetaDiff {
     pub index: usize,
@@ -59,6 +64,7 @@ pub struct BetaDiff {
     pub rel_diff: f64,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct BetaEquivalenceReport {
     pub len: usize,
@@ -228,8 +234,10 @@ pub fn fit_problem(
         FitResult::BernoulliMarginalSlope(out) => {
             let timing = FitTiming {
                 elapsed,
+                #[cfg(test)]
                 outer_iterations: out.fit.outer_iterations,
                 inner_cycles: out.fit.inner_cycles,
+                #[cfg(test)]
                 outer_converged: out.fit.outer_converged,
             };
             Ok((out, timing))
@@ -238,6 +246,7 @@ pub fn fit_problem(
     }
 }
 
+#[cfg(test)]
 pub fn fit_synthetic_beta(
     n: usize,
     inner_max_cycles: usize,
@@ -247,6 +256,7 @@ pub fn fit_synthetic_beta(
     Ok((fit.fit.beta, timing))
 }
 
+#[cfg(test)]
 pub fn compare_beta(
     left: &Array1<f64>,
     right: &Array1<f64>,
@@ -304,6 +314,7 @@ pub fn compare_beta(
     Ok(report)
 }
 
+#[cfg(test)]
 pub fn assert_repeated_fit_beta_equivalent(
     n: usize,
     inner_max_cycles: usize,
