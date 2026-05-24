@@ -63,14 +63,6 @@ pub fn fit_power_law(points: &[(f64, f64)]) -> Option<PowerLawFit> {
     })
 }
 
-pub fn report_power_law(
-    tag: &str,
-    points: &[(f64, f64)],
-    extrapolate: &[(&str, f64)],
-    budget_y: f64,
-) -> Option<PowerLawFit> {
-    report_power_law_full(tag, points, extrapolate, budget_y).map(|r| r.fit)
-}
 
 pub fn report_power_law_full(
     tag: &str,

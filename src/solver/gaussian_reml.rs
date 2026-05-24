@@ -3,7 +3,7 @@ use crate::faer_ndarray::{
     FaerCholesky, FaerEigh, fast_ab, fast_atb, fast_xt_diag_x, fast_xt_diag_y,
 };
 use faer::Side;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis};
 use rayon::prelude::*;
 use std::sync::Once;
 
@@ -1397,7 +1397,7 @@ fn add_reml_rho_gradient_vjp(
             grad_weights,
         );
     }
-    drop(add_ridge_profile_vjp(
+    std::hint::black_box(add_ridge_profile_vjp(
         1.0,
         x,
         y,
