@@ -48,7 +48,7 @@ use crate::smooth::{
 };
 use crate::solver::estimate::validate_all_finite_estimation;
 use crate::types::{InverseLink, LinkFunction, RidgePolicy};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, Axis, s};
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::{HashMap, hash_map::DefaultHasher};
@@ -4617,6 +4617,29 @@ fn mirror_upper_to_lower(target: &mut Array2<f64>) {
     for i in 0..target.nrows() {
         for j in 0..i {
             target[[i, j]] = target[[j, i]];
+        }
+    }
+}
+
+#[inline]
+fn scaled_outer_add(
+    mut target: ArrayViewMut2<'_, f64>,
+    scale: f64,
+    left: ArrayView1<'_, f64>,
+    right: ArrayView1<'_, f64>,
+) {
+    let n_left = left.len();
+    let n_right = right.len();
+    for i in 0..n_left {
+        // SAFETY: `i < left.len()` by loop construction; target rows match the
+        // caller-selected left block.
+        let scaled_left = unsafe { *left.uget(i) } * scale;
+        for j in 0..n_right {
+            // SAFETY: `j < right.len()` by loop construction; target columns
+            // match the caller-selected right block.
+            unsafe {
+                *target.uget_mut((i, j)) += scaled_left * *right.uget(j);
+            }
         }
     }
 }
@@ -19097,6 +19120,16 @@ impl BinomialLocationScaleWiggleFamily {
         let mut r_a = Array2::<f64>::zeros((total, total));
         let mut r_b = Array2::<f64>::zeros((total, total));
         let mut r_ab = Array2::<f64>::zeros((total, total));
+        let mut qw_a = Array1::<f64>::zeros(pw);
+        let mut qw_b = Array1::<f64>::zeros(pw);
+        let mut qw_ab = Array1::<f64>::zeros(pw);
+        let mut q_tw_a = Array1::<f64>::zeros(pw);
+        let mut q_tw_b = Array1::<f64>::zeros(pw);
+        let mut q_lw_a = Array1::<f64>::zeros(pw);
+        let mut q_lw_b = Array1::<f64>::zeros(pw);
+        let mut d0_ab = Array1::<f64>::zeros(pw);
+        let mut q_tw_ab = Array1::<f64>::zeros(pw);
+        let mut q_lw_ab = Array1::<f64>::zeros(pw);
         for row in 0..n {
             let q0 = base_core.q0[row];
             let q = q0 + etaw[row];
@@ -19198,26 +19231,42 @@ impl BinomialLocationScaleWiggleFamily {
                 + m_b * q0_ll_a
                 + m[row] * q0_ll_ab;
 
-            let brow = b0.row(row).to_owned();
-            let drow = d0.row(row).to_owned();
-            let ddrow = dd0.row(row).to_owned();
-            let d3row = d3_basis.row(row).to_owned();
-            let qw_a = &drow * q0_a;
-            let qw_b = &drow * q0_b;
-            let qw_ab = &ddrow * (q0_a * q0_b) + &(&drow * q0_ab);
-            let q_tw_a = &ddrow * (q0_a * q0_geom.q_t) + &(&drow * q0_t_a);
-            let q_tw_b = &ddrow * (q0_b * q0_geom.q_t) + &(&drow * q0_t_b);
-            let q_lw_a = &ddrow * (q0_a * q0_geom.q_ls) + &(&drow * q0_ls_a);
-            let q_lw_b = &ddrow * (q0_b * q0_geom.q_ls) + &(&drow * q0_ls_b);
-            let d0_ab = &d3row * (q0_a * q0_b) + &(&ddrow * q0_ab);
-            let q_tw_ab = &d0_ab * q0_geom.q_t
-                + &(&(&ddrow * q0_b) * q0_t_a)
-                + &(&(&ddrow * q0_a) * q0_t_b)
-                + &(&drow * q0_t_ab);
-            let q_lw_ab = &d0_ab * q0_geom.q_ls
-                + &(&(&ddrow * q0_b) * q0_ls_a)
-                + &(&(&ddrow * q0_a) * q0_ls_b)
-                + &(&drow * q0_ls_ab);
+            let brow = b0.row(row);
+            let drow = d0.row(row);
+            let ddrow = dd0.row(row);
+            let d3row = d3_basis.row(row);
+            qw_a.fill(0.0);
+            qw_a.scaled_add(q0_a, &drow);
+            qw_b.fill(0.0);
+            qw_b.scaled_add(q0_b, &drow);
+            qw_ab.fill(0.0);
+            qw_ab.scaled_add(q0_a * q0_b, &ddrow);
+            qw_ab.scaled_add(q0_ab, &drow);
+            q_tw_a.fill(0.0);
+            q_tw_a.scaled_add(q0_a * q0_geom.q_t, &ddrow);
+            q_tw_a.scaled_add(q0_t_a, &drow);
+            q_tw_b.fill(0.0);
+            q_tw_b.scaled_add(q0_b * q0_geom.q_t, &ddrow);
+            q_tw_b.scaled_add(q0_t_b, &drow);
+            q_lw_a.fill(0.0);
+            q_lw_a.scaled_add(q0_a * q0_geom.q_ls, &ddrow);
+            q_lw_a.scaled_add(q0_ls_a, &drow);
+            q_lw_b.fill(0.0);
+            q_lw_b.scaled_add(q0_b * q0_geom.q_ls, &ddrow);
+            q_lw_b.scaled_add(q0_ls_b, &drow);
+            d0_ab.fill(0.0);
+            d0_ab.scaled_add(q0_a * q0_b, &d3row);
+            d0_ab.scaled_add(q0_ab, &ddrow);
+            q_tw_ab.fill(0.0);
+            q_tw_ab.scaled_add(q0_geom.q_t, &d0_ab);
+            q_tw_ab.scaled_add(q0_b * q0_t_a, &ddrow);
+            q_tw_ab.scaled_add(q0_a * q0_t_b, &ddrow);
+            q_tw_ab.scaled_add(q0_t_ab, &drow);
+            q_lw_ab.fill(0.0);
+            q_lw_ab.scaled_add(q0_geom.q_ls, &d0_ab);
+            q_lw_ab.scaled_add(q0_b * q0_ls_a, &ddrow);
+            q_lw_ab.scaled_add(q0_a * q0_ls_b, &ddrow);
+            q_lw_ab.scaled_add(q0_ls_ab, &drow);
 
             let (loss_1, loss_2, loss_3) = binomial_neglog_q_derivatives_dispatch(
                 self.y[row],
@@ -19251,41 +19300,45 @@ impl BinomialLocationScaleWiggleFamily {
             let xlsab = x_ls_ab_map.row_vector(row)?;
 
             b.fill(0.0);
-            b.slice_mut(s![0..pt]).assign(&(xtr.to_owned() * q_t));
-            b.slice_mut(s![pt..pt + pls])
-                .assign(&(xlsr.to_owned() * q_ls));
+            b.slice_mut(s![0..pt]).scaled_add(q_t, &xtr);
+            b.slice_mut(s![pt..pt + pls]).scaled_add(q_ls, &xlsr);
             b.slice_mut(s![pt + pls..]).assign(&brow);
             c_a.fill(0.0);
-            c_a.slice_mut(s![0..pt])
-                .assign(&(xtr.to_owned() * q_t_a + xta.clone() * q_t));
+            c_a.slice_mut(s![0..pt]).scaled_add(q_t_a, &xtr);
+            c_a.slice_mut(s![0..pt]).scaled_add(q_t, &xta.view());
+            c_a.slice_mut(s![pt..pt + pls]).scaled_add(q_ls_a, &xlsr);
             c_a.slice_mut(s![pt..pt + pls])
-                .assign(&(xlsr.to_owned() * q_ls_a + xlsa.clone() * q_ls));
+                .scaled_add(q_ls, &xlsa.view());
             c_a.slice_mut(s![pt + pls..]).assign(&qw_a);
             c_b.fill(0.0);
-            c_b.slice_mut(s![0..pt])
-                .assign(&(xtr.to_owned() * q_t_b + xtb.clone() * q_t));
+            c_b.slice_mut(s![0..pt]).scaled_add(q_t_b, &xtr);
+            c_b.slice_mut(s![0..pt]).scaled_add(q_t, &xtb.view());
+            c_b.slice_mut(s![pt..pt + pls]).scaled_add(q_ls_b, &xlsr);
             c_b.slice_mut(s![pt..pt + pls])
-                .assign(&(xlsr.to_owned() * q_ls_b + xlsb.clone() * q_ls));
+                .scaled_add(q_ls, &xlsb.view());
             c_b.slice_mut(s![pt + pls..]).assign(&qw_b);
             c_ab.fill(0.0);
-            c_ab.slice_mut(s![0..pt]).assign(
-                &(xtr.to_owned() * q_t_ab
-                    + xta.clone() * q_t_b
-                    + xtb.clone() * q_t_a
-                    + xtab.clone() * q_t),
-            );
-            c_ab.slice_mut(s![pt..pt + pls]).assign(
-                &(xlsr.to_owned() * q_ls_ab
-                    + xlsa.clone() * q_ls_b
-                    + xlsb.clone() * q_ls_a
-                    + xlsab.clone() * q_ls),
-            );
+            c_ab.slice_mut(s![0..pt]).scaled_add(q_t_ab, &xtr);
+            c_ab.slice_mut(s![0..pt])
+                .scaled_add(q_t_b, &xta.view());
+            c_ab.slice_mut(s![0..pt])
+                .scaled_add(q_t_a, &xtb.view());
+            c_ab.slice_mut(s![0..pt])
+                .scaled_add(q_t, &xtab.view());
+            c_ab.slice_mut(s![pt..pt + pls])
+                .scaled_add(q_ls_ab, &xlsr);
+            c_ab.slice_mut(s![pt..pt + pls])
+                .scaled_add(q_ls_b, &xlsa.view());
+            c_ab.slice_mut(s![pt..pt + pls])
+                .scaled_add(q_ls_a, &xlsb.view());
+            c_ab.slice_mut(s![pt..pt + pls])
+                .scaled_add(q_ls, &xlsab.view());
             c_ab.slice_mut(s![pt + pls..]).assign(&qw_ab);
 
-            score_psi_psi += &(loss_1 * &c_ab
-                + loss_2 * q_b * &c_a
-                + loss_2 * q_a * &c_b
-                + (loss_2 * q_ab + loss_3 * q_a * q_b) * &b);
+            score_psi_psi.scaled_add(loss_1, &c_ab);
+            score_psi_psi.scaled_add(loss_2 * q_b, &c_a);
+            score_psi_psi.scaled_add(loss_2 * q_a, &c_b);
+            score_psi_psi.scaled_add(loss_2 * q_ab + loss_3 * q_a * q_b, &b);
 
             q_mat.fill(0.0);
             r_a.fill(0.0);
