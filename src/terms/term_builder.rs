@@ -9,10 +9,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use ndarray::{ArrayView1, Axis};
 
 use crate::basis::{
-    BSplineBasisSpec, BSplineBoundaryCondition, BSplineEndpointCondition, BSplineIdentifiability,
-    BSplineKnotSpec, CenterCountRequest, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
-    DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability, MaternNu,
-    SpatialIdentifiability, ThinPlateBasisSpec, auto_spatial_center_strategy, default_num_centers,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterCountRequest, CenterStrategy,
+    DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec,
+    MaternIdentifiability, MaternNu, OneDimensionalBoundary, SpatialIdentifiability,
+    ThinPlateBasisSpec, auto_spatial_center_strategy, default_num_centers,
     default_spatial_center_strategy, plan_spatial_basis, resolve_duchon_orders,
 };
 use crate::inference::data::{EncodedDataset as Dataset, missing_column_message};
@@ -963,7 +963,7 @@ pub fn build_smooth_basis(
                         },
                         double_penalty: false,
                         identifiability: BSplineIdentifiability::None,
-                        boundary_condition: Default::default(),
+                        boundary: OneDimensionalBoundary::Open,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -976,34 +976,7 @@ pub fn build_smooth_basis(
                 },
             })
         }
-        "periodic" | "cyclic" | "periodic-bspline" | "cc" => {
-            validate_known_options(
-                "periodic",
-                options,
-                &[
-                    "type",
-                    "bs",
-                    "by",
-                    "k",
-                    "basis_dim",
-                    "basis-dim",
-                    "basisdim",
-                    "degree",
-                    "penalty_order",
-                    "period",
-                    "periods",
-                    "period_start",
-                    "period_end",
-                    "origin",
-                    "period_origin",
-                    "period-origin",
-                    "domain_origin",
-                    "double_penalty",
-                    "by",
-                    "id",
-                    "__by_col",
-                ],
-            )?;
+        "bspline" | "ps" | "p-spline" | "cyclic" | "cc" | "cp" | "cyclic-ps" => {
             if cols.len() != 1 {
                 return Err(format!(
                     "periodic smooth expects one variable, got {}",
@@ -1156,7 +1129,14 @@ pub fn build_smooth_basis(
                     knotspec,
                     double_penalty: smooth_double_penalty,
                     identifiability: BSplineIdentifiability::default(),
-                    boundary_condition: parse_bspline_boundary_condition(options)?,
+                    boundary: if matches!(type_opt.as_str(), "cyclic" | "cc" | "cp" | "cyclic-ps") {
+                        OneDimensionalBoundary::Cyclic {
+                            start: minv,
+                            end: maxv,
+                        }
+                    } else {
+                        parse_cyclic_boundary(options, minv, maxv)?
+                    },
                 },
             })
         }
@@ -1504,7 +1484,13 @@ pub fn build_smooth_basis(
                         .map_err(|e| e.to_string())?,
                     aniso_log_scales,
                     operator_penalties,
-                    periodic,
+                    boundary: if cols.len() == 1 {
+                        let c = cols[0];
+                        let (minv, maxv) = col_minmax(ds.values.column(c))?;
+                        parse_cyclic_boundary(options, minv, maxv)?
+                    } else {
+                        OneDimensionalBoundary::Open
+                    },
                 },
                 input_scales: None,
             })
@@ -1893,11 +1879,39 @@ fn has_explicit_countwith_basis_alias(
             .any(|alias| options.contains_key(*alias))
 }
 
-pub fn parse_matern_nu(raw: &str) -> Result<MaternNu, String> {
-    let trimmed = raw.trim();
-    let lower = trimmed.to_ascii_lowercase();
-    if lower == "half" {
-        return Ok(MaternNu::Half);
+pub fn parse_cyclic_boundary(
+    options: &BTreeMap<String, String>,
+    minv: f64,
+    maxv: f64,
+) -> Result<OneDimensionalBoundary, String> {
+    let cyclic = option_bool(options, "cyclic")
+        .or_else(|| option_bool(options, "periodic"))
+        .unwrap_or(false);
+    if !cyclic {
+        return Ok(OneDimensionalBoundary::Open);
+    }
+    let start = option_f64(options, "period_start")
+        .or_else(|| option_f64(options, "start"))
+        .unwrap_or(minv);
+    let end = option_f64(options, "period_end")
+        .or_else(|| option_f64(options, "end"))
+        .unwrap_or(maxv);
+    if end <= start {
+        return Err(format!(
+            "cyclic smooth requires period_end/end ({end}) > period_start/start ({start})"
+        ));
+    }
+    Ok(OneDimensionalBoundary::Cyclic { start, end })
+}
+
+fn parse_matern_nu(raw: &str) -> Result<MaternNu, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1/2" | "0.5" | "half" => Ok(MaternNu::Half),
+        "3/2" | "1.5" => Ok(MaternNu::ThreeHalves),
+        "5/2" | "2.5" => Ok(MaternNu::FiveHalves),
+        "7/2" | "3.5" => Ok(MaternNu::SevenHalves),
+        "9/2" | "4.5" => Ok(MaternNu::NineHalves),
+        _ => Err(format!("unsupported Matern nu '{raw}'")),
     }
 
     let value = if let Some((num, den)) = trimmed.split_once('/') {
