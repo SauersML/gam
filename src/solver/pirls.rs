@@ -9272,7 +9272,7 @@ pub fn update_glmvectors(
                         y[i],
                         priorweights[i],
                         jet,
-                        /* freeze higher η-derivatives on nonsmooth regions */ true,
+                        true,
                     );
                     *mu_o = geom.mu;
                     *w_o = geom.weight;

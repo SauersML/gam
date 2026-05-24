@@ -375,15 +375,7 @@ pub enum LatentIftOutcome {
     Applied { delta_t: Array1<f64> },
     /// Predictor declined (no cache, dim mismatch, or non-finite input).
     /// Caller should fall back to a from-scratch latent inner solve.
-    /// `reason` is a stable string ID for diagnostics; the
-    /// `#[allow(dead_code)]` is required because the crate-wide
-    /// `deny(dead_code)` lint cannot see that this field is consumed
-    /// only by opt-in verbose IFT logging (Piece 2 driver integration,
-    /// not yet wired into the production REML loop).
-    Noop {
-        #[allow(dead_code)]
-        reason: &'static str,
-    },
+    Noop,
 }
 
 /// Predict the analytic shift in the latent field `t̂` induced by a
@@ -444,38 +436,26 @@ pub fn ift_warm_start_latent(
     let k = cache.k;
 
     if delta_beta.is_none() && delta_gt.is_none() {
-        return LatentIftOutcome::Noop {
-            reason: "no-perturbation: both delta_beta and delta_gt are None",
-        };
+        return LatentIftOutcome::Noop;
     }
     if let Some(db) = delta_beta.as_ref() {
         if db.len() != k {
-            return LatentIftOutcome::Noop {
-                reason: "delta_beta length mismatch with cached K",
-            };
+            return LatentIftOutcome::Noop;
         }
         if db.iter().any(|v| !v.is_finite()) {
-            return LatentIftOutcome::Noop {
-                reason: "delta_beta contains non-finite entries",
-            };
+            return LatentIftOutcome::Noop;
         }
     }
     if let Some(dg) = delta_gt.as_ref() {
         if dg.len() != n * d {
-            return LatentIftOutcome::Noop {
-                reason: "delta_gt length mismatch with cached N·d",
-            };
+            return LatentIftOutcome::Noop;
         }
         if dg.iter().any(|v| !v.is_finite()) {
-            return LatentIftOutcome::Noop {
-                reason: "delta_gt contains non-finite entries",
-            };
+            return LatentIftOutcome::Noop;
         }
     }
     if cache.htt_factors_undamped.len() != n || cache.htbeta.len() != n {
-        return LatentIftOutcome::Noop {
-            reason: "cache block counts mismatch across damped, undamped, and H_tβ factors",
-        };
+        return LatentIftOutcome::Noop;
     }
     for factor in cache
         .htt_factors
@@ -483,15 +463,11 @@ pub fn ift_warm_start_latent(
         .chain(cache.htt_factors_undamped.iter())
     {
         if factor.dim() != (d, d) {
-            return LatentIftOutcome::Noop {
-                reason: "cached H_tt factor shape mismatch",
-            };
+            return LatentIftOutcome::Noop;
         }
     }
     if cache.htbeta.iter().any(|block| block.dim() != (d, k)) {
-        return LatentIftOutcome::Noop {
-            reason: "cached H_tβ block shape mismatch",
-        };
+        return LatentIftOutcome::Noop;
     }
 
     // Sum the two contributions on the RHS, then per-row solve.
