@@ -1197,7 +1197,14 @@ fn batched_inverse_hessians_from_caches(
         .collect()
 }
 
-fn add_ridge_profile_vjp(
+/// Side-effects of the ridge-profile VJP that are independent of λ.
+///
+/// Computes the KKT adjoint `m = M^{-1} u` for `u = upstream_beta` and accumulates
+/// the partials w.r.t. `X`, `y`, `S`, and `w` into the provided gradient buffers.
+/// Returns `m` so callers that also need `∂L/∂λ` can fold in the λ-adjoint dot
+/// product `−scale · ⟨m, S β⟩` without recomputing the adjoint solve.
+#[allow(clippy::too_many_arguments)]
+fn ridge_profile_vjp_data_partials(
     scale: f64,
     x: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,
@@ -1211,7 +1218,7 @@ fn add_ridge_profile_vjp(
     grad_y: &mut Array2<f64>,
     grad_penalty: &mut Array2<f64>,
     grad_weights: &mut Array1<f64>,
-) -> f64 {
+) -> Array2<f64> {
     let m = dense_ab(inverse_hessian.view(), upstream_beta);
     let c = dense_ab(m.view(), beta.t());
     let c_sym = &c + &c.t();
@@ -1245,7 +1252,6 @@ fn add_ridge_profile_vjp(
         grad_weights[i] += scale * (from_b - from_a);
     }
 
-    let penalty_beta = dense_ab(penalty, beta.view());
     for row in 0..penalty.nrows() {
         for col in 0..penalty.ncols() {
             let mut value = 0.0;
@@ -1255,11 +1261,88 @@ fn add_ridge_profile_vjp(
             grad_penalty[[row, col]] -= scale * lambda * value;
         }
     }
-    -scale
-        * m.iter()
-            .zip(penalty_beta.iter())
-            .map(|(left, right)| left * right)
-            .sum::<f64>()
+    m
+}
+
+/// Ridge-profile VJP for callers that also need `∂L/∂λ`.
+///
+/// Accumulates the data/penalty/weight partials and adds the implicit-function
+/// λ-adjoint contribution `−scale · ⟨M^{-1} u, S β⟩` into `lambda_adjoint_out`.
+#[allow(clippy::too_many_arguments)]
+fn add_ridge_profile_vjp_with_lambda_grad(
+    scale: f64,
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: &Array1<f64>,
+    lambda: f64,
+    inverse_hessian: &Array2<f64>,
+    beta: &Array2<f64>,
+    upstream_beta: ArrayView2<'_, f64>,
+    grad_x: &mut Array2<f64>,
+    grad_y: &mut Array2<f64>,
+    grad_penalty: &mut Array2<f64>,
+    grad_weights: &mut Array1<f64>,
+    lambda_adjoint_out: &mut f64,
+) {
+    let m = ridge_profile_vjp_data_partials(
+        scale,
+        x,
+        y,
+        penalty,
+        weights,
+        lambda,
+        inverse_hessian,
+        beta,
+        upstream_beta,
+        grad_x,
+        grad_y,
+        grad_penalty,
+        grad_weights,
+    );
+    let penalty_beta = dense_ab(penalty, beta.view());
+    let dot = m
+        .iter()
+        .zip(penalty_beta.iter())
+        .map(|(left, right)| left * right)
+        .sum::<f64>();
+    *lambda_adjoint_out += -scale * dot;
+}
+
+/// Ridge-profile VJP for callers that hold λ fixed (e.g. the implicit-root
+/// partial inside `add_reml_rho_gradient_vjp`). The λ-adjoint dot product is
+/// skipped entirely — it would be unused work in this branch.
+#[allow(clippy::too_many_arguments)]
+fn add_ridge_profile_vjp_fixed_lambda(
+    scale: f64,
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: &Array1<f64>,
+    lambda: f64,
+    inverse_hessian: &Array2<f64>,
+    beta: &Array2<f64>,
+    upstream_beta: ArrayView2<'_, f64>,
+    grad_x: &mut Array2<f64>,
+    grad_y: &mut Array2<f64>,
+    grad_penalty: &mut Array2<f64>,
+    grad_weights: &mut Array1<f64>,
+) {
+    ridge_profile_vjp_data_partials(
+        scale,
+        x,
+        y,
+        penalty,
+        weights,
+        lambda,
+        inverse_hessian,
+        beta,
+        upstream_beta,
+        grad_x,
+        grad_y,
+        grad_penalty,
+        grad_weights,
+    );
 }
 
 fn add_reml_score_vjp(
