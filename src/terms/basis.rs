@@ -26,22 +26,26 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use thiserror::Error;
 
-/// Wrapper to send a raw pointer across thread boundaries.
-/// SAFETY: the caller must ensure the pointer targets disjoint memory per thread.
+/// Wrapper to send a raw pointer across thread boundaries for parallel buffer fills.
+/// SAFETY: every `SendPtr` value must be built from live, properly aligned `f64`
+/// storage whose mutable borrow is held until all worker threads finish; callers
+/// may only dereference offsets that are in-bounds and disjoint across workers.
 #[derive(Clone, Copy)]
 struct SendPtr(*mut f64);
-// SAFETY: the pointer is only ever dereferenced through SendPtr::add at
-// per-thread-disjoint offsets, as enforced by the par_iter callers.
+// SAFETY: SendPtr only grants raw-pointer transport. Actual dereferences occur
+// at call sites after row-chunk partitioning proves each thread writes a
+// distinct in-bounds element of the backing Array/Vec allocation.
 unsafe impl Send for SendPtr {}
-// SAFETY: same disjoint-offset rationale as the Send impl above.
+// SAFETY: shared references to SendPtr are sound because the pointee is never
+// accessed through the wrapper without the call-site disjoint-offset proof.
 unsafe impl Sync for SendPtr {}
 
 impl SendPtr {
     #[inline(always)]
     fn add(self, offset: usize) -> *mut f64 {
-        // SAFETY: callers add offsets within the bounds of the buffer the
-        // raw pointer was constructed from; the worker partitioning at the
-        // top of each par_iter ensures distinct workers use distinct ranges.
+        // SAFETY: callers pass offsets within the backing allocation and only
+        // dereference the returned pointer after proving the target element is
+        // uniquely owned by that worker's chunk for the whole parallel region.
         unsafe { self.0.add(offset) }
     }
 }
@@ -3296,7 +3300,8 @@ impl StreamingRadialState {
             | StreamingAxisMode::ScalarTotal { metric_weights } => metric_weights,
         };
         let dim = metric_weights.len();
-        debug_assert!(dim <= self.data.ncols() && dim <= self.centers.ncols());
+        debug_assert_eq!(dim, self.data.ncols());
+        debug_assert_eq!(dim, self.centers.ncols());
 
         // SERIAL fill: `ensure_triplet_cache` is called from inside outer
         // `into_par_iter` workers (e.g. the per-axis cross-trace sweep at
@@ -3312,9 +3317,9 @@ impl StreamingRadialState {
             for j in 0..n_knots {
                 let mut r2 = 0.0_f64;
                 for a in 0..dim {
-                    // i < n ≤ data.nrows(), j < n_knots ≤ centers.nrows(), and
-                    // a < dim ≤ min(data.ncols(), centers.ncols()) per the
-                    // debug_assert above, so both uget reads stay in-bounds.
+                    // Streaming constructors set n=data.nrows(), n_knots=centers.nrows(),
+                    // and require dim=data.ncols()=centers.ncols(); the loop ranges
+                    // therefore keep both uget reads in-bounds.
                     let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) }; // SAFETY: bounds per the comment immediately above
                     r2 += metric_weights[a] * h * h;
                 }
@@ -3338,9 +3343,10 @@ impl StreamingRadialState {
                 let dim = metric_weights.len();
                 debug_assert_eq!(s_buf.len(), dim);
                 for a in 0..dim {
-                    // SAFETY: callers pass i < data.nrows() and j <
-                    // centers.nrows() (per ensure_triplet_cache's outer
-                    // bounds); a < dim ≤ min(data.ncols(), centers.ncols()).
+                    // SAFETY: compute_pair/ensure_triplet_cache callers pass
+                    // i < data.nrows() and j < centers.nrows(); streaming
+                    // constructors require dim=data.ncols()=centers.ncols(),
+                    // and this loop has a < dim.
                     let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) };
                     s_buf[a] = metric_weights[a] * h * h;
                 }
@@ -4128,6 +4134,12 @@ impl ImplicitDesignPsiDerivative {
         let n_axes = data.ncols();
         let psi_scale_share = radial_kind.raw_psi_isotropic_share();
         assert_eq!(eta.len(), n_axes);
+        assert_eq!(
+            centers.ncols(),
+            n_axes,
+            "streaming radial centers have {} columns but data/eta have {n_axes}",
+            centers.ncols()
+        );
         let metric_weights: Arc<[f64]> = Arc::from(centered_aniso_metric_weights(&eta));
         Self {
             // Empty arrays -- not used in streaming mode.
@@ -4169,6 +4181,12 @@ impl ImplicitDesignPsiDerivative {
         let n_knots = centers.nrows();
         let dim = data.ncols();
         assert_eq!(eta.len(), dim);
+        assert_eq!(
+            centers.ncols(),
+            dim,
+            "streaming scalar radial centers have {} columns but data/eta have {dim}",
+            centers.ncols()
+        );
         let metric_weights: Arc<[f64]> = Arc::from(centered_aniso_metric_weights(&eta));
         Self {
             phi_values: Array1::<f64>::zeros(0),
@@ -5823,7 +5841,14 @@ fn build_aniso_design_psi_derivatives_shared(
     // Allocate O(n*k) arrays up front and fill with parallel chunks that
     // write directly into preallocated storage via raw pointers. No
     // intermediate Vec<(i, q_row, t_row, s_row)> collection.
-    let nk = n * k;
+    let nk = n.checked_mul(k).ok_or_else(|| {
+        BasisError::InvalidInput("aniso radial cache has too many data-center pairs".to_string())
+    })?;
+    if nk.checked_mul(dim).is_none() {
+        return Err(BasisError::InvalidInput(
+            "aniso radial cache axis component storage is too large".to_string(),
+        ));
+    }
     let mut phi_values = Array1::<f64>::zeros(nk);
     let mut q_values = Array1::<f64>::zeros(nk);
     let mut t_values = Array1::<f64>::zeros(nk);
@@ -5832,7 +5857,7 @@ fn build_aniso_design_psi_derivatives_shared(
     let psi_scale_share = radial_kind.raw_psi_isotropic_share();
 
     let cs = IMPLICIT_MATVEC_CHUNK_SIZE;
-    let nc = (n + cs - 1) / cs;
+    let nc = n.div_ceil(cs);
     let err_flag = std::sync::atomic::AtomicBool::new(false);
     {
         let pp = SendPtr(phi_values.as_mut_ptr());
@@ -5862,9 +5887,11 @@ fn build_aniso_design_psi_derivatives_shared(
                         }
                     };
                     let flat = i * k + j;
-                    // SAFETY: chunk owns rows [start..end) of preallocated
-                    // nk-long phi/q/t buffers (and nk×dim axis_components); flat = i*k+j
-                    // and flat*dim+a stay in-bounds and per-chunk writes are disjoint.
+                    // SAFETY: nk=n*k and nk*dim were checked above, the Array1/Array2
+                    // buffers are owned and contiguous, and each Rayon chunk owns a
+                    // disjoint i-row range. Thus flat=i*k+j is in-bounds for phi/q/t,
+                    // flat*dim+a is in-bounds for axis_components, and no two workers
+                    // write the same offset.
                     unsafe {
                         *pp.add(flat) = phi;
                         *qp.add(flat) = q;
@@ -5988,7 +6015,9 @@ fn build_scalar_design_psi_derivatives_shared(
         });
     }
 
-    let nk = n * k;
+    let nk = n.checked_mul(k).ok_or_else(|| {
+        BasisError::InvalidInput("scalar radial cache has too many data-center pairs".to_string())
+    })?;
     let mut phi_values = Array1::<f64>::zeros(nk);
     let mut q_values = Array1::<f64>::zeros(nk);
     let mut t_values = Array1::<f64>::zeros(nk);
@@ -6033,9 +6062,10 @@ fn build_scalar_design_psi_derivatives_shared(
                         }
                     };
                     let flat = i * k + j;
-                    // SAFETY: per-chunk row ownership ensures the flat =
-                    // i*k+j offsets are pairwise disjoint across workers
-                    // and stay within the nk-long phi/q/t/axis buffers.
+                    // SAFETY: nk=n*k was checked above, the owned phi/q/t buffers and
+                    // one-column axis_components buffer are contiguous, and each Rayon
+                    // chunk owns a disjoint i-row range. Thus flat=i*k+j is in-bounds
+                    // for every write below and no two workers write the same offset.
                     unsafe {
                         *pp.add(flat) = phi;
                         *qp.add(flat) = q;
