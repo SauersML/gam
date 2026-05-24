@@ -7506,13 +7506,13 @@ impl TransformationNormalFamily {
         let projected_cov_f = match projected_cov_f {
             Some(view) => {
                 if view.nrows() != n || view.ncols() != projected_len {
-                    return Err(TransformationNormalError::InvalidInput { reason: format!(
+                    return Err(format!(
                         "SCOP psi Hessian directional projected cov-factor shape {}x{} != expected {}x{}",
                         view.nrows(),
                         view.ncols(),
                         n,
                         projected_len
-                    ) }.into());
+                    ));
                 }
                 view
             }
@@ -7533,13 +7533,13 @@ impl TransformationNormalFamily {
         let projected_psi_f = match projected_psi_f {
             Some(view) => {
                 if view.nrows() != n || view.ncols() != projected_len {
-                    return Err(TransformationNormalError::InvalidInput { reason: format!(
+                    return Err(format!(
                         "SCOP psi Hessian directional projected psi-factor shape {}x{} != expected {}x{}",
                         view.nrows(),
                         view.ncols(),
                         n,
                         projected_len
-                    ) }.into());
+                    ));
                 }
                 view
             }
