@@ -12259,7 +12259,7 @@ mod tests {
                             identifiability: BSplineIdentifiability::default(),
                             boundary: OneDimensionalBoundary::Open,
                             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
+                            streaming_chunk_size: None,
                         },
                     },
                     shape: gam::smooth::ShapeConstraint::None,

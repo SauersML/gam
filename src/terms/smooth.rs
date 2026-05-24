@@ -764,7 +764,9 @@ impl TermCollectionSpec {
                     }
                 }
                 SmoothBasisSpec::Sphere { spec, .. } => {
-                    if spec.max_degree == 0 {
+                    if matches!(spec.method, crate::basis::SphereMethod::Harmonic)
+                        && spec.max_degree.is_none_or(|d| d == 0)
+                    {
                         return Err(format!(
                             "{label} term '{}' is not frozen: sphere max_degree must be positive",
                             st.name
@@ -3960,7 +3962,6 @@ fn build_shape_constraint_design_1d(
                 knots,
                 identifiability_transform,
                 periodic,
-                ..
             },
         ) => {
             let evalspec = BSplineBasisSpec {
@@ -3983,7 +3984,7 @@ fn build_shape_constraint_design_1d(
                     .unwrap_or(BSplineIdentifiability::None),
                 boundary: spec.boundary.clone(),
                 boundary_conditions: BSplineBoundaryConditions::default(),
-                streaming_chunk_size: None,
+                streaming_chunk_size: spec.streaming_chunk_size,
             };
             build_bspline_basis_1d(x_grid.view(), &evalspec)?
                 .design
@@ -4534,7 +4535,7 @@ fn build_factor_smooth_basis(
                 feature_cols: vec![continuous_col, spec.group_col],
                 knots: vec![],
                 degrees: vec![],
-                periodic: vec![],
+                periods: vec![],
                 identifiability_transform: None,
             },
         ),
@@ -5247,7 +5248,6 @@ fn bspline_boundary_linear_constraints(
         knots,
         identifiability_transform,
         periodic: _,
-        ..
     } = metadata
     else {
         return Err(BasisError::InvalidInput(
@@ -6456,8 +6456,8 @@ fn build_smooth_design_withworkspace_unvalidated(
     let mut linear_constraints_b: Vec<f64> = Vec::new();
 
     let mut col_start = 0usize;
-    for ((idx, term), mut built) in terms.iter().enumerate().zip(local_builds.into_iter()) {
-        let p_local = local_dims[idx];
+    for (term, mut built) in terms.iter().zip(local_builds.into_iter()) {
+        let p_local = built.dim;
         let col_end = col_start + p_local;
         let lb_local = if built.box_reparam {
             shape_lower_bounds_local(term.shape, p_local)
@@ -7748,11 +7748,9 @@ fn with_identifiability_transform(
             knots,
             identifiability_transform,
             periodic,
-            streaming_chunk_size,
         } => Ok(BasisMetadata::BSpline1D {
             knots: knots.clone(),
             periodic: *periodic,
-            streaming_chunk_size: *streaming_chunk_size,
             identifiability_transform: compose_identifiability_transforms(
                 identifiability_transform.as_ref(),
                 transform,
@@ -14814,16 +14812,10 @@ impl SingleBlockLatentCoordDesignCache {
                     ..
                 },
             ) => {
-                if !power.is_finite() || *power < 0.0 || power.fract() != 0.0 {
-                    return Err(SmoothError::invalid_config(format!(
-                        "latent-coordinate Duchon cache key requires whole nonnegative power; got {power}"
-                    ))
-                    .into());
-                }
                 Ok(crate::solver::latent_cache::LatentBasisKind::Duchon {
                     centers: centers.clone(),
                     length_scale: *length_scale,
-                    power: *power as usize,
+                    power: *power,
                     nullspace_order: *nullspace_order,
                     aniso_log_scales: aniso_log_scales
                         .clone()
@@ -14849,10 +14841,7 @@ impl SingleBlockLatentCoordDesignCache {
             (
                 SmoothBasisSpec::BSpline1D { spec, .. },
                 BasisMetadata::BSpline1D {
-                    knots,
-                    periodic,
-                    streaming_chunk_size,
-                    ..
+                    knots, periodic, ..
                 },
             ) => {
                 if let Some((domain_start, period, num_basis)) = periodic {
@@ -14861,13 +14850,11 @@ impl SingleBlockLatentCoordDesignCache {
                         period: *period,
                         degree: spec.degree,
                         num_basis: *num_basis,
-                        chunk_size: *streaming_chunk_size,
                     })
                 } else {
                     Ok(crate::solver::latent_cache::LatentBasisKind::TensorBspline {
                         knots: vec![knots.clone()],
                         degrees: vec![spec.degree],
-                        chunk_size: *streaming_chunk_size,
                     })
                 }
             }
@@ -14877,7 +14864,6 @@ impl SingleBlockLatentCoordDesignCache {
             ) => Ok(crate::solver::latent_cache::LatentBasisKind::TensorBspline {
                 knots: knots.clone(),
                 degrees: degrees.clone(),
-                chunk_size: None,
             }),
             (
                 SmoothBasisSpec::Pca { .. },
@@ -16144,7 +16130,6 @@ fn freeze_inner_smooth_basis_from_metadata(
                 knots,
                 identifiability_transform,
                 periodic,
-                streaming_chunk_size,
             },
         ) => {
             s.knotspec = periodic
@@ -16161,7 +16146,6 @@ fn freeze_inner_smooth_basis_from_metadata(
                     transform: z.clone(),
                 })
                 .unwrap_or(BSplineIdentifiability::None);
-            s.streaming_chunk_size = *streaming_chunk_size;
             s.boundary_conditions = Default::default();
             Ok(())
         }
@@ -16257,7 +16241,6 @@ pub fn freeze_term_collection_from_design(
                     knots,
                     identifiability_transform,
                     periodic,
-                    streaming_chunk_size,
                 },
             ) => {
                 s.knotspec = periodic
@@ -16274,7 +16257,6 @@ pub fn freeze_term_collection_from_design(
                     },
                     None => BSplineIdentifiability::None,
                 };
-                s.streaming_chunk_size = *streaming_chunk_size;
                 // Boundary projections are folded into `identifiability_transform`
                 // by `build_bspline_basis_1d`. A frozen prediction spec must
                 // rebuild the same raw knot basis and apply the captured
@@ -16478,14 +16460,20 @@ pub fn freeze_term_collection_from_design(
                 *feature_cols = fitted_cols.clone();
                 for i in 0..s.marginalspecs.len() {
                     s.marginalspecs[i].degree = degrees[i];
-                    s.marginalspecs[i].knotspec = periodic[i]
-                        .map(
-                            |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
+                    s.marginalspecs[i].knotspec = match (periods[i], knots[i].len()) {
+                        (Some(period), num_basis) if num_basis >= 1 => {
+                            // Periodic uniform reconstructs the open
+                            // `[start, start + period)` data range from the
+                            // first knot and the saved period. `knots[i].len()`
+                            // is the periodic control-site count.
+                            let domain_start = knots[i][0];
+                            BSplineKnotSpec::PeriodicUniform {
                                 data_range: (domain_start, domain_start + period),
                                 num_basis,
-                            },
-                        )
-                        .unwrap_or_else(|| BSplineKnotSpec::Provided(knots[i].clone()));
+                            }
+                        }
+                        _ => BSplineKnotSpec::Provided(knots[i].clone()),
+                    };
                 }
                 s.periods = periods.clone();
                 s.identifiability = match identifiability_transform {
@@ -16544,7 +16532,6 @@ pub fn freeze_term_collection_from_design(
                         knots,
                         periodic,
                         identifiability_transform,
-                        streaming_chunk_size,
                     } = metadata
                 {
                     inner.knotspec = periodic
@@ -16561,7 +16548,6 @@ pub fn freeze_term_collection_from_design(
                         },
                         None => BSplineIdentifiability::None,
                     };
-                    inner.streaming_chunk_size = *streaming_chunk_size;
                 }
             }
             _ => {
@@ -19159,7 +19145,6 @@ mod tests {
                         right: BSplineEndpointBoundaryCondition::Clamped,
                     },
                     boundary: OneDimensionalBoundary::Open,
-                    streaming_chunk_size: None,
                 },
             },
             shape: ShapeConstraint::None,
@@ -19229,7 +19214,6 @@ mod tests {
                         right: BSplineEndpointBoundaryCondition::Free,
                     },
                     boundary: OneDimensionalBoundary::Open,
-                    streaming_chunk_size: None,
                 },
             },
             shape: ShapeConstraint::None,
@@ -19646,7 +19630,6 @@ mod tests {
                         identifiability: BSplineIdentifiability::default(),
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -19962,7 +19945,6 @@ mod tests {
                     identifiability: BSplineIdentifiability::default(),
                     boundary: OneDimensionalBoundary::Open,
                     boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
                 },
             },
             shape: ShapeConstraint::MonotoneIncreasing,
@@ -20057,7 +20039,6 @@ mod tests {
                         identifiability: BSplineIdentifiability::default(),
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -20429,7 +20410,6 @@ mod tests {
                         identifiability: BSplineIdentifiability::default(),
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -20557,7 +20537,6 @@ mod tests {
                     identifiability: BSplineIdentifiability::default(),
                     boundary: OneDimensionalBoundary::Open,
                     boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
                 },
             },
             shape: ShapeConstraint::None,
@@ -20708,7 +20687,6 @@ mod tests {
                             identifiability: BSplineIdentifiability::default(),
                             boundary: OneDimensionalBoundary::Open,
                             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
                         },
                     },
                     shape: ShapeConstraint::None,
@@ -21364,7 +21342,6 @@ mod tests {
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
         let spec_y = BSplineBasisSpec {
             degree: 3,
@@ -21377,7 +21354,6 @@ mod tests {
             identifiability: BSplineIdentifiability::default(),
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
 
         let terms = vec![SmoothTermSpec {
@@ -21438,7 +21414,6 @@ mod tests {
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::default(),
                             boundary_conditions: Default::default(),
-            streaming_chunk_size: None,
                             boundary: OneDimensionalBoundary::Open,
                         },
                         BSplineBasisSpec {
@@ -21451,7 +21426,6 @@ mod tests {
                             double_penalty: false,
                             identifiability: BSplineIdentifiability::default(),
                             boundary_conditions: Default::default(),
-            streaming_chunk_size: None,
                             boundary: OneDimensionalBoundary::Open,
                         },
                     ],
@@ -21499,7 +21473,6 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
-            streaming_chunk_size: None,
             boundary: OneDimensionalBoundary::Open,
         };
         let built = build_bspline_basis_1d(x.view(), &spec).expect("periodic bspline");
@@ -21538,7 +21511,6 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
-            streaming_chunk_size: None,
             boundary: OneDimensionalBoundary::Open,
         };
         let spec_hour = BSplineBasisSpec {
@@ -21551,7 +21523,6 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
-            streaming_chunk_size: None,
             boundary: OneDimensionalBoundary::Open,
         };
         let spec_collection = TermCollectionSpec {
@@ -21616,7 +21587,6 @@ mod tests {
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
         let spec_y = BSplineBasisSpec {
             degree: 3,
@@ -21629,7 +21599,6 @@ mod tests {
             identifiability: BSplineIdentifiability::None,
             boundary: OneDimensionalBoundary::Open,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
         };
         let mx = build_bspline_basis_1d(data.column(0), &spec_x)
             .unwrap()
@@ -21682,7 +21651,6 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
             boundary: OneDimensionalBoundary::Cyclic {
                 start: 0.0,
                 end: 7.0,
@@ -21698,7 +21666,6 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
             boundary: OneDimensionalBoundary::Cyclic {
                 start: 0.0,
                 end: 24.0,
@@ -21758,7 +21725,6 @@ mod tests {
                             identifiability: BSplineIdentifiability::default(),
                             boundary: OneDimensionalBoundary::Open,
                             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
                         },
                         BSplineBasisSpec {
                             degree: 3,
@@ -21771,7 +21737,6 @@ mod tests {
                             identifiability: BSplineIdentifiability::default(),
                             boundary: OneDimensionalBoundary::Open,
                             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
                         },
                     ],
                     double_penalty: false,
@@ -23453,7 +23418,6 @@ mod tests {
                         identifiability: BSplineIdentifiability::default(),
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
                     },
                 },
                 shape: ShapeConstraint::None,
@@ -23729,7 +23693,6 @@ mod tests {
                     identifiability: BSplineIdentifiability::None,
                     boundary: OneDimensionalBoundary::Open,
                     boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
                 },
             },
             shape: ShapeConstraint::None,
@@ -23910,7 +23873,6 @@ mod tests {
                             identifiability: BSplineIdentifiability::None,
                             boundary: OneDimensionalBoundary::Open,
                             boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
                         },
                     },
                     shape: ShapeConstraint::MonotoneIncreasing,
@@ -24268,7 +24230,6 @@ mod tests {
                             weights: None,
                         },
                         boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
                         boundary: OneDimensionalBoundary::Open,
                     },
                 },
@@ -25765,7 +25726,6 @@ mod tests {
                         identifiability: BSplineIdentifiability::None,
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
-            streaming_chunk_size: None,
                     },
                 },
                 shape: ShapeConstraint::None,
