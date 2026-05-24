@@ -7837,9 +7837,9 @@ fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodFamily) -> O
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SavedFitSummary {
-    likelihood_family: Option<LikelihoodFamily>,
+    likelihood_family: Option<LikelihoodSpec>,
     likelihood_scale: LikelihoodScaleMetadata,
     log_likelihood_normalization: LogLikelihoodNormalization,
     log_likelihood: f64,
@@ -7871,7 +7871,7 @@ impl SavedFitSummary {
             .flat_map(|b| b.eta.iter())
             .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         Self {
-            likelihood_family: fit.likelihood_family,
+            likelihood_family: Some(fit.likelihood_family.clone()),
             likelihood_scale: fit.likelihood_scale,
             log_likelihood_normalization: fit.log_likelihood_normalization,
             log_likelihood: fit.log_likelihood,
@@ -9991,7 +9991,10 @@ mod tests {
 
     fn saved_fit_summary_fixture() -> SavedFitSummary {
         SavedFitSummary {
-            likelihood_family: Some(LikelihoodFamily::GaussianIdentity),
+            likelihood_family: Some(LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            )),
             likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
             log_likelihood_normalization: LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,

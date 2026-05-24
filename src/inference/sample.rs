@@ -447,7 +447,6 @@ fn sample_standard(
             cfg,
         );
     }
-    let family = likelihood.as_likelihood_family();
     let parsed = parse_formula(&model.formula)?;
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = data.column(y_col).to_owned();
@@ -469,7 +468,7 @@ fn sample_standard(
         weights.view(),
         offset.view(),
         &design.penalties,
-        family,
+        likelihood.clone(),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -502,7 +501,7 @@ fn sample_standard(
         weighted_blockwise_penalty_sum(&design.penalties, fit.lambdas.as_slice().unwrap(), p);
 
     run_nuts_sampling_flattened_family(
-        family,
+        likelihood,
         FamilyNutsInputs::Glm(GlmFlatInputs {
             x: dense_design_hmc.view(),
             y: y.view(),
