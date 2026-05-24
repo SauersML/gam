@@ -22065,15 +22065,12 @@ mod tests {
             data[[i, 0]] = t;
             let eta = 1.4 * (2.0 * std::f64::consts::PI * t).sin() + 0.5 * (t - 0.5);
             let raw = eta + 0.7 * (3.7 * (i as f64) + 1.0).sin();
-            y[i] = match family {
-                LikelihoodFamily::GaussianIdentity => raw,
-                _ => {
-                    if raw > 0.0 {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }
+            y[i] = if family.is_gaussian_identity() {
+                raw
+            } else if raw > 0.0 {
+                1.0
+            } else {
+                0.0
             };
         }
         let weights = Array1::ones(n);

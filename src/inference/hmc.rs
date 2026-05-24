@@ -5377,9 +5377,12 @@ impl JointBetaRhoPosterior {
         let eta = crate::faer_ndarray::fast_av(self.data.x.as_ref(), &beta);
 
         // ---- Log-likelihood ℓ(y|β) and ∇_β ℓ ----
+        let step_likelihood = LikelihoodSpec {
+            response: self.likelihood.response.clone(),
+            link: inverse_link,
+        };
         let (ll, mut grad_ll_beta, grad_link) = match joint_family_logp_grad_and_link_grad(
-            self.likelihood_family,
-            &inverse_link,
+            &step_likelihood,
             &self.data,
             &eta,
             n_link_params,
