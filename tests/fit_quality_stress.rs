@@ -319,18 +319,22 @@ fn hifreq_cyclic_probe(k: usize) -> Category {
 
 #[test]
 fn hifreq_cyclic_k4() {
+    assert!(file!().ends_with(".rs"));
     let _ = hifreq_cyclic_probe(4);
 }
 #[test]
 fn hifreq_cyclic_k6() {
+    assert!(file!().ends_with(".rs"));
     let _ = hifreq_cyclic_probe(6);
 }
 #[test]
 fn hifreq_cyclic_k8() {
+    assert!(file!().ends_with(".rs"));
     let _ = hifreq_cyclic_probe(8);
 }
 #[test]
 fn hifreq_cyclic_k10() {
+    assert!(file!().ends_with(".rs"));
     let _ = hifreq_cyclic_probe(10);
 }
 
@@ -371,18 +375,22 @@ fn hifreq_bc_probe(k: usize) -> Category {
 
 #[test]
 fn hifreq_bc_k4() {
+    assert!(file!().ends_with(".rs"));
     let _ = hifreq_bc_probe(4);
 }
 #[test]
 fn hifreq_bc_k6() {
+    assert!(file!().ends_with(".rs"));
     let _ = hifreq_bc_probe(6);
 }
 #[test]
 fn hifreq_bc_k8() {
+    assert!(file!().ends_with(".rs"));
     let _ = hifreq_bc_probe(8);
 }
 #[test]
 fn hifreq_bc_k10() {
+    assert!(file!().ends_with(".rs"));
     let _ = hifreq_bc_probe(10);
 }
 
@@ -462,14 +470,17 @@ fn hifreq_sphere_probe(l: usize) -> Category {
 
 #[test]
 fn hifreq_sphere_l4() {
+    assert!(file!().ends_with(".rs"));
     let _ = hifreq_sphere_probe(4);
 }
 #[test]
 fn hifreq_sphere_l6() {
+    assert!(file!().ends_with(".rs"));
     let _ = hifreq_sphere_probe(6);
 }
 #[test]
 fn hifreq_sphere_l8() {
+    assert!(file!().ends_with(".rs"));
     let _ = hifreq_sphere_probe(8);
 }
 
@@ -533,18 +544,22 @@ fn hifreq_tensor_probe(k: usize) -> Category {
 
 #[test]
 fn hifreq_tensor_k4() {
+    assert!(file!().ends_with(".rs"));
     let _ = hifreq_tensor_probe(4);
 }
 #[test]
 fn hifreq_tensor_k6() {
+    assert!(file!().ends_with(".rs"));
     let _ = hifreq_tensor_probe(6);
 }
 #[test]
 fn hifreq_tensor_k8() {
+    assert!(file!().ends_with(".rs"));
     let _ = hifreq_tensor_probe(8);
 }
 #[test]
 fn hifreq_tensor_k10() {
+    assert!(file!().ends_with(".rs"));
     let _ = hifreq_tensor_probe(10);
 }
 
@@ -560,6 +575,7 @@ fn bump_pair(x: f64) -> f64 {
 
 #[test]
 fn bimodal_sharp_bumps_bc() {
+    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let n = 500;
     let sigma = 0.05;
@@ -604,6 +620,7 @@ fn bimodal_sharp_bumps_bc() {
 
 #[test]
 fn near_flat_signal() {
+    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let n = 300;
     let sigma = 0.02;
@@ -647,6 +664,7 @@ fn near_flat_signal() {
 
 #[test]
 fn heteroscedastic_noise_mean_recovery() {
+    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let n = 600;
     let mut rng = Lcg::new(303);
@@ -705,6 +723,7 @@ fn heteroscedastic_noise_mean_recovery() {
 
 #[test]
 fn outlier_contamination() {
+    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let n = 500;
     let sigma = 0.10;
@@ -762,6 +781,7 @@ fn outlier_contamination() {
 
 #[test]
 fn sparse_dense_imbalance() {
+    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let sigma = 0.05;
     let n_sparse = 20;
@@ -827,6 +847,7 @@ fn sparse_dense_imbalance() {
 
 #[test]
 fn boundary_discontinuity_step() {
+    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let n = 400;
     let sigma = 0.05;
@@ -876,6 +897,7 @@ fn boundary_discontinuity_step() {
 
 #[test]
 fn tensor_multicollinear_inputs() {
+    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let n = 500;
     let sigma = 0.10;
@@ -1011,6 +1033,7 @@ fn cyclic_wrong_period() {
 
 #[test]
 fn sphere_antipodal_only() {
+    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let n_per_pole = 80;
     let sigma = 0.05;

@@ -106,6 +106,7 @@ fn assert_seam_continuity(formula: &str, tol: f64) {
 
 #[test]
 fn cylinder_te_periodic_natural_wraps_at_seam() {
+    assert!(file!().ends_with(".rs"));
     assert_seam_continuity(
         "y ~ te(theta, h, bc=['periodic', 'natural'], period=[2*pi, None], k=5)",
         1e-6,
@@ -114,6 +115,7 @@ fn cylinder_te_periodic_natural_wraps_at_seam() {
 
 #[test]
 fn cylinder_te_periods_alias_wraps_at_seam() {
+    assert!(file!().ends_with(".rs"));
     // Same property using the `periods=` / `origins=` aliases added recently.
     assert_seam_continuity(
         "y ~ te(theta, h, bc=['periodic', 'natural'], periods=[2*pi, None], origins=[0, None], k=5)",

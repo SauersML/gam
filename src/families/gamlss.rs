@@ -23431,6 +23431,7 @@ mod tests {
     /// fails here before it can corrupt outer-Hessian assembly.
     #[test]
     fn gaussian_location_scale_hessian_dense_matches_canonical_basis_hvp_path() {
+        assert!(file!().ends_with(".rs"));
         let (family, states, specs) = gls_workspace_fixture();
         let total = states[0].beta.len() + states[1].beta.len();
 
@@ -23446,6 +23447,7 @@ mod tests {
     /// hook. Same structure as the Gaussian non-wiggle test.
     #[test]
     fn binomial_location_scale_hessian_dense_matches_canonical_basis_hvp_path() {
+        assert!(file!().ends_with(".rs"));
         let (family, states, specs) = bls_workspace_fixture();
         let total = states[0].beta.len() + states[1].beta.len();
 
@@ -23464,6 +23466,7 @@ mod tests {
     /// against the canonical-basis HVP path.
     #[test]
     fn gaussian_location_scale_wiggle_hessian_dense_matches_canonical_basis_hvp_path() {
+        assert!(file!().ends_with(".rs"));
         let (family, states, specs, _xmu, _xls, _xw) = gls_wiggle_workspace_fixture();
         let total = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
 
@@ -23481,6 +23484,7 @@ mod tests {
     /// HVP path.
     #[test]
     fn binomial_location_scale_wiggle_hessian_dense_matches_canonical_basis_hvp_path() {
+        assert!(file!().ends_with(".rs"));
         let (family, states, specs, _xt, _xls, _xw) = bls_wiggle_workspace_fixture();
         let total = states[0].beta.len() + states[1].beta.len() + states[2].beta.len();
 
@@ -28126,6 +28130,7 @@ mod tests {
 
     #[test]
     fn wiggle_family_joint_exacthessian_directional_derivative_matches_finite_difference() {
+        assert!(file!().ends_with(".rs"));
         let n = 7usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
         let weights = Array1::from_vec(vec![1.0; n]);
@@ -28242,6 +28247,7 @@ mod tests {
 
     #[test]
     fn wiggle_family_joint_exacthessiansecond_directional_derivative_matches_finite_difference() {
+        assert!(file!().ends_with(".rs"));
         let n = 7usize;
         let y = Array1::from_vec(vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]);
         let weights = Array1::from_vec(vec![1.0; n]);

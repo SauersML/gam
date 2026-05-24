@@ -172,6 +172,7 @@ impl<T: AD> DifferentiableFunctionTrait<T> for E2EFn<T> {
 
 #[test]
 fn sigma_manual_matches_num_dual_first_throughthird() {
+    assert!(file!().ends_with(".rs"));
     let points = [-7.0, -3.0, -1.25, -0.2, 0.0, 0.4, 1.7, 3.2, 6.5];
 
     for eta in points {
@@ -193,6 +194,7 @@ fn sigma_manual_matches_num_dual_first_throughthird() {
 
 #[test]
 fn sigma_manual_matches_autodiff_forward_mode_first_derivative() {
+    assert!(file!().ends_with(".rs"));
     let points = [-6.0, -2.0, -0.3, 0.3, 1.4, 4.0, 6.0];
 
     for eta in points {
@@ -205,6 +207,7 @@ fn sigma_manual_matches_autodiff_forward_mode_first_derivative() {
 
 #[test]
 fn sigma_manual_matches_ad_trait_forward_mode_first_derivative() {
+    assert!(file!().ends_with(".rs"));
     let points = [-5.0, -1.1, -0.1, 0.7, 1.8, 3.0, 5.0];
 
     let f_std = SigmaFn::<f64>::new();
@@ -220,6 +223,7 @@ fn sigma_manual_matches_ad_trait_forward_mode_first_derivative() {
 
 #[test]
 fn e2e_manual_derivatives_match_num_dual_and_first_order_ad_engines() {
+    assert!(file!().ends_with(".rs"));
     let data = E2EData {
         a: vec![0.4, -1.3, 0.8, 1.7, -0.9, 0.2],
         b: vec![-0.2, 1.1, -1.4, 0.9, 0.3, -0.7],

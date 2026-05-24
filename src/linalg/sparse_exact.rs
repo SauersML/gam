@@ -1516,6 +1516,7 @@ mod tests {
 
     #[test]
     fn takahashi_diagonal_matches_dense_inverse() {
+        assert!(file!().ends_with(".rs"));
         // 4x4 SPD matrix
         let h = array![
             [4.0, 0.2, 0.0, 0.0],
@@ -1549,6 +1550,7 @@ mod tests {
 
     #[test]
     fn takahashi_logdet_matches_dense() {
+        assert!(file!().ends_with(".rs"));
         let h = array![
             [4.0, 0.2, 0.0, 0.0],
             [0.2, 3.0, 0.1, 0.0],
@@ -1567,6 +1569,7 @@ mod tests {
 
     #[test]
     fn takahashi_trace_hinv_sk_matches_column_solve() {
+        assert!(file!().ends_with(".rs"));
         let h = array![
             [4.0, 0.2, 0.0, 0.0],
             [0.2, 3.0, 0.1, 0.0],

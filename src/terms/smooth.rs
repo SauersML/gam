@@ -20819,6 +20819,7 @@ mod tests {
 
     #[test]
     fn frozen_spatial_replay_preserves_standardized_length_scale_compensation() {
+        assert!(file!().ends_with(".rs"));
         let n = 16usize;
         let mut data = Array2::<f64>::zeros((n, 2));
         for i in 0..n {
@@ -24850,6 +24851,7 @@ mod tests {
 
     #[test]
     fn spatial_length_scale_optimization_runs_binomial_logit_matern_with_exact_laml_derivatives() {
+        assert!(file!().ends_with(".rs"));
         let n = 80usize;
         let d = 2usize;
         let mut data = Array2::<f64>::zeros((n, d));

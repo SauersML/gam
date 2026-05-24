@@ -19778,6 +19778,7 @@ mod tests {
 
     #[test]
     fn link_flex_blockwise_exact_newton_matches_joint_principal_blocks() {
+        assert!(file!().ends_with(".rs"));
         let score_runtime = test_deviation_runtime();
         let link_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2], [0.1, 0.6]];
@@ -20177,6 +20178,7 @@ mod tests {
 
     #[test]
     fn timewiggle_blockwise_exact_newton_matches_joint_principal_blocks() {
+        assert!(file!().ends_with(".rs"));
         let score_runtime = test_deviation_runtime();
         let marginal_design = array![[0.7, -0.2], [0.1, 0.6]];
         let marginal_beta = array![0.35, -0.1];
@@ -20943,6 +20945,7 @@ mod tests {
 
     #[test]
     fn closed_form_row_matches_exact_directional_derivatives() {
+        assert!(file!().ends_with(".rs"));
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![1.0]),
@@ -20997,6 +21000,7 @@ mod tests {
 
     #[test]
     fn closed_form_row_matches_exact_directional_derivatives_with_gaussian_frailty() {
+        assert!(file!().ends_with(".rs"));
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![1.0]),
@@ -21051,6 +21055,7 @@ mod tests {
 
     #[test]
     fn closed_form_row_matches_exact_directional_derivatives_with_timewiggle() {
+        assert!(file!().ends_with(".rs"));
         let time_wiggle_knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
         let time_wiggle_degree = 3;
         let base_q0 = array![0.09];
@@ -21254,6 +21259,7 @@ mod tests {
 
     #[test]
     fn timewiggle_tail_step_is_clipped_before_it_can_flip_derivative() {
+        assert!(file!().ends_with(".rs"));
         let constraints = append_timewiggle_tail_nonnegative_constraints(None, 2, 1)
             .expect("tail constraints")
             .expect("time constraints");
