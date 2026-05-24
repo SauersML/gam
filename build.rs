@@ -64,6 +64,22 @@ fn main() {
     let mut should_panic_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_bare_should_panic(&manifest_dir, &manifest_dir, &mut should_panic_offenders);
 
+    // `eprintln!` / `eprint!` carrying `{:?}` / `{:#?}` debug formatting is
+    // a hand-rolled `dbg!`. Test-aware; build.rs exempt.
+    let mut debug_eprintln_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_debug_eprintln(&manifest_dir, &manifest_dir, &mut debug_eprintln_offenders);
+
+    // Bare `const <ident>: bool = <literal>;` items are dead-by-construction
+    // guards (rustc's `dead_code` cannot prove unreachability through them)
+    // or constant truths that should not exist. Real toggles belong in
+    // `cfg`/`feature`/runtime config.
+    let mut dead_guard_const_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_dead_guard_consts(
+        &manifest_dir,
+        &manifest_dir,
+        &mut dead_guard_const_offenders,
+    );
+
     let mut sections: Vec<Section> = Vec::new();
 
     if !todo_offenders.is_empty() {
@@ -147,6 +163,30 @@ fn main() {
         });
     }
 
+    if !debug_eprintln_offenders.is_empty() {
+        sections.push(Section {
+            title:
+                "eprintln!/eprint! with {:?} debug formatting (use real logging or delete)"
+                    .to_string(),
+            rows: debug_eprintln_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !dead_guard_const_offenders.is_empty() {
+        sections.push(Section {
+            title:
+                "const <name>: bool = <literal> (dead-by-construction guard — use cfg or delete)"
+                    .to_string(),
+            rows: dead_guard_const_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
     if sections.is_empty() {
         return;
     }
@@ -211,6 +251,10 @@ fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
         // ban. Acceptable in test scaffolding.
         ("todo!(", "todo!", true),
         ("unimplemented!(", "unimplemented!", true),
+        // `unreachable!(` is a drop-in synonym for `unimplemented!(` from
+        // the same panic family — propagate via `Result` or restructure so
+        // the impossible branch is not expressible.
+        ("unreachable!(", "unreachable!", true),
         // Direct panics. Tests use `panic!("expected variant X")` after
         // destructuring matches, which is idiomatic; non-test code should
         // propagate `Result`.
@@ -222,6 +266,12 @@ fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
         // Strict everywhere.
         ("env::var(", "env::var", false),
         ("env::var_os(", "env::var_os", false),
+        // Env-var iteration is the same read-from-environment loophole as
+        // `env::var(...)`; banning the singular form without these would
+        // leave `env::vars().any(|(k,v)| k == "FOO" && v == "1")` as a
+        // behavior-identical workaround.
+        ("env::vars(", "env::vars", false),
+        ("env::vars_os(", "env::vars_os", false),
         // `if let Ok/Some/Err(_) = …` — `.is_ok()` / `.is_some()` /
         // `.is_err()` are strictly cleaner. Match-arm forms `Ok(_) =>`
         // etc. are NOT banned: when the inner type is `()` (e.g.
@@ -240,6 +290,12 @@ fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
         // need a real sleep (e.g. timing scheduler races).
         ("thread::sleep(", "thread::sleep", true),
         ("std::thread::sleep(", "std::thread::sleep", true),
+        // Busy-wait primitives. `while Instant::now() < until { spin_loop() }`
+        // is a worse `thread::sleep` (pins a core instead of parking).
+        // Strict everywhere; legitimate uses are vanishingly rare.
+        ("spin_loop()", "spin_loop", false),
+        ("thread::yield_now(", "thread::yield_now", false),
+        ("std::thread::yield_now(", "std::thread::yield_now", false),
     ]
 }
 
@@ -532,6 +588,174 @@ fn scan_for_bare_should_panic(
                 || (trimmed.starts_with("#[should_panic")
                     && !trimmed.contains("expected"))
             {
+                offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+            }
+        }
+    });
+}
+
+/// Flags `const <ident>: bool = false;` and `const <ident>: bool = true;`
+/// item declarations. A bare boolean constant set to a literal is either a
+/// dead-by-construction guard (`if !RUN_BENCH { return; }` patterns that
+/// rustc's `dead_code` lint cannot catch because the const *could* in
+/// principle be flipped) or a constant truth that does not need to exist.
+/// Real toggles belong in `cfg`/`feature` gates or runtime configuration.
+/// Build.rs is exempt.
+fn scan_for_dead_guard_consts(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("const ") {
+            return;
+        }
+        for (idx, line) in content.lines().enumerate() {
+            let stripped = strip_strings_and_comments(line);
+            if !line_has_keyword(&stripped, "const") {
+                continue;
+            }
+            if line_matches_bool_literal_const(&stripped) {
+                offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+            }
+        }
+    });
+}
+
+/// True if `stripped` contains a `const <ident>: bool = <true|false>;`
+/// item-style declaration (visibility prefix tolerated; whitespace flexible
+/// throughout). Operates on the stripped line.
+fn line_matches_bool_literal_const(stripped: &str) -> bool {
+    let bytes = stripped.as_bytes();
+    let kw = b"const";
+    let mut i = 0usize;
+    'outer: while i + kw.len() <= bytes.len() {
+        if &bytes[i..i + kw.len()] != kw {
+            i += 1;
+            continue;
+        }
+        let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+        let after_ok =
+            i + kw.len() < bytes.len() && !is_ident_byte(bytes[i + kw.len()]);
+        if !before_ok || !after_ok {
+            i += 1;
+            continue;
+        }
+        // Skip whitespace after `const`.
+        let mut j = i + kw.len();
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        // Identifier (one or more ident bytes, must start with non-digit).
+        if j >= bytes.len() || !(bytes[j].is_ascii_alphabetic() || bytes[j] == b'_') {
+            i += 1;
+            continue;
+        }
+        while j < bytes.len() && is_ident_byte(bytes[j]) {
+            j += 1;
+        }
+        // Whitespace, then `:`.
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b':' {
+            i += 1;
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        // Type token `bool`.
+        let bool_kw = b"bool";
+        if j + bool_kw.len() > bytes.len() || &bytes[j..j + bool_kw.len()] != bool_kw {
+            i += 1;
+            continue;
+        }
+        let after = j + bool_kw.len();
+        if after < bytes.len() && is_ident_byte(bytes[after]) {
+            i += 1;
+            continue;
+        }
+        j = after;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] != b'=' {
+            i += 1;
+            continue;
+        }
+        j += 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        // Match `true` or `false`.
+        for lit in [b"true".as_ref(), b"false".as_ref()] {
+            if j + lit.len() <= bytes.len() && &bytes[j..j + lit.len()] == lit {
+                let after_lit = j + lit.len();
+                let bound_ok =
+                    after_lit == bytes.len() || !is_ident_byte(bytes[after_lit]);
+                if bound_ok {
+                    // Optional whitespace then `;`.
+                    let mut k = after_lit;
+                    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    if k < bytes.len() && bytes[k] == b';' {
+                        return true;
+                    }
+                }
+            }
+        }
+        i += 1;
+        continue 'outer;
+    }
+    false
+}
+
+/// Flags lines where `eprintln!(` or `eprint!(` appears together with a
+/// `{...:?}` / `{...:#?}` debug format spec. This is the hand-rolled `dbg!`
+/// pattern: same intent (dump a value with `Debug` formatting to stderr),
+/// different spelling. Test-aware via the shared `compute_test_mask`
+/// machinery; build.rs is exempt.
+///
+/// The `eprintln!(` / `eprint!(` token check uses the stripped line (so
+/// string-literal occurrences are ignored), but the `:?}` / `:#?}` probe
+/// looks at the original line because `strip_strings_and_comments` blanks
+/// out string-literal contents and would erase the format spec.
+fn scan_for_debug_eprintln(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("eprint") {
+            return;
+        }
+        let mask = compute_test_mask(content, rel);
+        for (idx, line) in content.lines().enumerate() {
+            if mask.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let stripped = strip_strings_and_comments(line);
+            if !stripped.contains("eprintln!(") && !stripped.contains("eprint!(") {
+                continue;
+            }
+            if line.contains(":?}") || line.contains(":#?}") {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }
         }

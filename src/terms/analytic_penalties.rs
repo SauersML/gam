@@ -2103,7 +2103,7 @@ impl AnalyticPenalty for SparsityPenalty {
 /// REML-selectable log-precision per axis. Penalty contribution for axis `j`:
 ///
 /// ```text
-///   P_j(t; ρ) = ½ exp(ρ_j) · ‖t[:, j]‖² - (n_eff / 2) · ρ_j
+///   P_j(t; ρ) = ½ α_j · ‖t[:, j]‖² - (n_eff / 2) · log α_j
 /// ```
 ///
 /// summed over `j ∈ [0, d)`. Under REML, axis `j` whose data evidence is too
@@ -2211,7 +2211,7 @@ impl AnalyticPenalty for ARDPenalty {
                 let v = target[n * d + j];
                 sq += v * v;
             }
-            acc += 0.5 * lam_j * sq - 0.5 * self.n_eff * rho_j;
+            acc += 0.5 * lam_j * sq - 0.5 * self.n_eff * lam_j.ln();
         }
         acc
     }
@@ -2255,18 +2255,7 @@ impl AnalyticPenalty for ARDPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        // Occam-corrected REML penalty contribution per axis:
-        //
-        //   P_j(ρ_j) = ½ exp(ρ_j) Σ_n t_{n,j}²  −  (N_eff/2) · ρ_j  + const
-        //
-        // (the −(N/2) ρ comes from the −½ log|S| Gaussian normalizing
-        // constant under prior precision λ_j = exp(ρ_j)).
-        //
-        //   ∂P_j/∂ρ_j = ½ exp(ρ_j) Σ_n t_{n,j}²  −  N_eff/2.
-        //
-        // At an unused axis Σ_n t_{n,j}² = 0 the gradient is −N_eff/2 < 0;
-        // minimising the (negative-log) marginal drives ρ_j → +∞ and
-        // prunes the axis, recovering ARD's pruning behaviour.
+        // Uses the prior normalizer -0.5 * N_eff * log(weight * exp(rho_j)).
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut out = Array1::<f64>::zeros(self.rho_count());

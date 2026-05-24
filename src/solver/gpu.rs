@@ -36,17 +36,6 @@ impl GpuPolicy {
         }
     }
 
-    /// Resolve the current process policy from `GAM_GPU`.
-    pub fn from_env() -> Self {
-        match std::env::var("GAM_GPU") {
-            Ok(value) => Self::parse(&value).unwrap_or_else(|| {
-                log::warn!("unrecognized GAM_GPU={value:?}; expected auto|off|force, using auto");
-                Self::Auto
-            }),
-            Err(_) => Self::Auto,
-        }
-    }
-
     /// Whether unsupported GPU dispatch should be returned as a hard error.
     #[inline]
     pub fn is_force(self) -> bool {
@@ -112,23 +101,12 @@ pub fn dense_pirls_dispatch(
     cols: usize,
     signed_weights: bool,
 ) -> Result<GpuDispatch, String> {
-    let policy = GpuPolicy::from_env();
-    if matches!(policy, GpuPolicy::Off) {
-        return Ok(GpuDispatch::UseCpu {
-            reason: "GAM_GPU=off".to_string(),
-        });
-    }
-
     let reason = format!(
         "{} requires a compiled device backend; this build has no CUDA/HIP/Metal backend registered (n={rows}, p={cols}, signed_weights={signed_weights})",
         operation.label()
     );
-    if policy.is_force() {
-        Err(format!("GAM_GPU=force requested but {reason}"))
-    } else {
-        log_auto_fallback_once(operation, &reason);
-        Ok(GpuDispatch::UseCpu { reason })
-    }
+    log_auto_fallback_once(operation, &reason);
+    Ok(GpuDispatch::UseCpu { reason })
 }
 
 fn log_auto_fallback_once(operation: GpuOperation, reason: &str) {
@@ -158,25 +136,24 @@ fn log_auto_fallback_once(operation: GpuOperation, reason: &str) {
     once.call_once(|| log::info!("GPU auto fallback for {}: {reason}", operation.label()));
 }
 
-/// Lightweight event timer for hot-path instrumentation.  It logs only when
-/// `GAM_GPU_TIMING=1|true|on`, keeping the default path allocation-free except
-/// for the `Instant` captured by callers that opt into timing.
+/// Compile-time flag for hot-path GPU stage timing. Off in production; flip
+/// to `true` locally when investigating GPU vs. CPU latency. There is no
+/// runtime env override — see [`crate::gpu::GpuStageTimer`] for the
+/// always-on workload-tagged timer used by the dispatch layer.
+const GPU_STAGE_TIMING_ENABLED: bool = false;
+
+/// Lightweight event timer for hot-path instrumentation. Gated on the
+/// [`GPU_STAGE_TIMING_ENABLED`] compile-time flag.
 pub struct GpuStageTimer {
     label: &'static str,
     start: Instant,
-    enabled: bool,
 }
 
 impl GpuStageTimer {
     pub fn start(label: &'static str) -> Self {
-        let enabled = std::env::var("GAM_GPU_TIMING")
-            .ok()
-            .and_then(|v| GpuPolicy::parse(&v))
-            .is_some_and(|p| !matches!(p, GpuPolicy::Off));
         Self {
             label,
             start: Instant::now(),
-            enabled,
         }
     }
 
@@ -187,7 +164,7 @@ impl GpuStageTimer {
 
 impl Drop for GpuStageTimer {
     fn drop(&mut self) {
-        if self.enabled {
+        if GPU_STAGE_TIMING_ENABLED {
             log::info!(
                 "[gpu-timing] {} {:.3} ms",
                 self.label,
