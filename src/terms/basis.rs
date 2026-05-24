@@ -3042,6 +3042,12 @@ pub enum BasisMetadata {
         /// Per-axis anisotropy log-scales η_a, stored for prediction.
         aniso_log_scales: Option<Vec<f64>>,
     },
+    Pca {
+        feature_cols: Vec<usize>,
+        basis_matrix: Array2<f64>,
+        centered: bool,
+        center_mean: Option<Array1<f64>>,
+    },
     TensorBSpline {
         feature_cols: Vec<usize>,
         knots: Vec<Array1<f64>>,
@@ -3049,6 +3055,133 @@ pub enum BasisMetadata {
         periodic: Vec<Option<(f64, f64, usize)>>,
         identifiability_transform: Option<Array2<f64>>,
     },
+}
+
+pub fn pca_center_mean(data: ArrayView2<'_, f64>) -> Result<Array1<f64>, BasisError> {
+    if data.nrows() == 0 {
+        return Err(BasisError::InvalidInput(
+            "PCA basis requires at least one row".to_string(),
+        ));
+    }
+    let mut mean = Array1::<f64>::zeros(data.ncols());
+    for row in data.rows() {
+        for (j, value) in row.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(BasisError::InvalidInput(format!(
+                    "PCA basis input contains non-finite value at column {j}"
+                )));
+            }
+            mean[j] += *value;
+        }
+    }
+    mean.mapv_inplace(|value| value / data.nrows() as f64);
+    Ok(mean)
+}
+
+fn centered_copy(
+    data: ArrayView2<'_, f64>,
+    center_mean: Option<&Array1<f64>>,
+) -> Result<Array2<f64>, BasisError> {
+    if let Some(mean) = center_mean
+        && mean.len() != data.ncols()
+    {
+        return Err(BasisError::DimensionMismatch(format!(
+            "PCA center mean has length {} but data has {} columns",
+            mean.len(),
+            data.ncols()
+        )));
+    }
+    let mut out = data.to_owned();
+    for ((_, col), value) in out.indexed_iter_mut() {
+        if !value.is_finite() {
+            return Err(BasisError::InvalidInput(format!(
+                "PCA basis input contains non-finite value at column {col}"
+            )));
+        }
+        if let Some(mean) = center_mean {
+            *value -= mean[col];
+        }
+    }
+    Ok(out)
+}
+
+pub fn compute_pca_basis_matrix(
+    data: ArrayView2<'_, f64>,
+    k_pca: usize,
+    centered: bool,
+) -> Result<Array2<f64>, BasisError> {
+    let n = data.nrows();
+    let d = data.ncols();
+    if k_pca == 0 || k_pca > d {
+        return Err(BasisError::InvalidInput(format!(
+            "PCA basis rank K must satisfy 1 <= K <= D; got K={k_pca}, D={d}"
+        )));
+    }
+    let mean = centered.then(|| pca_center_mean(data)).transpose()?;
+    let x = centered_copy(data, mean.as_ref())?;
+    if n == 0 {
+        return Err(BasisError::InvalidInput(
+            "PCA basis requires at least one row".to_string(),
+        ));
+    }
+
+    let mut basis = Array2::<f64>::zeros((d, k_pca));
+    if n < d {
+        let gram = fast_ab(&x, &x.t().to_owned());
+        let sym = (&gram + &gram.t().to_owned()) * 0.5;
+        let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
+        let mut order: Vec<usize> = (0..evals.len()).collect();
+        order.sort_by(|&a, &b| {
+            evals[b]
+                .partial_cmp(&evals[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (out_col, eig_idx) in order.into_iter().take(k_pca).enumerate() {
+            let ev = evals[eig_idx].max(0.0);
+            if ev <= 1e-12 {
+                continue;
+            }
+            let scores = evecs.column(eig_idx);
+            let mut pc = x.t().dot(&scores) / ev.sqrt();
+            let norm = pc.dot(&pc).sqrt();
+            if norm > 0.0 {
+                pc.mapv_inplace(|value| value / norm);
+            }
+            orient_pca_component(&mut pc);
+            basis.column_mut(out_col).assign(&pc);
+        }
+    } else {
+        let cov = fast_atb(&x, &x);
+        let sym = (&cov + &cov.t().to_owned()) * 0.5;
+        let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
+        let mut order: Vec<usize> = (0..evals.len()).collect();
+        order.sort_by(|&a, &b| {
+            evals[b]
+                .partial_cmp(&evals[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for (out_col, eig_idx) in order.into_iter().take(k_pca).enumerate() {
+            let mut pc = evecs.column(eig_idx).to_owned();
+            orient_pca_component(&mut pc);
+            basis.column_mut(out_col).assign(&pc);
+        }
+    }
+    Ok(basis)
+}
+
+fn orient_pca_component(component: &mut Array1<f64>) {
+    let pivot = component
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| {
+            a.abs()
+                .partial_cmp(&b.abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(idx, _)| idx);
+    if pivot.is_some_and(|idx| component[idx] < 0.0) {
+        component.mapv_inplace(|value| -value);
+    }
 }
 
 /// Standardized basis build result for engine-level composition.

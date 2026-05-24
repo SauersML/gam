@@ -10,11 +10,12 @@ use crate::basis::{
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
     build_spherical_spline_basis, build_thin_plate_basis,
-    build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto, center_strategy_kind,
-    center_strategy_num_centers, center_strategy_with_num_centers, estimate_penalty_nullity,
-    filter_active_penalty_candidates, filter_active_penalty_candidates_with_ops,
-    initial_aniso_contrasts, orthogonality_transform_for_design, pairwise_distance_bounds,
-    pairwise_distance_bounds_sampled, points_in_aniso_y_space, select_centers_by_strategy,
+    build_pca_basis_matrix, build_thin_plate_basis_log_kappa_derivatives,
+    center_strategy_is_auto, center_strategy_kind, center_strategy_num_centers,
+    center_strategy_with_num_centers, estimate_penalty_nullity, filter_active_penalty_candidates,
+    filter_active_penalty_candidates_with_ops, initial_aniso_contrasts,
+    orthogonality_transform_for_design, pairwise_distance_bounds, pairwise_distance_bounds_sampled,
+    pca_center_mean, points_in_aniso_y_space, select_centers_by_strategy,
 };
 use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
@@ -209,6 +210,13 @@ pub enum SmoothBasisSpec {
         #[serde(default)]
         input_scales: Option<Vec<f64>>,
     },
+    Pca {
+        feature_cols: Vec<usize>,
+        basis_matrix: Array2<f64>,
+        centered: bool,
+        #[serde(default)]
+        center_mean: Option<Array1<f64>>,
+    },
     /// Tensor-product smooth built from 1D B-spline marginals.
     ///
     /// This is the `te()`-style construction used when axes have different units/scales
@@ -238,8 +246,9 @@ impl SmoothBasisSpec {
             Self::Sphere { .. } => 3,
             Self::Matern { .. } => 4,
             Self::Duchon { .. } => 5,
-            Self::FactorSmooth { .. } => 6,
-            Self::BySmooth { .. } => 7,
+            Self::Pca { .. } => 6,
+            Self::FactorSmooth { .. } => 7,
+            Self::BySmooth { .. } => 8,
         }
     }
 }
@@ -605,6 +614,19 @@ impl TermCollectionSpec {
                     ) {
                         return Err(SmoothError::invalid_config(format!(
                             "{label} term '{}' is not frozen: Duchon identifiability must be FrozenTransform or None",
+                            st.name
+                        ))
+                        .into());
+                    }
+                }
+                SmoothBasisSpec::Pca {
+                    centered,
+                    center_mean,
+                    ..
+                } => {
+                    if *centered && center_mean.is_none() {
+                        return Err(SmoothError::invalid_config(format!(
+                            "{label} term '{}' is not frozen: centered Pca missing center_mean",
                             st.name
                         ))
                         .into());
@@ -3576,7 +3598,10 @@ fn shape_lower_bounds_local(shape: ShapeConstraint, dim: usize) -> Option<Array1
 }
 
 fn shape_supports_basis(term: &SmoothTermSpec) -> bool {
-    !matches!(term.basis, SmoothBasisSpec::TensorBSpline { .. })
+    !matches!(
+        term.basis,
+        SmoothBasisSpec::TensorBSpline { .. } | SmoothBasisSpec::Pca { .. }
+    )
 }
 
 fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> BasisMetadata {
@@ -4972,6 +4997,96 @@ struct LocalSmoothTermBuild {
     kronecker_factored: Option<KroneckerFactoredBasis>,
 }
 
+fn build_pca_smooth_basis(
+    data: ArrayView2<'_, f64>,
+    feature_cols: &[usize],
+    basis_matrix: &Array2<f64>,
+    centered: bool,
+    center_mean: Option<&Array1<f64>>,
+) -> Result<BasisBuildResult, BasisError> {
+    if feature_cols.is_empty() {
+        return Err(BasisError::InvalidInput(
+            "Pca smooth requires at least one feature column".to_string(),
+        ));
+    }
+    if basis_matrix.nrows() != feature_cols.len() {
+        return Err(BasisError::DimensionMismatch(format!(
+            "Pca basis matrix has {} rows but smooth uses {} feature columns",
+            basis_matrix.nrows(),
+            feature_cols.len()
+        )));
+    }
+    let k_pca = basis_matrix.ncols();
+    if k_pca == 0 {
+        return Err(BasisError::InvalidInput(
+            "Pca basis matrix must have at least one column".to_string(),
+        ));
+    }
+    if let Some(mean) = center_mean
+        && mean.len() != feature_cols.len()
+    {
+        return Err(BasisError::DimensionMismatch(format!(
+            "Pca center mean has length {} but smooth uses {} feature columns",
+            mean.len(),
+            feature_cols.len()
+        )));
+    }
+    if let Some(((row, col), _)) = basis_matrix
+        .indexed_iter()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(BasisError::InvalidInput(format!(
+            "Pca basis matrix contains non-finite value at ({row}, {col})"
+        )));
+    }
+
+    let mut x = select_columns(data, feature_cols)?;
+    let fitted_mean = if centered {
+        match center_mean {
+            Some(mean) => {
+                for mut row in x.rows_mut() {
+                    row -= mean;
+                }
+                Some(mean.clone())
+            }
+            None => {
+                let mean = pca_center_mean(x.view())?;
+                for mut row in x.rows_mut() {
+                    row -= &mean;
+                }
+                Some(mean)
+            }
+        }
+    } else {
+        None
+    };
+    let design = fast_ab(&x, basis_matrix);
+    let penalty = Array2::<f64>::eye(k_pca);
+    Ok(BasisBuildResult {
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+        penalties: vec![penalty],
+        nullspace_dims: vec![0],
+        penaltyinfo: vec![PenaltyInfo {
+            source: PenaltySource::Primary,
+            original_index: 0,
+            active: true,
+            effective_rank: k_pca,
+            dropped_reason: None,
+            nullspace_dim_hint: 0,
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+        }],
+        metadata: BasisMetadata::Pca {
+            feature_cols: feature_cols.to_vec(),
+            basis_matrix: basis_matrix.clone(),
+            centered,
+            center_mean: fitted_mean,
+        },
+        kronecker_factored: None,
+        ops: vec![None],
+    })
+}
+
 fn build_single_local_smooth_term(
     data: ArrayView2<'_, f64>,
     term: &SmoothTermSpec,
@@ -5213,6 +5328,26 @@ fn build_single_local_smooth_term(
                 *length_scale = spec.length_scale;
             }
             result
+        }
+        SmoothBasisSpec::Pca {
+            feature_cols,
+            basis_matrix,
+            centered,
+            center_mean,
+        } => {
+            if term.shape != ShapeConstraint::None {
+                return Err(BasisError::InvalidInput(format!(
+                    "ShapeConstraint::{:?} for term '{}' is not supported on Pca basis",
+                    term.shape, term.name
+                )));
+            }
+            build_pca_smooth_basis(
+                data,
+                feature_cols,
+                basis_matrix,
+                *centered,
+                center_mean.as_ref(),
+            )?
         }
         SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
             build_tensor_bspline_basis(data, feature_cols, spec)?
@@ -5971,6 +6106,7 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
         | SmoothBasisSpec::Sphere { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
+        | SmoothBasisSpec::Pca { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
         SmoothBasisSpec::FactorSmooth { spec } => {
             let mut cols = spec.continuous_cols.clone();
@@ -6778,6 +6914,17 @@ fn with_identifiability_transform(
                 identifiability_transform.as_ref(),
                 transform,
             )?,
+        }),
+        BasisMetadata::Pca {
+            feature_cols,
+            basis_matrix,
+            centered,
+            center_mean,
+        } => Ok(BasisMetadata::Pca {
+            feature_cols: feature_cols.clone(),
+            basis_matrix: basis_matrix.clone(),
+            centered: *centered,
+            center_mean: center_mean.clone(),
         }),
         BasisMetadata::TensorBSpline {
             feature_cols,
