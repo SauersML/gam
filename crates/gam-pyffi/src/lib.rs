@@ -572,55 +572,10 @@ fn sample_table(
     })
 }
 
-#[pyfunction]
-fn paired_sample_table(
-    py: Python<'_>,
-    target_model_bytes: Vec<u8>,
-    competing_model_bytes: Vec<u8>,
-    target_headers: Vec<String>,
-    target_rows: Vec<Vec<String>>,
-    competing_headers: Vec<String>,
-    competing_rows: Vec<Vec<String>>,
-    options_json: Option<String>,
-) -> PyResult<String> {
-    detach_py_result(py, "paired_sample_table", move || {
-        paired_sample_table_impl(
-            &target_model_bytes,
-            &competing_model_bytes,
-            target_headers,
-            target_rows,
-            competing_headers,
-            competing_rows,
-            options_json.as_deref(),
-        )
-    })
-}
-
-#[pyfunction]
-fn paired_cumulative_incidence_table(
-    py: Python<'_>,
-    target_model_bytes: Vec<u8>,
-    competing_model_bytes: Vec<u8>,
-    target_samples: PyReadonlyArray2<'_, f64>,
-    competing_samples: PyReadonlyArray2<'_, f64>,
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
-    options_json: Option<String>,
-) -> PyResult<String> {
-    let target_samples = target_samples.as_array().to_owned();
-    let competing_samples = competing_samples.as_array().to_owned();
-    detach_py_result(py, "paired_cumulative_incidence_table", move || {
-        paired_cumulative_incidence_table_impl(
-            &target_model_bytes,
-            &competing_model_bytes,
-            target_samples.view(),
-            competing_samples.view(),
-            headers,
-            rows,
-            options_json.as_deref(),
-        )
-    })
-}
+// paired_sample_table and paired_cumulative_incidence_table pyffi wrappers
+// removed: their payload types (PairedSamplePayload, PairedCifPayload,
+// PyPairedCifOptions) were never defined in the main crate; the orphaned
+// implementations and their helpers were deleted below.
 
 #[pyfunction]
 fn design_matrix_table(
@@ -13210,13 +13165,23 @@ fn duchon_basis_1d_impl(
     let center_matrix = column_array(centers);
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::UserProvided(center_matrix),
+        periodic: None,
         length_scale: None,
         power: 0.0,
         nullspace_order: duchon_nullspace_from_m(m),
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
         operator_penalties: Default::default(),
-        periodic,
+        boundary: if periodic {
+            let left = centers[0];
+            let right = centers[centers.len() - 1];
+            if !(left.is_finite() && right.is_finite() && right > left) {
+                return Err("periodic Duchon centers must define a finite ordered domain".to_string());
+            }
+            OneDimensionalBoundary::Cyclic { start: left, end: right }
+        } else {
+            OneDimensionalBoundary::Open
+        },
     };
     let built = build_duchon_basis(data.view(), &spec)
         .map_err(|err| format!("failed to evaluate Duchon basis: {err}"))?;
