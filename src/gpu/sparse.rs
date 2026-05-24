@@ -12,11 +12,11 @@ pub struct DeviceCsrMatrix<T> {
 
 impl<T> DeviceCsrMatrix<T> {
     #[must_use]
-    pub fn unavailable(rows: usize, cols: usize, nnz: usize) -> Self {
+    pub fn descriptor(rows: usize, cols: usize, nnz: usize) -> Self {
         Self {
-            row_offsets: DeviceBuffer::unavailable(rows + 1),
-            col_indices: DeviceBuffer::unavailable(nnz),
-            values: DeviceBuffer::unavailable(nnz),
+            row_offsets: DeviceBuffer::new_unallocated(rows + 1),
+            col_indices: DeviceBuffer::new_unallocated(nnz),
+            values: DeviceBuffer::new_unallocated(nnz),
             rows,
             cols,
             nnz,
