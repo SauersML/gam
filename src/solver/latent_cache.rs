@@ -189,10 +189,12 @@ pub(crate) enum LatentBasisKind {
         period: f64,
         degree: usize,
         num_basis: usize,
+        chunk_size: Option<usize>,
     },
     TensorBspline {
         knots: Vec<Array1<f64>>,
         degrees: Vec<usize>,
+        chunk_size: Option<usize>,
     },
     Pca {
         basis_matrix: Array2<f64>,
@@ -281,19 +283,26 @@ impl LatentBasisKind {
                 period,
                 degree,
                 num_basis,
+                chunk_size,
             } => {
                 hasher.write_usize(3);
                 hasher.write_f64(*domain_start);
                 hasher.write_f64(*period);
                 hasher.write_usize(*degree);
                 hasher.write_usize(*num_basis);
+                hash_optional_usize(*chunk_size, &mut hasher);
             }
-            Self::TensorBspline { knots, degrees } => {
+            Self::TensorBspline {
+                knots,
+                degrees,
+                chunk_size,
+            } => {
                 hasher.write_usize(4);
                 hasher.write_usize(degrees.len());
                 for &degree in degrees {
                     hasher.write_usize(degree);
                 }
+                hash_optional_usize(*chunk_size, &mut hasher);
                 hasher.write_usize(knots.len());
                 for axis_knots in knots {
                     hash_vector(axis_knots, &mut hasher);
