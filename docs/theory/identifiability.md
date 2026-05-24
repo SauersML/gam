@@ -5,8 +5,7 @@ engine.  The purpose is not to claim that every non-convex latent model has a
 unique numerical optimum.  That statement is false.  The purpose is to state
 the exact conditions under which the composed beta/latent/rho objective has one
 statistical solution after the only legitimate equivalences have been quotiented
-out, and to separate those conditions from the empirical recipe validated in
-`auto_exp_38` and `auto_exp_54`.
+out.
 
 The setting is a finite sample of size \(N\).  A latent block is
 \(\psi=(\psi_1,\ldots,\psi_N)\in\mathbb R^{N\times d}\).  A smooth decoder
@@ -350,10 +349,8 @@ supervised auxiliary variables span the intended concept rank, the conditional
 ridge means or precisions are full rank on that span, and the REML objective
 includes the normalized auxiliary/ARD terms, then `IvaeRidgeMeanGauge` breaks
 rotation, ARD breaks active-axis scale, and ordered IBP breaks atom relabeling
-up to tied or unused atoms.  This is exactly the regime tested by
-`auto_exp_38`: HSV supervision fixed the three-dimensional gauge, and the
-free companion block became interpretable rather than arbitrarily rotated into
-HSV.
+up to tied or unused atoms.  The free companion block then becomes interpretable
+rather than arbitrarily rotated into the supervised span.
 
 ## Inner Penalized-Newton Convergence
 
@@ -457,42 +454,6 @@ term.  Vanishing forcing terms give superlinear convergence; fixed forcing
 gives linear convergence.  Non-convexity is harmless for this conclusion
 because the theorem claims convergence to a critical point, not to the global
 minimum.  \(\square\)
-
-## Empirical Validation Map
-
-`auto_exp_38` is the principal positive validation.  HSV supervision supplied
-the auxiliary conditional gauge, recovering
-\(R^2(\mathrm{hue},\mathrm{sat},\mathrm{val})=(0.700,0.657,0.719)\).  The free
-companion block remained mostly orthogonal to HSV and exposed name-semantic
-axes.  This validates Lemma 1 and Lemma 4 in the intended LLM setting.
-
-`auto_exp_54` is the target-invariance check.  The same supervised gauge-fix
-recipe recovered name-semantic targets with cross-validated
-\(R^2=0.763\) for modifier count, \(0.733\) for monoword, and \(0.620\) for
-template sigma.  This supports the theorem's claim that the recipe is not
-HSV-specific; it is a rank-and-auxiliary-variation condition.
-
-`auto_exp_47` explains why topology alone is insufficient.  A Circle latent
-failed on raw PCs even though an oracle \(PC2+PC4\) plane had circular
-correlation about \(-0.720\) with hue.  In theorem language, the cyclic
-topology did not satisfy decoder separation modulo the semantic gauge.
-
-`auto_exp_49` and `auto_exp_50` validate Lemma 2 by failure.  ARD over PCs,
-even with improved scale normalization, followed reconstruction variance and
-did not discover the semantic cycle.  The normalized ARD term is necessary for
-scale identifiability, but it is not sufficient for concept identifiability
-without the auxiliary conditional gauge.
-
-These empirical results are consistent with GPFA and mGPLVM practice.  GPFA
-identifies smooth latent trajectories only after choosing a latent dimension
-and covariance structure; rotations of factor loadings remain a standard
-factor-model issue.  mGPLVM shows that non-Euclidean topology such as a circle
-or torus can recover neural variables like head direction when the likelihood
-and topology align, but `auto_exp_47` shows that topology cannot name a
-sub-dominant semantic factor by itself.  The SAE literature reaches the same
-warning from another direction: sparse autoencoders give useful feature
-dictionaries, but feature labels and atom counts require additional functional
-or coding assumptions rather than reconstruction sparsity alone.
 
 ## Limitations and Open Problems
 
