@@ -265,11 +265,11 @@ impl<'a> RemlState<'a> {
         for i in 0..n_rho {
             hessian_rho[[i, i]] += ridge;
         }
-        let hessian_rho_inv =
-            match matrix_inversewith_regularization(&hessian_rho, "auto cubature rho Hessian") {
-                Some(v) => v,
-                None => return first_order_correction,
-            };
+        let Some(hessian_rho_inv) =
+            matrix_inversewith_regularization(&hessian_rho, "auto cubature rho Hessian")
+        else {
+            return first_order_correction;
+        };
 
         let max_rhovar = hessian_rho_inv
             .diag()
@@ -316,9 +316,8 @@ impl<'a> RemlState<'a> {
             return first_order_correction;
         }
 
-        let base_cov = match base_covariance {
-            Some(v) => v,
-            None => return first_order_correction,
+        let Some(base_cov) = base_covariance else {
+            return first_order_correction;
         };
         let p = base_cov.nrows();
         let radius = (rank as f64).sqrt();

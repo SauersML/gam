@@ -64,7 +64,9 @@ pub enum OperationKind {
 }
 
 #[inline]
-pub fn profiling_enabled() -> bool { false }
+pub fn profiling_enabled() -> bool {
+    false
+}
 
 pub fn cpu_scope<R>(
     name: &'static str,

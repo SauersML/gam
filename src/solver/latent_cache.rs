@@ -223,8 +223,7 @@ impl LatentBasisKind {
             Self::Matern {
                 chunk_size: Some(_),
                 ..
-            }
-            | Self::Sphere {
+            } | Self::Sphere {
                 chunk_size: Some(_),
                 ..
             }

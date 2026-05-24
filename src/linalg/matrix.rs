@@ -1973,8 +1973,7 @@ impl RandomEffectOperator {
         weights: &Array1<f64>,
     ) -> Array2<f64> {
         assert_eq!(
-            other.n,
-            self.n,
+            other.n, self.n,
             "RandomEffectOperator::weighted_cross_with_re row mismatch"
         );
         assert_eq!(
@@ -4787,10 +4786,7 @@ pub fn xt_diag_x_signed(
 /// guaranteed nonneg by construction. The precondition is checked under
 /// `debug_assertions` and silently inherited in release builds; the underlying
 /// numeric path is identical to `xt_diag_x_signed`.
-pub fn xt_diag_x_psd(
-    design: &DesignMatrix,
-    diag: &Array1<f64>,
-) -> Result<SymmetricMatrix, String> {
+pub fn xt_diag_x_psd(design: &DesignMatrix, diag: &Array1<f64>) -> Result<SymmetricMatrix, String> {
     debug_assert!(
         diag.iter().all(|&w| w >= 0.0),
         "xt_diag_x_psd requires nonneg weights; use xt_diag_x_signed for observed-Hessian assembly"
@@ -5183,11 +5179,11 @@ impl SparseHessianAccumulator {
                 shared.dim,
             ),
         };
-        // SAFETY: rows_by_col has dim buckets, so col_ptrs has dim+1 monotone entries
-        // starting at 0 and ending at row_indices.len(); ca/cb asserts prove every row < dim.
-        // BTreeSet iteration makes each column sorted and duplicate-free.
-        let symbolic = unsafe {
-            SymbolicSparseColMat::new_unchecked(dim, dim, col_ptrs, None, row_indices)
+        let symbolic = {
+            // col_ptrs is dim+1 monotone 0..row_indices.len(); ca/cb assert row<dim.
+            // BTreeSet iter ⇒ each column sorted + duplicate-free.
+            // SAFETY: invariants enforced by the assertions above.
+            unsafe { SymbolicSparseColMat::new_unchecked(dim, dim, col_ptrs, None, row_indices) }
         };
         SparseColMat::new(symbolic, self.values)
     }

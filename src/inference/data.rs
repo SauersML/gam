@@ -938,19 +938,23 @@ fn parse_cell_with_schema(
     unseen_policy: UnseenCategoryPolicy,
 ) -> Result<f64, DataError> {
     let val = match meta.kind {
-        ColumnKindTag::Continuous => raw.parse::<f64>().map_err(|err| DataError::SchemaMismatch {
-            reason: format!(
-                "column '{}' is continuous in schema but row {} has non-numeric value '{}': {}",
-                col_name, row, raw, err
-            ),
-        })?,
-        ColumnKindTag::Binary => {
-            let v = raw.parse::<f64>().map_err(|err| DataError::SchemaMismatch {
+        ColumnKindTag::Continuous => raw.parse::<f64>().map_err(|err| {
+            DataError::SchemaMismatch {
                 reason: format!(
-                    "column '{}' is binary in schema but row {} has non-numeric value '{}': {}",
+                    "column '{}' is continuous in schema but row {} has non-numeric value '{}': {}",
                     col_name, row, raw, err
                 ),
-            })?;
+            }
+        })?,
+        ColumnKindTag::Binary => {
+            let v = raw
+                .parse::<f64>()
+                .map_err(|err| DataError::SchemaMismatch {
+                    reason: format!(
+                        "column '{}' is binary in schema but row {} has non-numeric value '{}': {}",
+                        col_name, row, raw, err
+                    ),
+                })?;
             if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
                 return Err(DataError::SchemaMismatch {
                     reason: format!(
@@ -1422,14 +1426,9 @@ fn load_parquet_with_schema(
                             ),
                         });
                     }
-                    if let Some(row) = values
-                        .column(j)
-                        .iter()
-                        .position(|value| {
-                            (*value - 0.0).abs() >= 1e-12
-                                && (*value - 1.0).abs() >= 1e-12
-                        })
-                    {
+                    if let Some(row) = values.column(j).iter().position(|value| {
+                        (*value - 0.0).abs() >= 1e-12 && (*value - 1.0).abs() >= 1e-12
+                    }) {
                         return Err(DataError::SchemaMismatch {
                             reason: format!(
                                 "column '{}' is binary in schema but row {} has value {}; expected 0 or 1",

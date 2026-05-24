@@ -259,7 +259,9 @@ pub fn evidence_hessian_log_det(source: EvidenceLogDetSource<'_>) -> Result<f64,
             Some(v) => Ok(v),
             None => match fallback_hvp {
                 Some(hvp) => hessian_log_det_from_hvp(hvp),
-                None => Err("evidence Hessian logdet requires exact factors or HVP fallback".into()),
+                None => {
+                    Err("evidence Hessian logdet requires exact factors or HVP fallback".into())
+                }
             },
         },
         EvidenceLogDetSource::Hvp(hvp) => hessian_log_det_from_hvp(hvp),
@@ -315,6 +317,15 @@ fn dense_spd_log_det(matrix: &Array2<f64>) -> Result<f64, String> {
             matrix.nrows(),
             matrix.ncols()
         ));
+    }
+    if crate::solver::gpu::cuda_selected() {
+        return crate::solver::gpu::reml_gpu::evidence_derivatives_gpu(
+            crate::solver::gpu::reml_gpu::RemlGpuInput {
+                penalized_hessian: matrix.view(),
+                derivative_hessians: Vec::new(),
+            },
+        )
+        .map(|evidence| evidence.logdet_hessian);
     }
     let (evals, _) = matrix
         .eigh(Side::Lower)
@@ -520,11 +531,7 @@ fn rademacher_unit_probe_into_slice(z: &mut [f64], probe: u64, scale: f64) {
 
 #[inline]
 fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E3779B97F4A7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^ (z >> 31)
+    crate::linalg::utils::splitmix64(state)
 }
 
 /// Sum of per-row arrow log-determinants plus the Schur log-det.
@@ -1001,7 +1008,9 @@ pub fn select_topology(
     let mut valid: Vec<TopologyCandidate> = candidates
         .iter()
         .filter(|c| {
-            c.converged && c.exclusion_reason.is_none() && c.negative_log_evidence.is_finite()
+            c.converged
+                && c.exclusion_reason.is_none()
+                && c.negative_log_evidence.is_finite()
                 && topology_selection_score(c, options.score_scale).is_finite()
         })
         .cloned()
@@ -1191,8 +1200,8 @@ mod tests {
             1.0,
         );
         assert!(v.is_finite());
-        let expected = 0.5 * (2.0_f64.ln() + 1.875_f64.ln())
-            - 0.5 * (2.0 * std::f64::consts::PI).ln();
+        let expected =
+            0.5 * (2.0_f64.ln() + 1.875_f64.ln()) - 0.5 * (2.0 * std::f64::consts::PI).ln();
         assert!((v - expected).abs() < 1e-12);
     }
 
@@ -1233,8 +1242,8 @@ mod tests {
             2.0,
             1.0,
         );
-        let expected = 0.5 * (2.0_f64.ln() + 1.875_f64.ln())
-            - 0.5 * (2.0 * std::f64::consts::PI).ln();
+        let expected =
+            0.5 * (2.0_f64.ln() + 1.875_f64.ln()) - 0.5 * (2.0 * std::f64::consts::PI).ln();
         assert!((v - expected).abs() < 1e-12);
     }
 

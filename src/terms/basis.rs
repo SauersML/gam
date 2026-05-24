@@ -1,17 +1,17 @@
 use crate::faer_ndarray::{
-    FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_abt,
-    fast_ata, fast_atb, rrqr_nullspace_basis,
+    FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_abt, fast_ata, fast_atb,
+    rrqr_nullspace_basis,
 };
 use crate::linalg::utils::KahanSum;
 use crate::matrix::{
     ChunkedKernelDesignOperator, CoefficientTransformOperator, DenseDesignOperator, DesignMatrix,
     LinearOperator,
 };
-use crate::resource::MatrixMaterializationError;
 use crate::probability::{
     binomial_coefficient_f64 as binomial_f64,
     stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg,
 };
+use crate::resource::MatrixMaterializationError;
 use crate::types::RhoPrior;
 use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
@@ -3437,7 +3437,9 @@ impl StreamingMaternEvaluator {
                 ));
             }
         }
-        let kernel_cols = ident_transform.as_ref().map_or(centers.nrows(), |z| z.ncols());
+        let kernel_cols = ident_transform
+            .as_ref()
+            .map_or(centers.nrows(), |z| z.ncols());
         Ok(Self {
             data: Arc::new(data.as_standard_layout().to_owned()),
             centers: Arc::new(centers.as_standard_layout().to_owned()),
@@ -4405,7 +4407,9 @@ impl LatentCoordDesignDerivativeBasis {
             Self::Jet {
                 jet,
                 ident_transform,
-            } => ident_transform.as_ref().map_or(jet.shape()[1], Array2::ncols),
+            } => ident_transform
+                .as_ref()
+                .map_or(jet.shape()[1], Array2::ncols),
         }
     }
 
@@ -4426,7 +4430,9 @@ impl LatentCoordDesignDerivativeBasis {
                 .map_or(self.p_after_pad(), Array2::ncols),
             Self::Jet {
                 ident_transform, ..
-            } => ident_transform.as_ref().map_or(self.raw_cols(), Array2::ncols),
+            } => ident_transform
+                .as_ref()
+                .map_or(self.raw_cols(), Array2::ncols),
         }
     }
 }
@@ -4599,11 +4605,8 @@ impl LatentCoordDesignDerivative {
                 basis_matrix.nrows()
             )));
         }
-        let mut jet = Array3::<f64>::zeros((
-            latent.n_obs(),
-            basis_matrix.ncols(),
-            basis_matrix.nrows(),
-        ));
+        let mut jet =
+            Array3::<f64>::zeros((latent.n_obs(), basis_matrix.ncols(), basis_matrix.nrows()));
         for row in 0..latent.n_obs() {
             for axis in 0..basis_matrix.nrows() {
                 for col in 0..basis_matrix.ncols() {
@@ -4663,10 +4666,7 @@ impl LatentCoordDesignDerivative {
         (flat_axis / d, flat_axis % d)
     }
 
-    fn unproject(
-        &self,
-        u: &ArrayView1<'_, f64>,
-    ) -> Result<(Array1<f64>, Array1<f64>), BasisError> {
+    fn unproject(&self, u: &ArrayView1<'_, f64>) -> Result<(Array1<f64>, Array1<f64>), BasisError> {
         match &self.basis {
             LatentCoordDesignDerivativeBasis::Radial {
                 ident_transform,
@@ -4734,9 +4734,7 @@ impl LatentCoordDesignDerivative {
                     .slice_mut(s![..constrained.len()])
                     .assign(&constrained);
                 if *n_poly > 0 {
-                    padded
-                        .slice_mut(s![constrained.len()..])
-                        .assign(raw_poly);
+                    padded.slice_mut(s![constrained.len()..]).assign(raw_poly);
                 }
                 Ok(match full_ident_transform {
                     Some(zf) => zf.t().dot(&padded),
@@ -4767,7 +4765,12 @@ impl LatentCoordDesignDerivative {
         }
     }
 
-    fn kernel_axis_scalar(&self, row: usize, center: usize, axis: usize) -> Result<f64, BasisError> {
+    fn kernel_axis_scalar(
+        &self,
+        row: usize,
+        center: usize,
+        axis: usize,
+    ) -> Result<f64, BasisError> {
         let (centers, radial_kind) = match &self.basis {
             LatentCoordDesignDerivativeBasis::Radial {
                 centers,
@@ -4913,7 +4916,9 @@ impl LatentCoordDesignDerivative {
                         raw_knot[center] = scale * self.kernel_axis_scalar(row, center, axis)?;
                     }
                 }
-                let raw_poly = self.polynomial_axis_values(row, axis).mapv(|value| scale * value);
+                let raw_poly = self
+                    .polynomial_axis_values(row, axis)
+                    .mapv(|value| scale * value);
                 self.project_and_pad(&raw_knot, &raw_poly)
             }
             LatentCoordDesignDerivativeBasis::Jet { jet, .. } => {
@@ -8436,10 +8441,9 @@ fn streaming_bspline_sum_cross(
             found: w.len(),
         });
     }
-    let cols = transform
-        .map(Array2::ncols)
-        .unwrap_or(bspline_raw_column_count(knots, degree, periodic)
-            .map_err(BasisError::InvalidInput)?);
+    let cols = transform.map(Array2::ncols).unwrap_or(
+        bspline_raw_column_count(knots, degree, periodic).map_err(BasisError::InvalidInput)?,
+    );
     let mut out = Array1::<f64>::zeros(cols);
     for start in (0..data.len()).step_by(chunk_size.max(1)) {
         let end = (start + chunk_size.max(1)).min(data.len());
@@ -8478,10 +8482,9 @@ fn streaming_bspline_orthogonality_transform(
             found: w.len(),
         });
     }
-    let cols = transform
-        .map(Array2::ncols)
-        .unwrap_or(bspline_raw_column_count(knots, degree, periodic)
-            .map_err(BasisError::InvalidInput)?);
+    let cols = transform.map(Array2::ncols).unwrap_or(
+        bspline_raw_column_count(knots, degree, periodic).map_err(BasisError::InvalidInput)?,
+    );
     if columns.ncols() == 0 {
         return Ok(Array2::eye(cols));
     }
@@ -8571,11 +8574,10 @@ fn build_streaming_bspline_design_and_candidates(
             transform_opt = Some(compose_bspline_transform(transform_opt, z)?);
         }
         BSplineIdentifiability::FrozenTransform { transform } => {
-            let raw_cols = transform_opt
-                .as_ref()
-                .map(Array2::ncols)
-                .unwrap_or(bspline_raw_column_count(knots, degree, periodic)
-                    .map_err(BasisError::InvalidInput)?);
+            let raw_cols = transform_opt.as_ref().map(Array2::ncols).unwrap_or(
+                bspline_raw_column_count(knots, degree, periodic)
+                    .map_err(BasisError::InvalidInput)?,
+            );
             if raw_cols != transform.nrows() {
                 return Err(BasisError::DimensionMismatch(format!(
                     "frozen identifiability transform mismatch: design has {} columns but transform has {} rows",
@@ -16139,10 +16141,7 @@ fn select_spherical_farthest_point_centers(
 /// of `f64` (`chunk = (256 MiB) / (n_basis_cols * 8)`), clamped to
 /// `[1024, n_rows]`. Returning `None` means "do not stream, materialize
 /// densely".
-pub fn auto_streaming_chunk_size_for_dense(
-    n_rows: usize,
-    n_basis_cols: usize,
-) -> Option<usize> {
+pub fn auto_streaming_chunk_size_for_dense(n_rows: usize, n_basis_cols: usize) -> Option<usize> {
     if n_rows == 0 || n_basis_cols == 0 {
         return None;
     }
@@ -16538,7 +16537,8 @@ pub fn build_matern_basiswithworkspace(
     let dense_bytes = dense_design_bytes(data.nrows(), design_cols);
     let matern_auto_chunk = auto_streaming_chunk_size_for_dense(data.nrows(), design_cols);
     let use_streaming = matern_auto_chunk.is_some();
-    let use_lazy = !use_streaming && should_use_lazy_spatial_design(data.nrows(), design_cols, workspace.policy());
+    let use_lazy = !use_streaming
+        && should_use_lazy_spatial_design(data.nrows(), design_cols, workspace.policy());
     let (design, candidates) = if let Some(chunk) = matern_auto_chunk {
         log::info!(
             "Matérn basis auto-streaming evaluator: n={} p={} chunk_size={}",
@@ -20772,7 +20772,11 @@ pub fn duchon_radial_first_derivative_nd(
                 cnt += 1;
             }
         }
-        if cnt == 0 || acc <= 0.0 { 1.0 } else { acc / cnt as f64 }
+        if cnt == 0 || acc <= 0.0 {
+            1.0
+        } else {
+            acc / cnt as f64
+        }
     });
     let mut out = Array2::<f64>::zeros((n_rows, n_centers));
     for n in 0..n_rows {
@@ -20783,14 +20787,8 @@ pub fn duchon_radial_first_derivative_nd(
                 r2 += dv * dv;
             }
             let r = r2.sqrt();
-            let jets = duchon_radial_jets(
-                r,
-                effective_length_scale,
-                p_order,
-                s_order,
-                dim,
-                &coeffs,
-            )?;
+            let jets =
+                duchon_radial_jets(r, effective_length_scale, p_order, s_order, dim, &coeffs)?;
             out[[n, k]] = jets.phi_r;
         }
     }
@@ -20871,14 +20869,8 @@ pub fn duchon_radial_second_derivative_nd(
                 r2 += dv * dv;
             }
             let r = r2.sqrt();
-            let jets = duchon_radial_jets(
-                r,
-                effective_length_scale,
-                p_order,
-                s_order,
-                dim,
-                &coeffs,
-            )?;
+            let jets =
+                duchon_radial_jets(r, effective_length_scale, p_order, s_order, dim, &coeffs)?;
             out[[n, k]] = jets.phi_rr;
         }
     }
@@ -20946,14 +20938,8 @@ pub fn duchon_radial_third_derivative_nd(
                 r2 += dv * dv;
             }
             let r = r2.sqrt();
-            let jets = duchon_radial_jets(
-                r,
-                effective_length_scale,
-                p_order,
-                s_order,
-                dim,
-                &coeffs,
-            )?;
+            let jets =
+                duchon_radial_jets(r, effective_length_scale, p_order, s_order, dim, &coeffs)?;
             out[[n, k]] = jets.phi_rrr;
         }
     }
@@ -21124,7 +21110,11 @@ fn wahba_sphere_kernel_sobolev_derivative_dcos(x: f64, m: usize) -> f64 {
         // Within 1e-10 of the poles, the recurrence identity divides by
         // 1-x^2 and loses the exact endpoint limit. Use
         // P_l'(±1) = l(l+1)/2 * (±1)^(l+1) directly.
-        let pole = if x.is_sign_negative() { -1.0_f64 } else { 1.0_f64 };
+        let pole = if x.is_sign_negative() {
+            -1.0_f64
+        } else {
+            1.0_f64
+        };
         let mut sum = 0.0_f64;
         for l in 1..=l_max {
             let ell = l as f64;
@@ -21209,8 +21199,8 @@ pub fn sphere_first_derivative_nd(
             centers.ncols()
         )));
     }
-    let tangent_projector = project_to_tangent
-        .then_some(crate::terms::latent_coord::LatentManifold::Sphere { dim });
+    let tangent_projector =
+        project_to_tangent.then_some(crate::terms::latent_coord::LatentManifold::Sphere { dim });
     let mut out = Array3::<f64>::zeros((n_rows, n_centers, dim));
     let mut ambient = Array1::<f64>::zeros(dim);
     for n in 0..n_rows {
@@ -21382,10 +21372,8 @@ pub fn bspline_tensor_first_derivative(
     }
     let mut out = Array3::<f64>::zeros((n_rows, total, n_axes));
     // Scratch per row: per-axis value vector and derivative vector.
-    let mut values_per_axis: Vec<Vec<f64>> =
-        k_per_axis.iter().map(|&k| vec![0.0; k]).collect();
-    let mut derivs_per_axis: Vec<Vec<f64>> =
-        k_per_axis.iter().map(|&k| vec![0.0; k]).collect();
+    let mut values_per_axis: Vec<Vec<f64>> = k_per_axis.iter().map(|&k| vec![0.0; k]).collect();
+    let mut derivs_per_axis: Vec<Vec<f64>> = k_per_axis.iter().map(|&k| vec![0.0; k]).collect();
     let mut idx = vec![0usize; n_axes];
     let mut prefix = vec![1.0; n_axes + 1];
     let mut suffix = vec![1.0; n_axes + 1];
@@ -24816,12 +24804,7 @@ pub fn create_ispline_derivative_dense(
                         "I-spline derivative row is not contiguous".to_string(),
                     )
                 })?;
-                evaluate_bspline_fourth_derivative_scalar(
-                    x,
-                    knot_vector.view(),
-                    bs_degree,
-                    row,
-                )?;
+                evaluate_bspline_fourth_derivative_scalar(x, knot_vector.view(), bs_degree, row)?;
             }
             db
         }
@@ -26073,7 +26056,10 @@ pub mod closed_form_penalty {
         kappa_derivative_order: usize,
     ) -> Vec<f64> {
         debug_assert!(b >= 1);
-        debug_assert!(kappa > 0.0, "matern kernel derivative requires kappa > 0: kappa={kappa}");
+        debug_assert!(
+            kappa > 0.0,
+            "matern kernel derivative requires kappa > 0: kappa={kappa}"
+        );
         debug_assert!(r > 0.0, "matern kernel derivative requires r > 0: r={r}");
         debug_assert!(
             kappa_derivative_order <= 2,
@@ -26699,7 +26685,10 @@ pub mod closed_form_penalty {
     ) -> Vec<f64> {
         assert!(d >= 1, "matern block requires dimension >= 1: d={d}");
         assert!(ell >= 1, "matern block requires ell >= 1: ell={ell}");
-        assert!(kappa > 0.0, "matern block requires kappa > 0: kappa={kappa}");
+        assert!(
+            kappa > 0.0,
+            "matern block requires kappa > 0: kappa={kappa}"
+        );
         assert!(r > 0.0, "matern block requires r > 0: r={r}");
         assert!(
             max_order <= 6,
@@ -36122,17 +36111,15 @@ mod tests {
             (
                 MaternNu::NineHalves,
                 a92,
-                -(3.0 / 35.0)
-                    * (-a92).exp()
-                    * (a92.powi(3) + 6.0 * a92 * a92 + 15.0 * a92 + 15.0),
+                -(3.0 / 35.0) * (-a92).exp() * (a92.powi(3) + 6.0 * a92 * a92 + 15.0 * a92 + 15.0),
                 (3.0 / 35.0)
                     * (-a92).exp()
                     * (a92.powi(4) + 2.0 * a92.powi(3) - 3.0 * a92 * a92 - 15.0 * a92 - 15.0),
             ),
         ];
         for (nu, _a, expected_ratio, expected_lap) in cases {
-            let triplet = matern_operator_psi_triplet(r, length_scale, nu, 1)
-                .expect("operator psi triplet");
+            let triplet =
+                matern_operator_psi_triplet(r, length_scale, nu, 1).expect("operator psi triplet");
             let ratio = triplet.3;
             let lap = triplet.6;
             assert!(
@@ -36179,9 +36166,7 @@ mod tests {
                     + (2.0 / 21.0) * a92.powi(3)
                     + (1.0 / 105.0) * a92.powi(4))
                     * (-a92).exp(),
-                -(3.0 / 35.0)
-                    * (-a92).exp()
-                    * (a92.powi(3) + 6.0 * a92 * a92 + 15.0 * a92 + 15.0),
+                -(3.0 / 35.0) * (-a92).exp() * (a92.powi(3) + 6.0 * a92 * a92 + 15.0 * a92 + 15.0),
                 (3.0 / 35.0)
                     * (-a92).exp()
                     * (a92.powi(4) + 2.0 * a92.powi(3) - 3.0 * a92 * a92 - 15.0 * a92 - 15.0),
@@ -37780,10 +37765,7 @@ mod tests {
                 let r3 = r2 * big_r;
                 let dm1 = (d as f64) - 1.0;
                 let dm3 = (d as f64) - 3.0;
-                fr[4]
-                    + 2.0 * dm1 * fr[3] / big_r
-                    + dm1 * dm3 * fr[2] / r2
-                    - dm1 * dm3 * fr[1] / r3
+                fr[4] + 2.0 * dm1 * fr[3] / big_r + dm1 * dm3 * fr[2] / r2 - dm1 * dm3 * fr[1] / r3
             }
         }
     }

@@ -799,15 +799,11 @@ pub struct WeightedOuterRow {
     pub stratum: u32,
 }
 
-/// Splitmix64: deterministic single-u64 expansion. Local copy so this module
-/// stays self-contained; matches the constants used elsewhere in the crate.
+/// Splitmix64: deterministic single-u64 expansion. Thin wrapper over the
+/// canonical implementation in [`crate::linalg::utils::splitmix64`].
 #[inline]
 fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E3779B97F4A7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^ (z >> 31)
+    crate::linalg::utils::splitmix64(state)
 }
 
 /// Configuration for the automatic outer-score subsampler.

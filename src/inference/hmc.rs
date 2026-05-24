@@ -34,8 +34,7 @@ use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv, fast_
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::matrix::DesignMatrix;
 use crate::solver::mixture_link::{
-    InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link,
-    softmax_last_fixedzero,
+    InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link, softmax_last_fixedzero,
 };
 use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior, is_valid_tweedie_power};
 use crate::visualizer::VisualizerSession;
@@ -604,7 +603,8 @@ impl NutsPosterior {
             validate_binary_responses("binomial NUTS", &y, &weights).map_err(String::from)?;
         }
         if matches!(nuts_family, NutsFamily::NegativeBinomialLog) {
-            validate_count_responses("negative-binomial NUTS", &y, &weights).map_err(String::from)?;
+            validate_count_responses("negative-binomial NUTS", &y, &weights)
+                .map_err(String::from)?;
         }
 
         // Use faer for numerically stable Cholesky decomposition of H
@@ -972,7 +972,11 @@ fn log_terms_from_mu_and_dmu(
             "binomial inverse link returned invalid mu/deta derivative: mu={mu}, dmu_deta={dmu_deta}"
         ));
     }
-    let log_mu = if mu == 0.0 { f64::NEG_INFINITY } else { mu.ln() };
+    let log_mu = if mu == 0.0 {
+        f64::NEG_INFINITY
+    } else {
+        mu.ln()
+    };
     let one_minus_mu = 1.0 - mu;
     let log1m_mu = if one_minus_mu == 0.0 {
         f64::NEG_INFINITY
@@ -1004,7 +1008,8 @@ fn binomial_link_terms(
     eta: f64,
     n_link_params: usize,
 ) -> Result<BinomialLinkTerms, String> {
-    let jet = inverse_link_jet_for_inverse_link(inverse_link, eta).map_err(|err| err.to_string())?;
+    let jet =
+        inverse_link_jet_for_inverse_link(inverse_link, eta).map_err(|err| err.to_string())?;
     let mut dmu_dlink = vec![0.0; n_link_params];
     if n_link_params > 0 {
         match inverse_link
@@ -1122,7 +1127,10 @@ fn joint_binomial_logp_and_grad(
             Ok((ll, grad_beta))
         }
         _ => Err(HmcError::UnsupportedFamily {
-            reason: format!("{} is not a binomial joint-HMC family", family.pretty_name()),
+            reason: format!(
+                "{} is not a binomial joint-HMC family",
+                family.pretty_name()
+            ),
         }
         .into()),
     }
@@ -1296,10 +1304,7 @@ fn probit_logp_and_grad_into(
 /// log p(y|η) = Σ [y·log(1−exp(−exp(η))) + (1−y)·(−exp(η))]
 /// gradient_i = w_i · [y_i · exp(η_i)·exp(−exp(η_i)) / (1−exp(−exp(η_i))) − (1−y_i)·exp(η_i)]
 #[inline]
-fn cloglog_bernoulli_logp_and_residual(
-    eta: f64,
-    y: f64,
-) -> Result<(f64, f64), EstimationError> {
+fn cloglog_bernoulli_logp_and_residual(eta: f64, y: f64) -> Result<(f64, f64), EstimationError> {
     if !(eta.is_finite() && (-700.0..=700.0).contains(&eta)) {
         return Err(EstimationError::InvalidInput(format!(
             "cloglog eta must be finite and within [-700, 700]; got {eta}"
@@ -1345,8 +1350,8 @@ fn cloglog_logp_and_grad_into(
         .map(|(i, slot)| {
             let y_i = data.y[i];
             let w_i = data.weights[i];
-            let (ll_i, residual_i) = cloglog_bernoulli_logp_and_residual(eta[i], y_i)
-                .expect("validated cloglog eta");
+            let (ll_i, residual_i) =
+                cloglog_bernoulli_logp_and_residual(eta[i], y_i).expect("validated cloglog eta");
             *slot = w_i * residual_i;
             w_i * ll_i
         })
@@ -1466,8 +1471,7 @@ fn tweedie_log_quasilogp_and_grad(
             let y_i = data.y[i];
             let w_i = data.weights[i] * inv_phi;
             *slot = w_i * (y_i - mu_i) * mu_i.powf(1.0 - p);
-            let qll = y_i * mu_i.powf(1.0 - p) / (1.0 - p)
-                - mu_i.powf(2.0 - p) / (2.0 - p);
+            let qll = y_i * mu_i.powf(1.0 - p) / (1.0 - p) - mu_i.powf(2.0 - p) / (2.0 - p);
             w_i * qll
         })
         .sum();
@@ -1785,10 +1789,8 @@ mod tests {
         assert!((ll_y1 - wrong_log_one_minus_exp_eta).abs() > 0.5);
 
         let eps = 1e-6;
-        let (lp, _) =
-            cloglog_bernoulli_logp_and_residual(eta + eps, 1.0).expect("valid eta");
-        let (lm, _) =
-            cloglog_bernoulli_logp_and_residual(eta - eps, 1.0).expect("valid eta");
+        let (lp, _) = cloglog_bernoulli_logp_and_residual(eta + eps, 1.0).expect("valid eta");
+        let (lm, _) = cloglog_bernoulli_logp_and_residual(eta - eps, 1.0).expect("valid eta");
         let fd = (lp - lm) / (2.0 * eps);
         assert!(
             (residual_y1 - fd).abs() < 1e-9,
@@ -3083,12 +3085,8 @@ fn validate_nuts_target_accept(target_accept: f64) -> Result<(), HmcError> {
 }
 
 #[inline]
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+fn splitmix64(x: u64) -> u64 {
+    crate::linalg::utils::splitmix64_hash(x)
 }
 
 #[inline]
@@ -3360,19 +3358,12 @@ pub fn run_logit_polya_gamma_gibbs(
 
     for chain in 0..config.n_chains {
         progress.begin_chain(chain, "polya-gamma gibbs");
-        let mut pg_rng = StdRng::seed_from_u64(
-            chain_stream_seed(config.seed, chain, 0x4D94_DF4E_5D72_81AB),
-        );
-        let mut init_rng = StdRng::seed_from_u64(chain_stream_seed(
-            config.seed,
-            chain,
-            0xB3C4_5A1F_8E9D_7632,
-        ));
-        let mut draw_rng = StdRng::seed_from_u64(chain_stream_seed(
-            config.seed,
-            chain,
-            0x17A9_26D5_4C1B_E083,
-        ));
+        let mut pg_rng =
+            StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0x4D94_DF4E_5D72_81AB));
+        let mut init_rng =
+            StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0xB3C4_5A1F_8E9D_7632));
+        let mut draw_rng =
+            StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0x17A9_26D5_4C1B_E083));
         let pg = PolyaGamma::new();
         let mut beta = mode.to_owned();
         // Small jitter so chains are not perfectly coupled.
@@ -3535,19 +3526,12 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
 
     let mut kept = 0usize;
     for chain in 0..config.n_chains {
-        let mut pg_rng = StdRng::seed_from_u64(
-            chain_stream_seed(config.seed, chain, 0x83F1_56C9_A7E0_2D4B),
-        );
-        let mut init_rng = StdRng::seed_from_u64(chain_stream_seed(
-            config.seed,
-            chain,
-            0x28F0_7B65_1A4D_C93E,
-        ));
-        let mut draw_rng = StdRng::seed_from_u64(chain_stream_seed(
-            config.seed,
-            chain,
-            0xC642_6E35_B5A9_1D80,
-        ));
+        let mut pg_rng =
+            StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0x83F1_56C9_A7E0_2D4B));
+        let mut init_rng =
+            StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0x28F0_7B65_1A4D_C93E));
+        let mut draw_rng =
+            StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, 0xC642_6E35_B5A9_1D80));
         let pg = PolyaGamma::new();
         let mut beta = mode.to_owned();
         for j in 0..p {
@@ -3689,8 +3673,7 @@ pub(crate) fn run_nuts_sampling(
     let chol = target.chol().clone();
     let mode_arr = target.mode().clone();
 
-    let initial_positions =
-        jittered_initial_positions(config, dim, 0.1, 0x0F65_83B2_BC71_4D9E);
+    let initial_positions = jittered_initial_positions(config, dim, 0.1, 0x0F65_83B2_BC71_4D9E);
 
     // Create GenericNUTS sampler - it auto-tunes step size!
     let mass_cfg = robust_mass_matrix_config(dim, config.nwarmup);
@@ -4138,7 +4121,8 @@ impl LinkWigglePosterior {
             .into());
         }
         if nuts_family.likelihood_family().is_binomial() {
-            validate_binary_responses("binomial link-wiggle NUTS", &y, &weights).map_err(String::from)?;
+            validate_binary_responses("binomial link-wiggle NUTS", &y, &weights)
+                .map_err(String::from)?;
         }
         if matches!(nuts_family, NutsFamily::NegativeBinomialLog) {
             validate_count_responses("negative-binomial link-wiggle NUTS", &y, &weights)
@@ -4344,14 +4328,13 @@ impl LinkWigglePosterior {
                         return f64::NEG_INFINITY;
                     }
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
-                    let (ll_i, residual_i) =
-                        match cloglog_bernoulli_logp_and_residual(eta_i, y_i) {
-                            Ok(values) => values,
-                            Err(_) => {
-                                grad.fill(0.0);
-                                return f64::NEG_INFINITY;
-                            }
-                        };
+                    let (ll_i, residual_i) = match cloglog_bernoulli_logp_and_residual(eta_i, y_i) {
+                        Ok(values) => values,
+                        Err(_) => {
+                            grad.fill(0.0);
+                            return f64::NEG_INFINITY;
+                        }
+                    };
                     ll_acc += w_i * ll_i;
                     residual[i] = w_i * residual_i;
                 }
@@ -4389,9 +4372,8 @@ impl LinkWigglePosterior {
                     }
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
                     let mu = eta_i.exp().max(1e-300);
-                    ll_acc += w_i
-                        * (y_i * mu.powf(1.0 - p) / (1.0 - p)
-                            - mu.powf(2.0 - p) / (2.0 - p));
+                    ll_acc +=
+                        w_i * (y_i * mu.powf(1.0 - p) / (1.0 - p) - mu.powf(2.0 - p) / (2.0 - p));
                     residual[i] = w_i * (y_i - mu) * mu.powf(1.0 - p);
                 }
                 ll = ll_acc;
@@ -4488,8 +4470,8 @@ impl LinkWigglePosterior {
         let grad_beta = &fast_atv(&self.x, &r_scaled) - &(&s_base_beta * penalty_scale);
 
         // Penalty (also φ-scaled for Gaussian; see `penalty_scale` above).
-        let penalty = penalty_scale
-            * (0.5 * beta.dot(&s_base_beta) + 0.5 * theta.dot(&s_link_theta));
+        let penalty =
+            penalty_scale * (0.5 * beta.dot(&s_base_beta) + 0.5 * theta.dot(&s_link_theta));
 
         // Assemble joint gradient and transform to whitened space
         let mut grad_q = Array1::<f64>::zeros(dim);
@@ -4559,8 +4541,7 @@ pub fn run_link_wiggle_nuts_sampling(
     let chol = target.chol().clone();
     let mode_arr = target.mode_joint();
 
-    let initial_positions =
-        jittered_initial_positions(config, dim, 0.1, 0x8C48_0F65_3A2B_D917);
+    let initial_positions = jittered_initial_positions(config, dim, 0.1, 0x8C48_0F65_3A2B_D917);
 
     let mass_cfg = robust_mass_matrix_config(dim, config.nwarmup);
     let mut sampler = GenericNUTS::new_with_mass_matrix(
@@ -5237,7 +5218,10 @@ impl JointBetaRhoPosterior {
         match &self.inverse_link {
             InverseLink::Sas(_) => {
                 if link_params.len() != 2 {
-                    return Err(format!("SAS link parameter length must be 2, got {}", link_params.len()));
+                    return Err(format!(
+                        "SAS link parameter length must be 2, got {}",
+                        link_params.len()
+                    ));
                 }
                 Ok(InverseLink::Sas(crate::types::SasLinkState::new(
                     link_params[0],
@@ -5246,7 +5230,9 @@ impl JointBetaRhoPosterior {
             }
             InverseLink::BetaLogistic(_) => {
                 if link_params.len() != 2 || !link_params.iter().all(|v| v.is_finite()) {
-                    return Err("Beta-Logistic link parameters must be finite with length 2".to_string());
+                    return Err(
+                        "Beta-Logistic link parameters must be finite with length 2".to_string()
+                    );
                 }
                 Ok(InverseLink::BetaLogistic(crate::types::SasLinkState {
                     epsilon: link_params[0],
@@ -5262,7 +5248,9 @@ impl JointBetaRhoPosterior {
                     rho,
                 }))
             }
-            InverseLink::Standard(_) | InverseLink::LatentCLogLog(_) => Ok(self.inverse_link.clone()),
+            InverseLink::Standard(_) | InverseLink::LatentCLogLog(_) => {
+                Ok(self.inverse_link.clone())
+            }
         }
     }
 
@@ -5304,7 +5292,10 @@ impl JointBetaRhoPosterior {
         let inverse_link = match self.inverse_link_with_params(link_params) {
             Ok(link) => link,
             Err(err) => {
-                log::warn!("[Joint HMC] adaptive inverse-link parameters are invalid: {}", err);
+                log::warn!(
+                    "[Joint HMC] adaptive inverse-link parameters are invalid: {}",
+                    err
+                );
                 out_grad.fill(0.0);
                 return f64::NEG_INFINITY;
             }
@@ -5609,7 +5600,8 @@ pub fn run_joint_beta_rho_sampling(
             }
             // Small jitter for adaptive link parameters around fitted state
             for k in 0..n_link_params {
-                pos[n_beta + n_rho + k] = link_param_mode[k] + sample_standard_normal(&mut rng) * 0.05;
+                pos[n_beta + n_rho + k] =
+                    link_param_mode[k] + sample_standard_normal(&mut rng) * 0.05;
             }
             pos
         })
@@ -5901,8 +5893,7 @@ mod survival_hmc {
         let mode_arr = target.mode().clone();
         let dim = mode_arr.len();
 
-        let initial_positions =
-            jittered_initial_positions(config, dim, 0.1, 0xEC2D_7A9B_4051_F638);
+        let initial_positions = jittered_initial_positions(config, dim, 0.1, 0xEC2D_7A9B_4051_F638);
 
         // Create GenericNUTS sampler
         let mass_cfg = robust_survival_mass_matrix_config(dim, config.nwarmup);

@@ -7,4 +7,3 @@ impl PenaltyManifest for OrthogonalityPenalty {
     const PYTHON_WRAPPER: &'static str = "OrthogonalityPenalty";
     const ROW_BLOCK_DIAGONAL: bool = false;
 }
-

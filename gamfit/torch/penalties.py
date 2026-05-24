@@ -434,7 +434,8 @@ class RiemannianRetraction(Optimizer):
     @torch.no_grad()
     def step(self, closure: Callable[[], torch.Tensor] | None = None) -> torch.Tensor | None:
         loss = closure() if closure is not None else None
-        manifold_json = json.dumps(self.manifold if isinstance(self.manifold, dict) else {"kind": self.manifold})
+        manifold_spec = self.manifold.to_json() if hasattr(self.manifold, "to_json") else self.manifold
+        manifold_json = json.dumps(manifold_spec if isinstance(manifold_spec, dict) else {"kind": manifold_spec})
         for group in self.param_groups:
             lr = float(group["lr"])
             inner_steps = int(group["inner_steps"])

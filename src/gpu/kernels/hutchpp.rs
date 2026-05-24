@@ -27,14 +27,12 @@ pub fn backend_status() -> BackendStatus {
 }
 
 /// Cheap deterministic 64-bit hash (SplitMix64) used to derive probe vectors
-/// without pulling a dedicated RNG crate.
+/// without pulling a dedicated RNG crate. Thin wrapper over
+/// [`crate::linalg::utils::splitmix64`] so existing call sites in this
+/// module are unchanged.
 #[inline]
 fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+    crate::linalg::utils::splitmix64(state)
 }
 
 /// Build a length-`n` Rademacher probe from a 64-bit seed.
@@ -129,14 +127,17 @@ extern "C" __global__ void hutchpp_dot_kernel(
     let ptx = compile_ptx(KERNEL).map_err(|e| GpuError::DriverCallFailed {
         reason: format!("hutchpp NVRTC compile failed: {e}"),
     })?;
-    let module = ctx.load_module(ptx).map_err(|e| GpuError::DriverCallFailed {
-        reason: format!("hutchpp load module failed: {e}"),
-    })?;
-    let func = module
-        .load_function("hutchpp_dot_kernel")
+    let module = ctx
+        .load_module(ptx)
         .map_err(|e| GpuError::DriverCallFailed {
-            reason: format!("hutchpp load function failed: {e}"),
+            reason: format!("hutchpp load module failed: {e}"),
         })?;
+    let func =
+        module
+            .load_function("hutchpp_dot_kernel")
+            .map_err(|e| GpuError::DriverCallFailed {
+                reason: format!("hutchpp load function failed: {e}"),
+            })?;
 
     let threads: u32 = 256;
     let blocks = ((n as u32) + threads - 1) / threads;

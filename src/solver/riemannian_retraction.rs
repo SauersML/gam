@@ -12,8 +12,11 @@ pub struct EuclideanRetraction;
 impl Retraction for EuclideanRetraction {
     fn retract(&self, base: &mut ArrayViewMut1<f64>, tangent: ArrayView1<f64>) {
         debug_assert_eq!(base.len(), tangent.len());
-        for (value, delta) in base.iter_mut().zip(tangent.iter()) {
-            *value += *delta;
+        let manifold = crate::geometry::EuclideanManifold::new(base.len());
+        let next = crate::geometry::RiemannianManifold::exp_map(&manifold, base.view(), tangent)
+            .expect("Euclidean retraction dimensions were prevalidated");
+        for axis in 0..base.len() {
+            base[axis] = next[axis];
         }
     }
 }
@@ -25,7 +28,10 @@ impl Retraction for CircleRetraction {
     fn retract(&self, base: &mut ArrayViewMut1<f64>, tangent: ArrayView1<f64>) {
         debug_assert_eq!(base.len(), 1);
         debug_assert_eq!(tangent.len(), 1);
-        base[0] = wrap_angle(base[0] + tangent[0]);
+        let manifold = crate::geometry::CircleManifold::new();
+        let next = crate::geometry::RiemannianManifold::exp_map(&manifold, base.view(), tangent)
+            .expect("Circle retraction dimensions were prevalidated");
+        base[0] = next[0];
     }
 }
 
@@ -38,18 +44,15 @@ impl Retraction for SphereRetraction {
     fn retract(&self, base: &mut ArrayViewMut1<f64>, tangent: ArrayView1<f64>) {
         debug_assert_eq!(base.len(), self.dim);
         debug_assert_eq!(tangent.len(), self.dim);
-        let mut norm_sq = 0.0_f64;
-        for axis in 0..self.dim {
-            let next = base[axis] + tangent[axis];
-            norm_sq += next * next;
-        }
-        let norm = norm_sq.sqrt();
         assert!(
-            norm.is_finite() && norm > 0.0,
-            "SphereRetraction cannot normalize a zero or non-finite update"
+            self.dim >= 2,
+            "SphereRetraction ambient dim must be at least 2"
         );
+        let manifold = crate::geometry::SphereManifold::new(self.dim - 1);
+        let next = crate::geometry::RiemannianManifold::exp_map(&manifold, base.view(), tangent)
+            .expect("Sphere retraction dimensions were prevalidated");
         for axis in 0..self.dim {
-            base[axis] = (base[axis] + tangent[axis]) / norm;
+            base[axis] = next[axis];
         }
     }
 }
@@ -141,8 +144,4 @@ impl Retraction for RetractionKind {
             Self::Product(product) => product.retract(base, tangent),
         }
     }
-}
-
-fn wrap_angle(theta: f64) -> f64 {
-    (theta + std::f64::consts::PI).rem_euclid(TWO_PI) - std::f64::consts::PI
 }

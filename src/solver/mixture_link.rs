@@ -1244,14 +1244,12 @@ pub fn inverse_link_jet_for_family(
         LikelihoodFamily::PoissonLog
         | LikelihoodFamily::Tweedie { .. }
         | LikelihoodFamily::NegativeBinomial { .. }
-        | LikelihoodFamily::GammaLog => {
-            inverse_link_jet_for_link_function(
-                LinkFunction::Log,
-                eta,
-                mixture_link_state,
-                sas_link_state,
-            )
-        }
+        | LikelihoodFamily::GammaLog => inverse_link_jet_for_link_function(
+            LinkFunction::Log,
+            eta,
+            mixture_link_state,
+            sas_link_state,
+        ),
         LikelihoodFamily::BetaLogit { .. } => inverse_link_jet_for_link_function(
             LinkFunction::Logit,
             eta,

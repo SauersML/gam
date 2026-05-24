@@ -4858,11 +4858,7 @@ fn clamped_binomial_probability(mu: f64) -> (f64, bool) {
 
 #[inline]
 fn stable_softplus(x: f64) -> f64 {
-    if x > 0.0 {
-        x + (-x).exp().ln_1p()
-    } else {
-        x.exp().ln_1p()
-    }
+    crate::linalg::utils::stable_softplus(x)
 }
 
 #[inline]
@@ -14470,17 +14466,14 @@ where
         let Some(dir_j) = self.psi_direction(psi_j)? else {
             return Ok(None);
         };
-        Ok(Some(
-            self.family
-                .ws_psi_second_order_terms_from_parts(
-                    &self.block_states,
-                    &self.derivative_blocks,
-                    dir_i.as_ref(),
-                    dir_j.as_ref(),
-                    self.x_t.as_ref(),
-                    self.x_ls.as_ref(),
-                )?,
-        ))
+        Ok(Some(self.family.ws_psi_second_order_terms_from_parts(
+            &self.block_states,
+            &self.derivative_blocks,
+            dir_i.as_ref(),
+            dir_j.as_ref(),
+            self.x_t.as_ref(),
+            self.x_ls.as_ref(),
+        )?))
     }
 
     fn hessian_directional_derivative(
@@ -14493,14 +14486,13 @@ where
         };
         Ok(Some(
             crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
-                self.family
-                    .ws_psi_hessian_directional_from_parts(
-                        &self.block_states,
-                        dir.as_ref(),
-                        d_beta_flat,
-                        self.x_t.as_ref(),
-                        self.x_ls.as_ref(),
-                    )?,
+                self.family.ws_psi_hessian_directional_from_parts(
+                    &self.block_states,
+                    dir.as_ref(),
+                    d_beta_flat,
+                    self.x_t.as_ref(),
+                    self.x_ls.as_ref(),
+                )?,
             ),
         ))
     }
@@ -19246,14 +19238,10 @@ impl BinomialLocationScaleWiggleFamily {
             c_b.slice_mut(s![pt + pls..]).assign(&qw_b);
             c_ab.fill(0.0);
             c_ab.slice_mut(s![0..pt]).scaled_add(q_t_ab, &xtr);
-            c_ab.slice_mut(s![0..pt])
-                .scaled_add(q_t_b, &xta.view());
-            c_ab.slice_mut(s![0..pt])
-                .scaled_add(q_t_a, &xtb.view());
-            c_ab.slice_mut(s![0..pt])
-                .scaled_add(q_t, &xtab.view());
-            c_ab.slice_mut(s![pt..pt + pls])
-                .scaled_add(q_ls_ab, &xlsr);
+            c_ab.slice_mut(s![0..pt]).scaled_add(q_t_b, &xta.view());
+            c_ab.slice_mut(s![0..pt]).scaled_add(q_t_a, &xtb.view());
+            c_ab.slice_mut(s![0..pt]).scaled_add(q_t, &xtab.view());
+            c_ab.slice_mut(s![pt..pt + pls]).scaled_add(q_ls_ab, &xlsr);
             c_ab.slice_mut(s![pt..pt + pls])
                 .scaled_add(q_ls_b, &xlsa.view());
             c_ab.slice_mut(s![pt..pt + pls])
@@ -19297,8 +19285,18 @@ impl BinomialLocationScaleWiggleFamily {
             scaled_outer_add(r_a.slice_mut(s![0..pt, 0..pt]), q_tt, xta.view(), xtr);
             scaled_outer_add(r_a.slice_mut(s![0..pt, 0..pt]), q_tt, xtr, xta.view());
             scaled_outer_add(r_a.slice_mut(s![0..pt, pt..pt + pls]), q_tl_a, xtr, xlsr);
-            scaled_outer_add(r_a.slice_mut(s![0..pt, pt..pt + pls]), q_tl, xta.view(), xlsr);
-            scaled_outer_add(r_a.slice_mut(s![0..pt, pt..pt + pls]), q_tl, xtr, xlsa.view());
+            scaled_outer_add(
+                r_a.slice_mut(s![0..pt, pt..pt + pls]),
+                q_tl,
+                xta.view(),
+                xlsr,
+            );
+            scaled_outer_add(
+                r_a.slice_mut(s![0..pt, pt..pt + pls]),
+                q_tl,
+                xtr,
+                xlsa.view(),
+            );
             scaled_outer_add(
                 r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]),
                 q_ll_a,
@@ -19347,8 +19345,18 @@ impl BinomialLocationScaleWiggleFamily {
             scaled_outer_add(r_b.slice_mut(s![0..pt, 0..pt]), q_tt, xtb.view(), xtr);
             scaled_outer_add(r_b.slice_mut(s![0..pt, 0..pt]), q_tt, xtr, xtb.view());
             scaled_outer_add(r_b.slice_mut(s![0..pt, pt..pt + pls]), q_tl_b, xtr, xlsr);
-            scaled_outer_add(r_b.slice_mut(s![0..pt, pt..pt + pls]), q_tl, xtb.view(), xlsr);
-            scaled_outer_add(r_b.slice_mut(s![0..pt, pt..pt + pls]), q_tl, xtr, xlsb.view());
+            scaled_outer_add(
+                r_b.slice_mut(s![0..pt, pt..pt + pls]),
+                q_tl,
+                xtb.view(),
+                xlsr,
+            );
+            scaled_outer_add(
+                r_b.slice_mut(s![0..pt, pt..pt + pls]),
+                q_tl,
+                xtr,
+                xlsb.view(),
+            );
             scaled_outer_add(
                 r_b.slice_mut(s![pt..pt + pls, pt..pt + pls]),
                 q_ll_b,
@@ -19400,15 +19408,20 @@ impl BinomialLocationScaleWiggleFamily {
             scaled_outer_add(r_ab.slice_mut(s![0..pt, 0..pt]), q_tt_a, xtr, xtb.view());
             scaled_outer_add(r_ab.slice_mut(s![0..pt, 0..pt]), q_tt, xtab.view(), xtr);
             scaled_outer_add(r_ab.slice_mut(s![0..pt, 0..pt]), q_tt, xtr, xtab.view());
-            scaled_outer_add(r_ab.slice_mut(s![0..pt, 0..pt]), q_tt, xta.view(), xtb.view());
-            scaled_outer_add(r_ab.slice_mut(s![0..pt, 0..pt]), q_tt, xtb.view(), xta.view());
-
             scaled_outer_add(
-                r_ab.slice_mut(s![0..pt, pt..pt + pls]),
-                q_tl_ab,
-                xtr,
-                xlsr,
+                r_ab.slice_mut(s![0..pt, 0..pt]),
+                q_tt,
+                xta.view(),
+                xtb.view(),
             );
+            scaled_outer_add(
+                r_ab.slice_mut(s![0..pt, 0..pt]),
+                q_tt,
+                xtb.view(),
+                xta.view(),
+            );
+
+            scaled_outer_add(r_ab.slice_mut(s![0..pt, pt..pt + pls]), q_tl_ab, xtr, xlsr);
             scaled_outer_add(
                 r_ab.slice_mut(s![0..pt, pt..pt + pls]),
                 q_tl_b,
@@ -19892,10 +19905,7 @@ impl BinomialLocationScaleWiggleFamily {
             dq_tw_a_u.scaled_add(dq0_t_a_u, &dr);
             dq_lw_a_u.fill(0.0);
             dq_lw_a_u.scaled_add(dq0_u * q0_a * q0.q_ls, &d3r);
-            dq_lw_a_u.scaled_add(
-                dq0_a_u * q0.q_ls + q0_a * dq0_ls_u + dq0_u * q0_ls_a,
-                &ddr,
-            );
+            dq_lw_a_u.scaled_add(dq0_a_u * q0.q_ls + q0_a * dq0_ls_u + dq0_u * q0_ls_a, &ddr);
             dq_lw_a_u.scaled_add(dq0_ls_a_u, &dr);
 
             b.fill(0.0);
@@ -19931,9 +19941,10 @@ impl BinomialLocationScaleWiggleFamily {
                     + q_tw_a_dot_u,
                 &xtr,
             );
-            gamma_a
-                .slice_mut(s![0..pt])
-                .scaled_add(q_tt * xi_t_i + q_tl * xi_ls_i + q0.q_t * d_dot_u, &xta.view());
+            gamma_a.slice_mut(s![0..pt]).scaled_add(
+                q_tt * xi_t_i + q_tl * xi_ls_i + q0.q_t * d_dot_u,
+                &xta.view(),
+            );
             gamma_a.slice_mut(s![pt..pt + pls]).scaled_add(
                 q_tl_a * xi_t_i
                     + q_tl * xi_ta_i
@@ -19942,15 +19953,14 @@ impl BinomialLocationScaleWiggleFamily {
                     + q_lw_a_dot_u,
                 &xlsr,
             );
-            gamma_a
-                .slice_mut(s![pt..pt + pls])
-                .scaled_add(q_tl * xi_t_i + q_ll * xi_ls_i + q0.q_ls * d_dot_u, &xlsa.view());
+            gamma_a.slice_mut(s![pt..pt + pls]).scaled_add(
+                q_tl * xi_t_i + q_ll * xi_ls_i + q0.q_ls * d_dot_u,
+                &xlsa.view(),
+            );
             gamma_a
                 .slice_mut(s![pt + pls..])
                 .scaled_add(xi_t_i, &q_tw_a);
-            gamma_a
-                .slice_mut(s![pt + pls..])
-                .scaled_add(xi_ta_i, &q_tw);
+            gamma_a.slice_mut(s![pt + pls..]).scaled_add(xi_ta_i, &q_tw);
             gamma_a
                 .slice_mut(s![pt + pls..])
                 .scaled_add(xi_ls_i, &q_lw_a);
@@ -19970,7 +19980,12 @@ impl BinomialLocationScaleWiggleFamily {
                 xlsr,
                 xlsr,
             );
-            scaled_outer_add(q_mat.slice_mut(s![0..pt, pt + pls..]), 1.0, xtr, q_tw.view());
+            scaled_outer_add(
+                q_mat.slice_mut(s![0..pt, pt + pls..]),
+                1.0,
+                xtr,
+                q_tw.view(),
+            );
             scaled_outer_add(
                 q_mat.slice_mut(s![pt..pt + pls, pt + pls..]),
                 1.0,
@@ -19984,8 +19999,18 @@ impl BinomialLocationScaleWiggleFamily {
             scaled_outer_add(r_a.slice_mut(s![0..pt, 0..pt]), q_tt, xta.view(), xtr);
             scaled_outer_add(r_a.slice_mut(s![0..pt, 0..pt]), q_tt, xtr, xta.view());
             scaled_outer_add(r_a.slice_mut(s![0..pt, pt..pt + pls]), q_tl_a, xtr, xlsr);
-            scaled_outer_add(r_a.slice_mut(s![0..pt, pt..pt + pls]), q_tl, xta.view(), xlsr);
-            scaled_outer_add(r_a.slice_mut(s![0..pt, pt..pt + pls]), q_tl, xtr, xlsa.view());
+            scaled_outer_add(
+                r_a.slice_mut(s![0..pt, pt..pt + pls]),
+                q_tl,
+                xta.view(),
+                xlsr,
+            );
+            scaled_outer_add(
+                r_a.slice_mut(s![0..pt, pt..pt + pls]),
+                q_tl,
+                xtr,
+                xlsa.view(),
+            );
             scaled_outer_add(
                 r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]),
                 q_ll_a,
@@ -20004,8 +20029,18 @@ impl BinomialLocationScaleWiggleFamily {
                 xlsr,
                 xlsa.view(),
             );
-            scaled_outer_add(r_a.slice_mut(s![0..pt, pt + pls..]), 1.0, xta.view(), q_tw.view());
-            scaled_outer_add(r_a.slice_mut(s![0..pt, pt + pls..]), 1.0, xtr, q_tw_a.view());
+            scaled_outer_add(
+                r_a.slice_mut(s![0..pt, pt + pls..]),
+                1.0,
+                xta.view(),
+                q_tw.view(),
+            );
+            scaled_outer_add(
+                r_a.slice_mut(s![0..pt, pt + pls..]),
+                1.0,
+                xtr,
+                q_tw_a.view(),
+            );
             scaled_outer_add(
                 r_a.slice_mut(s![pt..pt + pls, pt + pls..]),
                 1.0,
@@ -20029,7 +20064,12 @@ impl BinomialLocationScaleWiggleFamily {
                 xlsr,
                 xlsr,
             );
-            scaled_outer_add(c_u.slice_mut(s![0..pt, pt + pls..]), 1.0, xtr, dq_tw_u.view());
+            scaled_outer_add(
+                c_u.slice_mut(s![0..pt, pt + pls..]),
+                1.0,
+                xtr,
+                dq_tw_u.view(),
+            );
             scaled_outer_add(
                 c_u.slice_mut(s![pt..pt + pls, pt + pls..]),
                 1.0,
@@ -20040,8 +20080,18 @@ impl BinomialLocationScaleWiggleFamily {
 
             delta_a.fill(0.0);
             scaled_outer_add(delta_a.slice_mut(s![0..pt, 0..pt]), dq_tt_a_u, xtr, xtr);
-            scaled_outer_add(delta_a.slice_mut(s![0..pt, 0..pt]), dq_tt_u, xta.view(), xtr);
-            scaled_outer_add(delta_a.slice_mut(s![0..pt, 0..pt]), dq_tt_u, xtr, xta.view());
+            scaled_outer_add(
+                delta_a.slice_mut(s![0..pt, 0..pt]),
+                dq_tt_u,
+                xta.view(),
+                xtr,
+            );
+            scaled_outer_add(
+                delta_a.slice_mut(s![0..pt, 0..pt]),
+                dq_tt_u,
+                xtr,
+                xta.view(),
+            );
             scaled_outer_add(
                 delta_a.slice_mut(s![0..pt, pt..pt + pls]),
                 dq_tl_a_u,
@@ -20112,12 +20162,7 @@ impl BinomialLocationScaleWiggleFamily {
             scaled_outer_add(out.view_mut(), loss_2, gamma.view(), c_a.view());
             scaled_outer_add(out.view_mut(), loss_2, c_a.view(), gamma.view());
             out.scaled_add(loss_2 * alpha_a, &q_mat);
-            scaled_outer_add(
-                out.view_mut(),
-                loss_3 * alpha * q_a,
-                b.view(),
-                b.view(),
-            );
+            scaled_outer_add(out.view_mut(), loss_3 * alpha * q_a, b.view(), b.view());
             scaled_outer_add(out.view_mut(), loss_3 * q_a, gamma.view(), b.view());
             scaled_outer_add(out.view_mut(), loss_3 * q_a, b.view(), gamma.view());
             scaled_outer_add(out.view_mut(), loss_3 * alpha, c_a.view(), b.view());

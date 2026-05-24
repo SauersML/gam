@@ -70,9 +70,8 @@ use gam::terms::sae_manifold::{
 use gam::terms::smooth::BlockwisePenalty;
 use gam::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
-    DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty, IsometryPenalty,
-    IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty, NuclearNormPenalty,
-    OrthogonalityPenalty,
+    DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge,
+    JumpReLUPenalty, MechanismSparsityPenalty, NuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
     SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
@@ -5389,9 +5388,7 @@ fn gated_sae_decode<'py>(
 ) -> PyResult<Py<PyArray2<f64>>> {
     let decoder = GatedSAEDecoder::new(w_gate.as_array().to_owned(), w_amp.as_array().to_owned())
         .map_err(py_value_error)?;
-    let out = decoder
-        .decode_batch(x.as_array())
-        .map_err(py_value_error)?;
+    let out = decoder.decode_batch(x.as_array()).map_err(py_value_error)?;
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -11852,15 +11849,9 @@ fn build_analytic_penalty_registry_from_json(
                     .get("learnable")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
-                let penalty = IvaeRidgeMeanGauge::new(
-                    slice,
-                    aux,
-                    ridge_eps,
-                    weight,
-                    n_eff,
-                    learnable,
-                )
-                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty =
+                    IvaeRidgeMeanGauge::new(slice, aux, ridge_eps, weight, n_eff, learnable)
+                        .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
@@ -12024,12 +12015,10 @@ fn analytic_penalty_value_grad<'py>(
     ))
 }
 
-fn parse_manifold_kind(
-    value: &serde_json::Value,
-) -> Result<gam::solver::riemannian::ManifoldKind, String> {
+fn parse_manifold_kind(value: &serde_json::Value) -> Result<gam::geometry::ManifoldSpec, String> {
     if let Some(name) = value.as_str() {
         return match name.to_ascii_lowercase().as_str() {
-            "circle" | "s1" => Ok(gam::solver::riemannian::ManifoldKind::Circle),
+            "circle" | "s1" => Ok(gam::geometry::ManifoldSpec::Circle),
             other => Err(format!("unknown manifold string {other:?}")),
         };
     }
@@ -12049,20 +12038,21 @@ fn parse_manifold_kind(
                 .or_else(|| obj.get("d"))
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| "euclidean manifold requires dim".to_string())?;
-            Ok(gam::solver::riemannian::ManifoldKind::Euclidean(
+            Ok(gam::geometry::ManifoldSpec::Euclidean(
                 json_positive_u64_to_usize(dim, "euclidean.dim")?,
             ))
         }
-        "circle" | "s1" => Ok(gam::solver::riemannian::ManifoldKind::Circle),
+        "circle" | "s1" => Ok(gam::geometry::ManifoldSpec::Circle),
         "sphere" => {
             let n = obj
-                .get("n")
+                .get("intrinsic_dim")
+                .or_else(|| obj.get("n"))
                 .or_else(|| obj.get("dim"))
                 .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| "sphere manifold requires n or dim".to_string())?;
-            Ok(gam::solver::riemannian::ManifoldKind::Sphere(
-                json_positive_u64_to_usize(n, "sphere.n")?,
-            ))
+                .ok_or_else(|| "sphere manifold requires intrinsic_dim".to_string())?;
+            Ok(gam::geometry::ManifoldSpec::Sphere {
+                intrinsic_dim: json_positive_u64_to_usize(n, "sphere.intrinsic_dim")?,
+            })
         }
         "torus" => {
             let d = obj
@@ -12070,9 +12060,46 @@ fn parse_manifold_kind(
                 .or_else(|| obj.get("dim"))
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| "torus manifold requires d".to_string())?;
-            Ok(gam::solver::riemannian::ManifoldKind::Torus(
-                json_positive_u64_to_usize(d, "torus.d")?,
-            ))
+            Ok(gam::geometry::ManifoldSpec::Torus {
+                dim: json_positive_u64_to_usize(d, "torus.d")?,
+            })
+        }
+        "grassmann" => {
+            let k = obj
+                .get("k")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| "grassmann manifold requires k".to_string())?;
+            let n = obj
+                .get("n")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| "grassmann manifold requires n".to_string())?;
+            Ok(gam::geometry::ManifoldSpec::Grassmann {
+                k: json_positive_u64_to_usize(k, "grassmann.k")?,
+                n: json_positive_u64_to_usize(n, "grassmann.n")?,
+            })
+        }
+        "stiefel" => {
+            let k = obj
+                .get("k")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| "stiefel manifold requires k".to_string())?;
+            let n = obj
+                .get("n")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| "stiefel manifold requires n".to_string())?;
+            Ok(gam::geometry::ManifoldSpec::Stiefel {
+                k: json_positive_u64_to_usize(k, "stiefel.k")?,
+                n: json_positive_u64_to_usize(n, "stiefel.n")?,
+            })
+        }
+        "spd" => {
+            let n = obj
+                .get("n")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| "spd manifold requires n".to_string())?;
+            Ok(gam::geometry::ManifoldSpec::Spd {
+                n: json_positive_u64_to_usize(n, "spd.n")?,
+            })
         }
         "product" => {
             let parts = obj
@@ -12084,7 +12111,7 @@ fn parse_manifold_kind(
             for part in parts {
                 parsed.push(parse_manifold_kind(part)?);
             }
-            Ok(gam::solver::riemannian::ManifoldKind::Product(parsed))
+            Ok(gam::geometry::ManifoldSpec::Product(parsed))
         }
         other => Err(format!("unknown manifold kind {other:?}")),
     }
@@ -12119,12 +12146,13 @@ fn riemannian_retract<'py>(
     }
     let mut out = Array2::<f64>::zeros(p.dim());
     for row in 0..p.nrows() {
-        gam::solver::riemannian::retract_euclidean_delta(
-            manifold.as_ref(),
-            p.row(row),
-            d.row(row),
-            out.row_mut(row),
-        );
+        let tangent = manifold
+            .project_tangent(p.row(row), d.row(row))
+            .map_err(|err| py_value_error(err.to_string()))?;
+        let next = manifold
+            .retract(p.row(row), tangent.view())
+            .map_err(|err| py_value_error(err.to_string()))?;
+        out.row_mut(row).assign(&next);
     }
     Ok(out.into_pyarray(py).unbind())
 }

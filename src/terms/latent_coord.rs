@@ -192,9 +192,10 @@ impl LatentManifold {
             Self::Euclidean => fallback_dim,
             Self::Circle | Self::Interval { .. } => 1,
             Self::Sphere { dim } => *dim,
-            Self::Product(parts) | Self::ProductWithMetric { manifolds: parts, .. } => {
-                parts.iter().map(|part| part.ambient_dim(1)).sum()
-            }
+            Self::Product(parts)
+            | Self::ProductWithMetric {
+                manifolds: parts, ..
+            } => parts.iter().map(|part| part.ambient_dim(1)).sum(),
         }
     }
 
@@ -253,7 +254,10 @@ impl LatentManifold {
                 out[0] = t[0].clamp(*lo, *hi);
                 out
             }
-            Self::Product(parts) | Self::ProductWithMetric { manifolds: parts, .. } => {
+            Self::Product(parts)
+            | Self::ProductWithMetric {
+                manifolds: parts, ..
+            } => {
                 let mut out = Array1::<f64>::zeros(t.len());
                 let mut offset = 0_usize;
                 for part in parts {
@@ -299,7 +303,10 @@ impl LatentManifold {
                 out[0] = (t[0] + xi[0]).clamp(*lo, *hi);
                 out
             }
-            Self::Product(parts) | Self::ProductWithMetric { manifolds: parts, .. } => {
+            Self::Product(parts)
+            | Self::ProductWithMetric {
+                manifolds: parts, ..
+            } => {
                 let mut out = Array1::<f64>::zeros(t.len());
                 let mut offset = 0_usize;
                 for part in parts {
@@ -344,7 +351,10 @@ impl LatentManifold {
                 out[0] = if at_lo || at_hi { 0.0 } else { v[0] };
                 out
             }
-            Self::Product(parts) | Self::ProductWithMetric { manifolds: parts, .. } => {
+            Self::Product(parts)
+            | Self::ProductWithMetric {
+                manifolds: parts, ..
+            } => {
                 let mut out = Array1::<f64>::zeros(v.len());
                 let mut offset = 0_usize;
                 for part in parts {
@@ -412,7 +422,10 @@ impl LatentManifold {
                 }
                 self.project_to_tangent(t, ambient.view())
             }
-            Self::Product(parts) | Self::ProductWithMetric { manifolds: parts, .. } => {
+            Self::Product(parts)
+            | Self::ProductWithMetric {
+                manifolds: parts, ..
+            } => {
                 let mut out = Array1::<f64>::zeros(t.len());
                 let mut offset = 0_usize;
                 for part in parts {
@@ -493,17 +506,17 @@ impl LatentManifold {
                     }
                 }
             }
-            Self::Product(parts) | Self::ProductWithMetric { manifolds: parts, .. } => {
+            Self::Product(parts)
+            | Self::ProductWithMetric {
+                manifolds: parts, ..
+            } => {
                 let mut offset = 0_usize;
                 for part in parts {
                     let dim = part.ambient_dim(1);
-                    let mut block = matrix
-                        .slice_mut(ndarray::s![offset..offset + dim, offset..offset + dim]);
+                    let mut block =
+                        matrix.slice_mut(ndarray::s![offset..offset + dim, offset..offset + dim]);
                     let mut owned = block.to_owned();
-                    part.add_normal_pinning(
-                        t.slice(ndarray::s![offset..offset + dim]),
-                        &mut owned,
-                    );
+                    part.add_normal_pinning(t.slice(ndarray::s![offset..offset + dim]), &mut owned);
                     block.assign(&owned);
                     offset += dim;
                 }
@@ -656,7 +669,13 @@ impl LatentCoordValues {
         latent_dim: usize,
         id_mode: LatentIdMode,
     ) -> Self {
-        Self::from_flat_with_manifold(values, n_obs, latent_dim, id_mode, LatentManifold::Euclidean)
+        Self::from_flat_with_manifold(
+            values,
+            n_obs,
+            latent_dim,
+            id_mode,
+            LatentManifold::Euclidean,
+        )
     }
 
     /// Construct directly from a flat array and explicit latent manifold.
@@ -848,7 +867,9 @@ impl LatentCoordValues {
         for n in 0..self.n_obs {
             let start = n * self.latent_dim;
             let end = start + self.latent_dim;
-            let projected = self.manifold.project_point(self.values.slice(ndarray::s![start..end]));
+            let projected = self
+                .manifold
+                .project_point(self.values.slice(ndarray::s![start..end]));
             for a in 0..self.latent_dim {
                 self.values[start + a] = projected[a];
             }
@@ -1096,9 +1117,7 @@ fn normalize_or_axis(v: ArrayView1<'_, f64>, dim: usize) -> Array1<f64> {
         // vectors; the term builder validates this upstream.
         // SAFETY: a zero/non-finite norm means the upstream contract
         // was broken at the caller boundary.
-        panic!(
-            "LatentManifold::Sphere cannot normalize a zero or non-finite ambient vector"
-        );
+        panic!("LatentManifold::Sphere cannot normalize a zero or non-finite ambient vector");
     }
     let inv = 1.0 / norm_sq.sqrt();
     let mut out = Array1::<f64>::zeros(dim);
@@ -1130,15 +1149,11 @@ fn matvec(a: ArrayView2<'_, f64>, x: ArrayView1<'_, f64>) -> Array1<f64> {
     out
 }
 
+#[inline]
 fn symmetrize(a: &mut Array2<f64>) {
-    let n = a.nrows().min(a.ncols());
-    for i in 0..n {
-        for j in 0..i {
-            let v = 0.5 * (a[[i, j]] + a[[j, i]]);
-            a[[i, j]] = v;
-            a[[j, i]] = v;
-        }
-    }
+    // Callers in this module always pass square (d, d) matrices; delegate to
+    // the canonical helper in `linalg::utils`.
+    crate::linalg::utils::enforce_symmetry(a)
 }
 
 /// Auxiliary-prior penalty contribution: returns the per-row reference

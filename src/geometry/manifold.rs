@@ -112,18 +112,14 @@ impl ManifoldSpec {
             Self::Grassmann { k, n } => Box::new(crate::geometry::GrassmannManifold::new(*k, *n)),
             Self::Stiefel { k, n } => Box::new(crate::geometry::StiefelManifold::new(*k, *n)),
             Self::Spd { n } => Box::new(crate::geometry::SpdManifold::new(*n)),
-            Self::Product(parts) => {
-                Box::new(crate::geometry::ProductManifold::new(parts.iter().map(Self::build).collect()))
-            }
+            Self::Product(parts) => Box::new(crate::geometry::ProductManifold::new(
+                parts.iter().map(Self::build).collect(),
+            )),
         }
     }
 }
 
-pub(crate) fn check_len(
-    context: &'static str,
-    got: usize,
-    expected: usize,
-) -> GeometryResult<()> {
+pub(crate) fn check_len(context: &'static str, got: usize, expected: usize) -> GeometryResult<()> {
     if got == expected {
         Ok(())
     } else {
@@ -175,7 +171,11 @@ pub(crate) fn sym(a: &Array2<f64>) -> Array2<f64> {
     out
 }
 
-pub(crate) fn from_flat(v: ArrayView1<'_, f64>, rows: usize, cols: usize) -> GeometryResult<Array2<f64>> {
+pub(crate) fn from_flat(
+    v: ArrayView1<'_, f64>,
+    rows: usize,
+    cols: usize,
+) -> GeometryResult<Array2<f64>> {
     check_len("flat matrix", v.len(), rows * cols)?;
     let mut out = Array2::<f64>::zeros((rows, cols));
     for i in 0..rows {
@@ -283,7 +283,9 @@ pub(crate) fn inverse(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
 pub(crate) fn jacobi_symmetric(a: &Array2<f64>) -> GeometryResult<(Array1<f64>, Array2<f64>)> {
     let n = a.nrows();
     if n != a.ncols() {
-        return Err(GeometryError::InvalidPoint("Jacobi eigensolver requires square input"));
+        return Err(GeometryError::InvalidPoint(
+            "Jacobi eigensolver requires square input",
+        ));
     }
     let mut d = sym(a);
     let mut v = identity(n);
@@ -344,7 +346,9 @@ pub(crate) fn spectral_map_spd(
     let mut diag = Array2::<f64>::zeros((n, n));
     for i in 0..n {
         if evals[i] <= 0.0 || !evals[i].is_finite() {
-            return Err(GeometryError::InvalidPoint("SPD eigenvalue is not positive"));
+            return Err(GeometryError::InvalidPoint(
+                "SPD eigenvalue is not positive",
+            ));
         }
         diag[[i, i]] = f(evals[i])?;
     }
@@ -367,7 +371,9 @@ pub(crate) fn spectral_map_symmetric(
 pub(crate) fn cholesky_spd(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
     let n = a.nrows();
     if n != a.ncols() {
-        return Err(GeometryError::InvalidPoint("Cholesky requires square input"));
+        return Err(GeometryError::InvalidPoint(
+            "Cholesky requires square input",
+        ));
     }
     let mut l = Array2::<f64>::zeros((n, n));
     for i in 0..n {
@@ -378,7 +384,9 @@ pub(crate) fn cholesky_spd(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
             }
             if i == j {
                 if sum <= GEOMETRY_EPS || !sum.is_finite() {
-                    return Err(GeometryError::InvalidPoint("matrix is not positive definite"));
+                    return Err(GeometryError::InvalidPoint(
+                        "matrix is not positive definite",
+                    ));
                 }
                 l[[i, j]] = sum.sqrt();
             } else {

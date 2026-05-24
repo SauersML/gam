@@ -43,9 +43,7 @@
 
 use ndarray::{Array1, Array3, ArrayView1, ArrayView2, ArrayViewMut2, ArrayViewMut3};
 
-use crate::terms::basis::{
-    duchon_partial_fraction_coeffs, BasisError, MaternNu, RadialScalarKind,
-};
+use crate::terms::basis::{BasisError, MaternNu, RadialScalarKind, duchon_partial_fraction_coeffs};
 
 // =========================================================================
 // Kernel parameter bundle
@@ -645,7 +643,7 @@ pub fn contract_input_loc_gradient(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array2};
+    use ndarray::{Array2, array};
 
     fn finite_diff_grad(
         kernel: &RadialInputKernel,
@@ -695,10 +693,7 @@ mod tests {
             for k in 0..centers.nrows() {
                 for a in 0..t.ncols() {
                     let diff = (analytic[[n, k, a]] - numeric[[n, k, a]]).abs();
-                    assert!(
-                        diff < 1e-4,
-                        "Duchon grad mismatch at ({n},{k},{a}): {diff}"
-                    );
+                    assert!(diff < 1e-4, "Duchon grad mismatch at ({n},{k},{a}): {diff}");
                 }
             }
         }
@@ -714,8 +709,8 @@ mod tests {
         // for Matérn ν ≥ 3/2).
         let t: Array2<f64> = array![[0.5, 0.5]];
         let centers: Array2<f64> = array![[0.5, 0.5]];
-        let g = basis_input_loc_grad_alloc(&kernel, t.view(), centers.view())
-            .expect("collision grad");
+        let g =
+            basis_input_loc_grad_alloc(&kernel, t.view(), centers.view()).expect("collision grad");
         assert_eq!(g[[0, 0, 0]], 0.0);
         assert_eq!(g[[0, 0, 1]], 0.0);
     }
@@ -834,7 +829,9 @@ mod tests {
     fn contract_input_loc_gradient_matches_einsum() {
         let jet = Array3::from_shape_vec(
             (2, 3, 2),
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
         )
         .unwrap();
         let grad_phi = array![[1.0_f64, 0.0, 1.0], [0.0, 1.0, 0.0]];
@@ -887,7 +884,10 @@ mod tests {
         let (_, q, _) = kind
             .eval_design_triplet(eps)
             .expect("ν=1/2 at r=ε is finite");
-        assert!(q.abs() > 1e6, "expected divergent q for Matérn ν=1/2 near r=0, got {q}");
+        assert!(
+            q.abs() > 1e6,
+            "expected divergent q for Matérn ν=1/2 near r=0, got {q}"
+        );
     }
 
     #[test]
@@ -934,7 +934,10 @@ mod tests {
         let (_, q, _) = kind
             .eval_design_triplet(eps)
             .expect("TPS dim=2 at r=ε is finite");
-        assert!(q.abs() > 10.0, "expected large |q| for TPS dim=2 near r=0, got {q}");
+        assert!(
+            q.abs() > 10.0,
+            "expected large |q| for TPS dim=2 near r=0, got {q}"
+        );
     }
 
     #[test]

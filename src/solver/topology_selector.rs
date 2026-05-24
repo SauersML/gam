@@ -239,9 +239,7 @@ pub fn tk_normalized_score(
             "TopologyAutoSelector TK normalizer requires null-space Hessian logdet".to_string()
         })?;
         if !logdet.is_finite() {
-            return Err(
-                "TopologyAutoSelector null-space Hessian logdet is not finite".to_string(),
-            );
+            return Err("TopologyAutoSelector null-space Hessian logdet is not finite".to_string());
         }
         -0.5 * null_dim.max(0.0) * TK_LOG_2PI + 0.5 * logdet
     };

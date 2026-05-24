@@ -64,8 +64,8 @@ pub fn init_parallelism() {
 
 pub mod cache;
 pub mod families;
-pub mod gpu;
 pub mod geometry;
+pub mod gpu;
 pub mod inference;
 pub mod linalg;
 pub mod report;
@@ -80,13 +80,13 @@ pub mod types;
 pub use data::{
     encode_recordswith_inferred_schema, load_csvwith_inferred_schema, load_csvwith_schema,
 };
-pub use gpu::{GpuDecision, GpuPolicy};
 pub use geometry::{
     CircleManifold, EuclideanManifold, GeodesicIntegrator, GeometryError, GeometryResult,
     GrassmannManifold, ManifoldSpec, ProductManifold, RiemannianLBFGS, RiemannianManifold,
     RiemannianObjective, RiemannianTrustRegion, SpdManifold, SphereManifold, StiefelManifold,
     TorusManifold,
 };
+pub use gpu::{GpuDecision, GpuPolicy};
 pub use inference::{
     alo, data, diagnostics, generative, hmc, predict, probability, quadrature, sample, smooth_test,
 };

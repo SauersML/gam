@@ -7,4 +7,3 @@ impl PenaltyManifest for TopKActivationPenalty {
     const PYTHON_WRAPPER: &'static str = "TopKActivationPenalty";
     const ROW_BLOCK_DIAGONAL: bool = true;
 }
-

@@ -2530,12 +2530,14 @@ impl FittedModel {
             runtime.model_class,
             PredictModelClass::BernoulliMarginalSlope
         ) {
-            let unified = self.payload().unified.as_ref().ok_or_else(|| {
-                FittedModelError::MissingField {
-                    reason: "marginal-slope model is missing unified fit payload; refit"
-                        .to_string(),
-                }
-            })?;
+            let unified =
+                self.payload()
+                    .unified
+                    .as_ref()
+                    .ok_or_else(|| FittedModelError::MissingField {
+                        reason: "marginal-slope model is missing unified fit payload; refit"
+                            .to_string(),
+                    })?;
             validate_marginal_slope_saved_fit(
                 unified,
                 runtime.score_warp.as_ref(),
@@ -2946,12 +2948,12 @@ impl FittedModel {
                     reason: "marginal-slope model is missing z_column; refit".to_string(),
                 });
             }
-            let z_normalization = self.latent_z_normalization.ok_or_else(|| {
-                FittedModelError::MissingField {
-                    reason: "marginal-slope model is missing latent_z_normalization; refit"
-                        .to_string(),
-                }
-            })?;
+            let z_normalization =
+                self.latent_z_normalization
+                    .ok_or_else(|| FittedModelError::MissingField {
+                        reason: "marginal-slope model is missing latent_z_normalization; refit"
+                            .to_string(),
+                    })?;
             z_normalization.validate("marginal-slope model")?;
             let latent_measure =
                 self.latent_measure
@@ -3037,12 +3039,14 @@ impl FittedModel {
                     }
                         })?;
                 z_normalization.validate("survival marginal-slope model")?;
-                let latent_measure = self.latent_measure.as_ref().ok_or_else(|| {
-                    FittedModelError::MissingField {
-                        reason: "survival marginal-slope model is missing latent_measure; refit"
-                            .to_string(),
-                    }
-                })?;
+                let latent_measure =
+                    self.latent_measure
+                        .as_ref()
+                        .ok_or_else(|| FittedModelError::MissingField {
+                            reason:
+                                "survival marginal-slope model is missing latent_measure; refit"
+                                    .to_string(),
+                        })?;
                 latent_measure
                     .validate("survival marginal-slope model latent_measure")
                     .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
@@ -3297,12 +3301,13 @@ impl FittedModel {
                 self.link_deviation_runtime.as_ref(),
                 "fit_result",
             )?;
-            let unified = self.unified.as_ref().ok_or_else(|| {
-                FittedModelError::MissingField {
+            let unified = self
+                .unified
+                .as_ref()
+                .ok_or_else(|| FittedModelError::MissingField {
                     reason: "marginal-slope model is missing unified fit payload; refit"
                         .to_string(),
-                }
-            })?;
+                })?;
             validate_marginal_slope_saved_fit(
                 unified,
                 self.score_warp_runtime.as_ref(),

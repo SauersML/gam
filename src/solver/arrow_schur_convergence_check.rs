@@ -407,13 +407,9 @@ fn symmetric_eigenvalue_bounds(a: &Array2<f64>) -> (f64, f64) {
     (lo, hi)
 }
 
+#[inline]
 fn symmetrize(a: &mut Array2<f64>) {
-    let n = a.nrows().min(a.ncols());
-    for i in 0..n {
-        for j in 0..i {
-            let v = 0.5 * (a[[i, j]] + a[[j, i]]);
-            a[[i, j]] = v;
-            a[[j, i]] = v;
-        }
-    }
+    // Callers in this module always pass square matrices (Schur complements);
+    // delegate to the canonical helper in `linalg::utils`.
+    crate::linalg::utils::enforce_symmetry(a)
 }
