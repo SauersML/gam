@@ -686,10 +686,7 @@ fn hash_array3(hasher: &mut StableHasher, values: &ndarray::Array3<f64>) {
     }
 }
 
-fn hash_psi_slice(
-    hasher: &mut StableHasher,
-    target: &crate::terms::analytic_penalties::PsiSlice,
-) {
+fn hash_psi_slice(hasher: &mut StableHasher, target: &crate::terms::analytic_penalties::PsiSlice) {
     hasher.write_usize(target.range.start);
     hasher.write_usize(target.range.end);
     match target.latent_dim {
@@ -3065,22 +3062,20 @@ impl<'a> RemlState<'a> {
         let beta = if use_original_basis {
             self.sparse_exact_beta_original(pirls_result)
         } else if let Some(z) = free_basis_opt.as_ref() {
-            z.t()
-                .dot(pirls_result.beta_transformed.as_ref())
+            z.t().dot(pirls_result.beta_transformed.as_ref())
         } else {
             pirls_result.beta_transformed.as_ref().clone()
         };
-        let firth_op = if self.config.firth_bias_reduction
-            && reml_supports_firth(self.config.likelihood)
-        {
-            Some(std::sync::Arc::new(Self::build_firth_dense_operator(
-                &x_eff_dense,
-                &pirls_result.final_eta,
-                self.weights,
-            )?))
-        } else {
-            None
-        };
+        let firth_op =
+            if self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood) {
+                Some(std::sync::Arc::new(Self::build_firth_dense_operator(
+                    &x_eff_dense,
+                    &pirls_result.final_eta,
+                    self.weights,
+                )?))
+            } else {
+                None
+            };
 
         self.tierney_kadane_analytic_core(
             &x_eff_dense,
@@ -5872,9 +5867,7 @@ impl<'a> RemlState<'a> {
         let pirls_result = self.execute_pirls_if_needed(rho)?;
         let (mut h_total, ridge_passport) = self.effectivehessian(pirls_result.as_ref())?;
         let mut firth_dense_operator: Option<Arc<FirthDenseOperator>> = None;
-        if self.config.firth_bias_reduction
-            && reml_supports_firth(self.config.likelihood)
-        {
+        if self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood) {
             let firth_n = pirls_result.x_transformed.nrows();
             let firth_p = pirls_result.x_transformed.ncols();
             if !super::firth_problem_scale_allows(firth_n, firth_p) {
@@ -7676,8 +7669,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         free_basis_opt: &Option<Array2<f64>>,
     ) -> Result<Option<std::sync::Arc<super::FirthDenseOperator>>, EstimationError> {
-        if !(self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood))
-        {
+        if !(self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood)) {
             return Ok(None);
         }
 
@@ -7839,27 +7831,26 @@ impl<'a> RemlState<'a> {
 
         // Sparse exact still uses the same dense Jeffreys operator; only the
         // H^{-1} applications move to the sparse Cholesky operator.
-        let firth_op = if self.config.firth_bias_reduction
-            && reml_supports_firth(self.config.likelihood)
-        {
-            if let Some(cached) = bundle.firth_dense_operator_original.clone() {
-                Some(cached)
+        let firth_op =
+            if self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood) {
+                if let Some(cached) = bundle.firth_dense_operator_original.clone() {
+                    Some(cached)
+                } else {
+                    let x_dense = self
+                        .x()
+                        .try_to_dense_arc(
+                            "sparse exact REML runtime requires dense design for Firth operator",
+                        )
+                        .map_err(EstimationError::InvalidInput)?;
+                    Some(std::sync::Arc::new(Self::build_firth_dense_operator(
+                        x_dense.as_ref(),
+                        &pirls_result.final_eta,
+                        self.weights,
+                    )?))
+                }
             } else {
-                let x_dense = self
-                    .x()
-                    .try_to_dense_arc(
-                        "sparse exact REML runtime requires dense design for Firth operator",
-                    )
-                    .map_err(EstimationError::InvalidInput)?;
-                Some(std::sync::Arc::new(Self::build_firth_dense_operator(
-                    x_dense.as_ref(),
-                    &pirls_result.final_eta,
-                    self.weights,
-                )?))
-            }
-        } else {
-            None
-        };
+                None
+            };
 
         // Dispersion and derivative provider depend on family.
         let (dispersion, deriv_provider): (_, Box<dyn super::unified::HessianDerivativeProvider>) =
@@ -8025,8 +8016,8 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
-        use std::borrow::Cow;
         use super::unified::{DenseSpectralOperator, PseudoLogdetMode};
+        use std::borrow::Cow;
 
         let pirls_result = bundle.pirls_result.as_ref();
         let ridge_passport = pirls_result.ridge_passport;
@@ -8077,12 +8068,9 @@ impl<'a> RemlState<'a> {
         );
 
         let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
-        let uses_kron_penalty_logdet = self
-            .kronecker_penalty_system
-            .as_ref()
-            .is_some_and(|kron| {
-                self.kronecker_factored.is_some() && kron.num_penalties() == rho.len()
-            });
+        let uses_kron_penalty_logdet = self.kronecker_penalty_system.as_ref().is_some_and(|kron| {
+            self.kronecker_factored.is_some() && kron.num_penalties() == rho.len()
+        });
         let needs_penalty_subspace = !uses_kron_penalty_logdet
             || (matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial);
         let penalty_subspace = if needs_penalty_subspace {
@@ -8100,8 +8088,7 @@ impl<'a> RemlState<'a> {
         )?;
 
         let beta = if let Some(z) = free_basis_opt.as_ref() {
-            z.t()
-                .dot(pirls_result.beta_transformed.as_ref())
+            z.t().dot(pirls_result.beta_transformed.as_ref())
         } else {
             pirls_result.beta_transformed.as_ref().clone()
         };
@@ -8178,10 +8165,8 @@ impl<'a> RemlState<'a> {
                         "projected Hessian logdet requires penalty subspace".to_string(),
                     ));
                 };
-                let (log_det_h_proj, kernel) = self.fixed_subspace_hessian_projected_parts(
-                    &h_for_operator,
-                    penalty_subspace,
-                )?;
+                let (log_det_h_proj, kernel) =
+                    self.fixed_subspace_hessian_projected_parts(&h_for_operator, penalty_subspace)?;
                 (
                     log_det_h_proj - hessian_op.logdet(),
                     kernel.map(std::sync::Arc::new),
@@ -8425,12 +8410,9 @@ impl<'a> RemlState<'a> {
 
         let e_for_logdet = &pirls_result.reparam_result.e_transformed;
         let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
-        let uses_kron_penalty_logdet = self
-            .kronecker_penalty_system
-            .as_ref()
-            .is_some_and(|kron| {
-                self.kronecker_factored.is_some() && kron.num_penalties() == rho.len()
-            });
+        let uses_kron_penalty_logdet = self.kronecker_penalty_system.as_ref().is_some_and(|kron| {
+            self.kronecker_factored.is_some() && kron.num_penalties() == rho.len()
+        });
         let needs_penalty_subspace = !uses_kron_penalty_logdet
             || (matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial);
         let penalty_subspace = if needs_penalty_subspace {
@@ -8509,10 +8491,8 @@ impl<'a> RemlState<'a> {
                     &crate::faer_ndarray::fast_atb(qs, &h_total_original),
                     qs,
                 );
-                let (log_det_h_proj, kernel_trans) = self.fixed_subspace_hessian_projected_parts(
-                    &h_transformed,
-                    penalty_subspace,
-                )?;
+                let (log_det_h_proj, kernel_trans) =
+                    self.fixed_subspace_hessian_projected_parts(&h_transformed, penalty_subspace)?;
                 let kernel_orig = kernel_trans.map(|kernel_trans| {
                     let u_s_orig = qs.dot(&kernel_trans.u_s);
                     std::sync::Arc::new(super::unified::PenaltySubspaceTrace {
@@ -8687,16 +8667,17 @@ impl<'a> RemlState<'a> {
         .map_err(EstimationError::InvalidInput)?;
         let cost_result = self.apply_tk_to_result(cost_result, tk_terms)?;
         self.store_ift_mode_response_cache_from_result(rho, bundle, &cost_result);
-        let gradient = cost_result
-            .gradient
-            .as_ref()
-            .ok_or_else(|| EstimationError::GradientUnavailable {
-                context: concat!(
-                    "[outer-efs-first-order-fallback] EFS needs gradient; ",
-                    "switch to BFGS or compass search"
-                ),
-                mode: "ValueAndGradient",
-            })?;
+        let gradient =
+            cost_result
+                .gradient
+                .as_ref()
+                .ok_or_else(|| EstimationError::GradientUnavailable {
+                    context: concat!(
+                        "[outer-efs-first-order-fallback] EFS needs gradient; ",
+                        "switch to BFGS or compass search"
+                    ),
+                    mode: "ValueAndGradient",
+                })?;
 
         let efs_eval = if has_psi {
             let hybrid = compute_hybrid_efs_update(

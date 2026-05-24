@@ -101,9 +101,7 @@ impl GumbelTemperatureSchedule {
             }
             ScheduleKind::Linear { steps } => {
                 if steps == 0 {
-                    return Err(
-                        "GumbelTemperatureSchedule::Linear: steps must be positive".into(),
-                    );
+                    return Err("GumbelTemperatureSchedule::Linear: steps must be positive".into());
                 }
             }
             ScheduleKind::ReciprocalIter => {}
@@ -168,10 +166,7 @@ impl SaeAtomBasisKind {
 }
 
 pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
-    fn evaluate(
-        &self,
-        coords: ArrayView2<'_, f64>,
-    ) -> Result<(Array2<f64>, Array3<f64>), String>;
+    fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String>;
 }
 
 /// One manifold atom.
@@ -511,10 +506,9 @@ impl SaeAssignment {
     pub fn try_assignments_row(&self, row: usize) -> Result<Array1<f64>, String> {
         validate_finite_logits(self.logits.row(row), row)?;
         match self.mode {
-            AssignmentMode::Softmax { temperature, .. } => Ok(softmax_row(
-                self.logits.row(row),
-                temperature,
-            )),
+            AssignmentMode::Softmax { temperature, .. } => {
+                Ok(softmax_row(self.logits.row(row), temperature))
+            }
             AssignmentMode::IBPMap { temperature, .. } => {
                 Ok(sigmoid_row(self.logits.row(row), temperature))
             }
@@ -589,11 +583,7 @@ impl SaeAssignment {
             .iter()
             .zip(manifolds.into_iter())
             .map(|(c, manifold)| {
-                LatentCoordValues::from_matrix_with_manifold(
-                    c.view(),
-                    LatentIdMode::None,
-                    manifold,
-                )
+                LatentCoordValues::from_matrix_with_manifold(c.view(), LatentIdMode::None, manifold)
             })
             .collect();
         Self::with_mode(logits, coords, mode)
@@ -792,8 +782,7 @@ impl SaeManifoldTerm {
     }
 
     pub fn fitted(&self) -> Array2<f64> {
-        self.try_fitted()
-            .expect("assignment logits must be finite")
+        self.try_fitted().expect("assignment logits must be finite")
     }
 
     pub fn try_fitted(&self) -> Result<Array2<f64>, String> {
@@ -990,8 +979,7 @@ impl SaeManifoldTerm {
                     for logit_col in 0..k_atoms {
                         let dz = assignments[logit_col] * (1.0 - assignments[logit_col]) * inv_tau;
                         for out_col in 0..p {
-                            local_jac[[logit_col, out_col]] =
-                                dz * decoded[logit_col][out_col];
+                            local_jac[[logit_col, out_col]] = dz * decoded[logit_col][out_col];
                         }
                     }
                 }
@@ -1431,7 +1419,9 @@ impl SaeManifoldTerm {
         let (delta_ext_coord, delta_beta) = self
             .solve_newton_step(target, rho, analytic_penalties, ridge_ext_coord, ridge_beta)
             .map_err(|err| {
-                format!("SaeManifoldTerm::run_single_external_basis_refresh_step_arrow_schur: {err}")
+                format!(
+                    "SaeManifoldTerm::run_single_external_basis_refresh_step_arrow_schur: {err}"
+                )
             })?;
         self.apply_newton_step_external_basis_refresh(
             delta_ext_coord.view(),
@@ -1457,12 +1447,8 @@ impl SaeManifoldTerm {
                 alpha,
                 learnable_alpha,
             } => {
-                let penalty = IBPAssignmentPenalty::new(
-                    self.k_atoms(),
-                    alpha,
-                    temperature,
-                    learnable_alpha,
-                );
+                let penalty =
+                    IBPAssignmentPenalty::new(self.k_atoms(), alpha, temperature, learnable_alpha);
                 let penalty = match self.temperature_schedule.clone() {
                     Some(schedule) => penalty.with_temperature_schedule(schedule),
                     None => penalty,
@@ -1549,8 +1535,7 @@ fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f
             temperature,
             sparsity,
         } => {
-            let penalty =
-                SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
+            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
             let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
             penalty.value(target.view(), rho_view.view())
         }
@@ -1559,13 +1544,12 @@ fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f
             alpha,
             learnable_alpha,
         } => {
-            let penalty =
-                IBPAssignmentPenalty::new(
-                    assignment.k_atoms(),
-                    alpha,
-                    temperature,
-                    learnable_alpha,
-                );
+            let penalty = IBPAssignmentPenalty::new(
+                assignment.k_atoms(),
+                alpha,
+                temperature,
+                learnable_alpha,
+            );
             let rho_view = if learnable_alpha {
                 Array1::from_vec(vec![rho.log_lambda_sparse])
             } else {
@@ -1589,8 +1573,7 @@ fn assignment_prior_grad_hdiag(
             temperature,
             sparsity,
         } => {
-            let penalty =
-                SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
+            let penalty = SoftmaxAssignmentSparsityPenalty::new(assignment.k_atoms(), temperature);
             let rho_view = Array1::from_vec(vec![rho.log_lambda_sparse + sparsity.ln()]);
             let grad = penalty.grad_target(target.view(), rho_view.view());
             let diag = penalty
@@ -1603,13 +1586,12 @@ fn assignment_prior_grad_hdiag(
             alpha,
             learnable_alpha,
         } => {
-            let penalty =
-                IBPAssignmentPenalty::new(
-                    assignment.k_atoms(),
-                    alpha,
-                    temperature,
-                    learnable_alpha,
-                );
+            let penalty = IBPAssignmentPenalty::new(
+                assignment.k_atoms(),
+                alpha,
+                temperature,
+                learnable_alpha,
+            );
             let rho_view = if learnable_alpha {
                 Array1::from_vec(vec![rho.log_lambda_sparse])
             } else {
@@ -1755,7 +1737,12 @@ mod tests {
 
         assert!(loss.total().is_finite());
         assert!(loss.total() <= loss0 + 1.0e-8);
-        assert!(term.assignment.coords[0].as_flat().iter().all(|v| v.is_finite()));
+        assert!(
+            term.assignment.coords[0]
+                .as_flat()
+                .iter()
+                .all(|v| v.is_finite())
+        );
         assert!(term.assignment.assignments().iter().all(|v| v.is_finite()));
         let basis_delta = (&term.atoms[0].basis_values - &basis0).mapv(f64::abs).sum();
         assert!(basis_delta > 1.0e-10);

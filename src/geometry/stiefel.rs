@@ -74,7 +74,11 @@ impl RiemannianManifold for StiefelManifold {
         tangent_vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
         let y = from_flat(point, self.n, self.k)?;
-        let tangent = from_flat(self.project_tangent(point, tangent_vec)?.view(), self.n, self.k)?;
+        let tangent = from_flat(
+            self.project_tangent(point, tangent_vec)?.view(),
+            self.n,
+            self.k,
+        )?;
         Ok(flatten(&self.qr_retraction(&(y + tangent))))
     }
 
@@ -85,7 +89,8 @@ impl RiemannianManifold for StiefelManifold {
     ) -> GeometryResult<Array1<f64>> {
         check_len("Stiefel source", p_from.len(), self.ambient_dim())?;
         check_len("Stiefel target", p_to.len(), self.ambient_dim())?;
-        self.project_tangent(p_from, &p_to - &p_from)
+        let diff = &p_to - &p_from;
+        self.project_tangent(p_from, diff.view())
     }
 
     fn parallel_transport(
@@ -116,8 +121,16 @@ impl RiemannianManifold for StiefelManifold {
         tangent_pair: (ArrayView1<'_, f64>, ArrayView1<'_, f64>),
     ) -> GeometryResult<f64> {
         check_len("Stiefel curvature point", point.len(), self.ambient_dim())?;
-        check_len("Stiefel curvature tangent u", tangent_pair.0.len(), self.ambient_dim())?;
-        check_len("Stiefel curvature tangent v", tangent_pair.1.len(), self.ambient_dim())?;
+        check_len(
+            "Stiefel curvature tangent u",
+            tangent_pair.0.len(),
+            self.ambient_dim(),
+        )?;
+        check_len(
+            "Stiefel curvature tangent v",
+            tangent_pair.1.len(),
+            self.ambient_dim(),
+        )?;
         Ok(0.0)
     }
 

@@ -803,7 +803,6 @@ impl RemlConfig {
             arrow_schur: None,
         }
     }
-
 }
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
 use std::sync::RwLock;
@@ -3707,9 +3706,9 @@ where
                 }
             }
         };
-        beta_covariance = beta_covariance_unscaled
-            .as_ref()
-            .map(|cov| crate::inference::dispersion_cov::PhiScaledCovariance::wrap(cov * dispersion_phi));
+        beta_covariance = beta_covariance_unscaled.as_ref().map(|cov| {
+            crate::inference::dispersion_cov::PhiScaledCovariance::wrap(cov * dispersion_phi)
+        });
 
         if let Some(h_inv) = beta_covariance_unscaled.as_ref()
             && !covariance_is_diagonal_only
@@ -3749,7 +3748,9 @@ where
             beta_covariance_unscaled.as_ref(),
             finalgrad_norm,
         );
-        beta_standard_errors = beta_covariance.as_ref().map(|c| se_from_covariance(c.as_array()));
+        beta_standard_errors = beta_covariance
+            .as_ref()
+            .map(|c| se_from_covariance(c.as_array()));
         beta_covariance_corrected = match (&beta_covariance, &smoothing_correction) {
             (Some(base_cov), Some(corr)) if base_cov.as_array().dim() == corr.dim() => {
                 let mut corrected = base_cov.as_array().clone();

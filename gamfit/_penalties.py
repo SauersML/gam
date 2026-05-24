@@ -66,7 +66,10 @@ from typing import Any, Literal, TypeAlias
 
 import numpy as np
 
+from ._penalties_manifest import PENALTY_MANIFEST
+
 __all__ = [
+    "PENALTY_MANIFEST",
     "IsometryPenalty",
     "SparsityPenalty",
     "ScadMcpPenalty",

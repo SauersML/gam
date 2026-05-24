@@ -81,14 +81,22 @@ impl BitVec {
 
     #[inline]
     pub fn get(&self, i: usize) -> bool {
-        debug_assert!(i < self.len, "BitVec::get index {i} out of bounds {}", self.len);
+        debug_assert!(
+            i < self.len,
+            "BitVec::get index {i} out of bounds {}",
+            self.len
+        );
         let (w, b) = (i / 64, i % 64);
         (self.words[w] >> b) & 1 == 1
     }
 
     #[inline]
     pub fn set(&mut self, i: usize, v: bool) {
-        debug_assert!(i < self.len, "BitVec::set index {i} out of bounds {}", self.len);
+        debug_assert!(
+            i < self.len,
+            "BitVec::set index {i} out of bounds {}",
+            self.len
+        );
         let (w, b) = (i / 64, i % 64);
         if v {
             self.words[w] |= 1u64 << b;

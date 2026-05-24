@@ -235,14 +235,17 @@ extern "C" __global__ void irls_link_kernel(
     let ptx = compile_ptx(KERNEL).map_err(|e| GpuError::DriverCallFailed {
         reason: format!("irls_link NVRTC compile failed: {e}"),
     })?;
-    let module = ctx.load_module(ptx).map_err(|e| GpuError::DriverCallFailed {
-        reason: format!("irls_link load module failed: {e}"),
-    })?;
-    let func = module
-        .load_function("irls_link_kernel")
+    let module = ctx
+        .load_module(ptx)
         .map_err(|e| GpuError::DriverCallFailed {
-            reason: format!("irls_link load function failed: {e}"),
+            reason: format!("irls_link load module failed: {e}"),
         })?;
+    let func =
+        module
+            .load_function("irls_link_kernel")
+            .map_err(|e| GpuError::DriverCallFailed {
+                reason: format!("irls_link load function failed: {e}"),
+            })?;
 
     let eta_slice = eta.as_slice().ok_or_else(|| GpuError::DriverCallFailed {
         reason: "irls_link eta slice not contiguous".to_string(),

@@ -7,4 +7,3 @@ impl PenaltyManifest for IvaeRidgeMeanGauge {
     const PYTHON_WRAPPER: &'static str = "IvaeRidgeMeanGauge";
     const ROW_BLOCK_DIAGONAL: bool = false;
 }
-

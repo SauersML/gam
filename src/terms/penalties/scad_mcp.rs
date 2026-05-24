@@ -7,4 +7,3 @@ impl PenaltyManifest for ScadMcpPenalty {
     const PYTHON_WRAPPER: &'static str = "ScadMcpPenalty";
     const ROW_BLOCK_DIAGONAL: bool = true;
 }
-

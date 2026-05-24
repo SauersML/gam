@@ -7,4 +7,3 @@ impl PenaltyManifest for IBPAssignmentPenalty {
     const PYTHON_WRAPPER: &'static str = "IBPAssignmentPenalty";
     const ROW_BLOCK_DIAGONAL: bool = true;
 }
-

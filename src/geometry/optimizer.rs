@@ -3,10 +3,7 @@ use ndarray::{Array1, ArrayView1};
 use crate::geometry::manifold::{GeometryResult, RiemannianManifold, check_len, dot, norm};
 
 pub trait RiemannianObjective {
-    fn value_gradient(
-        &mut self,
-        point: ArrayView1<'_, f64>,
-    ) -> GeometryResult<(f64, Array1<f64>)>;
+    fn value_gradient(&mut self, point: ArrayView1<'_, f64>) -> GeometryResult<(f64, Array1<f64>)>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,7 +108,11 @@ impl RiemannianLBFGS {
     }
 }
 
-fn two_loop(grad: ArrayView1<'_, f64>, s_hist: &[Array1<f64>], y_hist: &[Array1<f64>]) -> Array1<f64> {
+fn two_loop(
+    grad: ArrayView1<'_, f64>,
+    s_hist: &[Array1<f64>],
+    y_hist: &[Array1<f64>],
+) -> Array1<f64> {
     let mut q = grad.to_owned();
     let mut alpha = vec![0.0; s_hist.len()];
     for i in (0..s_hist.len()).rev() {

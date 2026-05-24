@@ -3518,9 +3518,8 @@ where
     for i in 0..D {
         cov_arr[i][i] = cov_arr[i][i].max(0.0);
     }
-    let l = match cholesky_static_with_jitter::<D>(&cov_arr) {
-        Some(v) => v,
-        None => return Ok(None),
+    let Some(l) = cholesky_static_with_jitter::<D>(&cov_arr) else {
+        return Ok(None);
     };
     let norm = 1.0 / std::f64::consts::PI.powf(0.5 * D as f64);
 

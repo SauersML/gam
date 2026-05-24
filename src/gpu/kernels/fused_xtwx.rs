@@ -93,14 +93,17 @@ extern "C" __global__ void row_scale_kernel(
     let ptx = compile_ptx(ROW_SCALE).map_err(|e| GpuError::DriverCallFailed {
         reason: format!("xtwx NVRTC compile failed: {e}"),
     })?;
-    let module = ctx.load_module(ptx).map_err(|e| GpuError::DriverCallFailed {
-        reason: format!("xtwx load module failed: {e}"),
-    })?;
-    let scale_fn = module
-        .load_function("row_scale_kernel")
+    let module = ctx
+        .load_module(ptx)
         .map_err(|e| GpuError::DriverCallFailed {
-            reason: format!("xtwx load function failed: {e}"),
+            reason: format!("xtwx load module failed: {e}"),
         })?;
+    let scale_fn =
+        module
+            .load_function("row_scale_kernel")
+            .map_err(|e| GpuError::DriverCallFailed {
+                reason: format!("xtwx load function failed: {e}"),
+            })?;
 
     let tx: u32 = 16;
     let ty: u32 = 16;

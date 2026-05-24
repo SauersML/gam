@@ -7,4 +7,3 @@ impl PenaltyManifest for NuclearNormPenalty {
     const PYTHON_WRAPPER: &'static str = "NuclearNormPenalty";
     const ROW_BLOCK_DIAGONAL: bool = false;
 }
-

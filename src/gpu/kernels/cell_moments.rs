@@ -76,10 +76,7 @@ pub fn try_dispatch(
     Some(cuda_cell_moments(cells, degree))
 }
 
-fn cuda_cell_moments(
-    cells: &[DenestedCubicCell],
-    degree: usize,
-) -> Result<Array2<f64>, GpuError> {
+fn cuda_cell_moments(cells: &[DenestedCubicCell], degree: usize) -> Result<Array2<f64>, GpuError> {
     use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::compile_ptx;
 
@@ -135,14 +132,17 @@ extern "C" __global__ void cell_moments_kernel(
     let ctx = CudaContext::new(0).map_err(|e| GpuError::DriverCallFailed {
         reason: format!("cell_moments context init failed: {e}"),
     })?;
-    let module = ctx.load_module(ptx).map_err(|e| GpuError::DriverCallFailed {
-        reason: format!("cell_moments load module failed: {e}"),
-    })?;
-    let func = module
-        .load_function("cell_moments_kernel")
+    let module = ctx
+        .load_module(ptx)
         .map_err(|e| GpuError::DriverCallFailed {
-            reason: format!("cell_moments load function failed: {e}"),
+            reason: format!("cell_moments load module failed: {e}"),
         })?;
+    let func =
+        module
+            .load_function("cell_moments_kernel")
+            .map_err(|e| GpuError::DriverCallFailed {
+                reason: format!("cell_moments load function failed: {e}"),
+            })?;
     let stream = ctx.default_stream();
 
     let n_cells = cells.len();

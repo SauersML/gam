@@ -6,6 +6,48 @@ use crate::faer_ndarray::{
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayBase, ArrayView1, Data, Dimension, Zip};
 
+/// SplitMix64: deterministic 64-bit hash / streaming RNG step.
+///
+/// Canonical home for the implementation that previously lived as eight
+/// module-local copies (gpu/kernels/hutchpp, terms/analytic_penalties,
+/// solver/evidence, solver/reml/unified, inference/sample, inference/hmc,
+/// families/cubic_cell_kernel, families/marginal_slope_shared). All call
+/// sites used identical constants; this is the streaming form. For the
+/// pure-hash flavour (single `u64 -> u64` with no externally retained
+/// state) use [`splitmix64_hash`].
+#[inline]
+pub(crate) fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Pure-hash flavour of [`splitmix64`]: takes a single `u64` seed and
+/// returns a mixed value without persisting state. Equivalent to
+/// `{ let mut s = x; splitmix64(&mut s) }`.
+#[inline]
+pub(crate) fn splitmix64_hash(x: u64) -> u64 {
+    let mut state = x;
+    splitmix64(&mut state)
+}
+
+/// Numerically stable softplus `log(1 + exp(x))`.
+///
+/// Uses the identity `softplus(x) = max(x, 0) + log1p(exp(-|x|))`, which
+/// avoids both `exp` overflow for large positive `x` and `log(1)` cancellation
+/// for large negative `x`. Previously duplicated as `stable_softplus` in
+/// `terms/smooth.rs` and `families/gamlss.rs`.
+#[inline]
+pub(crate) fn stable_softplus(x: f64) -> f64 {
+    if x > 0.0 {
+        x + (-x).exp().ln_1p()
+    } else {
+        x.exp().ln_1p()
+    }
+}
+
 /// Generic finiteness check for any `f64` ndarray view (1-D, 2-D, etc.). This
 /// is the canonical helper; module-local `array1_is_finite` / `array2_is_finite`
 /// in `solver/pirls.rs` and `solver/active_set.rs` now forward here.

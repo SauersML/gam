@@ -7,4 +7,3 @@ impl PenaltyManifest for JumpReLUPenalty {
     const PYTHON_WRAPPER: &'static str = "JumpReLUPenalty";
     const ROW_BLOCK_DIAGONAL: bool = true;
 }
-

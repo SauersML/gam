@@ -7,4 +7,3 @@ impl PenaltyManifest for RowPrecisionPriorPenalty {
     const PYTHON_WRAPPER: &'static str = "AuxConditionalPriorPenalty";
     const ROW_BLOCK_DIAGONAL: bool = true;
 }
-

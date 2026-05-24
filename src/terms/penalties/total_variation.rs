@@ -7,4 +7,3 @@ impl PenaltyManifest for TotalVariationPenalty {
     const PYTHON_WRAPPER: &'static str = "TotalVariationPenalty";
     const ROW_BLOCK_DIAGONAL: bool = false;
 }
-

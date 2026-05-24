@@ -48,7 +48,12 @@ impl Default for PersistentLatentValuesCache {
 }
 
 impl PersistentLatentValuesCache {
-    pub(crate) fn lookup(&mut self, key: &str, n_obs: usize, latent_dim: usize) -> Option<Array2<f64>> {
+    pub(crate) fn lookup(
+        &mut self,
+        key: &str,
+        n_obs: usize,
+        latent_dim: usize,
+    ) -> Option<Array2<f64>> {
         let values = self.entries.get(key)?;
         if values.dim() != (n_obs, latent_dim) {
             return None;
@@ -2601,9 +2606,9 @@ struct LatentCoordDerivativeOp {
 
 impl LatentCoordDerivativeOp {
     fn materialize_local(&self) -> Array2<f64> {
-        self.operator
-            .materialize_axis(self.flat_axis)
-            .expect("radial scalar evaluation failed during latent-coordinate derivative materialization")
+        self.operator.materialize_axis(self.flat_axis).expect(
+            "radial scalar evaluation failed during latent-coordinate derivative materialization",
+        )
     }
 
     fn materialize_dense(&self) -> &Array2<f64> {
@@ -2628,7 +2633,9 @@ impl LatentCoordDerivativeOp {
         let local = self
             .operator
             .transpose_mul_axis(self.flat_axis, &v.view())
-            .expect("radial scalar evaluation failed during latent-coordinate derivative transpose_mul");
+            .expect(
+                "radial scalar evaluation failed during latent-coordinate derivative transpose_mul",
+            );
         let mut out = Array1::<f64>::zeros(self.total_dim);
         out.slice_mut(s![self.global_range.clone()]).assign(&local);
         out
@@ -2638,7 +2645,9 @@ impl LatentCoordDerivativeOp {
         let u_local = u.slice(s![self.global_range.clone()]).to_owned();
         self.operator
             .forward_mul_axis(self.flat_axis, &u_local.view())
-            .expect("radial scalar evaluation failed during latent-coordinate derivative forward_mul")
+            .expect(
+                "radial scalar evaluation failed during latent-coordinate derivative forward_mul",
+            )
     }
 }
 
@@ -2743,9 +2752,9 @@ pub(crate) struct HyperDesignDerivative {
 impl HyperDesignDerivative {
     pub(crate) fn resident_byte_count(&self) -> usize {
         match &self.storage {
-            DerivativeMatrixStorage::Dense(dense) => dense
-                .len()
-                .saturating_mul(std::mem::size_of::<f64>()),
+            DerivativeMatrixStorage::Dense(dense) => {
+                dense.len().saturating_mul(std::mem::size_of::<f64>())
+            }
             DerivativeMatrixStorage::Embedded(embedded) => embedded
                 .local
                 .len()
@@ -3096,9 +3105,9 @@ pub(crate) struct HyperPenaltyDerivative {
 impl HyperPenaltyDerivative {
     pub(crate) fn resident_byte_count(&self) -> usize {
         match &self.storage {
-            DerivativeMatrixStorage::Dense(dense) => dense
-                .len()
-                .saturating_mul(std::mem::size_of::<f64>()),
+            DerivativeMatrixStorage::Dense(dense) => {
+                dense.len().saturating_mul(std::mem::size_of::<f64>())
+            }
             DerivativeMatrixStorage::Embedded(embedded) => embedded
                 .local
                 .len()

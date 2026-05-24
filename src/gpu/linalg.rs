@@ -67,8 +67,7 @@ pub fn route_through_gpu(op: DispatchOp) -> Option<&'static GpuRuntime> {
     let policy = &runtime.policy;
     let admit = match op {
         DispatchOp::Gemm { m, n, k } => {
-            (op.flops() as u128) >= (policy.gemm_min_flops as u128)
-                && m.min(n).min(k) > 0
+            (op.flops() as u128) >= (policy.gemm_min_flops as u128) && m.min(n).min(k) > 0
         }
         DispatchOp::Gemv { m, k } => {
             (op.flops() as u128) >= (policy.gemm_min_flops as u128) && m > 0 && k > 0
@@ -152,10 +151,7 @@ pub fn try_fast_atv(a: ArrayView2<'_, f64>, v: ArrayView1<'_, f64>) -> Option<Ar
 
 #[inline]
 #[must_use]
-pub fn try_fast_xt_diag_x(
-    x: ArrayView2<'_, f64>,
-    w: ArrayView1<'_, f64>,
-) -> Option<Array2<f64>> {
+pub fn try_fast_xt_diag_x(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Option<Array2<f64>> {
     let (n, p) = x.dim();
     if n != w.len() {
         return None;
