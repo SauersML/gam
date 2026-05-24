@@ -72,7 +72,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
     let p = fit.beta.len();
     let dispersion = fit.dispersion().expect("dispersion should be stored");
     assert!(dispersion.is_estimated());
-    let phi = dispersion.variance_scale();
+    let phi = dispersion.phi();
     assert!(phi.is_finite() && phi > 0.0);
 
     let fmat = fit
