@@ -1414,8 +1414,7 @@ fn cloglog_negative_tail_mean(eta: f64) -> f64 {
     }
 }
 
-/// Pointwise cloglog derivative dμ/dη in the deep negative tail.
-///
+// Pointwise cloglog derivative dμ/dη in the deep negative tail:
 // `cloglog_negative_tail_derivative` (a reference implementation retained
 // solely for its unit test) lives inside `mod tests` below.
 
