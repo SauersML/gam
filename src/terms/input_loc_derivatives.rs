@@ -84,49 +84,6 @@ pub enum RadialInputKernel {
 }
 
 impl RadialInputKernel {
-    /// Project onto the internal `RadialScalarKind` enum so the existing
-    /// radial-jet routines can be reused verbatim.
-    #[cfg(test)]
-    fn into_scalar_kind(&self) -> RadialScalarKind {
-        match self {
-            RadialInputKernel::Matern { length_scale, nu } => RadialScalarKind::Matern {
-                length_scale: *length_scale,
-                nu: *nu,
-            },
-            RadialInputKernel::DuchonHybrid {
-                length_scale,
-                p_order,
-                s_order,
-                dim,
-            } => {
-                let kappa = 1.0 / length_scale.max(1e-300);
-                let coeffs = duchon_partial_fraction_coeffs(*p_order, *s_order, kappa);
-                RadialScalarKind::Duchon {
-                    length_scale: *length_scale,
-                    p_order: *p_order,
-                    s_order: *s_order,
-                    dim: *dim,
-                    coeffs,
-                }
-            }
-            RadialInputKernel::DuchonPure {
-                block_order,
-                p_order,
-                s_order,
-                dim,
-            } => RadialScalarKind::PureDuchon {
-                block_order: *block_order,
-                p_order: *p_order,
-                s_order: *s_order,
-                dim: *dim,
-            },
-            RadialInputKernel::ThinPlate { length_scale, dim } => RadialScalarKind::ThinPlate {
-                length_scale: *length_scale,
-                dim: *dim,
-            },
-        }
-    }
-
     /// Ambient input dimension `d` (the kernel argument length).
     pub const fn dim(&self) -> usize {
         match self {
@@ -193,6 +150,49 @@ mod tests {
     use super::*;
     use ndarray::array;
 
+    /// Project a `RadialInputKernel` onto the internal `RadialScalarKind`
+    /// enum so the radial-jet routines can be reused verbatim by the
+    /// divergence-witness tests.
+    fn into_scalar_kind(kernel: &RadialInputKernel) -> RadialScalarKind {
+        match kernel {
+            RadialInputKernel::Matern { length_scale, nu } => RadialScalarKind::Matern {
+                length_scale: *length_scale,
+                nu: *nu,
+            },
+            RadialInputKernel::DuchonHybrid {
+                length_scale,
+                p_order,
+                s_order,
+                dim,
+            } => {
+                let kappa = 1.0 / length_scale.max(1e-300);
+                let coeffs = duchon_partial_fraction_coeffs(*p_order, *s_order, kappa);
+                RadialScalarKind::Duchon {
+                    length_scale: *length_scale,
+                    p_order: *p_order,
+                    s_order: *s_order,
+                    dim: *dim,
+                    coeffs,
+                }
+            }
+            RadialInputKernel::DuchonPure {
+                block_order,
+                p_order,
+                s_order,
+                dim,
+            } => RadialScalarKind::PureDuchon {
+                block_order: *block_order,
+                p_order: *p_order,
+                s_order: *s_order,
+                dim: *dim,
+            },
+            RadialInputKernel::ThinPlate { length_scale, dim } => RadialScalarKind::ThinPlate {
+                length_scale: *length_scale,
+                dim: *dim,
+            },
+        }
+    }
+
     #[test]
     fn contract_input_loc_gradient_matches_einsum() {
         let jet = Array3::from_shape_vec(
@@ -234,7 +234,7 @@ mod tests {
             length_scale: 1.0,
             nu: MaternNu::Half,
         };
-        let kind = kernel.into_scalar_kind();
+        let kind = into_scalar_kind(&kernel);
         let eps = 1e-8_f64;
         let (_, q, _) = kind
             .eval_design_triplet(eps)
@@ -252,7 +252,7 @@ mod tests {
             length_scale: 1.0,
             dim: 2,
         };
-        let kind = kernel.into_scalar_kind();
+        let kind = into_scalar_kind(&kernel);
         let eps = 1e-10_f64;
         let (_, q, _) = kind
             .eval_design_triplet(eps)
