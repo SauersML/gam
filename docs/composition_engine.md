@@ -51,7 +51,7 @@ Related design notes:
 | `IvaeRidgeMeanGauge` (also: `AuxConditionalPriorPenalty`, legacy Python alias) | Per-row latent coordinates conditioned on auxiliary inputs | `½ w Σ_i t_i^T Λ_i t_i` | Auxiliary conditional shrinkage | Injects row-local prior precision from covariates without coupling observations. |
 | `ParametricRowPrecisionPriorPenalty` | Per-row latent coordinates with learned aux-conditioned precision | `½ w Σ_ik λ_k(u_i) t_ik²` | Parametric auxiliary shrinkage | Learns an iVAE-style aux-to-precision map when fixed row precisions are unavailable. |
 | `ScadMcpPenalty` | Configured latent, assignment, or decoder block | `Σ_j p_λ,γ(|x_j|)` with SCAD/MCP concavity | Concave sparsity | Reduces L1 bias while retaining sparsity pressure on selected mechanisms. |
-| `BlockOrthogonalityPenalty` | Configured groups of latent axes | `½ w Σ_{g<h} ‖T_g^T T_h‖²_F` | Supervised block plus free block gauge transfer | Enforces only between-block orthogonality, leaving within-block structure free for the auto_exp_38 companion-block pattern. |
+| `BlockOrthogonalityPenalty` | Configured groups of latent axes | `½ w Σ_{g<h} ‖T_g^T T_h‖²_F` | Supervised block plus free block gauge transfer | Enforces only between-block orthogonality, leaving within-block structure free. |
 
 ## Minimal Configurations
 
@@ -138,8 +138,6 @@ dispatch to exhaustive `GlmLikelihoodFamily` match arms in `pirls.rs`.
 
 For under-dispersed counts (`var / mean < 1`), Poisson is typically the right
 choice because the NegBin over-dispersion parameter collapses to ∞ otherwise.
-The `project_cogito_modifier_count_underdispersed` memory records this as the
-`auto_exp_28` finding.
 
 ## Identifiability Rules
 
@@ -158,28 +156,13 @@ because it keeps cross-topology REML comparisons on the observed-data scale;
 BIC/REML disagreement when basis dimensions were compared raw.
 
 `ARDPenalty` / `dim_selection=True` is a companion, not a gauge fix. It prunes
-axes only after an aux prior or isometry has pinned the coordinate system.
-The `auto_exp_21` finding showed the failure mode directly: ARD alone stayed
-rotation-invariant and kept all tested auxiliary dimensions. The established
-axis-selection composition is `OrthogonalityPenalty` plus `ARDPenalty`, as in
-`examples/orthogonality_plus_ard_demo.py`, because orthogonality fixes the
-rotation/scale gauge before ARD applies axis-wise evidence pressure.
-When the unsupervised priors fail, as in `auto_exp_21` through `auto_exp_32`,
-match `d_aux` to the actual signal dimensionality and use
-`IvaeRidgeMeanGauge` with supervised aux. `auto_exp_33` recovered the
-cogito run at `d_aux=3`: R²(hue)=0.70, and each latent axis aligned with one HSV channel.
-Extending to `d_aux=6` with concat(HSV, name-features) supervision recovers
-the full `U_3d` perceptual + name-semantic decomposition (`auto_exp_35`):
-each of the 6 supervised aux axes maps cleanly to its own latent axis (max
-axis-correlation 0.80–0.88), with no cross-subspace mixing. Mean R²=0.707
-across all 6 aux dims, exceeding the unsupervised `U_3d` ceiling of 0.61.
-This makes the §4(c) prediction ("structured prior + supervised aux breaks
-gauge") a demonstrated solution on real LLM data, not just synthetic.
-A 5-fold-by-color cross-validation (`auto_exp_36`) confirms the decomposition
-is not within-sample overfitting: held-out R² is within 2% of in-sample across
-all 6 axes (held-out hue R²=0.687, in-sample 0.700), while a permutation-control
-fit (shuffle aux labels) collapses to ~null (R² range [-0.035, -0.018]).
-The cogito-L40 subspace structure is REAL, not a fit-time artifact.
+axes only after an aux prior or isometry has pinned the coordinate system: ARD
+alone is rotation-invariant and will keep all tested auxiliary dimensions.
+The established axis-selection composition is `OrthogonalityPenalty` plus
+`ARDPenalty`, as in `examples/orthogonality_plus_ard_demo.py`, because
+orthogonality fixes the rotation/scale gauge before ARD applies axis-wise
+evidence pressure. When the unsupervised priors fail, match `d_aux` to the
+actual signal dimensionality and use `IvaeRidgeMeanGauge` with supervised aux.
 
 ### Persistent Caching
 
