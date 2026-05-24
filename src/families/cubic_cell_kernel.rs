@@ -1481,9 +1481,8 @@ impl CellMomentScratch {
 
     #[inline]
     fn prepare_moments(&mut self, len: usize) -> &mut [f64] {
-        #[cfg(test)]
         if self.moments.capacity() < len {
-            CELL_MOMENT_TEST_REALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            CELL_MOMENT_REALLOCS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.moments.resize(len, 0.0);
         self.moments.fill(0.0);
@@ -1491,19 +1490,11 @@ impl CellMomentScratch {
     }
 }
 
-#[cfg(test)]
-static CELL_MOMENT_TEST_REALLOCS: std::sync::atomic::AtomicUsize =
+/// Counter for moment-buffer reallocations in `prepare_moments`. Production
+/// code increments this on every buffer growth; the test mod inspects it to
+/// assert the steady-state hot loop allocates exactly once per row buffer.
+pub(crate) static CELL_MOMENT_REALLOCS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-pub(crate) fn reset_cell_moment_test_reallocs() {
-    CELL_MOMENT_TEST_REALLOCS.store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
-#[cfg(test)]
-pub(crate) fn cell_moment_test_reallocs() -> usize {
-    CELL_MOMENT_TEST_REALLOCS.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 /// 20-point Gauss–Legendre nodes on [-1, 1] for the Drezner–Wesolowsky
 /// bivariate normal CDF representation.  20 points give >30-digit accuracy
