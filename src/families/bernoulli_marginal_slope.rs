@@ -7547,14 +7547,6 @@ impl BernoulliMarginalSlopeFamily {
 
         Ok((a, abs_deriv, false))
     }
-    fn build_row_exact_context(
-        &self,
-        row: usize,
-        block_states: &[ParameterBlockState],
-    ) -> Result<BernoulliMarginalSlopeRowExactContext, String> {
-        self.build_row_exact_context_with_stats_and_cell_cache(row, block_states, None, true)
-    }
-
     fn build_row_exact_context_with_stats_and_cell_cache(
         &self,
         row: usize,
@@ -12588,71 +12580,6 @@ impl BernoulliMarginalSlopeFamily {
             )?;
         Ok(out)
     }
-    fn exact_newton_joint_hessian_matvec_from_cache_serial_reference(
-        &self,
-        direction: &Array1<f64>,
-        block_states: &[ParameterBlockState],
-        cache: &BernoulliMarginalSlopeExactEvalCache,
-    ) -> Result<Array1<f64>, String> {
-        let slices = &cache.slices;
-        let primary = &cache.primary;
-        let mut out = Array1::<f64>::zeros(slices.total);
-
-        if !self.effective_flex_active(block_states)? {
-            for row in 0..self.y.len() {
-                let marginal_eta = block_states[0].eta[row];
-                let marginal = self.marginal_link_map(marginal_eta)?;
-                let g = block_states[1].eta[row];
-                let (_, _, h) = self.rigid_row_kernel_eval(row, marginal_eta, marginal, g)?;
-                let v_q = self
-                    .marginal_design
-                    .dot_row_view(row, direction.slice(s![slices.marginal.clone()]));
-                let v_g = self
-                    .logslope_design
-                    .dot_row_view(row, direction.slice(s![slices.logslope.clone()]));
-                let a_q = h[0][0] * v_q + h[0][1] * v_g;
-                let a_g = h[1][0] * v_q + h[1][1] * v_g;
-                {
-                    let mut marginal_out = out.slice_mut(s![slices.marginal.clone()]);
-                    self.marginal_design
-                        .axpy_row_into(row, a_q, &mut marginal_out)?;
-                }
-                {
-                    let mut logslope_out = out.slice_mut(s![slices.logslope.clone()]);
-                    self.logslope_design
-                        .axpy_row_into(row, a_g, &mut logslope_out)?;
-                }
-            }
-            return Ok(out);
-        }
-
-        let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(primary.total);
-        for row in 0..self.y.len() {
-            let row_ctx = Self::row_ctx(cache, row);
-            let row_dir = self.row_primary_direction_from_flat(row, slices, primary, direction)?;
-            let row_action = if let Some(row_hess) = Self::cached_row_primary_hessian(cache, row) {
-                row_hess.dot(&row_dir)
-            } else {
-                let row_moments = cache
-                    .row_cell_moments
-                    .as_ref()
-                    .and_then(|bundle| bundle.row(row, 9));
-                self.compute_row_analytic_flex_into_with_moments(
-                    row,
-                    block_states,
-                    primary,
-                    row_ctx,
-                    row_moments,
-                    true,
-                    &mut scratch,
-                )?;
-                scratch.hess.dot(&row_dir)
-            };
-            out += &self.pullback_primary_vector(row, slices, primary, &row_action)?;
-        }
-        Ok(out)
-    }
-
     fn exact_newton_joint_hessian_diagonal_from_cache(
         &self,
         block_states: &[ParameterBlockState],
