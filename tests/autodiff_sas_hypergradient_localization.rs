@@ -244,8 +244,7 @@ impl<T: AD> SasD1Fn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for SasD1Fn<T> {
     const NAME: &'static str = "SasD1Fn";
 
-    fn call(&self, inputs: &[T], frozen: bool) -> Vec<T> {
-        drop(frozen);
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
         vec![sas_eta_d1_ad(self.eta, inputs[0], self.log_delta)]
     }
 
@@ -282,8 +281,7 @@ impl<T: AD> SasD2Fn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for SasD2Fn<T> {
     const NAME: &'static str = "SasD2Fn";
 
-    fn call(&self, inputs: &[T], frozen: bool) -> Vec<T> {
-        drop(frozen);
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
         vec![sas_eta_d2_ad(self.eta, inputs[0], self.log_delta)]
     }
 

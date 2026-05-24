@@ -1513,13 +1513,8 @@ mod gram_inner_contraction_tests {
         let p = factor.nrows();
         let mut total = 0.0_f64;
         for row in 0..n_rows {
-            let mut dir_k_buf = [0.0_f64; 16];
             let dir_k_arr = kern.jacobian_action(row, direction);
-            for k in 0..K {
-                dir_k_buf[k] = dir_k_arr[k];
-            }
             let third = kern.row_third_contracted(row, &dir_k_arr).expect("third");
-            let _ = dir_k_buf;
             for k_col in 0..rank {
                 // vec_k[k] = (J_r · F[:, k_col])[k]
                 let mut col = vec![0.0_f64; p];

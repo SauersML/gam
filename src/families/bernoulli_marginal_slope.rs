@@ -7547,8 +7547,6 @@ impl BernoulliMarginalSlopeFamily {
 
         Ok((a, abs_deriv, false))
     }
-
-    #[cfg(test)]
     fn build_row_exact_context(
         &self,
         row: usize,
@@ -12590,8 +12588,6 @@ impl BernoulliMarginalSlopeFamily {
             )?;
         Ok(out)
     }
-
-    #[cfg(test)]
     fn exact_newton_joint_hessian_matvec_from_cache_serial_reference(
         &self,
         direction: &Array1<f64>,
@@ -17527,7 +17523,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
         true,
         None,
         outer_policy,
-        |theta, _: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+        |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            assert_eq!(
+                specs.len(),
+                designs.len(),
+                "spatial joint optimizer must supply one spec per design",
+            );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             let sigma = sigma_from_theta(theta);

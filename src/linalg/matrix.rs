@@ -3601,7 +3601,12 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
             }
             _ => None,
         };
-        drop(self.materialized.set(computed));
+        if self.materialized.set(computed).is_err() {
+            return self
+                .materialized
+                .get()
+                .and_then(|opt| opt.as_ref().map(|a| a.as_ref()));
+        }
         self.materialized
             .get()
             .and_then(|opt| opt.as_ref().map(|a| a.as_ref()))
@@ -3920,7 +3925,12 @@ impl CoefficientTransformOperator {
             }
             _ => None,
         };
-        drop(self.materialized.set(computed));
+        if self.materialized.set(computed).is_err() {
+            return self
+                .materialized
+                .get()
+                .and_then(|opt| opt.as_ref().map(|a| a.as_ref()));
+        }
         self.materialized
             .get()
             .and_then(|opt| opt.as_ref().map(|a| a.as_ref()))
@@ -7347,7 +7357,7 @@ mod tests {
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
     use crate::resource::{MatrixMaterializationError, ResourcePolicy};
-    use crate::testing::no_densify_design;
+    use crate::test_support::no_densify_design;
     use crate::types::RidgePolicy;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
     use ndarray::{Array1, Array2, ArrayViewMut2, Axis, array, s};
@@ -7629,10 +7639,7 @@ mod tests {
     fn reparam_operator_rejects_incompatible_transform_shape() {
         let x = array![[1.0, 2.0], [0.5, -1.0]];
         let qs = Arc::new(Array2::<f64>::zeros((3, 1)));
-        drop(ReparamOperator::new(
-            DesignMatrix::Dense(DenseDesignMatrix::from(x)),
-            qs,
-        ));
+        ReparamOperator::new(DesignMatrix::Dense(DenseDesignMatrix::from(x)), qs);
     }
 
     #[test]
@@ -7743,7 +7750,8 @@ mod tests {
         // until something exercises it, so `as_dense_ref` would otherwise
         // return None before the first hot call.
         let probe = Array1::from_elem(3, 1.0);
-        drop(dense_design.apply_transpose(&probe));
+        let warmed = dense_design.apply_transpose(&probe);
+        assert_eq!(warmed.len(), expected.ncols());
 
         let dense_ref = dense_design
             .as_dense_ref()
@@ -7774,7 +7782,8 @@ mod tests {
         let dense_design = DenseDesignMatrix::from(Arc::new(op));
 
         let probe = Array1::from_elem(3, 1.0);
-        drop(dense_design.apply_transpose(&probe));
+        let warmed = dense_design.apply_transpose(&probe);
+        assert_eq!(warmed.len(), expected.ncols());
 
         let dense_ref = dense_design
             .as_dense_ref()
@@ -7816,7 +7825,7 @@ mod tests {
     #[should_panic(expected = "DesignMatrix::as_dense_cow called on operator-backed design")]
     fn design_matrix_as_dense_cow_rejects_operator_backed_designs() {
         let design = no_densify_design(array![[1.0, 2.0], [3.0, 4.0]]);
-        drop(design.as_dense_cow());
+        design.as_dense_cow();
     }
 
     #[test]

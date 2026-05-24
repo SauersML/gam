@@ -18307,15 +18307,25 @@ fn pure_duchon_reparameterize_penalty_axes(
     Vec<(usize, usize)>,
     Option<AnisoPenaltyCrossProvider>,
 ) {
-    drop(cross_pairs);
     let free_dim = dim.saturating_sub(1).max(1);
     if dim <= 1 {
+        assert!(
+            cross_pairs.is_empty(),
+            "pure Duchon one-dimensional reparameterization received raw cross-axis derivatives"
+        );
         let mut per_axis_iter = per_axis.into_iter();
         let (first, second_diag) = per_axis_iter.next().unwrap_or_default();
         return (vec![first], vec![second_diag], Vec::new(), None);
     }
 
     let last = dim - 1;
+    let expected_cross_pairs = (0..dim)
+        .flat_map(|axis_a| ((axis_a + 1)..dim).map(move |axis_b| (axis_a, axis_b)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        cross_pairs, expected_cross_pairs,
+        "pure Duchon reparameterization requires raw cross-axis derivative pairs in canonical order"
+    );
     let raw_first: Vec<Vec<Array2<f64>>> =
         per_axis.iter().map(|(first, _)| first.clone()).collect();
     let raw_second_diag: Vec<Vec<Array2<f64>>> =
@@ -28481,9 +28491,18 @@ mod tests {
         let third =
             Array2::from_shape_vec((2, 2), vec![9.0, 10.0, 11.0, 12.0]).expect("third data");
 
-        drop(shared_owned_data_matrix(first.view(), &cache));
-        drop(shared_owned_data_matrix(second.view(), &cache));
-        drop(shared_owned_data_matrix(third.view(), &cache));
+        {
+            let first_cached = shared_owned_data_matrix(first.view(), &cache);
+            assert_eq!(first_cached.dim(), (2, 2));
+        }
+        {
+            let second_cached = shared_owned_data_matrix(second.view(), &cache);
+            assert_eq!(second_cached.dim(), (2, 2));
+        }
+        {
+            let third_cached = shared_owned_data_matrix(third.view(), &cache);
+            assert_eq!(third_cached.dim(), (2, 2));
+        }
 
         // At most one 2x2 f64 matrix (32 bytes) resident.
         assert!(cache.owned_data.resident_bytes() <= 8 * 2 * 2);
@@ -28526,7 +28545,7 @@ mod tests {
             &third_cached,
             &shared_owned_data_matrix(third.view(), &cache)
         ));
-        drop(first_cached);
+        assert_eq!(first_cached.dim(), (2, 2));
     }
 
     #[test]

@@ -2162,10 +2162,6 @@ trait LocationScaleFamilyBuilder {
         Ok(Array1::zeros(0))
     }
 
-    fn augment_result_designs(&self, term_design: &mut TermCollectionDesign, term_design2: &mut TermCollectionDesign) {
-        assert!(std::mem::size_of_val(term_design) > 0);
-        assert!(std::mem::size_of_val(term_design2) > 0);}
-
     fn build_psiderivative_blocks(
         &self,
         arr: ndarray::ArrayView2<'_, f64>,
@@ -2173,18 +2169,7 @@ trait LocationScaleFamilyBuilder {
         term_spec2: &TermCollectionSpec,
         term_design: &TermCollectionDesign,
         term_design2: &TermCollectionDesign,
-    ) -> Result<Vec<Vec<CustomFamilyBlockPsiDerivative>>, String> {
-        assert!(arr.iter().all(|v| !v.is_nan()));
-        assert!(std::mem::size_of_val(term_spec) > 0);
-        assert!(std::mem::size_of_val(term_spec2) > 0);
-        assert!(std::mem::size_of_val(term_design) > 0);
-        assert!(std::mem::size_of_val(term_design2) > 0);
-        Err(GamlssError::UnsupportedConfiguration {
-            reason: "spatial psi derivatives are unavailable for this location-scale family"
-                .to_string(),
-        }
-        .into())
-    }
+    ) -> Result<Vec<Vec<CustomFamilyBlockPsiDerivative>>, String>;
 }
 
 fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
@@ -2601,9 +2586,19 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     let mut solved = run_exact_joint_spatial!()
         .map_err(|err| format!("exact two-block spatial optimization failed: {err}"))?;
 
-    {
-        let (left, right) = solved.designs.split_at_mut(1);
-        builder.augment_result_designs(&mut left[0], &mut right[0]);
+    let expected_noise_penalty_count = builder.noise_penalty_count(&solved.designs[1]);
+    let actual_noise_penalty_count = solved.designs[1].penalties.len();
+    if expected_noise_penalty_count > actual_noise_penalty_count {
+        if expected_noise_penalty_count != actual_noise_penalty_count + 1 {
+            return Err(GamlssError::UnsupportedConfiguration {
+                reason: format!(
+                    "location-scale result noise design expected {} penalties after augmentation, got {} before augmentation",
+                    expected_noise_penalty_count, actual_noise_penalty_count
+                ),
+            }
+            .into());
+        }
+        append_binomial_log_sigma_shrinkage_penalty_design(&mut solved.designs[1]);
     }
 
     BlockwiseTermFitResult::try_from_parts(BlockwiseTermFitResultParts {
@@ -2970,15 +2965,6 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         noise_design.penalties.len() + 1
     }
 
-    fn augment_result_designs(
-        &self,
-        term_design: &mut TermCollectionDesign,
-        noise_design: &mut TermCollectionDesign,
-    ) {
-        assert!(std::mem::size_of_val(term_design) > 0);
-        append_binomial_log_sigma_shrinkage_penalty_design(noise_design);
-    }
-
     fn build_blocks(
         &self,
         theta: &Array1<f64>,
@@ -3129,15 +3115,6 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
 
     fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
         noise_design.penalties.len() + 1
-    }
-
-    fn augment_result_designs(
-        &self,
-        term_design: &mut TermCollectionDesign,
-        noise_design: &mut TermCollectionDesign,
-    ) {
-        assert!(std::mem::size_of_val(term_design) > 0);
-        append_binomial_log_sigma_shrinkage_penalty_design(noise_design);
     }
 
     fn build_blocks(
@@ -22530,7 +22507,7 @@ mod tests {
     use super::*;
     use crate::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
     use crate::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
-    use crate::testing::{binomial_location_scale_base_fixture, no_densify_design};
+    use crate::test_support::{binomial_location_scale_base_fixture, no_densify_design};
     use ndarray::{Array2, Axis, array};
     use num_dual::{
         DualNum, second_derivative, second_partial_derivative, third_partial_derivative_vec,
@@ -26802,7 +26779,7 @@ mod tests {
             let h_plus = extract(family.evaluate(&plus_states).expect("plus eval"), block_idx);
             let h_base = extract(base_eval.clone(), block_idx);
             let fd = (h_plus - h_base) / eps;
-            crate::testing::assert_matrix_derivativefd(
+            crate::test_support::assert_matrix_derivativefd(
                 &fd,
                 &analytic,
                 5e-4,
@@ -27771,7 +27748,7 @@ mod tests {
                 BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton block"),
             };
             let joint_block = joint.slice(s![start..end, start..end]).to_owned();
-            crate::testing::assert_matrix_derivativefd(
+            crate::test_support::assert_matrix_derivativefd(
                 &joint_block,
                 &blockhessian,
                 1e-10,
@@ -27907,7 +27884,7 @@ mod tests {
                 let f_minus = objective(&beta_t_minus, &beta_ls_minus, &betaw_minus);
                 fd[j] = (f_plus - f_minus) / (2.0 * eps);
             }
-            crate::testing::assert_matrix_derivativefd(
+            crate::test_support::assert_matrix_derivativefd(
                 &fd.insert_axis(Axis(1)),
                 &(-&analytic).insert_axis(Axis(1)),
                 2e-4,
@@ -28064,7 +28041,12 @@ mod tests {
             }
         }
 
-        crate::testing::assert_matrix_derivativefd(&fd, &h_joint, 4e-4, "wiggle joint hessian");
+        crate::test_support::assert_matrix_derivativefd(
+            &fd,
+            &h_joint,
+            4e-4,
+            "wiggle joint hessian",
+        );
     }
 
     #[test]
@@ -28181,7 +28163,7 @@ mod tests {
             .expect("plus joint hessian")
             .expect("expected plus joint hessian");
         let fd = (h_plus - base_h) / eps;
-        crate::testing::assert_matrix_derivativefd(&fd, &analytic, 2e-3, "joint dH");
+        crate::test_support::assert_matrix_derivativefd(&fd, &analytic, 2e-3, "joint dH");
     }
 
     #[test]
@@ -28296,7 +28278,7 @@ mod tests {
             .expect("expected joint exact dH minus");
         let fd = (d_h_plus - d_h_minus) / (2.0 * eps);
 
-        crate::testing::assert_matrix_derivativefd(&fd, &analytic, 4e-3, "joint d2H");
+        crate::test_support::assert_matrix_derivativefd(&fd, &analytic, 4e-3, "joint d2H");
     }
 
     #[test]
@@ -28451,9 +28433,9 @@ mod tests {
             .slice(ndarray::s![pt..pt + pls, pt + pls..pt + pls + pw])
             .to_owned();
 
-        crate::testing::assert_matrix_derivativefd(&fd_t_ls, &h_t_ls, 2e-4, "H_t_ls");
-        crate::testing::assert_matrix_derivativefd(&fd_tw, &h_tw, 4e-4, "H_tw");
-        crate::testing::assert_matrix_derivativefd(&fd_lsw, &h_lsw, 6e-4, "H_lsw");
+        crate::test_support::assert_matrix_derivativefd(&fd_t_ls, &h_t_ls, 2e-4, "H_t_ls");
+        crate::test_support::assert_matrix_derivativefd(&fd_tw, &h_tw, 4e-4, "H_tw");
+        crate::test_support::assert_matrix_derivativefd(&fd_lsw, &h_lsw, 6e-4, "H_lsw");
     }
 
     #[test]
@@ -28518,7 +28500,7 @@ mod tests {
                 BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton block"),
             };
             let joint_block = joint.slice(s![start..end, start..end]).to_owned();
-            crate::testing::assert_matrix_derivativefd(
+            crate::test_support::assert_matrix_derivativefd(
                 &joint_block,
                 &blockhessian,
                 1e-10,
@@ -28597,7 +28579,7 @@ mod tests {
             .expect("plus joint hessian")
             .expect("expected plus joint hessian");
         let fd = (h_plus - base_h) / eps;
-        crate::testing::assert_matrix_derivativefd(&fd, &analytic, 2e-3, "nonwiggle joint dH");
+        crate::test_support::assert_matrix_derivativefd(&fd, &analytic, 2e-3, "nonwiggle joint dH");
     }
 
     #[test]
@@ -28682,7 +28664,12 @@ mod tests {
             .expect("joint dH minus")
             .expect("expected joint exact dH minus");
         let fd = (d_h_plus - d_h_minus) / (2.0 * eps);
-        crate::testing::assert_matrix_derivativefd(&fd, &analytic, 4e-3, "nonwiggle joint d2H");
+        crate::test_support::assert_matrix_derivativefd(
+            &fd,
+            &analytic,
+            4e-3,
+            "nonwiggle joint d2H",
+        );
     }
 
     #[test]
@@ -29015,7 +29002,7 @@ mod tests {
             ..BlockwiseFitOptions::default()
         };
 
-        let (f0, g0) = crate::families::custom_family::test_outerobjective_andgradient(
+        let (f0, g0) = crate::families::custom_family::tests::test_outerobjective_andgradient(
             &family,
             &specs,
             &options,
@@ -29039,7 +29026,7 @@ mod tests {
             let mut rho_m = rho.clone();
             rho_p[k] += h;
             rho_m[k] -= h;
-            let (fp, _) = crate::families::custom_family::test_outerobjective_andgradient(
+            let (fp, _) = crate::families::custom_family::tests::test_outerobjective_andgradient(
                 &family,
                 &specs,
                 &options,
@@ -29047,7 +29034,7 @@ mod tests {
                 &rho_p,
             )
             .expect("objective at rho+h");
-            let (fm, _) = crate::families::custom_family::test_outerobjective_andgradient(
+            let (fm, _) = crate::families::custom_family::tests::test_outerobjective_andgradient(
                 &family,
                 &specs,
                 &options,

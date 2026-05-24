@@ -170,7 +170,6 @@ impl From<RemlError> for String {
 //  used by the iso-κ Duchon FD investigation test. Empty in production runs.
 // ═══════════════════════════════════════════════════════════════════════════
 
-#[cfg(test)]
 pub mod debug_stash {
     use std::cell::RefCell;
 
@@ -2090,7 +2089,6 @@ pub trait HyperOperator: Send + Sync {
 
     /// Test-only downcast to `SparseDirectionalHyperOperator`, used by the
     /// per-term operator decomposition diagnostic.
-    #[cfg(test)]
     fn as_sparse_directional(&self) -> Option<&SparseDirectionalHyperOperator> {
         None
     }
@@ -2228,7 +2226,6 @@ impl ProjectedFactorCache {
     /// for `key`. Returns 0 if the key has no in-progress computation. Used
     /// by panic-recovery tests to deterministically synchronize without
     /// `thread::sleep`.
-    #[cfg(test)]
     pub fn pending_waiters_for(&self, key: ProjectedFactorKey) -> usize {
         let inner = self
             .inner
@@ -2246,7 +2243,6 @@ impl ProjectedFactorCache {
     /// observed before the deadline, `false` on timeout. Test-only API used
     /// by the producer-panic recovery test so it does not need to spin or
     /// sleep waiting for the subscribe race window to close.
-    #[cfg(test)]
     pub fn wait_for_subscriber(
         &self,
         key: ProjectedFactorKey,
@@ -4133,8 +4129,6 @@ impl HyperOperator for SparseDirectionalHyperOperator {
     fn is_implicit(&self) -> bool {
         false
     }
-
-    #[cfg(test)]
     fn as_sparse_directional(&self) -> Option<&SparseDirectionalHyperOperator> {
         Some(self)
     }
@@ -7835,10 +7829,8 @@ pub fn reml_laml_evaluate(
     // the stash inside the worker and handing it back through a per-call
     // sink eliminates the cross-thread overwrites that a process-global
     // sink suffered under concurrent tests.
-    #[cfg(test)]
     let ext_stash_sink: std::sync::Arc<std::sync::Mutex<Option<debug_stash::TermStash>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
-    #[cfg(test)]
     let ext_stash_sink_for_closure = ext_stash_sink.clone();
     let ext_grad_entries: Result<Vec<(usize, f64)>, String> = (0..ext_dim)
         .into_par_iter()
@@ -7915,7 +7907,6 @@ pub fn reml_laml_evaluate(
             // `projected_trace_values` or `exact_dense_trace_values` is
             // already batched, which is the configuration the
             // projection-pin regression test actually exercises.
-            #[cfg(test)]
             if incl_logdet_h
                 && let Some(ds) = hop.as_exact_dense_spectral()
                 && ds.dim() <= 12
@@ -8029,7 +8020,6 @@ pub fn reml_laml_evaluate(
     // call `take_terms()` from, because everything between
     // `evaluate_joint_reml_outer_eval_at_theta` and `reml_laml_evaluate`
     // is synchronous and stays on the test thread.
-    #[cfg(test)]
     if let Some(stash) = ext_stash_sink
         .lock()
         .expect("EIG-DECOMP stash sink mutex poisoned")
@@ -14601,7 +14591,6 @@ impl BlockCoupledOperator {
     /// explicitly through `_with_mode`, so the Smooth-only entry point is
     /// intentionally gated to tests to keep the family-mode choice
     /// unambiguous at every production callsite.
-    #[cfg(test)]
     pub fn from_joint_hessian(joint_hessian: &Array2<f64>) -> Result<Self, String> {
         Self::from_joint_hessian_with_mode(joint_hessian, PseudoLogdetMode::Smooth)
     }

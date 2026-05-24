@@ -8631,7 +8631,8 @@ mod tests {
         assert!((payload.cost - 9.0).abs() < 1e-12);
         assert_eq!(payload.rho, vec![3.0]);
         // Strictly improving eval must bypass the 2-second rate limit.
-        let _v1 = wrapped.eval_cost(&array![0.5]).unwrap();
+        let v1 = wrapped.eval_cost(&array![0.5]).unwrap();
+        assert!((v1 - 0.25).abs() < 1e-12);
         let on_disk = session
             .try_load()
             .expect("improving eval should checkpoint");
@@ -8640,7 +8641,10 @@ mod tests {
         assert_eq!(payload.rho, vec![0.5]);
         // Non-finite values must not corrupt the on-disk best-known iterate.
         let v_inf = wrapped.eval_cost(&array![f64::NAN]);
-        assert!(v_inf.is_ok() || v_inf.is_err());
+        match v_inf {
+            Ok(value) => assert!(!value.is_finite()),
+            Err(err) => assert!(!err.to_string().is_empty()),
+        }
         let on_disk = session.try_load().expect("prior best preserved");
         let payload = decode_iterate(&on_disk.payload, 1).expect("payload decodes");
         assert!((payload.cost - 0.25).abs() < 1e-12);
@@ -8723,7 +8727,8 @@ mod tests {
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
         let mut wrapped = CheckpointingObjective::new(&mut inner, Arc::clone(&session), Vec::new());
-        drop(wrapped.eval(&array![0.5]).expect("eval ok"));
+        let eval = wrapped.eval(&array![0.5]).expect("eval ok");
+        assert!((eval.cost - 0.25).abs() < 1e-12);
         let on_disk = session
             .try_load()
             .expect("eval with finite β must persist a (ρ,β) checkpoint");
@@ -8754,7 +8759,8 @@ mod tests {
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
         let mut wrapped = CheckpointingObjective::new(&mut inner, Arc::clone(&session), Vec::new());
-        drop(wrapped.eval(&array![0.5]).expect("eval ok"));
+        let eval = wrapped.eval(&array![0.5]).expect("eval ok");
+        assert!((eval.cost - 0.25).abs() < 1e-12);
         assert!(
             session.try_load().is_none(),
             "non-finite β must abort the checkpoint write, not poison the cache",
@@ -8879,7 +8885,10 @@ mod tests {
             .with_hessian(DeclaredHessianForm::Unavailable)
             .with_max_iter(1)
             .with_cache_session(Arc::clone(&session));
-        drop(problem.run(&mut obj, "seed-inner-state-call"));
+        match problem.run(&mut obj, "seed-inner-state-call") {
+            Ok(result) => assert!(result.final_value.is_finite()),
+            Err(err) => assert!(!err.to_string().is_empty()),
+        }
 
         let observed = seeded.lock().unwrap().clone();
         assert_eq!(
@@ -8948,7 +8957,10 @@ mod tests {
             .with_hessian(DeclaredHessianForm::Unavailable)
             .with_max_iter(1)
             .with_cache_session(Arc::clone(&session));
-        drop(problem.run(&mut obj, "seed-inner-state-skip"));
+        match problem.run(&mut obj, "seed-inner-state-skip") {
+            Ok(result) => assert!(result.final_value.is_finite()),
+            Err(err) => assert!(!err.to_string().is_empty()),
+        }
 
         assert_eq!(
             *seed_calls.lock().unwrap(),
@@ -9144,7 +9156,10 @@ mod tests {
                 ) -> Result<EfsEval, EstimationError>,
             >,
         );
-        drop(problem.run(&mut obj, "seed-prepend"));
+        match problem.run(&mut obj, "seed-prepend") {
+            Ok(result) => assert!(result.final_value.is_finite()),
+            Err(err) => assert!(!err.to_string().is_empty()),
+        }
         // The cached rho (2.5) must appear in the eval trace, and it must
         // appear no later than the configured initial_rho (−3.0). Both
         // are inside the bounds so the projector cannot rewrite them.
@@ -9222,7 +9237,10 @@ mod tests {
             >,
         );
 
-        drop(problem.run(&mut obj, "all-saturated-honored"));
+        match problem.run(&mut obj, "all-saturated-honored") {
+            Ok(result) => assert!(result.final_value.is_finite()),
+            Err(err) => assert!(!err.to_string().is_empty()),
+        }
         let evals = seen.lock().unwrap();
         assert!(
             evals.iter().any(|rho| rho == array![10.0, -10.0]),

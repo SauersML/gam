@@ -17816,10 +17816,10 @@ where
                 crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
             };
             let t0 = std::time::Instant::now();
-            let row_set_borrow = current_row_set.borrow();
-            let result =
-                (*exact_fn_cell.borrow_mut())(theta, &specs, &designs, eval_mode, &row_set_borrow);
-            drop(row_set_borrow);
+            let result = {
+                let row_set_borrow = current_row_set.borrow();
+                (*exact_fn_cell.borrow_mut())(theta, &specs, &designs, eval_mode, &row_set_borrow)
+            };
             let elapsed_s = t0.elapsed().as_secs_f64();
             kphase_eval_calls.set(kphase_eval_calls.get() + 1);
             kphase_eval_total_s.set(kphase_eval_total_s.get() + elapsed_s);
@@ -17882,15 +17882,16 @@ where
                 // n=320 000, n_grid=293, p_resp=32, p_cov=23) is now paid only
                 // when the outer evaluator actually requests it.
                 let t0 = std::time::Instant::now();
-                let row_set_borrow = current_row_set.borrow();
-                let result = (*exact_fn_cell.borrow_mut())(
-                    theta,
-                    &specs,
-                    &designs,
-                    crate::solver::estimate::reml::unified::EvalMode::ValueOnly,
-                    &row_set_borrow,
-                );
-                drop(row_set_borrow);
+                let result = {
+                    let row_set_borrow = current_row_set.borrow();
+                    (*exact_fn_cell.borrow_mut())(
+                        theta,
+                        &specs,
+                        &designs,
+                        crate::solver::estimate::reml::unified::EvalMode::ValueOnly,
+                        &row_set_borrow,
+                    )
+                };
                 let elapsed_s = t0.elapsed().as_secs_f64();
                 kphase_cost_calls.set(kphase_cost_calls.get() + 1);
                 kphase_cost_total_s.set(kphase_cost_total_s.get() + elapsed_s);
@@ -18025,21 +18026,27 @@ where
             "[KAPPA-STAGED] rotating to polish subsample: k={} at theta_star",
             polish.rows.len(),
         );
-        // One V+G evaluation at theta_star on the polish subsample.
-        // Result is intentionally discarded — the cache update inside
-        // `exact_fn` is the side effect we want.
+        // One V+G evaluation at theta_star on the polish subsample. The
+        // returned objective pieces must be usable; the family-side cache
+        // update inside `exact_fn` is consumed by the final fit.
         state.cache.ensure_theta(&theta_star)?;
-        {
+        let (polish_cost, polish_grad, _) = {
             let specs = collect_specs(&state.cache);
             let designs = collect_designs(&state.cache);
             let row_set_borrow = current_row_set.borrow();
-            drop(exact_fn(
+            exact_fn(
                 &theta_star,
                 &specs,
                 &designs,
                 crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient,
                 &row_set_borrow,
-            ));
+            )?
+        };
+        if !polish_cost.is_finite() || polish_grad.iter().any(|value| !value.is_finite()) {
+            return Err(
+                "polish subsample exact-joint evaluation produced non-finite objective pieces"
+                    .to_string(),
+            );
         }
     }
     *current_row_set.borrow_mut() = crate::families::row_kernel::RowSet::All;
@@ -18383,29 +18390,30 @@ fn try_exact_joint_latent_coord_optimization(
         })
     };
 
-    let mut obj = problem.build_objective_with_eval_order(
-        &mut ctx,
-        |ctx: &mut &mut LatentJointContext<'_>, theta: &Array1<f64>| Ok(ctx.eval_cost(theta)),
-        |ctx: &mut &mut LatentJointContext<'_>, theta: &Array1<f64>| {
-            eval_outer(ctx, theta, OuterEvalOrder::ValueAndGradient)
-        },
-        |ctx: &mut &mut LatentJointContext<'_>, theta: &Array1<f64>, order: OuterEvalOrder| {
-            eval_outer(ctx, theta, order)
-        },
-        Some(|ctx: &mut &mut LatentJointContext<'_>| {
-            ctx.cache.reset();
-        }),
-        Some(|ctx: &mut &mut LatentJointContext<'_>, theta: &Array1<f64>| ctx.eval_efs(theta)),
-    );
+    let result = {
+        let mut obj = problem.build_objective_with_eval_order(
+            &mut ctx,
+            |ctx: &mut &mut LatentJointContext<'_>, theta: &Array1<f64>| Ok(ctx.eval_cost(theta)),
+            |ctx: &mut &mut LatentJointContext<'_>, theta: &Array1<f64>| {
+                eval_outer(ctx, theta, OuterEvalOrder::ValueAndGradient)
+            },
+            |ctx: &mut &mut LatentJointContext<'_>, theta: &Array1<f64>, order: OuterEvalOrder| {
+                eval_outer(ctx, theta, order)
+            },
+            Some(|ctx: &mut &mut LatentJointContext<'_>| {
+                ctx.cache.reset();
+            }),
+            Some(|ctx: &mut &mut LatentJointContext<'_>, theta: &Array1<f64>| ctx.eval_efs(theta)),
+        );
 
-    let result = problem
-        .run(&mut obj, "latent-coordinate joint REML")
-        .map_err(|e| {
-            EstimationError::InvalidInput(format!(
-                "latent-coordinate joint optimization failed after exhausting strategy fallbacks: {e}"
-            ))
-        })?;
-    drop(obj);
+        problem
+            .run(&mut obj, "latent-coordinate joint REML")
+            .map_err(|e| {
+                EstimationError::InvalidInput(format!(
+                    "latent-coordinate joint optimization failed after exhausting strategy fallbacks: {e}"
+                ))
+            })?
+    };
     if !result.converged {
         return Err(EstimationError::InvalidInput(format!(
             "latent-coordinate joint optimization did not converge after {} iterations (final_objective={:.6e}, final_grad_norm={})",
@@ -22734,19 +22742,19 @@ mod tests {
         )
         .expect("hyper dirs build")
         .expect("hyper dirs present");
-        drop(
-            evaluate_joint_reml_outer_eval_at_theta(
-                &mut evaluator,
-                cache.design(),
-                &theta_zero,
-                rho_dim,
-                hyper_dirs,
-                None,
-                crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
-                None,
-            )
-            .expect("analytic outer eval"),
-        );
+        let (analytic_cost, analytic_gradient, _) = evaluate_joint_reml_outer_eval_at_theta(
+            &mut evaluator,
+            cache.design(),
+            &theta_zero,
+            rho_dim,
+            hyper_dirs,
+            None,
+            crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+            None,
+        )
+        .expect("analytic outer eval");
+        assert!(analytic_cost.is_finite());
+        assert!(analytic_gradient.iter().all(|value| value.is_finite()));
         let stash = crate::solver::estimate::reml::unified::debug_stash::take_terms();
         let c_x_tau_beta = stash.c_x_tau_beta_diag.clone().expect("term4 diag stashed");
         let x_v_psi = stash.c_x_v_psi_diag.clone().expect("X·v_ψ stashed");
@@ -22788,7 +22796,14 @@ mod tests {
             l2_c_dnu
         );
 
-        drop((c_p, w_p, w_0, eta_0));
+        assert_eq!(eta_0.len(), n);
+        assert_eq!(w_0.len(), n);
+        assert_eq!(c_p.len(), n);
+        assert_eq!(w_p.len(), n);
+        assert!(eta_0.iter().all(|value| value.is_finite()));
+        assert!(w_0.iter().all(|value| value.is_finite()));
+        assert!(c_p.iter().all(|value| value.is_finite()));
+        assert!(w_p.iter().all(|value| value.is_finite()));
     }
 
     /// Test PIRLS structural determinism: call debug_full_h three times at

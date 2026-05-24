@@ -171,3 +171,48 @@ pub fn assert_matrix_derivativefd(fd: &Array2<f64>, analytic: &Array2<f64>, tol:
         }
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Debug stash: thread-local capture of (op_total, U) from the ext-grad path,
+//  used by the iso-κ Duchon FD investigation test. Empty in production runs.
+//  Moved here from src/solver/reml/unified.rs so the `test_support` crate-wide
+//  test module hosts it without an item-level `#[cfg(test)]` annotation.
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub mod debug_stash {
+    use std::cell::RefCell;
+
+    #[derive(Clone, Debug, Default)]
+    pub struct TermStash {
+        /// Per-row diagonal of term4: `c · X_τβ̂` (n-vector).
+        pub c_x_tau_beta_diag: Option<ndarray::Array1<f64>>,
+        /// `X · v_ψ` per row, where v_ψ = hop⁻¹·stored_g. The correction
+        /// matrix is `−X' diag(c · X · v_ψ) X`, so multiplying this by c
+        /// (from PIRLS) gives the diagonal entering the correction sandwich.
+        pub c_x_v_psi_diag: Option<ndarray::Array1<f64>>,
+        /// Unprojected eigenmode trace Σ φ'(σ_j)·(Uᵀ op U)_jj.
+        pub unprojected_tr: Option<f64>,
+        /// The production `trace_logdet_i` value that actually enters the
+        /// outer gradient.
+        pub production_tr: Option<f64>,
+        /// Whether `penalty_subspace_trace` was Some for this coordinate.
+        pub projection_active: Option<bool>,
+    }
+
+    thread_local! {
+        static TERMS: RefCell<TermStash> = const { RefCell::new(TermStash {
+            c_x_tau_beta_diag: None,
+            c_x_v_psi_diag: None,
+            unprojected_tr: None,
+            production_tr: None,
+            projection_active: None,
+        }) };
+    }
+
+    pub fn store_terms(stash: TermStash) {
+        TERMS.with(|cell| *cell.borrow_mut() = stash);
+    }
+    pub fn take_terms() -> TermStash {
+        TERMS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+    }
+}
