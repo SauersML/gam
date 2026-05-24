@@ -9179,15 +9179,12 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 },
                 reparam_qs: None,
                 dispersion: crate::estimate::Dispersion::Known(1.0),
-                // Boundary adapter: wrap the φ-scaled covariance as
-                // `PhiScaledCovariance` for the newtype storage.
-                beta_covariance: beta_covariance.clone().map(Into::into),
+                beta_covariance,
                 beta_standard_errors,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
                 beta_covariance_frequentist: None,
-                influence_matrix: None,
-                dispersion: crate::estimate::Dispersion::Known(1.0),
+                coefficient_influence: None,
                 covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             };
@@ -11636,15 +11633,12 @@ fn fit_bounded_term_collection_with_design(
                 },
                 reparam_qs: None,
                 dispersion: crate::estimate::Dispersion::Known(1.0),
-                // Boundary adapter: `beta_covariance` storage is now
-                // `Option<PhiScaledCovariance>`.
-                beta_covariance: beta_covariance.clone().map(Into::into),
+                beta_covariance,
                 beta_standard_errors,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
                 beta_covariance_frequentist: None,
-                influence_matrix: None,
-                dispersion: crate::estimate::Dispersion::Known(1.0),
+                coefficient_influence: None,
                 covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             };
