@@ -1664,6 +1664,13 @@ impl From<BSplineBoundaryCondition> for BSplineBoundaryConditions {
     }
 }
 
+impl BSplineBoundaryCondition {
+    pub fn is_unconstrained(&self) -> bool {
+        matches!(self.left, BSplineEndpointCondition::None)
+            && matches!(self.right, BSplineEndpointCondition::None)
+    }
+}
+
 /// Per-smooth identifiability policy for 1D B-spline bases.
 ///
 /// These constraints are applied directly in the builder via a reparameterization
@@ -2485,6 +2492,25 @@ pub enum BasisMetadata {
     Sphere {
         max_degree: usize,
         radians: bool,
+    },
+    /// Wrap an inner basis metadata to record a multiplicative `by` (continuous or
+    /// factor) along a column of the dataset.
+    BySmooth {
+        inner: Box<BasisMetadata>,
+        by_col: usize,
+        levels: Option<Vec<u64>>,
+        ordered: bool,
+    },
+    /// Factor-by-smooth (mgcv-style `s(x, by=g, bs="fs"|"sz"|"re")`).
+    FactorSmooth {
+        continuous_cols: Vec<usize>,
+        group_col: usize,
+        knots: Array1<f64>,
+        degree: usize,
+        #[serde(default)]
+        periodic: Option<(f64, f64, usize)>,
+        group_levels: Vec<u64>,
+        flavour: String,
     },
 }
 
@@ -6862,7 +6888,17 @@ pub fn build_bspline_basis_1d(
                         + 1
                 }
                 BSplineKnotSpec::Provided(knots) => knots.len().saturating_sub(spec.degree + 1),
-                BSplineKnotSpec::PeriodicUniform { .. } => unreachable!(),
+                BSplineKnotSpec::PeriodicUniform { .. } => {
+                    // Filtered upstream by the outer match arm; if we ever
+                    // reach this branch, the upstream filter is broken.
+                    // Surface a debug-assert in test builds and fall back
+                    // to 0 in release so the build does not panic.
+                    debug_assert!(
+                        false,
+                        "PeriodicUniform knotspec should have been handled by the outer match arm"
+                    );
+                    0
+                }
             };
             (start, end, num_basis)
         }),
@@ -22769,6 +22805,7 @@ pub struct PeriodicBSplineBasisSpec {
     /// Cyclic finite-difference order used by curve fitting penalties.
     pub penalty_order: usize,
     boundary_conditions: BSplineBoundaryConditions::default(),
+    boundary: OneDimensionalBoundary::Open,
 }
 
 impl PeriodicBSplineBasisSpec {
@@ -22790,6 +22827,7 @@ impl PeriodicBSplineBasisSpec {
         }
     },
     boundary_conditions: BSplineBoundaryConditions::default(),
+    boundary: OneDimensionalBoundary::Open,
 }
 
 /// Fitted vector-valued periodic spline curve.
@@ -28115,6 +28153,7 @@ mod tests {
                 left: BSplineEndpointBoundaryCondition::Clamped,
                 right: BSplineEndpointBoundaryCondition::Free,
             },
+            boundary: OneDimensionalBoundary::Open,
         };
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
         let z = bspline_transform_from_result(&result);
@@ -28154,6 +28193,7 @@ mod tests {
                 left: BSplineEndpointBoundaryCondition::Anchored { value: 0.0 },
                 right: BSplineEndpointBoundaryCondition::Clamped,
             },
+            boundary: OneDimensionalBoundary::Open,
         };
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
         assert_eq!(
@@ -28200,6 +28240,7 @@ mod tests {
                 left: BSplineEndpointBoundaryCondition::Anchored { value: 2.5 },
                 right: BSplineEndpointBoundaryCondition::Free,
             },
+            boundary: OneDimensionalBoundary::Open,
         };
         let err = build_bspline_basis_1d(x.view(), &spec).unwrap_err();
         assert!(err.to_string().contains("non-zero B-spline left anchor"));
@@ -28512,6 +28553,7 @@ mod tests {
             boundary_condition: Default::default(),
             ..raw.clone(),
             boundary_conditions: BSplineBoundaryConditions::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
 
         let b_raw = build_bspline_basis_1d(x.view(), &raw).unwrap();
@@ -37467,6 +37509,7 @@ mod tests {
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
         let built = build_bspline_basis_1d(x.view(), &spec).expect("periodic basis");
         let design = built.design.to_dense();
@@ -37494,6 +37537,7 @@ mod tests {
             double_penalty: true,
             identifiability: BSplineIdentifiability::WeightedSumToZero { weights: None },
             boundary_conditions: Default::default(),
+            boundary: OneDimensionalBoundary::Open,
         };
         let built = build_bspline_basis_1d(x.view(), &spec).expect("periodic centered basis");
         let design = built.design.to_dense();

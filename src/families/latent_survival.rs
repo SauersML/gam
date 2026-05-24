@@ -1734,6 +1734,9 @@ impl LatentSurvivalFamily {
                     &mut target.slice_mut(s![slices.mean.clone()]),
                 )
                 .unwrap_or_else(|error| {
+                    // SAFETY: shape contract — `slices.mean`/`target.len()`/
+                    // `x_mean.ncols()` agree by construction; any mismatch
+                    // is caller-side shape drift, surfaced via panic.
                     panic!(
                         "latent survival mean gradient pullback dimension mismatch: row={row}, mean_slice={:?}, target_len={}, x_mean_cols={}, error={error}",
                         slices.mean,
@@ -1815,6 +1818,9 @@ impl LatentSurvivalFamily {
                 target.slice_mut(s![slices.mean.clone(), slices.mean.clone()]),
             )
             .unwrap_or_else(|error| {
+                // SAFETY: shape contract — `slices.mean` and `target.dim()`
+                // sized to `x_mean.ncols()` at construction. An error
+                // here indicates caller-side shape drift.
                 panic!(
                     "latent survival mean Hessian pullback dimension mismatch: row={row}, mean_slice={:?}, target_dim={:?}, x_mean_cols={}, error={error}",
                     slices.mean,
@@ -1827,6 +1833,9 @@ impl LatentSurvivalFamily {
             .x_mean
             .try_row_chunk(row..row + 1)
             .unwrap_or_else(|error| {
+                // SAFETY: row index comes from the enclosing `0..n` loop
+                // bound by `self.x_mean.nrows()`, so `row..row+1` is
+                // always a valid single-row chunk.
                 panic!(
                     "latent survival mean pullback row chunk failed: row={row}, x_mean_rows={}, x_mean_cols={}, error={error}",
                     self.x_mean.nrows(),
@@ -2041,6 +2050,9 @@ impl LatentSurvivalFamily {
         let mean_weight = h[[LATENT_SURVIVAL_PRIMARY_MU, LATENT_SURVIVAL_PRIMARY_MU]];
         self.x_mean
             .syr_row_into_view(row, mean_weight, mean_target.view_mut())
+            // SAFETY: `mean_target` is sized at construction to match
+            // `x_mean.ncols()`; an error here means the caller passed a
+            // mismatched target — a contract violation.
             .unwrap_or_else(|error| {
                 panic!(
                     "latent survival mean block-diagonal pullback dimension mismatch: row={row}, mean_target_dim={:?}, x_mean_cols={}, error={error}",
@@ -2815,6 +2827,8 @@ impl LatentBinaryFamily {
                     mean_scale,
                     &mut target.slice_mut(s![slices.mean.clone()]),
                 )
+                // SAFETY: `slices.mean` sized at construction to match
+                // `x_mean.ncols()`; an error means caller-side shape drift.
                 .unwrap_or_else(|error| {
                     panic!(
                         "latent binary mean gradient pullback dimension mismatch: row={row}, mean_slice={:?}, target_len={}, x_mean_cols={}, error={error}",
@@ -2869,6 +2883,9 @@ impl LatentBinaryFamily {
                 mean_weight,
                 target.slice_mut(s![slices.mean.clone(), slices.mean.clone()]),
             )
+            // SAFETY: `slices.mean` × `slices.mean` slab is sized at
+            // construction to match `x_mean.ncols()` × `x_mean.ncols()`;
+            // an error means caller-side shape drift.
             .unwrap_or_else(|error| {
                 panic!(
                     "latent binary mean Hessian pullback dimension mismatch: row={row}, mean_slice={:?}, target_dim={:?}, x_mean_cols={}, error={error}",
