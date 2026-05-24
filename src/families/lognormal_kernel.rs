@@ -257,11 +257,30 @@ pub fn log_kernel_term(
 ) -> Result<(f64, IntegratedExpectationMode), EstimationError> {
     validate_kernel_inputs(m, mu, sigma)?;
     let kf = k as f64;
-    let prefix = kf * mu + 0.5 * kf * kf * sigma * sigma;
+    let sigma2 = sigma * sigma;
+    if !sigma2.is_finite() {
+        return Err(EstimationError::InvalidInput(format!(
+            "lognormal kernel sigma is outside the finite exact-derivative range: sigma={sigma}"
+        )));
+    }
+    let prefix_bound = kf * mu.abs() + 0.5 * kf * kf * sigma2;
+    if !prefix_bound.is_finite() {
+        return Err(EstimationError::InvalidInput(format!(
+            "lognormal kernel prefix is outside the finite exact-derivative range: k={k}, mu={mu}, sigma={sigma}"
+        )));
+    }
+    let prefix = kf * mu + 0.5 * kf * kf * sigma2;
     if m == 0.0 {
         return Ok((prefix, IntegratedExpectationMode::ExactClosedForm));
     }
-    let shifted_mu = mu + kf * sigma * sigma + m.ln();
+    let log_m = m.ln();
+    let shifted_bound = mu.abs() + kf * sigma2 + log_m.abs();
+    if !shifted_bound.is_finite() {
+        return Err(EstimationError::InvalidInput(format!(
+            "lognormal kernel shifted location is outside the finite exact-derivative range: k={k}, m={m}, mu={mu}, sigma={sigma}"
+        )));
+    }
+    let shifted_mu = mu + kf * sigma2 + log_m;
     let (laplace, mode) = lognormal_laplace_unit_term_shared(quadctx, shifted_mu, sigma);
     if laplace <= 0.0 {
         return Ok((f64::NEG_INFINITY, mode));
@@ -299,8 +318,20 @@ pub fn log_kernel_bundle(
 ) -> Result<LogLognormalKernelBundle, EstimationError> {
     validate_kernel_inputs(m, mu, sigma)?;
     let mut log_values = Vec::with_capacity(max_k + 1);
+    let sigma2 = sigma * sigma;
+    if !sigma2.is_finite() {
+        return Err(EstimationError::InvalidInput(format!(
+            "lognormal kernel sigma is outside the finite exact-derivative range: sigma={sigma}"
+        )));
+    }
+    let max_kf = max_k as f64;
+    let prefix_bound = max_kf * mu.abs() + 0.5 * max_kf * max_kf * sigma2;
+    if !prefix_bound.is_finite() {
+        return Err(EstimationError::InvalidInput(format!(
+            "lognormal kernel bundle prefix is outside the finite exact-derivative range: max_k={max_k}, mu={mu}, sigma={sigma}"
+        )));
+    }
     if m == 0.0 {
-        let sigma2 = sigma * sigma;
         let mut prefix = 0.0;
         for k in 0..=max_k {
             log_values.push(prefix);
@@ -312,8 +343,13 @@ pub fn log_kernel_bundle(
         });
     }
 
-    let sigma2 = sigma * sigma;
     let log_m = m.ln();
+    let shifted_bound = mu.abs() + max_kf * sigma2 + log_m.abs();
+    if !shifted_bound.is_finite() {
+        return Err(EstimationError::InvalidInput(format!(
+            "lognormal kernel bundle shifted location is outside the finite exact-derivative range: max_k={max_k}, m={m}, mu={mu}, sigma={sigma}"
+        )));
+    }
     let mut shifted_mu = mu + log_m;
     let mut prefix = 0.0;
     let mut mode = IntegratedExpectationMode::ExactClosedForm;
