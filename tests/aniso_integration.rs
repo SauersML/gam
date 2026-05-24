@@ -6,7 +6,7 @@ use gam::{
         ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
         TermCollectionSpec,
     },
-    types::LikelihoodFamily,
+    types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily},
 };
 use ndarray::{Array1, Array2};
 
@@ -94,7 +94,10 @@ fn aniso_matern_recovers_signal_axis() {
         weights,
         offset,
         spec,
-        family: LikelihoodFamily::GaussianIdentity,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(LinkFunction::Identity),
+        ),
         options: FitOptions {
             latent_cloglog: None,
             mixture_link: None,
