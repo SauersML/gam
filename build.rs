@@ -721,6 +721,14 @@ fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
         // `assert_eq!` / real predicates, production code uses `Result`.
         ("assert!(true)", "assert!(true)", false),
         ("assert!(false)", "assert!(false)", false),
+        // `debug_assert!` family — checks that compile to nothing in
+        // release. An invariant worth checking is worth checking in
+        // release; one that isn't should be deleted. Banned everywhere
+        // (tests included — a test asserting only in debug mode silently
+        // passes in release).
+        ("debug_assert!(", "debug_assert!", false),
+        ("debug_assert_eq!(", "debug_assert_eq!", false),
+        ("debug_assert_ne!(", "debug_assert_ne!", false),
         // `file!().ends_with(".rs")` is a tautological assertion (the
         // compile-time `file!()` macro always returns the `.rs` source
         // path) commonly used to satisfy `scan_for_useless_tests` without
@@ -1413,6 +1421,7 @@ fn scan_for_cargo_lint_allows(
             return;
         }
         let mut in_lints = false;
+        let mut in_clippy_section = false;
         for (idx, line) in content.lines().enumerate() {
             let trimmed = line.trim();
             let code_part = match trimmed.find('#') {
@@ -1428,9 +1437,21 @@ fn scan_for_cargo_lint_allows(
                     || header.starts_with("lints.")
                     || header == "workspace.lints"
                     || header.starts_with("workspace.lints.");
+                in_clippy_section = header == "lints.clippy"
+                    || header == "workspace.lints.clippy";
                 continue;
             }
             if !in_lints || code_part.is_empty() {
+                continue;
+            }
+            // `clippy::*` / `clippy.*` lints are exempt — we don't enforce
+            // clippy in this repo, so allow-entries for it are fine. Skip
+            // when we're inside a `[lints.clippy]` table, or when the bare
+            // key on this line targets the clippy tool.
+            if in_clippy_section
+                || code_part.starts_with("clippy.")
+                || code_part.starts_with("\"clippy::")
+            {
                 continue;
             }
             if code_part.contains("\"allow\"") {
