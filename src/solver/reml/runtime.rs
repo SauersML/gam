@@ -760,9 +760,17 @@ fn reml_fixed_glm_dispersion(likelihood: GlmLikelihoodSpec) -> f64 {
         | GlmLikelihoodFamily::BinomialSas
         | GlmLikelihoodFamily::BinomialBetaLogistic
         | GlmLikelihoodFamily::BinomialMixture
-        | GlmLikelihoodFamily::PoissonLog
-        | GlmLikelihoodFamily::Tweedie { .. }
-        | GlmLikelihoodFamily::NegativeBinomial { .. } => likelihood.fixed_phi().unwrap_or(1.0),
+        | GlmLikelihoodFamily::PoissonLog => likelihood.fixed_phi().unwrap_or(1.0),
+        GlmLikelihoodFamily::Tweedie { .. } => {
+            // REML dispersion is the exponential-family scale phi from the scale slot.
+            // The family field stores only the Tweedie variance power p used by IRLS weights.
+            likelihood.fixed_phi().unwrap_or(1.0)
+        }
+        GlmLikelihoodFamily::NegativeBinomial { .. } => {
+            // REML uses unit scale for NB; overdispersion is encoded by theta in the family slot.
+            // IRLS consumes theta through the variance chain, not as a separate phi.
+            1.0
+        }
         GlmLikelihoodFamily::BetaLogit { phi } => phi,
         GlmLikelihoodFamily::GammaLog => likelihood.fixed_phi().unwrap_or(1.0),
     }
