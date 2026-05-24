@@ -53,13 +53,13 @@ pub struct DriverApi {
 }
 
 impl DriverApi {
-    pub fn load(library: &Library) -> Result<Self, GpuError> {
+    pub fn load(library: &'static Library) -> Result<Self, GpuError> {
         let sym = |e: libloading::Error| GpuError::DriverSymbolMissing {
             reason: e.to_string(),
         };
         // SAFETY: each library.get asserts a signature matching the
         // libcuda export of the same name; deref yields raw fn pointers
-        // backed by the process-static handle from load_static_library.
+        // backed by a process-static handle that cannot be unloaded.
         unsafe {
             Ok(Self {
                 cu_init: *library.get(b"cuInit\0").map_err(sym)?,

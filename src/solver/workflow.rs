@@ -4866,7 +4866,7 @@ fn materialize_survival<'a>(
         marginal_logslopespecs,
         marginal_slope_deviation_routing,
     ) = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        let _base_link = resolve_survival_marginal_slope_base_link(parsed.linkspec.as_ref())?;
+        drop(resolve_survival_marginal_slope_base_link(parsed.linkspec.as_ref())?);
         let default_z_column =
             marginal_z_column_name.expect("marginal-slope z column should be available");
         if let Some(ls_formula) = config.logslope_formula.as_deref() {

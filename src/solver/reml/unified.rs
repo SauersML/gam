@@ -12064,7 +12064,7 @@ fn active_bound_indices_for_theta(
     let mut active = detect_active_theta_bounds(theta, q);
     // Drop ψ-coordinates: they are unbounded by construction.
     active.retain(|&i| i < rho_len);
-    let _ = ext_len;
+    drop(ext_len);
     active
 }
 
@@ -12119,7 +12119,7 @@ fn projected_inverse_with_inertia_gate(
             hessian_norm: h_norm,
             suggested_action: INDEFINITE_SUGGESTED_ACTION,
         };
-        let _theta_dimension = diagnostic.theta_dimension();
+        drop(diagnostic.theta_dimension());
         return Err(CorrectedCovarianceError::Indefinite(diagnostic));
     }
 

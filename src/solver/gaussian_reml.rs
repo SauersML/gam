@@ -1471,7 +1471,7 @@ fn add_reml_rho_gradient_vjp(
             grad_weights,
         );
     }
-    let _ = add_ridge_profile_vjp(
+    drop(add_ridge_profile_vjp(
         1.0,
         x,
         y,
@@ -1485,7 +1485,7 @@ fn add_reml_rho_gradient_vjp(
         grad_y,
         grad_penalty,
         grad_weights,
-    );
+    ));
 }
 
 fn add_rank_one_penalty_vjp(

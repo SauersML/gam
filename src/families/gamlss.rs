@@ -5065,17 +5065,20 @@ fn binomial_location_scale_core(
     /// on each `unsafe` site below).
     #[derive(Clone, Copy)]
     struct SendPtr(*mut f64);
-    // SAFETY: pointers are used only for disjoint per-row writes inside a
-    // bounded parallel region; the owning `Vec`s outlive the region.
+    // SAFETY: pointers are constructed from live writable buffers and used
+    // only for disjoint per-row writes inside a bounded parallel region; the
+    // owning `Vec`s outlive the region.
     unsafe impl Send for SendPtr {}
-    // SAFETY: same disjoint-index invariant as `Send`; no aliasing writes.
+    // SAFETY: same live-buffer and disjoint-index invariants as `Send`; no
+    // two threads write the same offset through any shared `SendPtr` value.
     unsafe impl Sync for SendPtr {}
     impl SendPtr {
         #[inline(always)]
-        // SAFETY: `i` is unique per parallel iteration (driven by `par_iter`
-        // over the row index) and within the allocation pointed to by `self.0`.
+        // SAFETY: `self.0` points to a live writable allocation with length
+        // greater than `i`, and `i` is exclusively owned by the calling
+        // parallel iteration.
         unsafe fn write(self, i: usize, v: f64) {
-            // SAFETY: see `write`'s function-level note — `i` is in-bounds
+            // SAFETY: see `write`'s function-level note: `i` is in-bounds
             // and exclusively owned by this iteration.
             unsafe { *self.0.add(i) = v };
         }
@@ -5100,8 +5103,9 @@ fn binomial_location_scale_core(
                 ew_slice.map_or(0.0, |w| w[i]),
                 link_kind,
             )?;
-            // SAFETY: index `i` is unique across the parallel iter; each pointer
-            // targets a distinct preallocated buffer of length `n`.
+            // SAFETY: `i` comes from `0..n`, so it is in-bounds for each
+            // preallocated length-`n` buffer, and every index is produced once;
+            // each pointer targets a distinct output buffer.
             unsafe {
                 sigma_p.write(i, row.sigma);
                 dsigma_p.write(i, row.dsigma_deta);
