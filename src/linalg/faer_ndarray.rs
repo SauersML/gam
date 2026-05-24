@@ -163,7 +163,7 @@ pub(crate) fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
 fn gpu_profile_start(
     op: crate::gpu::GpuOperation,
 ) -> (crate::gpu::GpuOperation, Option<std::time::Instant>) {
-    let _decision = crate::gpu::try_dispatch_dense(op);
+    drop(crate::gpu::try_dispatch_dense(op));
     let start = if crate::gpu::profile::profiling_enabled() {
         Some(std::time::Instant::now())
     } else {
@@ -1102,7 +1102,7 @@ fn fast_joint_hessian_2x2_impl<
         return out;
     }
 
-    let _gpu_preferred = crate::gpu::linalg::should_dispatch_joint_hessian(n, pa, pb);
+    drop(crate::gpu::linalg::should_dispatch_joint_hessian(n, pa, pb));
 
     // For small problems, fall back to separate computations
     if !should_use_faer_matmul(pa.max(pb), pa.max(pb), n) {
@@ -1687,9 +1687,11 @@ impl<'a> FaerArrayView<'a> {
                 self.col_stride,
             )
         };
-        // SAFETY: pointer/shape/strides either come directly from a live ndarray
-        // view with positive strides, or from an owned compact copy stored inside
-        // this wrapper, which guarantees validity for the returned view lifetime.
+        // SAFETY: pointer/shape/strides either come from a live ndarray view
+        // with positive row and column strides, or from the owned compact copy
+        // stored in this wrapper. ndarray guarantees the addressed elements are
+        // in-bounds, aligned, and initialized, and the shared borrow/private
+        // owned storage prevents mutable aliasing for the returned view lifetime.
         unsafe { MatRef::from_raw_parts(ptr, rows, cols, row_stride, col_stride) }
     }
 }
@@ -1732,7 +1734,11 @@ impl<'a> FaerColView<'a> {
         } else {
             (self.ptr, self.len, self.stride)
         };
-        // SAFETY: analogous to FaerArrayView::as_ref.
+        // SAFETY: pointer/len/stride either come from a live ndarray column with
+        // positive stride, or from the owned compact copy stored in this wrapper.
+        // ndarray guarantees the addressed elements are in-bounds, aligned, and
+        // initialized; ncols is 1 so the zero column stride addresses no extra
+        // columns, and shared/private storage prevents mutable aliasing.
         unsafe { MatRef::from_raw_parts(ptr, len, 1, stride, 0) }
     }
 }

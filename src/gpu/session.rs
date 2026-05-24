@@ -89,8 +89,9 @@ struct SessionInner {
 // only ever access the contents through the lock. The whole
 // DeviceXSession is owned by an Arc shared via the cache, which is
 // itself protected by a Mutex.
-// SAFETY: SessionInner is only ever accessed through the enclosing Mutex,
-// so the !Send raw cublas/cuda handles never cross threads concurrently.
+// The stream/context and device allocations are owned by SessionInner.
+// SAFETY: moving SessionInner across threads cannot create concurrent
+// cuBLAS handle or scratch-buffer access because all use is Mutex-guarded.
 unsafe impl Send for SessionInner {}
 
 impl DeviceXSession {
@@ -137,9 +138,10 @@ impl DeviceXSession {
                 ref mut wy_dev,
                 ..
             } = *inner;
-            // SAFETY: shapes/strides match the col-major X layout uploaded
-            // above; n_i, p_i are i32-checked; pointers come from valid
-            // CudaSlice<f64>s living for the duration of this call.
+            // ddgmm sees X as an n_i×p_i col-major matrix with lda=ldc=n_i,
+            // row weights in w_dev with incx=1, and an n*p output in wy_dev.
+            // SAFETY: all three slices share this stream/context; wy_dev is
+            // mutably borrowed and distinct from x_dev/w_dev.
             unsafe {
                 let (x_ptr, _record_x) = x_dev.device_ptr(&stream);
                 let (w_ptr, _record_w) = w_dev.device_ptr(&stream);
@@ -188,9 +190,9 @@ impl DeviceXSession {
                 ref mut out_pp_dev,
                 ..
             } = *inner;
-            // SAFETY: shapes match the resident X (see preceding SAFETY block):
-            // x_dev/wy_dev are n*p f64s, out_pp_dev is p*p f64s, leading dims
-            // and op flags in `cfg` agree with the col-major layout.
+            // SAFETY: cfg computes (p×n) op(x_dev) times (n×p) wy_dev
+            // into p×p out_pp_dev. Buffers are sized n*p, n*p, and p*p,
+            // are distinct, and all leading dimensions match col-major X.
             unsafe { blas.gemm(cfg, x_dev, wy_dev, out_pp_dev) }.is_ok()
         };
         if !gemm_ok {
@@ -250,9 +252,9 @@ impl DeviceXSession {
                 ref mut out_n_dev,
                 ..
             } = *inner;
-            // SAFETY: shapes match the resident X (see preceding SAFETY block):
-            // x_dev is n*p, v_p_dev is p, out_n_dev is n; lda/incx/incy in
-            // `cfg` agree with the col-major buffer layout.
+            // SAFETY: cfg treats x_dev as an n×p col-major matrix and
+            // multiplies by contiguous p-length v_p_dev into contiguous
+            // n-length out_n_dev; output is distinct and Mutex-guarded.
             unsafe { blas.gemv(cfg, x_dev, v_p_dev, out_n_dev) }.is_ok()
         };
         if !gemv_ok {

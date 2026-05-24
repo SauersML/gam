@@ -1132,7 +1132,7 @@ fn compute_multiblock_alo_chunk(
             for d in 0..b {
                 scratch.imwa[d * b + d] += 1e-6;
             }
-            let _ = lu_factor_in_place(&mut scratch.imwa, &mut scratch.perm_imwa, b);
+            drop(lu_factor_in_place(&mut scratch.imwa, &mut scratch.perm_imwa, b));
         }
         if !lu_factor_in_place(&mut scratch.imaw, &mut scratch.perm_imaw, b) {
             for r in 0..b {
@@ -1145,7 +1145,7 @@ fn compute_multiblock_alo_chunk(
             for d in 0..b {
                 scratch.imaw[d * b + d] += 1e-6;
             }
-            let _ = lu_factor_in_place(&mut scratch.imaw, &mut scratch.perm_imaw, b);
+            drop(lu_factor_in_place(&mut scratch.imaw, &mut scratch.perm_imaw, b));
         }
 
         // v_i = (I - W A)⁻¹ s_i  -- solve into rhs_buf.
