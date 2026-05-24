@@ -972,6 +972,7 @@ impl SparseDesignMatrix {
                 // matrix is permitted (size below the densification guard); a
                 // failure here means the caller broke that contract, which
                 // warrants an immediate abort with backtrace for diagnosis.
+                // SAFETY: infallible accessor; densification refusal here is a caller contract violation.
                 panic!("{msg}\nbacktrace:\n{bt}")
             })
     }
@@ -1250,6 +1251,7 @@ impl DenseDesignMatrix {
                     // fails on operator implementation bugs (it does not
                     // enforce a byte budget), so failure here is a hard
                     // contract violation rather than a runtime condition.
+                    // SAFETY: row_chunk_into is infallible-by-contract for valid operators.
                     panic!(
                         "DenseDesignMatrix::to_dense: failed to materialize {}x{} \
                          operator-backed design via row chunks: {err}",
@@ -1271,6 +1273,7 @@ impl DenseDesignMatrix {
                     // materialization only fails on operator implementation
                     // bugs, so a non-Ok result here is a hard contract
                     // violation rather than a runtime budget issue.
+                    // SAFETY: row_chunk_into is infallible-by-contract for valid operators.
                     panic!(
                         "DenseDesignMatrix::to_dense_arc: failed to materialize {}x{} \
                          operator-backed design via row chunks: {err}",
@@ -4106,6 +4109,7 @@ impl DenseDesignOperator for RowwiseKroneckerOperator {
         // tensors. Any caller that reaches this point bypassed the
         // operator-aware dispatch and would otherwise silently allocate a
         // matrix sized to crash the process.
+        // SAFETY: operator-only type; reaching to_dense means dispatch bypassed the operator-aware path.
         panic!(
             "RowwiseKroneckerOperator must remain operator-backed; refused persistent n x p_covariate x p_time materialization (n={n}, p_covariate={p_cov}, p_time={p_time}, dense={:.1} MiB)",
             bytes as f64 / (1024.0 * 1024.0),
@@ -6125,6 +6129,7 @@ impl DesignMatrix {
                 // permits (csc → csr conversion requires only valid column
                 // pointers). Reaching `None` would mean the SparseDesignMatrix
                 // invariant was violated upstream.
+                // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
                 let csr = matrix
                     .to_csr_arc()
                     .unwrap_or_else(|| panic!("DesignMatrix::dot_row: failed to obtain CSR view"));
@@ -6177,6 +6182,7 @@ impl DesignMatrix {
                 // SAFETY: `to_csr_arc` returns `None` only if csc→csr conversion
                 // fails, which is infallible for the well-formed sparse matrices
                 // that `SparseDesignMatrix` is contractually allowed to hold.
+                // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
                 let csr = matrix.to_csr_arc().unwrap_or_else(|| {
                     panic!("DesignMatrix::axpy_row_into: failed to obtain CSR view")
                 });
@@ -6229,6 +6235,7 @@ impl DesignMatrix {
                 // SAFETY: `to_csr_arc` returns `None` only if csc→csr conversion
                 // fails, which is infallible for the well-formed sparse matrices
                 // that `SparseDesignMatrix` is contractually allowed to hold.
+                // SAFETY: SparseDesignMatrix invariants guarantee csc→csr conversion succeeds.
                 let csr = matrix.to_csr_arc().unwrap_or_else(|| {
                     panic!("DesignMatrix::squared_axpy_row_into: failed to obtain CSR view")
                 });

@@ -3714,6 +3714,7 @@ impl<'a> RemlState<'a> {
             penalty_block_structural_nullities: RwLock::new(None),
             gaussian_fixed_cache: RwLock::new(None),
             persistent_warm_start_key: RwLock::new(None),
+            analytic_penalty_registry_fingerprint: 0,
             persistent_warm_start_loaded: AtomicBool::new(false),
         })
     }

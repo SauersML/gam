@@ -15452,12 +15452,11 @@ impl SurvivalMarginalSlopeFamily {
                 match (self, other) {
                     (Self::Dense(lhs), Self::Dense(rhs)) => *lhs += rhs,
                     (Self::Sparse(lhs), Self::Sparse(rhs)) => lhs.add_values(&rhs.values),
-                    // SAFETY: per-block accumulators are constructed from
-                    // the same `marginal_csr`/`logslope_csr` storage decision
-                    // at the top of `family_evaluate_blockwise`, so all
-                    // partial accumulators for one block share the same
-                    // Dense/Sparse variant; a mismatch here would mean a
-                    // newly-introduced partial picked the wrong storage.
+                    // Per-block accumulators all share one storage decision
+                    // (marginal_csr / logslope_csr) made at the top of
+                    // `family_evaluate_blockwise`.
+                    // SAFETY: mismatch ⇒ a newly added partial picked the
+                    // wrong storage variant — invariant violation.
                     _ => panic!("blockwise Hessian accumulator kind mismatch"),
                 }
             }
@@ -17111,7 +17110,13 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
                 .into());
             }
         }
-        FrailtySpec::HazardMultiplier { .. } => unreachable!(),
+        FrailtySpec::HazardMultiplier { .. } => {
+            return Err(SurvivalMarginalSlopeError::InvalidInput {
+                reason: "survival-marginal-slope does not support FrailtySpec::HazardMultiplier"
+                    .to_string(),
+            }
+            .into());
+        }
     }
     if spec.event_target.iter().any(|&d| d != 0.0 && d != 1.0) {
         return Err(SurvivalMarginalSlopeError::InvalidInput {
@@ -17560,7 +17565,12 @@ pub fn fit_survival_marginal_slope_terms(
         } => Some(*s),
         FrailtySpec::None => None,
         FrailtySpec::GaussianShift { sigma_fixed: None } | FrailtySpec::HazardMultiplier { .. } => {
-            unreachable!("validate_spec rejects unsupported marginal-slope frailty")
+            return Err(SurvivalMarginalSlopeError::InvalidInput {
+                reason:
+                    "internal: validate_spec should have rejected unsupported marginal-slope frailty"
+                        .to_string(),
+            }
+            .into());
         }
     };
     let probit_scale = probit_frailty_scale(initial_sigma);
