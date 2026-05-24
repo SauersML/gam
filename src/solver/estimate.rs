@@ -1840,7 +1840,7 @@ fn resolve_external_family(
     if firth_override == Some(true) && !supports_firth {
         return Err(EstimationError::InvalidInput(format!(
             "firth_bias_reduction is currently implemented only for Binomial Logit; {} does not support it",
-            likelihood_spec_pretty_name(family),
+            family.pretty_name(),
         )));
     }
 
@@ -1894,34 +1894,6 @@ fn resolve_external_family(
         GlmLikelihoodSpec::canonical(glm_family),
         firth_override.unwrap_or(false) && supports_firth,
     ))
-}
-
-/// Pretty display name for a `LikelihoodSpec` (response + link).
-#[inline]
-fn likelihood_spec_pretty_name(spec: &crate::types::LikelihoodSpec) -> &'static str {
-    match (&spec.response, &spec.link) {
-        (ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)) => {
-            "Gaussian Identity"
-        }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => "Binomial Logit",
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
-            "Binomial Probit"
-        }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
-            "Binomial CLogLog"
-        }
-        (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => "Latent CLogLog Binomial",
-        (ResponseFamily::Binomial, InverseLink::Sas(_)) => "Binomial SAS",
-        (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => "Binomial Beta-Logistic",
-        (ResponseFamily::Binomial, InverseLink::Mixture(_)) => "Binomial Blended Inverse-Link",
-        (ResponseFamily::Poisson, _) => "Poisson Log",
-        (ResponseFamily::Tweedie { .. }, _) => "Tweedie Log",
-        (ResponseFamily::NegativeBinomial { .. }, _) => "Negative-Binomial Log",
-        (ResponseFamily::Beta { .. }, _) => "Beta Regression Logit",
-        (ResponseFamily::Gamma, _) => "Gamma Log",
-        (ResponseFamily::RoystonParmar, _) => "Royston Parmar",
-        (ResponseFamily::Binomial, _) => "Binomial",
-    }
 }
 
 #[inline]
