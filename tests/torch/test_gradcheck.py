@@ -252,6 +252,7 @@ def test_gaussian_reml_fit_blocks_gradcheck() -> None:
         rtol=1e-3,
         nondet_tol=1e-6,
     )
+<<<<<<< Updated upstream
 
 
 def test_gaussian_reml_fit_blocks_f1_matches_single_block_backward() -> None:
@@ -289,3 +290,5 @@ def test_gaussian_reml_fit_blocks_f1_matches_single_block_backward() -> None:
     grad_x_single = x_single.grad.detach().clone()
 
     torch.testing.assert_close(grad_x_blocks, grad_x_single, rtol=2e-3, atol=2e-4)
+=======
+>>>>>>> Stashed changes

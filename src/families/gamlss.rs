@@ -2162,16 +2162,23 @@ trait LocationScaleFamilyBuilder {
         Ok(Array1::zeros(0))
     }
 
-    fn augment_result_designs(&self, _: &mut TermCollectionDesign, _: &mut TermCollectionDesign) {}
+    fn augment_result_designs(&self, term_design: &mut TermCollectionDesign, term_design2: &mut TermCollectionDesign) {
+        debug_assert!(std::mem::size_of_val(term_design) > 0);
+        debug_assert!(std::mem::size_of_val(term_design2) > 0);}
 
     fn build_psiderivative_blocks(
         &self,
-        _: ndarray::ArrayView2<'_, f64>,
-        _: &TermCollectionSpec,
-        _: &TermCollectionSpec,
-        _: &TermCollectionDesign,
-        _: &TermCollectionDesign,
+        arr: ndarray::ArrayView2<'_, f64>,
+        term_spec: &TermCollectionSpec,
+        term_spec2: &TermCollectionSpec,
+        term_design: &TermCollectionDesign,
+        term_design2: &TermCollectionDesign,
     ) -> Result<Vec<Vec<CustomFamilyBlockPsiDerivative>>, String> {
+        debug_assert!(arr.iter().all(|v| !v.is_nan()));
+        debug_assert!(std::mem::size_of_val(term_spec) > 0);
+        debug_assert!(std::mem::size_of_val(term_spec2) > 0);
+        debug_assert!(std::mem::size_of_val(term_design) > 0);
+        debug_assert!(std::mem::size_of_val(term_design2) > 0);
         Err(GamlssError::UnsupportedConfiguration {
             reason: "spatial psi derivatives are unavailable for this location-scale family"
                 .to_string(),
@@ -2953,9 +2960,10 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
 
     fn augment_result_designs(
         &self,
-        _: &mut TermCollectionDesign,
+        term_design: &mut TermCollectionDesign,
         noise_design: &mut TermCollectionDesign,
     ) {
+        debug_assert!(std::mem::size_of_val(term_design) > 0);
         append_binomial_log_sigma_shrinkage_penalty_design(noise_design);
     }
 
@@ -3113,9 +3121,10 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
 
     fn augment_result_designs(
         &self,
-        _: &mut TermCollectionDesign,
+        term_design: &mut TermCollectionDesign,
         noise_design: &mut TermCollectionDesign,
     ) {
+        debug_assert!(std::mem::size_of_val(term_design) > 0);
         append_binomial_log_sigma_shrinkage_penalty_design(noise_design);
     }
 
@@ -4207,7 +4216,8 @@ fn binomial_neglog_q_derivatives_logit_closed_form(y: f64, weight: f64, q: f64) 
 }
 
 #[inline]
-fn binomial_neglog_q_fourth_derivative_logit_closed_form(_: f64, weight: f64, q: f64) -> f64 {
+fn binomial_neglog_q_fourth_derivative_logit_closed_form(x: f64, weight: f64, q: f64) -> f64 {
+    debug_assert!(!x.is_nan());
     // Returns m4 = d^4F/dq^4 for logit link.
     // m4 = ws(1 - 6s) = ws(1 - 6p(1-p)).
     //
@@ -5523,8 +5533,9 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         psi_b: &GaussianLocationScaleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-        _: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
+        outer_rows: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
+        debug_assert!(outer_rows.map_or(true, |r| r.len() <= isize::MAX as usize));
         // Wiggle ψ path: full-data exact (= trivially unbiased). The
         // wiggle-specific second-order from-parts function inlines 30+
         // per-row coefficient arrays (`coeff_mm{,_a,_b,_ab}`,
@@ -5561,8 +5572,9 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         d_beta_flat: &Array1<f64>,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-        _: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
+        outer_rows: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<Array2<f64>, String> {
+        debug_assert!(outer_rows.map_or(true, |r| r.len() <= isize::MAX as usize));
         // Same rationale as `ws_psi_second_order_terms_from_parts` above:
         // the wiggle ψ-Hessian directional-derivative function also inlines
         // dozens of per-row arrays. Full-data is exact (= trivially
@@ -11330,10 +11342,11 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
 
     fn block_linear_constraints(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_idx: usize,
         spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
         if block_idx != Self::BLOCK_WIGGLE {
             return Ok(None);
         }
@@ -11342,11 +11355,13 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
 
     fn post_update_block_beta(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_idx: usize,
-        _: &ParameterBlockSpec,
+        block_spec: &ParameterBlockSpec,
         beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(!block_spec.name.is_empty());
         if block_idx != Self::BLOCK_WIGGLE {
             return Ok(beta);
         }
@@ -12868,10 +12883,11 @@ impl CustomFamily for BinomialMeanWiggleFamily {
 
     fn block_linear_constraints(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_idx: usize,
         spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
         if block_idx != Self::BLOCK_WIGGLE {
             return Ok(None);
         }
@@ -12880,11 +12896,13 @@ impl CustomFamily for BinomialMeanWiggleFamily {
 
     fn post_update_block_beta(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_idx: usize,
-        _: &ParameterBlockSpec,
+        block_spec: &ParameterBlockSpec,
         beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(!block_spec.name.is_empty());
         if block_idx != Self::BLOCK_WIGGLE {
             return Ok(beta);
         }
@@ -16499,8 +16517,9 @@ impl CustomFamily for BinomialLocationScaleFamily {
     fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],
-        _: &BlockwiseFitOptions,
+        options: &BlockwiseFitOptions,
     ) -> crate::custom_family::ExactOuterDerivativeOrder {
+        debug_assert!(std::mem::size_of_val(options) > 0);
         let coefficient_work = self
             .coefficient_hessian_cost(specs)
             .max(self.coefficient_gradient_cost(specs));
@@ -16732,10 +16751,13 @@ impl CustomFamily for BinomialLocationScaleFamily {
 
     fn diagonalworking_weights_directional_derivative(
         &self,
-        _: &[ParameterBlockState],
-        _: usize,
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        idx: usize,
+        arr: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(idx < usize::MAX);
+        debug_assert!(arr.iter().all(|v| !v.is_nan()));
         Err(
             "BinomialLocationScaleFamily no longer supports diagonal working weights; exact curvature is required"
                 .to_string(),
@@ -17067,9 +17089,11 @@ impl CustomFamily for BinomialLocationScaleFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         rho: &ndarray::Array1<f64>,
-        _: &BlockwiseFitOptions,
-        _: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+        options: &BlockwiseFitOptions,
+        workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
+        debug_assert!(std::mem::size_of_val(options) > 0);
+        debug_assert!(workspace.is_some() || workspace.is_none());
         use crate::faer_ndarray::FaerCholesky;
         use faer::Side;
 
@@ -20402,10 +20426,11 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
 
     fn block_linear_constraints(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_idx: usize,
         spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
         if block_idx != Self::BLOCK_WIGGLE {
             return Ok(None);
         }
@@ -20414,11 +20439,13 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
 
     fn post_update_block_beta(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_idx: usize,
-        _: &ParameterBlockSpec,
+        block_spec: &ParameterBlockSpec,
         beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(!block_spec.name.is_empty());
         if block_idx != Self::BLOCK_WIGGLE {
             return Ok(beta);
         }

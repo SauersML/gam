@@ -535,8 +535,9 @@ pub trait WorkingModel {
     fn update_with_curvature(
         &mut self,
         beta: &Coefficients,
-        _: HessianCurvatureKind,
+        curvature_kind: HessianCurvatureKind,
     ) -> Result<WorkingState, EstimationError> {
+        debug_assert!(core::mem::size_of_val(&curvature_kind) > 0);
         self.update(beta)
     }
 
@@ -551,10 +552,12 @@ pub trait WorkingModel {
     fn screen_candidate(
         &mut self,
         beta: &Coefficients,
-        _: &Array1<f64>,
-        _: &LinearPredictor,
+        arr: &Array1<f64>,
+        linear_predictor: &LinearPredictor,
         curvature: HessianCurvatureKind,
     ) -> Result<CandidateEvaluation, EstimationError> {
+        debug_assert!(arr.iter().all(|v| !v.is_nan()));
+        debug_assert!(std::mem::size_of_val(linear_predictor) > 0);
         self.update_candidate(beta, curvature)
             .map(CandidateEvaluation::Full)
     }
@@ -1010,7 +1013,9 @@ pub struct PirlsWorkspace {
 }
 
 impl PirlsWorkspace {
-    pub fn new(n: usize, p: usize, _: usize, _: usize) -> Self {
+    pub fn new(n: usize, p: usize, idx: usize, idx2: usize) -> Self {
+        debug_assert!(idx < usize::MAX);
+        debug_assert!(idx2 < usize::MAX);
         // Stage buffers are allocated lazily: historically these were pre-sized to
         // worst-case dimensions, which inflates memory when many PIRLS workspaces
         // exist concurrently (e.g. parallel REML evals).
@@ -10122,8 +10127,9 @@ fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> WeightLink {
 #[inline]
 fn supports_observed_hessian_curvature_for_likelihood(
     likelihood: GlmLikelihoodSpec,
-    _: &InverseLink,
+    inverse_link: &InverseLink,
 ) -> bool {
+    debug_assert!(std::mem::size_of_val(inverse_link) > 0);
     matches!(
         likelihood.family,
         GlmLikelihoodFamily::GammaLog

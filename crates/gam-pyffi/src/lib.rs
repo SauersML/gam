@@ -1817,6 +1817,10 @@ fn trace_product(left: ArrayView2<'_, f64>, right: ArrayView2<'_, f64>) -> f64 {
     value
 }
 
+<<<<<<< Updated upstream
+=======
+#[allow(clippy::too_many_arguments)]
+>>>>>>> Stashed changes
 fn gaussian_reml_fit_blocks_backward_analytic(
     designs: &[Array2<f64>],
     penalties_raw: &[Array2<f64>],

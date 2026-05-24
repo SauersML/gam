@@ -739,6 +739,16 @@ fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
         // exempt via the test mask.
         ("hint::black_box(", "hint::black_box", true),
         ("std::hint::black_box(", "std::hint::black_box", true),
+        ("core::hint::black_box(", "core::hint::black_box", true),
+        // `cfg!(debug_assertions)` / `cfg!(test)` — runtime branches whose
+        // behavior diverges between debug↔release or test↔non-test. Same
+        // pathology as `debug_assert!`: code that only runs in one build
+        // configuration silently changes meaning in the other. If the
+        // check matters it should be unconditional; if it doesn't it
+        // should be deleted. Test-aware (the test build legitimately
+        // queries its own configuration).
+        ("cfg!(debug_assertions)", "cfg!(debug_assertions)", true),
+        ("cfg!(test)", "cfg!(test)", true),
         // `file!().ends_with(".rs")` is a tautological assertion (the
         // compile-time `file!()` macro always returns the `.rs` source
         // path) commonly used to satisfy `scan_for_useless_tests` without
