@@ -2132,6 +2132,11 @@ struct ProjectedFactorCacheInner {
 struct ProjectedFactorInProgress {
     state: Mutex<Option<ProjectedFactorInProgressState>>,
     ready: Condvar,
+    /// Number of threads currently parked inside the `Wait` branch for this
+    /// in-progress slot. Producer panics-recovery tests poll this to know
+    /// when subscribers have actually entered the condvar wait — without
+    /// relying on `thread::sleep` to mask the race window.
+    waiter_count: std::sync::atomic::AtomicUsize,
 }
 
 enum ProjectedFactorInProgressState {
@@ -2175,6 +2180,23 @@ impl ProjectedFactorCache {
         }
     }
 
+    /// Number of threads currently parked as waiters on an in-progress slot
+    /// for `key`. Returns 0 if the key has no in-progress computation. Used
+    /// by panic-recovery tests to deterministically synchronize without
+    /// `thread::sleep`.
+    #[cfg(test)]
+    pub fn pending_waiters_for(&self, key: ProjectedFactorKey) -> usize {
+        let inner = self
+            .inner
+            .lock()
+            .expect("projected factor cache lock poisoned");
+        inner
+            .in_progress
+            .get(&key)
+            .map(|m| m.waiter_count.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(0)
+    }
+
     pub fn get_or_insert_with(
         &self,
         key: ProjectedFactorKey,
@@ -2202,6 +2224,7 @@ impl ProjectedFactorCache {
                 let marker = Arc::new(ProjectedFactorInProgress {
                     state: Mutex::new(None),
                     ready: Condvar::new(),
+                    waiter_count: std::sync::atomic::AtomicUsize::new(0),
                 });
                 inner.in_progress.insert(key, marker.clone());
                 CacheLookup::Compute(marker)
@@ -2211,14 +2234,22 @@ impl ProjectedFactorCache {
         match lookup {
             CacheLookup::Hit(value) => value,
             CacheLookup::Wait(marker) => {
+                marker
+                    .waiter_count
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 let mut guard = marker
                     .state
                     .lock()
                     .expect("projected factor in-progress lock poisoned");
-                loop {
+                let result = loop {
                     match guard.as_ref() {
-                        Some(ProjectedFactorInProgressState::Ready(value)) => return value.clone(),
+                        Some(ProjectedFactorInProgressState::Ready(value)) => {
+                            break value.clone();
+                        }
                         Some(ProjectedFactorInProgressState::Failed) => {
+                            marker
+                                .waiter_count
+                                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                             panic!("projected factor cache producer panicked")
                         }
                         None => {
@@ -2228,7 +2259,11 @@ impl ProjectedFactorCache {
                                 .expect("projected factor in-progress wait poisoned");
                         }
                     }
-                }
+                };
+                marker
+                    .waiter_count
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                result
             }
             CacheLookup::Compute(marker) => {
                 // Compute outside the cache mutex so expensive design GEMMs do
