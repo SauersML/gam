@@ -4008,6 +4008,26 @@ struct OuterConfig {
     solver_class: SolverClass,
     operator_initial_trust_radius: Option<f64>,
     arc_initial_regularization: Option<f64>,
+    /// Optional scale factor for the objective's natural magnitude.
+    /// Used to widen the absolute gradient-norm floor on objectives whose
+    /// gradient lives on a non-unit scale (e.g. Gaussian-identity REML at
+    /// large `n`, whose ∂/∂logλ inherits the O(n) likelihood constant).
+    /// `None` falls back to the bare `tolerance` floor.
+    objective_scale: Option<f64>,
+    /// BFGS line-search infinity-norm cap applied to the leading `rho_dim`
+    /// outer parameters (log-λ axes). Documented natural step for
+    /// `log(lambda)` is ≈ 5 (`e^5 ≈ 148`-fold smoothing-parameter change
+    /// per accepted outer iter — matches typical quasi-Newton direction
+    /// magnitude on flat REML surfaces). Setting this `None` disables the
+    /// rho-axis cap entirely.
+    bfgs_step_cap: Option<f64>,
+    /// BFGS line-search infinity-norm cap applied to the trailing `psi_dim`
+    /// outer parameters (kappa / aniso-log-scale axes). Required because
+    /// the kernel scale axes need much tighter control (`e^1 ≈ 2.7`-fold
+    /// per iter is plenty) — using the rho-axis cap here lets the optimizer
+    /// jump kappa by orders of magnitude per step and oscillate. Setting
+    /// this `None` disables the psi-axis cap.
+    bfgs_step_cap_psi: Option<f64>,
     /// Optional persistent-cache session. When `Some`, every finite objective
     /// evaluation is written through to disk (rate-limited, atomic-rename)
     /// and the best on-disk rho is prepended as a seed at the start of each
@@ -4039,6 +4059,9 @@ impl Default for OuterConfig {
             solver_class: SolverClass::Primary,
             operator_initial_trust_radius: None,
             arc_initial_regularization: None,
+            objective_scale: None,
+            bfgs_step_cap: None,
+            bfgs_step_cap_psi: None,
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
         }
@@ -4335,6 +4358,9 @@ impl OuterProblem {
             solver_class: self.solver_class,
             operator_initial_trust_radius: self.operator_initial_trust_radius,
             arc_initial_regularization: self.arc_initial_regularization,
+            objective_scale: self.objective_scale,
+            bfgs_step_cap: self.bfgs_step_cap,
+            bfgs_step_cap_psi: self.bfgs_step_cap_psi,
             cache_session: self.cache_session.clone(),
             cache_mirror_sessions: self.cache_mirror_sessions.clone(),
         }
