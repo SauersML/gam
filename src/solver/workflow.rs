@@ -118,6 +118,12 @@ pub enum WorkflowError {
     /// optimizer / profile-cost evaluation) failed to converge or
     /// produced a non-finite value that downstream code cannot consume.
     IntegrationFailed { reason: String },
+    /// Formula parsing / term-resolution failed before materialization; the
+    /// source retains the parser-layer category and argument context.
+    FormulaDsl {
+        context: &'static str,
+        source: crate::inference::formula_dsl::FormulaDslError,
+    },
 }
 
 impl std::fmt::Display for WorkflowError {
@@ -127,11 +133,22 @@ impl std::fmt::Display for WorkflowError {
             | WorkflowError::SchemaMismatch { reason }
             | WorkflowError::MissingDependency { reason }
             | WorkflowError::IntegrationFailed { reason } => f.write_str(reason),
+            WorkflowError::FormulaDsl { context, source } => write!(f, "{context}: {source}"),
         }
     }
 }
 
-impl std::error::Error for WorkflowError {}
+impl std::error::Error for WorkflowError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WorkflowError::FormulaDsl { source, .. } => Some(source),
+            WorkflowError::InvalidConfig { .. }
+            | WorkflowError::SchemaMismatch { .. }
+            | WorkflowError::MissingDependency { .. }
+            | WorkflowError::IntegrationFailed { .. } => None,
+        }
+    }
+}
 
 impl From<WorkflowError> for String {
     fn from(err: WorkflowError) -> String {
@@ -145,8 +162,9 @@ impl From<WorkflowError> for String {
 /// boundary instead of stringifying immediately.
 impl From<crate::inference::formula_dsl::FormulaDslError> for WorkflowError {
     fn from(err: crate::inference::formula_dsl::FormulaDslError) -> Self {
-        Self::InvalidConfig {
-            reason: err.to_string(),
+        Self::FormulaDsl {
+            context: "workflow formula materialization",
+            source: err,
         }
     }
 }

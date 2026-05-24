@@ -5958,6 +5958,99 @@ impl crate::solver::outer_strategy::OuterHessianOperator for OwnedDenseOuterHess
     }
 }
 
+struct LabeledOuterHessianOperator {
+    base: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
+    physical_to_outer: Vec<usize>,
+    outer_dim: usize,
+}
+
+impl LabeledOuterHessianOperator {
+    fn new(
+        base: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
+        layout: &PenaltyLabelLayout,
+    ) -> Self {
+        Self {
+            base,
+            physical_to_outer: layout.physical_to_outer.clone(),
+            outer_dim: layout.initial_rho.len(),
+        }
+    }
+}
+
+impl crate::solver::outer_strategy::OuterHessianOperator for LabeledOuterHessianOperator {
+    fn dim(&self) -> usize {
+        self.outer_dim
+    }
+
+    fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if v.len() != self.outer_dim {
+            return Err(format!(
+                "labeled outer Hessian input length mismatch: got {}, expected {}",
+                v.len(),
+                self.outer_dim
+            ));
+        }
+        let mut physical = Array1::<f64>::zeros(self.physical_to_outer.len());
+        for (physical_idx, &outer_idx) in self.physical_to_outer.iter().enumerate() {
+            physical[physical_idx] = v[outer_idx];
+        }
+        let physical_out = self.base.matvec(&physical)?;
+        if physical_out.len() != self.physical_to_outer.len() {
+            return Err(format!(
+                "labeled outer Hessian physical matvec length mismatch: got {}, expected {}",
+                physical_out.len(),
+                self.physical_to_outer.len()
+            ));
+        }
+        let mut out = Array1::<f64>::zeros(self.outer_dim);
+        for (physical_idx, &outer_idx) in self.physical_to_outer.iter().enumerate() {
+            out[outer_idx] += physical_out[physical_idx];
+        }
+        Ok(out)
+    }
+
+    fn mul_mat(&self, factor: ndarray::ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        if factor.nrows() != self.outer_dim {
+            return Err(format!(
+                "labeled outer Hessian factor row mismatch: got {}, expected {}",
+                factor.nrows(),
+                self.outer_dim
+            ));
+        }
+        let mut physical_factor =
+            Array2::<f64>::zeros((self.physical_to_outer.len(), factor.ncols()));
+        for (physical_idx, &outer_idx) in self.physical_to_outer.iter().enumerate() {
+            physical_factor
+                .row_mut(physical_idx)
+                .assign(&factor.row(outer_idx));
+        }
+        let physical_out = self.base.mul_mat(physical_factor.view())?;
+        if physical_out.nrows() != self.physical_to_outer.len() {
+            return Err(format!(
+                "labeled outer Hessian physical output row mismatch: got {}, expected {}",
+                physical_out.nrows(),
+                self.physical_to_outer.len()
+            ));
+        }
+        let mut out = Array2::<f64>::zeros((self.outer_dim, factor.ncols()));
+        for (physical_idx, &outer_idx) in self.physical_to_outer.iter().enumerate() {
+            let physical_row = physical_out.row(physical_idx);
+            out.row_mut(outer_idx).scaled_add(1.0, &physical_row);
+        }
+        Ok(out)
+    }
+
+    fn is_cheap_to_materialize(&self) -> bool {
+        self.base.is_cheap_to_materialize()
+    }
+
+    fn materialization_capability(
+        &self,
+    ) -> crate::solver::outer_strategy::OuterHessianMaterialization {
+        self.base.materialization_capability()
+    }
+}
+
 fn custom_family_batched_outer_hessian_operator<F: CustomFamily>(
     family: &F,
     states: &[ParameterBlockState],
