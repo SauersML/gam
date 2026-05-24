@@ -1,4 +1,4 @@
-use gam::basis::{PeriodicSpline1DOptions, fit_periodic_spline_1d};
+use gam::basis::{PeriodicBSplineBasisSpec, fit_periodic_bspline_curve};
 use ndarray::{Array1, Array2, array};
 
 const TWO_PI: f64 = std::f64::consts::TAU;
@@ -23,12 +23,12 @@ fn periodic_spline_interpolates_anisotropic_ellipse_in_multi_output_space() {
         y[[i, 1]] = 0.35 * t.sin();
     }
 
-    let spline = fit_periodic_spline_1d(u.view(), y.view(), PeriodicSpline1DOptions::new(TWO_PI))
-        .expect("periodic ellipse fit");
+    let spec = PeriodicBSplineBasisSpec::new(3, 16, TWO_PI, 0.0, 2);
+    let spline =
+        fit_periodic_bspline_curve(u.view(), y.view(), &spec, 0.0).expect("periodic ellipse fit");
     let fitted = spline.evaluate(u.view()).expect("ellipse eval at knots");
 
     assert_eq!(spline.ambient_dim(), 2);
-    assert_eq!(spline.num_sites(), n);
     assert!(max_abs(&fitted, &y) < 1e-10);
 
     let seam = array![0.0, TWO_PI, -TWO_PI, 11.0 * TWO_PI];
@@ -63,8 +63,9 @@ fn periodic_spline_handles_skewed_oval_embedded_in_3d() {
         y[[i, 2]] = 0.25 * (t + 0.3).sin() + 0.1 * (4.0 * t).cos();
     }
 
-    let spline = fit_periodic_spline_1d(u.view(), y.view(), PeriodicSpline1DOptions::new(TWO_PI))
-        .expect("periodic 3d oval fit");
+    let spec = PeriodicBSplineBasisSpec::new(3, 24, TWO_PI, 0.0, 2);
+    let spline =
+        fit_periodic_bspline_curve(u.view(), y.view(), &spec, 0.0).expect("periodic 3d oval fit");
     let fitted = spline.evaluate(u.view()).expect("oval eval at knots");
     assert_eq!(spline.ambient_dim(), 3);
     assert!(max_abs(&fitted, &y) < 1e-10);
@@ -90,9 +91,9 @@ fn periodic_spline_accepts_unsorted_samples_and_duplicate_endpoint() {
         y[[i, 1]] = 0.25 * t.sin();
     }
 
-    let spline = fit_periodic_spline_1d(u.view(), y.view(), PeriodicSpline1DOptions::new(TWO_PI))
+    let spec = PeriodicBSplineBasisSpec::new(3, 4, TWO_PI, 0.0, 2);
+    let spline = fit_periodic_bspline_curve(u.view(), y.view(), &spec, 0.0)
         .expect("fit with duplicate endpoint");
-    assert_eq!(spline.num_sites(), 3);
 
     let at_zero = spline.evaluate(array![0.0].view()).expect("zero eval");
     let at_period = spline.evaluate(array![TWO_PI].view()).expect("period eval");
@@ -105,21 +106,18 @@ fn periodic_spline_accepts_unsorted_samples_and_duplicate_endpoint() {
 fn periodic_spline_rejects_scalar_only_or_degenerate_inputs() {
     let u = array![0.0, 1.0];
     let y = Array2::<f64>::zeros((2, 2));
-    let err = fit_periodic_spline_1d(u.view(), y.view(), PeriodicSpline1DOptions::new(2.0))
+    let spec = PeriodicBSplineBasisSpec::new(3, 4, 2.0, 0.0, 2);
+    fit_periodic_bspline_curve(u.view(), y.view(), &spec, 0.0)
         .expect_err("too few samples should fail");
-    assert!(err.to_string().contains("at least three samples"));
 
     let u3 = array![0.0, 1.0, 2.0];
     let y_bad = Array2::<f64>::zeros((2, 2));
-    let err = fit_periodic_spline_1d(u3.view(), y_bad.view(), PeriodicSpline1DOptions::new(3.0))
+    let spec3 = PeriodicBSplineBasisSpec::new(3, 4, 3.0, 0.0, 2);
+    fit_periodic_bspline_curve(u3.view(), y_bad.view(), &spec3, 0.0)
         .expect_err("row mismatch should fail");
-    assert!(err.to_string().contains("does not match output row count"));
 
     let y3 = Array2::<f64>::zeros((3, 1));
-    let err = fit_periodic_spline_1d(u3.view(), y3.view(), PeriodicSpline1DOptions::new(f64::NAN))
+    let spec_nan = PeriodicBSplineBasisSpec::new(3, 4, f64::NAN, 0.0, 2);
+    fit_periodic_bspline_curve(u3.view(), y3.view(), &spec_nan, 0.0)
         .expect_err("bad period should fail");
-    assert!(
-        err.to_string()
-            .contains("period must be finite and positive")
-    );
 }

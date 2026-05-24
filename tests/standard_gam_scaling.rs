@@ -25,7 +25,7 @@ use rand::{RngExt, SeedableRng};
 use std::time::Instant;
 
 mod power_law_common;
-use power_law_common::report_power_law_full as fit_and_report_power_law_inner;
+use power_law_common::fit_power_law as fit_and_report_power_law_inner;
 
 const K: usize = 8;
 const SEED: u64 = 0x5CA1_AB1E;
@@ -223,7 +223,54 @@ fn fit_and_report_power_law(
     extrapolate: &[(&str, f64)],
     budget_y: f64,
 ) {
-    let _ = fit_and_report_power_law_inner(tag, &points, extrapolate, budget_y);
+    let Some(fit) = fit_and_report_power_law_inner(&points) else {
+        eprintln!(
+            "{tag} INSUFFICIENT DATA: {} points (need >=3 for an honest fit)",
+            points.len()
+        );
+        return;
+    };
+    eprintln!(
+        "{tag} fit: y ~= {:.3e} * x^{:.3}  | R^2={:.4}  max|log-resid|={:.3} (x{:.2})  | n_points={}",
+        fit.a,
+        fit.alpha,
+        fit.r2,
+        fit.max_abs_log_resid,
+        fit.max_abs_log_resid.exp(),
+        fit.n_points,
+    );
+    if fit.r2 < 0.85 || fit.max_abs_log_resid > 0.5 {
+        eprintln!(
+            "{tag} REFUSING EXTRAPOLATION: fit quality insufficient (R^2 < 0.85 or max-resid > 0.5 in log-space)."
+        );
+        return;
+    }
+    eprintln!("{tag} budget: {:.1}", budget_y);
+    let max_x: f64 = points.iter().map(|(x, _)| *x).fold(0.0_f64, f64::max);
+    let min_x: f64 = points.iter().map(|(x, _)| *x).fold(f64::INFINITY, f64::min);
+    for (label, x_target) in extrapolate {
+        let pred = fit.a * x_target.powf(fit.alpha);
+        let stretch = x_target / max_x;
+        let stretch_note = if stretch > 5.0 {
+            format!(
+                " [extrapolating {:.1}x past max calibration x={:.1e}]",
+                stretch, max_x
+            )
+        } else if *x_target < min_x {
+            format!(" [extrapolating below min calibration x={:.1e}]", min_x)
+        } else {
+            String::new()
+        };
+        let verdict_str = if pred <= budget_y {
+            format!("FITS ({:.0}x headroom)", budget_y / pred.max(1e-300))
+        } else {
+            format!("OVER BUDGET ({:.1}x)", pred / budget_y.max(1e-300))
+        };
+        eprintln!(
+            "{tag} extrap @ {label} (x={:.3e}): pred={:.3e}{stretch_note} -> {verdict_str}",
+            x_target, pred
+        );
+    }
 }
 
 #[test]
