@@ -8804,15 +8804,12 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(predict_array, module)?)?;
     module.add_function(wrap_pyfunction!(competing_risks_cif, module)?)?;
     module.add_function(wrap_pyfunction!(sample_table, module)?)?;
-    module.add_function(wrap_pyfunction!(paired_sample_table, module)?)?;
-    module.add_function(wrap_pyfunction!(paired_cumulative_incidence_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_table, module)?)?;
     module.add_function(wrap_pyfunction!(design_matrix_array, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis, module)?)?;
     module.add_function(wrap_pyfunction!(bspline_basis_derivative, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_basis, module)?)?;
     module.add_function(wrap_pyfunction!(smoothness_penalty, module)?)?;
-    module.add_function(wrap_pyfunction!(periodic_spline_curve_basis, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_function_norm_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_operator_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis, module)?)?;
@@ -10196,122 +10193,6 @@ fn sample_table_impl(
         &cfg,
     )?;
     serialize_sample_payload(&model, &nuts, &cfg)
-}
-
-fn paired_sample_table_impl(
-    target_model_bytes: &[u8],
-    competing_model_bytes: &[u8],
-    target_headers: Vec<String>,
-    target_rows: Vec<Vec<String>>,
-    competing_headers: Vec<String>,
-    competing_rows: Vec<Vec<String>>,
-    options_json: Option<&str>,
-) -> Result<String, String> {
-    let target_model = load_model_impl(target_model_bytes)?;
-    let competing_model = load_model_impl(competing_model_bytes)?;
-    let target_dataset = dataset_with_model_schema(&target_model, &target_headers, &target_rows)?;
-    drop(target_rows);
-    drop(target_headers);
-    let competing_dataset =
-        dataset_with_model_schema(&competing_model, &competing_headers, &competing_rows)?;
-    drop(competing_rows);
-    drop(competing_headers);
-    let options = parse_sample_options(options_json)?;
-    let (target_cfg, competing_cfg) =
-        resolve_paired_nuts_configs(&target_model, &competing_model, options);
-
-    let target_col_map = target_dataset.column_map();
-    let target_nuts = gam::sample::sample_saved_model(
-        &target_model,
-        target_dataset.values.view(),
-        &target_col_map,
-        target_model.training_headers.as_ref(),
-        &target_cfg,
-    )?;
-    let competing_col_map = competing_dataset.column_map();
-    let competing_nuts = gam::sample::sample_saved_model(
-        &competing_model,
-        competing_dataset.values.view(),
-        &competing_col_map,
-        competing_model.training_headers.as_ref(),
-        &competing_cfg,
-    )?;
-    if target_nuts.samples.nrows() != competing_nuts.samples.nrows() {
-        return Err(format!(
-            "paired posterior sampling produced unequal draw counts: target={}, competing={}",
-            target_nuts.samples.nrows(),
-            competing_nuts.samples.nrows()
-        ));
-    }
-    let payload = PairedSamplePayload {
-        class: "paired_posterior_samples",
-        n_draws: target_nuts.samples.nrows(),
-        target: build_sample_payload(&target_model, &target_nuts, &target_cfg),
-        competing: build_sample_payload(&competing_model, &competing_nuts, &competing_cfg),
-    };
-    serde_json::to_string(&payload)
-        .map_err(|err| format!("failed to serialize paired sample payload: {err}"))
-}
-
-fn resolve_paired_nuts_configs(
-    target_model: &FittedModel,
-    competing_model: &FittedModel,
-    options: PySampleOptions,
-) -> (NutsConfig, NutsConfig) {
-    let target_adaptive = NutsConfig::for_dimension(
-        target_model
-            .fit_result
-            .as_ref()
-            .map(|fit| fit.beta.len())
-            .unwrap_or(0),
-    );
-    let competing_adaptive = NutsConfig::for_dimension(
-        competing_model
-            .fit_result
-            .as_ref()
-            .map(|fit| fit.beta.len())
-            .unwrap_or(0),
-    );
-    let n_samples = options
-        .samples
-        .unwrap_or_else(|| target_adaptive.n_samples.max(competing_adaptive.n_samples));
-    let nwarmup = options
-        .warmup
-        .unwrap_or_else(|| target_adaptive.nwarmup.max(competing_adaptive.nwarmup));
-    let n_chains = options
-        .chains
-        .unwrap_or_else(|| target_adaptive.n_chains.max(competing_adaptive.n_chains));
-    let target_accept = options.target_accept.unwrap_or_else(|| {
-        target_adaptive
-            .target_accept
-            .max(competing_adaptive.target_accept)
-    });
-    let seed = options.seed.unwrap_or(target_adaptive.seed);
-    let competing_seed = splitmix64(seed ^ 0x9E37_79B9_7F4A_7C15);
-    (
-        NutsConfig {
-            n_samples,
-            nwarmup,
-            n_chains,
-            target_accept,
-            seed,
-        },
-        NutsConfig {
-            n_samples,
-            nwarmup,
-            n_chains,
-            target_accept,
-            seed: competing_seed,
-        },
-    )
-}
-
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
 }
 
 /// Returns the inverse-link kind tag emitted to the Python wrapper.
