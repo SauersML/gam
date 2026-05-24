@@ -632,12 +632,11 @@ fn bspline_basis_derivative<'py>(
 /// `points` is `(N, d)`, `centers` is `(K, d)`. For 1D smooths, pass
 /// shapes `(N, 1)` and `(K, 1)`.
 ///
-/// `periodic_per_axis` is an optional `Vec<bool>` of length `d`. For `d=1`
-/// with a single periodic axis, the legacy Bernoulli-Green builder is used
-/// (true periodic Green's function on the circle). For `d ≥ 2` with any
-/// periodic axis, the multi-D mixed-periodicity radial polyharmonic builder
-/// is used (cylinder/torus chord distance); per-axis periods are auto-derived
-/// from the centers' span along each periodic axis.
+/// `periodic_per_axis` is an optional `Vec<bool>` of length `d`. Whenever any
+/// axis is periodic (including the 1D circle case), the mixed-periodicity
+/// radial polyharmonic builder is used (cylinder/torus chord distance);
+/// per-axis periods are auto-derived from the centers' span along each
+/// periodic axis.
 #[pyfunction(signature = (
     points,
     centers,
@@ -890,9 +889,9 @@ fn duchon_function_norm_penalty<'py>(
     } else {
         (None, duchon_nullspace_from_m(m), 0.0)
     };
-    // Multi-D periodic: route through the mixed-periodicity builder
-    // (cylinder/torus chord-distance polyharmonic).
-    if any_periodic && d > 1 {
+    // Any periodic axis (1D or multi-D) routes through the mixed-periodicity
+    // builder (cylinder/torus chord-distance polyharmonic).
+    if any_periodic {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
             length_scale: spec_length_scale,
@@ -912,8 +911,7 @@ fn duchon_function_norm_penalty<'py>(
         )
         .map_err(|err| py_value_error(err.to_string()))?;
         // Mixed-periodicity builder emits a single Primary candidate (the
-        // function-norm Gram). Look it up by source for parity with the
-        // 1D periodic fallback below.
+        // function-norm Gram).
         let idx = built
             .penaltyinfo
             .iter()
@@ -935,58 +933,17 @@ fn duchon_function_norm_penalty<'py>(
         aniso_log_scales: None,
         operator_penalties: Default::default(),
         periodic: None,
-        boundary: if any_periodic && d == 1 {
-            let left = center_matrix[[0, 0]];
-            let right = center_matrix[[center_matrix.nrows() - 1, 0]];
-            if !(left.is_finite() && right.is_finite() && right > left) {
-                return Err(py_value_error(
-                    "periodic Duchon centers must define a finite ordered domain".to_string(),
-                ));
-            }
-            OneDimensionalBoundary::Cyclic {
-                start: left,
-                end: right,
-            }
-        } else {
-            OneDimensionalBoundary::Open
-        },
+        boundary: OneDimensionalBoundary::Open,
     };
     let built = build_duchon_basis(center_matrix.view(), &spec)
         .map_err(|err| py_value_error(err.to_string()))?;
-    let periodic = any_periodic;
     // The scale-free pure-Duchon path emits the operator triplet (mass,
     // tension, stiffness); the function-norm seminorm is the curvature
-    // (stiffness) block — `∫|∇^(p+s) f|²`-flavoured — *not* the leading
-    // mass entry, which was previously returned by mistake when the
-    // factory was a single Primary candidate. Look up the stiffness slot
-    // by source so the FFI returns the correct object regardless of the
-    // factory's candidate ordering.
-    // Find the function-norm penalty. The non-periodic builder emits an
-    // operator triplet (mass/tension/stiffness); the function-norm
-    // seminorm `∫|∇^(p+s) f|²` is the stiffness block.
-    //
-    // The PERIODIC builder takes a different code path
-    // (`build_periodic_duchon_basis_1d`): it constructs a single Primary
-    // candidate from the Bernoulli Green's function Gram
-    // (`omega = z' K_centers z`), which IS the function-norm penalty in
-    // the periodic basis — there is no separate operator triplet. So when
-    // the spec is periodic and no OperatorStiffness slot exists, fall
-    // back to the Primary block. This was previously a hard error that
-    // made `ManifoldSAE(periodic=True)` unusable.
+    // (stiffness) block — `∫|∇^(p+s) f|²`-flavoured.
     let stiffness_idx = built
         .penaltyinfo
         .iter()
         .position(|info| matches!(info.source, gam::basis::PenaltySource::OperatorStiffness))
-        .or_else(|| {
-            if periodic {
-                built
-                    .penaltyinfo
-                    .iter()
-                    .position(|info| matches!(info.source, gam::basis::PenaltySource::Primary))
-            } else {
-                None
-            }
-        })
         .ok_or_else(|| {
             py_value_error(
                 "Duchon function-norm penalty (stiffness) was not built; \
@@ -13066,22 +13023,16 @@ fn duchon_basis_1d_impl(
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
         operator_penalties: Default::default(),
-        boundary: if periodic {
-            let left = centers[0];
-            let right = centers[centers.len() - 1];
-            if !(left.is_finite() && right.is_finite() && right > left) {
-                return Err(
-                    "periodic Duchon centers must define a finite ordered domain".to_string(),
-                );
-            }
-            OneDimensionalBoundary::Cyclic {
-                start: left,
-                end: right,
-            }
-        } else {
-            OneDimensionalBoundary::Open
-        },
+        boundary: OneDimensionalBoundary::Open,
     };
+    if periodic {
+        let built = build_duchon_basis_mixed_periodicity_auto(data.view(), &spec, &[true], None)
+            .map_err(|err| format!("failed to evaluate Duchon basis: {err}"))?;
+        return built
+            .design
+            .try_to_dense_by_chunks("duchon_basis_1d_impl")
+            .map_err(|err| format!("failed to evaluate Duchon basis: {err}"));
+    }
     let built = build_duchon_basis(data.view(), &spec)
         .map_err(|err| format!("failed to evaluate Duchon basis: {err}"))?;
     built

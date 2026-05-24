@@ -21499,16 +21499,13 @@ fn duchon_mixed_periodicity_distance(
 ///
 /// Notes
 /// -----
-/// * **Math (1D match)**: for ``d = 1`` and one periodic axis, the new path
-///   uses the polyharmonic-of-chord-distance kernel
-///   ``c · |(P/π) sin(π Δ/P)|^(2m − 1)``. The legacy 1D path uses the
-///   Bernoulli Green's function ``B_{2m}(Δ/P)`` of the iterated 1D
-///   Laplacian on the circle. These are *different kernels* (both PSD
-///   on the circle), so a 1D run via the new path is **not** expected to
-///   numerically match the legacy 1D periodic builder. The pyffi
-///   dispatcher keeps the legacy Bernoulli builder for the ``d = 1`` case
-///   so existing 1D users see no behavioral change; this builder is the
-///   principled generalization for ``d ≥ 2``.
+/// * **Math (1D)**: for ``d = 1`` with one periodic axis, this path uses the
+///   polyharmonic-of-chord-distance kernel
+///   ``c · |(P/π) sin(π Δ/P)|^(2m − 1)``. This is the principled
+///   generalization on the circle and is also the kernel the pyffi
+///   dispatcher uses for the 1D periodic case; the older Bernoulli
+///   Green's-function ``B_{2m}(Δ/P)`` builder is no longer dispatched
+///   from pyffi.
 /// * **Nullspace audit**: a more principled choice for the cylinder
 ///   (``d = 2``, axis 0 periodic, axis 1 non-periodic) is the polynomial
 ///   nullspace ``{1, x_1, x_1², …, x_1^{m−1}}`` — polynomials in the
