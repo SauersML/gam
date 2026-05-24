@@ -8,7 +8,9 @@ use crate::families::marginal_slope_shared::{
     ObservedDenestedCellPartials, eval_coeff4_at,
     probit_frailty_scale as marginal_slope_probit_frailty_scale, scale_coeff4,
 };
-use crate::families::strategy::{FamilyStrategy, strategy_for_family, strategy_from_fit};
+use crate::families::strategy::{
+    FamilyStrategy, strategy_for_family, strategy_for_spec, strategy_from_fit,
+};
 use crate::inference::model::{
     SavedAnchoredDeviationRuntime, SavedLatentZNormalization, SavedLinkWiggleRuntime,
 };
@@ -39,10 +41,9 @@ pub fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
 
 fn apply_family_inverse_link(
     eta: &Array1<f64>,
-    family: crate::types::LikelihoodFamily,
-    link_kind: Option<&InverseLink>,
+    family: &LikelihoodSpec,
 ) -> Result<Array1<f64>, EstimationError> {
-    strategy_for_family(family, link_kind).inverse_link_array(eta.view())
+    strategy_for_spec(family).inverse_link_array(eta.view())
 }
 
 /// Build a `LikelihoodSpec` from a legacy `(LikelihoodFamily, Option<&InverseLink>)`

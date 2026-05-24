@@ -332,7 +332,7 @@ mod tests {
     use crate::solver::outer_strategy::{HessianResult, OuterEval};
     use crate::terms::basis::{ImplicitDesignPsiDerivative, RadialScalarKind};
     use crate::types::{
-        GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
+        GlmFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
         ResponseFamily,
     };
     use faer::Side;
@@ -360,42 +360,42 @@ mod tests {
     fn glm_spec_from_likelihood_spec(spec: LikelihoodSpec) -> GlmLikelihoodSpec {
         let family = match (&spec.response, &spec.link) {
             (ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)) => {
-                GlmLikelihoodFamily::GaussianIdentity
+                GlmFamily::GaussianIdentity
             }
             (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
-                GlmLikelihoodFamily::BinomialLogit
+                GlmFamily::BinomialLogit
             }
             (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
-                GlmLikelihoodFamily::BinomialProbit
+                GlmFamily::BinomialProbit
             }
             (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
-                GlmLikelihoodFamily::BinomialCLogLog
+                GlmFamily::BinomialCLogLog
             }
-            (ResponseFamily::Binomial, InverseLink::Sas(_)) => GlmLikelihoodFamily::BinomialSas,
+            (ResponseFamily::Binomial, InverseLink::Sas(_)) => GlmFamily::BinomialSas,
             (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
-                GlmLikelihoodFamily::BinomialBetaLogistic
+                GlmFamily::BinomialBetaLogistic
             }
             (ResponseFamily::Binomial, InverseLink::Mixture(_)) => {
-                GlmLikelihoodFamily::BinomialMixture
+                GlmFamily::BinomialMixture
             }
             (ResponseFamily::Poisson, InverseLink::Standard(LinkFunction::Log)) => {
-                GlmLikelihoodFamily::PoissonLog
+                GlmFamily::PoissonLog
             }
             (ResponseFamily::Tweedie { p }, InverseLink::Standard(LinkFunction::Log)) => {
-                GlmLikelihoodFamily::Tweedie { p: *p }
+                GlmFamily::Tweedie { p: *p }
             }
             (
                 ResponseFamily::NegativeBinomial { theta },
                 InverseLink::Standard(LinkFunction::Log),
-            ) => GlmLikelihoodFamily::NegativeBinomial { theta: *theta },
+            ) => GlmFamily::NegativeBinomial { theta: *theta },
             (ResponseFamily::Beta { phi }, InverseLink::Standard(LinkFunction::Logit)) => {
-                GlmLikelihoodFamily::BetaLogit { phi: *phi }
+                GlmFamily::BetaLogit { phi: *phi }
             }
             (ResponseFamily::Gamma, InverseLink::Standard(LinkFunction::Log)) => {
-                GlmLikelihoodFamily::GammaLog
+                GlmFamily::GammaLog
             }
             (response, link) => panic!(
-                "no GlmLikelihoodFamily mapping for LikelihoodSpec {{ response: {:?}, link: {:?} }}",
+                "no GlmFamily mapping for LikelihoodSpec {{ response: {:?}, link: {:?} }}",
                 response, link,
             ),
         };

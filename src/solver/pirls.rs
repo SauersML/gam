@@ -16,7 +16,7 @@ use crate::probability::standard_normal_quantile;
 use crate::solver::active_set;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 // MIGRATION_TODO(pirls/LikelihoodSpec): this module is currently parameterized
-// on `GlmLikelihoodSpec`/`GlmLikelihoodFamily` (the GLM-restricted projection of
+// on `GlmLikelihoodSpec`/`GlmFamily` (the GLM-restricted projection of
 // the legacy `LikelihoodFamily` enum). The agreed migration target is the
 // unified `LikelihoodSpec { response: ResponseFamily, link: InverseLink }` type
 // from `types.rs`.
@@ -70,7 +70,7 @@ use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 // change. Until that companion change lands, the file keeps the existing
 // `GlmLikelihoodSpec` parameterization.
 use crate::types::{
-    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LinkFunction, MixtureLinkState,
+    GlmFamily, GlmLikelihoodSpec, InverseLink, LinkFunction, MixtureLinkState,
     RidgePassport, RidgePolicy, SasLinkState, is_valid_tweedie_power,
 };
 use dyn_stack::{MemBuffer, MemStack};
@@ -737,12 +737,12 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
     ) -> Result<(), EstimationError> {
         match (self.family, integrated) {
             (
-                GlmLikelihoodFamily::BinomialLogit
-                | GlmLikelihoodFamily::BinomialProbit
-                | GlmLikelihoodFamily::BinomialCLogLog
-                | GlmLikelihoodFamily::BinomialSas
-                | GlmLikelihoodFamily::BinomialBetaLogistic
-                | GlmLikelihoodFamily::BinomialMixture,
+                GlmFamily::BinomialLogit
+                | GlmFamily::BinomialProbit
+                | GlmFamily::BinomialCLogLog
+                | GlmFamily::BinomialSas
+                | GlmFamily::BinomialBetaLogistic
+                | GlmFamily::BinomialMixture,
                 Some(integ),
             ) => {
                 update_glmvectors_integrated_by_family(
@@ -762,11 +762,11 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 Ok(())
             }
             (
-                GlmLikelihoodFamily::BinomialLogit
-                | GlmLikelihoodFamily::BinomialProbit
-                | GlmLikelihoodFamily::BinomialCLogLog
-                | GlmLikelihoodFamily::BinomialSas
-                | GlmLikelihoodFamily::BinomialBetaLogistic,
+                GlmFamily::BinomialLogit
+                | GlmFamily::BinomialProbit
+                | GlmFamily::BinomialCLogLog
+                | GlmFamily::BinomialSas
+                | GlmFamily::BinomialBetaLogistic,
                 None,
             ) => {
                 update_glmvectors(
@@ -781,10 +781,10 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (GlmLikelihoodFamily::BinomialMixture, None) => Err(EstimationError::InvalidInput(
+            (GlmFamily::BinomialMixture, None) => Err(EstimationError::InvalidInput(
                 "BinomialMixture IRLS update requires explicit mixture link state".to_string(),
             )),
-            (GlmLikelihoodFamily::GaussianIdentity, _) => {
+            (GlmFamily::GaussianIdentity, _) => {
                 update_glmvectors(
                     y,
                     eta,
@@ -797,11 +797,11 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (GlmLikelihoodFamily::PoissonLog, _) => {
+            (GlmFamily::PoissonLog, _) => {
                 write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives);
                 Ok(())
             }
-            (GlmLikelihoodFamily::Tweedie { p }, _) => {
+            (GlmFamily::Tweedie { p }, _) => {
                 write_tweedie_log_working_state(
                     y,
                     eta,
@@ -815,7 +815,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (GlmLikelihoodFamily::NegativeBinomial { theta }, _) => {
+            (GlmFamily::NegativeBinomial { theta }, _) => {
                 write_negative_binomial_log_working_state(
                     y,
                     eta,
@@ -828,7 +828,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (GlmLikelihoodFamily::BetaLogit { phi }, _) => {
+            (GlmFamily::BetaLogit { phi }, _) => {
                 write_beta_logit_working_state(
                     y,
                     eta,
@@ -841,7 +841,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (GlmLikelihoodFamily::GammaLog, _) => {
+            (GlmFamily::GammaLog, _) => {
                 write_gamma_log_working_state(
                     y,
                     eta,
@@ -863,7 +863,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
         mu: &Array1<f64>,
         priorweights: ArrayView1<f64>,
     ) -> Result<f64, EstimationError> {
-        if let GlmLikelihoodFamily::Tweedie { .. } = self.family {
+        if let GlmFamily::Tweedie { .. } = self.family {
             validate_tweedie_responses(&y, &priorweights)?;
         }
         Ok(calculate_deviance(y, mu, *self, priorweights))
@@ -9253,15 +9253,15 @@ pub fn update_glmvectors_by_family(
 }
 
 fn integrated_inverse_link_from_family(
-    family: GlmLikelihoodFamily,
+    family: GlmFamily,
     mixture_link_state: Option<&MixtureLinkState>,
     sas_link_state: Option<&SasLinkState>,
 ) -> Result<InverseLink, EstimationError> {
     match family {
-        GlmLikelihoodFamily::BinomialLogit
-        | GlmLikelihoodFamily::BinomialProbit
-        | GlmLikelihoodFamily::BinomialCLogLog => Ok(InverseLink::Standard(family.link_function())),
-        GlmLikelihoodFamily::BinomialSas => {
+        GlmFamily::BinomialLogit
+        | GlmFamily::BinomialProbit
+        | GlmFamily::BinomialCLogLog => Ok(InverseLink::Standard(family.link_function())),
+        GlmFamily::BinomialSas => {
             let state = sas_link_state.ok_or_else(|| {
                 EstimationError::InvalidInput(
                     "Integrated BinomialSas update requires explicit SasLinkState".to_string(),
@@ -9269,7 +9269,7 @@ fn integrated_inverse_link_from_family(
             })?;
             Ok(InverseLink::Sas(*state))
         }
-        GlmLikelihoodFamily::BinomialBetaLogistic => {
+        GlmFamily::BinomialBetaLogistic => {
             let state = sas_link_state.ok_or_else(|| {
                 EstimationError::InvalidInput(
                     "Integrated BinomialBetaLogistic update requires explicit SasLinkState"
@@ -9278,7 +9278,7 @@ fn integrated_inverse_link_from_family(
             })?;
             Ok(InverseLink::BetaLogistic(*state))
         }
-        GlmLikelihoodFamily::BinomialMixture => {
+        GlmFamily::BinomialMixture => {
             let state = mixture_link_state.ok_or_else(|| {
                 EstimationError::InvalidInput(
                     "Integrated BinomialMixture update requires explicit MixtureLinkState"
@@ -9287,12 +9287,12 @@ fn integrated_inverse_link_from_family(
             })?;
             Ok(InverseLink::Mixture(state.clone()))
         }
-        GlmLikelihoodFamily::GaussianIdentity
-        | GlmLikelihoodFamily::PoissonLog
-        | GlmLikelihoodFamily::Tweedie { .. }
-        | GlmLikelihoodFamily::NegativeBinomial { .. }
-        | GlmLikelihoodFamily::BetaLogit { .. }
-        | GlmLikelihoodFamily::GammaLog => Err(EstimationError::InvalidInput(format!(
+        GlmFamily::GaussianIdentity
+        | GlmFamily::PoissonLog
+        | GlmFamily::Tweedie { .. }
+        | GlmFamily::NegativeBinomial { .. }
+        | GlmFamily::BetaLogit { .. }
+        | GlmFamily::GammaLog => Err(EstimationError::InvalidInput(format!(
             "Integrated link-runtime update is not supported for family {:?}",
             family
         ))),
@@ -9536,7 +9536,7 @@ pub fn update_glmvectors_integrated_by_family(
     y: ArrayView1<f64>,
     eta: &Array1<f64>,
     se: ArrayView1<f64>,
-    family: GlmLikelihoodFamily,
+    family: GlmFamily,
     priorweights: ArrayView1<f64>,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
@@ -9599,10 +9599,10 @@ fn computeworkingweight_derivatives_from_eta(
     let mut d2mu_deta2 = Array1::<f64>::zeros(n);
     let mut d3mu_deta3 = Array1::<f64>::zeros(n);
     match likelihood.family {
-        GlmLikelihoodFamily::GaussianIdentity => {
+        GlmFamily::GaussianIdentity => {
             dmu_deta.fill(1.0);
         }
-        GlmLikelihoodFamily::PoissonLog => {
+        GlmFamily::PoissonLog => {
             const MIN_WEIGHT: f64 = 1e-12;
             // Per-row independent: jet/weight depend only on eta[i] and
             // priorweights[i]. Parallel write into the five output slices
@@ -9645,7 +9645,7 @@ fn computeworkingweight_derivatives_from_eta(
                     },
                 )?;
         }
-        GlmLikelihoodFamily::Tweedie { p } => {
+        GlmFamily::Tweedie { p } => {
             const MIN_WEIGHT: f64 = 1e-12;
             if !is_valid_tweedie_power(p) {
                 return Err(EstimationError::InvalidInput(format!(
@@ -9705,7 +9705,7 @@ fn computeworkingweight_derivatives_from_eta(
                     },
                 )?;
         }
-        GlmLikelihoodFamily::NegativeBinomial { theta } => {
+        GlmFamily::NegativeBinomial { theta } => {
             const MIN_WEIGHT: f64 = 1e-12;
             if !valid_negbin_theta(theta) {
                 return Err(EstimationError::InvalidInput(format!(
@@ -9756,7 +9756,7 @@ fn computeworkingweight_derivatives_from_eta(
                     },
                 )?;
         }
-        GlmLikelihoodFamily::BetaLogit { phi } => {
+        GlmFamily::BetaLogit { phi } => {
             const MIN_WEIGHT: f64 = 1e-12;
             if !valid_beta_phi(phi) {
                 return Err(EstimationError::InvalidInput(format!(
@@ -9813,7 +9813,7 @@ fn computeworkingweight_derivatives_from_eta(
                     *d3_o = q * (1.0 - 6.0 * q);
                 });
         }
-        GlmLikelihoodFamily::GammaLog => {
+        GlmFamily::GammaLog => {
             let dmu_s = dmu_deta
                 .as_slice_mut()
                 .expect("dmu_deta must be contiguous");
@@ -9839,12 +9839,12 @@ fn computeworkingweight_derivatives_from_eta(
                     },
                 )?;
         }
-        GlmLikelihoodFamily::BinomialLogit
-        | GlmLikelihoodFamily::BinomialProbit
-        | GlmLikelihoodFamily::BinomialCLogLog
-        | GlmLikelihoodFamily::BinomialSas
-        | GlmLikelihoodFamily::BinomialBetaLogistic
-        | GlmLikelihoodFamily::BinomialMixture => {
+        GlmFamily::BinomialLogit
+        | GlmFamily::BinomialProbit
+        | GlmFamily::BinomialCLogLog
+        | GlmFamily::BinomialSas
+        | GlmFamily::BinomialBetaLogistic
+        | GlmFamily::BinomialMixture => {
             let link = inverse_link.link_function();
             // On logit geometry, freeze higher η-derivatives in nonsmooth
             // regions so PIRLS and outer derivative code differentiate the
@@ -10144,18 +10144,18 @@ fn fixed_glm_dispersion(likelihood: GlmLikelihoodSpec) -> f64 {
 #[inline]
 pub fn weight_family_for_glm_likelihood(likelihood: GlmLikelihoodSpec) -> WeightFamily {
     match likelihood.family {
-        GlmLikelihoodFamily::GaussianIdentity => WeightFamily::Gaussian,
-        GlmLikelihoodFamily::PoissonLog => WeightFamily::Poisson,
-        GlmLikelihoodFamily::Tweedie { p } => WeightFamily::Tweedie { p },
-        GlmLikelihoodFamily::NegativeBinomial { theta } => WeightFamily::NegativeBinomial { theta },
-        GlmLikelihoodFamily::BetaLogit { phi } => WeightFamily::Beta { phi },
-        GlmLikelihoodFamily::GammaLog => WeightFamily::Gamma,
-        GlmLikelihoodFamily::BinomialLogit
-        | GlmLikelihoodFamily::BinomialProbit
-        | GlmLikelihoodFamily::BinomialCLogLog
-        | GlmLikelihoodFamily::BinomialSas
-        | GlmLikelihoodFamily::BinomialBetaLogistic
-        | GlmLikelihoodFamily::BinomialMixture => WeightFamily::Binomial,
+        GlmFamily::GaussianIdentity => WeightFamily::Gaussian,
+        GlmFamily::PoissonLog => WeightFamily::Poisson,
+        GlmFamily::Tweedie { p } => WeightFamily::Tweedie { p },
+        GlmFamily::NegativeBinomial { theta } => WeightFamily::NegativeBinomial { theta },
+        GlmFamily::BetaLogit { phi } => WeightFamily::Beta { phi },
+        GlmFamily::GammaLog => WeightFamily::Gamma,
+        GlmFamily::BinomialLogit
+        | GlmFamily::BinomialProbit
+        | GlmFamily::BinomialCLogLog
+        | GlmFamily::BinomialSas
+        | GlmFamily::BinomialBetaLogistic
+        | GlmFamily::BinomialMixture => WeightFamily::Binomial,
     }
 }
 
@@ -10184,12 +10184,12 @@ fn supports_observed_hessian_curvature_for_likelihood(
     assert!(std::mem::size_of_val(inverse_link) > 0);
     matches!(
         likelihood.family,
-        GlmLikelihoodFamily::GammaLog
-            | GlmLikelihoodFamily::BinomialProbit
-            | GlmLikelihoodFamily::BinomialCLogLog
-            | GlmLikelihoodFamily::BinomialSas
-            | GlmLikelihoodFamily::BinomialBetaLogistic
-            | GlmLikelihoodFamily::BinomialMixture
+        GlmFamily::GammaLog
+            | GlmFamily::BinomialProbit
+            | GlmFamily::BinomialCLogLog
+            | GlmFamily::BinomialSas
+            | GlmFamily::BinomialBetaLogistic
+            | GlmFamily::BinomialMixture
     )
 }
 
@@ -10870,12 +10870,12 @@ pub fn calculate_deviance(
     // stay self-consistent when the linear predictor saturates.
     const MU_FLOOR: f64 = 1e-10;
     match likelihood.family {
-        GlmLikelihoodFamily::BinomialLogit
-        | GlmLikelihoodFamily::BinomialProbit
-        | GlmLikelihoodFamily::BinomialCLogLog
-        | GlmLikelihoodFamily::BinomialSas
-        | GlmLikelihoodFamily::BinomialBetaLogistic
-        | GlmLikelihoodFamily::BinomialMixture => {
+        GlmFamily::BinomialLogit
+        | GlmFamily::BinomialProbit
+        | GlmFamily::BinomialCLogLog
+        | GlmFamily::BinomialSas
+        | GlmFamily::BinomialBetaLogistic
+        | GlmFamily::BinomialMixture => {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let total_residual: f64 = (0..y.len())
                 .into_par_iter()
@@ -10903,12 +10903,12 @@ pub fn calculate_deviance(
                 .sum();
             2.0 * total_residual
         }
-        GlmLikelihoodFamily::GaussianIdentity => ndarray::Zip::from(y)
+        GlmFamily::GaussianIdentity => ndarray::Zip::from(y)
             .and(mu)
             .and(priorweights)
             .map_collect(|&yi, &mui, &wi| wi * (yi - mui) * (yi - mui))
             .sum(),
-        GlmLikelihoodFamily::PoissonLog => {
+        GlmFamily::PoissonLog => {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let total: f64 = (0..y.len())
                 .into_par_iter()
@@ -10920,7 +10920,7 @@ pub fn calculate_deviance(
                 .sum();
             2.0 * total
         }
-        GlmLikelihoodFamily::Tweedie { p } => {
+        GlmFamily::Tweedie { p } => {
             let phi = fixed_glm_dispersion(likelihood);
             if !is_valid_tweedie_power(p) || !(phi.is_finite() && phi > 0.0) {
                 return f64::NAN;
@@ -10939,7 +10939,7 @@ pub fn calculate_deviance(
                 .sum();
             2.0 * total
         }
-        GlmLikelihoodFamily::NegativeBinomial { theta } => {
+        GlmFamily::NegativeBinomial { theta } => {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let total: f64 = (0..y.len())
                 .into_par_iter()
@@ -10951,7 +10951,7 @@ pub fn calculate_deviance(
                 .sum();
             2.0 * total
         }
-        GlmLikelihoodFamily::BetaLogit { phi } => {
+        GlmFamily::BetaLogit { phi } => {
             if !valid_beta_phi(phi) {
                 return f64::NAN;
             }
@@ -10962,7 +10962,7 @@ pub fn calculate_deviance(
                 .sum();
             2.0 * total
         }
-        GlmLikelihoodFamily::GammaLog => {
+        GlmFamily::GammaLog => {
             let shape = likelihood.gamma_shape().unwrap_or(1.0);
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let total: f64 = (0..y.len())
@@ -10991,19 +10991,19 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = y.len();
     match likelihood.family {
-        GlmLikelihoodFamily::GaussianIdentity => (0..n)
+        GlmFamily::GaussianIdentity => (0..n)
             .into_par_iter()
             .map(|i| {
                 let resid = y[i] - mu[i];
                 -0.5 * priorweights[i] * resid * resid
             })
             .sum(),
-        GlmLikelihoodFamily::BinomialLogit
-        | GlmLikelihoodFamily::BinomialProbit
-        | GlmLikelihoodFamily::BinomialCLogLog
-        | GlmLikelihoodFamily::BinomialSas
-        | GlmLikelihoodFamily::BinomialBetaLogistic
-        | GlmLikelihoodFamily::BinomialMixture => (0..n)
+        GlmFamily::BinomialLogit
+        | GlmFamily::BinomialProbit
+        | GlmFamily::BinomialCLogLog
+        | GlmFamily::BinomialSas
+        | GlmFamily::BinomialBetaLogistic
+        | GlmFamily::BinomialMixture => (0..n)
             .into_par_iter()
             .map(|i| {
                 // Share the deviance helper so both reductions floor mu at
@@ -11013,7 +11013,7 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                 priorweights[i] * (y[i] * mui_c.ln() + (1.0 - y[i]) * (1.0 - mui_c).ln())
             })
             .sum(),
-        GlmLikelihoodFamily::PoissonLog => (0..n)
+        GlmFamily::PoissonLog => (0..n)
             .into_par_iter()
             .map(|i| {
                 let mui_c = mu[i].max(MU_FLOOR);
@@ -11021,14 +11021,14 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                 priorweights[i] * (log_term - mui_c)
             })
             .sum(),
-        GlmLikelihoodFamily::Tweedie { p } => {
+        GlmFamily::Tweedie { p } => {
             let phi = fixed_glm_dispersion(likelihood);
             if !is_valid_tweedie_power(p) || !(phi.is_finite() && phi > 0.0) {
                 return f64::NAN;
             }
             -0.5 * calculate_deviance(y, mu, likelihood, priorweights)
         }
-        GlmLikelihoodFamily::NegativeBinomial { theta } => (0..n)
+        GlmFamily::NegativeBinomial { theta } => (0..n)
             .into_par_iter()
             .map(|i| {
                 if !valid_negbin_theta(theta) {
@@ -11046,7 +11046,7 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                         - yi * (theta + mui_c).ln())
             })
             .sum(),
-        GlmLikelihoodFamily::BetaLogit { phi } => (0..n)
+        GlmFamily::BetaLogit { phi } => (0..n)
             .into_par_iter()
             .map(|i| {
                 if !valid_beta_phi(phi) {
@@ -11055,7 +11055,7 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                 priorweights[i] * beta_loglikelihood_full_unit(y[i], mu[i], phi)
             })
             .sum(),
-        GlmLikelihoodFamily::GammaLog => gamma_loglikelihood_with_shape(
+        GlmFamily::GammaLog => gamma_loglikelihood_with_shape(
             y,
             mu,
             priorweights,
@@ -11682,7 +11682,7 @@ mod tests {
     use crate::probability::standard_normal_quantile;
     use crate::solver::active_set;
     use crate::types::{
-        Coefficients, GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LinkFunction,
+        Coefficients, GlmFamily, GlmLikelihoodSpec, InverseLink, LinkFunction,
         LogSmoothingParamsView,
     };
     use approx::assert_relative_eq;
@@ -12059,7 +12059,7 @@ mod tests {
             crate::construction::canonicalize_penalty_specs(&specs, &nulls, p, "prior mean test")
                 .expect("canonical penalties");
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GaussianIdentity),
+            likelihood: GlmLikelihoodSpec::canonical(GlmFamily::GaussianIdentity),
             link_kind: InverseLink::Standard(LinkFunction::Identity),
             max_iterations: 20,
             convergence_tolerance: 1e-12,
@@ -12275,7 +12275,7 @@ mod tests {
             })
             .collect();
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            likelihood: GlmLikelihoodSpec::canonical(GlmFamily::BinomialLogit),
             link_kind: InverseLink::Standard(LinkFunction::Logit),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -12428,7 +12428,7 @@ mod tests {
         let dev = calculate_deviance(
             y.view(),
             &mu,
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GammaLog),
+            GlmLikelihoodSpec::canonical(GlmFamily::GammaLog),
             w.view(),
         );
         let expected = 2.0
@@ -12447,7 +12447,7 @@ mod tests {
         let fisher = w.clone();
 
         let (w_obs, c_obs, d_obs) = compute_observed_hessian_curvature_arrays(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GammaLog),
+            GlmLikelihoodSpec::canonical(GlmFamily::GammaLog),
             &InverseLink::Standard(LinkFunction::Log),
             &eta,
             y.view(),
@@ -12489,7 +12489,7 @@ mod tests {
             })
             .collect();
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GammaLog),
+            likelihood: GlmLikelihoodSpec::canonical(GlmFamily::GammaLog),
             link_kind: InverseLink::Standard(LinkFunction::Log),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -12565,7 +12565,7 @@ mod tests {
             })
             .collect();
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::PoissonLog),
+            likelihood: GlmLikelihoodSpec::canonical(GlmFamily::PoissonLog),
             link_kind: InverseLink::Standard(LinkFunction::Log),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -13791,7 +13791,7 @@ mod root_cause_tests {
             })
             .collect();
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GaussianIdentity),
+            likelihood: GlmLikelihoodSpec::canonical(GlmFamily::GaussianIdentity),
             link_kind: InverseLink::Standard(LinkFunction::Identity),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -13874,7 +13874,7 @@ mod root_cause_tests {
             })
             .collect();
         let config = PirlsConfig {
-            likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            likelihood: GlmLikelihoodSpec::canonical(GlmFamily::BinomialLogit),
             link_kind: InverseLink::Standard(LinkFunction::Logit),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
@@ -13976,7 +13976,7 @@ mod root_cause_tests {
                 })
                 .collect();
             let config = PirlsConfig {
-                likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+                likelihood: GlmLikelihoodSpec::canonical(GlmFamily::BinomialLogit),
                 link_kind: InverseLink::Standard(LinkFunction::Logit),
                 max_iterations: 100,
                 convergence_tolerance: 1e-8,
