@@ -170,11 +170,10 @@ impl<T: AD> DifferentiableFunctionTrait<T> for GaussianPsiFn<T> {
     const NAME: &'static str = "GaussianPsiFn";
 
     fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
-        stateless_ad_output(freeze, gaussian_psi_quantity_ad(
-            inputs[0],
-            &self.params,
-            self.quantity,
-        ))
+        stateless_ad_output(
+            freeze,
+            gaussian_psi_quantity_ad(inputs[0], &self.params, self.quantity),
+        )
     }
 
     fn num_inputs(&self) -> usize {
@@ -389,13 +388,10 @@ impl<T: AD> DifferentiableFunctionTrait<T> for EpsGaussianHessianPsiFn<T> {
     const NAME: &'static str = "EpsGaussianHessianPsiFn";
 
     fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
-        stateless_ad_output(freeze, eps_gaussianhessian_psi_ad(
-            inputs[0],
-            self.psi0,
-            &self.params,
-            self.i,
-            self.j,
-        ))
+        stateless_ad_output(
+            freeze,
+            eps_gaussianhessian_psi_ad(inputs[0], self.psi0, &self.params, self.i, self.j),
+        )
     }
 
     fn num_inputs(&self) -> usize {
