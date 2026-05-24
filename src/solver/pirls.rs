@@ -6667,7 +6667,7 @@ impl PirlsResult {
                 &self.final_eta,
                 priorweights,
             )?;
-        let (raw_finalweights, raw_solve_c_array, raw_solve_d_array) =
+        let (finalweights, solve_c_array, solve_d_array) =
             if self.hessian_curvature == HessianCurvatureKind::Observed {
                 compute_observed_hessian_curvature_arrays(
                     self.likelihood,
@@ -6684,14 +6684,6 @@ impl PirlsResult {
                     score_d_array.clone(),
                 )
             };
-        let (finalweights, solve_c_array, solve_d_array) = outer_hessian_curvature_arrays(
-            &raw_finalweights,
-            &self.solveweights,
-            &raw_solve_c_array,
-            &raw_solve_d_array,
-            &self.final_eta,
-            inverse_link,
-        );
         // Lazy rehydration: wrap in ReparamOperator instead of materializing X·Qs.
         let qs_arc = Arc::new(self.reparam_result.qs.clone());
         Ok(Self {
@@ -6759,7 +6751,6 @@ fn assemble_pirls_result(
     final_dmu_deta: &Array1<f64>,
     final_d2mu_deta2: &Array1<f64>,
     final_d3mu_deta3: &Array1<f64>,
-    inverse_link: &InverseLink,
     status: PirlsStatus,
     reparam_result: ReparamResult,
     x_transformed: DesignMatrix,
@@ -6767,14 +6758,6 @@ fn assemble_pirls_result(
     linear_constraints_transformed: Option<LinearInequalityConstraints>,
 ) -> PirlsResult {
     let final_eta_arr = working_summary.state.eta.as_ref().clone();
-    let (outer_finalweights, outer_c, outer_d) = outer_hessian_curvature_arrays(
-        finalweights,
-        scoreweights,
-        final_c,
-        final_d,
-        &final_eta_arr,
-        inverse_link,
-    );
     PirlsResult {
         likelihood,
         beta_transformed: working_summary.beta.clone(),
@@ -6789,7 +6772,7 @@ fn assemble_pirls_result(
         edf,
         stable_penalty_term: penalty_term,
         firth: working_summary.state.firth.clone(),
-        finalweights: outer_finalweights,
+        finalweights: finalweights.clone(),
         final_offset: offset.to_owned(),
         final_eta: final_eta_arr,
         finalmu: finalmu.clone(),
@@ -6799,8 +6782,8 @@ fn assemble_pirls_result(
         solve_dmu_deta: final_dmu_deta.clone(),
         solve_d2mu_deta2: final_d2mu_deta2.clone(),
         solve_d3mu_deta3: final_d3mu_deta3.clone(),
-        solve_c_array: outer_c,
-        solve_d_array: outer_d,
+        solve_c_array: final_c.clone(),
+        solve_d_array: final_d.clone(),
         derivatives_unsupported: working_derivatives_unsupported(likelihood),
         status,
         iteration: working_summary.iterations,
@@ -7893,7 +7876,6 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         &final_dmu_deta,
         &final_d2mu_deta2,
         &final_d3mu_deta3,
-        &config.link_kind,
         status,
         reparam_result_final,
         x_transformed_final,
