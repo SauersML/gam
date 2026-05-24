@@ -30,9 +30,8 @@
 
 use gam::estimate::{FitOptions, fit_gam};
 use gam::pirls::PirlsStatus;
-use gam::predict::predict_gam;
 use gam::smooth::BlockwisePenalty;
-use gam::types::LikelihoodFamily;
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -133,7 +132,10 @@ fn biobank_dense_logit_regression_guard() {
         weights.view(),
         offset.view(),
         &s_list,
-        LikelihoodFamily::BinomialLogit,
+        LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        ),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -210,15 +212,10 @@ fn biobank_dense_logit_regression_guard() {
     //     probabilities against the true `p` from the data-generating
     //     process; a fit that "converges" to the wrong place will have a
     //     much larger Brier-style discrepancy.
-    let pred = predict_gam(
-        x.view(),
-        fit.beta.view(),
-        offset.view(),
-        LikelihoodFamily::BinomialLogit,
-    )
-    .expect("predict on training X");
-    assert_eq!(pred.mean.len(), n);
-    let mse_vs_truth = (&pred.mean - &true_p)
+    let eta = x.dot(&fit.beta) + &offset;
+    let pred_mean = eta.mapv(|eta_i| 1.0 / (1.0 + (-eta_i).exp()));
+    assert_eq!(pred_mean.len(), n);
+    let mse_vs_truth = (&pred_mean - &true_p)
         .mapv(|v| v * v)
         .mean()
         .unwrap_or(f64::INFINITY);
