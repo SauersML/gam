@@ -12115,6 +12115,7 @@ mod tests {
                         include_intercept: false,
                         identifiability: gam::basis::MaternIdentifiability::default(),
                         aniso_log_scales: None,
+                    }
                     },
                     input_scales: None,
                 },
