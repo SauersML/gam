@@ -23,7 +23,7 @@ use gam::estimate::{
 };
 use gam::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam::smooth::BlockwisePenalty;
-use gam::types::LikelihoodFamily;
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 use ndarray::{Array1, Array2, Axis, array};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -508,7 +508,10 @@ fn test_single_penalty_logit_gradient() {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        family: LikelihoodFamily::BinomialLogit,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        ),
         compute_inference: true,
         max_iter: 200,
         tol: 1e-12,
@@ -577,7 +580,10 @@ fn test_two_overlapping_penalties_logit_gradient() {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        family: LikelihoodFamily::BinomialLogit,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        ),
         compute_inference: true,
         max_iter: 200,
         tol: 1e-12,
@@ -642,7 +648,10 @@ fn test_two_nonoverlapping_penalties_logit_gradient() {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        family: LikelihoodFamily::BinomialLogit,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        ),
         compute_inference: true,
         max_iter: 200,
         tol: 1e-12,
@@ -723,7 +732,10 @@ fn test_gaussian_gradient_vs_fd() {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        family: LikelihoodFamily::GaussianIdentity,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(LinkFunction::Identity),
+        ),
         compute_inference: true,
         max_iter: 120,
         tol: 1e-10,
@@ -777,7 +789,10 @@ fn test_probit_single_penalty_gradient() {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        family: LikelihoodFamily::BinomialProbit,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Probit),
+        ),
         compute_inference: true,
         max_iter: 200,
         tol: 1e-12,
@@ -831,7 +846,10 @@ fn test_probit_overlapping_penalties_gradient() {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        family: LikelihoodFamily::BinomialProbit,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Probit),
+        ),
         compute_inference: true,
         max_iter: 200,
         tol: 1e-12,

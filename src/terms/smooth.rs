@@ -9961,8 +9961,8 @@ fn evaluate_standard_familyobservations(
         let w = weights[i].max(0.0);
         let yi = y[i];
         let eta_i = eta[i];
-        match family {
-            LikelihoodFamily::GaussianIdentity => {
+        match (&family.response, &family.link) {
+            (ResponseFamily::Gaussian, _) => {
                 let resid = yi - eta_i;
                 mu[i] = eta_i;
                 score[i] = w * resid;
@@ -9971,7 +9971,7 @@ fn evaluate_standard_familyobservations(
                 neghessian_eta_derivative[i] = 0.0;
                 log_likelihood += -0.5 * w * resid * resid;
             }
-            LikelihoodFamily::BinomialLogit => {
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
                 let jet = logit_inverse_link_jet5(eta_i);
                 mu[i] = jet.mu;
                 score[i] = w * (yi - jet.mu);
@@ -9982,12 +9982,7 @@ fn evaluate_standard_familyobservations(
                 let log_one_minusmu = -stable_softplus(eta_i);
                 log_likelihood += w * (yi * logmu + (1.0 - yi) * log_one_minusmu);
             }
-            LikelihoodFamily::BinomialProbit
-            | LikelihoodFamily::BinomialCLogLog
-            | LikelihoodFamily::BinomialLatentCLogLog
-            | LikelihoodFamily::BinomialSas
-            | LikelihoodFamily::BinomialBetaLogistic
-            | LikelihoodFamily::BinomialMixture => {
+            (ResponseFamily::Binomial, _) => {
                 let inverse_link = if let Some(state) = latent_cloglog_state {
                     Some(InverseLink::LatentCLogLog(*state))
                 } else if let Some(state) = mixture_link_state {
@@ -10001,8 +9996,8 @@ fn evaluate_standard_familyobservations(
                         }
                     })
                 };
-                let jet =
-                    strategy_for_family(family, inverse_link.as_ref()).inverse_link_jet(eta_i)?;
+                let jet = strategy_for_family(spec_to_family(&family), inverse_link.as_ref())
+                    .inverse_link_jet(eta_i)?;
                 let mu_i_raw = jet.mu;
                 let dmu_deta_raw = jet.d1;
                 let mu_i: f64 = mu_i_raw.clamp(PROB_EPS, 1.0 - PROB_EPS);
@@ -10024,32 +10019,32 @@ fn evaluate_standard_familyobservations(
                         + lmu * d3mu_deta3);
                 log_likelihood += w * (yi * mu_i.ln() + (1.0 - yi) * (1.0 - mu_i).ln());
             }
-            LikelihoodFamily::PoissonLog => {
+            (ResponseFamily::Poisson, _) => {
                 return Err(EstimationError::InvalidInput(
                     "bounded linear terms are not supported for PoissonLog fits".to_string(),
                 ));
             }
-            LikelihoodFamily::Tweedie { .. } => {
+            (ResponseFamily::Tweedie { .. }, _) => {
                 return Err(EstimationError::InvalidInput(
                     "bounded linear terms are not supported for Tweedie fits".to_string(),
                 ));
             }
-            LikelihoodFamily::NegativeBinomial { .. } => {
+            (ResponseFamily::NegativeBinomial { .. }, _) => {
                 return Err(EstimationError::InvalidInput(
                     "bounded linear terms are not supported for NegativeBinomial fits".to_string(),
                 ));
             }
-            LikelihoodFamily::BetaLogit { .. } => {
+            (ResponseFamily::Beta { .. }, _) => {
                 return Err(EstimationError::InvalidInput(
                     "bounded linear terms are not supported for BetaLogit fits".to_string(),
                 ));
             }
-            LikelihoodFamily::GammaLog => {
+            (ResponseFamily::Gamma, _) => {
                 return Err(EstimationError::InvalidInput(
                     "bounded linear terms are not supported for GammaLog fits".to_string(),
                 ));
             }
-            LikelihoodFamily::RoystonParmar => {
+            (ResponseFamily::RoystonParmar, _) => {
                 return Err(EstimationError::InvalidInput(
                     "bounded linear terms are not supported for survival model fits".to_string(),
                 ));
@@ -12110,14 +12105,14 @@ fn fit_bounded_term_collection_with_design(
         design.design.ncols(),
     );
     let penalty_term = beta_user.dot(&s_lambda_original.dot(&beta_user));
-    let deviance = match family {
-        LikelihoodFamily::GaussianIdentity => y
-            .iter()
+    let deviance = if family.is_gaussian_identity() {
+        y.iter()
             .zip(eta_state.mu.iter())
             .zip(weights.iter())
             .map(|((&yy, &mu), &w)| w.max(0.0) * (yy - mu) * (yy - mu))
-            .sum(),
-        _ => -2.0 * eta_state.log_likelihood,
+            .sum()
+    } else {
+        -2.0 * eta_state.log_likelihood
     };
     let (edf_by_block, edf_total) = if let Some(cov) = latent_cov.as_ref() {
         exact_bounded_edf(&fit_penalties, &fit.lambdas, cov)?
@@ -12813,21 +12808,22 @@ fn exact_joint_spatial_outer_hessian_available(
     // explicitly so any future family addition (which may not yet provide
     // outer-Hessian ingredients) forces an authoring decision here rather
     // than silently inheriting `true`.
-    let family_supported = match family {
-        LikelihoodFamily::GaussianIdentity
-        | LikelihoodFamily::BinomialLogit
-        | LikelihoodFamily::BinomialProbit
-        | LikelihoodFamily::BinomialCLogLog
-        | LikelihoodFamily::BinomialLatentCLogLog
-        | LikelihoodFamily::BinomialSas
-        | LikelihoodFamily::BinomialBetaLogistic
-        | LikelihoodFamily::BinomialMixture
-        | LikelihoodFamily::PoissonLog
-        | LikelihoodFamily::Tweedie { .. }
-        | LikelihoodFamily::NegativeBinomial { .. }
-        | LikelihoodFamily::BetaLogit { .. }
-        | LikelihoodFamily::GammaLog
-        | LikelihoodFamily::RoystonParmar => true,
+    // Every supported response (Gaussian, Binomial-*, Poisson, Tweedie,
+    // NegativeBinomial, Beta, Gamma, Royston-Parmar) routes through the
+    // unified evaluator's outer-Hessian path; the spec-level capability
+    // check therefore always succeeds. Match every response explicitly so
+    // any future family addition (which may not yet provide outer-Hessian
+    // ingredients) forces an authoring decision here rather than silently
+    // inheriting `true`.
+    let family_supported = match &family.response {
+        ResponseFamily::Gaussian
+        | ResponseFamily::Binomial
+        | ResponseFamily::Poisson
+        | ResponseFamily::Tweedie { .. }
+        | ResponseFamily::NegativeBinomial { .. }
+        | ResponseFamily::Beta { .. }
+        | ResponseFamily::Gamma
+        | ResponseFamily::RoystonParmar => true,
     };
     // A design with zero columns has no joint outer-Hessian to compute;
     // the analytic path is only meaningful for non-empty parameter blocks.

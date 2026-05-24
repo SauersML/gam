@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""auto_exp_38-style demo: iVAE mean gauge + block orthogonality lets ARD prune a free semantic block."""
+"""iVAE mean gauge + block orthogonality lets ARD prune a free semantic block.
+
+Composes an iVAE-style auxiliary-conditional mean prior on a supervised
+sub-block with a between-block orthogonality constraint, so that ARD on the
+remaining "free" latent block operates in a pinned basis and can prune
+axes that carry no signal.
+"""
 
 import warnings
 

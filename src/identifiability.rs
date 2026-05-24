@@ -1,9 +1,9 @@
 //! Identifiability primitives — frontier 2026 unification.
 //!
-//! Two new analytic primitives that compose with the existing manifold-SAE
-//! infrastructure, formalising the empirical recipe from `auto_exp_38`
-//! (3 supervised HSV axes + 3 free axes that unsupervisedly align with
-//! name-semantics):
+//! Two analytic primitives that compose with the SAE-manifold infrastructure,
+//! formalising the supervised-block plus free-discovery-block gauge-fix recipe
+//! (a small number of supervised axes alongside additional free axes that
+//! unsupervisedly align with downstream semantics):
 //!
 //! * `MechanismSparsityJacobian` — column-2-norm penalty on the decoder
 //!   Jacobian: `Σ_k ||J_dec[:, k]||_2`. For an affine decoder `x = W t + b`,

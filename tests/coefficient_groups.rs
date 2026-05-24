@@ -9,7 +9,7 @@ use gam::smooth::{
     CoefficientGroupPrior, CoefficientGroupSpec, CoefficientSelector, LinearTermSpec,
     TermCollectionSpec, build_term_collection_design, fit_term_collection_with_coefficient_groups,
 };
-use gam::types::{LikelihoodFamily, RhoPrior};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior};
 use ndarray::{Array1, Array2, array};
 use std::sync::Arc;
 
@@ -32,6 +32,13 @@ fn fit_options(rho_prior: RhoPrior) -> FitOptions {
         kronecker_penalty_system: None,
         kronecker_factored: None,
     }
+}
+
+fn gaussian_identity_spec() -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(LinkFunction::Identity),
+    )
 }
 
 fn two_linear_term_spec() -> TermCollectionSpec {
@@ -398,7 +405,7 @@ fn coefficient_group_spanning_two_terms_matches_manual_merged_penalty() {
         offset.view(),
         &spec,
         &groups,
-        LikelihoodFamily::GaussianIdentity,
+        gaussian_identity_spec(),
         &fit_options(RhoPrior::Flat),
     )
     .expect("grouped fit");
@@ -415,7 +422,7 @@ fn coefficient_group_spanning_two_terms_matches_manual_merged_penalty() {
         offset.view(),
         vec![PenaltySpec::Dense(merged)],
         vec![p - 2],
-        LikelihoodFamily::GaussianIdentity,
+        gaussian_identity_spec(),
         &fit_options(RhoPrior::GammaPrecision {
             shape: 2.0,
             rate: 1.0,
@@ -491,7 +498,7 @@ fn nested_groups_with_gamma_priors_apply_per_level_shrinkage() {
         offset.view(),
         &spec,
         &groups,
-        LikelihoodFamily::GaussianIdentity,
+        gaussian_identity_spec(),
         &fit_options(RhoPrior::Flat),
     )
     .expect("nested grouped fit");
@@ -540,7 +547,7 @@ fn coefficient_group_constant_prior_mean_shrinks_toward_mean() {
             prior: strong_precision.clone(),
             prior_mean: CoefficientPriorMean::constant(array![2.0]),
         }],
-        LikelihoodFamily::GaussianIdentity,
+        gaussian_identity_spec(),
         &fit_options(RhoPrior::Flat),
     )
     .expect("constant-mean fit");
@@ -558,7 +565,7 @@ fn coefficient_group_constant_prior_mean_shrinks_toward_mean() {
             prior: strong_precision,
             prior_mean: CoefficientPriorMean::Zero,
         }],
-        LikelihoodFamily::GaussianIdentity,
+        gaussian_identity_spec(),
         &fit_options(RhoPrior::Flat),
     )
     .expect("zero-mean fit");
@@ -609,7 +616,7 @@ fn coefficient_group_kernel_basis_prior_mean_recovers_known_amplitude() {
                 Arc::new(move |_| kernel_values_for_closure.clone()),
             ),
         }],
-        LikelihoodFamily::GaussianIdentity,
+        gaussian_identity_spec(),
         &fit_options(RhoPrior::Flat),
     )
     .expect("kernel-basis prior mean fit");
@@ -644,7 +651,7 @@ fn coefficient_group_zero_prior_mean_matches_default_bits() {
         offset.view(),
         &spec,
         &[group(Default::default())],
-        LikelihoodFamily::GaussianIdentity,
+        gaussian_identity_spec(),
         &fit_options(RhoPrior::Flat),
     )
     .expect("default prior mean fit");
@@ -655,7 +662,7 @@ fn coefficient_group_zero_prior_mean_matches_default_bits() {
         offset.view(),
         &spec,
         &[group(CoefficientPriorMean::Zero)],
-        LikelihoodFamily::GaussianIdentity,
+        gaussian_identity_spec(),
         &fit_options(RhoPrior::Flat),
     )
     .expect("explicit zero prior mean fit");

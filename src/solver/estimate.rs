@@ -3874,7 +3874,7 @@ where
     let result = ExternalOptimResult {
         beta: beta_orig_internal,
         lambdas: lambdas.to_owned(),
-        likelihood_family: likelihood_spec.response_family(),
+        likelihood_family: opts.family.clone(),
         likelihood_scale: likelihood_spec.scale,
         log_likelihood_normalization: LogLikelihoodNormalization::OmittingResponseConstants,
         log_likelihood,
@@ -6060,19 +6060,30 @@ where
             "BinomialMixture requires mixture_link specification".to_string(),
         ));
     }
-    let effective_sas_link = effective_sas_link_for_family(family, opts.sas_link);
+    let effective_sas_link = effective_sas_link_for_family(&family, opts.sas_link);
     if opts.mixture_link.is_some() && opts.sas_link.is_some() {
         return Err(EstimationError::InvalidInput(
             "mixture_link and sas_link cannot both be set".to_string(),
         ));
     }
-    let resolved_family = if opts.mixture_link.is_some() {
-        match family {
-            crate::types::LikelihoodFamily::BinomialLogit
-            | crate::types::LikelihoodFamily::BinomialProbit
-            | crate::types::LikelihoodFamily::BinomialCLogLog
-            | crate::types::LikelihoodFamily::BinomialMixture => {
-                crate::types::LikelihoodFamily::BinomialMixture
+    let resolved_family: crate::types::LikelihoodSpec = if let Some(mix_spec) =
+        opts.mixture_link.as_ref()
+    {
+        if !family.is_binomial() {
+            return Err(EstimationError::InvalidInput(
+                "mixture_link is only supported for binomial families".to_string(),
+            ));
+        }
+        match &family.link {
+            InverseLink::Standard(LinkFunction::Logit)
+            | InverseLink::Standard(LinkFunction::Probit)
+            | InverseLink::Standard(LinkFunction::CLogLog)
+            | InverseLink::Mixture(_) => {
+                let mixture_state =
+                    crate::mixture_link::state_fromspec(mix_spec).map_err(|e| {
+                        EstimationError::InvalidInput(format!("invalid mixture link: {e}"))
+                    })?;
+                LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Mixture(mixture_state))
             }
             _ => {
                 return Err(EstimationError::InvalidInput(
@@ -6080,17 +6091,32 @@ where
                 ));
             }
         }
-    } else if effective_sas_link.is_some() {
-        match family {
-            crate::types::LikelihoodFamily::BinomialLogit
-            | crate::types::LikelihoodFamily::BinomialProbit
-            | crate::types::LikelihoodFamily::BinomialCLogLog
-            | crate::types::LikelihoodFamily::BinomialSas
-            | crate::types::LikelihoodFamily::BinomialBetaLogistic => {
-                if family.is_binomial_beta_logistic() {
-                    crate::types::LikelihoodFamily::BinomialBetaLogistic
+    } else if let Some(sas_spec) = effective_sas_link {
+        if !family.is_binomial() {
+            return Err(EstimationError::InvalidInput(
+                "sas_link is only supported for binomial families".to_string(),
+            ));
+        }
+        let use_beta_logistic = family.is_binomial_beta_logistic();
+        match &family.link {
+            InverseLink::Standard(LinkFunction::Logit)
+            | InverseLink::Standard(LinkFunction::Probit)
+            | InverseLink::Standard(LinkFunction::CLogLog)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_) => {
+                if use_beta_logistic {
+                    let st = crate::mixture_link::state_from_beta_logisticspec(sas_spec)
+                        .map_err(|e| {
+                            EstimationError::InvalidInput(format!(
+                                "invalid Beta-Logistic link: {e}"
+                            ))
+                        })?;
+                    LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::BetaLogistic(st))
                 } else {
-                    crate::types::LikelihoodFamily::BinomialSas
+                    let st = crate::mixture_link::state_from_sasspec(sas_spec).map_err(|e| {
+                        EstimationError::InvalidInput(format!("invalid SAS link: {e}"))
+                    })?;
+                    LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(st))
                 }
             }
             _ => {
@@ -6100,12 +6126,9 @@ where
             }
         }
     } else {
-        family
+        family.clone()
     };
-    if matches!(
-        resolved_family,
-        crate::types::LikelihoodFamily::RoystonParmar
-    ) {
+    if resolved_family.is_royston_parmar() {
         return Err(EstimationError::InvalidInput(
             "fit_gam external design path does not support RoystonParmar; use survival training APIs".to_string(),
         ));
@@ -6487,7 +6510,7 @@ pub fn evaluate_external_ift_residual_at_perturbed_rho<X>(
 where
     X: Into<DesignMatrix>,
 {
-    if !matches!(opts.family, LikelihoodFamily::GaussianIdentity) {
+    if !opts.family.is_gaussian_identity() {
         return Err(EstimationError::InvalidInput(
             "evaluate_external_ift_residual_at_perturbed_rho currently supports GaussianIdentity"
                 .to_string(),
@@ -6681,7 +6704,7 @@ mod estimate_policy_tests {
     use super::*;
     use crate::linalg::utils::{StableSolver, max_abs_diag};
     use crate::mixture_link::{sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials};
-    use crate::types::LikelihoodFamily;
+    use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
@@ -6754,7 +6777,10 @@ mod estimate_policy_tests {
             }],
             log_lambdas: array![0.2_f64.max(1e-300).ln(), 0.8_f64.max(1e-300).ln()],
             lambdas: array![0.2, 0.8],
-            likelihood_family: Some(LikelihoodFamily::GaussianIdentity),
+            likelihood_family: Some(LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            )),
             likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
             log_likelihood_normalization: LogLikelihoodNormalization::Full,
             log_likelihood: -1.2,
@@ -6804,7 +6830,13 @@ mod estimate_policy_tests {
 
     #[test]
     fn resolve_external_family_rejects_unsupported_firth_request() {
-        let err = resolve_external_family(LikelihoodFamily::PoissonLog, Some(true))
+        let err = resolve_external_family(
+            &LikelihoodSpec::new(
+                ResponseFamily::Poisson,
+                InverseLink::Standard(LinkFunction::Log),
+            ),
+            Some(true),
+        )
             .expect_err("Poisson fitting should reject unsupported Firth requests explicitly");
         assert!(
             err.to_string()
@@ -6955,7 +6987,16 @@ mod estimate_policy_tests {
         let y = p.mapv(|pi| if rng.random::<f64>() < pi { 1.0 } else { 0.0 });
 
         let opts = ExternalOptimOptions {
-            family: LikelihoodFamily::BinomialSas,
+            family: LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Sas(
+                    crate::mixture_link::state_from_sasspec(SasLinkSpec {
+                        initial_epsilon: 0.0,
+                        initial_log_delta: 0.0,
+                    })
+                    .expect("valid SAS initial state"),
+                ),
+            ),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -7171,7 +7212,16 @@ mod estimate_policy_tests {
         let y = p.mapv(|pi| if rng.random::<f64>() < pi { 1.0 } else { 0.0 });
 
         let opts = ExternalOptimOptions {
-            family: LikelihoodFamily::BinomialSas,
+            family: LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Sas(
+                    crate::mixture_link::state_from_sasspec(SasLinkSpec {
+                        initial_epsilon: 0.0,
+                        initial_log_delta: 0.0,
+                    })
+                    .expect("valid SAS initial state"),
+                ),
+            ),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,
@@ -7330,7 +7380,16 @@ mod estimate_policy_tests {
         let y = p.mapv(|pi| if rng.random::<f64>() < pi { 1.0 } else { 0.0 });
 
         let opts = ExternalOptimOptions {
-            family: LikelihoodFamily::BinomialSas,
+            family: LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Sas(
+                    crate::mixture_link::state_from_sasspec(SasLinkSpec {
+                        initial_epsilon: 0.0,
+                        initial_log_delta: 0.0,
+                    })
+                    .expect("valid SAS initial state"),
+                ),
+            ),
             latent_cloglog: None,
             mixture_link: None,
             optimize_mixture: false,

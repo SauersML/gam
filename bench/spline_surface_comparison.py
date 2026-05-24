@@ -356,7 +356,8 @@ def main() -> None:
         weight="bold",
     )
 
-    out = "/Users/user/gam/scripts/spline_methods_surface_comparison.png"
+    out = Path(__file__).resolve().parent.parent / "scripts" / "spline_methods_surface_comparison.png"
+    out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=220, facecolor="white")
     print(out)
 
