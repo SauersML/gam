@@ -10997,7 +10997,7 @@ impl SpatialAdaptiveExactFamily {
     ) -> Result<SpatialAdaptiveExactEvaluation, String> {
         let eta = self.total_eta(beta);
         let obs = evaluate_standard_familyobservations(
-            self.family,
+            self.family.clone(),
             self.latent_cloglog_state.as_ref(),
             self.mixture_link_state.as_ref(),
             self.sas_link_state.as_ref(),
@@ -11207,7 +11207,7 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         let state = expect_single_block_state(block_states, "spatial adaptive exact family")?;
         let beta = &state.beta;
         let obs = evaluate_standard_familyobservations(
-            self.family,
+            self.family.clone(),
             self.latent_cloglog_state.as_ref(),
             self.mixture_link_state.as_ref(),
             self.sas_link_state.as_ref(),
@@ -11542,7 +11542,7 @@ impl BoundedLinearFamily {
         let eta =
             self.designzeroed.dot(latent_beta) + self.nonlinear_offset_from_latent(latent_beta);
         let obs = evaluate_standard_familyobservations(
-            self.family,
+            self.family.clone(),
             self.latent_cloglog_state.as_ref(),
             self.mixture_link_state.as_ref(),
             self.sas_link_state.as_ref(),
