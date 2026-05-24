@@ -802,24 +802,6 @@ where
     None
 }
 
-/// Write-into variant of `solve_spd_pcg`. Matches `solve_spd_pcg`'s return
-/// shape but takes an `apply` closure that writes its result into a caller
-/// buffer, enabling the inner-Newton PCG hot path to avoid per-iter
-/// `Array1::<f64>` allocations for the matvec output (biobank-scale critical).
-pub fn solve_spd_pcg_into<F>(
-    apply: F,
-    rhs: &Array1<f64>,
-    preconditioner_diag: &Array1<f64>,
-    rel_tol: f64,
-    max_iter: usize,
-) -> Option<Array1<f64>>
-where
-    F: Fn(&Array1<f64>, &mut Array1<f64>),
-{
-    solve_spd_pcg_with_info_into(apply, rhs, preconditioner_diag, rel_tol, max_iter)
-        .map(|(solution, _)| solution)
-}
-
 #[derive(Clone)]
 pub(crate) struct RidgePlanner {
     cond_estimate: Option<f64>,
@@ -934,7 +916,7 @@ impl RidgePlanner {
 #[cfg(test)]
 mod tests {
     use super::{
-        boundary_hit_step_fraction, solve_spd_pcg, solve_spd_pcg_into, solve_spd_pcg_with_info,
+        boundary_hit_step_fraction, solve_spd_pcg, solve_spd_pcg_with_info,
         solve_spd_pcg_with_info_into,
     };
     use ndarray::{Array1, array};
@@ -974,29 +956,6 @@ mod tests {
         let m = Array1::from_vec(vec![4.0, 3.0]);
         assert!(solve_spd_pcg_with_info(|v| h.dot(v), &b, &m, 1e-10, 0).is_none());
         assert!(solve_spd_pcg(|v| h.dot(v), &b, &m, 1e-10, 0).is_none());
-    }
-
-    #[test]
-    fn solve_spd_pcg_into_matches_legacy_owned_variant() {
-        let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0]];
-        let b = array![1.0, 2.0, -0.5];
-        let m = Array1::from_vec(vec![4.0, 3.0, 2.0]);
-        let owned = solve_spd_pcg(|v| h.dot(v), &b, &m, 1e-12, 50).expect("legacy pcg");
-        let writeinto = solve_spd_pcg_into(
-            |v, out| {
-                let prod = h.dot(v);
-                out.assign(&prod);
-            },
-            &b,
-            &m,
-            1e-12,
-            50,
-        )
-        .expect("write-into pcg");
-        assert_eq!(owned.len(), writeinto.len());
-        for (a, b) in owned.iter().zip(writeinto.iter()) {
-            assert!((a - b).abs() < 1e-10, "owned={a} writeinto={b}");
-        }
     }
 
     #[test]
@@ -1052,19 +1011,6 @@ mod tests {
         let m = Array1::from_vec(vec![4.0, 3.0]);
         assert!(
             solve_spd_pcg_with_info_into(
-                |v, out| {
-                    let prod = h.dot(v);
-                    out.assign(&prod);
-                },
-                &b,
-                &m,
-                1e-10,
-                0,
-            )
-            .is_none()
-        );
-        assert!(
-            solve_spd_pcg_into(
                 |v, out| {
                     let prod = h.dot(v);
                     out.assign(&prod);
