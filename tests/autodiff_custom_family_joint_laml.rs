@@ -212,7 +212,8 @@ impl<T: AD> CoupledQuarticObjectiveFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for CoupledQuarticObjectiveFn<T> {
     const NAME: &'static str = "CoupledQuarticObjectiveFn";
 
-    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], frozen: bool) -> Vec<T> {
+        drop(frozen);
         let rho = inputs[0];
         let lambda = rho.exp();
         let d = T::constant(self.beta2ridge);
@@ -271,34 +272,42 @@ impl CustomFamily for LowerBoundConstrainedExactFamily {
 
     fn exact_newton_joint_hessian(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
+        drop(block_states);
         Ok(Some(array![[1.0]]))
     }
 
     fn exact_newton_hessian_directional_derivative(
         &self,
-        _: &[ParameterBlockState],
-        _: usize,
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
+        direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        drop(block_states);
+        drop(block_idx);
+        drop(direction);
         Ok(Some(array![[0.0]]))
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
-        _: &[ParameterBlockState],
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        drop(block_states);
+        drop(direction);
         Ok(Some(array![[0.0]]))
     }
 
     fn block_linear_constraints(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_idx: usize,
-        _: &ParameterBlockSpec,
+        block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
+        drop(block_states);
+        drop(block_spec);
         if block_idx != 0 {
             return Ok(None);
         }
@@ -364,7 +373,8 @@ impl<T: AD> ConstrainedExactObjectiveFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for ConstrainedExactObjectiveFn<T> {
     const NAME: &'static str = "ConstrainedExactObjectiveFn";
 
-    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], frozen: bool) -> Vec<T> {
+        drop(frozen);
         let rho = inputs[0];
         let lambda = rho.exp();
         let beta_hat = T::constant(self.lower);

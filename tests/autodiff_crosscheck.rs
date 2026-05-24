@@ -107,7 +107,8 @@ impl<T: AD> SigmaFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for SigmaFn<T> {
     const NAME: &'static str = "SigmaFn";
 
-    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], frozen: bool) -> Vec<T> {
+        drop(frozen);
         vec![inputs[0].exp()]
     }
 
@@ -145,7 +146,8 @@ impl<T: AD> E2EFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for E2EFn<T> {
     const NAME: &'static str = "E2EFn";
 
-    fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    fn call(&self, inputs: &[T], frozen: bool) -> Vec<T> {
+        drop(frozen);
         let theta = inputs[0];
         let mut acc = T::zero();
 
