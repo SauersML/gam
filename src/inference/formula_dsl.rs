@@ -194,8 +194,8 @@ fn validate_balanced_delimiters(input: &str, prefix: &str) -> Result<(), String>
                 let expected = match ch {
                     ')' => '(',
                     ']' => '[',
-                    '}' => '{',
-                    _ => unreachable!(),
+                    // The outer match arm guarantees ch is one of ')', ']', '}'.
+                    _ => '{',
                 };
                 if stack.pop() != Some(expected) {
                     return Err(FormulaDslError::ParseError {

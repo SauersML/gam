@@ -26050,6 +26050,9 @@ pub mod closed_form_penalty {
             // `{0, 1, 2}`; reaching this wildcard means an unsupported `q`
             // was forwarded by an internal entry point that should never
             // expose it.
+            // SAFETY: `q` is statically restricted to `{0, 1, 2}` by the
+            // public radial-kernel API (value/gradient/laplacian); this
+            // arm is unreachable for in-contract callers.
             _ => panic!("radial_g_q_partials: q must be in {{0, 1, 2}}"),
         }
     }
@@ -26210,6 +26213,9 @@ pub mod closed_form_penalty {
             // kernel API (value/gradient/laplacian only). An unsupported `q`
             // here means an internal helper forwarded an out-of-contract
             // value.
+            // SAFETY: companion to `radial_g_q_partials` — `q` is
+            // statically restricted to `{0, 1, 2}` by the public radial
+            // kernel API; this arm is unreachable for in-contract callers.
             _ => panic!("radial_g_q_hessian: q must be in {{0, 1, 2}}"),
         }
     }

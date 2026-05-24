@@ -371,7 +371,9 @@ impl QuadratureContext {
 
     fn gauss_hermite_n(&self, n: usize) -> &GaussHermiteRuleDynamic {
         match n {
-            7 => unreachable!("7-point rule uses fixed cache"),
+            // The fixed 7-point cache is served via `gauss_hermite()`. If a caller
+            // ends up here with n=7 anyway, fall back to the 15-point rule.
+            7 => self.gh15_cache.get_or_init(|| compute_gauss_hermite_n(15)),
             15 => self.gh15_cache.get_or_init(|| compute_gauss_hermite_n(15)),
             21 => self.gh21_cache.get_or_init(|| compute_gauss_hermite_n(21)),
             31 => self.gh31_cache.get_or_init(|| compute_gauss_hermite_n(31)),

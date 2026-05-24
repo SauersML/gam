@@ -7608,7 +7608,10 @@ fn stable_logdet_with_ridge_policy(
             })?;
             Ok(2.0 * chol.diag().mapv(f64::ln).sum())
         }
-        RidgeDeterminantMode::Auto => unreachable!("adaptive determinant mode must resolve"),
+        RidgeDeterminantMode::Auto => Err(
+            "internal: resolved_ridge_determinant_mode must resolve Auto to a concrete mode"
+                .to_string(),
+        ),
         RidgeDeterminantMode::PositivePart => {
             smooth_regularized_logdet_hessian_finite_check(&a, None)?;
             // Smooth-regularized logdet objective, aligned with the gradient
@@ -7876,7 +7879,12 @@ fn exact_newton_joint_hessian_from_exact_blocks<F: CustomFamily + ?Sized>(
         let p_block = state.beta.len();
         let end = start + p_block;
         let BlockWorkingSet::ExactNewton { hessian, .. } = working_set else {
-            unreachable!("non-ExactNewton working sets were filtered above");
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "exact_newton_joint_hessian default: block {block_idx} working set is not ExactNewton after filter"
+                ),
+            }
+            .into());
         };
         let dense = hessian.to_dense();
         if dense.nrows() != p_block || dense.ncols() != p_block {
