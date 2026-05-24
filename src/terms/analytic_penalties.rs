@@ -1583,8 +1583,9 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
 /// remedy, adapted here to gamfit's REML/MAP engine with a finite truncation
 /// and deterministic concrete relaxation.
 ///
-/// The target is row-major `(N, K)` logits. For MAP we drop Gumbel noise and
-/// use `z_ik = sigmoid(logit_ik / tau)`. Each column has
+/// The target is row-major `(N, K)` logits. For MAP we use a deterministic
+/// binary-concrete score `z_ik = sigmoid(logit_ik / tau)`, with optional
+/// Gumbel temperature annealing across outer iterations. Each column has
 /// `pi_k ~ Beta(alpha / K, 1)` and `z_ik | pi_k ~ Bernoulli(pi_k)`. We plug in
 /// the columnwise Beta-Bernoulli MAP `pi_k` from the relaxed active mass, so
 /// the penalty is a gauge-fixing prior: it breaks the per-row

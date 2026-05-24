@@ -23083,7 +23083,7 @@ mod tests {
         )
         .expect("hyper dirs build")
         .expect("hyper dirs present");
-        let _ = evaluate_joint_reml_outer_eval_at_theta(
+        drop(evaluate_joint_reml_outer_eval_at_theta(
             &mut evaluator,
             cache.design(),
             &theta_zero,
@@ -23093,7 +23093,7 @@ mod tests {
             crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
             None,
         )
-        .expect("analytic outer eval");
+        .expect("analytic outer eval"));
         let stash = crate::solver::estimate::reml::unified::debug_stash::take_terms();
         let c_x_tau_beta = stash.c_x_tau_beta_diag.clone().expect("term4 diag stashed");
         let x_v_psi = stash.c_x_v_psi_diag.clone().expect("X·v_ψ stashed");
@@ -23135,10 +23135,7 @@ mod tests {
             l2_c_dnu
         );
 
-        let _ = c_p;
-        let _ = w_p;
-        let _ = w_0;
-        let _ = eta_0;
+        drop((c_p, w_p, w_0, eta_0));
     }
 
     /// Test PIRLS structural determinism: call debug_full_h three times at
@@ -23446,7 +23443,6 @@ mod tests {
         let fd_tv = fd_tv_full.dot(&v_test);
         // Extract smooth portion only
         let fd_tv_smooth = fd_tv.slice(s![smooth_start..(smooth_start + p)]).to_owned();
-        let _ = &fd_tv_smooth;
         let max_tv_diff = analytic_tv
             .iter()
             .zip(fd_tv_smooth.iter())

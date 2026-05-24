@@ -57,6 +57,7 @@ they slot into the same REML outer loop, and their weights are
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from operator import index
 from typing import Any, Literal, TypeAlias
@@ -167,6 +168,68 @@ def _add_weight_schedule(payload: dict[str, Any], owner: Any) -> dict[str, Any]:
     schedule = _weight_schedule_descriptor(getattr(owner, "weight_schedule", None))
     if schedule is not None:
         payload["weight_schedule"] = schedule
+    return payload
+
+
+def _temperature_schedule_descriptor(schedule: Any) -> dict[str, Any] | None:
+    if schedule is None:
+        return None
+    if hasattr(schedule, "to_rust_descriptor"):
+        raw = schedule.to_rust_descriptor()
+    elif isinstance(schedule, Mapping):
+        raw = dict(schedule)
+    else:
+        raw = {
+            "tau_start": getattr(schedule, "tau_start"),
+            "tau_min": getattr(schedule, "tau_min", getattr(schedule, "tau_end", None)),
+            "decay": getattr(schedule, "decay"),
+            "rate": getattr(schedule, "rate", None),
+            "steps": getattr(schedule, "steps", None),
+            "iter_count": getattr(schedule, "iter_count", 0),
+        }
+    decay = str(raw.get("decay", "geometric")).lower().replace("-", "_")
+    if decay == "exponential":
+        decay = "geometric"
+    tau_start = float(raw["tau_start"])
+    raw_tau_min = raw.get("tau_min", raw.get("tau_end"))
+    if raw_tau_min is None:
+        raise ValueError("temperature_schedule requires tau_min or tau_end")
+    tau_min = float(raw_tau_min)
+    if not np.isfinite(tau_start) or tau_start <= 0.0:
+        raise ValueError("temperature_schedule.tau_start must be finite and > 0")
+    if not np.isfinite(tau_min) or tau_min <= 0.0:
+        raise ValueError("temperature_schedule.tau_min must be finite and > 0")
+    if tau_min > tau_start:
+        raise ValueError("temperature_schedule.tau_min cannot exceed tau_start")
+    out: dict[str, Any] = {
+        "tau_start": tau_start,
+        "tau_min": tau_min,
+        "decay": decay,
+        "iter_count": int(raw.get("iter_count", 0)),
+    }
+    if out["iter_count"] < 0:
+        raise ValueError("temperature_schedule.iter_count must be non-negative")
+    if decay == "geometric":
+        rate = float(raw.get("rate", 0.9))
+        if not np.isfinite(rate) or not 0.0 < rate < 1.0:
+            raise ValueError("temperature_schedule.rate must be in (0, 1)")
+        out["rate"] = rate
+    elif decay == "linear":
+        steps = raw.get("steps")
+        if steps is None or int(steps) <= 0:
+            raise ValueError("temperature_schedule.steps must be positive")
+        out["steps"] = int(steps)
+    elif decay != "reciprocal_iter":
+        raise ValueError(
+            "temperature_schedule.decay must be 'geometric', 'exponential', 'linear', or 'reciprocal_iter'"
+        )
+    return out
+
+
+def _add_temperature_schedule(payload: dict[str, Any], owner: Any) -> dict[str, Any]:
+    schedule = _temperature_schedule_descriptor(getattr(owner, "temperature_schedule", None))
+    if schedule is not None:
+        payload["temperature_schedule"] = schedule
     return payload
 
 
@@ -1335,6 +1398,7 @@ class IBPAssignmentPenalty:
     alpha: float = 1.0
     tau: float = 1.0
     learnable: bool = False
+    temperature_schedule: Any = None
     weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
 
     def __init__(
@@ -1345,6 +1409,7 @@ class IBPAssignmentPenalty:
         learnable: bool = False,
         *,
         target: TargetSpec = "t",
+        temperature_schedule: Any = None,
         weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None,
     ) -> None:
         self.target = target
@@ -1352,6 +1417,7 @@ class IBPAssignmentPenalty:
         self.alpha = float(alpha)
         self.tau = float(tau)
         self.learnable = bool(learnable)
+        self.temperature_schedule = temperature_schedule
         self.weight_schedule = weight_schedule
         self.__post_init__()
 
@@ -1364,7 +1430,7 @@ class IBPAssignmentPenalty:
             raise ValueError(f"IBPAssignmentPenalty.tau must be > 0, got {self.tau}")
 
     def _to_rust_payload(self) -> dict[str, Any]:
-        return _add_weight_schedule({
+        payload = _add_temperature_schedule({
             "kind": "ibp_assignment",
             "target": _target_descriptor(self.target),
             "k_max": int(self.k_max),
@@ -1372,6 +1438,7 @@ class IBPAssignmentPenalty:
             "tau": float(self.tau),
             "learnable": bool(self.learnable),
         }, self)
+        return _add_weight_schedule(payload, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         return self._to_rust_payload()
