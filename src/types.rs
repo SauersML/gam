@@ -588,8 +588,7 @@ impl GlmLikelihoodSpec {
     /// Build a `GlmLikelihoodSpec` from a `LikelihoodSpec`, deriving the
     /// canonical default scale metadata for the response family.
     #[inline]
-    pub fn canonical(spec: impl Into<LikelihoodSpec>) -> Self {
-        let spec = spec.into();
+    pub fn canonical(spec: LikelihoodSpec) -> Self {
         let scale = spec.default_scale_metadata();
         Self { spec, scale }
     }
