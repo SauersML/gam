@@ -10393,6 +10393,8 @@ fn smooth_basis_kind_label(basis: &gam::smooth::SmoothBasisSpec) -> &'static str
         S::Pca { .. } => "pca",
         S::FactorSmooth { .. } => "factor_smooth",
         S::BySmooth { .. } => "by_smooth",
+        S::ByVariable { .. } => "by_variable",
+        S::FactorSumToZero { .. } => "factor_sum_to_zero",
     }
 }
 
