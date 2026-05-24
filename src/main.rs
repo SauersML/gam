@@ -850,7 +850,7 @@ fn require_dataset_rows(command: &str, path: &Path, rows: usize) -> Result<(), S
             path.display()
         ));
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 fn default_output_path_from_model(model: &Path, suffix: &str) -> PathBuf {
@@ -7040,7 +7040,7 @@ fn validate_positive_optional_usize(flag: &str, value: Option<usize>) -> Result<
     if matches!(value, Some(0)) {
         return Err(format!("{flag} must be > 0"));
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 fn validate_survival_baseline_args(

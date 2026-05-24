@@ -1725,9 +1725,7 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
                     }
                     return Ok((evals, evecs));
                 }
-                Ok((evals, evecs)) => {
-                    drop(evals);
-                    drop(evecs);
+                Ok((_, _)) => {
                     last_error = FaerLinalgError::SelfAdjointEigenNonFiniteInput {
                         context: "self-adjoint eigendecomposition repaired output validation",
                     };

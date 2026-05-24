@@ -244,7 +244,7 @@ fn validate_kernel_inputs(m: f64, mu: f64, sigma: f64) -> Result<(), EstimationE
             "lognormal kernel requires finite mu and sigma >= 0, got mu={mu}, sigma={sigma}"
         )));
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 #[inline]

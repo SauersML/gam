@@ -1893,7 +1893,7 @@ fn require_moments_degree(
         ))
         .into());
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 #[inline]
@@ -1908,7 +1908,7 @@ fn require_scratch_capacity(
         ))
         .into());
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 #[inline]
@@ -2832,7 +2832,7 @@ fn validate_bvn_args(h: f64, k: f64, rho: f64) -> Result<(), String> {
         ))
         .into());
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 #[inline]

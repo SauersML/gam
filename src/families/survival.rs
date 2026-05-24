@@ -1580,7 +1580,7 @@ impl WorkingModelSurvival {
         {
             return Err(SurvivalError::NonFiniteInput);
         }
-        Ok(())
+        Ok::<(), _>(())
     }
 
     fn validate_monotonicity_constraints(

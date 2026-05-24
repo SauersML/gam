@@ -208,7 +208,7 @@ impl StreamingMaternBasisGradientEvaluator {
                 "Matérn gradient data must be finite".to_string(),
             ));
         }
-        Ok(())
+        Ok::<(), _>(())
     }
 }
 

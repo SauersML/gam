@@ -1305,7 +1305,7 @@ impl StreamingArrowSchur {
                 reason: format!("streaming row g_t length {} != {}", row.gt.len(), self.d),
             });
         }
-        Ok(())
+        Ok::<(), _>(())
     }
 }
 
@@ -2793,7 +2793,7 @@ fn ensure_finite_values<'a>(
     if values.any(|v| !v.is_finite()) {
         return Err(format!("{caller}: {name} contains non-finite value"));
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 /// Flatten a `(block, basis_col α, output_col s)` triple into the shared

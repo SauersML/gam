@@ -190,7 +190,7 @@ impl GaussianRemlNoAllocWorkspace {
                 "Gaussian REML no-alloc workspace shape mismatch: expected p={p}, d={d}"
             )));
         }
-        Ok(())
+        Ok::<(), _>(())
     }
 }
 
@@ -2047,7 +2047,7 @@ fn validate_gaussian_reml_eigen_cache(
                 .to_string(),
         ));
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 fn prepare_gaussian_reml(

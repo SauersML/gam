@@ -14,7 +14,7 @@ pub(crate) fn validate_breakpoints(breakpoints: &[f64], label: &str) -> Result<(
             window[1]
         ));
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 /// Deduplicate an ordered knot sequence into strictly increasing breakpoints.

@@ -514,10 +514,7 @@ fn mismatched_prior_mean_length_panics() {
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         CanonicalPenalty::from_dense_root_with_mean(root.clone(), dim, bad_mean);
     }));
-    assert!(
-        result.is_err(),
-        "mismatched prior_mean length must panic"
-    );
+    assert!(result.is_err(), "mismatched prior_mean length must panic");
 }
 
 // ---------------------------------------------------------------------------

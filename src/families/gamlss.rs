@@ -825,7 +825,7 @@ fn validate_len_match(name: &str, expected: usize, found: usize) -> Result<(), S
         }
         .into());
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 fn validateweights(weights: &Array1<f64>, context: &str) -> Result<(), String> {
@@ -1150,7 +1150,7 @@ fn validate_term_datarows(context: &str, expected: usize, found: usize) -> Resul
             "{context}: data row count must match response length (expected {expected}, found {found})"
         ) }.into());
     }
-    Ok(())
+    Ok::<(), _>(())
 }
 
 fn validate_term_weights(
@@ -13965,7 +13965,7 @@ impl LogLinkDiagonalIrlsFamily for PoissonLogFamily {
             }
             .into());
         }
-        Ok(())
+        Ok::<(), _>(())
     }
     #[inline]
     fn row_kernel(&self, yi: f64, e_clamped: f64, m: f64, prior_w: f64) -> DiagonalIrlsRow {
@@ -14056,7 +14056,7 @@ impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
             }
             .into());
         }
-        Ok(())
+        Ok::<(), _>(())
     }
     #[inline]
     fn row_kernel(&self, yi: f64, e_clamped: f64, m: f64, prior_w: f64) -> DiagonalIrlsRow {
