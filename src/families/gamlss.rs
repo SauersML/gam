@@ -16503,27 +16503,6 @@ impl CustomFamily for BinomialLocationScaleFamily {
         }
     }
 
-    fn exact_outer_derivative_order(
-        &self,
-        specs: &[ParameterBlockSpec],
-        options: &BlockwiseFitOptions,
-    ) -> crate::custom_family::ExactOuterDerivativeOrder {
-        assert!(std::mem::size_of_val(options) > 0);
-        let coefficient_work = self
-            .coefficient_hessian_cost(specs)
-            .max(self.coefficient_gradient_cost(specs));
-        if !self.outer_hyper_hessian_dense_available(specs)
-            && !self.outer_hyper_hessian_hvp_available(specs)
-        {
-            return crate::custom_family::ExactOuterDerivativeOrder::First;
-        }
-        crate::custom_family::exact_outer_order_with_outer_hvp(
-            specs,
-            coefficient_work,
-            self.outer_hyper_hessian_hvp_available(specs),
-        )
-    }
-
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
             return Err(GamlssError::DimensionMismatch {
@@ -17081,10 +17060,12 @@ impl CustomFamily for BinomialLocationScaleFamily {
         options: &BlockwiseFitOptions,
         workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
-        assert!(std::mem::size_of_val(options) > 0);
-        assert!(workspace.is_some() || workspace.is_none());
         use crate::faer_ndarray::FaerCholesky;
         use faer::Side;
+
+        if options.outer_score_subsample.is_some() {
+            return Ok(None);
+        }
 
         // ψ-coords fall back to the generic path; the leverage form here is
         // ρ-only (penalty hyperparameters).
@@ -17127,12 +17108,23 @@ impl CustomFamily for BinomialLocationScaleFamily {
         }
 
         // ── Step 1: build dense joint Hessian H_L (unpenalized).
-        let h_l = self
-            .exact_newton_joint_hessian_from_designs(block_states, &x_t, &x_ls)?
-            .ok_or_else(|| {
+        let h_l = if let Some(workspace) = workspace.as_ref() {
+            if let Some(hessian) = workspace.hessian_dense()? {
+                hessian
+            } else {
+                self.exact_newton_joint_hessian_from_designs(block_states, &x_t, &x_ls)?
+                    .ok_or_else(|| {
+                        "BinomialLocationScaleFamily: unable to assemble joint Hessian for batched gradient"
+                            .to_string()
+                    })?
+            }
+        } else {
+            self.exact_newton_joint_hessian_from_designs(block_states, &x_t, &x_ls)?
+                .ok_or_else(|| {
                 "BinomialLocationScaleFamily: unable to assemble joint Hessian for batched gradient"
                     .to_string()
-            })?;
+            })?
+        };
 
         // ── Step 2: assemble penalty `S_λ` and add to H.
         // Match the unified evaluator's per-block convention.

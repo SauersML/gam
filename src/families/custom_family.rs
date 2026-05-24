@@ -20084,7 +20084,10 @@ mod tests {
     }
 
     impl CustomFamily for BatchedOuterHessianTestFamily {
-        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
             assert!(block_states.len() <= isize::MAX as usize);
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
@@ -20178,9 +20181,7 @@ mod tests {
     use faer::sparse::{SparseColMat, Triplet};
     use ndarray::{Array1, Array2, array};
 
-    pub(crate) fn outerobjectivegradienthessian<
-        F: CustomFamily + Clone + Send + Sync + 'static,
-    >(
+    pub(crate) fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Sync + 'static>(
         family: &F,
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
@@ -20223,25 +20224,17 @@ mod tests {
         penalty_counts: &[usize],
         rho: &Array1<f64>,
     ) -> Result<(f64, Array1<f64>), String> {
-        let (obj, grad, hess, warm) = outerobjectivegradienthessian(
+        let result = super::outerobjectivegradienthessian_internal(
             family,
             specs,
             options,
             penalty_counts,
             rho,
             None,
+            crate::types::RhoPrior::Flat,
             EvalMode::ValueAndGradient,
         )?;
-        assert!(
-            hess.as_ref().is_none_or(|h| h.nrows() == h.ncols()),
-            "outer Hessian must be square when materialised"
-        );
-        assert_eq!(
-            warm.block_beta.len(),
-            specs.len(),
-            "warm-start block_beta length must match specs"
-        );
-        Ok((obj, grad))
+        Ok((result.objective, result.gradient))
     }
 
     fn solve_blockweighted_system(
@@ -21456,7 +21449,10 @@ mod tests {
         struct ZeroFamily;
 
         impl CustomFamily for ZeroFamily {
-            fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+            fn evaluate(
+                &self,
+                block_states: &[ParameterBlockState],
+            ) -> Result<FamilyEvaluation, String> {
                 assert!(block_states.len() <= isize::MAX as usize);
                 Ok(FamilyEvaluation {
                     log_likelihood: 0.0,
@@ -22446,7 +22442,10 @@ mod tests {
     struct OneBlockConstrainedNaNHessianFamily;
 
     impl CustomFamily for OneBlockConstrainedNaNHessianFamily {
-        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
             assert!(block_states.len() <= isize::MAX as usize);
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
@@ -22479,7 +22478,10 @@ mod tests {
     struct OneBlockConstrainedIndefiniteHessianFamily;
 
     impl CustomFamily for OneBlockConstrainedIndefiniteHessianFamily {
-        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
             assert!(block_states.len() <= isize::MAX as usize);
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
@@ -22539,7 +22541,10 @@ mod tests {
     struct PreferJointExactFamily;
 
     impl CustomFamily for PreferJointExactFamily {
-        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
             assert!(block_states.len() <= isize::MAX as usize);
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
@@ -22788,7 +22793,10 @@ mod tests {
     struct OneBlockExactPsiHookFamily;
 
     impl CustomFamily for OneBlockExactPsiHookFamily {
-        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
             assert!(block_states.len() <= isize::MAX as usize);
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
@@ -22857,7 +22865,10 @@ mod tests {
     struct OneBlockIndefinitePseudoLaplaceFamily;
 
     impl CustomFamily for OneBlockIndefinitePseudoLaplaceFamily {
-        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
             assert!(block_states.len() <= isize::MAX as usize);
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
@@ -22922,7 +22933,10 @@ mod tests {
     struct OneBlockAlwaysErrorFamily;
 
     impl CustomFamily for OneBlockAlwaysErrorFamily {
-        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
             assert!(block_states.len() <= isize::MAX as usize);
             Err("synthetic outer objective failure: block[0] evaluate()".to_string())
         }
