@@ -6,9 +6,10 @@ gamfit primitives:
     LatentBasisKind = {"LieAtom"}   variant added to the smooth-spec enum
     LieAtom(group=..., n_atoms=..., d_per_atom=...)   Smooth subclass
     EquivariantPenalty(...)         AnalyticPenalty: ½‖[ρ(g), W] z‖² + ARD
-    gauge_companion(aux="HSV")      Helper that bakes auto_exp_38's recipe into
-                                    one call (HSV-supervises d_aux dims, leaves
-                                    the rest free for unsupervised name-semantic
+    gauge_companion(aux="HSV")      Helper that bakes the auxiliary-supervised
+                                    gauge-fix recipe into one call
+                                    (auxiliary-supervises d_aux dims, leaves
+                                    the rest free for unsupervised semantic
                                     discovery).
     equivariant_smooth(...)         PyFFI-style one-shot constructor.
 
