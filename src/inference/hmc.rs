@@ -5618,12 +5618,12 @@ pub fn run_joint_beta_rho_sampling(
     inputs: &JointBetaRhoInputs<'_>,
     config: &NutsConfig,
 ) -> Result<JointBetaRhoResult, String> {
-    validate_firth_likelihood_support(inputs.likelihood_family, inputs.firth_bias_reduction)
+    validate_firth_likelihood_support(&inputs.likelihood, inputs.firth_bias_reduction)
         .map_err(String::from)?;
     validate_nuts_target_accept(config.target_accept).map_err(String::from)?;
     let n_beta = inputs.mode.len();
     let n_rho = inputs.penalty_roots.len();
-    let n_link_params = JointBetaRhoPosterior::link_param_mode(&inputs.inverse_link).len();
+    let n_link_params = JointBetaRhoPosterior::link_param_mode(&inputs.likelihood.link).len();
     let total_dim = n_beta + n_rho + n_link_params;
 
     log::info!(
@@ -5643,8 +5643,7 @@ pub fn run_joint_beta_rho_sampling(
         inputs.hessian,
         inputs.penalty_roots.clone(),
         inputs.rho_mode,
-        inputs.likelihood_family,
-        inputs.inverse_link.clone(),
+        inputs.likelihood.clone(),
         inputs.gamma_shape,
         inputs.rho_prior.clone(),
         inputs.firth_bias_reduction,
