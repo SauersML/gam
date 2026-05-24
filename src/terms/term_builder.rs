@@ -1103,7 +1103,7 @@ pub fn build_smooth_basis(
                 },
             })
         }
-        "bspline" | "ps" | "p-spline" | "cyclic" | "cc" | "cp" | "cyclic-ps" => {
+        "cyclic" | "cc" | "cp" | "cyclic-ps" => {
             if cols.len() != 1 {
                 return Err(format!(
                     "periodic smooth expects one variable, got {}",
@@ -1141,7 +1141,10 @@ pub fn build_smooth_basis(
                     double_penalty: smooth_double_penalty,
                     identifiability: BSplineIdentifiability::default(),
                     boundary_conditions: Default::default(),
-                    boundary: OneDimensionalBoundary::Open,
+                    boundary: OneDimensionalBoundary::Cyclic {
+                        start: domain_start,
+                        end: domain_start + period,
+                    },
                 },
             })
         }
@@ -1228,7 +1231,7 @@ pub fn build_smooth_basis(
             let periods = parse_periods(options, &periodic_axes).map_err(|e| e.to_string())?;
             let origins =
                 parse_period_origins(options, &periodic_axes).map_err(|e| e.to_string())?;
-            let knotspec = if periodic_axes[0] {
+            let (knotspec, boundary) = if periodic_axes[0] {
                 if !boundary_conditions.is_free() {
                     return Err(TermBuilderError::incompatible_config(
                         "periodic B-splines cannot also declare endpoint boundary conditions",
@@ -1241,16 +1244,26 @@ pub fn build_smooth_basis(
                     } else {
                         parse_periodic_domain_1d(options, minv, maxv).map_err(|e| e.to_string())?
                     };
-                    BSplineKnotSpec::PeriodicUniform {
-                        data_range: (domain_start, domain_start + p_value),
-                        num_basis: n_knots + degree + 1,
-                    }
+                    let domain_end = domain_start + p_value;
+                    (
+                        BSplineKnotSpec::PeriodicUniform {
+                            data_range: (domain_start, domain_end),
+                            num_basis: n_knots + degree + 1,
+                        },
+                        OneDimensionalBoundary::Cyclic {
+                            start: domain_start,
+                            end: domain_end,
+                        },
+                    )
                 }
             } else {
-                BSplineKnotSpec::Generate {
-                    data_range: (minv, maxv),
-                    num_internal_knots: n_knots,
-                }
+                (
+                    BSplineKnotSpec::Generate {
+                        data_range: (minv, maxv),
+                        num_internal_knots: n_knots,
+                    },
+                    parse_cyclic_boundary(options, minv, maxv)?,
+                )
             };
             Ok(SmoothBasisSpec::BSpline1D {
                 feature_col: c,
@@ -1260,14 +1273,7 @@ pub fn build_smooth_basis(
                     knotspec,
                     double_penalty: smooth_double_penalty,
                     identifiability: BSplineIdentifiability::default(),
-                    boundary: if matches!(type_opt.as_str(), "cyclic" | "cc" | "cp" | "cyclic-ps") {
-                        OneDimensionalBoundary::Cyclic {
-                            start: minv,
-                            end: maxv,
-                        }
-                    } else {
-                        parse_cyclic_boundary(options, minv, maxv)?
-                    },
+                    boundary,
                     boundary_conditions,
                 },
             })
