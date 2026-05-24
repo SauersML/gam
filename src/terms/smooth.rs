@@ -32,7 +32,7 @@ use crate::estimate::{
     UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
-use crate::faer_ndarray::{FaerEigh, fast_atb, fast_atv};
+use crate::faer_ndarray::{FaerEigh, fast_ab, fast_atb, fast_atv};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{
     BlockDesignOperator, CoefficientTransformOperator, DenseDesignOperator, DesignBlock,
