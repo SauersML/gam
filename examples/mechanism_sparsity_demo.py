@@ -8,12 +8,10 @@ import warnings
 
 import numpy as np
 
-
 N, P, D, SEED = 300, 24, 3, 802
 GROUPS = [list(range(0, 6)), list(range(6, 12)), list(range(12, 18)), list(range(18, 24))]
 TRUE_ACTIVE = [{0, 2}, {1}, {2, 3}]
 LAMBDA, RIDGE, STEPS = 0.18, 1e-3, 900
-
 
 def make_data() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     rng = np.random.default_rng(SEED)
@@ -28,7 +26,6 @@ def make_data() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     x -= x.mean(axis=0, keepdims=True)
     return z, x, w_true
 
-
 def prox_mechanism(w: np.ndarray, step: float, lam: float) -> np.ndarray:
     out = w.copy()
     for latent in range(D):
@@ -37,7 +34,6 @@ def prox_mechanism(w: np.ndarray, step: float, lam: float) -> np.ndarray:
             shrink = max(0.0, 1.0 - step * lam * np.sqrt(len(group)) / max(norm, 1e-12))
             out[latent, group] *= shrink
     return out
-
 
 def fit_decoder(z: np.ndarray, x: np.ndarray) -> np.ndarray:
     lipschitz = float(np.linalg.norm(z, ord=2) ** 2 / N + RIDGE)
@@ -48,7 +44,6 @@ def fit_decoder(z: np.ndarray, x: np.ndarray) -> np.ndarray:
         w = prox_mechanism(w - step * grad, step, LAMBDA)
     return w
 
-
 def active_counts(w: np.ndarray) -> list[int]:
     row_max = np.maximum(np.linalg.norm(w, axis=1), 1e-12)
     counts = []
@@ -56,7 +51,6 @@ def active_counts(w: np.ndarray) -> list[int]:
         norms = np.array([np.linalg.norm(w[latent, group]) for group in GROUPS])
         counts.append(int(np.count_nonzero(norms > 0.08 * row_max[latent])))
     return counts
-
 
 def check_wrapper() -> None:
     try:
@@ -77,7 +71,6 @@ def check_wrapper() -> None:
         )
     except Exception as exc:
         warnings.warn(f"pyffi registry check skipped: {exc!r}")
-
 
 def main() -> None:
     check_wrapper()
