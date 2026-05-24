@@ -8041,8 +8041,17 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::Pca { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
-        SmoothBasisSpec::BySmooth { .. } | SmoothBasisSpec::FactorSmooth { .. } => {
-            panic!("BySmooth/FactorSmooth not handled here yet")
+        SmoothBasisSpec::BySmooth { smooth, .. } => smooth_term_feature_cols(&SmoothTermSpec {
+            name: term.name.clone(),
+            basis: (**smooth).clone(),
+            shape: term.shape,
+        }),
+        SmoothBasisSpec::FactorSmooth { spec } => {
+            let mut cols = spec.continuous_cols.clone();
+            cols.push(spec.group_col);
+            cols.sort_unstable();
+            cols.dedup();
+            cols
         }
     }
 }
@@ -8109,9 +8118,14 @@ fn smooth_basiswarning_family_rank(term: &SmoothTermSpec) -> u8 {
         SmoothBasisSpec::Matern { .. } => 4,
         SmoothBasisSpec::Duchon { .. } => 5,
         SmoothBasisSpec::Pca { .. } => 6,
-        SmoothBasisSpec::BySmooth { .. } | SmoothBasisSpec::FactorSmooth { .. } => {
-            panic!("BySmooth/FactorSmooth not handled here yet")
+        SmoothBasisSpec::BySmooth { smooth, .. } => {
+            smooth_basiswarning_family_rank(&SmoothTermSpec {
+                name: term.name.clone(),
+                basis: (**smooth).clone(),
+                shape: term.shape,
+            })
         }
+        SmoothBasisSpec::FactorSmooth { .. } => 7,
     }
 }
 
