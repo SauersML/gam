@@ -108,6 +108,8 @@ y ~ s(x, knots=10)          # 10 interior knots
 y ~ s(x, degree=3, penalty_order=2)
 y ~ s(x, type=ps)           # explicit P-spline
 y ~ s(x, double_penalty=true)
+y ~ s(x, bc_left=anchored, anchor_left=0)  # start at a known value only
+y ~ s(x, bc=clamped)        # zero slope at both endpoints
 ```
 
 For a single covariate, `s(x)` defaults to a cubic P-spline with a
@@ -121,10 +123,11 @@ second-order difference penalty.
 | `penalty_order` | 2 | Derivative order penalised (1 = slope, 2 = curvature). |
 | `type` | `ps` (1-D), `tps` (2+D) | `ps`, `tps`, `matern`, `duchon`, `sphere`. |
 | `double_penalty` | `true` | Add a ridge penalty alongside the difference penalty. |
-| `bc` | `free` | Same boundary condition on both ends: `free`, `clamped`, or `anchored`. |
-| `bc_left`, `bc_right` | `free` | Per-endpoint boundary condition. Aliases: `left_bc`/`right_bc`, `start_bc`/`end_bc`. |
-| `anchor`, `anchor_left`, `anchor_right` | 0 | Anchor value for `anchored`. Aliases: `anchor_value`, `value`, `left_anchor`, `right_anchor`. |
-| `by` | none | Column for varying-coefficient or by-factor smooths. |
+| `bc` | `none` | Boundary condition for both endpoints: `none`, `clamped` (zero first derivative), or `anchored` (fixed value). Combine with `side=left`/`right` for half-open smooths. |
+| `bc_left`, `bc_right` | inherit from `bc` | Per-endpoint overrides, with aliases `start_bc`/`end_bc`. |
+| `anchor`, `anchor_left`, `anchor_right` | `0` for anchored endpoints | Fixed endpoint value(s) when an endpoint uses `anchored`. |
+
+Boundary conditions are available for 1-D P-spline smooths. They are useful for trajectories with a known start or end: `bc_left=anchored, anchor_left=0` fixes only the left endpoint, while leaving the right endpoint open; `bc_right=clamped` forces a flat terminal slope.
 
 The 1-D B-spline path accepts these options plus `periodic`, `period`,
 `periods`, `period_start`, `period_end`, `origin`, `identifiability`.

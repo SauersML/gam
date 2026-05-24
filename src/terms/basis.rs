@@ -2047,27 +2047,46 @@ pub struct BSplineBasisSpec {
     pub knotspec: BSplineKnotSpec,
     pub double_penalty: bool,
     pub identifiability: BSplineIdentifiability,
+    /// Optional endpoint value/slope constraints for 1D B-spline smooths.
+    ///
+    /// These are enforced by the smooth-term builder as linear equality
+    /// constraints (represented internally as paired inequalities) in the
+    /// final coefficient coordinates, after identifiability and shape
+    /// reparameterizations have been applied.
     #[serde(default)]
     pub boundary_condition: BSplineBoundaryCondition,
 }
 
-/// Boundary condition used by 1D B-spline-like bases.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum BSplineBoundaryCondition {
-    /// Ordinary open/clamped P-spline basis.
-    Open,
-    /// Fully cyclic margin with the supplied period and coordinate origin.
-    ///
-    /// Periodic margins are represented by a finite Fourier basis with a
-    /// diagonal derivative penalty. This gives exact value/derivative wrapping
-    /// under x -> origin + (x-origin) mod period and composes directly in
-    /// tensor-product smooths.
-    Periodic { period: f64, origin: f64 },
+/// Per-endpoint boundary condition for a 1D B-spline smooth.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum BSplineEndpointCondition {
+    /// Do not constrain this endpoint.
+    None,
+    /// Force the first derivative to zero at this endpoint.
+    Clamped,
+    /// Force the smooth value to the supplied value at this endpoint.
+    Anchored { value: f64 },
 }
 
-impl Default for BSplineBoundaryCondition {
+impl Default for BSplineEndpointCondition {
     fn default() -> Self {
-        Self::Open
+        Self::None
+    }
+}
+
+/// Boundary conditions for the left and right endpoints of a 1D B-spline smooth.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct BSplineBoundaryCondition {
+    #[serde(default)]
+    pub left: BSplineEndpointCondition,
+    #[serde(default)]
+    pub right: BSplineEndpointCondition,
+}
+
+impl BSplineBoundaryCondition {
+    pub fn is_unconstrained(self) -> bool {
+        matches!(self.left, BSplineEndpointCondition::None)
+            && matches!(self.right, BSplineEndpointCondition::None)
     }
 }
 
