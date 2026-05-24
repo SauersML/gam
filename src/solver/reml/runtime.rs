@@ -4176,6 +4176,7 @@ impl<'a> RemlState<'a> {
     /// is structurally fixed, so this is C∞ in ρ. The rank must come from the
     /// same positive eigenspace as the pseudo-logdet; root row count overstates
     /// rank whenever penalty blocks overlap or the root carries redundant rows.
+    #[allow(dead_code)] // INTEGRATION-HOOK(evidence): canonical penalty rank+logdet entry, consumed once REML routes evidence through evidence_grad_rho.
     pub(super) fn fixed_subspace_penalty_rank_and_logdet(
         &self,
         e_transformed: &Array2<f64>,
@@ -4312,6 +4313,7 @@ impl<'a> RemlState<'a> {
     ///
     /// Uses the exact pseudoinverse S⁺ restricted to the positive eigenspace.
     /// Only eigenvectors in the canonical structural rank participate.
+    #[allow(dead_code)] // INTEGRATION-HOOK(evidence): paired with fixed_subspace_penalty_rank_and_logdet for ∂V/∂ρ.
     pub(super) fn fixed_subspace_penalty_trace(
         &self,
         e_transformed: &Array2<f64>,
