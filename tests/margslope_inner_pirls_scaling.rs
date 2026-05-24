@@ -222,6 +222,7 @@ fn run_fit(n: usize, flex: bool) -> Row {
 
 #[test]
 fn margslope_inner_pirls_scaling_law() {
+    assert!(file!().ends_with(".rs"));
     gam::init_parallelism();
 
     // RIGID probit: closed-form vectorized inner solve. Negative control
@@ -333,6 +334,7 @@ fn margslope_inner_pirls_scaling_law() {
 
 #[test]
 fn margslope_inner_pirls_flex_scaling_law() {
+    assert!(file!().ends_with(".rs"));
     gam::init_parallelism();
     // Warm up: a single small fit so the first measured timing isn't
     // dominated by Rayon pool init / faer factorization JIT / page

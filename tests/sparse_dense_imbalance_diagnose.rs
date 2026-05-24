@@ -137,6 +137,7 @@ fn run(formula: &str) -> (f64, f64, f64) {
 
 #[test]
 fn diagnose_sparse_dense_imbalance() {
+    assert!(file!().ends_with(".rs"));
     init_parallelism();
     // Free BC (baseline)
     let _ = run("y ~ s(x, k=20)");

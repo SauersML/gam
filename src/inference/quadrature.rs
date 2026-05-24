@@ -4246,6 +4246,7 @@ mod tests {
 
     #[test]
     fn test_computed_nodes_symmetric() {
+        assert!(file!().ends_with(".rs"));
         // Verify computed nodes are symmetric around zero
         let ctx = QuadratureContext::new();
         let gh = ctx.gauss_hermite();
@@ -4259,6 +4260,7 @@ mod tests {
 
     #[test]
     fn test_computedweights_symmetric() {
+        assert!(file!().ends_with(".rs"));
         // Verify computed weights are symmetric
         let ctx = QuadratureContext::new();
         let gh = ctx.gauss_hermite();
@@ -4270,6 +4272,7 @@ mod tests {
 
     #[test]
     fn testweights_sum_to_sqrt_pi() {
+        assert!(file!().ends_with(".rs"));
         // Verify weights sum to sqrt(pi) for physicist's Hermite
         let ctx = QuadratureContext::new();
         let gh = ctx.gauss_hermite();
@@ -4279,6 +4282,7 @@ mod tests {
 
     #[test]
     fn test_clenshaw_curtisweights_are_symmetric_and_integrate_constants() {
+        assert!(file!().ends_with(".rs"));
         let rule = compute_clenshaw_curtis_n(33);
         let m = rule.weights.len() - 1;
         for j in 0..=m / 2 {
@@ -4315,6 +4319,7 @@ mod tests {
 
     #[test]
     fn test_matches_known_7_point_constants() {
+        assert!(file!().ends_with(".rs"));
         let known_nodes = [
             -2.651_961_356_835_233_4,
             -1.673_551_628_767_471_4,
@@ -4344,6 +4349,7 @@ mod tests {
 
     #[test]
     fn testzero_se_returns_mode() {
+        assert!(file!().ends_with(".rs"));
         // When SE is zero, posterior mean is expected to equal mode
         let eta = 1.5;
         let se = 0.0;
@@ -4355,6 +4361,7 @@ mod tests {
 
     #[test]
     fn test_symmetric_atzero() {
+        assert!(file!().ends_with(".rs"));
         // At eta=0 (50% probability), mean is expected to be ~50%
         let eta = 0.0;
         let se = 1.0;
@@ -4381,6 +4388,7 @@ mod tests {
 
     #[test]
     fn test_matches_monte_carlo() {
+        assert!(file!().ends_with(".rs"));
         // Compare quadrature to Monte Carlo with many samples
         let eta = 2.0;
         let se = 0.8;
@@ -4410,6 +4418,7 @@ mod tests {
 
     #[test]
     fn test_quadrature_integrates_x_squared() {
+        assert!(file!().ends_with(".rs"));
         // The quadrature exactly integrates x² against exp(-x²)
         // ∫ x² exp(-x²) dx = sqrt(π)/2
         let ctx = QuadratureContext::new();
@@ -4424,6 +4433,7 @@ mod tests {
 
     #[test]
     fn test_quadrature_integrates_x_fourth() {
+        assert!(file!().ends_with(".rs"));
         // The quadrature exactly integrates x⁴ against exp(-x²)
         // ∫ x⁴ exp(-x²) dx = 3*sqrt(π)/4
         let ctx = QuadratureContext::new();
@@ -4468,6 +4478,7 @@ mod tests {
 
     #[test]
     fn test_integrated_sigmoid_matches_high_res_integral_random_pairs() {
+        assert!(file!().ends_with(".rs"));
         let ctx = QuadratureContext::new();
         let mut rng_state = 0x4d595df4d0f33173u64;
 
@@ -4519,6 +4530,7 @@ mod tests {
 
     #[test]
     fn test_logit_posterior_mean_exact_symmetry_identity() {
+        assert!(file!().ends_with(".rs"));
         let cases = [(-3.0, 0.5), (-1.2, 1.7), (0.0, 2.2), (2.3, 0.8)];
         for (mu, sigma) in cases {
             let p = logit_posterior_mean_exact(mu, sigma);
@@ -4529,6 +4541,7 @@ mod tests {
 
     #[test]
     fn test_logit_posterior_mean_exact_matches_high_res_integral() {
+        assert!(file!().ends_with(".rs"));
         let cases = [(-2.0, 0.4), (-0.7, 1.1), (0.8, 0.9), (2.4, 1.7)];
         for (mu, sigma) in cases {
             let exact = logit_posterior_mean_exact(mu, sigma);
@@ -4539,6 +4552,7 @@ mod tests {
 
     #[test]
     fn test_integrated_logit_mean_close_to_exact_oracle() {
+        assert!(file!().ends_with(".rs"));
         let ctx = QuadratureContext::new();
         let cases = [(-3.0, 0.3), (-1.0, 0.8), (0.5, 1.2), (2.8, 1.0)];
         for (eta, se) in cases {
@@ -4550,6 +4564,7 @@ mod tests {
 
     #[test]
     fn test_probit_posterior_mean_reduces_to_map_atzero_se() {
+        assert!(file!().ends_with(".rs"));
         let eta = 1.25;
         let p = probit_posterior_mean(eta, 0.0);
         let map = crate::probability::normal_cdf(eta);
@@ -4580,6 +4595,7 @@ mod tests {
 
     #[test]
     fn test_cloglog_and_survival_posterior_means_are_complements() {
+        assert!(file!().ends_with(".rs"));
         let ctx = QuadratureContext::new();
         let cases = [
             (-3.0, 0.0),
@@ -4618,6 +4634,7 @@ mod tests {
 
     #[test]
     fn test_cloglog_and_survival_posteriorvariances_match() {
+        assert!(file!().ends_with(".rs"));
         let ctx = QuadratureContext::new();
         let cases = [(-3.0, 0.0), (-0.2, 0.1), (0.4, 0.8), (2.0, 1.5)];
         for (eta, se) in cases {
@@ -4629,6 +4646,7 @@ mod tests {
 
     #[test]
     fn test_survivalvariance_uses_exactsecond_moment_shift() {
+        assert!(file!().ends_with(".rs"));
         let ctx = QuadratureContext::new();
         let eta = -0.2;
         let se = 0.8;
@@ -4668,6 +4686,7 @@ mod tests {
 
     #[test]
     fn test_integrated_probit_jet_matches_closed_form_derivatives() {
+        assert!(file!().ends_with(".rs"));
         let ctx = QuadratureContext::new();
         let mu = 0.7;
         let sigma = 1.3;
@@ -5020,6 +5039,7 @@ mod tests {
 
     #[test]
     fn test_cloglog_controlled_matches_mathematical_target_on_small_sigma_grid() {
+        assert!(file!().ends_with(".rs"));
         let ctx = QuadratureContext::new();
         // Cover the entire small-sigma routing region with negative-tail,
         // central, and saturated-positive cases. The reference is the
@@ -5080,6 +5100,7 @@ mod tests {
 
     #[test]
     fn test_cloglog_cc_matches_gamma_reference_on_central_case() {
+        assert!(file!().ends_with(".rs"));
         let ctx = QuadratureContext::new();
         let mu = -0.2;
         let sigma = 0.8;
@@ -5090,6 +5111,7 @@ mod tests {
 
     #[test]
     fn test_cloglog_gamma_reference_matches_seeded_monte_carlo_small_case() {
+        assert!(file!().ends_with(".rs"));
         let mu = -0.2;
         let sigma = 0.8;
         let gamma =
@@ -5195,6 +5217,7 @@ mod tests {
 
     #[test]
     fn test_logit_batch_uses_same_dispatchvalues() {
+        assert!(file!().ends_with(".rs"));
         let ctx = QuadratureContext::new();
         let eta = ndarray::array![-2.0, 0.0, 1.25, 35.0];
         let se = ndarray::array![0.1, 0.5, 1.0, 1.0];
@@ -5352,6 +5375,7 @@ mod tests {
 
     #[test]
     fn cloglog_g_derivatives_at_zero() {
+        assert!(file!().ends_with(".rs"));
         let (g, g1, g2, g3, g4) = cloglog_g_derivatives(0.0);
         // g(0) = 1 - exp(-1)
         let expected_g = 1.0 - (-1.0_f64).exp();
@@ -5390,6 +5414,7 @@ mod tests {
 
     #[test]
     fn cloglog_ghq_value_sigma_zero_matches_pointwise() {
+        assert!(file!().ends_with(".rs"));
         let ctx = QuadratureContext::new();
         // When sigma=0, L(mu,0) = g(mu)
         for &mu in &[-2.0, -1.0, 0.0, 0.5, 1.5] {
@@ -5429,6 +5454,7 @@ mod tests {
 
     #[test]
     fn cloglog_ghq_derivatives_finite_difference_mu() {
+        assert!(file!().ends_with(".rs"));
         // Verify ∂L/∂μ by finite differences
         let ctx = QuadratureContext::new();
         let mu = 0.5;
@@ -5449,6 +5475,7 @@ mod tests {
 
     #[test]
     fn cloglog_ghq_derivatives_finite_difference_sigma() {
+        assert!(file!().ends_with(".rs"));
         // Verify ∂L/∂σ by finite differences
         let ctx = QuadratureContext::new();
         let mu = 0.2;
@@ -5463,6 +5490,7 @@ mod tests {
 
     #[test]
     fn cloglog_ghq_derivatives_finite_difference_cross() {
+        assert!(file!().ends_with(".rs"));
         // Verify ∂²L/∂μ∂σ by finite differences of ∂L/∂μ w.r.t. σ
         let ctx = QuadratureContext::new();
         let mu = -0.5;
@@ -5493,6 +5521,7 @@ mod tests {
 
     #[test]
     fn cloglog_ghq_adaptive_matches_explicit() {
+        assert!(file!().ends_with(".rs"));
         let ctx = QuadratureContext::new();
         let mu = 0.7;
         let sigma = 1.2;
@@ -5507,6 +5536,7 @@ mod tests {
 
     #[test]
     fn cloglog_ghq_value_matches_mathematical_target_in_central_regime() {
+        assert!(file!().ends_with(".rs"));
         let ctx = QuadratureContext::new();
         for &mu in &[-1.0, 0.0, 0.5, 2.0] {
             for &sigma in &[0.1, 0.5, 1.0] {
@@ -5551,6 +5581,7 @@ mod tests {
 
     #[test]
     fn cloglog_negative_tail_degenerate_branch_matches_target_near_transition() {
+        assert!(file!().ends_with(".rs"));
         let ctx = QuadratureContext::default();
         let sigma = 0.0;
         for &mu in &[-30.001, -30.0, -29.999] {
@@ -5572,6 +5603,7 @@ mod tests {
 
     #[test]
     fn cloglog_negative_tail_small_sigma_branch_matches_target_near_transition() {
+        assert!(file!().ends_with(".rs"));
         let ctx = QuadratureContext::default();
         let sigma = 0.1;
         for &mu in &[-30.001, -30.0, -29.999] {

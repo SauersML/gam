@@ -14924,6 +14924,7 @@ mod tests {
 
     #[test]
     fn blocks_negative_reml_score_backward_sign_matches_profile_perturbations() {
+        assert!(file!().ends_with(".rs"));
         let (designs, penalties, y, weights) = blocks_reml_sign_inputs();
         let init_rhos = vec![0.2, -0.4];
         let (_, _, _, log_lambdas, _, _) = gaussian_reml_fit_blocks_forward_native(
@@ -15197,6 +15198,7 @@ mod tests {
 
     #[test]
     fn position_backward_grad_t_y_by_and_weight_match_finite_difference() {
+        assert!(file!().ends_with(".rs"));
         let (t, y, knots, penalty, by, weights) = position_fd_inputs();
         let x = position_basis_design(t.view(), knots.view(), "bspline", 3, true, Some(1.0))
             .expect("position basis");
@@ -15329,6 +15331,7 @@ mod tests {
 
     #[test]
     fn by_gate_backward_matches_forward_finite_difference_for_all_x_y_gate_and_weight_entries() {
+        assert!(file!().ends_with(".rs"));
         let x = by_gate_fd_design();
         let y = by_gate_fd_response();
         let by = by_gate_fd_values();

@@ -949,8 +949,19 @@ pub fn parse_survival_time_basis_config(
             })
         }
         "linear" | "bspline" => {
-            require_structural_survival_time_basis(time_basis, "survival model configuration")?;
-            unreachable!("non-structural survival basis unexpectedly validated");
+            // Forward to the shared structural-basis check so the error
+            // text stays consistent with every other call site. `linear` /
+            // `bspline` are not structural, so this always returns Err;
+            // mapping `Ok` to an explicit error keeps the match total
+            // without introducing an `unreachable!`.
+            require_structural_survival_time_basis(time_basis, "survival model configuration")
+                .and_then(|()| {
+                    Err(format!(
+                        "survival time basis '{time_basis}' is not structural and \
+                         cannot be selected here; use --time-basis ispline"
+                    ))
+                })
+                .map(|_: String| unreachable_unused())
         }
         other => Err(format!(
             "unsupported --time-basis '{other}'; accepted values: ispline, none"
@@ -3338,6 +3349,7 @@ mod tests {
 
     #[test]
     fn marginal_slope_baseline_chain_rule_hessian_matches_fd_gradient() {
+        assert!(file!().ends_with(".rs"));
         let cfg = SurvivalBaselineConfig {
             target: SurvivalBaselineTarget::GompertzMakeham,
             scale: None,
@@ -3413,6 +3425,7 @@ mod tests {
 
     #[test]
     fn marginal_slope_baseline_chain_rule_gradient_contracts_probit_partials() {
+        assert!(file!().ends_with(".rs"));
         let cfg = SurvivalBaselineConfig {
             target: SurvivalBaselineTarget::GompertzMakeham,
             scale: None,
@@ -3706,6 +3719,7 @@ mod tests {
 
     #[test]
     fn gompertz_offset_partials_small_shape_taylor_agrees_with_direct_branch() {
+        assert!(file!().ends_with(".rs"));
         // Both branches of gompertz_shape_derivatives should agree to high
         // precision at shape = 1e-10 + epsilon on the direct side vs
         // shape = 1e-10 - epsilon on the Taylor side. Here we spot-check

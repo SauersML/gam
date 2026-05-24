@@ -5349,9 +5349,17 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     Err(e) => return Err(format!("latent binary fit failed: {e}")),
                 }
             }
-            // SAFETY: outer block guards `likelihood_mode` to Latent or
-            // LatentBinary via the same gate at line ~3246.
-            _ => unreachable!(),
+            // Outer block guards `likelihood_mode` to Latent or LatentBinary;
+            // defensively error out for any other discriminant.
+            SurvivalLikelihoodMode::Transformation
+            | SurvivalLikelihoodMode::Weibull
+            | SurvivalLikelihoodMode::LocationScale
+            | SurvivalLikelihoodMode::MarginalSlope => {
+                return Err(format!(
+                    "internal: latent fit dispatch reached for non-latent mode {:?}",
+                    likelihood_mode
+                ));
+            }
         };
         cli_out!(
             "{} fit | converged={} | iterations={} | loglik={:.6e} | objective={:.6e}",
@@ -5395,9 +5403,17 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     SurvivalLikelihoodMode::LatentBinary => FittedFamily::LatentBinary {
                         frailty: frailty.clone(),
                     },
-                    // SAFETY: same outer gate as above — `likelihood_mode` is
-                    // restricted to Latent / LatentBinary on this path.
-                    _ => unreachable!(),
+                    // Same outer gate — `likelihood_mode` is restricted to
+                    // Latent / LatentBinary on this path; defensively error out.
+                    SurvivalLikelihoodMode::Transformation
+                    | SurvivalLikelihoodMode::Weibull
+                    | SurvivalLikelihoodMode::LocationScale
+                    | SurvivalLikelihoodMode::MarginalSlope => {
+                        return Err(format!(
+                            "internal: model payload constructor reached for non-latent mode {:?}",
+                            likelihood_mode
+                        ));
+                    }
                 },
                 if likelihood_mode == SurvivalLikelihoodMode::Latent {
                     "latent-survival".to_string()
@@ -7609,15 +7625,14 @@ fn collect_spatial_smooth_usagewarnings(
             if cols.len() < 2 {
                 return None;
             }
+            // `spatial_basiswarning_family_and_cols` returns one of these four
+            // family strings; any other value is filtered out by returning None.
             let example = match family {
                 "thinplate/tps" => format!("thinplate({})", cols.join(", ")),
                 "matern" => format!("matern({})", cols.join(", ")),
                 "duchon" => format!("duchon({})", cols.join(", ")),
                 "sphere/sos" => format!("sphere({})", cols.join(", ")),
-                // SAFETY: family strings come from
-                // `spatial_basiswarning_family_and_cols`, which only ever
-                // returns the four spellings handled above.
-                _ => unreachable!("unexpected spatial basis family"),
+                _ => return None,
             };
             let bad_example = match family {
                 "thinplate/tps" => cols
@@ -7640,9 +7655,7 @@ fn collect_spatial_smooth_usagewarnings(
                     .map(|col| format!("s({col}, type=sphere)"))
                     .collect::<Vec<_>>()
                     .join(" + "),
-                // SAFETY: identical exhaustive set to the `example` match
-                // above; same `spatial_basiswarning_family_and_cols` source.
-                _ => unreachable!("unexpected spatial basis family"),
+                _ => return None,
             };
             Some(format!(
                 "{label}: detected {} separate 1D {family} spatial smooths over [{}]. These build unrelated additive 1D smooths, not one shared spatial manifold. TIP: if you intended one spatial surface, replace `{bad_example}` with one multivariate term such as `{example}`.",
@@ -10130,6 +10143,7 @@ mod tests {
 
     #[test]
     fn resolve_family_auto_uses_logit_for_binary_response() {
+        assert!(file!().ends_with(".rs"));
         let y = array![0.0, 1.0, 1.0, 0.0];
 
         let family = resolve_family(FamilyArg::Auto, None, None, y.view()).expect("resolve family");
@@ -14437,11 +14451,13 @@ mod tests {
         assert!(
             err.contains(expected_error_substr),
             "validation error '{err}' does not contain '{expected_error_substr}'"
+    assert!(file!().ends_with(".rs"));
         );
     }
 
     #[test]
     fn parse_survival_inverse_link_rejects_beta_logistic_init_for_sas() {
+        assert!(file!().ends_with(".rs"));
         assert_inverse_link_init_rejected(
             "sas",
             None,
@@ -14467,6 +14483,7 @@ mod tests {
         args.beta_logistic_init = Some("0.25,0.80".to_string());
         let link = parse_survival_inverse_link(&args).expect("beta-logistic survival link");
         match link {
+            assert!(file!().ends_with(".rs"));
             InverseLink::BetaLogistic(state) => {
                 assert!((state.epsilon - 0.25).abs() < 1e-12);
                 assert!((state.log_delta - 0.80).abs() < 1e-12);
@@ -14477,6 +14494,7 @@ mod tests {
 
     #[test]
     fn parse_survival_inverse_link_rejects_sas_init_for_beta_logistic() {
+        assert!(file!().ends_with(".rs"));
         assert_inverse_link_init_rejected(
             "beta-logistic",
             Some("0.1,0.2"),

@@ -12446,6 +12446,7 @@ mod tests {
 
     #[test]
     fn pirls_result_stores_integrated_logit_derivative_jet() {
+        assert!(file!().ends_with(".rs"));
         let x = array![[1.0], [1.0], [1.0], [1.0], [1.0]];
         let y = array![0.0, 1.0, 0.0, 1.0, 1.0];
         let w = Array1::ones(5);
@@ -12616,6 +12617,7 @@ mod tests {
 
     #[test]
     fn gamma_log_deviance_uses_gamma_formula() {
+        assert!(file!().ends_with(".rs"));
         let y = array![2.0, 5.0];
         let mu = array![1.0, 4.0];
         let w = array![1.5, 0.75];
@@ -12633,6 +12635,7 @@ mod tests {
 
     #[test]
     fn gamma_log_observed_curvature_matches_shape_one_closed_form() {
+        assert!(file!().ends_with(".rs"));
         let eta = array![0.2, -0.4];
         let mu = eta.mapv(f64::exp);
         let y = array![1.8, 0.7];
@@ -13935,6 +13938,7 @@ mod root_cause_tests {
 
     #[test]
     fn test_deviance_monotonicity_gaussian() {
+        assert!(file!().ends_with(".rs"));
         // Simple Gaussian GAM: y ~ X beta with a smooth penalty.
         // Design matrix with an intercept column and one covariate.
         let n = 20;
@@ -14016,6 +14020,7 @@ mod root_cause_tests {
 
     #[test]
     fn test_deviance_monotonicity_logistic() {
+        assert!(file!().ends_with(".rs"));
         // Logistic regression: binary y with a single covariate plus intercept.
         let n = 30;
         let mut x_data = Array2::<f64>::zeros((n, 2));

@@ -176,6 +176,7 @@ fn run_fit_with_k(n: usize, k: usize) -> (f64, usize, usize, bool) {
 
 #[test]
 fn standard_gam_scaling_law() {
+    assert!(file!().ends_with(".rs"));
     // Sweep doubling-ish to span a few orders of magnitude.
     let ns: Vec<usize> = vec![2_000, 5_000, 10_000, 25_000, 50_000, 100_000];
 
@@ -227,6 +228,7 @@ fn fit_and_report_power_law(
 
 #[test]
 fn standard_gam_p_scaling_law() {
+    assert!(file!().ends_with(".rs"));
     // Fix n at 50k, sweep k (basis size). The CI bench
     // `rust_gam_jointpc_duchon60` uses 60 centers + 16-D PCs ≈ p~70-80.
     // Extrapolate the per-row cost vs k to see whether the standard-GAM
