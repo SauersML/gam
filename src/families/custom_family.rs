@@ -20456,7 +20456,7 @@ mod tests {
     // gamfit 0.1.92 lives in the custom survival-marginal-slope outer-
     // gradient assembler (which has its own unprojected formula and has
     // not been retrofitted to use joint_outer_evaluate's projected
-    // kernel) — see project_biobank_marginal_slope_failure.md.
+    // kernel).
     #[test]
     fn biobank_scale_rho_scan_joint_outer_evaluate_is_projection_invariant() {
         // Same fixture shape as the rank-deficient projected-trace test,

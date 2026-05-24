@@ -192,11 +192,10 @@ fn logistic(x: f64) -> f64 {
 /// weight during REML outer iterations. This follows the standard annealed
 /// regularization pattern in deep learning, where optimization first finds
 /// good fits before stronger structure constrains the solution. It also
-/// addresses the auto_exp_30-37 finding that hand-picked analytic weights
-/// materially affect outcomes: auto_exp_30 preferred `w_ortho = 0`, while
-/// auto_exp_33's fixed tight `sigma_aux = 0.5` beat the learned-weight
-/// auto_exp_34 result (`R²(hue)=0.70` versus `0.62`). A schedule side-steps
-/// that brittle initial choice by ramping the constraint.
+/// addresses the general observation that hand-picked analytic weights
+/// materially affect outcomes — fixed tight auxiliary scales can outperform
+/// learned weights on one dataset and underperform on another. A schedule
+/// side-steps that brittle initial choice by ramping the constraint.
 #[derive(Debug, Clone)]
 pub struct ScalarWeightSchedule {
     pub w_start: f64,
@@ -6029,9 +6028,8 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
 /// Gauge-fixing penalty for latent-coordinate axes.
 ///
 /// ARD alone is rotation-invariant — pair with Orthogonality to identify
-/// intrinsic dim (auto_exp_21). This penalty locks a canonical orthonormal
-/// basis first; ARD can then shrink axes after the rotation gauge has been
-/// identified.
+/// intrinsic dim. This penalty locks a canonical orthonormal basis first;
+/// ARD can then shrink axes after the rotation gauge has been identified.
 #[derive(Debug, Clone)]
 pub struct OrthogonalityPenalty {
     pub target: PsiSlice,

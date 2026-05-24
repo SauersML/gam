@@ -3949,7 +3949,11 @@ pub fn run_nuts_sampling_flattened_family(
             glm.firth_bias_reduction,
             config,
         ),
-        (LikelihoodFamily::BinomialLogit, FamilyNutsInputs::Glm(glm)) => {
+        (
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+            FamilyNutsInputs::Glm(glm),
+        ) => {
             // Auto-select PG Gibbs when assumptions hold; otherwise fall back to NUTS.
             // This gives gradient-free posterior draws for standard Bernoulli logit GAMs.
             if !glm.firth_bias_reduction && glm.weights.iter().all(|w| (*w - 1.0).abs() <= 1e-10) {
@@ -3977,7 +3981,11 @@ pub fn run_nuts_sampling_flattened_family(
                 )
             }
         }
-        (LikelihoodFamily::BinomialProbit, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
+        (
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Probit),
+            FamilyNutsInputs::Glm(glm),
+        ) => run_nuts_sampling(
             glm.x,
             glm.y,
             glm.weights,
@@ -3990,7 +3998,11 @@ pub fn run_nuts_sampling_flattened_family(
             glm.firth_bias_reduction,
             config,
         ),
-        (LikelihoodFamily::BinomialCLogLog, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
+        (
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::CLogLog),
+            FamilyNutsInputs::Glm(glm),
+        ) => run_nuts_sampling(
             glm.x,
             glm.y,
             glm.weights,
@@ -4003,7 +4015,11 @@ pub fn run_nuts_sampling_flattened_family(
             glm.firth_bias_reduction,
             config,
         ),
-        (LikelihoodFamily::BinomialLatentCLogLog, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
+        (
+            ResponseFamily::Binomial,
+            InverseLink::LatentCLogLog(_),
+            FamilyNutsInputs::Glm(glm),
+        ) => run_nuts_sampling(
             glm.x,
             glm.y,
             glm.weights,
@@ -4016,19 +4032,22 @@ pub fn run_nuts_sampling_flattened_family(
             glm.firth_bias_reduction,
             config,
         ),
-        (LikelihoodFamily::BinomialMixture, FamilyNutsInputs::Glm(_)) => Err(
+        (ResponseFamily::Binomial, InverseLink::Mixture(_), FamilyNutsInputs::Glm(_)) => Err(
             "BinomialMixture NUTS is not implemented yet; use fit_gam/predict_gam for blended inverse-link models"
                 .to_string(),
         ),
-        (LikelihoodFamily::BinomialSas, FamilyNutsInputs::Glm(_)) => Err(
+        (ResponseFamily::Binomial, InverseLink::Sas(_), FamilyNutsInputs::Glm(_)) => Err(
             "BinomialSas NUTS is not implemented yet; use fit_gam/predict_gam for SAS-link models"
                 .to_string(),
         ),
-        (LikelihoodFamily::BinomialBetaLogistic, FamilyNutsInputs::Glm(_)) => Err(
+        (ResponseFamily::Binomial, InverseLink::BetaLogistic(_), FamilyNutsInputs::Glm(_)) => Err(
             "BinomialBetaLogistic NUTS is not implemented yet; use fit_gam/predict_gam for beta-logistic-link models"
                 .to_string(),
         ),
-        (LikelihoodFamily::RoystonParmar, FamilyNutsInputs::Survival(survival)) => {
+        (ResponseFamily::Binomial, InverseLink::Standard(_), FamilyNutsInputs::Glm(_)) => Err(
+            "NUTS sampling is not implemented for this binomial inverse link".to_string(),
+        ),
+        (ResponseFamily::RoystonParmar, _, FamilyNutsInputs::Survival(survival)) => {
             survival_hmc::run_survival_nuts_sampling(
                 survival.flat.age_entry,
                 survival.flat.age_exit,
@@ -4051,14 +4070,14 @@ pub fn run_nuts_sampling_flattened_family(
                 config,
             )
         }
-        (LikelihoodFamily::RoystonParmar, FamilyNutsInputs::Glm(_)) => Err(
+        (ResponseFamily::RoystonParmar, _, FamilyNutsInputs::Glm(_)) => Err(
             "RoystonParmar family requires FamilyNutsInputs::Survival flattened inputs".to_string(),
         ),
-        (_, FamilyNutsInputs::Survival(_)) => Err(
-            "Survival flattened inputs are only valid for LikelihoodFamily::RoystonParmar"
+        (_, _, FamilyNutsInputs::Survival(_)) => Err(
+            "Survival flattened inputs are only valid for the Royston-Parmar response family"
                 .to_string(),
         ),
-        (LikelihoodFamily::PoissonLog, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
+        (ResponseFamily::Poisson, _, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
             glm.x,
             glm.y,
             glm.weights,
@@ -4071,7 +4090,7 @@ pub fn run_nuts_sampling_flattened_family(
             glm.firth_bias_reduction,
             config,
         ),
-        (LikelihoodFamily::Tweedie { p }, FamilyNutsInputs::Glm(glm)) => {
+        (ResponseFamily::Tweedie { p }, _, FamilyNutsInputs::Glm(glm)) => {
             // Family mapping: Tweedie payload p is passed through the family-parameter slot.
             // The Tweedie dispersion phi remains in glm.dispersion, matching REML.
             if !is_valid_tweedie_power(p) {
@@ -4093,7 +4112,7 @@ pub fn run_nuts_sampling_flattened_family(
                 config,
             )
         }
-        (LikelihoodFamily::NegativeBinomial { theta }, FamilyNutsInputs::Glm(glm)) => {
+        (ResponseFamily::NegativeBinomial { theta }, _, FamilyNutsInputs::Glm(glm)) => {
             // Family mapping: NegativeBinomial payload theta is passed through the family slot.
             // NB dispersion scale is unit; theta is not derived from fixed_phi.
             run_nuts_sampling(
@@ -4110,10 +4129,10 @@ pub fn run_nuts_sampling_flattened_family(
                 config,
             )
         }
-        (LikelihoodFamily::BetaLogit { .. }, FamilyNutsInputs::Glm(_)) => Err(
+        (ResponseFamily::Beta { .. }, _, FamilyNutsInputs::Glm(_)) => Err(
             "NUTS sampling is not implemented for beta-regression logit".to_string(),
         ),
-        (LikelihoodFamily::GammaLog, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
+        (ResponseFamily::Gamma, _, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
             glm.x,
             glm.y,
             glm.weights,
@@ -4125,6 +4144,9 @@ pub fn run_nuts_sampling_flattened_family(
             glm.dispersion,
             glm.firth_bias_reduction,
             config,
+        ),
+        (ResponseFamily::Gaussian, _, FamilyNutsInputs::Glm(_)) => Err(
+            "NUTS sampling is only implemented for Gaussian with identity link".to_string(),
         ),
     }
 }
@@ -5072,10 +5094,8 @@ struct JointBetaRhoPosterior {
     chol: Array2<f64>,
     /// L' for chain rule
     chol_t: Array2<f64>,
-    /// Family for log-likelihood computation
-    likelihood_family: LikelihoodFamily,
-    /// Exact runtime inverse-link state for adaptive binomial links.
-    inverse_link: InverseLink,
+    /// Joint likelihood specification (response + parameterized link).
+    likelihood: LikelihoodSpec,
     /// Dimension of β
     n_beta: usize,
     /// Dimension of ρ
@@ -5112,8 +5132,7 @@ impl JointBetaRhoPosterior {
         hessian: ArrayView2<f64>,
         penalty_canonical: Vec<crate::construction::CanonicalPenalty>,
         rho_mode: ArrayView1<f64>,
-        likelihood_family: LikelihoodFamily,
-        inverse_link: InverseLink,
+        likelihood: LikelihoodSpec,
         gamma_shape: Option<f64>,
         rho_prior: RhoPrior,
         firth_enabled: bool,
@@ -5133,97 +5152,57 @@ impl JointBetaRhoPosterior {
             .into());
         }
 
-        match likelihood_family {
-            LikelihoodFamily::BinomialLogit => {
-                if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Logit)) {
-                    return Err(HmcError::LinkMismatch {
-                        reason: "Joint HMC BinomialLogit requires a logit inverse link".to_string(),
-                    }
-                    .into());
+        match (&likelihood.response, &likelihood.link) {
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {}
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {}
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {}
+            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {}
+            (ResponseFamily::Binomial, InverseLink::Sas(_)) => {}
+            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {}
+            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => {}
+            (ResponseFamily::Binomial, InverseLink::Standard(other)) => {
+                return Err(HmcError::LinkMismatch {
+                    reason: format!(
+                        "Joint HMC binomial response requires a binomial-compatible inverse link; got {:?}",
+                        other
+                    ),
                 }
+                .into());
             }
-            LikelihoodFamily::BinomialProbit => {
-                if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Probit)) {
-                    return Err(HmcError::LinkMismatch {
-                        reason: "Joint HMC BinomialProbit requires a probit inverse link"
-                            .to_string(),
-                    }
-                    .into());
+            (ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)) => {}
+            (ResponseFamily::Gaussian, _) => {
+                return Err(HmcError::LinkMismatch {
+                    reason: "Joint HMC Gaussian requires an identity inverse link".to_string(),
                 }
+                .into());
             }
-            LikelihoodFamily::BinomialCLogLog => {
-                if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::CLogLog)) {
-                    return Err(HmcError::LinkMismatch {
-                        reason: "Joint HMC BinomialCLogLog requires a cloglog inverse link"
-                            .to_string(),
-                    }
-                    .into());
+            (
+                ResponseFamily::Poisson
+                | ResponseFamily::Tweedie { .. }
+                | ResponseFamily::NegativeBinomial { .. }
+                | ResponseFamily::Gamma,
+                InverseLink::Standard(LinkFunction::Log),
+            ) => {}
+            (
+                ResponseFamily::Poisson
+                | ResponseFamily::Tweedie { .. }
+                | ResponseFamily::NegativeBinomial { .. }
+                | ResponseFamily::Gamma,
+                _,
+            ) => {
+                return Err(HmcError::LinkMismatch {
+                    reason: "Joint HMC log-link family requires a log inverse link".to_string(),
                 }
+                .into());
             }
-            LikelihoodFamily::BinomialLatentCLogLog => {
-                if !matches!(&inverse_link, InverseLink::LatentCLogLog(_)) {
-                    return Err(HmcError::LinkMismatch {
-                        reason:
-                            "Joint HMC BinomialLatentCLogLog requires latent cloglog link state"
-                                .to_string(),
-                    }
-                    .into());
+            (ResponseFamily::Beta { .. }, InverseLink::Standard(LinkFunction::Logit)) => {}
+            (ResponseFamily::Beta { .. }, _) => {
+                return Err(HmcError::LinkMismatch {
+                    reason: "Joint HMC Beta requires a logit inverse link".to_string(),
                 }
+                .into());
             }
-            LikelihoodFamily::BinomialSas => {
-                if !matches!(&inverse_link, InverseLink::Sas(_)) {
-                    return Err(HmcError::LinkMismatch {
-                        reason: "Joint HMC BinomialSas requires SAS link state".to_string(),
-                    }
-                    .into());
-                }
-            }
-            LikelihoodFamily::BinomialBetaLogistic => {
-                if !matches!(&inverse_link, InverseLink::BetaLogistic(_)) {
-                    return Err(HmcError::LinkMismatch {
-                        reason: "Joint HMC BinomialBetaLogistic requires Beta-Logistic link state"
-                            .to_string(),
-                    }
-                    .into());
-                }
-            }
-            LikelihoodFamily::BinomialMixture => {
-                if !matches!(&inverse_link, InverseLink::Mixture(_)) {
-                    return Err(HmcError::LinkMismatch {
-                        reason: "Joint HMC BinomialMixture requires mixture link state".to_string(),
-                    }
-                    .into());
-                }
-            }
-            LikelihoodFamily::GaussianIdentity => {
-                if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Identity)) {
-                    return Err(HmcError::LinkMismatch {
-                        reason: "Joint HMC GaussianIdentity requires an identity inverse link"
-                            .to_string(),
-                    }
-                    .into());
-                }
-            }
-            LikelihoodFamily::PoissonLog
-            | LikelihoodFamily::Tweedie { .. }
-            | LikelihoodFamily::NegativeBinomial { .. }
-            | LikelihoodFamily::GammaLog => {
-                if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Log)) {
-                    return Err(HmcError::LinkMismatch {
-                        reason: "Joint HMC log-link family requires a log inverse link".to_string(),
-                    }
-                    .into());
-                }
-            }
-            LikelihoodFamily::BetaLogit { .. } => {
-                if !matches!(&inverse_link, InverseLink::Standard(LinkFunction::Logit)) {
-                    return Err(HmcError::LinkMismatch {
-                        reason: "Joint HMC BetaLogit requires a logit inverse link".to_string(),
-                    }
-                    .into());
-                }
-            }
-            LikelihoodFamily::RoystonParmar => {
+            (ResponseFamily::RoystonParmar, _) => {
                 return Err(HmcError::UnsupportedFamily {
                     reason: "Joint HMC fallback is not implemented for RoystonParmar".to_string(),
                 }
@@ -5231,13 +5210,13 @@ impl JointBetaRhoPosterior {
             }
         }
 
-        validate_firth_likelihood_support(likelihood_family, firth_enabled)
+        validate_firth_likelihood_support(&likelihood, firth_enabled)
             .map_err(String::from)?;
-        if matches!(likelihood_family, LikelihoodFamily::NegativeBinomial { .. }) {
+        if matches!(likelihood.response, ResponseFamily::NegativeBinomial { .. }) {
             validate_count_responses("negative-binomial joint HMC", &y, &weights)
                 .map_err(String::from)?;
         }
-        if likelihood_family.is_binomial() {
+        if likelihood.is_binomial() {
             validate_binary_responses("binomial joint HMC", &y, &weights).map_err(String::from)?;
         }
 
@@ -6055,7 +6034,10 @@ pub fn run_survival_nuts_sampling_flattened<'a>(
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
     run_nuts_sampling_flattened_family(
-        LikelihoodFamily::RoystonParmar,
+        LikelihoodSpec {
+            response: ResponseFamily::RoystonParmar,
+            link: InverseLink::Standard(LinkFunction::Identity),
+        },
         FamilyNutsInputs::Survival(Box::new(SurvivalNutsInputs {
             flat,
             penalties,

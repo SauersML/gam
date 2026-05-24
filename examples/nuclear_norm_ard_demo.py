@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """NuclearNormPenalty + ARDPenalty worked example.
 
-Motivation: per [[project_ard_gauge_fix_doesnt_help_cogito]], ARDPenalty
-shrinks per-canonical-axis variance and failed on cogito because the prior is
-rotation-invariant and signal spread across all dims. NuclearNormPenalty is a
-basis-free singular-value penalty: it encourages low rank without canonical
-axis alignment. The pair tests whether NuclearNorm can find the intrinsic-rank
-subspace and ARD can prune exact axes inside it. See
+Motivation: ARDPenalty shrinks per-canonical-axis variance, which is only
+informative when the latent gauge is axis-aligned; if the true signal is
+spread across an arbitrary rotation of the coordinate basis, ARD alone cannot
+identify it. NuclearNormPenalty is a basis-free singular-value penalty: it
+encourages low rank without committing to any canonical axis alignment. This
+demo composes the two penalties to test whether NuclearNorm can find the
+intrinsic-rank subspace while ARD prunes exact axes inside it. See
 ``docs/composition_engine.md#analytic-primitives``; this checkout has
 ARD/Orthogonality rows there, while NuclearNorm is documented in
 ``gamfit/_penalties.py`` until the primitives-table row lands.

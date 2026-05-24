@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """BlockOrthogonalityPenalty + AuxConditionalPriorPenalty worked example.
 
-Motivation: auto_exp_38, per memory ``project_cogito_recovery_at_d_aux_3.md``,
-found that on cogito-L40, supervising HSV-only (3 axes) while leaving 3 axes
-free made the free axes spontaneously align with name-semantic features
-(axis 4: mod_count corr 0.67), but only when a gauge-fix companion was present
-on the supervised block. Without it, ARD-alone failed across five prior
-experiments. Commit ``bazzadca2`` landed ``BlockOrthogonalityPenalty`` at
-``src/terms/analytic_penalties.rs:4648``; it enforces between-block
-orthogonality ``T_A.T @ T_B ~= 0`` while leaving within-block structure free,
-codifying the "supervised gauge-fix companion enables unsupervised discovery
+Motivation: when only part of the latent space is supervised (a "supervised
+block") and the rest is left free for unsupervised discovery, ARD on the free
+block alone is rotation-invariant and can fail to identify any axis. Adding
+a gauge-fix companion to the supervised block, combined with a between-block
+orthogonality constraint ``T_A.T @ T_B ~= 0``, breaks the rotational symmetry
+on the free block while leaving within-block structure unconstrained.
+``BlockOrthogonalityPenalty`` (see ``src/terms/analytic_penalties.rs``)
+codifies the "supervised gauge-fix companion enables unsupervised discovery
 on the free block" pattern as a Rust primitive.
 """
 

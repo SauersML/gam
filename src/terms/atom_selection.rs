@@ -90,9 +90,9 @@
 //!   *straight-through* gradient estimator (forward pass uses the
 //!   sparsified `a_n`; backward pass uses the dense gradient as if the
 //!   thresholding were the identity). This is the standard convention in
-//!   the TopK-SAE literature and matches the Manifold-SAE Curve-SAE
-//!   benchmark; the bias of the estimator is documented at
-//!   [`TopK::apply`].
+//!   the TopK-SAE literature and is the canonical choice when pairing a
+//!   discrete active-set with smooth manifold atoms; the bias of the
+//!   estimator is documented at [`TopK::apply`].
 //! * [`L1Relaxed`] — non-negative free amplitudes with a smoothed-L¹
 //!   ([`crate::terms::analytic_penalties::SparsityPenalty`]) penalty. Pairs
 //!   directly with the active-set inner solver (Piece 4) — strictly-zero
@@ -529,7 +529,7 @@ impl TopK {
     /// "dead-feature freezing" behaviour observed in TopK-SAE). Some
     /// references (e.g. Hubinger-style straight-through) pass the gradient
     /// through unmodified; the masked form is empirically better at avoiding
-    /// dead atoms (see `project_curve_sae_efficiency.md`).
+    /// dead atoms.
     pub fn backward_straight_through(
         &self,
         code: &SparseAtomCode,

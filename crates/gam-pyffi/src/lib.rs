@@ -77,7 +77,7 @@ use gam::terms::{
     TopKActivationPenalty, TotalVariationPenalty,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
-use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
 use numpy::{
@@ -1536,7 +1536,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
             offset_zero.view(),
             &s_list,
             heuristic_slice,
-            gam::types::LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)),
             &opts,
         )
     })?;
@@ -2552,7 +2552,7 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
                 offset_zero.view(),
                 &s_list,
                 heuristic_slice,
-                gam::types::LikelihoodFamily::GaussianIdentity,
+                LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)),
                 &opts,
             )
         },
@@ -5593,18 +5593,36 @@ fn latent_glm_family_from_str(
     tweedie_p: f64,
     negbin_theta: f64,
     beta_phi: f64,
-) -> Result<LikelihoodFamily, String> {
+) -> Result<LikelihoodSpec, String> {
     match value.to_ascii_lowercase().replace('_', "-").as_str() {
-        "gaussian" | "gaussian-identity" => Ok(LikelihoodFamily::GaussianIdentity),
-        "binomial" | "binomial-logit" | "logistic" => Ok(LikelihoodFamily::BinomialLogit),
-        "binomial-probit" | "probit" => Ok(LikelihoodFamily::BinomialProbit),
-        "binomial-cloglog" | "cloglog" => Ok(LikelihoodFamily::BinomialCLogLog),
-        "poisson" | "poisson-log" => Ok(LikelihoodFamily::PoissonLog),
+        "gaussian" | "gaussian-identity" => Ok(LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(LinkFunction::Identity),
+        )),
+        "binomial" | "binomial-logit" | "logistic" => Ok(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        )),
+        "binomial-probit" | "probit" => Ok(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Probit),
+        )),
+        "binomial-cloglog" | "cloglog" => Ok(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::CLogLog),
+        )),
+        "poisson" | "poisson-log" => Ok(LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            InverseLink::Standard(LinkFunction::Log),
+        )),
         "tweedie" | "tweedie-log" => {
             if !tweedie_p.is_finite() {
                 return Err(format!("tweedie_p must be finite; got {tweedie_p}"));
             }
-            Ok(LikelihoodFamily::Tweedie { p: tweedie_p })
+            Ok(LikelihoodSpec::new(
+                ResponseFamily::Tweedie { p: tweedie_p },
+                InverseLink::Standard(LinkFunction::Log),
+            ))
         }
         "negbin" | "negbin-log" | "negative-binomial" | "negative-binomial-log" => {
             if !(negbin_theta.is_finite() && negbin_theta > 0.0) {
@@ -5612,17 +5630,26 @@ fn latent_glm_family_from_str(
                     "negbin_theta must be finite and > 0; got {negbin_theta}"
                 ));
             }
-            Ok(LikelihoodFamily::NegativeBinomial {
-                theta: negbin_theta,
-            })
+            Ok(LikelihoodSpec::new(
+                ResponseFamily::NegativeBinomial {
+                    theta: negbin_theta,
+                },
+                InverseLink::Standard(LinkFunction::Log),
+            ))
         }
         "beta" | "beta-logit" | "beta-regression" | "beta-regression-logit" => {
             if !(beta_phi.is_finite() && beta_phi > 0.0) {
                 return Err(format!("beta_phi must be finite and > 0; got {beta_phi}"));
             }
-            Ok(LikelihoodFamily::BetaLogit { phi: beta_phi })
+            Ok(LikelihoodSpec::new(
+                ResponseFamily::Beta { phi: beta_phi },
+                InverseLink::Standard(LinkFunction::Logit),
+            ))
         }
-        "gamma" | "gamma-log" => Ok(LikelihoodFamily::GammaLog),
+        "gamma" | "gamma-log" => Ok(LikelihoodSpec::new(
+            ResponseFamily::Gamma,
+            InverseLink::Standard(LinkFunction::Log),
+        )),
         other => Err(format!(
             "unsupported latent GLM family {other:?}; supported families are gaussian-identity, binomial-logit, binomial-probit, binomial-cloglog, poisson-log, tweedie-log, negbin-log, beta-regression-logit, gamma-log"
         )),
@@ -5639,7 +5666,7 @@ fn glm_reml_fit_latent_impl(
     penalty: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,
     init_lambda: Option<f64>,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     aux_u: Option<ArrayView2<'_, f64>>,
     aux_family: AuxPriorFamily,
     aux_strength: Option<f64>,
@@ -6185,9 +6212,9 @@ fn glm_reml_fit_latent_backward<'py>(
 // `proposals/composition_engine.md` §7 audit revisions).
 //
 // Exposes the per-observation arrow-Schur Newton-direction solver to
-// Python for testing and for the prototype-stack `auto_75.py` to
-// validate the inner-loop math before the full REML driver wires up
-// auto-dispatch. The bordered system is supplied as packed arrays:
+// Python for testing and for downstream prototypes to validate the
+// inner-loop math before the full REML driver wires up auto-dispatch.
+// The bordered system is supplied as packed arrays:
 //
 //   * `htt_blocks`    — shape `(N, d, d)` per-row latent Hessian blocks.
 //   * `htbeta_blocks` — shape `(N, d, K)` per-row cross-blocks.
@@ -6773,7 +6800,7 @@ fn gaussian_reml_fit_formula_table_impl(
             );
         }
     };
-    if standard.family != LikelihoodFamily::GaussianIdentity {
+    if !standard.family.is_gaussian_identity() {
         return Err(
             "closed-form Gaussian REML formula fitting requires Gaussian identity".to_string(),
         );

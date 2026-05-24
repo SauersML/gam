@@ -102,8 +102,9 @@ use gam::term_builder::{
 };
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{
-    InverseLink, LikelihoodFamily, LikelihoodScaleMetadata, LinkComponent, LinkFunction,
-    LogLikelihoodNormalization, MixtureLinkSpec, SasLinkSpec, WigglePenaltyConfig,
+    InverseLink, LikelihoodFamily, LikelihoodScaleMetadata, LikelihoodSpec, LinkComponent,
+    LinkFunction, LogLikelihoodNormalization, MixtureLinkSpec, ResponseFamily, SasLinkSpec,
+    WigglePenaltyConfig,
 };
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
@@ -713,6 +714,34 @@ enum PredictModeArg {
 /// unchanged; the underlying source of truth now lives next to the struct
 /// whose schema it describes, eliminating drift between writer and reader.
 const MODEL_VERSION: u32 = MODEL_PAYLOAD_VERSION;
+
+/// Total mapping `LikelihoodSpec -> LikelihoodFamily` for the saved-model and
+/// downstream-API boundaries that still consume the flat legacy enum. Mirrors
+/// `inference::model::likelihood_family_from_spec`. Every `(response, link)`
+/// combination produced by fitting corresponds to exactly one legacy variant.
+fn spec_to_legacy_family(spec: &LikelihoodSpec) -> LikelihoodFamily {
+    match (&spec.response, &spec.link) {
+        (ResponseFamily::Gaussian, _) => LikelihoodFamily::GaussianIdentity,
+        (ResponseFamily::Poisson, _) => LikelihoodFamily::PoissonLog,
+        (ResponseFamily::Tweedie { p }, _) => LikelihoodFamily::Tweedie { p: *p },
+        (ResponseFamily::NegativeBinomial { theta }, _) => {
+            LikelihoodFamily::NegativeBinomial { theta: *theta }
+        }
+        (ResponseFamily::Beta { phi }, _) => LikelihoodFamily::BetaLogit { phi: *phi },
+        (ResponseFamily::Gamma, _) => LikelihoodFamily::GammaLog,
+        (ResponseFamily::RoystonParmar, _) => LikelihoodFamily::RoystonParmar,
+        (ResponseFamily::Binomial, link) => match link {
+            InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
+            InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
+            InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
+            InverseLink::Standard(_) => LikelihoodFamily::BinomialLogit,
+            InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
+            InverseLink::Sas(_) => LikelihoodFamily::BinomialSas,
+            InverseLink::BetaLogistic(_) => LikelihoodFamily::BinomialBetaLogistic,
+            InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
+        },
+    }
+}
 
 struct CliFirthValidation<'a> {
     enabled: bool,
@@ -2456,13 +2485,7 @@ fn run_fitwith_predict_noise(
         model.noise_offset_column = args.noise_offset_column.clone();
         let location_scale_likelihood_spec =
             inverse_link_to_binomial_spec(&location_scale_link_kind).map_err(|e| e.to_string())?;
-        let location_scale_likelihood = LikelihoodFamily::try_from(location_scale_likelihood_spec)
-            .map_err(|e| {
-                format!(
-                    "failed to resolve LikelihoodFamily for binomial location-scale link {:?}: {e}",
-                    location_scale_link_kind
-                )
-            })?;
+        let location_scale_likelihood = spec_to_legacy_family(&location_scale_likelihood_spec);
         model.family_state = FittedFamily::LocationScale {
             likelihood: location_scale_likelihood,
             base_link: Some(location_scale_link_kind.clone()),
@@ -7613,12 +7636,7 @@ fn build_bernoulli_marginal_slope_saved_model(
 ) -> Result<SavedModel, String> {
     let marginal_likelihood_spec =
         inverse_link_to_binomial_spec(&base_link).map_err(|e| e.to_string())?;
-    let marginal_likelihood =
-        LikelihoodFamily::try_from(marginal_likelihood_spec).map_err(|e| {
-            format!(
-                "failed to resolve LikelihoodFamily for bernoulli marginal-slope base link {base_link:?}: {e}"
-            )
-        })?;
+    let marginal_likelihood = spec_to_legacy_family(&marginal_likelihood_spec);
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
         formula,

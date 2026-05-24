@@ -2,7 +2,7 @@
 //! covariance through to predict so that `gam predict --uncertainty` works.
 //!
 //! Previously the CLI's standard fit path passed
-//! `compute_inference: !matches!(family, LikelihoodFamily::GaussianIdentity)`,
+//! `compute_inference: !family.is_gaussian_identity()`,
 //! i.e. Gaussian fits skipped covariance computation as a perf optimization.
 //! The saved model's `fit_result.covariance_conditional` field then ended
 //! up `None`, and `predict --uncertainty` errored with
