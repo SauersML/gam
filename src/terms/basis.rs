@@ -3761,7 +3761,10 @@ impl LatentCoordDesignDerivative {
         (flat_axis / d, flat_axis % d)
     }
 
-    fn unproject(&self, u: &ArrayView1<'_, f64>) -> (Array1<f64>, Array1<f64>) {
+    fn unproject(
+        &self,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<(Array1<f64>, Array1<f64>), BasisError> {
         match &self.basis {
             LatentCoordDesignDerivativeBasis::Radial {
                 ident_transform,
@@ -3782,29 +3785,37 @@ impl LatentCoordDesignDerivative {
                 let poly = after_full
                     .slice(s![p_constrained..p_constrained + *n_poly])
                     .to_owned();
-                (raw_knot, poly)
+                Ok((raw_knot, poly))
             }
-            LatentCoordDesignDerivativeBasis::Jet { .. } => {
-                unreachable!("jet derivatives use unproject_jet")
-            }
+            LatentCoordDesignDerivativeBasis::Jet { .. } => Err(BasisError::InvalidInput(
+                "LatentCoordDesignDerivative::unproject called on Jet basis; \
+                 jet derivatives must route through unproject_jet"
+                    .to_string(),
+            )),
         }
     }
 
-    fn unproject_jet(&self, u: &ArrayView1<'_, f64>) -> Array1<f64> {
+    fn unproject_jet(&self, u: &ArrayView1<'_, f64>) -> Result<Array1<f64>, BasisError> {
         match &self.basis {
             LatentCoordDesignDerivativeBasis::Jet {
                 ident_transform, ..
-            } => match ident_transform {
+            } => Ok(match ident_transform {
                 Some(z) => z.dot(u),
                 None => u.to_owned(),
-            },
-            LatentCoordDesignDerivativeBasis::Radial { .. } => {
-                unreachable!("radial derivatives use unproject")
-            }
+            }),
+            LatentCoordDesignDerivativeBasis::Radial { .. } => Err(BasisError::InvalidInput(
+                "LatentCoordDesignDerivative::unproject_jet called on Radial basis; \
+                 radial derivatives must route through unproject"
+                    .to_string(),
+            )),
         }
     }
 
-    fn project_and_pad(&self, raw_knot: &Array1<f64>, raw_poly: &Array1<f64>) -> Array1<f64> {
+    fn project_and_pad(
+        &self,
+        raw_knot: &Array1<f64>,
+        raw_poly: &Array1<f64>,
+    ) -> Result<Array1<f64>, BasisError> {
         match &self.basis {
             LatentCoordDesignDerivativeBasis::Radial {
                 ident_transform,
@@ -3825,39 +3836,49 @@ impl LatentCoordDesignDerivative {
                         .slice_mut(s![constrained.len()..])
                         .assign(raw_poly);
                 }
-                match full_ident_transform {
+                Ok(match full_ident_transform {
                     Some(zf) => zf.t().dot(&padded),
                     None => padded,
-                }
+                })
             }
-            LatentCoordDesignDerivativeBasis::Jet { .. } => {
-                unreachable!("jet derivatives use project_jet")
-            }
+            LatentCoordDesignDerivativeBasis::Jet { .. } => Err(BasisError::InvalidInput(
+                "LatentCoordDesignDerivative::project_and_pad called on Jet basis; \
+                 jet derivatives must route through project_jet"
+                    .to_string(),
+            )),
         }
     }
 
-    fn project_jet(&self, raw_knot: &Array1<f64>) -> Array1<f64> {
+    fn project_jet(&self, raw_knot: &Array1<f64>) -> Result<Array1<f64>, BasisError> {
         match &self.basis {
             LatentCoordDesignDerivativeBasis::Jet {
                 ident_transform, ..
-            } => match ident_transform {
+            } => Ok(match ident_transform {
                 Some(z) => z.t().dot(raw_knot),
                 None => raw_knot.clone(),
-            },
-            LatentCoordDesignDerivativeBasis::Radial { .. } => {
-                unreachable!("radial derivatives use project_and_pad")
-            }
+            }),
+            LatentCoordDesignDerivativeBasis::Radial { .. } => Err(BasisError::InvalidInput(
+                "LatentCoordDesignDerivative::project_jet called on Radial basis; \
+                 radial derivatives must route through project_and_pad"
+                    .to_string(),
+            )),
         }
     }
 
     fn kernel_axis_scalar(&self, row: usize, center: usize, axis: usize) -> Result<f64, BasisError> {
-        let LatentCoordDesignDerivativeBasis::Radial {
-            centers,
-            radial_kind,
-            ..
-        } = &self.basis
-        else {
-            unreachable!("jet derivatives do not use radial kernel scalar")
+        let (centers, radial_kind) = match &self.basis {
+            LatentCoordDesignDerivativeBasis::Radial {
+                centers,
+                radial_kind,
+                ..
+            } => (centers, radial_kind),
+            LatentCoordDesignDerivativeBasis::Jet { .. } => {
+                return Err(BasisError::InvalidInput(
+                    "LatentCoordDesignDerivative::kernel_axis_scalar called on Jet basis; \
+                     this helper is radial-only"
+                        .to_string(),
+                ));
+            }
         };
         let t_row = self.latent.row(row);
         let mut r2 = 0.0_f64;
@@ -3934,7 +3955,7 @@ impl LatentCoordDesignDerivative {
         let (row, axis) = self.row_axis(flat_axis);
         let value = match &self.basis {
             LatentCoordDesignDerivativeBasis::Radial { centers, .. } => {
-                let (u_knot, u_poly) = self.unproject(u);
+                let (u_knot, u_poly) = self.unproject(u)?;
                 let mut value = 0.0_f64;
                 for center in 0..centers.nrows() {
                     value += self.kernel_axis_scalar(row, center, axis)? * u_knot[center];
@@ -3944,7 +3965,7 @@ impl LatentCoordDesignDerivative {
                 value
             }
             LatentCoordDesignDerivativeBasis::Jet { jet, .. } => {
-                let u_knot = self.unproject_jet(u);
+                let u_knot = self.unproject_jet(u)?;
                 let mut value = 0.0_f64;
                 for basis_col in 0..jet.shape()[1] {
                     value += jet[[row, basis_col, axis]] * u_knot[basis_col];
@@ -3975,7 +3996,7 @@ impl LatentCoordDesignDerivative {
                     }
                 }
                 let raw_poly = self.polynomial_axis_values(row, axis).mapv(|value| scale * value);
-                Ok(self.project_and_pad(&raw_knot, &raw_poly))
+                self.project_and_pad(&raw_knot, &raw_poly)
             }
             LatentCoordDesignDerivativeBasis::Jet { jet, .. } => {
                 let mut raw_knot = Array1::<f64>::zeros(jet.shape()[1]);
@@ -3984,7 +4005,7 @@ impl LatentCoordDesignDerivative {
                         raw_knot[basis_col] = scale * jet[[row, basis_col, axis]];
                     }
                 }
-                Ok(self.project_jet(&raw_knot))
+                self.project_jet(&raw_knot)
             }
         }
     }
@@ -3999,14 +4020,14 @@ impl LatentCoordDesignDerivative {
                     raw_knot[center] = self.kernel_axis_scalar(row, center, axis)?;
                 }
                 let raw_poly = self.polynomial_axis_values(row, axis);
-                self.project_and_pad(&raw_knot, &raw_poly)
+                self.project_and_pad(&raw_knot, &raw_poly)?
             }
             LatentCoordDesignDerivativeBasis::Jet { jet, .. } => {
                 let mut raw_knot = Array1::<f64>::zeros(jet.shape()[1]);
                 for basis_col in 0..jet.shape()[1] {
                     raw_knot[basis_col] = jet[[row, basis_col, axis]];
                 }
-                self.project_jet(&raw_knot)
+                self.project_jet(&raw_knot)?
             }
         };
         let mut out = Array2::<f64>::zeros((self.n_data(), projected.len()));

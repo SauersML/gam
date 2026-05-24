@@ -4165,50 +4165,6 @@ impl<'a> RemlState<'a> {
         (penalty_subspace.rank, log_det)
     }
 
-    /// Compute the structural penalty rank and exact pseudo-logdet log|S|₊.
-    ///
-    /// Uses the exact pseudo-logdet on the positive eigenspace:
-    ///   L(S) = Σ_{σ_i > ε} log σ_i
-    /// where ε is a relative threshold identifying the structural nullspace
-    /// directly from the eigenspectrum. No δ-regularization or nullity metadata.
-    ///
-    /// For S(ρ) = Σ exp(ρ_k) S_k with S_k ⪰ 0, the nullspace N(S) = ∩_k N(S_k)
-    /// is structurally fixed, so this is C∞ in ρ. The rank must come from the
-    /// same positive eigenspace as the pseudo-logdet; root row count overstates
-    /// rank whenever penalty blocks overlap or the root carries redundant rows.
-    #[allow(dead_code)] // INTEGRATION-HOOK(evidence): canonical penalty rank+logdet entry, consumed once REML routes evidence through evidence_grad_rho.
-    pub(super) fn fixed_subspace_penalty_rank_and_logdet(
-        &self,
-        e_transformed: &Array2<f64>,
-        ridge_passport: RidgePassport,
-    ) -> Result<(usize, f64), EstimationError> {
-        // Use the STRUCTURAL penalty rank from the canonical-penalty
-        // decomposition rather than a numerical-threshold rank assessment.
-        //
-        // Why: the threshold path (`positive_penalty_rank_and_logdet`) uses
-        // `100·p·ε_machine·max_ev` as its cutoff. With the ridge floor
-        // added to `s_lambda` above, the null-direction eigenvalues sit at
-        // `ridge` (a fixed number) while `max_ev` scales linearly with λ,
-        // so `λ × ε_machine` crossing the ridge floor flips the rank
-        // assessment between p and the true structural rank as ρ varies.
-        // The result was a step change in `penalty_rank`, which in turn
-        // toggled the rank-deficient LAML projection in the cost — a
-        // discrete cliff that biased the outer optimizer toward
-        // over-smoothed local minima (see fuzz seed=92: ~18-unit cost drop
-        // between ρ=9 and ρ=12 with no underlying smooth gradient).
-        //
-        // The structural rank is invariant in λ by construction (the
-        // basis fixes the null space), so the cost surface stays C∞ in ρ.
-        // We still take the eigh log-sum across the top
-        // `structural_rank` eigenvalues so that any column-rank-deficient
-        // basis (e.g. user-supplied data triggering a non-trivial QR
-        // pivot at construction) gets the same numerical log|S|+ as
-        // before — the only change is which eigenvalues count as
-        // "active", and that count is now anchored to the basis.
-        let penalty_subspace = self.compute_penalty_subspace(e_transformed, ridge_passport)?;
-        Ok(self.fixed_subspace_penalty_rank_and_logdet_from_subspace(&penalty_subspace))
-    }
-
     /// Compute the projected logdet `log|U_Sᵀ H U_S|_+` together with the
     /// matching trace kernel `(U_S, (U_Sᵀ H U_S)⁻¹)` — the [`PenaltySubspaceTrace`]
     /// that pairs the rank-deficient LAML cost with a gradient-consistent
@@ -4313,7 +4269,6 @@ impl<'a> RemlState<'a> {
     ///
     /// Uses the exact pseudoinverse S⁺ restricted to the positive eigenspace.
     /// Only eigenvectors in the canonical structural rank participate.
-    #[allow(dead_code)] // INTEGRATION-HOOK(evidence): paired with fixed_subspace_penalty_rank_and_logdet for ∂V/∂ρ.
     pub(super) fn fixed_subspace_penalty_trace(
         &self,
         e_transformed: &Array2<f64>,
