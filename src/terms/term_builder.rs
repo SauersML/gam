@@ -1205,6 +1205,8 @@ pub fn build_smooth_basis(
                     "id",
                     "__by_col",
                     "identifiability",
+                    "streaming_chunk_size",
+                    "chunk_size",
                     "by",
                 ],
             )?;
@@ -1289,7 +1291,8 @@ pub fn build_smooth_basis(
                     identifiability: BSplineIdentifiability::default(),
                     boundary,
                     boundary_conditions,
-                    streaming_chunk_size: None,
+                    streaming_chunk_size: option_usize(options, "streaming_chunk_size")
+                        .or_else(|| option_usize(options, "chunk_size")),
                 },
             })
         }

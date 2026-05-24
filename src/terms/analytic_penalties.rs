@@ -3756,7 +3756,7 @@ impl MechanismSparsityPenalty {
 
 impl AnalyticPenalty for MechanismSparsityPenalty {
     fn tier(&self) -> PenaltyTier {
-        PenaltyTier::Beta
+        PenaltyTier::Psi
     }
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
