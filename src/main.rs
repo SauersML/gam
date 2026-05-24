@@ -609,6 +609,11 @@ struct SampleArgs {
     )]
     warmup: Option<usize>,
     #[arg(
+        long = "seed",
+        help = "RNG seed for deterministic posterior sampling (default: 42)"
+    )]
+    seed: Option<u64>,
+    #[arg(
         long = "out",
         help = "Output path for the posterior draws (parquet); default: <model_stem>.posterior.parquet"
     )]
@@ -6064,6 +6069,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
         n_samples: args.samples.unwrap_or(adaptive.n_samples),
         nwarmup: args.warmup.unwrap_or(adaptive.nwarmup),
         n_chains: args.chains.unwrap_or(adaptive.n_chains),
+        seed: args.seed.unwrap_or(adaptive.seed),
         ..adaptive
     };
 

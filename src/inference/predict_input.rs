@@ -45,6 +45,19 @@ pub enum PredictInputError {
     /// prediction (response knots, transform, degree, calibration block,
     /// unified fit, z column, etc.).
     MissingMetadata { reason: String },
+    /// Survival-specific prediction assembly failed below this layer; the
+    /// source error keeps its own semantic variant instead of being flattened
+    /// into a generic predict-input bucket.
+    SurvivalPrediction {
+        context: &'static str,
+        source: SurvivalPredictError,
+    },
+    /// Saved-model payload validation failed below this layer; the source
+    /// error keeps its model-layer category and payload context.
+    ModelPayload {
+        context: &'static str,
+        source: FittedModelError,
+    },
 }
 
 impl std::fmt::Display for PredictInputError {
@@ -53,11 +66,27 @@ impl std::fmt::Display for PredictInputError {
             PredictInputError::InvalidInput { reason }
             | PredictInputError::DimensionMismatch { reason }
             | PredictInputError::MissingMetadata { reason } => f.write_str(reason),
+            PredictInputError::SurvivalPrediction { context, source } => {
+                write!(f, "{context}: {source}")
+            }
+            PredictInputError::ModelPayload { context, source } => {
+                write!(f, "{context}: {source}")
+            }
         }
     }
 }
 
-impl std::error::Error for PredictInputError {}
+impl std::error::Error for PredictInputError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            PredictInputError::SurvivalPrediction { source, .. } => Some(source),
+            PredictInputError::ModelPayload { source, .. } => Some(source),
+            PredictInputError::InvalidInput { .. }
+            | PredictInputError::DimensionMismatch { .. }
+            | PredictInputError::MissingMetadata { .. } => None,
+        }
+    }
+}
 
 impl From<PredictInputError> for String {
     fn from(err: PredictInputError) -> String {
@@ -79,22 +108,23 @@ impl From<String> for PredictInputError {
 impl From<SurvivalPredictError> for PredictInputError {
     /// Survival-prediction helpers (`resolve_termspec_for_prediction`,
     /// `fit_result_from_saved_model_for_prediction`) emit their own typed
-    /// errors; flatten them to `InvalidInput` preserving the rendered text.
+    /// errors; keep that typed source so `?` preserves the layer that failed.
     fn from(err: SurvivalPredictError) -> PredictInputError {
-        PredictInputError::InvalidInput {
-            reason: err.to_string(),
+        PredictInputError::SurvivalPrediction {
+            context: "predict-input survival assembly",
+            source: err,
         }
     }
 }
 
 impl From<FittedModelError> for PredictInputError {
     /// `FittedModel` payload helpers (deployment extension assembly,
-    /// calibration validation) surface model-layer errors that the
-    /// predict-input boundary forwards as `InvalidInput` with the original
-    /// rendered text.
+    /// calibration validation) surface model-layer errors that remain
+    /// chained here instead of being recategorized as request input.
     fn from(err: FittedModelError) -> PredictInputError {
-        PredictInputError::InvalidInput {
-            reason: err.to_string(),
+        PredictInputError::ModelPayload {
+            context: "predict-input model payload",
+            source: err,
         }
     }
 }

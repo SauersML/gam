@@ -1,10 +1,11 @@
 use crate::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError,
-    BasisMetadata, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy,
-    CenterStrategyKind, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
-    KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability, OneDimensionalBoundary,
-    PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability, ThinPlateBasisSpec,
-    apply_sum_to_zero_constraint, build_bspline_basis_1d, build_duchon_basis,
+    BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
+    BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError, BasisMetadata,
+    BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy, CenterStrategyKind,
+    DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, KroneckerFactoredBasis,
+    MaternBasisSpec, MaternIdentifiability, OneDimensionalBoundary, PenaltyCandidate, PenaltyInfo,
+    PenaltySource, SpatialIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
+    build_bspline_basis_1d, build_duchon_basis,
     build_duchon_basis_log_kappa_aniso_derivatives, build_duchon_basis_log_kappa_derivatives,
     build_duchon_basiswithworkspace, build_matern_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
@@ -5629,19 +5630,19 @@ fn bspline_boundary_endpoint(
 fn bspline_endpoint_row(
     knots: &Array1<f64>,
     degree: usize,
-    condition: BSplineEndpointCondition,
+    condition: BSplineEndpointBoundaryCondition,
     right: bool,
     identifiability_transform: Option<&Array2<f64>>,
     coefficient_transform: Option<&Array2<f64>>,
 ) -> Result<Option<(Array1<f64>, f64)>, BasisError> {
     let derivative_order = match condition {
-        BSplineEndpointCondition::None => return Ok(None),
-        BSplineEndpointCondition::Clamped => 1,
-        BSplineEndpointCondition::Anchored { .. } => 0,
+        BSplineEndpointBoundaryCondition::Free => return Ok(None),
+        BSplineEndpointBoundaryCondition::Clamped => 1,
+        BSplineEndpointBoundaryCondition::Anchored { .. } => 0,
     };
     let target = match condition {
-        BSplineEndpointCondition::None | BSplineEndpointCondition::Clamped => 0.0,
-        BSplineEndpointCondition::Anchored { value } => value,
+        BSplineEndpointBoundaryCondition::Free | BSplineEndpointBoundaryCondition::Clamped => 0.0,
+        BSplineEndpointBoundaryCondition::Anchored { value } => value,
     };
     if !target.is_finite() {
         return Err(BasisError::InvalidInput(
@@ -5686,12 +5687,12 @@ fn bspline_endpoint_row(
 }
 
 fn bspline_boundary_linear_constraints(
-    boundary: BSplineBoundaryCondition,
+    boundary_conditions: BSplineBoundaryConditions,
     metadata: &BasisMetadata,
     degree: usize,
     coefficient_transform: Option<&Array2<f64>>,
 ) -> Result<Option<LinearInequalityConstraints>, BasisError> {
-    if boundary.is_unconstrained() {
+    if boundary_conditions.is_free() {
         return Ok(None);
     }
     let BasisMetadata::BSpline1D {
@@ -5707,7 +5708,10 @@ fn bspline_boundary_linear_constraints(
 
     let mut eq_rows = Vec::<Array1<f64>>::new();
     let mut eq_targets = Vec::<f64>::new();
-    for (cond, right) in [(boundary.left, false), (boundary.right, true)] {
+    for (cond, right) in [
+        (boundary_conditions.left, false),
+        (boundary_conditions.right, true),
+    ] {
         if let Some((row, target)) = bspline_endpoint_row(
             knots,
             degree,
@@ -6335,7 +6339,7 @@ fn build_single_local_smooth_term(
     };
     let boundary_linear_constraints = match &term.basis {
         SmoothBasisSpec::BSpline1D { spec, .. } => bspline_boundary_linear_constraints(
-            spec.boundary_condition,
+            spec.boundary_conditions,
             &metadata,
             spec.degree,
             coefficient_transform_for_constraints.as_ref(),
@@ -18979,10 +18983,9 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
 mod tests {
     use super::*;
     use crate::basis::{
-        BSplineBasisSpec, BSplineBoundaryCondition, BSplineEndpointCondition,
-        BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
-        DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
-        MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
+        BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy,
+        DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec,
+        MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
     };
     use crate::estimate::AdaptiveRegularizationOptions;
     use crate::faer_ndarray::{FaerEigh, FaerSvd};
