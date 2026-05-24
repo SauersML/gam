@@ -143,8 +143,7 @@ fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodFamily) -> O
     if let LikelihoodFamily::BetaLogit { phi } = family {
         return Some(phi);
     }
-    let spec: crate::types::LikelihoodSpec = family.into();
-    if matches!(spec.response, crate::types::ResponseFamily::Gamma) {
+    if matches!(family, LikelihoodFamily::GammaLog) {
         fit.likelihood_scale
             .gamma_shape()
             .or(Some(fit.standard_deviation))

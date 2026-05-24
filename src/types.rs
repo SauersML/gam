@@ -256,11 +256,9 @@ impl ResponseFamily {
 
 /// Unified likelihood specification: response distribution + parameterized link.
 ///
-/// This is the target replacement for `LikelihoodFamily`. During migration both
-/// types coexist; `From<LikelihoodFamily> for LikelihoodSpec` decomposes a
-/// legacy variant into the (response, link) pair, and
-/// `TryFrom<LikelihoodSpec> for LikelihoodFamily` reconstructs a legacy variant
-/// when one exists.
+/// `ResponseFamily` carries the per-family scalars (Tweedie p, NegBin theta,
+/// Beta phi); `InverseLink` carries the parameterized link state. Together
+/// they replace the flat legacy `LikelihoodFamily` enum.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LikelihoodSpec {
     pub response: ResponseFamily,
@@ -330,110 +328,6 @@ impl LikelihoodSpec {
             | ResponseFamily::NegativeBinomial { .. }
             | ResponseFamily::Beta { .. } => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
             ResponseFamily::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
-        }
-    }
-}
-
-impl From<LikelihoodFamily> for LikelihoodSpec {
-    fn from(value: LikelihoodFamily) -> Self {
-        let response = match value {
-            LikelihoodFamily::GaussianIdentity => ResponseFamily::Gaussian,
-            LikelihoodFamily::PoissonLog => ResponseFamily::Poisson,
-            LikelihoodFamily::Tweedie { .. } => ResponseFamily::Tweedie,
-            LikelihoodFamily::NegativeBinomial { .. } => ResponseFamily::NegativeBinomial,
-            LikelihoodFamily::BetaLogit { .. } => ResponseFamily::Beta,
-            LikelihoodFamily::GammaLog => ResponseFamily::Gamma,
-            LikelihoodFamily::RoystonParmar => ResponseFamily::RoystonParmar,
-            LikelihoodFamily::BinomialLogit
-            | LikelihoodFamily::BinomialProbit
-            | LikelihoodFamily::BinomialCLogLog
-            | LikelihoodFamily::BinomialLatentCLogLog
-            | LikelihoodFamily::BinomialSas
-            | LikelihoodFamily::BinomialBetaLogistic
-            | LikelihoodFamily::BinomialMixture => ResponseFamily::Binomial,
-        };
-        // For the standard scalar-link variants we can build a Standard(link)
-        // directly. For the parameterized variants we synthesize a default
-        // state, since the legacy `LikelihoodFamily` does not carry one. Call
-        // sites that need the real parameterized state must build
-        // `LikelihoodSpec` directly with the live `InverseLink`.
-        let link = match value {
-            LikelihoodFamily::GaussianIdentity | LikelihoodFamily::RoystonParmar => {
-                InverseLink::Standard(LinkFunction::Identity)
-            }
-            LikelihoodFamily::PoissonLog
-            | LikelihoodFamily::Tweedie { .. }
-            | LikelihoodFamily::NegativeBinomial { .. }
-            | LikelihoodFamily::BetaLogit { .. }
-            | LikelihoodFamily::GammaLog => InverseLink::Standard(value.link_function()),
-            LikelihoodFamily::BinomialLogit => InverseLink::Standard(LinkFunction::Logit),
-            LikelihoodFamily::BinomialProbit => InverseLink::Standard(LinkFunction::Probit),
-            LikelihoodFamily::BinomialCLogLog => InverseLink::Standard(LinkFunction::CLogLog),
-            LikelihoodFamily::BinomialLatentCLogLog => {
-                InverseLink::LatentCLogLog(LatentCLogLogState { latent_sd: 0.0 })
-            }
-            LikelihoodFamily::BinomialSas => InverseLink::Sas(SasLinkState {
-                epsilon: 0.0,
-                log_delta: 0.0,
-                delta: 1.0,
-            }),
-            LikelihoodFamily::BinomialBetaLogistic => InverseLink::BetaLogistic(SasLinkState {
-                epsilon: 0.0,
-                log_delta: 0.0,
-                delta: 1.0,
-            }),
-            LikelihoodFamily::BinomialMixture => InverseLink::Mixture(MixtureLinkState {
-                components: Vec::new(),
-                rho: Array1::zeros(0),
-                pi: Array1::zeros(0),
-            }),
-        };
-        Self { response, link }
-    }
-}
-
-impl TryFrom<LikelihoodSpec> for LikelihoodFamily {
-    type Error = &'static str;
-
-    fn try_from(value: LikelihoodSpec) -> Result<Self, Self::Error> {
-        match (value.response, &value.link) {
-            (ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)) => {
-                Ok(Self::GaussianIdentity)
-            }
-            (ResponseFamily::Poisson, InverseLink::Standard(LinkFunction::Log)) => {
-                Ok(Self::PoissonLog)
-            }
-            (ResponseFamily::Tweedie, InverseLink::Standard(LinkFunction::Log)) => {
-                Ok(Self::Tweedie { p: 1.5 })
-            }
-            (ResponseFamily::NegativeBinomial, InverseLink::Standard(LinkFunction::Log)) => {
-                Ok(Self::NegativeBinomial { theta: 1.0 })
-            }
-            (ResponseFamily::Beta, InverseLink::Standard(LinkFunction::Logit)) => {
-                Ok(Self::BetaLogit { phi: 1.0 })
-            }
-            (ResponseFamily::Gamma, InverseLink::Standard(LinkFunction::Log)) => Ok(Self::GammaLog),
-            (ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)) => {
-                Ok(Self::RoystonParmar)
-            }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
-                Ok(Self::BinomialLogit)
-            }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
-                Ok(Self::BinomialProbit)
-            }
-            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
-                Ok(Self::BinomialCLogLog)
-            }
-            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
-                Ok(Self::BinomialLatentCLogLog)
-            }
-            (ResponseFamily::Binomial, InverseLink::Sas(_)) => Ok(Self::BinomialSas),
-            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
-                Ok(Self::BinomialBetaLogistic)
-            }
-            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => Ok(Self::BinomialMixture),
-            _ => Err("no legacy LikelihoodFamily variant matches this (response, link) pair"),
         }
     }
 }
