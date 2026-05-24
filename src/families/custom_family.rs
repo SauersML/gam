@@ -2753,6 +2753,9 @@ struct CachedInnerMode {
     block_logdet_h: f64,
     block_logdet_s: f64,
     joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    kkt_residual: Option<crate::estimate::reml::unified::ProjectedKktResidual>,
+    active_constraints:
+        Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
 }
 
 fn screened_outer_warm_start<'a>(
@@ -2793,6 +2796,8 @@ fn cached_inner_mode_from_result(result: &BlockwiseInnerResult) -> CachedInnerMo
         block_logdet_h: result.block_logdet_h,
         block_logdet_s: result.block_logdet_s,
         joint_workspace: result.joint_workspace.clone(),
+        kkt_residual: result.kkt_residual.clone(),
+        active_constraints: result.active_constraints.clone(),
     }
 }
 
@@ -3016,6 +3021,14 @@ fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>(
         block_logdet_h: inner.block_logdet_h,
         block_logdet_s: inner.block_logdet_s,
         joint_workspace: None,
+        // Persistent warm-start records don't carry the KKT-residual or
+        // active-constraint diagnostics (they're not serialized on disk;
+        // they're rebuilt from the inner solve on next visit), so a
+        // restored cache replay forces the unified evaluator's IFT
+        // correction path to degrade to its no-data branch until a fresh
+        // joint-Newton pass produces them.
+        kkt_residual: None,
+        active_constraints: None,
     });
     let inner_status = cached_inner.as_ref().map_or("missing", |inner| {
         if inner.converged {
@@ -11196,7 +11209,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // a carry-over — `residual <= residual_tol` is the canonical
         // KKT certificate and the end-of-cycle test consumes it
         // directly when it fires.
-        let mut last_cycle_obj_change_below_tol = false;
 
         // Predicted-reduction tracker for the principled trust-region
         // stopping criterion (Conn-Gould-Toint, *Trust-Region Methods*,
@@ -11268,16 +11280,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let mut best_residual_seen: f64 = f64::INFINITY;
         let mut cycles_since_residual_improved: usize = 0;
         let mut tr_clamped_during_stall: bool = false;
-        let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
-        let mut prev_kkt_norm: Option<f64> = None;
-        let mut ew_pcg_log_emitted = false;
-        // Divergence early-exit: a joint-Newton iterate whose
-        // log-likelihood is frozen for several consecutive cycles while
-        // |δ|∞ is clamped at the family safeguard is moving but not
-        // making progress; bail out rather than burn the cycle budget.
-        let mut prev_log_likelihood_for_joint_divergence_check: f64 = current_log_likelihood;
-        let mut consecutive_joint_frozen_loglik_cycles: usize = 0;
-        const JOINT_DIVERGENCE_FROZEN_LOGLIK_CYCLES: usize = 8;
+        let last_joint_math: Option<JointNewtonMathDiagnostic> = None;
+        let prev_kkt_norm: Option<f64> = None;
         // Plateau detector: count consecutive cycles whose |Δobj| sits
         // below `objective_tol`; when the streak hits the threshold
         // the linearized stall exit fires.
@@ -11328,7 +11332,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // exit `converged = false` so the outer optimizer rejects this
         // ρ evaluation immediately instead of riding the geometric tail
         // to `inner_max_cycles`.
-        let mut linearized_stall_streak: usize = 0;
 
         // The exact joint-Hessian route solves the penalized Newton system
         // directly. Extra damping must be wired through an accepted/rejected
@@ -11364,7 +11367,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let joint_constraints =
                 assemble_joint_linear_constraints(&block_constraints, &ranges, total_p)?;
             // Get joint Hessian and block gradients from the current evaluation.
-            let mut hessian_workspace_for_cycle: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> =
+            let hessian_workspace_for_cycle: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> =
                 None;
             let joint_hessian_source = if joint_workspace_requested {
                 let workspace = match cached_joint_workspace.take() {
@@ -11775,7 +11778,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // the same exact full-objective accept/reject test.
             const JOINT_TRUST_MAX_ATTEMPTS: usize = 24;
             let mut search_delta = delta.clone();
-            let mut search_joint_active_set: Option<Vec<usize>> = joint_active_set.clone();
+            let search_joint_active_set: Option<Vec<usize>> = joint_active_set.clone();
             let mut tried_preconditioned_descent = false;
             let mut model_rejects = 0usize;
             let mut likelihood_rejects = 0usize;
@@ -11908,6 +11911,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     family,
                     specs,
                     &line_search_options,
+                    options,
                     &states,
                     joint_workspace_requested && options.line_search_prefer_workspace,
                 ) {
@@ -12295,25 +12299,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 beta_inf,
             );
 
-            // Divergence early-exit. See the rationale block above the
-            // loop. We track current_log_likelihood (not the smoothed
-            // `objective_change`) because under a near-null mode the
-            // penalty drifts cycle-to-cycle even when the data fit is
-            // genuinely stagnant — `objective_change` would mask the
-            // divergence whereas a frozen log-likelihood is unambiguous.
-            let loglik_change_for_joint_divergence_check =
-                (current_log_likelihood - prev_log_likelihood_for_joint_divergence_check).abs();
-            let loglik_frozen_tol_for_joint_divergence_check =
-                inner_tol * (1.0 + current_log_likelihood.abs());
-            let step_clamped_for_joint_divergence_check = step_inf >= 0.95 * MAX_JOINT_STEP;
-            if loglik_change_for_joint_divergence_check
-                <= loglik_frozen_tol_for_joint_divergence_check
-                && step_clamped_for_joint_divergence_check
-            {
-                consecutive_joint_frozen_loglik_cycles += 1;
-            } else {
-                consecutive_joint_frozen_loglik_cycles = 0;
-            }
             if verbose_cycle || near_convergence {
                 log::info!(
                     "[PIRLS/JN] cyc={:>3}/{} obj={:.6e} -loglik={:.6e} pen={:.3e} Δobj={:+.3e} |δ|∞={:.3e} accepted_|δ|∞={:.3e} resid={:.3e} (tol={:.3e}) obj_tol={:.3e} step_tol={:.3e} |β|∞={:.3e} attempts={} t={:.3}s",
@@ -12803,7 +12788,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_logdet_s,
                 s_lambdas,
                 joint_workspace: cached_joint_workspace.clone(),
-                kkt_residual: Some(kkt_residual),
+                kkt_residual,
                 active_constraints,
             });
         }

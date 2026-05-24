@@ -7079,13 +7079,6 @@ fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
             spec.identifiability,
             TensorBSplineIdentifiability::FrozenTransform { .. }
         ),
-        SmoothBasisSpec::ByVariable { inner, .. } => {
-            smooth_has_frozen_identifiability(&SmoothTermSpec {
-                name: term.name.clone(),
-                basis: (**inner).clone(),
-                shape: term.shape,
-            })
-        }
     }
 }
 
@@ -13626,7 +13619,10 @@ fn try_build_spatial_term_log_kappa_derivative(
         SmoothBasisSpec::BSpline1D { .. }
         | SmoothBasisSpec::TensorBSpline { .. }
         | SmoothBasisSpec::ByVariable { .. }
-        | SmoothBasisSpec::FactorSumToZero { .. } => {
+        | SmoothBasisSpec::FactorSumToZero { .. }
+        | SmoothBasisSpec::BySmooth { .. }
+        | SmoothBasisSpec::FactorSmooth { .. }
+        | SmoothBasisSpec::Pca { .. } => {
             return Ok(None);
         }
     };
