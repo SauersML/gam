@@ -10939,6 +10939,11 @@ pub fn closed_form_aniso_psi_derivatives_in_total_basis(
                     q, p_order, s_order, kappa, eta_raw, &powers, &r_buf,
                 )
             };
+            // SAFETY: g_row plus each g_eta*/g_eta2* row pointer was
+            // resolved to lower_triangular_offset(i) of its k(k+1)/2
+            // buffer at the top of this iteration; the writes at offset j
+            // stay within row i, owned exclusively by this rayon iter.
+            // cross_pairs.len() matches the count of g_eta2_cross_rows.
             unsafe {
                 *g_row.add(j) = bundle.value;
                 for a in 0..d {
