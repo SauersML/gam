@@ -1,11 +1,10 @@
-    Blocking waiting for file lock on build directory
    Compiling gam v0.2.1 (/Users/user/gam)
 error: failed to run custom build command for `gam v0.2.1 (/Users/user/gam)`
 
 Caused by:
   process didn't exit successfully: `/Users/user/gam/target/debug/build/gam-d21e4c878405adc3/build-script-build` (exit status: 1)
   --- stdout
-  cargo:rustc-env=GAM_BUILD_TIMESTAMP=1779649426
+  cargo:rustc-env=GAM_BUILD_TIMESTAMP=1779649800
   cargo:rerun-if-changed=build.rs
   cargo:rerun-if-changed=src/terms/penalties
   cargo:rerun-if-changed=/Users/user/gam/Cargo.toml
@@ -17193,23 +17192,19 @@ Caused by:
 
   --- stderr
 
-  error: 13 ban violations across 1 rule
+  error: 6 ban violations across 2 rules
 
-  ── pub(crate)/pub(super) item in src/ with ZERO consumers anywhere (no production caller, no test reference — implement a real caller or delete the item; rustc's `dead_code` lint cannot see this in a library-shaped crate)  (13 hits)
-    src/gpu/diagnostics.rs:56: [log_library_ready] pub(crate) fn log_library_ready(library: &'static str, device: &GpuDeviceInfo) {
-    src/gpu/diagnostics.rs:63: [log_library_unavailable] pub(crate) fn log_library_unavailable(library: &'static str, reason: &str) {
-    src/gpu/diagnostics.rs:80: [dispatch_decline_reason] pub(crate) fn dispatch_decline_reason(policy_reason: String) -> String {
-    src/gpu/diagnostics.rs:123: [log_gpu_success_multi] pub(crate) fn log_gpu_success_multi(
-    src/gpu/diagnostics.rs:182: [bytes_for_i32] pub(crate) const fn bytes_for_i32(len: usize) -> usize {
-    src/gpu/diagnostics.rs:193: [gemv_flops] pub(crate) const fn gemv_flops(rows: usize, cols: usize) -> u64 {
-    src/gpu/diagnostics.rs:197: [chol_flops] pub(crate) const fn chol_flops(p: usize) -> u64 {
-    src/solver/persistent_warm_start.rs:18: [CACHE_SCHEMA_VERSION] pub(crate) const CACHE_SCHEMA_VERSION: u32 = 2;
-    src/solver/estimate.rs:2516: [debug_full_h] pub(crate) fn debug_full_h(
-    src/solver/estimate.rs:2555: [debug_logdet_h_proj] pub(crate) fn debug_logdet_h_proj(
-    src/solver/estimate.rs:2587: [debug_full_eta_w_c] pub(crate) fn debug_full_eta_w_c(
-    src/solver/estimate.rs:4932: [new_for_test_unchecked] pub(crate) fn new_for_test_unchecked(parts: UnifiedFitResultParts) -> Self {
-    src/solver/estimate.rs:5641: [try_compute_continuous_smoothness_order] pub(crate) fn try_compute_continuous_smoothness_order(
+  ── cfg!(debug_assertions)  (3 hits)
+    src/solver/riemannian.rs:403: if cfg!(debug_assertions) {
+    src/solver/riemannian.rs:430: if cfg!(debug_assertions) {
+    src/solver/riemannian.rs:699: if cfg!(debug_assertions) {
+
+  ── #[cfg(test)] on src/ item (move into a private `#[cfg(test)] mod tests { ... }` / `mod test_support` / `mod tests_*` / `mod *_tests`, or delete the unused item — `#[cfg(test)]` is not a dead_code-lint escape hatch, regardless of visibility)  (3 hits)
+    src/solver/estimate.rs:2513: [impl<'a> ExternalJointHyperEvaluator<'a>] #[cfg(test)]
+    src/solver/estimate.rs:4976: [impl UnifiedFitResult] #[cfg(test)]
+    src/families/custom_family.rs:20061: [pub(crate) mod tests] #[cfg(test)]
 
   summary:
-       13  pub(crate)/pub(super) item in src/ with ZERO consumers anywhere (no production caller, no test reference — implement a real caller or delete the item; rustc's `dead_code` lint cannot see this in a library-shaped crate)
+        3  cfg!(debug_assertions)
+        3  #[cfg(test)] on src/ item (move into a private `#[cfg(test)] mod tests { ... }` / `mod test_support` / `mod tests_*` / `mod *_tests`, or delete the unused item — `#[cfg(test)]` is not a dead_code-lint escape hatch, regardless of visibility)
 

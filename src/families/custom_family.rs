@@ -20059,7 +20059,7 @@ pub(crate) fn fit_custom_family_fixed_log_lambda_warm_start<
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[derive(Clone)]
     struct BatchedOuterHessianTestFamily {
         matrix: Array2<f64>,

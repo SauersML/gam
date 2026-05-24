@@ -968,7 +968,6 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
                 problem.weights.as_ref().map(|w| w.view()),
                 problem.fit,
             )?;
-            let lambda = problem.fit.lambda;
             let n = problem.x.nrows();
             let p = problem.x.ncols();
             let d = problem.y.ncols();
