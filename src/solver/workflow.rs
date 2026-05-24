@@ -4462,7 +4462,7 @@ fn natural_latent_manifold_for_basis(
             }
         }
         crate::smooth::SmoothBasisSpec::Sphere { .. } => LatentManifold::Sphere { dim: d },
-        crate::smooth::SmoothBasisSpec::Duchon { spec, .. } if spec.periodic && d == 1 => {
+        crate::smooth::SmoothBasisSpec::Duchon { spec, .. } if spec.periodic.is_some() && d == 1 => {
             LatentManifold::Circle
         }
         crate::smooth::SmoothBasisSpec::TensorBSpline { spec, .. } => {
