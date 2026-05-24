@@ -36,7 +36,10 @@ use crate::matrix::DesignMatrix;
 use crate::solver::mixture_link::{
     InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link, softmax_last_fixedzero,
 };
-use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior, is_valid_tweedie_power};
+use crate::types::{
+    InverseLink, LikelihoodFamily, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior,
+    is_valid_tweedie_power,
+};
 use crate::visualizer::VisualizerSession;
 use faer::Side;
 use general_mcmc::generic_hmc::HamiltonianTarget;
@@ -47,6 +50,47 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+
+/// Pretty-printed name for a `LikelihoodSpec`. Mirrors the equivalent legacy
+/// `LikelihoodFamily::pretty_name` output so error messages remain stable.
+#[inline]
+fn likelihood_spec_pretty_name(spec: &LikelihoodSpec) -> &'static str {
+    match (&spec.response, &spec.link) {
+        (ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)) => {
+            "Gaussian Identity"
+        }
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => "Binomial Logit",
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+            "Binomial Probit"
+        }
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+            "Binomial CLogLog"
+        }
+        (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => "Binomial Latent CLogLog",
+        (ResponseFamily::Binomial, InverseLink::Sas(_)) => "Binomial SAS",
+        (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => "Binomial Beta-Logistic",
+        (ResponseFamily::Binomial, InverseLink::Mixture(_)) => "Binomial Mixture",
+        (ResponseFamily::Poisson, _) => "Poisson Log",
+        (ResponseFamily::Tweedie { .. }, _) => "Tweedie Log",
+        (ResponseFamily::NegativeBinomial { .. }, _) => "Negative Binomial Log",
+        (ResponseFamily::Beta { .. }, _) => "Beta Logit",
+        (ResponseFamily::Gamma, _) => "Gamma Log",
+        (ResponseFamily::RoystonParmar, _) => "Royston-Parmar",
+        _ => "Unsupported Likelihood",
+    }
+}
+
+/// Only Binomial Logit supports Firth bias reduction.
+#[inline]
+fn likelihood_spec_supports_firth(spec: &LikelihoodSpec) -> bool {
+    matches!(
+        (&spec.response, &spec.link),
+        (
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        )
+    )
+}
 
 /// Typed error variants for the HMC / NUTS sampling module.
 ///

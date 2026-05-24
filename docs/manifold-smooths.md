@@ -26,12 +26,6 @@ observations. Right panel: the fitted surface.
 ![rotating-shape demo of six geometric smooths recovered from noisy 3-D
 point clouds](images/geometric_shapes_demo.gif){ width="100%" }
 
-Slower MP4 (first half of the loop, 2/3 speed):
-
-<video controls autoplay loop muted playsinline width="100%">
-  <source src="../images/geometric_shapes_demo_slow.mp4" type="video/mp4">
-</video>
-
 The script writes a full-length MP4 alongside the GIF and PNG. See
 [reproduction recipe](#reproducing-the-demo) below.
 
