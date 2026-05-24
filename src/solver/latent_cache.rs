@@ -29,7 +29,6 @@ use crate::terms::smooth::TermCollectionDesign;
 
 const DEFAULT_LATENT_CACHE_CAPACITY: usize = 4;
 const DEFAULT_PERSISTENT_LATENT_CACHE_CAPACITY: usize = 16;
-const DISABLE_PERSISTENT_LATENT_CACHE_ENV: &str = "GAMFIT_DISABLE_PERSISTENT_LATENT_CACHE";
 
 static PERSISTENT_LATENT_DESIGN_CACHE: OnceLock<Mutex<PersistentLatentDesignCache>> =
     OnceLock::new();
@@ -768,9 +767,6 @@ fn lookup_persistent_latent_design(
     latent_metadata_digest: CacheDigest,
     fingerprint: &LatentFingerprint,
 ) -> Result<Option<Arc<CachedDesign>>, EstimationError> {
-    if persistent_latent_cache_disabled() {
-        return Ok(None);
-    }
     let cache = PERSISTENT_LATENT_DESIGN_CACHE
         .get_or_init(|| Mutex::new(PersistentLatentDesignCache::default()));
     let mut guard = cache.lock().map_err(|_| {
@@ -780,9 +776,6 @@ fn lookup_persistent_latent_design(
 }
 
 fn insert_persistent_latent_design(cached: Arc<CachedDesign>) -> Result<(), EstimationError> {
-    if persistent_latent_cache_disabled() {
-        return Ok(());
-    }
     let cache = PERSISTENT_LATENT_DESIGN_CACHE
         .get_or_init(|| Mutex::new(PersistentLatentDesignCache::default()));
     let mut guard = cache.lock().map_err(|_| {
@@ -790,12 +783,6 @@ fn insert_persistent_latent_design(cached: Arc<CachedDesign>) -> Result<(), Esti
     })?;
     guard.insert(cached);
     Ok(())
-}
-
-fn persistent_latent_cache_disabled() -> bool {
-    std::env::var(DISABLE_PERSISTENT_LATENT_CACHE_ENV)
-        .map(|value| value == "1")
-        .unwrap_or(false)
 }
 
 fn latent_bits(latent: &LatentCoordValues) -> Arc<[u64]> {
