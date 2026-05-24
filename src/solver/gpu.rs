@@ -136,41 +136,26 @@ fn log_auto_fallback_once(operation: GpuOperation, reason: &str) {
     once.call_once(|| log::info!("GPU auto fallback for {}: {reason}", operation.label()));
 }
 
-/// Compile-time flag for hot-path GPU stage timing. Off in production; flip
-/// to `true` locally when investigating GPU vs. CPU latency. There is no
-/// runtime env override — see [`crate::gpu::GpuStageTimer`] for the
-/// always-on workload-tagged timer used by the dispatch layer.
-const GPU_STAGE_TIMING_ENABLED: bool = false;
-
-/// Lightweight event timer for hot-path instrumentation. Gated on the
-/// [`GPU_STAGE_TIMING_ENABLED`] compile-time flag.
+/// Lightweight event timer for hot-path GPU instrumentation. The `Drop`
+/// impl is intentionally a no-op: callers that want timing logs should
+/// route through [`crate::gpu::GpuStageTimer`] which carries workload
+/// context and feeds the dispatch-layer aggregator. This type exists only
+/// so the dispatch sites that need an [`Instant`]-style local timer (for
+/// `elapsed()` checks against routing thresholds) avoid hand-rolling the
+/// `Instant::now()` capture and still share the same callsite vocabulary.
 pub struct GpuStageTimer {
-    label: &'static str,
     start: Instant,
 }
 
 impl GpuStageTimer {
-    pub fn start(label: &'static str) -> Self {
+    pub fn start(_label: &'static str) -> Self {
         Self {
-            label,
             start: Instant::now(),
         }
     }
 
     pub fn elapsed(&self) -> Duration {
         self.start.elapsed()
-    }
-}
-
-impl Drop for GpuStageTimer {
-    fn drop(&mut self) {
-        if GPU_STAGE_TIMING_ENABLED {
-            log::info!(
-                "[gpu-timing] {} {:.3} ms",
-                self.label,
-                self.elapsed().as_secs_f64() * 1e3
-            );
-        }
     }
 }
 

@@ -2133,10 +2133,13 @@ struct ProjectedFactorInProgress {
     state: Mutex<Option<ProjectedFactorInProgressState>>,
     ready: Condvar,
     /// Number of threads currently parked inside the `Wait` branch for this
-    /// in-progress slot. Producer panics-recovery tests poll this to know
-    /// when subscribers have actually entered the condvar wait — without
-    /// relying on `thread::sleep` to mask the race window.
+    /// in-progress slot. Producer panics-recovery tests use this to block
+    /// (via [`subscriber_arrived`]) on subscriber arrival deterministically.
     waiter_count: std::sync::atomic::AtomicUsize,
+    /// Notifies once a subscriber has incremented `waiter_count`. Producer
+    /// panics-recovery tests park on this condvar so they don't have to
+    /// spin or sleep waiting for the race window to close.
+    subscriber_arrived: (Mutex<()>, Condvar),
 }
 
 enum ProjectedFactorInProgressState {
@@ -2197,6 +2200,66 @@ impl ProjectedFactorCache {
             .unwrap_or(0)
     }
 
+    /// Block (up to `timeout`) until at least one waiter has subscribed to
+    /// the in-progress slot for `key`. Returns `true` if a subscriber was
+    /// observed before the deadline, `false` on timeout. Test-only API used
+    /// by the producer-panic recovery test so it does not need to spin or
+    /// sleep waiting for the subscribe race window to close.
+    #[cfg(test)]
+    pub fn wait_for_subscriber(
+        &self,
+        key: ProjectedFactorKey,
+        timeout: std::time::Duration,
+    ) -> bool {
+        let marker = {
+            let inner = self
+                .inner
+                .lock()
+                .expect("projected factor cache lock poisoned");
+            match inner.in_progress.get(&key) {
+                Some(m) => Arc::clone(m),
+                None => return false,
+            }
+        };
+        if marker
+            .waiter_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+        {
+            return true;
+        }
+        let (lock, cv) = &marker.subscriber_arrived;
+        let mut guard = lock
+            .lock()
+            .expect("subscriber-arrived notification lock poisoned");
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if marker
+                .waiter_count
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0
+            {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next_guard, result) = cv
+                .wait_timeout(guard, deadline - now)
+                .expect("subscriber-arrived wait poisoned");
+            guard = next_guard;
+            if result.timed_out()
+                && marker
+                    .waiter_count
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == 0
+            {
+                return false;
+            }
+        }
+    }
+
     pub fn get_or_insert_with(
         &self,
         key: ProjectedFactorKey,
@@ -2225,6 +2288,7 @@ impl ProjectedFactorCache {
                     state: Mutex::new(None),
                     ready: Condvar::new(),
                     waiter_count: std::sync::atomic::AtomicUsize::new(0),
+                    subscriber_arrived: (Mutex::new(()), Condvar::new()),
                 });
                 inner.in_progress.insert(key, marker.clone());
                 CacheLookup::Compute(marker)
@@ -2237,6 +2301,12 @@ impl ProjectedFactorCache {
                 marker
                     .waiter_count
                     .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let (lock, cv) = &marker.subscriber_arrived;
+                drop(
+                    lock.lock()
+                        .expect("subscriber-arrived notification lock poisoned"),
+                );
+                cv.notify_all();
                 let mut guard = marker
                     .state
                     .lock()
@@ -16933,17 +17003,13 @@ mod tests {
             .is_err()
         });
 
-        // Spin until the waiter has parked inside the Wait branch, then
-        // release the producer to panic. `yield_now` keeps the wait bounded
-        // without burning a core.
-        let waited_at = std::time::Instant::now();
-        while cache.pending_waiters_for(key) == 0 {
-            assert!(
-                waited_at.elapsed() < std::time::Duration::from_secs(5),
-                "waiter never subscribed to the in-progress slot"
-            );
-            std::thread::yield_now();
-        }
+        // Block on the cache's subscriber-arrived condvar until the waiter
+        // has parked inside the Wait branch, then release the producer to
+        // panic. No spinning, no sleeping — purely event-driven.
+        assert!(
+            cache.wait_for_subscriber(key, std::time::Duration::from_secs(5)),
+            "waiter never subscribed to the in-progress slot"
+        );
         release_tx.send(()).expect("release producer");
 
         assert!(producer.join().expect("producer thread joined"));
