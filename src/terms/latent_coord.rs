@@ -62,6 +62,7 @@
 //!
 //! `IsometryToReference` is deferred to a follow-up (see proposal §4(b)).
 
+use crate::solver::latent_cache::LatentRetractionRegistry;
 use crate::terms::basis::{BasisError, RadialScalarKind};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -593,6 +594,8 @@ pub struct LatentCoordValues {
     id_mode: LatentIdMode,
     /// Manifold used for per-row Riemannian updates.
     manifold: LatentManifold,
+    /// Explicit update-side retraction. The empty registry is Euclidean.
+    retraction_registry: LatentRetractionRegistry,
 }
 
 impl LatentCoordValues {
@@ -607,9 +610,26 @@ impl LatentCoordValues {
         id_mode: LatentIdMode,
         manifold: LatentManifold,
     ) -> Self {
+        Self::from_matrix_with_manifold_and_retraction(
+            matrix,
+            id_mode,
+            manifold,
+            LatentRetractionRegistry::all_euclidean(),
+        )
+    }
+
+    pub(crate) fn from_matrix_with_manifold_and_retraction(
+        matrix: ArrayView2<'_, f64>,
+        id_mode: LatentIdMode,
+        manifold: LatentManifold,
+        retraction_registry: LatentRetractionRegistry,
+    ) -> Self {
         id_mode.reject_dim_selection_alone();
         let n_obs = matrix.nrows();
         let latent_dim = matrix.ncols();
+        retraction_registry
+            .validate_dim(latent_dim, "LatentCoordValues::from_matrix_with_manifold")
+            .expect("invalid latent retraction dimension");
         let mut values = Array1::<f64>::zeros(n_obs * latent_dim);
         for n in 0..n_obs {
             for k in 0..latent_dim {
@@ -623,6 +643,7 @@ impl LatentCoordValues {
             latent_dim,
             id_mode,
             manifold,
+            retraction_registry,
         };
         out.project_all_rows_to_manifold();
         out
@@ -646,12 +667,13 @@ impl LatentCoordValues {
         id_mode: LatentIdMode,
         manifold: LatentManifold,
     ) -> Self {
-        Self::from_flat_with_manifold_and_id(
+        Self::from_flat_with_manifold_and_retraction_and_id(
             values,
             n_obs,
             latent_dim,
             id_mode,
             manifold,
+            LatentRetractionRegistry::all_euclidean(),
             next_latent_coord_id(),
         )
     }
@@ -664,6 +686,26 @@ impl LatentCoordValues {
         manifold: LatentManifold,
         id: u64,
     ) -> Self {
+        Self::from_flat_with_manifold_and_retraction_and_id(
+            values,
+            n_obs,
+            latent_dim,
+            id_mode,
+            manifold,
+            LatentRetractionRegistry::all_euclidean(),
+            id,
+        )
+    }
+
+    pub(crate) fn from_flat_with_manifold_and_retraction_and_id(
+        values: Array1<f64>,
+        n_obs: usize,
+        latent_dim: usize,
+        id_mode: LatentIdMode,
+        manifold: LatentManifold,
+        retraction_registry: LatentRetractionRegistry,
+        id: u64,
+    ) -> Self {
         id_mode.reject_dim_selection_alone();
         debug_assert_eq!(
             values.len(),
@@ -672,6 +714,9 @@ impl LatentCoordValues {
             values.len(),
             n_obs * latent_dim
         );
+        retraction_registry
+            .validate_dim(latent_dim, "LatentCoordValues::from_flat_with_manifold")
+            .expect("invalid latent retraction dimension");
         let mut out = Self {
             id,
             values,
@@ -679,6 +724,7 @@ impl LatentCoordValues {
             latent_dim,
             id_mode,
             manifold,
+            retraction_registry,
         };
         out.project_all_rows_to_manifold();
         out
@@ -713,13 +759,33 @@ impl LatentCoordValues {
         &self.manifold
     }
 
+    pub(crate) fn retraction_registry(&self) -> &LatentRetractionRegistry {
+        &self.retraction_registry
+    }
+
     pub fn with_manifold(&self, manifold: LatentManifold) -> Self {
-        Self::from_flat_with_manifold_and_id(
+        Self::from_flat_with_manifold_and_retraction_and_id(
             self.values.clone(),
             self.n_obs,
             self.latent_dim,
             self.id_mode.clone(),
             manifold,
+            self.retraction_registry.clone(),
+            self.id,
+        )
+    }
+
+    pub(crate) fn with_retraction_registry(
+        &self,
+        retraction_registry: LatentRetractionRegistry,
+    ) -> Self {
+        Self::from_flat_with_manifold_and_retraction_and_id(
+            self.values.clone(),
+            self.n_obs,
+            self.latent_dim,
+            self.id_mode.clone(),
+            self.manifold.clone(),
+            retraction_registry,
             self.id,
         )
     }
@@ -759,7 +825,7 @@ impl LatentCoordValues {
     /// Apply a flat tangent update row-by-row through the manifold retraction.
     pub fn retract_flat_delta(&mut self, delta: ArrayView1<'_, f64>) {
         debug_assert_eq!(delta.len(), self.values.len());
-        if self.manifold.is_euclidean() {
+        if self.retraction_registry.is_all_euclidean() {
             for (t, dt) in self.values.iter_mut().zip(delta.iter()) {
                 *t += *dt;
             }
@@ -768,12 +834,9 @@ impl LatentCoordValues {
         for n in 0..self.n_obs {
             let start = n * self.latent_dim;
             let end = start + self.latent_dim;
-            let current = self.values.slice(ndarray::s![start..end]);
+            let mut current = self.values.slice_mut(ndarray::s![start..end]);
             let xi = delta.slice(ndarray::s![start..end]);
-            let next = self.manifold.retract(current, xi);
-            for a in 0..self.latent_dim {
-                self.values[start + a] = next[a];
-            }
+            self.retraction_registry.retract(&mut current, xi);
         }
     }
 

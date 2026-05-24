@@ -15,13 +15,14 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
 use sha2::{Digest, Sha256};
 
 use crate::basis::{DuchonNullspaceOrder, MaternNu, RadialScalarKind};
 use crate::estimate::EstimationError;
 use crate::estimate::reml::DirectionalHyperParam;
 use crate::solver::persistent_warm_start::StableHasher;
+use crate::solver::riemannian_retraction::{Retraction, RetractionKind};
 use crate::terms::latent_coord::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };
@@ -33,6 +34,62 @@ const DEFAULT_PERSISTENT_LATENT_CACHE_BYTE_BUDGET: usize = 1024 * 1024 * 1024;
 
 static PERSISTENT_LATENT_DESIGN_CACHE: OnceLock<Mutex<PersistentLatentDesignCache>> =
     OnceLock::new();
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LatentRetractionRegistry {
+    block: Option<RetractionKind>,
+}
+
+impl LatentRetractionRegistry {
+    pub(crate) fn all_euclidean() -> Self {
+        Self { block: None }
+    }
+
+    pub(crate) fn new(block: RetractionKind) -> Self {
+        if block.is_euclidean() {
+            Self::all_euclidean()
+        } else {
+            Self { block: Some(block) }
+        }
+    }
+
+    pub(crate) fn is_all_euclidean(&self) -> bool {
+        self.block.is_none()
+    }
+
+    pub(crate) fn ambient_dim(&self, fallback_dim: usize) -> usize {
+        self.block
+            .as_ref()
+            .map_or(fallback_dim, RetractionKind::ambient_dim)
+    }
+
+    pub(crate) fn metric_weights(&self, fallback_dim: usize) -> Vec<f64> {
+        self.block
+            .as_ref()
+            .map_or_else(|| vec![1.0; fallback_dim], RetractionKind::metric_weights)
+    }
+
+    pub(crate) fn validate_dim(&self, latent_dim: usize, context: &str) -> Result<(), String> {
+        let dim = self.ambient_dim(latent_dim);
+        if dim != latent_dim {
+            return Err(format!(
+                "{context} retraction ambient dimension {dim} does not match latent d={latent_dim}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retract(&self, base: &mut ArrayViewMut1<f64>, tangent: ArrayView1<f64>) {
+        debug_assert_eq!(base.len(), tangent.len());
+        if let Some(block) = self.block.as_ref() {
+            block.retract(base, tangent);
+        } else {
+            for (value, delta) in base.iter_mut().zip(tangent.iter()) {
+                *value += *delta;
+            }
+        }
+    }
+}
 
 /// O(N) identity summary for a flat latent-coordinate vector.
 #[derive(Clone, Debug)]
