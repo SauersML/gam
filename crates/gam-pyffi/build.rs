@@ -1,15 +1,9 @@
+// Build script that emits Linux-specific cdylib rpath link args. On non-
+// Linux hosts the rpath syntax differs (and is unnecessary), so the entire
+// emission is gated on the build-script HOST being Linux. cdylib pyffi
+// wheels are built natively per platform, so host == target in practice.
+#[cfg(target_os = "linux")]
 fn main() {
-    // CARGO_CFG_TARGET_OS is the canonical Cargo build-script signal for the
-    // target platform (build scripts run on the host, so `cfg!` would gate on
-    // host instead). We read it via the `vars()` iterator to keep the
-    // workspace-wide `env::var(` ban satisfied while preserving the
-    // target-aware behavior.
-    let is_linux_target = std::env::vars()
-        .any(|(k, v)| k == "CARGO_CFG_TARGET_OS" && v == "linux");
-    if !is_linux_target {
-        return;
-    }
-
     for path in [
         "$ORIGIN/../nvidia/cuda_runtime/lib",
         "$ORIGIN/../nvidia/nvjitlink/lib",
@@ -20,3 +14,6 @@ fn main() {
         println!("cargo:rustc-link-arg-cdylib=-Wl,-rpath,{path}");
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+fn main() {}
