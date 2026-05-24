@@ -2,16 +2,16 @@ use gam::inference::data::EncodedDataset;
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use gam::resource::ResourcePolicy;
 use gam::terms::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, PeriodicSplineCurveSpec,
-    build_bspline_basis_1d, create_cyclic_difference_penalty_matrix,
-    create_periodic_bspline_basis_dense, create_periodic_bspline_derivative_dense,
-    evaluate_periodic_spline_curve, fit_periodic_spline_curve,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, OneDimensionalBoundary,
+    PeriodicBSplineBasisSpec, build_bspline_basis_1d, build_periodic_bspline_basis_1d,
+    create_cyclic_difference_penalty_matrix, fit_periodic_bspline_curve,
+    periodic_bspline_first_derivative_nd,
 };
 use gam::terms::smooth::{
     SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec, build_term_collection_design,
 };
 use gam::terms::term_builder::build_termspec;
-use ndarray::{Array1, Array2, array};
+use ndarray::{Array1, Array2, Axis, array};
 
 fn max_abs(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
     a.iter()
@@ -20,10 +20,27 @@ fn max_abs(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
         .fold(0.0, f64::max)
 }
 
+fn periodic_derivative_dense(
+    u: ndarray::ArrayView1<'_, f64>,
+    spec: &PeriodicBSplineBasisSpec,
+) -> Array2<f64> {
+    let t = u.to_owned().insert_axis(Axis(1));
+    periodic_bspline_first_derivative_nd(
+        t.view(),
+        (spec.origin, spec.origin + spec.period),
+        spec.degree,
+        spec.num_basis,
+    )
+    .unwrap()
+    .index_axis(Axis(2), 0)
+    .to_owned()
+}
+
 #[test]
 fn periodic_basis_wraps_partitions_unity_and_has_periodic_derivative() {
     let u = array![0.0, 0.07, 0.25, 0.61, 0.999_999, 1.0, 1.07, -0.93];
-    let basis = create_periodic_bspline_basis_dense(u.view(), (0.0, 1.0), 3, 12).unwrap();
+    let spec = PeriodicBSplineBasisSpec::new(3, 12, 1.0, 0.0, 2);
+    let basis = build_periodic_bspline_basis_1d(u.view(), &spec).unwrap();
     for row in basis.rows() {
         let sum: f64 = row.iter().sum();
         assert!((sum - 1.0).abs() < 1e-12, "row sum {sum}");
@@ -31,16 +48,14 @@ fn periodic_basis_wraps_partitions_unity_and_has_periodic_derivative() {
     }
 
     let endpoints = array![0.0, 1.0, 2.0, -1.0];
-    let endpoint_basis =
-        create_periodic_bspline_basis_dense(endpoints.view(), (0.0, 1.0), 3, 12).unwrap();
+    let endpoint_basis = build_periodic_bspline_basis_1d(endpoints.view(), &spec).unwrap();
     for i in 1..endpoint_basis.nrows() {
         for j in 0..endpoint_basis.ncols() {
             assert!((endpoint_basis[[0, j]] - endpoint_basis[[i, j]]).abs() < 1e-12);
         }
     }
 
-    let endpoint_deriv =
-        create_periodic_bspline_derivative_dense(endpoints.view(), (0.0, 1.0), 3, 12).unwrap();
+    let endpoint_deriv = periodic_derivative_dense(endpoints.view(), &spec);
     for i in 1..endpoint_deriv.nrows() {
         for j in 0..endpoint_deriv.ncols() {
             assert!((endpoint_deriv[[0, j]] - endpoint_deriv[[i, j]]).abs() < 1e-12);
@@ -80,16 +95,16 @@ fn multi_output_periodic_curve_fits_anisotropic_ellipse_in_ambient_3d() {
         y[[i, 2]] = 0.3 - 1.1 * c + 0.6 * s;
     }
 
-    let spec = PeriodicSplineCurveSpec::new(3, 32, period, 0.0, 2).unwrap();
-    let control = fit_periodic_spline_curve(u.view(), y.view(), &spec, 1e-10).unwrap();
-    assert_eq!(control.dim(), (32, 3));
+    let spec = PeriodicBSplineBasisSpec::new(3, 32, period, 0.0, 2);
+    let curve = fit_periodic_bspline_curve(u.view(), y.view(), &spec, 1e-10).unwrap();
+    assert_eq!(curve.coefficients.dim(), (32, 3));
 
-    let fitted = evaluate_periodic_spline_curve(u.view(), control.view(), &spec).unwrap();
+    let fitted = curve.evaluate(u.view()).unwrap();
     let err = max_abs(&fitted, &y);
     assert!(err < 2.5e-3, "max ellipse fit error {err}");
 
     let seam = array![0.0, period];
-    let seam_fit = evaluate_periodic_spline_curve(seam.view(), control.view(), &spec).unwrap();
+    let seam_fit = curve.evaluate(seam.view()).unwrap();
     for col in 0..3 {
         assert!((seam_fit[[0, col]] - seam_fit[[1, col]]).abs() < 1e-11);
     }
@@ -123,15 +138,14 @@ fn multi_output_periodic_curve_handles_distorted_closed_loop_in_4d() {
         y[[i, 3]] = 0.1 * t.cos() - 0.35 * (4.0 * t).sin();
     }
 
-    let spec = PeriodicSplineCurveSpec::new(3, 48, period, 0.0, 2).unwrap();
-    let control = fit_periodic_spline_curve(u.view(), y.view(), &spec, 1e-9).unwrap();
-    let fitted = evaluate_periodic_spline_curve(u.view(), control.view(), &spec).unwrap();
+    let spec = PeriodicBSplineBasisSpec::new(3, 48, period, 0.0, 2);
+    let curve = fit_periodic_bspline_curve(u.view(), y.view(), &spec, 1e-9).unwrap();
+    let fitted = curve.evaluate(u.view()).unwrap();
     let err = max_abs(&fitted, &y);
     assert!(err < 4e-3, "max distorted-loop fit error {err}");
 
     let shifted = array![0.125, 1.125, -0.875];
-    let shifted_fit =
-        evaluate_periodic_spline_curve(shifted.view(), control.view(), &spec).unwrap();
+    let shifted_fit = curve.evaluate(shifted.view()).unwrap();
     for row in 1..shifted_fit.nrows() {
         for col in 0..shifted_fit.ncols() {
             assert!((shifted_fit[[0, col]] - shifted_fit[[row, col]]).abs() < 1e-11);
@@ -156,6 +170,7 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
                 },
                 double_penalty: true,
                 identifiability: BSplineIdentifiability::None,
+                boundary: OneDimensionalBoundary::Open,
                 boundary_conditions: Default::default(),
             },
         },
@@ -181,6 +196,7 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Open,
             boundary_conditions: Default::default(),
         },
     )

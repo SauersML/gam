@@ -149,7 +149,8 @@ fn duchon_aniso_pc_spec(name: &str, pc_dim: usize, k_centers: usize) -> TermColl
                     aniso_log_scales: Some(vec![0.0; pc_dim]),
                     operator_penalties: DuchonOperatorPenaltySpec::default(),
 
-                    periodic: false,
+                    periodic: None,
+                    boundary: gam::basis::OneDimensionalBoundary::Open,
                 },
                 input_scales: None,
             },

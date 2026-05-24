@@ -11,11 +11,11 @@ use gam::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
     BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, OneDimensionalBoundary,
     PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec, build_bspline_basis_1d,
-    build_spherical_spline_basis, create_cyclic_bspline_basis_dense,
+    build_periodic_bspline_basis_1d, build_spherical_spline_basis,
     create_cyclic_difference_penalty_matrix, fit_periodic_bspline_curve,
     periodic_bspline_first_derivative_nd, spherical_wahba_kernel_matrix,
 };
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Axis};
 use std::time::Instant;
 
 fn make_uniform_loop(n: usize, period: f64) -> Array1<f64> {
@@ -55,7 +55,11 @@ fn periodic_bspline_scales_and_partitions_unity_at_100k() {
     for n in [1_000usize, 10_000, 100_000] {
         let xs = make_uniform_loop(n, period);
         let basis = time_label(&format!("periodic_bspline N={n} k=24 degree=3"), || {
-            create_cyclic_bspline_basis_dense(xs.view(), (0.0, period), 3, 24).expect("basis")
+            build_periodic_bspline_basis_1d(
+                xs.view(),
+                &PeriodicBSplineBasisSpec::new(3, 24, period, 0.0, 2),
+            )
+            .expect("basis")
         });
         assert_eq!(basis.nrows(), n);
         assert_eq!(basis.ncols(), 24);
@@ -69,8 +73,11 @@ fn periodic_bspline_scales_and_partitions_unity_at_100k() {
         }
         // periodicity: row at x and x + period (mod) give the same row vector
         let xs_wrap = Array1::from_iter(xs.iter().map(|x| x + period));
-        let basis_wrap = create_cyclic_bspline_basis_dense(xs_wrap.view(), (0.0, period), 3, 24)
-            .expect("wrap basis");
+        let basis_wrap = build_periodic_bspline_basis_1d(
+            xs_wrap.view(),
+            &PeriodicBSplineBasisSpec::new(3, 24, period, 0.0, 2),
+        )
+        .expect("wrap basis");
         for i in 0..n.min(2048) {
             for j in 0..24 {
                 let d = (basis[(i, j)] - basis_wrap[(i, j)]).abs();
@@ -86,8 +93,11 @@ fn periodic_bspline_derivative_integrates_to_zero_over_loop() {
     let n = 10_000;
     let xs = make_uniform_loop(n, period);
     let d = time_label(&format!("periodic_bspline_deriv N={n} k=20"), || {
-        periodic_bspline_first_derivative_nd(xs.view(), (0.0, period), 3, 20)
+        let t = xs.clone().insert_axis(Axis(1));
+        periodic_bspline_first_derivative_nd(t.view(), (0.0, period), 3, 20)
             .expect("derivative basis")
+            .index_axis(Axis(2), 0)
+            .to_owned()
     });
     // Integral of each derivative basis column around the loop is zero
     // for an exact periodic spline. Use trapezoidal sum over uniform xs.
@@ -122,7 +132,6 @@ fn exact_periodic_cubic_spline_scales_and_interpolates_at_100k() {
             )
             .expect("exact periodic spline")
         });
-        assert_eq!(spline.num_sites(), n);
         assert_eq!(spline.ambient_dim(), 3);
 
         let fitted = spline.evaluate(u.view()).expect("knot interpolation");
