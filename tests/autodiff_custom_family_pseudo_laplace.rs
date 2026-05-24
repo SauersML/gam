@@ -41,19 +41,18 @@ impl CustomFamily for ScalarPseudoLaplaceRhoFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(block_states);
+        assert!(!block_states.is_empty(), "rho joint hessian needs blocks");
         Ok(Some(array![[2.0]]))
     }
 
     fn exact_newton_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
-        block_idx: usize,
+        block_index: usize,
         direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(block_states);
-        drop(block_idx);
-        drop(direction);
+        assert!(block_index < block_states.len(), "rho block index in range");
+        assert_eq!(direction.len(), block_states[block_index].beta.len(), "rho dir len matches beta");
         Ok(Some(array![[0.0]]))
     }
 
@@ -62,8 +61,8 @@ impl CustomFamily for ScalarPseudoLaplaceRhoFamily {
         block_states: &[ParameterBlockState],
         direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(block_states);
-        drop(direction);
+        let total: usize = block_states.iter().map(|s| s.beta.len()).sum();
+        assert_eq!(direction.len(), total, "rho joint dir matches total beta");
         Ok(Some(array![[0.0]]))
     }
 }
@@ -96,12 +95,11 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
     fn exact_newton_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
-        block_idx: usize,
+        block_index: usize,
         direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(block_states);
-        drop(block_idx);
-        drop(direction);
+        assert!(block_index < block_states.len(), "psi block index in range");
+        assert_eq!(direction.len(), block_states[block_index].beta.len(), "psi dir len matches beta");
         Ok(Some(array![[0.0]]))
     }
 
@@ -109,7 +107,7 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(block_states);
+        assert!(!block_states.is_empty(), "psi joint hessian needs blocks");
         Ok(Some(array![[2.0]]))
     }
 
@@ -118,8 +116,8 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
         block_states: &[ParameterBlockState],
         direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(block_states);
-        drop(direction);
+        let total: usize = block_states.iter().map(|s| s.beta.len()).sum();
+        assert_eq!(direction.len(), total, "psi joint dir matches total beta");
         Ok(Some(array![[0.0]]))
     }
 
@@ -127,12 +125,12 @@ impl CustomFamily for ScalarPseudoLaplacePsiFamily {
         &self,
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
-        block_derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
-        psi_idx: usize,
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        drop(block_specs);
-        drop(block_derivs);
-        drop(psi_idx);
+        assert_eq!(block_states.len(), block_specs.len(), "psi terms: states/specs aligned");
+        assert_eq!(derivative_blocks.len(), block_states.len(), "psi terms: derivs/states aligned");
+        assert_eq!(psi_index, 0, "psi terms: scalar psi index expected 0");
         let beta = block_states
             .first()
             .ok_or_else(|| "missing block 0".to_string())?

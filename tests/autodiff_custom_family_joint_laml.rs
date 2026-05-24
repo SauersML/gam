@@ -212,8 +212,7 @@ impl<T: AD> CoupledQuarticObjectiveFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for CoupledQuarticObjectiveFn<T> {
     const NAME: &'static str = "CoupledQuarticObjectiveFn";
 
-    fn call(&self, inputs: &[T], frozen: bool) -> Vec<T> {
-        drop(frozen);
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
         let rho = inputs[0];
         let lambda = rho.exp();
         let d = T::constant(self.beta2ridge);
@@ -274,7 +273,9 @@ impl CustomFamily for LowerBoundConstrainedExactFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(block_states);
+        if block_states.len() != 1 || block_states[0].beta.len() != 1 {
+            return Err("expected one scalar parameter block".to_string());
+        }
         Ok(Some(array![[1.0]]))
     }
 
@@ -284,9 +285,9 @@ impl CustomFamily for LowerBoundConstrainedExactFamily {
         block_idx: usize,
         direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(block_states);
-        drop(block_idx);
-        drop(direction);
+        if block_idx != 0 || block_states.len() != 1 || direction.len() != 1 {
+            return Err("expected scalar block-0 Hessian direction".to_string());
+        }
         Ok(Some(array![[0.0]]))
     }
 
@@ -295,8 +296,9 @@ impl CustomFamily for LowerBoundConstrainedExactFamily {
         block_states: &[ParameterBlockState],
         direction: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(block_states);
-        drop(direction);
+        if block_states.len() != 1 || direction.len() != 1 {
+            return Err("expected scalar joint Hessian direction".to_string());
+        }
         Ok(Some(array![[0.0]]))
     }
 
@@ -306,8 +308,9 @@ impl CustomFamily for LowerBoundConstrainedExactFamily {
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        drop(block_states);
-        drop(block_spec);
+        if block_states.len() != 1 || block_spec.name.is_empty() {
+            return Err("expected one named parameter block".to_string());
+        }
         if block_idx != 0 {
             return Ok(None);
         }
@@ -373,8 +376,7 @@ impl<T: AD> ConstrainedExactObjectiveFn<T> {
 impl<T: AD> DifferentiableFunctionTrait<T> for ConstrainedExactObjectiveFn<T> {
     const NAME: &'static str = "ConstrainedExactObjectiveFn";
 
-    fn call(&self, inputs: &[T], frozen: bool) -> Vec<T> {
-        drop(frozen);
+    fn call(&self, inputs: &[T], freeze: bool) -> Vec<T> {
         let rho = inputs[0];
         let lambda = rho.exp();
         let beta_hat = T::constant(self.lower);

@@ -1,5 +1,4 @@
 use crossterm::execute;
-#[cfg(not(test))]
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 use log::{LevelFilter, Log, Metadata, Record};
@@ -386,14 +385,12 @@ struct InteractiveVisualizer {
 // from a panic hook (it's behind a Mutex and the panic might be holding
 // it), so we cache a clone of the fd here at activation time.
 static TTY_HANDLE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
-#[cfg(not(test))]
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 
 fn tty_handle_slot() -> &'static Mutex<Option<File>> {
     TTY_HANDLE.get_or_init(|| Mutex::new(None))
 }
 
-#[cfg(not(test))]
 fn install_tty_handle(handle: File) {
     if let Ok(mut g) = tty_handle_slot().lock() {
         *g = Some(handle);
@@ -406,7 +403,7 @@ fn clear_tty_handle() {
     }
 }
 
-#[cfg(all(not(test), unix))]
+#[cfg(unix)]
 fn open_dev_tty() -> io::Result<File> {
     std::fs::OpenOptions::new()
         .read(true)
@@ -414,7 +411,7 @@ fn open_dev_tty() -> io::Result<File> {
         .open("/dev/tty")
 }
 
-#[cfg(all(not(test), not(unix)))]
+#[cfg(not(unix))]
 fn open_dev_tty() -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -427,7 +424,6 @@ fn open_dev_tty() -> io::Result<File> {
 // instead of stuck in alt-screen + raw mode, and (b) preserves the last
 // few hundred log records in whatever was capturing stderr — typically
 // the `tee` pipe in run.sh that backs the run's $RESULTS file.
-#[cfg(not(test))]
 fn install_panic_hook() {
     PANIC_HOOK_INSTALLED.get_or_init(|| {
         let prev = std::panic::take_hook();
@@ -487,12 +483,11 @@ struct DumbVisualizer {
 
 impl InteractiveVisualizer {
     fn new() -> io::Result<Self> {
-        // `live_visualization_enabled()` is hard-wired to `false`, so
-        // every production code path routes through the Dumb renderer
-        // and this method never runs. The alt-screen takeover below
-        // stays for the day the live renderer flag is wired up again;
-        // until then the open_dev_tty() / panic-hook plumbing is
-        // intentionally unexercised.
+        // Never claim the alt-screen during the test binary: shared
+        // global terminal state racing with parallel tests is a recipe
+        // for hangs, and the existing "use Dumb when not attached to
+        // TTY" tests rely on this short-circuit to assert their
+        // invariants without needing to fake a tty.
         {
             // Route the chart to /dev/tty rather than stdout, so it
             // works even when the parent shell pipes stdout/stderr

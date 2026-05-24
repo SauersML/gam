@@ -5178,10 +5178,9 @@ fn materialize_survival<'a>(
         marginal_logslopespec,
         marginal_logslopespecs,
         marginal_slope_deviation_routing,
+        marginal_slope_base_link,
     ) = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        drop(resolve_survival_marginal_slope_base_link(
-            parsed.linkspec.as_ref(),
-        )?);
+        let base_link = resolve_survival_marginal_slope_base_link(parsed.linkspec.as_ref())?;
         let default_z_column =
             marginal_z_column_name.expect("marginal-slope z column should be available");
         if let Some(ls_formula) = config.logslope_formula.as_deref() {
@@ -5236,6 +5235,7 @@ fn materialize_survival<'a>(
                     parsed.linkwiggle.as_ref(),
                     ls_parsed.linkwiggle.as_ref(),
                 )?,
+                Some(base_link),
             )
         } else {
             validate_marginal_slope_z_column_exclusion(
@@ -5252,6 +5252,7 @@ fn materialize_survival<'a>(
                 Some(termspec.clone()),
                 Some(vec![termspec.clone()]),
                 route_marginal_slope_deviation_blocks(parsed.linkwiggle.as_ref(), None)?,
+                Some(base_link),
             )
         }
     } else {
@@ -5263,6 +5264,7 @@ fn materialize_survival<'a>(
                 score_warp: None,
                 link_dev: None,
             },
+            None,
         )
     };
     let marginal_slope_score_warp = marginal_slope_deviation_routing.score_warp;
@@ -5454,7 +5456,9 @@ fn materialize_survival<'a>(
                     z: marginal_z.clone().ok_or_else(|| {
                         "marginal-slope survival requires z_column in FitConfig".to_string()
                     })?,
-                    base_link: resolve_survival_marginal_slope_base_link(parsed.linkspec.as_ref())?,
+                    base_link: marginal_slope_base_link.clone().ok_or_else(|| {
+                        "internal error: marginal-slope base link validation missing".to_string()
+                    })?,
                     marginalspec: termspec.clone(),
                     marginal_offset: threshold_offset.clone(),
                     frailty: marginal_slope_frailty.clone().ok_or_else(|| {

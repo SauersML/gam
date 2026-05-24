@@ -1326,49 +1326,6 @@ impl TransformationNormalFamily {
         Ok(dense)
     }
 
-    #[cfg(test)]
-    fn scop_endpoint_values(
-        &self,
-        beta: &Array1<f64>,
-        beta_mat: ArrayView2<'_, f64>,
-        cov: ArrayView2<'_, f64>,
-    ) -> Result<(Array1<f64>, Array1<f64>), String> {
-        let n = cov.nrows();
-        let p_resp = self.response_val_basis.ncols();
-        if beta.len() != p_resp * self.covariate_design.ncols() {
-            return Err(TransformationNormalError::InvalidInput {
-                reason: format!(
-                    "SCOP endpoint beta length {} != p_resp({p_resp}) * p_cov({})",
-                    beta.len(),
-                    self.covariate_design.ncols()
-                ),
-            }
-            .into());
-        }
-        let mut lower = Array1::<f64>::zeros(n);
-        let mut upper = Array1::<f64>::zeros(n);
-        let mut gamma = vec![0.0; p_resp];
-        for i in 0..n {
-            let cov_row = cov.row(i);
-            for k in 0..p_resp {
-                gamma[k] = beta_mat.row(k).dot(&cov_row);
-            }
-            let mut h_l = self.response_lower_basis[0] * gamma[0]
-                + self.offset[i]
-                + self.response_lower_floor_offset;
-            let mut h_u = self.response_upper_basis[0] * gamma[0]
-                + self.offset[i]
-                + self.response_upper_floor_offset;
-            for k in 1..p_resp {
-                h_l += self.response_lower_basis[k] * gamma[k] * gamma[k];
-                h_u += self.response_upper_basis[k] * gamma[k] * gamma[k];
-            }
-            lower[i] = h_l;
-            upper[i] = h_u;
-        }
-        Ok((lower, upper))
-    }
-
     fn row_quantities(
         &self,
         beta: &Array1<f64>,
@@ -11393,7 +11350,7 @@ impl TensorKroneckerPsiOperator {
 mod tests {
     use super::*;
     use crate::custom_family::custom_family_outer_derivatives;
-    use crate::testing::assert_matrix_derivativefd;
+    use crate::test_support::assert_matrix_derivativefd;
     use ndarray::array;
 
     fn dense_first_order_psi_hessian(terms: &ExactNewtonJointPsiTerms) -> Array2<f64> {
@@ -11756,9 +11713,27 @@ mod tests {
             .covariate_design
             .try_row_chunk(0..family.n_obs())
             .expect("toy covariate rows");
-        let (h_lower, h_upper) = family
-            .scop_endpoint_values(&state.beta, beta_mat, cov.view())
-            .expect("toy endpoint values");
+        let mut h_lower = Array1::<f64>::zeros(cov.nrows());
+        let mut h_upper = Array1::<f64>::zeros(cov.nrows());
+        let mut gamma = vec![0.0; p_resp];
+        for i in 0..cov.nrows() {
+            let cov_row = cov.row(i);
+            for k in 0..p_resp {
+                gamma[k] = beta_mat.row(k).dot(&cov_row);
+            }
+            let mut lower = family.response_lower_basis[0] * gamma[0]
+                + family.offset[i]
+                + family.response_lower_floor_offset;
+            let mut upper = family.response_upper_basis[0] * gamma[0]
+                + family.offset[i]
+                + family.response_upper_floor_offset;
+            for k in 1..p_resp {
+                lower += family.response_lower_basis[k] * gamma[k] * gamma[k];
+                upper += family.response_upper_basis[k] * gamma[k] * gamma[k];
+            }
+            h_lower[i] = lower;
+            h_upper[i] = upper;
+        }
 
         let mut expected_ll = 0.0;
         for i in 0..direct_h.len() {
