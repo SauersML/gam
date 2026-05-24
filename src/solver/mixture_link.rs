@@ -2148,24 +2148,32 @@ mod tests {
     }
 
     #[test]
-    fn family_dispatch_requires_state_for_sas_and_mixture() {
-        let sas_err = inverse_link_jet_for_family(
-            crate::types::LikelihoodFamily::BinomialSas,
-            0.1,
-            None,
-            None,
-        )
-        .expect_err("SAS without state should error");
-        assert!(sas_err.to_string().contains("requires SAS link state"));
+    fn family_dispatch_resolves_parameterized_links_from_spec() {
+        // After the LikelihoodSpec migration, the dispatch no longer needs
+        // out-of-band state arguments — the parameterized link state lives on
+        // `spec.link`. Verify that supplying explicit SAS/Mixture link states
+        // through the spec produces finite jets at a representative eta.
+        let sas_state = SasLinkState::new(0.0, 0.0).expect("sas state");
+        let sas_spec = crate::types::LikelihoodSpec {
+            response: crate::types::ResponseFamily::Binomial,
+            link: InverseLink::Sas(sas_state),
+        };
+        let sas_jet = inverse_link_jet_for_family(&sas_spec, 0.1).expect("sas jet");
+        assert!(sas_jet.mu.is_finite());
+        assert!(sas_jet.d1.is_finite());
 
-        let mix_err = inverse_link_jet_for_family(
-            crate::types::LikelihoodFamily::BinomialMixture,
-            0.1,
-            None,
-            None,
-        )
-        .expect_err("mixture without state should error");
-        assert!(mix_err.to_string().contains("requires mixture link state"));
+        let mix_state = MixtureLinkState {
+            components: vec![LinkComponent::Logit, LinkComponent::Probit],
+            rho: ndarray::array![0.0],
+            pi: ndarray::array![0.5, 0.5],
+        };
+        let mix_spec = crate::types::LikelihoodSpec {
+            response: crate::types::ResponseFamily::Binomial,
+            link: InverseLink::Mixture(mix_state),
+        };
+        let mix_jet = inverse_link_jet_for_family(&mix_spec, 0.1).expect("mix jet");
+        assert!(mix_jet.mu.is_finite());
+        assert!(mix_jet.d1.is_finite());
     }
 
     #[test]

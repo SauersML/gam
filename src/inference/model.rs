@@ -2025,16 +2025,17 @@ impl SavedAnchoredDeviationRuntime {
 impl FittedFamily {
     #[inline]
     pub fn likelihood(&self) -> LikelihoodFamily {
-        match self {
+        let spec = match self {
             Self::Standard { likelihood, .. }
             | Self::LocationScale { likelihood, .. }
             | Self::MarginalSlope { likelihood, .. }
             | Self::Survival { likelihood, .. }
-            | Self::TransformationNormal { likelihood, .. } => *likelihood,
+            | Self::TransformationNormal { likelihood, .. } => likelihood,
             Self::LatentSurvival { .. } | Self::LatentBinary { .. } => {
-                LikelihoodFamily::RoystonParmar
+                return LikelihoodFamily::RoystonParmar;
             }
-        }
+        };
+        likelihood_family_from_spec(spec)
     }
 
     #[inline]
