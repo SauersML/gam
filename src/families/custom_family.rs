@@ -10744,11 +10744,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // waste regardless of whether the raw gradient residual or
         // step-norm gates have closed.
         //
-        // Tracked here at cycle scope so the end-of-cycle convergence
-        // test can consume the value from the accepted trust-region
-        // attempt. Reset every cycle alongside the line-search state.
-        let mut _accepted_predicted_reduction: f64 = f64::INFINITY;
-
         // Cross-cycle convergence carry-over: set at the end of every
         // accepted cycle so the next cycle's line-search-failure path
         // can distinguish a true KKT optimum on a rank-deficient
@@ -11552,13 +11547,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             scatter_joint_active_set(joint_active_set, &block_constraints);
                     }
                     // Record the Newton-model predicted decrease at this
-                    // accepted attempt for the end-of-cycle stopping
-                    // criterion (Conn-Gould-Toint Theorem 6.4.6). For a
-                    // trust-region-clipped step, `predicted_reduction`
-                    // is the model's promised decrease at the realized
-                    // step magnitude; for an unclipped Newton step it
-                    // equals half the Newton decrement squared.
-                    _accepted_predicted_reduction = predicted_reduction;
+                    // `predicted_reduction` would be the natural quantity
+                    // for an end-of-cycle Conn-Gould-Toint Theorem 6.4.6
+                    // stopping test, but the existing convergence path
+                    // already consults the realized objective change and
+                    // gradient residual instead. Drop the value so its
+                    // computation is not silently wasted.
+                    drop(predicted_reduction);
                     accepted = true;
                     break;
                 }

@@ -8108,8 +8108,6 @@ fn solve_penalized_least_squares_implicit(
                 Ok(crate::solver::gpu::GpuDispatch::UseCpu { .. }) => {}
                 Err(msg) => return Err(EstimationError::InvalidInput(msg)),
             }
-            let _gpu_timer =
-                crate::solver::gpu::GpuStageTimer::start("pls.dense_xtwx.cpu_fallback");
             let x_dense = x_dense.to_dense_arc();
             if workspace.hessian_buf.nrows() != p || workspace.hessian_buf.ncols() != p {
                 workspace.hessian_buf = Array2::zeros((p, p).f());

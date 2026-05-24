@@ -597,6 +597,12 @@ pub fn ift_du_dbeta(cache: &ArrowFactorCache) -> Array2<f64> {
         for col in 0..k {
             beta_basis.fill(0.0);
             beta_basis[col] = 1.0;
+            // SAFETY: this Tier-2 IFT sensitivity is the dense `du/dβ`
+            // assembler that the joint-evidence path constructs only when
+            // the family promised cached `H_tβ` row products via its
+            // capability surface; reaching `false` here means a family
+            // declared the cache available but failed to populate it,
+            // which is a contract violation.
             if !cache.apply_htbeta_row(i, beta_basis.view(), &mut rhs) {
                 panic!("IFT du/dbeta requires cached H_tβ row products");
             }
@@ -674,6 +680,10 @@ pub fn ift_du_drho(
     for a in 0..r {
         // Per-row: rhs_i = G_{u_i,ρ_a} + H_uβ_i · ∂β*/∂ρ_a.
         for i in 0..n {
+            // SAFETY: companion to the `du/dβ` assembler above —
+            // `apply_htbeta_row` returning `false` would mean the family
+            // declared `H_tβ` row products available but failed to populate
+            // them, violating the joint-evidence capability contract.
             if !cache.apply_htbeta_row(i, dbeta_drho.column(a), &mut htbeta_delta) {
                 panic!("IFT du/drho requires cached H_tβ row products");
             }
@@ -818,6 +828,10 @@ pub fn evidence_grad_rho(
         for col in 0..k {
             beta_basis.fill(0.0);
             beta_basis[col] = 1.0;
+            // SAFETY: same contract as `du/dβ` and `du/dρ` above — the
+            // joint-evidence gradient path only runs when the family
+            // capability surface advertised cached `H_tβ` row products; a
+            // `false` here means the cache was promised but not populated.
             if !cache.apply_htbeta_row(i, beta_basis.view(), &mut rhs) {
                 panic!("evidence gradient requires cached H_tβ row products");
             }

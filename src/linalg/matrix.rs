@@ -7311,18 +7311,13 @@ mod tests {
     fn sparse_to_dense_accumulates_duplicate_entries() {
         // Build a non-canonical CSC with duplicate row index in the same column.
         // This can happen if a caller bypasses canonical constructors.
-        // SAFETY: col_ptrs has ncols+1 entries, starts at 0, is monotone, and ends
-        // at nnz=3; each column's row indices are sorted and all rows are < nrows=3.
-        // Duplicate row 1 is intentional non-canonical input accepted by new_unchecked.
-        let symbolic = unsafe {
-            SymbolicSparseColMat::new_unchecked(
-                3,
-                2,
-                vec![0_usize, 2, 3],
-                None,
-                vec![1_usize, 1, 0],
-            )
-        };
+        let symbolic = SymbolicSparseColMat::new_unsorted_checked(
+            3,
+            2,
+            vec![0_usize, 2, 3],
+            None,
+            vec![1_usize, 1, 0],
+        );
         let sparse = SparseColMat::new(symbolic, vec![2.0_f64, 3.5, -1.0]);
         let design = DesignMatrix::from(sparse);
         let dense = design.to_dense_arc();
