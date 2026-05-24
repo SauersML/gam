@@ -11070,8 +11070,8 @@ fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
         return f64::NAN;
     }
     let mui_c = safe_beta_mu(mui);
-    let a = mui_c * phi;
-    let b = (1.0 - mui_c) * phi;
+    let a = (mui_c * phi).max(BETA_MU_EPS);
+    let b = ((1.0 - mui_c) * phi).max(BETA_MU_EPS);
     beta_log_normalizer(a, b, phi)
         + phi * xlogy(mui_c, yi)
         + phi * xlogy(1.0 - mui_c, 1.0 - yi)

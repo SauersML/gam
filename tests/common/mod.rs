@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 pub fn assert_manualwith_ad_band(
     case: &str,
     x: f64,
@@ -42,7 +41,6 @@ macro_rules! assert_manual_ad_band {
 
 /// Result of a log-log OLS fit `y ≈ a · x^α`.
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)]
 pub struct PowerLawFit {
     pub alpha: f64,
     pub a: f64,
@@ -54,7 +52,6 @@ pub struct PowerLawFit {
 /// One extrapolation row in a `PowerLawReport`: at `x_target`, the fit
 /// predicts `pred_y`, which compares to `budget_y` as `verdict`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum BudgetVerdict {
     /// `pred_y <= budget_y`.
     Fits,
@@ -63,7 +60,6 @@ pub enum BudgetVerdict {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct PowerLawExtrapolation {
     pub label: String,
     pub x_target: f64,
@@ -76,7 +72,6 @@ pub struct PowerLawExtrapolation {
 /// the side-effect printing so callers (tests, downstream analyzers)
 /// can assert against the verdicts directly instead of parsing stderr.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct PowerLawReport {
     pub fit: PowerLawFit,
     pub extrapolations: Vec<PowerLawExtrapolation>,
@@ -88,7 +83,6 @@ pub struct PowerLawReport {
 /// `tests/margslope_inner_pirls_scaling.rs`) where the consistency of
 /// the fit's R² and max log-residual gates extrapolation to biobank
 /// shape — see `report_power_law` for the policy.
-#[allow(dead_code)]
 pub fn fit_power_law(points: &[(f64, f64)]) -> Option<PowerLawFit> {
     if points.len() < 3 {
         return None;
@@ -157,7 +151,6 @@ pub fn fit_power_law(points: &[(f64, f64)]) -> Option<PowerLawFit> {
 /// `stretch_note` flags extrapolations >5× past the calibration max,
 /// or below the calibration min, so a reader can cross-check the
 /// extrapolation distance against the fit confidence.
-#[allow(dead_code)]
 pub fn report_power_law(
     tag: &str,
     points: &[(f64, f64)],
@@ -172,7 +165,6 @@ pub fn report_power_law(
 /// just the fit. Side-effect printing is unchanged. Tests use this
 /// variant to assert against `BudgetVerdict::Fits` /
 /// `BudgetVerdict::OverBudget` directly rather than parsing stderr.
-#[allow(dead_code)]
 pub fn report_power_law_full(
     tag: &str,
     points: &[(f64, f64)],

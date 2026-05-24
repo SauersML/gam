@@ -7587,7 +7587,7 @@ fn build_nullspace_shrinkage_penalty(
         return Ok(None);
     }
     let z = evecs.select(Axis(1), &zero_idx);
-    let shrink = fast_ab(&z, &z.t().to_owned());
+    let shrink = fast_abt(&z, &z);
     Ok(Some(CanonicalPenaltyBlock {
         sym_penalty: shrink,
         eigenvalues: evals,
