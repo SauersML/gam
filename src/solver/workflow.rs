@@ -41,6 +41,8 @@ use crate::families::transformation_normal::{
 };
 use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
+use crate::solver::latent_cache::LatentRetractionRegistry;
+use crate::solver::riemannian_retraction::{ProductRetraction, RetractionKind};
 use crate::smooth::{
     AdaptiveRegularizationDiagnostics, CoefficientGroupSpec, SpatialLengthScaleOptimizationOptions,
     StandardLatentCoordConfig, TermCollectionDesign, TermCollectionSpec,
@@ -2922,6 +2924,7 @@ struct LatentSpec {
     d: usize,
     init: LatentInitSpec,
     manifold: LatentManifoldSpec,
+    retraction_registry: LatentRetractionRegistry,
     aux_prior: Option<LatentAuxPriorSpec>,
     dim_selection: Option<LatentDimSelectionSpec>,
     explicit_none_mode: bool,
@@ -3845,6 +3848,109 @@ fn parse_latent_manifold(
     })
 }
 
+fn parse_retraction_kind(
+    value: &JsonValue,
+    fallback_dim: usize,
+    context: &str,
+) -> Result<RetractionKind, String> {
+    let parse_named = |name: &str| -> Result<RetractionKind, String> {
+        match name.to_ascii_lowercase().as_str() {
+            "euclidean" | "r" | "real" => Ok(RetractionKind::euclidean(fallback_dim)),
+            "circle" | "s1" | "periodic" => {
+                if fallback_dim == 1 {
+                    Ok(RetractionKind::Circle)
+                } else {
+                    Ok(RetractionKind::Product(ProductRetraction {
+                        parts: (0..fallback_dim).map(|_| RetractionKind::Circle).collect(),
+                    }))
+                }
+            }
+            "sphere" | "sn" => Ok(RetractionKind::Sphere { dim: fallback_dim }),
+            other => Err(format!(
+                "{context} must be 'euclidean', 'circle', 'sphere', or a product; got '{other}'"
+            )),
+        }
+    };
+    if let Some(name) = value.as_str() {
+        return parse_named(name);
+    }
+    if let Some(items) = value.as_array() {
+        let mut parts = Vec::with_capacity(items.len());
+        for (idx, item) in items.iter().enumerate() {
+            parts.push(parse_retraction_kind(
+                item,
+                1,
+                &format!("{context}[{idx}]"),
+            )?);
+        }
+        return Ok(RetractionKind::Product(ProductRetraction { parts }));
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| format!("{context} must be a string, object, or product array"))?;
+    let kind = obj
+        .get("type")
+        .or_else(|| obj.get("kind"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("euclidean");
+    match kind.to_ascii_lowercase().as_str() {
+        "euclidean" | "r" | "real" => {
+            let dim = obj
+                .get("dim")
+                .or_else(|| obj.get("d"))
+                .and_then(JsonValue::as_u64)
+                .map_or(fallback_dim, |value| value as usize);
+            if dim == 0 {
+                return Err(format!("{context}.dim must be positive"));
+            }
+            Ok(RetractionKind::euclidean(dim))
+        }
+        "circle" | "s1" | "periodic" => Ok(RetractionKind::Circle),
+        "sphere" | "sn" => {
+            let dim = obj
+                .get("dim")
+                .or_else(|| obj.get("d"))
+                .and_then(JsonValue::as_u64)
+                .map_or(fallback_dim, |value| value as usize);
+            if dim == 0 {
+                return Err(format!("{context}.dim must be positive"));
+            }
+            Ok(RetractionKind::Sphere { dim })
+        }
+        "product" => {
+            let items = obj
+                .get("parts")
+                .or_else(|| obj.get("components"))
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| format!("{context}.parts is required for product retraction"))?;
+            let mut parts = Vec::with_capacity(items.len());
+            for (idx, item) in items.iter().enumerate() {
+                parts.push(parse_retraction_kind(
+                    item,
+                    1,
+                    &format!("{context}.parts[{idx}]"),
+                )?);
+            }
+            Ok(RetractionKind::Product(ProductRetraction { parts }))
+        }
+        other => parse_named(other),
+    }
+}
+
+fn parse_latent_retraction(
+    value: Option<&JsonValue>,
+    d: usize,
+    context: &str,
+) -> Result<LatentRetractionRegistry, String> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(LatentRetractionRegistry::all_euclidean());
+    };
+    let kind = parse_retraction_kind(value, d, context)?;
+    let registry = LatentRetractionRegistry::new(kind);
+    registry.validate_dim(d, context)?;
+    Ok(registry)
+}
+
 fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, String> {
     let Some(payload) = payload.filter(|value| !value.is_null()) else {
         return Ok(Vec::new());
@@ -3877,6 +3983,11 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
             obj.get("manifold"),
             d,
             &format!("latents['{key}'].manifold"),
+        )?;
+        let retraction_registry = parse_latent_retraction(
+            obj.get("retraction"),
+            d,
+            &format!("latents['{key}'].retraction"),
         )?;
         let init = match obj.get("init") {
             None => LatentInitSpec::Pca,
@@ -3990,6 +4101,7 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
             d,
             init,
             manifold,
+            retraction_registry,
             aux_prior,
             dim_selection,
             explicit_none_mode,
@@ -4151,10 +4263,11 @@ fn prepare_standard_latent_coord(
 
     let matrix = initial_latent_matrix(&spec, y)?;
     let id_mode = latent_id_mode(&spec)?;
-    let latent_values = Arc::new(LatentCoordValues::from_matrix_with_manifold(
+    let latent_values = Arc::new(LatentCoordValues::from_matrix_with_manifold_and_retraction(
         matrix.view(),
         id_mode,
         spec.manifold.manifold.clone(),
+        spec.retraction_registry.clone(),
     ));
 
     let base_cols = data.values.ncols();
@@ -4212,6 +4325,7 @@ fn prepare_standard_latent_coord(
             feature_cols,
             manifold: spec.manifold.manifold,
             manifold_auto: spec.manifold.auto,
+            retraction_registry: spec.retraction_registry,
             analytic_penalties: (!analytic_penalties.penalties.is_empty())
                 .then(|| Arc::new(analytic_penalties)),
         },

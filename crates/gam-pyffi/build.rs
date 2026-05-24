@@ -1,9 +1,8 @@
-// Build script that emits Linux-specific cdylib rpath link args. On non-
-// Linux hosts the rpath syntax differs (and is unnecessary), so the entire
-// emission is gated on the build-script HOST being Linux. cdylib pyffi
-// wheels are built natively per platform, so host == target in practice.
-#[cfg(target_os = "linux")]
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "linux" {
+        return;
+    }
+
     use std::io::Write as _;
     let mut stdout = std::io::stdout();
     for path in [
@@ -20,6 +19,3 @@ fn main() {
         drop(writeln!(stdout, "cargo:rustc-link-arg-cdylib=-Wl,-rpath,{path}"));
     }
 }
-
-#[cfg(not(target_os = "linux"))]
-fn main() {}
