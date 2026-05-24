@@ -39,6 +39,9 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
 * `AuxConditionalPriorPenalty` lives on t. Fixed-precomputed iVAE-style
   row-conditional precision, the auxiliary-supervised sibling to ARD/Ortho
   from `proposals/composition_engine.md` §4(c).
+* `IvaeRidgeMeanGauge` lives on t. It fixes the iVAE conditional-mean gauge
+  by penalizing the component of t not explained by a ridge fit against
+  auxiliary covariates u.
 * `ParametricAuxConditionalPriorPenalty` lives on t. Parametric iVAE-style
   diagonal row precision learned from auxiliary covariates through a
   distance-kernel map.
@@ -70,6 +73,7 @@ __all__ = [
     "BlockSparsityPenalty",
     "BlockOrthogonalityPenalty",
     "AuxConditionalPriorPenalty",
+    "IvaeRidgeMeanGauge",
     "ParametricAuxConditionalPriorPenalty",
     "OrthogonalityPenalty",
     "IBPAssignmentPenalty",
@@ -79,7 +83,8 @@ __all__ = [
 ]
 
 
-# Weight specification: either "auto" or a positive scalar base multiplier.
+# Weight specification: either "auto" (REML-selected) or a positive float
+# (held fixed at that value throughout the fit).
 WeightSpec: TypeAlias = str | float
 TargetSpec: TypeAlias = str | int | Any
 
@@ -222,7 +227,7 @@ class IsometryPenalty:
         Either the name of a ``LatentCoord`` block (``"t"``) or the
         ``LatentCoord`` object itself.
     weight
-        ``"auto"`` (the default) or a positive scalar base multiplier.
+        ``"auto"`` (REML-selected; the default) or a fixed positive float.
     """
 
     target: TargetSpec
@@ -294,7 +299,7 @@ class SparsityPenalty:
     kind
         ``"smooth_l1"`` (the default), ``"hoyer"``, or ``"log"``.
     weight
-        ``"auto"`` (the default) or a positive scalar base multiplier.
+        ``"auto"`` (REML) or a fixed positive float.
     eps
         Smoothing scale for ``"smooth_l1"`` / ``"log"`` kernels. Default
         ``1e-3``.
@@ -1011,6 +1016,105 @@ class AuxConditionalPriorPenalty:
 
 
 @dataclass(init=False)
+class IvaeRidgeMeanGauge:
+    """iVAE conditional-mean gauge penalty on t.
+
+    Applies ``0.5 * weight * ||t - U @ inv(U.T @ U + ridge_eps * I) @ U.T @ t||^2``.
+    This is the conditional-mean identifiability signal from Khemakhem et al.
+    (2020): with sufficient auxiliary variation in ``u``, the latent variables
+    recover the true generative factors up to an affine transform.
+
+    Parameters
+    ----------
+    aux
+        Numeric ndarray of shape ``(N, q)`` containing one auxiliary row per
+        latent row.
+    ridge_eps
+        Positive ridge added to ``U.T @ U`` before inversion.
+    weight
+        Fixed base weight, or the base multiplier when ``learnable=True``.
+    n_eff
+        Number of rows in the row-major latent coefficient block.
+    learnable
+        If true, expose one REML-selectable log-weight ``rho``.
+    target
+        The ``LatentCoord`` block name/object. Defaults to ``"t"``.
+    """
+
+    target: TargetSpec
+    aux: np.ndarray
+    ridge_eps: float
+    weight: float
+    n_eff: int
+    learnable: bool
+
+    def __init__(
+        self,
+        aux: Any,
+        weight: float,
+        n_eff: int,
+        ridge_eps: float = 1.0e-6,
+        learnable: bool = False,
+        *,
+        target: TargetSpec = "t",
+    ) -> None:
+        self.target = target
+        self.aux = np.asarray(aux, dtype=float)
+        self.ridge_eps = float(ridge_eps)
+        self.weight = float(weight)
+        self.n_eff = int(n_eff)
+        self.learnable = bool(learnable)
+        self.weight_schedule = None
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        if not self.weight > 0.0:
+            raise ValueError(
+                f"IvaeRidgeMeanGauge.weight must be > 0, got {self.weight}"
+            )
+        if self.n_eff <= 0:
+            raise ValueError(
+                f"IvaeRidgeMeanGauge.n_eff must be > 0, got {self.n_eff}"
+            )
+        if not self.ridge_eps > 0.0 or not np.isfinite(self.ridge_eps):
+            raise ValueError(
+                "IvaeRidgeMeanGauge.ridge_eps must be finite and > 0, "
+                f"got {self.ridge_eps}"
+            )
+        if self.aux.ndim != 2:
+            raise ValueError(
+                "IvaeRidgeMeanGauge.aux must have shape (N, q), "
+                f"got ndim={self.aux.ndim}"
+            )
+        n_obs, aux_dim = self.aux.shape
+        if n_obs != self.n_eff:
+            raise ValueError(
+                "IvaeRidgeMeanGauge.aux first dimension must equal "
+                f"n_eff={self.n_eff}, got {n_obs}"
+            )
+        if aux_dim == 0:
+            raise ValueError("IvaeRidgeMeanGauge.aux must have q > 0")
+        if not np.isfinite(self.aux).all():
+            raise ValueError("IvaeRidgeMeanGauge.aux must be finite")
+
+    def _to_rust_payload(self) -> dict[str, Any]:
+        aux = np.ascontiguousarray(self.aux, dtype=float)
+        return _add_weight_schedule({
+            "kind": "ivae_ridge_mean_gauge",
+            "target": _target_descriptor(self.target),
+            "aux": aux.reshape(-1).tolist(),
+            "aux_shape": list(aux.shape),
+            "ridge_eps": self.ridge_eps,
+            "weight": self.weight,
+            "n_eff": self.n_eff,
+            "learnable": self.learnable,
+        }, self)
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
+
+
+@dataclass(init=False)
 class ParametricAuxConditionalPriorPenalty:
     """Parametric iVAE-style auxiliary-conditional prior on t.
 
@@ -1327,6 +1431,7 @@ for _penalty_cls in (
     NuclearNormPenalty,
     BlockSparsityPenalty,
     AuxConditionalPriorPenalty,
+    IvaeRidgeMeanGauge,
     ParametricAuxConditionalPriorPenalty,
     OrthogonalityPenalty,
     IBPAssignmentPenalty,
@@ -1339,6 +1444,6 @@ for _penalty_cls in (
 Penalty = (
     "IsometryPenalty | SparsityPenalty | ScadMcpPenalty | ARDPenalty | "
     "TotalVariationPenalty | NuclearNormPenalty | BlockSparsityPenalty | "
-    "AuxConditionalPriorPenalty | ParametricAuxConditionalPriorPenalty | "
+    "AuxConditionalPriorPenalty | IvaeRidgeMeanGauge | ParametricAuxConditionalPriorPenalty | "
     "OrthogonalityPenalty | IBPAssignmentPenalty | SoftmaxAssignmentSparsityPenalty"
 )

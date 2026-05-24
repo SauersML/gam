@@ -684,18 +684,39 @@ fn checksum_hex(payload: &[u8]) -> String {
     s
 }
 
+/// Test-only monotonic offset (in nanoseconds) added to every `*_now`
+/// reading so tests can simulate elapsed time without `thread::sleep`.
+/// Reads atomically; production code never mutates this.
+#[cfg(test)]
+static TEST_TIME_OFFSET_NS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn test_time_offset_ns() -> u64 {
+    TEST_TIME_OFFSET_NS.load(Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+fn test_time_offset_ns() -> u64 {
+    0
+}
+
 fn unix_now_parts() -> (u64, u32) {
-    SystemTime::now()
+    let base = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| (d.as_secs(), d.subsec_nanos()))
-        .unwrap_or((0, 0))
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let total = base.saturating_add(u128::from(test_time_offset_ns()));
+    let secs = (total / 1_000_000_000u128) as u64;
+    let nanos = (total % 1_000_000_000u128) as u32;
+    (secs, nanos)
 }
 
 fn nanos_now() -> u128 {
-    SystemTime::now()
+    let base = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    base.saturating_add(u128::from(test_time_offset_ns()))
 }
 
 fn fresh_run_id() -> String {
@@ -774,7 +795,7 @@ mod tests {
         store
             .save(&key, b"low-objective", Some(1.0), Some(1), EntryKind::Final)
             .unwrap();
-        thread::sleep(Duration::from_millis(2));
+        TEST_TIME_OFFSET_NS.fetch_add(2_000_000, Ordering::Relaxed);
         store
             .save(
                 &key,
@@ -816,7 +837,7 @@ mod tests {
         store
             .save(&key, b"first", None, None, EntryKind::Checkpoint)
             .unwrap();
-        thread::sleep(Duration::from_millis(1100));
+        TEST_TIME_OFFSET_NS.fetch_add(1_100_000_000, Ordering::Relaxed);
         store
             .save(&key, b"second", None, None, EntryKind::Checkpoint)
             .unwrap();
@@ -966,7 +987,7 @@ mod tests {
             .save(&key, b"x", None, None, EntryKind::Checkpoint)
             .unwrap();
         assert!(store.lookup(&key).unwrap().is_some());
-        thread::sleep(Duration::from_millis(1500));
+        TEST_TIME_OFFSET_NS.fetch_add(1_500_000_000, Ordering::Relaxed);
         // Trigger eviction via a save under an unrelated key.
         let other = key_for("ttl-other");
         store
