@@ -8432,7 +8432,13 @@ impl SurvivalLocationScaleFamily {
         dynamic: &SurvivalDynamicGeometry,
         row_mask: Option<&Array1<f64>>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let _ = block_states;
+        assert_eq!(
+            block_states.len(),
+            self.expected_blocks(),
+            "block_states length mismatch in exact_newton_joint_hessiansecond_directional_derivative_from_parts_masked: expected {}, got {}",
+            self.expected_blocks(),
+            block_states.len()
+        );
         let offsets = self.joint_block_offsets();
         let p_total = *offsets
             .last()
