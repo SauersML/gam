@@ -87,7 +87,7 @@ pub use geometry::{
     RiemannianObjective, RiemannianTrustRegion, SpdManifold, SphereManifold, StiefelManifold,
     TorusManifold,
 };
-pub use gpu::{GpuDecision, GpuPolicy};
+pub use gpu::GpuPolicy;
 pub use inference::{
     alo, data, diagnostics, generative, hmc, predict, probability, quadrature, sample, smooth_test,
 };
