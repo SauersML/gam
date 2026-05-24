@@ -214,7 +214,10 @@ fn closed_form_batches_ragged_scalar_and_multi_problems() {
             problem.x.view(),
             problem.y.view(),
             s.view(),
-            problem.weights.as_ref().map(|weights: &ndarray::ArrayView1<f64>| weights.view()),
+            problem
+                .weights
+                .as_ref()
+                .map(|weights: &ndarray::ArrayView1<f64>| weights.view()),
             problem.init_rho,
         )
         .expect("individual scalar fit");
@@ -252,7 +255,10 @@ fn closed_form_batches_ragged_scalar_and_multi_problems() {
             problem.x.view(),
             problem.y.view(),
             s.view(),
-            problem.weights.as_ref().map(|weights: &ndarray::ArrayView1<f64>| weights.view()),
+            problem
+                .weights
+                .as_ref()
+                .map(|weights: &ndarray::ArrayView1<f64>| weights.view()),
             problem.init_rho,
         )
         .expect("individual multi fit");
