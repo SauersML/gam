@@ -40,7 +40,9 @@ fn main() {
 
     // `let _...` ban (any underscore-leading let pattern). This covers
     // `let _ = expr;`, `let _: T = expr;`, `let _name = expr;`,
-    // `let mut _name = expr;`. Every underscore-leading binding silences
+    // `let mut _name = expr;`, and the tuple-pattern dodge
+    // `let (_, _) = expr;` / `let (_a, _b) = expr;` where every binding
+    // in the tuple is underscore-prefixed. Every such binding silences
     // the type system's unused-value feedback. Use or delete: bind a real
     // name and read it, or call the expression for its effect without a
     // binding (e.g. `drop(expr)` or just `expr;` for `Result` consumers
@@ -188,7 +190,7 @@ fn main() {
 
     if !underscore_offenders.is_empty() {
         sections.push(Section {
-            title: "let _ binding (bare `_` or `_name`)".to_string(),
+            title: "let _ binding (bare `_`, `_name`, or all-underscore tuple pattern)".to_string(),
             rows: underscore_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
@@ -1110,6 +1112,128 @@ fn scan_for_dead_cfg_gates(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf
     });
 }
 
+/// Flags `#[cfg(test)]` (and `#[cfg(all(test, ...))]` / `#[cfg(any(test,
+/// ...))]`) attributes that directly annotate a publicly-visible item:
+/// `pub`, `pub(crate)`, `pub(super)`, `pub(in path)`. Test-gating
+/// production API hides the item from rustc's `dead_code` lint under the
+/// normal build while keeping it available to the test target — the
+/// exact "make the lint shut up" pattern the build script enforces
+/// against everywhere else.
+///
+/// Walks forward through blank lines, `//` comments, and additional
+/// `#[...]` attribute lines from the `cfg(test)` site until reaching the
+/// first non-attribute, non-blank, non-comment line. If the trimmed line
+/// begins with `pub ` / `pub(` / `pub\t`, the `cfg(test)` is flagged.
+/// `#[cfg(test)] mod foo { ... }` (private mod) is intentionally NOT
+/// flagged — that is the legitimate test-only scope. `#[cfg(test)] pub
+/// mod foo { ... }` IS flagged: exporting a test-only module's interior
+/// is the same dodge.
+///
+/// `is_cfg_test_attr_line` already excludes `#[cfg(not(test))]`, so
+/// negations cannot fire here.
+///
+/// Test/bench directories are skipped — they are not "production
+/// surface," and `pub` items there are confined to the test target by
+/// the directory layout. Build.rs is exempt.
+fn scan_for_cfg_test_on_pub_items(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        // Skip files entirely under tests/, bench/, benches/, or
+        // crates/<name>/tests|benches/ — those are not production surface.
+        if rel_str.starts_with("tests/")
+            || rel_str.starts_with("bench/")
+            || rel_str.starts_with("benches/")
+            || path_matches_crates_test(&rel_str)
+        {
+            return;
+        }
+        if !content.contains("cfg(") {
+            return;
+        }
+        let lines: Vec<&str> = content.lines().collect();
+        let stripped_lines = strip_file_lines(content);
+        let n = lines.len();
+        for idx in 0..n {
+            let stripped = stripped_lines
+                .get(idx)
+                .map(String::as_str)
+                .unwrap_or(lines[idx]);
+            if !is_cfg_test_attr_line(stripped) {
+                continue;
+            }
+            // Walk forward through blank lines, `//` comments, and other
+            // `#[...]` attribute lines until reaching the first real item
+            // line.
+            let mut j = idx + 1;
+            let mut item_line: Option<usize> = None;
+            while j < n {
+                let sj = stripped_lines.get(j).map(String::as_str).unwrap_or(lines[j]);
+                let t = sj.trim();
+                if t.is_empty() {
+                    j += 1;
+                    continue;
+                }
+                // `//` comments are stripped to whitespace by
+                // `strip_file_lines`, so a comment-only original line shows
+                // as empty here. Defensive: also accept a stripped line that
+                // happens to start with `//`.
+                if t.starts_with("//") {
+                    j += 1;
+                    continue;
+                }
+                if t.starts_with("#[") || t.starts_with("#![") {
+                    j += 1;
+                    continue;
+                }
+                item_line = Some(j);
+                break;
+            }
+            let Some(item_idx) = item_line else {
+                continue;
+            };
+            let item_raw = lines.get(item_idx).copied().unwrap_or("");
+            let item_trim = item_raw.trim_start();
+            let bytes = item_trim.as_bytes();
+            // Match `pub ` / `pub\t` / `pub(` — the three syntactic forms
+            // for a publicly-visible item declaration. Bare `pub` at
+            // end-of-line is vanishingly rare but is also a `pub`-token
+            // start, so accept it too.
+            let is_pub = bytes.starts_with(b"pub")
+                && (bytes.len() == 3
+                    || bytes[3] == b' '
+                    || bytes[3] == b'\t'
+                    || bytes[3] == b'(');
+            if !is_pub {
+                continue;
+            }
+            // Capture a short item descriptor (up to the first `{`, `;`,
+            // or 80 chars) as the report tag so the row shows both the
+            // `cfg(test)` line and what it gates.
+            let mut descriptor: String = item_trim
+                .chars()
+                .take_while(|c| *c != '{' && *c != ';' && *c != '\n')
+                .collect();
+            descriptor = descriptor.trim().chars().take(80).collect();
+            offenders.push((
+                rel.to_path_buf(),
+                idx + 1,
+                descriptor,
+                lines[idx].to_string(),
+            ));
+        }
+    });
+}
+
 /// True when `stripped` contains `cfg(any(...))` or `cfg(all(...))` with
 /// only whitespace between the inner parens.
 fn line_has_empty_cfg_gate(stripped: &str) -> bool {
@@ -1666,7 +1790,8 @@ fn scan_for_banned_allow(
     });
 }
 
-/// Scan for any `let _...` binding (bare `_`, `_name`, `mut _`, `mut _name`).
+/// Scan for any `let _...` binding (bare `_`, `_name`, `mut _`, `mut _name`,
+/// or tuple pattern `let (_, _) = ...;` where every binding is underscore-named).
 /// Skips lines whose `let` is inside a `//`-line-comment or a string literal.
 /// Multi-line raw strings and `/* ... */` blocks are out of scope: the scanner
 /// is a line-level heuristic, not a full parser. Build.rs is exempt.
@@ -1698,7 +1823,12 @@ fn scan_for_let_underscore(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf
 
 /// `let _...` detector that runs over an already-stripped line (string and
 /// comment contents already masked to spaces). Looks for `let` followed by
-/// an optional `mut` and then `_`.
+/// an optional `mut` and then either a bare `_`-leading binding or a
+/// tuple pattern in which every binding is underscore-prefixed. Catches:
+///   `let _ = expr;`             `let _: T = expr;`        `let _name = expr;`
+///   `let mut _name = expr;`     `let (_, _) = expr;`      `let (_a, _b) = expr;`
+///   `let (mut _a, _b) = expr;`  `let (_, (_x, _y)) = expr;`
+/// Does NOT flag `let (_, x) = expr;` because `x` is a real binding.
 fn stripped_line_has_let_underscore(line: &str) -> bool {
     let bytes = line.as_bytes();
     let mut i = 0usize;
@@ -1725,12 +1855,106 @@ fn stripped_line_has_let_underscore(line: &str) -> bool {
             if j < bytes.len() && bytes[j] == b'_' {
                 return true;
             }
+            // Tuple-pattern discard: `let (...) = ...;`. Walk the parenthesized
+            // pattern and flag iff every binding-name inside is `_` or `_<ident>`.
+            // Conservative: if the heuristic cannot classify (path / struct /
+            // refutable patterns, multi-line, type ascription, etc.), do not fire.
+            if j < bytes.len()
+                && bytes[j] == b'('
+                && tuple_pattern_all_underscore(bytes, j) == Some(true)
+            {
+                return true;
+            }
             i = j;
             continue;
         }
         i += 1;
     }
     false
+}
+
+/// Walk a parenthesized pattern starting at `start` (which must point at `(`)
+/// and decide whether every identifier-shaped binding inside is underscore-
+/// prefixed. Returns `Some(true)` iff at least one binding exists and all are
+/// underscore-named, `Some(false)` if any binding is a real name, and `None`
+/// if the pattern is malformed / multi-line / contains constructs the
+/// heuristic cannot classify (paths, struct patterns, refutable shapes like
+/// `Some(x)`, type ascriptions, etc.).
+fn tuple_pattern_all_underscore(bytes: &[u8], start: usize) -> Option<bool> {
+    if start >= bytes.len() || bytes[start] != b'(' {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut k = start;
+    let mut any_binding = false;
+    let mut all_underscore = true;
+    while k < bytes.len() {
+        let b = bytes[k];
+        match b {
+            b'(' => {
+                depth += 1;
+                k += 1;
+            }
+            b')' => {
+                depth -= 1;
+                k += 1;
+                if depth == 0 {
+                    if !any_binding {
+                        return None;
+                    }
+                    return Some(all_underscore);
+                }
+            }
+            b',' | b' ' | b'\t' => {
+                k += 1;
+            }
+            b'=' => {
+                // Reached the `=` of the let without closing the outer paren
+                // — malformed or multi-line. Bail conservatively.
+                return None;
+            }
+            _ => {
+                if b == b'_' || b.is_ascii_alphabetic() {
+                    // Read identifier-shaped run.
+                    let s = k;
+                    while k < bytes.len() && is_ident_byte(bytes[k]) {
+                        k += 1;
+                    }
+                    let word = &bytes[s..k];
+                    // Skip pattern modifiers; they precede the actual binding.
+                    if word == b"mut" || word == b"ref" {
+                        continue;
+                    }
+                    // Look ahead: if the next non-space byte is `(`, `{`, or
+                    // `::`, this is a path / struct / tuple-struct pattern
+                    // (e.g. `Some(x)`, `Foo { .. }`, `path::Variant(..)`) —
+                    // bail, the heuristic cannot classify it.
+                    let mut m = k;
+                    while m < bytes.len() && (bytes[m] == b' ' || bytes[m] == b'\t') {
+                        m += 1;
+                    }
+                    if m < bytes.len() {
+                        let nb = bytes[m];
+                        if nb == b'(' || nb == b'{' {
+                            return None;
+                        }
+                        if nb == b':' && m + 1 < bytes.len() && bytes[m + 1] == b':' {
+                            return None;
+                        }
+                    }
+                    any_binding = true;
+                    if !word.starts_with(b"_") {
+                        all_underscore = false;
+                    }
+                } else {
+                    // Any other byte (`:` type ascription, `&`, `@`, digits,
+                    // `..`, etc.) is outside the heuristic's competence.
+                    return None;
+                }
+            }
+        }
+    }
+    None
 }
 
 fn is_ident_byte(b: u8) -> bool {
