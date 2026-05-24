@@ -275,11 +275,11 @@ pub fn reconstruct_row(
     code: &SparseAtomCode,
     decoder_outputs: &[ArrayView1<'_, f64>],
 ) -> Array1<f64> {
-    debug_assert_eq!(decoder_outputs.len(), code.k_atoms());
+    assert_eq!(decoder_outputs.len(), code.k_atoms());
     let p = decoder_outputs.first().map(|v| v.len()).unwrap_or(0);
     let mut reconstruction = Array1::<f64>::zeros(p);
     for k in code.active_mask.iter_ones() {
-        debug_assert_eq!(decoder_outputs[k].len(), p);
+        assert_eq!(decoder_outputs[k].len(), p);
         let w = code.weights[k];
         for i in 0..p {
             reconstruction[i] += w * decoder_outputs[k][i];
@@ -307,7 +307,7 @@ pub fn data_grad_assignment_row(
     let mut g = Array1::<f64>::zeros(k);
     let p = residual.len();
     for kk in 0..k {
-        debug_assert_eq!(decoder_outputs[kk].len(), p);
+        assert_eq!(decoder_outputs[kk].len(), p);
         let mut acc = 0.0;
         let g_k = &decoder_outputs[kk];
         for i in 0..p {
@@ -438,7 +438,7 @@ impl EntropicSoftmax {
             out[i] = v;
             s += v;
         }
-        debug_assert!(s > 0.0);
+        assert!(s > 0.0);
         for v in out.iter_mut() {
             *v /= s;
         }

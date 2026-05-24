@@ -1234,13 +1234,13 @@ fn load_parquet_inferred(
         for (j, decoded) in decoded_columns.into_iter().enumerate() {
             match decoded? {
                 ParquetBatchColumn::Strings(mut strings) => {
-                    debug_assert!(is_string_col[j]);
+                    assert!(is_string_col[j]);
                     string_cols[j].as_mut().unwrap().append(&mut strings);
                     let new_len = col_vecs[j].len() + n_rows;
                     col_vecs[j].resize(new_len, f64::NAN);
                 }
                 ParquetBatchColumn::Numeric(mut values) => {
-                    debug_assert!(!is_string_col[j]);
+                    assert!(!is_string_col[j]);
                     col_vecs[j].append(&mut values);
                 }
             }

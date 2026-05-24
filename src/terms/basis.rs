@@ -4174,8 +4174,8 @@ impl StreamingRadialState {
             | StreamingAxisMode::ScalarTotal { metric_weights } => metric_weights,
         };
         let dim = metric_weights.len();
-        debug_assert_eq!(dim, self.data.ncols());
-        debug_assert_eq!(dim, self.centers.ncols());
+        assert_eq!(dim, self.data.ncols());
+        assert_eq!(dim, self.centers.ncols());
 
         // SERIAL fill: `ensure_triplet_cache` is called from inside outer
         // `into_par_iter` workers (e.g. the per-axis cross-trace sweep at
@@ -4215,7 +4215,7 @@ impl StreamingRadialState {
         match &self.axis_mode {
             StreamingAxisMode::PerAxis { metric_weights } => {
                 let dim = metric_weights.len();
-                debug_assert_eq!(s_buf.len(), dim);
+                assert_eq!(s_buf.len(), dim);
                 for a in 0..dim {
                     // SAFETY: compute_pair/ensure_triplet_cache callers pass i <
                     // data.nrows() and j < centers.nrows(); streaming constructors
@@ -4225,7 +4225,7 @@ impl StreamingRadialState {
                 }
             }
             StreamingAxisMode::ScalarTotal { metric_weights } => {
-                debug_assert_eq!(s_buf.len(), 1);
+                assert_eq!(s_buf.len(), 1);
                 let dim = metric_weights.len();
                 let mut r2 = 0.0;
                 for a in 0..dim {
@@ -4250,7 +4250,7 @@ impl StreamingRadialState {
         j: usize,
         s_buf: &mut [f64],
     ) -> Result<(f64, f64, f64), BasisError> {
-        debug_assert!(i < self.data.nrows() && j < self.centers.nrows());
+        assert!(i < self.data.nrows() && j < self.centers.nrows());
         self.fill_s_buf(i, j, s_buf);
         match &self.axis_mode {
             StreamingAxisMode::PerAxis { metric_weights } => {
@@ -5517,7 +5517,7 @@ impl ImplicitDesignPsiDerivative {
     /// `forward_mul_matrix` so per-axis trace evaluations can be a single
     /// chunked GEMM rather than rank-many `forward_mul` calls.
     pub fn unproject_matrix(&self, u: &ArrayView2<f64>) -> Array2<f64> {
-        debug_assert_eq!(u.nrows(), self.p_out());
+        assert_eq!(u.nrows(), self.p_out());
         // Step 1: undo full identifiability transform → (p_after_pad, rank).
         let after_full = match &self.full_ident_transform {
             Some(zf) => fast_ab(zf, u),
@@ -7650,7 +7650,7 @@ pub fn build_bspline_basis_1d(
                     // reach this branch, the upstream filter is broken.
                     // Surface a debug-assert in test builds and fall back
                     // to 0 in release so the build does not panic.
-                    debug_assert!(
+                    assert!(
                         false,
                         "PeriodicUniform knotspec should have been handled by the outer match arm"
                     );
@@ -10052,7 +10052,7 @@ fn hessian_operator_eta_cross_entry(
     axis_b: usize,
     axis_c: usize,
 ) -> f64 {
-    debug_assert_ne!(axis_i, axis_j);
+    assert_ne!(axis_i, axis_j);
     let i_is_b = usize::from(axis_i == axis_b) as f64;
     let i_is_c = usize::from(axis_i == axis_c) as f64;
     let j_is_b = usize::from(axis_j == axis_b) as f64;
@@ -11588,7 +11588,7 @@ fn lower_triangular_len(k: usize) -> usize {
 }
 
 fn symmetric_matrix_from_lower_values(k: usize, values: &[f64]) -> Array2<f64> {
-    debug_assert_eq!(values.len(), lower_triangular_len(k));
+    assert_eq!(values.len(), lower_triangular_len(k));
     let mut g = Array2::<f64>::zeros((k, k));
     let mut idx = 0usize;
     for i in 0..k {
@@ -14817,7 +14817,7 @@ fn euclidean_distance_rows(
     rhs: ArrayView2<'_, f64>,
     rhs_row: usize,
 ) -> f64 {
-    debug_assert_eq!(lhs.ncols(), rhs.ncols());
+    assert_eq!(lhs.ncols(), rhs.ncols());
     stable_euclidean_norm((0..lhs.ncols()).map(|axis| lhs[[lhs_row, axis]] - rhs[[rhs_row, axis]]))
 }
 
@@ -14837,8 +14837,8 @@ fn aniso_distance_rows_with_scales(
     rhs_row: usize,
     axis_scales: &[f64],
 ) -> f64 {
-    debug_assert_eq!(lhs.ncols(), rhs.ncols());
-    debug_assert_eq!(lhs.ncols(), axis_scales.len());
+    assert_eq!(lhs.ncols(), rhs.ncols());
+    assert_eq!(lhs.ncols(), axis_scales.len());
     stable_euclidean_norm(
         (0..lhs.ncols())
             .map(|axis| axis_scales[axis] * (lhs[[lhs_row, axis]] - rhs[[rhs_row, axis]])),
@@ -14849,7 +14849,7 @@ fn fill_symmetric_from_row_kernel<F>(matrix: &mut Array2<f64>, kernel: F) -> Res
 where
     F: Fn(usize, usize) -> Result<f64, BasisError> + Sync,
 {
-    debug_assert_eq!(matrix.nrows(), matrix.ncols());
+    assert_eq!(matrix.nrows(), matrix.ncols());
     matrix
         .axis_iter_mut(Axis(0))
         .into_par_iter()
@@ -16299,8 +16299,8 @@ fn fill_real_spherical_harmonics_row(
     mut row: ndarray::ArrayViewMut1<'_, f64>,
 ) {
     let l_cap = max_degree + 1;
-    debug_assert_eq!(p_buf.len(), l_cap * l_cap);
-    debug_assert_eq!(norms.len(), l_cap * l_cap);
+    assert_eq!(p_buf.len(), l_cap * l_cap);
+    assert_eq!(norms.len(), l_cap * l_cap);
     // Recurrence for associated Legendre P_{l,m}(sin(lat)) — standard
     // formulation (no Condon-Shortley phase, since we apply the (-1)^m
     // factor implicitly through cos(m·φ)/sin(m·φ) sign cancellation).
@@ -21781,9 +21781,9 @@ fn duchon_mixed_periodicity_distance(
     periods: &[f64],
 ) -> f64 {
     let d = x.len();
-    debug_assert_eq!(d, y.len());
-    debug_assert_eq!(d, periodic_per_axis.len());
-    debug_assert_eq!(d, periods.len());
+    assert_eq!(d, y.len());
+    assert_eq!(d, periodic_per_axis.len());
+    assert_eq!(d, periods.len());
     let mut acc = 0.0_f64;
     for j in 0..d {
         let delta = if periodic_per_axis[j] {
@@ -25682,15 +25682,15 @@ pub mod closed_form_penalty {
         r: f64,
         max_order: usize,
     ) -> Vec<f64> {
-        debug_assert!(m >= 1, "stable_hybrid_duchon_radial: m ≥ 1");
-        debug_assert!(s >= 1, "stable_hybrid_duchon_radial: s ≥ 1");
-        debug_assert!(kappa > 0.0, "stable_hybrid_duchon_radial: κ > 0");
-        debug_assert!(r > 0.0, "stable_hybrid_duchon_radial: r > 0");
-        debug_assert!(
+        assert!(m >= 1, "stable_hybrid_duchon_radial: m ≥ 1");
+        assert!(s >= 1, "stable_hybrid_duchon_radial: s ≥ 1");
+        assert!(kappa > 0.0, "stable_hybrid_duchon_radial: κ > 0");
+        assert!(r > 0.0, "stable_hybrid_duchon_radial: r > 0");
+        assert!(
             max_order <= 6,
             "stable_hybrid_duchon_radial requires max_order <= 6: max_order={max_order}"
         );
-        debug_assert!(
+        assert!(
             schwinger_radial_is_convergent(d, m),
             "stable_hybrid_duchon_radial: requires d > 4m"
         );
@@ -26059,13 +26059,13 @@ pub mod closed_form_penalty {
         max_order: usize,
         kappa_derivative_order: usize,
     ) -> Vec<f64> {
-        debug_assert!(b >= 1);
-        debug_assert!(
+        assert!(b >= 1);
+        assert!(
             kappa > 0.0,
             "matern kernel derivative requires kappa > 0: kappa={kappa}"
         );
-        debug_assert!(r > 0.0, "matern kernel derivative requires r > 0: r={r}");
-        debug_assert!(
+        assert!(r > 0.0, "matern kernel derivative requires r > 0: r={r}");
+        assert!(
             kappa_derivative_order <= 2,
             "matern kernel derivative supports kappa_derivative_order <= 2: order={kappa_derivative_order}"
         );
@@ -26313,9 +26313,9 @@ pub mod closed_form_penalty {
 
         #[inline(always)]
         fn assert_dim(&self, dim: usize) {
-            debug_assert_eq!(self.b.len(), dim);
-            debug_assert_eq!(self.b2.len(), dim);
-            debug_assert_eq!(self.b3.len(), dim);
+            assert_eq!(self.b.len(), dim);
+            assert_eq!(self.b2.len(), dim);
+            assert_eq!(self.b3.len(), dim);
         }
     }
 
@@ -26738,7 +26738,7 @@ pub mod closed_form_penalty {
                     if c == 0.0 {
                         continue;
                     }
-                    debug_assert!(
+                    assert!(
                         a.fract() == 0.0,
                         "matern_block_radial_derivatives: expected integer exponent for even d"
                     );
@@ -37529,7 +37529,7 @@ mod tests {
                 r: f64,
                 max_order: usize,
             ) -> Vec<f64> {
-                debug_assert_eq!(d % 2, 1);
+                assert_eq!(d % 2, 1);
                 let value = super::closed_form_penalty::riesz_kernel_value(d, (j) as f64, r);
                 let p = 2 * j as i32 - d as i32;
                 let mut out = Vec::with_capacity(max_order + 1);

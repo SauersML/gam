@@ -217,8 +217,8 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
     use faer::linalg::matmul::triangular::{BlockStructure, matmul as tri_matmul};
 
     let (n, p) = a.dim();
-    debug_assert_eq!(out.nrows(), p, "output rows must match p");
-    debug_assert_eq!(out.ncols(), p, "output cols must match p");
+    assert_eq!(out.nrows(), p, "output rows must match p");
+    assert_eq!(out.ncols(), p, "output cols must match p");
 
     if !should_use_faer_matmul(p, p, n) {
         out.assign(&a.t().dot(a));
@@ -279,7 +279,7 @@ pub fn fast_atb_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let (n_a, p) = a.dim();
     let (n_b, q) = b.dim();
-    debug_assert_eq!(n_a, n_b, "A and B must have same number of rows");
+    assert_eq!(n_a, n_b, "A and B must have same number of rows");
 
     // For very small matrices, ndarray might be faster due to less overhead
     if !should_use_faer_matmul(p, q, n_a) {
@@ -318,7 +318,7 @@ pub fn fast_abt<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let (m, k_a) = a.dim();
     let (n, k_b) = b.dim();
-    debug_assert_eq!(
+    assert_eq!(
         k_a, k_b,
         "A and B must have same number of columns for A·Bᵀ"
     );
@@ -382,7 +382,7 @@ fn fast_av_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     use faer::{Accum, Mat};
 
     let (n, p) = a.dim();
-    debug_assert_eq!(p, v.len(), "A cols must match v length");
+    assert_eq!(p, v.len(), "A cols must match v length");
 
     if !should_use_faer_matmul(n, 1, p) {
         return a.dot(v);
@@ -426,8 +426,8 @@ fn fast_av_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     use faer::linalg::matmul::matmul;
 
     let (n, p) = a.dim();
-    debug_assert_eq!(v.len(), p, "vector length must match A cols");
-    debug_assert_eq!(out.len(), n, "output length must match A rows");
+    assert_eq!(v.len(), p, "vector length must match A cols");
+    assert_eq!(out.len(), n, "output length must match A rows");
 
     if !should_use_faer_matmul(n, 1, p) {
         out.assign(&a.dot(v));
@@ -469,8 +469,8 @@ fn fast_av_view_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     use faer::linalg::matmul::matmul;
 
     let (n, p) = a.dim();
-    debug_assert_eq!(v.len(), p, "vector length must match A cols");
-    debug_assert_eq!(out.len(), n, "output length must match A rows");
+    assert_eq!(v.len(), p, "vector length must match A cols");
+    assert_eq!(out.len(), n, "output length must match A rows");
 
     if !should_use_faer_matmul(n, 1, p) {
         let prod = a.dot(v);
@@ -523,7 +523,7 @@ fn fast_atv_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     use faer::{Accum, Mat};
 
     let (n, p) = a.dim();
-    debug_assert_eq!(n, v.len(), "A rows must match v length");
+    assert_eq!(n, v.len(), "A rows must match v length");
 
     // For very small arrays, ndarray might be faster
     if !should_use_faer_matmul(p, 1, n) {
@@ -576,8 +576,8 @@ fn fast_atv_into_impl<S: Data<Elem = f64>>(
     use faer::linalg::matmul::matmul;
 
     let (n, p) = a.dim();
-    debug_assert_eq!(v.len(), n, "vector length must match A rows");
-    debug_assert_eq!(out.len(), p, "output length must match A cols");
+    assert_eq!(v.len(), n, "vector length must match A rows");
+    assert_eq!(out.len(), p, "output length must match A cols");
 
     if !should_use_faer_matmul(p, 1, n) {
         out.assign(&a.t().dot(v));
@@ -646,7 +646,7 @@ fn fast_xt_diag_x_with_parallelism_impl<S1: Data<Elem = f64>, S2: Data<Elem = f6
     use ndarray::{ShapeBuilder, s};
 
     let (n, p) = x.dim();
-    debug_assert_eq!(n, w.len(), "X rows must match W length");
+    assert_eq!(n, w.len(), "X rows must match W length");
     if n == 0 || p == 0 {
         return Array2::<f64>::zeros((p, p));
     }
@@ -776,8 +776,8 @@ fn fast_xt_diag_y_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem
 
     let (n, q) = y.dim();
     let px = x.ncols();
-    debug_assert_eq!(n, w.len(), "Y rows must match W length");
-    debug_assert_eq!(n, x.nrows(), "X rows must match Y rows");
+    assert_eq!(n, w.len(), "Y rows must match W length");
+    assert_eq!(n, x.nrows(), "X rows must match Y rows");
     if n == 0 || px == 0 || q == 0 {
         return Array2::<f64>::zeros((px, q));
     }
@@ -908,10 +908,10 @@ fn fast_joint_hessian_2x2_impl<
     let pa = x_a.ncols();
     let pb = x_b.ncols();
     let total = pa + pb;
-    debug_assert_eq!(n, x_b.nrows());
-    debug_assert_eq!(n, w_aa.len());
-    debug_assert_eq!(n, w_ab.len());
-    debug_assert_eq!(n, w_bb.len());
+    assert_eq!(n, x_b.nrows());
+    assert_eq!(n, w_aa.len());
+    assert_eq!(n, w_ab.len());
+    assert_eq!(n, w_bb.len());
 
     if n == 0 || total == 0 {
         return Array2::<f64>::zeros((total, total));
@@ -1130,8 +1130,8 @@ fn fast_ab_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let (n, p) = a.dim();
     let (p_b, q) = b.dim();
-    debug_assert_eq!(p, p_b, "A and B must have compatible inner dimensions");
-    debug_assert_eq!(out.dim(), (n, q), "output dimensions must match A*B result");
+    assert_eq!(p, p_b, "A and B must have compatible inner dimensions");
+    assert_eq!(out.dim(), (n, q), "output dimensions must match A*B result");
 
     if !should_use_faer_matmul(n, q, p) {
         out.assign(&a.dot(b));

@@ -1152,7 +1152,7 @@ fn compute_multiblock_alo_chunk(
                 scratch.imwa[d * b + d] += ALO_LOCAL_BLOCK_RIDGE;
             }
             let refactored = lu_factor_in_place(&mut scratch.imwa, &mut scratch.perm_imwa, b);
-            debug_assert!(
+            assert!(
                 refactored,
                 "ALO local block remained singular after ridge regularization"
             );
@@ -1169,7 +1169,7 @@ fn compute_multiblock_alo_chunk(
                 scratch.imaw[d * b + d] += ALO_LOCAL_BLOCK_RIDGE;
             }
             let refactored = lu_factor_in_place(&mut scratch.imaw, &mut scratch.perm_imaw, b);
-            debug_assert!(
+            assert!(
                 refactored,
                 "ALO local variance block remained singular after ridge regularization"
             );

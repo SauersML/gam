@@ -501,7 +501,7 @@ fn lanczos_log_quadrature_hvp(
 
 #[inline]
 fn dot_slice(a: &[f64], b: &[f64]) -> f64 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len());
     let mut s = 0.0_f64;
     for i in 0..a.len() {
         s += a[i] * b[i];
@@ -887,7 +887,7 @@ pub fn evidence_grad_rho(
         let mut row_trace_acc = 0.0_f64;
         for i in 0..n {
             let m_i = &huu_drho[i][a];
-            debug_assert_eq!(m_i.shape(), &[d, d]);
+            assert_eq!(m_i.shape(), &[d, d]);
             for col in 0..d {
                 for r0 in 0..d {
                     trace_rhs[r0] = m_i[[r0, col]];
@@ -906,7 +906,7 @@ pub fn evidence_grad_rho(
         // tr(A⁻¹ ∂A) by `Σ_j (A⁻¹ ∂A)[j, j]` via column solves of the
         // Schur Cholesky.
         let mut da = hbb_drho[a].clone();
-        debug_assert_eq!(da.shape(), &[k, k]);
+        assert_eq!(da.shape(), &[k, k]);
         for i in 0..n {
             let dhtb = &htbeta_drho[i][a]; // d × K
             let yi = &y_blocks[i]; // d × K

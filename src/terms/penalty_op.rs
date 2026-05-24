@@ -71,7 +71,7 @@ pub trait PenaltyOp: Send + Sync {
 
 impl PenaltyOp for Array2<f64> {
     fn dim(&self) -> usize {
-        debug_assert_eq!(
+        assert_eq!(
             self.nrows(),
             self.ncols(),
             "PenaltyOp matrix must be square"
@@ -215,7 +215,7 @@ impl PenaltyForm {
     pub fn dim(&self) -> usize {
         match self {
             PenaltyForm::Dense(m) => {
-                debug_assert_eq!(m.nrows(), m.ncols());
+                assert_eq!(m.nrows(), m.ncols());
                 m.nrows()
             }
             PenaltyForm::Operator(op) => op.dim(),
