@@ -79,8 +79,7 @@ __all__ = [
 ]
 
 
-# Weight specification: either "auto" (REML-selected) or a positive float
-# (held fixed at that value throughout the fit).
+# Weight specification: either "auto" or a positive scalar base multiplier.
 WeightSpec: TypeAlias = str | float
 TargetSpec: TypeAlias = str | int | Any
 
@@ -223,7 +222,7 @@ class IsometryPenalty:
         Either the name of a ``LatentCoord`` block (``"t"``) or the
         ``LatentCoord`` object itself.
     weight
-        ``"auto"`` (REML-selected; the default) or a fixed positive float.
+        ``"auto"`` (the default) or a positive scalar base multiplier.
     """
 
     target: TargetSpec
@@ -295,7 +294,7 @@ class SparsityPenalty:
     kind
         ``"smooth_l1"`` (the default), ``"hoyer"``, or ``"log"``.
     weight
-        ``"auto"`` (REML) or a fixed positive float.
+        ``"auto"`` (the default) or a positive scalar base multiplier.
     eps
         Smoothing scale for ``"smooth_l1"`` / ``"log"`` kernels. Default
         ``1e-3``.

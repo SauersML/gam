@@ -290,7 +290,7 @@ fn t04_epsilon_boundary_lowrank_to_full_transition() {
             scores[[i, 2]] = scores[[i, 0]] + eps * noise[[i, 0]];
         }
         let shape = classify(scores.view(), &weights);
-        dbg!(eps, shape);
+        eprintln!("eps={eps:e} shape={shape:?}");
         shapes_per_eps.push((eps, shape));
     }
     println!("t04 threshold sweep (col3 = col1 + eps*noise):");
