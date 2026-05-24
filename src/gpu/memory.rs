@@ -1,83 +1,86 @@
-use ndarray::{Array1, Array2};
-use serde::{Deserialize, Serialize};
+use super::cpu_traits::MatrixLocation;
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DeviceBuffer {
+#[derive(Clone, Debug)]
+pub struct DeviceBuffer<T> {
     pub len: usize,
-    pub bytes: usize,
-    pub backend: String,
+    pub location: MatrixLocation,
+    pub host_shadow: Vec<T>,
 }
 
-impl DeviceBuffer {
-    #[must_use]
-    pub fn placeholder(len: usize, elem_bytes: usize) -> Self {
+impl<T: Clone + Default> DeviceBuffer<T> {
+    pub fn zeros(len: usize) -> Self {
         Self {
             len,
-            bytes: len.saturating_mul(elem_bytes),
-            backend: "cpu-placeholder".to_string(),
+            location: MatrixLocation::Host,
+            host_shadow: vec![T::default(); len],
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub type DeviceVector = DeviceBuffer<f64>;
+
+#[derive(Clone, Debug)]
 pub struct DeviceMatrix {
     pub rows: usize,
     pub cols: usize,
-    pub buffer: DeviceBuffer,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DeviceVector {
-    pub len: usize,
-    pub buffer: DeviceBuffer,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct DeviceCsrMatrix {
-    pub rows: usize,
-    pub cols: usize,
-    pub nnz: usize,
-    pub rowptr: DeviceBuffer,
-    pub colidx: DeviceBuffer,
-    pub values: DeviceBuffer,
+    pub leading_dim: usize,
+    pub location: MatrixLocation,
+    pub host_shadow: Vec<f64>,
 }
 
 impl DeviceMatrix {
-    #[must_use]
-    pub fn from_host_shape(host: &Array2<f64>) -> Self {
-        let (rows, cols) = host.dim();
+    pub fn zeros(rows: usize, cols: usize) -> Self {
         Self {
             rows,
             cols,
-            buffer: DeviceBuffer::placeholder(rows.saturating_mul(cols), 8),
+            leading_dim: rows,
+            location: MatrixLocation::Host,
+            host_shadow: vec![0.0; rows.saturating_mul(cols)],
         }
     }
 }
 
-impl DeviceVector {
-    #[must_use]
-    pub fn from_host_shape(host: &Array1<f64>) -> Self {
-        Self {
-            len: host.len(),
-            buffer: DeviceBuffer::placeholder(host.len(), 8),
-        }
-    }
+#[derive(Clone, Debug)]
+pub struct DeviceCsrMatrix {
+    pub rows: usize,
+    pub cols: usize,
+    pub rowptr: Vec<usize>,
+    pub colidx: Vec<usize>,
+    pub values: Vec<f64>,
+    pub location: MatrixLocation,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct GpuFitSession {
-    pub persistent_bytes: usize,
-    pub iteration_bytes: usize,
-    pub lm_attempt_bytes: usize,
-    pub dense_design: Option<DeviceMatrix>,
-    pub sparse_design: Option<DeviceCsrMatrix>,
+    pub target: super::cpu_traits::ExecutionTarget,
+    pub n: usize,
+    pub p: usize,
+    pub x_dense: Option<DeviceMatrix>,
+    pub x_sparse: Option<DeviceCsrMatrix>,
+    pub beta: DeviceVector,
+    pub eta: DeviceVector,
+    pub mu: DeviceVector,
+    pub w: DeviceVector,
+    pub z: DeviceVector,
+    pub gradient: DeviceVector,
+    pub hessian: DeviceMatrix,
 }
 
 impl GpuFitSession {
-    #[must_use]
-    pub fn total_bytes(&self) -> usize {
-        self.persistent_bytes
-            .saturating_add(self.iteration_bytes)
-            .saturating_add(self.lm_attempt_bytes)
+    pub fn host_fallback(n: usize, p: usize) -> Self {
+        Self {
+            target: super::cpu_traits::ExecutionTarget::Cpu,
+            n,
+            p,
+            x_dense: None,
+            x_sparse: None,
+            beta: DeviceVector::zeros(p),
+            eta: DeviceVector::zeros(n),
+            mu: DeviceVector::zeros(n),
+            w: DeviceVector::zeros(n),
+            z: DeviceVector::zeros(n),
+            gradient: DeviceVector::zeros(p),
+            hessian: DeviceMatrix::zeros(p, p),
+        }
     }
 }

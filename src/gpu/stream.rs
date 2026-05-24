@@ -1,7 +1,18 @@
-//! Phase-specific GPU backend placeholder.
-//!
-//! The public marker keeps the HAL surface explicit while the default build and
-//! unsupported CUDA configurations use CPU fallback through dispatch policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamRole {
+    Main,
+    LinkKernel,
+    XtWx,
+    Reduction,
+}
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BackendPhaseMarker;
+#[derive(Clone, Debug, Default)]
+pub struct GpuStreamPool {
+    pub streams: usize,
+}
+
+impl GpuStreamPool {
+    pub fn new(streams: usize) -> Self {
+        Self { streams }
+    }
+}
