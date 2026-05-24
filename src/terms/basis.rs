@@ -20348,7 +20348,7 @@ fn build_duchon_basis_designwithworkspace(
         centers,
         length_scale,
         p_order,
-        s_order,
+        duchon_power_to_usize(s_order),
         d,
         aniso_log_scales,
         coeffs.as_ref(),
@@ -21231,18 +21231,56 @@ pub fn periodic_bspline_first_derivative_nd(
             t.ncols()
         )));
     }
+    if degree == 0 {
+        return Err(BasisError::InvalidInput(
+            "periodic_bspline_first_derivative_nd requires degree >= 1".to_string(),
+        ));
+    }
+    if num_basis < degree + 1 {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic_bspline_first_derivative_nd requires num_basis >= degree + 1 (got num_basis={num_basis}, degree={degree})"
+        )));
+    }
+    let (start, end) = data_range;
+    if !(start.is_finite() && end.is_finite()) || end <= start {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic_bspline_first_derivative_nd: data_range must be finite and ordered, got {data_range:?}"
+        )));
+    }
+    let period = end - start;
+    let m = num_basis as f64;
+    let h = period / m;
     let n_rows = t.nrows();
-    let t_col = t.column(0).to_owned();
-    let deriv = create_periodic_bspline_derivative_dense(
-        t_col.view(),
-        data_range,
-        degree,
-        num_basis,
-    )?;
+    let t_col = t.column(0);
+
+    // Closed-form derivative of the periodized cardinal B-spline:
+    //   B_i(x) = Σ_κ N_d(τ − i + κ·m)
+    //   B'_i(x) = (1/h) · Σ_κ [N_{d−1}(τ − i + κ·m) − N_{d−1}(τ − i + κ·m − 1)]
+    // where τ = wrap(x; start, period) / h, d = degree, m = num_basis,
+    // and N_d is the cardinal B-spline of degree d. The κ-window matches the
+    // value path in `build_periodic_bspline_basis_1d`; degree d − 1 means
+    // support [0, d], so the κ bounds widen by exactly one m-period at each
+    // end of the support compared to the value computation.
     let mut out = Array3::<f64>::zeros((n_rows, num_basis, 1));
-    for n in 0..n_rows {
-        for k in 0..num_basis {
-            out[[n, k, 0]] = deriv[[n, k]];
+    for row in 0..n_rows {
+        let xi = t_col[row];
+        if !xi.is_finite() {
+            return Err(BasisError::InvalidInput(format!(
+                "periodic_bspline_first_derivative_nd: non-finite latent at row {row}"
+            )));
+        }
+        let tau = wrap_periodic_phase(xi, start, period) / h;
+        for i in 0..num_basis {
+            let base = tau - i as f64;
+            let k_min = ((-base) / m).floor() as isize - 1;
+            let k_max = (((degree + 1) as f64 - base) / m).ceil() as isize + 1;
+            let mut value = 0.0_f64;
+            for k in k_min..=k_max {
+                let x_arg = base + (k as f64) * m;
+                value += cardinal_bspline_value(x_arg, degree - 1)
+                    - cardinal_bspline_value(x_arg - 1.0, degree - 1);
+            }
+            out[[row, i, 0]] = value / h;
         }
     }
     Ok(out)
@@ -21708,7 +21746,7 @@ fn build_periodic_duchon_basis_1d(
             centers,
             length_scale: spec.length_scale,
             periodic: Some(vec![Some(period)]),
-            power: spec.power,
+            power: spec.power_as_usize(),
             nullspace_order: effective_nullspace_order,
             identifiability_transform,
             input_scales: None,
@@ -21966,7 +22004,7 @@ fn build_duchon_basis_mixed_periodicity(
                     .map(|(&is_periodic, &period)| if is_periodic { Some(period) } else { None })
                     .collect(),
             ),
-            power: spec.power,
+            power: spec.power_as_usize(),
             nullspace_order: effective_nullspace_order,
             identifiability_transform,
             input_scales: None,
@@ -22117,7 +22155,7 @@ pub fn build_duchon_basiswithworkspace(
             centers.view(),
             length_scale,
             p_order,
-            s_order,
+            duchon_power_to_usize(s_order),
             d,
             aniso.as_deref(),
             coeffs.as_ref(),
@@ -22327,10 +22365,10 @@ pub fn build_duchon_basiswithworkspace(
         penaltyinfo,
         ops,
         metadata: BasisMetadata::Duchon {
-            centers: original_centers,
+            centers,
             length_scale: spec.length_scale,
             periodic: spec.periodic.clone(),
-            power: spec.power,
+            power: spec.power_as_usize(),
             nullspace_order: effective_nullspace_order,
             identifiability_transform,
             input_scales: None,
