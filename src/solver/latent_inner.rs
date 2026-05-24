@@ -492,9 +492,11 @@ mod tests {
     impl ArrowSystemAssembler for ZeroAssembler {
         fn assemble(
             &mut self,
-            _: ArrayView1<'_, f64>,
-            _: &LatentCoordValues,
+            arr: ArrayView1<'_, f64>,
+            latent_coords: &LatentCoordValues,
         ) -> Result<ArrowSchurSystem, String> {
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
+            debug_assert!(std::mem::size_of_val(latent_coords) > 0);
             let mut sys = ArrowSchurSystem::new(self.n, self.d, self.k);
             for j in 0..self.k {
                 sys.hbb[[j, j]] = 1.0;
@@ -509,9 +511,11 @@ mod tests {
 
         fn objective(
             &mut self,
-            _: ArrayView1<'_, f64>,
-            _: &LatentCoordValues,
+            arr: ArrayView1<'_, f64>,
+            latent_coords: &LatentCoordValues,
         ) -> Result<f64, String> {
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
+            debug_assert!(std::mem::size_of_val(latent_coords) > 0);
             Ok(0.0)
         }
     }

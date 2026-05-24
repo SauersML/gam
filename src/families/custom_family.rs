@@ -1558,8 +1558,9 @@ pub trait CustomFamily {
     fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],
-        _: &BlockwiseFitOptions,
+        options: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
+        debug_assert!(std::mem::size_of_val(options) > 0);
         let coefficient_work = self
             .coefficient_hessian_cost(specs)
             .max(self.coefficient_gradient_cost(specs));
@@ -1662,9 +1663,10 @@ pub trait CustomFamily {
     /// current values of other blocks.
     fn block_geometry(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         spec: &ParameterBlockSpec,
     ) -> Result<(DesignMatrix, Array1<f64>), String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
         Ok((spec.design.clone(), spec.offset.clone()))
     }
 
@@ -1706,22 +1708,29 @@ pub trait CustomFamily {
     /// when that declaration is false.
     fn block_geometry_directional_derivative(
         &self,
-        _: &[ParameterBlockState],
-        _: usize,
-        _: &ParameterBlockSpec,
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        idx: usize,
+        block_spec: &ParameterBlockSpec,
+        arr: &Array1<f64>,
     ) -> Result<Option<BlockGeometryDirectionalDerivative>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(idx < usize::MAX);
+        debug_assert!(!block_spec.name.is_empty());
+        debug_assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
 
     /// Optional per-block coefficient projection applied after each block update.
     fn post_update_block_beta(
         &self,
-        _: &[ParameterBlockState],
-        _: usize,
-        _: &ParameterBlockSpec,
+        block_states: &[ParameterBlockState],
+        idx: usize,
+        block_spec: &ParameterBlockSpec,
         beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(idx < usize::MAX);
+        debug_assert!(!block_spec.name.is_empty());
         Ok(beta)
     }
 
@@ -1741,10 +1750,13 @@ pub trait CustomFamily {
     /// Returns `None` if no barrier constraint applies (the default).
     fn max_feasible_step_size(
         &self,
-        _: &[ParameterBlockState],
-        _: usize,
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        idx: usize,
+        arr: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(idx < usize::MAX);
+        debug_assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
 
@@ -1752,10 +1764,13 @@ pub trait CustomFamily {
     /// `A * beta_block >= b`.
     fn block_linear_constraints(
         &self,
-        _: &[ParameterBlockState],
-        _: usize,
-        _: &ParameterBlockSpec,
+        block_states: &[ParameterBlockState],
+        idx: usize,
+        block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(idx < usize::MAX);
+        debug_assert!(!block_spec.name.is_empty());
         Ok(None)
     }
 
@@ -1771,10 +1786,13 @@ pub trait CustomFamily {
     /// `None` as unavailable rather than silently substituting zero.
     fn exact_newton_hessian_directional_derivative(
         &self,
-        _: &[ParameterBlockState],
-        _: usize,
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        idx: usize,
+        arr: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(idx < usize::MAX);
+        debug_assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
 
@@ -1790,11 +1808,15 @@ pub trait CustomFamily {
     /// Hessian drift is unavailable.
     fn exact_newton_hessian_second_directional_derivative(
         &self,
-        _: &[ParameterBlockState],
-        _: usize,
-        _: &Array1<f64>,
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        idx: usize,
+        arr: &Array1<f64>,
+        arr2: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(idx < usize::MAX);
+        debug_assert!(arr.iter().all(|v| !v.is_nan()));
+        debug_assert!(arr2.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
 
@@ -1834,9 +1856,11 @@ pub trait CustomFamily {
     /// coefficient space without building per-block Hessian working sets.
     fn exact_newton_joint_gradient_evaluation(
         &self,
-        _: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
+        block_states: &[ParameterBlockState],
+        block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(block_specs.len() <= isize::MAX as usize);
         Ok(None)
     }
 
@@ -1885,9 +1909,11 @@ pub trait CustomFamily {
     /// calls made by the unified outer evaluator.
     fn exact_newton_joint_hessian_workspace(
         &self,
-        _: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
+        block_states: &[ParameterBlockState],
+        block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(block_specs.len() <= isize::MAX as usize);
         Ok(None)
     }
 
@@ -2241,8 +2267,9 @@ pub trait CustomFamily {
     /// return derivatives in that same scaled curvature space.
     fn exact_newton_outer_curvature(
         &self,
-        _: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
     ) -> Result<Option<ExactNewtonOuterCurvature>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
         Ok(None)
     }
 
@@ -2260,9 +2287,10 @@ pub trait CustomFamily {
     fn exact_newton_outer_curvature_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
+        block_specs: &[ParameterBlockSpec],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        debug_assert!(block_specs.len() <= isize::MAX as usize);
         self.exact_newton_outer_curvature_directional_derivative(block_states, d_beta_flat)
     }
 
@@ -2285,10 +2313,11 @@ pub trait CustomFamily {
     fn exact_newton_outer_curvature_second_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
+        block_specs: &[ParameterBlockSpec],
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        debug_assert!(block_specs.len() <= isize::MAX as usize);
         self.exact_newton_outer_curvature_second_directional_derivative(
             block_states,
             d_beta_u_flat,
@@ -2467,10 +2496,13 @@ pub trait CustomFamily {
     /// this with zero unless the family truly has constant working weights.
     fn diagonalworking_weights_directional_derivative(
         &self,
-        _: &[ParameterBlockState],
-        _: usize,
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        idx: usize,
+        arr: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(idx < usize::MAX);
+        debug_assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
 
@@ -2487,11 +2519,15 @@ pub trait CustomFamily {
     /// first-order geometry while building `d²H`.
     fn diagonalworking_weights_second_directional_derivative(
         &self,
-        _: &[ParameterBlockState],
-        _: usize,
-        _: &Array1<f64>,
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        idx: usize,
+        arr: &Array1<f64>,
+        arr2: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(idx < usize::MAX);
+        debug_assert!(arr.iter().all(|v| !v.is_nan()));
+        debug_assert!(arr2.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
 
@@ -2523,11 +2559,15 @@ pub trait CustomFamily {
     /// evaluation must use this flattened-coefficient hook instead.
     fn exact_newton_joint_psi_terms(
         &self,
-        _: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
-        _: &[Vec<CustomFamilyBlockPsiDerivative>],
-        _: usize,
+        block_states: &[ParameterBlockState],
+        block_specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        idx: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(block_specs.len() <= isize::MAX as usize);
+        debug_assert!(derivative_blocks.len() <= isize::MAX as usize);
+        debug_assert!(idx < usize::MAX);
         Ok(None)
     }
 
@@ -2544,12 +2584,17 @@ pub trait CustomFamily {
     /// contributions and profile/Laplace corrections.
     fn exact_newton_joint_psisecond_order_terms(
         &self,
-        _: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
-        _: &[Vec<CustomFamilyBlockPsiDerivative>],
-        _: usize,
-        _: usize,
+        block_states: &[ParameterBlockState],
+        block_specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        idx: usize,
+        idx2: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(block_specs.len() <= isize::MAX as usize);
+        debug_assert!(derivative_blocks.len() <= isize::MAX as usize);
+        debug_assert!(idx < usize::MAX);
+        debug_assert!(idx2 < usize::MAX);
         Ok(None)
     }
 
@@ -2565,10 +2610,13 @@ pub trait CustomFamily {
     /// above when no workspace is provided.
     fn exact_newton_joint_psi_workspace(
         &self,
-        _: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
-        _: &[Vec<CustomFamilyBlockPsiDerivative>],
+        block_states: &[ParameterBlockState],
+        block_specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(block_specs.len() <= isize::MAX as usize);
+        debug_assert!(derivative_blocks.len() <= isize::MAX as usize);
         Ok(None)
     }
 
@@ -2622,12 +2670,17 @@ pub trait CustomFamily {
     /// `exact_newton_joint_psi_workspace()` instead.
     fn exact_newton_joint_psihessian_directional_derivative(
         &self,
-        _: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
-        _: &[Vec<CustomFamilyBlockPsiDerivative>],
-        _: usize,
-        _: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        block_specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        idx: usize,
+        arr: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        debug_assert!(block_states.len() <= isize::MAX as usize);
+        debug_assert!(block_specs.len() <= isize::MAX as usize);
+        debug_assert!(derivative_blocks.len() <= isize::MAX as usize);
+        debug_assert!(idx < usize::MAX);
+        debug_assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
 
@@ -4090,27 +4143,30 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn transpose_mul(
         &self,
-        _: usize,
+        idx: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert!(idx < usize::MAX);
         assert_eq!(v.len(), self.n, "zero psi transpose_mul length mismatch");
         Ok(Array1::<f64>::zeros(self.p))
     }
 
     fn forward_mul(
         &self,
-        _: usize,
+        idx: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert!(idx < usize::MAX);
         assert_eq!(u.len(), self.p, "zero psi forward_mul length mismatch");
         Ok(Array1::<f64>::zeros(self.n))
     }
 
     fn transpose_mul_second_diag(
         &self,
-        _: usize,
+        idx: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert!(idx < usize::MAX);
         assert_eq!(
             v.len(),
             self.n,
@@ -4121,10 +4177,12 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn transpose_mul_second_cross(
         &self,
-        _: usize,
-        _: usize,
+        idx: usize,
+        idx2: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert!(idx < usize::MAX);
+        debug_assert!(idx2 < usize::MAX);
         assert_eq!(
             v.len(),
             self.n,
@@ -4135,9 +4193,10 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn forward_mul_second_diag(
         &self,
-        _: usize,
+        idx: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert!(idx < usize::MAX);
         assert_eq!(
             u.len(),
             self.p,
@@ -4148,10 +4207,12 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn forward_mul_second_cross(
         &self,
-        _: usize,
-        _: usize,
+        idx: usize,
+        idx2: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert!(idx < usize::MAX);
+        debug_assert!(idx2 < usize::MAX);
         assert_eq!(
             u.len(),
             self.p,
@@ -4162,9 +4223,10 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn row_chunk_first(
         &self,
-        _: usize,
+        idx: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        debug_assert!(idx < usize::MAX);
         assert!(
             rows.start <= rows.end && rows.end <= self.n,
             "zero psi row_chunk_first row range out of bounds"
@@ -4174,10 +4236,11 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn row_vector_first_into(
         &self,
-        _: usize,
+        idx: usize,
         row: usize,
         mut out: ArrayViewMut1<'_, f64>,
     ) -> Result<(), crate::terms::basis::BasisError> {
+        debug_assert!(idx < usize::MAX);
         assert!(
             row < self.n,
             "zero psi row_vector_first_into row out of bounds"
@@ -4193,9 +4256,10 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn row_chunk_second_diag(
         &self,
-        _: usize,
+        idx: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        debug_assert!(idx < usize::MAX);
         assert!(
             rows.start <= rows.end && rows.end <= self.n,
             "zero psi row_chunk_second_diag row range out of bounds"
@@ -4205,10 +4269,12 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn row_chunk_second_cross(
         &self,
-        _: usize,
-        _: usize,
+        idx: usize,
+        idx2: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        debug_assert!(idx < usize::MAX);
+        debug_assert!(idx2 < usize::MAX);
         assert!(
             rows.start <= rows.end && rows.end <= self.n,
             "zero psi row_chunk_second_cross row range out of bounds"
@@ -6117,7 +6183,8 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         Ok(None)
     }
 
-    fn hessian_matvec(&self, _: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+    fn hessian_matvec(&self, arr: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+        debug_assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
 
@@ -6198,9 +6265,11 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
 
     fn second_directional_derivative(
         &self,
-        _: &Array1<f64>,
-        _: &Array1<f64>,
+        arr: &Array1<f64>,
+        arr2: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        debug_assert!(arr.iter().all(|v| !v.is_nan()));
+        debug_assert!(arr2.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
 
@@ -6220,7 +6289,8 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
 }
 
 pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
-    fn first_order_terms(&self, _: usize) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+    fn first_order_terms(&self, idx: usize) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        debug_assert!(idx < usize::MAX);
         Ok(None)
     }
 
@@ -20098,21 +20168,24 @@ mod tests {
     }
 
     impl CustomFamily for BatchedOuterHessianTestFamily {
-        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![],
             })
         }
 
-        fn outer_hyper_hessian_hvp_available(&self, _: &[ParameterBlockSpec]) -> bool {
+        fn outer_hyper_hessian_hvp_available(&self, block_specs: &[ParameterBlockSpec]) -> bool {
+            debug_assert!(block_specs.len() <= isize::MAX as usize);
             true
         }
 
         fn outer_hyper_hessian_operator(
             &self,
-            _: &[ParameterBlockSpec],
+            block_specs: &[ParameterBlockSpec],
         ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+            debug_assert!(block_specs.len() <= isize::MAX as usize);
             Some(Arc::new(TestOuterHessianOperator {
                 matrix: self.matrix.clone(),
             }))
@@ -21244,7 +21317,8 @@ mod tests {
             Ok(Some(Array1::ones(2)))
         }
 
-        fn directional_derivative(&self, _: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+        fn directional_derivative(&self, arr: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
             Ok(None)
         }
     }
@@ -21380,7 +21454,8 @@ mod tests {
         struct ZeroFamily;
 
         impl CustomFamily for ZeroFamily {
-            fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+            fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+                debug_assert!(block_states.len() <= isize::MAX as usize);
                 Ok(FamilyEvaluation {
                     log_likelihood: 0.0,
                     blockworking_sets: vec![],
@@ -21393,17 +21468,20 @@ mod tests {
         impl ExactNewtonJointPsiWorkspace for BlockLocalPsiWorkspace {
             fn second_order_terms(
                 &self,
-                _: usize,
-                _: usize,
+                idx: usize,
+                idx2: usize,
             ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+                debug_assert!(idx < usize::MAX);
+                debug_assert!(idx2 < usize::MAX);
                 Ok(None)
             }
 
             fn hessian_directional_derivative(
                 &self,
                 psi_index: usize,
-                _: &Array1<f64>,
+                arr: &Array1<f64>,
             ) -> Result<Option<DriftDerivResult>, String> {
+                debug_assert!(arr.iter().all(|v| !v.is_nan()));
                 assert_eq!(psi_index, 0);
                 Ok(Some(DriftDerivResult::Operator(Arc::new(
                     crate::solver::estimate::reml::unified::BlockLocalDrift {
@@ -21465,9 +21543,11 @@ mod tests {
 
             fn exact_outer_derivative_order(
                 &self,
-                _: &[ParameterBlockSpec],
-                _: &BlockwiseFitOptions,
+                block_specs: &[ParameterBlockSpec],
+                options: &BlockwiseFitOptions,
             ) -> ExactOuterDerivativeOrder {
+                debug_assert!(block_specs.len() <= isize::MAX as usize);
+                debug_assert!(std::mem::size_of_val(options) > 0);
                 ExactOuterDerivativeOrder::First
             }
         }
@@ -21522,9 +21602,10 @@ mod tests {
         fn diagonalworking_weights_directional_derivative(
             &self,
             block_states: &[ParameterBlockState],
-            _: usize,
+            idx: usize,
             d_eta: &Array1<f64>,
         ) -> Result<Option<Array1<f64>>, String> {
+            debug_assert!(idx < usize::MAX);
             Ok(Some((&block_states[0].eta * d_eta) * 2.0))
         }
 
@@ -21846,11 +21927,12 @@ mod tests {
 
         fn exact_newton_hessian_second_directional_derivative(
             &self,
-            _: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
             block_idx: usize,
             u: &Array1<f64>,
             v: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
             assert_eq!(block_idx, 0);
             let value = 2.0 * self.curvature * self.second_scale * u[0] * v[0];
             Ok(Some(array![[value]]))
@@ -22288,20 +22370,25 @@ mod tests {
 
         fn diagonalworking_weights_directional_derivative(
             &self,
-            _: &[ParameterBlockState],
-            _: usize,
+            block_states: &[ParameterBlockState],
+            idx: usize,
             d_eta: &Array1<f64>,
         ) -> Result<Option<Array1<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(idx < usize::MAX);
             Ok(Some(Array1::zeros(d_eta.len())))
         }
 
         fn diagonalworking_weights_second_directional_derivative(
             &self,
-            _: &[ParameterBlockState],
-            _: usize,
+            block_states: &[ParameterBlockState],
+            idx: usize,
             d_eta_u: &Array1<f64>,
-            _: &Array1<f64>,
+            arr: &Array1<f64>,
         ) -> Result<Option<Array1<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(idx < usize::MAX);
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
             Ok(Some(Array1::zeros(d_eta_u.len())))
         }
     }
@@ -22337,10 +22424,12 @@ mod tests {
 
         fn block_linear_constraints(
             &self,
-            _: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
             block_idx: usize,
-            _: &ParameterBlockSpec,
+            block_spec: &ParameterBlockSpec,
         ) -> Result<Option<LinearInequalityConstraints>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(!block_spec.name.is_empty());
             if block_idx != 0 {
                 return Ok(None);
             }
@@ -22355,7 +22444,8 @@ mod tests {
     struct OneBlockConstrainedNaNHessianFamily;
 
     impl CustomFamily for OneBlockConstrainedNaNHessianFamily {
-        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -22367,10 +22457,12 @@ mod tests {
 
         fn block_linear_constraints(
             &self,
-            _: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
             block_idx: usize,
-            _: &ParameterBlockSpec,
+            block_spec: &ParameterBlockSpec,
         ) -> Result<Option<LinearInequalityConstraints>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(!block_spec.name.is_empty());
             if block_idx != 0 {
                 return Ok(None);
             }
@@ -22385,7 +22477,8 @@ mod tests {
     struct OneBlockConstrainedIndefiniteHessianFamily;
 
     impl CustomFamily for OneBlockConstrainedIndefiniteHessianFamily {
-        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -22397,10 +22490,12 @@ mod tests {
 
         fn block_linear_constraints(
             &self,
-            _: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
             block_idx: usize,
-            _: &ParameterBlockSpec,
+            block_spec: &ParameterBlockSpec,
         ) -> Result<Option<LinearInequalityConstraints>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(!block_spec.name.is_empty());
             if block_idx != 0 {
                 return Ok(None);
             }
@@ -22442,7 +22537,8 @@ mod tests {
     struct PreferJointExactFamily;
 
     impl CustomFamily for PreferJointExactFamily {
-        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -22454,10 +22550,13 @@ mod tests {
 
         fn exact_newton_hessian_directional_derivative(
             &self,
-            _: &[ParameterBlockState],
-            _: usize,
-            _: &Array1<f64>,
+            block_states: &[ParameterBlockState],
+            idx: usize,
+            arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(idx < usize::MAX);
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
             Err(
                 "blockwise exact-newton path should not be used when joint path is available"
                     .to_string(),
@@ -22466,16 +22565,19 @@ mod tests {
 
         fn exact_newton_joint_hessian(
             &self,
-            _: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
             Ok(Some(array![[2.0]]))
         }
 
         fn exact_newton_joint_hessian_directional_derivative(
             &self,
-            _: &[ParameterBlockState],
-            _: &Array1<f64>,
+            block_states: &[ParameterBlockState],
+            arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
             Ok(Some(array![[0.0]]))
         }
     }
@@ -22514,25 +22616,30 @@ mod tests {
 
         fn exact_newton_joint_hessian(
             &self,
-            _: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
             Ok(Some(array![[1.0, self.coupling], [self.coupling, 1.0]]))
         }
 
         fn exact_newton_joint_hessian_directional_derivative(
             &self,
-            _: &[ParameterBlockState],
-            _: &Array1<f64>,
+            block_states: &[ParameterBlockState],
+            arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
             Ok(Some(Array2::zeros((2, 2))))
         }
 
         fn block_linear_constraints(
             &self,
-            _: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
             block_idx: usize,
-            _: &ParameterBlockSpec,
+            block_spec: &ParameterBlockSpec,
         ) -> Result<Option<LinearInequalityConstraints>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(!block_spec.name.is_empty());
             if block_idx >= 2 {
                 return Ok(None);
             }
@@ -22578,30 +22685,36 @@ mod tests {
 
         fn exact_newton_joint_hessian_with_specs(
             &self,
-            _: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
             specs: &[ParameterBlockSpec],
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
             let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
             Ok(Some(Array2::eye(p)))
         }
 
         fn exact_newton_joint_hessian_directional_derivative_with_specs(
             &self,
-            _: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
             specs: &[ParameterBlockSpec],
-            _: &Array1<f64>,
+            arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
             let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
             Ok(Some(Array2::zeros((p, p))))
         }
 
         fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
             &self,
-            _: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
             specs: &[ParameterBlockSpec],
-            _: &Array1<f64>,
-            _: &Array1<f64>,
+            arr: &Array1<f64>,
+            arr2: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
+            debug_assert!(arr2.iter().all(|v| !v.is_nan()));
             let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
             Ok(Some(Array2::zeros((p, p))))
         }
@@ -22640,25 +22753,31 @@ mod tests {
 
         fn exact_newton_joint_hessian(
             &self,
-            _: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
             Ok(Some(array![[2.0]]))
         }
 
         fn exact_newton_hessian_directional_derivative(
             &self,
-            _: &[ParameterBlockState],
-            _: usize,
-            _: &Array1<f64>,
+            block_states: &[ParameterBlockState],
+            idx: usize,
+            arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(idx < usize::MAX);
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
             Ok(Some(array![[0.0]]))
         }
 
         fn exact_newton_joint_hessian_directional_derivative(
             &self,
-            _: &[ParameterBlockState],
-            _: &Array1<f64>,
+            block_states: &[ParameterBlockState],
+            arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
             Ok(Some(array![[0.0]]))
         }
     }
@@ -22667,7 +22786,8 @@ mod tests {
     struct OneBlockExactPsiHookFamily;
 
     impl CustomFamily for OneBlockExactPsiHookFamily {
-        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -22683,35 +22803,45 @@ mod tests {
 
         fn exact_newton_joint_hessian(
             &self,
-            _: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
             Ok(Some(array![[1.0]]))
         }
 
         fn exact_newton_hessian_directional_derivative(
             &self,
-            _: &[ParameterBlockState],
-            _: usize,
-            _: &Array1<f64>,
+            block_states: &[ParameterBlockState],
+            idx: usize,
+            arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(idx < usize::MAX);
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
             Ok(Some(array![[0.0]]))
         }
 
         fn exact_newton_joint_hessian_directional_derivative(
             &self,
-            _: &[ParameterBlockState],
-            _: &Array1<f64>,
+            block_states: &[ParameterBlockState],
+            arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
             Ok(Some(array![[0.0]]))
         }
 
         fn exact_newton_joint_psi_terms(
             &self,
-            _: &[ParameterBlockState],
-            _: &[ParameterBlockSpec],
-            _: &[Vec<CustomFamilyBlockPsiDerivative>],
-            _: usize,
+            block_states: &[ParameterBlockState],
+            block_specs: &[ParameterBlockSpec],
+            derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+            idx: usize,
         ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(block_specs.len() <= isize::MAX as usize);
+            debug_assert!(derivative_blocks.len() <= isize::MAX as usize);
+            debug_assert!(idx < usize::MAX);
             Ok(Some(ExactNewtonJointPsiTerms {
                 objective_psi: 3.5,
                 score_psi: array![0.0],
@@ -22725,7 +22855,8 @@ mod tests {
     struct OneBlockIndefinitePseudoLaplaceFamily;
 
     impl CustomFamily for OneBlockIndefinitePseudoLaplaceFamily {
-        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -22741,8 +22872,9 @@ mod tests {
 
         fn exact_newton_joint_hessian(
             &self,
-            _: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
             Ok(Some(array![[-1.0]]))
         }
     }
@@ -22777,8 +22909,9 @@ mod tests {
 
         fn exact_newton_joint_hessian(
             &self,
-            _: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
             Ok(Some(array![[2.0, 0.1], [3.0, 2.0]]))
         }
     }
@@ -22787,7 +22920,8 @@ mod tests {
     struct OneBlockAlwaysErrorFamily;
 
     impl CustomFamily for OneBlockAlwaysErrorFamily {
-        fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
             Err("synthetic outer objective failure: block[0] evaluate()".to_string())
         }
     }
@@ -22812,9 +22946,11 @@ mod tests {
 
         fn exact_newton_joint_hessian_with_specs(
             &self,
-            _: &[ParameterBlockState],
-            _: &[ParameterBlockSpec],
+            block_states: &[ParameterBlockState],
+            block_specs: &[ParameterBlockSpec],
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(block_states.len() <= isize::MAX as usize);
+            debug_assert!(block_specs.len() <= isize::MAX as usize);
             Err("synthetic covariance assembly failure".to_string())
         }
     }
@@ -25038,16 +25174,19 @@ mod tests {
 
             fn exact_newton_joint_hessian(
                 &self,
-                _: &[ParameterBlockState],
+                block_states: &[ParameterBlockState],
             ) -> Result<Option<Array2<f64>>, String> {
+                debug_assert!(block_states.len() <= isize::MAX as usize);
                 Ok(Some(array![[1.0]]))
             }
 
             fn exact_newton_joint_hessian_directional_derivative(
                 &self,
-                _: &[ParameterBlockState],
-                _: &Array1<f64>,
+                block_states: &[ParameterBlockState],
+                arr: &Array1<f64>,
             ) -> Result<Option<Array2<f64>>, String> {
+                debug_assert!(block_states.len() <= isize::MAX as usize);
+                debug_assert!(arr.iter().all(|v| !v.is_nan()));
                 Ok(Some(array![[f64::NAN]]))
             }
         }

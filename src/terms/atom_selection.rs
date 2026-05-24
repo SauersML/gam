@@ -491,10 +491,9 @@ impl AtomSelectionStrategy for EntropicSoftmax {
     fn backward(
         &self,
         free_amplitudes_row: ArrayView1<'_, f64>,
-        atom_code: &SparseAtomCode,
+        _: &SparseAtomCode,
         grad_a_row: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert!(std::ptr::eq(atom_code, atom_code));
         assert_eq!(
             grad_a_row.len(),
             free_amplitudes_row.len(),
@@ -511,12 +510,10 @@ impl AtomSelectionStrategy for EntropicSoftmax {
 impl AssignmentSparsityCoupling for EntropicSoftmax {
     fn penalty_value_and_grad(
         &self,
-        sparsity_penalty: &SparsityPenalty,
+        _: &SparsityPenalty,
         free_amplitudes_row: ArrayView1<'_, f64>,
-        arr: ArrayView1<'_, f64>,
+        _: ArrayView1<'_, f64>,
     ) -> (f64, Array1<f64>) {
-        debug_assert!(std::ptr::eq(sparsity_penalty, sparsity_penalty));
-        debug_assert!(arr.iter().all(|v| !v.is_nan()));
         // Entropic-softmax does not consume the L¹ sparsity penalty
         // directly; the entropy regularisation lives inside the strategy
         // itself. We return zero contribution here (Piece 4 sees nothing
@@ -611,11 +608,10 @@ impl AtomSelectionStrategy for TopK {
 
     fn backward(
         &self,
-        arr: ArrayView1<'_, f64>,
+        _: ArrayView1<'_, f64>,
         code: &SparseAtomCode,
         grad_a_row: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert!(arr.iter().all(|v| !v.is_nan()));
         self.backward_straight_through(code, grad_a_row)
     }
 }
@@ -623,12 +619,10 @@ impl AtomSelectionStrategy for TopK {
 impl AssignmentSparsityCoupling for TopK {
     fn penalty_value_and_grad(
         &self,
-        sparsity_penalty: &SparsityPenalty,
+        _: &SparsityPenalty,
         free_amplitudes_row: ArrayView1<'_, f64>,
-        arr: ArrayView1<'_, f64>,
+        _: ArrayView1<'_, f64>,
     ) -> (f64, Array1<f64>) {
-        debug_assert!(std::ptr::eq(sparsity_penalty, sparsity_penalty));
-        debug_assert!(arr.iter().all(|v| !v.is_nan()));
         // Cardinality is enforced structurally; no smooth penalty consumed.
         let k = free_amplitudes_row.len();
         (0.0, Array1::<f64>::zeros(k))

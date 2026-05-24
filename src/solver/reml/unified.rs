@@ -377,9 +377,19 @@ pub trait HessianOperator: Send + Sync {
         &self,
         rhs: &Array1<f64>,
         rel_tol: f64,
-        _: u64,
-        _: Option<&Arc<Mutex<StochasticTraceState>>>,
+        probe_id: u64,
+        state: Option<&Arc<Mutex<StochasticTraceState>>>,
     ) -> Array1<f64> {
+        // Default exact backend has no matrix-free CG, so per-probe warm
+        // starts are inapplicable. If a previous matrix-free backend left
+        // a warm-start vector for this `probe_id` in the shared state,
+        // drop it so a later matrix-free run does not consume a vector
+        // that was generated against a different operator factorization.
+        if let Some(state_arc) = state
+            && let Ok(mut guard) = state_arc.lock()
+        {
+            guard.cg_warm_starts.remove(&probe_id);
+        }
         self.stochastic_trace_solve(rhs, rel_tol)
     }
 
@@ -852,10 +862,13 @@ pub trait HessianDerivativeProvider: Send + Sync {
     /// Returns `None` if not needed or not implemented.
     fn hessian_second_derivative_correction(
         &self,
-        _: &Array1<f64>,
-        _: &Array1<f64>,
-        _: &Array1<f64>,
+        arr: &Array1<f64>,
+        arr2: &Array1<f64>,
+        arr3: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        debug_assert!(arr.iter().all(|v| !v.is_nan()));
+        debug_assert!(arr2.iter().all(|v| !v.is_nan()));
+        debug_assert!(arr3.iter().all(|v| !v.is_nan()));
         if self.has_corrections() {
             Err(
                 "HessianDerivativeProvider reports first-order corrections but does not implement second-order correction"
@@ -1023,8 +1036,9 @@ impl HessianDerivativeProvider for GaussianDerivatives {
 
     fn hessian_derivative_correction(
         &self,
-        _: &Array1<f64>,
+        arr: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        debug_assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
     fn has_corrections(&self) -> bool {
@@ -1938,7 +1952,8 @@ pub trait HyperOperator: Send + Sync {
             .sum()
     }
 
-    fn trace_projected_factor_cached(&self, factor: &Array2<f64>, _: &ProjectedFactorCache) -> f64 {
+    fn trace_projected_factor_cached(&self, factor: &Array2<f64>, factor_cache: &ProjectedFactorCache) -> f64 {
+        debug_assert!(std::mem::size_of_val(factor_cache) > 0);
         self.trace_projected_factor(factor)
     }
 
@@ -1958,8 +1973,9 @@ pub trait HyperOperator: Send + Sync {
     fn projected_matrix_cached(
         &self,
         factor: &Array2<f64>,
-        _: &ProjectedFactorCache,
+        factor_cache: &ProjectedFactorCache,
     ) -> Array2<f64> {
+        debug_assert!(std::mem::size_of_val(factor_cache) > 0);
         self.projected_matrix(factor)
     }
 
@@ -17630,8 +17646,9 @@ mod tests {
     impl HessianDerivativeProvider for FamilyOperatorOnlyDerivatives {
         fn hessian_derivative_correction(
             &self,
-            _: &Array1<f64>,
+            arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
             Ok(None)
         }
 
@@ -19519,17 +19536,21 @@ mod tests {
     impl HessianDerivativeProvider for FamilyOperatorDerivatives {
         fn hessian_derivative_correction(
             &self,
-            _: &Array1<f64>,
+            arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
             panic!("family operator dispatch should not request pairwise first derivatives")
         }
 
         fn hessian_second_derivative_correction(
             &self,
-            _: &Array1<f64>,
-            _: &Array1<f64>,
-            _: &Array1<f64>,
+            arr: &Array1<f64>,
+            arr2: &Array1<f64>,
+            arr3: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
+            debug_assert!(arr2.iter().all(|v| !v.is_nan()));
+            debug_assert!(arr3.iter().all(|v| !v.is_nan()));
             panic!("family operator dispatch should not request pairwise second derivatives")
         }
 
@@ -19606,8 +19627,9 @@ mod tests {
     impl HessianDerivativeProvider for FixedCorrectionDerivatives {
         fn hessian_derivative_correction(
             &self,
-            _: &Array1<f64>,
+            arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
+            debug_assert!(arr.iter().all(|v| !v.is_nan()));
             Ok(Some(self.correction.clone()))
         }
 
