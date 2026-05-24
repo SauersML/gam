@@ -395,7 +395,7 @@ pub trait InverseLinkKernel {
     fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError>;
 
     fn param_partials(&self, eta: f64) -> Result<Option<LinkParamPartials>, EstimationError> {
-        assert!(eta.is_finite());
+        assert!(eta.is_finite(), "eta must be finite");
         Ok(None)
     }
 }

@@ -359,9 +359,7 @@ mod tests {
                         row.map(|components| {
                             components
                                 .into_iter()
-                                .map(|(idx, matrix)| {
-                                    (idx, HyperPenaltyDerivative::from(matrix))
-                                })
+                                .map(|(idx, matrix)| (idx, HyperPenaltyDerivative::from(matrix)))
                                 .collect::<Vec<_>>()
                         })
                     })
