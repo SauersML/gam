@@ -18022,10 +18022,10 @@ where
     const KAPPA_PILOT_K: usize = 5_000;
     const KAPPA_POLISH_K: usize = 25_000;
     const KAPPA_POLISH_TRIGGER_N: usize = 100_000;
-    let _ = KAPPA_SUBSAMPLE_PILOT_TRIGGER_N; // Documented threshold; engaged via policy.
-    let _ = KAPPA_POLISH_TRIGGER_N;
-    let _ = KAPPA_POLISH_K;
-    let _ = KAPPA_PILOT_K;
+    drop(KAPPA_SUBSAMPLE_PILOT_TRIGGER_N); // Documented threshold; engaged via policy.
+    drop(KAPPA_POLISH_TRIGGER_N);
+    drop(KAPPA_POLISH_K);
+    drop(KAPPA_PILOT_K);
 
     let n_total = data.nrows();
     let use_staged_kappa = outer_derivative_policy.should_use_staged_kappa(n_total);
@@ -18232,7 +18232,7 @@ where
             } else {
                 crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient
             };
-            let _t0 = std::time::Instant::now();
+            let t0 = std::time::Instant::now();
             let row_set_borrow = current_row_set.borrow();
             let result = (&mut *exact_fn_cell.borrow_mut())(
                 theta,
@@ -18242,7 +18242,7 @@ where
                 &*row_set_borrow,
             );
             drop(row_set_borrow);
-            let elapsed_s = _t0.elapsed().as_secs_f64();
+            let elapsed_s = t0.elapsed().as_secs_f64();
             kphase_eval_calls.set(kphase_eval_calls.get() + 1);
             kphase_eval_total_s.set(kphase_eval_total_s.get() + elapsed_s);
             let (theta_norm, log_kappa_norm) = kphase_log_norms(theta);
