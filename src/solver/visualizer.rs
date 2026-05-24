@@ -492,13 +492,11 @@ impl InteractiveVisualizer {
         // for hangs, and the existing "use Dumb when not attached to
         // TTY" tests rely on this short-circuit to assert their
         // invariants without needing to fake a tty.
-        #[cfg(test)]
-        {
-            Err(io::Error::other(
+        if cfg!(test) {
+            return Err(io::Error::other(
                 "interactive visualizer disabled under cfg(test)",
-            ))
+            ));
         }
-        #[cfg(not(test))]
         {
             // Route the chart to /dev/tty rather than stdout, so it
             // works even when the parent shell pipes stdout/stderr

@@ -1016,11 +1016,7 @@ fn assert_derivative_blocks_match_specs(
     );
 }
 
-fn assert_rho_matches_specs(
-    rho: &Array1<f64>,
-    specs: &[ParameterBlockSpec],
-    context: &str,
-) {
+fn assert_rho_matches_specs(rho: &Array1<f64>, specs: &[ParameterBlockSpec], context: &str) {
     let expected = specs.iter().map(|spec| spec.penalties.len()).sum::<usize>();
     assert_eq!(
         rho.len(),
