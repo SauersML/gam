@@ -1,7 +1,6 @@
 # Proposal: `LatentCoord` — per-row latent coordinates as a first-class gamfit parameter
 
-Status: draft. Author: scottsauersc@gmail.com.  
-Companion prototype: `/Users/user/Manifold-SAE/experiments/auto_75.py`.
+Status: draft. Author: scottsauersc@gmail.com.
 
 ## 1. Motivation
 
@@ -35,9 +34,7 @@ Use case: **GP-LVM and principal-manifold inference** (Lawrence 2005,
 Titsias 2010), entirely in gamfit primitives. This subsumes a non-trivial
 set of workloads — manifold learning, latent-trait inference, identifiable
 nonlinear ICA via iVAE-style auxiliary priors — that currently require
-GPy / sklearn `IsoMap` or hand-rolled alternation (see this repo's
-`experiments/auto_71.py` for a geodesic-LM gauge-unfixed example, and
-`auto_74.py` for the alternation-then-ICA workaround).
+GPy / sklearn `IsoMap` or hand-rolled alternation.
 
 We already ship `gaussian_reml_fit_positions{,_backward}` for the 1-D
 case (B-spline positions with `grad_t` exposed; `gamfit/_api.py:1848`,
@@ -110,9 +107,7 @@ spline-curvature in `t`-space), but is invariant under isometries
 (rotation + translation), which still leaves at least a `d(d+1)/2`-dim
 gauge orbit per fit. **IFT is singular along this orbit** — the inner
 Hessian has zero eigenvalues, so the nested optimizer's predictor step
-blows up. `auto_71.py` in the companion repo demonstrates this: geodesic
-LM hits R² = 0.640 but Procrustes disparity = 0.99 across seeds —
-solutions wander freely along the gauge.
+blows up.
 
 Three model-level fixes, all exposed as `LatentCoord` configurations:
 
@@ -279,36 +274,22 @@ matrix-free CG**. The existing ext-coordinate machinery covers it.
 
 ## 5. Test plan
 
-Reproduce `auto_74`'s stacked CV R² = 0.608 on cogito-L40 color
-centroids using *only* a `LatentCoord`-equipped GAM config — no
-hand-rolled alternation, no FastICA, no per-fold ICA refit.
+Fit a multi-output GP-LVM-style design using *only* a `LatentCoord`-equipped
+GAM config — no hand-rolled alternation, no FastICA, no per-fold ICA refit.
 
 ```
-y = Z_top16  ∈ ℝ^(N × 16)
+y = Z  ∈ ℝ^(N × p)
 config:
-  s(hue, periodic, m=2)               # observed
-  + s(sat, val, m=2, ns=degree2)      # observed
+  s(x_obs, periodic, m=2)             # observed covariate
   + s(t, m=2, ns=degree2,             # LATENT
-       latent=LatentCoord(d=4, aux_prior=u=rgb))
+       latent=LatentCoord(d=4, aux_prior=u=u_obs))
 ```
 
-Expected:
-- CV R² ≥ 0.60 (matches auto_74 stacked).
-- Procrustes disparity across seeds ≤ 0.2 (auto_71 was 0.99 unfixed).
-- REML-selected `d` ∈ {3, 4} when `dim_selection=True` is enabled.
-
-Empirical baseline observed in the prototype (`auto_75.py`, K_PC=16):
-- observed-only (hue + sv) CV R² = 0.41 (the K_PC=16 ceiling, vs 0.32 at K_PC=64).
-- LatentCoord d=4 with τ=0.5 aux-prior on RGB: CV R² ≈ 0.50 (early).
-- The prototype's pure-Python out-of-fold `t_test` refinement is the
-  bottleneck for full parity with auto_74; the Rust LatentCoord with
-  IFT-warm-started `grad_t` would close this gap with better step
-  control (and at production speed).
-
-The companion prototype `experiments/auto_75.py` simulates this in
-pure Python (using gamfit's existing primitives + a hand-rolled outer
-on `t`) to validate the loss surface and identifiability gain *before*
-the Rust work lands.
+Acceptance:
+- CV R² recovers the supervised baseline on the same data.
+- Procrustes disparity across seeds stays small (gauge actually fixed).
+- REML-selected `d` matches the supervised target dim when
+  `dim_selection=True` is enabled.
 
 ## 6. Open questions
 
