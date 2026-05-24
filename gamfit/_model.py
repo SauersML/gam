@@ -1263,50 +1263,179 @@ class Model:
         # matrix without the caller passing the model back in.
         return PosteriorSamples.from_ffi_json(raw, model_bytes=self._model_bytes)
 
-    def sample_paired(
+
+    def difference_smooth(
         self,
-        competing: "Model",
         data: Any,
-        competing_data: Any | None = None,
         *,
-        samples: int | None = None,
-        warmup: int | None = None,
-        chains: int | None = None,
-        target_accept: float | None = None,
+        view: str,
+        group: str,
+        pair: tuple[Any, Any] | list[Any] | None = None,
+        n: int = 100,
+        level: float = 0.95,
+        simultaneous: bool = False,
+        n_sim: int = 10_000,
         seed: int | None = None,
-    ) -> PairedPosteriorSamples:
-        """Draw this fit and a linked competing fit with paired draw indices."""
-        headers, rows, _table_kind = normalize_table(data)
-        competing_headers, competing_rows, _ = normalize_table(
-            data if competing_data is None else competing_data
-        )
-        payload: dict[str, Any] = {}
-        if samples is not None:
-            payload["samples"] = int(samples)
-        if warmup is not None:
-            payload["warmup"] = int(warmup)
-        if chains is not None:
-            payload["chains"] = int(chains)
-        if target_accept is not None:
-            payload["target_accept"] = float(target_accept)
-        if seed is not None:
-            payload["seed"] = int(seed)
-        try:
-            raw = rust_module().paired_sample_table(
-                self._model_bytes,
-                competing._model_bytes,
-                headers,
-                rows,
-                competing_headers,
-                competing_rows,
-                json.dumps(payload),
+        group_means: bool = True,
+        marginalise_random: bool = True,
+        return_type: str | None = "pandas",
+    ) -> Any:
+        """Estimate a covariance-aware difference smooth between group levels.
+
+        The contrast is computed directly as ``(X_level2 - X_level1) beta`` on
+        the fitted model matrix, with standard errors from the joint posterior
+        covariance ``(X_level2 - X_level1) V (X_level2 - X_level1)'``.  This is
+        the safe post-hoc contrast used by gratia-style difference smooths; it
+        avoids the common but incorrect practice of comparing overlap between
+        two separately plotted smooth intervals.
+
+        Parameters
+        ----------
+        data:
+            A representative table containing all model columns.  Its range in
+            ``view`` defines the evaluation grid, and its first row supplies
+            covariate values for non-varied columns.
+        view:
+            Continuous covariate to evaluate along.
+        group:
+            Grouping column whose two levels are contrasted.
+        pair:
+            Optional ``(reference, comparison)`` pair.  When omitted all
+            pairwise contrasts among observed levels in ``data`` are returned.
+        simultaneous:
+            If ``True``, use posterior simulation to form a simultaneous band
+            for the whole curve; otherwise return pointwise credible bands.
+        group_means:
+            When ``True`` (default), all columns are allowed to contribute to
+            the design-matrix contrast, so parametric group offsets are included
+            where present.  When ``False``, columns that are constant over the
+            grid are dropped from the contrast as a pragmatic shape-only mode.
+        marginalise_random:
+            Reserved for random-effect-aware term metadata.  The current design
+            matrix export does not label random-effect columns, so the argument
+            is accepted for API stability but does not alter columns yet.
+        """
+        import itertools
+        from statistics import NormalDist
+
+        import numpy as np
+
+        if not (0.0 < float(level) < 1.0):
+            raise ValueError("level must be in (0, 1)")
+        if int(n) < 2:
+            raise ValueError("n must be at least 2")
+        if simultaneous and int(n_sim) < 100:
+            raise ValueError("n_sim must be at least 100 for simultaneous bands")
+
+        columns, table_kind = table_columns(data)
+        if view not in columns:
+            raise ValueError(f"view column {view!r} is not present in data")
+        if group not in columns:
+            raise ValueError(f"group column {group!r} is not present in data")
+        if not columns[view]:
+            raise ValueError("data must contain at least one row")
+
+        x_values = np.asarray(columns[view], dtype=float)
+        if not np.all(np.isfinite(x_values)):
+            raise ValueError(f"view column {view!r} must be finite")
+        grid = np.linspace(float(np.min(x_values)), float(np.max(x_values)), int(n))
+
+        observed_levels = []
+        for value in columns[group]:
+            if value not in observed_levels:
+                observed_levels.append(value)
+        if len(observed_levels) < 2:
+            raise ValueError(f"group column {group!r} must contain at least two levels")
+        if pair is None:
+            pairs = list(itertools.combinations(observed_levels, 2))
+        else:
+            if len(pair) != 2:  # type: ignore[arg-type]
+                raise ValueError("pair must contain exactly two group levels")
+            pairs = [(pair[0], pair[1])]  # type: ignore[index]
+
+        summary = self.summary()
+        beta = np.asarray([row["estimate"] for row in summary.coefficients], dtype=float)
+        cov_n = summary.get("covariance_n")
+        cov_flat = summary.get("covariance_flat")
+        if cov_n is None or cov_flat is None:
+            raise ValueError(
+                "difference_smooth requires a saved coefficient covariance; refit with covariance-enabled inference"
             )
-        except Exception as exc:
-            raise map_exception(exc) from exc
-        return PairedPosteriorSamples.from_ffi_json(
-            raw,
-            target_model_bytes=self._model_bytes,
-            competing_model_bytes=competing._model_bytes,
+        cov = np.asarray(cov_flat, dtype=float).reshape(int(cov_n), int(cov_n))
+        if cov.shape != (beta.size, beta.size):
+            raise ValueError(
+                f"coefficient covariance shape {cov.shape} does not match beta length {beta.size}"
+            )
+
+        base = {name: values[0] for name, values in columns.items()}
+        out: dict[str, list[Any]] = {
+            view: [],
+            "level_1": [],
+            "level_2": [],
+            "diff": [],
+            "se": [],
+            "lower": [],
+            "upper": [],
+            "critical": [],
+            "band": [],
+        }
+        z = NormalDist().inv_cdf(0.5 + float(level) / 2.0)
+        rng = np.random.default_rng(seed)
+
+        for level_1, level_2 in pairs:
+            rows_1 = []
+            rows_2 = []
+            for x in grid:
+                r1 = dict(base)
+                r2 = dict(base)
+                r1[view] = float(x)
+                r2[view] = float(x)
+                r1[group] = level_1
+                r2[group] = level_2
+                rows_1.append(r1)
+                rows_2.append(r2)
+            x1 = self.design_matrix(rows_1)
+            x2 = self.design_matrix(rows_2)
+            xd = np.asarray(x2 - x1, dtype=float)
+            if not group_means:
+                varying = np.any(np.abs(xd - xd[0:1, :]) > 1e-12, axis=0)
+                xd = xd.copy()
+                xd[:, ~varying] = 0.0
+            if marginalise_random:
+                # The Rust design export currently has no public random-effect
+                # column map. Keep the default explicit and future-compatible;
+                # fixed-effect and smooth contrasts remain covariance-correct.
+                pass
+            diff = xd @ beta
+            xv = xd @ cov
+            se = np.sqrt(np.maximum(np.sum(xv * xd, axis=1), 0.0))
+            crit = z
+            band = "pointwise"
+            if simultaneous:
+                draws = rng.multivariate_normal(np.zeros(beta.size), cov, size=int(n_sim), method="svd")
+                draw_diff = draws @ xd.T
+                denom = np.where(se > 0.0, se, np.inf)
+                maxima = np.max(np.abs(draw_diff) / denom.reshape(1, -1), axis=1)
+                crit = float(np.quantile(maxima[np.isfinite(maxima)], float(level)))
+                band = "simultaneous"
+            lower = diff - crit * se
+            upper = diff + crit * se
+            for i, x in enumerate(grid):
+                out[view].append(float(x))
+                out["level_1"].append(level_1)
+                out["level_2"].append(level_2)
+                out["diff"].append(float(diff[i]))
+                out["se"].append(float(se[i]))
+                out["lower"].append(float(lower[i]))
+                out["upper"].append(float(upper[i]))
+                out["critical"].append(float(crit))
+                out["band"].append(band)
+
+        return restore_output_table(
+            out,
+            requested=return_type,
+            input_kind=table_kind,
+            training_kind=self._training_table_kind,
         )
 
     def design_matrix(self, data: Any) -> Any:

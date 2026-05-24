@@ -1,104 +1,45 @@
 # Difference smooths
 
-Difference smooths answer questions like “how does group B’s trajectory differ
-from group A’s over `x`?”  The library supports the same core idioms used in
-mgcv workflows and exposes a single covariance-aware post-fit API:
+Difference smooths compare trajectories across groups using the fitted model's joint coefficient covariance. The safe workflow is to fit one of the supported group-smooth parameterisations, then call `Model.difference_smooth(...)` instead of eyeballing overlap between two separately plotted smooth bands.
+
+## Parameterisations
+
+| Idiom | Formula shape | Use when |
+| --- | --- | --- |
+| Unordered by-factor smooths | `y ~ Group + s(Time, by=Group)` | Groups are scientifically distinct and each level should have its own smoothness. |
+| Ordered-factor/reference differences | `y ~ Group + s(Time) + s(Time, by=Group)` | A reference level is meaningful and non-reference rows should be interpreted as deviations from it. |
+| Binary numeric by-smooths | `y ~ s(Time) + s(Time, by=treated)` | `treated` is a numeric 0/1 column and the contrast may include both level and shape. |
+| Sum-to-zero factor deviations | `y ~ s(Time) + s(Group, Time, bs="sz")` | Three or more groups have no privileged baseline; this is the symmetric default to prefer for new analyses. |
+
+The Rust term builder now recognises `by=` on `s(...)`. Categorical `by` columns are expanded to one row-gated smooth per observed level; numeric/binary `by` columns multiply the smooth by the numeric `by` value. The `bs="sz"` alias is accepted for `s(factor, x, bs="sz")` and exposes the symmetric factor-deviation formula idiom.
+
+## Inference API
 
 ```python
-model.difference_smooth(view="Time", group="Group", simultaneous=True)
+contr = model.difference_smooth(
+    data=train,
+    view="Time",
+    group="Group",
+    pair=("A", "B"),
+    level=0.95,
+    simultaneous=True,
+)
 ```
 
-The result is tidy: one row per grid point and pair, with `diff`, `se`, `lower`,
-`upper`, the interval `level`, whether the band is `simultaneous`, and the
-critical value used.
-
-## Which parameterisation to use
-
-### 1. Unordered by-factor smooths
-
-```python
-model = gamfit.fit(df, "Y ~ s(Time, by=Group)")
-```
-
-Use this when groups are scientifically distinct and each level should have its
-own independently penalised curve.  Internally the formula expands to one
-smooth block per level, with rows outside that level zeroed.  Post-hoc pairwise
-contrasts are obtained with `difference_smooth()`.
-
-### 2. Ordered-factor / reference difference smooths
-
-The canonical Soskuthy setup is a reference smooth plus deviations from that
-reference:
-
-```python
-model = gamfit.fit(df, "Y ~ s(Time) + s(Time, by=OrderedGroup)")
-```
-
-When the `by` column is represented with treatment-coded ordered levels, the
-non-reference by-smooths encode deviations from the reference trajectory.  This
-is useful for a pre-specified baseline comparison, but it privileges one level.
-For three or more symmetric groups prefer the sum-to-zero construction below.
-
-### 3. Binary numeric by-smooths
-
-```python
-model = gamfit.fit(df, "Y ~ s(Time) + s(Time, by=is_treated)")
-```
-
-If `is_treated` is numeric 0/1, the by-smooth is multiplied by that column and
-is not active for the 0 rows.  This is a compact two-group contrast when the
-vertical offset and shape difference are meant to be interpreted together.
-
-### 4. Sum-to-zero factor smooths (`bs="sz"`)
-
-```python
-model = gamfit.fit(df, "Y ~ s(Time) + s(Group, Time, bs='sz')")
-```
-
-This is the recommended default when no group should be the reference.  Each
-level gets a deviation smooth, and equivalent coefficients are constrained to
-sum to zero across levels.  The main `s(Time)` captures the population smooth;
-the factor smooth captures level-specific deviations around that population
-curve.  This mirrors mgcv’s `bs="sz"` design motivation: it is more symmetric
-than ordered-factor contrasts.
-
-## Pointwise vs simultaneous bands
-
-`difference_smooth(..., simultaneous=False)` returns pointwise credible bands.
-At each grid value the interval uses the joint coefficient covariance:
+The returned tidy table contains the evaluation coordinate, `level_1`, `level_2`, `diff`, `se`, `lower`, `upper`, `critical`, and `band`. Pointwise bands use
 
 ```text
-se(x) = sqrt(diag(X_delta V X_delta^T))
+Xd = X_level2 - X_level1
+se = sqrt(diag(Xd V Xd'))
 ```
 
-Do **not** compare two independently plotted smooth bands for overlap; that is
-not a valid difference-band calculation.
+where `V` is the joint coefficient covariance saved with the model. Simultaneous bands simulate from the coefficient posterior and use the empirical quantile of the maximum absolute standardized deviation over the grid. Use simultaneous bands for regional claims such as “the curves differ between Time = 4 and Time = 8”; pointwise bands do not have whole-curve coverage.
 
-`difference_smooth(..., simultaneous=True)` simulates coefficient draws from the
-posterior covariance, computes the maximum standardized deviation over the grid
-for each draw, and uses the requested quantile as a simultaneous critical value.
-Use simultaneous bands for regional claims such as “the groups differ from Time
-4 to Time 8,” because that claim implicitly scans many x-values.
+## Options
 
-## Random effects and population-level contrasts
-
-By default `marginalise_random=True`, so random-effect coefficient columns are
-zeroed in the contrast matrix before computing the difference.  This reports the
-population-level contrast rather than a contrast conditional on one subject’s
-random deviation.  Set `marginalise_random=False` when a conditional contrast is
-intended.
-
-## Including group means
-
-`group_means=True` is the substantive default: the contrast is the full fitted
-trajectory difference.  Set `group_means=False` to suppress group-offset blocks
-where the fitted model exposes them separately from smooth shape.
+- `group_means=True` includes parametric group offsets in the contrast. Set it to `False` for a shape-only contrast.
+- `marginalise_random=True` is the population-level default. The current public design-matrix export does not yet label random-effect columns, so the flag is accepted for API stability while fixed-effect/smooth covariance contrasts are already computed jointly.
 
 ## References
 
-* Soskuthy (2017), *Generalised additive mixed models for dynamic analysis in linguistics*.
-* Soskuthy (2021), tutorial notes on ordered-factor difference smooths.
-* Wieling (2018), tutorials on GAMMs for time-course data.
-* Simpson, gratia documentation and papers on simultaneous intervals for GAM smooths.
-* Wood (2017), *Generalized Additive Models: An Introduction with R*, especially smooth construction and inference chapters.
-* mgcv documentation for factor `by` smooths and `bs="sz"` sum-to-zero factor smooth interactions.
+This page follows the distinction drawn in Soskuthy (2017, 2021), Wieling (2018), Wood (2017), and Simpson's gratia/difference-smooth work: parameterisation controls what the model encodes, while post-fit contrast inference must use the joint covariance and simultaneous intervals for regional claims. The mgcv `factor.smooth` documentation motivates the `bs="sz"` construction because no group is privileged as the reference.
