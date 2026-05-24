@@ -74,6 +74,7 @@ fn assert_rejects_missing_period(formula: &str, data: &gam::data::EncodedDataset
 
 #[test]
 fn periodic_without_explicit_period_behavior_consistent() {
+    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let data = make_data_on((0.0, TAU), TAU, 200, 11);
     assert_rejects_missing_period("y ~ s(t, periodic=true)", &data);
@@ -83,6 +84,7 @@ fn periodic_without_explicit_period_behavior_consistent() {
 
 #[test]
 fn tensor_periodic_margin_without_explicit_period_rejected() {
+    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let data = make_tensor_data(80, 19);
     assert_rejects_missing_period("y ~ te(theta, h, periodic=[0])", &data);

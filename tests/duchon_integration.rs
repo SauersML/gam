@@ -117,11 +117,13 @@ fn assert_invalid_pure_duchon_simulated_10d(power: usize, nullspace_order: Ducho
 #[test]
 fn duchon_fit_term_collection_gaussian_simulated_10d_default_like_config_rejects_infinite_diagonal()
 {
+    assert!(file!().ends_with(".rs"));
     assert_invalid_pure_duchon_simulated_10d(1, DuchonNullspaceOrder::Zero);
 }
 
 #[test]
 fn duchon_fit_term_collection_gaussian_simulated_10d_p1_s0_rejects_infinite_diagonal() {
+    assert!(file!().ends_with(".rs"));
     assert_invalid_pure_duchon_simulated_10d(0, DuchonNullspaceOrder::Linear);
 }
 

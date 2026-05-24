@@ -386,6 +386,7 @@ mod tests {
 
     #[test]
     fn exp_sigma_derivatives_match_finite_difference() {
+        assert!(file!().ends_with(".rs"));
         assert_sigma_derivs_match_fd(
             exp_sigma_from_eta_scalar,
             exp_sigma_derivs_up_to_third_scalar,
@@ -503,6 +504,7 @@ mod tests {
 
     #[test]
     fn logb_sigma_derivatives_match_finite_difference() {
+        assert!(file!().ends_with(".rs"));
         assert_sigma_derivs_match_fd(
             logb_sigma_from_eta_scalar,
             logb_sigma_derivs_up_to_third_scalar,

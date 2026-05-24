@@ -13,9 +13,6 @@
 # then re-validates each surviving entry.
 src/families/latent_survival.rs	fn build_latent_survival_row( row_index: usize, hazard_loading: HazardLoading, event_type: LatentSurvivalEventType, q_entry: f64, q_exit: f64, qdot_exit: f64, unloaded_mass_entry: f64, unloaded_mass_exit: f64, unloaded_hazard_exit: f64, ) -> Result<LatentSurvivalRow, LatentSurvivalError>	unreachable!
 src/families/survival_construction.rs	pub fn parse_survival_time_basis_config( time_basis: &str, time_degree: usize, time_num_internal_knots: usize, time_smooth_lambda: f64, ) -> Result<SurvivalTimeBasisConfig, String>	unreachable!
-src/main.rs	fn collect_spatial_smooth_usagewarnings( spec: &TermCollectionSpec, headers: &[String], label: &str, ) -> Vec<String>	unreachable!
-src/main.rs	fn run_predict_survival( progress: &mut gam::visualizer::VisualizerSession, args: &PredictArgs, model: &SavedModel, data: ndarray::ArrayView2<'_, f64>, col_map: &HashMap<String, usize>, training_headers: Option<&Vec<String>>, primary_offset: &Array1<f64>, noise_offset: &Array1<f64>, ) -> Result<(), String>	unreachable!
-src/main.rs	fn run_survival(args: SurvivalArgs) -> Result<(), String>	unreachable!
 src/terms/basis.rs	fn isotropic_radial_laplacian_power_from_q0( q: usize, d: usize, m: usize, s: usize, kappa: f64, big_r: f64, ) -> f64	unreachable!
 src/terms/basis.rs	fn matern_collocation_operator_matrices_should_match_closed_forms_in_1d()	unreachable!
 src/terms/basis.rs	fn matern_operator_psi_triplet_should_match_closed_form_polynomials()	unreachable!

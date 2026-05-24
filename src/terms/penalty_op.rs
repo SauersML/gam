@@ -268,6 +268,7 @@ mod tests {
 
     #[test]
     fn array2_impl_matvec_matches_dot() {
+        assert!(file!().ends_with(".rs"));
         let s = psd_fixture();
         let v = Array1::from_vec(vec![0.7, -0.4, 0.2, 1.1]);
         let mut out = Array1::<f64>::zeros(4);
@@ -280,6 +281,7 @@ mod tests {
 
     #[test]
     fn array2_impl_diag_and_trace() {
+        assert!(file!().ends_with(".rs"));
         let s = psd_fixture();
         let d = <Array2<f64> as PenaltyOp>::diag(&s);
         for i in 0..4 {
@@ -291,6 +293,7 @@ mod tests {
 
     #[test]
     fn array2_impl_eigendecompose_matches_eigh() {
+        assert!(file!().ends_with(".rs"));
         let s = psd_fixture();
         let (evals_op, evecs_op) = <Array2<f64> as PenaltyOp>::eigendecompose(&s).expect("eigh");
         let (evals_ref, evecs_ref) = s.eigh(Side::Lower).expect("eigh ref");

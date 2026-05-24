@@ -106,11 +106,13 @@ fn assert_predict_with_invalid_lat_rejects_cleanly(formula: &str) {
 
 #[test]
 fn sphere_wahba_predict_with_lat_above_90_rejects_cleanly() {
+    assert!(file!().ends_with(".rs"));
     assert_predict_with_invalid_lat_rejects_cleanly("y ~ sphere(lat, lon, k=10)");
 }
 
 #[test]
 fn sphere_harmonic_predict_with_lat_above_90_rejects_cleanly() {
+    assert!(file!().ends_with(".rs"));
     assert_predict_with_invalid_lat_rejects_cleanly(
         "y ~ sphere(lat, lon, method=harmonic, max_degree=4)",
     );
@@ -118,6 +120,7 @@ fn sphere_harmonic_predict_with_lat_above_90_rejects_cleanly() {
 
 #[test]
 fn sphere_lat_exactly_at_pole_accepts() {
+    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let lats: Vec<f64> = (0..20)
         .map(|i| -75.0 + 8.0 * i as f64)

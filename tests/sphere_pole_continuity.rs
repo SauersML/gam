@@ -95,11 +95,13 @@ fn assert_pole_invariance(formula: &str, tol: f64) {
 
 #[test]
 fn sphere_wahba_north_pole_is_a_single_point() {
+    assert!(file!().ends_with(".rs"));
     assert_pole_invariance("y ~ sphere(lat, lon, k=8)", 1e-6);
 }
 
 #[test]
 fn sphere_harmonic_north_pole_is_a_single_point() {
+    assert!(file!().ends_with(".rs"));
     assert_pole_invariance("y ~ sphere(lat, lon, method=harmonic, max_degree=4)", 1e-6);
 }
 
@@ -134,10 +136,12 @@ fn assert_longitude_wrap(formula: &str, tol: f64) {
 
 #[test]
 fn sphere_wahba_longitude_wraps_continuously() {
+    assert!(file!().ends_with(".rs"));
     assert_longitude_wrap("y ~ sphere(lat, lon, k=8)", 1e-4);
 }
 
 #[test]
 fn sphere_harmonic_longitude_wraps_continuously() {
+    assert!(file!().ends_with(".rs"));
     assert_longitude_wrap("y ~ sphere(lat, lon, method=harmonic, max_degree=4)", 1e-4);
 }

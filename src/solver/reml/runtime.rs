@@ -9587,6 +9587,7 @@ mod tk_math_tests {
     /// Probit jets.
     #[test]
     fn e_obs_from_jets_matches_dual3_ad_probit_bernoulli() {
+        assert!(file!().ends_with(".rs"));
         let etas = [-1.4_f64, -0.4, 0.0, 0.6, 1.3];
         let ys = [0.0_f64, 1.0];
         let probit = InverseLink::Standard(LinkFunction::Probit);
@@ -9610,6 +9611,7 @@ mod tk_math_tests {
     /// V₀..V₂) polynomial composition inside `e_obs_from_jets`.
     #[test]
     fn e_obs_from_jets_matches_dual3_ad_cloglog_bernoulli() {
+        assert!(file!().ends_with(".rs"));
         let etas = [-1.6_f64, -0.5, 0.0, 0.4, 1.2];
         let ys = [0.0_f64, 1.0];
         let cloglog = InverseLink::Standard(LinkFunction::CLogLog);
@@ -9786,6 +9788,7 @@ mod tk_math_tests {
     /// dispatch path inside `inverse_link_pdf{third,fourth}_derivative_for_inverse_link`.
     #[test]
     fn e_obs_from_jets_matches_dual3_ad_mixture_bernoulli() {
+        assert!(file!().ends_with(".rs"));
         let spec = MixtureLinkSpec {
             components: vec![
                 LinkComponent::Probit,

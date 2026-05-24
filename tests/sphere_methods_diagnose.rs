@@ -98,6 +98,7 @@ fn stats(name: &str, pred: &[f64], truth_vals: &[f64]) -> (f64, f64) {
 
 #[test]
 fn diagnose_sphere_methods_vs_truth() {
+    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let data = make_dataset(12, 24, 0.05, 41);
     let mut lats = Vec::with_capacity(15 * 30);

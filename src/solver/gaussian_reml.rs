@@ -3121,11 +3121,13 @@ mod tests {
 
     #[test]
     fn scalar_backward_matches_forward_finite_difference_for_all_x_y_and_weight_entries() {
+        assert!(file!().ends_with(".rs"));
         assert_backward_matches_forward_finite_difference(1);
     }
 
     #[test]
     fn multi_output_backward_matches_forward_finite_difference_for_all_x_y_and_weight_entries() {
+        assert!(file!().ends_with(".rs"));
         assert_backward_matches_forward_finite_difference(3);
     }
 

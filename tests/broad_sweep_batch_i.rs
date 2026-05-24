@@ -438,6 +438,7 @@ fn sphere_logit_predict_finite_at_pole() {
 
 #[test]
 fn sphere_with_method_alias_sos() {
+    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u_lat = Uniform::new(-80.0_f64, 80.0).expect("uniform");

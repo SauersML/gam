@@ -12811,6 +12811,7 @@ mod tests {
 
     #[test]
     fn transformation_normal_joint_hessian_second_directional_derivative_matches_fd() {
+        assert!(file!().ends_with(".rs"));
         let psi = array![0.15, -0.10];
         let h = 1e-6;
         let (family, _, state, _) = toy_family_and_derivatives(&psi);

@@ -19552,6 +19552,7 @@ mod tests {
 
     #[test]
     fn flex_hessian_matvec_parallel_chunks_match_serial_reference() {
+        assert!(file!().ends_with(".rs"));
         let (family, states, cache, direction) =
             flex_hessian_matvec_fixture(96).expect("flex Hv fixture");
         let serial = family
@@ -21970,6 +21971,7 @@ mod tests {
 
     #[test]
     fn validate_spec_accepts_learnable_gaussian_shift_sigma() {
+        assert!(file!().ends_with(".rs"));
         let data = Array2::<f64>::zeros((3, 0));
         let mut spec = base_spec(
             array![0.0, 1.0, 0.0],

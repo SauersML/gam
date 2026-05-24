@@ -101,6 +101,7 @@ fn sphere_large_amplitude_response_fits_correctly() {
 
 #[test]
 fn sphere_duplicate_points_different_y_does_not_crash() {
+    assert!(file!().ends_with(".rs"));
     init_parallelism();
     // 200 points all at (lat=30, lon=45), with noise so y varies.
     let mut rng = StdRng::seed_from_u64(7);

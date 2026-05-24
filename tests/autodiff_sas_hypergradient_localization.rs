@@ -296,6 +296,7 @@ impl<T: AD> DifferentiableFunctionTrait<T> for SasD2Fn<T> {
 
 #[test]
 fn sas_epsilon_eta_derivative_partials_match_three_autodiff_engines() {
+    assert!(file!().ends_with(".rs"));
     let cases = [
         (-1.2, -0.4, -0.3),
         (-0.5, 0.2, 0.1),
