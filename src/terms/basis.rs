@@ -24288,6 +24288,28 @@ impl PeriodicSplineCurve {
         let basis = build_periodic_bspline_basis_1d(u, &self.spec)?;
         Ok(basis.dot(&self.coefficients))
     }
+
+    /// Evaluate the derivative of the fitted curve with respect to its scalar
+    /// periodic parameter.
+    pub fn evaluate_derivative(&self, u: ArrayView1<'_, f64>) -> Result<Array2<f64>, BasisError> {
+        if self.coefficients.nrows() != self.spec.num_basis {
+            return Err(BasisError::DimensionMismatch(format!(
+                "curve coefficient rows ({}) must equal periodic basis size ({})",
+                self.coefficients.nrows(),
+                self.spec.num_basis
+            )));
+        }
+        let t = u.to_owned().insert_axis(Axis(1));
+        let derivative = periodic_bspline_first_derivative_nd(
+            t.view(),
+            (self.spec.origin, self.spec.origin + self.spec.period),
+            self.spec.degree,
+            self.spec.num_basis,
+        )?
+        .index_axis(Axis(2), 0)
+        .to_owned();
+        Ok(derivative.dot(&self.coefficients))
+    }
 }
 
 fn validate_periodic_bspline_spec(spec: &PeriodicBSplineBasisSpec) -> Result<(), BasisError> {

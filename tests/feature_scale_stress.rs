@@ -11,10 +11,9 @@ use gam::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
     BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, OneDimensionalBoundary,
     PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec, build_bspline_basis_1d,
-    build_spherical_spline_basis,
-    create_cyclic_bspline_basis_dense, create_cyclic_difference_penalty_matrix,
-    fit_periodic_bspline_curve, periodic_bspline_first_derivative_nd,
-    spherical_wahba_kernel_matrix,
+    build_spherical_spline_basis, create_cyclic_bspline_basis_dense,
+    create_cyclic_difference_penalty_matrix, fit_periodic_bspline_curve,
+    periodic_bspline_first_derivative_nd, spherical_wahba_kernel_matrix,
 };
 use ndarray::{Array1, Array2};
 use std::time::Instant;
@@ -115,8 +114,13 @@ fn exact_periodic_cubic_spline_scales_and_interpolates_at_100k() {
             y[(i, 2)] = 0.1 * (t + 0.3).sin() + 0.05 * (7.0 * t).cos();
         }
         let spline = time_label(&format!("exact_periodic_cubic N={n} d=3"), || {
-            fit_periodic_bspline_curve(u.view(), y.view(), &PeriodicBSplineBasisSpec::new(3, 24, period, 0.0, 2), 1e-10)
-                .expect("exact periodic spline")
+            fit_periodic_bspline_curve(
+                u.view(),
+                y.view(),
+                &PeriodicBSplineBasisSpec::new(3, 24, period, 0.0, 2),
+                1e-10,
+            )
+            .expect("exact periodic spline")
         });
         assert_eq!(spline.num_sites(), n);
         assert_eq!(spline.ambient_dim(), 3);
