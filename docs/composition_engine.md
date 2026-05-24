@@ -44,6 +44,11 @@ Related design notes:
 | `SparsityPenalty` | Code, assignment, or decoder block | `λ Σ_j sqrt(x_j² + ε²)` | Mechanism sparsity | Encourages small active sets for SAE-style codes and block mechanisms. |
 | `OrthogonalityPenalty` | Latent coordinate matrix `T` | `½ w ‖T^T T - I‖²_F` | Gauge fix paired with ARD | Fixes rotation and scale so ARD can make axis-wise pruning identifiable. |
 | `TotalVariationPenalty` | `ForwardDiff1D` or `GraphEdges` differences of a latent block | `λ Σ_e sqrt(‖D_e x‖² + ε²)` | Piecewise structure | Promotes piecewise-constant atom maps over sequences or arbitrary adjacency graphs. |
+| `IBPAssignmentPenalty` | Binary or relaxed atom-assignment logits | `-log p(Z; α, τ)` with IBP-style occupancy terms | Nonparametric assignment prior | Lets the model discover a sparse active atom count below the configured maximum. |
+| `SoftmaxAssignmentSparsityPenalty` | Per-row softmax atom assignments | `λ Σ_i H(softmax(a_i / τ))` | Assignment concentration | Favors decisive atom ownership without hard-coding a discrete assignment step. |
+| `NuclearNormPenalty` | Row-wise latent matrix blocks | `λ Σ_i ‖X_i‖_*` with smoothed singular values | Low-rank structure | Encourages each latent matrix block to use only the rank needed by the data. |
+| `BlockSparsityPenalty` | Configured groups of latent axes | `λ Σ_g sqrt(‖T_g‖²_F + ε²)` | Group sparsity | Removes whole latent-axis groups when a mechanism block is unnecessary. |
+| `AuxConditionalPriorPenalty` | Per-row latent coordinates conditioned on auxiliary inputs | `½ w Σ_i t_i^T Λ_i t_i` | Auxiliary conditional shrinkage | Injects row-local prior precision from covariates without coupling observations. |
 
 ## Minimal Configurations
 

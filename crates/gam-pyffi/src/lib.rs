@@ -70,9 +70,10 @@ use gam::terms::sae_manifold::{
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::terms::{
-    ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, DifferenceOpKind,
-    IBPAssignmentPenalty, IsometryPenalty, NuclearNormPenalty, OrthogonalityPenalty, PenaltyTier,
-    PsiSlice, SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TotalVariationPenalty,
+    ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, AuxConditionalPriorPenalty,
+    DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty, NuclearNormPenalty,
+    OrthogonalityPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty,
+    SparsityPenalty, TotalVariationPenalty,
 };
 use gam::terms::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
@@ -10370,6 +10371,59 @@ fn descriptor_difference_op(
     }
 }
 
+fn descriptor_array3_flat(
+    descriptor: &serde_json::Map<String, serde_json::Value>,
+    data_key: &str,
+    shape_key: &str,
+    context: &str,
+) -> Result<Array3<f64>, String> {
+    let shape_values = descriptor
+        .get(shape_key)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{context}.{shape_key} must be a three-item shape list"))?;
+    if shape_values.len() != 3 {
+        return Err(format!(
+            "{context}.{shape_key} must contain exactly three dimensions"
+        ));
+    }
+    let mut shape = [0usize; 3];
+    for (idx, raw_dim) in shape_values.iter().enumerate() {
+        let dim = raw_dim.as_u64().ok_or_else(|| {
+            format!("{context}.{shape_key}[{idx}] must be a positive integer")
+        })?;
+        if dim == 0 {
+            return Err(format!("{context}.{shape_key}[{idx}] must be > 0"));
+        }
+        shape[idx] = dim as usize;
+    }
+    let expected_len = shape[0]
+        .checked_mul(shape[1])
+        .and_then(|value| value.checked_mul(shape[2]))
+        .ok_or_else(|| format!("{context}.{shape_key} overflows usize"))?;
+    let values = descriptor
+        .get(data_key)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{context}.{data_key} must be a flattened numeric array"))?;
+    if values.len() != expected_len {
+        return Err(format!(
+            "{context}.{data_key} length {} does not match {shape_key} product {expected_len}",
+            values.len()
+        ));
+    }
+    let mut flat = Vec::with_capacity(expected_len);
+    for (idx, cell) in values.iter().enumerate() {
+        let value = cell
+            .as_f64()
+            .ok_or_else(|| format!("{context}.{data_key}[{idx}] must be a finite number"))?;
+        if !value.is_finite() {
+            return Err(format!("{context}.{data_key}[{idx}] must be finite"));
+        }
+        flat.push(value);
+    }
+    Array3::from_shape_vec((shape[0], shape[1], shape[2]), flat)
+        .map_err(|err| format!("{context}.{data_key} shape reconstruction failed: {err}"))
+}
+
 fn build_analytic_penalty_registry_from_json(
     latents: Option<&serde_json::Value>,
     penalties: Option<&serde_json::Value>,
@@ -10567,6 +10621,32 @@ fn build_analytic_penalty_registry_from_json(
                             weight,
                             n_eff,
                             smoothing_eps,
+                            learnable,
+                        )
+                        .map_err(|err| format!("{context}: {err}"))?,
+                    ),
+                ));
+            }
+            "aux_conditional_prior" => {
+                let weight = descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let lambda_per_row = descriptor_array3_flat(
+                    descriptor,
+                    "lambda_per_row",
+                    "lambda_per_row_shape",
+                    &context,
+                )?;
+                registry.push(gam::terms::AnalyticPenaltyKind::AuxConditionalPrior(
+                    std::sync::Arc::new(
+                        AuxConditionalPriorPenalty::new(
+                            slice,
+                            lambda_per_row,
+                            weight,
+                            n_eff,
                             learnable,
                         )
                         .map_err(|err| format!("{context}: {err}"))?,
