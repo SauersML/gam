@@ -790,7 +790,7 @@ pub enum PredictModelClass {
 
 impl PredictModelClass {
     #[inline]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Standard => "standard",
             Self::GaussianLocationScale => "gaussian location-scale",

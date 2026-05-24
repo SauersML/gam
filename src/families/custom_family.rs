@@ -10429,12 +10429,14 @@ fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'sta
     states: &[ParameterBlockState],
     prefer_workspace: bool,
 ) -> Result<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>), String> {
-    if let Some((log_likelihood, workspace)) =
-        family.joint_line_search_log_likelihood_workspace(states, specs, options)?
+    if prefer_workspace
+        && let Some((log_likelihood, workspace)) =
+            family.joint_line_search_log_likelihood_workspace(states, specs, workspace_options)?
     {
         return Ok((log_likelihood, Some(workspace)));
     }
-    if (!family.supports_log_likelihood_early_exit() || options.early_exit_threshold.is_none())
+    if (!family.supports_log_likelihood_early_exit()
+        || line_search_options.early_exit_threshold.is_none())
         && prefer_workspace
         && family.inner_joint_workspace_log_likelihood_available(specs)
         && let Some(workspace) = family.exact_newton_joint_hessian_workspace_with_options(
@@ -10727,6 +10729,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 joint_workspace: cached.joint_workspace.clone(),
             });
         }
+        // Cold-start path: copy prior β where dimensions match
+        // (best-effort; mismatched blocks keep the freshly-built
+        // initial state).
         for (b, beta_seed) in seed.block_beta.iter().enumerate() {
             if beta_seed.len() == states[b].beta.len() {
                 let beta_projected =
@@ -10734,31 +10739,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 states[b].beta.assign(&beta_projected);
             }
         }
-
-        if warm_start_path == "cold" {
-            // Historical cold-start: copy prior β where dimensions match
-            // (best-effort; mismatched blocks keep the freshly-built
-            // initial state). This is the same behavior as before the
-            // soft-warm-start logic was introduced.
-            for (b, beta_seed) in seed.block_beta.iter().enumerate() {
-                if beta_seed.len() == states[b].beta.len() {
-                    let beta_projected =
-                        family.post_update_block_beta(&states, b, &specs[b], beta_seed.clone())?;
-                    states[b].beta.assign(&beta_projected);
-                }
-            }
-            cached_active_sets = seed.active_sets.clone();
-            refresh_all_block_etas(family, specs, &mut states)?;
-        }
-
-        log::debug!(
-            "[GAMLSS soft warm-start] path={} (structure_unchanged={}, rho_change_max={})",
-            warm_start_path,
-            structure_unchanged,
-            rho_change_max
-                .map(|v| format!("{:.3e}", v))
-                .unwrap_or_else(|| "n/a".to_string()),
-        );
+        cached_active_sets = seed.active_sets.clone();
+        refresh_all_block_etas(family, specs, &mut states)?;
     }
     let (
         mut current_log_likelihood,

@@ -32,6 +32,6 @@ impl Timer {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last);
         self.last = now;
-        println!("[{:?}] {:?}", elapsed, msg);
+        crate::__vmc_out!("[{:?}] {:?}", elapsed, msg);
     }
 }

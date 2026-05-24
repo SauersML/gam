@@ -192,6 +192,32 @@ pub fn log_backend_inventory_once() {
     });
 }
 
+/// Operation kind passed through dispatch & profiling — CPU-only build
+/// uses this purely as a label.
+#[derive(Clone, Copy, Debug)]
+pub enum GpuOperation {
+    Gemm { m: usize, n: usize, k: usize },
+    Gemv { m: usize, k: usize },
+    XtDiagX { n: usize, p: usize },
+    XtDiagY { n: usize, px: usize, q: usize },
+}
+
+#[inline]
+pub fn try_dispatch_dense(_op: GpuOperation) -> linalg::GpuDispatch { linalg::GpuDispatch::Cpu }
+
+#[inline]
+pub fn try_fast_ab<A, B>(_a: A, _b: B) -> Option<ndarray::Array2<f64>> { None }
+#[inline]
+pub fn try_fast_av<A, V>(_a: A, _v: V) -> Option<ndarray::Array1<f64>> { None }
+#[inline]
+pub fn try_fast_atv<A, V>(_a: A, _v: V) -> Option<ndarray::Array1<f64>> { None }
+#[inline]
+pub fn try_syevd_inplace(_a: &mut ndarray::Array2<f64>) -> Option<ndarray::Array1<f64>> { None }
+#[inline]
+pub fn record_cpu_kernel(_op: GpuOperation, _elapsed: std::time::Duration) {}
+#[inline]
+pub fn record_cpu_fallback(_name: &str, _kind: profile::OperationKind, _n: usize, _p: usize, _q: usize, _flops: usize) {}
+
 #[cfg(test)]
 mod policy_tests {
     use super::*;

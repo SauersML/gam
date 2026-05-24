@@ -153,6 +153,20 @@ fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodFamily) -> O
     }
 }
 
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+#[inline]
+fn chain_stream_seed(seed: u64, chain: usize, stream: u64) -> u64 {
+    splitmix64(seed ^ stream ^ ((chain as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)))
+}
+
 /// Run NUTS posterior sampling over a saved model.
 ///
 /// Dispatches on `model.predict_model_class()`:
@@ -277,19 +291,29 @@ pub fn laplace_gaussian_fallback(
 
     let n_total = cfg.n_samples.saturating_mul(cfg.n_chains).max(1);
     let mut samples = Array2::<f64>::zeros((n_total, p));
-    let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.seed);
     let mut eps = Array1::<f64>::zeros(p);
     let mut delta = Array1::<f64>::zeros(p);
-    for k in 0..n_total {
-        for i in 0..p {
-            eps[i] = sample_standard_normal(&mut rng);
-        }
-        back_solve_lower_transpose(&l, &eps, &mut delta);
-        for i in 0..p {
-            // `delta` has covariance H⁻¹; multiplying by √φ produces a
-            // draw with covariance φ·H⁻¹, matching the φ-scaled
-            // posterior covariance `Vb` the rest of inference assumes.
-            samples[(k, i)] = mode[i] + sqrt_phi * delta[i];
+    for chain in 0..cfg.n_chains.max(1) {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(chain_stream_seed(
+            cfg.seed,
+            chain,
+            0xA0B7_6C5D_E431_298F,
+        ));
+        for draw in 0..cfg.n_samples.max(1) {
+            let k = chain * cfg.n_samples.max(1) + draw;
+            if k >= n_total {
+                break;
+            }
+            for i in 0..p {
+                eps[i] = sample_standard_normal(&mut rng);
+            }
+            back_solve_lower_transpose(&l, &eps, &mut delta);
+            for i in 0..p {
+                // `delta` has covariance H⁻¹; multiplying by √φ produces a
+                // draw with covariance φ·H⁻¹, matching the φ-scaled
+                // posterior covariance `Vb` the rest of inference assumes.
+                samples[(k, i)] = mode[i] + sqrt_phi * delta[i];
+            }
         }
     }
 

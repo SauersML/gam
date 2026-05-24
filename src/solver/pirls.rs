@@ -6367,7 +6367,7 @@ impl PirlsStatus {
     /// Both the iteration-cap and LM-exhausted exits should be treated the
     /// same by callers that just want to know "did we get a valid solution?".
     #[inline]
-    pub fn is_failed_max_iterations(self) -> bool {
+    pub const fn is_failed_max_iterations(self) -> bool {
         matches!(
             self,
             PirlsStatus::MaxIterationsReached | PirlsStatus::LmStepSearchExhausted

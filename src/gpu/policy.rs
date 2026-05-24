@@ -55,3 +55,13 @@ impl GpuDispatchPolicy {
         h_resident && p >= self.potrf_min_p
     }
 }
+
+/// Operation discriminator used by the dispatch decision API. Mirrors
+/// `super::GpuOperation` at the policy layer.
+#[derive(Clone, Copy, Debug)]
+pub enum Operation {
+    Gemm,
+    Gemv,
+    XtDiagX,
+    XtDiagY,
+}

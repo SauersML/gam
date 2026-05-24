@@ -351,7 +351,7 @@ impl<'a> FitRequest<'a> {
     /// shape shares the same family tag, so a hierarchical lookup can
     /// drop trailing key segments to find near-match seeds from prior
     /// fits of the same family on related data.
-    pub fn family_tag(&self) -> &'static str {
+    pub const fn family_tag(&self) -> &'static str {
         match self {
             FitRequest::Standard(_) => "standard",
             FitRequest::GaussianLocationScale(_) => "gaussian-location-scale",

@@ -3609,6 +3609,16 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
         )?;
         let max_step_abs = raw_step.iter().map(|s| s.abs()).fold(0.0_f64, f64::max);
         let current_cost = eval.cost;
+        if self.fixed_point_step_converged(x, &raw_step, psi_indices.as_deref()) {
+            if psi_indices.is_some() {
+                self.consecutive_psi_zero_iters = 0;
+            }
+            return Ok(FixedPointSample {
+                value: current_cost,
+                step: raw_step,
+                status: FixedPointStatus::Stop,
+            });
+        }
 
         // Negligible raw step — the iteration is at (or numerically
         // indistinguishable from) a fixed point. Pass it through so the
@@ -3815,6 +3825,28 @@ impl OuterFixedPointBridge<'_> {
             alpha *= 0.5;
         }
         Ok(None)
+    }
+
+    fn fixed_point_step_converged(
+        &self,
+        x: &Array1<f64>,
+        step: &Array1<f64>,
+        psi_indices: Option<&[usize]>,
+    ) -> bool {
+        if x.len() != step.len() {
+            return false;
+        }
+        for idx in 0..step.len() {
+            let scale = match psi_indices {
+                Some(indices) if indices.contains(&idx) => x[idx].abs().max(1.0),
+                _ => 1.0,
+            };
+            let normalized = step[idx].abs() / scale;
+            if !normalized.is_finite() || normalized > self.fixed_point_tolerance {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -4924,6 +4956,15 @@ fn run_outer(
         match outcome {
             Ok(result) => {
                 if result.converged || attempt_idx + 1 == attempts.len() {
+                    if !result.converged {
+                        log::warn!(
+                            "[OUTER warning] {context}: final outer attempt returned without convergence \
+                             (plan={the_plan}, iterations={}, final_value={:.6e}, |g|={})",
+                            result.iterations,
+                            result.final_value,
+                            result.final_grad_norm_report(),
+                        );
+                    }
                     return Ok(result);
                 }
 
@@ -5266,7 +5307,8 @@ fn run_outer_with_plan(
                     // already learned instead of redoing the trust-radius
                     // adaptation from the configured initial radius.
                     match report.status {
-                        OptimizationStatus::Converged => {
+                        OptimizationStatus::Converged
+                        | OptimizationStatus::NumericallyConverged => {
                             let mut result =
                                 solution_into_outer_result(report.solution, true, *the_plan);
                             result.operator_stop_reason =
@@ -5296,6 +5338,18 @@ fn run_outer_with_plan(
                             Ok(result)
                         }
                         OptimizationStatus::TrustRegionRejectFloor => {
+                            log::warn!(
+                                "[OUTER warning] {context}: matrix-free TR reached trust-radius reject floor at final_value={:.6e} |g|={:.3e} final_trust_radius={}",
+                                report.solution.final_value,
+                                report
+                                    .solution
+                                    .final_gradient_norm
+                                    .unwrap_or(f64::NAN),
+                                match final_radius {
+                                    Some(r) => format!("{:.3e}", r),
+                                    None => "n/a".to_string(),
+                                },
+                            );
                             let mut result =
                                 solution_into_outer_result(report.solution, false, *the_plan);
                             result.operator_stop_reason =
@@ -5619,6 +5673,12 @@ fn run_outer_with_plan(
                 match optimizer.run() {
                     Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                     Err(FixedPointError::MaxIterationsReached { last_solution }) => {
+                        log::warn!(
+                            "[OUTER warning] {context}: EFS hit max_iter={} at final_value={:.6e} step_norm={:.3e}",
+                            config.max_iter,
+                            last_solution.final_value,
+                            last_solution.final_gradient_norm.unwrap_or(f64::NAN),
+                        );
                         Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                     }
                     Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
@@ -5666,6 +5726,12 @@ fn run_outer_with_plan(
                 match optimizer.run() {
                     Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                     Err(FixedPointError::MaxIterationsReached { last_solution }) => {
+                        log::warn!(
+                            "[OUTER warning] {context}: HybridEFS hit max_iter={} at final_value={:.6e} step_norm={:.3e}",
+                            config.max_iter,
+                            last_solution.final_value,
+                            last_solution.final_gradient_norm.unwrap_or(f64::NAN),
+                        );
                         Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                     }
                     Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
@@ -5718,6 +5784,11 @@ fn run_outer_with_plan(
                         operator_stop_reason: None,
                     }),
                     CompassSearchOutcome::BudgetExhausted { point, cost, polls } => {
+                        log::warn!(
+                            "[OUTER warning] {context}: compass search exhausted max_polls={} at best_cost={:.6e}",
+                            config.max_iter,
+                            cost,
+                        );
                         Ok(OuterResult {
                             rho: point,
                             final_value: cost,
@@ -8041,7 +8112,7 @@ mod tests {
             None::<fn(&mut ())>,
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
-        let _ = problem
+        problem
             .run(&mut obj, "cascade should escalate")
             .expect("cascade should reach a finite cost at the 4× cap stage");
         // The cascade is [3, 12, 48, 0]; the 4× stage (cap=12) is the first
@@ -8456,7 +8527,7 @@ mod tests {
             None::<fn(&mut ())>,
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
-        let _ = problem
+        problem
             .run(&mut obj, "arc seed projection")
             .expect("arc should evaluate the projected seed");
         assert_eq!(
@@ -8497,7 +8568,7 @@ mod tests {
             None::<fn(&mut ())>,
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
-        let _ = problem
+        problem
             .run(&mut obj, "bfgs seed projection")
             .expect("BFGS should evaluate the projected seed");
         assert_eq!(
@@ -8639,7 +8710,7 @@ mod tests {
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
         let mut wrapped = CheckpointingObjective::new(&mut inner, Arc::clone(&session), Vec::new());
-        let _ = wrapped.eval(&array![0.5]).expect("eval ok");
+        drop(wrapped.eval(&array![0.5]).expect("eval ok"));
         let on_disk = session
             .try_load()
             .expect("eval with finite β must persist a (ρ,β) checkpoint");
@@ -8670,7 +8741,7 @@ mod tests {
             None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
         );
         let mut wrapped = CheckpointingObjective::new(&mut inner, Arc::clone(&session), Vec::new());
-        let _ = wrapped.eval(&array![0.5]).expect("eval ok");
+        drop(wrapped.eval(&array![0.5]).expect("eval ok"));
         assert!(
             session.try_load().is_none(),
             "non-finite β must abort the checkpoint write, not poison the cache",
@@ -8795,7 +8866,7 @@ mod tests {
             .with_hessian(DeclaredHessianForm::Unavailable)
             .with_max_iter(1)
             .with_cache_session(Arc::clone(&session));
-        let _ = problem.run(&mut obj, "seed-inner-state-call");
+        drop(problem.run(&mut obj, "seed-inner-state-call"));
 
         let observed = seeded.lock().unwrap().clone();
         assert_eq!(
@@ -8865,7 +8936,7 @@ mod tests {
             .with_hessian(DeclaredHessianForm::Unavailable)
             .with_max_iter(1)
             .with_cache_session(Arc::clone(&session));
-        let _ = problem.run(&mut obj, "seed-inner-state-skip");
+        drop(problem.run(&mut obj, "seed-inner-state-skip"));
 
         assert_eq!(
             *seed_calls.lock().unwrap(),
@@ -9062,7 +9133,7 @@ mod tests {
                 ) -> Result<EfsEval, EstimationError>,
             >,
         );
-        let _ = problem.run(&mut obj, "seed-prepend");
+        drop(problem.run(&mut obj, "seed-prepend"));
         // The cached rho (2.5) must appear in the eval trace, and it must
         // appear no later than the configured initial_rho (−3.0). Both
         // are inside the bounds so the projector cannot rewrite them.
@@ -9140,7 +9211,7 @@ mod tests {
             >,
         );
 
-        let _ = problem.run(&mut obj, "all-saturated-honored");
+        drop(problem.run(&mut obj, "all-saturated-honored"));
         let evals = seen.lock().unwrap();
         assert!(
             evals.iter().any(|rho| rho == &array![10.0, -10.0]),

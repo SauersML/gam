@@ -717,12 +717,15 @@ pub fn effectivelinkwiggle_formulaspec(
     })
 }
 
-pub fn linkname_supports_joint_wiggle(link: LinkFunction) -> bool {
+pub const fn linkname_supports_joint_wiggle(link: LinkFunction) -> bool {
     !matches!(link, LinkFunction::Sas | LinkFunction::BetaLogistic)
 }
 
-pub fn linkchoice_supports_joint_wiggle(choice: &LinkChoice) -> bool {
-    choice.mixture_components.is_none() && linkname_supports_joint_wiggle(choice.link)
+pub const fn linkchoice_supports_joint_wiggle(choice: &LinkChoice) -> bool {
+    match &choice.mixture_components {
+        None => linkname_supports_joint_wiggle(choice.link),
+        Some(_) => false,
+    }
 }
 
 pub fn require_linkchoice_supports_joint_wiggle(
@@ -736,12 +739,14 @@ pub fn require_linkchoice_supports_joint_wiggle(
     }
 }
 
-pub fn likelihood_family_supports_joint_wiggle(family: LikelihoodFamily) -> bool {
-    let spec: crate::types::LikelihoodSpec = family.into();
-    !(spec.is_latent_cloglog()
-        || spec.is_binomial_sas()
-        || spec.is_binomial_beta_logistic()
-        || spec.is_binomial_mixture())
+pub const fn likelihood_family_supports_joint_wiggle(family: LikelihoodFamily) -> bool {
+    !matches!(
+        family,
+        LikelihoodFamily::BinomialLatentCLogLog
+            | LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialBetaLogistic
+            | LikelihoodFamily::BinomialMixture
+    )
 }
 
 pub fn require_likelihood_family_supports_joint_wiggle(
@@ -755,7 +760,7 @@ pub fn require_likelihood_family_supports_joint_wiggle(
     }
 }
 
-pub fn inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
+pub const fn inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
     matches!(
         link,
         InverseLink::Standard(LinkFunction::Identity)
@@ -777,7 +782,7 @@ pub fn require_inverse_link_supports_joint_wiggle(
     }
 }
 
-pub fn binomial_inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
+pub const fn binomial_inverse_link_supports_joint_wiggle(link: &InverseLink) -> bool {
     matches!(
         link,
         InverseLink::Standard(LinkFunction::Logit)

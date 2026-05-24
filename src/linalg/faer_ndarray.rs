@@ -1,5 +1,3 @@
-use crate::gpu::linalg::{self as gpu_linalg, GpuDispatch};
-use crate::gpu::policy::Operation;
 use dyn_stack::{MemBuffer, MemStack};
 use faer::diag::{Diag, DiagMut, DiagRef};
 use faer::linalg::cholesky::lblt::factor::{self, LbltParams, PivotingStrategy};
@@ -159,25 +157,6 @@ pub(crate) fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
     }
 }
 
-#[inline]
-fn gpu_profile_start(
-    op: crate::gpu::GpuOperation,
-) -> (crate::gpu::GpuOperation, Option<std::time::Instant>) {
-    drop(crate::gpu::try_dispatch_dense(op));
-    let start = if crate::gpu::profile::profiling_enabled() {
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    (op, start)
-}
-
-#[inline]
-fn gpu_profile_finish(op: crate::gpu::GpuOperation, start: Option<std::time::Instant>) {
-    if let Some(start) = start {
-        crate::gpu::record_cpu_kernel(op, start.elapsed());
-    }
-}
 
 #[inline]
 pub fn array2_to_matmut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
@@ -239,14 +218,11 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
     use faer::linalg::matmul::triangular::{BlockStructure, matmul as tri_matmul};
 
     let (n, p) = a.dim();
-    let (profile_op, profile_start) =
-        gpu_profile_start(crate::gpu::GpuOperation::Gemm { m: p, n: p, k: n });
     debug_assert_eq!(out.nrows(), p, "output rows must match p");
     debug_assert_eq!(out.ncols(), p, "output cols must match p");
 
     if !should_use_faer_matmul(p, p, n) {
         out.assign(&a.t().dot(a));
-        gpu_profile_finish(profile_op, profile_start);
         return;
     }
 
@@ -256,8 +232,23 @@ pub fn fast_ata_into<S: Data<Elem = f64>>(a: &ArrayBase<S, Ix2>, out: &mut Array
     let a_ref = aview.as_ref();
     let a_t = a_ref.transpose();
     let par = matmul_parallelism(p, p, n);
-    matmul(outview.as_mut(), Accum::Replace, a_t, a_ref, 1.0, par);
-    gpu_profile_finish(profile_op, profile_start);
+    tri_matmul(
+        outview.as_mut(),
+        BlockStructure::TriangularLower,
+        Accum::Replace,
+        a_t,
+        BlockStructure::Rectangular,
+        a_ref,
+        BlockStructure::Rectangular,
+        1.0,
+        par,
+    );
+    // Mirror lower triangle to upper to populate the full symmetric output.
+    for i in 0..p {
+        for j in (i + 1)..p {
+            out[[i, j]] = out[[j, i]];
+        }
+    }
 }
 
 /// Compute A^T * B using faer's SIMD-optimized GEMM.
@@ -268,20 +259,9 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
-    if let GpuDispatch::Executed(out) = gpu_linalg::try_fast_atb(a, b) {
-        return out;
-    }
     let (n_a, p) = a.dim();
-    let (_, q) = b.dim();
-    let op = Operation::Gemm {
-        m: p,
-        n: q,
-        k: n_a,
-        resident: false,
-    };
-    gpu_linalg::profile_cpu(op, || {
-        fast_atb_with_parallelism(a, b, matmul_parallelism(p, q, n_a))
-    })
+    let q = b.ncols();
+    fast_atb_with_parallelism(a, b, matmul_parallelism(p, q, n_a))
 }
 
 /// Compute A^T * B with an explicit faer parallelism policy for callers that
@@ -292,23 +272,16 @@ pub fn fast_atb_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     b: &ArrayBase<S2, Ix2>,
     par: Par,
 ) -> Array2<f64> {
-    if let Some(out) = crate::gpu::linalg::try_fast_atb(a, b) {
-        return out;
-    }
     use faer::linalg::matmul::matmul;
     use faer::{Accum, Mat};
 
     let (n_a, p) = a.dim();
     let (n_b, q) = b.dim();
-    let (profile_op, profile_start) =
-        gpu_profile_start(crate::gpu::GpuOperation::Gemm { m: p, n: q, k: n_a });
     debug_assert_eq!(n_a, n_b, "A and B must have same number of rows");
 
     // For very small matrices, ndarray might be faster due to less overhead
     if !should_use_faer_matmul(p, q, n_a) {
-        let out = a.t().dot(b);
-        gpu_profile_finish(profile_op, profile_start);
-        return out;
+        return a.t().dot(b);
     }
 
     let mut result = Mat::<f64>::zeros(p, q);
@@ -328,9 +301,7 @@ pub fn fast_atb_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         par,
     );
 
-    let out = mat_to_array(result.as_ref());
-    gpu_profile_finish(profile_op, profile_start);
-    out
+    mat_to_array(result.as_ref())
 }
 
 /// Compute A * B^T using faer's SIMD-optimized GEMM.
@@ -377,23 +348,11 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
-    if let GpuDispatch::Executed(out) = gpu_linalg::try_fast_ab(a, b) {
-        return out;
-    }
-    let (n, p) = a.dim();
-    let (_, q) = b.dim();
-    crate::gpu::profile::cpu_scope(
-        "fast_ab",
-        n,
-        q,
-        a.ncols(),
-        n.saturating_mul(q).saturating_mul(8),
-        || {
-            let mut out = Array2::<f64>::zeros((n, q));
-            fast_ab_into(a, b, &mut out);
-            out
-        },
-    )
+    let n = a.nrows();
+    let q = b.ncols();
+    let mut out = Array2::<f64>::zeros((n, q));
+    fast_ab_into(a, b, &mut out);
+    out
 }
 
 /// Compute A * v using faer's SIMD-optimized GEMV.
@@ -403,10 +362,7 @@ pub fn fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     v: &ArrayBase<S2, Ix1>,
 ) -> Array1<f64> {
-    let (n, p) = a.dim();
-    crate::gpu::profile::cpu_scope("fast_av", n, 1, p, n.saturating_mul(8), || {
-        fast_av_impl(a, v)
-    })
+    fast_av_impl(a, v)
 }
 
 #[inline]
@@ -419,51 +375,25 @@ fn fast_av_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let (n, p) = a.dim();
     debug_assert_eq!(p, v.len(), "A cols must match v length");
-    crate::gpu::record_cpu_fallback(
-        "linalg.fast_av",
-        crate::gpu::profile::OperationKind::Gemv,
-        n,
-        p,
-        1,
-        0,
-    );
 
     if !should_use_faer_matmul(n, 1, p) {
         return a.dot(v);
     }
 
-    let (n, p) = a.dim();
-    let (profile_op, profile_start) =
-        gpu_profile_start(crate::gpu::GpuOperation::Gemv { m: n, k: p });
-    debug_assert_eq!(p, v.len(), "A cols must match v length");
-    let op = Operation::Gemv {
-        rows: n,
-        cols: p,
-        transpose: false,
-        resident: false,
-    };
+    let mut result = Mat::<f64>::zeros(n, 1);
 
-    if !should_use_faer_matmul(n, 1, p) {
-        let out = a.dot(v);
-        gpu_profile_finish(profile_op, profile_start);
-        return out;
-    }
+    let aview = FaerArrayView::new(a);
+    let vview = FaerColView::new(v);
+    let a_ref = aview.as_ref();
+    let v_ref = vview.as_ref();
 
-        let mut result = Mat::<f64>::zeros(n, 1);
-
-        let aview = FaerArrayView::new(a);
-        let vview = FaerColView::new(v);
-        let a_ref = aview.as_ref();
-        let v_ref = vview.as_ref();
-
-        let par = matmul_parallelism(n, 1, p);
-        matmul(result.as_mut(), Accum::Replace, a_ref, v_ref, 1.0, par);
+    let par = matmul_parallelism(n, 1, p);
+    matmul(result.as_mut(), Accum::Replace, a_ref, v_ref, 1.0, par);
 
     let mut out = Array1::<f64>::zeros(n);
     for i in 0..n {
         out[i] = result[(i, 0)];
     }
-    gpu_profile_finish(profile_op, profile_start);
     out
 }
 
@@ -475,10 +405,7 @@ pub fn fast_av_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     v: &ArrayBase<S2, Ix1>,
     out: &mut Array1<f64>,
 ) {
-    let (n, p) = a.dim();
-    crate::gpu::profile::cpu_scope("fast_av_into", n, 1, p, n.saturating_mul(8), || {
-        fast_av_into_impl(a, v, out);
-    });
+    fast_av_into_impl(a, v, out);
 }
 
 #[inline]
@@ -491,27 +418,11 @@ fn fast_av_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     use faer::linalg::matmul::matmul;
 
     let (n, p) = a.dim();
-    let (profile_op, profile_start) =
-        gpu_profile_start(crate::gpu::GpuOperation::Gemv { m: n, k: p });
     debug_assert_eq!(v.len(), p, "vector length must match A cols");
     debug_assert_eq!(out.len(), n, "output length must match A rows");
-    crate::gpu::record_cpu_fallback(
-        "linalg.fast_av_into",
-        crate::gpu::profile::OperationKind::Gemv,
-        n,
-        p,
-        1,
-        0,
-    );
-
-    if let Some(result) = crate::gpu::try_fast_av(a, v) {
-        out.assign(&result);
-        return;
-    }
 
     if !should_use_faer_matmul(n, 1, p) {
         out.assign(&a.dot(v));
-        gpu_profile_finish(profile_op, profile_start);
         return;
     }
 
@@ -523,7 +434,6 @@ fn fast_av_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let v_ref = vview.as_ref();
     let par = matmul_parallelism(n, 1, p);
     matmul(outview.as_mut(), Accum::Replace, a_ref, v_ref, 1.0, par);
-    gpu_profile_finish(profile_op, profile_start);
 }
 
 /// Compute A * v into a pre-allocated `ArrayViewMut1` slice. Like
@@ -538,10 +448,7 @@ pub fn fast_av_view_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     v: &ArrayBase<S2, Ix1>,
     out: ArrayViewMut1<'_, f64>,
 ) {
-    let (n, p) = a.dim();
-    crate::gpu::profile::cpu_scope("fast_av_view_into", n, 1, p, n.saturating_mul(8), || {
-        fast_av_view_into_impl(a, v, out);
-    });
+    fast_av_view_into_impl(a, v, out);
 }
 
 #[inline]
@@ -556,19 +463,6 @@ fn fast_av_view_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let (n, p) = a.dim();
     debug_assert_eq!(v.len(), p, "vector length must match A cols");
     debug_assert_eq!(out.len(), n, "output length must match A rows");
-    crate::gpu::record_cpu_fallback(
-        "linalg.fast_av_view_into",
-        crate::gpu::profile::OperationKind::Gemv,
-        n,
-        p,
-        1,
-        0,
-    );
-
-    if let Some(result) = crate::gpu::try_fast_av(a, v) {
-        out.assign(&result);
-        return;
-    }
 
     if !should_use_faer_matmul(n, 1, p) {
         let prod = a.dot(v);
@@ -606,10 +500,7 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     v: &ArrayBase<S2, Ix1>,
 ) -> Array1<f64> {
-    let (n, p) = a.dim();
-    crate::gpu::profile::cpu_scope("fast_atv", p, 1, n, p.saturating_mul(8), || {
-        fast_atv_impl(a, v)
-    })
+    fast_atv_impl(a, v)
 }
 
 #[inline]
@@ -620,53 +511,36 @@ fn fast_atv_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     use faer::linalg::matmul::matmul;
     use faer::{Accum, Mat};
 
-    if let GpuDispatch::Executed(out) = gpu_linalg::try_fast_atv(a, v) {
-        return out;
-    }
-
     let (n, p) = a.dim();
-    let (profile_op, profile_start) =
-        gpu_profile_start(crate::gpu::GpuOperation::Gemv { m: n, k: p });
     debug_assert_eq!(n, v.len(), "A rows must match v length");
-    crate::gpu::record_cpu_fallback(
-        "linalg.fast_atv",
-        crate::gpu::profile::OperationKind::GemvTranspose,
-        n,
-        p,
-        1,
-        0,
-    );
 
     // For very small arrays, ndarray might be faster
     if !should_use_faer_matmul(p, 1, n) {
-        let out = a.t().dot(v);
-        gpu_profile_finish(profile_op, profile_start);
-        return out;
+        return a.t().dot(v);
     }
 
-        let mut result = Mat::<f64>::zeros(p, 1);
+    let mut result = Mat::<f64>::zeros(p, 1);
 
-        let aview = FaerArrayView::new(a);
-        let vview = FaerColView::new(v);
-        let a_ref = aview.as_ref();
-        let v_ref = vview.as_ref();
+    let aview = FaerArrayView::new(a);
+    let vview = FaerColView::new(v);
+    let a_ref = aview.as_ref();
+    let v_ref = vview.as_ref();
 
-        // dst = A^T * v (treating v as n×1 matrix)
-        let par = matmul_parallelism(p, 1, n);
-        matmul(
-            result.as_mut(),
-            Accum::Replace,
-            a_ref.transpose(),
-            v_ref,
-            1.0,
-            par,
-        );
+    // dst = A^T * v (treating v as n×1 matrix)
+    let par = matmul_parallelism(p, 1, n);
+    matmul(
+        result.as_mut(),
+        Accum::Replace,
+        a_ref.transpose(),
+        v_ref,
+        1.0,
+        par,
+    );
 
     let mut out = Array1::<f64>::zeros(p);
     for i in 0..p {
         out[i] = result[(i, 0)];
     }
-    gpu_profile_finish(profile_op, profile_start);
     out
 }
 
@@ -678,10 +552,7 @@ pub fn fast_atv_into<S: Data<Elem = f64>>(
     v: &Array1<f64>,
     out: &mut Array1<f64>,
 ) {
-    let (n, p) = a.dim();
-    crate::gpu::profile::cpu_scope("fast_atv_into", p, 1, n, p.saturating_mul(8), || {
-        fast_atv_into_impl(a, v, out);
-    });
+    fast_atv_into_impl(a, v, out);
 }
 
 #[inline]

@@ -453,6 +453,7 @@ class ScadMcpPenalty:
     variant: Literal["mcp", "scad"]
     smoothing_eps: float
     learnable: bool
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
 
     def __init__(
         self,
@@ -601,6 +602,7 @@ class TotalVariationPenalty:
     smoothing_eps: float
     learnable: bool
     _edges: list[tuple[int, int]] | None
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
 
     def __init__(
         self,
@@ -711,6 +713,7 @@ class NuclearNormPenalty:
     smoothing_eps: float
     max_rank: int | None
     learnable: bool
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
 
     def __init__(
         self,
@@ -791,6 +794,7 @@ class BlockSparsityPenalty:
     n_eff: int
     smoothing_eps: float
     learnable: bool
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
 
     def __init__(
         self,
@@ -903,6 +907,7 @@ class BlockOrthogonalityPenalty:
     weight: float
     n_eff: int
     learnable: bool
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
 
     def __init__(
         self,
@@ -1012,6 +1017,7 @@ class AuxConditionalPriorPenalty:
     weight: float
     n_eff: int
     learnable: bool
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
 
     def __init__(
         self,
@@ -1114,6 +1120,7 @@ class IvaeRidgeMeanGauge:
     weight: float
     n_eff: int
     learnable: bool
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
 
     def __init__(
         self,
@@ -1220,6 +1227,7 @@ class ParametricAuxConditionalPriorPenalty:
     weight: float
     n_eff: int
     learnable: bool
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
 
     def __init__(
         self,
@@ -1360,6 +1368,7 @@ class OrthogonalityPenalty:
     weight: float
     n_eff: int
     learnable: bool
+    weight_schedule: ScalarWeightSchedule | dict[str, Any] | None
 
     def __init__(
         self,

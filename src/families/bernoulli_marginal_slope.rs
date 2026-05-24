@@ -17,8 +17,8 @@ use crate::families::marginal_slope_shared::{
     build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
     eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,
     observed_denested_cell_partials as shared_observed_denested_cell_partials, outer_row_indices,
-    outer_weighted_rows, probit_frailty_scale, probit_frailty_scale_multi_dir_jet,
-    psi_derivative_location, scale_coeff4,
+    outer_score_scale, outer_weighted_rows, probit_frailty_scale,
+    probit_frailty_scale_multi_dir_jet, psi_derivative_location, scale_coeff4,
 };
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
@@ -62,8 +62,7 @@ pub use deviation_runtime::ParametricAnchorBlock;
 /// spends most of its time in third/fourth β-derivative contractions over the
 /// FLEX cell kernel; exact value/gradient evaluations keep the same likelihood,
 /// calibration, and inner Newton solve without paying that curvature bill.
-const BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT: usize =
-    crate::families::marginal_slope_shared::BIOBANK_OUTER_SUBSAMPLE_THRESHOLD;
+const BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT: usize = 50_000;
 
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
@@ -8555,9 +8554,28 @@ impl BernoulliMarginalSlopeFamily {
         let n = self.y.len();
         let primary = &cache.primary;
         let r = primary.total;
-        let rows: Result<Vec<_>, String> = (0..n)
+        let cache_bytes = n
+            .saturating_mul(r)
+            .saturating_mul(r)
+            .saturating_mul(std::mem::size_of::<f64>());
+        if cache_bytes > self.policy.max_single_materialization_bytes {
+            if log_exact_work(n) {
+                log::info!(
+                    "[BMS row-primary-hessian-cache] stream rows n={} r={} bytes={} limit_bytes={}",
+                    n,
+                    r,
+                    cache_bytes,
+                    self.policy.max_single_materialization_bytes
+                );
+            }
+            return Ok(None);
+        }
+        let mut packed = Array2::<f64>::zeros((n, r * r));
+        packed
+            .axis_iter_mut(Axis(0))
             .into_par_iter()
-            .map(|row| {
+            .enumerate()
+            .try_for_each(|(row, mut packed_row)| -> Result<(), String> {
                 let row_ctx = Self::row_ctx(cache, row);
                 let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
                 let row_moments = cache

@@ -156,14 +156,14 @@ where
             "Chain statistics tracker caused error: {}.\nAborting generation of further observations.",
             e
             );
-            println!("{}", msg);
+            crate::__vmc_out!("{}", msg);
             msg
         })?;
 
         let now = Instant::now();
         if (now >= last + freq) | (i == total - 1) {
             if let Err(e) = tx.send(tracker.stats()) {
-                eprintln!("Sending chain statistics failed: {e}");
+                crate::__vmc_err!("Sending chain statistics failed: {e}");
             }
             last = now;
         }
@@ -394,7 +394,8 @@ where
         )?;
 
         if let Err(e) = progress_handle.join() {
-            eprintln!("Progress bar thread emitted error message: {:?}", e);
+            crate::__vmc_err!("Progress bar thread emitted error message (join error)");
+            drop(e);
         }
 
         let run_stats = RunStats::from(sample.view());
