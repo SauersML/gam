@@ -1358,19 +1358,6 @@ pub(crate) fn build_score_warp_deviation_block_from_seed(
     build_deviation_block_from_knots_and_design_seed(seed, seed, cfg)
 }
 
-pub(crate) fn build_score_warp_deviation_block_from_seed_empirical_anchor(
-    seed: &Array1<f64>,
-    weights: &Array1<f64>,
-    cfg: &DeviationBlockConfig,
-) -> Result<DeviationPrepared, String> {
-    std::hint::black_box(weights);
-    // The `weights` argument is retained for caller-API stability but no
-    // longer participates in basis construction: identifiability now comes
-    // from the smoothness-penalty null-space drop (β-independent), not from a
-    // data-distribution moment anchor at the rigid-pilot η₀.
-    build_deviation_block_from_knots_and_design_seed(seed, seed, cfg)
-}
-
 const BERNOULLI_LINK_PROBABILITY_EPS: f64 = 1e-12;
 
 /// Positivity floor on a sample / weighted standard deviation (or variance)

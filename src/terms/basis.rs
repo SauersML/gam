@@ -833,6 +833,7 @@ fn evaluate_splines_derivative_sparse_intowith_lower(
     start_col
 }
 
+#[inline]
 fn evaluate_splines_derivative_sparse_into(
     x: f64,
     degree: usize,
@@ -948,6 +949,7 @@ fn evaluate_splinessecond_derivative_sparse_into(
     start_col
 }
 
+#[inline]
 fn evaluate_splines_sparsewith_kind(
     x: f64,
     degree: usize,
@@ -969,6 +971,7 @@ fn evaluate_splines_sparsewith_kind(
     }
 }
 
+#[inline]
 fn evaluate_bsplinerow_entries<F>(
     x: f64,
     degree: usize,
@@ -1309,10 +1312,12 @@ pub fn create_cyclic_difference_penalty_matrix(
     Ok(fast_ata(&d))
 }
 
+#[inline]
 fn wrap_to_period(x: f64, start: f64, period: f64) -> f64 {
     start + (x - start).rem_euclid(period)
 }
 
+#[inline]
 fn cyclic_distance_1d(x: f64, c: f64, period: f64) -> f64 {
     let delta = (x - c).abs().rem_euclid(period);
     delta.min(period - delta)
