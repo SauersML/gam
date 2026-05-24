@@ -13863,15 +13863,26 @@ impl SingleBlockLatentCoordDesignCache {
                     center_mean,
                     ..
                 },
-            ) => Ok(crate::solver::latent_cache::LatentBasisKind::Pca {
-                basis_matrix: basis_matrix.clone(),
-                centered: *centered,
-                center_mean_fingerprint: crate::solver::latent_cache::pca_center_mean_fingerprint(
-                    *centered,
-                    center_mean.as_ref(),
-                ),
-                smooth_penalty: *smooth_penalty,
-            }),
+            ) => {
+                let center_mean_fingerprint = if *centered {
+                    let mean = center_mean.as_ref().ok_or_else(|| {
+                        SmoothError::invalid_config(
+                            "latent-coordinate Pca cache key requires center_mean when centered",
+                        )
+                    })?;
+                    Some(crate::solver::latent_cache::pca_center_mean_fingerprint(
+                        mean,
+                    ))
+                } else {
+                    None
+                };
+                Ok(crate::solver::latent_cache::LatentBasisKind::Pca {
+                    basis_matrix: basis_matrix.clone(),
+                    centered: *centered,
+                    center_mean_fingerprint,
+                    smooth_penalty: *smooth_penalty,
+                })
+            }
             _ => Err(SmoothError::invalid_config(
                 "latent-coordinate design cache could not key the realized latent smooth basis"
                     .to_string(),
