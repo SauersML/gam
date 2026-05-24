@@ -5287,10 +5287,18 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                             }
                             Err(e) => return Err(format!("latent binary fit failed: {e}")),
                         },
-                        // SAFETY: enclosing `if matches!(saved_likelihood_mode,
-                        // Latent | LatentBinary)` block (line ~3246) gates this
-                        // match — no other discriminant can reach here.
-                        _ => unreachable!(),
+                        // Enclosing `if matches!(likelihood_mode, Latent |
+                        // LatentBinary)` gates this match — defensively error
+                        // out for any other discriminant.
+                        SurvivalLikelihoodMode::Transformation
+                        | SurvivalLikelihoodMode::Weibull
+                        | SurvivalLikelihoodMode::LocationScale
+                        | SurvivalLikelihoodMode::MarginalSlope => {
+                            return Err(format!(
+                                "internal: latent baseline closure reached for non-latent mode {:?}",
+                                likelihood_mode
+                            ));
+                        }
                     };
                     Ok(objective)
                 },
