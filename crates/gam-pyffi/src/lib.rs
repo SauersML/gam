@@ -4730,13 +4730,16 @@ fn analytic_penalty_value_for_targets(
 ) -> Result<f64, String> {
     let rho = Array1::<f64>::zeros(registry.total_rho_count());
     let mut value = 0.0_f64;
-    for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(registry.rho_layout()) {
+    for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout()) {
         let rho_local = rho.slice(s![rho_slice]);
         let target = match tier {
             PenaltyTier::Psi => target_t.view(),
-            PenaltyTier::Beta => target_beta.as_ref().ok_or_else(|| {
-                format!("analytic penalty {name:?} targets beta, but this fit has no beta target")
-            })?.view(),
+            PenaltyTier::Beta => {
+                let Some(target_beta) = target_beta.as_ref() else {
+                    continue;
+                };
+                target_beta.view()
+            }
             PenaltyTier::Rho => continue,
         };
         value += penalty.value(target, rho_local);

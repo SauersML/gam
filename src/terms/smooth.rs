@@ -14160,11 +14160,7 @@ fn analytic_penalty_objective_contribution(
                     gradient[rho_start + rho_slice.start + local_idx] += grad_rho_local[local_idx];
                 }
             }
-            crate::terms::PenaltyTier::Beta => {
-                return Err(EstimationError::InvalidInput(format!(
-                    "standard latent-coordinate analytic penalty {name:?} targets beta; formula latent fits only register Psi-tier latent penalties"
-                )));
-            }
+            crate::terms::PenaltyTier::Beta => {}
             crate::terms::PenaltyTier::Rho => {}
         }
     }
