@@ -3273,9 +3273,15 @@ fn build_standard_latent_analytic_penalty_registry(
                     .get("learnable")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                registry.push(AnalyticPenaltyKind::Orthogonality(Arc::new(
+                let penalty =
                     OrthogonalityPenalty::new(slice, target.d, weight, n_eff, learnable)
-                        .map_err(|err| format!("{context}: {err}"))?,
+                        .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(AnalyticPenaltyKind::Orthogonality(Arc::new(
+                    penalty,
                 )));
             }
             "sparsity" => {
@@ -3297,6 +3303,10 @@ fn build_standard_latent_analytic_penalty_registry(
                         "{context}.sparsity_kind must be smooth_l1, hoyer, or log; got {other:?}"
                     )),
                 }?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
                 registry.push(AnalyticPenaltyKind::Sparsity(Arc::new(penalty)));
             }
             "scad_mcp" => {
@@ -3324,8 +3334,7 @@ fn build_standard_latent_analytic_penalty_registry(
                     .get("learnable")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                registry.push(AnalyticPenaltyKind::ScadMcp(Arc::new(
-                    ScadMcpPenalty::new(
+                let penalty = ScadMcpPenalty::new(
                         slice,
                         weight,
                         n_eff,
@@ -3334,8 +3343,12 @@ fn build_standard_latent_analytic_penalty_registry(
                         variant,
                         learnable,
                     )
-                    .map_err(|err| format!("{context}: {err}"))?,
-                )));
+                    .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(AnalyticPenaltyKind::ScadMcp(Arc::new(penalty)));
             }
             "ibp_assignment" | "ibp_assignment_penalty" => {
                 let k_max = analytic_descriptor_usize(descriptor, "k_max", target.d)?;
@@ -3345,16 +3358,22 @@ fn build_standard_latent_analytic_penalty_registry(
                     .get("learnable_alpha")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                registry.push(AnalyticPenaltyKind::IBPAssignment(Arc::new(
-                    IBPAssignmentPenalty::new(k_max, alpha, tau, learnable_alpha),
-                )));
+                let penalty = IBPAssignmentPenalty::new(k_max, alpha, tau, learnable_alpha);
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(AnalyticPenaltyKind::IBPAssignment(Arc::new(penalty)));
             }
             "softmax_assignment_sparsity" => {
                 let k_atoms = analytic_descriptor_usize(descriptor, "k_atoms", target.d)?;
                 let temperature = analytic_descriptor_f64(descriptor, "temperature", 1.0)?;
-                registry.push(AnalyticPenaltyKind::SoftmaxAssignmentSparsity(Arc::new(
-                    SoftmaxAssignmentSparsityPenalty::new(k_atoms, temperature),
-                )));
+                let penalty = SoftmaxAssignmentSparsityPenalty::new(k_atoms, temperature);
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(AnalyticPenaltyKind::SoftmaxAssignmentSparsity(Arc::new(penalty)));
             }
             "total_variation" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
@@ -3365,16 +3384,19 @@ fn build_standard_latent_analytic_penalty_registry(
                     .get("learnable")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                registry.push(AnalyticPenaltyKind::TotalVariation(Arc::new(
-                    TotalVariationPenalty::new(
+                let penalty = TotalVariationPenalty::new(
                         weight,
                         n_eff,
                         difference_op,
                         smoothing_eps,
                         learnable,
                     )
-                    .map_err(|err| format!("{context}: {err}"))?,
-                )));
+                    .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(AnalyticPenaltyKind::TotalVariation(Arc::new(penalty)));
             }
             "nuclear_norm" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;

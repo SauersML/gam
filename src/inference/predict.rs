@@ -4413,8 +4413,8 @@ pub struct PredictUncertaintyOptions {
     pub covariance_mode: InferenceCovarianceMode,
     /// Mean-scale interval construction method.
     pub mean_interval_method: MeanIntervalMethod,
-    /// For Gaussian identity, also return observation intervals using
-    /// Var(y_new | x) = Var(eta_hat) + sigma^2.
+    /// Return observation intervals for supported response families using
+    /// Var(y_new | x) = Var(mu_hat) + Var(Y | mu).
     pub includeobservation_interval: bool,
     /// Apply the O(n⁻¹) frequentist bias correction at prediction time.
     /// When enabled (default), η̂_BC(x) = η̂(x) + s_*(x)^T H⁻¹ S(λ̂) β̂
@@ -4646,7 +4646,7 @@ pub struct PredictUncertaintyResult {
     pub eta_upper: Array1<f64>,
     pub mean_lower: Array1<f64>,
     pub mean_upper: Array1<f64>,
-    /// Optional Gaussian observation interval bounds.
+    /// Optional observation interval bounds.
     pub observation_lower: Option<Array1<f64>>,
     pub observation_upper: Option<Array1<f64>>,
     /// Covariance mode requested by caller.
@@ -5201,26 +5201,65 @@ where
         mean_upper.mapv_inplace(|v| v.clamp(lo, hi));
     }
 
-    let (observation_lower, observation_upper) =
-        if options.includeobservation_interval && family.is_gaussian_identity() {
-            let obsvar = fit.standard_deviation.max(0.0).powi(2);
-            let obs_se = etavar.mapv(|v| (v + obsvar).max(0.0).sqrt());
+    let (observation_lower, observation_upper) = if options.includeobservation_interval {
+        let response_observation_bounds = |response_var: Array1<f64>| {
+            let obs_se = Array1::from_iter(
+                mean_standard_error
+                    .iter()
+                    .zip(response_var.iter())
+                    .map(|(&mean_se, &obsvar)| (mean_se.powi(2) + obsvar).max(0.0).sqrt()),
+            );
             let lower = Array1::from_iter(
-                eta.iter()
+                mean.iter()
                     .zip(obs_se.iter())
                     .zip(z_lower_per_row.iter())
-                    .map(|((&e, &s), &zl)| e - zl * s),
+                    .map(|((&m, &s), &zl)| m - zl * s),
             );
             let upper = Array1::from_iter(
-                eta.iter()
+                mean.iter()
                     .zip(obs_se.iter())
                     .zip(z_upper_per_row.iter())
-                    .map(|((&e, &s), &zu)| e + zu * s),
+                    .map(|((&m, &s), &zu)| m + zu * s),
             );
             (Some(lower), Some(upper))
-        } else {
-            (None, None)
         };
+
+        match family {
+            crate::types::LikelihoodFamily::GaussianIdentity => {
+                let obsvar = fit.standard_deviation.max(0.0).powi(2);
+                let obs_se = etavar.mapv(|v| (v + obsvar).max(0.0).sqrt());
+                let lower = Array1::from_iter(
+                    eta.iter()
+                        .zip(obs_se.iter())
+                        .zip(z_lower_per_row.iter())
+                        .map(|((&e, &s), &zl)| e - zl * s),
+                );
+                let upper = Array1::from_iter(
+                    eta.iter()
+                        .zip(obs_se.iter())
+                        .zip(z_upper_per_row.iter())
+                        .map(|((&e, &s), &zu)| e + zu * s),
+                );
+                (Some(lower), Some(upper))
+            }
+            crate::types::LikelihoodFamily::NegativeBinomial { theta } => {
+                let response_var = mean.mapv(|mu| mu + mu.powi(2) / theta);
+                response_observation_bounds(response_var)
+            }
+            crate::types::LikelihoodFamily::Tweedie { p } => {
+                let phi = fit.likelihood_scale.fixed_phi().unwrap_or(1.0);
+                let response_var = mean.mapv(|mu| phi * mu.powf(p));
+                response_observation_bounds(response_var)
+            }
+            crate::types::LikelihoodFamily::BetaLogit { phi } => {
+                let response_var = mean.mapv(|mu| mu * (1.0 - mu) / (1.0 + phi));
+                response_observation_bounds(response_var)
+            }
+            _ => (None, None),
+        }
+    } else {
+        (None, None)
+    };
 
     Ok(PredictUncertaintyResult {
         eta,
