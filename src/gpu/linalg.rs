@@ -19,7 +19,7 @@
 //! assemblers can stay backend-agnostic: they call `crate::faer_ndarray::fast_*`
 //! and get GPU acceleration automatically whenever it is profitable.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis};
 
 use super::runtime::GpuRuntime;
 
@@ -29,6 +29,17 @@ use super::runtime::GpuRuntime;
 pub enum DispatchOp {
     /// Generic matrix-matrix product with the given output dims and reduction depth.
     Gemm { m: usize, n: usize, k: usize },
+    /// Batch of independent matrix-matrix products.
+    BatchedGemm {
+        batch: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+    },
+    /// Dense Cholesky factorization.
+    Potrf { p: usize, batch: usize },
+    /// Triangular matrix solve.
+    Trsm { m: usize, n: usize },
     /// Matrix-vector (or matrix · single-column) product.
     Gemv { m: usize, k: usize },
     /// `Xᵀ · diag(w) · X` reduction with n rows and p columns.
@@ -45,7 +56,12 @@ impl DispatchOp {
     pub const fn flops(self) -> u128 {
         match self {
             Self::Gemm { m, n, k } => 2u128 * (m as u128) * (n as u128) * (k as u128),
+            Self::BatchedGemm { batch, m, n, k } => {
+                2u128 * (batch as u128) * (m as u128) * (n as u128) * (k as u128)
+            }
             Self::Gemv { m, k } => 2u128 * (m as u128) * (k as u128),
+            Self::Potrf { p, batch } => (batch as u128) * (p as u128).pow(3) / 3,
+            Self::Trsm { m, n } => (m as u128) * (m as u128) * (n as u128),
             Self::XtDiagX { n, p } => 2u128 * (n as u128) * (p as u128) * (p as u128),
             Self::XtDiagY { n, px, q } => 2u128 * (n as u128) * (px as u128) * (q as u128),
             Self::JointHessian2x2 { n, pa, pb } => {
@@ -69,8 +85,15 @@ pub fn route_through_gpu(op: DispatchOp) -> Option<&'static GpuRuntime> {
         DispatchOp::Gemm { m, n, k } => {
             op.flops() >= (policy.gemm_min_flops as u128) && m.min(n).min(k) > 0
         }
+        DispatchOp::BatchedGemm { batch, m, n, k } => {
+            op.flops() >= (policy.gemm_min_flops as u128) && batch > 1 && m.min(n).min(k) > 0
+        }
         DispatchOp::Gemv { m, k } => {
             op.flops() >= (policy.gemm_min_flops as u128) && m > 0 && k > 0
+        }
+        DispatchOp::Potrf { p, batch } => p >= policy.potrf_min_p && batch > 0,
+        DispatchOp::Trsm { m, n } => {
+            op.flops() >= (policy.gemm_min_flops as u128) && m > 0 && n > 0
         }
         DispatchOp::XtDiagX { n, p } => {
             n >= policy.xtwx_n_min
@@ -88,6 +111,52 @@ pub fn route_through_gpu(op: DispatchOp) -> Option<&'static GpuRuntime> {
         }
     };
     if admit { Some(runtime) } else { None }
+}
+
+#[inline]
+#[must_use]
+pub fn try_fast_ab_broadcast_b_batched(
+    a: ArrayView3<'_, f64>,
+    b: ArrayView2<'_, f64>,
+) -> Option<Array3<f64>> {
+    let (batch, m, k) = a.dim();
+    let (bk, n) = b.dim();
+    if k != bk {
+        return None;
+    }
+    let runtime = route_through_gpu(DispatchOp::BatchedGemm { batch, m, n, k })?;
+    let mut out = Array3::<f64>::zeros((batch, m, n));
+    for idx in 0..batch {
+        let product = cuda_backend::gemm(runtime, a.index_axis(Axis(0), idx), b, false, false)?;
+        out.index_axis_mut(Axis(0), idx).assign(&product);
+    }
+    Some(out)
+}
+
+#[inline]
+#[must_use]
+pub fn try_fast_abt_strided_batched(
+    a: ArrayView3<'_, f64>,
+    b: ArrayView3<'_, f64>,
+) -> Option<Array3<f64>> {
+    let (batch, m, k) = a.dim();
+    let (batch_b, n, k_b) = b.dim();
+    if batch != batch_b || k != k_b {
+        return None;
+    }
+    let runtime = route_through_gpu(DispatchOp::BatchedGemm { batch, m, n, k })?;
+    let mut out = Array3::<f64>::zeros((batch, m, n));
+    for idx in 0..batch {
+        let product = cuda_backend::gemm(
+            runtime,
+            a.index_axis(Axis(0), idx),
+            b.index_axis(Axis(0), idx),
+            false,
+            true,
+        )?;
+        out.index_axis_mut(Axis(0), idx).assign(&product);
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +290,60 @@ pub fn should_dispatch_joint_hessian(n: usize, pa: usize, pb: usize) -> bool {
     route_through_gpu(DispatchOp::JointHessian2x2 { n, pa, pb }).is_some()
 }
 
+#[inline]
+#[must_use]
+pub fn try_cholesky_lower_inplace(a: &mut Array2<f64>) -> Option<()> {
+    let p = a.nrows();
+    if p != a.ncols() {
+        return None;
+    }
+    route_through_gpu(DispatchOp::Potrf { p, batch: 1 })?;
+    let lower = crate::solver::gpu::pirls_gpu::cholesky_lower_gpu(a.view()).ok()?;
+    *a = lower;
+    Some(())
+}
+
+#[inline]
+#[must_use]
+pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Option<()> {
+    let first = matrices.first()?;
+    let p = first.nrows();
+    if p == 0 || first.ncols() != p || matrices.iter().any(|matrix| matrix.dim() != (p, p)) {
+        return None;
+    }
+    route_through_gpu(DispatchOp::Potrf {
+        p,
+        batch: matrices.len(),
+    })?;
+    for matrix in matrices {
+        let lower = crate::solver::gpu::pirls_gpu::cholesky_lower_gpu(matrix.view()).ok()?;
+        *matrix = lower;
+    }
+    Some(())
+}
+
+#[inline]
+#[must_use]
+pub fn try_solve_lower_triangular_matrix(
+    lower: ArrayView2<'_, f64>,
+    rhs: ArrayView2<'_, f64>,
+) -> Option<Array2<f64>> {
+    let (m, n) = rhs.dim();
+    let runtime = route_through_gpu(DispatchOp::Trsm { m, n })?;
+    cuda_backend::trsm(runtime, lower, rhs, false)
+}
+
+#[inline]
+#[must_use]
+pub fn try_solve_upper_triangular_matrix(
+    upper: ArrayView2<'_, f64>,
+    rhs: ArrayView2<'_, f64>,
+) -> Option<Array2<f64>> {
+    let (m, n) = rhs.dim();
+    let runtime = route_through_gpu(DispatchOp::Trsm { m, n })?;
+    cuda_backend::trsm(runtime, upper, rhs, true)
+}
+
 // ---------------------------------------------------------------------------
 // Backend selection. Each fn below is either a stub (no cuda feature) or a
 // thin wrapper around cudarc-backed kernels (when cuda is enabled). The CPU
@@ -292,5 +415,15 @@ mod cuda_backend {
         w_bb: ArrayView1<'_, f64>,
     ) -> Option<Array2<f64>> {
         super::super::blas::joint_hessian_2x2_cuda(runtime, x_a, x_b, w_aa, w_ab, w_bb)
+    }
+
+    #[inline]
+    pub(super) fn trsm(
+        runtime: &GpuRuntime,
+        triangular: ArrayView2<'_, f64>,
+        rhs: ArrayView2<'_, f64>,
+        upper: bool,
+    ) -> Option<Array2<f64>> {
+        super::super::blas::trsm_cuda(runtime, triangular, rhs, upper)
     }
 }

@@ -254,6 +254,42 @@ pub fn try_fast_atv(
     linalg::try_fast_atv(a, v)
 }
 #[inline]
+pub fn try_fast_ab_broadcast_b_batched(
+    a: ndarray::ArrayView3<'_, f64>,
+    b: ndarray::ArrayView2<'_, f64>,
+) -> Option<ndarray::Array3<f64>> {
+    linalg::try_fast_ab_broadcast_b_batched(a, b)
+}
+#[inline]
+pub fn try_fast_abt_strided_batched(
+    a: ndarray::ArrayView3<'_, f64>,
+    b: ndarray::ArrayView3<'_, f64>,
+) -> Option<ndarray::Array3<f64>> {
+    linalg::try_fast_abt_strided_batched(a, b)
+}
+#[inline]
+pub fn try_cholesky_lower_inplace(a: &mut ndarray::Array2<f64>) -> Option<()> {
+    linalg::try_cholesky_lower_inplace(a)
+}
+#[inline]
+pub fn try_cholesky_batched_lower_inplace(matrices: &mut [ndarray::Array2<f64>]) -> Option<()> {
+    linalg::try_cholesky_batched_lower_inplace(matrices)
+}
+#[inline]
+pub fn try_solve_lower_triangular_matrix(
+    lower: ndarray::ArrayView2<'_, f64>,
+    rhs: ndarray::ArrayView2<'_, f64>,
+) -> Option<ndarray::Array2<f64>> {
+    linalg::try_solve_lower_triangular_matrix(lower, rhs)
+}
+#[inline]
+pub fn try_solve_upper_triangular_matrix(
+    upper: ndarray::ArrayView2<'_, f64>,
+    rhs: ndarray::ArrayView2<'_, f64>,
+) -> Option<ndarray::Array2<f64>> {
+    linalg::try_solve_upper_triangular_matrix(upper, rhs)
+}
+#[inline]
 pub fn try_syevd_inplace(a: &mut ndarray::Array2<f64>) -> Option<ndarray::Array1<f64>> {
     std::hint::black_box(a);
     None

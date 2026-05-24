@@ -195,6 +195,29 @@ mod cuda {
         Ok((solved, cholesky_logdet_from_col_major(&factor_col, p)))
     }
 
+    pub(super) fn cholesky_lower(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        let (ctx, stream) = context_and_stream()?;
+        let (p, p2) = hessian.dim();
+        if p == 0 || p != p2 {
+            return Err("Cholesky factorization dimension mismatch".to_string());
+        }
+        let solver = DnHandle::new(stream.clone()).map_err(|e| format!("cusolver init: {e}"))?;
+        let h_col = to_col_major(&hessian);
+        let mut h_dev = pinned_htod(&ctx, &stream, &h_col)?;
+        potrf_in_place(&solver, &stream, p, &mut h_dev)?;
+        let factor_col = stream
+            .clone_dtoh(&h_dev)
+            .map_err(|e| format!("download Cholesky factor: {e}"))?;
+        let mut lower =
+            from_col_major(&factor_col, p, p).ok_or("factor layout conversion failed")?;
+        for row in 0..p {
+            for col in (row + 1)..p {
+                lower[[row, col]] = 0.0;
+            }
+        }
+        Ok(lower)
+    }
+
     fn context_and_stream() -> Result<
         (
             std::sync::Arc<CudaContext>,
@@ -498,11 +521,22 @@ pub fn cholesky_solve_gpu(
     cuda::cholesky_solve(hessian, rhs)
 }
 
+#[cfg(feature = "cuda")]
+pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+    cuda::cholesky_lower(hessian)
+}
+
 #[cfg(not(feature = "cuda"))]
 pub fn cholesky_solve_gpu(
     hessian: ArrayView2<'_, f64>,
     rhs: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, f64), String> {
     std::hint::black_box((hessian, rhs));
+    Err("cuda feature is not enabled".to_string())
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+    std::hint::black_box(hessian);
     Err("cuda feature is not enabled".to_string())
 }
