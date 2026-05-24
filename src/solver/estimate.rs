@@ -720,6 +720,23 @@ fn dispersion_from_likelihood(
     }
 }
 
+/// Scale a posterior covariance H^{-1} by the dispersion phi.
+///
+/// `Vb = H^{-1} * phi`. For fixed-scale exponential families (Poisson,
+/// Binomial) `phi == 1` and this is a no-op; for Gaussian
+/// (`phi = sigma^2`) and Gamma (`phi = 1 / shape`) the unscaled inverse
+/// Hessian carries the wrong units and must be multiplied in. Centralizing
+/// the scaling here keeps the contract visible at every covariance
+/// construction site instead of being inlined as a bare `cov * phi`.
+#[inline]
+pub(crate) fn scaled_covariance(cov: Array2<f64>, phi: f64) -> Array2<f64> {
+    if (phi - 1.0).abs() <= f64::EPSILON {
+        cov
+    } else {
+        cov * phi
+    }
+}
+
 /// Default inner P-IRLS tolerance floor.
 ///
 /// The inner Newton iteration certifies the coefficient mode against this
