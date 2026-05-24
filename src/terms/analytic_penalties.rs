@@ -4849,20 +4849,20 @@ impl BlockOrthogonalityPenalty {
                     .expect("between-block cross Gram must be precomputed");
                 Self::add_right_times_cross(
                     &mut out,
-                    v,
+                    v.view(),
                     group_g,
                     group_h,
                     c_hg.view(),
                     weight,
                 );
 
-                let v_h_t_g = Self::cross_gram(v, group_h, group_g);
-                let t_h_v_g = Self::cross_gram(t, group_h, group_g);
+                let v_h_t_g = Self::cross_gram(v.view(), group_h, group_g);
+                let t_h_v_g = Self::cross_gram(t.view(), group_h, group_g);
                 let mut d_c_hg = v_h_t_g;
                 d_c_hg += &t_h_v_g;
                 Self::add_right_times_cross(
                     &mut out,
-                    t,
+                    t.view(),
                     group_g,
                     group_h,
                     d_c_hg.view(),
@@ -5742,9 +5742,10 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
         }
         // For the diagonal-Hessian penalties (ARD, smoothed-L¹ and Log) the
         // closed form is `Σ_i log(d_i + λ)`. Forward-difference TV uses the
-        // tridiagonal path-graph structure. Graph TV, NuclearNorm, and
-        // BlockSparsity keep the exact dense eigensolve only below the
-        // small-block threshold; large blocks use SLQ against the analytic HVP.
+        // tridiagonal path-graph structure. Graph TV, NuclearNorm,
+        // BlockSparsity, and BlockOrthogonality keep the exact dense
+        // eigensolve only below the small-block threshold; large blocks use
+        // SLQ against the analytic HVP.
         // Orthogonality is excluded because its exact Hessian is indefinite.
         match &self.penalty {
             AnalyticPenaltyKind::Ard(_)
