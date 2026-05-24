@@ -21745,7 +21745,14 @@ mod tests {
         theta.slice_mut(s![rho_dim..]).assign(log_kappa0.as_array());
 
         let external_opts =
-            external_opts_for_design(LikelihoodFamily::GaussianIdentity, &design, &fit_opts);
+            external_opts_for_design(
+                LikelihoodSpec::new(
+                    ResponseFamily::Gaussian,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
+                &design,
+                &fit_opts,
+            );
         let mut cache = SingleBlockExactJointDesignCache::new(
             data.view(),
             frozen,
@@ -21900,7 +21907,14 @@ mod tests {
         assert!(psi_dim >= 1, "test requires at least one log-κ axis");
 
         let external_opts =
-            external_opts_for_design(LikelihoodFamily::BinomialProbit, &frozen_design, &fit_opts);
+            external_opts_for_design(
+                LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Probit),
+                ),
+                &frozen_design,
+                &fit_opts,
+            );
         let mut cache = SingleBlockExactJointDesignCache::new(
             data.view(),
             frozen.clone(),
@@ -22471,7 +22485,14 @@ mod tests {
         let psi_dim: usize = dims_per_term.iter().sum();
 
         let external_opts =
-            external_opts_for_design(LikelihoodFamily::BinomialProbit, &frozen_design, &fit_opts);
+            external_opts_for_design(
+                LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Probit),
+                ),
+                &frozen_design,
+                &fit_opts,
+            );
         let mut cache = SingleBlockExactJointDesignCache::new(
             data.view(),
             frozen.clone(),
@@ -22696,7 +22717,14 @@ mod tests {
         let psi_dim: usize = dims_per_term.iter().sum();
 
         let external_opts =
-            external_opts_for_design(LikelihoodFamily::BinomialProbit, &frozen_design, &fit_opts);
+            external_opts_for_design(
+                LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Probit),
+                ),
+                &frozen_design,
+                &fit_opts,
+            );
         let mut cache = SingleBlockExactJointDesignCache::new(
             data.view(),
             frozen.clone(),
@@ -22945,7 +22973,14 @@ mod tests {
         let psi_dim: usize = dims_per_term.iter().sum();
 
         let external_opts =
-            external_opts_for_design(LikelihoodFamily::BinomialProbit, &frozen_design, &fit_opts);
+            external_opts_for_design(
+                LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(LinkFunction::Probit),
+                ),
+                &frozen_design,
+                &fit_opts,
+            );
         let mut cache = SingleBlockExactJointDesignCache::new(
             data.view(),
             frozen.clone(),
@@ -24003,7 +24038,14 @@ mod tests {
         theta1[rho_dim] += 0.3;
 
         let external_opts =
-            external_opts_for_design(LikelihoodFamily::GaussianIdentity, &design, &fit_opts);
+            external_opts_for_design(
+                LikelihoodSpec::new(
+                    ResponseFamily::Gaussian,
+                    InverseLink::Standard(LinkFunction::Identity),
+                ),
+                &design,
+                &fit_opts,
+            );
         let mut cache = SingleBlockExactJointDesignCache::new(
             data.view(),
             frozen,
