@@ -4156,7 +4156,6 @@ fn normalize_penalty_in_constrained_space(matrix: &Array2<f64>) -> (Array2<f64>,
     }
 }
 
-#[expect(dead_code)]
 fn sorted_finite_levels_from_col(col: ArrayView1<'_, f64>) -> Result<Vec<u64>, BasisError> {
     let mut levels = BTreeSet::<u64>::new();
     for &v in col.iter() {
@@ -4170,7 +4169,6 @@ fn sorted_finite_levels_from_col(col: ArrayView1<'_, f64>) -> Result<Vec<u64>, B
     Ok(levels.into_iter().collect())
 }
 
-#[expect(dead_code)]
 fn indicator_design_for_levels(
     data: ArrayView2<'_, f64>,
     feature_col: usize,
@@ -4203,7 +4201,6 @@ fn indicator_design_for_levels(
     Ok(out)
 }
 
-#[expect(dead_code)]
 fn dense_block_diag(blocks: &[Array2<f64>]) -> Array2<f64> {
     let rows = blocks.iter().map(|b| b.nrows()).sum::<usize>();
     let cols = blocks.iter().map(|b| b.ncols()).sum::<usize>();
@@ -4219,7 +4216,6 @@ fn dense_block_diag(blocks: &[Array2<f64>]) -> Array2<f64> {
     out
 }
 
-#[expect(dead_code)]
 fn replicate_design_by_indicator(base: &Array2<f64>, indicator: &Array2<f64>) -> Array2<f64> {
     let n = base.nrows();
     let p = base.ncols();
@@ -4236,7 +4232,6 @@ fn replicate_design_by_indicator(base: &Array2<f64>, indicator: &Array2<f64>) ->
     out
 }
 
-#[expect(dead_code)]
 fn sum_to_zero_level_contrast(levels: usize) -> Array2<f64> {
     let mut c = Array2::<f64>::zeros((levels, levels.saturating_sub(1)));
     if levels < 2 {
@@ -4249,7 +4244,6 @@ fn sum_to_zero_level_contrast(levels: usize) -> Array2<f64> {
     c
 }
 
-#[expect(dead_code)]
 fn apply_level_contrast_to_replicated_design(
     base_by_level: &Array2<f64>,
     p_base: usize,
@@ -4273,7 +4267,6 @@ fn apply_level_contrast_to_replicated_design(
     out
 }
 
-#[expect(dead_code)]
 fn expand_penalty_by_levels(base_s: &Array2<f64>, levels: usize) -> Array2<f64> {
     let blocks = (0..levels).map(|_| base_s.clone()).collect::<Vec<_>>();
     dense_block_diag(&blocks)
