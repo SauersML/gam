@@ -15360,7 +15360,7 @@ pub fn fit_transformation_normal(
             let eval = evaluate_custom_family_joint_hyper(
                 &geometry.family,
                 &geometry.blocks,
-                options,
+                &options,
                 &rho,
                 &geometry.derivative_blocks,
                 warm_start.as_ref(),
@@ -15400,7 +15400,7 @@ pub fn fit_transformation_normal(
             let eval = evaluate_custom_family_joint_hyper_efs(
                 &geometry.family,
                 &geometry.blocks,
-                options,
+                &options,
                 &rho,
                 &geometry.derivative_blocks,
                 warm_start.as_ref(),

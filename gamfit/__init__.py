@@ -112,6 +112,17 @@ from ._topology_selector import (
     TopologyAutoSelectorResult,
 )
 from ._diagnostics import Diagnostics
+from ._equivariant import (
+    EquivariantPenalty,
+    GaugeCompanion,
+    LieAtom,
+    equivariant_smooth,
+    gauge_companion,
+    rho_so2,
+    rho_so2_jvp,
+    rho_so3,
+    rho_so3_jvp,
+)
 from .smooth import (
     BSpline,
     Categorical,
@@ -207,6 +218,15 @@ def load_posterior(path: str | Path) -> PosteriorSamples:
 
 __all__ = [
     "Diagnostics",
+    "EquivariantPenalty",
+    "GaugeCompanion",
+    "LieAtom",
+    "equivariant_smooth",
+    "gauge_companion",
+    "rho_so2",
+    "rho_so2_jvp",
+    "rho_so3",
+    "rho_so3_jvp",
     "FormulaError",
     "FormulaValidation",
     "GamError",
