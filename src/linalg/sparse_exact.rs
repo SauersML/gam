@@ -1038,6 +1038,9 @@ fn factorize_simplicial_canonical_upper(
         );
         simplicial::factorize_simplicial_symbolic_cholesky(
             a_perm_upper.symbolic(),
+            // SAFETY: etree was just filled by prefactorize_symbolic_cholesky
+            // immediately above with length n and the parent-of-each-node
+            // sentinel layout that EliminationTreeRef::from_inner expects.
             unsafe { simplicial::EliminationTreeRef::from_inner(&etree) },
             &col_counts,
             stack,
