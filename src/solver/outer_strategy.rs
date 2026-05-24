@@ -5082,14 +5082,12 @@ fn run_outer(
         let mut prev_attempt_grad_norm: Option<f64> = None;
 
         let outcome = loop {
-            // Borrow the active config: prefer the prior retry override
-            // (if any) over the caller's config. Cloning `OuterConfig`
-            // here would pull in `heuristic_lambdas: Option<Vec<Array1>>`,
-            // `seed_config`, `bounds`, and mirror-session handles every
-            // iteration of the retry loop — none of which mutate inside
-            // the body. The retry branch below clones explicitly when it
-            // needs to derive a *new* owned config.
-            let active_config: &OuterConfig = retry_config.as_ref().unwrap_or(&config);
+            // Bind the active config by cloning into a local owned value so
+            // subsequent retry-config assignment does not collide with the
+            // borrow used inside this iteration body.
+            let active_config_owned: OuterConfig =
+                retry_config.clone().unwrap_or_else(|| config.clone());
+            let active_config: &OuterConfig = &active_config_owned;
             match run_outer_with_plan(obj, active_config, context, attempt_cap, &the_plan) {
                 Ok(result) => {
                     if result.converged

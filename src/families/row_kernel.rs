@@ -827,8 +827,11 @@ impl<const K: usize, T: RowKernel<K>> RowKernelDirectionalDerivativeOperator<K, 
         // path overtakes; at n=20K it's 4× faster. The threshold
         // matches that crossover.
         const BLAS3_PROJECTED_MATRIX_FLOP_THRESHOLD: usize = 2_500_000;
-        n_rows.saturating_mul(rank).saturating_mul(rank) >= BLAS3_PROJECTED_MATRIX_FLOP_THRESHOLD
-    }
+        if n_rows.saturating_mul(rank).saturating_mul(rank) < BLAS3_PROJECTED_MATRIX_FLOP_THRESHOLD
+        {
+            let op_factor = self.mul_mat(factor);
+            return factor.t().dot(&op_factor);
+        }
 
     fn projected_matrix_with_jf(
         &self,
