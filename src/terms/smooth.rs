@@ -9772,8 +9772,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 }],
                 log_lambdas,
                 lambdas: full_lambdas,
-                likelihood_family: Some(family),
                 likelihood_scale: family.default_scale_metadata(),
+                likelihood_family: Some(family),
                 log_likelihood_normalization:
                     crate::types::LogLikelihoodNormalization::UserProvided,
                 log_likelihood: final_eval.obs.log_likelihood,

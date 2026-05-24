@@ -3,8 +3,8 @@ use gam::estimate::{ExternalOptimOptions, PenaltySpec, evaluate_externalcost_and
 use gam::pirls::{PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho};
 use gam::smooth::BlockwisePenalty;
 use gam::types::{
-    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LikelihoodFamily, LinkFunction,
-    LogSmoothingParamsView,
+    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
+    LogSmoothingParamsView, ResponseFamily,
 };
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
@@ -58,6 +58,13 @@ fn make_problem(
         s[[j, j]] = 1.0;
     }
     (x, y, w, s.clone(), vec![BlockwisePenalty::new(0..p, s)])
+}
+
+fn binomial_logit_likelihood() -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::Standard(LinkFunction::Logit),
+    )
 }
 
 fn fit_beta_norm(
@@ -170,7 +177,7 @@ fn firthfd_step_size_sensitivity() {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        family: LikelihoodFamily::BinomialLogit,
+        family: binomial_logit_likelihood(),
         compute_inference: true,
         tol: 1e-10,
         max_iter: 500,
