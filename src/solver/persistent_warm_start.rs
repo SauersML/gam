@@ -349,7 +349,7 @@ pub(crate) fn open_outer_session(key: &str) -> Option<std::sync::Arc<crate::cach
 // inner solve. The latent IFT predictor below is the row-local analogue
 // for the arrow-structured (t, β) system: per-row `H_tt^(i)` factors
 // already produced by
-// [`crate::solver::arrow_schur::solve_arrow_newton_step`] are reused to
+// [`crate::solver::arrow_schur::solve_arrow_newton_step_with_options`] are reused to
 // apply the per-row sensitivity in O(d²) ops per row, independent of K.
 //
 // Math recap (proposal §2.3 + composition_engine §7):
@@ -393,7 +393,7 @@ pub enum LatentIftOutcome {
 /// This is the row-local analogue of
 /// `RemlState::predict_warm_start_beta_ift_with_outcome`: it consumes
 /// the per-row factor cache produced by
-/// [`crate::solver::arrow_schur::solve_arrow_newton_step`] at the last
+/// [`crate::solver::arrow_schur::solve_arrow_newton_step_with_options`] at the last
 /// accepted Newton step and applies the IFT first-order predictor
 ///
 /// ```text
@@ -408,7 +408,7 @@ pub enum LatentIftOutcome {
 /// The IFT formula inverts the *undamped* inner Hessian `H_tt^(i)` — the LM
 /// ridge `ρ_t·I` is part of the Newton damping, not the implicit-function
 /// theorem derivation. The cache produced by
-/// [`crate::solver::arrow_schur::solve_arrow_newton_step`] stores both the
+/// [`crate::solver::arrow_schur::solve_arrow_newton_step_with_options`] stores both the
 /// damped Newton factor and the undamped IFT factor; this predictor
 /// dispatches into `predict_delta_t_from_delta_*` which select the latter.
 /// Callers MUST NOT hand-construct an `ArrowFactorCache` with missing
