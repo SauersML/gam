@@ -192,6 +192,8 @@ posterior = model.sample(train_df)
 custom_eta = posterior.samples @ X.T    # (n_draws, n_rows)
 ```
 
-Other model classes raise a clear FFI error from this call.
+Use this to compose your own posterior quantity that
+isn't a straightforward `predict()` call. Restricted to standard
+non-link-wiggle GAMs.
 
 * [Difference smooths](difference-smooths.md)
