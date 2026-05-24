@@ -1297,7 +1297,8 @@ impl ExactJeffreysTerm {
 
 /// Configuration for a log-barrier penalty on constrained coefficients.
 ///
-/// The barrier-augmented objective adds `-τ Σ_{j ∈ C} log(β_j − b_j)`.
+/// The barrier-augmented objective adds `-τ Σ_{j ∈ C} log(s_j β_j − b_j)`,
+/// where `s_j = 1` for lower bounds and `s_j = -1` for upper bounds.
 /// τ is an algorithmic continuation parameter — NOT a hyperparameter.
 #[derive(Clone, Debug)]
 pub struct BarrierConfig {
@@ -1305,15 +1306,18 @@ pub struct BarrierConfig {
     pub tau: f64,
     /// Indices of constrained coefficients in the β vector.
     pub constrained_indices: Vec<usize>,
-    /// Lower bounds b_j for each constrained coefficient.
+    /// Right-hand-side `b_j` for each directional coordinate constraint.
     pub lower_bounds: Vec<f64>,
+    /// Direction `s_j` for each coordinate constraint `s_j β_j >= b_j`.
+    pub bound_signs: Vec<f64>,
 }
 
 impl BarrierConfig {
     /// Construct a `BarrierConfig` from linear inequality constraints `A β ≥ b`
-    /// by extracting rows that represent simple coordinate bounds (β_j ≥ b_i).
+    /// by extracting rows that represent simple coordinate bounds
+    /// (`β_j ≥ b_i` or `β_j ≤ -b_i`).
     ///
-    /// A row is a simple bound iff it has exactly one nonzero entry equal to 1.0.
+    /// A row is a simple bound iff it has exactly one nonzero entry equal to ±1.0.
     /// Returns `None` if the constraints are `None` or no simple-bound rows are found.
     pub fn from_constraints(
         constraints: Option<&crate::pirls::LinearInequalityConstraints>,
@@ -1321,16 +1325,21 @@ impl BarrierConfig {
         let constraints = constraints?;
         let mut indices = Vec::new();
         let mut lower_bounds = Vec::new();
+        let mut bound_signs = Vec::new();
         for i in 0..constraints.a.nrows() {
             let row = constraints.a.row(i);
             let mut single_col = None;
+            let mut single_sign = 0.0_f64;
             let mut is_simple = true;
             for (j, &val) in row.iter().enumerate() {
                 if val.abs() < 1e-14 {
                     continue;
                 }
-                if (val - 1.0).abs() < 1e-14 && single_col.is_none() {
+                if ((val - 1.0).abs() < 1e-14 || (val + 1.0).abs() < 1e-14)
+                    && single_col.is_none()
+                {
                     single_col = Some(j);
+                    single_sign = if val > 0.0 { 1.0 } else { -1.0 };
                 } else {
                     is_simple = false;
                     break;
@@ -1340,6 +1349,7 @@ impl BarrierConfig {
                 if let Some(col) = single_col {
                     indices.push(col);
                     lower_bounds.push(constraints.b[i]);
+                    bound_signs.push(single_sign);
                 }
             }
         }
@@ -1350,14 +1360,16 @@ impl BarrierConfig {
             tau: 1e-6,
             constrained_indices: indices,
             lower_bounds,
+            bound_signs,
         })
     }
 
-    /// Compute slack values Δ_j = β_j − b_j. Returns `None` if infeasible.
+    /// Compute slack values Δ_j = s_j β_j − b_j. Returns `None` if infeasible.
     pub fn slacks(&self, beta: &Array1<f64>) -> Option<Vec<f64>> {
         let mut slacks = Vec::with_capacity(self.constrained_indices.len());
         for (ci, &idx) in self.constrained_indices.iter().enumerate() {
-            let delta = beta[idx] - self.lower_bounds[ci];
+            let sign = self.bound_signs.get(ci).copied().unwrap_or(1.0);
+            let delta = sign * beta[idx] - self.lower_bounds[ci];
             if delta <= 0.0 {
                 return None;
             }
@@ -1489,6 +1501,7 @@ pub struct BarrierDerivativeProvider<'a> {
     inner: &'a dyn HessianDerivativeProvider,
     tau: f64,
     constrained_indices: &'a [usize],
+    bound_signs: &'a [f64],
     slacks: Vec<f64>,
     p: usize,
 }
@@ -1506,6 +1519,7 @@ impl<'a> BarrierDerivativeProvider<'a> {
             inner,
             tau: config.tau,
             constrained_indices: &config.constrained_indices,
+            bound_signs: &config.bound_signs,
             slacks,
             p: beta.len(),
         })
@@ -1515,7 +1529,7 @@ impl<'a> BarrierDerivativeProvider<'a> {
         let mut result = Array2::zeros((self.p, self.p));
         for (ci, &idx) in self.constrained_indices.iter().enumerate() {
             let inv_cube = 1.0 / (self.slacks[ci].powi(3));
-            result[[idx, idx]] = -2.0 * self.tau * u[idx] * inv_cube;
+            result[[idx, idx]] = -2.0 * self.tau * self.bound_signs[ci] * u[idx] * inv_cube;
         }
         result
     }
@@ -4564,7 +4578,10 @@ impl PenaltySubspaceTrace {
     /// Uses `A.mul_mat(U_S)` so an Hv-only operator is probed in `r` matvecs
     /// (each `O(work_of_A)`), then a single `r × p × r` reduction routed
     /// through faer's parallel SIMD GEMM (`fast_atb`).
-    pub fn reduce_operator(&self, a: &dyn HyperOperator) -> Array2<f64> {
+    pub fn reduce_operator<O>(&self, a: &O) -> Array2<f64>
+    where
+        O: HyperOperator + ?Sized,
+    {
         let au = a.mul_mat(&self.u_s);
         crate::faer_ndarray::fast_atb(&self.u_s, &au)
     }
@@ -4572,7 +4589,10 @@ impl PenaltySubspaceTrace {
     /// `tr(K · A)` for `A` exposed only as a `HyperOperator`.  Mirrors
     /// [`Self::trace_projected_logdet`] without forcing dense materialization
     /// of `A`.
-    pub fn trace_operator(&self, a: &dyn HyperOperator) -> f64 {
+    pub fn trace_operator<O>(&self, a: &O) -> f64
+    where
+        O: HyperOperator + ?Sized,
+    {
         self.trace_projected_logdet_reduced(&self.reduce_operator(a))
     }
 
@@ -5273,15 +5293,23 @@ impl<'dp> InnerSolutionBuilder<'dp> {
                 barrier_config.constrained_indices.len(),
                 barrier_config.lower_bounds.len()
             );
+            assert_eq!(
+                barrier_config.constrained_indices.len(),
+                barrier_config.bound_signs.len(),
+                "InnerSolutionBuilder: barrier constrained index count {} does not match bound-direction count {}",
+                barrier_config.constrained_indices.len(),
+                barrier_config.bound_signs.len()
+            );
             assert!(
                 barrier_config.tau.is_finite() && barrier_config.tau >= 0.0,
                 "InnerSolutionBuilder: barrier tau must be finite and non-negative, got {}",
                 barrier_config.tau
             );
-            for (&idx, &lower_bound) in barrier_config
+            for ((&idx, &lower_bound), &sign) in barrier_config
                 .constrained_indices
                 .iter()
                 .zip(barrier_config.lower_bounds.iter())
+                .zip(barrier_config.bound_signs.iter())
             {
                 assert!(
                     idx < beta_dim,
@@ -5290,6 +5318,10 @@ impl<'dp> InnerSolutionBuilder<'dp> {
                 assert!(
                     lower_bound.is_finite(),
                     "InnerSolutionBuilder: barrier lower bound for beta[{idx}] must be finite, got {lower_bound}"
+                );
+                assert!(
+                    sign == 1.0 || sign == -1.0,
+                    "InnerSolutionBuilder: barrier bound direction for beta[{idx}] must be ±1, got {sign}"
                 );
             }
         }
@@ -7976,6 +8008,14 @@ pub(crate) const MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD: usize = 32;
 /// contractions over the upper-triangular coordinate pairs.
 pub(crate) const CALLBACK_OUTER_HESSIAN_ROW_PAIR_WORK_THRESHOLD: usize = 25_000_000;
 
+fn upper_triangle_pair_from_index(pair_idx: usize, n: usize) -> (usize, usize) {
+    let span = 2 * n + 1;
+    let discriminant = span * span - 8 * pair_idx;
+    let row = ((span as f64 - (discriminant as f64).sqrt()) * 0.5) as usize;
+    let row_start = row * (2 * n - row + 1) / 2;
+    (row, row + pair_idx - row_start)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OuterHessianRoutePlan {
     use_operator: bool,
@@ -9224,11 +9264,11 @@ fn compute_outer_hessian(
             // are both read-only borrows so the K(K+1)/2 pairs dispatch in
             // parallel, then we stitch the symmetric `n × n` Array2
             // sequentially.
-            let pairs: Vec<(usize, usize)> =
-                (0..n).flat_map(|i| (i..n).map(move |j| (i, j))).collect();
-            let pair_values: Vec<(usize, usize, f64)> = pairs
+            let pair_count = n * (n + 1) / 2;
+            let pair_values: Vec<(usize, usize, f64)> = (0..pair_count)
                 .into_par_iter()
-                .map(|(i, j)| {
+                .map(|pair_idx| {
+                    let (i, j) = upper_triangle_pair_from_index(pair_idx, n);
                     let value =
                         -kernel.trace_projected_logdet_cross_reduced(&reduced[i], &reduced[j]);
                     (i, j, value)
@@ -9301,10 +9341,7 @@ fn compute_outer_hessian(
     // `rayon::current_thread_index().is_some()`, preventing nested-rayon
     // oversubscription inside the family callbacks invoked by
     // `compute_ift_correction_trace`.
-    let rho_pair_indices: Vec<(usize, usize)> = (0..k)
-        .flat_map(|kk| (kk..k).map(move |ll| (kk, ll)))
-        .collect();
-    let rho_pair_count = rho_pair_indices.len();
+    let rho_pair_count = k * (k + 1) / 2;
     let rho_pair_start = std::time::Instant::now();
     log::debug!(
         "[compute_outer_hessian rho-rho] starting {} pair(s), k={}",
@@ -9327,7 +9364,8 @@ fn compute_outer_hessian(
         && effective_deriv.has_batched_hessian_second_derivative_corrections()
     {
         let mut rhs_matrix = Array2::<f64>::zeros((hop.dim(), rho_pair_count));
-        for (pair_idx, &(kk, ll)) in rho_pair_indices.iter().enumerate() {
+        for pair_idx in 0..rho_pair_count {
+            let (kk, ll) = upper_triangle_pair_from_index(pair_idx, k);
             let rhs = build_rho_pair_rhs(kk, ll);
             rhs_matrix.column_mut(pair_idx).assign(&rhs);
         }
@@ -9344,10 +9382,9 @@ fn compute_outer_hessian(
         } else {
             hop.solve_multi(&rhs_matrix)
         };
-        let triples: Vec<(Array1<f64>, Array1<f64>, Array1<f64>)> = rho_pair_indices
-            .iter()
-            .enumerate()
-            .map(|(pair_idx, &(kk, ll))| {
+        let triples: Vec<(Array1<f64>, Array1<f64>, Array1<f64>)> = (0..rho_pair_count)
+            .map(|pair_idx| {
+                let (kk, ll) = upper_triangle_pair_from_index(pair_idx, k);
                 (
                     v_ks[kk].clone(),
                     v_ks[ll].clone(),
@@ -9377,12 +9414,12 @@ fn compute_outer_hessian(
     };
 
     let rho_pair_values: Vec<(usize, usize, f64)> = {
-        use rayon::iter::ParallelIterator;
-        rho_pair_indices
-            .par_iter()
-            .enumerate()
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        (0..rho_pair_count)
+            .into_par_iter()
             .map(
-                |(pair_idx, &(kk, ll))| -> Result<(usize, usize, f64), String> {
+                |pair_idx| -> Result<(usize, usize, f64), String> {
+                    let (kk, ll) = upper_triangle_pair_from_index(pair_idx, k);
                     let pair_a = if kk == ll { rho_a_vals[kk] } else { 0.0 };
 
                     let cross_trace = if let Some(ref exact) = exact_logdet_cross_traces {
@@ -16230,11 +16267,15 @@ fn modified_gram_schmidt(y: &Array2<f64>, q: &mut Array2<f64>) -> usize {
 /// the sketch captures the dominant subspace exactly and Hutchinson
 /// only handles the small residual. For roughly-flat spectra both
 /// methods perform similarly per-matvec.
-pub(crate) fn hutchpp_estimate_trace_hinv_operator<H: HessianOperator + ?Sized>(
+pub(crate) fn hutchpp_estimate_trace_hinv_operator<H, O>(
     hop: &H,
-    op: &dyn HyperOperator,
+    op: &O,
     config: &StochasticTraceConfig,
-) -> f64 {
+) -> f64
+where
+    H: HessianOperator + ?Sized,
+    O: HyperOperator + ?Sized,
+{
     let p = hop.dim();
     debug_assert_eq!(op.dim(), p, "Hutch++: operator dim mismatch");
     if p == 0 {
@@ -16341,11 +16382,15 @@ pub(crate) fn hutchpp_estimate_trace_hinv_operator<H: HessianOperator + ?Sized>(
 /// `B²` is similar to `(H^{-1/2} A H^{-1/2})²` (PSD), so its trace is
 /// nonnegative and Hutch++ on the linear map `x ↦ B² x` produces an
 /// unbiased estimate of `tr(B²)` on standard probes.
-pub(crate) fn hutchpp_estimate_trace_hinv_op_squared<H: HessianOperator + ?Sized>(
+pub(crate) fn hutchpp_estimate_trace_hinv_op_squared<H, O>(
     hop: &H,
-    op: &dyn HyperOperator,
+    op: &O,
     config: &StochasticTraceConfig,
-) -> f64 {
+) -> f64
+where
+    H: HessianOperator + ?Sized,
+    O: HyperOperator + ?Sized,
+{
     let p = hop.dim();
     debug_assert_eq!(op.dim(), p, "Hutch++ squared: operator dim mismatch");
     if p == 0 {
@@ -16356,7 +16401,6 @@ pub(crate) fn hutchpp_estimate_trace_hinv_op_squared<H: HessianOperator + ?Sized
 
     // Apply B² = H⁻¹ A H⁻¹ A in place via two solve+apply legs.
     let apply_b_squared = |hop: &H,
-                           op: &dyn HyperOperator,
                            input: ArrayView1<'_, f64>,
                            tmp: &mut Array1<f64>|
      -> Array1<f64> {
@@ -16374,7 +16418,7 @@ pub(crate) fn hutchpp_estimate_trace_hinv_op_squared<H: HessianOperator + ?Sized
         let mut tmp = Array1::<f64>::zeros(p);
         for j in 0..sketch_dim {
             rademacher_probe_into(z.view_mut(), &mut rng_state);
-            let w = apply_b_squared(hop, op, z.view(), &mut tmp);
+            let w = apply_b_squared(hop, z.view(), &mut tmp);
             y.column_mut(j).assign(&w);
         }
         q_rank = modified_gram_schmidt(&y, &mut q);
@@ -16385,7 +16429,7 @@ pub(crate) fn hutchpp_estimate_trace_hinv_op_squared<H: HessianOperator + ?Sized
         let mut tmp = Array1::<f64>::zeros(p);
         for j in 0..q_rank {
             let qcol = q.column(j).to_owned();
-            let w = apply_b_squared(hop, op, qcol.view(), &mut tmp);
+            let w = apply_b_squared(hop, qcol.view(), &mut tmp);
             t_low += qcol.dot(&w);
         }
     }
@@ -16417,7 +16461,7 @@ pub(crate) fn hutchpp_estimate_trace_hinv_op_squared<H: HessianOperator + ?Sized
                 }
             }
         }
-        let w = apply_b_squared(hop, op, z_tilde.view(), &mut tmp);
+        let w = apply_b_squared(hop, z_tilde.view(), &mut tmp);
         let q_val = z_tilde.dot(&w);
         sum += q_val;
         sum_sq += q_val * q_val;
@@ -16452,12 +16496,17 @@ pub(crate) fn hutchpp_estimate_trace_hinv_op_squared<H: HessianOperator + ?Sized
 /// A leave-one-out XTrace estimator (Epperly & Tropp 2024, arxiv
 /// 2301.07825) would reduce variance further by exchanging each probe
 /// between sketch and residual roles, at O(m²) bookkeeping cost.
-pub(crate) fn hutchpp_estimate_trace_hinv_operator_cross<H: HessianOperator + ?Sized>(
+pub(crate) fn hutchpp_estimate_trace_hinv_operator_cross<H, L, R>(
     hop: &H,
-    left: &dyn HyperOperator,
-    right: &dyn HyperOperator,
+    left: &L,
+    right: &R,
     config: &StochasticTraceConfig,
-) -> f64 {
+) -> f64
+where
+    H: HessianOperator + ?Sized,
+    L: HyperOperator + ?Sized,
+    R: HyperOperator + ?Sized,
+{
     let p = hop.dim();
     debug_assert_eq!(left.dim(), p, "cross trace: left operator dim mismatch");
     debug_assert_eq!(right.dim(), p, "cross trace: right operator dim mismatch");

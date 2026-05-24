@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     pass
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SamplingConfig:
     """Echo of the NUTS configuration the engine ran with.
 
@@ -102,7 +102,7 @@ class SamplingConfig:
 _NO_MODEL: bytes = b""
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True, eq=False, slots=True)
 class PosteriorPredictive:
     """Per-row posterior fitted-mean draws on the link and response scales.
 
@@ -266,7 +266,7 @@ class PosteriorPredictive:
         )
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True, eq=False, slots=True)
 class CumulativeIncidenceDraws:
     """Paired posterior draws for a target-cause cumulative incidence curve."""
 
@@ -326,7 +326,7 @@ class CumulativeIncidenceDraws:
         )
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True, eq=False, slots=True)
 class PairedPosteriorSamples:
     """Posterior samples from two linked fits with draw rows paired by index."""
 
@@ -420,7 +420,7 @@ class PairedPosteriorSamples:
         )
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True, eq=False, slots=True)
 class PosteriorSamples:
     """Posterior draws over the model's coefficient vector.
 

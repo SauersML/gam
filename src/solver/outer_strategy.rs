@@ -48,6 +48,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 /// gate adjusts the *current* outer trust radius without changing inner
 /// tolerances.
 const TRUST_ENERGY_FACTOR: f64 = 10.0;
+const OPERATOR_TRUST_RESTART_RADIUS_FLOOR: f64 = 1.0e-6;
 
 /// Bidirectional inner-PIRLS feedback channel.
 ///
@@ -518,17 +519,17 @@ impl DeclaredHessianForm {
     /// for `Dense` / `Operator` / `Either`; `false` for `Unavailable`.
     /// Used by `plan` to keep the existing `Derivative`-based match
     /// arms while richer routing decisions consult the form directly.
-    pub fn is_analytic(self) -> bool {
+    pub const fn is_analytic(self) -> bool {
         !matches!(self, DeclaredHessianForm::Unavailable)
     }
 
     /// True when the declaration commits to a matrix-free path.
-    pub fn is_operator_only(self) -> bool {
+    pub const fn is_operator_only(self) -> bool {
         matches!(self, DeclaredHessianForm::Operator { .. })
     }
 
     /// True when the declaration commits to a dense path.
-    pub fn is_dense_only(self) -> bool {
+    pub const fn is_dense_only(self) -> bool {
         matches!(self, DeclaredHessianForm::Dense)
     }
 }
@@ -568,11 +569,11 @@ pub struct OuterThetaLayout {
 }
 
 impl OuterThetaLayout {
-    pub fn new(n_params: usize, psi_dim: usize) -> Self {
+    pub const fn new(n_params: usize, psi_dim: usize) -> Self {
         Self { n_params, psi_dim }
     }
 
-    pub fn rho_dim(&self) -> usize {
+    pub const fn rho_dim(&self) -> usize {
         self.n_params.saturating_sub(self.psi_dim)
     }
 
@@ -749,7 +750,7 @@ pub struct OuterCapability {
 }
 
 impl OuterCapability {
-    pub fn theta_layout(&self) -> OuterThetaLayout {
+    pub const fn theta_layout(&self) -> OuterThetaLayout {
         OuterThetaLayout::new(self.n_params, self.psi_dim)
     }
 
@@ -758,11 +759,11 @@ impl OuterCapability {
     }
 
     /// True when all coordinates are penalty-like (no ψ coords).
-    pub fn all_penalty_like(&self) -> bool {
+    pub const fn all_penalty_like(&self) -> bool {
         self.psi_dim == 0
     }
     /// True when ψ (design-moving) coordinates are present.
-    pub fn has_psi_coords(&self) -> bool {
+    pub const fn has_psi_coords(&self) -> bool {
         self.psi_dim > 0
     }
 
@@ -4228,7 +4229,7 @@ impl OuterProblem {
     }
 
     pub fn with_operator_initial_trust_radius(mut self, radius: Option<f64>) -> Self {
-        self.operator_initial_trust_radius = radius;
+        self.operator_initial_trust_radius = sanitized_operator_trust_restart_radius(radius);
         self
     }
 
@@ -4880,7 +4881,8 @@ fn run_outer(
                             break Ok(result);
                         }
                     }
-                    let next_trust_radius = result.operator_trust_radius;
+                    let next_trust_radius =
+                        sanitized_operator_trust_restart_radius(result.operator_trust_radius);
                     log::info!(
                         "[OUTER] {context}: ARC attempt exhausted budget at \
                          iter={} cost={:.6e} |g|={:.6e}; resuming from last \
@@ -4963,6 +4965,12 @@ fn outer_max_iterations(value: usize) -> Result<MaxIterations, EstimationError> 
     MaxIterations::new(value).map_err(|err| {
         EstimationError::InvalidInput(format!("outer max_iter is invalid: {err}"))
     })
+}
+
+fn sanitized_operator_trust_restart_radius(radius: Option<f64>) -> Option<f64> {
+    radius
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| value.max(OPERATOR_TRUST_RESTART_RADIUS_FLOOR))
 }
 
 /// Execute a single plan attempt (seed generation → solver loop → best result).
@@ -5225,7 +5233,9 @@ fn run_outer_with_plan(
                             feedback: feedback.clone(),
                         });
                     }
-                    if let Some(r) = config.operator_initial_trust_radius {
+                    if let Some(r) =
+                        sanitized_operator_trust_restart_radius(config.operator_initial_trust_radius)
+                    {
                         solver = solver.with_initial_trust_radius(r);
                     }
 
@@ -5265,6 +5275,19 @@ fn run_outer_with_plan(
                             Ok(result)
                         }
                         OptimizationStatus::MaxIterations => {
+                            log::warn!(
+                                "[OUTER warning] {context}: matrix-free TR hit max_iter={} at final_value={:.6e} |g|={:.3e} final_trust_radius={}",
+                                config.max_iter,
+                                report.solution.final_value,
+                                report
+                                    .solution
+                                    .final_gradient_norm
+                                    .unwrap_or(f64::NAN),
+                                match final_radius {
+                                    Some(r) => format!("{:.3e}", r),
+                                    None => "n/a".to_string(),
+                                },
+                            );
                             let mut result =
                                 solution_into_outer_result(report.solution, false, *the_plan);
                             result.operator_stop_reason =
@@ -5335,6 +5358,9 @@ fn run_outer_with_plan(
                         .with_gradient_tolerance(grad_tol)
                         .with_max_iterations(max_iter)
                         .with_initial_sample(seed.clone(), initial_sample);
+                    if let Some(sigma) = config.arc_initial_regularization {
+                        optimizer = optimizer.with_initial_regularization(sigma);
+                    }
                     if let Some(feedback) = config.outer_inner_cap.as_ref() {
                         optimizer = optimizer.with_observer(OuterAcceptObserver {
                             feedback: feedback.clone(),
@@ -5360,6 +5386,12 @@ fn run_outer_with_plan(
                     match optimizer.run() {
                         Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
                         Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
+                            log::warn!(
+                                "[OUTER warning] {context}: ARC hit max_iter={} at final_value={:.6e} |g|={:.3e}",
+                                config.max_iter,
+                                last_solution.final_value,
+                                last_solution.final_gradient_norm.unwrap_or(f64::NAN),
+                            );
                             Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                         }
                         Err(e) => Err(EstimationError::RemlOptimizationFailed(format!(
@@ -5468,7 +5500,7 @@ fn run_outer_with_plan(
                         bfgs_elapsed,
                         sol.final_value
                     ),
-                    Err(BfgsError::MaxIterationsReached { last_solution }) => log::info!(
+                    Err(BfgsError::MaxIterationsReached { last_solution }) => log::warn!(
                         // Include `in N iters` for symmetry with the
                         // converged log line — the runner aggregator
                         // (commit afd66d6a) reads the optional iters
@@ -6130,6 +6162,7 @@ mod tests {
             tau: 1e-6,
             constrained_indices: vec![0, 1],
             lower_bounds: vec![0.0, 0.0],
+            bound_signs: vec![1.0, 1.0],
         };
         let cap = OuterCapability {
             gradient: Derivative::Analytic,
@@ -6155,6 +6188,7 @@ mod tests {
             tau: 1e-6,
             constrained_indices: vec![0],
             lower_bounds: vec![0.0],
+            bound_signs: vec![1.0],
         };
         let cap = OuterCapability {
             gradient: Derivative::Unavailable,
@@ -6179,6 +6213,7 @@ mod tests {
             tau: 1e-6,
             constrained_indices: vec![0],
             lower_bounds: vec![0.0],
+            bound_signs: vec![1.0],
         };
         // β very close to bound → curvature is large
         let beta_near = Array1::from_vec(vec![0.001]);
@@ -6200,6 +6235,7 @@ mod tests {
             tau: 1e-6,
             constrained_indices: vec![0, 1],
             lower_bounds: vec![0.0, 0.0],
+            bound_signs: vec![1.0, 1.0],
         };
 
         // Mode (b) symmetric near-boundary: slacks uniform & both small.

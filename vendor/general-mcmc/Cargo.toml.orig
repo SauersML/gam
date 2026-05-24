@@ -1,0 +1,54 @@
+[package]
+name = "general-mcmc"
+version = "0.9.0"
+edition = "2024"
+authors = ["Matteo Gätzner <matteo.gatzner@gmail.com>"]
+license = "Apache-2.0"
+description = "A compact Rust library for Markov Chain Monte Carlo (MCMC) methods with GPU support."
+repository = "https://github.com/SauersML/general-mcmc"
+readme = "README.md"
+documentation = "https://docs.rs/general-mcmc"
+homepage = "https://docs.rs/general-mcmc"
+
+exclude = [
+  "target/*"
+]
+
+[dependencies]
+rand = {version="0.9", features=["small_rng", "std"]}
+rand_distr = "0.5"
+rayon = "1.11"
+indicatif = "0.18"
+num-traits = "0.2"
+csv = {version="1.3", optional=true}
+arrow = {version="56.2", optional=true}
+parquet = {version="56.2", optional=true}
+burn = { version = "0.18", features = ["autodiff", "ndarray"] }
+ndarray = { version = "0.17.1", features = ["rayon"] }
+ndarray-stats = "0.6"
+rustfft = "6.4"
+
+[features]
+default = ["burn"]
+burn = []
+wgpu = ["burn", "burn/wgpu"]
+no_burn = []
+csv = ["dep:csv"]
+arrow = ["dep:arrow"]
+parquet = ["dep:parquet", "dep:arrow"]
+
+[dev-dependencies]
+approx = "0.5"
+ndarray = { version = "0.17.1", features = ["approx", "rayon"] }
+plotly = "0.13"
+tempfile = "3.23"
+
+[profile.dev]
+debug = true
+
+[profile.release]
+debug = false
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "abort"

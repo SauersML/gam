@@ -1258,13 +1258,12 @@ impl TermCollectionDesign {
         let kron = kron_terms[0];
         // Only use the Kronecker path when the model is purely this tensor term
         // (no other smooth terms with separate penalties).
-        let non_kron_smooth_terms = self
+        let has_non_kron_smooth_terms = self
             .smooth
             .terms
             .iter()
-            .filter(|t| t.kronecker_factored.is_none())
-            .count();
-        if non_kron_smooth_terms > 0 {
+            .any(|t| t.kronecker_factored.is_none());
+        if has_non_kron_smooth_terms {
             return None; // mixed model — fall back to standard path
         }
         KroneckerPenaltySystem::new(
@@ -6410,8 +6409,7 @@ fn build_smooth_design_withworkspace_unvalidated(
             .collect::<Result<Vec<_>, _>>()?
     };
 
-    let local_dims: Vec<usize> = local_builds.iter().map(|built| built.dim).collect();
-    let total_p: usize = local_dims.iter().sum();
+    let total_p: usize = local_builds.iter().map(|built| built.dim).sum();
 
     let mut local_designs: Vec<DesignMatrix> = Vec::with_capacity(local_builds.len());
     let mut terms_out = Vec::<SmoothTerm>::with_capacity(terms.len());

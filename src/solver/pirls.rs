@@ -879,51 +879,6 @@ pub enum ExportedLaplaceCurvature {
 }
 
 #[derive(Debug, Clone)]
-pub struct CandidateScreen {
-    pub penalized_objective: f64,
-    pub deviance: f64,
-    pub penalty_term: f64,
-    pub arithmetic_finite: bool,
-}
-
-pub enum CandidateEvaluation {
-    Screen(CandidateScreen),
-    Full(WorkingState),
-}
-
-impl CandidateEvaluation {
-    #[inline]
-    fn penalized_objective(&self, firth_bias_reduction: bool) -> f64 {
-        match self {
-            Self::Screen(screen) => screen.penalized_objective,
-            Self::Full(state) => {
-                let mut value = state.deviance + state.penalty_term;
-                if firth_bias_reduction && let Some(jeffreys_logdet) = state.jeffreys_logdet() {
-                    value -= 2.0 * jeffreys_logdet;
-                }
-                value
-            }
-        }
-    }
-
-    #[inline]
-    fn arithmetic_finite(&self) -> bool {
-        match self {
-            Self::Screen(screen) => screen.arithmetic_finite,
-            Self::Full(state) => state.gradient.iter().all(|g| g.is_finite()),
-        }
-    }
-
-    #[inline]
-    fn into_full(self) -> Option<WorkingState> {
-        match self {
-            Self::Full(state) => Some(state),
-            Self::Screen(_) => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct WorkingState {
     pub eta: LinearPredictor,
     pub gradient: Array1<f64>,

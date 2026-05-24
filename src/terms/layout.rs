@@ -27,7 +27,7 @@ pub struct EngineTermSpec {
 }
 
 impl EngineTermSpec {
-    pub fn unpenalized(kind: EngineTermKind, width: usize) -> Self {
+    pub const fn unpenalized(kind: EngineTermKind, width: usize) -> Self {
         Self {
             kind,
             width,
@@ -35,7 +35,7 @@ impl EngineTermSpec {
         }
     }
 
-    pub fn penalized(kind: EngineTermKind, width: usize, penalty_count: usize) -> Self {
+    pub const fn penalized(kind: EngineTermKind, width: usize, penalty_count: usize) -> Self {
         Self {
             kind,
             width,
@@ -84,7 +84,7 @@ pub struct EngineLayoutBuilder {
 }
 
 impl EngineLayoutBuilder {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             next_col: 0,
             next_penalty: 0,
@@ -92,7 +92,7 @@ impl EngineLayoutBuilder {
         }
     }
 
-    pub fn with_offsets(start_col: usize, start_penalty: usize) -> Self {
+    pub const fn with_offsets(start_col: usize, start_penalty: usize) -> Self {
         Self {
             next_col: start_col,
             next_penalty: start_penalty,

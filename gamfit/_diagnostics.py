@@ -5,7 +5,7 @@ from html import escape
 from typing import Any
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Diagnostics:
     """Held-out / in-sample diagnostics for a fitted GAM.
 

@@ -70,7 +70,7 @@ cudarc = { version = "0.19.6", optional = true, default-features = false, featur
 
 [dependencies.general-mcmc]
 package = "general-mcmc"
-version = "0.9.0"
+path = "vendor/general-mcmc"
 default-features = false
 
 [dev-dependencies]

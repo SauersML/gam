@@ -41,17 +41,17 @@ impl Default for GpuDispatchPolicy {
 }
 
 impl GpuDispatchPolicy {
-    pub fn dense_gemv_target_is_gpu(&self, n: usize, p: usize, resident: bool) -> bool {
+    pub const fn dense_gemv_target_is_gpu(&self, n: usize, p: usize, resident: bool) -> bool {
         resident || n.saturating_mul(p).saturating_mul(2) >= self.gemm_min_flops
     }
 
-    pub fn xtwx_target_is_gpu(&self, n: usize, p: usize, materialized: bool) -> bool {
+    pub const fn xtwx_target_is_gpu(&self, n: usize, p: usize, materialized: bool) -> bool {
         materialized
             && n >= self.xtwx_n_min
             && n.saturating_mul(p).saturating_mul(p).saturating_mul(2) >= self.xtwx_flops_min
     }
 
-    pub fn potrf_target_is_gpu(&self, p: usize, h_resident: bool) -> bool {
+    pub const fn potrf_target_is_gpu(&self, p: usize, h_resident: bool) -> bool {
         h_resident && p >= self.potrf_min_p
     }
 }

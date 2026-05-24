@@ -89,7 +89,7 @@ impl ResourcePolicy {
     /// biobank-scale problems error out and force the analytic-operator path.
     /// Set `derivative_storage_mode = AnalyticOperatorRequired` explicitly to
     /// reject all dense fallback.
-    pub fn default_library() -> Self {
+    pub const fn default_library() -> Self {
         Self {
             max_single_materialization_bytes: 256 * 1024 * 1024, // 256 MiB
             max_operator_cache_bytes: 1024 * 1024 * 1024,        // 1 GiB
@@ -103,10 +103,14 @@ impl ResourcePolicy {
     /// Strict mode that rejects every dense fallback. Use when you intend to
     /// run only on operator-backed bases (biobank-scale Duchon/TPS, exact
     /// GAMLSS marginal slope, CTN, etc.).
-    pub fn analytic_operator_required() -> Self {
+    pub const fn analytic_operator_required() -> Self {
         Self {
+            max_single_materialization_bytes: 256 * 1024 * 1024,
+            max_operator_cache_bytes: 1024 * 1024 * 1024,
+            max_spatial_distance_cache_bytes: SPATIAL_DISTANCE_CACHE_MAX_BYTES,
+            max_owned_data_cache_bytes: 512 * 1024 * 1024,
+            row_chunk_target_bytes: 8 * 1024 * 1024,
             derivative_storage_mode: DerivativeStorageMode::AnalyticOperatorRequired,
-            ..Self::default_library()
         }
     }
 
@@ -123,7 +127,7 @@ impl ResourcePolicy {
     ///   * `hints.marginal_slope_biobank_active` (the GAMLSS marginal-slope
     ///     biobank path is in play; the corresponding operators MUST stay
     ///     matrix-free regardless of n)
-    pub fn for_problem(n_rows: usize, p_estimate: usize, hints: ProblemHints) -> Self {
+    pub const fn for_problem(n_rows: usize, p_estimate: usize, hints: ProblemHints) -> Self {
         let strict = n_rows >= STRICT_POLICY_NROWS_THRESHOLD
             || p_estimate >= STRICT_POLICY_P_THRESHOLD
             || hints.marginal_slope_biobank_active;
@@ -135,7 +139,7 @@ impl ResourcePolicy {
     }
 
     /// Permissive mode for small-data usage and tests.
-    pub fn permissive_small_data() -> Self {
+    pub const fn permissive_small_data() -> Self {
         Self {
             max_single_materialization_bytes: 2 * 1024 * 1024 * 1024, // 2 GiB
             max_operator_cache_bytes: 2 * 1024 * 1024 * 1024,
@@ -146,7 +150,7 @@ impl ResourcePolicy {
         }
     }
 
-    pub fn material_policy(&self) -> MaterializationPolicy {
+    pub const fn material_policy(&self) -> MaterializationPolicy {
         MaterializationPolicy {
             max_single_dense_bytes: self.max_single_materialization_bytes,
             max_cached_dense_bytes: self.max_operator_cache_bytes,
@@ -165,9 +169,15 @@ impl ResourcePolicy {
 
 /// Returns how many rows to stream per chunk so that each chunk uses approximately
 /// `target_bytes` given a row width of `cols` f64 entries.
-pub fn rows_for_target_bytes(target_bytes: usize, cols: usize) -> usize {
-    let bytes_per_row = cols.saturating_mul(std::mem::size_of::<f64>()).max(1);
-    (target_bytes / bytes_per_row).max(1)
+pub const fn rows_for_target_bytes(target_bytes: usize, cols: usize) -> usize {
+    let raw_bytes_per_row = cols.saturating_mul(std::mem::size_of::<f64>());
+    let bytes_per_row = if raw_bytes_per_row == 0 {
+        1
+    } else {
+        raw_bytes_per_row
+    };
+    let rows = target_bytes / bytes_per_row;
+    if rows == 0 { 1 } else { rows }
 }
 
 use std::collections::{HashMap, VecDeque};

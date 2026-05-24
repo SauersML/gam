@@ -54,7 +54,7 @@ _TRANSFORMATION_NORMAL_MODEL_CLASSES = frozenset(
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TermBlock:
     """Per-term coefficient column range, exposed by :attr:`Model.term_blocks`.
 
@@ -71,7 +71,7 @@ class TermBlock:
     end: int
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CompetingRisksPrediction:
     """Rust-computed joint cause-specific competing-risks prediction."""
 
@@ -88,7 +88,7 @@ class CompetingRisksPrediction:
     columns: dict[str, list[float]]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class CompetingRisksCIF:
     """Cause-specific cumulative incidence assembled by the Rust core."""
 
@@ -156,7 +156,7 @@ def competing_risks_cif(
     )
 
 
-@dataclass
+@dataclass(slots=True)
 class SurvivalPrediction:
     """Per-row survival functions evaluated on demand.
 
@@ -335,7 +335,7 @@ class SurvivalPrediction:
             )
         return self._survival_block(params, times_arr)
 
-    def survival_se_at(self, times: Any) -> Any:
+    def survival_se_at(self, times: Any) -> Any | None:
         """Delta-method standard error on ``S(t)`` at each requested time.
 
         Returns ``None`` when the prediction was not issued with
@@ -373,7 +373,7 @@ class SurvivalPrediction:
             )
         return _interpolate_rows(grid, surface, times_arr, clip=clip)
 
-    def _ffi_surface(self, kind: str) -> tuple[Any, Any]:
+    def _ffi_surface(self, kind: str) -> tuple[Any | None, Any | None]:
         """Return ``(grid, surface)`` for the FFI-provided surface or
         ``(None, None)`` when the caller constructed this object manually."""
         import numpy as np
@@ -659,6 +659,8 @@ class SurvivalPrediction:
 
 
 class Model:
+    __slots__ = ("_model_bytes", "_training_table_kind", "_summary_cache")
+
     def __init__(self, *, _model_bytes: bytes, _training_table_kind: str | None = None) -> None:
         self._model_bytes = _model_bytes
         self._training_table_kind = _training_table_kind
@@ -1808,6 +1810,8 @@ def _numeric_matrix(values: Any, label: str) -> Any:
         raise ValueError(f"{label} cannot be empty")
     if arr.dtype != np.float64:
         raise TypeError(f"{label} must be a float64 numpy array for zero-copy FFI")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{label} must contain only finite values")
     return arr
 
 
@@ -1920,7 +1924,7 @@ def _survival_prediction_from_ffi_payload(
     )
 
 
-def _coerce_matrix(value: Any) -> Any:
+def _coerce_matrix(value: Any) -> Any | None:
     import numpy as np
 
     if value is None:
