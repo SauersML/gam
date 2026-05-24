@@ -18,18 +18,26 @@ use std::borrow::Cow;
 use super::error::GpuError;
 
 pub type CuResult = i32;
-// SAFETY: these are FFI fn-pointer type aliases for libcuda driver entry
-// points; `unsafe extern "C"` matches the C ABI of the cu* functions we
-// resolve via dlsym below. The `unsafe` qualifier propagates the call-site
-// obligation (valid context, in-range pointers/sizes) up to each invoker.
+// SAFETY: FFI fn-pointer alias for the libcuda driver entry of the same
+// name; `unsafe extern "C"` matches the C ABI we resolve via dlsym below
+// and propagates the call's obligation (live context, in-range pointers
+// and sizes) up to the invoker.
 type CuInit = unsafe extern "C" fn(u32) -> CuResult;
+// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
 type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> CuResult;
+// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
 type CuCtxCreate = unsafe extern "C" fn(*mut usize, u32, i32) -> CuResult;
+// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
 type CuCtxSetCurrent = unsafe extern "C" fn(usize) -> CuResult;
+// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
 type CuCtxDestroy = unsafe extern "C" fn(usize) -> CuResult;
+// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
 type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> CuResult;
+// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
 type CuMemFree = unsafe extern "C" fn(u64) -> CuResult;
+// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
 type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const std::ffi::c_void, usize) -> CuResult;
+// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
 type CuMemcpyDtoH = unsafe extern "C" fn(*mut std::ffi::c_void, u64, usize) -> CuResult;
 
 /// Resolved CUDA driver entry points.
@@ -50,6 +58,11 @@ impl DriverApi {
         let sym = |e: libloading::Error| GpuError::DriverSymbolMissing {
             reason: e.to_string(),
         };
+        // SAFETY: each `library.get` returns a libloading::Symbol whose
+        // signature we are asserting matches the libcuda export of the
+        // same name; deref'ing yields the raw fn pointer. The `library`
+        // is the process-static dlopen handle from load_static_library,
+        // so the pointers we copy out stay valid for the process.
         unsafe {
             Ok(Self {
                 cu_init: *library.get(b"cuInit\0").map_err(sym)?,
@@ -89,6 +102,9 @@ impl CudaWorkingState {
         let ordinal = to_i32(device_ordinal)?;
         let library = load_static_library(cuda_library_candidates()).ok()?;
         let api = DriverApi::load(library).ok()?;
+        // SAFETY: api was just resolved from the live libcuda handle;
+        // we pass in-range device ordinals and pointers to local stack
+        // slots that outlive each call, satisfying the driver-API contract.
         unsafe {
             check_cuda((api.cu_init)(0), "cuInit").ok()?;
             let mut device = 0_i32;
@@ -104,6 +120,9 @@ impl CudaWorkingState {
     #[inline]
     pub fn set_current(&self) -> Result<(), GpuError> {
         check_cuda(
+            // SAFETY: self.context was produced by cuCtxCreate in init()
+            // and lives until Self::drop; the driver fn pointer was
+            // resolved against the same libcuda handle.
             unsafe { (self.api.cu_ctx_set_current)(self.context) },
             "cuCtxSetCurrent",
         )
@@ -116,6 +135,8 @@ impl Drop for CudaWorkingState {
         // best-effort cleanup so cuda-gdb / nvidia-smi see no dangling
         // context. Errors are swallowed because the process is on its
         // way out anyway.
+        // SAFETY: self.context was produced by cuCtxCreate in init() and
+        // is destroyed exactly once here as part of Self::drop.
         unsafe {
             drop((self.api.cu_ctx_destroy)(self.context));
         }

@@ -280,10 +280,24 @@ fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
         // the same panic family — propagate via `Result` or restructure so
         // the impossible branch is not expressible.
         ("unreachable!(", "unreachable!", true),
-        // Direct panics. Tests use `panic!("expected variant X")` after
-        // destructuring matches, which is idiomatic; non-test code should
-        // propagate `Result`.
-        ("panic!(", "panic!", true),
+        // Direct panics are handled by `scan_for_panic_without_safety`
+        // (a dedicated scanner that requires a `// SAFETY:` justification
+        // for non-test panics), not by the lexical substring ban.
+        // Vacuous assertions. Neither form belongs anywhere — tests use
+        // `assert_eq!` / real predicates, production code uses `Result`.
+        ("assert!(true)", "assert!(true)", false),
+        ("assert!(false)", "assert!(false)", false),
+        // Process termination bypasses `Drop`. Build.rs uses
+        // `std::process::exit(1)` legitimately at end-of-report and is
+        // already exempt from every scanner.
+        ("std::process::exit(", "std::process::exit", false),
+        ("process::exit(", "process::exit", false),
+        ("std::process::abort(", "std::process::abort", false),
+        ("process::abort(", "process::abort", false),
+        // Library code writing to stdout pollutes downstream consumers.
+        // Tests, examples, and benches legitimately print.
+        ("println!(", "println!", true),
+        ("print!(", "print!", true),
         // Memory-leak primitives. Tests sometimes leak intentionally.
         ("mem::forget(", "mem::forget", true),
         ("Box::leak(", "Box::leak", true),
