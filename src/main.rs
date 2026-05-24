@@ -58,8 +58,8 @@ use gam::predict::{
 use gam::probability::{normal_cdf, standard_normal_quantile};
 use gam::report;
 use gam::smooth::{
-    BoundedCoefficientPriorSpec, ByVarKind, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
-    SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
+    BoundedCoefficientPriorSpec, ByVarKind, LinearCoefficientGeometry, LinearTermSpec,
+    SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
     build_term_collection_design, freeze_term_collection_from_design,
 };
 use gam::smooth_test::SmoothTestScale;
@@ -927,7 +927,7 @@ fn run() -> CliResult<()> {
 fn blockwise_options_from_fit_args(
     args: &FitArgs,
 ) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
-    drop(args);
+    std::hint::black_box(args);
     let options = gam::families::custom_family::BlockwiseFitOptions::default();
     Ok(options)
 }
@@ -3886,7 +3886,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // useful default and matches user expectation that `gam diagnose` does
     // SOMETHING (a smoke-test for the most common workflow). If/when more
     // diagnostics land, this path can route based on explicit flags.
-    drop(args.alo);
+    std::hint::black_box(args.alo);
 
     progress.set_stage("diagnose", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
@@ -7137,6 +7137,18 @@ fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
                 shape: term.shape,
             })
         }
+        SmoothBasisSpec::BySmooth { smooth, .. } => smooth_term_primary_column(&SmoothTermSpec {
+            name: term.name.clone(),
+            basis: (**smooth).clone(),
+            shape: term.shape,
+        }),
+        SmoothBasisSpec::FactorSmooth { spec } => {
+            if spec.continuous_cols.len() == 1 {
+                Some(spec.continuous_cols[0])
+            } else {
+                None
+            }
+        }
         SmoothBasisSpec::BSpline1D { feature_col, .. } => Some(*feature_col),
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
         | SmoothBasisSpec::Sphere { feature_cols, .. }
@@ -7150,7 +7162,6 @@ fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
                 None
             }
         }
-        SmoothBasisSpec::BySmooth { .. } | SmoothBasisSpec::FactorSmooth { .. } => None,
     }
 }
 
@@ -7939,16 +7950,28 @@ fn termspec_has_bounded_terms(spec: &TermCollectionSpec) -> bool {
 }
 
 fn spatial_basiswarning_family_and_cols(term: &SmoothTermSpec) -> Option<(&'static str, &[usize])> {
-    match &term.basis {
-        SmoothBasisSpec::ByVariable { .. } | SmoothBasisSpec::FactorSumToZero { .. } => None,
+    spatial_basiswarning_family_and_cols_basis(&term.basis)
+}
+
+fn spatial_basiswarning_family_and_cols_basis(
+    basis: &SmoothBasisSpec,
+) -> Option<(&'static str, &[usize])> {
+    match basis {
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            spatial_basiswarning_family_and_cols_basis(inner)
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => {
+            spatial_basiswarning_family_and_cols_basis(smooth)
+        }
         SmoothBasisSpec::ThinPlate { feature_cols, .. } => Some(("thinplate/tps", feature_cols)),
         SmoothBasisSpec::Sphere { feature_cols, .. } => Some(("sphere/sos", feature_cols)),
         SmoothBasisSpec::Matern { feature_cols, .. } => Some(("matern", feature_cols)),
         SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
         SmoothBasisSpec::BSpline1D { .. }
         | SmoothBasisSpec::Pca { .. }
-        | SmoothBasisSpec::TensorBSpline { .. } => None,
-        SmoothBasisSpec::BySmooth { .. } | SmoothBasisSpec::FactorSmooth { .. } => None,
+        | SmoothBasisSpec::TensorBSpline { .. }
+        | SmoothBasisSpec::FactorSmooth { .. } => None,
     }
 }
 
@@ -8041,11 +8064,21 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::Pca { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
-        SmoothBasisSpec::BySmooth { smooth, .. } => smooth_term_feature_cols(&SmoothTermSpec {
-            name: term.name.clone(),
-            basis: (**smooth).clone(),
-            shape: term.shape,
-        }),
+        SmoothBasisSpec::BySmooth { smooth, by_kind } => {
+            let mut cols = smooth_term_feature_cols(&SmoothTermSpec {
+                name: term.name.clone(),
+                basis: (**smooth).clone(),
+                shape: term.shape,
+            });
+            match by_kind {
+                ByVarKind::Numeric { feature_col } | ByVarKind::Factor { feature_col, .. } => {
+                    cols.push(*feature_col)
+                }
+            }
+            cols.sort_unstable();
+            cols.dedup();
+            cols
+        }
         SmoothBasisSpec::FactorSmooth { spec } => {
             let mut cols = spec.continuous_cols.clone();
             cols.push(spec.group_col);
