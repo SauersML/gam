@@ -521,6 +521,13 @@ fn build_penalized_symbolic(
         row_idx.extend(rows.into_iter());
         col_ptr.push(row_idx.len());
     }
+    // SAFETY: `cols` is a Vec<BTreeSet<usize>> of exactly p entries, so the
+    // loop above pushes p+1 monotone-ascending col_ptr values ending at nnz
+    // = row_idx.len(); each per-column row slice was drained from a BTreeSet
+    // (already sorted, no duplicates); every inserted row satisfies row <=
+    // col < p (enforced for penalty triplets and structurally true for the
+    // XᵀWX upper-tri scan), so all row indices lie in [0, p). These are the
+    // CSC invariants that SymbolicSparseColMat::new_unchecked skips checking.
     Ok(unsafe { SymbolicSparseColMat::new_unchecked(p, p, col_ptr, None, row_idx) })
 }
 
