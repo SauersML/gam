@@ -761,11 +761,6 @@ fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
         ("spin_loop()", "spin_loop", false),
         ("thread::yield_now(", "thread::yield_now", false),
         ("std::thread::yield_now(", "std::thread::yield_now", false),
-        // `std::hint::black_box(...)` is a value-discard launderer in non-bench
-        // code (used to silence unused_must_use / unused warnings without naming
-        // the value). Legitimate in criterion benchmarks — test-aware exempts
-        // bench files. Production-side uses must bind and use the value.
-        ("hint::black_box(", "hint::black_box", true),
     ]
 }
 

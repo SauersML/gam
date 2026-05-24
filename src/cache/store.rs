@@ -712,18 +712,18 @@ fn checksum_hex(payload: &[u8]) -> String {
 
 /// Test-only monotonic offset (in nanoseconds) added to every `*_now`
 /// reading so tests can simulate elapsed time without `thread::sleep`.
-/// Reads atomically; production code never mutates this.
-#[cfg(test)]
-static TEST_TIME_OFFSET_NS: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(test)]
+/// Reads atomically; production code never mutates this. The storage and
+/// reader live inside `mod tests` so production builds carry no entry
+/// point to perturb the clock.
 fn test_time_offset_ns() -> u64 {
-    TEST_TIME_OFFSET_NS.load(Ordering::Relaxed)
-}
-
-#[cfg(not(test))]
-const fn test_time_offset_ns() -> u64 {
-    0
+    #[cfg(test)]
+    {
+        tests::TEST_TIME_OFFSET_NS.load(Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        0
+    }
 }
 
 fn unix_now_parts() -> (u64, u32) {
