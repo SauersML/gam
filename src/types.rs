@@ -214,97 +214,40 @@ impl Default for RhoPrior {
 }
 
 // ---------------------------------------------------------------------------
-// Unified likelihood specification (in-progress migration)
+// Unified likelihood specification
 // ---------------------------------------------------------------------------
 //
-// The codebase historically carries two parallel selectors:
-//
-//   * `LikelihoodFamily` — a flat enum mixing response distribution and link
-//     (e.g. `BinomialLogit`, `BinomialProbit`, `PoissonLog`).
-//   * `InverseLink` — a parameterized inverse-link selector (Standard,
-//     LatentCLogLog, Sas, BetaLogistic, Mixture).
-//
-// These two have to be kept consistent at every call site, which has caused
-// real drift bugs. The principled refactor is:
-//
-//   pub struct LikelihoodSpec { response: ResponseFamily, link: InverseLink }
-//
-// where `ResponseFamily` is a pure distribution selector
-// (`Gaussian | Binomial | Poisson | Gamma | RoystonParmar`) and every existing
-// `LikelihoodFamily` variant decomposes uniquely into the (response, link)
-// pair.
-//
-// MIGRATION PLAN (multi-phase):
-//
-//   Phase 1 (LANDED):
-//     - Introduce `ResponseFamily` and `LikelihoodSpec` alongside the legacy
-//       `LikelihoodFamily`.
-//     - Bidirectional conversion: `From<LikelihoodFamily> for LikelihoodSpec`
-//       (total) and `TryFrom<LikelihoodSpec> for LikelihoodFamily` (fails on
-//       (response, link) pairs that have no legacy variant — currently only
-//       Royston-Parmar with a non-identity link).
-//     - Mirror the 7 typed predicates on `LikelihoodSpec` so leaf modules can
-//       switch over without losing semantics.
-//     - Compatibility shim only. Zero behavior change. `cargo check` clean.
-//
-//   Phase 2 (LANDED, demonstration):
-//     - Migrated `src/families/family_meta.rs` and
-//       `src/families/survival_predict.rs` — the two smallest leaf modules — to
-//       use `LikelihoodSpec` predicates internally while their public APIs
-//       still accept `LikelihoodFamily` (bridged via `.into()` at entry).
-//
-//   Phase 3 (FUTURE):
-//     - Migrate remaining leaves (`solver/mixture_link`, `inference/probability`,
-//       `inference/generative`, `inference/sample`, `inference/formula_dsl`)
-//       upward to `solver/reml/runtime`, `solver/workflow`, `inference/model`.
-//
-//   Phase 4 (FUTURE):
-//     - Migrate the four large hubs in dependency order:
-//       `inference/quadrature.rs` → `families/strategy.rs` → `inference/predict.rs`
-//       → `inference/hmc.rs` → `solver/estimate.rs` → `solver/pirls.rs` →
-//       `terms/smooth.rs` → `src/main.rs`.
-//
-//   Phase 5 (FUTURE):
-//     - Once every site reads from `LikelihoodSpec`, replace remaining storage
-//       of `LikelihoodFamily` with `LikelihoodSpec` and delete the legacy enum
-//       (or keep as a thin newtype if serialized configs need a stable name).
-//
-// Predicate semantics on `LikelihoodSpec`:
-//   * `is_binomial`         <=> response == Binomial
-//   * `is_gaussian_identity`<=> response == Gaussian && link == Identity
-//   * `is_royston_parmar`   <=> response == RoystonParmar
-//   * `is_latent_cloglog`   <=> response == Binomial && link matches LatentCLogLog
-//   * `is_binomial_mixture` <=> response == Binomial && link matches Mixture
-//   * `is_binomial_sas`     <=> response == Binomial && link matches Sas
-//   * `is_binomial_beta_logistic` <=> response == Binomial && link matches BetaLogistic
-//
-// These mirror `LikelihoodFamily`'s predicates one-for-one. Any code that holds
-// both a `LikelihoodFamily` and an `InverseLink` should convert to
-// `LikelihoodSpec` ASAP so the two cannot drift.
+// `LikelihoodSpec { response: ResponseFamily, link: InverseLink }` is the
+// canonical likelihood selector. `ResponseFamily` is a pure response-
+// distribution selector that carries the per-family scalars
+// (`Tweedie { p }`, `NegativeBinomial { theta }`, `Beta { phi }`); `InverseLink`
+// is the parameterized inverse-link selector. Splitting (response, link)
+// removes the drift bug that the flat legacy `LikelihoodFamily` enum allowed
+// when its variant disagreed with a separately-stored `InverseLink`.
 
 /// Pure response distribution selector — no link information.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ResponseFamily {
     Gaussian,
     Binomial,
     Poisson,
-    Tweedie,
-    NegativeBinomial,
-    Beta,
+    Tweedie { p: f64 },
+    NegativeBinomial { theta: f64 },
+    Beta { phi: f64 },
     Gamma,
     RoystonParmar,
 }
 
 impl ResponseFamily {
     #[inline]
-    pub const fn name(self) -> &'static str {
+    pub const fn name(&self) -> &'static str {
         match self {
             Self::Gaussian => "gaussian",
             Self::Binomial => "binomial",
             Self::Poisson => "poisson",
-            Self::Tweedie => "tweedie",
-            Self::NegativeBinomial => "negative-binomial",
-            Self::Beta => "beta",
+            Self::Tweedie { .. } => "tweedie",
+            Self::NegativeBinomial { .. } => "negative-binomial",
+            Self::Beta { .. } => "beta",
             Self::Gamma => "gamma",
             Self::RoystonParmar => "royston-parmar",
         }
@@ -375,18 +318,17 @@ impl LikelihoodSpec {
             && matches!(self.link, InverseLink::BetaLogistic(_))
     }
 
-    /// Default scale metadata for this (response, link). Mirrors
-    /// `LikelihoodFamily::default_scale_metadata` for the response.
+    /// Default scale metadata for this (response, link).
     #[inline]
-    pub const fn default_scale_metadata(&self) -> LikelihoodScaleMetadata {
-        match self.response {
+    pub fn default_scale_metadata(&self) -> LikelihoodScaleMetadata {
+        match &self.response {
             ResponseFamily::Gaussian => LikelihoodScaleMetadata::ProfiledGaussian,
             ResponseFamily::Gamma => LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 },
             ResponseFamily::Binomial
             | ResponseFamily::Poisson
-            | ResponseFamily::Tweedie
-            | ResponseFamily::NegativeBinomial
-            | ResponseFamily::Beta => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            | ResponseFamily::Tweedie { .. }
+            | ResponseFamily::NegativeBinomial { .. }
+            | ResponseFamily::Beta { .. } => LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
             ResponseFamily::RoystonParmar => LikelihoodScaleMetadata::Unspecified,
         }
     }
