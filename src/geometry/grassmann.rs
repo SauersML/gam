@@ -194,7 +194,7 @@ impl RiemannianManifold for GrassmannManifold {
     ) -> GeometryResult<Array1<f64>> {
         let y = from_flat(point, self.n, self.k)?;
         let z = from_flat(vec, self.n, self.k)?;
-        let projected = z - y.dot(&y.t().dot(&z));
+        let projected = &z - y.dot(&y.t().dot(&z));
         Ok(flatten(&projected))
     }
 

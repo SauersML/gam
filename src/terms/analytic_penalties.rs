@@ -1398,9 +1398,8 @@ pub struct SparsityPenalty {
 ///
 /// Minimizing entropy drives each row toward a small active support while the
 /// softmax keeps `a_ik >= 0` and `sum_k a_ik = 1`. The exact Hessian is dense
-/// and can be indefinite because entropy is concave in assignment space; the
-/// diagonal returned here is the positive Gauss-Newton damping used by the
-/// row-local arrow solve.
+/// in each row and can be indefinite because entropy is concave in assignment
+/// space, so callers must use the HVP rather than a diagonal Hessian shortcut.
 #[derive(Debug, Clone)]
 pub struct SoftmaxAssignmentSparsityPenalty {
     pub k_atoms: usize,
@@ -1507,19 +1506,60 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
+        drop(target);
+        drop(rho);
+        None
+    }
+
+    fn hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        /*
+        Bug fix: softmax entropy is not coordinate-separable in logits.
+        The old `hessian_diag` returned λ p_k(1-p_k)/τ², which is only the
+        softmax Jacobian diagonal and omits the entropy curvature and all
+        cross-logit terms. That made `hvp` and log-det callers consume a
+        diagonal surrogate that is not the derivative of `grad_target`.
+        For H(p(z)), p'=p*(v-E_p[v])/τ and
+        (log p_k + 1)'=(v_k-E_p[v])/τ. Differentiating
+        g_k=λ p_k(E_p[log p + 1]-(log p_k+1))/τ gives the row-dense product
+        below. `hessian_diag` now returns `None`, so diagonal users recover
+        the true diagonal by probing this exact symmetric HVP.
+        */
         let lambda = self.weight * rho[0].exp();
+        assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
         let n = target.len() / self.k_atoms;
         let values: Vec<f64> = target.iter().copied().collect();
         let mut out = Array1::<f64>::zeros(target.len());
-        let inv_tau2 = 1.0 / (self.temperature * self.temperature);
+        let inv_tau = 1.0 / self.temperature;
+        let scale = lambda * inv_tau * inv_tau;
         for row in 0..n {
             let start = row * self.k_atoms;
             let a = self.softmax_row(&values[start..start + self.k_atoms]);
+            let mut mean_log_plus_one = 0.0;
+            let mut mean_v = 0.0;
             for k in 0..self.k_atoms {
-                out[start + k] = lambda * a[k] * (1.0 - a[k]) * inv_tau2;
+                mean_log_plus_one += a[k] * (a[k].max(1e-300).ln() + 1.0);
+                mean_v += a[k] * v[start + k];
+            }
+            let mut mean_centered_v_log_plus_one = 0.0;
+            for k in 0..self.k_atoms {
+                let centered_v = v[start + k] - mean_v;
+                mean_centered_v_log_plus_one += a[k] * centered_v * (a[k].max(1e-300).ln() + 1.0);
+            }
+            for k in 0..self.k_atoms {
+                let log_plus_one = a[k].max(1e-300).ln() + 1.0;
+                let centered_v = v[start + k] - mean_v;
+                out[start + k] = scale
+                    * a[k]
+                    * (centered_v * (mean_log_plus_one - log_plus_one - 1.0)
+                        + mean_centered_v_log_plus_one);
             }
         }
-        Some(out)
+        out
     }
 
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
@@ -6556,9 +6596,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::IBPAssignment(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
                 .expect("IBP assignment diag"),
-            AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => p
-                .hessian_diag(self.target.view(), self.rho.view())
-                .expect("softmax assignment diag"),
+            AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::Sparsity(p) => {
                 if let Some(d) = p.hessian_diag(self.target.view(), self.rho.view()) {
                     d
@@ -6593,7 +6631,6 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             | AnalyticPenaltyKind::TopKActivation(_)
             | AnalyticPenaltyKind::JumpReLU(_)
             | AnalyticPenaltyKind::Sparsity(_)
-            | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
             | AnalyticPenaltyKind::IBPAssignment(_) => {
                 let d = self.diag();
                 let mut s = 0.0;
@@ -6662,6 +6699,11 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             {
                 self.stochastic_log_det_plus_lambda_i(lambda)
             }
+            AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_log_det_plus_lambda_i(lambda)
+            }
             AnalyticPenaltyKind::Isometry(_) => {
                 let dense = self.as_dense();
                 <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
@@ -6670,7 +6712,8 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             | AnalyticPenaltyKind::BlockSparsity(_)
             | AnalyticPenaltyKind::MechanismSparsity(_)
             | AnalyticPenaltyKind::IvaeRidgeMeanGauge(_)
-            | AnalyticPenaltyKind::BlockOrthogonality(_) => {
+            | AnalyticPenaltyKind::BlockOrthogonality(_)
+            | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_) => {
                 let dense = self.as_dense();
                 <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
             }
@@ -7409,6 +7452,34 @@ mod tests {
     }
 
     #[test]
+    fn softmax_assignment_hvp_matches_gradient_directional_derivative() {
+        let pen = SoftmaxAssignmentSparsityPenalty::new(3, 0.7);
+        let t = array![0.4_f64, -0.8, 1.3, -0.2, 0.9, 0.1];
+        let rho = array![1.4_f64.ln()];
+        let v = array![0.2_f64, -0.5, 0.7, -0.3, 0.4, 0.6];
+
+        assert!(
+            pen.hessian_diag(t.view(), rho.view()).is_none(),
+            "softmax entropy has row-dense logit curvature, not a diagonal Hessian"
+        );
+
+        let hv = pen.hvp(t.view(), rho.view(), v.view());
+        let eps = 1e-6;
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        for i in 0..t.len() {
+            tp[i] += eps * v[i];
+            tm[i] -= eps * v[i];
+        }
+        let gp = pen.grad_target(tp.view(), rho.view());
+        let gm = pen.grad_target(tm.view(), rho.view());
+        for i in 0..t.len() {
+            let fd = (gp[i] - gm[i]) / (2.0 * eps);
+            assert_abs_diff_eq!(hv[i], fd, epsilon = 1e-6);
+        }
+    }
+
+    #[test]
     fn ard_grad_target_matches_lambda_t() {
         let d = 2;
         let t = array![0.5_f64, 1.0, 2.0, -1.0];
@@ -7719,5 +7790,161 @@ mod tests {
             err.contains("feature 1 appears in more than one group"),
             "unexpected error message: {err}"
         );
+    }
+
+    // ----- NestedPrefixPenalty (Matryoshka SAE) tests -----
+
+    fn nested_prefix_test_target() -> (Array1<f64>, usize, usize) {
+        // n_rows = 3, latent_dim = 4. Row-major (n*F + i).
+        let t = array![
+            1.0_f64, 2.0, 3.0, 4.0, // row 0
+            -1.0, 0.5, 0.0, 2.0, // row 1
+            0.1, -0.2, 0.3, -0.4, // row 2
+        ];
+        (t, 3, 4)
+    }
+
+    #[test]
+    fn nested_prefix_grad_matches_finite_difference() {
+        let (t, _n, f) = nested_prefix_test_target();
+        let target = PsiSlice::full(t.len(), Some(f));
+        let pen = NestedPrefixPenalty::new(
+            target,
+            PenaltyTier::Psi,
+            vec![1_usize, 2, 4],
+            vec![0.7, 0.5, 0.3],
+            1e-3,
+        )
+        .expect("valid nested-prefix penalty");
+        let rho = array![0.0_f64, 0.0, 0.0];
+        let g = pen.grad_target(t.view(), rho.view());
+        let eps = 1e-6;
+        let mut max_err = 0.0_f64;
+        for i in 0..t.len() {
+            let mut tp = t.clone();
+            let mut tm = t.clone();
+            tp[i] += eps;
+            tm[i] -= eps;
+            let fd =
+                (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * eps);
+            let err = (g[i] - fd).abs();
+            if err > max_err {
+                max_err = err;
+            }
+            assert_abs_diff_eq!(g[i], fd, epsilon = 1e-5);
+        }
+        assert!(max_err < 1e-5, "grad-FD max abs error = {max_err:.3e}");
+    }
+
+    #[test]
+    fn nested_prefix_hessian_diag_is_psd() {
+        let (t, _n, f) = nested_prefix_test_target();
+        let target = PsiSlice::full(t.len(), Some(f));
+        let pen = NestedPrefixPenalty::new(
+            target,
+            PenaltyTier::Psi,
+            vec![2_usize, 3, 4],
+            vec![1.0, 0.5, 0.25],
+            1e-3,
+        )
+        .expect("valid nested-prefix penalty");
+        let rho = array![0.0_f64, 0.0, 0.0];
+        let h = pen
+            .hessian_diag(t.view(), rho.view())
+            .expect("nested-prefix Hessian is diagonal");
+        for &v in h.iter() {
+            assert!(
+                v >= 0.0 && v.is_finite(),
+                "Hessian diag must be finite and PSD; got {v}"
+            );
+        }
+        assert!(h[0] > 0.0);
+    }
+
+    #[test]
+    fn nested_prefix_mask_is_correct() {
+        let (t, n_rows, f) = nested_prefix_test_target();
+        let target = PsiSlice::full(t.len(), Some(f));
+        let prefixes = vec![1_usize, 3, 4];
+        let weights = vec![2.0_f64, 1.0, 0.5];
+        let eps = 0.5;
+        let pen = NestedPrefixPenalty::new(target, PenaltyTier::Psi, prefixes, weights, eps)
+            .expect("valid");
+        let rho = Array1::<f64>::zeros(3);
+        let v = pen.value(t.view(), rho.view());
+
+        // W_i = Σ_{k: m_k > i} λ_k.
+        //   axis 0: m_k ∈ {1,3,4} > 0 → 2+1+0.5 = 3.5
+        //   axis 1: {3,4} > 1 → 1+0.5 = 1.5
+        //   axis 2: {3,4} > 2 → 1+0.5 = 1.5
+        //   axis 3: {4} > 3 → 0.5
+        let w_axis = [3.5_f64, 1.5, 1.5, 0.5];
+        let mut expected = 0.0;
+        let eps2 = eps * eps;
+        let src = t.as_slice().unwrap();
+        for n in 0..n_rows {
+            for i in 0..f {
+                let x = src[n * f + i];
+                expected += w_axis[i] * (x * x + eps2).sqrt();
+            }
+        }
+        assert_abs_diff_eq!(v, expected, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn nested_prefix_grad_rho_matches_finite_difference() {
+        let (t, _n, f) = nested_prefix_test_target();
+        let target = PsiSlice::full(t.len(), Some(f));
+        let pen = NestedPrefixPenalty::new(
+            target,
+            PenaltyTier::Psi,
+            vec![1_usize, 2, 4],
+            vec![0.7, 0.5, 0.3],
+            1e-3,
+        )
+        .expect("valid");
+        let rho = array![0.1_f64, -0.2, 0.3];
+        let dr = pen.grad_rho(t.view(), rho.view());
+        let eps = 1e-6;
+        for k in 0..3 {
+            let mut rp = rho.clone();
+            let mut rm = rho.clone();
+            rp[k] += eps;
+            rm[k] -= eps;
+            let fd =
+                (pen.value(t.view(), rp.view()) - pen.value(t.view(), rm.view())) / (2.0 * eps);
+            assert_abs_diff_eq!(dr[k], fd, epsilon = 1e-5);
+        }
+    }
+
+    #[test]
+    fn nested_prefix_rejects_non_monotone_prefixes() {
+        let target = PsiSlice::full(12, Some(4));
+        let err = NestedPrefixPenalty::new(
+            target,
+            PenaltyTier::Psi,
+            vec![2_usize, 2, 4],
+            vec![1.0, 1.0, 1.0],
+            1e-3,
+        )
+        .expect_err("non-strictly-increasing prefixes must error");
+        assert!(err.contains("strictly increasing"), "got: {err}");
+    }
+
+    #[test]
+    fn nested_prefix_bic_picks_best_schedule() {
+        let candidates = vec![
+            (vec![64_usize, 256], vec![10.0_f64, 5.0]),
+            (vec![64, 256], vec![1.0, 0.5]),
+            (vec![64, 256], vec![0.01, 0.005]),
+        ];
+        let deviances = vec![100.0_f64, 100.0, 100.0];
+        let edfs = vec![50.0_f64, 50.0, 50.0];
+        let (best, _bic) = select_nested_prefix_schedule(&candidates, &deviances, &edfs, 1000.0);
+        assert_eq!(best, 2, "smallest λ wins under equal deviance");
+
+        let deviances2 = vec![10.0_f64, 100.0, 100.0];
+        let (best2, _) = select_nested_prefix_schedule(&candidates, &deviances2, &edfs, 1000.0);
+        assert_eq!(best2, 0, "low deviance overrides shell term");
     }
 }

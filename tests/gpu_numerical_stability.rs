@@ -1,11 +1,14 @@
+#[cfg(feature = "cuda")]
 use gam::solver::gpu::{Device, configure_device};
 use ndarray::{Array1, Array2};
 
+#[cfg(feature = "cuda")]
 fn close(a: f64, b: f64, tol: f64) -> bool {
     let scale = 1.0_f64.max(a.abs()).max(b.abs());
     (a - b).abs() <= tol * scale
 }
 
+#[cfg(feature = "cuda")]
 fn assert_arrays_close(a: &Array2<f64>, b: &Array2<f64>, tol: f64) {
     assert_eq!(a.dim(), b.dim());
     for i in 0..a.nrows() {
@@ -20,6 +23,7 @@ fn assert_arrays_close(a: &Array2<f64>, b: &Array2<f64>, tol: f64) {
     }
 }
 
+#[cfg(feature = "cuda")]
 fn assert_vec_close(a: &Array1<f64>, b: &Array1<f64>, tol: f64) {
     assert_eq!(a.len(), b.len());
     for i in 0..a.len() {
@@ -53,6 +57,7 @@ fn synthetic_case(
     (x, weights, penalty, gradient)
 }
 
+#[cfg(feature = "cuda")]
 fn cpu_xtwx(x: &Array2<f64>, weights: &Array1<f64>) -> Array2<f64> {
     let mut out = Array2::<f64>::zeros((x.ncols(), x.ncols()));
     for i in 0..x.nrows() {
@@ -66,6 +71,7 @@ fn cpu_xtwx(x: &Array2<f64>, weights: &Array1<f64>) -> Array2<f64> {
     out
 }
 
+#[cfg(feature = "cuda")]
 fn cpu_cholesky_solve(h: &Array2<f64>, rhs: &Array2<f64>) -> (Array2<f64>, f64) {
     let n = h.nrows();
     let nrhs = rhs.ncols();

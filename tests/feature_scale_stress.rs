@@ -214,7 +214,7 @@ fn sphere_harmonic_basis_scales_and_keeps_diag_penalty_at_100k() {
             method: SphereMethod::Harmonic,
             max_degree: Some(l),
             wahba_kernel: Default::default(),
-        streaming_chunk_size: None,
+            streaming_chunk_size: None,
         };
         let built = time_label(
             &format!("sphere_harmonic_basis N={n} L={l} p={}", l * (l + 2)),

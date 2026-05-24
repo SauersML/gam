@@ -71,11 +71,11 @@ use gam::terms::smooth::BlockwisePenalty;
 use gam::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
     DifferenceOpKind, GatedSAEDecoder, IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge,
-    JumpReLUPenalty, MechanismSparsityPenalty, NuclearNormPenalty, OrthogonalityPenalty,
-    ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
-    RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
-    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
-    TotalVariationPenalty,
+    JumpReLUPenalty, MaternBasisGradientTarget, MechanismSparsityPenalty, NuclearNormPenalty,
+    OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier,
+    PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
+    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, StreamingMaternBasisGradientEvaluator,
+    TopKActivationPenalty, TotalVariationPenalty,
 };
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
@@ -8600,6 +8600,19 @@ fn duchon_polynomial_input_location_first_derivative<'py>(
 /// `φ'(r_{n,k})` for the Matérn kernel at every `(row, center)` pair.
 /// Returns `(n_rows, n_centers)`. `nu` accepted: `"1/2"`, `"3/2"`, `"5/2"`,
 /// `"7/2"`, `"9/2"` (any whitespace stripped).
+fn parse_matern_nu_py(context: &str, nu: &str) -> PyResult<MaternNu> {
+    match nu.replace(char::is_whitespace, "").as_str() {
+        "1/2" | "0.5" => Ok(MaternNu::Half),
+        "3/2" | "1.5" => Ok(MaternNu::ThreeHalves),
+        "5/2" | "2.5" => Ok(MaternNu::FiveHalves),
+        "7/2" | "3.5" => Ok(MaternNu::SevenHalves),
+        "9/2" | "4.5" => Ok(MaternNu::NineHalves),
+        other => Err(py_value_error(format!(
+            "{context}: nu must be one of '1/2','3/2','5/2','7/2','9/2'; got {other:?}"
+        ))),
+    }
+}
+
 #[pyfunction(signature = (t, centers, length_scale, nu = "3/2"))]
 fn matern_input_location_first_derivative<'py>(
     py: Python<'py>,
@@ -8608,19 +8621,7 @@ fn matern_input_location_first_derivative<'py>(
     length_scale: f64,
     nu: &str,
 ) -> PyResult<Py<PyArray2<f64>>> {
-    let nu_parsed = match nu.replace(char::is_whitespace, "").as_str() {
-        "1/2" | "0.5" => MaternNu::Half,
-        "3/2" | "1.5" => MaternNu::ThreeHalves,
-        "5/2" | "2.5" => MaternNu::FiveHalves,
-        "7/2" | "3.5" => MaternNu::SevenHalves,
-        "9/2" | "4.5" => MaternNu::NineHalves,
-        other => {
-            return Err(py_value_error(format!(
-                "matern_input_location_first_derivative: nu must be one of \
-                 '1/2','3/2','5/2','7/2','9/2'; got {other:?}"
-            )));
-        }
-    };
+    let nu_parsed = parse_matern_nu_py("matern_input_location_first_derivative", nu)?;
     let out = matern_radial_first_derivative_nd(
         t.as_array(),
         centers.as_array(),
@@ -8628,6 +8629,72 @@ fn matern_input_location_first_derivative<'py>(
         nu_parsed,
     )
     .map_err(|err| py_value_error(err.to_string()))?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+/// Streaming closed-form `dK/dtheta` for Matérn basis values.
+///
+/// `target="log_kappa"` returns the global scale derivative. `target="aniso"`
+/// requires `axis` and returns the derivative for that axis' log-scale.
+#[pyfunction(signature = (
+    data,
+    centers,
+    length_scale,
+    nu = "3/2",
+    target = "log_kappa",
+    axis = None,
+    aniso_log_scales = None,
+    chunk_size = None
+))]
+fn matern_basis_gradient_streaming<'py>(
+    py: Python<'py>,
+    data: PyReadonlyArray2<'py, f64>,
+    centers: PyReadonlyArray2<'py, f64>,
+    length_scale: f64,
+    nu: &str,
+    target: &str,
+    axis: Option<usize>,
+    aniso_log_scales: Option<PyReadonlyArray1<'py, f64>>,
+    chunk_size: Option<usize>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let nu_parsed = parse_matern_nu_py("matern_basis_gradient_streaming", nu)?;
+    let target = match target
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .as_str()
+    {
+        "log_kappa" | "kappa" | "scale" => MaternBasisGradientTarget::LogKappa,
+        "aniso" | "aniso_log_scale" | "axis" => {
+            MaternBasisGradientTarget::AnisoLogScale(axis.ok_or_else(|| {
+                py_value_error(
+                    "matern_basis_gradient_streaming: axis is required for target='aniso'"
+                        .to_string(),
+                )
+            })?)
+        }
+        other => {
+            return Err(py_value_error(format!(
+                "matern_basis_gradient_streaming: target must be 'log_kappa' or 'aniso'; got {other:?}"
+            )));
+        }
+    };
+    let aniso = aniso_log_scales
+        .as_ref()
+        .map(|values| values.as_slice())
+        .transpose()
+        .map_err(|err| py_value_error(format!("aniso_log_scales must be contiguous: {err}")))?;
+    let evaluator = StreamingMaternBasisGradientEvaluator::new(
+        centers.as_array(),
+        length_scale,
+        nu_parsed,
+        aniso,
+        chunk_size,
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
+    let out = evaluator
+        .evaluate(data.as_array(), target)
+        .map_err(|err| py_value_error(err.to_string()))?;
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -8827,6 +8894,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         matern_input_location_first_derivative,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(matern_basis_gradient_streaming, module)?)?;
     module.add_function(wrap_pyfunction!(
         sphere_input_location_first_derivative,
         module

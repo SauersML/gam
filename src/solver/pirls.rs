@@ -1952,6 +1952,13 @@ impl<'a> GamWorkingModel<'a> {
                 } else {
                     workspace.hessian_buf.fill(0.0);
                 }
+                if crate::solver::gpu::cuda_selected() {
+                    return crate::solver::gpu::pirls_gpu::weighted_crossprod_gpu(
+                        x_dense.view(),
+                        weights.view(),
+                    )
+                    .map_err(EstimationError::InvalidInput);
+                }
                 crate::gpu::log_backend_inventory_once();
                 let large_enough = x.nrows() >= 100_000 || (x.nrows() * p) >= 2_000_000;
                 let gpu_decision =
@@ -1960,13 +1967,6 @@ impl<'a> GamWorkingModel<'a> {
                     .require_supported()
                     .map_err(EstimationError::InvalidInput)?;
                 gpu_decision.log();
-                if crate::solver::gpu::cuda_selected() {
-                    return crate::solver::gpu::pirls_gpu::weighted_crossprod_gpu(
-                        x_dense.view(),
-                        weights.view(),
-                    )
-                    .map_err(EstimationError::InvalidInput);
-                }
                 if weights.iter().any(|&w| w < 0.0) {
                     // Observed-information assembly may have signed row
                     // weights.  Use Xᵀ(WX) exactly; never sqrt/clip.

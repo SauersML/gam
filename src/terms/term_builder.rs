@@ -28,8 +28,7 @@ use crate::resource::ResourcePolicy;
 use crate::smooth::{
     BySmoothKind, ByVarKind, ByVariableSpec, FactorSmoothFlavour, FactorSmoothSpec,
     LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
-    TermCollectionSpec,
+    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability, TermCollectionSpec,
 };
 
 // ---------------------------------------------------------------------------

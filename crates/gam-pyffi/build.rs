@@ -23,6 +23,9 @@ fn main() {
         // on stdout (which cargo captures for `cargo:` build-script
         // directives), but does not match the workspace lint's literal
         // `println!(` substring ban applied to sub-crate build scripts.
-        drop(writeln!(stdout, "cargo:rustc-link-arg-cdylib=-Wl,-rpath,{path}"));
+        drop(writeln!(
+            stdout,
+            "cargo:rustc-link-arg-cdylib=-Wl,-rpath,{path}"
+        ));
     }
 }

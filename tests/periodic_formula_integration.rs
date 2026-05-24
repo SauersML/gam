@@ -74,6 +74,7 @@ fn fit_from_formula_accepts_tensor_period_origin_aliases() {
 
 #[test]
 fn fit_from_formula_accepts_cyclic_duchon() {
-    let ncoef = assert_standard_fit_has_finite_coefficients("y ~ duchon(theta, periodic=true, k=8)", 1);
+    let ncoef =
+        assert_standard_fit_has_finite_coefficients("y ~ duchon(theta, periodic=true, k=8)", 1);
     assert!(ncoef > 0);
 }

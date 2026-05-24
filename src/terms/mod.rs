@@ -9,6 +9,7 @@ pub mod hull;
 pub mod input_loc_derivatives;
 pub mod latent_coord;
 pub mod layout;
+pub mod matern_gradient;
 pub mod penalties;
 pub mod penalty_op;
 pub mod sae_manifold;
@@ -20,12 +21,10 @@ pub use analytic_penalties::{
     BlockOrthogonalityPenalty, BlockSparsityPenalty, DifferenceOpKind, FrozenAnalyticPenaltyOp,
     IBPAssignmentPenalty, IsometryDuchonRadialSource, IsometryPenalty, IsometryReference,
     IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty, NestedPrefixPenalty,
-    NuclearNormPenalty, OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty,
-    PenaltyConcavity, PenaltyTier,
-    nested_prefix_bic, select_nested_prefix_schedule,
-    PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
+    NuclearNormPenalty, OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity,
+    PenaltyTier, PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
     SoftmaxAssignmentSparsityPenalty, SparsityKind, SparsityPenalty, TopKActivationPenalty,
-    TotalVariationPenalty, WeightField,
+    TotalVariationPenalty, WeightField, nested_prefix_bic, select_nested_prefix_schedule,
 };
 pub use atom_selection::{
     AssignmentSparsityCoupling, AtomLibrary, AtomRecord, AtomSelectionStrategy, EntropicSoftmax,
@@ -36,6 +35,7 @@ pub use latent_coord::{
     AuxPriorFamily, AuxPriorStrength, InputLocationDerivative, LatentCoordValues, LatentIdMode,
     LatentManifold,
 };
+pub use matern_gradient::{MaternBasisGradientTarget, StreamingMaternBasisGradientEvaluator};
 pub use sae_manifold::{
     AssignmentMode, GumbelTemperatureSchedule, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom,
     SaeManifoldLoss, SaeManifoldRho, SaeManifoldTerm, ScheduleKind,

@@ -652,7 +652,13 @@ impl LogKernelSumJet {
         mu: f64,
         sigma: f64,
     ) -> Result<Self, EstimationError> {
-        assert!(!terms.is_empty(), "KernelSumJet requires at least one term");
+        if terms.is_empty() {
+            // Empty sums are a caller-contract violation, not a degenerate row.
+            // Return an input error so callers can report the malformed kernel sum.
+            return Err(EstimationError::InvalidInput(
+                "KernelSumJet requires at least one term".to_string(),
+            ));
+        }
 
         // Fast path for single term.
         if terms.len() == 1 {

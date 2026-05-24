@@ -203,7 +203,7 @@ print(model.latents["t"].values) # (N, d) posterior mean
 ### 3.2 Rust
 
 Current Rust shape, now landed as the sibling of `SpatialLogKappaCoords`
-(`src/terms/latent_coord.rs:561`):
+(`src/terms/latent_coord.rs:596`):
 
 ```rust
 // src/terms/latent_coord.rs
@@ -243,8 +243,8 @@ impl LatentCoordValues {
 The outer optimizer receives `t` as a block of `hyper_dirs` (existing
 machinery — `try_build_spatial_log_kappa_hyper_dirs` already builds these
 for ψ; the landed builder is `try_build_latent_coord_hyper_dirs`
-at `src/terms/smooth.rs:12527`). Basis-side derivatives flow through
-`LatentCoordDesignDerivative` (`src/terms/basis.rs:4118`) and
+at `src/terms/smooth.rs:13812`). Basis-side derivatives flow through
+`LatentCoordDesignDerivative` (`src/terms/basis.rs:4369`) and
 `HyperDesignDerivative::from_latent_coord` (`src/solver/reml/mod.rs:2723`).
 
 ## 4. Mechanical reuse map
@@ -261,15 +261,15 @@ at `src/terms/smooth.rs:12527`). Basis-side derivatives flow through
 | `gaussian_reml_fit_positions_backward_impl` + `contract_position_gradient` | shipped 1D special case → generalize to ND | already returns `grad_t` |
 
 **Implementation checkpoint:**
-1. `LatentCoordValues` and id modes are present (`src/terms/latent_coord.rs:561`,
-   `src/terms/latent_coord.rs:107`).
+1. `LatentCoordValues` and id modes are present (`src/terms/latent_coord.rs:596`,
+   `src/terms/latent_coord.rs:115`).
 2. The standard formula workflow accepts `latents={...}` and prepares a
    single latent smooth term (`src/solver/workflow.rs:3105-3241`,
    `src/solver/workflow.rs:3354-3457`).
 3. Outer-fit dispatch builds `hyper_dirs` through
-   `try_build_latent_coord_hyper_dirs` (`src/terms/smooth.rs:12527`) and
+   `try_build_latent_coord_hyper_dirs` (`src/terms/smooth.rs:13812`) and
    optimizes via `fit_term_collectionwith_latent_coord_optimization`
-   (`src/terms/smooth.rs:17191`).
+   (`src/terms/smooth.rs:19028`).
 4. `dim_selection=True` is wired only with an auxiliary prior; the workflow
    rejects ARD-alone latent fits because ARD is not a gauge fix
    (`src/solver/workflow.rs:3231-3241`).

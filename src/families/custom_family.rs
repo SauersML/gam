@@ -19309,7 +19309,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     rho_prior: crate::types::RhoPrior,
 ) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
     let penalty_counts = validate_blockspecs(specs)?;
-    let label_layout = penalty_label_layout(specs, penalty_counts)?;
+    let label_layout = penalty_label_layout(specs, penalty_counts.clone())?;
     let rho0 = label_layout.initial_rho.clone();
     let (persistent_warm_start_key, persistent_warm_start) =
         load_persistent_custom_family_warm_start::<F>(family, specs, options, rho0.len());
