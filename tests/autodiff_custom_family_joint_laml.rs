@@ -18,6 +18,12 @@ use std::marker::PhantomData;
 
 mod common;
 
+fn stateless_ad_output<T>(freeze: bool, output: T) -> Vec<T> {
+    match freeze {
+        true | false => vec![output],
+    }
+}
+
 #[derive(Clone)]
 struct CoupledQuarticExactFamily {
     center: f64,
@@ -232,10 +238,11 @@ impl<T: AD> DifferentiableFunctionTrait<T> for CoupledQuarticObjectiveFn<T> {
             + T::constant(0.5) * d * beta2 * beta2;
         let curvature = T::one() + T::constant(3.0) * a * eta * eta;
         let det = (curvature + lambda) * (curvature + d) - curvature * curvature;
-        vec![
+        stateless_ad_output(
+            freeze,
             nll + T::constant(0.5) * lambda * beta1 * beta1 + T::constant(0.5) * det.ln()
                 - T::constant(0.5) * rho,
-        ]
+        )
     }
 
     fn num_inputs(&self) -> usize {
@@ -381,12 +388,13 @@ impl<T: AD> DifferentiableFunctionTrait<T> for ConstrainedExactObjectiveFn<T> {
         let lambda = rho.exp();
         let beta_hat = T::constant(self.lower);
         let resid = beta_hat - T::constant(self.target);
-        vec![
+        stateless_ad_output(
+            freeze,
             T::constant(0.5) * resid * resid
                 + T::constant(0.5) * lambda * beta_hat * beta_hat
                 + T::constant(0.5) * (T::one() + lambda).ln()
                 - T::constant(0.5) * rho,
-        ]
+        )
     }
 
     fn num_inputs(&self) -> usize {
