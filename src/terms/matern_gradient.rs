@@ -223,23 +223,6 @@ fn stable_poly_exp(a: f64, coeffs: &[f64]) -> f64 {
     poly * (-a).exp()
 }
 
-#[cfg(test)]
-fn matern_value_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> f64 {
-    let x = r / length_scale;
-    match nu {
-        MaternNu::Half => stable_poly_exp(x, &[1.0]),
-        MaternNu::ThreeHalves => stable_poly_exp(3.0_f64.sqrt() * x, &[1.0, 1.0]),
-        MaternNu::FiveHalves => stable_poly_exp(5.0_f64.sqrt() * x, &[1.0, 1.0, 1.0 / 3.0]),
-        MaternNu::SevenHalves => {
-            stable_poly_exp(7.0_f64.sqrt() * x, &[1.0, 1.0, 2.0 / 5.0, 1.0 / 15.0])
-        }
-        MaternNu::NineHalves => stable_poly_exp(
-            9.0_f64.sqrt() * x,
-            &[1.0, 1.0, 3.0 / 7.0, 2.0 / 21.0, 1.0 / 105.0],
-        ),
-    }
-}
-
 fn matern_log_kappa_derivative(r: f64, length_scale: f64, nu: MaternNu) -> f64 {
     let x = r / length_scale;
     match nu {
@@ -263,6 +246,22 @@ fn matern_log_kappa_derivative(r: f64, length_scale: f64, nu: MaternNu) -> f64 {
 mod tests {
     use super::*;
     use ndarray::array;
+
+    fn matern_value_from_distance(r: f64, length_scale: f64, nu: MaternNu) -> f64 {
+        let x = r / length_scale;
+        match nu {
+            MaternNu::Half => stable_poly_exp(x, &[1.0]),
+            MaternNu::ThreeHalves => stable_poly_exp(3.0_f64.sqrt() * x, &[1.0, 1.0]),
+            MaternNu::FiveHalves => stable_poly_exp(5.0_f64.sqrt() * x, &[1.0, 1.0, 1.0 / 3.0]),
+            MaternNu::SevenHalves => {
+                stable_poly_exp(7.0_f64.sqrt() * x, &[1.0, 1.0, 2.0 / 5.0, 1.0 / 15.0])
+            }
+            MaternNu::NineHalves => stable_poly_exp(
+                9.0_f64.sqrt() * x,
+                &[1.0, 1.0, 3.0 / 7.0, 2.0 / 21.0, 1.0 / 105.0],
+            ),
+        }
+    }
 
     #[test]
     fn log_kappa_gradient_matches_finite_difference() {
