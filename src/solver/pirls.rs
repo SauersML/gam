@@ -16,8 +16,8 @@ use crate::probability::standard_normal_quantile;
 use crate::solver::active_set;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use crate::types::{
-    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LinkFunction, MixtureLinkState,
-    RidgePassport, RidgePolicy, SasLinkState, is_valid_tweedie_power,
+    InverseLink, LikelihoodSpec, LinkFunction, MixtureLinkState, ResponseFamily, RidgePassport,
+    RidgePolicy, SasLinkState, is_valid_tweedie_power,
 };
 use dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::matmul::matmul;

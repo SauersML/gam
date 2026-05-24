@@ -521,16 +521,40 @@ pub enum NutsFamily {
 
 impl NutsFamily {
     #[inline]
-    fn likelihood_family(self) -> LikelihoodFamily {
+    fn likelihood_spec(self) -> LikelihoodSpec {
         match self {
-            Self::Gaussian => LikelihoodFamily::GaussianIdentity,
-            Self::BinomialLogit => LikelihoodFamily::BinomialLogit,
-            Self::BinomialProbit => LikelihoodFamily::BinomialProbit,
-            Self::BinomialCLogLog => LikelihoodFamily::BinomialCLogLog,
-            Self::PoissonLog => LikelihoodFamily::PoissonLog,
-            Self::TweedieLog => LikelihoodFamily::Tweedie { p: 1.5 },
-            Self::NegativeBinomialLog => LikelihoodFamily::NegativeBinomial { theta: 1.0 },
-            Self::GammaLog => LikelihoodFamily::GammaLog,
+            Self::Gaussian => LikelihoodSpec {
+                response: ResponseFamily::Gaussian,
+                link: InverseLink::Standard(LinkFunction::Identity),
+            },
+            Self::BinomialLogit => LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Standard(LinkFunction::Logit),
+            },
+            Self::BinomialProbit => LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Standard(LinkFunction::Probit),
+            },
+            Self::BinomialCLogLog => LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Standard(LinkFunction::CLogLog),
+            },
+            Self::PoissonLog => LikelihoodSpec {
+                response: ResponseFamily::Poisson,
+                link: InverseLink::Standard(LinkFunction::Log),
+            },
+            Self::TweedieLog => LikelihoodSpec {
+                response: ResponseFamily::Tweedie { p: 1.5 },
+                link: InverseLink::Standard(LinkFunction::Log),
+            },
+            Self::NegativeBinomialLog => LikelihoodSpec {
+                response: ResponseFamily::NegativeBinomial { theta: 1.0 },
+                link: InverseLink::Standard(LinkFunction::Log),
+            },
+            Self::GammaLog => LikelihoodSpec {
+                response: ResponseFamily::Gamma,
+                link: InverseLink::Standard(LinkFunction::Log),
+            },
         }
     }
 }
@@ -840,12 +864,17 @@ fn log_ndtr(x: f64) -> f64 {
 
 #[inline]
 fn validate_firth_support(family: NutsFamily, firth_enabled: bool) -> Result<(), HmcError> {
-    if firth_enabled && !family.likelihood_family().supports_firth() {
+    let spec = family.likelihood_spec();
+    if firth_enabled && !likelihood_spec_supports_firth(&spec) {
+        let binomial_logit = LikelihoodSpec {
+            response: ResponseFamily::Binomial,
+            link: InverseLink::Standard(LinkFunction::Logit),
+        };
         return Err(HmcError::FirthUnsupported {
             reason: format!(
                 "NUTS with Firth is only supported for {}; {} does not support it",
-                LikelihoodFamily::BinomialLogit.pretty_name(),
-                family.likelihood_family().pretty_name()
+                likelihood_spec_pretty_name(&binomial_logit),
+                likelihood_spec_pretty_name(&spec)
             ),
         });
     }
@@ -854,15 +883,19 @@ fn validate_firth_support(family: NutsFamily, firth_enabled: bool) -> Result<(),
 
 #[inline]
 fn validate_firth_likelihood_support(
-    family: LikelihoodFamily,
+    likelihood: &LikelihoodSpec,
     firth_enabled: bool,
 ) -> Result<(), HmcError> {
-    if firth_enabled && !family.supports_firth() {
+    if firth_enabled && !likelihood_spec_supports_firth(likelihood) {
+        let binomial_logit = LikelihoodSpec {
+            response: ResponseFamily::Binomial,
+            link: InverseLink::Standard(LinkFunction::Logit),
+        };
         return Err(HmcError::FirthUnsupported {
             reason: format!(
                 "Joint HMC with Firth is only supported for {}; {} does not support it",
-                LikelihoodFamily::BinomialLogit.pretty_name(),
-                family.pretty_name()
+                likelihood_spec_pretty_name(&binomial_logit),
+                likelihood_spec_pretty_name(likelihood)
             ),
         });
     }

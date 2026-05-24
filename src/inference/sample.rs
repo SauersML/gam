@@ -135,23 +135,127 @@ fn validate_explicit_link_wiggle_joint_hessian(
     Ok(())
 }
 
-fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodFamily) -> Option<f64> {
-    if let LikelihoodFamily::NegativeBinomial { theta } = family {
+fn family_noise_parameter(fit: &UnifiedFitResult, likelihood: &LikelihoodSpec) -> Option<f64> {
+    if let ResponseFamily::NegativeBinomial { theta } = likelihood.response {
         return Some(theta);
     }
-    if let LikelihoodFamily::Tweedie { p } = family {
+    if let ResponseFamily::Tweedie { p } = likelihood.response {
         return Some(p);
     }
-    if let LikelihoodFamily::BetaLogit { phi } = family {
+    if let ResponseFamily::Beta { phi } = likelihood.response {
         return Some(phi);
     }
-    if matches!(family, LikelihoodFamily::GammaLog) {
+    if matches!(likelihood.response, ResponseFamily::Gamma) {
         fit.likelihood_scale
             .gamma_shape()
             .or(Some(fit.standard_deviation))
     } else {
         Some(fit.standard_deviation)
     }
+}
+
+/// Build a `LikelihoodSpec` for a saved model. Combines the legacy
+/// `LikelihoodFamily` selector returned by `model.likelihood()` with any
+/// parameterized link state (`MixtureLinkState`, `SasLinkState`,
+/// `LatentCLogLogState`) the saved model carries so downstream sampling code
+/// can dispatch directly on the (response, link) pair.
+fn likelihood_spec_for_saved_model(model: &SavedModel) -> Result<LikelihoodSpec, String> {
+    let family = model.likelihood();
+    if let Some(spec) = LikelihoodSpec::from_non_parameterized(family) {
+        return Ok(spec);
+    }
+    match family {
+        LikelihoodFamily::BinomialMixture => {
+            let state = model
+                .saved_mixture_state()
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| {
+                    "binomial-mixture saved model is missing mixture link state".to_string()
+                })?;
+            Ok(LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Mixture(state),
+            })
+        }
+        LikelihoodFamily::BinomialSas => {
+            let state = model
+                .saved_sas_state()
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| {
+                    "binomial-sas saved model is missing SAS link state".to_string()
+                })?;
+            Ok(LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Sas(state),
+            })
+        }
+        LikelihoodFamily::BinomialBetaLogistic => {
+            let state = model
+                .saved_beta_logistic_state()
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| {
+                    "binomial-beta-logistic saved model is missing beta-logistic link state"
+                        .to_string()
+                })?;
+            Ok(LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::BetaLogistic(state),
+            })
+        }
+        LikelihoodFamily::BinomialLatentCLogLog => {
+            let state = model
+                .saved_latent_cloglog_state()
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| {
+                    "latent-cloglog binomial saved model is missing latent cloglog state"
+                        .to_string()
+                })?;
+            Ok(LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::LatentCLogLog(state),
+            })
+        }
+        _ => Err(format!(
+            "internal: likelihood family {} is non-parameterized but \
+             LikelihoodSpec::from_non_parameterized did not map it",
+            family.pretty_name()
+        )),
+    }
+}
+
+/// Map a `LikelihoodSpec` back to the flat legacy `LikelihoodFamily` enum
+/// that the downstream sampling engine (`fit_gam`,
+/// `run_nuts_sampling_flattened_family`) still consumes. The mapping is
+/// total because every `(response, link)` combination produced by a saved
+/// model corresponds to exactly one legacy variant.
+fn legacy_family_from_spec(spec: &LikelihoodSpec) -> LikelihoodFamily {
+    match (&spec.response, &spec.link) {
+        (ResponseFamily::Gaussian, _) => LikelihoodFamily::GaussianIdentity,
+        (ResponseFamily::Poisson, _) => LikelihoodFamily::PoissonLog,
+        (ResponseFamily::Tweedie { p }, _) => LikelihoodFamily::Tweedie { p: *p },
+        (ResponseFamily::NegativeBinomial { theta }, _) => {
+            LikelihoodFamily::NegativeBinomial { theta: *theta }
+        }
+        (ResponseFamily::Beta { phi }, _) => LikelihoodFamily::BetaLogit { phi: *phi },
+        (ResponseFamily::Gamma, _) => LikelihoodFamily::GammaLog,
+        (ResponseFamily::RoystonParmar, _) => LikelihoodFamily::RoystonParmar,
+        (ResponseFamily::Binomial, link) => match link {
+            InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
+            InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
+            InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
+            InverseLink::Standard(_) => LikelihoodFamily::BinomialLogit,
+            InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
+            InverseLink::Sas(_) => LikelihoodFamily::BinomialSas,
+            InverseLink::BetaLogistic(_) => LikelihoodFamily::BinomialBetaLogistic,
+            InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
+        },
+    }
+}
+
+/// Human-readable label for a `LikelihoodSpec`, mirroring the legacy
+/// `LikelihoodFamily::pretty_name` used in error messages.
+fn spec_pretty_name(spec: &LikelihoodSpec) -> &'static str {
+    legacy_family_from_spec(spec).pretty_name()
 }
 
 #[inline]
@@ -186,7 +290,7 @@ pub fn sample_saved_model(
     training_headers: Option<&Vec<String>>,
     cfg: &NutsConfig,
 ) -> Result<NutsResult, String> {
-    let family = model.likelihood();
+    let likelihood = likelihood_spec_for_saved_model(model)?;
     match model.predict_model_class() {
         PredictModelClass::Survival => {
             // Latent / latent-binary / location-scale survival likelihoods
@@ -207,7 +311,7 @@ pub fn sample_saved_model(
             }
         }
         PredictModelClass::Standard => {
-            sample_standard(model, data, col_map, training_headers, family, cfg)
+            sample_standard(model, data, col_map, training_headers, likelihood, cfg)
         }
         // For classes where the Rust core doesn't yet have an exact NUTS
         // implementation we fall back to drawing from the Laplace
@@ -365,12 +469,20 @@ fn sample_standard(
     data: ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
-    family: LikelihoodFamily,
+    likelihood: LikelihoodSpec,
     cfg: &NutsConfig,
 ) -> Result<NutsResult, String> {
     if model.has_link_wiggle() {
-        return sample_standard_link_wiggle(model, data, col_map, training_headers, family, cfg);
+        return sample_standard_link_wiggle(
+            model,
+            data,
+            col_map,
+            training_headers,
+            likelihood,
+            cfg,
+        );
     }
+    let family = legacy_family_from_spec(&likelihood);
     let parsed = parse_formula(&model.formula)?;
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = data.column(y_col).to_owned();
@@ -450,7 +562,7 @@ fn sample_standard_link_wiggle(
     data: ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
-    family: LikelihoodFamily,
+    likelihood: LikelihoodSpec,
     cfg: &NutsConfig,
 ) -> Result<NutsResult, String> {
     let parsed = parse_formula(&model.formula)?;
