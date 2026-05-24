@@ -38,9 +38,8 @@ use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use ndarray::{Array2, ArrayBase, Data, Ix1};
 
 use super::device::GpuDeviceInfo;
-use super::diagnostics;
 use super::driver::{from_col_major, to_col_major, to_i32};
-use super::runtime::{GpuRuntime, cuda_context_for};
+use super::runtime::{self, GpuRuntime, cuda_context_for};
 
 /// A device-resident column-major copy of an `Array2<f64>`. Holds the
 /// allocation alive for the session lifetime and serializes per-session
@@ -287,7 +286,7 @@ pub fn try_fast_xt_diag_x_arc<S: Data<Elem = f64>>(
         .saturating_mul(cols)
         .saturating_mul(2);
     if rows < policy.xtwx_n_min || flops < policy.xtwx_flops_min {
-        diagnostics::log_policy_cpu(
+        runtime::diagnostics::log_policy_cpu(
             "xt_diag_x_resident",
             format!("rows={rows} cols={cols}"),
             format!(
@@ -302,22 +301,22 @@ pub fn try_fast_xt_diag_x_arc<S: Data<Elem = f64>>(
     let start = std::time::Instant::now();
     match session.xtwx(w) {
         Some(out) => {
-            diagnostics::log_gpu_success(
+            runtime::diagnostics::log_gpu_success(
                 "xt_diag_x_resident",
                 "cuBLAS",
                 session.device(),
                 format!("rows={rows} cols={cols}"),
-                diagnostics::gemm_flops(cols, cols, rows),
+                runtime::diagnostics::gemm_flops(cols, cols, rows),
                 // Only w + result crossed PCIe on this call. The resident
                 // X upload is amortized over the session lifetime.
-                diagnostics::bytes_for_f64(rows),
-                diagnostics::bytes_for_f64(cols.saturating_mul(cols)),
+                runtime::diagnostics::bytes_for_f64(rows),
+                runtime::diagnostics::bytes_for_f64(cols.saturating_mul(cols)),
                 start.elapsed().as_secs_f64(),
             );
             Some(out)
         }
         None => {
-            diagnostics::log_runtime_cpu(
+            runtime::diagnostics::log_runtime_cpu(
                 "xt_diag_x_resident",
                 "cuBLAS",
                 format!("rows={rows} cols={cols}"),
