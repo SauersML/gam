@@ -1121,19 +1121,6 @@ impl PirlsWorkspace {
         }
     }
 
-    #[inline]
-    fn fill_sqrtweights<S>(&mut self, weights: &ArrayBase<S, Ix1>)
-    where
-        S: Data<Elem = f64>,
-    {
-        if self.sqrtw.len() != weights.len() {
-            self.sqrtw = Array1::zeros(weights.len());
-        }
-        Zip::from(&mut self.sqrtw)
-            .and(weights)
-            .par_for_each(|sqrtw, &w| *sqrtw = w.max(0.0).sqrt());
-    }
-
     /// Ensure the sparse penalty cache is populated and consistent with `x` and `s_lambda`.
     fn ensure_sparse_penalty_cache(
         &mut self,

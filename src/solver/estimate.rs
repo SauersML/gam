@@ -720,13 +720,6 @@ fn dispersion_from_likelihood(
     }
 }
 
-fn scaled_covariance(mut cov: Array2<f64>, phi: f64) -> Array2<f64> {
-    if (phi - 1.0).abs() > f64::EPSILON {
-        cov.mapv_inplace(|v| v * phi);
-    }
-    cov
-}
-
 /// Default inner P-IRLS tolerance floor.
 ///
 /// The inner Newton iteration certifies the coefficient mode against this
@@ -3707,7 +3700,10 @@ where
             }
         };
         beta_covariance = beta_covariance_unscaled.as_ref().map(|cov| {
-            crate::inference::dispersion_cov::PhiScaledCovariance::wrap(cov * dispersion_phi)
+            crate::inference::dispersion_cov::PhiScaledCovariance::wrap(scaled_covariance(
+                cov.clone(),
+                dispersion_phi,
+            ))
         });
 
         if let Some(h_inv) = beta_covariance_unscaled.as_ref()
