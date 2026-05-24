@@ -6706,13 +6706,13 @@ fn choose_formula(args: &FitArgs) -> Result<String, CliError> {
 
 fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
     match &term.basis {
-        SmoothBasisSpec::By { inner, .. } | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
-            let nested = SmoothTermSpec {
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            smooth_term_primary_column(&SmoothTermSpec {
                 name: term.name.clone(),
-                basis: (*inner.clone()),
+                basis: (**inner).clone(),
                 shape: term.shape,
-            };
-            smooth_term_primary_column(&nested)
+            })
         }
         SmoothBasisSpec::BSpline1D { feature_col, .. } => Some(*feature_col),
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
@@ -7521,6 +7521,7 @@ fn termspec_has_bounded_terms(spec: &TermCollectionSpec) -> bool {
 
 fn spatial_basiswarning_family_and_cols(term: &SmoothTermSpec) -> Option<(&'static str, &[usize])> {
     match &term.basis {
+        SmoothBasisSpec::ByVariable { .. } | SmoothBasisSpec::FactorSumToZero { .. } => None,
         SmoothBasisSpec::ThinPlate { feature_cols, .. } => Some(("thinplate/tps", feature_cols)),
         SmoothBasisSpec::Sphere { feature_cols, .. } => Some(("sphere/sos", feature_cols)),
         SmoothBasisSpec::Matern { feature_cols, .. } => Some(("matern", feature_cols)),
@@ -7600,26 +7601,16 @@ fn collect_spatial_smooth_usagewarnings(
 
 fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
     match &term.basis {
-        SmoothBasisSpec::By { inner, by_col, .. } => {
-            let nested = SmoothTermSpec {
+        SmoothBasisSpec::ByVariable { inner, by_col, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, by_col, .. } => {
+            let mut cols = smooth_term_feature_cols(&SmoothTermSpec {
                 name: term.name.clone(),
-                basis: (*inner.clone()),
+                basis: (**inner).clone(),
                 shape: term.shape,
-            };
-            let mut cols = vec![*by_col];
-            cols.extend(smooth_term_feature_cols(&nested));
-            cols
-        }
-        SmoothBasisSpec::FactorSumToZero {
-            inner, group_col, ..
-        } => {
-            let nested = SmoothTermSpec {
-                name: term.name.clone(),
-                basis: (*inner.clone()),
-                shape: term.shape,
-            };
-            let mut cols = vec![*group_col];
-            cols.extend(smooth_term_feature_cols(&nested));
+            });
+            cols.push(*by_col);
+            cols.sort_unstable();
+            cols.dedup();
             cols
         }
         SmoothBasisSpec::BSpline1D { feature_col, .. } => vec![*feature_col],
@@ -7689,13 +7680,13 @@ fn collect_linear_smooth_overlapwarnings(
 
 fn smooth_basiswarning_family_rank(term: &SmoothTermSpec) -> u8 {
     match &term.basis {
-        SmoothBasisSpec::By { inner, .. } | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
-            let nested = SmoothTermSpec {
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            smooth_basiswarning_family_rank(&SmoothTermSpec {
                 name: term.name.clone(),
-                basis: (*inner.clone()),
+                basis: (**inner).clone(),
                 shape: term.shape,
-            };
-            smooth_basiswarning_family_rank(&nested)
+            })
         }
         SmoothBasisSpec::BSpline1D { .. } => 0,
         SmoothBasisSpec::TensorBSpline { .. } => 1,

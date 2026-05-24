@@ -196,4 +196,6 @@ Use this to compose your own posterior quantity that
 isn't a straightforward `predict()` call. Restricted to standard
 non-link-wiggle GAMs.
 
-See also: [Difference smooths](difference-smooths.md) for pointwise and simultaneous bands on group trajectory contrasts.
+## Difference-smooth contrasts
+
+Use `Model.difference_smooth(data, group="group", view="x")` for covariance-aware pairwise smooth differences and optional simultaneous bands. See [Difference smooths](difference-smooths.md) for parameterisation choices and interval interpretation.
