@@ -376,7 +376,7 @@ pub trait HessianOperator: Send + Sync {
         probe_id: u64,
         trace_state: Option<&Arc<Mutex<StochasticTraceState>>>,
     ) -> Array1<f64> {
-        let _ = (probe_id, trace_state);
+        drop((probe_id, trace_state));
         self.stochastic_trace_solve(rhs, rel_tol)
     }
 
