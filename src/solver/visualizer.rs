@@ -1600,6 +1600,12 @@ fn advance_lane(lane: &mut LaneState, current: usize) {
 mod tests {
     use super::*;
 
+    impl VisualizerSession {
+        pub(super) fn is_interactive(&self) -> bool {
+            matches!(&*lock_state(&self.state), VisualizerState::Interactive(_))
+        }
+    }
+
     #[test]
     fn unicode_bar_uses_partial_blocks() {
         let bar = unicode_bar(0.53, 8);
