@@ -766,7 +766,7 @@ fn resolved_wiggle_inverse_link(
     fallback: &InverseLink,
 ) -> Result<InverseLink, String> {
     let resolved = match fit
-        .fitted_link_state(legacy_family_from_spec(spec))
+        .fitted_link_state(spec)
         .map_err(|e| e.to_string())?
     {
         FittedLinkState::Standard(Some(link)) => InverseLink::Standard(link),

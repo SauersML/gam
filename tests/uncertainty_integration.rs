@@ -7,13 +7,32 @@ use gam::predict::{
 };
 use gam::probability::try_inverse_link_array;
 use gam::smooth::BlockwisePenalty;
-use gam::types::LikelihoodFamily;
-use gam::types::LinkComponent;
+use gam::types::{
+    InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec, ResponseFamily,
+};
 use ndarray::{Array1, Array2};
 
 fn dense_penalty(local: Array2<f64>) -> BlockwisePenalty {
     let p = local.ncols();
     BlockwisePenalty::new(0..p, local)
+}
+
+fn gaussian_identity_likelihood() -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(LinkFunction::Identity),
+    )
+}
+
+fn binomial_likelihood(link: LinkFunction) -> LikelihoodSpec {
+    LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(link))
+}
+
+fn mixture_likelihood(spec: &MixtureLinkSpec) -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::Mixture(state_fromspec(spec).expect("mixture state")),
+    )
 }
 
 #[test]
@@ -41,7 +60,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
         weights.view(),
         offset.view(),
         &[dense_penalty(s.clone())],
-        LikelihoodFamily::GaussianIdentity,
+        gaussian_identity_likelihood(),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -283,7 +302,7 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
         weights.view(),
         offset.view(),
         &[dense_penalty(s)],
-        LikelihoodFamily::BinomialLogit,
+        binomial_likelihood(LinkFunction::Logit),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -309,7 +328,7 @@ fn prediction_uncertainty_is_finite_andwell_shaped() {
         x.view(),
         fit.beta.view(),
         offset.view(),
-        LikelihoodFamily::BinomialLogit,
+        binomial_likelihood(LinkFunction::Logit),
         &fit,
         &PredictUncertaintyOptions {
             confidence_level: 0.95,
@@ -371,7 +390,7 @@ fn gaussian_prediction_intervals_includeobservation_noise() {
         weights.view(),
         offset.view(),
         &[dense_penalty(s)],
-        LikelihoodFamily::GaussianIdentity,
+        gaussian_identity_likelihood(),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -397,7 +416,7 @@ fn gaussian_prediction_intervals_includeobservation_noise() {
         x.view(),
         fit.beta.view(),
         offset.view(),
-        LikelihoodFamily::GaussianIdentity,
+        gaussian_identity_likelihood(),
         &fit,
         &PredictUncertaintyOptions::default(),
     )
@@ -461,7 +480,7 @@ fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
         x.view(),
         beta.view(),
         offset.view(),
-        LikelihoodFamily::BinomialLogit,
+        binomial_likelihood(LinkFunction::Logit),
         cov.view(),
     )
     .expect("posterior mean prediction should succeed");
@@ -501,15 +520,15 @@ fn posterior_mean_prediction_shrinks_extreme_logit_probabilities() {
 }
 
 #[test]
-fn stateful_inverse_link_requires_state_for_sas_and_mixture() {
+fn stateless_sas_inverse_link_is_rejected() {
     let eta = Array1::from_vec(vec![-0.7, 0.0, 1.2]);
-    let sas_err = try_inverse_link_array(LikelihoodFamily::BinomialSas, eta.view(), None)
+    let likelihood = LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::Standard(LinkFunction::Sas),
+    );
+    let sas_err = try_inverse_link_array(&likelihood, eta.view())
         .expect_err("SAS inverse-link should require explicit sas_params");
-    assert!(sas_err.to_string().contains("requires SAS link state"));
-
-    let mix_err = try_inverse_link_array(LikelihoodFamily::BinomialMixture, eta.view(), None)
-        .expect_err("Mixture inverse-link should require explicit mixture_state");
-    assert!(mix_err.to_string().contains("requires mixture link state"));
+    assert!(sas_err.to_string().contains("requires explicit SAS link state"));
 }
 
 #[test]
@@ -535,7 +554,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
         weights.view(),
         offset.view(),
         &[dense_penalty(s)],
-        LikelihoodFamily::BinomialLogit,
+        binomial_likelihood(LinkFunction::Logit),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -558,17 +577,18 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
     .expect("base fit should succeed");
 
     let mut fit = fit_base.clone();
-    let state = state_fromspec(&gam::types::MixtureLinkSpec {
+    let mixture_spec = MixtureLinkSpec {
         components: vec![
             LinkComponent::Probit,
             LinkComponent::Logit,
             LinkComponent::CLogLog,
         ],
         initial_rho: Array1::from_vec(vec![0.4, -0.2]),
-    })
-    .expect("valid synthetic mixture state");
+    };
+    let state = state_fromspec(&mixture_spec).expect("valid synthetic mixture state");
+    let likelihood = mixture_likelihood(&mixture_spec);
     fit.fitted_link = FittedLinkState::Mixture {
-        state,
+        state: state.clone(),
         covariance: None,
     };
 
@@ -576,7 +596,7 @@ fn mixture_uncertainty_intervals_are_clamped_to_unit_interval() {
         x.view(),
         fit.beta.view(),
         offset.view(),
-        LikelihoodFamily::BinomialMixture,
+        likelihood,
         &fit,
         &PredictUncertaintyOptions {
             confidence_level: 0.95,
