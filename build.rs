@@ -1130,18 +1130,54 @@ fn scan_for_debug_eprintln(
     });
 }
 
-/// Replace string-literal contents and `'...'` char-literal contents with
-/// spaces, and truncate at `//` line comments. Preserves length where the
-/// caller relies on column alignment; for substring search this only needs
-/// to remove confusing content, which it does. Raw strings (`r"..."`,
-/// `r#"..."#`) and block comments (`/* ... */`) are not modeled — the
-/// scanner is a line-level heuristic.
+/// Per-line wrapper around `strip_strings_and_comments_stateful` that
+/// assumes the line does not start inside an open string. Adequate for
+/// most code lines but WRONG for any line that sits inside a multi-line
+/// string literal — those need `strip_file_lines` to carry state across
+/// line boundaries. Callers that scan for keywords like `unsafe` /
+/// `panic` / `let _` (which can legitimately appear as words inside
+/// long error-message strings) must use `strip_file_lines` instead, or
+/// they'll false-positive on string content.
 fn strip_strings_and_comments(line: &str) -> String {
+    strip_strings_and_comments_stateful(line, false, 0).0
+}
+
+/// Walk every line of `content`, carrying string-open state across line
+/// boundaries. Returns one stripped line per source line. This is the
+/// correct path for any scanner whose keyword/substring could appear
+/// inside a multi-line string literal (Rust permits real newlines inside
+/// `"..."`, and `\<newline>` continuations are common in long error
+/// messages). Raw strings (`r"..."`, `r#"..."#`) and block comments
+/// (`/* ... */`) are still out of scope — the helper handles plain
+/// double-quoted strings only, which covers the dominant false-positive
+/// case (multi-line `format!`/`panic!`/`write!` message text).
+fn strip_file_lines(content: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_str = false;
+    let mut quote: u8 = 0;
+    for line in content.lines() {
+        let (stripped, after_in_str, after_quote) =
+            strip_strings_and_comments_stateful(line, in_str, quote);
+        out.push(stripped);
+        in_str = after_in_str;
+        quote = after_quote;
+    }
+    out
+}
+
+/// State-aware variant of `strip_strings_and_comments`. Takes the
+/// "currently inside a string?" flag and the opening quote byte;
+/// returns the stripped line and the post-line state.
+fn strip_strings_and_comments_stateful(
+    line: &str,
+    in_str_in: bool,
+    quote_in: u8,
+) -> (String, bool, u8) {
     let bytes = line.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
-    let mut in_str = false;
-    let mut str_quote: u8 = 0;
+    let mut in_str = in_str_in;
+    let mut str_quote: u8 = quote_in;
     while i < bytes.len() {
         let c = bytes[i];
         if in_str {

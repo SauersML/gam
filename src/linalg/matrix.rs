@@ -4099,6 +4099,12 @@ impl DenseDesignOperator for RowwiseKroneckerOperator {
             .saturating_mul(p_cov)
             .saturating_mul(p_time)
             .saturating_mul(std::mem::size_of::<f64>());
+        // SAFETY: `RowwiseKroneckerOperator` is explicitly an operator-only
+        // representation: the wrapping `LazyOperator::to_dense` contract
+        // forbids dense materialization for biobank-scale n*p_cov*p_time
+        // tensors. Any caller that reaches this point bypassed the
+        // operator-aware dispatch and would otherwise silently allocate a
+        // matrix sized to crash the process.
         panic!(
             "RowwiseKroneckerOperator must remain operator-backed; refused persistent n x p_covariate x p_time materialization (n={n}, p_covariate={p_cov}, p_time={p_time}, dense={:.1} MiB)",
             bytes as f64 / (1024.0 * 1024.0),
@@ -5020,9 +5026,8 @@ impl SparseHessianAccumulator {
                 shared.dim,
             ),
         };
-        // SAFETY: col_ptrs and row_indices were built from a valid BTreeSet
-        // enumeration → sorted row indices per column, no duplicates, all
-        // indices in [0, dim).
+        // SAFETY: col_ptrs/row_indices came from a BTreeSet enumeration —
+        // sorted rows per column, no duplicates, every row index in [0, dim).
         let symbolic =
             unsafe { SymbolicSparseColMat::new_unchecked(dim, dim, col_ptrs, None, row_indices) };
         SparseColMat::new(symbolic, self.values)
@@ -6104,6 +6109,12 @@ impl DesignMatrix {
                 }
             }
             Self::Sparse(matrix) => {
+                // SAFETY: `to_csr_arc` only returns `None` if the underlying
+                // SparseColMat fails `to_row_major`, which is infallible for
+                // any well-formed sparse matrix the surrounding type system
+                // permits (csc → csr conversion requires only valid column
+                // pointers). Reaching `None` would mean the SparseDesignMatrix
+                // invariant was violated upstream.
                 let csr = matrix
                     .to_csr_arc()
                     .unwrap_or_else(|| panic!("DesignMatrix::dot_row: failed to obtain CSR view"));
@@ -6153,6 +6164,9 @@ impl DesignMatrix {
                 }
             }
             Self::Sparse(matrix) => {
+                // SAFETY: `to_csr_arc` returns `None` only if csc→csr conversion
+                // fails, which is infallible for the well-formed sparse matrices
+                // that `SparseDesignMatrix` is contractually allowed to hold.
                 let csr = matrix.to_csr_arc().unwrap_or_else(|| {
                     panic!("DesignMatrix::axpy_row_into: failed to obtain CSR view")
                 });

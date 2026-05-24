@@ -1011,11 +1011,9 @@ fn factorize_simplicial_canonical_upper(
             MemStack::new(&mut mem),
         );
         SparseColMat::<usize, f64>::new(
-            // SAFETY: col_ptrs and row_indices were just produced by
-            // faer::sparse::utils::permute_self_adjoint_to_unsorted from a
-            // valid n×n symbolic CSC, so they satisfy the CSC invariants
-            // (monotone col_ptrs in 0..=a_nnz, row indices in 0..n) that
-            // new_unchecked skips re-checking.
+            // SAFETY: col_ptrs/row_indices were just produced by
+            // permute_self_adjoint_to_unsorted from a valid n×n CSC, so
+            // they preserve its monotone col_ptrs and rows-in-0..n invariants.
             unsafe { SymbolicSparseColMat::new_unchecked(n, n, col_ptrs, None, row_indices) },
             values,
         )

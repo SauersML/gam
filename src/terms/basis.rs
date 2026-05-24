@@ -3343,10 +3343,9 @@ impl StreamingRadialState {
                 let dim = metric_weights.len();
                 debug_assert_eq!(s_buf.len(), dim);
                 for a in 0..dim {
-                    // SAFETY: compute_pair/ensure_triplet_cache callers pass
-                    // i < data.nrows() and j < centers.nrows(); streaming
-                    // constructors require dim=data.ncols()=centers.ncols(),
-                    // and this loop has a < dim.
+                    // SAFETY: compute_pair/ensure_triplet_cache callers pass i <
+                    // data.nrows() and j < centers.nrows(); streaming constructors
+                    // require dim=data.ncols()=centers.ncols(), and this loop has a < dim.
                     let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) };
                     s_buf[a] = metric_weights[a] * h * h;
                 }
@@ -3356,7 +3355,9 @@ impl StreamingRadialState {
                 let dim = metric_weights.len();
                 let mut r2 = 0.0;
                 for a in 0..dim {
-                    // SAFETY: same bounds rationale as the PerAxis arm.
+                    // SAFETY: compute_pair/ensure_triplet_cache callers pass i <
+                    // data.nrows() and j < centers.nrows(); streaming constructors
+                    // require dim=data.ncols()=centers.ncols(), and this loop has a < dim.
                     let h = unsafe { self.data.uget((i, a)) - self.centers.uget((j, a)) };
                     r2 += metric_weights[a] * h * h;
                 }
@@ -5867,7 +5868,7 @@ fn build_aniso_design_psi_derivatives_shared(
         let ef = &err_flag;
         (0..nc).into_par_iter().for_each(move |ci| {
             let start = ci * cs;
-            let end = (start + cs).min(n);
+            let end = start.saturating_add(cs).min(n);
             let mut drb = vec![0.0; dim];
             let mut cb = vec![0.0; dim];
             for i in start..end {
@@ -6034,7 +6035,7 @@ fn build_scalar_design_psi_derivatives_shared(
         let ef = &err_flag;
         (0..nc).into_par_iter().for_each(move |ci| {
             let start = ci * cs;
-            let end = (start + cs).min(n);
+            let end = start.saturating_add(cs).min(n);
             let mut data_row_buf = vec![0.0; dim];
             let mut center_buf = vec![0.0; dim];
             for i in start..end {
@@ -10345,9 +10346,9 @@ pub fn closed_form_anisotropic_pair_block(
             let value = closed_form_anisotropic_pair_value_with_powers(
                 q, m, s, kappa, eta_raw, &powers, &r_buf, r_eps,
             );
-            // SAFETY: parallel iter owns row i of the lower-triangular table;
-            // row_ptr = base + lower_triangular_offset(i) and j ∈ 0..=i make
-            // the write land within row i, disjoint from any other worker.
+            // SAFETY: values has k(k+1)/2 slots; for i in 0..k and j ∈ 0..=i,
+            // lower_triangular_offset(i)+j is in bounds. Each rayon iteration
+            // owns a distinct lower-triangular row, so writes are disjoint.
             unsafe {
                 *row_ptr.add(j) = value;
             }
@@ -10450,9 +10451,9 @@ pub fn closed_form_anisotropic_pair_block_pure(
                         q, m, s, 0.0, eta_slice, &powers, &r_buf,
                     )
             };
-            // SAFETY: per-row ownership in the parallel iter — row_ptr
-            // points to the lower_triangular_offset(i) slot, and j ∈ 0..=i
-            // stays in row i, disjoint from every other worker.
+            // SAFETY: values has k(k+1)/2 slots; for i in 0..k and j ∈ 0..=i,
+            // lower_triangular_offset(i)+j is in bounds. Each rayon iteration
+            // owns a distinct lower-triangular row, so writes are disjoint.
             unsafe {
                 *row_ptr.add(j) = value;
             }
@@ -10660,8 +10661,9 @@ pub fn closed_form_matern_pair_block(
                 acc +=
                     binom_coeffs[jj] * closed_form_penalty::matern_kernel_value(d, order, kappa, r);
             }
-            // SAFETY: row_ptr points at the offset for row i and j ∈ 0..=i
-            // stays inside that row, disjoint from other parallel rows.
+            // SAFETY: values has k(k+1)/2 slots; for i in 0..k and j ∈ 0..=i,
+            // lower_triangular_offset(i)+j is in bounds. Each rayon iteration
+            // owns a distinct lower-triangular row, so writes are disjoint.
             unsafe {
                 *row_ptr.add(j) = acc;
             }
@@ -10825,9 +10827,9 @@ pub fn closed_form_psi_derivatives_in_total_basis(
                     q, p_order, s_order, kappa, eta_raw, &powers, &r_buf,
                 )
             };
-            // SAFETY: g_row / g_psi_row / g_psi_psi_row each point at
-            // lower_triangular_offset(i) of their k(k+1)/2 buffers; j ∈ 0..=i
-            // confines writes to row i, owned by this parallel iteration.
+            // SAFETY: each output has k(k+1)/2 slots; for i in 0..k and j ∈ 0..=i,
+            // lower_triangular_offset(i)+j is in bounds. Each rayon iteration
+            // owns that lower-triangular row in every output, so writes are disjoint.
             unsafe {
                 *g_row.add(j) = bundle.value;
                 *g_psi_row.add(j) = kappa * bundle.d_kappa;
@@ -10968,9 +10970,9 @@ pub fn closed_form_aniso_psi_derivatives_in_total_basis(
                     q, p_order, s_order, kappa, eta_raw, &powers, &r_buf,
                 )
             };
-            // SAFETY: g_row and each g_eta*/g_eta2*/cross row pointer was resolved
-            // to lower_triangular_offset(i) at iteration top, so writes at offset
-            // j ∈ 0..=i stay in row i owned exclusively by this rayon iter.
+            // SAFETY: every output has k(k+1)/2 slots; for i in 0..k and j ∈ 0..=i,
+            // lower_triangular_offset(i)+j is in bounds. Each rayon iteration owns
+            // that lower-triangular row in every output, so writes are disjoint.
             unsafe {
                 *g_row.add(j) = bundle.value;
                 for a in 0..d {
@@ -23991,8 +23993,7 @@ pub mod closed_form_penalty {
     /// or `4(m+s) ≤ d`. The latter never coincides with the convergent
     /// regime of canonical TPS, so we use `d > 4m` as the dispatch gate.
     #[inline]
-    fn schwinger_radial_is_convergent(d: usize, m: usize, s: usize) -> bool {
-        let _ = s;
+    fn schwinger_radial_is_convergent(d: usize, m: usize, _s: usize) -> bool {
         d > 4 * m
     }
 

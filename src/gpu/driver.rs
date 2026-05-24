@@ -142,36 +142,43 @@ impl Drop for CudaWorkingState {
 
 /// RAII device allocation: frees on drop via `cuMemFree_v2`.
 pub struct DeviceAllocation<'a> {
-    driver: &'a DriverApi,
+    state: &'a CudaWorkingState,
     pub ptr: u64,
 }
 
 impl<'a> DeviceAllocation<'a> {
     /// Allocate `bytes` of device memory. Caller is responsible for context
-    /// `cuCtxSetCurrent` having been issued before this call.
+    /// `cuCtxSetCurrent` having been issued for `state.context` before this call.
     // SAFETY: marked `unsafe fn` because the caller must guarantee that a
-    // CUDA context is current on this thread; without that precondition
-    // the inner cuMemAlloc call is undefined behavior.
-    pub unsafe fn new(driver: &'a DriverApi, bytes: usize) -> Option<Self> {
+    // CUDA context is current on this thread; borrowing state also keeps
+    // the owning context alive until this allocation has been dropped.
+    pub unsafe fn new(state: &'a CudaWorkingState, bytes: usize) -> Option<Self> {
         let mut ptr = 0_u64;
         check_cuda(
             // SAFETY: &mut ptr is a valid u64 slot living to the end of
-            // this fn; `bytes` is the caller-requested allocation size.
-            unsafe { (driver.cu_mem_alloc)(&mut ptr, bytes) },
+            // this fn; `state.context` is current by the caller contract;
+            // `bytes` is the caller-requested allocation size.
+            unsafe { (state.api.cu_mem_alloc)(&mut ptr, bytes) },
             "cuMemAlloc",
         )
         .ok()?;
-        Some(Self { driver, ptr })
+        Some(Self { state, ptr })
     }
 }
 
 impl Drop for DeviceAllocation<'_> {
     fn drop(&mut self) {
-        // SAFETY: self.ptr was produced by cuMemAlloc inside Self::new
-        // (precondition: a context is current on the freeing thread, as
-        // guaranteed by the caller of `unsafe fn new`) and is freed once.
-        unsafe {
-            drop((self.driver.cu_mem_free)(self.ptr));
+        // SAFETY: state.context was produced by cuCtxCreate and is kept
+        // alive by the allocation borrow; the driver fn pointer was
+        // resolved against the same live libcuda handle.
+        let set_current = unsafe { (self.state.api.cu_ctx_set_current)(self.state.context) };
+        if set_current == 0 {
+            // SAFETY: self.ptr was produced by cuMemAlloc inside Self::new
+            // while state.context was current; Drop has just made that same
+            // context current on this thread, and this RAII owner frees once.
+            unsafe {
+                drop((self.state.api.cu_mem_free)(self.ptr));
+            }
         }
     }
 }
@@ -189,9 +196,10 @@ pub fn check_cuda(result: CuResult, name: &str) -> Result<(), GpuError> {
 
 fn load_library(candidates: &[&str]) -> Result<Library, GpuError> {
     for candidate in candidates {
-        // SAFETY: Library::new runs the library's loader initializer; we
-        // only ever pass canonical libcuda paths from
-        // cuda_library_candidates(), which has no init-time side effects.
+        // SAFETY: `Library::new` may execute library initializers. This
+        // loading path is only used with the fixed CUDA driver names from
+        // `cuda_library_candidates()`, so we intentionally trust the platform
+        // dynamic loader's CUDA driver resolution and vendor startup code.
         if let Ok(library) = unsafe { Library::new(*candidate) } {
             return Ok(library);
         }
@@ -205,12 +213,8 @@ fn load_library(candidates: &[&str]) -> Result<Library, GpuError> {
 /// mapping stays alive for the process. Use this when the caller's fn-pointer
 /// table needs to stay valid forever (i.e. for every library binding we
 /// resolve at startup).
-pub fn load_static_library(candidates: &[&str]) -> Result<&'static Library, GpuError> {
-    let raw = Box::into_raw(Box::new(load_library(candidates)?));
-    // SAFETY: deliberate process-lifetime leak. `raw` was just produced by
-    // `Box::into_raw`, so it is a valid, properly aligned, exclusive pointer
-    // and the reborrow yields a `&'static Library` that no other code holds.
-    Ok(unsafe { &*raw })
+fn load_static_library(candidates: &[&str]) -> Result<&'static Library, GpuError> {
+    Ok(Box::leak(Box::new(load_library(candidates)?)))
 }
 
 pub fn cuda_library_candidates() -> &'static [&'static str] {
