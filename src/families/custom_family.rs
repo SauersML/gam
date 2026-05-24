@@ -11352,13 +11352,32 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // avoids stale no-op configuration and makes the trust-region behavior
         // explicit at the only place it is used.
 
-        // Starting objective snapshot. This is diagnostic only: descent
-        // without a KKT certificate is a useful warm-start, not a converged
-        // inner mode. The outer REML/LAML gradient uses the envelope theorem,
-        // which requires the inner beta to be stationary; accepting a merely
-        // descended iterate as converged makes the outer optimizer see a
-        // mathematically invalid gradient.
-        let initial_joint_objective = lastobjective;
+        // Cross-cycle convergence carry-over: set at the end of every
+        // accepted cycle so the next cycle can distinguish a true KKT
+        // optimum on a rank-deficient null mode (objective stuck
+        // because every direction is along the null space) from
+        // genuine non-convergence. The residual signal does not need
+        // a carry-over — `residual <= residual_tol` is the canonical
+        // KKT certificate and the end-of-cycle test consumes it
+        // directly when it fires.
+        let mut last_cycle_obj_change_below_tol = false;
+
+        // Predicted-reduction tracker for the principled trust-region
+        // stopping criterion (Conn-Gould-Toint, *Trust-Region Methods*,
+        // Theorem 6.4.6). The Newton model at the accepted step has a
+        // predicted decrease `m(0) − m(δ) = −g·δ − 0.5·δ·H·δ`. For an
+        // unclipped Newton step (H·δ = −g) this is `0.5·g·H⁻¹·g`, the
+        // Newton decrement squared / 2. When the model itself predicts
+        // a decrease smaller than the objective tolerance, no descent
+        // direction the Hessian can resolve will lower the objective
+        // by more than `objective_tol`, and continuing is wall-clock
+        // waste regardless of whether the raw gradient residual or
+        // step-norm gates have closed.
+        //
+        // Tracked here at cycle scope so the end-of-cycle convergence
+        // test can consume the value from the accepted trust-region
+        // attempt. Reset every cycle alongside the line-search state.
+        let mut _accepted_predicted_reduction: f64 = f64::INFINITY;
 
         let mut joint_trust_radius = 1.0_f64;
         // Hard upper bound for the for-loop's range. The cap is fixed at
@@ -12379,6 +12398,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         cached_active_sets =
                             scatter_joint_active_set(joint_active_set, &block_constraints);
                     }
+                    // Record the Newton-model predicted decrease at this
+                    // accepted attempt for the end-of-cycle stopping
+                    // criterion (Conn-Gould-Toint Theorem 6.4.6). For a
+                    // trust-region-clipped step, `predicted_reduction`
+                    // is the model's promised decrease at the realized
+                    // step magnitude; for an unclipped Newton step it
+                    // equals half the Newton decrement squared.
+                    _accepted_predicted_reduction = predicted_reduction;
                     accepted = true;
                     break;
                 }
@@ -12585,6 +12612,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 if converged {
                     break;
                 }
+                last_cycle_obj_change_below_tol = false;
+                _accepted_predicted_reduction = f64::INFINITY;
                 continue;
             }
 
