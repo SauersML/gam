@@ -31,10 +31,10 @@ use crate::probability::{
     standard_normal_quantile,
 };
 use crate::smooth::{
-    ExactJointHyperSetup, SmoothBasisSpec, SpatialLengthScaleOptimizationOptions,
-    SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec,
-    apply_spatial_anisotropy_pilot_initializer, build_term_collection_designs_and_freeze_joint,
-    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
+    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+    TermCollectionDesign, TermCollectionSpec, apply_spatial_anisotropy_pilot_initializer,
+    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
+    spatial_length_scale_term_indices,
 };
 use crate::types::{InverseLink, LinkFunction, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
@@ -5332,7 +5332,7 @@ struct BernoulliMarginalSlopeExactEvalCache {
     /// rank=32. Per-row, the five distinct components are axis-invariant,
     /// so caching them lets every pair contraction be a 16-multiply 2×2
     /// bilinear instead of a fresh 8-direction empirical jet.
-    rigid_fourth_full: OnceLock<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
+    rigid_fourth_full: crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
 }
 
 // ── RowKernel<2> implementation (rigid path only) ────────────────────
@@ -18266,6 +18266,24 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let data_view = data;
     validate_spec(data_view, &spec)?;
     let mut effective_kappa_options = kappa_options.clone();
+    // Honor explicit `length_scale=X` in the user's formula: when every
+    // spatial term in BOTH the marginal mean and log-slope blocks carries
+    // a user-supplied scalar length scale and no per-axis anisotropy is
+    // requested, there is nothing for the joint-spatial outer optimizer
+    // to do. Routing through it anyway spends ~80 outer ARC iters stalled
+    // at the user's chosen ρ (the n-block ARC's first proposed step lands
+    // at the box corner and never recovers), then falls through to the
+    // ρ-only "custom family" path which is what we wanted all along.
+    // Short-circuit straight to the ρ-only path.
+    let kappa_locked_marginal = crate::smooth::all_spatial_terms_kappa_fixed(&spec.marginalspec);
+    let kappa_locked_logslope = crate::smooth::all_spatial_terms_kappa_fixed(&spec.logslopespec);
+    if effective_kappa_options.enabled && kappa_locked_marginal && kappa_locked_logslope {
+        log::info!(
+            "[BMS spatial] disabling κ/ψ optimization: every spatial term has an \
+             explicit length_scale and no anisotropy; user-supplied kernel scale is fixed"
+        );
+        effective_kappa_options.enabled = false;
+    }
     let flex_spatial_scale_path = (spec.score_warp.is_some() || spec.link_dev.is_some())
         && spec.y.len() >= BMS_FLEX_OUTER_HESSIAN_ROW_LIMIT
         && effective_kappa_options.enabled;
