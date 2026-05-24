@@ -70,8 +70,9 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
     assert_eq!(cov.ncols(), fit.beta.len());
     assert!(cov.iter().all(|v: &f64| v.is_finite()));
     let p = fit.beta.len();
-    assert!(fit.dispersion().is_estimated());
-    let phi = fit.dispersion().variance_scale();
+    let dispersion = fit.dispersion().expect("dispersion should be stored");
+    assert!(dispersion.is_estimated());
+    let phi = dispersion.variance_scale();
     assert!(phi.is_finite() && phi > 0.0);
 
     let fmat = fit
@@ -98,7 +99,7 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
     let mut ve_expected = h_inv.dot(&xtwx).dot(&h_inv);
     ve_expected.mapv_inplace(|v| v * phi);
     let ve = fit
-        .ve()
+        .ve_covariance()
         .expect("frequentist covariance should be stored when full covariance is available");
     let max_ve_diff = ve
         .iter()
