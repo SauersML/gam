@@ -1,7 +1,18 @@
-//! Phase-specific GPU backend placeholder.
-//!
-//! The public marker keeps the HAL surface explicit while the default build and
-//! unsupported CUDA configurations use CPU fallback through dispatch policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GraphMode {
+    Auto,
+    Off,
+    Force,
+}
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BackendPhaseMarker;
+#[derive(Clone, Debug, Default)]
+pub struct CudaGraphCache {
+    pub captured_iterations: usize,
+    pub stable_shape: Option<(usize, usize)>,
+}
+
+impl CudaGraphCache {
+    pub fn should_capture_after_iteration(&self, iter: usize) -> bool {
+        iter >= 2 && self.stable_shape.is_some()
+    }
+}
