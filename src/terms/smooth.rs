@@ -14715,6 +14715,10 @@ struct SingleBlockLatentCoordDesignCache {
     analytic_penalties: Option<std::sync::Arc<crate::terms::AnalyticPenaltyRegistry>>,
     analytic_rho_count: usize,
     design_revision: u64,
+    // Stamp the outer-iter the cached cost/eval was computed under; analytic
+    // penalty weight schedules advance with this counter, so a stale stamp
+    // invalidates the memo even at unchanged θ.
+    last_outer_iter: Option<u64>,
 }
 
 impl SingleBlockLatentCoordDesignCache {
@@ -14775,6 +14779,7 @@ impl SingleBlockLatentCoordDesignCache {
             analytic_penalties: latent.analytic_penalties.clone(),
             analytic_rho_count,
             design_revision: 0,
+            last_outer_iter: None,
         })
     }
 
@@ -15053,6 +15058,7 @@ impl SingleBlockLatentCoordDesignCache {
         self.current_theta = Some(theta.clone());
         self.last_cost = None;
         self.last_eval = None;
+        self.last_outer_iter = None;
         if !latent_values_changed && self.current_design_cache_id != Some(lookup.cached.id) {
             self.design_revision = self.design_revision.wrapping_add(1);
         }
@@ -15065,6 +15071,8 @@ impl SingleBlockLatentCoordDesignCache {
             .current_theta
             .as_ref()
             .is_some_and(|cached| theta_values_match(cached, theta))
+            && self.last_outer_iter
+                == Some(crate::solver::estimate::reml::runtime::current_outer_iter())
         {
             self.last_eval
                 .as_ref()
@@ -15087,6 +15095,8 @@ impl SingleBlockLatentCoordDesignCache {
             .current_theta
             .as_ref()
             .is_some_and(|cached| theta_values_match(cached, theta))
+            && self.last_outer_iter
+                == Some(crate::solver::estimate::reml::runtime::current_outer_iter())
         {
             self.last_eval.clone()
         } else {
@@ -15104,10 +15114,14 @@ impl SingleBlockLatentCoordDesignCache {
     ) {
         self.last_cost = Some(eval.0);
         self.last_eval = Some(eval);
+        self.last_outer_iter =
+            Some(crate::solver::estimate::reml::runtime::current_outer_iter());
     }
 
     fn store_cost(&mut self, cost: f64) {
         self.last_cost = Some(cost);
+        self.last_outer_iter =
+            Some(crate::solver::estimate::reml::runtime::current_outer_iter());
     }
 
     fn reset(&mut self) {
@@ -15118,6 +15132,7 @@ impl SingleBlockLatentCoordDesignCache {
         self.latent_design_cache.invalidate();
         self.last_cost = None;
         self.last_eval = None;
+        self.last_outer_iter = None;
     }
 }
 
