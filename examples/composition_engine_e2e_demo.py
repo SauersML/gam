@@ -3,9 +3,9 @@
 
 Shows: latents= + manifold="circle" + Fisher-Rao W + ARD identifiability.
 Proposal references:
-* /Users/user/gam/proposals/composition_engine.md
-* /Users/user/gam/proposals/latent_coord.md
-* /Users/user/gam/proposals/sae_manifold.md
+* proposals/composition_engine.md
+* proposals/latent_coord.md
+* proposals/sae_manifold.md
 
 API gap: current formula ``gamfit.fit`` may not expose ``fisher_w``. If so,
 the demo uses the low-level Fisher hook and applies circle retraction in Python.
