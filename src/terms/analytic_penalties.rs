@@ -220,16 +220,16 @@ impl ScalarWeightSchedule {
                 self.w_end
             ));
         }
-        match self.kind {
+        match &self.kind {
             ScheduleKind::Geometric { rate } => {
-                if !(rate.is_finite() && rate > 0.0 && rate < 1.0) {
+                if !(rate.is_finite() && *rate > 0.0 && *rate < 1.0) {
                     return Err(format!(
                         "ScalarWeightSchedule::Geometric: rate must be in (0, 1); got {rate}"
                     ));
                 }
             }
             ScheduleKind::Linear { steps } => {
-                if steps == 0 {
+                if *steps == 0 {
                     return Err("ScalarWeightSchedule::Linear: steps must be positive".into());
                 }
             }
@@ -240,13 +240,13 @@ impl ScalarWeightSchedule {
 
     pub fn current_weight(&self, iter: usize) -> f64 {
         let delta = self.w_end - self.w_start;
-        let raw = match self.kind {
+        let raw = match &self.kind {
             ScheduleKind::Geometric { rate } => self.w_end - delta * rate.powf(iter as f64),
             ScheduleKind::Linear { steps } => {
-                if iter >= steps {
+                if iter >= *steps {
                     self.w_end
                 } else {
-                    let frac = iter as f64 / steps as f64;
+                    let frac = iter as f64 / *steps as f64;
                     self.w_start + frac * delta
                 }
             }
