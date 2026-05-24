@@ -222,7 +222,7 @@ impl Default for RhoPrior {
 // distribution selector that carries the per-family scalars
 // (`Tweedie { p }`, `NegativeBinomial { theta }`, `Beta { phi }`); `InverseLink`
 // is the parameterized inverse-link selector. Splitting (response, link)
-// removes the drift bug that the flat legacy `LikelihoodFamily` enum allowed
+// removes the drift bug that the former flat likelihood enum allowed
 // when its variant disagreed with a separately-stored `InverseLink`.
 
 /// Pure response distribution selector — no link information.
@@ -258,7 +258,7 @@ impl ResponseFamily {
 ///
 /// `ResponseFamily` carries the per-family scalars (Tweedie p, NegBin theta,
 /// Beta phi); `InverseLink` carries the parameterized link state. Together
-/// they replace the flat legacy `LikelihoodFamily` enum.
+/// they replace the former flat likelihood enum.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LikelihoodSpec {
     pub response: ResponseFamily,
@@ -331,7 +331,7 @@ impl LikelihoodSpec {
         }
     }
 
-    /// Map this `LikelihoodSpec` back to the flat `LikelihoodFamily` enum
+    /// Map this `LikelihoodSpec` back to the flat the flat likelihood enum enum
     /// still consumed by the lower-level fit/sampling engines. The mapping is
     /// total because every `(response, link)` combination corresponds to
     /// exactly one legacy variant.
@@ -374,7 +374,7 @@ impl LikelihoodSpec {
         self.as_likelihood_family().name()
     }
 
-    /// Build a `LikelihoodSpec` from a non-parameterized `LikelihoodFamily`
+    /// Build a `LikelihoodSpec` from a non-parameterized the flat likelihood enum
     /// variant. Returns `None` for the parameterized binomial variants
     /// (`Sas`, `BetaLogistic`, `Mixture`, `LatentCLogLog`) whose new
     /// `InverseLink` form carries extra state that must be sourced from the
@@ -640,74 +640,50 @@ pub enum LogLikelihoodNormalization {
     UserProvided,
 }
 
-/// Explicit GLM likelihood specification: family plus scale semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// Explicit GLM likelihood specification: response/link spec plus scale semantics.
+///
+/// `spec` is the canonical `(ResponseFamily, InverseLink)` selector. `scale`
+/// records how the scale parameter is handled (profiled Gaussian sigma, fixed
+/// dispersion, fixed/estimated Gamma shape). The Gamma shape is mutated in
+/// place during PIRLS via `with_gamma_shape`; preserving that field on this
+/// struct is what lets the inner solver thread the estimated shape into
+/// deviance / log-likelihood / weight evaluation without a separate side
+/// channel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GlmLikelihoodSpec {
-    pub family: GlmFamily,
+    pub spec: LikelihoodSpec,
     pub scale: LikelihoodScaleMetadata,
 }
 
 impl GlmLikelihoodSpec {
+    /// Build a `GlmLikelihoodSpec` from a `LikelihoodSpec`, deriving the
+    /// canonical default scale metadata for the response family.
     #[inline]
-    pub const fn canonical(family: GlmFamily) -> Self {
-        let scale = match family {
-            GlmFamily::GaussianIdentity => LikelihoodScaleMetadata::ProfiledGaussian,
-            GlmFamily::GammaLog => {
-                LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 }
-            }
-            GlmFamily::BinomialLogit
-            | GlmFamily::BinomialProbit
-            | GlmFamily::BinomialCLogLog
-            | GlmFamily::BinomialSas
-            | GlmFamily::BinomialBetaLogistic
-            | GlmFamily::BinomialMixture
-            | GlmFamily::Tweedie { .. }
-            | GlmFamily::NegativeBinomial { .. }
-            | GlmFamily::BetaLogit { .. }
-            | GlmFamily::PoissonLog => {
-                LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 }
-            }
-        };
-        Self { family, scale }
+    pub fn canonical(spec: LikelihoodSpec) -> Self {
+        let scale = spec.default_scale_metadata();
+        Self { spec, scale }
     }
 
     #[inline]
-    pub const fn link_function(self) -> LinkFunction {
-        self.family.link_function()
+    pub fn link_function(&self) -> LinkFunction {
+        self.spec.link_function()
     }
 
     #[inline]
-    pub const fn response_family(self) -> LikelihoodFamily {
-        match self.family {
-            GlmFamily::GaussianIdentity => LikelihoodFamily::GaussianIdentity,
-            GlmFamily::BinomialLogit => LikelihoodFamily::BinomialLogit,
-            GlmFamily::BinomialProbit => LikelihoodFamily::BinomialProbit,
-            GlmFamily::BinomialCLogLog => LikelihoodFamily::BinomialCLogLog,
-            GlmFamily::BinomialSas => LikelihoodFamily::BinomialSas,
-            GlmFamily::BinomialBetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
-            GlmFamily::BinomialMixture => LikelihoodFamily::BinomialMixture,
-            GlmFamily::PoissonLog => LikelihoodFamily::PoissonLog,
-            GlmFamily::Tweedie { p } => LikelihoodFamily::Tweedie { p },
-            GlmFamily::NegativeBinomial { theta } => {
-                LikelihoodFamily::NegativeBinomial { theta }
-            }
-            GlmFamily::BetaLogit { phi } => LikelihoodFamily::BetaLogit { phi },
-            GlmFamily::GammaLog => LikelihoodFamily::GammaLog,
-        }
-    }
-
-    #[inline]
-    pub const fn fixed_phi(self) -> Option<f64> {
+    pub fn fixed_phi(&self) -> Option<f64> {
         self.scale.fixed_phi()
     }
 
     #[inline]
-    pub const fn gamma_shape(self) -> Option<f64> {
+    pub fn gamma_shape(&self) -> Option<f64> {
         self.scale.gamma_shape()
     }
 
+    /// Mutate the Gamma shape parameter in place while preserving the rest of
+    /// the spec. The shape only takes effect for Gamma families; for other
+    /// families the scale metadata is left untouched.
     #[inline]
-    pub const fn with_gamma_shape(mut self, shape: f64) -> Self {
+    pub fn with_gamma_shape(mut self, shape: f64) -> Self {
         self.scale = match self.scale {
             LikelihoodScaleMetadata::FixedGammaShape { .. } => {
                 LikelihoodScaleMetadata::FixedGammaShape { shape }
@@ -715,62 +691,14 @@ impl GlmLikelihoodSpec {
             LikelihoodScaleMetadata::EstimatedGammaShape { .. } => {
                 LikelihoodScaleMetadata::EstimatedGammaShape { shape }
             }
-            other => match self.family {
-                GlmFamily::GammaLog => {
+            other => match &self.spec.response {
+                ResponseFamily::Gamma => {
                     LikelihoodScaleMetadata::EstimatedGammaShape { shape }
                 }
                 _ => other,
             },
         };
         self
-    }
-}
-
-impl TryFrom<LikelihoodFamily> for GlmFamily {
-    type Error = &'static str;
-
-    fn try_from(value: LikelihoodFamily) -> Result<Self, Self::Error> {
-        match value {
-            LikelihoodFamily::GaussianIdentity => Ok(Self::GaussianIdentity),
-            LikelihoodFamily::BinomialLogit => Ok(Self::BinomialLogit),
-            LikelihoodFamily::BinomialProbit => Ok(Self::BinomialProbit),
-            LikelihoodFamily::BinomialCLogLog | LikelihoodFamily::BinomialLatentCLogLog => {
-                Ok(Self::BinomialCLogLog)
-            }
-            LikelihoodFamily::BinomialSas => Ok(Self::BinomialSas),
-            LikelihoodFamily::BinomialBetaLogistic => Ok(Self::BinomialBetaLogistic),
-            LikelihoodFamily::BinomialMixture => Ok(Self::BinomialMixture),
-            LikelihoodFamily::PoissonLog => Ok(Self::PoissonLog),
-            LikelihoodFamily::Tweedie { p } if is_valid_tweedie_power(p) => Ok(Self::Tweedie { p }),
-            LikelihoodFamily::Tweedie { .. } => Err(
-                "Tweedie variance power must be finite and strictly between 1 and 2; use PoissonLog or GammaLog for boundary cases",
-            ),
-            LikelihoodFamily::NegativeBinomial { theta } => Ok(Self::NegativeBinomial { theta }),
-            LikelihoodFamily::BetaLogit { phi } => Ok(Self::BetaLogit { phi }),
-            LikelihoodFamily::GammaLog => Ok(Self::GammaLog),
-            LikelihoodFamily::RoystonParmar => {
-                Err("RoystonParmar is survival-specific and not a GLM likelihood")
-            }
-        }
-    }
-}
-
-impl From<GlmFamily> for LikelihoodFamily {
-    fn from(value: GlmFamily) -> Self {
-        match value {
-            GlmFamily::GaussianIdentity => Self::GaussianIdentity,
-            GlmFamily::BinomialLogit => Self::BinomialLogit,
-            GlmFamily::BinomialProbit => Self::BinomialProbit,
-            GlmFamily::BinomialCLogLog => Self::BinomialCLogLog,
-            GlmFamily::BinomialSas => Self::BinomialSas,
-            GlmFamily::BinomialBetaLogistic => Self::BinomialBetaLogistic,
-            GlmFamily::BinomialMixture => Self::BinomialMixture,
-            GlmFamily::PoissonLog => Self::PoissonLog,
-            GlmFamily::Tweedie { p } => Self::Tweedie { p },
-            GlmFamily::NegativeBinomial { theta } => Self::NegativeBinomial { theta },
-            GlmFamily::BetaLogit { phi } => Self::BetaLogit { phi },
-            GlmFamily::GammaLog => Self::GammaLog,
-        }
     }
 }
 
