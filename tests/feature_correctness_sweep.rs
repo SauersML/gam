@@ -7,13 +7,13 @@
 
 use gam::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-    BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, CenterStrategy, SphereMethod,
-    SphericalSplineBasisSpec, build_bspline_basis_1d, build_spherical_spline_basis,
-    create_cyclic_difference_penalty_matrix, create_periodic_bspline_basis_dense,
-    create_periodic_bspline_derivative_dense, evaluate_bspline_derivative_scalar,
-    spherical_wahba_kernel_matrix,
+    BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, CenterStrategy,
+    OneDimensionalBoundary, PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec,
+    build_bspline_basis_1d, build_periodic_bspline_basis_1d, build_spherical_spline_basis,
+    create_cyclic_difference_penalty_matrix, evaluate_bspline_derivative_scalar,
+    periodic_bspline_first_derivative_nd, spherical_wahba_kernel_matrix,
 };
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use std::f64::consts::{PI, TAU};
 
 // ----- helpers -----
@@ -24,6 +24,34 @@ fn near(a: f64, b: f64, eps: f64) -> bool {
 
 fn make_uniform_loop(n: usize, period: f64) -> Array1<f64> {
     Array1::from_iter((0..n).map(|i| (i as f64) / (n as f64) * period))
+}
+
+fn periodic_basis_dense(
+    x: ArrayView1<'_, f64>,
+    data_range: (f64, f64),
+    degree: usize,
+    num_basis: usize,
+) -> Result<Array2<f64>, gam::basis::BasisError> {
+    let spec = PeriodicBSplineBasisSpec::new(
+        degree,
+        num_basis,
+        data_range.1 - data_range.0,
+        data_range.0,
+        2,
+    );
+    build_periodic_bspline_basis_1d(x, &spec)
+}
+
+fn periodic_derivative_dense(
+    x: ArrayView1<'_, f64>,
+    data_range: (f64, f64),
+    degree: usize,
+    num_basis: usize,
+) -> Result<Array2<f64>, gam::basis::BasisError> {
+    let t = x.to_owned().insert_axis(Axis(1));
+    Ok(periodic_bspline_first_derivative_nd(t.view(), data_range, degree, num_basis)?
+        .index_axis(Axis(2), 0)
+        .to_owned())
 }
 
 fn random_lat_lon(n: usize, seed: u64) -> Array2<f64> {
@@ -56,7 +84,7 @@ fn periodic_bspline_partition_of_unity_across_periods_and_k() {
         for &k in &[4usize, 6, 8, 12, 24, 48] {
             let n = 200;
             let xs = make_uniform_loop(n, period);
-            let basis = create_periodic_bspline_basis_dense(xs.view(), (0.0, period), 3, k)
+            let basis = periodic_basis_dense(xs.view(), (0.0, period), 3, k)
                 .unwrap_or_else(|e| panic!("period={period} k={k}: {e}"));
             assert_eq!(basis.ncols(), k, "period={period} k={k}");
             for i in 0..n {
@@ -72,7 +100,7 @@ fn periodic_bspline_evaluates_seam_exactly() {
     for &k in &[4usize, 8, 16] {
         let period = TAU;
         let pts = ndarray::array![0.0, period, 0.5 * period, 1.5 * period, -0.25 * period];
-        let basis = create_periodic_bspline_basis_dense(pts.view(), (0.0, period), 3, k).unwrap();
+        let basis = periodic_basis_dense(pts.view(), (0.0, period), 3, k).unwrap();
         // 0 and period should give identical rows
         for j in 0..k {
             assert!(
@@ -83,7 +111,7 @@ fn periodic_bspline_evaluates_seam_exactly() {
         // 0.5 period == 0.5 period (trivially)
         // -0.25 period == 0.75 period
         let pts2 = ndarray::array![0.75 * period];
-        let basis2 = create_periodic_bspline_basis_dense(pts2.view(), (0.0, period), 3, k).unwrap();
+        let basis2 = periodic_basis_dense(pts2.view(), (0.0, period), 3, k).unwrap();
         for j in 0..k {
             assert!(
                 near(basis[(4, j)], basis2[(0, j)], 1e-12),
@@ -99,7 +127,7 @@ fn periodic_bspline_for_all_supported_degrees() {
         let period = TAU;
         let k = (degree + 1).max(4);
         let xs = make_uniform_loop(50, period);
-        let basis = create_periodic_bspline_basis_dense(xs.view(), (0.0, period), degree, k)
+        let basis = periodic_basis_dense(xs.view(), (0.0, period), degree, k)
             .unwrap_or_else(|e| panic!("degree={degree} k={k}: {e}"));
         for i in 0..xs.len() {
             assert!(
@@ -114,27 +142,27 @@ fn periodic_bspline_for_all_supported_degrees() {
 fn periodic_bspline_rejects_too_few_basis() {
     // degree+1 is the minimum; degree=3, k=3 should fail
     let xs = make_uniform_loop(10, TAU);
-    let err = create_periodic_bspline_basis_dense(xs.view(), (0.0, TAU), 3, 3);
+    let err = periodic_basis_dense(xs.view(), (0.0, TAU), 3, 3);
     assert!(err.is_err(), "expected error for k < degree+1");
 }
 
 #[test]
 fn periodic_bspline_rejects_nonfinite_data() {
     let xs = ndarray::array![0.0, 1.0, f64::NAN, 2.0];
-    let err = create_periodic_bspline_basis_dense(xs.view(), (0.0, TAU), 3, 8);
+    let err = periodic_basis_dense(xs.view(), (0.0, TAU), 3, 8);
     assert!(err.is_err(), "expected error for NaN input");
 
     let xs = ndarray::array![0.0, 1.0, f64::INFINITY, 2.0];
-    let err = create_periodic_bspline_basis_dense(xs.view(), (0.0, TAU), 3, 8);
+    let err = periodic_basis_dense(xs.view(), (0.0, TAU), 3, 8);
     assert!(err.is_err(), "expected error for inf input");
 }
 
 #[test]
 fn periodic_bspline_rejects_invalid_range() {
     let xs = ndarray::array![0.0, 1.0, 2.0];
-    let err = create_periodic_bspline_basis_dense(xs.view(), (0.0, 0.0), 3, 8);
+    let err = periodic_basis_dense(xs.view(), (0.0, 0.0), 3, 8);
     assert!(err.is_err(), "expected error for zero-width range");
-    let err = create_periodic_bspline_basis_dense(xs.view(), (1.0, 0.0), 3, 8);
+    let err = periodic_basis_dense(xs.view(), (1.0, 0.0), 3, 8);
     assert!(err.is_err(), "expected error for inverted range");
 }
 
@@ -166,7 +194,7 @@ fn periodic_bspline_derivative_preserves_analytic_periodic_invariants() {
     let k = 12;
     let degree = 3;
     let xs = ndarray::array![0.0, 0.5, 1.7, 3.0, 4.2, 5.5, period];
-    let d = create_periodic_bspline_derivative_dense(xs.view(), (0.0, period), degree, k).unwrap();
+    let d = periodic_derivative_dense(xs.view(), (0.0, period), degree, k).unwrap();
 
     for (i, row) in d.outer_iter().enumerate() {
         let row_sum = row.iter().sum::<f64>();
@@ -186,8 +214,7 @@ fn periodic_bspline_derivative_preserves_analytic_periodic_invariants() {
     }
 
     let shifted = &xs + period;
-    let d_shifted =
-        create_periodic_bspline_derivative_dense(shifted.view(), (0.0, period), degree, k).unwrap();
+    let d_shifted = periodic_derivative_dense(shifted.view(), (0.0, period), degree, k).unwrap();
     for i in 0..xs.len() {
         for j in 0..k {
             assert!(
@@ -218,6 +245,7 @@ fn build_bc(
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
+        boundary: OneDimensionalBoundary::Open,
         boundary_conditions: BSplineBoundaryConditions {
             left: bc_left,
             right: bc_right,
@@ -251,6 +279,7 @@ fn bc_bspline_anchored_at_left_vanishes_at_x_zero() {
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
+        boundary: OneDimensionalBoundary::Open,
         boundary_conditions: BSplineBoundaryConditions {
             left: Anchored { value: 0.0 },
             right: Free,
@@ -281,6 +310,7 @@ fn bc_bspline_clamped_at_right_has_zero_derivative_at_x_one() {
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
+        boundary: OneDimensionalBoundary::Open,
         boundary_conditions: BSplineBoundaryConditions {
             left: Free,
             right: Clamped,
@@ -495,7 +525,6 @@ fn build_harmonic(
         method: SphereMethod::Harmonic,
         max_degree: Some(l),
         wahba_kernel: Default::default(),
-        streaming_chunk_size: None,
     };
     build_spherical_spline_basis(data, &spec)
 }
@@ -631,7 +660,6 @@ fn sphere_harmonic_rejects_l_zero_and_too_large() {
         method: SphereMethod::Harmonic,
         max_degree: Some(0),
         wahba_kernel: Default::default(),
-        streaming_chunk_size: None,
     };
     let r = build_spherical_spline_basis(pts.view(), &spec);
     assert!(r.is_err(), "L=0 should be rejected");
@@ -644,7 +672,6 @@ fn sphere_harmonic_rejects_l_zero_and_too_large() {
         method: SphereMethod::Harmonic,
         max_degree: Some(33),
         wahba_kernel: Default::default(),
-        streaming_chunk_size: None,
     };
     let r = build_spherical_spline_basis(pts.view(), &spec);
     assert!(r.is_err(), "L>32 should be rejected");
@@ -708,7 +735,6 @@ fn both_sphere_methods_give_rotation_invariant_smoothers() {
             method,
             max_degree: Some(4),
             wahba_kernel: Default::default(),
-            streaming_chunk_size: None,
         };
         let spec_b = SphericalSplineBasisSpec {
             center_strategy: CenterStrategy::UserProvided(rot.clone()),
@@ -718,7 +744,6 @@ fn both_sphere_methods_give_rotation_invariant_smoothers() {
             method,
             max_degree: Some(4),
             wahba_kernel: Default::default(),
-            streaming_chunk_size: None,
         };
         let a = build_spherical_spline_basis(pts.view(), &spec_a).unwrap();
         let b = build_spherical_spline_basis(rot.view(), &spec_b).unwrap();
