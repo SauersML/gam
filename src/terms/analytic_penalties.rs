@@ -103,6 +103,7 @@ use crate::terms::basis::{
     duchon_radial_second_derivative_nd, duchon_radial_third_derivative_nd,
 };
 use crate::terms::penalty_op::PenaltyOp;
+use crate::terms::sae_manifold::ScheduleKind;
 use crate::terms::smooth::BlockwisePenalty;
 
 // ---------------------------------------------------------------------------
@@ -173,6 +174,94 @@ fn logistic(x: f64) -> f64 {
     }
 }
 
+/// Scalar annealing schedule for analytic penalty weights.
+///
+/// This is the penalty-weight analogue of [`crate::terms::sae_manifold::GumbelTemperatureSchedule`]:
+/// it starts with a weak analytic regularizer and ramps toward the target
+/// weight during REML outer iterations. This follows the standard annealed
+/// regularization pattern in deep learning, where optimization first finds
+/// good fits before stronger structure constrains the solution. It also
+/// addresses the auto_exp_30-37 finding that hand-picked analytic weights
+/// materially affect outcomes: auto_exp_30 preferred `w_ortho = 0`, while
+/// auto_exp_33's fixed tight `sigma_aux = 0.5` beat the learned-weight
+/// auto_exp_34 result (`R²(hue)=0.70` versus `0.62`). A schedule side-steps
+/// that brittle initial choice by ramping the constraint.
+#[derive(Debug, Clone)]
+pub struct ScalarWeightSchedule {
+    pub w_start: f64,
+    pub w_end: f64,
+    pub kind: ScheduleKind,
+    pub iter_count: usize,
+}
+
+impl ScalarWeightSchedule {
+    #[must_use = "build error must be handled"]
+    pub fn new(w_start: f64, w_end: f64, kind: ScheduleKind) -> Result<Self, String> {
+        let schedule = Self {
+            w_start,
+            w_end,
+            kind,
+            iter_count: 0,
+        };
+        schedule.validate()?;
+        Ok(schedule)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !(self.w_start.is_finite() && self.w_start >= 0.0) {
+            return Err(format!(
+                "ScalarWeightSchedule: w_start must be finite and non-negative; got {}",
+                self.w_start
+            ));
+        }
+        if !(self.w_end.is_finite() && self.w_end >= 0.0) {
+            return Err(format!(
+                "ScalarWeightSchedule: w_end must be finite and non-negative; got {}",
+                self.w_end
+            ));
+        }
+        match self.kind {
+            ScheduleKind::Geometric { rate } => {
+                if !(rate.is_finite() && rate > 0.0 && rate < 1.0) {
+                    return Err(format!(
+                        "ScalarWeightSchedule::Geometric: rate must be in (0, 1); got {rate}"
+                    ));
+                }
+            }
+            ScheduleKind::Linear { steps } => {
+                if steps == 0 {
+                    return Err("ScalarWeightSchedule::Linear: steps must be positive".into());
+                }
+            }
+            ScheduleKind::ReciprocalIter => {}
+        }
+        Ok(())
+    }
+
+    pub fn current_weight(&self, iter: usize) -> f64 {
+        let delta = self.w_end - self.w_start;
+        let raw = match self.kind {
+            ScheduleKind::Geometric { rate } => self.w_end - delta * rate.powf(iter as f64),
+            ScheduleKind::Linear { steps } => {
+                if iter >= steps {
+                    self.w_end
+                } else {
+                    let frac = iter as f64 / steps as f64;
+                    self.w_start + frac * delta
+                }
+            }
+            ScheduleKind::ReciprocalIter => self.w_end - delta / (1.0 + iter as f64),
+        };
+        raw.clamp(self.w_start.min(self.w_end), self.w_start.max(self.w_end))
+    }
+
+    pub fn step(&mut self) -> f64 {
+        let weight = self.current_weight(self.iter_count);
+        self.iter_count += 1;
+        weight
+    }
+}
+
 /// Uniform interface implemented by every analytic penalty in this module.
 ///
 /// `target` is the relevant slice of the β or extension-coordinate vector, viewed as
@@ -238,6 +327,10 @@ pub trait AnalyticPenalty: Send + Sync {
 
     /// Human-readable identifier for diagnostics / logging.
     fn name(&self) -> &str;
+
+    /// Update any attached scalar weight schedule at the given REML outer
+    /// iteration. Penalties without schedules keep their stored weight.
+    fn apply_schedule(&mut self, _iter: usize) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -449,6 +542,8 @@ pub struct IsometryPenalty {
     /// memory and FLOPs scaling at `O(p · r · d)` per row instead of
     /// `O(p²)` per row.
     pub weight: WeightField,
+    pub scalar_weight: f64,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
 struct IsometryHvpState<'a> {
@@ -477,6 +572,8 @@ impl IsometryPenalty {
             cache_third_decoder_derivative: None,
             p_out,
             weight: WeightField::Identity,
+            scalar_weight: 1.0,
+            weight_schedule: None,
         }
     }
 
@@ -530,6 +627,13 @@ impl IsometryPenalty {
     #[must_use]
     pub fn with_weight(mut self, weight: WeightField) -> Self {
         self.weight = weight;
+        self
+    }
+
+    #[must_use]
+    pub fn with_weight_schedule(mut self, schedule: ScalarWeightSchedule) -> Self {
+        self.scalar_weight = schedule.current_weight(schedule.iter_count);
+        self.weight_schedule = Some(schedule);
         self
     }
 
@@ -911,7 +1015,7 @@ impl IsometryPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        let mu = rho[self.rho_index].exp();
+        let mu = self.scalar_weight * rho[self.rho_index].exp();
         let d = state.d;
         let n_obs = state.n_obs;
         let p = state.p;
@@ -1079,7 +1183,7 @@ impl AnalyticPenalty for IsometryPenalty {
             return Self::DEFAULT_VALUE_ON_MISSING_CACHE;
         };
         let g_ref = self.reference_metric(n_obs, d);
-        let mu = rho[self.rho_index].exp();
+        let mu = self.scalar_weight * rho[self.rho_index].exp();
         let mut acc = 0.0;
         for n in 0..n_obs {
             for k in 0..(d * d) {
@@ -1122,7 +1226,7 @@ impl AnalyticPenalty for IsometryPenalty {
         };
         let g_ref = self.reference_metric(n_obs, d);
         let p = self.p_out;
-        let mu = rho[self.rho_index].exp();
+        let mu = self.scalar_weight * rho[self.rho_index].exp();
         let mut grad = Array1::<f64>::zeros(target.len());
         let Some(jac2) = self.jacobian_second(target, n_obs, d) else {
             return grad;
