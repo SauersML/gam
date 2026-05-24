@@ -3,7 +3,6 @@
 Status: draft RFC
 Audience: gamfit maintainers
 Companion proposals: `composition_engine.md` (three-tier engine), `latent_coord.md` (per-row latent field)
-Companion empirical work: `/Users/user/Manifold-SAE` (Curve-SAE benchmark)
 
 ## 1. Premise
 
@@ -326,24 +325,7 @@ all included and gauges are pinned, the manifold side's Occam load
 grows sublinearly in `K_required` while the linear side's grows
 linearly. That motivates — but does not prove — a crossover beyond
 some `K_required`. Sign and threshold depend on `p`, `d_C`, the
-normalisation choices, and the realised decoder complexity. The
-empirical hook in §5.4 is what currently carries the load.
-
-### 5.4 Empirical hook
-
-This is not just an algebraic argument. The
-`/Users/user/Manifold-SAE` Curve-SAE benchmark already realises a
-prototype of this on synthetic data:
-
-> On pure-curve data (D=256, 16 GT smooth curves, 32 positions each,
-> 30K samples): per-active-atom, the curve SAE is ≈3.7× more
-> efficient than vanilla TopK SAE, with 4× fewer features needed for
-> matched MSE, and zero dead atoms. (Source: project memory
-> `project_curve_sae_efficiency.md`.)
-
-That prototype is hand-rolled; the proposal here is the gamfit-native
-re-expression of the same finding, with REML doing the work that the
-manual Curve-SAE benchmark left to grid search.
+normalisation choices, and the realised decoder complexity.
 
 ## 6. API sketch
 
@@ -549,14 +531,8 @@ original optimistic draft. Tightened claims:
   favour the manifold beyond some `K_required` *given* proper prior
   normalisation, fixed model families, controlled gauge, comparable
   fit, and smooth-decoder effective dim growing slower than the
-  required linear-shard count. The empirical Curve-SAE 3.7×
-  efficiency result (§5.4) is now the load-bearing argument; the
-  theoretical sketch motivates rather than proves.
+  required linear-shard count.
 - **§8 identifiability minimum open question.** ARD removed from the
   list of acceptable standalone gauge fixes; explicit recommendation
   added that `IsometryToReference` per atom or an aux-conditional
   prior be required whenever `d_k > 0`.
-
-Source: math-audit findings summarised in
-`/Users/user/.claude/projects/-Users-user-Manifold-SAE/memory/project_gamfit_composition_engine.md`
-(section "Math-audit findings").
