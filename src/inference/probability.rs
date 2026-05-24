@@ -50,7 +50,7 @@ pub fn erfcx_nonnegative(x: f64) -> f64 {
 /// Computes `log(1 - exp(-a))` for `a >= 0` without cancellation.
 #[inline]
 pub fn log1mexp_positive(a: f64) -> f64 {
-    assert!(a >= 0.0);
+    assert!(a >= 0.0, "log1mexp_positive requires a >= 0: a={a}");
     if a > core::f64::consts::LN_2 {
         (-(-a).exp()).ln_1p()
     } else if a > 0.0 {

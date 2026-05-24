@@ -1879,12 +1879,13 @@ impl<'a> RemlState<'a> {
             .par_for_each(|o, &d, &h, &c, &xy| *o = d * h - c * xy);
         let chunk_len = (n / (rayon::current_num_threads().saturating_mul(4).max(1)))
             .clamp(TK_BLOCK_SIZE, 2048);
-        let diag_chunks: Vec<usize> = (0..n).step_by(chunk_len).collect();
-        let mut p_total = diag_chunks
-            .par_iter()
+        let chunks = (n + chunk_len - 1) / chunk_len;
+        let mut p_total = (0..chunks)
+            .into_par_iter()
             .fold(
                 || Array2::<f64>::zeros((p, p)),
-                |mut local, &i0| {
+                |mut local, chunk_idx| {
+                    let i0 = chunk_idx * chunk_len;
                     let i1 = (i0 + chunk_len).min(n);
                     for i in i0..i1 {
                         let wi = diag_combined[i];
@@ -2927,7 +2928,7 @@ impl<'a> RemlState<'a> {
             self.sparse_exact_beta_original(pirls_result)
         } else if let Some(z) = free_basis_opt.as_ref() {
             z.t()
-                .dot(&pirls_result.beta_transformed.as_ref().to_owned())
+                .dot(pirls_result.beta_transformed.as_ref())
         } else {
             pirls_result.beta_transformed.as_ref().clone()
         };
@@ -7879,6 +7880,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
+        use std::borrow::Cow;
         use super::unified::{DenseSpectralOperator, PseudoLogdetMode};
 
         let pirls_result = bundle.pirls_result.as_ref();
@@ -7887,13 +7889,13 @@ impl<'a> RemlState<'a> {
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
         let (h_for_operator, e_for_logdet) = if let Some(z) = free_basis_opt.as_ref() {
             (
-                Self::projectwith_basis(bundle.h_total.as_ref(), z),
-                pirls_result.reparam_result.e_transformed.dot(z),
+                Cow::Owned(Self::projectwith_basis(bundle.h_total.as_ref(), z)),
+                Cow::Owned(pirls_result.reparam_result.e_transformed.dot(z)),
             )
         } else {
             (
-                bundle.h_total.as_ref().clone(),
-                pirls_result.reparam_result.e_transformed.clone(),
+                Cow::Borrowed(bundle.h_total.as_ref()),
+                Cow::Borrowed(&pirls_result.reparam_result.e_transformed),
             )
         };
 
@@ -7921,7 +7923,7 @@ impl<'a> RemlState<'a> {
         };
 
         let hessian_op = std::sync::Arc::new(
-            DenseSpectralOperator::from_symmetric_with_mode(&h_for_operator, hessian_mode)
+            DenseSpectralOperator::from_symmetric_with_mode(h_for_operator.as_ref(), hessian_mode)
                 .map_err(|e| {
                     EstimationError::InvalidInput(format!(
                         "DenseSpectralOperator from PIRLS Hessian: {e}"
@@ -7939,13 +7941,13 @@ impl<'a> RemlState<'a> {
         let needs_penalty_subspace = !uses_kron_penalty_logdet
             || (matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial);
         let penalty_subspace = if needs_penalty_subspace {
-            Some(self.compute_penalty_subspace(&e_for_logdet, ridge_passport)?)
+            Some(self.compute_penalty_subspace(e_for_logdet.as_ref(), ridge_passport)?)
         } else {
             None
         };
         let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
             rho,
-            &e_for_logdet,
+            e_for_logdet.as_ref(),
             &[],
             ridge_passport,
             penalty_subspace.as_ref(),
@@ -7954,7 +7956,7 @@ impl<'a> RemlState<'a> {
 
         let beta = if let Some(z) = free_basis_opt.as_ref() {
             z.t()
-                .dot(&pirls_result.beta_transformed.as_ref().to_owned())
+                .dot(pirls_result.beta_transformed.as_ref())
         } else {
             pirls_result.beta_transformed.as_ref().clone()
         };
@@ -8276,7 +8278,7 @@ impl<'a> RemlState<'a> {
                 })?,
         );
 
-        let e_for_logdet = pirls_result.reparam_result.e_transformed.clone();
+        let e_for_logdet = &pirls_result.reparam_result.e_transformed;
         let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
         let uses_kron_penalty_logdet = self
             .kronecker_penalty_system
@@ -8287,13 +8289,13 @@ impl<'a> RemlState<'a> {
         let needs_penalty_subspace = !uses_kron_penalty_logdet
             || (matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial);
         let penalty_subspace = if needs_penalty_subspace {
-            Some(self.compute_penalty_subspace(&e_for_logdet, ridge_passport)?)
+            Some(self.compute_penalty_subspace(e_for_logdet, ridge_passport)?)
         } else {
             None
         };
         let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
             rho,
-            &e_for_logdet,
+            e_for_logdet,
             &[],
             ridge_passport,
             penalty_subspace.as_ref(),

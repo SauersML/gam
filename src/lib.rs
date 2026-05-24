@@ -79,7 +79,7 @@ pub mod types;
 pub use data::{
     encode_recordswith_inferred_schema, load_csvwith_inferred_schema, load_csvwith_schema,
 };
-pub use gpu::{GpuDecision, GpuPolicy, GpuWorkloadKind, GpuWorkloadShape};
+pub use gpu::{GpuDecision, GpuPolicy};
 pub use inference::{
     alo, data, diagnostics, generative, hmc, predict, probability, quadrature, sample, smooth_test,
 };
@@ -100,7 +100,7 @@ pub use families::survival_location_scale;
 pub use families::survival_marginal_slope;
 pub use families::survival_predict;
 pub use families::transformation_normal;
-pub use gpu::{GpuDeviceInfo, gpu_available, selected_gpu_info};
+pub use gpu::GpuDeviceInfo;
 pub use solver::protocol::{
     LatentScoreSemantics, MarginalSlopeCalibrationProtocol, SurvivalMarginalSlopeProtocol,
 };
