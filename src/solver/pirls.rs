@@ -8394,11 +8394,6 @@ fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> {
         .map(DesignMatrix::from)
 }
 
-// When logit geometry enters hard-clamped or otherwise nonsmooth regions, keep
-// the statistical weight exact but freeze the higher eta-derivatives so PIRLS
-// and outer derivative code differentiate the same piecewise-smooth surface.
-const LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH: bool = true;
-
 #[inline]
 fn standard_inverse_link_jet(
     inverse_link: &InverseLink,
@@ -9247,7 +9242,7 @@ pub fn update_glmvectors(
                             y[i],
                             priorweights[i],
                             jet,
-                            LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH,
+                            true,
                         );
                         *mu_o = geom.mu;
                         *w_o = geom.weight;
@@ -9277,7 +9272,7 @@ pub fn update_glmvectors(
                         y[i],
                         priorweights[i],
                         jet,
-                        LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH,
+                        /* freeze higher η-derivatives on nonsmooth regions */ true,
                     );
                     *mu_o = geom.mu;
                     *w_o = geom.weight;
@@ -9293,8 +9288,10 @@ pub fn update_glmvectors(
         | LinkFunction::CLogLog
         | LinkFunction::Sas
         | LinkFunction::BetaLogistic => {
-            let zero_on_nonsmooth =
-                matches!(link, LinkFunction::Logit) && LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH;
+            // On logit geometry, freeze higher η-derivatives in nonsmooth
+            // regions so PIRLS and outer derivative code differentiate the
+            // same piecewise-smooth surface.
+            let zero_on_nonsmooth = matches!(link, LinkFunction::Logit);
             if let Some(derivs) = derivatives {
                 let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
                 let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
@@ -10040,8 +10037,10 @@ fn computeworkingweight_derivatives_from_eta(
         | GlmLikelihoodFamily::BinomialBetaLogistic
         | GlmLikelihoodFamily::BinomialMixture => {
             let link = inverse_link.link_function();
-            let zero_on_nonsmooth =
-                matches!(link, LinkFunction::Logit) && LOGIT_ZERO_HIGHER_DERIVATIVES_ON_NONSMOOTH;
+            // On logit geometry, freeze higher η-derivatives in nonsmooth
+            // regions so PIRLS and outer derivative code differentiate the
+            // same piecewise-smooth surface.
+            let zero_on_nonsmooth = matches!(link, LinkFunction::Logit);
             // Five independent per-row writes: same parallelization shape as
             // `update_glmvectors` above. Note the `jet.mu` argument is reused
             // here as the response (matching the original serial code) — this
