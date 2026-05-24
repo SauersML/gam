@@ -37,7 +37,9 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
   smoothed L¹ over feature groups.
 * `BlockOrthogonalityPenalty` lives on t. Penalizes only between-block
   cross-products, leaving each block internally free; this is the
-  auto_exp_38 supervised gauge-fix block plus free discovery block pattern.
+  supervised-block-plus-free-discovery-block pattern: an
+  auxiliary-supervised gauge-fix block pins one subspace while a free block
+  discovers the residual structure.
 * `AuxConditionalPriorPenalty` lives on t. Fixed-precomputed iVAE-style
   row-conditional precision, the auxiliary-supervised sibling to ARD/Ortho
   from `proposals/composition_engine.md` §4(c).
@@ -1157,9 +1159,10 @@ class BlockOrthogonalityPenalty:
 
     Penalizes ``0.5 * weight * sum_{g<h} ||T[:, G_g].T @ T[:, G_h]||²_F``
     while leaving each within-block Gram matrix unconstrained. This codifies
-    the ``auto_exp_38`` pattern: supervise one block via an auxiliary
-    conditional prior, leave a companion block free, and force the two blocks
-    to be orthogonal so the supervised gauge anchors the free axes.
+    the supervised-block-plus-free-discovery-block composition: supervise one
+    block via an auxiliary conditional prior, leave a companion block free,
+    and force the two blocks to be orthogonal so the supervised gauge anchors
+    the free axes.
 
     Parameters
     ----------

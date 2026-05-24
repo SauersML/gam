@@ -786,9 +786,8 @@ def _score_disagreement_warnings(
         ]
     return [
         "Topology score rankings differ across score kinds "
-        f"({detail}). See memory "
-        "`project_gumbel_anneal_population_sparsity_falsified`: BIC and REML "
-        "can disagree when candidate basis sizes differ wildly."
+        f"({detail}). BIC and REML can disagree when candidate basis sizes "
+        "differ wildly."
     ]
 
 

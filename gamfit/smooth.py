@@ -204,9 +204,9 @@ class Matern(Smooth):
 class Pca(Smooth):
     """Precomputed-PCA linear feature projection as a first-class smooth.
 
-    In every cogito experiment (auto_exp_17..35), the user manually does
+    A common pattern is to manually do
     ``from _pca_basis import load_pc_basis; basis = load_pc_basis(K=64);
-    X_proj = X @ basis`` and then fits gamfit on the projected ``(N, K)``
+    X_proj = X @ basis`` and then fit gamfit on the projected ``(N, K)``
     data. Pca makes that recurring projection a GAM basis. It also captures
     the Schur elimination benefit: when ``D >> K_pca`` (for example
     ``D=7168, K=64``), gamfit projects through the cached ``(D, K_pca)``
