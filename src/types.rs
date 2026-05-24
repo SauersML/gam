@@ -591,53 +591,6 @@ impl LikelihoodFamily {
     }
 }
 
-/// GLM-compatible likelihood families (survival families excluded by type).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum GlmFamily {
-    GaussianIdentity,
-    BinomialLogit,
-    BinomialProbit,
-    BinomialCLogLog,
-    BinomialSas,
-    BinomialBetaLogistic,
-    BinomialMixture,
-    PoissonLog,
-    Tweedie { p: f64 },
-    NegativeBinomial { theta: f64 },
-    BetaLogit { phi: f64 },
-    GammaLog,
-}
-
-impl GlmFamily {
-    #[inline]
-    pub const fn link_function(self) -> LinkFunction {
-        match self {
-            Self::GaussianIdentity => LinkFunction::Identity,
-            Self::PoissonLog
-            | Self::Tweedie { .. }
-            | Self::NegativeBinomial { .. }
-            | Self::GammaLog => LinkFunction::Log,
-            Self::BetaLogit { .. } => LinkFunction::Logit,
-            Self::BinomialLogit | Self::BinomialMixture => LinkFunction::Logit,
-            Self::BinomialProbit => LinkFunction::Probit,
-            Self::BinomialCLogLog => LinkFunction::CLogLog,
-            Self::BinomialSas => LinkFunction::Sas,
-            Self::BinomialBetaLogistic => LinkFunction::BetaLogistic,
-        }
-    }
-
-    #[inline]
-    pub const fn supports_firth(self) -> bool {
-        matches!(self, Self::BinomialLogit)
-    }
-
-    /// `true` for the Gaussian-identity GLM family.
-    #[inline]
-    pub const fn is_gaussian_identity(self) -> bool {
-        matches!(self, Self::GaussianIdentity)
-    }
-}
-
 /// How a likelihood's scale parameter is handled by the fit/result contract.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum LikelihoodScaleMetadata {

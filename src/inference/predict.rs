@@ -947,7 +947,8 @@ impl PredictableModel for StandardPredictor {
                         .to_string(),
                 )
             })?;
-            let strategy = strategy_from_fit(self.family, fit)?;
+            let family = spec_from_family_link(self.family, self.link_kind.as_ref());
+            let strategy = strategy_from_fit(&family, fit)?;
             predict_gam_posterior_mean_from_backendwith_bc(
                 input.design.clone(),
                 self.beta.view(),
@@ -4439,8 +4440,9 @@ pub fn enrich_posterior_mean_bounds(
     let eta_lower = &result.eta - &z_se;
     let eta_upper = &result.eta + &z_se;
 
-    let transformed_lower = apply_family_inverse_link(&eta_lower, family, link_kind)?;
-    let transformed_upper = apply_family_inverse_link(&eta_upper, family, link_kind)?;
+    let spec = spec_from_family_link(family, link_kind);
+    let transformed_lower = apply_family_inverse_link(&eta_lower, &spec)?;
+    let transformed_upper = apply_family_inverse_link(&eta_upper, &spec)?;
 
     // Handle potentially non-monotone transforms (e.g. survival).
     let mut mean_lower = Array1::from_iter(
@@ -4457,7 +4459,6 @@ pub fn enrich_posterior_mean_bounds(
     );
 
     // Clamp bounded-response families to [0, 1].
-    let spec = spec_from_family_link(family, link_kind);
     if matches!(
         spec.response,
         ResponseFamily::Binomial

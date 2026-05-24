@@ -4826,7 +4826,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 formula,
                 ModelKind::Survival,
                 FittedFamily::Survival {
-                    likelihood: legacy_family_to_spec(LikelihoodFamily::RoystonParmar),
+                    likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
                     survival_likelihood: Some(
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
@@ -5217,7 +5217,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 formula,
                 ModelKind::Survival,
                 FittedFamily::Survival {
-                    likelihood: legacy_family_to_spec(LikelihoodFamily::RoystonParmar),
+                    likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
                     survival_likelihood: Some(
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
@@ -5681,7 +5681,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 formula,
                 ModelKind::Survival,
                 FittedFamily::Survival {
-                    likelihood: legacy_family_to_spec(LikelihoodFamily::RoystonParmar),
+                    likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
                     survival_likelihood: Some(
                         survival_likelihood_modename(likelihood_mode).to_string(),
                     ),
@@ -6114,7 +6114,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             formula,
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::RoystonParmar),
+                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
                 survival_likelihood: Some(
                     survival_likelihood_modename(likelihood_mode).to_string(),
                 ),
@@ -7739,7 +7739,7 @@ fn build_transformation_normal_saved_model(
         formula,
         ModelKind::TransformationNormal,
         FittedFamily::TransformationNormal {
-            likelihood: legacy_family_to_spec(LikelihoodFamily::GaussianIdentity),
+            likelihood: LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)),
         },
         FAMILY_TRANSFORMATION_NORMAL.to_string(),
     );
@@ -10787,7 +10787,7 @@ mod tests {
             "Surv(entry, exit, event) ~ 1",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::RoystonParmar),
+                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
                 survival_likelihood: Some("location-scale".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -11448,7 +11448,7 @@ mod tests {
             "y ~ 1",
             ModelKind::LocationScale,
             FittedFamily::LocationScale {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::GaussianIdentity),
+                likelihood: LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)),
                 base_link: None,
             },
             FAMILY_GAUSSIAN_LOCATION_SCALE,
@@ -12800,7 +12800,7 @@ mod tests {
             "Surv(entry, exit, event) ~ 1",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::RoystonParmar),
+                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
                 survival_likelihood: Some("marginal-slope".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -13630,7 +13630,7 @@ mod tests {
             "Surv(start, stop, event) ~ x",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::RoystonParmar),
+                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -13688,7 +13688,7 @@ mod tests {
             "Surv(start, stop, event) ~ x",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::RoystonParmar),
+                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
                 survival_likelihood: Some("marginal-slope".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -13907,7 +13907,7 @@ mod tests {
             "Surv(entry, exit, event) ~ x1 + x2",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::RoystonParmar),
+                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
                 survival_likelihood: Some("marginal-slope".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -14050,7 +14050,7 @@ mod tests {
             "Surv(entry, exit, event) ~ 1",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::RoystonParmar),
+                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
                 survival_likelihood: Some("marginal-slope".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -14183,7 +14183,7 @@ mod tests {
             "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=5)",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::RoystonParmar),
+                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -14253,7 +14253,7 @@ mod tests {
             "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=4)",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::RoystonParmar),
+                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
@@ -14554,7 +14554,7 @@ mod tests {
             "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=4)",
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: legacy_family_to_spec(LikelihoodFamily::RoystonParmar),
+                likelihood: LikelihoodSpec::new(ResponseFamily::RoystonParmar, InverseLink::Standard(LinkFunction::Identity)),
                 survival_likelihood: Some("transformation".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
