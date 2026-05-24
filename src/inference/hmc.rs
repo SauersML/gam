@@ -45,6 +45,7 @@ use general_mcmc::generic_nuts::{GenericNUTS, MassMatrixAdaptation, NUTSMassMatr
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -454,6 +455,10 @@ struct SharedData {
     dim: usize,
 }
 
+thread_local! {
+    static NUTS_RESIDUAL_SCRATCH: RefCell<Array1<f64>> = RefCell::new(Array1::zeros(0));
+}
+
 /// Whitened log-posterior target with analytical gradients.
 ///
 /// Uses Arc for shared data to prevent memory explosion when cloned for chains.
@@ -666,6 +671,15 @@ impl NutsPosterior {
     /// Returns (log_posterior, gradientz) where gradientz is the gradient
     /// with respect to the whitened parameters z.
     fn compute_logp_and_grad_nd(&self, z: &Array1<f64>) -> (f64, Array1<f64>) {
+        let mut residual = Array1::<f64>::zeros(self.data.n_samples);
+        self.compute_logp_and_grad_nd_into(z, &mut residual)
+    }
+
+    fn compute_logp_and_grad_nd_into(
+        &self,
+        z: &Array1<f64>,
+        residual: &mut Array1<f64>,
+    ) -> (f64, Array1<f64>) {
         // === Step 1: Transform z (whitened) -> β (original) ===
         // β = μ + L @ z
         let beta = self.data.mode.as_ref() + &self.chol.dot(z);
@@ -674,7 +688,7 @@ impl NutsPosterior {
         let eta = crate::faer_ndarray::fast_av(self.data.x.as_ref(), &beta);
 
         // === Step 3: Compute log-likelihood and gradient ===
-        let (ll, mut grad_ll_beta) = self.family_logp_and_grad(&eta);
+        let (ll, mut grad_ll_beta) = self.family_logp_and_grad_into(&eta, residual);
 
         let mut firth_logdet = 0.0;
         if self.firth_enabled {
@@ -734,9 +748,12 @@ impl NutsPosterior {
         (logp, gradz)
     }
 
-    /// Dispatch log-likelihood and β-gradient computation to the appropriate family.
-    fn family_logp_and_grad(&self, eta: &Array1<f64>) -> (f64, Array1<f64>) {
-        nuts_family_logp_and_grad(self.nuts_family, &self.data, eta)
+    fn family_logp_and_grad_into(
+        &self,
+        eta: &Array1<f64>,
+        residual: &mut Array1<f64>,
+    ) -> (f64, Array1<f64>) {
+        nuts_family_logp_and_grad_into(self.nuts_family, &self.data, eta, residual)
     }
 
     /// Get the Cholesky factor L for un-whitening samples
@@ -895,17 +912,17 @@ fn firth_jeffreys_logp_and_grad(
 // family. Used by both `NutsPosterior` (fixed-ρ β-only sampling) and
 // `JointBetaRhoPosterior` (joint β+ρ sampling).
 
-/// Dispatch log-likelihood and ∇_β computation to the appropriate family.
-fn nuts_family_logp_and_grad(
+fn nuts_family_logp_and_grad_into(
     family: NutsFamily,
     data: &SharedData,
     eta: &Array1<f64>,
+    residual: &mut Array1<f64>,
 ) -> (f64, Array1<f64>) {
     match family {
-        NutsFamily::BinomialLogit => logit_logp_and_grad(data, eta),
-        NutsFamily::BinomialProbit => probit_logp_and_grad(data, eta),
-        NutsFamily::BinomialCLogLog => cloglog_logp_and_grad(data, eta),
-        NutsFamily::Gaussian => gaussian_logp_and_grad(data, eta),
+        NutsFamily::BinomialLogit => logit_logp_and_grad_into(data, eta, residual),
+        NutsFamily::BinomialProbit => probit_logp_and_grad_into(data, eta, residual),
+        NutsFamily::BinomialCLogLog => cloglog_logp_and_grad_into(data, eta, residual),
+        NutsFamily::Gaussian => gaussian_logp_and_grad_into(data, eta, residual),
         NutsFamily::PoissonLog => poisson_log_logp_and_grad(data, eta),
         // Family mapping: TweedieLog stores variance power p in data.gamma_shape.
         // Its dispersion phi stays in data.dispersion, matching REML scale ownership.
@@ -1180,12 +1197,21 @@ fn joint_family_logp_and_grad(
 ///
 /// log p(y|η) = y·η − log(1 + exp(η)), gradient = X'(w ⊙ (y − μ))
 fn logit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    let mut residual = Array1::<f64>::zeros(data.n_samples);
+    logit_logp_and_grad_into(data, eta, &mut residual)
+}
+
+fn logit_logp_and_grad_into(
+    data: &SharedData,
+    eta: &Array1<f64>,
+    residual: &mut Array1<f64>,
+) -> (f64, Array1<f64>) {
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
+    debug_assert_eq!(residual.len(), n);
     // Per-row independent: write residual entry into a pre-allocated buffer and
     // reduce the ll contribution in parallel — avoids materialising a
     // Vec<(f64, f64)> and the serial scatter that follows.
-    let mut residual = Array1::<f64>::zeros(n);
     let ll: f64 = residual
         .as_slice_mut()
         .unwrap()
@@ -1201,7 +1227,7 @@ fn logit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64
         })
         .sum();
 
-    let grad_ll = fast_atv(&data.x, &residual);
+    let grad_ll = fast_atv(&data.x, residual);
     (ll, grad_ll)
 }
 
@@ -1212,9 +1238,18 @@ fn logit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64
 ///
 /// Uses erfc-based log Φ for numerical stability.
 fn probit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    let mut residual = Array1::<f64>::zeros(data.n_samples);
+    probit_logp_and_grad_into(data, eta, &mut residual)
+}
+
+fn probit_logp_and_grad_into(
+    data: &SharedData,
+    eta: &Array1<f64>,
+    residual: &mut Array1<f64>,
+) -> (f64, Array1<f64>) {
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
-    let mut residual = Array1::<f64>::zeros(n);
+    debug_assert_eq!(residual.len(), n);
     let ll: f64 = residual
         .as_slice_mut()
         .unwrap()
@@ -1235,7 +1270,7 @@ fn probit_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f6
         })
         .sum();
 
-    let grad_ll = fast_atv(&data.x, &residual);
+    let grad_ll = fast_atv(&data.x, residual);
     (ll, grad_ll)
 }
 
@@ -1268,15 +1303,24 @@ fn cloglog_bernoulli_logp_and_residual(
 }
 
 fn cloglog_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    let mut residual = Array1::<f64>::zeros(data.n_samples);
+    cloglog_logp_and_grad_into(data, eta, &mut residual)
+}
+
+fn cloglog_logp_and_grad_into(
+    data: &SharedData,
+    eta: &Array1<f64>,
+    residual: &mut Array1<f64>,
+) -> (f64, Array1<f64>) {
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
+    debug_assert_eq!(residual.len(), n);
     if eta
         .iter()
         .any(|&eta_i| !(eta_i.is_finite() && (-700.0..=700.0).contains(&eta_i)))
     {
         return (f64::NEG_INFINITY, Array1::zeros(data.dim));
     }
-    let mut residual = Array1::<f64>::zeros(n);
     let ll: f64 = residual
         .as_slice_mut()
         .unwrap()
@@ -1292,7 +1336,7 @@ fn cloglog_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f
         })
         .sum();
 
-    let grad_ll = fast_atv(&data.x, &residual);
+    let grad_ll = fast_atv(&data.x, residual);
     (ll, grad_ll)
 }
 
@@ -1308,13 +1352,22 @@ fn cloglog_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f
 /// `Dispersion::Estimated(σ²)` branch) it removes the silent unit-σ
 /// approximation the Gaussian NUTS log-density used previously.
 fn gaussian_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<f64>) {
+    let mut weighted_residual = Array1::<f64>::zeros(data.n_samples);
+    gaussian_logp_and_grad_into(data, eta, &mut weighted_residual)
+}
+
+fn gaussian_logp_and_grad_into(
+    data: &SharedData,
+    eta: &Array1<f64>,
+    weighted_residual: &mut Array1<f64>,
+) -> (f64, Array1<f64>) {
     use crate::inference::dispersion_cov::DispersionExt as _;
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
     let inv_phi = data.dispersion.inv_phi();
+    debug_assert_eq!(weighted_residual.len(), n);
     // Per-row: residual = y - η, weighted_residual = (w/φ)·residual,
     // ll contribution = -0.5·(w/φ)·residual². All independent across rows.
-    let mut weighted_residual = Array1::<f64>::zeros(n);
     let ll: f64 = weighted_residual
         .as_slice_mut()
         .unwrap()
@@ -1329,7 +1382,7 @@ fn gaussian_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1<
         })
         .sum();
 
-    let grad_ll = fast_atv(&data.x, &weighted_residual);
+    let grad_ll = fast_atv(&data.x, weighted_residual);
     (ll, grad_ll)
 }
 
@@ -2971,9 +3024,15 @@ mod tests {
 /// Implement HamiltonianTarget for NUTS with analytical gradients.
 impl HamiltonianTarget<Array1<f64>> for NutsPosterior {
     fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
-        let (logp, gradz) = self.compute_logp_and_grad_nd(position);
-        grad.assign(&gradz);
-        logp
+        NUTS_RESIDUAL_SCRATCH.with(|scratch| {
+            let mut residual = scratch.borrow_mut();
+            if residual.len() != self.data.n_samples {
+                *residual = Array1::<f64>::zeros(self.data.n_samples);
+            }
+            let (logp, gradz) = self.compute_logp_and_grad_nd_into(position, &mut residual);
+            grad.assign(&gradz);
+            logp
+        })
     }
 }
 
