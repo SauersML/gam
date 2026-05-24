@@ -41,7 +41,7 @@
 //! call site in `crate::terms::latent_coord` without an additional
 //! materialization layer.
 
-use ndarray::{Array1, Array3, ArrayView1, ArrayView2, ArrayViewMut2, ArrayViewMut3};
+use ndarray::{Array1, Array3, ArrayView2};
 
 use crate::terms::basis::{BasisError, MaternNu, RadialScalarKind, duchon_partial_fraction_coeffs};
 
@@ -190,38 +190,7 @@ pub fn contract_input_loc_gradient(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{Array2, array};
-
-    fn finite_diff_grad(
-        kernel: &RadialInputKernel,
-        t: ArrayView2<'_, f64>,
-        centers: ArrayView2<'_, f64>,
-    ) -> Array3<f64> {
-        let n_obs = t.nrows();
-        let d = t.ncols();
-        let n_centers = centers.nrows();
-        let mut out = Array3::<f64>::zeros((n_obs, n_centers, d));
-        let eps = 1e-6;
-        let kind = kernel.into_scalar_kind();
-        for n in 0..n_obs {
-            for a in 0..d {
-                for sign in &[1.0_f64, -1.0_f64] {
-                    let mut tp = t.to_owned();
-                    tp[[n, a]] += sign * eps;
-                    for k in 0..n_centers {
-                        let mut r2 = 0.0_f64;
-                        for b in 0..d {
-                            let v = tp[[n, b]] - centers[[k, b]];
-                            r2 += v * v;
-                        }
-                        let (phi, _, _) = kind.eval_design_triplet(r2.sqrt()).unwrap();
-                        out[[n, k, a]] += sign * phi / (2.0 * eps);
-                    }
-                }
-            }
-        }
-        out
-    }
+    use ndarray::array;
 
     #[test]
     fn contract_input_loc_gradient_matches_einsum() {
