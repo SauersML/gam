@@ -394,7 +394,8 @@ pub enum LinkParamPartials {
 pub trait InverseLinkKernel {
     fn jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError>;
 
-    fn param_partials(&self, _: f64) -> Result<Option<LinkParamPartials>, EstimationError> {
+    fn param_partials(&self, eta: f64) -> Result<Option<LinkParamPartials>, EstimationError> {
+        assert!(eta.is_finite());
         Ok(None)
     }
 }

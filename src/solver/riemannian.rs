@@ -400,7 +400,7 @@ impl Manifold for Sphere {
         for i in 0..p.len() {
             v[i] -= dot * p[i];
         }
-        if cfg!(debug_assertions) {
+        if cfg!(assertions) {
             let mut chk = 0.0_f64;
             for i in 0..p.len() {
                 chk += v[i] * p[i];
@@ -427,7 +427,7 @@ impl Manifold for Sphere {
         for i in 0..m {
             out[i] /= norm;
         }
-        if cfg!(debug_assertions) {
+        if cfg!(assertions) {
             let mut n2 = 0.0_f64;
             for i in 0..m {
                 n2 += out[i] * out[i];
@@ -696,7 +696,7 @@ impl Manifold for Torus {
             let norm = s2.sqrt().max(1.0e-300);
             out[2 * k] = x / norm;
             out[2 * k + 1] = y / norm;
-            if cfg!(debug_assertions) {
+            if cfg!(assertions) {
                 let n2 = out[2 * k] * out[2 * k] + out[2 * k + 1] * out[2 * k + 1];
                 assert!((n2 - 1.0).abs() < 1.0e-9);
             }

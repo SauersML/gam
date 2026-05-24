@@ -4784,7 +4784,7 @@ pub fn xt_diag_x_signed(
 ///
 /// Use for Fisher-scoring / canonical-link IRLS, where the working weights are
 /// guaranteed nonneg by construction. The precondition is checked under
-/// `debug_assertions` and silently inherited in release builds; the underlying
+/// `assertions` and silently inherited in release builds; the underlying
 /// numeric path is identical to `xt_diag_x_signed`.
 pub fn xt_diag_x_psd(design: &DesignMatrix, diag: &Array1<f64>) -> Result<SymmetricMatrix, String> {
     assert!(

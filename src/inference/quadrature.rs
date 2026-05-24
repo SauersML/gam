@@ -1416,19 +1416,8 @@ fn cloglog_negative_tail_mean(eta: f64) -> f64 {
 
 /// Pointwise cloglog derivative dμ/dη in the deep negative tail.
 ///
-/// Production code now uses `cloglog_mean_d1_exact` which is exact for all
-/// finite x.  This function is retained for its dedicated unit test.
-#[cfg(test)]
-#[inline]
-fn cloglog_negative_tail_derivative(eta: f64) -> f64 {
-    // dμ/dη = exp(η) · exp(−exp(η)).  For η ≪ 0 this simplifies to ≈ exp(η).
-    if eta < -745.0 {
-        0.0
-    } else {
-        let ex = safe_exp(eta);
-        (ex * (-ex).exp()).max(0.0)
-    }
-}
+// `cloglog_negative_tail_derivative` (a reference implementation retained
+// solely for its unit test) lives inside `mod tests` below.
 
 #[inline]
 fn cloglog_small_sigma_taylor(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
@@ -5565,6 +5554,17 @@ mod tests {
             (exact - tail).abs() < 1e-26 * exact.abs().max(1e-300),
             "tail mean at η={eta}: exact={exact:.6e} tail={tail:.6e}"
         );
+    }
+
+    #[inline]
+    fn cloglog_negative_tail_derivative(eta: f64) -> f64 {
+        // dμ/dη = exp(η) · exp(−exp(η)).
+        if eta < -745.0 {
+            0.0
+        } else {
+            let ex = safe_exp(eta);
+            (ex * (-ex).exp()).max(0.0)
+        }
     }
 
     #[test]
