@@ -1990,28 +1990,19 @@ fn resolved_external_config(
             "mixture_link and sas_link are mutually exclusive".to_string(),
         ));
     }
-    if matches!(
-        opts.family,
-        crate::types::LikelihoodFamily::BinomialLatentCLogLog
-    ) && opts.latent_cloglog.is_none()
-    {
+    if opts.family.is_latent_cloglog() && opts.latent_cloglog.is_none() {
         return Err(EstimationError::InvalidInput(
             "BinomialLatentCLogLog requires latent_cloglog state".to_string(),
         ));
     }
-    if opts.latent_cloglog.is_some()
-        && !matches!(
-            opts.family,
-            crate::types::LikelihoodFamily::BinomialLatentCLogLog
-        )
-    {
+    if opts.latent_cloglog.is_some() && !opts.family.is_latent_cloglog() {
         return Err(EstimationError::InvalidInput(
             "latent_cloglog is only supported with BinomialLatentCLogLog".to_string(),
         ));
     }
-    let effective_sas_link = effective_sas_link_for_family(opts.family, opts.sas_link);
+    let effective_sas_link = effective_sas_link_for_family(&opts.family, opts.sas_link);
     let (likelihood, firth_active) =
-        resolve_external_family(opts.family, opts.firth_bias_reduction)?;
+        resolve_external_family(&opts.family, opts.firth_bias_reduction)?;
     let mut cfg = RemlConfig::external(likelihood, opts.tol, firth_active);
     let link = likelihood.link_function();
     cfg.link_kind = resolved_external_inverse_link(
@@ -3910,18 +3901,18 @@ where
         } else if let Some(state) = opts.latent_cloglog {
             FittedLinkState::LatentCLogLog { state }
         } else if let Some(state) = final_sas_state {
-            match opts.family {
-                crate::types::LikelihoodFamily::BinomialSas => FittedLinkState::Sas {
+            if opts.family.is_binomial_sas() {
+                FittedLinkState::Sas {
                     state,
                     covariance: final_sas_param_covariance,
-                },
-                crate::types::LikelihoodFamily::BinomialBetaLogistic => {
-                    FittedLinkState::BetaLogistic {
-                        state,
-                        covariance: final_sas_param_covariance,
-                    }
                 }
-                _ => FittedLinkState::Standard(None),
+            } else if opts.family.is_binomial_beta_logistic() {
+                FittedLinkState::BetaLogistic {
+                    state,
+                    covariance: final_sas_param_covariance,
+                }
+            } else {
+                FittedLinkState::Standard(None)
             }
         } else {
             FittedLinkState::Standard(None)
@@ -4276,7 +4267,7 @@ pub struct UnifiedFitResultParts {
     pub blocks: Vec<FittedBlock>,
     pub log_lambdas: Array1<f64>,
     pub lambdas: Array1<f64>,
-    pub likelihood_family: Option<LikelihoodFamily>,
+    pub likelihood_family: Option<LikelihoodSpec>,
     pub likelihood_scale: LikelihoodScaleMetadata,
     pub log_likelihood_normalization: LogLikelihoodNormalization,
     pub log_likelihood: f64,
@@ -4325,7 +4316,7 @@ pub struct UnifiedFitResult {
     /// Smoothing parameters (exp of log_lambdas).
     pub lambdas: Array1<f64>,
     /// Explicit engine-level family, when the fit uses a built-in family.
-    pub likelihood_family: Option<LikelihoodFamily>,
+    pub likelihood_family: Option<LikelihoodSpec>,
     /// Fixed-scale metadata for the fitted likelihood.
     pub likelihood_scale: LikelihoodScaleMetadata,
     /// Whether `log_likelihood` includes response-only normalization constants.

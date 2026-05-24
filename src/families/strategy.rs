@@ -9,11 +9,14 @@ use crate::quadrature::{
     normal_expectation_1d_adaptive, normal_expectation_1d_adaptive_pair,
     probit_posterior_meanvariance, survival_posterior_mean, survival_posterior_meanvariance,
 };
-use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, is_valid_tweedie_power};
+use crate::types::{
+    InverseLink, LikelihoodFamily, LikelihoodSpec, LinkFunction, ResponseFamily,
+    is_valid_tweedie_power,
+};
 use ndarray::{Array1, ArrayView1};
 
-/// Runtime family behavior carrier built from a stable family identifier plus
-/// optional fitted inverse-link state.
+/// Runtime family behavior carrier built from a `LikelihoodSpec` (response
+/// distribution + parameterized inverse-link).
 pub trait FamilyStrategy: std::fmt::Debug + Send + Sync {
     fn name(&self) -> &'static str;
 
@@ -55,32 +58,112 @@ pub trait FamilyStrategy: std::fmt::Debug + Send + Sync {
     ) -> Result<IntegratedMomentsJet, EstimationError>;
 }
 
-/// Default `FamilyStrategy` implementation: bundles a stable
-/// `LikelihoodFamily` identifier with the optional fitted `InverseLink`
-/// state.  All trait methods route through this pair: `inverse_link_*`
-/// dispatches on the stored `InverseLink` if present, otherwise falls back
-/// to the family-default inverse-link routines; `posterior_*` integrates
-/// `p(η) | η ~ N(eta, se_eta²)` via the appropriate exact / quadrature path;
-/// `simulate_noise` extracts the dispersion parameter from `gaussian_scale`
-/// (or rejects when the family needs one and it is missing).
+/// Default `FamilyStrategy` implementation: stores a `LikelihoodSpec`
+/// (response distribution + parameterized inverse-link state).  Trait
+/// methods dispatch on `spec.response` / `spec.link`: `inverse_link_*`
+/// routes through the parameterized link; `posterior_*` integrates
+/// `p(η) | η ~ N(eta, se_eta²)` via the appropriate exact / quadrature
+/// path; `simulate_noise` extracts the dispersion parameter from
+/// `gaussian_scale` (or rejects when the family needs one and it is
+/// missing).
 #[derive(Clone, Debug)]
 pub struct ResolvedFamilyStrategy {
-    family: LikelihoodFamily,
-    inverse_link: Option<InverseLink>,
+    spec: LikelihoodSpec,
+}
+
+/// Reconstruct the legacy flat `LikelihoodFamily` identifier from a
+/// `LikelihoodSpec`. Used to feed downstream helpers (state-aware
+/// integration dispatchers, `pretty_name`/`name` queries) that still
+/// accept the legacy enum.
+#[inline]
+fn family_from_spec(spec: &LikelihoodSpec) -> LikelihoodFamily {
+    match (&spec.response, &spec.link) {
+        (ResponseFamily::Gaussian, _) => LikelihoodFamily::GaussianIdentity,
+        (ResponseFamily::Poisson, _) => LikelihoodFamily::PoissonLog,
+        (ResponseFamily::Tweedie { p }, _) => LikelihoodFamily::Tweedie { p: *p },
+        (ResponseFamily::NegativeBinomial { theta }, _) => {
+            LikelihoodFamily::NegativeBinomial { theta: *theta }
+        }
+        (ResponseFamily::Beta { phi }, _) => LikelihoodFamily::BetaLogit { phi: *phi },
+        (ResponseFamily::Gamma, _) => LikelihoodFamily::GammaLog,
+        (ResponseFamily::RoystonParmar, _) => LikelihoodFamily::RoystonParmar,
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+            LikelihoodFamily::BinomialLogit
+        }
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+            LikelihoodFamily::BinomialProbit
+        }
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+            LikelihoodFamily::BinomialCLogLog
+        }
+        (ResponseFamily::Binomial, InverseLink::Standard(_)) => LikelihoodFamily::BinomialLogit,
+        (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
+            LikelihoodFamily::BinomialLatentCLogLog
+        }
+        (ResponseFamily::Binomial, InverseLink::Sas(_)) => LikelihoodFamily::BinomialSas,
+        (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
+            LikelihoodFamily::BinomialBetaLogistic
+        }
+        (ResponseFamily::Binomial, InverseLink::Mixture(_)) => LikelihoodFamily::BinomialMixture,
+    }
+}
+
+/// Build a `LikelihoodSpec` from a legacy `LikelihoodFamily` plus an
+/// optional fitted `InverseLink` state. For parameterized binomial
+/// variants (`BinomialMixture`/`Sas`/`BetaLogistic`/`LatentCLogLog`) the
+/// supplied `InverseLink` is preferred — when absent, a default
+/// `Standard(<family link>)` placeholder is used; subsequent strategy
+/// methods will surface a `missing_state` error if they actually need
+/// the parameterized state.
+fn spec_from_family(family: LikelihoodFamily, inverse_link: Option<&InverseLink>) -> LikelihoodSpec {
+    if let Some(link) = inverse_link {
+        let response = match family {
+            LikelihoodFamily::GaussianIdentity => ResponseFamily::Gaussian,
+            LikelihoodFamily::PoissonLog => ResponseFamily::Poisson,
+            LikelihoodFamily::Tweedie { p } => ResponseFamily::Tweedie { p },
+            LikelihoodFamily::NegativeBinomial { theta } => {
+                ResponseFamily::NegativeBinomial { theta }
+            }
+            LikelihoodFamily::BetaLogit { phi } => ResponseFamily::Beta { phi },
+            LikelihoodFamily::GammaLog => ResponseFamily::Gamma,
+            LikelihoodFamily::RoystonParmar => ResponseFamily::RoystonParmar,
+            LikelihoodFamily::BinomialLogit
+            | LikelihoodFamily::BinomialProbit
+            | LikelihoodFamily::BinomialCLogLog
+            | LikelihoodFamily::BinomialLatentCLogLog
+            | LikelihoodFamily::BinomialSas
+            | LikelihoodFamily::BinomialBetaLogistic
+            | LikelihoodFamily::BinomialMixture => ResponseFamily::Binomial,
+        };
+        return LikelihoodSpec {
+            response,
+            link: link.clone(),
+        };
+    }
+    if let Some(spec) = LikelihoodSpec::from_non_parameterized(family) {
+        return spec;
+    }
+    // Parameterized binomial variant without fitted state: build a spec
+    // with a `Standard` link placeholder; state-requiring strategy
+    // methods will fail later with a descriptive `missing_state` error.
+    let placeholder_link = InverseLink::Standard(family.link_function());
+    LikelihoodSpec {
+        response: ResponseFamily::Binomial,
+        link: placeholder_link,
+    }
 }
 
 /// Construct a `ResolvedFamilyStrategy` from a family identifier and an
-/// optional inverse-link state (cloned).  No validation is performed — the
-/// strategy methods will return `EstimationError::InvalidInput` later if
-/// they need state that this constructor did not supply.
+/// optional inverse-link state (cloned).  No validation is performed —
+/// the strategy methods will return `EstimationError::InvalidInput`
+/// later if they need state that this constructor did not supply.
 #[inline]
 pub fn strategy_for_family(
     family: LikelihoodFamily,
     inverse_link: Option<&InverseLink>,
 ) -> ResolvedFamilyStrategy {
     ResolvedFamilyStrategy {
-        family,
-        inverse_link: inverse_link.cloned(),
+        spec: spec_from_family(family, inverse_link),
     }
 }
 
@@ -107,21 +190,17 @@ pub fn strategy_from_fit(
 impl ResolvedFamilyStrategy {
     #[inline]
     fn mixture_state(&self) -> Option<&crate::types::MixtureLinkState> {
-        self.inverse_link
-            .as_ref()
-            .and_then(InverseLink::mixture_state)
+        self.spec.link.mixture_state()
     }
 
     #[inline]
     fn sas_state(&self) -> Option<&crate::types::SasLinkState> {
-        self.inverse_link.as_ref().and_then(InverseLink::sas_state)
+        self.spec.link.sas_state()
     }
 
     #[inline]
     fn latent_cloglog_state(&self) -> Option<&crate::types::LatentCLogLogState> {
-        self.inverse_link
-            .as_ref()
-            .and_then(InverseLink::latent_cloglog_state)
+        self.spec.link.latent_cloglog_state()
     }
 
     #[inline]
@@ -129,27 +208,27 @@ impl ResolvedFamilyStrategy {
         &self,
     ) -> Result<&crate::types::LatentCLogLogState, EstimationError> {
         self.latent_cloglog_state()
-            .ok_or_else(|| missing_state(self.family, "latent cloglog"))
+            .ok_or_else(|| missing_state(&self.spec, "latent cloglog"))
     }
 
     #[inline]
     fn require_sas_state(&self) -> Result<&crate::types::SasLinkState, EstimationError> {
         self.sas_state()
-            .ok_or_else(|| missing_state(self.family, "SAS link"))
+            .ok_or_else(|| missing_state(&self.spec, "SAS link"))
     }
 
     #[inline]
     fn require_mixture_state(&self) -> Result<&crate::types::MixtureLinkState, EstimationError> {
         self.mixture_state()
-            .ok_or_else(|| missing_state(self.family, "mixture link"))
+            .ok_or_else(|| missing_state(&self.spec, "mixture link"))
     }
 }
 
 #[cold]
-fn missing_state(family: LikelihoodFamily, what: &str) -> EstimationError {
+fn missing_state(spec: &LikelihoodSpec, what: &str) -> EstimationError {
     EstimationError::InvalidInput(format!(
         "{} requires fitted {} state",
-        family.pretty_name(),
+        family_from_spec(spec).pretty_name(),
         what
     ))
 }
@@ -177,14 +256,14 @@ where
 
 #[inline]
 fn require_noise_parameter(
-    family: LikelihoodFamily,
+    spec: &LikelihoodSpec,
     parameter_name: &str,
     value: Option<f64>,
 ) -> Result<f64, EstimationError> {
     let value = value.ok_or_else(|| {
         EstimationError::InvalidInput(format!(
             "{} generative sampling requires fitted {parameter_name}",
-            family.pretty_name()
+            family_from_spec(spec).pretty_name()
         ))
     })?;
     if value.is_finite() {
@@ -192,42 +271,39 @@ fn require_noise_parameter(
     } else {
         Err(EstimationError::InvalidInput(format!(
             "{} generative sampling requires finite {parameter_name}; got {value}",
-            family.pretty_name()
+            family_from_spec(spec).pretty_name()
         )))
     }
 }
 
 #[inline]
 fn require_positive_noise_parameter(
-    family: LikelihoodFamily,
+    spec: &LikelihoodSpec,
     parameter_name: &str,
     value: Option<f64>,
 ) -> Result<f64, EstimationError> {
-    let value = require_noise_parameter(family, parameter_name, value)?;
+    let value = require_noise_parameter(spec, parameter_name, value)?;
     if value > 0.0 {
         Ok(value)
     } else {
         Err(EstimationError::InvalidInput(format!(
             "{} generative sampling requires {parameter_name} > 0; got {value}",
-            family.pretty_name()
+            family_from_spec(spec).pretty_name()
         )))
     }
 }
 
 impl FamilyStrategy for ResolvedFamilyStrategy {
     fn name(&self) -> &'static str {
-        self.family.name()
+        family_from_spec(&self.spec).name()
     }
 
     fn family(&self) -> LikelihoodFamily {
-        self.family
+        family_from_spec(&self.spec)
     }
 
     fn link_function(&self) -> LinkFunction {
-        if let Some(inverse_link) = &self.inverse_link {
-            return inverse_link.link_function();
-        }
-        self.family.link_function()
+        self.spec.link.link_function()
     }
 
     fn inverse_link(&self, eta: f64) -> Result<f64, EstimationError> {
@@ -243,10 +319,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
     }
 
     fn inverse_link_jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
-        if let Some(inverse_link) = &self.inverse_link {
-            return crate::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta);
-        }
-        inverse_link_jet_for_family(self.family, eta, self.mixture_state(), self.sas_state())
+        inverse_link_jet_for_family(&self.spec, eta)
     }
 
     fn posterior_mean(
@@ -255,23 +328,24 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         eta: f64,
         se_eta: f64,
     ) -> Result<f64, EstimationError> {
-        match self.family {
-            LikelihoodFamily::GaussianIdentity => Ok(eta),
-            LikelihoodFamily::BinomialLogit
-            | LikelihoodFamily::BinomialProbit
-            | LikelihoodFamily::BinomialCLogLog => integrated_inverse_link_mean_and_derivative(
-                quadctx,
-                self.link_function(),
-                eta,
-                se_eta,
-            )
-            .map(|v| v.mean),
-            LikelihoodFamily::BinomialLatentCLogLog => {
+        match (&self.spec.response, &self.spec.link) {
+            (ResponseFamily::Gaussian, _) => Ok(eta),
+            (ResponseFamily::Binomial, InverseLink::Standard(_)) => {
+                integrated_inverse_link_mean_and_derivative(
+                    quadctx,
+                    self.link_function(),
+                    eta,
+                    se_eta,
+                )
+                .map(|v| v.mean)
+            }
+            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
                 let state = self.require_latent_cloglog_state()?;
                 latent_cloglog_inverse_link_jet(quadctx, eta, se_eta.hypot(state.latent_sd))
                     .map(|v| v.mean)
             }
-            LikelihoodFamily::BinomialSas | LikelihoodFamily::BinomialBetaLogistic => {
+            (ResponseFamily::Binomial, InverseLink::Sas(_))
+            | (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
                 integrated_inverse_link_jetwith_state(
                     quadctx,
                     self.link_function(),
@@ -282,7 +356,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 )
                 .map(|v| v.mean)
             }
-            LikelihoodFamily::BinomialMixture => {
+            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => {
                 let state = self.require_mixture_state()?;
                 integrated_family_moments_jetwith_state(
                     quadctx,
@@ -294,17 +368,19 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 )
                 .map(|v| v.mean)
             }
-            LikelihoodFamily::PoissonLog
-            | LikelihoodFamily::Tweedie { .. }
-            | LikelihoodFamily::NegativeBinomial { .. }
-            | LikelihoodFamily::GammaLog => {
+            (ResponseFamily::Poisson, _)
+            | (ResponseFamily::Tweedie { .. }, _)
+            | (ResponseFamily::NegativeBinomial { .. }, _)
+            | (ResponseFamily::Gamma, _) => {
                 // E[exp(η)] where η ~ N(eta, se²) = exp(eta + se²/2)  (log-normal MGF)
                 Ok((eta + 0.5 * se_eta * se_eta).exp())
             }
-            LikelihoodFamily::BetaLogit { .. } => {
+            (ResponseFamily::Beta { .. }, _) => {
                 Ok(logit_posterior_meanvariance(quadctx, eta, se_eta).0)
             }
-            LikelihoodFamily::RoystonParmar => Ok(survival_posterior_mean(quadctx, eta, se_eta)),
+            (ResponseFamily::RoystonParmar, _) => {
+                Ok(survival_posterior_mean(quadctx, eta, se_eta))
+            }
         }
     }
 
@@ -314,18 +390,24 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         eta: f64,
         se_eta: f64,
     ) -> Result<(f64, f64), EstimationError> {
-        match self.family {
-            LikelihoodFamily::GaussianIdentity => Ok((eta, (se_eta * se_eta).max(0.0))),
-            LikelihoodFamily::BinomialLogit => {
+        match (&self.spec.response, &self.spec.link) {
+            (ResponseFamily::Gaussian, _) => Ok((eta, (se_eta * se_eta).max(0.0))),
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
                 Ok(logit_posterior_meanvariance(quadctx, eta, se_eta))
             }
-            LikelihoodFamily::BinomialProbit => {
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
                 Ok(probit_posterior_meanvariance(quadctx, eta, se_eta))
             }
-            LikelihoodFamily::BinomialCLogLog => {
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
                 Ok(cloglog_posterior_meanvariance(quadctx, eta, se_eta))
             }
-            LikelihoodFamily::BinomialLatentCLogLog => {
+            (ResponseFamily::Binomial, InverseLink::Standard(_)) => {
+                // Other standard binomial links fall back to the logit path
+                // (the legacy default for non-{logit,probit,cloglog} binomial
+                // standard links).
+                Ok(logit_posterior_meanvariance(quadctx, eta, se_eta))
+            }
+            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
                 let state = self.require_latent_cloglog_state()?;
                 let total_sigma = se_eta.hypot(state.latent_sd);
                 let m1 = latent_cloglog_inverse_link_jet(quadctx, eta, total_sigma)?.mean;
@@ -339,13 +421,13 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 });
                 Ok((m1, (m2 - m1 * m1).max(0.0)))
             }
-            LikelihoodFamily::BinomialSas => {
+            (ResponseFamily::Binomial, InverseLink::Sas(_)) => {
                 let state = self.require_sas_state()?;
                 Ok(posterior_mv_from_prob_kernel(quadctx, eta, se_eta, |x| {
                     crate::mixture_link::sas_inverse_link_jet(x, state.epsilon, state.log_delta).mu
                 }))
             }
-            LikelihoodFamily::BinomialBetaLogistic => {
+            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
                 let state = self.require_sas_state()?;
                 Ok(posterior_mv_from_prob_kernel(quadctx, eta, se_eta, |x| {
                     crate::mixture_link::beta_logistic_inverse_link_jet(
@@ -356,7 +438,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                     .mu
                 }))
             }
-            LikelihoodFamily::BinomialMixture => {
+            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => {
                 let state = self.require_mixture_state()?;
                 let m1 = integrated_family_moments_jetwith_state(
                     quadctx,
@@ -373,10 +455,10 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 });
                 Ok((m1, (m2 - m1 * m1).max(0.0)))
             }
-            LikelihoodFamily::PoissonLog
-            | LikelihoodFamily::Tweedie { .. }
-            | LikelihoodFamily::NegativeBinomial { .. }
-            | LikelihoodFamily::GammaLog => {
+            (ResponseFamily::Poisson, _)
+            | (ResponseFamily::Tweedie { .. }, _)
+            | (ResponseFamily::NegativeBinomial { .. }, _)
+            | (ResponseFamily::Gamma, _) => {
                 // Log-normal moments: E[exp(η)] = exp(μ + σ²/2),
                 // Var[exp(η)] = exp(2μ + σ²)(exp(σ²) - 1)
                 let s2 = se_eta * se_eta;
@@ -384,10 +466,10 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 let m2 = (2.0 * eta + s2).exp() * (s2.exp() - 1.0);
                 Ok((m1, m2.max(0.0)))
             }
-            LikelihoodFamily::BetaLogit { .. } => {
+            (ResponseFamily::Beta { .. }, _) => {
                 Ok(logit_posterior_meanvariance(quadctx, eta, se_eta))
             }
-            LikelihoodFamily::RoystonParmar => {
+            (ResponseFamily::RoystonParmar, _) => {
                 Ok(survival_posterior_meanvariance(quadctx, eta, se_eta))
             }
         }
@@ -398,9 +480,10 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         mean: &Array1<f64>,
         gaussian_scale: Option<f64>,
     ) -> Result<NoiseModel, EstimationError> {
-        match self.family {
-            LikelihoodFamily::GaussianIdentity => {
-                let sigma = require_noise_parameter(self.family, "Gaussian sigma", gaussian_scale)?;
+        match &self.spec.response {
+            ResponseFamily::Gaussian => {
+                let sigma =
+                    require_noise_parameter(&self.spec, "Gaussian sigma", gaussian_scale)?;
                 if sigma < 0.0 {
                     return Err(EstimationError::InvalidInput(format!(
                         "Gaussian Identity generative sampling requires Gaussian sigma >= 0; got {sigma}"
@@ -410,15 +493,10 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                     sigma: Array1::from_elem(mean.len(), sigma),
                 })
             }
-            LikelihoodFamily::BinomialLogit
-            | LikelihoodFamily::BinomialProbit
-            | LikelihoodFamily::BinomialCLogLog
-            | LikelihoodFamily::BinomialLatentCLogLog
-            | LikelihoodFamily::BinomialSas
-            | LikelihoodFamily::BinomialBetaLogistic
-            | LikelihoodFamily::BinomialMixture => Ok(NoiseModel::Bernoulli),
-            LikelihoodFamily::PoissonLog => Ok(NoiseModel::Poisson),
-            LikelihoodFamily::Tweedie { p } => {
+            ResponseFamily::Binomial => Ok(NoiseModel::Bernoulli),
+            ResponseFamily::Poisson => Ok(NoiseModel::Poisson),
+            ResponseFamily::Tweedie { p } => {
+                let p = *p;
                 if !is_valid_tweedie_power(p) {
                     return Err(EstimationError::InvalidInput(format!(
                         "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
@@ -427,13 +505,14 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 Ok(NoiseModel::Tweedie {
                     p,
                     phi: require_positive_noise_parameter(
-                        self.family,
+                        &self.spec,
                         "Tweedie dispersion phi",
                         gaussian_scale,
                     )?,
                 })
             }
-            LikelihoodFamily::NegativeBinomial { theta } => {
+            ResponseFamily::NegativeBinomial { theta } => {
+                let theta = *theta;
                 if !(theta.is_finite() && theta > 0.0) {
                     return Err(EstimationError::InvalidInput(format!(
                         "negative-binomial theta must be finite and > 0; got {theta}"
@@ -441,7 +520,8 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 }
                 Ok(NoiseModel::NegativeBinomial { theta })
             }
-            LikelihoodFamily::BetaLogit { phi } => {
+            ResponseFamily::Beta { phi } => {
+                let phi = *phi;
                 if !(phi.is_finite() && phi > 0.0) {
                     return Err(EstimationError::InvalidInput(format!(
                         "beta-regression phi must be finite and > 0; got {phi}"
@@ -449,14 +529,14 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 }
                 Ok(NoiseModel::Beta { phi })
             }
-            LikelihoodFamily::GammaLog => Ok(NoiseModel::Gamma {
+            ResponseFamily::Gamma => Ok(NoiseModel::Gamma {
                 shape: require_positive_noise_parameter(
-                    self.family,
+                    &self.spec,
                     "Gamma shape",
                     gaussian_scale,
                 )?,
             }),
-            LikelihoodFamily::RoystonParmar => Err(EstimationError::InvalidInput(
+            ResponseFamily::RoystonParmar => Err(EstimationError::InvalidInput(
                 "RoystonParmar generative sampling is not exposed via generic family strategy"
                     .to_string(),
             )),
@@ -483,7 +563,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         }
         integrated_family_moments_jetwith_state(
             quadctx,
-            self.family,
+            family_from_spec(&self.spec),
             eta,
             se_eta,
             self.mixture_state(),

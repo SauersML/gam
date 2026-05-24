@@ -1242,26 +1242,18 @@ fn joint_family_logp_grad_and_link_grad(
 }
 
 fn joint_family_logp_and_grad(
-    family: LikelihoodFamily,
-    inverse_link: &InverseLink,
+    likelihood: &LikelihoodSpec,
     data: &SharedData,
     eta: &Array1<f64>,
 ) -> Result<(f64, Array1<f64>), String> {
-    match family {
-        LikelihoodFamily::BinomialLogit
-        | LikelihoodFamily::BinomialProbit
-        | LikelihoodFamily::BinomialCLogLog
-        | LikelihoodFamily::BinomialLatentCLogLog
-        | LikelihoodFamily::BinomialSas
-        | LikelihoodFamily::BinomialBetaLogistic
-        | LikelihoodFamily::BinomialMixture => {
-            joint_binomial_logp_and_grad(family, inverse_link, data, eta)
-        }
-        LikelihoodFamily::GaussianIdentity => Ok(gaussian_logp_and_grad(data, eta)),
-        LikelihoodFamily::PoissonLog => Ok(poisson_log_logp_and_grad(data, eta)),
-        LikelihoodFamily::Tweedie { p } => {
+    match &likelihood.response {
+        ResponseFamily::Binomial => joint_binomial_logp_and_grad(likelihood, data, eta),
+        ResponseFamily::Gaussian => Ok(gaussian_logp_and_grad(data, eta)),
+        ResponseFamily::Poisson => Ok(poisson_log_logp_and_grad(data, eta)),
+        ResponseFamily::Tweedie { p } => {
             // Family mapping: Tweedie payload p is the variance power.
             // Its dispersion phi stays in data.dispersion, matching REML.
+            let p = *p;
             if !is_valid_tweedie_power(p) {
                 return Err(HmcError::InvalidConfig {
                     reason: format!(
@@ -1272,17 +1264,17 @@ fn joint_family_logp_and_grad(
             }
             Ok(tweedie_log_quasilogp_and_grad(data, eta, p))
         }
-        LikelihoodFamily::NegativeBinomial { theta } => {
+        ResponseFamily::NegativeBinomial { theta } => {
             // Family mapping: NegativeBinomial payload theta is overdispersion.
             // NB keeps unit REML scale and never reads fixed_phi for theta.
-            Ok(negative_binomial_log_logp_and_grad(data, eta, theta))
+            Ok(negative_binomial_log_logp_and_grad(data, eta, *theta))
         }
-        LikelihoodFamily::BetaLogit { .. } => Err(HmcError::UnsupportedFamily {
+        ResponseFamily::Beta { .. } => Err(HmcError::UnsupportedFamily {
             reason: "Joint HMC fallback is not implemented for BetaLogit".to_string(),
         }
         .into()),
-        LikelihoodFamily::GammaLog => Ok(gamma_log_logp_and_grad(data, eta)),
-        LikelihoodFamily::RoystonParmar => Err(HmcError::UnsupportedFamily {
+        ResponseFamily::Gamma => Ok(gamma_log_logp_and_grad(data, eta)),
+        ResponseFamily::RoystonParmar => Err(HmcError::UnsupportedFamily {
             reason: "Joint HMC fallback is not implemented for RoystonParmar".to_string(),
         }
         .into()),
@@ -3917,26 +3909,34 @@ pub fn explicit_fit_hessian_for_whitening<'a>(
 
 /// Family-agnostic flattened NUTS entrypoint across all supported likelihood families.
 pub fn run_nuts_sampling_flattened_family(
-    family: LikelihoodFamily,
+    likelihood: LikelihoodSpec,
     inputs: FamilyNutsInputs<'_>,
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
     if let FamilyNutsInputs::Glm(glm) = &inputs
         && glm.firth_bias_reduction
-        && !family.supports_firth()
+        && !likelihood_spec_supports_firth(&likelihood)
     {
+        let binomial_logit = LikelihoodSpec {
+            response: ResponseFamily::Binomial,
+            link: InverseLink::Standard(LinkFunction::Logit),
+        };
         return Err(HmcError::FirthUnsupported {
             reason: format!(
                 "NUTS with Firth is only supported for {}; {} does not support it",
-                LikelihoodFamily::BinomialLogit.pretty_name(),
-                family.pretty_name()
+                likelihood_spec_pretty_name(&binomial_logit),
+                likelihood_spec_pretty_name(&likelihood)
             ),
         }
         .into());
     }
 
-    match (family, inputs) {
-        (LikelihoodFamily::GaussianIdentity, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
+    match (likelihood.response.clone(), likelihood.link.clone(), inputs) {
+        (
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(LinkFunction::Identity),
+            FamilyNutsInputs::Glm(glm),
+        ) => run_nuts_sampling(
             glm.x,
             glm.y,
             glm.weights,
