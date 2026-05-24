@@ -543,15 +543,11 @@ pub trait WorkingModel {
         self.update_with_curvature(beta, curvature)
     }
 
-    /// Cheap LM-candidate evaluation that skips Hessian assembly when
-    /// possible. The default falls back to `update_candidate`, but Models
-    /// that can evaluate `η + Xδ → μ, weights, deviance` without the O(np²)
-    /// curvature build should override this for a meaningful speed-up.
     fn screen_candidate(
         &mut self,
         beta: &Coefficients,
-        _direction: &Array1<f64>,
-        _current_eta: &LinearPredictor,
+        _: &Array1<f64>,
+        _: &LinearPredictor,
         curvature: HessianCurvatureKind,
     ) -> Result<CandidateEvaluation, EstimationError> {
         self.update_candidate(beta, curvature)
@@ -871,6 +867,51 @@ pub enum ExportedLaplaceCurvature {
 }
 
 #[derive(Debug, Clone)]
+pub struct CandidateScreen {
+    pub penalized_objective: f64,
+    pub deviance: f64,
+    pub penalty_term: f64,
+    pub arithmetic_finite: bool,
+}
+
+pub enum CandidateEvaluation {
+    Screen(CandidateScreen),
+    Full(WorkingState),
+}
+
+impl CandidateEvaluation {
+    #[inline]
+    fn penalized_objective(&self, firth_bias_reduction: bool) -> f64 {
+        match self {
+            Self::Screen(screen) => screen.penalized_objective,
+            Self::Full(state) => {
+                let mut value = state.deviance + state.penalty_term;
+                if firth_bias_reduction && let Some(jeffreys_logdet) = state.jeffreys_logdet() {
+                    value -= 2.0 * jeffreys_logdet;
+                }
+                value
+            }
+        }
+    }
+
+    #[inline]
+    fn arithmetic_finite(&self) -> bool {
+        match self {
+            Self::Screen(screen) => screen.arithmetic_finite,
+            Self::Full(state) => state.gradient.iter().all(|g| g.is_finite()),
+        }
+    }
+
+    #[inline]
+    fn into_full(self) -> Option<WorkingState> {
+        match self {
+            Self::Full(state) => Some(state),
+            Self::Screen(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct WorkingState {
     pub eta: LinearPredictor,
     pub gradient: Array1<f64>,
@@ -1186,12 +1227,6 @@ impl PirlsWorkspace {
         }
     }
 
-    /// Streaming chunked BLAS computation of Xᵀ·diag(W)·X with signed weights.
-    ///
-    /// Fisher updates with non-negative weights can use the faster Gram form on
-    /// sqrt(W)X. Observed-information updates can contain negative curvature
-    /// weights, so they must use the sign-preserving Xᵀ(WX) form instead of
-    /// clipping through sqrt(max(W, 0)).
     fn add_dense_xtwx_streaming_signed<S>(
         weights: &Array1<f64>,
         weighted_x_chunk: &mut Array2<f64>,
@@ -1209,7 +1244,7 @@ impl PirlsWorkspace {
         debug_assert_eq!(
             weights.len(),
             n,
-            "weights length must match row count for streamed signed XtWX"
+            "weight length must match row count for signed streamed XtWX"
         );
         let chunkrows = Self::dense_xtwx_chunkrows(p).min(n);
         if weighted_x_chunk.ncols() != p || weighted_x_chunk.nrows() != chunkrows {
@@ -1226,18 +1261,20 @@ impl PirlsWorkspace {
                     .and(x_slice.rows())
                     .and(&w_slice)
                     .par_for_each(|mut dst, src, &w| {
-                        Zip::from(&mut dst).and(&src).for_each(|d, &s| *d = s * w);
+                        Zip::from(&mut dst)
+                            .and(&src)
+                            .for_each(|d, &xij| *d = xij * w);
                     });
             }
-            let x_slice = x.slice(s![start..start + rows, ..]);
-            let wx_slice = weighted_x_chunk.slice(s![0..rows, ..]);
-            let x_view = FaerArrayView::new(&x_slice);
-            let wx_view = FaerArrayView::new(&wx_slice);
+            let weighted_rows = weighted_x_chunk.slice(s![0..rows, ..]);
+            let x_rows = x.slice(s![start..start + rows, ..]);
+            let weighted_view = FaerArrayView::new(&weighted_rows);
+            let x_view = FaerArrayView::new(&x_rows);
             matmul(
                 outview.as_mut(),
                 Accum::Add,
                 x_view.as_ref().transpose(),
-                wx_view.as_ref(),
+                weighted_view.as_ref(),
                 1.0,
                 par,
             );
@@ -2070,7 +2107,17 @@ impl<'a> GamWorkingModel<'a> {
                 } else {
                     workspace.hessian_buf.fill(0.0);
                 }
-                if has_signed_weights {
+                crate::gpu::log_backend_inventory_once();
+                let large_enough = x.nrows() >= 100_000 || (x.nrows() * p) >= 2_000_000;
+                let gpu_decision =
+                    crate::gpu::decide(crate::gpu::GpuKernel::DenseXtWX, false, large_enough);
+                gpu_decision
+                    .require_supported()
+                    .map_err(EstimationError::InvalidInput)?;
+                gpu_decision.log();
+                if weights.iter().any(|&w| w < 0.0) {
+                    // Observed-information assembly may have signed row
+                    // weights.  Use Xᵀ(WX) exactly; never sqrt/clip.
                     PirlsWorkspace::add_dense_xtwx_streaming_signed(
                         weights,
                         &mut workspace.weighted_x_chunk,
@@ -2088,7 +2135,6 @@ impl<'a> GamWorkingModel<'a> {
                         get_global_parallelism(),
                     );
                 }
-                timer.finish();
                 // Move the buffer out instead of cloning — saves O(p²) memcpy.
                 // Next call will reallocate (same cost as the existing zero-fill).
                 Ok(std::mem::take(&mut workspace.hessian_buf))
@@ -2172,6 +2218,113 @@ impl<'a> GamWorkingModel<'a> {
             &mut self.lasthessian_d,
         )?;
         Ok(HessianCurvatureKind::Observed)
+    }
+
+    fn screen_candidate_from_direction(
+        &mut self,
+        beta: &Coefficients,
+        direction: &Array1<f64>,
+        current_eta: &LinearPredictor,
+    ) -> Result<CandidateScreen, EstimationError> {
+        crate::gpu::log_backend_inventory_once();
+        let decision = crate::gpu::decide(
+            crate::gpu::GpuKernel::CandidateScreen,
+            false,
+            self.offset.len() >= 100_000,
+        );
+        decision
+            .require_supported()
+            .map_err(EstimationError::InvalidInput)?;
+        decision.log();
+
+        let n = self.offset.len();
+        if self.workspace.eta_buf.len() != n {
+            self.workspace.eta_buf = Array1::zeros(n);
+        }
+        if self.workspace.delta_eta.len() != n {
+            self.workspace.delta_eta = Array1::zeros(n);
+        }
+        let mut delta_eta = std::mem::take(&mut self.workspace.delta_eta);
+        self.transformed_matvec_into(&Coefficients::new(direction.clone()), &mut delta_eta);
+        Zip::from(&mut self.workspace.eta_buf)
+            .and(current_eta.as_ref())
+            .and(&delta_eta)
+            .par_for_each(|eta, &base, &delta| *eta = base + delta);
+        self.workspace.delta_eta = delta_eta;
+
+        if self.likelihood.scale.gamma_shape_is_estimated() {
+            let shape =
+                estimate_gamma_shape_from_eta(self.y, &self.workspace.eta_buf, self.priorweights);
+            self.likelihood = self.likelihood.with_gamma_shape(shape);
+        }
+
+        let integrated = self.covariate_se.as_ref().map(|se| IntegratedWorkingInput {
+            quadctx: &self.quadctx,
+            se: se.view(),
+            mixture_link_state: self.link_kind.mixture_state(),
+            sas_link_state: self.link_kind.sas_state(),
+        });
+        match &self.link_kind {
+            InverseLink::Mixture(_)
+            | InverseLink::LatentCLogLog(_)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_) => {
+                if let Some(integ) = integrated {
+                    update_glmvectors_integrated_for_link(
+                        integ.quadctx,
+                        self.y,
+                        &self.workspace.eta_buf,
+                        integ.se,
+                        &self.link_kind,
+                        self.priorweights,
+                        &mut self.lastmu,
+                        &mut self.lastweights,
+                        &mut self.lastz,
+                        None,
+                    )?;
+                } else {
+                    update_glmvectors(
+                        self.y,
+                        &self.workspace.eta_buf,
+                        &self.link_kind,
+                        self.priorweights,
+                        &mut self.lastmu,
+                        &mut self.lastweights,
+                        &mut self.lastz,
+                        None,
+                    )?;
+                }
+            }
+            InverseLink::Standard(_) => {
+                self.likelihood.irls_update(
+                    self.y,
+                    &self.workspace.eta_buf,
+                    self.priorweights,
+                    &mut self.lastmu,
+                    &mut self.lastweights,
+                    &mut self.lastz,
+                    integrated,
+                    None,
+                )?;
+            }
+        }
+
+        let deviance = self
+            .likelihood
+            .loglik_deviance(self.y, &self.lastmu, self.priorweights)?;
+        let s_beta = self.penalty.apply(beta.as_ref());
+        let penalty_term = beta.as_ref().dot(&s_beta);
+        let penalized_objective = deviance + penalty_term;
+        let arithmetic_finite = penalized_objective.is_finite()
+            && self.workspace.eta_buf.iter().all(|v| v.is_finite())
+            && self.lastmu.iter().all(|v| v.is_finite())
+            && self.lastweights.iter().all(|v| v.is_finite());
+        Ok(CandidateScreen {
+            penalized_objective,
+            deviance,
+            penalty_term,
+            arithmetic_finite,
+        })
     }
 
     fn sparse_penalized_hessian(
@@ -2681,9 +2834,6 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         curvature: HessianCurvatureKind,
     ) -> Result<CandidateEvaluation, EstimationError> {
         if self.firth_bias_reduction {
-            // Jeffreys logdet enters the penalized objective, and the only
-            // safe way to recover it is through the full Fisher Hessian
-            // assembly — fall back to the existing full candidate path.
             return self
                 .update_candidate(beta, curvature)
                 .map(CandidateEvaluation::Full);
@@ -5385,18 +5535,22 @@ where
                     // reason to reject a candidate; only non-finite objective
                     // or gradient arithmetic is. Saturation is diagnosed later
                     // by `pirls_soft_acceptance`.
-                    let candidate_grad_finite = candidate_eval.arithmetic_finite();
+                    let candidate_arithmetic_finite = candidate_eval.arithmetic_finite();
 
                     if screening_rho > 0.0
                         && screening_penalized.is_finite()
-                        && candidate_grad_finite
+                        && candidate_arithmetic_finite
                     {
-                        let accepted_state = if options.firth_bias_reduction {
-                            let firth_curv_start = std::time::Instant::now();
-                            let firth_curv_result = model
+                        let accepted_state = if let Some(candidate_state) =
+                            candidate_eval.into_full()
+                        {
+                            candidate_state
+                        } else {
+                            let accepted_curv_start = std::time::Instant::now();
+                            let accepted_curv_result = model
                                 .update_with_curvature(&candidate_beta, state.hessian_curvature);
-                            curvature_total += firth_curv_start.elapsed();
-                            match firth_curv_result {
+                            curvature_total += accepted_curv_start.elapsed();
+                            match accepted_curv_result {
                                 Ok(state) => state,
                                 Err(err) => {
                                     if !is_lm_retriable_candidate_error(&err) {
@@ -5430,53 +5584,6 @@ where
                                     loop_lambda *= madsen_reject_factor;
                                     madsen_reject_factor *= 2.0;
                                     continue;
-                                }
-                            }
-                        } else {
-                            match candidate_eval.into_full() {
-                                Some(state) => state,
-                                None => {
-                                    let curv_start = std::time::Instant::now();
-                                    let full_state = model.update_with_curvature(
-                                        &candidate_beta,
-                                        state.hessian_curvature,
-                                    );
-                                    curvature_total += curv_start.elapsed();
-                                    match full_state {
-                                        Ok(state) => state,
-                                        Err(err) => {
-                                            if !is_lm_retriable_candidate_error(&err) {
-                                                restore_arrow_latent_if_needed(
-                                                    options,
-                                                    pending_arrow_latent_restore.take(),
-                                                );
-                                                return Err(err);
-                                            }
-                                            if lm_retry_exhausted(
-                                                loop_lambda,
-                                                attempts,
-                                                lm_max_attempts,
-                                            ) {
-                                                restore_arrow_latent_if_needed(
-                                                    options,
-                                                    pending_arrow_latent_restore.take(),
-                                                );
-                                                return Err(lm_nonconvergence_error(
-                                                    options,
-                                                    constrained_stationarity_norm(
-                                                        &state.gradient,
-                                                        beta.as_ref(),
-                                                        options.coefficient_lower_bounds.as_ref(),
-                                                        options.linear_constraints.as_ref(),
-                                                    ),
-                                                ));
-                                            }
-                                            candidate_buf = candidate_beta.into();
-                                            loop_lambda *= madsen_reject_factor;
-                                            madsen_reject_factor *= 2.0;
-                                            continue;
-                                        }
-                                    }
                                 }
                             }
                         };
