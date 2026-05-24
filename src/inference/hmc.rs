@@ -2485,15 +2485,19 @@ mod tests {
         };
 
         let (ll_sas, _) = joint_family_logp_and_grad(
-            LikelihoodFamily::BinomialSas,
-            &InverseLink::Sas(sas_state),
+            &LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Sas(sas_state),
+            },
             &data,
             &eta,
         )
         .expect("sas joint logp");
         let (ll_logit, _) = joint_family_logp_and_grad(
-            LikelihoodFamily::BinomialLogit,
-            &InverseLink::Standard(LinkFunction::Logit),
+            &LikelihoodSpec {
+                response: ResponseFamily::Binomial,
+                link: InverseLink::Standard(LinkFunction::Logit),
+            },
             &data,
             &eta,
         )
