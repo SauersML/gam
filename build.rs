@@ -80,6 +80,17 @@ fn main() {
         &mut dead_guard_const_offenders,
     );
 
+    // Persistent unimplemented/todo/unreachable removal audit. Compares the
+    // current set of marker-bearing functions against the on-disk ledger and
+    // flags any function whose marker disappeared without a real implementation
+    // taking its place (trivial body, or replaced by another panic-shape
+    // macro). The ledger is rewritten in place; pruning happens automatically
+    // for legitimately-removed sites. Build.rs cannot reach the section
+    // builder below without finishing this call, so the audit's ledger
+    // write always lands even when other scanners report offenders.
+    let mut history_violations: Vec<(PathBuf, usize, String, String)> = Vec::new();
+    run_unimplemented_history_audit(&manifest_dir, &mut history_violations);
+
     let mut sections: Vec<Section> = Vec::new();
 
     if !todo_offenders.is_empty() {
@@ -183,6 +194,20 @@ fn main() {
             rows: dead_guard_const_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !history_violations.is_empty() {
+        sections.push(Section {
+            title: "unimplemented!/todo!/unreachable! removed without real implementation \
+                    (history audit — ban_history.txt)"
+                .to_string(),
+            rows: history_violations
+                .iter()
+                .map(|(file, line, sig, reason)| {
+                    (file.clone(), *line, Some(reason.clone()), sig.clone())
+                })
                 .collect(),
         });
     }
