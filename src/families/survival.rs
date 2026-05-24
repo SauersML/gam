@@ -179,23 +179,6 @@ impl PenaltyBlocks {
 }
 
 #[derive(Debug, Clone)]
-pub struct CauseSpecificSurvivalExpanded {
-    pub cause_count: usize,
-    pub base_coefficient_dim: usize,
-    pub age_entry: Array1<f64>,
-    pub age_exit: Array1<f64>,
-    pub event_target: Array1<u8>,
-    pub event_competing: Array1<u8>,
-    pub sampleweight: Array1<f64>,
-    pub x_entry: Array2<f64>,
-    pub x_exit: Array2<f64>,
-    pub x_derivative: Array2<f64>,
-    pub offset_eta_entry: Array1<f64>,
-    pub offset_eta_exit: Array1<f64>,
-    pub offset_derivative_exit: Array1<f64>,
-}
-
-#[derive(Debug, Clone)]
 pub struct CauseSpecificRoystonParmarBlock {
     pub age_entry: Array1<f64>,
     pub age_exit: Array1<f64>,
