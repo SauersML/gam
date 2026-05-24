@@ -31,11 +31,14 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
 * `BlockSparsityPenalty` lives on t. Group-lasso smoothed L¹ on predefined
   latent-axis blocks, shrinking whole groups rather than individual entries
   or single ARD axes.
+* `AuxConditionalPriorPenalty` lives on t. Fixed-precomputed iVAE-style
+  row-conditional precision, the auxiliary-supervised sibling to ARD/Ortho
+  from `proposals/composition_engine.md` §4(c).
 * `OrthogonalityPenalty` lives on t. It fixes the rotation gauge by
   penalizing latent-axis correlations; pair it with ARD so pruned axes
   are identifiable.
 
-All seven compose with the existing smoothness penalty (`S(ρ)`),
+All eight compose with the existing smoothness penalty (`S(ρ)`),
 they slot into the same REML outer loop, and their weights are
 "just another hyperparameter" to that loop. Pass `weight="auto"`
 (the default) to let REML choose; pass an explicit float to pin.
@@ -47,6 +50,8 @@ from dataclasses import dataclass
 from operator import index
 from typing import Any, Literal, TypeAlias
 
+import numpy as np
+
 __all__ = [
     "IsometryPenalty",
     "SparsityPenalty",
@@ -54,6 +59,7 @@ __all__ = [
     "TotalVariationPenalty",
     "NuclearNormPenalty",
     "BlockSparsityPenalty",
+    "AuxConditionalPriorPenalty",
     "OrthogonalityPenalty",
     "IBPAssignmentPenalty",
     "SoftmaxAssignmentSparsityPenalty",
@@ -610,6 +616,105 @@ class BlockSparsityPenalty:
 
 
 @dataclass(init=False)
+class AuxConditionalPriorPenalty:
+    """Fixed-precomputed iVAE-style auxiliary-conditional prior on t.
+
+    Applies ``0.5 * weight * sum_n t_n.T @ Lambda_n @ t_n`` with one
+    caller-supplied positive-definite precision matrix per latent row. Python
+    validates shape, finiteness, and symmetry; Rust performs the PD eigensolve.
+    This is the fixed variant of the aux-conditional prior family identified
+    in ``proposals/composition_engine.md`` §4(c).
+
+    Parameters
+    ----------
+    lambda_per_row
+        Numeric ndarray of shape ``(N, d, d)`` containing one symmetric
+        precision matrix per latent row.
+    weight
+        Fixed base weight, or the base multiplier when ``learnable=True``.
+    n_eff
+        Number of rows in the row-major latent coefficient block.
+    learnable
+        If true, expose one REML-selectable log-weight ``ρ``.
+    target
+        The ``LatentCoord`` block name/object. Defaults to ``"t"``.
+    """
+
+    target: TargetSpec
+    lambda_per_row: np.ndarray
+    weight: float
+    n_eff: int
+    learnable: bool
+
+    def __init__(
+        self,
+        lambda_per_row: Any,
+        weight: float,
+        n_eff: int,
+        learnable: bool = False,
+        *,
+        target: TargetSpec = "t",
+    ) -> None:
+        self.target = target
+        self.lambda_per_row = np.asarray(lambda_per_row, dtype=float)
+        self.weight = float(weight)
+        self.n_eff = int(n_eff)
+        self.learnable = bool(learnable)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        if not self.weight > 0.0:
+            raise ValueError(
+                f"AuxConditionalPriorPenalty.weight must be > 0, got {self.weight}"
+            )
+        if self.n_eff <= 0:
+            raise ValueError(
+                f"AuxConditionalPriorPenalty.n_eff must be > 0, got {self.n_eff}"
+            )
+        if self.lambda_per_row.ndim != 3:
+            raise ValueError(
+                "AuxConditionalPriorPenalty.lambda_per_row must have shape (N, d, d), "
+                f"got ndim={self.lambda_per_row.ndim}"
+            )
+        n_obs, rows, cols = self.lambda_per_row.shape
+        if n_obs != self.n_eff:
+            raise ValueError(
+                "AuxConditionalPriorPenalty.lambda_per_row first dimension must equal "
+                f"n_eff={self.n_eff}, got {n_obs}"
+            )
+        if rows == 0 or cols == 0 or rows != cols:
+            raise ValueError(
+                "AuxConditionalPriorPenalty.lambda_per_row must have square non-empty "
+                f"row matrices, got shape {self.lambda_per_row.shape}"
+            )
+        if not np.isfinite(self.lambda_per_row).all():
+            raise ValueError("AuxConditionalPriorPenalty.lambda_per_row must be finite")
+        max_asym = float(
+            np.max(np.abs(self.lambda_per_row - np.swapaxes(self.lambda_per_row, 1, 2)))
+        )
+        if max_asym >= 1.0e-10:
+            raise ValueError(
+                "AuxConditionalPriorPenalty.lambda_per_row matrices must be symmetric "
+                f"within 1e-10; max asymmetry is {max_asym:.3e}"
+            )
+
+    def _to_rust_payload(self) -> dict[str, Any]:
+        arr = np.ascontiguousarray(self.lambda_per_row, dtype=float)
+        return {
+            "kind": "aux_conditional_prior",
+            "target": _target_descriptor(self.target),
+            "lambda_per_row": arr.reshape(-1).tolist(),
+            "lambda_per_row_shape": list(arr.shape),
+            "weight": self.weight,
+            "n_eff": self.n_eff,
+            "learnable": self.learnable,
+        }
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
+
+
+@dataclass(init=False)
 class OrthogonalityPenalty:
     """Gauge-fixing penalty for latent-axis identifiability.
 
@@ -735,5 +840,6 @@ class SoftmaxAssignmentSparsityPenalty:
 Penalty = (
     "IsometryPenalty | SparsityPenalty | ARDPenalty | "
     "TotalVariationPenalty | NuclearNormPenalty | BlockSparsityPenalty | "
-    "OrthogonalityPenalty | IBPAssignmentPenalty | SoftmaxAssignmentSparsityPenalty"
+    "AuxConditionalPriorPenalty | OrthogonalityPenalty | IBPAssignmentPenalty | "
+    "SoftmaxAssignmentSparsityPenalty"
 )

@@ -3328,6 +3328,59 @@ fn build_standard_latent_analytic_penalty_registry(
     Ok(registry)
 }
 
+fn analytic_descriptor_array3_flat(
+    descriptor: &serde_json::Map<String, JsonValue>,
+    data_key: &str,
+    shape_key: &str,
+    context: &str,
+) -> Result<Array3<f64>, String> {
+    let shape_values = descriptor
+        .get(shape_key)
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{context}.{shape_key} must be a three-item shape list"))?;
+    if shape_values.len() != 3 {
+        return Err(format!(
+            "{context}.{shape_key} must contain exactly three dimensions"
+        ));
+    }
+    let mut shape = [0usize; 3];
+    for (idx, raw_dim) in shape_values.iter().enumerate() {
+        let dim = raw_dim.as_u64().ok_or_else(|| {
+            format!("{context}.{shape_key}[{idx}] must be a positive integer")
+        })?;
+        if dim == 0 {
+            return Err(format!("{context}.{shape_key}[{idx}] must be > 0"));
+        }
+        shape[idx] = dim as usize;
+    }
+    let expected_len = shape[0]
+        .checked_mul(shape[1])
+        .and_then(|v| v.checked_mul(shape[2]))
+        .ok_or_else(|| format!("{context}.{shape_key} overflows usize"))?;
+    let values = descriptor
+        .get(data_key)
+        .and_then(JsonValue::as_array)
+        .ok_or_else(|| format!("{context}.{data_key} must be a flattened numeric array"))?;
+    if values.len() != expected_len {
+        return Err(format!(
+            "{context}.{data_key} length {} does not match {shape_key} product {expected_len}",
+            values.len()
+        ));
+    }
+    let mut flat = Vec::with_capacity(expected_len);
+    for (idx, cell) in values.iter().enumerate() {
+        let value = cell
+            .as_f64()
+            .ok_or_else(|| format!("{context}.{data_key}[{idx}] must be a finite number"))?;
+        if !value.is_finite() {
+            return Err(format!("{context}.{data_key}[{idx}] must be finite"));
+        }
+        flat.push(value);
+    }
+    Array3::from_shape_vec((shape[0], shape[1], shape[2]), flat)
+        .map_err(|err| format!("{context}.{data_key} shape reconstruction failed: {err}"))
+}
+
 fn json_array2(value: &JsonValue, context: &str) -> Result<Array2<f64>, String> {
     let rows = value.as_array().ok_or_else(|| {
         format!("{context} must be a two-dimensional numeric array")
