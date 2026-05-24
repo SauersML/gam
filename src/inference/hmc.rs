@@ -492,6 +492,18 @@ impl NutsFamily {
     }
 }
 
+/// Whitened-coordinate target for the No-U-Turn HMC sampler.
+///
+/// The posterior over β is reparameterized via `β = L z` where `L Lᵀ = H⁻¹`
+/// (Cholesky factor of the inverse posterior Hessian at the MAP), so that
+/// in `z`-coordinates the local curvature is approximately the identity.
+/// The struct holds the shared design, the whitening factor `L` and its
+/// transpose (for gradient chain-rule pull-back `∇_z = Lᵀ ∇_β`), the
+/// family-specific log-likelihood adapter, and a precomputed
+/// `M = Lᵀ S L` so the smoothing penalty `−½ βᵀSβ` becomes the cheap
+/// quadratic `−½ zᵀMz` inside the leapfrog hot loop.  Optionally adds
+/// the identifiable-subspace Firth/Jeffreys term to keep posterior modes
+/// away from infinity under separation.
 pub struct NutsPosterior {
     /// Shared read-only data (Arc prevents duplication)
     data: SharedData,

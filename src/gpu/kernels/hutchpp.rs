@@ -20,16 +20,9 @@ pub enum BackendStatus {
 
 #[inline]
 pub fn backend_status() -> BackendStatus {
-    #[cfg(feature = "cuda")]
-    {
-        match crate::gpu::runtime::GpuRuntime::global() {
-            Some(_) => BackendStatus::CudaReady,
-            None => BackendStatus::CudaUnavailable,
-        }
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        BackendStatus::CpuFallback
+    match crate::gpu::runtime::GpuRuntime::global() {
+        Some(_) => BackendStatus::CudaReady,
+        None => BackendStatus::CudaUnavailable,
     }
 }
 
@@ -89,21 +82,12 @@ pub fn try_dispatch(
     if n_samples == 0 || operator.ncols() == 0 {
         return None;
     }
-    #[cfg(feature = "cuda")]
-    {
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
-            return None;
-        };
-        Some(cuda_hutchpp(operator, n_samples, seed))
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        drop((operator, n_samples, seed));
-        None
-    }
+    let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+        return None;
+    };
+    Some(cuda_hutchpp(operator, n_samples, seed))
 }
 
-#[cfg(feature = "cuda")]
 fn cuda_hutchpp(
     operator: &dyn LinearOperator,
     n_samples: usize,
@@ -182,6 +166,9 @@ extern "C" __global__ void hutchpp_dot_kernel(
         let nn = n as u64;
         let mut builder = stream.launch_builder(&func);
         builder.arg(&dz).arg(&daz).arg(&mut dpart).arg(&nn);
+        // SAFETY: func loaded from a freshly NVRTC-compiled module on this
+        // context; dz/daz are length-n device vectors, dpart is the per-block
+        // partial-sum buffer matching blocks. cfg grid covers exactly blocks.
         unsafe { builder.launch(cfg) }.map_err(map_drv)?;
         let host_part = stream.memcpy_dtov(&dpart).map_err(map_drv)?;
         let mut dot = 0.0_f64;
@@ -193,7 +180,6 @@ extern "C" __global__ void hutchpp_dot_kernel(
     Ok(acc / (n_samples as f64))
 }
 
-#[cfg(feature = "cuda")]
 fn map_drv(e: cudarc::driver::DriverError) -> GpuError {
     GpuError::DriverCallFailed {
         reason: format!("hutchpp cudarc driver error: {e}"),

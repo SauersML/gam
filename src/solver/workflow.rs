@@ -3330,6 +3330,30 @@ fn build_standard_latent_analytic_penalty_registry(
                 };
                 registry.push(AnalyticPenaltyKind::Ard(Arc::new(penalty)));
             }
+            "topk" | "topk_activation" => {
+                let k = analytic_descriptor_usize(descriptor, "k", 1)?;
+                let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
+                let penalty = TopKActivationPenalty::new(slice, k, weight)
+                    .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(AnalyticPenaltyKind::TopKActivation(Arc::new(penalty)));
+            }
+            "jumprelu" | "jump_relu" => {
+                let thresholds = analytic_descriptor_array1_flat(descriptor, "thresholds", &context)?;
+                let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
+                let smoothing_eps =
+                    analytic_descriptor_f64(descriptor, "smoothing_eps", 1.0e-3)?;
+                let penalty = JumpReLUPenalty::new(slice, thresholds, weight, smoothing_eps)
+                    .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(AnalyticPenaltyKind::JumpReLU(Arc::new(penalty)));
+            }
             "orthogonality" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = analytic_descriptor_usize(descriptor, "n_eff", target.n)?;

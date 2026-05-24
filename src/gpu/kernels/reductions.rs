@@ -16,16 +16,9 @@ pub enum BackendStatus {
 
 #[inline]
 pub fn backend_status() -> BackendStatus {
-    #[cfg(feature = "cuda")]
-    {
-        match crate::gpu::runtime::GpuRuntime::global() {
-            Some(_) => BackendStatus::CudaReady,
-            None => BackendStatus::CudaUnavailable,
-        }
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        BackendStatus::CpuFallback
+    match crate::gpu::runtime::GpuRuntime::global() {
+        Some(_) => BackendStatus::CudaReady,
+        None => BackendStatus::CudaUnavailable,
     }
 }
 
@@ -65,21 +58,12 @@ pub fn try_dispatch(
     if values.is_empty() {
         return None;
     }
-    #[cfg(feature = "cuda")]
-    {
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
-            return None;
-        };
-        Some(cuda_reduce(values, kind))
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        drop((values, kind));
-        None
-    }
+    let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+        return None;
+    };
+    Some(cuda_reduce(values, kind))
 }
 
-#[cfg(feature = "cuda")]
 fn cuda_reduce(values: ArrayView1<'_, f64>, kind: ReductionKind) -> Result<f64, GpuError> {
     use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::compile_ptx;
@@ -169,6 +153,10 @@ extern "C" __global__ void reduce_kernel(
         .arg(&mut dpart)
         .arg(&nn)
         .arg(&op_code);
+    // SAFETY: func loaded from a freshly NVRTC-compiled module on this
+    // context; dx is the length-n device input, dpart is the per-block
+    // partial-sum buffer matching blocks. cfg grid covers exactly the
+    // kernel's bounded tid range.
     unsafe { builder.launch(cfg) }.map_err(map_drv)?;
 
     let host_part = stream.memcpy_dtov(&dpart).map_err(map_drv)?;
@@ -181,7 +169,6 @@ extern "C" __global__ void reduce_kernel(
     Ok(result)
 }
 
-#[cfg(feature = "cuda")]
 fn map_drv(e: cudarc::driver::DriverError) -> GpuError {
     GpuError::DriverCallFailed {
         reason: format!("reductions cudarc driver error: {e}"),

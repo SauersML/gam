@@ -27,8 +27,10 @@ from ._penalties import (
     BlockOrthogonalityPenalty,
     IBPAssignmentPenalty,
     IsometryPenalty,
+    JumpReLUPenalty,
     MechanismSparsityPenalty,
     SoftmaxAssignmentSparsityPenalty,
+    TopKActivationPenalty,
 )
 from ._topology_selector import TopologyAutoSelector
 from .smooth import Duchon, LatentCoord, PeriodicSplineCurve, Smooth, Sphere
@@ -380,6 +382,7 @@ def _legacy_sae_manifold_fit(
     learning_rate: float = 0.05,
     random_state: int = 0,
     penalties: Sequence[Any] | None = None,
+    assignment: Literal["softmax", "ibp_map", "topk", "jumprelu", "gated"] | None = None,
 ) -> SaeManifoldFitResult:
     """Fit a sparse mixture of smooth manifold atoms to activations ``Z``.
 
@@ -400,10 +403,16 @@ def _legacy_sae_manifold_fit(
     z = _as_2d_float(Z, "Z")
     if z.shape[0] == 0 or z.shape[1] == 0:
         raise ValueError("sae_manifold_fit requires a non-empty (N, p) matrix")
+    if assignment is None:
+        assignment_mode = assignment_prior
+    else:
+        assignment_mode = assignment
+    if assignment_mode not in {"softmax", "ibp_map", "topk", "jumprelu", "gated"}:
+        raise ValueError("assignment must be 'softmax', 'ibp_map', 'topk', 'jumprelu', or 'gated'")
     if assignment_prior not in {"softmax", "ibp_map"}:
         raise ValueError("assignment_prior must be 'softmax' or 'ibp_map'")
-    if learnable_alpha and assignment_prior != "ibp_map":
-        raise ValueError("learnable_alpha only applies to assignment_prior='ibp_map'")
+    if learnable_alpha and assignment_mode != "ibp_map":
+        raise ValueError("learnable_alpha only applies to assignment='ibp_map'")
     if not np.isfinite(tau) or tau <= 0.0:
         raise ValueError("tau must be finite and positive")
     schedule = _normalize_gumbel_schedule(gumbel_schedule)
@@ -422,7 +431,7 @@ def _legacy_sae_manifold_fit(
             atom_dim,
             sparsity_strength,
             smoothness,
-            assignment_prior,
+            assignment_mode,
             alpha,
             learnable_alpha,
             tau_initial,
@@ -584,7 +593,7 @@ def _fit_fixed_k(
     atom_dim: int | Sequence[int] | Literal["auto"] | None,
     sparsity_strength: float | Literal["auto"],
     smoothness: float | Literal["auto"],
-    assignment_prior: Literal["softmax", "ibp_map"],
+    assignment_prior: Literal["softmax", "ibp_map", "topk", "jumprelu", "gated"],
     alpha: float | Literal["auto"],
     learnable_alpha: bool,
     tau: float,
@@ -678,7 +687,7 @@ def _fit_fixed_k(
     if not np.isfinite(alpha_value) or alpha_value <= 0.0:
         raise ValueError("alpha must be positive, finite, or 'auto'")
 
-    if assignment_prior == "ibp_map":
+    if assignment_prior == "ibp_map" and hasattr(rust_module(), "sae_manifold_fit_ibp"):
         return _fit_fixed_k_ibp_rust(
             z,
             k_atoms,
@@ -752,6 +761,7 @@ def _fit_fixed_k(
             alpha = np.exp(log_ard[atom])
             grad_t += coords[atom] * alpha[None, :]
             coords[atom] -= learning_rate * grad_t
+            coords[atom] = _retract_coords(basis_specs[atom], coords[atom])
             if atom_dim == "auto" or atom_dim is None:
                 var = np.maximum(np.var(coords[atom], axis=0), 1e-8)
                 log_ard[atom] = np.clip(-np.log(var), -8.0, 12.0)
@@ -763,14 +773,27 @@ def _fit_fixed_k(
     if last_payload is None:
         raise RuntimeError("sae_manifold_fit did not execute an optimization iteration")
 
-    B_flat = np.asarray(last_payload["coefficients"], dtype=float)
-    decoder_blocks = _split_decoder(B_flat, [d.shape[1] for d in last_designs])
+    final_designs: list[np.ndarray] = []
+    final_penalties: list[np.ndarray] = []
+    final_blocks: list[np.ndarray] = []
+    for atom in range(k_atoms):
+        phi, _jet, penalty = _basis_and_jacobian(basis_specs[atom], coords[atom])
+        final_designs.append(phi)
+        final_penalties.append(penalty)
+        final_blocks.append(last_assignments[:, [atom]] * phi)
+    final_payload = gaussian_reml_fit(
+        np.concatenate(final_blocks, axis=1),
+        z,
+        _block_diag(final_penalties) * lambda_smooth,
+    )
+    B_flat = np.asarray(final_payload["coefficients"], dtype=float)
+    decoder_blocks = _split_decoder(B_flat, [d.shape[1] for d in final_designs])
     fitted = np.zeros_like(z)
     atoms: list[SaeManifoldAtomFit] = []
     for atom in range(k_atoms):
-        decoded = last_designs[atom] @ decoder_blocks[atom]
+        decoded = final_designs[atom] @ decoder_blocks[atom]
         fitted += last_assignments[:, [atom]] * decoded
-    score = float(last_payload["reml_score"])
+    score = float(final_payload["reml_score"])
     score -= _assignment_prior_value(
         last_assignments, assignment_prior, lambda_sparse, effective_alpha
     )
@@ -885,8 +908,8 @@ def _fit_fixed_k_ibp_rust(
         )
         logits_current = np.asarray(payload["logits"], dtype=float)
         coords_current = [
-            np.asarray(atom_payload["on_atom_coords_t"], dtype=float).copy()
-            for atom_payload in payload["atoms"]
+            _retract_coords(basis_specs[atom_idx], np.asarray(atom_payload["on_atom_coords_t"], dtype=float))
+            for atom_idx, atom_payload in enumerate(payload["atoms"])
         ]
         decoder_blocks = [
             np.asarray(atom_payload["decoder_B"], dtype=float).copy()
@@ -992,19 +1015,32 @@ def _basis_kind_name(spec: str | Smooth) -> str:
         return "sphere"
     if isinstance(spec, Duchon):
         return "duchon"
-    if isinstance(spec, EuclideanPatch):
-        return "euclidean_patch"
     return spec.__class__.__name__
 
 
 def _basis_and_jacobian(spec: str | Smooth, t: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if isinstance(spec, PeriodicSplineCurve):
-        return _periodic_fourier_basis(t[:, 0], max(3, int(spec.n_knots // 2)))
+        return _periodic_fourier_basis(_retract_coords(spec, t)[:, 0], max(3, int(spec.n_knots // 2)))
     if isinstance(spec, Sphere):
-        return _sphere_chart_basis(t)
+        return _sphere_chart_basis(_retract_coords(spec, t))
     if isinstance(spec, Duchon):
         return _duchon_basis_local(t, spec)
     return _duchon_basis_local(t, Duchon(centers=None, m=2))
+
+
+def _retract_coords(spec: str | Smooth, coords: np.ndarray) -> np.ndarray:
+    out = np.asarray(coords, dtype=float).copy()
+    if out.size == 0:
+        return out
+    if isinstance(spec, PeriodicSplineCurve):
+        out[:, 0] = np.mod(out[:, 0], 1.0)
+        return out
+    if isinstance(spec, Sphere):
+        out[:, 0] = np.clip(out[:, 0], -np.pi / 2.0, np.pi / 2.0)
+        if out.shape[1] > 1:
+            out[:, 1] = (out[:, 1] + np.pi) % (2.0 * np.pi) - np.pi
+        return out
+    return out
 
 
 def _duchon_basis_local(t: np.ndarray, spec: Duchon) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

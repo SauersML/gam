@@ -1628,6 +1628,8 @@ fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) -> bool {
     matches!(
         penalty,
         AnalyticPenaltyKind::Ard(_)
+            | AnalyticPenaltyKind::TopKActivation(_)
+            | AnalyticPenaltyKind::JumpReLU(_)
             | AnalyticPenaltyKind::Sparsity(_)
             | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
             | AnalyticPenaltyKind::IBPAssignment(_)

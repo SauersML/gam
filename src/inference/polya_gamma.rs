@@ -35,6 +35,11 @@ pub struct PolyaGamma {
 }
 
 impl PolyaGamma {
+    /// Construct a stateless Pólya–Gamma sampler.  The struct caches the
+    /// `Exp(1)` and `N(0,1)` distribution objects used by every Devroye
+    /// rejection draw; the caller supplies the per-draw RNG via the
+    /// `draw(...)` entry point, so a single `PolyaGamma` instance is
+    /// safely reused across threads and chains.
     pub fn new() -> Self {
         Self {
             exp: RandExp::new(1.0).expect("Exp(1) valid"),
