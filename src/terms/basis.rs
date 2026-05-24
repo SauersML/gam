@@ -2735,6 +2735,7 @@ pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usiz
             // resource policy is `AnalyticOperatorRequired`, any caller that
             // reached this point has materialized something the strict
             // operator contract forbids.
+            // SAFETY: AnalyticOperatorRequired forbids dense derivative materialization.
             panic!(
                 "spatial PC Duchon derivative designs must remain operator-backed; refused persistent dense derivative materialization (n={n}, p={p}, d_pc={d_pc}, first_order={:.1} MiB, second_order={:.1} MiB)",
                 first as f64 / (1024.0 * 1024.0),
@@ -10163,11 +10164,29 @@ fn duchon_kernel_radial_triplet(
 
 #[inline(always)]
 fn lower_triangular_offset(row: usize) -> usize {
-    row * (row + 1) / 2
+    if row & 1 == 0 {
+        (row / 2)
+            .checked_mul(row + 1)
+            .expect("lower-triangular row offset overflow")
+    } else {
+        row.checked_mul(row / 2 + 1)
+            .expect("lower-triangular row offset overflow")
+    }
+}
+
+fn lower_triangular_len(k: usize) -> usize {
+    if k & 1 == 0 {
+        (k / 2)
+            .checked_mul(k.checked_add(1).expect("lower-triangular length overflow"))
+            .expect("lower-triangular length overflow")
+    } else {
+        k.checked_mul(k / 2 + 1)
+            .expect("lower-triangular length overflow")
+    }
 }
 
 fn symmetric_matrix_from_lower_values(k: usize, values: &[f64]) -> Array2<f64> {
-    debug_assert_eq!(values.len(), k * (k + 1) / 2);
+    debug_assert_eq!(values.len(), lower_triangular_len(k));
     let mut g = Array2::<f64>::zeros((k, k));
     let mut idx = 0usize;
     for i in 0..k {
@@ -10335,7 +10354,7 @@ pub fn closed_form_anisotropic_pair_block(
     // Parallelize by independent lower-triangular rows. This keeps one lag
     // scratch buffer per worker row, avoids the sqrt-based flat-index decode
     // in the hot loop, and still evaluates each symmetric pair only once.
-    let n_pairs = k * (k + 1) / 2;
+    let n_pairs = lower_triangular_len(k);
     let mut values = vec![0.0_f64; n_pairs];
     let values_ptr = SendPtr(values.as_mut_ptr());
     (0..k).into_par_iter().for_each(|i| {
@@ -10415,7 +10434,7 @@ pub fn closed_form_anisotropic_pair_block_pure(
 
     // Parallelize by independent lower-triangular rows and evaluate each
     // symmetric pair once while reusing a single lag scratch buffer per row.
-    let n_pairs = k * (k + 1) / 2;
+    let n_pairs = lower_triangular_len(k);
     let eta_slice: &[f64] = eta_centered.as_slice();
     let mut values = vec![0.0_f64; n_pairs];
     let values_ptr = SendPtr(values.as_mut_ptr());
@@ -10639,7 +10658,7 @@ pub fn closed_form_matern_pair_block(
         binom_coeffs.push(coeff);
     }
 
-    let n_pairs = k * (k + 1) / 2;
+    let n_pairs = lower_triangular_len(k);
     let mut values = vec![0.0_f64; n_pairs];
     let values_ptr = SendPtr(values.as_mut_ptr());
     (0..k).into_par_iter().for_each(|i| {
@@ -10795,7 +10814,7 @@ pub fn closed_form_psi_derivatives_in_total_basis(
         };
     let powers = closed_form_penalty::AnisoMetricPowers::new(eta_raw);
 
-    let n_pairs = k * (k + 1) / 2;
+    let n_pairs = lower_triangular_len(k);
     let mut g_values = vec![0.0_f64; n_pairs];
     let mut g_psi_values = vec![0.0_f64; n_pairs];
     let mut g_psi_psi_values = vec![0.0_f64; n_pairs];
@@ -10914,7 +10933,7 @@ pub fn closed_form_aniso_psi_derivatives_in_total_basis(
 
     let cross_pairs: Vec<(usize, usize)> =
         (0..d).flat_map(|a| (a..d).map(move |b| (a, b))).collect();
-    let n_pairs = k * (k + 1) / 2;
+    let n_pairs = lower_triangular_len(k);
     let mut g_values = vec![0.0_f64; n_pairs];
     let mut g_eta_values: Vec<Vec<f64>> = (0..d).map(|_| vec![0.0_f64; n_pairs]).collect();
     let mut g_eta2_diag_values: Vec<Vec<f64>> = (0..d).map(|_| vec![0.0_f64; n_pairs]).collect();
@@ -25503,6 +25522,7 @@ pub mod closed_form_penalty {
         let d = r.len();
         // Integer-only helpers gate the self-pair / partial-fraction
         // branches; fractional `s` routes around them via the
+        // SAFETY: zero-lag self-pair requires validated nullspace-order condition (m > d/2 + s).
         // already-fractional `radial_derivatives_of_isotropic_duchon`
         // path below.
         let s_int = if s.fract() == 0.0 {
@@ -25516,11 +25536,7 @@ pub mod closed_form_penalty {
             {
                 return bundle.value / eta.iter().sum::<f64>().exp();
             }
-            // SAFETY: zero-lag self-pair values are well-defined only when the
-            // nullspace-order condition (m > d/2 + s) holds; the public
-            // Duchon constructors validate this at term creation, so a
-            // missing analytic bundle here means an unvalidated tuple
-            // reached the kernel evaluator — a caller-contract violation.
+            // SAFETY: zero-lag self-pair requires validated nullspace-order condition (m > d/2 + s).
             panic!(
                 "anisotropic_duchon_penalty_radial: zero lag has no finite analytic self-pair for q={q} d={d} m={m} s={s}"
             );

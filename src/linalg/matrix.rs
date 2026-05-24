@@ -6340,7 +6340,14 @@ impl DesignMatrix {
                 let (sparse_mat, dense_mat) = match (self, other) {
                     (Self::Sparse(s), Self::Dense(d)) => (s, d),
                     (Self::Dense(d), Self::Sparse(s)) => (s, d),
-                    _ => unreachable!(),
+                    // Outer match's first two arms already handled (Dense,Dense)
+                    // and (Sparse,Sparse); only mixed pairs reach this fallback.
+                    _ => {
+                        return Err(
+                            "crossdiag_axpy_row_into: mixed-arm dispatch reached non-mixed pair"
+                                .to_string(),
+                        );
+                    }
                 };
                 // SAFETY: same CSR conversion invariant as above — only fails
                 // on a malformed sparse matrix, which the SparseDesignMatrix

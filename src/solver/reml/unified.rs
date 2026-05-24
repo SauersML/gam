@@ -508,6 +508,7 @@ pub trait HessianOperator: Send + Sync {
                 // `0..n = 0..x.nrows()` with `end = (start+block).min(n)`,
                 // so it is always a valid sub-range of `x`. A failure here
                 // means the operator violated its row-chunk contract.
+                // SAFETY: row range built from 0..x.nrows(); failure means operator broke its contract.
                 panic!("xt_logdet_kernel_x_diagonal: row chunk failed: {err}")
             });
             let chunk_t = rows.t().to_owned();
@@ -2334,6 +2335,7 @@ impl ProjectedFactorCache {
                             // half-initialized factor would corrupt every
                             // downstream REML/PIRLS computation that depends
                             // on it.
+                            // SAFETY: producer thread panicked; propagating to waiters avoids returning corrupted factor.
                             panic!("projected factor cache producer panicked")
                         }
                         None => {
@@ -3410,6 +3412,7 @@ impl ImplicitHyperOperator {
                 // always a valid sub-range of `x_design`. Failure means the
                 // operator broke its row-chunk contract.
                 .unwrap_or_else(|err| {
+                    // SAFETY: row range is a valid sub-range of x_design; failure means operator broke contract.
                     panic!("ImplicitHyperOperator::compute_xf row chunk failed: {err}")
                 });
             let block = crate::faer_ndarray::fast_ab(&rows, factor);
@@ -3941,6 +3944,7 @@ impl PenaltyCoordinate {
                 // above); callers of `apply_root` are required to gate on
                 // `has_root()`, so reaching this arm means a caller
                 // invoked the rooted-only API on a rootless variant.
+                // SAFETY: KroneckerMarginal has no root; callers must gate on has_root() before apply_root.
                 panic!(
                     "apply_root not supported for KroneckerMarginal; use apply_penalty directly"
                 );
@@ -4577,6 +4581,7 @@ impl PenaltySubspaceTrace {
                 // `0..n = 0..x.nrows()` with `end = (start+block).min(n)`,
                 // so it is always a valid sub-range of `x`. Failure means
                 // the operator broke its row-chunk contract.
+                // SAFETY: row range built from 0..x.nrows(); failure means operator broke its contract.
                 panic!("xt_projected_kernel_x_diagonal: row chunk failed: {err}")
             });
             // Z_chunk = rows · U_S  ((end-start) × r).
@@ -13131,6 +13136,7 @@ impl HessianOperator for DenseSpectralOperator {
                 // `0..n = 0..x.nrows()` with `end = (start+block).min(n)`,
                 // so it is always a valid sub-range of `x`. A failure here
                 // means the operator violated its row-chunk contract.
+                // SAFETY: row range built from 0..x.nrows(); failure means operator broke its contract.
                 panic!("xt_logdet_kernel_x_diagonal: row chunk failed: {err}")
             });
             let xg = crate::faer_ndarray::fast_ab(&rows, &self.g_factor);
@@ -13427,6 +13433,7 @@ impl SparseCholeskyOperator {
                 // matching the factor's dimension, so failure here means
                 // the cached factor was corrupted after construction —
                 // a hard invariant violation.
+                // SAFETY: self.factor is validated SPD; sparse-SPD solve only fails on factor corruption.
                 panic!("SparseCholeskyOperator exact trace_hinv_operator solve failed: {e}")
             });
             start = end;
@@ -13553,6 +13560,7 @@ impl SparseCholeskyOperator {
                 // sparse-SPD multi-RHS solves only fail on factor
                 // corruption, which `SparseCholeskyOperator`'s
                 // construction invariant forbids.
+                // SAFETY: self.factor is validated SPD; block-local solve only fails on factor corruption.
                 panic!("SparseCholeskyOperator exact block-local trace solve failed: {e}")
             });
             local_col_start += cols;
@@ -13642,6 +13650,7 @@ impl SparseCholeskyOperator {
             // failure here means factor corruption, forbidden by the
             // `SparseCholeskyOperator` construction invariant.
             .unwrap_or_else(|e| {
+                // SAFETY: self.factor is validated SPD; cross solve only fails on factor corruption.
                 panic!("SparseCholeskyOperator exact block-local cross solve failed: {e}")
             });
         let result = trace_matrix_product(&solved, &solved);
@@ -13701,6 +13710,7 @@ impl SparseCholeskyOperator {
                 // is `n_dim × cols` by construction. A sparse-SPD multi-RHS
                 // failure here would mean factor corruption, which the
                 // construction invariant forbids.
+                // SAFETY: self.factor is validated SPD; matrix/operator multi-solve only fails on corruption.
                 panic!("SparseCholeskyOperator exact matrix/operator cross solve failed: {e}")
             });
 
@@ -13751,6 +13761,7 @@ impl SparseCholeskyOperator {
                 // SPD factor and `op_rhs_block` is allocated as
                 // `n_dim × chunk`, so dimensions are compatible by
                 // construction. Any failure indicates factor corruption.
+                // SAFETY: self.factor is validated SPD; block-operator multi-solve only fails on corruption.
                 panic!(
                     "SparseCholeskyOperator exact matrix/block-operator cross operator solve failed: {e}"
                 )
@@ -13767,6 +13778,7 @@ impl SparseCholeskyOperator {
                 // and `eye_rhs_block` was just filled as an identity-block
                 // RHS sized `n_dim × chunk`. Failure indicates factor
                 // corruption, forbidden by the construction invariant.
+                // SAFETY: self.factor is validated SPD; identity-RHS multi-solve only fails on corruption.
                 panic!(
                     "SparseCholeskyOperator exact matrix/block-operator cross identity solve failed: {e}"
                 )
@@ -13821,6 +13833,7 @@ impl SparseCholeskyOperator {
                 // the validated SPD Cholesky factor; column ranges come
                 // from the operator's own `block_local_data` (or fall back
                 // to `0..n_dim`), so failure indicates factor corruption.
+                // SAFETY: self.factor is validated SPD; operator cross-left solve only fails on corruption.
                 panic!("SparseCholeskyOperator exact operator cross left solve failed: {e}")
             });
         let same_operator =
@@ -13841,6 +13854,7 @@ impl SparseCholeskyOperator {
                     // `self.factor` is validated SPD and the column range
                     // is taken from `right`'s own `block_local_data`,
                     // so failure indicates factor corruption.
+                    // SAFETY: self.factor is validated SPD; operator cross-right solve only fails on corruption.
                     panic!("SparseCholeskyOperator exact operator cross right solve failed: {e}")
                 }),
             )
@@ -13907,6 +13921,7 @@ impl HessianOperator for SparseCholeskyOperator {
                 // successful factorization); a single-square multi-RHS solve
                 // here can only fail on factor corruption, which the
                 // construction invariant forbids.
+                // SAFETY: self.factor is validated SPD; single-square multi-solve only fails on corruption.
                 panic!("SparseCholeskyOperator exact trace_hinv_product solve failed: {e}")
             })
             .diag()
@@ -13967,6 +13982,7 @@ impl HessianOperator for SparseCholeskyOperator {
         // factor can only fail on factor corruption, which the
         // `SparseCholeskyOperator` construction invariant forbids.
         crate::linalg::sparse_exact::solve_sparse_spd(&self.factor, rhs)
+            // SAFETY: self.factor is validated SPD; triangular solve only fails on corruption.
             .unwrap_or_else(|e| panic!("SparseCholeskyOperator exact solve failed: {e}"))
     }
 
@@ -13975,6 +13991,7 @@ impl HessianOperator for SparseCholeskyOperator {
         // was created from a successful Cholesky factorization, so a
         // multi-RHS solve can only fail on factor corruption.
         crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, rhs)
+            // SAFETY: self.factor is validated SPD; multi-RHS solve only fails on corruption.
             .unwrap_or_else(|e| panic!("SparseCholeskyOperator exact multi-solve failed: {e}"))
     }
 
