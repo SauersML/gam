@@ -1203,7 +1203,6 @@ fn batched_inverse_hessians_from_caches(
 /// the partials w.r.t. `X`, `y`, `S`, and `w` into the provided gradient buffers.
 /// Returns `m` so callers that also need `∂L/∂λ` can fold in the λ-adjoint dot
 /// product `−scale · ⟨m, S β⟩` without recomputing the adjoint solve.
-#[allow(clippy::too_many_arguments)]
 fn ridge_profile_vjp_data_partials(
     scale: f64,
     x: ArrayView2<'_, f64>,
@@ -1268,7 +1267,6 @@ fn ridge_profile_vjp_data_partials(
 ///
 /// Accumulates the data/penalty/weight partials and adds the implicit-function
 /// λ-adjoint contribution `−scale · ⟨M^{-1} u, S β⟩` into `lambda_adjoint_out`.
-#[allow(clippy::too_many_arguments)]
 fn add_ridge_profile_vjp_with_lambda_grad(
     scale: f64,
     x: ArrayView2<'_, f64>,
@@ -1312,7 +1310,6 @@ fn add_ridge_profile_vjp_with_lambda_grad(
 /// Ridge-profile VJP for callers that hold λ fixed (e.g. the implicit-root
 /// partial inside `add_reml_rho_gradient_vjp`). The λ-adjoint dot product is
 /// skipped entirely — it would be unused work in this branch.
-#[allow(clippy::too_many_arguments)]
 fn add_ridge_profile_vjp_fixed_lambda(
     scale: f64,
     x: ArrayView2<'_, f64>,

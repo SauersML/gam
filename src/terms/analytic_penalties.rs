@@ -295,9 +295,16 @@ pub trait AnalyticPenalty: Send + Sync {
     /// (Isometry); those implement [`Self::hvp`] instead.
     fn hessian_diag(
         &self,
-        _target: ArrayView1<'_, f64>,
-        _rho: ArrayView1<'_, f64>,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
+        assert!(
+            rho.iter().all(|value| value.is_finite()),
+            "analytic-penalty rho must be finite"
+        );
+        if target.is_empty() {
+            return Some(Array1::zeros(0));
+        }
         None
     }
 
@@ -1499,9 +1506,16 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
 
     fn hessian_diag(
         &self,
-        _target: ArrayView1<'_, f64>,
-        _rho: ArrayView1<'_, f64>,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
+        assert!(
+            rho.iter().all(|value| value.is_finite()),
+            "softmax entropy rho must be finite"
+        );
+        if target.is_empty() {
+            return Some(Array1::zeros(0));
+        }
         None
     }
 
@@ -2388,8 +2402,7 @@ impl AnalyticPenalty for TopKActivationPenalty {
         PenaltyTier::Psi
     }
 
-    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
-        std::hint::black_box(rho);
+    fn value(&self, target: ArrayView1<'_, f64>, _rho: ArrayView1<'_, f64>) -> f64 {
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut mask = vec![false; d];
@@ -2407,8 +2420,7 @@ impl AnalyticPenalty for TopKActivationPenalty {
         acc
     }
 
-    fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        std::hint::black_box(rho);
+    fn grad_target(&self, target: ArrayView1<'_, f64>, _rho: ArrayView1<'_, f64>) -> Array1<f64> {
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut mask = vec![false; d];
@@ -7238,7 +7250,10 @@ impl AnalyticPenalty for NestedPrefixPenalty {
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
         let f = self.latent_dim();
-        debug_assert!(target.len().is_multiple_of(f), "target length must be n_rows · F");
+        debug_assert!(
+            target.len().is_multiple_of(f),
+            "target length must be n_rows · F"
+        );
         let n_rows = target.len() / f;
         let lambdas = self.lambdas(rho);
         let eps2 = self.eps * self.eps;
