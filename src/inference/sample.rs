@@ -668,7 +668,7 @@ fn sample_standard_link_wiggle(
         _ => {
             return Err(format!(
                 "NUTS sampling with link wiggle is not supported for family {}",
-                spec_pretty_name(&likelihood)
+                likelihood.pretty_name()
             ));
         }
     };

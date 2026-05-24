@@ -10164,12 +10164,9 @@ fn sample_table_impl(
     serialize_sample_payload(&model, &nuts, &cfg)
 }
 
-/// Returns the inverse-link kind tag emitted to the Python wrapper.
-///
-/// The tag is intentionally lower-kebab-case so it can be matched as a
 /// Stable lower-kebab-case name of a `LikelihoodSpec`, matching the strings
-/// the saved-model payload's `family` field used to carry from the legacy
-/// `LikelihoodSpec` name. Used in the `FittedModelPayload::new`
+/// the saved-model payload's `family` field used to carry under the legacy
+/// `LikelihoodFamily::name()` enum. Used in the `FittedModelPayload::new`
 /// third argument and in user-visible error messages.
 fn likelihood_spec_legacy_name(family: &LikelihoodSpec) -> &'static str {
     match (&family.response, &family.link) {
@@ -10195,6 +10192,10 @@ fn likelihood_spec_legacy_name(family: &LikelihoodSpec) -> &'static str {
     }
 }
 
+/// plain string on the Python side (the Rust `LikelihoodSpec` itself is
+/// Returns the inverse-link kind tag emitted to the Python wrapper.
+///
+/// The tag is intentionally lower-kebab-case so it can be matched as a
 /// plain string on the Python side (the Rust `LikelihoodSpec` itself is
 /// not part of the FFI surface). Families that don't have a closed-form
 /// scalar inverse link (`royston-parmar`, `binomial-sas`,
