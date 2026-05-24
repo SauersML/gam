@@ -1,63 +1,66 @@
-use std::fmt;
+use serde::{Deserialize, Serialize};
 
-/// Coarse hardware tiers used by dispatch policy defaults.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GpuCapability {
-    Unknown,
-    Legacy,
-    Datacenter,
-    HopperOrNewer,
+/// Capability flags derived from CUDA device attributes.  Compute capability is
+/// only a hint; runtime probing fills the concrete memory and SM attributes.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GpuCapability {
+    pub compute_major: i32,
+    pub compute_minor: i32,
+    pub has_tensor_cores: bool,
+    pub has_fp64_tensor_cores: bool,
+    pub has_async_copy: bool,
+    pub cluster_launch: bool,
+    pub tma: bool,
+    pub min_warp_size: i32,
 }
 
-/// Runtime-discovered CUDA device metadata.
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl GpuCapability {
+    #[must_use]
+    pub fn from_compute_capability(major: i32, minor: i32) -> Self {
+        Self {
+            compute_major: major,
+            compute_minor: minor,
+            has_tensor_cores: major >= 7,
+            has_fp64_tensor_cores: major >= 8,
+            has_async_copy: major >= 8,
+            cluster_launch: major >= 9,
+            tma: major >= 9,
+            min_warp_size: 32,
+        }
+    }
+}
+
+/// Device information consumed by dispatch policy and profile logs.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct GpuDeviceInfo {
     pub ordinal: usize,
     pub name: String,
-    pub compute_capability_major: i32,
-    pub compute_capability_minor: i32,
-    pub total_memory_bytes: Option<usize>,
-    pub free_memory_bytes: Option<usize>,
+    pub capability: GpuCapability,
+    pub sm_count: i32,
+    pub max_threads_per_sm: i32,
+    pub shared_mem_per_block: usize,
+    pub l2_cache_bytes: usize,
+    pub total_mem_bytes: usize,
+    pub free_mem_bytes: usize,
+    pub ecc_enabled: bool,
+    pub integrated: bool,
+    pub mig_mode: bool,
 }
 
 impl GpuDeviceInfo {
     #[must_use]
-    pub fn compute_capability(&self) -> (i32, i32) {
-        (self.compute_capability_major, self.compute_capability_minor)
-    }
-
-    #[must_use]
-    pub fn capability_tier(&self) -> GpuCapability {
-        match self.compute_capability() {
-            (major, _) if major >= 9 => GpuCapability::HopperOrNewer,
-            (major, _) if major >= 7 => GpuCapability::Datacenter,
-            (major, _) if major > 0 => GpuCapability::Legacy,
-            _ => GpuCapability::Unknown,
-        }
-    }
-
-    #[must_use]
-    pub fn score(&self) -> u128 {
-        let memory = self.total_memory_bytes.unwrap_or(0) as u128;
-        let cc = (self.compute_capability_major.max(0) as u128) * 100
-            + self.compute_capability_minor.max(0) as u128;
-        (cc << 64) | memory
-    }
-}
-
-impl fmt::Display for GpuDeviceInfo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "CUDA device {}: {} (sm_{}{})",
-            self.ordinal, self.name, self.compute_capability_major, self.compute_capability_minor
-        )?;
-        if let Some(total) = self.total_memory_bytes {
-            write!(f, ", total={} MiB", total / (1024 * 1024))?;
-        }
-        if let Some(free) = self.free_memory_bytes {
-            write!(f, ", free={} MiB", free / (1024 * 1024))?;
-        }
-        Ok(())
+    pub fn score(&self) -> f64 {
+        let free_gib = self.free_mem_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+        let fp64_bonus = if self.capability.has_fp64_tensor_cores {
+            100.0
+        } else {
+            0.0
+        };
+        let async_bonus = if self.capability.has_async_copy {
+            50.0
+        } else {
+            0.0
+        };
+        f64::from(self.sm_count.max(0)) + free_gib * 4.0 + fp64_bonus + async_bonus
     }
 }

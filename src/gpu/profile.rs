@@ -1,123 +1,80 @@
-use crate::gpu::policy::GpuOperation;
-use std::env;
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::Instant;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct KernelStat {
     pub name: &'static str,
     pub n: usize,
     pub p: usize,
     pub k: usize,
-    pub nnz: Option<usize>,
-    pub flops_est: f64,
-    pub bytes_est: f64,
+    pub nnz: usize,
+    pub flops_est: usize,
+    pub bytes_est: usize,
     pub cpu_ms: f64,
     pub gpu_ms: Option<f64>,
+    pub backend: &'static str,
 }
 
-#[must_use]
-pub fn profiling_enabled() -> bool {
-    matches!(
-        env::var("GAM_GPU_PROFILE").ok().as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
+#[derive(Debug)]
+pub struct GpuProfile {
+    capacity: usize,
+    stats: Mutex<VecDeque<KernelStat>>,
 }
 
-pub fn record_cpu_kernel(op: GpuOperation, elapsed: Duration) {
-    if !profiling_enabled() {
-        return;
+impl GpuProfile {
+    #[must_use]
+    pub fn global() -> &'static Self {
+        static PROFILE: OnceLock<GpuProfile> = OnceLock::new();
+        PROFILE.get_or_init(|| GpuProfile {
+            capacity: 512,
+            stats: Mutex::new(VecDeque::with_capacity(512)),
+        })
     }
-    let (n, p, k, nnz) = dimensions(op);
-    let stat = KernelStat {
-        name: op.name(),
+
+    pub fn push(&self, stat: KernelStat) {
+        if let Ok(mut stats) = self.stats.lock() {
+            if stats.len() == self.capacity {
+                stats.pop_front();
+            }
+            stats.push_back(stat);
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<KernelStat> {
+        self.stats
+            .lock()
+            .map(|stats| stats.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+}
+
+pub fn record_cpu_kernel<R, F: FnOnce() -> R>(
+    name: &'static str,
+    n: usize,
+    p: usize,
+    k: usize,
+    nnz: usize,
+    f: F,
+) -> R {
+    let start = Instant::now();
+    let out = f();
+    let cpu_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let flops_est = n.saturating_mul(p.max(1)).saturating_mul(k.max(1));
+    let bytes_est = n.saturating_mul(p.max(1)).saturating_mul(8);
+    GpuProfile::global().push(KernelStat {
+        name,
         n,
         p,
         k,
         nnz,
-        flops_est: op.estimated_flops(),
-        bytes_est: estimated_bytes(op),
-        cpu_ms: elapsed.as_secs_f64() * 1_000.0,
+        flops_est,
+        bytes_est,
+        cpu_ms,
         gpu_ms: None,
-    };
-    stats()
-        .lock()
-        .expect("GPU profile mutex poisoned")
-        .push(stat);
-}
-
-#[must_use]
-pub fn snapshot() -> Vec<KernelStat> {
-    stats().lock().expect("GPU profile mutex poisoned").clone()
-}
-
-fn stats() -> &'static Mutex<Vec<KernelStat>> {
-    static STATS: OnceLock<Mutex<Vec<KernelStat>>> = OnceLock::new();
-    STATS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn dimensions(op: GpuOperation) -> (usize, usize, usize, Option<usize>) {
-    match op {
-        GpuOperation::Gemm { m, n, k } => (m, n, k, None),
-        GpuOperation::Gemv { m, k } => (m, 1, k, None),
-        GpuOperation::XtDiagX { rows, cols, .. } => (rows, cols, cols, None),
-        GpuOperation::XtDiagY {
-            rows,
-            x_cols,
-            y_cols,
-            ..
-        } => (rows, x_cols, y_cols, None),
-        GpuOperation::JointHessian2x2 {
-            rows,
-            a_cols,
-            b_cols,
-            ..
-        } => (rows, a_cols + b_cols, a_cols + b_cols, None),
-        GpuOperation::Cholesky { cols, rhs, .. } => (cols, cols, rhs, None),
-        GpuOperation::SparseXtDiagX {
-            rows, cols, nnz, ..
-        } => (rows, cols, cols, Some(nnz)),
-        GpuOperation::RowKernel {
-            rows,
-            axes,
-            candidates,
-            ..
-        } => (rows, axes, candidates, None),
-    }
-}
-
-fn estimated_bytes(op: GpuOperation) -> f64 {
-    let f64_bytes = 8.0;
-    match op {
-        GpuOperation::Gemm { m, n, k } => ((m * k) + (k * n) + (m * n)) as f64 * f64_bytes,
-        GpuOperation::Gemv { m, k } => ((m * k) + k + m) as f64 * f64_bytes,
-        GpuOperation::XtDiagX { rows, cols, .. } => {
-            ((rows * cols) + rows + (cols * cols)) as f64 * f64_bytes
-        }
-        GpuOperation::XtDiagY {
-            rows,
-            x_cols,
-            y_cols,
-            ..
-        } => ((rows * x_cols) + rows + (rows * y_cols) + (x_cols * y_cols)) as f64 * f64_bytes,
-        GpuOperation::JointHessian2x2 {
-            rows,
-            a_cols,
-            b_cols,
-            ..
-        } => {
-            let c = a_cols + b_cols;
-            ((rows * c) + (3 * rows) + (c * c)) as f64 * f64_bytes
-        }
-        GpuOperation::Cholesky { cols, rhs, .. } => {
-            ((cols * cols) + (cols * rhs)) as f64 * f64_bytes
-        }
-        GpuOperation::SparseXtDiagX { nnz, cols, .. } => (nnz + (cols * cols)) as f64 * f64_bytes,
-        GpuOperation::RowKernel {
-            rows,
-            axes,
-            candidates,
-            ..
-        } => (rows * axes.max(1) * candidates.max(1)) as f64 * f64_bytes,
-    }
+        backend: "cpu",
+    });
+    out
 }
