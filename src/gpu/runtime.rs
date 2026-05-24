@@ -1,74 +1,43 @@
-use super::device::GpuDeviceInfo;
-use super::policy::{GpuDispatchPolicy, GpuEnv};
-use std::path::PathBuf;
+use std::sync::OnceLock;
 
-#[derive(Clone, Debug)]
-pub enum GpuProbeStatus {
-    Disabled,
-    Unavailable(String),
-    Available,
+use super::device::GpuDeviceInfo;
+use super::policy::GpuDispatchPolicy;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GpuProbeError {
+    CudaFeatureDisabled,
+    DynamicLoaderUnavailable,
+    NoDevice,
+    Driver(String),
 }
 
 #[derive(Clone, Debug)]
 pub struct GpuRuntime {
-    pub status: GpuProbeStatus,
-    pub env: GpuEnv,
-    pub devices: Vec<GpuDeviceInfo>,
-    pub selected_device: Option<usize>,
-    pub memory_budget_bytes: usize,
+    pub device: GpuDeviceInfo,
     pub policy: GpuDispatchPolicy,
-    pub calibration_cache_path: PathBuf,
+    pub memory_budget_bytes: usize,
 }
 
 impl GpuRuntime {
-    pub fn probe() -> Option<Self> {
-        let env = GpuEnv::from_process_env();
-        if env.gpu == "off" {
-            return None;
+    pub fn probe() -> Result<Option<Self>, GpuProbeError> {
+        #[cfg(feature = "cuda")]
+        {
+            Ok(None)
         }
-        let cache = calibration_cache_path();
-        let runtime = Self {
-            status: GpuProbeStatus::Unavailable(cuda_backend_status().to_string()),
-            env,
-            devices: Vec::new(),
-            selected_device: None,
-            memory_budget_bytes: 0,
-            policy: GpuDispatchPolicy::default(),
-            calibration_cache_path: cache,
-        };
-        None.or(Some(runtime))
-            .filter(|rt| matches!(rt.env.gpu.as_str(), "force"))
-    }
-
-    pub fn cpu_fallback() -> Self {
-        Self {
-            status: GpuProbeStatus::Unavailable(cuda_backend_status().to_string()),
-            env: GpuEnv::from_process_env(),
-            devices: Vec::new(),
-            selected_device: None,
-            memory_budget_bytes: 0,
-            policy: GpuDispatchPolicy::default(),
-            calibration_cache_path: calibration_cache_path(),
+        #[cfg(not(feature = "cuda"))]
+        {
+            Ok(None)
         }
     }
 
-    pub fn is_available(&self) -> bool {
-        matches!(self.status, GpuProbeStatus::Available)
+    pub fn global() -> Option<&'static Self> {
+        static RUNTIME: OnceLock<Option<GpuRuntime>> = OnceLock::new();
+        RUNTIME
+            .get_or_init(|| Self::probe().unwrap_or(None))
+            .as_ref()
     }
-}
 
-pub fn cuda_backend_status() -> &'static str {
-    if cfg!(feature = "cuda") {
-        "cuda feature enabled; cudarc dynamic backend is compiled but no device work is active in this routing layer"
-    } else {
-        "cuda feature disabled"
+    pub fn is_available() -> bool {
+        Self::global().is_some()
     }
-}
-
-pub fn calibration_cache_path() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from(".cache"));
-    base.join("gam").join("gpu_calib.json")
 }

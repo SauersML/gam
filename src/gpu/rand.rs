@@ -1,22 +1,16 @@
-#[derive(Clone, Debug)]
-pub struct RademacherGenerator {
-    pub seed: u64,
+//! Placeholder module for the CUDA backend phase described in the GPU HAL.
+//!
+//! The public HAL is present so solver call sites can be routed without CUDA
+//! types. Concrete cudarc kernels are intentionally isolated here in follow-up
+//! implementations and unavailable backends fall back to CPU numerics.
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendStatus {
+    CpuFallback,
+    CudaUnavailable,
+    CudaReady,
 }
 
-impl Default for RademacherGenerator {
-    fn default() -> Self {
-        Self { seed: 0xCAFE_BABE }
-    }
-}
-
-impl RademacherGenerator {
-    pub fn fill_host(&self, out: &mut [f64]) {
-        let mut state = self.seed;
-        for value in out {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            *value = if state & 1 == 0 { -1.0 } else { 1.0 };
-        }
-    }
+pub fn backend_status() -> BackendStatus {
+    BackendStatus::CpuFallback
 }

@@ -1,19 +1,16 @@
+//! Placeholder module for the CUDA backend phase described in the GPU HAL.
+//!
+//! The public HAL is present so solver call sites can be routed without CUDA
+//! types. Concrete cudarc kernels are intentionally isolated here in follow-up
+//! implementations and unavailable backends fall back to CPU numerics.
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GpuLinkKernel {
-    Logit,
-    Probit,
-    CLogLog,
-    Identity,
-    Log,
-    Sas,
-    BetaLogistic,
+pub enum BackendStatus {
+    CpuFallback,
+    CudaUnavailable,
+    CudaReady,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct LinkKernelOutputs {
-    pub emits_mu: bool,
-    pub emits_w: bool,
-    pub emits_z: bool,
-    pub emits_derivative_jets: bool,
-    pub emits_deviance_loglik: bool,
+pub fn backend_status() -> BackendStatus {
+    BackendStatus::CpuFallback
 }

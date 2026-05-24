@@ -1,10 +1,9 @@
 //! GPU acceleration hardware-abstraction layer.
 //!
-//! The module is intentionally a thin, CPU-safe façade.  The `cuda` Cargo
-//! feature pulls in cudarc with dynamic loading, but all public entry points are
-//! allowed to return [`GpuUnavailable`] and fall back to the existing CPU path.
-//! This keeps default builds CUDA-free while giving solver/linalg call sites a
-//! stable routing contract for the device-resident pipeline.
+//! The module is intentionally callable from CPU-only builds: all public entry
+//! points are available without CUDA, and the runtime reports an unavailable
+//! backend instead of changing numerical results.  CUDA-specific code is kept
+//! behind the `cuda` Cargo feature and does not leak into solver modules.
 
 pub mod blas;
 pub mod cpu_traits;
@@ -30,9 +29,11 @@ pub mod kernels {
     pub mod spatial;
 }
 
-pub use cpu_traits::{ExecutionTarget, MatrixLocation};
+pub use cpu_traits::{
+    DeviceBlas, DeviceDesignOperator, DeviceSolver, ExecutionTarget, MatrixLocation,
+};
 pub use device::{GpuCapability, GpuDeviceInfo};
-pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector, GpuFitSession};
-pub use policy::{GpuDispatchPolicy, GpuEnv, MixedPrecisionMode, ValidationMode};
-pub use profile::{KernelStat, OperationKind, record_cpu_fallback};
-pub use runtime::{GpuProbeStatus, GpuRuntime};
+pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector};
+pub use policy::{GpuDispatchPolicy, MixedPrecisionPolicy};
+pub use profile::{KernelStat, KernelStatsSnapshot};
+pub use runtime::{GpuProbeError, GpuRuntime};
