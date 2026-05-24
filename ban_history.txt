@@ -42,17 +42,12 @@ src/solver/reml/unified.rs	pub fn scaled_add_penalty_view( &self, beta: ArrayVie
 src/terms/basis.rs	fn duchon_small_chi_riesz_series_radial_derivatives( d: usize, a: usize, b: usize, kappa: f64, r: f64, max_order: usize, kappa_derivative_order: usize, ) -> Vec<f64>	unreachable!
 src/terms/basis.rs	fn finite_part_series( d: usize, a: usize, b: usize, kappa: f64, r: f64, max_order: usize, kappa_derivative_order: usize, ) -> Vec<f64>	unreachable!
 src/terms/basis.rs	fn isotropic_radial_laplacian_power_from_q0( q: usize, d: usize, m: usize, s: usize, kappa: f64, big_r: f64, ) -> f64	unreachable!
-src/terms/basis.rs	fn kernel_axis_scalar(&self, row: usize, center: usize, axis: usize) -> Result<f64, BasisError>	unreachable!
 src/terms/basis.rs	fn matern_collocation_operator_matrices_should_match_closed_forms_in_1d()	unreachable!
 src/terms/basis.rs	fn matern_operator_psi_triplet_should_match_closed_form_polynomials()	unreachable!
 src/terms/basis.rs	fn periodic_duchon_identifiability_transformwithworkspace( data: ArrayView2<' spec: &DuchonBasisSpec, centers: Array2<f64>, workspace: &mut BasisWorkspace, ) -> Result<Option<Array2<f64>>, BasisError>	unreachable!
-src/terms/basis.rs	fn project_and_pad(&self, raw_knot: &Array1<f64>, raw_poly: &Array1<f64>) -> Array1<f64>	unreachable!
-src/terms/basis.rs	fn project_jet(&self, raw_knot: &Array1<f64>) -> Array1<f64>	unreachable!
 src/terms/basis.rs	fn test_duchon_design_log_kappa_derivative_matchesfd_dim1_power1_frozen()	unreachable!
 src/terms/basis.rs	fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_frozen()	unreachable!
 src/terms/basis.rs	fn uniform_metric_radial_duchon_penalty( q: usize, m: usize, s: f64, kappa: f64, d: usize, common_eta: f64, euclidean_r2: f64, ) -> Option<f64>	unreachable!
-src/terms/basis.rs	fn unproject(&self, u: &ArrayView1<' match &self.basis	unreachable!
-src/terms/basis.rs	fn unproject_jet(&self, u: &ArrayView1<' match &self.basis	unreachable!
 src/terms/basis.rs	pub fn apply_sum_to_zero_constraint_sparse( basis_matrix: &SparseColMat<usize, f64>, weights: Option<ArrayView1<f64>>, ) -> Result<(SparseColMat<usize, f64>, Array2<f64>), BasisError>	unreachable!
 src/terms/basis.rs	pub fn build_bspline_basis_1d( data: ArrayView1<' spec: &BSplineBasisSpec, ) -> Result<BasisBuildResult, BasisError>	unreachable!
 src/terms/basis.rs	pub fn create_duchon_basis_1d_derivative_dense( t: ArrayView1<' centers: ArrayView1<' power: f64, nullspace_order: DuchonNullspaceOrder, periodic: bool, order: usize, ) -> Result<Array2<f64>, BasisError>	unreachable!

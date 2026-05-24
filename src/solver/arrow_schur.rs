@@ -105,6 +105,7 @@ const DEFAULT_PCG_MAX_ITERATIONS: usize = 200;
 const DEFAULT_PCG_RELATIVE_TOLERANCE: f64 = 1e-4;
 const DEFAULT_TRUST_REGION_RADIUS: f64 = f64::INFINITY;
 const EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT: u64 = 0;
+const ARROW_FACTOR_CACHE_HTBETA_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// Matrix-free shared-block multiply for large BA/SAE Schur PCG.
 ///
@@ -113,6 +114,8 @@ const EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT: u64 = 0;
 /// shared block before Agarwal-style inexact Schur PCG.
 pub type SharedBetaMatvec =
     Arc<dyn for<'a> Fn(ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync>;
+pub type RowHtbetaMatvec =
+    Arc<dyn for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync>;
 type MetricWeights = [f64];
 
 /// BA Schur solve variant for the reduced shared `β` system.
@@ -669,6 +672,11 @@ pub struct ArrowSchurSystem {
     /// this operator when present, avoiding dense shared-block storage for
     /// SAE-manifold scale `K`.
     pub hbb_matvec: Option<SharedBetaMatvec>,
+    /// Optional row-local matrix-free multiply for `H_tβ^(i) x`.
+    ///
+    /// When present, factor caches can retain this lightweight operator instead
+    /// of cloning every dense `d × K` row cross-block.
+    pub htbeta_matvec: Option<RowHtbetaMatvec>,
     /// Optional diagonal of the matrix-free shared block, used by the
     /// Schur-Jacobi preconditioner in the Agarwal-style PCG path.
     pub hbb_diag: Option<Array1<f64>>,
@@ -700,6 +708,7 @@ impl ArrowSchurSystem {
             rows,
             hbb: Array2::<f64>::zeros((k, k)),
             hbb_matvec: None,
+            htbeta_matvec: None,
             hbb_diag: None,
             gb: Array1::<f64>::zeros(k),
             d,
@@ -735,6 +744,7 @@ impl ArrowSchurSystem {
             rows,
             hbb: Array2::<f64>::zeros((0, 0)),
             hbb_matvec: Some(Arc::new(matvec)),
+            htbeta_matvec: None,
             hbb_diag: Some(diag),
             gb: Array1::<f64>::zeros(k),
             d,
@@ -786,6 +796,20 @@ impl ArrowSchurSystem {
         debug_assert_eq!(diag.len(), self.k);
         self.hbb_matvec = Some(Arc::new(matvec));
         self.hbb_diag = Some(diag);
+        self.refresh_row_hessian_fingerprint();
+    }
+
+    /// Install a matrix-free per-row cross-block operator for cache consumers.
+    ///
+    /// The closure must write `out = H_tβ^(row) x` for `out.len() == d` and
+    /// `x.len() == K`. It is used only after the Newton solve, by IFT/evidence
+    /// predictors that need row cross-block products without retaining the
+    /// full `N · d · K` dense slab in the factor cache.
+    pub fn set_row_htbeta_operator<F>(&mut self, matvec: F)
+    where
+        F: for<'a> Fn(usize, ArrayView1<'a, f64>, &mut Array1<f64>) + Send + Sync + 'static,
+    {
+        self.htbeta_matvec = Some(Arc::new(matvec));
         self.refresh_row_hessian_fingerprint();
     }
 
@@ -1062,13 +1086,98 @@ fn analytic_penalty_is_row_block_diagonal(penalty: &AnalyticPenaltyKind) -> bool
 /// loop perturbs `(β, ρ)` by a small amount, the new Newton step can be
 /// predicted by re-using these factors against a refreshed RHS, saving
 /// the dominant `O(N d³ + K³)` factorization cost.
+#[derive(Clone)]
+pub enum ArrowUndampedFactors {
+    SameAsDamped,
+    Owned(Arc<[Array2<f64>]>),
+}
+
+impl std::fmt::Debug for ArrowUndampedFactors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SameAsDamped => f.write_str("SameAsDamped"),
+            Self::Owned(factors) => f.debug_tuple("Owned").field(&factors.len()).finish(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum ArrowHtbetaCache {
+    Dense {
+        blocks: Arc<[Array2<f64>]>,
+        estimated_bytes: usize,
+    },
+    Matvec {
+        op: RowHtbetaMatvec,
+        estimated_bytes: usize,
+    },
+    Disabled {
+        estimated_bytes: usize,
+    },
+}
+
+impl std::fmt::Debug for ArrowHtbetaCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dense {
+                blocks,
+                estimated_bytes,
+            } => f
+                .debug_struct("Dense")
+                .field("blocks", &blocks.len())
+                .field("estimated_bytes", estimated_bytes)
+                .finish(),
+            Self::Matvec { estimated_bytes, .. } => f
+                .debug_struct("Matvec")
+                .field("estimated_bytes", estimated_bytes)
+                .finish(),
+            Self::Disabled { estimated_bytes } => f
+                .debug_struct("Disabled")
+                .field("estimated_bytes", estimated_bytes)
+                .finish(),
+        }
+    }
+}
+
+impl ArrowHtbetaCache {
+    fn is_available(&self) -> bool {
+        !matches!(self, Self::Disabled { .. })
+    }
+
+    fn apply_row(&self, row: usize, delta_beta: ArrayView1<'_, f64>, out: &mut Array1<f64>) -> bool {
+        match self {
+            Self::Dense { blocks, .. } => {
+                let Some(block) = blocks.get(row) else {
+                    return false;
+                };
+                if block.ncols() != delta_beta.len() || block.nrows() != out.len() {
+                    return false;
+                }
+                for c in 0..block.nrows() {
+                    let mut acc = 0.0_f64;
+                    for a in 0..block.ncols() {
+                        acc += block[[c, a]] * delta_beta[a];
+                    }
+                    out[c] = acc;
+                }
+                true
+            }
+            Self::Matvec { op, .. } => {
+                op(row, delta_beta, out);
+                true
+            }
+            Self::Disabled { .. } => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ArrowFactorCache {
     /// Per-row lower-triangular Cholesky factors of `H_tt^(i) + ridge_t·I`.
     ///
     /// These are the *damped* factors used inside the Newton solve. The IFT
     /// predictor must NOT use them — see [`Self::htt_factors_undamped`].
-    pub htt_factors: Vec<Array2<f64>>,
+    pub htt_factors: Arc<[Array2<f64>]>,
     /// Per-row lower-triangular Cholesky factors of the UNDAMPED
     /// `H_tt^(i)` (no `ridge_t` added).
     ///
@@ -1079,7 +1188,7 @@ pub struct ArrowFactorCache {
     /// in proportion to `ridge_t`. We pay one extra `O(N d³)` Cholesky per
     /// Newton solve — the same complexity class as the Newton solve itself —
     /// to make the IFT exact.
-    pub htt_factors_undamped: Vec<Array2<f64>>,
+    pub htt_factors_undamped: ArrowUndampedFactors,
     /// Lower-triangular Cholesky factor of the Schur complement when the
     /// selected BA mode formed/factored dense RCS. `None` for
     /// [`ArrowSolverMode::InexactPCG`], where Agarwal-style inexact LM avoids
@@ -1092,11 +1201,11 @@ pub struct ArrowFactorCache {
     /// requested ridge level).
     pub ridge_t: f64,
     pub ridge_beta: f64,
-    /// Per-row cross-blocks `H_tβ^(i)` carried so the IFT warm-start
-    /// predictor (see `crate::solver::persistent_warm_start::ift_warm_start_latent`)
-    /// can rebuild the `β`-coupled RHS without revisiting the assembly
-    /// path. Length `N`, each entry shape `(d, K)`.
-    pub htbeta: Vec<Array2<f64>>,
+    /// Per-row cross-block access for `H_tβ^(i) x`.
+    ///
+    /// Large caches retain a row matvec callback or disable β-coupled IFT
+    /// prediction instead of cloning every dense `d × K` slab.
+    pub htbeta: ArrowHtbetaCache,
     /// Latent dimensionality `d`.
     pub d: usize,
     /// β dimensionality `K`.
@@ -1109,6 +1218,44 @@ pub struct ArrowFactorCache {
 }
 
 impl ArrowFactorCache {
+    pub fn n_rows(&self) -> usize {
+        self.htt_factors.len()
+    }
+
+    pub fn htbeta_available(&self) -> bool {
+        self.htbeta.is_available()
+    }
+
+    pub fn undamped_factor(&self, row: usize) -> &Array2<f64> {
+        match &self.htt_factors_undamped {
+            ArrowUndampedFactors::SameAsDamped => &self.htt_factors[row],
+            ArrowUndampedFactors::Owned(factors) => &factors[row],
+        }
+    }
+
+    pub fn undamped_factor_count(&self) -> usize {
+        match &self.htt_factors_undamped {
+            ArrowUndampedFactors::SameAsDamped => self.htt_factors.len(),
+            ArrowUndampedFactors::Owned(factors) => factors.len(),
+        }
+    }
+
+    pub fn undamped_factors_iter(&self) -> impl Iterator<Item = &Array2<f64>> {
+        (0..self.undamped_factor_count()).map(|row| self.undamped_factor(row))
+    }
+
+    pub fn apply_htbeta_row(
+        &self,
+        row: usize,
+        delta_beta: ArrayView1<'_, f64>,
+        out: &mut Array1<f64>,
+    ) -> bool {
+        if out.len() != self.d || delta_beta.len() != self.k {
+            return false;
+        }
+        self.htbeta.apply_row(row, delta_beta, out)
+    }
+
     /// Apply `Δt_i = -(H_tt^(i))⁻¹ · (H_tβ^(i) · Δβ)` per row, returning
     /// the flat row-major `Δt` of length `N · d`.
     ///
@@ -1117,30 +1264,19 @@ impl ArrowFactorCache {
     /// `proposals/latent_coord.md` §2.2. BA analogue: back-substitution after
     /// reduced-camera-system solve.
     pub fn predict_delta_t_from_delta_beta(&self, delta_beta: ArrayView1<'_, f64>) -> Array1<f64> {
-        let n = self.htt_factors_undamped.len();
+        let n = self.undamped_factor_count();
         let d = self.d;
-        let k = self.k;
-        debug_assert_eq!(delta_beta.len(), k);
-        debug_assert_eq!(self.htbeta.len(), n);
+        debug_assert_eq!(delta_beta.len(), self.k);
+        if !self.htbeta_available() {
+            return Array1::<f64>::zeros(n * d);
+        }
         let mut out = Array1::<f64>::zeros(n * d);
         let mut rhs = Array1::<f64>::zeros(d);
         for i in 0..n {
-            debug_assert_eq!(self.htbeta[i].dim(), (d, k));
-            // Inline matvec: H_tβ^(i) · δβ. Row-major iteration over the
-            // (d, k) cross block keeps the inner k-loop unit-strided in
-            // memory.
-            for c in 0..d {
-                rhs[c] = 0.0;
+            if !self.apply_htbeta_row(i, delta_beta.view(), &mut rhs) {
+                return Array1::<f64>::zeros(n * d);
             }
-            for c in 0..d {
-                let mut acc = 0.0_f64;
-                for a in 0..k {
-                    acc += self.htbeta[i][[c, a]] * delta_beta[a];
-                }
-                rhs[c] = acc;
-            }
-            // Use UNDAMPED factor: IFT inverts H_tt, not H_tt + ridge_t·I.
-            let v = chol_solve_vector(&self.htt_factors_undamped[i], &rhs);
+            let v = chol_solve_vector(self.undamped_factor(i), &rhs);
             for c in 0..d {
                 out[i * d + c] = -v[c];
             }
@@ -1162,11 +1298,10 @@ impl ArrowFactorCache {
         delta_beta: Option<ArrayView1<'_, f64>>,
         delta_gt: Option<ArrayView1<'_, f64>>,
     ) -> Array1<f64> {
-        let n = self.htt_factors_undamped.len();
+        let n = self.undamped_factor_count();
         let d = self.d;
-        let k = self.k;
         if let Some(db) = delta_beta.as_ref() {
-            debug_assert_eq!(db.len(), k);
+            debug_assert_eq!(db.len(), self.k);
         }
         if let Some(dg) = delta_gt.as_ref() {
             debug_assert_eq!(dg.len(), n * d);
@@ -1178,13 +1313,12 @@ impl ArrowFactorCache {
                 rhs[c] = 0.0;
             }
             if let Some(db) = delta_beta.as_ref() {
-                debug_assert_eq!(self.htbeta[i].dim(), (d, k));
+                let mut htbeta_delta = Array1::<f64>::zeros(d);
+                if !self.apply_htbeta_row(i, db.view(), &mut htbeta_delta) {
+                    return Array1::<f64>::zeros(n * d);
+                }
                 for c in 0..d {
-                    let mut acc = 0.0_f64;
-                    for a in 0..k {
-                        acc += self.htbeta[i][[c, a]] * db[a];
-                    }
-                    rhs[c] += acc;
+                    rhs[c] += htbeta_delta[c];
                 }
             }
             if let Some(dg) = delta_gt.as_ref() {
@@ -1192,7 +1326,7 @@ impl ArrowFactorCache {
                     rhs[c] += dg[i * d + c];
                 }
             }
-            let v = chol_solve_vector(&self.htt_factors_undamped[i], &rhs);
+            let v = chol_solve_vector(self.undamped_factor(i), &rhs);
             for c in 0..d {
                 out[i * d + c] = -v[c];
             }
@@ -1237,11 +1371,11 @@ impl ArrowFactorCache {
     /// resolved externally by the driver). BA analogue: reuse point-block
     /// factors for local point updates after shared parameters move.
     pub fn predict_delta_t_from_delta_gt(&self, delta_gt: ArrayView1<'_, f64>) -> Array1<f64> {
-        let n = self.htt_factors_undamped.len();
+        let n = self.undamped_factor_count();
         let d = self.d;
         debug_assert_eq!(delta_gt.len(), n * d);
         debug_assert_eq!(
-            self.htt_factors_undamped.len(),
+            self.undamped_factor_count(),
             n,
             "undamped factor cache and N must agree"
         );
@@ -1251,8 +1385,7 @@ impl ArrowFactorCache {
             for c in 0..d {
                 rhs[c] = delta_gt[i * d + c];
             }
-            // Use UNDAMPED factor: IFT inverts H_tt, not H_tt + ridge_t·I.
-            let v = chol_solve_vector(&self.htt_factors_undamped[i], &rhs);
+            let v = chol_solve_vector(self.undamped_factor(i), &rhs);
             for c in 0..d {
                 out[i * d + c] = -v[c];
             }
@@ -1297,20 +1430,35 @@ pub fn solve_arrow_newton_step_with_options(
     let step = solve_arrow_newton_step_artifacts(sys, ridge_t, ridge_beta, options)?;
     let backend = CpuBatchedBlockSolver;
 
-    // Snapshot per-row cross-blocks so the IFT predictor can apply
-    // the β-coupled sensitivity without re-running the assembler.
-    let htbeta: Vec<Array2<f64>> = sys.rows.iter().map(|r| r.htbeta.clone()).collect();
+    let htbeta_estimated_bytes =
+        estimated_htbeta_bytes(sys.rows.len(), sys.d, sys.k).unwrap_or(usize::MAX);
+    let htbeta = if let Some(op) = sys.htbeta_matvec.as_ref() {
+        ArrowHtbetaCache::Matvec {
+            op: Arc::clone(op),
+            estimated_bytes: htbeta_estimated_bytes,
+        }
+    } else if htbeta_estimated_bytes <= ARROW_FACTOR_CACHE_HTBETA_BUDGET_BYTES {
+        ArrowHtbetaCache::Dense {
+            blocks: sys.rows.iter().map(|r| r.htbeta.clone()).collect::<Vec<_>>().into(),
+            estimated_bytes: htbeta_estimated_bytes,
+        }
+    } else {
+        ArrowHtbetaCache::Disabled {
+            estimated_bytes: htbeta_estimated_bytes,
+        }
+    };
     // Factor the UNDAMPED per-row blocks for the IFT predictor. When
     // ridge_t was zero the damped and undamped factors coincide and we
-    // can reuse htt_factors directly; otherwise pay a second per-row
+    // can alias htt_factors directly; otherwise pay a second per-row
     // Cholesky (O(N d³), same complexity class as the Newton solve).
-    let htt_factors_undamped: Vec<Array2<f64>> = if ridge_t == 0.0 {
-        step.htt_factors.clone()
+    let htt_factors = Arc::<[Array2<f64>]>::from(step.htt_factors);
+    let htt_factors_undamped = if ridge_t == 0.0 {
+        ArrowUndampedFactors::SameAsDamped
     } else {
-        backend.factor_blocks(&sys.rows, 0.0, sys.d)?
+        ArrowUndampedFactors::Owned(backend.factor_blocks(&sys.rows, 0.0, sys.d)?.into())
     };
     let cache = ArrowFactorCache {
-        htt_factors: step.htt_factors,
+        htt_factors,
         htt_factors_undamped,
         schur_factor: step.schur_factor,
         solver_mode: options.mode,
@@ -1323,6 +1471,12 @@ pub fn solve_arrow_newton_step_with_options(
         row_hessian_fingerprint: sys.current_row_hessian_fingerprint(),
     };
     Ok((step.delta_t, step.delta_beta, cache))
+}
+
+fn estimated_htbeta_bytes(n: usize, d: usize, k: usize) -> Option<usize> {
+    n.checked_mul(d)?
+        .checked_mul(k)?
+        .checked_mul(std::mem::size_of::<f64>())
 }
 
 /// Schur-eliminate the per-row latent block and solve with explicit options,

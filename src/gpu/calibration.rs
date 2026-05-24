@@ -239,9 +239,10 @@ pub fn measure_device(ctx: Arc<CudaContext>) -> Result<DeviceCalibration, GpuErr
 
     // D2H result so the device-side pages are exercised end-to-end (also
     // serves as a sanity check that dgemm actually wrote something).
-    let _c_host = stream
+    let c_host = stream
         .clone_dtoh(&c_dev)
         .map_err(|e| driver_err(format!("d2h C result: {e}")))?;
+    drop(c_host);
     stream
         .synchronize()
         .map_err(|e| driver_err(format!("d2h C result sync: {e}")))?;
