@@ -682,6 +682,41 @@ fn hash_weight_schedule_option(
     }
 }
 
+fn hash_gumbel_temperature_schedule(
+    hasher: &mut StableHasher,
+    schedule: &crate::terms::sae_manifold::GumbelTemperatureSchedule,
+) {
+    use crate::terms::sae_manifold::ScheduleKind;
+
+    hasher.write_f64(schedule.tau_start);
+    hasher.write_f64(schedule.tau_min);
+    match &schedule.decay {
+        ScheduleKind::Geometric { rate } => {
+            hasher.write_str("geometric");
+            hasher.write_f64(*rate);
+        }
+        ScheduleKind::Linear { steps } => {
+            hasher.write_str("linear");
+            hasher.write_usize(*steps);
+        }
+        ScheduleKind::ReciprocalIter => hasher.write_str("reciprocal-iter"),
+    }
+    hasher.write_usize(schedule.iter_count);
+}
+
+fn hash_gumbel_schedule_option(
+    hasher: &mut StableHasher,
+    schedule: &Option<crate::terms::sae_manifold::GumbelTemperatureSchedule>,
+) {
+    match schedule {
+        Some(schedule) => {
+            hasher.write_bool(true);
+            hash_gumbel_temperature_schedule(hasher, schedule);
+        }
+        None => hasher.write_bool(false),
+    }
+}
+
 fn hash_isometry_reference(
     hasher: &mut StableHasher,
     reference: &crate::terms::analytic_penalties::IsometryReference,
@@ -846,6 +881,7 @@ fn hash_analytic_penalty_kind(
             hasher.write_usize(p.k_max);
             hasher.write_f64(p.alpha);
             hasher.write_f64(p.tau);
+            hash_gumbel_schedule_option(hasher, &p.temperature_schedule);
             hasher.write_bool(p.learnable_alpha);
             hasher.write_f64(p.weight);
             hash_weight_schedule_option(hasher, &p.weight_schedule);

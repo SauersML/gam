@@ -2828,40 +2828,6 @@ fn update_custom_outer_inner_cap_from_warm_start(
     outer_cap.store(next_cap, Ordering::Relaxed);
 }
 
-fn warm_start_matches_block_log_lambdas(
-    seed: &ConstrainedWarmStart,
-    block_log_lambdas: &[Array1<f64>],
-) -> bool {
-    let expected = block_log_lambdas
-        .iter()
-        .map(|values| values.len())
-        .sum::<usize>();
-    if seed.rho.len() != expected {
-        return false;
-    }
-    let mut offset = 0usize;
-    for block in block_log_lambdas {
-        let end = offset + block.len();
-        if seed.rho.slice(s![offset..end]) != block.view() {
-            return false;
-        }
-        offset = end;
-    }
-    true
-}
-
-fn cached_inner_mode_from_result(result: &BlockwiseInnerResult) -> CachedInnerMode {
-    CachedInnerMode {
-        log_likelihood: result.log_likelihood,
-        penalty_value: result.penalty_value,
-        cycles: result.cycles,
-        converged: result.converged,
-        block_logdet_h: result.block_logdet_h,
-        block_logdet_s: result.block_logdet_s,
-        joint_workspace: result.joint_workspace.clone(),
-    }
-}
-
 /// Helper struct mirroring the old `BlockwiseFitResultParts`.
 pub struct BlockwiseFitResultParts {
     pub block_states: Vec<ParameterBlockState>,
