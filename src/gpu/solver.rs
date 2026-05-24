@@ -21,7 +21,6 @@ pub fn backend_status() -> BackendStatus {
     }
 }
 
-#[cfg(feature = "cuda")]
 mod cuda {
     use crate::gpu::driver::{from_col_major, to_col_major};
     use cudarc::cusolver::{DnHandle, sys as cusolver_sys};
@@ -242,41 +241,31 @@ mod cuda {
     }
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) use cuda::{
     cholesky_logdet_from_col_major, context_and_stream, pinned_htod, potrf_in_place, potrs_in_place,
 };
 
-#[cfg(feature = "cuda")]
 pub fn cholesky_solve_gpu(
     hessian: ArrayView2<'_, f64>,
     rhs: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, f64), String> {
+    if super::runtime::GpuRuntime::global().is_none() {
+        let (rows, cols) = hessian.dim();
+        return Err(format!(
+            "CUDA runtime unavailable for Cholesky solve; hessian={rows}x{cols}, rhs={}x{}",
+            rhs.nrows(),
+            rhs.ncols()
+        ));
+    }
     cuda::cholesky_solve(hessian, rhs)
 }
 
-#[cfg(not(feature = "cuda"))]
-pub fn cholesky_solve_gpu(
-    hessian: ArrayView2<'_, f64>,
-    rhs: ArrayView2<'_, f64>,
-) -> Result<(Array2<f64>, f64), String> {
-    let (rows, cols) = hessian.dim();
-    Err(format!(
-        "cuda feature is not enabled for Cholesky solve; hessian={rows}x{cols}, rhs={}x{}",
-        rhs.nrows(),
-        rhs.ncols()
-    ))
-}
-
-#[cfg(feature = "cuda")]
 pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+    if super::runtime::GpuRuntime::global().is_none() {
+        let (rows, cols) = hessian.dim();
+        return Err(format!(
+            "CUDA runtime unavailable for Cholesky factorization; hessian={rows}x{cols}"
+        ));
+    }
     cuda::cholesky_lower(hessian)
-}
-
-#[cfg(not(feature = "cuda"))]
-pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    let (rows, cols) = hessian.dim();
-    Err(format!(
-        "cuda feature is not enabled for Cholesky factorization; hessian={rows}x{cols}"
-    ))
 }

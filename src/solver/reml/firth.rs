@@ -2252,7 +2252,6 @@ impl FirthDenseOperator {
     ///   [(YBWᵀ) ⊙ (Y'B'W'ᵀ) v]_i= rowwise_bilinear(Y, B · (Wᵀdiag(v)W') · B'ᵀ, Y')_i,
     ///
     /// with S := row-wise reducedweighted Gram.
-    #[allow(clippy::too_many_arguments)]
     fn apply_p_ddot_ij(
         &self,
         x_r: &Array2<f64>,

@@ -22062,7 +22062,6 @@ mod tests {
     /// alt) and panics with full violations only if `assert_pass` is true.
     /// Knobs let one-at-a-time variants of the original BinomialProbit Duchon
     /// failure isolate which dimension triggers the analytic-vs-FD blow-up.
-    #[allow(clippy::too_many_arguments)]
     fn iso_kappa_fd_variant_driver(
         label: &str,
         n: usize,

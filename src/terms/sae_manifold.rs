@@ -188,7 +188,6 @@ pub struct SaeManifoldAtom {
 }
 
 impl SaeManifoldAtom {
-    #[allow(clippy::too_many_arguments)]
     #[must_use = "build error must be handled"]
     pub fn new(
         name: impl Into<String>,
@@ -1624,7 +1623,6 @@ fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) -> bool {
 /// Helper for padded FFI callers. Arrays use `(K, N, M_max)` and
 /// `(K, N, M_max, D_max)` storage, with `basis_sizes` and `latent_dims`
 /// selecting each atom's active prefix.
-#[allow(clippy::too_many_arguments)]
 #[must_use = "build error must be handled"]
 pub fn term_from_padded_blocks_with_mode(
     n_obs: usize,

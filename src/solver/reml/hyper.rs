@@ -833,7 +833,6 @@ impl<'a> RemlState<'a> {
             .collect()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn build_tau_tau_pair_callback(
         basis: TauPairBasis,
         pld: std::sync::Arc<super::penalty_logdet::PenaltyPseudologdet>,
