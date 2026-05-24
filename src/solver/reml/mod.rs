@@ -1253,8 +1253,11 @@ mod tests {
         // With the exact pseudoinverse, the null-direction trace is zero:
         // tr(S⁺ S_null) = 0 because S⁺ projects onto the positive eigenspace
         // and u₀ is orthogonal to it.
+        let penalty_subspace = state
+            .compute_penalty_subspace(e, pr.ridge_passport)
+            .expect("penalty-subspace");
         let tr_null = state
-            .fixed_subspace_penalty_trace(e, &s_dir_null, pr.ridge_passport)
+            .fixed_subspace_penalty_trace_from_subspace(&penalty_subspace, &s_dir_null)
             .expect("trace-null");
         assert!(
             tr_null.abs() < 1e-10,
@@ -1262,7 +1265,7 @@ mod tests {
         );
 
         let tr_pos = state
-            .fixed_subspace_penalty_trace(e, &s_dir_pos, pr.ridge_passport)
+            .fixed_subspace_penalty_trace_from_subspace(&penalty_subspace, &s_dir_pos)
             .expect("trace-pos");
         // With exact pseudoinverse, expected is 1/σ_pos.
         let expected_pos = 1.0 / evals[pos_idx];

@@ -53,7 +53,10 @@ fn bench_arrow_gpu(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let start = Instant::now();
             for _ in 0..iters {
-                black_box(sys.solve_with_options(1e-8, 1e-8, &direct));
+                let solution = sys
+                    .solve_with_options(1e-8, 1e-8, &direct)
+                    .expect("CPU direct Arrow-Schur solve should succeed in benchmark fixture");
+                black_box(solution);
             }
             start.elapsed()
         })
@@ -64,11 +67,12 @@ fn bench_arrow_gpu(c: &mut Criterion) {
             configure_device(Device::Cuda);
             let start = Instant::now();
             for _ in 0..iters {
-                black_box(
+                let solution =
                     gam::solver::gpu::arrow_schur_gpu::solve_arrow_newton_step_gpu(
                         &sys, 1e-8, 1e-8,
-                    ),
-                );
+                    )
+                    .expect("CUDA Arrow-Schur solve should succeed in benchmark fixture");
+                black_box(solution);
             }
             start.elapsed()
         })

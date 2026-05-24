@@ -8407,8 +8407,8 @@ fn upper_triangle_pair_from_index(pair_idx: usize, n: usize) -> (usize, usize) {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct OuterHessianRoutePlan {
-    use_operator: bool,
+pub(crate) struct OuterHessianRoutePlan {
+    pub(crate) use_operator: bool,
     reason: &'static str,
     scale_prefers_operator: bool,
     dense_workspace_bytes: usize,
@@ -8526,7 +8526,7 @@ fn callback_outer_hessian_scale_decision(
     }
 }
 
-fn outer_hessian_route_plan(
+pub(crate) fn outer_hessian_route_plan(
     n: usize,
     p: usize,
     k: usize,
