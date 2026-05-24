@@ -1133,7 +1133,6 @@ struct BernoulliMarginalSlopeFamily {
     auto_subsample_last_rho: Arc<Mutex<Option<Array1<f64>>>>,
 }
 
-#[derive(Clone)]
 /// Number of outer-gradient evaluations the auto-subsample schedule
 /// spends in Phase 1 (stratified subsample, ≈ 1 % gradient noise).
 /// After this many calls the family reverts to full data for all

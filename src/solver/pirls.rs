@@ -32,8 +32,7 @@ use faer::sparse::{
 use faer::{Accum, Par, Side, Unbind, get_global_parallelism};
 use log;
 use ndarray::{
-    Array1, Array2, ArrayBase, ArrayView1, ArrayView2, ArrayView3, Data, Ix1, Ix2, ShapeBuilder,
-    Zip, s,
+    Array1, Array2, ArrayBase, ArrayView1, ArrayView2, ArrayView3, Data, Ix2, ShapeBuilder, Zip, s,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
