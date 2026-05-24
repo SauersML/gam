@@ -28,10 +28,8 @@ Design choices
   ``shape_constraint`` kwargs for API consistency with other ``Smooth`` specs.
 * Defaults mirror the underlying primitives (``n_knots=20`` for 1D curves;
   ``n_centers=64`` for Duchon patches; ``8`` per axis for 2D tensor / radial).
-* For ``Cylinder`` / ``Torus`` we rely on the ``periodic_per_axis`` flag on
-  :class:`~gamfit.smooth.Duchon`, which already handles mixed-periodic radial
-  kernels (see ``Duchon.periodic_per_axis`` docstring). This avoids a manual
-  Kronecker / tensor-product construction.
+* ``Cylinder`` / ``Torus`` are explicit tensor B-spline candidates, matching
+  the formula path used by topology selection.
 * For d >= 2 the underlying Duchon basis requires explicit ``centers``; the
   ``centers`` kwarg is forwarded so users can pass them. When omitted the
   wrappers pass ``n_centers`` (an ``int``) through to the spec, which the
@@ -42,14 +40,16 @@ Design choices
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Any
 
 from .smooth import (
+    BSpline,
     Duchon,
     PeriodicSplineCurve,
     ShapeConstraintLiteral,
     Smooth,
     Sphere as _SphereSmooth,
+    TensorBSpline,
 )
 
 
@@ -75,6 +75,25 @@ def _common(
         "double_penalty": double_penalty,
         "shape_constraint": shape_constraint,
     }
+
+
+def _tensor_topology(
+    name: str | None,
+    n_knots: tuple[int, int],
+    periodic: tuple[bool, bool],
+    by: Any | None,
+    double_penalty: bool,
+    shape_constraint: ShapeConstraintLiteral | None,
+) -> Smooth:
+    spec = TensorBSpline(
+        marginals=[BSpline(periodic=value) for value in periodic],
+        **_common(name, by, double_penalty, shape_constraint),
+    )
+    setattr(spec, "_gamfit_topology_dim", 2)
+    setattr(spec, "_gamfit_tensor_k", tuple(int(value) for value in n_knots))
+    setattr(spec, "_gamfit_tensor_periods", tuple("2*pi" if value else None for value in periodic))
+    setattr(spec, "_gamfit_tensor_identifiability", "sum_tozero")
+    return spec
 
 
 def Circle(
@@ -117,9 +136,6 @@ def Cylinder(
     name: str | None = None,
     n_knots: tuple[int, int] = (20, 8),
     *,
-    centers: Any | None = None,
-    m: int = 2,
-    length_scale: float | None = None,
     by: Any | None = None,
     double_penalty: bool = False,
     shape_constraint: ShapeConstraintLiteral | None = None,
@@ -130,42 +146,20 @@ def Cylinder(
     lightness, time-of-day x temperature). The input is ``(N, 2)`` with
     the first column the periodic axis.
 
-    Implemented as :class:`~gamfit.smooth.Duchon` with d=2 and
-    ``periodic_per_axis=(True, False)`` — the mixed-periodic radial
-    polyharmonic kernel on cylinder chord distance (see ``Duchon``
-    docstring).
+    Implemented as a :class:`~gamfit.smooth.TensorBSpline` with a periodic
+    first margin and a nonperiodic second margin.
 
     Parameters
     ----------
-    n_knots : ``(n_periodic, n_nonperiodic)`` — only used to size auto
-        centers; ignored when ``centers`` is supplied.
-    centers : optional ``(K, 2)`` array of control points. Required in
-        practice for d=2 (see Admissibility note below).
-
-    Admissibility
-    -------------
-    The Rust core's auto-center derivation is currently d=1 only; for the
-    d=2 cylinder the user must pass explicit ``centers``. Passing them as
-    a regular grid (e.g. ``itertools.product(periodic_grid, real_grid)``)
-    is the simplest pattern. This is a *maintainer-review item*: auto-grid
-    derivation for d>=2 radial bases would close the gap.
+    n_knots : ``(n_periodic, n_nonperiodic)`` tensor basis sizes.
     """
-    return Duchon(
-        centers=centers if centers is not None else int(n_knots[0] * n_knots[1]),
-        m=int(m),
-        length_scale=length_scale,
-        periodic_per_axis=(True, False),
-        **_common(name, by, double_penalty, shape_constraint),
-    )
+    return _tensor_topology(name, n_knots, (True, False), by, double_penalty, shape_constraint)
 
 
 def Torus(
     name: str | None = None,
     n_knots: tuple[int, int] = (20, 20),
     *,
-    centers: Any | None = None,
-    m: int = 2,
-    length_scale: float | None = None,
     by: Any | None = None,
     double_penalty: bool = False,
     shape_constraint: ShapeConstraintLiteral | None = None,
@@ -176,27 +170,14 @@ def Torus(
     longitude x time-of-day for a daily-cycle equirectangular field). The
     input is ``(N, 2)`` with both columns periodic.
 
-    Implemented as :class:`~gamfit.smooth.Duchon` with d=2 and
-    ``periodic_per_axis=(True, True)`` — the mixed-periodic radial
-    polyharmonic kernel on toroidal chord distance.
+    Implemented as a :class:`~gamfit.smooth.TensorBSpline` with both margins
+    periodic.
 
     Parameters
     ----------
-    n_knots : ``(n_axis_0, n_axis_1)``. Defaults to ``(20, 20)``.
-    centers : optional ``(K, 2)`` array of control points.
-
-    Admissibility
-    -------------
-    Same caveat as :func:`Cylinder`: explicit d=2 ``centers`` are required
-    in the current Rust core because auto-derivation is d=1 only.
+    n_knots : ``(n_axis_0, n_axis_1)`` tensor basis sizes.
     """
-    return Duchon(
-        centers=centers if centers is not None else int(n_knots[0] * n_knots[1]),
-        m=int(m),
-        length_scale=length_scale,
-        periodic_per_axis=(True, True),
-        **_common(name, by, double_penalty, shape_constraint),
-    )
+    return _tensor_topology(name, n_knots, (True, True), by, double_penalty, shape_constraint)
 
 
 def Sphere(
