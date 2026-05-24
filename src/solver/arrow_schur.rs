@@ -329,23 +329,7 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
     ) -> Result<Vec<Array2<f64>>, ArrowSchurError> {
         let mut out = Vec::with_capacity(rows.len());
         for (row_idx, row) in rows.iter().enumerate() {
-            debug_assert_eq!(row.htt.dim(), (d, d), "row {row_idx} H_tt shape != (d,d)");
-            let mut block = row.htt.clone();
-            for a in 0..d {
-                block[[a, a]] += ridge_t;
-            }
-            match cholesky_lower(&block) {
-                Ok(l) => out.push(l),
-                Err(e) => {
-                    return Err(ArrowSchurError::PerRowFactorFailed {
-                        row: row_idx,
-                        reason: format!(
-                            "row {row_idx} H_tt was non-PD at ridge_t={ridge_t}; \
-                             cholesky error: {e}"
-                        ),
-                    });
-                }
-            }
+            out.push(factor_one_row(row, ridge_t, d, row_idx)?);
         }
         Ok(out)
     }
@@ -390,6 +374,26 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
             }
         }
     }
+}
+
+fn factor_one_row(
+    row: &ArrowRowBlock,
+    ridge_t: f64,
+    d: usize,
+    row_idx: usize,
+) -> Result<Array2<f64>, ArrowSchurError> {
+    debug_assert_eq!(row.htt.dim(), (d, d), "row {row_idx} H_tt shape != (d,d)");
+    let mut block = row.htt.clone();
+    for a in 0..d {
+        block[[a, a]] += ridge_t;
+    }
+    cholesky_lower(&block).map_err(|e| ArrowSchurError::PerRowFactorFailed {
+        row: row_idx,
+        reason: format!(
+            "row {row_idx} H_tt was non-PD at ridge_t={ridge_t}; \
+             cholesky error: {e}"
+        ),
+    })
 }
 
 fn manifold_mode_fingerprint(latent: &LatentCoordValues) -> u64 {
@@ -1039,6 +1043,240 @@ impl ArrowSchurSystem {
     }
 }
 
+/// Chunked Schur assembler that never retains all row cross-blocks.
+pub struct StreamingArrowSchur {
+    pub n_rows: usize,
+    pub d: usize,
+    pub k: usize,
+    pub chunk_size: usize,
+    pub s_acc: Array2<f64>,
+    rhs_acc: Array1<f64>,
+    hbb: Array2<f64>,
+    gb: Array1<f64>,
+    row_builder: StreamingArrowRowBuilder,
+    manifold_mode_fingerprint: u64,
+    row_hessian_fingerprint: u64,
+}
+
+impl std::fmt::Debug for StreamingArrowSchur {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingArrowSchur")
+            .field("n_rows", &self.n_rows)
+            .field("d", &self.d)
+            .field("k", &self.k)
+            .field("chunk_size", &self.chunk_size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StreamingArrowSchur {
+    #[must_use]
+    pub fn new(
+        n_rows: usize,
+        d: usize,
+        k: usize,
+        hbb: Array2<f64>,
+        gb: Array1<f64>,
+        row_builder: StreamingArrowRowBuilder,
+        chunk_size: usize,
+    ) -> Self {
+        debug_assert_eq!(hbb.dim(), (k, k));
+        debug_assert_eq!(gb.len(), k);
+        Self {
+            n_rows,
+            d,
+            k,
+            chunk_size: chunk_size.max(1),
+            s_acc: Array2::<f64>::zeros((k, k)),
+            rhs_acc: Array1::<f64>::zeros(k),
+            hbb,
+            gb,
+            row_builder,
+            manifold_mode_fingerprint: EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT,
+            row_hessian_fingerprint: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn from_system(sys: &ArrowSchurSystem, chunk_size: usize) -> Self {
+        let rows = Arc::new(sys.rows.clone());
+        let row_builder: StreamingArrowRowBuilder = Arc::new(move |row| {
+            rows.get(row)
+                .cloned()
+                .ok_or_else(|| ArrowSchurError::SchurFactorFailed {
+                    reason: format!("streaming row {row} out of bounds"),
+                })
+        });
+        let mut out = Self::new(
+            sys.rows.len(),
+            sys.d,
+            sys.k,
+            sys.hbb.clone(),
+            sys.gb.clone(),
+            row_builder,
+            chunk_size,
+        );
+        out.manifold_mode_fingerprint = sys.manifold_mode_fingerprint;
+        out.row_hessian_fingerprint = sys.current_row_hessian_fingerprint();
+        out
+    }
+
+    pub fn set_fingerprints(&mut self, manifold_mode: u64, row_hessian: u64) {
+        self.manifold_mode_fingerprint = manifold_mode;
+        self.row_hessian_fingerprint = row_hessian;
+    }
+
+    /// Reset the dense shared accumulator to `H_ββ + ridge_beta I`.
+    pub fn reset_accumulator(&mut self, ridge_beta: f64) -> Result<(), ArrowSchurError> {
+        if self.hbb.dim() != (self.k, self.k) {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: "streaming Arrow-Schur requires a dense beta block accumulator"
+                    .to_string(),
+            });
+        }
+        self.s_acc.assign(&self.hbb);
+        for j in 0..self.k {
+            self.s_acc[[j, j]] += ridge_beta;
+            self.rhs_acc[j] = 0.0;
+        }
+        Ok(())
+    }
+
+    /// Accumulate rows `[start, end)` into the reduced RHS and Schur block.
+    pub fn accumulate_chunk(
+        &mut self,
+        start: usize,
+        end: usize,
+        ridge_t: f64,
+        mode: ArrowSolverMode,
+    ) -> Result<(), ArrowSchurError> {
+        if start > end || end > self.n_rows {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "streaming Arrow-Schur chunk [{start}, {end}) outside 0..{}",
+                    self.n_rows
+                ),
+            });
+        }
+        let backend = CpuBatchedBlockSolver;
+        for row_idx in start..end {
+            let row = (self.row_builder)(row_idx)?;
+            self.validate_row(row_idx, &row)?;
+            let factor = factor_one_row(&row, ridge_t, self.d, row_idx)?;
+            let v = backend.solve_block_vector(&factor, &row.gt);
+            for c in 0..self.d {
+                let vc = v[c];
+                if vc == 0.0 {
+                    continue;
+                }
+                for a in 0..self.k {
+                    self.rhs_acc[a] += row.htbeta[[c, a]] * vc;
+                }
+            }
+            match mode {
+                ArrowSolverMode::Direct => {
+                    let solved = backend.solve_block_matrix(&factor, &row.htbeta);
+                    backend.block_gemm_subtract(&mut self.s_acc, &row.htbeta, &solved);
+                }
+                ArrowSolverMode::SqrtBA => {
+                    let whitened = backend.sqrt_solve_block_matrix(&factor, &row.htbeta);
+                    backend.block_gemm_subtract(&mut self.s_acc, &whitened, &whitened);
+                }
+                ArrowSolverMode::InexactPCG => {
+                    return Err(ArrowSchurError::PcgFailed {
+                        reason: "streaming Arrow-Schur accumulator is for dense direct modes; use matrix-free PCG without streaming_chunk_size".to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn solve(
+        &mut self,
+        ridge_t: f64,
+        ridge_beta: f64,
+        options: &ArrowSolveOptions,
+    ) -> Result<(Array1<f64>, Array1<f64>, Option<Array2<f64>>), ArrowSchurError> {
+        self.reset_accumulator(ridge_beta)?;
+        for start in (0..self.n_rows).step_by(self.chunk_size) {
+            let end = (start + self.chunk_size).min(self.n_rows);
+            self.accumulate_chunk(start, end, ridge_t, options.mode)?;
+        }
+        for j in 0..self.k {
+            self.rhs_acc[j] -= self.gb[j];
+        }
+        symmetrize_upper_from_lower(&mut self.s_acc);
+        let trust_metric_weights = None;
+        let (delta_beta, schur_factor) =
+            solve_dense_reduced_system(&self.s_acc, &self.rhs_acc, options, trust_metric_weights)?;
+        let delta_t = self.back_substitute(ridge_t, delta_beta.view())?;
+        Ok((delta_t, delta_beta, schur_factor))
+    }
+
+    fn back_substitute(
+        &self,
+        ridge_t: f64,
+        delta_beta: ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, ArrowSchurError> {
+        let backend = CpuBatchedBlockSolver;
+        let mut delta_t = Array1::<f64>::zeros(self.n_rows * self.d);
+        let mut rhs = Array1::<f64>::zeros(self.d);
+        for start in (0..self.n_rows).step_by(self.chunk_size) {
+            let end = (start + self.chunk_size).min(self.n_rows);
+            for row_idx in start..end {
+                let row = (self.row_builder)(row_idx)?;
+                self.validate_row(row_idx, &row)?;
+                let factor = factor_one_row(&row, ridge_t, self.d, row_idx)?;
+                for c in 0..self.d {
+                    let mut acc = row.gt[c];
+                    for a in 0..self.k {
+                        acc += row.htbeta[[c, a]] * delta_beta[a];
+                    }
+                    rhs[c] = acc;
+                }
+                let dt_i = backend.solve_block_vector(&factor, &rhs);
+                let row_base = row_idx * self.d;
+                for c in 0..self.d {
+                    delta_t[row_base + c] = -dt_i[c];
+                }
+            }
+        }
+        Ok(delta_t)
+    }
+
+    fn validate_row(&self, row_idx: usize, row: &ArrowRowBlock) -> Result<(), ArrowSchurError> {
+        if row.htt.dim() != (self.d, self.d) {
+            return Err(ArrowSchurError::PerRowFactorFailed {
+                row: row_idx,
+                reason: format!(
+                    "streaming row H_tt shape {:?} != ({}, {})",
+                    row.htt.dim(),
+                    self.d,
+                    self.d
+                ),
+            });
+        }
+        if row.htbeta.dim() != (self.d, self.k) {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "streaming row H_tβ shape {:?} != ({}, {})",
+                    row.htbeta.dim(),
+                    self.d,
+                    self.k
+                ),
+            });
+        }
+        if row.gt.len() != self.d {
+            return Err(ArrowSchurError::PerRowFactorFailed {
+                row: row_idx,
+                reason: format!("streaming row g_t length {} != {}", row.gt.len(), self.d),
+            });
+        }
+        Ok(())
+    }
+}
+
 fn apply_analytic_penalty<S, G, D, P, H>(
     penalty: &AnalyticPenaltyKind,
     target: ArrayView1<'_, f64>,
@@ -1442,6 +1680,11 @@ pub fn solve_arrow_newton_step_with_options(
     ridge_beta: f64,
     options: &ArrowSolveOptions,
 ) -> Result<(Array1<f64>, Array1<f64>, ArrowFactorCache), ArrowSchurError> {
+    if options.streaming_chunk_size.is_some() {
+        return Err(ArrowSchurError::SchurFactorFailed {
+            reason: "streaming Arrow-Schur solve does not materialize the factor cache required by this entry point".to_string(),
+        });
+    }
     let step = solve_arrow_newton_step_artifacts(sys, ridge_t, ridge_beta, options)?;
     let backend = CpuBatchedBlockSolver;
 
@@ -1504,6 +1747,12 @@ pub fn solve_arrow_newton_step_core(
     ridge_beta: f64,
     options: &ArrowSolveOptions,
 ) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
+    if let Some(chunk_size) = options.streaming_chunk_size {
+        let mut streaming = StreamingArrowSchur::from_system(sys, chunk_size);
+        return streaming
+            .solve(ridge_t, ridge_beta, options)
+            .map(|(delta_t, delta_beta, _)| (delta_t, delta_beta));
+    }
     solve_arrow_newton_step_artifacts(sys, ridge_t, ridge_beta, options)
         .map(|step| (step.delta_t, step.delta_beta))
 }
@@ -1521,6 +1770,16 @@ fn solve_arrow_newton_step_artifacts(
     ridge_beta: f64,
     options: &ArrowSolveOptions,
 ) -> Result<ArrowNewtonStepArtifacts, ArrowSchurError> {
+    if let Some(chunk_size) = options.streaming_chunk_size {
+        let mut streaming = StreamingArrowSchur::from_system(sys, chunk_size);
+        let (delta_t, delta_beta, schur_factor) = streaming.solve(ridge_t, ridge_beta, options)?;
+        return Ok(ArrowNewtonStepArtifacts {
+            delta_t,
+            delta_beta,
+            htt_factors: Vec::new(),
+            schur_factor,
+        });
+    }
     let n = sys.rows.len();
     let d = sys.d;
     let k = sys.k;

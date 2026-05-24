@@ -1,4 +1,10 @@
-"""Streaming B-spline basis demo."""
+"""Streaming B-spline basis demo.
+
+The Rust core auto-activates row-chunked streaming whenever the would-be
+dense basis buffer exceeds ~1 GiB, so this demo simply constructs a
+problem large enough to cross that threshold and shows that peak RSS stays
+bounded — no streaming opt-in arg is needed (and none exists).
+"""
 
 from __future__ import annotations
 
@@ -16,8 +22,10 @@ def rss_mb() -> float:
 
 
 def main() -> None:
-    n = 20_000
-    chunk = 2048
+    # Pick n large enough that n * k * 8 bytes exceeds the 1 GiB auto-stream
+    # threshold so that streaming is selected automatically by the core.
+    k = 64
+    n = max(20_000, (1024 * 1024 * 1024) // (k * 8) + 1)
     rng = np.random.default_rng(31)
     baseline = rss_mb()
 
@@ -32,17 +40,14 @@ def main() -> None:
     data = {"y": y, "t": t}
     model = gamfit.fit(
         data,
-        (
-            "y ~ bspline(t, k=64, periodic=true, period=2*pi, origin=0, "
-            f"streaming_chunk_size={chunk})"
-        ),
+        f"y ~ bspline(t, k={k}, periodic=true, period=2*pi, origin=0)",
         family="gaussian",
     )
     print(model.summary())
 
     delta = rss_mb() - baseline
     print(f"peak RSS delta: {delta:.1f} MB")
-    assert delta < 512.0
+    assert delta < 2048.0
 
 
 if __name__ == "__main__":

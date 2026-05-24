@@ -7095,4 +7095,270 @@ mod tests {
         assert!((dr[0] - (-0.5)).abs() < 1e-12);
         assert!((dr[1] - 1.0).abs() < 1e-12);
     }
+
+    // ----- BlockOrthogonalityPenalty tests -----
+
+    fn block_ortho_test_target() -> Array1<f64> {
+        // n_eff = 4, latent_dim = 4, row-major (n*d + a):
+        // T = [[ 1, 0, 1,  0],
+        //      [ 0, 1, 0,  1],
+        //      [ 1, 1, 1, -1],
+        //      [-1, 0, 1,  0]]
+        // Groups = [[0,1], [2,3]]
+        // Between-block cross Gram (T_L^T T_R) is 2x2:
+        //   col0·col2 = 1*1 + 0*0 + 1*1 + (-1)*1 = 1
+        //   col0·col3 = 1*0 + 0*1 + 1*(-1) + (-1)*0 = -1
+        //   col1·col2 = 0*1 + 1*0 + 1*1 + 0*1 = 1
+        //   col1·col3 = 0*0 + 1*1 + 1*(-1) + 0*0 = 0
+        // ‖.‖_F² = 1 + 1 + 1 + 0 = 3
+        array![1.0_f64, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 1.0, 0.0]
+    }
+
+    #[test]
+    fn block_orthogonality_value_matches_offdiag_gram_frobenius() {
+        let t = block_ortho_test_target();
+        let target = PsiSlice::full(t.len(), Some(4));
+        let pen = BlockOrthogonalityPenalty::new(
+            target,
+            vec![vec![0_usize, 1], vec![2, 3]],
+            2.5,
+            4,
+            false,
+        )
+        .expect("valid block orthogonality penalty");
+        let rho = array![0.0_f64];
+        let v = pen.value(t.view(), rho.view());
+        // value = 0.5 · w · 3.0 = 0.5 · 2.5 · 3.0 = 3.75
+        assert_abs_diff_eq!(v, 3.75, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn block_orthogonality_grad_matches_finite_difference() {
+        let t = block_ortho_test_target();
+        let n = t.len();
+        let target = PsiSlice::full(n, Some(4));
+        let pen = BlockOrthogonalityPenalty::new(
+            target,
+            vec![vec![0_usize, 1], vec![2, 3]],
+            1.25,
+            4,
+            false,
+        )
+        .expect("valid block orthogonality penalty");
+        let rho = array![0.0_f64];
+        let g = pen.grad_target(t.view(), rho.view());
+        let eps = 1e-6;
+        let mut max_err = 0.0_f64;
+        for i in 0..n {
+            let mut tp = t.clone();
+            let mut tm = t.clone();
+            tp[i] += eps;
+            tm[i] -= eps;
+            let fd = (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view()))
+                / (2.0 * eps);
+            let err = (g[i] - fd).abs();
+            if err > max_err {
+                max_err = err;
+            }
+            assert_abs_diff_eq!(g[i], fd, epsilon = 1e-6);
+        }
+        assert!(max_err < 1e-6, "grad-FD max abs error = {max_err:.3e}");
+    }
+
+    #[test]
+    fn block_orthogonality_hvp_matches_gradient_directional_derivative() {
+        let t = block_ortho_test_target();
+        let n = t.len();
+        let target = PsiSlice::full(n, Some(4));
+        let pen = BlockOrthogonalityPenalty::new(
+            target,
+            vec![vec![0_usize, 1], vec![2, 3]],
+            0.75,
+            4,
+            false,
+        )
+        .expect("valid block orthogonality penalty");
+        let rho = array![0.0_f64];
+        // Pick a non-trivial probe direction.
+        let v: Array1<f64> = Array1::from_vec(
+            (0..n).map(|i| 0.3 * ((i as f64) + 1.0).sin()).collect(),
+        );
+        let hv = pen.hvp(t.view(), rho.view(), v.view());
+        let eps = 1e-5;
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        for i in 0..n {
+            tp[i] += eps * v[i];
+            tm[i] -= eps * v[i];
+        }
+        let gp = pen.grad_target(tp.view(), rho.view());
+        let gm = pen.grad_target(tm.view(), rho.view());
+        let mut max_err = 0.0_f64;
+        for i in 0..n {
+            let fd = (gp[i] - gm[i]) / (2.0 * eps);
+            let err = (hv[i] - fd).abs();
+            if err > max_err {
+                max_err = err;
+            }
+            assert_abs_diff_eq!(hv[i], fd, epsilon = 1e-5);
+        }
+        assert!(max_err < 1e-5, "hvp-FD max abs error = {max_err:.3e}");
+    }
+
+    #[test]
+    fn block_orthogonality_rejects_groups_missing_an_axis() {
+        // latent_dim derived as len/n_eff = 16/4 = 4; groups cover only axes
+        // 0,1,2 → axis 3 is missing.
+        let t = block_ortho_test_target();
+        let target = PsiSlice::full(t.len(), Some(4));
+        let err = BlockOrthogonalityPenalty::new(
+            target,
+            vec![vec![0_usize, 1], vec![2]],
+            1.0,
+            4,
+            false,
+        )
+        .expect_err("groups missing axis 3 must error");
+        assert!(
+            err.contains("must partition latent axes") && err.contains("missing axis 3"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    // ----- MechanismSparsityPenalty tests -----
+
+    fn mech_sparsity_test_target() -> Array1<f64> {
+        // latent_dim = 2, p_features = 3, row-major (latent*p + feature):
+        // W = [[ 0.4, -0.3,  0.2],
+        //      [-0.1,  0.6,  0.5]]
+        array![0.4_f64, -0.3, 0.2, -0.1, 0.6, 0.5]
+    }
+
+    fn build_mech_sparsity(weight: f64) -> MechanismSparsityPenalty {
+        let t = mech_sparsity_test_target();
+        let target = PsiSlice::full(t.len(), Some(2));
+        MechanismSparsityPenalty::new(
+            target,
+            vec![vec![0_usize, 1], vec![2]],
+            weight,
+            1e-2,
+            4.0,
+            false,
+        )
+        .expect("valid mechanism sparsity penalty")
+    }
+
+    #[test]
+    fn mechanism_sparsity_value_matches_group_norm_sum() {
+        let pen = build_mech_sparsity(1.5);
+        let t = mech_sparsity_test_target();
+        let rho = array![0.0_f64];
+        let v = pen.value(t.view(), rho.view());
+        // For each latent row, sum_g sqrt(|g|) · sqrt(Σ x² + ε²)
+        let eps2 = 1e-2_f64 * 1e-2_f64;
+        let sqrt2 = 2.0_f64.sqrt();
+        // Latent 0: group{0,1} → sqrt(2)·sqrt(0.16+0.09+eps²); group{2} → 1·sqrt(0.04+eps²)
+        let l0 = sqrt2 * (0.16_f64 + 0.09 + eps2).sqrt() + (0.04_f64 + eps2).sqrt();
+        // Latent 1: group{0,1} → sqrt(2)·sqrt(0.01+0.36+eps²); group{2} → 1·sqrt(0.25+eps²)
+        let l1 = sqrt2 * (0.01_f64 + 0.36 + eps2).sqrt() + (0.25_f64 + eps2).sqrt();
+        let expected = 1.5 * (l0 + l1);
+        assert_abs_diff_eq!(v, expected, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn mechanism_sparsity_grad_matches_finite_difference() {
+        let pen = build_mech_sparsity(0.8);
+        let t = mech_sparsity_test_target();
+        let n = t.len();
+        let rho = array![0.0_f64];
+        let g = pen.grad_target(t.view(), rho.view());
+        let eps = 1e-6;
+        let mut max_err = 0.0_f64;
+        for i in 0..n {
+            let mut tp = t.clone();
+            let mut tm = t.clone();
+            tp[i] += eps;
+            tm[i] -= eps;
+            let fd = (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view()))
+                / (2.0 * eps);
+            let err = (g[i] - fd).abs();
+            if err > max_err {
+                max_err = err;
+            }
+            assert_abs_diff_eq!(g[i], fd, epsilon = 1e-6);
+        }
+        assert!(max_err < 1e-6, "grad-FD max abs error = {max_err:.3e}");
+    }
+
+    #[test]
+    fn mechanism_sparsity_hvp_matches_gradient_directional_derivative() {
+        let pen = build_mech_sparsity(0.5);
+        let t = mech_sparsity_test_target();
+        let n = t.len();
+        let rho = array![0.0_f64];
+        let v: Array1<f64> = Array1::from_vec(
+            (0..n).map(|i| 0.2 * ((i as f64) + 1.3).cos()).collect(),
+        );
+        let hv = pen.hvp(t.view(), rho.view(), v.view());
+        let eps = 1e-5;
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        for i in 0..n {
+            tp[i] += eps * v[i];
+            tm[i] -= eps * v[i];
+        }
+        let gp = pen.grad_target(tp.view(), rho.view());
+        let gm = pen.grad_target(tm.view(), rho.view());
+        let mut max_err = 0.0_f64;
+        for i in 0..n {
+            let fd = (gp[i] - gm[i]) / (2.0 * eps);
+            let err = (hv[i] - fd).abs();
+            if err > max_err {
+                max_err = err;
+            }
+            assert_abs_diff_eq!(hv[i], fd, epsilon = 1e-5);
+        }
+        assert!(max_err < 1e-5, "hvp-FD max abs error = {max_err:.3e}");
+    }
+
+    #[test]
+    fn mechanism_sparsity_rejects_groups_missing_a_feature() {
+        // groups cover features {0, 2} only → feature 1 missing.
+        let t = mech_sparsity_test_target();
+        let target = PsiSlice::full(t.len(), Some(2));
+        let err = MechanismSparsityPenalty::new(
+            target,
+            vec![vec![0_usize], vec![2]],
+            1.0,
+            1e-2,
+            4.0,
+            false,
+        )
+        .expect_err("groups missing feature 1 must error");
+        assert!(
+            err.contains("must partition features") && err.contains("missing feature 1"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn mechanism_sparsity_rejects_overlapping_groups() {
+        // Feature 1 appears in two groups → must error before reaching the
+        // missing-feature path.
+        let t = mech_sparsity_test_target();
+        let target = PsiSlice::full(t.len(), Some(2));
+        let err = MechanismSparsityPenalty::new(
+            target,
+            vec![vec![0_usize, 1], vec![1, 2]],
+            1.0,
+            1e-2,
+            4.0,
+            false,
+        )
+        .expect_err("overlapping feature must error");
+        assert!(
+            err.contains("feature 1 appears in more than one group"),
+            "unexpected error message: {err}"
+        );
+    }
 }
