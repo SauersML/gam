@@ -496,6 +496,7 @@ fn ift_mode_response_caches() -> &'static Mutex<HashMap<usize, IftModeResponseRu
     IFT_MODE_RESPONSE_CACHES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+<<<<<<< Updated upstream
 #[derive(Clone)]
 struct IftJointModeResponseRuntimeCache {
     theta: Array1<f64>,
@@ -536,6 +537,8 @@ fn latest_outer_theta_for_ift() -> Option<Array1<f64>> {
         .clone()
 }
 
+=======
+>>>>>>> Stashed changes
 fn l2_norm(values: &Array1<f64>) -> f64 {
     values.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
