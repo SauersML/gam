@@ -741,6 +741,11 @@ pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     x: &ArrayBase<S1, Ix2>,
     w: &ArrayBase<S2, Ix1>,
 ) -> Array2<f64> {
+    assert_eq!(
+        x.nrows(),
+        w.len(),
+        "fast_xt_diag_x row/weight length mismatch"
+    );
     let (_, p) = x.dim();
     crate::gpu::profile::cpu_scope(
         "fast_xt_diag_x",
@@ -760,6 +765,11 @@ pub fn fast_xt_diag_x_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64
     w: &ArrayBase<S2, Ix1>,
     par: Par,
 ) -> Array2<f64> {
+    assert_eq!(
+        x.nrows(),
+        w.len(),
+        "fast_xt_diag_x_with_parallelism row/weight length mismatch"
+    );
     let (n, p) = x.dim();
     crate::gpu::profile::cpu_scope(
         "fast_xt_diag_x_with_parallelism",
@@ -905,6 +915,16 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
     w: &ArrayBase<S2, Ix1>,
     y: &ArrayBase<S3, Ix2>,
 ) -> Array2<f64> {
+    assert_eq!(
+        x.nrows(),
+        y.nrows(),
+        "fast_xt_diag_y X/Y row mismatch"
+    );
+    assert_eq!(
+        y.nrows(),
+        w.len(),
+        "fast_xt_diag_y row/weight length mismatch"
+    );
     let n = x.nrows();
     let px = x.ncols();
     let q = y.ncols();

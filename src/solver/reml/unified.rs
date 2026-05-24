@@ -5295,18 +5295,6 @@ pub struct RemlLamlResult {
     pub ext_mode_response_cols: Option<Array2<f64>>,
 }
 
-fn mode_response_columns(vectors: &[Array1<f64>]) -> Array2<f64> {
-    let Some(first) = vectors.first() else {
-        return Array2::<f64>::zeros((0, 0));
-    };
-    let mut cols = Array2::<f64>::zeros((first.len(), vectors.len()));
-    for (idx, vector) in vectors.iter().enumerate() {
-        debug_assert_eq!(vector.len(), first.len());
-        cols.column_mut(idx).assign(vector);
-    }
-    cols
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Soft floor for penalized deviance (Gaussian profiled scale)
 // ═══════════════════════════════════════════════════════════════════════════

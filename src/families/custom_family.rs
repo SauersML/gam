@@ -42,8 +42,6 @@ use thiserror::Error;
 
 pub use crate::solver::estimate::reml::unified::{EvalMode, PseudoLogdetMode};
 
-const JOINT_NEWTON_TRUST_RADIUS_EXPANSION_MAX_STEP_INF: f64 = 20.0;
-
 /// A penalty matrix that may be stored in Kronecker-factored form.
 ///
 /// For tensor-product terms (e.g. time-varying survival covariates), the penalty
@@ -10156,110 +10154,6 @@ fn joint_inner_kkt_converged(residual: f64, residual_tol: f64) -> bool {
     residual.is_finite() && residual_tol.is_finite() && residual <= residual_tol
 }
 
-fn joint_pcg_eisenstat_walker_forcing(prev_kkt_norm: Option<f64>, current_kkt_norm: f64) -> f64 {
-    if !current_kkt_norm.is_finite() || current_kkt_norm < 0.0 {
-        return JOINT_PCG_REL_TOL;
-    }
-    let Some(prev_kkt_norm) = prev_kkt_norm else {
-        return PCG_ETA_MAX;
-    };
-    if !prev_kkt_norm.is_finite() || prev_kkt_norm <= 0.0 {
-        return JOINT_PCG_REL_TOL;
-    }
-    let ratio = current_kkt_norm / prev_kkt_norm;
-    if !ratio.is_finite() || ratio < 0.0 {
-        return JOINT_PCG_REL_TOL;
-    }
-    (PCG_GAMMA * ratio.powf(PCG_ALPHA)).clamp(PCG_ETA_MIN, PCG_ETA_MAX)
-}
-
-/// Solve the dense trust-region Newton subproblem with Hebden damping instead
-/// of rescaling the unconstrained Newton direction. Rescaling preserves
-/// near-null components of `H + S` and can leave the iterate objective-flat
-/// but far from KKT stationarity.
-fn dense_more_sorensen_step(
-    hessian_dense: &Array2<f64>,
-    ranges: &[(usize, usize)],
-    s_lambdas: &[Array2<f64>],
-    base_solver_ridge: f64,
-    rhs: &Array1<f64>,
-    radius: f64,
-    initial_unconstrained_norm: f64,
-) -> Option<(Array1<f64>, f64)> {
-    let radius = radius.max(1.0e-12);
-    let total_p = rhs.len();
-    if hessian_dense.nrows() != total_p || hessian_dense.ncols() != total_p {
-        return None;
-    }
-
-    let mut h_pen_base = hessian_dense.clone();
-    add_joint_penalty_to_matrix(&mut h_pen_base, ranges, s_lambdas, base_solver_ridge);
-    let solver = crate::linalg::utils::StableSolver::new("joint Newton TR subproblem");
-
-    let max_abs_diag = h_pen_base
-        .diag()
-        .iter()
-        .copied()
-        .map(f64::abs)
-        .fold(0.0_f64, f64::max)
-        .max(1.0e-12);
-    let mut lambda_tr =
-        if initial_unconstrained_norm.is_finite() && initial_unconstrained_norm > radius {
-            let oversize = (initial_unconstrained_norm / radius - 1.0).max(0.0);
-            (oversize * max_abs_diag).clamp(1.0e-12, 1.0e18)
-        } else {
-            0.0
-        };
-
-    let radius_tol = (1.0e-3 * radius).max(1.0e-12);
-    let mut best: Option<(Array1<f64>, f64, f64)> = None;
-    for _ in 0..8 {
-        let mut lhs = h_pen_base.clone();
-        if lambda_tr > 0.0 {
-            for d in 0..total_p {
-                lhs[[d, d]] += lambda_tr;
-            }
-        }
-
-        let delta = solver.solvevectorwithridge_retries(&lhs, rhs, JOINT_TRACE_STABILITY_RIDGE)?;
-        if !delta.iter().all(|v| v.is_finite()) {
-            lambda_tr = (lambda_tr * 4.0).max(1.0e-9);
-            continue;
-        }
-
-        let delta_norm = joint_trust_region_step_norm(&delta);
-        let err = (delta_norm - radius).abs();
-        if best.as_ref().is_none_or(|(_, _, e)| err < *e) {
-            best = Some((delta.clone(), lambda_tr, err));
-        }
-        if err <= radius_tol {
-            return Some((delta, lambda_tr));
-        }
-
-        let q = solver.solvevectorwithridge_retries(&lhs, &delta, JOINT_TRACE_STABILITY_RIDGE)?;
-        let q_norm = joint_trust_region_step_norm(&q);
-        if !q_norm.is_finite() || q_norm <= 0.0 {
-            break;
-        }
-
-        let secant = (delta_norm / q_norm).powi(2) * (delta_norm - radius) / radius;
-        let mut lambda_new = lambda_tr + secant;
-        if !lambda_new.is_finite() {
-            break;
-        }
-        if lambda_new < 0.0 {
-            lambda_new = 0.5 * lambda_tr;
-        }
-        let upper_jump = (lambda_tr.max(max_abs_diag) * 10.0).max(1.0);
-        if lambda_new > lambda_tr + upper_jump {
-            lambda_new = lambda_tr + upper_jump;
-        }
-        lambda_tr = lambda_new;
-    }
-
-    best.map(|(delta, lambda, _)| (delta, lambda))
-}
-
 fn apply_joint_penalized_hessian_into(
     source: &JointHessianSource,
     ranges: &[(usize, usize)],
@@ -17783,11 +17677,6 @@ const JOINT_MATRIX_FREE_MIN_ROWS: usize = 50_000;
 const JOINT_MATRIX_FREE_MIN_DIM_AT_LARGE_N: usize = 128;
 const JOINT_MATRIX_FREE_MIN_LINEAR_WORK: usize = 4_000_000;
 const JOINT_TRACE_STABILITY_RIDGE: f64 = 1e-10;
-const JOINT_PCG_REL_TOL: f64 = 1e-8;
-const PCG_ETA_MAX: f64 = 1.0e-1;
-const PCG_ETA_MIN: f64 = 1.0e-8;
-const PCG_GAMMA: f64 = 0.9;
-const PCG_ALPHA: f64 = 1.6180339887498949;
 const JOINT_PCG_MAX_ITER_MULTIPLIER: usize = 4;
 
 pub(crate) fn joint_exact_analytic_outer_hessian_available() -> bool {
