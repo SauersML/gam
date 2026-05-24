@@ -3919,7 +3919,6 @@ pub(crate) struct StreamingBSplineEvaluator {
     data: Arc<Array1<f64>>,
     knots: Arc<Array1<f64>>,
     degree: usize,
-    #[expect(dead_code)]
     boundary_conditions: BSplineBoundaryConditions,
     periodic: Option<(f64, f64, usize)>,
     transform: Option<Arc<Array2<f64>>>,
