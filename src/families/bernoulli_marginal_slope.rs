@@ -4211,121 +4211,6 @@ impl BernoulliBlockHessianAccumulator {
         Ok(())
     }
 
-    /// Batch the exact h/w pullback terms for one row chunk.
-    ///
-    /// The large marginal/logslope blocks are already accumulated as chunked
-    /// weighted Gram products.  h/w used to be the remaining per-row dense
-    /// path: for every sampled row and every h/w coordinate we performed two
-    /// design-row AXPYs (column plus symmetric row).  At biobank `n` that
-    /// repeated row materialization dominates even though the h/w blocks are
-    /// tiny.  This routine keeps the same exact Hessian entries, but turns the
-    /// cross terms into `X_chunk^T weights` / `G_chunk^T weights` products and
-    /// sums the tiny h/w self-blocks in registers.
-    fn add_weighted_hw_cross_terms(
-        &mut self,
-        family: &BernoulliMarginalSlopeFamily,
-        rows: std::ops::Range<usize>,
-        slices: &BlockSlices,
-        h_q: Option<&Array2<f64>>,
-        h_g: Option<&Array2<f64>>,
-        h_h: Option<&Array2<f64>>,
-        w_q: Option<&Array2<f64>>,
-        w_g: Option<&Array2<f64>>,
-        h_w: Option<&Array2<f64>>,
-        w_w: Option<&Array2<f64>>,
-    ) -> Result<(), String> {
-        let Some(dc) = self.dense_correction.as_mut() else {
-            return Ok(());
-        };
-
-        let need_marginal = h_q.is_some() || w_q.is_some();
-        let need_logslope = h_g.is_some() || w_g.is_some();
-        let x = if need_marginal {
-            Some(
-                family
-                    .marginal_design
-                    .try_row_chunk(rows.clone())
-                    .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?,
-            )
-        } else {
-            None
-        };
-        let g = if need_logslope {
-            Some(
-                family
-                    .logslope_design
-                    .try_row_chunk(rows)
-                    .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?,
-            )
-        } else {
-            None
-        };
-
-        if let (Some(block_h), Some(hq)) = (slices.h.as_ref(), h_q) {
-            let x = x.as_ref().expect("marginal chunk for h/q cross");
-            let cross = crate::faer_ndarray::fast_atb(x, hq);
-            for (local_idx, global_idx) in block_h.clone().enumerate() {
-                let col = cross.column(local_idx);
-                dc.slice_mut(s![slices.marginal.clone(), global_idx])
-                    .scaled_add(1.0, &col);
-                dc.slice_mut(s![global_idx, slices.marginal.clone()])
-                    .scaled_add(1.0, &col);
-            }
-        }
-        if let (Some(block_h), Some(hg)) = (slices.h.as_ref(), h_g) {
-            let g = g.as_ref().expect("logslope chunk for h/g cross");
-            let cross = crate::faer_ndarray::fast_atb(g, hg);
-            for (local_idx, global_idx) in block_h.clone().enumerate() {
-                let col = cross.column(local_idx);
-                dc.slice_mut(s![slices.logslope.clone(), global_idx])
-                    .scaled_add(1.0, &col);
-                dc.slice_mut(s![global_idx, slices.logslope.clone()])
-                    .scaled_add(1.0, &col);
-            }
-        }
-        if let (Some(block_h), Some(hh)) = (slices.h.as_ref(), h_h) {
-            dc.slice_mut(s![block_h.clone(), block_h.clone()])
-                .scaled_add(1.0, hh);
-        }
-
-        if let (Some(block_w), Some(wq)) = (slices.w.as_ref(), w_q) {
-            let x = x.as_ref().expect("marginal chunk for w/q cross");
-            let cross = crate::faer_ndarray::fast_atb(x, wq);
-            for (local_idx, global_idx) in block_w.clone().enumerate() {
-                let col = cross.column(local_idx);
-                dc.slice_mut(s![slices.marginal.clone(), global_idx])
-                    .scaled_add(1.0, &col);
-                dc.slice_mut(s![global_idx, slices.marginal.clone()])
-                    .scaled_add(1.0, &col);
-            }
-        }
-        if let (Some(block_w), Some(wg)) = (slices.w.as_ref(), w_g) {
-            let g = g.as_ref().expect("logslope chunk for w/g cross");
-            let cross = crate::faer_ndarray::fast_atb(g, wg);
-            for (local_idx, global_idx) in block_w.clone().enumerate() {
-                let col = cross.column(local_idx);
-                dc.slice_mut(s![slices.logslope.clone(), global_idx])
-                    .scaled_add(1.0, &col);
-                dc.slice_mut(s![global_idx, slices.logslope.clone()])
-                    .scaled_add(1.0, &col);
-            }
-        }
-        if let (Some(block_h), Some(block_w), Some(hw)) =
-            (slices.h.as_ref(), slices.w.as_ref(), h_w)
-        {
-            dc.slice_mut(s![block_h.clone(), block_w.clone()])
-                .scaled_add(1.0, hw);
-            dc.slice_mut(s![block_w.clone(), block_h.clone()])
-                .scaled_add(1.0, &hw.t());
-        }
-        if let (Some(block_w), Some(ww)) = (slices.w.as_ref(), w_w) {
-            dc.slice_mut(s![block_w.clone(), block_w.clone()])
-                .scaled_add(1.0, ww);
-        }
-
-        Ok(())
-    }
-
     /// Add a rank-1 update from psi_row (in the psi block) crossed with the
     /// pullback of a primary-space vector.  Adds both left outer right and right outer left.
     ///
@@ -6228,75 +6113,6 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    /// Per-row uncontracted fourth-derivative tensor in the rigid path.
-    ///
-    /// Closed-form path drops straight out of [`rigid_transformed_fourth_full`]
-    /// with five primary-space components computed from the
-    /// `rigid_internal_third_components` quantities and the link's higher
-    /// derivatives — all axis-invariant, so the previous design that re-ran
-    /// these for every (u, v) ψ-axis pair was paying `O(rank²)` redundancy.
-    ///
-    /// Empirical-grid path widens [`empirical_rigid_neglog_jet`] to eight
-    /// identity directions (`[e_q, e_g] × 4`), giving a 256-coefficient jet
-    /// from which the five distinct symmetric components `T_qqqq, T_qqqg,
-    /// T_qqgg, T_qggg, T_gggg` are read directly. The (u, v) directions are
-    /// folded in afterwards via the cheap [`contract_fourth_full`] bilinear
-    /// — at most one jet per row total, instead of `(rank²+rank)/2` per row.
-    fn rigid_row_fourth_full(
-        &self,
-        row: usize,
-        marginal_eta: f64,
-        marginal: BernoulliMarginalLinkMap,
-        slope: f64,
-    ) -> Result<[[[[f64; 2]; 2]; 2]; 2], String> {
-        match self.latent_measure.empirical_grid_for_training_row(row)? {
-            None => {
-                let kernel = RigidProbitKernel::new(
-                    marginal.q,
-                    slope,
-                    self.z[row],
-                    self.y[row],
-                    self.weights[row],
-                    self.probit_frailty_scale(),
-                )?;
-                Ok(rigid_transformed_fourth_full(marginal, &kernel))
-            }
-            Some(grid) => {
-                // Eight identity directions: positions 0, 2, 4, 6 are `e_q`,
-                // positions 1, 3, 5, 7 are `e_g`. The mask encoding for
-                // `MultiDirJet::coeff` is `Σ 2^position`, so a 4-element
-                // subset like {0, 2, 4, 6} (four `e_q`s) becomes mask
-                // 1 | 4 | 16 | 64 = 85 — the partial `∂⁴f/∂q∂q∂q∂q`.
-                let jet = self.empirical_rigid_neglog_jet(
-                    row,
-                    marginal_eta,
-                    marginal,
-                    slope,
-                    &[
-                        [1.0, 0.0],
-                        [0.0, 1.0],
-                        [1.0, 0.0],
-                        [0.0, 1.0],
-                        [1.0, 0.0],
-                        [0.0, 1.0],
-                        [1.0, 0.0],
-                        [0.0, 1.0],
-                    ],
-                    &grid.nodes,
-                    &grid.weights,
-                )?;
-                let t_qqqq = jet.coeff(1 | 4 | 16 | 64); // {0, 2, 4, 6}: 4× e_q
-                let t_qqqg = jet.coeff(1 | 4 | 16 | 2); // {0, 2, 4, 1}: 3× e_q + 1× e_g
-                let t_qqgg = jet.coeff(1 | 4 | 2 | 8); // {0, 2, 1, 3}: 2× e_q + 2× e_g
-                let t_qggg = jet.coeff(1 | 2 | 8 | 32); // {0, 1, 3, 5}: 1× e_q + 3× e_g
-                let t_gggg = jet.coeff(2 | 8 | 32 | 128); // {1, 3, 5, 7}: 4× e_g
-                Ok(fourth_full_from_symmetric_components(
-                    t_qqqq, t_qqqg, t_qqgg, t_qggg, t_gggg,
-                ))
-            }
-        }
-    }
-
     /// Above this `n`, line-search trial probes (calls with
     /// `options.early_exit_threshold = Some(_)`) install an
     /// auto-stratified Horvitz–Thompson subsample for the reject/accept
@@ -6662,15 +6478,7 @@ impl BernoulliMarginalSlopeFamily {
                     row_contexts,
                     row_cell_moments: None,
                     row_primary_hessians: None,
-                    rigid_third_full: crate::resource::RayonSafeOnce::new(),
-                    fingerprint: CacheFingerprint::compute(
-                        block_states,
-                        workspace_options
-                            .outer_score_subsample
-                            .as_ref()
-                            .map(|s| s.mask.as_slice()),
-                        Some(workspace_options),
-                    ),
+                    rigid_third_full: OnceLock::new(),
                     rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
                 },
                 options: workspace_options.clone(),
@@ -7345,16 +7153,6 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<exact_kernel::CellMomentState, String> {
         self.cell_moment_cache_stats.record_miss();
         exact_kernel::evaluate_cell_moments_uncached(cell, max_degree)
-    }
-
-    #[inline]
-    fn evaluate_cell_derivative_moments_lru(
-        &self,
-        cell: exact_kernel::DenestedCubicCell,
-        max_degree: usize,
-    ) -> Result<exact_kernel::CellDerivativeMomentState, String> {
-        self.cell_moment_cache_stats.record_miss();
-        exact_kernel::evaluate_cell_derivative_moments_uncached(cell, max_degree)
     }
 
     #[inline]
@@ -8299,145 +8097,6 @@ impl BernoulliMarginalSlopeFamily {
             rigid_third_full: OnceLock::new(),
             rigid_fourth_full: OnceLock::new(),
         })
-    }
-
-    fn line_search_log_likelihood_workspace(
-        &self,
-        block_states: &[ParameterBlockState],
-        options: &BlockwiseFitOptions,
-    ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
-        self.validate_exact_block_state_shapes(block_states)?;
-        if !self.effective_flex_active(block_states)? {
-            return Ok(None);
-        }
-        let n = self.y.len();
-        let rows = outer_row_indices(options, n).to_vec();
-        if rows.len() != n || rows.iter().copied().ne(0..n) {
-            return Ok(None);
-        }
-        let scale = outer_score_scale(options, n);
-        if scale != 1.0 {
-            return Ok(None);
-        }
-        self.validate_exact_monotonicity(block_states)?;
-
-        let slices = block_slices(self);
-        let primary = primary_slices(&slices);
-        let started = std::time::Instant::now();
-        if log_exact_work(n) {
-            log::info!(
-                "[BMS exact-cache] build start n={} p={} flex=true purpose=line-search",
-                n,
-                slices.total
-            );
-        }
-        self.preseed_intercept_warm_starts(block_states)?;
-        exact_kernel::reset_tail_cell_moment_cache();
-        let stats = BernoulliInterceptSolveStats::default();
-        let cell_cache_before = self.cell_moment_cache_stats.snapshot();
-        let beta_h = self.score_beta(block_states)?;
-        let beta_w = self.link_beta(block_states)?;
-        let threshold = options.early_exit_threshold;
-        let mut row_contexts: Vec<Option<BernoulliMarginalSlopeRowExactContext>> =
-            (0..n).map(|_| None).collect();
-        let mut total_ll = 0.0;
-
-        for chunk in rows.chunks(BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS) {
-            let chunk_entries = chunk
-                .into_par_iter()
-                .map(|&row| -> Result<_, String> {
-                    let ctx =
-                        self.build_row_exact_context_with_stats(row, block_states, Some(&stats))?;
-                    let slope = block_states[1].eta[row];
-                    let obs = self.observed_denested_cell_partials(
-                        row,
-                        ctx.intercept,
-                        slope,
-                        beta_h,
-                        beta_w,
-                    )?;
-                    let s_i = eval_coeff4_at(&obs.coeff, self.z[row]);
-                    let signed = (2.0 * self.y[row] - 1.0) * s_i;
-                    let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
-                    Ok((row, ctx, self.weights[row] * log_cdf))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            for (row, ctx, row_ll) in chunk_entries {
-                row_contexts[row] = Some(ctx);
-                total_ll += row_ll;
-            }
-            if let Some(threshold) = threshold
-                && -total_ll > threshold
-            {
-                return Err(format!(
-                    "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
-                    -total_ll, threshold
-                ));
-            }
-        }
-
-        let row_contexts = row_contexts
-            .into_iter()
-            .enumerate()
-            .map(|(row, ctx)| {
-                ctx.ok_or_else(|| format!("line-search exact cache missing row context {row}"))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let fast_path_rows = row_contexts
-            .iter()
-            .filter(|ctx| ctx.intercept_fast_path)
-            .count();
-        log::debug!(
-            "[BMS exact-cache] row-intercept zero-deviation fast path rows={}/{}",
-            fast_path_rows,
-            n
-        );
-        let (cell_hits, cell_misses, cell_hit_rate) = self
-            .cell_moment_cache_stats
-            .hit_rate_delta(cell_cache_before);
-        if log_exact_work(n) {
-            log::info!(
-                "[BMS cell-moment LRU] cycle hits={} misses={} hit_rate={:.1}% entries={} resident_mib={:.1}/{:.1}",
-                cell_hits,
-                cell_misses,
-                100.0 * cell_hit_rate,
-                self.cell_moment_lru.len(),
-                self.cell_moment_lru.resident_bytes() as f64 / (1024.0 * 1024.0),
-                self.cell_moment_lru.max_bytes() as f64 / (1024.0 * 1024.0),
-            );
-            let tail_stats = exact_kernel::tail_cell_moment_cache_stats();
-            log::info!(
-                "[BMS exact-cache] affine tail-cell memo: hits={} misses={} entries={} hit_rate={:.3}%",
-                tail_stats.hits,
-                tail_stats.misses,
-                tail_stats.entries,
-                100.0 * tail_stats.hit_rate(),
-            );
-            log::info!(
-                "[BMS exact-cache] build done n={} p={} flex=true purpose=line-search elapsed={:.3}s",
-                n,
-                slices.total,
-                started.elapsed().as_secs_f64()
-            );
-        }
-        let cache = BernoulliMarginalSlopeExactEvalCache {
-            slices,
-            primary,
-            row_contexts,
-            row_cell_moments: None,
-            row_primary_hessians: None,
-            rigid_third_full: OnceLock::new(),
-            rigid_fourth_full: OnceLock::new(),
-        };
-        let workspace: Arc<dyn ExactNewtonJointHessianWorkspace> =
-            Arc::new(BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
-                family: self.clone(),
-                block_states: block_states.to_vec(),
-                cache,
-                matvec_calls: AtomicUsize::new(0),
-                options: options.clone(),
-            });
-        Ok(Some((total_ll, workspace)))
     }
 
     /// Build a top-of-cycle [`RowCellMomentsBundle`] at the given
@@ -15849,39 +15508,18 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        line_search_options: &BlockwiseFitOptions,
-        workspace_options: &BlockwiseFitOptions,
+        options: &BlockwiseFitOptions,
     ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
-        let Some(workspace) = self.exact_newton_joint_hessian_workspace_with_options(
-            block_states,
-            specs,
-            workspace_options,
-        )?
+        let Some(workspace) =
+            self.exact_newton_joint_hessian_workspace_with_options(block_states, specs, options)?
         else {
             return Ok(None);
         };
         let log_likelihood = match workspace.joint_log_likelihood_evaluation()? {
             Some(value) => value,
-            None => {
-                Self::log_likelihood_only_with_options(self, block_states, line_search_options)?
-            }
+            None => Self::log_likelihood_only_with_options(self, block_states, options)?,
         };
         Ok(Some((log_likelihood, workspace)))
-    }
-
-    fn joint_line_search_log_likelihood_evaluation(
-        &self,
-        block_states: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
-        line_search_options: &BlockwiseFitOptions,
-        workspace_options: &BlockwiseFitOptions,
-    ) -> Result<Option<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>)>, String> {
-        self.line_search_log_likelihood_workspace(
-            block_states,
-            line_search_options,
-            workspace_options,
-        )
-        .map(|maybe| maybe.map(|(log_likelihood, workspace)| (log_likelihood, Some(workspace))))
     }
 
     fn has_explicit_joint_hessian(&self) -> bool {

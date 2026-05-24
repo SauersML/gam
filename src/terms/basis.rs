@@ -1,8 +1,8 @@
 use crate::faer_ndarray::{
-    FaerCholesky, FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_abt,
+    FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_abt,
     fast_ata, fast_atb, rrqr_nullspace_basis,
 };
-use crate::linalg::utils::{KahanSum, StableSolver};
+use crate::linalg::utils::KahanSum;
 use crate::matrix::{
     ChunkedKernelDesignOperator, CoefficientTransformOperator, DesignMatrix, LinearOperator,
 };
@@ -1951,6 +1951,10 @@ pub fn center_strategy_with_num_centers(
         }
     }
     let rebuilt = rebuild_inner(strategy, num_centers)?;
+    Ok(match strategy {
+        CenterStrategy::Auto(_) => CenterStrategy::Auto(Box::new(rebuilt)),
+        _ => rebuilt,
+    })
 }
 
 /// Thin-plate basis configuration.
@@ -2481,7 +2485,6 @@ pub enum BasisMetadata {
         group_col: usize,
         knots: Array1<f64>,
         degree: usize,
-        #[serde(default)]
         periodic: Option<(f64, f64, usize)>,
         group_levels: Vec<u64>,
         flavour: String,
@@ -14366,6 +14369,83 @@ fn validate_lat_lon_matrix(
 /// validated against tabulated `Li_3(1/2) = 7ζ(3)/8 − π²/12·ln 2 +
 /// ln³ 2 / 6 ≈ 0.5372131936` to 15 digits, and against scipy's
 /// `spence`-based Li₃ on a sweep of `z ∈ {0.1, ..., 0.99}` to ≤ 1e-13.
+/// Dilogarithm `Li_2(z) = Σ_{k≥1} z^k / k²` for `z ∈ [0, 1]`.
+#[inline]
+fn dilog_unit(z: f64) -> f64 {
+    if !z.is_finite() {
+        return f64::NAN;
+    }
+    let z = z.clamp(0.0, 1.0);
+    if z == 0.0 {
+        return 0.0;
+    }
+    if z >= 1.0 {
+        return std::f64::consts::PI * std::f64::consts::PI / 6.0;
+    }
+    if z <= 0.5 {
+        let mut sum = 0.0_f64;
+        let mut zk = z;
+        for k in 1..=200 {
+            let kf = k as f64;
+            let term = zk / (kf * kf);
+            sum += term;
+            if term < 1e-18 {
+                break;
+            }
+            zk *= z;
+        }
+        sum
+    } else {
+        let one_minus_z = 1.0 - z;
+        let pi2_6 = std::f64::consts::PI * std::f64::consts::PI / 6.0;
+        pi2_6 - z.ln() * one_minus_z.ln() - dilog_unit(one_minus_z)
+    }
+}
+
+/// Pseudo-spline Wahba kernel on S² (mgcv `makeR`-style closed form).
+#[inline]
+fn wahba_sphere_kernel_pseudo_from_cos(cos_gamma: f64, m: usize) -> f64 {
+    let cg = cos_gamma.clamp(-1.0, 1.0);
+    let z = (1.0 - cg).max(f64::EPSILON * 1.0e-4);
+    let w = 0.5 * z;
+    let c0 = w.sqrt();
+    let a = (1.0 + 1.0 / c0).ln();
+    let c = 2.0 * c0;
+    let two_pi = 2.0 * std::f64::consts::PI;
+    match m {
+        1 => {
+            let q1 = 2.0 * a * w - c + 1.0;
+            (q1 - 0.5) / two_pi
+        }
+        2 => {
+            let w2 = w * w;
+            let q2 = a * (6.0 * w2 - 2.0 * w) - 3.0 * c * w + 3.0 * w + 0.5;
+            (q2 / 2.0 - 1.0 / 6.0) / two_pi
+        }
+        3 => {
+            let w2 = w * w;
+            let w3 = w2 * w;
+            let q3 = (a * (60.0 * w3 - 36.0 * w2) + 30.0 * w2 + c * (8.0 * w - 30.0 * w2)
+                - 3.0 * w
+                + 1.0)
+                / 3.0;
+            (q3 / 6.0 - 1.0 / 24.0) / two_pi
+        }
+        _ => {
+            let w2 = w * w;
+            let w3 = w2 * w;
+            let w4 = w3 * w;
+            let q4 = a * (70.0 * w4 - 60.0 * w3 + 6.0 * w2)
+                + 35.0 * w3 * (1.0 - c)
+                + c * 55.0 * w2 / 3.0
+                - 12.5 * w2
+                - w / 3.0
+                + 0.25;
+            (q4 / 24.0 - 1.0 / 120.0) / two_pi
+        }
+    }
+}
+
 #[inline]
 fn trilog_unit(z: f64) -> f64 {
     const ZETA3: f64 = 1.2020569031595942853997381615114499907649862923404988817922;
@@ -16433,14 +16513,12 @@ fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
         centers.view(),
         Some(length_scale),
         p_order,
-        s_order as f64,
+        s_order,
         1,
         None,
         Some(&coeffs),
         None,
-        effective_nullspace_order,
-        &mut workspace.cache,
-    )?;
+    );
     let kernel_cols = z_kernel.ncols();
     let total_cols = kernel_cols + 1;
     let mut design_first = Array2::<f64>::zeros((data.nrows(), total_cols));
@@ -19050,7 +19128,8 @@ fn build_cyclic_duchon_basis_1dwithworkspace(
         )));
     }
     let k = centers.nrows();
-    if k <= spec.power.max(1) {
+    let s_order_usize = spec.power_as_usize();
+    if k <= s_order_usize.max(1) {
         return Err(BasisError::InvalidInput(format!(
             "cyclic Duchon basis requires more centers ({k}) than power ({})",
             spec.power
@@ -19061,7 +19140,7 @@ fn build_cyclic_duchon_basis_1dwithworkspace(
     validate_duchon_kernel_orders(spec.length_scale, p_order, spec.power, 1)?;
     let coeffs = spec
         .length_scale
-        .map(|ls| duchon_partial_fraction_coeffs(p_order, spec.power, 1.0 / ls.max(1e-300)));
+        .map(|ls| duchon_partial_fraction_coeffs(p_order, s_order_usize, 1.0 / ls.max(1e-300)));
     let pure_poly_coeff = if spec.length_scale.is_none() {
         Some(PolyharmonicBlockCoeff::new(
             pure_duchon_block_order(p_order, spec.power),
@@ -19074,14 +19153,12 @@ fn build_cyclic_duchon_basis_1dwithworkspace(
         centers.view(),
         spec.length_scale,
         p_order,
-        spec.power,
+        duchon_power_to_usize(spec.power),
         1,
         None,
         coeffs.as_ref(),
         pure_poly_coeff.as_ref(),
-        DuchonNullspaceOrder::Zero,
-        &mut workspace.cache,
-    )?;
+    );
     let mut basis = Array2::<f64>::zeros((data.nrows(), k + 1));
     for i in 0..data.nrows() {
         let x = wrap_to_period(data[[i, 0]], start, period);
@@ -19215,14 +19292,12 @@ pub fn create_duchon_basis_1d_derivative_dense(
         center_matrix.view(),
         None,
         p_order,
-        s_order as f64,
+        s_order,
         1,
         None,
         None,
         Some(&pure_coeff),
-        effective_order,
-        &mut workspace.cache,
-    )?;
+    );
     let periodic_domain = if periodic {
         let left = centers.iter().fold(f64::INFINITY, |a, &b| a.min(b));
         let right = centers.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
@@ -20170,14 +20245,12 @@ fn build_periodic_duchon_basis_1d(
         centers.view(),
         spec.length_scale,
         p_order,
-        s_order as f64,
+        s_order,
         1,
         None,
         coeffs.as_ref(),
         pure_poly_coeff.as_ref(),
-        effective_nullspace_order,
-        &mut workspace.cache,
-    )?;
+    );
     // Step 1: build the N×K raw kernel matrix in parallel (each row is
     // independent; no shared writes). Step 2: design[:, :kernel_cols] =
     // K @ z via fast_ab (BLAS), which beats a hand-rolled per-row matvec

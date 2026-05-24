@@ -1613,6 +1613,7 @@ fn fit_survival_transformation_model(
             let dense_time_entry = prepared.time_design_entry.to_dense();
             let dense_time_exit = prepared.time_design_exit.to_dense();
             let dense_time_derivative = prepared.time_design_derivative.to_dense();
+            let event_competing = Array1::<u8>::zeros(spec.event_target.len());
             let mut model =
                 crate::families::royston_parmar::working_model_from_time_covariateshared(
                     PenaltyBlocks::new(penalty_blocks.clone()),
@@ -2288,7 +2289,8 @@ use crate::families::survival_construction::{
     initial_survival_baseline_config_for_fit, location_scale_uses_probit_survival_baseline,
     marginal_slope_baseline_chain_rule_gradient, marginal_slope_baseline_chain_rule_hessian,
     normalize_survival_time_pair, optimize_survival_baseline_config,
-    optimize_survival_baseline_config_with_gradient, parse_survival_distribution,
+    optimize_survival_baseline_config_with_gradient,
+    optimize_survival_baseline_config_with_gradient_only, parse_survival_distribution,
     parse_survival_likelihood_mode, parse_survival_time_basis_config, positive_survival_time_seed,
     require_structural_survival_time_basis, resolve_survival_time_anchor_value,
     resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
@@ -2523,7 +2525,7 @@ pub fn materialize<'a>(
     formula: &str,
     data: &'a Dataset,
     config: &FitConfig,
-) -> Result<MaterializedModel<'a>, String> {
+) -> Result<MaterializedModel<'a>, WorkflowError> {
     crate::gpu::configure_global_policy(config.gpu_policy);
     let parsed = parse_formula(formula)?;
     let col_map = data.column_map();
@@ -5606,16 +5608,13 @@ fn materialize_survival<'a>(
                 let profile_cost = -fit_result.fit.fit.log_likelihood
                     + 0.5 * fit_result.fit.fit.stable_penalty_term;
                 if !profile_cost.is_finite() {
-                    return Err(WorkflowError::IntegrationFailed {
-                        reason: format!(
-                            "workflow survival location-scale baseline: non-finite profile cost \
-                             (log_likelihood={}, stable_penalty_term={}, cost={})",
-                            fit_result.fit.fit.log_likelihood,
-                            fit_result.fit.fit.stable_penalty_term,
-                            profile_cost
-                        ),
-                    }
-                    .into());
+                    return Err(format!(
+                        "workflow survival location-scale baseline: non-finite profile cost \
+                         (log_likelihood={}, stable_penalty_term={}, cost={})",
+                        fit_result.fit.fit.log_likelihood,
+                        fit_result.fit.fit.stable_penalty_term,
+                        profile_cost
+                    ));
                 }
                 Ok((profile_cost, gradient))
             },
