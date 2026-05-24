@@ -60,15 +60,13 @@ pub enum MonotoneRootError {
 /// These are folded into the enum variants above via Display so callers see
 /// byte-identical strings to the pre-refactor format!() output.
 impl MonotoneRootError {
-    fn exact_root_degenerate(label: &str, a: f64, fp: f64) -> Self {
+    fn exact_root_degenerate(label: &str, a: f64, _fp: f64) -> Self {
         // Tagged via `iters = usize::MAX` to select the "exact root" Display arm.
         MonotoneRootError::RefinementDidNotConverge {
             label: format!("__EXACT_ROOT__{label}"),
             iters: usize::MAX,
             last_residual: a,
         }
-        // (fp is intentionally unused; we only need the label+a for the message)
-        .with_fp_hint(fp)
     }
 
     fn converged_root_degenerate(label: &str, a: f64) -> Self {
@@ -106,10 +104,6 @@ impl MonotoneRootError {
         }
     }
 
-    fn with_fp_hint(self, fp: f64) -> Self {
-        std::hint::black_box(fp);
-        self
-    }
 }
 
 impl std::fmt::Display for MonotoneRootError {

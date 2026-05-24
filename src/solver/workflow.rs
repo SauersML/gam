@@ -2708,9 +2708,7 @@ fn build_termspec_with_geometry(
 
 fn standard_adaptive_regularization_options(
     config: &FitConfig,
-    spec: &TermCollectionSpec,
 ) -> Option<AdaptiveRegularizationOptions> {
-    std::hint::black_box(spec);
     let enabled = config.adaptive_regularization.unwrap_or(false);
     enabled.then(|| AdaptiveRegularizationOptions {
         enabled: true,
@@ -4744,7 +4742,7 @@ fn materialize_standard<'a>(
         nullspace_dims: vec![],
         linear_constraints: None,
         firth_bias_reduction: config.firth,
-        adaptive_regularization: standard_adaptive_regularization_options(config, &spec),
+        adaptive_regularization: standard_adaptive_regularization_options(config),
         penalty_shrinkage_floor: Some(1e-6),
         rho_prior: Default::default(),
         kronecker_penalty_system: None,

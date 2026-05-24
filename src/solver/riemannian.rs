@@ -120,8 +120,10 @@ pub trait Manifold: Send + Sync {
 
     /// Riemannian inner product `<ξ, η>_p`. Default: weighted ambient
     /// inner product restricted to `T_p M`.
-    fn inner_product(&self, _p: ArrayView1<f64>, xi: ArrayView1<f64>, eta: ArrayView1<f64>) -> f64 {
+    fn inner_product(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, eta: ArrayView1<f64>) -> f64 {
+        debug_assert_eq!(p.len(), self.ambient_dim());
         debug_assert_eq!(xi.len(), eta.len());
+        debug_assert_eq!(xi.len(), p.len());
         let weights = self.metric_weights();
         debug_assert_eq!(weights.len(), xi.len());
         let mut acc = 0.0_f64;
@@ -159,7 +161,8 @@ pub trait Manifold: Send + Sync {
 
     /// Typed advisory sentinel — preferred over [`Manifold::warn_at`] for
     /// callers that route to a structured logger. Default returns `None`.
-    fn warn_at_typed(&self, _p: ArrayView1<f64>) -> Option<ManifoldWarning> {
+    fn warn_at_typed(&self, p: ArrayView1<f64>) -> Option<ManifoldWarning> {
+        debug_assert_eq!(p.len(), self.ambient_dim());
         None
     }
 
@@ -245,7 +248,10 @@ impl Manifold for Euclidean {
     fn ambient_dim(&self) -> usize {
         self.d
     }
-    fn project_tangent(&self, _p: ArrayView1<f64>, _v: ArrayViewMut1<f64>) {}
+    fn project_tangent(&self, p: ArrayView1<f64>, v: ArrayViewMut1<f64>) {
+        debug_assert_eq!(p.len(), self.d);
+        debug_assert_eq!(v.len(), self.d);
+    }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
         debug_assert_eq!(p.len(), self.d);
         debug_assert_eq!(xi.len(), self.d);
@@ -253,14 +259,27 @@ impl Manifold for Euclidean {
             out[i] = p[i] + xi[i];
         }
     }
-    fn vector_transport(&self, _from: ArrayView1<f64>, _to: ArrayView1<f64>, _xi: ArrayViewMut1<f64>) {}
+    fn vector_transport(
+        &self,
+        from: ArrayView1<f64>,
+        to: ArrayView1<f64>,
+        xi: ArrayViewMut1<f64>,
+    ) {
+        debug_assert_eq!(from.len(), self.d);
+        debug_assert_eq!(to.len(), self.d);
+        debug_assert_eq!(xi.len(), self.d);
+    }
     fn euclidean_to_riemannian_hess_vp(
         &self,
-        _p: ArrayView1<f64>,
-        _egrad: ArrayView1<f64>,
-        _ehess_vp: ArrayViewMut1<f64>,
-        _xi: ArrayView1<f64>,
+        p: ArrayView1<f64>,
+        egrad: ArrayView1<f64>,
+        ehess_vp: ArrayViewMut1<f64>,
+        xi: ArrayView1<f64>,
     ) {
+        debug_assert_eq!(p.len(), self.d);
+        debug_assert_eq!(egrad.len(), self.d);
+        debug_assert_eq!(ehess_vp.len(), self.d);
+        debug_assert_eq!(xi.len(), self.d);
         // Identity: no Weingarten correction in flat space.
     }
     fn name(&self) -> &str {
@@ -312,9 +331,10 @@ impl Manifold for Circle {
         // Post-condition: retraction stays on S¹.
         debug_assert!((out[0] * out[0] + out[1] * out[1] - 1.0).abs() < 1.0e-9);
     }
-    fn vector_transport(&self, _from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
+    fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
         // Projection approximation τ_{p→q}(ξ) = P_q(ξ) (proposal §4.4).
         // Safe even at antipodal endpoints since it does not divide by 1+<p,q>.
+        debug_assert_eq!(from.len(), 2);
         self.project_tangent(to, xi);
     }
     fn euclidean_to_riemannian_hess_vp(
@@ -423,12 +443,13 @@ impl Manifold for Sphere {
             );
         }
     }
-    fn vector_transport(&self, _from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
+    fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
         // Projection transport (proposal §6.4). Cheap, stable, not exactly
         // isometric. Antipodal case (to ≈ -from) does not divide by zero
         // here — unlike exact geodesic transport which has a 1+<p,q>
         // denominator. The transported tangent can be small near antipodal
         // endpoints; that is a correctness-preserving degradation.
+        debug_assert_eq!(from.len(), self.n + 1);
         self.project_tangent(to, xi);
     }
     fn euclidean_to_riemannian_hess_vp(
@@ -574,7 +595,9 @@ impl Manifold for Interval {
         let scale = self.hi - self.lo;
         vec![1.0 / (scale * scale)]
     }
-    fn project_tangent(&self, _p: ArrayView1<f64>, _v: ArrayViewMut1<f64>) {
+    fn project_tangent(&self, p: ArrayView1<f64>, v: ArrayViewMut1<f64>) {
+        debug_assert_eq!(p.len(), 1);
+        debug_assert_eq!(v.len(), 1);
         // 1-d open submanifold of ℝ; tangent space is all of ℝ.
     }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
@@ -593,14 +616,27 @@ impl Manifold for Interval {
             "Interval::retract output left feasible band"
         );
     }
-    fn vector_transport(&self, _from: ArrayView1<f64>, _to: ArrayView1<f64>, _xi: ArrayViewMut1<f64>) {}
+    fn vector_transport(
+        &self,
+        from: ArrayView1<f64>,
+        to: ArrayView1<f64>,
+        xi: ArrayViewMut1<f64>,
+    ) {
+        debug_assert_eq!(from.len(), 1);
+        debug_assert_eq!(to.len(), 1);
+        debug_assert_eq!(xi.len(), 1);
+    }
     fn euclidean_to_riemannian_hess_vp(
         &self,
-        _p: ArrayView1<f64>,
-        _egrad: ArrayView1<f64>,
-        _ehess_vp: ArrayViewMut1<f64>,
-        _xi: ArrayView1<f64>,
+        p: ArrayView1<f64>,
+        egrad: ArrayView1<f64>,
+        ehess_vp: ArrayViewMut1<f64>,
+        xi: ArrayView1<f64>,
     ) {
+        debug_assert_eq!(p.len(), 1);
+        debug_assert_eq!(egrad.len(), 1);
+        debug_assert_eq!(ehess_vp.len(), 1);
+        debug_assert_eq!(xi.len(), 1);
         // Open submanifold of ℝ: no second fundamental form correction in
         // the natural chart used here.
     }
@@ -614,7 +650,8 @@ impl Manifold for Interval {
     }
     /// Closed-form trivial 1×1 identity basis (proposal §7: T_p M = ℝ in
     /// the interior). Override avoids the generic O(m³) Gram-Schmidt path.
-    fn tangent_basis(&self, _p: ArrayView1<f64>) -> Array2<f64> {
+    fn tangent_basis(&self, p: ArrayView1<f64>) -> Array2<f64> {
+        debug_assert_eq!(p.len(), 1);
         let mut q = Array2::<f64>::zeros((1, 1));
         q[[0, 0]] = 1.0;
         q
@@ -674,7 +711,8 @@ impl Manifold for Torus {
             }
         }
     }
-    fn vector_transport(&self, _from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
+    fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
+        debug_assert_eq!(from.len(), 2 * self.d);
         self.project_tangent(to, xi);
     }
     fn euclidean_to_riemannian_hess_vp(

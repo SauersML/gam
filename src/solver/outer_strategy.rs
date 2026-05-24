@@ -1695,8 +1695,7 @@ pub trait OuterObjective {
     /// slope, …) override this to install β as the warm-start iterate so the
     /// first inner solve opens at `‖∇‖ ≈ 0` and the boundary-ρ conditioning
     /// stops mattering.
-    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
-        std::hint::black_box(beta);
+    fn seed_inner_state(&mut self, _beta: &Array1<f64>) -> Result<(), EstimationError> {
         Ok(())
     }
 }
@@ -1826,9 +1825,7 @@ pub(crate) enum CacheSeedDecision {
 pub(crate) fn classify_cache_entry_for_outer(
     loaded: &crate::cache::LoadedEntry,
     expected_rho_dim: usize,
-    rho_bound: f64,
 ) -> CacheSeedDecision {
-    std::hint::black_box(rho_bound);
     let entry = &loaded.entry;
     let Some(payload) = decode_iterate(&entry.payload, expected_rho_dim) else {
         return CacheSeedDecision::Discard {
@@ -1876,10 +1873,9 @@ pub(crate) fn classify_cache_entry_for_outer(
 pub(crate) fn cache_entry_would_help_outer(
     loaded: &crate::cache::LoadedEntry,
     expected_rho_dim: usize,
-    rho_bound: f64,
 ) -> bool {
     matches!(
-        classify_cache_entry_for_outer(loaded, expected_rho_dim, rho_bound),
+        classify_cache_entry_for_outer(loaded, expected_rho_dim),
         CacheSeedDecision::ExactFinal { .. } | CacheSeedDecision::Seed { .. }
     )
 }
@@ -3079,7 +3075,13 @@ struct OuterAcceptObserver {
 
 impl OptimizerObserver for OuterAcceptObserver {
     fn on_step_accepted(&mut self, info: &StepInfo) {
-        std::hint::black_box(info);
+        log::trace!(
+            "outer step accepted iter={} step_norm={:.3e} predicted_decrease={:.3e} actual_decrease={:.3e}",
+            info.iter,
+            info.step_norm,
+            info.predicted_decrease,
+            info.actual_decrease,
+        );
         self.feedback.accepted_iter.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -3215,7 +3217,12 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
             };
             let snapshot = feedback.snapshot();
             let cap = first_order_inner_cap_schedule(self.eval_count, g_ratio, snapshot);
-            std::hint::black_box(feedback.cap.swap(cap, Ordering::Relaxed));
+            let previous_cap = feedback.cap.swap(cap, Ordering::Relaxed);
+            if previous_cap != cap {
+                log::trace!(
+                    "outer operator bridge updated inner cap from {previous_cap} to {cap}"
+                );
+            }
         }
         let stage_start = std::time::Instant::now();
         log::info!(

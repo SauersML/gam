@@ -104,6 +104,15 @@ fn main() {
     let mut cargo_feature_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_cargo_feature_entries(&manifest_dir, &manifest_dir, &mut cargo_feature_offenders);
 
+    // Cargo.toml `[lints.*]` `allow` entries are the moral equivalent of
+    // `#[allow(...)]` attributes (already banned crate-wide) — they
+    // silence lints at the manifest level instead of fixing the code.
+    // Whole-category allows (`clippy.all = "allow"`, `clippy.pedantic = {
+    // level = "allow", ... }`) are the worst form: they preemptively
+    // turn off every current and future lint in a category. Banned.
+    let mut cargo_lint_allow_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_cargo_lint_allows(&manifest_dir, &manifest_dir, &mut cargo_lint_allow_offenders);
+
     // `#[should_panic]` without `expected = "..."` catches any panic and
     // masks unrelated bugs. Require an `expected` string.
     let mut should_panic_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
@@ -331,6 +340,16 @@ fn main() {
         sections.push(Section {
             title: "#[cfg(feature = ...)] / #[cfg_attr(feature = ...)] (feature gating banned — autoderive paths from problem characteristics; do not branch the codebase on opt-in flags)".to_string(),
             rows: feature_cfg_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !cargo_lint_allow_offenders.is_empty() {
+        sections.push(Section {
+            title: "Cargo.toml [lints.*] `allow` entry (manifest-level lint silencing banned — fix the code instead of disabling the lint)".to_string(),
+            rows: cargo_lint_allow_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
                 .collect(),
@@ -1363,6 +1382,61 @@ fn scan_for_cargo_feature_entries(
             }
         }
     });
+}
+
+/// Flags `allow` levels inside Cargo.toml `[lints.*]` tables. This mirrors
+/// the attribute scanner for manifest-level lint policy: `allow` hides the
+/// diagnostic instead of forcing the owning code to use, delete, or
+/// restructure the offending item.
+fn scan_for_cargo_lint_allows(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let basename = rel.file_name().and_then(OsStr::to_str).unwrap_or("");
+        if basename != "Cargo.toml" {
+            return;
+        }
+        let mut in_lints = false;
+        for (idx, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            let code_part = match trimmed.find('#') {
+                Some(p) => trimmed[..p].trim_end(),
+                None => trimmed,
+            };
+            if code_part.starts_with('[') && code_part.ends_with(']') {
+                let header = code_part
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .trim();
+                in_lints = header == "lints"
+                    || header.starts_with("lints.")
+                    || header == "workspace.lints"
+                    || header.starts_with("workspace.lints.");
+                continue;
+            }
+            if !in_lints || code_part.is_empty() {
+                continue;
+            }
+            if toml_assignment_mentions_allow_level(code_part) {
+                offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+            }
+        }
+    });
+}
+
+fn toml_assignment_mentions_allow_level(code_part: &str) -> bool {
+    let Some(eq_pos) = code_part.find('=') else {
+        return false;
+    };
+    let rhs = code_part[eq_pos + 1..].trim();
+    rhs == "\"allow\""
+        || rhs == "'allow'"
+        || rhs.contains("level = \"allow\"")
+        || rhs.contains("level='allow'")
+        || rhs.contains("level = 'allow'")
+        || rhs.contains("level=\"allow\"")
 }
 
 /// Flags `#[cfg(test)]` (and `#[cfg(all(test, ...))]` / `#[cfg(any(test,

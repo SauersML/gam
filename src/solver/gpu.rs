@@ -9,7 +9,6 @@
 use std::fmt;
 use std::sync::Once;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::{Duration, Instant};
 
 pub mod arrow_schur_gpu;
 pub mod pirls_gpu;
@@ -192,30 +191,6 @@ fn log_auto_fallback_once(operation: GpuOperation, reason: &str) {
         GpuOperation::FinalInference => &INFERENCE,
     };
     once.call_once(|| log::info!("GPU auto fallback for {}: {reason}", operation.label()));
-}
-
-/// Lightweight event timer for hot-path GPU instrumentation. The `Drop`
-/// impl is intentionally a no-op: callers that want timing logs should
-/// route through [`crate::gpu::GpuStageTimer`] which carries workload
-/// context and feeds the dispatch-layer aggregator. This type exists only
-/// so the dispatch sites that need an [`Instant`]-style local timer (for
-/// `elapsed()` checks against routing thresholds) avoid hand-rolling the
-/// `Instant::now()` capture and still share the same callsite vocabulary.
-pub struct GpuStageTimer {
-    start: Instant,
-}
-
-impl GpuStageTimer {
-    pub fn start(label: &'static str) -> Self {
-        std::hint::black_box(label);
-        Self {
-            start: Instant::now(),
-        }
-    }
-
-    pub fn elapsed(&self) -> Duration {
-        self.start.elapsed()
-    }
 }
 
 #[cfg(test)]

@@ -366,16 +366,6 @@ impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
         base_trace - firth_trace
     }
 
-    fn trace_projected_factor_cached(
-        &self,
-        factor: &Array2<f64>,
-        cache: &super::unified::ProjectedFactorCache,
-    ) -> f64 {
-        std::hint::black_box(cache);
-        // Forward: the wrapper's compute is the base op's GEMM trace plus
-        // a single batched Firth correction; both already amortize work.
-        self.trace_projected_factor(factor)
-    }
 }
 
 /// Augments a pair `HyperOperator` with the fixed-β Firth (Jeffreys) pair

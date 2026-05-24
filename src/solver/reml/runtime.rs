@@ -3410,12 +3410,13 @@ impl<'a> RemlState<'a> {
         {
             return None;
         }
-        std::hint::black_box(
-            cached
-                .ext_mode_response_cols
-                .as_ref()
-                .map_or(0, Array2::ncols),
-        );
+        if cached
+            .ext_mode_response_cols
+            .as_ref()
+            .is_some_and(|cols| cols.nrows() != self.p)
+        {
+            return None;
+        }
         let cols = cached.rho_mode_response_cols.as_ref()?;
         if cols.nrows() != self.p || cols.ncols() != cache.rho.len() {
             return None;
@@ -8563,9 +8564,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
-        has_ext: bool,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
-        std::hint::black_box(has_ext);
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             self.build_sparse_assembly(rho, bundle, mode)
         } else if matches!(

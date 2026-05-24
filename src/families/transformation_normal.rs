@@ -7982,8 +7982,7 @@ impl CustomFamily for TransformationNormalFamily {
         true
     }
 
-    fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
-        std::hint::black_box(specs);
+    fn coefficient_hessian_cost(&self, _specs: &[ParameterBlockSpec]) -> u64 {
         // Khatri–Rao tensor design: the coefficient block is X = R ⊙ C with
         // rows length p_resp · p_cov. Two regimes:
         //
@@ -8365,9 +8364,8 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
+        _specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        std::hint::black_box(specs);
         if block_states.len() != 1 {
             return Err(TransformationNormalError::InvalidInput {
                 reason: format!(
@@ -8395,10 +8393,9 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_psi_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
+        _specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
-        std::hint::black_box(specs);
         Ok(Some(Arc::new(TransformationNormalPsiWorkspace::new(
             self.clone(),
             block_states.to_vec(),
@@ -8428,11 +8425,10 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_psi_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
+        _specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
-        std::hint::black_box(specs);
         // Route through a mask-aware family clone when an outer-score
         // subsample is active. Every CTN ψ assembly site — including the
         // workspace's `compute_all_axes` (per-row reduction near line ~13916)
@@ -8465,20 +8461,17 @@ impl CustomFamily for TransformationNormalFamily {
         true
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        std::hint::black_box(specs);
+    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // CTN's SCOP coefficient-space joint Hessian is supplied as a
         // row-streaming matrix-free Hv operator.
         true
     }
 
-    fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        std::hint::black_box(specs);
+    fn outer_hyper_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         true
     }
 
-    fn outer_hyper_hessian_dense_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        std::hint::black_box(specs);
+    fn outer_hyper_hessian_dense_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // Dense materialization remains mathematically available through the
         // outer-HVP operator, but SCOP's primary production path is the
         // matrix-free θθ operator above.
@@ -10843,9 +10836,11 @@ impl TensorKroneckerPsiOperator {
         }
         if let Some(rows) = deriv_d.x_psi_psi.as_ref()
             && let Some(mat) = rows.get(axis_e)
-            && mat.nrows() == self.n_data() && mat.ncols() == self.p_cov() {
-                return Ok(crate::faer_ndarray::fast_av(mat, u));
-            }
+            && mat.nrows() == self.n_data()
+            && mat.ncols() == self.p_cov()
+        {
+            return Ok(crate::faer_ndarray::fast_av(mat, u));
+        }
         Ok(Array1::<f64>::zeros(self.n_data()))
     }
 
@@ -10871,9 +10866,11 @@ impl TensorKroneckerPsiOperator {
         }
         if let Some(rows) = deriv_d.x_psi_psi.as_ref()
             && let Some(mat) = rows.get(axis_e)
-            && mat.nrows() == self.n_data() && mat.ncols() == self.p_cov() {
-                return Ok(crate::faer_ndarray::fast_atv(mat, v));
-            }
+            && mat.nrows() == self.n_data()
+            && mat.ncols() == self.p_cov()
+        {
+            return Ok(crate::faer_ndarray::fast_atv(mat, v));
+        }
         Ok(Array1::<f64>::zeros(self.p_cov()))
     }
 
@@ -10934,9 +10931,11 @@ impl TensorKroneckerPsiOperator {
         }
         if let Some(second_rows) = deriv_d.x_psi_psi.as_ref()
             && let Some(mat) = second_rows.get(axis_e)
-            && mat.nrows() == self.n_data() && mat.ncols() == self.p_cov() {
-                return Ok(mat.slice(s![rows, ..]).to_owned());
-            }
+            && mat.nrows() == self.n_data()
+            && mat.ncols() == self.p_cov()
+        {
+            return Ok(mat.slice(s![rows, ..]).to_owned());
+        }
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p_cov())))
     }
 
@@ -12765,9 +12764,11 @@ mod tests {
 
         // Hessian-vector product must agree with dense H · v across a few
         // randomly chosen directions (deterministic seed for stability).
-        let directions = [toy_probe_vector(p, 101),
+        let directions = [
+            toy_probe_vector(p, 101),
             toy_probe_vector(p, 102),
-            toy_probe_vector(p, 103)];
+            toy_probe_vector(p, 103),
+        ];
         for (k, v) in directions.iter().enumerate() {
             assert_eq!(v.len(), p);
             let want = dense.dot(v);
@@ -13040,9 +13041,11 @@ mod tests {
             .expect("dH operator call")
             .expect("dH operator present");
 
-        let probes = [toy_probe_vector(p, 202),
+        let probes = [
+            toy_probe_vector(p, 202),
             toy_probe_vector(p, 203),
-            toy_probe_vector(p, 204)];
+            toy_probe_vector(p, 204),
+        ];
         let mut probe_mat = Array2::<f64>::zeros((p, probes.len()));
         for (j, w) in probes.iter().enumerate() {
             probe_mat.column_mut(j).assign(w);
@@ -13146,9 +13149,11 @@ mod tests {
             .expect("d2H operator call")
             .expect("d2H operator present");
 
-        let probes = [toy_probe_vector(p, 303),
+        let probes = [
+            toy_probe_vector(p, 303),
             toy_probe_vector(p, 304),
-            toy_probe_vector(p, 305)];
+            toy_probe_vector(p, 305),
+        ];
         let mut probe_mat = Array2::<f64>::zeros((p, probes.len()));
         for (j, w) in probes.iter().enumerate() {
             probe_mat.column_mut(j).assign(w);
@@ -15185,8 +15190,7 @@ pub fn fit_transformation_normal(
          specs: &[TermCollectionSpec],
          designs: &[TermCollectionDesign],
          eval_mode,
-         row_set| {
-            std::hint::black_box(row_set);
+         _row_set| {
             ensure_exact_geometry(&specs[0], &designs[0])?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
             let geometry = cache_ref

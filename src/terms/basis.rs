@@ -2916,7 +2916,6 @@ pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usiz
 }
 
 pub fn assert_spatial_centers_below_biobank_cap(
-    _n: usize,
     d_pc: usize,
     centers: ArrayView2<'_, f64>,
 ) -> Result<(), BasisError> {
@@ -10036,7 +10035,6 @@ fn hessian_operator_eta2_entry(
 
 #[inline(always)]
 fn hessian_operator_eta_cross_entry(
-    _q: f64,
     t: f64,
     t_r: f64,
     t_rr: f64,
@@ -15399,10 +15397,18 @@ pub fn create_matern_spline_basiswithworkspace(
     aniso_log_scales: Option<&[f64]>,
     workspace: &mut BasisWorkspace,
 ) -> Result<MaternSplineBasis, BasisError> {
-    std::hint::black_box(workspace);
     let n = data.nrows();
     let d = data.ncols();
     let k = centers.nrows();
+    let total_cols = k + usize::from(include_intercept);
+    let dense_bytes = dense_design_bytes(n, total_cols);
+    if dense_bytes > workspace.policy().max_single_materialization_bytes {
+        return Err(BasisError::InvalidInput(format!(
+            "Matérn basis dense design exceeds resource policy: n={n}, p={total_cols}, dense={:.1} MiB, cap={:.1} MiB",
+            dense_bytes as f64 / (1024.0 * 1024.0),
+            workspace.policy().max_single_materialization_bytes as f64 / (1024.0 * 1024.0),
+        )));
+    }
 
     if d == 0 {
         return Err(BasisError::InvalidInput(
@@ -25629,8 +25635,7 @@ pub mod closed_form_penalty {
     /// or `4(m+s) ≤ d`. The latter never coincides with the convergent
     /// regime of canonical TPS, so we use `d > 4m` as the dispatch gate.
     #[inline]
-    fn schwinger_radial_is_convergent(d: usize, m: usize, s: usize) -> bool {
-        std::hint::black_box(s);
+    fn schwinger_radial_is_convergent(d: usize, m: usize) -> bool {
         d > 4 * m
     }
 
