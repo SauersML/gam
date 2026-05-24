@@ -2,8 +2,9 @@ use gam::estimate::{
     ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
     optimize_external_design,
 };
+use gam::mixture_link::state_from_sasspec;
 use gam::smooth::BlockwisePenalty;
-use gam::types::{LikelihoodFamily, SasLinkSpec};
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, SasLinkSpec};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -48,7 +49,7 @@ fn default_logit_opts() -> ExternalOptimOptions {
         optimize_mixture: false,
         sas_link: None,
         optimize_sas: false,
-        family: LikelihoodFamily::BinomialLogit,
+        family: binomial_logit_spec(),
         compute_inference: true,
         tol: 1e-10,
         max_iter: 500,
@@ -60,6 +61,27 @@ fn default_logit_opts() -> ExternalOptimOptions {
         kronecker_penalty_system: None,
         kronecker_factored: None,
     }
+}
+
+fn gaussian_identity_spec() -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(LinkFunction::Identity),
+    )
+}
+
+fn binomial_logit_spec() -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::Standard(LinkFunction::Logit),
+    )
+}
+
+fn binomial_sas_spec(sas_link: SasLinkSpec) -> LikelihoodSpec {
+    LikelihoodSpec::new(
+        ResponseFamily::Binomial,
+        InverseLink::Sas(state_from_sasspec(sas_link).expect("valid SAS link state")),
+    )
 }
 
 #[test]
@@ -197,17 +219,20 @@ fn sas_helpercost_depends_on_link_state() {
     let rho = array![0.7];
 
     let mut opts_a = default_logit_opts();
-    opts_a.family = LikelihoodFamily::BinomialSas;
-    opts_a.sas_link = Some(SasLinkSpec {
+    let sas_link_a = SasLinkSpec {
         initial_epsilon: 0.0,
         initial_log_delta: 0.0,
-    });
+    };
+    opts_a.family = binomial_sas_spec(sas_link_a);
+    opts_a.sas_link = Some(sas_link_a);
 
     let mut opts_b = opts_a.clone();
-    opts_b.sas_link = Some(SasLinkSpec {
+    let sas_link_b = SasLinkSpec {
         initial_epsilon: 0.45,
         initial_log_delta: -0.6,
-    });
+    };
+    opts_b.family = binomial_sas_spec(sas_link_b);
+    opts_b.sas_link = Some(sas_link_b);
 
     let cost_a = evaluate_externalcost_andridge(
         y.view(),
@@ -259,7 +284,7 @@ fn conditioned_helpercost_matches_fittedobjective() {
     let s_list = vec![BlockwisePenalty::new(0..3, s)];
 
     let opts = ExternalOptimOptions {
-        family: LikelihoodFamily::GaussianIdentity,
+        family: gaussian_identity_spec(),
         latent_cloglog: None,
         mixture_link: None,
         optimize_mixture: false,

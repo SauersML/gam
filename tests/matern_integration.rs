@@ -1,11 +1,10 @@
 use gam::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
 use gam::estimate::{AdaptiveRegularizationOptions, FitOptions};
-use gam::predict::predict_gam;
 use gam::smooth::{
     FittedTermCollectionWithSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
     SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
 };
-use gam::types::LikelihoodFamily;
+use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -82,7 +81,10 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
         weights.view(),
         offset.view(),
         &spec,
-        LikelihoodFamily::GaussianIdentity,
+        LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(LinkFunction::Identity),
+        ),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -109,16 +111,10 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
     assert_eq!(fitted.fit.lambdas.len(), 3);
     assert!(fitted.fit.edf_total().is_some_and(f64::is_finite));
 
-    let pred = predict_gam(
-        fitted.design.design.to_dense(),
-        fitted.fit.beta.view(),
-        offset.view(),
-        LikelihoodFamily::GaussianIdentity,
-    )
-    .expect("prediction on fitted Matérn design should succeed");
-    assert!(pred.mean.iter().all(|v| v.is_finite()));
+    let pred_mean = fitted.design.design.to_dense().dot(&fitted.fit.beta) + &offset;
+    assert!(pred_mean.iter().all(|v| v.is_finite()));
 
-    let mse_model = (&pred.mean - &y_true)
+    let mse_model = (&pred_mean - &y_true)
         .mapv(|v| v * v)
         .mean()
         .unwrap_or(f64::INFINITY);
@@ -181,7 +177,10 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
         weights.view(),
         offset.view(),
         &spec,
-        LikelihoodFamily::GaussianIdentity,
+        LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(LinkFunction::Identity),
+        ),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -223,16 +222,10 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
     assert_eq!(diag.maps.len(), 1);
     assert!(fitted.fit.reml_score.is_finite());
 
-    let pred = predict_gam(
-        fitted.design.design.to_dense(),
-        fitted.fit.beta.view(),
-        offset.view(),
-        LikelihoodFamily::GaussianIdentity,
-    )
-    .expect("prediction on exact adaptive Matérn design should succeed");
-    assert!(pred.mean.iter().all(|v| v.is_finite()));
+    let pred_mean = fitted.design.design.to_dense().dot(&fitted.fit.beta) + &offset;
+    assert!(pred_mean.iter().all(|v| v.is_finite()));
 
-    let mse_model = (&pred.mean - &y_true)
+    let mse_model = (&pred_mean - &y_true)
         .mapv(|v| v * v)
         .mean()
         .unwrap_or(f64::INFINITY);
@@ -337,7 +330,10 @@ fn matern_3d_aniso_fits_successfully() {
             weights.clone(),
             offset.clone(),
             &spec,
-            LikelihoodFamily::GaussianIdentity,
+            LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             &FitOptions {
                 latent_cloglog: None,
                 mixture_link: None,
@@ -394,16 +390,10 @@ fn matern_3d_aniso_fits_successfully() {
     );
 
     // Prediction quality check.
-    let pred = predict_gam(
-        fitted.design.design.to_dense(),
-        fitted.fit.beta.view(),
-        offset.view(),
-        LikelihoodFamily::GaussianIdentity,
-    )
-    .expect("prediction on fitted aniso Matérn design should succeed");
-    assert!(pred.mean.iter().all(|v| v.is_finite()));
+    let pred_mean = fitted.design.design.to_dense().dot(&fitted.fit.beta) + &offset;
+    assert!(pred_mean.iter().all(|v| v.is_finite()));
 
-    let mse_model = (&pred.mean - &y_true)
+    let mse_model = (&pred_mean - &y_true)
         .mapv(|v| v * v)
         .mean()
         .unwrap_or(f64::INFINITY);
