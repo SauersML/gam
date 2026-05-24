@@ -353,6 +353,10 @@ class LatentCoord:
         values include ``"euclidean"``, ``"circle"``, ``"sphere"``,
         ``"torus"``, ``"cylinder"``, or ``{"type": "interval", "lo": ...,
         "hi": ...}``.
+    retraction : str | dict | list, default ``"euclidean"``
+        Per-row latent update retraction. Values are passed to the Rust
+        workflow as strings such as ``"euclidean"``, ``"circle"``, or
+        ``"sphere"``, or as products like ``{"type": "product", "parts": [...]}``.
 
     Examples
     --------
@@ -369,6 +373,7 @@ class LatentCoord:
     aux_prior: Mapping[str, Any] | None = None
     dim_selection: bool = False
     manifold: Any = "auto"
+    retraction: Any = "euclidean"
     name: str | None = None
 
 
