@@ -9184,7 +9184,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
                 beta_covariance_frequentist: None,
-                coefficient_influence: None,
+                influence_matrix: None,
                 covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             };
@@ -11638,7 +11638,7 @@ fn fit_bounded_term_collection_with_design(
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
                 beta_covariance_frequentist: None,
-                coefficient_influence: None,
+                influence_matrix: None,
                 covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             };
