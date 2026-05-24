@@ -2370,7 +2370,13 @@ fn validate_spec(
                 .into());
             }
         }
-        FrailtySpec::HazardMultiplier { .. } => unreachable!(),
+        FrailtySpec::HazardMultiplier { .. } => {
+            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                reason: "bernoulli-marginal-slope does not support FrailtySpec::HazardMultiplier"
+                    .to_string(),
+            }
+            .into());
+        }
     }
     Ok(())
 }
@@ -4046,13 +4052,14 @@ fn fourth_full_from_symmetric_components(
             for c in 0..2 {
                 for d in 0..2 {
                     let g_count = a + b + c + d; // count of `g` indices, 0..=4
+                    // a,b,c,d ∈ {0,1} so g_count ∈ 0..=4; the final arm catches
+                    // any unexpected value defensively without panicking.
                     t[a][b][c][d] = match g_count {
                         0 => t_qqqq,
                         1 => t_qqqg,
                         2 => t_qqgg,
                         3 => t_qggg,
-                        4 => t_gggg,
-                        _ => unreachable!(),
+                        _ => t_gggg,
                     };
                 }
             }
@@ -18329,7 +18336,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
         FrailtySpec::GaussianShift { sigma_fixed: None } => Some(0.5),
         FrailtySpec::None => None,
         FrailtySpec::HazardMultiplier { .. } => {
-            unreachable!("validate_spec rejects unsupported marginal-slope frailty")
+            return Err(BernoulliMarginalSlopeError::InvalidInput {
+                reason:
+                    "internal: validate_spec should have rejected unsupported marginal-slope frailty"
+                        .to_string(),
+            }
+            .into());
         }
     };
     let probit_scale = probit_frailty_scale(initial_sigma);

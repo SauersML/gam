@@ -622,6 +622,368 @@ fn hash_array2(hasher: &mut StableHasher, values: &Array2<f64>) {
     }
 }
 
+fn hash_array3(hasher: &mut StableHasher, values: &ndarray::Array3<f64>) {
+    let (a, b, c) = values.dim();
+    hasher.write_usize(a);
+    hasher.write_usize(b);
+    hasher.write_usize(c);
+    for &value in values {
+        hasher.write_f64(value);
+    }
+}
+
+fn hash_psi_slice(
+    hasher: &mut StableHasher,
+    target: &crate::terms::analytic_penalties::PsiSlice,
+) {
+    hasher.write_usize(target.range.start);
+    hasher.write_usize(target.range.end);
+    match target.latent_dim {
+        Some(latent_dim) => {
+            hasher.write_bool(true);
+            hasher.write_usize(latent_dim);
+        }
+        None => hasher.write_bool(false),
+    }
+}
+
+fn hash_scalar_weight_schedule(
+    hasher: &mut StableHasher,
+    schedule: &crate::terms::analytic_penalties::ScalarWeightSchedule,
+) {
+    use crate::terms::sae_manifold::ScheduleKind;
+
+    hasher.write_f64(schedule.w_start);
+    hasher.write_f64(schedule.w_end);
+    match &schedule.kind {
+        ScheduleKind::Geometric { rate } => {
+            hasher.write_str("geometric");
+            hasher.write_f64(*rate);
+        }
+        ScheduleKind::Linear { steps } => {
+            hasher.write_str("linear");
+            hasher.write_usize(*steps);
+        }
+        ScheduleKind::ReciprocalIter => hasher.write_str("reciprocal-iter"),
+    }
+    hasher.write_usize(schedule.iter_count);
+}
+
+fn hash_weight_schedule_option(
+    hasher: &mut StableHasher,
+    schedule: &Option<crate::terms::analytic_penalties::ScalarWeightSchedule>,
+) {
+    match schedule {
+        Some(schedule) => {
+            hasher.write_bool(true);
+            hash_scalar_weight_schedule(hasher, schedule);
+        }
+        None => hasher.write_bool(false),
+    }
+}
+
+fn hash_isometry_reference(
+    hasher: &mut StableHasher,
+    reference: &crate::terms::analytic_penalties::IsometryReference,
+) {
+    use crate::terms::analytic_penalties::IsometryReference;
+
+    match reference {
+        IsometryReference::Euclidean => hasher.write_str("euclidean"),
+        IsometryReference::UserSupplied(values) => {
+            hasher.write_str("user-supplied");
+            hash_array2(hasher, values.as_ref());
+        }
+    }
+}
+
+fn hash_weight_field(
+    hasher: &mut StableHasher,
+    field: &crate::terms::analytic_penalties::WeightField,
+) {
+    use crate::terms::analytic_penalties::WeightField;
+
+    match field {
+        WeightField::Identity => hasher.write_str("identity"),
+        WeightField::Factored { u, rank, p_out } => {
+            hasher.write_str("factored");
+            hash_array2(hasher, u.as_ref());
+            hasher.write_usize(*rank);
+            hasher.write_usize(*p_out);
+        }
+    }
+}
+
+fn hash_sparsity_kind(
+    hasher: &mut StableHasher,
+    kind: crate::terms::analytic_penalties::SparsityKind,
+) {
+    use crate::terms::analytic_penalties::SparsityKind;
+
+    match kind {
+        SparsityKind::SmoothedL1 { eps } => {
+            hasher.write_str("smoothed-l1");
+            hasher.write_f64(eps);
+        }
+        SparsityKind::Hoyer => hasher.write_str("hoyer"),
+        SparsityKind::Log { delta } => {
+            hasher.write_str("log");
+            hasher.write_f64(delta);
+        }
+    }
+}
+
+fn hash_difference_op_kind(
+    hasher: &mut StableHasher,
+    kind: &crate::terms::analytic_penalties::DifferenceOpKind,
+) {
+    use crate::terms::analytic_penalties::DifferenceOpKind;
+
+    match kind {
+        DifferenceOpKind::ForwardDiff1D => hasher.write_str("forward-diff-1d"),
+        DifferenceOpKind::GraphEdges(edges) => {
+            hasher.write_str("graph-edges");
+            hasher.write_usize(edges.len());
+            for &(from, to) in edges {
+                hasher.write_usize(from);
+                hasher.write_usize(to);
+            }
+        }
+    }
+}
+
+fn hash_groups(hasher: &mut StableHasher, groups: &[Vec<usize>]) {
+    hasher.write_usize(groups.len());
+    for group in groups {
+        hasher.write_usize(group.len());
+        for &axis in group {
+            hasher.write_usize(axis);
+        }
+    }
+}
+
+fn hash_analytic_penalty_kind(
+    hasher: &mut StableHasher,
+    penalty: &crate::terms::analytic_penalties::AnalyticPenaltyKind,
+) {
+    use crate::terms::analytic_penalties::{AnalyticPenaltyKind, PenaltyConcavity};
+
+    hasher.write_str(penalty.name());
+    hasher.write_str(&format!("{:?}", penalty.tier()));
+    hasher.write_usize(penalty.rho_count());
+    match penalty {
+        AnalyticPenaltyKind::Isometry(p) => {
+            hasher.write_str("isometry");
+            hash_psi_slice(hasher, &p.target);
+            hash_isometry_reference(hasher, &p.reference);
+            hasher.write_usize(p.rho_index);
+            hasher.write_usize(p.p_out);
+            hash_weight_field(hasher, &p.weight);
+            hasher.write_f64(p.scalar_weight);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+            match p.jacobian_cache.as_ref() {
+                Some(values) => {
+                    hasher.write_bool(true);
+                    hash_array2(hasher, values.as_ref());
+                }
+                None => hasher.write_bool(false),
+            }
+            match p.jacobian_second_cache.as_ref() {
+                Some(values) => {
+                    hasher.write_bool(true);
+                    hash_array2(hasher, values.as_ref());
+                }
+                None => hasher.write_bool(false),
+            }
+            match p.duchon_radial_source.as_ref() {
+                Some(source) => {
+                    hasher.write_bool(true);
+                    hash_array2(hasher, source.centers.as_ref());
+                    hash_array2(hasher, source.radial_coefficients.as_ref());
+                    match source.length_scale {
+                        Some(length_scale) => {
+                            hasher.write_bool(true);
+                            hasher.write_f64(length_scale);
+                        }
+                        None => hasher.write_bool(false),
+                    }
+                    hasher.write_str(&format!("{:?}", source.nullspace_order));
+                }
+                None => hasher.write_bool(false),
+            }
+            match p.cache_third_decoder_derivative.as_ref() {
+                Some(values) => {
+                    hasher.write_bool(true);
+                    hash_array3(hasher, values.as_ref());
+                }
+                None => hasher.write_bool(false),
+            }
+        }
+        AnalyticPenaltyKind::Sparsity(p) => {
+            hasher.write_str("sparsity");
+            hasher.write_str(&format!("{:?}", p.target_tier));
+            hash_sparsity_kind(hasher, p.kind);
+            hasher.write_f64(p.weight);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+            hasher.write_usize(p.strength_rho_index);
+            match p.eps_rho_index {
+                Some(idx) => {
+                    hasher.write_bool(true);
+                    hasher.write_usize(idx);
+                }
+                None => hasher.write_bool(false),
+            }
+        }
+        AnalyticPenaltyKind::SoftmaxAssignmentSparsity(p) => {
+            hasher.write_str("softmax-assignment-sparsity");
+            hasher.write_usize(p.k_atoms);
+            hasher.write_f64(p.temperature);
+            hasher.write_f64(p.weight);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
+        AnalyticPenaltyKind::IBPAssignment(p) => {
+            hasher.write_str("ibp-assignment");
+            hasher.write_usize(p.k_max);
+            hasher.write_f64(p.alpha);
+            hasher.write_f64(p.tau);
+            hasher.write_bool(p.learnable_alpha);
+            hasher.write_f64(p.weight);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
+        AnalyticPenaltyKind::Ard(p) => {
+            hasher.write_str("ard");
+            hash_psi_slice(hasher, &p.target);
+            hasher.write_usize(p.latent_dim);
+            hasher.write_f64(p.weight);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+            hasher.write_usize(p.rho_indices.len());
+            for &idx in &p.rho_indices {
+                hasher.write_usize(idx);
+            }
+            hasher.write_f64(p.n_eff);
+        }
+        AnalyticPenaltyKind::TotalVariation(p) => {
+            hasher.write_str("total-variation");
+            hasher.write_f64(p.weight);
+            hasher.write_usize(p.n_eff);
+            hash_difference_op_kind(hasher, &p.difference_op);
+            hasher.write_f64(p.smoothing_eps);
+            hasher.write_bool(p.learnable_weight);
+            hasher.write_usize(p.rho_index);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
+        AnalyticPenaltyKind::NuclearNorm(p) => {
+            hasher.write_str("nuclear-norm");
+            hash_psi_slice(hasher, &p.target);
+            hasher.write_f64(p.weight);
+            hasher.write_usize(p.n_eff);
+            hasher.write_f64(p.smoothing_eps);
+            match p.max_rank {
+                Some(max_rank) => {
+                    hasher.write_bool(true);
+                    hasher.write_usize(max_rank);
+                }
+                None => hasher.write_bool(false),
+            }
+            hasher.write_bool(p.learnable_weight);
+            hasher.write_usize(p.rho_index);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
+        AnalyticPenaltyKind::BlockSparsity(p) => {
+            hasher.write_str("block-sparsity");
+            hash_psi_slice(hasher, &p.target);
+            hash_groups(hasher, &p.groups);
+            hasher.write_f64(p.weight);
+            hasher.write_usize(p.n_eff);
+            hasher.write_f64(p.smoothing_eps);
+            hasher.write_bool(p.learnable_weight);
+            hasher.write_usize(p.rho_index);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
+        AnalyticPenaltyKind::RowPrecisionPrior(p) => {
+            hasher.write_str("row-precision-prior");
+            hash_array3(hasher, &p.lambda_per_row);
+            hasher.write_f64(p.weight);
+            hasher.write_usize(p.n_eff);
+            hasher.write_bool(p.learnable_weight);
+            hasher.write_usize(p.rho_index);
+            hash_psi_slice(hasher, &p.target);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
+        AnalyticPenaltyKind::IvaeRidgeMeanGauge(p) => {
+            hasher.write_str("ivae-ridge-mean-gauge");
+            hash_array2(hasher, &p.aux);
+            hash_array2(hasher, &p.ridge_inv);
+            hasher.write_f64(p.ridge_eps);
+            hasher.write_f64(p.weight);
+            hasher.write_usize(p.n_eff);
+            hasher.write_bool(p.learnable_weight);
+            hasher.write_usize(p.rho_index);
+            hash_psi_slice(hasher, &p.target);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
+        AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => {
+            hasher.write_str("parametric-row-precision-prior");
+            hash_array2(hasher, &p.aux);
+            hash_array_view(hasher, p.log_alpha.view());
+            hash_array_view(hasher, p.raw_beta.view());
+            hash_array2(hasher, &p.mu);
+            hasher.write_f64(p.weight);
+            hasher.write_usize(p.n_eff);
+            hasher.write_bool(p.learnable_weight);
+            hash_psi_slice(hasher, &p.target);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
+        AnalyticPenaltyKind::ScadMcp(p) => {
+            hasher.write_str("scad-mcp");
+            hash_psi_slice(hasher, &p.target);
+            hasher.write_f64(p.weight);
+            hasher.write_usize(p.n_eff);
+            hasher.write_f64(p.gamma);
+            hasher.write_f64(p.smoothing_eps);
+            match p.variant {
+                PenaltyConcavity::Mcp => hasher.write_str("mcp"),
+                PenaltyConcavity::Scad => hasher.write_str("scad"),
+            }
+            hasher.write_bool(p.learnable_weight);
+            hasher.write_usize(p.rho_index);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
+        AnalyticPenaltyKind::BlockOrthogonality(p) => {
+            hasher.write_str("block-orthogonality");
+            hash_psi_slice(hasher, &p.target);
+            hash_groups(hasher, &p.groups);
+            hasher.write_f64(p.weight);
+            hasher.write_usize(p.n_eff);
+            hasher.write_bool(p.learnable_weight);
+            hasher.write_usize(p.rho_index);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
+        AnalyticPenaltyKind::Orthogonality(p) => {
+            hasher.write_str("orthogonality");
+            hash_psi_slice(hasher, &p.target);
+            hasher.write_usize(p.latent_dim);
+            hasher.write_f64(p.weight);
+            hasher.write_usize(p.n_eff);
+            hasher.write_bool(p.learnable_weight);
+            hasher.write_usize(p.rho_index);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
+    }
+}
+
+pub(crate) fn analytic_penalty_registry_fingerprint(
+    registry: &crate::terms::analytic_penalties::AnalyticPenaltyRegistry,
+) -> u64 {
+    let mut hasher = StableHasher::new();
+    hasher.write_str("analytic-penalty-registry-v1");
+    hasher.write_usize(registry.penalties.len());
+    for penalty in &registry.penalties {
+        hash_analytic_penalty_kind(&mut hasher, penalty);
+    }
+    hasher.finish_u64()
+}
+
 fn hash_design_matrix(hasher: &mut StableHasher, design: &DesignMatrix) -> Result<(), String> {
     let n = design.nrows();
     let p = design.ncols();
@@ -3818,6 +4180,16 @@ impl<'a> RemlState<'a> {
             .store(false, Ordering::Relaxed);
     }
 
+    pub(crate) fn set_analytic_penalty_registry_fingerprint(&mut self, fingerprint: u64) {
+        if self.analytic_penalty_registry_fingerprint == fingerprint {
+            return;
+        }
+        self.analytic_penalty_registry_fingerprint = fingerprint;
+        *self.persistent_warm_start_key.write().unwrap() = None;
+        self.persistent_warm_start_loaded
+            .store(false, Ordering::Relaxed);
+    }
+
     /// Creates a sanitized cache key from rho values.
     /// Returns None if any component is NaN, in which case caching is skipped.
     /// Maps -0.0 to 0.0 to ensure consistency in caching.
@@ -4455,7 +4827,7 @@ impl<'a> RemlState<'a> {
             return Some(key);
         }
         let mut hasher = StableHasher::new();
-        hasher.write_str("gamfit-persistent-warm-start");
+        hasher.write_str("gamfit-persistent-warm-start-v2");
         // Use the cache schema tag (NOT CARGO_PKG_VERSION) so routine
         // library version bumps don't invalidate users' on-disk
         // warm-start caches.
@@ -4486,6 +4858,8 @@ impl<'a> RemlState<'a> {
             return None;
         }
         hash_canonical_penalties(&mut hasher, self.canonical_penalties.as_ref());
+        // Analytic penalties alter the realized fit even when X and canonical S match.
+        hasher.write_u64(self.analytic_penalty_registry_fingerprint);
         hasher.write_usize(self.nullspace_dims.len());
         for &dim in &self.nullspace_dims {
             hasher.write_usize(dim);
