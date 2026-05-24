@@ -47,7 +47,8 @@ fn main() {
     // code so the offending binding is actually read, or remove it.
     let mut allow_offenders: Vec<(PathBuf, usize, String, String)> = Vec::new();
     scan_for_banned_allow(&manifest_dir, &manifest_dir, &mut allow_offenders);
-    if !allow_offenders.is_empty() {
+    let allow_violations = !allow_offenders.is_empty();
+    if allow_violations {
         eprintln!();
         eprintln!(
             "error: {} banned `#[allow(...)]` attribute(s) found. \
@@ -62,7 +63,6 @@ fn main() {
             eprintln!("  {}:{}: [allow({})] {}", rel.display(), line_no, lint, snippet);
         }
         eprintln!();
-        std::process::exit(1);
     }
 
     // `let _name = ...` ban (underscore-prefixed binding with a non-empty
@@ -138,14 +138,81 @@ fn scan_for_banned_marker(
     });
 }
 
-/// Scan for `#[allow(<lint>)]` and `#[allow(..., <lint>, ...)]`. Matches the
-/// lint name as a whole word so `unused_assignments_foo` would not collide.
-/// Only Rust files are inspected; build.rs is exempt (it documents the bans
-/// it enforces, including the lint name).
+/// Scan for `#[allow(<lint>)]` / `#![allow(<lint>)]` where `<lint>` is in the
+/// banned set: any token starting with `unused` (covers `unused_assignments`,
+/// `unused_variables`, `unused_imports`, `unused_mut`, `unused_must_use`,
+/// `unused_macros`, `unused_doc_comments`, `unused_attributes`, etc.) or
+/// exactly `dead_code`. Lint names are matched as whole comma-delimited
+/// tokens inside the `allow(...)` parenthesized list, so identifiers that
+/// merely contain the substring are not flagged. The leading `clippy::`
+/// path prefix is tolerated. Build.rs itself is exempt (it names the lints
+/// as part of this scanner's own contract).
 fn scan_for_banned_allow(
     root: &Path,
     dir: &Path,
-    lint: &str,
+    offenders: &mut Vec<(PathBuf, usize, String, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("allow(") {
+            return;
+        }
+        for (idx, line) in content.lines().enumerate() {
+            // Strip line comments (`//`, `///`, `//!`) so that doc/comment
+            // text mentioning the attribute syntax is not flagged. String
+            // literals containing `allow(` would still be matched, but the
+            // codebase does not embed such literals.
+            let code = match line.find("//") {
+                Some(pos) => &line[..pos],
+                None => line,
+            };
+            // Only match when `allow(` is part of an attribute on this
+            // line: preceded somewhere by `#[` or `#![`.
+            if !code.contains("#[") && !code.contains("#![") {
+                continue;
+            }
+            let mut search_from = 0usize;
+            while let Some(rel_idx) = code[search_from..].find("allow(") {
+                let start = search_from + rel_idx + "allow(".len();
+                let Some(end_rel) = code[start..].find(')') else {
+                    break;
+                };
+                let inside = &code[start..start + end_rel];
+                for tok in inside.split(',') {
+                    let t = tok.trim().trim_start_matches("clippy::");
+                    if t.starts_with("unused") || t == "dead_code" {
+                        offenders.push((
+                            rel.to_path_buf(),
+                            idx + 1,
+                            t.to_string(),
+                            line.to_string(),
+                        ));
+                    }
+                }
+                search_from = start + end_rel + 1;
+                if search_from >= code.len() {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Scan for `let _name = ...` / `let mut _name = ...` / `let _name: T = ...`.
+/// Matches an underscore followed by at least one identifier char. The bare
+/// `let _ = ...` / `let _: T = ...` discard pattern is allowed and not
+/// flagged. Build.rs is exempt (its `let _name` would be self-flagging if
+/// any ever appeared; none do today, but the exemption mirrors the other
+/// scanners for consistency).
+fn scan_for_let_underscore_binding(
+    root: &Path,
+    dir: &Path,
     offenders: &mut Vec<(PathBuf, usize, String)>,
 ) {
     visit_files(root, dir, &mut |rel, content| {
@@ -156,44 +223,89 @@ fn scan_for_banned_allow(
         if rel.extension().and_then(OsStr::to_str) != Some("rs") {
             return;
         }
-        if !content.contains("allow(") || !content.contains(lint) {
+        if !content.contains("let ") {
             return;
         }
         for (idx, line) in content.lines().enumerate() {
-            // Find `allow(` then look inside the parenthesized list for `lint`
-            // as a comma/whitespace-delimited token. This avoids matching
-            // identifiers that merely contain the lint name as a substring
-            // and also avoids matching the lint name in unrelated string
-            // literals or comments.
-            let bytes = line.as_bytes();
-            let mut search_from = 0usize;
-            let mut matched = false;
-            while let Some(rel_idx) = line[search_from..].find("allow(") {
-                let start = search_from + rel_idx + "allow(".len();
-                // Find matching ')' on the same line.
-                let Some(end_rel) = line[start..].find(')') else {
-                    break;
-                };
-                let inside = &line[start..start + end_rel];
-                for tok in inside.split(',') {
-                    if tok.trim() == lint {
-                        matched = true;
-                        break;
-                    }
-                }
-                if matched {
-                    break;
-                }
-                search_from = start + end_rel + 1;
-                if search_from >= bytes.len() {
-                    break;
-                }
-            }
-            if matched {
+            if matches_let_underscore(line) {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }
         }
     });
+}
+
+/// Returns true when `line` contains a `let` (or `let mut`) binding whose
+/// pattern starts with `_<ident_char>...`. Skips lines whose `let` is inside
+/// a `//`-line-comment or a string literal on that line. Multi-line raw
+/// strings and `/* ... */` blocks are out of scope: the scanner is a
+/// line-level heuristic, not a full parser, and the codebase does not use
+/// such constructs to embed `let _foo`.
+fn matches_let_underscore(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut in_str = false;
+    let mut str_quote: u8 = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if c == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if c == str_quote {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            return false;
+        }
+        if c == b'"' || c == b'\'' {
+            in_str = true;
+            str_quote = c;
+            i += 1;
+            continue;
+        }
+        // Look for word `let` at this position with a word boundary before.
+        if c == b'l'
+            && i + 3 <= bytes.len()
+            && &bytes[i..i + 3] == b"let"
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && i + 3 < bytes.len()
+            && bytes[i + 3].is_ascii_whitespace()
+        {
+            // Advance past `let` and any whitespace.
+            let mut j = i + 3;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            // Optional `mut `.
+            if j + 4 <= bytes.len() && &bytes[j..j + 3] == b"mut" && bytes[j + 3].is_ascii_whitespace()
+            {
+                j += 3;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+            }
+            // Pattern must begin with `_` followed by at least one ident char.
+            if j < bytes.len() && bytes[j] == b'_' {
+                if let Some(&next) = bytes.get(j + 1) {
+                    if is_ident_byte(next) {
+                        return true;
+                    }
+                }
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 fn scan_for_ignored_tests(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
