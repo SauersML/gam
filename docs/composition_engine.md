@@ -174,6 +174,11 @@ axis-correlation 0.80–0.88), with no cross-subspace mixing. Mean R²=0.707
 across all 6 aux dims, exceeding the unsupervised `U_3d` ceiling of 0.61.
 This makes the §4(c) prediction ("structured prior + supervised aux breaks
 gauge") a demonstrated solution on real LLM data, not just synthetic.
+A 5-fold-by-color cross-validation (`auto_exp_36`) confirms the decomposition
+is not within-sample overfitting: held-out R² is within 2% of in-sample across
+all 6 axes (held-out hue R²=0.687, in-sample 0.700), while a permutation-control
+fit (shuffle aux labels) collapses to ~null (R² range [-0.035, -0.018]).
+The cogito-L40 subspace structure is REAL, not a fit-time artifact.
 
 ### Persistent Caching
 
