@@ -7393,27 +7393,6 @@ fn weighted_normal_equations(
     Ok((xtwx, xtwy))
 }
 
-#[cfg(test)]
-fn solve_blockweighted_system(
-    x: &DesignMatrix,
-    y_star: &Array1<f64>,
-    w: &Array1<f64>,
-    s_lambda: &Array2<f64>,
-    ridge_floor: f64,
-    ridge_policy: RidgePolicy,
-) -> Result<Array1<f64>, String> {
-    let n = x.nrows();
-    if y_star.len() != n || w.len() != n {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: "weighted-system dimension mismatch".to_string(),
-        }
-        .into());
-    }
-    let xtwy = x.compute_xtwy(w, y_star)?;
-    x.solve_systemwith_policy(w, &xtwy, Some(s_lambda), ridge_floor, ridge_policy)
-        .map_err(|_| "block solve failed after ridge retries".to_string())
-}
-
 fn solve_spd_systemwith_policy(
     lhs: &Array2<f64>,
     rhs: &Array1<f64>,
