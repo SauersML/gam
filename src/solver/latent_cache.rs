@@ -107,6 +107,7 @@ impl CacheDigestBuilder {
 
 #[derive(Clone)]
 pub(crate) enum LatentBasisKind {
+    // Basis/evaluator family for Phi(t); the per-row latent values live in LatentCoordValues.
     Matern {
         centers: Array2<f64>,
         length_scale: f64,
