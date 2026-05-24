@@ -26495,7 +26495,12 @@ mod tests {
             Array1::ones(n).view(),
             Array1::zeros(n).view(),
             &spec,
-            LikelihoodFamily::BinomialSas,
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Sas(
+                    SasLinkState::new(0.1, -0.2).expect("valid SAS link state"),
+                ),
+            ),
             &FitOptions {
                 latent_cloglog: None,
                 mixture_link: None,

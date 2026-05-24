@@ -667,7 +667,7 @@ impl NutsPosterior {
         }
 
         validate_firth_support(nuts_family, firth_enabled).map_err(String::from)?;
-        if nuts_family.likelihood_family().is_binomial() {
+        if nuts_family.likelihood_spec().is_binomial() {
             validate_binary_responses("binomial NUTS", &y, &weights).map_err(String::from)?;
         }
         if matches!(nuts_family, NutsFamily::NegativeBinomialLog) {
@@ -4248,7 +4248,7 @@ impl LinkWigglePosterior {
             }
             .into());
         }
-        if nuts_family.likelihood_family().is_binomial() {
+        if nuts_family.likelihood_spec().is_binomial() {
             validate_binary_responses("binomial link-wiggle NUTS", &y, &weights)
                 .map_err(String::from)?;
         }
