@@ -1,1022 +1,203 @@
-//! Env-free autodetection of an installed CUDA driver via `cudarc` 0.19.
-//!
-//! The runtime probes the driver API exactly once at first access:
-//!
-//! 1. Ask `cudarc::driver::CudaContext::device_count()` for the visible
-//!    device count. This implicitly initializes the driver.
-//! 2. For each ordinal, retain the primary context via
-//!    `CudaContext::new(ordinal)` and pull name / compute capability /
-//!    total memory / SM count through the safe driver API.
-//! 3. Materialize a [`GpuDeviceInfo`] per device, sort by score, and keep
-//!    the full device set available for batched work partitioning.
-//!
-//! Probe failure is silent: callers see [`GpuRuntime::is_available`] return
-//! `false` and the dispatch policy stays unused. There are no environment
-//! variables or CLI flags involved in any of this.
-
-use std::any::Any;
-use std::fmt;
-use std::ops::Range;
-use std::panic;
-#[cfg(target_os = "linux")]
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-use cudarc::driver::CudaContext;
-use cudarc::driver::sys::CUdevice_attribute_enum;
-#[cfg(target_os = "linux")]
+use super::device::{GpuDeviceInfo, GpuSelection, classify_capability};
+use super::policy::{AccelPolicy, GpuDispatchPolicy, accel_policy_from_env};
 use libloading::Library;
+use std::ffi::c_char;
+use std::sync::OnceLock;
 
-use super::calibration::{DeviceCalibration, measure_device};
-use super::device::GpuDeviceInfo;
-use super::diagnostics;
-use super::policy::DispatchPolicy;
+type CuResult = i32;
+type CuDevice = i32;
+type CuInit = unsafe extern "C" fn(u32) -> CuResult;
+type CuDeviceGetCount = unsafe extern "C" fn(*mut i32) -> CuResult;
+type CuDeviceGet = unsafe extern "C" fn(*mut CuDevice, i32) -> CuResult;
+type CuDeviceGetName = unsafe extern "C" fn(*mut c_char, i32, CuDevice) -> CuResult;
+type CuDeviceComputeCapability = unsafe extern "C" fn(*mut i32, *mut i32, CuDevice) -> CuResult;
+type CuDeviceTotalMem = unsafe extern "C" fn(*mut usize, CuDevice) -> CuResult;
 
-/// Pre-flight: can libcuda be dlopen'd at all?
-///
-/// `cudarc` 0.19 panics with `panic_no_lib_found` (cudarc/src/lib.rs:200)
-/// the first time any of its `culib()`-backed entry points is called on a
-/// host that has no `libcuda.*`. That's a hard abort path — there is no
-/// Result-returning variant. So before we touch *any* cudarc API in the
-/// probe, we ask cudarc itself whether its loader can find the library.
-///
-/// We delegate to cudarc's own `is_culib_present()` rather than rolling
-/// our own short candidate list, because the cudarc loader walks a much
-/// broader name set (versioned variants `libcuda.so.1`, Windows-style
-/// `cuda64_X.so` mappings, etc.) than the three names we used to try.
-/// A narrower preflight produced a real regression on cloud GPU images
-/// where the library lives under a name cudarc would have found but our
-/// hard-coded list missed — surfacing as "libcublas … not loadable" even
-/// though the device set was perfectly usable.
-fn libcuda_loadable() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| unsafe { cudarc::driver::sys::is_culib_present() })
-}
-
-/// Pre-flight: can libcublas be dlopen'd? Same rationale as
-/// [`libcuda_loadable`] — cudarc's cublas loader is independent of the
-/// driver loader, and a host with libcuda but no libcublas would still
-/// panic the first time `CudaBlas::new` runs. Delegating to cudarc's own
-/// presence check keeps the preflight name list in lockstep with the
-/// names cudarc will actually try.
-///
-/// Strategy: ask cudarc's bare-name probe first. If a complete CUDA
-/// stack is reachable through the loader's normal search path (system
-/// `/usr/local/cuda*`, `ld.so.cache`, or an explicit `LD_LIBRARY_PATH`),
-/// we do not preload any absolute-path bundled libraries. That avoids
-/// introducing a second CUDA stack from gamfit itself on hosts where both
-/// system CUDA and pip `nvidia-*-cu12` wheels are installed.
-///
-/// Only fall back to the bundled-wheel preload when cudarc's normal
-/// search fails outright (a host with no CUDA on the loader path at
-/// all). If another framework has already mapped both CUDA stacks, gamfit
-/// warns with the paths and keeps CUDA enabled because cudarc resolves all
-/// gamfit cuBLAS symbols through one process-wide library handle.
-pub fn libcublas_loadable() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        // First pass: try cudarc's normal loader without any preload.
-        // `is_culib_present` dlopens its probe handles transiently
-        // (Drop → dlclose), so on success we *also* force-init the
-        // persistent `culib()` handle below — that way the mapping
-        // visible to `detect_cuda_library_conflicts` is exactly the
-        // one CudaBlas::new will use, not a transient probe.
-        if unsafe { cudarc::cublas::sys::is_culib_present() } && force_init_culib_persistent() {
-            warn_cuda_library_conflicts();
-            return true;
-        }
-        // Fall back to the bundled-wheel preload only if the system
-        // stack is genuinely unreachable.
-        preload_packaged_cuda_libraries();
-        if !force_init_culib_persistent() {
-            return false;
-        }
-        warn_cuda_library_conflicts();
-        true
-    })
-}
-
-/// Force `cudarc::cublas::sys::culib()` to initialise its process-wide
-/// `OnceLock<Library>` so libcublas stays mapped for the rest of the
-/// process — guaranteeing that subsequent `/proc/self/maps` scans see
-/// the same file `CudaBlas::new` will dispatch through.
-///
-/// `culib()` panics with `panic_no_lib_found` when no candidate name
-/// is dlopen'able, so the call is wrapped in `catch_unwind` to convert
-/// that into a clean `false` instead of an unrecoverable abort.
-fn force_init_culib_persistent() -> bool {
-    let outcome = std::panic::catch_unwind(|| unsafe {
-        let _ = cudarc::cublas::sys::culib();
-    });
-    outcome.is_ok()
-}
-
-/// Linux-only diagnostic: report when more than one distinct file is
-/// mapped under any CUDA library SONAME family. This used to refuse
-/// cuBLAS work; it now only warns.
-///
-/// The crash scenario the refuse-path was guarding against —
-/// `cublasDestroy_v2` resolving to a *different* library than the one
-/// that produced the handle, freeing a chunk it never owned — requires
-/// per-call symbol resolution to flip libraries. cudarc's `culib()` is
-/// a process-wide `OnceLock<Library>` and every cuBLAS symbol is
-/// resolved through that single `Library` handle. Once initialized,
-/// `cublasCreate_v2` and `cublasDestroy_v2` necessarily route through
-/// the same physical file; the second mapping (typically pulled in by
-/// PyTorch or a sibling Python framework via its own DT_NEEDED chain)
-/// is dead weight that we never call into.
-///
-/// On dual-stack Colab / AoU images the strict-refuse policy was a
-/// false positive: the host happily runs PyTorch CUDA, our cudarc
-/// handle is consistent, and disabling GPU forced an n-times-slower
-/// CPU fallback. Downgrading to a warning surfaces the diagnostic
-/// without sacrificing throughput. If gam ever genuinely sees a
-/// destroy mismatch it surfaces as a SIGABRT from glibc anyway —
-/// observable, not silenced.
-#[cfg(target_os = "linux")]
-fn warn_cuda_library_conflicts() {
-    if let Some(report) = detect_cuda_library_conflicts() {
-        log::warn!("[GPU] {report}");
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn warn_cuda_library_conflicts() {}
-
-/// Return the canonical CUDA library family for a file basename, or
-/// `None` if the basename isn't a CUDA library we care about.
-///
-/// Families are matched on the stem before the first `.so`, so
-/// `libcublas.so.12.3.4.1` and `libcublas.so.12` both resolve to
-/// `libcublas`. `libcublasLt.so.12` resolves to `libcublasLt` — a
-/// distinct family despite the shared prefix.
-#[cfg(target_os = "linux")]
-fn cuda_library_family(basename: &str) -> Option<&'static str> {
-    let stem = basename.split(".so").next()?;
-    match stem {
-        "libcuda" => Some("libcuda"),
-        "libcudart" => Some("libcudart"),
-        "libcublas" => Some("libcublas"),
-        "libcublasLt" => Some("libcublasLt"),
-        "libcusparse" => Some("libcusparse"),
-        "libcusolver" => Some("libcusolver"),
-        "libnvJitLink" => Some("libnvJitLink"),
-        "libnvrtc" => Some("libnvrtc"),
-        _ => None,
-    }
-}
-
-/// Detect whether more than one distinct file is mapped into the process
-/// for the same CUDA SONAME family. Returns a multi-line, actionable report
-/// naming every conflicting path.
-#[cfg(target_os = "linux")]
-fn detect_cuda_library_conflicts() -> Option<String> {
-    use std::collections::{BTreeMap, BTreeSet};
-
-    let maps = match std::fs::read_to_string("/proc/self/maps") {
-        Ok(content) => content,
-        Err(_) => return None,
-    };
-    let mut by_family: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
-    for line in maps.lines() {
-        let Some(path) = line.split_whitespace().last() else {
-            continue;
-        };
-        if !path.starts_with('/') {
-            continue;
-        }
-        let name = Path::new(path)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if let Some(family) = cuda_library_family(name) {
-            by_family
-                .entry(family)
-                .or_default()
-                .insert(path.to_string());
-        }
-    }
-    let conflicts: Vec<(&'static str, Vec<String>)> = by_family
-        .into_iter()
-        .filter(|(_, paths)| paths.len() > 1)
-        .map(|(f, p)| (f, p.into_iter().collect()))
-        .collect();
-    if conflicts.is_empty() {
-        return None;
-    }
-    let mut msg = String::from(
-        "CUDA library duplicate mapping: more than one distinct file \
-         is mapped under the same SONAME. cudarc's `culib()` is a \
-         process-wide `OnceLock<Library>` so every cuBLAS symbol in \
-         gam resolves through one specific handle — the other mapping \
-         is dead weight (typically from PyTorch's DT_NEEDED chain) \
-         that gam does not call into. Continuing with CUDA enabled.",
-    );
-    for (family, paths) in &conflicts {
-        msg.push_str(&format!("\n  {family}:"));
-        for path in paths {
-            msg.push_str(&format!("\n    {path}"));
-        }
-    }
-    msg.push_str(
-        "\nTo silence this warning, ensure only one CUDA toolkit is \
-         reachable to the loader: either the system toolkit (usually \
-         /usr/local/cuda*) or the pip nvidia-*-cu12 wheels, not both.",
-    );
-    Some(msg)
-}
-
-#[cfg(target_os = "linux")]
-fn preload_packaged_cuda_libraries() {
-    static HANDLES: OnceLock<Vec<Library>> = OnceLock::new();
-    let _ = HANDLES.get_or_init(load_packaged_cuda_libraries);
-}
-
-#[cfg(not(target_os = "linux"))]
-fn preload_packaged_cuda_libraries() {}
-
-#[cfg(target_os = "linux")]
-fn load_packaged_cuda_libraries() -> Vec<Library> {
-    let paths = cuda_library_candidate_paths();
-    let loaded: Vec<Library> = paths
-        .iter()
-        .filter_map(|path| match unsafe { Library::new(path) } {
-            Ok(lib) => {
-                log::debug!("[GPU] preloaded CUDA library: {}", path.display());
-                Some(lib)
-            }
-            Err(err) => {
-                log::debug!("[GPU] preload failed for {}: {}", path.display(), err);
-                None
-            }
-        })
-        .collect();
-    if loaded.is_empty() && !paths.is_empty() {
-        log::warn!(
-            "[GPU] found {} CUDA library file(s) but none could be dlopen'd; \
-             CUDA math libraries remain unavailable",
-            paths.len()
-        );
-    }
-    loaded
-}
-
-#[cfg(target_os = "linux")]
-fn cuda_library_candidate_paths() -> Vec<PathBuf> {
-    if let Some(image_dir) = current_image_dir() {
-        for root in packaged_nvidia_roots(&image_dir) {
-            if let Some(paths) = complete_packaged_cuda_stack(&root) {
-                return paths;
-            }
-        }
-    }
-
-    for lib_dir in system_library_dirs() {
-        if let Some(paths) = complete_system_cuda_stack(&lib_dir) {
-            return paths;
-        }
-    }
-
-    Vec::new()
-}
-
-#[cfg(target_os = "linux")]
-fn cuda_library_groups() -> &'static [(&'static str, &'static [&'static [&'static str]])] {
-    &[
-        ("cuda_runtime", &[&["libcudart.so.12", "libcudart.so"]]),
-        ("nvjitlink", &[&["libnvJitLink.so.12", "libnvJitLink.so"]]),
-        (
-            "cublas",
-            &[
-                &["libcublasLt.so.12", "libcublasLt.so"],
-                &["libcublas.so.12", "libcublas.so"],
-            ],
-        ),
-        ("cusparse", &[&["libcusparse.so.12", "libcusparse.so"]]),
-        (
-            "cusolver",
-            &[&["libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"]],
-        ),
-    ]
-}
-
-#[cfg(target_os = "linux")]
-fn complete_packaged_cuda_stack(root: &Path) -> Option<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    for (component, library_groups) in cuda_library_groups() {
-        let lib_dir = root.join(component).join("lib");
-        for names in *library_groups {
-            out.push(first_existing_library(&lib_dir, names)?);
-        }
-    }
-    Some(dedup_canonical_paths(out))
-}
-
-#[cfg(target_os = "linux")]
-fn complete_system_cuda_stack(lib_dir: &Path) -> Option<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    for (_, library_groups) in cuda_library_groups() {
-        for names in *library_groups {
-            out.push(first_existing_library(lib_dir, names)?);
-        }
-    }
-    Some(dedup_canonical_paths(out))
-}
-
-#[cfg(target_os = "linux")]
-fn first_existing_library(lib_dir: &Path, names: &[&str]) -> Option<PathBuf> {
-    names
-        .iter()
-        .map(|name| lib_dir.join(name))
-        .find(|path| path.exists())
-}
-
-#[cfg(target_os = "linux")]
-fn dedup_canonical_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for path in paths {
-        let canonical = path.canonicalize().unwrap_or(path);
-        if !out.iter().any(|seen| seen == &canonical) {
-            out.push(canonical);
-        }
-    }
-    out
-}
-
-/// CUDA toolkit shared libraries live in a handful of well-known places
-/// across cloud images, distro packages, and conda envs — but rarely all
-/// of them are on `LD_LIBRARY_PATH`, so `libloading::Library::new("libcublas.so.12")`
-/// fails on a host that nonetheless has a perfectly usable install. We choose
-/// one complete userspace stack and dlopen those absolute paths; once the
-/// shared objects are mapped, cudarc's own bare-name `dlopen("libcublas.so.12")`
-/// succeeds by SONAME match against the already-loaded mapping.
-#[cfg(target_os = "linux")]
-fn system_library_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut push = |path: PathBuf| {
-        if path.is_dir() && !dirs.iter().any(|seen| seen == &path) {
-            dirs.push(path);
-        }
-    };
-
-    // Canonical CUDA toolkit install (symlinked).
-    push(PathBuf::from("/usr/local/cuda/lib64"));
-    push(PathBuf::from("/usr/local/cuda/lib"));
-
-    // Versioned toolkit installs without the `/usr/local/cuda` symlink —
-    // some Google Cloud Deep Learning VM images ship `/usr/local/cuda-12.x/`
-    // with no current-version symlink, so we enumerate them.
-    if let Ok(entries) = std::fs::read_dir("/usr/local") {
-        let mut versioned: Vec<PathBuf> = entries
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.starts_with("cuda-"))
-                    .unwrap_or(false)
-            })
-            .collect();
-        versioned.sort();
-        for root in versioned {
-            push(root.join("lib64"));
-            push(root.join("lib"));
-        }
-    }
-
-    // Debian / Ubuntu system packages (`nvidia-cuda-toolkit`, `libcublas12`).
-    push(PathBuf::from("/usr/lib/x86_64-linux-gnu"));
-    // RHEL / Fedora / CentOS system packages.
-    push(PathBuf::from("/usr/lib64"));
-    // WSL2 GPU passthrough.
-    push(PathBuf::from("/usr/lib/wsl/lib"));
-
-    dirs
-}
-
-#[cfg(target_os = "linux")]
-fn packaged_nvidia_roots(image_dir: &Path) -> Vec<PathBuf> {
-    let candidates = [
-        image_dir.join("../nvidia"),
-        image_dir.join("nvidia"),
-        image_dir.join("../../nvidia"),
-    ];
-    candidates
-        .into_iter()
-        .filter_map(|path| path.canonicalize().ok())
-        .filter(|path| path.is_dir())
-        .fold(Vec::new(), |mut roots, path| {
-            if !roots.iter().any(|seen| seen == &path) {
-                roots.push(path);
-            }
-            roots
-        })
-}
-
-#[cfg(target_os = "linux")]
-fn current_image_dir() -> Option<PathBuf> {
-    use std::ffi::{CStr, c_char, c_void};
-
-    #[repr(C)]
-    struct DlInfo {
-        dli_fname: *const c_char,
-        dli_fbase: *mut c_void,
-        dli_sname: *const c_char,
-        dli_saddr: *mut c_void,
-    }
-
-    unsafe extern "C" {
-        fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
-    }
-
-    let mut info = DlInfo {
-        dli_fname: std::ptr::null(),
-        dli_fbase: std::ptr::null_mut(),
-        dli_sname: std::ptr::null(),
-        dli_saddr: std::ptr::null_mut(),
-    };
-    let rc = unsafe { dladdr(current_image_dir as *const () as *const c_void, &mut info) };
-    if rc == 0 || info.dli_fname.is_null() {
-        return None;
-    }
-    let image_path = unsafe { CStr::from_ptr(info.dli_fname) }.to_str().ok()?;
-    Path::new(image_path)
-        .canonicalize()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf))
-}
-
-/// Reason that GPU probing failed; never surfaced to callers, only logged.
-#[derive(Debug)]
-pub enum GpuProbeError {
-    /// The CUDA driver could not be loaded or initialized on this host.
-    DriverLibraryMissing(String),
-    /// A cudarc safe-API call returned an error.
-    DriverError(String),
-    /// The driver reports zero usable devices.
-    NoDevices,
-    /// All enumerated devices failed runtime calibration (dgemm or memcpy).
-    /// Callers fall through to CPU dispatch.
-    CalibrationFailed,
-}
-
-impl fmt::Display for GpuProbeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DriverLibraryMissing(s) => write!(f, "CUDA driver library not found: {s}"),
-            Self::DriverError(s) => write!(f, "CUDA driver call failed: {s}"),
-            Self::NoDevices => f.write_str("no CUDA devices reported by the driver"),
-            Self::CalibrationFailed => f.write_str("all CUDA devices failed runtime calibration"),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DeviceBatchPlan {
-    pub ordinal: usize,
-    pub chunks: Vec<Range<usize>>,
-}
-
-/// Cached probe outcome — either a selected CUDA device set or CPU-only.
-#[derive(Debug)]
+/// Cached runtime discovery result.
+#[derive(Clone, Debug)]
 pub struct GpuRuntime {
-    selected_device: Option<GpuDeviceInfo>,
-    devices: Vec<GpuDeviceInfo>,
-    policy: DispatchPolicy,
-    cpu_reason: Option<String>,
-    dispatch_cursor: AtomicUsize,
+    pub selection: GpuSelection,
+    pub policy: GpuDispatchPolicy,
 }
 
 impl GpuRuntime {
-    /// Access the process-wide runtime. The probe runs at most once.
-    pub fn global() -> &'static Self {
+    #[inline]
+    pub fn get() -> &'static Self {
         static RUNTIME: OnceLock<GpuRuntime> = OnceLock::new();
         RUNTIME.get_or_init(Self::probe)
     }
 
-    fn probe() -> Self {
-        let probe_result = match panic::catch_unwind(probe_cuda_devices) {
-            Ok(result) => result,
-            Err(payload) => Err(GpuProbeError::DriverLibraryMissing(format!(
-                "CUDA loader panicked: {}",
-                panic_payload_message(payload.as_ref())
-            ))),
-        };
-        match probe_result {
-            Ok(mut devices) => {
-                debug_assert!(!devices.is_empty());
-                devices.sort_by(|a, b| {
-                    b.score()
-                        .partial_cmp(&a.score())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let device = devices[0].clone();
-                let policy = DispatchPolicy::for_devices(&devices);
-                diagnostics::log_cuda_enabled(&device, &policy);
-                diagnostics::log_cuda_pool(&devices);
+    pub fn probe() -> Self {
+        let accel_policy = accel_policy_from_env();
+        if matches!(accel_policy, AccelPolicy::CpuOnly) {
+            return Self::cpu("GAM_GPU disabled acceleration".to_string(), accel_policy);
+        }
+        match probe_cuda_devices() {
+            Ok(mut devices) if !devices.is_empty() => {
+                devices.sort_by_key(|device| std::cmp::Reverse(device.score()));
+                let selected = select_device(devices);
+                let policy = GpuDispatchPolicy::for_device(accel_policy, Some(&selected));
                 Self {
-                    selected_device: Some(device),
-                    devices,
+                    selection: GpuSelection::Cuda { device: selected },
                     policy,
-                    cpu_reason: None,
-                    dispatch_cursor: AtomicUsize::new(0),
                 }
             }
+            Ok(_) => Self::cpu(
+                "CUDA driver loaded but reported no devices".to_string(),
+                accel_policy,
+            ),
             Err(err) => {
-                let reason = err.to_string();
-                diagnostics::log_cuda_disabled(&reason);
-                Self {
-                    selected_device: None,
-                    devices: Vec::new(),
-                    policy: DispatchPolicy::for_device(None),
-                    cpu_reason: Some(reason),
-                    dispatch_cursor: AtomicUsize::new(0),
+                if matches!(accel_policy, AccelPolicy::GpuOnly) {
+                    log::warn!(
+                        "[GAM GPU] GAM_GPU=force but CUDA probing failed: {err}; falling back to CPU"
+                    );
                 }
+                Self::cpu(err, accel_policy)
             }
         }
     }
 
-    /// True when a CUDA device was successfully selected.
     #[inline]
-    pub fn is_available(&self) -> bool {
-        self.selected_device.is_some()
+    pub fn cuda_available(&self) -> bool {
+        matches!(self.selection, GpuSelection::Cuda { .. })
     }
 
-    /// Selected device descriptor, or `None` for CPU-only hosts.
     #[inline]
     pub fn selected_device(&self) -> Option<&GpuDeviceInfo> {
-        self.selected_device.as_ref()
+        match &self.selection {
+            GpuSelection::CpuOnly { .. } => None,
+            GpuSelection::Cuda { device } => Some(device),
+        }
     }
 
-    /// All CUDA devices visible to the process, sorted by dispatch preference.
-    #[inline]
-    pub fn devices(&self) -> &[GpuDeviceInfo] {
-        &self.devices
-    }
-
-    /// Workload-size policy for the selected device.
-    #[inline]
-    pub fn policy(&self) -> &DispatchPolicy {
-        &self.policy
-    }
-
-    /// CPU-only probe reason, or `None` when a CUDA device was selected.
-    #[inline]
-    pub fn cpu_reason(&self) -> Option<&str> {
-        self.cpu_reason.as_deref()
-    }
-
-    pub fn plan_batched_work_for_devices(
-        &self,
-        devices: &[GpuDeviceInfo],
-        batch_size: usize,
-        fixed_bytes_per_device: usize,
-        bytes_per_batch_item: usize,
-    ) -> Option<Vec<DeviceBatchPlan>> {
-        if batch_size == 0 {
-            return Some(Vec::new());
-        }
-        if devices.is_empty() || bytes_per_batch_item == 0 {
-            return None;
-        }
-
-        struct Candidate {
-            ordinal: usize,
-            score: f64,
-            capacity: usize,
-            chunks: Vec<Range<usize>>,
-        }
-
-        let mut candidates = devices
-            .iter()
-            .filter_map(|device| {
-                let budget = device.dispatch_memory_budget_bytes();
-                if budget <= fixed_bytes_per_device {
-                    return None;
-                }
-                let capacity = (budget - fixed_bytes_per_device) / bytes_per_batch_item;
-                if capacity == 0 {
-                    return None;
-                }
-                Some(Candidate {
-                    ordinal: device.ordinal,
-                    score: device.score().max(1.0),
-                    capacity,
-                    chunks: Vec::new(),
-                })
-            })
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return None;
-        }
-        candidates.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let mut next = 0usize;
-        while next < batch_size {
-            let total_score = candidates.iter().map(|c| c.score).sum::<f64>().max(1.0);
-            let mut made_progress = false;
-            for candidate in candidates.iter_mut() {
-                if next >= batch_size {
-                    break;
-                }
-                let remaining = batch_size - next;
-                let proportional = ((remaining as f64) * candidate.score / total_score).ceil();
-                let take = (proportional as usize)
-                    .clamp(1, candidate.capacity)
-                    .min(remaining);
-                if take == 0 {
-                    continue;
-                }
-                let start = next;
-                next += take;
-                candidate.chunks.push(start..next);
-                made_progress = true;
-            }
-            if !made_progress {
-                return None;
-            }
-        }
-
-        let plans = candidates
-            .into_iter()
-            .filter(|candidate| !candidate.chunks.is_empty())
-            .map(|candidate| DeviceBatchPlan {
-                ordinal: candidate.ordinal,
-                chunks: candidate.chunks,
-            })
-            .collect::<Vec<_>>();
-        if plans.is_empty() { None } else { Some(plans) }
-    }
-
-    /// Pick a start slot for a multi-device runtime pool. Callers should try
-    /// slots modulo their own pool length from this offset.
-    #[inline]
-    pub fn next_runtime_slot(&self, len: usize) -> usize {
-        if len <= 1 {
-            0
-        } else {
-            self.dispatch_cursor.fetch_add(1, Ordering::Relaxed) % len
+    fn cpu(reason: String, accel_policy: AccelPolicy) -> Self {
+        Self {
+            selection: GpuSelection::CpuOnly { reason },
+            policy: GpuDispatchPolicy::for_device(accel_policy, None),
         }
     }
 }
 
-/// Trait implemented by per-device runtime wrappers (`CublasRuntime`,
-/// `CusolverRuntime`) so the shared two-phase dispatch helper in
-/// [`with_runtime_two_phase`] can recover the device id after the callback
-/// has succeeded.
-pub(crate) trait HasGpuDevice {
-    fn device(&self) -> &GpuDeviceInfo;
-}
-
-/// Dispatch `f` against a pool of per-device runtimes using the two-phase
-/// rotation that cuBLAS and cuSOLVER both use:
-///
-/// 1. Pick a rotating start slot, then sweep every device with `try_lock`.
-///    Skip devices another thread already holds so concurrent callers spread
-///    to idle GPUs rather than serializing on the rotated slot.
-/// 2. If every device was busy (or every Phase 1 attempt compute-failed),
-///    fall back to a blocking `lock` on each device in turn so the dispatch
-///    still completes.
-///
-/// Returns `Some((result, device))` from the first runtime where
-/// `f(&mut runtime)` returns `Some`, or `None` if no device produced a
-/// result.
-pub(crate) fn with_runtime_two_phase<R, T>(
-    runtimes: &[std::sync::Mutex<R>],
-    mut f: impl FnMut(&mut R) -> Option<T>,
-) -> Option<(T, GpuDeviceInfo)>
-where
-    R: HasGpuDevice,
-{
-    if runtimes.is_empty() {
-        return None;
-    }
-    let start = GpuRuntime::global().next_runtime_slot(runtimes.len());
-    for offset in 0..runtimes.len() {
-        let idx = (start + offset) % runtimes.len();
-        if let Ok(mut runtime) = runtimes[idx].try_lock()
-            && let Some(out) = f(&mut runtime)
-        {
-            return Some((out, runtime.device().clone()));
-        }
-    }
-    for offset in 0..runtimes.len() {
-        let idx = (start + offset) % runtimes.len();
-        if let Ok(mut runtime) = runtimes[idx].lock()
-            && let Some(out) = f(&mut runtime)
-        {
-            return Some((out, runtime.device().clone()));
-        }
-    }
-    None
-}
-
-fn panic_payload_message(payload: &(dyn Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        return (*message).to_string();
-    }
-    if let Some(message) = payload.downcast_ref::<String>() {
-        return message.clone();
-    }
-    "non-string panic payload".to_string()
-}
-
-/// Convenience: is a GPU available in this process?
 #[inline]
 pub fn gpu_available() -> bool {
-    GpuRuntime::global().is_available()
+    GpuRuntime::get().cuda_available()
 }
 
-/// Force the one-shot GPU probe to run *now* rather than lazily on first
-/// dispatch. Call this once at process start so the `[GPU] CUDA acceleration
-/// enabled` (or `disabled`) banner — and the calibration log lines — land at
-/// the top of the run, not buried mid-fit. Idempotent.
-pub fn warm() {
-    let _ = GpuRuntime::global();
-}
-
-/// Convenience: the selected device, if any.
 #[inline]
 pub fn selected_gpu_info() -> Option<GpuDeviceInfo> {
-    GpuRuntime::global().selected_device().cloned()
+    GpuRuntime::get().selected_device().cloned()
 }
 
-/// Shared `Arc<CudaContext>` for `ordinal`, or `None` if no such device.
-///
-/// The contexts are cached in a process-wide `OnceLock` so every cuBLAS /
-/// cuSOLVER / cuSPARSE / session / calibration consumer reuses the same
-/// primary context. Calling this before the probe has run will trigger
-/// enumeration as a side effect, since contexts must be discovered to be
-/// cached.
-pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
-    contexts().get(ordinal).cloned()
-}
-
-/// Lazily enumerate and retain every visible primary context. Returns an
-/// empty slice when no driver is present.
-fn contexts() -> &'static [Arc<CudaContext>] {
-    static CONTEXTS: OnceLock<Vec<Arc<CudaContext>>> = OnceLock::new();
-    CONTEXTS.get_or_init(|| {
-        // Guard against cudarc's panic-on-missing-libcuda: never call
-        // `CudaContext::device_count()` unless we've verified libcuda is
-        // dlopen'able. CPU-only hosts return an empty Vec here, and every
-        // caller (`cuda_context_for`, the probe) treats that as "no GPU".
-        if !libcuda_loadable() {
-            return Vec::new();
-        }
-        let count = match CudaContext::device_count() {
-            Ok(c) if c > 0 => c as usize,
-            _ => return Vec::new(),
-        };
-        let mut out = Vec::with_capacity(count);
-        for ordinal in 0..count {
-            match CudaContext::new(ordinal) {
-                Ok(ctx) => out.push(ctx),
-                Err(err) => {
-                    log::warn!("[GPU] CudaContext::new({}) failed: {}", ordinal, err);
-                }
+fn select_device(devices: Vec<GpuDeviceInfo>) -> GpuDeviceInfo {
+    if let Ok(requested) = std::env::var("GAM_GPU_DEVICE") {
+        if let Ok(ordinal) = requested.parse::<usize>() {
+            if let Some(device) = devices.iter().find(|device| device.ordinal == ordinal) {
+                return device.clone();
             }
+            log::warn!(
+                "[GAM GPU] requested GAM_GPU_DEVICE={ordinal} was not found; using best scored CUDA device"
+            );
         }
-        out
-    })
+    }
+    devices
+        .into_iter()
+        .next()
+        .expect("device list is non-empty")
 }
 
-fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, GpuProbeError> {
-    // Pre-flight libcuda check — cudarc 0.19 will panic, not error, if its
-    // own dynamic-loading attempt fails. We never let it get there on a
-    // CPU-only host.
-    if !libcuda_loadable() {
-        return Err(GpuProbeError::DriverLibraryMissing(
-            "libcuda (or platform equivalent) is not loadable on this host".to_string(),
-        ));
-    }
-    // Pre-flight libcublas check — calibration runs a real `cublasDgemm`,
-    // and every dispatch path also goes through cuBLAS. If libcublas can't
-    // be loaded the device set is unusable for our workloads, so we
-    // report the same "no driver" reason rather than letting cudarc panic
-    // mid-calibration.
-    if !libcublas_loadable() {
-        return Err(GpuProbeError::DriverLibraryMissing(
-            "libcublas (or platform equivalent) is not loadable on this host".to_string(),
-        ));
-    }
-    let count = CudaContext::device_count().map_err(|err| {
-        // No driver / unloadable libcuda surfaces as a DriverError here; we
-        // map it to `DriverLibraryMissing` so the disabled-banner reads as
-        // "no driver" rather than a noisy call error.
-        GpuProbeError::DriverLibraryMissing(err.to_string())
-    })?;
-    if count <= 0 {
-        return Err(GpuProbeError::NoDevices);
-    }
+fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, String> {
+    let lib = load_cuda_driver()?;
+    let cu_init: libloading::Symbol<'_, CuInit> =
+        unsafe { lib.get(b"cuInit\0") }.map_err(|err| err.to_string())?;
+    let cu_device_get_count: libloading::Symbol<'_, CuDeviceGetCount> =
+        unsafe { lib.get(b"cuDeviceGetCount\0") }.map_err(|err| err.to_string())?;
+    let cu_device_get: libloading::Symbol<'_, CuDeviceGet> =
+        unsafe { lib.get(b"cuDeviceGet\0") }.map_err(|err| err.to_string())?;
+    let cu_device_get_name: libloading::Symbol<'_, CuDeviceGetName> =
+        unsafe { lib.get(b"cuDeviceGetName\0") }.map_err(|err| err.to_string())?;
+    let cu_device_compute_capability: libloading::Symbol<'_, CuDeviceComputeCapability> =
+        unsafe { lib.get(b"cuDeviceComputeCapability\0") }.map_err(|err| err.to_string())?;
+    let cu_device_total_mem = unsafe { lib.get::<CuDeviceTotalMem>(b"cuDeviceTotalMem_v2\0") }
+        .or_else(|_| unsafe { lib.get::<CuDeviceTotalMem>(b"cuDeviceTotalMem\0") })
+        .map_err(|err| err.to_string())?;
 
-    // Eagerly populate the shared-context cache so that every later caller
-    // (`cuda_context_for`) sees the same `Arc<CudaContext>` we used here.
-    let ctxs = contexts();
-    if ctxs.is_empty() {
-        return Err(GpuProbeError::DriverError(
-            "no CUDA contexts could be retained".to_string(),
-        ));
-    }
-
-    // ---- Phase 1: enumerate device descriptors -------------------------
-    let mut descriptors: Vec<GpuDeviceDescriptor> = Vec::with_capacity(ctxs.len());
-    for ctx in ctxs.iter() {
-        let ordinal = ctx.ordinal();
-        let name = ctx
-            .name()
-            .map_err(|e| GpuProbeError::DriverError(format!("cuDeviceGetName: {e}")))?;
-        let (major, minor) = ctx
-            .compute_capability()
-            .map_err(|e| GpuProbeError::DriverError(format!("compute_capability: {e}")))?;
-        let sm_count = ctx
-            .attribute(CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
-            .map_err(|e| GpuProbeError::DriverError(format!("cuDeviceGetAttribute(SM): {e}")))?;
-        let total_memory_bytes = ctx
-            .total_mem()
-            .map_err(|e| GpuProbeError::DriverError(format!("cuDeviceTotalMem: {e}")))?;
-        descriptors.push(GpuDeviceDescriptor {
-            ordinal,
-            name: name.trim().to_string(),
+    check_cuda(unsafe { cu_init(0) }, "cuInit")?;
+    let mut count = 0_i32;
+    check_cuda(
+        unsafe { cu_device_get_count(&mut count) },
+        "cuDeviceGetCount",
+    )?;
+    let mut devices = Vec::with_capacity(count.max(0) as usize);
+    for ordinal in 0..count.max(0) {
+        let mut raw_device = 0_i32;
+        check_cuda(
+            unsafe { cu_device_get(&mut raw_device, ordinal) },
+            "cuDeviceGet",
+        )?;
+        let mut name_bytes = [0_i8; 256];
+        check_cuda(
+            unsafe {
+                cu_device_get_name(name_bytes.as_mut_ptr(), name_bytes.len() as i32, raw_device)
+            },
+            "cuDeviceGetName",
+        )?;
+        let mut major = 0_i32;
+        let mut minor = 0_i32;
+        check_cuda(
+            unsafe { cu_device_compute_capability(&mut major, &mut minor, raw_device) },
+            "cuDeviceComputeCapability",
+        )?;
+        let mut total_memory_bytes = 0_usize;
+        check_cuda(
+            unsafe { cu_device_total_mem(&mut total_memory_bytes, raw_device) },
+            "cuDeviceTotalMem",
+        )?;
+        let name = c_name_to_string(&name_bytes);
+        devices.push(GpuDeviceInfo {
+            ordinal: ordinal as usize,
+            name,
             compute_capability_major: major,
             compute_capability_minor: minor,
-            sm_count,
             total_memory_bytes,
+            free_memory_bytes: None,
+            capability: classify_capability(major, minor, total_memory_bytes),
         });
-    }
-
-    // ---- Phase 2: calibrate each device --------------------------------
-    // Run a real cublasDgemm + memcpy on every visible device and keep
-    // only the ones that complete successfully. Calibration replaces the
-    // earlier synthetic throughput proxy entirely — every dispatch
-    // threshold derives from the measured numbers.
-    let mut devices: Vec<GpuDeviceInfo> = Vec::with_capacity(descriptors.len());
-    for desc in descriptors {
-        let ctx = match cuda_context_for(desc.ordinal) {
-            Some(ctx) => ctx,
-            None => {
-                log::warn!(
-                    "[GPU] device {} '{}' skipped: context retain failed",
-                    desc.ordinal,
-                    desc.name
-                );
-                continue;
-            }
-        };
-        let start = std::time::Instant::now();
-        let calibration: DeviceCalibration = match measure_device(ctx) {
-            Ok(c) => c,
-            Err(reason) => {
-                log::warn!(
-                    "[GPU] device {} '{}' skipped: calibration failed at {}",
-                    desc.ordinal,
-                    desc.name,
-                    reason
-                );
-                continue;
-            }
-        };
-        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-        log::debug!(
-            "[GPU] device {} '{}' calibrated in {:.0} ms: fp64={:.0} GFLOPS h2d={:.1} GB/s d2h={:.1} GB/s",
-            desc.ordinal,
-            desc.name,
-            elapsed_ms,
-            calibration.fp64_gflops,
-            calibration.h2d_gb_s,
-            calibration.d2h_gb_s,
-        );
-        devices.push(GpuDeviceInfo {
-            ordinal: desc.ordinal,
-            name: desc.name,
-            compute_capability_major: desc.compute_capability_major,
-            compute_capability_minor: desc.compute_capability_minor,
-            sm_count: desc.sm_count,
-            total_memory_bytes: desc.total_memory_bytes,
-            calibration,
-        });
-    }
-    if devices.is_empty() {
-        return Err(GpuProbeError::CalibrationFailed);
     }
     Ok(devices)
 }
 
-struct GpuDeviceDescriptor {
-    ordinal: usize,
-    name: String,
-    compute_capability_major: i32,
-    compute_capability_minor: i32,
-    sm_count: i32,
-    total_memory_bytes: usize,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn duplicate_cuda_library_mappings_are_warn_only() {
-        // Whether the running host has duplicate mappings or not, the
-        // warning path must not feed back into CUDA availability. cudarc's
-        // culib() is a process-wide OnceLock<Library>, so gamfit's cuBLAS
-        // symbols route through one Library handle after initialization.
-        warn_cuda_library_conflicts();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn cuda_library_family_matches_versioned_and_unversioned_names() {
-        // The detector's accuracy depends on canonicalizing
-        // libcublas.so.12, libcublas.so.12.8.4.1, and libcublas.so to
-        // the same family — otherwise duplicates would be missed.
-        assert_eq!(cuda_library_family("libcublas.so.12"), Some("libcublas"));
-        assert_eq!(
-            cuda_library_family("libcublas.so.12.8.4.1"),
-            Some("libcublas")
-        );
-        assert_eq!(cuda_library_family("libcublas.so"), Some("libcublas"));
-        // libcublasLt is a distinct family despite the prefix.
-        assert_eq!(
-            cuda_library_family("libcublasLt.so.12"),
-            Some("libcublasLt")
-        );
-        // Unrelated libraries do not produce a family match.
-        assert_eq!(cuda_library_family("libfoo.so"), None);
-        assert_eq!(cuda_library_family("libc.so.6"), None);
-    }
-
-    #[test]
-    fn global_probe_is_idempotent_and_safe_without_driver() {
-        // We cannot assume a driver is installed; just exercise the API.
-        let first = GpuRuntime::global() as *const GpuRuntime;
-        let second = GpuRuntime::global() as *const GpuRuntime;
-        assert_eq!(first, second);
-        // `gpu_available()` must return a stable answer.
-        let a = gpu_available();
-        let b = gpu_available();
-        assert_eq!(a, b);
-        if !a {
-            assert!(selected_gpu_info().is_none());
+fn load_cuda_driver() -> Result<Library, String> {
+    let candidates: &[&str] = if cfg!(target_os = "windows") {
+        &["nvcuda.dll"]
+    } else if cfg!(target_os = "macos") {
+        &["/usr/local/cuda/lib/libcuda.dylib", "libcuda.dylib"]
+    } else {
+        &["libcuda.so.1", "libcuda.so"]
+    };
+    let mut errors = Vec::new();
+    for candidate in candidates {
+        match unsafe { Library::new(candidate) } {
+            Ok(lib) => return Ok(lib),
+            Err(err) => errors.push(format!("{candidate}: {err}")),
         }
     }
+    Err(format!(
+        "CUDA driver library not found ({})",
+        errors.join("; ")
+    ))
+}
 
-    #[test]
-    fn batch_planner_splits_by_capacity_and_score() {
-        let runtime = GpuRuntime {
-            selected_device: None,
-            devices: Vec::new(),
-            policy: DispatchPolicy::for_device(None),
-            cpu_reason: None,
-            dispatch_cursor: AtomicUsize::new(0),
-        };
-        let devices = vec![
-            GpuDeviceInfo {
-                ordinal: 0,
-                name: String::new(),
-                compute_capability_major: 9,
-                compute_capability_minor: 0,
-                sm_count: 132,
-                total_memory_bytes: 80 * 1024 * 1024 * 1024,
-                calibration: DeviceCalibration {
-                    fp64_gflops: 30_000.0,
-                    h2d_gb_s: 25.0,
-                    d2h_gb_s: 25.0,
-                },
-            },
-            GpuDeviceInfo {
-                ordinal: 1,
-                name: String::new(),
-                compute_capability_major: 7,
-                compute_capability_minor: 5,
-                sm_count: 40,
-                total_memory_bytes: 16 * 1024 * 1024 * 1024,
-                calibration: DeviceCalibration {
-                    fp64_gflops: 250.0,
-                    h2d_gb_s: 12.0,
-                    d2h_gb_s: 12.0,
-                },
-            },
-        ];
-        let plans = runtime
-            .plan_batched_work_for_devices(&devices, 100, 0, 1024 * 1024 * 1024)
-            .expect("large devices should accept 1GiB batch items");
-        assert_eq!(
-            plans
-                .iter()
-                .flat_map(|plan| plan.chunks.iter())
-                .map(|range| range.end - range.start)
-                .sum::<usize>(),
-            100
-        );
-        assert!(plans.iter().any(|plan| plan.ordinal == 0));
-        assert!(plans.iter().any(|plan| plan.ordinal == 1));
+#[inline]
+fn check_cuda(result: CuResult, call: &str) -> Result<(), String> {
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(format!("{call} failed with CUDA driver code {result}"))
     }
+}
+
+fn c_name_to_string(bytes: &[i8]) -> String {
+    let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let raw: Vec<u8> = bytes[..nul].iter().map(|&b| b as u8).collect();
+    String::from_utf8_lossy(&raw).trim().to_string()
 }

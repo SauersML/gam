@@ -279,6 +279,9 @@ pub fn fast_atb_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     b: &ArrayBase<S2, Ix2>,
     par: Par,
 ) -> Array2<f64> {
+    if let Some(out) = crate::gpu::linalg::try_fast_atb(a, b) {
+        return out;
+    }
     use faer::linalg::matmul::matmul;
     use faer::{Accum, Mat};
 
@@ -355,6 +358,9 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
+    if let Some(out) = crate::gpu::linalg::try_fast_ab(a, b) {
+        return out;
+    }
     let (n, _) = a.dim();
     let (_, q) = b.dim();
     let mut out = Array2::<f64>::zeros((n, q));
@@ -369,6 +375,9 @@ pub fn fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     v: &ArrayBase<S2, Ix1>,
 ) -> Array1<f64> {
+    if let Some(out) = crate::gpu::linalg::try_fast_av(a, v) {
+        return out;
+    }
     use faer::linalg::matmul::matmul;
     use faer::{Accum, Mat};
 
@@ -408,6 +417,10 @@ pub fn fast_av_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     v: &ArrayBase<S2, Ix1>,
     out: &mut Array1<f64>,
 ) {
+    if let Some(gpu_out) = crate::gpu::linalg::try_fast_av(a, v) {
+        out.assign(&gpu_out);
+        return;
+    }
     use faer::Accum;
     use faer::linalg::matmul::matmul;
 
@@ -492,6 +505,9 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     v: &ArrayBase<S2, Ix1>,
 ) -> Array1<f64> {
+    if let Some(out) = crate::gpu::linalg::try_fast_atv(a, v) {
+        return out;
+    }
     use faer::linalg::matmul::matmul;
     use faer::{Accum, Mat};
 
@@ -540,6 +556,10 @@ pub fn fast_atv_into<S: Data<Elem = f64>>(
     v: &Array1<f64>,
     out: &mut Array1<f64>,
 ) {
+    if let Some(gpu_out) = crate::gpu::linalg::try_fast_atv(a, v) {
+        out.assign(&gpu_out);
+        return;
+    }
     use faer::Accum;
     use faer::linalg::matmul::matmul;
 
@@ -592,6 +612,9 @@ pub fn fast_xt_diag_x_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64
     w: &ArrayBase<S2, Ix1>,
     par: Par,
 ) -> Array2<f64> {
+    if let Some(out) = crate::gpu::linalg::try_fast_xt_diag_x(x, w) {
+        return out;
+    }
     use faer::Accum;
     use faer::linalg::matmul::triangular::{BlockStructure, matmul as tri_matmul};
     use ndarray::{ShapeBuilder, s};
@@ -703,6 +726,9 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
     w: &ArrayBase<S2, Ix1>,
     y: &ArrayBase<S3, Ix2>,
 ) -> Array2<f64> {
+    if let Some(out) = crate::gpu::linalg::try_fast_xt_diag_y(x, w, y) {
+        return out;
+    }
     use faer::Accum;
     use faer::linalg::matmul::matmul;
     use ndarray::{ShapeBuilder, s};
@@ -807,6 +833,9 @@ pub fn fast_joint_hessian_2x2<
     w_ab: &ArrayBase<S4, Ix1>,
     w_bb: &ArrayBase<S5, Ix1>,
 ) -> Array2<f64> {
+    if let Some(out) = crate::gpu::linalg::try_fast_joint_hessian_2x2(x_a, x_b, w_aa, w_ab, w_bb) {
+        return out;
+    }
     use faer::Accum;
     use faer::linalg::matmul::matmul;
     use ndarray::{ShapeBuilder, s};
