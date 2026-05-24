@@ -189,6 +189,9 @@ impl DeviceXSession {
                 ref mut out_pp_dev,
                 ..
             } = *inner;
+            // SAFETY: shapes match the resident X (see preceding SAFETY block):
+            // x_dev/wy_dev are n*p f64s, out_pp_dev is p*p f64s, leading dims
+            // and op flags in `cfg` agree with the col-major layout.
             unsafe { blas.gemm(cfg, x_dev, wy_dev, out_pp_dev) }.is_ok()
         };
         if !gemm_ok {
@@ -248,6 +251,9 @@ impl DeviceXSession {
                 ref mut out_n_dev,
                 ..
             } = *inner;
+            // SAFETY: shapes match the resident X (see preceding SAFETY block):
+            // x_dev is n*p, v_p_dev is p, out_n_dev is n; lda/incx/incy in
+            // `cfg` agree with the col-major buffer layout.
             unsafe { blas.gemv(cfg, x_dev, v_p_dev, out_n_dev) }.is_ok()
         };
         if !gemv_ok {

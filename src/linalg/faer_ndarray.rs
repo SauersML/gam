@@ -202,6 +202,9 @@ pub fn array2_to_matmut(array: &mut Array2<f64>) -> MatMut<'_, f64> {
 pub fn array1_to_col_matmut(array: &mut Array1<f64>) -> MatMut<'_, f64> {
     let len = array.len();
     let stride = array.strides()[0];
+    // SAFETY: pointer, length, and row-stride come from the &mut Array1
+    // itself, so they describe a valid len×1 contiguous (in row stride)
+    // f64 buffer borrowed for the returned MatMut's lifetime.
     unsafe {
         MatMut::from_raw_parts_mut(
             array.as_mut_ptr(),
@@ -573,6 +576,9 @@ fn fast_av_view_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let len = out.len();
     let stride = out.strides()[0];
+    // SAFETY: out is a uniquely borrowed Array1, so as_mut_ptr +
+    // (len, 1, stride, 0) describes a valid f64 buffer of the same
+    // length and lifetime as the borrowed view.
     let outview = unsafe {
         MatMut::from_raw_parts_mut(
             out.as_mut_ptr(),

@@ -59,6 +59,23 @@ fn main() {
     let mut unsafe_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_unsafe_without_safety(&manifest_dir, &manifest_dir, &mut unsafe_offenders);
 
+    // `mem::transmute` requires a `// SAFETY:` justification, same shape
+    // as the `unsafe` rule. Transmute is loud enough that the dedicated
+    // section keeps it visible even when surrounded by other `unsafe`.
+    let mut transmute_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_transmute_without_safety(&manifest_dir, &manifest_dir, &mut transmute_offenders);
+
+    // `panic!(` in non-test code requires a `// SAFETY:` justification.
+    // Mirrors the `unsafe` rule: legal but every site cites a reason.
+    let mut panic_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_panic_without_safety(&manifest_dir, &manifest_dir, &mut panic_offenders);
+
+    // `#[cfg(any())]` is permanently false, `#[cfg(all())]` permanently
+    // true. Both are dead-by-construction guards in the same family as
+    // `const X: bool = false;`.
+    let mut dead_cfg_gate_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_dead_cfg_gates(&manifest_dir, &manifest_dir, &mut dead_cfg_gate_offenders);
+
     // `#[should_panic]` without `expected = "..."` catches any panic and
     // masks unrelated bugs. Require an `expected` string.
     let mut should_panic_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
@@ -158,6 +175,38 @@ fn main() {
         sections.push(Section {
             title: "unsafe without `// SAFETY:`".to_string(),
             rows: unsafe_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !transmute_offenders.is_empty() {
+        sections.push(Section {
+            title: "mem::transmute without `// SAFETY:` justification".to_string(),
+            rows: transmute_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !panic_offenders.is_empty() {
+        sections.push(Section {
+            title: "panic!() in non-test code without `// SAFETY:` justification".to_string(),
+            rows: panic_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !dead_cfg_gate_offenders.is_empty() {
+        sections.push(Section {
+            title:
+                "#[cfg(any())]/#[cfg(all())] (empty-arg cfg — permanently false/true)"
+                    .to_string(),
+            rows: dead_cfg_gate_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
                 .collect(),
@@ -580,6 +629,12 @@ fn scan_for_unsafe_without_safety(
                 continue;
             }
             if line.contains("SAFETY:") {
+                continue;
+            }
+            // `unsafe impl Send` / `unsafe impl Sync` — the SAFETY
+            // rationale belongs on the type's documentation, not the impl
+            // line. Skip both spellings, whitespace-tolerant.
+            if is_unsafe_marker_impl(&stripped) {
                 continue;
             }
             // Scan up to 3 preceding non-blank lines for `// SAFETY:`.
