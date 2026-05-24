@@ -12766,14 +12766,16 @@ fn fit_with_null_space_logdet(
     fit: &gam::estimate::UnifiedFitResult,
 ) -> Result<gam::estimate::UnifiedFitResult, String> {
     let mut fit = fit.clone();
-    fit.artifacts.null_space_logdet = Some(compute_null_space_logdet(design, &fit)?);
+    let (null_dim, logdet) = compute_null_space_metadata(design, &fit)?;
+    fit.artifacts.null_space_dim = Some(null_dim);
+    fit.artifacts.null_space_logdet = Some(logdet);
     Ok(fit)
 }
 
-fn compute_null_space_logdet(
+fn compute_null_space_metadata(
     design: &TermCollectionDesign,
     fit: &gam::estimate::UnifiedFitResult,
-) -> Result<f64, String> {
+) -> Result<(usize, f64), String> {
     let hessian = fit
         .penalized_hessian()
         .ok_or_else(|| "null-space Hessian logdet requires fitted penalized Hessian".to_string())?;
@@ -12819,7 +12821,7 @@ fn compute_null_space_logdet(
     .map_err(|err| format!("failed to compute penalty null-space basis: {err}"))?;
     let q = null_basis.ncols();
     if q == 0 {
-        return Ok(0.0);
+        return Ok((0, 0.0));
     }
 
     let projected = hessian.dot(&null_basis);
@@ -12830,7 +12832,7 @@ fn compute_null_space_logdet(
         .map_err(|err| format!("null-space Hessian is not positive definite: {err}"))?;
     let logdet = 2.0 * chol.diag().iter().map(|value| value.ln()).sum::<f64>();
     if logdet.is_finite() {
-        Ok(logdet)
+        Ok((q, logdet))
     } else {
         Err(format!("null-space Hessian logdet is not finite: {logdet}"))
     }
