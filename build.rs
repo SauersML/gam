@@ -1802,7 +1802,14 @@ fn scan_for_underscore_fn_args(
                     continue;
                 }
                 if name.starts_with('_') && name.len() >= 2 {
-                    let abs = paren_open + 1 + ps;
+                    // Compute the byte offset of the parameter NAME (not the
+                    // leading whitespace/attribute/mut prefix) so the line
+                    // mapping points to the underscore-prefixed identifier
+                    // rather than the previous line's trailing comma.
+                    let name_off_in_param = raw_param
+                        .find(name)
+                        .unwrap_or(0);
+                    let abs = paren_open + 1 + ps + name_off_in_param;
                     let mut hit_line = sig_start;
                     for (off, ln) in &line_offsets {
                         if *off <= abs {

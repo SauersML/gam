@@ -678,11 +678,11 @@ pub fn ift_du_drho(
     for a in 0..r {
         // Per-row: rhs_i = G_{u_i,ρ_a} + H_uβ_i · ∂β*/∂ρ_a.
         for i in 0..n {
-            // SAFETY: companion to the `du/dβ` assembler above —
-            // `apply_htbeta_row` returning `false` would mean the family
-            // declared `H_tβ` row products available but failed to populate
-            // them, violating the joint-evidence capability contract.
+            // Companion to the `du/dβ` assembler above; same H_tβ cache.
             if !cache.apply_htbeta_row(i, dbeta_drho.column(a), &mut htbeta_delta) {
+                // SAFETY: `false` here means the family declared H_tβ row
+                // products available but did not populate them — contract
+                // violation against the joint-evidence capability surface.
                 panic!("IFT du/drho requires cached H_tβ row products");
             }
             for c in 0..d {
@@ -826,11 +826,10 @@ pub fn evidence_grad_rho(
         for col in 0..k {
             beta_basis.fill(0.0);
             beta_basis[col] = 1.0;
-            // SAFETY: same contract as `du/dβ` and `du/dρ` above — the
-            // joint-evidence gradient path only runs when the family
-            // capability surface advertised cached `H_tβ` row products; a
-            // `false` here means the cache was promised but not populated.
+            // Same H_tβ cache contract as the IFT du/dβ and du/dρ paths.
             if !cache.apply_htbeta_row(i, beta_basis.view(), &mut rhs) {
+                // SAFETY: `false` means the family declared the cache
+                // available but did not populate it — contract violation.
                 panic!("evidence gradient requires cached H_tβ row products");
             }
             let v = chol_lower_solve_vector(factor, &rhs);
