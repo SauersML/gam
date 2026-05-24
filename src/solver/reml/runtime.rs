@@ -990,6 +990,23 @@ fn hash_analytic_penalty_kind(
             hasher.write_usize(p.rho_index);
             hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
+        AnalyticPenaltyKind::MechanismSparsity(p) => {
+            hasher.write_str("mechanism-sparsity");
+            hash_psi_slice(hasher, &p.target);
+            hash_groups(hasher, &p.feature_groups);
+            hasher.write_f64(p.weight);
+            hasher.write_f64(p.smoothing_eps);
+            hasher.write_f64(p.n_eff);
+            hasher.write_bool(p.learnable_weight);
+            hasher.write_usize(p.rho_index);
+            match &p.weight_schedule {
+                Some(schedule) => {
+                    hasher.write_bool(true);
+                    hash_scalar_weight_schedule(hasher, schedule.as_ref());
+                }
+                None => hasher.write_bool(false),
+            }
+        }
         AnalyticPenaltyKind::RowPrecisionPrior(p) => {
             hasher.write_str("row-precision-prior");
             hash_array3(hasher, &p.lambda_per_row);

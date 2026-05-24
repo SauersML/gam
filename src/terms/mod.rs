@@ -18,7 +18,7 @@ pub use analytic_penalties::{
     AnalyticPenaltyRegistry, RowPrecisionPriorPenalty, BlockOrthogonalityPenalty,
     BlockSparsityPenalty, DifferenceOpKind, FrozenAnalyticPenaltyOp, IBPAssignmentPenalty,
     IsometryPenalty, IsometryDuchonRadialSource, IsometryReference, IvaeRidgeMeanGauge,
-    NuclearNormPenalty, OrthogonalityPenalty,
+    MechanismSparsityPenalty, NuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     ScalarWeightSchedule, ScadMcpPenalty, SoftmaxAssignmentSparsityPenalty, SparsityKind,
     SparsityPenalty, TotalVariationPenalty, WeightField,
