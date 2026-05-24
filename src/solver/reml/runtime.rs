@@ -3399,7 +3399,7 @@ impl<'a> RemlState<'a> {
         {
             return None;
         }
-        drop(
+        std::hint::black_box(
             cached
                 .ext_mode_response_cols
                 .as_ref()
@@ -8574,7 +8574,7 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         has_ext: bool,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
-        drop(has_ext);
+        std::hint::black_box(has_ext);
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             self.build_sparse_assembly(rho, bundle, mode)
         } else if matches!(

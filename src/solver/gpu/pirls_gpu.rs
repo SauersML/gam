@@ -469,7 +469,7 @@ pub fn weighted_crossprod_gpu(
     x: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
 ) -> Result<Array2<f64>, String> {
-    drop((x, weights));
+    std::hint::black_box((x, weights));
     Err("cuda feature is not enabled".to_string())
 }
 
@@ -497,6 +497,6 @@ pub fn cholesky_solve_gpu(
     hessian: ArrayView2<'_, f64>,
     rhs: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, f64), String> {
-    drop((hessian, rhs));
+    std::hint::black_box((hessian, rhs));
     Err("cuda feature is not enabled".to_string())
 }

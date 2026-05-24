@@ -23,7 +23,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
     ) -> HessianStrategyDecision {
-        drop(rho);
+        std::hint::black_box(rho);
         // When the sparse-exact backend produced the PIRLS result, prefer
         // the sparse Hessian path for consistency (avoids dense→sparse
         // round-trip that loses sparsity structure).

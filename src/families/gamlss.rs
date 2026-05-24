@@ -4096,7 +4096,7 @@ fn binomial_neglog_q_derivatives_probit_closed_form(
     q: f64,
     mu: f64,
 ) -> (f64, f64, f64) {
-    drop(mu);
+    std::hint::black_box(mu);
     // Closed-form derivatives for F_i(q) = -w_i[y log Phi(q) + (1-y) log(1-Phi(q))].
     // Uses stable Mills ratios instead of `phi / mu` divisions. In the
     // incompatible separated tail (for example y=0, q>>0), `phi(q)` underflows
@@ -4131,7 +4131,7 @@ fn binomial_neglog_q_fourth_derivative_probit_closed_form(
     q: f64,
     mu: f64,
 ) -> f64 {
-    drop(mu);
+    std::hint::black_box(mu);
     // Closed-form m4 for F_i(q) = -w_i[y log Phi(q) + (1-y) log(1-Phi(q))].
     // Stability (Issue 5): see binomial_neglog_q_derivatives_probit_closed_form.
     if weight == 0.0 || !q.is_finite() {
@@ -5536,7 +5536,7 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         x_ls: &Array2<f64>,
         subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
-        drop(subsample);
+        std::hint::black_box(subsample);
         // Wiggle ψ path: full-data exact (= trivially unbiased). The
         // wiggle-specific second-order from-parts function inlines 30+
         // per-row coefficient arrays (`coeff_mm{,_a,_b,_ab}`,
@@ -5575,7 +5575,7 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         x_ls: &Array2<f64>,
         subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<Array2<f64>, String> {
-        drop(subsample);
+        std::hint::black_box(subsample);
         // Same rationale as `ws_psi_second_order_terms_from_parts` above:
         // the wiggle ψ-Hessian directional-derivative function also inlines
         // dozens of per-row arrays. Full-data is exact (= trivially
@@ -8214,7 +8214,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         // The Gaussian location-scale workspace is returned by
         // `exact_newton_joint_hessian_workspace` whenever
         // `exact_joint_dense_block_designs` succeeds, which itself depends on
@@ -11935,7 +11935,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         // Same gating as the workspace impl above: matrix-free fires when
         // `exact_joint_dense_block_designs` is satisfiable, which requires
         // both location and scale block designs to be present.  The wiggle
@@ -13032,7 +13032,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         true
     }
 
@@ -13756,7 +13756,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(d_beta_flat);
+        std::hint::black_box(d_beta_flat);
         Ok(None)
     }
 
@@ -13774,8 +13774,8 @@ impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(d_beta_u_flat);
-        drop(d_beta_v_flat);
+        std::hint::black_box(d_beta_u_flat);
+        std::hint::black_box(d_beta_v_flat);
         Ok(None)
     }
 
@@ -14064,7 +14064,7 @@ impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
     }
     #[inline]
     fn row_kernel(&self, yi: f64, e_clamped: f64, m: f64, prior_w: f64) -> DiagonalIrlsRow {
-        drop(e_clamped);
+        std::hint::black_box(e_clamped);
         // Gamma(shape=k, scale=mu/k), dropping eta-independent constants.
         let log_lik_increment = prior_w * (-self.shape * (yi / m + m.ln()));
         // Gamma with log mean is non-canonical. Use the exact observed
@@ -17085,7 +17085,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         options: &BlockwiseFitOptions,
         hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
-        drop(options);
+        std::hint::black_box(options);
         drop(hessian_workspace);
         use crate::faer_ndarray::FaerCholesky;
         use faer::Side;
@@ -17837,7 +17837,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(d_beta_flat);
+        std::hint::black_box(d_beta_flat);
         Ok(None)
     }
 
@@ -17876,8 +17876,8 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        drop(d_beta_u_flat);
-        drop(d_beta_v_flat);
+        std::hint::black_box(d_beta_u_flat);
+        std::hint::black_box(d_beta_v_flat);
         Ok(None)
     }
 
@@ -21601,7 +21601,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         // Same gating as the workspace impl: matrix-free path is available
         // when both threshold and log-σ block designs are present (the
         // wiggle block is folded into the per-row pieces inside

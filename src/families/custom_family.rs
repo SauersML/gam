@@ -949,8 +949,8 @@ pub fn exact_outer_order_from_capability(
     specs: &[ParameterBlockSpec],
     coefficient_cost: u64,
 ) -> ExactOuterDerivativeOrder {
-    drop(specs);
-    drop(coefficient_cost);
+    std::hint::black_box(specs);
+    std::hint::black_box(coefficient_cost);
     ExactOuterDerivativeOrder::Second
 }
 
@@ -964,7 +964,7 @@ pub fn exact_outer_order_with_outer_hvp(
     coefficient_cost: u64,
     outer_hyper_hessian_hvp_available: bool,
 ) -> ExactOuterDerivativeOrder {
-    drop(outer_hyper_hessian_hvp_available);
+    std::hint::black_box(outer_hyper_hessian_hvp_available);
     exact_outer_order_from_capability(specs, coefficient_cost)
 }
 
@@ -1300,8 +1300,8 @@ pub trait CustomFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Option<String> {
-        drop(specs);
-        drop(options);
+        std::hint::black_box(specs);
+        std::hint::black_box(options);
         None
     }
 
@@ -1336,7 +1336,7 @@ pub trait CustomFamily {
         block_states: &[ParameterBlockState],
         options: &BlockwiseFitOptions,
     ) -> Result<f64, String> {
-        drop(options);
+        std::hint::black_box(options);
         self.log_likelihood_only(block_states)
     }
 
@@ -1807,7 +1807,7 @@ pub trait CustomFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        drop(options);
+        std::hint::black_box(options);
         self.exact_newton_joint_hessian_workspace(states, specs)
     }
 
@@ -1824,9 +1824,9 @@ pub trait CustomFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
-        drop(states);
-        drop(specs);
-        drop(options);
+        std::hint::black_box(states);
+        std::hint::black_box(specs);
+        std::hint::black_box(options);
         Ok(None)
     }
 
@@ -1866,11 +1866,11 @@ pub trait CustomFamily {
         options: &BlockwiseFitOptions,
         hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
-        drop(block_states);
-        drop(specs);
-        drop(derivative_blocks);
-        drop(rho);
-        drop(options);
+        std::hint::black_box(block_states);
+        std::hint::black_box(specs);
+        std::hint::black_box(derivative_blocks);
+        std::hint::black_box(rho);
+        std::hint::black_box(options);
         drop(hessian_workspace);
         Ok(None)
     }
@@ -1892,9 +1892,9 @@ pub trait CustomFamily {
         rho: &Array1<f64>,
         hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterHessianTerms>, String> {
-        drop(block_states);
-        drop(derivative_blocks);
-        drop(rho);
+        std::hint::black_box(block_states);
+        std::hint::black_box(derivative_blocks);
+        std::hint::black_box(rho);
         drop(hessian_workspace);
         Ok(self
             .outer_hyper_hessian_operator(specs)
@@ -1908,24 +1908,24 @@ pub trait CustomFamily {
     /// Kept separate from outer hyper-Hessian capabilities so CTN/GAMLSS row
     /// operators do not accidentally advertise pairwise θθ calculus as cheap.
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         false
     }
 
     fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         false
     }
 
     fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         false
     }
 
     /// True only when the family has a real profiled outer Hessian-vector
     /// product over θ = (ρ, ψ), without enumerating all θ_i θ_j pairs.
     fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         false
     }
 
@@ -1934,7 +1934,7 @@ pub trait CustomFamily {
     /// availability; families with only inner HVP support should override this
     /// if dense θθ assembly is not a valid capability for their path.
     fn outer_hyper_hessian_dense_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         true
     }
 
@@ -1959,7 +1959,7 @@ pub trait CustomFamily {
         &self,
         specs: &[ParameterBlockSpec],
     ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
-        drop(specs);
+        std::hint::black_box(specs);
         None
     }
 
@@ -2479,7 +2479,7 @@ pub trait CustomFamily {
         derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
-        drop(options);
+        std::hint::black_box(options);
         self.exact_newton_joint_psi_workspace(states, specs, derivs)
     }
 
@@ -3983,7 +3983,7 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        drop(axis);
+        std::hint::black_box(axis);
         debug_assert_eq!(v.len(), self.n);
         Ok(Array1::<f64>::zeros(self.p))
     }
@@ -3993,7 +3993,7 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        drop(axis);
+        std::hint::black_box(axis);
         debug_assert_eq!(u.len(), self.p);
         Ok(Array1::<f64>::zeros(self.n))
     }
@@ -4003,7 +4003,7 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        drop(axis);
+        std::hint::black_box(axis);
         debug_assert_eq!(v.len(), self.n);
         Ok(Array1::<f64>::zeros(self.p))
     }
@@ -4014,8 +4014,8 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis_e: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        drop(axis_d);
-        drop(axis_e);
+        std::hint::black_box(axis_d);
+        std::hint::black_box(axis_e);
         debug_assert_eq!(v.len(), self.n);
         Ok(Array1::<f64>::zeros(self.p))
     }
@@ -4025,7 +4025,7 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        drop(axis);
+        std::hint::black_box(axis);
         debug_assert_eq!(u.len(), self.p);
         Ok(Array1::<f64>::zeros(self.n))
     }
@@ -4036,8 +4036,8 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis_e: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        drop(axis_d);
-        drop(axis_e);
+        std::hint::black_box(axis_d);
+        std::hint::black_box(axis_e);
         debug_assert_eq!(u.len(), self.p);
         Ok(Array1::<f64>::zeros(self.n))
     }
@@ -4047,7 +4047,7 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        drop(axis);
+        std::hint::black_box(axis);
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 
@@ -4057,8 +4057,8 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         row: usize,
         mut out: ArrayViewMut1<'_, f64>,
     ) -> Result<(), crate::terms::basis::BasisError> {
-        drop(axis);
-        drop(row);
+        std::hint::black_box(axis);
+        std::hint::black_box(row);
         out.fill(0.0);
         Ok(())
     }
@@ -4068,7 +4068,7 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        drop(axis);
+        std::hint::black_box(axis);
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 
@@ -4078,8 +4078,8 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis_e: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        drop(axis_d);
-        drop(axis_e);
+        std::hint::black_box(axis_d);
+        std::hint::black_box(axis_e);
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 }
@@ -6031,8 +6031,8 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         factor: &Array2<f64>,
         directions: &Array2<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        drop(factor);
-        drop(directions);
+        std::hint::black_box(factor);
+        std::hint::black_box(directions);
         Ok(None)
     }
 
@@ -8326,7 +8326,7 @@ fn penalty_logdet_cholesky_fallback(
 }
 
 fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, dim: usize) -> RidgeDeterminantMode {
-    drop(dim);
+    std::hint::black_box(dim);
     match ridge_policy.determinant_mode {
         RidgeDeterminantMode::Auto => RidgeDeterminantMode::Full,
         mode => mode,
@@ -12042,7 +12042,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // already consults the realized objective change and
                     // gradient residual instead. Drop the value so its
                     // computation is not silently wasted.
-                    drop(predicted_reduction);
+                    std::hint::black_box(predicted_reduction);
                     accepted = true;
                     break;
                 }

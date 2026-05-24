@@ -2922,7 +2922,7 @@ pub fn assert_spatial_centers_below_biobank_cap(
     d_pc: usize,
     centers: ArrayView2<'_, f64>,
 ) -> Result<(), BasisError> {
-    drop(n);
+    std::hint::black_box(n);
     if centers.ncols() != d_pc {
         return Err(BasisError::DimensionMismatch(format!(
             "spatial PC center dimension mismatch: centers have {} columns, expected {d_pc}",
@@ -10064,7 +10064,7 @@ fn hessian_operator_eta_cross_entry(
     axis_b: usize,
     axis_c: usize,
 ) -> f64 {
-    drop(q);
+    std::hint::black_box(q);
     debug_assert_ne!(axis_i, axis_j);
     let i_is_b = usize::from(axis_i == axis_b) as f64;
     let i_is_c = usize::from(axis_i == axis_c) as f64;
@@ -15413,7 +15413,7 @@ pub fn create_matern_spline_basiswithworkspace(
     aniso_log_scales: Option<&[f64]>,
     workspace: &mut BasisWorkspace,
 ) -> Result<MaternSplineBasis, BasisError> {
-    drop(workspace);
+    std::hint::black_box(workspace);
     let n = data.nrows();
     let d = data.ncols();
     let k = centers.nrows();
@@ -25632,7 +25632,7 @@ pub mod closed_form_penalty {
     /// regime of canonical TPS, so we use `d > 4m` as the dispatch gate.
     #[inline]
     fn schwinger_radial_is_convergent(d: usize, m: usize, s: usize) -> bool {
-        drop(s);
+        std::hint::black_box(s);
         d > 4 * m
     }
 
@@ -28296,11 +28296,11 @@ mod tests {
         panic!("test only covers nu >= 5/2; got {nu:?}")
     }
 
-    fn periodic_test_spec(num_basis: usize) -> PeriodicSplineCurveSpec {
-        PeriodicSplineCurveSpec {
+    fn periodic_test_spec(num_basis: usize) -> PeriodicSplineCurve {
+        PeriodicSplineCurve {
             lambda: 1e-10,
             ridge: 1e-10,
-            ..PeriodicSplineCurveSpec::cubic(num_basis, 0.0, std::f64::consts::TAU)
+            ..PeriodicSplineCurve::cubic(num_basis, 0.0, std::f64::consts::TAU)
         }
     }
 

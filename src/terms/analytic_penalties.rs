@@ -298,8 +298,8 @@ pub trait AnalyticPenalty: Send + Sync {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
-        drop(target);
-        drop(rho);
+        std::hint::black_box(target);
+        std::hint::black_box(rho);
         None
     }
 
@@ -365,7 +365,7 @@ pub trait AnalyticPenalty: Send + Sync {
     /// Update any attached scalar weight schedule at the given REML outer
     /// iteration. Penalties without schedules keep their stored weight.
     fn apply_schedule(&mut self, iter: usize) {
-        drop(iter);
+        std::hint::black_box(iter);
     }
 }
 
@@ -1506,8 +1506,8 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
-        drop(target);
-        drop(rho);
+        std::hint::black_box(target);
+        std::hint::black_box(rho);
         None
     }
 
@@ -2395,7 +2395,7 @@ impl AnalyticPenalty for TopKActivationPenalty {
     }
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
-        drop(rho);
+        std::hint::black_box(rho);
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut mask = vec![false; d];
@@ -2414,7 +2414,7 @@ impl AnalyticPenalty for TopKActivationPenalty {
     }
 
     fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        drop(rho);
+        std::hint::black_box(rho);
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut mask = vec![false; d];
@@ -2436,7 +2436,7 @@ impl AnalyticPenalty for TopKActivationPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
-        drop(rho);
+        std::hint::black_box(rho);
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut mask = vec![false; d];
@@ -2454,8 +2454,8 @@ impl AnalyticPenalty for TopKActivationPenalty {
     }
 
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        drop(target);
-        drop(rho);
+        std::hint::black_box(target);
+        std::hint::black_box(rho);
         Array1::<f64>::zeros(0)
     }
 
@@ -6211,7 +6211,7 @@ impl OrthogonalityPenalty {
     /// Dense cross-axis Hessian; no blockwise reduction preserves the
     /// rotation-gauge term.
     pub fn as_blockwise(&self, global_offset: usize) -> Option<Vec<BlockwisePenalty>> {
-        drop(global_offset);
+        std::hint::black_box(global_offset);
         None
     }
 }

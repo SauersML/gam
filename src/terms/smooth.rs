@@ -13338,8 +13338,8 @@ fn exact_joint_spatial_outer_hessian_available(
     family: LikelihoodFamily,
     design: &TermCollectionDesign,
 ) -> bool {
-    drop(family);
-    drop(design);
+    std::hint::black_box(family);
+    std::hint::black_box(design);
     // Every `LikelihoodFamily` variant (Gaussian, Binomial-*, Poisson, Gamma,
     // Royston-Parmar) routes through the unified evaluator's outer-Hessian
     // path: Gaussian Identity uses the no-correction dense form, all GLM
@@ -18173,10 +18173,10 @@ where
     const KAPPA_PILOT_K: usize = 5_000;
     const KAPPA_POLISH_K: usize = 25_000;
     const KAPPA_POLISH_TRIGGER_N: usize = 100_000;
-    drop(KAPPA_SUBSAMPLE_PILOT_TRIGGER_N); // Documented threshold; engaged via policy.
-    drop(KAPPA_POLISH_TRIGGER_N);
-    drop(KAPPA_POLISH_K);
-    drop(KAPPA_PILOT_K);
+    std::hint::black_box(KAPPA_SUBSAMPLE_PILOT_TRIGGER_N); // Documented threshold; engaged via policy.
+    std::hint::black_box(KAPPA_POLISH_TRIGGER_N);
+    std::hint::black_box(KAPPA_POLISH_K);
+    std::hint::black_box(KAPPA_PILOT_K);
 
     let n_total = data.nrows();
     let use_staged_kappa = outer_derivative_policy.should_use_staged_kappa(n_total);

@@ -8124,7 +8124,7 @@ impl CustomFamily for TransformationNormalFamily {
     }
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
-        drop(specs);
+        std::hint::black_box(specs);
         // Khatri–Rao tensor design: the coefficient block is X = R ⊙ C with
         // rows length p_resp · p_cov. Two regimes:
         //
@@ -8508,7 +8508,7 @@ impl CustomFamily for TransformationNormalFamily {
         block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        drop(specs);
+        std::hint::black_box(specs);
         if block_states.len() != 1 {
             return Err(TransformationNormalError::InvalidInput {
                 reason: format!(
@@ -8539,7 +8539,7 @@ impl CustomFamily for TransformationNormalFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
-        drop(specs);
+        std::hint::black_box(specs);
         Ok(Some(Arc::new(TransformationNormalPsiWorkspace::new(
             self.clone(),
             block_states.to_vec(),
@@ -8573,7 +8573,7 @@ impl CustomFamily for TransformationNormalFamily {
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
-        drop(specs);
+        std::hint::black_box(specs);
         // Route through a mask-aware family clone when an outer-score
         // subsample is active. Every CTN ψ assembly site — including the
         // workspace's `compute_all_axes` (per-row reduction near line ~13916)
@@ -8607,19 +8607,19 @@ impl CustomFamily for TransformationNormalFamily {
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         // CTN's SCOP coefficient-space joint Hessian is supplied as a
         // row-streaming matrix-free Hv operator.
         true
     }
 
     fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         true
     }
 
     fn outer_hyper_hessian_dense_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         // Dense materialization remains mathematically available through the
         // outer-HVP operator, but SCOP's primary production path is the
         // matrix-free θθ operator above.
@@ -15348,7 +15348,7 @@ pub fn fit_transformation_normal(
          designs: &[TermCollectionDesign],
          eval_mode,
          row_set| {
-            drop(row_set);
+            std::hint::black_box(row_set);
             ensure_exact_geometry(&specs[0], &designs[0])?;
             let mut cache_ref = exact_geometry_cache.borrow_mut();
             let geometry = cache_ref

@@ -1656,7 +1656,7 @@ mod tests {
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
                 beta_covariance_frequentist: None,
-                influence_matrix: None,
+                coefficient_influence: None,
                 covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             }),

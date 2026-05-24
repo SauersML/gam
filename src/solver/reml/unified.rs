@@ -361,7 +361,7 @@ pub trait HessianOperator: Send + Sync {
     /// this to use a looser PCG tolerance when the caller's Monte Carlo error
     /// dominates the linear-solve error.
     fn stochastic_trace_solve(&self, rhs: &Array1<f64>, rel_tol: f64) -> Array1<f64> {
-        drop(rel_tol);
+        std::hint::black_box(rel_tol);
         self.solve(rhs)
     }
 
@@ -377,13 +377,13 @@ pub trait HessianOperator: Send + Sync {
         probe_id: u64,
         trace_state: Option<&Arc<Mutex<StochasticTraceState>>>,
     ) -> Array1<f64> {
-        drop((probe_id, trace_state));
+        std::hint::black_box((probe_id, trace_state));
         self.stochastic_trace_solve(rhs, rel_tol)
     }
 
     /// H⁻¹ M for stochastic trace probes.
     fn stochastic_trace_solve_multi(&self, rhs: &Array2<f64>, rel_tol: f64) -> Array2<f64> {
-        drop(rel_tol);
+        std::hint::black_box(rel_tol);
         self.solve_multi(rhs)
     }
 
@@ -1933,7 +1933,7 @@ pub trait HyperOperator: Send + Sync {
         factor: &Array2<f64>,
         cache: &ProjectedFactorCache,
     ) -> f64 {
-        drop(cache);
+        std::hint::black_box(cache);
         self.trace_projected_factor(factor)
     }
 
@@ -1955,7 +1955,7 @@ pub trait HyperOperator: Send + Sync {
         factor: &Array2<f64>,
         cache: &ProjectedFactorCache,
     ) -> Array2<f64> {
-        drop(cache);
+        std::hint::black_box(cache);
         self.projected_matrix(factor)
     }
 
@@ -12600,7 +12600,7 @@ fn active_bound_indices_for_theta(
     let mut active = detect_active_theta_bounds(theta, q);
     // Drop ψ-coordinates: they are unbounded by construction.
     active.retain(|&i| i < rho_len);
-    drop(ext_len);
+    std::hint::black_box(ext_len);
     active
 }
 
@@ -12658,7 +12658,7 @@ fn projected_inverse_with_inertia_gate(
             hessian_norm: h_norm,
             suggested_action: INDEFINITE_SUGGESTED_ACTION,
         };
-        drop(diagnostic.theta_dimension());
+        std::hint::black_box(diagnostic.theta_dimension());
         return Err(CorrectedCovarianceError::Indefinite(diagnostic));
     }
 
@@ -16741,7 +16741,7 @@ where
                 if stderr / denom <= config.relative_tol {
                     // `m` is the matvec count at exit, useful for
                     // diagnostics but not consumed by the caller.
-                    drop(m);
+                    std::hint::black_box(m);
                     break;
                 }
             }
