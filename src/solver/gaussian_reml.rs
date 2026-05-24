@@ -861,8 +861,7 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
             &mut grad_y,
             &mut grad_penalty,
             &mut grad_weights,
-        )
-        .lambda_adjoint();
+        );
     }
 
     if upstream_reml_score != 0.0 {
@@ -1470,8 +1469,7 @@ fn add_reml_rho_gradient_vjp(
         grad_y,
         grad_penalty,
         grad_weights,
-    )
-    .discard_lambda_adjoint_for_fixed_lambda();
+    );
 }
 
 fn add_rank_one_penalty_vjp(
