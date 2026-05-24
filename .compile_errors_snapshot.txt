@@ -1,1 +1,155 @@
     Blocking waiting for file lock on build directory
+   Compiling gam v0.2.1 (/Users/user/gam)
+error[E0425]: cannot find function `location_scale_hazard_component` in this scope
+    --> src/families/survival_predict.rs:1851:27
+     |
+1851 |         .map(|(&q, &q_t)| location_scale_hazard_component(q, q_t, inverse_link))
+     |                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> src/gpu/kernels/cell_moments.rs:164:21
+    |
+164 |     let dl = stream.memcpy_stod(&lefts).map_err(map_drv)?;
+    |                     ^^^^^^^^^^^
+    |
+    = note: `-D deprecated` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(deprecated)]`
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> src/gpu/kernels/cell_moments.rs:165:21
+    |
+165 |     let dr = stream.memcpy_stod(&rights).map_err(map_drv)?;
+    |                     ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> src/gpu/kernels/cell_moments.rs:166:21
+    |
+166 |     let d0 = stream.memcpy_stod(&cc0).map_err(map_drv)?;
+    |                     ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> src/gpu/kernels/cell_moments.rs:167:21
+    |
+167 |     let d1 = stream.memcpy_stod(&cc1).map_err(map_drv)?;
+    |                     ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> src/gpu/kernels/cell_moments.rs:168:21
+    |
+168 |     let d2 = stream.memcpy_stod(&cc2).map_err(map_drv)?;
+    |                     ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> src/gpu/kernels/cell_moments.rs:169:21
+    |
+169 |     let d3 = stream.memcpy_stod(&cc3).map_err(map_drv)?;
+    |                     ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+   --> src/gpu/kernels/cell_moments.rs:199:23
+    |
+199 |     let host = stream.memcpy_dtov(&dout).map_err(map_drv)?;
+    |                       ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+  --> src/gpu/kernels/fused_xtwx.rs:85:21
+   |
+85 |     let dx = stream.memcpy_stod(&col_major).map_err(map_drv)?;
+   |                     ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+  --> src/gpu/kernels/fused_xtwx.rs:87:10
+   |
+87 |         .memcpy_stod(w.as_slice().ok_or_else(|| GpuError::DriverCallFailed {
+   |          ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+   --> src/gpu/kernels/fused_xtwx.rs:147:26
+    |
+147 |     let host_cm = stream.memcpy_dtov(&dout).map_err(map_drv)?;
+    |                          ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> src/gpu/kernels/hutchpp.rs:162:25
+    |
+162 |         let dz = stream.memcpy_stod(z_slice).map_err(map_drv)?;
+    |                         ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> src/gpu/kernels/hutchpp.rs:163:26
+    |
+163 |         let daz = stream.memcpy_stod(az_slice).map_err(map_drv)?;
+    |                          ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+   --> src/gpu/kernels/hutchpp.rs:174:32
+    |
+174 |         let host_part = stream.memcpy_dtov(&dpart).map_err(map_drv)?;
+    |                                ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> src/gpu/kernels/irls_link.rs:253:23
+    |
+253 |     let deta = stream.memcpy_stod(eta_slice).map_err(map_drv)?;
+    |                       ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+   --> src/gpu/kernels/irls_link.rs:277:23
+    |
+277 |     let host = stream.memcpy_dtov(&dout).map_err(map_drv)?;
+    |                       ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> src/gpu/kernels/reductions.rs:134:21
+    |
+134 |     let dx = stream.memcpy_stod(slice).map_err(map_drv)?;
+    |                     ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+   --> src/gpu/kernels/reductions.rs:161:28
+    |
+161 |     let host_part = stream.memcpy_dtov(&dpart).map_err(map_drv)?;
+    |                            ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> src/gpu/kernels/row_scale.rs:100:25
+    |
+100 |     let mut dx = stream.memcpy_stod(&host).map_err(map_drv)?;
+    |                         ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> src/gpu/kernels/row_scale.rs:101:21
+    |
+101 |     let dw = stream.memcpy_stod(w_slice).map_err(map_drv)?;
+    |                     ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+   --> src/gpu/kernels/row_scale.rs:121:28
+    |
+121 |     let host_back = stream.memcpy_dtov(&dx).map_err(map_drv)?;
+    |                            ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> src/gpu/kernels/spatial.rs:203:21
+    |
+203 |     let da = stream.memcpy_stod(&a_host).map_err(map_drv)?;
+    |                     ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_stod`: Use clone_htod
+   --> src/gpu/kernels/spatial.rs:204:21
+    |
+204 |     let db = stream.memcpy_stod(&b_host).map_err(map_drv)?;
+    |                     ^^^^^^^^^^^
+
+error: use of deprecated method `cudarc::driver::CudaStream::memcpy_dtov`: Use clone_dtoh
+   --> src/gpu/kernels/spatial.rs:241:23
+    |
+241 |     let host = stream.memcpy_dtov(&dout).map_err(map_drv)?;
+    |                       ^^^^^^^^^^^
+
+error[E0614]: type `usize` cannot be dereferenced
+    --> src/terms/smooth.rs:4775:71
+     |
+4775 |                 BSplineKnotSpec::PeriodicUniform { num_basis, .. } => *num_basis,
+     |                                                                       ^^^^^^^^^^ can't be dereferenced
+
