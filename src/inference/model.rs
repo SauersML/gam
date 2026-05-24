@@ -20,8 +20,7 @@ use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
 use crate::span::span_index_for_breakpoints;
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodFamily, LikelihoodSpec, LinkFunction,
-    MixtureLinkState, SasLinkSpec,
+    InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkState, SasLinkSpec,
     SasLinkState,
 };
 use ndarray::{Array1, Array2};
@@ -737,7 +736,7 @@ pub enum ModelKind {
 #[serde(tag = "family_kind", rename_all = "kebab-case")]
 pub enum FittedFamily {
     Standard {
-        likelihood: LikelihoodSpec,
+        likelihood: LikelihoodFamily,
         link: Option<LinkFunction>,
         #[serde(default)]
         latent_cloglog_state: Option<LatentCLogLogState>,
@@ -747,17 +746,17 @@ pub enum FittedFamily {
         sas_state: Option<SasLinkState>,
     },
     LocationScale {
-        likelihood: LikelihoodSpec,
+        likelihood: LikelihoodFamily,
         #[serde(default)]
         base_link: Option<InverseLink>,
     },
     MarginalSlope {
-        likelihood: LikelihoodSpec,
+        likelihood: LikelihoodFamily,
         base_link: Option<InverseLink>,
         frailty: FrailtySpec,
     },
     Survival {
-        likelihood: LikelihoodSpec,
+        likelihood: LikelihoodFamily,
         #[serde(default)]
         survival_likelihood: Option<String>,
         #[serde(default)]
@@ -771,7 +770,7 @@ pub enum FittedFamily {
         frailty: FrailtySpec,
     },
     TransformationNormal {
-        likelihood: LikelihoodSpec,
+        likelihood: LikelihoodFamily,
     },
 }
 

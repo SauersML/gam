@@ -869,13 +869,17 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
             );
         }
         let mut w_col = Array1::<f64>::zeros(n_rows);
+        // Reusable (n × rank) working buffer for jf_a · diag(w_ab). Allocated
+        // once here and overwritten via `assign` on every (a, b) iteration,
+        // avoiding O(K²) Array2 allocations on the hot path.
+        let mut jf_a_weighted: Array2<f64> = Array2::<f64>::zeros((n_rows, rank));
         for a in 0..K {
             for b in a..K {
                 for r in 0..n_rows {
                     w_col[r] = t_flat[r * (K * K) + a * K + b];
                 }
                 // jf_a_weighted = jf_a · diag(w)
-                let mut jf_a_weighted = jf_axis_blocks[a].clone();
+                jf_a_weighted.assign(&jf_axis_blocks[a]);
                 for r in 0..n_rows {
                     let wr = w_col[r];
                     if wr == 0.0 {
