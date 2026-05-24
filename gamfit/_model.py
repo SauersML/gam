@@ -1271,6 +1271,15 @@ class Model:
         rng = np.random.default_rng(seed)
         rows_out: list[dict[str, Any]] = []
         random_ranges = [(int(a), int(b)) for a, b in state.get("random_column_ranges", [])]
+        # Categorical group columns are represented as `random_effect` term
+        # blocks; isolate the ones whose term name matches the contrast
+        # group so `group_means=False` can drop only that group's level
+        # offsets and not (e.g.) some unrelated random intercept term.
+        group_random_ranges = [
+            (int(block["start"]), int(block["end"]))
+            for block in state.get("term_blocks", []) or []
+            if block.get("kind") == "random_effect" and block.get("name") == group
+        ]
 
         for a, b in pairs:
             left_level = str(a)
@@ -1293,12 +1302,14 @@ class Model:
                 for start, stop in random_ranges:
                     xd[:, start:stop] = 0.0
             if not group_means:
-                # Drop parametric main-effect columns from the contrast while
-                # retaining smooth blocks. The global layout is intercept,
-                # linear terms, random effects, smooths; categorical offsets in
-                # this package are represented as random-effect blocks, so this
-                # also removes those offsets under the population contrast.
-                for start, stop in random_ranges:
+                # Drop the contrast group's parametric / random-effect level
+                # offsets so the contrast carries only the per-group SMOOTH
+                # shape difference, not the group-level mean step. Under
+                # `marginalise_random=True` this is a strict subset of the
+                # already-zeroed ranges and is redundant; under
+                # `marginalise_random=False` it isolates the group of
+                # interest from any other random terms in the model.
+                for start, stop in group_random_ranges:
                     xd[:, start:stop] = 0.0
             diff = xd @ beta
             var = np.einsum("ij,jk,ik->i", xd, cov, xd)
