@@ -32,7 +32,7 @@ use crate::estimate::{
     UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
-use crate::faer_ndarray::{FaerEigh, fast_ab, fast_atb, fast_atv};
+use crate::faer_ndarray::{FaerEigh, fast_atb, fast_atv};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{
     BlockDesignOperator, CoefficientTransformOperator, DesignBlock, DesignMatrix,
@@ -234,29 +234,6 @@ pub enum SmoothBasisSpec {
         smooth: Box<SmoothBasisSpec>,
         by_kind: ByVarKind,
     },
-}
-
-fn default_pca_smooth_penalty() -> f64 {
-    1.0
-}
-
-impl SmoothBasisSpec {
-    /// Stable per-variant ordinal used when sorting smooth-related warnings:
-    /// each variant gets a fixed rank so callers can sort heterogeneous
-    /// smooth specs without matching on the variant themselves.
-    pub fn family_rank(&self) -> u8 {
-        match self {
-            Self::BSpline1D { .. } => 0,
-            Self::TensorBSpline { .. } => 1,
-            Self::ThinPlate { .. } => 2,
-            Self::Sphere { .. } => 3,
-            Self::Matern { .. } => 4,
-            Self::Duchon { .. } => 5,
-            Self::Pca { .. } => 6,
-            Self::FactorSmooth { .. } => 7,
-            Self::BySmooth { .. } => 8,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -669,29 +646,26 @@ impl TermCollectionSpec {
                         spec.marginal.knotspec,
                         BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. }
                     ) {
-                        return Err(SmoothError::invalid_config(format!(
+                        return Err(format!(
                             "{label} term '{}' is not frozen: factor-smooth marginal knotspec must be Provided or PeriodicUniform",
                             st.name
-                        ))
-                        .into());
+                        ));
                     }
                     if spec.group_frozen_levels.is_none() {
-                        return Err(SmoothError::invalid_config(format!(
+                        return Err(format!(
                             "{label} term '{}' is not frozen: factor smooth missing group_frozen_levels",
                             st.name
-                        ))
-                        .into());
+                        ));
                     }
                 }
                 SmoothBasisSpec::BySmooth { smooth, by_kind } => {
                     if let ByVarKind::Factor { frozen_levels, .. } = by_kind
                         && frozen_levels.is_none()
                     {
-                        return Err(SmoothError::invalid_config(format!(
+                        return Err(format!(
                             "{label} term '{}' is not frozen: factor by-smooth missing frozen_levels",
                             st.name
-                        ))
-                        .into());
+                        ));
                     }
                     let nested = TermCollectionSpec {
                         linear_terms: vec![],
@@ -4043,60 +4017,385 @@ fn normalize_penalty_in_constrained_space(matrix: &Array2<f64>) -> (Array2<f64>,
     }
 }
 
-fn build_periodic_fourier_margin(
-    x: ArrayView1<'_, f64>,
-    period: f64,
-    requested_cols: usize,
-    penalty_order: usize,
-) -> Result<(Array2<f64>, Array2<f64>, Array1<f64>), BasisError> {
-    if !period.is_finite() || period <= 0.0 {
-        return Err(BasisError::InvalidInput(format!(
-            "periodic tensor margin requires finite positive period, got {period}"
+fn sorted_finite_levels_from_col(col: ArrayView1<'_, f64>) -> Result<Vec<u64>, BasisError> {
+    let mut levels = BTreeSet::<u64>::new();
+    for &v in col.iter() {
+        if !v.is_finite() {
+            return Err(BasisError::InvalidInput(
+                "factor smooth grouping column contains non-finite values".to_string(),
+            ));
+        }
+        levels.insert(v.to_bits());
+    }
+    Ok(levels.into_iter().collect())
+}
+
+fn indicator_design_for_levels(
+    data: ArrayView2<'_, f64>,
+    feature_col: usize,
+    levels: &[u64],
+) -> Result<Array2<f64>, BasisError> {
+    if feature_col >= data.ncols() {
+        return Err(BasisError::DimensionMismatch(format!(
+            "categorical feature column {feature_col} out of bounds for {} columns",
+            data.ncols()
         )));
     }
-    let q = requested_cols.max(3);
-    let harmonics = q / 2;
-    let has_nyquist_cos = q % 2 == 0;
-    let mut basis = Array2::<f64>::zeros((x.len(), q));
-    basis.column_mut(0).fill(1.0);
-    for (i, &xi) in x.iter().enumerate() {
-        let angle = 2.0 * std::f64::consts::PI * xi / period;
-        let mut col = 1usize;
-        for h in 1..=harmonics {
-            if col >= q {
-                break;
+    let n = data.nrows();
+    let mut out = Array2::<f64>::zeros((n, levels.len()));
+    let level_to_idx = levels
+        .iter()
+        .enumerate()
+        .map(|(i, &b)| (b, i))
+        .collect::<BTreeMap<_, _>>();
+    for i in 0..n {
+        let v = data[[i, feature_col]];
+        if !v.is_finite() {
+            return Err(BasisError::InvalidInput(
+                "categorical feature column contains non-finite values".to_string(),
+            ));
+        }
+        if let Some(&j) = level_to_idx.get(&v.to_bits()) {
+            out[[i, j]] = 1.0;
+        }
+    }
+    Ok(out)
+}
+
+fn dense_block_diag(blocks: &[Array2<f64>]) -> Array2<f64> {
+    let rows = blocks.iter().map(|b| b.nrows()).sum::<usize>();
+    let cols = blocks.iter().map(|b| b.ncols()).sum::<usize>();
+    let mut out = Array2::<f64>::zeros((rows, cols));
+    let mut r = 0usize;
+    let mut c = 0usize;
+    for b in blocks {
+        out.slice_mut(s![r..r + b.nrows(), c..c + b.ncols()])
+            .assign(b);
+        r += b.nrows();
+        c += b.ncols();
+    }
+    out
+}
+
+fn replicate_design_by_indicator(base: &Array2<f64>, indicator: &Array2<f64>) -> Array2<f64> {
+    let n = base.nrows();
+    let p = base.ncols();
+    let l = indicator.ncols();
+    let mut out = Array2::<f64>::zeros((n, p * l));
+    for lev in 0..l {
+        for j in 0..p {
+            let col = lev * p + j;
+            for i in 0..n {
+                out[[i, col]] = base[[i, j]] * indicator[[i, lev]];
             }
-            basis[[i, col]] = (h as f64 * angle).cos();
-            col += 1;
-            if col >= q {
-                break;
+        }
+    }
+    out
+}
+
+fn sum_to_zero_level_contrast(levels: usize) -> Array2<f64> {
+    let mut c = Array2::<f64>::zeros((levels, levels.saturating_sub(1)));
+    if levels < 2 {
+        return c;
+    }
+    for j in 0..levels - 1 {
+        c[[j, j]] = 1.0;
+        c[[levels - 1, j]] = -1.0;
+    }
+    c
+}
+
+fn apply_level_contrast_to_replicated_design(
+    base_by_level: &Array2<f64>,
+    p_base: usize,
+    contrast: &Array2<f64>,
+) -> Array2<f64> {
+    let n = base_by_level.nrows();
+    let l = contrast.nrows();
+    let lc = contrast.ncols();
+    let mut out = Array2::<f64>::zeros((n, p_base * lc));
+    for i in 0..n {
+        for j in 0..p_base {
+            for cidx in 0..lc {
+                let mut v = 0.0;
+                for lev in 0..l {
+                    v += base_by_level[[i, lev * p_base + j]] * contrast[[lev, cidx]];
+                }
+                out[[i, cidx * p_base + j]] = v;
             }
-            basis[[i, col]] = (h as f64 * angle).sin();
-            col += 1;
-        }
-        if has_nyquist_cos && q > 1 {
-            basis[[i, q - 1]] = (harmonics as f64 * angle).cos();
         }
     }
-    let mut penalty = Array2::<f64>::zeros((q, q));
-    let order = penalty_order.max(1) as i32;
-    let mut col = 1usize;
-    for h in 1..=harmonics {
-        let w = (h as f64).powi(2 * order);
-        if col < q {
-            penalty[[col, col]] = w;
-            col += 1;
+    out
+}
+
+fn expand_penalty_by_levels(base_s: &Array2<f64>, levels: usize) -> Array2<f64> {
+    let blocks = (0..levels).map(|_| base_s.clone()).collect::<Vec<_>>();
+    dense_block_diag(&blocks)
+}
+
+fn build_by_smooth_basis(
+    data: ArrayView2<'_, f64>,
+    smooth: &SmoothBasisSpec,
+    by_kind: &ByVarKind,
+    workspace: &mut crate::basis::BasisWorkspace,
+) -> Result<BasisBuildResult, BasisError> {
+    let inner_term = SmoothTermSpec {
+        name: "by-inner".to_string(),
+        basis: smooth.clone(),
+        shape: ShapeConstraint::None,
+    };
+    let inner = build_single_local_smooth_term(data, &inner_term, workspace)?;
+    let base = inner.design.to_dense();
+    match by_kind {
+        ByVarKind::Numeric { feature_col } => {
+            if *feature_col >= data.ncols() {
+                return Err(BasisError::DimensionMismatch(
+                    "numeric by column out of bounds".to_string(),
+                ));
+            }
+            let mut out = base.clone();
+            for i in 0..out.nrows() {
+                let z = data[[i, *feature_col]];
+                if !z.is_finite() {
+                    return Err(BasisError::InvalidInput(
+                        "numeric by column contains non-finite values".to_string(),
+                    ));
+                }
+                for j in 0..out.ncols() {
+                    out[[i, j]] *= z;
+                }
+            }
+            Ok(BasisBuildResult {
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(out)),
+                penalties: inner.penalties,
+                nullspace_dims: inner.nullspaces,
+                penaltyinfo: inner.penaltyinfo,
+                ops: inner.ops,
+                metadata: inner.metadata,
+                kronecker_factored: None,
+            })
         }
-        if col < q {
-            penalty[[col, col]] = w;
-            col += 1;
+        ByVarKind::Factor {
+            feature_col,
+            ordered,
+            frozen_levels,
+        } => {
+            let mut levels = frozen_levels.clone().unwrap_or_else(Vec::new);
+            if levels.is_empty() {
+                levels = sorted_finite_levels_from_col(data.column(*feature_col))?;
+            }
+            let kept = if *ordered && !levels.is_empty() {
+                levels[1..].to_vec()
+            } else {
+                levels
+            };
+            let ind = indicator_design_for_levels(data, *feature_col, &kept)?;
+            let design = replicate_design_by_indicator(&base, &ind);
+            let penalties = inner
+                .penalties
+                .iter()
+                .map(|s| expand_penalty_by_levels(s, kept.len()))
+                .collect::<Vec<_>>();
+            let candidates = penalties
+                .into_iter()
+                .enumerate()
+                .map(|(i, matrix)| PenaltyCandidate {
+                    matrix,
+                    nullspace_dim_hint: 0,
+                    source: PenaltySource::Other(format!("BySmoothPenalty({i})")),
+                    normalization_scale: 1.0,
+                    kronecker_factors: None,
+                    op: None,
+                })
+                .collect::<Vec<_>>();
+            let (penalties, nullspace_dims, penaltyinfo, ops) =
+                filter_active_penalty_candidates_with_ops(candidates)?;
+            Ok(BasisBuildResult {
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+                penalties,
+                nullspace_dims,
+                penaltyinfo,
+                ops,
+                metadata: inner.metadata,
+                kronecker_factored: None,
+            })
         }
     }
-    if has_nyquist_cos && q > 1 {
-        penalty[[q - 1, q - 1]] = (harmonics as f64).powi(2 * order);
+}
+
+fn bspline_base_design_and_penalty(
+    data: ArrayView2<'_, f64>,
+    col: usize,
+    spec: &BSplineBasisSpec,
+) -> Result<(Array2<f64>, Array2<f64>, BasisMetadata), BasisError> {
+    let mut local = spec.clone();
+    local.identifiability = BSplineIdentifiability::None;
+    let built = build_bspline_basis_1d(data.column(col), &local)?;
+    let design = built.design.to_dense();
+    let penalty =
+        built.penalties.first().cloned().ok_or_else(|| {
+            BasisError::InvalidInput("B-spline marginal missing penalty".to_string())
+        })?;
+    Ok((design, penalty, built.metadata))
+}
+
+fn natural_reparameterize_design_penalty(
+    x: &Array2<f64>,
+    s: &Array2<f64>,
+) -> Result<(Array2<f64>, usize, usize), BasisError> {
+    let sym = (s + &s.t().to_owned()) * 0.5;
+    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
+    let max_ev = evals.iter().copied().fold(0.0_f64, f64::max);
+    let tol = (max_ev.max(1.0)) * 1e-10;
+    let mut order = Vec::<usize>::new();
+    for (i, &ev) in evals.iter().enumerate() {
+        if ev <= tol {
+            order.push(i);
+        }
     }
-    let knots = Array1::linspace(0.0, period, q + 1);
-    Ok((basis, penalty, knots))
+    for (i, &ev) in evals.iter().enumerate() {
+        if ev > tol {
+            order.push(i);
+        }
+    }
+    let null_dim = order.iter().filter(|&&i| evals[i] <= tol).count();
+    let rank = order.len() - null_dim;
+    let mut transform = Array2::<f64>::zeros((evecs.nrows(), evecs.ncols()));
+    for (new_j, &old_j) in order.iter().enumerate() {
+        let scale = if evals[old_j] > tol {
+            evals[old_j].sqrt().recip()
+        } else {
+            1.0
+        };
+        for r in 0..evecs.nrows() {
+            transform[[r, new_j]] = evecs[[r, old_j]] * scale;
+        }
+    }
+    Ok((x.dot(&transform), null_dim, rank))
+}
+
+fn build_linear_margin(data: ArrayView2<'_, f64>, col: usize) -> Result<Array2<f64>, BasisError> {
+    if col >= data.ncols() {
+        return Err(BasisError::DimensionMismatch(
+            "random-slope continuous column out of bounds".to_string(),
+        ));
+    }
+    let n = data.nrows();
+    let mut x = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        let v = data[[i, col]];
+        if !v.is_finite() {
+            return Err(BasisError::InvalidInput(
+                "random-slope column contains non-finite values".to_string(),
+            ));
+        }
+        x[[i, 0]] = 1.0;
+        x[[i, 1]] = v;
+    }
+    Ok(x)
+}
+
+fn build_factor_smooth_basis(
+    data: ArrayView2<'_, f64>,
+    spec: &FactorSmoothSpec,
+) -> Result<BasisBuildResult, BasisError> {
+    if spec.group_col >= data.ncols() {
+        return Err(BasisError::DimensionMismatch(
+            "factor-smooth group column out of bounds".to_string(),
+        ));
+    }
+    let mut levels = spec.group_frozen_levels.clone().unwrap_or_else(Vec::new);
+    if levels.is_empty() {
+        levels = sorted_finite_levels_from_col(data.column(spec.group_col))?;
+    }
+    if levels.is_empty() {
+        return Err(BasisError::InvalidInput(
+            "factor smooth requires at least one group level".to_string(),
+        ));
+    }
+    let continuous_col = *spec.continuous_cols.first().ok_or_else(|| {
+        BasisError::InvalidInput("factor smooth requires one continuous margin".to_string())
+    })?;
+    let (base_x, base_s, metadata) = match spec.flavour {
+        FactorSmoothFlavour::Re => (
+            build_linear_margin(data, continuous_col)?,
+            Array2::<f64>::zeros((2, 2)),
+            BasisMetadata::TensorBSpline {
+                feature_cols: vec![continuous_col, spec.group_col],
+                knots: vec![],
+                degrees: vec![],
+                periodic: vec![],
+                identifiability_transform: None,
+            },
+        ),
+        _ => bspline_base_design_and_penalty(data, continuous_col, &spec.marginal)?,
+    };
+    let (base_x, null_dim, rank) = match spec.flavour {
+        FactorSmoothFlavour::Fs { .. } => natural_reparameterize_design_penalty(&base_x, &base_s)?,
+        FactorSmoothFlavour::Re => (base_x, 0, 2),
+        FactorSmoothFlavour::Sz => (base_x, 0, base_s.ncols()),
+    };
+    let p = base_x.ncols();
+    let ind = indicator_design_for_levels(data, spec.group_col, &levels)?;
+    let mut design = replicate_design_by_indicator(&base_x, &ind);
+    let mut penalties = Vec::<Array2<f64>>::new();
+    match &spec.flavour {
+        FactorSmoothFlavour::Fs {
+            m_null_penalty_orders,
+        } => {
+            let mut range = Array2::<f64>::zeros((p, p));
+            for j in null_dim..(null_dim + rank) {
+                range[[j, j]] = 1.0;
+            }
+            penalties.push(expand_penalty_by_levels(&range, levels.len()));
+            let null_count = if m_null_penalty_orders.len() == 1 && m_null_penalty_orders[0] == 1 {
+                null_dim.min(1)
+            } else {
+                null_dim
+            };
+            for j in 0..null_count {
+                let mut sj = Array2::<f64>::zeros((p, p));
+                sj[[j, j]] = 1.0;
+                penalties.push(expand_penalty_by_levels(&sj, levels.len()));
+            }
+        }
+        FactorSmoothFlavour::Sz => {
+            let contrast = sum_to_zero_level_contrast(levels.len());
+            design = apply_level_contrast_to_replicated_design(&design, p, &contrast);
+            let s_level = dense_block_diag(
+                &(0..contrast.ncols())
+                    .map(|_| base_s.clone())
+                    .collect::<Vec<_>>(),
+            );
+            penalties.push(s_level);
+        }
+        FactorSmoothFlavour::Re => {
+            penalties.push(Array2::<f64>::eye(design.ncols()));
+        }
+    }
+    let candidates = penalties
+        .into_iter()
+        .enumerate()
+        .map(|(i, matrix)| PenaltyCandidate {
+            matrix,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::Other(format!("FactorSmoothPenalty({i})")),
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+            op: None,
+        })
+        .collect::<Vec<_>>();
+    let (penalties, nullspace_dims, penaltyinfo, ops) =
+        filter_active_penalty_candidates_with_ops(candidates)?;
+    Ok(BasisBuildResult {
+        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
+        penalties,
+        nullspace_dims,
+        penaltyinfo,
+        ops,
+        metadata,
+        kronecker_factored: None,
+    })
 }
 
 fn build_tensor_bspline_basis(
@@ -5825,7 +6124,16 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
 }
 
 fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
-    term.basis.family_rank()
+    match &term.basis {
+        SmoothBasisSpec::BSpline1D { .. } => 0,
+        SmoothBasisSpec::TensorBSpline { .. } => 1,
+        SmoothBasisSpec::ThinPlate { .. } => 2,
+        SmoothBasisSpec::Sphere { .. } => 3,
+        SmoothBasisSpec::Matern { .. } => 4,
+        SmoothBasisSpec::Duchon { .. } => 5,
+        SmoothBasisSpec::FactorSmooth { .. } => 6,
+        SmoothBasisSpec::BySmooth { .. } => 7,
+    }
 }
 
 fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
@@ -12297,7 +12605,6 @@ fn try_build_spatial_term_log_kappa_derivative(
                 .map_err(EstimationError::from)?
         }
         SmoothBasisSpec::BSpline1D { .. }
-        | SmoothBasisSpec::Pca { .. }
         | SmoothBasisSpec::TensorBSpline { .. }
         | SmoothBasisSpec::FactorSmooth { .. }
         | SmoothBasisSpec::BySmooth { .. } => {
@@ -15136,28 +15443,6 @@ pub fn freeze_term_collection_from_design(
                             },
                             None => TensorBSplineIdentifiability::None,
                         };
-                    }
-                    (
-                        SmoothBasisSpec::Pca {
-                            feature_cols,
-                            basis_matrix,
-                            centered,
-                            smooth_penalty,
-                            center_mean,
-                        },
-                        BasisMetadata::Pca {
-                            feature_cols: fitted_cols,
-                            basis_matrix: fitted_basis,
-                            centered: fitted_centered,
-                            smooth_penalty: fitted_smooth_penalty,
-                            center_mean: fitted_mean,
-                        },
-                    ) => {
-                        *feature_cols = fitted_cols.clone();
-                        *basis_matrix = fitted_basis.clone();
-                        *centered = *fitted_centered;
-                        *smooth_penalty = *fitted_smooth_penalty;
-                        *center_mean = fitted_mean.clone();
                     }
                     _ => {}
                 }
