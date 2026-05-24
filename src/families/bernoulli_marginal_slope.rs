@@ -5345,6 +5345,7 @@ struct BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     options: BlockwiseFitOptions,
 }
 
+#[expect(dead_code)]
 struct BernoulliMarginalSlopeLineSearchWorkspace {
     family: BernoulliMarginalSlopeFamily,
     block_states: Vec<ParameterBlockState>,
