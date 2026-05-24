@@ -60,7 +60,7 @@ pub enum MonotoneRootError {
 /// These are folded into the enum variants above via Display so callers see
 /// byte-identical strings to the pre-refactor format!() output.
 impl MonotoneRootError {
-    fn exact_root_degenerate(label: &str, a: f64, _fp: f64) -> Self {
+    fn exact_root_degenerate(label: &str, a: f64) -> Self {
         // Tagged via `iters = usize::MAX` to select the "exact root" Display arm.
         MonotoneRootError::RefinementDidNotConverge {
             label: format!("__EXACT_ROOT__{label}"),
@@ -240,11 +240,7 @@ pub fn solve_monotone_root_detailed_with_bracket(
     if f_init.abs() <= convergence_tol {
         let abs_d = f_deriv_init.abs();
         if !abs_d.is_finite() || abs_d == 0.0 {
-            return Err(MonotoneRootError::exact_root_degenerate(
-                label,
-                a_init,
-                f_deriv_init,
-            ));
+            return Err(MonotoneRootError::exact_root_degenerate(label, a_init));
         }
         return Ok(MonotoneRootSolution {
             root: a_init,

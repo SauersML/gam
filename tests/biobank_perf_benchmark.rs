@@ -415,7 +415,10 @@ fn time_design_build_and_apply(
     let ms_apply = t_apply.elapsed().as_secs_f64() * 1e3;
     // Asserting on `accum_sum` consumes the value, which prevents the optimizer
     // from dead-code-eliminating the timed `term.apply` loop above.
-    assert!(accum_sum.is_finite(), "apply loop produced non-finite accumulator");
+    assert!(
+        accum_sum.is_finite(),
+        "apply loop produced non-finite accumulator"
+    );
     (ms_build, ms_apply, p, is_sparse)
 }
 

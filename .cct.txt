@@ -4,7 +4,7 @@ error: failed to run custom build command for `gam v0.2.1 (/Users/user/gam)`
 Caused by:
   process didn't exit successfully: `/Users/user/gam/target/debug/build/gam-d21e4c878405adc3/build-script-build` (exit status: 1)
   --- stdout
-  cargo:rustc-env=GAM_BUILD_TIMESTAMP=1779647723
+  cargo:rustc-env=GAM_BUILD_TIMESTAMP=1779648063
   cargo:rerun-if-changed=build.rs
   cargo:rerun-if-changed=src/terms/penalties
   cargo:rerun-if-changed=/Users/user/gam/Cargo.toml
@@ -17192,584 +17192,293 @@ Caused by:
 
   --- stderr
 
-  error: 629 ban violations across 6 rules
+  error: 338 ban violations across 3 rules
 
-  ── debug_assert!  (90 hits)
-    src/linalg/matrix.rs:225: debug_assert!(
-    src/linalg/matrix.rs:530: debug_assert!(
-    src/linalg/matrix.rs:652: debug_assert!(
-    src/linalg/matrix.rs:788: debug_assert!(
-    src/linalg/matrix.rs:1408: debug_assert!(
-    src/linalg/matrix.rs:1485: debug_assert!(
-    src/linalg/matrix.rs:1769: debug_assert!(
-    src/linalg/matrix.rs:4790: debug_assert!(
-    src/linalg/matrix.rs:5138: debug_assert!(
-    src/terms/sae_manifold.rs:1483: debug_assert!(sum.is_finite() && sum > 0.0);
-    src/terms/analytic_penalties.rs:688: debug_assert!(
-    src/terms/analytic_penalties.rs:1417: debug_assert!(k_atoms > 0);
-    src/terms/analytic_penalties.rs:1418: debug_assert!(temperature > 0.0);
-    src/terms/analytic_penalties.rs:1623: debug_assert!(k_max > 0);
-    src/terms/analytic_penalties.rs:1624: debug_assert!(alpha.is_finite() && alpha > 0.0);
-    src/terms/analytic_penalties.rs:1625: debug_assert!(tau.is_finite() && tau > 0.0);
-    src/terms/analytic_penalties.rs:1900: debug_assert!(n > 1.0, "Hoyer requires n > 1");
-    src/terms/analytic_penalties.rs:1934: debug_assert!(n > 1.0, "Hoyer requires n > 1");
-    src/terms/analytic_penalties.rs:2061: debug_assert!(n > 1.0, "Hoyer requires n > 1");
-    src/terms/analytic_penalties.rs:2198: debug_assert!(latent_dim > 0, "ARDPenalty requires latent_dim > 0");
-    src/terms/analytic_penalties.rs:7252: debug_assert!(
-    src/terms/construction.rs:317: debug_assert!(rotated_eigenvalues.len() >= cols);
-    src/terms/basis.rs:4253: debug_assert!(i < self.data.nrows() && j < self.centers.nrows());
-    src/terms/basis.rs:7653: debug_assert!(
-    src/terms/basis.rs:25685: debug_assert!(m >= 1, "stable_hybrid_duchon_radial: m ≥ 1");
-    src/terms/basis.rs:25686: debug_assert!(s >= 1, "stable_hybrid_duchon_radial: s ≥ 1");
-    src/terms/basis.rs:25687: debug_assert!(kappa > 0.0, "stable_hybrid_duchon_radial: κ > 0");
-    src/terms/basis.rs:25688: debug_assert!(r > 0.0, "stable_hybrid_duchon_radial: r > 0");
-    src/terms/basis.rs:25689: debug_assert!(
-    src/terms/basis.rs:25693: debug_assert!(
-    src/terms/basis.rs:26062: debug_assert!(b >= 1);
-    src/terms/basis.rs:26063: debug_assert!(
-    src/terms/basis.rs:26067: debug_assert!(r > 0.0, "matern kernel derivative requires r > 0: r={r}");
-    src/terms/basis.rs:26068: debug_assert!(
-    src/terms/basis.rs:26741: debug_assert!(
-    src/terms/atom_codes.rs:84: debug_assert!(
-    src/terms/atom_codes.rs:95: debug_assert!(
-    src/terms/atom_codes.rs:177: debug_assert!(k < self.k_atoms());
-    src/terms/atom_codes.rs:184: debug_assert!(k < self.k_atoms());
-    src/terms/smooth.rs:13244: debug_assert!(local_implicit_first_unused.is_none());
-    src/terms/smooth.rs:13245: debug_assert!(local_implicit_second_unused.is_none());
-    src/terms/atom_selection.rs:441: debug_assert!(s > 0.0);
-    src/solver/arrow_schur.rs:2811: debug_assert!(block < beta_block_offsets.len());
-    src/solver/riemannian.rs:309: debug_assert!((v[0] * p[0] + v[1] * p[1]).abs() < 1.0e-9);
-    src/solver/riemannian.rs:319: debug_assert!(
-    src/solver/riemannian.rs:327: debug_assert!((out[0] * out[0] + out[1] * out[1] - 1.0).abs() < 1.0e-9);
-    src/solver/riemannian.rs:408: debug_assert!(chk.abs() < 1.0e-8 * (1.0 + p.len() as f64));
-    src/solver/riemannian.rs:422: debug_assert!(
-    src/solver/riemannian.rs:435: debug_assert!(
-    src/solver/riemannian.rs:610: debug_assert!(
-    src/solver/riemannian.rs:691: debug_assert!(
-    src/solver/riemannian.rs:701: debug_assert!((n2 - 1.0).abs() < 1.0e-9);
-    src/solver/reml/runtime.rs:1962: debug_assert!(rows <= gram.nrows());
-    src/solver/reml/runtime.rs:1963: debug_assert!(cols <= gram.ncols());
-    src/solver/reml/runtime.rs:9359: debug_assert!(ext_dim > 0);
-    src/solver/reml/unified.rs:491: debug_assert!(self.logdet_traces_match_hinv_kernel());
-    src/solver/reml/unified.rs:1963: debug_assert!(start + cols <= dim);
-    src/solver/reml/unified.rs:2491: debug_assert!(end <= self.matrix.ncols());
-    src/solver/reml/unified.rs:3519: debug_assert!(start + cols <= self.p);
-    src/solver/reml/unified.rs:6232: debug_assert!(col < design.ncols());
-    src/solver/latent_inner.rs:195: debug_assert!(opts.lm_grow > 1.0, "LM ridge grow factor must exceed 1");
-    src/solver/latent_inner.rs:196: debug_assert!(
-    src/inference/quadrature.rs:896: debug_assert!(sigma > 0.0);
-    src/inference/quadrature.rs:897: debug_assert!(target_accuracy > 0.0);
-    src/inference/quadrature.rs:3254: debug_assert!(max_order <= 5);
-    src/inference/data.rs:1237: debug_assert!(is_string_col[j]);
-    src/inference/data.rs:1243: debug_assert!(!is_string_col[j]);
-    src/inference/alo.rs:1155: debug_assert!(
-    src/inference/alo.rs:1172: debug_assert!(
-    src/families/custom_family.rs:8464: debug_assert!(
-    src/families/custom_family.rs:18285: debug_assert!(s_lambdas.len() <= ranges.len());
-    src/families/custom_family.rs:18322: debug_assert!(start >= cursor);
-    src/families/custom_family.rs:18323: debug_assert!(end >= start);
-    src/families/bernoulli_marginal_slope.rs:708: debug_assert!(!sorted_z.is_empty());
-    src/families/bernoulli_marginal_slope.rs:3930: debug_assert!(
-    src/families/bernoulli_marginal_slope.rs:4469: debug_assert!(
-    src/families/bernoulli_marginal_slope.rs:8504: debug_assert!(
-    src/families/cubic_cell_kernel.rs:1888: debug_assert!(out.len() >= len);
-    src/families/cubic_cell_kernel.rs:3107: debug_assert!(
-    src/families/bernoulli_marginal_slope/deviation_runtime.rs:886: debug_assert!(
-    src/families/marginal_slope_shared.rs:423: debug_assert!(direction_adjoint.len() > self.primary_index);
-    src/families/marginal_slope_shared.rs:512: debug_assert!(direction_adjoint.len() > self.primary_index);
-    src/families/marginal_slope_shared.rs:598: debug_assert!(direction_adjoint.len() > self.primary_index);
-    src/families/gamlss.rs:4855: debug_assert!(z >= 0.0);
-    src/families/gamlss.rs:8604: debug_assert!(start + cols <= self.dim);
-    src/families/gamlss.rs:8687: debug_assert!(start + cols <= self.dim);
-    src/families/gamlss.rs:14056: debug_assert!(e_clamped.is_finite());
-    src/families/gamlss.rs:14057: debug_assert!((e_clamped.exp() - m).abs() <= 1.0e-8 * m.abs().max(1.0));
-    src/families/latent_survival.rs:2749: debug_assert!(
-    src/families/latent_survival.rs:2753: debug_assert!(
+  ── underscore-prefixed fn parameter (use the value, restructure the API, or delete the param)  (281 hits)
+    tests/autodiff_custom_family_joint_laml.rs:215: fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    tests/autodiff_custom_family_joint_laml.rs:274: _: &[ParameterBlockState],
+    tests/autodiff_custom_family_joint_laml.rs:281: _: &[ParameterBlockState],
+    tests/autodiff_custom_family_joint_laml.rs:282: _: usize,
+    tests/autodiff_custom_family_joint_laml.rs:283: _: &Array1<f64>,
+    tests/autodiff_custom_family_joint_laml.rs:290: _: &[ParameterBlockState],
+    tests/autodiff_custom_family_joint_laml.rs:291: _: &Array1<f64>,
+    tests/autodiff_custom_family_joint_laml.rs:298: _: &[ParameterBlockState],
+    tests/autodiff_custom_family_joint_laml.rs:300: _: &ParameterBlockSpec,
+    tests/autodiff_custom_family_joint_laml.rs:367: fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    tests/autodiff_custom_family_pseudo_laplace.rs:42: _: &[ParameterBlockState],
+    tests/autodiff_custom_family_pseudo_laplace.rs:49: _: &[ParameterBlockState],
+    tests/autodiff_custom_family_pseudo_laplace.rs:50: _: usize,
+    tests/autodiff_custom_family_pseudo_laplace.rs:51: _: &Array1<f64>,
+    tests/autodiff_custom_family_pseudo_laplace.rs:58: _: &[ParameterBlockState],
+    tests/autodiff_custom_family_pseudo_laplace.rs:59: _: &Array1<f64>,
+    tests/autodiff_custom_family_pseudo_laplace.rs:92: _: &[ParameterBlockState],
+    tests/autodiff_custom_family_pseudo_laplace.rs:93: _: usize,
+    tests/autodiff_custom_family_pseudo_laplace.rs:94: _: &Array1<f64>,
+    tests/autodiff_custom_family_pseudo_laplace.rs:101: _: &[ParameterBlockState],
+    tests/autodiff_custom_family_pseudo_laplace.rs:108: _: &[ParameterBlockState],
+    tests/autodiff_custom_family_pseudo_laplace.rs:109: _: &Array1<f64>,
+    tests/autodiff_custom_family_pseudo_laplace.rs:117: _: &[ParameterBlockSpec],
+    tests/autodiff_custom_family_pseudo_laplace.rs:118: _: &[Vec<CustomFamilyBlockPsiDerivative>],
+    tests/autodiff_custom_family_pseudo_laplace.rs:119: _: usize,
+    tests/autodiff_binomial_location_scale_exact.rs:218: fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    tests/autodiff_binomial_location_scale_exact.rs:521: fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    tests/autodiff_binomial_location_scale_exact.rs:577: fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    tests/autodiff_binomial_location_scale_exact.rs:636: fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    tests/autodiff_sas_hypergradient_localization.rs:247: fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    tests/autodiff_sas_hypergradient_localization.rs:284: fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    tests/autodiff_gaussian_location_scale_exact.rs:166: fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    tests/autodiff_gaussian_location_scale_exact.rs:385: fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    tests/autodiff_crosscheck.rs:110: fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    tests/autodiff_crosscheck.rs:148: fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    tests/autodiff_crosscheck_extended.rs:255: fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    tests/autodiff_crosscheck_extended.rs:288: fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    tests/autodiff_crosscheck_extended.rs:321: fn call(&self, inputs: &[T], _: bool) -> Vec<T> {
+    src/terms/smooth.rs:12853: _family: LikelihoodFamily,
+    src/terms/smooth.rs:12854: _design: &TermCollectionDesign,
+    src/terms/atom_selection.rs:494: _: &SparseAtomCode,
+    src/terms/atom_selection.rs:513: _: &SparsityPenalty,
+    src/terms/atom_selection.rs:515: _: ArrayView1<'_, f64>,
+    src/terms/atom_selection.rs:611: _: ArrayView1<'_, f64>,
+    src/terms/atom_selection.rs:622: _: &SparsityPenalty,
+    src/terms/atom_selection.rs:624: _: ArrayView1<'_, f64>,
+    src/solver/reml/unified.rs:380: _: u64,
+    src/solver/reml/unified.rs:381: _: Option<&Arc<Mutex<StochasticTraceState>>>,
+    src/solver/reml/unified.rs:855: _: &Array1<f64>,
+    src/solver/reml/unified.rs:856: _: &Array1<f64>,
+    src/solver/reml/unified.rs:857: _: &Array1<f64>,
+    src/solver/reml/unified.rs:1026: _: &Array1<f64>,
+    src/solver/reml/unified.rs:1941: fn trace_projected_factor_cached(&self, factor: &Array2<f64>, _: &ProjectedFactorCache) -> f64 {
+    src/solver/reml/unified.rs:1961: _: &ProjectedFactorCache,
+    src/solver/reml/unified.rs:17633: _: &Array1<f64>,
+    src/solver/reml/unified.rs:19522: _: &Array1<f64>,
+    src/solver/reml/unified.rs:19529: _: &Array1<f64>,
+    src/solver/reml/unified.rs:19530: _: &Array1<f64>,
+    src/solver/reml/unified.rs:19531: _: &Array1<f64>,
+    src/solver/reml/unified.rs:19609: _: &Array1<f64>,
+    src/solver/pirls.rs:554: _: &Array1<f64>,
+    src/solver/pirls.rs:555: _: &LinearPredictor,
+    src/solver/pirls.rs:1013: pub fn new(n: usize, p: usize, _: usize, _: usize) -> Self {
+    src/solver/pirls.rs:1013: pub fn new(n: usize, p: usize, _: usize, _: usize) -> Self {
+    src/solver/pirls.rs:10125: _: &InverseLink,
+    src/solver/latent_inner.rs:495: _: ArrayView1<'_, f64>,
+    src/solver/latent_inner.rs:496: _: &LatentCoordValues,
+    src/solver/latent_inner.rs:512: _: ArrayView1<'_, f64>,
+    src/solver/latent_inner.rs:513: _: &LatentCoordValues,
+    src/solver/outer_strategy.rs:1681: fn eval_efs(&mut self, _: &Array1<f64>) -> Result<EfsEval, EstimationError> {
+    src/solver/outer_strategy.rs:8929: fn seed_inner_state(&mut self, _: &Array1<f64>) -> Result<(), EstimationError> {
+    src/inference/predict.rs:763: _: &PredictInput,
+    src/inference/predict.rs:2929: _: &PredictInput,
+    src/inference/predict.rs:3450: _: &PredictInput,
+    src/inference/predict.rs:3458: _: &UnifiedFitResult,
+    src/inference/predict.rs:3995: _: &PredictInput,
+    src/inference/predict.rs:4003: _: &UnifiedFitResult,
+    src/inference/predict.rs:4185: _: &PredictInput,
+    src/families/custom_family.rs:1561: _: &BlockwiseFitOptions,
+    src/families/custom_family.rs:1665: _: &[ParameterBlockState],
+    src/families/custom_family.rs:1709: _: &[ParameterBlockState],
+    src/families/custom_family.rs:1710: _: usize,
+    src/families/custom_family.rs:1711: _: &ParameterBlockSpec,
+    src/families/custom_family.rs:1712: _: &Array1<f64>,
+    src/families/custom_family.rs:1720: _: &[ParameterBlockState],
+    src/families/custom_family.rs:1721: _: usize,
+    src/families/custom_family.rs:1722: _: &ParameterBlockSpec,
+    src/families/custom_family.rs:1744: _: &[ParameterBlockState],
+    src/families/custom_family.rs:1745: _: usize,
+    src/families/custom_family.rs:1746: _: &Array1<f64>,
+    src/families/custom_family.rs:1755: _: &[ParameterBlockState],
+    src/families/custom_family.rs:1756: _: usize,
+    src/families/custom_family.rs:1757: _: &ParameterBlockSpec,
+    src/families/custom_family.rs:1774: _: &[ParameterBlockState],
+    src/families/custom_family.rs:1775: _: usize,
+    src/families/custom_family.rs:1776: _: &Array1<f64>,
+    src/families/custom_family.rs:1793: _: &[ParameterBlockState],
+    src/families/custom_family.rs:1794: _: usize,
+    src/families/custom_family.rs:1795: _: &Array1<f64>,
+    src/families/custom_family.rs:1796: _: &Array1<f64>,
+    src/families/custom_family.rs:1837: _: &[ParameterBlockState],
+    src/families/custom_family.rs:1838: _: &[ParameterBlockSpec],
+    src/families/custom_family.rs:1888: _: &[ParameterBlockState],
+    src/families/custom_family.rs:1889: _: &[ParameterBlockSpec],
+    src/families/custom_family.rs:2244: _: &[ParameterBlockState],
+    src/families/custom_family.rs:2263: _: &[ParameterBlockSpec],
+    src/families/custom_family.rs:2288: _: &[ParameterBlockSpec],
+    src/families/custom_family.rs:2470: _: &[ParameterBlockState],
+    src/families/custom_family.rs:2471: _: usize,
+    src/families/custom_family.rs:2472: _: &Array1<f64>,
+    src/families/custom_family.rs:2490: _: &[ParameterBlockState],
+    src/families/custom_family.rs:2491: _: usize,
+    src/families/custom_family.rs:2492: _: &Array1<f64>,
+    src/families/custom_family.rs:2493: _: &Array1<f64>,
+    src/families/custom_family.rs:2526: _: &[ParameterBlockState],
+    src/families/custom_family.rs:2527: _: &[ParameterBlockSpec],
+    src/families/custom_family.rs:2528: _: &[Vec<CustomFamilyBlockPsiDerivative>],
+    src/families/custom_family.rs:2529: _: usize,
+    src/families/custom_family.rs:2547: _: &[ParameterBlockState],
+    src/families/custom_family.rs:2548: _: &[ParameterBlockSpec],
+    src/families/custom_family.rs:2549: _: &[Vec<CustomFamilyBlockPsiDerivative>],
+    src/families/custom_family.rs:2550: _: usize,
+    src/families/custom_family.rs:2551: _: usize,
+    src/families/custom_family.rs:2568: _: &[ParameterBlockState],
+    src/families/custom_family.rs:2569: _: &[ParameterBlockSpec],
+    src/families/custom_family.rs:2570: _: &[Vec<CustomFamilyBlockPsiDerivative>],
+    src/families/custom_family.rs:2625: _: &[ParameterBlockState],
+    src/families/custom_family.rs:2626: _: &[ParameterBlockSpec],
+    src/families/custom_family.rs:2627: _: &[Vec<CustomFamilyBlockPsiDerivative>],
+    src/families/custom_family.rs:2628: _: usize,
+    src/families/custom_family.rs:2629: _: &Array1<f64>,
+    src/families/custom_family.rs:4093: _: usize,
+    src/families/custom_family.rs:4102: _: usize,
+    src/families/custom_family.rs:4111: _: usize,
+    src/families/custom_family.rs:4124: _: usize,
+    src/families/custom_family.rs:4125: _: usize,
+    src/families/custom_family.rs:4138: _: usize,
+    src/families/custom_family.rs:4151: _: usize,
+    src/families/custom_family.rs:4152: _: usize,
+    src/families/custom_family.rs:4165: _: usize,
+    src/families/custom_family.rs:4177: _: usize,
+    src/families/custom_family.rs:4196: _: usize,
+    src/families/custom_family.rs:4208: _: usize,
+    src/families/custom_family.rs:4209: _: usize,
+    src/families/custom_family.rs:6120: fn hessian_matvec(&self, _: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+    src/families/custom_family.rs:6201: _: &Array1<f64>,
+    src/families/custom_family.rs:6202: _: &Array1<f64>,
+    src/families/custom_family.rs:6223: fn first_order_terms(&self, _: usize) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+    src/families/custom_family.rs:20101: fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+    src/families/custom_family.rs:20108: fn outer_hyper_hessian_hvp_available(&self, _: &[ParameterBlockSpec]) -> bool {
+    src/families/custom_family.rs:20114: _: &[ParameterBlockSpec],
+    src/families/custom_family.rs:21247: fn directional_derivative(&self, _: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+    src/families/custom_family.rs:21383: fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+    src/families/custom_family.rs:21396: _: usize,
+    src/families/custom_family.rs:21397: _: usize,
+    src/families/custom_family.rs:21405: _: &Array1<f64>,
+    src/families/custom_family.rs:21468: _: &[ParameterBlockSpec],
+    src/families/custom_family.rs:21469: _: &BlockwiseFitOptions,
+    src/families/custom_family.rs:21525: _: usize,
+    src/families/custom_family.rs:21849: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22291: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22292: _: usize,
+    src/families/custom_family.rs:22300: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22301: _: usize,
+    src/families/custom_family.rs:22303: _: &Array1<f64>,
+    src/families/custom_family.rs:22340: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22342: _: &ParameterBlockSpec,
+    src/families/custom_family.rs:22358: fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+    src/families/custom_family.rs:22370: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22372: _: &ParameterBlockSpec,
+    src/families/custom_family.rs:22388: fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+    src/families/custom_family.rs:22400: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22402: _: &ParameterBlockSpec,
+    src/families/custom_family.rs:22445: fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+    src/families/custom_family.rs:22457: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22458: _: usize,
+    src/families/custom_family.rs:22459: _: &Array1<f64>,
+    src/families/custom_family.rs:22469: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22476: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22477: _: &Array1<f64>,
+    src/families/custom_family.rs:22517: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22524: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22525: _: &Array1<f64>,
+    src/families/custom_family.rs:22532: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22534: _: &ParameterBlockSpec,
+    src/families/custom_family.rs:22581: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22590: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22592: _: &Array1<f64>,
+    src/families/custom_family.rs:22600: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22602: _: &Array1<f64>,
+    src/families/custom_family.rs:22603: _: &Array1<f64>,
+    src/families/custom_family.rs:22643: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22650: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22651: _: usize,
+    src/families/custom_family.rs:22652: _: &Array1<f64>,
+    src/families/custom_family.rs:22659: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22660: _: &Array1<f64>,
+    src/families/custom_family.rs:22670: fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+    src/families/custom_family.rs:22686: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22693: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22694: _: usize,
+    src/families/custom_family.rs:22695: _: &Array1<f64>,
+    src/families/custom_family.rs:22702: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22703: _: &Array1<f64>,
+    src/families/custom_family.rs:22710: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22711: _: &[ParameterBlockSpec],
+    src/families/custom_family.rs:22712: _: &[Vec<CustomFamilyBlockPsiDerivative>],
+    src/families/custom_family.rs:22713: _: usize,
+    src/families/custom_family.rs:22728: fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+    src/families/custom_family.rs:22744: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22780: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22790: fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+    src/families/custom_family.rs:22815: _: &[ParameterBlockState],
+    src/families/custom_family.rs:22816: _: &[ParameterBlockSpec],
+    src/families/custom_family.rs:25041: _: &[ParameterBlockState],
+    src/families/custom_family.rs:25048: _: &[ParameterBlockState],
+    src/families/custom_family.rs:25049: _: &Array1<f64>,
+    src/families/survival.rs:431: _: &[ParameterBlockState],
+    src/families/bernoulli_marginal_slope.rs:14824: _: &BlockwiseFitOptions,
+    src/families/bernoulli_marginal_slope.rs:15185: _: &[ParameterBlockSpec],
+    src/families/bernoulli_marginal_slope.rs:15216: _: &[ParameterBlockSpec],
+    src/families/bernoulli_marginal_slope.rs:15237: _: &[ParameterBlockSpec],
+    src/families/bernoulli_marginal_slope.rs:15359: _: &[ParameterBlockSpec],
+    src/families/bernoulli_marginal_slope.rs:15388: _: &[ParameterBlockSpec],
+    src/families/bernoulli_marginal_slope.rs:15473: _: &ParameterBlockSpec,
+    src/families/survival_marginal_slope.rs:16358: _: &[ParameterBlockSpec],
+    src/families/survival_marginal_slope.rs:16392: _: &[ParameterBlockSpec],
+    src/families/survival_marginal_slope.rs:16413: _: &[ParameterBlockSpec],
+    src/families/survival_marginal_slope.rs:16575: _: &[ParameterBlockSpec],
+    src/families/survival_marginal_slope.rs:16594: _: &[ParameterBlockSpec],
+    src/families/survival_marginal_slope.rs:16656: _: &[ParameterBlockState],
+    src/families/survival_marginal_slope.rs:16658: _: &ParameterBlockSpec,
+    src/families/survival_marginal_slope.rs:16695: _: &ParameterBlockSpec,
+    src/families/transformation_normal.rs:7959: _: &[ParameterBlockSpec],
+    src/families/transformation_normal.rs:8129: _: &[ParameterBlockState],
+    src/families/transformation_normal.rs:8131: _: &ParameterBlockSpec,
+    src/families/transformation_normal.rs:8196: _: &[ParameterBlockSpec],
+    src/families/transformation_normal.rs:8237: _: &[ParameterBlockSpec],
+    src/families/transformation_normal.rs:8343: _: &[ParameterBlockSpec],
+    src/families/transformation_normal.rs:8652: fn directional_derivative(&self, _: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+    src/families/transformation_normal.rs:8682: _: &Array1<f64>,
+    src/families/transformation_normal.rs:8683: _: &Array1<f64>,
+    src/families/survival_location_scale.rs:8885: _: &[ParameterBlockState],
+    src/families/survival_location_scale.rs:8919: _: &[ParameterBlockState],
+    src/families/survival_location_scale.rs:8921: _: &ParameterBlockSpec,
+    src/families/row_kernel.rs:1400: fn row_kernel(&self, _: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
+    src/families/gamlss.rs:2165: fn augment_result_designs(&self, _: &mut TermCollectionDesign, _: &mut TermCollectionDesign) {}
+    src/families/gamlss.rs:2165: fn augment_result_designs(&self, _: &mut TermCollectionDesign, _: &mut TermCollectionDesign) {}
+    src/families/gamlss.rs:2169: _: ndarray::ArrayView2<'_, f64>,
+    src/families/gamlss.rs:2170: _: &TermCollectionSpec,
+    src/families/gamlss.rs:2171: _: &TermCollectionSpec,
+    src/families/gamlss.rs:2172: _: &TermCollectionDesign,
+    src/families/gamlss.rs:2173: _: &TermCollectionDesign,
+    src/families/gamlss.rs:2956: _: &mut TermCollectionDesign,
+    src/families/gamlss.rs:3116: _: &mut TermCollectionDesign,
+    src/families/gamlss.rs:4210: fn binomial_neglog_q_fourth_derivative_logit_closed_form(_: f64, weight: f64, q: f64) -> f64 {
+    src/families/gamlss.rs:5526: _: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
+    src/families/gamlss.rs:5564: _: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
+    src/families/gamlss.rs:11333: _: &[ParameterBlockState],
+    src/families/gamlss.rs:11345: _: &[ParameterBlockState],
+    src/families/gamlss.rs:11347: _: &ParameterBlockSpec,
+    src/families/gamlss.rs:12871: _: &[ParameterBlockState],
+    src/families/gamlss.rs:12883: _: &[ParameterBlockState],
+    src/families/gamlss.rs:12885: _: &ParameterBlockSpec,
+    src/families/gamlss.rs:16502: _: &BlockwiseFitOptions,
+    src/families/gamlss.rs:16735: _: &[ParameterBlockState],
+    src/families/gamlss.rs:16736: _: usize,
+    src/families/gamlss.rs:16737: _: &Array1<f64>,
+    src/families/gamlss.rs:17070: _: &BlockwiseFitOptions,
+    src/families/gamlss.rs:17071: _: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    src/families/gamlss.rs:20405: _: &[ParameterBlockState],
+    src/families/gamlss.rs:20417: _: &[ParameterBlockState],
+    src/families/gamlss.rs:20419: _: &ParameterBlockSpec,
+    src/families/latent_survival.rs:3578: _: &[ParameterBlockState],
+    src/families/latent_survival.rs:3580: _: &ParameterBlockSpec,
+    src/families/latent_survival.rs:3600: _: &[ParameterBlockSpec],
+    src/families/latent_survival.rs:3611: _: &[ParameterBlockSpec],
+    src/families/latent_survival.rs:3806: _: &[ParameterBlockState],
+    src/families/latent_survival.rs:3808: _: &ParameterBlockSpec,
+    src/families/latent_survival.rs:3828: _: &[ParameterBlockSpec],
+    src/families/latent_survival.rs:3839: _: &[ParameterBlockSpec],
 
-  ── debug_assert_eq!  (436 hits)
-    tests/aniso_population_calibration.rs:98: debug_assert_eq!(start, n);
-    tests/no_production_finite_differences.rs:89: debug_assert_eq!(bytes[open_brace], b'{');
-    src/linalg/matrix.rs:355: debug_assert_eq!(
-    src/linalg/matrix.rs:5148: debug_assert_eq!(self.values.len(), other.len());
-    src/linalg/matrix.rs:6406: debug_assert_eq!(self.ncols(), other.ncols());
-    src/linalg/matrix.rs:6407: debug_assert_eq!(out.len(), self.ncols());
-    src/linalg/faer_ndarray.rs:220: debug_assert_eq!(out.nrows(), p, "output rows must match p");
-    src/linalg/faer_ndarray.rs:221: debug_assert_eq!(out.ncols(), p, "output cols must match p");
-    src/linalg/faer_ndarray.rs:282: debug_assert_eq!(n_a, n_b, "A and B must have same number of rows");
-    src/linalg/faer_ndarray.rs:321: debug_assert_eq!(
-    src/linalg/faer_ndarray.rs:385: debug_assert_eq!(p, v.len(), "A cols must match v length");
-    src/linalg/faer_ndarray.rs:429: debug_assert_eq!(v.len(), p, "vector length must match A cols");
-    src/linalg/faer_ndarray.rs:430: debug_assert_eq!(out.len(), n, "output length must match A rows");
-    src/linalg/faer_ndarray.rs:472: debug_assert_eq!(v.len(), p, "vector length must match A cols");
-    src/linalg/faer_ndarray.rs:473: debug_assert_eq!(out.len(), n, "output length must match A rows");
-    src/linalg/faer_ndarray.rs:526: debug_assert_eq!(n, v.len(), "A rows must match v length");
-    src/linalg/faer_ndarray.rs:579: debug_assert_eq!(v.len(), n, "vector length must match A rows");
-    src/linalg/faer_ndarray.rs:580: debug_assert_eq!(out.len(), p, "output length must match A cols");
-    src/linalg/faer_ndarray.rs:649: debug_assert_eq!(n, w.len(), "X rows must match W length");
-    src/linalg/faer_ndarray.rs:779: debug_assert_eq!(n, w.len(), "Y rows must match W length");
-    src/linalg/faer_ndarray.rs:780: debug_assert_eq!(n, x.nrows(), "X rows must match Y rows");
-    src/linalg/faer_ndarray.rs:911: debug_assert_eq!(n, x_b.nrows());
-    src/linalg/faer_ndarray.rs:912: debug_assert_eq!(n, w_aa.len());
-    src/linalg/faer_ndarray.rs:913: debug_assert_eq!(n, w_ab.len());
-    src/linalg/faer_ndarray.rs:914: debug_assert_eq!(n, w_bb.len());
-    src/linalg/faer_ndarray.rs:1133: debug_assert_eq!(p, p_b, "A and B must have compatible inner dimensions");
-    src/linalg/faer_ndarray.rs:1134: debug_assert_eq!(out.dim(), (n, q), "output dimensions must match A*B result");
-    src/linalg/utils.rs:172: debug_assert_eq!(regularized.nrows(), p);
-    src/linalg/utils.rs:360: debug_assert_eq!(n, matrix.ncols());
-    src/terms/analytic_penalties.rs:787: debug_assert_eq!(p, *p_out);
-    src/terms/analytic_penalties.rs:819: debug_assert_eq!(p, *p_out);
-    src/terms/analytic_penalties.rs:868: debug_assert_eq!(source.centers.ncols(), d);
-    src/terms/analytic_penalties.rs:869: debug_assert_eq!(source.radial_coefficients.nrows(), n_centers);
-    src/terms/analytic_penalties.rs:870: debug_assert_eq!(source.radial_coefficients.ncols(), self.p_out);
-    src/terms/analytic_penalties.rs:934: debug_assert_eq!(source.centers.ncols(), d);
-    src/terms/analytic_penalties.rs:935: debug_assert_eq!(source.radial_coefficients.nrows(), n_centers);
-    src/terms/analytic_penalties.rs:936: debug_assert_eq!(source.radial_coefficients.ncols(), self.p_out);
-    src/terms/analytic_penalties.rs:1168: debug_assert_eq!(jac.ncols(), p * latent_dim);
-    src/terms/analytic_penalties.rs:1201: debug_assert_eq!(a.nrows(), n_obs);
-    src/terms/analytic_penalties.rs:1202: debug_assert_eq!(a.ncols(), d * d);
-    src/terms/analytic_penalties.rs:1271: debug_assert_eq!(jac2.ncols(), p * d * d);
-    src/terms/analytic_penalties.rs:2759: debug_assert_eq!(
-    src/terms/analytic_penalties.rs:3042: debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-    src/terms/analytic_penalties.rs:3199: debug_assert_eq!(
-    src/terms/analytic_penalties.rs:3407: debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-    src/terms/analytic_penalties.rs:3598: debug_assert_eq!(
-    src/terms/analytic_penalties.rs:3740: debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-    src/terms/analytic_penalties.rs:4073: debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-    src/terms/analytic_penalties.rs:4268: debug_assert_eq!(
-    src/terms/analytic_penalties.rs:4438: debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-    src/terms/analytic_penalties.rs:4656: debug_assert_eq!(
-    src/terms/analytic_penalties.rs:4821: debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-    src/terms/analytic_penalties.rs:5037: debug_assert_eq!(
-    src/terms/analytic_penalties.rs:5221: debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-    src/terms/analytic_penalties.rs:5600: debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-    src/terms/analytic_penalties.rs:5774: debug_assert_eq!(
-    src/terms/analytic_penalties.rs:5823: debug_assert_eq!(cross_right_left.dim(), (right_axes.len(), left_axes.len()));
-    src/terms/analytic_penalties.rs:5842: debug_assert_eq!(v.dim(), t.dim(), "hvp matrix dimension mismatch");
-    src/terms/analytic_penalties.rs:5962: debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-    src/terms/analytic_penalties.rs:6102: debug_assert_eq!(
-    src/terms/analytic_penalties.rs:6151: debug_assert_eq!(v.dim(), t.dim(), "hvp matrix dimension mismatch");
-    src/terms/analytic_penalties.rs:6152: debug_assert_eq!(m.dim(), (d, d), "precomputed gram dimension mismatch");
-    src/terms/analytic_penalties.rs:6191: debug_assert_eq!(m.dim(), (d, d), "precomputed gram dimension mismatch");
-    src/terms/analytic_penalties.rs:6271: debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-    src/terms/analytic_penalties.rs:7036: debug_assert_eq!(a.len(), b.len());
-    src/terms/construction.rs:210: debug_assert_eq!(rows, cols, "Matrix must be square for sanitization");
-    src/terms/construction.rs:838: debug_assert_eq!(prior_mean.len(), p);
-    src/terms/construction.rs:1041: debug_assert_eq!(canonical[i].local.dim(), canonical[j].local.dim());
-    src/terms/basis.rs:4177: debug_assert_eq!(dim, self.data.ncols());
-    src/terms/basis.rs:4178: debug_assert_eq!(dim, self.centers.ncols());
-    src/terms/basis.rs:4218: debug_assert_eq!(s_buf.len(), dim);
-    src/terms/basis.rs:4228: debug_assert_eq!(s_buf.len(), 1);
-    src/terms/basis.rs:5520: debug_assert_eq!(u.nrows(), self.p_out());
-    src/terms/basis.rs:11591: debug_assert_eq!(values.len(), lower_triangular_len(k));
-    src/terms/basis.rs:14820: debug_assert_eq!(lhs.ncols(), rhs.ncols());
-    src/terms/basis.rs:14840: debug_assert_eq!(lhs.ncols(), rhs.ncols());
-    src/terms/basis.rs:14841: debug_assert_eq!(lhs.ncols(), axis_scales.len());
-    src/terms/basis.rs:14852: debug_assert_eq!(matrix.nrows(), matrix.ncols());
-    src/terms/basis.rs:16302: debug_assert_eq!(p_buf.len(), l_cap * l_cap);
-    src/terms/basis.rs:16303: debug_assert_eq!(norms.len(), l_cap * l_cap);
-    src/terms/basis.rs:21784: debug_assert_eq!(d, y.len());
-    src/terms/basis.rs:21785: debug_assert_eq!(d, periodic_per_axis.len());
-    src/terms/basis.rs:21786: debug_assert_eq!(d, periods.len());
-    src/terms/basis.rs:26316: debug_assert_eq!(self.b.len(), dim);
-    src/terms/basis.rs:26317: debug_assert_eq!(self.b2.len(), dim);
-    src/terms/basis.rs:26318: debug_assert_eq!(self.b3.len(), dim);
-    src/terms/basis.rs:37532: debug_assert_eq!(d % 2, 1);
-    src/terms/latent_coord.rs:244: debug_assert_eq!(t.len(), *dim);
-    src/terms/latent_coord.rs:266: debug_assert_eq!(offset, t.len());
-    src/terms/latent_coord.rs:274: debug_assert_eq!(t.len(), xi.len());
-    src/terms/latent_coord.rs:289: debug_assert_eq!(t.len(), *dim);
-    src/terms/latent_coord.rs:318: debug_assert_eq!(offset, t.len());
-    src/terms/latent_coord.rs:330: debug_assert_eq!(t.len(), v.len());
-    src/terms/latent_coord.rs:334: debug_assert_eq!(t.len(), *dim);
-    src/terms/latent_coord.rs:366: debug_assert_eq!(offset, v.len());
-    src/terms/latent_coord.rs:386: debug_assert_eq!(t.len(), eg.len());
-    src/terms/latent_coord.rs:387: debug_assert_eq!(t.len(), xi.len());
-    src/terms/latent_coord.rs:388: debug_assert_eq!(eh.nrows(), t.len());
-    src/terms/latent_coord.rs:389: debug_assert_eq!(eh.ncols(), t.len());
-    src/terms/latent_coord.rs:401: debug_assert_eq!(t.len(), eg.len());
-    src/terms/latent_coord.rs:402: debug_assert_eq!(t.len(), xi.len());
-    src/terms/latent_coord.rs:403: debug_assert_eq!(t.len(), eh_xi.len());
-    src/terms/latent_coord.rs:409: debug_assert_eq!(t.len(), *dim);
-    src/terms/latent_coord.rs:439: debug_assert_eq!(offset, t.len());
-    src/terms/latent_coord.rs:492: debug_assert_eq!(t.len(), *dim);
-    src/terms/latent_coord.rs:700: debug_assert_eq!(
-    src/terms/latent_coord.rs:795: debug_assert_eq!(flat.len(), self.values.len());
-    src/terms/latent_coord.rs:802: debug_assert_eq!(delta.len(), self.values.len());
-    src/terms/latent_coord.rs:822: debug_assert_eq!(self.manifold.ambient_dim(self.latent_dim), self.latent_dim);
-    src/terms/latent_coord.rs:966: debug_assert_eq!(a.len(), b.len());
-    src/terms/latent_coord.rs:975: debug_assert_eq!(a.ncols(), x.len());
-    src/terms/penalty_op.rs:74: debug_assert_eq!(
-    src/terms/penalty_op.rs:218: debug_assert_eq!(m.nrows(), m.ncols());
-    src/terms/smooth.rs:884: debug_assert_eq!(col_range.len(), local.nrows());
-    src/terms/smooth.rs:885: debug_assert_eq!(col_range.len(), local.ncols());
-    src/terms/smooth.rs:932: debug_assert_eq!(col_range.len(), local.nrows());
-    src/terms/smooth.rs:933: debug_assert_eq!(col_range.len(), local.ncols());
-    src/terms/smooth.rs:979: debug_assert_eq!(penalties.len(), lambdas.len());
-    src/terms/smooth.rs:1937: debug_assert_eq!(
-    src/terms/smooth.rs:2163: debug_assert_eq!(term_indices.len(), dims_per_term.len());
-    src/terms/smooth.rs:2216: debug_assert_eq!(term_indices.len(), self.dims_per_term.len());
-    src/terms/smooth.rs:2258: debug_assert_eq!(self.values.len(), lower.values.len());
-    src/terms/smooth.rs:2259: debug_assert_eq!(self.values.len(), upper.values.len());
-    src/terms/smooth.rs:6160: debug_assert_eq!(
-    src/terms/smooth.rs:6165: debug_assert_eq!(
-    src/terms/smooth.rs:6470: debug_assert_eq!(
-    src/terms/smooth.rs:6475: debug_assert_eq!(
-    src/terms/smooth.rs:7139: debug_assert_eq!(
-    src/terms/smooth.rs:7144: debug_assert_eq!(
-    src/terms/smooth.rs:18928: debug_assert_eq!(
-    src/terms/atom_selection.rs:278: debug_assert_eq!(decoder_outputs.len(), code.k_atoms());
-    src/terms/atom_selection.rs:282: debug_assert_eq!(decoder_outputs[k].len(), p);
-    src/terms/atom_selection.rs:310: debug_assert_eq!(decoder_outputs[kk].len(), p);
-    src/solver/arrow_schur.rs:407: debug_assert_eq!(left.ncols(), k);
-    src/solver/arrow_schur.rs:408: debug_assert_eq!(right.ncols(), k);
-    src/solver/arrow_schur.rs:409: debug_assert_eq!(schur.ncols(), k);
-    src/solver/arrow_schur.rs:430: debug_assert_eq!(row.htt.dim(), (d, d), "row {row_idx} H_tt shape != (d,d)");
-    src/solver/arrow_schur.rs:803: debug_assert_eq!(diag.len(), k);
-    src/solver/arrow_schur.rs:858: debug_assert_eq!(diag.len(), self.k);
-    src/solver/arrow_schur.rs:967: debug_assert_eq!(latent.n_obs(), self.rows.len());
-    src/solver/arrow_schur.rs:968: debug_assert_eq!(latent.latent_dim(), self.d);
-    src/solver/arrow_schur.rs:1126: debug_assert_eq!(hbb.dim(), (k, k));
-    src/solver/arrow_schur.rs:1127: debug_assert_eq!(gb.len(), k);
-    src/solver/arrow_schur.rs:1329: debug_assert_eq!(target.len(), expected_target_len);
-    src/solver/arrow_schur.rs:1337: debug_assert_eq!(diag.len(), expected_target_len);
-    src/solver/arrow_schur.rs:1550: debug_assert_eq!(delta_beta.len(), self.k);
-    src/solver/arrow_schur.rs:1585: debug_assert_eq!(db.len(), self.k);
-    src/solver/arrow_schur.rs:1588: debug_assert_eq!(dg.len(), n * d);
-    src/solver/arrow_schur.rs:1659: debug_assert_eq!(delta_gt.len(), n * d);
-    src/solver/arrow_schur.rs:1660: debug_assert_eq!(
-    src/solver/arrow_schur.rs:1923: debug_assert_eq!(delta_t.len(), sys.rows.len() * sys.d);
-    src/solver/arrow_schur.rs:1924: debug_assert_eq!(delta_beta.len(), sys.k);
-    src/solver/arrow_schur.rs:2014: debug_assert_eq!(sys.rows[i].gt.len(), d);
-    src/solver/arrow_schur.rs:2015: debug_assert_eq!(sys.rows[i].htbeta.dim(), (d, k));
-    src/solver/arrow_schur.rs:2075: debug_assert_eq!(point_flat.len(), n * row_ambient_dim);
-    src/solver/arrow_schur.rs:2076: debug_assert_eq!(delta_t.len(), n * row_ambient_dim);
-    src/solver/arrow_schur.rs:2123: debug_assert_eq!(row.htbeta.dim(), (d, k));
-    src/solver/arrow_schur.rs:2260: debug_assert_eq!(row.htbeta.dim(), (d, k));
-    src/solver/arrow_schur.rs:2535: debug_assert_eq!(a.len(), b.len());
-    src/solver/arrow_schur.rs:2538: debug_assert_eq!(weights.len(), a.len());
-    src/solver/arrow_schur.rs:2553: debug_assert_eq!(weights.len(), v.len());
-    src/solver/arrow_schur.rs:2738: debug_assert_eq!(out.len(), k + nt);
-    src/solver/evidence.rs:504: debug_assert_eq!(a.len(), b.len());
-    src/solver/evidence.rs:890: debug_assert_eq!(m_i.shape(), &[d, d]);
-    src/solver/evidence.rs:909: debug_assert_eq!(da.shape(), &[k, k]);
-    src/solver/riemannian_retraction.rs:14: debug_assert_eq!(base.len(), tangent.len());
-    src/solver/riemannian_retraction.rs:29: debug_assert_eq!(base.len(), 1);
-    src/solver/riemannian_retraction.rs:30: debug_assert_eq!(tangent.len(), 1);
-    src/solver/riemannian_retraction.rs:45: debug_assert_eq!(base.len(), self.dim);
-    src/solver/riemannian_retraction.rs:46: debug_assert_eq!(tangent.len(), self.dim);
-    src/solver/riemannian_retraction.rs:77: debug_assert_eq!(base.len(), tangent.len());
-    src/solver/riemannian_retraction.rs:86: debug_assert_eq!(offset, base.len());
-    src/solver/latent_cache.rs:84: debug_assert_eq!(base.len(), tangent.len());
-    src/solver/riemannian.rs:124: debug_assert_eq!(p.len(), self.ambient_dim());
-    src/solver/riemannian.rs:125: debug_assert_eq!(xi.len(), eta.len());
-    src/solver/riemannian.rs:126: debug_assert_eq!(xi.len(), p.len());
-    src/solver/riemannian.rs:128: debug_assert_eq!(weights.len(), xi.len());
-    src/solver/riemannian.rs:165: debug_assert_eq!(p.len(), self.ambient_dim());
-    src/solver/riemannian.rs:252: debug_assert_eq!(p.len(), self.d);
-    src/solver/riemannian.rs:253: debug_assert_eq!(v.len(), self.d);
-    src/solver/riemannian.rs:256: debug_assert_eq!(p.len(), self.d);
-    src/solver/riemannian.rs:257: debug_assert_eq!(xi.len(), self.d);
-    src/solver/riemannian.rs:263: debug_assert_eq!(from.len(), self.d);
-    src/solver/riemannian.rs:264: debug_assert_eq!(to.len(), self.d);
-    src/solver/riemannian.rs:265: debug_assert_eq!(xi.len(), self.d);
-    src/solver/riemannian.rs:274: debug_assert_eq!(p.len(), self.d);
-    src/solver/riemannian.rs:275: debug_assert_eq!(egrad.len(), self.d);
-    src/solver/riemannian.rs:276: debug_assert_eq!(ehess_vp.len(), self.d);
-    src/solver/riemannian.rs:277: debug_assert_eq!(xi.len(), self.d);
-    src/solver/riemannian.rs:302: debug_assert_eq!(p.len(), 2);
-    src/solver/riemannian.rs:303: debug_assert_eq!(v.len(), 2);
-    src/solver/riemannian.rs:332: debug_assert_eq!(from.len(), 2);
-    src/solver/riemannian.rs:349: debug_assert_eq!(p.len(), 2);
-    src/solver/riemannian.rs:350: debug_assert_eq!(egrad.len(), 2);
-    src/solver/riemannian.rs:351: debug_assert_eq!(ehess_vp.len(), 2);
-    src/solver/riemannian.rs:352: debug_assert_eq!(xi.len(), 2);
-    src/solver/riemannian.rs:361: debug_assert_eq!(p.len(), 2);
-    src/solver/riemannian.rs:393: debug_assert_eq!(p.len(), self.n + 1);
-    src/solver/riemannian.rs:394: debug_assert_eq!(v.len(), self.n + 1);
-    src/solver/riemannian.rs:447: debug_assert_eq!(from.len(), self.n + 1);
-    src/solver/riemannian.rs:463: debug_assert_eq!(p.len(), self.n + 1);
-    src/solver/riemannian.rs:464: debug_assert_eq!(egrad.len(), self.n + 1);
-    src/solver/riemannian.rs:465: debug_assert_eq!(ehess_vp.len(), self.n + 1);
-    src/solver/riemannian.rs:466: debug_assert_eq!(xi.len(), self.n + 1);
-    src/solver/riemannian.rs:487: debug_assert_eq!(p.len(), m);
-    src/solver/riemannian.rs:595: debug_assert_eq!(p.len(), 1);
-    src/solver/riemannian.rs:596: debug_assert_eq!(v.len(), 1);
-    src/solver/riemannian.rs:606: debug_assert_eq!(p.len(), 1);
-    src/solver/riemannian.rs:607: debug_assert_eq!(xi.len(), 1);
-    src/solver/riemannian.rs:608: debug_assert_eq!(out.len(), 1);
-    src/solver/riemannian.rs:616: debug_assert_eq!(from.len(), 1);
-    src/solver/riemannian.rs:617: debug_assert_eq!(to.len(), 1);
-    src/solver/riemannian.rs:618: debug_assert_eq!(xi.len(), 1);
-    src/solver/riemannian.rs:627: debug_assert_eq!(p.len(), 1);
-    src/solver/riemannian.rs:628: debug_assert_eq!(egrad.len(), 1);
-    src/solver/riemannian.rs:629: debug_assert_eq!(ehess_vp.len(), 1);
-    src/solver/riemannian.rs:630: debug_assert_eq!(xi.len(), 1);
-    src/solver/riemannian.rs:645: debug_assert_eq!(p.len(), 1);
-    src/solver/riemannian.rs:706: debug_assert_eq!(from.len(), 2 * self.d);
-    src/solver/riemannian.rs:734: debug_assert_eq!(p.len(), 2 * self.d);
-    src/solver/riemannian.rs:844: debug_assert_eq!(qc.nrows(), mc);
-    src/solver/riemannian.rs:845: debug_assert_eq!(qc.ncols(), dc);
-    src/solver/riemannian.rs:952: debug_assert_eq!(point.len(), m);
-    src/solver/riemannian.rs:953: debug_assert_eq!(delta.len(), m);
-    src/solver/estimate.rs:275: debug_assert_eq!(m.ncols(), p);
-    src/solver/estimate.rs:279: debug_assert_eq!(matrix.ncols(), p);
-    src/solver/estimate.rs:341: debug_assert_eq!(m.nrows(), p_total);
-    src/solver/estimate.rs:345: debug_assert_eq!(matrix.nrows(), p_total);
-    src/solver/estimate.rs:3199: debug_assert_eq!(
-    src/solver/reml/hyper.rs:120: debug_assert_eq!(v.len(), self.p);
-    src/solver/reml/hyper.rs:260: debug_assert_eq!(v.len(), self.p);
-    src/solver/reml/hyper.rs:328: debug_assert_eq!(v.len(), self.p);
-    src/solver/reml/hyper.rs:356: debug_assert_eq!(factor.nrows(), self.p);
-    src/solver/reml/hyper.rs:394: debug_assert_eq!(v.len(), self.p);
-    src/solver/reml/unified.rs:3379: debug_assert_eq!(v.len(), out.len());
-    src/solver/reml/unified.rs:3497: debug_assert_eq!(v.len(), self.p);
-    src/solver/reml/unified.rs:3581: debug_assert_eq!(v.len(), self.p);
-    src/solver/reml/unified.rs:3582: debug_assert_eq!(u.len(), self.p);
-    src/solver/reml/unified.rs:3653: debug_assert_eq!(factor.nrows(), self.p);
-    src/solver/reml/unified.rs:3678: debug_assert_eq!(factor.nrows(), self.p);
-    src/solver/reml/unified.rs:3749: debug_assert_eq!(xf.dim(), (n_obs, rank));
-    src/solver/reml/unified.rs:3820: debug_assert_eq!(xf.dim(), (n_obs, rank));
-    src/solver/reml/unified.rs:3890: debug_assert_eq!(x_col.len(), c.len());
-    src/solver/reml/unified.rs:3891: debug_assert_eq!(n_work.len(), c.len());
-    src/solver/reml/unified.rs:3892: debug_assert_eq!(p_work.len(), self.p);
-    src/solver/reml/unified.rs:3994: debug_assert_eq!(z.len(), self.p);
-    src/solver/reml/unified.rs:3995: debug_assert_eq!(out.len(), self.p);
-    src/solver/reml/unified.rs:3996: debug_assert_eq!(n_work.len(), self.w_diag.len());
-    src/solver/reml/unified.rs:3997: debug_assert_eq!(p_work.len(), self.p);
-    src/solver/reml/unified.rs:4067: debug_assert_eq!(v.len(), self.p);
-    src/solver/reml/unified.rs:4325: debug_assert_eq!(beta.len(), self.dim());
-    src/solver/reml/unified.rs:4350: debug_assert_eq!(beta.len(), self.dim());
-    src/solver/reml/unified.rs:4362: debug_assert_eq!(beta.len(), self.dim());
-    src/solver/reml/unified.rs:4363: debug_assert_eq!(out.len(), self.dim());
-    src/solver/reml/unified.rs:4374: debug_assert_eq!(beta.len(), self.dim());
-    src/solver/reml/unified.rs:4375: debug_assert_eq!(out.len(), self.dim());
-    src/solver/reml/unified.rs:4440: debug_assert_eq!(
-    src/solver/reml/unified.rs:4606: debug_assert_eq!(
-    src/solver/reml/unified.rs:4965: debug_assert_eq!(self.u_s.nrows(), p);
-    src/solver/reml/unified.rs:4966: debug_assert_eq!(self.h_proj_inverse.nrows(), r);
-    src/solver/reml/unified.rs:4967: debug_assert_eq!(self.h_proj_inverse.ncols(), r);
-    src/solver/reml/unified.rs:6151: debug_assert_eq!(matrix.ncols(), x.len());
-    src/solver/reml/unified.rs:6152: debug_assert_eq!(matrix.nrows(), out.len());
-    src/solver/reml/unified.rs:6165: debug_assert_eq!(matrix.ncols(), x.len());
-    src/solver/reml/unified.rs:6166: debug_assert_eq!(matrix.nrows(), out.len());
-    src/solver/reml/unified.rs:6181: debug_assert_eq!(matrix.nrows(), x.len());
-    src/solver/reml/unified.rs:6182: debug_assert_eq!(matrix.ncols(), out.len());
-    src/solver/reml/unified.rs:6194: debug_assert_eq!(matrix.nrows(), x.len());
-    src/solver/reml/unified.rs:6195: debug_assert_eq!(matrix.ncols(), out.len());
-    src/solver/reml/unified.rs:6212: debug_assert_eq!(matrix.ncols(), v.len());
-    src/solver/reml/unified.rs:6213: debug_assert_eq!(matrix.nrows(), u.len());
-    src/solver/reml/unified.rs:6233: debug_assert_eq!(design.nrows(), output.len());
-    src/solver/reml/unified.rs:6262: debug_assert_eq!(design.ncols(), vector.len());
-    src/solver/reml/unified.rs:6263: debug_assert_eq!(design.nrows(), output.len());
-    src/solver/reml/unified.rs:6296: debug_assert_eq!(design.nrows(), vector.len());
-    src/solver/reml/unified.rs:6297: debug_assert_eq!(design.ncols(), output.len());
-    src/solver/reml/unified.rs:6324: debug_assert_eq!(left.nrows(), left.ncols());
-    src/solver/reml/unified.rs:6325: debug_assert_eq!(left.raw_dim(), right.raw_dim());
-    src/solver/reml/unified.rs:6513: debug_assert_eq!(out.nrows(), p, "penalty coord dim mismatch");
-    src/solver/reml/unified.rs:6514: debug_assert_eq!(out.ncols(), p, "penalty coord dim mismatch");
-    src/solver/reml/unified.rs:7384: debug_assert_eq!(col_idx, total_cols);
-    src/solver/reml/unified.rs:10214: debug_assert_eq!(v.len(), out.len());
-    src/solver/reml/unified.rs:10229: debug_assert_eq!(v.len(), test.len());
-    src/solver/reml/unified.rs:11640: debug_assert_eq!(
-    src/solver/reml/unified.rs:11719: debug_assert_eq!(gradient.len(), total);
-    src/solver/reml/unified.rs:11720: debug_assert_eq!(steps.len(), total);
-    src/solver/reml/unified.rs:11899: debug_assert_eq!(
-    src/solver/reml/unified.rs:13818: debug_assert_eq!(block.nrows(), block.ncols());
-    src/solver/reml/unified.rs:13989: debug_assert_eq!(block.nrows(), end - start);
-    src/solver/reml/unified.rs:14052: debug_assert_eq!(block.nrows(), end - start);
-    src/solver/reml/unified.rs:14398: debug_assert_eq!(local.nrows(), end - start);
-    src/solver/reml/unified.rs:14422: debug_assert_eq!(block.nrows(), end - start);
-    src/solver/reml/unified.rs:14436: debug_assert_eq!(block.nrows(), end - start);
-    src/solver/reml/unified.rs:16532: debug_assert_eq!(q.dim(), (p, m));
-    src/solver/reml/unified.rs:16610: debug_assert_eq!(op.dim(), p, "Hutch++: operator dim mismatch");
-    src/solver/reml/unified.rs:16722: debug_assert_eq!(op.dim(), p, "Hutch++ squared: operator dim mismatch");
-    src/solver/reml/unified.rs:16836: debug_assert_eq!(left.dim(), p, "cross trace: left operator dim mismatch");
-    src/solver/reml/unified.rs:16837: debug_assert_eq!(right.dim(), p, "cross trace: right operator dim mismatch");
-    src/solver/reml/firth.rs:84: debug_assert_eq!(out.nrows(), scale.len());
-    src/solver/reml/firth.rs:143: debug_assert_eq!(eta.len(), w.len());
-    src/solver/reml/firth.rs:144: debug_assert_eq!(eta.len(), w1.len());
-    src/solver/reml/firth.rs:145: debug_assert_eq!(eta.len(), w2.len());
-    src/solver/reml/firth.rs:146: debug_assert_eq!(eta.len(), w3.len());
-    src/solver/reml/firth.rs:147: debug_assert_eq!(eta.len(), w4.len());
-    src/solver/reml/firth.rs:189: debug_assert_eq!(left.nrows(), right.nrows());
-    src/solver/reml/firth.rs:190: debug_assert_eq!(left.nrows(), weights.len());
-    src/solver/reml/firth.rs:195: debug_assert_eq!(a.nrows(), b.ncols());
-    src/solver/reml/firth.rs:196: debug_assert_eq!(a.ncols(), b.nrows());
-    src/solver/reml/firth.rs:340: debug_assert_eq!(p, gram.ncols());
-    src/solver/reml/firth.rs:380: debug_assert_eq!(diag.len(), matrix.nrows());
-    src/solver/reml/firth.rs:381: debug_assert_eq!(matrix.nrows(), matrix.ncols());
-    src/solver/reml/firth.rs:665: debug_assert_eq!(
-    src/solver/reml/firth.rs:968: debug_assert_eq!(a.nrows(), b.nrows());
-    src/solver/reml/firth.rs:969: debug_assert_eq!(a.ncols(), b.ncols());
-    src/solver/reml/firth.rs:987: debug_assert_eq!(a.nrows(), b.nrows());
-    src/solver/reml/firth.rs:988: debug_assert_eq!(a.ncols(), m.nrows());
-    src/solver/reml/firth.rs:989: debug_assert_eq!(b.ncols(), m.ncols());
-    src/solver/reml/penalty_logdet.rs:523: debug_assert_eq!(
-    src/solver/reml/penalty_logdet.rs:895: debug_assert_eq!(local_end - local_start, penalty.local.nrows());
-    src/solver/reml/assembly.rs:48: debug_assert_eq!(x.nrows(), scale.len(), "scale length must match row count");
-    src/solver/reml/assembly.rs:122: debug_assert_eq!(left.nrows(), right.nrows());
-    src/solver/reml/assembly.rs:123: debug_assert_eq!(left.nrows(), weights.len());
-    src/solver/reml/assembly.rs:168: debug_assert_eq!(diag.len(), n, "diag length must match row count");
-    src/solver/active_set.rs:39: debug_assert_eq!(a.nrows(), b.len(), "paired constraint shape invariant");
-    src/solver/pirls.rs:1074: debug_assert_eq!(
-    src/solver/pirls.rs:1560: debug_assert_eq!(vector.len(), self.p);
-    src/solver/pirls.rs:1630: debug_assert_eq!(out.len(), data.len());
-    src/solver/pirls.rs:2780: debug_assert_eq!(self.xtwx_dense.dim(), (p, p));
-    src/solver/pirls.rs:2860: debug_assert_eq!(weights.len(), n);
-    src/solver/pirls.rs:2861: debug_assert_eq!(self.sqrt_weights.len(), n);
-    src/solver/pirls.rs:2936: debug_assert_eq!(acc.nrows(), acc.ncols());
-    src/solver/pirls.rs:4984: debug_assert_eq!(arrow_cfg.n_beta, beta.as_ref().len());
-    src/solver/pirls.rs:7867: debug_assert_eq!(
-    src/solver/pirls.rs:11297: debug_assert_eq!(delta_t.len(), n * d);
-    src/solver/latent_inner.rs:447: debug_assert_eq!(delta_t.len(), sys.rows.len() * sys.d);
-    src/solver/latent_inner.rs:448: debug_assert_eq!(delta_beta.len(), sys.k);
-    src/inference/vector_predict.rs:149: debug_assert_eq!(y.dim(), y_hat.dim());
-    src/inference/hmc.rs:1234: debug_assert_eq!(residual.len(), n);
-    src/inference/hmc.rs:1275: debug_assert_eq!(residual.len(), n);
-    src/inference/hmc.rs:1337: debug_assert_eq!(residual.len(), n);
-    src/inference/hmc.rs:1388: debug_assert_eq!(weighted_residual.len(), n);
-    src/inference/hmc.rs:3281: debug_assert_eq!(l.nrows(), p);
-    src/inference/hmc.rs:3282: debug_assert_eq!(l.ncols(), p);
-    src/inference/hmc.rs:3283: debug_assert_eq!(out.len(), p);
-    src/inference/sample.rs:349: debug_assert_eq!(l.nrows(), p);
-    src/inference/sample.rs:350: debug_assert_eq!(l.ncols(), p);
-    src/inference/sample.rs:351: debug_assert_eq!(out.len(), p);
-    src/geometry/manifold.rs:138: debug_assert_eq!(a.len(), b.len());
-    src/families/custom_family.rs:242: debug_assert_eq!(target.len(), p_left * p_right);
-    src/families/custom_family.rs:720: debug_assert_eq!(base_prior_idx, base_count);
-    src/families/custom_family.rs:6166: debug_assert_eq!(
-    src/families/custom_family.rs:18284: debug_assert_eq!(out.len(), vector.len());
-    src/families/custom_family.rs:18538: debug_assert_eq!(residual.len(), beta.len());
-    src/families/bernoulli_marginal_slope.rs:707: debug_assert_eq!(sorted_z.len(), weighted_cdf.len());
-    src/families/bernoulli_marginal_slope.rs:1921: debug_assert_eq!(new_p, k_kept);
-    src/families/bernoulli_marginal_slope.rs:1922: debug_assert_eq!(new_design.nrows(), n);
-    src/families/bernoulli_marginal_slope.rs:4180: debug_assert_eq!(psi_row.len(), p);
-    src/families/bernoulli_marginal_slope.rs:4181: debug_assert_eq!(self.h_mm.nrows(), p);
-    src/families/bernoulli_marginal_slope.rs:4182: debug_assert_eq!(self.h_mm.ncols(), p);
-    src/families/bernoulli_marginal_slope.rs:4205: debug_assert_eq!(self.h_mg.nrows(), pm);
-    src/families/bernoulli_marginal_slope.rs:4206: debug_assert_eq!(self.h_mg.ncols(), pl);
-    src/families/bernoulli_marginal_slope.rs:4231: debug_assert_eq!(self.h_mg.nrows(), pm);
-    src/families/bernoulli_marginal_slope.rs:4232: debug_assert_eq!(self.h_mg.ncols(), pl);
-    src/families/bernoulli_marginal_slope.rs:4250: debug_assert_eq!(psi_row.len(), p);
-    src/families/bernoulli_marginal_slope.rs:4251: debug_assert_eq!(self.h_gg.nrows(), p);
-    src/families/bernoulli_marginal_slope.rs:4252: debug_assert_eq!(self.h_gg.ncols(), p);
-    src/families/bernoulli_marginal_slope.rs:5148: debug_assert_eq!(jf_marg.dim(), (n_rows, rank));
-    src/families/bernoulli_marginal_slope.rs:5149: debug_assert_eq!(jf_logs.dim(), (n_rows, rank));
-    src/families/bernoulli_marginal_slope.rs:15856: debug_assert_eq!(third.ncols(), r);
-    src/families/bernoulli_marginal_slope.rs:15857: debug_assert_eq!(gram.len(), r * r);
-    src/families/cubic_cell_kernel.rs:3085: debug_assert_eq!(out.len(), max_degree + 1);
-    src/families/cubic_cell_kernel.rs:3233: debug_assert_eq!(GL_NODES.len(), GL_WEIGHTS.len());
-    src/families/survival_marginal_slope.rs:3565: debug_assert_eq!(self.score_covariance.dim(), self.z.ncols());
-    src/families/survival_marginal_slope.rs:16944: debug_assert_eq!(
-    src/families/transformation_normal.rs:340: debug_assert_eq!(h.len(), n);
-    src/families/transformation_normal.rs:341: debug_assert_eq!(h_lower.len(), n);
-    src/families/transformation_normal.rs:342: debug_assert_eq!(h_upper.len(), n);
-    src/families/transformation_normal.rs:343: debug_assert_eq!(weights.len(), n);
-    src/families/transformation_normal.rs:905: debug_assert_eq!(x_val_kron.ncols(), p_total);
-    src/families/transformation_normal.rs:906: debug_assert_eq!(x_deriv_kron.ncols(), p_total);
-    src/families/transformation_normal.rs:1101: debug_assert_eq!(x_val_kron.ncols(), p_total);
-    src/families/transformation_normal.rs:1102: debug_assert_eq!(x_deriv_kron.ncols(), p_total);
-    src/families/transformation_normal.rs:8744: debug_assert_eq!(v.len(), self.p_total());
-    src/families/transformation_normal.rs:8749: debug_assert_eq!(factor.nrows(), self.p_total());
-    src/families/transformation_normal.rs:8761: debug_assert_eq!(factor.nrows(), self.p_total());
-    src/families/transformation_normal.rs:8781: debug_assert_eq!(factor.nrows(), self.p_total());
-    src/families/transformation_normal.rs:8863: debug_assert_eq!(v.len(), self.p_total());
-    src/families/transformation_normal.rs:8868: debug_assert_eq!(factor.nrows(), self.p_total());
-    src/families/transformation_normal.rs:8996: debug_assert_eq!(factor.nrows(), self.dim());
-    src/families/transformation_normal.rs:9045: debug_assert_eq!(chunk_traces.len(), traces.len());
-    src/families/transformation_normal.rs:9073: debug_assert_eq!(factor.nrows(), self.dim());
-    src/families/transformation_normal.rs:9085: debug_assert_eq!(out.nrows(), p);
-    src/families/transformation_normal.rs:9086: debug_assert_eq!(out.ncols(), k);
-    src/families/transformation_normal.rs:9091: debug_assert_eq!(factor.nrows(), self.dim());
-    src/families/transformation_normal.rs:9234: debug_assert_eq!(factor.nrows(), self.p_total());
-    src/families/transformation_normal.rs:9288: debug_assert_eq!(factor.nrows(), self.p_total());
-    src/families/transformation_normal.rs:9294: debug_assert_eq!(table.dim(), (n, 2 * projected_len));
-    src/families/transformation_normal.rs:9388: debug_assert_eq!(v.len(), self.p_total());
-    src/families/transformation_normal.rs:9393: debug_assert_eq!(factor.nrows(), self.p_total());
-    src/families/transformation_normal.rs:9398: debug_assert_eq!(factor.nrows(), self.p_total());
-    src/families/transformation_normal.rs:9421: debug_assert_eq!(factor.nrows(), self.p_total());
-    src/families/transformation_normal.rs:9565: debug_assert_eq!(factor.nrows(), self.p_total());
-    src/families/transformation_normal.rs:9622: debug_assert_eq!(factor.nrows(), self.p_total());
-    src/families/transformation_normal.rs:9683: debug_assert_eq!(v.len(), self.p_total());
-    src/families/transformation_normal.rs:9688: debug_assert_eq!(v.len(), self.p_total());
-    src/families/transformation_normal.rs:9689: debug_assert_eq!(u.len(), self.p_total());
-    src/families/transformation_normal.rs:9711: debug_assert_eq!(factor.nrows(), self.p_total());
-    src/families/transformation_normal.rs:9743: debug_assert_eq!(factor.nrows(), self.p_total());
-    src/families/transformation_normal.rs:10118: debug_assert_eq!(beta.len(), pa * pb);
-    src/families/transformation_normal.rs:10165: debug_assert_eq!(beta.len(), pa * pb);
-    src/families/transformation_normal.rs:10214: debug_assert_eq!(v.len(), n);
-    src/families/transformation_normal.rs:10739: debug_assert_eq!(n, w.len());
-    src/families/row_kernel.rs:672: debug_assert_eq!(factor.nrows(), self.p);
-    src/families/row_kernel.rs:695: debug_assert_eq!(factor.nrows(), self.p);
-    src/families/row_kernel.rs:741: debug_assert_eq!(factor.nrows(), self.p);
-    src/families/row_kernel.rs:777: debug_assert_eq!(jf.dim(), (n_rows, K * rank));
-    src/families/row_kernel.rs:809: debug_assert_eq!(left.len(), right.len());
-    src/families/row_kernel.rs:951: debug_assert_eq!(jf.dim(), (n_rows, K * rank));
-    src/families/row_kernel.rs:1048: debug_assert_eq!(factor.nrows(), self.p);
-    src/families/row_kernel.rs:1066: debug_assert_eq!(factor.nrows(), self.p);
-    src/families/row_kernel.rs:1130: debug_assert_eq!(jf.dim(), (n_rows, K * rank));
-    src/families/vector_response.rs:242: debug_assert_eq!(eta.dim(), y.dim());
-    src/families/vector_response.rs:243: debug_assert_eq!(eta.ncols(), self.precision.len());
-    src/families/vector_response.rs:278: debug_assert_eq!(eta.dim(), y.dim());
-    src/families/marginal_slope_shared.rs:1214: debug_assert_eq!(
-    src/families/gamlss.rs:8495: debug_assert_eq!(grams.nrows(), self.nrows);
-    src/families/gamlss.rs:8496: debug_assert_eq!(grams.ncols(), self.pair_coeffs.len());
-    src/families/gamlss.rs:8514: debug_assert_eq!(v.len(), self.dim);
-    src/families/gamlss.rs:8524: debug_assert_eq!(ch.design.ncols(), width);
-    src/families/gamlss.rs:8668: debug_assert_eq!(v.len(), self.dim);
-    src/families/gamlss.rs:8673: debug_assert_eq!(u_a.len(), self.nrows);
-    src/families/gamlss.rs:8674: debug_assert_eq!(u_b.len(), self.nrows);
-    src/families/gamlss.rs:8846: debug_assert_eq!(grams.nrows(), self.nrows);
-    src/families/gamlss.rs:8847: debug_assert_eq!(grams.ncols(), 3);
-    src/families/gamlss.rs:13077: debug_assert_eq!(h_eta_eta.nrows(), p_eta);
-    src/families/gamlss.rs:13078: debug_assert_eq!(h_ww.nrows(), pw);
-
-  ── debug_assert_ne!  (1 hit)
-    src/terms/basis.rs:10055: debug_assert_ne!(axis_i, axis_j);
-
-  ── underscore-prefixed fn parameter (use the value, restructure the API, or delete the param)  (24 hits)
-    src/terms/smooth.rs:12843: _family: LikelihoodFamily,
-    src/terms/smooth.rs:12844: _design: &TermCollectionDesign,
-    src/solver/reml/unified.rs:376: _probe_id: u64,
-    src/solver/reml/unified.rs:377: _trace_state: Option<&Arc<Mutex<StochasticTraceState>>>,
-    src/solver/reml/unified.rs:383: fn stochastic_trace_solve_multi(&self, rhs: &Array2<f64>, _rel_tol: f64) -> Array2<f64> {
-    src/solver/reml/unified.rs:1929: _cache: &ProjectedFactorCache,
-    src/solver/reml/unified.rs:1950: _cache: &ProjectedFactorCache,
-    src/main.rs:926: _args: &FitArgs,
-    src/families/monotone_root.rs:63: fn exact_root_degenerate(label: &str, a: f64, _fp: f64) -> Self {
-    src/families/transformation_normal.rs:8371: _specs: &[ParameterBlockSpec],
-    src/families/transformation_normal.rs:8400: _specs: &[ParameterBlockSpec],
-    src/families/transformation_normal.rs:8432: _specs: &[ParameterBlockSpec],
-    src/families/row_kernel.rs:273: fn jacobian_action_matrix(&self, _factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
-    src/families/vector_response.rs:312: fn hess_diag(&self, eta: ArrayView2<f64>, _y: ArrayView2<f64>) -> Array2<f64> {
-    src/families/gamlss.rs:5526: _subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
-    src/families/gamlss.rs:5564: _subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
-    src/families/gamlss.rs:13749: _d_beta_flat: &Array1<f64>,
-    src/families/gamlss.rs:13765: _d_beta_u_flat: &Array1<f64>,
-    src/families/gamlss.rs:13766: _d_beta_v_flat: &Array1<f64>,
-    src/families/gamlss.rs:17066: _options: &BlockwiseFitOptions,
-    src/families/gamlss.rs:17067: _hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-    src/families/gamlss.rs:17817: _d_beta_flat: &Array1<f64>,
-    src/families/gamlss.rs:17854: _d_beta_u_flat: &Array1<f64>,
-    src/families/gamlss.rs:17855: _d_beta_v_flat: &Array1<f64>,
-
-  ── #[cfg(test)] on src/ item (move into a private `#[cfg(test)] mod tests { ... }` / `mod test_support` / `mod tests_*` / `mod *_tests`, or delete the unused item — `#[cfg(test)]` is not a dead_code-lint escape hatch, regardless of visibility)  (75 hits)
+  ── #[cfg(test)] on src/ item (move into a private `#[cfg(test)] mod tests { ... }` / `mod test_support` / `mod tests_*` / `mod *_tests`, or delete the unused item — `#[cfg(test)]` is not a dead_code-lint escape hatch, regardless of visibility)  (56 hits)
     src/lib.rs:77: [pub mod testing] #[cfg(test)]
-    src/terms/basis.rs:9458: [fn matern_poly_terms(nu: MaternNu, a: f64) -> (f64, f64, f64)] #[cfg(test)]
-    src/terms/basis.rs:9485: [fn matern_kernel_radial_triplet(] #[cfg(test)]
-    src/terms/basis.rs:9668: [fn matern_aniso_radial_scalars(] #[cfg(test)]
-    src/terms/basis.rs:18796: [gradient_ratio: PsiTriplet,] #[cfg(test)]
-    src/terms/basis.rs:18798: [laplacian: PsiTriplet,] #[cfg(test)]
-    src/terms/basis.rs:18975: [fn duchon_laplacian_psi_triplet_from_jets(] #[cfg(test)]
-    src/terms/basis.rs:19000: [fn duchon_collision_operator_core_fromphi_rr(] #[cfg(test)]
-    src/terms/basis.rs:19270: [let (g_psi, g_psi_psi) = duchon_q_psi_triplet_from_jets(&jets, p_order, s_order,] #[cfg(test)]
-    src/terms/basis.rs:19272: [let (lap_psi, lap_psi_psi) =] #[cfg(test)]
-    src/terms/basis.rs:19284: [gradient_ratio: PsiTriplet] #[cfg(test)]
-    src/terms/basis.rs:19290: [laplacian: PsiTriplet] #[cfg(test)]
-    src/terms/basis.rs:19307: [let (gradient_ratio, laplacian) =] #[cfg(test)]
-    src/terms/basis.rs:19319: [gradient_ratio,] #[cfg(test)]
-    src/terms/basis.rs:19321: [laplacian,] #[cfg(test)]
-    src/terms/basis.rs:24131: [pub(super) fn evaluate_splines_at_point(] #[cfg(test)]
     src/terms/smooth.rs:2036: [pub(crate) fn lower_bounds_aniso(] #[cfg(test)]
     src/terms/smooth.rs:2049: [pub(crate) fn upper_bounds_aniso(] #[cfg(test)]
     src/terms/smooth.rs:7827: [magweight: Array1<f64>,] #[cfg(test)]
@@ -17798,19 +17507,15 @@ Caused by:
     src/solver/estimate.rs:4936: [pub(crate) fn new_for_test_unchecked(parts: UnifiedFitResultParts) -> Self] #[cfg(test)]
     src/solver/estimate.rs:5646: [pub(crate) fn try_compute_continuous_smoothness_order(] #[cfg(test)]
     src/solver/reml/unified.rs:173: [pub mod debug_stash] #[cfg(test)]
-    src/solver/reml/unified.rs:2066: [fn as_sparse_directional(&self) -> Option<&SparseDirectionalHyperOperator>] #[cfg(test)]
-    src/solver/reml/unified.rs:2204: [pub fn pending_waiters_for(&self, key: ProjectedFactorKey) -> usize] #[cfg(test)]
-    src/solver/reml/unified.rs:2222: [pub fn wait_for_subscriber(] #[cfg(test)]
-    src/solver/reml/unified.rs:4110: [fn as_sparse_directional(&self) -> Option<&SparseDirectionalHyperOperator>] #[cfg(test)]
-    src/solver/reml/unified.rs:7811: [let ext_stash_sink: std::sync::Arc<std::sync::Mutex<Option<debug_stash::TermStas] #[cfg(test)]
-    src/solver/reml/unified.rs:7814: [let ext_stash_sink_for_closure = ext_stash_sink.clone()] #[cfg(test)]
-    src/solver/reml/unified.rs:7891: [if incl_logdet_h] #[cfg(test)]
-    src/solver/reml/unified.rs:8005: [if let Some(stash) = ext_stash_sink] #[cfg(test)]
-    src/solver/reml/unified.rs:14577: [pub fn from_joint_hessian(joint_hessian: &Array2<f64>) -> Result<Self, String>] #[cfg(test)]
-    src/solver/reml/mod.rs:3351: [pub(crate) fn new(] #[cfg(test)]
-    src/solver/reml/mod.rs:3466: [pub(crate) fn single_penalty(] #[cfg(test)]
-    src/inference/quadrature.rs:1421: [fn cloglog_negative_tail_derivative(eta: f64) -> f64] #[cfg(test)]
-    src/inference/quadrature.rs:2174: [pub(crate) fn cloglog_posterior_meanwith_deriv_gamma_reference(] #[cfg(test)]
+    src/solver/reml/unified.rs:2077: [fn as_sparse_directional(&self) -> Option<&SparseDirectionalHyperOperator>] #[cfg(test)]
+    src/solver/reml/unified.rs:2215: [pub fn pending_waiters_for(&self, key: ProjectedFactorKey) -> usize] #[cfg(test)]
+    src/solver/reml/unified.rs:2233: [pub fn wait_for_subscriber(] #[cfg(test)]
+    src/solver/reml/unified.rs:4121: [fn as_sparse_directional(&self) -> Option<&SparseDirectionalHyperOperator>] #[cfg(test)]
+    src/solver/reml/unified.rs:7822: [let ext_stash_sink: std::sync::Arc<std::sync::Mutex<Option<debug_stash::TermStas] #[cfg(test)]
+    src/solver/reml/unified.rs:7825: [let ext_stash_sink_for_closure = ext_stash_sink.clone()] #[cfg(test)]
+    src/solver/reml/unified.rs:7902: [if incl_logdet_h] #[cfg(test)]
+    src/solver/reml/unified.rs:8016: [if let Some(stash) = ext_stash_sink] #[cfg(test)]
+    src/solver/reml/unified.rs:14588: [pub fn from_joint_hessian(joint_hessian: &Array2<f64>) -> Result<Self, String>] #[cfg(test)]
     src/inference/hmc.rs:685: [fn compute_logp_and_grad_nd(&self, z: &Array1<f64>) -> (f64, Array1<f64>)] #[cfg(test)]
     src/inference/hmc.rs:4257: [fn compute_logp_and_grad(&self, z: &Array1<f64>) -> (f64, Array1<f64>)] #[cfg(test)]
     src/inference/hmc.rs:5270: [fn compute_joint_logp_and_grad(&self, params: &Array1<f64>) -> (f64, Array1<f64>] #[cfg(test)]
@@ -17830,16 +17535,11 @@ Caused by:
     src/families/survival_marginal_slope.rs:18296: [mod survival_intercept_test_counter] #[cfg(test)]
     src/families/transformation_normal.rs:1329: [fn scop_endpoint_values(] #[cfg(test)]
 
-  ── stub function body (multi-arg function whose entire body is a sentinel like None/Ok(())/Default::default() — implement the function, return a real Result/Error, or delete the function)  (3 hits)
-    src/terms/smooth.rs:12842: fn exact_joint_spatial_outer_hessian_available(
-    src/solver/outer_strategy.rs:1700: fn seed_inner_state(&mut self, _beta: &Array1<f64>) -> Result<(), EstimationError> {
-    src/families/row_kernel.rs:273: fn jacobian_action_matrix(&self, _factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
+  ── stub function body (multi-arg function whose entire body is a sentinel like None/Ok(())/Default::default() — implement the function, return a real Result/Error, or delete the function)  (1 hit)
+    src/terms/smooth.rs:12852: fn exact_joint_spatial_outer_hessian_available(
 
   summary:
-       90  debug_assert!
-      436  debug_assert_eq!
-        1  debug_assert_ne!
-       24  underscore-prefixed fn parameter (use the value, restructure the API, or delete the param)
-       75  #[cfg(test)] on src/ item (move into a private `#[cfg(test)] mod tests { ... }` / `mod test_support` / `mod tests_*` / `mod *_tests`, or delete the unused item — `#[cfg(test)]` is not a dead_code-lint escape hatch, regardless of visibility)
-        3  stub function body (multi-arg function whose entire body is a sentinel like None/Ok(())/Default::default() — implement the function, return a real Result/Error, or delete the function)
+      281  underscore-prefixed fn parameter (use the value, restructure the API, or delete the param)
+       56  #[cfg(test)] on src/ item (move into a private `#[cfg(test)] mod tests { ... }` / `mod test_support` / `mod tests_*` / `mod *_tests`, or delete the unused item — `#[cfg(test)]` is not a dead_code-lint escape hatch, regardless of visibility)
+        1  stub function body (multi-arg function whose entire body is a sentinel like None/Ok(())/Default::default() — implement the function, return a real Result/Error, or delete the function)
 

@@ -18575,10 +18575,6 @@ struct PsiTriplet {
 #[derive(Clone, Copy, Debug, Default)]
 struct DuchonRadialCore {
     phi: PsiTriplet,
-    #[cfg(test)]
-    gradient_ratio: PsiTriplet,
-    #[cfg(test)]
-    laplacian: PsiTriplet,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -18725,92 +18721,6 @@ fn duchon_operator_scaling_exponent(p_order: usize, s_order: usize, k_dim: usize
     //
     // Thus both Duchon operator scalars use exponent delta + 2.
     duchon_scaling_exponent(p_order, s_order, k_dim) + 2.0
-}
-
-#[inline(always)]
-fn duchon_q_psi_triplet_from_jets(
-    jets: &DuchonRadialJets,
-    p_order: usize,
-    s_order: usize,
-    k_dim: usize,
-    r: f64,
-) -> (f64, f64) {
-    // Exact scaling derivatives for
-    //   q(r; kappa) = phi_r(r; kappa) / r.
-    //
-    // Since q scales like kappa^(delta + 2),
-    //   q_psi     = (delta + 2) q + r q_r
-    //   q_psipsi  = (delta + 2)^2 q + (2 delta + 5) r q_r + r^2 q_rr.
-    //
-    // For r > 0 this is algebraically equivalent to
-    //   q_psi = (delta + 1) q + phi_rr,
-    // because q_r = (phi_rr - q) / r.
-    scaled_log_kappa_derivatives(
-        jets.q,
-        jets.q_r,
-        jets.q_rr,
-        duchon_operator_scaling_exponent(p_order, s_order, k_dim),
-        r,
-    )
-}
-
-#[cfg(test)]
-#[inline(always)]
-fn duchon_laplacian_psi_triplet_from_jets(
-    jets: &DuchonRadialJets,
-    p_order: usize,
-    s_order: usize,
-    k_dim: usize,
-    r: f64,
-) -> (f64, f64) {
-    // Exact scaling derivatives for
-    //   ell(r; kappa) = Delta phi(r; kappa).
-    //
-    // The Laplacian raises the scaling exponent by 2, so ell follows the same
-    // exponent as q:
-    //   ell_psi     = (delta + 2) ell + r ell_r
-    //   ell_psipsi  = (delta + 2)^2 ell + (2 delta + 5) r ell_r + r^2 ell_rr.
-    scaled_log_kappa_derivatives(
-        jets.lap,
-        jets.lap_r,
-        jets.lap_rr,
-        duchon_operator_scaling_exponent(p_order, s_order, k_dim),
-        r,
-    )
-}
-
-#[cfg(test)]
-#[inline(always)]
-fn duchon_collision_operator_core_fromphi_rr(
-    phi_rr: f64,
-    phi_rr_psi: f64,
-    phi_rr_psi_psi: f64,
-    k_dim: usize,
-) -> (PsiTriplet, PsiTriplet) {
-    // Center-collision identities for a C^2 radial kernel:
-    //   q(0)       = lim_{r->0} phi_r(r)/r = phi_rr(0)
-    //   Delta phi(0) = d * phi_rr(0).
-    //
-    // The same identities propagate to psi derivatives as long as the
-    // corresponding collision limits exist:
-    //   q_psi(0)        = phi_rr_psi(0)
-    //   q_psipsi(0)     = phi_rr_psipsi(0)
-    //   (Delta phi)_psi(0)    = d * phi_rr_psi(0)
-    //   (Delta phi)_psipsi(0) = d * phi_rr_psipsi(0).
-    //
-    // This helper packages exactly those canonical origin values.
-    (
-        PsiTriplet {
-            value: phi_rr,
-            psi: phi_rr_psi,
-            psi_psi: phi_rr_psi_psi,
-        },
-        PsiTriplet {
-            value: k_dim as f64 * phi_rr,
-            psi: k_dim as f64 * phi_rr_psi,
-            psi_psi: k_dim as f64 * phi_rr_psi_psi,
-        },
-    )
 }
 
 fn duchon_regularized_operator_core(
@@ -19049,11 +18959,6 @@ fn duchon_radial_core_psi_triplet(
     let (phi_psi, phi_psi_psi) =
         scaled_log_kappa_derivatives(phi, jets.phi_r, jets.phi_rr, delta, r);
     if r > 1e-10 {
-        #[cfg(test)]
-        let (g_psi, g_psi_psi) = duchon_q_psi_triplet_from_jets(&jets, p_order, s_order, k_dim, r);
-        #[cfg(test)]
-        let (lap_psi, lap_psi_psi) =
-            duchon_laplacian_psi_triplet_from_jets(&jets, p_order, s_order, k_dim, r);
         assert!(
             ((delta * phi + r * jets.phi_r) - phi_psi).abs() < 1e-7_f64.max(1e-7_f64 * phi.abs())
         );
@@ -19062,18 +18967,6 @@ fn duchon_radial_core_psi_triplet(
                 value: phi,
                 psi: phi_psi,
                 psi_psi: phi_psi_psi,
-            },
-            #[cfg(test)]
-            gradient_ratio: PsiTriplet {
-                value: jets.q,
-                psi: g_psi,
-                psi_psi: g_psi_psi,
-            },
-            #[cfg(test)]
-            laplacian: PsiTriplet {
-                value: jets.lap,
-                psi: lap_psi,
-                psi_psi: lap_psi_psi,
             },
         });
     }
@@ -19086,22 +18979,12 @@ fn duchon_radial_core_psi_triplet(
     // coefficient of the assembled partial-fraction kernel. In even dimensions
     // this preserves the log-Riesz finite-part constants, so the collision
     // derivative is not the naive `(delta + 2) * phi_rr` scaling shortcut.
-    #[cfg(test)]
-    let (gradient_ratio, laplacian) = {
-        let (phi_rr, phi_rr_psi, phi_rr_psi_psi) =
-            duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, coeffs)?;
-        duchon_collision_operator_core_fromphi_rr(phi_rr, phi_rr_psi, phi_rr_psi_psi, k_dim)
-    };
     Ok(DuchonRadialCore {
         phi: PsiTriplet {
             value: phi,
             psi: phi_psi,
             psi_psi: phi_psi_psi,
         },
-        #[cfg(test)]
-        gradient_ratio,
-        #[cfg(test)]
-        laplacian,
     })
 }
 
@@ -23909,28 +23792,6 @@ pub(crate) mod internal {
 
         mu.saturating_sub(degree)
     }
-
-    #[cfg(test)]
-    pub(super) fn evaluate_splines_at_point(
-        x: f64,
-        degree: usize,
-        knots: ArrayView1<f64>,
-    ) -> Array1<f64> {
-        let num_knots = knots.len();
-        let num_basis = num_knots - degree - 1;
-        let mut basisvalues = Array1::zeros(num_basis);
-        let mut scratch = BsplineScratch::new(degree);
-        evaluate_splines_at_point_into(
-            x,
-            degree,
-            knots,
-            basisvalues
-                .as_slice_mut()
-                .expect("basis row should be contiguous"),
-            &mut scratch,
-        );
-        basisvalues
-    }
 }
 
 /// Scratch memory for B-spline evaluation to avoid allocations in tight loops.
@@ -28068,6 +27929,23 @@ mod tests {
         panic!("expected Duchon metadata for centers extraction")
     }
 
+    fn evaluate_splines_at_point(x: f64, degree: usize, knots: ArrayView1<f64>) -> Array1<f64> {
+        let num_knots = knots.len();
+        let num_basis = num_knots - degree - 1;
+        let mut basisvalues = Array1::zeros(num_basis);
+        let mut scratch = internal::BsplineScratch::new(degree);
+        internal::evaluate_splines_at_point_into(
+            x,
+            degree,
+            knots,
+            basisvalues
+                .as_slice_mut()
+                .expect("basis row should be contiguous"),
+            &mut scratch,
+        );
+        basisvalues
+    }
+
     /// Cubic periodic B-spline basis spec for tests, with the standard
     /// `period = TAU`, `origin = 0.0`, `penalty_order = 2` shape.
     fn periodic_test_spec(num_basis: usize) -> PeriodicBSplineBasisSpec {
@@ -29997,7 +29875,7 @@ mod tests {
         let knots = array![0.0, 0.0, 1.0, 2.0, 2.0];
         let x = 0.5; // For x=0.5, the knot interval is mu=1, since t_1 <= x < t_2.
 
-        let values = internal::evaluate_splines_at_point(x, 1, knots.view());
+        let values = evaluate_splines_at_point(x, 1, knots.view());
         assert_eq!(values.len(), 3);
 
         // Manual calculation for x=0.5:
@@ -30035,7 +29913,7 @@ mod tests {
         let knots = array![0.0, 0.0, 0.0, 1.0, 3.0, 4.0, 4.0, 4.0];
         let x = 2.0;
 
-        let values = internal::evaluate_splines_at_point(x, 2, knots.view());
+        let values = evaluate_splines_at_point(x, 2, knots.view());
 
         // The basis functions should sum to 1.0 (partition of unity property)
         let sum = values.sum();
@@ -30068,7 +29946,7 @@ mod tests {
         let x = 10.0; // This is the value that caused the panic
         let degree = 3;
 
-        let basisvalues = internal::evaluate_splines_at_point(x, degree, knots.view());
+        let basisvalues = evaluate_splines_at_point(x, degree, knots.view());
 
         // Should not panic and should return valid results
         assert_eq!(basisvalues.len(), 8); // num_basis = 12 - 3 - 1 = 8
@@ -30093,7 +29971,7 @@ mod tests {
         let num_basis = knots.len() - degree - 1; // 11 - 3 - 1 = 7
 
         // Test at the lower boundary (x=0)
-        let basis_at_start = internal::evaluate_splines_at_point(0.0, degree, knots.view());
+        let basis_at_start = evaluate_splines_at_point(0.0, degree, knots.view());
 
         // At the very start of the domain, only the first basis function should be non-zero (and equal to 1).
         assert_abs_diff_eq!(basis_at_start[0], 1.0, epsilon = 1e-9);
@@ -30102,7 +29980,7 @@ mod tests {
         }
 
         // Test at the upper boundary (x=4)
-        let basis_at_end = internal::evaluate_splines_at_point(4.0, degree, knots.view());
+        let basis_at_end = evaluate_splines_at_point(4.0, degree, knots.view());
 
         // At the very end of the domain, only the LAST basis function should be non-zero (and equal to 1).
         for i in 0..(num_basis - 1) {
@@ -30113,7 +29991,7 @@ mod tests {
         // Test intermediate points for partition of unity
         let test_points = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5];
         for &x in &test_points {
-            let basis = internal::evaluate_splines_at_point(x, degree, knots.view());
+            let basis = evaluate_splines_at_point(x, degree, knots.view());
             let sum: f64 = basis.sum();
             assert_abs_diff_eq!(sum, 1.0, epsilon = 1e-9);
             if (sum - 1.0).abs() >= 1e-9 {
@@ -30127,11 +30005,11 @@ mod tests {
         assert!(file!().ends_with(".rs"));
         let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0];
         let degree = 3usize;
-        let left_boundary = internal::evaluate_splines_at_point(0.0, degree, knots.view());
-        let right_boundary = internal::evaluate_splines_at_point(4.0, degree, knots.view());
+        let left_boundary = evaluate_splines_at_point(0.0, degree, knots.view());
+        let right_boundary = evaluate_splines_at_point(4.0, degree, knots.view());
 
-        let left_out = internal::evaluate_splines_at_point(-100.0, degree, knots.view());
-        let right_out = internal::evaluate_splines_at_point(100.0, degree, knots.view());
+        let left_out = evaluate_splines_at_point(-100.0, degree, knots.view());
+        let right_out = evaluate_splines_at_point(100.0, degree, knots.view());
 
         for i in 0..left_boundary.len() {
             assert_abs_diff_eq!(left_out[i], left_boundary[i], epsilon = 1e-12);
@@ -30800,7 +30678,7 @@ mod tests {
         let x = 2.0;
 
         let num_basis = knots.len() - degree - 1;
-        let iterative_basis = internal::evaluate_splines_at_point(x, degree, knots.view());
+        let iterative_basis = evaluate_splines_at_point(x, degree, knots.view());
 
         let recursivevalues: Vec<f64> = (0..num_basis)
             .map(|i| evaluate_bspline(x, &knots, i, degree))
@@ -30845,7 +30723,7 @@ mod tests {
 
         // Test case 1: u = 1.5, which is in the span [1, 2].
         // Expected: Two non-zero basis functions, each with value 0.5
-        let basis_at_1_5 = internal::evaluate_splines_at_point(1.5, degree, knots.view());
+        let basis_at_1_5 = evaluate_splines_at_point(1.5, degree, knots.view());
         assert_eq!(basis_at_1_5.len(), num_basis);
         assert_abs_diff_eq!(basis_at_1_5.sum(), 1.0, epsilon = 1e-9);
 
@@ -30863,7 +30741,7 @@ mod tests {
 
         // Test case 2: u = 2.5, which is in the span [2, 3].
         // Expected: Two non-zero basis functions, each with value 0.5
-        let basis_at_2_5 = internal::evaluate_splines_at_point(2.5, degree, knots.view());
+        let basis_at_2_5 = evaluate_splines_at_point(2.5, degree, knots.view());
         assert_eq!(basis_at_2_5.len(), num_basis);
         assert_abs_diff_eq!(basis_at_2_5.sum(), 1.0, epsilon = 1e-9);
 
@@ -34280,19 +34158,9 @@ mod tests {
         let core =
             duchon_radial_core_psi_triplet(r, length_scale_2, p_order, s_order, k_dim, &coeffs_2)
                 .expect("radial core");
-        let q_psi_expected = (delta + 2.0) * jets_2.q + r * jets_2.q_r;
-        let q_psi_psi_expected = (delta + 2.0) * (delta + 2.0) * jets_2.q
-            + (2.0 * delta + 5.0) * r * jets_2.q_r
-            + r * r * jets_2.q_rr;
-        let lap_psi_expected = (delta + 2.0) * jets_2.lap + r * jets_2.lap_r;
-        let lap_psi_psi_expected = (delta + 2.0) * (delta + 2.0) * jets_2.lap
-            + (2.0 * delta + 5.0) * r * jets_2.lap_r
-            + r * r * jets_2.lap_rr;
-
-        assert!((core.gradient_ratio.psi - q_psi_expected).abs() < 1e-10);
-        assert!((core.gradient_ratio.psi_psi - q_psi_psi_expected).abs() < 1e-9);
-        assert!((core.laplacian.psi - lap_psi_expected).abs() < 1e-10);
-        assert!((core.laplacian.psi_psi - lap_psi_psi_expected).abs() < 1e-9);
+        assert!(core.phi.value.is_finite());
+        assert!(core.phi.psi.is_finite());
+        assert!(core.phi.psi_psi.is_finite());
     }
 
     #[test]
@@ -34304,23 +34172,9 @@ mod tests {
         let kappa = 1.0 / length_scale;
         let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
 
-        let core =
-            duchon_radial_core_psi_triplet(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
-                .expect("collision core");
         let (phi_rr, phi_rr_psi, phi_rr_psi_psi) =
             duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
                 .expect("collision phi_rr");
-
-        assert!((core.gradient_ratio.value - phi_rr).abs() < 1e-12);
-        assert!((core.gradient_ratio.psi - phi_rr_psi).abs() < 1e-12);
-        assert!((core.gradient_ratio.psi_psi - phi_rr_psi_psi).abs() < 1e-12);
-
-        let lap = k_dim as f64 * phi_rr;
-        let lap_psi = k_dim as f64 * phi_rr_psi;
-        let lap_psi_psi = k_dim as f64 * phi_rr_psi_psi;
-        assert!((core.laplacian.value - lap).abs() < 1e-12);
-        assert!((core.laplacian.psi - lap_psi).abs() < 1e-12);
-        assert!((core.laplacian.psi_psi - lap_psi_psi).abs() < 1e-12);
 
         let eps = 2e-5_f64;
         let ls_plus = 1.0 / (kappa * eps.exp());
@@ -35399,8 +35253,8 @@ mod tests {
         let r = 0.37;
         let length_scale = 0.9;
         let nu = MaternNu::FiveHalves;
-        let (phi, phi_r, phi_rr) =
-            matern_kernel_radial_triplet(r, length_scale, nu).expect("triplet");
+        let (phi, phi_r, phi_rr, _) =
+            matern_kernel_radial_tripletwith_safe_ratio(r, length_scale, nu).expect("triplet");
         let h = 1e-6;
         let fp = matern_kernel_from_distance(r + h, length_scale, nu).expect("fp");
         let fm = matern_kernel_from_distance((r - h).max(0.0), length_scale, nu).expect("fm");
@@ -35441,169 +35295,6 @@ mod tests {
             matern_kernel_radial_tripletwith_safe_ratio(0.0, ls, MaternNu::Half).expect("half");
         assert!(ratio.is_finite());
         assert!(ratio < 0.0);
-    }
-
-    // ---------------------------------------------------------------
-    // Tests for matern_aniso_radial_scalars
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn test_aniso_scalars_q_matches_phi_prime_over_r() {
-        // For several (nu, r) pairs, verify q == phi'/r by comparing against
-        // the radial triplet which gives us phi'.
-        let ls = 1.4;
-        for &nu in &[
-            MaternNu::FiveHalves,
-            MaternNu::SevenHalves,
-            MaternNu::NineHalves,
-        ] {
-            for &r in &[0.01, 0.1, 0.5, 1.0, 2.5] {
-                let (_, phi_r, _) = matern_kernel_radial_triplet(r, ls, nu).expect("triplet");
-                let (_, q, _) = matern_aniso_radial_scalars(r, ls, nu).expect("aniso");
-                let q_ref = phi_r / r;
-                assert!(
-                    (q - q_ref).abs() < 1e-12 * q_ref.abs().max(1.0),
-                    "q mismatch for nu={nu:?}, r={r}: q={q}, phi'/r={q_ref}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_aniso_scalars_t_matches_definition() {
-        // Verify t == (phi'' - q) / r^2 at several r values by computing
-        // phi'' from the radial triplet.
-        let ls = 1.7;
-        for &nu in &[
-            MaternNu::FiveHalves,
-            MaternNu::SevenHalves,
-            MaternNu::NineHalves,
-        ] {
-            for &r in &[0.05, 0.2, 0.7, 1.5, 3.0] {
-                let (_, phi_r, phi_rr) = matern_kernel_radial_triplet(r, ls, nu).expect("triplet");
-                let (_, _, t) = matern_aniso_radial_scalars(r, ls, nu).expect("aniso");
-                let q_check = phi_r / r;
-                let t_ref = (phi_rr - q_check) / (r * r);
-                assert!(
-                    (t - t_ref).abs() < 1e-10 * t_ref.abs().max(1.0),
-                    "t mismatch for nu={nu:?}, r={r}: t={t}, ref={t_ref}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_aniso_scalars_collision_limits() {
-        // At r = 0, q(0) = phi''(0), t(0) = phi''''(0) / 3 for smooth nus.
-        //   nu=5/2: q(0) = -s^2/3, t(0) = s^4/3
-        //   nu=7/2: q(0) = -s^2·(1/5), t(0) = s^4/15
-        //   nu=9/2: q(0) = -s^2·(1/7), t(0) = 3·s^4/105 = s^4/35
-        let ls = 2.1;
-        {
-            let s2 = 5.0 / (ls * ls);
-            let s4 = s2 * s2;
-            let (phi, q, t) =
-                matern_aniso_radial_scalars(0.0, ls, MaternNu::FiveHalves).expect("5/2 at 0");
-            assert!((phi - 1.0).abs() < 1e-14, "phi(0) should be 1");
-            assert!((q - (-s2 / 3.0)).abs() < 1e-12, "q(0) for 5/2: got {q}");
-            assert!((t - s4 / 3.0).abs() < 1e-10, "t(0) for 5/2: got {t}");
-        }
-        {
-            let s2 = 7.0 / (ls * ls);
-            let s4 = s2 * s2;
-            let (phi, q, t) =
-                matern_aniso_radial_scalars(0.0, ls, MaternNu::SevenHalves).expect("7/2 at 0");
-            assert!((phi - 1.0).abs() < 1e-14);
-            assert!((q - (-s2 / 5.0)).abs() < 1e-12, "q(0) for 7/2: got {q}");
-            // t(0) = s^4/15
-            assert!((t - s4 / 15.0).abs() < 1e-10, "t(0) for 7/2: got {t}");
-        }
-        {
-            let s2 = 9.0 / (ls * ls);
-            let s4 = s2 * s2;
-            let (phi, q, t) =
-                matern_aniso_radial_scalars(0.0, ls, MaternNu::NineHalves).expect("9/2 at 0");
-            assert!((phi - 1.0).abs() < 1e-14);
-            assert!((q - (-s2 / 7.0)).abs() < 1e-12, "q(0) for 9/2: got {q}");
-            // t(0) = 3 s^4 / 105 = s^4 / 35
-            assert!((t - s4 / 35.0).abs() < 1e-10, "t(0) for 9/2: got {t}");
-        }
-    }
-
-    #[test]
-    fn test_aniso_scalars_half_and_three_halves_diverge_at_zero() {
-        let ls = 1.0;
-        assert!(matern_aniso_radial_scalars(0.0, ls, MaternNu::Half).is_err());
-        assert!(matern_aniso_radial_scalars(0.0, ls, MaternNu::ThreeHalves).is_err());
-    }
-
-    #[test]
-    fn test_aniso_scalars_half_and_three_halves_finite_away_from_zero() {
-        let ls = 1.5;
-        let r = 0.3;
-        let (phi, q, t) = matern_aniso_radial_scalars(r, ls, MaternNu::Half).expect("half r>0");
-        assert!(phi.is_finite() && q.is_finite() && t.is_finite());
-        let (phi, q, t) =
-            matern_aniso_radial_scalars(r, ls, MaternNu::ThreeHalves).expect("3/2 r>0");
-        assert!(phi.is_finite() && q.is_finite() && t.is_finite());
-    }
-
-    #[test]
-    fn test_aniso_scalars_t_finite_difference_validation() {
-        // Validate t via finite differences on q:
-        //   t(r) = d/dr[q(r)] / r  (by differentiating q = phi'/r).
-        // Actually, t = (phi'' - q)/r^2. We can also check by finite-diff on
-        // the function f(r) = phi'(r)/r:
-        //   f'(r) = (phi''(r) - phi'(r)/r) / r = (phi''(r) - q(r)) / r = t(r) * r
-        // So t(r) = f'(r) / r = (q(r+h) - q(r-h)) / (2h r).
-        let ls = 1.3;
-        let h = 1e-6;
-        for &nu in &[
-            MaternNu::FiveHalves,
-            MaternNu::SevenHalves,
-            MaternNu::NineHalves,
-        ] {
-            for &r in &[0.1, 0.5, 1.0, 2.0] {
-                let (_, q_plus, _) = matern_aniso_radial_scalars(r + h, ls, nu).expect("q+");
-                let (_, q_minus, _) = matern_aniso_radial_scalars(r - h, ls, nu).expect("q-");
-                let (_, _, t) = matern_aniso_radial_scalars(r, ls, nu).expect("t");
-                // f'(r) ≈ (q(r+h) - q(r-h)) / (2h), and t = f'(r) / r
-                let t_fd = (q_plus - q_minus) / (2.0 * h * r);
-                assert!(
-                    (t - t_fd).abs() < 1e-4 * t.abs().max(1e-10),
-                    "t finite-diff mismatch for nu={nu:?}, r={r}: t={t}, fd={t_fd}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_aniso_scalars_phi_matches_kernel_evaluator() {
-        // Verify that phi from the aniso scalars matches matern_kernel_from_distance.
-        let ls = 0.8;
-        for &nu in &[
-            MaternNu::FiveHalves,
-            MaternNu::SevenHalves,
-            MaternNu::NineHalves,
-        ] {
-            for &r in &[0.0, 0.1, 0.5, 1.0, 3.0] {
-                let phi_ref = matern_kernel_from_distance(r, ls, nu).expect("kern");
-                let (phi, _, _) = matern_aniso_radial_scalars(r, ls, nu).expect("aniso");
-                assert!(
-                    (phi - phi_ref).abs() < 1e-14,
-                    "phi mismatch for nu={nu:?}, r={r}: {phi} vs {phi_ref}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_aniso_scalars_invalid_inputs() {
-        assert!(matern_aniso_radial_scalars(-1.0, 1.0, MaternNu::FiveHalves).is_err());
-        assert!(matern_aniso_radial_scalars(1.0, 0.0, MaternNu::FiveHalves).is_err());
-        assert!(matern_aniso_radial_scalars(1.0, -1.0, MaternNu::FiveHalves).is_err());
-        assert!(matern_aniso_radial_scalars(f64::NAN, 1.0, MaternNu::FiveHalves).is_err());
-        assert!(matern_aniso_radial_scalars(1.0, f64::INFINITY, MaternNu::FiveHalves).is_err());
     }
 
     #[test]

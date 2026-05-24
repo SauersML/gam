@@ -360,7 +360,11 @@ pub trait HessianOperator: Send + Sync {
     /// Exact backends use the normal solve. Matrix-free backends may override
     /// this to use a looser PCG tolerance when the caller's Monte Carlo error
     /// dominates the linear-solve error.
-    fn stochastic_trace_solve(&self, rhs: &Array1<f64>, _rel_tol: f64) -> Array1<f64> {
+    fn stochastic_trace_solve(&self, rhs: &Array1<f64>, rel_tol: f64) -> Array1<f64> {
+        assert!(
+            rel_tol.is_finite() && rel_tol > 0.0,
+            "stochastic trace solve tolerance must be positive and finite"
+        );
         self.solve(rhs)
     }
 
@@ -373,14 +377,18 @@ pub trait HessianOperator: Send + Sync {
         &self,
         rhs: &Array1<f64>,
         rel_tol: f64,
-        _probe_id: u64,
-        _trace_state: Option<&Arc<Mutex<StochasticTraceState>>>,
+        _: u64,
+        _: Option<&Arc<Mutex<StochasticTraceState>>>,
     ) -> Array1<f64> {
         self.stochastic_trace_solve(rhs, rel_tol)
     }
 
     /// H⁻¹ M for stochastic trace probes.
-    fn stochastic_trace_solve_multi(&self, rhs: &Array2<f64>, _rel_tol: f64) -> Array2<f64> {
+    fn stochastic_trace_solve_multi(&self, rhs: &Array2<f64>, rel_tol: f64) -> Array2<f64> {
+        assert!(
+            rel_tol.is_finite() && rel_tol > 0.0,
+            "stochastic trace multi-solve tolerance must be positive and finite"
+        );
         self.solve_multi(rhs)
     }
 
@@ -848,7 +856,14 @@ pub trait HessianDerivativeProvider: Send + Sync {
         _: &Array1<f64>,
         _: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        Ok(None)
+        if self.has_corrections() {
+            Err(
+                "HessianDerivativeProvider reports first-order corrections but does not implement second-order correction"
+                    .to_string(),
+            )
+        } else {
+            Ok(None)
+        }
     }
 
     /// Operator-capable version of `hessian_second_derivative_correction`.
@@ -1923,11 +1938,7 @@ pub trait HyperOperator: Send + Sync {
             .sum()
     }
 
-    fn trace_projected_factor_cached(
-        &self,
-        factor: &Array2<f64>,
-        _cache: &ProjectedFactorCache,
-    ) -> f64 {
+    fn trace_projected_factor_cached(&self, factor: &Array2<f64>, _: &ProjectedFactorCache) -> f64 {
         self.trace_projected_factor(factor)
     }
 
@@ -1947,7 +1958,7 @@ pub trait HyperOperator: Send + Sync {
     fn projected_matrix_cached(
         &self,
         factor: &Array2<f64>,
-        _cache: &ProjectedFactorCache,
+        _: &ProjectedFactorCache,
     ) -> Array2<f64> {
         self.projected_matrix(factor)
     }

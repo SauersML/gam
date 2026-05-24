@@ -2032,32 +2032,6 @@ impl SpatialLogKappaCoords {
         }
     }
 
-    /// Anisotropic-aware lower bounds: one bound per stored ψ coordinate.
-    #[cfg(test)]
-    pub(crate) fn lower_bounds_aniso(
-        dims_per_term: &[usize],
-        options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Self {
-        let total: usize = dims_per_term.iter().sum();
-        Self {
-            values: Array1::<f64>::from_elem(total, -options.max_length_scale.ln()),
-            dims_per_term: dims_per_term.to_vec(),
-        }
-    }
-
-    /// Anisotropic-aware upper bounds: one bound per stored ψ coordinate.
-    #[cfg(test)]
-    pub(crate) fn upper_bounds_aniso(
-        dims_per_term: &[usize],
-        options: &SpatialLengthScaleOptimizationOptions,
-    ) -> Self {
-        let total: usize = dims_per_term.iter().sum();
-        Self {
-            values: Array1::<f64>::from_elem(total, -options.min_length_scale.ln()),
-            dims_per_term: dims_per_term.to_vec(),
-        }
-    }
-
     /// Isotropic lower bounds derived from per-term data geometry.
     /// Each entry gets the ψ_lo bound returned by `spatial_term_psi_bounds`
     /// for the corresponding term, intersected with the options window.
@@ -7824,12 +7798,6 @@ struct SpatialOperatorRuntimeCache {
 
 #[derive(Clone)]
 struct SpatialAdaptiveWeights {
-    #[cfg(test)]
-    magweight: Array1<f64>,
-    #[cfg(test)]
-    gradweight: Array1<f64>,
-    #[cfg(test)]
-    lapweight: Array1<f64>,
     inv_magweight: Array1<f64>,
     invgradweight: Array1<f64>,
     inv_lapweight: Array1<f64>,
@@ -8778,37 +8746,16 @@ fn compute_spatial_adaptiveweights_for_beta(
                 cache,
                 [epsilon_0, epsilon_g, epsilon_c],
             )?;
-            #[cfg(test)]
-            let (u_0, inv_0) = exact
-                .magnitude
-                .surrogateweights(weight_floor, weight_ceiling);
-            #[cfg(not(test))]
             let (_, inv_0) = exact
                 .magnitude
                 .surrogateweights(weight_floor, weight_ceiling);
-            #[cfg(test)]
-            let (u_g, inv_g) = exact
-                .gradient
-                .surrogateweights(weight_floor, weight_ceiling);
-            #[cfg(not(test))]
             let (_, inv_g) = exact
                 .gradient
                 .surrogateweights(weight_floor, weight_ceiling);
-            #[cfg(test)]
-            let (u_c, inv_c) = exact
-                .curvature
-                .surrogateweights(weight_floor, weight_ceiling);
-            #[cfg(not(test))]
             let (_, inv_c) = exact
                 .curvature
                 .surrogateweights(weight_floor, weight_ceiling);
             Ok(SpatialAdaptiveWeights {
-                #[cfg(test)]
-                magweight: u_0,
-                #[cfg(test)]
-                gradweight: u_g,
-                #[cfg(test)]
-                lapweight: u_c,
                 inv_magweight: inv_0,
                 invgradweight: inv_g,
                 inv_lapweight: inv_c,
@@ -11188,7 +11135,11 @@ impl SpatialAdaptiveExactFamily {
         eval: &SpatialAdaptiveExactEvaluation,
         direction: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
-        assert_eq!(beta.len(), direction.len());
+        assert_eq!(
+            beta.len(),
+            direction.len(),
+            "beta/direction length mismatch",
+        );
         let d_eta = crate::faer_ndarray::fast_av(self.design.as_ref(), direction);
         let mut total = xt_diag_x_dense(
             self.design.view(),
@@ -11330,8 +11281,11 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        assert!(!block_states.is_empty());
-        assert!(!block_spec.name.is_empty());
+        assert!(!block_states.is_empty(), "block_states must be non-empty");
+        assert!(
+            !block_spec.name.is_empty(),
+            "block spec name must be non-empty",
+        );
         expect_block_idx_zero(block_idx, "spatial adaptive exact family", "")?;
         Ok(self.linear_constraints.clone())
     }
@@ -12843,8 +12797,8 @@ fn evaluate_joint_reml_efs_at_theta(
 }
 
 fn exact_joint_spatial_outer_hessian_available(
-    _family: LikelihoodFamily,
-    _design: &TermCollectionDesign,
+    family: LikelihoodFamily,
+    design: &TermCollectionDesign,
 ) -> bool {
     // Every `LikelihoodFamily` variant (Gaussian, Binomial-*, Poisson, Gamma,
     // Royston-Parmar) routes through the unified evaluator's outer-Hessian
@@ -12857,8 +12811,29 @@ fn exact_joint_spatial_outer_hessian_available(
     // gate predates that operator routing and forced binomial+logit+Matern
     // (and any other non-Gaussian dense-lazy spatial design) onto the
     // gradient-only BFGS path even though analytic Hessian is fully
-    // available — capability check, not cost.
-    true
+    // available — capability check, not cost.  Match every variant
+    // explicitly so any future family addition (which may not yet provide
+    // outer-Hessian ingredients) forces an authoring decision here rather
+    // than silently inheriting `true`.
+    let family_supported = match family {
+        LikelihoodFamily::GaussianIdentity
+        | LikelihoodFamily::BinomialLogit
+        | LikelihoodFamily::BinomialProbit
+        | LikelihoodFamily::BinomialCLogLog
+        | LikelihoodFamily::BinomialLatentCLogLog
+        | LikelihoodFamily::BinomialSas
+        | LikelihoodFamily::BinomialBetaLogistic
+        | LikelihoodFamily::BinomialMixture
+        | LikelihoodFamily::PoissonLog
+        | LikelihoodFamily::Tweedie { .. }
+        | LikelihoodFamily::NegativeBinomial { .. }
+        | LikelihoodFamily::BetaLogit { .. }
+        | LikelihoodFamily::GammaLog
+        | LikelihoodFamily::RoystonParmar => true,
+    };
+    // A design with zero columns has no joint outer-Hessian to compute;
+    // the analytic path is only meaningful for non-empty parameter blocks.
+    family_supported && design.design.ncols() > 0
 }
 
 fn smooth_term_penalty_index(

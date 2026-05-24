@@ -1447,8 +1447,7 @@ fn scan_for_cargo_lint_allows(
                     || header.starts_with("lints.")
                     || header == "workspace.lints"
                     || header.starts_with("workspace.lints.");
-                in_clippy_section = header == "lints.clippy"
-                    || header == "workspace.lints.clippy";
+                in_clippy_section = header == "lints.clippy" || header == "workspace.lints.clippy";
                 continue;
             }
             if !in_lints || code_part.is_empty() {

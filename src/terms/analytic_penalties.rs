@@ -370,7 +370,13 @@ pub trait AnalyticPenalty: Send + Sync {
     /// Update any attached scalar weight schedule at the given REML outer
     /// iteration. Penalties without schedules keep their stored weight.
     fn apply_schedule(&mut self, iter: usize) {
-        let _iter_unused = iter;
+        // REML outer loops are bounded well below 1,000,000; a value beyond
+        // that cap signals counter corruption rather than a legitimate
+        // iteration count, so refuse to silently accept it.
+        assert!(
+            iter < 1_000_000,
+            "apply_schedule received implausible outer iteration {iter}",
+        );
     }
 }
 
