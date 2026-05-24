@@ -4,7 +4,7 @@ use gam::predict::predict_gam;
 use gam::probability::normal_cdf;
 use gam::smooth::BlockwisePenalty;
 use gam::types::{
-    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
+    GlmFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
     ResponseFamily,
 };
 use ndarray::{Array1, Array2};
@@ -108,7 +108,7 @@ fn probitworkingvectors_are_finite_for_extreme_eta() {
     update_glmvectors_by_family(
         y.view(),
         &eta,
-        GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialProbit),
+        GlmLikelihoodSpec::canonical(GlmFamily::BinomialProbit),
         w.view(),
         &mut mu,
         &mut weights,
@@ -303,7 +303,7 @@ fn cloglogworkingvectors_are_finite_for_extreme_eta() {
     update_glmvectors_by_family(
         y.view(),
         &eta,
-        GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialCLogLog),
+        GlmLikelihoodSpec::canonical(GlmFamily::BinomialCLogLog),
         w.view(),
         &mut mu,
         &mut weights,

@@ -724,11 +724,9 @@ fn legacy_family_to_spec(family: LikelihoodFamily) -> LikelihoodSpec {
     if let Some(spec) = LikelihoodSpec::from_non_parameterized(family) {
         return spec;
     }
-    // SAFETY: all `FittedFamily` construction sites in main.rs build saved
-    // models from non-parameterized variants only (RoystonParmar,
-    // GaussianIdentity, BinomialLogit, BinomialProbit); parameterized
-    // binomial variants flow through `inverse_link_to_binomial_spec` and
-    // never reach this helper, so this arm guards a misuse contract.
+    // All callers pass non-parameterized variants; parameterized binomial
+    // variants flow through `inverse_link_to_binomial_spec`.
+    // SAFETY: misuse contract — unreachable from current call sites.
     panic!(
         "legacy_family_to_spec called with parameterized binomial variant {family:?}; \
          callers must source InverseLink state explicitly"
@@ -9047,7 +9045,7 @@ fn build_model_summary(
             Array1::from_elem(y.len(), baseline)
         }
     };
-    let null_dev = if let Ok(glm_family) = gam::types::GlmLikelihoodFamily::try_from(family) {
+    let null_dev = if let Ok(glm_family) = gam::types::GlmFamily::try_from(family) {
         gam::pirls::calculate_deviance(
             y,
             &nullmu,
@@ -9059,7 +9057,7 @@ fn build_model_summary(
             y,
             &nullmu,
             gam::types::GlmLikelihoodSpec::canonical(
-                gam::types::GlmLikelihoodFamily::GaussianIdentity,
+                gam::types::GlmFamily::GaussianIdentity,
             ),
             weights,
         )

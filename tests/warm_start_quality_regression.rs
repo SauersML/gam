@@ -26,7 +26,7 @@ use gam::construction::CanonicalPenalty;
 use gam::estimate::PenaltySpec;
 use gam::pirls::{PenaltyConfig, PirlsConfig, PirlsProblem, PirlsStatus, fit_model_for_fixed_rho};
 use gam::types::{
-    Coefficients, GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LinkFunction,
+    Coefficients, GlmFamily, GlmLikelihoodSpec, InverseLink, LinkFunction,
     LogSmoothingParamsView,
 };
 use ndarray::{Array1, Array2, array};
@@ -109,7 +109,7 @@ fn fit_at_rho_full(
     let p = x.ncols();
     let offset = Array1::<f64>::zeros(y.len());
     let cfg = PirlsConfig {
-        likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+        likelihood: GlmLikelihoodSpec::canonical(GlmFamily::BinomialLogit),
         link_kind: InverseLink::Standard(LinkFunction::Logit),
         max_iterations: 200,
         // Tight enough that any drift between cold/warm shows up at the
@@ -306,7 +306,7 @@ fn pirls_result_exposes_final_accept_rho_in_unit_interval() {
     let p = x.ncols();
     let offset = Array1::<f64>::zeros(y.len());
     let cfg = PirlsConfig {
-        likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+        likelihood: GlmLikelihoodSpec::canonical(GlmFamily::BinomialLogit),
         link_kind: InverseLink::Standard(LinkFunction::Logit),
         max_iterations: 200,
         convergence_tolerance: 1e-10,

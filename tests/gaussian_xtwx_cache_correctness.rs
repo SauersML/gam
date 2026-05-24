@@ -20,7 +20,7 @@ use gam::pirls::{
     GaussianFixedCache, PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho,
 };
 use gam::types::{
-    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LinkFunction, LogSmoothingParamsView,
+    GlmFamily, GlmLikelihoodSpec, InverseLink, LinkFunction, LogSmoothingParamsView,
 };
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
@@ -123,7 +123,7 @@ fn fit_at_rho(
     let p = x.ncols();
     let offset = Array1::<f64>::zeros(y.len());
     let cfg = PirlsConfig {
-        likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GaussianIdentity),
+        likelihood: GlmLikelihoodSpec::canonical(GlmFamily::GaussianIdentity),
         link_kind: InverseLink::Standard(LinkFunction::Identity),
         max_iterations: 200,
         convergence_tolerance: 1e-12,
