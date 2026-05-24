@@ -64,145 +64,138 @@ fn main() {
     let mut should_panic_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_bare_should_panic(&manifest_dir, &manifest_dir, &mut should_panic_offenders);
 
-    let mut any_violation = false;
+    let mut sections: Vec<Section> = Vec::new();
 
     if !todo_offenders.is_empty() {
-        any_violation = true;
-        eprintln!();
-        eprintln!("error: {} markers are banned. just do it now.", needle);
-        eprintln!();
-        for (rel, line_no, line) in &todo_offenders {
-            let trimmed = line.trim();
-            let snippet: String = trimmed.chars().take(160).collect();
-            eprintln!("  {}:{}: {}", rel.display(), line_no, snippet);
-        }
-        eprintln!();
-        eprintln!(
-            "error: {} {} marker(s) found. just do it now.",
-            todo_offenders.len(),
-            needle
-        );
+        sections.push(Section {
+            title: format!("{} marker", needle),
+            rows: todo_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
     }
 
     if !allow_offenders.is_empty() {
-        any_violation = true;
-        eprintln!();
-        eprintln!(
-            "error: {} banned `#[allow(...)]` attribute(s) found. \
-             `unused_*` and `dead_code` are not allowed to be silenced — \
-             use the value or delete the binding.",
-            allow_offenders.len()
-        );
-        eprintln!();
-        for (rel, line_no, lint, line) in &allow_offenders {
-            let trimmed = line.trim();
-            let snippet: String = trimmed.chars().take(160).collect();
-            eprintln!(
-                "  {}:{}: [allow({})] {}",
-                rel.display(),
-                line_no,
-                lint,
-                snippet
-            );
-        }
-        eprintln!();
+        sections.push(Section {
+            title: "#[allow(unused_* / dead_code)]".to_string(),
+            rows: allow_offenders
+                .iter()
+                .map(|(r, l, lint, s)| (r.clone(), *l, Some(format!("allow({lint})")), s.clone()))
+                .collect(),
+        });
     }
 
     if !underscore_offenders.is_empty() {
-        any_violation = true;
-        eprintln!();
-        eprintln!(
-            "error: {} underscore-leading `let _...` binding(s) found. \
-             Every `let _...` (bare `_` or `_name`) is banned — bind a real \
-             name and read it, or call the expression without a binding.",
-            underscore_offenders.len()
-        );
-        eprintln!();
-        for (rel, line_no, line) in &underscore_offenders {
-            let trimmed = line.trim();
-            let snippet: String = trimmed.chars().take(160).collect();
-            eprintln!("  {}:{}: {}", rel.display(), line_no, snippet);
-        }
-        eprintln!();
+        sections.push(Section {
+            title: "let _ binding (bare `_` or `_name`)".to_string(),
+            rows: underscore_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
     }
 
     if !ignored.is_empty() {
-        any_violation = true;
-        eprintln!();
-        eprintln!(
-            "error: {} `#[ignore]` test attribute(s) found.",
-            ignored.len()
-        );
-        eprintln!(
-            "       Ignored tests are silently dead. Either delete the test \
-             or remove the `#[ignore]` attribute so it runs again."
-        );
-        eprintln!();
-        for (rel, line_no, line) in &ignored {
-            let trimmed = line.trim();
-            let snippet: String = trimmed.chars().take(160).collect();
-            eprintln!("  {}:{}: {}", rel.display(), line_no, snippet);
-        }
-        eprintln!();
+        sections.push(Section {
+            title: "#[ignore] test".to_string(),
+            rows: ignored
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
     }
 
     if !substring_offenders.is_empty() {
-        any_violation = true;
-        eprintln!();
-        eprintln!(
-            "error: {} banned substring(s) found in code. \
-             These patterns are sketchy by default — replace them with the \
-             explicit alternative noted per pattern.",
-            substring_offenders.len()
-        );
-        eprintln!();
-        for (rel, line_no, needle, line) in &substring_offenders {
-            let trimmed = line.trim();
-            let snippet: String = trimmed.chars().take(160).collect();
-            eprintln!("  {}:{}: [{}] {}", rel.display(), line_no, needle, snippet);
+        // Group by needle label so each banned pattern gets its own section.
+        let mut by_label: std::collections::BTreeMap<&'static str, Vec<(PathBuf, usize, String)>> =
+            std::collections::BTreeMap::new();
+        for (rel, line_no, label, line) in &substring_offenders {
+            by_label
+                .entry(*label)
+                .or_default()
+                .push((rel.clone(), *line_no, line.clone()));
         }
-        eprintln!();
+        for (label, rows_in) in by_label {
+            sections.push(Section {
+                title: label.to_string(),
+                rows: rows_in
+                    .into_iter()
+                    .map(|(r, l, s)| (r, l, None, s))
+                    .collect(),
+            });
+        }
     }
 
     if !unsafe_offenders.is_empty() {
-        any_violation = true;
-        eprintln!();
-        eprintln!(
-            "error: {} `unsafe` use(s) without a `// SAFETY:` justification. \
-             Add a `// SAFETY: <why this is sound>` comment on the same line \
-             or one of the 3 preceding non-blank lines.",
-            unsafe_offenders.len()
-        );
-        eprintln!();
-        for (rel, line_no, line) in &unsafe_offenders {
-            let trimmed = line.trim();
-            let snippet: String = trimmed.chars().take(160).collect();
-            eprintln!("  {}:{}: {}", rel.display(), line_no, snippet);
-        }
-        eprintln!();
+        sections.push(Section {
+            title: "unsafe without `// SAFETY:`".to_string(),
+            rows: unsafe_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
     }
 
     if !should_panic_offenders.is_empty() {
-        any_violation = true;
-        eprintln!();
-        eprintln!(
-            "error: {} `#[should_panic]` attribute(s) without `expected = \"...\"`. \
-             Bare `#[should_panic]` accepts any panic and masks unrelated bugs; \
-             require an `expected` substring.",
-            should_panic_offenders.len()
-        );
-        eprintln!();
-        for (rel, line_no, line) in &should_panic_offenders {
-            let trimmed = line.trim();
-            let snippet: String = trimmed.chars().take(160).collect();
-            eprintln!("  {}:{}: {}", rel.display(), line_no, snippet);
-        }
-        eprintln!();
+        sections.push(Section {
+            title: "#[should_panic] without `expected = \"...\"`".to_string(),
+            rows: should_panic_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
     }
 
-    if any_violation {
-        std::process::exit(1);
+    if sections.is_empty() {
+        return;
     }
+
+    render_report(&sections);
+    std::process::exit(1);
+}
+
+/// One banned-pattern report section: a title plus the file/line rows that
+/// matched. `tag` is an optional per-row marker (e.g. `allow(dead_code)`)
+/// rendered between line number and snippet.
+struct Section {
+    title: String,
+    rows: Vec<(PathBuf, usize, Option<String>, String)>,
+}
+
+fn render_report(sections: &[Section]) {
+    let total: usize = sections.iter().map(|s| s.rows.len()).sum();
+    eprintln!();
+    eprintln!(
+        "error: {} ban violation{} across {} rule{}",
+        total,
+        if total == 1 { "" } else { "s" },
+        sections.len(),
+        if sections.len() == 1 { "" } else { "s" },
+    );
+    for section in sections {
+        eprintln!();
+        eprintln!(
+            "── {}  ({} hit{})",
+            section.title,
+            section.rows.len(),
+            if section.rows.len() == 1 { "" } else { "s" },
+        );
+        for (rel, line_no, tag, line) in &section.rows {
+            let trimmed = line.trim();
+            let snippet: String = trimmed.chars().take(160).collect();
+            match tag {
+                Some(t) => eprintln!("  {}:{}: [{}] {}", rel.display(), line_no, t, snippet),
+                None => eprintln!("  {}:{}: {}", rel.display(), line_no, snippet),
+            }
+        }
+    }
+    eprintln!();
+    eprintln!("summary:");
+    for section in sections {
+        eprintln!("  {:>5}  {}", section.rows.len(), section.title);
+    }
+    eprintln!();
 }
 
 /// Build the table of banned substrings. Each entry is matched in the
