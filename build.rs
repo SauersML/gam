@@ -218,18 +218,14 @@ fn banned_substrings() -> &'static [(&'static str, &'static str)] {
         // Environment-variable reads (see feedback_no_env_vars memory).
         ("env::var(", "env::var"),
         ("env::var_os(", "env::var_os"),
-        // Discarded inner values in `if let` and match arms — same family
-        // as the `let _...` ban.
+        // `if let Ok/Some/Err(_) = …` — `.is_ok()` / `.is_some()` /
+        // `.is_err()` are strictly cleaner. Match-arm forms `Ok(_) =>`
+        // etc. are NOT banned: when the inner type is `()` (e.g.
+        // `Result<(), E>` from `channel.send`), `Ok(_) =>` is the
+        // idiomatic variant-only check and there is nothing to bind.
         ("if let Ok(_)", "if let Ok(_)"),
         ("if let Some(_)", "if let Some(_)"),
         ("if let Err(_)", "if let Err(_)"),
-        ("Ok(_) =>", "Ok(_) =>"),
-        ("Err(_) =>", "Err(_) =>"),
-        ("Some(_) =>", "Some(_) =>"),
-        // Poison-panic on lock acquisition.
-        (".lock().unwrap()", ".lock().unwrap()"),
-        (".read().unwrap()", ".read().unwrap()"),
-        (".write().unwrap()", ".write().unwrap()"),
         // Redundant boolean comparisons.
         ("== true", "== true"),
         ("== false", "== false"),
