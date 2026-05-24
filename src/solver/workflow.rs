@@ -4096,6 +4096,7 @@ fn smooth_basis_feature_cols_for_latent(
         | crate::smooth::SmoothBasisSpec::Sphere { feature_cols, .. }
         | crate::smooth::SmoothBasisSpec::Matern { feature_cols, .. }
         | crate::smooth::SmoothBasisSpec::Duchon { feature_cols, .. }
+        | crate::smooth::SmoothBasisSpec::Pca { feature_cols, .. }
         | crate::smooth::SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
             Some(feature_cols.clone())
         }
@@ -4152,6 +4153,7 @@ fn natural_latent_manifold_for_basis(
         crate::smooth::SmoothBasisSpec::ThinPlate { .. }
         | crate::smooth::SmoothBasisSpec::Matern { .. }
         | crate::smooth::SmoothBasisSpec::Duchon { .. }
+        | crate::smooth::SmoothBasisSpec::Pca { .. }
         | crate::smooth::SmoothBasisSpec::FactorSmooth { .. } => LatentManifold::Euclidean,
     }
 }

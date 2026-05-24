@@ -669,6 +669,7 @@ fn build_basis_derivative_jets(
         }
         LatentBasisKind::Sphere { .. }
         | LatentBasisKind::PeriodicBspline { .. }
+        | LatentBasisKind::Pca { .. }
         | LatentBasisKind::TensorBspline { .. } => {
             let _ = latent;
             let _ = distances;
