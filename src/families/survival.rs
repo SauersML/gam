@@ -1572,6 +1572,13 @@ impl WorkingModelSurvival {
         {
             return Err(SurvivalError::NonFiniteInput);
         }
+        if age_entry
+            .iter()
+            .zip(age_exit.iter())
+            .any(|(&entry, &exit)| entry < 0.0 || exit <= 0.0)
+        {
+            return Err(SurvivalError::NonFiniteInput);
+        }
         Ok(())
     }
 
