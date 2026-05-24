@@ -3098,6 +3098,11 @@ impl AnalyticPenalty for NuclearNormPenalty {
         let Some(v_mat) = self.target_matrix(v) else {
             return Array1::<f64>::zeros(target.len());
         };
+        // SAFETY: `right_spectral_inverse_sqrt_derivative` only errors on a
+        // non-SPD spectral target; reaching this HVP path means the upstream
+        // penalty assembly already enforced SPD via `target_matrix` (which
+        // returned `Some` above) and the shared `_inverse_sqrt_derivative`
+        // contract guarantees the matching factorisation succeeds.
         let (right_filter, right_filter_derivative) = self
             .right_spectral_inverse_sqrt_derivative(t.view(), v_mat.view())
             .unwrap_or_else(|message| panic!("{}", message));

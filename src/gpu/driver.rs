@@ -213,7 +213,11 @@ fn load_library(candidates: &[&str]) -> Result<Library, GpuError> {
 /// table needs to stay valid forever (i.e. for every library binding we
 /// resolve at startup).
 fn load_static_library(candidates: &[&str]) -> Result<&'static Library, GpuError> {
-    Ok(Box::leak(Box::new(load_library(candidates)?)))
+    let raw = Box::into_raw(Box::new(load_library(candidates)?));
+    // SAFETY: deliberate process-lifetime leak. `raw` was just produced by
+    // `Box::into_raw`, so it is a valid, properly aligned, exclusive pointer
+    // and the reborrow yields a `&'static Library` that no other code holds.
+    Ok(unsafe { &*raw })
 }
 
 pub fn cuda_library_candidates() -> &'static [&'static str] {
