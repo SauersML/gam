@@ -200,8 +200,8 @@ extern "C" __global__ void spatial_kernel(
             b_host.push(points_b[[j, k]]);
         }
     }
-    let da = stream.memcpy_stod(&a_host).map_err(map_drv)?;
-    let db = stream.memcpy_stod(&b_host).map_err(map_drv)?;
+    let da = stream.clone_htod(&a_host).map_err(map_drv)?;
+    let db = stream.clone_htod(&b_host).map_err(map_drv)?;
     let mut dout = stream.alloc_zeros::<f64>(na * nb).map_err(map_drv)?;
 
     let (kind_code, p1): (i32, f64) = match kernel {
@@ -238,7 +238,7 @@ extern "C" __global__ void spatial_kernel(
     // SAFETY: all kernel-arg lifetimes + bounds checked above.
     unsafe { builder.launch(cfg) }.map_err(map_drv)?;
 
-    let host = stream.memcpy_dtov(&dout).map_err(map_drv)?;
+    let host = stream.clone_dtoh(&dout).map_err(map_drv)?;
     Array2::from_shape_vec((na, nb), host).map_err(|e| GpuError::DriverCallFailed {
         reason: format!("spatial host reshape failed: {e}"),
     })
