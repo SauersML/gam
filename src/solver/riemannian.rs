@@ -400,13 +400,11 @@ impl Manifold for Sphere {
         for i in 0..p.len() {
             v[i] -= dot * p[i];
         }
-        if cfg!(debug_assertions) {
-            let mut chk = 0.0_f64;
-            for i in 0..p.len() {
-                chk += v[i] * p[i];
-            }
-            assert!(chk.abs() < 1.0e-8 * (1.0 + p.len() as f64));
+        let mut chk = 0.0_f64;
+        for i in 0..p.len() {
+            chk += v[i] * p[i];
         }
+        assert!(chk.abs() < 1.0e-8 * (1.0 + p.len() as f64));
     }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
         // Closed-form projective retraction R_p(ξ) = (p + ξ)/||p + ξ||
@@ -427,15 +425,14 @@ impl Manifold for Sphere {
         for i in 0..m {
             out[i] /= norm;
         }
-        if cfg!(debug_assertions) {
-            let mut n2 = 0.0_f64;
-            for i in 0..m {
-                n2 += out[i] * out[i];
-            }
-            assert!(
-                (n2 - 1.0).abs() < 1.0e-9,
-                "Sphere::retract output not on S^n"
-            );
+        let mut n2 = 0.0_f64;
+        for i in 0..m {
+            n2 += out[i] * out[i];
+        }
+        assert!(
+            (n2 - 1.0).abs() < 1.0e-9,
+            "Sphere::retract output not on S^n"
+        );
         }
     }
     fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
