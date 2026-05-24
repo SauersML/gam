@@ -7,9 +7,9 @@
 
 use gam::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
-    BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, CenterStrategy,
-    OneDimensionalBoundary, PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec,
-    build_bspline_basis_1d, build_periodic_bspline_basis_1d, build_spherical_spline_basis,
+    BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, CenterStrategy, OneDimensionalBoundary,
+    PeriodicBSplineBasisSpec, SphereMethod, SphericalSplineBasisSpec, build_bspline_basis_1d,
+    build_periodic_bspline_basis_1d, build_spherical_spline_basis,
     create_cyclic_difference_penalty_matrix, evaluate_bspline_derivative_scalar,
     periodic_bspline_first_derivative_nd, spherical_wahba_kernel_matrix,
 };
@@ -49,9 +49,11 @@ fn periodic_derivative_dense(
     num_basis: usize,
 ) -> Result<Array2<f64>, gam::basis::BasisError> {
     let t = x.to_owned().insert_axis(Axis(1));
-    Ok(periodic_bspline_first_derivative_nd(t.view(), data_range, degree, num_basis)?
-        .index_axis(Axis(2), 0)
-        .to_owned())
+    Ok(
+        periodic_bspline_first_derivative_nd(t.view(), data_range, degree, num_basis)?
+            .index_axis(Axis(2), 0)
+            .to_owned(),
+    )
 }
 
 fn random_lat_lon(n: usize, seed: u64) -> Array2<f64> {

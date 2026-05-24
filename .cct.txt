@@ -1,1 +1,30 @@
    Compiling gam v0.2.1 (/Users/user/gam)
+error[E0063]: missing field `boundary` in initializer of `BSplineBasisSpec`
+   --> tests/biobank_perf_benchmark.rs:328:18
+    |
+328 |     let spec_x = BSplineBasisSpec {
+    |                  ^^^^^^^^^^^^^^^^ missing `boundary`
+
+error[E0063]: missing field `boundary` in initializer of `BSplineBasisSpec`
+   --> tests/biobank_perf_benchmark.rs:339:18
+    |
+339 |     let spec_h = BSplineBasisSpec {
+    |                  ^^^^^^^^^^^^^^^^ missing `boundary`
+
+error[E0063]: missing field `periods` in initializer of `TensorBSplineSpec`
+   --> tests/biobank_perf_benchmark.rs:357:23
+    |
+357 |                 spec: TensorBSplineSpec {
+    |                       ^^^^^^^^^^^^^^^^^ missing `periods`
+
+For more information about this error, try `rustc --explain E0063`.
+error: could not compile `gam` (test "biobank_perf_benchmark") due to 3 previous errors
+warning: build failed, waiting for other jobs to finish...
+error[E0599]: no method named `variance_scale` found for enum `Dispersion` in the current scope
+  --> tests/uncertainty_integration.rs:75:26
+   |
+75 |     let phi = dispersion.variance_scale();
+   |                          ^^^^^^^^^^^^^^ method not found in `Dispersion`
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `gam` (test "uncertainty_integration") due to 1 previous error
