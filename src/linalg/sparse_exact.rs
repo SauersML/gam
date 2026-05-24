@@ -1440,25 +1440,6 @@ impl TakahashiInverse {
     }
 }
 
-/// Compute tr(H⁻¹ Sₖ) using a precomputed Takahashi selected inverse.
-pub fn trace_hinv_sk_takahashi(taka: &TakahashiInverse, penalty: &SparsePenaltyBlock) -> f64 {
-    if penalty.block_support_strict {
-        let mut trace = 0.0;
-        for &(row, col, val) in penalty.s_k_block_upper_entries.iter() {
-            let z_val = taka.get(penalty.p_start + row, penalty.p_start + col);
-            if row == col {
-                trace += z_val * val;
-            } else {
-                trace += 2.0 * z_val * val;
-            }
-        }
-        trace
-    } else {
-        // General: sparse trace
-        taka.trace_product_sparse(&penalty.s_k_sparse)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1565,43 +1546,6 @@ mod tests {
 
         let sfactor = factorize_simplicial(&h_sparse).unwrap();
         approx_eq(sfactor.logdet, logdet_dense, 1e-10);
-    }
-
-    #[test]
-    fn takahashi_trace_hinv_sk_matches_column_solve() {
-        assert!(file!().ends_with(".rs"));
-        let h = array![
-            [4.0, 0.2, 0.0, 0.0],
-            [0.2, 3.0, 0.1, 0.0],
-            [0.0, 0.1, 2.5, 0.3],
-            [0.0, 0.0, 0.3, 2.0]
-        ];
-        let h_sparse = dense_to_sparse_symmetric_upper(&h, ZERO_TOL).unwrap();
-
-        let mut s = Array2::<f64>::zeros((4, 4));
-        s[[1, 1]] = 2.0;
-        s[[2, 2]] = 3.0;
-        let blocks = super::tests_blocks::build_sparse_penalty_blocks(&[s])
-            .unwrap()
-            .expect("single local block expected");
-
-        let chol = h.cholesky(Side::Lower).unwrap();
-        let mut h_inv = Array2::<f64>::zeros((4, 4));
-        for j in 0..4 {
-            let mut rhs = Array1::<f64>::zeros(4);
-            rhs[j] = 1.0;
-            let col = chol.solvevec(&rhs);
-            for i in 0..4 {
-                h_inv[[i, j]] = col[i];
-            }
-        }
-        let reference = h_inv[[1, 1]] * 2.0 + h_inv[[2, 2]] * 3.0;
-
-        let sfactor = factorize_simplicial(&h_sparse).unwrap();
-        let taka = TakahashiInverse::compute(&sfactor).unwrap();
-        let taka_result = trace_hinv_sk_takahashi(&taka, &blocks[0]);
-
-        approx_eq(taka_result, reference, 1e-10);
     }
 
     #[test]
