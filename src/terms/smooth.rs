@@ -17391,21 +17391,15 @@ impl<'d> ExactJointDesignCache<'d> {
 pub(crate) fn seed_risk_profile_for_likelihood_family(
     family: LikelihoodSpec,
 ) -> crate::seeding::SeedRiskProfile {
-    match family {
-        LikelihoodFamily::GaussianIdentity => crate::seeding::SeedRiskProfile::Gaussian,
-        LikelihoodFamily::RoystonParmar => crate::seeding::SeedRiskProfile::Survival,
-        LikelihoodFamily::BinomialLogit
-        | LikelihoodFamily::BinomialProbit
-        | LikelihoodFamily::BinomialCLogLog
-        | LikelihoodFamily::BinomialLatentCLogLog
-        | LikelihoodFamily::BinomialSas
-        | LikelihoodFamily::BinomialBetaLogistic
-        | LikelihoodFamily::BinomialMixture
-        | LikelihoodFamily::PoissonLog
-        | LikelihoodFamily::Tweedie { .. }
-        | LikelihoodFamily::NegativeBinomial { .. }
-        | LikelihoodFamily::BetaLogit { .. }
-        | LikelihoodFamily::GammaLog => crate::seeding::SeedRiskProfile::GeneralizedLinear,
+    match &family.response {
+        ResponseFamily::Gaussian => crate::seeding::SeedRiskProfile::Gaussian,
+        ResponseFamily::RoystonParmar => crate::seeding::SeedRiskProfile::Survival,
+        ResponseFamily::Binomial
+        | ResponseFamily::Poisson
+        | ResponseFamily::Tweedie { .. }
+        | ResponseFamily::NegativeBinomial { .. }
+        | ResponseFamily::Beta { .. }
+        | ResponseFamily::Gamma => crate::seeding::SeedRiskProfile::GeneralizedLinear,
     }
 }
 
