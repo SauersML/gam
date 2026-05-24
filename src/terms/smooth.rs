@@ -33,7 +33,7 @@ use crate::estimate::{
     reml::DirectionalHyperParam,
 };
 use crate::faer_ndarray::{fast_ab, fast_atb, fast_atv};
-use crate::families::strategy::{FamilyStrategy, strategy_for_family};
+use crate::families::strategy::{FamilyStrategy, strategy_for_spec};
 use crate::matrix::{
     BlockDesignOperator, CoefficientTransformOperator, DenseDesignOperator, DesignBlock,
     DesignMatrix, LinearOperator, RandomEffectOperator, SymmetricMatrix,
