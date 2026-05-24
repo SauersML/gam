@@ -92,11 +92,19 @@ impl ManifoldWarning {
     }
 }
 
-fn no_manifold_warning(p: ArrayView1<'_, f64>, ambient_dim: usize) -> Option<ManifoldWarning> {
+fn no_manifold_warning(valid_dimension: bool) -> Option<ManifoldWarning> {
+    match valid_dimension {
+        true => None,
+        false => Some(ManifoldWarning::InvalidPointDimension),
+    }
+}
+
+fn valid_manifold_warning_dimension(p: ArrayView1<'_, f64>, ambient_dim: usize) -> bool {
     match p.len().cmp(&ambient_dim) {
         std::cmp::Ordering::Equal => None,
         _ => Some(ManifoldWarning::InvalidPointDimension),
     }
+    .is_none()
 }
 
 /// Trait for a smooth manifold on which a per-point latent coordinate lives.
@@ -172,9 +180,17 @@ pub trait Manifold: Send + Sync {
     }
 
     /// Typed advisory sentinel — preferred over [`Manifold::warn_at`] for
-    /// callers that route to a structured logger. Default returns `None`.
+    /// callers that route to a structured logger. Default surfaces a
+    /// dimension mismatch when `p.len() != ambient_dim()`; otherwise no
+    /// warning. Concrete manifolds (Sphere near the pole, Interval near
+    /// the boundary, etc.) override with their own chart-singularity
+    /// proximity checks.
     fn warn_at_typed(&self, p: ArrayView1<f64>) -> Option<ManifoldWarning> {
-        no_manifold_warning(p, self.ambient_dim())
+        if p.len() == self.ambient_dim() {
+            None
+        } else {
+            Some(ManifoldWarning::InvalidPointDimension)
+        }
     }
 
     /// Orthonormal basis `Q ∈ ℝ^{m × d}` for the tangent space `T_p M`,
@@ -560,7 +576,7 @@ impl Manifold for Sphere {
         {
             return Some(ManifoldWarning::SphereNearPole);
         }
-        no_manifold_warning(p.len() == self.ambient_dim())
+        no_manifold_warning(valid_manifold_warning_dimension(p, self.ambient_dim()))
     }
     fn name(&self) -> &str {
         "Sphere"
