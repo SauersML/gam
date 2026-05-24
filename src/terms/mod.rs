@@ -17,9 +17,9 @@ pub use analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyOp,
     AnalyticPenaltyRegistry, AuxConditionalPriorPenalty, BlockSparsityPenalty, DifferenceOpKind,
     FrozenAnalyticPenaltyOp, IBPAssignmentPenalty, IsometryPenalty, IsometryDuchonRadialSource,
-    IsometryReference, NuclearNormPenalty, OrthogonalityPenalty, PenaltyTier, PsiSlice,
-    SoftmaxAssignmentSparsityPenalty, SparsityKind, SparsityPenalty, TotalVariationPenalty,
-    WeightField,
+    IsometryReference, NuclearNormPenalty, OrthogonalityPenalty,
+    ParametricAuxConditionalPriorPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty,
+    SparsityKind, SparsityPenalty, TotalVariationPenalty, WeightField,
 };
 pub use atom_selection::{
     AssignmentSparsityCoupling, AtomLibrary, AtomRecord, AtomSelectionStrategy, EntropicSoftmax,
