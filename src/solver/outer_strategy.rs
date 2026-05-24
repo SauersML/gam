@@ -1764,7 +1764,8 @@ pub trait OuterObjective {
     /// slope, …) override this to install β as the warm-start iterate so the
     /// first inner solve opens at `‖∇‖ ≈ 0` and the boundary-ρ conditioning
     /// stops mattering.
-    fn seed_inner_state(&mut self, _beta: &Array1<f64>) -> Result<(), EstimationError> {
+    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<(), EstimationError> {
+        drop(beta);
         Ok(())
     }
 }
@@ -1894,8 +1895,9 @@ pub(crate) enum CacheSeedDecision {
 pub(crate) fn classify_cache_entry_for_outer(
     loaded: &crate::cache::LoadedEntry,
     expected_rho_dim: usize,
-    _rho_bound: f64,
+    rho_bound: f64,
 ) -> CacheSeedDecision {
+    drop(rho_bound);
     let entry = &loaded.entry;
     let Some(payload) = decode_iterate(&entry.payload, expected_rho_dim) else {
         return CacheSeedDecision::Discard {
@@ -3146,7 +3148,8 @@ struct OuterAcceptObserver {
 }
 
 impl OptimizerObserver for OuterAcceptObserver {
-    fn on_step_accepted(&mut self, _info: &StepInfo) {
+    fn on_step_accepted(&mut self, info: &StepInfo) {
+        drop(info);
         self.feedback.accepted_iter.fetch_add(1, Ordering::Relaxed);
     }
 }

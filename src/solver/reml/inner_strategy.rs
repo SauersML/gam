@@ -20,9 +20,10 @@ pub(super) struct HessianStrategyDecision {
 impl<'a> RemlState<'a> {
     pub(super) fn selecthessian_strategy_policy(
         &self,
-        _rho: &Array1<f64>,
+        rho: &Array1<f64>,
         bundle: &EvalShared,
     ) -> HessianStrategyDecision {
+        drop(rho);
         // When the sparse-exact backend produced the PIRLS result, prefer
         // the sparse Hessian path for consistency (avoids dense→sparse
         // round-trip that loses sparsity structure).

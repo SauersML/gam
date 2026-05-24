@@ -8373,8 +8373,9 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         mode: super::unified::EvalMode,
-        _has_ext: bool,
+        has_ext: bool,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
+        drop(has_ext);
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             self.build_sparse_assembly(rho, bundle, mode)
         } else if matches!(

@@ -9108,8 +9108,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
     fn outer_hyper_hessian_hvp_available(
         &self,
-        _specs: &[crate::custom_family::ParameterBlockSpec],
+        specs: &[crate::custom_family::ParameterBlockSpec],
     ) -> bool {
+        drop(specs);
         true
     }
 
@@ -9389,12 +9390,17 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
     fn exact_newton_joint_psisecond_order_terms(
         &self,
-        _block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
-        _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        _psi_i: usize,
-        _psi_j: usize,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        psi_i: usize,
+        psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        drop(block_states);
+        drop(specs);
+        drop(derivative_blocks);
+        drop(psi_i);
+        drop(psi_j);
         Ok(None)
     }
 
@@ -9457,21 +9463,29 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
     fn exact_newton_joint_psihessian_directional_derivative(
         &self,
-        _block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
-        _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        _psi_index: usize,
-        _d_beta_flat: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        drop(block_states);
+        drop(specs);
+        drop(derivative_blocks);
+        drop(psi_index);
+        drop(d_beta_flat);
         Ok(None)
     }
 
     fn exact_newton_joint_hessiansecond_directional_derivative(
         &self,
-        _block_states: &[ParameterBlockState],
-        _d_beta_u_flat: &Array1<f64>,
-        _d_beta_v_flat: &Array1<f64>,
+        block_states: &[ParameterBlockState],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        drop(block_states);
+        drop(d_beta_u_flat);
+        drop(d_beta_v_flat);
         Ok(None)
     }
 
@@ -9545,8 +9559,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        drop(specs);
         Ok(Some(Arc::new(
             SurvivalLocationScaleExactNewtonJointHessianWorkspace::new(
                 self.clone(),
@@ -9558,9 +9573,10 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     fn exact_newton_joint_hessian_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        drop(specs);
         let mut workspace = SurvivalLocationScaleExactNewtonJointHessianWorkspace::new(
             self.clone(),
             block_states.to_vec(),
@@ -10310,17 +10326,21 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
 
     fn block_linear_constraints(
         &self,
-        _psi_i: usize,
-        _psi_j: usize,
+        psi_i: usize,
+        psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        drop(psi_i);
+        drop(psi_j);
         Ok(None)
     }
 
     fn hessian_directional_derivative(
         &self,
-        _psi_index: usize,
-        _d_beta_flat: &Array1<f64>,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
     ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
+        drop(psi_index);
+        drop(d_beta_flat);
         Ok(None)
     }
 }
@@ -10400,17 +10420,21 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
 
     fn second_directional_derivative(
         &self,
-        _d_beta_u_flat: &Array1<f64>,
-        _d_beta_v_flat: &Array1<f64>,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        drop(d_beta_u_flat);
+        drop(d_beta_v_flat);
         Ok(None)
     }
 
     fn second_directional_derivative_operator(
         &self,
-        _d_beta_u_flat: &Array1<f64>,
-        _d_beta_v_flat: &Array1<f64>,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        drop(d_beta_u_flat);
+        drop(d_beta_v_flat);
         Ok(self
             .family
             .exact_newton_joint_hessiansecond_directional_derivative_from_parts(

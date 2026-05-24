@@ -36,10 +36,13 @@ pub trait VectorPredictableModel {
     /// Optional per-column SE on η. Default: None (scaffold the API).
     fn predict_column_se(
         &self,
-        _x: &Self::Design,
-        _t: &Self::Latent,
-        _m: usize,
+        x: &Self::Design,
+        t: &Self::Latent,
+        m: usize,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
+        drop(x);
+        drop(t);
+        drop(m);
         Ok(None)
     }
 }

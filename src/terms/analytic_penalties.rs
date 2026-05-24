@@ -299,9 +299,11 @@ pub trait AnalyticPenalty: Send + Sync {
     /// (Isometry); those implement [`Self::hvp`] instead.
     fn hessian_diag(
         &self,
-        _target: ArrayView1<'_, f64>,
-        _rho: ArrayView1<'_, f64>,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
+        drop(target);
+        drop(rho);
         None
     }
 
