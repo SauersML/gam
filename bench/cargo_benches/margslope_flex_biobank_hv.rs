@@ -30,11 +30,13 @@ fn bench_margslope_flex_biobank_cycle0(c: &mut Criterion) {
             let (fit, timing) = fit_problem(problem, cycle_capped_options(inner_cycles))
                 .expect("criterion biobank-shape margslope fit");
             eprintln!(
-                "[MS-FLEX-BIOBANK-BENCH-ITER] n={} inner_max_cycles={} elapsed_s={:.3} inner_cycles={} beta_len={}",
+                "[MS-FLEX-BIOBANK-BENCH-ITER] n={} inner_max_cycles={} elapsed_s={:.3} outer_iters={} inner_cycles={} converged={} beta_len={}",
                 n,
                 inner_cycles,
                 timing.elapsed.as_secs_f64(),
+                timing.outer_iterations,
                 timing.inner_cycles,
+                timing.outer_converged,
                 fit.fit.beta.len()
             );
             black_box(fit.fit.beta.len())
