@@ -279,7 +279,6 @@ impl CtnDenseHessianKey {
 /// scale.
 #[derive(Default)]
 pub(crate) struct CtnPersistentDenseHessianCache {
-    #[expect(dead_code)]
     slot: Mutex<Option<(CtnDenseHessianKey, Arc<Array2<f64>>)>>,
 }
 
@@ -413,7 +412,6 @@ pub struct TransformationNormalFamily {
     /// for the full-data family; `Some(hash)` for subsampled clones. The hash
     /// is over the HT mask + per-row weight bits so that two subsamples with
     /// the same β never alias each other's caches.
-    #[expect(dead_code)]
     outer_subsample_hash: Option<u64>,
 }
 
@@ -429,7 +427,6 @@ struct TransformationNormalRowQuantityCache {
     log_likelihood: f64,
     /// Monotonic version tag set at construction time. Used by the
     /// persistent dense-Hessian cache key.
-    #[expect(dead_code)]
     version: u64,
 }
 
