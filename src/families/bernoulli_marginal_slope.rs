@@ -37,7 +37,7 @@ use crate::smooth::{
     spatial_length_scale_term_indices,
 };
 use crate::types::{InverseLink, LinkFunction, WigglePenaltyConfig};
-use ndarray::{Array1, Array2, ArrayView2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
 };
@@ -46,6 +46,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+thread_local! {
+    static EMPIRICAL_FLEX_DIRECTION_SCRATCH: RefCell<EmpiricalFlexDirectionScratch> =
+        RefCell::new(EmpiricalFlexDirectionScratch::new(0));
+}
 
 pub mod deviation_runtime;
 pub(crate) mod exact_kernel;
@@ -4961,6 +4966,27 @@ struct BernoulliMarginalSlopeFlexRowScratch {
     zero_family: Vec<[f64; 4]>,
 }
 
+struct EmpiricalFlexDirectionScratch {
+    basis_u: Array1<f64>,
+    basis_v: Array1<f64>,
+}
+
+impl EmpiricalFlexDirectionScratch {
+    fn new(primary_dim: usize) -> Self {
+        Self {
+            basis_u: Array1::zeros(primary_dim),
+            basis_v: Array1::zeros(primary_dim),
+        }
+    }
+
+    fn ensure_dim(&mut self, primary_dim: usize) {
+        if self.basis_u.len() != primary_dim {
+            self.basis_u = Array1::zeros(primary_dim);
+            self.basis_v = Array1::zeros(primary_dim);
+        }
+    }
+}
+
 impl BernoulliMarginalSlopeFlexRowScratch {
     fn new(primary_dim: usize) -> Self {
         Self {
@@ -5912,7 +5938,7 @@ impl BernoulliMarginalSlopeFamily {
     fn primary_component_jet(
         n_dirs: usize,
         base: f64,
-        directions: &[Array1<f64>],
+        directions: &[ArrayView1<'_, f64>],
         idx: usize,
     ) -> Result<MultiDirJet, String> {
         let first = directions
@@ -5959,7 +5985,7 @@ impl BernoulliMarginalSlopeFamily {
         b_jet: &MultiDirJet,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
-        directions: &[Array1<f64>],
+        directions: &[ArrayView1<'_, f64>],
         z: f64,
     ) -> Result<(MultiDirJet, MultiDirJet), String> {
         let n_dirs = directions.len();
@@ -6034,7 +6060,7 @@ impl BernoulliMarginalSlopeFamily {
         b_jet: &MultiDirJet,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
-        directions: &[Array1<f64>],
+        directions: &[ArrayView1<'_, f64>],
         grid: &EmpiricalZGrid,
     ) -> Result<(MultiDirJet, MultiDirJet), String> {
         let n_dirs = directions.len();
@@ -6061,7 +6087,7 @@ impl BernoulliMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
-        directions: &[Array1<f64>],
+        directions: &[ArrayView1<'_, f64>],
         grid: &EmpiricalZGrid,
     ) -> Result<MultiDirJet, String> {
         let n_dirs = directions.len();
@@ -6136,12 +6162,6 @@ impl BernoulliMarginalSlopeFamily {
             signed.coeff(0),
             self.weights[row],
         )))
-    }
-
-    fn unit_primary_direction(dim: usize, idx: usize) -> Array1<f64> {
-        let mut direction = Array1::<f64>::zeros(dim);
-        direction[idx] = 1.0;
-        direction
     }
 
     fn empirical_flex_row_third_contracted_recompute(
