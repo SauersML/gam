@@ -1,31 +1,3 @@
     Blocking waiting for file lock on build directory
    Compiling gam v0.2.1 (/Users/user/gam)
-error: enum `BudgetVerdict` is never used
-  --> tests/power_law_common.rs:56:10
-   |
-56 | pub enum BudgetVerdict {
-   |          ^^^^^^^^^^^^^
-   |
-   = note: `-D dead-code` implied by `-D warnings`
-   = help: to override `-D warnings` add `#[allow(dead_code)]`
-
-error: function `report_power_law_full` is never used
-  --> tests/power_law_common.rs:61:8
-   |
-61 | pub fn report_power_law_full(
-   |        ^^^^^^^^^^^^^^^^^^^^^
-
-error: could not compile `gam` (test "standard_gam_scaling") due to 2 previous errors
-warning: build failed, waiting for other jobs to finish...
-error[E0432]: unresolved imports `margslope_flex_equivalence::DEFAULT_SMOKE_N`, `margslope_flex_equivalence::DEFAULT_WALL_BOUND`, `margslope_flex_equivalence::assert_repeated_fit_beta_equivalent`
-  --> tests/margslope_flex_biobank_repro.rs:27:22
-   |
-27 |     DEFAULT_REPRO_N, DEFAULT_SMOKE_N, DEFAULT_WALL_BOUND, assert_repeated_fit_beta_equivalent,
-   |                      ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `assert_repeated_fit_beta_equivalent` in `margslope_flex_equivalence`
-   |                      |                |
-   |                      |                no `DEFAULT_WALL_BOUND` in `margslope_flex_equivalence`
-   |                      no `DEFAULT_SMOKE_N` in `margslope_flex_equivalence`
-   |                      help: a similar name exists in the module: `DEFAULT_REPRO_N`
-
-For more information about this error, try `rustc --explain E0432`.
-error: could not compile `gam` (test "margslope_flex_biobank_repro") due to 1 previous error
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 41.17s
