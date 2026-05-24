@@ -135,7 +135,7 @@ pub fn global_policy() -> GpuPolicy {
 /// concurrent fits cannot race policy changes.
 pub fn configure_global_policy(policy: GpuPolicy) {
     // First-writer-wins semantics; ignore a redundant late call.
-    drop(POLICY.set(policy));
+    POLICY.set(policy).ok();
 }
 
 /// Decide whether a GPU kernel may run. This is deliberately conservative:
