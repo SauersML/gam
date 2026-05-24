@@ -2241,6 +2241,19 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .set_analytic_penalty_registry_fingerprint(fingerprint);
     }
 
+    pub(crate) fn load_persistent_latent_values(
+        &self,
+        n_obs: usize,
+        latent_dim: usize,
+    ) -> Option<Array2<f64>> {
+        self.reml_state
+            .load_persistent_latent_values(n_obs, latent_dim)
+    }
+
+    pub(crate) fn store_persistent_latent_values(&self, values: &Array2<f64>) {
+        self.reml_state.store_persistent_latent_values(values);
+    }
+
     fn prepare_eval_state(
         &mut self,
         x: &DesignMatrix,
