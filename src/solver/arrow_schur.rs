@@ -1999,6 +1999,8 @@ where
         return Ok(x);
     }
     let mut ap = Array1::<f64>::zeros(n);
+    // Reused candidate scratch — avoid per-iteration clone of x.
+    let mut candidate = Array1::<f64>::zeros(n);
     for _ in 0..max_iterations {
         matvec(&p, &mut ap);
         let pap = metric_dot(&p, &ap, metric_weights);
@@ -2011,14 +2013,13 @@ where
             });
         }
         let alpha = rz / pap;
-        let mut candidate = x.clone();
         for i in 0..n {
-            candidate[i] += alpha * p[i];
+            candidate[i] = x[i] + alpha * p[i];
         }
         if radius.is_finite() && metric_norm(candidate.view(), metric_weights) >= radius {
             return Ok(step_to_trust_boundary(&x, &p, radius, metric_weights));
         }
-        x = candidate;
+        x.assign(&candidate);
         for i in 0..n {
             r[i] -= alpha * ap[i];
         }

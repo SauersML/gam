@@ -202,26 +202,52 @@ pub enum GpuOperation {
     XtDiagY { n: usize, px: usize, q: usize },
 }
 
+/// Decide whether a generic dense kernel should be routed to the device.
+///
+/// Today this returns `GpuDispatch::Cpu` whenever the GPU layer cannot
+/// admit the workload (no device probed, kernel below threshold, cuda
+/// feature not compiled). When a device backend is wired into
+/// `gpu::blas`, the result variant carries the device output instead, and
+/// callers that consume `GpuDispatch::Executed(array)` automatically take
+/// the GPU path with no further changes.
 #[inline]
 pub fn try_dispatch_dense(op: GpuOperation) -> linalg::GpuDispatch {
-    drop(op);
+    // Probe the auto-dispatch policy so the kernel-level decision matches
+    // the per-call auto-dispatch in `crate::faer_ndarray::fast_*`. Today
+    // there is no compiled backend, so we still return `Cpu` and the
+    // matrix-typed entry points return `None`; the architecture is in
+    // place to swap in cudarc kernels behind `#[cfg(feature = "cuda")]`
+    // and have every caller pick them up automatically.
+    let dispatch_op = match op {
+        GpuOperation::Gemm { m, n, k } => linalg::DispatchOp::Gemm { m, n, k },
+        GpuOperation::Gemv { m, k } => linalg::DispatchOp::Gemv { m, k },
+        GpuOperation::XtDiagX { n, p } => linalg::DispatchOp::XtDiagX { n, p },
+        GpuOperation::XtDiagY { n, px, q } => linalg::DispatchOp::XtDiagY { n, px, q },
+    };
+    drop(linalg::route_through_gpu(dispatch_op));
     linalg::GpuDispatch::Cpu
 }
 
 #[inline]
-pub fn try_fast_ab<A, B>(a: A, b: B) -> Option<ndarray::Array2<f64>> {
-    drop((a, b));
-    None
+pub fn try_fast_ab(
+    a: ndarray::ArrayView2<'_, f64>,
+    b: ndarray::ArrayView2<'_, f64>,
+) -> Option<ndarray::Array2<f64>> {
+    linalg::try_fast_ab(a, b)
 }
 #[inline]
-pub fn try_fast_av<A, V>(a: A, v: V) -> Option<ndarray::Array1<f64>> {
-    drop((a, v));
-    None
+pub fn try_fast_av(
+    a: ndarray::ArrayView2<'_, f64>,
+    v: ndarray::ArrayView1<'_, f64>,
+) -> Option<ndarray::Array1<f64>> {
+    linalg::try_fast_av(a, v)
 }
 #[inline]
-pub fn try_fast_atv<A, V>(a: A, v: V) -> Option<ndarray::Array1<f64>> {
-    drop((a, v));
-    None
+pub fn try_fast_atv(
+    a: ndarray::ArrayView2<'_, f64>,
+    v: ndarray::ArrayView1<'_, f64>,
+) -> Option<ndarray::Array1<f64>> {
+    linalg::try_fast_atv(a, v)
 }
 #[inline]
 pub fn try_syevd_inplace(a: &mut ndarray::Array2<f64>) -> Option<ndarray::Array1<f64>> {
