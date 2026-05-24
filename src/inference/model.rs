@@ -3651,6 +3651,8 @@ mod tests {
             constraint_kkt: None,
             artifacts: FitArtifacts {
                 pirls: None,
+                null_space_logdet: None,
+                null_space_dim: None,
                 survival_link_wiggle_knots: None,
                 survival_link_wiggle_degree: None,
             },

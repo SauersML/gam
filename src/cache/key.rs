@@ -22,7 +22,7 @@ impl Fingerprint {
         let mut s = String::with_capacity(64);
         for b in &self.0 {
             use std::fmt::Write;
-            drop(write!(&mut s, "{:02x}", b));
+            std::hint::black_box(write!(&mut s, "{:02x}", b));
         }
         s
     }

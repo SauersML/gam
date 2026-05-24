@@ -75,7 +75,7 @@ pub trait RiemannianManifold: Send + Sync {
         point: ArrayView1<'_, f64>,
         vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
-        drop(point);
+        std::hint::black_box(point);
         Ok(vec.to_owned())
     }
 

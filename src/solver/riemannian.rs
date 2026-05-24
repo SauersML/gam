@@ -121,7 +121,7 @@ pub trait Manifold: Send + Sync {
     /// Riemannian inner product `<ξ, η>_p`. Default: weighted ambient
     /// inner product restricted to `T_p M`.
     fn inner_product(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, eta: ArrayView1<f64>) -> f64 {
-        drop(p);
+        std::hint::black_box(p);
         debug_assert_eq!(xi.len(), eta.len());
         let weights = self.metric_weights();
         debug_assert_eq!(weights.len(), xi.len());
@@ -161,7 +161,7 @@ pub trait Manifold: Send + Sync {
     /// Typed advisory sentinel — preferred over [`Manifold::warn_at`] for
     /// callers that route to a structured logger. Default returns `None`.
     fn warn_at_typed(&self, p: ArrayView1<f64>) -> Option<ManifoldWarning> {
-        drop(p);
+        std::hint::black_box(p);
         None
     }
 
@@ -248,7 +248,7 @@ impl Manifold for Euclidean {
         self.d
     }
     fn project_tangent(&self, p: ArrayView1<f64>, v: ArrayViewMut1<f64>) {
-        drop(p);
+        std::hint::black_box(p);
         drop(v);
     }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
@@ -259,8 +259,8 @@ impl Manifold for Euclidean {
         }
     }
     fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
-        drop(from);
-        drop(to);
+        std::hint::black_box(from);
+        std::hint::black_box(to);
         drop(xi);
     }
     fn euclidean_to_riemannian_hess_vp(
@@ -270,10 +270,10 @@ impl Manifold for Euclidean {
         ehess_vp: ArrayViewMut1<f64>,
         xi: ArrayView1<f64>,
     ) {
-        drop(p);
-        drop(egrad);
+        std::hint::black_box(p);
+        std::hint::black_box(egrad);
         drop(ehess_vp);
-        drop(xi);
+        std::hint::black_box(xi);
         // Identity: no Weingarten correction in flat space.
     }
     fn name(&self) -> &str {
@@ -326,7 +326,7 @@ impl Manifold for Circle {
         debug_assert!((out[0] * out[0] + out[1] * out[1] - 1.0).abs() < 1.0e-9);
     }
     fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
-        drop(from);
+        std::hint::black_box(from);
         // Projection approximation τ_{p→q}(ξ) = P_q(ξ) (proposal §4.4).
         // Safe even at antipodal endpoints since it does not divide by 1+<p,q>.
         self.project_tangent(to, xi);
@@ -438,7 +438,7 @@ impl Manifold for Sphere {
         }
     }
     fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
-        drop(from);
+        std::hint::black_box(from);
         // Projection transport (proposal §6.4). Cheap, stable, not exactly
         // isometric. Antipodal case (to ≈ -from) does not divide by zero
         // here — unlike exact geodesic transport which has a 1+<p,q>
@@ -592,7 +592,7 @@ impl Manifold for Interval {
     }
     fn project_tangent(&self, p: ArrayView1<f64>, v: ArrayViewMut1<f64>) {
         // 1-d open submanifold of ℝ; tangent space is all of ℝ.
-        drop(p);
+        std::hint::black_box(p);
         drop(v);
     }
     fn retract(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, mut out: ArrayViewMut1<f64>) {
@@ -612,8 +612,8 @@ impl Manifold for Interval {
         );
     }
     fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
-        drop(from);
-        drop(to);
+        std::hint::black_box(from);
+        std::hint::black_box(to);
         drop(xi);
     }
     fn euclidean_to_riemannian_hess_vp(
@@ -625,10 +625,10 @@ impl Manifold for Interval {
     ) {
         // Open submanifold of ℝ: no second fundamental form correction in
         // the natural chart used here.
-        drop(p);
-        drop(egrad);
+        std::hint::black_box(p);
+        std::hint::black_box(egrad);
         drop(ehess_vp);
-        drop(xi);
+        std::hint::black_box(xi);
     }
     fn warn_at_typed(&self, p: ArrayView1<f64>) -> Option<ManifoldWarning> {
         let band = (self.hi - self.lo).abs() * Self::EDGE_FRAC * 10.0;
@@ -641,7 +641,7 @@ impl Manifold for Interval {
     /// Closed-form trivial 1×1 identity basis (proposal §7: T_p M = ℝ in
     /// the interior). Override avoids the generic O(m³) Gram-Schmidt path.
     fn tangent_basis(&self, p: ArrayView1<f64>) -> Array2<f64> {
-        drop(p);
+        std::hint::black_box(p);
         let mut q = Array2::<f64>::zeros((1, 1));
         q[[0, 0]] = 1.0;
         q
@@ -702,7 +702,7 @@ impl Manifold for Torus {
         }
     }
     fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
-        drop(from);
+        std::hint::black_box(from);
         self.project_tangent(to, xi);
     }
     fn euclidean_to_riemannian_hess_vp(

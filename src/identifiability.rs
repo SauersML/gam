@@ -26,7 +26,7 @@
 //! standalone to keep the patch surface tight while parallel agents are
 //! editing `analytic_penalties.rs`.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array2, ArrayView1, ArrayView2};
 
 /// Smoothed column-2-norm of the decoder Jacobian.
 ///

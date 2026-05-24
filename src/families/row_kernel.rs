@@ -271,7 +271,7 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     /// `Array2`). The default returns `None`, in which case generic
     /// per-row `jacobian_action` is used.
     fn jacobian_action_matrix(&self, factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
-        drop(factor);
+        std::hint::black_box(factor);
         None
     }
 }

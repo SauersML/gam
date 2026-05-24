@@ -4285,7 +4285,7 @@ impl SurvivalMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        drop(specs);
+        std::hint::black_box(specs);
         if self.flex_active() {
             return Err(
                 "survival marginal-slope log-sigma hyperderivatives are implemented for the rigid probit marginal-slope kernel; flex score/link/timewiggle kernels still require the analytic cell-tensor sigma path"
@@ -16130,8 +16130,8 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Option<String> {
-        drop(specs);
-        drop(options);
+        std::hint::black_box(specs);
+        std::hint::black_box(options);
         let mut hasher = crate::solver::persistent_warm_start::StableHasher::new();
         hasher.write_str("survival-marginal-slope-family");
         hasher.write_usize(self.n);
@@ -16429,7 +16429,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         // The workspace impl above unconditionally returns `Some(workspace)`
         // — the rigid path produces a `RowKernelHessianWorkspace` and the
         // flex path produces a
@@ -16440,7 +16440,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     }
 
     fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        std::hint::black_box(specs);
         // The exact outer Hessian over θ=(ρ,ψ[,log σ]) can be applied without
         // pairwise θθ materialization: coefficient-Hessian drift terms use the
         // joint-Hessian workspace's directional-derivative operators, and ψ
@@ -18139,7 +18139,7 @@ pub fn fit_survival_marginal_slope_terms(
          designs: &[TermCollectionDesign],
          eval_mode,
          row_set: &crate::families::row_kernel::RowSet| {
-            drop(row_set);
+            std::hint::black_box(row_set);
             use crate::solver::estimate::reml::unified::EvalMode;
             let eval_started = std::time::Instant::now();
             log::info!(
