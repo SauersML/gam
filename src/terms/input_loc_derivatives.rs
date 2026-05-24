@@ -43,7 +43,7 @@
 
 use ndarray::{Array1, Array3, ArrayView2};
 
-use crate::terms::basis::{BasisError, MaternNu, RadialScalarKind, duchon_partial_fraction_coeffs};
+use crate::terms::basis::{BasisError, MaternNu};
 
 // =========================================================================
 // Kernel parameter bundle
@@ -148,6 +148,7 @@ pub fn contract_input_loc_gradient(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terms::basis::{RadialScalarKind, duchon_partial_fraction_coeffs};
     use ndarray::array;
 
     /// Project a `RadialInputKernel` onto the internal `RadialScalarKind`
