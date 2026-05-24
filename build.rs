@@ -3449,3 +3449,444 @@ fn fn_body_is_empty(stripped_lines: &[String], open: usize, close: usize) -> boo
     };
     close_line[..close_brace].chars().all(char::is_whitespace)
 }
+
+/// Cross-file scanner: items defined in `src/` whose identifier is named by
+/// a test/bench file but NOT by any other production `src/` file. Catches
+/// items kept alive only because a test references them (rustc's
+/// `dead_code` lint can't see this because the test target is a consumer).
+///
+/// Lexical and heuristic — false positives are accepted. To control noise:
+///   * Only definitions with NON-`pub` visibility are scanned (`pub(crate)`,
+///     `pub(super)`, `pub(in path)`, or no visibility modifier). Truly
+///     `pub` items may be consumed by external callers we can't see.
+///   * Definitions inside `impl <Trait> for <Type>` blocks are skipped —
+///     trait dispatch is not lexically trackable.
+///   * Identifiers re-exported via `pub use` from `src/lib.rs` /
+///     `src/main.rs` (and the crates/* equivalents) count as production
+///     usage.
+///   * Definitions inside `#[cfg(test)]` regions of `src/` files are not
+///     collected at all — those are test-only and outside scope (sibling
+///     scanners already cover that case).
+///   * Common-name exemption list and `< 3 char` length cut the noisiest
+///     std/third-party collisions.
+fn scan_for_src_items_used_only_by_tests(
+    root: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String, String)>,
+) {
+    const EXEMPT_NAMES: &[&str] = &[
+        "new",
+        "default",
+        "iter",
+        "len",
+        "is_empty",
+        "clone",
+        "from",
+        "into",
+        "as_ref",
+        "as_mut",
+        "next",
+        "build",
+        "with",
+        "to_string",
+        "display",
+        "fmt",
+        "index",
+        "borrow",
+        "drop",
+        "main",
+        "deref",
+        "deref_mut",
+        "hash",
+        "eq",
+        "ne",
+        "cmp",
+        "partial_cmp",
+        "iter_mut",
+        "into_iter",
+        "as_slice",
+        "as_str",
+    ];
+
+    struct SrcFile {
+        rel: PathBuf,
+        content: String,
+        mask: Vec<bool>,
+        stripped: Vec<String>,
+        trait_impl: Vec<bool>,
+    }
+    let mut src_files: Vec<SrcFile> = Vec::new();
+    let mut test_contents: Vec<(PathBuf, String)> = Vec::new();
+
+    visit_files(root, root, &mut |rel, content| {
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let is_test = rel_str.starts_with("tests/")
+            || rel_str.starts_with("bench/")
+            || rel_str.starts_with("benches/")
+            || path_matches_crates_test(&rel_str);
+        if is_test {
+            test_contents.push((rel.to_path_buf(), content.to_string()));
+            return;
+        }
+        let is_src = rel_str.starts_with("src/")
+            || (rel_str.starts_with("crates/") && rel_str.contains("/src/"));
+        if !is_src {
+            return;
+        }
+        let mask = compute_test_mask(content, rel);
+        let stripped = strip_file_lines(content);
+        let trait_impl = compute_trait_impl_mask(content);
+        src_files.push(SrcFile {
+            rel: rel.to_path_buf(),
+            content: content.to_string(),
+            mask,
+            stripped,
+            trait_impl,
+        });
+    });
+
+    // Extract definitions from src/ files.
+    let mut defs: Vec<(usize, usize, String)> = Vec::new();
+    for (fi, sf) in src_files.iter().enumerate() {
+        for (idx, stripped) in sf.stripped.iter().enumerate() {
+            if sf.mask.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let trimmed = stripped.trim_start();
+            let (vis, rest) = strip_leading_visibility(trimmed);
+            if matches!(vis, Visibility::Public) {
+                continue;
+            }
+            let rest = strip_leading_item_modifiers(rest);
+            let Some(ident) = extract_item_ident(rest) else {
+                continue;
+            };
+            if ident.starts_with('_') || ident.len() <= 2 {
+                continue;
+            }
+            if EXEMPT_NAMES.contains(&ident.as_str()) {
+                continue;
+            }
+            if sf.trait_impl.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            defs.push((fi, idx, ident));
+        }
+    }
+
+    if defs.is_empty() {
+        return;
+    }
+
+    // Per-file production token set (whole file, test-masked).
+    let mut per_file_tokens: Vec<std::collections::HashSet<String>> =
+        Vec::with_capacity(src_files.len());
+    for sf in &src_files {
+        let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (idx, stripped) in sf.stripped.iter().enumerate() {
+            if sf.mask.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            extract_ident_tokens_into(stripped, &mut set);
+        }
+        per_file_tokens.push(set);
+    }
+
+    // Per-file per-line token sets (to detect same-file non-definition refs).
+    let mut defining_file_token_lines: Vec<Vec<std::collections::HashSet<String>>> =
+        Vec::with_capacity(src_files.len());
+    for sf in &src_files {
+        let mut v: Vec<std::collections::HashSet<String>> = Vec::with_capacity(sf.stripped.len());
+        for (idx, stripped) in sf.stripped.iter().enumerate() {
+            let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+            if !sf.mask.get(idx).copied().unwrap_or(false) {
+                extract_ident_tokens_into(stripped, &mut set);
+            }
+            v.push(set);
+        }
+        defining_file_token_lines.push(v);
+    }
+
+    // Test reference set with first-hit hint.
+    let mut test_first_hit: std::collections::HashMap<String, PathBuf> =
+        std::collections::HashMap::new();
+    for (rel, content) in &test_contents {
+        let mut local: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for line in content.lines() {
+            let stripped = strip_strings_and_comments(line);
+            extract_ident_tokens_into(&stripped, &mut local);
+        }
+        for tok in local {
+            test_first_hit.entry(tok).or_insert_with(|| rel.clone());
+        }
+    }
+    if test_first_hit.is_empty() {
+        return;
+    }
+
+    // `pub use` re-exports from src/lib.rs / src/main.rs (and crates/* equivs)
+    // count as production usage.
+    let mut pub_use_idents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for sf in &src_files {
+        let rel_str = sf.rel.to_string_lossy().replace('\\', "/");
+        let is_lib_root = rel_str == "src/lib.rs"
+            || rel_str.ends_with("/src/lib.rs")
+            || rel_str == "src/main.rs"
+            || rel_str.ends_with("/src/main.rs");
+        if !is_lib_root {
+            continue;
+        }
+        for stripped in &sf.stripped {
+            collect_pub_use_idents(stripped, &mut pub_use_idents);
+        }
+    }
+
+    for (fi, line_idx, ident) in defs {
+        if pub_use_idents.contains(&ident) {
+            continue;
+        }
+        let Some(test_hint) = test_first_hit.get(&ident) else {
+            continue;
+        };
+        let mut prod_consumer = false;
+        for (other_fi, set) in per_file_tokens.iter().enumerate() {
+            if other_fi == fi {
+                continue;
+            }
+            if set.contains(&ident) {
+                prod_consumer = true;
+                break;
+            }
+        }
+        if !prod_consumer {
+            let token_lines = &defining_file_token_lines[fi];
+            for (li, toks) in token_lines.iter().enumerate() {
+                if li == line_idx {
+                    continue;
+                }
+                if toks.contains(&ident) {
+                    prod_consumer = true;
+                    break;
+                }
+            }
+        }
+        if prod_consumer {
+            continue;
+        }
+        let sf = &src_files[fi];
+        let raw = sf.content.lines().nth(line_idx).unwrap_or("").to_string();
+        let hint = format!(
+            "{} (test ref: {})",
+            ident,
+            test_hint.to_string_lossy().replace('\\', "/")
+        );
+        offenders.push((sf.rel.clone(), line_idx + 1, hint, raw));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Visibility {
+    Private,
+    Public,
+    PubScoped,
+}
+
+/// Strip a leading visibility modifier from `trimmed`. Returns the
+/// classification and the remainder after the modifier and any trailing
+/// whitespace.
+fn strip_leading_visibility(trimmed: &str) -> (Visibility, &str) {
+    if let Some(rest) = trimmed.strip_prefix("pub(") {
+        let bytes = rest.as_bytes();
+        let mut depth = 1i32;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        let after = rest[i + 1..].trim_start();
+                        return (Visibility::PubScoped, after);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        return (Visibility::PubScoped, "");
+    }
+    if let Some(rest) = trimmed.strip_prefix("pub ") {
+        return (Visibility::Public, rest.trim_start());
+    }
+    if trimmed == "pub" {
+        return (Visibility::Public, "");
+    }
+    (Visibility::Private, trimmed)
+}
+
+/// Strip leading per-item modifiers (`unsafe`, `async`, `default`,
+/// `const fn`, `extern "..."`) before the item-kind keyword.
+fn strip_leading_item_modifiers(mut s: &str) -> &str {
+    loop {
+        let before = s;
+        if let Some(rest) = s.strip_prefix("unsafe ") {
+            s = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("async ") {
+            s = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("default ") {
+            s = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("const fn ") {
+            // Reinsert `fn ` so extract_item_ident sees the kind keyword.
+            // We can't return a synthetic str; instead match by leaving the
+            // `fn ` prefix in place: walk back to include it.
+            // Simpler: this branch always means the item is a fn — emit a
+            // marker via this static prefix-restoration trick: caller will
+            // strip `fn ` itself. We achieve that by returning a slice that
+            // begins at "fn " in the ORIGINAL `s`. The original `s` begins
+            // with "const fn "; "fn " starts at offset 6.
+            return &s[6..];
+        }
+        if let Some(rest) = s.strip_prefix("extern ") {
+            let r = rest.trim_start();
+            if r.starts_with('"') {
+                if let Some(end) = r[1..].find('"') {
+                    s = r[end + 2..].trim_start();
+                    continue;
+                }
+            }
+            s = r;
+            continue;
+        }
+        if s == before {
+            return s;
+        }
+    }
+}
+
+/// Extract the item identifier from a line beginning with an item-kind
+/// keyword (`fn`, `struct`, `enum`, `const`, `static`, `type`, `trait`).
+/// Returns None if `s` does not begin with one of those.
+fn extract_item_ident(s: &str) -> Option<String> {
+    for kw in ["fn ", "struct ", "enum ", "const ", "static ", "type ", "trait "] {
+        if let Some(rest) = s.strip_prefix(kw) {
+            let rest = rest.trim_start();
+            let bytes = rest.as_bytes();
+            if bytes.is_empty() {
+                return None;
+            }
+            if !(bytes[0].is_ascii_alphabetic() || bytes[0] == b'_') {
+                return None;
+            }
+            let mut end = 0usize;
+            while end < bytes.len() && is_ident_byte(bytes[end]) {
+                end += 1;
+            }
+            if end == 0 {
+                return None;
+            }
+            return Some(rest[..end].to_string());
+        }
+    }
+    None
+}
+
+/// Extract identifier-shaped tokens from `stripped` into `out`. Runs of
+/// `[a-zA-Z_][a-zA-Z0-9_]*` (length >= 1) are collected; numeric-leading
+/// runs are skipped as numeric literals.
+fn extract_ident_tokens_into(stripped: &str, out: &mut std::collections::HashSet<String>) {
+    let bytes = stripped.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
+    while i < n {
+        let b = bytes[i];
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let s = i;
+            while i < n && is_ident_byte(bytes[i]) {
+                i += 1;
+            }
+            out.insert(stripped[s..i].to_string());
+        } else if b.is_ascii_digit() {
+            while i < n && (is_ident_byte(bytes[i]) || bytes[i] == b'.') {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Collect identifiers re-exported by a `pub use` (or `pub(crate) use`)
+/// statement on `stripped`. Captures the trailing-segment ident of each
+/// path: `pub use foo::Bar;` → `Bar`; `pub use foo::{A, B as C};` →
+/// `A`, `C`. Wildcards yield nothing.
+fn collect_pub_use_idents(stripped: &str, out: &mut std::collections::HashSet<String>) {
+    let t = stripped.trim_start();
+    let rest = if let Some(r) = t.strip_prefix("pub use ") {
+        r
+    } else if let Some(r) = t.strip_prefix("pub(crate) use ") {
+        r
+    } else {
+        return;
+    };
+    let rest = rest.trim_end().trim_end_matches(';').trim();
+    collect_use_tree_idents(rest, out);
+}
+
+fn collect_use_tree_idents(tree: &str, out: &mut std::collections::HashSet<String>) {
+    if let Some(brace_start) = tree.find('{') {
+        let prefix = &tree[..brace_start];
+        let inside = &tree[brace_start + 1..];
+        let close = match inside.rfind('}') {
+            Some(p) => p,
+            None => return,
+        };
+        let inside = &inside[..close];
+        let mut depth = 0i32;
+        let mut start = 0usize;
+        let bytes = inside.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                b',' if depth == 0 => {
+                    let seg = inside[start..i].trim();
+                    if !seg.is_empty() {
+                        let combined = format!("{}{}", prefix, seg);
+                        collect_use_tree_idents(&combined, out);
+                    }
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        let tail = inside[start..].trim();
+        if !tail.is_empty() {
+            let combined = format!("{}{}", prefix, tail);
+            collect_use_tree_idents(&combined, out);
+        }
+        return;
+    }
+    let path = tree.trim();
+    if path.is_empty() || path == "*" || path.ends_with("::*") {
+        return;
+    }
+    if let Some(as_pos) = path.rfind(" as ") {
+        let alias = path[as_pos + 4..].trim().trim_end_matches(',').trim();
+        if !alias.is_empty() && alias != "_" {
+            out.insert(alias.to_string());
+        }
+        return;
+    }
+    let last = path.rsplit("::").next().unwrap_or(path).trim();
+    if !last.is_empty() && last != "*" && last != "self" {
+        out.insert(last.to_string());
+    }
+}

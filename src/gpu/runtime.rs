@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::device::GpuDeviceInfo;
-use super::diagnostics;
 use super::policy::GpuDispatchPolicy;
 use cudarc::driver::{CudaContext, result, sys};
+
+#[path = "diagnostics.rs"]
+pub(crate) mod diagnostics;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[must_use]

@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
 
-use super::device::GpuDeviceInfo;
-use super::policy::GpuDispatchPolicy;
-use super::runtime::GpuRuntime;
+use super::super::device::GpuDeviceInfo;
+use super::super::policy::GpuDispatchPolicy;
+use super::GpuRuntime;
 
 pub(crate) fn log_cuda_enabled(device: &GpuDeviceInfo, policy: &GpuDispatchPolicy) {
     log::info!(
