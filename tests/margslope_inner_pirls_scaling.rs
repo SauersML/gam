@@ -467,6 +467,6 @@ fn report_power_law(
 ) -> Option<(f64, f64, f64)> {
     // Thin wrapper around the shared analyzer; preserves
     // the (alpha, a, r²) return tuple this probe's caller expects.
-    let report = power_law_common::report_power_law_full(tag, points, extrapolate, budget_y)?;
-    Some((report.fit.alpha, report.fit.a, report.fit.r2))
+    let fit = power_law_common::report_power_law_full(tag, points, extrapolate, budget_y)?;
+    Some((fit.alpha, fit.a, fit.r2))
 }
