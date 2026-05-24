@@ -31,7 +31,7 @@ let gauss: Gaussian2D<f64> = Gaussian2D { mean, cov };
 
 // Compute the fully normalized log-prob at (0.5, -0.5):
 let logp = gauss.logp(&vec![0.5, -0.5]);
-println!("Normalized log-density (2D Gaussian): {}", logp);
+crate::__vmc_out!("Normalized log-density (2D Gaussian): {}", logp);
 
 // ----------------------
 // Example: IsotropicGaussian (any dimension)
@@ -39,7 +39,7 @@ println!("Normalized log-density (2D Gaussian): {}", logp);
 let mut proposal: IsotropicGaussian<f64> = IsotropicGaussian::new(1.0);
 let current = vec![0.0, 0.0];  // dimension = 2 in this example
 let candidate = proposal.sample(&current);
-println!("Candidate state: {:?}", candidate);
+crate::__vmc_out!("Candidate state: {:?}", candidate);
 */
 
 use burn::prelude::*;
@@ -122,10 +122,10 @@ pub trait Normalized<T, F: Float> {
  // Create a categorical distribution over three categories.
  let mut cat = Categorical::new(vec![0.2f64, 0.3, 0.5]);
  let observation = cat.sample();
- println!("Sampled category: {}", observation); // E.g. 1usize
+ crate::__vmc_out!("Sampled category: {}", observation); // E.g. 1usize
 
  let logp = cat.logp(observation);
- println!("Log-probability of sampled category: {}", logp); // E.g. 0.3f64
+ crate::__vmc_out!("Log-probability of sampled category: {}", logp); // E.g. 0.3f64
 ```
 */
 pub trait Discrete<T: Float> {
@@ -154,7 +154,7 @@ let cov = arr2(&[[1.0, 0.0],
 let gauss: Gaussian2D<f64> = Gaussian2D { mean, cov };
 
 let lp = gauss.logp(&vec![0.5, -0.5]);
-println!("Normalized log probability: {}", lp);
+crate::__vmc_out!("Normalized log probability: {}", lp);
 ```
 */
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,11 +338,11 @@ use general_mcmc::distributions::{IsotropicGaussian, Proposal};
 let mut proposal: IsotropicGaussian<f64> = IsotropicGaussian::new(1.0);
 let current = vec![0.0, 0.0, 0.0]; // dimension = 3
 let candidate = proposal.sample(&current);
-println!("Candidate state: {:?}", candidate);
+crate::__vmc_out!("Candidate state: {:?}", candidate);
 
 // Evaluate log q(candidate | current):
 let logq = proposal.logp(&current, &candidate);
-println!("Log of the proposal density: {}", logq);
+crate::__vmc_out!("Log of the proposal density: {}", logq);
 ```
 */
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,9 +417,9 @@ use general_mcmc::distributions::{Categorical, Discrete};
 
 let mut cat = Categorical::new(vec![0.2f64, 0.3, 0.5]);
 let observation = cat.sample();
-println!("Sampled category: {}", observation);
+crate::__vmc_out!("Sampled category: {}", observation);
 let logp = cat.logp(observation);
-println!("Log probability of category {}: {}", observation, logp);
+crate::__vmc_out!("Log probability of category {}: {}", observation, logp);
 ```
 */
 #[derive(Debug, Clone, PartialEq, Eq)]
