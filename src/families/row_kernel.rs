@@ -271,7 +271,7 @@ pub trait RowKernel<const K: usize>: Send + Sync {
     /// `Array2`). The default returns `None`, in which case generic
     /// per-row `jacobian_action` is used.
     fn jacobian_action_matrix(&self, factor: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
-        drop(factor);
+        _ = factor;
         None
     }
 }
@@ -1481,7 +1481,7 @@ mod gram_inner_contraction_tests {
                 dir_k_buf[k] = dir_k_arr[k];
             }
             let third = kern.row_third_contracted(row, &dir_k_arr).expect("third");
-            let _ = dir_k_buf;
+            _ = dir_k_buf;
             for k_col in 0..rank {
                 // vec_k[k] = (J_r · F[:, k_col])[k]
                 let mut col = vec![0.0_f64; p];

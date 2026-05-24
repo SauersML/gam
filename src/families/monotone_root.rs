@@ -107,7 +107,7 @@ impl MonotoneRootError {
     }
 
     fn with_fp_hint(self, fp: f64) -> Self {
-        drop(fp);
+        _ = fp;
         self
     }
 }

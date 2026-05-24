@@ -720,13 +720,6 @@ fn dispersion_from_likelihood(
     }
 }
 
-fn scaled_covariance(mut cov: Array2<f64>, phi: f64) -> Array2<f64> {
-    if (phi - 1.0).abs() > f64::EPSILON {
-        cov.mapv_inplace(|v| v * phi);
-    }
-    cov
-}
-
 /// Default inner P-IRLS tolerance floor.
 ///
 /// The inner Newton iteration certifies the coefficient mode against this
@@ -2572,7 +2565,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         )?;
         let rho = theta.slice(s![..rho_dim]).to_owned();
         // Drive PIRLS at this theta (populates eval bundle cache).
-        let _ = self.reml_state.compute_cost(&rho)?;
+        _ = self.reml_state.compute_cost(&rho)?;
         self.reml_state.objective_innerhessian(&rho)
     }
 
@@ -2611,7 +2604,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             None,
         )?;
         let rho = theta.slice(s![..rho_dim]).to_owned();
-        let _ = self.reml_state.compute_cost(&rho)?;
+        _ = self.reml_state.compute_cost(&rho)?;
         self.reml_state.objective_logdet_h_proj(&rho)
     }
 
@@ -2637,7 +2630,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             None,
         )?;
         let rho = theta.slice(s![..rho_dim]).to_owned();
-        let _ = self.reml_state.compute_cost(&rho)?;
+        _ = self.reml_state.compute_cost(&rho)?;
         self.reml_state.debug_eta_w_c(&rho)
     }
 }
@@ -2887,7 +2880,6 @@ where
         // defaults because their objective is non-quadratic in log-λ
         // and their gradient is not on an O(n) scale.
         let gaussian_identity = matches!(cfg.link_function(), LinkFunction::Identity);
-        let n_obs = y_o.len();
         let problem = OuterProblem::new(k)
             .with_gradient(Derivative::Analytic)
             .with_hessian(if analytic_outer_hessian_available {
@@ -2909,11 +2901,6 @@ where
                 last_converged: Arc::clone(&reml_state.last_inner_converged),
                 ift_residual: Arc::clone(&reml_state.last_ift_prediction_residual),
                 accept_rho: Arc::clone(&reml_state.last_pirls_accept_rho),
-            })
-            .with_objective_scale(if gaussian_identity {
-                Some(n_obs as f64)
-            } else {
-                None
             })
             .with_arc_initial_regularization(if gaussian_identity { Some(0.25) } else { None })
             .with_operator_initial_trust_radius(if gaussian_identity { Some(4.0) } else { None })

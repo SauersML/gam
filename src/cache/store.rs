@@ -708,7 +708,7 @@ fn checksum_hex(payload: &[u8]) -> String {
     let mut s = String::with_capacity(out.len() * 2);
     for b in out.iter() {
         use std::fmt::Write;
-        drop(write!(&mut s, "{:02x}", b));
+        _ = write!(&mut s, "{:02x}", b);
     }
     s
 }

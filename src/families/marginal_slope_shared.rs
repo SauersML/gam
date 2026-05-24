@@ -1097,7 +1097,7 @@ pub fn build_outer_score_subsample(
         // Deterministic key from (seed, stratum_id).
         let mut state = seed ^ (stratum_id as u64).wrapping_mul(0x9E3779B97F4A7C15);
         // Mix once so even seed=0, stratum_id=0 produces a non-trivial state.
-        drop(splitmix64(&mut state));
+        _ = splitmix64(&mut state);
 
         if take == rows.len() {
             for &index in rows.iter() {
@@ -1209,7 +1209,7 @@ pub fn outer_row_indices(
 /// weighted masks (e.g. callers that build `OuterScoreSubsample::new`).
 #[inline]
 pub fn outer_score_scale(opts: &crate::custom_family::BlockwiseFitOptions, n: usize) -> f64 {
-    drop(n);
+    _ = n;
     match opts.outer_score_subsample.as_ref() {
         Some(s) => s.weight_scale,
         None => 1.0,

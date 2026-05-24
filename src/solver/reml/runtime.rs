@@ -74,16 +74,6 @@ pub(crate) fn clear_outer_ift_residual_energy_for_fit() {
     OUTER_IFT_RESIDUAL_ENERGY_ITER.store(0, Ordering::Relaxed);
 }
 
-pub(crate) fn cached_ift_residual_energy_for_outer_theta(
-    theta: &Array1<f64>,
-) -> Option<(f64, u64)> {
-    let key = super::cache::sanitized_rhokey(theta)?;
-    let (energy, iter) = *outer_ift_residual_energy_cache().lock().ok()?.get(&key)?;
-    (energy.is_finite() && energy >= 0.0)
-        .then_some(energy)
-        .map(|energy| (energy, iter))
-}
-
 fn store_ift_residual_energy_for_outer_theta(theta: &Array1<f64>, energy: Option<f64>) {
     let Some(key) = super::cache::sanitized_rhokey(theta) else {
         return;
@@ -1088,6 +1078,25 @@ fn hash_analytic_penalty_kind(
             hasher.write_usize(p.n_eff);
             hasher.write_bool(p.learnable_weight);
             hasher.write_usize(p.rho_index);
+            hash_weight_schedule_option(hasher, &p.weight_schedule);
+        }
+        AnalyticPenaltyKind::NestedPrefix(p) => {
+            hasher.write_str("nested-prefix");
+            hash_psi_slice(hasher, &p.target);
+            hasher.write_str(&format!("{:?}", p.target_tier));
+            hasher.write_usize(p.prefix_sizes.len());
+            for &size in &p.prefix_sizes {
+                hasher.write_usize(size);
+            }
+            hasher.write_usize(p.shell_weights.len());
+            for &w in &p.shell_weights {
+                hasher.write_f64(w);
+            }
+            hasher.write_f64(p.eps);
+            hasher.write_usize(p.rho_indices.len());
+            for &idx in &p.rho_indices {
+                hasher.write_usize(idx);
+            }
             hash_weight_schedule_option(hasher, &p.weight_schedule);
         }
     }
@@ -3380,12 +3389,10 @@ impl<'a> RemlState<'a> {
         {
             return None;
         }
-        drop(
-            cached
-                .ext_mode_response_cols
-                .as_ref()
-                .map_or(0, Array2::ncols),
-        );
+        _ = cached
+            .ext_mode_response_cols
+            .as_ref()
+            .map_or(0, Array2::ncols);
         let cols = cached.rho_mode_response_cols.as_ref()?;
         if cols.nrows() != self.p || cols.ncols() != cache.rho.len() {
             return None;
@@ -4800,19 +4807,6 @@ impl<'a> RemlState<'a> {
 
     /// Compute tr(S⁺ S_direction) — the first derivative of log|S|₊
     /// in the direction S_direction.
-    ///
-    /// Uses the exact pseudoinverse S⁺ restricted to the positive eigenspace.
-    /// Only eigenvectors in the canonical structural rank participate.
-    pub(super) fn fixed_subspace_penalty_trace(
-        &self,
-        e_transformed: &Array2<f64>,
-        s_direction: &Array2<f64>,
-        ridge_passport: RidgePassport,
-    ) -> Result<f64, EstimationError> {
-        let penalty_subspace = self.compute_penalty_subspace(e_transformed, ridge_passport)?;
-        self.fixed_subspace_penalty_trace_from_subspace(&penalty_subspace, s_direction)
-    }
-
     pub(super) fn fixed_subspace_penalty_trace_from_subspace(
         &self,
         penalty_subspace: &PenaltySubspace,
@@ -8555,7 +8549,7 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         has_ext: bool,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
-        drop(has_ext);
+        _ = has_ext;
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             self.build_sparse_assembly(rho, bundle, mode)
         } else if matches!(

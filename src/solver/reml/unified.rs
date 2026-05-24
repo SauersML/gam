@@ -361,7 +361,7 @@ pub trait HessianOperator: Send + Sync {
     /// this to use a looser PCG tolerance when the caller's Monte Carlo error
     /// dominates the linear-solve error.
     fn stochastic_trace_solve(&self, rhs: &Array1<f64>, rel_tol: f64) -> Array1<f64> {
-        drop(rel_tol);
+        _ = rel_tol;
         self.solve(rhs)
     }
 
@@ -377,13 +377,13 @@ pub trait HessianOperator: Send + Sync {
         probe_id: u64,
         trace_state: Option<&Arc<Mutex<StochasticTraceState>>>,
     ) -> Array1<f64> {
-        drop((probe_id, trace_state));
+        _ = (probe_id, trace_state);
         self.stochastic_trace_solve(rhs, rel_tol)
     }
 
     /// H⁻¹ M for stochastic trace probes.
     fn stochastic_trace_solve_multi(&self, rhs: &Array2<f64>, rel_tol: f64) -> Array2<f64> {
-        drop(rel_tol);
+        _ = rel_tol;
         self.solve_multi(rhs)
     }
 
@@ -1933,7 +1933,7 @@ pub trait HyperOperator: Send + Sync {
         factor: &Array2<f64>,
         cache: &ProjectedFactorCache,
     ) -> f64 {
-        drop(cache);
+        _ = cache;
         self.trace_projected_factor(factor)
     }
 
@@ -1955,7 +1955,7 @@ pub trait HyperOperator: Send + Sync {
         factor: &Array2<f64>,
         cache: &ProjectedFactorCache,
     ) -> Array2<f64> {
-        drop(cache);
+        _ = cache;
         self.projected_matrix(factor)
     }
 
@@ -8571,31 +8571,6 @@ pub(crate) fn prefer_outer_hessian_operator(n: usize, p: usize, k: usize) -> boo
     generic_outer_hessian_scale_decision(n, p, k).prefers_operator
 }
 
-/// Selects the matrix-free outer-Hessian representation once a Hessian HVP
-/// kernel is available. Decision is cost-driven via the `(n, p, K)` crossover
-/// plus a callback-specific row-pair workload crossover: the operator and
-/// dense paths produce identical math, so they only differ in assembly cost.
-///
-/// Callback-backed kernels deliberately do not inherit the generic
-/// large-`n`, moderate-`p` route. At small coefficient dimension their
-/// operator logdet projections still stream row kernels over all observations
-/// per outer-HVP, while the dense path can assemble the small `K x K` Hessian
-/// directly. The callback path only flips to matrix-free for genuinely wide
-/// bases, many outer coordinates, or enough row-pair work to amortize those
-/// repeated projections.
-///
-/// Real fast HVP capability (a family-supplied directional θθ operator) is
-/// routed separately through `HessianDerivativeProvider::family_outer_hessian_operator`,
-/// which short-circuits this function entirely at the call site.
-pub(crate) fn use_outer_hessian_operator_path(
-    n: usize,
-    p: usize,
-    k: usize,
-    callback_kernel: bool,
-) -> bool {
-    outer_hessian_route_plan(n, p, k, true, callback_kernel, false).use_operator
-}
-
 fn is_hessian_unavailable(error: &str) -> bool {
     error.starts_with(HESSIAN_UNAVAILABLE_PREFIX)
 }
@@ -12600,7 +12575,7 @@ fn active_bound_indices_for_theta(
     let mut active = detect_active_theta_bounds(theta, q);
     // Drop ψ-coordinates: they are unbounded by construction.
     active.retain(|&i| i < rho_len);
-    drop(ext_len);
+    _ = ext_len;
     active
 }
 
@@ -12658,7 +12633,7 @@ fn projected_inverse_with_inertia_gate(
             hessian_norm: h_norm,
             suggested_action: INDEFINITE_SUGGESTED_ACTION,
         };
-        drop(diagnostic.theta_dimension());
+        _ = diagnostic.theta_dimension();
         return Err(CorrectedCovarianceError::Indefinite(diagnostic));
     }
 
@@ -16741,7 +16716,7 @@ where
                 if stderr / denom <= config.relative_tol {
                     // `m` is the matvec count at exit, useful for
                     // diagnostics but not consumed by the caller.
-                    drop(m);
+                    _ = m;
                     break;
                 }
             }

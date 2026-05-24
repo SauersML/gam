@@ -135,7 +135,7 @@ pub fn global_policy() -> GpuPolicy {
 /// concurrent fits cannot race policy changes.
 pub fn configure_global_policy(policy: GpuPolicy) {
     // First-writer-wins semantics; ignore a redundant late call.
-    drop(POLICY.set(policy));
+    _ = POLICY.set(policy);
 }
 
 /// Decide whether a GPU kernel may run. This is deliberately conservative:
@@ -227,7 +227,7 @@ pub fn try_dispatch_dense(op: GpuOperation) -> linalg::GpuDispatch {
         GpuOperation::XtDiagX { n, p } => linalg::DispatchOp::XtDiagX { n, p },
         GpuOperation::XtDiagY { n, px, q } => linalg::DispatchOp::XtDiagY { n, px, q },
     };
-    drop(linalg::route_through_gpu(dispatch_op));
+    _ = linalg::route_through_gpu(dispatch_op);
     linalg::GpuDispatch::Cpu
 }
 
@@ -254,12 +254,12 @@ pub fn try_fast_atv(
 }
 #[inline]
 pub fn try_syevd_inplace(a: &mut ndarray::Array2<f64>) -> Option<ndarray::Array1<f64>> {
-    drop(a);
+    _ = a;
     None
 }
 #[inline]
 pub fn record_cpu_kernel(op: GpuOperation, elapsed: std::time::Duration) {
-    drop((op, elapsed));
+    _ = (op, elapsed);
 }
 #[inline]
 pub fn record_cpu_fallback(
@@ -270,7 +270,7 @@ pub fn record_cpu_fallback(
     q: usize,
     flops: usize,
 ) {
-    drop((name, kind, n, p, q, flops));
+    _ = (name, kind, n, p, q, flops);
 }
 
 #[cfg(test)]

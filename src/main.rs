@@ -49,7 +49,6 @@ use gam::inference::model::{
 };
 use gam::inference::predict_input::build_predict_input_for_model;
 use gam::inference::prediction_linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
-use gam::inference::smooth_test::{SmoothTestInput, wood_smooth_test};
 use gam::matrix::{DesignMatrix, SymmetricMatrix};
 use gam::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use gam::predict::{
@@ -58,12 +57,12 @@ use gam::predict::{
 use gam::probability::{normal_cdf, standard_normal_quantile};
 use gam::report;
 use gam::smooth::{
-    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint,
+    BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec,
     SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions, TermCollectionSpec,
     build_term_collection_design, freeze_term_collection_from_design,
 };
 use gam::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
-use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
+use gam::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec, survival_event_code_from_value};
 use gam::survival_construction::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBasisConfig, SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset,
@@ -875,10 +874,6 @@ const HARD_EXIT: fn(i32) -> ! = std::process::exit;
 fn main() {
     gam::init_parallelism();
     let result = run();
-    // Emit the GPU activity roll-up exactly once, regardless of success/
-    // failure path. Tells the user — and the log reader — how many kernels
-    // actually reached the device this run and what was kept on the host.
-    gam::gpu::flush_gpu_activity_summary();
     if let Err(e) = result {
         cli_err!("error: {e}");
         if let Some(advice) = e.advice() {
@@ -926,7 +921,7 @@ fn run() -> CliResult<()> {
 fn blockwise_options_from_fit_args(
     args: &FitArgs,
 ) -> Result<gam::families::custom_family::BlockwiseFitOptions, String> {
-    drop(args);
+    _ = args;
     let options = gam::families::custom_family::BlockwiseFitOptions::default();
     Ok(options)
 }
@@ -2730,7 +2725,12 @@ fn run_predict_model(
 }
 
 fn run_predict(args: PredictArgs) -> Result<(), String> {
-    parse_probability_open_cli(&args.level).map_err(|e| format!("--level {e}"))?;
+    if !(args.level.is_finite() && args.level > 0.0 && args.level < 1.0) {
+        return Err(format!(
+            "--level expected a probability in (0, 1), got {}",
+            args.level
+        ));
+    }
     let mut progress = gam::visualizer::VisualizerSession::new(true);
     progress.start_workflow("Predict", 5);
     let phase_start = std::time::Instant::now();
@@ -3403,9 +3403,9 @@ fn run_predict_survival(
             SurvivalLikelihoodMode::Transformation
             | SurvivalLikelihoodMode::Weibull
             | SurvivalLikelihoodMode::LocationScale
-            | SurvivalLikelihoodMode::MarginalSlope => Err(CliError::from(
+            | SurvivalLikelihoodMode::MarginalSlope => Err(
                 "internal: non-latent survival modes are routed earlier; this branch is gated by an outer `if matches!(_, Latent | LatentBinary)` and cannot fire".to_string(),
-            )),
+            ),
         };
     }
     let saved_location_scale_inverse_link =
@@ -3873,7 +3873,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     // useful default and matches user expectation that `gam diagnose` does
     // SOMETHING (a smoke-test for the most common workflow). If/when more
     // diagnostics land, this path can route based on explicit flags.
-    drop(args.alo);
+    _ = args.alo;
 
     progress.set_stage("diagnose", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
@@ -6189,45 +6189,14 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
 
     progress.set_stage("sample", "running posterior sampling");
     progress.teardown();
-    // Collapsing this dispatch requires SurvivalPredictor and
-    // LocationScalePredictor implementations of PredictableModel.
-    let nuts = match model.predict_model_class() {
-        PredictModelClass::Survival => run_sample_survival(
-            &mut progress,
-            &model,
-            ds.values.view(),
-            &col_map,
-            training_headers,
-            &cfg,
-        )?,
-        PredictModelClass::GaussianLocationScale => gam::sample::laplace_gaussian_fallback(
-            &model,
-            &cfg,
-            "gaussian location-scale posterior",
-        )?,
-        PredictModelClass::BinomialLocationScale => gam::sample::laplace_gaussian_fallback(
-            &model,
-            &cfg,
-            "binomial location-scale posterior",
-        )?,
-        PredictModelClass::BernoulliMarginalSlope => gam::sample::laplace_gaussian_fallback(
-            &model,
-            &cfg,
-            "bernoulli marginal-slope posterior",
-        )?,
-        PredictModelClass::TransformationNormal => {
-            gam::sample::laplace_gaussian_fallback(&model, &cfg, "transformation-normal posterior")?
-        }
-        PredictModelClass::Standard => run_sample_standard(
-            &mut progress,
-            &model,
-            ds.values.view(),
-            &col_map,
-            training_headers,
-            family,
-            &cfg,
-        )?,
-    };
+    let nuts = gam::sample::sample_saved_model(
+        &model,
+        ds.values.view(),
+        &col_map,
+        training_headers,
+        &cfg,
+    )?;
+    _ = family;
 
     let out = args
         .out
@@ -7142,25 +7111,31 @@ fn smooth_term_primary_column(term: &SmoothTermSpec) -> Option<usize> {
                 shape: term.shape,
             })
         }
+        SmoothBasisSpec::BySmooth { smooth, .. } => smooth_term_primary_column(&SmoothTermSpec {
+            name: term.name.clone(),
+            basis: (**smooth).clone(),
+            shape: term.shape,
+        }),
+        SmoothBasisSpec::FactorSmooth { spec } => {
+            if spec.continuous_cols.len() == 1 {
+                Some(spec.continuous_cols[0])
+            } else {
+                None
+            }
+        }
         SmoothBasisSpec::BSpline1D { feature_col, .. } => Some(*feature_col),
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
         | SmoothBasisSpec::Sphere { feature_cols, .. }
         | SmoothBasisSpec::Matern { feature_cols, .. }
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::Pca { feature_cols, .. }
-        | SmoothBasisSpec::TensorBSpline { feature_cols, .. }
-        | SmoothBasisSpec::Sphere { feature_cols, .. } => {
+        | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
             if feature_cols.len() == 1 {
                 Some(feature_cols[0])
             } else {
                 None
             }
         }
-        SmoothBasisSpec::ByVariable { inner, .. } => smooth_term_primary_column(&SmoothTermSpec {
-            name: term.name.clone(),
-            basis: (**inner).clone(),
-            shape: term.shape,
-        }),
     }
 }
 
@@ -7950,11 +7925,6 @@ fn termspec_has_bounded_terms(spec: &TermCollectionSpec) -> bool {
 
 fn spatial_basiswarning_family_and_cols(term: &SmoothTermSpec) -> Option<(&'static str, &[usize])> {
     match &term.basis {
-        SmoothBasisSpec::ByVariable { .. } | SmoothBasisSpec::FactorSumToZero { .. } => None,
-        SmoothBasisSpec::ThinPlate { feature_cols, .. } => Some(("thinplate/tps", feature_cols)),
-        SmoothBasisSpec::Sphere { feature_cols, .. } => Some(("sphere/sos", feature_cols)),
-        SmoothBasisSpec::Matern { feature_cols, .. } => Some(("matern", feature_cols)),
-        SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
         SmoothBasisSpec::ByVariable { inner, .. } => match inner.as_ref() {
             SmoothBasisSpec::ThinPlate { feature_cols, .. } => {
                 Some(("thinplate/tps", feature_cols))
@@ -7964,7 +7934,14 @@ fn spatial_basiswarning_family_and_cols(term: &SmoothTermSpec) -> Option<(&'stat
             SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
             _ => None,
         },
+        SmoothBasisSpec::FactorSumToZero { .. } => None,
+        SmoothBasisSpec::ThinPlate { feature_cols, .. } => Some(("thinplate/tps", feature_cols)),
+        SmoothBasisSpec::Sphere { feature_cols, .. } => Some(("sphere/sos", feature_cols)),
+        SmoothBasisSpec::Matern { feature_cols, .. } => Some(("matern", feature_cols)),
+        SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
         SmoothBasisSpec::BSpline1D { .. }
+        | SmoothBasisSpec::BySmooth { .. }
+        | SmoothBasisSpec::FactorSmooth { .. }
         | SmoothBasisSpec::Pca { .. }
         | SmoothBasisSpec::TensorBSpline { .. } => None,
     }
@@ -8052,6 +8029,18 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
             cols.dedup();
             cols
         }
+        SmoothBasisSpec::BySmooth { smooth, .. } => smooth_term_feature_cols(&SmoothTermSpec {
+            name: term.name.clone(),
+            basis: (**smooth).clone(),
+            shape: term.shape,
+        }),
+        SmoothBasisSpec::FactorSmooth { spec } => {
+            let mut cols = spec.continuous_cols.clone();
+            cols.push(spec.group_col);
+            cols.sort_unstable();
+            cols.dedup();
+            cols
+        }
         SmoothBasisSpec::BSpline1D { feature_col, .. } => vec![*feature_col],
         SmoothBasisSpec::ThinPlate { feature_cols, .. }
         | SmoothBasisSpec::Sphere { feature_cols, .. }
@@ -8059,17 +8048,6 @@ fn smooth_term_feature_cols(term: &SmoothTermSpec) -> Vec<usize> {
         | SmoothBasisSpec::Duchon { feature_cols, .. }
         | SmoothBasisSpec::Pca { feature_cols, .. }
         | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
-        SmoothBasisSpec::ByVariable { inner, by_col, .. } => {
-            let mut cols = smooth_term_feature_cols(&SmoothTermSpec {
-                name: term.name.clone(),
-                basis: (**inner).clone(),
-                shape: term.shape,
-            });
-            cols.push(*by_col);
-            cols.sort_unstable();
-            cols.dedup();
-            cols
-        }
     }
 }
 
@@ -8128,6 +8106,12 @@ fn smooth_basiswarning_family_rank(term: &SmoothTermSpec) -> u8 {
                 shape: term.shape,
             })
         }
+        SmoothBasisSpec::BySmooth { smooth, .. } => smooth_basiswarning_family_rank(&SmoothTermSpec {
+            name: term.name.clone(),
+            basis: (**smooth).clone(),
+            shape: term.shape,
+        }),
+        SmoothBasisSpec::FactorSmooth { .. } => 7,
         SmoothBasisSpec::BSpline1D { .. } => 0,
         SmoothBasisSpec::TensorBSpline { .. } => 1,
         SmoothBasisSpec::ThinPlate { .. } => 2,
@@ -8135,13 +8119,6 @@ fn smooth_basiswarning_family_rank(term: &SmoothTermSpec) -> u8 {
         SmoothBasisSpec::Matern { .. } => 4,
         SmoothBasisSpec::Duchon { .. } => 5,
         SmoothBasisSpec::Pca { .. } => 6,
-        SmoothBasisSpec::ByVariable { inner, .. } => {
-            smooth_basiswarning_family_rank(&SmoothTermSpec {
-                name: term.name.clone(),
-                basis: (**inner).clone(),
-                shape: term.shape,
-            })
-        }
     }
 }
 
@@ -9124,9 +9101,6 @@ fn build_model_summary(
         penalty_cursor += 1;
         // Random-effect smooths are variance-component tests on the boundary;
         // a naive coefficient Wald χ² p-value is anti-conservative, so only EDF is reported.
-        let chi_sq_opt = None;
-        let ref_df = edf.max(0.0);
-        let pvalue = None;
         smooth_terms.push(SmoothTermSummary {
             name: name.clone(),
             edf,

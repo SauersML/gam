@@ -47,11 +47,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-thread_local! {
-    static EMPIRICAL_FLEX_DIRECTION_SCRATCH: RefCell<EmpiricalFlexDirectionScratch> =
-        RefCell::new(EmpiricalFlexDirectionScratch::new(0));
-}
-
 pub mod deviation_runtime;
 pub(crate) mod exact_kernel;
 pub use deviation_runtime::DeviationRuntime;
@@ -655,7 +650,7 @@ impl LatentZRankIntCalibration {
         let mut sum_wz = 0.0_f64;
         let mut sum_w = 0.0_f64;
         for (i, &idx) in order.iter().enumerate() {
-            drop(i);
+            _ = i;
             let zi = z[idx];
             let calibrated = Self::apply_with_knots(zi, &sorted_z, &weighted_cdf);
             sum_wz += weights[idx] * calibrated;
@@ -789,8 +784,8 @@ fn build_latent_measure_with_geometry(
                     calibration.post_sd,
                     calibration.sorted_z.len(),
                 );
-                drop(data);
-                drop(specs);
+                _ = data;
+                _ = specs;
                 Ok((
                     LatentMeasureKind::StandardNormal,
                     LatentMeasureCalibration::RankInverseNormal(calibration),
@@ -1136,126 +1131,6 @@ struct BernoulliMarginalSlopeFamily {
     /// updated atomically so two threads cannot both decide "new ρ" and
     /// double-bump.
     auto_subsample_last_rho: Arc<Mutex<Option<Array1<f64>>>>,
-    /// Per-outer-eval shared exact-eval cache. The Hessian and ψ workspaces
-    /// constructed for the same `(block_states, options)` consume an
-    /// identical cache build (row contexts + cell moments + per-row primary
-    /// Hessians + rigid third/fourth tensor warm-ups). This slot lets the
-    /// second workspace pick up the first one's primed `Arc` instead of
-    /// rebuilding from scratch. Keyed by a content fingerprint of the
-    /// joint β snapshot and the subsample Arc identity carried on the
-    /// options — a change in either invalidates the entry and forces a
-    /// fresh build on next access.
-    shared_eval_cache: Arc<Mutex<Option<SharedEvalCacheEntry>>>,
-}
-
-#[derive(Clone)]
-struct SharedEvalCacheFingerprint {
-    /// Flattened β snapshot across all blocks, in block order. The exact
-    /// cache build (row contexts + per-row jets + cell moments) is a pure
-    /// function of β + design + options, so byte-equal β + matching
-    /// subsample identity → identical cache.
-    betas: Vec<Array1<f64>>,
-    /// Pointer identity of the per-eval outer-score subsample Arc, if any.
-    /// `None` is distinct from `Some(_)` and from a different `Some` Arc.
-    subsample: Option<usize>,
-}
-
-impl SharedEvalCacheFingerprint {
-    fn from_inputs(block_states: &[ParameterBlockState], options: &BlockwiseFitOptions) -> Self {
-        let betas = block_states.iter().map(|s| s.beta.clone()).collect();
-        let subsample = options
-            .outer_score_subsample
-            .as_ref()
-            .map(|arc| Arc::as_ptr(arc) as usize);
-        Self { betas, subsample }
-    }
-
-    fn matches(&self, other: &Self) -> bool {
-        if self.subsample != other.subsample {
-            return false;
-        }
-        if self.betas.len() != other.betas.len() {
-            return false;
-        }
-        for (a, b) in self.betas.iter().zip(other.betas.iter()) {
-            if a.len() != b.len() {
-                return false;
-            }
-            if a.iter()
-                .zip(b.iter())
-                .any(|(x, y)| x.to_bits() != y.to_bits())
-            {
-                return false;
-            }
-        }
-        true
-    }
-}
-
-struct SharedEvalCacheEntry {
-    fingerprint: SharedEvalCacheFingerprint,
-    cache: Arc<BernoulliMarginalSlopeExactEvalCache>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CacheFingerprint {
-    beta_hash: u64,
-    block_count: usize,
-    subsample_mask_hash: u64,
-    options_hash: u64,
-}
-
-impl CacheFingerprint {
-    fn compute(
-        block_states: &[ParameterBlockState],
-        subsample_mask: Option<&[usize]>,
-        options: Option<&BlockwiseFitOptions>,
-    ) -> Self {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut beta_hasher = DefaultHasher::new();
-        for st in block_states {
-            for v in st.beta.iter() {
-                v.to_bits().hash(&mut beta_hasher);
-            }
-        }
-        let mut mask_hasher = DefaultHasher::new();
-        if let Some(mask) = subsample_mask {
-            mask.hash(&mut mask_hasher);
-        } else {
-            0u64.hash(&mut mask_hasher);
-        }
-        let mut opts_hasher = DefaultHasher::new();
-        if let Some(opts) = options {
-            // `BlockwiseFitOptions` does not implement `Debug` (it carries an
-            // `Arc<dyn ...>`-style subsample reference), so hash the stable
-            // scalar fields plus the subsample Arc identity manually.
-            opts.inner_max_cycles.hash(&mut opts_hasher);
-            opts.inner_tol.to_bits().hash(&mut opts_hasher);
-            opts.outer_max_iter.hash(&mut opts_hasher);
-            opts.outer_tol.to_bits().hash(&mut opts_hasher);
-            opts.minweight.to_bits().hash(&mut opts_hasher);
-            opts.ridge_floor.to_bits().hash(&mut opts_hasher);
-            opts.use_remlobjective.hash(&mut opts_hasher);
-            opts.use_outer_hessian.hash(&mut opts_hasher);
-            opts.compute_covariance.hash(&mut opts_hasher);
-            opts.line_search_prefer_workspace.hash(&mut opts_hasher);
-            opts.early_exit_threshold
-                .map(|v| v.to_bits())
-                .hash(&mut opts_hasher);
-            opts.auto_outer_subsample.hash(&mut opts_hasher);
-            opts.outer_score_subsample
-                .as_ref()
-                .map(|a| Arc::as_ptr(a) as usize)
-                .hash(&mut opts_hasher);
-        }
-        Self {
-            beta_hash: beta_hasher.finish(),
-            block_count: block_states.len(),
-            subsample_mask_hash: mask_hasher.finish(),
-            options_hash: opts_hasher.finish(),
-        }
-    }
 }
 
 /// Number of outer-gradient evaluations the auto-subsample schedule
@@ -1355,19 +1230,6 @@ pub(crate) fn build_score_warp_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    build_deviation_block_from_knots_and_design_seed(seed, seed, cfg)
-}
-
-pub(crate) fn build_score_warp_deviation_block_from_seed_empirical_anchor(
-    seed: &Array1<f64>,
-    weights: &Array1<f64>,
-    cfg: &DeviationBlockConfig,
-) -> Result<DeviationPrepared, String> {
-    drop(weights);
-    // The `weights` argument is retained for caller-API stability but no
-    // longer participates in basis construction: identifiability now comes
-    // from the smoothness-penalty null-space drop (β-independent), not from a
-    // data-distribution moment anchor at the rigid-pilot η₀.
     build_deviation_block_from_knots_and_design_seed(seed, seed, cfg)
 }
 
@@ -1515,7 +1377,7 @@ pub(crate) fn build_link_deviation_block_from_knots_design_seed_and_weights(
     anchor_weights: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    drop(anchor_weights);
+    _ = anchor_weights;
     // The `anchor_weights` argument is retained for caller-API stability but
     // no longer participates in basis construction (see
     // `build_score_warp_deviation_block_from_seed_empirical_anchor` for the
@@ -4667,27 +4529,6 @@ struct BernoulliMarginalSlopeFlexRowScratch {
     zero_family: Vec<[f64; 4]>,
 }
 
-struct EmpiricalFlexDirectionScratch {
-    basis_u: Array1<f64>,
-    basis_v: Array1<f64>,
-}
-
-impl EmpiricalFlexDirectionScratch {
-    fn new(primary_dim: usize) -> Self {
-        Self {
-            basis_u: Array1::zeros(primary_dim),
-            basis_v: Array1::zeros(primary_dim),
-        }
-    }
-
-    fn ensure_dim(&mut self, primary_dim: usize) {
-        if self.basis_u.len() != primary_dim {
-            self.basis_u = Array1::zeros(primary_dim);
-            self.basis_v = Array1::zeros(primary_dim);
-        }
-    }
-}
-
 impl BernoulliMarginalSlopeFlexRowScratch {
     fn new(primary_dim: usize) -> Self {
         Self {
@@ -5190,8 +5031,8 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         // Touch both caches so their parallel builds run here, not later
         // (nested inside the outer ext-idx par_iter where the lock-holder
         // thread would have to do each row pass alone).
-        drop(self.third_full_cache());
-        drop(self.fourth_full_cache());
+        _ = self.third_full_cache();
+        _ = self.fourth_full_cache();
         Ok(())
     }
 
@@ -5330,25 +5171,6 @@ struct BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     /// biobank scale. When `None`, the row iteration is identical to the
     /// legacy full-data path.
     options: BlockwiseFitOptions,
-}
-
-struct BernoulliMarginalSlopeLineSearchWorkspace {
-    family: BernoulliMarginalSlopeFamily,
-    block_states: Vec<ParameterBlockState>,
-    cache: BernoulliMarginalSlopeExactEvalCache,
-    options: BlockwiseFitOptions,
-    log_likelihood: f64,
-    // `RayonSafeOnce` (not `OnceLock`): the materialization closure runs
-    // nested rayon work (`build_row_primary_hessian_cache`,
-    // `build_row_cell_moments_bundle`). If reached for the first time
-    // concurrently from inside an outer par_iter, a plain `OnceLock` would
-    // park the racing workers on its condvar and starve the leader's
-    // nested par_iter. `RayonSafeOnce` keeps init lock-free; pair this
-    // with the top-level `warm_up_outer_caches()` call for steady-state
-    // single-build behaviour.
-    full_workspace: crate::resource::RayonSafeOnce<
-        Result<Arc<BernoulliMarginalSlopeExactNewtonJointHessianWorkspace>, String>,
-    >,
 }
 
 struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
@@ -6380,163 +6202,6 @@ impl BernoulliMarginalSlopeFamily {
         total
     }
 
-    fn line_search_log_likelihood_workspace(
-        &self,
-        block_states: &[ParameterBlockState],
-        line_search_options: &BlockwiseFitOptions,
-        workspace_options: &BlockwiseFitOptions,
-    ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
-        self.validate_exact_monotonicity(block_states)?;
-        self.validate_exact_block_state_shapes(block_states)?;
-        if !self.effective_flex_active(block_states)? {
-            return Ok(None);
-        }
-        // Line-search subsampling: when the caller supplied an outer-score
-        // subsample in `line_search_options`, accumulate the trial
-        // log-likelihood against the Horvitz-Thompson-weighted subsample
-        // rather than the full row set. The workspace itself still builds
-        // a `row_ctx` for every row so the cached state remains valid for
-        // any subsequent full-data gradient/Hessian reload (the caller
-        // does a full-row confirmation evaluation via the returned
-        // workspace's `joint_log_likelihood_evaluation` before committing
-        // the new β). With the default `coefficient_line_search_options`
-        // stripping the subsample, this branch is a no-op (HT weights all
-        // 1.0 → identical to the legacy full-data sum); enabling
-        // subsampled trial LL is purely additive — callers that opt in
-        // get a cheap unbiased estimate, all other call sites are
-        // unchanged bit-for-bit.
-
-        let n = self.y.len();
-        let slices = block_slices(self);
-        let primary = primary_slices(&slices);
-        let p_total = slices.total;
-        let started = std::time::Instant::now();
-        let subsample_active = line_search_options.outer_score_subsample.is_some();
-        if log_exact_work(n) {
-            log::info!(
-                "[BMS line-search cache] build start n={} p={} flex=true subsample={}",
-                n,
-                p_total,
-                subsample_active
-            );
-        }
-        self.preseed_intercept_warm_starts(block_states)?;
-        exact_kernel::reset_tail_cell_moment_cache();
-        let stats = BernoulliInterceptSolveStats::default();
-        let cell_cache_before = self.cell_moment_cache_stats.snapshot();
-        let beta_h = self.score_beta(block_states)?;
-        let beta_w = self.link_beta(block_states)?;
-
-        let mut row_contexts = Vec::with_capacity(n);
-        let mut log_likelihood = 0.0_f64;
-
-        // Dense per-row LL weights. No-subsample → all 1.0 (legacy
-        // full-data behavior). Subsample present → sampled rows carry
-        // their HT inverse-inclusion weight, unsampled rows carry 0.0
-        // and skip the per-row probit log-CDF entirely.
-        let ll_row_weights: Vec<f64> = match line_search_options.outer_score_subsample.as_ref() {
-            Some(s) => {
-                let mut weights = vec![0.0; n];
-                for r in s.rows.iter() {
-                    if r.index < n {
-                        weights[r.index] = r.weight;
-                    }
-                }
-                weights
-            }
-            None => vec![1.0; n],
-        };
-
-        for start in (0..n).step_by(BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS) {
-            let end = (start + BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS).min(n);
-            let ll_weights_slice = ll_row_weights.as_slice();
-            let mut chunk_rows = (start..end)
-                .into_par_iter()
-                .map(|row| -> Result<_, String> {
-                    let row_ctx = self.build_row_exact_context_with_stats_and_cell_cache(
-                        row,
-                        block_states,
-                        Some(&stats),
-                        false,
-                    )?;
-                    let ll_weight = ll_weights_slice[row];
-                    let row_ll = if ll_weight == 0.0 {
-                        0.0
-                    } else {
-                        let slope = block_states[1].eta[row];
-                        let obs = self.observed_denested_cell_partials(
-                            row,
-                            row_ctx.intercept,
-                            slope,
-                            beta_h,
-                            beta_w,
-                        )?;
-                        let s_i = eval_coeff4_at(&obs.coeff, self.z[row]);
-                        let signed = (2.0 * self.y[row] - 1.0) * s_i;
-                        let (log_cdf, _) = signed_probit_logcdf_and_mills_ratio(signed);
-                        ll_weight * self.weights[row] * log_cdf
-                    };
-                    Ok((row, row_ctx, row_ll))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            chunk_rows.sort_unstable_by_key(|(row, _, _)| *row);
-            for (_, row_ctx, row_ll) in chunk_rows {
-                log_likelihood += row_ll;
-                row_contexts.push(row_ctx);
-            }
-            if let Some(threshold) = line_search_options.early_exit_threshold
-                && -log_likelihood > threshold
-            {
-                return Err(format!(
-                    "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
-                    -log_likelihood, threshold
-                ));
-            }
-        }
-
-        if log_exact_work(n) {
-            let (cell_hits, cell_misses, cell_hit_rate) = self
-                .cell_moment_cache_stats
-                .hit_rate_delta(cell_cache_before);
-            log::info!(
-                "[BMS line-search cache] cell moments hits={} misses={} hit_rate={:.1}% entries={} resident_mib={:.1}/{:.1}",
-                cell_hits,
-                cell_misses,
-                100.0 * cell_hit_rate,
-                self.cell_moment_lru.len(),
-                self.cell_moment_lru.resident_bytes() as f64 / (1024.0 * 1024.0),
-                self.cell_moment_lru.max_bytes() as f64 / (1024.0 * 1024.0),
-            );
-        }
-
-        let workspace: Arc<dyn ExactNewtonJointHessianWorkspace> =
-            Arc::new(BernoulliMarginalSlopeLineSearchWorkspace {
-                family: self.clone(),
-                block_states: block_states.to_vec(),
-                cache: BernoulliMarginalSlopeExactEvalCache {
-                    slices,
-                    primary,
-                    row_contexts,
-                    row_cell_moments: None,
-                    row_primary_hessians: None,
-                    rigid_third_full: OnceLock::new(),
-                    rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
-                },
-                options: workspace_options.clone(),
-                log_likelihood,
-                full_workspace: crate::resource::RayonSafeOnce::new(),
-            });
-        if log_exact_work(n) {
-            log::info!(
-                "[BMS line-search cache] build done n={} p={} elapsed={:.3}s",
-                n,
-                p_total,
-                started.elapsed().as_secs_f64()
-            );
-        }
-        Ok(Some((log_likelihood, workspace)))
-    }
-
     fn is_sigma_aux_index(
         &self,
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
@@ -6728,7 +6393,7 @@ impl BernoulliMarginalSlopeFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        drop(specs);
+        _ = specs;
         if self.effective_flex_active(block_states)? {
             return Err("bernoulli marginal-slope log-sigma hyperderivatives are implemented for the rigid probit marginal-slope kernel; flexible score/link kernels require the analytic denested cell-tensor sigma path"
                         .to_string());
@@ -7120,53 +6785,6 @@ impl BernoulliMarginalSlopeFamily {
         Ok(())
     }
 
-    /// Build per-row degree-9 cached cell moments (denested partition +
-    /// per-cell intra-row dedup + LRU lookup). Shared by
-    /// `build_row_exact_context_with_stats_and_cell_cache` and the
-    /// row-cell-moments-bundle fallback inside
-    /// `build_exact_eval_cache_with_options`, so the partition + dedup +
-    /// LRU pipeline is expressed once and the two call sites stay
-    /// bit-identical.
-    fn compute_row_degree9_cells(
-        &self,
-        intercept: f64,
-        slope: f64,
-        beta_h: Option<&Array1<f64>>,
-        beta_w: Option<&Array1<f64>>,
-    ) -> Result<Vec<CachedDenestedCellMoments>, String> {
-        let cells = self.denested_partition_cells(intercept, slope, beta_h, beta_w)?;
-        // Per-row dedup: within ONE row's denested-partition output, the
-        // score-warp and link-wiggle bases occasionally produce cells
-        // whose `(left, right, c0, c1, c2, c3)` are bit-equal. Evaluating
-        // moments once and cloning the result into the other slots is
-        // numerically identical to evaluating each cell independently
-        // (`evaluate_cell_moments_lru` is a pure function of the cell), and
-        // skips redundant work. The dedup is purely intra-row, so it is
-        // orthogonal to the per-family LRU (which is keyed across rows)
-        // and the affine tail-cell memo (a separate mechanism).
-        let mut dedup: HashMap<
-            exact_kernel::CellFingerprint,
-            exact_kernel::CellDerivativeMomentState,
-        > = HashMap::new();
-        let mut out: Vec<CachedDenestedCellMoments> = Vec::with_capacity(cells.len());
-        for partition_cell in cells.into_iter() {
-            let key = exact_kernel::CellFingerprint::new(partition_cell.cell);
-            let state: exact_kernel::CellDerivativeMomentState = if let Some(existing) =
-                dedup.get(&key)
-            {
-                existing.clone()
-            } else {
-                let computed = self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 9)?;
-                dedup.insert(key, computed.clone());
-                computed
-            };
-            out.push(CachedDenestedCellMoments {
-                partition_cell,
-                state,
-            });
-        }
-        Ok(out)
-    }
 
     fn denested_partition_cells(
         &self,
@@ -8323,41 +7941,6 @@ impl BernoulliMarginalSlopeFamily {
         self.build_exact_eval_cache_with_order(block_states)
     }
 
-    /// Build (or reuse) a fully-primed exact-eval cache for the joint
-    /// Hessian and ψ workspaces. The first workspace constructed for a
-    /// given `(block_states, options)` pays the full build cost (row
-    /// contexts, cell moments, per-row primary Hessians, and on the rigid
-    /// path the per-row third/fourth uncontracted tensors). Subsequent
-    /// requests with a byte-equal β snapshot and matching subsample Arc
-    /// pointer return the same `Arc<_>` without any rebuild work.
-    fn build_shared_eval_cache_with_options(
-        &self,
-        block_states: &[ParameterBlockState],
-        options: &BlockwiseFitOptions,
-    ) -> Result<Arc<BernoulliMarginalSlopeExactEvalCache>, String> {
-        let fingerprint = SharedEvalCacheFingerprint::from_inputs(block_states, options);
-        {
-            let guard = self.shared_eval_cache.lock().map_err(|e| e.to_string())?;
-            if let Some(entry) = guard.as_ref() {
-                if entry.fingerprint.matches(&fingerprint) {
-                    return Ok(Arc::clone(&entry.cache));
-                }
-            }
-        }
-        let mut cache = self.build_exact_eval_cache_with_options(block_states, Some(options))?;
-        cache.row_primary_hessians = self.build_row_primary_hessian_cache(block_states, &cache)?;
-        if !self.effective_flex_active(block_states)? {
-            drop(self.rigid_third_full_cached(block_states, &cache, 0)?);
-            drop(self.rigid_fourth_full_cached(block_states, &cache, 0)?);
-        }
-        let arc = Arc::new(cache);
-        let mut guard = self.shared_eval_cache.lock().map_err(|e| e.to_string())?;
-        *guard = Some(SharedEvalCacheEntry {
-            fingerprint,
-            cache: Arc::clone(&arc),
-        });
-        Ok(arc)
-    }
 
     fn row_primary_direction_from_flat(
         &self,
@@ -13290,7 +12873,7 @@ impl BernoulliMarginalSlopeFamily {
         // on the FLEX path because that branch routes through the flex jet
         // machinery, which has its own row-cell-moments cache.
         if !self.effective_flex_active(block_states)? {
-            drop(self.rigid_third_full_cached(block_states, cache, 0)?);
+            _ = self.rigid_third_full_cached(block_states, cache, 0)?;
         }
 
         // Block-local accumulator path: avoids O(n p^2) dense Hessian
@@ -14319,13 +13902,13 @@ impl BernoulliMarginalSlopeFamily {
         // Mirrors the same discipline applied in
         // `exact_newton_joint_hessiansecond_directional_derivative_from_cache_with_options`.
         if !flex_active && n > 0 {
-            drop(self.rigid_third_full_cached(block_states, cache, 0)?);
+            _ = self.rigid_third_full_cached(block_states, cache, 0)?;
         }
         if n > 0 {
             let warm_marg = Array1::<f64>::zeros(slices.marginal.end - slices.marginal.start);
-            drop(self.marginal_design.dot_row_view(0, warm_marg.view()));
+            _ = self.marginal_design.dot_row_view(0, warm_marg.view());
             let warm_log = Array1::<f64>::zeros(slices.logslope.end - slices.logslope.start);
-            drop(self.logslope_design.dot_row_view(0, warm_log.view()));
+            _ = self.logslope_design.dot_row_view(0, warm_log.view());
         }
         // Even with the warm-up above, fall back to a serial row loop when the
         // par_iter cannot pay for its own dispatch overhead, or when we are
@@ -14616,7 +14199,7 @@ impl BernoulliMarginalSlopeFamily {
         // path because that branch routes through the flex jet machinery
         // instead of `rigid_fourth_full_cached`.
         if !self.effective_flex_active(block_states)? {
-            drop(self.rigid_fourth_full_cached(block_states, cache, 0)?);
+            _ = self.rigid_fourth_full_cached(block_states, cache, 0)?;
         }
 
         // ── Rigid closed-form: 4th-order scalar kernel ───────────────
@@ -14709,7 +14292,7 @@ impl BernoulliMarginalSlopeFamily {
         // entering the per-row `par_iter` to avoid the OnceLock-under-rayon
         // deadlock — see `feedback_oncelock_rayon_deadlock`.
         if !self.effective_flex_active(block_states)? {
-            drop(self.rigid_fourth_full_cached(block_states, cache, 0)?);
+            _ = self.rigid_fourth_full_cached(block_states, cache, 0)?;
         }
 
         if !self.effective_flex_active(block_states)? {
@@ -15627,7 +15210,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        _ = specs;
         // The workspace impl above unconditionally returns `Some(workspace)`
         // — the rigid path produces a `RowKernelHessianWorkspace` and the
         // flex path produces a
@@ -15639,12 +15222,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     }
 
     fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        _ = specs;
         true
     }
 
     fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        _ = specs;
         true
     }
 
@@ -15914,287 +15497,6 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     }
 }
 
-impl BernoulliMarginalSlopeLineSearchWorkspace {
-    fn materialized(
-        &self,
-    ) -> Result<&Arc<BernoulliMarginalSlopeExactNewtonJointHessianWorkspace>, String> {
-        match self.full_workspace.get_or_init(|| {
-            let mut cache = self.cache.clone();
-            let row_cell_mask = self
-                .options
-                .outer_score_subsample
-                .as_ref()
-                .map(|subsample| subsample.mask.as_slice());
-            cache.row_cell_moments = match row_cell_mask {
-                Some(mask) => self.family.build_row_cell_moments_bundle(
-                    &self.block_states,
-                    &cache.row_contexts,
-                    21,
-                    Some(mask),
-                )?,
-                None => None,
-            };
-            BernoulliMarginalSlopeExactNewtonJointHessianWorkspace::from_arc_cache(
-                self.family.clone(),
-                self.block_states.clone(),
-                Arc::new(cache),
-                self.options.clone(),
-            )
-            .map(Arc::new)
-        }) {
-            Ok(workspace) => Ok(workspace),
-            Err(err) => Err(err.clone()),
-        }
-    }
-}
-
-impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
-    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
-        if self.cache.slices.total >= 512 {
-            return Ok(None);
-        }
-        self.family
-            .exact_newton_joint_hessian_dense_from_cache(&self.block_states, &self.cache)
-            .map(Some)
-    }
-
-    fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
-        self.family
-            .log_likelihood_from_exact_cache(&self.block_states, &self.cache)
-            .map(Some)
-    }
-
-    fn joint_gradient_evaluation(
-        &self,
-    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        self.family
-            .exact_newton_joint_gradient_evaluation_from_cache(&self.block_states, &self.cache)
-            .map(Some)
-    }
-
-    fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
-        // Hv-action against the full coefficient Hessian is consumed by inner
-        // PCG / inner-Newton paths (not outer-only score), so the row mask
-        // does not apply here — keep full-data semantics.
-        let call = self.matvec_calls.fetch_add(1, Ordering::Relaxed) + 1;
-        let started = std::time::Instant::now();
-        let result = self
-            .family
-            .exact_newton_joint_hessian_matvec_from_cache(
-                beta_flat,
-                &self.block_states,
-                &self.cache,
-            )
-            .map(Some);
-        if log_exact_work(self.family.y.len()) && (call <= 3 || call.is_power_of_two()) {
-            log::info!(
-                "[BMS Hessian-Hv] call={} n={} p={} elapsed={:.3}s",
-                call,
-                self.family.y.len(),
-                self.cache.slices.total,
-                started.elapsed().as_secs_f64()
-            );
-        }
-        result
-    }
-
-    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
-        // Diagonal is consumed by inner preconditioners; full-data semantics
-        // preserved (see `hessian_matvec`).
-        self.family
-            .exact_newton_joint_hessian_diagonal_from_cache(&self.block_states, &self.cache)
-            .map(Some)
-    }
-
-    fn projected_directional_derivative_traces(
-        &self,
-        factor: &Array2<f64>,
-        directions: &Array2<f64>,
-    ) -> Result<Option<Array1<f64>>, String> {
-        let traces = if self.options.outer_score_subsample.is_some() {
-            let weighted_rows = outer_weighted_rows(&self.options, self.family.y.len());
-            self.family.batched_rho_correction_logdet_traces_for_rows(
-                &self.block_states,
-                &self.cache,
-                factor,
-                directions,
-                &weighted_rows,
-            )?
-        } else {
-            self.family.batched_rho_correction_logdet_traces_full_rows(
-                &self.block_states,
-                &self.cache,
-                factor,
-                directions,
-            )?
-        };
-        Ok(Some(traces))
-    }
-
-    fn directional_derivative_operator(
-        &self,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
-        self.family
-            .exact_newton_joint_hessian_directional_derivative_operator_from_cache_with_options(
-                &self.block_states,
-                d_beta_flat,
-                &self.cache,
-                &self.options,
-            )
-    }
-
-    fn directional_derivative_operators(
-        &self,
-        d_beta_flats: &[Array1<f64>],
-    ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
-        self.family
-            .exact_newton_joint_hessian_directional_derivative_operators_from_cache_with_options(
-                &self.block_states,
-                d_beta_flats,
-                &self.cache,
-                &self.options,
-            )
-    }
-
-    fn directional_derivative(
-        &self,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.family
-            .exact_newton_joint_hessian_directional_derivative_from_cache_with_options(
-                &self.block_states,
-                d_beta_flat,
-                &self.cache,
-                &self.options,
-            )
-    }
-
-    fn second_directional_derivative_operator(
-        &self,
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
-        self.family
-            .exact_newton_joint_hessiansecond_directional_derivative_operator_from_cache_with_options(
-                &self.block_states,
-                d_beta_u_flat,
-                d_beta_v_flat,
-                &self.cache,
-                &self.options,
-            )
-    }
-
-    fn second_directional_derivative(
-        &self,
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.family
-            .exact_newton_joint_hessiansecond_directional_derivative_from_cache_with_options(
-                &self.block_states,
-                d_beta_u_flat,
-                d_beta_v_flat,
-                &self.cache,
-                &self.options,
-            )
-    }
-}
-
-impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeLineSearchWorkspace {
-    /// Pre-materialize the full workspace at top-level rayon, *before* any
-    /// outer ext-coordinate `par_iter` enters. The lazy `OnceLock`-guarded
-    /// init in [`Self::materialized`] runs nested `into_par_iter()` calls
-    /// inside the init closure (`build_row_primary_hessian_cache`,
-    /// `build_row_cell_moments_bundle`); when several rayon workers race
-    /// into `materialized` from inside an outer par_iter, all-but-one park
-    /// on the OnceLock's OS mutex and the initializer's nested par_iter
-    /// starves waiting for chunks that those parked workers can never run
-    /// — classic OnceLock-under-rayon deadlock (every thread sleeps in
-    /// pthread_mutex/cond_wait, 0% CPU). Warming here turns the eventual
-    /// `materialized` calls inside the outer par_iter into pure O(1) reads
-    /// of the already-populated OnceLock.
-    fn warm_up_outer_caches(&self) -> Result<(), String> {
-        self.materialized()?;
-        Ok(())
-    }
-
-    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
-        self.materialized()?.hessian_dense()
-    }
-
-    fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
-        Ok(Some(self.log_likelihood))
-    }
-
-    fn joint_gradient_evaluation(
-        &self,
-    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        self.materialized()?.joint_gradient_evaluation()
-    }
-
-    fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
-        self.materialized()?.hessian_matvec(beta_flat)
-    }
-
-    fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
-        self.materialized()?.hessian_matvec_into(v, out)
-    }
-
-    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
-        self.materialized()?.hessian_diagonal()
-    }
-
-    fn projected_directional_derivative_traces(
-        &self,
-        factor: &Array2<f64>,
-        directions: &Array2<f64>,
-    ) -> Result<Option<Array1<f64>>, String> {
-        self.materialized()?
-            .projected_directional_derivative_traces(factor, directions)
-    }
-
-    fn directional_derivative_operator(
-        &self,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
-        self.materialized()?
-            .directional_derivative_operator(d_beta_flat)
-    }
-
-    fn directional_derivative_operators(
-        &self,
-        d_beta_flats: &[Array1<f64>],
-    ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
-        self.materialized()?
-            .directional_derivative_operators(d_beta_flats)
-    }
-
-    fn directional_derivative(
-        &self,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.materialized()?.directional_derivative(d_beta_flat)
-    }
-
-    fn second_directional_derivative_operator(
-        &self,
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
-        self.materialized()?
-            .second_directional_derivative_operator(d_beta_u_flat, d_beta_v_flat)
-    }
-
-    fn second_directional_derivative(
-        &self,
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.materialized()?
-            .second_directional_derivative(d_beta_u_flat, d_beta_v_flat)
-    }
-}
 
 impl BernoulliMarginalSlopeFamily {
     fn block_ranges_from_specs(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
@@ -17174,6 +16476,154 @@ impl BernoulliMarginalSlopeFamily {
     }
 }
 
+impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
+    fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+        if self.cache.slices.total >= 512 {
+            return Ok(None);
+        }
+        self.family
+            .exact_newton_joint_hessian_dense_from_cache(&self.block_states, &self.cache)
+            .map(Some)
+    }
+
+    fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
+        self.family
+            .log_likelihood_from_exact_cache(&self.block_states, &self.cache)
+            .map(Some)
+    }
+
+    fn joint_gradient_evaluation(
+        &self,
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        self.family
+            .exact_newton_joint_gradient_evaluation_from_cache(&self.block_states, &self.cache)
+            .map(Some)
+    }
+
+    fn hessian_matvec(&self, beta_flat: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+        let call = self.matvec_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        let started = std::time::Instant::now();
+        let result = self
+            .family
+            .exact_newton_joint_hessian_matvec_from_cache(
+                beta_flat,
+                &self.block_states,
+                &self.cache,
+            )
+            .map(Some);
+        if log_exact_work(self.family.y.len()) && (call <= 3 || call.is_power_of_two()) {
+            log::info!(
+                "[BMS Hessian-Hv] call={} n={} p={} elapsed={:.3}s",
+                call,
+                self.family.y.len(),
+                self.cache.slices.total,
+                started.elapsed().as_secs_f64()
+            );
+        }
+        result
+    }
+
+    fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessian_diagonal_from_cache(&self.block_states, &self.cache)
+            .map(Some)
+    }
+
+    fn projected_directional_derivative_traces(
+        &self,
+        factor: &Array2<f64>,
+        directions: &Array2<f64>,
+    ) -> Result<Option<Array1<f64>>, String> {
+        let traces = if self.options.outer_score_subsample.is_some() {
+            let weighted_rows = outer_weighted_rows(&self.options, self.family.y.len());
+            self.family.batched_rho_correction_logdet_traces_for_rows(
+                &self.block_states,
+                &self.cache,
+                factor,
+                directions,
+                &weighted_rows,
+            )?
+        } else {
+            self.family.batched_rho_correction_logdet_traces_full_rows(
+                &self.block_states,
+                &self.cache,
+                factor,
+                directions,
+            )?
+        };
+        Ok(Some(traces))
+    }
+
+    fn directional_derivative_operator(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        self.family
+            .exact_newton_joint_hessian_directional_derivative_operator_from_cache_with_options(
+                &self.block_states,
+                d_beta_flat,
+                &self.cache,
+                &self.options,
+            )
+    }
+
+    fn directional_derivative_operators(
+        &self,
+        d_beta_flats: &[Array1<f64>],
+    ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
+        self.family
+            .exact_newton_joint_hessian_directional_derivative_operators_from_cache_with_options(
+                &self.block_states,
+                d_beta_flats,
+                &self.cache,
+                &self.options,
+            )
+    }
+
+    fn directional_derivative(
+        &self,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessian_directional_derivative_from_cache_with_options(
+                &self.block_states,
+                d_beta_flat,
+                &self.cache,
+                &self.options,
+            )
+    }
+
+    fn second_directional_derivative_operator(
+        &self,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Arc<dyn HyperOperator>>, String> {
+        self.family
+            .exact_newton_joint_hessiansecond_directional_derivative_operator_from_cache_with_options(
+                &self.block_states,
+                d_beta_u_flat,
+                d_beta_v_flat,
+                &self.cache,
+                &self.options,
+            )
+    }
+
+    fn second_directional_derivative(
+        &self,
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.family
+            .exact_newton_joint_hessiansecond_directional_derivative_from_cache_with_options(
+                &self.block_states,
+                d_beta_u_flat,
+                d_beta_v_flat,
+                &self.cache,
+                &self.options,
+            )
+    }
+}
+
 impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
     fn new(
         family: BernoulliMarginalSlopeFamily,
@@ -17191,12 +16641,12 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
         // parallel — but priming here lifts the first-axis cost out of the
         // workspace's `first_order_terms` measurement.
         if !family.effective_flex_active(&block_states)? {
-            drop(family.rigid_third_full_cached(&block_states, &cache, 0)?);
+            _ = family.rigid_third_full_cached(&block_states, &cache, 0)?;
             // Outer-Hessian path consumes per-row fourth-tensor over every
             // (ψ-axis-i, ψ-axis-j) pair — prime here too so the 528-pair
             // sweep reads a populated cache instead of triggering the
             // 8-direction empirical jet on its first per-pair call.
-            drop(family.rigid_fourth_full_cached(&block_states, &cache, 0)?);
+            _ = family.rigid_fourth_full_cached(&block_states, &cache, 0)?;
         }
         Ok(Self {
             family,
@@ -17874,7 +17324,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
             intercept_warm_starts: Some(Arc::clone(&intercept_warm_starts)),
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         }
     };
 
@@ -18051,7 +17500,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
          designs: &[TermCollectionDesign],
          eval_mode,
          row_set: &crate::families::row_kernel::RowSet| {
-            drop(row_set);
+            _ = row_set;
             use crate::solver::estimate::reml::unified::EvalMode;
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
@@ -18241,7 +17690,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let marginal_beta = array![0.05, 0.08];
         let logslope_beta = array![-0.15, 0.04];
@@ -18320,7 +17768,7 @@ mod tests {
         )
         .expect("link-deviation fixture");
         let p_link_before = link_prepared.runtime.basis_dim();
-        let _ = link_seed; // padded knot-seed retained only for knot construction
+        _ = link_seed; // padded knot-seed retained only for knot construction
         let anchor_design_for_test = score_prepared
             .runtime
             .design(&z)
@@ -18404,7 +17852,7 @@ mod tests {
             &link_seed, &q0_seed, &weights, &link_cfg,
         )
         .expect("link-dev fixture");
-        let _ = link_seed;
+        _ = link_seed;
         let p_before = link_prepared.runtime.basis_dim();
         assert!(p_before > 0, "fixture must have positive basis_dim");
         use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
@@ -18467,7 +17915,7 @@ mod tests {
             &link_seed, &q0_seed, &weights, &link_cfg,
         )
         .expect("link-dev fixture");
-        let _ = link_seed;
+        _ = link_seed;
         let p_before = link_prepared.runtime.basis_dim();
         assert!(
             p_before >= 2,
@@ -18552,7 +18000,7 @@ mod tests {
             &link_seed, &q0_seed, &weights, &link_cfg,
         )
         .expect("link-dev fixture");
-        let _ = link_seed;
+        _ = link_seed;
         let candidate_design = link_prepared
             .runtime
             .design(&q0_seed)
@@ -18629,7 +18077,7 @@ mod tests {
             &link_seed, &q0_seed, &weights, &link_cfg,
         )
         .expect("link-dev fixture");
-        let _ = link_seed;
+        _ = link_seed;
         let candidate_design = link_prepared
             .runtime
             .design(&q0_seed)
@@ -18821,7 +18269,6 @@ mod tests {
                 intercept_warm_starts: cache,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let marginal_eta = Array1::from_iter((0..n).map(|i| 0.15 * ((i as f64) * 0.001).sin()));
         let slope_eta = Array1::from_iter((0..n).map(|i| 0.35 + 0.02 * ((i as f64) * 0.003).cos()));
@@ -18922,7 +18369,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let states = vec![
             ParameterBlockState {
@@ -18993,7 +18439,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -19153,7 +18598,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -19854,7 +19298,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -19978,7 +19421,6 @@ mod tests {
             intercept_warm_starts: Some(new_intercept_warm_start_cache(n)),
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let marginal_eta = 0.35;
         let slope = -0.8;
@@ -20062,7 +19504,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -20137,7 +19578,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -20200,7 +19640,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let current = Array1::<f64>::zeros(score_dim);
         let mut proposed = current.clone();
@@ -21039,7 +20478,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
 
         let a = 0.35;
@@ -21213,7 +20651,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let specs = vec![
             dummy_blockspec(1, 3),
@@ -21404,7 +20841,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let specs = vec![
             ParameterBlockSpec {
@@ -21467,7 +20903,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let states_at = |q: f64, g: f64| {
             vec![
@@ -21607,7 +21042,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
 
         // Three blocks: marginal (dim 0), logslope (dim 0), link_dev.
@@ -21714,7 +21148,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
 
         let block_states = vec![
@@ -21816,7 +21249,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             dummy_block_state(array![0.0], seed.len()),
@@ -21961,7 +21393,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let block_states = vec![
             ParameterBlockState {
@@ -22075,7 +21506,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
 
         let block_states = vec![
@@ -22209,7 +21639,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
 
         let block_states = vec![
@@ -22347,7 +21776,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -22504,7 +21932,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -22614,7 +22041,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -22701,7 +22127,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -22786,7 +22211,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -22878,7 +22302,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -22992,7 +22415,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -23125,7 +22547,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -23281,7 +22702,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -23388,7 +22808,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -23495,7 +22914,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -23613,7 +23031,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -23729,7 +23146,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -23862,7 +23278,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -23982,7 +23397,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -24100,7 +23514,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -24242,7 +23655,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -24358,7 +23770,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let cache = family
             .build_exact_eval_cache(&block_states)
@@ -24472,7 +23883,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -24602,7 +24012,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -24692,7 +24101,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -24782,7 +24190,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -24877,7 +24284,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -24972,7 +24378,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -25056,7 +24461,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let total = slices.total;
@@ -25140,7 +24544,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
@@ -25211,7 +24614,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let slices = block_slices(&family);
         let zero = Array1::<f64>::zeros(slices.total);
@@ -25272,7 +24674,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let beta_w = Array1::from_iter(
             (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
@@ -25389,7 +24790,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -25515,7 +24915,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -25666,7 +25065,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let beta_h = Array1::from_iter(
             (0..score_prepared.block.design.ncols()).map(|idx| 0.015 * (idx as f64 + 1.0)),
@@ -25804,7 +25202,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let beta_m = array![0.18, -0.07];
         let beta_g = array![0.42, 0.05];
@@ -26229,7 +25626,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let block_states = vec![
             ParameterBlockState {
@@ -26305,7 +25701,6 @@ mod tests {
                 intercept_warm_starts: None,
                 auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-                shared_eval_cache: Arc::new(Mutex::new(None)),
             };
         let family = make_family(sigma);
         let block_states = vec![
@@ -26404,7 +25799,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -27060,7 +26454,6 @@ mod tests {
             intercept_warm_starts: None,
             auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            shared_eval_cache: Arc::new(Mutex::new(None)),
         };
         let beta_m = array![0.12, -0.04];
         let beta_g = array![0.35, 0.03];
@@ -27212,14 +26605,14 @@ mod tests {
             .collect();
         let start_uncached = std::time::Instant::now();
         for direction in &directions {
-            let _ = family
+            _ = family
                 .exact_newton_joint_hessian_matvec_from_cache(direction, &states, &uncached)
                 .expect("uncached Hv");
         }
         let uncached_elapsed = start_uncached.elapsed();
         let start_cached = std::time::Instant::now();
         for direction in &directions {
-            let _ = family
+            _ = family
                 .exact_newton_joint_hessian_matvec_from_cache(direction, &states, &cached)
                 .expect("cached Hv");
         }

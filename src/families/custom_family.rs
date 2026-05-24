@@ -949,8 +949,8 @@ pub fn exact_outer_order_from_capability(
     specs: &[ParameterBlockSpec],
     coefficient_cost: u64,
 ) -> ExactOuterDerivativeOrder {
-    drop(specs);
-    drop(coefficient_cost);
+    _ = specs;
+    _ = coefficient_cost;
     ExactOuterDerivativeOrder::Second
 }
 
@@ -964,7 +964,7 @@ pub fn exact_outer_order_with_outer_hvp(
     coefficient_cost: u64,
     outer_hyper_hessian_hvp_available: bool,
 ) -> ExactOuterDerivativeOrder {
-    drop(outer_hyper_hessian_hvp_available);
+    _ = outer_hyper_hessian_hvp_available;
     exact_outer_order_from_capability(specs, coefficient_cost)
 }
 
@@ -1204,23 +1204,6 @@ pub fn cost_gated_first_order_max_iter(
     requested.min(affordable.max(MIN_FIRST_ORDER_ITERS))
 }
 
-/// Local trust budget for first-order outer BFGS on log-smoothing parameters.
-///
-/// One unit in `rho = log(lambda)` is an `e`-fold smoothing-parameter change.
-/// Previously this cap was `1.0`, which throttled BFGS to ~1/5 of its
-/// quasi-Newton step on flat REML surfaces (the natural BFGS direction has
-/// `|d|_inf` of ~5 in log-λ for biobank-scale survival fits). Probes whose
-/// `step_inf > cap` are rejected for free in `OuterFirstOrderBridge::eval_cost`
-/// (returning `BFGS_LINE_SEARCH_REJECT_COST` without running an inner solve),
-/// so a larger cap costs nothing on rejection — it only lets Strong-Wolfe
-/// accept bigger steps that the inner-PIRLS divergence guard can already
-/// validate. `5.0` allows up to `e^5 ≈ 148`-fold smoothing-parameter change
-/// per accepted outer iter, which matches the typical quasi-Newton direction
-/// magnitude while still bounding pathological probes.
-pub const fn first_order_bfgs_loglambda_step_cap(has_outer_hessian: bool) -> Option<f64> {
-    if has_outer_hessian { None } else { Some(5.0) }
-}
-
 pub(crate) fn exact_newton_outer_geometry_supports_second_order_solver<F: CustomFamily + ?Sized>(
     family: &F,
 ) -> bool {
@@ -1300,8 +1283,8 @@ pub trait CustomFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Option<String> {
-        drop(specs);
-        drop(options);
+        _ = specs;
+        _ = options;
         None
     }
 
@@ -1336,7 +1319,7 @@ pub trait CustomFamily {
         block_states: &[ParameterBlockState],
         options: &BlockwiseFitOptions,
     ) -> Result<f64, String> {
-        drop(options);
+        _ = options;
         self.log_likelihood_only(block_states)
     }
 
@@ -1807,7 +1790,7 @@ pub trait CustomFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        drop(options);
+        _ = options;
         self.exact_newton_joint_hessian_workspace(states, specs)
     }
 
@@ -1824,9 +1807,9 @@ pub trait CustomFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
-        drop(states);
-        drop(specs);
-        drop(options);
+        _ = states;
+        _ = specs;
+        _ = options;
         Ok(None)
     }
 
@@ -1866,11 +1849,11 @@ pub trait CustomFamily {
         options: &BlockwiseFitOptions,
         hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
-        drop(block_states);
-        drop(specs);
-        drop(derivative_blocks);
-        drop(rho);
-        drop(options);
+        _ = block_states;
+        _ = specs;
+        _ = derivative_blocks;
+        _ = rho;
+        _ = options;
         drop(hessian_workspace);
         Ok(None)
     }
@@ -1892,9 +1875,9 @@ pub trait CustomFamily {
         rho: &Array1<f64>,
         hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterHessianTerms>, String> {
-        drop(block_states);
-        drop(derivative_blocks);
-        drop(rho);
+        _ = block_states;
+        _ = derivative_blocks;
+        _ = rho;
         drop(hessian_workspace);
         Ok(self
             .outer_hyper_hessian_operator(specs)
@@ -1908,24 +1891,24 @@ pub trait CustomFamily {
     /// Kept separate from outer hyper-Hessian capabilities so CTN/GAMLSS row
     /// operators do not accidentally advertise pairwise θθ calculus as cheap.
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        _ = specs;
         false
     }
 
     fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        _ = specs;
         false
     }
 
     fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        _ = specs;
         false
     }
 
     /// True only when the family has a real profiled outer Hessian-vector
     /// product over θ = (ρ, ψ), without enumerating all θ_i θ_j pairs.
     fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        _ = specs;
         false
     }
 
@@ -1934,7 +1917,7 @@ pub trait CustomFamily {
     /// availability; families with only inner HVP support should override this
     /// if dense θθ assembly is not a valid capability for their path.
     fn outer_hyper_hessian_dense_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        drop(specs);
+        _ = specs;
         true
     }
 
@@ -1959,7 +1942,7 @@ pub trait CustomFamily {
         &self,
         specs: &[ParameterBlockSpec],
     ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
-        drop(specs);
+        _ = specs;
         None
     }
 
@@ -2479,7 +2462,7 @@ pub trait CustomFamily {
         derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
-        drop(options);
+        _ = options;
         self.exact_newton_joint_psi_workspace(states, specs, derivs)
     }
 
@@ -3983,7 +3966,7 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        drop(axis);
+        _ = axis;
         debug_assert_eq!(v.len(), self.n);
         Ok(Array1::<f64>::zeros(self.p))
     }
@@ -3993,7 +3976,7 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        drop(axis);
+        _ = axis;
         debug_assert_eq!(u.len(), self.p);
         Ok(Array1::<f64>::zeros(self.n))
     }
@@ -4003,7 +3986,7 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        drop(axis);
+        _ = axis;
         debug_assert_eq!(v.len(), self.n);
         Ok(Array1::<f64>::zeros(self.p))
     }
@@ -4014,8 +3997,8 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis_e: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        drop(axis_d);
-        drop(axis_e);
+        _ = axis_d;
+        _ = axis_e;
         debug_assert_eq!(v.len(), self.n);
         Ok(Array1::<f64>::zeros(self.p))
     }
@@ -4025,7 +4008,7 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        drop(axis);
+        _ = axis;
         debug_assert_eq!(u.len(), self.p);
         Ok(Array1::<f64>::zeros(self.n))
     }
@@ -4036,8 +4019,8 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis_e: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        drop(axis_d);
-        drop(axis_e);
+        _ = axis_d;
+        _ = axis_e;
         debug_assert_eq!(u.len(), self.p);
         Ok(Array1::<f64>::zeros(self.n))
     }
@@ -4047,7 +4030,7 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        drop(axis);
+        _ = axis;
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 
@@ -4057,8 +4040,8 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         row: usize,
         mut out: ArrayViewMut1<'_, f64>,
     ) -> Result<(), crate::terms::basis::BasisError> {
-        drop(axis);
-        drop(row);
+        _ = axis;
+        _ = row;
         out.fill(0.0);
         Ok(())
     }
@@ -4068,7 +4051,7 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        drop(axis);
+        _ = axis;
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 
@@ -4078,8 +4061,8 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
         axis_e: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        drop(axis_d);
-        drop(axis_e);
+        _ = axis_d;
+        _ = axis_e;
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 }
@@ -6031,8 +6014,8 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         factor: &Array2<f64>,
         directions: &Array2<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        drop(factor);
-        drop(directions);
+        _ = factor;
+        _ = directions;
         Ok(None)
     }
 
@@ -8326,7 +8309,7 @@ fn penalty_logdet_cholesky_fallback(
 }
 
 fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, dim: usize) -> RidgeDeterminantMode {
-    drop(dim);
+    _ = dim;
     match ridge_policy.determinant_mode {
         RidgeDeterminantMode::Auto => RidgeDeterminantMode::Full,
         mode => mode,
@@ -10889,37 +10872,6 @@ fn require_projected_kkt_residual(
     }
 }
 
-const LINEARIZED_STALL_REL_THRESHOLD: f64 = 0.9;
-const LINEARIZED_STALL_CYCLES: usize = 15;
-const LINEARIZED_STALL_RESIDUAL_FACTOR: f64 = 50.0;
-
-fn joint_linearized_rate_stall_candidate(
-    linearized_rel: f64,
-    residual: f64,
-    residual_tol: f64,
-) -> bool {
-    linearized_rel.is_finite()
-        && linearized_rel >= LINEARIZED_STALL_REL_THRESHOLD
-        && residual.is_finite()
-        && residual_tol.is_finite()
-        && residual > LINEARIZED_STALL_RESIDUAL_FACTOR * residual_tol.max(0.0)
-}
-
-fn projected_cycles_to_residual_tol(linearized_rel: f64, residual: f64, residual_tol: f64) -> f64 {
-    if linearized_rel > 0.0 && linearized_rel < 1.0 && residual_tol > 0.0 && residual > residual_tol
-    {
-        let ratio_log = linearized_rel.ln();
-        let r_log = (residual / residual_tol).ln();
-        if ratio_log < 0.0 && r_log.is_finite() {
-            (r_log / -ratio_log).max(0.0)
-        } else {
-            f64::INFINITY
-        }
-    } else {
-        f64::INFINITY
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConstrainedStationaryCertificate {
     NotCandidate,
@@ -10946,10 +10898,6 @@ impl JointNewtonMathDiagnostic {
 
     fn linearized_rel(&self) -> f64 {
         self.linearized_next_kkt_inf / (1.0 + self.old_kkt_inf)
-    }
-
-    fn quadratic_defect_ratio(&self, new_kkt_inf: f64) -> f64 {
-        new_kkt_inf / self.step_inf.powi(2).max(f64::EPSILON)
     }
 }
 
@@ -11279,10 +11227,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // Total descent budget across the joint-Newton loop, used by
         // the end-of-loop summary to report `descent_total`.
         let initial_joint_objective: f64 = lastobjective;
-        // Family-side cap on the inf-norm of a single Newton proposal.
-        // Mirrors the rescale in the legacy implementation (see commit
-        // 4bb663ab, "Perf: add joint Newton fast path for GAMLSS").
-        const MAX_JOINT_STEP: f64 = 20.0;
 
         // Per-cycle |Δobjective| history for the geometric-tail trigger of
         // the constrained-stationary certificate below. When the cycles
@@ -12042,7 +11986,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // already consults the realized objective change and
                     // gradient residual instead. Drop the value so its
                     // computation is not silently wasted.
-                    drop(predicted_reduction);
+                    _ = predicted_reduction;
                     accepted = true;
                     break;
                 }
@@ -19389,7 +19333,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         log::info!(
             "[OUTER] custom family: skipping smoothing outer solve for explicit one-cycle inner probe"
         );
-        let per_block = split_log_lambdas(&rho0, &penalty_counts)?;
+        let per_block = split_log_lambdas(&rho0, &label_layout.penalty_counts)?;
         let mut inner = inner_blockwise_fit(family, specs, &per_block, options, None)?;
         refresh_all_block_etas(family, specs, &mut inner.block_states).map_err(|reason| {
             CustomFamilyError::Optimization {
@@ -19472,7 +19416,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         family.coefficient_gradient_cost(specs),
         need_outer_hessian,
     );
-    let bfgs_step_cap = first_order_bfgs_loglambda_step_cap(need_outer_hessian);
     if outer_max_iter < options.outer_max_iter {
         log::info!(
             "[OUTER] custom family: first-order work gate reduced outer_max_iter {} -> {}",
@@ -19502,7 +19445,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_fallback_policy(fallback_policy)
         .with_tolerance(options.outer_tol)
         .with_max_iter(outer_max_iter)
-        .with_bfgs_step_cap(bfgs_step_cap)
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(rho0.clone())

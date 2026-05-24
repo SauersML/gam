@@ -45,7 +45,7 @@ mod cuda_impl {
         trans_a: bool,
         trans_b: bool,
     ) -> Option<Array2<f64>> {
-        drop((runtime, a, b, trans_a, trans_b));
+        _ = (runtime, a, b, trans_a, trans_b);
         None
     }
 
@@ -56,7 +56,7 @@ mod cuda_impl {
         v: ArrayView1<'_, f64>,
         trans_a: bool,
     ) -> Option<Array1<f64>> {
-        drop((runtime, a, v, trans_a));
+        _ = (runtime, a, v, trans_a);
         None
     }
 
@@ -66,7 +66,7 @@ mod cuda_impl {
         x: ArrayView2<'_, f64>,
         w: ArrayView1<'_, f64>,
     ) -> Option<Array2<f64>> {
-        drop((runtime, x, w));
+        _ = (runtime, x, w);
         None
     }
 
@@ -77,7 +77,7 @@ mod cuda_impl {
         w: ArrayView1<'_, f64>,
         y: ArrayView2<'_, f64>,
     ) -> Option<Array2<f64>> {
-        drop((runtime, x, w, y));
+        _ = (runtime, x, w, y);
         None
     }
 
@@ -90,7 +90,7 @@ mod cuda_impl {
         w_ab: ArrayView1<'_, f64>,
         w_bb: ArrayView1<'_, f64>,
     ) -> Option<Array2<f64>> {
-        drop((runtime, x_a, x_b, w_aa, w_ab, w_bb));
+        _ = (runtime, x_a, x_b, w_aa, w_ab, w_bb);
         None
     }
 }

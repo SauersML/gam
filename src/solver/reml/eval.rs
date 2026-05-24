@@ -138,7 +138,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
-        drop(self.selecthessian_strategy_policy(rho, &bundle));
+        _ = self.selecthessian_strategy_policy(rho, &bundle);
         self.compute_lamlhessian_exact_from_bundle(rho, &bundle)
     }
 

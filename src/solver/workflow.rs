@@ -2712,7 +2712,7 @@ fn standard_adaptive_regularization_options(
     config: &FitConfig,
     spec: &TermCollectionSpec,
 ) -> Option<AdaptiveRegularizationOptions> {
-    drop(spec);
+    _ = spec;
     let enabled = config.adaptive_regularization.unwrap_or(false);
     enabled.then(|| AdaptiveRegularizationOptions {
         enabled: true,

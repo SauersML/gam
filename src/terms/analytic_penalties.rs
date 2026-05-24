@@ -298,8 +298,8 @@ pub trait AnalyticPenalty: Send + Sync {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
-        drop(target);
-        drop(rho);
+        _ = target;
+        _ = rho;
         None
     }
 
@@ -365,7 +365,7 @@ pub trait AnalyticPenalty: Send + Sync {
     /// Update any attached scalar weight schedule at the given REML outer
     /// iteration. Penalties without schedules keep their stored weight.
     fn apply_schedule(&mut self, iter: usize) {
-        drop(iter);
+        _ = iter;
     }
 }
 
@@ -2355,7 +2355,7 @@ impl AnalyticPenalty for TopKActivationPenalty {
     }
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
-        drop(rho);
+        _ = rho;
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut mask = vec![false; d];
@@ -2374,7 +2374,7 @@ impl AnalyticPenalty for TopKActivationPenalty {
     }
 
     fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        drop(rho);
+        _ = rho;
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut mask = vec![false; d];
@@ -2396,7 +2396,7 @@ impl AnalyticPenalty for TopKActivationPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
-        drop(rho);
+        _ = rho;
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut mask = vec![false; d];
@@ -2414,8 +2414,8 @@ impl AnalyticPenalty for TopKActivationPenalty {
     }
 
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        drop(target);
-        drop(rho);
+        _ = target;
+        _ = rho;
         Array1::<f64>::zeros(0)
     }
 
@@ -6171,7 +6171,7 @@ impl OrthogonalityPenalty {
     /// Dense cross-axis Hessian; no blockwise reduction preserves the
     /// rotation-gauge term.
     pub fn as_blockwise(&self, global_offset: usize) -> Option<Vec<BlockwisePenalty>> {
-        drop(global_offset);
+        _ = global_offset;
         None
     }
 }
@@ -6566,6 +6566,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                     self.diag_via_matvec()
                 }
             }
+            AnalyticPenaltyKind::NestedPrefix(p) => p
+                .hessian_diag(self.target.view(), self.rho.view())
+                .expect("nested prefix diag"),
             AnalyticPenaltyKind::Isometry(_)
                 if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
             {
@@ -6592,6 +6595,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::Ard(_)
             | AnalyticPenaltyKind::TopKActivation(_)
             | AnalyticPenaltyKind::JumpReLU(_)
+            | AnalyticPenaltyKind::NestedPrefix(_)
             | AnalyticPenaltyKind::Sparsity(_)
             | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
             | AnalyticPenaltyKind::IBPAssignment(_) => {

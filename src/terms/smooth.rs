@@ -32,7 +32,7 @@ use crate::estimate::{
     UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
-use crate::faer_ndarray::{FaerEigh, fast_ab, fast_atb, fast_atv};
+use crate::faer_ndarray::{fast_ab, fast_atb, fast_atv};
 use crate::families::strategy::{FamilyStrategy, strategy_for_family};
 use crate::matrix::{
     BlockDesignOperator, CoefficientTransformOperator, DenseDesignOperator, DesignBlock,
@@ -47,7 +47,6 @@ use crate::resource::MatrixMaterializationError;
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, MixtureLinkState, SasLinkState,
 };
-use faer::Side;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 use serde::{Deserialize, Serialize};
@@ -4156,386 +4155,6 @@ fn normalize_penalty_in_constrained_space(matrix: &Array2<f64>) -> (Array2<f64>,
     }
 }
 
-fn sorted_finite_levels_from_col(col: ArrayView1<'_, f64>) -> Result<Vec<u64>, BasisError> {
-    let mut levels = BTreeSet::<u64>::new();
-    for &v in col.iter() {
-        if !v.is_finite() {
-            return Err(BasisError::InvalidInput(
-                "factor smooth grouping column contains non-finite values".to_string(),
-            ));
-        }
-        levels.insert(v.to_bits());
-    }
-    Ok(levels.into_iter().collect())
-}
-
-fn indicator_design_for_levels(
-    data: ArrayView2<'_, f64>,
-    feature_col: usize,
-    levels: &[u64],
-) -> Result<Array2<f64>, BasisError> {
-    if feature_col >= data.ncols() {
-        return Err(BasisError::DimensionMismatch(format!(
-            "categorical feature column {feature_col} out of bounds for {} columns",
-            data.ncols()
-        )));
-    }
-    let n = data.nrows();
-    let mut out = Array2::<f64>::zeros((n, levels.len()));
-    let level_to_idx = levels
-        .iter()
-        .enumerate()
-        .map(|(i, &b)| (b, i))
-        .collect::<BTreeMap<_, _>>();
-    for i in 0..n {
-        let v = data[[i, feature_col]];
-        if !v.is_finite() {
-            return Err(BasisError::InvalidInput(
-                "categorical feature column contains non-finite values".to_string(),
-            ));
-        }
-        if let Some(&j) = level_to_idx.get(&v.to_bits()) {
-            out[[i, j]] = 1.0;
-        }
-    }
-    Ok(out)
-}
-
-fn dense_block_diag(blocks: &[Array2<f64>]) -> Array2<f64> {
-    let rows = blocks.iter().map(|b| b.nrows()).sum::<usize>();
-    let cols = blocks.iter().map(|b| b.ncols()).sum::<usize>();
-    let mut out = Array2::<f64>::zeros((rows, cols));
-    let mut r = 0usize;
-    let mut c = 0usize;
-    for b in blocks {
-        out.slice_mut(s![r..r + b.nrows(), c..c + b.ncols()])
-            .assign(b);
-        r += b.nrows();
-        c += b.ncols();
-    }
-    out
-}
-
-fn replicate_design_by_indicator(base: &Array2<f64>, indicator: &Array2<f64>) -> Array2<f64> {
-    let n = base.nrows();
-    let p = base.ncols();
-    let l = indicator.ncols();
-    let mut out = Array2::<f64>::zeros((n, p * l));
-    for lev in 0..l {
-        for j in 0..p {
-            let col = lev * p + j;
-            for i in 0..n {
-                out[[i, col]] = base[[i, j]] * indicator[[i, lev]];
-            }
-        }
-    }
-    out
-}
-
-fn sum_to_zero_level_contrast(levels: usize) -> Array2<f64> {
-    let mut c = Array2::<f64>::zeros((levels, levels.saturating_sub(1)));
-    if levels < 2 {
-        return c;
-    }
-    for j in 0..levels - 1 {
-        c[[j, j]] = 1.0;
-        c[[levels - 1, j]] = -1.0;
-    }
-    c
-}
-
-fn apply_level_contrast_to_replicated_design(
-    base_by_level: &Array2<f64>,
-    p_base: usize,
-    contrast: &Array2<f64>,
-) -> Array2<f64> {
-    let n = base_by_level.nrows();
-    let l = contrast.nrows();
-    let lc = contrast.ncols();
-    let mut out = Array2::<f64>::zeros((n, p_base * lc));
-    for i in 0..n {
-        for j in 0..p_base {
-            for cidx in 0..lc {
-                let mut v = 0.0;
-                for lev in 0..l {
-                    v += base_by_level[[i, lev * p_base + j]] * contrast[[lev, cidx]];
-                }
-                out[[i, cidx * p_base + j]] = v;
-            }
-        }
-    }
-    out
-}
-
-fn expand_penalty_by_levels(base_s: &Array2<f64>, levels: usize) -> Array2<f64> {
-    let blocks = (0..levels).map(|_| base_s.clone()).collect::<Vec<_>>();
-    dense_block_diag(&blocks)
-}
-
-fn build_by_smooth_basis(
-    data: ArrayView2<'_, f64>,
-    smooth: &SmoothBasisSpec,
-    by_kind: &ByVarKind,
-    workspace: &mut crate::basis::BasisWorkspace,
-) -> Result<BasisBuildResult, BasisError> {
-    let inner_term = SmoothTermSpec {
-        name: "by-inner".to_string(),
-        basis: smooth.clone(),
-        shape: ShapeConstraint::None,
-    };
-    let inner = build_single_local_smooth_term(data, &inner_term, workspace)?;
-    let base = inner.design.to_dense();
-    match by_kind {
-        ByVarKind::Numeric { feature_col } => {
-            if *feature_col >= data.ncols() {
-                return Err(BasisError::DimensionMismatch(
-                    "numeric by column out of bounds".to_string(),
-                ));
-            }
-            let mut out = base.clone();
-            for i in 0..out.nrows() {
-                let z = data[[i, *feature_col]];
-                if !z.is_finite() {
-                    return Err(BasisError::InvalidInput(
-                        "numeric by column contains non-finite values".to_string(),
-                    ));
-                }
-                for j in 0..out.ncols() {
-                    out[[i, j]] *= z;
-                }
-            }
-            Ok(BasisBuildResult {
-                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(out)),
-                penalties: inner.penalties,
-                nullspace_dims: inner.nullspaces,
-                penaltyinfo: inner.penaltyinfo,
-                ops: inner.ops,
-                metadata: inner.metadata,
-                kronecker_factored: None,
-            })
-        }
-        ByVarKind::Factor {
-            feature_col,
-            ordered,
-            frozen_levels,
-        } => {
-            let mut levels = frozen_levels.clone().unwrap_or_else(Vec::new);
-            if levels.is_empty() {
-                levels = sorted_finite_levels_from_col(data.column(*feature_col))?;
-            }
-            let kept = if *ordered && !levels.is_empty() {
-                levels[1..].to_vec()
-            } else {
-                levels
-            };
-            let ind = indicator_design_for_levels(data, *feature_col, &kept)?;
-            let design = replicate_design_by_indicator(&base, &ind);
-            let penalties = inner
-                .penalties
-                .iter()
-                .map(|s| expand_penalty_by_levels(s, kept.len()))
-                .collect::<Vec<_>>();
-            let candidates = penalties
-                .into_iter()
-                .enumerate()
-                .map(|(i, matrix)| PenaltyCandidate {
-                    matrix,
-                    nullspace_dim_hint: 0,
-                    source: PenaltySource::Other(format!("BySmoothPenalty({i})")),
-                    normalization_scale: 1.0,
-                    kronecker_factors: None,
-                    op: None,
-                })
-                .collect::<Vec<_>>();
-            let (penalties, nullspace_dims, penaltyinfo, ops) =
-                filter_active_penalty_candidates_with_ops(candidates)?;
-            Ok(BasisBuildResult {
-                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
-                penalties,
-                nullspace_dims,
-                penaltyinfo,
-                ops,
-                metadata: inner.metadata,
-                kronecker_factored: None,
-            })
-        }
-    }
-}
-
-fn bspline_base_design_and_penalty(
-    data: ArrayView2<'_, f64>,
-    col: usize,
-    spec: &BSplineBasisSpec,
-) -> Result<(Array2<f64>, Array2<f64>, BasisMetadata), BasisError> {
-    let mut local = spec.clone();
-    local.identifiability = BSplineIdentifiability::None;
-    let built = build_bspline_basis_1d(data.column(col), &local)?;
-    let design = built.design.to_dense();
-    let penalty =
-        built.penalties.first().cloned().ok_or_else(|| {
-            BasisError::InvalidInput("B-spline marginal missing penalty".to_string())
-        })?;
-    Ok((design, penalty, built.metadata))
-}
-
-fn natural_reparameterize_design_penalty(
-    x: &Array2<f64>,
-    s: &Array2<f64>,
-) -> Result<(Array2<f64>, usize, usize), BasisError> {
-    let sym = (s + &s.t().to_owned()) * 0.5;
-    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
-    let max_ev = evals.iter().copied().fold(0.0_f64, f64::max);
-    let tol = (max_ev.max(1.0)) * 1e-10;
-    let mut order = Vec::<usize>::new();
-    for (i, &ev) in evals.iter().enumerate() {
-        if ev <= tol {
-            order.push(i);
-        }
-    }
-    for (i, &ev) in evals.iter().enumerate() {
-        if ev > tol {
-            order.push(i);
-        }
-    }
-    let null_dim = order.iter().filter(|&&i| evals[i] <= tol).count();
-    let rank = order.len() - null_dim;
-    let mut transform = Array2::<f64>::zeros((evecs.nrows(), evecs.ncols()));
-    for (new_j, &old_j) in order.iter().enumerate() {
-        let scale = if evals[old_j] > tol {
-            evals[old_j].sqrt().recip()
-        } else {
-            1.0
-        };
-        for r in 0..evecs.nrows() {
-            transform[[r, new_j]] = evecs[[r, old_j]] * scale;
-        }
-    }
-    Ok((x.dot(&transform), null_dim, rank))
-}
-
-fn build_linear_margin(data: ArrayView2<'_, f64>, col: usize) -> Result<Array2<f64>, BasisError> {
-    if col >= data.ncols() {
-        return Err(BasisError::DimensionMismatch(
-            "random-slope continuous column out of bounds".to_string(),
-        ));
-    }
-    let n = data.nrows();
-    let mut x = Array2::<f64>::zeros((n, 2));
-    for i in 0..n {
-        let v = data[[i, col]];
-        if !v.is_finite() {
-            return Err(BasisError::InvalidInput(
-                "random-slope column contains non-finite values".to_string(),
-            ));
-        }
-        x[[i, 0]] = 1.0;
-        x[[i, 1]] = v;
-    }
-    Ok(x)
-}
-
-fn build_factor_smooth_basis(
-    data: ArrayView2<'_, f64>,
-    spec: &FactorSmoothSpec,
-) -> Result<BasisBuildResult, BasisError> {
-    if spec.group_col >= data.ncols() {
-        return Err(BasisError::DimensionMismatch(
-            "factor-smooth group column out of bounds".to_string(),
-        ));
-    }
-    let mut levels = spec.group_frozen_levels.clone().unwrap_or_else(Vec::new);
-    if levels.is_empty() {
-        levels = sorted_finite_levels_from_col(data.column(spec.group_col))?;
-    }
-    if levels.is_empty() {
-        return Err(BasisError::InvalidInput(
-            "factor smooth requires at least one group level".to_string(),
-        ));
-    }
-    let continuous_col = *spec.continuous_cols.first().ok_or_else(|| {
-        BasisError::InvalidInput("factor smooth requires one continuous margin".to_string())
-    })?;
-    let (base_x, base_s, metadata) = match spec.flavour {
-        FactorSmoothFlavour::Re => (
-            build_linear_margin(data, continuous_col)?,
-            Array2::<f64>::zeros((2, 2)),
-            BasisMetadata::TensorBSpline {
-                feature_cols: vec![continuous_col, spec.group_col],
-                knots: vec![],
-                degrees: vec![],
-                periods: vec![],
-                identifiability_transform: None,
-            },
-        ),
-        _ => bspline_base_design_and_penalty(data, continuous_col, &spec.marginal)?,
-    };
-    let (base_x, null_dim, rank) = match spec.flavour {
-        FactorSmoothFlavour::Fs { .. } => natural_reparameterize_design_penalty(&base_x, &base_s)?,
-        FactorSmoothFlavour::Re => (base_x, 0, 2),
-        FactorSmoothFlavour::Sz => (base_x, 0, base_s.ncols()),
-    };
-    let p = base_x.ncols();
-    let ind = indicator_design_for_levels(data, spec.group_col, &levels)?;
-    let mut design = replicate_design_by_indicator(&base_x, &ind);
-    let mut penalties = Vec::<Array2<f64>>::new();
-    match &spec.flavour {
-        FactorSmoothFlavour::Fs {
-            m_null_penalty_orders,
-        } => {
-            let mut range = Array2::<f64>::zeros((p, p));
-            for j in null_dim..(null_dim + rank) {
-                range[[j, j]] = 1.0;
-            }
-            penalties.push(expand_penalty_by_levels(&range, levels.len()));
-            let null_count = if m_null_penalty_orders.len() == 1 && m_null_penalty_orders[0] == 1 {
-                null_dim.min(1)
-            } else {
-                null_dim
-            };
-            for j in 0..null_count {
-                let mut sj = Array2::<f64>::zeros((p, p));
-                sj[[j, j]] = 1.0;
-                penalties.push(expand_penalty_by_levels(&sj, levels.len()));
-            }
-        }
-        FactorSmoothFlavour::Sz => {
-            let contrast = sum_to_zero_level_contrast(levels.len());
-            design = apply_level_contrast_to_replicated_design(&design, p, &contrast);
-            let s_level = dense_block_diag(
-                &(0..contrast.ncols())
-                    .map(|_| base_s.clone())
-                    .collect::<Vec<_>>(),
-            );
-            penalties.push(s_level);
-        }
-        FactorSmoothFlavour::Re => {
-            penalties.push(Array2::<f64>::eye(design.ncols()));
-        }
-    }
-    let candidates = penalties
-        .into_iter()
-        .enumerate()
-        .map(|(i, matrix)| PenaltyCandidate {
-            matrix,
-            nullspace_dim_hint: 0,
-            source: PenaltySource::Other(format!("FactorSmoothPenalty({i})")),
-            normalization_scale: 1.0,
-            kronecker_factors: None,
-            op: None,
-        })
-        .collect::<Vec<_>>();
-    let (penalties, nullspace_dims, penaltyinfo, ops) =
-        filter_active_penalty_candidates_with_ops(candidates)?;
-    Ok(BasisBuildResult {
-        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
-        ops,
-        metadata,
-        kronecker_factored: None,
-    })
-}
 
 fn build_periodic_fourier_margin(
     x: ArrayView1<'_, f64>,
@@ -4593,115 +4212,6 @@ fn build_periodic_fourier_margin(
     Ok((basis, penalty, knots))
 }
 
-fn tensor_product_design_from_sparse_marginals(
-    marginal_sparse: &[&SparseColMat<usize, f64>],
-) -> Result<SparseColMat<usize, f64>, BasisError> {
-    if marginal_sparse.is_empty() {
-        return Err(BasisError::InvalidInput(
-            "TensorBSpline requires at least one marginal basis".to_string(),
-        ));
-    }
-    let n = marginal_sparse[0].nrows();
-    for (i, m) in marginal_sparse.iter().enumerate().skip(1) {
-        if m.nrows() != n {
-            return Err(BasisError::DimensionMismatch(format!(
-                "tensor sparse marginal row mismatch at dim {i}: expected {n}, got {}",
-                m.nrows()
-            )));
-        }
-    }
-    let dims: Vec<usize> = marginal_sparse.iter().map(|m| m.ncols()).collect();
-    let total_cols = dims.iter().try_fold(1usize, |acc, &q| {
-        acc.checked_mul(q)
-            .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))
-    })?;
-    let mut strides = vec![1usize; dims.len()];
-    for d in (0..dims.len().saturating_sub(1)).rev() {
-        strides[d] = strides[d + 1]
-            .checked_mul(dims[d + 1])
-            .ok_or_else(|| BasisError::DimensionMismatch("tensor basis too large".to_string()))?;
-    }
-
-    use faer::sparse::SparseRowMat;
-    let csrs: Vec<SparseRowMat<usize, f64>> = marginal_sparse
-        .iter()
-        .enumerate()
-        .map(|(d, m)| {
-            m.as_ref().to_row_major().map_err(|e| {
-                BasisError::SparseCreation(format!(
-                    "tensor sparse marginal {d} CSR conversion failed: {e:?}"
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let row_ptrs: Vec<&[usize]> = csrs.iter().map(|c| c.symbolic().row_ptr()).collect();
-    let col_idxs: Vec<&[usize]> = csrs.iter().map(|c| c.symbolic().col_idx()).collect();
-    let vals: Vec<&[f64]> = csrs.iter().map(|c| c.val()).collect();
-
-    use rayon::prelude::*;
-    const CHUNK: usize = 1024;
-    let num_chunks = n.div_ceil(CHUNK);
-    let per_chunk: Vec<Vec<Triplet<usize, usize, f64>>> = (0..num_chunks)
-        .into_par_iter()
-        .map(|chunk_idx| {
-            let row_start = chunk_idx * CHUNK;
-            let row_end = (row_start + CHUNK).min(n);
-            let mut chunk_triplets = Vec::<Triplet<usize, usize, f64>>::new();
-            let mut cur_cols = Vec::<usize>::with_capacity(64);
-            let mut cur_vals = Vec::<f64>::with_capacity(64);
-            let mut next_cols = Vec::<usize>::with_capacity(64);
-            let mut next_vals = Vec::<f64>::with_capacity(64);
-            for i in row_start..row_end {
-                cur_cols.clear();
-                cur_vals.clear();
-                cur_cols.push(0);
-                cur_vals.push(1.0);
-                let mut row_is_zero = false;
-                for d in 0..dims.len() {
-                    let row_start_d = row_ptrs[d][i];
-                    let row_end_d = row_ptrs[d][i + 1];
-                    if row_start_d == row_end_d {
-                        row_is_zero = true;
-                        break;
-                    }
-                    let stride = strides[d];
-                    next_cols.clear();
-                    next_vals.clear();
-                    next_cols.reserve(cur_cols.len() * (row_end_d - row_start_d));
-                    next_vals.reserve(cur_vals.len() * (row_end_d - row_start_d));
-                    for (&prev_col, &prev_val) in cur_cols.iter().zip(cur_vals.iter()) {
-                        for ptr in row_start_d..row_end_d {
-                            let cj = col_idxs[d][ptr];
-                            let vj = vals[d][ptr];
-                            next_cols.push(prev_col + cj * stride);
-                            next_vals.push(prev_val * vj);
-                        }
-                    }
-                    std::mem::swap(&mut cur_cols, &mut next_cols);
-                    std::mem::swap(&mut cur_vals, &mut next_vals);
-                }
-                if row_is_zero {
-                    continue;
-                }
-                for (&col, &val) in cur_cols.iter().zip(cur_vals.iter()) {
-                    chunk_triplets.push(Triplet::new(i, col, val));
-                }
-            }
-            chunk_triplets
-        })
-        .collect();
-    let total_nnz: usize = per_chunk.iter().map(Vec::len).sum();
-    let mut triplets = Vec::<Triplet<usize, usize, f64>>::with_capacity(total_nnz);
-    for chunk in per_chunk {
-        triplets.extend(chunk);
-    }
-    SparseColMat::try_new_from_triplets(n, total_cols, &triplets).map_err(|e| {
-        BasisError::SparseCreation(format!(
-            "failed to assemble sparse tensor product design: {e:?}"
-        ))
-    })
-}
-
 fn build_tensor_bspline_basis(
     data: ArrayView2<'_, f64>,
     feature_cols: &[usize],
@@ -4740,15 +4250,6 @@ fn build_tensor_bspline_basis(
     let mut marginalnum_basis = Vec::<usize>::with_capacity(feature_cols.len());
     let mut marginal_penalties = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
     let mut marginal_designs = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
-    // Per-marginal sparse representation, populated when the 1D builder returned
-    // a `DesignMatrix::Sparse`. Used to assemble the Khatri-Rao tensor product
-    // sparsely (only ∏(degree+1) nonzeros per row) instead of densifying to
-    // shape (n, ∏ q_j) up front. When any marginal lacks a sparse form (e.g.
-    // periodic B-splines currently realize a dense Array2), we fall back to the
-    // existing dense Khatri-Rao path.
-    let mut marginal_sparse =
-        Vec::<Option<SparseColMat<usize, f64>>>::with_capacity(feature_cols.len());
-    let mut marginal_periodic = Vec::<Option<(f64, f64, usize)>>::with_capacity(feature_cols.len());
 
     // Reuse the robust 1D builder to ensure the same knot validation and
     // marginal difference-penalty construction as standalone smooth terms.
@@ -4772,6 +4273,10 @@ fn build_tensor_bspline_basis(
                 BSplineKnotSpec::Automatic {
                     num_internal_knots, ..
                 } => num_internal_knots.unwrap_or(8) + marginalspec.degree + 1,
+                // PeriodicUniform pins `num_basis` directly — the spec carries
+                // the periodic control-site count rather than internal knots,
+                // so it bypasses the (knots + degree + 1) accounting.
+                BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
             };
             let (basis, penalty, knots) = build_periodic_fourier_margin(
                 data.column(col),
@@ -4916,30 +4421,8 @@ fn build_tensor_bspline_basis(
 
     let (penalties, nullspace_dims, penaltyinfo, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
-    let identifiability_is_none =
-        matches!(spec.identifiability, TensorBSplineIdentifiability::None);
-    // All marginals expose a sparse representation iff each `marginal_sparse`
-    // slot is `Some(...)`. Currently this is true when every marginal is a
-    // free-boundary, non-periodic 1D B-spline returned as
-    // `DesignMatrix::Sparse` from `build_bspline_basis_1d`. Periodic B-splines
-    // and other dense-only marginals leave a `None` and trigger the fall-back
-    // path. Identifiability transforms (`SumToZero`, `FrozenTransform`) make
-    // the tensor design dense in general, so we also gate on that.
-    let all_marginals_sparse = marginal_sparse.iter().all(Option::is_some);
     let design = if let Some(dense_design) = dense_design {
         DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(dense_design))
-    } else if identifiability_is_none && all_marginals_sparse {
-        // Sparse Khatri-Rao path: assemble the (n, ∏ q_j) tensor product
-        // directly as a SparseColMat, preserving the ∏(degree_j+1) nonzero
-        // structure per row instead of densifying to ∏ q_j columns. This is
-        // mathematically identical to `tensor_product_design_from_marginals`
-        // applied to the corresponding dense marginals.
-        let sparse_marginals: Vec<&SparseColMat<usize, f64>> = marginal_sparse
-            .iter()
-            .map(|m| m.as_ref().expect("all_marginals_sparse just verified"))
-            .collect();
-        let sparse_design = tensor_product_design_from_sparse_marginals(&sparse_marginals)?;
-        DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse_design))
     } else {
         let marginals: Vec<Arc<Array2<f64>>> = marginal_designs
             .iter()
@@ -5043,44 +4526,6 @@ fn tensor_product_design_from_marginals(
     Ok(design)
 }
 
-fn sorted_levels_from_column(
-    col: ArrayView1<'_, f64>,
-    frozen: Option<&Vec<u64>>,
-) -> Result<Vec<u64>, BasisError> {
-    let mut levels: Vec<u64> = if let Some(v) = frozen {
-        v.clone()
-    } else {
-        let mut set = BTreeSet::new();
-        for &x in col {
-            if !x.is_finite() {
-                return Err(BasisError::InvalidInput(
-                    "factor smooth group column contains non-finite values".to_string(),
-                ));
-            }
-            set.insert(x.to_bits());
-        }
-        set.into_iter().collect()
-    };
-    levels.sort_unstable();
-    levels.dedup();
-    if levels.is_empty() {
-        return Err(BasisError::InvalidInput(
-            "factor smooth has no observed levels".to_string(),
-        ));
-    }
-    Ok(levels)
-}
-
-fn block_diag_repeat(base: &Array2<f64>, repeat: usize) -> Array2<f64> {
-    let p = base.nrows();
-    let mut out = Array2::<f64>::zeros((p * repeat, p * repeat));
-    for r in 0..repeat {
-        let start = r * p;
-        out.slice_mut(s![start..start + p, start..start + p])
-            .assign(base);
-    }
-    out
-}
 
 fn build_random_effect_block(
     data: ArrayView2<'_, f64>,
@@ -5162,75 +4607,6 @@ fn build_random_effect_block(
     })
 }
 
-fn sorted_factor_levels(
-    data: ArrayView2<'_, f64>,
-    feature_col: usize,
-    frozen: Option<&Vec<u64>>,
-    drop_first: bool,
-) -> Result<Vec<u64>, BasisError> {
-    if feature_col >= data.ncols() {
-        return Err(BasisError::DimensionMismatch(format!(
-            "factor column {feature_col} out of bounds for {} columns",
-            data.ncols()
-        )));
-    }
-    let mut levels = if let Some(levels) = frozen {
-        levels.clone()
-    } else {
-        let mut set = BTreeSet::<u64>::new();
-        for &v in data.column(feature_col) {
-            if !v.is_finite() {
-                return Err(BasisError::InvalidInput(
-                    "factor smooth contains non-finite group values".to_string(),
-                ));
-            }
-            set.insert(v.to_bits());
-        }
-        let all: Vec<u64> = set.into_iter().collect();
-        if drop_first && all.len() > 1 {
-            all[1..].to_vec()
-        } else {
-            all
-        }
-    };
-    levels.sort_unstable();
-    levels.dedup();
-    if levels.is_empty() {
-        return Err(BasisError::InvalidInput(
-            "factor smooth has no retained levels".to_string(),
-        ));
-    }
-    Ok(levels)
-}
-
-fn block_diag_penalty(base: &Array2<f64>, blocks: usize) -> Array2<f64> {
-    let p = base.nrows();
-    let mut out = Array2::<f64>::zeros((p * blocks, p * blocks));
-    for b in 0..blocks {
-        let off = b * p;
-        out.slice_mut(s![off..off + p, off..off + p]).assign(base);
-    }
-    out
-}
-
-fn dense_by_factor_design(
-    inner: &Array2<f64>,
-    groups: &[Option<usize>],
-    levels: usize,
-) -> Array2<f64> {
-    let n = inner.nrows();
-    let p = inner.ncols();
-    let mut out = Array2::<f64>::zeros((n, p * levels));
-    for i in 0..n {
-        if let Some(g) = groups[i] {
-            let off = g * p;
-            for j in 0..p {
-                out[[i, off + j]] = inner[[i, j]];
-            }
-        }
-    }
-    out
-}
 
 impl SmoothDesign {
     /// Map an unconstrained term coefficient vector to its constrained shape space.
@@ -13337,8 +12713,8 @@ fn exact_joint_spatial_outer_hessian_available(
     family: LikelihoodFamily,
     design: &TermCollectionDesign,
 ) -> bool {
-    drop(family);
-    drop(design);
+    _ = family;
+    _ = design;
     // Every `LikelihoodFamily` variant (Gaussian, Binomial-*, Poisson, Gamma,
     // Royston-Parmar) routes through the unified evaluator's outer-Hessian
     // path: Gaussian Identity uses the no-correction dense form, all GLM
@@ -15683,12 +15059,6 @@ fn try_exact_joint_spatial_aniso_optimization(
         seed_risk_profile_for_likelihood_family(family),
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
-        // Rho-axis BFGS cap: log-λ's natural step is ≈ 5 per
-        // `first_order_bfgs_loglambda_step_cap`. Anything tighter throttles
-        // BFGS on flat REML valleys.
-        Some(5.0),
-        // Psi-axis BFGS cap: kappa / aniso-log-scale needs ~ln 2 per iter.
-        Some(kappa_options.log_step.clamp(0.25, 1.0)),
         None,
     );
 
@@ -16038,10 +15408,6 @@ fn try_exact_joint_spatial_isotropic_optimization(
         seed_risk_profile_for_likelihood_family(family),
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
-        // Rho-axis cap: log-λ natural step ≈ 5.
-        Some(5.0),
-        // Psi-axis cap: kappa scale needs ~ln 2 per iter.
-        Some(kappa_options.log_step.clamp(0.25, 1.0)),
         None,
     );
 
@@ -17947,16 +17313,6 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     risk_profile: crate::seeding::SeedRiskProfile,
     tolerance: f64,
     max_iter: usize,
-    // BFGS step caps split by parameter type. `bfgs_step_cap` (rho-axis cap)
-    // bounds first-trial moves on log-λ; documented natural step is ≈ 5.
-    // `bfgs_step_cap_psi` bounds moves on the trailing `auxiliary_dim`
-    // psi-axes (kappa / aniso-log-scales), where ≈ ln 2 keeps the kernel
-    // scale from oscillating across orders of magnitude per iter. Using a
-    // single uniform cap (the old API) starved rho on the survival-marg-slope
-    // joint solver because the psi-calibrated value (`ln 2 ≈ 0.69`) was
-    // applied to log-λ, where |d|≈5 is the natural quasi-Newton magnitude.
-    bfgs_step_cap: Option<f64>,
-    bfgs_step_cap_psi: Option<f64>,
     screening_cap: Option<Arc<AtomicUsize>>,
 ) -> crate::solver::outer_strategy::OuterProblem {
     let mut seed_heuristic = theta0.to_vec();
@@ -17983,8 +17339,6 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_max_iter(max_iter)
         .with_bounds(lower.clone(), upper.clone())
         .with_initial_rho(theta0.clone())
-        .with_bfgs_step_cap(bfgs_step_cap)
-        .with_bfgs_step_cap_psi(bfgs_step_cap_psi)
         .with_seed_config(crate::seeding::SeedConfig {
             max_seeds: 4,
             seed_budget: 2,
@@ -18172,10 +17526,10 @@ where
     const KAPPA_PILOT_K: usize = 5_000;
     const KAPPA_POLISH_K: usize = 25_000;
     const KAPPA_POLISH_TRIGGER_N: usize = 100_000;
-    drop(KAPPA_SUBSAMPLE_PILOT_TRIGGER_N); // Documented threshold; engaged via policy.
-    drop(KAPPA_POLISH_TRIGGER_N);
-    drop(KAPPA_POLISH_K);
-    drop(KAPPA_PILOT_K);
+    _ = KAPPA_SUBSAMPLE_PILOT_TRIGGER_N;
+    _ = KAPPA_POLISH_TRIGGER_N;
+    _ = KAPPA_POLISH_K;
+    _ = KAPPA_PILOT_K;
 
     let n_total = data.nrows();
     let use_staged_kappa = outer_derivative_policy.should_use_staged_kappa(n_total);
@@ -18316,10 +17670,6 @@ where
         seed_risk_profile,
         kappa_options.rel_tol.max(1e-6),
         kappa_options.max_outer_iter.max(1),
-        // Rho-axis cap: log-λ natural step ≈ 5.
-        Some(5.0),
-        // Psi-axis cap: kappa scale needs ~ln 2 per iter.
-        Some(kappa_options.log_step.clamp(0.25, 1.0)),
         screening_cap.clone(),
     );
 
@@ -18937,8 +18287,6 @@ fn try_exact_joint_latent_coord_optimization(
         seed_risk_profile_for_likelihood_family(family),
         options.tol,
         options.max_iter.max(1),
-        Some(5.0),
-        Some(0.5),
         None,
     );
 
