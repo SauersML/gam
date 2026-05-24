@@ -4112,7 +4112,7 @@ fn build_shape_linear_constraints_1d(
             group_sum.fill(0.0);
             group_count = 0;
         }
-        group_sum += &design_local.row(r).to_owned();
+        group_sum.scaled_add(1.0, &design_local.row(r));
         group_count += 1;
         last_x = Some(xr);
     }
@@ -8790,7 +8790,7 @@ fn grouped_operatorgradient(
         let gk = d1
             .slice(s![k * dimension..(k + 1) * dimension, ..])
             .to_owned();
-        out += &gk.t().dot(&blocks.row(k).to_owned());
+        out += &gk.t().dot(&blocks.row(k));
     }
     Ok(out)
 }
@@ -12022,7 +12022,7 @@ impl BoundedLinearFamily {
         for term in &self.bounded_terms {
             let (beta, _, _) =
                 bounded_latent_to_user(latent_beta[term.col_idx], term.min, term.max);
-            offset += &(self.design.column(term.col_idx).to_owned() * beta);
+            offset.scaled_add(beta, &self.design.column(term.col_idx));
         }
         offset
     }
@@ -12030,8 +12030,9 @@ impl BoundedLinearFamily {
     fn effective_design_for_latent(&self, jac_diag: &Array1<f64>) -> Array2<f64> {
         let mut x_eff = self.design.clone();
         for term in &self.bounded_terms {
-            let scaled = self.design.column(term.col_idx).to_owned() * jac_diag[term.col_idx];
-            x_eff.column_mut(term.col_idx).assign(&scaled);
+            x_eff
+                .column_mut(term.col_idx)
+                .mapv_inplace(|v| v * jac_diag[term.col_idx]);
         }
         x_eff
     }
@@ -12175,8 +12176,9 @@ impl CustomFamily for BoundedLinearFamily {
         for term in &self.bounded_terms {
             let scale = second_diag[term.col_idx] * d_beta_flat[term.col_idx];
             if scale != 0.0 {
-                let col = self.design.column(term.col_idx).to_owned() * scale;
-                dx_eff.column_mut(term.col_idx).assign(&col);
+                let mut col = dx_eff.column_mut(term.col_idx);
+                col.assign(&self.design.column(term.col_idx));
+                col.mapv_inplace(|v| v * scale);
             }
         }
 
@@ -12280,7 +12282,7 @@ impl CustomFamily for BoundedLinearFamily {
             let col = term.col_idx;
             let drift = jac_diag[col] * d_beta[col];
             if drift != 0.0 {
-                d_offset += &(self.design.column(col).to_owned() * drift);
+                d_offset.scaled_add(drift, &self.design.column(col));
             }
         }
         Ok(Some(BlockGeometryDirectionalDerivative {
@@ -12578,9 +12580,12 @@ fn fit_bounded_term_collection_with_design(
     let latent_cov = fit.covariance_conditional.clone();
     let beta_covariance = latent_cov.as_ref().map(|cov| {
         let mut out = cov.clone();
-        let jac_col = jac_diag.view().insert_axis(ndarray::Axis(1));
-        let jacrow = jac_diag.view().insert_axis(ndarray::Axis(0));
-        out *= &(jac_col.to_owned() * jacrow);
+        for i in 0..out.nrows() {
+            out.row_mut(i).mapv_inplace(|v| v * jac_diag[i]);
+        }
+        for j in 0..out.ncols() {
+            out.column_mut(j).mapv_inplace(|v| v * jac_diag[j]);
+        }
         conditioning.backtransform_covariance(&out)
     });
     let beta_standard_errors = beta_covariance
@@ -19256,7 +19261,7 @@ mod tests {
         for j in 0..rank.min(u.ncols()) {
             let uj = u.column(j);
             let coeff = uj.dot(y);
-            proj += &(&uj.to_owned() * coeff);
+            proj.scaled_add(coeff, &uj);
         }
         let resid = y - &proj;
         resid.dot(&resid).sqrt()

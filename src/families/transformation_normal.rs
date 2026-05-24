@@ -28,7 +28,7 @@ use crate::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_difference_penalty_matrix,
     create_ispline_derivative_dense,
 };
-use crate::faer_ndarray::{fast_ab, fast_atb};
+use crate::faer_ndarray::{fast_ab, fast_abt, fast_atb};
 use crate::families::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
@@ -1531,7 +1531,7 @@ impl TransformationNormalFamily {
         // all depend on the same covariate-side γ_k(x_i).  Compute γ once and
         // fan it out exactly; the previous path projected β through the same
         // covariate design three times per row-quantity build.
-        let gamma = fast_ab(cov.as_ref(), &beta_mat.t().to_owned());
+        let gamma = fast_abt(cov.as_ref(), &beta_mat);
         let n = gamma.nrows();
         let mut h = Array1::<f64>::zeros(n);
         let mut h_prime = Array1::<f64>::zeros(n);
@@ -10268,7 +10268,7 @@ impl KroneckerDesign {
                 let beta_mat = beta.view().into_shape_with_order((pa, pb)).unwrap();
                 let mut result = Array1::zeros(n);
                 if let Some(right_dense) = right.as_dense_ref() {
-                    let right_beta = fast_ab(right_dense, &beta_mat.t().to_owned());
+                    let right_beta = fast_abt(right_dense, &beta_mat);
                     ndarray::Zip::from(&mut result)
                         .and(left.rows())
                         .and(right_beta.rows())
@@ -10316,7 +10316,7 @@ impl KroneckerDesign {
                 let mut result = Array1::zeros(n);
                 if let Some(right_dense) = right.as_dense_ref() {
                     // right_beta[i, k] = γ_k(x_i)
-                    let right_beta = fast_ab(right_dense, &beta_mat.t().to_owned());
+                    let right_beta = fast_abt(right_dense, &beta_mat);
                     ndarray::Zip::from(&mut result)
                         .and(left.rows())
                         .and(right_beta.rows())

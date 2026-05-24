@@ -1386,6 +1386,13 @@ impl LinearOperator for DenseDesignMatrix {
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         match self {
             Self::Materialized(matrix) => {
+                if weights.len() != matrix.nrows() {
+                    return Err(format!(
+                        "DenseDesignMatrix::diag_xtw_x weight length mismatch: weights={}, nrows={}",
+                        weights.len(),
+                        matrix.nrows()
+                    ));
+                }
                 let mut xtwx = Array2::<f64>::zeros((matrix.ncols(), matrix.ncols()));
                 streaming_blas_xt_diag_x(matrix, weights, &mut xtwx);
                 Ok(xtwx)
@@ -1405,6 +1412,13 @@ impl LinearOperator for DenseDesignMatrix {
             Self::Materialized(matrix) => {
                 let n = matrix.nrows();
                 let p = matrix.ncols();
+                if weights.len() != n {
+                    return Err(format!(
+                        "DenseDesignMatrix::diag_gram weight length mismatch: weights={}, nrows={}",
+                        weights.len(),
+                        n
+                    ));
+                }
                 if (n as u64) * (p as u64) < DENSE_ROW_PARALLEL_MIN_NP {
                     let mut diag = Array1::<f64>::zeros(p);
                     for i in 0..n {
@@ -1454,6 +1468,16 @@ impl LinearOperator for DenseDesignMatrix {
         penalty: Option<&Array2<f64>>,
         ridge: f64,
     ) -> Array1<f64> {
+        assert_eq!(
+            weights.len(),
+            self.nrows(),
+            "DenseDesignMatrix::apply_weighted_normal weight length mismatch"
+        );
+        assert_eq!(
+            vector.len(),
+            self.ncols(),
+            "DenseDesignMatrix::apply_weighted_normal vector length mismatch"
+        );
         // PSD precondition: apply_weighted_normal is the Fisher-scoring PCG
         // normal-equations matvec ((XᵀWX + S + ρI) v); signed observed-Hessian
         // assembly routes through xt_diag_x_signed instead.
@@ -1541,6 +1565,14 @@ impl DenseDesignOperator for DenseDesignMatrix {
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
         match self {
             Self::Materialized(matrix) => {
+                if weights.len() != matrix.nrows() || y.len() != matrix.nrows() {
+                    return Err(format!(
+                        "DenseDesignMatrix::compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
+                        weights.len(),
+                        y.len(),
+                        matrix.nrows()
+                    ));
+                }
                 Ok(dense_transpose_weighted_response(matrix, weights, y, None))
             }
             Self::Lazy(op) => op.compute_xtwy(weights, y),
@@ -1721,6 +1753,16 @@ impl LinearOperator for ReparamOperator {
         penalty: Option<&Array2<f64>>,
         ridge: f64,
     ) -> Array1<f64> {
+        assert_eq!(
+            weights.len(),
+            self.x_original.nrows(),
+            "ReparamOperator::apply_weighted_normal weight length mismatch"
+        );
+        assert_eq!(
+            vector.len(),
+            self.qs.ncols(),
+            "ReparamOperator::apply_weighted_normal vector length mismatch"
+        );
         // PSD precondition: Fisher-scoring PCG normal-equations matvec; signed
         // observed-Hessian assembly does not reach this path.
         debug_assert!(
@@ -1830,7 +1872,9 @@ impl DenseDesignOperator for ReparamOperator {
                 // Extract rows directly from CSR without densifying the full matrix.
                 let csr = sdm
                     .to_csr_arc()
-                    .expect("ReparamOperator::row_chunk_into: CSR conversion");
+                    .ok_or(MatrixMaterializationError::MissingRowChunk {
+                        context: "ReparamOperator::row_chunk_into: failed to obtain CSR view",
+                    })?;
                 let sym = csr.symbolic();
                 let row_ptr = sym.row_ptr();
                 let col_idx = sym.col_idx();
@@ -1891,6 +1935,16 @@ impl RandomEffectOperator {
         dense: &Array2<f64>,
         weights: &Array1<f64>,
     ) -> Array2<f64> {
+        assert_eq!(
+            dense.nrows(),
+            self.n,
+            "RandomEffectOperator::weighted_cross_with_dense row mismatch"
+        );
+        assert_eq!(
+            weights.len(),
+            self.n,
+            "RandomEffectOperator::weighted_cross_with_dense weight length mismatch"
+        );
         let p_dense = dense.ncols();
         let mut cross = Array2::<f64>::zeros((p_dense, self.num_groups));
         for i in 0..self.n {
@@ -1915,6 +1969,16 @@ impl RandomEffectOperator {
         other: &RandomEffectOperator,
         weights: &Array1<f64>,
     ) -> Array2<f64> {
+        assert_eq!(
+            other.n,
+            self.n,
+            "RandomEffectOperator::weighted_cross_with_re row mismatch"
+        );
+        assert_eq!(
+            weights.len(),
+            self.n,
+            "RandomEffectOperator::weighted_cross_with_re weight length mismatch"
+        );
         let mut cross = Array2::<f64>::zeros((self.num_groups, other.num_groups));
         for i in 0..self.n {
             if let (Some(a), Some(b)) = (self.group_ids[i], other.group_ids[i]) {
@@ -1961,6 +2025,13 @@ impl LinearOperator for RandomEffectOperator {
 
     /// X'WX for a one-hot design is diagonal: D[g,g] = Σ_{i: group[i]=g} w[i].
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if weights.len() != self.n {
+            return Err(format!(
+                "RandomEffectOperator::diag_xtw_x weight length mismatch: weights={}, nrows={}",
+                weights.len(),
+                self.n
+            ));
+        }
         let q = self.num_groups;
         let mut xtwx = Array2::<f64>::zeros((q, q));
         for i in 0..self.n {
@@ -1973,6 +2044,13 @@ impl LinearOperator for RandomEffectOperator {
 
     /// Diagonal of X'WX: per-group weight sums.
     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if weights.len() != self.n {
+            return Err(format!(
+                "RandomEffectOperator::diag_gram weight length mismatch: weights={}, nrows={}",
+                weights.len(),
+                self.n
+            ));
+        }
         let mut diag = Array1::<f64>::zeros(self.num_groups);
         for i in 0..self.n {
             if let Some(g) = self.group_ids[i] {
@@ -1990,6 +2068,16 @@ impl LinearOperator for RandomEffectOperator {
         penalty: Option<&Array2<f64>>,
         ridge: f64,
     ) -> Array1<f64> {
+        assert_eq!(
+            weights.len(),
+            self.n,
+            "RandomEffectOperator::apply_weighted_normal weight length mismatch"
+        );
+        assert_eq!(
+            vector.len(),
+            self.num_groups,
+            "RandomEffectOperator::apply_weighted_normal vector length mismatch"
+        );
         // Step 1: accumulate per-group weighted β[g] contributions.
         //   group_acc[g] = Σ_{i in group g} w[i]
         //   result[g] = group_acc[g] * vector[g]
@@ -2516,6 +2604,13 @@ impl LinearOperator for BlockDesignOperator {
     }
 
     fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if weights.len() != self.n {
+            return Err(format!(
+                "BlockDesignOperator::diag_xtw_x weight length mismatch: weights={}, nrows={}",
+                weights.len(),
+                self.n
+            ));
+        }
         let p = self.total_cols;
         let mut result = Array2::<f64>::zeros((p, p));
 
@@ -2546,6 +2641,13 @@ impl LinearOperator for BlockDesignOperator {
     }
 
     fn diag_gram(&self, weights: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if weights.len() != self.n {
+            return Err(format!(
+                "BlockDesignOperator::diag_gram weight length mismatch: weights={}, nrows={}",
+                weights.len(),
+                self.n
+            ));
+        }
         let mut out = Array1::<f64>::zeros(self.total_cols);
         for (idx, block) in self.blocks.iter().enumerate() {
             let start = self.col_offsets[idx];
@@ -2563,6 +2665,16 @@ impl LinearOperator for BlockDesignOperator {
         penalty: Option<&Array2<f64>>,
         ridge: f64,
     ) -> Array1<f64> {
+        assert_eq!(
+            weights.len(),
+            self.n,
+            "BlockDesignOperator::apply_weighted_normal weight length mismatch"
+        );
+        assert_eq!(
+            vector.len(),
+            self.total_cols,
+            "BlockDesignOperator::apply_weighted_normal vector length mismatch"
+        );
         // Fused: X'W(Xβ) + Sβ + ridge·β
         let xv = self.apply(vector);
         let mut weighted = xv;
@@ -2589,6 +2701,14 @@ impl LinearOperator for BlockDesignOperator {
 
 impl DenseDesignOperator for BlockDesignOperator {
     fn compute_xtwy(&self, weights: &Array1<f64>, y: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if weights.len() != self.n || y.len() != self.n {
+            return Err(format!(
+                "BlockDesignOperator::compute_xtwy dimension mismatch: weights={}, y={}, nrows={}",
+                weights.len(),
+                y.len(),
+                self.n
+            ));
+        }
         let mut wy = Array1::<f64>::zeros(self.n);
         ndarray::Zip::from(&mut wy)
             .and(weights)
@@ -5079,6 +5199,16 @@ pub trait LinearOperator {
         penalty: Option<&Array2<f64>>,
         ridge: f64,
     ) -> Array1<f64> {
+        assert_eq!(
+            weights.len(),
+            self.nrows(),
+            "apply_weighted_normal weight length mismatch"
+        );
+        assert_eq!(
+            vector.len(),
+            self.ncols(),
+            "apply_weighted_normal vector length mismatch"
+        );
         let xv = self.apply(vector);
         let mut weighted_xv = xv;
         for i in 0..weighted_xv.len() {
@@ -5322,6 +5452,16 @@ impl LinearOperator for DesignMatrix {
         penalty: Option<&Array2<f64>>,
         ridge: f64,
     ) -> Array1<f64> {
+        assert_eq!(
+            weights.len(),
+            self.nrows(),
+            "DesignMatrix::apply_weighted_normal weight length mismatch"
+        );
+        assert_eq!(
+            vector.len(),
+            self.ncols(),
+            "DesignMatrix::apply_weighted_normal vector length mismatch"
+        );
         match self {
             Self::Dense(matrix) => matrix.apply_weighted_normal(weights, vector, penalty, ridge),
             Self::Sparse(_) => {

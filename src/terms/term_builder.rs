@@ -486,7 +486,7 @@ fn parse_numeric_expr(raw: &str) -> Result<f64, String> {
         } else {
             factor
                 .parse::<f64>()
-                .map_err(|_| format!("invalid numeric expression '{raw}'"))?
+                .map_err(|err| format!("invalid numeric expression '{raw}': {err}"))?
         };
         acc *= value;
     }
@@ -537,7 +537,7 @@ fn parse_periodic_axes_option(
     for a in axes {
         let axis = a
             .parse::<usize>()
-            .map_err(|_| format!("invalid periodic axis '{a}'"))?;
+            .map_err(|err| format!("invalid periodic axis '{a}': {err}"))?;
         if axis >= dim {
             return Err(format!(
                 "periodic axis {axis} out of range for {dim}D smooth"
@@ -1909,24 +1909,26 @@ pub fn parse_cyclic_boundary(
 }
 
 fn parse_matern_nu(raw: &str) -> Result<MaternNu, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1/2" | "0.5" | "half" => Ok(MaternNu::Half),
-        "3/2" | "1.5" => Ok(MaternNu::ThreeHalves),
-        "5/2" | "2.5" => Ok(MaternNu::FiveHalves),
-        "7/2" | "3.5" => Ok(MaternNu::SevenHalves),
-        "9/2" | "4.5" => Ok(MaternNu::NineHalves),
-        _ => Err(format!("unsupported Matern nu '{raw}'")),
+    let trimmed = raw.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    match lowered.as_str() {
+        "1/2" | "0.5" | "half" => return Ok(MaternNu::Half),
+        "3/2" | "1.5" => return Ok(MaternNu::ThreeHalves),
+        "5/2" | "2.5" => return Ok(MaternNu::FiveHalves),
+        "7/2" | "3.5" => return Ok(MaternNu::SevenHalves),
+        "9/2" | "4.5" => return Ok(MaternNu::NineHalves),
+        _ => {}
     }
 
     let value = if let Some((num, den)) = trimmed.split_once('/') {
         let num = num
             .trim()
             .parse::<f64>()
-            .map_err(|_| unsupported_matern_nu_message(raw))?;
+            .map_err(|err| format!("{}: {err}", unsupported_matern_nu_message(raw)))?;
         let den = den
             .trim()
             .parse::<f64>()
-            .map_err(|_| unsupported_matern_nu_message(raw))?;
+            .map_err(|err| format!("{}: {err}", unsupported_matern_nu_message(raw)))?;
         if den == 0.0 || !num.is_finite() || !den.is_finite() {
             return Err(unsupported_matern_nu_message(raw));
         }
@@ -1934,7 +1936,7 @@ fn parse_matern_nu(raw: &str) -> Result<MaternNu, String> {
     } else {
         trimmed
             .parse::<f64>()
-            .map_err(|_| unsupported_matern_nu_message(raw))?
+            .map_err(|err| format!("{}: {err}", unsupported_matern_nu_message(raw)))?
     };
 
     const TOL: f64 = 1e-12;
@@ -1977,10 +1979,10 @@ pub fn parse_duchon_power_policy(
         .to_string());
     }
     match options.get("power") {
-        Some(raw) => raw.parse::<usize>().map(DuchonPowerPolicy::Explicit).map_err(|_| {
+        Some(raw) => raw.parse::<usize>().map(DuchonPowerPolicy::Explicit).map_err(|err| {
             TermBuilderError::invalid_option(format!(
-                "invalid Duchon power '{}'; expected a non-negative integer such as power=0 or power=1",
-                raw
+                "invalid Duchon power '{}'; expected a non-negative integer such as power=0 or power=1: {}",
+                raw, err
             ))
             .to_string()
         }),

@@ -9913,10 +9913,18 @@ fn nuts_method_label(model: &FittedModel) -> &'static str {
             // dispatch in `gam::sample::sample_saved_model`.
             match model.survival_likelihood.as_deref() {
                 Some("latent") | Some("latent-binary") | Some("location-scale") => "laplace",
-                _ => "nuts",
+                None
+                | Some("marginal-slope")
+                | Some("transformation")
+                | Some("weibull")
+                | Some("royston-parmar")
+                | Some(_) => "nuts",
             }
         }
-        _ => "laplace",
+        PredictModelClass::GaussianLocationScale
+        | PredictModelClass::BinomialLocationScale
+        | PredictModelClass::BernoulliMarginalSlope
+        | PredictModelClass::TransformationNormal => "laplace",
     }
 }
 
@@ -12088,11 +12096,22 @@ fn prediction_model_class_label(model: &FittedModel) -> String {
             }
             Some("marginal-slope") => "survival marginal-slope".to_string(),
             Some("location-scale") => "survival location-scale".to_string(),
-            _ => model.predict_model_class().name().to_string(),
+            None
+            | Some("latent")
+            | Some("latent-binary")
+            | Some("transformation")
+            | Some("weibull")
+            | Some("royston-parmar")
+            | Some(_) => model.predict_model_class().name().to_string(),
         },
         FittedFamily::LatentSurvival { .. } => "latent survival".to_string(),
         FittedFamily::LatentBinary { .. } => "latent binary".to_string(),
-        _ => model.predict_model_class().name().to_string(),
+        FittedFamily::Standard { .. }
+        | FittedFamily::LocationScale { .. }
+        | FittedFamily::MarginalSlope { .. }
+        | FittedFamily::TransformationNormal { .. } => {
+            model.predict_model_class().name().to_string()
+        }
     }
 }
 
@@ -14190,7 +14209,11 @@ fn serialize_survival_prediction_payload(
             "survival location-scale".to_string()
         }
         gam::survival_construction::SurvivalLikelihoodMode::Latent => "latent survival".to_string(),
-        _ => model.predict_model_class().name().to_string(),
+        gam::survival_construction::SurvivalLikelihoodMode::Transformation
+        | gam::survival_construction::SurvivalLikelihoodMode::Weibull
+        | gam::survival_construction::SurvivalLikelihoodMode::LatentBinary => {
+            model.predict_model_class().name().to_string()
+        }
     };
     let survival_payload = SurvivalPredictionPayload {
         class: "survival_prediction",

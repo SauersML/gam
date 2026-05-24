@@ -69,45 +69,10 @@ fn mixed_term_spec() -> TermCollectionSpec {
     }
 }
 
-/// Extract `(matrix, prior_mean_vec)` from a `PenaltySpec::DenseWithMean`.
-fn dense_with_mean(spec: &PenaltySpec, p: usize) -> (Array2<f64>, Array1<f64>) {
-    match spec {
-        PenaltySpec::DenseWithMean { matrix, prior_mean } => {
-            let mean = prior_mean.clone().evaluate_for_test(p).unwrap_or_else(|| {
-                // Fallback: walk the public enum.  We compute the mean by
-                // probing well-known constructors.  If the helper isn't
-                // available, panic so the missing surface is visible.
-                panic!(
-                    "test helper requires `CoefficientPriorMean::evaluate_for_test`; \
-                         this surface does not exist in the public API yet"
-                )
-            });
-            (matrix.clone(), mean)
-        }
-        other => panic!("expected DenseWithMean, got {other:?}"),
-    }
-}
-
 /// Closed-form evaluation of `(β − μ)' S (β − μ) / 2` for a single penalty.
 fn penalty_quadratic(matrix: &Array2<f64>, mean: &Array1<f64>, beta: &Array1<f64>) -> f64 {
     let delta = beta - mean;
     0.5 * delta.dot(&matrix.dot(&delta))
-}
-
-/// Recover the prior mean for a DenseWithMean penalty by exploiting
-/// `(β − μ)' S (β − μ) / 2 = β' S β /2 − β' S μ + μ' S μ /2`.
-///
-/// For the canonical identity-on-active-cols S produced by
-/// `realize_coefficient_groups`, the gradient at β=0 is `−S μ`, which equals
-/// `−μ` restricted to active columns; the rest is 0.  We extract μ that way
-/// to avoid depending on private API.
-fn recover_prior_mean(matrix: &Array2<f64>) -> Array1<f64> {
-    // The mean is encoded indirectly via the runtime accounting; without
-    // public accessor we cannot recover it here.  This helper exists as a
-    // placeholder — tests below construct β around a known μ that they
-    // themselves supplied, so the actual μ does not need to be recovered
-    // from the spec.
-    Array1::zeros(matrix.nrows())
 }
 
 // ---------------------------------------------------------------------------
@@ -755,25 +720,3 @@ fn functional_prior_mean_resolved_at_realize_time() {
         "functional-mean perturbation quadratic mismatch: got {q} expected {expected}"
     );
 }
-
-// Silence unused-helper warnings: these helpers are intentionally kept for
-// future tests that may need to extract the runtime-side μ for direct
-// comparison against the public API (currently unavailable as a public method).
-#[allow(dead_code)]
-fn _unused_helpers_kept_alive() {
-    let _ = dense_with_mean;
-    let _ = recover_prior_mean;
-}
-
-// Mock extension trait for `CoefficientPriorMean::evaluate_for_test` referenced
-// in the `dense_with_mean` helper.  We intentionally do NOT implement it: the
-// helper is only invoked from the `_unused_helpers_kept_alive` path, which is
-// never called.  This keeps the failing-test contract explicit: if a future
-// reviewer wires the public `evaluate` method, they can drop this trait.
-trait EvaluateForTest {
-    fn evaluate_for_test(&self, block_dim: usize) -> Option<Array1<f64>> {
-        drop(block_dim);
-        None
-    }
-}
-impl EvaluateForTest for CoefficientPriorMean {}
