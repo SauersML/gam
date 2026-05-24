@@ -694,7 +694,7 @@ fn entry_newer(candidate: &OnDiskMeta, current: &OnDiskMeta) -> bool {
     candidate_stamp > current_stamp
 }
 
-fn candidate_kind_rank(kind: EntryKind) -> u8 {
+const fn candidate_kind_rank(kind: EntryKind) -> u8 {
     match kind {
         EntryKind::Checkpoint => 0,
         EntryKind::Final => 1,
