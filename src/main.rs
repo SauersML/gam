@@ -11204,7 +11204,7 @@ mod tests {
             "y ~ x".to_string(),
             ModelKind::Standard,
             FittedFamily::Standard {
-                likelihood: LikelihoodFamily::BinomialLogit,
+                likelihood: legacy_family_to_spec(LikelihoodFamily::BinomialLogit),
                 link: Some(LinkFunction::Logit),
                 latent_cloglog_state: None,
                 mixture_state: None,
