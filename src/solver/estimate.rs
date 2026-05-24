@@ -3035,7 +3035,7 @@ where
             // tolerance and the refit would be a wasted inner Newton solve
             // (~30s at biobank n=320k).
             let guard_start = std::time::Instant::now();
-            let _ = reml_state.compute_cost(&strategy_result.rho);
+            drop(reml_state.compute_cost(&strategy_result.rho));
             log::info!(
                 "[OUTER guard] convergence-guard re-eval at converged ρ done (prev_cap={prev_cap}, elapsed={:.3}s)",
                 guard_start.elapsed().as_secs_f64()
@@ -3329,7 +3329,7 @@ where
             // See standard-REML arm: only re-eval when the schedule had
             // capped, otherwise the cached β is already at full tolerance.
             let guard_start_mix = std::time::Instant::now();
-            let _ = reml_state.compute_cost(&outer_result.rho);
+            drop(reml_state.compute_cost(&outer_result.rho));
             log::info!(
                 "[OUTER guard] convergence-guard re-eval at converged ρ done (mixture/SAS arm; prev_cap={prev_cap_mix}, elapsed={:.3}s)",
                 guard_start_mix.elapsed().as_secs_f64()
@@ -6510,7 +6510,7 @@ where
         cfg.link_kind.sas_state().copied(),
     );
 
-    let _ = reml_state.compute_gradient(rho)?;
+    drop(reml_state.compute_gradient(rho)?);
     let beta_hat = reml_state
         .warm_start_beta
         .read()
