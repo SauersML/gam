@@ -152,7 +152,11 @@ impl ConditionalPriorIvae {
 
     /// Evaluate negative-log-prior value and gradient w.r.t. latent t.
     pub fn value_and_grad(&self, t: ArrayView2<f64>) -> (f64, Array2<f64>) {
-        assert_eq!(t.dim(), self.mean.dim(), "ConditionalPriorIvae: t/mean shape mismatch");
+        assert_eq!(
+            t.dim(),
+            self.mean.dim(),
+            "ConditionalPriorIvae: t/mean shape mismatch"
+        );
         let (n, d) = t.dim();
         let log_2pi = (2.0 * std::f64::consts::PI).ln();
         let mut grad = Array2::<f64>::zeros((n, d));
@@ -197,8 +201,7 @@ pub fn piecewise_linear_eval(
         let hi = (lo + 1).min(k - 1);
         let frac = pos - lo as f64;
         for col in 0..d {
-            out[[row, col]] =
-                coeffs[[lo, col]] * (1.0 - frac) + coeffs[[hi, col]] * frac;
+            out[[row, col]] = coeffs[[lo, col]] * (1.0 - frac) + coeffs[[hi, col]] * frac;
         }
     }
     out

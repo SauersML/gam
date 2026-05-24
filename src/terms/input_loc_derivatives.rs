@@ -127,7 +127,7 @@ impl RadialInputKernel {
     }
 
     /// Ambient input dimension `d` (the kernel argument length).
-    pub fn dim(&self) -> usize {
+    pub const fn dim(&self) -> usize {
         match self {
             RadialInputKernel::Matern { .. } => {
                 // Matérn is ambient-dimension agnostic in `q, t`; the caller
@@ -323,7 +323,7 @@ pub struct TensorAxisFactors {
 }
 
 impl TensorAxisFactors {
-    pub fn n_axes(&self) -> usize {
+    pub const fn n_axes(&self) -> usize {
         self.values.len()
     }
 

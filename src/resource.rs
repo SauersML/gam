@@ -298,7 +298,7 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
             .resident_bytes
     }
 
-    pub fn max_bytes(&self) -> usize {
+    pub const fn max_bytes(&self) -> usize {
         self.max_bytes
     }
 

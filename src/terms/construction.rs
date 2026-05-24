@@ -874,7 +874,7 @@ impl CanonicalPenalty {
     }
 
     /// Whether this penalty is block-local (col_range != 0..total_dim).
-    pub fn is_block_local(&self) -> bool {
+    pub const fn is_block_local(&self) -> bool {
         self.col_range.start != 0 || self.col_range.end != self.total_dim
     }
 
@@ -1567,7 +1567,7 @@ pub struct ReparamInvariant {
 impl ReparamInvariant {
     /// Returns the largest eigenvalue of the balanced penalty matrix.
     /// This is lambda-independent and provides a natural scale for shrinkage.
-    pub fn max_balanced_eigenvalue(&self) -> f64 {
+    pub const fn max_balanced_eigenvalue(&self) -> f64 {
         self.max_balanced_eigenvalue
     }
 }

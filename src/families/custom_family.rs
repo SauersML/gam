@@ -11282,7 +11282,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // Family-side cap on the inf-norm of a single Newton proposal.
         // Mirrors the rescale in the legacy implementation (see commit
         // 4bb663ab, "Perf: add joint Newton fast path for GAMLSS").
-            const MAX_JOINT_STEP: f64 = 20.0;
+        const MAX_JOINT_STEP: f64 = 20.0;
 
         // Per-cycle |Δobjective| history for the geometric-tail trigger of
         // the constrained-stationary certificate below. When the cycles

@@ -327,7 +327,7 @@ mod cuda {
         h: &mut CudaSlice<f64>,
     ) -> Result<(), String> {
         let p_i = to_i32(p)?;
-        let uplo = cudarc::cublas::sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
+        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
         let mut lwork = 0_i32;
         {
             let (h_ptr, _h_record) = h.device_ptr_mut(stream);
@@ -389,7 +389,7 @@ mod cuda {
     ) -> Result<(), String> {
         let p_i = to_i32(p)?;
         let nrhs_i = to_i32(nrhs)?;
-        let uplo = cudarc::cublas::sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
+        let uplo = cusolver_sys::cublasFillMode_t::CUBLAS_FILL_MODE_LOWER;
         let mut info = stream
             .alloc_zeros::<i32>(1)
             .map_err(|e| format!("cuda alloc potrs info: {e}"))?;
