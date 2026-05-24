@@ -81,7 +81,7 @@ pub use data::{
 };
 pub use gpu::{gpu_available, selected_gpu_info};
 pub use inference::{
-    alo, data, diagnostics, generative, hmc, predict, probability, quadrature, sample,
+    alo, data, diagnostics, generative, hmc, predict, probability, quadrature, sample, smooth_test,
 };
 pub use linalg::{faer_ndarray, matrix, utils};
 pub use resource::{

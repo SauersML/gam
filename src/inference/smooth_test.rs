@@ -1,160 +1,189 @@
-//! Wood-style smooth-term Wald tests.
+//! Wood-style smooth-component Wald tests.
 //!
-//! The entry point here implements the covariance-rank truncation and reference
-//! degrees-of-freedom pieces that should not be inlined in summary rendering.
+//! The test follows the rank-truncated covariance inverse used by Wood (2013):
+//! the penalized part of the coefficient block is tested with a pseudo-inverse
+//! of rank approximately equal to the term EDF, while unpenalized null-space
+//! coefficients are kept full-rank. The reference degrees of freedom use the
+//! coefficient-space influence block `F_jj = (H⁻¹ X'WX)_jj`.
 
 use crate::faer_ndarray::FaerEigh;
-use crate::linalg::utils::enforce_symmetry;
-use crate::solver::estimate::Dispersion;
-use ndarray::{Array2, ArrayView1, s};
+use ndarray::{Array1, Array2, ArrayView1, s};
 use statrs::distribution::{ChiSquared, ContinuousCDF, FisherSnedecor};
 use std::ops::Range;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SmoothTestCovariance {
-    /// Use smoothing-parameter-corrected Bayesian covariance (`Vp`).
-    Corrected,
-    /// Use conditional Bayesian covariance (`Vb`).
-    Conditional,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmoothTestScale {
+    Known,
+    Estimated,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct SmoothTestInput<'a> {
     pub beta: ArrayView1<'a, f64>,
     pub covariance: &'a Array2<f64>,
-    pub coefficient_influence: Option<&'a Array2<f64>>,
+    pub influence_matrix: Option<&'a Array2<f64>>,
     pub coeff_range: Range<usize>,
     pub edf: f64,
     pub nullspace_dim: usize,
-    pub dispersion: Dispersion,
-    pub residual_df: Option<f64>,
-    pub constrained: bool,
+    pub dispersion: f64,
+    pub residual_df: f64,
+    pub scale: SmoothTestScale,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct SmoothTestResult {
     pub statistic: f64,
     pub ref_df: f64,
-    pub p_value: Option<f64>,
-    pub valid: bool,
-    pub reason: Option<String>,
+    pub p_value: f64,
 }
 
-fn covariance_block(cov: &Array2<f64>, range: Range<usize>) -> Option<Array2<f64>> {
-    if range.start >= range.end || range.end > cov.nrows() || range.end > cov.ncols() {
+pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> {
+    let start = input.coeff_range.start;
+    let end = input.coeff_range.end;
+    if start >= end
+        || end > input.beta.len()
+        || end > input.covariance.nrows()
+        || end > input.covariance.ncols()
+        || !input.edf.is_finite()
+        || input.edf <= 0.0
+        || !input.dispersion.is_finite()
+        || input.dispersion <= 0.0
+    {
         return None;
     }
-    Some(cov.slice(s![range.clone(), range]).to_owned())
+    let k = end - start;
+    let beta = input.beta.slice(s![start..end]).to_owned();
+    let cov = block(input.covariance, start, end)?;
+    let null_dim = input.nullspace_dim.min(k);
+    let pen_dim = k.saturating_sub(null_dim);
+
+    let mut statistic = 0.0;
+    if null_dim > 0 {
+        let beta_null = beta.slice(s![0..null_dim]).to_owned();
+        let cov_null = cov.slice(s![0..null_dim, 0..null_dim]).to_owned();
+        statistic += full_rank_quadratic(&beta_null, &cov_null)?;
+    }
+    if pen_dim > 0 {
+        let beta_pen = beta.slice(s![null_dim..k]).to_owned();
+        let cov_pen = cov.slice(s![null_dim..k, null_dim..k]).to_owned();
+        let rank = truncated_rank(input.edf - null_dim as f64, pen_dim);
+        if rank > 0 {
+            statistic += truncated_quadratic(&beta_pen, &cov_pen, rank)?;
+        }
+    }
+
+    let ref_df = reference_df(input.influence_matrix, start, end).unwrap_or(input.edf.max(1e-12));
+    if !statistic.is_finite() || statistic < 0.0 || !ref_df.is_finite() || ref_df <= 0.0 {
+        return None;
+    }
+    let p_value = match input.scale {
+        SmoothTestScale::Known => {
+            let dist = ChiSquared::new(ref_df).ok()?;
+            1.0 - dist.cdf(statistic)
+        }
+        SmoothTestScale::Estimated => {
+            if !input.residual_df.is_finite() || input.residual_df <= 0.0 {
+                return None;
+            }
+            let f_stat = statistic / (ref_df * input.dispersion);
+            let dist = FisherSnedecor::new(ref_df, input.residual_df).ok()?;
+            1.0 - dist.cdf(f_stat)
+        }
+    };
+    if !p_value.is_finite() {
+        return None;
+    }
+    Some(SmoothTestResult {
+        statistic,
+        ref_df,
+        p_value: p_value.clamp(0.0, 1.0),
+    })
 }
 
-fn influence_ref_df(fmat: &Array2<f64>, range: Range<usize>, fallback: f64) -> f64 {
-    if range.start >= range.end || range.end > fmat.nrows() || range.end > fmat.ncols() {
-        return fallback.max(1e-12);
+fn truncated_rank(edf_pen: f64, pen_dim: usize) -> usize {
+    if pen_dim == 0 || !edf_pen.is_finite() || edf_pen <= 0.0 {
+        return 0;
     }
-    let block = fmat.slice(s![range.clone(), range]).to_owned();
-    let tr = block.diag().iter().copied().sum::<f64>();
-    let tr2 = block.dot(&block).diag().iter().copied().sum::<f64>();
-    if tr.is_finite() && tr > 0.0 && tr2.is_finite() && tr2 > 0.0 {
-        (tr * tr / tr2).max(1e-12)
-    } else {
-        fallback.max(1e-12)
-    }
+    (edf_pen.round() as usize).clamp(1, pen_dim)
 }
 
-fn truncated_wald(beta: ArrayView1<'_, f64>, cov: &Array2<f64>, rank: usize) -> Option<f64> {
-    let k = beta.len();
-    if k == 0 || cov.nrows() != k || cov.ncols() != k || rank == 0 {
-        return Some(0.0);
+fn block(matrix: &Array2<f64>, start: usize, end: usize) -> Option<Array2<f64>> {
+    if start >= end || end > matrix.nrows() || end > matrix.ncols() {
+        return None;
     }
-    let mut sym = cov.clone();
-    enforce_symmetry(&mut sym);
-    let (evals, evecs) = sym.eigh(faer::Side::Lower).ok()?;
+    Some(matrix.slice(s![start..end, start..end]).to_owned())
+}
+
+fn full_rank_quadratic(beta: &Array1<f64>, cov: &Array2<f64>) -> Option<f64> {
+    truncated_quadratic(beta, cov, beta.len())
+}
+
+fn truncated_quadratic(beta: &Array1<f64>, cov: &Array2<f64>, rank: usize) -> Option<f64> {
+    if beta.is_empty() || cov.nrows() != beta.len() || cov.ncols() != beta.len() || rank == 0 {
+        return None;
+    }
+    let (evals, evecs) = cov.to_owned().eigh(faer::Side::Lower).ok()?;
     let mut order: Vec<usize> = (0..evals.len()).collect();
-    order.sort_by(|&a, &b| {
-        evals[b]
-            .partial_cmp(&evals[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    order.sort_by(|&a, &b| evals[b].total_cmp(&evals[a]));
+    let tol = evals
+        .iter()
+        .copied()
+        .fold(0.0_f64, |acc, v| acc.max(v.abs()))
+        * 1e-10;
     let mut q = 0.0;
-    let keep = rank.min(k);
-    for &idx in order.iter().take(keep) {
+    let mut used = 0usize;
+    for idx in order {
         let lambda = evals[idx];
-        if !(lambda.is_finite() && lambda > 0.0) {
+        if lambda <= tol {
             continue;
         }
         let v = evecs.column(idx);
         let proj = beta.dot(&v);
         q += proj * proj / lambda;
+        used += 1;
+        if used >= rank {
+            break;
+        }
     }
-    q.is_finite().then_some(q.max(0.0))
+    (used > 0 && q.is_finite()).then_some(q.max(0.0))
 }
 
-pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> SmoothTestResult {
-    if input.constrained {
-        return SmoothTestResult {
-            statistic: f64::NAN,
-            ref_df: input.edf.max(1e-12),
-            p_value: None,
-            valid: false,
-            reason: Some("shape-constrained smooth p-values are disabled because the null distribution is constrained".to_string()),
-        };
-    }
-    let Some(cov_block) = covariance_block(input.covariance, input.coeff_range.clone()) else {
-        return SmoothTestResult {
-            statistic: f64::NAN,
-            ref_df: input.edf.max(1e-12),
-            p_value: None,
-            valid: false,
-            reason: Some(
-                "covariance block is unavailable or has incompatible dimensions".to_string(),
-            ),
-        };
-    };
-    let k = input.beta.len();
-    let ns = input.nullspace_dim.min(k);
-    let penalized_k = k.saturating_sub(ns);
-    let penalized_rank = input.edf.round().max(0.0) as usize;
-    let penalized_rank = penalized_rank.saturating_sub(ns).min(penalized_k);
-
-    let mut stat = 0.0;
-    if ns > 0 {
-        let beta_ns = input.beta.slice(s![0..ns]);
-        let cov_ns = cov_block.slice(s![0..ns, 0..ns]).to_owned();
-        stat += truncated_wald(beta_ns, &cov_ns, ns).unwrap_or(f64::NAN);
-    }
-    if penalized_k > 0 && penalized_rank > 0 {
-        let beta_pen = input.beta.slice(s![ns..k]);
-        let cov_pen = cov_block.slice(s![ns..k, ns..k]).to_owned();
-        stat += truncated_wald(beta_pen, &cov_pen, penalized_rank).unwrap_or(f64::NAN);
-    }
-
-    let fallback_df = input.edf.round().clamp(1.0, k.max(1) as f64);
-    let ref_df = input
-        .coefficient_influence
-        .map(|f| influence_ref_df(f, input.coeff_range.clone(), fallback_df))
-        .unwrap_or(fallback_df);
-    let p_value = if stat.is_finite() {
-        if input.dispersion.is_estimated() {
-            input.residual_df.and_then(|den_df| {
-                (den_df.is_finite() && den_df > 0.0)
-                    .then(|| FisherSnedecor::new(ref_df, den_df).ok())
-                    .flatten()
-                    .map(|dist| 1.0 - dist.cdf(stat / ref_df / input.dispersion.phi()))
-            })
-        } else {
-            ChiSquared::new(ref_df)
-                .ok()
-                .map(|dist| 1.0 - dist.cdf(stat))
-        }
+fn reference_df(influence: Option<&Array2<f64>>, start: usize, end: usize) -> Option<f64> {
+    let f = influence?;
+    let f_block = block(f, start, end)?;
+    let tr = (0..f_block.nrows()).map(|i| f_block[[i, i]]).sum::<f64>();
+    let tr2 = f_block.dot(&f_block).diag().sum();
+    if tr.is_finite() && tr2.is_finite() && tr > 0.0 && tr2 > 0.0 {
+        Some((tr * tr / tr2).max(1e-12))
     } else {
         None
-    };
+    }
+}
 
-    SmoothTestResult {
-        statistic: stat,
-        ref_df,
-        p_value,
-        valid: stat.is_finite(),
-        reason: (!stat.is_finite()).then(|| "smooth test statistic was non-finite".to_string()),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn reference_df_uses_trace_correction() {
+        let beta = array![1.0, 2.0];
+        let cov = array![[2.0, 0.0], [0.0, 3.0]];
+        let f = array![[0.5, 0.0], [0.0, 0.25]];
+        let out = wood_smooth_test(SmoothTestInput {
+            beta: beta.view(),
+            covariance: &cov,
+            influence_matrix: Some(&f),
+            coeff_range: 0..2,
+            edf: 1.0,
+            nullspace_dim: 0,
+            dispersion: 1.0,
+            residual_df: 20.0,
+            scale: SmoothTestScale::Known,
+        })
+        .expect("smooth test");
+        assert!((out.ref_df - 1.8).abs() < 1e-12);
+        assert!(out.statistic > 0.0);
+        assert!((0.0..=1.0).contains(&out.p_value));
     }
 }
