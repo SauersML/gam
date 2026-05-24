@@ -2103,6 +2103,8 @@ pub struct SphericalSplineBasisSpec {
     /// DSL via term_builder) still produce Sobolev specs.
     #[serde(default = "legacy_pseudo_wahba_kernel")]
     pub wahba_kernel: SphereWahbaKernel,
+    #[serde(default)]
+    pub streaming_chunk_size: Option<usize>,
 }
 
 /// Serde-compat default for `SphericalSplineBasisSpec::wahba_kernel`.
@@ -2122,6 +2124,7 @@ impl Default for SphericalSplineBasisSpec {
             method: SphereMethod::Wahba,
             max_degree: None,
             wahba_kernel: SphereWahbaKernel::Sobolev,
+            streaming_chunk_size: None,
         }
     }
 }
@@ -2428,7 +2431,9 @@ pub enum BasisMetadata {
         penalty_order: usize,
         method: SphereMethod,
         max_degree: Option<usize>,
+        wahba_kernel: SphereWahbaKernel,
         constraint_transform: Option<Array2<f64>>,
+        streaming_chunk_size: Option<usize>,
     },
     Matern {
         centers: Array2<f64>,
