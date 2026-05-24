@@ -10668,7 +10668,7 @@ fn report_html_impl(model_bytes: &[u8]) -> Result<String, String> {
             role: fit
                 .blocks
                 .get(index)
-                .map(|block| block.role.name().to_string()),
+                .map(|block| block.role.clone().name().to_string()),
         })
         .collect::<Vec<_>>();
     let report_input = ReportInput {
@@ -15061,24 +15061,24 @@ fn serialize_competing_risks_prediction_payload(
         gam::survival_construction::SurvivalLikelihoodMode::Latent => "latent",
         gam::survival_construction::SurvivalLikelihoodMode::LatentBinary => "latent-binary",
     };
-    let payload = CompetingRisksPredictionPayload {
-        class: "competing_risks_prediction",
-        model_class: "competing risks survival".to_string(),
-        likelihood_mode: likelihood_mode_str.to_string(),
-        endpoint_names: result.endpoint_names,
-        times: result.times,
-        hazard: matrices_to_nested(&result.hazard),
-        survival: matrices_to_nested(&result.survival),
-        cumulative_hazard: matrices_to_nested(&result.cumulative_hazard),
-        cif: matrices_to_nested(&result.cif),
-        overall_survival: matrix_to_nested(&result.overall_survival),
-        linear_predictor: result
+    let payload = serde_json::json!({
+        "class": "competing_risks_prediction",
+        "model_class": "competing risks survival",
+        "likelihood_mode": likelihood_mode_str,
+        "endpoint_names": result.endpoint_names,
+        "times": result.times,
+        "hazard": matrices_to_nested(&result.hazard),
+        "survival": matrices_to_nested(&result.survival),
+        "cumulative_hazard": matrices_to_nested(&result.cumulative_hazard),
+        "cif": matrices_to_nested(&result.cif),
+        "overall_survival": matrix_to_nested(&result.overall_survival),
+        "linear_predictor": result
             .linear_predictor
             .iter()
             .map(|eta| eta.to_vec())
-            .collect(),
-        columns,
-    };
+            .collect::<Vec<_>>(),
+        "columns": columns,
+    });
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize competing-risks prediction payload: {err}"))
 }
