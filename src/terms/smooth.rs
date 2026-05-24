@@ -21656,7 +21656,10 @@ mod tests {
         // non-Gaussian dense-lazy designs through `build_outer_hessian_operator`
         // at biobank scale and through `compute_outer_hessian` otherwise.
         assert!(exact_joint_spatial_outer_hessian_available(
-            LikelihoodFamily::BinomialLogit,
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Logit),
+            ),
             &design,
         ));
         assert!(exact_joint_spatial_outer_hessian_available(
@@ -22315,7 +22318,10 @@ mod tests {
         let (pass, worst, violations) = iso_kappa_fd_variant_driver(
             "duchon_logit",
             80,
-            LikelihoodFamily::BinomialLogit,
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Logit),
+            ),
             false,
             false,
         );
@@ -22331,7 +22337,10 @@ mod tests {
         let (pass, worst, violations) = iso_kappa_fd_variant_driver(
             "tps_probit",
             80,
-            LikelihoodFamily::BinomialProbit,
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Probit),
+            ),
             true,
             false,
         );
@@ -22347,7 +22356,10 @@ mod tests {
         let (pass, worst, violations) = iso_kappa_fd_variant_driver(
             "duchon_probit_n20",
             20,
-            LikelihoodFamily::BinomialProbit,
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Probit),
+            ),
             false,
             false,
         );
@@ -22363,7 +22375,10 @@ mod tests {
         let (pass, _worst, violations) = iso_kappa_fd_variant_driver(
             "duchon_probit_rho_only",
             80,
-            LikelihoodFamily::BinomialProbit,
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Probit),
+            ),
             false,
             true,
         );
@@ -23041,7 +23056,10 @@ mod tests {
 
         assert!(matches!(design.design, DesignMatrix::Sparse(_)));
         assert!(exact_joint_spatial_outer_hessian_available(
-            LikelihoodFamily::BinomialLogit,
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Logit),
+            ),
             &design,
         ));
     }
@@ -24608,7 +24626,10 @@ mod tests {
             weights,
             offset,
             &spec,
-            LikelihoodFamily::BinomialLogit,
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Logit),
+            ),
             &fit_opts,
             &SpatialLengthScaleOptimizationOptions {
                 enabled: true,
@@ -26985,7 +27006,10 @@ mod tests {
         let y = array![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
         let weights = Array1::ones(eta.len());
         let obs = evaluate_standard_familyobservations(
-            LikelihoodFamily::BinomialLogit,
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Logit),
+            ),
             None,
             None,
             None,
@@ -27030,7 +27054,10 @@ mod tests {
         let y = array![0.0, 1.0, 1.0, 0.0];
         let weights = Array1::ones(eta.len());
         for family in [
-            LikelihoodFamily::BinomialProbit,
+            LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Probit),
+            ),
             LikelihoodFamily::BinomialCLogLog,
         ] {
             let obs =

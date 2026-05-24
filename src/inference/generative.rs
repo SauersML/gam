@@ -1,7 +1,6 @@
 use crate::custom_family::{CustomFamily, ParameterBlockState};
 use crate::estimate::{EstimationError, PredictResult};
-use crate::families::strategy::{FamilyStrategy, strategy_for_family};
-use crate::types::LikelihoodFamily;
+use crate::types::{LikelihoodSpec, ResponseFamily};
 use ndarray::{Array1, Array2};
 
 /// Observation-noise model used for generative sampling.
@@ -47,15 +46,113 @@ impl GenerativeSpec {
 /// Build a generative specification for built-in GAM families from eta/mean.
 pub fn generativespec_from_predict(
     prediction: PredictResult,
-    family: LikelihoodFamily,
+    likelihood: LikelihoodSpec,
     gaussian_scale: Option<f64>,
 ) -> Result<GenerativeSpec, EstimationError> {
-    let strategy = strategy_for_family(family, None);
-    let noise = strategy.simulate_noise(&prediction.mean, gaussian_scale)?;
+    let noise = noise_model_for_likelihood(&likelihood, prediction.mean.len(), gaussian_scale)?;
     Ok(GenerativeSpec {
         mean: prediction.mean,
         noise,
     })
+}
+
+fn require_noise_parameter(
+    likelihood: &LikelihoodSpec,
+    parameter_name: &str,
+    value: Option<f64>,
+) -> Result<f64, EstimationError> {
+    let value = value.ok_or_else(|| {
+        EstimationError::InvalidInput(format!(
+            "{} generative sampling requires fitted {parameter_name}",
+            likelihood.response.name()
+        ))
+    })?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(EstimationError::InvalidInput(format!(
+            "{} generative sampling requires finite {parameter_name}; got {value}",
+            likelihood.response.name()
+        )))
+    }
+}
+
+fn require_positive_noise_parameter(
+    likelihood: &LikelihoodSpec,
+    parameter_name: &str,
+    value: Option<f64>,
+) -> Result<f64, EstimationError> {
+    let value = require_noise_parameter(likelihood, parameter_name, value)?;
+    if value > 0.0 {
+        Ok(value)
+    } else {
+        Err(EstimationError::InvalidInput(format!(
+            "{} generative sampling requires {parameter_name} > 0; got {value}",
+            likelihood.response.name()
+        )))
+    }
+}
+
+fn noise_model_for_likelihood(
+    likelihood: &LikelihoodSpec,
+    nobs: usize,
+    gaussian_scale: Option<f64>,
+) -> Result<NoiseModel, EstimationError> {
+    match &likelihood.response {
+        ResponseFamily::Gaussian => {
+            let sigma = require_noise_parameter(likelihood, "Gaussian sigma", gaussian_scale)?;
+            if sigma < 0.0 {
+                return Err(EstimationError::InvalidInput(format!(
+                    "gaussian generative sampling requires Gaussian sigma >= 0; got {sigma}"
+                )));
+            }
+            Ok(NoiseModel::Gaussian {
+                sigma: Array1::from_elem(nobs, sigma),
+            })
+        }
+        ResponseFamily::Binomial => Ok(NoiseModel::Bernoulli),
+        ResponseFamily::Poisson => Ok(NoiseModel::Poisson),
+        ResponseFamily::Tweedie { p } => {
+            let p = *p;
+            if !(p.is_finite() && p > 1.0 && p < 2.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
+                )));
+            }
+            Ok(NoiseModel::Tweedie {
+                p,
+                phi: require_positive_noise_parameter(
+                    likelihood,
+                    "Tweedie dispersion phi",
+                    gaussian_scale,
+                )?,
+            })
+        }
+        ResponseFamily::NegativeBinomial { theta } => {
+            let theta = *theta;
+            if !(theta.is_finite() && theta > 0.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "negative-binomial theta must be finite and > 0; got {theta}"
+                )));
+            }
+            Ok(NoiseModel::NegativeBinomial { theta })
+        }
+        ResponseFamily::Beta { phi } => {
+            let phi = *phi;
+            if !(phi.is_finite() && phi > 0.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "beta-regression phi must be finite and > 0; got {phi}"
+                )));
+            }
+            Ok(NoiseModel::Beta { phi })
+        }
+        ResponseFamily::Gamma => Ok(NoiseModel::Gamma {
+            shape: require_positive_noise_parameter(likelihood, "Gamma shape", gaussian_scale)?,
+        }),
+        ResponseFamily::RoystonParmar => Err(EstimationError::InvalidInput(
+            "RoystonParmar generative sampling is not exposed via generic generation".to_string(),
+        )),
+    }
 }
 
 /// Draw one synthetic observation vector from a generative spec.

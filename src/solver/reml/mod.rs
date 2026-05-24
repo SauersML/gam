@@ -857,7 +857,7 @@ mod tests {
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
         let rho = array![0.0];
         let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            binomial_logit_glm_spec(),
             1e-10,
             false,
         );
@@ -1002,7 +1002,7 @@ mod tests {
         // P-IRLS optimum; 1e-10 leaves enough residual gradient to cause ~12%
         // V_tau mismatch on this small (n=8) logistic problem.
         let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            binomial_logit_glm_spec(),
             1e-14,
             false,
         );
@@ -1168,7 +1168,7 @@ mod tests {
         // Rank-deficient Firth logit needs more inner iterations to converge
         // tightly enough for the envelope-theorem derivative tests.
         let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            binomial_logit_glm_spec(),
             1e-9,
             true,
         )
@@ -1235,7 +1235,7 @@ mod tests {
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.1], [0.0, 0.1, 0.7],];
         let s1 = array![[0.0, 0.0, 0.0], [0.0, 0.4, -0.05], [0.0, -0.05, 0.9],];
         let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            binomial_logit_glm_spec(),
             1e-9,
             true,
         )
@@ -1352,7 +1352,7 @@ mod tests {
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
         let rho = array![0.0];
         let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            binomial_logit_glm_spec(),
             1e-10,
             false,
         );
@@ -1440,7 +1440,7 @@ mod tests {
         .expect("single-penalty hyper direction");
         let rho = array![0.0];
         let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            binomial_logit_glm_spec(),
             1e-8,
             true,
         );
@@ -1501,7 +1501,7 @@ mod tests {
         .expect("single-penalty hyper direction");
         let rho = array![0.0];
         let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            binomial_logit_glm_spec(),
             1e-8,
             true,
         );
@@ -1546,7 +1546,7 @@ mod tests {
         ];
         let rho = array![0.0];
         let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            binomial_logit_glm_spec(),
             1e-8,
             true,
         );
@@ -1589,7 +1589,7 @@ mod tests {
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
         let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            binomial_logit_glm_spec(),
             1e-10,
             false,
         )
@@ -1656,7 +1656,7 @@ mod tests {
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
         let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            binomial_logit_glm_spec(),
             1e-10,
             false,
         )
@@ -1755,7 +1755,7 @@ mod tests {
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.1], [0.0, 0.1, 0.8],];
         let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            binomial_logit_glm_spec(),
             1e-10,
             true,
         );
@@ -1797,7 +1797,7 @@ mod tests {
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9],];
         let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            binomial_logit_glm_spec(),
             1e-10,
             false,
         )
@@ -1918,7 +1918,7 @@ mod tests {
                 x: x.clone(),
                 s0: array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9]],
                 cfg: RemlConfig::external(
-                    GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::GaussianIdentity),
+                    gaussian_identity_glm_spec(),
                     1e-14,
                     false,
                 ),
@@ -2099,7 +2099,7 @@ mod tests {
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9]];
         let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            binomial_logit_glm_spec(),
             1e-14,
             false,
         );
@@ -2166,7 +2166,7 @@ mod tests {
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.2], [0.0, 0.2, 0.9]];
         let cfg = RemlConfig::external(
-            GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+            binomial_logit_glm_spec(),
             1e-14,
             false,
         );
@@ -2303,7 +2303,7 @@ mod tests {
                 [0.0, -0.10, 0.08, 0.12, 1.25]
             ];
             let cfg = RemlConfig::external(
-                GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+                binomial_logit_glm_spec(),
                 1e-14,
                 false,
             );
