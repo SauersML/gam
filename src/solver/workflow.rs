@@ -65,7 +65,7 @@ use crate::terms::{
     TotalVariationPenalty,
 };
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodFamily, LikelihoodSpec, LinkFunction,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LikelihoodSpec, LinkFunction,
     MixtureLinkSpec, ResponseFamily, SasLinkSpec, WigglePenaltyConfig,
 };
 
@@ -1078,7 +1078,7 @@ fn survival_unified_fit_result(
         }],
         log_lambdas,
         lambdas,
-        likelihood_family: Some(LikelihoodFamily::RoystonParmar),
+        likelihood_family: Some(LikelihoodSpec::royston_parmar()),
         likelihood_scale: crate::types::LikelihoodScaleMetadata::Unspecified,
         log_likelihood_normalization: crate::types::LogLikelihoodNormalization::UserProvided,
         log_likelihood: state.log_likelihood,
@@ -1246,7 +1246,7 @@ fn fit_cause_specific_survival_transformation_custom(
         fit_custom_family_with_rho_prior(&family, &block_specs, &fit_options, rho_prior)
     }
     .map_err(|err| format!("cause-specific survival custom-family fit failed: {err}"))?;
-    fit.likelihood_family = Some(LikelihoodFamily::RoystonParmar);
+    fit.likelihood_family = Some(LikelihoodSpec::royston_parmar());
     let time_basis = crate::families::survival_construction::SavedSurvivalTimeBasis::from_build(
         &spec.time_build,
         spec.time_anchor,

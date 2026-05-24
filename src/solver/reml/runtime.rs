@@ -1257,7 +1257,7 @@ struct DerivativeContext {
 /// substituted. The REML helpers below only consult variant kinds (not link
 /// payloads), which keeps the substitution sound.
 #[inline]
-fn reml_likelihood_spec(likelihood: GlmLikelihoodSpec) -> LikelihoodSpec {
+fn reml_spec(likelihood: GlmLikelihoodSpec) -> LikelihoodSpec {
     let placeholder_sas = SasLinkState {
         epsilon: 0.0,
         log_delta: 0.0,
@@ -1320,19 +1320,19 @@ fn reml_likelihood_spec(likelihood: GlmLikelihoodSpec) -> LikelihoodSpec {
 
 #[inline]
 fn reml_is_gaussian_identity(likelihood: GlmLikelihoodSpec) -> bool {
-    reml_likelihood_spec(likelihood).is_gaussian_identity()
+    reml_spec(likelihood).is_gaussian_identity()
 }
 
 #[inline]
 fn reml_supports_firth(likelihood: GlmLikelihoodSpec) -> bool {
-    let spec = reml_likelihood_spec(likelihood);
+    let spec = reml_spec(likelihood);
     matches!(spec.response, ResponseFamily::Binomial)
         && matches!(spec.link, InverseLink::Standard(LinkFunction::Logit))
 }
 
 #[inline]
 fn reml_fixed_glm_dispersion(likelihood: GlmLikelihoodSpec) -> f64 {
-    let spec = reml_likelihood_spec(likelihood);
+    let spec = reml_spec(likelihood);
     match (&spec.response, &spec.link) {
         // Beta carries phi inside the response variant under the LikelihoodSpec form.
         (ResponseFamily::Beta { phi }, _) => *phi,
@@ -1353,7 +1353,7 @@ fn reml_fixed_glm_dispersion(likelihood: GlmLikelihoodSpec) -> f64 {
             _,
         ) => likelihood.fixed_phi().unwrap_or(1.0),
         // RoystonParmar is survival-specific and not produced by
-        // `reml_likelihood_spec` from any `GlmFamily` variant.
+        // `reml_spec` from any `GlmFamily` variant.
         (ResponseFamily::RoystonParmar, _) => likelihood.fixed_phi().unwrap_or(1.0),
     }
 }
@@ -3757,7 +3757,7 @@ impl<'a> RemlState<'a> {
         // Mixture links advertise `link_function() == Logit` but are
         // non-canonical; route them through the general path below.
         let canonical_logit = {
-            let spec = reml_likelihood_spec(pirls_result.likelihood);
+            let spec = reml_spec(pirls_result.likelihood);
             matches!(spec.response, ResponseFamily::Binomial)
                 && matches!(spec.link, InverseLink::Standard(LinkFunction::Logit))
         } && self.runtime_mixture_link_state.is_none();
@@ -3869,7 +3869,7 @@ impl<'a> RemlState<'a> {
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
         let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
         let canonical_logit = {
-            let spec = reml_likelihood_spec(pirls_result.likelihood);
+            let spec = reml_spec(pirls_result.likelihood);
             matches!(spec.response, ResponseFamily::Binomial)
                 && matches!(spec.link, InverseLink::Standard(LinkFunction::Logit))
         } && self.runtime_mixture_link_state.is_none();
@@ -5791,7 +5791,7 @@ impl<'a> RemlState<'a> {
     ) -> Option<Arc<crate::pirls::GaussianFixedCache>> {
         // Static eligibility — these only depend on data the outer loop
         // never mutates, so the gate is correct once and stays correct.
-        let spec = reml_likelihood_spec(self.config.likelihood);
+        let spec = reml_spec(self.config.likelihood);
         let family_ok = matches!(spec.response, ResponseFamily::Gaussian);
         let link_ok = matches!(
             self.config.link_kind,

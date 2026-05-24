@@ -716,7 +716,7 @@ const MODEL_VERSION: u32 = MODEL_PAYLOAD_VERSION;
 
 struct CliFirthValidation<'a> {
     enabled: bool,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     predict_noise: bool,
     has_bounded_terms: bool,
     is_survival: bool,
@@ -760,7 +760,7 @@ fn validate_cli_firth_configuration(ctx: CliFirthValidation<'_>) -> Result<(), C
     Err(CliError::IncompatibleConfig {
         reason: format!(
             "--firth currently requires {}; resolved family is {}",
-            LikelihoodFamily::BinomialLogit.pretty_name(),
+            LikelihoodSpec::binomial_logit().pretty_name(),
             ctx.family.pretty_name()
         ),
     })
@@ -984,7 +984,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     if let Some((entry, exit, event)) = parse_surv_response(&parsed.response)? {
         validate_cli_firth_configuration(CliFirthValidation {
             enabled: args.firth,
-            family: LikelihoodFamily::RoystonParmar,
+            family: LikelihoodSpec::royston_parmar(),
             predict_noise: args.predict_noise.is_some(),
             has_bounded_terms: false,
             is_survival: true,
@@ -2085,7 +2085,7 @@ fn run_fitwith_predict_noise(
     col_map: &HashMap<String, usize>,
     parsed: &ParsedFormula,
     y: &Array1<f64>,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     effective_link: LinkFunction,
     link_choice: Option<&LinkChoice>,
     mixture_linkspec: Option<&MixtureLinkSpec>,
@@ -2139,7 +2139,7 @@ fn run_fitwith_predict_noise(
     let weights = resolve_weight_column(ds, col_map, args.weights_column.as_deref())?;
     let mean_offset = resolve_offset_column(ds, col_map, args.offset_column.as_deref())?;
     let noise_offset = resolve_offset_column(ds, col_map, args.noise_offset_column.as_deref())?;
-    if family == LikelihoodFamily::GaussianIdentity {
+    if family == LikelihoodSpec::gaussian_identity() {
         let response_scale = sample_std(y.view()).max(1e-6);
         let y_scaled = y.mapv(|v| v / response_scale);
         let options = blockwise_options_from_fit_args()?;
@@ -2288,7 +2288,7 @@ fn run_fitwith_predict_noise(
         );
     }
     let location_scale_link_kind = match family {
-        LikelihoodFamily::BinomialMixture => {
+        LikelihoodSpec::binomial_link(LinkFunction::Logit) => {
             let spec = mixture_linkspec
                 .ok_or_else(|| {
                     "binomial blended-inverse-link location-scale fitting requires link(type=blended(...))"
@@ -2299,7 +2299,7 @@ fn run_fitwith_predict_noise(
                 .map_err(|e| format!("invalid blended link configuration: {e}"))?;
             InverseLink::Mixture(state)
         }
-        LikelihoodFamily::BinomialSas => {
+        LikelihoodSpec::binomial_link(LinkFunction::Sas) => {
             let spec = *sas_linkspec.ok_or_else(|| {
                 "binomial SAS location-scale fitting requires link(type=sas)".to_string()
             })?;
@@ -2307,7 +2307,7 @@ fn run_fitwith_predict_noise(
                 .map_err(|e| format!("invalid SAS link configuration: {e}"))?;
             InverseLink::Sas(state)
         }
-        LikelihoodFamily::BinomialBetaLogistic => {
+        LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic) => {
             let spec = *sas_linkspec.ok_or_else(|| {
                 "binomial beta-logistic location-scale fitting requires link(type=beta-logistic)"
                     .to_string()
@@ -2589,12 +2589,12 @@ fn run_predict_unified(
     let family = model.likelihood();
     let nonlinear = matches!(
         family,
-        LikelihoodFamily::BinomialLogit
-            | LikelihoodFamily::BinomialProbit
-            | LikelihoodFamily::BinomialCLogLog
-            | LikelihoodFamily::BinomialSas
-            | LikelihoodFamily::BinomialBetaLogistic
-            | LikelihoodFamily::BinomialMixture
+        LikelihoodSpec::binomial_logit()
+            | LikelihoodSpec::binomial_probit()
+            | LikelihoodSpec::binomial_cloglog()
+            | LikelihoodSpec::binomial_link(LinkFunction::Sas)
+            | LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic)
+            | LikelihoodSpec::binomial_link(LinkFunction::Logit)
     ) || model.has_link_wiggle()
         || model.has_baseline_time_wiggle();
     let sigma_opt = if model_class == PredictModelClass::GaussianLocationScale {
@@ -3791,7 +3791,7 @@ fn run_predict_survival(
             x_exit.view(),
             beta.view(),
             eta_offset_exit.view(),
-            LikelihoodFamily::RoystonParmar,
+            LikelihoodSpec::royston_parmar(),
             &backend,
         )
         .map_err(|e| format!("survival posterior-mean prediction failed: {e}"))?;
@@ -3801,7 +3801,7 @@ fn run_predict_survival(
             x_exit.view(),
             beta.view(),
             eta_offset_exit.view(),
-            LikelihoodFamily::RoystonParmar,
+            LikelihoodSpec::royston_parmar(),
         )
         .map_err(|e| format!("survival prediction failed: {e}"))?;
         (pred.eta, pred.mean)
@@ -3817,7 +3817,7 @@ fn run_predict_survival(
             x_exit.view(),
             beta.view(),
             eta_offset_exit.view(),
-            LikelihoodFamily::RoystonParmar,
+            LikelihoodSpec::royston_parmar(),
             &fit_saved,
             &gam::estimate::PredictUncertaintyOptions {
                 confidence_level: args.level,
@@ -4816,7 +4816,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     ),
                     frailty: gam::families::lognormal_kernel::FrailtySpec::None,
                 },
-                LikelihoodFamily::RoystonParmar.name().to_string(),
+                LikelihoodSpec::royston_parmar().name().to_string(),
             );
             payload.unified = Some(fit_result.clone());
             payload.fit_result = Some(fit_result);
@@ -5205,7 +5205,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survival_distribution: Some(ResidualDistribution::Gaussian),
                     frailty: save_frailty,
                 },
-                LikelihoodFamily::RoystonParmar.name().to_string(),
+                LikelihoodSpec::royston_parmar().name().to_string(),
             );
             payload.unified = Some(fit.fit.clone());
             payload.fit_result = Some(fit.fit.clone());
@@ -5669,7 +5669,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                     survival_distribution: None,
                     frailty: gam::families::lognormal_kernel::FrailtySpec::None,
                 },
-                LikelihoodFamily::RoystonParmar.name().to_string(),
+                LikelihoodSpec::royston_parmar().name().to_string(),
             );
             payload.unified = Some(fit.fit.clone());
             payload.fit_result = Some(fit.fit.clone());
@@ -6102,7 +6102,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 survival_distribution: None,
                 frailty: gam::families::lognormal_kernel::FrailtySpec::None,
             },
-            LikelihoodFamily::RoystonParmar.name().to_string(),
+            LikelihoodSpec::royston_parmar().name().to_string(),
         );
         payload.unified = Some(fit_result.clone());
         payload.fit_result = Some(fit_result);
@@ -7259,9 +7259,9 @@ fn build_location_scale_saved_model(
         ModelKind::LocationScale,
         FittedFamily::LocationScale {
             likelihood: if family == FAMILY_GAUSSIAN_LOCATION_SCALE {
-                LikelihoodFamily::GaussianIdentity
+                LikelihoodSpec::gaussian_identity()
             } else {
-                LikelihoodFamily::BinomialProbit
+                LikelihoodSpec::binomial_probit()
             },
             base_link: None,
         },
@@ -7824,12 +7824,12 @@ fn core_saved_fit_result(
     }
 }
 
-fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodFamily) -> Option<f64> {
+fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodSpec) -> Option<f64> {
     match family {
-        LikelihoodFamily::Tweedie { p } => Some(p),
-        LikelihoodFamily::NegativeBinomial { theta } => Some(theta),
-        LikelihoodFamily::BetaLogit { phi } => Some(phi),
-        LikelihoodFamily::GammaLog => fit
+        LikelihoodSpec::Tweedie { p } => Some(p),
+        LikelihoodSpec::NegativeBinomial { theta } => Some(theta),
+        LikelihoodSpec::BetaLogit { phi } => Some(phi),
+        LikelihoodSpec::gamma_log() => fit
             .likelihood_scale
             .gamma_shape()
             .or(Some(fit.standard_deviation)),
@@ -8578,7 +8578,7 @@ fn resolve_family(
     negative_binomial_theta: Option<f64>,
     link_choice: Option<LinkChoice>,
     y: ArrayView1<'_, f64>,
-) -> Result<LikelihoodFamily, String> {
+) -> Result<LikelihoodSpec, String> {
     let nb_theta = negative_binomial_theta.unwrap_or(1.0);
     if !nb_theta.is_finite() || nb_theta <= 0.0 {
         return Err(format!(
@@ -8591,31 +8591,31 @@ fn resolve_family(
     let explicit_family = family_from_arg(arg, nb_theta);
     if let Some(choice) = link_choice.as_ref() {
         let from_link = if choice.mixture_components.is_some() {
-            LikelihoodFamily::BinomialMixture
+            LikelihoodSpec::binomial_link(LinkFunction::Logit)
         } else {
             match choice.link {
-                LinkFunction::Identity => LikelihoodFamily::GaussianIdentity,
+                LinkFunction::Identity => LikelihoodSpec::gaussian_identity(),
                 LinkFunction::Log => {
                     if y.iter()
                         .all(|&yi| yi.is_finite() && yi >= 0.0 && (yi - yi.round()).abs() <= 1e-9)
                     {
-                        LikelihoodFamily::PoissonLog
+                        LikelihoodSpec::poisson_log()
                     } else {
-                        LikelihoodFamily::GammaLog
+                        LikelihoodSpec::gamma_log()
                     }
                 }
-                LinkFunction::Logit => LikelihoodFamily::BinomialLogit,
-                LinkFunction::Probit => LikelihoodFamily::BinomialProbit,
-                LinkFunction::CLogLog => LikelihoodFamily::BinomialCLogLog,
-                LinkFunction::Sas => LikelihoodFamily::BinomialSas,
-                LinkFunction::BetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
+                LinkFunction::Logit => LikelihoodSpec::binomial_logit(),
+                LinkFunction::Probit => LikelihoodSpec::binomial_probit(),
+                LinkFunction::CLogLog => LikelihoodSpec::binomial_cloglog(),
+                LinkFunction::Sas => LikelihoodSpec::binomial_link(LinkFunction::Sas),
+                LinkFunction::BetaLogistic => LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic),
             }
         };
         if let Some(explicit) = explicit_family {
             let compatible_log_nb = matches!(
                 (explicit, choice.link, choice.mixture_components.as_ref()),
                 (
-                    LikelihoodFamily::NegativeBinomial { .. },
+                    LikelihoodSpec::NegativeBinomial { .. },
                     LinkFunction::Log,
                     None
                 )
@@ -8632,41 +8632,41 @@ fn resolve_family(
     }
 
     Ok(match arg {
-        FamilyArg::Gaussian => LikelihoodFamily::GaussianIdentity,
-        FamilyArg::BinomialLogit => LikelihoodFamily::BinomialLogit,
-        FamilyArg::BinomialProbit => LikelihoodFamily::BinomialProbit,
-        FamilyArg::BinomialCloglog => LikelihoodFamily::BinomialCLogLog,
-        FamilyArg::LatentCloglogBinomial => LikelihoodFamily::BinomialLatentCLogLog,
-        FamilyArg::PoissonLog => LikelihoodFamily::PoissonLog,
-        FamilyArg::NegativeBinomial => LikelihoodFamily::NegativeBinomial { theta: nb_theta },
-        FamilyArg::GammaLog => LikelihoodFamily::GammaLog,
-        FamilyArg::RoystonParmar => LikelihoodFamily::RoystonParmar,
-        FamilyArg::TransformationNormal => LikelihoodFamily::GaussianIdentity,
+        FamilyArg::Gaussian => LikelihoodSpec::gaussian_identity(),
+        FamilyArg::BinomialLogit => LikelihoodSpec::binomial_logit(),
+        FamilyArg::BinomialProbit => LikelihoodSpec::binomial_probit(),
+        FamilyArg::BinomialCloglog => LikelihoodSpec::binomial_cloglog(),
+        FamilyArg::LatentCloglogBinomial => LikelihoodSpec::binomial_link(LinkFunction::CLogLog),
+        FamilyArg::PoissonLog => LikelihoodSpec::poisson_log(),
+        FamilyArg::NegativeBinomial => LikelihoodSpec::NegativeBinomial { theta: nb_theta },
+        FamilyArg::GammaLog => LikelihoodSpec::gamma_log(),
+        FamilyArg::RoystonParmar => LikelihoodSpec::royston_parmar(),
+        FamilyArg::TransformationNormal => LikelihoodSpec::gaussian_identity(),
         FamilyArg::Auto => {
             if is_binary_response(y) {
-                LikelihoodFamily::BinomialLogit
+                LikelihoodSpec::binomial_logit()
             } else {
-                LikelihoodFamily::GaussianIdentity
+                LikelihoodSpec::gaussian_identity()
             }
         }
     })
 }
 
-fn family_from_arg(arg: FamilyArg, negative_binomial_theta: f64) -> Option<LikelihoodFamily> {
+fn family_from_arg(arg: FamilyArg, negative_binomial_theta: f64) -> Option<LikelihoodSpec> {
     match arg {
         FamilyArg::Auto => None,
-        FamilyArg::Gaussian => Some(LikelihoodFamily::GaussianIdentity),
-        FamilyArg::BinomialLogit => Some(LikelihoodFamily::BinomialLogit),
-        FamilyArg::BinomialProbit => Some(LikelihoodFamily::BinomialProbit),
-        FamilyArg::BinomialCloglog => Some(LikelihoodFamily::BinomialCLogLog),
-        FamilyArg::LatentCloglogBinomial => Some(LikelihoodFamily::BinomialLatentCLogLog),
-        FamilyArg::PoissonLog => Some(LikelihoodFamily::PoissonLog),
-        FamilyArg::NegativeBinomial => Some(LikelihoodFamily::NegativeBinomial {
+        FamilyArg::Gaussian => Some(LikelihoodSpec::gaussian_identity()),
+        FamilyArg::BinomialLogit => Some(LikelihoodSpec::binomial_logit()),
+        FamilyArg::BinomialProbit => Some(LikelihoodSpec::binomial_probit()),
+        FamilyArg::BinomialCloglog => Some(LikelihoodSpec::binomial_cloglog()),
+        FamilyArg::LatentCloglogBinomial => Some(LikelihoodSpec::binomial_link(LinkFunction::CLogLog)),
+        FamilyArg::PoissonLog => Some(LikelihoodSpec::poisson_log()),
+        FamilyArg::NegativeBinomial => Some(LikelihoodSpec::NegativeBinomial {
             theta: negative_binomial_theta,
         }),
-        FamilyArg::GammaLog => Some(LikelihoodFamily::GammaLog),
-        FamilyArg::RoystonParmar => Some(LikelihoodFamily::RoystonParmar),
-        FamilyArg::TransformationNormal => Some(LikelihoodFamily::GaussianIdentity),
+        FamilyArg::GammaLog => Some(LikelihoodSpec::gamma_log()),
+        FamilyArg::RoystonParmar => Some(LikelihoodSpec::royston_parmar()),
+        FamilyArg::TransformationNormal => Some(LikelihoodSpec::gaussian_identity()),
     }
 }
 
@@ -8715,39 +8715,39 @@ fn link_choice_to_string(choice: &LinkChoice) -> String {
 }
 
 fn resolve_binomial_inverse_link_for_fit(
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     effective_link: LinkFunction,
     mixture_linkspec: Option<&MixtureLinkSpec>,
     sas_linkspec: Option<&SasLinkSpec>,
     context: &str,
 ) -> Result<InverseLink, String> {
     match family {
-        LikelihoodFamily::BinomialMixture => {
+        LikelihoodSpec::binomial_link(LinkFunction::Logit) => {
             let spec = mixture_linkspec
                 .ok_or_else(|| format!("{context} requires link(type=blended(...))"))?;
             let state = state_fromspec(spec)
                 .map_err(|e| format!("invalid blended link configuration: {e}"))?;
             Ok(InverseLink::Mixture(state))
         }
-        LikelihoodFamily::BinomialSas => {
+        LikelihoodSpec::binomial_link(LinkFunction::Sas) => {
             let spec = *sas_linkspec.ok_or_else(|| format!("{context} requires link(type=sas)"))?;
             let state = state_from_sasspec(spec)
                 .map_err(|e| format!("invalid SAS link configuration: {e}"))?;
             Ok(InverseLink::Sas(state))
         }
-        LikelihoodFamily::BinomialBetaLogistic => {
+        LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic) => {
             let spec = *sas_linkspec
                 .ok_or_else(|| format!("{context} requires link(type=beta-logistic)"))?;
             let state = state_from_beta_logisticspec(spec)
                 .map_err(|e| format!("invalid Beta-Logistic link configuration: {e}"))?;
             Ok(InverseLink::BetaLogistic(state))
         }
-        LikelihoodFamily::BinomialLatentCLogLog => Err(format!(
+        LikelihoodSpec::binomial_link(LinkFunction::CLogLog) => Err(format!(
             "{context} does not construct latent-cloglog links directly; use the latent-cloglog family path with explicit frailty"
         )),
-        LikelihoodFamily::BinomialLogit
-        | LikelihoodFamily::BinomialProbit
-        | LikelihoodFamily::BinomialCLogLog => Ok(InverseLink::Standard(effective_link)),
+        LikelihoodSpec::binomial_logit()
+        | LikelihoodSpec::binomial_probit()
+        | LikelihoodSpec::binomial_cloglog() => Ok(InverseLink::Standard(effective_link)),
         _ => Err(format!(
             "{context} is only available for binomial links, got {}",
             family.name()
@@ -8756,14 +8756,14 @@ fn resolve_binomial_inverse_link_for_fit(
 }
 
 fn binomial_mean_linkwiggle_supports_family(
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     link_choice: Option<&LinkChoice>,
 ) -> bool {
     matches!(
         family,
-        LikelihoodFamily::BinomialLogit
-            | LikelihoodFamily::BinomialProbit
-            | LikelihoodFamily::BinomialCLogLog
+        LikelihoodSpec::binomial_logit()
+            | LikelihoodSpec::binomial_probit()
+            | LikelihoodSpec::binomial_cloglog()
     ) && !link_choice.is_some_and(|choice| matches!(choice.mode, LinkMode::Flexible))
 }
 
@@ -8942,7 +8942,7 @@ fn build_model_summary(
     design: &gam::smooth::TermCollectionDesign,
     spec: &TermCollectionSpec,
     fit: &UnifiedFitResult,
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
 ) -> ModelSummary {
@@ -8953,12 +8953,12 @@ fn build_model_summary(
     let cov_forwald = fit.beta_covariance_corrected().or(fit.beta_covariance());
     let scale_is_estimated = matches!(
         family,
-        LikelihoodFamily::GaussianIdentity | LikelihoodFamily::GammaLog
+        LikelihoodSpec::gaussian_identity() | LikelihoodSpec::gamma_log()
     );
     let residual_df = (y.len() as f64 - fit.edf_total().unwrap_or(fit.beta.len() as f64)).max(1.0);
     let dispersion_phi = match family {
-        LikelihoodFamily::GaussianIdentity => fit.standard_deviation * fit.standard_deviation,
-        LikelihoodFamily::GammaLog => fit.likelihood_scale.fixed_phi().unwrap_or_else(|| {
+        LikelihoodSpec::gaussian_identity() => fit.standard_deviation * fit.standard_deviation,
+        LikelihoodSpec::gamma_log() => fit.likelihood_scale.fixed_phi().unwrap_or_else(|| {
             if fit.standard_deviation.is_finite() && fit.standard_deviation > 0.0 {
                 1.0 / fit.standard_deviation
             } else {
@@ -8980,7 +8980,7 @@ fn build_model_summary(
     };
 
     let nullmu = match family {
-        LikelihoodFamily::GaussianIdentity => {
+        LikelihoodSpec::gaussian_identity() => {
             let wsum = weights.iter().copied().sum::<f64>().max(1e-12);
             let ybar = y
                 .iter()
@@ -8990,13 +8990,13 @@ fn build_model_summary(
                 / wsum;
             Array1::from_elem(y.len(), ybar)
         }
-        LikelihoodFamily::BinomialLogit
-        | LikelihoodFamily::BinomialProbit
-        | LikelihoodFamily::BinomialCLogLog
-        | LikelihoodFamily::BinomialLatentCLogLog
-        | LikelihoodFamily::BinomialSas
-        | LikelihoodFamily::BinomialBetaLogistic
-        | LikelihoodFamily::BinomialMixture => {
+        LikelihoodSpec::binomial_logit()
+        | LikelihoodSpec::binomial_probit()
+        | LikelihoodSpec::binomial_cloglog()
+        | LikelihoodSpec::binomial_link(LinkFunction::CLogLog)
+        | LikelihoodSpec::binomial_link(LinkFunction::Sas)
+        | LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic)
+        | LikelihoodSpec::binomial_link(LinkFunction::Logit) => {
             let wsum = weights.iter().copied().sum::<f64>().max(1e-12);
             let p = y
                 .iter()
@@ -9006,12 +9006,12 @@ fn build_model_summary(
                 / wsum;
             Array1::from_elem(y.len(), p)
         }
-        LikelihoodFamily::RoystonParmar => Array1::from_elem(y.len(), 0.0),
-        LikelihoodFamily::PoissonLog
-        | LikelihoodFamily::Tweedie { .. }
-        | LikelihoodFamily::NegativeBinomial { .. }
-        | LikelihoodFamily::BetaLogit { .. }
-        | LikelihoodFamily::GammaLog => {
+        LikelihoodSpec::royston_parmar() => Array1::from_elem(y.len(), 0.0),
+        LikelihoodSpec::poisson_log()
+        | LikelihoodSpec::Tweedie { .. }
+        | LikelihoodSpec::NegativeBinomial { .. }
+        | LikelihoodSpec::BetaLogit { .. }
+        | LikelihoodSpec::gamma_log() => {
             let wsum = weights.iter().copied().sum::<f64>().max(1e-12);
             let mean = y
                 .iter()
@@ -9019,9 +9019,9 @@ fn build_model_summary(
                 .map(|(&yy, &ww)| yy * ww)
                 .sum::<f64>()
                 / wsum;
-            let baseline = if family == LikelihoodFamily::PoissonLog {
+            let baseline = if family == LikelihoodSpec::poisson_log() {
                 mean.max(0.0)
-            } else if matches!(family, LikelihoodFamily::BetaLogit { .. }) {
+            } else if matches!(family, LikelihoodSpec::BetaLogit { .. }) {
                 mean.clamp(gam::pirls::BETA_MU_EPS, 1.0 - gam::pirls::BETA_MU_EPS)
             } else {
                 mean.max(1e-12)
@@ -9876,7 +9876,7 @@ fn write_survival_binary_prediction_csv(
 mod tests {
     use super::{
         BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
-        FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, LikelihoodFamily, LinkChoice,
+        FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, LikelihoodSpec, LinkChoice,
         LinkMode, MODEL_VERSION, ModelKind, ResidualDistribution, SavedFitSummary, SavedModel,
         SurvivalArgs, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
         build_survival_time_basis, classify_cli_error, collect_hierarchical_smooth_overlapwarnings,
@@ -10482,7 +10482,7 @@ mod tests {
     fn cli_firth_validation_uses_shared_family_support_rule() {
         let err = validate_cli_firth_configuration(CliFirthValidation {
             enabled: true,
-            family: LikelihoodFamily::PoissonLog,
+            family: LikelihoodSpec::poisson_log(),
             predict_noise: false,
             has_bounded_terms: false,
             is_survival: false,
@@ -10554,7 +10554,7 @@ mod tests {
 
         let family = resolve_family(FamilyArg::Auto, None, None, y.view()).expect("resolve family");
 
-        assert_eq!(family, LikelihoodFamily::BinomialLogit);
+        assert_eq!(family, LikelihoodSpec::binomial_logit());
     }
 
     #[test]
@@ -10568,7 +10568,7 @@ mod tests {
 
         validate_cli_firth_configuration(CliFirthValidation {
             enabled: true,
-            family: LikelihoodFamily::BinomialLogit,
+            family: LikelihoodSpec::binomial_logit(),
             predict_noise: false,
             has_bounded_terms: false,
             is_survival: false,
@@ -10581,7 +10581,7 @@ mod tests {
     fn cli_firth_validation_rejects_survival_models() {
         let err = validate_cli_firth_configuration(CliFirthValidation {
             enabled: true,
-            family: LikelihoodFamily::RoystonParmar,
+            family: LikelihoodSpec::royston_parmar(),
             predict_noise: false,
             has_bounded_terms: false,
             is_survival: true,
@@ -10620,7 +10620,7 @@ mod tests {
                 likelihood,
                 base_link,
             } => {
-                assert_eq!(*likelihood, LikelihoodFamily::BinomialLogit);
+                assert_eq!(*likelihood, LikelihoodSpec::binomial_logit());
                 assert!(matches!(
                     base_link.as_ref(),
                     Some(InverseLink::Standard(LinkFunction::Logit))
@@ -10826,7 +10826,7 @@ mod tests {
                 likelihood,
                 base_link,
             } => {
-                assert_eq!(*likelihood, LikelihoodFamily::BinomialProbit);
+                assert_eq!(*likelihood, LikelihoodSpec::binomial_probit());
                 assert!(matches!(
                     base_link.as_ref(),
                     Some(InverseLink::Standard(LinkFunction::Probit))
@@ -11524,7 +11524,7 @@ mod tests {
         beta_eta: f64,
         covariance: Array2<f64>,
         link: LinkFunction,
-        family: LikelihoodFamily,
+        family: LikelihoodSpec,
         beta_link_wiggle: Vec<f64>,
         wiggle_knots: Vec<f64>,
         wiggle_degree: usize,
@@ -11613,7 +11613,7 @@ mod tests {
             0.1,
             cov,
             LinkFunction::Logit,
-            LikelihoodFamily::BinomialLogit,
+            LikelihoodSpec::binomial_logit(),
             beta_link_wiggle,
             knots.to_vec(),
             2,
@@ -11666,7 +11666,7 @@ mod tests {
             -0.2,
             cov,
             LinkFunction::Probit,
-            LikelihoodFamily::BinomialProbit,
+            LikelihoodSpec::binomial_probit(),
             beta_link_wiggle,
             knots.to_vec(),
             2,
@@ -11854,11 +11854,11 @@ mod tests {
     #[test]
     fn pretty_familynames_are_human_readable() {
         assert_eq!(
-            LikelihoodFamily::BinomialLogit.pretty_name(),
+            LikelihoodSpec::binomial_logit().pretty_name(),
             "Binomial Logit"
         );
         assert_eq!(
-            LikelihoodFamily::GaussianIdentity.pretty_name(),
+            LikelihoodSpec::gaussian_identity().pretty_name(),
             "Gaussian Identity"
         );
     }
@@ -14343,7 +14343,7 @@ mod tests {
             exit_w,
             beta.view(),
             eta_exit.view(),
-            LikelihoodFamily::RoystonParmar,
+            LikelihoodSpec::royston_parmar(),
         )
         .expect("expected survival predict");
 
