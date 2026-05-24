@@ -8212,13 +8212,7 @@ impl SurvivalLocationScaleFamily {
         // HT mask lookup: returns m[i] if mask is Some(m) else 1.0. For
         // f64 multiplication, `x * 1.0 == x` exactly (IEEE 754), so the
         // None path is byte-identical to the pre-refactor expression.
-<<<<<<< Updated upstream
         let mask_at = |i: usize| -> f64 { row_mask.map_or(1.0, |m| m[i]) };
-=======
-        let mask_at = |i: usize| -> f64 {
-            row_mask.map_or(1.0, |m| m[i])
-        };
->>>>>>> Stashed changes
         if n >= Self::EVALUATE_PARALLEL_ROW_THRESHOLD && rayon::current_num_threads() > 1 {
             const CHUNK: usize = 1024;
             let d1_q0_s = d1_q0
@@ -8396,8 +8390,6 @@ impl SurvivalLocationScaleFamily {
 
         Ok((ll, block_gradients))
     }
-<<<<<<< Updated upstream
-=======
 
     /// `_from_parts` variant of
     /// [`<Self as CustomFamily>::exact_newton_joint_hessiansecond_directional_derivative`]
@@ -9119,7 +9111,6 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
             ),
         ))
     }
->>>>>>> Stashed changes
 }
 
 /// Observed vs expected information: The survival location-scale family uses
