@@ -71,6 +71,7 @@ from ._binding import RustExtensionUnavailableError
 from ._compare import compare_models
 from ._penalties import (
     ARDPenalty,
+    AnalyticPenaltyKind,
     AuxConditionalPriorPenalty,
     BlockOrthogonalityPenalty,
     BlockSparsityPenalty,
@@ -92,6 +93,8 @@ from ._penalties import (
     TopKActivationPenalty,
     TotalVariationPenalty,
 )
+from . import identifiability
+from .identifiability import conditional_prior_ivae, mechanism_sparsity_jacobian
 from .topology import (
     Circle,
     Cylinder,
@@ -260,6 +263,7 @@ __all__ = [
     "TorusManifold",
     "BasisSpec",
     "ARDPenalty",
+    "AnalyticPenaltyKind",
     "AuxConditionalPriorPenalty",
     "BlockOrthogonalityPenalty",
     "BlockSparsityPenalty",
@@ -293,6 +297,7 @@ __all__ = [
     "closure",
     "clr",
     "compare_models",
+    "conditional_prior_ivae",
     "competing_risks_cif",
     "cross_fit_shared_precision_groups",
     "cuda_diagnostics",
@@ -343,9 +348,11 @@ __all__ = [
     "gumbel_geometric_schedule",
     "gumbel_linear_schedule",
     "gumbel_reciprocal_iter_schedule",
+    "identifiability",
     "load",
     "load_posterior",
     "loads",
+    "mechanism_sparsity_jacobian",
     "periodic_spline_curve_basis",
     "sphere_basis",
     "simplex_frechet_mean",
