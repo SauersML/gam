@@ -61,6 +61,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 from operator import index
 from typing import Any, Literal, TypeAlias
 
@@ -70,6 +71,7 @@ from ._penalties_manifest import PENALTY_MANIFEST
 
 __all__ = [
     "PENALTY_MANIFEST",
+    "AnalyticPenaltyKind",
     "IsometryPenalty",
     "SparsityPenalty",
     "ScadMcpPenalty",
@@ -91,6 +93,29 @@ __all__ = [
     "ScalarWeightSchedule",
     "Penalty",
 ]
+
+
+class AnalyticPenaltyKind(str, Enum):
+    """Stable Python names for Rust analytic penalty descriptor kinds."""
+
+    ISOMETRY = "isometry"
+    SPARSITY = "sparsity"
+    SOFTMAX_ASSIGNMENT_SPARSITY = "softmax_assignment_sparsity"
+    IBP_ASSIGNMENT = "ibp_assignment"
+    ARD = "ard"
+    TOPK_ACTIVATION = "topk_activation"
+    JUMPRELU = "jumprelu"
+    TOTAL_VARIATION = "total_variation"
+    NUCLEAR_NORM = "nuclear_norm"
+    BLOCK_SPARSITY = "block_sparsity"
+    MECHANISM_SPARSITY = "mechanism_sparsity"
+    NESTED_PREFIX = "nested_prefix"
+    ROW_PRECISION_PRIOR = "row_precision_prior"
+    IVAE_RIDGE_MEAN_GAUGE = "ivae_ridge_mean_gauge"
+    PARAMETRIC_ROW_PRECISION_PRIOR = "parametric_row_precision_prior"
+    SCAD_MCP = "scad_mcp"
+    BLOCK_ORTHOGONALITY = "block_orthogonality"
+    ORTHOGONALITY = "orthogonality"
 
 
 # Weight specification: either "auto" (REML-selected) or a positive float

@@ -10850,11 +10850,8 @@ mod ift_warm_start_tests {
     }
 }
 
-#[cfg(test)]
 mod tests_diagnostics {
-    //! Test-only inherent-method extensions on `RemlState`. Kept in a child
-    //! `mod tests_diagnostics` (not `#[cfg(test)]` on the methods themselves)
-    //! so the production type carries no test-gated inherent methods.
+    //! Diagnostic inherent-method extensions on `RemlState`.
     use super::*;
 
     impl<'a> RemlState<'a> {
