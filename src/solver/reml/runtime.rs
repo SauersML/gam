@@ -5654,11 +5654,9 @@ impl<'a> RemlState<'a> {
         let mut det1 = Array1::<f64>::zeros(rho.len());
         let mut penalty_rank = 0usize;
         for block in blocks {
-            let lambda_k = rho[block.term_index].exp();
-
             // L(λ_k S_k) = Σ_{positive} log(λ_k σ_i).
             for &eig in block.positive_eigenvalues.iter() {
-                logdet += (lambda_k * eig).ln();
+                logdet += rho[block.term_index] + eig.ln();
             }
 
             penalty_rank += block.positive_eigenvalues.len();
