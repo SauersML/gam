@@ -19,7 +19,6 @@ use ndarray::Array2;
 
 fn build_symmetric_data(n_pairs: usize) -> gam::data::EncodedDataset {
     let f = |t: f64| (2.0 * std::f64::consts::PI * t).cos();
-    let headers: Vec<String> = vec!["x".into(), "y".into()];
     let mut rows: Vec<StringRecord> = Vec::with_capacity(2 * n_pairs);
     for i in 0..n_pairs {
         let d = 0.001 + 0.498 * i as f64 / (n_pairs as f64 - 1.0);
