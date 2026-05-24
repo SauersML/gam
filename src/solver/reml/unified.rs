@@ -503,6 +503,11 @@ pub trait HessianOperator: Send + Sync {
         while start < n {
             let end = (start + block).min(n);
             let rows = x.try_row_chunk(start..end).unwrap_or_else(|err| {
+                // SAFETY: `try_row_chunk` only fails on operator implementation
+                // bugs — the `start..end` range is constructed from
+                // `0..n = 0..x.nrows()` with `end = (start+block).min(n)`,
+                // so it is always a valid sub-range of `x`. A failure here
+                // means the operator violated its row-chunk contract.
                 panic!("xt_logdet_kernel_x_diagonal: row chunk failed: {err}")
             });
             let chunk_t = rows.t().to_owned();
@@ -2320,6 +2325,15 @@ impl ProjectedFactorCache {
                             marker
                                 .waiter_count
                                 .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                            // SAFETY: a waiting consumer observed that the
+                            // producer thread for this projected-factor cache
+                            // slot panicked (state transitioned to `Failed`
+                            // via the producer's drop guard). Propagating the
+                            // panic to all waiters is the only correct
+                            // recovery — silently returning a stale or
+                            // half-initialized factor would corrupt every
+                            // downstream REML/PIRLS computation that depends
+                            // on it.
                             panic!("projected factor cache producer panicked")
                         }
                         None => {
@@ -3389,6 +3403,12 @@ impl ImplicitHyperOperator {
             let rows = self
                 .x_design
                 .try_row_chunk(start..end)
+                // SAFETY: `try_row_chunk` only fails on operator
+                // implementation bugs — `start..end` is built from
+                // `0..n_obs = 0..x_design.nrows()` with
+                // `end = (start+chunk_rows).min(n_obs)`, so the range is
+                // always a valid sub-range of `x_design`. Failure means the
+                // operator broke its row-chunk contract.
                 .unwrap_or_else(|err| {
                     panic!("ImplicitHyperOperator::compute_xf row chunk failed: {err}")
                 });
@@ -3916,6 +3936,11 @@ impl PenaltyCoordinate {
             } => root.dot(&beta.slice(ndarray::s![*start..*end])),
             Self::KroneckerMarginal { .. } => {
                 // No single root for Kronecker — use apply_penalty instead.
+                // SAFETY: `has_root()` returns `false` for the
+                // KroneckerMarginal variant (see the `matches!` block
+                // above); callers of `apply_root` are required to gate on
+                // `has_root()`, so reaching this arm means a caller
+                // invoked the rooted-only API on a rootless variant.
                 panic!(
                     "apply_root not supported for KroneckerMarginal; use apply_penalty directly"
                 );
@@ -3992,7 +4017,8 @@ impl PenaltyCoordinate {
                         out_block,
                     );
                 }
-                _ => unreachable!(),
+                // Outer arm guarantees only the four root-bearing variants reach here.
+                Self::KroneckerMarginal { .. } => {}
             },
             Self::KroneckerMarginal {
                 eigenvalues,
@@ -4547,6 +4573,10 @@ impl PenaltySubspaceTrace {
         while start < n {
             let end = (start + block).min(n);
             let rows = x.try_row_chunk(start..end).unwrap_or_else(|err| {
+                // SAFETY: `start..end` is constructed from
+                // `0..n = 0..x.nrows()` with `end = (start+block).min(n)`,
+                // so it is always a valid sub-range of `x`. Failure means
+                // the operator broke its row-chunk contract.
                 panic!("xt_projected_kernel_x_diagonal: row chunk failed: {err}")
             });
             // Z_chunk = rows · U_S  ((end-start) × r).
@@ -13096,6 +13126,11 @@ impl HessianOperator for DenseSpectralOperator {
         while start < n {
             let end = (start + chunk_rows).min(n);
             let rows = x.try_row_chunk(start..end).unwrap_or_else(|err| {
+                // SAFETY: `try_row_chunk` only fails on operator implementation
+                // bugs — the `start..end` range is constructed from
+                // `0..n = 0..x.nrows()` with `end = (start+block).min(n)`,
+                // so it is always a valid sub-range of `x`. A failure here
+                // means the operator violated its row-chunk contract.
                 panic!("xt_logdet_kernel_x_diagonal: row chunk failed: {err}")
             });
             let xg = crate::faer_ndarray::fast_ab(&rows, &self.g_factor);

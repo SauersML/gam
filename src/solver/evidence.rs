@@ -597,13 +597,11 @@ pub fn ift_du_dbeta(cache: &ArrowFactorCache) -> Array2<f64> {
         for col in 0..k {
             beta_basis.fill(0.0);
             beta_basis[col] = 1.0;
-            // SAFETY: this Tier-2 IFT sensitivity is the dense `du/dβ`
-            // assembler that the joint-evidence path constructs only when
-            // the family promised cached `H_tβ` row products via its
-            // capability surface; reaching `false` here means a family
-            // declared the cache available but failed to populate it,
-            // which is a contract violation.
+            // The Tier-2 IFT assembler is built only when the family's
+            // capability surface promises cached `H_tβ` row products.
             if !cache.apply_htbeta_row(i, beta_basis.view(), &mut rhs) {
+                // SAFETY: reaching `false` means a family declared the cache
+                // available but failed to populate it — contract violation.
                 panic!("IFT du/dbeta requires cached H_tβ row products");
             }
             let y = chol_lower_solve_vector(factor, &rhs);

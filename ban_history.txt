@@ -27,8 +27,6 @@ src/families/survival_marginal_slope.rs	fn validate_spec(spec: &SurvivalMarginal
 src/families/survival_marginal_slope.rs	pub fn fit_survival_marginal_slope_terms( data: ArrayView2<'_, f64>, spec: SurvivalMarginalSlopeTermSpec, options: &BlockwiseFitOptions, kappa_options: &SpatialLengthScaleOptimizationOptions, ) -> Result<SurvivalMarginalSlopeFitResult, String>	unreachable!
 src/families/transformation_normal.rs	fn build_transformation_row_derived( h: &Array1<f64>, h_prime: &Array1<f64>, h_lower: &Array1<f64>, h_upper: &Array1<f64>, weights: &Array1<f64>, ) -> Result<TransformationNormalRowDerived, String>	unreachable!
 src/families/transformation_normal.rs	fn factorial(n: usize) -> f64	unreachable!
-src/inference/formula_dsl.rs	fn validate_balanced_delimiters(input: &str, prefix: &str) -> Result<(), String>	unreachable!
-src/inference/quadrature.rs	fn gauss_hermite_n(&self, n: usize) -> &GaussHermiteRuleDynamic	unreachable!
 src/linalg/matrix.rs	pub fn add_upper(&mut self, r: usize, c: usize, val: f64)	unreachable!
 src/linalg/matrix.rs	pub fn crossdiag_axpy_row_into( &self, row: usize, other: &DesignMatrix, alpha: f64, out: &mut ArrayViewMut1<'_, f64>, ) -> Result<(), String>	unreachable!
 src/main.rs	fn collect_spatial_smooth_usagewarnings( spec: &TermCollectionSpec, headers: &[String], label: &str, ) -> Vec<String>	unreachable!
@@ -37,7 +35,6 @@ src/main.rs	fn run_survival(args: SurvivalArgs) -> Result<(), String>	unreachabl
 src/solver/pirls.rs	fn compute_xtwx_blas( workspace: &mut PirlsWorkspace, design: &DesignMatrix, weights: &Array1<f64>, ) -> Result<Array2<f64>, EstimationError>	unreachable!
 src/solver/pirls.rs	fn default_beta_guess_external( p: usize, link_function: LinkFunction, y: ArrayView1<f64>, priorweights: ArrayView1<f64>, mixture_link_state: Option<&MixtureLinkState>, sas_link_state: Option<&SasLinkState>, ) -> Array1<f64>	unreachable!
 src/solver/pirls.rs	fn solve_penalized_least_squares_implicit( x_original: &DesignMatrix, transform: Option<&WorkingReparamTransform>, z: ArrayView1<f64>, weights: ArrayView1<f64>, offset: ArrayView1<f64>, penalty: &PirlsPenalty, workspace: &mut PirlsWorkspace, y: ArrayView1<f64>, link_function: LinkFunction, gaussian_fixed_cache: Option<&GaussianFixedCache>, ) -> Result<(StablePLSResult, usize), EstimationError>	unreachable!
-src/solver/reml/unified.rs	pub fn scaled_add_penalty_view( &self, beta: ArrayView1<'_, f64>, scale: f64, mut out: ArrayViewMut1<'_, f64>, )	unreachable!
 src/solver/workflow.rs	fn materialize_survival<'a>( parsed: &ParsedFormula, data: &'a Dataset, col_map: &HashMap<String, usize>, config: &FitConfig, entry_col: &str, exit_col: &str, event_col: &str, ) -> Result<MaterializedModel<'a>, String>	unreachable!
 src/terms/basis.rs	fn isotropic_radial_laplacian_power_from_q0( q: usize, d: usize, m: usize, s: usize, kappa: f64, big_r: f64, ) -> f64	unreachable!
 src/terms/basis.rs	fn matern_collocation_operator_matrices_should_match_closed_forms_in_1d()	unreachable!
