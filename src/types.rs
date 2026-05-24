@@ -272,6 +272,114 @@ impl LikelihoodSpec {
     }
 
     #[inline]
+    pub const fn gaussian_identity() -> Self {
+        Self::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(LinkFunction::Identity),
+        )
+    }
+
+    #[inline]
+    pub const fn binomial_logit() -> Self {
+        Self::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        )
+    }
+
+    #[inline]
+    pub const fn binomial_probit() -> Self {
+        Self::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Probit),
+        )
+    }
+
+    #[inline]
+    pub const fn binomial_cloglog() -> Self {
+        Self::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::CLogLog),
+        )
+    }
+
+    #[inline]
+    pub const fn binomial_latent_cloglog(state: LatentCLogLogState) -> Self {
+        Self::new(
+            ResponseFamily::Binomial,
+            InverseLink::LatentCLogLog(state),
+        )
+    }
+
+    #[inline]
+    pub const fn binomial_sas(state: SasLinkState) -> Self {
+        Self::new(ResponseFamily::Binomial, InverseLink::Sas(state))
+    }
+
+    #[inline]
+    pub const fn binomial_beta_logistic(state: SasLinkState) -> Self {
+        Self::new(ResponseFamily::Binomial, InverseLink::BetaLogistic(state))
+    }
+
+    #[inline]
+    pub fn binomial_mixture(state: MixtureLinkState) -> Self {
+        Self::new(ResponseFamily::Binomial, InverseLink::Mixture(state))
+    }
+
+    #[inline]
+    pub const fn binomial_link(link: LinkFunction) -> Self {
+        Self::new(ResponseFamily::Binomial, InverseLink::Standard(link))
+    }
+
+    #[inline]
+    pub const fn poisson_log() -> Self {
+        Self::new(
+            ResponseFamily::Poisson,
+            InverseLink::Standard(LinkFunction::Log),
+        )
+    }
+
+    #[inline]
+    pub const fn tweedie_log(p: f64) -> Self {
+        Self::new(
+            ResponseFamily::Tweedie { p },
+            InverseLink::Standard(LinkFunction::Log),
+        )
+    }
+
+    #[inline]
+    pub const fn negative_binomial_log(theta: f64) -> Self {
+        Self::new(
+            ResponseFamily::NegativeBinomial { theta },
+            InverseLink::Standard(LinkFunction::Log),
+        )
+    }
+
+    #[inline]
+    pub const fn beta_logit(phi: f64) -> Self {
+        Self::new(
+            ResponseFamily::Beta { phi },
+            InverseLink::Standard(LinkFunction::Logit),
+        )
+    }
+
+    #[inline]
+    pub const fn gamma_log() -> Self {
+        Self::new(
+            ResponseFamily::Gamma,
+            InverseLink::Standard(LinkFunction::Log),
+        )
+    }
+
+    #[inline]
+    pub const fn royston_parmar() -> Self {
+        Self::new(
+            ResponseFamily::RoystonParmar,
+            InverseLink::Standard(LinkFunction::Identity),
+        )
+    }
+
+    #[inline]
     pub const fn link_function(&self) -> LinkFunction {
         self.link.link_function()
     }
@@ -495,6 +603,61 @@ impl GlmFamily {
     }
 }
 
+impl From<GlmFamily> for LikelihoodSpec {
+    fn from(value: GlmFamily) -> Self {
+        match value {
+            GlmFamily::GaussianIdentity => Self::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
+            GlmFamily::BinomialLogit => Self::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Logit),
+            ),
+            GlmFamily::BinomialProbit => Self::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Probit),
+            ),
+            GlmFamily::BinomialCLogLog => Self::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::CLogLog),
+            ),
+            GlmFamily::BinomialSas => Self::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Sas),
+            ),
+            GlmFamily::BinomialBetaLogistic => Self::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::BetaLogistic),
+            ),
+            GlmFamily::BinomialMixture => Self::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(LinkFunction::Logit),
+            ),
+            GlmFamily::PoissonLog => Self::new(
+                ResponseFamily::Poisson,
+                InverseLink::Standard(LinkFunction::Log),
+            ),
+            GlmFamily::Tweedie { p } => Self::new(
+                ResponseFamily::Tweedie { p },
+                InverseLink::Standard(LinkFunction::Log),
+            ),
+            GlmFamily::NegativeBinomial { theta } => Self::new(
+                ResponseFamily::NegativeBinomial { theta },
+                InverseLink::Standard(LinkFunction::Log),
+            ),
+            GlmFamily::BetaLogit { phi } => Self::new(
+                ResponseFamily::Beta { phi },
+                InverseLink::Standard(LinkFunction::Logit),
+            ),
+            GlmFamily::GammaLog => Self::new(
+                ResponseFamily::Gamma,
+                InverseLink::Standard(LinkFunction::Log),
+            ),
+        }
+    }
+}
+
 /// How a likelihood's scale parameter is handled by the fit/result contract.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum LikelihoodScaleMetadata {
@@ -563,7 +726,8 @@ impl GlmLikelihoodSpec {
     /// Build a `GlmLikelihoodSpec` from a `LikelihoodSpec`, deriving the
     /// canonical default scale metadata for the response family.
     #[inline]
-    pub fn canonical(spec: LikelihoodSpec) -> Self {
+    pub fn canonical(spec: impl Into<LikelihoodSpec>) -> Self {
+        let spec = spec.into();
         let scale = spec.default_scale_metadata();
         Self { spec, scale }
     }
