@@ -40,7 +40,7 @@ warnings = "deny"
 
 [features]
 default = []
-cuda = []
+cuda = ["dep:cudarc"]
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
@@ -69,7 +69,7 @@ arrow = { version = "54", default-features = false, features = ["ffi"] }
 parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
 wide = "0.7"
 smallvec = "1"
-libloading = "0.8"
+cudarc = { version = "0.19.6", optional = true, default-features = false, features = ["std", "driver", "runtime", "cublas", "cublaslt", "nvrtc", "fallback-dynamic-loading", "cuda-12080"] }
 
 [dependencies.general-mcmc]
 package = "general-mcmc"
