@@ -5779,7 +5779,7 @@ impl<'a> RemlState<'a> {
                     &(&firth_op.w2 * &firth_op.h_diag),
                     &mut weighted_xtdx,
                 );
-                let bpb = fast_ab(&firth_op.b_base.t().to_owned(), &firth_op.p_b_base);
+                let bpb = fast_atb(&firth_op.b_base, &firth_op.p_b_base);
                 let mut hphi = 0.5 * (diag_term - bpb);
                 // Numerical symmetry guard.
                 enforce_symmetry(&mut hphi);

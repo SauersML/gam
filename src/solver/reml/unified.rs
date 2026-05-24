@@ -4589,7 +4589,7 @@ impl PenaltySubspaceTrace {
                 panic!("xt_projected_kernel_x_diagonal: row chunk failed: {err}")
             });
             // Z_chunk = rows · U_S  ((end-start) × r).
-            let z_chunk = crate::faer_ndarray::fast_ab(&rows.to_owned(), &self.u_s);
+            let z_chunk = crate::faer_ndarray::fast_ab(&rows, &self.u_s);
             // h_i = Σ_{a,b} Z_{ia} (H_proj⁻¹)_{ab} Z_{ib}.
             for i in 0..(end - start) {
                 let row_z = z_chunk.row(i);
@@ -6092,8 +6092,7 @@ fn assemble_h_raw_dense(op: &DenseSpectralOperator) -> Array2<f64> {
     // Avoid the explicit transpose copy by going through `fast_abt`
     // when available; otherwise an explicit transpose is acceptable
     // because the cost is O(p²) vs the O(p³) matmul.
-    let vt = op.eigenvectors.t().to_owned();
-    crate::faer_ndarray::fast_ab(&vs, &vt)
+    crate::faer_ndarray::fast_abt(&vs, &op.eigenvectors)
 }
 
 /// Tangent-projected `HessianOperator` adapter. Wraps an `m × m`
