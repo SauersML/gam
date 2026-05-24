@@ -9,8 +9,8 @@ use gam::inference::model::{
 };
 use gam::pirls::PirlsStatus;
 use gam::types::{
-    InverseLink, LatentCLogLogState, LikelihoodFamily, LikelihoodScaleMetadata, LinkFunction,
-    LogLikelihoodNormalization, SasLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction,
+    LogLikelihoodNormalization, ResponseFamily, SasLinkState,
 };
 use ndarray::{Array1, Array2};
 use serde_json::Value;
@@ -88,7 +88,10 @@ fn minimal_fit_result(fitted_link: FittedLinkState) -> UnifiedFitResult {
         }],
         log_lambdas: Array1::zeros(0),
         lambdas: Array1::zeros(0),
-        likelihood_family: Some(LikelihoodFamily::GaussianIdentity),
+        likelihood_family: Some(LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(LinkFunction::Identity),
+        )),
         likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
         log_likelihood_normalization: LogLikelihoodNormalization::Full,
         log_likelihood: 0.0,
@@ -138,7 +141,10 @@ fn minimal_survival_fit_result() -> UnifiedFitResult {
         ],
         log_lambdas: Array1::zeros(0),
         lambdas: Array1::zeros(0),
-        likelihood_family: Some(LikelihoodFamily::RoystonParmar),
+        likelihood_family: Some(LikelihoodSpec::new(
+            ResponseFamily::RoystonParmar,
+            InverseLink::Standard(LinkFunction::Identity),
+        )),
         likelihood_scale: LikelihoodScaleMetadata::Unspecified,
         log_likelihood_normalization: LogLikelihoodNormalization::Full,
         log_likelihood: 0.0,
@@ -178,7 +184,10 @@ fn minimal_standard_model_with_group_metadata(
         "y ~ group(g)".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
-            likelihood: LikelihoodFamily::GaussianIdentity,
+            likelihood: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             link: Some(LinkFunction::Identity),
             latent_cloglog_state: None,
             mixture_state: None,
@@ -258,7 +267,7 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
         "y ~ x".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
-            likelihood: LikelihoodFamily::BinomialSas,
+            likelihood: LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(sas_state)),
             link: Some(LinkFunction::Sas),
             latent_cloglog_state: None,
             mixture_state: None,
@@ -295,8 +304,13 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
     assert_saved_model_schema_is_pinned(&saved);
     let family_state = standard_family_state(&saved);
     assert_eq!(
-        family_state.get("likelihood").and_then(Value::as_str),
-        Some("BinomialSas")
+        family_state.get("likelihood"),
+        Some(&serde_json::json!({
+            "response": "Binomial",
+            "link": {
+                "Sas": sas_state
+            }
+        }))
     );
     assert_eq!(
         family_state.get("link").and_then(Value::as_str),
@@ -349,7 +363,10 @@ fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
         "y ~ x".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
-            likelihood: LikelihoodFamily::BinomialLatentCLogLog,
+            likelihood: LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::LatentCLogLog(latent_state),
+            ),
             link: Some(LinkFunction::CLogLog),
             latent_cloglog_state: None,
             mixture_state: None,
@@ -392,8 +409,13 @@ fn save_and_load_syncs_standard_latent_cloglog_state_from_fit_result() {
     assert_saved_model_schema_is_pinned(&saved);
     let family_state = standard_family_state(&saved);
     assert_eq!(
-        family_state.get("likelihood").and_then(Value::as_str),
-        Some("BinomialLatentCLogLog")
+        family_state.get("likelihood"),
+        Some(&serde_json::json!({
+            "response": "Binomial",
+            "link": {
+                "LatentCLogLog": latent_state
+            }
+        }))
     );
     assert_eq!(
         family_state.get("link").and_then(Value::as_str),
@@ -447,7 +469,10 @@ fn survival_marginal_slope_saved_models_require_special_predict_handling() {
         "Surv(t0, t1, event) ~ s(x)".to_string(),
         ModelKind::Survival,
         FittedFamily::Survival {
-            likelihood: LikelihoodFamily::RoystonParmar,
+            likelihood: LikelihoodSpec::new(
+                ResponseFamily::RoystonParmar,
+                InverseLink::Standard(LinkFunction::Identity),
+            ),
             survival_likelihood: Some("marginal-slope".to_string()),
             survival_distribution: Some(ResidualDistribution::Gaussian),
             frailty: FrailtySpec::None,
