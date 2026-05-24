@@ -124,6 +124,7 @@ nav:
     - Response geometry: response-geometry.md
   - Using a fitted model:
     - Predictions: predictions.md
+  - Difference smooths: difference-smooths.md
     - Posterior sampling: posterior-sampling.md
     - Diagnostics, summaries, reports: diagnostics.md
     - scikit-learn integration: sklearn.md

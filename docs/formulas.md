@@ -410,4 +410,6 @@ Pair it with `survival_likelihood=` on `fit()`. See
 "y ~ smooth(x) + group(site)"
 ```
 
-See also: [Difference smooths](difference-smooths.md) for `by=` smooths, `bs="sz"`, and covariance-aware group contrasts.
+## Difference smooths
+
+For group-specific trajectories and pairwise smooth contrasts, see [Difference smooths](difference-smooths.md). That guide covers `s(x, by=group)`, numeric binary by-smooths, and `s(group, x, bs=sz)`.
