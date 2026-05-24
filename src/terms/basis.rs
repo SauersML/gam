@@ -2047,407 +2047,27 @@ pub struct BSplineBasisSpec {
     pub knotspec: BSplineKnotSpec,
     pub double_penalty: bool,
     pub identifiability: BSplineIdentifiability,
-    /// Optional endpoint constraints for 1D B-spline smooths.
+    #[serde(default)]
+    pub boundary_condition: BSplineBoundaryCondition,
+}
+
+/// Boundary condition used by 1D B-spline-like bases.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BSplineBoundaryCondition {
+    /// Ordinary open/clamped P-spline basis.
+    Open,
+    /// Fully cyclic margin with the supplied period and coordinate origin.
     ///
-    /// `Clamped` enforces zero first derivative at the selected endpoint.
-    /// `Anchored { value: 0.0 }` enforces a zero endpoint value and can be
-    /// combined independently on the left and right sides. Non-zero anchors are
-    /// parsed and validated, but fitting them requires an affine term offset and
-    /// is rejected by the builder for now rather than silently ignored.
-    #[serde(default)]
-    pub boundary_conditions: BSplineBoundaryConditions,
+    /// Periodic margins are represented by a finite Fourier basis with a
+    /// diagonal derivative penalty. This gives exact value/derivative wrapping
+    /// under x -> origin + (x-origin) mod period and composes directly in
+    /// tensor-product smooths.
+    Periodic { period: f64, origin: f64 },
 }
 
-/// Per-endpoint boundary condition for 1D B-spline smooths.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum BSplineEndpointBoundaryCondition {
-    /// No endpoint condition.
-    #[default]
-    Free,
-    /// Force the first derivative to be zero at the endpoint.
-    Clamped,
-    /// Force both the smooth value AND the first derivative to be zero at
-    /// the endpoint (Hermite-style C¹ pin). The value-only pin was added
-    /// originally but proved numerically unstable when training data was
-    /// sparse near the endpoint: the basis was free to swing arbitrarily
-    /// between the pinned point and the nearest data point since only
-    /// curvature was penalized. Co-pinning the slope removes exactly that
-    /// swing direction. Currently only `value == 0` is supported by the
-    /// homogeneous coefficient reparameterization.
-    Anchored { value: f64 },
-}
-
-/// Boundary-condition policy for the left and right ends of a 1D B-spline.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
-pub struct BSplineBoundaryConditions {
-    #[serde(default)]
-    pub left: BSplineEndpointBoundaryCondition,
-    #[serde(default)]
-    pub right: BSplineEndpointBoundaryCondition,
-}
-
-impl BSplineBoundaryConditions {
-    pub fn is_free(self) -> bool {
-        matches!(self.left, BSplineEndpointBoundaryCondition::Free)
-            && matches!(self.right, BSplineEndpointBoundaryCondition::Free)
-    }
-}
-
-/// Configuration for fitting/evaluating a one-dimensional periodic spline curve
-/// `u -> R^d` with a shared cyclic basis and one coefficient vector per ambient
-/// output dimension.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeriodicSplineCurveSpec {
-    pub degree: usize,
-    pub num_basis: usize,
-    pub period: f64,
-    pub origin: f64,
-    pub penalty_order: usize,
-}
-
-impl PeriodicSplineCurveSpec {
-    pub fn new(
-        degree: usize,
-        num_basis: usize,
-        period: f64,
-        origin: f64,
-        penalty_order: usize,
-    ) -> Result<Self, BasisError> {
-        validate_periodic_spline_config(degree, num_basis, period)?;
-        Ok(Self {
-            degree,
-            num_basis,
-            period,
-            origin,
-            penalty_order,
-        })
-    }
-}
-
-fn validate_periodic_spline_config(
-    degree: usize,
-    num_basis: usize,
-    period: f64,
-) -> Result<(), BasisError> {
-    if degree < 1 {
-        return Err(BasisError::InvalidDegree(degree));
-    }
-    if num_basis < degree + 1 {
-        return Err(BasisError::InvalidInput(format!(
-            "periodic B-spline requires num_basis >= degree + 1; got num_basis={num_basis}, degree={degree}"
-        )));
-    }
-    if !period.is_finite() || period <= 0.0 {
-        return Err(BasisError::InvalidInput(format!(
-            "periodic B-spline period must be positive and finite; got {period}"
-        )));
-    }
-    Ok(())
-}
-
-fn factorial_f64(n: usize) -> f64 {
-    (2..=n).fold(1.0, |acc, v| acc * v as f64)
-}
-
-#[inline]
-fn positive_part_pow(x: f64, p: usize) -> f64 {
-    if x <= 0.0 { 0.0 } else { x.powi(p as i32) }
-}
-
-fn cardinal_bspline_value(x: f64, degree: usize) -> f64 {
-    if degree == 0 {
-        return if (0.0..1.0).contains(&x) { 1.0 } else { 0.0 };
-    }
-    if x <= 0.0 || x >= (degree + 1) as f64 {
-        return 0.0;
-    }
-    let mut acc = 0.0;
-    for i in 0..=(degree + 1) {
-        let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
-        acc += sign * binomial_f64(degree + 1, i) * positive_part_pow(x - i as f64, degree);
-    }
-    (acc / factorial_f64(degree)).max(0.0)
-}
-
-fn cardinal_bspline_derivative_value(x: f64, degree: usize) -> f64 {
-    if degree == 0 {
-        return 0.0;
-    }
-    cardinal_bspline_value(x, degree - 1) - cardinal_bspline_value(x - 1.0, degree - 1)
-}
-
-/// Evaluate a uniform cyclic B-spline design matrix on a one-dimensional
-/// periodic coordinate.
-///
-/// Rows are periodic with `period = data_range.1 - data_range.0`: `x` and
-/// `x + m * period` produce bitwise-identical row stencils up to floating-point
-/// arithmetic. Columns are cyclic control sites, so arbitrary anisotropic
-/// stretching geometry is represented by using multiple output coefficient
-/// columns with this same design.
-pub fn create_periodic_bspline_basis_dense(
-    data: ArrayView1<'_, f64>,
-    data_range: (f64, f64),
-    degree: usize,
-    num_basis: usize,
-) -> Result<Array2<f64>, BasisError> {
-    let period = data_range.1 - data_range.0;
-    validate_periodic_spline_config(degree, num_basis, period)?;
-    if !data_range.0.is_finite() || !data_range.1.is_finite() || data_range.0 >= data_range.1 {
-        return Err(BasisError::InvalidRange(data_range.0, data_range.1));
-    }
-    let h = period / num_basis as f64;
-    let mut basis = Array2::<f64>::zeros((data.len(), num_basis));
-    let nb_isize = num_basis as isize;
-    let nb_f = num_basis as f64;
-    let origin = data_range.0;
-    let inv_h = 1.0 / h;
-    // Parallelize across row chunks. Each row touches exactly `degree + 1`
-    // columns wrapped mod `num_basis`, so chunks don't conflict on writes.
-    let nan_flag = std::sync::atomic::AtomicBool::new(false);
-    basis
-        .axis_chunks_iter_mut(ndarray::Axis(0), 4096)
-        .into_par_iter()
-        .enumerate()
-        .for_each(|(chunk_idx, mut block)| {
-            let row_offset = chunk_idx * 4096;
-            for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
-                let i = row_offset + local_i;
-                let x = data[i];
-                if !x.is_finite() {
-                    nan_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                    continue;
-                }
-                let tau = ((x - origin) * inv_h).rem_euclid(nb_f);
-                let base = tau.floor() as isize;
-                for local in 0..=degree {
-                    let j_unwrapped = base - degree as isize + local as isize;
-                    let value = cardinal_bspline_value(tau - j_unwrapped as f64, degree);
-                    let j = j_unwrapped.rem_euclid(nb_isize) as usize;
-                    out_row[j] += value;
-                }
-            }
-        });
-    if nan_flag.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(BasisError::InvalidInput(
-            "periodic B-spline data contains non-finite coordinate".to_string(),
-        ));
-    }
-    Ok(basis)
-}
-
-/// Evaluate first derivatives of a uniform cyclic B-spline design with respect
-/// to the original coordinate scale.
-pub fn create_periodic_bspline_derivative_dense(
-    data: ArrayView1<'_, f64>,
-    data_range: (f64, f64),
-    degree: usize,
-    num_basis: usize,
-) -> Result<Array2<f64>, BasisError> {
-    let period = data_range.1 - data_range.0;
-    validate_periodic_spline_config(degree, num_basis, period)?;
-    if !data_range.0.is_finite() || !data_range.1.is_finite() || data_range.0 >= data_range.1 {
-        return Err(BasisError::InvalidRange(data_range.0, data_range.1));
-    }
-    let h = period / num_basis as f64;
-    let inv_h = 1.0 / h;
-    let nb_isize = num_basis as isize;
-    let nb_f = num_basis as f64;
-    let origin = data_range.0;
-    let mut basis = Array2::<f64>::zeros((data.len(), num_basis));
-    let nan_flag = std::sync::atomic::AtomicBool::new(false);
-    basis
-        .axis_chunks_iter_mut(ndarray::Axis(0), 4096)
-        .into_par_iter()
-        .enumerate()
-        .for_each(|(chunk_idx, mut block)| {
-            let row_offset = chunk_idx * 4096;
-            for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
-                let i = row_offset + local_i;
-                let x = data[i];
-                if !x.is_finite() {
-                    nan_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                    continue;
-                }
-                let tau = ((x - origin) * inv_h).rem_euclid(nb_f);
-                let base = tau.floor() as isize;
-                for local in 0..=(degree + 1) {
-                    let j_unwrapped = base - degree as isize + local as isize;
-                    let value =
-                        cardinal_bspline_derivative_value(tau - j_unwrapped as f64, degree) * inv_h;
-                    let j = j_unwrapped.rem_euclid(nb_isize) as usize;
-                    out_row[j] += value;
-                }
-            }
-        });
-    if nan_flag.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err(BasisError::InvalidInput(
-            "periodic B-spline data contains non-finite coordinate".to_string(),
-        ));
-    }
-    Ok(basis)
-}
-
-/// Build a cyclic discrete-difference penalty `D' D` with wrap-around rows.
-pub fn create_cyclic_difference_penalty_matrix(
-    num_basis: usize,
-    order: usize,
-) -> Result<Array2<f64>, BasisError> {
-    if order == 0 {
-        return Ok(Array2::<f64>::eye(num_basis));
-    }
-    if num_basis == 0 || num_basis < order + 1 {
-        return Err(BasisError::InvalidInput(format!(
-            "cyclic difference penalty requires num_basis >= order + 1; got num_basis={num_basis}, order={order}"
-        )));
-    }
-    let mut d = Array2::<f64>::zeros((num_basis, num_basis));
-    for row in 0..num_basis {
-        for j in 0..=order {
-            let sign = if (order - j) % 2 == 0 { 1.0 } else { -1.0 };
-            d[[row, (row + j) % num_basis]] = sign * binomial_f64(order, j);
-        }
-    }
-    Ok(fast_ata(&d))
-}
-
-/// Evaluate a multi-output periodic spline curve from cyclic control points.
-pub fn evaluate_periodic_spline_curve(
-    data: ArrayView1<'_, f64>,
-    control_points: ArrayView2<'_, f64>,
-    spec: &PeriodicSplineCurveSpec,
-) -> Result<Array2<f64>, BasisError> {
-    if control_points.nrows() != spec.num_basis {
-        return Err(BasisError::DimensionMismatch(format!(
-            "periodic curve control point row mismatch: expected {}, got {}",
-            spec.num_basis,
-            control_points.nrows()
-        )));
-    }
-    let basis = create_periodic_bspline_basis_dense(
-        data,
-        (spec.origin, spec.origin + spec.period),
-        spec.degree,
-        spec.num_basis,
-    )?;
-    Ok(fast_ab(&basis, &control_points.to_owned()))
-}
-
-/// Fit a shared 1D periodic spline basis to arbitrary-dimensional ambient
-/// coordinates. Each output dimension is solved simultaneously, so ellipses,
-/// ovals, skewed loops, and distorted closed curves are represented without any
-/// unit-circle assumption.
-pub fn fit_periodic_spline_curve(
-    data: ArrayView1<'_, f64>,
-    points: ArrayView2<'_, f64>,
-    spec: &PeriodicSplineCurveSpec,
-    smoothing_lambda: f64,
-) -> Result<Array2<f64>, BasisError> {
-    if points.nrows() != data.len() {
-        return Err(BasisError::DimensionMismatch(format!(
-            "periodic curve fit row mismatch: u has {}, points have {} rows",
-            data.len(),
-            points.nrows()
-        )));
-    }
-    if !smoothing_lambda.is_finite() || smoothing_lambda < 0.0 {
-        return Err(BasisError::InvalidInput(format!(
-            "smoothing_lambda must be non-negative and finite; got {smoothing_lambda}"
-        )));
-    }
-    let basis = create_periodic_bspline_basis_dense(
-        data,
-        (spec.origin, spec.origin + spec.period),
-        spec.degree,
-        spec.num_basis,
-    )?;
-    let mut normal = fast_ata(&basis);
-    if smoothing_lambda > 0.0 {
-        let penalty = create_cyclic_difference_penalty_matrix(spec.num_basis, spec.penalty_order)?;
-        for i in 0..normal.nrows() {
-            for j in 0..normal.ncols() {
-                normal[[i, j]] += smoothing_lambda * penalty[[i, j]];
-            }
-        }
-    }
-    for i in 0..normal.nrows() {
-        normal[[i, i]] += 1e-12;
-    }
-    let mut control = fast_atb(&basis, &points.to_owned());
-    let factor = StableSolver::new("periodic_spline_curve_normal")
-        .factorize(&normal)
-        .map_err(|_| BasisError::LinalgError(FaerLinalgError::FactorizationFailed))?;
-    let mut control_view = array2_to_matmut(&mut control);
-    factor.solve_in_place(control_view.as_mut());
-    if !control.iter().all(|v| v.is_finite()) {
-        return Err(BasisError::LinalgError(
-            FaerLinalgError::FactorizationFailed,
-        ));
-    }
-    Ok(control)
-}
-
-/// Configuration for a single periodic 1D spline curve
-/// `u -> R^d_ambient`.
-///
-/// The same cyclic B-spline basis is shared by every ambient output column;
-/// only the coefficient matrix is multi-output. This is intentionally more
-/// general than a circular parameterization: any affine or nonlinear stretching
-/// present in the observed ambient coordinates is learned in the output
-/// coefficients, so ellipses, ovals, skewed loops, and higher-dimensional
-/// closed curves all use the same 1D periodic domain geometry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeriodicSplineCurveSpec {
-    /// Polynomial degree of the cyclic B-spline basis (3 = cubic).
-    pub degree: usize,
-    /// Number of periodic basis coefficients around one full cycle.
-    pub num_basis: usize,
-    /// Inclusive start of the period domain.
-    pub period_start: f64,
-    /// Exclusive end of the period domain. Values are wrapped modulo
-    /// `period_end - period_start` before evaluation.
-    pub period_end: f64,
-    /// Cyclic finite-difference penalty order applied to coefficients.
-    pub penalty_order: usize,
-    /// Smoothing weight multiplying the cyclic difference penalty.
-    pub lambda: f64,
-    /// Tiny ridge added to the normal matrix for numerical stability.
-    pub ridge: f64,
-}
-
-impl PeriodicSplineCurveSpec {
-    /// Cubic periodic P-spline defaults for a domain `[period_start, period_end)`.
-    pub fn cubic(num_basis: usize, period_start: f64, period_end: f64) -> Self {
-        Self {
-            degree: 3,
-            num_basis,
-            period_start,
-            period_end,
-            penalty_order: 2,
-            lambda: 1e-8,
-            ridge: 1e-10,
-        }
-    }
-}
-
-/// Fitted multi-output periodic spline curve.
-///
-/// `coefficients` has shape `(num_basis, ambient_dim)`. Evaluating the curve
-/// multiplies the cyclic 1D basis row by this full matrix, preserving arbitrary
-/// anisotropic stretching and skew in ambient space instead of projecting to a
-/// unit circle.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PeriodicSplineCurve {
-    pub spec: PeriodicSplineCurveSpec,
-    pub coefficients: Array2<f64>,
-}
-
-impl PeriodicSplineCurve {
-    pub fn ambient_dim(&self) -> usize {
-        self.coefficients.ncols()
-    }
-
-    pub fn evaluate(&self, u: ArrayView1<'_, f64>) -> Result<Array2<f64>, BasisError> {
-        evaluate_periodic_spline_curve(u, self)
+impl Default for BSplineBoundaryCondition {
+    fn default() -> Self {
+        Self::Open
     }
 }
 
@@ -7479,45 +7099,78 @@ pub fn select_centers_by_strategy(
     }
 }
 
-#[inline]
-fn wrap_to_period(x: f64, left: f64, period: f64) -> f64 {
-    left + (x - left).rem_euclid(period)
-}
-
-fn periodic_bspline_metadata_knots(
-    domain_start: f64,
-    period: f64,
-    num_basis: usize,
-) -> Array1<f64> {
-    Array1::from_vec(
-        (0..=num_basis)
-            .map(|i| domain_start + period * i as f64 / num_basis as f64)
-            .collect(),
-    )
-}
-
-fn build_periodic_bspline_basis_1d(
+fn build_periodic_fourier_basis_1d(
     data: ArrayView1<'_, f64>,
-    domain_start: f64,
-    period: f64,
-    num_basis: usize,
     spec: &BSplineBasisSpec,
+    period: f64,
+    origin: f64,
 ) -> Result<BasisBuildResult, BasisError> {
-    if !spec.boundary_conditions.is_free() {
+    if !period.is_finite() || period <= 0.0 || !origin.is_finite() {
+        return Err(BasisError::InvalidInput(format!(
+            "periodic B-spline margin requires finite origin and positive period, got origin={origin}, period={period}"
+        )));
+    }
+    let q = match &spec.knotspec {
+        BSplineKnotSpec::Generate {
+            num_internal_knots, ..
+        } => num_internal_knots + spec.degree + 1,
+        BSplineKnotSpec::Automatic {
+            num_internal_knots, ..
+        } => {
+            num_internal_knots
+                .unwrap_or_else(|| default_internal_knot_count_for_data(data.len(), spec.degree))
+                + spec.degree
+                + 1
+        }
+        BSplineKnotSpec::Provided(knots) => knots.len().saturating_sub(spec.degree + 1),
+    };
+    if q < 3 {
         return Err(BasisError::InvalidInput(
-            "periodic B-splines cannot also declare endpoint boundary conditions".to_string(),
+            "periodic margin requires at least three basis coefficients".to_string(),
         ));
     }
-    let knots = periodic_bspline_metadata_knots(domain_start, period, num_basis);
-    let design_raw = create_periodic_bspline_basis_dense(
-        data,
-        (domain_start, domain_start + period),
-        spec.degree,
-        num_basis,
-    )?;
-    let s_bend_raw = create_cyclic_difference_penalty_matrix(num_basis, spec.penalty_order)?;
+
+    let n = data.len();
+    let mut design = Array2::<f64>::zeros((n, q));
+    for (i, &x) in data.iter().enumerate() {
+        if !x.is_finite() {
+            return Err(BasisError::InvalidInput(
+                "periodic margin contains non-finite data".to_string(),
+            ));
+        }
+        let u = (x - origin).rem_euclid(period) / period;
+        design[[i, 0]] = 1.0;
+        let mut col = 1usize;
+        let mut harmonic = 1usize;
+        while col < q {
+            let angle = std::f64::consts::TAU * (harmonic as f64) * u;
+            design[[i, col]] = angle.sin();
+            col += 1;
+            if col < q {
+                design[[i, col]] = angle.cos();
+                col += 1;
+            }
+            harmonic += 1;
+        }
+    }
+
+    let mut s_bend = Array2::<f64>::zeros((q, q));
+    let mut col = 1usize;
+    let mut harmonic = 1usize;
+    while col < q {
+        let omega = std::f64::consts::TAU * (harmonic as f64) / period;
+        let weight = omega.powi((2 * spec.penalty_order) as i32);
+        s_bend[[col, col]] = weight;
+        col += 1;
+        if col < q {
+            s_bend[[col, col]] = weight;
+            col += 1;
+        }
+        harmonic += 1;
+    }
+
     let mut penalties_raw = vec![PenaltyCandidate {
-        matrix: s_bend_raw.clone(),
+        matrix: s_bend.clone(),
         nullspace_dim_hint: 1,
         source: PenaltySource::Primary,
         normalization_scale: 1.0,
@@ -7525,10 +7178,10 @@ fn build_periodic_bspline_basis_1d(
         op: None,
     }];
     if spec.double_penalty {
+        let mut shrink = Array2::<f64>::zeros((q, q));
+        shrink[[0, 0]] = 1.0;
         penalties_raw.push(PenaltyCandidate {
-            matrix: build_nullspace_shrinkage_penalty(&s_bend_raw)?
-                .map(|shrink| shrink.sym_penalty)
-                .unwrap_or_else(|| Array2::<f64>::zeros(s_bend_raw.raw_dim())),
+            matrix: shrink,
             nullspace_dim_hint: 0,
             source: PenaltySource::DoublePenaltyNullspace,
             normalization_scale: 1.0,
@@ -7537,12 +7190,13 @@ fn build_periodic_bspline_basis_1d(
         });
     }
 
-    let penalties_raw_mats = penalties_raw
+    let knots = Array1::linspace(origin, origin + period, q + spec.degree + 1);
+    let penalties_raw_mats: Vec<Array2<f64>> = penalties_raw
         .iter()
         .map(|candidate| candidate.matrix.clone())
-        .collect::<Vec<_>>();
+        .collect();
     let (design, penalties, identifiability_transform) = apply_bspline_identifiability_policy(
-        design_raw,
+        design,
         penalties_raw_mats,
         &knots,
         spec.degree,
@@ -7550,7 +7204,7 @@ fn build_periodic_bspline_basis_1d(
     )?;
     let transformed_candidates = penalties
         .into_iter()
-        .zip(penalties_raw)
+        .zip(penalties_raw.into_iter())
         .map(|(matrix, candidate)| PenaltyCandidate {
             nullspace_dim_hint: candidate.nullspace_dim_hint,
             matrix,
@@ -7570,7 +7224,6 @@ fn build_periodic_bspline_basis_1d(
         metadata: BasisMetadata::BSpline1D {
             knots,
             identifiability_transform,
-            periodic: Some((domain_start, period, num_basis)),
         },
         kronecker_factored: None,
         ops,
@@ -7582,24 +7235,13 @@ pub fn build_bspline_basis_1d(
     data: ArrayView1<'_, f64>,
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
-    if let BSplineKnotSpec::PeriodicUniform {
-        data_range,
-        num_basis,
-    } = spec.knotspec
-    {
-        return build_periodic_bspline_basis_1d(
-            data,
-            data_range.0,
-            data_range.1 - data_range.0,
-            num_basis,
-            spec,
-        );
+    if let BSplineBoundaryCondition::Periodic { period, origin } = spec.boundary_condition {
+        return build_periodic_fourier_basis_1d(data, spec, period, origin);
     }
-    let prefer_sparse_design = spec.boundary_conditions.is_free()
-        && matches!(
-            spec.identifiability,
-            BSplineIdentifiability::None | BSplineIdentifiability::WeightedSumToZero { .. }
-        );
+    let prefer_sparse_design = matches!(
+        spec.identifiability,
+        BSplineIdentifiability::None | BSplineIdentifiability::WeightedSumToZero { .. }
+    );
     let (design_sparse_opt, design_dense_opt, knots) = if prefer_sparse_design {
         match &spec.knotspec {
             BSplineKnotSpec::Generate {
@@ -28582,7 +28224,7 @@ mod tests {
             },
             double_penalty: true,
             identifiability: BSplineIdentifiability::default(),
-            boundary_conditions: Default::default(),
+            boundary_condition: Default::default(),
         };
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
         assert_eq!(result.penalties.len(), 2);
@@ -28725,7 +28367,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
-            boundary_conditions: Default::default(),
+            boundary_condition: Default::default(),
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28750,7 +28392,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
-            boundary_conditions: Default::default(),
+            boundary_condition: Default::default(),
         };
 
         let result = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28788,7 +28430,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
-            boundary_conditions: Default::default(),
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28832,7 +28474,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
-            boundary_conditions: Default::default(),
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).expect("build sparse bspline");
@@ -28851,7 +28493,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
-            boundary_conditions: Default::default(),
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).expect("build centered sparse bspline");
@@ -28870,7 +28512,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
-            boundary_conditions: Default::default(),
+            boundary_condition: Default::default(),
         };
 
         match build_bspline_basis_1d(x.view(), &spec).unwrap_err() {
@@ -28923,7 +28565,7 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::default(),
-            boundary_conditions: Default::default(),
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -28977,7 +28619,7 @@ mod tests {
             identifiability: BSplineIdentifiability::WeightedSumToZero {
                 weights: Some(weights.clone()),
             },
-            boundary_conditions: Default::default(),
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
@@ -29004,10 +28646,11 @@ mod tests {
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
-            boundary_conditions: Default::default(),
+            boundary_condition: Default::default(),
         };
         let constrained = BSplineBasisSpec {
             identifiability: BSplineIdentifiability::RemoveLinearTrend,
+            boundary_condition: Default::default(),
             ..raw.clone()
         };
 
@@ -29035,7 +28678,7 @@ mod tests {
                 columns: constraints.clone(),
                 weights: None,
             },
-            boundary_conditions: Default::default(),
+            boundary_condition: Default::default(),
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();

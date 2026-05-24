@@ -94,7 +94,7 @@ fn build_problem(n: usize, flex: bool) -> (Array2<f64>, BernoulliMarginalSlopeTe
                 },
                 double_penalty: false,
                 identifiability: Default::default(),
-                boundary_conditions: Default::default(),
+                boundary_condition: Default::default(),
             },
         },
         shape: ShapeConstraint::None,
