@@ -125,13 +125,16 @@ fn main() {
     let mut useless_test_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_useless_tests(&manifest_dir, &manifest_dir, &mut useless_test_offenders);
 
-    // `#[cfg(test)]` attribute directly on a publicly-visible item
-    // (`pub` / `pub(crate)` / `pub(super)` / `pub(in path)`). Production
-    // API gated on test-only compilation is the dodge: rustc's `dead_code`
-    // lint won't see it under the normal build, yet the item still exists
-    // for the test target. Real test-only public surface lives inside a
-    // private `#[cfg(test)] mod tests { ... }` so the items inside the
-    // module don't each carry their own gate.
+    // `#[cfg(test)]` attribute directly on ANY item inside `src/` (the
+    // production tree) — regardless of visibility. Tests must exercise
+    // production code, not other test code; `#[cfg(test)]` is not a
+    // legitimate way to silence the `dead_code` lint on either pub or
+    // private items. The only legitimate use of a top-level `#[cfg(test)]`
+    // attribute in `src/` is to gate a private test submodule:
+    // `#[cfg(test)] mod tests { ... }`, `mod test_support`, `mod tests_*`,
+    // or `mod *_tests`. Every other item — `fn`, `struct`, `enum`,
+    // `const`, `static`, `type`, `use`, `impl` — must live unconditionally
+    // in production or move inside one of those private test submodules.
     let mut cfg_test_pub_offenders: Vec<(PathBuf, usize, String, String)> = Vec::new();
     scan_for_cfg_test_on_pub_items(&manifest_dir, &manifest_dir, &mut cfg_test_pub_offenders);
 
@@ -146,6 +149,16 @@ fn main() {
         &manifest_dir,
         &mut noop_self_consuming_offenders,
     );
+
+    // Dodge-named function identifiers. Names like `discard_*`, `swallow_*`,
+    // `silence_*`, `*_for_fixed_lambda`, `*_no_op_*`, `*_intentionally_unused`,
+    // `placeholder_for_*`, `dummy_for_*` announce lint-laundering intent in
+    // the identifier itself: the only reason such a method exists is to
+    // consume a value or compile away a warning. Banning the names by
+    // substring makes "rename to look legitimate" cost the same as actually
+    // fixing the code. Build.rs is exempt; strict everywhere else.
+    let mut dodge_name_offenders: Vec<(PathBuf, usize, String, String)> = Vec::new();
+    scan_for_dodge_named_fns(&manifest_dir, &manifest_dir, &mut dodge_name_offenders);
 
     // Vendoring ban. Reject any `vendor/` directory under the manifest root
     // (any depth). Vendored upstream crates fork the dependency tree from
@@ -330,7 +343,7 @@ fn main() {
     if !cfg_test_pub_offenders.is_empty() {
         sections.push(Section {
             title:
-                "#[cfg(test)] on publicly-visible item (move into a private `#[cfg(test)] mod ...` or delete the unused item — do not hide production API from the dead_code lint)"
+                "#[cfg(test)] on src/ item (move into a private `#[cfg(test)] mod tests { ... }` / `mod test_support` / `mod tests_*` / `mod *_tests`, or delete the unused item — `#[cfg(test)]` is not a dead_code-lint escape hatch, regardless of visibility)"
                     .to_string(),
             rows: cfg_test_pub_offenders
                 .iter()
@@ -347,6 +360,18 @@ fn main() {
             rows: noop_self_consuming_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !dodge_name_offenders.is_empty() {
+        sections.push(Section {
+            title:
+                "dodge-named function (name announces lint-laundering intent — implement real behavior or restructure so the value isn't unused)"
+                    .to_string(),
+            rows: dodge_name_offenders
+                .iter()
+                .map(|(r, l, ident, s)| (r.clone(), *l, Some(ident.clone()), s.clone()))
                 .collect(),
         });
     }
@@ -1113,28 +1138,30 @@ fn scan_for_dead_cfg_gates(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf
 }
 
 /// Flags `#[cfg(test)]` (and `#[cfg(all(test, ...))]` / `#[cfg(any(test,
-/// ...))]`) attributes that directly annotate a publicly-visible item:
-/// `pub`, `pub(crate)`, `pub(super)`, `pub(in path)`. Test-gating
-/// production API hides the item from rustc's `dead_code` lint under the
-/// normal build while keeping it available to the test target — the
-/// exact "make the lint shut up" pattern the build script enforces
-/// against everywhere else.
+/// ...))]`) attributes that directly annotate ANY item inside the `src/`
+/// production tree. Visibility does NOT matter: a private
+/// `#[cfg(test)] fn foo()` is the same dodge as a `pub fn foo()` —
+/// rustc's `dead_code` lint never sees the item under the normal build
+/// while the test target still picks it up. Tests exist to exercise
+/// production code, not to keep other test-only code alive.
 ///
 /// Walks forward through blank lines, `//` comments, and additional
 /// `#[...]` attribute lines from the `cfg(test)` site until reaching the
-/// first non-attribute, non-blank, non-comment line. If the trimmed line
-/// begins with `pub ` / `pub(` / `pub\t`, the `cfg(test)` is flagged.
-/// `#[cfg(test)] mod foo { ... }` (private mod) is intentionally NOT
-/// flagged — that is the legitimate test-only scope. `#[cfg(test)] pub
-/// mod foo { ... }` IS flagged: exporting a test-only module's interior
-/// is the same dodge.
+/// first non-attribute, non-blank, non-comment line. That line is the
+/// gated item.
+///
+/// Exempt items (the only legitimate uses of a top-level `#[cfg(test)]`
+/// in `src/`): private test submodules. The trimmed item line must
+/// match `mod <NAME> ...` where `<NAME>` is `tests`, `test_support`,
+/// `tests_<...>`, or `<...>_tests`. `pub mod tests` IS flagged —
+/// exporting a test-only module's interior is the same dodge.
 ///
 /// `is_cfg_test_attr_line` already excludes `#[cfg(not(test))]`, so
 /// negations cannot fire here.
 ///
-/// Test/bench directories are skipped — they are not "production
-/// surface," and `pub` items there are confined to the test target by
-/// the directory layout. Build.rs is exempt.
+/// Only files under `src/` (and `crates/<name>/src/`) are scanned —
+/// test directories, benches, examples, and crate roots outside `src/`
+/// are not "production surface." Build.rs is exempt.
 fn scan_for_cfg_test_on_pub_items(
     root: &Path,
     dir: &Path,
@@ -1148,13 +1175,15 @@ fn scan_for_cfg_test_on_pub_items(
         if rel.extension().and_then(OsStr::to_str) != Some("rs") {
             return;
         }
-        // Skip files entirely under tests/, bench/, benches/, or
-        // crates/<name>/tests|benches/ — those are not production surface.
-        if rel_str.starts_with("tests/")
-            || rel_str.starts_with("bench/")
-            || rel_str.starts_with("benches/")
-            || path_matches_crates_test(&rel_str)
-        {
+        // Only `src/` files are in scope. Test/bench/example trees and
+        // any other path outside `src/` are skipped. `crates/<name>/src/`
+        // is also production surface — accept it too.
+        let in_src = rel_str.starts_with("src/")
+            || rel_str
+                .strip_prefix("crates/")
+                .and_then(|rest| rest.find('/').map(|i| &rest[i + 1..]))
+                .is_some_and(|tail| tail.starts_with("src/"));
+        if !in_src {
             return;
         }
         if !content.contains("cfg(") {
@@ -1203,18 +1232,18 @@ fn scan_for_cfg_test_on_pub_items(
             };
             let item_raw = lines.get(item_idx).copied().unwrap_or("");
             let item_trim = item_raw.trim_start();
-            let bytes = item_trim.as_bytes();
-            // Match `pub ` / `pub\t` / `pub(` — the three syntactic forms
-            // for a publicly-visible item declaration. Bare `pub` at
-            // end-of-line is vanishingly rare but is also a `pub`-token
-            // start, so accept it too.
-            let is_pub = bytes.starts_with(b"pub")
-                && (bytes.len() == 3
-                    || bytes[3] == b' '
-                    || bytes[3] == b'\t'
-                    || bytes[3] == b'(');
-            if !is_pub {
-                continue;
+            // Exempt: private test submodules. Must literally begin with
+            // `mod ` (not `pub mod`, not `pub(crate) mod`) and the module
+            // name must be `tests`, `test_support`, `tests_*`, or
+            // `*_tests`.
+            if let Some(rest) = item_trim.strip_prefix("mod ") {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() && is_exempt_test_submodule_name(&name) {
+                    continue;
+                }
             }
             // Capture a short item descriptor (up to the first `{`, `;`,
             // or 80 chars) as the report tag so the row shows both the
@@ -2877,4 +2906,333 @@ fn find_fn_body_at(lines: &[&str], fn_line: usize) -> Option<(String, (usize, us
         }
     }
     None
+}
+
+/// Case-insensitive substring patterns that flag a function identifier as a
+/// dodge-named lint launderer. The Codex agent that prompted this scanner
+/// invented `fn discard_lambda_adjoint_for_fixed_lambda(self) {}` whose
+/// name announces the dodge outright ("I exist to discard a value to
+/// satisfy a linter"). Banning the names by string makes "rename it to
+/// look legitimate" cost the same as actually fixing the code.
+///
+/// Survey notes (kept narrow where legitimate uses already exist):
+/// - `_for_fixed_` would flag `fit_model_for_fixed_rho` (a real solver
+///   entry point in `src/solver/pirls.rs` — "fit with rho held fixed"
+///   is genuine mathematical naming). Narrowed to the specific forms
+///   the dodge actually used (`_for_fixed_lambda`, `_for_fixed_arg`).
+/// - `_placeholder_` would flag a legitimate test about a renderer
+///   omitting placeholder metrics. Dropped; `placeholder_for_` retained.
+fn dodge_name_substrings() -> &'static [&'static str] {
+    &[
+        "discard_",
+        "_discard_",
+        "swallow_",
+        "_swallow_",
+        "_for_fixed_lambda",
+        "_for_fixed_arg",
+        "_for_unused",
+        "_for_no_op",
+        "_no_op_",
+        "silence_",
+        "ignore_unused",
+        "eat_unused",
+        "consume_unused",
+        "intentionally_unused",
+        "placeholder_for_",
+        "dummy_for_",
+    ]
+}
+
+/// Scan `.rs` files for `fn <ident>` declarations whose identifier (case-
+/// insensitive) contains any of the banned substrings in
+/// `dodge_name_substrings`. Build.rs itself is exempt. Strict everywhere
+/// else — the names are self-incriminating regardless of context.
+fn scan_for_dodge_named_fns(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String, String)>,
+) {
+    let needles = dodge_name_substrings();
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("fn ") {
+            return;
+        }
+        let stripped_lines = strip_file_lines(content);
+        for (idx, line) in content.lines().enumerate() {
+            let stripped = stripped_lines.get(idx).map(String::as_str).unwrap_or(line);
+            if !line_has_keyword(stripped, "fn") {
+                continue;
+            }
+            let Some(fn_pos) = locate_fn_keyword(stripped) else {
+                continue;
+            };
+            // Identifier follows `fn`, optionally after whitespace. Must
+            // start with an ident byte (alpha / `_`) and continue with
+            // ident bytes — matches the `\bfn\s+(\w+)` shape from the task.
+            let bytes = stripped.as_bytes();
+            let mut j = fn_pos + 2;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                continue;
+            }
+            if !(bytes[j].is_ascii_alphabetic() || bytes[j] == b'_') {
+                continue;
+            }
+            let name_start = j;
+            while j < bytes.len() && is_ident_byte(bytes[j]) {
+                j += 1;
+            }
+            if j == name_start {
+                continue;
+            }
+            let name = &stripped[name_start..j];
+            let lower = name.to_ascii_lowercase();
+            for needle in needles {
+                if lower.contains(needle) {
+                    offenders.push((
+                        rel.to_path_buf(),
+                        idx + 1,
+                        name.to_string(),
+                        line.to_string(),
+                    ));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Flags functions whose body is empty (only whitespace between `{` and `}`)
+/// AND whose first parameter is a by-value `self` receiver (`self`,
+/// `mut self`, `self: T`, `mut self: T`). These are the wrapper-struct
+/// laundering pattern: a no-op consume-self method whose only purpose is
+/// to satisfy the `let _` ban (`x.discard()` instead of `let _ = x;`).
+///
+/// By-reference receivers (`&self`, `&mut self`, `self: &Self`,
+/// `self: &mut Self`) are NOT flagged — empty `fn drop(&mut self) {}` is a
+/// legitimate (if unusual) Drop impl shape.
+///
+/// Bench files are NOT exempt: laundering in benches is the same failure
+/// mode. Build.rs itself IS exempt.
+fn scan_for_noop_self_consuming_fns(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("fn ") {
+            return;
+        }
+        let lines: Vec<&str> = content.lines().collect();
+        let stripped_lines = strip_file_lines(content);
+        let n = lines.len();
+        let mut i = 0usize;
+        while i < n {
+            let s = stripped_lines
+                .get(i)
+                .map(String::as_str)
+                .unwrap_or(lines[i]);
+            if !line_has_keyword(s, "fn") {
+                i += 1;
+                continue;
+            }
+            let Some((sig, (open, close))) = find_fn_body_at(&lines, i) else {
+                i += 1;
+                continue;
+            };
+            if !first_param_is_by_value_self(&sig) {
+                i = open + 1;
+                continue;
+            }
+            if fn_body_is_empty(&stripped_lines, open, close) {
+                offenders.push((rel.to_path_buf(), i + 1, lines[i].to_string()));
+            }
+            i = close + 1;
+        }
+    });
+}
+
+/// Parse the first parameter from a normalized fn signature string
+/// (whitespace collapsed, string/comment contents stripped). Returns true
+/// iff the first parameter is a by-value `self` receiver: `self`,
+/// `mut self`, `self: T`, `mut self: T` for any non-reference `T`. `&self`,
+/// `&mut self`, `self: &Self`, `self: &mut Self` return false.
+fn first_param_is_by_value_self(sig: &str) -> bool {
+    let bytes = sig.as_bytes();
+    let mut i = 0usize;
+    let mut fn_pos: Option<usize> = None;
+    while i + 2 <= bytes.len() {
+        if &bytes[i..i + 2] == b"fn"
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && (i + 2 == bytes.len() || !is_ident_byte(bytes[i + 2]))
+        {
+            fn_pos = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let Some(fp) = fn_pos else {
+        return false;
+    };
+    let mut j = fp + 2;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j >= bytes.len() || !(bytes[j].is_ascii_alphabetic() || bytes[j] == b'_') {
+        return false;
+    }
+    while j < bytes.len() && is_ident_byte(bytes[j]) {
+        j += 1;
+    }
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j < bytes.len() && bytes[j] == b'<' {
+        let mut depth: i32 = 0;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        j += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+    }
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j >= bytes.len() || bytes[j] != b'(' {
+        return false;
+    }
+    let params_start = j + 1;
+    let Some(end) = find_matching_paren(&bytes[params_start..]) else {
+        return false;
+    };
+    let params = &sig[params_start..params_start + end];
+    let first = first_top_level_segment(params);
+    let first_trim = first.trim();
+    if first_trim.is_empty() {
+        return false;
+    }
+    if first_trim.starts_with('&') {
+        return false;
+    }
+    let after_mut = first_trim
+        .strip_prefix("mut ")
+        .map(str::trim_start)
+        .unwrap_or(first_trim);
+    if after_mut == "self" {
+        return true;
+    }
+    if let Some(rest) = after_mut.strip_prefix("self") {
+        if let Some(&b) = rest.as_bytes().first()
+            && is_ident_byte(b)
+        {
+            return false;
+        }
+        let r = rest.trim_start();
+        if let Some(tail) = r.strip_prefix(':') {
+            let ty = tail.trim_start();
+            if ty.starts_with('&') {
+                return false;
+            }
+            return !ty.is_empty();
+        }
+    }
+    false
+}
+
+/// Return the leading segment of `params` up to the first top-level `,`
+/// (respecting `<>`/`()`/`[]` nesting). If no top-level comma exists,
+/// returns the entire input.
+fn first_top_level_segment(params: &str) -> &str {
+    let bytes = params.as_bytes();
+    let mut angle: i32 = 0;
+    let mut paren: i32 = 0;
+    let mut bracket: i32 = 0;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => angle += 1,
+            b'>' => {
+                if angle > 0 {
+                    angle -= 1;
+                }
+            }
+            b'(' => paren += 1,
+            b')' => {
+                if paren > 0 {
+                    paren -= 1;
+                }
+            }
+            b'[' => bracket += 1,
+            b']' => {
+                if bracket > 0 {
+                    bracket -= 1;
+                }
+            }
+            b',' if angle == 0 && paren == 0 && bracket == 0 => {
+                return &params[..i];
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    params
+}
+
+/// True iff the body between the `{` on `open` and the `}` on `close` is
+/// only whitespace. Uses the stripped lines so string-literal and comment
+/// contents are masked out.
+fn fn_body_is_empty(stripped_lines: &[String], open: usize, close: usize) -> bool {
+    if open > close || open >= stripped_lines.len() || close >= stripped_lines.len() {
+        return false;
+    }
+    let open_line = stripped_lines[open].as_str();
+    let Some(open_brace) = open_line.find('{') else {
+        return false;
+    };
+    if open == close {
+        let tail = &open_line[open_brace + 1..];
+        let Some(close_brace) = tail.rfind('}') else {
+            return false;
+        };
+        return tail[..close_brace].chars().all(char::is_whitespace);
+    }
+    let open_tail = &open_line[open_brace + 1..];
+    if !open_tail.chars().all(char::is_whitespace) {
+        return false;
+    }
+    for line in &stripped_lines[open + 1..close] {
+        if !line.chars().all(char::is_whitespace) {
+            return false;
+        }
+    }
+    let close_line = stripped_lines[close].as_str();
+    let Some(close_brace) = close_line.rfind('}') else {
+        return false;
+    };
+    close_line[..close_brace].chars().all(char::is_whitespace)
 }
