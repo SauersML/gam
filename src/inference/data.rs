@@ -938,17 +938,17 @@ fn parse_cell_with_schema(
     unseen_policy: UnseenCategoryPolicy,
 ) -> Result<f64, DataError> {
     let val = match meta.kind {
-        ColumnKindTag::Continuous => raw.parse::<f64>().map_err(|_| DataError::SchemaMismatch {
+        ColumnKindTag::Continuous => raw.parse::<f64>().map_err(|err| DataError::SchemaMismatch {
             reason: format!(
-                "column '{}' is continuous in schema but row {} has non-numeric value '{}'",
-                col_name, row, raw
+                "column '{}' is continuous in schema but row {} has non-numeric value '{}': {}",
+                col_name, row, raw, err
             ),
         })?,
         ColumnKindTag::Binary => {
-            let v = raw.parse::<f64>().map_err(|_| DataError::SchemaMismatch {
+            let v = raw.parse::<f64>().map_err(|err| DataError::SchemaMismatch {
                 reason: format!(
-                    "column '{}' is binary in schema but row {} has non-numeric value '{}'",
-                    col_name, row, raw
+                    "column '{}' is binary in schema but row {} has non-numeric value '{}': {}",
+                    col_name, row, raw, err
                 ),
             })?;
             if (v - 0.0).abs() >= 1e-12 && (v - 1.0).abs() >= 1e-12 {
@@ -1549,24 +1549,26 @@ pub fn encode_recordswith_schema(
                 .into());
             }
             let val = match col_schema.kind {
-                ColumnKindTag::Continuous => raw.parse::<f64>().map_err(|_| {
+                ColumnKindTag::Continuous => raw.parse::<f64>().map_err(|err| {
                     String::from(DataError::SchemaMismatch {
                         reason: format!(
-                            "column '{}' is continuous in schema but row {} has non-numeric value '{}'",
+                            "column '{}' is continuous in schema but row {} has non-numeric value '{}': {}",
                             name,
                             i + 1,
-                            raw
+                            raw,
+                            err
                         ),
                     })
                 })?,
                 ColumnKindTag::Binary => {
-                    let v = raw.parse::<f64>().map_err(|_| {
+                    let v = raw.parse::<f64>().map_err(|err| {
                         String::from(DataError::SchemaMismatch {
                             reason: format!(
-                                "column '{}' is binary in schema but row {} has non-numeric value '{}'",
+                                "column '{}' is binary in schema but row {} has non-numeric value '{}': {}",
                                 name,
                                 i + 1,
-                                raw
+                                raw,
+                                err
                             ),
                         })
                     })?;

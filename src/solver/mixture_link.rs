@@ -1131,7 +1131,12 @@ pub fn inverse_link_jet_for_link_function(
                 epsilon: sas.epsilon,
             }
             .jet(eta),
-            _ => sas.jet(eta),
+            LinkFunction::Sas => sas.jet(eta),
+            LinkFunction::Logit
+            | LinkFunction::Probit
+            | LinkFunction::CLogLog
+            | LinkFunction::Identity
+            | LinkFunction::Log => link.jet(eta),
         };
     }
     link.jet(eta)

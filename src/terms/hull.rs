@@ -91,7 +91,7 @@ impl PeeledHull {
         } else {
             // Outside: use Dykstra projection onto the feasible polytope
             let z = self.project_point(x);
-            let diff = &x.to_owned() - &z;
+            let diff = &z - &x;
 
             diff.mapv(|v| v * v).sum().sqrt()
         }

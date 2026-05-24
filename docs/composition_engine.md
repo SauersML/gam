@@ -48,8 +48,8 @@ Related design notes:
 | `SoftmaxAssignmentSparsityPenalty` | Per-row softmax atom assignments | `λ Σ_i H(softmax(a_i / τ))` | Assignment concentration | Favors decisive atom ownership without hard-coding a discrete assignment step. |
 | `NuclearNormPenalty` | Row-wise latent matrix blocks | `λ Σ_i ‖X_i‖_*` with smoothed singular values | Low-rank structure | Encourages each latent matrix block to use only the rank needed by the data. |
 | `BlockSparsityPenalty` | Configured groups of latent axes | `λ Σ_g sqrt(‖T_g‖²_F + ε²)` | Group sparsity | Removes whole latent-axis groups when a mechanism block is unnecessary. |
-| `AuxConditionalPriorPenalty` | Per-row latent coordinates conditioned on auxiliary inputs | `½ w Σ_i t_i^T Λ_i t_i` | Auxiliary conditional shrinkage | Injects row-local prior precision from covariates without coupling observations. |
-| `ParametricAuxConditionalPriorPenalty` | Per-row latent coordinates with learned aux-conditioned precision | `½ w Σ_ik λ_k(u_i) t_ik²` | Parametric auxiliary shrinkage | Learns an iVAE-style aux-to-precision map when fixed row precisions are unavailable. |
+| `IvaeRidgeMeanGauge` (also: `AuxConditionalPriorPenalty`, legacy Python alias) | Per-row latent coordinates conditioned on auxiliary inputs | `½ w Σ_i t_i^T Λ_i t_i` | Auxiliary conditional shrinkage | Injects row-local prior precision from covariates without coupling observations. |
+| `ParametricRowPrecisionPriorPenalty` | Per-row latent coordinates with learned aux-conditioned precision | `½ w Σ_ik λ_k(u_i) t_ik²` | Parametric auxiliary shrinkage | Learns an iVAE-style aux-to-precision map when fixed row precisions are unavailable. |
 | `ScadMcpPenalty` | Configured latent, assignment, or decoder block | `Σ_j p_λ,γ(|x_j|)` with SCAD/MCP concavity | Concave sparsity | Reduces L1 bias while retaining sparsity pressure on selected mechanisms. |
 | `BlockOrthogonalityPenalty` | Configured groups of latent axes | `½ w Σ_{g<h} ‖T_g^T T_h‖²_F` | Supervised block plus free block gauge transfer | Enforces only between-block orthogonality, leaving within-block structure free for the auto_exp_38 companion-block pattern. |
 
@@ -166,7 +166,7 @@ axis-selection composition is `OrthogonalityPenalty` plus `ARDPenalty`, as in
 rotation/scale gauge before ARD applies axis-wise evidence pressure.
 When the unsupervised priors fail, as in `auto_exp_21` through `auto_exp_32`,
 match `d_aux` to the actual signal dimensionality and use
-`AuxConditionalPriorPenalty` with supervised aux. `auto_exp_33` recovered the
+`IvaeRidgeMeanGauge` with supervised aux. `auto_exp_33` recovered the
 cogito run at `d_aux=3`: R²(hue)=0.70, and each latent axis aligned with one HSV channel.
 Extending to `d_aux=6` with concat(HSV, name-features) supervision recovers
 the full `U_3d` perceptual + name-semantic decomposition (`auto_exp_35`):

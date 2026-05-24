@@ -2592,22 +2592,24 @@ fn survival_hazard_theta_first_second(
             );
         }
         SurvivalBaselineTarget::Gompertz => {
+            let rate = cfg
+                .rate
+                .ok_or_else(|| "gompertz missing rate".to_string())?;
             let shape = cfg
                 .shape
                 .ok_or_else(|| "gompertz missing shape".to_string())?;
             second[0][0] = first[0];
             second[0][1] = first[1];
             second[1][0] = first[1];
-            second[1][1] =
-                gompertz_cumulative_shape_second_derivative(age, cfg.rate.unwrap(), shape);
+            second[1][1] = gompertz_cumulative_shape_second_derivative(age, rate, shape);
         }
         SurvivalBaselineTarget::GompertzMakeham => {
+            let rate = cfg.rate.ok_or_else(|| "gm missing rate".to_string())?;
             let shape = cfg.shape.ok_or_else(|| "gm missing shape".to_string())?;
             second[0][0] = first[0];
             second[0][1] = first[1];
             second[1][0] = first[1];
-            second[1][1] =
-                gompertz_cumulative_shape_second_derivative(age, cfg.rate.unwrap(), shape);
+            second[1][1] = gompertz_cumulative_shape_second_derivative(age, rate, shape);
             second[2][2] = first[2];
         }
     }
