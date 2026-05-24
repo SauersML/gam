@@ -4461,8 +4461,12 @@ fn default_beta_guess_external(
                         standard_normal_quantile(prevalence)
                             .unwrap_or_else(|_| (prevalence / (1.0 - prevalence)).ln())
                     }),
-                    LinkFunction::Log => unreachable!(),
-                    LinkFunction::Identity => unreachable!(),
+                    // Outer arm guard already filtered out Log/Identity; fall
+                    // back to the canonical logit transform for defensive safety
+                    // if these are ever reached unexpectedly.
+                    LinkFunction::Log | LinkFunction::Identity => {
+                        (prevalence / (1.0 - prevalence)).ln()
+                    }
                 };
                 if mixture_link_state.is_some() {
                     beta[intercept_col] = solve_intercept_for_prevalence(
@@ -8104,9 +8108,12 @@ fn solve_penalized_least_squares_implicit(
                 p,
                 true,
             ) {
-                Ok(crate::solver::gpu::GpuDispatch::UseDevice) => unreachable!(
-                    "dense_pirls_dispatch cannot select a device without a registered backend"
-                ),
+                Ok(crate::solver::gpu::GpuDispatch::UseDevice) => {
+                    return Err(EstimationError::InvalidInput(
+                        "dense_pirls_dispatch cannot select a device without a registered backend"
+                            .to_string(),
+                    ));
+                }
                 Ok(crate::solver::gpu::GpuDispatch::UseCpu { .. }) => {}
                 Err(msg) => return Err(EstimationError::InvalidInput(msg)),
             }
