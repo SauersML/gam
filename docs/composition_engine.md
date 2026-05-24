@@ -43,6 +43,7 @@ Related design notes:
 | `ARDPenalty` | Latent axes `t_{.,k}` | `½ Σ_k α_k ‖t_{.,k}‖²` plus REML normalizers | Dimension selection | Prunes axes only after another prior fixes the coordinate gauge. |
 | `SparsityPenalty` | Code, assignment, or decoder block | `λ Σ_j sqrt(x_j² + ε²)` | Mechanism sparsity | Encourages small active sets for SAE-style codes and block mechanisms. |
 | `OrthogonalityPenalty` | Latent coordinate matrix `T` | `½ w ‖T^T T - I‖²_F` | Gauge fix paired with ARD | Fixes rotation and scale so ARD can make axis-wise pruning identifiable. |
+| `BlockOrthogonalityPenalty` | Configured groups of latent axes | `½ w Σ_{g<h} ‖T_g^T T_h‖²_F` | Supervised block plus free block gauge transfer | Enforces only between-block orthogonality, leaving within-block structure free for the auto_exp_38 companion-block pattern. |
 | `TotalVariationPenalty` | `ForwardDiff1D` or `GraphEdges` differences of a latent block | `λ Σ_e sqrt(‖D_e x‖² + ε²)` | Piecewise structure | Promotes piecewise-constant atom maps over sequences or arbitrary adjacency graphs. |
 | `IBPAssignmentPenalty` | Binary or relaxed atom-assignment logits | `-log p(Z; α, τ)` with IBP-style occupancy terms | Nonparametric assignment prior | Lets the model discover a sparse active atom count below the configured maximum. |
 | `SoftmaxAssignmentSparsityPenalty` | Per-row softmax atom assignments | `λ Σ_i H(softmax(a_i / τ))` | Assignment concentration | Favors decisive atom ownership without hard-coding a discrete assignment step. |

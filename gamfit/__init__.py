@@ -72,6 +72,7 @@ from ._compare import compare_models
 from ._penalties import (
     ARDPenalty,
     AuxConditionalPriorPenalty,
+    BlockOrthogonalityPenalty,
     BlockSparsityPenalty,
     IBPAssignmentPenalty,
     IsometryPenalty,
