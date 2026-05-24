@@ -12182,8 +12182,8 @@ fn fit_bounded_term_collection_with_design(
                 }],
                 log_lambdas,
                 lambdas: fit.lambdas,
-                likelihood_family: Some(family),
                 likelihood_scale: family.default_scale_metadata(),
+                likelihood_family: Some(family),
                 log_likelihood_normalization:
                     crate::types::LogLikelihoodNormalization::UserProvided,
                 log_likelihood: eta_state.log_likelihood,

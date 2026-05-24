@@ -51,7 +51,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 /// Pretty-printed name for a `LikelihoodSpec`. Mirrors the equivalent legacy
-/// `LikelihoodFamily::pretty_name` output so error messages remain stable.
+/// `pretty_name` output so error messages remain stable.
 #[inline]
 fn likelihood_spec_pretty_name(spec: &LikelihoodSpec) -> &'static str {
     match (&spec.response, &spec.link) {
