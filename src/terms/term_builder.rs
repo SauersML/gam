@@ -974,6 +974,7 @@ pub fn build_smooth_basis(
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
             boundary: OneDimensionalBoundary::Open,
+            streaming_chunk_size: None,
         };
         let flavour = match type_opt.as_str() {
             "fs" => FactorSmoothFlavour::Fs {
@@ -1095,6 +1096,7 @@ pub fn build_smooth_basis(
                         identifiability: BSplineIdentifiability::None,
                         boundary: boundaries[i].clone(),
                         boundary_conditions: BSplineBoundaryConditions::default(),
+                        streaming_chunk_size: None,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -1149,6 +1151,8 @@ pub fn build_smooth_basis(
                         start: domain_start,
                         end: domain_start + period,
                     },
+                    streaming_chunk_size: option_usize(options, "streaming_chunk_size")
+                        .or_else(|| option_usize(options, "chunk_size")),
                 },
             })
         }
@@ -1190,6 +1194,8 @@ pub fn build_smooth_basis(
                     "period_start",
                     "period_end",
                     "origin",
+                    "streaming_chunk_size",
+                    "chunk_size",
                     "double_penalty",
                     "by",
                     "id",
@@ -1279,6 +1285,8 @@ pub fn build_smooth_basis(
                     identifiability: BSplineIdentifiability::default(),
                     boundary,
                     boundary_conditions,
+                    streaming_chunk_size: option_usize(options, "streaming_chunk_size")
+                        .or_else(|| option_usize(options, "chunk_size")),
                 },
             })
         }
