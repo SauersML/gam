@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use crate::basis::{DuchonNullspaceOrder, MaternNu, RadialScalarKind};
 use crate::estimate::EstimationError;
 use crate::estimate::reml::DirectionalHyperParam;
+use crate::solver::persistent_warm_start::StableHasher;
 use crate::terms::latent_coord::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };
@@ -76,6 +77,14 @@ impl CacheDigestBuilder {
         self.hasher.update([u8::from(value)]);
     }
 
+    fn write_u8(&mut self, value: u8) {
+        self.hasher.update([value]);
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.hasher.update(value.to_le_bytes());
+    }
+
     fn write_f64(&mut self, value: f64) {
         self.hasher.update(value.to_bits().to_le_bytes());
     }
@@ -128,6 +137,9 @@ pub(crate) enum LatentBasisKind {
     },
     Pca {
         basis_matrix: Array2<f64>,
+        centered: bool,
+        center_mean_fingerprint: Option<u64>,
+        smooth_penalty: f64,
     },
 }
 
@@ -208,8 +220,18 @@ impl LatentBasisKind {
                     hash_vector(axis_knots, &mut hasher);
                 }
             }
-            Self::Pca { basis_matrix } => {
+            Self::Pca {
+                basis_matrix,
+                centered,
+                center_mean_fingerprint,
+                smooth_penalty,
+            } => {
                 hasher.write_usize(5);
+                hasher.write_u8(*centered as u8);
+                if let Some(fp) = center_mean_fingerprint {
+                    hasher.write_u64(*fp);
+                }
+                hasher.write_u64(smooth_penalty.to_bits());
                 hasher.write_usize(basis_matrix.nrows());
                 hasher.write_usize(basis_matrix.ncols());
                 hash_matrix(basis_matrix, &mut hasher);
@@ -217,6 +239,20 @@ impl LatentBasisKind {
         }
         hasher.finish()
     }
+}
+
+pub(crate) fn pca_center_mean_fingerprint(centered: bool, center_mean: Option<&Array1<f64>>) -> Option<u64> {
+    if !centered {
+        return None;
+    }
+    center_mean.map(|mean| {
+        let mut hasher = StableHasher::new();
+        hasher.write_usize(mean.len());
+        for &value in mean.iter() {
+            hasher.write_f64(value);
+        }
+        hasher.finish_u64()
+    })
 }
 
 fn matern_nu_signature(nu: MaternNu) -> usize {
