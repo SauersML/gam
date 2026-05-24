@@ -4171,15 +4171,11 @@ fn strip_leading_item_modifiers(mut s: &str) -> &str {
             s = rest.trim_start();
             continue;
         }
-        if let Some(rest) = s.strip_prefix("const fn ") {
-            // Reinsert `fn ` so extract_item_ident sees the kind keyword.
-            // We can't return a synthetic str; instead match by leaving the
-            // `fn ` prefix in place: walk back to include it.
-            // Simpler: this branch always means the item is a fn — emit a
-            // marker via this static prefix-restoration trick: caller will
-            // strip `fn ` itself. We achieve that by returning a slice that
-            // begins at "fn " in the ORIGINAL `s`. The original `s` begins
-            // with "const fn "; "fn " starts at offset 6.
+        if s.strip_prefix("const fn ").is_some() {
+            // `const fn` always denotes a fn item — caller's
+            // `extract_item_ident` expects to see the `fn ` keyword
+            // first, so return a slice of the ORIGINAL `s` starting at
+            // the "fn " position (offset 6 inside "const fn ").
             return &s[6..];
         }
         if let Some(rest) = s.strip_prefix("extern ") {

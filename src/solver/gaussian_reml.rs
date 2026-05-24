@@ -1199,18 +1199,6 @@ fn batched_inverse_hessians_from_caches(
         .collect()
 }
 
-struct RidgeProfileVjp {
-    lambda_adjoint: f64,
-}
-
-impl RidgeProfileVjp {
-    fn lambda_adjoint(self) -> f64 {
-        self.lambda_adjoint
-    }
-
-    fn discard_lambda_adjoint_for_fixed_lambda(self) {}
-}
-
 fn add_ridge_profile_vjp(
     scale: f64,
     x: ArrayView2<'_, f64>,
@@ -1225,7 +1213,7 @@ fn add_ridge_profile_vjp(
     grad_y: &mut Array2<f64>,
     grad_penalty: &mut Array2<f64>,
     grad_weights: &mut Array1<f64>,
-) -> RidgeProfileVjp {
+) -> f64 {
     let m = dense_ab(inverse_hessian.view(), upstream_beta);
     let c = dense_ab(m.view(), beta.t());
     let c_sym = &c + &c.t();
@@ -1269,13 +1257,11 @@ fn add_ridge_profile_vjp(
             grad_penalty[[row, col]] -= scale * lambda * value;
         }
     }
-    RidgeProfileVjp {
-        lambda_adjoint: -scale
-            * m.iter()
-                .zip(penalty_beta.iter())
-                .map(|(left, right)| left * right)
-                .sum::<f64>(),
-    }
+    -scale
+        * m.iter()
+            .zip(penalty_beta.iter())
+            .map(|(left, right)| left * right)
+            .sum::<f64>()
 }
 
 fn add_reml_score_vjp(
