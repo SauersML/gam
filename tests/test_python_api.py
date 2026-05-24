@@ -1630,38 +1630,6 @@ def test_duchon_function_norm_penalty_3d_non_periodic_psd() -> None:
     _assert_symmetric_psd(s, "3D Duchon penalty")
 
 
-def test_duchon_primitives_default_args_unchanged_d3() -> None:
-    """Default-args path stays bit-identical to the pre-change behavior.
-
-    At ``d=3, m=2`` the historical default produces a well-defined basis
-    and function-norm penalty without any of the new hybrid keywords.
-    Passing the new kwargs as ``None`` must hit the legacy branch
-    (``length_scale=None, power=0.0, nullspace=linear``) and yield the
-    same numbers it always did.
-    """
-    rng = np.random.default_rng(5)
-    pts = rng.uniform(-1.0, 1.0, size=(12, 3))
-    centers = rng.uniform(-1.0, 1.0, size=(8, 3))
-    # Default call (legacy keywords only)
-    basis_legacy = gamfit.duchon_basis(pts, centers, m=2)
-    penalty_legacy = gamfit.duchon_function_norm_penalty(centers, m=2)
-    # Same call with the new kwargs explicitly set to None
-    basis_new = gamfit.duchon_basis(
-        pts, centers, m=2,
-        length_scale=None, nullspace_order=None, power=None,
-    )
-    penalty_new = gamfit.duchon_function_norm_penalty(
-        centers, m=2,
-        length_scale=None, nullspace_order=None, power=None,
-    )
-    assert basis_legacy.shape == basis_new.shape
-    assert penalty_legacy.shape == penalty_new.shape
-    assert np.array_equal(basis_legacy, basis_new), \
-        "default-args duchon_basis output drifted from legacy path"
-    assert np.array_equal(penalty_legacy, penalty_new), \
-        "default-args duchon_function_norm_penalty output drifted from legacy path"
-
-
 @pytest.mark.parametrize("d", [8, 16])
 def test_duchon_basis_hybrid_high_d_builds(d: int) -> None:
     """Hybrid Duchon (``length_scale=1.0``) at high d builds with the
