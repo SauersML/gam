@@ -259,6 +259,9 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
+    if let Some(out) = crate::gpu::linalg::try_fast_atb(a.view(), b.view()) {
+        return out;
+    }
     let (n_a, p) = a.dim();
     let q = b.ncols();
     fast_atb_with_parallelism(a, b, matmul_parallelism(p, q, n_a))
@@ -348,6 +351,9 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
+    if let Some(out) = crate::gpu::linalg::try_fast_ab(a.view(), b.view()) {
+        return out;
+    }
     let n = a.nrows();
     let q = b.ncols();
     let mut out = Array2::<f64>::zeros((n, q));
@@ -362,6 +368,9 @@ pub fn fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     v: &ArrayBase<S2, Ix1>,
 ) -> Array1<f64> {
+    if let Some(out) = crate::gpu::linalg::try_fast_av(a.view(), v.view()) {
+        return out;
+    }
     fast_av_impl(a, v)
 }
 
@@ -500,6 +509,9 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     v: &ArrayBase<S2, Ix1>,
 ) -> Array1<f64> {
+    if let Some(out) = crate::gpu::linalg::try_fast_atv(a.view(), v.view()) {
+        return out;
+    }
     fast_atv_impl(a, v)
 }
 
@@ -601,6 +613,9 @@ pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         w.len(),
         "fast_xt_diag_x row/weight length mismatch"
     );
+    if let Some(out) = crate::gpu::linalg::try_fast_xt_diag_x(x.view(), w.view()) {
+        return out;
+    }
     let p = x.ncols();
     fast_xt_diag_x_with_parallelism(x, w, matmul_parallelism(p, p, x.nrows()))
 }
@@ -748,6 +763,9 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
         w.len(),
         "fast_xt_diag_y row/weight length mismatch"
     );
+    if let Some(out) = crate::gpu::linalg::try_fast_xt_diag_y(x.view(), w.view(), y.view()) {
+        return out;
+    }
     fast_xt_diag_y_impl(x, w, y)
 }
 
@@ -861,6 +879,15 @@ pub fn fast_joint_hessian_2x2<
     w_ab: &ArrayBase<S4, Ix1>,
     w_bb: &ArrayBase<S5, Ix1>,
 ) -> Array2<f64> {
+    if let Some(out) = crate::gpu::linalg::try_fast_joint_hessian_2x2(
+        x_a.view(),
+        x_b.view(),
+        w_aa.view(),
+        w_ab.view(),
+        w_bb.view(),
+    ) {
+        return out;
+    }
     fast_joint_hessian_2x2_impl(x_a, x_b, w_aa, w_ab, w_bb)
 }
 

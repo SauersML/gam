@@ -2514,7 +2514,6 @@ pub enum BasisMetadata {
         /// Per-axis anisotropy log-scales η_a for geometric anisotropy.
         /// When Some, distance is r = √(Σ_a exp(2η_a) · (x_a - c_a)²).
         aniso_log_scales: Option<Vec<f64>>,
-        streaming_chunk_size: Option<usize>,
     },
     Duchon {
         centers: Array2<f64>,
@@ -4476,7 +4475,7 @@ impl LatentCoordDesignDerivative {
         latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
         centers: Arc<Array2<f64>>,
         length_scale: Option<f64>,
-        power: f64,
+        power: usize,
         nullspace_order: DuchonNullspaceOrder,
         full_ident_transform: Option<Array2<f64>>,
     ) -> Result<Self, BasisError> {
@@ -4489,7 +4488,7 @@ impl LatentCoordDesignDerivative {
         }
         let effective_order = duchon_effective_nullspace_order(centers.view(), nullspace_order);
         let p_order = duchon_p_from_nullspace_order(effective_order);
-        let s_order = power.max(0.0).round() as usize;
+        let s_order = power;
         let radial_kind = if let Some(length_scale) = length_scale {
             RadialScalarKind::Duchon {
                 length_scale,
@@ -4504,7 +4503,7 @@ impl LatentCoordDesignDerivative {
             }
         } else {
             RadialScalarKind::PureDuchon {
-                block_order: pure_duchon_block_order(p_order, power).max(1.0) as usize,
+                block_order: pure_duchon_block_order(p_order, power as f64).max(1.0) as usize,
                 p_order,
                 s_order,
                 dim: centers.ncols(),
@@ -7705,13 +7704,14 @@ pub fn build_bspline_basis_1d(
             .iter()
             .map(|candidate| candidate.matrix.clone())
             .collect();
+        let auto_chunk = auto_streaming_chunk_size_for_dense(data.len(), num_basis);
         let (design, transformed_candidates, identifiability_transform) =
-            if spec.streaming_chunk_size.is_some() {
+            if let Some(chunk) = auto_chunk {
                 log::info!(
-                    "B-spline basis using explicit streaming evaluator: n={} p={} chunk_size={}",
+                    "B-spline basis auto-streaming evaluator: n={} p={} chunk_size={}",
                     data.len(),
                     num_basis,
-                    spec.streaming_chunk_size.unwrap_or(2048).max(1),
+                    chunk,
                 );
                 build_streaming_bspline_design_and_candidates(
                     data,
@@ -7722,7 +7722,7 @@ pub fn build_bspline_basis_1d(
                     &spec.identifiability,
                     penalties_raw,
                     penalties_raw_mats,
-                    spec.streaming_chunk_size,
+                    Some(chunk),
                 )?
             } else {
                 let (basis, _) =
@@ -7764,7 +7764,6 @@ pub fn build_bspline_basis_1d(
                 knots,
                 identifiability_transform,
                 periodic: Some((start, end - start, num_basis)),
-                streaming_chunk_size: spec.streaming_chunk_size,
             },
             kronecker_factored: None,
             ops,
@@ -16110,6 +16109,35 @@ fn select_spherical_farthest_point_centers(
         centers.row_mut(r).assign(&data.row(idx));
     }
     Ok(centers)
+}
+
+/// Auto-derive a streaming row chunk size for dense basis evaluation.
+///
+/// The opt-in `streaming_chunk_size` knob has been removed from public specs:
+/// streaming activates automatically when the would-be dense buffer
+/// `n_rows * n_basis_cols * 8 bytes` exceeds 1 GiB. When streaming is
+/// active, the chunk size is sized so each resident chunk holds ~256 MiB
+/// of `f64` (`chunk = (256 MiB) / (n_basis_cols * 8)`), clamped to
+/// `[1024, n_rows]`. Returning `None` means "do not stream, materialize
+/// densely".
+pub fn auto_streaming_chunk_size_for_dense(
+    n_rows: usize,
+    n_basis_cols: usize,
+) -> Option<usize> {
+    if n_rows == 0 || n_basis_cols == 0 {
+        return None;
+    }
+    const DENSE_THRESHOLD_BYTES: usize = 1024 * 1024 * 1024;
+    const TARGET_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+    const MIN_CHUNK_ROWS: usize = 1024;
+    let dense_bytes = n_rows.saturating_mul(n_basis_cols).saturating_mul(8);
+    if dense_bytes <= DENSE_THRESHOLD_BYTES {
+        return None;
+    }
+    let row_bytes = n_basis_cols.saturating_mul(8).max(1);
+    let raw_chunk = TARGET_CHUNK_BYTES / row_bytes;
+    let clamped = raw_chunk.max(MIN_CHUNK_ROWS).min(n_rows);
+    Some(clamped)
 }
 
 pub fn build_spherical_spline_basis(
