@@ -26585,14 +26585,14 @@ mod tests {
             .collect();
         let start_uncached = std::time::Instant::now();
         for direction in &directions {
-            let _ = family
+            family
                 .exact_newton_joint_hessian_matvec_from_cache(direction, &states, &uncached)
                 .expect("uncached Hv");
         }
         let uncached_elapsed = start_uncached.elapsed();
         let start_cached = std::time::Instant::now();
         for direction in &directions {
-            let _ = family
+            family
                 .exact_newton_joint_hessian_matvec_from_cache(direction, &states, &cached)
                 .expect("cached Hv");
         }

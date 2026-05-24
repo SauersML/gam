@@ -17691,10 +17691,7 @@ pub fn fit_survival_marginal_slope_terms(
         .as_ref()
         .and_then(|session| session.peek_load_with_source())
         .is_some_and(|loaded| {
-            crate::solver::outer_strategy::cache_entry_would_help_outer(
-                &loaded,
-                setup.rho_dim(),
-            )
+            crate::solver::outer_strategy::cache_entry_would_help_outer(&loaded, setup.rho_dim())
         });
     if outer_cache_seed_available {
         log::info!(
@@ -22944,7 +22941,12 @@ mod tests {
                 for b in a..N_PRIMARY {
                     let db = unit_primary_direction_ref(b).view();
                     let value = family
-                        .row_neglog_directional_refs(row, &block_states, &[da, db, dir_u.view()])
+                        .row_neglog_directional_jet_batched(
+                            row,
+                            &block_states,
+                            &[da, db, dir_u.view()],
+                        )
+                        .map(|jet| jet.coeff(jet.full_mask()))
                         .expect("legacy third per-cell");
                     legacy_third[a][b] = value;
                     legacy_third[b][a] = value;
@@ -22973,11 +22975,12 @@ mod tests {
                 for b in a..N_PRIMARY {
                     let db = unit_primary_direction_ref(b).view();
                     let value = family
-                        .row_neglog_directional_refs(
+                        .row_neglog_directional_jet_batched(
                             row,
                             &block_states,
                             &[da, db, dir_u.view(), dir_v.view()],
                         )
+                        .map(|jet| jet.coeff(jet.full_mask()))
                         .expect("legacy fourth per-cell");
                     legacy_fourth[a][b] = value;
                     legacy_fourth[b][a] = value;

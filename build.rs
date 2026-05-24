@@ -4007,7 +4007,19 @@ fn strip_validation_prologue(body: &str) -> &str {
             s = rest.trim_start();
             continue;
         }
-        if let Some(rest) = strip_leading_empty_check_early_return(s) {
+        if let Some(rest) = strip_leading_if_return_guard(s) {
+            s = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = strip_leading_drop_call(s) {
+            s = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = strip_leading_wildcard_assignment(s) {
+            s = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = strip_leading_terminator_method(s) {
             s = rest.trim_start();
             continue;
         }
@@ -4016,28 +4028,40 @@ fn strip_validation_prologue(body: &str) -> &str {
     s
 }
 
-/// Match a leading `assert!(...);` / `assert_eq!(...);` / `assert_ne!(...);`
-/// invocation with balanced parens and a trailing semicolon. Returns the
-/// remainder past the `;`, or `None` if no match.
+/// Match a leading assertion macro invocation (any of
+/// `assert!`, `assert_eq!`, `assert_ne!`, `assert_matches!`) with
+/// balanced parens / square brackets / curly braces and a trailing `;`.
+/// Returns the remainder past the `;`, or `None` if no match. Both
+/// `assert_matches!(...)` and the rare brace/bracket-delimited forms
+/// (`assert!{ ... }`) are accepted — `macro!` delimiters are
+/// interchangeable in Rust.
 fn strip_leading_assert_call(s: &str) -> Option<&str> {
-    for prefix in ["assert!(", "assert_eq!(", "assert_ne!("] {
-        let Some(after_open) = s.strip_prefix(prefix) else {
+    for name in ["assert", "assert_eq", "assert_ne", "assert_matches"] {
+        let Some(after_name) = s.strip_prefix(name) else {
             continue;
         };
+        let after_bang = after_name.strip_prefix('!')?;
+        let after_open_ws = after_bang.trim_start();
+        let (open, close) = match after_open_ws.as_bytes().first()? {
+            b'(' => (b'(', b')'),
+            b'[' => (b'[', b']'),
+            b'{' => (b'{', b'}'),
+            _ => return None,
+        };
+        let after_open = &after_open_ws[1..];
         let bytes = after_open.as_bytes();
         let mut depth: i32 = 1;
         let mut i = 0usize;
         while i < bytes.len() {
-            match bytes[i] {
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        let after = after_open[i + 1..].trim_start();
-                        return after.strip_prefix(';');
-                    }
+            let b = bytes[i];
+            if b == open {
+                depth += 1;
+            } else if b == close {
+                depth -= 1;
+                if depth == 0 {
+                    let after = after_open[i + 1..].trim_start();
+                    return after.strip_prefix(';');
                 }
-                _ => {}
             }
             i += 1;
         }
@@ -4046,17 +4070,35 @@ fn strip_leading_assert_call(s: &str) -> Option<&str> {
     None
 }
 
-/// Match a leading `if <expr>.is_empty() { return <expr>; }` guard, where
-/// the condition mentions `.is_empty()` and the gated block is exactly a
-/// single `return ...;` statement. Returns the remainder past the closing
-/// brace, or `None` if no match.
-fn strip_leading_empty_check_early_return(s: &str) -> Option<&str> {
+/// Match a leading `if <cond> { return <expr>; }` early-return guard,
+/// where the gated block is exactly a single `return ...;` statement.
+/// The condition itself is not inspected — any predicate counts, since
+/// the goal is to peel off cheap "consume the parameter" guards before
+/// checking whether the tail of the function reduces to a sentinel.
+/// Legitimate functions whose body is `if cond { return X; } <real
+/// computation>` are unaffected because the surviving tail won't match
+/// the sentinel list. Returns the remainder past the closing brace, or
+/// `None` if no match.
+fn strip_leading_if_return_guard(s: &str) -> Option<&str> {
     let after_if = s.strip_prefix("if ")?;
-    let open_brace = after_if.find('{')?;
-    let cond = &after_if[..open_brace];
-    if !cond.contains(".is_empty()") {
-        return None;
-    }
+    let bytes = after_if.as_bytes();
+    let mut paren: i32 = 0;
+    let mut brack: i32 = 0;
+    let mut i = 0usize;
+    let open_brace = loop {
+        if i >= bytes.len() {
+            return None;
+        }
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren -= 1,
+            b'[' => brack += 1,
+            b']' => brack -= 1,
+            b'{' if paren == 0 && brack == 0 => break i,
+            _ => {}
+        }
+        i += 1;
+    };
     let rest_after_brace = &after_if[open_brace + 1..];
     let bytes = rest_after_brace.as_bytes();
     let mut depth: i32 = 1;
@@ -4070,6 +4112,7 @@ fn strip_leading_empty_check_early_return(s: &str) -> Option<&str> {
                     let inside = rest_after_brace[..i].trim();
                     if inside.starts_with("return ")
                         && inside.ends_with(';')
+                        && count_top_level_semicolons(inside) == 1
                     {
                         return Some(&rest_after_brace[i + 1..]);
                     }
@@ -4081,6 +4124,132 @@ fn strip_leading_empty_check_early_return(s: &str) -> Option<&str> {
         i += 1;
     }
     None
+}
+
+/// Match a leading `drop(<expr>);` statement (any expression) and
+/// return the remainder past the `;`. `drop` is a legitimate primitive,
+/// but as a leading no-op consumer that produces nothing it has the
+/// same fake-use shape as `let _ = expr;` once that ban exists.
+fn strip_leading_drop_call(s: &str) -> Option<&str> {
+    let after_open = s.strip_prefix("drop(")?;
+    let bytes = after_open.as_bytes();
+    let mut depth: i32 = 1;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let after = after_open[i + 1..].trim_start();
+                    return after.strip_prefix(';');
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Match a leading `_ = <expr>;` wildcard assignment — the non-`let`
+/// form of `let _ = expr;` that escapes the `scan_for_let_underscore`
+/// scanner because there is no `let`. The expression body is consumed
+/// up to the next top-level `;`.
+fn strip_leading_wildcard_assignment(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix("_ ")?.strip_prefix('=')?;
+    let rest = rest.trim_start();
+    let bytes = rest.as_bytes();
+    let mut paren: i32 = 0;
+    let mut brack: i32 = 0;
+    let mut brace: i32 = 0;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren -= 1,
+            b'[' => brack += 1,
+            b']' => brack -= 1,
+            b'{' => brace += 1,
+            b'}' => brace -= 1,
+            b';' if paren == 0 && brack == 0 && brace == 0 => {
+                return Some(&rest[i + 1..]);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Match a leading expression-statement whose terminating method is a
+/// no-result consumer used as fake validation: `.unwrap();`,
+/// `.expect("...");`, or `.unwrap_or_default();`. The expression
+/// itself is consumed by walking from the start of the body to the
+/// next top-level `;`, then verifying the segment before the `;` ends
+/// with one of the terminator suffixes. Restricting to these three
+/// keeps real method-call statements (`.push(...);`, `.write(...)?;`,
+/// `.send().await;`) from being stripped.
+fn strip_leading_terminator_method(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut paren: i32 = 0;
+    let mut brack: i32 = 0;
+    let mut brace: i32 = 0;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren -= 1,
+            b'[' => brack += 1,
+            b']' => brack -= 1,
+            b'{' => brace += 1,
+            b'}' => brace -= 1,
+            b';' if paren == 0 && brack == 0 && brace == 0 => {
+                let segment = s[..i].trim_end();
+                if segment.ends_with(".unwrap()")
+                    || segment.ends_with(".unwrap_or_default()")
+                    || segment_ends_with_method_call(segment, ".expect")
+                {
+                    return Some(&s[i + 1..]);
+                }
+                return None;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// True when `segment` syntactically ends with a method call whose
+/// dotted-method portion is exactly `method`. Walks parens backward
+/// from the trailing `)` to find its matching `(`, then checks the
+/// prefix immediately before that `(`. This is the precise check the
+/// terminator stripper needs — `"x.expect(y.run())"` matches `.expect`
+/// (last paren pair is the `.expect(...)` call), but
+/// `"y.expect(z).run()"` does NOT match `.expect` because the trailing
+/// paren pair belongs to `.run()`.
+fn segment_ends_with_method_call(segment: &str, method: &str) -> bool {
+    if !segment.ends_with(')') {
+        return false;
+    }
+    let bytes = segment.as_bytes();
+    let mut depth: i32 = 1;
+    let mut i = bytes.len() - 1;
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return segment[..i].ends_with(method);
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// True when `s` looks like a path expression: identifier chars, plus `::`,
