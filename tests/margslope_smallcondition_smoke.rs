@@ -16,7 +16,9 @@ use gam::families::bernoulli_marginal_slope::{
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::lognormal_kernel::FrailtySpec;
 use gam::resource::ResourcePolicy;
-use gam::terms::basis::{BSplineBasisSpec, BSplineKnotSpec};
+use gam::terms::basis::{
+    BSplineBasisSpec, BSplineBoundaryConditions, BSplineKnotSpec, OneDimensionalBoundary,
+};
 use gam::terms::smooth::{
     ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
     TermCollectionSpec,
@@ -94,6 +96,8 @@ fn build_problem(n: usize, flex: bool) -> (Array2<f64>, BernoulliMarginalSlopeTe
                 },
                 double_penalty: false,
                 identifiability: Default::default(),
+                boundary: OneDimensionalBoundary::Open,
+                boundary_conditions: BSplineBoundaryConditions::default(),
             },
         },
         shape: ShapeConstraint::None,
