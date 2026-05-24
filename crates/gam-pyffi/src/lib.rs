@@ -816,8 +816,8 @@ fn periodic_spline_curve_basis<'py>(
     degree: usize,
     penalty_order: usize,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
-    let basis = create_periodic_bspline_basis_dense(t.as_array(), (0.0, 1.0), degree, n_knots)
-        .map_err(|err| py_value_error(err.to_string()))?;
+    let basis = periodic_bspline_basis_dense_via_spec(t.as_array(), (0.0, 1.0), degree, n_knots)
+        .map_err(py_value_error)?;
     let penalty = create_cyclic_difference_penalty_matrix(n_knots, penalty_order)
         .map_err(|err| py_value_error(err.to_string()))?;
     Ok((
@@ -980,7 +980,8 @@ fn duchon_function_norm_penalty<'py>(
             identifiability: SpatialIdentifiability::None,
             aniso_log_scales: None,
             operator_penalties: Default::default(),
-            periodic: false,
+            periodic: None,
+            boundary: OneDimensionalBoundary::Open,
         };
         let built = build_duchon_basis_mixed_periodicity_auto(
             center_matrix.view(),
@@ -3794,11 +3795,12 @@ fn build_latent_forward_design(
             }
             let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
             let range = latent_periodic_range_from_centers(centers)?;
-            let design =
-                create_periodic_bspline_basis_dense(t_mat.column(0), range, m, centers.nrows())
-                    .map_err(|err| {
-                        format!("failed to evaluate periodic B-spline latent basis: {err}")
-                    })?;
+            let design = periodic_bspline_basis_dense_via_spec(
+                t_mat.column(0),
+                range,
+                m,
+                centers.nrows(),
+            )?;
             (design, t_mat)
         }
         other => {
@@ -8325,7 +8327,7 @@ fn bspline_position_derivative_impl(
             "periodic B-spline derivative supports order=1; got order={order}"
         ));
     }
-    let _ = periodic_position_domain(knots, period)?;
+    periodic_position_domain(knots, period)?;
     validate_vector("t", t)?;
     Err(
         "periodic B-spline first-derivative as a dense (N, K) matrix is no longer exposed; \
