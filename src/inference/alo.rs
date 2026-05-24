@@ -522,20 +522,21 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
         let s_chunk = factor.solve(rhs_chunk.as_ref());
 
         if e_rank > 0
-            && let Some(e) = input.penalty_root {
-                let eview = FaerArrayView::new(e);
-                // Compute only the leading `width` columns; `col_as_slice` will
-                // index into the full-width buffer up to `width` below.
-                let mut es_target = es_chunk_storage.as_mut().subcols_mut(0, width);
-                matmul(
-                    es_target.rb_mut(),
-                    Accum::Replace,
-                    eview.as_ref(),
-                    s_chunk.as_ref(),
-                    1.0,
-                    Par::Seq,
-                );
-            }
+            && let Some(e) = input.penalty_root
+        {
+            let eview = FaerArrayView::new(e);
+            // Compute only the leading `width` columns; `col_as_slice` will
+            // index into the full-width buffer up to `width` below.
+            let mut es_target = es_chunk_storage.as_mut().subcols_mut(0, width);
+            matmul(
+                es_target.rb_mut(),
+                Accum::Replace,
+                eview.as_ref(),
+                s_chunk.as_ref(),
+                1.0,
+                Par::Seq,
+            );
+        }
 
         let rhs_view = rhs_chunk_buf.slice(s![.., ..width]);
 
@@ -1150,11 +1151,11 @@ fn compute_multiblock_alo_chunk(
             for d in 0..b {
                 scratch.imwa[d * b + d] += ALO_LOCAL_BLOCK_RIDGE;
             }
-            debug_assert!(lu_factor_in_place(
-                &mut scratch.imwa,
-                &mut scratch.perm_imwa,
-                b,
-            ));
+            let refactored = lu_factor_in_place(&mut scratch.imwa, &mut scratch.perm_imwa, b);
+            debug_assert!(
+                refactored,
+                "ALO local block remained singular after ridge regularization"
+            );
         }
         if !lu_factor_in_place(&mut scratch.imaw, &mut scratch.perm_imaw, b) {
             for r in 0..b {
@@ -1167,11 +1168,11 @@ fn compute_multiblock_alo_chunk(
             for d in 0..b {
                 scratch.imaw[d * b + d] += ALO_LOCAL_BLOCK_RIDGE;
             }
-            debug_assert!(lu_factor_in_place(
-                &mut scratch.imaw,
-                &mut scratch.perm_imaw,
-                b,
-            ));
+            let refactored = lu_factor_in_place(&mut scratch.imaw, &mut scratch.perm_imaw, b);
+            debug_assert!(
+                refactored,
+                "ALO local variance block remained singular after ridge regularization"
+            );
         }
 
         // v_i = (I - W A)⁻¹ s_i  -- solve into rhs_buf.

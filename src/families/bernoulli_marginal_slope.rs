@@ -263,7 +263,6 @@ pub enum LatentMeasureKind {
     },
 }
 
-
 impl LatentMeasureKind {
     pub fn validate(&self, context: &str) -> Result<(), String> {
         match self {
@@ -628,13 +627,14 @@ impl LatentZRankIntCalibration {
             let zi = z[idx];
             // Collapse ties: store one knot per unique z (last cumulative).
             if let Some(prev) = last_z
-                && zi == prev {
-                    if let Some(slot) = weighted_cdf.last_mut() {
-                        let p = ((cum_w - 0.375) / denom).clamp(eps, 1.0 - eps);
-                        *slot = p;
-                    }
-                    continue;
+                && zi == prev
+            {
+                if let Some(slot) = weighted_cdf.last_mut() {
+                    let p = ((cum_w - 0.375) / denom).clamp(eps, 1.0 - eps);
+                    *slot = p;
                 }
+                continue;
+            }
             let p = ((cum_w - 0.375) / denom).clamp(eps, 1.0 - eps);
             sorted_z.push(zi);
             weighted_cdf.push(p);
@@ -3684,14 +3684,13 @@ fn contract_fourth_full(
     out
 }
 
-fn ensure_finite_third_full_cache_row(
-    t: &[[[f64; 2]; 2]; 2],
-    context: &str,
-) -> Result<(), String> {
+fn ensure_finite_third_full_cache_row(t: &[[[f64; 2]; 2]; 2], context: &str) -> Result<(), String> {
     if t.iter().flatten().flatten().all(|value| value.is_finite()) {
         Ok(())
     } else {
-        Err(format!("{context}: warmed third-derivative cache row contains a non-finite value"))
+        Err(format!(
+            "{context}: warmed third-derivative cache row contains a non-finite value"
+        ))
     }
 }
 
@@ -3707,7 +3706,9 @@ fn ensure_finite_fourth_full_cache_row(
     {
         Ok(())
     } else {
-        Err(format!("{context}: warmed fourth-derivative cache row contains a non-finite value"))
+        Err(format!(
+            "{context}: warmed fourth-derivative cache row contains a non-finite value"
+        ))
     }
 }
 
@@ -5204,6 +5205,13 @@ struct BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
     options: BlockwiseFitOptions,
 }
 
+fn parameter_block_specs_match_rows(specs: &[ParameterBlockSpec], expected_n: usize) -> bool {
+    !specs.is_empty()
+        && specs
+            .iter()
+            .all(|spec| spec.design.nrows() == expected_n && spec.offset.len() == expected_n)
+}
+
 const BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS: usize = 10_000;
 
 fn bernoulli_margslope_line_search_ll_with_early_exit<F>(
@@ -6122,23 +6130,22 @@ impl BernoulliMarginalSlopeFamily {
                 // check decides on the bit-exact full-data objective.
                 // Rejected trials short-circuit through the `Err` path —
                 // no full-data work paid on the reject.
-                if trial_subsample_installed
-                    && let Ok(_subsample_ll) = trial_result {
-                        let full_total: Result<f64, String> = (0..n)
-                            .into_par_iter()
-                            .try_fold(
-                                || 0.0,
-                                |mut ll, i| -> Result<_, String> {
-                                    ll += row_ll(i)?;
-                                    Ok(ll)
-                                },
-                            )
-                            .try_reduce(
-                                || 0.0,
-                                |left, right| -> Result<_, String> { Ok(left + right) },
-                            );
-                        return full_total;
-                    }
+                if trial_subsample_installed && let Ok(_subsample_ll) = trial_result {
+                    let full_total: Result<f64, String> = (0..n)
+                        .into_par_iter()
+                        .try_fold(
+                            || 0.0,
+                            |mut ll, i| -> Result<_, String> {
+                                ll += row_ll(i)?;
+                                Ok(ll)
+                            },
+                        )
+                        .try_reduce(
+                            || 0.0,
+                            |left, right| -> Result<_, String> { Ok(left + right) },
+                        );
+                    return full_total;
+                }
                 return trial_result;
             }
             let total: Result<f64, String> = weighted_rows
@@ -6183,23 +6190,22 @@ impl BernoulliMarginalSlopeFamily {
                 threshold,
                 row_ll,
             );
-            if trial_subsample_installed
-                && let Ok(_subsample_ll) = trial_result {
-                    let full_total: Result<f64, String> = (0..n)
-                        .into_par_iter()
-                        .try_fold(
-                            || 0.0,
-                            |mut ll, i| -> Result<_, String> {
-                                ll += row_ll(i)?;
-                                Ok(ll)
-                            },
-                        )
-                        .try_reduce(
-                            || 0.0,
-                            |left, right| -> Result<_, String> { Ok(left + right) },
-                        );
-                    return full_total;
-                }
+            if trial_subsample_installed && let Ok(_subsample_ll) = trial_result {
+                let full_total: Result<f64, String> = (0..n)
+                    .into_par_iter()
+                    .try_fold(
+                        || 0.0,
+                        |mut ll, i| -> Result<_, String> {
+                            ll += row_ll(i)?;
+                            Ok(ll)
+                        },
+                    )
+                    .try_reduce(
+                        || 0.0,
+                        |left, right| -> Result<_, String> { Ok(left + right) },
+                    );
+                return full_total;
+            }
             return trial_result;
         }
         let total: Result<f64, String> = weighted_rows
@@ -6406,9 +6412,16 @@ impl BernoulliMarginalSlopeFamily {
     pub(crate) fn sigma_exact_joint_psi_terms_with_options(
         &self,
         block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "bernoulli marginal-slope sigma psi terms: specs/block_states length mismatch {} vs {}",
+                specs.len(),
+                block_states.len()
+            ));
+        }
         if self.effective_flex_active(block_states)? {
             return Err("bernoulli marginal-slope log-sigma hyperderivatives are implemented for the rigid probit marginal-slope kernel; flexible score/link kernels require the analytic denested cell-tensor sigma path"
                         .to_string());
@@ -8130,21 +8143,23 @@ impl BernoulliMarginalSlopeFamily {
             )?;
         }
         if let Some(primary_h) = primary.h.as_ref()
-            && let Some(block_h) = slices.h.as_ref() {
-                out.slice_mut(s![block_h.clone()]).assign(
-                    &primary_vec
-                        .slice(s![primary_h.start..primary_h.end])
-                        .to_owned(),
-                );
-            }
+            && let Some(block_h) = slices.h.as_ref()
+        {
+            out.slice_mut(s![block_h.clone()]).assign(
+                &primary_vec
+                    .slice(s![primary_h.start..primary_h.end])
+                    .to_owned(),
+            );
+        }
         if let Some(primary_w) = primary.w.as_ref()
-            && let Some(block_w) = slices.w.as_ref() {
-                out.slice_mut(s![block_w.clone()]).assign(
-                    &primary_vec
-                        .slice(s![primary_w.start..primary_w.end])
-                        .to_owned(),
-                );
-            }
+            && let Some(block_w) = slices.w.as_ref()
+        {
+            out.slice_mut(s![block_w.clone()]).assign(
+                &primary_vec
+                    .slice(s![primary_w.start..primary_w.end])
+                    .to_owned(),
+            );
+        }
         Ok(out)
     }
 
@@ -14664,65 +14679,65 @@ impl BernoulliMarginalSlopeFamily {
                 Array2::<f64>::zeros((p_logslope, p_logslope)),
             )
         };
-        let (ll, grad_marginal, grad_logslope, hess_marginal, hess_logslope) =
-            (0..n.div_ceil(ROW_CHUNK_SIZE))
-                .into_par_iter()
-                .try_fold(
-                    make_acc,
-                    |(mut ll, mut gm, mut gl, mut hm, mut hl), chunk_idx| -> Result<_, String> {
-                        let start = chunk_idx * ROW_CHUNK_SIZE;
-                        let end = (start + ROW_CHUNK_SIZE).min(n);
-                        let rows = end - start;
-                        let marginal_chunk = self
-                            .marginal_design
-                            .try_row_chunk(start..end)
-                            .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?;
-                        let logslope_chunk = self
-                            .logslope_design
-                            .try_row_chunk(start..end)
-                            .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
-                        let mut gm_w_buf = [0.0f64; ROW_CHUNK_SIZE];
-                        let mut gl_w_buf = [0.0f64; ROW_CHUNK_SIZE];
-                        let mut hm_w_buf = [0.0f64; ROW_CHUNK_SIZE];
-                        let mut hl_w_buf = [0.0f64; ROW_CHUNK_SIZE];
-                        let gm_w = &mut gm_w_buf[..rows];
-                        let gl_w = &mut gl_w_buf[..rows];
-                        let hm_w = &mut hm_w_buf[..rows];
-                        let hl_w = &mut hl_w_buf[..rows];
-                        for local_row in 0..rows {
-                            let row = start + local_row;
-                            let marginal_eta = block_states[0].eta[row];
-                            let marginal = self.marginal_link_map(marginal_eta)?;
-                            let g = block_states[1].eta[row];
-                            let (neglog, grad, h) =
-                                self.rigid_row_kernel_eval(row, marginal_eta, marginal, g)?;
-                            ll -= neglog;
-                            gm_w[local_row] =
-                                Self::exact_newton_score_component_from_objective_gradient(grad[0]);
-                            gl_w[local_row] =
-                                Self::exact_newton_score_component_from_objective_gradient(grad[1]);
-                            hm_w[local_row] = h[0][0];
-                            hl_w[local_row] = h[1][1];
-                        }
-                        add_weighted_chunk_gradient(&marginal_chunk, gm_w, &mut gm);
-                        add_weighted_chunk_gradient(&logslope_chunk, gl_w, &mut gl);
-                        add_weighted_chunk_gram(&marginal_chunk, hm_w, &mut hm);
-                        add_weighted_chunk_gram(&logslope_chunk, hl_w, &mut hl);
-                        Ok((ll, gm, gl, hm, hl))
-                    },
-                )
-                .try_reduce(
-                    make_acc,
-                    |(lll, mut lgm, mut lgl, mut lhm, mut lhl),
-                     (rll, rgm, rgl, rhm, rhl)|
-                     -> Result<_, String> {
-                        lgm += &rgm;
-                        lgl += &rgl;
-                        lhm += &rhm;
-                        lhl += &rhl;
-                        Ok((lll + rll, lgm, lgl, lhm, lhl))
-                    },
-                )?;
+        let (ll, grad_marginal, grad_logslope, hess_marginal, hess_logslope) = (0..n
+            .div_ceil(ROW_CHUNK_SIZE))
+            .into_par_iter()
+            .try_fold(
+                make_acc,
+                |(mut ll, mut gm, mut gl, mut hm, mut hl), chunk_idx| -> Result<_, String> {
+                    let start = chunk_idx * ROW_CHUNK_SIZE;
+                    let end = (start + ROW_CHUNK_SIZE).min(n);
+                    let rows = end - start;
+                    let marginal_chunk = self
+                        .marginal_design
+                        .try_row_chunk(start..end)
+                        .map_err(|e| format!("bernoulli marginal_design try_row_chunk: {e}"))?;
+                    let logslope_chunk = self
+                        .logslope_design
+                        .try_row_chunk(start..end)
+                        .map_err(|e| format!("bernoulli logslope_design try_row_chunk: {e}"))?;
+                    let mut gm_w_buf = [0.0f64; ROW_CHUNK_SIZE];
+                    let mut gl_w_buf = [0.0f64; ROW_CHUNK_SIZE];
+                    let mut hm_w_buf = [0.0f64; ROW_CHUNK_SIZE];
+                    let mut hl_w_buf = [0.0f64; ROW_CHUNK_SIZE];
+                    let gm_w = &mut gm_w_buf[..rows];
+                    let gl_w = &mut gl_w_buf[..rows];
+                    let hm_w = &mut hm_w_buf[..rows];
+                    let hl_w = &mut hl_w_buf[..rows];
+                    for local_row in 0..rows {
+                        let row = start + local_row;
+                        let marginal_eta = block_states[0].eta[row];
+                        let marginal = self.marginal_link_map(marginal_eta)?;
+                        let g = block_states[1].eta[row];
+                        let (neglog, grad, h) =
+                            self.rigid_row_kernel_eval(row, marginal_eta, marginal, g)?;
+                        ll -= neglog;
+                        gm_w[local_row] =
+                            Self::exact_newton_score_component_from_objective_gradient(grad[0]);
+                        gl_w[local_row] =
+                            Self::exact_newton_score_component_from_objective_gradient(grad[1]);
+                        hm_w[local_row] = h[0][0];
+                        hl_w[local_row] = h[1][1];
+                    }
+                    add_weighted_chunk_gradient(&marginal_chunk, gm_w, &mut gm);
+                    add_weighted_chunk_gradient(&logslope_chunk, gl_w, &mut gl);
+                    add_weighted_chunk_gram(&marginal_chunk, hm_w, &mut hm);
+                    add_weighted_chunk_gram(&logslope_chunk, hl_w, &mut hl);
+                    Ok((ll, gm, gl, hm, hl))
+                },
+            )
+            .try_reduce(
+                make_acc,
+                |(lll, mut lgm, mut lgl, mut lhm, mut lhl),
+                 (rll, rgm, rgl, rhm, rhl)|
+                 -> Result<_, String> {
+                    lgm += &rgm;
+                    lgl += &rgl;
+                    lhm += &rhm;
+                    lhl += &rhl;
+                    Ok((lll + rll, lgm, lgl, lhm, lhl))
+                },
+            )?;
 
         Ok(FamilyEvaluation {
             log_likelihood: ll,
@@ -15248,7 +15263,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         // The workspace impl above unconditionally returns `Some(workspace)`
         // — the rigid path produces a `RowKernelHessianWorkspace` and the
         // flex path produces a
@@ -15256,15 +15271,15 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         // route the joint Hessian through Hv operators rather than dense
         // assembly. This advertises β-space representation support only; it
         // does not imply a profiled outer θ-HVP.
-        true
+        parameter_block_specs_match_rows(specs, self.y.len())
     }
 
-    fn inner_joint_workspace_gradient_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
-        true
+    fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        parameter_block_specs_match_rows(specs, self.y.len())
     }
 
-    fn inner_joint_workspace_log_likelihood_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
-        true
+    fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        parameter_block_specs_match_rows(specs, self.y.len())
     }
 
     fn exact_newton_joint_hessian_directional_derivative(
@@ -15469,31 +15484,31 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         if self.score_block_index().is_some_and(|idx| block_idx == idx)
             && let (Some(runtime), Some(score)) =
                 (&self.score_warp, self.score_block_state(block_states)?)
-            {
-                let current = &score.beta;
-                if current.len() != beta.len() {
-                    return Err(format!(
-                        "score-warp post-update beta length mismatch: current={}, proposed={}",
-                        current.len(),
-                        beta.len()
-                    ));
-                }
-                return project_monotone_feasible_beta(runtime, current, &beta, "score_warp_dev");
+        {
+            let current = &score.beta;
+            if current.len() != beta.len() {
+                return Err(format!(
+                    "score-warp post-update beta length mismatch: current={}, proposed={}",
+                    current.len(),
+                    beta.len()
+                ));
             }
+            return project_monotone_feasible_beta(runtime, current, &beta, "score_warp_dev");
+        }
         if self.link_block_index().is_some_and(|idx| block_idx == idx)
             && let (Some(runtime), Some(link)) =
                 (&self.link_dev, self.link_block_state(block_states)?)
-            {
-                let current = &link.beta;
-                if current.len() != beta.len() {
-                    return Err(format!(
-                        "link-deviation post-update beta length mismatch: current={}, proposed={}",
-                        current.len(),
-                        beta.len()
-                    ));
-                }
-                return project_monotone_feasible_beta(runtime, current, &beta, "link_dev");
+        {
+            let current = &link.beta;
+            if current.len() != beta.len() {
+                return Err(format!(
+                    "link-deviation post-update beta length mismatch: current={}, proposed={}",
+                    current.len(),
+                    beta.len()
+                ));
             }
+            return project_monotone_feasible_beta(runtime, current, &beta, "link_dev");
+        }
         Ok(beta)
     }
 }
@@ -17010,11 +17025,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let logslope_design = joint_designs.remove(0);
     let marginalspec_boot = joint_specs.remove(0);
     let logslopespec_boot = joint_specs.remove(0);
-    let (latent_measure, latent_z_calibration) = build_latent_measure_with_geometry(
-        &spec.z,
-        &spec.weights,
-        &spec.latent_z_policy,
-    )?;
+    let (latent_measure, latent_z_calibration) =
+        build_latent_measure_with_geometry(&spec.z, &spec.weights, &spec.latent_z_policy)?;
     if latent_measure.is_empirical() && sigma_learnable {
         return Err("empirical latent-measure marginal-slope calibration requires fixed GaussianShift sigma; learnable sigma derivatives must be fit under the standard-normal latent measure"
                     .to_string());
@@ -17532,17 +17544,27 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 bidx += 1;
             }
             if link_dev_prepared.is_some()
-                && let Some(block) = fit.block_states.get(bidx) {
-                    hints_mut.link_dev_beta = Some(block.beta.clone());
-                }
+                && let Some(block) = fit.block_states.get(bidx)
+            {
+                hints_mut.link_dev_beta = Some(block.beta.clone());
+            }
             Ok(fit)
         },
         |theta,
          specs: &[TermCollectionSpec],
          designs: &[TermCollectionDesign],
          eval_mode,
-         _row_set: &crate::families::row_kernel::RowSet| {
+         row_set: &crate::families::row_kernel::RowSet| {
             use crate::solver::estimate::reml::unified::EvalMode;
+            let row_set_rows = match row_set {
+                crate::families::row_kernel::RowSet::All => spec.y.len(),
+                crate::families::row_kernel::RowSet::Subsample { rows, .. } => rows.len(),
+            };
+            log::debug!(
+                "[BMS exact outer eval] mode={:?} row_set_rows={}",
+                eval_mode,
+                row_set_rows
+            );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             let sigma = sigma_from_theta(theta);
@@ -17707,8 +17729,9 @@ mod tests {
         let score_prepared = build_score_warp_deviation_block_from_seed(&z, &cfg)?;
         let q_seed = Array1::from_iter(z.iter().map(|zi| 0.05 + 0.2 * zi));
         let link_seed = padded_deviation_seed(&q_seed, 1.0, 0.5);
-        let link_prepared =
-            build_link_deviation_block_from_knots_design_seed_and_weights(&link_seed, &q_seed, &cfg)?;
+        let link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+            &link_seed, &q_seed, &cfg,
+        )?;
         let family = BernoulliMarginalSlopeFamily {
             y: Arc::new(y),
             weights: Arc::new(weights),
@@ -17803,11 +17826,10 @@ mod tests {
         // to functions strongly correlated with score-warp evaluations.
         let q0_seed = Array1::from_iter(z.iter().map(|zi| 0.1 + 0.45 * zi));
         let link_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
-        let mut link_prepared =
-            build_link_deviation_block_from_knots_design_seed_and_weights(
-                &link_seed, &q0_seed, &link_cfg,
-            )
-            .expect("link-deviation fixture");
+        let mut link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+            &link_seed, &q0_seed, &link_cfg,
+        )
+        .expect("link-deviation fixture");
         let p_link_before = link_prepared.runtime.basis_dim();
         let _ = link_seed; // padded knot-seed retained only for knot construction
         let anchor_design_for_test = score_prepared
@@ -17889,11 +17911,10 @@ mod tests {
         };
         let q0_seed = Array1::from_iter(z.iter().map(|zi| 0.05 + 0.4 * zi));
         let link_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
-        let mut link_prepared =
-            build_link_deviation_block_from_knots_design_seed_and_weights(
-                &link_seed, &q0_seed, &link_cfg,
-            )
-            .expect("link-dev fixture");
+        let mut link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+            &link_seed, &q0_seed, &link_cfg,
+        )
+        .expect("link-dev fixture");
         let _ = link_seed;
         let p_before = link_prepared.runtime.basis_dim();
         assert!(p_before > 0, "fixture must have positive basis_dim");
@@ -17953,11 +17974,10 @@ mod tests {
         };
         let q0_seed = Array1::from_iter(z.iter().map(|zi| 0.05 + 0.4 * zi));
         let link_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
-        let mut link_prepared =
-            build_link_deviation_block_from_knots_design_seed_and_weights(
-                &link_seed, &q0_seed, &link_cfg,
-            )
-            .expect("link-dev fixture");
+        let mut link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+            &link_seed, &q0_seed, &link_cfg,
+        )
+        .expect("link-dev fixture");
         let _ = link_seed;
         let p_before = link_prepared.runtime.basis_dim();
         assert!(
@@ -18039,11 +18059,10 @@ mod tests {
         };
         let q0_seed = Array1::from_iter(z.iter().map(|zi| 0.05 + 0.4 * zi));
         let link_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
-        let mut link_prepared =
-            build_link_deviation_block_from_knots_design_seed_and_weights(
-                &link_seed, &q0_seed, &link_cfg,
-            )
-            .expect("link-dev fixture");
+        let mut link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+            &link_seed, &q0_seed, &link_cfg,
+        )
+        .expect("link-dev fixture");
         let _ = link_seed;
         let candidate_design = link_prepared
             .runtime
@@ -18117,11 +18136,10 @@ mod tests {
         };
         let q0_seed = Array1::from_iter(z.iter().map(|zi| 0.03 + 0.42 * zi));
         let link_seed = padded_deviation_seed(&q0_seed, 1.0, 0.5);
-        let mut link_prepared =
-            build_link_deviation_block_from_knots_design_seed_and_weights(
-                &link_seed, &q0_seed, &link_cfg,
-            )
-            .expect("link-dev fixture");
+        let mut link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+            &link_seed, &q0_seed, &link_cfg,
+        )
+        .expect("link-dev fixture");
         let _ = link_seed;
         let candidate_design = link_prepared
             .runtime
@@ -18284,9 +18302,10 @@ mod tests {
             .expect("score-warp deviation block");
         let q_seed = Array1::from_iter(z.iter().map(|zi| 0.1 + 0.25 * zi));
         let link_seed = padded_deviation_seed(&q_seed, 1.0, 0.5);
-        let link_prepared =
-            build_link_deviation_block_from_knots_design_seed_and_weights(&link_seed, &q_seed, &cfg)
-                .expect("link-wiggle deviation block");
+        let link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+            &link_seed, &q_seed, &cfg,
+        )
+        .expect("link-wiggle deviation block");
 
         let cache = new_intercept_warm_start_cache(n);
         let make_family =
@@ -18386,9 +18405,10 @@ mod tests {
             .expect("score-warp deviation block");
         let q_seed = Array1::from_iter(z.iter().map(|zi| 0.1 + 0.2 * zi));
         let link_seed = padded_deviation_seed(&q_seed, 1.0, 0.5);
-        let link_prepared =
-            build_link_deviation_block_from_knots_design_seed_and_weights(&link_seed, &q_seed, &cfg)
-                .expect("link-wiggle deviation block");
+        let link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+            &link_seed, &q_seed, &cfg,
+        )
+        .expect("link-wiggle deviation block");
         let family = BernoulliMarginalSlopeFamily {
             y: Arc::new(y),
             weights: Arc::new(weights),
@@ -25272,10 +25292,12 @@ mod tests {
             .expect("joint gradient result")
             .expect("joint gradient");
         let slices = block_slices(&family);
-        let ranges = [slices.marginal.clone(),
+        let ranges = [
+            slices.marginal.clone(),
             slices.logslope.clone(),
             slices.h.clone().expect("score-warp block"),
-            slices.w.clone().expect("link-deviation block")];
+            slices.w.clone().expect("link-deviation block"),
+        ];
 
         assert!((eval.log_likelihood - joint_gradient.log_likelihood).abs() < 2e-12);
         assert!(

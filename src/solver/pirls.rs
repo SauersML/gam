@@ -813,8 +813,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
     }
 }
 
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum FirthDiagnostics {
     #[default]
     Inactive,
@@ -823,7 +822,6 @@ pub enum FirthDiagnostics {
         hat_diag: Array1<f64>,
     },
 }
-
 
 impl FirthDiagnostics {
     #[inline]
@@ -3567,27 +3565,24 @@ fn estimate_sparse_native_decision(
     };
     let nnz_x = x_sparse.val().len();
     match workspace.sparse_penalized_system_stats(x_sparse, s_lambda) {
-        Ok(stats) => {
-            
-            SparsePirlsDecision {
-                path: if stats.density_upper <= SPARSE_NATIVE_MAX_H_DENSITY {
-                    PirlsLinearSolvePath::SparseNative
-                } else {
-                    PirlsLinearSolvePath::DenseTransformed
-                },
-                reason: if stats.density_upper <= SPARSE_NATIVE_MAX_H_DENSITY {
-                    "sparse_native_eligible"
-                } else {
-                    "penalized_hessian_too_dense"
-                },
-                p,
-                nnz_x,
-                nnz_xtwx_symbolic: Some(stats.nnz_xtwx_symbolic),
-                nnz_s_lambda: stats.nnz_s_lambda_upper,
-                nnz_h_est: Some(stats.nnz_h_upper),
-                density_h_est: Some(stats.density_upper),
-            }
-        }
+        Ok(stats) => SparsePirlsDecision {
+            path: if stats.density_upper <= SPARSE_NATIVE_MAX_H_DENSITY {
+                PirlsLinearSolvePath::SparseNative
+            } else {
+                PirlsLinearSolvePath::DenseTransformed
+            },
+            reason: if stats.density_upper <= SPARSE_NATIVE_MAX_H_DENSITY {
+                "sparse_native_eligible"
+            } else {
+                "penalized_hessian_too_dense"
+            },
+            p,
+            nnz_x,
+            nnz_xtwx_symbolic: Some(stats.nnz_xtwx_symbolic),
+            nnz_s_lambda: stats.nnz_s_lambda_upper,
+            nnz_h_est: Some(stats.nnz_h_upper),
+            density_h_est: Some(stats.density_upper),
+        },
         Err(_) => dense_reject("sparse_stats_failed", nnz_x),
     }
 }
@@ -4636,12 +4631,13 @@ where
     let penalizedobjective = |state: &WorkingState| {
         let mut value = state.deviance + state.penalty_term;
         if options.firth_bias_reduction
-            && let Some(jeffreys_logdet) = state.jeffreys_logdet() {
-                // Jeffreys/Firth adds the identifiable-subspace Jeffreys term
-                // Φ to the log-likelihood,
-                // so the PIRLS deviance is reduced by 2 * Φ.
-                value -= 2.0 * jeffreys_logdet;
-            }
+            && let Some(jeffreys_logdet) = state.jeffreys_logdet()
+        {
+            // Jeffreys/Firth adds the identifiable-subspace Jeffreys term
+            // Φ to the log-likelihood,
+            // so the PIRLS deviance is reduced by 2 * Φ.
+            value -= 2.0 * jeffreys_logdet;
+        }
         value
     };
 
@@ -5335,10 +5331,10 @@ where
                         }
                         if preferred_curvature == HessianCurvatureKind::Observed
                             && state.hessian_curvature == HessianCurvatureKind::Observed
-                                && !used_fisher_fallback_this_iter
-                            {
-                                consecutive_fisher_fallbacks = 0;
-                            }
+                            && !used_fisher_fallback_this_iter
+                        {
+                            consecutive_fisher_fallbacks = 0;
+                        }
                         if aa_attempt {
                             aa_state.note_accept(iter);
                         }
@@ -6669,8 +6665,7 @@ fn build_sparse_native_reparam_result(
     };
     // In the sparse-native path, qs = I, so the penalties are already in the
     // right coordinate frame. We keep them as-is in canonical_transformed.
-    let canonical_transformed: Vec<crate::construction::CanonicalPenalty> =
-        penalties.to_vec();
+    let canonical_transformed: Vec<crate::construction::CanonicalPenalty> = penalties.to_vec();
     ReparamResult {
         penalty_shrinkage_ridge: base.penalty_shrinkage_ridge,
         s_transformed: s_original,
@@ -7726,96 +7721,96 @@ fn solve_penalized_least_squares_implicit(
     // assemble the penalized Hessian in sparse format and solve with sparse
     // Cholesky.  This avoids O(p²) dense X'WX and O(p³) dense factorization.
     if transform.is_none()
-        && let Some(x_sparse) = x_original.as_sparse() {
-            let PirlsPenalty::Dense { s_transformed, .. } = penalty else {
-                return Err(EstimationError::InvalidInput(
-                    "sparse-native PIRLS requires a dense transformed penalty matrix".to_string(),
-                ));
-            };
-            let weights_owned = weights.to_owned();
-
-            // Gaussian-Identity fast path: the inner sparse `XᵀWX` is invariant
-            // across the outer REML loop because the IRLS weights are constant
-            // (W = priorweights). The cached values land in the inner workspace
-            // and bypass the per-eval SpGEMM.
-            let precomputed_xtwx = gaussian_fixed_cache
-                .and_then(|c| c.xtwx_sparse_orig.as_ref().map(|arc| arc.as_ref()));
-
-            // 1. Sparse penalized Hessian: H = X'diag(w)X + S_λ + ridge·I.
-            //    The Cholesky factor is reused from the SPD check so we avoid
-            //    factorizing the same matrix twice.
-            let (h_sparse, factor, ridge_used) =
-                ensure_sparse_positive_definitewithridge(|ridge| {
-                    let ridge = if ridge == 0.0 {
-                        FIXED_STABILIZATION_RIDGE
-                    } else {
-                        ridge
-                    };
-                    workspace.assemble_sparse_penalized_hessian(
-                        x_sparse,
-                        &weights_owned,
-                        s_transformed,
-                        ridge,
-                        precomputed_xtwx,
-                    )
-                })?;
-
-            // 2. RHS = X'W(z - offset) + S_λ μ + ridge_used · μ.
-            // The `ridge_used · μ` term matches the diagonal ridge added to
-            // the Hessian in step 1, keeping the augmented system a
-            // Tikhonov regularization centered at the prior mean target
-            // rather than at zero (see `prior_mean_target` field docs).
-            let mut wz = z.to_owned();
-            wz -= &offset;
-            wz *= &weights_owned;
-            let mut rhs = x_original.transpose_vector_multiply(&wz);
-            rhs += penalty.linear_shift();
-            if ridge_used > 0.0 {
-                let prior_mean_target = penalty.prior_mean_target();
-                if prior_mean_target.len() == rhs.len() {
-                    rhs.scaled_add(ridge_used, prior_mean_target);
-                }
-            }
-
-            // 3. Sparse Cholesky solve (factor reused from step 1)
-            let betavec = solve_sparse_spd(&factor, &rhs)?;
-
-            // 4. EDF via sparse factorization
-            let h_sym = SymmetricMatrix::Sparse(h_sparse);
-            let edf = calculate_edf_with_penalty(&h_sym, penalty)?;
-
-            // 5. Fitted values and scale
-            let fitted_vals = {
-                let xb = x_original.apply(&betavec);
-                let mut f = xb;
-                f += &offset;
-                f
-            };
-            let standard_deviation = match link_function {
-                LinkFunction::Identity => {
-                    let residuals = &y - &fitted_vals;
-                    let weighted_rss: f64 = weights
-                        .iter()
-                        .zip(residuals.iter())
-                        .map(|(&w, &r)| w * r * r)
-                        .sum();
-                    let effective_n = y.len() as f64;
-                    (weighted_rss / (effective_n - edf).max(1.0)).sqrt()
-                }
-                _ => 1.0,
-            };
-
-            return Ok((
-                StablePLSResult {
-                    beta: Coefficients::new(betavec),
-                    penalized_hessian: h_sym,
-                    edf,
-                    standard_deviation,
-                    ridge_used,
-                },
-                p_dim,
+        && let Some(x_sparse) = x_original.as_sparse()
+    {
+        let PirlsPenalty::Dense { s_transformed, .. } = penalty else {
+            return Err(EstimationError::InvalidInput(
+                "sparse-native PIRLS requires a dense transformed penalty matrix".to_string(),
             ));
+        };
+        let weights_owned = weights.to_owned();
+
+        // Gaussian-Identity fast path: the inner sparse `XᵀWX` is invariant
+        // across the outer REML loop because the IRLS weights are constant
+        // (W = priorweights). The cached values land in the inner workspace
+        // and bypass the per-eval SpGEMM.
+        let precomputed_xtwx =
+            gaussian_fixed_cache.and_then(|c| c.xtwx_sparse_orig.as_ref().map(|arc| arc.as_ref()));
+
+        // 1. Sparse penalized Hessian: H = X'diag(w)X + S_λ + ridge·I.
+        //    The Cholesky factor is reused from the SPD check so we avoid
+        //    factorizing the same matrix twice.
+        let (h_sparse, factor, ridge_used) = ensure_sparse_positive_definitewithridge(|ridge| {
+            let ridge = if ridge == 0.0 {
+                FIXED_STABILIZATION_RIDGE
+            } else {
+                ridge
+            };
+            workspace.assemble_sparse_penalized_hessian(
+                x_sparse,
+                &weights_owned,
+                s_transformed,
+                ridge,
+                precomputed_xtwx,
+            )
+        })?;
+
+        // 2. RHS = X'W(z - offset) + S_λ μ + ridge_used · μ.
+        // The `ridge_used · μ` term matches the diagonal ridge added to
+        // the Hessian in step 1, keeping the augmented system a
+        // Tikhonov regularization centered at the prior mean target
+        // rather than at zero (see `prior_mean_target` field docs).
+        let mut wz = z.to_owned();
+        wz -= &offset;
+        wz *= &weights_owned;
+        let mut rhs = x_original.transpose_vector_multiply(&wz);
+        rhs += penalty.linear_shift();
+        if ridge_used > 0.0 {
+            let prior_mean_target = penalty.prior_mean_target();
+            if prior_mean_target.len() == rhs.len() {
+                rhs.scaled_add(ridge_used, prior_mean_target);
+            }
         }
+
+        // 3. Sparse Cholesky solve (factor reused from step 1)
+        let betavec = solve_sparse_spd(&factor, &rhs)?;
+
+        // 4. EDF via sparse factorization
+        let h_sym = SymmetricMatrix::Sparse(h_sparse);
+        let edf = calculate_edf_with_penalty(&h_sym, penalty)?;
+
+        // 5. Fitted values and scale
+        let fitted_vals = {
+            let xb = x_original.apply(&betavec);
+            let mut f = xb;
+            f += &offset;
+            f
+        };
+        let standard_deviation = match link_function {
+            LinkFunction::Identity => {
+                let residuals = &y - &fitted_vals;
+                let weighted_rss: f64 = weights
+                    .iter()
+                    .zip(residuals.iter())
+                    .map(|(&w, &r)| w * r * r)
+                    .sum();
+                let effective_n = y.len() as f64;
+                (weighted_rss / (effective_n - edf).max(1.0)).sqrt()
+            }
+            _ => 1.0,
+        };
+
+        return Ok((
+            StablePLSResult {
+                beta: Coefficients::new(betavec),
+                penalized_hessian: h_sym,
+                edf,
+                standard_deviation,
+                ridge_used,
+            },
+            p_dim,
+        ));
+    }
 
     // ── Dense / QS-rotated path ──────────────────────────────────────────
 
@@ -11495,12 +11490,13 @@ pub fn dense_block_xtwy(
         )));
     }
     if let Some(w) = row_weights.as_ref()
-        && w.len() != n {
-            return Err(EstimationError::InvalidInput(format!(
-                "dense block row weight length mismatch: expected {n}, got {}",
-                w.len()
-            )));
-        }
+        && w.len() != n
+    {
+        return Err(EstimationError::InvalidInput(format!(
+            "dense block row weight length mismatch: expected {n}, got {}",
+            w.len()
+        )));
+    }
     let mut out = Array1::<f64>::zeros(k * p_out);
     for row in 0..n {
         let rw = row_weights.as_ref().map(|w| w[row]).unwrap_or(1.0);

@@ -184,18 +184,19 @@ impl WarmStartStore {
         let now_nanos = nanos_now();
         if let Some(hit) = lookup_cache_get(&cache_key) {
             if let Ok(md) = fs::metadata(&hit.meta_path)
-                && md.modified().ok() == Some(hit.meta_mtime) {
-                    let expired = self.opts.ttl.as_nanos() > 0
-                        && now_nanos.saturating_sub(hit.write_nanos) >= self.opts.ttl.as_nanos();
-                    if !expired {
-                        return Ok(Some(hit.entry));
-                    }
-                    lookup_cache_invalidate(&cache_key);
-                    let bin = hit.meta_path.with_extension("bin");
-                    drop(fs::remove_file(&hit.meta_path));
-                    drop(fs::remove_file(&bin));
-                    return Ok(None);
+                && md.modified().ok() == Some(hit.meta_mtime)
+            {
+                let expired = self.opts.ttl.as_nanos() > 0
+                    && now_nanos.saturating_sub(hit.write_nanos) >= self.opts.ttl.as_nanos();
+                if !expired {
+                    return Ok(Some(hit.entry));
                 }
+                lookup_cache_invalidate(&cache_key);
+                let bin = hit.meta_path.with_extension("bin");
+                drop(fs::remove_file(&hit.meta_path));
+                drop(fs::remove_file(&bin));
+                return Ok(None);
+            }
             lookup_cache_invalidate(&cache_key);
         }
         let mut best: Option<(OnDiskMeta, PathBuf)> = None;
@@ -287,19 +288,20 @@ impl WarmStartStore {
         // nanosecond write timestamp is cached alongside so the fast path
         // can re-apply the TTL cutoff without re-reading the JSON.
         if let Ok(md) = fs::metadata(&meta_path)
-            && let Ok(mtime) = md.modified() {
-                let write_nanos = (meta.written_unix_secs as u128) * 1_000_000_000u128
-                    + meta.written_nanos as u128;
-                lookup_cache_insert(
-                    cache_key,
-                    CachedLookup {
-                        meta_path: meta_path.clone(),
-                        meta_mtime: mtime,
-                        write_nanos,
-                        entry: entry.clone(),
-                    },
-                );
-            }
+            && let Ok(mtime) = md.modified()
+        {
+            let write_nanos =
+                (meta.written_unix_secs as u128) * 1_000_000_000u128 + meta.written_nanos as u128;
+            lookup_cache_insert(
+                cache_key,
+                CachedLookup {
+                    meta_path: meta_path.clone(),
+                    meta_mtime: mtime,
+                    write_nanos,
+                    entry: entry.clone(),
+                },
+            );
+        }
         Ok(Some(entry))
     }
 
@@ -455,9 +457,10 @@ impl WarmStartStore {
                 // be in-flight writes from this very process; leave them.
                 if name.contains(".tmp.") {
                     if let Some(pid) = parse_tmp_pid(&name)
-                        && pid != std::process::id() {
-                            drop(fs::remove_file(&p));
-                        }
+                        && pid != std::process::id()
+                    {
+                        drop(fs::remove_file(&p));
+                    }
                     continue;
                 }
                 if p.extension().and_then(|s| s.to_str()) != Some("json") {

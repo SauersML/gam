@@ -229,31 +229,32 @@ fn weighted_crossprod_dense_rows(
     let p_left = left.ncols();
     let p_right = right.ncols();
     let mut out = Array2::<f64>::zeros((p_left, p_right));
-    if left.is_standard_layout() && right.is_standard_layout()
+    if left.is_standard_layout()
+        && right.is_standard_layout()
         && let (Some(lx), Some(rx), Some(w)) =
             (left.as_slice(), right.as_slice(), weights.as_slice())
-        {
-            let out_slice = out.as_slice_mut().expect("zeros are contiguous");
-            for i in rows {
-                let wi = w[i];
-                if wi == 0.0 {
+    {
+        let out_slice = out.as_slice_mut().expect("zeros are contiguous");
+        for i in rows {
+            let wi = w[i];
+            if wi == 0.0 {
+                continue;
+            }
+            let l_row = &lx[i * p_left..i * p_left + p_left];
+            let r_row = &rx[i * p_right..i * p_right + p_right];
+            for a in 0..p_left {
+                let scaled = wi * l_row[a];
+                if scaled == 0.0 {
                     continue;
                 }
-                let l_row = &lx[i * p_left..i * p_left + p_left];
-                let r_row = &rx[i * p_right..i * p_right + p_right];
-                for a in 0..p_left {
-                    let scaled = wi * l_row[a];
-                    if scaled == 0.0 {
-                        continue;
-                    }
-                    let out_row = &mut out_slice[a * p_right..a * p_right + p_right];
-                    for b in 0..p_right {
-                        out_row[b] += scaled * r_row[b];
-                    }
+                let out_row = &mut out_slice[a * p_right..a * p_right + p_right];
+                for b in 0..p_right {
+                    out_row[b] += scaled * r_row[b];
                 }
             }
-            return out;
         }
+        return out;
+    }
     for i in rows {
         let wi = weights[i];
         if wi == 0.0 {
@@ -537,50 +538,51 @@ fn dense_diag_gram_view(matrix: &Array2<f64>, weights: ArrayView1<'_, f64>) -> A
     // Fast path: if the matrix is row-major contiguous, read each row as a
     // slice and avoid n*p bounds-checked indexing.
     if matrix.is_standard_layout()
-        && let (Some(x), Some(w)) = (matrix.as_slice(), weights.as_slice()) {
-            if parallel {
-                return (0..n)
-                    .into_par_iter()
-                    .fold(
-                        || vec![0.0_f64; p],
-                        |mut acc, i| {
-                            let wi = w[i];
-                            if wi != 0.0 {
-                                let row = &x[i * p..i * p + p];
-                                for j in 0..p {
-                                    let xij = row[j];
-                                    acc[j] += wi * xij * xij;
-                                }
+        && let (Some(x), Some(w)) = (matrix.as_slice(), weights.as_slice())
+    {
+        if parallel {
+            return (0..n)
+                .into_par_iter()
+                .fold(
+                    || vec![0.0_f64; p],
+                    |mut acc, i| {
+                        let wi = w[i];
+                        if wi != 0.0 {
+                            let row = &x[i * p..i * p + p];
+                            for j in 0..p {
+                                let xij = row[j];
+                                acc[j] += wi * xij * xij;
                             }
-                            acc
-                        },
-                    )
-                    .reduce(
-                        || vec![0.0_f64; p],
-                        |mut a, b| {
-                            for (av, bv) in a.iter_mut().zip(b) {
-                                *av += bv;
-                            }
-                            a
-                        },
-                    )
-                    .into();
-            }
-            let mut diag = Array1::<f64>::zeros(p);
-            let diag_slice = diag.as_slice_mut().expect("zeros are contiguous");
-            for i in 0..n {
-                let wi = w[i];
-                if wi == 0.0 {
-                    continue;
-                }
-                let row = &x[i * p..i * p + p];
-                for j in 0..p {
-                    let xij = row[j];
-                    diag_slice[j] += wi * xij * xij;
-                }
-            }
-            return diag;
+                        }
+                        acc
+                    },
+                )
+                .reduce(
+                    || vec![0.0_f64; p],
+                    |mut a, b| {
+                        for (av, bv) in a.iter_mut().zip(b) {
+                            *av += bv;
+                        }
+                        a
+                    },
+                )
+                .into();
         }
+        let mut diag = Array1::<f64>::zeros(p);
+        let diag_slice = diag.as_slice_mut().expect("zeros are contiguous");
+        for i in 0..n {
+            let wi = w[i];
+            if wi == 0.0 {
+                continue;
+            }
+            let row = &x[i * p..i * p + p];
+            for j in 0..p {
+                let xij = row[j];
+                diag_slice[j] += wi * xij * xij;
+            }
+        }
+        return diag;
+    }
     let mut diag = Array1::<f64>::zeros(p);
     for i in 0..n {
         let wi = weights[i];
@@ -819,26 +821,26 @@ fn dense_transpose_weighted_response(
     if matrix.is_standard_layout()
         && let (Some(x), Some(w), Some(yslice)) =
             (matrix.as_slice(), weights.as_slice(), y.as_slice())
-        {
-            let scale_slice = row_scale.and_then(|s| s.as_slice());
-            let out_slice = out.as_slice_mut().expect("zeros are contiguous");
-            for i in 0..n {
-                let mut scaled = yslice[i] * w[i];
-                if let Some(s) = scale_slice {
-                    scaled *= s[i];
-                } else if let Some(scale) = row_scale {
-                    scaled *= scale[i];
-                }
-                if scaled == 0.0 {
-                    continue;
-                }
-                let row = &x[i * p..i * p + p];
-                for j in 0..p {
-                    out_slice[j] += row[j] * scaled;
-                }
+    {
+        let scale_slice = row_scale.and_then(|s| s.as_slice());
+        let out_slice = out.as_slice_mut().expect("zeros are contiguous");
+        for i in 0..n {
+            let mut scaled = yslice[i] * w[i];
+            if let Some(s) = scale_slice {
+                scaled *= s[i];
+            } else if let Some(scale) = row_scale {
+                scaled *= scale[i];
             }
-            return out;
+            if scaled == 0.0 {
+                continue;
+            }
+            let row = &x[i * p..i * p + p];
+            for j in 0..p {
+                out_slice[j] += row[j] * scaled;
+            }
         }
+        return out;
+    }
     for i in 0..n {
         let mut scaled = y[i] * weights[i];
         if let Some(scale) = row_scale {
@@ -868,20 +870,20 @@ fn dense_transpose_weighted_response_view(
     if matrix.is_standard_layout()
         && let (Some(x), Some(w), Some(yslice)) =
             (matrix.as_slice(), weights.as_slice(), y.as_slice())
-        {
-            let out_slice = out.as_slice_mut().expect("zeros are contiguous");
-            for i in 0..n {
-                let scaled = yslice[i] * w[i];
-                if scaled == 0.0 {
-                    continue;
-                }
-                let row = &x[i * p..i * p + p];
-                for j in 0..p {
-                    out_slice[j] += row[j] * scaled;
-                }
+    {
+        let out_slice = out.as_slice_mut().expect("zeros are contiguous");
+        for i in 0..n {
+            let scaled = yslice[i] * w[i];
+            if scaled == 0.0 {
+                continue;
             }
-            return out;
+            let row = &x[i * p..i * p + p];
+            for j in 0..p {
+                out_slice[j] += row[j] * scaled;
+            }
         }
+        return out;
+    }
     for i in 0..n {
         let scaled = y[i] * weights[i];
         if scaled == 0.0 {
@@ -3529,21 +3531,23 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
             ));
         }
         if let Some(z) = constraint_transform.as_ref()
-            && z.nrows() != k {
-                return Err(format!(
-                    "ChunkedKernelDesignOperator: constraint_transform rows {} != centers rows {}",
-                    z.nrows(),
-                    k,
-                ));
-            }
+            && z.nrows() != k
+        {
+            return Err(format!(
+                "ChunkedKernelDesignOperator: constraint_transform rows {} != centers rows {}",
+                z.nrows(),
+                k,
+            ));
+        }
         if let Some(poly) = poly_basis.as_ref()
-            && poly.nrows() != n {
-                return Err(format!(
-                    "ChunkedKernelDesignOperator: poly_basis rows {} != data rows {}",
-                    poly.nrows(),
-                    n,
-                ));
-            }
+            && poly.nrows() != n
+        {
+            return Err(format!(
+                "ChunkedKernelDesignOperator: poly_basis rows {} != data rows {}",
+                poly.nrows(),
+                n,
+            ));
+        }
         let k_eff = constraint_transform.as_ref().map_or(k, |z| z.ncols());
         let poly_cols = poly_basis.as_ref().map_or(0, |p| p.ncols());
         Ok(Self {
@@ -5366,12 +5370,13 @@ pub trait LinearOperator {
             0.0
         };
         // Try matrix-free PCG first to avoid assembling the dense p×p normal matrix.
-        if self.uses_matrix_free_pcg() && self.ncols() >= MATRIX_FREE_PCG_MIN_P
+        if self.uses_matrix_free_pcg()
+            && self.ncols() >= MATRIX_FREE_PCG_MIN_P
             && let Ok(solution) =
                 self.solve_system_matrix_free_pcg_try(weights, rhs, penalty, baseridge)
-            {
-                return Ok(solution);
-            }
+        {
+            return Ok(solution);
+        }
         // Fallback: assemble dense system and solve via Cholesky with ridge retries.
         let mut system = self.diag_xtw_x(weights)?;
         if let Some(pen) = penalty {

@@ -733,17 +733,18 @@ fn sample_survival(
             .assign(&tb_deriv_dense);
     }
     if let Some((entry_w, exit_w, deriv_w)) = saved_timewiggle.as_ref()
-        && p_timewiggle > 0 {
-            x_entry
-                .slice_mut(s![.., p_time..(p_time + p_timewiggle)])
-                .assign(entry_w);
-            x_exit
-                .slice_mut(s![.., p_time..(p_time + p_timewiggle)])
-                .assign(exit_w);
-            x_derivative
-                .slice_mut(s![.., p_time..(p_time + p_timewiggle)])
-                .assign(deriv_w);
-        }
+        && p_timewiggle > 0
+    {
+        x_entry
+            .slice_mut(s![.., p_time..(p_time + p_timewiggle)])
+            .assign(entry_w);
+        x_exit
+            .slice_mut(s![.., p_time..(p_time + p_timewiggle)])
+            .assign(exit_w);
+        x_derivative
+            .slice_mut(s![.., p_time..(p_time + p_timewiggle)])
+            .assign(deriv_w);
+    }
     if p_cov > 0 {
         let cov_dense = cov_design.design.to_dense();
         let cov_range = (p_time + p_timewiggle)..(p_time + p_timewiggle + p_cov);

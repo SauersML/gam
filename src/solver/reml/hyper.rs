@@ -365,7 +365,6 @@ impl super::unified::HyperOperator for FirthAugmentedSingleHyperOperator {
             .sum();
         base_trace - firth_trace
     }
-
 }
 
 /// Augments a pair `HyperOperator` with the fixed-β Firth (Jeffreys) pair
@@ -1631,12 +1630,13 @@ impl<'a> RemlState<'a> {
                 // depends on β_{τ_j} (the IFT solve result), which the unified
                 // evaluator computes itself. Only the fixed-β partial goes in B_j.
                 if let Some(op) = firth_op.as_ref()
-                    && let Some(kernel) = firth_tau_kernel_j.as_ref() {
-                        let eye = Array2::<f64>::eye(p_dim);
-                        let hphi_tau_partial =
-                            Self::firth_hphi_tau_partial_apply(op, x_tau_j, kernel, &eye);
-                        b_j -= &hphi_tau_partial;
-                    }
+                    && let Some(kernel) = firth_tau_kernel_j.as_ref()
+                {
+                    let eye = Array2::<f64>::eye(p_dim);
+                    let hphi_tau_partial =
+                        Self::firth_hphi_tau_partial_apply(op, x_tau_j, kernel, &eye);
+                    b_j -= &hphi_tau_partial;
+                }
 
                 Some(b_j)
             };
@@ -2189,9 +2189,10 @@ impl<'a> RemlState<'a> {
             for ii in 0..n_dirs {
                 for jj in 0..n_dirs {
                     if let Some(t) = x_tau_tau[ii][jj].as_ref()
-                        && let TauTauDesignTerm::Dense(d) = t {
-                            dense_tau_tau[ii][jj] = Some(d.clone());
-                        }
+                        && let TauTauDesignTerm::Dense(d) = t
+                    {
+                        dense_tau_tau[ii][jj] = Some(d.clone());
+                    }
                 }
             }
             (op_opt, dense_list, dense_tau_tau)
@@ -2417,9 +2418,10 @@ impl<'a> RemlState<'a> {
             for ii in 0..n_dirs {
                 for jj in 0..n_dirs {
                     if let Some(t) = x_tau_tau[ii][jj].as_ref()
-                        && let TauTauDesignTerm::Dense(d) = t {
-                            dense_tau_tau[ii][jj] = Some(d.clone());
-                        }
+                        && let TauTauDesignTerm::Dense(d) = t
+                    {
+                        dense_tau_tau[ii][jj] = Some(d.clone());
+                    }
                 }
             }
             (op_opt, dense_list, dense_tau_tau)

@@ -6336,7 +6336,7 @@ impl AnalyticPenaltyOp {
 ///   1. Concatenate each penalty's owned ρ-axes onto the global ρ vector.
 ///   2. Route the inner gradient `∂L/∂target` contribution back into the
 ///      correct β or ext-coordinate slice.
-///   3. Build a Hessian-block stub for `RemlState` cache-key invalidation.
+///   3. Build a Hessian-block descriptor for `RemlState` cache-key invalidation.
 macro_rules! define_analytic_penalty_kind {
     ($(register!($variant:ident, $ty:ty);)*) => {
         #[derive(Clone)]

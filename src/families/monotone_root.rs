@@ -103,7 +103,6 @@ impl MonotoneRootError {
             a_hi: step_sign,
         }
     }
-
 }
 
 impl std::fmt::Display for MonotoneRootError {

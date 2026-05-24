@@ -1548,8 +1548,7 @@ fn cloglog_posterior_meanwith_deriv_ghq(
         };
     }
     let mean = cloglog_mean_from_survival(survival_posterior_mean_ghq(ctx, mu, sigma));
-    let dmean_dmu =
-        integrate_normal_ghq_adaptive(ctx, mu, sigma, cloglog_mean_d1_exact).max(0.0);
+    let dmean_dmu = integrate_normal_ghq_adaptive(ctx, mu, sigma, cloglog_mean_d1_exact).max(0.0);
     IntegratedMeanDerivative {
         mean,
         dmean_dmu,
@@ -1620,12 +1619,13 @@ fn cloglog_survival_term_controlled(
         return out;
     }
     if (mu.abs() / sigma) >= 3.0
-        && let Ok(out) = cloglog_survival_miles(mu, sigma) {
-            return (
-                out.clamp(0.0, 1.0),
-                IntegratedExpectationMode::ExactSpecialFunction,
-            );
-        }
+        && let Ok(out) = cloglog_survival_miles(mu, sigma)
+    {
+        return (
+            out.clamp(0.0, 1.0),
+            IntegratedExpectationMode::ExactSpecialFunction,
+        );
+    }
     if cloglog_should_prefer_cc(mu, sigma, CLOGLOG_CC_TOL)
         && let Ok(out) = cloglog_survival_cc(ctx, mu, sigma, CLOGLOG_CC_TOL)
     {

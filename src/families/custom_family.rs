@@ -1021,10 +1021,7 @@ fn debug_assert_hook_rho_matches_specs(
     specs: &[ParameterBlockSpec],
     context: &str,
 ) {
-    let expected = specs
-        .iter()
-        .map(|spec| spec.penalties.len())
-        .sum::<usize>();
+    let expected = specs.iter().map(|spec| spec.penalties.len()).sum::<usize>();
     debug_assert_eq!(
         rho.len(),
         expected,
@@ -2041,10 +2038,7 @@ pub trait CustomFamily {
         false
     }
 
-    fn inner_joint_workspace_log_likelihood_available(
-        &self,
-        specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         debug_assert_hook_blockspecs(specs, "inner joint workspace log-likelihood availability");
         false
     }
@@ -4107,92 +4101,110 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn transpose_mul(
         &self,
-        _axis: usize,
+        axis: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert_psi_axis_index(axis, "zero psi transpose_mul");
         debug_assert_eq!(v.len(), self.n);
         Ok(Array1::<f64>::zeros(self.p))
     }
 
     fn forward_mul(
         &self,
-        _axis: usize,
+        axis: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert_psi_axis_index(axis, "zero psi forward_mul");
         debug_assert_eq!(u.len(), self.p);
         Ok(Array1::<f64>::zeros(self.n))
     }
 
     fn transpose_mul_second_diag(
         &self,
-        _axis: usize,
+        axis: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert_psi_axis_index(axis, "zero psi transpose_mul_second_diag");
         debug_assert_eq!(v.len(), self.n);
         Ok(Array1::<f64>::zeros(self.p))
     }
 
     fn transpose_mul_second_cross(
         &self,
-        _axis_d: usize,
-        _axis_e: usize,
+        axis_d: usize,
+        axis_e: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert_psi_axis_index(axis_d, "zero psi transpose_mul_second_cross lhs");
+        debug_assert_psi_axis_index(axis_e, "zero psi transpose_mul_second_cross rhs");
         debug_assert_eq!(v.len(), self.n);
         Ok(Array1::<f64>::zeros(self.p))
     }
 
     fn forward_mul_second_diag(
         &self,
-        _axis: usize,
+        axis: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert_psi_axis_index(axis, "zero psi forward_mul_second_diag");
         debug_assert_eq!(u.len(), self.p);
         Ok(Array1::<f64>::zeros(self.n))
     }
 
     fn forward_mul_second_cross(
         &self,
-        _axis_d: usize,
-        _axis_e: usize,
+        axis_d: usize,
+        axis_e: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
+        debug_assert_psi_axis_index(axis_d, "zero psi forward_mul_second_cross lhs");
+        debug_assert_psi_axis_index(axis_e, "zero psi forward_mul_second_cross rhs");
         debug_assert_eq!(u.len(), self.p);
         Ok(Array1::<f64>::zeros(self.n))
     }
 
     fn row_chunk_first(
         &self,
-        _axis: usize,
+        axis: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        debug_assert_psi_axis_index(axis, "zero psi row_chunk_first");
+        debug_assert!(rows.start <= rows.end && rows.end <= self.n);
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 
     fn row_vector_first_into(
         &self,
-        _axis: usize,
-        _row: usize,
+        axis: usize,
+        row: usize,
         mut out: ArrayViewMut1<'_, f64>,
     ) -> Result<(), crate::terms::basis::BasisError> {
+        debug_assert_psi_axis_index(axis, "zero psi row_vector_first_into");
+        debug_assert!(row < self.n);
+        debug_assert_eq!(out.len(), self.p);
         out.fill(0.0);
         Ok(())
     }
 
     fn row_chunk_second_diag(
         &self,
-        _axis: usize,
+        axis: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        debug_assert_psi_axis_index(axis, "zero psi row_chunk_second_diag");
+        debug_assert!(rows.start <= rows.end && rows.end <= self.n);
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 
     fn row_chunk_second_cross(
         &self,
-        _axis_d: usize,
-        _axis_e: usize,
+        axis_d: usize,
+        axis_e: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
+        debug_assert_psi_axis_index(axis_d, "zero psi row_chunk_second_cross lhs");
+        debug_assert_psi_axis_index(axis_e, "zero psi row_chunk_second_cross rhs");
+        debug_assert!(rows.start <= rows.end && rows.end <= self.n);
         Ok(Array2::<f64>::zeros((rows.end - rows.start, self.p)))
     }
 }
@@ -6140,9 +6152,14 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// trace against the fixed logdet factor `F`.
     fn projected_directional_derivative_traces(
         &self,
-        _factor: &Array2<f64>,
-        _directions: &Array2<f64>,
+        factor: &Array2<f64>,
+        directions: &Array2<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
+        debug_assert_eq!(
+            factor.nrows(),
+            directions.nrows(),
+            "projected directional derivative traces require shared coefficient dimension"
+        );
         Ok(None)
     }
 
@@ -8435,7 +8452,11 @@ fn penalty_logdet_cholesky_fallback(
     .into())
 }
 
-fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, _dim: usize) -> RidgeDeterminantMode {
+fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, dim: usize) -> RidgeDeterminantMode {
+    debug_assert!(
+        dim.checked_add(1).is_some(),
+        "ridge determinant dimension overflow"
+    );
     match ridge_policy.determinant_mode {
         RidgeDeterminantMode::Auto => RidgeDeterminantMode::Full,
         mode => mode,
@@ -8451,7 +8472,9 @@ fn inverse_spdwith_retry(
     symmetrize_dense_in_place(&mut sym);
 
     let invert_via_chol =
-        |chol: &crate::faer_ndarray::FaerCholeskyFactor, _attempt: usize, _boost: f64| {
+        |chol: &crate::faer_ndarray::FaerCholeskyFactor, attempt: usize, boost: f64| {
+            debug_assert!(attempt <= max_retry);
+            debug_assert!(boost.is_finite() && boost >= 0.0);
             let mut ident = Array2::<f64>::eye(sym.nrows());
             chol.solve_mat_in_place(&mut ident);
             symmetrize_dense_in_place(&mut ident);
