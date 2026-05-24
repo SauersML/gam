@@ -2327,7 +2327,7 @@ impl<'a> RemlState<'a> {
                     Self::tk_fill_gram_block_entries_scalar(x_dense, z, i_block, j_block, gram);
                 }
 
-                let design_gram = if has_design_deriv && use_dense_kernels {
+                let design_gram_active = if has_design_deriv && use_dense_kernels {
                     let x_theta = x_fixed.expect("design derivative checked above");
                     let rows = i1 - i0;
                     let cols = j1 - j0;
@@ -2339,9 +2339,9 @@ impl<'a> RemlState<'a> {
                     let x_theta_j = x_theta.slice(s![j0..j1, ..]);
                     let z_i = z.slice(s![.., i0..i1]);
                     ndarray::linalg::general_mat_mul(1.0, &x_theta_j, &z_i, 0.0, &mut reverse);
-                    Some((rows, cols))
+                    true
                 } else {
-                    None
+                    false
                 };
 
                 let mut block_sum = 0.0_f64;
@@ -2355,7 +2355,7 @@ impl<'a> RemlState<'a> {
                         let gij = gram[[bi, bj]];
                         let cpj = c_prime[jj];
                         let c_direct = (cpi * cj + ci * cpj) * gij * gij * gij / 12.0;
-                        let k_direct = if design_gram.is_some() {
+                        let k_direct = if design_gram_active {
                             let kp = block_scratch[[bi, bj]] + reverse_scratch[[bj, bi]];
                             0.25 * ci * cj * gij * gij * kp
                         } else if let Some(x_theta) = x_fixed {

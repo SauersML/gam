@@ -3,7 +3,7 @@ use crate::estimate::EstimationError;
 use crate::estimate::reml::FirthDenseOperator;
 use crate::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, FaerSymmetricFactor,
-    array1_to_col_matmut, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av_into,
+    array1_to_col_matmut, array2_to_matmut, fast_ab, fast_atb, fast_atv, fast_av, fast_av_into,
 };
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd, solve_sparse_spd_into,
@@ -1580,11 +1580,21 @@ impl KroneckerQsTransform {
 
     fn apply_internal(&self, vector: &Array1<f64>, transpose: bool) -> Array1<f64> {
         debug_assert_eq!(vector.len(), self.p);
-        let mut current = vector.to_vec();
-        for (axis, q) in self.marginal_qs.iter().enumerate() {
-            current = apply_kron_mode(&current, &self.dims, axis, q, transpose);
-        }
-        Array1::from_vec(current)
+        // Ping-pong two thread-local scratch buffers across axes so we
+        // allocate at most twice per thread for the whole solver lifetime
+        // instead of once per `apply` call per axis.
+        kron_apply_scratch::with(|scratch| {
+            let (front, back) = scratch.pair_with_capacity(self.p);
+            front.clear();
+            front.extend_from_slice(vector.as_slice().expect("Array1 must be contiguous"));
+            for (axis, q) in self.marginal_qs.iter().enumerate() {
+                back.clear();
+                back.resize(front.len(), 0.0);
+                apply_kron_mode_into(front, &self.dims, axis, q, transpose, back);
+                std::mem::swap(front, back);
+            }
+            Array1::from_vec(std::mem::take(front))
+        })
     }
 
     fn materialize(&self) -> Array2<f64> {
@@ -1625,17 +1635,18 @@ fn symmetrize_dense_matrix(matrix: &Array2<f64>) -> Array2<f64> {
     (matrix + &matrix.t().to_owned()) * 0.5
 }
 
-fn apply_kron_mode(
+fn apply_kron_mode_into(
     data: &[f64],
     dims: &[usize],
     axis: usize,
     q: &Array2<f64>,
     transpose: bool,
-) -> Vec<f64> {
+    out: &mut [f64],
+) {
     let before: usize = dims[..axis].iter().product();
     let dim = dims[axis];
     let after: usize = dims[axis + 1..].iter().product();
-    let mut out = vec![0.0_f64; data.len()];
+    debug_assert_eq!(out.len(), data.len());
     for b in 0..before {
         for s in 0..after {
             for i in 0..dim {
@@ -1648,7 +1659,44 @@ fn apply_kron_mode(
             }
         }
     }
-    out
+}
+
+/// Thread-local ping-pong scratch buffers for Kronecker mode application.
+/// Sized lazily to the largest p ever seen on this thread.
+mod kron_apply_scratch {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static SCRATCH: RefCell<Pair> = const { RefCell::new(Pair::new()) };
+    }
+
+    pub(super) struct Pair {
+        a: Vec<f64>,
+        b: Vec<f64>,
+    }
+
+    impl Pair {
+        pub(super) const fn new() -> Self {
+            Self {
+                a: Vec::new(),
+                b: Vec::new(),
+            }
+        }
+
+        pub(super) fn pair_with_capacity(&mut self, capacity: usize) -> (&mut Vec<f64>, &mut Vec<f64>) {
+            if self.a.capacity() < capacity {
+                self.a.reserve(capacity - self.a.capacity());
+            }
+            if self.b.capacity() < capacity {
+                self.b.reserve(capacity - self.b.capacity());
+            }
+            (&mut self.a, &mut self.b)
+        }
+    }
+
+    pub(super) fn with<R>(f: impl FnOnce(&mut Pair) -> R) -> R {
+        SCRATCH.with(|cell| f(&mut cell.borrow_mut()))
+    }
 }
 
 struct GamWorkingModel<'a> {
