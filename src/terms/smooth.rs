@@ -45,8 +45,8 @@ use crate::mixture_link::{
 use crate::pirls::LinearInequalityConstraints;
 use crate::resource::MatrixMaterializationError;
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodFamily, LikelihoodSpec, LinkFunction,
-    MixtureLinkState, ResponseFamily, SasLinkState,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LinkFunction, MixtureLinkState,
+    ResponseFamily, SasLinkState,
 };
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
