@@ -280,18 +280,16 @@ pub fn try_fast_xt_diag_x_arc<S: Data<Elem = f64>>(
     w: &ArrayBase<S, Ix1>,
 ) -> Option<Array2<f64>> {
     let (rows, cols) = x.dim();
-    let runtime = GpuRuntime::global();
-    if !runtime.is_available() {
-        return None;
-    }
+    let runtime = GpuRuntime::global()?;
     let policy = runtime.policy();
-    if !policy.route_xt_diag_y(rows, cols, cols) {
+    let flops = rows.saturating_mul(cols).saturating_mul(cols).saturating_mul(2);
+    if rows < policy.xtwx_n_min || flops < policy.xtwx_flops_min {
         diagnostics::log_policy_cpu(
             "xt_diag_x_resident",
             format!("rows={rows} cols={cols}"),
             format!(
-                "below cuBLAS policy threshold rows>={} and gemm_flops>={}",
-                policy.xtwx_min_rows, policy.gemm_min_flops
+                "below cuBLAS policy threshold rows>={} and xtwx_flops>={}",
+                policy.xtwx_n_min, policy.xtwx_flops_min
             ),
         );
         return None;
@@ -432,7 +430,7 @@ fn cache() -> &'static SessionCache {
 }
 
 fn upload_x(x: &Arc<Array2<f64>>) -> Option<DeviceXSession> {
-    let runtime = GpuRuntime::global();
+    let runtime = GpuRuntime::global()?;
     let device = runtime.selected_device()?.clone();
 
     let (rows, cols) = x.dim();
@@ -524,7 +522,7 @@ mod tests {
         let x = Arc::new(Array2::<f64>::zeros((512, 8)));
         let w = ndarray::Array1::<f64>::from_elem(512, 1.0);
         let result = try_fast_xt_diag_x_arc(&x, &w);
-        if GpuRuntime::global().is_available() {
+        if GpuRuntime::is_available() {
             // Either dispatched or declined — both are valid here.
             assert!(result.is_some() || result.is_none());
         } else {
@@ -537,7 +535,7 @@ mod tests {
         // Insert more than MAX_CACHE_ENTRIES distinct arcs. The cache must
         // evict the oldest. We can only check size when a GPU is available;
         // otherwise upload_x returns None and the cache stays empty.
-        if !GpuRuntime::global().is_available() {
+        if !GpuRuntime::is_available() {
             return;
         }
         let cache = cache();

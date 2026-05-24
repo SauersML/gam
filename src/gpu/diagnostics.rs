@@ -2,25 +2,20 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
 
 use super::device::GpuDeviceInfo;
-use super::policy::DispatchPolicy;
+use super::policy::GpuDispatchPolicy;
 use super::runtime::GpuRuntime;
 
-pub(crate) fn log_cuda_enabled(device: &GpuDeviceInfo, policy: &DispatchPolicy) {
+pub(crate) fn log_cuda_enabled(device: &GpuDeviceInfo, policy: &GpuDispatchPolicy) {
     log::info!(
-        "[GPU] CUDA acceleration enabled\n  device: {}\n  measured: fp64={} GFLOP/s h2d={:.1} GB/s d2h={:.1} GB/s memory={}\n  libraries: CUDA driver ready; cuBLAS/cuSOLVER/cuSPARSE load on first use\n  dispatch: xtwx_rows>={} gemm>={}flop gemv>={}flop spmv_rows>={} spmv_nnz>={} chol_p>={} syevd_p>={} trsm>={}flop",
-        device,
-        format_float(device.peak_fp64_gflops()),
-        device.calibration.h2d_gb_s,
-        device.calibration.d2h_gb_s,
-        format_bytes(device.total_memory_bytes),
-        policy.xtwx_min_rows,
+        "[GPU] CUDA acceleration enabled\n  device: {} '{}' | memory={}\n  libraries: CUDA driver ready; cuBLAS/cuSOLVER/cuSPARSE load on first use\n  dispatch: xtwx_rows>={} gemm>={}flop spmv_nnz>={} chol_p>={} syevd_p>={}",
+        device.ordinal,
+        device.name,
+        format_bytes(device.total_mem_bytes),
+        policy.xtwx_n_min,
         format_count(policy.gemm_min_flops),
-        format_count(policy.gemv_min_flops),
-        policy.spmv_min_rows,
-        format_count(policy.spmv_min_nnz as u64),
-        policy.chol_min_p,
+        format_count(policy.sparse_min_nnz as u64),
+        policy.potrf_min_p,
         policy.syevd_min_p,
-        format_count(policy.trsm_min_flops),
     );
 }
 
@@ -35,10 +30,10 @@ pub(crate) fn log_cuda_pool(devices: &[GpuDeviceInfo]) {
                 "{}:'{}' sm_{}{} {}SM {}",
                 device.ordinal,
                 device.name,
-                device.compute_capability_major,
-                device.compute_capability_minor,
+                device.capability.compute_major,
+                device.capability.compute_minor,
                 device.sm_count,
-                format_bytes(device.total_memory_bytes),
+                format_bytes(device.total_mem_bytes),
             )
         })
         .collect::<Vec<_>>()
@@ -83,7 +78,7 @@ pub(crate) fn log_policy_cpu(op: &'static str, shape: String, reason: String) {
 }
 
 pub(crate) fn dispatch_decline_reason(policy_reason: String) -> String {
-    if let Some(cpu_reason) = GpuRuntime::global().cpu_reason() {
+    if let Some(cpu_reason) = GpuRuntime::cpu_reason() {
         format!("CUDA unavailable: {cpu_reason}")
     } else {
         policy_reason
@@ -92,7 +87,7 @@ pub(crate) fn dispatch_decline_reason(policy_reason: String) -> String {
 
 pub(crate) fn log_runtime_cpu(op: &'static str, backend: &'static str, shape: String) {
     activity::record_runtime_decline(op);
-    if let Some(cpu_reason) = GpuRuntime::global().cpu_reason() {
+    if let Some(cpu_reason) = GpuRuntime::cpu_reason() {
         log_route(format!(
             "[GPU] CPU route | op={op} | backend={backend} | reason=CUDA unavailable: {cpu_reason}"
         ));
@@ -257,7 +252,7 @@ fn format_float(value: f64) -> String {
 /// host); the empty case is suppressed so we don't spam logs on machines
 /// without CUDA installed.
 pub fn gpu_activity_summary() -> Option<String> {
-    if !GpuRuntime::global().is_available() {
+    if !GpuRuntime::is_available() {
         return None;
     }
     Some(activity::snapshot_summary())
