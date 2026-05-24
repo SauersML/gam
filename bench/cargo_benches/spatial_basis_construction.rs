@@ -3,8 +3,8 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use gam::terms::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
-    MaternBasisSpec, MaternIdentifiability, MaternNu, ThinPlateBasisSpec, build_duchon_basis,
-    build_matern_basis, build_thin_plate_basis,
+    MaternBasisSpec, MaternIdentifiability, MaternNu, OneDimensionalBoundary, ThinPlateBasisSpec,
+    build_duchon_basis, build_matern_basis, build_thin_plate_basis,
 };
 use ndarray::Array2;
 
@@ -26,6 +26,7 @@ fn bench_spatial_basis_construction(c: &mut Criterion) {
     c.bench_function("matern_basis_design_kernel_large_nk", |b| {
         let spec = MaternBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            periodic: None,
             length_scale: 1.25,
             nu: MaternNu::ThreeHalves,
             include_intercept: true,
@@ -45,7 +46,8 @@ fn bench_spatial_basis_construction(c: &mut Criterion) {
             identifiability: Default::default(),
             aniso_log_scales: Some(vec![0.15, -0.05, 0.0]),
             operator_penalties: DuchonOperatorPenaltySpec::default(),
-            periodic: false,
+            periodic: None,
+            boundary: OneDimensionalBoundary::Open,
         };
         b.iter(|| black_box(build_duchon_basis(data.view(), &spec).unwrap()));
     });
@@ -53,6 +55,7 @@ fn bench_spatial_basis_construction(c: &mut Criterion) {
     c.bench_function("thin_plate_basis_design_kernel_large_nk", |b| {
         let spec = ThinPlateBasisSpec {
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            periodic: None,
             length_scale: 1.0,
             double_penalty: false,
             identifiability: Default::default(),
