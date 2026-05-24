@@ -72,10 +72,9 @@ pub trait RiemannianManifold: Send + Sync {
 
     fn project_tangent(
         &self,
-        point: ArrayView1<'_, f64>,
+        _point: ArrayView1<'_, f64>,
         vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
-        std::hint::black_box(point);
         Ok(vec.to_owned())
     }
 
