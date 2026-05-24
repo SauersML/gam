@@ -131,7 +131,7 @@ extern "C" __global__ void reduce_kernel(
         .ok_or_else(|| GpuError::DriverCallFailed {
             reason: "reductions input slice not contiguous".to_string(),
         })?;
-    let dx = stream.memcpy_stod(slice).map_err(map_drv)?;
+    let dx = stream.clone_htod(slice).map_err(map_drv)?;
 
     let threads: u32 = 256;
     let blocks = ((n as u32) + threads - 1) / threads;
@@ -158,7 +158,7 @@ extern "C" __global__ void reduce_kernel(
     // SAFETY: all kernel-arg lifetimes + bounds checked above.
     unsafe { builder.launch(cfg) }.map_err(map_drv)?;
 
-    let host_part = stream.memcpy_dtov(&dpart).map_err(map_drv)?;
+    let host_part = stream.clone_dtoh(&dpart).map_err(map_drv)?;
     let result = match kind {
         ReductionKind::Sum | ReductionKind::DotSelf => host_part.iter().copied().sum::<f64>(),
         ReductionKind::Max => host_part.iter().copied().fold(f64::NEG_INFINITY, f64::max),

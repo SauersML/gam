@@ -250,7 +250,7 @@ extern "C" __global__ void irls_link_kernel(
     let eta_slice = eta.as_slice().ok_or_else(|| GpuError::DriverCallFailed {
         reason: "irls_link eta slice not contiguous".to_string(),
     })?;
-    let deta = stream.memcpy_stod(eta_slice).map_err(map_drv)?;
+    let deta = stream.clone_htod(eta_slice).map_err(map_drv)?;
     let mut dout = stream.alloc_zeros::<f64>(n * cols).map_err(map_drv)?;
 
     let threads: u32 = 256;
@@ -274,7 +274,7 @@ extern "C" __global__ void irls_link_kernel(
     // SAFETY: all kernel-arg lifetimes + bounds checked above.
     unsafe { builder.launch(cfg) }.map_err(map_drv)?;
 
-    let host = stream.memcpy_dtov(&dout).map_err(map_drv)?;
+    let host = stream.clone_dtoh(&dout).map_err(map_drv)?;
     Array2::from_shape_vec((n, cols), host).map_err(|e| GpuError::DriverCallFailed {
         reason: format!("irls_link host reshape failed: {e}"),
     })

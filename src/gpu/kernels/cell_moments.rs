@@ -161,12 +161,12 @@ extern "C" __global__ void cell_moments_kernel(
         cc2.push(cell.c2);
         cc3.push(cell.c3);
     }
-    let dl = stream.memcpy_stod(&lefts).map_err(map_drv)?;
-    let dr = stream.memcpy_stod(&rights).map_err(map_drv)?;
-    let d0 = stream.memcpy_stod(&cc0).map_err(map_drv)?;
-    let d1 = stream.memcpy_stod(&cc1).map_err(map_drv)?;
-    let d2 = stream.memcpy_stod(&cc2).map_err(map_drv)?;
-    let d3 = stream.memcpy_stod(&cc3).map_err(map_drv)?;
+    let dl = stream.clone_htod(&lefts).map_err(map_drv)?;
+    let dr = stream.clone_htod(&rights).map_err(map_drv)?;
+    let d0 = stream.clone_htod(&cc0).map_err(map_drv)?;
+    let d1 = stream.clone_htod(&cc1).map_err(map_drv)?;
+    let d2 = stream.clone_htod(&cc2).map_err(map_drv)?;
+    let d3 = stream.clone_htod(&cc3).map_err(map_drv)?;
     let mut dout = stream
         .alloc_zeros::<f64>(n_cells * n_moments)
         .map_err(map_drv)?;
@@ -196,7 +196,7 @@ extern "C" __global__ void cell_moments_kernel(
     // threads, matching the kernel's indexed bounds check.
     unsafe { builder.launch(cfg) }.map_err(map_drv)?;
 
-    let host = stream.memcpy_dtov(&dout).map_err(map_drv)?;
+    let host = stream.clone_dtoh(&dout).map_err(map_drv)?;
     Array2::from_shape_vec((n_cells, n_moments), host).map_err(|e| GpuError::DriverCallFailed {
         reason: format!("cell_moments host reshape failed: {e}"),
     })
