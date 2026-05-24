@@ -6219,12 +6219,6 @@ impl OrthogonalityPenalty {
         }
         dense
     }
-
-    /// Dense cross-axis Hessian; no blockwise reduction preserves the
-    /// rotation-gauge term.
-    pub fn as_blockwise(&self, _: usize) -> Option<Vec<BlockwisePenalty>> {
-        None
-    }
 }
 
 impl AnalyticPenalty for OrthogonalityPenalty {
