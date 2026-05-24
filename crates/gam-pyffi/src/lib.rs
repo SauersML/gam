@@ -9404,6 +9404,12 @@ struct DesignMatrixPayload {
     n_cols: usize,
     family_kind: String,
     model_class: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    beta: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    covariance_flat: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    covariance_n: Option<usize>,
 }
 
 fn design_matrix_table_impl(
@@ -9436,12 +9442,21 @@ fn design_matrix_dataset_impl(
     let n_cols = dense.ncols();
     // Row-major flatten matches numpy's default reshape order.
     let x_flat: Vec<f64> = dense.iter().copied().collect();
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    let covariance = fit
+        .beta_covariance_corrected()
+        .or_else(|| fit.beta_covariance());
+    let covariance_n = covariance.map(|c| c.nrows());
+    let covariance_flat = covariance.map(|c| c.iter().copied().collect::<Vec<_>>());
     let payload = DesignMatrixPayload {
         x_flat,
         n_rows,
         n_cols,
         family_kind: family_link_kind(model.likelihood()).to_string(),
         model_class: prediction_model_class_label(model),
+        beta: Some(fit.beta.to_vec()),
+        covariance_flat,
+        covariance_n,
     };
     serde_json::to_string(&payload)
         .map_err(|err| format!("failed to serialize design matrix payload: {err}"))
