@@ -7958,7 +7958,7 @@ impl CustomFamily for TransformationNormalFamily {
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        debug_assert!(block_specs.len() <= isize::MAX as usize);
+        assert!(block_specs.len() <= isize::MAX as usize);
         if block_states.len() != 1 {
             return Err(TransformationNormalError::InvalidInput {
                 reason: format!(
@@ -8131,8 +8131,8 @@ impl CustomFamily for TransformationNormalFamily {
         block_index: usize,
         block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        debug_assert!(block_states.len() <= isize::MAX as usize);
-        debug_assert!(!block_spec.name.is_empty());
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(!block_spec.name.is_empty());
         if block_index != 0 {
             return Ok(None);
         }
@@ -8200,7 +8200,7 @@ impl CustomFamily for TransformationNormalFamily {
         psi_derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        debug_assert!(block_specs.len() <= isize::MAX as usize);
+        assert!(block_specs.len() <= isize::MAX as usize);
         if psi_derivs.is_empty() || psi_index >= psi_derivs[0].len() {
             return Ok(None);
         }
@@ -8243,7 +8243,7 @@ impl CustomFamily for TransformationNormalFamily {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        debug_assert!(block_specs.len() <= isize::MAX as usize);
+        assert!(block_specs.len() <= isize::MAX as usize);
         if psi_derivs.is_empty() || psi_i >= psi_derivs[0].len() || psi_j >= psi_derivs[0].len() {
             return Ok(None);
         }
@@ -8350,7 +8350,7 @@ impl CustomFamily for TransformationNormalFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        debug_assert!(block_specs.len() <= isize::MAX as usize);
+        assert!(block_specs.len() <= isize::MAX as usize);
         if psi_derivs.is_empty() || psi_index >= psi_derivs[0].len() {
             return Ok(None);
         }
@@ -8656,7 +8656,7 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
     }
 
     fn directional_derivative(&self, arr: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
-        debug_assert!(arr.iter().all(|v| !v.is_nan()));
+        assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
 
@@ -8689,8 +8689,8 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
         arr: &Array1<f64>,
         arr2: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        debug_assert!(arr.iter().all(|v| !v.is_nan()));
-        debug_assert!(arr2.iter().all(|v| !v.is_nan()));
+        assert!(arr.iter().all(|v| !v.is_nan()));
+        assert!(arr2.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
 
