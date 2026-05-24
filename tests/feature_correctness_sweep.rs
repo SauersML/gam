@@ -495,6 +495,7 @@ fn build_harmonic(
         method: SphereMethod::Harmonic,
         max_degree: Some(l),
         wahba_kernel: Default::default(),
+        streaming_chunk_size: None,
     };
     build_spherical_spline_basis(data, &spec)
 }
@@ -630,6 +631,7 @@ fn sphere_harmonic_rejects_l_zero_and_too_large() {
         method: SphereMethod::Harmonic,
         max_degree: Some(0),
         wahba_kernel: Default::default(),
+        streaming_chunk_size: None,
     };
     let r = build_spherical_spline_basis(pts.view(), &spec);
     assert!(r.is_err(), "L=0 should be rejected");
@@ -642,6 +644,7 @@ fn sphere_harmonic_rejects_l_zero_and_too_large() {
         method: SphereMethod::Harmonic,
         max_degree: Some(33),
         wahba_kernel: Default::default(),
+        streaming_chunk_size: None,
     };
     let r = build_spherical_spline_basis(pts.view(), &spec);
     assert!(r.is_err(), "L>32 should be rejected");
@@ -705,6 +708,7 @@ fn both_sphere_methods_give_rotation_invariant_smoothers() {
             method,
             max_degree: Some(4),
             wahba_kernel: Default::default(),
+        streaming_chunk_size: None,
         };
         let spec_b = SphericalSplineBasisSpec {
             center_strategy: CenterStrategy::UserProvided(rot.clone()),
@@ -714,6 +718,7 @@ fn both_sphere_methods_give_rotation_invariant_smoothers() {
             method,
             max_degree: Some(4),
             wahba_kernel: Default::default(),
+        streaming_chunk_size: None,
         };
         let a = build_spherical_spline_basis(pts.view(), &spec_a).unwrap();
         let b = build_spherical_spline_basis(rot.view(), &spec_b).unwrap();
