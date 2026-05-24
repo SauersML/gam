@@ -4,7 +4,8 @@ use gam::construction::CanonicalPenalty;
 use gam::faer_ndarray::{FaerArrayView, FaerColView, factorize_symmetricwith_fallback, fast_ata};
 use gam::pirls::{self, PenaltyConfig, PirlsConfig, PirlsProblem};
 use gam::types::{
-    GlmFamily, GlmLikelihoodSpec, InverseLink, LinkFunction, LogSmoothingParamsView,
+    GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, LogSmoothingParamsView,
+    ResponseFamily,
 };
 use ndarray::{Array1, Array2, Axis};
 use rand::SeedableRng;
@@ -48,7 +49,10 @@ fn fit_unpenalized(
     let offset = Array1::<f64>::zeros(x.nrows());
     let canonical: Vec<gam::construction::CanonicalPenalty> = Vec::new();
     let cfg = PirlsConfig {
-        likelihood: GlmLikelihoodSpec::canonical(GlmFamily::BinomialLogit),
+        likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        )),
         link_kind: InverseLink::Standard(link),
         max_iterations: 100,
         convergence_tolerance: 1e-10,
@@ -106,7 +110,10 @@ fn fit_identity_penalized(
         op: None,
     }];
     let cfg = PirlsConfig {
-        likelihood: GlmLikelihoodSpec::canonical(GlmFamily::BinomialLogit),
+        likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        )),
         link_kind: InverseLink::Standard(link),
         max_iterations: 100,
         convergence_tolerance: 1e-10,

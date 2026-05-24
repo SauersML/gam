@@ -1277,7 +1277,7 @@ fn reml_fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
             _,
         ) => likelihood.fixed_phi().unwrap_or(1.0),
         // RoystonParmar is survival-specific and not produced by
-        // `reml_spec` from any `GlmFamily` variant.
+        // `reml_spec` from any `LikelihoodSpec` GLM family combination.
         (ResponseFamily::RoystonParmar, _) => likelihood.fixed_phi().unwrap_or(1.0),
     }
 }
