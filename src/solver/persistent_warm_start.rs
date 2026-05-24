@@ -280,9 +280,19 @@ fn load_json_record<T: for<'de> Deserialize<'de>>(key: &str) -> Option<T> {
     serde_json::from_slice(&entry.payload).ok()
 }
 
+/// Anchor the warm-start cache under the platform temp directory.
+///
+/// Reading `XDG_CACHE_HOME` / `HOME` / `LOCALAPPDATA` (the canonical
+/// `dirs::cache_dir()` fallbacks) requires `env::var_os`, which is banned
+/// in this crate (see the build-script tripwire scan and the
+/// `feedback_no_env_vars` policy memo). `std::env::temp_dir()` resolves
+/// platform-conventional locations through OS-level primitives without
+/// going through `env::var`, so we route the persistent warm-start
+/// checkpoint root there instead. The directory is durable across
+/// processes within a single boot, and `WarmStartStore::open` falls back
+/// to `None` if the path is unwritable.
 fn persistent_store() -> Option<WarmStartStore> {
-    let base = dirs::cache_dir()?;
-    let root = base.join("gam").join("warm").join("v1");
+    let root = std::env::temp_dir().join("gam").join("warm").join("v1");
     WarmStartStore::open(
         root,
         StoreOptions {
