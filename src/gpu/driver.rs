@@ -168,17 +168,23 @@ impl<'a> DeviceAllocation<'a> {
 
 impl Drop for DeviceAllocation<'_> {
     fn drop(&mut self) {
+        // Re-bind the owning context before freeing: cuMemFree requires a
+        // current context on the calling thread, and Drop may fire from a
+        // different thread than `new`. We then ALWAYS attempt the free,
+        // even if set_current failed (e.g. driver was deinitialized at
+        // shutdown). Skipping the free on a transient set_current failure
+        // would silently leak device memory — never acceptable on GPU.
         // SAFETY: state.context was produced by cuCtxCreate and is kept
-        // alive by the allocation borrow; the driver fn pointer was
-        // resolved against the same live libcuda handle.
-        let set_current = unsafe { (self.state.api.cu_ctx_set_current)(self.state.context) };
-        if set_current == 0 {
-            // SAFETY: self.ptr was produced by cuMemAlloc inside Self::new
-            // while state.context was current; Drop has just made that same
-            // context current on this thread, and this RAII owner frees once.
-            unsafe {
-                drop((self.state.api.cu_mem_free)(self.ptr));
-            }
+        // alive for at least the duration of this borrow; the driver fn
+        // pointers were resolved against the same live libcuda handle.
+        unsafe {
+            drop((self.state.api.cu_ctx_set_current)(self.state.context));
+        }
+        // SAFETY: self.ptr was produced by cuMemAlloc inside Self::new
+        // while state.context was current; we have just re-bound that same
+        // context (best-effort) and this RAII owner frees exactly once.
+        unsafe {
+            drop((self.state.api.cu_mem_free)(self.ptr));
         }
     }
 }
