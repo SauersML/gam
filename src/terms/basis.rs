@@ -1587,6 +1587,8 @@ pub struct BSplineBasisSpec {
     /// sides which is a no-op.
     #[serde(default)]
     pub boundary_conditions: BSplineBoundaryConditions,
+    #[serde(default)]
+    pub streaming_chunk_size: Option<usize>,
 }
 
 /// Per-endpoint boundary constraint policy for B-spline 1D bases.
@@ -3831,6 +3833,193 @@ impl DenseDesignOperator for StreamingSphereEvaluator {
         if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
             return Err(MatrixMaterializationError::MissingRowChunk {
                 context: "StreamingSphereEvaluator row_chunk_into shape mismatch",
+            });
+        }
+        out.assign(&self.for_row_chunk(rows.start, rows.end));
+        Ok(())
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        self.for_row_chunk(0, self.nrows())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StreamingBSplineEvaluator {
+    data: Arc<Array1<f64>>,
+    knots: Arc<Array1<f64>>,
+    degree: usize,
+    boundary_conditions: BSplineBoundaryConditions,
+    periodic: Option<(f64, f64, usize)>,
+    transform: Option<Arc<Array2<f64>>>,
+    chunk_size: usize,
+    total_cols: usize,
+}
+
+impl StreamingBSplineEvaluator {
+    pub(crate) fn new(
+        data: Arc<Array1<f64>>,
+        knots: Arc<Array1<f64>>,
+        degree: usize,
+        boundary_conditions: BSplineBoundaryConditions,
+        periodic: Option<(f64, f64, usize)>,
+        transform: Option<Arc<Array2<f64>>>,
+        chunk_size: Option<usize>,
+    ) -> Result<Self, String> {
+        let raw_cols = bspline_raw_column_count(knots.as_ref(), degree, periodic)?;
+        if let Some(z) = transform.as_ref() {
+            if z.nrows() != raw_cols {
+                return Err(format!(
+                    "StreamingBSplineEvaluator: transform rows {} != raw basis columns {}",
+                    z.nrows(),
+                    raw_cols
+                ));
+            }
+        }
+        Ok(Self {
+            data: Arc::new(data.as_standard_layout().to_owned()),
+            knots: Arc::new(knots.as_standard_layout().to_owned()),
+            degree,
+            boundary_conditions,
+            periodic,
+            total_cols: transform.as_ref().map_or(raw_cols, |z| z.ncols()),
+            transform,
+            chunk_size: chunk_size.unwrap_or(2048).max(1),
+        })
+    }
+
+    fn chunk_rows(&self) -> usize {
+        self.chunk_size.min(self.data.len().max(1))
+    }
+
+    fn raw_chunk(&self, start: usize, end: usize) -> Array2<f64> {
+        let _boundary_conditions = self.boundary_conditions;
+        bspline_raw_row_chunk(
+            self.data.view(),
+            self.knots.view(),
+            self.degree,
+            self.periodic,
+            start,
+            end,
+        )
+        .expect("StreamingBSplineEvaluator validated inputs should build row chunks")
+    }
+
+    pub(crate) fn for_row_chunk(&self, start: usize, end: usize) -> Array2<f64> {
+        assert!(
+            start <= end && end <= self.data.len(),
+            "StreamingBSplineEvaluator row chunk out of bounds"
+        );
+        let raw = self.raw_chunk(start, end);
+        match self.transform.as_ref() {
+            Some(z) => fast_ab(&raw, z),
+            None => raw,
+        }
+    }
+
+    pub(crate) fn gradient_into(&self, theta: ArrayView1<'_, f64>, output: &mut Array1<f64>) {
+        assert_eq!(
+            theta.len(),
+            self.total_cols,
+            "StreamingBSplineEvaluator theta width mismatch"
+        );
+        assert_eq!(
+            output.len(),
+            self.data.len(),
+            "StreamingBSplineEvaluator output length mismatch"
+        );
+        output.fill(0.0);
+        for start in (0..self.data.len()).step_by(self.chunk_rows()) {
+            let end = (start + self.chunk_rows()).min(self.data.len());
+            let chunk = self.for_row_chunk(start, end);
+            let values = chunk.dot(&theta);
+            output.slice_mut(s![start..end]).assign(&values);
+        }
+    }
+}
+
+impl LinearOperator for StreamingBSplineEvaluator {
+    fn nrows(&self) -> usize {
+        self.data.len()
+    }
+
+    fn ncols(&self) -> usize {
+        self.total_cols
+    }
+
+    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(self.nrows());
+        self.gradient_into(vector.view(), &mut out);
+        out
+    }
+
+    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+        assert_eq!(
+            vector.len(),
+            self.nrows(),
+            "StreamingBSplineEvaluator transpose vector length mismatch"
+        );
+        let mut out = Array1::<f64>::zeros(self.ncols());
+        for start in (0..self.nrows()).step_by(self.chunk_rows()) {
+            let end = (start + self.chunk_rows()).min(self.nrows());
+            let chunk = self.for_row_chunk(start, end);
+            let partial = chunk.t().dot(&vector.slice(s![start..end]));
+            out += &partial;
+        }
+        out
+    }
+
+    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+        if weights.len() != self.nrows() {
+            return Err(format!(
+                "StreamingBSplineEvaluator diag_xtw_x weight length mismatch: weights={}, nrows={}",
+                weights.len(),
+                self.nrows()
+            ));
+        }
+        let p = self.ncols();
+        let chunk_rows = self.chunk_rows();
+        let starts = (0..self.nrows()).step_by(chunk_rows).collect::<Vec<_>>();
+        Ok(starts
+            .into_par_iter()
+            .fold(
+                || Array2::<f64>::zeros((p, p)),
+                |mut acc, start| {
+                    let end = (start + chunk_rows).min(self.nrows());
+                    let chunk = self.for_row_chunk(start, end);
+                    let mut weighted = chunk.clone();
+                    for local in 0..(end - start) {
+                        let w = weights[start + local];
+                        weighted.row_mut(local).mapv_inplace(|v| v * w);
+                    }
+                    acc += &chunk.t().dot(&weighted);
+                    acc
+                },
+            )
+            .reduce(
+                || Array2::<f64>::zeros((p, p)),
+                |mut a, b| {
+                    a += &b;
+                    a
+                },
+            ))
+    }
+}
+
+impl DenseDesignOperator for StreamingBSplineEvaluator {
+    fn row_chunk_into(
+        &self,
+        rows: Range<usize>,
+        mut out: ArrayViewMut2<'_, f64>,
+    ) -> Result<(), MatrixMaterializationError> {
+        if rows.end > self.nrows() || rows.start > rows.end {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "StreamingBSplineEvaluator row range out of bounds",
+            });
+        }
+        if out.nrows() != rows.end - rows.start || out.ncols() != self.ncols() {
+            return Err(MatrixMaterializationError::MissingRowChunk {
+                context: "StreamingBSplineEvaluator row_chunk_into shape mismatch",
             });
         }
         out.assign(&self.for_row_chunk(rows.start, rows.end));
