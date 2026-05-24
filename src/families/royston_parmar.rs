@@ -21,6 +21,16 @@ pub struct RoystonParmarInputs<'a> {
     pub derivative_offset_exit: Option<ArrayView1<'a, f64>>,
 }
 
+/// Per-row inputs for a Royston–Parmar survival model whose log-cumulative-hazard
+/// design factorises into a shared time block `time_*` and a row-aligned
+/// covariate block `covariates`.  The final design is `[time | covariates]`
+/// (column-wise concatenation per row).  `age_entry/age_exit` carry the
+/// delayed-entry/exit interval; `event_target` is the binary primary-event
+/// indicator and `event_competing` the competing-cause indicator.  The
+/// `monotonicity_constraint_*` views describe the linear constraint
+/// `A·β + offset ≥ 0` enforcing dη/da ≥ 0; the `*_offset_*` views carry the
+/// fixed (non-coefficient) addends to η at entry, η at exit, and dη/da at
+/// exit.  All views are zero-copy borrows of caller-owned storage.
 pub struct RoystonParmarSharedTimeCovariateInputs<'a> {
     pub age_entry: ArrayView1<'a, f64>,
     pub age_exit: ArrayView1<'a, f64>,
@@ -89,6 +99,14 @@ pub fn working_model_from_flattened(
     )
 }
 
+/// Build a Royston–Parmar `WorkingModelSurvival` from a shared time block
+/// and a row-aligned covariate block.  The composite design η = X β
+/// concatenates `[time_entry|covariates]` (and analogously for exit and
+/// derivative); penalties apply only to the time block, the covariate
+/// columns being unpenalized.  `monotonicity` records the dη/da ≥ 0
+/// linear-inequality penalty.  Returns the assembled working model that
+/// the engine drives during fitting; errors are `SurvivalError` cases
+/// (`DimensionMismatch` if the offset views are partially present).
 pub fn working_model_from_time_covariateshared(
     penalties: PenaltyBlocks,
     monotonicity: MonotonicityPenalty,

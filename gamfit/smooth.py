@@ -189,14 +189,15 @@ class Matern(Smooth):
     aniso_log_scales : optional length-d sequence. Per-axis log-scale
         contrasts with sum constraint Σ η_a = 0, implementing geometric
         anisotropy ``Λ = κ·diag(exp η)``. ``None`` uses isotropic.
-    streaming_chunk_size : optional row chunk size for streaming design evaluation.
+
+    Streaming row-chunked evaluation activates automatically when the
+    would-be dense basis buffer exceeds ~1 GiB; no opt-in is required.
     """
 
     centers: Any = None
     nu: float = 1.5
     length_scale: float = 1.0
     aniso_log_scales: Sequence[float] | None = None
-    streaming_chunk_size: int | None = None
 
 
 @dataclass(init=False, slots=True)
@@ -272,14 +273,15 @@ class Sphere(Smooth):
         ``m=2`` is the canonical TPS-on-sphere analogue (curvature).
     kernel : one of ``"sobolev"`` (default), ``"pseudo"``, ``"harmonic"``.
     radians : default ``False`` (degrees, Earth/data-frame convention).
-    streaming_chunk_size : optional row chunk size for streaming design evaluation.
+
+    Streaming row-chunked evaluation activates automatically when the
+    would-be dense basis buffer exceeds ~1 GiB; no opt-in is required.
     """
 
     n_centers: int = 50
     penalty_order: int = 2
     kernel: str = "sobolev"
     radians: bool = False
-    streaming_chunk_size: int | None = None
 
 
 @dataclass(slots=True)

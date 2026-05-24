@@ -24,6 +24,13 @@ pub fn normal_cdf(x: f64) -> f64 {
     0.5 * erfc(-x / std::f64::consts::SQRT_2)
 }
 
+/// Scaled complementary error function `erfcx(x) = exp(x²) · erfc(x)`,
+/// specialized to `x ≥ 0`.  Returns `1.0` for `x ≤ 0` and `0.0` for
+/// `x = +∞`.  For `0 < x < 26` uses the direct `exp(x²)·erfc(x)` form;
+/// beyond that the (otherwise overflowing) `exp(x²)` is replaced by a
+/// 4-term asymptotic expansion `(1/(x√π))·(1 − 1/(2x²) + 3/(4x⁴) − …)`,
+/// keeping relative accuracy near machine epsilon. The non-negative
+/// restriction lets the caller skip the reflection identity.
 #[inline]
 pub fn erfcx_nonnegative(x: f64) -> f64 {
     if !x.is_finite() {
