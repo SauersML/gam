@@ -387,6 +387,12 @@ struct FitArgs {
     /// non-binomial families.
     #[arg(long = "firth", default_value_t = false)]
     firth: bool,
+    /// Explicit response family. Use `auto` to infer the family.
+    #[arg(long = "family", value_enum, default_value_t = FamilyArg::Auto)]
+    family: FamilyArg,
+    /// Fixed size/overdispersion parameter for `--family negative-binomial`.
+    #[arg(long = "negative-binomial-theta", alias = "nb-theta")]
+    negative_binomial_theta: Option<f64>,
     /// Survival likelihood mode for Surv(...) formulas.
     #[arg(long = "survival-likelihood", default_value = "transformation")]
     survival_likelihood: String,
@@ -640,6 +646,8 @@ enum FamilyArg {
     BinomialCloglog,
     LatentCloglogBinomial,
     PoissonLog,
+    #[value(alias = "nb", alias = "negbin", alias = "negative_binomial")]
+    NegativeBinomial,
     GammaLog,
     RoystonParmar,
     TransformationNormal,
@@ -1085,7 +1093,12 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         None
     };
 
-    let family = resolve_family(FamilyArg::Auto, link_choice.clone(), y.view())?;
+    let family = resolve_family(
+        args.family,
+        args.negative_binomial_theta,
+        link_choice.clone(),
+        y.view(),
+    )?;
     if link_choice.is_none() {
         if is_binary_response(y.view()) {
             inference_notes.push(format!(
@@ -8032,10 +8045,20 @@ fn sample_std(v: ArrayView1<'_, f64>) -> f64 {
 
 fn resolve_family(
     arg: FamilyArg,
+    negative_binomial_theta: Option<f64>,
     link_choice: Option<LinkChoice>,
     y: ArrayView1<'_, f64>,
 ) -> Result<LikelihoodFamily, String> {
-    let explicit_family = family_from_arg(arg);
+    let nb_theta = negative_binomial_theta.unwrap_or(1.0);
+    if !nb_theta.is_finite() || nb_theta <= 0.0 {
+        return Err(format!(
+            "negative-binomial theta must be finite and > 0; got {nb_theta}"
+        ));
+    }
+    if negative_binomial_theta.is_some() && !matches!(arg, FamilyArg::NegativeBinomial) {
+        return Err("--negative-binomial-theta requires --family negative-binomial".to_string());
+    }
+    let explicit_family = family_from_arg(arg, nb_theta);
     if let Some(choice) = link_choice.as_ref() {
         let from_link = if choice.mixture_components.is_some() {
             LikelihoodFamily::BinomialMixture
@@ -8059,7 +8082,11 @@ fn resolve_family(
             }
         };
         if let Some(explicit) = explicit_family {
-            if explicit != from_link {
+            let compatible_log_nb = matches!(
+                (explicit, choice.link, choice.mixture_components.as_ref()),
+                (LikelihoodFamily::NegativeBinomial { .. }, LinkFunction::Log, None)
+            );
+            if explicit != from_link && !compatible_log_nb {
                 return Err(format!(
                     "--family '{}' conflicts with --link '{}'",
                     explicit.name(),
@@ -8067,7 +8094,7 @@ fn resolve_family(
                 ));
             }
         }
-        return Ok(from_link);
+        return Ok(explicit_family.unwrap_or(from_link));
     }
 
     Ok(match arg {
@@ -8077,6 +8104,7 @@ fn resolve_family(
         FamilyArg::BinomialCloglog => LikelihoodFamily::BinomialCLogLog,
         FamilyArg::LatentCloglogBinomial => LikelihoodFamily::BinomialLatentCLogLog,
         FamilyArg::PoissonLog => LikelihoodFamily::PoissonLog,
+        FamilyArg::NegativeBinomial => LikelihoodFamily::NegativeBinomial { theta: nb_theta },
         FamilyArg::GammaLog => LikelihoodFamily::GammaLog,
         FamilyArg::RoystonParmar => LikelihoodFamily::RoystonParmar,
         FamilyArg::TransformationNormal => LikelihoodFamily::GaussianIdentity,
@@ -8090,7 +8118,7 @@ fn resolve_family(
     })
 }
 
-fn family_from_arg(arg: FamilyArg) -> Option<LikelihoodFamily> {
+fn family_from_arg(arg: FamilyArg, negative_binomial_theta: f64) -> Option<LikelihoodFamily> {
     match arg {
         FamilyArg::Auto => None,
         FamilyArg::Gaussian => Some(LikelihoodFamily::GaussianIdentity),
@@ -8099,6 +8127,9 @@ fn family_from_arg(arg: FamilyArg) -> Option<LikelihoodFamily> {
         FamilyArg::BinomialCloglog => Some(LikelihoodFamily::BinomialCLogLog),
         FamilyArg::LatentCloglogBinomial => Some(LikelihoodFamily::BinomialLatentCLogLog),
         FamilyArg::PoissonLog => Some(LikelihoodFamily::PoissonLog),
+        FamilyArg::NegativeBinomial => Some(LikelihoodFamily::NegativeBinomial {
+            theta: negative_binomial_theta,
+        }),
         FamilyArg::GammaLog => Some(LikelihoodFamily::GammaLog),
         FamilyArg::RoystonParmar => Some(LikelihoodFamily::RoystonParmar),
         FamilyArg::TransformationNormal => Some(LikelihoodFamily::GaussianIdentity),
@@ -9850,6 +9881,8 @@ mod tests {
             hazard_loading: None,
             transformation_normal: false,
             firth: false,
+            family: FamilyArg::Auto,
+            negative_binomial_theta: None,
             survival_likelihood: "transformation".to_string(),
             survival_time_anchor: None,
             baseline_target: "linear".to_string(),
@@ -9963,7 +9996,7 @@ mod tests {
     fn resolve_family_auto_uses_logit_for_binary_response() {
         let y = array![0.0, 1.0, 1.0, 0.0];
 
-        let family = resolve_family(FamilyArg::Auto, None, y.view()).expect("resolve family");
+        let family = resolve_family(FamilyArg::Auto, None, None, y.view()).expect("resolve family");
 
         assert_eq!(family, LikelihoodFamily::BinomialLogit);
     }
@@ -10072,6 +10105,8 @@ mod tests {
             hazard_loading: None,
             transformation_normal: false,
             firth: false,
+            family: FamilyArg::Auto,
+            negative_binomial_theta: None,
             survival_likelihood: "transformation".to_string(),
             survival_time_anchor: None,
             baseline_target: "linear".to_string(),
@@ -10266,6 +10301,8 @@ mod tests {
             hazard_loading: None,
             transformation_normal: false,
             firth: false,
+            family: FamilyArg::Auto,
+            negative_binomial_theta: None,
             survival_likelihood: "transformation".to_string(),
             survival_time_anchor: None,
             baseline_target: "linear".to_string(),
@@ -10346,6 +10383,8 @@ mod tests {
             hazard_loading: None,
             transformation_normal: false,
             firth: false,
+            family: FamilyArg::Auto,
+            negative_binomial_theta: None,
             survival_likelihood: "transformation".to_string(),
             survival_time_anchor: None,
             baseline_target: "linear".to_string(),
@@ -10393,6 +10432,8 @@ mod tests {
             hazard_loading: None,
             transformation_normal: false,
             firth: false,
+            family: FamilyArg::Auto,
+            negative_binomial_theta: None,
             survival_likelihood: "transformation".to_string(),
             survival_time_anchor: None,
             baseline_target: "linear".to_string(),
@@ -10637,6 +10678,8 @@ mod tests {
             hazard_loading: None,
             transformation_normal: false,
             firth: false,
+            family: FamilyArg::Auto,
+            negative_binomial_theta: None,
             survival_likelihood: "transformation".to_string(),
             survival_time_anchor: None,
             baseline_target: "linear".to_string(),
@@ -10728,6 +10771,8 @@ mod tests {
             hazard_loading: None,
             transformation_normal: false,
             firth: true,
+            family: FamilyArg::Auto,
+            negative_binomial_theta: None,
             survival_likelihood: "transformation".to_string(),
             survival_time_anchor: None,
             baseline_target: "linear".to_string(),

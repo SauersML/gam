@@ -56,7 +56,7 @@ use crate::terms::{
     BlockSparsityPenalty, DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty,
     NuclearNormPenalty, OrthogonalityPenalty, ParametricAuxConditionalPriorPenalty,
     PenaltyConcavity, PenaltyTier, PsiSlice, ScadMcpPenalty, SoftmaxAssignmentSparsityPenalty,
-    SparsityPenalty, ScalarWeightSchedule, ScheduleKind, TotalVariationPenalty,
+    SparsityPenalty, TotalVariationPenalty,
 };
 use crate::survival::PenaltyBlock;
 use crate::types::{
@@ -2373,8 +2373,11 @@ use crate::term_builder::{
 /// Non-formula configuration for model fitting. All fields have sensible defaults.
 #[derive(Clone, Debug)]
 pub struct FitConfig {
-    /// Family: "gaussian", "binomial", "poisson", "gamma", or None for auto-detect.
+    /// Family: "gaussian", "binomial", "poisson", "negative-binomial", "gamma",
+    /// or None for auto-detect.
     pub family: Option<String>,
+    /// Fixed size/overdispersion parameter for `family="negative-binomial"`.
+    pub negative_binomial_theta: Option<f64>,
     /// Link: "identity", "logit", "probit", "cloglog", "sas", "beta-logistic", or None.
     pub link: Option<String>,
     /// Whether to use flexible (wiggle-augmented) link.
@@ -2475,6 +2478,7 @@ impl Default for FitConfig {
     fn default() -> Self {
         Self {
             family: None,
+            negative_binomial_theta: None,
             link: None,
             flexible_link: false,
             offset_column: None,
@@ -2619,22 +2623,53 @@ pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
 /// Resolve a family from an optional name, optional link choice, and response data.
 pub fn resolve_family(
     family: Option<&str>,
+    negative_binomial_theta: Option<f64>,
     link_choice: Option<&LinkChoice>,
     y: ArrayView1<'_, f64>,
 ) -> Result<LikelihoodFamily, String> {
-    let explicit = family.and_then(|name| match name.to_ascii_lowercase().as_str() {
-        "gaussian" => Some(LikelihoodFamily::GaussianIdentity),
-        "binomial" | "binomial-logit" => Some(LikelihoodFamily::BinomialLogit),
-        "binomial-probit" => Some(LikelihoodFamily::BinomialProbit),
-        "binomial-cloglog" => Some(LikelihoodFamily::BinomialCLogLog),
-        "latent-cloglog-binomial" => Some(LikelihoodFamily::BinomialLatentCLogLog),
-        "poisson" => Some(LikelihoodFamily::PoissonLog),
-        "beta" | "beta-logit" | "beta-regression" | "beta-regression-logit" => {
-            Some(LikelihoodFamily::BetaLogit { phi: 1.0 })
+    let nb_theta = negative_binomial_theta.unwrap_or(1.0);
+    if !nb_theta.is_finite() || nb_theta <= 0.0 {
+        return Err(format!(
+            "negative-binomial theta must be finite and > 0; got {nb_theta}"
+        ));
+    }
+    let explicit = match family {
+        Some(name) => {
+            let resolved = match name.to_ascii_lowercase().as_str() {
+                "gaussian" => LikelihoodFamily::GaussianIdentity,
+                "binomial" | "binomial-logit" => LikelihoodFamily::BinomialLogit,
+                "binomial-probit" => LikelihoodFamily::BinomialProbit,
+                "binomial-cloglog" => LikelihoodFamily::BinomialCLogLog,
+                "latent-cloglog-binomial" => LikelihoodFamily::BinomialLatentCLogLog,
+                "poisson" => LikelihoodFamily::PoissonLog,
+                "nb" | "negbin" | "negative_binomial" | "negative-binomial"
+                | "negative-binomial-log" => {
+                    LikelihoodFamily::NegativeBinomial { theta: nb_theta }
+                }
+                "beta" | "beta-logit" | "beta-regression" | "beta-regression-logit" => {
+                    LikelihoodFamily::BetaLogit { phi: 1.0 }
+                }
+                "gamma" => LikelihoodFamily::GammaLog,
+                other => {
+                    return Err(WorkflowError::InvalidConfig {
+                        reason: format!("unknown family '{other}'"),
+                    }
+                    .into());
+                }
+            };
+            Some(resolved)
         }
-        "gamma" => Some(LikelihoodFamily::GammaLog),
-        _ => None,
-    });
+        None => {
+            if negative_binomial_theta.is_some() {
+                return Err(WorkflowError::InvalidConfig {
+                    reason: "negative_binomial_theta requires family='negative-binomial'"
+                        .to_string(),
+                }
+                .into());
+            }
+            None
+        }
+    };
 
     if let Some(choice) = link_choice {
         let from_link = if choice.mixture_components.is_some() {
@@ -2659,14 +2694,18 @@ pub fn resolve_family(
             }
         };
         if let Some(explicit_family) = explicit {
-            if explicit_family != from_link {
+            let compatible_log_nb = matches!(
+                (explicit_family, choice.link, choice.mixture_components.as_ref()),
+                (LikelihoodFamily::NegativeBinomial { .. }, LinkFunction::Log, None)
+            );
+            if explicit_family != from_link && !compatible_log_nb {
                 return Err(WorkflowError::InvalidConfig {
                     reason: format!("family '{}' conflicts with link", explicit_family.name()),
                 }
                 .into());
             }
         }
-        return Ok(from_link);
+        return Ok(explicit.unwrap_or(from_link));
     }
 
     if let Some(f) = explicit {
@@ -3154,68 +3193,6 @@ fn analytic_descriptor_difference_op(
     }
 }
 
-fn analytic_descriptor_weight_schedule(
-    descriptor: &serde_json::Map<String, JsonValue>,
-    context: &str,
-) -> Result<Option<ScalarWeightSchedule>, String> {
-    let Some(raw_schedule) = descriptor.get("weight_schedule") else {
-        return Ok(None);
-    };
-    if raw_schedule.is_null() {
-        return Ok(None);
-    }
-    let schedule = raw_schedule
-        .as_object()
-        .ok_or_else(|| format!("{context}.weight_schedule must be an object"))?;
-    let w_start = schedule
-        .get("w_start")
-        .and_then(JsonValue::as_f64)
-        .ok_or_else(|| format!("{context}.weight_schedule.w_start must be a finite number"))?;
-    let w_end = schedule
-        .get("w_end")
-        .and_then(JsonValue::as_f64)
-        .ok_or_else(|| format!("{context}.weight_schedule.w_end must be a finite number"))?;
-    let kind_name = schedule
-        .get("kind")
-        .or_else(|| schedule.get("decay"))
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| format!("{context}.weight_schedule.kind is required"))?
-        .to_ascii_lowercase()
-        .replace('-', "_");
-    let kind = match kind_name.as_str() {
-        "geometric" => {
-            let rate = schedule
-                .get("rate")
-                .and_then(JsonValue::as_f64)
-                .ok_or_else(|| format!("{context}.weight_schedule.rate is required for geometric"))?;
-            ScheduleKind::Geometric { rate }
-        }
-        "linear" => {
-            let steps = schedule
-                .get("steps")
-                .and_then(JsonValue::as_u64)
-                .ok_or_else(|| format!("{context}.weight_schedule.steps is required for linear"))?;
-            ScheduleKind::Linear {
-                steps: steps as usize,
-            }
-        }
-        "reciprocal_iter" => ScheduleKind::ReciprocalIter,
-        other => {
-            return Err(format!(
-                "{context}.weight_schedule.kind must be geometric, linear, or reciprocal_iter; got {other:?}"
-            ));
-        }
-    };
-    let mut parsed = ScalarWeightSchedule::new(w_start, w_end, kind)
-        .map_err(|err| format!("{context}.weight_schedule: {err}"))?;
-    if let Some(iter_count) = schedule.get("iter_count") {
-        parsed.iter_count = iter_count.as_u64().ok_or_else(|| {
-            format!("{context}.weight_schedule.iter_count must be a non-negative integer")
-        })? as usize;
-    }
-    Ok(Some(parsed))
-}
-
 fn build_standard_latent_analytic_penalty_registry(
     latents: Option<&JsonValue>,
     penalties: Option<&JsonValue>,
@@ -3244,27 +3221,18 @@ fn build_standard_latent_analytic_penalty_registry(
             .ok_or_else(|| format!("{context}.kind is required"))?
             .to_ascii_lowercase()
             .replace('-', "_");
-        let weight_schedule = analytic_descriptor_weight_schedule(descriptor, &context)?;
         match kind.as_str() {
             "isometry" => {
                 analytic_descriptor_weight_value(descriptor, &context)?;
-                let penalty = IsometryPenalty::new_euclidean(slice, target.d);
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::Isometry(Arc::new(
-                    penalty,
+                    IsometryPenalty::new_euclidean(slice, target.d),
                 )));
             }
             "ard" => {
                 analytic_descriptor_weight_sequence(descriptor, &context)?;
-                let penalty = ARDPenalty::new(slice, target.d);
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
-                registry.push(AnalyticPenaltyKind::Ard(Arc::new(penalty)));
+                registry.push(AnalyticPenaltyKind::Ard(Arc::new(ARDPenalty::new(
+                    slice, target.d,
+                ))));
             }
             "orthogonality" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
@@ -3273,15 +3241,9 @@ fn build_standard_latent_analytic_penalty_registry(
                     .get("learnable")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                let penalty =
-                    OrthogonalityPenalty::new(slice, target.d, weight, n_eff, learnable)
-                        .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::Orthogonality(Arc::new(
-                    penalty,
+                    OrthogonalityPenalty::new(slice, target.d, weight, n_eff, learnable)
+                        .map_err(|err| format!("{context}: {err}"))?,
                 )));
             }
             "sparsity" => {
@@ -3303,10 +3265,6 @@ fn build_standard_latent_analytic_penalty_registry(
                         "{context}.sparsity_kind must be smooth_l1, hoyer, or log; got {other:?}"
                     )),
                 }?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
                 registry.push(AnalyticPenaltyKind::Sparsity(Arc::new(penalty)));
             }
             "scad_mcp" => {
@@ -3334,7 +3292,8 @@ fn build_standard_latent_analytic_penalty_registry(
                     .get("learnable")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                let penalty = ScadMcpPenalty::new(
+                registry.push(AnalyticPenaltyKind::ScadMcp(Arc::new(
+                    ScadMcpPenalty::new(
                         slice,
                         weight,
                         n_eff,
@@ -3343,12 +3302,8 @@ fn build_standard_latent_analytic_penalty_registry(
                         variant,
                         learnable,
                     )
-                    .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
-                registry.push(AnalyticPenaltyKind::ScadMcp(Arc::new(penalty)));
+                    .map_err(|err| format!("{context}: {err}"))?,
+                )));
             }
             "ibp_assignment" | "ibp_assignment_penalty" => {
                 let k_max = analytic_descriptor_usize(descriptor, "k_max", target.d)?;
@@ -3358,22 +3313,16 @@ fn build_standard_latent_analytic_penalty_registry(
                     .get("learnable_alpha")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                let penalty = IBPAssignmentPenalty::new(k_max, alpha, tau, learnable_alpha);
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
-                registry.push(AnalyticPenaltyKind::IBPAssignment(Arc::new(penalty)));
+                registry.push(AnalyticPenaltyKind::IBPAssignment(Arc::new(
+                    IBPAssignmentPenalty::new(k_max, alpha, tau, learnable_alpha),
+                )));
             }
             "softmax_assignment_sparsity" => {
                 let k_atoms = analytic_descriptor_usize(descriptor, "k_atoms", target.d)?;
                 let temperature = analytic_descriptor_f64(descriptor, "temperature", 1.0)?;
-                let penalty = SoftmaxAssignmentSparsityPenalty::new(k_atoms, temperature);
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
-                registry.push(AnalyticPenaltyKind::SoftmaxAssignmentSparsity(Arc::new(penalty)));
+                registry.push(AnalyticPenaltyKind::SoftmaxAssignmentSparsity(Arc::new(
+                    SoftmaxAssignmentSparsityPenalty::new(k_atoms, temperature),
+                )));
             }
             "total_variation" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
@@ -3384,19 +3333,16 @@ fn build_standard_latent_analytic_penalty_registry(
                     .get("learnable")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                let penalty = TotalVariationPenalty::new(
+                registry.push(AnalyticPenaltyKind::TotalVariation(Arc::new(
+                    TotalVariationPenalty::new(
                         weight,
                         n_eff,
                         difference_op,
                         smoothing_eps,
                         learnable,
                     )
-                    .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
-                registry.push(AnalyticPenaltyKind::TotalVariation(Arc::new(penalty)));
+                    .map_err(|err| format!("{context}: {err}"))?,
+                )));
             }
             "nuclear_norm" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
@@ -3418,7 +3364,8 @@ fn build_standard_latent_analytic_penalty_registry(
                     .get("learnable")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                let penalty = NuclearNormPenalty::new(
+                registry.push(AnalyticPenaltyKind::NuclearNorm(Arc::new(
+                    NuclearNormPenalty::new(
                         slice,
                         weight,
                         n_eff,
@@ -3426,12 +3373,8 @@ fn build_standard_latent_analytic_penalty_registry(
                         max_rank,
                         learnable,
                     )
-                    .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
-                registry.push(AnalyticPenaltyKind::NuclearNorm(Arc::new(penalty)));
+                    .map_err(|err| format!("{context}: {err}"))?,
+                )));
             }
             "block_sparsity" => {
                 let raw_groups = descriptor
@@ -3461,7 +3404,8 @@ fn build_standard_latent_analytic_penalty_registry(
                     .get("learnable")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                let penalty = BlockSparsityPenalty::new(
+                registry.push(AnalyticPenaltyKind::BlockSparsity(Arc::new(
+                    BlockSparsityPenalty::new(
                         slice,
                         groups,
                         weight,
@@ -3469,12 +3413,8 @@ fn build_standard_latent_analytic_penalty_registry(
                         smoothing_eps,
                         learnable,
                     )
-                    .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
-                registry.push(AnalyticPenaltyKind::BlockSparsity(Arc::new(penalty)));
+                    .map_err(|err| format!("{context}: {err}"))?,
+                )));
             }
             "aux_conditional_prior" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
@@ -3489,19 +3429,16 @@ fn build_standard_latent_analytic_penalty_registry(
                     "lambda_per_row_shape",
                     &context,
                 )?;
-                let penalty = AuxConditionalPriorPenalty::new(
+                registry.push(AnalyticPenaltyKind::AuxConditionalPrior(Arc::new(
+                    AuxConditionalPriorPenalty::new(
                         slice,
                         lambda_per_row,
                         weight,
                         n_eff,
                         learnable,
                     )
-                    .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
-                registry.push(AnalyticPenaltyKind::AuxConditionalPrior(Arc::new(penalty)));
+                    .map_err(|err| format!("{context}: {err}"))?,
+                )));
             }
             "parametric_aux_conditional_prior" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
@@ -3518,7 +3455,9 @@ fn build_standard_latent_analytic_penalty_registry(
                     analytic_descriptor_array1_flat(descriptor, "raw_beta", &context)?;
                 let mu =
                     analytic_descriptor_array2_flat(descriptor, "mu", "mu_shape", &context)?;
-                let penalty = ParametricAuxConditionalPriorPenalty::new(
+                registry.push(AnalyticPenaltyKind::ParametricAuxConditionalPrior(
+                    Arc::new(
+                        ParametricAuxConditionalPriorPenalty::new(
                             slice,
                             aux,
                             log_alpha,
@@ -3528,14 +3467,9 @@ fn build_standard_latent_analytic_penalty_registry(
                             n_eff,
                             learnable,
                         )
-                        .map_err(|err| format!("{context}: {err}"))?;
-                let penalty = match weight_schedule {
-                    Some(schedule) => penalty.with_weight_schedule(schedule),
-                    None => penalty,
-                };
-                registry.push(AnalyticPenaltyKind::ParametricAuxConditionalPrior(Arc::new(
-                    penalty,
-                )));
+                        .map_err(|err| format!("{context}: {err}"))?,
+                    ),
+                ));
             }
             other => return Err(format!("{context}.kind has unsupported analytic penalty {other:?}")),
         }
@@ -4279,7 +4213,12 @@ fn materialize_standard<'a>(
     let mut inference_notes = Vec::new();
 
     let link_choice = parse_link_choice(config.link.as_deref(), config.flexible_link)?;
-    let family = resolve_family(config.family.as_deref(), link_choice.as_ref(), y.view())?;
+    let family = resolve_family(
+        config.family.as_deref(),
+        config.negative_binomial_theta,
+        link_choice.as_ref(),
+        y.view(),
+    )?;
 
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
@@ -5581,7 +5520,12 @@ fn materialize_location_scale<'a>(
     let noise_parsed = parse_formula(&format!("{} ~ {noise_formula}", parsed.response))?;
 
     let link_choice = parse_link_choice(config.link.as_deref(), config.flexible_link)?;
-    let family = resolve_family(config.family.as_deref(), link_choice.as_ref(), y.view())?;
+    let family = resolve_family(
+        config.family.as_deref(),
+        config.negative_binomial_theta,
+        link_choice.as_ref(),
+        y.view(),
+    )?;
 
     let effective_linkwiggle =
         effectivelinkwiggle_formulaspec(parsed.linkwiggle.as_ref(), link_choice.as_ref());
