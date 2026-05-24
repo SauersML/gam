@@ -130,7 +130,7 @@ fn diagnose_sphere_methods_vs_truth() {
         let pred = predict_at(f, &data, &lats, &lons);
         stats(f, &pred, &truth_vals);
     }
-    // The CI assertion: we expect at least one method/parameterization to
-    // fit close to noise level (σ=0.05).
-    assert!(true);
+    // This is a diagnostic test: it prints stats but does not assert any
+    // numerical threshold. Removing it would lose the printed diagnostic;
+    // keeping it preserves the smoke-coverage of the fit path.
 }

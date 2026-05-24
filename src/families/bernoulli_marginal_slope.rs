@@ -9010,8 +9010,8 @@ impl BernoulliMarginalSlopeFamily {
         let mut cache = self.build_exact_eval_cache_with_options(block_states, Some(options))?;
         cache.row_primary_hessians = self.build_row_primary_hessian_cache(block_states, &cache)?;
         if !self.effective_flex_active(block_states)? {
-            let _ = self.rigid_third_full_cached(block_states, &cache, 0)?;
-            let _ = self.rigid_fourth_full_cached(block_states, &cache, 0)?;
+            drop(self.rigid_third_full_cached(block_states, &cache, 0)?);
+            drop(self.rigid_fourth_full_cached(block_states, &cache, 0)?);
         }
         let arc = Arc::new(cache);
         let mut guard = self.shared_eval_cache.lock().map_err(|e| e.to_string())?;
@@ -14060,7 +14060,7 @@ impl BernoulliMarginalSlopeFamily {
         // on the FLEX path because that branch routes through the flex jet
         // machinery, which has its own row-cell-moments cache.
         if !self.effective_flex_active(block_states)? {
-            let _ = self.rigid_third_full_cached(block_states, cache, 0)?;
+            drop(self.rigid_third_full_cached(block_states, cache, 0)?);
         }
 
         // Block-local accumulator path: avoids O(n p^2) dense Hessian
