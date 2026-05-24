@@ -50,6 +50,28 @@ const S_TRACE_INIT: f64 = 1.0;
 const HGB_SENS_FLOOR: f64 = 1e-6;
 const IFT_QUALITY_HISTORY_CAP: usize = 5;
 
+// KKT residual acceptance tolerances for the active-set inner solver.
+// Primal/dual/complementarity are checked at 1e-7 (matches the inner
+// barrier-stopping tolerance used in PIRLS); stationarity uses a looser
+// 5e-6 because the gradient is scaled by penalised Hessian curvature
+// that can carry an extra ~order of magnitude of roundoff at convergence.
+const KKT_TOL_PRIMAL: f64 = 1e-7;
+const KKT_TOL_DUAL: f64 = 1e-7;
+const KKT_TOL_COMP: f64 = 1e-7;
+const KKT_TOL_STAT: f64 = 5e-6;
+
+// Slack threshold below which a linear-inequality constraint Aβ ≥ b is
+// considered active when extracting the constraint-free tangent basis.
+// Chosen ~3 orders of magnitude above f64 roundoff on the dot product so
+// constraints that just-touch within IRLS roundoff are correctly flagged.
+const ACTIVE_CONSTRAINT_SLACK_TOL: f64 = 1e-8;
+
+// Norm threshold for accepting a Gram–Schmidt residual as a basis
+// direction when orthonormalising active-row vectors / null-space
+// directions. One order of magnitude below ACTIVE_CONSTRAINT_SLACK_TOL
+// because we are comparing squared-norm residuals after subtraction.
+const ORTHONORM_DROP_TOL: f64 = 1e-10;
+
 static OUTER_IFT_RESIDUAL_ENERGY: OnceLock<Mutex<HashMap<Vec<u64>, (f64, u64)>>> = OnceLock::new();
 static OUTER_IFT_RESIDUAL_ENERGY_ITER: AtomicU64 = AtomicU64::new(0);
 
@@ -4503,12 +4525,11 @@ impl<'a> RemlState<'a> {
 
     pub(super) fn active_constraint_free_basis(&self, pr: &PirlsResult) -> Option<Array2<f64>> {
         let lin = pr.linear_constraints_transformed.as_ref()?;
-        let active_tol = 1e-8;
         let beta_t = pr.beta_transformed.as_ref();
         let mut activerows: Vec<Array1<f64>> = Vec::new();
         for i in 0..lin.a.nrows() {
             let slack = lin.a.row(i).dot(beta_t) - lin.b[i];
-            if slack <= active_tol {
+            if slack <= ACTIVE_CONSTRAINT_SLACK_TOL {
                 activerows.push(lin.a.row(i).to_owned());
             }
         }
@@ -4524,7 +4545,7 @@ impl<'a> RemlState<'a> {
             }
         }
 
-        let qrow = Self::orthonormalize_columns(&a_t, 1e-10); // basis for active row-space^T
+        let qrow = Self::orthonormalize_columns(&a_t, ORTHONORM_DROP_TOL); // basis for active row-space^T
         let rank = qrow.ncols();
         if rank == 0 {
             return None;
@@ -4550,7 +4571,7 @@ impl<'a> RemlState<'a> {
                 v -= &zt.mapv(|x| x * proj);
             }
             let nrm = v.dot(&v).sqrt();
-            if nrm > 1e-10 {
+            if nrm > ORTHONORM_DROP_TOL {
                 z.column_mut(kept).assign(&v.mapv(|x| x / nrm));
                 kept += 1;
                 if kept == p_t - rank {
@@ -4601,14 +4622,10 @@ impl<'a> RemlState<'a> {
         let Some(kkt) = pr.constraint_kkt.as_ref() else {
             return Ok(());
         };
-        let tol_primal = 1e-7;
-        let tol_dual = 1e-7;
-        let tol_comp = 1e-7;
-        let tol_stat = 5e-6;
-        if kkt.primal_feasibility > tol_primal
-            || kkt.dual_feasibility > tol_dual
-            || kkt.complementarity > tol_comp
-            || kkt.stationarity > tol_stat
+        if kkt.primal_feasibility > KKT_TOL_PRIMAL
+            || kkt.dual_feasibility > KKT_TOL_DUAL
+            || kkt.complementarity > KKT_TOL_COMP
+            || kkt.stationarity > KKT_TOL_STAT
         {
             let mut worstrow_msg = String::new();
             if let Some(lin) = pr.linear_constraints_transformed.as_ref() {
