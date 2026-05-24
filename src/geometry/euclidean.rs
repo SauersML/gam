@@ -73,8 +73,16 @@ impl RiemannianManifold for EuclideanManifold {
         tangent_pair: (ArrayView1<'_, f64>, ArrayView1<'_, f64>),
     ) -> GeometryResult<f64> {
         check_len("Euclidean curvature point", point.len(), self.dim)?;
-        check_len("Euclidean curvature tangent u", tangent_pair.0.len(), self.dim)?;
-        check_len("Euclidean curvature tangent v", tangent_pair.1.len(), self.dim)?;
+        check_len(
+            "Euclidean curvature tangent u",
+            tangent_pair.0.len(),
+            self.dim,
+        )?;
+        check_len(
+            "Euclidean curvature tangent v",
+            tangent_pair.1.len(),
+            self.dim,
+        )?;
         Ok(0.0)
     }
 }

@@ -23,12 +23,11 @@ pub fn solve_arrow_newton_step_gpu(
 
     for row_idx in 0..n {
         let row = &sys.rows[row_idx];
-        let solved = row_solve(row, ridge_t).map_err(|reason| {
-            ArrowSchurError::PerRowFactorFailed {
+        let solved =
+            row_solve(row, ridge_t).map_err(|reason| ArrowSchurError::PerRowFactorFailed {
                 row: row_idx,
                 reason,
-            }
-        })?;
+            })?;
         for a in 0..k {
             let mut rhs_acc = 0.0_f64;
             for c in 0..d {
@@ -51,20 +50,18 @@ pub fn solve_arrow_newton_step_gpu(
         }
     })?;
     let (delta_beta_matrix, _) =
-        super::pirls_gpu::cholesky_solve_gpu(schur.view(), rhs_matrix.view()).map_err(
-            |reason| ArrowSchurError::SchurFactorFailed { reason },
-        )?;
+        super::pirls_gpu::cholesky_solve_gpu(schur.view(), rhs_matrix.view())
+            .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
     let delta_beta = delta_beta_matrix.column(0).to_owned();
 
     let mut delta_t = Array1::<f64>::zeros(n * d);
     for row_idx in 0..n {
         let row = &sys.rows[row_idx];
-        let solved = row_solve(row, ridge_t).map_err(|reason| {
-            ArrowSchurError::PerRowFactorFailed {
+        let solved =
+            row_solve(row, ridge_t).map_err(|reason| ArrowSchurError::PerRowFactorFailed {
                 row: row_idx,
                 reason,
-            }
-        })?;
+            })?;
         for c in 0..d {
             let mut acc = solved[[c, 0]];
             for a in 0..k {

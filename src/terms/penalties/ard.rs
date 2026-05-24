@@ -7,4 +7,3 @@ impl PenaltyManifest for ARDPenalty {
     const PYTHON_WRAPPER: &'static str = "ARDPenalty";
     const ROW_BLOCK_DIAGONAL: bool = true;
 }
-

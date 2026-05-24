@@ -1399,9 +1399,7 @@ fn predict_survival_location_scale_batch(
     let eval_times: Vec<f64> = match time_grid {
         Some(grid) => {
             if grid.is_empty() {
-                return Err(
-                    "survival time_grid must contain at least one time".to_string(),
-                );
+                return Err("survival time_grid must contain at least one time".to_string());
             }
             for (idx, &t) in grid.iter().enumerate() {
                 if !t.is_finite() || t < 0.0 {

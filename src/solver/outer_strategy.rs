@@ -4996,15 +4996,13 @@ fn outer_bounds(lo: &Array1<f64>, hi: &Array1<f64>) -> Result<Bounds, Estimation
 }
 
 fn outer_tolerance(value: f64) -> Result<Tolerance, EstimationError> {
-    Tolerance::new(value).map_err(|err| {
-        EstimationError::InvalidInput(format!("outer tolerance is invalid: {err}"))
-    })
+    Tolerance::new(value)
+        .map_err(|err| EstimationError::InvalidInput(format!("outer tolerance is invalid: {err}")))
 }
 
 fn outer_max_iterations(value: usize) -> Result<MaxIterations, EstimationError> {
-    MaxIterations::new(value).map_err(|err| {
-        EstimationError::InvalidInput(format!("outer max_iter is invalid: {err}"))
-    })
+    MaxIterations::new(value)
+        .map_err(|err| EstimationError::InvalidInput(format!("outer max_iter is invalid: {err}")))
 }
 
 fn sanitized_operator_trust_restart_radius(radius: Option<f64>) -> Option<f64> {
@@ -5273,9 +5271,9 @@ fn run_outer_with_plan(
                             feedback: feedback.clone(),
                         });
                     }
-                    if let Some(r) =
-                        sanitized_operator_trust_restart_radius(config.operator_initial_trust_radius)
-                    {
+                    if let Some(r) = sanitized_operator_trust_restart_radius(
+                        config.operator_initial_trust_radius,
+                    ) {
                         solver = solver.with_initial_trust_radius(r);
                     }
 
@@ -5320,10 +5318,7 @@ fn run_outer_with_plan(
                                 "[OUTER warning] {context}: matrix-free TR hit max_iter={} at final_value={:.6e} |g|={:.3e} final_trust_radius={}",
                                 config.max_iter,
                                 report.solution.final_value,
-                                report
-                                    .solution
-                                    .final_gradient_norm
-                                    .unwrap_or(f64::NAN),
+                                report.solution.final_gradient_norm.unwrap_or(f64::NAN),
                                 match final_radius {
                                     Some(r) => format!("{:.3e}", r),
                                     None => "n/a".to_string(),
@@ -5340,10 +5335,7 @@ fn run_outer_with_plan(
                             log::warn!(
                                 "[OUTER warning] {context}: matrix-free TR reached trust-radius reject floor at final_value={:.6e} |g|={:.3e} final_trust_radius={}",
                                 report.solution.final_value,
-                                report
-                                    .solution
-                                    .final_gradient_norm
-                                    .unwrap_or(f64::NAN),
+                                report.solution.final_gradient_norm.unwrap_or(f64::NAN),
                                 match final_radius {
                                     Some(r) => format!("{:.3e}", r),
                                     None => "n/a".to_string(),

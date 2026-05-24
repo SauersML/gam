@@ -37,7 +37,11 @@ mod cuda {
         let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("cublas init: {e}"))?;
         let x_col = to_col_major(&x);
         let x_dev = pinned_htod(ctx.as_ref(), &stream, &*x_col)?;
-        let mut w_dev = pinned_htod(ctx.as_ref(), &stream, weights.as_slice().ok_or("weights must be contiguous")?)?;
+        let mut w_dev = pinned_htod(
+            ctx.as_ref(),
+            &stream,
+            weights.as_slice().ok_or("weights must be contiguous")?,
+        )?;
         let mut wx_dev = stream
             .alloc_zeros::<f64>(n.checked_mul(p).ok_or("X size overflow")?)
             .map_err(|e| format!("cuda alloc WX: {e}"))?;
@@ -88,7 +92,14 @@ mod cuda {
         let solver = DnHandle::new(stream.clone()).map_err(|e| format!("cusolver init: {e}"))?;
         let x_col = to_col_major(&input.x);
         let x_dev = pinned_htod(ctx.as_ref(), &stream, &*x_col)?;
-        let mut w_dev = pinned_htod(ctx.as_ref(), &stream, input.weights.as_slice().ok_or("weights must be contiguous")?)?;
+        let mut w_dev = pinned_htod(
+            ctx.as_ref(),
+            &stream,
+            input
+                .weights
+                .as_slice()
+                .ok_or("weights must be contiguous")?,
+        )?;
         let mut wx_dev = stream
             .alloc_zeros::<f64>(n.checked_mul(p).ok_or("X size overflow")?)
             .map_err(|e| format!("cuda alloc WX: {e}"))?;
@@ -124,7 +135,12 @@ mod cuda {
         geam_add(&blas, &stream, p, &xtwx_dev, &penalty_dev, &mut h_dev)?;
 
         let mut rhs_col = vec![0.0_f64; p];
-        rhs_col.copy_from_slice(input.gradient.as_slice().ok_or("gradient must be contiguous")?);
+        rhs_col.copy_from_slice(
+            input
+                .gradient
+                .as_slice()
+                .ok_or("gradient must be contiguous")?,
+        );
         let mut rhs_dev = pinned_htod(ctx.as_ref(), &stream, &rhs_col)?;
         let h_total_col = stream
             .clone_dtoh(&h_dev)
@@ -173,22 +189,33 @@ mod cuda {
         let out_col = stream
             .clone_dtoh(&rhs_dev)
             .map_err(|e| format!("download solution: {e}"))?;
-        let solved = from_col_major(&out_col, p, nrhs).ok_or("solution layout conversion failed")?;
+        let solved =
+            from_col_major(&out_col, p, nrhs).ok_or("solution layout conversion failed")?;
         Ok((solved, cholesky_logdet_from_col_major(&factor_col, p)))
     }
 
-    fn context_and_stream(
-    ) -> Result<(std::sync::Arc<CudaContext>, std::sync::Arc<cudarc::driver::CudaStream>), String>
-    {
+    fn context_and_stream() -> Result<
+        (
+            std::sync::Arc<CudaContext>,
+            std::sync::Arc<cudarc::driver::CudaStream>,
+        ),
+        String,
+    > {
         let ctx = CudaContext::new(0).map_err(|e| format!("cuda context: {e}"))?;
         let stream = ctx.new_stream().map_err(|e| format!("cuda stream: {e}"))?;
         Ok((ctx, stream))
     }
 
-    fn validate_design(x: ArrayView2<'_, f64>, weights: ArrayView1<'_, f64>) -> Result<(usize, usize), String> {
+    fn validate_design(
+        x: ArrayView2<'_, f64>,
+        weights: ArrayView1<'_, f64>,
+    ) -> Result<(usize, usize), String> {
         let (n, p) = x.dim();
         if weights.len() != n {
-            return Err(format!("weights length {} does not match rows {n}", weights.len()));
+            return Err(format!(
+                "weights length {} does not match rows {n}",
+                weights.len()
+            ));
         }
         if n == 0 || p == 0 {
             return Err("empty design cannot be solved on CUDA".to_string());
@@ -327,6 +354,8 @@ mod cuda {
         let (h_ptr, _h_record) = h.device_ptr_mut(stream);
         let (work_ptr, _work_record) = workspace.device_ptr_mut(stream);
         let (info_ptr, _info_record) = info.device_ptr_mut(stream);
+        // SAFETY: cuSOLVER potrf factorization; h is p*p, workspace was allocated with the lwork
+        // size reported by the buffer-size query above, info is a 1-element device i32 buffer.
         let status = unsafe {
             cusolver_sys::cusolverDnDpotrf(
                 solver.cu(),
@@ -367,6 +396,8 @@ mod cuda {
         let (h_ptr, _h_record) = h.device_ptr(stream);
         let (rhs_ptr, _rhs_record) = rhs.device_ptr_mut(stream);
         let (info_ptr, _info_record) = info.device_ptr_mut(stream);
+        // SAFETY: cuSOLVER potrs solve; h is a p*p Cholesky factor from potrf above, rhs is
+        // p*nrhs, info is a 1-element device i32 buffer, leading dims match column-major p_i.
         let status = unsafe {
             cusolver_sys::cusolverDnDpotrs(
                 solver.cu(),

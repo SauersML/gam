@@ -2621,11 +2621,10 @@ fn build_latent_survival_row(
         ),
         LatentSurvivalEventType::IntervalCensored => {
             return Err(LatentSurvivalError::InvalidDataset {
-                reason:
-                    "latent survival fit path currently supports only exact events and right \
+                reason: "latent survival fit path currently supports only exact events and right \
                      censoring; interval-censored observations need to be expanded or routed \
                      through a different family"
-                        .to_string(),
+                    .to_string(),
             });
         }
     };

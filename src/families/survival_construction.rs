@@ -12,8 +12,7 @@
 use crate::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
     BasisMetadata, BasisOptions, Dense, KnotSource, OneDimensionalBoundary, build_bspline_basis_1d,
-    create_basis,
-    evaluate_bspline_derivative_scalar,
+    create_basis, evaluate_bspline_derivative_scalar,
 };
 use crate::families::gamlss::{
     WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
@@ -957,10 +956,8 @@ pub fn parse_survival_time_basis_config(
             // we map a (currently impossible) `Ok` to an explicit error
             // string instead of `unreachable!`, keeping the match total
             // without relying on a never-executes claim.
-            match require_structural_survival_time_basis(
-                time_basis,
-                "survival model configuration",
-            ) {
+            match require_structural_survival_time_basis(time_basis, "survival model configuration")
+            {
                 Err(e) => Err(e),
                 Ok(()) => Err(format!(
                     "internal: structural-basis check accepted non-structural \
@@ -1944,8 +1941,8 @@ pub fn baseline_chain_rule_gradient(
                 let r_e = residuals.entry[i];
                 if r_e != 0.0 {
                     let t_entry = age_entry[i];
-                    let partials_entry = baseline_offset_theta_partials(t_entry, cfg)?
-                        .ok_or_else(|| {
+                    let partials_entry =
+                        baseline_offset_theta_partials(t_entry, cfg)?.ok_or_else(|| {
                             "unexpected None from baseline partials at entry".to_string()
                         })?;
                     for k in 0..theta_dim {
@@ -1955,10 +1952,7 @@ pub fn baseline_chain_rule_gradient(
                 Ok(acc)
             },
         )
-        .try_reduce(
-            || Array1::<f64>::zeros(theta_dim),
-            |a, b| Ok(a + b),
-        )?;
+        .try_reduce(|| Array1::<f64>::zeros(theta_dim), |a, b| Ok(a + b))?;
     Ok(Some(grad))
 }
 
@@ -2012,12 +2006,13 @@ pub fn marginal_slope_baseline_chain_rule_gradient(
         .try_fold(
             || Array1::<f64>::zeros(theta_dim),
             |mut acc, i| -> Result<Array1<f64>, String> {
-                let partials_exit =
-                    marginal_slope_baseline_offset_theta_partials(age_exit[i], cfg)?
-                        .ok_or_else(|| {
-                            "unexpected None from marginal-slope baseline partials at exit"
-                                .to_string()
-                        })?;
+                let partials_exit = marginal_slope_baseline_offset_theta_partials(
+                    age_exit[i],
+                    cfg,
+                )?
+                .ok_or_else(|| {
+                    "unexpected None from marginal-slope baseline partials at exit".to_string()
+                })?;
                 if partials_exit.len() != theta_dim {
                     return Err(format!(
                         "marginal_slope_baseline_chain_rule_gradient: theta_dim drifted ({} != {})",
@@ -2047,10 +2042,7 @@ pub fn marginal_slope_baseline_chain_rule_gradient(
                 Ok(acc)
             },
         )
-        .try_reduce(
-            || Array1::<f64>::zeros(theta_dim),
-            |a, b| Ok(a + b),
-        )?;
+        .try_reduce(|| Array1::<f64>::zeros(theta_dim), |a, b| Ok(a + b))?;
     Ok(Some(grad))
 }
 
@@ -2510,8 +2502,7 @@ pub fn marginal_slope_baseline_chain_rule_hessian(
                         })?;
                 if exit_parts.first.len() != dim {
                     return Err(
-                        "marginal_slope_baseline_chain_rule_hessian: theta_dim drifted"
-                            .to_string(),
+                        "marginal_slope_baseline_chain_rule_hessian: theta_dim drifted".to_string(),
                     );
                 }
                 let mut entry_parts = None;
@@ -2536,10 +2527,8 @@ pub fn marginal_slope_baseline_chain_rule_hessian(
                             value += residuals.entry[i] * parts.second[a][b].0;
                         }
                         let curv = curvatures.rows[i];
-                        let j_entry_a =
-                            entry_parts.as_ref().map_or(0.0, |parts| parts.first[a].0);
-                        let j_entry_b =
-                            entry_parts.as_ref().map_or(0.0, |parts| parts.first[b].0);
+                        let j_entry_a = entry_parts.as_ref().map_or(0.0, |parts| parts.first[a].0);
+                        let j_entry_b = entry_parts.as_ref().map_or(0.0, |parts| parts.first[b].0);
                         let ja = [j_entry_a, j_exit_a, j_deriv_a];
                         let jb = [j_entry_b, j_exit_b, j_deriv_b];
                         for u in 0..3 {
@@ -2553,10 +2542,7 @@ pub fn marginal_slope_baseline_chain_rule_hessian(
                 Ok(acc)
             },
         )
-        .try_reduce(
-            || Array2::<f64>::zeros((dim, dim)),
-            |a, b| Ok(a + b),
-        )?;
+        .try_reduce(|| Array2::<f64>::zeros((dim, dim)), |a, b| Ok(a + b))?;
     Ok(Some(hessian))
 }
 

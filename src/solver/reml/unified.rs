@@ -1335,8 +1335,7 @@ impl BarrierConfig {
                 if val.abs() < 1e-14 {
                     continue;
                 }
-                if ((val - 1.0).abs() < 1e-14 || (val + 1.0).abs() < 1e-14)
-                    && single_col.is_none()
+                if ((val - 1.0).abs() < 1e-14 || (val + 1.0).abs() < 1e-14) && single_col.is_none()
                 {
                     single_col = Some(j);
                     single_sign = if val > 0.0 { 1.0 } else { -1.0 };
@@ -1435,9 +1434,8 @@ impl BarrierConfig {
         ratio: f64,
         saturation_threshold: f64,
     ) -> bool {
-        let mut slacks = match self.slacks(beta) {
-            Some(s) => s,
-            None => return true, // infeasible → conservatively unreliable
+        let Some(mut slacks) = self.slacks(beta) else {
+            return true; // infeasible → conservatively unreliable
         };
         if slacks.is_empty() {
             return false;
@@ -1482,9 +1480,8 @@ impl BarrierConfig {
         ref_diag: f64,
         threshold: f64,
     ) -> bool {
-        let slacks = match self.slacks(beta) {
-            Some(s) => s,
-            None => return true, // infeasible → conservatively active
+        let Some(slacks) = self.slacks(beta) else {
+            return true; // infeasible → conservatively active
         };
         let max_barrier_curv = slacks
             .iter()
@@ -3517,20 +3514,11 @@ impl HyperOperator for ImplicitHyperOperator {
             s.n_work.resize(n_obs, 0.0);
             s.p_work.clear();
             s.p_work.resize(self.p, 0.0);
-            let mut x_v_view =
-                ndarray::ArrayViewMut1::from(s.x_v.as_mut_slice());
-            let n_work_view =
-                ndarray::ArrayViewMut1::from(s.n_work.as_mut_slice());
-            let p_work_view =
-                ndarray::ArrayViewMut1::from(s.p_work.as_mut_slice());
+            let mut x_v_view = ndarray::ArrayViewMut1::from(s.x_v.as_mut_slice());
+            let n_work_view = ndarray::ArrayViewMut1::from(s.n_work.as_mut_slice());
+            let p_work_view = ndarray::ArrayViewMut1::from(s.p_work.as_mut_slice());
             design_matrix_apply_view_into(&self.x_design, v, x_v_view.view_mut());
-            self.matvec_with_shared_xz_into(
-                x_v_view.view(),
-                v,
-                out,
-                n_work_view,
-                p_work_view,
-            );
+            self.matvec_with_shared_xz_into(x_v_view.view(), v, out, n_work_view, p_work_view);
         });
     }
 
@@ -4790,9 +4778,8 @@ pub(crate) fn exact_intersection_nullity(
             Ok(usv) => usv,
             Err(_) => return 0,
         };
-        let u = match u_opt {
-            Some(u) => u,
-            None => return 0,
+        let Some(u) = u_opt else {
+            return 0;
         };
 
         // Count singular values ≈ 1 (shared directions).
@@ -9820,83 +9807,80 @@ fn compute_outer_hessian(
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         (0..rho_pair_count)
             .into_par_iter()
-            .map(
-                |pair_idx| -> Result<(usize, usize, f64), String> {
-                    let (kk, ll) = upper_triangle_pair_from_index(pair_idx, k);
-                    let pair_a = if kk == ll { rho_a_vals[kk] } else { 0.0 };
+            .map(|pair_idx| -> Result<(usize, usize, f64), String> {
+                let (kk, ll) = upper_triangle_pair_from_index(pair_idx, k);
+                let pair_a = if kk == ll { rho_a_vals[kk] } else { 0.0 };
 
-                    let cross_trace = if let Some(ref exact) = exact_logdet_cross_traces {
-                        exact[[kk, ll]]
-                    } else if let Some(ref sct) = stochastic_cross_traces {
-                        -sct[[kk, ll]]
+                let cross_trace = if let Some(ref exact) = exact_logdet_cross_traces {
+                    exact[[kk, ll]]
+                } else if let Some(ref sct) = stochastic_cross_traces {
+                    -sct[[kk, ll]]
+                } else {
+                    hop.trace_logdet_hessian_cross(&h_k_matrices[kk], &h_k_matrices[ll])
+                };
+
+                // Second Hessian drift trace via shared helpers.
+                //
+                // RHS = Ḣ_l v_k + B_k v_l − δ_{kl} g_k
+                // base = δ_{kl} tr(K A_k)
+                // correction = compute_ift_correction_trace(RHS, v_k, v_l)
+                //
+                // `K` is the full-space `G_ε(H)` unless the rank-deficient LAML
+                // fix is active, in which case every trace routes through the
+                // projected kernel so the outer Hessian matches the projected
+                // `½ log|U_Sᵀ H U_S|_+` cost.
+                let base = if kk == ll {
+                    if let Some(kernel) = subspace {
+                        kernel.trace_projected_logdet(&a_k_matrices[kk])
+                    } else if solution.penalty_coords[kk].is_block_local() {
+                        let (block, start, end) =
+                            solution.penalty_coords[kk].scaled_block_local(1.0);
+                        hop.trace_logdet_block_local(&block, curvature_lambdas[kk], start, end)
                     } else {
-                        hop.trace_logdet_hessian_cross(&h_k_matrices[kk], &h_k_matrices[ll])
-                    };
+                        hop.trace_logdet_gradient(&a_k_matrices[kk])
+                    }
+                } else {
+                    0.0
+                };
 
-                    // Second Hessian drift trace via shared helpers.
-                    //
-                    // RHS = Ḣ_l v_k + B_k v_l − δ_{kl} g_k
-                    // base = δ_{kl} tr(K A_k)
-                    // correction = compute_ift_correction_trace(RHS, v_k, v_l)
-                    //
-                    // `K` is the full-space `G_ε(H)` unless the rank-deficient LAML
-                    // fix is active, in which case every trace routes through the
-                    // projected kernel so the outer Hessian matches the projected
-                    // `½ log|U_Sᵀ H U_S|_+` cost.
-                    let base = if kk == ll {
-                        if let Some(kernel) = subspace {
-                            kernel.trace_projected_logdet(&a_k_matrices[kk])
-                        } else if solution.penalty_coords[kk].is_block_local() {
-                            let (block, start, end) =
-                                solution.penalty_coords[kk].scaled_block_local(1.0);
-                            hop.trace_logdet_block_local(&block, curvature_lambdas[kk], start, end)
-                        } else {
-                            hop.trace_logdet_gradient(&a_k_matrices[kk])
-                        }
-                    } else {
-                        0.0
-                    };
+                let correction = if let Some(corrections) = batched_rho_pair_corrections.as_ref() {
+                    corrections[pair_idx]
+                } else {
+                    let rhs = build_rho_pair_rhs(kk, ll);
+                    compute_ift_correction_trace(
+                        hop,
+                        &rhs,
+                        &v_ks[kk],
+                        &v_ks[ll],
+                        effective_deriv,
+                        adjoint_z_c.as_ref(),
+                        glm_ingredients.as_ref(),
+                        leverage.as_ref(),
+                        fourth_trace_matrix.as_ref().map(|trace| trace[[kk, ll]]),
+                        subspace,
+                    )?
+                };
 
-                    let correction =
-                        if let Some(corrections) = batched_rho_pair_corrections.as_ref() {
-                            corrections[pair_idx]
-                        } else {
-                            let rhs = build_rho_pair_rhs(kk, ll);
-                            compute_ift_correction_trace(
-                                hop,
-                                &rhs,
-                                &v_ks[kk],
-                                &v_ks[ll],
-                                effective_deriv,
-                                adjoint_z_c.as_ref(),
-                                glm_ingredients.as_ref(),
-                                leverage.as_ref(),
-                                fourth_trace_matrix.as_ref().map(|trace| trace[[kk, ll]]),
-                                subspace,
-                            )?
-                        };
+                let h_kl_trace = base + correction;
 
-                    let h_kl_trace = base + correction;
-
-                    let h_val = outer_hessian_entry(
-                        rho_a_vals[kk],
-                        rho_a_vals[ll],
-                        penalty_a_k_betas[ll].dot(&v_ks[kk]),
-                        pair_a,
-                        cross_trace,
-                        h_kl_trace,
-                        det2[[kk, ll]],
-                        profiled_phi,
-                        profiled_nu,
-                        profiled_dp_cgrad,
-                        profiled_dp_cgrad2,
-                        is_profiled,
-                        incl_logdet_h,
-                        incl_logdet_s,
-                    );
-                    Ok((kk, ll, h_val))
-                },
-            )
+                let h_val = outer_hessian_entry(
+                    rho_a_vals[kk],
+                    rho_a_vals[ll],
+                    penalty_a_k_betas[ll].dot(&v_ks[kk]),
+                    pair_a,
+                    cross_trace,
+                    h_kl_trace,
+                    det2[[kk, ll]],
+                    profiled_phi,
+                    profiled_nu,
+                    profiled_dp_cgrad,
+                    profiled_dp_cgrad2,
+                    is_profiled,
+                    incl_logdet_h,
+                    incl_logdet_s,
+                );
+                Ok((kk, ll, h_val))
+            })
             .collect::<Result<Vec<_>, String>>()?
     };
 
@@ -12655,12 +12639,12 @@ fn projected_inverse_with_inertia_gate(
         }
     }
 
-    let (evals, evecs) =
-        h_ff.eigh(faer::Side::Lower)
-            .map_err(|e| CorrectedCovarianceError::EigendecompositionFailed {
-                context: "projected outer Hessian",
-                reason: e.to_string(),
-            })?;
+    let (evals, evecs) = h_ff.eigh(faer::Side::Lower).map_err(|e| {
+        CorrectedCovarianceError::EigendecompositionFailed {
+            context: "projected outer Hessian",
+            reason: e.to_string(),
+        }
+    })?;
 
     let eps = f64::EPSILON;
     let neg_tol = 8.0 * eps * (q.max(1) as f64) * h_norm.max(1.0);
@@ -12948,12 +12932,12 @@ pub fn compute_corrected_covariance_diagonal_with_constraints(
     )?;
 
     // Symmetric square root of V_θ via eigendecomposition (PSD by construction).
-    let (sym_evals, sym_evecs) = v_theta_full
-        .eigh(faer::Side::Lower)
-        .map_err(|e| CorrectedCovarianceError::EigendecompositionFailed {
+    let (sym_evals, sym_evecs) = v_theta_full.eigh(faer::Side::Lower).map_err(|e| {
+        CorrectedCovarianceError::EigendecompositionFailed {
             context: "corrected covariance hyperparameter covariance",
             reason: e.to_string(),
-        })?;
+        }
+    })?;
     let mut v_theta_sqrt = Array2::<f64>::zeros((q, q));
     for j in 0..q {
         let s = sym_evals[j];
@@ -14938,11 +14922,11 @@ impl MatrixFreeSpdOperator {
             _ => (Array1::<f64>::zeros(dim), false),
         };
 
-        let (solution, iters, residual_norm) =
-            match conjugate_gradient_trace_solve(rhs, rel_tol, initial, |v| (self.apply)(v)) {
-                Some(result) => result,
-                None => return self.solve(rhs),
-            };
+        let Some((solution, iters, residual_norm)) =
+            conjugate_gradient_trace_solve(rhs, rel_tol, initial, |v| (self.apply)(v))
+        else {
+            return self.solve(rhs);
+        };
 
         if let Some(state) = trace_state {
             let mut guard = match state.lock() {
@@ -16556,11 +16540,7 @@ impl Xoshiro256SS {
 /// Splitmix64: deterministic expansion of a single u64 seed into a sequence.
 #[inline]
 fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E3779B97F4A7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
-    z ^ (z >> 31)
+    crate::linalg::utils::splitmix64(state)
 }
 
 #[inline]
@@ -16797,15 +16777,13 @@ where
     let mut rng_state = Xoshiro256SS::from_seed(config.seed);
 
     // Apply B² = H⁻¹ A H⁻¹ A in place via two solve+apply legs.
-    let apply_b_squared = |hop: &H,
-                           input: ArrayView1<'_, f64>,
-                           tmp: &mut Array1<f64>|
-     -> Array1<f64> {
-        op.mul_vec_into(input, tmp.view_mut());
-        let mid = hop.stochastic_trace_solve(tmp, config.solve_rel_tol);
-        op.mul_vec_into(mid.view(), tmp.view_mut());
-        hop.stochastic_trace_solve(tmp, config.solve_rel_tol)
-    };
+    let apply_b_squared =
+        |hop: &H, input: ArrayView1<'_, f64>, tmp: &mut Array1<f64>| -> Array1<f64> {
+            op.mul_vec_into(input, tmp.view_mut());
+            let mid = hop.stochastic_trace_solve(tmp, config.solve_rel_tol);
+            op.mul_vec_into(mid.view(), tmp.view_mut());
+            hop.stochastic_trace_solve(tmp, config.solve_rel_tol)
+        };
 
     let mut q = Array2::<f64>::zeros((p, sketch_dim));
     let mut q_rank = 0usize;
@@ -17598,11 +17576,9 @@ mod tests {
     fn projected_factor_cache_zero_budget_disables_eviction() {
         let cache = ProjectedFactorCache::with_budget(0);
         for seed in 0..16 {
-            drop(
-                cache.get_or_insert_with(make_factor_key(seed), || {
-                    Array2::from_elem((8, 8), seed as f64)
-                }),
-            );
+            drop(cache.get_or_insert_with(make_factor_key(seed), || {
+                Array2::from_elem((8, 8), seed as f64)
+            }));
         }
         assert_eq!(cache.len(), 16);
     }

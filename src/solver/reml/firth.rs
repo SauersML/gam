@@ -686,9 +686,8 @@ impl FirthDenseOperator {
             Ok(pair) => pair,
             Err(_) => return f64::NEG_INFINITY,
         };
-        let evals_slice = match evals.as_slice() {
-            Some(s) => s,
-            None => return f64::NEG_INFINITY,
+        let Some(evals_slice) = evals.as_slice() else {
+            return f64::NEG_INFINITY;
         };
         let threshold = super::unified::positive_eigenvalue_threshold(evals_slice);
         0.5 * super::unified::exact_pseudo_logdet(evals_slice, threshold)

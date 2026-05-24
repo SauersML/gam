@@ -1132,7 +1132,11 @@ fn compute_multiblock_alo_chunk(
             for d in 0..b {
                 scratch.imwa[d * b + d] += 1e-6;
             }
-            drop(lu_factor_in_place(&mut scratch.imwa, &mut scratch.perm_imwa, b));
+            drop(lu_factor_in_place(
+                &mut scratch.imwa,
+                &mut scratch.perm_imwa,
+                b,
+            ));
         }
         if !lu_factor_in_place(&mut scratch.imaw, &mut scratch.perm_imaw, b) {
             for r in 0..b {
@@ -1145,7 +1149,11 @@ fn compute_multiblock_alo_chunk(
             for d in 0..b {
                 scratch.imaw[d * b + d] += 1e-6;
             }
-            drop(lu_factor_in_place(&mut scratch.imaw, &mut scratch.perm_imaw, b));
+            drop(lu_factor_in_place(
+                &mut scratch.imaw,
+                &mut scratch.perm_imaw,
+                b,
+            ));
         }
 
         // v_i = (I - W A)⁻¹ s_i  -- solve into rhs_buf.
@@ -1501,16 +1509,9 @@ mod tests {
         let score_weight = 1.0;
         // centered: eta~=off + ((eta-off)-a(z-off))/(1-a) when W_S = W_H.
         let leverage = hessian_weight * x_hinv_x;
-        let expected =
-            offset + ((eta_hat - offset) - leverage * (z - offset)) / (1.0 - leverage);
-        let got = alo_eta_updatewith_offset(
-            eta_hat,
-            z,
-            offset,
-            x_hinv_x,
-            score_weight,
-            1.0 - leverage,
-        );
+        let expected = offset + ((eta_hat - offset) - leverage * (z - offset)) / (1.0 - leverage);
+        let got =
+            alo_eta_updatewith_offset(eta_hat, z, offset, x_hinv_x, score_weight, 1.0 - leverage);
         assert!((got - expected).abs() < 1e-12);
     }
 
@@ -1523,14 +1524,8 @@ mod tests {
         let score_weight = 1.0;
         let leverage = hessian_weight * x_hinv_x;
         let expected = (eta_hat - leverage * z) / (1.0 - leverage);
-        let got = alo_eta_updatewith_offset(
-            eta_hat,
-            z,
-            0.0,
-            x_hinv_x,
-            score_weight,
-            1.0 - leverage,
-        );
+        let got =
+            alo_eta_updatewith_offset(eta_hat, z, 0.0, x_hinv_x, score_weight, 1.0 - leverage);
         assert!((got - expected).abs() < 1e-12);
     }
 

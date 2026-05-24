@@ -458,7 +458,11 @@ fn install_panic_hook() {
                 && let Some(feed) = guard.as_ref()
                 && let Ok(model) = feed.model.try_lock()
             {
-                drop(writeln!(io::stderr(), "last {} log line(s):", model.log_tail.len()));
+                drop(writeln!(
+                    io::stderr(),
+                    "last {} log line(s):",
+                    model.log_tail.len()
+                ));
                 for line in &model.log_tail {
                     drop(writeln!(io::stderr(), "{line}"));
                 }

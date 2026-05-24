@@ -6,9 +6,8 @@ use crate::basis::{
     KnotSource, KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability,
     OneDimensionalBoundary, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
     SphericalSplineBasisSpec, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
-    build_bspline_basis_1d, build_duchon_basis,
-    build_duchon_basis_log_kappa_aniso_derivatives, build_duchon_basis_log_kappa_derivatives,
-    build_duchon_basiswithworkspace, build_matern_basis,
+    build_bspline_basis_1d, build_duchon_basis, build_duchon_basis_log_kappa_aniso_derivatives,
+    build_duchon_basis_log_kappa_derivatives, build_duchon_basiswithworkspace, build_matern_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
     build_spherical_spline_basis, build_thin_plate_basis,
@@ -4028,9 +4027,8 @@ fn build_shape_linear_constraints_1d(
     design_local: ArrayView2<'_, f64>,
     shape: ShapeConstraint,
 ) -> Result<Option<LinearInequalityConstraints>, BasisError> {
-    let (order, sign) = match shape_order_and_sign(shape) {
-        Some(v) => v,
-        None => return Ok(None),
+    let Some((order, sign)) = shape_order_and_sign(shape) else {
+        return Ok(None);
     };
     let n = x.len();
     let p = design_local.ncols();
@@ -5485,7 +5483,11 @@ impl LinearOperator for PcaScoresMemmapDesignOperator {
     }
 
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        assert_eq!(vector.len(), self.ncols, "lazy Pca apply vector length mismatch");
+        assert_eq!(
+            vector.len(),
+            self.ncols,
+            "lazy Pca apply vector length mismatch"
+        );
         let mut out = Array1::<f64>::zeros(self.nrows);
         for start in (0..self.nrows).step_by(self.chunk_rows()) {
             let end = (start + self.chunk_rows()).min(self.nrows);
@@ -5564,8 +5566,16 @@ impl LinearOperator for PcaScoresMemmapDesignOperator {
         penalty: Option<&Array2<f64>>,
         ridge: f64,
     ) -> Array1<f64> {
-        assert_eq!(weights.len(), self.nrows, "lazy Pca weighted-normal weight mismatch");
-        assert_eq!(vector.len(), self.ncols, "lazy Pca weighted-normal vector mismatch");
+        assert_eq!(
+            weights.len(),
+            self.nrows,
+            "lazy Pca weighted-normal weight mismatch"
+        );
+        assert_eq!(
+            vector.len(),
+            self.ncols,
+            "lazy Pca weighted-normal vector mismatch"
+        );
         let mut out = Array1::<f64>::zeros(self.ncols);
         for start in (0..self.nrows).step_by(self.chunk_rows()) {
             let end = (start + self.chunk_rows()).min(self.nrows);
@@ -5918,10 +5928,11 @@ fn ensure_by_variable_specs_match(
 ) -> Result<(), BasisError> {
     match (kind, by) {
         (BySmoothKind::Numeric, ByVariableSpec::Numeric) => Ok(()),
-        (
-            BySmoothKind::Level { level_bits },
-            ByVariableSpec::Level { value_bits, .. },
-        ) if level_bits == value_bits => Ok(()),
+        (BySmoothKind::Level { level_bits }, ByVariableSpec::Level { value_bits, .. })
+            if level_bits == value_bits =>
+        {
+            Ok(())
+        }
         _ => Err(BasisError::InvalidInput(format!(
             "by-variable smooth term '{term_name}' has inconsistent by-variable specifications"
         ))),
@@ -10429,12 +10440,9 @@ fn stable_sigmoid(theta: f64) -> f64 {
     }
 }
 
+#[inline]
 fn stable_softplus(x: f64) -> f64 {
-    if x > 0.0 {
-        x + (-x).exp().ln_1p()
-    } else {
-        x.exp().ln_1p()
-    }
+    crate::linalg::utils::stable_softplus(x)
 }
 
 fn bounded_latent_to_user(theta: f64, min: f64, max: f64) -> (f64, f64, f64) {
@@ -12956,13 +12964,13 @@ fn spatial_subsample_seed(
 
 #[inline]
 fn spatial_seed_mix(state: &mut u64, value: u64) {
-    let mut z = value.wrapping_add(0x9E37_79B9_7F4A_7C15).wrapping_add(*state);
+    let mut z = value
+        .wrapping_add(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(*state);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     *state ^= z ^ (z >> 31);
-    *state = (*state)
-        .rotate_left(27)
-        .wrapping_mul(0x3C79_AC49_2BA7_B653);
+    *state = (*state).rotate_left(27).wrapping_mul(0x3C79_AC49_2BA7_B653);
 }
 
 fn sampled_rows(data: ArrayView2<'_, f64>, indices: &[usize]) -> Array2<f64> {
@@ -13473,13 +13481,11 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
     term_idx: usize,
     aniso_group_id: usize,
 ) -> Result<Option<Vec<SpatialPsiDerivative>>, EstimationError> {
-    let smooth_term = match design.smooth.terms.get(term_idx) {
-        Some(t) => t,
-        None => return Ok(None),
+    let Some(smooth_term) = design.smooth.terms.get(term_idx) else {
+        return Ok(None);
     };
-    let termspec = match resolvedspec.smooth_terms.get(term_idx) {
-        Some(t) => t,
-        None => return Ok(None),
+    let Some(termspec) = resolvedspec.smooth_terms.get(term_idx) else {
+        return Ok(None);
     };
     let mut aniso_result = match &termspec.basis {
         SmoothBasisSpec::Sphere { .. } => return Ok(None),
@@ -13664,13 +13670,11 @@ fn try_build_spatial_term_log_kappa_derivative(
     )>,
     EstimationError,
 > {
-    let smooth_term = match design.smooth.terms.get(term_idx) {
-        Some(term) => term,
-        None => return Ok(None),
+    let Some(smooth_term) = design.smooth.terms.get(term_idx) else {
+        return Ok(None);
     };
-    let termspec = match resolvedspec.smooth_terms.get(term_idx) {
-        Some(term) => term,
-        None => return Ok(None),
+    let Some(termspec) = resolvedspec.smooth_terms.get(term_idx) else {
+        return Ok(None);
     };
 
     let derivative_bundle = match &termspec.basis {
@@ -13817,7 +13821,8 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
     }
     if latent_terms.len() != 1 {
         return Err(EstimationError::InvalidInput(
-            "LatentCoord standard-fit hyper_dirs currently require exactly one latent smooth term".to_string(),
+            "LatentCoord standard-fit hyper_dirs currently require exactly one latent smooth term"
+                .to_string(),
         ));
     }
     let term_idx = latent_terms[0];
@@ -13833,8 +13838,8 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
     })?;
     let p_total = design.design.ncols();
     let smooth_start = p_total.saturating_sub(design.smooth.total_smooth_cols());
-    let global_range =
-        (smooth_start + smooth_term.coeff_range.start)..(smooth_start + smooth_term.coeff_range.end);
+    let global_range = (smooth_start + smooth_term.coeff_range.start)
+        ..(smooth_start + smooth_term.coeff_range.end);
 
     // Spline bases do not add a separate continuous basis-scale ψ coordinate
     // here. When they are latent-coordinate terms, their ψ directions are the
@@ -13940,14 +13945,13 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
             identifiability_transform.clone(),
         )
         .map_err(EstimationError::from)?,
-        (
-            SmoothBasisSpec::Pca { .. },
-            BasisMetadata::Pca { basis_matrix, .. },
-        ) => crate::terms::basis::LatentCoordDesignDerivative::new_pca(
-            latent.clone(),
-            std::sync::Arc::new(basis_matrix.clone()),
-        )
-        .map_err(EstimationError::from)?,
+        (SmoothBasisSpec::Pca { .. }, BasisMetadata::Pca { basis_matrix, .. }) => {
+            crate::terms::basis::LatentCoordDesignDerivative::new_pca(
+                latent.clone(),
+                std::sync::Arc::new(basis_matrix.clone()),
+            )
+            .map_err(EstimationError::from)?
+        }
         _ => return Ok(None),
     };
     if operator.p_out() != global_range.len() {
@@ -13977,11 +13981,10 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
     }
     let direct_dim = latent_coord_direct_hyper_count(latent.id_mode(), latent.latent_dim());
     if analytic_rho_count + direct_dim > 0 {
-        let zero_x =
-            crate::estimate::reml::HyperDesignDerivative::from(Array2::<f64>::zeros((
-                design.design.nrows(),
-                p_total,
-            )));
+        let zero_x = crate::estimate::reml::HyperDesignDerivative::from(Array2::<f64>::zeros((
+            design.design.nrows(),
+            p_total,
+        )));
         for _ in 0..analytic_rho_count {
             hyper_dirs.push(
                 DirectionalHyperParam::new_compact(zero_x.clone(), Vec::new(), None, None)?
@@ -14295,7 +14298,8 @@ fn add_analytic_penalty_hessian_to_eval(
     }
     let target_t = theta.slice(s![t_start..t_end]);
     let rho = theta.slice(s![rho_start..rho_end]);
-    for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout()) {
+    for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())
+    {
         let rho_local = rho.slice(s![rho_slice]);
         if !matches!(tier, crate::terms::PenaltyTier::Psi) {
             continue;
@@ -14835,7 +14839,9 @@ impl SingleBlockLatentCoordDesignCache {
         &self.design
     }
 
-    fn latent(&self) -> Result<std::sync::Arc<crate::terms::latent_coord::LatentCoordValues>, String> {
+    fn latent(
+        &self,
+    ) -> Result<std::sync::Arc<crate::terms::latent_coord::LatentCoordValues>, String> {
         self.current_latent
             .as_ref()
             .cloned()
@@ -14858,12 +14864,17 @@ impl SingleBlockLatentCoordDesignCache {
     }
 
     fn latent_basis_kind(&self) -> Result<crate::solver::latent_cache::LatentBasisKind, String> {
-        let smooth_term = self.design.smooth.terms.get(self.term_index).ok_or_else(|| {
-            SmoothError::dimension_mismatch(format!(
-                "LatentCoord term index {} out of bounds for realized smooth design",
-                self.term_index
-            ))
-        })?;
+        let smooth_term = self
+            .design
+            .smooth
+            .terms
+            .get(self.term_index)
+            .ok_or_else(|| {
+                SmoothError::dimension_mismatch(format!(
+                    "LatentCoord term index {} out of bounds for realized smooth design",
+                    self.term_index
+                ))
+            })?;
         let termspec = self.spec.smooth_terms.get(self.term_index).ok_or_else(|| {
             SmoothError::dimension_mismatch(format!(
                 "LatentCoord term index {} out of bounds for resolved smooth spec",
@@ -14902,17 +14913,15 @@ impl SingleBlockLatentCoordDesignCache {
                     aniso_log_scales,
                     ..
                 },
-            ) => {
-                Ok(crate::solver::latent_cache::LatentBasisKind::Duchon {
-                    centers: centers.clone(),
-                    length_scale: *length_scale,
-                    power: *power,
-                    nullspace_order: *nullspace_order,
-                    aniso_log_scales: aniso_log_scales
-                        .clone()
-                        .unwrap_or_else(|| vec![0.0; centers.ncols()]),
-                })
-            }
+            ) => Ok(crate::solver::latent_cache::LatentBasisKind::Duchon {
+                centers: centers.clone(),
+                length_scale: *length_scale,
+                power: *power,
+                nullspace_order: *nullspace_order,
+                aniso_log_scales: aniso_log_scales
+                    .clone()
+                    .unwrap_or_else(|| vec![0.0; centers.ncols()]),
+            }),
             (
                 SmoothBasisSpec::Sphere { .. },
                 BasisMetadata::Sphere {
@@ -14934,42 +14943,45 @@ impl SingleBlockLatentCoordDesignCache {
             (
                 SmoothBasisSpec::BSpline1D { spec, .. },
                 BasisMetadata::BSpline1D {
-                    knots,
-                    periodic,
-                    ..
+                    knots, periodic, ..
                 },
             ) => {
                 if let Some((domain_start, period, num_basis)) = periodic {
-                    Ok(crate::solver::latent_cache::LatentBasisKind::PeriodicBspline {
-                        domain_start: *domain_start,
-                        period: *period,
-                        degree: spec.degree,
-                        num_basis: *num_basis,
-                        chunk_size: crate::basis::auto_streaming_chunk_size_for_dense(
-                            self.n_obs,
-                            *num_basis,
-                        ),
-                    })
+                    Ok(
+                        crate::solver::latent_cache::LatentBasisKind::PeriodicBspline {
+                            domain_start: *domain_start,
+                            period: *period,
+                            degree: spec.degree,
+                            num_basis: *num_basis,
+                            chunk_size: crate::basis::auto_streaming_chunk_size_for_dense(
+                                self.n_obs, *num_basis,
+                            ),
+                        },
+                    )
                 } else {
                     let num_basis_est = knots.len().saturating_sub(spec.degree + 1);
-                    Ok(crate::solver::latent_cache::LatentBasisKind::TensorBspline {
-                        knots: vec![knots.clone()],
-                        degrees: vec![spec.degree],
-                        chunk_size: crate::basis::auto_streaming_chunk_size_for_dense(
-                            self.n_obs,
-                            num_basis_est,
-                        ),
-                    })
+                    Ok(
+                        crate::solver::latent_cache::LatentBasisKind::TensorBspline {
+                            knots: vec![knots.clone()],
+                            degrees: vec![spec.degree],
+                            chunk_size: crate::basis::auto_streaming_chunk_size_for_dense(
+                                self.n_obs,
+                                num_basis_est,
+                            ),
+                        },
+                    )
                 }
             }
             (
                 SmoothBasisSpec::TensorBSpline { .. },
                 BasisMetadata::TensorBSpline { knots, degrees, .. },
-            ) => Ok(crate::solver::latent_cache::LatentBasisKind::TensorBspline {
-                knots: knots.clone(),
-                degrees: degrees.clone(),
-                chunk_size: None,
-            }),
+            ) => Ok(
+                crate::solver::latent_cache::LatentBasisKind::TensorBspline {
+                    knots: knots.clone(),
+                    degrees: degrees.clone(),
+                    chunk_size: None,
+                },
+            ),
             (
                 SmoothBasisSpec::Pca { .. },
                 BasisMetadata::Pca {
@@ -15020,8 +15032,7 @@ impl SingleBlockLatentCoordDesignCache {
             return Ok(());
         }
         let latent_flat_len = self.n_obs * self.latent_dim;
-        let direct_hyper_count =
-            latent_coord_direct_hyper_count(&self.id_mode, self.latent_dim);
+        let direct_hyper_count = latent_coord_direct_hyper_count(&self.id_mode, self.latent_dim);
         let expected =
             self.rho_dim + latent_flat_len + self.analytic_rho_count + direct_hyper_count;
         if theta.len() != expected {
@@ -15186,14 +15197,12 @@ impl SingleBlockLatentCoordDesignCache {
     ) {
         self.last_cost = Some(eval.0);
         self.last_eval = Some(eval);
-        self.last_outer_iter =
-            Some(crate::solver::estimate::reml::runtime::current_outer_iter());
+        self.last_outer_iter = Some(crate::solver::estimate::reml::runtime::current_outer_iter());
     }
 
     fn store_cost(&mut self, cost: f64) {
         self.last_cost = Some(cost);
-        self.last_outer_iter =
-            Some(crate::solver::estimate::reml::runtime::current_outer_iter());
+        self.last_outer_iter = Some(crate::solver::estimate::reml::runtime::current_outer_iter());
     }
 
     fn reset(&mut self) {
@@ -18854,8 +18863,7 @@ fn try_exact_joint_latent_coord_optimization(
                     let cost = if let Some(registry) = registry_for_key {
                         let mut registry = registry.as_ref().clone();
                         registry.apply_weight_schedules(
-                            crate::solver::estimate::reml::runtime::current_outer_iter()
-                                as usize,
+                            crate::solver::estimate::reml::runtime::current_outer_iter() as usize,
                         );
                         match analytic_penalty_objective_contribution(
                             theta,
@@ -19216,9 +19224,9 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
 mod tests {
     use super::*;
     use crate::basis::{
-        BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy,
-        DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec,
-        MaternIdentifiability, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
+        BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec,
+        DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability,
+        MaternNu, SpatialIdentifiability, ThinPlateBasisSpec,
     };
     use crate::estimate::AdaptiveRegularizationOptions;
     use crate::faer_ndarray::{FaerEigh, FaerSvd};
@@ -23279,17 +23287,19 @@ mod tests {
         )
         .expect("hyper dirs build")
         .expect("hyper dirs present");
-        drop(evaluate_joint_reml_outer_eval_at_theta(
-            &mut evaluator,
-            cache.design(),
-            &theta_zero,
-            rho_dim,
-            hyper_dirs,
-            None,
-            crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
-            None,
-        )
-        .expect("analytic outer eval"));
+        drop(
+            evaluate_joint_reml_outer_eval_at_theta(
+                &mut evaluator,
+                cache.design(),
+                &theta_zero,
+                rho_dim,
+                hyper_dirs,
+                None,
+                crate::solver::outer_strategy::OuterEvalOrder::ValueAndGradient,
+                None,
+            )
+            .expect("analytic outer eval"),
+        );
         let stash = crate::solver::estimate::reml::unified::debug_stash::take_terms();
         let c_x_tau_beta = stash.c_x_tau_beta_diag.clone().expect("term4 diag stashed");
         let x_v_psi = stash.c_x_v_psi_diag.clone().expect("X·v_ψ stashed");
@@ -24369,9 +24379,7 @@ mod tests {
         let eval = (
             1.25_f64,
             Array1::<f64>::from_elem(theta.len(), 0.5),
-            crate::solver::outer_strategy::HessianResult::Analytic(Array2::<f64>::eye(
-                theta.len(),
-            )),
+            crate::solver::outer_strategy::HessianResult::Analytic(Array2::<f64>::eye(theta.len())),
         );
         cache.store_eval(eval.clone());
 

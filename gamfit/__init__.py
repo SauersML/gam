@@ -84,6 +84,7 @@ from ._penalties import (
     OrthogonalityPenalty,
     ParametricAuxConditionalPriorPenalty,
     Penalty,
+    PENALTY_MANIFEST,
     ScalarWeightSchedule,
     ScadMcpPenalty,
     SoftmaxAssignmentSparsityPenalty,
@@ -162,6 +163,16 @@ from ._sae_manifold import (
 from ._schema import SchemaCheck, SchemaIssue
 from ._summary import Summary
 from ._validation import FormulaValidation
+from .geometry import (
+    CircleManifold,
+    EuclideanManifold,
+    GrassmannManifold,
+    ProductManifold,
+    SpdManifold,
+    SphereManifold,
+    StiefelManifold,
+    TorusManifold,
+)
 
 try:
     __version__ = _metadata.version("gamfit")
@@ -219,6 +230,14 @@ __all__ = [
     "SchemaIssue",
     "SchemaMismatchError",
     "SharedPrecisionGroup",
+    "CircleManifold",
+    "EuclideanManifold",
+    "GrassmannManifold",
+    "ProductManifold",
+    "SpdManifold",
+    "SphereManifold",
+    "StiefelManifold",
+    "TorusManifold",
     "BasisSpec",
     "ARDPenalty",
     "AuxConditionalPriorPenalty",
@@ -232,10 +251,13 @@ __all__ = [
     "OrthogonalityPenalty",
     "ParametricAuxConditionalPriorPenalty",
     "Penalty",
+    "PENALTY_MANIFEST",
     "Pca",
     "ScadMcpPenalty",
     "SoftmaxAssignmentSparsityPenalty",
     "SparsityPenalty",
+    "TopKActivationPenalty",
+    "JumpReLUPenalty",
     "TotalVariationPenalty",
     "Summary",
     "ScoreKind",

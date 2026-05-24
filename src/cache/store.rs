@@ -628,8 +628,7 @@ fn lookup_cache_insert(key: LookupCacheKey, val: CachedLookup) {
                 break;
             };
             if let Some(old) = guard.remove(&oldest) {
-                resident_bytes =
-                    resident_bytes.saturating_sub(cached_lookup_resident_bytes(&old));
+                resident_bytes = resident_bytes.saturating_sub(cached_lookup_resident_bytes(&old));
             }
         }
         guard.insert(key, val);

@@ -9,21 +9,21 @@ pub mod hull;
 pub mod input_loc_derivatives;
 pub mod latent_coord;
 pub mod layout;
-pub mod penalty_op;
 pub mod penalties;
+pub mod penalty_op;
 pub mod sae_manifold;
 pub mod smooth;
 pub mod term_builder;
 
 pub use analytic_penalties::{
-    ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyOp,
-    AnalyticPenaltyRegistry, RowPrecisionPriorPenalty, BlockOrthogonalityPenalty,
-    BlockSparsityPenalty, DifferenceOpKind, FrozenAnalyticPenaltyOp, IBPAssignmentPenalty,
-    IsometryPenalty, IsometryDuchonRadialSource, IsometryReference, IvaeRidgeMeanGauge,
-    JumpReLUPenalty, MechanismSparsityPenalty, NuclearNormPenalty, OrthogonalityPenalty,
-    ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
-    ScalarWeightSchedule, ScadMcpPenalty, SoftmaxAssignmentSparsityPenalty, SparsityKind,
-    SparsityPenalty, TopKActivationPenalty, TotalVariationPenalty, WeightField,
+    ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyOp, AnalyticPenaltyRegistry,
+    BlockOrthogonalityPenalty, BlockSparsityPenalty, DifferenceOpKind, FrozenAnalyticPenaltyOp,
+    IBPAssignmentPenalty, IsometryDuchonRadialSource, IsometryPenalty, IsometryReference,
+    IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty, NuclearNormPenalty,
+    OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier,
+    PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
+    SoftmaxAssignmentSparsityPenalty, SparsityKind, SparsityPenalty, TopKActivationPenalty,
+    TotalVariationPenalty, WeightField,
 };
 pub use atom_selection::{
     AssignmentSparsityCoupling, AtomLibrary, AtomRecord, AtomSelectionStrategy, EntropicSoftmax,

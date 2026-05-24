@@ -1917,10 +1917,7 @@ pub trait CustomFamily {
         false
     }
 
-    fn inner_joint_workspace_log_likelihood_available(
-        &self,
-        specs: &[ParameterBlockSpec],
-    ) -> bool {
+    fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         drop(specs);
         false
     }
@@ -2754,8 +2751,7 @@ struct CachedInnerMode {
     block_logdet_s: f64,
     joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     kkt_residual: Option<crate::estimate::reml::unified::ProjectedKktResidual>,
-    active_constraints:
-        Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
+    active_constraints: Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
 }
 
 fn screened_outer_warm_start<'a>(
@@ -6945,9 +6941,9 @@ fn pullback_labeled_outer_eval(
     if eval_mode == EvalMode::ValueGradientHessian {
         result.outer_hessian = match result.outer_hessian {
             crate::solver::outer_strategy::HessianResult::Analytic(hessian) => {
-                crate::solver::outer_strategy::HessianResult::Analytic(
-                    aggregate_labeled_hessian(&hessian, layout)?,
-                )
+                crate::solver::outer_strategy::HessianResult::Analytic(aggregate_labeled_hessian(
+                    &hessian, layout,
+                )?)
             }
             crate::solver::outer_strategy::HessianResult::Operator(operator) => {
                 crate::solver::outer_strategy::HessianResult::Operator(Arc::new(
@@ -6988,9 +6984,7 @@ fn outerobjectivegradienthessian_labeled<F: CustomFamily + Clone + Send + Sync +
     pullback_labeled_outer_eval(base, rho, layout, rho_prior, eval_mode)
 }
 
-fn custom_family_seed_screening_proxy_labeled<
-    F: CustomFamily + Clone + Send + Sync + 'static,
->(
+fn custom_family_seed_screening_proxy_labeled<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
@@ -8867,16 +8861,11 @@ type DriftDerivFn<'a> =
     dyn Fn(&Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync + 'a;
 type DriftDerivManyFn<'a> =
     dyn Fn(&[Array1<f64>]) -> Result<Vec<Option<DriftDerivResult>>, String> + Send + Sync + 'a;
-type DriftSecondDerivFn<'a> = dyn Fn(
-        &Array1<f64>,
-        &Array1<f64>,
-    ) -> Result<Option<DriftDerivResult>, String>
+type DriftSecondDerivFn<'a> = dyn Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String>
     + Send
     + Sync
     + 'a;
-type DriftSecondDerivManyFn<'a> = dyn Fn(
-        &[(Array1<f64>, Array1<f64>)],
-    ) -> Result<Vec<Option<DriftDerivResult>>, String>
+type DriftSecondDerivManyFn<'a> = dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>
     + Send
     + Sync
     + 'a;
@@ -9543,7 +9532,8 @@ fn exact_newton_d2h_closure<'a, F: CustomFamily + Sync>(
     use_outer_curvature_derivatives: bool,
     scale: f64,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-) -> impl Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync + 'a {
+) -> impl Fn(&Array1<f64>, &Array1<f64>) -> Result<Option<DriftDerivResult>, String> + Send + Sync + 'a
+{
     move |u: &Array1<f64>, v: &Array1<f64>| {
         if use_outer_curvature_derivatives {
             return match family
@@ -17029,8 +17019,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     let has_configured_rho_prior = !matches!(rho_prior, crate::types::RhoPrior::Flat);
     let mut batched_gradient_override: Option<Array1<f64>> = None;
     if !has_configured_rho_prior
-        && (eval_mode == EvalMode::ValueAndGradient
-            || eval_mode == EvalMode::ValueGradientHessian)
+        && (eval_mode == EvalMode::ValueAndGradient || eval_mode == EvalMode::ValueGradientHessian)
     {
         let beta_flat_for_batch = flatten_state_betas(&inner.block_states, specs);
         let synced_states_for_batch = synchronized_states_from_flat_beta(
@@ -19402,11 +19391,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         );
         let per_block = split_log_lambdas(&rho0, &penalty_counts)?;
         let mut inner = inner_blockwise_fit(family, specs, &per_block, options, None)?;
-        refresh_all_block_etas(family, specs, &mut inner.block_states)
-            .map_err(|reason| CustomFamilyError::Optimization {
+        refresh_all_block_etas(family, specs, &mut inner.block_states).map_err(|reason| {
+            CustomFamilyError::Optimization {
                 context: "fit_custom_family one-cycle eta refresh",
                 reason,
-            })?;
+            }
+        })?;
         let penalized_objective = checked_penalizedobjective(
             inner.log_likelihood,
             inner.penalty_value,
@@ -19852,11 +19842,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     let covariance_conditional =
         compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
 
-    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block)
-        .map_err(|reason| CustomFamilyError::Optimization {
+    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block).map_err(
+        |reason| CustomFamilyError::Optimization {
             context: "fit_custom_family joint geometry",
             reason,
-        })?;
+        },
+    )?;
     let penalized_objective = checked_penalizedobjective(
         inner.log_likelihood,
         inner.penalty_value,
@@ -19934,11 +19925,12 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
     let covariance_conditional =
         compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
-    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block)
-        .map_err(|reason| CustomFamilyError::Optimization {
+    let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block).map_err(
+        |reason| CustomFamilyError::Optimization {
             context: "fit_custom_family_fixed_log_lambdas joint geometry",
             reason,
-        })?;
+        },
+    )?;
     let penalized_objective = checked_penalizedobjective(
         inner.log_likelihood,
         inner.penalty_value,

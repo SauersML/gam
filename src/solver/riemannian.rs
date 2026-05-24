@@ -111,12 +111,7 @@ pub trait Manifold: Send + Sync {
 
     /// Transport tangent `xi` at `from` to a tangent vector at `to` in place
     /// (projection approximation — not full parallel transport).
-    fn vector_transport(
-        &self,
-        from: ArrayView1<f64>,
-        to: ArrayView1<f64>,
-        xi: ArrayViewMut1<f64>,
-    );
+    fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>);
 
     /// Per-ambient-axis trust-region metric weights.
     fn metric_weights(&self) -> Vec<f64> {
@@ -125,8 +120,7 @@ pub trait Manifold: Send + Sync {
 
     /// Riemannian inner product `<ξ, η>_p`. Default: weighted ambient
     /// inner product restricted to `T_p M`.
-    fn inner_product(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, eta: ArrayView1<f64>)
-        -> f64 {
+    fn inner_product(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, eta: ArrayView1<f64>) -> f64 {
         drop(p);
         debug_assert_eq!(xi.len(), eta.len());
         let weights = self.metric_weights();
@@ -264,12 +258,7 @@ impl Manifold for Euclidean {
             out[i] = p[i] + xi[i];
         }
     }
-    fn vector_transport(
-        &self,
-        from: ArrayView1<f64>,
-        to: ArrayView1<f64>,
-        xi: ArrayViewMut1<f64>,
-    ) {
+    fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
         drop(from);
         drop(to);
         drop(xi);
@@ -326,19 +315,17 @@ impl Manifold for Circle {
         let x = p[0] + xi[0];
         let y = p[1] + xi[1];
         let s2 = x * x + y * y;
-        debug_assert!(s2.is_finite() && s2 > 0.0, "Circle::retract degenerate ||p+ξ||");
+        debug_assert!(
+            s2.is_finite() && s2 > 0.0,
+            "Circle::retract degenerate ||p+ξ||"
+        );
         let norm = s2.sqrt().max(1.0e-300);
         out[0] = x / norm;
         out[1] = y / norm;
         // Post-condition: retraction stays on S¹.
         debug_assert!((out[0] * out[0] + out[1] * out[1] - 1.0).abs() < 1.0e-9);
     }
-    fn vector_transport(
-        &self,
-        from: ArrayView1<f64>,
-        to: ArrayView1<f64>,
-        xi: ArrayViewMut1<f64>,
-    ) {
+    fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
         drop(from);
         // Projection approximation τ_{p→q}(ξ) = P_q(ξ) (proposal §4.4).
         // Safe even at antipodal endpoints since it does not divide by 1+<p,q>.
@@ -431,7 +418,10 @@ impl Manifold for Sphere {
             out[i] = v;
             s2 += v * v;
         }
-        debug_assert!(s2.is_finite() && s2 > 0.0, "Sphere::retract degenerate ||p+ξ||");
+        debug_assert!(
+            s2.is_finite() && s2 > 0.0,
+            "Sphere::retract degenerate ||p+ξ||"
+        );
         let norm = s2.sqrt().max(1.0e-300);
         for i in 0..m {
             out[i] /= norm;
@@ -441,15 +431,13 @@ impl Manifold for Sphere {
             for i in 0..m {
                 n2 += out[i] * out[i];
             }
-            debug_assert!((n2 - 1.0).abs() < 1.0e-9, "Sphere::retract output not on S^n");
+            debug_assert!(
+                (n2 - 1.0).abs() < 1.0e-9,
+                "Sphere::retract output not on S^n"
+            );
         }
     }
-    fn vector_transport(
-        &self,
-        from: ArrayView1<f64>,
-        to: ArrayView1<f64>,
-        xi: ArrayViewMut1<f64>,
-    ) {
+    fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
         drop(from);
         // Projection transport (proposal §6.4). Cheap, stable, not exactly
         // isometric. Antipodal case (to ≈ -from) does not divide by zero
@@ -623,12 +611,7 @@ impl Manifold for Interval {
             "Interval::retract output left feasible band"
         );
     }
-    fn vector_transport(
-        &self,
-        from: ArrayView1<f64>,
-        to: ArrayView1<f64>,
-        xi: ArrayViewMut1<f64>,
-    ) {
+    fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
         drop(from);
         drop(to);
         drop(xi);
@@ -704,7 +687,11 @@ impl Manifold for Torus {
             let x = p[2 * k] + xi[2 * k];
             let y = p[2 * k + 1] + xi[2 * k + 1];
             let s2 = x * x + y * y;
-            debug_assert!(s2.is_finite() && s2 > 0.0, "Torus::retract degenerate at axis {}", k);
+            debug_assert!(
+                s2.is_finite() && s2 > 0.0,
+                "Torus::retract degenerate at axis {}",
+                k
+            );
             let norm = s2.sqrt().max(1.0e-300);
             out[2 * k] = x / norm;
             out[2 * k + 1] = y / norm;
@@ -714,12 +701,7 @@ impl Manifold for Torus {
             }
         }
     }
-    fn vector_transport(
-        &self,
-        from: ArrayView1<f64>,
-        to: ArrayView1<f64>,
-        xi: ArrayViewMut1<f64>,
-    ) {
+    fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
         drop(from);
         self.project_tangent(to, xi);
     }
@@ -812,12 +794,7 @@ impl Manifold for Product {
             off += m;
         }
     }
-    fn vector_transport(
-        &self,
-        from: ArrayView1<f64>,
-        to: ArrayView1<f64>,
-        xi: ArrayViewMut1<f64>,
-    ) {
+    fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
         let mut off = 0usize;
         let mut xi_mut = xi;
         for c in &self.components {
@@ -1207,7 +1184,11 @@ mod tests {
         // Riemannian Hess applied to a tangent vector ξ should equal
         //   P_T( H_E ξ - <p, g> ξ ).
         let m = Sphere { n: 2 };
-        let p = array![1.0_f64 / 3.0_f64.sqrt(), 1.0 / 3.0_f64.sqrt(), 1.0 / 3.0_f64.sqrt()];
+        let p = array![
+            1.0_f64 / 3.0_f64.sqrt(),
+            1.0 / 3.0_f64.sqrt(),
+            1.0 / 3.0_f64.sqrt()
+        ];
         let egrad = array![0.5_f64, -0.2, 0.7];
         // Tangent: cross with arbitrary direction then re-project.
         let mut xi = array![1.0_f64, 0.0, 0.0];

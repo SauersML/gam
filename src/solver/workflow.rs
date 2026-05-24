@@ -41,28 +41,29 @@ use crate::families::transformation_normal::{
 };
 use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
-use crate::solver::latent_cache::LatentRetractionRegistry;
-use crate::solver::riemannian_retraction::{ProductRetraction, RetractionKind};
 use crate::smooth::{
     AdaptiveRegularizationDiagnostics, CoefficientGroupSpec, SpatialLengthScaleOptimizationOptions,
     StandardLatentCoordConfig, TermCollectionDesign, TermCollectionSpec,
-    build_term_collection_design, fit_term_collectionwith_latent_coord_optimization,
+    build_term_collection_design,
     fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
+    fit_term_collectionwith_latent_coord_optimization,
     fit_term_collectionwith_spatial_length_scale_optimization,
 };
+use crate::solver::latent_cache::LatentRetractionRegistry;
+use crate::solver::riemannian_retraction::{ProductRetraction, RetractionKind};
+use crate::survival::PenaltyBlock;
 use crate::terms::latent_coord::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };
 use crate::terms::{
-    ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, RowPrecisionPriorPenalty,
-    BlockOrthogonalityPenalty, BlockSparsityPenalty, DifferenceOpKind, GumbelTemperatureSchedule,
-    IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty,
-    MechanismSparsityPenalty, NuclearNormPenalty, OrthogonalityPenalty,
-    ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice, ScadMcpPenalty,
-    SoftmaxAssignmentSparsityPenalty, ScalarWeightSchedule, ScheduleKind, SparsityPenalty,
-    TopKActivationPenalty, TotalVariationPenalty,
+    ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
+    BlockSparsityPenalty, DifferenceOpKind, GumbelTemperatureSchedule, IBPAssignmentPenalty,
+    IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty,
+    NuclearNormPenalty, OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity,
+    PenaltyTier, PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
+    ScheduleKind, SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
+    TotalVariationPenalty,
 };
-use crate::survival::PenaltyBlock;
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodFamily, LinkFunction, MixtureLinkSpec, SasLinkSpec,
     WigglePenaltyConfig,
@@ -781,7 +782,8 @@ fn fixed_gaussian_shift_frailty_from_spec(
 
 fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResult, String> {
     let fitted = if let Some(latent_coord) = request.latent_coord.as_ref() {
-        if !request.coefficient_groups.is_empty() || !request.penalty_block_gamma_priors.is_empty() {
+        if !request.coefficient_groups.is_empty() || !request.penalty_block_gamma_priors.is_empty()
+        {
             return Err("latent-coordinate standard fits do not support coefficient_groups or penalty_block_gamma_priors in the same request".to_string());
         }
         fit_term_collectionwith_latent_coord_optimization(
@@ -2600,10 +2602,11 @@ pub fn resolve_family(
                 "binomial-cloglog" => LikelihoodFamily::BinomialCLogLog,
                 "latent-cloglog-binomial" => LikelihoodFamily::BinomialLatentCLogLog,
                 "poisson" => LikelihoodFamily::PoissonLog,
-                "nb" | "negbin" | "negative_binomial" | "negative-binomial"
-                | "negative-binomial-log" => {
-                    LikelihoodFamily::NegativeBinomial { theta: nb_theta }
-                }
+                "nb"
+                | "negbin"
+                | "negative_binomial"
+                | "negative-binomial"
+                | "negative-binomial-log" => LikelihoodFamily::NegativeBinomial { theta: nb_theta },
                 "beta" | "beta-logit" | "beta-regression" | "beta-regression-logit" => {
                     LikelihoodFamily::BetaLogit { phi: 1.0 }
                 }
@@ -2653,8 +2656,16 @@ pub fn resolve_family(
         };
         if let Some(explicit_family) = explicit {
             let compatible_log_nb = matches!(
-                (explicit_family, choice.link, choice.mixture_components.as_ref()),
-                (LikelihoodFamily::NegativeBinomial { .. }, LinkFunction::Log, None)
+                (
+                    explicit_family,
+                    choice.link,
+                    choice.mixture_components.as_ref()
+                ),
+                (
+                    LikelihoodFamily::NegativeBinomial { .. },
+                    LinkFunction::Log,
+                    None
+                )
             );
             if explicit_family != from_link && !compatible_log_nb {
                 return Err(WorkflowError::InvalidConfig {
@@ -2963,9 +2974,7 @@ struct LatentPenaltyTarget {
     d: usize,
 }
 
-fn latent_penalty_targets(
-    latents: Option<&JsonValue>,
-) -> Result<Vec<LatentPenaltyTarget>, String> {
+fn latent_penalty_targets(latents: Option<&JsonValue>) -> Result<Vec<LatentPenaltyTarget>, String> {
     let Some(raw) = latents.filter(|value| !value.is_null()) else {
         return Ok(Vec::new());
     };
@@ -3029,7 +3038,9 @@ fn penalty_target_for_descriptor<'a>(
             )
         });
     }
-    Err(format!("{context}.target must be a latent block name or index"))
+    Err(format!(
+        "{context}.target must be a latent block name or index"
+    ))
 }
 
 fn analytic_descriptor_f64(
@@ -3101,7 +3112,9 @@ fn analytic_descriptor_weight_sequence(
     }
     for (idx, raw) in values.iter().enumerate() {
         let Some(weight) = raw.as_f64() else {
-            return Err(format!("{context}.weight[{idx}] must be a finite positive float"));
+            return Err(format!(
+                "{context}.weight[{idx}] must be a finite positive float"
+            ));
         };
         if !(weight.is_finite() && weight > 0.0) {
             return Err(format!("{context}.weight[{idx}] must be finite and > 0"));
@@ -3129,9 +3142,9 @@ fn analytic_descriptor_difference_op(
                 .ok_or_else(|| format!("{context}.edges is required for graph_edges"))?;
             let mut edges = Vec::with_capacity(raw_edges.len());
             for (edge_idx, raw_edge) in raw_edges.iter().enumerate() {
-                let pair = raw_edge
-                    .as_array()
-                    .ok_or_else(|| format!("{context}.edges[{edge_idx}] must be a two-item list"))?;
+                let pair = raw_edge.as_array().ok_or_else(|| {
+                    format!("{context}.edges[{edge_idx}] must be a two-item list")
+                })?;
                 if pair.len() != 2 {
                     return Err(format!(
                         "{context}.edges[{edge_idx}] must contain exactly two row indices"
@@ -3194,9 +3207,7 @@ fn analytic_descriptor_weight_schedule(
             let steps = schedule
                 .get("steps")
                 .and_then(JsonValue::as_u64)
-                .ok_or_else(|| {
-                    format!("{context}.weight_schedule.steps is required for linear")
-                })?;
+                .ok_or_else(|| format!("{context}.weight_schedule.steps is required for linear"))?;
             ScheduleKind::Linear {
                 steps: steps as usize,
             }
@@ -3234,14 +3245,14 @@ fn analytic_descriptor_temperature_schedule(
     let tau_start = schedule
         .get("tau_start")
         .and_then(JsonValue::as_f64)
-        .ok_or_else(|| format!("{context}.temperature_schedule.tau_start must be a finite number"))?;
+        .ok_or_else(|| {
+            format!("{context}.temperature_schedule.tau_start must be a finite number")
+        })?;
     let tau_min = schedule
         .get("tau_min")
         .or_else(|| schedule.get("tau_end"))
         .and_then(JsonValue::as_f64)
-        .ok_or_else(|| {
-            format!("{context}.temperature_schedule.tau_min must be a finite number")
-        })?;
+        .ok_or_else(|| format!("{context}.temperature_schedule.tau_min must be a finite number"))?;
     let decay_name = schedule
         .get("decay")
         .and_then(JsonValue::as_str)
@@ -3347,10 +3358,10 @@ fn build_standard_latent_analytic_penalty_registry(
                 registry.push(AnalyticPenaltyKind::TopKActivation(Arc::new(penalty)));
             }
             "jumprelu" | "jump_relu" => {
-                let thresholds = analytic_descriptor_array1_flat(descriptor, "thresholds", &context)?;
+                let thresholds =
+                    analytic_descriptor_array1_flat(descriptor, "thresholds", &context)?;
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
-                let smoothing_eps =
-                    analytic_descriptor_f64(descriptor, "smoothing_eps", 1.0e-3)?;
+                let smoothing_eps = analytic_descriptor_f64(descriptor, "smoothing_eps", 1.0e-3)?;
                 let penalty = JumpReLUPenalty::new(slice, thresholds, weight, smoothing_eps)
                     .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
@@ -3366,9 +3377,8 @@ fn build_standard_latent_analytic_penalty_registry(
                     .get("learnable")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                let penalty =
-                    OrthogonalityPenalty::new(slice, target.d, weight, n_eff, learnable)
-                        .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = OrthogonalityPenalty::new(slice, target.d, weight, n_eff, learnable)
+                    .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
@@ -3419,8 +3429,7 @@ fn build_standard_latent_analytic_penalty_registry(
                     }
                 };
                 let gamma = analytic_descriptor_f64(descriptor, "gamma", gamma_default)?;
-                let smoothing_eps =
-                    analytic_descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
+                let smoothing_eps = analytic_descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
                 let learnable = descriptor
                     .get("learnable")
                     .and_then(JsonValue::as_bool)
@@ -3507,7 +3516,9 @@ fn build_standard_latent_analytic_penalty_registry(
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
                 };
-                registry.push(AnalyticPenaltyKind::SoftmaxAssignmentSparsity(Arc::new(penalty)));
+                registry.push(AnalyticPenaltyKind::SoftmaxAssignmentSparsity(Arc::new(
+                    penalty,
+                )));
             }
             "total_variation" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
@@ -3552,9 +3563,15 @@ fn build_standard_latent_analytic_penalty_registry(
                     .get("learnable")
                     .and_then(JsonValue::as_bool)
                     .unwrap_or(false);
-                let penalty =
-                    NuclearNormPenalty::new(slice, weight, n_eff, smoothing_eps, max_rank, learnable)
-                        .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = NuclearNormPenalty::new(
+                    slice,
+                    weight,
+                    n_eff,
+                    smoothing_eps,
+                    max_rank,
+                    learnable,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
@@ -3670,14 +3687,9 @@ fn build_standard_latent_analytic_penalty_registry(
                     "lambda_per_row_shape",
                     &context,
                 )?;
-                let penalty = RowPrecisionPriorPenalty::new(
-                    slice,
-                    lambda_per_row,
-                    weight,
-                    n_eff,
-                    learnable,
-                )
-                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty =
+                    RowPrecisionPriorPenalty::new(slice, lambda_per_row, weight, n_eff, learnable)
+                        .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
@@ -3712,12 +3724,9 @@ fn build_standard_latent_analytic_penalty_registry(
                     .unwrap_or(false);
                 let aux =
                     analytic_descriptor_array2_flat(descriptor, "aux", "aux_shape", &context)?;
-                let log_alpha =
-                    analytic_descriptor_array1_flat(descriptor, "log_alpha", &context)?;
-                let raw_beta =
-                    analytic_descriptor_array1_flat(descriptor, "raw_beta", &context)?;
-                let mu =
-                    analytic_descriptor_array2_flat(descriptor, "mu", "mu_shape", &context)?;
+                let log_alpha = analytic_descriptor_array1_flat(descriptor, "log_alpha", &context)?;
+                let raw_beta = analytic_descriptor_array1_flat(descriptor, "raw_beta", &context)?;
+                let mu = analytic_descriptor_array2_flat(descriptor, "mu", "mu_shape", &context)?;
                 let penalty = ParametricRowPrecisionPriorPenalty::new(
                     slice, aux, log_alpha, raw_beta, mu, weight, n_eff, learnable,
                 )
@@ -3730,7 +3739,11 @@ fn build_standard_latent_analytic_penalty_registry(
                     penalty,
                 )));
             }
-            other => return Err(format!("{context}.kind has unsupported analytic penalty {other:?}")),
+            other => {
+                return Err(format!(
+                    "{context}.kind has unsupported analytic penalty {other:?}"
+                ));
+            }
         }
     }
     Ok(registry)
@@ -3753,9 +3766,9 @@ fn analytic_descriptor_array3_flat(
     }
     let mut shape = [0usize; 3];
     for (idx, raw_dim) in shape_values.iter().enumerate() {
-        let dim = raw_dim.as_u64().ok_or_else(|| {
-            format!("{context}.{shape_key}[{idx}] must be a positive integer")
-        })?;
+        let dim = raw_dim
+            .as_u64()
+            .ok_or_else(|| format!("{context}.{shape_key}[{idx}] must be a positive integer"))?;
         if dim == 0 {
             return Err(format!("{context}.{shape_key}[{idx}] must be > 0"));
         }
@@ -3831,9 +3844,9 @@ fn analytic_descriptor_array2_flat(
     }
     let mut shape = [0usize; 2];
     for (idx, raw_dim) in shape_values.iter().enumerate() {
-        let dim = raw_dim.as_u64().ok_or_else(|| {
-            format!("{context}.{shape_key}[{idx}] must be a positive integer")
-        })?;
+        let dim = raw_dim
+            .as_u64()
+            .ok_or_else(|| format!("{context}.{shape_key}[{idx}] must be a positive integer"))?;
         if dim == 0 {
             return Err(format!("{context}.{shape_key}[{idx}] must be > 0"));
         }
@@ -3867,9 +3880,9 @@ fn analytic_descriptor_array2_flat(
 }
 
 fn json_array2(value: &JsonValue, context: &str) -> Result<Array2<f64>, String> {
-    let rows = value.as_array().ok_or_else(|| {
-        format!("{context} must be a two-dimensional numeric array")
-    })?;
+    let rows = value
+        .as_array()
+        .ok_or_else(|| format!("{context} must be a two-dimensional numeric array"))?;
     let n = rows.len();
     let first = rows
         .first()
@@ -3888,9 +3901,9 @@ fn json_array2(value: &JsonValue, context: &str) -> Result<Array2<f64>, String> 
             ));
         }
         for (j, cell) in row.iter().enumerate() {
-            let value = cell.as_f64().ok_or_else(|| {
-                format!("{context}[{i}][{j}] must be a finite number")
-            })?;
+            let value = cell
+                .as_f64()
+                .ok_or_else(|| format!("{context}[{i}][{j}] must be a finite number"))?;
             if !value.is_finite() {
                 return Err(format!("{context}[{i}][{j}] must be finite"));
             }
@@ -4005,15 +4018,14 @@ fn parse_latent_manifold(
     } else if let Some(items) = value.as_array() {
         let mut parts = Vec::with_capacity(items.len());
         for (idx, item) in items.iter().enumerate() {
-            parts.push(parse_latent_manifold(
-                Some(item),
-                1,
-                &format!("{context}[{idx}]"),
-            )?.manifold);
+            parts
+                .push(parse_latent_manifold(Some(item), 1, &format!("{context}[{idx}]"))?.manifold);
         }
         LatentManifold::Product(parts)
     } else {
-        return Err(format!("{context} must be a string, object, or product array"));
+        return Err(format!(
+            "{context} must be a string, object, or product array"
+        ));
     };
     if manifold.ambient_dim(d) != d {
         return Err(format!(
@@ -4170,27 +4182,33 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
         )?;
         let init = match obj.get("init") {
             None => LatentInitSpec::Pca,
-            Some(value) if value.as_str().is_some_and(|s| s.eq_ignore_ascii_case("pca")) => {
+            Some(value)
+                if value
+                    .as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("pca")) =>
+            {
                 LatentInitSpec::Pca
             }
-            Some(value) if value.as_str().is_some_and(|s| s.eq_ignore_ascii_case("random")) => {
+            Some(value)
+                if value
+                    .as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("random")) =>
+            {
                 LatentInitSpec::Random
             }
-            Some(value) => LatentInitSpec::Explicit(json_array2(
-                value,
-                &format!("latents['{key}'].init"),
-            )?),
+            Some(value) => {
+                LatentInitSpec::Explicit(json_array2(value, &format!("latents['{key}'].init"))?)
+            }
         };
         let aux_prior = match obj.get("aux_prior").filter(|value| !value.is_null()) {
             None => None,
             Some(value) => {
-                let aux = value.as_object().ok_or_else(|| {
-                    format!("latents['{key}'].aux_prior must be an object")
-                })?;
+                let aux = value
+                    .as_object()
+                    .ok_or_else(|| format!("latents['{key}'].aux_prior must be an object"))?;
                 let u = json_array2(
-                    aux.get("u").ok_or_else(|| {
-                        format!("latents['{key}'].aux_prior.u is required")
-                    })?,
+                    aux.get("u")
+                        .ok_or_else(|| format!("latents['{key}'].aux_prior.u is required"))?,
                     &format!("latents['{key}'].aux_prior.u"),
                 )?;
                 let family = match aux
@@ -4335,8 +4353,7 @@ fn initial_latent_matrix(spec: &LatentSpec, y: ArrayView1<'_, f64>) -> Result<Ar
                 out[[n, 0]] = (y[n] - mean) / sd;
             }
             if spec.d > 1 {
-                let mut seed =
-                    0xD1B54A32D192ED03_u64 ^ ((spec.n as u64) << 16) ^ spec.d as u64;
+                let mut seed = 0xD1B54A32D192ED03_u64 ^ ((spec.n as u64) << 16) ^ spec.d as u64;
                 for n in 0..spec.n {
                     for axis in 1..spec.d {
                         out[[n, axis]] = deterministic_unit(&mut seed) - 0.5;
@@ -4551,7 +4568,9 @@ fn natural_latent_manifold_for_basis(
             }
         }
         crate::smooth::SmoothBasisSpec::Sphere { .. } => LatentManifold::Sphere { dim: d },
-        crate::smooth::SmoothBasisSpec::Duchon { spec, .. } if spec.periodic.is_some() && d == 1 => {
+        crate::smooth::SmoothBasisSpec::Duchon { spec, .. }
+            if spec.periodic.is_some() && d == 1 =>
+        {
             LatentManifold::Circle
         }
         crate::smooth::SmoothBasisSpec::TensorBSpline { spec, .. } => {
@@ -4625,7 +4644,8 @@ fn materialize_standard<'a>(
     let term_parsed = latent_parsed.as_ref().unwrap_or(parsed);
     let term_col_map = term_data.column_map();
 
-    let policy = resolved_resource_policy(config, term_data, crate::resource::ProblemHints::default());
+    let policy =
+        resolved_resource_policy(config, term_data, crate::resource::ProblemHints::default());
     let spec = build_termspec_with_geometry(
         &term_parsed.terms,
         term_data,
@@ -4647,8 +4667,10 @@ fn materialize_standard<'a>(
                     .to_string()
             })?;
         if coord.manifold_auto {
-            let inferred =
-                natural_latent_manifold_for_basis(&spec.smooth_terms[coord.term_index].basis, coord.feature_cols.len());
+            let inferred = natural_latent_manifold_for_basis(
+                &spec.smooth_terms[coord.term_index].basis,
+                coord.feature_cols.len(),
+            );
             coord.manifold = inferred.clone();
             coord.values = Arc::new(coord.values.with_manifold(inferred));
         }
@@ -5160,7 +5182,9 @@ fn materialize_survival<'a>(
         marginal_logslopespecs,
         marginal_slope_deviation_routing,
     ) = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
-        drop(resolve_survival_marginal_slope_base_link(parsed.linkspec.as_ref())?);
+        drop(resolve_survival_marginal_slope_base_link(
+            parsed.linkspec.as_ref(),
+        )?);
         let default_z_column =
             marginal_z_column_name.expect("marginal-slope z column should be available");
         if let Some(ls_formula) = config.logslope_formula.as_deref() {
@@ -5732,7 +5756,8 @@ fn materialize_survival<'a>(
         optimize_survival_baseline_config(
             &baseline_cfg,
             "workflow survival baseline",
-            |candidate| match survival_mode {
+            |candidate| {
+                match survival_mode {
                 SurvivalLikelihoodMode::LocationScale => Err(
                     "internal: location-scale baseline profiling uses analytic chain-rule gradient and should not reach the workflow scalar profile closure"
                         .to_string(),
@@ -5759,6 +5784,7 @@ fn materialize_survival<'a>(
                             .to_string(),
                     )
                 }
+            }
             },
         )?
     } else {

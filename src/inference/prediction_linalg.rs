@@ -58,7 +58,11 @@ impl<'a> PredictionCovarianceBackend<'a> {
         }
         let dim = hessian.nrows();
         let factor = hessian.factorize()?;
-        let phi_scale = if phi.is_finite() && phi > 0.0 { phi } else { 1.0 };
+        let phi_scale = if phi.is_finite() && phi > 0.0 {
+            phi
+        } else {
+            1.0
+        };
         Ok(Self::Factorized {
             factor,
             dim,
