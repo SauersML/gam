@@ -44,7 +44,7 @@ use crate::survival_construction::{
 };
 use crate::term_builder::resolve_role_col;
 use crate::types::{
-    InverseLink, LikelihoodFamily, LikelihoodSpec, LinkFunction, ResponseFamily,
+    InverseLink, LikelihoodSpec, LikelihoodSpec, LinkFunction, ResponseFamily,
 };
 
 /// Reconstruct the `LinkWiggleFormulaSpec` from a saved model's
@@ -155,7 +155,7 @@ fn family_noise_parameter(fit: &UnifiedFitResult, likelihood: &LikelihoodSpec) -
 }
 
 /// Build a `LikelihoodSpec` for a saved model. Combines the legacy
-/// `LikelihoodFamily` selector returned by `model.likelihood()` with any
+/// `LikelihoodSpec` selector returned by `model.likelihood()` with any
 /// parameterized link state (`MixtureLinkState`, `SasLinkState`,
 /// `LatentCLogLogState`) the saved model carries so downstream sampling code
 /// can dispatch directly on the (response, link) pair.
@@ -165,7 +165,7 @@ fn likelihood_spec_for_saved_model(model: &SavedModel) -> Result<LikelihoodSpec,
         return Ok(spec);
     }
     match family {
-        LikelihoodFamily::BinomialMixture => {
+        LikelihoodSpec::binomial_link(LinkFunction::Logit) => {
             let state = model
                 .saved_mixture_state()
                 .map_err(|e| e.to_string())?
@@ -177,7 +177,7 @@ fn likelihood_spec_for_saved_model(model: &SavedModel) -> Result<LikelihoodSpec,
                 link: InverseLink::Mixture(state),
             })
         }
-        LikelihoodFamily::BinomialSas => {
+        LikelihoodSpec::binomial_link(LinkFunction::Sas) => {
             let state = model
                 .saved_sas_state()
                 .map_err(|e| e.to_string())?
@@ -189,7 +189,7 @@ fn likelihood_spec_for_saved_model(model: &SavedModel) -> Result<LikelihoodSpec,
                 link: InverseLink::Sas(state),
             })
         }
-        LikelihoodFamily::BinomialBetaLogistic => {
+        LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic) => {
             let state = model
                 .saved_beta_logistic_state()
                 .map_err(|e| e.to_string())?
@@ -202,7 +202,7 @@ fn likelihood_spec_for_saved_model(model: &SavedModel) -> Result<LikelihoodSpec,
                 link: InverseLink::BetaLogistic(state),
             })
         }
-        LikelihoodFamily::BinomialLatentCLogLog => {
+        LikelihoodSpec::binomial_link(LinkFunction::CLogLog) => {
             let state = model
                 .saved_latent_cloglog_state()
                 .map_err(|e| e.to_string())?

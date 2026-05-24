@@ -10,7 +10,7 @@ use crate::quadrature::{
     probit_posterior_meanvariance, survival_posterior_mean, survival_posterior_meanvariance,
 };
 use crate::types::{
-    InverseLink, LikelihoodFamily, LikelihoodSpec, LinkFunction, ResponseFamily,
+    InverseLink, LikelihoodSpec, LikelihoodSpec, LinkFunction, ResponseFamily,
     is_valid_tweedie_power,
 };
 use ndarray::{Array1, ArrayView1};
@@ -20,7 +20,7 @@ use ndarray::{Array1, ArrayView1};
 pub trait FamilyStrategy: std::fmt::Debug + Send + Sync {
     fn name(&self) -> &'static str;
 
-    fn family(&self) -> LikelihoodFamily;
+    fn family(&self) -> LikelihoodSpec;
 
     fn link_function(&self) -> LinkFunction;
 
@@ -71,32 +71,32 @@ pub struct ResolvedFamilyStrategy {
     spec: LikelihoodSpec,
 }
 
-/// Build a `LikelihoodSpec` from a legacy `LikelihoodFamily` plus an
+/// Build a `LikelihoodSpec` from a legacy `LikelihoodSpec` plus an
 /// optional fitted `InverseLink` state. For parameterized binomial
 /// variants (`BinomialMixture`/`Sas`/`BetaLogistic`/`LatentCLogLog`) the
 /// supplied `InverseLink` is preferred — when absent, a default
 /// `Standard(<family link>)` placeholder is used; subsequent strategy
 /// methods will surface a `missing_state` error if they actually need
 /// the parameterized state.
-fn spec_from_family(family: LikelihoodFamily, inverse_link: Option<&InverseLink>) -> LikelihoodSpec {
+fn spec_from_family(family: LikelihoodSpec, inverse_link: Option<&InverseLink>) -> LikelihoodSpec {
     if let Some(link) = inverse_link {
         let response = match family {
-            LikelihoodFamily::GaussianIdentity => ResponseFamily::Gaussian,
-            LikelihoodFamily::PoissonLog => ResponseFamily::Poisson,
-            LikelihoodFamily::Tweedie { p } => ResponseFamily::Tweedie { p },
-            LikelihoodFamily::NegativeBinomial { theta } => {
+            LikelihoodSpec::gaussian_identity() => ResponseFamily::Gaussian,
+            LikelihoodSpec::poisson_log() => ResponseFamily::Poisson,
+            LikelihoodSpec::Tweedie { p } => ResponseFamily::Tweedie { p },
+            LikelihoodSpec::NegativeBinomial { theta } => {
                 ResponseFamily::NegativeBinomial { theta }
             }
-            LikelihoodFamily::BetaLogit { phi } => ResponseFamily::Beta { phi },
-            LikelihoodFamily::GammaLog => ResponseFamily::Gamma,
-            LikelihoodFamily::RoystonParmar => ResponseFamily::RoystonParmar,
-            LikelihoodFamily::BinomialLogit
-            | LikelihoodFamily::BinomialProbit
-            | LikelihoodFamily::BinomialCLogLog
-            | LikelihoodFamily::BinomialLatentCLogLog
-            | LikelihoodFamily::BinomialSas
-            | LikelihoodFamily::BinomialBetaLogistic
-            | LikelihoodFamily::BinomialMixture => ResponseFamily::Binomial,
+            LikelihoodSpec::BetaLogit { phi } => ResponseFamily::Beta { phi },
+            LikelihoodSpec::gamma_log() => ResponseFamily::Gamma,
+            LikelihoodSpec::royston_parmar() => ResponseFamily::RoystonParmar,
+            LikelihoodSpec::binomial_logit()
+            | LikelihoodSpec::binomial_probit()
+            | LikelihoodSpec::binomial_cloglog()
+            | LikelihoodSpec::binomial_link(LinkFunction::CLogLog)
+            | LikelihoodSpec::binomial_link(LinkFunction::Sas)
+            | LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic)
+            | LikelihoodSpec::binomial_link(LinkFunction::Logit) => ResponseFamily::Binomial,
         };
         return LikelihoodSpec {
             response,
@@ -122,7 +122,7 @@ fn spec_from_family(family: LikelihoodFamily, inverse_link: Option<&InverseLink>
 /// later if they need state that this constructor did not supply.
 #[inline]
 pub fn strategy_for_family(
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     inverse_link: Option<&InverseLink>,
 ) -> ResolvedFamilyStrategy {
     ResolvedFamilyStrategy {
@@ -275,26 +275,26 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         self.spec.name()
     }
 
-    fn family(&self) -> LikelihoodFamily {
+    fn family(&self) -> LikelihoodSpec {
         match (&self.spec.response, &self.spec.link) {
-            (ResponseFamily::Gaussian, _) => LikelihoodFamily::GaussianIdentity,
-            (ResponseFamily::Poisson, _) => LikelihoodFamily::PoissonLog,
-            (ResponseFamily::Tweedie { p }, _) => LikelihoodFamily::Tweedie { p: *p },
+            (ResponseFamily::Gaussian, _) => LikelihoodSpec::gaussian_identity(),
+            (ResponseFamily::Poisson, _) => LikelihoodSpec::poisson_log(),
+            (ResponseFamily::Tweedie { p }, _) => LikelihoodSpec::Tweedie { p: *p },
             (ResponseFamily::NegativeBinomial { theta }, _) => {
-                LikelihoodFamily::NegativeBinomial { theta: *theta }
+                LikelihoodSpec::NegativeBinomial { theta: *theta }
             }
-            (ResponseFamily::Beta { phi }, _) => LikelihoodFamily::BetaLogit { phi: *phi },
-            (ResponseFamily::Gamma, _) => LikelihoodFamily::GammaLog,
-            (ResponseFamily::RoystonParmar, _) => LikelihoodFamily::RoystonParmar,
+            (ResponseFamily::Beta { phi }, _) => LikelihoodSpec::BetaLogit { phi: *phi },
+            (ResponseFamily::Gamma, _) => LikelihoodSpec::gamma_log(),
+            (ResponseFamily::RoystonParmar, _) => LikelihoodSpec::royston_parmar(),
             (ResponseFamily::Binomial, link) => match link {
-                InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
-                InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
-                InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
-                InverseLink::Standard(_) => LikelihoodFamily::BinomialLogit,
-                InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
-                InverseLink::Sas(_) => LikelihoodFamily::BinomialSas,
-                InverseLink::BetaLogistic(_) => LikelihoodFamily::BinomialBetaLogistic,
-                InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
+                InverseLink::Standard(LinkFunction::Logit) => LikelihoodSpec::binomial_logit(),
+                InverseLink::Standard(LinkFunction::Probit) => LikelihoodSpec::binomial_probit(),
+                InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodSpec::binomial_cloglog(),
+                InverseLink::Standard(_) => LikelihoodSpec::binomial_logit(),
+                InverseLink::LatentCLogLog(_) => LikelihoodSpec::binomial_link(LinkFunction::CLogLog),
+                InverseLink::Sas(_) => LikelihoodSpec::binomial_link(LinkFunction::Sas),
+                InverseLink::BetaLogistic(_) => LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic),
+                InverseLink::Mixture(_) => LikelihoodSpec::binomial_link(LinkFunction::Logit),
             },
         }
     }
@@ -357,7 +357,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 let state = self.require_mixture_state()?;
                 integrated_family_moments_jetwith_state(
                     quadctx,
-                    LikelihoodFamily::BinomialMixture,
+                    LikelihoodSpec::binomial_link(LinkFunction::Logit),
                     eta,
                     se_eta,
                     Some(state),
@@ -439,7 +439,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 let state = self.require_mixture_state()?;
                 let m1 = integrated_family_moments_jetwith_state(
                     quadctx,
-                    LikelihoodFamily::BinomialMixture,
+                    LikelihoodSpec::binomial_link(LinkFunction::Logit),
                     eta,
                     se_eta,
                     Some(state),
@@ -560,7 +560,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         }
         integrated_family_moments_jetwith_state(
             quadctx,
-            self.spec.as_likelihood_family(),
+            self.family(),
             eta,
             se_eta,
             self.mixture_state(),
