@@ -12,7 +12,6 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::time::Duration;
 
-const RUN_BENCH: bool = false;
 const BENCH_WORK_MS: u64 = 25;
 const ACCEPT_BT: usize = 4;
 const MAX_ATTEMPTS: usize = 8;
@@ -56,13 +55,6 @@ fn speculative_backtracking(work: Duration) -> usize {
 }
 
 fn bench_joint_line_search_speculative(c: &mut Criterion) {
-    if !RUN_BENCH {
-        eprintln!(
-            "skipping opt-in joint line-search benchmark; flip `RUN_BENCH` to \
-             `true` in benches/joint_line_search_speculative.rs to run"
-        );
-        return;
-    }
     gam::init_parallelism();
     let work = Duration::from_millis(BENCH_WORK_MS);
 
