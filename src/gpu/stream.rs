@@ -1,34 +1,28 @@
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct GpuStream {
-    id: usize,
+    pub id: usize,
 }
-
-impl GpuStream {
-    #[must_use]
-    pub const fn default() -> Self {
-        Self { id: 0 }
-    }
-
-    #[must_use]
-    pub const fn id(self) -> usize {
-        self.id
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct GpuEvent;
 
 #[derive(Clone, Debug, Default)]
-pub struct StreamPool;
+pub struct GpuEvent {
+    pub id: usize,
+}
 
-impl StreamPool {
+#[derive(Clone, Debug, Default)]
+pub struct GpuStreamPool {
+    streams: Vec<GpuStream>,
+}
+
+impl GpuStreamPool {
     #[must_use]
-    pub const fn new() -> Self {
-        Self
+    pub fn new(count: usize) -> Self {
+        Self {
+            streams: (0..count.max(1)).map(|id| GpuStream { id }).collect(),
+        }
     }
 
     #[must_use]
-    pub const fn next(&self) -> GpuStream {
-        GpuStream::default()
+    pub fn get(&self, index: usize) -> &GpuStream {
+        &self.streams[index % self.streams.len()]
     }
 }

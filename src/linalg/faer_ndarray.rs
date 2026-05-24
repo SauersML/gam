@@ -1,3 +1,5 @@
+use crate::gpu::linalg::{self as gpu_linalg, GpuDispatch};
+use crate::gpu::policy::Operation;
 use dyn_stack::{MemBuffer, MemStack};
 use faer::diag::{Diag, DiagMut, DiagRef};
 use faer::linalg::cholesky::lblt::factor::{self, LbltParams, PivotingStrategy};
@@ -263,12 +265,20 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
-    if let Some(out) = crate::gpu::try_fast_atb(a, b) {
+    if let GpuDispatch::Executed(out) = gpu_linalg::try_fast_atb(a, b) {
         return out;
     }
     let (n_a, p) = a.dim();
     let (_, q) = b.dim();
-    fast_atb_with_parallelism(a, b, matmul_parallelism(p, q, n_a))
+    let op = Operation::Gemm {
+        m: p,
+        n: q,
+        k: n_a,
+        resident: false,
+    };
+    gpu_linalg::profile_cpu(op, || {
+        fast_atb_with_parallelism(a, b, matmul_parallelism(p, q, n_a))
+    })
 }
 
 /// Compute A^T * B with an explicit faer parallelism policy for callers that
@@ -358,16 +368,22 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
-    if crate::gpu::linalg::should_dispatch_gemm(a, b) {
-        if let Some(out) = crate::gpu::linalg::try_fast_ab(a, b) {
-            return out;
-        }
+    if let GpuDispatch::Executed(out) = gpu_linalg::try_fast_ab(a, b) {
+        return out;
     }
-    let (n, _) = a.dim();
+    let (n, p) = a.dim();
     let (_, q) = b.dim();
-    let mut out = Array2::<f64>::zeros((n, q));
-    fast_ab_into(a, b, &mut out);
-    out
+    let op = Operation::Gemm {
+        m: n,
+        n: q,
+        k: p,
+        resident: false,
+    };
+    gpu_linalg::profile_cpu(op, || {
+        let mut out = Array2::<f64>::zeros((n, q));
+        fast_ab_into(a, b, &mut out);
+        out
+    })
 }
 
 /// Compute A * v using faer's SIMD-optimized GEMV.
@@ -383,38 +399,40 @@ pub fn fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     use faer::linalg::matmul::matmul;
     use faer::{Accum, Mat};
 
-    if let Some(out) = crate::gpu::try_fast_av(a, v) {
+    if let GpuDispatch::Executed(out) = gpu_linalg::try_fast_av(a, v) {
         return out;
     }
 
     let (n, p) = a.dim();
     debug_assert_eq!(p, v.len(), "A cols must match v length");
+    let op = Operation::Gemv {
+        rows: n,
+        cols: p,
+        transpose: false,
+        resident: false,
+    };
 
-    if crate::gpu::linalg::should_dispatch_gemv(a, v, false) {
-        if let Some(out) = crate::gpu::linalg::try_fast_av(a, v) {
-            return out;
+    return gpu_linalg::profile_cpu(op, || {
+        if !should_use_faer_matmul(n, 1, p) {
+            return a.dot(v);
         }
-    }
 
-    if !should_use_faer_matmul(n, 1, p) {
-        return a.dot(v);
-    }
+        let mut result = Mat::<f64>::zeros(n, 1);
 
-    let mut result = Mat::<f64>::zeros(n, 1);
+        let aview = FaerArrayView::new(a);
+        let vview = FaerColView::new(v);
+        let a_ref = aview.as_ref();
+        let v_ref = vview.as_ref();
 
-    let aview = FaerArrayView::new(a);
-    let vview = FaerColView::new(v);
-    let a_ref = aview.as_ref();
-    let v_ref = vview.as_ref();
+        let par = matmul_parallelism(n, 1, p);
+        matmul(result.as_mut(), Accum::Replace, a_ref, v_ref, 1.0, par);
 
-    let par = matmul_parallelism(n, 1, p);
-    matmul(result.as_mut(), Accum::Replace, a_ref, v_ref, 1.0, par);
-
-    let mut out = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        out[i] = result[(i, 0)];
-    }
-    out
+        let mut out = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            out[i] = result[(i, 0)];
+        }
+        out
+    });
 }
 
 /// Compute A * v into a pre-allocated output buffer.
@@ -519,47 +537,49 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     use faer::linalg::matmul::matmul;
     use faer::{Accum, Mat};
 
-    if let Some(out) = crate::gpu::try_fast_atv(a, v) {
+    if let GpuDispatch::Executed(out) = gpu_linalg::try_fast_atv(a, v) {
         return out;
     }
 
     let (n, p) = a.dim();
     debug_assert_eq!(n, v.len(), "A rows must match v length");
+    let op = Operation::Gemv {
+        rows: n,
+        cols: p,
+        transpose: true,
+        resident: false,
+    };
 
-    if crate::gpu::linalg::should_dispatch_gemv(a, v, true) {
-        if let Some(out) = crate::gpu::linalg::try_fast_atv(a, v) {
-            return out;
+    return gpu_linalg::profile_cpu(op, || {
+        // For very small arrays, ndarray might be faster
+        if !should_use_faer_matmul(p, 1, n) {
+            return a.t().dot(v);
         }
-    }
 
-    // For very small arrays, ndarray might be faster
-    if !should_use_faer_matmul(p, 1, n) {
-        return a.t().dot(v);
-    }
+        let mut result = Mat::<f64>::zeros(p, 1);
 
-    let mut result = Mat::<f64>::zeros(p, 1);
+        let aview = FaerArrayView::new(a);
+        let vview = FaerColView::new(v);
+        let a_ref = aview.as_ref();
+        let v_ref = vview.as_ref();
 
-    let aview = FaerArrayView::new(a);
-    let vview = FaerColView::new(v);
-    let a_ref = aview.as_ref();
-    let v_ref = vview.as_ref();
+        // dst = A^T * v (treating v as n×1 matrix)
+        let par = matmul_parallelism(p, 1, n);
+        matmul(
+            result.as_mut(),
+            Accum::Replace,
+            a_ref.transpose(),
+            v_ref,
+            1.0,
+            par,
+        );
 
-    // dst = A^T * v (treating v as n×1 matrix)
-    let par = matmul_parallelism(p, 1, n);
-    matmul(
-        result.as_mut(),
-        Accum::Replace,
-        a_ref.transpose(),
-        v_ref,
-        1.0,
-        par,
-    );
-
-    let mut out = Array1::<f64>::zeros(p);
-    for i in 0..p {
-        out[i] = result[(i, 0)];
-    }
-    out
+        let mut out = Array1::<f64>::zeros(p);
+        for i in 0..p {
+            out[i] = result[(i, 0)];
+        }
+        out
+    });
 }
 
 /// Compute A^T * v into a pre-allocated output buffer.
@@ -626,9 +646,23 @@ pub fn fast_xt_diag_x_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64
     w: &ArrayBase<S2, Ix1>,
     par: Par,
 ) -> Array2<f64> {
-    if let Some(out) = crate::gpu::linalg::try_fast_xt_diag_x(x, w) {
+    if let GpuDispatch::Executed(out) = gpu_linalg::try_fast_xt_diag_x(x, w) {
         return out;
     }
+    let op = Operation::XtDiagX {
+        rows: x.nrows(),
+        cols: x.ncols(),
+        resident: false,
+    };
+    gpu_linalg::profile_cpu(op, || fast_xt_diag_x_cpu_with_parallelism(x, w, par))
+}
+
+#[inline]
+fn fast_xt_diag_x_cpu_with_parallelism<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
+    x: &ArrayBase<S1, Ix2>,
+    w: &ArrayBase<S2, Ix1>,
+    par: Par,
+) -> Array2<f64> {
     use faer::Accum;
     use faer::linalg::matmul::triangular::{BlockStructure, matmul as tri_matmul};
     use ndarray::{ShapeBuilder, s};
@@ -742,9 +776,24 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
     w: &ArrayBase<S2, Ix1>,
     y: &ArrayBase<S3, Ix2>,
 ) -> Array2<f64> {
-    if let Some(out) = crate::gpu::linalg::try_fast_xt_diag_y(x, w, y) {
+    if let GpuDispatch::Executed(out) = gpu_linalg::try_fast_xt_diag_y(x, w, y) {
         return out;
     }
+    let op = Operation::XtDiagY {
+        rows: x.nrows(),
+        x_cols: x.ncols(),
+        y_cols: y.ncols(),
+        resident: false,
+    };
+    gpu_linalg::profile_cpu(op, || fast_xt_diag_y_cpu(x, w, y))
+}
+
+#[inline]
+fn fast_xt_diag_y_cpu<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem = f64>>(
+    x: &ArrayBase<S1, Ix2>,
+    w: &ArrayBase<S2, Ix1>,
+    y: &ArrayBase<S3, Ix2>,
+) -> Array2<f64> {
     use faer::Accum;
     use faer::linalg::matmul::matmul;
     use ndarray::{ShapeBuilder, s};
@@ -851,9 +900,35 @@ pub fn fast_joint_hessian_2x2<
     w_ab: &ArrayBase<S4, Ix1>,
     w_bb: &ArrayBase<S5, Ix1>,
 ) -> Array2<f64> {
-    if let Some(out) = crate::gpu::linalg::try_fast_joint_hessian_2x2(x_a, x_b, w_aa, w_ab, w_bb) {
+    if let GpuDispatch::Executed(out) =
+        gpu_linalg::try_fast_joint_hessian_2x2(x_a, x_b, w_aa, w_ab, w_bb)
+    {
         return out;
     }
+    let op = Operation::JointHessian2x2 {
+        rows: x_a.nrows(),
+        a_cols: x_a.ncols(),
+        b_cols: x_b.ncols(),
+        resident: false,
+    };
+    gpu_linalg::profile_cpu(op, || {
+        fast_joint_hessian_2x2_cpu(x_a, x_b, w_aa, w_ab, w_bb)
+    })
+}
+
+fn fast_joint_hessian_2x2_cpu<
+    S1: Data<Elem = f64>,
+    S2: Data<Elem = f64>,
+    S3: Data<Elem = f64>,
+    S4: Data<Elem = f64>,
+    S5: Data<Elem = f64>,
+>(
+    x_a: &ArrayBase<S1, Ix2>,
+    x_b: &ArrayBase<S2, Ix2>,
+    w_aa: &ArrayBase<S3, Ix1>,
+    w_ab: &ArrayBase<S4, Ix1>,
+    w_bb: &ArrayBase<S5, Ix1>,
+) -> Array2<f64> {
     use faer::Accum;
     use faer::linalg::matmul::matmul;
     use ndarray::{ShapeBuilder, s};
