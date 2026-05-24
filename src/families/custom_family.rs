@@ -19437,7 +19437,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 stable_penalty_term: 2.0 * inner.penalty_value,
                 penalized_objective,
                 outer_iterations: 0,
-                outer_gradient_norm: 0.0,
+                outer_gradient_norm: Some(0.0),
                 inner_cycles: inner.cycles,
                 outer_converged: inner.converged,
                 geometry: None,
