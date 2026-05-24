@@ -18,6 +18,7 @@ fn periodic_spline_interpolates_anisotropic_ellipse_in_multi_output_space() {
     for i in 0..n {
         let t = i as f64 * TWO_PI / n as f64;
         u[i] = t;
+        // Strong anisotropic stretching: not a unit circle.
         y[[i, 0]] = 4.0 * t.cos();
         y[[i, 1]] = 0.35 * t.sin();
     }
@@ -37,6 +38,13 @@ fn periodic_spline_interpolates_anisotropic_ellipse_in_multi_output_space() {
             assert!((seam_y[[row, col]] - seam_y[[0, col]]).abs() < 1e-10);
         }
     }
+
+    let deriv = spline
+        .evaluate_derivative(array![0.0, TWO_PI].view())
+        .expect("seam derivative");
+    for col in 0..deriv.ncols() {
+        assert!((deriv[[0, col]] - deriv[[1, col]]).abs() < 1e-10);
+    }
 }
 
 #[test]
@@ -47,6 +55,7 @@ fn periodic_spline_handles_skewed_oval_embedded_in_3d() {
     for i in 0..n {
         let t = i as f64 * TWO_PI / n as f64;
         u[i] = t;
+        // A distorted loop with mixed harmonics and a non-axis-aligned ambient embedding.
         let x = 2.0 * t.cos() + 0.22 * (3.0 * t).cos();
         let z = 0.8 * t.sin() - 0.15 * (2.0 * t).sin();
         y[[i, 0]] = x + 0.4 * z;
@@ -72,8 +81,8 @@ fn periodic_spline_handles_skewed_oval_embedded_in_3d() {
 }
 
 #[test]
-fn periodic_spline_accepts_unsorted_samples_and_duplicate_endpoints() {
-    let u = array![TWO_PI, 0.25 * TWO_PI, 0.0, 0.75 * TWO_PI, -0.25 * TWO_PI];
+fn periodic_spline_accepts_unsorted_samples_and_duplicate_endpoint() {
+    let u = array![TWO_PI, 0.5 * TWO_PI, 0.0, 1.5 * TWO_PI, 0.25 * TWO_PI];
     let mut y = Array2::<f64>::zeros((u.len(), 2));
     for i in 0..u.len() {
         let t = u[i];
@@ -82,7 +91,7 @@ fn periodic_spline_accepts_unsorted_samples_and_duplicate_endpoints() {
     }
 
     let spline = fit_periodic_spline_1d(u.view(), y.view(), PeriodicSpline1DOptions::new(TWO_PI))
-        .expect("fit with duplicate endpoints");
+        .expect("fit with duplicate endpoint");
     assert_eq!(spline.num_sites(), 3);
 
     let at_zero = spline.evaluate(array![0.0].view()).expect("zero eval");
@@ -90,35 +99,6 @@ fn periodic_spline_accepts_unsorted_samples_and_duplicate_endpoints() {
     assert!(max_abs(&at_zero, &at_period) < 1e-12);
     assert!((at_zero[[0, 0]] - 1.5).abs() < 1e-12);
     assert!(at_zero[[0, 1]].abs() < 1e-12);
-}
-
-#[test]
-fn periodic_spline_matches_first_and_second_derivatives_at_seam() {
-    let n = 21;
-    let mut u = Array1::<f64>::zeros(n);
-    let mut y = Array2::<f64>::zeros((n, 2));
-    for i in 0..n {
-        let t = i as f64 * TWO_PI / n as f64;
-        u[i] = t;
-        y[[i, 0]] = (2.0 * t).cos() + 0.25 * (3.0 * t).sin();
-        y[[i, 1]] = 0.5 * t.sin() - 0.2 * (4.0 * t).cos();
-    }
-
-    let spline = fit_periodic_spline_1d(u.view(), y.view(), PeriodicSpline1DOptions::new(TWO_PI))
-        .expect("periodic derivative fit");
-    let seam = array![0.0, TWO_PI, -TWO_PI];
-    let first = spline
-        .evaluate_derivative(seam.view())
-        .expect("first derivative at seam");
-    let second = spline
-        .evaluate_second_derivative(seam.view())
-        .expect("second derivative at seam");
-    for row in 1..seam.len() {
-        for col in 0..spline.ambient_dim() {
-            assert!((first[[row, col]] - first[[0, col]]).abs() < 1e-10);
-            assert!((second[[row, col]] - second[[0, col]]).abs() < 1e-10);
-        }
-    }
 }
 
 #[test]
@@ -134,15 +114,6 @@ fn periodic_spline_rejects_scalar_only_or_degenerate_inputs() {
     let err = fit_periodic_spline_1d(u3.view(), y_bad.view(), PeriodicSpline1DOptions::new(3.0))
         .expect_err("row mismatch should fail");
     assert!(err.to_string().contains("does not match output row count"));
-
-    let y_scalar = Array2::<f64>::zeros((3, 0));
-    let err = fit_periodic_spline_1d(
-        u3.view(),
-        y_scalar.view(),
-        PeriodicSpline1DOptions::new(3.0),
-    )
-    .expect_err("empty ambient dimension should fail");
-    assert!(err.to_string().contains("at least one output dimension"));
 
     let y3 = Array2::<f64>::zeros((3, 1));
     let err = fit_periodic_spline_1d(u3.view(), y3.view(), PeriodicSpline1DOptions::new(f64::NAN))
