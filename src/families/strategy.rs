@@ -71,43 +71,6 @@ pub struct ResolvedFamilyStrategy {
     spec: LikelihoodSpec,
 }
 
-/// Reconstruct the legacy flat `LikelihoodFamily` identifier from a
-/// `LikelihoodSpec`. Used to feed downstream helpers (state-aware
-/// integration dispatchers, `pretty_name`/`name` queries) that still
-/// accept the legacy enum.
-#[inline]
-fn family_from_spec(spec: &LikelihoodSpec) -> LikelihoodFamily {
-    match (&spec.response, &spec.link) {
-        (ResponseFamily::Gaussian, _) => LikelihoodFamily::GaussianIdentity,
-        (ResponseFamily::Poisson, _) => LikelihoodFamily::PoissonLog,
-        (ResponseFamily::Tweedie { p }, _) => LikelihoodFamily::Tweedie { p: *p },
-        (ResponseFamily::NegativeBinomial { theta }, _) => {
-            LikelihoodFamily::NegativeBinomial { theta: *theta }
-        }
-        (ResponseFamily::Beta { phi }, _) => LikelihoodFamily::BetaLogit { phi: *phi },
-        (ResponseFamily::Gamma, _) => LikelihoodFamily::GammaLog,
-        (ResponseFamily::RoystonParmar, _) => LikelihoodFamily::RoystonParmar,
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
-            LikelihoodFamily::BinomialLogit
-        }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
-            LikelihoodFamily::BinomialProbit
-        }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
-            LikelihoodFamily::BinomialCLogLog
-        }
-        (ResponseFamily::Binomial, InverseLink::Standard(_)) => LikelihoodFamily::BinomialLogit,
-        (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
-            LikelihoodFamily::BinomialLatentCLogLog
-        }
-        (ResponseFamily::Binomial, InverseLink::Sas(_)) => LikelihoodFamily::BinomialSas,
-        (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
-            LikelihoodFamily::BinomialBetaLogistic
-        }
-        (ResponseFamily::Binomial, InverseLink::Mixture(_)) => LikelihoodFamily::BinomialMixture,
-    }
-}
-
 /// Build a `LikelihoodSpec` from a legacy `LikelihoodFamily` plus an
 /// optional fitted `InverseLink` state. For parameterized binomial
 /// variants (`BinomialMixture`/`Sas`/`BetaLogistic`/`LatentCLogLog`) the
@@ -228,7 +191,7 @@ impl ResolvedFamilyStrategy {
 fn missing_state(spec: &LikelihoodSpec, what: &str) -> EstimationError {
     EstimationError::InvalidInput(format!(
         "{} requires fitted {} state",
-        family_from_spec(spec).pretty_name(),
+        spec.pretty_name(),
         what
     ))
 }
@@ -263,7 +226,7 @@ fn require_noise_parameter(
     let value = value.ok_or_else(|| {
         EstimationError::InvalidInput(format!(
             "{} generative sampling requires fitted {parameter_name}",
-            family_from_spec(spec).pretty_name()
+            spec.pretty_name()
         ))
     })?;
     if value.is_finite() {
@@ -271,7 +234,7 @@ fn require_noise_parameter(
     } else {
         Err(EstimationError::InvalidInput(format!(
             "{} generative sampling requires finite {parameter_name}; got {value}",
-            family_from_spec(spec).pretty_name()
+            spec.pretty_name()
         )))
     }
 }
@@ -288,18 +251,18 @@ fn require_positive_noise_parameter(
     } else {
         Err(EstimationError::InvalidInput(format!(
             "{} generative sampling requires {parameter_name} > 0; got {value}",
-            family_from_spec(spec).pretty_name()
+            spec.pretty_name()
         )))
     }
 }
 
 impl FamilyStrategy for ResolvedFamilyStrategy {
     fn name(&self) -> &'static str {
-        family_from_spec(&self.spec).name()
+        self.spec.name()
     }
 
     fn family(&self) -> LikelihoodFamily {
-        family_from_spec(&self.spec)
+        self.spec.as_likelihood_family()
     }
 
     fn link_function(&self) -> LinkFunction {
@@ -563,7 +526,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
         }
         integrated_family_moments_jetwith_state(
             quadctx,
-            family_from_spec(&self.spec),
+            self.spec.as_likelihood_family(),
             eta,
             se_eta,
             self.mixture_state(),

@@ -12698,12 +12698,12 @@ fn require_successful_spatial_optimization_result<T>(
 }
 
 fn external_opts_for_design(
-    family: LikelihoodSpec,
+    family: &LikelihoodSpec,
     design: &TermCollectionDesign,
     options: &FitOptions,
 ) -> ExternalOptimOptions {
     ExternalOptimOptions {
-        family: spec_to_family(&family),
+        family: spec_to_family(family),
         latent_cloglog: options.latent_cloglog,
         mixture_link: options.mixture_link.clone(),
         optimize_mixture: options.optimize_mixture,
@@ -12791,7 +12791,7 @@ fn evaluate_joint_reml_efs_at_theta(
 }
 
 fn exact_joint_spatial_outer_hessian_available(
-    family: LikelihoodSpec,
+    family: &LikelihoodSpec,
     design: &TermCollectionDesign,
 ) -> bool {
     // Every `LikelihoodFamily` variant (Gaussian, Binomial-*, Poisson, Gamma,
@@ -17390,7 +17390,7 @@ impl<'d> ExactJointDesignCache<'d> {
 }
 
 pub(crate) fn seed_risk_profile_for_likelihood_family(
-    family: LikelihoodSpec,
+    family: &LikelihoodSpec,
 ) -> crate::seeding::SeedRiskProfile {
     match &family.response {
         ResponseFamily::Gaussian => crate::seeding::SeedRiskProfile::Gaussian,
