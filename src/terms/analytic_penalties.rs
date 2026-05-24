@@ -295,11 +295,9 @@ pub trait AnalyticPenalty: Send + Sync {
     /// (Isometry); those implement [`Self::hvp`] instead.
     fn hessian_diag(
         &self,
-        target: ArrayView1<'_, f64>,
-        rho: ArrayView1<'_, f64>,
+        _target: ArrayView1<'_, f64>,
+        _rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
-        std::hint::black_box(target);
-        std::hint::black_box(rho);
         None
     }
 
@@ -364,9 +362,7 @@ pub trait AnalyticPenalty: Send + Sync {
 
     /// Update any attached scalar weight schedule at the given REML outer
     /// iteration. Penalties without schedules keep their stored weight.
-    fn apply_schedule(&mut self, iter: usize) {
-        std::hint::black_box(iter);
-    }
+    fn apply_schedule(&mut self, _iter: usize) {}
 }
 
 fn advance_scalar_weight(
@@ -1503,11 +1499,9 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
 
     fn hessian_diag(
         &self,
-        target: ArrayView1<'_, f64>,
-        rho: ArrayView1<'_, f64>,
+        _target: ArrayView1<'_, f64>,
+        _rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
-        std::hint::black_box(target);
-        std::hint::black_box(rho);
         None
     }
 
