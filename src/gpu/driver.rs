@@ -189,9 +189,8 @@ pub fn check_cuda(result: CuResult, name: &str) -> Result<(), GpuError> {
 
 fn load_library(candidates: &[&str]) -> Result<Library, GpuError> {
     for candidate in candidates {
-        // SAFETY: Library::new is `unsafe` because it may execute
-        // arbitrary code from the loaded library's initializer; we only
-        // ever load OS-provided libcuda by canonical names from
+        // SAFETY: Library::new runs the library's loader initializer; we
+        // only ever pass canonical libcuda paths from
         // cuda_library_candidates(), which has no init-time side effects.
         if let Ok(library) = unsafe { Library::new(*candidate) } {
             return Ok(library);

@@ -642,7 +642,7 @@ impl ParametricColumnConditioning {
             // The influence matrix is a mixed linear operator, not a covariance
             // or Hessian. Drop it across column-conditioning transforms rather
             // than applying the wrong congruence map.
-            inf.influence_matrix = None;
+            inf.coefficient_influence = None;
             inf.bias_correction_beta = inf
                 .bias_correction_beta
                 .take()
@@ -700,6 +700,15 @@ fn dispersion_from_likelihood(
             } else {
                 Dispersion::Known(phi.max(1e-300))
             }
+        }
+        GlmLikelihoodFamily::Tweedie { .. } => {
+            Dispersion::Known(likelihood.fixed_phi().unwrap_or(1.0).max(1e-300))
+        }
+        GlmLikelihoodFamily::NegativeBinomial { theta } => {
+            Dispersion::Known(likelihood.fixed_phi().unwrap_or(theta).max(1e-300))
+        }
+        GlmLikelihoodFamily::BetaLogit { phi } => {
+            Dispersion::Known((1.0 / (1.0 + phi.max(1e-12))).max(1e-300))
         }
         GlmLikelihoodFamily::BinomialLogit
         | GlmLikelihoodFamily::BinomialProbit
@@ -3482,7 +3491,7 @@ where
     let mut beta_covariance_corrected = None;
     let mut beta_standard_errors_corrected = None;
     let mut beta_covariance_frequentist = None;
-    let mut influence_matrix = None;
+    let mut coefficient_influence = None;
     let mut covariance_is_diagonal_only = false;
     let mut bias_correction_beta = None;
 
@@ -3642,6 +3651,17 @@ where
                 .unwrap_or(1.0)
                 .max(f64::MIN_POSITIVE)
         }
+        GlmLikelihoodFamily::Tweedie { .. } => pirls_res
+            .likelihood
+            .fixed_phi()
+            .unwrap_or(1.0)
+            .max(f64::MIN_POSITIVE),
+        GlmLikelihoodFamily::NegativeBinomial { theta } => pirls_res
+            .likelihood
+            .fixed_phi()
+            .unwrap_or(theta)
+            .max(f64::MIN_POSITIVE),
+        GlmLikelihoodFamily::BetaLogit { phi } => 1.0 / (1.0 + phi.max(1e-12)),
         GlmLikelihoodFamily::BinomialLogit
         | GlmLikelihoodFamily::BinomialProbit
         | GlmLikelihoodFamily::BinomialCLogLog
@@ -3737,7 +3757,7 @@ where
             let mut ve = f_mat.dot(h_inv);
             ve *= dispersion_phi;
             enforce_symmetry(&mut ve);
-            influence_matrix = Some(f_mat);
+            coefficient_influence = Some(f_mat);
             beta_covariance_frequentist = Some(ve);
         }
 
@@ -3781,7 +3801,7 @@ where
         beta_covariance_corrected,
         beta_standard_errors_corrected,
         beta_covariance_frequentist,
-        influence_matrix,
+        coefficient_influence,
         covariance_is_diagonal_only,
         bias_correction_beta,
     });
@@ -4026,7 +4046,7 @@ pub struct FitInference {
     pub beta_covariance_frequentist: Option<Array2<f64>>,
     /// Coefficient-space influence matrix F = H⁻¹ X'WX. Its trace is the total EDF.
     #[serde(default)]
-    pub influence_matrix: Option<Array2<f64>>,
+    pub coefficient_influence: Option<Array2<f64>>,
     /// True when covariance was forced to diagonal-only because dense inversion was unavailable.
     #[serde(default)]
     pub covariance_is_diagonal_only: bool,
@@ -4457,9 +4477,6 @@ impl FitInference {
                 v.iter().copied(),
             )?;
         }
-        if let Some(v) = self.influence_matrix.as_ref() {
-            validate_all_finite_estimation("fit_result.influence_matrix", v.iter().copied())?;
-        }
         if let Some(v) = self.smoothing_correction.as_ref() {
             validate_all_finite_estimation("fit_result.smoothing_correction", v.iter().copied())?;
         }
@@ -4846,11 +4863,11 @@ impl UnifiedFitResult {
                     p
                 )));
             }
-            if let Some(f_mat) = inf.influence_matrix.as_ref()
+            if let Some(f_mat) = inf.coefficient_influence.as_ref()
                 && (f_mat.nrows() != p || f_mat.ncols() != p)
             {
                 return Err(EstimationError::InvalidInput(format!(
-                    "UnifiedFitResult influence matrix shape mismatch: got {}x{}, expected {}x{}",
+                    "UnifiedFitResult coefficient influence shape mismatch: got {}x{}, expected {}x{}",
                     f_mat.nrows(),
                     f_mat.ncols(),
                     p,
@@ -5112,7 +5129,7 @@ impl UnifiedFitResult {
     pub fn influence_matrix(&self) -> Option<&Array2<f64>> {
         self.inference
             .as_ref()
-            .and_then(|inf| inf.influence_matrix.as_ref())
+            .and_then(|inf| inf.coefficient_influence.as_ref())
     }
 
     pub fn covariance_is_diagonal_only(&self) -> bool {
@@ -6732,7 +6749,7 @@ mod estimate_policy_tests {
                 beta_covariance_corrected: Some(array![[1.2, 0.1], [0.1, 2.2]]),
                 beta_standard_errors_corrected: Some(array![1.2_f64.sqrt(), 2.2_f64.sqrt()]),
                 beta_covariance_frequentist: None,
-                influence_matrix: None,
+                coefficient_influence: None,
                 covariance_is_diagonal_only: false,
                 bias_correction_beta: None,
             }),
