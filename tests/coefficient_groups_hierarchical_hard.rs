@@ -771,7 +771,8 @@ fn _unused_helpers_kept_alive() {
 // never called.  This keeps the failing-test contract explicit: if a future
 // reviewer wires the public `evaluate` method, they can drop this trait.
 trait EvaluateForTest {
-    fn evaluate_for_test(&self, _block_dim: usize) -> Option<Array1<f64>> {
+    fn evaluate_for_test(&self, block_dim: usize) -> Option<Array1<f64>> {
+        drop(block_dim);
         None
     }
 }
