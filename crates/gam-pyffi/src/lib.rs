@@ -3402,10 +3402,10 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
 //     with N-D `data` and `centers` (an existing entry point);
 //   * radial first derivative `φ'(r_{nk})` is computed by the new
 //     `duchon_radial_first_derivative_nd` basis helper;
-//   * `∂Φ/∂t` is assembled at the call site via
-//     `LatentCoordValues::design_gradient_wrt_t`;
+//   * `∂Φ/∂t` is assembled at the call site via the
+//     per-basis `*_first_derivative_nd` helpers in `gam::terms::basis`;
 //   * `grad_t` is the contraction
-//     `LatentCoordValues::contract_gradient(grad_phi, jet)`.
+//     `gam::terms::input_loc_derivatives::contract_input_loc_gradient(grad_phi, jet)`.
 //
 // Identifiability modes (`LatentIdMode::AuxPrior`, `DimSelection`) are
 // folded into the inner Gaussian REML call via virtual-row augmentation:
@@ -15097,6 +15097,9 @@ fn matrices_to_nested(matrices: &[Array2<f64>]) -> Vec<Vec<Vec<f64>>> {
     matrices.iter().map(matrix_to_nested).collect()
 }
 
+#[allow(dead_code)]
+fn __pyffi_paired_cif_removed_stub() {}
+#[cfg(any())]
 fn paired_cumulative_incidence_table_impl(
     target_model_bytes: &[u8],
     competing_model_bytes: &[u8],
