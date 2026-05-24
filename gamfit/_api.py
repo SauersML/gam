@@ -2707,6 +2707,7 @@ def gaussian_reml_fit_formula(
     y: Any,
     *,
     config: dict[str, Any] | None = None,
+    fisher_rao_w: Any | None = None,
 ) -> dict[str, Any]:
     """Fit closed-form Gaussian REML after materialising a formula design."""
     import numpy as np
@@ -2719,6 +2720,11 @@ def gaussian_reml_fit_formula(
         raise ValueError("y must be a 1D or 2D numeric array")
     if not np.all(np.isfinite(y_arr)):
         raise ValueError("y must contain only finite values")
+    fisher_w = None
+    if fisher_rao_w is not None:
+        fisher_w = _normalize_fisher_rao_w(
+            fisher_rao_w, n_rows=y_arr.shape[0], dim=y_arr.shape[1]
+        )
     try:
         out = rust_module().gaussian_reml_fit_formula_table(
             headers,
@@ -2726,6 +2732,7 @@ def gaussian_reml_fit_formula(
             formula,
             np.ascontiguousarray(y_arr, dtype=np.float64),
             None if config is None else json.dumps(config),
+            fisher_w,
         )
     except Exception as exc:
         raise map_exception(exc) from exc
