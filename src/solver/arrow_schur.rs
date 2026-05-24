@@ -311,46 +311,21 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         ridge_t: f64,
         d: usize,
     ) -> Result<Vec<Array2<f64>>, ArrowSchurError> {
-        // Adaptive ridge backoff: if the user-supplied ridge_t is not
-        // sufficient to make `H_tt^(i)` PD, escalate along a geometric
-        // ramp before surfacing the failure. This is the robust analogue
-        // of the LM "grow ridge on inner failure" loop that lives in
-        // `LatentInnerSolver::solve`, applied at the per-row granularity
-        // so that one pathological row does not force a global ridge
-        // increase across all N rows.
-        //
-        // The ramp is chosen to span the typical 8 orders of magnitude
-        // between "machine-epsilon nudge" and "trust the diagonal".
-        const RIDGE_RAMP: [f64; 5] = [0.0, 1e-12, 1e-8, 1e-4, 1e0];
         let mut out = Vec::with_capacity(rows.len());
         for (row_idx, row) in rows.iter().enumerate() {
             debug_assert_eq!(row.htt.dim(), (d, d), "row {row_idx} H_tt shape != (d,d)");
-            let mut last_err = String::new();
-            let mut factored: Option<Array2<f64>> = None;
-            for extra in RIDGE_RAMP.iter() {
-                let mut block = row.htt.clone();
-                let total = ridge_t + extra;
-                for a in 0..d {
-                    block[[a, a]] += total;
-                }
-                match cholesky_lower(&block) {
-                    Ok(l) => {
-                        factored = Some(l);
-                        break;
-                    }
-                    Err(e) => {
-                        last_err = e;
-                    }
-                }
+            let mut block = row.htt.clone();
+            for a in 0..d {
+                block[[a, a]] += ridge_t;
             }
-            match factored {
-                Some(l) => out.push(l),
-                None => {
+            match cholesky_lower(&block) {
+                Ok(l) => out.push(l),
+                Err(e) => {
                     return Err(ArrowSchurError::PerRowFactorFailed {
                         row: row_idx,
                         reason: format!(
-                            "row {row_idx} H_tt remained non-PD after adaptive ridge ramp; \
-                             final cholesky error: {last_err}"
+                            "row {row_idx} H_tt was non-PD at ridge_t={ridge_t}; \
+                             cholesky error: {e}"
                         ),
                     });
                 }
@@ -423,7 +398,7 @@ fn manifold_mode_fingerprint(latent: &LatentCoordValues) -> u64 {
 
 fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 {
     let mut hasher = StableHasher::new();
-    hasher.write_str("arrow-schur-row-hessian-v1");
+    hasher.write_str("arrow-schur-row-hessian-v2");
     hasher.write_usize(sys.rows.len());
     hasher.write_usize(sys.d);
     hasher.write_usize(sys.k);
@@ -431,13 +406,7 @@ fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 {
         write_array2_fingerprint(&mut hasher, &row.htt);
         write_array2_fingerprint(&mut hasher, &row.htbeta);
     }
-    hasher.write_usize(sys.hbb.nrows());
-    hasher.write_usize(sys.hbb.ncols());
-    let hbb_diag_len = sys.hbb.nrows().min(sys.hbb.ncols());
-    hasher.write_usize(hbb_diag_len);
-    for j in 0..hbb_diag_len {
-        hasher.write_f64(sys.hbb[[j, j]]);
-    }
+    write_array2_fingerprint(&mut hasher, &sys.hbb);
     match sys.hbb_diag.as_ref() {
         Some(diag) => {
             hasher.write_bool(true);
@@ -1397,7 +1366,7 @@ fn solve_arrow_newton_step_artifacts(
         }
         ArrowSolverMode::InexactPCG => {
             let preconditioner =
-                JacobiPreconditioner::from_arrow_schur(sys, &htt_factors, ridge_beta, &backend);
+                JacobiPreconditioner::from_arrow_schur(sys, &htt_factors, ridge_beta, &backend)?;
             let delta = steihaug_pcg_reduced_system(
                 sys,
                 &htt_factors,
@@ -1711,7 +1680,7 @@ impl JacobiPreconditioner {
         htt_factors: &[Array2<f64>],
         ridge_beta: f64,
         backend: &B,
-    ) -> Self {
+    ) -> Result<Self, ArrowSchurError> {
         let k = sys.k;
         let d = sys.d;
         let mut diag = Array1::<f64>::zeros(k);
@@ -1739,13 +1708,17 @@ impl JacobiPreconditioner {
         let mut inverse_diag = Array1::<f64>::zeros(k);
         for a in 0..k {
             let v = diag[a];
-            inverse_diag[a] = if v.is_finite() && v.abs() > 1e-18 {
-                1.0 / v
-            } else {
-                1.0
-            };
+            if !v.is_finite() || v <= 1e-18 {
+                return Err(ArrowSchurError::PcgFailed {
+                    reason: format!(
+                        "invalid Schur Jacobi diagonal at index {a}: {v}; \
+                         operator regularization is required"
+                    ),
+                });
+            }
+            inverse_diag[a] = 1.0 / v;
         }
-        Self { inverse_diag }
+        Ok(Self { inverse_diag })
     }
 
     fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
@@ -1852,7 +1825,7 @@ where
             reason: "non-positive preconditioned residual in Schur PCG".to_string(),
         });
     }
-    if rz.sqrt() <= tol {
+    if metric_norm(r.view(), metric_weights) <= tol {
         return Ok(x);
     }
     let mut ap = Array1::<f64>::zeros(n);
