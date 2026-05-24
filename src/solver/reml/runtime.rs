@@ -1252,6 +1252,7 @@ impl<'a> RemlState<'a> {
         e_for_logdet: &Array2<f64>,
         penalty_roots: &[Array2<f64>],
         ridge_passport: RidgePassport,
+        penalty_subspace: Option<&PenaltySubspace>,
         mode: super::unified::EvalMode,
     ) -> Result<(usize, super::unified::PenaltyLogdetDerivs), EstimationError> {
         let logdet_s_start = std::time::Instant::now();
@@ -1265,7 +1266,14 @@ impl<'a> RemlState<'a> {
         let (penalty_rank, log_det_s) = if let Some((logdet, rank, _, _)) = kron_logdet.as_ref() {
             (*rank, *logdet)
         } else {
-            self.fixed_subspace_penalty_rank_and_logdet(e_for_logdet, ridge_passport)?
+            let owned_subspace;
+            let subspace = if let Some(penalty_subspace) = penalty_subspace {
+                penalty_subspace
+            } else {
+                owned_subspace = self.compute_penalty_subspace(e_for_logdet, ridge_passport)?;
+                &owned_subspace
+            };
+            self.fixed_subspace_penalty_rank_and_logdet_from_subspace(subspace)
         };
         log::info!(
             "[STAGE] logdet S rho_dim={} penalty_rank={} elapsed={:.3}s",
@@ -4238,8 +4246,9 @@ impl<'a> RemlState<'a> {
             )));
         }
 
-        let s_thr =
-            super::unified::positive_eigenvalue_threshold(penalty_subspace.evals.as_slice().unwrap());
+        let s_thr = super::unified::positive_eigenvalue_threshold(
+            penalty_subspace.evals.as_slice().unwrap(),
+        );
         let positive_cols: Vec<usize> = (0..p)
             .filter(|&j| penalty_subspace.evals[j] > s_thr)
             .collect();
@@ -4313,32 +4322,39 @@ impl<'a> RemlState<'a> {
         s_direction: &Array2<f64>,
         ridge_passport: RidgePassport,
     ) -> Result<f64, EstimationError> {
-        let (structural_rank, _) =
-            self.fixed_subspace_penalty_rank_and_logdet(e_transformed, ridge_passport)?;
-        let p_dim = e_transformed.ncols();
-        if structural_rank == 0 || p_dim == 0 {
+        let penalty_subspace = self.compute_penalty_subspace(e_transformed, ridge_passport)?;
+        self.fixed_subspace_penalty_trace_from_subspace(&penalty_subspace, s_direction)
+    }
+
+    pub(super) fn fixed_subspace_penalty_trace_from_subspace(
+        &self,
+        penalty_subspace: &PenaltySubspace,
+        s_direction: &Array2<f64>,
+    ) -> Result<f64, EstimationError> {
+        let p_dim = penalty_subspace.evals.len();
+        if penalty_subspace.rank == 0 || p_dim == 0 {
             return Ok(0.0);
         }
-
-        let mut s_lambda = e_transformed.t().dot(e_transformed);
-        let ridge = ridge_passport.penalty_logdet_ridge();
-        if ridge > 0.0 {
-            for i in 0..p_dim {
-                s_lambda[[i, i]] += ridge;
-            }
+        if s_direction.nrows() != p_dim || s_direction.ncols() != p_dim {
+            return Err(EstimationError::InvalidInput(format!(
+                "fixed_subspace_penalty_trace_from_subspace: S_direction must be {}x{}, got {}x{}",
+                p_dim,
+                p_dim,
+                s_direction.nrows(),
+                s_direction.ncols()
+            )));
         }
-        let (evals, evecs) = s_lambda
-            .eigh(Side::Lower)
-            .map_err(EstimationError::EigendecompositionFailed)?;
 
         // Exact pseudoinverse trace: tr(S⁺ S_direction) on the positive eigenspace.
-        let threshold = super::unified::positive_eigenvalue_threshold(evals.as_slice().unwrap());
+        let threshold = super::unified::positive_eigenvalue_threshold(
+            penalty_subspace.evals.as_slice().unwrap(),
+        );
 
         let mut trace = 0.0;
         for idx in 0..p_dim {
-            let ev = evals[idx];
+            let ev = penalty_subspace.evals[idx];
             if ev > threshold {
-                let u = evecs.column(idx).to_owned();
+                let u = penalty_subspace.evecs.column(idx).to_owned();
                 let spsi_u = s_direction.dot(&u);
                 trace += u.dot(&spsi_u) / ev;
             }
@@ -7522,8 +7538,28 @@ impl<'a> RemlState<'a> {
                 })?,
         );
 
-        let (penalty_rank, penalty_logdet) =
-            self.dense_penalty_logdet_derivs(rho, &e_for_logdet, &[], ridge_passport, mode)?;
+        let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
+        let uses_kron_penalty_logdet = self
+            .kronecker_penalty_system
+            .as_ref()
+            .is_some_and(|kron| {
+                self.kronecker_factored.is_some() && kron.num_penalties() == rho.len()
+            });
+        let needs_penalty_subspace = !uses_kron_penalty_logdet
+            || (matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial);
+        let penalty_subspace = if needs_penalty_subspace {
+            Some(self.compute_penalty_subspace(&e_for_logdet, ridge_passport)?)
+        } else {
+            None
+        };
+        let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
+            rho,
+            &e_for_logdet,
+            &[],
+            ridge_passport,
+            penalty_subspace.as_ref(),
+            mode,
+        )?;
 
         let beta = if let Some(z) = free_basis_opt.as_ref() {
             z.t()
@@ -7596,14 +7632,17 @@ impl<'a> RemlState<'a> {
         // Gamma / SAS / GAMLSS noise blocks / etc.) the projection is
         // still built unconditionally — that is the rank-deficient LAML
         // fix the comment above motivates.
-        let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
         let (hessian_logdet_correction, penalty_subspace_trace) =
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
                 use super::unified::HessianOperator;
+                let Some(penalty_subspace) = penalty_subspace.as_ref() else {
+                    return Err(EstimationError::InvalidInput(
+                        "projected Hessian logdet requires penalty subspace".to_string(),
+                    ));
+                };
                 let (log_det_h_proj, kernel) = self.fixed_subspace_hessian_projected_parts(
                     &h_for_operator,
-                    &e_for_logdet,
-                    ridge_passport,
+                    penalty_subspace,
                 )?;
                 (
                     log_det_h_proj - hessian_op.logdet(),
@@ -7847,8 +7886,28 @@ impl<'a> RemlState<'a> {
         );
 
         let e_for_logdet = pirls_result.reparam_result.e_transformed.clone();
-        let (penalty_rank, penalty_logdet) =
-            self.dense_penalty_logdet_derivs(rho, &e_for_logdet, &[], ridge_passport, mode)?;
+        let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
+        let uses_kron_penalty_logdet = self
+            .kronecker_penalty_system
+            .as_ref()
+            .is_some_and(|kron| {
+                self.kronecker_factored.is_some() && kron.num_penalties() == rho.len()
+            });
+        let needs_penalty_subspace = !uses_kron_penalty_logdet
+            || (matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial);
+        let penalty_subspace = if needs_penalty_subspace {
+            Some(self.compute_penalty_subspace(&e_for_logdet, ridge_passport)?)
+        } else {
+            None
+        };
+        let (penalty_rank, penalty_logdet) = self.dense_penalty_logdet_derivs(
+            rho,
+            &e_for_logdet,
+            &[],
+            ridge_passport,
+            penalty_subspace.as_ref(),
+            mode,
+        )?;
 
         let nullspace_dim = beta.len().saturating_sub(penalty_rank) as f64;
 
@@ -7899,10 +7958,14 @@ impl<'a> RemlState<'a> {
         // `iso_kappa_duchon_penalty_subspace_projection_pins_trace`)
         // while keeping the classical `log|H|` cost identity for
         // canonical Gaussian, where the leakage is identically zero.
-        let c_nontrivial = pirls_result.solve_c_array.iter().any(|&c| c != 0.0);
         let (hessian_logdet_correction, penalty_subspace_trace) =
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
                 use super::unified::HessianOperator;
+                let Some(penalty_subspace) = penalty_subspace.as_ref() else {
+                    return Err(EstimationError::InvalidInput(
+                        "projected Hessian logdet requires penalty subspace".to_string(),
+                    ));
+                };
                 let qs = &pirls_result.reparam_result.qs;
                 let h_transformed = crate::faer_ndarray::fast_ab(
                     &crate::faer_ndarray::fast_atb(qs, &h_total_original),
@@ -7910,8 +7973,7 @@ impl<'a> RemlState<'a> {
                 );
                 let (log_det_h_proj, kernel_trans) = self.fixed_subspace_hessian_projected_parts(
                     &h_transformed,
-                    &e_for_logdet,
-                    ridge_passport,
+                    penalty_subspace,
                 )?;
                 let kernel_orig = kernel_trans.map(|kernel_trans| {
                     let u_s_orig = qs.dot(&kernel_trans.u_s);

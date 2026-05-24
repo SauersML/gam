@@ -1414,6 +1414,8 @@ impl<'a> RemlState<'a> {
         } else {
             None
         };
+        let penalty_subspace =
+            self.compute_penalty_subspace(&e_eval, pirls_result.ridge_passport)?;
 
         let mut coords = Vec::with_capacity(psi_dim);
 
@@ -1652,9 +1654,9 @@ impl<'a> RemlState<'a> {
 
             // --- ld_s_j: penalty pseudo-logdet derivative ---
             // ld_s_j = tr(S⁺ S_{τ_j}).
-            // Uses the exact pseudoinverse (via fixed_subspace_penalty_trace).
+            // Uses the exact pseudoinverse from the shared penalty eigensystem.
             let ld_s_j =
-                self.fixed_subspace_penalty_trace(&e_eval, &s_tau_j, pirls_result.ridge_passport)?;
+                self.fixed_subspace_penalty_trace_from_subspace(&penalty_subspace, &s_tau_j)?;
             let tk_x_fixed = Some(
                 Self::ensure_transformed_x_tau_dense(
                     &mut x_tau_j_dense,
