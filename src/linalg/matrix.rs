@@ -2694,7 +2694,7 @@ impl LinearOperator for BlockDesignOperator {
         }
         let mut out = self.apply_transpose(&weighted);
         if let Some(pen) = penalty {
-            out += &pen.dot(vector);
+            out += &fast_av(pen, vector);
         }
         if ridge > 0.0 {
             out += &vector.mapv(|x| ridge * x);
@@ -5239,7 +5239,7 @@ pub trait LinearOperator {
         }
         let mut out = self.apply_transpose(&weighted_xv);
         if let Some(pen) = penalty {
-            out += &pen.dot(vector);
+            out += &fast_av(pen, vector);
         }
         if ridge > 0.0 {
             out += &vector.mapv(|x| ridge * x);
@@ -5513,7 +5513,7 @@ impl LinearOperator for DesignMatrix {
                     self.apply_transpose(&weighted_xv)
                 };
                 if let Some(pen) = penalty {
-                    out += &pen.dot(vector);
+                    out += &fast_av(pen, vector);
                 }
                 if ridge > 0.0 {
                     for j in 0..out.len() {
