@@ -1012,10 +1012,12 @@ def fit(
     headers, rows, table_kind = normalize_table(data)
     fisher_weight_col = None
     if fisher_rao_w is not None:
+        config_weights = config.get("weights") if isinstance(config, dict) else None
+        effective_weights = weights if weights is not None else config_weights
         headers, rows, fisher_weight_col = _apply_scalar_fisher_rao_w_to_rows(
             headers,
             rows,
-            weights=weights,
+            weights=effective_weights if isinstance(effective_weights, str) else None,
             fisher_rao_w=fisher_rao_w,
         )
     rust_config = dict(config or {})
