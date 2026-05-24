@@ -1836,6 +1836,7 @@ fn remap_term_collectionspec_columns(
             | SmoothBasisSpec::Sphere { feature_cols, .. }
             | SmoothBasisSpec::Matern { feature_cols, .. }
             | SmoothBasisSpec::Duchon { feature_cols, .. }
+            | SmoothBasisSpec::Pca { feature_cols, .. }
             | SmoothBasisSpec::TensorBSpline { feature_cols, .. }
             | SmoothBasisSpec::Sphere { feature_cols, .. } => {
                 for feature_col in feature_cols.iter_mut() {

@@ -356,6 +356,8 @@ def _build_fit_payload(
 def _jsonable_array(value: Any) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
+    if isinstance(value, (Path,)):
+        return str(value)
     if hasattr(value, "to_rust_descriptor"):
         return _jsonable_array(value.to_rust_descriptor())
     if hasattr(value, "_to_rust_payload"):

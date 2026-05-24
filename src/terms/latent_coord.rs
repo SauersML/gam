@@ -562,7 +562,7 @@ impl LatentIdMode {
 /// arguments differ structurally (radial bases reuse scalar radial kernels shared with
 /// the kernel-shape chain machinery; jet bases ship the full tensor). All chain rules
 /// are analytic and closed-form; no autodiff, no finite differences.
-pub(crate) enum InputLocationDerivative<'a> {
+pub enum InputLocationDerivative<'a> {
     /// Radial-kernel chain rule. The chain rule `(t − c)/r` is reconstructed
     /// internally from the finite `q = φ'(r)/r` scalar and the center coordinates.
     Radial {
