@@ -30,7 +30,7 @@ class GaussianRemlOutput(NamedTuple):
     edf: torch.Tensor
 
 
-@dataclass
+@dataclass(slots=True)
 class AdditiveRemlOutput:
     """Forward outputs for the multi-smooth additive REML fit.
 

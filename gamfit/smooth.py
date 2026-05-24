@@ -30,7 +30,7 @@ ShapeConstraintLiteral = Literal[
 ]
 
 
-@dataclass
+@dataclass(slots=True)
 class Smooth:
     """Base class for all smooth-term specs. Don't instantiate directly.
 
@@ -74,9 +74,21 @@ class Smooth:
     by: Any | None = None
     double_penalty: bool = False
     shape_constraint: ShapeConstraintLiteral | None = None
+    _gamfit_topology_dim: int | None = field(default=None, init=False, repr=False)
+    _gamfit_tensor_k: tuple[int, int] | None = field(default=None, init=False, repr=False)
+    _gamfit_tensor_periods: tuple[str | None, str | None] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
+    _gamfit_tensor_identifiability: str = field(
+        default="sum_tozero",
+        init=False,
+        repr=False,
+    )
 
 
-@dataclass
+@dataclass(slots=True)
 class Duchon(Smooth):
     """Duchon m-spline. Isotropic radial kernel. Works at any d ≥ 1.
 
@@ -129,7 +141,7 @@ class Duchon(Smooth):
     periodic_per_axis: Sequence[bool] | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class BSpline(Smooth):
     """1D B-spline (Eilers-Marx P-spline) with a difference penalty.
 
@@ -145,7 +157,7 @@ class BSpline(Smooth):
     periodic: bool = False
 
 
-@dataclass
+@dataclass(slots=True)
 class TensorBSpline(Smooth):
     """Tensor-product B-spline (mgcv ``te()`` style).
 
@@ -158,7 +170,7 @@ class TensorBSpline(Smooth):
     marginals: list[BSpline] = field(default_factory=list)
 
 
-@dataclass
+@dataclass(slots=True)
 class Matern(Smooth):
     """Matérn covariance kernel basis. Multi-d. Optional axis anisotropy.
 
@@ -182,7 +194,7 @@ class Matern(Smooth):
     aniso_log_scales: Sequence[float] | None = None
 
 
-@dataclass(init=False)
+@dataclass(init=False, slots=True)
 class Pca(Smooth):
     """Precomputed-PCA linear feature projection as a first-class smooth.
 
@@ -232,7 +244,7 @@ class Pca(Smooth):
         self.smooth_penalty = smooth_penalty
 
 
-@dataclass
+@dataclass(slots=True)
 class Sphere(Smooth):
     """Spherical-harmonic basis on the unit sphere S².
 
@@ -256,7 +268,7 @@ class Sphere(Smooth):
     radians: bool = False
 
 
-@dataclass
+@dataclass(slots=True)
 class PeriodicSplineCurve(Smooth):
     """Closed parametric curve in R^d, periodic in the parameter t ∈ [0, 1].
 
@@ -277,7 +289,7 @@ class PeriodicSplineCurve(Smooth):
     penalty_order: int = 2
 
 
-@dataclass
+@dataclass(slots=True)
 class LatentCoord:
     """Per-row latent coordinates ``t ∈ ℝ^{N × d}`` as a first-class parameter.
 
@@ -377,7 +389,7 @@ class LatentCoord:
     name: str | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class Categorical(Smooth):
     """Sum-to-zero contrast for a categorical predictor.
 

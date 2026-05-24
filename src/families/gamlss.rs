@@ -14515,106 +14515,6 @@ struct BinomialLocationScaleWiggleJointPsiDirection {
     z_ls_psi: Array1<f64>,
 }
 
-struct BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
-    family: BinomialLocationScaleWiggleFamily,
-    block_states: Vec<ParameterBlockState>,
-    derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
-    x_t: Arc<Array2<f64>>,
-    x_ls: Arc<Array2<f64>>,
-    psi_directions: ExactNewtonJointPsiDirectCache<BinomialLocationScaleWiggleJointPsiDirection>,
-}
-
-impl BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
-    fn new(
-        family: BinomialLocationScaleWiggleFamily,
-        block_states: Vec<ParameterBlockState>,
-        specs: &[ParameterBlockSpec],
-        derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
-    ) -> Result<Self, String> {
-        let Some((x_t, x_ls)) = family.exact_joint_dense_block_designs(Some(specs))? else {
-            return Err(
-                "BinomialLocationScaleWiggleFamily exact joint psi workspace requires dense block designs"
-                    .to_string(),
-            );
-        };
-        let x_t = shared_dense_arc(x_t.as_ref());
-        let x_ls = shared_dense_arc(x_ls.as_ref());
-        let psi_dim = derivative_blocks.iter().map(Vec::len).sum();
-        Ok(Self {
-            family,
-            block_states,
-            derivative_blocks,
-            x_t,
-            x_ls,
-            psi_directions: ExactNewtonJointPsiDirectCache::new(psi_dim),
-        })
-    }
-
-    fn psi_direction(
-        &self,
-        psi_index: usize,
-    ) -> Result<Option<Arc<BinomialLocationScaleWiggleJointPsiDirection>>, String> {
-        self.psi_directions.get_or_try_init(psi_index, || {
-            self.family.exact_newton_joint_psi_direction(
-                &self.block_states,
-                &self.derivative_blocks,
-                psi_index,
-                self.x_t.as_ref(),
-                self.x_ls.as_ref(),
-                &self.family.policy,
-            )
-        })
-    }
-}
-
-impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
-    fn second_order_terms(
-        &self,
-        psi_i: usize,
-        psi_j: usize,
-    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        let Some(dir_i) = self.psi_direction(psi_i)? else {
-            return Ok(None);
-        };
-        let Some(dir_j) = self.psi_direction(psi_j)? else {
-            return Ok(None);
-        };
-        Ok(Some(
-            self.family
-                .exact_newton_joint_psisecond_order_terms_from_parts(
-                    &self.block_states,
-                    &self.derivative_blocks,
-                    dir_i.as_ref(),
-                    dir_j.as_ref(),
-                    self.x_t.as_ref(),
-                    self.x_ls.as_ref(),
-                )?,
-        ))
-    }
-
-    fn hessian_directional_derivative(
-        &self,
-        psi_index: usize,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
-        let Some(dir) = self.psi_direction(psi_index)? else {
-            return Ok(None);
-        };
-        Ok(Some(
-            crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
-                self.family
-                    .exact_newton_joint_psihessian_directional_derivative_from_parts(
-                        &self.block_states,
-                        dir.as_ref(),
-                        d_beta_flat,
-                        self.x_t.as_ref(),
-                        self.x_ls.as_ref(),
-                    )?,
-            ),
-        ))
-    }
-}
-
 type BinomialLocationScaleExactNewtonJointPsiWorkspace =
     BinomialLocationScaleJointPsiWorkspace<BinomialLocationScaleFamily>;
 type BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace =
@@ -17249,15 +17149,15 @@ impl CustomFamily for BinomialLocationScaleFamily {
         // ── Step 2: assemble penalty `S_λ` and add to H.
         // Match the unified evaluator's per-block convention.
         let mut h = h_l.clone();
-        let penalty_counts: Vec<usize> = specs.iter().map(|s| s.penalties.len()).collect();
-        let total_pen: usize = penalty_counts.iter().sum();
+        let total_pen: usize = specs.iter().map(|s| s.penalties.len()).sum();
         if rho.len() != total_pen {
             return Ok(None);
         }
         // Per-block per-penalty lambdas.
         let mut per_block_rho: Vec<Vec<f64>> = Vec::with_capacity(specs.len());
         let mut cursor = 0;
-        for &cnt in &penalty_counts {
+        for spec in specs {
+            let cnt = spec.penalties.len();
             let mut row = Vec::with_capacity(cnt);
             for k in 0..cnt {
                 row.push(rho[cursor + k]);

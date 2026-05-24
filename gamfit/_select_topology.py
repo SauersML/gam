@@ -27,13 +27,13 @@ _SMOOTH_CALL_RE = re.compile(r"\b(s|smooth)\s*\(", re.IGNORECASE)
 _SIZE_OPTION_KEYS = {"k", "basis_dim", "basis-dim", "basisdim", "centers", "knots"}
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _Candidate:
     name: str
     topology: Smooth
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _TopologyTerm:
     call: str
     options: tuple[str, ...]
@@ -45,7 +45,7 @@ ScoreKind: TypeAlias = Literal["reml", "laml", "bic", "tk"]
 ScoreScale: TypeAlias = Literal["per_observation", "per_effective_dim", "raw"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SelectTopologyResult:
     """Result returned by :func:`select_topology`."""
 

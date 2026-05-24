@@ -37,7 +37,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 #[inline]
-pub fn eval_coeff4_at(coefficients: &[f64; 4], z: f64) -> f64 {
+pub const fn eval_coeff4_at(coefficients: &[f64; 4], z: f64) -> f64 {
     ((coefficients[3] * z + coefficients[2]) * z + coefficients[1]) * z + coefficients[0]
 }
 
@@ -54,7 +54,7 @@ fn coeff4_dot(left: &[f64; 4], right: &[f64; 4]) -> f64 {
 }
 
 #[inline]
-pub fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
+pub const fn scale_coeff4(source: [f64; 4], scale: f64) -> [f64; 4] {
     [
         source[0] * scale,
         source[1] * scale,

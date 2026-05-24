@@ -26,7 +26,7 @@ from .smooth import Duchon, PeriodicSplineCurve, Smooth, Sphere
 from .topology import Circle, EuclideanPatch
 
 
-@dataclass
+@dataclass(slots=True)
 class SaeManifoldAtomFit:
     """One fitted SAE-manifold atom."""
 
@@ -38,7 +38,7 @@ class SaeManifoldAtomFit:
     active_dim: int
 
 
-@dataclass
+@dataclass(slots=True)
 class SaeManifoldFitResult:
     """Result returned by :func:`sae_manifold_fit`."""
 
@@ -52,7 +52,7 @@ class SaeManifoldFitResult:
     reml_score: float
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True, init=False, slots=True)
 class GumbelTemperatureSchedule:
     """Deterministic temperature schedule for SAE assignment relaxations."""
 

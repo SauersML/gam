@@ -11,7 +11,7 @@ pub struct GpuCapability {
 }
 
 impl GpuCapability {
-    pub fn from_compute_capability(major: i32, minor: i32) -> Self {
+    pub const fn from_compute_capability(major: i32, minor: i32) -> Self {
         Self {
             compute_major: major,
             compute_minor: minor,

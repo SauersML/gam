@@ -13686,14 +13686,13 @@ pub fn initial_aniso_contrasts(centers: ArrayView2<'_, f64>) -> Vec<f64> {
         return Vec::new();
     }
     let scales = knot_cloud_axis_scales(centers);
-    let neg_log_scales: Vec<f64> = scales.iter().map(|&s| -s.ln()).collect();
-    let mean_neg_log: f64 = neg_log_scales.iter().sum::<f64>() / d as f64;
+    let mean_neg_log: f64 = scales.iter().map(|&s| -s.ln()).sum::<f64>() / d as f64;
     // η_a = −ln(σ_a) + (1/d) Σ_b ln(σ_b)
     //     = −ln(σ_a) − mean(−ln(σ_b))
     //     = neg_log_scales[a] − mean(neg_log_scales)
-    neg_log_scales
+    scales
         .iter()
-        .map(|&nls| nls - mean_neg_log)
+        .map(|&scale| -scale.ln() - mean_neg_log)
         .collect()
 }
 
@@ -22927,32 +22926,6 @@ pub fn build_periodic_bspline_basis_1d(
         }
     }
     Ok(out)
-}
-
-/// Cyclic finite-difference penalty `D' D` for periodic spline coefficients.
-///
-/// Unlike ordinary P-spline differences, the stencil wraps at both ends, so the
-/// penalty does not introduce a seam at `origin`.
-pub fn create_cyclic_difference_penalty_matrix(
-    num_basis: usize,
-    order: usize,
-) -> Result<Array2<f64>, BasisError> {
-    if order == 0 || order >= num_basis {
-        return Err(BasisError::InvalidPenaltyOrder { order, num_basis });
-    }
-    let mut coeffs = vec![0.0; order + 1];
-    for (j, c) in coeffs.iter_mut().enumerate() {
-        let sign = if j % 2 == 0 { 1.0 } else { -1.0 };
-        *c = sign * binomial_f64(order, j);
-    }
-    let mut d = Array2::<f64>::zeros((num_basis, num_basis));
-    for row in 0..num_basis {
-        for (j, &c) in coeffs.iter().enumerate() {
-            let col = (row + order - j) % num_basis;
-            d[[row, col]] += c;
-        }
-    }
-    Ok(d.t().dot(&d))
 }
 
 fn solve_spd_cholesky(a: Array2<f64>, b: &Array2<f64>) -> Result<Array2<f64>, BasisError> {

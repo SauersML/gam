@@ -5,7 +5,7 @@ from html import escape
 from typing import Any
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FormulaValidation:
     """Outcome of :func:`gamfit.validate_formula` (no fit performed).
 

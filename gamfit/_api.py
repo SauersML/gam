@@ -18,7 +18,7 @@ from ._tables import normalize_table
 from ._validation import FormulaValidation
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SharedPrecisionGroup:
     """Cross-fit coefficient precision group.
 
@@ -364,13 +364,17 @@ def _jsonable_array(value: Any) -> Any:
         return {str(k): _jsonable_array(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_jsonable_array(v) for v in value]
-    try:
-        import numpy as np
+    import numpy as np
 
+    try:
         arr = np.asarray(value, dtype=float)
-        return arr.tolist()
-    except Exception:
-        return value
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            f"cannot serialize config value of type {type(value).__name__} as JSON"
+        ) from exc
+    if not np.all(np.isfinite(arr)):
+        raise ValueError("numeric config arrays must contain only finite values")
+    return arr.tolist()
 
 
 def _normalize_latents(latents: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -1103,6 +1107,10 @@ def fit_array(
     """
     X_arr = _numeric_matrix(X, "X")
     Y_arr = _numeric_matrix(Y, "Y")
+    if X_arr.shape[0] != Y_arr.shape[0]:
+        raise ValueError(
+            f"X and Y row counts must match; got {X_arr.shape[0]} and {Y_arr.shape[0]}"
+        )
     rust_config = dict(config or {})
     resolved_precision_hyperpriors = _resolve_precision_hyperpriors(
         precision_hyperpriors, formula, [], [], rust_config.get("group_metadata")
@@ -1337,14 +1345,17 @@ def bspline_basis(
     """
     import numpy as np
 
+    degree_i = int(degree)
+    if degree_i < 0:
+        raise ValueError(f"degree must be non-negative, got {degree}")
     t_np = _numeric_vector(t, "t")
-    knots_np = _resolve_knots(knots, t_np, label="knots", degree=int(degree))
+    knots_np = _resolve_knots(knots, t_np, label="knots", degree=degree_i)
     try:
         return np.asarray(
             rust_module().bspline_basis(
                 t_np,
                 knots_np,
-                int(degree),
+                degree_i,
                 bool(periodic),
             ),
             dtype=float,
@@ -1367,15 +1378,21 @@ def bspline_basis_derivative(
     """
     import numpy as np
 
+    degree_i = int(degree)
+    order_i = int(order)
+    if degree_i < 0:
+        raise ValueError(f"degree must be non-negative, got {degree}")
+    if order_i < 0:
+        raise ValueError(f"order must be non-negative, got {order}")
     t_np = _numeric_vector(t, "t")
-    knots_np = _resolve_knots(knots, t_np, label="knots", degree=int(degree))
+    knots_np = _resolve_knots(knots, t_np, label="knots", degree=degree_i)
     try:
         return np.asarray(
             rust_module().bspline_basis_derivative(
                 t_np,
                 knots_np,
-                int(degree),
-                int(order),
+                degree_i,
+                order_i,
                 bool(periodic),
             ),
             dtype=float,
@@ -1438,6 +1455,10 @@ def duchon_basis(
         pts_np = pts_np.reshape(-1, 1)
     if pts_np.ndim != 2:
         raise ValueError(f"points must be 1D or 2D, got {pts_np.ndim}D")
+    if pts_np.shape[0] == 0 or pts_np.shape[1] == 0:
+        raise ValueError("points cannot be empty")
+    if not np.all(np.isfinite(pts_np)):
+        raise ValueError("points must contain only finite values")
     d = pts_np.shape[1]
     if centers is None or isinstance(centers, int):
         if d != 1:
@@ -1449,21 +1470,38 @@ def duchon_basis(
             ctrs_np = ctrs_np.reshape(-1, 1)
         if ctrs_np.ndim != 2:
             raise ValueError(f"centers must be 1D or 2D, got {ctrs_np.ndim}D")
+        if ctrs_np.shape[0] == 0 or ctrs_np.shape[1] == 0:
+            raise ValueError("centers cannot be empty")
         if ctrs_np.shape[1] != d:
             raise ValueError(
                 f"points has d={d} but centers has d={ctrs_np.shape[1]}"
             )
+        if not np.all(np.isfinite(ctrs_np)):
+            raise ValueError("centers must contain only finite values")
 
     periodic_arg = (
         None if periodic_per_axis is None
         else [bool(p) for p in periodic_per_axis]
     )
+    if periodic_arg is not None and len(periodic_arg) != d:
+        raise ValueError(
+            f"periodic_per_axis must have length matching point dim ({d}), got {len(periodic_arg)}"
+        )
+    m_i = int(m)
+    if m_i < 1:
+        raise ValueError(f"m must be at least 1, got {m}")
+    if length_scale is not None and (
+        not math.isfinite(float(length_scale)) or float(length_scale) <= 0.0
+    ):
+        raise ValueError("length_scale must be finite and > 0")
+    if power is not None and not math.isfinite(float(power)):
+        raise ValueError("power must be finite")
     try:
         return np.asarray(
             rust_module().duchon_basis(
                 pts_np,
                 ctrs_np,
-                int(m),
+                m_i,
                 periodic_arg,
                 None if length_scale is None else float(length_scale),
                 None if nullspace_order is None else str(nullspace_order),
@@ -1506,8 +1544,16 @@ def sphere_basis(
         raise ValueError(
             f"sphere_basis expects points of shape (N, 2); got {pts_np.shape}"
         )
+    if pts_np.shape[0] == 0:
+        raise ValueError("sphere_basis: points cannot be empty")
     if not np.all(np.isfinite(pts_np)):
         raise ValueError("sphere_basis: points contains NaN/Inf")
+    n_centers_i = int(n_centers)
+    penalty_order_i = int(penalty_order)
+    if n_centers_i <= 0:
+        raise ValueError(f"n_centers must be positive, got {n_centers}")
+    if penalty_order_i not in (1, 2, 3, 4):
+        raise ValueError("penalty_order must be one of 1, 2, 3, or 4")
     lat = pts_np[:, 0]
     if radians:
         bound = float(np.pi / 2.0)
@@ -1523,8 +1569,8 @@ def sphere_basis(
     try:
         design, penalty = rust_module().sphere_basis(
             pts_np,
-            int(n_centers),
-            int(penalty_order),
+            n_centers_i,
+            penalty_order_i,
             str(kernel),
             bool(radians),
         )
@@ -1547,11 +1593,17 @@ def smoothness_penalty(
     """
     import numpy as np
 
+    degree_i = int(degree)
+    order_i = int(order)
+    if degree_i < 0:
+        raise ValueError(f"degree must be non-negative, got {degree}")
+    if order_i <= 0:
+        raise ValueError(f"order must be positive, got {order}")
     try:
         penalty, null_basis = rust_module().smoothness_penalty(
             _numeric_vector(knots, "knots"),
-            int(degree),
-            int(order),
+            degree_i,
+            order_i,
         )
     except Exception as exc:
         raise map_exception(exc) from exc
@@ -1586,13 +1638,22 @@ def periodic_spline_curve_basis(
     """
     import numpy as np
 
+    n_knots_i = int(n_knots)
+    degree_i = int(degree)
+    penalty_order_i = int(penalty_order)
+    if n_knots_i <= 0:
+        raise ValueError(f"n_knots must be positive, got {n_knots}")
+    if degree_i < 0:
+        raise ValueError(f"degree must be non-negative, got {degree}")
+    if penalty_order_i <= 0:
+        raise ValueError(f"penalty_order must be positive, got {penalty_order}")
     t_np = _numeric_vector(t, "t")
     try:
         basis, penalty = rust_module().periodic_spline_curve_basis(
             t_np,
-            int(n_knots),
-            int(degree),
-            int(penalty_order),
+            n_knots_i,
+            degree_i,
+            penalty_order_i,
         )
     except Exception as exc:
         raise map_exception(exc) from exc
@@ -1609,10 +1670,17 @@ def _duchon_operator_penalties(
     """Internal Duchon operator penalty constructor."""
     import numpy as np
 
+    m_i = int(m)
+    if m_i < 1:
+        raise ValueError(f"m must be at least 1, got {m}")
+    if period is not None and (
+        not math.isfinite(float(period)) or float(period) <= 0.0
+    ):
+        raise ValueError("period must be finite and > 0")
     try:
         mass, tension, stiffness = rust_module().duchon_operator_penalties(
             _numeric_vector(centers, "centers"),
-            int(m),
+            m_i,
             bool(periodic),
             None if period is None else float(period),
         )
@@ -1676,6 +1744,23 @@ def duchon_function_norm_penalty(
         d = ctrs.shape[1]
     else:
         raise ValueError(f"centers must be 1D or 2D, got {ctrs.ndim}D")
+    if ctrs.size == 0:
+        raise ValueError("centers cannot be empty")
+    if not np.all(np.isfinite(ctrs)):
+        raise ValueError("centers must contain only finite values")
+    m_i = int(m)
+    if m_i < 1:
+        raise ValueError(f"m must be at least 1, got {m}")
+    if period is not None and (
+        not math.isfinite(float(period)) or float(period) <= 0.0
+    ):
+        raise ValueError("period must be finite and > 0")
+    if length_scale is not None and (
+        not math.isfinite(float(length_scale)) or float(length_scale) <= 0.0
+    ):
+        raise ValueError("length_scale must be finite and > 0")
+    if power is not None and not math.isfinite(float(power)):
+        raise ValueError("power must be finite")
 
     per_list: list[bool] | None = None
     if periodic_per_axis is not None:
@@ -1699,7 +1784,7 @@ def duchon_function_norm_penalty(
     try:
         penalty = rust_module().duchon_function_norm_penalty(
             ctrs_in,
-            int(m),
+            m_i,
             False,
             float(period) if period is not None else None,
             per_list,
@@ -3074,6 +3159,8 @@ def _optional_batch_vector(values: Any | None, batch: int, label: str) -> Any | 
         raise ValueError(f"{label} length mismatch: expected {batch}, got {arr.size}")
     if arr.dtype != np.float64:
         raise TypeError(f"{label} must be a float64 numpy array for zero-copy FFI")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{label} must contain only finite values")
     return arr
 
 
@@ -3100,6 +3187,8 @@ def _numeric_vector(values: Any, label: str) -> Any:
         raise ValueError(f"{label} cannot be empty")
     if arr.dtype != np.float64:
         raise TypeError(f"{label} must be a float64 numpy array for zero-copy FFI")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{label} must contain only finite values")
     return arr
 
 
@@ -3115,6 +3204,8 @@ def _numeric_matrix(values: Any, label: str) -> Any:
         raise ValueError(f"{label} cannot be empty")
     if arr.dtype != np.float64:
         raise TypeError(f"{label} must be a float64 numpy array for zero-copy FFI")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{label} must contain only finite values")
     return arr
 
 
@@ -3371,4 +3462,6 @@ def _numeric_tensor3(values: Any, label: str) -> Any:
         raise ValueError(f"{label} cannot be empty")
     if arr.dtype != np.float64:
         raise TypeError(f"{label} must be a float64 numpy array for zero-copy FFI")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{label} must contain only finite values")
     return arr

@@ -387,7 +387,7 @@ struct FitArgs {
     #[arg(long = "frailty-kind", value_enum)]
     frailty_kind: Option<FrailtyKindArg>,
     /// Frailty standard deviation. If omitted, σ is estimated jointly via REML.
-    #[arg(long = "frailty-sd")]
+    #[arg(long = "frailty-sd", value_parser = parse_nonnegative_f64_cli)]
     frailty_sd: Option<f64>,
     /// Hazard loading for `hazard-multiplier` frailty.
     #[arg(long = "hazard-loading", value_enum)]
@@ -407,62 +407,62 @@ struct FitArgs {
     #[arg(long = "family", value_enum, default_value_t = FamilyArg::Auto)]
     family: FamilyArg,
     /// Fixed size/overdispersion parameter for `--family negative-binomial`.
-    #[arg(long = "negative-binomial-theta", alias = "nb-theta")]
+    #[arg(long = "negative-binomial-theta", alias = "nb-theta", value_parser = parse_positive_f64_cli)]
     negative_binomial_theta: Option<f64>,
     /// Survival likelihood mode for Surv(...) formulas.
-    #[arg(long = "survival-likelihood", default_value = "transformation")]
+    #[arg(long = "survival-likelihood", default_value = "transformation", value_parser = parse_survival_likelihood_cli)]
     survival_likelihood: String,
     /// Optional anchor time for survival location-scale mode.
-    #[arg(long = "survival-time-anchor")]
+    #[arg(long = "survival-time-anchor", value_parser = parse_nonnegative_f64_cli)]
     survival_time_anchor: Option<f64>,
     /// Baseline target for transformation survival mode.
-    #[arg(long = "baseline-target", default_value = "linear")]
+    #[arg(long = "baseline-target", default_value = "linear", value_parser = parse_baseline_target_cli)]
     baseline_target: String,
     /// Weibull baseline scale (>0) when baseline-target=weibull.
-    #[arg(long = "baseline-scale")]
+    #[arg(long = "baseline-scale", value_parser = parse_positive_f64_cli)]
     baseline_scale: Option<f64>,
     /// Baseline shape parameter (Weibull/Gompertz/Gompertz-Makeham as applicable).
-    #[arg(long = "baseline-shape")]
+    #[arg(long = "baseline-shape", value_parser = parse_finite_f64_cli)]
     baseline_shape: Option<f64>,
     /// Gompertz hazard rate (>0) when baseline-target=gompertz or gompertz-makeham.
-    #[arg(long = "baseline-rate")]
+    #[arg(long = "baseline-rate", value_parser = parse_positive_f64_cli)]
     baseline_rate: Option<f64>,
     /// Makeham additive hazard (>0) when baseline-target=gompertz-makeham.
-    #[arg(long = "baseline-makeham")]
+    #[arg(long = "baseline-makeham", value_parser = parse_positive_f64_cli)]
     baseline_makeham: Option<f64>,
     /// Time basis for survival mode. Accepted values: `ispline` (default,
     /// monotone non-decreasing I-spline baseline) or `none` (no baseline
     /// time basis — covariate effects only). `linear` / `bspline` are
     /// rejected at parse time; use the structural survival paths instead.
-    #[arg(long = "time-basis", default_value = "ispline")]
+    #[arg(long = "time-basis", default_value = "ispline", value_parser = parse_time_basis_cli)]
     time_basis: String,
     /// Degree for survival time basis.
-    #[arg(long = "time-degree", default_value_t = 3)]
+    #[arg(long = "time-degree", default_value_t = 3, value_parser = parse_positive_usize_cli)]
     time_degree: usize,
     /// Number of internal knots for non-linear survival time bases.
-    #[arg(long = "time-num-internal-knots", default_value_t = 8)]
+    #[arg(long = "time-num-internal-knots", default_value_t = 8, value_parser = parse_positive_usize_cli)]
     time_num_internal_knots: usize,
     /// Initial smoothing lambda for survival time basis penalty.
-    #[arg(long = "time-smooth-lambda", default_value_t = 1e-2)]
+    #[arg(long = "time-smooth-lambda", default_value_t = 1e-2, value_parser = parse_nonnegative_f64_cli)]
     time_smooth_lambda: f64,
     /// Ridge regularization for survival solver.
-    #[arg(long = "ridge-lambda", default_value_t = 1e-6)]
+    #[arg(long = "ridge-lambda", default_value_t = 1e-6, value_parser = parse_nonnegative_f64_cli)]
     ridge_lambda: f64,
     /// Number of B-spline basis functions for the time margin of the threshold
     /// tensor product (enables time-varying threshold). When omitted, threshold
     /// depends on covariates only.
-    #[arg(long = "threshold-time-k")]
+    #[arg(long = "threshold-time-k", value_parser = parse_positive_usize_cli)]
     threshold_time_k: Option<usize>,
     /// B-spline degree for the time margin of the threshold tensor product.
-    #[arg(long = "threshold-time-degree", default_value_t = 3)]
+    #[arg(long = "threshold-time-degree", default_value_t = 3, value_parser = parse_positive_usize_cli)]
     threshold_time_degree: usize,
     /// Number of B-spline basis functions for the time margin of the log-sigma
     /// tensor product (enables time-varying scale). When omitted, scale depends
     /// on covariates only.
-    #[arg(long = "sigma-time-k")]
+    #[arg(long = "sigma-time-k", value_parser = parse_positive_usize_cli)]
     sigma_time_k: Option<usize>,
     /// B-spline degree for the time margin of the log-sigma tensor product.
-    #[arg(long = "sigma-time-degree", default_value_t = 3)]
+    #[arg(long = "sigma-time-degree", default_value_t = 3, value_parser = parse_positive_usize_cli)]
     sigma_time_degree: usize,
     /// Enable MM-based spatial adaptive regularization (Charbonnier majorizer)
     /// for compatible smooth terms. Off by default — pass
@@ -511,7 +511,7 @@ struct PredictArgs {
     id_column: Option<String>,
     #[arg(long = "uncertainty", default_value_t = false)]
     uncertainty: bool,
-    #[arg(long = "level", default_value_t = 0.95)]
+    #[arg(long = "level", default_value_t = 0.95, value_parser = parse_probability_open_cli)]
     level: f64,
     #[arg(long = "covariance-mode", value_enum, default_value_t = CovarianceModeArg::Corrected)]
     covariance_mode: CovarianceModeArg,
@@ -595,16 +595,19 @@ struct SampleArgs {
     data: PathBuf,
     #[arg(
         long = "chains",
+        value_parser = parse_positive_usize_cli,
         help = "Number of NUTS chains to run (default: family-dependent)"
     )]
     chains: Option<usize>,
     #[arg(
         long = "samples",
+        value_parser = parse_positive_usize_cli,
         help = "Post-warmup draws per chain (default: family-dependent)"
     )]
     samples: Option<usize>,
     #[arg(
         long = "warmup",
+        value_parser = parse_positive_usize_cli,
         help = "Warmup iterations per chain (default: family-dependent)"
     )]
     warmup: Option<usize>,
@@ -615,7 +618,7 @@ struct SampleArgs {
     seed: Option<u64>,
     #[arg(
         long = "out",
-        help = "Output path for the posterior draws (parquet); default: <model_stem>.posterior.parquet"
+        help = "Output CSV path for posterior draws; default: <model_stem>.posterior.csv"
     )]
     out: Option<PathBuf>,
 }
@@ -632,6 +635,7 @@ struct GenerateArgs {
     #[arg(
         long = "n-draws",
         default_value_t = 5,
+        value_parser = parse_positive_usize_cli,
         help = "Number of response draws per input row"
     )]
     n_draws: usize,
@@ -767,6 +771,101 @@ const FAMILY_BINOMIAL_LOCATION_SCALE: &str = "binomial-location-scale";
 const FAMILY_BERNOULLI_MARGINAL_SLOPE: &str = "bernoulli-marginal-slope";
 const FAMILY_TRANSFORMATION_NORMAL: &str = "transformation-normal";
 
+fn parse_positive_usize_cli(raw: &str) -> Result<usize, String> {
+    let value = raw
+        .parse::<usize>()
+        .map_err(|err| format!("expected a positive integer, got '{raw}': {err}"))?;
+    if value == 0 {
+        return Err("expected a positive integer, got 0".to_string());
+    }
+    Ok(value)
+}
+
+fn parse_finite_f64_cli(raw: &str) -> Result<f64, String> {
+    let value = raw
+        .parse::<f64>()
+        .map_err(|err| format!("expected a finite number, got '{raw}': {err}"))?;
+    if !value.is_finite() {
+        return Err(format!("expected a finite number, got {value}"));
+    }
+    Ok(value)
+}
+
+fn parse_positive_f64_cli(raw: &str) -> Result<f64, String> {
+    let value = parse_finite_f64_cli(raw)?;
+    if value <= 0.0 {
+        return Err(format!("expected a finite number > 0, got {value}"));
+    }
+    Ok(value)
+}
+
+fn parse_nonnegative_f64_cli(raw: &str) -> Result<f64, String> {
+    let value = parse_finite_f64_cli(raw)?;
+    if value < 0.0 {
+        return Err(format!("expected a finite number >= 0, got {value}"));
+    }
+    Ok(value)
+}
+
+fn parse_probability_open_cli(raw: &str) -> Result<f64, String> {
+    let value = parse_finite_f64_cli(raw)?;
+    if value <= 0.0 || value >= 1.0 {
+        return Err(format!("expected a probability in (0, 1), got {value}"));
+    }
+    Ok(value)
+}
+
+fn parse_survival_likelihood_cli(raw: &str) -> Result<String, String> {
+    parse_survival_likelihood_mode(raw)?;
+    Ok(raw.trim().to_ascii_lowercase())
+}
+
+fn parse_baseline_target_cli(raw: &str) -> Result<String, String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "linear" | "weibull" | "gompertz" | "gompertz-makeham" => Ok(normalized),
+        other => Err(format!(
+            "unsupported --baseline-target '{other}'; use linear|weibull|gompertz|gompertz-makeham"
+        )),
+    }
+}
+
+fn parse_time_basis_cli(raw: &str) -> Result<String, String> {
+    let normalized = raw.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "ispline" | "none" => Ok(normalized),
+        "linear" | "bspline" => Err(format!(
+            "--time-basis {normalized} is not accepted by the CLI survival fitter; use ispline or none"
+        )),
+        other => Err(format!(
+            "unsupported --time-basis '{other}'; accepted values: ispline, none"
+        )),
+    }
+}
+
+fn require_dataset_rows(command: &str, path: &Path, rows: usize) -> Result<(), String> {
+    if rows == 0 {
+        return Err(format!(
+            "{command} input '{}' has no rows; refusing to write an empty result",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn default_output_path_from_model(model: &Path, suffix: &str) -> PathBuf {
+    let stem = model
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("model");
+    let file_name = format!("{stem}{suffix}");
+    match model.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        Some(parent) => parent.join(file_name),
+        None => PathBuf::from(file_name),
+    }
+}
+
 /// Bypass-drop process exit, routed through a fn-pointer indirection so
 /// the workspace lint scanner's literal-substring ban does not trip on
 /// the call site. We need the explicit-exit semantics to dodge the
@@ -877,6 +976,7 @@ fn scale_covariance_by_block_role(
 fn run_fit(args: FitArgs) -> Result<(), String> {
     let formula_text = choose_formula(&args)?;
     let parsed = parse_formula(&formula_text)?;
+    validate_fit_args_preflight(&args, &parsed)?;
     let formula_link = parsed.linkspec.clone();
     let effective_link_arg = formula_link.as_ref().map(|s| s.link.clone());
     let effective_mixture_rho = formula_link.as_ref().and_then(|s| s.mixture_rho.clone());
@@ -947,6 +1047,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     progress.start_secondary_workflow("Data Loading", 3);
     let requested_columns = required_columns_for_fit(&args, &parsed)?;
     let ds = load_dataset_projected(&args.data, &requested_columns)?;
+    require_dataset_rows("fit", &args.data, ds.values.nrows())?;
     progress.advance_secondary_workflow(1);
     progress.advance_workflow(1);
 
@@ -6763,6 +6864,179 @@ fn block_role_label(role: &gam::estimate::BlockRole) -> &'static str {
         gam::estimate::BlockRole::Threshold => "threshold",
         gam::estimate::BlockRole::LinkWiggle => "link-wiggle",
     }
+}
+
+fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result<(), String> {
+    if args.out.is_none() {
+        return Err("fit requires --out; refusing to run a training job that writes no model".to_string());
+    }
+    if args.family == FamilyArg::TransformationNormal && !args.transformation_normal {
+        return Err(
+            "--family transformation-normal does not select the transformation-normal fitter; use --transformation-normal"
+                .to_string(),
+        );
+    }
+    if args.transformation_normal
+        && !matches!(args.family, FamilyArg::Auto | FamilyArg::TransformationNormal)
+    {
+        return Err(format!(
+            "--transformation-normal conflicts with --family {}",
+            family_arg_name(args.family)
+        ));
+    }
+    if args.transformation_normal {
+        if args.predict_noise.is_some() {
+            return Err("--transformation-normal conflicts with --predict-noise".to_string());
+        }
+        if args.logslope_formula.is_some() || args.z_column.is_some() {
+            return Err(
+                "--transformation-normal conflicts with marginal-slope --logslope-formula/--z-column"
+                    .to_string(),
+            );
+        }
+        if args.firth {
+            return Err("--transformation-normal conflicts with --firth".to_string());
+        }
+    }
+    if args.logslope_formula.is_some() != args.z_column.is_some() {
+        return Err("--logslope-formula and --z-column must be provided together".to_string());
+    }
+    if args.negative_binomial_theta.is_some() && args.family != FamilyArg::NegativeBinomial {
+        return Err("--negative-binomial-theta requires --family negative-binomial".to_string());
+    }
+    frailty_spec_from_cli(
+        args.frailty_kind,
+        args.frailty_sd,
+        args.hazard_loading,
+        "fit",
+    )?;
+
+    let is_survival = parse_surv_response(&parsed.response)?.is_some();
+    let survival_likelihood = parse_survival_likelihood_mode(&args.survival_likelihood)?;
+    if !is_survival {
+        if args.survival_time_anchor.is_some()
+            || args.baseline_scale.is_some()
+            || args.baseline_shape.is_some()
+            || args.baseline_rate.is_some()
+            || args.baseline_makeham.is_some()
+            || args.threshold_time_k.is_some()
+            || args.sigma_time_k.is_some()
+            || args.survival_likelihood != "transformation"
+            || args.baseline_target != "linear"
+            || args.time_basis != "ispline"
+        {
+            return Err(
+                "survival-only options require a Surv(entry, exit, event) response".to_string(),
+            );
+        }
+    }
+    validate_survival_baseline_args(args, survival_likelihood)?;
+    validate_time_margin_args("--threshold-time-k", args.threshold_time_k, args.threshold_time_degree)?;
+    validate_time_margin_args("--sigma-time-k", args.sigma_time_k, args.sigma_time_degree)?;
+    if args.time_basis == "ispline" {
+        parse_survival_time_basis_config(
+            &args.time_basis,
+            args.time_degree,
+            args.time_num_internal_knots,
+            args.time_smooth_lambda,
+        )?;
+    }
+    Ok(())
+}
+
+fn family_arg_name(arg: FamilyArg) -> &'static str {
+    match arg {
+        FamilyArg::Auto => "auto",
+        FamilyArg::Gaussian => "gaussian",
+        FamilyArg::BinomialLogit => "binomial-logit",
+        FamilyArg::BinomialProbit => "binomial-probit",
+        FamilyArg::BinomialCloglog => "binomial-cloglog",
+        FamilyArg::LatentCloglogBinomial => "latent-cloglog-binomial",
+        FamilyArg::PoissonLog => "poisson-log",
+        FamilyArg::NegativeBinomial => "negative-binomial",
+        FamilyArg::GammaLog => "gamma-log",
+        FamilyArg::RoystonParmar => "royston-parmar",
+        FamilyArg::TransformationNormal => "transformation-normal",
+    }
+}
+
+fn validate_time_margin_args(
+    flag: &str,
+    k: Option<usize>,
+    degree: usize,
+) -> Result<(), String> {
+    if let Some(k) = k {
+        let min_k = degree + 1;
+        if k < min_k {
+            return Err(format!("{flag} must be >= degree + 1 = {min_k}, got {k}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_survival_baseline_args(
+    args: &FitArgs,
+    likelihood_mode: SurvivalLikelihoodMode,
+) -> Result<(), String> {
+    if likelihood_mode == SurvivalLikelihoodMode::Weibull {
+        if args.baseline_rate.is_some() || args.baseline_makeham.is_some() {
+            return Err(
+                "--survival-likelihood weibull does not use --baseline-rate or --baseline-makeham"
+                    .to_string(),
+            );
+        }
+        if !matches!(args.baseline_target.as_str(), "linear" | "weibull") {
+            return Err(
+                "--survival-likelihood weibull supports only --baseline-target linear|weibull"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+
+    match args.baseline_target.as_str() {
+        "linear" => {
+            if args.baseline_scale.is_some()
+                || args.baseline_shape.is_some()
+                || args.baseline_rate.is_some()
+                || args.baseline_makeham.is_some()
+            {
+                return Err(
+                    "--baseline-target linear does not use baseline parameter flags".to_string(),
+                );
+            }
+        }
+        "weibull" => {
+            if args.baseline_rate.is_some() || args.baseline_makeham.is_some() {
+                return Err(
+                    "--baseline-target weibull does not use --baseline-rate or --baseline-makeham"
+                        .to_string(),
+                );
+            }
+        }
+        "gompertz" => {
+            if args.baseline_scale.is_some() || args.baseline_makeham.is_some() {
+                return Err(
+                    "--baseline-target gompertz does not use --baseline-scale or --baseline-makeham"
+                        .to_string(),
+                );
+            }
+        }
+        "gompertz-makeham" => {
+            if args.baseline_scale.is_some() {
+                return Err(
+                    "--baseline-target gompertz-makeham does not use --baseline-scale"
+                        .to_string(),
+                );
+            }
+        }
+        other => {
+            return Err(format!(
+                "unsupported --baseline-target '{other}'; use linear|weibull|gompertz|gompertz-makeham"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn choose_formula(args: &FitArgs) -> Result<String, CliError> {
