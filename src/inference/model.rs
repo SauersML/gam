@@ -2331,7 +2331,7 @@ impl FittedModel {
 
     #[inline]
     pub fn predict_model_class(&self) -> PredictModelClass {
-        match self.payload().family_state {
+        match &self.payload().family_state {
             FittedFamily::Survival { .. }
             | FittedFamily::LatentSurvival { .. }
             | FittedFamily::LatentBinary { .. } => PredictModelClass::Survival,
