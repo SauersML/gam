@@ -16,16 +16,10 @@ pub enum BackendStatus {
 
 #[inline]
 pub fn backend_status() -> BackendStatus {
-    #[cfg(feature = "cuda")]
-    {
-        match crate::gpu::runtime::GpuRuntime::global() {
-            Some(_) => BackendStatus::CudaReady,
-            None => BackendStatus::CudaUnavailable,
-        }
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        BackendStatus::CpuFallback
+    if crate::gpu::runtime::GpuRuntime::global().is_some() {
+        BackendStatus::CudaReady
+    } else {
+        BackendStatus::CudaUnavailable
     }
 }
 
@@ -46,25 +40,16 @@ pub fn try_dispatch(
     x: &mut Array2<f64>,
     w: ArrayView1<'_, f64>,
 ) -> Option<Result<(), GpuError>> {
-    let (n, _p) = x.dim();
+    let n = x.nrows();
     if n == 0 || n != w.len() {
         return None;
     }
-    #[cfg(feature = "cuda")]
-    {
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
-            return None;
-        };
-        Some(cuda_row_scale(x, w))
+    if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        return None;
     }
-    #[cfg(not(feature = "cuda"))]
-    {
-        drop((x, w));
-        None
-    }
+    Some(cuda_row_scale(x, w))
 }
 
-#[cfg(feature = "cuda")]
 fn cuda_row_scale(x: &mut Array2<f64>, w: ArrayView1<'_, f64>) -> Result<(), GpuError> {
     use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
     use cudarc::nvrtc::compile_ptx;
@@ -144,7 +129,6 @@ extern "C" __global__ void row_scale_inplace_kernel(
     Ok(())
 }
 
-#[cfg(feature = "cuda")]
 fn map_drv(e: cudarc::driver::DriverError) -> GpuError {
     GpuError::DriverCallFailed {
         reason: format!("row_scale cudarc driver error: {e}"),

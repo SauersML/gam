@@ -66,6 +66,18 @@ try:
         sphere_log_map,
     )
     from .modules import from_fitted
+    from .penalties import (
+        ARDPenalty,
+        BlockOrthogonalityPenalty,
+        GumbelTemperatureSchedule,
+        IBPAssignmentPenalty,
+        IsometryPenalty,
+        IvaeRidgeMeanGauge,
+        LazyPcaBasis,
+        MechanismSparsityPenalty,
+        RiemannianRetraction,
+        TopologyAutoSelector,
+    )
     # New unified Smooth/fit API — the recommended user-facing surface.
     from ..smooth import (
         BSpline,
@@ -94,6 +106,16 @@ __all__ = [
     "fit",
     "FitResult",
     "GAM",
+    "ARDPenalty",
+    "BlockOrthogonalityPenalty",
+    "GumbelTemperatureSchedule",
+    "IBPAssignmentPenalty",
+    "IsometryPenalty",
+    "IvaeRidgeMeanGauge",
+    "LazyPcaBasis",
+    "MechanismSparsityPenalty",
+    "RiemannianRetraction",
+    "TopologyAutoSelector",
     "Smooth",
     "Duchon",
     "BSpline",

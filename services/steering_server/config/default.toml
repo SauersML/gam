@@ -1,5 +1,5 @@
 [database]
-url = "sqlite:///services/steering_server/steering_server.db"
+url = "sqlite:///steering_server.db"
 
 [auth]
 bootstrap_user = "local-admin"

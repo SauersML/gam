@@ -9,9 +9,11 @@
 //!      process startup).
 //!   2. The kernel being large enough to amortize launch/PCIe overhead, per
 //!      the thresholds in `policy::GpuDispatchPolicy`.
-//!   3. The `cuda` Cargo feature being enabled at compile time. Without it,
-//!      no backend symbols are linked and every `try_*` returns `None` so the
-//!      caller falls through to the existing faer CPU kernel.
+//!   3. cudarc successfully dynamically loading `libcuda` at process startup
+//!      via its `fallback-dynamic-loading` feature. When the loader fails
+//!      (no driver, no toolkit installed), `GpuRuntime::probe()` returns
+//!      `Ok(None)` and every `try_*` returns `None` so the caller falls
+//!      through to the existing faer CPU kernel.
 //!
 //! The wiring lives here so `solver/pirls.rs` and the family Hessian
 //! assemblers can stay backend-agnostic: they call `crate::faer_ndarray::fast_*`

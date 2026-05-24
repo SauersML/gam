@@ -73,6 +73,7 @@ __all__ = [
     "ARDPenalty",
     "TopKActivationPenalty",
     "JumpReLUPenalty",
+    "GatedSAEDecoder",
     "TotalVariationPenalty",
     "NuclearNormPenalty",
     "BlockSparsityPenalty",
@@ -670,6 +671,54 @@ class JumpReLUPenalty:
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         return self._to_rust_payload()
+
+
+@dataclass(frozen=True, slots=True)
+class GatedSAEDecoder:
+    """Standalone gated SAE decoder with gate and amplitude weights."""
+
+    w_gate: Any
+    w_amp: Any
+
+    def __post_init__(self) -> None:
+        gate = np.asarray(self.w_gate, dtype=float)
+        amp = np.asarray(self.w_amp, dtype=float)
+        if gate.ndim != 2 or gate.shape[0] != gate.shape[1]:
+            raise ValueError("GatedSAEDecoder.w_gate must be square")
+        if amp.ndim != 2 or amp.shape[1] != gate.shape[1]:
+            raise ValueError("GatedSAEDecoder.w_amp columns must match w_gate input")
+        if not np.all(np.isfinite(gate)) or not np.all(np.isfinite(amp)):
+            raise ValueError("GatedSAEDecoder weights must be finite")
+        object.__setattr__(self, "w_gate", gate)
+        object.__setattr__(self, "w_amp", amp)
+
+    def decode(self, x: Any) -> np.ndarray:
+        x_arr = np.asarray(x, dtype=float)
+        single = x_arr.ndim == 1
+        x2 = x_arr.reshape(1, -1) if single else x_arr
+        if x2.ndim != 2 or x2.shape[1] != self.w_gate.shape[1]:
+            raise ValueError(
+                f"GatedSAEDecoder.decode expected input dimension {self.w_gate.shape[1]}"
+            )
+        gates = (_sigmoid_numpy(x2 @ self.w_gate.T) > 0.5).astype(float)
+        out = (gates * x2) @ self.w_amp.T
+        return out[0] if single else out
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return {
+            "kind": "gated_sae_decoder",
+            "w_gate": self.w_gate.tolist(),
+            "w_amp": self.w_amp.tolist(),
+        }
+
+
+def _sigmoid_numpy(x: np.ndarray) -> np.ndarray:
+    out = np.empty_like(x, dtype=float)
+    pos = x >= 0.0
+    out[pos] = 1.0 / (1.0 + np.exp(-x[pos]))
+    ex = np.exp(x[~pos])
+    out[~pos] = ex / (1.0 + ex)
+    return out
 
 
 @dataclass(init=False, slots=True)
