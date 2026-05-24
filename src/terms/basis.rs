@@ -4484,7 +4484,11 @@ impl LatentCoordDesignDerivative {
                 basis_matrix.nrows()
             )));
         }
-        let mut jet = Array3::<f64>::zeros((latent.n_obs(), basis_matrix.ncols(), basis_matrix.nrows()));
+        let mut jet = Array3::<f64>::zeros((
+            latent.n_obs(),
+            basis_matrix.ncols(),
+            basis_matrix.nrows(),
+        ));
         for row in 0..latent.n_obs() {
             for axis in 0..basis_matrix.nrows() {
                 for col in 0..basis_matrix.ncols() {
