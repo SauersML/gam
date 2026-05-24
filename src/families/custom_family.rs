@@ -16559,8 +16559,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 derivative_blocks.len(),
                 specs.len()
             ),
-        }
-        .into());
+        });
     }
 
     if penalty_counts.len() != specs.len() {
@@ -16570,8 +16569,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 penalty_counts.len(),
                 specs.len()
             ),
-        }
-        .into());
+        });
     }
     let rho_dim = penalty_counts.iter().sum::<usize>();
     let psi_dim = derivative_blocks.iter().map(Vec::len).sum::<usize>();
@@ -16583,8 +16581,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 rho_dim,
                 psi_dim
             ),
-        }
-        .into());
+        });
     }
 
     // ── Common setup: inner solve, ridge, refresh, ranges ──
@@ -16613,8 +16610,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
              inconsistent.",
                 inner.cycles, theta_dim, rho_dim, psi_dim
             ),
-        }
-        .into());
+        });
     }
     let ridge = effective_solverridge(options.ridge_floor);
     let moderidge = if options.ridge_policy.include_quadratic_penalty {
@@ -17208,7 +17204,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                     hessian.ncols(),
                     p,
                     p
-                ) }.into());
+                ) });
             }
             hessian.to_dense()
         }
@@ -17637,8 +17633,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
                 derivative_blocks.len(),
                 specs.len()
             ),
-        }
-        .into());
+        });
     }
     if penalty_counts.len() != specs.len() {
         return Err(CustomFamilyError::DimensionMismatch {
@@ -17647,8 +17642,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
                 penalty_counts.len(),
                 specs.len()
             ),
-        }
-        .into());
+        });
     }
 
     let rho_dim = penalty_counts.iter().sum::<usize>();
@@ -17667,8 +17661,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
                 rho_dim,
                 psi_dim
             ),
-        }
-        .into());
+        });
     }
 
     let include_logdet_h = include_exact_newton_logdet_h(family, options);
@@ -17989,8 +17982,7 @@ pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + S
                 derivative_blocks.len(),
                 specs.len()
             ),
-        }
-        .into());
+        });
     }
     let (efs_eval, warm_start, inner_converged) = if derivative_blocks.iter().all(Vec::is_empty) {
         outerobjectiveefs(
@@ -18039,8 +18031,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_shared<
                 derivative_blocks.len(),
                 specs.len()
             ),
-        }
-        .into());
+        });
     }
     let (efs_eval, warm_start, inner_converged) = if derivative_blocks.iter().all(Vec::is_empty) {
         outerobjectiveefs(
