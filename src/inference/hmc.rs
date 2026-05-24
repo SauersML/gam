@@ -1227,7 +1227,7 @@ fn logit_logp_and_grad_into(
         })
         .sum();
 
-    let grad_ll = fast_atv(&data.x, residual);
+    let grad_ll = fast_atv(data.x.as_ref(), &*residual);
     (ll, grad_ll)
 }
 
@@ -1270,7 +1270,7 @@ fn probit_logp_and_grad_into(
         })
         .sum();
 
-    let grad_ll = fast_atv(&data.x, residual);
+    let grad_ll = fast_atv(data.x.as_ref(), &*residual);
     (ll, grad_ll)
 }
 
@@ -1336,7 +1336,7 @@ fn cloglog_logp_and_grad_into(
         })
         .sum();
 
-    let grad_ll = fast_atv(&data.x, residual);
+    let grad_ll = fast_atv(data.x.as_ref(), &*residual);
     (ll, grad_ll)
 }
 
@@ -1382,7 +1382,7 @@ fn gaussian_logp_and_grad_into(
         })
         .sum();
 
-    let grad_ll = fast_atv(&data.x, weighted_residual);
+    let grad_ll = fast_atv(data.x.as_ref(), &*weighted_residual);
     (ll, grad_ll)
 }
 
@@ -3029,7 +3029,7 @@ impl HamiltonianTarget<Array1<f64>> for NutsPosterior {
             if residual.len() != self.data.n_samples {
                 *residual = Array1::<f64>::zeros(self.data.n_samples);
             }
-            let (logp, gradz) = self.compute_logp_and_grad_nd_into(position, &mut residual);
+            let (logp, gradz) = self.compute_logp_and_grad_nd_into(position, &mut *residual);
             grad.assign(&gradz);
             logp
         })
