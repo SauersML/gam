@@ -2901,7 +2901,7 @@ impl SparseSpGemmState {
 
         let wx_ref = SparseColMatRef::new(x.symbolic(), &self.wxvalues[..]);
         let wx_t_ref = SparseColMatRef::new(x_t.symbolic(), &self.wx_tvalues[..]);
-        let mut stack = MemStack::new(&mut self.scratch);
+        let stack = MemStack::new(&mut self.scratch);
         let xtwxmut = SparseColMatMut::new(xtwx_symbolic, xtwxvalues);
         sparse_sparse_matmul_numeric(
             xtwxmut,
@@ -7393,7 +7393,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             linear_constraints_transformed: linear_constraints.clone(),
             reparam_result,
             x_transformed: make_reparam_operator(&x_original, &qs_arc_final, use_sparse_native),
-            coordinate_frame: coordinate_frame,
+            coordinate_frame,
             cache_compacted: false,
             min_penalized_deviance: working_summary.min_penalized_deviance,
         };

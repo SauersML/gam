@@ -5058,9 +5058,7 @@ fn run_outer_with_plan(
     let mut projected_seeds = Vec::with_capacity(seeds.len());
     for seed in seeds {
         let projected = project_to_bounds(&seed, Some(&bounds_template));
-        if !projected_seeds
-            .iter()
-            .any(|existing: &Array1<f64>| existing == projected)
+        if !projected_seeds.contains(&projected)
         {
             projected_seeds.push(projected);
         }
