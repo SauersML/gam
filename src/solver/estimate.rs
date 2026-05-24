@@ -1717,6 +1717,12 @@ pub enum EstimationError {
     #[error("REML smoothing optimization failed to converge: {0}")]
     RemlOptimizationFailed(String),
 
+    #[error("{context}: unified evaluator returned no gradient in {mode} mode")]
+    GradientUnavailable {
+        context: &'static str,
+        mode: &'static str,
+    },
+
     #[error("An internal error occurred during model layout or coefficient mapping: {0}")]
     LayoutError(String),
 

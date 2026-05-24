@@ -859,6 +859,7 @@ fn analytic_penalty_is_row_block_diagonal(penalty: &AnalyticPenaltyKind) -> bool
             | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
             | AnalyticPenaltyKind::IBPAssignment(_)
             | AnalyticPenaltyKind::AuxConditionalPrior(_)
+            | AnalyticPenaltyKind::ParametricAuxConditionalPrior(_)
     )
 }
 
