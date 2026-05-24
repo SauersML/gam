@@ -401,9 +401,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_tensor_periodic_list_options() {
+    fn parses_tensor_boundary_list_options() {
         let call = parse_function_call(
-            "te(day_of_week, hour, bc=['periodic', 'periodic'], period=[7, 24])",
+            "te(day_of_week, hour, boundary=['periodic', 'periodic'], period=[7, 24])",
         )
         .expect("call");
         assert_eq!(call.name, "te");
@@ -411,7 +411,7 @@ mod tests {
         assert_eq!(
             call.args[2],
             CallArgSpec::Named {
-                key: "bc".to_string(),
+                key: "boundary".to_string(),
                 value: "['periodic', 'periodic']".to_string(),
             }
         );
