@@ -4047,9 +4047,8 @@ impl ImplicitHyperOperator {
 /// exact first-order τ Hessian drift
 ///   B_τ = X_τᵀ W X + Xᵀ W X_τ + Xᵀ diag(c ⊙ X_τ β̂) X + S_τ − (H_φ)_{τ}|_β
 /// without materializing the full dense matrix up front.
-pub struct SparseDirectionalHyperOperator {
+pub(crate) struct SparseDirectionalHyperOperator {
     /// Original-basis design derivative X_τ.
-    #[allow(private_interfaces)]
     pub x_tau: super::HyperDesignDerivative,
     /// Design matrix X in the sparse-native basis.
     pub x_design: DesignMatrix,

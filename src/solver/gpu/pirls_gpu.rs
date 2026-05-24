@@ -16,7 +16,6 @@ pub struct PirlsGpuStep {
     pub logdet: f64,
 }
 
-#[cfg(feature = "cuda")]
 mod cuda {
     use super::{PirlsGpuInput, PirlsGpuStep};
     use crate::gpu::driver::{from_col_major, to_col_major};
@@ -282,35 +281,25 @@ mod cuda {
     }
 }
 
-#[cfg(feature = "cuda")]
 pub fn weighted_crossprod_gpu(
     x: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
 ) -> Result<Array2<f64>, String> {
+    if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        let (rows, cols) = x.dim();
+        return Err(format!(
+            "CUDA runtime unavailable for weighted cross-product; x={rows}x{cols}, weights={}",
+            weights.len()
+        ));
+    }
     cuda::weighted_crossprod(x, weights)
 }
 
-#[cfg(not(feature = "cuda"))]
-pub fn weighted_crossprod_gpu(
-    x: ArrayView2<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-) -> Result<Array2<f64>, String> {
-    let (rows, cols) = x.dim();
-    Err(format!(
-        "cuda feature is not enabled for weighted cross-product; x={rows}x{cols}, weights={}",
-        weights.len()
-    ))
-}
-
-#[cfg(feature = "cuda")]
 pub fn solve_pirls_step_gpu(input: PirlsGpuInput<'_>) -> Result<PirlsGpuStep, String> {
+    if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        return Err("CUDA runtime unavailable for PIRLS step".to_string());
+    }
     cuda::solve_step(input)
-}
-
-#[cfg(not(feature = "cuda"))]
-pub fn solve_pirls_step_gpu(input: PirlsGpuInput<'_>) -> Result<PirlsGpuStep, String> {
-    drop(input);
-    Err("cuda feature is not enabled".to_string())
 }
 
 pub fn cholesky_solve_gpu(
