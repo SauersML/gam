@@ -16,7 +16,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
 use sha2::{Digest, Sha256};
 
 use crate::basis::{DuchonNullspaceOrder, MaternNu, RadialScalarKind};
@@ -27,7 +27,7 @@ use crate::solver::riemannian_retraction::{Retraction, RetractionKind};
 use crate::terms::latent_coord::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };
-use crate::terms::smooth::TermCollectionDesign;
+use crate::terms::smooth::{TermCollectionDesign, TermCollectionSpec};
 
 const DEFAULT_LATENT_CACHE_CAPACITY: usize = 4;
 const DEFAULT_PERSISTENT_LATENT_CACHE_CAPACITY: usize = 16;
@@ -428,6 +428,37 @@ fn latent_metadata_cache_digest(latent: &LatentCoordValues) -> CacheDigest {
     hasher.finish()
 }
 
+pub(crate) fn latent_design_context_cache_digest(
+    data: ArrayView2<'_, f64>,
+    spec: &TermCollectionSpec,
+    term_index: usize,
+    analytic_rho_count: usize,
+    feature_cols: &[usize],
+) -> Result<CacheDigest, EstimationError> {
+    let mut hasher = CacheDigestBuilder::new("latent-design-context-v1");
+    hasher.write_usize(data.nrows());
+    hasher.write_usize(data.ncols());
+    for row in 0..data.nrows() {
+        for col in 0..data.ncols() {
+            hasher.write_f64(data[[row, col]]);
+        }
+    }
+    let spec_bytes = serde_json::to_vec(spec).map_err(|err| {
+        EstimationError::InvalidInput(format!(
+            "failed to serialize latent design cache context: {err}"
+        ))
+    })?;
+    hasher.write_usize(spec_bytes.len());
+    hasher.hasher.update(spec_bytes);
+    hasher.write_usize(term_index);
+    hasher.write_usize(analytic_rho_count);
+    hasher.write_usize(feature_cols.len());
+    for &col in feature_cols {
+        hasher.write_usize(col);
+    }
+    Ok(hasher.finish())
+}
+
 fn hash_latent_id_mode(id_mode: &LatentIdMode, hasher: &mut CacheDigestBuilder) {
     match id_mode {
         LatentIdMode::AuxPrior {
@@ -563,6 +594,7 @@ pub(crate) struct CachedDesign {
     pub(crate) fingerprint: LatentFingerprint,
     basis_digest: CacheDigest,
     latent_metadata_digest: CacheDigest,
+    design_context_digest: CacheDigest,
     latent_bits: Arc<[u64]>,
     cacheable: bool,
     pub(crate) design: TermCollectionDesign,
@@ -587,6 +619,7 @@ struct PersistentLatentDesignKey {
     flat_hash: u64,
     basis_digest: CacheDigest,
     latent_metadata_digest: CacheDigest,
+    design_context_digest: CacheDigest,
 }
 
 struct PersistentLatentDesignEntry {
@@ -625,6 +658,7 @@ impl PersistentLatentDesignCache {
         latent: &LatentCoordValues,
         basis_digest: CacheDigest,
         latent_metadata_digest: CacheDigest,
+        design_context_digest: CacheDigest,
         fingerprint: &LatentFingerprint,
     ) -> Result<Option<Arc<CachedDesign>>, EstimationError> {
         let key = PersistentLatentDesignKey {
@@ -632,6 +666,7 @@ impl PersistentLatentDesignCache {
             flat_hash: fingerprint.hash,
             basis_digest,
             latent_metadata_digest,
+            design_context_digest,
         };
         let Some(entry) = self.entries.get(&key) else {
             return Ok(None);
@@ -646,6 +681,7 @@ impl PersistentLatentDesignCache {
             && cached.cacheable
             && cached.basis_digest == basis_digest
             && cached.latent_metadata_digest == latent_metadata_digest
+            && cached.design_context_digest == design_context_digest
             && latent_bits_match(latent, &cached.latent_bits)
         {
             return Ok(Some(cached));
@@ -666,6 +702,7 @@ impl PersistentLatentDesignCache {
             flat_hash: cached.fingerprint.hash,
             basis_digest: cached.basis_digest,
             latent_metadata_digest: cached.latent_metadata_digest,
+            design_context_digest: cached.design_context_digest,
         };
         let entry = PersistentLatentDesignEntry {
             fingerprint: cached.fingerprint.clone(),
@@ -745,6 +782,7 @@ impl LatentDesignCache {
         &mut self,
         latent: Arc<LatentCoordValues>,
         basis_kind: LatentBasisKind,
+        design_context_digest: CacheDigest,
         compute: F,
     ) -> Result<LatentDesignLookup<'_>, EstimationError>
     where
@@ -761,7 +799,12 @@ impl LatentDesignCache {
         let latent_metadata_digest = latent_metadata_cache_digest(&latent);
         let cacheable = flat_slice.iter().all(|value| value.is_finite());
         if cacheable {
-            if let Some(index) = self.find_entry(&latent, basis_digest, latent_metadata_digest) {
+            if let Some(index) = self.find_entry(
+                &latent,
+                basis_digest,
+                latent_metadata_digest,
+                design_context_digest,
+            ) {
                 self.entries[index].last_used = self.clock;
                 return Ok(LatentDesignLookup {
                     cached: self.entries[index].cached.as_ref(),
@@ -774,6 +817,7 @@ impl LatentDesignCache {
                 &latent,
                 basis_digest,
                 latent_metadata_digest,
+                design_context_digest,
                 &fingerprint,
             )? {
                 let id = self.next_entry_id;
@@ -807,6 +851,7 @@ impl LatentDesignCache {
             fingerprint,
             basis_digest,
             latent_metadata_digest,
+            design_context_digest,
             latent_bits: latent_bits(&latent),
             cacheable,
             design: computed.design,
@@ -826,11 +871,13 @@ impl LatentDesignCache {
         latent: &LatentCoordValues,
         basis_digest: CacheDigest,
         latent_metadata_digest: CacheDigest,
+        design_context_digest: CacheDigest,
     ) -> Option<usize> {
         self.entries.iter().position(|entry| {
             entry.cached.cacheable
                 && entry.cached.basis_digest == basis_digest
                 && entry.cached.latent_metadata_digest == latent_metadata_digest
+                && entry.cached.design_context_digest == design_context_digest
                 && entry.cached.latent_id == latent.latent_id()
                 && latent_bits_match(latent, &entry.cached.latent_bits)
         })
@@ -935,6 +982,7 @@ fn lookup_persistent_latent_design(
     latent: &LatentCoordValues,
     basis_digest: CacheDigest,
     latent_metadata_digest: CacheDigest,
+    design_context_digest: CacheDigest,
     fingerprint: &LatentFingerprint,
 ) -> Result<Option<Arc<CachedDesign>>, EstimationError> {
     let cache = PERSISTENT_LATENT_DESIGN_CACHE
@@ -942,7 +990,13 @@ fn lookup_persistent_latent_design(
     let mut guard = cache.lock().map_err(|_| {
         EstimationError::InvalidInput("persistent latent design cache mutex poisoned".to_string())
     })?;
-    guard.lookup(latent, basis_digest, latent_metadata_digest, fingerprint)
+    guard.lookup(
+        latent,
+        basis_digest,
+        latent_metadata_digest,
+        design_context_digest,
+        fingerprint,
+    )
 }
 
 fn insert_persistent_latent_design(cached: Arc<CachedDesign>) -> Result<(), EstimationError> {
