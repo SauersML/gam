@@ -26,7 +26,6 @@ use ::opt::{
 };
 use ndarray::{Array1, Array2, ArrayView2};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Trigger ratio for the IFT-energy trust gate.
@@ -5537,8 +5536,7 @@ fn run_outer_with_plan(
                     .with_initial_sample(seed.clone(), initial_sample)
                     .with_bounds(bounds)
                     .with_gradient_tolerance(grad_tol)
-                    .with_max_iterations(max_iter)
-                    .with_initial_sample(seed.clone(), initial_sample);
+                    .with_max_iterations(max_iter);
                 if let Some(feedback) = config.outer_inner_cap.as_ref() {
                     optimizer = optimizer.with_observer(OuterAcceptObserver {
                         feedback: feedback.clone(),

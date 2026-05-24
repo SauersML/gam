@@ -1,7 +1,7 @@
 //! CPU-only GPU dispatch stubs. All `try_fast_*` return Cpu / None until a
 //! real device backend is compiled in.
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum GpuDispatch {
     /// Caller should fall back to the CPU implementation.
     Cpu,

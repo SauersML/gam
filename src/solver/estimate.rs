@@ -806,7 +806,6 @@ impl RemlConfig {
 
 }
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
-use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
@@ -3627,7 +3626,6 @@ where
         | GlmLikelihoodFamily::PoissonLog => 1.0,
     };
     let dispersion = dispersion_from_likelihood(pirls_res.likelihood, standard_deviation);
-    let dispersion_phi = dispersion.phi();
 
     // Explicit dispersion contract for coefficient covariance matrices:
     // Vb = H⁻¹ * φ̂.  Fixed-scale likelihoods (Poisson/Binomial) use φ = 1,
@@ -3700,7 +3698,6 @@ where
             match matrix_inversewith_regularization(&penalized_hessian, "posterior covariance") {
                 Some(cov_unscaled) => Some(cov_unscaled),
                 None => {
-                    covariance_is_diagonal_only = true;
                     log::warn!(
                         "full posterior covariance inversion failed (p={p_cov}): \
                          falling back to diagonal-only standard errors"
@@ -5115,12 +5112,6 @@ impl UnifiedFitResult {
         self.inference
             .as_ref()
             .and_then(|inf| inf.coefficient_influence.as_ref())
-    }
-
-    pub fn covariance_is_diagonal_only(&self) -> bool {
-        self.inference
-            .as_ref()
-            .is_some_and(|inf| inf.covariance_is_diagonal_only)
     }
 
     /// Get beta standard errors (conditional) if available.
