@@ -46,7 +46,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 /// *future* inner accuracy across channels by adjusting target MSE; this
 /// gate adjusts the *current* outer trust radius without changing inner
 /// tolerances.
-#[expect(dead_code)]
 const TRUST_ENERGY_FACTOR: f64 = 10.0;
 const OPERATOR_TRUST_RESTART_RADIUS_FLOOR: f64 = 1.0e-6;
 
@@ -4033,7 +4032,6 @@ struct OuterConfig {
     /// gradient lives on a non-unit scale (e.g. Gaussian-identity REML at
     /// large `n`, whose ∂/∂logλ inherits the O(n) likelihood constant).
     /// `None` falls back to the bare `tolerance` floor.
-    #[expect(dead_code)]
     objective_scale: Option<f64>,
     /// BFGS line-search infinity-norm cap applied to the leading `rho_dim`
     /// outer parameters (log-λ axes). Documented natural step for
@@ -4041,7 +4039,6 @@ struct OuterConfig {
     /// per accepted outer iter — matches typical quasi-Newton direction
     /// magnitude on flat REML surfaces). Setting this `None` disables the
     /// rho-axis cap entirely.
-    #[expect(dead_code)]
     bfgs_step_cap: Option<f64>,
     /// BFGS line-search infinity-norm cap applied to the trailing `psi_dim`
     /// outer parameters (kappa / aniso-log-scale axes). Required because
@@ -4049,7 +4046,6 @@ struct OuterConfig {
     /// per iter is plenty) — using the rho-axis cap here lets the optimizer
     /// jump kappa by orders of magnitude per step and oscillate. Setting
     /// this `None` disables the psi-axis cap.
-    #[expect(dead_code)]
     bfgs_step_cap_psi: Option<f64>,
     /// Optional persistent-cache session. When `Some`, every finite objective
     /// evaluation is written through to disk (rate-limited, atomic-rename)

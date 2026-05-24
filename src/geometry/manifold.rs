@@ -119,7 +119,11 @@ impl ManifoldSpec {
     }
 }
 
-pub(crate) fn check_len(context: &'static str, got: usize, expected: usize) -> GeometryResult<()> {
+pub(crate) const fn check_len(
+    context: &'static str,
+    got: usize,
+    expected: usize,
+) -> GeometryResult<()> {
     if got == expected {
         Ok(())
     } else {
