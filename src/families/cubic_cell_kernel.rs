@@ -3918,7 +3918,7 @@ mod tests {
     where
         F: Fn(f64) -> f64,
     {
-        let n = if steps % 2 == 0 { steps } else { steps + 1 };
+        let n = if steps.is_multiple_of(2) { steps } else { steps + 1 };
         let h = (right - left) / n as f64;
         let mut acc = f(left) + f(right);
         for k in 1..n {

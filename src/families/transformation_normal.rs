@@ -12765,11 +12765,9 @@ mod tests {
 
         // Hessian-vector product must agree with dense H · v across a few
         // randomly chosen directions (deterministic seed for stability).
-        let directions = vec![
-            toy_probe_vector(p, 101),
+        let directions = [toy_probe_vector(p, 101),
             toy_probe_vector(p, 102),
-            toy_probe_vector(p, 103),
-        ];
+            toy_probe_vector(p, 103)];
         for (k, v) in directions.iter().enumerate() {
             assert_eq!(v.len(), p);
             let want = dense.dot(v);
@@ -13042,11 +13040,9 @@ mod tests {
             .expect("dH operator call")
             .expect("dH operator present");
 
-        let probes = vec![
-            toy_probe_vector(p, 202),
+        let probes = [toy_probe_vector(p, 202),
             toy_probe_vector(p, 203),
-            toy_probe_vector(p, 204),
-        ];
+            toy_probe_vector(p, 204)];
         let mut probe_mat = Array2::<f64>::zeros((p, probes.len()));
         for (j, w) in probes.iter().enumerate() {
             probe_mat.column_mut(j).assign(w);
@@ -13150,11 +13146,9 @@ mod tests {
             .expect("d2H operator call")
             .expect("d2H operator present");
 
-        let probes = vec![
-            toy_probe_vector(p, 303),
+        let probes = [toy_probe_vector(p, 303),
             toy_probe_vector(p, 304),
-            toy_probe_vector(p, 305),
-        ];
+            toy_probe_vector(p, 305)];
         let mut probe_mat = Array2::<f64>::zeros((p, probes.len()));
         for (j, w) in probes.iter().enumerate() {
             probe_mat.column_mut(j).assign(w);

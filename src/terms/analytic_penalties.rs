@@ -7497,7 +7497,7 @@ mod tests {
         assert!((g[2] - 2.0 * 2.0).abs() < 1e-12);
         // Axis 1 entries (n*d + 1): indices 1, 3. λ1 · t.
         assert!((g[1] - 3.0 * 1.0).abs() < 1e-12);
-        assert!((g[3] - 3.0 * (-1.0)).abs() < 1e-12);
+        assert!((g[3] - -3.0).abs() < 1e-12);
     }
 
     #[test]

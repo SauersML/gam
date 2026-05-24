@@ -17335,12 +17335,10 @@ mod tests {
         // Four ambient vectors with MIXED support (not the standard
         // basis) so Gram-Schmidt against `v_min` produces dense Q
         // columns and a dense `h_proj`.
-        let ambients = vec![
-            array![1.0_f64, 0.3, -0.2, 0.5, 0.0],
+        let ambients = [array![1.0_f64, 0.3, -0.2, 0.5, 0.0],
             array![0.4_f64, 1.0, 0.6, -0.3, 0.0],
             array![-0.5_f64, 0.2, 1.0, 0.7, 0.0],
-            array![0.6_f64, -0.4, 0.3, 1.0, 0.0],
-        ];
+            array![0.6_f64, -0.4, 0.3, 1.0, 0.0]];
         let mut q = Array2::<f64>::zeros((p, p));
         q.column_mut(p - 1).assign(&v_min);
         let mut col_idx = 0usize;
@@ -18553,8 +18551,7 @@ mod tests {
             dim_hint: 3,
         });
 
-        let pairs = vec![
-            HyperCoordPair {
+        let pairs = [HyperCoordPair {
                 a: 0.0,
                 g: Array1::zeros(3),
                 b_mat: dense_only,
@@ -18578,8 +18575,7 @@ mod tests {
                     dim_hint: 3,
                 })),
                 ld_s: 0.0,
-            },
-        ];
+            }];
         let pair_refs: Vec<&HyperCoordPair> = pairs.iter().collect();
 
         let batched = compute_base_h2_traces(&hop, &pair_refs, Some(&kernel), None);
@@ -18897,8 +18893,7 @@ mod tests {
         ];
 
         let batched = penalty_subspace_reduce_drifts_batched(&kernel, &drifts);
-        let serial = vec![
-            kernel.reduce(&dense),
+        let serial = [kernel.reduce(&dense),
             kernel.reduce_operator(&DenseMatrixHyperOperator {
                 matrix: op_matrix.clone(),
             }),
@@ -18906,10 +18901,9 @@ mod tests {
                 dim_hint: 3,
                 dense: Some(composite_dense),
                 operators: vec![Arc::new(DenseMatrixHyperOperator { matrix: op_matrix })],
-            }),
-        ];
+            })];
 
-        for (_idx, (batched_mat, serial_mat)) in batched.iter().zip(serial.iter()).enumerate() {
+        for (batched_mat, serial_mat) in batched.iter().zip(serial.iter()) {
             for row in 0..batched_mat.nrows() {
                 for col in 0..batched_mat.ncols() {
                     assert_relative_eq!(
@@ -21775,7 +21769,7 @@ mod tests {
 
         // --- (a) FD of projected-logdet cost via reml_laml_evaluate value-only ---
         let delta = 1e-4;
-        let mut fd_grad = vec![0.0_f64; 2];
+        let mut fd_grad = [0.0_f64; 2];
         for j in 0..2 {
             let mut rp = rho.clone();
             rp[j] += delta;

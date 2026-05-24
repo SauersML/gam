@@ -1630,7 +1630,7 @@ mod tests {
         let p = 2;
         let x = Array2::from_shape_vec((n, p), vec![1.0, 0.5, 0.8, -0.3, 0.2, 1.1]).unwrap();
         // H = X'WX + I (simple regularisation).
-        let w = vec![1.0, 2.0, 0.5];
+        let w = [1.0, 2.0, 0.5];
         let mut h = Array2::<f64>::eye(p);
         for i in 0..n {
             for r in 0..p {

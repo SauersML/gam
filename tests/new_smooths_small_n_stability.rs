@@ -110,7 +110,7 @@ fn periodic_1d_small_n_stable() {
     for n in [20usize, 50, 100] {
         let data = make_1d_periodic(n, 7);
         let probes: Vec<Vec<f64>> = (0..10).map(|i| vec![TAU * (i as f64) / 9.0, 0.0]).collect();
-        let formula = format!("y ~ s(t, periodic=true, period=6.283185307179586)");
+        let formula = "y ~ s(t, periodic=true, period=6.283185307179586)".to_string();
         match try_fit_predict(&formula, &data, 2, &probes) {
             Ok(_) => eprintln!("[smallN] periodic n={n}: OK"),
             Err(e) => {

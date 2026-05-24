@@ -6773,7 +6773,7 @@ mod estimate_policy_tests {
         // `Array1<f64>` uses ndarray's own (versioned-sequence) serde format,
         // not a bare JSON array, so round-trip the drifted value through
         // serde_json to honour that schema while still corrupting the data.
-        payload["beta"] = serde_json::to_value(&Array1::from(vec![9.0_f64, 8.0_f64]))
+        payload["beta"] = serde_json::to_value(Array1::from(vec![9.0_f64, 8.0_f64]))
             .expect("serialize drifted beta");
         let decoded: UnifiedFitResult =
             serde_json::from_value(payload).expect("deserialize corrupted fit");

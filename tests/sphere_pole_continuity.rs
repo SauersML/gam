@@ -77,7 +77,7 @@ fn assert_pole_invariance(formula: &str, tol: f64) {
     let data = make_dataset(9, 18); // 9 × 18 = 162 samples
     // 12 longitudes at the north pole — all must give the same y.
     let lons: Vec<f64> = (0..12).map(|j| -180.0 + 30.0 * j as f64).collect();
-    let lats: Vec<f64> = std::iter::repeat(90.0).take(lons.len()).collect();
+    let lats: Vec<f64> = std::iter::repeat_n(90.0, lons.len()).collect();
     let pred = predict(formula, &data, &lats, &lons);
     let max = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let min = pred.iter().cloned().fold(f64::INFINITY, f64::min);

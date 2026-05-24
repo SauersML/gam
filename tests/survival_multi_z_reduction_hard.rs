@@ -257,7 +257,7 @@ fn block_diagonal_independence_with_zero_slopes_in_block_b() {
         }
         let slopes_a: Vec<f64> = (0..ka).map(|_| rng.range(-1.0, 1.0)).collect();
         let mut slopes = slopes_a.clone();
-        slopes.extend(std::iter::repeat(0.0).take(kb));
+        slopes.extend(std::iter::repeat_n(0.0, kb));
         let z_a: Vec<f64> = (0..ka).map(|_| rng.normal()).collect();
         let z_b: Vec<f64> = (0..kb).map(|_| rng.normal()).collect();
         let mut z = z_a.clone();

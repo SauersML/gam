@@ -11596,7 +11596,7 @@ mod low_rank_weight_pirls_tests {
         for i in 0..5 {
             w[[i, i]] = d[i];
         }
-        w = w + &u.dot(&v.t());
+        w += &u.dot(&v.t());
         let want = xdense.t().dot(&w.dot(&y));
         let diff: f64 = got
             .iter()
@@ -12218,7 +12218,7 @@ mod tests {
         let offset = Array1::zeros(5);
         let rho = Array1::<f64>::zeros(1);
         let covariate_se = array![0.9, 0.7, 0.8, 0.6, 0.75];
-        let rs = vec![array![[1.0]]];
+        let rs = [array![[1.0]]];
         let canonical: Vec<crate::construction::CanonicalPenalty> = rs
             .iter()
             .map(|r| {
@@ -12432,7 +12432,7 @@ mod tests {
         let w = Array1::ones(y.len());
         let offset = Array1::zeros(y.len());
         let rho = array![0.0];
-        let rs = vec![array![[0.0]]];
+        let rs = [array![[0.0]]];
         let canonical: Vec<crate::construction::CanonicalPenalty> = rs
             .iter()
             .map(|r| {
@@ -12508,7 +12508,7 @@ mod tests {
         let w = Array1::ones(4);
         let offset = Array1::zeros(4);
         let rho = array![0.0];
-        let rs = vec![array![[1.0]]];
+        let rs = [array![[1.0]]];
         let canonical: Vec<crate::construction::CanonicalPenalty> = rs
             .iter()
             .map(|r| {
@@ -13721,7 +13721,7 @@ mod root_cause_tests {
         let offset = Array1::zeros(n);
         let rho = array![0.0]; // log(lambda) = 0, so lambda = 1
         // Penalty on the second coefficient only (leave intercept unpenalized).
-        let rs = vec![array![[0.0, 0.0], [0.0, 1.0]]];
+        let rs = [array![[0.0, 0.0], [0.0, 1.0]]];
         let canonical: Vec<crate::construction::CanonicalPenalty> = rs
             .iter()
             .map(|r| {
@@ -13804,7 +13804,7 @@ mod root_cause_tests {
         let w = Array1::ones(n);
         let offset = Array1::zeros(n);
         let rho = array![0.0];
-        let rs = vec![array![[0.0, 0.0], [0.0, 1.0]]];
+        let rs = [array![[0.0, 0.0], [0.0, 1.0]]];
         let canonical: Vec<crate::construction::CanonicalPenalty> = rs
             .iter()
             .map(|r| {

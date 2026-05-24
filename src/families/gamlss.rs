@@ -23265,12 +23265,10 @@ mod tests {
             );
         }
 
-        let directions = vec![
-            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+        let directions = [Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
             Array1::from_vec(vec![0.0, 0.0, 0.0, 1.0, 0.0]),
             Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
-            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05, -0.31]),
-        ];
+            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05, -0.31])];
         for (k, v) in directions.iter().enumerate() {
             assert_eq!(v.len(), p);
             let want = dense.dot(v);
@@ -23428,11 +23426,9 @@ mod tests {
             .expect("dH operator call")
             .expect("dH operator present");
 
-        let probes = vec![
-            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+        let probes = [Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
             Array1::from_vec(vec![0.0, 1.0, 0.0, 0.0, 0.0]),
-            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
-        ];
+            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15])];
         for (k, w) in probes.iter().enumerate() {
             assert_eq!(w.len(), p);
             let want = dense_dh.dot(w);
@@ -23482,12 +23478,10 @@ mod tests {
             );
         }
 
-        let directions = vec![
-            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+        let directions = [Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
             Array1::from_vec(vec![0.0, 0.0, 0.0, 1.0, 0.0]),
             Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
-            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05, -0.31]),
-        ];
+            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05, -0.31])];
         for (k, v) in directions.iter().enumerate() {
             assert_eq!(v.len(), p);
             let want = dense.dot(v);
@@ -23710,11 +23704,9 @@ mod tests {
             .expect("dH operator call")
             .expect("dH operator present");
 
-        let probes = vec![
-            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+        let probes = [Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
             Array1::from_vec(vec![0.0, 1.0, 0.0, 0.0, 0.0]),
-            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
-        ];
+            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15])];
         for (k, w) in probes.iter().enumerate() {
             assert_eq!(w.len(), p);
             let want = dense_dh.dot(w);
@@ -23754,11 +23746,9 @@ mod tests {
             .expect("d2H operator call")
             .expect("d2H operator present");
 
-        let probes = vec![
-            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+        let probes = [Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
             Array1::from_vec(vec![0.0, 1.0, 0.0, 0.0, 0.0]),
-            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
-        ];
+            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15])];
         for (k, w) in probes.iter().enumerate() {
             let want = dense_d2h.dot(w);
             let got = d2h_op.mul_vec(w);
@@ -24003,11 +23993,9 @@ mod tests {
             .expect("d2H op call")
             .expect("d2H op present");
 
-        let probes = vec![
-            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+        let probes = [Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
             Array1::from_vec(vec![0.0, 1.0, 0.0, 0.0, 0.0]),
-            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
-        ];
+            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15])];
         for (k, w) in probes.iter().enumerate() {
             let want = dense_d2h.dot(w);
             let got = d2h_op.mul_vec(w);
@@ -24296,8 +24284,7 @@ mod tests {
             .expect("dH op call")
             .expect("dH op present");
 
-        let probes = vec![
-            Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
+        let probes = [Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == states[0].beta.len() { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| {
                 if i == states[0].beta.len() + states[1].beta.len() {
@@ -24306,8 +24293,7 @@ mod tests {
                     0.0
                 }
             }),
-            Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).sin()),
-        ];
+            Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).sin())];
         for (k, w) in probes.iter().enumerate() {
             let want = dense_dh.dot(w);
             let got = dh_op.mul_vec(w);
@@ -24413,12 +24399,10 @@ mod tests {
 
         let pt = states[0].beta.len();
         let pls = states[1].beta.len();
-        let probes = vec![
-            Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
+        let probes = [Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == pt { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == pt + pls { 1.0 } else { 0.0 }),
-            Array1::from_shape_fn(p, |i| 0.07 * ((i + 3) as f64).cos()),
-        ];
+            Array1::from_shape_fn(p, |i| 0.07 * ((i + 3) as f64).cos())];
         for (k, w) in probes.iter().enumerate() {
             let want = dense_d2h.dot(w);
             let got = d2h_op.mul_vec(w);
@@ -24599,12 +24583,10 @@ mod tests {
             .expect("workspace build")
             .expect("workspace present");
 
-        let directions = vec![
-            Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
+        let directions = [Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == p_mu { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == p_mu + p_ls { 1.0 } else { 0.0 }),
-            Array1::from_shape_fn(p, |i| 0.1 * ((i + 1) as f64).sin()),
-        ];
+            Array1::from_shape_fn(p, |i| 0.1 * ((i + 1) as f64).sin())];
         for (k, v) in directions.iter().enumerate() {
             let want = dense.dot(v);
             let got = workspace
@@ -24751,12 +24733,10 @@ mod tests {
 
         let pmu = states[0].beta.len();
         let pls = states[1].beta.len();
-        let probes = vec![
-            Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
+        let probes = [Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == pmu { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == pmu + pls { 1.0 } else { 0.0 }),
-            Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).cos()),
-        ];
+            Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).cos())];
         for (k, w) in probes.iter().enumerate() {
             let want = dense_dh.dot(w);
             let got = dh_op.mul_vec(w);
@@ -24862,12 +24842,10 @@ mod tests {
 
         let pmu = states[0].beta.len();
         let pls = states[1].beta.len();
-        let probes = vec![
-            Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
+        let probes = [Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == pmu { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == pmu + pls { 1.0 } else { 0.0 }),
-            Array1::from_shape_fn(p, |i| 0.07 * ((i + 3) as f64).cos()),
-        ];
+            Array1::from_shape_fn(p, |i| 0.07 * ((i + 3) as f64).cos())];
         for (k, w) in probes.iter().enumerate() {
             let want = dense_d2h.dot(w);
             let got = d2h_op.mul_vec(w);
@@ -27454,7 +27432,7 @@ mod tests {
         for i in 0..total {
             for j in i..total {
                 let (_, _, _, _, _, _, _, d3) =
-                    third_partial_derivative_vec(&g, &vars, i, j, total);
+                    third_partial_derivative_vec(g, &vars, i, j, total);
                 ad[[i, j]] = d3;
                 if i != j {
                     ad[[j, i]] = d3;
@@ -28927,26 +28905,23 @@ mod tests {
             beta: Array1::zeros(0),
             eta: extreme_eta,
         }]);
-        match eval_result {
-            Ok(eval) => match &eval.blockworking_sets[0] {
-                crate::families::custom_family::BlockWorkingSet::Diagonal {
-                    working_response,
-                    working_weights,
-                } => {
-                    let all_finite = working_response.iter().all(|v| v.is_finite())
-                        && working_weights.iter().all(|v| v.is_finite())
-                        && eval.log_likelihood.is_finite();
-                    assert!(
-                        all_finite,
-                        "Poisson evaluate should produce finite outputs for all eta, \
-                             but got non-finite values: ll={}, z={:?}, w={:?}",
-                        eval.log_likelihood, working_response, working_weights
-                    );
-                }
-                _ => panic!("expected Diagonal block"),
-            },
-            Err(_) => {}
-        }
+        if let Ok(eval) = eval_result { match &eval.blockworking_sets[0] {
+            crate::families::custom_family::BlockWorkingSet::Diagonal {
+                working_response,
+                working_weights,
+            } => {
+                let all_finite = working_response.iter().all(|v| v.is_finite())
+                    && working_weights.iter().all(|v| v.is_finite())
+                    && eval.log_likelihood.is_finite();
+                assert!(
+                    all_finite,
+                    "Poisson evaluate should produce finite outputs for all eta, \
+                         but got non-finite values: ll={}, z={:?}, w={:?}",
+                    eval.log_likelihood, working_response, working_weights
+                );
+            }
+            _ => panic!("expected Diagonal block"),
+        } }
     }
 
     /// The batched outer-gradient override on `BinomialLocationScaleFamily`
