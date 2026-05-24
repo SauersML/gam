@@ -86,6 +86,7 @@ pub enum RadialInputKernel {
 impl RadialInputKernel {
     /// Project onto the internal `RadialScalarKind` enum so the existing
     /// radial-jet routines can be reused verbatim.
+    #[cfg(test)]
     fn into_scalar_kind(&self) -> RadialScalarKind {
         match self {
             RadialInputKernel::Matern { length_scale, nu } => RadialScalarKind::Matern {
