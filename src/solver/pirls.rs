@@ -11504,7 +11504,7 @@ pub fn latent_predict_and_apply_ift_warm_start(
             let clamped = latent_apply_ift_warm_start(latent, &delta_t, max_row_delta);
             (clamped, true)
         }
-        LatentIftOutcome::Noop { .. } => (0, false),
+        LatentIftOutcome::Noop => (0, false),
     }
 }
 
