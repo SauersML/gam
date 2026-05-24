@@ -900,7 +900,7 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
         .wiggle_options
         .ok_or_else(|| "standard wiggle workflow requires blockwise wiggle options".to_string())?;
     let wiggle_link_kind =
-        resolved_wiggle_inverse_link(request.family, &result.fit, &wiggle.link_kind)?;
+        resolved_wiggle_inverse_link(&request.family, &result.fit, &wiggle.link_kind)?;
     let selected_wiggle_basis = select_binomial_mean_link_wiggle_basis_from_pilot(
         &result.design,
         &result.fit,
