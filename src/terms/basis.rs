@@ -5,8 +5,9 @@ use crate::faer_ndarray::{
 use crate::linalg::utils::KahanSum;
 use crate::matrix::{
     ChunkedKernelDesignOperator, CoefficientTransformOperator, DenseDesignOperator, DesignMatrix,
-    LinearOperator, MatrixMaterializationError,
+    LinearOperator,
 };
+use crate::resource::MatrixMaterializationError;
 use crate::probability::{
     binomial_coefficient_f64 as binomial_f64,
     stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg,
