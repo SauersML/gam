@@ -7519,7 +7519,6 @@ fn spatial_basiswarning_family_and_cols(term: &SmoothTermSpec) -> Option<(&'stat
         SmoothBasisSpec::Matern { feature_cols, .. } => Some(("matern", feature_cols)),
         SmoothBasisSpec::Duchon { feature_cols, .. } => Some(("duchon", feature_cols)),
         SmoothBasisSpec::BSpline1D { .. }
-        | SmoothBasisSpec::Pca { .. }
         | SmoothBasisSpec::TensorBSpline { .. }
         | SmoothBasisSpec::FactorSmooth { .. }
         | SmoothBasisSpec::BySmooth { .. } => None,
@@ -7661,7 +7660,16 @@ fn collect_linear_smooth_overlapwarnings(
 }
 
 fn smooth_basiswarning_family_rank(term: &SmoothTermSpec) -> u8 {
-    term.basis.family_rank()
+    match &term.basis {
+        SmoothBasisSpec::BSpline1D { .. } => 0,
+        SmoothBasisSpec::TensorBSpline { .. } => 1,
+        SmoothBasisSpec::ThinPlate { .. } => 2,
+        SmoothBasisSpec::Sphere { .. } => 3,
+        SmoothBasisSpec::Matern { .. } => 4,
+        SmoothBasisSpec::Duchon { .. } => 5,
+        SmoothBasisSpec::FactorSmooth { .. } => 6,
+        SmoothBasisSpec::BySmooth { .. } => 7,
+    }
 }
 
 fn compare_smooth_warning_priority(
