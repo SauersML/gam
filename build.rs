@@ -141,8 +141,11 @@ fn main() {
     // Underscore-prefixed function parameter names. `_name: T` silences the
     // unused-parameter warning by hiding it from the lint rather than fixing
     // it. Use the parameter, restructure the API so it isn't passed, or
-    // delete the param. Bare `_` placeholders are allowed (rare; arguably
-    // legitimate). Build.rs is exempt.
+    // delete the param. Bare `_: T` is banned identically — it is the same
+    // act ("rename to silence the warning") with the name collapsed to a
+    // single underscore, and is the language-idiomatic third form of the
+    // `let _ = name;` / `hint::black_box(name);` dodge family. Build.rs is
+    // exempt.
     let mut underscore_fn_arg_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_underscore_fn_args(
         &manifest_dir,
@@ -2705,7 +2708,7 @@ fn scan_for_underscore_fn_args(
                 if !rest.starts_with(':') {
                     continue;
                 }
-                if name.starts_with('_') && name.len() >= 2 {
+                if name.starts_with('_') {
                     // Compute the byte offset of the parameter NAME (not the
                     // leading whitespace/attribute/mut prefix) so the line
                     // mapping points to the underscore-prefixed identifier
