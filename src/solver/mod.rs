@@ -10,6 +10,7 @@ pub mod pirls;
 pub mod protocol;
 pub mod riemannian;
 pub mod seeding;
+pub mod topology_selector;
 pub mod visualizer;
 pub(crate) mod workflow;
 pub mod latent_inner;
@@ -20,4 +21,8 @@ pub use evidence::{
     hessian_log_det_from_hvp, laplace_evidence, select_topology, EvidenceHvpLogDet,
     EvidenceIftGradientTerms, EvidenceLogDetSource, SelectedTopology, TopologyCandidate,
     TopologyKind, TopologyScoreScale, TopologySelectOptions,
+};
+pub use topology_selector::{
+    AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoRankedFit, TopologyAutoSelector,
+    TopologyAutoSelectorResult, select_topology_with_fit, tk_normalized_score,
 };

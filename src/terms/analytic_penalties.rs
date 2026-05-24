@@ -1450,23 +1450,27 @@ impl SoftmaxAssignmentSparsityPenalty {
 
     fn softmax_row(&self, row: &[f64]) -> Vec<f64> {
         let inv_tau = 1.0 / self.temperature;
-        let mut max_scaled = f64::NEG_INFINITY;
-        for &v in row {
-            max_scaled = max_scaled.max(v * inv_tau);
+        let mut max_logit = f64::NEG_INFINITY;
+        for (idx, &v) in row.iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "SoftmaxAssignmentSparsityPenalty: non-finite logit at atom {idx}: {v}"
+            );
+            max_logit = max_logit.max(v);
         }
         let mut out = vec![0.0; self.k_atoms];
         let mut sum = 0.0;
         for i in 0..self.k_atoms {
-            let v = (row[i] * inv_tau - max_scaled).exp();
+            let v = ((row[i] - max_logit) * inv_tau).exp();
             out[i] = v;
             sum += v;
         }
-        if sum == 0.0 || !sum.is_finite() {
-            out.fill(1.0 / self.k_atoms as f64);
-        } else {
-            for v in out.iter_mut() {
-                *v /= sum;
-            }
+        assert!(
+            sum.is_finite() && sum > 0.0,
+            "SoftmaxAssignmentSparsityPenalty: non-finite softmax normalizer"
+        );
+        for v in out.iter_mut() {
+            *v /= sum;
         }
         out
     }

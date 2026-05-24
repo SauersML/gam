@@ -137,6 +137,7 @@ struct PyFitConfig {
     penalty_block_gamma_priors: Option<serde_json::Value>,
     latents: Option<serde_json::Value>,
     penalties: Option<serde_json::Value>,
+    topology_auto_selector: Option<serde_json::Value>,
 
     // Frailty (only consumed by survival families today). Mirrors the CLI
     // names: --frailty-kind, --frailty-sd, --hazard-loading.
@@ -230,6 +231,8 @@ struct SummaryPayload {
     reml_score: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     null_space_logdet: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    null_dim: Option<f64>,
     iterations: usize,
     edf_total: Option<f64>,
     lambdas: Vec<f64>,
@@ -4610,38 +4613,6 @@ fn analytic_penalty_value_for_targets(
     Ok(value)
 }
 
-fn analytic_penalty_value_for_sae_manifold(
-    registry: &AnalyticPenaltyRegistry,
-    logits: ArrayView2<'_, f64>,
-    coords: &[LatentCoordValues],
-) -> Result<f64, String> {
-    let logits_flat = Array1::from_iter(logits.iter().copied());
-    let coord_flat = if coords.len() == 1 {
-        Some(coords[0].as_flat().to_owned())
-    } else {
-        None
-    };
-    let rho = Array1::<f64>::zeros(registry.total_rho_count());
-    let mut value = 0.0_f64;
-    for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(registry.rho_layout()) {
-        if matches!(tier, PenaltyTier::Rho) {
-            continue;
-        }
-        let rho_local = rho.slice(s![rho_slice]);
-        let target = match penalty {
-            AnalyticPenaltyKind::IBPAssignment(_)
-            | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_) => logits_flat.view(),
-            _ => coord_flat.as_ref().ok_or_else(|| {
-                format!(
-                    "analytic penalty {name:?} targets SAE coordinates; multi-atom coordinate penalties require an explicit atom target"
-                )
-            })?.view(),
-        };
-        value += penalty.value(target, rho_local);
-    }
-    Ok(value)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn gaussian_reml_fit_latent_impl(
     t_flat: ArrayView1<'_, f64>,
@@ -5025,6 +4996,11 @@ fn sae_manifold_fit_ibp<'py>(
         analytic_penalties.as_ref(),
     )
     .map_err(py_value_error)?;
+    if max_iter != 1 {
+        return Err(py_value_error(
+            "sae_manifold_fit_ibp accepts exactly one Newton step per basis snapshot; the Python driver refreshes Phi and dPhi/dt between calls".to_string(),
+        ));
+    }
     if initial_logits.as_array().dim() != (n_obs, k_atoms) {
         return Err(py_value_error(format!(
             "initial_logits must be ({n_obs}, {k_atoms}); got {:?}",
@@ -5148,23 +5124,24 @@ fn sae_manifold_fit_ibp<'py>(
         .iter()
         .map(|&d| Array1::<f64>::zeros(d))
         .collect();
-    let rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard);
+    let mut rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard);
     let loss = term
-        .run_joint_fit_arrow_schur(
+        .run_single_external_basis_refresh_step_arrow_schur(
             z_view,
-            &rho,
-            max_iter,
+            &mut rho,
+            Some(&registry),
             learning_rate,
             ridge_ext_coord,
             ridge_beta,
         )
         .map_err(py_value_error)?;
-    let analytic_score =
-        analytic_penalty_value_for_sae_manifold(&registry, term.assignment.logits.view(), &term.assignment.coords)
-            .map_err(py_value_error)?;
 
     let assignments = term.assignment.assignments();
     let fitted = term.fitted();
+    let log_ard_py = PyList::empty(py);
+    for atom_log_ard in &rho.log_ard {
+        log_ard_py.append(atom_log_ard.clone().into_pyarray(py))?;
+    }
     let atoms_py = PyList::empty(py);
     for atom_idx in 0..k_atoms {
         let atom = &term.atoms[atom_idx];
@@ -5187,11 +5164,13 @@ fn sae_manifold_fit_ibp<'py>(
     let out = PyDict::new(py);
     out.set_item("atoms", atoms_py)?;
     out.set_item("assignments_z", assignments.into_pyarray(py))?;
+    out.set_item("logits", term.assignment.logits.clone().into_pyarray(py))?;
     out.set_item("atom_active_mask", active_mask)?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
-    out.set_item("reml_score", loss.evidence_proxy() - analytic_score)?;
+    out.set_item("reml_score", loss.evidence_proxy())?;
     out.set_item("log_alpha", alpha.ln() + if learnable_alpha { rho.log_lambda_sparse } else { 0.0 })?;
     out.set_item("log_lambda_smooth", rho.log_lambda_smooth)?;
+    out.set_item("log_ard", log_ard_py)?;
     out.set_item("assignment_prior", "ibp_map")?;
     Ok(out.unbind())
 }
@@ -10130,6 +10109,7 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         deviance: fit.deviance,
         reml_score: fit.reml_score,
         null_space_logdet: fit.artifacts.null_space_logdet,
+        null_dim: fit.artifacts.null_space_dim.map(|dim| dim as f64),
         iterations: fit.outer_iterations,
         edf_total: fit.edf_total(),
         lambdas: fit.lambdas.to_vec(),
@@ -11159,6 +11139,11 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
     )?;
     fit_config.latents = py_config.latents;
     fit_config.analytic_penalties = analytic_penalties;
+    fit_config.topology_auto_selector = py_config
+        .topology_auto_selector
+        .as_ref()
+        .map(gam::solver::topology_selector::TopologyAutoSelector::from_json)
+        .transpose()?;
     fit_config.family = normalize_optional_family(py_config.family);
     fit_config.offset_column = py_config.offset;
     fit_config.weight_column = py_config.weights;
