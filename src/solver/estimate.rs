@@ -2508,6 +2508,10 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         self.reml_state.compute_cost(&rho)
     }
 
+}
+
+#[cfg(test)]
+impl<'a> ExternalJointHyperEvaluator<'a> {
     /// DEBUG ONLY: run PIRLS at `theta` (cost-only path) and return the dense
     /// effective Hessian `H_total = X' W_F X + S_λ + ridge I` in the
     /// transformed basis. This is the same matrix the analytic operator
@@ -4929,39 +4933,6 @@ impl UnifiedFitResult {
             inner_cycles,
         })
     }
-    pub fn new_for_test_unchecked(parts: UnifiedFitResultParts) -> Self {
-        let beta = flatten_block_betas(&parts.blocks);
-        Self {
-            blocks: parts.blocks,
-            log_lambdas: parts.log_lambdas,
-            lambdas: parts.lambdas,
-            likelihood_family: parts.likelihood_family,
-            likelihood_scale: parts.likelihood_scale,
-            log_likelihood_normalization: parts.log_likelihood_normalization,
-            log_likelihood: parts.log_likelihood,
-            deviance: parts.deviance,
-            reml_score: parts.reml_score,
-            stable_penalty_term: parts.stable_penalty_term,
-            penalized_objective: parts.penalized_objective,
-            outer_iterations: parts.outer_iterations,
-            outer_converged: parts.outer_converged,
-            outer_gradient_norm: parts.outer_gradient_norm,
-            standard_deviation: parts.standard_deviation,
-            covariance_conditional: parts.covariance_conditional,
-            covariance_corrected: parts.covariance_corrected,
-            inference: parts.inference,
-            fitted_link: parts.fitted_link,
-            geometry: parts.geometry,
-            block_states: parts.block_states,
-            beta,
-            pirls_status: parts.pirls_status,
-            max_abs_eta: parts.max_abs_eta,
-            constraint_kkt: parts.constraint_kkt,
-            artifacts: parts.artifacts,
-            inner_cycles: parts.inner_cycles,
-        }
-    }
-
     pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {
         let expected_beta = flatten_block_betas(&self.blocks);
         if !array1_values_equal(&self.beta, &expected_beta) {
@@ -4999,6 +4970,42 @@ impl UnifiedFitResult {
             inner_cycles: self.inner_cycles,
         })
         .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+impl UnifiedFitResult {
+    pub fn new_for_test_unchecked(parts: UnifiedFitResultParts) -> Self {
+        let beta = flatten_block_betas(&parts.blocks);
+        Self {
+            blocks: parts.blocks,
+            log_lambdas: parts.log_lambdas,
+            lambdas: parts.lambdas,
+            likelihood_family: parts.likelihood_family,
+            likelihood_scale: parts.likelihood_scale,
+            log_likelihood_normalization: parts.log_likelihood_normalization,
+            log_likelihood: parts.log_likelihood,
+            deviance: parts.deviance,
+            reml_score: parts.reml_score,
+            stable_penalty_term: parts.stable_penalty_term,
+            penalized_objective: parts.penalized_objective,
+            outer_iterations: parts.outer_iterations,
+            outer_converged: parts.outer_converged,
+            outer_gradient_norm: parts.outer_gradient_norm,
+            standard_deviation: parts.standard_deviation,
+            covariance_conditional: parts.covariance_conditional,
+            covariance_corrected: parts.covariance_corrected,
+            inference: parts.inference,
+            fitted_link: parts.fitted_link,
+            geometry: parts.geometry,
+            block_states: parts.block_states,
+            beta,
+            pirls_status: parts.pirls_status,
+            max_abs_eta: parts.max_abs_eta,
+            constraint_kkt: parts.constraint_kkt,
+            artifacts: parts.artifacts,
+            inner_cycles: parts.inner_cycles,
+        }
     }
 }
 
@@ -5636,25 +5643,6 @@ pub fn compute_continuous_smoothness_order(
         kappa2: Some(kappa2),
         status,
     }
-}
-
-fn try_compute_continuous_smoothness_order(
-    lambda_tilde: &[f64],
-    normalization_scale: &[f64],
-    eps: f64,
-) -> Option<ContinuousSmoothnessOrder> {
-    if lambda_tilde.len() != 3 || normalization_scale.len() != 3 {
-        return None;
-    }
-    Some(compute_continuous_smoothness_order(
-        [lambda_tilde[0], lambda_tilde[1], lambda_tilde[2]],
-        [
-            normalization_scale[0],
-            normalization_scale[1],
-            normalization_scale[2],
-        ],
-        eps,
-    ))
 }
 
 fn significance_stars(p: Option<f64>) -> &'static str {
@@ -7378,6 +7366,25 @@ mod estimate_policy_tests {
 #[cfg(test)]
 mod continuous_order_tests {
     use super::*;
+
+    fn try_compute_continuous_smoothness_order(
+        lambda_tilde: &[f64],
+        normalization_scale: &[f64],
+        eps: f64,
+    ) -> Option<ContinuousSmoothnessOrder> {
+        if lambda_tilde.len() != 3 || normalization_scale.len() != 3 {
+            return None;
+        }
+        Some(compute_continuous_smoothness_order(
+            [lambda_tilde[0], lambda_tilde[1], lambda_tilde[2]],
+            [
+                normalization_scale[0],
+                normalization_scale[1],
+                normalization_scale[2],
+            ],
+            eps,
+        ))
+    }
 
     #[test]
     fn continuous_order_formula_matches_closed_form() {
