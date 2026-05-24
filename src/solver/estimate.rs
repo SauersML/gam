@@ -1844,11 +1844,52 @@ fn resolve_external_family(
         )));
     }
 
-    let glm_family = glm_likelihood_family_from_spec(family).map_err(|msg| {
-        EstimationError::InvalidInput(format!(
-            "optimize_external_design requires a GLM family; {msg}"
-        ))
-    })?;
+    let glm_family = match (&family.response, &family.link) {
+        (ResponseFamily::Gaussian, _) => GlmLikelihoodFamily::GaussianIdentity,
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+            GlmLikelihoodFamily::BinomialLogit
+        }
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+            GlmLikelihoodFamily::BinomialProbit
+        }
+        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog))
+        | (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
+            GlmLikelihoodFamily::BinomialCLogLog
+        }
+        (ResponseFamily::Binomial, InverseLink::Sas(_)) => GlmLikelihoodFamily::BinomialSas,
+        (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
+            GlmLikelihoodFamily::BinomialBetaLogistic
+        }
+        (ResponseFamily::Binomial, InverseLink::Mixture(_)) => GlmLikelihoodFamily::BinomialMixture,
+        (ResponseFamily::Binomial, _) => {
+            return Err(EstimationError::InvalidInput(
+                "optimize_external_design requires a GLM family; unsupported (binomial, link) combination"
+                    .to_string(),
+            ));
+        }
+        (ResponseFamily::Poisson, _) => GlmLikelihoodFamily::PoissonLog,
+        (ResponseFamily::Tweedie { p }, _) => {
+            if crate::types::is_valid_tweedie_power(*p) {
+                GlmLikelihoodFamily::Tweedie { p: *p }
+            } else {
+                return Err(EstimationError::InvalidInput(
+                    "optimize_external_design requires a GLM family; Tweedie variance power must be finite and strictly between 1 and 2; use PoissonLog or GammaLog for boundary cases"
+                        .to_string(),
+                ));
+            }
+        }
+        (ResponseFamily::NegativeBinomial { theta }, _) => {
+            GlmLikelihoodFamily::NegativeBinomial { theta: *theta }
+        }
+        (ResponseFamily::Beta { phi }, _) => GlmLikelihoodFamily::BetaLogit { phi: *phi },
+        (ResponseFamily::Gamma, _) => GlmLikelihoodFamily::GammaLog,
+        (ResponseFamily::RoystonParmar, _) => {
+            return Err(EstimationError::InvalidInput(
+                "optimize_external_design requires a GLM family; RoystonParmar is survival-specific and not a GLM likelihood"
+                    .to_string(),
+            ));
+        }
+    };
     Ok((
         GlmLikelihoodSpec::canonical(glm_family),
         firth_override.unwrap_or(false) && supports_firth,
@@ -1880,53 +1921,6 @@ fn likelihood_spec_pretty_name(spec: &crate::types::LikelihoodSpec) -> &'static 
         (ResponseFamily::Gamma, _) => "Gamma Log",
         (ResponseFamily::RoystonParmar, _) => "Royston Parmar",
         (ResponseFamily::Binomial, _) => "Binomial",
-    }
-}
-
-/// Map a `LikelihoodSpec` to the engine-internal `GlmLikelihoodFamily`. Returns
-/// `Err` for survival families and invalid Tweedie powers (per
-/// `is_valid_tweedie_power`).
-fn glm_likelihood_family_from_spec(
-    spec: &crate::types::LikelihoodSpec,
-) -> Result<GlmLikelihoodFamily, &'static str> {
-    match (&spec.response, &spec.link) {
-        (ResponseFamily::Gaussian, _) => Ok(GlmLikelihoodFamily::GaussianIdentity),
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
-            Ok(GlmLikelihoodFamily::BinomialLogit)
-        }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
-            Ok(GlmLikelihoodFamily::BinomialProbit)
-        }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog))
-        | (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
-            Ok(GlmLikelihoodFamily::BinomialCLogLog)
-        }
-        (ResponseFamily::Binomial, InverseLink::Sas(_)) => Ok(GlmLikelihoodFamily::BinomialSas),
-        (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
-            Ok(GlmLikelihoodFamily::BinomialBetaLogistic)
-        }
-        (ResponseFamily::Binomial, InverseLink::Mixture(_)) => {
-            Ok(GlmLikelihoodFamily::BinomialMixture)
-        }
-        (ResponseFamily::Binomial, _) => Err("unsupported (binomial, link) combination"),
-        (ResponseFamily::Poisson, _) => Ok(GlmLikelihoodFamily::PoissonLog),
-        (ResponseFamily::Tweedie { p }, _) => {
-            if crate::types::is_valid_tweedie_power(*p) {
-                Ok(GlmLikelihoodFamily::Tweedie { p: *p })
-            } else {
-                Err(
-                    "Tweedie variance power must be finite and strictly between 1 and 2; use PoissonLog or GammaLog for boundary cases",
-                )
-            }
-        }
-        (ResponseFamily::NegativeBinomial { theta }, _) => {
-            Ok(GlmLikelihoodFamily::NegativeBinomial { theta: *theta })
-        }
-        (ResponseFamily::Beta { phi }, _) => Ok(GlmLikelihoodFamily::BetaLogit { phi: *phi }),
-        (ResponseFamily::Gamma, _) => Ok(GlmLikelihoodFamily::GammaLog),
-        (ResponseFamily::RoystonParmar, _) => {
-            Err("RoystonParmar is survival-specific and not a GLM likelihood")
-        }
     }
 }
 
