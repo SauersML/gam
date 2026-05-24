@@ -168,6 +168,21 @@ fn main() {
         &mut noop_self_consuming_offenders,
     );
 
+    // Stub-body function ban: multi-parameter (>= 2 args, counting `self`)
+    // functions whose entire body is a single trivial sentinel expression —
+    // `None`, `Ok(())`, `Err("...".into())`, `Default::default()` /
+    // `T::default()`, `Vec::new()` / `vec![]`, `HashMap::new()` / similar
+    // no-arg standard constructors, `Array{1,2,3}::zeros(...)`,
+    // `Some(Default::default())`, the empty tuple `()`, or a bare literal.
+    // The no-arg threshold lifts the rule above legitimate constructors
+    // (`fn empty() -> Vec<u32> { Vec::new() }` has no inputs to compute
+    // from). For a >=2-arg fn the sentinel body means the parameters are
+    // never used — the canonical "delete the real impl to make the compile
+    // error go away" shape. Test scope and bodyless trait declarations are
+    // exempt; build.rs is exempt.
+    let mut stub_body_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_stub_function_bodies(&manifest_dir, &manifest_dir, &mut stub_body_offenders);
+
     // Dodge-named function identifiers. Names like `discard_*`, `swallow_*`,
     // `silence_*`, `*_for_fixed_lambda`, `*_no_op_*`, `*_intentionally_unused`,
     // `placeholder_for_*`, `dummy_for_*` announce lint-laundering intent in
@@ -407,6 +422,18 @@ fn main() {
                 "no-op self-consuming fn (empty body with by-value `self` — likely a `let _` launderer; use or restructure the return value)"
                     .to_string(),
             rows: noop_self_consuming_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !stub_body_offenders.is_empty() {
+        sections.push(Section {
+            title:
+                "stub function body (multi-arg function whose entire body is a sentinel like None/Ok(())/Default::default() — implement the function, return a real Result/Error, or delete the function)"
+                    .to_string(),
+            rows: stub_body_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
                 .collect(),
@@ -3448,6 +3475,407 @@ fn fn_body_is_empty(stripped_lines: &[String], open: usize, close: usize) -> boo
         return false;
     };
     close_line[..close_brace].chars().all(char::is_whitespace)
+}
+
+/// Flags multi-arg functions whose entire body is a single trivial sentinel
+/// expression — the canonical "stub the impl to make the compile error
+/// vanish" shape. A no-arg constructor that legitimately returns a
+/// default-shaped value (e.g. `fn empty() -> Vec<u32> { Vec::new() }`) has
+/// nothing to compute from its inputs because it has no inputs; the
+/// threshold is therefore >= 2 parameters (counting `self` toward the
+/// total). Trait-method declarations without bodies are skipped via the
+/// depth-0 `;`-before-`{` check; test files / `#[cfg(test)]` regions are
+/// exempt via `compute_test_mask`. Build.rs is exempt.
+fn scan_for_stub_function_bodies(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        if !content.contains("fn ") {
+            return;
+        }
+        let mask = compute_test_mask(content, rel);
+        let lines: Vec<&str> = content.lines().collect();
+        let stripped_lines = strip_file_lines(content);
+        let n = lines.len();
+        let mut i = 0usize;
+        while i < n {
+            let s = stripped_lines
+                .get(i)
+                .map(String::as_str)
+                .unwrap_or(lines[i]);
+            if !line_has_keyword(s, "fn") {
+                i += 1;
+                continue;
+            }
+            if mask.get(i).copied().unwrap_or(false) {
+                i += 1;
+                continue;
+            }
+            // `find_fn_body_at` walks forward to the first balanced `{...}`
+            // regardless of whether a `;` ended the signature earlier (trait
+            // method declaration). Guard explicitly: if the signature ends
+            // with `;` at depth 0 before any `{`, this is a declaration
+            // only — skip.
+            if fn_signature_ends_with_semicolon(&stripped_lines, i) {
+                i += 1;
+                continue;
+            }
+            let Some((sig, (open, close))) = find_fn_body_at(&lines, i) else {
+                i += 1;
+                continue;
+            };
+            let Some(param_count) = signature_param_count(&sig) else {
+                i = close + 1;
+                continue;
+            };
+            if param_count < 2 {
+                i = close + 1;
+                continue;
+            }
+            let body = extract_body_text(&stripped_lines, open, close);
+            if body_is_trivial_sentinel(&body) {
+                offenders.push((rel.to_path_buf(), i + 1, lines[i].to_string()));
+            }
+            i = close + 1;
+        }
+    });
+}
+
+/// True when the line starting at `fn_line` has a `;` at brace/paren/bracket
+/// depth zero BEFORE any `{`. That spells a trait-method declaration
+/// (`fn foo(...);`) rather than a definition, and the caller must skip it
+/// — otherwise `find_fn_body_at` will attach the body of the next function
+/// to this declaration and produce a spurious offender.
+fn fn_signature_ends_with_semicolon(stripped_lines: &[String], fn_line: usize) -> bool {
+    let mut paren: i32 = 0;
+    let mut brack: i32 = 0;
+    let mut angle: i32 = 0;
+    let limit = (fn_line + 64).min(stripped_lines.len());
+    for line in &stripped_lines[fn_line..limit] {
+        for &b in line.as_bytes() {
+            match b {
+                b'(' => paren += 1,
+                b')' => paren -= 1,
+                b'[' => brack += 1,
+                b']' => brack -= 1,
+                b'<' => angle += 1,
+                b'>' => {
+                    if angle > 0 {
+                        angle -= 1;
+                    }
+                }
+                b';' if paren == 0 && brack == 0 => return true,
+                b'{' if paren == 0 && brack == 0 => return false,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// Count parameters in a normalized fn signature. Returns `None` if the
+/// signature is malformed. `self` / `&self` / `&mut self` / `mut self`
+/// count as one parameter, matching the natural reading of arity.
+fn signature_param_count(sig: &str) -> Option<usize> {
+    let bytes = sig.as_bytes();
+    let mut i = 0usize;
+    let mut fn_pos: Option<usize> = None;
+    while i + 2 <= bytes.len() {
+        if &bytes[i..i + 2] == b"fn"
+            && (i == 0 || !is_ident_byte(bytes[i - 1]))
+            && (i + 2 == bytes.len() || !is_ident_byte(bytes[i + 2]))
+        {
+            fn_pos = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let fp = fn_pos?;
+    let mut j = fp + 2;
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j >= bytes.len() || !(bytes[j].is_ascii_alphabetic() || bytes[j] == b'_') {
+        return None;
+    }
+    while j < bytes.len() && is_ident_byte(bytes[j]) {
+        j += 1;
+    }
+    let mut k = j;
+    while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    // Skip generic param list `<...>` if present.
+    if k < bytes.len() && bytes[k] == b'<' {
+        let mut ang: i32 = 0;
+        while k < bytes.len() {
+            match bytes[k] {
+                b'<' => ang += 1,
+                b'>' => {
+                    ang -= 1;
+                    if ang == 0 {
+                        k += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            k += 1;
+        }
+    }
+    // Find the param-list `(` at angle-depth 0.
+    let mut ang2: i32 = 0;
+    let mut open: Option<usize> = None;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'<' => ang2 += 1,
+            b'>' => {
+                if ang2 > 0 {
+                    ang2 -= 1;
+                }
+            }
+            b'(' if ang2 == 0 => {
+                open = Some(k);
+                break;
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    let op = open?;
+    let inner_start = op + 1;
+    let end_rel = find_matching_paren(&bytes[inner_start..])?;
+    let inner = &sig[inner_start..inner_start + end_rel];
+    if inner.trim().is_empty() {
+        return Some(0);
+    }
+    let mut count = 0usize;
+    let mut a: i32 = 0;
+    let mut p: i32 = 0;
+    let mut br: i32 = 0;
+    let mut seen_nonws = false;
+    for &c in inner.as_bytes() {
+        match c {
+            b'<' => {
+                a += 1;
+                seen_nonws = true;
+            }
+            b'>' => {
+                if a > 0 {
+                    a -= 1;
+                }
+                seen_nonws = true;
+            }
+            b'(' => {
+                p += 1;
+                seen_nonws = true;
+            }
+            b')' => {
+                p -= 1;
+                seen_nonws = true;
+            }
+            b'[' => {
+                br += 1;
+                seen_nonws = true;
+            }
+            b']' => {
+                br -= 1;
+                seen_nonws = true;
+            }
+            b',' if a == 0 && p == 0 && br == 0 => {
+                if seen_nonws {
+                    count += 1;
+                }
+                seen_nonws = false;
+            }
+            x if !(x as char).is_whitespace() => seen_nonws = true,
+            _ => {}
+        }
+    }
+    if seen_nonws {
+        count += 1;
+    }
+    Some(count)
+}
+
+/// Read the body between the `{` on `open` and the `}` on `close` from
+/// pre-stripped (string/comment-free) source lines and return the trimmed
+/// joined text, single-space separated.
+fn extract_body_text(stripped_lines: &[String], open: usize, close: usize) -> String {
+    if open > close || close >= stripped_lines.len() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for k in open..=close {
+        let line = stripped_lines[k].as_str();
+        let segment: &str = if k == open && k == close {
+            let after_open = line.find('{').map(|p| p + 1).unwrap_or(line.len());
+            let before_close = line[after_open..]
+                .rfind('}')
+                .map(|p| after_open + p)
+                .unwrap_or(line.len());
+            &line[after_open..before_close]
+        } else if k == open {
+            let after_open = line.find('{').map(|p| p + 1).unwrap_or(line.len());
+            &line[after_open..]
+        } else if k == close {
+            let before_close = line.rfind('}').unwrap_or(line.len());
+            &line[..before_close]
+        } else {
+            line
+        };
+        let t = segment.trim();
+        if !t.is_empty() {
+            parts.push(t.to_string());
+        }
+    }
+    parts.join(" ").trim().to_string()
+}
+
+/// True iff `body` is exactly one of the trivial sentinel expressions a
+/// real implementation would never reduce to: `None`, `Ok(())`,
+/// `Err("...".into())`, `Default::default()` / `T::default()`, `Vec::new()`,
+/// `vec![]`, `HashMap::new()` / `BTreeMap::new()` / similar no-arg standard
+/// constructors, `Array1::zeros(0)` / `Array2::zeros((0, 0))` /
+/// `Array3::zeros((0, 0, 0))`, `Some(Default::default())` /
+/// `Some(T::default())`, the empty tuple `()`, or a bare numeric / bool /
+/// empty-string literal. A trailing `;` is tolerated.
+fn body_is_trivial_sentinel(body: &str) -> bool {
+    let mut s = body.trim();
+    if let Some(stripped) = s.strip_suffix(';') {
+        s = stripped.trim_end();
+    }
+    if s.is_empty() {
+        // Empty body is handled by `scan_for_noop_self_consuming_fns`; don't
+        // double-report here.
+        return false;
+    }
+    if matches!(
+        s,
+        "None"
+            | "Ok(())"
+            | "Default::default()"
+            | "Vec::new()"
+            | "vec![]"
+            | "()"
+            | "HashMap::new()"
+            | "BTreeMap::new()"
+            | "HashSet::new()"
+            | "BTreeSet::new()"
+            | "VecDeque::new()"
+            | "String::new()"
+            | "Some(Default::default())"
+            | "true"
+            | "false"
+            | "\"\""
+    ) {
+        return true;
+    }
+    if let Some(prefix) = s.strip_suffix("::default()")
+        && is_path_like(prefix)
+    {
+        return true;
+    }
+    if let Some(inner) = s.strip_prefix("Some(").and_then(|r| r.strip_suffix(')'))
+        && let Some(prefix) = inner.strip_suffix("::default()")
+        && is_path_like(prefix)
+    {
+        return true;
+    }
+    if let Some(inner) = s.strip_prefix("Err(").and_then(|r| r.strip_suffix(')'))
+        && err_arg_is_string_literal(inner.trim())
+    {
+        return true;
+    }
+    if matches!(
+        s,
+        "Array1::zeros(0)" | "Array2::zeros((0, 0))" | "Array3::zeros((0, 0, 0))"
+    ) {
+        return true;
+    }
+    if is_bare_numeric_literal(s) {
+        return true;
+    }
+    false
+}
+
+/// True when `s` looks like a path expression: identifier chars, plus `::`,
+/// `<`, `>`, `,`, whitespace. Catches `Foo`, `path::Foo`, `Foo<T>`,
+/// `crate::path::Bar`.
+fn is_path_like(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    s.bytes()
+        .all(|b| is_ident_byte(b) || b == b':' || b == b'<' || b == b'>' || b == b',' || b == b' ')
+}
+
+/// True when `arg` is a string-literal expression possibly followed by an
+/// `.into()` / `.to_string()` / `.to_owned()` conversion. After
+/// `strip_strings_and_comments` the literal contents are blanked to
+/// spaces but the surrounding quotes survive.
+fn err_arg_is_string_literal(arg: &str) -> bool {
+    let bytes = arg.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'"' {
+        return false;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            i += 1;
+            let tail = arg[i..].trim();
+            return tail.is_empty()
+                || tail == ".into()"
+                || tail == ".to_string()"
+                || tail == ".to_owned()";
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True when `s` is a bare numeric literal: integer or float, optionally
+/// suffixed (`0`, `0.0`, `0_usize`, `1u8`, `2.5f64`).
+fn is_bare_numeric_literal(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut i = 0usize;
+    let mut saw_digit = false;
+    while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
+        if bytes[i].is_ascii_digit() {
+            saw_digit = true;
+        }
+        i += 1;
+    }
+    if !saw_digit {
+        return false;
+    }
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'_') {
+            i += 1;
+        }
+    }
+    while i < bytes.len() && is_ident_byte(bytes[i]) {
+        i += 1;
+    }
+    i == bytes.len()
 }
 
 /// Cross-file scanner: items defined in `src/` whose identifier is named by
