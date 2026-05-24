@@ -2498,14 +2498,6 @@ pub fn fit_from_formula(
     fit_model(mat.request)
 }
 
-fn validate_gpu_policy_for_materialize(config: &FitConfig) -> Result<(), String> {
-    if config.gpu_policy != crate::gpu::GpuPolicy::Force {
-        return Ok(());
-    }
-    let shape = crate::gpu::GpuWorkloadShape::dense_pirls(usize::MAX / 2, 2, false);
-    crate::gpu::plan_workload(config.gpu_policy, &shape).map(|_| ())
-}
-
 /// Parse a formula, resolve it against a dataset, and produce a ready-to-fit `FitRequest`.
 pub fn materialize<'a>(
     formula: &str,
