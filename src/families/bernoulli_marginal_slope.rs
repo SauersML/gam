@@ -6189,35 +6189,36 @@ impl BernoulliMarginalSlopeFamily {
         if dir.iter().all(|value| *value == 0.0) {
             return Ok(Array2::<f64>::zeros((r, r)));
         }
-        let basis_dirs = (0..r)
-            .map(|idx| Self::unit_primary_direction(r, idx))
-            .collect::<Vec<_>>();
-        let dir_owned = dir.to_owned();
-        let mut out = Array2::<f64>::zeros((r, r));
-        for u in 0..r {
-            for v in u..r {
-                let directions = vec![
-                    basis_dirs[u].clone(),
-                    basis_dirs[v].clone(),
-                    dir_owned.clone(),
-                ];
-                let jet = self.empirical_flex_neglog_jet(
-                    row,
-                    primary,
-                    q,
-                    b,
-                    beta_h,
-                    beta_w,
-                    row_ctx,
-                    &directions,
-                    grid,
-                )?;
-                let val = jet.coeff(1 | 2 | 4);
-                out[[u, v]] = val;
-                out[[v, u]] = val;
+        EMPIRICAL_FLEX_DIRECTION_SCRATCH.with(|scratch_cell| -> Result<Array2<f64>, String> {
+            let mut scratch = scratch_cell.borrow_mut();
+            scratch.ensure_dim(r);
+            let (basis_u, basis_v) = (&mut scratch.basis_u, &mut scratch.basis_v);
+            let mut out = Array2::<f64>::zeros((r, r));
+            for u in 0..r {
+                basis_u.fill(0.0);
+                basis_u[u] = 1.0;
+                for v in u..r {
+                    basis_v.fill(0.0);
+                    basis_v[v] = 1.0;
+                    let directions = [basis_u.view(), basis_v.view(), dir.view()];
+                    let jet = self.empirical_flex_neglog_jet(
+                        row,
+                        primary,
+                        q,
+                        b,
+                        beta_h,
+                        beta_w,
+                        row_ctx,
+                        &directions,
+                        grid,
+                    )?;
+                    let val = jet.coeff(1 | 2 | 4);
+                    out[[u, v]] = val;
+                    out[[v, u]] = val;
+                }
             }
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 
     fn empirical_flex_row_fourth_contracted_recompute(
@@ -6247,37 +6248,41 @@ impl BernoulliMarginalSlopeFamily {
         if dir_u.iter().all(|value| *value == 0.0) || dir_v.iter().all(|value| *value == 0.0) {
             return Ok(Array2::<f64>::zeros((r, r)));
         }
-        let basis_dirs = (0..r)
-            .map(|idx| Self::unit_primary_direction(r, idx))
-            .collect::<Vec<_>>();
-        let dir_u_owned = dir_u.to_owned();
-        let dir_v_owned = dir_v.to_owned();
-        let mut out = Array2::<f64>::zeros((r, r));
-        for p in 0..r {
-            for q_idx in p..r {
-                let directions = vec![
-                    basis_dirs[p].clone(),
-                    basis_dirs[q_idx].clone(),
-                    dir_u_owned.clone(),
-                    dir_v_owned.clone(),
-                ];
-                let jet = self.empirical_flex_neglog_jet(
-                    row,
-                    primary,
-                    q,
-                    b,
-                    beta_h,
-                    beta_w,
-                    row_ctx,
-                    &directions,
-                    grid,
-                )?;
-                let val = jet.coeff(1 | 2 | 4 | 8);
-                out[[p, q_idx]] = val;
-                out[[q_idx, p]] = val;
+        EMPIRICAL_FLEX_DIRECTION_SCRATCH.with(|scratch_cell| -> Result<Array2<f64>, String> {
+            let mut scratch = scratch_cell.borrow_mut();
+            scratch.ensure_dim(r);
+            let (basis_p, basis_q) = (&mut scratch.basis_u, &mut scratch.basis_v);
+            let mut out = Array2::<f64>::zeros((r, r));
+            for p in 0..r {
+                basis_p.fill(0.0);
+                basis_p[p] = 1.0;
+                for q_idx in p..r {
+                    basis_q.fill(0.0);
+                    basis_q[q_idx] = 1.0;
+                    let directions = [
+                        basis_p.view(),
+                        basis_q.view(),
+                        dir_u.view(),
+                        dir_v.view(),
+                    ];
+                    let jet = self.empirical_flex_neglog_jet(
+                        row,
+                        primary,
+                        q,
+                        b,
+                        beta_h,
+                        beta_w,
+                        row_ctx,
+                        &directions,
+                        grid,
+                    )?;
+                    let val = jet.coeff(1 | 2 | 4 | 8);
+                    out[[p, q_idx]] = val;
+                    out[[q_idx, p]] = val;
+                }
             }
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 
     fn rigid_row_kernel_eval(

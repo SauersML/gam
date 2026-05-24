@@ -3955,6 +3955,338 @@ impl AnalyticPenalty for ParametricAuxConditionalPriorPenalty {
 }
 
 // ---------------------------------------------------------------------------
+// SCAD / MCP concave sparsity penalty
+// ---------------------------------------------------------------------------
+
+/// Concave alternative to smoothed-L¹ sparsity with less bias on large signals.
+/// MCP (Zhang 2010) and SCAD (Fan-Li 2001) keep strong shrinkage near zero but
+/// flatten the gradient on large coefficients; `gamma` controls concavity, and
+/// `gamma -> infinity` recovers the L¹ limit. Fan-Li recommend `gamma = 3.7`
+/// for SCAD.
+///
+/// `SparsityPenalty` uses Huber-smoothed L¹, `Σ_j sqrt(t_j² + ε²)`, whose
+/// gradient magnitude stays constant outside the Huber region. That constant
+/// pull over-shrinks moderate true signals. SCAD/MCP flatten the gradient for
+/// large coefficients, which gives less-biased estimates while still shrinking
+/// near-zero noise; paired with AuxConditional/Parametric priors, the aux prior
+/// anchors which axes are active and this penalty fits their magnitudes without
+/// L¹'s constant pull.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PenaltyConcavity {
+    Mcp,
+    Scad,
+}
+
+/// Element-wise SCAD/MCP family penalty on a row-major latent block.
+#[derive(Debug, Clone)]
+pub struct ScadMcpPenalty {
+    pub target: PsiSlice,
+    /// Base strength. If `learnable_weight` is true, the resolved strength is
+    /// `weight * exp(rho[rho_index])`; otherwise it is fixed at `weight`.
+    pub weight: f64,
+    /// Number of rows in the row-major matrix-valued latent block.
+    pub n_eff: usize,
+    /// Concavity parameter. Larger values approach smoothed L¹.
+    pub gamma: f64,
+    pub smoothing_eps: f64,
+    pub variant: PenaltyConcavity,
+    pub learnable_weight: bool,
+    pub rho_index: usize,
+}
+
+impl ScadMcpPenalty {
+    #[must_use = "build error must be handled"]
+    pub fn new(
+        target: PsiSlice,
+        weight: f64,
+        n_eff: usize,
+        gamma: f64,
+        smoothing_eps: f64,
+        variant: PenaltyConcavity,
+        learnable_weight: bool,
+    ) -> Result<Self, String> {
+        if target.is_empty() {
+            return Err("ScadMcpPenalty::new requires a non-empty target".to_string());
+        }
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!(
+                "ScadMcpPenalty::new requires finite weight > 0, got {weight}"
+            ));
+        }
+        if n_eff == 0 {
+            return Err("ScadMcpPenalty::new requires n_eff > 0".to_string());
+        }
+        if target.len() % n_eff != 0 {
+            return Err(format!(
+                "ScadMcpPenalty::new target length {} is not divisible by n_eff {}",
+                target.len(),
+                n_eff
+            ));
+        }
+        if let Some(expected_dim) = target.latent_dim {
+            let expected = n_eff.checked_mul(expected_dim).ok_or_else(|| {
+                "ScadMcpPenalty::new target shape overflows usize".to_string()
+            })?;
+            if expected != target.len() {
+                return Err(format!(
+                    "ScadMcpPenalty::new target length {} does not match n_eff {} × latent_dim {}",
+                    target.len(),
+                    n_eff,
+                    expected_dim
+                ));
+            }
+        }
+        if !(gamma.is_finite() && gamma > 1.0) {
+            return Err(format!(
+                "ScadMcpPenalty::new requires finite gamma > 1, got {gamma}"
+            ));
+        }
+        if !(smoothing_eps.is_finite() && smoothing_eps > 0.0) {
+            return Err(format!(
+                "ScadMcpPenalty::new requires finite smoothing_eps > 0, got {smoothing_eps}"
+            ));
+        }
+        Ok(Self {
+            target,
+            weight,
+            n_eff,
+            gamma,
+            smoothing_eps,
+            variant,
+            learnable_weight,
+            rho_index: 0,
+        })
+    }
+
+    fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
+        if self.learnable_weight {
+            self.weight * rho[self.rho_index].exp()
+        } else {
+            self.weight
+        }
+    }
+
+    fn smooth_abs(&self, t: f64) -> f64 {
+        (t * t + self.smoothing_eps * self.smoothing_eps).sqrt()
+    }
+
+    fn value_one(&self, t: f64, weight: f64) -> f64 {
+        let r = self.smooth_abs(t);
+        match self.variant {
+            PenaltyConcavity::Mcp => {
+                let cutoff = self.gamma * weight;
+                if r <= cutoff {
+                    weight * r - (r * r - self.smoothing_eps * self.smoothing_eps) / (2.0 * self.gamma)
+                } else {
+                    0.5 * self.gamma * weight * weight
+                        + self.smoothing_eps * self.smoothing_eps / (2.0 * self.gamma)
+                }
+            }
+            PenaltyConcavity::Scad => {
+                let cutoff1 = weight;
+                let cutoff2 = self.gamma * weight;
+                if r <= cutoff1 {
+                    weight * r
+                } else if r <= cutoff2 {
+                    (-r * r + 2.0 * self.gamma * weight * r - weight * weight)
+                        / (2.0 * (self.gamma - 1.0))
+                } else {
+                    0.5 * (self.gamma + 1.0) * weight * weight
+                }
+            }
+        }
+    }
+
+    fn grad_one(&self, t: f64, weight: f64) -> f64 {
+        let r = self.smooth_abs(t);
+        match self.variant {
+            PenaltyConcavity::Mcp => {
+                if r <= self.gamma * weight {
+                    t * (weight / r - 1.0 / self.gamma)
+                } else {
+                    0.0
+                }
+            }
+            PenaltyConcavity::Scad => {
+                if r <= weight {
+                    weight * t / r
+                } else if r <= self.gamma * weight {
+                    (self.gamma * weight - r) * t / ((self.gamma - 1.0) * r)
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+
+    fn hess_one(&self, t: f64, weight: f64) -> f64 {
+        let r = self.smooth_abs(t);
+        let eps2 = self.smoothing_eps * self.smoothing_eps;
+        match self.variant {
+            PenaltyConcavity::Mcp => {
+                if r <= self.gamma * weight {
+                    weight * eps2 / (r * r * r) - 1.0 / self.gamma
+                } else {
+                    0.0
+                }
+            }
+            PenaltyConcavity::Scad => {
+                if r <= weight {
+                    weight * eps2 / (r * r * r)
+                } else if r <= self.gamma * weight {
+                    let p_prime = (self.gamma * weight - r) / (self.gamma - 1.0);
+                    p_prime * eps2 / (r * r * r)
+                        - t * t / ((self.gamma - 1.0) * r * r)
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+
+    fn grad_log_weight_one(&self, t: f64, weight: f64) -> f64 {
+        let r = self.smooth_abs(t);
+        let d_p_d_weight = match self.variant {
+            PenaltyConcavity::Mcp => {
+                if r <= self.gamma * weight {
+                    r
+                } else {
+                    self.gamma * weight
+                }
+            }
+            PenaltyConcavity::Scad => {
+                if r <= weight {
+                    r
+                } else if r <= self.gamma * weight {
+                    (self.gamma * r - weight) / (self.gamma - 1.0)
+                } else {
+                    (self.gamma + 1.0) * weight
+                }
+            }
+        };
+        weight * d_p_d_weight
+    }
+
+    pub fn diag_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let weight = self.resolved_weight(rho);
+        let mut out = Array1::<f64>::zeros(target.len());
+        for (i, &t) in target.iter().enumerate() {
+            out[i] = self.hess_one(t, weight);
+        }
+        out
+    }
+
+    pub fn log_det_plus_lambda_i(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        lambda: f64,
+    ) -> Result<f64, String> {
+        if !(lambda.is_finite() && lambda > 0.0) {
+            return Err(format!(
+                "ScadMcpPenalty::log_det_plus_lambda_i requires finite λ > 0; got {lambda}"
+            ));
+        }
+        let diag = self.diag_target(target, rho);
+        let mut sum = 0.0;
+        for &entry in diag.iter() {
+            let shifted = lambda + entry;
+            if !(shifted.is_finite() && shifted > 0.0) {
+                return Err(format!(
+                    "ScadMcpPenalty::log_det_plus_lambda_i non-positive shifted diagonal {shifted:.3e}"
+                ));
+            }
+            sum += shifted.ln();
+        }
+        Ok(sum)
+    }
+}
+
+impl AnalyticPenalty for ScadMcpPenalty {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Psi
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        let weight = self.resolved_weight(rho);
+        let mut acc = 0.0;
+        for &t in target.iter() {
+            acc += self.value_one(t, weight);
+        }
+        acc
+    }
+
+    fn grad_target(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        let weight = self.resolved_weight(rho);
+        let mut out = Array1::<f64>::zeros(target.len());
+        for (i, &t) in target.iter().enumerate() {
+            out[i] = self.grad_one(t, weight);
+        }
+        out
+    }
+
+    fn hessian_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        Some(self.diag_target(target, rho))
+    }
+
+    fn hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        debug_assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        if target.len() != v.len() {
+            return Array1::<f64>::zeros(target.len());
+        }
+        let diag = self.diag_target(target, rho);
+        let mut out = Array1::<f64>::zeros(v.len());
+        for i in 0..v.len() {
+            out[i] = diag[i] * v[i];
+        }
+        out
+    }
+
+    fn grad_rho(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        if !self.learnable_weight {
+            return Array1::<f64>::zeros(0);
+        }
+        let weight = self.resolved_weight(rho);
+        let mut grad = 0.0;
+        for &t in target.iter() {
+            grad += self.grad_log_weight_one(t, weight);
+        }
+        let mut out = Array1::<f64>::zeros(1);
+        out[self.rho_index] = grad;
+        out
+    }
+
+    fn rho_count(&self) -> usize {
+        usize::from(self.learnable_weight)
+    }
+
+    fn name(&self) -> &str {
+        "scad_mcp"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Orthogonality penalty
 // ---------------------------------------------------------------------------
 
@@ -4284,6 +4616,7 @@ pub enum AnalyticPenaltyKind {
     BlockSparsity(Arc<BlockSparsityPenalty>),
     AuxConditionalPrior(Arc<AuxConditionalPriorPenalty>),
     ParametricAuxConditionalPrior(Arc<ParametricAuxConditionalPriorPenalty>),
+    ScadMcp(Arc<ScadMcpPenalty>),
     Orthogonality(Arc<OrthogonalityPenalty>),
 }
 
@@ -4300,6 +4633,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::BlockSparsity(p) => p.tier(),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.tier(),
             AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.tier(),
+            AnalyticPenaltyKind::ScadMcp(p) => p.tier(),
             AnalyticPenaltyKind::Orthogonality(p) => p.tier(),
         }
     }
@@ -4316,6 +4650,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::BlockSparsity(p) => p.rho_count(),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.rho_count(),
             AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.rho_count(),
+            AnalyticPenaltyKind::ScadMcp(p) => p.rho_count(),
             AnalyticPenaltyKind::Orthogonality(p) => p.rho_count(),
         }
     }
@@ -4332,6 +4667,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::BlockSparsity(p) => p.name(),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.name(),
             AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.name(),
+            AnalyticPenaltyKind::ScadMcp(p) => p.name(),
             AnalyticPenaltyKind::Orthogonality(p) => p.name(),
         }
     }
@@ -4348,6 +4684,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::BlockSparsity(p) => p.value(target, rho),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.value(target, rho),
             AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.value(target, rho),
+            AnalyticPenaltyKind::ScadMcp(p) => p.value(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.value(target, rho),
         }
     }
@@ -4368,6 +4705,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::BlockSparsity(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.grad_target(target, rho),
+            AnalyticPenaltyKind::ScadMcp(p) => p.grad_target(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_target(target, rho),
         }
     }
@@ -4388,6 +4726,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::BlockSparsity(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.grad_rho(target, rho),
+            AnalyticPenaltyKind::ScadMcp(p) => p.grad_rho(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.grad_rho(target, rho),
         }
     }
@@ -4408,6 +4747,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::BlockSparsity(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.hessian_diag(target, rho),
+            AnalyticPenaltyKind::ScadMcp(p) => p.hessian_diag(target, rho),
             AnalyticPenaltyKind::Orthogonality(p) => p.hessian_diag(target, rho),
         }
     }
@@ -4436,6 +4776,7 @@ impl AnalyticPenaltyKind {
             AnalyticPenaltyKind::BlockSparsity(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::AuxConditionalPrior(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => p.hvp(target, rho, v),
+            AnalyticPenaltyKind::ScadMcp(p) => p.hvp(target, rho, v),
             AnalyticPenaltyKind::Orthogonality(p) => p.hvp(target, rho, v),
         }
     }
@@ -4582,6 +4923,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => {
                 p.diag_target(self.target.view(), self.rho.view())
             }
+            AnalyticPenaltyKind::ScadMcp(p) => {
+                p.diag_target(self.target.view(), self.rho.view())
+            }
             AnalyticPenaltyKind::IBPAssignment(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
                 .expect("IBP assignment diag"),
@@ -4666,6 +5010,9 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             }
             AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => {
                 p.log_det_plus_lambda_i(self.rho.view(), lambda)
+            }
+            AnalyticPenaltyKind::ScadMcp(p) => {
+                p.log_det_plus_lambda_i(self.target.view(), self.rho.view(), lambda)
             }
             AnalyticPenaltyKind::BlockSparsity(_)
                 if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>

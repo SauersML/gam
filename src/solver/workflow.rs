@@ -54,8 +54,8 @@ use crate::terms::latent_coord::{
 use crate::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, AuxConditionalPriorPenalty,
     BlockSparsityPenalty, DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty,
-    NuclearNormPenalty, OrthogonalityPenalty, PenaltyTier, PsiSlice,
-    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TotalVariationPenalty,
+    NuclearNormPenalty, OrthogonalityPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
+    ScadMcpPenalty, SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TotalVariationPenalty,
 };
 use crate::survival::PenaltyBlock;
 use crate::types::{
@@ -3226,6 +3226,44 @@ fn build_standard_latent_analytic_penalty_registry(
                     )),
                 }?;
                 registry.push(AnalyticPenaltyKind::Sparsity(Arc::new(penalty)));
+            }
+            "scad_mcp" => {
+                let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = analytic_descriptor_usize(descriptor, "n_eff", target.n)?;
+                let gamma = analytic_descriptor_f64(descriptor, "gamma", 3.7)?;
+                let smoothing_eps =
+                    analytic_descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
+                let variant = descriptor
+                    .get("variant")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("mcp")
+                    .to_ascii_lowercase()
+                    .replace('-', "_");
+                let variant = match variant.as_str() {
+                    "mcp" => PenaltyConcavity::Mcp,
+                    "scad" => PenaltyConcavity::Scad,
+                    other => {
+                        return Err(format!(
+                            "{context}.variant must be 'mcp' or 'scad'; got {other:?}"
+                        ));
+                    }
+                };
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                registry.push(AnalyticPenaltyKind::ScadMcp(Arc::new(
+                    ScadMcpPenalty::new(
+                        slice,
+                        weight,
+                        n_eff,
+                        gamma,
+                        smoothing_eps,
+                        variant,
+                        learnable,
+                    )
+                    .map_err(|err| format!("{context}: {err}"))?,
+                )));
             }
             "ibp_assignment" | "ibp_assignment_penalty" => {
                 let k_max = analytic_descriptor_usize(descriptor, "k_max", target.d)?;
