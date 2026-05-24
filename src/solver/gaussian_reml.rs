@@ -857,7 +857,8 @@ fn gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
             &mut grad_y,
             &mut grad_penalty,
             &mut grad_weights,
-        );
+        )
+        .lambda_adjoint();
     }
 
     if upstream_reml_score != 0.0 {
@@ -1142,6 +1143,18 @@ fn gaussian_reml_inverse_hessian_from_cache(
     Ok(inverse)
 }
 
+struct RidgeProfileVjp {
+    lambda_adjoint: f64,
+}
+
+impl RidgeProfileVjp {
+    fn lambda_adjoint(self) -> f64 {
+        self.lambda_adjoint
+    }
+
+    fn discard_lambda_adjoint_for_fixed_lambda(self) {}
+}
+
 fn add_ridge_profile_vjp(
     scale: f64,
     x: ArrayView2<'_, f64>,
@@ -1156,7 +1169,7 @@ fn add_ridge_profile_vjp(
     grad_y: &mut Array2<f64>,
     grad_penalty: &mut Array2<f64>,
     grad_weights: &mut Array1<f64>,
-) -> f64 {
+) -> RidgeProfileVjp {
     let m = dense_ab(inverse_hessian.view(), upstream_beta);
     let c = dense_ab(m.view(), beta.t());
     let c_sym = &c + &c.t();
@@ -1200,11 +1213,13 @@ fn add_ridge_profile_vjp(
             grad_penalty[[row, col]] -= scale * lambda * value;
         }
     }
-    -scale
-        * m.iter()
-            .zip(penalty_beta.iter())
-            .map(|(left, right)| left * right)
-            .sum::<f64>()
+    RidgeProfileVjp {
+        lambda_adjoint: -scale
+            * m.iter()
+                .zip(penalty_beta.iter())
+                .map(|(left, right)| left * right)
+                .sum::<f64>(),
+    }
 }
 
 fn add_reml_score_vjp(
@@ -1397,7 +1412,9 @@ fn add_reml_rho_gradient_vjp(
             grad_weights,
         );
     }
-    std::hint::black_box(add_ridge_profile_vjp(
+    // The implicit-root VJP holds lambda fixed inside this partial; only the
+    // data, penalty, and weight side effects from the ridge solve are needed.
+    add_ridge_profile_vjp(
         1.0,
         x,
         y,
@@ -1411,7 +1428,8 @@ fn add_reml_rho_gradient_vjp(
         grad_y,
         grad_penalty,
         grad_weights,
-    ));
+    )
+    .discard_lambda_adjoint_for_fixed_lambda();
 }
 
 fn add_rank_one_penalty_vjp(

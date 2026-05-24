@@ -63,7 +63,6 @@ pub fn fit_power_law(points: &[(f64, f64)]) -> Option<PowerLawFit> {
     })
 }
 
-
 pub fn report_power_law_full(
     tag: &str,
     points: &[(f64, f64)],
