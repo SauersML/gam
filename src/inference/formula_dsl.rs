@@ -369,6 +369,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_sphere_smooth_aliases() {
+        let parsed = parse_formula("y ~ sphere(lat, lon, degree=6)").expect("sphere formula");
+        let ParsedTerm::Smooth { vars, options, .. } = &parsed.terms[0] else {
+            panic!("expected smooth term");
+        };
+        assert_eq!(vars, &vec!["lat".to_string(), "lon".to_string()]);
+        assert_eq!(options.get("type").map(String::as_str), Some("sphere"));
+        assert_eq!(options.get("degree").map(String::as_str), Some("6"));
+
+        let err = parse_formula("y ~ sphere(lat)").expect_err("arity");
+        assert!(err.contains("expects exactly two variables"));
+    }
+
+    #[test]
     fn parses_function_callwithnamed_and_positional_args() {
         let call = parse_function_call("s(log(x + 1), type=\"duchon\", centers=12)").expect("call");
         assert_eq!(call.name, "s");
@@ -1723,6 +1737,20 @@ pub fn parse_term(raw: &str) -> Result<ParsedTerm, String> {
                         ),
                     }
                     .into());
+                }
+                options.insert("type".to_string(), "sphere".to_string());
+                return Ok(ParsedTerm::Smooth {
+                    label: raw.to_string(),
+                    vars,
+                    kind: SmoothKind::S,
+                    options,
+                });
+            }
+            "sphere" | "s2" | "sos" => {
+                if vars.len() != 2 {
+                    return Err(format!(
+                        "sphere()/s2()/sos() expects exactly two variables (lat, lon): {raw}"
+                    ));
                 }
                 options.insert("type".to_string(), "sphere".to_string());
                 return Ok(ParsedTerm::Smooth {
