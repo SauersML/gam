@@ -1118,3 +1118,363 @@ fn visit_files(root: &Path, dir: &Path, visitor: &mut dyn FnMut(&Path, &str)) {
         visitor(&rel, &content);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unimplemented-removal history audit.
+//
+// The lexical bans catch direct uses of `unimplemented!(` / `todo!(` /
+// `unreachable!(` in non-test code. They do NOT catch the more subtle cheat
+// of *deleting* a marker without writing real code in its place — e.g.
+// `fn foo() { unimplemented!(); }` becoming `fn foo() { Err(NotImpl) }`. To
+// catch that, we maintain a persistent ledger of every (file, fn-signature)
+// pair that currently holds at least one marker. On each build we diff the
+// ledger against the current scan: any pair that disappeared must now have a
+// substantive function body, otherwise the build fails.
+//
+// The ledger is a tab-separated, sorted, line-oriented file at the repo root
+// (`ban_history.txt`) so git merges resolve naturally as line-level diffs.
+// Build.rs rewrites the file on every run; humans should not hand-edit it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const HISTORY_LEDGER_FILENAME: &str = "ban_history.txt";
+
+/// The marker macros tracked by the audit. Same family as the lexical bans
+/// for `unimplemented!` / `todo!` / `unreachable!` — every one is a runtime
+/// "not done yet" panic dressed differently.
+const HISTORY_MARKERS: &[&str] = &["unimplemented!(", "todo!(", "unreachable!("];
+
+/// Macros that, if present anywhere in a function body, mean the body is
+/// "still a panic" — even if the original marker was syntactically removed.
+/// Includes the tracked markers themselves (catches "swap unimplemented for
+/// unreachable") plus bare `panic!(` (catches "swap for a generic panic").
+const HISTORY_BODY_REJECT_MACROS: &[&str] = &[
+    "unimplemented!(",
+    "todo!(",
+    "unreachable!(",
+    "panic!(",
+];
+
+/// Minimum number of substantive (non-blank, non-comment, non-pure-brace,
+/// non-panic) statement lines a function body must contain to count as
+/// "actually implemented" after marker removal. Trivial single-line returns
+/// (`Err(...)`, `Ok(())`, `default()`) fall below this threshold and are
+/// flagged — if a function legitimately has nothing to do, the call site
+/// should be deleted instead of leaving a stub.
+const HISTORY_MIN_SUBSTANTIVE_BODY_LINES: usize = 2;
+
+fn run_unimplemented_history_audit(
+    manifest_dir: &Path,
+    violations: &mut Vec<(PathBuf, usize, String, String)>,
+) {
+    let ledger_path = manifest_dir.join(HISTORY_LEDGER_FILENAME);
+    println!("cargo:rerun-if-changed={}", ledger_path.display());
+
+    // Step 1: scan the current tree. For each .rs file (non-test scope only)
+    // collect the (file, normalized-fn-signature) pairs that contain at least
+    // one history marker, along with the kinds of markers present.
+    let mut current: std::collections::BTreeMap<
+        (String, String),
+        (PathBuf, usize, Vec<String>),
+    > = std::collections::BTreeMap::new();
+    let mut file_contents: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+
+    visit_files(manifest_dir, manifest_dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        file_contents.insert(rel_str.clone(), content.to_string());
+
+        let lines: Vec<&str> = content.lines().collect();
+        let mask = compute_test_mask(content, rel);
+        for (idx, line) in lines.iter().enumerate() {
+            if mask.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let stripped = strip_strings_and_comments(line);
+            for &marker in HISTORY_MARKERS {
+                if !stripped.contains(marker) {
+                    continue;
+                }
+                if let Some((sig, (open, _close))) = find_enclosing_fn(&lines, idx) {
+                    let kind = marker.trim_end_matches('(').to_string();
+                    let entry = current
+                        .entry((rel_str.clone(), sig.clone()))
+                        .or_insert_with(|| (rel.to_path_buf(), open + 1, Vec::new()));
+                    if !entry.2.contains(&kind) {
+                        entry.2.push(kind);
+                    }
+                    break;
+                }
+            }
+        }
+    });
+
+    // Step 2: load the previous ledger (empty on first run).
+    let previous = load_history_ledger(&ledger_path);
+
+    // Step 3: build the next ledger from the current scan. Legitimately-
+    // removed entries are simply absent from the next ledger; flagged
+    // entries are carried forward so future builds re-check them.
+    let mut next_ledger: std::collections::BTreeMap<(String, String), Vec<String>> =
+        std::collections::BTreeMap::new();
+    for ((file, sig), (_, _, kinds)) in &current {
+        next_ledger.insert((file.clone(), sig.clone()), kinds.clone());
+    }
+
+    for ((file, sig), prev_kinds) in &previous {
+        if current.contains_key(&(file.clone(), sig.clone())) {
+            continue;
+        }
+        let state = match file_contents.get(file) {
+            None => HistoryBodyState::FnAbsent,
+            Some(c) => body_state_for_signature(c, sig),
+        };
+        match state {
+            HistoryBodyState::FnAbsent | HistoryBodyState::Substantive => {
+                // Pruned: legitimate removal (whole fn deleted, or body now
+                // substantive).
+            }
+            HistoryBodyState::Trivial {
+                fn_open_line,
+                snippet,
+            } => {
+                violations.push((
+                    PathBuf::from(file),
+                    fn_open_line + 1,
+                    sig.clone(),
+                    format!(
+                        "marker(s) [{}] removed but body still trivial / panic-shaped — first body line: {}",
+                        prev_kinds.join(","),
+                        snippet,
+                    ),
+                ));
+                // Keep entry alive so a real fix is required to clear it.
+                next_ledger.insert((file.clone(), sig.clone()), prev_kinds.clone());
+            }
+        }
+    }
+
+    // Step 4: write the next ledger if it differs from disk. Avoid spurious
+    // mtime churn on identical content.
+    save_history_ledger(&ledger_path, &next_ledger);
+}
+
+fn load_history_ledger(
+    path: &Path,
+) -> std::collections::BTreeMap<(String, String), Vec<String>> {
+    let mut out: std::collections::BTreeMap<(String, String), Vec<String>> =
+        std::collections::BTreeMap::new();
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return out,
+    };
+    for line in content.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.splitn(3, '\t').collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let file = parts[0].to_string();
+        let sig = parts[1].to_string();
+        let kinds: Vec<String> = parts[2]
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        out.insert((file, sig), kinds);
+    }
+    out
+}
+
+fn save_history_ledger(
+    path: &Path,
+    ledger: &std::collections::BTreeMap<(String, String), Vec<String>>,
+) {
+    let mut out = String::new();
+    out.push_str(
+        "# Persistent audit of `unimplemented!(` / `todo!(` / `unreachable!(`\n\
+         # sites. Auto-managed by build.rs — do NOT hand-edit. Each non-comment\n\
+         # line is tab-separated:\n\
+         #   <relative_path>\\t<normalized_fn_signature>\\t<comma_marker_kinds>\n\
+         # When an entry disappears from the source tree, build.rs inspects the\n\
+         # enclosing function's body. Trivial bodies (under a few code lines)\n\
+         # and bodies that still contain any panic-shape macro fail the build,\n\
+         # so deleting a `unimplemented!` without writing a real implementation\n\
+         # is caught. Legitimately-implemented removals auto-prune.\n\
+         #\n\
+         # Concurrent branches that both remove markers will produce additive\n\
+         # line-level diff conflicts that resolve by union — the next build\n\
+         # then re-validates each surviving entry.\n",
+    );
+    for ((file, sig), kinds) in ledger {
+        out.push_str(file);
+        out.push('\t');
+        out.push_str(sig);
+        out.push('\t');
+        out.push_str(&kinds.join(","));
+        out.push('\n');
+    }
+    if let Ok(existing) = fs::read_to_string(path) {
+        if existing == out {
+            return;
+        }
+    }
+    if fs::write(path, out).is_err() {
+        // Non-fatal: write failures (e.g. read-only checkout) leave the
+        // ledger stale rather than failing the build. Future runs retry.
+    }
+}
+
+enum HistoryBodyState {
+    FnAbsent,
+    Trivial {
+        fn_open_line: usize,
+        snippet: String,
+    },
+    Substantive,
+}
+
+/// Walk the file looking for a function whose normalized signature matches
+/// `target_sig`. Returns the body shape: absent, trivial, or substantive.
+/// "Substantive" requires at least `HISTORY_MIN_SUBSTANTIVE_BODY_LINES`
+/// non-blank, non-comment, non-pure-brace code lines AND no occurrence of
+/// any `HISTORY_BODY_REJECT_MACROS` macro in the body.
+fn body_state_for_signature(content: &str, target_sig: &str) -> HistoryBodyState {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let stripped = strip_strings_and_comments(lines[idx]);
+        if !line_has_keyword(&stripped, "fn") {
+            idx += 1;
+            continue;
+        }
+        if let Some((sig, (open, close))) = find_fn_body_at(&lines, idx) {
+            if sig == target_sig {
+                let mut code_lines = 0usize;
+                let mut first_snippet: Option<String> = None;
+                for j in open..=close {
+                    let raw = lines[j];
+                    let s = strip_strings_and_comments(raw);
+                    let t = s.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    if t.chars().all(|c| matches!(c, '{' | '}' | ' ')) {
+                        continue;
+                    }
+                    for &m in HISTORY_BODY_REJECT_MACROS {
+                        if s.contains(m) {
+                            return HistoryBodyState::Trivial {
+                                fn_open_line: open,
+                                snippet: raw
+                                    .trim()
+                                    .chars()
+                                    .take(120)
+                                    .collect::<String>(),
+                            };
+                        }
+                    }
+                    if first_snippet.is_none() {
+                        first_snippet =
+                            Some(raw.trim().chars().take(120).collect::<String>());
+                    }
+                    code_lines += 1;
+                }
+                if code_lines < HISTORY_MIN_SUBSTANTIVE_BODY_LINES {
+                    return HistoryBodyState::Trivial {
+                        fn_open_line: open,
+                        snippet: first_snippet
+                            .unwrap_or_else(|| "<empty body>".to_string()),
+                    };
+                }
+                return HistoryBodyState::Substantive;
+            }
+            idx = close + 1;
+            continue;
+        }
+        idx += 1;
+    }
+    HistoryBodyState::FnAbsent
+}
+
+/// Walk backward from `at_line` looking for the most recent line that bears
+/// a `fn` keyword AND whose resulting body braces enclose `at_line`. Returns
+/// `(normalized_signature, (body_open_line, body_close_line))`.
+fn find_enclosing_fn(
+    lines: &[&str],
+    at_line: usize,
+) -> Option<(String, (usize, usize))> {
+    let mut start = at_line + 1;
+    while start > 0 {
+        start -= 1;
+        let stripped = strip_strings_and_comments(lines[start]);
+        if !line_has_keyword(&stripped, "fn") {
+            continue;
+        }
+        if let Some((sig, (open, close))) = find_fn_body_at(lines, start) {
+            if open <= at_line && at_line <= close {
+                return Some((sig, (open, close)));
+            }
+        }
+    }
+    None
+}
+
+/// Starting at `fn_line` (a line containing the `fn` keyword), find the
+/// function body's opening `{` and matching `}`. Brace counting uses
+/// `strip_strings_and_comments` per line so braces inside string literals
+/// or `//` comments don't perturb depth. Block comments and raw strings
+/// are out of scope (same limitation as the other scanners). Returns the
+/// normalized signature text — everything from `fn_line` up to (and
+/// excluding) the body's opening `{`, whitespace-collapsed.
+fn find_fn_body_at(
+    lines: &[&str],
+    fn_line: usize,
+) -> Option<(String, (usize, usize))> {
+    let mut depth: i32 = 0;
+    let mut body_open: Option<usize> = None;
+    for j in fn_line..lines.len() {
+        let s = strip_strings_and_comments(lines[j]);
+        for b in s.bytes() {
+            match b {
+                b'{' => {
+                    depth += 1;
+                    if body_open.is_none() {
+                        body_open = Some(j);
+                    }
+                }
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(open) = body_open {
+                            let mut sig = String::new();
+                            for k in fn_line..=open {
+                                let ss = strip_strings_and_comments(lines[k]);
+                                let cut = if k == open {
+                                    ss.find('{').unwrap_or(ss.len())
+                                } else {
+                                    ss.len()
+                                };
+                                sig.push_str(&ss[..cut]);
+                                sig.push(' ');
+                            }
+                            let normalized: String =
+                                sig.split_whitespace().collect::<Vec<_>>().join(" ");
+                            return Some((normalized, (open, j)));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}

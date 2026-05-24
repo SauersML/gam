@@ -100,9 +100,8 @@ def latent_theta(result, fallback):
     if hasattr(result, "latent"):
         return np.asarray(result.latent("t"), dtype=float).reshape(len(fallback), -1)[:, 0]
     if isinstance(result, dict):
-        for key in ("latent", "t", "latent_t", "latent_values"):
-            if key in result:
-                return np.asarray(result[key], dtype=float).reshape(len(fallback), -1)[:, 0]
+        if "t" in result:
+            return np.asarray(result["t"], dtype=float).reshape(len(fallback), -1)[:, 0]
     return fallback
 
 

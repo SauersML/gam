@@ -37,13 +37,13 @@ class FitReport:
 
 def make_data() -> np.ndarray:
     rng = np.random.default_rng(SEED)
-    z = rng.standard_normal((N, TRUE_D))
-    z[:, 1] = 0.7 * z[:, 1] + 0.35 * np.sin(z[:, 0])
-    z -= z.mean(axis=0, keepdims=True)
-    z /= z.std(axis=0, keepdims=True)
+    t_true = rng.standard_normal((N, TRUE_D))
+    t_true[:, 1] = 0.7 * t_true[:, 1] + 0.35 * np.sin(t_true[:, 0])
+    t_true -= t_true.mean(axis=0, keepdims=True)
+    t_true /= t_true.std(axis=0, keepdims=True)
 
     base = np.zeros((N, D))
-    base[:, :TRUE_D] = z @ np.diag([2.2, 0.95])
+    base[:, :TRUE_D] = t_true @ np.diag([2.2, 0.95])
     q, _ = np.linalg.qr(rng.normal(size=(D, D)))
     scaled = base @ q.T
     ambient_scale = np.array([1.15, 0.82, 1.05, 0.91, 1.10, 0.96])

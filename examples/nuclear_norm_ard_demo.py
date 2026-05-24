@@ -52,11 +52,11 @@ def axes_kept(report: FitReport) -> int:
 
 def make_data() -> np.ndarray:
     rng = np.random.default_rng(SEED)
-    z = rng.standard_normal((N, TRUE_RANK))
-    z -= z.mean(axis=0, keepdims=True)
-    z /= z.std(axis=0, keepdims=True)
+    t_true = rng.standard_normal((N, TRUE_RANK))
+    t_true -= t_true.mean(axis=0, keepdims=True)
+    t_true /= t_true.std(axis=0, keepdims=True)
     latent = np.zeros((N, D))
-    latent[:, :TRUE_RANK] = z @ np.diag([3.0, 2.35, 1.80])
+    latent[:, :TRUE_RANK] = t_true @ np.diag([3.0, 2.35, 1.80])
     q_latent, _ = np.linalg.qr(rng.normal(size=(D, D)))
     latent = latent @ q_latent.T + 0.22 * rng.standard_normal((N, D))
     embed, _ = np.linalg.qr(rng.normal(size=(AMBIENT_D, D)))

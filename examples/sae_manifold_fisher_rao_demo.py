@@ -147,7 +147,7 @@ def active_counts(fit: Any) -> np.ndarray:
 
 
 def atom_topologies(fit: Any) -> list[str]:
-    """Infer Circle/Sphere/Plane from each atom's fitted LatentCoord values."""
+    """Infer Circle/Sphere/Plane from each atom's fitted LatentCoord coordinates."""
 
     out: list[str] = []
     assignments = np.asarray(fit.assignments, dtype=float)

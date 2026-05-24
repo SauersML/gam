@@ -24127,6 +24127,112 @@ mod tests {
     }
 
     #[test]
+    fn single_block_latent_coord_design_cache_invalidates_memo_on_outer_iter_advance() {
+        // Pins θ and re-evaluates after current_outer_iter() advances; the
+        // scheduled penalty weight at that θ has changed, so the memo must miss.
+        use crate::solver::estimate::reml::runtime::{
+            current_outer_iter, record_current_outer_iter_for_ift,
+        };
+        use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
+
+        let n = 16usize;
+        let latent_dim = 1usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            data[[i, 0]] = i as f64 / (n as f64 - 1.0);
+        }
+
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "s(x0)".to_string(),
+                basis: SmoothBasisSpec::BSpline1D {
+                    feature_col: 0,
+                    spec: BSplineBasisSpec {
+                        degree: 3,
+                        penalty_order: 2,
+                        knotspec: BSplineKnotSpec::Generate {
+                            data_range: (0.0, 1.0),
+                            num_internal_knots: 3,
+                        },
+                        double_penalty: false,
+                        identifiability: BSplineIdentifiability::WeightedSumToZero {
+                            weights: None,
+                        },
+                        boundary_condition: BSplineBoundaryCondition {
+                            left: BSplineEndpointCondition::None,
+                            right: BSplineEndpointCondition::None,
+                        },
+                    },
+                },
+                shape: ShapeConstraint::None,
+            }],
+        };
+        let design = build_term_collection_design(data.view(), &spec).expect("design");
+        let rho_dim = design.penalties.len();
+
+        let flat = Array1::<f64>::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
+        let latent_values = std::sync::Arc::new(LatentCoordValues::from_flat_with_manifold(
+            flat,
+            n,
+            latent_dim,
+            LatentIdMode::None,
+            LatentManifold::Euclidean,
+        ));
+        let latent = StandardLatentCoordConfig {
+            values: latent_values,
+            term_index: 0,
+            feature_cols: vec![0],
+            manifold: LatentManifold::Euclidean,
+            manifold_auto: false,
+            analytic_penalties: None,
+        };
+
+        let mut cache = SingleBlockLatentCoordDesignCache::new(
+            data.clone(),
+            spec.clone(),
+            design.clone(),
+            &latent,
+            rho_dim,
+        )
+        .expect("latent-coord cache");
+
+        // Seed θ + cached eval directly (skip `ensure_theta`'s latent rebuild;
+        // we only exercise the memo invalidation property). Same-module access.
+        let theta = Array1::<f64>::zeros(rho_dim + n * latent_dim);
+        cache.current_theta = Some(theta.clone());
+
+        let initial_iter = current_outer_iter();
+        let eval = (
+            1.25_f64,
+            Array1::<f64>::from_elem(theta.len(), 0.5),
+            crate::solver::outer_strategy::HessianResult::Analytic(Array2::<f64>::eye(
+                theta.len(),
+            )),
+        );
+        cache.store_eval(eval.clone());
+
+        let hit = cache
+            .memoized_eval(&theta)
+            .expect("memo should hit at the same outer iter");
+        assert!((hit.0 - eval.0).abs() <= 1e-12);
+        assert_eq!(cache.memoized_cost(&theta), Some(eval.0));
+
+        record_current_outer_iter_for_ift(initial_iter.wrapping_add(1));
+        assert!(
+            cache.memoized_eval(&theta).is_none(),
+            "memoized_eval returned a stale cached eval after current_outer_iter advanced"
+        );
+        assert!(
+            cache.memoized_cost(&theta).is_none(),
+            "memoized_cost returned a stale cached cost after current_outer_iter advanced"
+        );
+
+        record_current_outer_iter_for_ift(initial_iter);
+    }
+
+    #[test]
     fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
         let n = 26usize;
         let mut data = Array2::<f64>::zeros((n, 2));
