@@ -2403,7 +2403,7 @@ impl AnalyticPenalty for TopKActivationPenalty {
     }
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
-        debug_assert_eq!(rho.len(), 0);
+        assert_eq!(rho.len(), 0, "TopKActivationPenalty has no rho parameters");
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut mask = vec![false; d];
@@ -2422,7 +2422,7 @@ impl AnalyticPenalty for TopKActivationPenalty {
     }
 
     fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        debug_assert_eq!(rho.len(), 0);
+        assert_eq!(rho.len(), 0, "TopKActivationPenalty has no rho parameters");
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut mask = vec![false; d];
@@ -2444,7 +2444,7 @@ impl AnalyticPenalty for TopKActivationPenalty {
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
     ) -> Option<Array1<f64>> {
-        debug_assert_eq!(rho.len(), 0);
+        assert_eq!(rho.len(), 0, "TopKActivationPenalty has no rho parameters");
         let d = self.latent_dim;
         let n_obs = target.len() / d;
         let mut mask = vec![false; d];
@@ -2462,8 +2462,12 @@ impl AnalyticPenalty for TopKActivationPenalty {
     }
 
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        debug_assert_eq!(rho.len(), 0);
-        debug_assert_eq!(target.len() % self.latent_dim, 0);
+        assert_eq!(rho.len(), 0, "TopKActivationPenalty has no rho parameters");
+        assert_eq!(
+            target.len() % self.latent_dim,
+            0,
+            "TopKActivationPenalty target length must be a multiple of latent_dim"
+        );
         Array1::<f64>::zeros(0)
     }
 

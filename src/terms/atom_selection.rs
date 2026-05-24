@@ -140,7 +140,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1};
 
-use crate::terms::analytic_penalties::{AnalyticPenalty, SparsityPenalty};
+use crate::terms::analytic_penalties::SparsityPenalty;
 use crate::terms::atom_codes::{BitVec, SparseAtomCode, SparseAtomCodes};
 use crate::terms::latent_coord::LatentCoordValues;
 
@@ -491,12 +491,14 @@ impl AtomSelectionStrategy for EntropicSoftmax {
     fn backward(
         &self,
         free_amplitudes_row: ArrayView1<'_, f64>,
-        code: &SparseAtomCode,
+        _: &SparseAtomCode,
         grad_a_row: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert_eq!(code.k_atoms(), free_amplitudes_row.len());
-        debug_assert_eq!(code.active_mask.len(), free_amplitudes_row.len());
-        debug_assert_eq!(grad_a_row.len(), free_amplitudes_row.len());
+        assert_eq!(
+            grad_a_row.len(),
+            free_amplitudes_row.len(),
+            "EntropicSoftmax backward gradient length mismatch"
+        );
         // Recompute softmax (cheap; alternative is to cache it in the code,
         // but that conflates the masked weights with the *unmasked* softmax
         // needed by the Jacobian).
@@ -508,11 +510,10 @@ impl AtomSelectionStrategy for EntropicSoftmax {
 impl AssignmentSparsityCoupling for EntropicSoftmax {
     fn penalty_value_and_grad(
         &self,
-        penalty: &SparsityPenalty,
+        _: &SparsityPenalty,
         free_amplitudes_row: ArrayView1<'_, f64>,
-        rho: ArrayView1<'_, f64>,
+        _: ArrayView1<'_, f64>,
     ) -> (f64, Array1<f64>) {
-        debug_assert_eq!(rho.len(), penalty.rho_count());
         // Entropic-softmax does not consume the L¹ sparsity penalty
         // directly; the entropy regularisation lives inside the strategy
         // itself. We return zero contribution here (Piece 4 sees nothing
@@ -607,11 +608,10 @@ impl AtomSelectionStrategy for TopK {
 
     fn backward(
         &self,
-        free_amplitudes_row: ArrayView1<'_, f64>,
+        _: ArrayView1<'_, f64>,
         code: &SparseAtomCode,
         grad_a_row: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        debug_assert_eq!(free_amplitudes_row.len(), code.k_atoms());
         self.backward_straight_through(code, grad_a_row)
     }
 }
@@ -619,11 +619,10 @@ impl AtomSelectionStrategy for TopK {
 impl AssignmentSparsityCoupling for TopK {
     fn penalty_value_and_grad(
         &self,
-        penalty: &SparsityPenalty,
+        _: &SparsityPenalty,
         free_amplitudes_row: ArrayView1<'_, f64>,
-        rho: ArrayView1<'_, f64>,
+        _: ArrayView1<'_, f64>,
     ) -> (f64, Array1<f64>) {
-        debug_assert_eq!(rho.len(), penalty.rho_count());
         // Cardinality is enforced structurally; no smooth penalty consumed.
         let k = free_amplitudes_row.len();
         (0.0, Array1::<f64>::zeros(k))
