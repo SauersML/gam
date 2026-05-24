@@ -69,9 +69,48 @@ fn fit_exposes_posterior_covariance_and_standard_errors() {
     assert_eq!(cov.nrows(), fit.beta.len());
     assert_eq!(cov.ncols(), fit.beta.len());
     assert!(cov.iter().all(|v: &f64| v.is_finite()));
+    let p = fit.beta.len();
+    assert!(fit.dispersion().is_estimated());
+    let phi = fit.dispersion().variance_scale();
+    assert!(phi.is_finite() && phi > 0.0);
+
+    let fmat = fit
+        .influence_matrix()
+        .expect("coefficient-space influence matrix should be stored");
+    let trace_f: f64 = (0..fmat.nrows()).map(|i| fmat[[i, i]]).sum();
+    assert!(
+        (trace_f - fit.edf_total().expect("edf total")).abs() < 1e-6,
+        "tr(F) = {trace_f} should equal edf_total = {:?}",
+        fit.edf_total()
+    );
+
+    let mut xtwx = Array2::<f64>::zeros((p, p));
+    let ww = fit.working_weights().expect("working weights");
+    for i in 0..n {
+        for a in 0..p {
+            for b in 0..p {
+                xtwx[[a, b]] += ww[i] * x[[i, a]] * x[[i, b]];
+            }
+        }
+    }
+    let mut h_inv = cov.clone();
+    h_inv.mapv_inplace(|v| v / phi);
+    let mut ve_expected = h_inv.dot(&xtwx).dot(&h_inv);
+    ve_expected.mapv_inplace(|v| v * phi);
+    let ve = fit
+        .ve()
+        .expect("frequentist covariance should be stored when full covariance is available");
+    let max_ve_diff = ve
+        .iter()
+        .zip(ve_expected.iter())
+        .map(|(a, b): (&f64, &f64)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_ve_diff < 1e-8,
+        "Ve should match H^-1 X'WX H^-1 * phi; max diff {max_ve_diff}"
+    );
 
     // --- Posterior covariance must be symmetric within fp tolerance ---
-    let p = fit.beta.len();
     let mut max_asym = 0.0_f64;
     let (mut asym_i, mut asym_j) = (0usize, 0usize);
     for i in 0..p {
