@@ -625,6 +625,18 @@ fn penalty_manifest_source_for_type(
         {
             continue;
         }
+        // Skip macOS AppleDouble sidecar files (`._foo.rs`) that ride along
+        // with `.rs` files when a directory is tar'd on Darwin and untar'd
+        // on Linux. They share the `.rs` extension but contain binary
+        // extended-attribute blobs, so `fs::read_to_string` fails with
+        // "stream did not contain valid UTF-8". Treat them as not-there.
+        if path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with("._"))
+        {
+            continue;
+        }
         let source = fs::read_to_string(&path)?;
         if source.contains(&format!("impl PenaltyManifest for {rust_type}")) {
             return Ok(source);
