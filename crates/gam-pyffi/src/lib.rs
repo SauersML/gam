@@ -131,6 +131,7 @@ struct PyFitConfig {
 
     firth: Option<bool>,
     gpu: Option<String>,
+    device: Option<String>,
 
     // Integration seam for task 04's group abstraction. The proposed group
     // type can pass either `group_metadata` directly or `groups` entries with
@@ -12228,6 +12229,14 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
             format!(
                 "invalid gpu policy '{}'; supported values are auto, off, force",
                 raw_gpu
+            )
+        })?;
+    }
+    if let Some(raw_device) = py_config.device {
+        fit_config.device = gam::solver::gpu::Device::parse(&raw_device).ok_or_else(|| {
+            format!(
+                "invalid solver device '{}'; supported values are cpu, cuda",
+                raw_device
             )
         })?;
     }

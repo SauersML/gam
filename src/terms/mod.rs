@@ -10,6 +10,7 @@ pub mod input_loc_derivatives;
 pub mod latent_coord;
 pub mod layout;
 pub mod penalty_op;
+pub mod penalties;
 pub mod sae_manifold;
 pub mod smooth;
 pub mod term_builder;
