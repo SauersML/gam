@@ -727,50 +727,6 @@ fn scaled_covariance(mut cov: Array2<f64>, phi: f64) -> Array2<f64> {
     cov
 }
 
-fn materialize_weighted_penalty_original(
-    pirls: &crate::pirls::PirlsResult,
-    lambdas: &Array1<f64>,
-    p_dim: usize,
-) -> Array2<f64> {
-    let mut s_t = Array2::<f64>::zeros((p_dim, p_dim));
-    for (kk, cp) in pirls
-        .reparam_result
-        .canonical_transformed
-        .iter()
-        .enumerate()
-    {
-        let lam = lambdas.get(kk).copied().unwrap_or(0.0);
-        if lam != 0.0 {
-            cp.accumulate_weighted(&mut s_t, lam);
-        }
-    }
-    let qs = &pirls.reparam_result.qs;
-    let tmp = qs.dot(&s_t);
-    let mut s_orig = tmp.dot(&qs.t());
-    crate::families::custom_family::symmetrize_dense_in_place(&mut s_orig);
-    s_orig
-}
-
-fn covariance_contract_matrices(
-    h_inv_unscaled: &Array2<f64>,
-    penalized_hessian: &Array2<f64>,
-    weighted_penalty: &Array2<f64>,
-    phi: f64,
-) -> (Array2<f64>, Array2<f64>) {
-    let mut xwx = penalized_hessian.clone();
-    xwx -= weighted_penalty;
-    crate::families::custom_family::symmetrize_dense_in_place(&mut xwx);
-    let mut influence = h_inv_unscaled.dot(&xwx);
-    // F is not generally symmetric, but near-zero asymmetry can leak from the
-    // dense products in the symmetric inputs; do not symmetrize it because
-    // Wood's block trace uses the actual coefficient-space operator.
-    influence.mapv_inplace(|v| if v.abs() < 1e-14 { 0.0 } else { v });
-    let mut ve = influence.dot(h_inv_unscaled);
-    ve.mapv_inplace(|v| v * phi);
-    crate::families::custom_family::symmetrize_dense_in_place(&mut ve);
-    (ve, influence)
-}
-
 /// Default inner P-IRLS tolerance floor.
 ///
 /// The inner Newton iteration certifies the coefficient mode against this
