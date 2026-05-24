@@ -474,19 +474,7 @@ pub fn ift_warm_start_latent(
     }
 
     // Sum the two contributions on the RHS, then per-row solve.
-    let mut delta_t = Array1::<f64>::zeros(n * d);
-    if let Some(db) = delta_beta {
-        let part = cache.predict_delta_t_from_delta_beta(db);
-        for i in 0..delta_t.len() {
-            delta_t[i] += part[i];
-        }
-    }
-    if let Some(dg) = delta_gt {
-        let part = cache.predict_delta_t_from_delta_gt(dg);
-        for i in 0..delta_t.len() {
-            delta_t[i] += part[i];
-        }
-    }
+    let delta_t = cache.predict_delta_t_combined(delta_beta, delta_gt);
     LatentIftOutcome::Applied { delta_t }
 }
 
