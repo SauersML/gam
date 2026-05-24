@@ -3966,7 +3966,6 @@ impl StreamingBSplineEvaluator {
     }
 
     fn raw_chunk(&self, start: usize, end: usize) -> Array2<f64> {
-        let _boundary_conditions = self.boundary_conditions;
         bspline_raw_row_chunk(
             self.data.view(),
             self.knots.view(),
