@@ -860,7 +860,10 @@ fn default_output_path_from_model(model: &Path, suffix: &str) -> PathBuf {
         .filter(|s| !s.is_empty())
         .unwrap_or("model");
     let file_name = format!("{stem}{suffix}");
-    match model.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    match model
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
         Some(parent) => parent.join(file_name),
         None => PathBuf::from(file_name),
     }
@@ -1872,7 +1875,9 @@ fn run_fit_bernoulli_marginal_slope(
                 cli_out!(
                     "WARNING: cross-block identifiability dropped flex block '{}' \
                      (anchors: {}). {}",
-                    w.candidate_label, w.anchor_summary, w.reason
+                    w.candidate_label,
+                    w.anchor_summary,
+                    w.reason
                 );
             }
             result
@@ -1900,7 +1905,9 @@ fn run_fit_bernoulli_marginal_slope(
     progress.advance_workflow(4);
     cli_out!(
         "model fit complete | family={} | outer_iter={} | converged={}",
-        FAMILY_BERNOULLI_MARGINAL_SLOPE, solved.fit.outer_iterations, solved.fit.outer_converged
+        FAMILY_BERNOULLI_MARGINAL_SLOPE,
+        solved.fit.outer_iterations,
+        solved.fit.outer_converged
     );
     print_spatial_aniso_scales(&solved.marginalspec_resolved);
     print_spatial_aniso_scales(&solved.logslopespec_resolved);
@@ -2051,7 +2058,9 @@ fn run_fit_transformation_normal(
     progress.advance_workflow(4);
     cli_out!(
         "model fit complete | family={} | outer_iter={} | converged={}",
-        FAMILY_TRANSFORMATION_NORMAL, solved.fit.outer_iterations, solved.fit.outer_converged
+        FAMILY_TRANSFORMATION_NORMAL,
+        solved.fit.outer_iterations,
+        solved.fit.outer_converged
     );
     print_spatial_aniso_scales(&solved.covariate_spec_resolved);
 
@@ -2213,7 +2222,9 @@ fn run_fitwith_predict_noise(
         progress.advance_workflow(4);
         cli_out!(
             "model fit complete | family={} | outer_iter={} | converged={}",
-            FAMILY_GAUSSIAN_LOCATION_SCALE, fit.outer_iterations, fit.outer_converged
+            FAMILY_GAUSSIAN_LOCATION_SCALE,
+            fit.outer_iterations,
+            fit.outer_converged
         );
         print_spatial_aniso_scales(&meanspec_resolved);
         print_spatial_aniso_scales(&noisespec_resolved);
@@ -2405,7 +2416,9 @@ fn run_fitwith_predict_noise(
     progress.advance_workflow(4);
     cli_out!(
         "model fit complete | family={} | outer_iter={} | converged={}",
-        FAMILY_BINOMIAL_LOCATION_SCALE, fit.outer_iterations, fit.outer_converged
+        FAMILY_BINOMIAL_LOCATION_SCALE,
+        fit.outer_iterations,
+        fit.outer_converged
     );
     print_spatial_aniso_scales(&solved.fit.meanspec_resolved);
     print_spatial_aniso_scales(&solved.fit.noisespec_resolved);
@@ -6272,7 +6285,11 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     cli_out!();
     cli_out!(
         "  {:<10} {:>12} {:>12} {:>12} {:>12}",
-        "coeff", "post_mean", "post_std", "ci_2.5%", "ci_97.5%"
+        "coeff",
+        "post_mean",
+        "post_std",
+        "ci_2.5%",
+        "ci_97.5%"
     );
     cli_out!("  {}", "-".repeat(62));
     for j in 0..n_coeffs {
@@ -6292,7 +6309,9 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     cli_out!();
     cli_out!(
         "  convergence: rhat={:.4}  ess={:.1}  converged={}",
-        nuts.rhat, nuts.ess, nuts.converged
+        nuts.rhat,
+        nuts.ess,
+        nuts.converged
     );
 
     // Write per-coefficient posterior summary (mean, std, 95% CI) to CSV.
@@ -6883,7 +6902,9 @@ fn block_role_label(role: &gam::estimate::BlockRole) -> &'static str {
 
 fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result<(), String> {
     if args.out.is_none() {
-        return Err("fit requires --out; refusing to run a training job that writes no model".to_string());
+        return Err(
+            "fit requires --out; refusing to run a training job that writes no model".to_string(),
+        );
     }
     if args.family == FamilyArg::TransformationNormal && !args.transformation_normal {
         return Err(
@@ -6892,7 +6913,10 @@ fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result
         );
     }
     if args.transformation_normal
-        && !matches!(args.family, FamilyArg::Auto | FamilyArg::TransformationNormal)
+        && !matches!(
+            args.family,
+            FamilyArg::Auto | FamilyArg::TransformationNormal
+        )
     {
         return Err(format!(
             "--transformation-normal conflicts with --family {}",
@@ -6984,7 +7008,9 @@ fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result
     }
     if !is_survival {
         if args.family == FamilyArg::RoystonParmar {
-            return Err("--family royston-parmar requires a Surv(entry, exit, event) response".to_string());
+            return Err(
+                "--family royston-parmar requires a Surv(entry, exit, event) response".to_string(),
+            );
         }
         if args.survival_time_anchor.is_some()
             || args.baseline_scale.is_some()
@@ -7006,7 +7032,11 @@ fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result
         }
     }
     validate_survival_baseline_args(args, survival_likelihood, &baseline_target_raw)?;
-    validate_time_margin_args("--threshold-time-k", args.threshold_time_k, args.threshold_time_degree)?;
+    validate_time_margin_args(
+        "--threshold-time-k",
+        args.threshold_time_k,
+        args.threshold_time_degree,
+    )?;
     validate_time_margin_args("--sigma-time-k", args.sigma_time_k, args.sigma_time_degree)?;
     if time_basis_raw == "ispline" {
         parse_survival_time_basis_config(
@@ -7035,11 +7065,7 @@ fn family_arg_name(arg: FamilyArg) -> &'static str {
     }
 }
 
-fn validate_time_margin_args(
-    flag: &str,
-    k: Option<usize>,
-    degree: usize,
-) -> Result<(), String> {
+fn validate_time_margin_args(flag: &str, k: Option<usize>, degree: usize) -> Result<(), String> {
     if let Some(k) = k {
         let min_k = degree + 1;
         if k < min_k {
@@ -7108,8 +7134,7 @@ fn validate_survival_baseline_args(
         "gompertz-makeham" => {
             if args.baseline_scale.is_some() {
                 return Err(
-                    "--baseline-target gompertz-makeham does not use --baseline-scale"
-                        .to_string(),
+                    "--baseline-target gompertz-makeham does not use --baseline-scale".to_string(),
                 );
             }
         }
@@ -8297,11 +8322,14 @@ fn print_spatial_aniso_scales(spec: &TermCollectionSpec) {
         match ls {
             Some(ls) => cli_out!(
                 "[spatial-kappa] term {} (\"{}\"): anisotropic length scales (global length_scale={:.4})",
-                term_idx, term.name, ls
+                term_idx,
+                term.name,
+                ls
             ),
             None => cli_out!(
                 "[spatial-kappa] term {} (\"{}\"): pure Duchon shape anisotropy",
-                term_idx, term.name
+                term_idx,
+                term.name
             ),
         }
         for (a, &eta_a) in eta.iter().enumerate() {
@@ -8310,7 +8338,10 @@ fn print_spatial_aniso_scales(spec: &TermCollectionSpec) {
                 let kappa_a = (1.0 / ls) * eta_a.exp();
                 cli_out!(
                     "  axis {}: eta={:+.4}, length={:.4}, kappa={:.4}",
-                    a, eta_a, length_a, kappa_a
+                    a,
+                    eta_a,
+                    length_a,
+                    kappa_a
                 );
             } else {
                 cli_out!("  axis {}: eta={:+.4}", a, eta_a);
@@ -8596,7 +8627,11 @@ fn resolve_family(
         if let Some(explicit) = explicit_family {
             let compatible_log_nb = matches!(
                 (explicit, choice.link, choice.mixture_components.as_ref()),
-                (LikelihoodFamily::NegativeBinomial { .. }, LinkFunction::Log, None)
+                (
+                    LikelihoodFamily::NegativeBinomial { .. },
+                    LinkFunction::Log,
+                    None
+                )
             );
             if explicit != from_link && !compatible_log_nb {
                 return Err(format!(
@@ -9010,10 +9045,7 @@ fn build_model_summary(
             let baseline = if family == LikelihoodFamily::PoissonLog {
                 mean.max(0.0)
             } else if matches!(family, LikelihoodFamily::BetaLogit { .. }) {
-                mean.clamp(
-                    gam::pirls::BETA_MU_EPS,
-                    1.0 - gam::pirls::BETA_MU_EPS,
-                )
+                mean.clamp(gam::pirls::BETA_MU_EPS, 1.0 - gam::pirls::BETA_MU_EPS)
             } else {
                 mean.max(1e-12)
             };
@@ -9891,8 +9923,8 @@ mod tests {
     use gam::basis::{
         BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
         BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
-        DuchonOperatorPenaltySpec, KnotSource,
-        MaternBasisSpec, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
+        DuchonOperatorPenaltySpec, KnotSource, MaternBasisSpec, MaternNu, SpatialIdentifiability,
+        ThinPlateBasisSpec, create_basis,
     };
     use gam::bernoulli_marginal_slope::LatentMeasureKind;
     use gam::estimate::{

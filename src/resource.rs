@@ -232,7 +232,8 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
     }
 
     pub fn get(&self, key: &K) -> Option<V> {
-        let mut g = self.inner.lock().unwrap();
+        // recover from poison
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let v = g.map.get(key)?.0.clone();
         // move to back (most-recently-used)
         if let Some(pos) = g.order.iter().position(|k| k == key) {
@@ -244,7 +245,7 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
 
     pub fn insert(&self, key: K, value: V) {
         let charge = value.resident_bytes();
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
 
         // If already present, remove the old entry first so resident bytes stay
         // accurate and the LRU ordering reflects this insertion.
@@ -291,7 +292,10 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
     }
 
     pub fn resident_bytes(&self) -> usize {
-        self.inner.lock().unwrap().resident_bytes
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .resident_bytes
     }
 
     pub fn max_bytes(&self) -> usize {
@@ -299,11 +303,15 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().map.len()
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .map
+            .len()
     }
 
     pub fn clear(&self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         g.map.clear();
         g.order.clear();
         g.resident_bytes = 0;

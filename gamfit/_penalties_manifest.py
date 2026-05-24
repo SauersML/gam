@@ -67,6 +67,12 @@ PENALTY_MANIFEST = (
         "row_block_diagonal": False,
     },
     {
+        "kind": "nested_prefix",
+        "rust": "NestedPrefix:NestedPrefixPenalty",
+        "python": "NestedPrefixPenalty",
+        "row_block_diagonal": True,
+    },
+    {
         "kind": "row_precision_prior",
         "rust": "RowPrecisionPrior:RowPrecisionPriorPenalty",
         "python": "AuxConditionalPriorPenalty",
