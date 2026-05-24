@@ -17,7 +17,7 @@ use crate::solver::active_set;
 use crate::types::{Coefficients, LinearPredictor, LogSmoothingParamsView};
 use crate::types::{
     GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LinkFunction, MixtureLinkState,
-    RidgePassport, RidgePolicy, SasLinkState,
+    RidgePassport, RidgePolicy, SasLinkState, is_valid_tweedie_power,
 };
 use dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::matmul::matmul;
@@ -748,11 +748,12 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                     eta,
                     priorweights,
                     p,
+                    fixed_glm_dispersion(*self),
                     mu,
                     weights,
                     z,
                     derivatives,
-                );
+                )?;
                 Ok(())
             }
             (GlmLikelihoodFamily::NegativeBinomial { theta }, _) => {
@@ -8483,39 +8484,15 @@ fn write_gamma_log_working_state(
     }
 }
 
-const TWEEDIE_LIMIT_EPS: f64 = 1.0e-6;
 pub const BETA_RESPONSE_EPS: f64 = 1.0e-12;
 pub const BETA_MU_EPS: f64 = 1.0e-12;
 
 #[inline]
-fn tweedie_p_is_poisson(p: f64) -> bool {
-    // 1e-6 avoids cancellation in the Tweedie unit-deviance denominators near p=1.
-    (p - 1.0).abs() <= TWEEDIE_LIMIT_EPS
-}
-
-#[inline]
-fn tweedie_p_is_gamma(p: f64) -> bool {
-    // 1e-6 avoids cancellation in the Tweedie unit-deviance denominators near p=2.
-    (p - 2.0).abs() <= TWEEDIE_LIMIT_EPS
-}
-
-#[inline]
-fn sanitize_tweedie_p(p: f64) -> f64 {
-    if p.is_finite() { p } else { 1.5 }
-}
-
-#[inline]
 fn tweedie_log_weight_mu_power(mu: f64, p: f64) -> f64 {
-    if tweedie_p_is_poisson(p) {
-        mu
-    } else if tweedie_p_is_gamma(p) {
-        1.0
-    } else {
-        // Match the 1e-300 MIN_DEVIANCE floor used by the REML deviance path:
-        // smaller positive mu values are below a non-degenerate f64 likelihood
-        // contribution, but flooring here keeps mu^(2-p) away from underflow.
-        mu.max(1.0e-300).powf(2.0 - p)
-    }
+    // Match the 1e-300 MIN_DEVIANCE floor used by the REML deviance path:
+    // smaller positive mu values are below a non-degenerate f64 likelihood
+    // contribution, but flooring here keeps mu^(2-p) away from underflow.
+    mu.max(1.0e-300).powf(2.0 - p)
 }
 
 #[inline]
@@ -8558,74 +8535,6 @@ fn trigamma(mut x: f64) -> f64 {
         - inv2 * inv2 * inv2 * inv2 * inv / 30.0
 }
 
-#[inline]
-fn estimate_tweedie_phi_from_eta(
-    y: ArrayView1<f64>,
-    eta: &Array1<f64>,
-    priorweights: ArrayView1<f64>,
-    p: f64,
-) -> f64 {
-    const MIN_MU: f64 = 1e-10;
-    const MIN_PHI: f64 = 1e-12;
-    if tweedie_p_is_poisson(p) {
-        return 1.0;
-    }
-    let (num, den) = (0..eta.len())
-        .into_par_iter()
-        .map(|i| {
-            let wi = priorweights[i].max(0.0);
-            if wi == 0.0 {
-                return (0.0_f64, 0.0_f64);
-            }
-            let mui = eta[i].clamp(-700.0, 700.0).exp().max(MIN_MU);
-            let resid = y[i] - mui;
-            (wi * resid * resid / mui.powf(p), wi)
-        })
-        .reduce(
-            || (0.0_f64, 0.0_f64),
-            |(num_a, den_a), (num_b, den_b)| (num_a + num_b, den_a + den_b),
-        );
-    if den > 0.0 {
-        (num / den).max(MIN_PHI)
-    } else {
-        1.0
-    }
-}
-
-#[inline]
-fn estimate_tweedie_phi_from_mu(
-    y: ArrayView1<f64>,
-    mu: &Array1<f64>,
-    priorweights: ArrayView1<f64>,
-    p: f64,
-) -> f64 {
-    const MIN_MU: f64 = 1e-10;
-    const MIN_PHI: f64 = 1e-12;
-    if tweedie_p_is_poisson(p) {
-        return 1.0;
-    }
-    let (num, den) = (0..mu.len())
-        .into_par_iter()
-        .map(|i| {
-            let wi = priorweights[i].max(0.0);
-            if wi == 0.0 {
-                return (0.0_f64, 0.0_f64);
-            }
-            let mui = mu[i].max(MIN_MU);
-            let resid = y[i] - mui;
-            (wi * resid * resid / mui.powf(p), wi)
-        })
-        .reduce(
-            || (0.0_f64, 0.0_f64),
-            |(num_a, den_a), (num_b, den_b)| (num_a + num_b, den_a + den_b),
-        );
-    if den > 0.0 {
-        (num / den).max(MIN_PHI)
-    } else {
-        1.0
-    }
-}
-
 /// Working state for Tweedie with a log link.
 ///
 /// With `mu = exp(eta)`, `V(mu) = phi * mu^p`, and `g'(mu) = 1 / mu`,
@@ -8636,33 +8545,23 @@ fn write_tweedie_log_working_state(
     eta: &Array1<f64>,
     priorweights: ArrayView1<f64>,
     p: f64,
+    phi: f64,
     mu: &mut Array1<f64>,
     weights: &mut Array1<f64>,
     z: &mut Array1<f64>,
     derivatives: Option<WorkingDerivativeBuffersMut<'_>>,
-) {
+) -> Result<(), EstimationError> {
     const MIN_MU: f64 = 1e-10;
     const MIN_WEIGHT: f64 = 1e-12;
-    let p = sanitize_tweedie_p(p);
-    // Keep IRLS on the same fuzzy p-boundary convention as deviance/log-likelihood dispatch.
-    // TWEEDIE_LIMIT_EPS = 1e-6: below this, f64 relative error in (1-p)(2-p) dominates the general formula.
-    if tweedie_p_is_poisson(p) {
-        write_poisson_log_working_state(y, eta, priorweights, mu, weights, z, derivatives);
-        return;
+    if !is_valid_tweedie_power(p) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
+        )));
     }
-    let phi = estimate_tweedie_phi_from_eta(y, eta, priorweights, p);
-    if tweedie_p_is_gamma(p) {
-        write_gamma_log_working_state(
-            y,
-            eta,
-            priorweights,
-            1.0 / phi,
-            mu,
-            weights,
-            z,
-            derivatives,
-        );
-        return;
+    if !(phi.is_finite() && phi > 0.0) {
+        return Err(EstimationError::InvalidInput(format!(
+            "Tweedie dispersion phi must be finite and > 0; got {phi}"
+        )));
     }
     let exponent = 2.0 - p;
     if let Some(derivs) = derivatives {
@@ -8696,6 +8595,7 @@ fn write_tweedie_log_working_state(
                 |(i, (((((((mu_o, w_o), z_o), dmu_o), d2_o), d3_o), c_o), d_o))| {
                     let eta_raw = eta[i];
                     let eta_i = eta_raw.clamp(-700.0, 700.0);
+                    let clamp_active = eta_raw != eta_i;
                     let mu_i = eta_i.exp().max(MIN_MU);
                     *mu_o = mu_i;
                     // `mu_i` is already floored like Poisson/Gamma for the log-link
@@ -8710,10 +8610,16 @@ fn write_tweedie_log_working_state(
                         0.0
                     };
                     *z_o = eta_i + (y[i] - mu_i) / mu_i;
-                    *dmu_o = mu_i;
-                    *d2_o = mu_i;
-                    *d3_o = mu_i;
-                    if floor_active || eta_raw != eta_i {
+                    if clamp_active {
+                        *dmu_o = 0.0;
+                        *d2_o = 0.0;
+                        *d3_o = 0.0;
+                    } else {
+                        *dmu_o = mu_i;
+                        *d2_o = mu_i;
+                        *d3_o = mu_i;
+                    }
+                    if floor_active || clamp_active {
                         *c_o = 0.0;
                         *d_o = 0.0;
                     } else {
@@ -8747,6 +8653,7 @@ fn write_tweedie_log_working_state(
                 *z_o = eta_i + (y[i] - mu_i) / mu_i;
             });
     }
+    Ok(())
 }
 
 /// Working state for NB(mu, theta) with a log link and fixed theta.
@@ -9615,15 +9522,18 @@ fn computeworkingweight_derivatives_from_eta(
         }
         GlmLikelihoodFamily::Tweedie { p } => {
             const MIN_WEIGHT: f64 = 1e-12;
-            let p = sanitize_tweedie_p(p);
-            let exponent = if tweedie_p_is_poisson(p) {
-                1.0
-            } else if tweedie_p_is_gamma(p) {
-                0.0
-            } else {
-                2.0 - p
-            };
+            if !is_valid_tweedie_power(p) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
+                )));
+            }
+            let exponent = 2.0 - p;
             let phi = fixed_glm_dispersion(likelihood);
+            if !(phi.is_finite() && phi > 0.0) {
+                return Err(EstimationError::InvalidInput(format!(
+                    "Tweedie dispersion phi must be finite and > 0; got {phi}"
+                )));
+            }
             let c_s = c.as_slice_mut().expect("c must be contiguous");
             let d_s = d.as_slice_mut().expect("d must be contiguous");
             let dmu_s = dmu_deta
@@ -9643,22 +9553,30 @@ fn computeworkingweight_derivatives_from_eta(
                 .enumerate()
                 .try_for_each(
                     |(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| -> Result<(), EstimationError> {
-                        let eta_used = eta[i].clamp(-700.0, 700.0);
+                        let eta_raw = eta[i];
+                        let eta_used = eta_raw.clamp(-700.0, 700.0);
+                        let clamp_active = eta_raw != eta_used;
                         let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
                         let raw_weight = priorweights[i].max(0.0)
                             * tweedie_log_weight_mu_power(jet.mu, p)
                             / phi;
                         let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
-                        if eta[i] != eta_used || floor_active {
+                        if clamp_active || floor_active {
                             *c_o = 0.0;
                             *d_o = 0.0;
                         } else {
                             *c_o = exponent * raw_weight;
                             *d_o = exponent * exponent * raw_weight;
                         }
-                        *dmu_o = jet.d1;
-                        *d2_o = jet.d2;
-                        *d3_o = jet.d3;
+                        if clamp_active {
+                            *dmu_o = 0.0;
+                            *d2_o = 0.0;
+                            *d3_o = 0.0;
+                        } else {
+                            *dmu_o = jet.d1;
+                            *d2_o = jet.d2;
+                            *d3_o = jet.d3;
+                        }
                         Ok(())
                     },
                 )?;
@@ -10744,11 +10662,9 @@ fn gamma_unit_deviance(yi_c: f64, mui_c: f64) -> f64 {
 }
 
 #[inline]
-fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64, eps: f64) -> f64 {
-    if tweedie_p_is_poisson(p) {
-        poisson_unit_deviance(yi, mui_c)
-    } else if tweedie_p_is_gamma(p) {
-        gamma_unit_deviance(yi.max(eps), mui_c)
+fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
+    if !is_valid_tweedie_power(p) {
+        f64::NAN
     } else if yi == 0.0 {
         mui_c.powf(2.0 - p) / (2.0 - p)
     } else {
@@ -10848,42 +10764,20 @@ pub fn calculate_deviance(
             2.0 * total
         }
         GlmLikelihoodFamily::Tweedie { p } => {
-            let p = sanitize_tweedie_p(p);
-            if tweedie_p_is_poisson(p) {
-                use rayon::iter::{IntoParallelIterator, ParallelIterator};
-                let total: f64 = (0..y.len())
-                    .into_par_iter()
-                    .map(|i| {
-                        let yi = y[i];
-                        let mui_c = mu[i].max(EPS);
-                        priorweights[i] * tweedie_unit_deviance(yi, mui_c, p, EPS)
-                    })
-                    .sum();
-                2.0 * total
-            } else if tweedie_p_is_gamma(p) {
-                let phi = estimate_tweedie_phi_from_mu(y, mu, priorweights, p);
-                use rayon::iter::{IntoParallelIterator, ParallelIterator};
-                let total: f64 = (0..y.len())
-                    .into_par_iter()
-                    .map(|i| {
-                        let mui_c = mu[i].max(EPS);
-                        priorweights[i] * tweedie_unit_deviance(y[i], mui_c, p, EPS) / phi
-                    })
-                    .sum();
-                2.0 * total
-            } else {
-                let phi = estimate_tweedie_phi_from_mu(y, mu, priorweights, p);
-                use rayon::iter::{IntoParallelIterator, ParallelIterator};
-                let total: f64 = (0..y.len())
-                    .into_par_iter()
-                    .map(|i| {
-                        let yi = y[i];
-                        let mui_c = mu[i].max(EPS);
-                        priorweights[i] * tweedie_unit_deviance(yi, mui_c, p, EPS) / phi
-                    })
-                    .sum();
-                2.0 * total
+            let phi = fixed_glm_dispersion(likelihood);
+            if !is_valid_tweedie_power(p) || !(phi.is_finite() && phi > 0.0) {
+                return f64::NAN;
             }
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let total: f64 = (0..y.len())
+                .into_par_iter()
+                .map(|i| {
+                    let yi = y[i];
+                    let mui_c = mu[i].max(EPS);
+                    priorweights[i] * tweedie_unit_deviance(yi, mui_c, p) / phi
+                })
+                .sum();
+            2.0 * total
         }
         GlmLikelihoodFamily::NegativeBinomial { theta } => {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -10966,22 +10860,11 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
             })
             .sum(),
         GlmLikelihoodFamily::Tweedie { p } => {
-            let p = sanitize_tweedie_p(p);
-            if tweedie_p_is_poisson(p) {
-                (0..n)
-                    .into_par_iter()
-                    .map(|i| {
-                        let mui_c = mu[i].max(EPS);
-                        let log_term = if y[i] > 0.0 { y[i] * mui_c.ln() } else { 0.0 };
-                        priorweights[i] * (log_term - mui_c)
-                    })
-                    .sum()
-            } else if tweedie_p_is_gamma(p) {
-                let phi = estimate_tweedie_phi_from_mu(y, mu, priorweights, p);
-                gamma_loglikelihood_with_shape(y, mu, priorweights, 1.0 / phi)
-            } else {
-                -0.5 * calculate_deviance(y, mu, likelihood, priorweights)
+            let phi = fixed_glm_dispersion(likelihood);
+            if !is_valid_tweedie_power(p) || !(phi.is_finite() && phi > 0.0) {
+                return f64::NAN;
             }
+            -0.5 * calculate_deviance(y, mu, likelihood, priorweights)
         }
         GlmLikelihoodFamily::NegativeBinomial { theta } => (0..n)
             .into_par_iter()

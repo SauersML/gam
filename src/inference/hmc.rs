@@ -32,7 +32,7 @@ use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv};
 use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::matrix::DesignMatrix;
 use crate::solver::mixture_link::inverse_link_jet_for_family;
-use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
+use crate::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior, is_valid_tweedie_power};
 use crate::visualizer::VisualizerSession;
 use faer::Side;
 use general_mcmc::generic_hmc::HamiltonianTarget;
@@ -936,6 +936,14 @@ fn joint_family_logp_and_grad(
         LikelihoodFamily::Tweedie { p } => {
             // Family mapping: Tweedie payload p is the variance power.
             // Its dispersion phi stays in data.dispersion, matching REML.
+            if !is_valid_tweedie_power(p) {
+                return Err(HmcError::InvalidConfig {
+                    reason: format!(
+                        "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
+                    ),
+                }
+                .into());
+            }
             Ok(tweedie_log_quasilogp_and_grad(data, eta, p))
         }
         LikelihoodFamily::NegativeBinomial { theta } => {
@@ -1134,7 +1142,7 @@ fn tweedie_log_quasilogp_and_grad(
     let n = data.n_samples;
     // Family mapping: Tweedie p is the variant payload; phi is data.dispersion.
     // Invalid payloads invalidate the target instead of falling back to p=1.5.
-    if !p.is_finite() {
+    if !is_valid_tweedie_power(p) {
         return (f64::NAN, Array1::from_elem(data.dim, f64::NAN));
     }
     let inv_phi = data.dispersion.inv_phi();
@@ -1150,14 +1158,8 @@ fn tweedie_log_quasilogp_and_grad(
             let y_i = data.y[i];
             let w_i = data.weights[i] * inv_phi;
             *slot = w_i * (y_i - mu_i) * mu_i.powf(1.0 - p);
-            let qll = if (p - 1.0).abs() <= 1.0e-12 {
-                y_i * eta_i - mu_i
-            } else if (p - 2.0).abs() <= 1.0e-12 {
-                -y_i / mu_i - eta_i
-            } else {
-                y_i * mu_i.powf(1.0 - p) / (1.0 - p)
-                    - mu_i.powf(2.0 - p) / (2.0 - p)
-            };
+            let qll = y_i * mu_i.powf(1.0 - p) / (1.0 - p)
+                - mu_i.powf(2.0 - p) / (2.0 - p);
             w_i * qll
         })
         .sum();
@@ -3276,6 +3278,11 @@ pub(crate) fn run_nuts_sampling(
 ) -> Result<NutsResult, String> {
     validate_firth_support(nuts_family, firth_bias_reduction).map_err(String::from)?;
     validate_nuts_target_accept(config.target_accept).map_err(String::from)?;
+    if nuts_family == NutsFamily::TweedieLog && !is_valid_tweedie_power(gamma_shape) {
+        return Err(format!(
+            "Tweedie variance power must be finite and strictly between 1 and 2; got {gamma_shape}"
+        ));
+    }
     let dim = mode.len();
 
     // Create posterior target with analytical gradients. When Firth is enabled,
@@ -3602,6 +3609,11 @@ pub fn run_nuts_sampling_flattened_family(
         (LikelihoodFamily::Tweedie { p }, FamilyNutsInputs::Glm(glm)) => {
             // Family mapping: Tweedie payload p is passed through the family-parameter slot.
             // The Tweedie dispersion phi remains in glm.dispersion, matching REML.
+            if !is_valid_tweedie_power(p) {
+                return Err(format!(
+                    "Tweedie variance power must be finite and strictly between 1 and 2; got {p}"
+                ));
+            }
             run_nuts_sampling(
                 glm.x,
                 glm.y,
@@ -3958,7 +3970,7 @@ impl LinkWigglePosterior {
                 let mut ll_acc = 0.0;
                 // Family mapping: Tweedie scale carries payload p; phi is not stored here.
                 // Invalid p makes the link-wiggle target invalid instead of defaulting.
-                if !self.scale.is_finite() {
+                if !is_valid_tweedie_power(self.scale) {
                     return (f64::NEG_INFINITY, Array1::zeros(dim));
                 }
                 let p = self.scale;
@@ -3967,14 +3979,8 @@ impl LinkWigglePosterior {
                     let (y_i, w_i) = (self.y[i], self.weights[i]);
                     let mu = eta_i.exp().max(1e-300);
                     ll_acc += w_i
-                        * if (p - 1.0).abs() <= 1.0e-12 {
-                            y_i * eta_i - mu
-                        } else if (p - 2.0).abs() <= 1.0e-12 {
-                            -y_i / mu - eta_i
-                        } else {
-                            y_i * mu.powf(1.0 - p) / (1.0 - p)
-                                - mu.powf(2.0 - p) / (2.0 - p)
-                        };
+                        * (y_i * mu.powf(1.0 - p) / (1.0 - p)
+                            - mu.powf(2.0 - p) / (2.0 - p));
                     residual[i] = w_i * (y_i - mu) * mu.powf(1.0 - p);
                 }
                 ll = ll_acc;
