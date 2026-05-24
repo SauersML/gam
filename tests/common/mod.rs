@@ -181,7 +181,6 @@ pub fn report_power_law_full(
     eprintln!("{tag} budget: {:.1}", budget_y);
     let max_x: f64 = points.iter().map(|(x, _)| *x).fold(0.0_f64, f64::max);
     let min_x: f64 = points.iter().map(|(x, _)| *x).fold(f64::INFINITY, f64::min);
-    let mut extrapolations = Vec::with_capacity(extrapolate.len());
     for (label, x_target) in extrapolate {
         let pred = fit.a * x_target.powf(fit.alpha);
         let stretch = x_target / max_x;
@@ -220,15 +219,6 @@ pub fn report_power_law_full(
             stretch_note,
             verdict_str,
         );
-        extrapolations.push(PowerLawExtrapolation {
-            label: (*label).to_string(),
-            x_target: *x_target,
-            pred_y: pred,
-            verdict: verdict_enum,
-        });
     }
-    Some(PowerLawReport {
-        fit,
-        extrapolations,
-    })
+    Some(PowerLawReport { fit })
 }

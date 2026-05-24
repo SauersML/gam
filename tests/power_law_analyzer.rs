@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{BudgetVerdict, PowerLawFit, fit_power_law, report_power_law_full};
+use common::{PowerLawFit, fit_power_law, report_power_law_full};
 
 /// Fit a clean `y = 2 · x^1.5` line and verify recovery to ~10 significant
 /// figures (log-log OLS on noiseless data is exact up to roundoff).
@@ -140,25 +140,36 @@ fn report_extrapolation_verdicts_track_budget_boundary() {
     let extrapolate = [("under", 30_000.0), ("over", 90_000.0)];
     let report = report_power_law_full("[BOUNDARY]", &points, &extrapolate, 60.0)
         .expect("clean fit should produce a report");
-    assert_eq!(report.extrapolations.len(), 2);
-    let under = &report.extrapolations[0];
-    assert_eq!(under.label, "under");
-    assert_eq!(under.x_target, 30_000.0);
-    assert_eq!(under.verdict, BudgetVerdict::Fits);
+    // With the structured-extrapolations contract removed, validate the
+    // fit recovered the linear law that drives the side-effect verdicts:
+    // a · x^α with α=1, a=0.001 implies pred(30k)=30 < 60 (FITS) and
+    // pred(90k)=90 > 60 (OVER BUDGET). The verdicts themselves are now
+    // stderr-only.
+    let fit = report.fit;
     assert!(
-        (under.pred_y - 30.0).abs() < 1e-6,
-        "pred_y at n=30k should be ~30s, got {}",
-        under.pred_y
+        (fit.alpha - alpha_true).abs() < 1e-9,
+        "alpha drift: got {} expected {}",
+        fit.alpha,
+        alpha_true
     );
-    let over = &report.extrapolations[1];
-    assert_eq!(over.label, "over");
-    assert_eq!(over.x_target, 90_000.0);
-    assert_eq!(over.verdict, BudgetVerdict::OverBudget);
     assert!(
-        (over.pred_y - 90.0).abs() < 1e-6,
-        "pred_y at n=90k should be ~90s, got {}",
-        over.pred_y
+        (fit.a - a_true).abs() < 1e-9,
+        "a drift: got {} expected {}",
+        fit.a,
+        a_true
     );
+    let pred_under = fit.a * 30_000.0_f64.powf(fit.alpha);
+    let pred_over = fit.a * 90_000.0_f64.powf(fit.alpha);
+    assert!(
+        (pred_under - 30.0).abs() < 1e-6,
+        "pred at n=30k should be ~30s, got {pred_under}"
+    );
+    assert!(
+        (pred_over - 90.0).abs() < 1e-6,
+        "pred at n=90k should be ~90s, got {pred_over}"
+    );
+    assert!(pred_under <= 60.0, "n=30k should FIT (≤60s budget)");
+    assert!(pred_over > 60.0, "n=90k should be OVER BUDGET (>60s)");
 }
 
 /// Refuse-to-extrapolate gate: when the fit's max-residual exceeds the
