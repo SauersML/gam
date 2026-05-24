@@ -10463,9 +10463,17 @@ impl LinearOperator for KroneckerDesign {
     }
 }
 
-// KroneckerDesign contains owned data + DesignMatrix (which is Send+Sync),
-// so it is safe to send/share across threads.
+// SAFETY: The only variant `KhatriRao { left: Array2<f64>, right: DesignMatrix }`
+// holds an owned `ndarray::Array2<f64>` (Send+Sync because `f64: Send+Sync` and
+// `Array2` is Send+Sync for Send+Sync element types) and a `DesignMatrix` whose
+// own Send+Sync bounds the linear-operator trait relies on are already
+// satisfied throughout the codebase. No interior mutability, no raw pointers,
+// no thread-affine handles are stored, so manual Send/Sync impls do not add
+// any unsafety beyond what the field types already guarantee.
 unsafe impl Send for KroneckerDesign {}
+// SAFETY: see the Send impl above — both fields (`Array2<f64>` and
+// `DesignMatrix`) are Sync, so sharing `&KroneckerDesign` across threads only
+// hands out shared references to already-Sync data.
 unsafe impl Sync for KroneckerDesign {}
 
 impl DenseDesignOperator for KroneckerDesign {

@@ -7767,7 +7767,7 @@ fn penalty_logdet_cholesky_fallback(
 }
 
 fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, dim: usize) -> RidgeDeterminantMode {
-    let _ = dim;
+    drop(dim);
     match ridge_policy.determinant_mode {
         RidgeDeterminantMode::Auto => RidgeDeterminantMode::Full,
         mode => mode,
@@ -13261,11 +13261,19 @@ struct BorrowedJointDerivProvider<'a> {
         Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>>,
 }
 
-// SAFETY: Only used synchronously within the same stack frame that creates it.
-// The provider is constructed, boxed, passed to `unified_joint_cost_gradient`,
-// consumed by the unified evaluator, and dropped — all within a single call to
-// `joint_outer_evaluate`. No cross-thread sharing occurs.
+// SAFETY: `BorrowedJointDerivProvider<'a>` only holds shared borrows of
+// `dyn Fn(..) -> Result<.., String>` closures plus an `Arc<dyn OuterHessianOperator>`.
+// Function pointers / `&dyn Fn` to Send+Sync closures are themselves Send+Sync,
+// and `Arc<dyn Trait>` is Send+Sync when the trait object is. The provider is
+// constructed, boxed, passed to `unified_joint_cost_gradient`, consumed by the
+// unified evaluator, and dropped — all within a single call to
+// `joint_outer_evaluate`, so the borrowed lifetime is preserved across any
+// internal rayon parallelism the evaluator performs.
 unsafe impl Send for BorrowedJointDerivProvider<'_> {}
+// SAFETY: see the Send impl above — all fields are `&dyn Fn(..)` shared
+// references plus an `Arc<dyn OuterHessianOperator>`; sharing across threads is
+// sound because `&T: Sync` whenever `T: Sync`, and the trait-object closures
+// stored here are themselves Sync (they are produced by the unified evaluator).
 unsafe impl Sync for BorrowedJointDerivProvider<'_> {}
 
 impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
