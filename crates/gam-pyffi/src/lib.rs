@@ -1343,7 +1343,7 @@ fn gaussian_reml_fit_backward<'py>(
     Ok(out.unbind())
 }
 
-#[pyfunction(signature = (headers, rows, formula, y, config_json = None))]
+#[pyfunction(signature = (headers, rows, formula, y, config_json = None, fisher_rao_w = None))]
 fn gaussian_reml_fit_formula_table<'py>(
     py: Python<'py>,
     headers: Vec<String>,
@@ -1351,8 +1351,10 @@ fn gaussian_reml_fit_formula_table<'py>(
     formula: String,
     y: PyReadonlyArray2<'py, f64>,
     config_json: Option<String>,
+    fisher_rao_w: Option<PyReadonlyArray3<'py, f64>>,
 ) -> PyResult<Py<PyDict>> {
     let y_values = y.as_array().to_owned();
+    let fisher_values = fisher_rao_w.as_ref().map(|w| w.as_array().to_owned());
     let result = py
         .detach(move || {
             gaussian_reml_fit_formula_table_impl(
@@ -1361,6 +1363,7 @@ fn gaussian_reml_fit_formula_table<'py>(
                 formula,
                 y_values.view(),
                 config_json.as_deref(),
+                fisher_values.as_ref().map(|w| w.view()),
             )
         })
         .map_err(py_value_error)?;
@@ -6501,6 +6504,7 @@ fn gaussian_reml_fit_formula_table_impl(
     formula: String,
     y: ArrayView2<'_, f64>,
     config_json: Option<&str>,
+    fisher_rao_w: Option<ArrayView3<'_, f64>>,
 ) -> Result<gam::gaussian_reml::GaussianRemlMultiResult, String> {
     let dataset = dataset_with_inferred_schema(headers, rows)?;
     let mut fit_config = parse_fit_config(config_json)?;
@@ -6550,6 +6554,9 @@ fn gaussian_reml_fit_formula_table_impl(
         ));
     }
     let penalty = global_penalty_from_block(x.ncols(), &design.penalties[0])?;
+    if let Some(w) = fisher_rao_w {
+        return gaussian_reml_formula_table_dense_fisher(x.view(), y, penalty.view(), standard.weights.view(), w);
+    }
     gam::gaussian_reml::gaussian_reml_multi_closed_form(
         x.view(),
         y,

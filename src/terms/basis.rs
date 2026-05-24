@@ -10796,9 +10796,8 @@ pub fn closed_form_psi_derivatives_in_total_basis(
                 )
             };
             // SAFETY: g_row / g_psi_row / g_psi_psi_row each point at
-            // lower_triangular_offset(i) of their respective k(k+1)/2
-            // buffers; j ∈ 0..=i confines the writes to row i, owned
-            // exclusively by this parallel iteration.
+            // lower_triangular_offset(i) of their k(k+1)/2 buffers; j ∈ 0..=i
+            // confines writes to row i, owned by this parallel iteration.
             unsafe {
                 *g_row.add(j) = bundle.value;
                 *g_psi_row.add(j) = kappa * bundle.d_kappa;
@@ -10939,10 +10938,9 @@ pub fn closed_form_aniso_psi_derivatives_in_total_basis(
                     q, p_order, s_order, kappa, eta_raw, &powers, &r_buf,
                 )
             };
-            // SAFETY: g_row plus each g_eta*/g_eta2* row pointer was
-            // resolved to lower_triangular_offset(i) of its k(k+1)/2
-            // buffer at the top of this iteration; the writes at offset j
-            // stay within row i, owned exclusively by this rayon iter.
+            // SAFETY: g_row and each g_eta*/g_eta2* row pointer was resolved to
+            // lower_triangular_offset(i) at the top of this iteration; writes at
+            // offset j ∈ 0..=i stay within row i, owned by this rayon iter, and
             // cross_pairs.len() matches the count of g_eta2_cross_rows.
             unsafe {
                 *g_row.add(j) = bundle.value;
@@ -35745,22 +35743,22 @@ mod tests {
             for n in 0..96 {
                 let kappa_factor = match kappa_derivative_order {
                     0 => 1.0,
-                    1 => {
-                        if n == 0 {
-                            0.0
-                        } else {
-                            2.0 * n as f64 / kappa
-                        }
-                    }
-                    2 => {
+                    other => {
+                        // Closed-form k-th κ-derivative of (κ²)^n; mirrors the
+                        // production routine
+                        // `duchon_small_chi_riesz_series_radial_derivatives`.
                         if n == 0 {
                             0.0
                         } else {
                             let p = 2.0 * n as f64;
-                            p * (p - 1.0) / kappa_sq
+                            let mut numerator = 1.0_f64;
+                            for j in 0..other {
+                                numerator *= p - j as f64;
+                            }
+                            let denom = kappa.powi(other as i32);
+                            numerator / denom
                         }
                     }
-                    _ => unreachable!(),
                 };
                 if kappa_factor != 0.0 {
                     let block = odd_dim_riesz_block_from_value(d, a + b + n, r, max_order);
