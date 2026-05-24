@@ -1,8 +1,4 @@
-use serde::{Deserialize, Serialize};
-
-/// Capability flags derived from CUDA device attributes.  Compute capability is
-/// only a hint; runtime probing fills the concrete memory and SM attributes.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct GpuCapability {
     pub compute_major: i32,
     pub compute_minor: i32,
@@ -15,7 +11,6 @@ pub struct GpuCapability {
 }
 
 impl GpuCapability {
-    #[must_use]
     pub fn from_compute_capability(major: i32, minor: i32) -> Self {
         Self {
             compute_major: major,
@@ -30,8 +25,7 @@ impl GpuCapability {
     }
 }
 
-/// Device information consumed by dispatch policy and profile logs.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct GpuDeviceInfo {
     pub ordinal: usize,
     pub name: String,
@@ -45,12 +39,11 @@ pub struct GpuDeviceInfo {
     pub ecc_enabled: bool,
     pub integrated: bool,
     pub mig_mode: bool,
+    pub peer_access: Vec<bool>,
 }
 
 impl GpuDeviceInfo {
-    #[must_use]
     pub fn score(&self) -> f64 {
-        let free_gib = self.free_mem_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
         let fp64_bonus = if self.capability.has_fp64_tensor_cores {
             100.0
         } else {
@@ -61,6 +54,9 @@ impl GpuDeviceInfo {
         } else {
             0.0
         };
-        f64::from(self.sm_count.max(0)) + free_gib * 4.0 + fp64_bonus + async_bonus
+        self.sm_count as f64
+            + (self.free_mem_bytes as f64 / 1_073_741_824.0) * 4.0
+            + fp64_bonus
+            + async_bonus
     }
 }

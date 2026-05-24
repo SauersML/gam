@@ -1,7 +1,16 @@
-//! Phase-specific GPU backend placeholder.
-//!
-//! The public marker keeps the HAL surface explicit while the default build and
-//! unsupported CUDA configurations use CPU fallback through dispatch policy.
+#[derive(Clone, Debug)]
+pub struct FusedXtWxConfig {
+    pub tile_p: usize,
+    pub chunk_rows: usize,
+    pub signed_weights: bool,
+}
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BackendPhaseMarker;
+impl Default for FusedXtWxConfig {
+    fn default() -> Self {
+        Self {
+            tile_p: 32,
+            chunk_rows: 32_768,
+            signed_weights: true,
+        }
+    }
+}
