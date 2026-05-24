@@ -31,10 +31,10 @@ use std::sync::Arc;
 
 use crate::solver::arrow_schur::{ArrowRowBlock, ArrowSchurError, ArrowSchurSystem};
 use crate::terms::analytic_penalties::{
-    ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, IBPAssignmentPenalty, PsiSlice,
-    SoftmaxAssignmentSparsityPenalty,
+    ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
+    IBPAssignmentPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty,
 };
-use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode};
+use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 
 /// Decay law for deterministic Gumbel/concrete assignment temperature.
 #[derive(Debug, Clone)]
@@ -149,6 +149,31 @@ pub enum SaeAtomBasisKind {
     Precomputed(String),
 }
 
+impl SaeAtomBasisKind {
+    fn latent_manifold(&self, latent_dim: usize) -> LatentManifold {
+        match self {
+            Self::Periodic => {
+                if latent_dim == 1 {
+                    LatentManifold::Circle
+                } else {
+                    LatentManifold::Product(
+                        (0..latent_dim).map(|_| LatentManifold::Circle).collect(),
+                    )
+                }
+            }
+            Self::Sphere => LatentManifold::Sphere { dim: latent_dim },
+            Self::Duchon | Self::EuclideanPatch | Self::Precomputed(_) => LatentManifold::Euclidean,
+        }
+    }
+}
+
+pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
+    fn evaluate(
+        &self,
+        coords: ArrayView2<'_, f64>,
+    ) -> Result<(Array2<f64>, Array3<f64>), String>;
+}
+
 /// One manifold atom.
 ///
 /// `basis_values` is `Phi_k(t_{ik})`, shape `(N, M_k)`.
@@ -164,6 +189,7 @@ pub struct SaeManifoldAtom {
     pub basis_jacobian: Array3<f64>,
     pub decoder_coefficients: Array2<f64>,
     pub smooth_penalty: Array2<f64>,
+    pub basis_evaluator: Option<Arc<dyn SaeBasisEvaluator>>,
 }
 
 impl SaeManifoldAtom {
@@ -210,7 +236,40 @@ impl SaeManifoldAtom {
             basis_jacobian,
             decoder_coefficients,
             smooth_penalty,
+            basis_evaluator: None,
         })
+    }
+
+    pub fn with_basis_evaluator(mut self, evaluator: Arc<dyn SaeBasisEvaluator>) -> Self {
+        self.basis_evaluator = Some(evaluator);
+        self
+    }
+
+    pub fn refresh_basis(&mut self, coords: ArrayView2<'_, f64>) -> Result<(), String> {
+        let evaluator = self.basis_evaluator.as_ref().ok_or_else(|| {
+            format!(
+                "SaeManifoldAtom {} has no basis evaluator; caller must rebuild the term after each coordinate step",
+                self.name
+            )
+        })?;
+        let (phi, jet) = evaluator.evaluate(coords)?;
+        if phi.dim() != self.basis_values.dim() {
+            return Err(format!(
+                "SaeManifoldAtom::refresh_basis: evaluator returned Phi {:?}, expected {:?}",
+                phi.dim(),
+                self.basis_values.dim()
+            ));
+        }
+        if jet.dim() != self.basis_jacobian.dim() {
+            return Err(format!(
+                "SaeManifoldAtom::refresh_basis: evaluator returned jet {:?}, expected {:?}",
+                jet.dim(),
+                self.basis_jacobian.dim()
+            ));
+        }
+        self.basis_values = phi;
+        self.basis_jacobian = jet;
+        Ok(())
     }
 
     pub fn n_obs(&self) -> usize {
@@ -431,13 +490,33 @@ impl SaeAssignment {
         out
     }
 
-    pub fn assignments_row(&self, row: usize) -> Array1<f64> {
-        match self.mode {
-            AssignmentMode::Softmax { temperature, .. } => {
-                softmax_row(self.logits.row(row), temperature)
+    pub fn try_assignments(&self) -> Result<Array2<f64>, String> {
+        let n = self.n_obs();
+        let k = self.k_atoms();
+        let mut out = Array2::<f64>::zeros((n, k));
+        for row in 0..n {
+            let a = self.try_assignments_row(row)?;
+            for atom in 0..k {
+                out[[row, atom]] = a[atom];
             }
+        }
+        Ok(out)
+    }
+
+    pub fn assignments_row(&self, row: usize) -> Array1<f64> {
+        self.try_assignments_row(row)
+            .expect("assignment logits must be finite")
+    }
+
+    pub fn try_assignments_row(&self, row: usize) -> Result<Array1<f64>, String> {
+        validate_finite_logits(self.logits.row(row), row)?;
+        match self.mode {
+            AssignmentMode::Softmax { temperature, .. } => Ok(softmax_row(
+                self.logits.row(row),
+                temperature,
+            )),
             AssignmentMode::IBPMap { temperature, .. } => {
-                sigmoid_row(self.logits.row(row), temperature)
+                Ok(sigmoid_row(self.logits.row(row), temperature))
             }
         }
     }
@@ -488,6 +567,34 @@ impl SaeAssignment {
         let coords = coord_blocks
             .iter()
             .map(|c| LatentCoordValues::from_matrix(c.view(), LatentIdMode::None))
+            .collect();
+        Self::with_mode(logits, coords, mode)
+    }
+
+    #[must_use = "build error must be handled"]
+    pub fn from_blocks_with_mode_and_manifolds(
+        logits: Array2<f64>,
+        coord_blocks: Vec<Array2<f64>>,
+        manifolds: Vec<LatentManifold>,
+        mode: AssignmentMode,
+    ) -> Result<Self, String> {
+        if coord_blocks.len() != manifolds.len() {
+            return Err(format!(
+                "SaeAssignment::from_blocks_with_mode_and_manifolds: coord block length {} != manifold length {}",
+                coord_blocks.len(),
+                manifolds.len()
+            ));
+        }
+        let coords = coord_blocks
+            .iter()
+            .zip(manifolds.into_iter())
+            .map(|(c, manifold)| {
+                LatentCoordValues::from_matrix_with_manifold(
+                    c.view(),
+                    LatentIdMode::None,
+                    manifold,
+                )
+            })
             .collect();
         Self::with_mode(logits, coords, mode)
     }
@@ -685,12 +792,17 @@ impl SaeManifoldTerm {
     }
 
     pub fn fitted(&self) -> Array2<f64> {
+        self.try_fitted()
+            .expect("assignment logits must be finite")
+    }
+
+    pub fn try_fitted(&self) -> Result<Array2<f64>, String> {
         let n = self.n_obs();
         let p = self.output_dim();
         let k_atoms = self.k_atoms();
         let mut out = Array2::<f64>::zeros((n, p));
         for row in 0..n {
-            let a = self.assignment.assignments_row(row);
+            let a = self.assignment.try_assignments_row(row)?;
             for atom_idx in 0..k_atoms {
                 let g = self.atoms[atom_idx].decoded_row(row);
                 for out_col in 0..p {
@@ -698,7 +810,7 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     pub fn loss(
@@ -714,7 +826,7 @@ impl SaeManifoldTerm {
                 target.dim()
             ));
         }
-        let fitted = self.fitted();
+        let fitted = self.try_fitted()?;
         let mut data_fit = 0.0_f64;
         for row in 0..target.nrows() {
             for out_col in 0..target.ncols() {
@@ -792,6 +904,7 @@ impl SaeManifoldTerm {
         &self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
     ) -> Result<ArrowSchurSystem, String> {
         if target.dim() != (self.n_obs(), self.output_dim()) {
             return Err(format!(
@@ -841,7 +954,7 @@ impl SaeManifoldTerm {
         }
 
         for row in 0..n {
-            let assignments = self.assignment.assignments_row(row);
+            let assignments = self.assignment.try_assignments_row(row)?;
             let mut decoded: Vec<Array1<f64>> = Vec::with_capacity(k_atoms);
             let mut fitted = Array1::<f64>::zeros(p);
             for atom_idx in 0..k_atoms {
@@ -969,18 +1082,234 @@ impl SaeManifoldTerm {
             }
             sys.rows[row] = block;
         }
+        if let Some(registry) = analytic_penalties {
+            self.add_sae_analytic_penalty_contributions(&mut sys, registry)
+                .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
+        }
+        self.apply_sae_riemannian_geometry(&mut sys);
         Ok(sys)
+    }
+
+    fn ext_coord_matrix(&self) -> Array2<f64> {
+        let n = self.n_obs();
+        let q = self.assignment.row_block_dim();
+        let flat = self.assignment.flatten_ext_coords();
+        let mut out = Array2::<f64>::zeros((n, q));
+        for row in 0..n {
+            for col in 0..q {
+                out[[row, col]] = flat[row * q + col];
+            }
+        }
+        out
+    }
+
+    fn ext_coord_manifold(&self) -> LatentManifold {
+        let mut parts = Vec::with_capacity(self.assignment.row_block_dim());
+        for _ in 0..self.k_atoms() {
+            parts.push(LatentManifold::Euclidean);
+        }
+        let mut any_constrained = false;
+        for coord in &self.assignment.coords {
+            if coord.manifold().is_euclidean() {
+                for _ in 0..coord.latent_dim() {
+                    parts.push(LatentManifold::Euclidean);
+                }
+            } else {
+                any_constrained = true;
+                parts.push(coord.manifold().clone());
+            }
+        }
+        if any_constrained {
+            LatentManifold::Product(parts)
+        } else {
+            LatentManifold::Euclidean
+        }
+    }
+
+    fn apply_sae_riemannian_geometry(&self, sys: &mut ArrowSchurSystem) {
+        let manifold = self.ext_coord_manifold();
+        if manifold.is_euclidean() {
+            return;
+        }
+        let ext = self.ext_coord_matrix();
+        let latent =
+            LatentCoordValues::from_matrix_with_manifold(ext.view(), LatentIdMode::None, manifold);
+        sys.apply_riemannian_latent_geometry(&latent);
+    }
+
+    pub fn update_ard_reml(&self, rho: &mut SaeManifoldRho) -> Result<(), String> {
+        if rho.log_ard.len() != self.k_atoms() {
+            return Err(format!(
+                "SaeManifoldTerm::update_ard_reml: log_ard length {} != K {}",
+                rho.log_ard.len(),
+                self.k_atoms()
+            ));
+        }
+        let n = self.n_obs() as f64;
+        for (atom_idx, coord) in self.assignment.coords.iter().enumerate() {
+            let d = coord.latent_dim();
+            if rho.log_ard[atom_idx].len() != d {
+                return Err(format!(
+                    "SaeManifoldTerm::update_ard_reml: atom {atom_idx} log_ard length {} != dim {d}",
+                    rho.log_ard[atom_idx].len()
+                ));
+            }
+            for axis in 0..d {
+                let mut sq = 0.0;
+                for row in 0..coord.n_obs() {
+                    let v = coord.row(row)[axis];
+                    sq += v * v;
+                }
+                let alpha = n / sq.max(1.0e-12);
+                rho.log_ard[atom_idx][axis] = alpha.ln().clamp(-8.0, 16.0);
+            }
+        }
+        Ok(())
+    }
+
+    fn add_sae_analytic_penalty_contributions(
+        &self,
+        sys: &mut ArrowSchurSystem,
+        registry: &AnalyticPenaltyRegistry,
+    ) -> Result<(), ArrowSchurError> {
+        let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
+        let layout = registry.rho_layout();
+        let logits_flat = flat_logits(self.assignment.logits.view());
+        let beta = self.flatten_beta();
+        for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(layout.iter()) {
+            let rho_local = rho_global.slice(s![rho_slice.clone()]);
+            match tier {
+                PenaltyTier::Psi => {
+                    if matches!(
+                        penalty,
+                        AnalyticPenaltyKind::IBPAssignment(_)
+                            | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
+                    ) {
+                        self.add_sae_logit_penalty(sys, penalty, logits_flat.view(), rho_local);
+                    } else if self.k_atoms() == 1 && sae_penalty_is_row_block_supported(penalty) {
+                        let off = self.assignment.coord_offsets()[0];
+                        let coord = &self.assignment.coords[0];
+                        self.add_sae_coord_penalty(sys, off, coord, penalty, rho_local);
+                    } else {
+                        return Err(ArrowSchurError::SchurFactorFailed {
+                            reason: format!(
+                                "analytic penalty {name:?} cannot be injected into the SAE-manifold row layout; multi-atom coordinate or cross-row penalties require an explicit atom target"
+                            ),
+                        });
+                    }
+                }
+                PenaltyTier::Beta => {
+                    self.add_sae_beta_penalty(sys, penalty, beta.view(), rho_local);
+                }
+                PenaltyTier::Rho => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn add_sae_logit_penalty(
+        &self,
+        sys: &mut ArrowSchurSystem,
+        penalty: &AnalyticPenaltyKind,
+        target: ArrayView1<'_, f64>,
+        rho_local: ArrayView1<'_, f64>,
+    ) {
+        let n = self.n_obs();
+        let k = self.k_atoms();
+        let grad = penalty.grad_target(target, rho_local);
+        for row in 0..n {
+            for atom in 0..k {
+                sys.rows[row].gt[atom] += grad[row * k + atom];
+            }
+        }
+        if let Some(diag) = penalty.hessian_diag(target, rho_local) {
+            for row in 0..n {
+                for atom in 0..k {
+                    sys.rows[row].htt[[atom, atom]] += diag[row * k + atom];
+                }
+            }
+        }
+    }
+
+    fn add_sae_coord_penalty(
+        &self,
+        sys: &mut ArrowSchurSystem,
+        off: usize,
+        coord: &LatentCoordValues,
+        penalty: &AnalyticPenaltyKind,
+        rho_local: ArrayView1<'_, f64>,
+    ) {
+        let n = coord.n_obs();
+        let d = coord.latent_dim();
+        let target = coord.as_flat().view();
+        let grad = penalty.grad_target(target, rho_local);
+        for row in 0..n {
+            for axis in 0..d {
+                sys.rows[row].gt[off + axis] += grad[row * d + axis];
+            }
+        }
+        if let Some(diag) = penalty.hessian_diag(target, rho_local) {
+            for row in 0..n {
+                for axis in 0..d {
+                    sys.rows[row].htt[[off + axis, off + axis]] += diag[row * d + axis];
+                }
+            }
+            return;
+        }
+        let mut probe = Array1::<f64>::zeros(n * d);
+        for axis in 0..d {
+            probe.fill(0.0);
+            for row in 0..n {
+                probe[row * d + axis] = 1.0;
+            }
+            let hv = penalty.hvp(target, rho_local, probe.view());
+            for row in 0..n {
+                for b in 0..d {
+                    sys.rows[row].htt[[off + b, off + axis]] += hv[row * d + b];
+                }
+            }
+        }
+    }
+
+    fn add_sae_beta_penalty(
+        &self,
+        sys: &mut ArrowSchurSystem,
+        penalty: &AnalyticPenaltyKind,
+        target_beta: ArrayView1<'_, f64>,
+        rho_local: ArrayView1<'_, f64>,
+    ) {
+        let k = self.beta_dim();
+        let grad = penalty.grad_target(target_beta, rho_local);
+        for j in 0..k {
+            sys.gb[j] += grad[j];
+        }
+        if let Some(diag) = penalty.hessian_diag(target_beta, rho_local) {
+            for j in 0..k {
+                sys.hbb[[j, j]] += diag[j];
+            }
+            return;
+        }
+        let mut probe = Array1::<f64>::zeros(k);
+        for j in 0..k {
+            probe.fill(0.0);
+            probe[j] = 1.0;
+            let hv = penalty.hvp(target_beta, rho_local, probe.view());
+            for i in 0..k {
+                sys.hbb[[i, j]] += hv[i];
+            }
+        }
     }
 
     pub fn solve_newton_step(
         &self,
         target: ArrayView2<'_, f64>,
         rho: &SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
         ridge_ext_coord: f64,
         ridge_beta: f64,
     ) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
         let sys = self
-            .assemble_arrow_schur(target, rho)
+            .assemble_arrow_schur(target, rho, analytic_penalties)
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })?;
         sys.solve(ridge_ext_coord, ridge_beta)
     }
@@ -990,6 +1319,25 @@ impl SaeManifoldTerm {
         delta_ext_coord: ArrayView1<'_, f64>,
         delta_beta: ArrayView1<'_, f64>,
         step_size: f64,
+    ) -> Result<(), String> {
+        self.apply_newton_step_impl(delta_ext_coord, delta_beta, step_size, true)
+    }
+
+    pub fn apply_newton_step_external_basis_refresh(
+        &mut self,
+        delta_ext_coord: ArrayView1<'_, f64>,
+        delta_beta: ArrayView1<'_, f64>,
+        step_size: f64,
+    ) -> Result<(), String> {
+        self.apply_newton_step_impl(delta_ext_coord, delta_beta, step_size, false)
+    }
+
+    fn apply_newton_step_impl(
+        &mut self,
+        delta_ext_coord: ArrayView1<'_, f64>,
+        delta_beta: ArrayView1<'_, f64>,
+        step_size: f64,
+        refresh_basis: bool,
     ) -> Result<(), String> {
         if !(step_size.is_finite() && step_size > 0.0) {
             return Err(format!(
@@ -1033,20 +1381,9 @@ impl SaeManifoldTerm {
                 }
             }
             self.assignment.coords[atom_idx].retract_flat_delta(delta_coord.view());
-
-            // The FFI caller supplies basis values and jets at the current grid.
-            // Advance the stored basis by the same first-order model used by
-            // the Gauss-Newton arrow-Schur step.
-            let m = self.atoms[atom_idx].basis_size();
-            for row in 0..n {
-                for basis_col in 0..m {
-                    let mut dphi = 0.0;
-                    for axis in 0..d {
-                        dphi += self.atoms[atom_idx].basis_jacobian[[row, basis_col, axis]]
-                            * delta_coord[row * d + axis];
-                    }
-                    self.atoms[atom_idx].basis_values[[row, basis_col]] += dphi;
-                }
+            if refresh_basis {
+                let coords = self.assignment.coords[atom_idx].as_matrix();
+                self.atoms[atom_idx].refresh_basis(coords.view())?;
             }
         }
 
@@ -1060,7 +1397,8 @@ impl SaeManifoldTerm {
     pub fn run_joint_fit_arrow_schur(
         &mut self,
         target: ArrayView2<'_, f64>,
-        rho: &SaeManifoldRho,
+        rho: &mut SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
         max_iter: usize,
         step_size: f64,
         ridge_ext_coord: f64,
@@ -1068,12 +1406,40 @@ impl SaeManifoldTerm {
     ) -> Result<SaeManifoldLoss, String> {
         for _ in 0..max_iter {
             self.advance_temperature_schedule()?;
+            self.update_ard_reml(rho)?;
             let (delta_ext_coord, delta_beta) = self
-                .solve_newton_step(target, rho, ridge_ext_coord, ridge_beta)
+                .solve_newton_step(target, rho, analytic_penalties, ridge_ext_coord, ridge_beta)
                 .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
             self.apply_newton_step(delta_ext_coord.view(), delta_beta.view(), step_size)?;
         }
+        self.update_ard_reml(rho)?;
         self.loss(target, rho)
+    }
+
+    pub fn run_single_external_basis_refresh_step_arrow_schur(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &mut SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        step_size: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+    ) -> Result<SaeManifoldLoss, String> {
+        self.advance_temperature_schedule()?;
+        self.update_ard_reml(rho)?;
+        let pre_step_loss = self.loss(target, rho)?;
+        let (delta_ext_coord, delta_beta) = self
+            .solve_newton_step(target, rho, analytic_penalties, ridge_ext_coord, ridge_beta)
+            .map_err(|err| {
+                format!("SaeManifoldTerm::run_single_external_basis_refresh_step_arrow_schur: {err}")
+            })?;
+        self.apply_newton_step_external_basis_refresh(
+            delta_ext_coord.view(),
+            delta_beta.view(),
+            step_size,
+        )?;
+        self.update_ard_reml(rho)?;
+        Ok(pre_step_loss)
     }
 
     /// Build the analytic-penalty descriptors that correspond to the current
@@ -1111,26 +1477,33 @@ impl SaeManifoldTerm {
 fn softmax_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
     let k = logits.len();
     let inv_tau = 1.0 / temperature;
-    let mut max_scaled = f64::NEG_INFINITY;
+    let mut max_logit = f64::NEG_INFINITY;
     for &v in logits.iter() {
-        max_scaled = max_scaled.max(v * inv_tau);
+        max_logit = max_logit.max(v);
     }
     let mut out = Array1::<f64>::zeros(k);
     let mut sum = 0.0;
     for i in 0..k {
-        let v = (logits[i] * inv_tau - max_scaled).exp();
+        let v = ((logits[i] - max_logit) * inv_tau).exp();
         out[i] = v;
         sum += v;
     }
-    if sum == 0.0 || !sum.is_finite() {
-        let uniform = 1.0 / k as f64;
-        out.fill(uniform);
-        return out;
-    }
+    debug_assert!(sum.is_finite() && sum > 0.0);
     for v in out.iter_mut() {
         *v /= sum;
     }
     out
+}
+
+fn validate_finite_logits(logits: ArrayView1<'_, f64>, row: usize) -> Result<(), String> {
+    for (col, &v) in logits.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(format!(
+                "SaeAssignment: non-finite assignment logit at row {row}, atom {col}: {v}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn sigmoid_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
@@ -1159,6 +1532,10 @@ fn flat_logits(logits: ArrayView2<'_, f64>) -> Array1<f64> {
 }
 
 fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f64 {
+    for row in 0..assignment.n_obs() {
+        validate_finite_logits(assignment.logits.row(row), row)
+            .expect("assignment logits must be finite");
+    }
     let target = flat_logits(assignment.logits.view());
     match assignment.mode {
         AssignmentMode::Softmax {
@@ -1196,6 +1573,9 @@ fn assignment_prior_grad_hdiag(
     assignment: &SaeAssignment,
     rho: &SaeManifoldRho,
 ) -> Result<(Array1<f64>, Array1<f64>), String> {
+    for row in 0..assignment.n_obs() {
+        validate_finite_logits(assignment.logits.row(row), row)?;
+    }
     let target = flat_logits(assignment.logits.view());
     match assignment.mode {
         AssignmentMode::Softmax {
@@ -1235,6 +1615,19 @@ fn assignment_prior_grad_hdiag(
             Ok((grad, diag))
         }
     }
+}
+
+fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) -> bool {
+    matches!(
+        penalty,
+        AnalyticPenaltyKind::Ard(_)
+            | AnalyticPenaltyKind::Sparsity(_)
+            | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
+            | AnalyticPenaltyKind::IBPAssignment(_)
+            | AnalyticPenaltyKind::RowPrecisionPrior(_)
+            | AnalyticPenaltyKind::ParametricRowPrecisionPrior(_)
+            | AnalyticPenaltyKind::ScadMcp(_)
+    )
 }
 
 /// Helper for padded FFI callers. Arrays use `(K, N, M_max)` and
@@ -1284,6 +1677,90 @@ pub fn term_from_padded_blocks_with_mode(
             s,
         )?);
     }
-    let assignment = SaeAssignment::from_blocks_with_mode(logits.to_owned(), coords.to_vec(), mode)?;
+    let manifolds = basis_kinds
+        .iter()
+        .zip(latent_dims.iter().copied())
+        .map(|(kind, d)| kind.latent_manifold(d))
+        .collect();
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits.to_owned(),
+        coords.to_vec(),
+        manifolds,
+        mode,
+    )?;
     SaeManifoldTerm::new(atoms, assignment)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    fn periodic_basis(coords: &Array2<f64>) -> (Array2<f64>, Array3<f64>) {
+        let n = coords.nrows();
+        let mut phi = Array2::<f64>::zeros((n, 3));
+        let mut jet = Array3::<f64>::zeros((n, 3, 1));
+        for row in 0..n {
+            let x = coords[[row, 0]].rem_euclid(1.0);
+            let angle = 2.0 * std::f64::consts::PI * x;
+            phi[[row, 0]] = 1.0;
+            phi[[row, 1]] = angle.sin();
+            phi[[row, 2]] = angle.cos();
+            jet[[row, 1, 0]] = 2.0 * std::f64::consts::PI * angle.cos();
+            jet[[row, 2, 0]] = -2.0 * std::f64::consts::PI * angle.sin();
+        }
+        (phi, jet)
+    }
+
+    #[test]
+    fn ibp_path_refreshes_periodic_basis_for_two_newton_iterations() {
+        let coords0 = array![[0.05], [0.20], [0.55], [0.80]];
+        let (phi0, jet0) = periodic_basis(&coords0);
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi0,
+            jet0,
+            array![[0.2], [-0.3], [0.4]],
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((4, 1)),
+            vec![coords0],
+            vec![LatentManifold::Circle],
+            AssignmentMode::ibp_map(0.7, 1.0, true),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let target = array![[0.10], [0.05], [-0.15], [0.20]];
+        let mut rho = SaeManifoldRho::new(0.0, -6.0, vec![Array1::<f64>::zeros(1)]);
+        let loss0 = term.loss(target.view(), &rho).unwrap().total();
+        let basis0 = term.atoms[0].basis_values.clone();
+
+        let loss = term
+            .run_joint_fit_arrow_schur(target.view(), &mut rho, None, 2, 0.05, 1.0e-3, 1.0e-3)
+            .unwrap();
+
+        assert!(loss.total().is_finite());
+        assert!(loss.total() <= loss0 + 1.0e-8);
+        assert!(term.assignment.coords[0].as_flat().iter().all(|v| v.is_finite()));
+        assert!(term.assignment.assignments().iter().all(|v| v.is_finite()));
+        let basis_delta = (&term.atoms[0].basis_values - &basis0).mapv(f64::abs).sum();
+        assert!(basis_delta > 1.0e-10);
+    }
+
+    #[derive(Debug)]
+    struct TestPeriodicEvaluator;
+
+    impl SaeBasisEvaluator for TestPeriodicEvaluator {
+        fn evaluate(
+            &self,
+            coords: ArrayView2<'_, f64>,
+        ) -> Result<(Array2<f64>, Array3<f64>), String> {
+            Ok(periodic_basis(&coords.to_owned()))
+        }
+    }
 }
