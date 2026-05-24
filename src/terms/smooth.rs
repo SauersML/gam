@@ -10,12 +10,12 @@ use crate::basis::{
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
     build_spherical_spline_basis, build_thin_plate_basis,
-    build_pca_basis_matrix, build_thin_plate_basis_log_kappa_derivatives,
-    center_strategy_is_auto, center_strategy_kind, center_strategy_num_centers,
-    center_strategy_with_num_centers, estimate_penalty_nullity, filter_active_penalty_candidates,
-    filter_active_penalty_candidates_with_ops, initial_aniso_contrasts,
-    orthogonality_transform_for_design, pairwise_distance_bounds, pairwise_distance_bounds_sampled,
-    pca_center_mean, points_in_aniso_y_space, select_centers_by_strategy,
+    build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto, center_strategy_kind,
+    center_strategy_num_centers, center_strategy_with_num_centers, estimate_penalty_nullity,
+    filter_active_penalty_candidates, filter_active_penalty_candidates_with_ops,
+    initial_aniso_contrasts, orthogonality_transform_for_design, pairwise_distance_bounds,
+    pairwise_distance_bounds_sampled, pca_center_mean, points_in_aniso_y_space,
+    select_centers_by_strategy,
 };
 use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
@@ -214,6 +214,8 @@ pub enum SmoothBasisSpec {
         feature_cols: Vec<usize>,
         basis_matrix: Array2<f64>,
         centered: bool,
+        #[serde(default = "default_pca_smooth_penalty")]
+        smooth_penalty: f64,
         #[serde(default)]
         center_mean: Option<Array1<f64>>,
     },
@@ -232,6 +234,10 @@ pub enum SmoothBasisSpec {
         smooth: Box<SmoothBasisSpec>,
         by_kind: ByVarKind,
     },
+}
+
+fn default_pca_smooth_penalty() -> f64 {
+    1.0
 }
 
 impl SmoothBasisSpec {
@@ -5002,6 +5008,7 @@ fn build_pca_smooth_basis(
     feature_cols: &[usize],
     basis_matrix: &Array2<f64>,
     centered: bool,
+    smooth_penalty: f64,
     center_mean: Option<&Array1<f64>>,
 ) -> Result<BasisBuildResult, BasisError> {
     if feature_cols.is_empty() {
@@ -5039,6 +5046,11 @@ fn build_pca_smooth_basis(
             "Pca basis matrix contains non-finite value at ({row}, {col})"
         )));
     }
+    if !smooth_penalty.is_finite() || smooth_penalty <= 0.0 {
+        return Err(BasisError::InvalidInput(format!(
+            "Pca smooth_penalty must be finite and positive; got {smooth_penalty}"
+        )));
+    }
 
     let mut x = select_columns(data, feature_cols)?;
     let fitted_mean = if centered {
@@ -5061,7 +5073,7 @@ fn build_pca_smooth_basis(
         None
     };
     let design = fast_ab(&x, basis_matrix);
-    let penalty = Array2::<f64>::eye(k_pca);
+    let penalty = Array2::<f64>::eye(k_pca) * smooth_penalty;
     Ok(BasisBuildResult {
         design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
         penalties: vec![penalty],
@@ -5080,6 +5092,7 @@ fn build_pca_smooth_basis(
             feature_cols: feature_cols.to_vec(),
             basis_matrix: basis_matrix.clone(),
             centered,
+            smooth_penalty,
             center_mean: fitted_mean,
         },
         kronecker_factored: None,
@@ -5333,6 +5346,7 @@ fn build_single_local_smooth_term(
             feature_cols,
             basis_matrix,
             centered,
+            smooth_penalty,
             center_mean,
         } => {
             if term.shape != ShapeConstraint::None {
@@ -5346,6 +5360,7 @@ fn build_single_local_smooth_term(
                 feature_cols,
                 basis_matrix,
                 *centered,
+                *smooth_penalty,
                 center_mean.as_ref(),
             )?
         }
@@ -6920,11 +6935,13 @@ fn with_identifiability_transform(
             feature_cols,
             basis_matrix,
             centered,
+            smooth_penalty,
             center_mean,
         } => Ok(BasisMetadata::Pca {
             feature_cols: feature_cols.clone(),
             basis_matrix: basis_matrix.clone(),
             centered: *centered,
+            smooth_penalty: *smooth_penalty,
             center_mean: center_mean.clone(),
         }),
         BasisMetadata::TensorBSpline {
@@ -12598,6 +12615,7 @@ fn try_build_spatial_term_log_kappa_derivative(
                 .map_err(EstimationError::from)?
         }
         SmoothBasisSpec::BSpline1D { .. }
+        | SmoothBasisSpec::Pca { .. }
         | SmoothBasisSpec::TensorBSpline { .. }
         | SmoothBasisSpec::FactorSmooth { .. }
         | SmoothBasisSpec::BySmooth { .. } => {
@@ -13835,6 +13853,12 @@ impl SingleBlockLatentCoordDesignCache {
             ) => Ok(crate::solver::latent_cache::LatentBasisKind::TensorBspline {
                 knots: knots.clone(),
                 degrees: degrees.clone(),
+            }),
+            (
+                SmoothBasisSpec::Pca { .. },
+                BasisMetadata::Pca { basis_matrix, .. },
+            ) => Ok(crate::solver::latent_cache::LatentBasisKind::Pca {
+                basis_matrix: basis_matrix.clone(),
             }),
             _ => Err(SmoothError::invalid_config(
                 "latent-coordinate design cache could not key the realized latent smooth basis"
@@ -15264,18 +15288,21 @@ pub fn freeze_term_collection_from_design(
                     feature_cols,
                     basis_matrix,
                     centered,
+                    smooth_penalty,
                     center_mean,
                 },
                 BasisMetadata::Pca {
                     feature_cols: fitted_cols,
                     basis_matrix: fitted_basis,
                     centered: fitted_centered,
+                    smooth_penalty: fitted_smooth_penalty,
                     center_mean: fitted_mean,
                 },
             ) => {
                 *feature_cols = fitted_cols.clone();
                 *basis_matrix = fitted_basis.clone();
                 *centered = *fitted_centered;
+                *smooth_penalty = *fitted_smooth_penalty;
                 *center_mean = fitted_mean.clone();
             }
             (
@@ -15402,18 +15429,21 @@ pub fn freeze_term_collection_from_design(
                             feature_cols,
                             basis_matrix,
                             centered,
+                            smooth_penalty,
                             center_mean,
                         },
                         BasisMetadata::Pca {
                             feature_cols: fitted_cols,
                             basis_matrix: fitted_basis,
                             centered: fitted_centered,
+                            smooth_penalty: fitted_smooth_penalty,
                             center_mean: fitted_mean,
                         },
                     ) => {
                         *feature_cols = fitted_cols.clone();
                         *basis_matrix = fitted_basis.clone();
                         *centered = *fitted_centered;
+                        *smooth_penalty = *fitted_smooth_penalty;
                         *center_mean = fitted_mean.clone();
                     }
                     _ => {}
