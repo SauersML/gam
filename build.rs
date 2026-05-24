@@ -3924,17 +3924,19 @@ fn body_is_trivial_sentinel(body: &str) -> bool {
     // the whole function to count as a stub — legitimate validation
     // followed by real logic survives because the tail won't match the
     // sentinel list. Each iteration of `strip_validation_prologue`
-    // tries, in order: any of the four `assert*!` / `assert_matches!`
-    // macros (paren/bracket/brace delimited); a single-statement
-    // `if <cond> { return <expr>; }` early-return guard;
-    // `drop(<expr>);`; a `_ = <expr>;` wildcard-assignment statement
-    // (the non-`let` form `scan_for_let_underscore` cannot see);
-    // and a terminator-method expression statement ending in
-    // `.unwrap()`, `.unwrap_or_default()`, or `.expect(...)`. Together
-    // these cover the documented bypass shapes the underscore-fn-arg
-    // ban produced in the wild — workers renaming `_param: T` to
-    // `param: T` and adding a single fake-use line to satisfy the
-    // scanner.
+    // tries, in order:
+    //   * any of `assert!` / `assert_eq!` / `assert_ne!` /
+    //     `assert_matches!` (any macro-delimiter style),
+    //   * a single-statement `if <cond> { return <expr>; }` guard
+    //     (multi-statement bodies survive — they may be real work),
+    //   * `drop(<expr>);`,
+    //   * `_ = <expr>;` — the non-`let` wildcard-assignment dodge that
+    //     `scan_for_let_underscore` cannot see.
+    // Terminator-method statements (`.unwrap();`, `.expect("...");`,
+    // `.unwrap_or_default();`) are deliberately NOT stripped: many
+    // legitimate functions exist solely to perform a side-effectful
+    // `.send(...).unwrap();` or similar and return `Ok(())`, and
+    // stripping the call would punish that correct shape.
     let after_prologue = strip_validation_prologue(body);
     let mut s = after_prologue.trim();
     if let Some(stripped) = s.strip_suffix(';') {
@@ -4017,10 +4019,6 @@ fn strip_validation_prologue(body: &str) -> &str {
             continue;
         }
         if let Some(rest) = strip_leading_wildcard_assignment(s) {
-            s = rest.trim_start();
-            continue;
-        }
-        if let Some(rest) = strip_leading_terminator_method(s) {
             s = rest.trim_start();
             continue;
         }
@@ -4297,76 +4295,6 @@ fn strip_leading_wildcard_assignment(s: &str) -> Option<&str> {
         i += 1;
     }
     None
-}
-
-/// Match a leading expression-statement whose terminating method is a
-/// no-result consumer used as fake validation: `.unwrap();`,
-/// `.expect("...");`, or `.unwrap_or_default();`. The expression
-/// itself is consumed by walking from the start of the body to the
-/// next top-level `;`, then verifying the segment before the `;` ends
-/// with one of the terminator suffixes. Restricting to these three
-/// keeps real method-call statements (`.push(...);`, `.write(...)?;`,
-/// `.send().await;`) from being stripped.
-fn strip_leading_terminator_method(s: &str) -> Option<&str> {
-    let bytes = s.as_bytes();
-    let mut paren: i32 = 0;
-    let mut brack: i32 = 0;
-    let mut brace: i32 = 0;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' => paren += 1,
-            b')' => paren -= 1,
-            b'[' => brack += 1,
-            b']' => brack -= 1,
-            b'{' => brace += 1,
-            b'}' => brace -= 1,
-            b';' if paren == 0 && brack == 0 && brace == 0 => {
-                let segment = s[..i].trim_end();
-                if segment.ends_with(".unwrap()")
-                    || segment.ends_with(".unwrap_or_default()")
-                    || segment_ends_with_method_call(segment, ".expect")
-                {
-                    return Some(&s[i + 1..]);
-                }
-                return None;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// True when `segment` syntactically ends with a method call whose
-/// dotted-method portion is exactly `method`. Walks parens backward
-/// from the trailing `)` to find its matching `(`, then checks the
-/// prefix immediately before that `(`. This is the precise check the
-/// terminator stripper needs — `"x.expect(y.run())"` matches `.expect`
-/// (last paren pair is the `.expect(...)` call), but
-/// `"y.expect(z).run()"` does NOT match `.expect` because the trailing
-/// paren pair belongs to `.run()`.
-fn segment_ends_with_method_call(segment: &str, method: &str) -> bool {
-    if !segment.ends_with(')') {
-        return false;
-    }
-    let bytes = segment.as_bytes();
-    let mut depth: i32 = 1;
-    let mut i = bytes.len() - 1;
-    while i > 0 {
-        i -= 1;
-        match bytes[i] {
-            b')' => depth += 1,
-            b'(' => {
-                depth -= 1;
-                if depth == 0 {
-                    return segment[..i].ends_with(method);
-                }
-            }
-            _ => {}
-        }
-    }
-    false
 }
 
 /// True when `s` looks like a path expression: identifier chars, plus `::`,
