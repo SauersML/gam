@@ -4955,6 +4955,19 @@ fn outer_tolerance(value: f64) -> Result<Tolerance, EstimationError> {
         .map_err(|err| EstimationError::InvalidInput(format!("outer tolerance is invalid: {err}")))
 }
 
+fn outer_gradient_tolerance(config: &OuterConfig) -> GradientTolerance {
+    let abs = config
+        .objective_scale
+        .map(|scale| config.tolerance.max(scale * 1.0e-9))
+        .unwrap_or(config.tolerance);
+    GradientTolerance {
+        abs,
+        rel_initial_grad: None,
+        rel_cost: Some(config.tolerance),
+        projected: true,
+    }
+}
+
 fn outer_max_iterations(value: usize) -> Result<MaxIterations, EstimationError> {
     MaxIterations::new(value)
         .map_err(|err| EstimationError::InvalidInput(format!("outer max_iter is invalid: {err}")))
@@ -4964,6 +4977,24 @@ fn sanitized_operator_trust_restart_radius(radius: Option<f64>) -> Option<f64> {
     radius
         .filter(|value| value.is_finite() && *value > 0.0)
         .map(|value| value.max(OPERATOR_TRUST_RESTART_RADIUS_FLOOR))
+}
+
+fn bfgs_axis_step_caps(config: &OuterConfig, layout: OuterThetaLayout) -> Option<Array1<f64>> {
+    if config.bfgs_step_cap.is_none() && config.bfgs_step_cap_psi.is_none() {
+        return None;
+    }
+    let mut caps = Array1::from_elem(layout.n_params, f64::INFINITY);
+    if let Some(cap) = config.bfgs_step_cap {
+        for i in 0..layout.rho_dim() {
+            caps[i] = cap;
+        }
+    }
+    if let Some(cap) = config.bfgs_step_cap_psi {
+        for i in layout.rho_dim()..layout.n_params {
+            caps[i] = cap;
+        }
+    }
+    Some(caps)
 }
 
 /// Execute a single plan attempt (seed generation → solver loop → best result).
@@ -5175,7 +5206,7 @@ fn run_outer_with_plan(
                     // at run time from the seed cost and initial grad
                     // norm. Replaces the previous gam-side
                     // precomputed `outer_scaled_tolerance` hack.
-                    let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
+                    let grad_tol = outer_gradient_tolerance(config);
                     let max_iter = outer_max_iterations(config.max_iter)?;
 
                     // Translate the seed_eval into an opt::OperatorSample
@@ -5316,7 +5347,7 @@ fn run_outer_with_plan(
                     let hessian_source = the_plan.hessian_source;
                     let (lo, hi) = &bounds_template;
                     let bounds = outer_bounds(lo, hi)?;
-                    let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
+                    let grad_tol = outer_gradient_tolerance(config);
                     let max_iter = outer_max_iterations(config.max_iter)?;
 
                     let objective = OuterSecondOrderBridge {
@@ -5457,7 +5488,7 @@ fn run_outer_with_plan(
                 seed_slot = started_seeds;
                 let (lo, hi) = &bounds_template;
                 let bounds = outer_bounds(lo, hi)?;
-                let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
+                let grad_tol = outer_gradient_tolerance(config);
                 let max_iter = outer_max_iterations(config.max_iter)?;
                 let objective = OuterFirstOrderBridge {
                     obj,
@@ -5484,6 +5515,9 @@ fn run_outer_with_plan(
                     .with_bounds(bounds)
                     .with_gradient_tolerance(grad_tol)
                     .with_max_iterations(max_iter);
+                if let Some(caps) = bfgs_axis_step_caps(config, layout) {
+                    optimizer = optimizer.with_axis_step_caps(caps);
+                }
                 if let Some(feedback) = config.outer_inner_cap.as_ref() {
                     optimizer = optimizer.with_observer(OuterAcceptObserver {
                         feedback: feedback.clone(),
