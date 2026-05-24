@@ -33,10 +33,6 @@ use std::time::{Duration, Instant};
 pub const BIOBANK_SHAPE_SEED: u64 = 0xB10B_AA1C_F13E_2026;
 pub const BIOBANK_SHAPE_PC_DIM: usize = 16;
 pub const DEFAULT_REPRO_N: usize = 50_000;
-#[cfg(test)]
-pub const DEFAULT_SMOKE_N: usize = 2_000;
-#[cfg(test)]
-pub const DEFAULT_WALL_BOUND: Duration = Duration::from_secs(300);
 
 #[derive(Clone)]
 pub struct BiobankShapeProblem {
@@ -47,30 +43,9 @@ pub struct BiobankShapeProblem {
 #[derive(Clone, Debug)]
 pub struct FitTiming {
     pub elapsed: Duration,
-    #[cfg(test)]
     pub outer_iterations: usize,
     pub inner_cycles: usize,
-    #[cfg(test)]
     pub outer_converged: bool,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub struct BetaDiff {
-    pub index: usize,
-    pub left: f64,
-    pub right: f64,
-    pub abs_diff: f64,
-    pub rel_diff: f64,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub struct BetaEquivalenceReport {
-    pub len: usize,
-    pub max_abs_diff: f64,
-    pub max_rel_diff: f64,
-    pub worst: Option<BetaDiff>,
 }
 
 fn normal_pair(rng: &mut StdRng) -> (f64, f64) {
@@ -244,95 +219,4 @@ pub fn fit_problem(
         }
         _ => Err("unexpected fit result variant".to_string()),
     }
-}
-
-#[cfg(test)]
-pub fn fit_synthetic_beta(
-    n: usize,
-    inner_max_cycles: usize,
-) -> Result<(Array1<f64>, FitTiming), String> {
-    let problem = build_biobank_shape_problem(n);
-    let (fit, timing) = fit_problem(problem, cycle_capped_options(inner_max_cycles))?;
-    Ok((fit.fit.beta, timing))
-}
-
-#[cfg(test)]
-pub fn compare_beta(
-    left: &Array1<f64>,
-    right: &Array1<f64>,
-    rel_tol: f64,
-) -> Result<BetaEquivalenceReport, String> {
-    if left.len() != right.len() {
-        return Err(format!(
-            "beta length mismatch: left={} right={}",
-            left.len(),
-            right.len()
-        ));
-    }
-    let mut report = BetaEquivalenceReport {
-        len: left.len(),
-        max_abs_diff: 0.0,
-        max_rel_diff: 0.0,
-        worst: None,
-    };
-    for (index, (&a, &b)) in left.iter().zip(right.iter()).enumerate() {
-        if !a.is_finite() || !b.is_finite() {
-            return Err(format!(
-                "non-finite beta at index {index}: left={a} right={b}"
-            ));
-        }
-        let abs_diff = (a - b).abs();
-        let scale = a.abs().max(b.abs()).max(1.0);
-        let rel_diff = abs_diff / scale;
-        if rel_diff > report.max_rel_diff || abs_diff > report.max_abs_diff {
-            report.max_abs_diff = report.max_abs_diff.max(abs_diff);
-            report.max_rel_diff = report.max_rel_diff.max(rel_diff);
-            report.worst = Some(BetaDiff {
-                index,
-                left: a,
-                right: b,
-                abs_diff,
-                rel_diff,
-            });
-        }
-    }
-    if report.max_rel_diff > rel_tol {
-        let worst = report.worst.as_ref().expect("worst beta diff");
-        return Err(format!(
-            "beta mismatch: len={} max_abs={:.3e} max_rel={:.3e} rel_tol={:.3e} worst_index={} left={:.17e} right={:.17e} worst_abs={:.3e} worst_rel={:.3e}",
-            report.len,
-            report.max_abs_diff,
-            report.max_rel_diff,
-            rel_tol,
-            worst.index,
-            worst.left,
-            worst.right,
-            worst.abs_diff,
-            worst.rel_diff
-        ));
-    }
-    Ok(report)
-}
-
-#[cfg(test)]
-pub fn assert_repeated_fit_beta_equivalent(
-    n: usize,
-    inner_max_cycles: usize,
-    rel_tol: f64,
-) -> BetaEquivalenceReport {
-    let (left, left_timing) = fit_synthetic_beta(n, inner_max_cycles).expect("left synthetic fit");
-    let (right, right_timing) =
-        fit_synthetic_beta(n, inner_max_cycles).expect("right synthetic fit");
-    let report = compare_beta(&left, &right, rel_tol).expect("synthetic fit beta equivalence");
-    eprintln!(
-        "[MS-FLEX-EQUIV-PASS] n={} inner_max_cycles={} beta_len={} max_abs={:.3e} max_rel={:.3e} left_elapsed_s={:.3} right_elapsed_s={:.3}",
-        n,
-        inner_max_cycles,
-        report.len,
-        report.max_abs_diff,
-        report.max_rel_diff,
-        left_timing.elapsed.as_secs_f64(),
-        right_timing.elapsed.as_secs_f64()
-    );
-    report
 }
