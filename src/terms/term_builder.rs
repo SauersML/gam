@@ -1302,8 +1302,6 @@ pub fn build_smooth_basis(
                     "identifiability",
                     "by",
                     "scale_dims",
-                    "streaming_chunk_size",
-                    "chunk_size",
                 ],
             )?;
             let plan = plan_spatial_basis(
@@ -1401,6 +1399,8 @@ pub fn build_smooth_basis(
                     "identifiability",
                     "by",
                     "scale_dims",
+                    "streaming_chunk_size",
+                    "chunk_size",
                 ],
             )?;
             let plan = plan_spatial_basis(
