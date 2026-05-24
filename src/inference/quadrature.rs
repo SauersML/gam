@@ -2783,23 +2783,9 @@ pub fn integrated_inverse_link_jetwith_state(
 #[inline]
 pub fn integrated_family_moments_jet(
     quadctx: &QuadratureContext,
-    family: LikelihoodFamily,
+    likelihood: &LikelihoodSpec,
     eta: f64,
     se_eta: f64,
-) -> Result<IntegratedMomentsJet, EstimationError> {
-    integrated_family_moments_jetwith_state(quadctx, family, eta, se_eta, None, None)
-}
-
-/// State-aware family-level integration dispatcher for Gaussian-uncertain
-/// linear predictors.
-#[inline]
-pub fn integrated_family_moments_jetwith_state(
-    quadctx: &QuadratureContext,
-    family: LikelihoodFamily,
-    eta: f64,
-    se_eta: f64,
-    mixture_link_state: Option<&MixtureLinkState>,
-    sas_link_state: Option<&SasLinkState>,
 ) -> Result<IntegratedMomentsJet, EstimationError> {
     const PROB_EPS: f64 = 1e-12;
     if !(eta.is_finite() && (-700.0..=700.0).contains(&eta)) {
@@ -2809,86 +2795,108 @@ pub fn integrated_family_moments_jetwith_state(
     }
     let e = eta;
     let se = se_eta.max(0.0);
-    match family {
-        LikelihoodFamily::BinomialLogit => {
-            let jet = integrated_inverse_link_jet(quadctx, LinkFunction::Logit, e, se)?;
-            let mean = jet.mean;
-            Ok(IntegratedMomentsJet {
-                mean,
-                variance: (mean * (1.0 - mean)).max(PROB_EPS),
-                d1: jet.d1,
-                d2: jet.d2,
-                d3: jet.d3,
-                mode: jet.mode,
-            })
-        }
-        LikelihoodFamily::BinomialProbit => {
-            let jet = integrated_inverse_link_jet(quadctx, LinkFunction::Probit, e, se)?;
-            let mean = jet.mean;
-            Ok(IntegratedMomentsJet {
-                mean,
-                variance: (mean * (1.0 - mean)).max(PROB_EPS),
-                d1: jet.d1,
-                d2: jet.d2,
-                d3: jet.d3,
-                mode: jet.mode,
-            })
-        }
-        LikelihoodFamily::BinomialCLogLog => {
-            let jet = integrated_inverse_link_jet(quadctx, LinkFunction::CLogLog, e, se)?;
-            let mean = jet.mean;
-            Ok(IntegratedMomentsJet {
-                mean,
-                variance: (mean * (1.0 - mean)).max(PROB_EPS),
-                d1: jet.d1,
-                d2: jet.d2,
-                d3: jet.d3,
-                mode: jet.mode,
-            })
-        }
-        LikelihoodFamily::BinomialLatentCLogLog => Err(EstimationError::InvalidInput(
-            "BinomialLatentCLogLog integrated moments require an explicit latent cloglog inverse-link state"
-                .to_string(),
-        )),
-        LikelihoodFamily::BinomialSas => {
-            let jet = integrated_inverse_link_jetwith_state(
-                quadctx,
-                LinkFunction::Sas,
-                e,
-                se,
-                mixture_link_state,
-                sas_link_state,
-            )?;
-            let mean = jet.mean;
-            Ok(IntegratedMomentsJet {
-                mean,
-                variance: (mean * (1.0 - mean)).max(PROB_EPS),
-                d1: jet.d1,
-                d2: jet.d2,
-                d3: jet.d3,
-                mode: jet.mode,
-            })
-        }
-        LikelihoodFamily::BinomialBetaLogistic => {
-            let jet = integrated_inverse_link_jetwith_state(
-                quadctx,
-                LinkFunction::BetaLogistic,
-                e,
-                se,
-                mixture_link_state,
-                sas_link_state,
-            )?;
-            let mean = jet.mean;
-            Ok(IntegratedMomentsJet {
-                mean,
-                variance: (mean * (1.0 - mean)).max(PROB_EPS),
-                d1: jet.d1,
-                d2: jet.d2,
-                d3: jet.d3,
-                mode: jet.mode,
-            })
-        }
-        LikelihoodFamily::GaussianIdentity => Ok(IntegratedMomentsJet {
+    // Pull parameterized link state from the spec itself; these helpers return
+    // `None` for `InverseLink::Standard`, which is what every non-parameterized
+    // dispatch arm expects.
+    let mixture_link_state: Option<&MixtureLinkState> = likelihood.link.mixture_state();
+    let sas_link_state: Option<&SasLinkState> = likelihood.link.sas_state();
+    match &likelihood.response {
+        ResponseFamily::Binomial => match &likelihood.link {
+            InverseLink::Standard(LinkFunction::Logit) => {
+                let jet = integrated_inverse_link_jet(quadctx, LinkFunction::Logit, e, se)?;
+                let mean = jet.mean;
+                Ok(IntegratedMomentsJet {
+                    mean,
+                    variance: (mean * (1.0 - mean)).max(PROB_EPS),
+                    d1: jet.d1,
+                    d2: jet.d2,
+                    d3: jet.d3,
+                    mode: jet.mode,
+                })
+            }
+            InverseLink::Standard(LinkFunction::Probit) => {
+                let jet = integrated_inverse_link_jet(quadctx, LinkFunction::Probit, e, se)?;
+                let mean = jet.mean;
+                Ok(IntegratedMomentsJet {
+                    mean,
+                    variance: (mean * (1.0 - mean)).max(PROB_EPS),
+                    d1: jet.d1,
+                    d2: jet.d2,
+                    d3: jet.d3,
+                    mode: jet.mode,
+                })
+            }
+            InverseLink::Standard(LinkFunction::CLogLog) => {
+                let jet = integrated_inverse_link_jet(quadctx, LinkFunction::CLogLog, e, se)?;
+                let mean = jet.mean;
+                Ok(IntegratedMomentsJet {
+                    mean,
+                    variance: (mean * (1.0 - mean)).max(PROB_EPS),
+                    d1: jet.d1,
+                    d2: jet.d2,
+                    d3: jet.d3,
+                    mode: jet.mode,
+                })
+            }
+            InverseLink::LatentCLogLog(_) => Err(EstimationError::InvalidInput(
+                "Binomial+LatentCLogLog integrated moments require an explicit latent cloglog inverse-link state"
+                    .to_string(),
+            )),
+            InverseLink::Sas(_) => {
+                let jet = integrated_inverse_link_jetwith_state(
+                    quadctx,
+                    LinkFunction::Sas,
+                    e,
+                    se,
+                    mixture_link_state,
+                    sas_link_state,
+                )?;
+                let mean = jet.mean;
+                Ok(IntegratedMomentsJet {
+                    mean,
+                    variance: (mean * (1.0 - mean)).max(PROB_EPS),
+                    d1: jet.d1,
+                    d2: jet.d2,
+                    d3: jet.d3,
+                    mode: jet.mode,
+                })
+            }
+            InverseLink::BetaLogistic(_) => {
+                let jet = integrated_inverse_link_jetwith_state(
+                    quadctx,
+                    LinkFunction::BetaLogistic,
+                    e,
+                    se,
+                    mixture_link_state,
+                    sas_link_state,
+                )?;
+                let mean = jet.mean;
+                Ok(IntegratedMomentsJet {
+                    mean,
+                    variance: (mean * (1.0 - mean)).max(PROB_EPS),
+                    d1: jet.d1,
+                    d2: jet.d2,
+                    d3: jet.d3,
+                    mode: jet.mode,
+                })
+            }
+            InverseLink::Mixture(state) => {
+                let jet = integrated_mixture_jet(quadctx, e, se, state)?;
+                let mean = jet.mean;
+                Ok(IntegratedMomentsJet {
+                    mean,
+                    variance: (mean * (1.0 - mean)).max(PROB_EPS),
+                    d1: jet.d1,
+                    d2: jet.d2,
+                    d3: jet.d3,
+                    mode: jet.mode,
+                })
+            }
+            InverseLink::Standard(other) => Err(EstimationError::InvalidInput(format!(
+                "Binomial response paired with unsupported standard link {other:?} for integrated moments"
+            ))),
+        },
+        ResponseFamily::Gaussian => Ok(IntegratedMomentsJet {
             mean: e,
             variance: 1.0,
             d1: 1.0,
@@ -2896,7 +2904,7 @@ pub fn integrated_family_moments_jetwith_state(
             d3: 0.0,
             mode: IntegratedExpectationMode::ExactClosedForm,
         }),
-        LikelihoodFamily::RoystonParmar => {
+        ResponseFamily::RoystonParmar => {
             let jet = integrated_inverse_link_jetwith_state(
                 quadctx,
                 LinkFunction::CLogLog,
@@ -2915,25 +2923,7 @@ pub fn integrated_family_moments_jetwith_state(
                 mode: jet.mode,
             })
         }
-        LikelihoodFamily::BinomialMixture => {
-            let state = mixture_link_state.ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "BinomialMixture integrated moments require explicit MixtureLinkState"
-                        .to_string(),
-                )
-            })?;
-            let jet = integrated_mixture_jet(quadctx, e, se, state)?;
-            let mean = jet.mean;
-            Ok(IntegratedMomentsJet {
-                mean,
-                variance: (mean * (1.0 - mean)).max(PROB_EPS),
-                d1: jet.d1,
-                d2: jet.d2,
-                d3: jet.d3,
-                mode: jet.mode,
-            })
-        }
-        LikelihoodFamily::BetaLogit { phi } => {
+        ResponseFamily::Beta { phi } => {
             let jet = integrated_inverse_link_jet(quadctx, LinkFunction::Logit, e, se)?;
             let mean = jet.mean.clamp(PROB_EPS, 1.0 - PROB_EPS);
             Ok(IntegratedMomentsJet {
@@ -2945,10 +2935,10 @@ pub fn integrated_family_moments_jetwith_state(
                 mode: jet.mode,
             })
         }
-        LikelihoodFamily::PoissonLog
-        | LikelihoodFamily::Tweedie { .. }
-        | LikelihoodFamily::NegativeBinomial { .. }
-        | LikelihoodFamily::GammaLog => {
+        ResponseFamily::Poisson
+        | ResponseFamily::Tweedie { .. }
+        | ResponseFamily::NegativeBinomial { .. }
+        | ResponseFamily::Gamma => {
             // Log-normal MGF: E[exp(η)] = exp(e + s²/2)
             // d/de = exp(e + s²/2)   (same as the mean)
             // d²/de² = exp(e + s²/2)
@@ -2956,13 +2946,15 @@ pub fn integrated_family_moments_jetwith_state(
             let s2 = se * se;
             let (mean, saturated) = safe_expwith_saturation(e + 0.5 * s2);
             // Variance of the response depends on family:
-            //   Poisson: Var = mean (since Var[Y|mu] = mu)
-            //   Gamma:   Var = mean² / shape, but shape not available here;
-            //            use mean² as proxy (shape=1).
-            let variance = match family {
-                LikelihoodFamily::PoissonLog => mean,
-                LikelihoodFamily::Tweedie { p } => mean.powf(p),
-                LikelihoodFamily::NegativeBinomial { theta } => {
+            //   Poisson:           Var = mean
+            //   Tweedie(p):        Var = mean^p
+            //   NegativeBinomial:  Var = mean + mean^2 / theta
+            //   Gamma:             Var = mean^2 / shape; shape not available
+            //                      here, so use mean^2 as the shape=1 proxy.
+            let variance = match &likelihood.response {
+                ResponseFamily::Poisson => mean,
+                ResponseFamily::Tweedie { p } => mean.powf(*p),
+                ResponseFamily::NegativeBinomial { theta } => {
                     mean + mean * mean / theta.max(1e-12)
                 }
                 _ => mean * mean,

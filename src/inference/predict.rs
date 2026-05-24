@@ -24,7 +24,7 @@ use crate::mixture_link::{
 };
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::quadrature::QuadratureContext;
-use crate::types::{InverseLink, LikelihoodFamily};
+use crate::types::{InverseLink, LikelihoodFamily, LikelihoodSpec, ResponseFamily};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 

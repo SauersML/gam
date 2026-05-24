@@ -3177,67 +3177,41 @@ impl FittedModel {
             }
         }
 
-        if matches!(
+        let family_likelihood = match &self.family_state {
+            FittedFamily::Standard { likelihood, .. }
+            | FittedFamily::LocationScale { likelihood, .. }
+            | FittedFamily::MarginalSlope { likelihood, .. }
+            | FittedFamily::Survival { likelihood, .. }
+            | FittedFamily::TransformationNormal { likelihood, .. } => Some(likelihood),
+            FittedFamily::LatentSurvival { .. } | FittedFamily::LatentBinary { .. } => None,
+        };
+        let is_standard_or_location_scale = matches!(
             self.family_state,
-            FittedFamily::Standard {
-                likelihood: LikelihoodFamily::BinomialSas,
-                ..
-            }
-        ) || matches!(
-            self.family_state,
-            FittedFamily::LocationScale {
-                likelihood: LikelihoodFamily::BinomialSas,
-                ..
-            }
-        ) {
+            FittedFamily::Standard { .. } | FittedFamily::LocationScale { .. }
+        );
+        if is_standard_or_location_scale
+            && family_likelihood.is_some_and(LikelihoodSpec::is_binomial_sas)
+        {
             self.saved_sas_state()?;
         }
-        if matches!(
-            self.family_state,
-            FittedFamily::Standard {
-                likelihood: LikelihoodFamily::BinomialBetaLogistic,
-                ..
-            }
-        ) || matches!(
-            self.family_state,
-            FittedFamily::LocationScale {
-                likelihood: LikelihoodFamily::BinomialBetaLogistic,
-                ..
-            }
-        ) {
+        if is_standard_or_location_scale
+            && family_likelihood.is_some_and(LikelihoodSpec::is_binomial_beta_logistic)
+        {
             self.saved_beta_logistic_state()?;
         }
-        if matches!(
-            self.family_state,
-            FittedFamily::Standard {
-                likelihood: LikelihoodFamily::BinomialMixture,
-                ..
-            }
-        ) || matches!(
-            self.family_state,
-            FittedFamily::LocationScale {
-                likelihood: LikelihoodFamily::BinomialMixture,
-                ..
-            }
-        ) {
+        if is_standard_or_location_scale
+            && family_likelihood.is_some_and(LikelihoodSpec::is_binomial_mixture)
+        {
             self.saved_mixture_state()?;
         }
-        if matches!(
-            self.family_state,
-            FittedFamily::Standard {
-                likelihood: LikelihoodFamily::BinomialLatentCLogLog,
-                ..
-            }
-        ) {
+        if matches!(self.family_state, FittedFamily::Standard { .. })
+            && family_likelihood.is_some_and(LikelihoodSpec::is_latent_cloglog)
+        {
             self.saved_latent_cloglog_state()?;
         }
-        if matches!(
-            self.family_state,
-            FittedFamily::LocationScale {
-                likelihood: LikelihoodFamily::BinomialLatentCLogLog,
-                ..
-            }
-        ) {
+        if matches!(self.family_state, FittedFamily::LocationScale { .. })
+            && family_likelihood.is_some_and(LikelihoodSpec::is_latent_cloglog)
+        {
             return Err(FittedModelError::IncompatibleConfig {
                 reason: "latent-cloglog-binomial is not supported for location-scale saved models"
                     .to_string(),
