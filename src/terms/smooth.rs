@@ -4040,7 +4040,7 @@ fn build_shape_constraint_design_1d(
                 double_penalty: false,
                 identifiability: ident,
                 aniso_log_scales: aniso_log_scales.clone(),
-            }
+                streaming_chunk_size: None,
             };
             build_matern_basis(grid_2d.view(), &evalspec)?
                 .design
@@ -7790,6 +7790,7 @@ fn with_identifiability_transform(
             identifiability_transform,
             input_scales,
             aniso_log_scales,
+            streaming_chunk_size,
         } => Ok(BasisMetadata::Matern {
             centers: centers.clone(),
             length_scale: *length_scale,
@@ -7802,7 +7803,7 @@ fn with_identifiability_transform(
             )?,
             input_scales: input_scales.clone(),
             aniso_log_scales: aniso_log_scales.clone(),
-        }
+            streaming_chunk_size: *streaming_chunk_size,
         }),
         BasisMetadata::Duchon {
             centers,
@@ -16250,7 +16251,6 @@ pub fn freeze_term_collection_from_design(
                     identifiability_transform,
                     input_scales: meta_scales,
                     aniso_log_scales: meta_aniso,
-                }
                 },
             ) => {
                 // Auto-promotion path: the basis builder rewrote a canonical-TPS
@@ -16311,7 +16311,7 @@ pub fn freeze_term_collection_from_design(
                     identifiability_transform,
                     input_scales: meta_scales,
                     aniso_log_scales: meta_aniso,
-                }
+                    streaming_chunk_size: meta_streaming_chunk_size,
                 },
             ) => {
                 s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
@@ -16325,6 +16325,7 @@ pub fn freeze_term_collection_from_design(
                     None => MaternIdentifiability::None,
                 };
                 s.aniso_log_scales = meta_aniso.clone();
+                s.streaming_chunk_size = *meta_streaming_chunk_size;
                 s.periodic = meta_periodic.clone();
                 *input_scales = meta_scales.clone();
             }
@@ -16343,7 +16344,6 @@ pub fn freeze_term_collection_from_design(
                     identifiability_transform,
                     input_scales: meta_scales,
                     aniso_log_scales: meta_aniso,
-                }
                 },
             ) => {
                 s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
@@ -18731,6 +18731,8 @@ fn try_exact_joint_latent_coord_optimization(
     let registry_for_key = ctx.cache.analytic_penalties();
     ctx.evaluator
         .set_analytic_penalty_registry(registry_for_key.as_deref());
+    ctx.evaluator
+        .set_persistent_latent_values_fingerprint(latent.values.id_mode());
     if let Some(cached_t) = ctx
         .evaluator
         .load_persistent_latent_values(latent.values.n_obs(), latent.values.latent_dim())
@@ -19810,7 +19812,7 @@ mod tests {
                     double_penalty: false,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
-                }
+                    streaming_chunk_size: None,
                 },
                 input_scales: None,
             },
@@ -20855,7 +20857,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
-                    }
+                        streaming_chunk_size: None,
                     },
                     input_scales: None,
                 },
@@ -20949,7 +20951,7 @@ mod tests {
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
-                }
+                    streaming_chunk_size: None,
                 },
                 input_scales: None,
             },
@@ -21236,7 +21238,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
-                    }
+                        streaming_chunk_size: None,
                     },
                     input_scales: None,
                 },
@@ -21739,7 +21741,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
-                    }
+                        streaming_chunk_size: None,
                     },
                     input_scales: None,
                 },
@@ -21846,7 +21848,7 @@ mod tests {
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
-                }
+                    streaming_chunk_size: None,
                 },
                 input_scales: None,
             },
@@ -22025,7 +22027,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: Some(vec![0.2, -0.2]),
-                    }
+                        streaming_chunk_size: None,
                     },
                     input_scales: None,
                 },
@@ -23552,7 +23554,7 @@ mod tests {
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
-                }
+                    streaming_chunk_size: None,
                 },
                 input_scales: None,
             },
@@ -23785,7 +23787,7 @@ mod tests {
                             double_penalty: true,
                             identifiability: MaternIdentifiability::CenterSumToZero,
                             aniso_log_scales: Some(vec![0.15, -0.15]),
-                        }
+                            streaming_chunk_size: None,
                         },
                         input_scales: None,
                     },
@@ -23921,7 +23923,7 @@ mod tests {
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
-                }
+                    streaming_chunk_size: None,
                 },
                 input_scales: None,
             },
@@ -24059,7 +24061,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
-                    }
+                        streaming_chunk_size: None,
                     },
                     input_scales: None,
                 },
@@ -24268,7 +24270,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
-                    }
+                        streaming_chunk_size: None,
                     },
                     input_scales: None,
                 },
@@ -24490,7 +24492,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
-                    }
+                        streaming_chunk_size: None,
                     },
                     input_scales: None,
                 },
@@ -24778,7 +24780,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
-                    }
+                        streaming_chunk_size: None,
                     },
                     input_scales: None,
                 },
@@ -24895,7 +24897,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
-                    }
+                        streaming_chunk_size: None,
                     },
                     input_scales: None,
                 },
@@ -25236,7 +25238,7 @@ mod tests {
                             double_penalty: false,
                             identifiability: MaternIdentifiability::None,
                             aniso_log_scales: Some(vec![0.3, -0.3]),
-                        }
+                            streaming_chunk_size: None,
                         },
                         input_scales: None,
                     },
@@ -25259,7 +25261,7 @@ mod tests {
                             double_penalty: false,
                             identifiability: MaternIdentifiability::None,
                             aniso_log_scales: None,
-                        }
+                            streaming_chunk_size: None,
                         },
                         input_scales: None,
                     },
@@ -25307,7 +25309,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::None,
                         aniso_log_scales: Some(vec![3.0, -3.0]),
-                    }
+                        streaming_chunk_size: None,
                     },
                     input_scales: None,
                 },
@@ -25468,7 +25470,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::None,
                         aniso_log_scales: Some(vec![0.0, 0.0]),
-                    }
+                        streaming_chunk_size: None,
                     },
                     input_scales: Some(vec![1.0, 1.0]),
                 },
@@ -26580,7 +26582,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
-                    }
+                        streaming_chunk_size: None,
                     },
                     input_scales: None,
                 },
@@ -26763,7 +26765,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
-                    }
+                        streaming_chunk_size: None,
                     },
                     input_scales: None,
                 },
@@ -26850,7 +26852,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
-                    }
+                        streaming_chunk_size: None,
                     },
                     input_scales: None,
                 },
@@ -27421,7 +27423,7 @@ mod tests {
                         double_penalty: true,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: None,
-                    }
+                        streaming_chunk_size: None,
                     },
                     input_scales: None,
                 },
