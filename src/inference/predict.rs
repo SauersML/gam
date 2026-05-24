@@ -26,7 +26,7 @@ use crate::mixture_link::{
 };
 use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::quadrature::QuadratureContext;
-use crate::types::{InverseLink, LikelihoodFamily, LikelihoodSpec, ResponseFamily};
+use crate::types::{InverseLink, LikelihoodSpec, LikelihoodSpec, ResponseFamily};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
@@ -46,7 +46,7 @@ fn apply_family_inverse_link(
     strategy_for_spec(family).inverse_link_array(eta.view())
 }
 
-/// Build a `LikelihoodSpec` from a legacy `(LikelihoodFamily, Option<&InverseLink>)`
+/// Build a `LikelihoodSpec` from a legacy `(LikelihoodSpec, Option<&InverseLink>)`
 /// pair as it appears at call sites in this file. For the parameterized binomial
 /// variants (`BinomialSas`, `BinomialBetaLogistic`, `BinomialMixture`,
 /// `BinomialLatentCLogLog`) the sibling `link_kind` carries the required state;
@@ -56,52 +56,52 @@ fn apply_family_inverse_link(
 /// drive `match`es on `spec.response` / `spec.link`; no public API in this
 /// file changes shape.
 fn spec_from_family_link(
-    family: LikelihoodFamily,
+    family: LikelihoodSpec,
     link_kind: Option<&InverseLink>,
 ) -> LikelihoodSpec {
     use crate::types::LinkFunction;
     match family {
-        LikelihoodFamily::GaussianIdentity => LikelihoodSpec {
+        LikelihoodSpec::gaussian_identity() => LikelihoodSpec {
             response: ResponseFamily::Gaussian,
             link: InverseLink::Standard(LinkFunction::Identity),
         },
-        LikelihoodFamily::BinomialLogit => LikelihoodSpec {
+        LikelihoodSpec::binomial_logit() => LikelihoodSpec {
             response: ResponseFamily::Binomial,
             link: InverseLink::Standard(LinkFunction::Logit),
         },
-        LikelihoodFamily::BinomialProbit => LikelihoodSpec {
+        LikelihoodSpec::binomial_probit() => LikelihoodSpec {
             response: ResponseFamily::Binomial,
             link: InverseLink::Standard(LinkFunction::Probit),
         },
-        LikelihoodFamily::BinomialCLogLog => LikelihoodSpec {
+        LikelihoodSpec::binomial_cloglog() => LikelihoodSpec {
             response: ResponseFamily::Binomial,
             link: InverseLink::Standard(LinkFunction::CLogLog),
         },
-        LikelihoodFamily::PoissonLog => LikelihoodSpec {
+        LikelihoodSpec::poisson_log() => LikelihoodSpec {
             response: ResponseFamily::Poisson,
             link: InverseLink::Standard(LinkFunction::Log),
         },
-        LikelihoodFamily::Tweedie { p } => LikelihoodSpec {
+        LikelihoodSpec::Tweedie { p } => LikelihoodSpec {
             response: ResponseFamily::Tweedie { p },
             link: InverseLink::Standard(LinkFunction::Log),
         },
-        LikelihoodFamily::NegativeBinomial { theta } => LikelihoodSpec {
+        LikelihoodSpec::NegativeBinomial { theta } => LikelihoodSpec {
             response: ResponseFamily::NegativeBinomial { theta },
             link: InverseLink::Standard(LinkFunction::Log),
         },
-        LikelihoodFamily::BetaLogit { phi } => LikelihoodSpec {
+        LikelihoodSpec::BetaLogit { phi } => LikelihoodSpec {
             response: ResponseFamily::Beta { phi },
             link: InverseLink::Standard(LinkFunction::Logit),
         },
-        LikelihoodFamily::GammaLog => LikelihoodSpec {
+        LikelihoodSpec::gamma_log() => LikelihoodSpec {
             response: ResponseFamily::Gamma,
             link: InverseLink::Standard(LinkFunction::Log),
         },
-        LikelihoodFamily::RoystonParmar => LikelihoodSpec {
+        LikelihoodSpec::royston_parmar() => LikelihoodSpec {
             response: ResponseFamily::RoystonParmar,
             link: InverseLink::Standard(LinkFunction::Identity),
         },
-        LikelihoodFamily::BinomialMixture => {
+        LikelihoodSpec::binomial_link(LinkFunction::Logit) => {
             let link = match link_kind {
                 Some(InverseLink::Mixture(state)) => InverseLink::Mixture(state.clone()),
                 _ => InverseLink::Standard(LinkFunction::Logit),
@@ -111,7 +111,7 @@ fn spec_from_family_link(
                 link,
             }
         }
-        LikelihoodFamily::BinomialSas => {
+        LikelihoodSpec::binomial_link(LinkFunction::Sas) => {
             let link = match link_kind {
                 Some(InverseLink::Sas(state)) => InverseLink::Sas(state.clone()),
                 _ => InverseLink::Standard(LinkFunction::Logit),
@@ -121,7 +121,7 @@ fn spec_from_family_link(
                 link,
             }
         }
-        LikelihoodFamily::BinomialBetaLogistic => {
+        LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic) => {
             let link = match link_kind {
                 Some(InverseLink::BetaLogistic(state)) => InverseLink::BetaLogistic(state.clone()),
                 _ => InverseLink::Standard(LinkFunction::Logit),
@@ -131,7 +131,7 @@ fn spec_from_family_link(
                 link,
             }
         }
-        LikelihoodFamily::BinomialLatentCLogLog => {
+        LikelihoodSpec::binomial_link(LinkFunction::CLogLog) => {
             let link = match link_kind {
                 Some(InverseLink::LatentCLogLog(state)) => InverseLink::LatentCLogLog(state.clone()),
                 _ => InverseLink::Standard(LinkFunction::CLogLog),
@@ -700,7 +700,7 @@ pub trait PredictableModel {
 /// Standard (single-block) GAM predictor.
 pub struct StandardPredictor {
     pub beta: Array1<f64>,
-    pub family: crate::types::LikelihoodFamily,
+    pub family: crate::types::LikelihoodSpec,
     pub link_kind: Option<InverseLink>,
     pub covariance: Option<Array2<f64>>,
     pub link_wiggle: Option<SavedLinkWiggleRuntime>,
@@ -711,7 +711,7 @@ impl StandardPredictor {
     /// from the first block and covariance from the unified result.
     pub(crate) fn from_unified(
         unified: &UnifiedFitResult,
-        family: crate::types::LikelihoodFamily,
+        family: crate::types::LikelihoodSpec,
         link_kind: Option<InverseLink>,
         link_wiggle: Option<SavedLinkWiggleRuntime>,
     ) -> Result<Self, String> {
@@ -1184,8 +1184,8 @@ impl BernoulliMarginalSlopePredictor {
         })
     }
 
-    fn likelihood_family(&self) -> LikelihoodFamily {
-        LikelihoodFamily::BinomialProbit
+    fn likelihood_family(&self) -> LikelihoodSpec {
+        LikelihoodSpec::binomial_probit()
     }
 
     fn mean_from_eta(&self, eta: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
@@ -4425,7 +4425,7 @@ pub struct PredictPosteriorMeanResult {
 pub fn enrich_posterior_mean_bounds(
     result: &mut PredictPosteriorMeanResult,
     confidence_level: f64,
-    family: crate::types::LikelihoodFamily,
+    family: crate::types::LikelihoodSpec,
     link_kind: Option<&InverseLink>,
 ) -> Result<(), EstimationError> {
     if !(confidence_level.is_finite() && confidence_level > 0.0 && confidence_level < 1.0) {
@@ -5534,7 +5534,7 @@ mod tests {
             }],
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
-            likelihood_family: Some(crate::types::LikelihoodFamily::GaussianIdentity),
+            likelihood_family: Some(crate::types::LikelihoodSpec::gaussian_identity()),
             likelihood_scale: crate::types::LikelihoodScaleMetadata::ProfiledGaussian,
             log_likelihood_normalization: crate::types::LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
@@ -5586,7 +5586,7 @@ mod tests {
             ],
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
-            likelihood_family: Some(crate::types::LikelihoodFamily::GaussianIdentity),
+            likelihood_family: Some(crate::types::LikelihoodSpec::gaussian_identity()),
             likelihood_scale: crate::types::LikelihoodScaleMetadata::ProfiledGaussian,
             log_likelihood_normalization: crate::types::LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
@@ -5638,7 +5638,7 @@ mod tests {
             ],
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
-            likelihood_family: Some(crate::types::LikelihoodFamily::RoystonParmar),
+            likelihood_family: Some(crate::types::LikelihoodSpec::royston_parmar()),
             likelihood_scale: crate::types::LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
             log_likelihood_normalization: crate::types::LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
@@ -5678,7 +5678,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::BinomialProbit,
+            crate::types::LikelihoodSpec::binomial_probit(),
             covariance.view(),
         )
         .expect("predict posterior mean");
@@ -5697,7 +5697,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::BinomialLogit,
+            crate::types::LikelihoodSpec::binomial_logit(),
             covariance.view(),
         )
         .expect("predict posterior mean");
@@ -6107,7 +6107,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::RoystonParmar,
+            crate::types::LikelihoodSpec::royston_parmar(),
         )
         .expect("royston-parmar point prediction");
         let expected_eta = array![0.4, 1.2];
@@ -6136,7 +6136,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::RoystonParmar,
+            crate::types::LikelihoodSpec::royston_parmar(),
             covariance.view(),
         )
         .expect("royston-parmar posterior mean");
@@ -6144,7 +6144,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::RoystonParmar,
+            crate::types::LikelihoodSpec::royston_parmar(),
             covariance.view(),
             &fit,
         )
@@ -6188,7 +6188,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::RoystonParmar,
+            crate::types::LikelihoodSpec::royston_parmar(),
             &fit,
             &options,
         )
@@ -6411,7 +6411,7 @@ mod tests {
             }],
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
-            likelihood_family: Some(crate::types::LikelihoodFamily::GaussianIdentity),
+            likelihood_family: Some(crate::types::LikelihoodSpec::gaussian_identity()),
             likelihood_scale: crate::types::LikelihoodScaleMetadata::ProfiledGaussian,
             log_likelihood_normalization: crate::types::LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
@@ -6471,7 +6471,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -6480,7 +6480,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -6509,7 +6509,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -6532,7 +6532,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit_with,
             &bc_options(true),
         )
@@ -6541,7 +6541,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit_without,
             &bc_options(true),
         )
@@ -6665,7 +6665,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -6674,7 +6674,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -6715,7 +6715,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -6724,7 +6724,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -6768,7 +6768,7 @@ mod tests {
                 x.clone(),
                 beta.view(),
                 offset.view(),
-                crate::types::LikelihoodFamily::GaussianIdentity,
+                crate::types::LikelihoodSpec::gaussian_identity(),
                 &fit,
                 &bc_options(false),
             )
@@ -6777,7 +6777,7 @@ mod tests {
                 x.clone(),
                 beta.view(),
                 offset.view(),
-                crate::types::LikelihoodFamily::GaussianIdentity,
+                crate::types::LikelihoodSpec::gaussian_identity(),
                 &fit,
                 &bc_options(true),
             )
@@ -6888,7 +6888,7 @@ mod tests {
             xt.clone(),
             beta_hat.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -6897,7 +6897,7 @@ mod tests {
             xt.clone(),
             beta_hat.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -7014,7 +7014,7 @@ mod tests {
                     xt.clone(),
                     beta_mean.view(),
                     offset.view(),
-                    crate::types::LikelihoodFamily::GaussianIdentity,
+                    crate::types::LikelihoodSpec::gaussian_identity(),
                     &fit,
                     &bc_options(false),
                 )
@@ -7023,7 +7023,7 @@ mod tests {
                     xt.clone(),
                     beta_mean.view(),
                     offset.view(),
-                    crate::types::LikelihoodFamily::GaussianIdentity,
+                    crate::types::LikelihoodSpec::gaussian_identity(),
                     &fit,
                     &bc_options(true),
                 )
@@ -7117,7 +7117,7 @@ mod tests {
             x_row,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit_orig,
             &bc_options(true),
         )
@@ -7126,7 +7126,7 @@ mod tests {
             x_tilde,
             theta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit_repar,
             &bc_options(true),
         )
@@ -7174,7 +7174,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -7183,7 +7183,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -7219,7 +7219,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -7246,7 +7246,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -7311,7 +7311,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -7481,7 +7481,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )
@@ -7517,7 +7517,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )
@@ -7540,7 +7540,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )
@@ -7575,7 +7575,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )
@@ -7627,7 +7627,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )
@@ -7664,7 +7664,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodFamily::GaussianIdentity,
+            crate::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )

@@ -20,7 +20,7 @@ use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
 use crate::span::span_index_for_breakpoints;
 use crate::types::{
-    InverseLink, LatentCLogLogState, LikelihoodFamily, LikelihoodSpec, LinkFunction,
+    InverseLink, LatentCLogLogState, LikelihoodSpec, LikelihoodSpec, LinkFunction,
     MixtureLinkState, ResponseFamily, SasLinkSpec, SasLinkState,
 };
 use ndarray::{Array1, Array2};
@@ -864,7 +864,7 @@ pub enum SavedAnchorKind {
 #[derive(Clone, Debug)]
 pub struct SavedPredictionRuntime {
     pub model_class: PredictModelClass,
-    pub likelihood: LikelihoodFamily,
+    pub likelihood: LikelihoodSpec,
     pub inverse_link: Option<InverseLink>,
     pub link_wiggle: Option<SavedLinkWiggleRuntime>,
     pub baseline_time_wiggle: Option<SavedBaselineTimeWiggleRuntime>,
@@ -2024,7 +2024,7 @@ impl SavedAnchoredDeviationRuntime {
 
 impl FittedFamily {
     #[inline]
-    pub fn likelihood(&self) -> LikelihoodFamily {
+    pub fn likelihood(&self) -> LikelihoodSpec {
         let spec = match self {
             Self::Standard { likelihood, .. }
             | Self::LocationScale { likelihood, .. }
@@ -2032,28 +2032,28 @@ impl FittedFamily {
             | Self::Survival { likelihood, .. }
             | Self::TransformationNormal { likelihood, .. } => likelihood,
             Self::LatentSurvival { .. } | Self::LatentBinary { .. } => {
-                return LikelihoodFamily::RoystonParmar;
+                return LikelihoodSpec::royston_parmar();
             }
         };
         match (&spec.response, &spec.link) {
-            (ResponseFamily::Gaussian, _) => LikelihoodFamily::GaussianIdentity,
-            (ResponseFamily::Poisson, _) => LikelihoodFamily::PoissonLog,
-            (ResponseFamily::Tweedie { p }, _) => LikelihoodFamily::Tweedie { p: *p },
+            (ResponseFamily::Gaussian, _) => LikelihoodSpec::gaussian_identity(),
+            (ResponseFamily::Poisson, _) => LikelihoodSpec::poisson_log(),
+            (ResponseFamily::Tweedie { p }, _) => LikelihoodSpec::Tweedie { p: *p },
             (ResponseFamily::NegativeBinomial { theta }, _) => {
-                LikelihoodFamily::NegativeBinomial { theta: *theta }
+                LikelihoodSpec::NegativeBinomial { theta: *theta }
             }
-            (ResponseFamily::Beta { phi }, _) => LikelihoodFamily::BetaLogit { phi: *phi },
-            (ResponseFamily::Gamma, _) => LikelihoodFamily::GammaLog,
-            (ResponseFamily::RoystonParmar, _) => LikelihoodFamily::RoystonParmar,
+            (ResponseFamily::Beta { phi }, _) => LikelihoodSpec::BetaLogit { phi: *phi },
+            (ResponseFamily::Gamma, _) => LikelihoodSpec::gamma_log(),
+            (ResponseFamily::RoystonParmar, _) => LikelihoodSpec::royston_parmar(),
             (ResponseFamily::Binomial, link) => match link {
-                InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
-                InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
-                InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
-                InverseLink::Standard(_) => LikelihoodFamily::BinomialLogit,
-                InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
-                InverseLink::Sas(_) => LikelihoodFamily::BinomialSas,
-                InverseLink::BetaLogistic(_) => LikelihoodFamily::BinomialBetaLogistic,
-                InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
+                InverseLink::Standard(LinkFunction::Logit) => LikelihoodSpec::binomial_logit(),
+                InverseLink::Standard(LinkFunction::Probit) => LikelihoodSpec::binomial_probit(),
+                InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodSpec::binomial_cloglog(),
+                InverseLink::Standard(_) => LikelihoodSpec::binomial_logit(),
+                InverseLink::LatentCLogLog(_) => LikelihoodSpec::binomial_link(LinkFunction::CLogLog),
+                InverseLink::Sas(_) => LikelihoodSpec::binomial_link(LinkFunction::Sas),
+                InverseLink::BetaLogistic(_) => LikelihoodSpec::binomial_link(LinkFunction::BetaLogistic),
+                InverseLink::Mixture(_) => LikelihoodSpec::binomial_link(LinkFunction::Logit),
             },
         }
     }
@@ -2201,7 +2201,7 @@ impl FittedModel {
             ModelKind::MarginalSlope => PredictModelClass::BernoulliMarginalSlope,
             ModelKind::TransformationNormal => PredictModelClass::TransformationNormal,
             ModelKind::LocationScale => {
-                if likelihood == LikelihoodFamily::GaussianIdentity {
+                if likelihood == LikelihoodSpec::gaussian_identity() {
                     PredictModelClass::GaussianLocationScale
                 } else {
                     PredictModelClass::BinomialLocationScale
@@ -2316,7 +2316,7 @@ impl FittedModel {
     }
 
     #[inline]
-    pub fn likelihood(&self) -> LikelihoodFamily {
+    pub fn likelihood(&self) -> LikelihoodSpec {
         self.payload().family_state.likelihood()
     }
 
@@ -3624,7 +3624,7 @@ mod tests {
             blocks,
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
-            likelihood_family: Some(LikelihoodFamily::BinomialProbit),
+            likelihood_family: Some(LikelihoodSpec::binomial_probit()),
             likelihood_scale: LikelihoodScaleMetadata::Unspecified,
             log_likelihood_normalization: LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
@@ -3663,7 +3663,7 @@ mod tests {
             "y ~ 1".to_string(),
             ModelKind::MarginalSlope,
             FittedFamily::MarginalSlope {
-                likelihood: LikelihoodFamily::BinomialProbit,
+                likelihood: LikelihoodSpec::binomial_probit(),
                 base_link: Some(InverseLink::Standard(LinkFunction::Probit)),
                 frailty: FrailtySpec::None,
             },
@@ -3697,7 +3697,7 @@ mod tests {
             "Surv(entry, exit, event) ~ 1".to_string(),
             ModelKind::Survival,
             FittedFamily::Survival {
-                likelihood: LikelihoodFamily::RoystonParmar,
+                likelihood: LikelihoodSpec::royston_parmar(),
                 survival_likelihood: Some("marginal-slope".to_string()),
                 survival_distribution: Some(ResidualDistribution::Gaussian),
                 frailty: FrailtySpec::None,
