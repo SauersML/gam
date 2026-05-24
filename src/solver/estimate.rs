@@ -42,7 +42,7 @@ use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::terms::smooth::BlockwisePenalty;
 use crate::types::{
-    Coefficients, GlmFamily, GlmLikelihoodSpec, InverseLink, LatentCLogLogState,
+    Coefficients, GlmLikelihoodSpec, InverseLink, LatentCLogLogState,
     LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction, LogLikelihoodNormalization,
     LogSmoothingParamsView, MixtureLinkState, ResponseFamily, RidgePassport, SasLinkState,
 };
@@ -681,14 +681,14 @@ fn map_hessian_to_original_basis(
 }
 
 fn dispersion_from_likelihood(
-    likelihood: GlmLikelihoodSpec,
+    likelihood: &GlmLikelihoodSpec,
     standard_deviation: f64,
 ) -> Dispersion {
-    match likelihood.family {
-        GlmFamily::GaussianIdentity => {
+    match &likelihood.spec.response {
+        ResponseFamily::Gaussian => {
             Dispersion::Estimated((standard_deviation * standard_deviation).max(1e-300))
         }
-        GlmFamily::GammaLog => {
+        ResponseFamily::Gamma => {
             let phi = likelihood.scale.fixed_phi().unwrap_or_else(|| {
                 let shape = likelihood
                     .gamma_shape()
@@ -701,22 +701,18 @@ fn dispersion_from_likelihood(
                 Dispersion::Known(phi.max(1e-300))
             }
         }
-        GlmFamily::Tweedie { .. } => {
+        ResponseFamily::Tweedie { .. } => {
             Dispersion::Known(likelihood.fixed_phi().unwrap_or(1.0).max(1e-300))
         }
-        GlmFamily::NegativeBinomial { theta } => {
-            Dispersion::Known(likelihood.fixed_phi().unwrap_or(theta).max(1e-300))
+        ResponseFamily::NegativeBinomial { theta } => {
+            Dispersion::Known(likelihood.fixed_phi().unwrap_or(*theta).max(1e-300))
         }
-        GlmFamily::BetaLogit { phi } => {
+        ResponseFamily::Beta { phi } => {
             Dispersion::Known((1.0 / (1.0 + phi.max(1e-12))).max(1e-300))
         }
-        GlmFamily::BinomialLogit
-        | GlmFamily::BinomialProbit
-        | GlmFamily::BinomialCLogLog
-        | GlmFamily::BinomialSas
-        | GlmFamily::BinomialBetaLogistic
-        | GlmFamily::BinomialMixture
-        | GlmFamily::PoissonLog => Dispersion::Known(1.0),
+        ResponseFamily::Binomial | ResponseFamily::Poisson | ResponseFamily::RoystonParmar => {
+            Dispersion::Known(1.0)
+        }
     }
 }
 
@@ -1845,54 +1841,22 @@ fn resolve_external_family(
         )));
     }
 
-    let glm_family = match (&family.response, &family.link) {
-        (ResponseFamily::Gaussian, _) => GlmFamily::GaussianIdentity,
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
-            GlmFamily::BinomialLogit
-        }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
-            GlmFamily::BinomialProbit
-        }
-        (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog))
-        | (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
-            GlmFamily::BinomialCLogLog
-        }
-        (ResponseFamily::Binomial, InverseLink::Sas(_)) => GlmFamily::BinomialSas,
-        (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
-            GlmFamily::BinomialBetaLogistic
-        }
-        (ResponseFamily::Binomial, InverseLink::Mixture(_)) => GlmFamily::BinomialMixture,
-        (ResponseFamily::Binomial, _) => {
+    if let ResponseFamily::Tweedie { p } = &family.response {
+        if !crate::types::is_valid_tweedie_power(*p) {
             return Err(EstimationError::InvalidInput(
-                "optimize_external_design requires a GLM family; unsupported (binomial, link) combination"
+                "optimize_external_design requires a GLM family; Tweedie variance power must be finite and strictly between 1 and 2; use PoissonLog or GammaLog for boundary cases"
                     .to_string(),
             ));
         }
-        (ResponseFamily::Poisson, _) => GlmFamily::PoissonLog,
-        (ResponseFamily::Tweedie { p }, _) => {
-            if crate::types::is_valid_tweedie_power(*p) {
-                GlmFamily::Tweedie { p: *p }
-            } else {
-                return Err(EstimationError::InvalidInput(
-                    "optimize_external_design requires a GLM family; Tweedie variance power must be finite and strictly between 1 and 2; use PoissonLog or GammaLog for boundary cases"
-                        .to_string(),
-                ));
-            }
-        }
-        (ResponseFamily::NegativeBinomial { theta }, _) => {
-            GlmFamily::NegativeBinomial { theta: *theta }
-        }
-        (ResponseFamily::Beta { phi }, _) => GlmFamily::BetaLogit { phi: *phi },
-        (ResponseFamily::Gamma, _) => GlmFamily::GammaLog,
-        (ResponseFamily::RoystonParmar, _) => {
-            return Err(EstimationError::InvalidInput(
-                "optimize_external_design requires a GLM family; RoystonParmar is survival-specific and not a GLM likelihood"
-                    .to_string(),
-            ));
-        }
-    };
+    }
+    if matches!(family.response, ResponseFamily::RoystonParmar) {
+        return Err(EstimationError::InvalidInput(
+            "optimize_external_design requires a GLM family; RoystonParmar is survival-specific and not a GLM likelihood"
+                .to_string(),
+        ));
+    }
     Ok((
-        GlmLikelihoodSpec::canonical(glm_family),
+        GlmLikelihoodSpec::canonical(family.clone()),
         firth_override.unwrap_or(false) && supports_firth,
     ))
 }
@@ -3640,8 +3604,8 @@ where
 
     // Persist residual-based scale for Gaussian identity models.
     // Contract: residual standard deviation sigma, not variance.
-    let standard_deviation = match pirls_res.likelihood.family {
-        GlmFamily::GaussianIdentity => {
+    let standard_deviation = match &pirls_res.likelihood.spec.response {
+        ResponseFamily::Gaussian => {
             let denom = if opts.compute_inference {
                 (n - mp).max(1.0)
             } else {
@@ -3649,50 +3613,40 @@ where
             };
             (weighted_rss / denom).sqrt()
         }
-        GlmFamily::GammaLog => pirls_res.likelihood.gamma_shape().unwrap_or(1.0),
-        GlmFamily::BinomialLogit
-        | GlmFamily::BinomialProbit
-        | GlmFamily::BinomialCLogLog
-        | GlmFamily::BinomialSas
-        | GlmFamily::BinomialBetaLogistic
-        | GlmFamily::BinomialMixture
-        | GlmFamily::Tweedie { .. }
-        | GlmFamily::NegativeBinomial { .. }
-        | GlmFamily::BetaLogit { .. }
-        | GlmFamily::PoissonLog => 1.0,
+        ResponseFamily::Gamma => pirls_res.likelihood.gamma_shape().unwrap_or(1.0),
+        ResponseFamily::Binomial
+        | ResponseFamily::Tweedie { .. }
+        | ResponseFamily::NegativeBinomial { .. }
+        | ResponseFamily::Beta { .. }
+        | ResponseFamily::Poisson
+        | ResponseFamily::RoystonParmar => 1.0,
     };
-    let dispersion = dispersion_from_likelihood(pirls_res.likelihood, standard_deviation);
+    let dispersion = dispersion_from_likelihood(&pirls_res.likelihood, standard_deviation);
 
     // Explicit dispersion contract for coefficient covariance matrices:
     // Vb = H⁻¹ * φ̂.  Fixed-scale likelihoods (Poisson/Binomial) use φ = 1,
     // Gaussian uses the profiled residual variance, and Gamma uses φ = 1/shape.
-    let dispersion_phi = match pirls_res.likelihood.family {
-        GlmFamily::GaussianIdentity => standard_deviation * standard_deviation,
-        GlmFamily::GammaLog => {
+    let dispersion_phi = match &pirls_res.likelihood.spec.response {
+        ResponseFamily::Gaussian => standard_deviation * standard_deviation,
+        ResponseFamily::Gamma => {
             1.0 / pirls_res
                 .likelihood
                 .gamma_shape()
                 .unwrap_or(1.0)
                 .max(f64::MIN_POSITIVE)
         }
-        GlmFamily::Tweedie { .. } => pirls_res
+        ResponseFamily::Tweedie { .. } => pirls_res
             .likelihood
             .fixed_phi()
             .unwrap_or(1.0)
             .max(f64::MIN_POSITIVE),
-        GlmFamily::NegativeBinomial { theta } => pirls_res
+        ResponseFamily::NegativeBinomial { theta } => pirls_res
             .likelihood
             .fixed_phi()
-            .unwrap_or(theta)
+            .unwrap_or(*theta)
             .max(f64::MIN_POSITIVE),
-        GlmFamily::BetaLogit { phi } => 1.0 / (1.0 + phi.max(1e-12)),
-        GlmFamily::BinomialLogit
-        | GlmFamily::BinomialProbit
-        | GlmFamily::BinomialCLogLog
-        | GlmFamily::BinomialSas
-        | GlmFamily::BinomialBetaLogistic
-        | GlmFamily::BinomialMixture
-        | GlmFamily::PoissonLog => 1.0,
+        ResponseFamily::Beta { phi } => 1.0 / (1.0 + phi.max(1e-12)),
+        ResponseFamily::Binomial | ResponseFamily::Poisson | ResponseFamily::RoystonParmar => 1.0,
     };
 
     // Compute gradient norm at final rho for reporting
@@ -3830,11 +3784,11 @@ where
     });
 
     let pirls_status = pirls_res.status;
-    let likelihood_spec = pirls_res.likelihood;
+    let likelihood_scale_field = pirls_res.likelihood.scale;
     let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
         y_o.view(),
         &pirls_res.finalmu,
-        likelihood_spec,
+        &pirls_res.likelihood,
         w_o.view(),
     );
 
@@ -3842,7 +3796,7 @@ where
         beta: beta_orig_internal,
         lambdas: lambdas.to_owned(),
         likelihood_family: opts.family.clone(),
-        likelihood_scale: likelihood_spec.scale,
+        likelihood_scale: likelihood_scale_field,
         log_likelihood_normalization: LogLikelihoodNormalization::OmittingResponseConstants,
         log_likelihood,
         standard_deviation,

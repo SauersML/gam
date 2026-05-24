@@ -9040,7 +9040,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         baseline.design.design.ncols(),
     )));
     let base_family = SpatialAdaptiveExactFamily {
-        family,
+        family: family.clone(),
         latent_cloglog_state,
         mixture_link_state: mixture_link_state.clone(),
         sas_link_state,
@@ -11957,7 +11957,7 @@ fn fit_bounded_term_collection_with_design(
 
     let is_beta_logistic = family.is_binomial_beta_logistic();
     let family_adapter = BoundedLinearFamily {
-        family,
+        family: family.clone(),
         latent_cloglog_state: options.latent_cloglog,
         mixture_link_state: options
             .mixture_link
@@ -14767,7 +14767,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
             offset,
             resolvedspec,
             &best.design,
-            family,
+            family.clone(),
             options,
             spatial_terms,
             &dims_per_term,
@@ -14790,7 +14790,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
             offset,
             resolvedspec,
             &best.design,
-            family,
+            family.clone(),
             options,
             spatial_terms,
             &dims_per_term,
@@ -18484,7 +18484,7 @@ pub fn fit_term_collectionwith_latent_coord_optimization(
         weights.view(),
         offset.view(),
         spec,
-        family,
+        family.clone(),
         options,
     )?;
     let resolvedspec = freeze_term_collection_from_design(spec, &best.design)?;
@@ -18597,7 +18597,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         weights.view(),
         offset.view(),
         &resolvedspec,
-        family,
+        family.clone(),
         options,
     )?;
     resolvedspec = freeze_term_collection_from_design(&resolvedspec, &best.design)?;
