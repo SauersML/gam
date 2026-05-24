@@ -52,9 +52,9 @@ use crate::terms::latent_coord::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };
 use crate::terms::{
-    ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, AuxConditionalPriorPenalty,
+    ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, RowPrecisionPriorPenalty,
     BlockSparsityPenalty, DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty,
-    NuclearNormPenalty, OrthogonalityPenalty, ParametricAuxConditionalPriorPenalty,
+    NuclearNormPenalty, OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty,
     PenaltyConcavity, PenaltyTier, PsiSlice, ScadMcpPenalty, SoftmaxAssignmentSparsityPenalty,
     ScalarWeightSchedule, ScheduleKind, SparsityPenalty, TotalVariationPenalty,
 };
@@ -3508,7 +3508,7 @@ fn build_standard_latent_analytic_penalty_registry(
                 };
                 registry.push(AnalyticPenaltyKind::BlockSparsity(Arc::new(penalty)));
             }
-            "aux_conditional_prior" => {
+            "row_precision_prior" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = analytic_descriptor_usize(descriptor, "n_eff", target.n)?;
                 let learnable = descriptor
@@ -3521,7 +3521,7 @@ fn build_standard_latent_analytic_penalty_registry(
                     "lambda_per_row_shape",
                     &context,
                 )?;
-                let penalty = AuxConditionalPriorPenalty::new(
+                let penalty = RowPrecisionPriorPenalty::new(
                     slice,
                     lambda_per_row,
                     weight,
@@ -3533,9 +3533,9 @@ fn build_standard_latent_analytic_penalty_registry(
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
                 };
-                registry.push(AnalyticPenaltyKind::AuxConditionalPrior(Arc::new(penalty)));
+                registry.push(AnalyticPenaltyKind::RowPrecisionPrior(Arc::new(penalty)));
             }
-            "parametric_aux_conditional_prior" => {
+            "parametric_row_precision_prior" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = analytic_descriptor_usize(descriptor, "n_eff", target.n)?;
                 let learnable = descriptor
@@ -3550,7 +3550,7 @@ fn build_standard_latent_analytic_penalty_registry(
                     analytic_descriptor_array1_flat(descriptor, "raw_beta", &context)?;
                 let mu =
                     analytic_descriptor_array2_flat(descriptor, "mu", "mu_shape", &context)?;
-                let penalty = ParametricAuxConditionalPriorPenalty::new(
+                let penalty = ParametricRowPrecisionPriorPenalty::new(
                     slice, aux, log_alpha, raw_beta, mu, weight, n_eff, learnable,
                 )
                 .map_err(|err| format!("{context}: {err}"))?;
@@ -3558,7 +3558,7 @@ fn build_standard_latent_analytic_penalty_registry(
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
                 };
-                registry.push(AnalyticPenaltyKind::ParametricAuxConditionalPrior(Arc::new(
+                registry.push(AnalyticPenaltyKind::ParametricRowPrecisionPrior(Arc::new(
                     penalty,
                 )));
             }

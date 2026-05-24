@@ -468,9 +468,9 @@ fn analytic_penalty_row_hessian_fingerprint(
     }
 
     match penalty {
-        AnalyticPenaltyKind::AuxConditionalPrior(p) => {
+        AnalyticPenaltyKind::RowPrecisionPrior(p) => {
             let (n, rows, cols) = p.lambda_per_row.dim();
-            hasher.write_str("aux-conditional-fixed");
+            hasher.write_str("row-precision-fixed");
             hasher.write_usize(n);
             hasher.write_usize(rows);
             hasher.write_usize(cols);
@@ -484,11 +484,11 @@ fn analytic_penalty_row_hessian_fingerprint(
                 hasher.write_f64(value);
             }
         }
-        AnalyticPenaltyKind::ParametricAuxConditionalPrior(p) => {
+        AnalyticPenaltyKind::ParametricRowPrecisionPrior(p) => {
             let (aux_n, aux_dim) = p.aux.dim();
             let (mu_rows, mu_cols) = p.mu.dim();
             let weight_offset = p.log_alpha.len() + p.raw_beta.len() + p.mu.len();
-            hasher.write_str("aux-conditional-parametric");
+            hasher.write_str("row-precision-parametric");
             hasher.write_usize(aux_n);
             hasher.write_usize(aux_dim);
             hasher.write_usize(mu_rows);
@@ -803,7 +803,7 @@ impl ArrowSchurSystem {
     /// has no place to store them. The supported row-block-only Psi-tier
     /// penalties are `ARDPenalty`, `SparsityPenalty`,
     /// `SoftmaxAssignmentSparsity`, `IBPAssignment`,
-    /// `AuxConditionalPrior`, `ParametricAuxConditionalPrior`, and
+    /// `RowPrecisionPrior`, `ParametricRowPrecisionPrior`, and
     /// `ScadMcpPenalty`. Dense Beta-tier penalties still fall back to `hvp`
     /// probes against the canonical basis vectors for `β`.
     ///
@@ -1036,8 +1036,8 @@ fn analytic_penalty_is_row_block_diagonal(penalty: &AnalyticPenaltyKind) -> bool
             | AnalyticPenaltyKind::Sparsity(_)
             | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
             | AnalyticPenaltyKind::IBPAssignment(_)
-            | AnalyticPenaltyKind::AuxConditionalPrior(_)
-            | AnalyticPenaltyKind::ParametricAuxConditionalPrior(_)
+            | AnalyticPenaltyKind::RowPrecisionPrior(_)
+            | AnalyticPenaltyKind::ParametricRowPrecisionPrior(_)
             | AnalyticPenaltyKind::ScadMcp(_)
     )
 }
