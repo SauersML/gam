@@ -208,14 +208,14 @@ pub enum GpuOperation {
 
 /// Decide whether a generic dense kernel should be routed to the device.
 ///
-/// Today this returns `GpuDispatch::Cpu` whenever the GPU layer cannot
+/// Today this returns `GpuDispatch::UseCpu` whenever the GPU layer cannot
 /// admit the workload (no device probed, kernel below threshold, cuda
 /// feature not compiled). When a device backend is wired into
 /// `gpu::blas`, the result variant carries the device output instead, and
-/// callers that consume `GpuDispatch::Executed(array)` automatically take
+/// callers that consume `GpuDispatch::UseDevice` automatically take
 /// the GPU path with no further changes.
 #[inline]
-pub fn try_dispatch_dense(op: GpuOperation) -> linalg::GpuDispatch {
+pub fn try_dispatch_dense(op: GpuOperation) -> crate::solver::gpu::GpuDispatch {
     // Probe the auto-dispatch policy so the kernel-level decision matches
     // the per-call auto-dispatch in `crate::faer_ndarray::fast_*`. Today
     // there is no compiled backend, so we still return `Cpu` and the
@@ -235,7 +235,13 @@ pub fn try_dispatch_dense(op: GpuOperation) -> linalg::GpuDispatch {
             op_label(op)
         );
     }
-    linalg::GpuDispatch::Cpu
+    crate::solver::gpu::GpuDispatch::UseCpu {
+        reason: format!(
+            "dense {} admitted_by_policy={} has no erased device result in this dispatch layer",
+            op_label(op),
+            admitted_by_gpu_policy
+        ),
+    }
 }
 
 #[inline]

@@ -45,7 +45,6 @@ src/solver/reml/unified.rs	fn trace_hinv_product(&self, a: &Array2<f64>) -> f64	
 src/solver/reml/unified.rs	fn xt_logdet_kernel_x_diagonal(&self, x: &DesignMatrix) -> Array1<f64>	panic!
 src/solver/reml/unified.rs	pub fn get_or_insert_with( &self, key: ProjectedFactorKey, compute: impl FnOnce() -> Array2<f64>, ) -> Arc<Array2<f64>>	panic!
 src/solver/reml/unified.rs	pub fn xt_projected_kernel_x_diagonal(&self, x: &DesignMatrix) -> Array1<f64>	panic!
-src/solver/riemannian.rs	fn no_manifold_warning(p: ArrayView1<'_, f64>, ambient_dim: usize) -> Option<ManifoldWarning>	panic!
 src/terms/analytic_penalties.rs	fn hvp( &self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>, v: ArrayView1<'_, f64>, ) -> Array1<f64>	panic!
 src/terms/basis.rs	fn radial_g_q_hessian( q: usize, big_r: f64, s1: f64, s2: f64, u1: f64, u2: f64, fr: &[f64], ) -> ( f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, f64, )	panic!
 src/terms/basis.rs	fn radial_g_q_partials( q: usize, big_r: f64, s1: f64, s2: f64, u1: f64, u2: f64, fr: &[f64], ) -> (f64, f64, f64, f64, f64, f64)	panic!
