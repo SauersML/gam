@@ -12,7 +12,9 @@ use crate::solver::outer_strategy::{HessianResult, OuterEval};
 use crate::solver::persistent_warm_start::{
     PersistentWarmStartRecord, StableHasher, load_record, store_record,
 };
-use crate::types::{InverseLink, LinkFunction, RhoPrior, SasLinkState};
+use crate::types::{
+    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LinkFunction, RhoPrior, SasLinkState,
+};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -710,6 +712,60 @@ struct DerivativeContext {
     log_likelihood: f64,
     firth_op: Option<std::sync::Arc<super::FirthDenseOperator>>,
     barrier_config: Option<super::unified::BarrierConfig>,
+}
+
+#[inline]
+fn reml_is_gaussian_identity(likelihood: GlmLikelihoodSpec) -> bool {
+    match likelihood.family {
+        GlmLikelihoodFamily::GaussianIdentity => true,
+        GlmLikelihoodFamily::BinomialLogit
+        | GlmLikelihoodFamily::BinomialProbit
+        | GlmLikelihoodFamily::BinomialCLogLog
+        | GlmLikelihoodFamily::BinomialSas
+        | GlmLikelihoodFamily::BinomialBetaLogistic
+        | GlmLikelihoodFamily::BinomialMixture
+        | GlmLikelihoodFamily::PoissonLog
+        | GlmLikelihoodFamily::Tweedie { .. }
+        | GlmLikelihoodFamily::NegativeBinomial { .. }
+        | GlmLikelihoodFamily::BetaLogit { .. }
+        | GlmLikelihoodFamily::GammaLog => false,
+    }
+}
+
+#[inline]
+fn reml_supports_firth(likelihood: GlmLikelihoodSpec) -> bool {
+    match likelihood.family {
+        GlmLikelihoodFamily::BinomialLogit => true,
+        GlmLikelihoodFamily::GaussianIdentity
+        | GlmLikelihoodFamily::BinomialProbit
+        | GlmLikelihoodFamily::BinomialCLogLog
+        | GlmLikelihoodFamily::BinomialSas
+        | GlmLikelihoodFamily::BinomialBetaLogistic
+        | GlmLikelihoodFamily::BinomialMixture
+        | GlmLikelihoodFamily::PoissonLog
+        | GlmLikelihoodFamily::Tweedie { .. }
+        | GlmLikelihoodFamily::NegativeBinomial { .. }
+        | GlmLikelihoodFamily::BetaLogit { .. }
+        | GlmLikelihoodFamily::GammaLog => false,
+    }
+}
+
+#[inline]
+fn reml_fixed_glm_dispersion(likelihood: GlmLikelihoodSpec) -> f64 {
+    match likelihood.family {
+        GlmLikelihoodFamily::GaussianIdentity
+        | GlmLikelihoodFamily::BinomialLogit
+        | GlmLikelihoodFamily::BinomialProbit
+        | GlmLikelihoodFamily::BinomialCLogLog
+        | GlmLikelihoodFamily::BinomialSas
+        | GlmLikelihoodFamily::BinomialBetaLogistic
+        | GlmLikelihoodFamily::BinomialMixture
+        | GlmLikelihoodFamily::PoissonLog
+        | GlmLikelihoodFamily::Tweedie { .. }
+        | GlmLikelihoodFamily::NegativeBinomial { .. } => likelihood.fixed_phi().unwrap_or(1.0),
+        GlmLikelihoodFamily::BetaLogit { phi } => phi,
+        GlmLikelihoodFamily::GammaLog => likelihood.fixed_phi().unwrap_or(1.0),
+    }
 }
 
 impl<'a> RemlState<'a> {
@@ -2266,7 +2322,7 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         ext_coords: &[super::unified::HyperCoord],
     ) -> Result<TkCorrectionTerms, EstimationError> {
-        if self.config.link_function() == LinkFunction::Identity {
+        if reml_is_gaussian_identity(self.config.likelihood) {
             return Ok(TkCorrectionTerms {
                 value: 0.0,
                 gradient: None,
@@ -2340,7 +2396,7 @@ impl<'a> RemlState<'a> {
             let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
             let beta = self.sparse_exact_beta_original(pirls_result);
             let firth_op = if self.config.firth_bias_reduction
-                && matches!(self.config.link_function(), LinkFunction::Logit)
+                && reml_supports_firth(self.config.likelihood)
             {
                 if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
                     Some(cached.clone())
@@ -2489,7 +2545,7 @@ impl<'a> RemlState<'a> {
             pirls_result.beta_transformed.as_ref().clone()
         };
         let firth_op = if self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit)
+            && reml_supports_firth(self.config.likelihood)
         {
             Some(std::sync::Arc::new(Self::build_firth_dense_operator(
                 &x_eff_dense,
@@ -2523,7 +2579,7 @@ impl<'a> RemlState<'a> {
         mode: super::unified::EvalMode,
         ext_coords: &[super::unified::HyperCoord],
     ) -> Result<(), EstimationError> {
-        if self.config.link_function() == LinkFunction::Identity
+        if reml_is_gaussian_identity(self.config.likelihood)
             || !self.config.firth_bias_reduction
             || !compute_gradient_for_tk(mode)
         {
@@ -3071,8 +3127,10 @@ impl<'a> RemlState<'a> {
         // taken from the dedicated 5-jet (no variance-jet machinery).
         // Mixture links advertise `link_function() == Logit` but are
         // non-canonical; route them through the general path below.
-        let canonical_logit = matches!(link_function, LinkFunction::Logit)
-            && self.runtime_mixture_link_state.is_none();
+        let canonical_logit = matches!(
+            pirls_result.likelihood.family,
+            GlmLikelihoodFamily::BinomialLogit
+        ) && self.runtime_mixture_link_state.is_none();
 
         if canonical_logit {
             // Canonical Logit fast path: per-row 5-jet evaluation, no
@@ -3099,7 +3157,7 @@ impl<'a> RemlState<'a> {
         // surface (Probit, CLogLog, SAS, BetaLogistic, Mixture, GammaLog).
         let likelihood = pirls_result.likelihood;
         let weight_family = pirls::weight_family_for_glm_likelihood(likelihood);
-        let phi = likelihood.fixed_phi().unwrap_or(1.0);
+        let phi = reml_fixed_glm_dispersion(likelihood);
         let dmu_deta = &pirls_result.solve_dmu_deta;
         let d2mu_deta2 = &pirls_result.solve_d2mu_deta2;
         let d3mu_deta3 = &pirls_result.solve_d3mu_deta3;
@@ -3180,9 +3238,10 @@ impl<'a> RemlState<'a> {
         pirls_result: &PirlsResult,
     ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
         let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
-        let link_function = self.config.link_function();
-        let canonical_logit = matches!(link_function, LinkFunction::Logit)
-            && self.runtime_mixture_link_state.is_none();
+        let canonical_logit = matches!(
+            pirls_result.likelihood.family,
+            GlmLikelihoodFamily::BinomialLogit
+        ) && self.runtime_mixture_link_state.is_none();
         if !canonical_logit {
             return Err(EstimationError::InvalidInput(
                 "Tierney-Kadane outer Hessian is implemented for canonical Binomial Logit Firth fits only".to_string(),
@@ -5241,7 +5300,7 @@ impl<'a> RemlState<'a> {
         let (mut h_total, ridge_passport) = self.effectivehessian(pirls_result.as_ref())?;
         let mut firth_dense_operator: Option<Arc<FirthDenseOperator>> = None;
         if self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit)
+            && reml_supports_firth(self.config.likelihood)
         {
             let firth_n = pirls_result.x_transformed.nrows();
             let firth_p = pirls_result.x_transformed.ncols();
@@ -5398,7 +5457,7 @@ impl<'a> RemlState<'a> {
         let (logdet_s_pos, det1_values) =
             self.sparse_penalty_logdet_runtime(rho, penalty_blocks.as_ref());
         let firth_dense_operator_original = if self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit)
+            && reml_supports_firth(self.config.likelihood)
         {
             let firth_n = self.x().nrows();
             let firth_p = self.x().ncols();
@@ -7042,8 +7101,7 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         free_basis_opt: &Option<Array2<f64>>,
     ) -> Result<Option<std::sync::Arc<super::FirthDenseOperator>>, EstimationError> {
-        if !(self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit))
+        if !(self.config.firth_bias_reduction && reml_supports_firth(self.config.likelihood))
         {
             return Ok(None);
         }
@@ -7108,7 +7166,7 @@ impl<'a> RemlState<'a> {
             DispersionHandling, GaussianDerivatives, SinglePredictorGlmDerivatives,
         };
 
-        let is_gaussian_identity = self.config.link_function() == LinkFunction::Identity;
+        let is_gaussian_identity = reml_is_gaussian_identity(pirls_result.likelihood);
         let firth_op =
             self.build_dense_firth_operator_for_outer_basis(pirls_result, bundle, free_basis_opt)?;
 
@@ -7150,7 +7208,7 @@ impl<'a> RemlState<'a> {
             DispersionHandling::ProfiledGaussian
         } else {
             DispersionHandling::Fixed {
-                phi: pirls_result.likelihood.fixed_phi().unwrap_or(1.0),
+                phi: reml_fixed_glm_dispersion(pirls_result.likelihood),
                 include_logdet_h: true,
                 include_logdet_s: true,
             }
@@ -7201,12 +7259,12 @@ impl<'a> RemlState<'a> {
             SinglePredictorGlmDerivatives,
         };
 
-        let is_gaussian_identity = self.config.link_function() == LinkFunction::Identity;
+        let is_gaussian_identity = reml_is_gaussian_identity(pirls_result.likelihood);
 
         // Sparse exact still uses the same dense Jeffreys operator; only the
         // H^{-1} applications move to the sparse Cholesky operator.
         let firth_op = if self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit)
+            && reml_supports_firth(self.config.likelihood)
         {
             if let Some(cached) = bundle.firth_dense_operator_original.clone() {
                 Some(cached)
@@ -7238,7 +7296,7 @@ impl<'a> RemlState<'a> {
                 let (c_array, d_array) = self.hessian_cd_arrays(pirls_result)?;
                 (
                     DispersionHandling::Fixed {
-                        phi: pirls_result.likelihood.fixed_phi().unwrap_or(1.0),
+                        phi: reml_fixed_glm_dispersion(pirls_result.likelihood),
                         include_logdet_h: true,
                         include_logdet_s: true,
                     },

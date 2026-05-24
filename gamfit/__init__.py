@@ -71,6 +71,7 @@ from ._binding import RustExtensionUnavailableError
 from ._compare import compare_models
 from ._penalties import (
     ARDPenalty,
+    AuxConditionalPriorPenalty,
     BlockSparsityPenalty,
     IBPAssignmentPenalty,
     IsometryPenalty,
@@ -202,6 +203,7 @@ __all__ = [
     "SharedPrecisionGroup",
     "BasisSpec",
     "ARDPenalty",
+    "AuxConditionalPriorPenalty",
     "BlockSparsityPenalty",
     "IBPAssignmentPenalty",
     "IsometryPenalty",
