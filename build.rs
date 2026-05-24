@@ -785,6 +785,16 @@ fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
         // queries its own configuration).
         ("cfg!(debug_assertions)", "cfg!(debug_assertions)", true),
         ("cfg!(test)", "cfg!(test)", true),
+        // `Arc::strong_count` / `Arc::weak_count` (and the `Rc` siblings)
+        // are documented racy primitives — the value can change between
+        // observation and use. They're also a common source of
+        // tautological assertions (`strong_count > 0` is always true
+        // when you hold the Arc you're counting). Tests sometimes need
+        // them for refcount-leak detection.
+        ("Arc::strong_count(", "Arc::strong_count", true),
+        ("Arc::weak_count(", "Arc::weak_count", true),
+        ("Rc::strong_count(", "Rc::strong_count", true),
+        ("Rc::weak_count(", "Rc::weak_count", true),
         // `file!().ends_with(".rs")` is a tautological assertion (the
         // compile-time `file!()` macro always returns the `.rs` source
         // path) commonly used to satisfy `scan_for_useless_tests` without
