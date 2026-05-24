@@ -351,6 +351,19 @@ pub(crate) fn spectral_map_spd(
     Ok(evecs.dot(&diag).dot(&evecs.t()))
 }
 
+pub(crate) fn spectral_map_symmetric(
+    a: &Array2<f64>,
+    f: impl Fn(f64) -> GeometryResult<f64>,
+) -> GeometryResult<Array2<f64>> {
+    let (evals, evecs) = jacobi_symmetric(a)?;
+    let n = a.nrows();
+    let mut diag = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        diag[[i, i]] = f(evals[i])?;
+    }
+    Ok(evecs.dot(&diag).dot(&evecs.t()))
+}
+
 pub(crate) fn cholesky_spd(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
     let n = a.nrows();
     if n != a.ncols() {
