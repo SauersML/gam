@@ -2703,6 +2703,17 @@ pub struct BlockwiseInnerResult {
     /// Avoids redundant re-assembly in the outer objective evaluation.
     pub s_lambdas: Vec<Array2<f64>>,
     pub joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    /// Projected KKT residual at the converged inner iterate, propagated to
+    /// the unified evaluator's `InnerAssembly::kkt_residual` for the
+    /// outer REML/LAML scoring path. `None` when the solver path doesn't
+    /// produce a typed KKT diagnostic (blockwise NR fallback, eager-stop).
+    pub kkt_residual: Option<crate::estimate::reml::unified::ProjectedKktResidual>,
+    /// Active linear-inequality constraint rows at the converged inner
+    /// iterate. When `Some`, the unified evaluator builds the
+    /// constraint-aware kernel `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S`
+    /// for per-coordinate mode responses `v_k = ∂β/∂ρ_k`.
+    pub active_constraints:
+        Option<Arc<crate::estimate::reml::unified::ActiveLinearConstraintBlock>>,
 }
 
 impl std::fmt::Debug for BlockwiseInnerResult {
@@ -11079,6 +11090,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_logdet_s: cached.block_logdet_s,
                 s_lambdas,
                 joint_workspace: cached.joint_workspace.clone(),
+                kkt_residual: cached.kkt_residual.clone(),
+                active_constraints: cached.active_constraints.clone(),
             });
         }
         // Cold-start path: copy prior β where dimensions match
@@ -12790,6 +12803,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_logdet_s,
                 s_lambdas,
                 joint_workspace: cached_joint_workspace.clone(),
+                kkt_residual: Some(kkt_residual),
+                active_constraints,
             });
         }
         if cycles_done >= inner_max_cycles {
@@ -12814,6 +12829,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_logdet_s,
                 s_lambdas,
                 joint_workspace: cached_joint_workspace.clone(),
+                kkt_residual: None,
+                active_constraints: None,
             });
         }
         if cycles_done >= inner_max_cycles {
@@ -13737,6 +13754,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         block_logdet_s,
         s_lambdas,
         joint_workspace: None,
+        kkt_residual,
+        active_constraints,
     })
 }
 
