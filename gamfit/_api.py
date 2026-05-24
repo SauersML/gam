@@ -650,6 +650,67 @@ def _resolve_precision_hyperpriors(
     return value
 
 
+def _normalize_fisher_rao_w(value: Any, *, n_rows: int, dim: int) -> Any:
+    import numpy as np
+
+    w = np.asarray(value, dtype=float)
+    if w.ndim == 1:
+        if w.shape[0] != n_rows:
+            raise ValueError(
+                f"fisher_rao_w vector must have length {n_rows}; got {w.shape[0]}"
+            )
+        out = np.zeros((n_rows, dim, dim), dtype=float)
+        idx = np.arange(dim)
+        out[:, idx, idx] = w[:, None]
+    elif w.ndim == 2:
+        if w.shape != (dim, dim):
+            raise ValueError(
+                f"fisher_rao_w matrix must have shape ({dim}, {dim}); got {w.shape}"
+            )
+        out = np.broadcast_to(w, (n_rows, dim, dim)).copy()
+    elif w.ndim == 3:
+        if w.shape != (n_rows, dim, dim):
+            raise ValueError(
+                f"fisher_rao_w must have shape ({n_rows}, {dim}, {dim}); got {w.shape}"
+            )
+        out = np.ascontiguousarray(w, dtype=float)
+    else:
+        raise ValueError("fisher_rao_w must be a 1-D, 2-D, or 3-D numeric array")
+    if not np.all(np.isfinite(out)):
+        raise ValueError("fisher_rao_w must contain only finite values")
+    if not np.allclose(out, np.swapaxes(out, 1, 2), rtol=1e-10, atol=1e-10):
+        raise ValueError("fisher_rao_w must be symmetric in every row block")
+    if np.any(np.diagonal(out, axis1=1, axis2=2) < 0.0):
+        raise ValueError("fisher_rao_w diagonal entries must be non-negative")
+    return out
+
+
+def _apply_scalar_fisher_rao_w_to_rows(
+    headers: list[str],
+    rows: list[list[str]],
+    *,
+    weights: str | None,
+    fisher_rao_w: Any,
+) -> tuple[list[str], list[list[str]], str]:
+    w = _normalize_fisher_rao_w(fisher_rao_w, n_rows=len(rows), dim=1)[:, 0, 0]
+    weight_col = "__gamfit_fisher_rao_weight"
+    if weight_col in headers:
+        raise ValueError(f"reserved fisher_rao_w column already exists: {weight_col}")
+    headers = list(headers) + [weight_col]
+    out_rows = [list(row) for row in rows]
+    if weights is None:
+        combined = w
+    else:
+        try:
+            weight_idx = headers.index(weights)
+        except ValueError as exc:
+            raise ValueError(f"weights column {weights!r} is not present") from exc
+        combined = [float(row[weight_idx]) * float(w[idx]) for idx, row in enumerate(out_rows)]
+    for row, value in zip(out_rows, combined, strict=True):
+        row.append(repr(float(value)))
+    return headers, out_rows, weight_col
+
+
 @overload
 def fit(
     data: Any,
@@ -680,6 +741,7 @@ def fit(
     response_columns: list[str] | tuple[str, ...] | None = ...,
     response_coordinates: str | None = ...,
     response_reference: int | None = ...,
+    fisher_rao_w: Any | None = ...,
     latents: Mapping[str, Any] | None = ...,
     penalties: Sequence[Any] | None = ...,
     config: dict[str, Any] | None = ...,
@@ -716,6 +778,7 @@ def fit(
     response_columns: list[str] | tuple[str, ...] | None = ...,
     response_coordinates: str | None = ...,
     response_reference: int | None = ...,
+    fisher_rao_w: Any | None = ...,
     latents: Mapping[str, Any] | None = ...,
     penalties: Sequence[Any] | None = ...,
     config: dict[str, Any] | None = ...,
@@ -751,6 +814,7 @@ def fit(
     response_columns: list[str] | tuple[str, ...] | None = None,
     response_coordinates: str | None = None,
     response_reference: int | None = None,
+    fisher_rao_w: Any | None = None,
     latents: Mapping[str, Any] | None = None,
     penalties: Sequence[Any] | None = None,
     config: dict[str, Any] | None = None,
@@ -820,6 +884,10 @@ def fit(
         ``"alr"``. Spherical responses always use ambient tangent coordinates.
     response_reference:
         Reference component for ``"alr"`` coordinates (default: last column).
+    fisher_rao_w:
+        Optional Fisher-Rao behavioral precision blocks. Accepts length-N
+        scalar weights, one broadcast ``(p, p)`` matrix, or dense ``(N, p, p)``
+        blocks.
     frailty_sd:
         Fixed frailty standard deviation. Omit to let latent hazard-multiplier
         models learn it. Corresponds to ``--frailty-sd``.
@@ -913,6 +981,7 @@ def fit(
             coordinates=response_coordinates,
             reference=-1 if response_reference is None else int(response_reference),
             weights=weights,
+            fisher_rao_w=fisher_rao_w,
             fit_kwargs={
                 "offset": offset,
                 "weights": weights,
@@ -933,6 +1002,7 @@ def fit(
                 "adaptive_regularization": adaptive_regularization,
                 "firth": firth,
                 "precision_hyperpriors": precision_hyperpriors,
+                "fisher_rao_w": fisher_rao_w,
                 "latents": latents,
                 "penalties": penalties,
                 "config": nested_config or None,
@@ -940,6 +1010,14 @@ def fit(
         )
 
     headers, rows, table_kind = normalize_table(data)
+    fisher_weight_col = None
+    if fisher_rao_w is not None:
+        headers, rows, fisher_weight_col = _apply_scalar_fisher_rao_w_to_rows(
+            headers,
+            rows,
+            weights=weights,
+            fisher_rao_w=fisher_rao_w,
+        )
     rust_config = dict(config or {})
     for key in (
         "response_geometry",
@@ -954,7 +1032,7 @@ def fit(
     payload = _build_fit_payload(
         family=family,
         offset=offset,
-        weights=weights,
+        weights=fisher_weight_col or weights,
         transformation_normal=transformation_normal,
         survival_likelihood=survival_likelihood,
         baseline_target=baseline_target,

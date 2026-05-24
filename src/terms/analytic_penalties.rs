@@ -1978,7 +1978,7 @@ impl AnalyticPenalty for SparsityPenalty {
             // and force callers through `hvp`. See `hvp` below for the exact
             // dense-Hessian-vector product.
             SparsityKind::Hoyer => {
-                let _ = d;
+                drop(d);
                 None
             }
         }

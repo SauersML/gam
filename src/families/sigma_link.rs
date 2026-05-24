@@ -88,6 +88,8 @@ pub fn exp_sigma_derivs_up_to_third(
         d2[i].write(jet.d2);
         d3[i].write(jet.d3);
     }
+    // SAFETY: every slot in each length-`n` output is written exactly once by
+    // the loop over `0..n` before `assume_init`.
     unsafe {
         (
             sigma.assume_init(),
@@ -139,6 +141,8 @@ pub fn exp_sigma_derivs_up_to_fourth(
         d3[i].write(jet.d3);
         d4[i].write(jet.d4);
     }
+    // SAFETY: every slot in each length-`n` output is written exactly once by
+    // the loop over `0..n` before `assume_init`.
     unsafe {
         (
             sigma.assume_init(),
@@ -265,6 +269,8 @@ pub fn logb_sigma_derivs_up_to_fourth(
         d3[i].write(jet.d3);
         d4[i].write(jet.d4);
     }
+    // SAFETY: every slot in each length-`n` output is written exactly once by
+    // the loop over `0..n` before `assume_init`.
     unsafe {
         (
             sigma.assume_init(),
