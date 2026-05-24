@@ -2160,40 +2160,8 @@ fn complex_log_gamma_lanczos(z: Complex) -> Complex {
     )
 }
 
-#[cfg(test)]
-pub(crate) fn cloglog_posterior_meanwith_deriv_gamma_reference(
-    mu: f64,
-    sigma: f64,
-) -> Result<IntegratedMeanDerivative, EstimationError> {
-    // This backend uses the exact Mellin-Barnes/Gamma representation for the
-    // same survival term S(mu, sigma). The integrated cloglog outputs are still
-    // recovered by the same exact identities:
-    //
-    //   mean       = 1 - S(mu, sigma)
-    //   dmean/dmu  = exp(mu + sigma^2 / 2) * S(mu + sigma^2, sigma).
-    //
-    // Using the shift identity here matters even more than in the Miles case.
-    // Differentiating the Bromwich integral directly inserts an extra factor
-    // (k + i t) into an already oscillatory complex integrand. That is
-    // mathematically valid, but it needlessly makes the derivative a second,
-    // separate special-function quadrature problem. Reusing the scalar survival
-    // evaluator keeps mean and derivative on the same approximation surface and
-    // preserves dmean/dmu >= 0 up to roundoff.
-    let survival = cloglog_survival_gamma_reference(mu, sigma)?;
-    let shifted_survival = cloglog_survival_gamma_reference(mu + sigma * sigma, sigma)?;
-    let mean = cloglog_mean_from_survival(survival);
-    let dmean = cloglog_shift_identity_derivative(mu, sigma, shifted_survival);
-    if !(mean.is_finite() && dmean.is_finite()) {
-        return Err(EstimationError::InvalidInput(
-            "Gamma cloglog reference backend produced non-finite values".to_string(),
-        ));
-    }
-    Ok(IntegratedMeanDerivative {
-        mean,
-        dmean_dmu: dmean.max(0.0),
-        mode: IntegratedExpectationMode::ExactSpecialFunction,
-    })
-}
+// `cloglog_posterior_meanwith_deriv_gamma_reference` is a test reference
+// implementation; it lives inside `mod tests` below.
 
 fn cloglog_survival_gamma_reference(mu: f64, sigma: f64) -> Result<f64, EstimationError> {
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= 0.0 {
@@ -4198,6 +4166,28 @@ pub fn cloglog_ghq_derivatives_adaptive(
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    pub(crate) fn cloglog_posterior_meanwith_deriv_gamma_reference(
+        mu: f64,
+        sigma: f64,
+    ) -> Result<IntegratedMeanDerivative, EstimationError> {
+        // Reference: mean = 1 - S(mu, sigma), dmean/dmu = exp(mu + sigma^2/2) *
+        // S(mu + sigma^2, sigma).
+        let survival = cloglog_survival_gamma_reference(mu, sigma)?;
+        let shifted_survival = cloglog_survival_gamma_reference(mu + sigma * sigma, sigma)?;
+        let mean = cloglog_mean_from_survival(survival);
+        let dmean = cloglog_shift_identity_derivative(mu, sigma, shifted_survival);
+        if !(mean.is_finite() && dmean.is_finite()) {
+            return Err(EstimationError::InvalidInput(
+                "Gamma cloglog reference backend produced non-finite values".to_string(),
+            ));
+        }
+        Ok(IntegratedMeanDerivative {
+            mean,
+            dmean_dmu: dmean.max(0.0),
+            mode: IntegratedExpectationMode::ExactSpecialFunction,
+        })
+    }
 
     fn even_moment_exp_neg_x2(power: usize) -> f64 {
         assert!(power.is_multiple_of(2));
