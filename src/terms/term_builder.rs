@@ -176,18 +176,6 @@ pub fn column_map_with_alias(
     aliased
 }
 
-fn unique_finite_level_bits(column: ArrayView1<'_, f64>) -> Vec<u64> {
-    let mut levels = column
-        .iter()
-        .copied()
-        .filter(|v| v.is_finite())
-        .map(f64::to_bits)
-        .collect::<Vec<_>>();
-    levels.sort_unstable();
-    levels.dedup();
-    levels
-}
-
 // ---------------------------------------------------------------------------
 // ParsedTerm[] + Dataset → TermCollectionSpec
 // ---------------------------------------------------------------------------
@@ -562,39 +550,6 @@ fn parse_periodic_axes_option(
     Ok(Some(periods))
 }
 
-fn parse_bc_periods_option(
-    options: &BTreeMap<String, String>,
-    dim: usize,
-) -> Result<Vec<Option<f64>>, String> {
-    let mut periods = vec![None; dim];
-    if let Some(raw_bc) = options.get("bc") {
-        let bc = split_list_option(raw_bc);
-        if bc.len() != dim {
-            return Err(format!(
-                "bc list length {} must match tensor dimension {}",
-                bc.len(),
-                dim
-            ));
-        }
-        let period_values = parse_periods_option(options, dim)?.unwrap_or_else(|| vec![None; dim]);
-        for (i, b) in bc.iter().enumerate() {
-            let b = strip_quotes(b).trim().to_ascii_lowercase();
-            match b.as_str() {
-                "periodic" | "cyclic" | "cc" => {
-                    periods[i] =
-                        period_values[i].or_else(|| if dim == 1 { period_values[0] } else { None });
-                    if periods[i].is_none() {
-                        return Err(format!("periodic tensor margin {i} requires period[{i}]"));
-                    }
-                }
-                "natural" | "cr" | "bspline" | "p-spline" | "ps" | "none" => {}
-                other => return Err(format!("unsupported tensor bc '{other}' at margin {i}")),
-            }
-        }
-    }
-    Ok(periods)
-}
-
 // ---------------------------------------------------------------------------
 // Smooth basis spec construction
 // ---------------------------------------------------------------------------
@@ -617,10 +572,13 @@ fn parse_option_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_f64_option_list(raw: &str) -> Vec<f64> {
+fn parse_f64_option_list(raw: &str) -> Result<Vec<f64>, String> {
     parse_option_list(raw)
         .into_iter()
-        .filter_map(|v| v.parse::<f64>().ok())
+        .map(|v| {
+            v.parse::<f64>()
+                .map_err(|err| format!("invalid numeric option list value '{v}': {err}"))
+        })
         .collect()
 }
 
@@ -645,11 +603,13 @@ fn tensor_margin_boundary_conditions(
         .get("period")
         .or_else(|| options.get("periods"))
         .map(|raw| parse_f64_option_list(raw))
+        .transpose()?
         .unwrap_or_default();
     let origins = options
         .get("origin")
         .or_else(|| options.get("origins"))
         .map(|raw| parse_f64_option_list(raw))
+        .transpose()?
         .unwrap_or_default();
     for (i, boundary) in bc.iter().enumerate() {
         match boundary.as_str() {
@@ -1598,45 +1558,6 @@ pub fn heuristic_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
     let unique = unique_count_column(col);
     let ceiling = ((unique as f64).cbrt() as usize).max(20);
     (unique / 4).clamp(4, ceiling)
-}
-
-fn cap_inferred_tensor_internal_knots(internal_knots: &mut [usize], degree: usize, n: usize) {
-    if internal_knots.is_empty() {
-        return;
-    }
-    let min_basis = degree + 1;
-    let max_product = inferred_tensor_basis_product_cap(n, internal_knots.len());
-    loop {
-        let product = internal_knots
-            .iter()
-            .try_fold(1usize, |acc, &knots| acc.checked_mul(knots + min_basis));
-        if matches!(product, Some(p) if p <= max_product) {
-            break;
-        }
-        let Some((idx, _)) = internal_knots
-            .iter()
-            .enumerate()
-            .filter(|(_, knots)| **knots > 1)
-            .max_by_key(|(_, knots)| **knots + min_basis)
-        else {
-            break;
-        };
-        internal_knots[idx] -= 1;
-    }
-}
-
-fn tensor_effective_support_count(ds: &Dataset, cols: &[usize]) -> usize {
-    let product = cols.iter().try_fold(1usize, |acc, &col| {
-        acc.checked_mul(unique_count_column(ds.values.column(col)))
-    });
-    product.unwrap_or(usize::MAX).min(ds.values.nrows()).max(1)
-}
-
-fn inferred_tensor_basis_product_cap(n: usize, ndim: usize) -> usize {
-    let upper = 128usize;
-    let n_cap = (4.0 * (n.max(1) as f64).sqrt()).round() as usize;
-    let dim_floor = 4usize.saturating_pow(ndim as u32).max(64).min(upper);
-    n_cap.clamp(dim_floor, upper)
 }
 
 pub fn heuristic_centers(n: usize, d: usize) -> usize {

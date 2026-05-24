@@ -49,11 +49,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 /// tolerances.
 const TRUST_ENERGY_FACTOR: f64 = 10.0;
 
-/// Multiplicative shrink applied to the trust radius when the IFT-energy
-/// gate fires. Chosen conservatively at `0.5` — one octave per rejection —
-/// so a single noisy step does not collapse the radius and stall progress.
-const TRUST_ENERGY_SHRINK_FACTOR: f64 = 0.5;
-
 /// Bidirectional inner-PIRLS feedback channel.
 ///
 /// The outer-loop scheduler (BFGS or ARC bridge) writes a coarsened
@@ -1340,33 +1335,6 @@ fn automatic_fallback_attempts(cap: &OuterCapability) -> Vec<OuterCapability> {
     }
 
     attempts
-}
-
-/// Builds the outer-gradient convergence tolerance.
-///
-/// The shape is a magnitude-scaled absolute rule:
-/// `‖g‖_proj ≤ max(tolerance, objective_scale · 1e-9)`. The optional
-/// `objective_scale` widening lifts the floor so a biobank-scale fit
-/// (n=1e6, tol=1e-5 → floor 1e-3) is not forced to chase sub-ULP
-/// gradient components; the per-unit-magnitude budget of `1e-9` stays
-/// ~9 decades below typical biobank-scale seed gradients
-/// (which are 1e6+), so the floor cannot drown out real descent.
-///
-/// The relative-from-seed shape (`rel_initial_grad`) is deliberately
-/// not used. On a resumed-from-cache start the optimizer's first-iter
-/// line search can accept a near-zero step where `‖g‖ / ‖g_0‖` stays
-/// at ≈ 1, and any rel-from-seed rule then fires at the seed itself
-/// — the optimizer "converges" at the very gradient it started with,
-/// no descent achieved, the iterate is not a stationary point. Using
-/// the absolute floor only means the optimizer must drive the
-/// gradient down to a magnitude-meaningful value before it can claim
-/// convergence, which is the only honest stop criterion.
-fn outer_gradient_tolerance_with_scale(
-    tolerance: f64,
-    objective_scale: Option<f64>,
-) -> GradientTolerance {
-    let abs = outer_gradient_absolute_floor(tolerance, objective_scale);
-    GradientTolerance::absolute(abs)
 }
 
 /// Effective absolute-gradient floor: the scalar tolerance, widened
@@ -4983,6 +4951,24 @@ fn run_outer(
     }))
 }
 
+fn outer_bounds(lo: &Array1<f64>, hi: &Array1<f64>) -> Result<Bounds, EstimationError> {
+    Bounds::new(lo.clone(), hi.clone(), 1e-6).map_err(|err| {
+        EstimationError::InvalidInput(format!("outer rho bounds are invalid: {err}"))
+    })
+}
+
+fn outer_tolerance(value: f64) -> Result<Tolerance, EstimationError> {
+    Tolerance::new(value).map_err(|err| {
+        EstimationError::InvalidInput(format!("outer tolerance is invalid: {err}"))
+    })
+}
+
+fn outer_max_iterations(value: usize) -> Result<MaxIterations, EstimationError> {
+    MaxIterations::new(value).map_err(|err| {
+        EstimationError::InvalidInput(format!("outer max_iter is invalid: {err}"))
+    })
+}
+
 /// Execute a single plan attempt (seed generation → solver loop → best result).
 fn run_outer_with_plan(
     obj: &mut dyn OuterObjective,
@@ -5183,19 +5169,17 @@ fn run_outer_with_plan(
                 if matches!(seed_eval.hessian, HessianResult::Operator(_)) {
                     log::debug!(
                         "[OUTER] {context}: analytic Hessian provided as Hv operator; \
-                         routing to opt::MatrixFreeTrustRegion (Steihaug-Toint CG)"
+                        routing to opt::MatrixFreeTrustRegion (Steihaug-Toint CG)"
                     );
                     let (lo, hi) = &bounds_template;
-                    let bounds_obj = Bounds::new(lo.clone(), hi.clone(), 1e-6)
-                        .expect("outer rho bounds must be valid");
+                    let bounds_obj = outer_bounds(lo, hi)?;
                     // Scale-aware tolerance via opt 0.5.0:
                     // `relative_to_cost(τ)` = `τ * (1 + |f|)` resolved
                     // at run time from the seed cost and initial grad
                     // norm. Replaces the previous gam-side
                     // precomputed `outer_scaled_tolerance` hack.
                     let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
-                    let max_iter =
-                        MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
+                    let max_iter = outer_max_iterations(config.max_iter)?;
 
                     // Translate the seed_eval into an opt::OperatorSample
                     // so the matrix-free TR solver can serve its first
@@ -5312,11 +5296,9 @@ fn run_outer_with_plan(
                 } else {
                     let hessian_source = the_plan.hessian_source;
                     let (lo, hi) = &bounds_template;
-                    let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
-                        .expect("outer rho bounds must be valid");
+                    let bounds = outer_bounds(lo, hi)?;
                     let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
-                    let max_iter =
-                        MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
+                    let max_iter = outer_max_iterations(config.max_iter)?;
 
                     let objective = OuterSecondOrderBridge {
                         obj,
@@ -5446,11 +5428,9 @@ fn run_outer_with_plan(
                 started_seeds += 1;
                 seed_slot = started_seeds;
                 let (lo, hi) = &bounds_template;
-                let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
-                    .expect("outer rho bounds must be valid");
+                let bounds = outer_bounds(lo, hi)?;
                 let grad_tol = GradientTolerance::relative_to_cost(config.tolerance);
-                let max_iter =
-                    MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
+                let max_iter = outer_max_iterations(config.max_iter)?;
                 let objective = OuterFirstOrderBridge {
                     obj,
                     layout,
@@ -5601,11 +5581,9 @@ fn run_outer_with_plan(
                 started_seeds += 1;
                 seed_slot = started_seeds;
                 let (lo, hi) = &bounds_template;
-                let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
-                    .expect("outer rho bounds must be valid");
-                let tol = Tolerance::new(config.tolerance).expect("outer tolerance must be valid");
-                let max_iter =
-                    MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
+                let bounds = outer_bounds(lo, hi)?;
+                let tol = outer_tolerance(config.tolerance)?;
+                let max_iter = outer_max_iterations(config.max_iter)?;
                 let mut optimizer = FixedPoint::new(seed.clone(), objective)
                     .with_bounds(bounds)
                     .with_tolerance(tol)
@@ -5650,11 +5628,9 @@ fn run_outer_with_plan(
                 started_seeds += 1;
                 seed_slot = started_seeds;
                 let (lo, hi) = &bounds_template;
-                let bounds = Bounds::new(lo.clone(), hi.clone(), 1e-6)
-                    .expect("outer rho bounds must be valid");
-                let tol = Tolerance::new(config.tolerance).expect("outer tolerance must be valid");
-                let max_iter =
-                    MaxIterations::new(config.max_iter).expect("outer max_iter must be valid");
+                let bounds = outer_bounds(lo, hi)?;
+                let tol = outer_tolerance(config.tolerance)?;
+                let max_iter = outer_max_iterations(config.max_iter)?;
                 let mut optimizer = FixedPoint::new(seed.clone(), objective)
                     .with_bounds(bounds)
                     .with_tolerance(tol)
