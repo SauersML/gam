@@ -3,7 +3,7 @@ use crate::faer_ndarray::{
     FaerCholesky, FaerEigh, fast_ab, fast_atb, fast_xt_diag_x, fast_xt_diag_y,
 };
 use faer::Side;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, s};
 use rayon::prelude::*;
 use std::sync::Once;
 
@@ -944,9 +944,11 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
     problems: &[GaussianRemlMultiBackwardProblem<'a>],
     penalty: ArrayView2<'a, f64>,
 ) -> Vec<Result<GaussianRemlBackwardResult, EstimationError>> {
+    let inverse_hessians = batched_inverse_hessians_from_caches(problems);
     let results: Vec<Result<GaussianRemlBackwardResult, EstimationError>> = problems
         .par_iter()
-        .map(|problem| {
+        .zip(inverse_hessians.into_par_iter())
+        .map(|(problem, inverse_hessian_result)| {
             validate_gaussian_reml_backward_upstreams(
                 problem.x.view(),
                 problem.y.view(),
@@ -975,15 +977,14 @@ pub fn gaussian_reml_multi_closed_form_backward_batch<'a>(
                 return Ok(zero_backward_result(n, p, d));
             }
             let weight = gaussian_reml_weights(n, problem.weights.as_ref().map(|w| w.view()))?;
-            let inverse_hessian =
-                match gaussian_reml_inverse_hessian_from_cache(&problem.fit.cache, lambda) {
-                    Ok(inv) => inv,
-                    Err(EstimationError::ModelIsIllConditioned { condition_number }) => {
-                        warn_ill_conditioned_backward_once(p, d, condition_number);
-                        return Ok(zero_backward_result(n, p, d));
-                    }
-                    Err(err) => return Err(err),
-                };
+            let inverse_hessian = match inverse_hessian_result {
+                Ok(inv) => inv,
+                Err(EstimationError::ModelIsIllConditioned { condition_number }) => {
+                    warn_ill_conditioned_backward_once(p, d, condition_number);
+                    return Ok(zero_backward_result(n, p, d));
+                }
+                Err(err) => return Err(err),
+            };
             gaussian_reml_multi_closed_form_backward_from_fit_with_inverse_hessian_impl(
                 problem.x.view(),
                 problem.y.view(),
@@ -1141,6 +1142,57 @@ fn gaussian_reml_inverse_hessian_from_cache(
         });
     }
     Ok(inverse)
+}
+
+fn batched_inverse_hessians_from_caches(
+    problems: &[GaussianRemlMultiBackwardProblem<'_>],
+) -> Vec<Result<Array2<f64>, EstimationError>> {
+    if problems.is_empty() {
+        return Vec::new();
+    }
+    let p = problems[0].fit.cache.coefficient_basis.nrows();
+    let uniform = p > 0
+        && problems.iter().all(|problem| {
+            let cache = &problem.fit.cache;
+            cache.coefficient_basis.dim() == (p, p) && cache.penalty_eigenvalues.len() == p
+        });
+    if uniform && problems.len() > 1 {
+        let mut scaled_basis = Array3::<f64>::zeros((problems.len(), p, p));
+        let mut basis = Array3::<f64>::zeros((problems.len(), p, p));
+        let mut valid = true;
+        for (idx, problem) in problems.iter().enumerate() {
+            let lambda = problem.fit.lambda;
+            if !(lambda.is_finite() && lambda > 0.0) {
+                valid = false;
+                break;
+            }
+            let cache = &problem.fit.cache;
+            basis
+                .slice_mut(s![idx, .., ..])
+                .assign(&cache.coefficient_basis);
+            for eig in 0..p {
+                let scale = 1.0 / (1.0 + lambda * cache.penalty_eigenvalues[eig]);
+                for row in 0..p {
+                    scaled_basis[[idx, row, eig]] = cache.coefficient_basis[[row, eig]] * scale;
+                }
+            }
+        }
+        if valid
+            && let Some(inverses) =
+                crate::gpu::try_fast_abt_strided_batched(scaled_basis.view(), basis.view())
+        {
+            return inverses
+                .axis_iter(Axis(0))
+                .map(|inverse| Ok(inverse.to_owned()))
+                .collect();
+        }
+    }
+    problems
+        .iter()
+        .map(|problem| {
+            gaussian_reml_inverse_hessian_from_cache(&problem.fit.cache, problem.fit.lambda)
+        })
+        .collect()
 }
 
 struct RidgeProfileVjp {
@@ -1544,6 +1596,32 @@ pub fn build_gaussian_reml_eigen_cache_batched(
         .map(|m| matrix_fingerprint(m.view()))
         .collect();
 
+    let p = xtwx_matrices[0].nrows();
+    let uniform_square = p > 0
+        && xtwx_matrices
+            .iter()
+            .all(|matrix| matrix.dim() == (p, p));
+    if uniform_square && k > 1 {
+        let mut lower_matrices = xtwx_matrices.clone();
+        if crate::gpu::try_cholesky_batched_lower_inplace(&mut lower_matrices).is_some() {
+            let transforms =
+                batched_whitened_penalty_transforms(&lower_matrices, penalty).unwrap_or_default();
+            return lower_matrices
+                .into_iter()
+                .enumerate()
+                .map(|(b, lower)| {
+                    gaussian_reml_eigen_cache_from_lower_with_transform(
+                        lower,
+                        penalty,
+                        nullspace_dim,
+                        fingerprints[b],
+                        transforms.get(b).cloned(),
+                    )
+                })
+                .collect();
+        }
+    }
+
     let mut results = Vec::with_capacity(k);
     for (b, xtwx) in xtwx_matrices.into_iter().enumerate() {
         let lower = match gaussian_reml_cholesky_lower(xtwx) {
@@ -1562,6 +1640,32 @@ pub fn build_gaussian_reml_eigen_cache_batched(
         ));
     }
     results
+}
+
+fn batched_whitened_penalty_transforms(
+    lowers: &[Array2<f64>],
+    penalty: ArrayView2<'_, f64>,
+) -> Option<Vec<Array2<f64>>> {
+    let first = lowers.first()?;
+    let p = first.nrows();
+    if p == 0 || first.ncols() != p || lowers.iter().any(|lower| lower.dim() != (p, p)) {
+        return None;
+    }
+    let mut linv_stack = Array3::<f64>::zeros((lowers.len(), p, p));
+    for (idx, lower) in lowers.iter().enumerate() {
+        let l_inv = invert_lower_triangular(lower).ok()?;
+        linv_stack.slice_mut(s![idx, .., ..]).assign(&l_inv);
+    }
+    let penalty_in_metric =
+        crate::gpu::try_fast_ab_broadcast_b_batched(linv_stack.view(), penalty)?;
+    let transformed =
+        crate::gpu::try_fast_abt_strided_batched(penalty_in_metric.view(), linv_stack.view())?;
+    Some(
+        transformed
+            .axis_iter(Axis(0))
+            .map(|matrix| matrix.to_owned())
+            .collect(),
+    )
 }
 
 pub fn build_gaussian_reml_eigen_cache(
@@ -1766,6 +1870,10 @@ fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, Estima
     // jitter of 1e-12 * trace/p shifts every eigenvalue up by an amount well
     // below the natural scale of the well-conditioned eigenvalues but well
     // above f64 FP noise, eliminating the spurious-failure regime.
+    let mut gpu_candidate = xtwx.clone();
+    if crate::gpu::try_cholesky_lower_inplace(&mut gpu_candidate).is_some() {
+        return Ok(gpu_candidate);
+    }
     if let Ok(chol) = xtwx.cholesky(Side::Lower) {
         return Ok(chol.lower_triangular());
     }
@@ -1781,6 +1889,10 @@ fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, Estima
         let mut jittered = xtwx.clone();
         for i in 0..p {
             jittered[[i, i]] += jitter;
+        }
+        let mut gpu_candidate = jittered.clone();
+        if crate::gpu::try_cholesky_lower_inplace(&mut gpu_candidate).is_some() {
+            return Ok(gpu_candidate);
         }
         if let Ok(chol) = jittered.cholesky(Side::Lower) {
             return Ok(chol.lower_triangular());
@@ -2455,6 +2567,9 @@ fn solve_lower_triangular_matrix(
             "lower-triangular solve dimension mismatch".to_string(),
         ));
     }
+    if let Some(out) = crate::gpu::try_solve_lower_triangular_matrix(lower.view(), rhs.view()) {
+        return Ok(out);
+    }
     let mut out = Array2::<f64>::zeros(rhs.dim());
     for col in 0..rhs.ncols() {
         for i in 0..n {
@@ -2483,6 +2598,9 @@ fn solve_upper_triangular_matrix(
         return Err(EstimationError::InvalidInput(
             "upper-triangular solve dimension mismatch".to_string(),
         ));
+    }
+    if let Some(out) = crate::gpu::try_solve_upper_triangular_matrix(upper.view(), rhs.view()) {
+        return Ok(out);
     }
     let mut out = Array2::<f64>::zeros(rhs.dim());
     for col in 0..rhs.ncols() {
