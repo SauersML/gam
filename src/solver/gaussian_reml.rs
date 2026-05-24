@@ -1734,13 +1734,12 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
         .filter(|&&value| value > eig_tol)
         .count();
     let nullity = p - penalty_rank;
-    if let Some(expected_nullity) = nullspace_dim {
-        if expected_nullity != nullity {
+    if let Some(expected_nullity) = nullspace_dim
+        && expected_nullity != nullity {
             return Err(EstimationError::InvalidInput(format!(
                 "Gaussian REML penalty nullspace mismatch: expected {expected_nullity}, inferred {nullity}"
             )));
         }
-    }
     let logdet_penalty_positive = gaussian_penalty_positive_logdet(penalty, penalty_rank)?;
     let coefficient_basis = solve_upper_triangular_matrix(&lower.t().to_owned(), &eigenvectors)?;
 
@@ -1928,14 +1927,13 @@ fn prepare_gaussian_reml(
                 "Gaussian REML eigen cache penalty mismatch".to_string(),
             ));
         }
-        if let Some(expected_nullity) = nullspace_dim {
-            if expected_nullity != cache.nullity {
+        if let Some(expected_nullity) = nullspace_dim
+            && expected_nullity != cache.nullity {
                 return Err(EstimationError::InvalidInput(format!(
                     "Gaussian REML eigen cache nullspace mismatch: expected {expected_nullity}, got {}",
                     cache.nullity
                 )));
             }
-        }
         if n <= cache.nullity {
             return Err(EstimationError::InvalidInput(format!(
                 "Gaussian REML requires n > nullspace dimension; got n={n}, nullity={}",

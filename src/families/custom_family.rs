@@ -592,14 +592,13 @@ pub fn realize_coefficient_groups_for_custom_family(
         if let Some(prior) = group.prior.as_ref() {
             prior.validate(&format!("coefficient group '{}'", group.label))?;
         }
-        if let Some(initial) = group.initial_log_precision {
-            if !initial.is_finite() {
+        if let Some(initial) = group.initial_log_precision
+            && !initial.is_finite() {
                 return Err(CustomFamilyError::DimensionMismatch { reason: format!(
                     "coefficient group '{}' initial log precision must be finite, got {initial}",
                     group.label
                 ) }.into());
             }
-        }
     }
 
     let mut realized_groups = Vec::<RealizedCoefficientGroup>::with_capacity(groups.len());
@@ -3059,7 +3058,7 @@ fn persistent_block_inner_summary(
             && cached.penalty_value.is_finite()
             && cached.block_logdet_h.is_finite()
             && cached.block_logdet_s.is_finite())
-        .then(|| PersistentBlockInnerSummary {
+        .then_some(PersistentBlockInnerSummary {
             log_likelihood: cached.log_likelihood,
             penalty_value: cached.penalty_value,
             cycles: cached.cycles,
@@ -4861,7 +4860,7 @@ pub(crate) fn build_block_spatial_psi_derivatives(
                 .zip(
                     info.s_psi_psi_components_local
                         .iter()
-                        .map(|local| embed_penalty(local)),
+                        .map(&embed_penalty),
                 )
                 .collect();
             if let (Some(gid), Some(cross_penalty_provider)) = (
@@ -4928,8 +4927,8 @@ impl CustomFamilyPsiDesignAction {
             }
             .into());
         }
-        if let Some(op) = deriv.implicit_operator.as_ref() {
-            if op.n_data() == total_rows && op.p_out() == p {
+        if let Some(op) = deriv.implicit_operator.as_ref()
+            && op.n_data() == total_rows && op.p_out() == p {
                 return Ok(Self {
                     operator: Arc::clone(op),
                     axis: deriv.implicit_axis,
@@ -4937,7 +4936,6 @@ impl CustomFamilyPsiDesignAction {
                     p,
                 });
             }
-        }
         Err(CustomFamilyError::UnsupportedConfiguration { reason: format!(
             "{label} is missing an implicit x_psi operator with shape {}x{}; got dense payload {}x{} instead",
             total_rows,
@@ -5736,15 +5734,14 @@ pub(crate) fn resolve_custom_family_x_psi_map(
     }
 
     // Prefer operator action when dimensions match.
-    if let Some(op) = deriv.implicit_operator.as_ref() {
-        if op.n_data() == n && op.p_out() == p {
+    if let Some(op) = deriv.implicit_operator.as_ref()
+        && op.n_data() == n && op.p_out() == p {
             return Ok(PsiDesignMap::First {
                 action: CustomFamilyPsiDesignAction::from_first_derivative(
                     deriv, n, p, row_range, label,
                 )?,
             });
         }
-    }
 
     // Dense fallback guarded by policy.
     if deriv.x_psi.nrows() == n && deriv.x_psi.ncols() == p {
@@ -5817,8 +5814,8 @@ pub(crate) fn resolve_custom_family_x_psi_psi_map(
     }
 
     // Prefer operator action when dimensions match.
-    if let Some(op) = deriv_i.implicit_operator.as_ref() {
-        if op.n_data() == n && op.p_out() == p {
+    if let Some(op) = deriv_i.implicit_operator.as_ref()
+        && op.n_data() == n && op.p_out() == p {
             let same_group = deriv_i.implicit_group_id.is_some()
                 && deriv_i.implicit_group_id == deriv_j.implicit_group_id;
             if !same_group {
@@ -5846,7 +5843,6 @@ pub(crate) fn resolve_custom_family_x_psi_psi_map(
                 }
             }
         }
-    }
 
     // Dense fallback guarded by policy, reading from the per-second-derivative
     // slot `x_psi_psi[local_j]` if provided.
@@ -6903,11 +6899,10 @@ fn add_labeled_rho_prior_to_outer_eval(
         }
         result.gradient += &gradient;
     }
-    if eval_mode == EvalMode::ValueGradientHessian {
-        if let Some(prior_hessian) = hessian {
+    if eval_mode == EvalMode::ValueGradientHessian
+        && let Some(prior_hessian) = hessian {
             result.outer_hessian.add_rho_block_dense(&prior_hessian)?;
         }
-    }
     Ok(result)
 }
 
@@ -8251,11 +8246,10 @@ fn try_cholesky_with_escalating_ridge<R>(
                 candidate[[i, i]] += boost;
             }
         }
-        if let Ok(chol) = candidate.cholesky(Side::Lower) {
-            if let Some(r) = on_success(&chol, attempt, boost) {
+        if let Ok(chol) = candidate.cholesky(Side::Lower)
+            && let Some(r) = on_success(&chol, attempt, boost) {
                 return Some((r, boost, attempt));
             }
-        }
         boost *= growth;
     }
     None
@@ -8359,13 +8353,12 @@ fn inverse_spdwith_retry(
 
     // Subsequent attempts use ridge = baseridge * 10^(k-1) for k = 1..=max_retry,
     // which is `max_retry` total attempts with initial_boost=baseridge, growth=10.
-    if max_retry > 0 {
-        if let Some((inv, _, _)) =
+    if max_retry > 0
+        && let Some((inv, _, _)) =
             try_cholesky_with_escalating_ridge(&sym, baseridge, max_retry, 10.0, invert_via_chol)
         {
             return Ok(inv);
         }
-    }
 
     Err(CustomFamilyError::BasisDecompositionFailed {
         reason: "failed to invert SPD system after Cholesky ridge retries".to_string(),
@@ -9465,14 +9458,13 @@ fn exact_newton_dh_closure<'a, F: CustomFamily + Sync>(
             };
         }
 
-        if let Some(workspace) = workspace.as_ref() {
-            if let Some(operator) = workspace.directional_derivative_operator(v_k)? {
+        if let Some(workspace) = workspace.as_ref()
+            && let Some(operator) = workspace.directional_derivative_operator(v_k)? {
                 return Ok(Some(scale_drift_deriv_result(
                     DriftDerivResult::Operator(operator),
                     scale,
                 )));
             }
-        }
 
         match family.exact_newton_joint_hessian_directional_derivative_with_specs(
             synced_states.as_ref(),
@@ -9558,14 +9550,13 @@ fn exact_newton_d2h_closure<'a, F: CustomFamily + Sync>(
             };
         }
 
-        if let Some(workspace) = workspace.as_ref() {
-            if let Some(operator) = workspace.second_directional_derivative_operator(u, v)? {
+        if let Some(workspace) = workspace.as_ref()
+            && let Some(operator) = workspace.second_directional_derivative_operator(u, v)? {
                 return Ok(Some(scale_drift_deriv_result(
                     DriftDerivResult::Operator(operator),
                     scale,
                 )));
             }
-        }
 
         match family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
             synced_states.as_ref(),
@@ -9622,14 +9613,13 @@ fn exact_newton_dh_closure_owned<F: CustomFamily + Clone + Send + Sync + 'static
             };
         }
 
-        if let Some(workspace) = workspace.as_ref() {
-            if let Some(operator) = workspace.directional_derivative_operator(v_k)? {
+        if let Some(workspace) = workspace.as_ref()
+            && let Some(operator) = workspace.directional_derivative_operator(v_k)? {
                 return Ok(Some(scale_drift_deriv_result(
                     DriftDerivResult::Operator(operator),
                     scale,
                 )));
             }
-        }
 
         match family.exact_newton_joint_hessian_directional_derivative_with_specs(
             synced_states.as_ref(),
@@ -9706,14 +9696,13 @@ fn exact_newton_d2h_closure_owned<F: CustomFamily + Clone + Send + Sync + 'stati
             };
         }
 
-        if let Some(workspace) = workspace.as_ref() {
-            if let Some(operator) = workspace.second_directional_derivative_operator(u, v)? {
+        if let Some(workspace) = workspace.as_ref()
+            && let Some(operator) = workspace.second_directional_derivative_operator(u, v)? {
                 return Ok(Some(scale_drift_deriv_result(
                     DriftDerivResult::Operator(operator),
                     scale,
                 )));
             }
-        }
 
         match family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
             synced_states.as_ref(),
@@ -10669,7 +10658,7 @@ const JOINT_PCG_REL_TOL: f64 = 1e-8;
 const PCG_ETA_MAX: f64 = 1.0e-1;
 const PCG_ETA_MIN: f64 = 1.0e-8;
 const PCG_GAMMA: f64 = 0.9;
-const PCG_ALPHA: f64 = 1.6180339887498949;
+const PCG_ALPHA: f64 = 1.618_033_988_749_895;
 
 /// Eisenstat–Walker adaptive forcing term for the inner PCG tolerance:
 /// when the previous outer KKT residual is known, scale the next inner
@@ -10810,11 +10799,9 @@ fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'sta
             specs,
             workspace_options,
         )?
-    {
-        if let Some(log_likelihood) = workspace.joint_log_likelihood_evaluation()? {
+        && let Some(log_likelihood) = workspace.joint_log_likelihood_evaluation()? {
             return Ok((log_likelihood, Some(workspace)));
         }
-    }
     family
         .log_likelihood_only_with_options(states, line_search_options)
         .map(|log_likelihood| (log_likelihood, None))
@@ -14895,7 +14882,7 @@ fn joint_outer_evaluate(
                     ))
                 }
                 JointHessianSource::Operator { apply, .. } => {
-                    let apply_h = Arc::clone(&apply);
+                    let apply_h = Arc::clone(apply);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
                     Arc::new(MatrixFreeSpdOperator::new_with_mode(
@@ -15218,7 +15205,7 @@ fn joint_outer_evaluate_efs(
                     ))
                 }
                 JointHessianSource::Operator { apply, .. } => {
-                    let apply_h = Arc::clone(&apply);
+                    let apply_h = Arc::clone(apply);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
                     Arc::new(MatrixFreeSpdOperator::new_with_mode(
@@ -16016,7 +16003,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
         let (start, end) = ranges[block_idx];
         let p_block = end - start;
 
-        for (_, deriv) in block_derivs.iter().enumerate() {
+        for deriv in block_derivs.iter() {
             // 1. Get family-provided likelihood objects (joint flattened space).
             let psi_terms = if let Some(batched) = batched_terms.as_ref() {
                 batched[psi_global].clone()
@@ -16571,8 +16558,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 "joint hyper derivative block count mismatch: got {}, expected {}",
                 derivative_blocks.len(),
                 specs.len()
-            )
-            .into(),
+            ),
         }
         .into());
     }
@@ -16583,8 +16569,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 "joint hyper penalty-count block mismatch: got {}, expected {}",
                 penalty_counts.len(),
                 specs.len()
-            )
-            .into(),
+            ),
         }
         .into());
     }
@@ -16597,8 +16582,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 rho_current.len(),
                 rho_dim,
                 psi_dim
-            )
-            .into(),
+            ),
         }
         .into());
     }
@@ -16607,7 +16591,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     let include_logdet_h = include_exact_newton_logdet_h(family, options);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);
-    let per_block = split_log_lambdas(rho_current, &penalty_counts)?;
+    let per_block = split_log_lambdas(rho_current, penalty_counts)?;
     let psi_safe_warm_start =
         warm_start_without_cached_inner_for_psi_derivatives(warm_start, psi_dim > 0);
     let mut inner = inner_blockwise_fit(
@@ -16628,8 +16612,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
              a value with zero or shape-only derivatives is mathematically \
              inconsistent.",
                 inner.cycles, theta_dim, rho_dim, psi_dim
-            )
-            .into(),
+            ),
         }
         .into());
     }
@@ -16808,7 +16791,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 derivative_blocks.as_ref(),
                 &beta_flat,
                 rho_slice,
-                &penalty_counts,
+                penalty_counts,
                 s_logdet_blocks.as_deref(),
                 hessian_beta_independent,
                 psi_workspace.clone(),
@@ -16823,7 +16806,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                     Arc::clone(&derivative_blocks),
                     &beta_flat,
                     rho_slice,
-                    &penalty_counts,
+                    penalty_counts,
                     s_logdet_blocks.as_deref(),
                     psi_workspace.clone(),
                 )?;
@@ -17014,8 +16997,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             if batch.objective_theta.len() == expected
                 && batch.trace_h_inv_hdot.len() == expected
                 && batch.trace_s_pinv_sdot.len() == expected
-            {
-                if let Some(joint_bundle_value_only) = build_joint_hessian_closures(
+                && let Some(joint_bundle_value_only) = build_joint_hessian_closures(
                     family,
                     &inner.block_states,
                     specs,
@@ -17098,7 +17080,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         });
                     }
                 }
-            }
         }
     }
 
@@ -17171,11 +17152,10 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
         )?;
 
         let mut eval_result = eval_result;
-        if let Some(batched_grad) = batched_gradient_override.take() {
-            if batched_grad.len() == eval_result.gradient.len() {
+        if let Some(batched_grad) = batched_gradient_override.take()
+            && batched_grad.len() == eval_result.gradient.len() {
                 eval_result.gradient = batched_grad;
             }
-        }
         return Ok(eval_result);
     }
 
@@ -17228,7 +17208,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                     hessian.ncols(),
                     p,
                     p
-                ).into() }.into());
+                ) }.into());
             }
             hessian.to_dense()
         }
@@ -17656,8 +17636,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
                 "joint hyper derivative block count mismatch: got {}, expected {}",
                 derivative_blocks.len(),
                 specs.len()
-            )
-            .into(),
+            ),
         }
         .into());
     }
@@ -17667,8 +17646,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
                 "joint hyper penalty-count block mismatch: got {}, expected {}",
                 penalty_counts.len(),
                 specs.len()
-            )
-            .into(),
+            ),
         }
         .into());
     }
@@ -17688,8 +17666,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
                 rho_current.len(),
                 rho_dim,
                 psi_dim
-            )
-            .into(),
+            ),
         }
         .into());
     }
@@ -18011,8 +17988,7 @@ pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + S
                 "joint hyper derivative block count mismatch: got {}, expected {}",
                 derivative_blocks.len(),
                 specs.len()
-            )
-            .into(),
+            ),
         }
         .into());
     }
@@ -18062,8 +18038,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_shared<
                 "joint hyper derivative block count mismatch: got {}, expected {}",
                 derivative_blocks.len(),
                 specs.len()
-            )
-            .into(),
+            ),
         }
         .into());
     }
@@ -18227,7 +18202,7 @@ fn apply_joint_block_penalty_into(
             .for_each(|(b, out_block)| {
                 let (start, end) = ranges[b];
                 let block = vector.slice(s![start..end]);
-                let out_view = ArrayViewMut1::from(out_block.as_mut());
+                let out_view = ArrayViewMut1::from(out_block);
                 crate::linalg::faer_ndarray::fast_av_view_into(&s_lambdas[b], &block, out_view);
             });
     }
@@ -19457,7 +19432,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     };
     let problem = OuterProblem::new(n_rho)
         .with_gradient(cap_gradient)
-        .with_hessian(hessian.into())
+        .with_hessian(hessian)
         .with_disable_fixed_point(multi_block_beta_dependent)
         .with_fallback_policy(fallback_policy)
         .with_tolerance(options.outer_tol)

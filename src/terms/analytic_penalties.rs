@@ -2743,7 +2743,7 @@ impl TotalVariationPenalty {
     }
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
-        if self.n_eff == 0 || target_len % self.n_eff != 0 {
+        if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
             debug_assert_eq!(
                 target_len % self.n_eff.max(1),
                 0,
@@ -3127,7 +3127,7 @@ impl NuclearNormPenalty {
         if n_eff == 0 {
             return Err("NuclearNormPenalty::new requires n_eff > 0".to_string());
         }
-        if target.len() % n_eff != 0 {
+        if !target.len().is_multiple_of(n_eff) {
             return Err(format!(
                 "NuclearNormPenalty::new target length {} is not divisible by n_eff {}",
                 target.len(),
@@ -3183,7 +3183,7 @@ impl NuclearNormPenalty {
     }
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
-        if self.n_eff == 0 || target_len % self.n_eff != 0 {
+        if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
             debug_assert_eq!(
                 target_len % self.n_eff.max(1),
                 0,
@@ -3497,7 +3497,7 @@ impl BlockSparsityPenalty {
         if n_eff == 0 {
             return Err("BlockSparsityPenalty::new requires n_eff > 0".to_string());
         }
-        if target.len() % n_eff != 0 {
+        if !target.len().is_multiple_of(n_eff) {
             return Err(format!(
                 "BlockSparsityPenalty::new target length {} is not divisible by n_eff {}",
                 target.len(),
@@ -3582,7 +3582,7 @@ impl BlockSparsityPenalty {
     }
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
-        if self.n_eff == 0 || target_len % self.n_eff != 0 {
+        if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
             debug_assert_eq!(
                 target_len % self.n_eff.max(1),
                 0,
@@ -3926,7 +3926,7 @@ impl MechanismSparsityPenalty {
 
     fn feature_count(&self) -> Option<usize> {
         let d = self.latent_dim()?;
-        if self.target.len() % d != 0 {
+        if !self.target.len().is_multiple_of(d) {
             return None;
         }
         Some(self.target.len() / d)
@@ -4163,7 +4163,7 @@ impl RowPrecisionPriorPenalty {
         if n_eff == 0 {
             return Err("RowPrecisionPriorPenalty::new requires n_eff > 0".to_string());
         }
-        if target.len() % n_eff != 0 {
+        if !target.len().is_multiple_of(n_eff) {
             return Err(format!(
                 "RowPrecisionPriorPenalty::new target length {} is not divisible by n_eff {}",
                 target.len(),
@@ -4252,7 +4252,7 @@ impl RowPrecisionPriorPenalty {
     }
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
-        if self.n_eff == 0 || target_len % self.n_eff != 0 {
+        if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
             debug_assert_eq!(
                 target_len % self.n_eff.max(1),
                 0,
@@ -4536,7 +4536,7 @@ impl IvaeRidgeMeanGauge {
         if n_eff == 0 {
             return Err("IvaeRidgeMeanGauge::new requires n_eff > 0".to_string());
         }
-        if target.len() % n_eff != 0 {
+        if !target.len().is_multiple_of(n_eff) {
             return Err(format!(
                 "IvaeRidgeMeanGauge::new target length {} is not divisible by n_eff {}",
                 target.len(),
@@ -4640,7 +4640,7 @@ impl IvaeRidgeMeanGauge {
     }
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
-        if self.n_eff == 0 || target_len % self.n_eff != 0 {
+        if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
             debug_assert_eq!(
                 target_len % self.n_eff.max(1),
                 0,
@@ -4900,7 +4900,7 @@ impl ParametricRowPrecisionPriorPenalty {
         if n_eff == 0 {
             return Err("ParametricRowPrecisionPriorPenalty::new requires n_eff > 0".to_string());
         }
-        if target.len() % n_eff != 0 {
+        if !target.len().is_multiple_of(n_eff) {
             return Err(format!(
                 "ParametricRowPrecisionPriorPenalty::new target length {} is not divisible by n_eff {}",
                 target.len(),
@@ -5021,7 +5021,7 @@ impl ParametricRowPrecisionPriorPenalty {
     }
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
-        if self.n_eff == 0 || target_len % self.n_eff != 0 {
+        if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
             debug_assert_eq!(
                 target_len % self.n_eff.max(1),
                 0,
@@ -5341,7 +5341,7 @@ impl ScadMcpPenalty {
         if n_eff == 0 {
             return Err("ScadMcpPenalty::new requires n_eff > 0".to_string());
         }
-        if target.len() % n_eff != 0 {
+        if !target.len().is_multiple_of(n_eff) {
             return Err(format!(
                 "ScadMcpPenalty::new target length {} is not divisible by n_eff {}",
                 target.len(),
@@ -5679,7 +5679,7 @@ impl BlockOrthogonalityPenalty {
         if n_eff == 0 {
             return Err("BlockOrthogonalityPenalty::new requires n_eff > 0".to_string());
         }
-        if target.len() % n_eff != 0 {
+        if !target.len().is_multiple_of(n_eff) {
             return Err(format!(
                 "BlockOrthogonalityPenalty::new target length {} is not divisible by n_eff {}",
                 target.len(),
@@ -5758,7 +5758,7 @@ impl BlockOrthogonalityPenalty {
     }
 
     fn latent_dim(&self, target_len: usize) -> Option<usize> {
-        if self.n_eff == 0 || target_len % self.n_eff != 0 {
+        if self.n_eff == 0 || !target_len.is_multiple_of(self.n_eff) {
             debug_assert_eq!(
                 target_len % self.n_eff.max(1),
                 0,
@@ -6026,7 +6026,7 @@ impl OrthogonalityPenalty {
         if latent_dim == 0 {
             return Err("OrthogonalityPenalty::new requires latent_dim > 0".to_string());
         }
-        if target.len() % latent_dim != 0 {
+        if !target.len().is_multiple_of(latent_dim) {
             return Err(format!(
                 "OrthogonalityPenalty::new target length {} is not divisible by latent_dim {}",
                 target.len(),
@@ -6086,7 +6086,7 @@ impl OrthogonalityPenalty {
 
     fn target_matrix<'a>(&self, target: ArrayView1<'a, f64>) -> Option<ArrayView2<'a, f64>> {
         let d = self.latent_dim;
-        if target.len() % d != 0 {
+        if !target.len().is_multiple_of(d) {
             debug_assert_eq!(
                 target.len() % d,
                 0,
@@ -7244,7 +7244,7 @@ impl AnalyticPenalty for NestedPrefixPenalty {
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
         let f = self.latent_dim();
-        debug_assert!(target.len() % f == 0, "target length must be n_rows · F");
+        debug_assert!(target.len().is_multiple_of(f), "target length must be n_rows · F");
         let n_rows = target.len() / f;
         let lambdas = self.lambdas(rho);
         let eps2 = self.eps * self.eps;

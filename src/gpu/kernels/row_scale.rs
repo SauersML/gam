@@ -41,9 +41,7 @@ pub fn try_dispatch(x: &mut Array2<f64>, w: ArrayView1<'_, f64>) -> Option<Resul
     if n == 0 || n != w.len() {
         return None;
     }
-    if crate::gpu::runtime::GpuRuntime::global().is_none() {
-        return None;
-    }
+    crate::gpu::runtime::GpuRuntime::global()?;
     Some(cuda_row_scale(x, w))
 }
 
@@ -102,8 +100,8 @@ extern "C" __global__ void row_scale_inplace_kernel(
 
     let tx: u32 = 16;
     let ty: u32 = 16;
-    let bx = ((p as u32) + tx - 1) / tx;
-    let by = ((n as u32) + ty - 1) / ty;
+    let bx = (p as u32).div_ceil(tx);
+    let by = (n as u32).div_ceil(ty);
     let cfg = LaunchConfig {
         grid_dim: (bx, by, 1),
         block_dim: (tx, ty, 1),

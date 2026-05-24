@@ -88,8 +88,8 @@ impl<'a> RemlState<'a> {
         }
         const PAR_MIN_CELLS: usize = 64 * 1024;
         let cells = out.nrows().saturating_mul(ncols);
-        if cells >= PAR_MIN_CELLS && rayon::current_num_threads() > 1 && out.is_standard_layout() {
-            if let Some(slice) = out.as_slice_memory_order_mut() {
+        if cells >= PAR_MIN_CELLS && rayon::current_num_threads() > 1 && out.is_standard_layout()
+            && let Some(slice) = out.as_slice_memory_order_mut() {
                 slice
                     .par_chunks_mut(ncols)
                     .enumerate()
@@ -108,7 +108,6 @@ impl<'a> RemlState<'a> {
                     });
                 return;
             }
-        }
         for row in 0..out.nrows() {
             let s = scale[row];
             if s > 0.0 {
@@ -808,7 +807,7 @@ impl FirthDenseOperator {
         let diag_term = self
             .x_dense_t
             .dot(&(&etav * &c_u.view().insert_axis(Axis(1))));
-        let term1 = self.left_scaled_xt(&buvec, &m_qv);
+        let term1 = self.left_scaled_xt(buvec, &m_qv);
         let term2 = self.left_scaled_xt(&self.w1, &m_buv);
         let term3 = self.left_scaled_xt(&self.w1, &p_u_qv);
         0.5 * (diag_term - (term1 + term2 + term3))
@@ -1231,7 +1230,7 @@ impl FirthDenseOperator {
             - &(&m_qv * &self.w1.view().insert_axis(Axis(1)));
         let rv_tau = (&(&etav * &kernel.dotw2.view().insert_axis(Axis(1)))
             + &(&etav_tau * &self.w2.view().insert_axis(Axis(1))))
-            * &self.h_diag.view().insert_axis(Axis(1))
+            * self.h_diag.view().insert_axis(Axis(1))
             + &(&etav * &self.w2.view().insert_axis(Axis(1)))
                 * &kernel.dot_h_partial.view().insert_axis(Axis(1))
             - &(&m_qv * &kernel.dotw1.view().insert_axis(Axis(1))
@@ -1875,9 +1874,9 @@ impl FirthDenseOperator {
         let bddot_scale = &w3_didj + &w2_dij;
         let bddot_scale_col = bddot_scale.view().insert_axis(Axis(1));
         let mut bddot_ij_v = &eta_v * &bddot_scale_col;
-        bddot_ij_v = bddot_ij_v + &(&eta_j_v * &w2_deta_i_col);
-        bddot_ij_v = bddot_ij_v + &(&eta_i_v * &w2_deta_j_col);
-        bddot_ij_v = bddot_ij_v + &(&eta_ij_v * &w1_col);
+        bddot_ij_v += &(&eta_j_v * &w2_deta_i_col);
+        bddot_ij_v += &(&eta_i_v * &w2_deta_j_col);
+        bddot_ij_v += &(&eta_ij_v * &w1_col);
 
         // P V  (columnwise, using K ⊙ K Hadamard gram on Z = X_r).
         let p_bv = RemlState::apply_hadamard_gram_to_matrix(z, k, k, &b_v);
@@ -2178,10 +2177,10 @@ impl FirthDenseOperator {
         //  + (w2 ⊙ η̇_j) ⊙ ḣ_i
         //  +  w1 ⊙ ḧ_{ij}.
         let mut v_dot_ij = &(&(&self.w3 * &deta_j) * &deta_i) * &self.h_diag;
-        v_dot_ij = v_dot_ij + &(&(&self.w2 * deta_ij_ref) * &self.h_diag);
-        v_dot_ij = v_dot_ij + &(&(&self.w2 * &deta_i) * &dot_h_j);
-        v_dot_ij = v_dot_ij + &(&(&self.w2 * &deta_j) * &dot_h_i);
-        v_dot_ij = v_dot_ij + &(&self.w1 * &dh_ij);
+        v_dot_ij += &(&(&self.w2 * deta_ij_ref) * &self.h_diag);
+        v_dot_ij += &(&(&self.w2 * &deta_i) * &dot_h_j);
+        v_dot_ij += &(&(&self.w2 * &deta_j) * &dot_h_i);
+        v_dot_ij += &(&self.w1 * &dh_ij);
         gphi_tau_tau = gphi_tau_tau + 0.5 * self.x_dense.t().dot(&v_dot_ij);
 
         let tau_tau_kernel = if include_hphi_tau_tau_kernel {

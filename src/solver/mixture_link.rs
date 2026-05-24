@@ -1152,7 +1152,7 @@ fn royston_parmar_inverse_link_jet(eta: f64) -> InverseLinkJet {
     let z = eta.clamp(-SURVIVAL_ETA_CLAMP, SURVIVAL_ETA_CLAMP);
     let hazard = z.exp();
     let survival = (-hazard).exp();
-    if eta < -SURVIVAL_ETA_CLAMP || eta > SURVIVAL_ETA_CLAMP {
+    if !(-SURVIVAL_ETA_CLAMP..=SURVIVAL_ETA_CLAMP).contains(&eta) {
         return InverseLinkJet {
             mu: survival,
             d1: 0.0,

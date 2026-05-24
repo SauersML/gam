@@ -760,9 +760,9 @@ impl NutsPosterior {
                 *g -= penalty_scale * (l + m);
             });
 
-        let logp = ll + firth_logdet - penalty;
+        
 
-        logp
+        ll + firth_logdet - penalty
     }
 
     fn family_logp_and_grad_into(
@@ -3048,7 +3048,7 @@ impl HamiltonianTarget<Array1<f64>> for NutsPosterior {
             if residual.len() != self.data.n_samples {
                 *residual = Array1::<f64>::zeros(self.data.n_samples);
             }
-            self.compute_logp_and_grad_nd_into(position, &mut *residual, grad)
+            self.compute_logp_and_grad_nd_into(position, &mut residual, grad)
         })
     }
 }
@@ -3817,8 +3817,8 @@ pub fn run_nuts_sampling_flattened_family(
     inputs: FamilyNutsInputs<'_>,
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
-    if let FamilyNutsInputs::Glm(glm) = &inputs {
-        if glm.firth_bias_reduction && !family.supports_firth() {
+    if let FamilyNutsInputs::Glm(glm) = &inputs
+        && glm.firth_bias_reduction && !family.supports_firth() {
             return Err(HmcError::FirthUnsupported {
                 reason: format!(
                     "NUTS with Firth is only supported for {}; {} does not support it",
@@ -3828,7 +3828,6 @@ pub fn run_nuts_sampling_flattened_family(
             }
             .into());
         }
-    }
 
     match (family, inputs) {
         (LikelihoodFamily::GaussianIdentity, FamilyNutsInputs::Glm(glm)) => run_nuts_sampling(
@@ -4203,8 +4202,8 @@ impl LinkWigglePosterior {
                 break;
             }
         }
-        if needs_ext {
-            if let Ok(b_prime) = monotone_wiggle_basis_with_derivative_order(
+        if needs_ext
+            && let Ok(b_prime) = monotone_wiggle_basis_with_derivative_order(
                 z_c.view(),
                 &self.spline.knot_vector,
                 self.spline.degree,
@@ -4220,7 +4219,6 @@ impl LinkWigglePosterior {
                     }
                 }
             }
-        }
         (
             basis.clone(),
             u + &crate::faer_ndarray::fast_av(&basis, theta),

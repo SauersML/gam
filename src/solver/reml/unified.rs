@@ -1344,13 +1344,12 @@ impl BarrierConfig {
                     break;
                 }
             }
-            if is_simple {
-                if let Some(col) = single_col {
+            if is_simple
+                && let Some(col) = single_col {
                     indices.push(col);
                     lower_bounds.push(constraints.b[i]);
                     bound_signs.push(single_sign);
                 }
-            }
         }
         if indices.is_empty() {
             return None;
@@ -2556,8 +2555,8 @@ fn composite_trace_implicit_batched(
             if handled[j] {
                 continue;
             }
-            if let Some(impl_j) = operators[j].as_implicit() {
-                if Arc::ptr_eq(&impl_i.implicit_deriv, &impl_j.implicit_deriv)
+            if let Some(impl_j) = operators[j].as_implicit()
+                && Arc::ptr_eq(&impl_i.implicit_deriv, &impl_j.implicit_deriv)
                     && Arc::ptr_eq(&impl_i.x_design, &impl_j.x_design)
                     && Arc::ptr_eq(&impl_i.w_diag, &impl_j.w_diag)
                     && impl_i.p == impl_j.p
@@ -2565,7 +2564,6 @@ fn composite_trace_implicit_batched(
                     group.push(j);
                     handled[j] = true;
                 }
-            }
         }
         group_starts.push(group);
     }
@@ -4725,7 +4723,7 @@ pub(crate) fn exact_intersection_nullity(
         return 0;
     }
     // If any penalty is full rank, the intersection nullspace is {0}.
-    if nullspace_dims.iter().any(|&m| m == 0) {
+    if nullspace_dims.contains(&0) {
         return 0;
     }
 
@@ -5136,7 +5134,6 @@ impl PenaltySubspaceTrace {
         // necessary in the math review.
         let (evals, evecs) = m
             .eigh(faer::Side::Lower)
-            .map(|(w, v)| (w, v))
             .unwrap_or_else(|_| (Array1::<f64>::zeros(k_active), Array2::<f64>::eye(k_active)));
         let sigma_max = evals.iter().copied().fold(0.0_f64, f64::max).max(0.0);
         let tol = f64::EPSILON * (k_active as f64) * sigma_max.max(1.0);
@@ -7366,7 +7363,7 @@ pub fn reml_laml_evaluate(
                 Some(
                     rho_curvature_a_k_betas
                         .iter()
-                        .map(|a_k| apply(a_k))
+                        .map(&apply)
                         .collect::<Vec<_>>(),
                 )
             } else {
@@ -8822,21 +8819,17 @@ fn compute_drift_deriv_traces(
     };
     let mut trace = 0.0;
     // M_i[β_j] = D_β B_i[β_j]
-    if b_i_depends {
-        if let (Some(ei), Some(drift_fn)) = (ext_i, fixed_drift_deriv) {
-            if let Some(result) = drift_fn(ei, beta_j) {
+    if b_i_depends
+        && let (Some(ei), Some(drift_fn)) = (ext_i, fixed_drift_deriv)
+            && let Some(result) = drift_fn(ei, beta_j) {
                 trace += trace_via(result);
             }
-        }
-    }
     // M_j[β_i] = D_β B_j[β_i]
-    if b_j_depends {
-        if let (Some(ej), Some(drift_fn)) = (ext_j, fixed_drift_deriv) {
-            if let Some(result) = drift_fn(ej, beta_i) {
+    if b_j_depends
+        && let (Some(ej), Some(drift_fn)) = (ext_j, fixed_drift_deriv)
+            && let Some(result) = drift_fn(ej, beta_i) {
                 trace += trace_via(result);
             }
-        }
-    }
     trace
 }
 
@@ -8903,8 +8896,8 @@ fn compute_base_h2_traces(
     // kernel scalars) is traversed once instead of `pairs.len()` times. At
     // biobank scale this turns the 16+ per-call `trace_logdet_operator`
     // hot spots into a single batched evaluation.
-    if subspace.is_none() {
-        if let Some(ds) = hop.as_exact_dense_spectral() {
+    if subspace.is_none()
+        && let Some(ds) = hop.as_exact_dense_spectral() {
             let mut out = vec![0.0_f64; pairs.len()];
             let mut op_terms: Vec<(usize, f64, &dyn HyperOperator)> = Vec::new();
             for (idx, pair) in pairs.iter().enumerate() {
@@ -8927,7 +8920,6 @@ fn compute_base_h2_traces(
             }
             return out;
         }
-    }
     if subspace.is_none()
         && hop.prefers_stochastic_trace_estimation()
         && hop.logdet_traces_match_hinv_kernel()
@@ -9437,7 +9429,7 @@ fn compute_outer_hessian(
     // is large enough to warrant stochastic cross-traces instead of
     // materializing p x p Hessian drift matrices.
     let any_ext_implicit = solution.ext_coords.iter().any(|c| {
-        c.drift.operator_ref().map_or(false, |op| {
+        c.drift.operator_ref().is_some_and(|op| {
             c.drift.uses_operator_fast_path() && op.is_implicit()
         })
     });
@@ -11990,10 +11982,7 @@ pub fn compute_hybrid_efs_update(
         && rayon::current_thread_index().is_none()
     {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        tau_local_indices
-            .iter()
-            .copied()
-            .collect::<Vec<_>>()
+        tau_local_indices.to_vec()
             .into_par_iter()
             .map(|ext_idx| {
                 let coord = &solution.ext_coords[ext_idx];
@@ -14511,11 +14500,10 @@ impl HessianOperator for SparseCholeskyOperator {
     ) -> f64 {
         // Takahashi fast path: when both operators are block-local to the same
         // block, compute tr(Z A Z B) using only the block of Z = H⁻¹.
-        if let Some(ref taka) = self.takahashi {
-            if let (Some((a_local, a_start, a_end)), Some((b_local, b_start, b_end))) =
+        if let Some(ref taka) = self.takahashi
+            && let (Some((a_local, a_start, a_end)), Some((b_local, b_start, b_end))) =
                 (left.block_local_data(), right.block_local_data())
-            {
-                if a_start == b_start && a_end == b_end {
+                && a_start == b_start && a_end == b_end {
                     // Same block: tr(Z_block * A_local * Z_block * B_local)
                     let za = Self::takahashi_left_multiply_block(taka, a_local, a_start);
                     if std::ptr::addr_eq(left, right) {
@@ -14527,8 +14515,6 @@ impl HessianOperator for SparseCholeskyOperator {
                 }
                 // Different blocks: column solves are better than materializing
                 // full p×p Z. Fall through to exact path.
-            }
-        }
         self.trace_hinv_operator_cross_exact(left, right)
     }
 
@@ -15627,11 +15613,10 @@ impl StochasticTraceEstimator {
 
             let n_done = m + 1;
             n_drawn = n_done;
-            if n_done >= effective_n_probes_min && n_done % check_interval == 0 {
-                if self.check_convergence(n_done, &means, &m2s) {
+            if n_done >= effective_n_probes_min && n_done % check_interval == 0
+                && self.check_convergence(n_done, &means, &m2s) {
                     break;
                 }
-            }
         }
 
         self.record_probe_batch(Self::max_probe_variance(&m2s, n_drawn), n_drawn);
@@ -16706,7 +16691,7 @@ where
 
         // Adaptive stopping: same Welford-style relative-error check
         // as `estimate_from_probe_batch`, applied to the residual mean.
-        if count >= residual_min && count % check_interval == 0 && count >= 2 {
+        if count >= residual_min && count.is_multiple_of(check_interval) && count >= 2 {
             let n = count as f64;
             let mean = sum / n;
             let var = (sum_sq - n * mean * mean) / (n - 1.0).max(1.0);
@@ -16817,7 +16802,7 @@ where
         sum_sq += q_val * q_val;
         count += 1;
 
-        if count >= residual_min && count % check_interval == 0 && count >= 2 {
+        if count >= residual_min && count.is_multiple_of(check_interval) && count >= 2 {
             let n = count as f64;
             let mean = sum / n;
             let var = (sum_sq - n * mean * mean) / (n - 1.0).max(1.0);
@@ -16934,7 +16919,7 @@ where
         sum_sq += q_val * q_val;
         count += 1;
 
-        if count >= residual_min && count % check_interval == 0 && count >= 2 {
+        if count >= residual_min && count.is_multiple_of(check_interval) && count >= 2 {
             let n = count as f64;
             let mean = sum / n;
             let var = (sum_sq - n * mean * mean) / (n - 1.0).max(1.0);

@@ -92,7 +92,7 @@ fn weighted_penalty_matrix(
             ));
         }
         let lam = lambdas[k];
-        out = out + &(s * lam);
+        out += &(s * lam);
     }
     Ok(out)
 }
@@ -732,8 +732,8 @@ fn sample_survival(
             .slice_mut(s![.., ..p_time])
             .assign(&tb_deriv_dense);
     }
-    if let Some((entry_w, exit_w, deriv_w)) = saved_timewiggle.as_ref() {
-        if p_timewiggle > 0 {
+    if let Some((entry_w, exit_w, deriv_w)) = saved_timewiggle.as_ref()
+        && p_timewiggle > 0 {
             x_entry
                 .slice_mut(s![.., p_time..(p_time + p_timewiggle)])
                 .assign(entry_w);
@@ -744,7 +744,6 @@ fn sample_survival(
                 .slice_mut(s![.., p_time..(p_time + p_timewiggle)])
                 .assign(deriv_w);
         }
-    }
     if p_cov > 0 {
         let cov_dense = cov_design.design.to_dense();
         let cov_range = (p_time + p_timewiggle)..(p_time + p_timewiggle + p_cov);

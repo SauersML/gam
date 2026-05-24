@@ -58,7 +58,7 @@ pub struct BitVec {
 impl BitVec {
     /// All-zero bitset of length `len`.
     pub fn zeros(len: usize) -> Self {
-        let words = vec![0u64; (len + 63) / 64];
+        let words = vec![0u64; len.div_ceil(64)];
         Self { words, len }
     }
 

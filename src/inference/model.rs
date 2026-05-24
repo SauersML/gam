@@ -182,15 +182,12 @@ pub const TRANSFORMATION_SCORE_PIT_CLIP_EPS: f64 = 1.0e-12;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum TransformationScoreKind {
+    #[default]
     FiniteSupportPit,
 }
 
-impl Default for TransformationScoreKind {
-    fn default() -> Self {
-        Self::FiniteSupportPit
-    }
-}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct TransformationScoreCalibration {
@@ -2145,11 +2142,10 @@ impl FittedModel {
                 // Sphere terms: longitude (second feature col) is always
                 // periodic. Latitude is bounded and stays clamped.
                 SmoothBasisSpec::Sphere { feature_cols, .. } => {
-                    if let Some(&lon_col) = feature_cols.get(1) {
-                        if lon_col < training_headers.len() {
+                    if let Some(&lon_col) = feature_cols.get(1)
+                        && lon_col < training_headers.len() {
                             out.insert(lon_col);
                         }
-                    }
                 }
                 // 1D periodic B-spline: the single feature column is periodic.
                 SmoothBasisSpec::BSpline1D { feature_col, spec } => {
@@ -2163,13 +2159,11 @@ impl FittedModel {
                 // PeriodicUniform is periodic; mark those columns.
                 SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
                     for (i, marginal) in spec.marginalspecs.iter().enumerate() {
-                        if matches!(marginal.knotspec, BSplineKnotSpec::PeriodicUniform { .. }) {
-                            if let Some(&col) = feature_cols.get(i) {
-                                if col < training_headers.len() {
+                        if matches!(marginal.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
+                            && let Some(&col) = feature_cols.get(i)
+                                && col < training_headers.len() {
                                     out.insert(col);
                                 }
-                            }
-                        }
                     }
                 }
                 _ => {}

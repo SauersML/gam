@@ -2910,7 +2910,7 @@ where
             ))
             .with_tolerance(reml_tol)
             .with_max_iter(reml_max_iter)
-            .with_seed_config(reml_seed_config.clone())
+            .with_seed_config(reml_seed_config)
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
             .with_outer_inner_cap(InnerProgressFeedback {
                 cap: Arc::clone(&reml_state.outer_inner_cap),
@@ -2928,7 +2928,7 @@ where
             .with_arc_initial_regularization(if gaussian_identity { Some(0.25) } else { None })
             .with_operator_initial_trust_radius(if gaussian_identity { Some(4.0) } else { None })
             .with_rho_bound(crate::estimate::RHO_BOUND);
-        let problem = if let Some(ref h) = heuristic_lambdas {
+        let problem = if let Some(h) = heuristic_lambdas {
             problem.with_heuristic_lambdas(h.to_vec())
         } else {
             problem
@@ -3079,8 +3079,8 @@ where
             })
             .ok_or_else(|| EstimationError::InvalidInput("missing mixture spec".to_string()))?;
         let mut heuristic_theta = Vec::new();
-        if let Some(hvals) = heuristic_lambdas {
-            if hvals.len() == k {
+        if let Some(hvals) = heuristic_lambdas
+            && hvals.len() == k {
                 heuristic_theta.extend_from_slice(hvals);
                 if use_mixture {
                     heuristic_theta
@@ -3091,14 +3091,13 @@ where
                     heuristic_theta.push(spec.initial_log_delta);
                 }
             }
-        }
         let heuristic_theta_ref = if heuristic_theta.len() == theta_dim {
             Some(heuristic_theta.as_slice())
         } else {
             None
         };
         let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
-        let mut reml_seed_config_mix = reml_seed_config.clone();
+        let mut reml_seed_config_mix = reml_seed_config;
         reml_seed_config_mix.num_auxiliary_trailing = aux_dim_outer;
         use crate::solver::outer_strategy::{
             DeclaredHessianForm, Derivative, HessianResult, InnerProgressFeedback, OuterEval,
@@ -3114,7 +3113,7 @@ where
             ))
             .with_tolerance(reml_tol)
             .with_max_iter(reml_max_iter)
-            .with_seed_config(reml_seed_config_mix.clone())
+            .with_seed_config(reml_seed_config_mix)
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
             .with_outer_inner_cap(InnerProgressFeedback {
                 cap: Arc::clone(&reml_state.outer_inner_cap),
@@ -3302,11 +3301,10 @@ where
                         if efs_eval.steps.len() > k {
                             efs_eval.steps[k] *= d_eps_d_raw;
                         }
-                        if let Some(ref mut pg) = efs_eval.psi_gradient {
-                            if !pg.is_empty() {
+                        if let Some(ref mut pg) = efs_eval.psi_gradient
+                            && !pg.is_empty() {
                                 pg[0] *= d_eps_d_raw;
                             }
-                        }
                     }
 
                     // SAS log-δ ridge + edge barrier: their gradients enter
@@ -4727,8 +4725,8 @@ impl UnifiedFitResult {
         validate_fitted_link_estimation(&fitted_link)?;
 
         let p = beta.len();
-        if let Some(cov) = covariance_conditional.as_ref() {
-            if cov.nrows() != p || cov.ncols() != p {
+        if let Some(cov) = covariance_conditional.as_ref()
+            && (cov.nrows() != p || cov.ncols() != p) {
                 return Err(EstimationError::InvalidInput(format!(
                     "UnifiedFitResult conditional covariance shape mismatch: got {}x{}, expected {}x{}",
                     cov.nrows(),
@@ -4737,9 +4735,8 @@ impl UnifiedFitResult {
                     p
                 )));
             }
-        }
-        if let Some(cov) = covariance_corrected.as_ref() {
-            if cov.nrows() != p || cov.ncols() != p {
+        if let Some(cov) = covariance_corrected.as_ref()
+            && (cov.nrows() != p || cov.ncols() != p) {
                 return Err(EstimationError::InvalidInput(format!(
                     "UnifiedFitResult corrected covariance shape mismatch: got {}x{}, expected {}x{}",
                     cov.nrows(),
@@ -4748,7 +4745,6 @@ impl UnifiedFitResult {
                     p
                 )));
             }
-        }
         if let Some(inf) = inference.as_ref() {
             if !inf.edf_by_block.is_empty() && inf.edf_by_block.len() != lambdas.len() {
                 return Err(EstimationError::InvalidInput(format!(
@@ -5331,7 +5327,7 @@ impl UnifiedFitResult {
             },
             crate::types::LikelihoodFamily::BinomialSas => match &self.fitted_link {
                 FittedLinkState::Sas { state, covariance } => Ok(FittedLinkState::Sas {
-                    state: state.clone(),
+                    state: *state,
                     covariance: covariance.clone(),
                 }),
                 _ => Err(EstimationError::InvalidInput(
@@ -5341,7 +5337,7 @@ impl UnifiedFitResult {
             crate::types::LikelihoodFamily::BinomialBetaLogistic => match &self.fitted_link {
                 FittedLinkState::BetaLogistic { state, covariance } => {
                     Ok(FittedLinkState::BetaLogistic {
-                        state: state.clone(),
+                        state: *state,
                         covariance: covariance.clone(),
                     })
                 }

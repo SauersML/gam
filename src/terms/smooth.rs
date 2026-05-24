@@ -2367,11 +2367,10 @@ impl SpatialLogKappaCoords {
             let d = self.dims_per_term[slot];
             let (next_length_scale, next_aniso) =
                 spatial_term_psi_to_length_scale_and_aniso(spec, term_idx, psi);
-            if d == 1 || next_length_scale.is_some() {
-                if let Some(length_scale) = next_length_scale {
+            if (d == 1 || next_length_scale.is_some())
+                && let Some(length_scale) = next_length_scale {
                     set_spatial_length_scale(&mut updated, term_idx, length_scale)?;
                 }
-            }
             if let Some(eta) = next_aniso {
                 set_spatial_aniso_log_scales(&mut updated, term_idx, eta)?;
             }
@@ -2684,11 +2683,10 @@ pub(crate) fn sync_aniso_contrasts_from_metadata(
             } => aniso_log_scales.clone(),
             _ => None,
         };
-        if let Some(eta) = meta_aniso {
-            if eta.len() > 1 {
+        if let Some(eta) = meta_aniso
+            && eta.len() > 1 {
                 set_spatial_aniso_log_scales(spec, term_idx, eta).ok();
             }
-        }
     }
 }
 
@@ -4168,7 +4166,7 @@ fn build_periodic_fourier_margin(
     }
     let q = requested_cols.max(3);
     let harmonics = q / 2;
-    let has_nyquist_cos = q % 2 == 0;
+    let has_nyquist_cos = q.is_multiple_of(2);
     let mut basis = Array2::<f64>::zeros((x.len(), q));
     basis.column_mut(0).fill(1.0);
     for (i, &xi) in x.iter().enumerate() {
@@ -5841,15 +5839,12 @@ fn build_single_local_smooth_term(
         }
     };
 
-    match &term.basis {
-        SmoothBasisSpec::Matern { .. } => {
-            let (penalties, nullspace_dims, penaltyinfo) =
-                matern_operator_penalty_triplet_from_metadata(&built.metadata)?;
-            built.penalties = penalties;
-            built.nullspace_dims = nullspace_dims;
-            built.penaltyinfo = penaltyinfo;
-        }
-        _ => {}
+    if let SmoothBasisSpec::Matern { .. } = &term.basis {
+        let (penalties, nullspace_dims, penaltyinfo) =
+            matern_operator_penalty_triplet_from_metadata(&built.metadata)?;
+        built.penalties = penalties;
+        built.nullspace_dims = nullspace_dims;
+        built.penaltyinfo = penaltyinfo;
     }
 
     let p_local = built.design.ncols();
@@ -8376,7 +8371,7 @@ fn collocationgradient_blocks(
     gradrows: &Array1<f64>,
     dimension: usize,
 ) -> Result<Array2<f64>, EstimationError> {
-    if dimension == 0 || gradrows.len() % dimension != 0 {
+    if dimension == 0 || !gradrows.len().is_multiple_of(dimension) {
         return Err(EstimationError::InvalidInput(format!(
             "invalid collocation gradient layout: rows={}, dimension={dimension}",
             gradrows.len()
@@ -8399,7 +8394,7 @@ fn collocationhessian_blocks(
     let block_dim = dimension.checked_mul(dimension).ok_or_else(|| {
         EstimationError::InvalidInput("invalid collocation Hessian dimension overflow".to_string())
     })?;
-    if block_dim == 0 || hessianrows.len() % block_dim != 0 {
+    if block_dim == 0 || !hessianrows.len().is_multiple_of(block_dim) {
         return Err(EstimationError::InvalidInput(format!(
             "invalid collocation Hessian layout: rows={}, dimension={dimension}",
             hessianrows.len()
@@ -10050,15 +10045,11 @@ fn evaluate_standard_familyobservations(
                     Some(InverseLink::LatentCLogLog(*state))
                 } else if let Some(state) = mixture_link_state {
                     Some(InverseLink::Mixture(state.clone()))
-                } else if let Some(state) = sas_link_state {
-                    Some(if family.is_binomial_beta_logistic() {
+                } else { sas_link_state.map(|state| if family.is_binomial_beta_logistic() {
                         InverseLink::BetaLogistic(*state)
                     } else {
                         InverseLink::Sas(*state)
-                    })
-                } else {
-                    None
-                };
+                    }) };
                 let jet =
                     strategy_for_family(family, inverse_link.as_ref()).inverse_link_jet(eta_i)?;
                 let mu_i_raw = jet.mu;
@@ -11987,7 +11978,7 @@ fn fit_bounded_term_collection_with_design(
             (!linear.double_penalty).then_some(design.intercept_range.end + j)
         })
         .collect();
-    let conditioning = LinearFitConditioning::from_columns(&design, &conditioning_cols);
+    let conditioning = LinearFitConditioning::from_columns(design, &conditioning_cols);
     let dense_design = design.design.to_dense_cow();
     let fit_design = conditioning.apply_to_design(&dense_design);
     let fit_penalties = conditioning
@@ -12357,7 +12348,7 @@ fn stratified_spatial_subsample(
             SmoothBasisSpec::ThinPlate { feature_cols, .. }
             | SmoothBasisSpec::Matern { feature_cols, .. }
             | SmoothBasisSpec::Duchon { feature_cols, .. } => {
-                if feature_cols.len() >= 1 {
+                if !feature_cols.is_empty() {
                     Some(feature_cols.clone())
                 } else {
                     None
@@ -12955,8 +12946,8 @@ pub(crate) fn try_build_spatial_log_kappa_derivativeinfo_list(
     for &term_idx in spatial_terms {
         let aniso = get_spatial_aniso_log_scales(resolvedspec, term_idx);
         let dim = get_spatial_feature_dim(resolvedspec, term_idx);
-        if let (Some(eta), Some(d)) = (&aniso, dim) {
-            if eta.len() == d && d > 1 {
+        if let (Some(eta), Some(d)) = (&aniso, dim)
+            && eta.len() == d && d > 1 {
                 if let Some(entries) = try_build_spatial_term_log_kappa_aniso_derivativeinfos(
                     data,
                     resolvedspec,
@@ -12971,7 +12962,6 @@ pub(crate) fn try_build_spatial_log_kappa_derivativeinfo_list(
                     return Ok(None);
                 }
             }
-        }
         let Some(info) =
             try_build_spatial_term_log_kappa_derivativeinfo(data, resolvedspec, design, term_idx)?
         else {
@@ -13577,7 +13567,7 @@ fn append_latent_ard_seed(
         }
         values.extend(init.iter().copied());
     } else {
-        values.extend(std::iter::repeat(0.0).take(latent_dim));
+        values.extend(std::iter::repeat_n(0.0, latent_dim));
     }
     Ok(())
 }
@@ -16800,7 +16790,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             return Ok(false);
         }
 
-        if let Some(length_scale) = next_length_scale.clone() {
+        if let Some(length_scale) = next_length_scale {
             set_spatial_length_scale(&mut self.spec, term_idx, length_scale)
                 .map_err(|e| e.to_string())?;
         }
@@ -17893,12 +17883,12 @@ where
             };
             let t0 = std::time::Instant::now();
             let row_set_borrow = current_row_set.borrow();
-            let result = (&mut *exact_fn_cell.borrow_mut())(
+            let result = (*exact_fn_cell.borrow_mut())(
                 theta,
                 &specs,
                 &designs,
                 eval_mode,
-                &*row_set_borrow,
+                &row_set_borrow,
             );
             drop(row_set_borrow);
             let elapsed_s = t0.elapsed().as_secs_f64();
@@ -17964,12 +17954,12 @@ where
                 // when the outer evaluator actually requests it.
                 let t0 = std::time::Instant::now();
                 let row_set_borrow = current_row_set.borrow();
-                let result = (&mut *exact_fn_cell.borrow_mut())(
+                let result = (*exact_fn_cell.borrow_mut())(
                     theta,
                     &specs,
                     &designs,
                     crate::solver::estimate::reml::unified::EvalMode::ValueOnly,
-                    &*row_set_borrow,
+                    &row_set_borrow,
                 );
                 drop(row_set_borrow);
                 let elapsed_s = t0.elapsed().as_secs_f64();
@@ -18026,7 +18016,7 @@ where
                     let specs = collect_specs(&ctx.cache);
                     let designs = collect_designs(&ctx.cache);
                     let t0 = std::time::Instant::now();
-                    let eval_result = (&mut *exact_efs_fn_cell.borrow_mut())(
+                    let eval_result = (*exact_efs_fn_cell.borrow_mut())(
                         theta,
                         &specs,
                         &designs,
@@ -18119,7 +18109,7 @@ where
                 &specs,
                 &designs,
                 crate::solver::estimate::reml::unified::EvalMode::ValueAndGradient,
-                &*row_set_borrow,
+                &row_set_borrow,
             ));
         }
     }

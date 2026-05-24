@@ -183,8 +183,8 @@ impl WarmStartStore {
         let cache_key = LookupCacheKey { fp: *key, mode };
         let now_nanos = nanos_now();
         if let Some(hit) = lookup_cache_get(&cache_key) {
-            if let Ok(md) = fs::metadata(&hit.meta_path) {
-                if md.modified().ok() == Some(hit.meta_mtime) {
+            if let Ok(md) = fs::metadata(&hit.meta_path)
+                && md.modified().ok() == Some(hit.meta_mtime) {
                     let expired = self.opts.ttl.as_nanos() > 0
                         && now_nanos.saturating_sub(hit.write_nanos) >= self.opts.ttl.as_nanos();
                     if !expired {
@@ -196,7 +196,6 @@ impl WarmStartStore {
                     drop(fs::remove_file(&bin));
                     return Ok(None);
                 }
-            }
             lookup_cache_invalidate(&cache_key);
         }
         let mut best: Option<(OnDiskMeta, PathBuf)> = None;
@@ -214,7 +213,7 @@ impl WarmStartStore {
             if path
                 .file_name()
                 .and_then(|s| s.to_str())
-                .map_or(false, |n| n.contains(".tmp."))
+                .is_some_and(|n| n.contains(".tmp."))
             {
                 continue;
             }
@@ -287,8 +286,8 @@ impl WarmStartStore {
         // short-circuit until the meta file's mtime changes. The full
         // nanosecond write timestamp is cached alongside so the fast path
         // can re-apply the TTL cutoff without re-reading the JSON.
-        if let Ok(md) = fs::metadata(&meta_path) {
-            if let Ok(mtime) = md.modified() {
+        if let Ok(md) = fs::metadata(&meta_path)
+            && let Ok(mtime) = md.modified() {
                 let write_nanos = (meta.written_unix_secs as u128) * 1_000_000_000u128
                     + meta.written_nanos as u128;
                 lookup_cache_insert(
@@ -301,7 +300,6 @@ impl WarmStartStore {
                     },
                 );
             }
-        }
         Ok(Some(entry))
     }
 
@@ -409,7 +407,7 @@ impl WarmStartStore {
         let new_total = prev_total + approx_added;
         let n = self.save_counter.fetch_add(1, Ordering::Relaxed);
         let over_budget = new_total > self.opts.size_budget_bytes;
-        if n == 0 || over_budget || n % EVICT_EVERY_N_SAVES == 0 {
+        if n == 0 || over_budget || n.is_multiple_of(EVICT_EVERY_N_SAVES) {
             drop(self.evict_overflow());
         }
         Ok(())
@@ -456,11 +454,10 @@ impl WarmStartStore {
                 // Sweep tmp files from other processes. Same-PID tmps may
                 // be in-flight writes from this very process; leave them.
                 if name.contains(".tmp.") {
-                    if let Some(pid) = parse_tmp_pid(&name) {
-                        if pid != std::process::id() {
+                    if let Some(pid) = parse_tmp_pid(&name)
+                        && pid != std::process::id() {
                             drop(fs::remove_file(&p));
                         }
-                    }
                     continue;
                 }
                 if p.extension().and_then(|s| s.to_str()) != Some("json") {

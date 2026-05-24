@@ -154,8 +154,10 @@ pub enum LatentIdMode {
 /// composes these blockwise; inside a product, `Euclidean` denotes one
 /// unconstrained scalar axis.
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub enum LatentManifold {
     /// Unconstrained `R^d` — the current default.
+    #[default]
     Euclidean,
     /// Scalar angular coordinate on `S^1`, represented in radians.
     Circle,
@@ -176,11 +178,6 @@ pub enum LatentManifold {
     },
 }
 
-impl Default for LatentManifold {
-    fn default() -> Self {
-        Self::Euclidean
-    }
-}
 
 impl LatentManifold {
     pub fn is_euclidean(&self) -> bool {
@@ -337,7 +334,7 @@ impl LatentManifold {
             Self::Euclidean | Self::Circle => v.to_owned(),
             Self::Sphere { dim } => {
                 debug_assert_eq!(t.len(), *dim);
-                let tv = dot_views(t.clone(), v.clone());
+                let tv = dot_views(t, v);
                 let mut out = v.to_owned();
                 for a in 0..*dim {
                     out[a] -= tv * t[a];
@@ -392,7 +389,7 @@ impl LatentManifold {
         debug_assert_eq!(t.len(), xi.len());
         debug_assert_eq!(eh.nrows(), t.len());
         debug_assert_eq!(eh.ncols(), t.len());
-        let eh_xi = matvec(eh, xi.clone());
+        let eh_xi = matvec(eh, xi);
         self.euclidean_hessian_action_to_riemannian(t, eg, xi, eh_xi.view())
     }
 
@@ -412,10 +409,10 @@ impl LatentManifold {
             }
             Self::Sphere { dim } => {
                 debug_assert_eq!(t.len(), *dim);
-                let grad_r = self.project_to_tangent(t.clone(), eg.clone());
-                let mut ambient = self.project_to_tangent(t.clone(), eh_xi);
-                let eg_normal = dot_views(eg, t.clone());
-                let normal_curve = dot_views(grad_r.view(), xi.clone());
+                let grad_r = self.project_to_tangent(t, eg);
+                let mut ambient = self.project_to_tangent(t, eh_xi);
+                let eg_normal = dot_views(eg, t);
+                let normal_curve = dot_views(grad_r.view(), xi);
                 for a in 0..*dim {
                     ambient[a] -= eg_normal * xi[a];
                     ambient[a] -= normal_curve * t[a];
@@ -464,11 +461,11 @@ impl LatentManifold {
         for a in 0..d {
             xi.fill(0.0);
             xi[a] = 1.0;
-            let tangent_xi = self.project_to_tangent(t.clone(), xi.view());
+            let tangent_xi = self.project_to_tangent(t, xi.view());
             let col = self.euclidean_to_riemannian_hessian(
-                t.clone(),
-                eg.clone(),
-                eh.clone(),
+                t,
+                eg,
+                eh,
                 tangent_xi.view(),
             );
             for b in 0..d {
@@ -488,7 +485,7 @@ impl LatentManifold {
     ) -> Array2<f64> {
         let mut out = Array2::<f64>::zeros(matrix.dim());
         for col_idx in 0..matrix.ncols() {
-            let col = self.project_to_tangent(t.clone(), matrix.column(col_idx));
+            let col = self.project_to_tangent(t, matrix.column(col_idx));
             for row_idx in 0..matrix.nrows() {
                 out[[row_idx, col_idx]] = col[row_idx];
             }
@@ -928,7 +925,7 @@ impl LatentCoordValues {
                 radial_kind,
             } => self.design_gradient_wrt_t(centers, radial_kind),
             InputLocationDerivative::Jet(jet) => {
-                if jet.shape() != &[self.n_obs, jet.shape()[1], self.latent_dim] {
+                if jet.shape() != [self.n_obs, jet.shape()[1], self.latent_dim] {
                     return Err(BasisError::DimensionMismatch(format!(
                         "LatentCoordValues::design_gradient_wrt_t_dispatch jet shape {:?} does not match latent shape ({}, {}, {})",
                         jet.shape(),
