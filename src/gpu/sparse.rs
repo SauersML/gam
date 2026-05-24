@@ -1,11 +1,25 @@
-//! CPU-safe placeholder module for the GPU backend.
-//!
-//! Concrete CUDA resources are introduced behind operation-level dispatch so
-//! CPU-only builds keep identical behavior and do not require CUDA libraries.
+use super::policy::{Operation, OperationDecision};
+use super::runtime::GpuRuntime;
 
-/// Describes whether a value is host-resident or intended for device residency.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Residency {
-    Host,
-    Device,
+#[derive(Clone, Debug)]
+pub struct DeviceCsrMatrix<T> {
+    pub row_offsets: Vec<i32>,
+    pub col_indices: Vec<i32>,
+    pub values: Vec<T>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl<T> DeviceCsrMatrix<T> {
+    #[must_use]
+    pub fn nnz(&self) -> usize {
+        self.values.len()
+    }
+}
+
+#[must_use]
+pub fn should_dispatch_sparse_xt_diag_x(nnz: usize, pattern_reuse: bool) -> bool {
+    GpuRuntime::global().selected_context().is_some_and(|ctx| {
+        ctx.target_for(Operation::SparseXtDiagX { nnz, pattern_reuse }) == OperationDecision::Gpu
+    })
 }

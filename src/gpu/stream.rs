@@ -1,11 +1,34 @@
-//! CPU-safe placeholder module for the GPU backend.
-//!
-//! Concrete CUDA resources are introduced behind operation-level dispatch so
-//! CPU-only builds keep identical behavior and do not require CUDA libraries.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GpuStream {
+    id: usize,
+}
 
-/// Describes whether a value is host-resident or intended for device residency.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Residency {
-    Host,
-    Device,
+impl GpuStream {
+    #[must_use]
+    pub const fn default() -> Self {
+        Self { id: 0 }
+    }
+
+    #[must_use]
+    pub const fn id(self) -> usize {
+        self.id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GpuEvent;
+
+#[derive(Clone, Debug, Default)]
+pub struct StreamPool;
+
+impl StreamPool {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+
+    #[must_use]
+    pub const fn next(&self) -> GpuStream {
+        GpuStream::default()
+    }
 }
