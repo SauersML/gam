@@ -4566,14 +4566,11 @@ fn xt_diag_y_dense(
 
 fn xt_diag_x_design(design: &DesignMatrix, diag: &Array1<f64>) -> Result<Array2<f64>, String> {
     if design.nrows() != diag.len() {
-        return Err(GamlssError::DimensionMismatch {
-            reason: format!(
-                "xt_diag_x_design row mismatch: design has {} rows but diag has {} entries",
-                design.nrows(),
-                diag.len()
-            ),
-        }
-        .into());
+        return Err(format!(
+            "xt_diag_x_design row mismatch: design has {} rows but diag has {} entries",
+            design.nrows(),
+            diag.len()
+        ));
     }
     design.compute_xtwx(diag)
 }
@@ -4584,24 +4581,18 @@ fn xt_diag_y_design(
     right: &DesignMatrix,
 ) -> Result<Array2<f64>, String> {
     if left.nrows() != diag.len() {
-        return Err(GamlssError::DimensionMismatch {
-            reason: format!(
-                "xt_diag_y_design row mismatch: left has {} rows but diag has {} entries",
-                left.nrows(),
-                diag.len()
-            ),
-        }
-        .into());
+        return Err(format!(
+            "xt_diag_y_design row mismatch: left has {} rows but diag has {} entries",
+            left.nrows(),
+            diag.len()
+        ));
     }
     if right.nrows() != diag.len() {
-        return Err(GamlssError::DimensionMismatch {
-            reason: format!(
-                "xt_diag_y_design row mismatch: right has {} rows but diag has {} entries",
-                right.nrows(),
-                diag.len()
-            ),
-        }
-        .into());
+        return Err(format!(
+            "xt_diag_y_design row mismatch: right has {} rows but diag has {} entries",
+            right.nrows(),
+            diag.len()
+        ));
     }
     if let (Some(left_dense), Some(right_dense)) = (left.as_dense_ref(), right.as_dense_ref()) {
         return xt_diag_y_dense(left_dense, diag, right_dense);
@@ -14398,7 +14389,7 @@ impl<F: BinomialLocationScaleJointPsiFamily> BinomialLocationScaleJointPsiWorksp
                 psi_index,
                 self.x_t.as_ref(),
                 self.x_ls.as_ref(),
-                self.family.ws_policy(),
+                &self.family.policy,
             )
         })
     }
@@ -14419,14 +14410,17 @@ where
         let Some(dir_j) = self.psi_direction(psi_j)? else {
             return Ok(None);
         };
-        Ok(Some(self.family.ws_psi_second_order_terms_from_parts(
-            &self.block_states,
-            &self.derivative_blocks,
-            dir_i.as_ref(),
-            dir_j.as_ref(),
-            self.x_t.as_ref(),
-            self.x_ls.as_ref(),
-        )?))
+        Ok(Some(
+            self.family
+                .exact_newton_joint_psisecond_order_terms_from_parts(
+                    &self.block_states,
+                    &self.derivative_blocks,
+                    dir_i.as_ref(),
+                    dir_j.as_ref(),
+                    self.x_t.as_ref(),
+                    self.x_ls.as_ref(),
+                )?,
+        ))
     }
 
     fn hessian_directional_derivative(
@@ -14439,13 +14433,132 @@ where
         };
         Ok(Some(
             crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
-                self.family.ws_psi_hessian_directional_from_parts(
+                self.family
+                    .exact_newton_joint_psihessian_directional_derivative_from_parts(
+                        &self.block_states,
+                        dir.as_ref(),
+                        d_beta_flat,
+                        self.x_t.as_ref(),
+                        self.x_ls.as_ref(),
+                    )?,
+            ),
+        ))
+    }
+}
+
+struct BinomialLocationScaleWiggleJointPsiDirection {
+    block_idx: usize,
+    local_idx: usize,
+    x_t_psi: PsiDesignMap,
+    x_ls_psi: PsiDesignMap,
+    z_t_psi: Array1<f64>,
+    z_ls_psi: Array1<f64>,
+}
+
+struct BinomialLocationScaleWiggleJointPsiSecondDrifts {
+    x_t_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
+    x_ls_ab_action: Option<CustomFamilyPsiSecondDesignAction>,
+    x_t_ab: Option<Array2<f64>>,
+    x_ls_ab: Option<Array2<f64>>,
+    z_t_ab: Array1<f64>,
+    z_ls_ab: Array1<f64>,
+}
+
+struct BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
+    family: BinomialLocationScaleWiggleFamily,
+    block_states: Vec<ParameterBlockState>,
+    derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+    x_t: Arc<Array2<f64>>,
+    x_ls: Arc<Array2<f64>>,
+    psi_directions: ExactNewtonJointPsiDirectCache<BinomialLocationScaleWiggleJointPsiDirection>,
+}
+
+impl BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
+    fn new(
+        family: BinomialLocationScaleWiggleFamily,
+        block_states: Vec<ParameterBlockState>,
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
+    ) -> Result<Self, String> {
+        let Some((x_t, x_ls)) = family.exact_joint_dense_block_designs(Some(specs))? else {
+            return Err(
+                "BinomialLocationScaleWiggleFamily exact joint psi workspace requires dense block designs"
+                    .to_string(),
+            );
+        };
+        let x_t = shared_dense_arc(x_t.as_ref());
+        let x_ls = shared_dense_arc(x_ls.as_ref());
+        let psi_dim = derivative_blocks.iter().map(Vec::len).sum();
+        Ok(Self {
+            family,
+            block_states,
+            derivative_blocks,
+            x_t,
+            x_ls,
+            psi_directions: ExactNewtonJointPsiDirectCache::new(psi_dim),
+        })
+    }
+
+    fn psi_direction(
+        &self,
+        psi_index: usize,
+    ) -> Result<Option<Arc<BinomialLocationScaleWiggleJointPsiDirection>>, String> {
+        self.psi_directions.get_or_try_init(psi_index, || {
+            self.family.exact_newton_joint_psi_direction(
+                &self.block_states,
+                &self.derivative_blocks,
+                psi_index,
+                self.x_t.as_ref(),
+                self.x_ls.as_ref(),
+                &self.family.policy,
+            )
+        })
+    }
+}
+
+impl ExactNewtonJointPsiWorkspace for BinomialLocationScaleWiggleExactNewtonJointPsiWorkspace {
+    fn second_order_terms(
+        &self,
+        psi_i: usize,
+        psi_j: usize,
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
+        let Some(dir_i) = self.psi_direction(psi_i)? else {
+            return Ok(None);
+        };
+        let Some(dir_j) = self.psi_direction(psi_j)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.family
+                .exact_newton_joint_psisecond_order_terms_from_parts(
                     &self.block_states,
-                    dir.as_ref(),
-                    d_beta_flat,
+                    &self.derivative_blocks,
+                    dir_i.as_ref(),
+                    dir_j.as_ref(),
                     self.x_t.as_ref(),
                     self.x_ls.as_ref(),
                 )?,
+        ))
+    }
+
+    fn hessian_directional_derivative(
+        &self,
+        psi_index: usize,
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
+        let Some(dir) = self.psi_direction(psi_index)? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
+                self.family
+                    .exact_newton_joint_psihessian_directional_derivative_from_parts(
+                        &self.block_states,
+                        dir.as_ref(),
+                        d_beta_flat,
+                        self.x_t.as_ref(),
+                        self.x_ls.as_ref(),
+                    )?,
             ),
         ))
     }
@@ -17673,35 +17786,6 @@ impl BinomialLocationScaleHessianWorkspace {
             tl: Arc::new(tl),
             ll: Arc::new(ll),
         }))
-    }
-
-    /// Apply a Horvitz–Thompson outer-row subsample mask to the precomputed
-    /// per-row coefficient arrays in place.
-    ///
-    /// Each sampled row's `coeff_*[i]` is multiplied by its
-    /// `WeightedOuterRow.weight` (the HT inverse-inclusion factor 1/π_i —
-    /// uniform or stratified sampling both supported). All non-sampled rows
-    /// are zeroed. Because every downstream assembly (`hessian_dense`,
-    /// `hessian_matvec`, `hessian_diagonal`) is row-linear in these arrays
-    /// via `Xᵀ diag(W) X`, the resulting joint-Hessian is an unbiased
-    /// estimator of the full-data joint Hessian.
-    fn apply_outer_subsample(
-        &mut self,
-        rows: &[crate::families::marginal_slope_shared::WeightedOuterRow],
-    ) {
-        let n = self.coeff_tt.len();
-        let mut mask_tt = Array1::<f64>::zeros(n);
-        let mut mask_tl = Array1::<f64>::zeros(n);
-        let mut mask_ll = Array1::<f64>::zeros(n);
-        for r in rows {
-            let i = r.index;
-            mask_tt[i] = self.coeff_tt[i] * r.weight;
-            mask_tl[i] = self.coeff_tl[i] * r.weight;
-            mask_ll[i] = self.coeff_ll[i] * r.weight;
-        }
-        self.coeff_tt = mask_tt;
-        self.coeff_tl = mask_tl;
-        self.coeff_ll = mask_ll;
     }
 }
 

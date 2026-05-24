@@ -1,52 +1,23 @@
 name: Publish to PyPI
 
 # Build wheels per (os, arch) as artifacts, then upload them in one final
-# job using twine.
+# job using twine. Why split build from upload?
 #
-# Why split build from upload?  `maturin-action@v1`'s `command: publish`
-# injects `--release`, which newer maturin rejects (it's always release).
-# `command: build` works, and we upload via twine — same pattern as the
-# sdist path.
+# `maturin-action@v1`'s `command: publish` injects `--release` into the
+# maturin invocation, but newer maturin's `publish` subcommand rejects it
+# (it's always release). Every wheel job was failing at that line, but
+# `continue-on-error: true` swallowed the error so only the sdist made it
+# to PyPI — leaving downstream consumers (`uv sync` / `pip install`) to
+# fall back to the source build path. That's the "Building gamfit==0.1.17"
+# 5× in parallel symptom.
 #
-# Speed strategy (rebuild from scratch on a cold cache used to take
-# ~12 min per wheel; warm cache target is ~2 min):
+# `command: build` does NOT trigger the `--release` injection, so the
+# wheels actually get built. We then upload them all via `twine upload`
+# in the `release` job — same pattern the existing sdist path uses, and
+# the standard PyO3 wheel-distribution recipe.
 #
-#   * **Trigger on push-to-main, not just on tag.**  Found by reading
-#     the v0.3.21 logs: every wheel job reported `No cache found.` and
-#     spent 14–22 min in a cold compile.  GitHub Actions caches are
-#     branch-scoped — tags can read caches saved under `main`, but
-#     this workflow only ever ran on tag pushes, so `main` itself was
-#     never warmed.  Adding a `push: main` trigger lets every merge to
-#     main warm the per-(os, arch) caches, and tag pushes then build
-#     from the warm cache (~2 min warm vs ~22 min cold on macos-15-
-#     intel, the worst case).  The `release` job is now gated on
-#     `if: startsWith(github.ref, 'refs/tags/v')` so main builds don't
-#     publish to PyPI.
-#
-#   * **Native ARM Linux runners** (`ubuntu-24.04-arm`) for the
-#     aarch64 jobs.  Aarch64 jobs were ~9 min on a QEMU-emulated host;
-#     native ARM brings them down to ~6 min.  Smaller win than the
-#     cache fix but free and removes QEMU as a future surprise.
-#
-#   * `Swatinem/rust-cache@v2` on every job — caches `~/.cargo`,
-#     `target/`, and registry between runs. On a warm cache the action
-#     only recompiles `gam` + `gam-pyffi`, not the 200+ transitive deps.
-#
-#   * `sccache: 'true'` inside `maturin-action` — turns on the action's
-#     built-in sccache wrapper for the cargo invocations it runs in its
-#     Docker images (Linux + musllinux). The host-side rust-cache covers
-#     the non-Docker macOS/Windows builds; sccache covers Docker.
-#
-#   * `--profile release-pypi` — a dedicated profile with
-#     `lto = "thin"` retained (production-bound users keep the runtime
-#     win) but `codegen-units = 16` (vs the default `release`'s
-#     `codegen-units = 1`).  The codegen-units change cuts wheel build
-#     time roughly in half with sub-2% runtime impact at biobank shape;
-#     the LTO is the more important production lever.
-#
-#   * Removed `continue-on-error` everywhere — a silent wheel failure
-#     leaves a slot missing and PyPI consumers fall back to the slow
-#     sdist source build.
+# `continue-on-error: true` is removed everywhere: real failures need to
+# fail loudly so the wheel slot doesn't silently disappear.
 
 on:
   push:
@@ -128,29 +99,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: pypi-${{ matrix.platform.target }}-linux
-          workspaces: |
-            .
-            crates/gam-pyffi
-          # Only main warms the per-runner cache; tag / workflow_dispatch
-          # runs read it but skip the ~30s upload step.  The shared-key is
-          # unchanged, so this does not invalidate anything that was saved.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
       - name: Build Linux wheels
         uses: PyO3/maturin-action@v1
         with:
           command: build
           target: ${{ matrix.platform.target }}
           args: >-
-            --profile=release-pypi
+            --release
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
           manylinux: auto
-          sccache: 'true'
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.platform.target }}
@@ -172,26 +131,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: pypi-${{ matrix.target }}-musllinux
-          workspaces: |
-            .
-            crates/gam-pyffi
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
       - name: Build musllinux wheels
         uses: PyO3/maturin-action@v1
         with:
           command: build
           target: ${{ matrix.target }}
           args: >-
-            --profile=release-pypi
+            --release
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
           manylinux: musllinux_1_2
-          sccache: 'true'
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-musllinux-${{ matrix.target }}
@@ -215,41 +165,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      # Install rustup proper before maturin-action runs.
-      #
-      # macOS GitHub-hosted runners (both macos-14 ARM and macos-15-intel)
-      # ship `rustup-init` but not full `rustup` on PATH. maturin-action's
-      # toolchain selection invokes `rustup-init +1.93.0 ...` to honor
-      # the in-repo `rust-toolchain.toml`, but `rustup-init` rejects the
-      # `+TOOLCHAIN` syntax — only the management tool `rustup` accepts
-      # it. The build dies with "error: unexpected argument '+1.93.0'
-      # found" before maturin gets a chance to run.
-      #
-      # Linux + Windows runners aren't affected: linux jobs run inside a
-      # manylinux/musllinux Docker image with a pre-installed rustc, and
-      # the windows runner image bundles full rustup. Only the macos
-      # path needs an explicit install.
-      - name: Install Rust toolchain (macos rustup-init workaround)
-        uses: dtolnay/rust-toolchain@1.93.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: pypi-${{ matrix.platform.target }}-macos
-          workspaces: |
-            .
-            crates/gam-pyffi
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
       - name: Build macOS wheels
         uses: PyO3/maturin-action@v1
         with:
           command: build
           target: ${{ matrix.platform.target }}
           args: >-
-            --profile=release-pypi
+            --release
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
-          sccache: 'true'
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-macos-${{ matrix.platform.target }}
@@ -271,25 +196,16 @@ jobs:
         with:
           python-version: '3.x'
           architecture: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: pypi-${{ matrix.target }}-windows
-          workspaces: |
-            .
-            crates/gam-pyffi
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
       - name: Build Windows wheels
         uses: PyO3/maturin-action@v1
         with:
           command: build
           target: ${{ matrix.target }}
           args: >-
-            --profile=release-pypi
+            --release
             --strip
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
-          sccache: 'true'
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-windows-${{ matrix.target }}
@@ -316,60 +232,13 @@ jobs:
 
   release:
     name: Upload to PyPI
-    # Publish on:
-    #   * tag push (`refs/tags/v*`) — historical release path
-    #   * `workflow_dispatch` — on-demand republish
-    #   * push to `main` — every merged commit attempts a publish
-    #
-    # Why publish on every main push: main-branch runs already build the
-    # full wheel matrix (cache-warming was the original justification),
-    # so the marginal cost of also uploading is the ~1 min Upload step.
-    # `twine upload --skip-existing` makes this safe: if pyproject.toml's
-    # version is unchanged from what's on PyPI, twine no-ops silently;
-    # if the bump commit landed (the common case for "I want this fix
-    # released"), the upload publishes without anyone needing to dispatch
-    # the workflow manually.
-    #
-    # Failure mode this fixes: previously, after a `Bump versions` commit
-    # to main, the push-triggered run would build all wheels successfully
-    # but the Upload step was gated off — leaving gamfit stuck at the last
-    # tag-pushed / dispatched version on PyPI even though main carried a
-    # newer release. Required a manual `gh workflow run "Publish to PyPI"`
-    # after each bump. With push-to-main in the gate, the bump itself is
-    # the trigger.
-    #
-    # Tolerate `skipped` on macos / windows so the `linux_only=true`
-    # workflow_dispatch fast-release path still publishes Linux wheels.
-    # Tag pushes (the legacy release path) ignore that input and always
-    # run the full matrix.
-    #
-    # `always()` is REQUIRED. By default, when ANY `needs:` job is `skipped`
-    # (which is what happens for macos / windows under `linux_only=true`),
-    # GitHub Actions auto-skips the dependent job BEFORE evaluating the
-    # `if:` expression — so even though our explicit checks accept
-    # `result == 'skipped'`, the job never gets the chance to evaluate
-    # them. Prefixing with `always()` forces the condition to be
-    # evaluated despite skipped upstream needs. Without this, the
-    # `linux_only=true` dispatch builds successfully but the Upload to
-    # PyPI step silently skips — which is exactly what kept gamfit stuck
-    # at 0.1.43 on PyPI through v0.3.24..v0.3.34.
-    if: |
-      always() &&
-      (startsWith(github.ref, 'refs/tags/v') ||
-       github.event_name == 'workflow_dispatch' ||
-       (github.event_name == 'push' && github.ref == 'refs/heads/main')) &&
-      needs.linux.result == 'success' &&
-      needs.musllinux.result == 'success' &&
-      needs.sdist.result == 'success' &&
-      (needs.macos.result == 'success' || needs.macos.result == 'skipped') &&
-      (needs.windows.result == 'success' || needs.windows.result == 'skipped')
     needs:
       - linux
       - musllinux
       - macos
       - windows
       - sdist
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/setup-python@v5
         with:

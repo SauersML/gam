@@ -1806,32 +1806,19 @@ pub trait CustomFamily {
         self.exact_newton_joint_hessian_workspace(states, specs)
     }
 
-    /// Optional line-search evaluator that returns both the exact
-    /// log-likelihood and a reusable joint-Hessian workspace built during the
-    /// same row sweep.
+    /// Optional line-search evaluator that can return the exact workspace
+    /// corresponding to a full accepted-trial log-likelihood sweep.
+    ///
+    /// Implementations must preserve the same accept/reject semantics as
+    /// [`Self::log_likelihood_only_with_options`], including any certified
+    /// early-exit rejection. Returning a workspace is only valid when the full
+    /// log-likelihood was evaluated at the same coefficient state.
     fn joint_line_search_log_likelihood_workspace(
         &self,
-        _: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
-        _: &BlockwiseFitOptions,
-        _: &BlockwiseFitOptions,
+        _states: &[ParameterBlockState],
+        _specs: &[ParameterBlockSpec],
+        _options: &BlockwiseFitOptions,
     ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
-        Ok(None)
-    }
-
-    /// Optional exact line-search evaluator.
-    ///
-    /// This hook is for families where the likelihood can be scored exactly
-    /// without constructing the full reusable joint-Hessian workspace for
-    /// every rejected trial. Returning `Some((ll, workspace))` lets the caller
-    /// keep any exact row state worth reusing if the trial is accepted.
-    fn joint_line_search_log_likelihood_evaluation(
-        &self,
-        _: &[ParameterBlockState],
-        _: &[ParameterBlockSpec],
-        _: &BlockwiseFitOptions,
-        _: &BlockwiseFitOptions,
-    ) -> Result<Option<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>)>, String> {
         Ok(None)
     }
 
@@ -2677,13 +2664,6 @@ impl Default for BlockwiseFitOptions {
     }
 }
 
-impl BlockwiseFitOptions {
-    pub fn with_outer_cap(mut self, outer_inner_max_iterations: Arc<AtomicUsize>) -> Self {
-        self.outer_inner_max_iterations = Some(outer_inner_max_iterations);
-        self
-    }
-}
-
 #[derive(Clone)]
 pub struct BlockwiseInnerResult {
     pub block_states: Vec<ParameterBlockState>,
@@ -2698,21 +2678,6 @@ pub struct BlockwiseInnerResult {
     /// Avoids redundant re-assembly in the outer objective evaluation.
     pub s_lambdas: Vec<Array2<f64>>,
     pub joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
-    /// Free-space-projected inner KKT residual; the projection invariant is
-    /// enforced by the [`ProjectedKktResidual`] newtype so this field can only
-    /// be populated by an active-set-aware constructor.
-    pub kkt_residual: Option<ProjectedKktResidual>,
-    /// Joint active linear-inequality constraint block at the converged
-    /// inner iterate. When `Some`, downstream consumers (unified REML
-    /// evaluator) build the constraint-aware kernel
-    /// `K_T = K_S − K_S Aᵀ (A K_S Aᵀ)⁻¹ A K_S` so the per-coordinate IFT
-    /// mode response `v_k = ∂β/∂ρ_k` lies in the smooth tangent
-    /// `T = range(S₊) ∩ ker(A_act)` — the manifold the inner is
-    /// genuinely moving on at a constrained-stationary point — and the
-    /// derivative agrees with the constrained Laplace cost
-    /// `log|U_Tᵀ H U_T|`.
-    pub active_constraints:
-        Option<Arc<crate::solver::estimate::reml::unified::ActiveLinearConstraintBlock>>,
 }
 
 impl std::fmt::Debug for BlockwiseInnerResult {
@@ -2730,10 +2695,6 @@ impl std::fmt::Debug for BlockwiseInnerResult {
             .field(
                 "joint_workspace",
                 &self.joint_workspace.as_ref().map(|_| "<workspace>"),
-            )
-            .field(
-                "kkt_residual",
-                &self.kkt_residual.as_ref().map(|r| r.as_array().len()),
             )
             .finish()
     }
@@ -2758,282 +2719,6 @@ struct CachedInnerMode {
     joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
 }
 
-fn hash_cf_array_view(hasher: &mut StableHasher, values: ndarray::ArrayView1<'_, f64>) {
-    hasher.write_usize(values.len());
-    for &value in values {
-        hasher.write_f64(value);
-    }
-}
-
-fn hash_cf_array2(hasher: &mut StableHasher, values: &Array2<f64>) {
-    hasher.write_usize(values.nrows());
-    hasher.write_usize(values.ncols());
-    for &value in values {
-        hasher.write_f64(value);
-    }
-}
-
-fn hash_cf_design_matrix(hasher: &mut StableHasher, design: &DesignMatrix) -> Result<(), String> {
-    let n = design.nrows();
-    let p = design.ncols();
-    hasher.write_usize(n);
-    hasher.write_usize(p);
-    let bytes_per_row = p.saturating_mul(std::mem::size_of::<f64>()).max(1);
-    let chunk_rows = ((8 * 1024 * 1024) / bytes_per_row).clamp(1, 4096);
-    for start in (0..n).step_by(chunk_rows) {
-        let end = (start + chunk_rows).min(n);
-        let chunk = design
-            .try_row_chunk(start..end)
-            .map_err(|e| format!("custom-family persistent warm-start design hash failed: {e}"))?;
-        hash_cf_array2(hasher, &chunk);
-    }
-    Ok(())
-}
-
-fn hash_cf_penalty(hasher: &mut StableHasher, penalty: &PenaltyMatrix) {
-    match penalty {
-        PenaltyMatrix::Dense(matrix) => {
-            hasher.write_str("dense");
-            hash_cf_array2(hasher, matrix);
-        }
-        PenaltyMatrix::KroneckerFactored { left, right } => {
-            hasher.write_str("kron");
-            hash_cf_array2(hasher, left);
-            hash_cf_array2(hasher, right);
-        }
-        PenaltyMatrix::Blockwise {
-            local,
-            col_range,
-            total_dim,
-        } => {
-            hasher.write_str("blockwise");
-            hasher.write_usize(col_range.start);
-            hasher.write_usize(col_range.end);
-            hasher.write_usize(*total_dim);
-            hash_cf_array2(hasher, local);
-        }
-        PenaltyMatrix::Labeled { label, inner } => {
-            hasher.write_str("labeled");
-            hasher.write_str(label);
-            hash_cf_penalty(hasher, inner);
-        }
-    }
-}
-
-fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-) -> Option<String> {
-    let mut hasher = StableHasher::new();
-    hasher.write_str("gamfit-persistent-block-warm-start");
-    // Use the cache schema tag (NOT CARGO_PKG_VERSION) so routine
-    // library version bumps don't invalidate users' on-disk warm-start
-    // caches. The schema tag bumps only on deliberate cache layout
-    // changes; same-schema lib versions share keys.
-    hasher.write_str(&crate::solver::persistent_warm_start::cache_schema_tag());
-    hasher.write_str(type_name::<F>());
-    hasher.write_str(&family.persistent_warm_start_fingerprint(specs, options)?);
-    hasher.write_usize(specs.len());
-    for spec in specs {
-        hasher.write_str(&spec.name);
-        hash_cf_design_matrix(&mut hasher, &spec.design).ok()?;
-        hash_cf_array_view(&mut hasher, spec.offset.view());
-        hasher.write_usize(spec.penalties.len());
-        for penalty in &spec.penalties {
-            hash_cf_penalty(&mut hasher, penalty);
-        }
-        hasher.write_usize(spec.nullspace_dims.len());
-        for &dim in &spec.nullspace_dims {
-            hasher.write_usize(dim);
-        }
-        hash_cf_array_view(&mut hasher, spec.initial_log_lambdas.view());
-        // Deliberately exclude `initial_beta`: it is an optimization hint, not
-        // model geometry. Survival marginal-slope pilots write data-dependent
-        // hints here; hashing them made the warm-start key depend on the thing
-        // the cache is supposed to replace, guaranteeing self-invalidating
-        // misses on every improved seed.
-    }
-    hasher.write_usize(options.inner_max_cycles);
-    hasher.write_f64(options.inner_tol);
-    hasher.write_usize(options.outer_max_iter);
-    hasher.write_f64(options.outer_tol);
-    hasher.write_f64(options.minweight);
-    hasher.write_f64(options.ridge_floor);
-    hasher.write_str(&format!("{:?}", options.ridge_policy));
-    hasher.write_bool(options.use_remlobjective);
-    hasher.write_bool(options.use_outer_hessian);
-    hasher.write_bool(options.compute_covariance);
-    hasher.write_bool(options.line_search_prefer_workspace);
-    hasher.write_bool(options.early_exit_threshold.is_some());
-    if let Some(value) = options.early_exit_threshold {
-        hasher.write_f64(value);
-    }
-    hasher.write_bool(options.outer_score_subsample.is_some());
-    hasher.write_bool(options.auto_outer_subsample);
-    Some(format!("cf-{}", hasher.finish_hex()))
-}
-
-fn custom_family_cache_shape(specs: &[ParameterBlockSpec]) -> (usize, Vec<String>, Vec<usize>) {
-    let n_rows = specs.first().map(|spec| spec.design.nrows()).unwrap_or(0);
-    let block_names = specs.iter().map(|spec| spec.name.clone()).collect();
-    let block_dims = specs.iter().map(|spec| spec.design.ncols()).collect();
-    (n_rows, block_names, block_dims)
-}
-
-fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    rho_len: usize,
-) -> (Option<String>, Option<ConstrainedWarmStart>) {
-    let Some(key) = persistent_custom_family_key::<F>(family, specs, options) else {
-        return (None, None);
-    };
-    let (n_rows, block_names, block_dims) = custom_family_cache_shape(specs);
-    let Some(record) = load_block_record(&key) else {
-        return (Some(key), None);
-    };
-    if !record.is_compatible(&key, n_rows, &block_names, &block_dims, rho_len) {
-        return (Some(key), None);
-    }
-    let active_sets = normalize_active_sets(record.active_sets);
-    let cached_inner = record.inner.map(|inner| CachedInnerMode {
-        log_likelihood: inner.log_likelihood,
-        penalty_value: inner.penalty_value,
-        cycles: inner.cycles,
-        converged: inner.converged,
-        block_logdet_h: inner.block_logdet_h,
-        block_logdet_s: inner.block_logdet_s,
-        joint_workspace: None,
-    });
-    let inner_status = cached_inner.as_ref().map_or("missing", |inner| {
-        if inner.converged {
-            "converged"
-        } else {
-            "partial"
-        }
-    });
-    log::info!(
-        "[warm-start-cache] restored custom-family persistent warm start key={key} inner={inner_status}"
-    );
-    (
-        Some(key),
-        Some(ConstrainedWarmStart {
-            rho: Array1::from_vec(record.rho),
-            block_beta: record
-                .block_beta
-                .into_iter()
-                .map(Array1::from_vec)
-                .collect(),
-            active_sets,
-            cached_inner,
-        }),
-    )
-}
-
-fn persistent_block_inner_summary(
-    warm_start: &ConstrainedWarmStart,
-) -> Option<PersistentBlockInnerSummary> {
-    warm_start.cached_inner.as_ref().and_then(|cached| {
-        (cached.log_likelihood.is_finite()
-            && cached.penalty_value.is_finite()
-            && cached.block_logdet_h.is_finite()
-            && cached.block_logdet_s.is_finite())
-        .then(|| PersistentBlockInnerSummary {
-            log_likelihood: cached.log_likelihood,
-            penalty_value: cached.penalty_value,
-            cycles: cached.cycles,
-            converged: cached.converged,
-            block_logdet_h: cached.block_logdet_h,
-            block_logdet_s: cached.block_logdet_s,
-        })
-    })
-}
-
-fn store_persistent_custom_family_warm_start(
-    key: Option<&str>,
-    specs: &[ParameterBlockSpec],
-    warm_start: &ConstrainedWarmStart,
-) {
-    let Some(key) = key else {
-        return;
-    };
-    let (n_rows, block_names, block_dims) = custom_family_cache_shape(specs);
-    if warm_start.block_beta.len() != block_dims.len()
-        || warm_start
-            .block_beta
-            .iter()
-            .zip(block_dims.iter())
-            .any(|(beta, dim)| beta.len() != *dim || beta.iter().any(|v| !v.is_finite()))
-        || warm_start.rho.iter().any(|v| !v.is_finite())
-    {
-        return;
-    }
-    // Saturation gate: don't persist iterates whose ρ has any coordinate
-    // at extreme smoothing magnitude. λ_i = exp(9) ≈ 8100 is already
-    // "essentially shrunk to nullspace" for any reasonable design, and
-    // ρ_i ≥ 9 typically indicates either (a) a legitimate but
-    // active-bound optimum where the outer optimizer is up against its
-    // box (`with_rho_bound(10.0)` at the custom-family bridge), or (b)
-    // a non-converged intermediate iterate that drifted toward the box
-    // — both of which make poor *seed* material for the next run. A
-    // seed at the box pins the outer gradient computation in a regime
-    // where (for families that don't yet route through the joint
-    // penalty-subspace-trace projection in `joint_outer_evaluate`) the
-    // analytic `tr(H⁻¹ Ḣ_k)` / `λ_k tr(S_λ⁺ S_k)` cancellation fails
-    // and `|g|` blows up by many orders of magnitude, trapping ARC's
-    // trust-region acceptor and surfacing as the deterministic-replay
-    // stall (observed in the biobank hypertension marginal-slope fit
-    // on the gamfit 0.1.92 release line).
-    //
-    // The load-side counterpart at the cache-hit injection point (see
-    // `outer_strategy.rs` `[CACHE] hit-clamp`) pulls any
-    // already-on-disk saturated ρ into the box interior before
-    // seeding. This write-side guard is the complement: if a fit
-    // genuinely needs ρ at the bound, the optimizer can re-walk back
-    // to it cheaply in one or two iterations from the previous
-    // non-saturated checkpoint — at no cost to convergence quality,
-    // and at the gain of never feeding the next run a trapping seed.
-    //
-    // Threshold rationale: the customary `rho_bound` for custom-family
-    // outer config is 10.0, and the load-side clamp uses a 1.0
-    // interior margin. Using 9.0 here keeps the persist/load
-    // thresholds aligned end-to-end.
-    const SATURATION_THRESHOLD: f64 = 9.0;
-    if warm_start
-        .rho
-        .iter()
-        .any(|&v| v.abs() >= SATURATION_THRESHOLD)
-    {
-        log::debug!(
-            "[warm-start-cache] skip persist custom-family key={} \
-             reason=rho-saturated threshold=±{:.1} rho_inf_norm={:.3e}",
-            key,
-            SATURATION_THRESHOLD,
-            warm_start
-                .rho
-                .iter()
-                .fold(0.0_f64, |acc, &v| acc.max(v.abs())),
-        );
-        return;
-    }
-    let mut record =
-        PersistentBlockWarmStartRecord::new(key.to_string(), n_rows, block_names, block_dims);
-    record.updated_unix_secs = record.created_unix_secs;
-    record.rho = warm_start.rho.to_vec();
-    record.block_beta = warm_start
-        .block_beta
-        .iter()
-        .map(|beta| beta.to_vec())
-        .collect();
-    record.active_sets = warm_start.active_sets.clone();
-    record.inner = persistent_block_inner_summary(warm_start);
-    if let Err(err) = store_block_record(&record) {
-        log::warn!("[warm-start-cache] failed to persist custom-family warm start: {err}");
-    }
-}
-
 fn screened_outer_warm_start<'a>(
     warm_start: Option<&'a ConstrainedWarmStart>,
     rho: &Array1<f64>,
@@ -3041,19 +2726,38 @@ fn screened_outer_warm_start<'a>(
     warm_start.filter(|seed| seed.rho.len() == rho.len())
 }
 
-fn warm_start_without_cached_inner_for_psi_derivatives(
-    warm_start: Option<&ConstrainedWarmStart>,
-    has_psi_derivatives: bool,
-) -> Option<ConstrainedWarmStart> {
-    if !has_psi_derivatives {
-        return None;
+fn warm_start_matches_block_log_lambdas(
+    seed: &ConstrainedWarmStart,
+    block_log_lambdas: &[Array1<f64>],
+) -> bool {
+    let expected = block_log_lambdas
+        .iter()
+        .map(|values| values.len())
+        .sum::<usize>();
+    if seed.rho.len() != expected {
+        return false;
     }
-    // WS1b-long-term: replace this conservative invalidation with a
-    // geometry_key/theta_key on the cached inner-mode record.
-    warm_start.cloned().map(|mut warm| {
-        warm.cached_inner = None;
-        warm
-    })
+    let mut offset = 0usize;
+    for block in block_log_lambdas {
+        let end = offset + block.len();
+        if seed.rho.slice(s![offset..end]) != block.view() {
+            return false;
+        }
+        offset = end;
+    }
+    true
+}
+
+fn cached_inner_mode_from_result(result: &BlockwiseInnerResult) -> CachedInnerMode {
+    CachedInnerMode {
+        log_likelihood: result.log_likelihood,
+        penalty_value: result.penalty_value,
+        cycles: result.cycles,
+        converged: result.converged,
+        block_logdet_h: result.block_logdet_h,
+        block_logdet_s: result.block_logdet_s,
+        joint_workspace: result.joint_workspace.clone(),
+    }
 }
 
 const CUSTOM_OUTER_INNER_CAP_MARGIN: usize = 5;
@@ -6170,115 +5874,6 @@ struct OuterObjectiveEvalResult {
     inner_converged: bool,
 }
 
-fn constrained_warm_start_from_inner(
-    rho: &Array1<f64>,
-    inner: &BlockwiseInnerResult,
-) -> ConstrainedWarmStart {
-    ConstrainedWarmStart {
-        rho: rho.clone(),
-        block_beta: inner
-            .block_states
-            .iter()
-            .map(|state| state.beta.clone())
-            .collect(),
-        active_sets: inner.active_sets.clone(),
-        cached_inner: Some(cached_inner_mode_from_result(inner)),
-    }
-}
-
-fn inner_penalized_objective(
-    inner: &BlockwiseInnerResult,
-    include_logdet_h: bool,
-    include_logdet_s: bool,
-    context: &str,
-) -> Result<f64, String> {
-    let reml_term = if include_logdet_h {
-        0.5 * inner.block_logdet_h
-    } else {
-        0.0
-    } - if include_logdet_s {
-        0.5 * inner.block_logdet_s
-    } else {
-        0.0
-    };
-    checked_penalizedobjective(
-        inner.log_likelihood,
-        inner.penalty_value,
-        reml_term,
-        context,
-    )
-}
-
-fn nonconverged_outer_efs_result(
-    inner: &BlockwiseInnerResult,
-    rho: &Array1<f64>,
-    theta_dim: usize,
-    include_logdet_h: bool,
-    include_logdet_s: bool,
-    context: &str,
-) -> Result<
-    (
-        crate::solver::outer_strategy::EfsEval,
-        ConstrainedWarmStart,
-        bool,
-    ),
-    String,
-> {
-    Ok((
-        crate::solver::outer_strategy::EfsEval {
-            cost: inner_penalized_objective(inner, include_logdet_h, include_logdet_s, context)?,
-            steps: vec![0.0; theta_dim],
-            beta: None,
-            psi_gradient: None,
-            psi_indices: None,
-            inner_hessian_scale: None,
-        },
-        constrained_warm_start_from_inner(rho, inner),
-        false,
-    ))
-}
-
-fn custom_family_seed_screening_proxy_labeled<F: CustomFamily + Clone + Send + Sync + 'static>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    layout: &PenaltyLabelLayout,
-    rho: &Array1<f64>,
-    warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: &crate::types::RhoPrior,
-) -> Result<(f64, ConstrainedWarmStart, bool), String> {
-    let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
-    let physical_warm_start = if layout.has_tied_coordinates() {
-        warm_start.map(|seed| {
-            let mut seed = seed.clone();
-            seed.rho = physical_rho.clone();
-            seed
-        })
-    } else {
-        warm_start.cloned()
-    };
-    let per_block = split_log_lambdas(&physical_rho, &layout.penalty_counts)?;
-    let inner = inner_blockwise_fit(
-        family,
-        specs,
-        &per_block,
-        options,
-        physical_warm_start.as_ref(),
-    )?;
-    let mut score = inner_penalized_objective(
-        &inner,
-        false,
-        false,
-        "custom-family seed-screening partial inner objective",
-    )?;
-    if !matches!(rho_prior, crate::types::RhoPrior::Flat) {
-        score += rho_prior_cost_gradient_hessian(rho_prior, rho)?.0;
-    }
-    let mut warm_start = constrained_warm_start_from_inner(&physical_rho, &inner);
-    warm_start.rho = rho.clone();
-    Ok((score, warm_start, inner.converged))
-}
-
 fn outer_eval_result_to_joint_hyper_result(
     result: OuterObjectiveEvalResult,
 ) -> CustomFamilyJointHyperResult {
@@ -8822,20 +8417,16 @@ fn exact_newton_joint_hessian_source_from_workspace(
         return Ok(None);
     };
     if zero_image.len() != total {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "{context}: operator matvec length mismatch: got {}, expected {}",
-                zero_image.len(),
-                total
-            ),
-        }
-        .into());
+        return Err(format!(
+            "{context}: operator matvec length mismatch: got {}, expected {}",
+            zero_image.len(),
+            total
+        ));
     }
     if zero_image.iter().any(|value| !value.is_finite()) {
-        return Err(CustomFamilyError::NumericalFailure {
-            reason: format!("{context}: operator matvec returned non-finite values"),
-        }
-        .into());
+        return Err(format!(
+            "{context}: operator matvec returned non-finite values"
+        ));
     }
 
     let workspace_apply = Arc::clone(workspace);
@@ -9946,12 +9537,15 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     } else {
         Derivative::Unavailable
     };
-    // Even with a capable family we route through `Unavailable` whenever
-    // the predicted Hessian work exceeds the universal budget. Quasi-Newton
-    // BFGS / L-BFGS still converges to the exact MLE on gradient-only —
-    // this is **not** a feature drop, see `OuterDerivativePolicy`'s doc.
-    let hessian = if options.use_outer_hessian && include_exact_newton_logdet_h(family, options) {
-        policy.declared_hessian_form()
+    // The analytic outer Hessian is routed to ARC whenever the realized family
+    // exposes second-order calculus. Matrix-free Hessian support is a
+    // representation capability used by the evaluator; it must not be hidden
+    // from the outer optimizer by a cost-based first-order policy.
+    let hessian = if options.use_outer_hessian
+        && include_exact_newton_logdet_h(family, options)
+        && order.has_hessian()
+    {
+        DeclaredHessianForm::Either
     } else {
         DeclaredHessianForm::Unavailable
     };
@@ -10697,59 +10291,6 @@ fn joint_preconditioned_descent_delta(
     Ok(delta)
 }
 
-fn joint_constrained_preconditioned_descent_delta(
-    source: &JointHessianSource,
-    ranges: &[(usize, usize)],
-    s_lambdas: &[Array2<f64>],
-    diagonal_ridge: f64,
-    rhs: &Array1<f64>,
-    beta_joint: &Array1<f64>,
-    constraints: &LinearInequalityConstraints,
-    active_rows: Option<&[usize]>,
-) -> Result<Option<(Array1<f64>, Vec<usize>)>, String> {
-    if rhs.len() != beta_joint.len() || constraints.a.ncols() != beta_joint.len() {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "joint constrained descent dimension mismatch: rhs={}, beta={}, A_cols={}",
-                rhs.len(),
-                beta_joint.len(),
-                constraints.a.ncols()
-            ),
-        }
-        .into());
-    }
-    let base_diagonal = match source {
-        JointHessianSource::Dense(h_joint) => h_joint.diag().to_owned(),
-        JointHessianSource::Operator { diagonal, .. } => diagonal.clone(),
-    };
-    let preconditioner =
-        joint_penalty_preconditioner_diag(&base_diagonal, ranges, s_lambdas, diagonal_ridge);
-    let p = beta_joint.len();
-    let mut lhs = Array2::<f64>::zeros((p, p));
-    for j in 0..p {
-        lhs[[j, j]] = preconditioner[j];
-    }
-    let rhs_beta = &(&preconditioner * beta_joint) + rhs;
-    let (candidate, active) = solve_quadratic_with_linear_constraints(
-        &lhs,
-        &rhs_beta,
-        beta_joint,
-        constraints,
-        active_rows,
-    )
-    .map_err(|e| format!("joint constrained descent solve failed: {e}"))?;
-    let delta = &candidate - beta_joint;
-    if !delta.iter().all(|v| v.is_finite()) {
-        return Ok(None);
-    }
-    let directional = rhs.dot(&delta);
-    if directional.is_finite() && directional > 0.0 {
-        Ok(Some((delta, active)))
-    } else {
-        Ok(None)
-    }
-}
-
 fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -10758,27 +10299,12 @@ fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'sta
     states: &[ParameterBlockState],
     prefer_workspace: bool,
 ) -> Result<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>), String> {
-    if let Some((log_likelihood, workspace)) = family.joint_line_search_log_likelihood_evaluation(
-        states,
-        specs,
-        line_search_options,
-        workspace_options,
-    )? {
-        return Ok((log_likelihood, workspace));
-    }
-    if prefer_workspace
-        && let Some((log_likelihood, workspace)) = family
-            .joint_line_search_log_likelihood_workspace(
-                states,
-                specs,
-                line_search_options,
-                workspace_options,
-            )?
+    if let Some((log_likelihood, workspace)) =
+        family.joint_line_search_log_likelihood_workspace(states, specs, options)?
     {
         return Ok((log_likelihood, Some(workspace)));
     }
-    if (!family.supports_log_likelihood_early_exit()
-        || line_search_options.early_exit_threshold.is_none())
+    if (!family.supports_log_likelihood_early_exit() || options.early_exit_threshold.is_none())
         && prefer_workspace
         && family.inner_joint_workspace_log_likelihood_available(specs)
         && let Some(workspace) = family.exact_newton_joint_hessian_workspace_with_options(
@@ -10802,7 +10328,6 @@ fn coefficient_line_search_options(
 ) -> BlockwiseFitOptions {
     let mut line_search_options = options.clone();
     line_search_options.outer_score_subsample = None;
-    line_search_options.auto_outer_subsample = false;
     line_search_options.early_exit_threshold = Some(early_exit_threshold);
     line_search_options
 }
@@ -11059,32 +10584,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 cached.block_logdet_h,
                 cached.block_logdet_s,
             );
-            let kkt_residual = exact_newton_joint_kkt_residual_for_ift(
-                family,
-                specs,
-                &states,
-                &s_lambdas,
-                ridge,
-                options.ridge_policy,
-                Some(cached_active_sets.as_slice()),
-            )?;
-            let kkt_residual = if use_joint_newton {
-                require_projected_kkt_residual(kkt_residual, "same-rho warm-start inner reuse")?
-            } else {
-                kkt_residual
-            };
-            let active_constraints = {
-                let local_ranges = block_param_ranges(specs);
-                let local_total_p = local_ranges.last().map(|(_, end)| *end).unwrap_or(0);
-                let block_constraints = collect_block_linear_constraints(family, &states, specs)?;
-                assemble_active_constraint_block(
-                    &block_constraints,
-                    &cached_active_sets,
-                    &local_ranges,
-                    local_total_p,
-                )
-                .map(std::sync::Arc::new)
-            };
             return Ok(BlockwiseInnerResult {
                 block_states: states,
                 active_sets: normalize_active_sets(cached_active_sets),
@@ -11096,153 +10595,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_logdet_s: cached.block_logdet_s,
                 s_lambdas,
                 joint_workspace: cached.joint_workspace.clone(),
-                kkt_residual,
-                active_constraints,
             });
         }
-        // Soft warm-start across rho changes.
-        //
-        // Exact-rho match has already been handled (and short-circuited)
-        // above. We're here because either log-lambdas differ, the prior
-        // inner solve didn't converge, or the cached mode is missing.
-        // Rather than discarding the prior β entirely (the historical
-        // cold-start behavior), classify the change:
-        //
-        //   * modest rho change with same block/penalty structure:
-        //         keep prior β unchanged (penalty changed but the
-        //         coordinate system is the same, β is a fine seed).
-        //   * larger rho change but structure unchanged:
-        //         project β onto the new joint penalty's range space
-        //         (positive-eigenvalue subspace). This zeros out
-        //         components that the new penalty heavily damps,
-        //         giving the inner solver a starting point already
-        //         compatible with the new penalty geometry.
-        //   * structure change (penalty count or dimension differs):
-        //         fall through to cold start.
-        //
-        // A safety guard rejects projections whose 2-norm ratio against
-        // the prior β is pathological (>10 or <0.1) and reverts to cold
-        // start.
-        let expected_rho_len: usize = block_log_lambdas.iter().map(|v| v.len()).sum();
-        let structure_unchanged = seed.rho.len() == expected_rho_len
-            && seed.block_beta.len() == specs.len()
-            && seed
-                .block_beta
-                .iter()
-                .zip(specs.iter())
-                .all(|(beta_seed, spec)| beta_seed.len() == spec.design.ncols())
-            && seed
-                .block_beta
-                .iter()
-                .zip(&states)
-                .all(|(beta_seed, state)| beta_seed.len() == state.beta.len());
-
-        let rho_change_max = if structure_unchanged {
-            let mut offset = 0usize;
-            let mut max_change = 0.0_f64;
-            for block in block_log_lambdas {
-                let end = offset + block.len();
-                let old_slice = seed.rho.slice(s![offset..end]);
-                for (new_v, old_v) in block.iter().zip(old_slice.iter()) {
-                    let d = (new_v - old_v).abs();
-                    if d > max_change {
-                        max_change = d;
-                    }
-                }
-                offset = end;
-            }
-            Some(max_change)
-        } else {
-            None
-        };
-
-        let mut warm_start_path: &'static str = "cold";
-        if let Some(rho_change_max) = rho_change_max {
-            if rho_change_max < 0.5 {
-                // Modest rho change: reuse prior β as-is (with the
-                // family's required post-update projection).
-                for (b, beta_seed) in seed.block_beta.iter().enumerate() {
-                    let beta_projected =
-                        family.post_update_block_beta(&states, b, &specs[b], beta_seed.clone())?;
-                    states[b].beta.assign(&beta_projected);
-                }
-                cached_active_sets = seed.active_sets.clone();
-                refresh_all_block_etas(family, specs, &mut states)?;
-                warm_start_path = "unchanged";
-            } else {
-                // Larger rho change but penalty structure intact:
-                // project β onto the positive eigenspace of the new
-                // joint penalty per block.
-                let mut all_blocks_ok = true;
-                let mut projected_blocks: Vec<Array1<f64>> = Vec::with_capacity(specs.len());
-                for (b, beta_seed) in seed.block_beta.iter().enumerate() {
-                    let s_lambda = &s_lambdas[b];
-                    // Symmetrize defensively.
-                    let p = s_lambda.nrows();
-                    let mut sym = Array2::<f64>::zeros((p, p));
-                    for i in 0..p {
-                        for j in 0..p {
-                            sym[[i, j]] = 0.5 * (s_lambda[[i, j]] + s_lambda[[j, i]]);
-                        }
-                    }
-                    let (evals, evecs) = match FaerEigh::eigh(&sym, Side::Lower) {
-                        Ok(pair) => pair,
-                        Err(_) => {
-                            all_blocks_ok = false;
-                            break;
-                        }
-                    };
-                    let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-                    // Standard positive-eigenvalue threshold: anything
-                    // above 1e-12 · max|λ| counts as a real penalty
-                    // direction; everything else is the null space the
-                    // penalty cannot resolve.
-                    let pos_threshold = (CUSTOM_FAMILY_EVAL_FLOOR * max_abs_eval).max(1e-300);
-                    let beta_prior_norm: f64 = beta_seed.iter().map(|v| v * v).sum::<f64>().sqrt();
-                    // Form β_proj = U_pos U_posᵀ β.
-                    let mut beta_proj = Array1::<f64>::zeros(p);
-                    for k in 0..p {
-                        if evals[k] <= pos_threshold {
-                            continue;
-                        }
-                        let mut u_t_beta = 0.0;
-                        for i in 0..p {
-                            u_t_beta += evecs[[i, k]] * beta_seed[i];
-                        }
-                        for i in 0..p {
-                            beta_proj[i] += evecs[[i, k]] * u_t_beta;
-                        }
-                    }
-                    let beta_proj_norm: f64 = beta_proj.iter().map(|v| v * v).sum::<f64>().sqrt();
-                    // Safety guard: pathological projection ratio.
-                    if beta_prior_norm > 0.0 {
-                        let ratio = beta_proj_norm / beta_prior_norm;
-                        if !ratio.is_finite() || ratio > 10.0 || ratio < 0.1 {
-                            log::debug!(
-                                "[GAMLSS soft warm-start] block {} projection ratio {:.3e} out of [0.1, 10]; falling back to cold start",
-                                b,
-                                ratio,
-                            );
-                            all_blocks_ok = false;
-                            break;
-                        }
-                    }
-                    if !beta_proj.iter().all(|v| v.is_finite()) {
-                        all_blocks_ok = false;
-                        break;
-                    }
-                    projected_blocks.push(beta_proj);
-                }
-                if all_blocks_ok && projected_blocks.len() == specs.len() {
-                    for (b, beta_proj) in projected_blocks.into_iter().enumerate() {
-                        let beta_post =
-                            family.post_update_block_beta(&states, b, &specs[b], beta_proj)?;
-                        states[b].beta.assign(&beta_post);
-                    }
-                    cached_active_sets = seed.active_sets.clone();
-                    refresh_all_block_etas(family, specs, &mut states)?;
-                    warm_start_path = "projected";
-                }
+        for (b, beta_seed) in seed.block_beta.iter().enumerate() {
+            if beta_seed.len() == states[b].beta.len() {
+                let beta_projected =
+                    family.post_update_block_beta(&states, b, &specs[b], beta_seed.clone())?;
+                states[b].beta.assign(&beta_projected);
             }
         }
 
@@ -11378,6 +10737,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // test can consume the value from the accepted trust-region
         // attempt. Reset every cycle alongside the line-search state.
         let mut _accepted_predicted_reduction: f64 = f64::INFINITY;
+
+        // Cross-cycle convergence carry-over: set at the end of every
+        // accepted cycle so the next cycle's line-search-failure path
+        // can distinguish a true KKT optimum on a rank-deficient
+        // Hessian (no meaningful trial step, even though step_inf is
+        // O(1) along the null mode) from genuine non-convergence.
+        let mut last_cycle_residual_below_tol = false;
+        let mut last_cycle_obj_change_below_tol = false;
 
         let mut joint_trust_radius = 1.0_f64;
         // Hard upper bound for the for-loop's range. The cap is fixed at
@@ -11516,7 +10883,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         &states, specs, options,
                     )?,
                 };
-                hessian_workspace_for_cycle = workspace.clone();
                 workspace
                     .as_ref()
                     .map(|workspace| {
@@ -11567,25 +10933,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let trace_diagonal_ridge = joint_mode_diagonal_ridge + JOINT_TRACE_STABILITY_RIDGE;
             let joint_hessian_is_dense =
                 matches!(&joint_hessian_source, JointHessianSource::Dense(_));
-            let joint_solver_diagonal_ridge = stabilized_joint_solver_diagonal_ridge(
-                family,
-                &joint_hessian_source,
-                &ranges,
-                &s_lambdas,
-                trace_diagonal_ridge,
-                options.ridge_floor,
-            );
-            let current_kkt_norm = exact_newton_joint_stationarity_inf_norm_from_gradient(
-                &grad_joint,
-                &states,
-                specs,
-                &s_lambdas,
-                ridge,
-                options.ridge_policy,
-                &block_constraints,
-                Some(cached_active_sets.as_slice()),
-            )?;
-            let pcg_rel_tol = joint_pcg_eisenstat_walker_forcing(prev_kkt_norm, current_kkt_norm);
 
             let solve_joint_constraints_dense =
                 !matrix_free_joint_requested || joint_hessian_is_dense;
@@ -11670,15 +11017,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 let pcg_started = std::time::Instant::now();
                 let pcg_requested = matrix_free_joint_requested && !joint_hessian_is_dense;
                 let mut delta = if pcg_requested {
-                    if !ew_pcg_log_emitted && let Some(prev_kkt) = prev_kkt_norm {
-                        log::info!(
-                            "[EW-PCG] eta={:.3e} prev_kkt={:.3e} cur_kkt={:.3e}",
-                            pcg_rel_tol,
-                            prev_kkt,
-                            current_kkt_norm,
-                        );
-                        ew_pcg_log_emitted = true;
-                    }
                     let preconditioner_diag = match &joint_hessian_source {
                         JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
                             &h_joint.diag().to_owned(),
@@ -11846,7 +11184,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let mut accepted_joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> =
                 None;
             let mut line_search_attempts = 0usize;
-            let mut search_joint_active_set = joint_active_set.clone();
 
             // Pure Newton must take a full step on the first cycle of an
             // exact quadratic problem (i.e. converge in one cycle when the
@@ -11856,57 +11193,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // 2-norm. Bumping the radius up to the post-barrier Newton-step
             // norm on cycle 0 preserves quadratic convergence on
             // well-conditioned problems while leaving the standard adaptive
-            // shrink/expand for subsequent cycles. The family infinity-norm cap on
+            // shrink/expand for subsequent cycles. The MAX_JOINT_STEP cap on
             // |delta|_inf above remains the actual safeguard against runaway
             // proposals.
             if cycle == 0 {
                 let initial_step_norm = joint_trust_region_step_norm(&delta);
                 if initial_step_norm.is_finite() && initial_step_norm > joint_trust_radius {
-                    // Cycle-0 trust-radius bump. Three competing caps:
-                    //
-                    //   (a) the unconstrained Newton step's L2 norm — so a
-                    //       well-conditioned problem gets a single full
-                    //       quadratic step rather than ten shrunk halves.
-                    //   (b) 1.0e6, matching the upper clamp in
-                    //       `update_joint_trust_region_radius` so a sane
-                    //       Newton step never pays for an attempt the next
-                    //       update would immediately re-clamp.
-                    //   (c) `max_step_inf · L2 / inf` — the largest L2
-                    //       radius for which rescaling the Newton step to
-                    //       length r still keeps every coordinate inside
-                    //       the local coefficient-space sanity threshold.
-                    //
-                    // The earlier all-or-nothing gate (`newton_step_is_sane
-                    // = initial_step_inf <= max_step_inf`) discarded the
-                    // bump entirely whenever the *uncapped* inf-norm
-                    // exceeded `max_step_inf`. That measured the wrong
-                    // step: the trust region never accepts a step longer
-                    // than its radius, so the relevant inf-norm is the
-                    // inf-norm of `delta * r/L2`, not of `delta` itself.
-                    // For modestly out-of-bound Newton steps (e.g.
-                    // inf=97.4 vs max=20, L2=135, p=18 — the wiggle Probit
-                    // case pinned by
-                    // `binomial_location_scalewiggle_exact_newton_spatial_joint_hyper_returns_fullhessian`)
-                    // the all-or-nothing gate stranded the trust radius at
-                    // the default 1.0 and inner failed to converge within
-                    // the cycle budget. Cap (c) instead bumps to r_safe ≈
-                    // 27.7 — large enough to make rapid progress, small
-                    // enough that no β coordinate moves further than the
-                    // local sanity threshold.
-                    let initial_step_inf =
-                        delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
-                    let max_step_inf = JOINT_NEWTON_TRUST_RADIUS_EXPANSION_MAX_STEP_INF;
-                    let r_safe =
-                        if initial_step_inf > 0.0 && max_step_inf.is_finite() && max_step_inf > 0.0
-                        {
-                            max_step_inf * initial_step_norm / initial_step_inf
-                        } else {
-                            f64::INFINITY
-                        };
-                    let bumped = initial_step_norm.min(1.0e6).min(r_safe);
-                    if bumped > joint_trust_radius {
-                        joint_trust_radius = bumped;
-                    }
+                    joint_trust_radius = initial_step_norm;
                 }
             }
 
@@ -11966,123 +11259,23 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 break;
             }
 
-            // We do NOT add an analytic Newton-decrement pre-loop test here.
-            // It is tempting (and principled: ½ gᵀ H⁻¹ g is exactly the
-            // canonical convergence signal). But at rank-deficient optima
-            // (σ_min(H) ≲ ε_machine, e.g. HardPseudo with σ_min ~ 1e-10) the
-            // Newton step has a non-trivial component along H's near-null
-            // eigenvector that *does* move β by O(g / σ_min) per cycle. The
-            // outer-gradient identity ∇_λ L = ∂L/∂λ holds at KKT modulo
-            // O(‖rhs‖) — but only when consecutive λ probes converge to the
-            // *same* point in H's null space, which requires every probe to
-            // exhaust the same number of trust-region cycles. Exiting earlier
-            // at one λ than at another decorrelates the null-space drift and
-            // breaks `outerobjective_andgradient` FD checks at tight inner
-            // tolerances (regression test:
-            // `outer_lamlgradient_matches_finite_differencewhen_joint_exact_path_is_active`,
-            // inner_tol=1e-12, noise floor ~1.3e-9).
-            //
-            // The trust-region loop's intra-attempt `joint_objective_floor_reached`
-            // already saves 23/24 of the wasted evals at the round-off-stuck
-            // state (the pre-loop test would have saved the 24th). The
-            // marginal 1/24 is not worth the rank-deficient fit-quality risk.
-
             // Trust-region retries preserve the objective-decrease guarantee
             // when the initial radius is too optimistic. If the Newton proposal
             // is not a descent direction for the penalized quadratic model,
-            // switch once to a diagonally preconditioned descent step and keep
-            // the same exact full-objective accept/reject test. Constrained
-            // problems use a diagonal constrained QP for this rescue direction,
-            // so retries stay in the active linear-constraint tangent cone.
+            // switch once to a diagonally preconditioned gradient step and keep
+            // the same exact full-objective accept/reject test.
             const JOINT_TRUST_MAX_ATTEMPTS: usize = 24;
-            let mut search_delta =
-                if step_inf <= step_tol && current_stationarity_residual > residual_tol {
-                    if let Some(constraints) = joint_constraints.as_ref() {
-                        match joint_constrained_preconditioned_descent_delta(
-                            &joint_hessian_source,
-                            &ranges,
-                            &s_lambdas,
-                            joint_solver_diagonal_ridge,
-                            &rhs,
-                            &beta_joint,
-                            constraints,
-                            search_joint_active_set.as_deref(),
-                        )? {
-                            Some((descent_delta, active_set)) => {
-                                search_joint_active_set = Some(active_set);
-                                descent_delta
-                            }
-                            None => Array1::<f64>::zeros(total_p),
-                        }
-                    } else {
-                        joint_preconditioned_descent_delta(
-                            &joint_hessian_source,
-                            &ranges,
-                            &s_lambdas,
-                            joint_solver_diagonal_ridge,
-                            &rhs,
-                        )?
-                    }
-                } else {
-                    delta.clone()
-                };
+            let mut search_delta = delta.clone();
             let mut tried_preconditioned_descent = false;
             let mut model_rejects = 0usize;
             let mut likelihood_rejects = 0usize;
             let mut objective_rejects = 0usize;
-            let mut barrier_rejects = 0usize;
             let mut first_likelihood_reject: Option<String> = None;
-            // Coalesce consecutive trust-region attempts whose accept/reject
-            // outcome and numeric signature round to the same values, so a long
-            // run of identical retries collapses into a single "attempts a..b
-            // (×N)" line at flush time instead of spamming one line per try.
-            let mut tr_log_sig: Option<String> = None;
-            let mut tr_log_first: usize = 0;
-            let mut tr_log_last: usize = 0;
-            let mut accepted_math_diag: Option<JointNewtonMathDiagnostic> = None;
-            // Right-hand side for the TR subproblem, ∇L_pen = ∇ℓ − Sβ.
-            // Constant across TR retries because β only mutates on accept,
-            // and the gradient/penalty are reloaded outside the loop.
-            // For the dense unconstrained path we solve the TR subproblem
-            // properly (Moré–Sorensen / Hebden damping); the constrained QP
-            // and matrix-free PCG paths keep the rescaling fallback (their
-            // step directions are not simple Newton solves).
-            let tr_dense_unconstrained = joint_constraints.is_none()
-                && matches!(&joint_hessian_source, JointHessianSource::Dense(_));
             for trust_attempt in 0..JOINT_TRUST_MAX_ATTEMPTS {
                 line_search_attempts = trust_attempt + 1;
                 accepted_joint_workspace = None;
-                let search_norm = joint_trust_region_step_norm(&search_delta);
-                let mut trial_delta =
-                    if search_norm.is_finite() && search_norm <= joint_trust_radius {
-                        // Unconstrained Newton step already fits in the trust
-                        // region — take it as-is.
-                        search_delta.clone()
-                    } else if tr_dense_unconstrained
-                        && let JointHessianSource::Dense(h_dense) = &joint_hessian_source
-                        && let Some((tr_delta, _lambda_tr)) = dense_more_sorensen_step(
-                            h_dense,
-                            &ranges,
-                            &s_lambdas,
-                            joint_solver_diagonal_ridge,
-                            &rhs,
-                            joint_trust_radius,
-                            search_norm,
-                        )
-                    {
-                        // Proper damped Newton step: δ = -(H+S+(ε+λ_TR)·I)⁻¹ rhs
-                        // with λ_TR ≥ 0 chosen so ‖δ‖ ≈ Δ. This regularizes the
-                        // near-null eigenvectors that the legacy rescale-based
-                        // truncation amplified.
-                        tr_delta
-                    } else {
-                        // Fallback for paths Moré–Sorensen does not own
-                        // (constrained QP, matrix-free PCG, dense subproblem
-                        // failure): rescale the unconstrained direction.
-                        let mut fallback = search_delta.clone();
-                        truncate_joint_step_to_radius(&mut fallback, joint_trust_radius);
-                        fallback
-                    };
+                let mut trial_delta = search_delta.clone();
+                truncate_joint_step_to_radius(&mut trial_delta, joint_trust_radius);
                 let mut barrier_ceiling = 1.0_f64;
                 for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
                     let block_delta = trial_delta.slice(s![start..end]).to_owned();
@@ -12093,16 +11286,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     }
                 }
                 if !barrier_ceiling.is_finite() || barrier_ceiling <= 0.0 {
-                    // Per-block feasibility barrier reduced the proposed step
-                    // length to zero. Without this counter the failure mode is
-                    // silent and the trust-region loop spins to its max-attempt
-                    // ceiling shrinking the radius while every attempt remains
-                    // infeasible — the failure shows up downstream as
-                    // `inner solve did not converge` with no diagnostic
-                    // pointing at the barrier. Counting and logging makes the
-                    // path visible and feeds the constrained-KKT certificate
-                    // in the post-loop rescue below.
-                    barrier_rejects += 1;
                     joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
                     continue;
                 }
@@ -12110,11 +11293,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     trial_delta.mapv_inplace(|v| v * barrier_ceiling);
                 }
                 let step_norm = joint_trust_region_step_norm(&trial_delta);
-                let trial_step_inf = trial_delta
-                    .iter()
-                    .copied()
-                    .map(f64::abs)
-                    .fold(0.0_f64, f64::max);
                 let mut hpen_delta = Array1::<f64>::zeros(total_p);
                 // Predicted reduction must use the TRUE penalized Hessian
                 // (the one that appears in `f(β) = -ℓ + ½βᵀSβ + ½·joint_mode_diagonal_ridge·‖β‖²`),
@@ -12161,39 +11339,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 if !predicted_reduction.is_finite() || predicted_reduction <= 0.0 {
                     model_rejects += 1;
                     if !tried_preconditioned_descent {
-                        if let Some(constraints) = joint_constraints.as_ref() {
-                            match joint_constrained_preconditioned_descent_delta(
-                                &joint_hessian_source,
-                                &ranges,
-                                &s_lambdas,
-                                joint_solver_diagonal_ridge,
-                                &rhs,
-                                &beta_joint,
-                                constraints,
-                                search_joint_active_set.as_deref(),
-                            ) {
-                                Ok(Some((descent_delta, active_set))) => {
-                                    search_delta = descent_delta;
-                                    search_joint_active_set = Some(active_set);
-                                }
-                                Ok(None) | Err(_) => {
-                                    joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
-                                }
+                        match joint_preconditioned_descent_delta(
+                            &joint_hessian_source,
+                            &ranges,
+                            &s_lambdas,
+                            trace_diagonal_ridge,
+                            &rhs,
+                        ) {
+                            Ok(descent_delta) => {
+                                search_delta = descent_delta;
                             }
-                        } else {
-                            match joint_preconditioned_descent_delta(
-                                &joint_hessian_source,
-                                &ranges,
-                                &s_lambdas,
-                                joint_solver_diagonal_ridge,
-                                &rhs,
-                            ) {
-                                Ok(descent_delta) => {
-                                    search_delta = descent_delta;
-                                }
-                                Err(_) => {
-                                    joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
-                                }
+                            Err(_) => {
+                                joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
                             }
                         }
                         tried_preconditioned_descent = true;
@@ -12214,37 +11371,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 refresh_all_block_etas(family, specs, &mut states)?;
                 let trial_penalty =
                     total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
-                // PSD invariant: ½β'S_λβ is non-negative for PSD S_λ by
-                // construction. A negative trial penalty beyond roundoff means
-                // S_λ has lost PSD upstream -- refuse the step regardless of
-                // what the rho-test thinks of the objective change, restore
-                // betas, and shrink the trust region so the next cycle re-enters
-                // the region where the quadratic model is sane. This is
-                // bookkeeping for a model violation (the penalty term of the
-                // quadratic model is not PSD), so it counts as a model reject.
-                let penalty_tol = 1e-10 * (1.0 + old_objective.abs() + current_penalty.abs());
-                if trial_penalty < -penalty_tol {
-                    model_rejects += 1;
-                    for (b, old) in old_beta.iter().enumerate() {
-                        states[b].beta.assign(old);
-                    }
-                    refresh_all_block_etas(family, specs, &mut states)?;
-                    joint_trust_radius = (0.25 * joint_trust_radius).max(1.0e-12);
-                    continue;
-                }
-                // Families that can build a reusable workspace while computing
-                // the line-search likelihood do so here. Rejected attempts can
-                // still stop through the early-exit threshold; accepted full
-                // sweeps keep their exact row cache for the gradient reload.
+                // Cheap-LL line-search path: rejected backtracking attempts
+                // discard the exact-Newton workspace they build, so by default
+                // we evaluate just the scalar full-data log-likelihood for the
+                // accept/reject decision and only build the full state once the
+                // step is accepted (via the gradient reload below). The
+                // workspace path is preserved behind
+                // `options.line_search_prefer_workspace` for A/B regression
+                // checks against the legacy numerics.
                 let line_search_options =
                     coefficient_line_search_options(options, old_objective + 1e-10);
                 let trial_ll = match joint_line_search_log_likelihood(
                     family,
                     specs,
                     &line_search_options,
-                    options,
                     &states,
-                    joint_workspace_requested || options.line_search_prefer_workspace,
+                    joint_workspace_requested && options.line_search_prefer_workspace,
                 ) {
                     Ok((value, workspace)) => {
                         accepted_joint_workspace = workspace;
@@ -12415,40 +11557,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 refresh_all_block_etas(family, specs, &mut states)?;
                 objective_rejects += 1;
             }
-            // The per-attempt TR signature carries ρ, radius, step size — useful
-            // on rejections and rare events, redundant on routine first-attempt
-            // accepts. Emit on verbose cycles or whenever the search ran more
-            // than one attempt (multi-attempt cycles are inherently interesting).
-            let tr_log_interesting = verbose_cycle || line_search_attempts > 1 || !accepted;
-            if tr_log_interesting {
-                if let Some(prev) = tr_log_sig.as_deref() {
-                    if tr_log_first == tr_log_last {
-                        log::info!(
-                            "[PIRLS/joint-Newton/TR cycle={} attempt={}] {}",
-                            cycle,
-                            tr_log_first,
-                            prev,
-                        );
-                    } else {
-                        log::info!(
-                            "[PIRLS/joint-Newton/TR cycle={} attempts={}..{} ×{}] {}",
-                            cycle,
-                            tr_log_first,
-                            tr_log_last,
-                            tr_log_last - tr_log_first + 1,
-                            prev,
-                        );
-                    }
-                }
-            }
             let line_search_elapsed = line_search_started.elapsed();
             if accepted && converged {
                 log::info!(
-                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=true hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} grad_reload=0.000s total={:.3}s",
+                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=false hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} reject_model={} reject_likelihood={} reject_objective={} first_likelihood_reject={} grad_reload=0.000s total={:.3}s",
                     cycle,
                     hessian_and_qp_elapsed.as_secs_f64(),
                     line_search_elapsed.as_secs_f64(),
                     line_search_attempts,
+                    model_rejects,
+                    likelihood_rejects,
+                    objective_rejects,
+                    first_likelihood_reject.as_deref().unwrap_or("none"),
                     cycle_started.elapsed().as_secs_f64(),
                 );
                 cached_joint_workspace = hessian_workspace_for_cycle;
@@ -12482,139 +11602,23 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     states[b].beta.assign(old);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
-                // Trust-region floor + exhausted attempts is the
-                // algebraic certificate that the current cycle could
-                // not find ANY descent direction at this β within
-                // numerical precision: once the radius is clamped to
-                // its 1e-12 floor (by `update_joint_trust_region_radius`
-                // and the barrier-shrink path), every attempt evaluates
-                // the same truncated step from the same β, so 24
-                // successive rejects do not represent 24 distinct
-                // failed proposals — they represent the SAME proposal
-                // failing 24 times. At radius 1e-12 the model-predicted
-                // reduction is bounded above by ‖rhs‖ · 1e-12 + ½ ·
-                // λ_max(H_pen) · 1e-24, which lies at the
-                // likelihood-evaluator round-off floor for any finite
-                // gradient; the sufficient-decrease test's `actual −
-                // predicted` sign is then dominated by round-off and
-                // produces ρ = −∞ rejects regardless of how close β is
-                // to a true KKT point.
-                //
-                // The previous gate paired `trust_region_collapsed`
-                // with `last_cycle_obj_change_below_tol`. That
-                // precondition presumed an intermediate near-converged
-                // accepted cycle would always precede TR collapse, so
-                // collapse-on-its-own would never imply a usable
-                // iterate. The presumption is false: a single accepted
-                // Newton step from a region of well-determined
-                // curvature can push β into a feasibility cliff,
-                // triggering 24 successive `barrier_rejects` and
-                // driving the radius to its floor in ONE cycle — with
-                // no opportunity for the flag to be set first. From
-                // cycle N+1 onward every attempt rejects on the
-                // sign-noise of `actual_reduction`, and the rescue
-                // never fires because the flag was set false at the
-                // end of cycle N (where Δobj was still well above tol
-                // — exactly the regime where the descent was genuinely
-                // making progress). The loop spins to
-                // `inner_max_cycles` on a state from which no further
-                // progress is numerically detectable.
-                //
-                // The replacement certificate is purely algebraic: at
-                // TR-floor with all attempts exhausted, the iterate
-                // sits at a constrained KKT point of the
-                // truncated-step problem (no feasible step of L2-norm
-                // ≤ 1e-12 reduces the objective). `made_progress`
-                // still guards against accepting a degenerate cycle-0
-                // failure.
-                let trust_region_collapsed = joint_trust_radius <= 1.0e-9;
-                // Require at least 2 successful cycles before accepting the
-                // relaxed (residual > tol) KKT signature, so we never accept
-                // a degenerate cycle-0 failure as convergence.
-                let made_progress = cycles_done >= 2;
-
-                // Constrained-KKT certificate: full trust-region exhaustion
-                // (`line_search_attempts == JOINT_TRUST_MAX_ATTEMPTS`) after a
-                // model-rejection fallback (`tried_preconditioned_descent`)
-                // with no successful trial — i.e., the QP-derived Newton step
-                // had non-positive predicted reduction on the unconstrained
-                // quadratic model AND every subsequent attempt either
-                // re-rejected the model (`reject_model` climbs) or hit the
-                // per-block feasibility barrier (`reject_barrier` climbs) —
-                // is the canonical "QP says we are at the constrained
-                // optimum" signature. β_current is the constrained QP
-                // optimum to within solver precision: any feasible move from
-                // here either fails to descend the quadratic model (the QP
-                // saw it first) or crosses an active face (the barrier saw
-                // it next).
-                //
-                // The standard unconstrained stationarity test at the top of
-                // the cycle (‖Sβ − ∇L‖_∞ ≤ residual_tol) cannot detect this
-                // on its own: at a constrained optimum that residual equals
-                // the Lagrange-multiplier norm ‖Aᵀλ‖_∞ ≥ ‖λ_min‖ · ‖A_active‖,
-                // which does NOT vanish. Without this rescue the inner loop
-                // spins to `inner_max_cycles` producing byte-identical cycle
-                // summaries (β is restored each iteration, so every cycle
-                // re-fires the same model + barrier pair) and the outer
-                // optimizer rejects the seed with `objective returned a
-                // non-finite cost`.
-                //
-                // Conditions ensure we only fire when:
-                // - the QP returned a non-empty active set (active
-                //   constraints actually exist for this configuration),
-                // - the model-rejection fallback was tried (a real QP
-                //   step was judged non-descending),
-                // - all `JOINT_TRUST_MAX_ATTEMPTS` attempts were spent
-                //   (we did not exit early through a likelihood error),
-                // - no attempt produced a finite trial likelihood that
-                //   merely failed the objective check (which would be a
-                //   different failure mode, not a KKT certificate),
-                // - we have at least two prior successful cycles, matching
-                //   the standard rescue's progress guard.
-                let trust_region_exhausted = line_search_attempts >= JOINT_TRUST_MAX_ATTEMPTS;
-                let qp_constrained_kkt = model_rejects >= 1
-                    && tried_preconditioned_descent
-                    && trust_region_exhausted
-                    && likelihood_rejects == 0
-                    && objective_rejects == 0
-                    && joint_active_set
-                        .as_ref()
-                        .is_some_and(|active| !active.is_empty());
-                // TR-floor exhaustion: radius clamped at 1e-12 AND a full
-                // attempt sweep failed at that radius. No descent step of
-                // L2-norm ≤ 1e-12 exists at this β within numerical precision.
-                let tr_floor_exhausted = trust_region_collapsed && trust_region_exhausted;
-                if (tr_floor_exhausted && made_progress) || (qp_constrained_kkt && made_progress) {
-                    if qp_constrained_kkt && !trust_region_collapsed {
-                        log::info!(
-                            "[PIRLS/joint-Newton] cycle={} constrained-KKT certificate: QP delta gave non-positive model reduction and the preconditioned-descent fallback exhausted {} trust-region attempts at active constraints (reject_model={}, reject_barrier={}, active_rows={})",
-                            cycle,
-                            line_search_attempts,
-                            model_rejects,
-                            barrier_rejects,
-                            joint_active_set.as_ref().map_or(0, |active| active.len()),
-                        );
-                    } else if tr_floor_exhausted {
-                        log::info!(
-                            "[PIRLS/joint-Newton] cycle={} TR-floor KKT certificate: trust-region collapsed to its 1e-12 floor and a full sweep of {} attempts rejected every step at that radius (reject_model={}, reject_barrier={}, reject_objective={}, reject_likelihood={}); no descent direction exists in the L2-ball around β within numerical precision",
-                            cycle,
-                            line_search_attempts,
-                            model_rejects,
-                            barrier_rejects,
-                            objective_rejects,
-                            likelihood_rejects,
-                        );
-                    }
+                // If the previous cycle's bookkeeping certified KKT
+                // stationarity (residual ≤ tol and objective change ≤
+                // tol), the line-search failure here is round-off on a
+                // rank-deficient null mode rather than non-convergence:
+                // the proposed `H⁻¹ g` step stays O(1) along the null
+                // direction at the optimum, every trial moves β along
+                // it without changing the objective, and round-off
+                // flips the sign of `actual − predicted` so the
+                // sufficient-decrease check rejects every trial. The
+                // iterate ALREADY satisfies the first-order optimality
+                // conditions; we accept that as convergence rather
+                // than fail the outer "inner solve did not converge"
+                // panic on a fully resolved fit.
+                if last_cycle_residual_below_tol && last_cycle_obj_change_below_tol {
                     converged = true;
                 }
-                cycles_done = cycle + 1;
-                prev_kkt_norm = Some(current_kkt_norm);
-                if converged {
-                    break;
-                }
-                last_cycle_obj_change_below_tol = false;
-                _accepted_predicted_reduction = f64::INFINITY;
-                continue;
+                break; // Fall back to blockwise
             }
 
             let grad_reload_started = std::time::Instant::now();
@@ -12753,68 +11757,37 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // this, the only visible signal is the objective itself,
             // which is insufficient to choose the right algorithmic
             // remedy.
-            //
-            // Verbose cycles (first, last, every JOINT_LOG_VERBOSE_PERIOD,
-            // near-convergence) emit the full criterion-by-criterion
-            // breakdown; routine cycles emit a single compact one-liner
-            // that still carries cycle/objective/Δobj/step/residual/time so
-            // a CI tail can confirm the solver is descending without
-            // drowning in 4 lines per cycle. Near-convergence auto-promotes
-            // only when the *binding* criterion (residual, which is the one
-            // the convergence check at line ~10874 actually evaluates) is
-            // within an order of magnitude of firing. Tying this to obj_change
-            // or step_inf alone fires on every cycle of a slow descent where
-            // the step is small but residual is still 10⁵× above tol —
-            // defeating the throttle entirely.
-            let near_convergence = residual <= 10.0 * residual_tol;
-            let signed_obj_change = lastobjective - old_objective;
-            if let Some(math_diag) = accepted_math_diag.take() {
-                // Newton identities for the penalized negative objective
-                //
-                //   f(β) = -ℓ(β) + 1/2 βᵀ S_λ β + 1/2 r βᵀβ
-                //   g(β) = ∇f(β) = S_λβ + rβ - ∇ℓ(β) = -rhs
-                //   H(β) = ∇²f(β) = -∇²ℓ(β) + S_λ + rI.
-                //
-                // The exact Newton step solves Hδ = -g = rhs. Therefore the
-                // *linearized* next KKT residual is
-                //
-                //   ‖g(β) + Hδ‖∞ = ‖Hδ - rhs‖∞,
-                //
-                // which should sit at solver roundoff. The actual next
-                // residual obeys Taylor's theorem:
-                //
-                //   g(β+δ) = g(β) + Hδ
-                //          + ∫₀¹ [H(β+tδ) - H(β)] δ dt.
-                //
-                // Thus, once ‖Hδ-rhs‖∞ is tiny, a large post-step KKT
-                // residual can only come from (1) true nonlinear curvature
-                // along δ, (2) a Hessian/gradient assembly mismatch, or
-                // (3) constrained/rank-deficient geometry. The scalar trust
-                // ratio ρ = actual/predicted only checks the one-dimensional
-                // objective model; it cannot by itself prove the vector
-                // Newton equation.
-                let quadratic_defect = math_diag.quadratic_defect_ratio(residual);
-                let scalar_model_relerr = math_diag.scalar_model_relative_error();
-                let linearized_rel = math_diag.linearized_rel();
-                last_joint_math = Some(math_diag.clone());
-                if verbose_cycle || residual > 100.0 * residual_tol || scalar_model_relerr > 1e-3 {
-                    log::info!(
-                        "[PIRLS/JN/math] cyc={:>3}/{} equations: old_kkt=‖g‖∞={:.3e}; linearized_next=‖g+Hδ‖∞=‖Hδ-rhs‖∞={:.3e} (rel={:.3e}); new_kkt=‖g(β+δ)‖∞={:.3e}; new_kkt/|δ|∞²={:.3e}; scalar_model actual={:+.3e} pred={:+.3e} ρ={:+.3e} relerr={:.3e}; |δ|∞={:.3e} |proposal|∞={:.3e}",
-                        cycle,
-                        inner_max_cycles,
-                        math_diag.old_kkt_inf,
-                        math_diag.linearized_next_kkt_inf,
-                        linearized_rel,
-                        residual,
-                        quadratic_defect,
-                        math_diag.actual_reduction,
-                        math_diag.predicted_reduction,
-                        math_diag.trust_ratio,
-                        scalar_model_relerr,
-                        math_diag.step_inf,
-                        math_diag.proposal_inf,
-                    );
-                }
+            log::info!(
+                "[PIRLS/joint-Newton convergence] cycle {:>3} | step_inf={:.3e} (tol={:.3e}) | accepted_step_inf={:.3e} | residual={:.3e} (tol={:.3e}) | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e}",
+                cycle,
+                step_inf,
+                step_tol,
+                accepted_step_inf,
+                residual,
+                residual_tol,
+                objective_change,
+                objective_tol,
+                beta_inf,
+            );
+
+            // Divergence early-exit. See the rationale block above the
+            // loop. We track current_log_likelihood (not the smoothed
+            // `objective_change`) because under a near-null mode the
+            // penalty drifts cycle-to-cycle even when the data fit is
+            // genuinely stagnant — `objective_change` would mask the
+            // divergence whereas a frozen log-likelihood is unambiguous.
+            let loglik_change_for_joint_divergence_check =
+                (current_log_likelihood - prev_log_likelihood_for_joint_divergence_check).abs();
+            let loglik_frozen_tol_for_joint_divergence_check =
+                inner_tol * (1.0 + current_log_likelihood.abs());
+            let step_clamped_for_joint_divergence_check = step_inf >= 0.95 * MAX_JOINT_STEP;
+            if loglik_change_for_joint_divergence_check
+                <= loglik_frozen_tol_for_joint_divergence_check
+                && step_clamped_for_joint_divergence_check
+            {
+                consecutive_joint_frozen_loglik_cycles += 1;
+            } else {
+                consecutive_joint_frozen_loglik_cycles = 0;
             }
             if verbose_cycle || near_convergence {
                 log::info!(
@@ -13201,44 +12174,30 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 converged = false;
                 break;
             }
-            // Plateau-flat-objective convergence certificate.
-            //
-            // When all three recent residual ratios sit above 0.95,
-            // Newton has stopped reducing the gradient residual along
-            // any direction the penalized Hessian can resolve — the
-            // remaining residual is locked into a curvature-bounded
-            // floor along null / ill-conditioned directions. If the
-            // objective has *also* been below `objective_tol` for the
-            // last three accepted cycles, the iterate is at a
-            // stationary point of the objective on the identifiable
-            // subspace, and the raw `‖∇L − Sβ‖∞` residual will not
-            // drop because there is no descent direction available.
-            //
-            // Operationally this is the projected-KKT certificate the
-            // raw residual gate cannot express: stalled descent ratios
-            // are the no-descent observation, and a Cauchy-on-
-            // objective tail is the convergence observation. Neither
-            // is sufficient alone — a stalled ratio with a still-
-            // shrinking objective means Newton is making small but
-            // real progress, and a flat objective with shrinking
-            // ratios means Newton is closing in fast and the residual
-            // gate will fire on its own. Their conjunction is the
-            // signal that further iteration is wall-clock waste.
-            //
-            // The `cycles_done >= 2` guard mirrors every other relaxed
-            // certificate in this function; it prevents certification
-            // on a degenerate cycle-0 stall (initial β at a barrier or
-            // machine-zero gradient that nonetheless is not optimal).
-            if descent_ratio_window.len() == 3
-                && descent_ratio_window.iter().all(|r| *r > 0.95)
-                && consecutive_obj_flat_cycles >= 3
-                && residual.is_finite()
-                && cycles_done >= 2
+
+            // KKT convergence: small residual plus EITHER a small
+            // Newton step (tight quadratic-rate convergence, lets β
+            // polish to machine precision), confirmed stagnation
+            // (`accepted_step_inf <= step_tol` AND `objective_change
+            // <= objective_tol`, the rank-deficient null-mode case),
+            // OR a stricter stationarity certificate where both the
+            // residual and objective change are an additional factor of
+            // `inner_tol` below their scale-aware tolerances. The last
+            // branch is deliberately stricter than the public tolerance:
+            // it handles machine-precision null directions where β can
+            // still move by about `step_tol` but the KKT residual and
+            // objective are already over-polished. Using objective
+            // stagnation alone is not sufficient; the residual guard is
+            // what preserves first-order correctness.
+            let superconverged_residual_tol = inner_tol * residual_tol;
+            let superconverged_objective_tol = inner_tol * objective_tol;
+            let superconverged_stationarity = residual <= superconverged_residual_tol
+                && objective_change <= superconverged_objective_tol;
+            if residual <= residual_tol
+                && (step_inf <= step_tol
+                    || (accepted_step_inf <= step_tol && objective_change <= objective_tol)
+                    || superconverged_stationarity)
             {
-                eprintln!(
-                    "[JN-EXIT] cycle={cycle} reason=plateau_objective_flat residual={residual:.3e} residual_tol={residual_tol:.3e} obj_change={objective_change:.3e} objective_tol={objective_tol:.3e} ratios=[{:.3},{:.3},{:.3}] consecutive_flat={consecutive_obj_flat_cycles} accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e}",
-                    descent_ratio_window[0], descent_ratio_window[1], descent_ratio_window[2],
-                );
                 converged = true;
                 break;
             }
@@ -13256,7 +12215,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             } else {
                 consecutive_obj_flat_cycles = 0;
             }
-            prev_kkt_norm = Some(current_kkt_norm);
+            // Carry the KKT-stationarity signal into the next cycle so
+            // the line-search-failure path above can recognise a true
+            // KKT optimum on a rank-deficient null mode. See that path
+            // for the full rationale.
+            last_cycle_residual_below_tol = residual <= residual_tol;
+            last_cycle_obj_change_below_tol = objective_change <= objective_tol;
         }
 
         // If joint Newton converged, skip the blockwise loop entirely.
@@ -13311,8 +12275,30 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 block_logdet_s,
                 s_lambdas,
                 joint_workspace: cached_joint_workspace.clone(),
-                kkt_residual,
-                active_constraints,
+            });
+        }
+        if cycles_done >= inner_max_cycles {
+            let penalty_value =
+                total_quadratic_penalty(&states, &s_lambdas, ridge, options.ridge_policy);
+            let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
+                family,
+                specs,
+                &mut states,
+                block_log_lambdas,
+                options,
+                cached_joint_workspace.clone(),
+            )?;
+            return Ok(BlockwiseInnerResult {
+                block_states: states,
+                active_sets: normalize_active_sets(cached_active_sets),
+                log_likelihood: current_log_likelihood,
+                penalty_value,
+                cycles: cycles_done,
+                converged,
+                block_logdet_h,
+                block_logdet_s,
+                s_lambdas,
+                joint_workspace: cached_joint_workspace.clone(),
             });
         }
         if cycles_done >= inner_max_cycles {
@@ -14236,8 +13222,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         block_logdet_s,
         s_lambdas,
         joint_workspace: None,
-        kkt_residual,
-        active_constraints,
     })
 }
 
@@ -15937,56 +14921,6 @@ fn outerobjectivegradienthessian_internal<F: CustomFamily + Clone + Send + Sync 
     .map_err(String::from)
 }
 
-fn outerobjectivegradienthessian_labeled<F: CustomFamily + Clone + Send + Sync + 'static>(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    layout: &PenaltyLabelLayout,
-    rho: &Array1<f64>,
-    warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: &crate::types::RhoPrior,
-    eval_mode: EvalMode,
-) -> Result<OuterObjectiveEvalResult, String> {
-    if !layout.has_tied_coordinates() {
-        return outerobjectivegradienthessian_internal(
-            family,
-            specs,
-            options,
-            &layout.penalty_counts,
-            rho,
-            warm_start,
-            rho_prior.clone(),
-            eval_mode,
-        );
-    }
-
-    let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
-    let physical_warm_start = warm_start.map(|seed| {
-        let mut seed = seed.clone();
-        seed.rho = physical_rho.clone();
-        seed
-    });
-    let mut result = outerobjectivegradienthessian_internal(
-        family,
-        specs,
-        options,
-        &layout.penalty_counts,
-        &physical_rho,
-        physical_warm_start.as_ref(),
-        crate::types::RhoPrior::Flat,
-        eval_mode,
-    )?;
-    result.gradient = aggregate_labeled_gradient(&result.gradient, layout)?;
-    result.outer_hessian = match result.outer_hessian.materialize_dense()? {
-        Some(hessian) => crate::solver::outer_strategy::HessianResult::Analytic(
-            aggregate_labeled_hessian(&hessian, layout)?,
-        ),
-        None => crate::solver::outer_strategy::HessianResult::Unavailable,
-    };
-    result.warm_start.rho = rho.clone();
-    add_labeled_rho_prior_to_outer_eval(result, rho, rho_prior, eval_mode)
-}
-
 #[cfg(test)]
 fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
@@ -16049,7 +14983,6 @@ fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     penalty_counts: &[usize],
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: crate::types::RhoPrior,
 ) -> Result<
     (
         crate::solver::outer_strategy::EfsEval,
@@ -17659,10 +16592,27 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 && batch.trace_h_inv_hdot.len() == expected
                 && batch.trace_s_pinv_sdot.len() == expected
             {
-                if eval_mode == EvalMode::ValueAndGradient {
-                    if let Some(joint_bundle_value_only) = build_joint_hessian_closures(
-                        family,
-                        &inner.block_states,
+                if let Some(joint_bundle_value_only) = build_joint_hessian_closures(
+                    family,
+                    &inner.block_states,
+                    specs,
+                    total,
+                    options,
+                    inner.joint_workspace.clone(),
+                )? {
+                    let JointHessianBundle {
+                        source: h_joint_unpen,
+                        beta_flat,
+                        compute_dh,
+                        compute_d2h,
+                        owned_compute_dh: _,
+                        owned_compute_d2h: _,
+                        rho_curvature_scale,
+                        hessian_logdet_correction,
+                        ..
+                    } = joint_bundle_value_only;
+                    let value_only = joint_outer_evaluate(
+                        &inner,
                         specs,
                         total,
                         options,
@@ -17765,9 +16715,13 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         };
                         gradient[j] = batch.objective_theta[j] + trace_term - det_term;
                     }
-                    batched_gradient_override = Some(gradient);
-                    batched_first_order_trace_skip =
-                        include_logdet_h.then(|| batch.trace_h_inv_hdot.clone());
+                    return Ok(OuterObjectiveEvalResult {
+                        objective: value_only.objective,
+                        gradient,
+                        outer_hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
+                        warm_start: value_only.warm_start,
+                        inner_converged: inner.converged,
+                    });
                 }
             }
         }
@@ -20018,14 +18972,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         log::info!(
             "[OUTER] custom family: skipping smoothing outer solve for explicit one-cycle inner probe"
         );
-        let per_block = split_labeled_log_lambdas(&rho0, &label_layout)?;
-        let mut inner = inner_blockwise_fit(
-            family,
-            specs,
-            &per_block,
-            options,
-            persistent_warm_start.as_ref(),
-        )?;
+        let per_block = split_log_lambdas(&rho0, &penalty_counts)?;
+        let mut inner = inner_blockwise_fit(family, specs, &per_block, options, None)?;
         refresh_all_block_etas(family, specs, &mut inner.block_states)
             .map_err(CustomFamilyError::Optimization)?;
         let penalized_objective = checked_penalizedobjective(
@@ -20043,15 +18991,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             "custom-family explicit one-cycle inner probe",
         )
         .map_err(CustomFamilyError::Optimization)?;
-        let rho0_physical = expand_labeled_log_lambdas(&rho0, &label_layout)?;
-        let lambdas = rho0_physical.mapv(f64::exp);
+        let lambdas = rho0.mapv(f64::exp);
         let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
-        let warm_start = constrained_warm_start_from_inner(&rho0, &inner);
-        store_persistent_custom_family_warm_start(
-            persistent_warm_start_key.as_deref(),
-            specs,
-            &warm_start,
-        );
         return blockwise_fit_from_parts(
             BlockwiseFitResultParts {
                 block_states: inner.block_states,
@@ -20062,8 +19003,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 stable_penalty_term: 2.0 * inner.penalty_value,
                 penalized_objective,
                 outer_iterations: 0,
-                // No outer optimization ran — there is no gradient to report.
-                outer_gradient_norm: None,
+                outer_gradient_norm: 0.0,
                 inner_cycles: inner.cycles,
                 outer_converged: inner.converged,
                 geometry: None,
@@ -20131,7 +19071,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     let problem = OuterProblem::new(n_rho)
         .with_gradient(cap_gradient)
         .with_hessian(hessian.into())
-        .with_disable_fixed_point(multi_block_beta_dependent || label_layout.has_tied_coordinates())
+        .with_disable_fixed_point(multi_block_beta_dependent)
         .with_fallback_policy(fallback_policy)
         .with_tolerance(options.outer_tol)
         .with_max_iter(outer_max_iter)
@@ -20204,12 +19144,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             },
         ) {
             Ok(eval) if !eval.inner_converged => {
-                update_custom_outer_inner_cap_from_warm_start(
-                    &outer_options,
-                    &eval.warm_start,
-                    None,
-                    &mut outer.initial_gradient_norm,
-                );
                 outer.warm_cache = Some(eval.warm_start.clone());
                 outer.last_error = Some("custom-family inner solve did not converge".to_string());
                 return Err(EstimationError::RemlOptimizationFailed(
@@ -20292,7 +19226,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             // exact-Hessian families, forcing every inner solve to start from
             // scratch (5-10 Newton steps instead of 1-2 with warm start).
             let warm_ref = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
-            match outerobjectivegradienthessian_labeled(
+            match outerobjectivegradienthessian_internal(
                 family,
                 specs,
                 &outer_options,
@@ -20303,29 +19237,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 EvalMode::ValueOnly,
             ) {
                 Ok(eval) if eval.inner_converged && eval.objective.is_finite() => {
-                    let warm_start = eval.warm_start;
-                    update_custom_outer_inner_cap_from_warm_start(
-                        &outer_options,
-                        &warm_start,
-                        None,
-                        &mut outer.initial_gradient_norm,
-                    );
-                    store_persistent_custom_family_warm_start(
-                        persistent_warm_start_key.as_deref(),
-                        specs,
-                        &warm_start,
-                    );
-                    outer.warm_cache = Some(warm_start);
+                    outer.warm_cache = Some(eval.warm_start);
                     outer.last_error = None;
                     Ok(eval.objective)
                 }
                 Ok(eval) => {
-                    update_custom_outer_inner_cap_from_warm_start(
-                        &outer_options,
-                        &eval.warm_start,
-                        None,
-                        &mut outer.initial_gradient_norm,
-                    );
                     outer.warm_cache = Some(eval.warm_start);
                     outer.last_error = Some(
                         "custom-family value-only inner solve did not converge or objective was non-finite"
@@ -20377,28 +19293,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 rho_prior.clone(),
             ) {
                 Ok((eval, warm, true)) => {
-                    update_custom_outer_inner_cap_from_warm_start(
-                        &outer_options,
-                        &warm,
-                        None,
-                        &mut outer.initial_gradient_norm,
-                    );
-                    store_persistent_custom_family_warm_start(
-                        persistent_warm_start_key.as_deref(),
-                        specs,
-                        &warm,
-                    );
                     outer.warm_cache = Some(warm);
                     outer.last_error = None;
                     Ok(eval)
                 }
                 Ok((_eval, warm, false)) => {
-                    update_custom_outer_inner_cap_from_warm_start(
-                        &outer_options,
-                        &warm,
-                        None,
-                        &mut outer.initial_gradient_norm,
-                    );
                     outer.warm_cache = Some(warm);
                     outer.last_error =
                         Some("custom-family EFS inner solve did not converge".to_string());

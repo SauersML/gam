@@ -3260,32 +3260,6 @@ impl HyperOperator for ImplicitHyperOperator {
         let xf = self.cached_xf(factor, cache);
         self.trace_projected_factor_with_xf(factor, xf.view())
     }
-
-    fn projected_matrix(&self, factor: &Array2<f64>) -> Array2<f64> {
-        debug_assert_eq!(factor.nrows(), self.p);
-        let n_obs = self.w_diag.len();
-        let rank = factor.ncols();
-        if rank == 0 || n_obs == 0 {
-            return Array2::<f64>::zeros((rank, rank));
-        }
-        let xf = self.compute_xf(factor);
-        self.projected_matrix_with_xf(factor, xf.view())
-    }
-
-    fn projected_matrix_cached(
-        &self,
-        factor: &Array2<f64>,
-        cache: &ProjectedFactorCache,
-    ) -> Array2<f64> {
-        debug_assert_eq!(factor.nrows(), self.p);
-        let n_obs = self.w_diag.len();
-        let rank = factor.ncols();
-        if rank == 0 || n_obs == 0 {
-            return Array2::<f64>::zeros((rank, rank));
-        }
-        let xf = self.cached_xf(factor, cache);
-        self.projected_matrix_with_xf(factor, xf.view())
-    }
 }
 
 impl ImplicitHyperOperator {
@@ -3304,48 +3278,18 @@ impl ImplicitHyperOperator {
         let chunk_rows = (TARGET_BYTES / ((self.p + rank).max(1) * 8))
             .max(512)
             .min(n_obs);
-        let num_chunks = (n_obs + chunk_rows - 1) / chunk_rows;
-        // Parallelize chunk traversal when we are not already inside a rayon
-        // worker (so we don't oversubscribe nested pools) and the work is
-        // large enough to amortize thread setup.
-        let use_parallel = num_chunks >= 2
-            && rayon::current_thread_index().is_none()
-            && (n_obs as u64) * (self.p as u64).max(1) >= 1_000_000;
-        if use_parallel {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            let chunks: Vec<(usize, Array2<f64>)> = (0..num_chunks)
-                .into_par_iter()
-                .map(|ci| {
-                    let start = ci * chunk_rows;
-                    let end = (start + chunk_rows).min(n_obs);
-                    let rows = self
-                        .x_design
-                        .try_row_chunk(start..end)
-                        .unwrap_or_else(|err| {
-                            panic!("ImplicitHyperOperator::compute_xf row chunk failed: {err}")
-                        });
-                    let block = crate::faer_ndarray::fast_ab(&rows, factor);
-                    (start, block)
-                })
-                .collect();
-            for (start, block) in chunks {
-                let end = start + block.nrows();
-                xf.slice_mut(ndarray::s![start..end, ..]).assign(&block);
-            }
-        } else {
-            let mut start = 0usize;
-            while start < n_obs {
-                let end = (start + chunk_rows).min(n_obs);
-                let rows = self
-                    .x_design
-                    .try_row_chunk(start..end)
-                    .unwrap_or_else(|err| {
-                        panic!("ImplicitHyperOperator::compute_xf row chunk failed: {err}")
-                    });
-                let block = crate::faer_ndarray::fast_ab(&rows, factor);
-                xf.slice_mut(ndarray::s![start..end, ..]).assign(&block);
-                start = end;
-            }
+        let mut start = 0usize;
+        while start < n_obs {
+            let end = (start + chunk_rows).min(n_obs);
+            let rows = self
+                .x_design
+                .try_row_chunk(start..end)
+                .unwrap_or_else(|err| {
+                    panic!("ImplicitHyperOperator::compute_xf row chunk failed: {err}")
+                });
+            let block = crate::faer_ndarray::fast_ab(&rows, factor);
+            xf.slice_mut(ndarray::s![start..end, ..]).assign(&block);
+            start = end;
         }
         xf
     }
@@ -3360,123 +3304,6 @@ impl ImplicitHyperOperator {
         let design_id = Arc::as_ptr(&self.x_design) as usize;
         let key = ProjectedFactorKey::from_factor_view(design_id, factor.view());
         cache.get_or_insert_with(key, || self.compute_xf(factor))
-    }
-
-    fn projected_chunk_contribution(
-        &self,
-        xf: ArrayView2<'_, f64>,
-        u_knot: &Array2<f64>,
-        w: &[f64],
-        c_opt: Option<&[f64]>,
-        rank: usize,
-        start: usize,
-        end: usize,
-    ) -> Array2<f64> {
-        let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
-        let kd_chunk = self
-            .implicit_deriv
-            .row_chunk_first_raw(self.axis, start..end)
-            .expect("radial scalar evaluation failed during implicit hyper projected_matrix");
-        let mut weighted_dxf = crate::faer_ndarray::fast_ab(&kd_chunk, u_knot);
-        for i_local in 0..(end - start) {
-            let w_i = w[start + i_local];
-            let mut row = weighted_dxf.row_mut(i_local);
-            for col in 0..rank {
-                row[col] *= w_i;
-            }
-        }
-        let m = crate::faer_ndarray::fast_atb(&weighted_dxf, &xf_chunk);
-        let mut partial = Array2::<f64>::zeros((rank, rank));
-        partial += &m;
-        partial += &m.t();
-        if let Some(c) = c_opt {
-            let mut weighted_xf = xf_chunk.to_owned();
-            for i_local in 0..(end - start) {
-                let c_i = c[start + i_local];
-                let mut row = weighted_xf.row_mut(i_local);
-                for col in 0..rank {
-                    row[col] *= c_i;
-                }
-            }
-            partial += &crate::faer_ndarray::fast_atb(&xf_chunk, &weighted_xf);
-        }
-        partial
-    }
-
-    fn trace_projected_chunk_reduction(
-        &self,
-        xf: ArrayView2<'_, f64>,
-        u_knot: &Array2<f64>,
-        w: &[f64],
-        c_opt: Option<&[f64]>,
-        rank: usize,
-        start: usize,
-        end: usize,
-    ) -> (f64, f64) {
-        let chunk_n = end - start;
-        let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
-        let kd_chunk = self
-            .implicit_deriv
-            .row_chunk_first_raw(self.axis, start..end)
-            .expect("radial scalar evaluation failed during trace chunk reduction");
-        let dxf_chunk = crate::faer_ndarray::fast_ab(&kd_chunk, u_knot);
-        let mut design_total = 0.0_f64;
-        let mut correction_total = 0.0_f64;
-        let dxf_slice_opt = if dxf_chunk.is_standard_layout() {
-            dxf_chunk.as_slice()
-        } else {
-            None
-        };
-        let xf_slice_opt = if xf_chunk.is_standard_layout() {
-            xf_chunk.as_slice()
-        } else {
-            None
-        };
-        if let (Some(dxf_slice), Some(xf_slice)) = (dxf_slice_opt, xf_slice_opt) {
-            for i_local in 0..chunk_n {
-                let i = start + i_local;
-                let w_i = w[i];
-                let off = i_local * rank;
-                let drow = &dxf_slice[off..off + rank];
-                let xrow = &xf_slice[off..off + rank];
-                let mut acc = 0.0_f64;
-                for k in 0..rank {
-                    acc += drow[k] * xrow[k];
-                }
-                design_total += w_i * acc;
-                if let Some(c) = c_opt {
-                    let c_i = c[i];
-                    let mut acc2 = 0.0_f64;
-                    for k in 0..rank {
-                        let v = xrow[k];
-                        acc2 += v * v;
-                    }
-                    correction_total += c_i * acc2;
-                }
-            }
-        } else {
-            for i_local in 0..chunk_n {
-                let i = start + i_local;
-                let w_i = w[i];
-                let dxf_row = dxf_chunk.row(i_local);
-                let xf_row = xf_chunk.row(i_local);
-                let mut acc = 0.0_f64;
-                for k in 0..rank {
-                    acc += dxf_row[k] * xf_row[k];
-                }
-                design_total += w_i * acc;
-                if let Some(c) = c_opt {
-                    let c_i = c[i];
-                    let mut acc2 = 0.0_f64;
-                    for k in 0..rank {
-                        let v = xf_row[k];
-                        acc2 += v * v;
-                    }
-                    correction_total += c_i * acc2;
-                }
-            }
-        }
-        (design_total, correction_total)
     }
 
     /// Evaluate `tr(Fᵀ B_d F)` given a precomputed `X · F`. Pulls every
@@ -3500,45 +3327,44 @@ impl ImplicitHyperOperator {
             .max(512)
             .min(n_obs);
 
-        let w_array = self.w_diag.as_ref();
-        let w = w_array
-            .as_slice()
-            .expect("w_diag must be contiguous for slice access");
-        let c_opt = self
-            .c_x_psi_beta
-            .as_ref()
-            .map(|arc| arc.as_slice().expect("c_x_psi_beta must be contiguous"));
-        let num_chunks = (n_obs + chunk_rows - 1) / chunk_rows;
-        let use_parallel = num_chunks >= 2
-            && rayon::current_thread_index().is_none()
-            && (n_obs as u64) * (rank as u64).max(1) >= 1_000_000;
-        let chunk_totals: Vec<(f64, f64)> = if use_parallel {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            (0..num_chunks)
-                .into_par_iter()
-                .map(|ci| {
-                    let start = ci * chunk_rows;
-                    let end = (start + chunk_rows).min(n_obs);
-                    self.trace_projected_chunk_reduction(xf, &u_knot, w, c_opt, rank, start, end)
-                })
-                .collect()
-        } else {
-            let mut totals = Vec::with_capacity(num_chunks);
-            let mut start = 0usize;
-            while start < n_obs {
-                let end = (start + chunk_rows).min(n_obs);
-                totals.push(
-                    self.trace_projected_chunk_reduction(xf, &u_knot, w, c_opt, rank, start, end),
-                );
-                start = end;
-            }
-            totals
-        };
+        let w = self.w_diag.as_ref();
+        let c_opt = self.c_x_psi_beta.as_ref().map(|arc| arc.as_ref());
         let mut design_total = 0.0_f64;
         let mut correction_total = 0.0_f64;
-        for (d, c) in chunk_totals {
-            design_total += d;
-            correction_total += c;
+        let mut start = 0usize;
+        while start < n_obs {
+            let end = (start + chunk_rows).min(n_obs);
+            let chunk_n = end - start;
+
+            // Cached-or-precomputed X·F slice for this chunk.
+            let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
+
+            // Raw kernel scalars for axis d on this chunk, then a single
+            // (chunk × n_knots) · (n_knots × rank) GEMM gives DXF_chunk.
+            let kd_chunk = self
+                .implicit_deriv
+                .row_chunk_first_raw(self.axis, start..end)
+                .expect("radial scalar evaluation failed during implicit hyper forward_mul_matrix");
+            let dxf_chunk = crate::faer_ndarray::fast_ab(&kd_chunk, &u_knot);
+
+            // Fused inner-product accumulation.
+            for i_local in 0..chunk_n {
+                let i = start + i_local;
+                let w_i = w[i];
+                let dxf_row = dxf_chunk.row(i_local);
+                let xf_row = xf_chunk.row(i_local);
+                for k in 0..rank {
+                    design_total += dxf_row[k] * w_i * xf_row[k];
+                }
+                if let Some(c) = c_opt {
+                    let c_i = c[i];
+                    for k in 0..rank {
+                        let v = xf_row[k];
+                        correction_total += c_i * v * v;
+                    }
+                }
+            }
+            start = end;
         }
 
         // Penalty trace: tr(F^T S_psi F) via dense BLAS3.
@@ -3546,352 +3372,6 @@ impl ImplicitHyperOperator {
         let penalty: f64 = factor.iter().zip(s_f.iter()).map(|(&f, &s)| f * s).sum();
 
         2.0 * design_total + correction_total + penalty
-    }
-
-    /// Exact `F^T B_d F` using the same cached `X · F` projection as the
-    /// scalar trace path. This avoids the default rank-many matrix-free
-    /// matvecs in dense-spectral outer-Hessian cross-trace assembly.
-    fn projected_matrix_with_xf(
-        &self,
-        factor: &Array2<f64>,
-        xf: ArrayView2<'_, f64>,
-    ) -> Array2<f64> {
-        let rank = factor.ncols();
-        let n_obs = self.w_diag.len();
-        debug_assert_eq!(xf.dim(), (n_obs, rank));
-
-        let u_knot = self.implicit_deriv.unproject_matrix(&factor.view());
-        const TARGET_BYTES: usize = 8 * 1024 * 1024;
-        let chunk_rows = (TARGET_BYTES / ((self.p + rank).max(1) * 8))
-            .max(512)
-            .min(n_obs);
-
-        let w_array = self.w_diag.as_ref();
-        let w = w_array
-            .as_slice()
-            .expect("w_diag must be contiguous for slice access");
-        let c_opt = self
-            .c_x_psi_beta
-            .as_ref()
-            .map(|arc| arc.as_slice().expect("c_x_psi_beta must be contiguous"));
-        let num_chunks = (n_obs + chunk_rows - 1) / chunk_rows;
-        let use_parallel = num_chunks >= 2
-            && rayon::current_thread_index().is_none()
-            && (n_obs as u64) * (rank as u64).max(1) >= 1_000_000;
-        let mut projected = if use_parallel {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            (0..num_chunks)
-                .into_par_iter()
-                .map(|ci| {
-                    let start = ci * chunk_rows;
-                    let end = (start + chunk_rows).min(n_obs);
-                    self.projected_chunk_contribution(xf, &u_knot, w, c_opt, rank, start, end)
-                })
-                .reduce(
-                    || Array2::<f64>::zeros((rank, rank)),
-                    |mut acc, partial| {
-                        acc += &partial;
-                        acc
-                    },
-                )
-        } else {
-            let mut projected = Array2::<f64>::zeros((rank, rank));
-            let mut start = 0usize;
-            while start < n_obs {
-                let end = (start + chunk_rows).min(n_obs);
-                let partial =
-                    self.projected_chunk_contribution(xf, &u_knot, w, c_opt, rank, start, end);
-                projected += &partial;
-                start = end;
-            }
-            projected
-        };
-
-        let s_f = crate::faer_ndarray::fast_ab(&self.s_psi, factor);
-        projected += &crate::faer_ndarray::fast_atb(factor, &s_f);
-        let projected_t = projected.t().to_owned();
-        projected += &projected_t;
-        projected.mapv_inplace(|value| 0.5 * value);
-        projected
-    }
-
-    /// Batched-axis sibling of [`Self::projected_matrix_with_xf`].
-    /// Shares `X · F`, raw radial row chunks, and chunk traversal across all
-    /// axes in the group; each axis still gets its exact own penalty and
-    /// optional third-derivative correction.
-    fn projected_matrix_all_axes_with_xf<'a>(
-        &self,
-        factor: &Array2<f64>,
-        xf: ArrayView2<'_, f64>,
-        axes: &[(usize, &'a Array2<f64>, Option<&'a Array1<f64>>)],
-    ) -> Vec<Array2<f64>> {
-        let n_axes = axes.len();
-        if n_axes == 0 {
-            return Vec::new();
-        }
-        let rank = factor.ncols();
-        let n_obs = self.w_diag.len();
-        debug_assert_eq!(xf.dim(), (n_obs, rank));
-
-        let u_knot = self.implicit_deriv.unproject_matrix(&factor.view());
-        const TARGET_BYTES: usize = 8 * 1024 * 1024;
-        let chunk_rows = (TARGET_BYTES / ((self.p + rank).max(1) * 8))
-            .max(512)
-            .min(n_obs);
-
-        let w_array = self.w_diag.as_ref();
-        let w = w_array
-            .as_slice()
-            .expect("w_diag must be contiguous for slice access");
-        let num_chunks = (n_obs + chunk_rows - 1) / chunk_rows;
-        let use_parallel = num_chunks >= 2
-            && rayon::current_thread_index().is_none()
-            && (n_obs as u64) * (rank as u64).max(1) >= 1_000_000;
-        let compute_chunk = |start: usize, end: usize| -> Vec<Array2<f64>> {
-            let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
-            let kd_all = self
-                .implicit_deriv
-                .row_chunk_first_raw_all_axes(start..end)
-                .expect("radial scalar evaluation failed during implicit hyper batched projected_matrix");
-            let mut wxf_chunk = xf_chunk.to_owned();
-            for i_local in 0..(end - start) {
-                let w_i = w[start + i_local];
-                let mut row = wxf_chunk.row_mut(i_local);
-                for col in 0..rank {
-                    row[col] *= w_i;
-                }
-            }
-            let mut local = (0..n_axes)
-                .map(|_| Array2::<f64>::zeros((rank, rank)))
-                .collect::<Vec<_>>();
-            for (slot, (axis, _, c_opt)) in axes.iter().enumerate() {
-                let kd_chunk = &kd_all[*axis];
-                let dxf_chunk = crate::faer_ndarray::fast_ab(kd_chunk, &u_knot);
-                let m = crate::faer_ndarray::fast_atb(&dxf_chunk, &wxf_chunk);
-                local[slot] += &m;
-                local[slot] += &m.t();
-                if let Some(c) = c_opt {
-                    let c_slice = c.as_slice().expect("c_x_psi_beta must be contiguous");
-                    let mut weighted_xf = xf_chunk.to_owned();
-                    for i_local in 0..(end - start) {
-                        let c_i = c_slice[start + i_local];
-                        let mut row = weighted_xf.row_mut(i_local);
-                        for col in 0..rank {
-                            row[col] *= c_i;
-                        }
-                    }
-                    local[slot] += &crate::faer_ndarray::fast_atb(&xf_chunk, &weighted_xf);
-                }
-            }
-            local
-        };
-        let mut out = if use_parallel {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            (0..num_chunks)
-                .into_par_iter()
-                .map(|ci| {
-                    let start = ci * chunk_rows;
-                    let end = (start + chunk_rows).min(n_obs);
-                    compute_chunk(start, end)
-                })
-                .reduce(
-                    || {
-                        (0..n_axes)
-                            .map(|_| Array2::<f64>::zeros((rank, rank)))
-                            .collect::<Vec<_>>()
-                    },
-                    |mut acc, partial| {
-                        for (a, p) in acc.iter_mut().zip(partial) {
-                            *a += &p;
-                        }
-                        acc
-                    },
-                )
-        } else {
-            let mut out = (0..n_axes)
-                .map(|_| Array2::<f64>::zeros((rank, rank)))
-                .collect::<Vec<_>>();
-            let mut start = 0usize;
-            while start < n_obs {
-                let end = (start + chunk_rows).min(n_obs);
-                let local = compute_chunk(start, end);
-                for (a, l) in out.iter_mut().zip(local) {
-                    *a += &l;
-                }
-                start = end;
-            }
-            out
-        };
-
-        for (slot, (_, s_psi, _)) in axes.iter().enumerate() {
-            let s_f = crate::faer_ndarray::fast_ab(s_psi, factor);
-            out[slot] += &crate::faer_ndarray::fast_atb(factor, &s_f);
-            let out_t = out[slot].t().to_owned();
-            out[slot] += &out_t;
-            out[slot].mapv_inplace(|value| 0.5 * value);
-        }
-
-        out
-    }
-
-    /// Batched-axis sibling of [`Self::trace_projected_factor_with_xf`].
-    /// For every `(axis, s_psi, c_x_psi_beta)` tuple in `axes`, returns
-    /// `tr(F^T B_d F)` using a single sweep through the design rows: each
-    /// chunk's radial scalars `(phi, q, r²)` are evaluated once via
-    /// `row_chunk_first_raw_all_axes`, then the per-axis `K_d · U_knot`
-    /// GEMM and fused inner products run inside that one row pass. Each
-    /// axis carries its own penalty matrix and (optional) third-derivative
-    /// correction vector so the per-axis result is numerically identical
-    /// (modulo accumulation order) to the existing per-axis path.
-    fn trace_projected_factor_all_axes_with_xf<'a>(
-        &self,
-        factor: &Array2<f64>,
-        xf: ArrayView2<'_, f64>,
-        axes: &[(usize, &'a Array2<f64>, Option<&'a Array1<f64>>)],
-    ) -> Vec<f64> {
-        let n_axes = axes.len();
-        if n_axes == 0 {
-            return Vec::new();
-        }
-        let rank = factor.ncols();
-        let n_obs = self.w_diag.len();
-        debug_assert_eq!(xf.dim(), (n_obs, rank));
-
-        let u_knot = self.implicit_deriv.unproject_matrix(&factor.view());
-
-        const TARGET_BYTES: usize = 8 * 1024 * 1024;
-        let chunk_rows = (TARGET_BYTES / ((self.p + rank).max(1) * 8))
-            .max(512)
-            .min(n_obs);
-
-        let w_array = self.w_diag.as_ref();
-        let w = w_array
-            .as_slice()
-            .expect("w_diag must be contiguous for slice access");
-        let num_chunks = (n_obs + chunk_rows - 1) / chunk_rows;
-        let use_parallel = num_chunks >= 2
-            && rayon::current_thread_index().is_none()
-            && (n_obs as u64) * (rank as u64).max(1) >= 1_000_000;
-        let compute_chunk = |start: usize, end: usize| -> (Vec<f64>, Vec<f64>) {
-            let chunk_n = end - start;
-            let xf_chunk = xf.slice(ndarray::s![start..end, ..]);
-            let kd_all = self
-                .implicit_deriv
-                .row_chunk_first_raw_all_axes(start..end)
-                .expect("radial scalar evaluation failed during implicit hyper batched trace");
-            let xf_slice_opt = if xf_chunk.is_standard_layout() {
-                xf_chunk.as_slice()
-            } else {
-                None
-            };
-            let mut design_local = vec![0.0_f64; n_axes];
-            let mut correction_local = vec![0.0_f64; n_axes];
-            for (slot, (axis, _, c_opt)) in axes.iter().enumerate() {
-                let kd_chunk = &kd_all[*axis];
-                let dxf_chunk = crate::faer_ndarray::fast_ab(kd_chunk, &u_knot);
-                let mut design_total = 0.0_f64;
-                let mut correction_total = 0.0_f64;
-                let dxf_slice_opt = if dxf_chunk.is_standard_layout() {
-                    dxf_chunk.as_slice()
-                } else {
-                    None
-                };
-                let c_slice_opt = c_opt.and_then(|c| c.as_slice());
-                if let (Some(dxf_slice), Some(xf_slice)) = (dxf_slice_opt, xf_slice_opt) {
-                    for i_local in 0..chunk_n {
-                        let i = start + i_local;
-                        let w_i = w[i];
-                        let off = i_local * rank;
-                        let drow = &dxf_slice[off..off + rank];
-                        let xrow = &xf_slice[off..off + rank];
-                        let mut acc = 0.0_f64;
-                        for k in 0..rank {
-                            acc += drow[k] * xrow[k];
-                        }
-                        design_total += w_i * acc;
-                        if let Some(c) = c_slice_opt {
-                            let c_i = c[i];
-                            let mut acc2 = 0.0_f64;
-                            for k in 0..rank {
-                                let v = xrow[k];
-                                acc2 += v * v;
-                            }
-                            correction_total += c_i * acc2;
-                        }
-                    }
-                } else {
-                    for i_local in 0..chunk_n {
-                        let i = start + i_local;
-                        let w_i = w[i];
-                        let dxf_row = dxf_chunk.row(i_local);
-                        let xf_row = xf_chunk.row(i_local);
-                        let mut acc = 0.0_f64;
-                        for k in 0..rank {
-                            acc += dxf_row[k] * xf_row[k];
-                        }
-                        design_total += w_i * acc;
-                        if let Some(c) = c_opt {
-                            let c_i = c[i];
-                            let mut acc2 = 0.0_f64;
-                            for k in 0..rank {
-                                let v = xf_row[k];
-                                acc2 += v * v;
-                            }
-                            correction_total += c_i * acc2;
-                        }
-                    }
-                }
-                design_local[slot] = design_total;
-                correction_local[slot] = correction_total;
-            }
-            (design_local, correction_local)
-        };
-        let (design_totals, correction_totals) = if use_parallel {
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            (0..num_chunks)
-                .into_par_iter()
-                .map(|ci| {
-                    let start = ci * chunk_rows;
-                    let end = (start + chunk_rows).min(n_obs);
-                    compute_chunk(start, end)
-                })
-                .reduce(
-                    || (vec![0.0_f64; n_axes], vec![0.0_f64; n_axes]),
-                    |(mut da, mut ca), (db, cb)| {
-                        for (a, b) in da.iter_mut().zip(db) {
-                            *a += b;
-                        }
-                        for (a, b) in ca.iter_mut().zip(cb) {
-                            *a += b;
-                        }
-                        (da, ca)
-                    },
-                )
-        } else {
-            let mut design_totals = vec![0.0_f64; n_axes];
-            let mut correction_totals = vec![0.0_f64; n_axes];
-            let mut start = 0usize;
-            while start < n_obs {
-                let end = (start + chunk_rows).min(n_obs);
-                let (d_local, c_local) = compute_chunk(start, end);
-                for (a, b) in design_totals.iter_mut().zip(d_local) {
-                    *a += b;
-                }
-                for (a, b) in correction_totals.iter_mut().zip(c_local) {
-                    *a += b;
-                }
-                start = end;
-            }
-            (design_totals, correction_totals)
-        };
-
-        let mut out = Vec::with_capacity(n_axes);
-        for (slot, (_axis, s_psi, _)) in axes.iter().enumerate() {
-            let s_f = s_psi.dot(factor);
-            let penalty: f64 = factor.iter().zip(s_f.iter()).map(|(&f, &s)| f * s).sum();
-            out.push(2.0 * design_totals[slot] + correction_totals[slot] + penalty);
-        }
-        out
     }
 
     fn accumulate_c_correction_xt_into(
@@ -7303,87 +6783,29 @@ pub fn reml_laml_evaluate(
             (rho_v_ks, ext_v_is)
         }
     };
-    if let Some(rho_vs) = rho_v_ks.as_ref() {
-        for (coord_idx, response) in rho_vs.iter().enumerate() {
-            if let Some((entry_idx, value)) = response
-                .iter()
-                .enumerate()
-                .find(|(_, value)| !value.is_finite())
-            {
-                return Err(RemlError::NonFiniteValue {
-                    reason: format!(
-                        "REML/LAML rho mode response contains non-finite entry: \
-                         coord={coord_idx} entry={entry_idx} value={value}"
-                    ),
-                }
-                .into());
-            }
-        }
-    }
-    for (coord_idx, response) in ext_v_is.iter().enumerate() {
-        if let Some((entry_idx, value)) = response
-            .iter()
-            .enumerate()
-            .find(|(_, value)| !value.is_finite())
-        {
-            return Err(RemlError::NonFiniteValue {
-                reason: format!(
-                    "REML/LAML extended-coordinate mode response contains non-finite entry: \
-                     coord={coord_idx} entry={entry_idx} value={value}"
-                ),
-            }
-            .into());
-        }
-    }
-    let rho_mode_response_cols = rho_v_ks
-        .as_deref()
-        .filter(|vectors| !vectors.is_empty())
-        .map(mode_response_columns);
-    let ext_mode_response_cols = (!ext_v_is.is_empty()).then(|| mode_response_columns(&ext_v_is));
-    let coord_corrections: Vec<Option<DriftDerivResult>> = if need_family_corrections {
+    let rho_corrections: Vec<Option<DriftDerivResult>> = if effective_deriv.has_corrections() {
         let rho_vs = rho_v_ks
             .as_ref()
             .expect("rho mode responses required for Hessian corrections");
-        let mut correction_vs = Vec::with_capacity(k + ext_dim);
-        correction_vs.extend(rho_vs.iter().cloned());
-        correction_vs.extend(ext_v_is.iter().cloned());
         let correction_work = solution
             .n_observations
             .saturating_mul(hop.dim())
-            .saturating_mul((k + ext_dim).max(1));
-        // Small coefficient systems produce bounded-size correction operators;
-        // keep their independent row contractions parallel even at large n.
-        let correction_parallel_work_limit = if hop.dim() <= 512 {
-            1_000_000_000
-        } else {
-            64_000_000
-        };
-        let parallel_corrections = correction_work <= correction_parallel_work_limit;
-        if effective_deriv.has_batched_hessian_derivative_corrections() {
-            log::info!(
-                "[STAGE] reml_laml coord_corrections mode=batched k={} ext_dim={} n={} dim={} work={}",
-                k,
-                ext_dim,
-                solution.n_observations,
-                hop.dim(),
-                correction_work
-            );
-            effective_deriv.hessian_derivative_corrections_result(&correction_vs)?
-        } else if parallel_corrections {
-            correction_vs
+            .saturating_mul(k.max(1));
+        let parallel_corrections = correction_work <= 64_000_000;
+        if parallel_corrections {
+            rho_vs
                 .par_iter()
                 .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
                 .collect::<Result<Vec<_>, _>>()?
         } else {
             log::info!(
-                "[STAGE] reml_laml coord_corrections mode=serial k={} ext_dim={} n={} dim={} work={}",
+                "[STAGE] reml_laml rho_corrections mode=serial k={} n={} dim={} work={}",
                 k,
-                ext_dim,
                 solution.n_observations,
                 hop.dim(),
                 correction_work
             );
-            correction_vs
+            rho_vs
                 .iter()
                 .map(|v_k| effective_deriv.hessian_derivative_correction_result(v_k))
                 .collect::<Result<Vec<_>, _>>()?

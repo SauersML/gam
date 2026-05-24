@@ -4251,25 +4251,10 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
     let blands_threshold = BLANDS_RULE_GRACE * (p + 1);
     let max_iters = 8 * (p + 1);
     let mut d_free = Array1::<f64>::zeros(p);
-    // Hoist active-set scratch buffers above the pivot loop. Each pivot used
-    // to allocate Array2<f64>::zeros((n_free, n_free)) (≈70 MB for p≈3000),
-    // an Array1<f64>::zeros(n_free), and two Vec<usize>. We now keep them at
-    // the maximum possible size (p) and reslice/refill in place per pivot.
-    let mut h_ff_buf = Array2::<f64>::zeros((p, p));
-    let mut g_f_buf = Array1::<f64>::zeros(p);
-    let mut free_idx: Vec<usize> = Vec::with_capacity(p);
-    let mut active_idx: Vec<usize> = Vec::with_capacity(p);
     for it in 0..max_iters {
         let use_blands = it >= blands_threshold;
-        free_idx.clear();
-        active_idx.clear();
-        for i in 0..p {
-            if active[i] {
-                active_idx.push(i);
-            } else {
-                free_idx.push(i);
-            }
-        }
+        let free_idx: Vec<usize> = (0..p).filter(|&i| !active[i]).collect();
+        let active_idx: Vec<usize> = (0..p).filter(|&i| active[i]).collect();
         direction_out.fill(0.0);
         for &i in &active_idx {
             let lb = lower_bounds[i];
