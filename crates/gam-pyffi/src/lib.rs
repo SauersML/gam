@@ -64,7 +64,7 @@ use gam::terms::basis::{
 };
 use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
 use gam::terms::latent_coord::{
-    AuxPriorFamily, InputLocationDerivative, LatentCoordValues, LatentIdMode, aux_prior_targets,
+    AuxPriorFamily, LatentCoordValues, LatentIdMode, aux_prior_targets,
 };
 use gam::terms::sae_manifold::{
     AssignmentMode, GumbelTemperatureSchedule, SaeAtomBasisKind, SaeManifoldRho, ScheduleKind,
@@ -3812,6 +3812,47 @@ fn latent_basis_kind(value: &str) -> Result<&'static str, String> {
     }
 }
 
+fn radial_input_location_jet(
+    t_mat: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    phi_r: ArrayView2<'_, f64>,
+) -> Result<Array3<f64>, String> {
+    if phi_r.dim() != (t_mat.nrows(), centers.nrows()) {
+        return Err(format!(
+            "radial derivative shape {:?} does not match t/centers ({}, {})",
+            phi_r.dim(),
+            t_mat.nrows(),
+            centers.nrows()
+        ));
+    }
+    if t_mat.ncols() != centers.ncols() {
+        return Err(format!(
+            "radial derivative dimension mismatch: t has {} cols, centers has {}",
+            t_mat.ncols(),
+            centers.ncols()
+        ));
+    }
+    let mut out = Array3::<f64>::zeros((t_mat.nrows(), centers.nrows(), t_mat.ncols()));
+    for n in 0..t_mat.nrows() {
+        for k in 0..centers.nrows() {
+            let mut r2 = 0.0;
+            for a in 0..t_mat.ncols() {
+                let delta = t_mat[[n, a]] - centers[[k, a]];
+                r2 += delta * delta;
+            }
+            let r = r2.sqrt();
+            if r <= 1.0e-12 {
+                continue;
+            }
+            let scale = phi_r[[n, k]] / r;
+            for a in 0..t_mat.ncols() {
+                out[[n, k, a]] = scale * (t_mat[[n, a]] - centers[[k, a]]);
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn latent_input_location_jet(
     basis_kind: &str,
     t_mat: ArrayView2<'_, f64>,
@@ -3821,17 +3862,12 @@ fn latent_input_location_jet(
     tensor_knot_offsets: Option<&[usize]>,
     tensor_degrees: Option<&[usize]>,
 ) -> Result<Array3<f64>, String> {
-    let latent = LatentCoordValues::from_matrix(t_mat, LatentIdMode::None);
     match latent_basis_kind(basis_kind)? {
         "duchon" => {
             let nullspace_order = duchon_nullspace_from_m(m);
             let phi_r = duchon_radial_first_derivative_nd(t_mat, centers, None, nullspace_order)
                 .map_err(|err| err.to_string())?;
-            let radial_jet =
-                latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Radial {
-                    kernel_first_derivative: phi_r.view(),
-                    centers,
-                });
+            let radial_jet = radial_input_location_jet(t_mat, centers, phi_r.view())?;
             let poly_jet = duchon_polynomial_first_derivative_nd(t_mat, nullspace_order);
             let n_rows = radial_jet.shape()[0];
             let n_radial = radial_jet.shape()[1];
@@ -3870,19 +3906,14 @@ fn latent_input_location_jet(
             let phi_r =
                 matern_radial_first_derivative_nd(t_mat, centers, 1.0, MaternNu::ThreeHalves)
                     .map_err(|err| err.to_string())?;
-            Ok(
-                latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Radial {
-                    kernel_first_derivative: phi_r.view(),
-                    centers,
-                }),
-            )
+            radial_input_location_jet(t_mat, centers, phi_r.view())
         }
         "sphere" => {
             // Fixes audit-revised claim that sphere latent derivatives are
             // analytic jets, not unsupported hooks.
             let jet = sphere_first_derivative_nd(t_mat, centers, m, true)
                 .map_err(|err| err.to_string())?;
-            Ok(latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Jet(jet.view())))
+            Ok(jet)
         }
         "bspline_tensor" => {
             let knots = tensor_knots_concat.ok_or_else(|| {
@@ -3900,7 +3931,7 @@ fn latent_input_location_jet(
                 .collect::<Vec<_>>();
             let jet = bspline_tensor_first_derivative(t_mat, &per_axis_views, degrees)
                 .map_err(|err| err.to_string())?;
-            Ok(latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Jet(jet.view())))
+            Ok(jet)
         }
         "periodic_bspline" => {
             // Fixes audit-revised claim that periodic latent derivatives are
@@ -3922,7 +3953,7 @@ fn latent_input_location_jet(
             }
             let jet = periodic_bspline_first_derivative_nd(t_mat, (lo, hi), m, centers.nrows())
                 .map_err(|err| err.to_string())?;
-            Ok(latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Jet(jet.view())))
+            Ok(jet)
         }
         other => Err(format!(
             "latent_basis_kind returned an unknown normalized kind: {other}"
@@ -5512,7 +5543,8 @@ fn gaussian_reml_fit_latent_backward<'py>(
         backward.clone()
     };
     let grad_x = &backward_for_t.grad_x;
-    let mut grad_t = LatentCoordValues::contract_gradient(grad_x.view(), &jet);
+    let mut grad_t =
+        contract_input_loc_gradient(grad_x.view(), &jet).map_err(|err| py_value_error(err.to_string()))?;
     if grad_reml_score != 0.0 {
         add_latent_outer_reml_score_gradient(
             &mut grad_t,
