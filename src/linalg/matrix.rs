@@ -1781,7 +1781,8 @@ impl LinearOperator for ReparamOperator {
             out += &fast_av(pen, vector);
         }
         if ridge > 0.0 {
-            out += &vector.mapv(|x| ridge * x);
+            // BLAS axpy: out += ridge * vector, no temporary allocation.
+            out.scaled_add(ridge, vector);
         }
         out
     }
@@ -2692,7 +2693,8 @@ impl LinearOperator for BlockDesignOperator {
             out += &fast_av(pen, vector);
         }
         if ridge > 0.0 {
-            out += &vector.mapv(|x| ridge * x);
+            // BLAS axpy: out += ridge * vector, no temporary allocation.
+            out.scaled_add(ridge, vector);
         }
         out
     }
@@ -5232,7 +5234,8 @@ pub trait LinearOperator {
             out += &fast_av(pen, vector);
         }
         if ridge > 0.0 {
-            out += &vector.mapv(|x| ridge * x);
+            // BLAS axpy: out += ridge * vector, no temporary allocation.
+            out.scaled_add(ridge, vector);
         }
         out
     }

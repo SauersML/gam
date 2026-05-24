@@ -136,6 +136,26 @@ const LEVERAGE_PERCENTILES: [f64; 3] = [0.50, 0.95, 0.99];
 const ALO_DENOMINATOR_MIN: f64 = 1e-12;
 const MULTIBLOCK_ALO_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
+/// Relative tolerance for accepting the input penalised Hessian `H` as
+/// symmetric. We require `|H_ij − H_ji| ≤ HESSIAN_SYMMETRY_REL_TOL ·
+/// max(|H_ij|, |H_ji|, 1)`. `1e-8` matches the loosest tolerance any
+/// upstream symmetrisation pass leaves on the matrix and is tight enough
+/// that a genuinely asymmetric Hessian (a real bug) is caught.
+const HESSIAN_SYMMETRY_REL_TOL: f64 = 1e-8;
+
+/// Diagonal ridge added to the local block precision when its LU pivot is
+/// below [`LU_PIVOT_SINGULAR_TOL`]. Matches the legacy `eps = 1e-6`
+/// regularisation in the prior `det_small < 1e-12` branch — bumping the
+/// determinant of `I − W A` (or `I − A W`) safely off zero without
+/// perturbing well-conditioned blocks.
+const ALO_LOCAL_BLOCK_RIDGE: f64 = 1e-6;
+
+/// Pivot magnitude below which [`lu_factor_in_place`] reports the block
+/// `I − W A` as singular and triggers the ridge-regularised refactor.
+/// Equivalent to the original `det_small < 1e-12` test on the unfactored
+/// determinant.
+const LU_PIVOT_SINGULAR_TOL: f64 = 1e-12;
+
 #[inline]
 fn percentile_index(sample_size: usize, quantile: f64) -> usize {
     if sample_size <= 1 {
@@ -650,13 +670,12 @@ fn validate_alo_solve_setup(input: &AloInput, n: usize, p: usize) -> Result<(), 
             reason: "ALO diagnostics require a finite dense exact penalized Hessian".to_string(),
         });
     }
-    let sym_tol = 1e-8;
     for i in 0..p {
         for j in 0..i {
             let a = h[[i, j]];
             let b = h[[j, i]];
             let scale = a.abs().max(b.abs()).max(1.0);
-            if (a - b).abs() > sym_tol * scale {
+            if (a - b).abs() > HESSIAN_SYMMETRY_REL_TOL * scale {
                 return Err(AloError::InvalidInput {
                     reason: format!(
                         "ALO diagnostics require a symmetric dense exact penalized Hessian; entries ({i},{j}) and ({j},{i}) differ by {:.3e}",
@@ -1129,7 +1148,7 @@ fn compute_multiblock_alo_chunk(
                 }
             }
             for d in 0..b {
-                scratch.imwa[d * b + d] += 1e-6;
+                scratch.imwa[d * b + d] += ALO_LOCAL_BLOCK_RIDGE;
             }
             std::hint::black_box(lu_factor_in_place(
                 &mut scratch.imwa,
@@ -1146,7 +1165,7 @@ fn compute_multiblock_alo_chunk(
                 }
             }
             for d in 0..b {
-                scratch.imaw[d * b + d] += 1e-6;
+                scratch.imaw[d * b + d] += ALO_LOCAL_BLOCK_RIDGE;
             }
             std::hint::black_box(lu_factor_in_place(
                 &mut scratch.imaw,
@@ -1291,7 +1310,7 @@ fn lu_factor_in_place(m: &mut [f64], perm: &mut [usize], b: usize) -> bool {
                 max_idx = row;
             }
         }
-        if max_val < 1e-12 {
+        if max_val < LU_PIVOT_SINGULAR_TOL {
             return false;
         }
         if max_idx != col {
