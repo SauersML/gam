@@ -65,6 +65,12 @@ pub enum SurvivalPredictError {
     /// produced a non-finite or out-of-domain value that downstream code
     /// cannot consume.
     NumericalFailure { reason: String },
+    /// Saved-model validation failed below this prediction layer; the model
+    /// source error keeps its own payload/schema category.
+    ModelPayload {
+        context: &'static str,
+        source: crate::inference::model::FittedModelError,
+    },
 }
 
 impl std::fmt::Display for SurvivalPredictError {
@@ -75,11 +81,25 @@ impl std::fmt::Display for SurvivalPredictError {
             | SurvivalPredictError::IncompatibleSchema { reason }
             | SurvivalPredictError::UnsupportedConfiguration { reason }
             | SurvivalPredictError::NumericalFailure { reason } => f.write_str(reason),
+            SurvivalPredictError::ModelPayload { context, source } => {
+                write!(f, "{context}: {source}")
+            }
         }
     }
 }
 
-impl std::error::Error for SurvivalPredictError {}
+impl std::error::Error for SurvivalPredictError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            SurvivalPredictError::ModelPayload { source, .. } => Some(source),
+            SurvivalPredictError::InvalidInput { .. }
+            | SurvivalPredictError::MissingFitMetadata { .. }
+            | SurvivalPredictError::IncompatibleSchema { .. }
+            | SurvivalPredictError::UnsupportedConfiguration { .. }
+            | SurvivalPredictError::NumericalFailure { .. } => None,
+        }
+    }
+}
 
 impl From<SurvivalPredictError> for String {
     fn from(err: SurvivalPredictError) -> String {

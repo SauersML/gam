@@ -9058,7 +9058,12 @@ fn write_negative_binomial_log_working_state(
                     let eta_i = eta_raw.clamp(-700.0, 700.0);
                     let mu_i = eta_i.exp().max(MIN_MU);
                     let denom = theta + mu_i;
-                    let raw_weight = priorweights[i].max(0.0) * theta * mu_i / denom;
+                    let negbin_weight = if theta > mu_i {
+                        mu_i / (1.0 + mu_i / theta)
+                    } else {
+                        theta / (1.0 + theta / mu_i)
+                    };
+                    let raw_weight = priorweights[i].max(0.0) * negbin_weight;
                     let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
                     *mu_o = mu_i;
                     *w_o = if raw_weight > 0.0 {
@@ -9090,7 +9095,12 @@ fn write_negative_binomial_log_working_state(
             .for_each(|(i, ((mu_o, w_o), z_o))| {
                 let eta_i = eta[i].clamp(-700.0, 700.0);
                 let mu_i = eta_i.exp().max(MIN_MU);
-                let raw_weight = priorweights[i].max(0.0) * theta * mu_i / (theta + mu_i);
+                let negbin_weight = if theta > mu_i {
+                    mu_i / (1.0 + mu_i / theta)
+                } else {
+                    theta / (1.0 + theta / mu_i)
+                };
+                let raw_weight = priorweights[i].max(0.0) * negbin_weight;
                 *mu_o = mu_i;
                 *w_o = if raw_weight > 0.0 {
                     raw_weight.max(MIN_WEIGHT)
@@ -9972,7 +9982,12 @@ fn computeworkingweight_derivatives_from_eta(
                         let eta_used = eta_raw.clamp(-700.0, 700.0);
                         let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
                         let denom = theta + jet.mu;
-                        let raw_weight = priorweights[i].max(0.0) * theta * jet.mu / denom;
+                        let negbin_weight = if theta > jet.mu {
+                            jet.mu / (1.0 + jet.mu / theta)
+                        } else {
+                            theta / (1.0 + theta / jet.mu)
+                        };
+                        let raw_weight = priorweights[i].max(0.0) * negbin_weight;
                         let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
                         if eta_raw != eta_used || floor_active {
                             *c_o = 0.0;

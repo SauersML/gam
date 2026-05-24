@@ -28522,10 +28522,7 @@ mod tests {
         };
         let constrained = BSplineBasisSpec {
             identifiability: BSplineIdentifiability::RemoveLinearTrend,
-            boundary_condition: Default::default(),
-            ..raw.clone(),
-            boundary_conditions: BSplineBoundaryConditions::default(),
-            boundary: OneDimensionalBoundary::Open,
+            ..raw.clone()
         };
 
         let b_raw = build_bspline_basis_1d(x.view(), &raw).unwrap();

@@ -694,45 +694,48 @@ fn streaming_sparse_csc_xt_diag_x(
     let par = faer::get_global_parallelism();
     let mut x_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
     let mut wx_chunk = Array2::<f64>::zeros((chunk_rows, p).f());
-    let mut out_view = array2_to_matmut(out);
 
-    for start in (0..n).step_by(chunk_rows) {
-        let rows = (n - start).min(chunk_rows);
-        {
-            let mut x_slice = x_chunk.slice_mut(s![0..rows, ..]);
-            let mut wx_slice = wx_chunk.slice_mut(s![0..rows, ..]);
-            x_slice.fill(0.0);
-            wx_slice.fill(0.0);
-            let end = start + rows;
-            for col in 0..p {
-                let col_start = col_ptr[col];
-                let col_end = col_ptr[col + 1];
-                let rows_for_col = &row_idx[col_start..col_end];
-                let local_start = rows_for_col.partition_point(|&row| row < start);
-                let local_end = rows_for_col.partition_point(|&row| row < end);
-                for local_ptr in local_start..local_end {
-                    let ptr = col_start + local_ptr;
-                    let row = row_idx[ptr];
-                    let local = row - start;
-                    let wi = weights[row];
-                    let value = vals[ptr];
-                    x_slice[[local, col]] += value;
-                    wx_slice[[local, col]] += wi * value;
+    {
+        let mut out_view = array2_to_matmut(out);
+
+        for start in (0..n).step_by(chunk_rows) {
+            let rows = (n - start).min(chunk_rows);
+            {
+                let mut x_slice = x_chunk.slice_mut(s![0..rows, ..]);
+                let mut wx_slice = wx_chunk.slice_mut(s![0..rows, ..]);
+                x_slice.fill(0.0);
+                wx_slice.fill(0.0);
+                let end = start + rows;
+                for col in 0..p {
+                    let col_start = col_ptr[col];
+                    let col_end = col_ptr[col + 1];
+                    let rows_for_col = &row_idx[col_start..col_end];
+                    let local_start = rows_for_col.partition_point(|&row| row < start);
+                    let local_end = rows_for_col.partition_point(|&row| row < end);
+                    for local_ptr in local_start..local_end {
+                        let ptr = col_start + local_ptr;
+                        let row = row_idx[ptr];
+                        let local = row - start;
+                        let wi = weights[row];
+                        let value = vals[ptr];
+                        x_slice[[local, col]] += value;
+                        wx_slice[[local, col]] += wi * value;
+                    }
                 }
             }
+            let x_slice = x_chunk.slice(s![0..rows, ..]);
+            let wx_slice = wx_chunk.slice(s![0..rows, ..]);
+            let x_view = FaerArrayView::new(&x_slice);
+            let wx_view = FaerArrayView::new(&wx_slice);
+            matmul(
+                out_view.as_mut(),
+                Accum::Add,
+                x_view.as_ref().transpose(),
+                wx_view.as_ref(),
+                1.0,
+                par,
+            );
         }
-        let x_slice = x_chunk.slice(s![0..rows, ..]);
-        let wx_slice = wx_chunk.slice(s![0..rows, ..]);
-        let x_view = FaerArrayView::new(&x_slice);
-        let wx_view = FaerArrayView::new(&wx_slice);
-        matmul(
-            out_view.as_mut(),
-            Accum::Add,
-            x_view.as_ref().transpose(),
-            wx_view.as_ref(),
-            1.0,
-            par,
-        );
     }
 }
 
@@ -6013,58 +6016,61 @@ fn streaming_blas_xt_diag_x(x: &Array2<f64>, weights: &Array1<f64>, out: &mut Ar
     // forced the inner write loop to skip by `chunk_rows` between
     // columns, defeating cache + vectorization.
     let mut wx_chunk = Array2::<f64>::zeros((chunk_rows, p));
-    let mut out_view = array2_to_matmut(out);
 
     let x_is_row_major = x.is_standard_layout();
     let weights_slice_opt = weights.as_slice();
 
-    for start in (0..n).step_by(chunk_rows) {
-        let rows = (n - start).min(chunk_rows);
-        {
-            let chunk_slice = wx_chunk
-                .as_slice_mut()
-                .expect("row-major chunk is contiguous");
-            if x_is_row_major
-                && let Some(x_slice_all) = x.as_slice()
-                && let Some(w_slice) = weights_slice_opt
+    {
+        let mut out_view = array2_to_matmut(out);
+
+        for start in (0..n).step_by(chunk_rows) {
+            let rows = (n - start).min(chunk_rows);
             {
-                // Fast path: scale row-major X directly via raw slices.
-                for local in 0..rows {
-                    let src = start + local;
-                    let wi = w_slice[src];
-                    let src_off = src * p;
-                    let dst_off = local * p;
-                    let src_row = &x_slice_all[src_off..src_off + p];
-                    let dst_row = &mut chunk_slice[dst_off..dst_off + p];
-                    for col in 0..p {
-                        dst_row[col] = src_row[col] * wi;
+                let chunk_slice = wx_chunk
+                    .as_slice_mut()
+                    .expect("row-major chunk is contiguous");
+                if x_is_row_major
+                    && let Some(x_slice_all) = x.as_slice()
+                    && let Some(w_slice) = weights_slice_opt
+                {
+                    // Fast path: scale row-major X directly via raw slices.
+                    for local in 0..rows {
+                        let src = start + local;
+                        let wi = w_slice[src];
+                        let src_off = src * p;
+                        let dst_off = local * p;
+                        let src_row = &x_slice_all[src_off..src_off + p];
+                        let dst_row = &mut chunk_slice[dst_off..dst_off + p];
+                        for col in 0..p {
+                            dst_row[col] = src_row[col] * wi;
+                        }
                     }
-                }
-            } else {
-                for local in 0..rows {
-                    let src = start + local;
-                    let wi = weights[src];
-                    let xrow = x.row(src);
-                    let dst_off = local * p;
-                    let dst_row = &mut chunk_slice[dst_off..dst_off + p];
-                    for (col, xij) in xrow.iter().enumerate() {
-                        dst_row[col] = xij * wi;
+                } else {
+                    for local in 0..rows {
+                        let src = start + local;
+                        let wi = weights[src];
+                        let xrow = x.row(src);
+                        let dst_off = local * p;
+                        let dst_row = &mut chunk_slice[dst_off..dst_off + p];
+                        for (col, xij) in xrow.iter().enumerate() {
+                            dst_row[col] = xij * wi;
+                        }
                     }
                 }
             }
+            let x_slice = x.slice(s![start..start + rows, ..]);
+            let wx_slice = wx_chunk.slice(s![0..rows, ..]);
+            let x_view = FaerArrayView::new(&x_slice);
+            let wx_view = FaerArrayView::new(&wx_slice);
+            matmul(
+                out_view.as_mut(),
+                Accum::Add,
+                x_view.as_ref().transpose(),
+                wx_view.as_ref(),
+                1.0,
+                par,
+            );
         }
-        let x_slice = x.slice(s![start..start + rows, ..]);
-        let wx_slice = wx_chunk.slice(s![0..rows, ..]);
-        let x_view = FaerArrayView::new(&x_slice);
-        let wx_view = FaerArrayView::new(&wx_slice);
-        matmul(
-            out_view.as_mut(),
-            Accum::Add,
-            x_view.as_ref().transpose(),
-            wx_view.as_ref(),
-            1.0,
-            par,
-        );
     }
 }
 
@@ -7640,7 +7646,10 @@ mod tests {
     fn reparam_operator_rejects_incompatible_transform_shape() {
         let x = array![[1.0, 2.0], [0.5, -1.0]];
         let qs = Arc::new(Array2::<f64>::zeros((3, 1)));
-        let _ = ReparamOperator::new(DesignMatrix::Dense(DenseDesignMatrix::from(x)), qs);
+        drop(ReparamOperator::new(
+            DesignMatrix::Dense(DenseDesignMatrix::from(x)),
+            qs,
+        ));
     }
 
     #[test]
@@ -7751,7 +7760,7 @@ mod tests {
         // until something exercises it, so `as_dense_ref` would otherwise
         // return None before the first hot call.
         let probe = Array1::from_elem(3, 1.0);
-        let _ = dense_design.apply_transpose(&probe);
+        drop(dense_design.apply_transpose(&probe));
 
         let dense_ref = dense_design
             .as_dense_ref()
@@ -7782,7 +7791,7 @@ mod tests {
         let dense_design = DenseDesignMatrix::from(Arc::new(op));
 
         let probe = Array1::from_elem(3, 1.0);
-        let _ = dense_design.apply_transpose(&probe);
+        drop(dense_design.apply_transpose(&probe));
 
         let dense_ref = dense_design
             .as_dense_ref()
@@ -7824,7 +7833,7 @@ mod tests {
     #[should_panic(expected = "DesignMatrix::as_dense_cow called on operator-backed design")]
     fn design_matrix_as_dense_cow_rejects_operator_backed_designs() {
         let design = no_densify_design(array![[1.0, 2.0], [3.0, 4.0]]);
-        let _ = design.as_dense_cow();
+        drop(design.as_dense_cow());
     }
 
     #[test]
