@@ -309,8 +309,7 @@ impl VectorLikelihood for GaussianVectorLikelihood {
         out
     }
 
-    fn hess_diag(&self, eta: ArrayView2<f64>, y: ArrayView2<f64>) -> Array2<f64> {
-        std::hint::black_box(y);
+    fn hess_diag(&self, eta: ArrayView2<f64>, _y: ArrayView2<f64>) -> Array2<f64> {
         // −∂² log p / ∂η² = w · (diag(d) + F·Fᵀ); the diagonal of (F·Fᵀ)
         // at output m is Σ_k F[m, k]². Cross terms F[m, k]·F[m', k] live in
         // the dense rank-r correction returned by `hess_full` (only exposed

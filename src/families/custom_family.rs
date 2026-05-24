@@ -593,12 +593,16 @@ pub fn realize_coefficient_groups_for_custom_family(
             prior.validate(&format!("coefficient group '{}'", group.label))?;
         }
         if let Some(initial) = group.initial_log_precision
-            && !initial.is_finite() {
-                return Err(CustomFamilyError::DimensionMismatch { reason: format!(
+            && !initial.is_finite()
+        {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
                     "coefficient group '{}' initial log precision must be finite, got {initial}",
                     group.label
-                ) }.into());
+                ),
             }
+            .into());
+        }
     }
 
     let mut realized_groups = Vec::<RealizedCoefficientGroup>::with_capacity(groups.len());
@@ -944,11 +948,118 @@ impl ExactOuterDerivativeOrder {
 /// the outer optimizer should see the exact second-order objective. Runtime
 /// representation choices (dense vs operator) belong below this declaration,
 /// not in a first-order downgrade.
+fn debug_assert_hook_blockspecs(specs: &[ParameterBlockSpec], context: &str) {
+    debug_assert!(
+        validate_blockspecs(specs).is_ok(),
+        "{context}: invalid parameter block specs"
+    );
+}
+
+fn debug_assert_hook_options(options: &BlockwiseFitOptions, context: &str) {
+    debug_assert!(
+        options.inner_tol.is_finite() && options.inner_tol >= 0.0,
+        "{context}: inner_tol must be finite and non-negative"
+    );
+    debug_assert!(
+        options.outer_tol.is_finite() && options.outer_tol >= 0.0,
+        "{context}: outer_tol must be finite and non-negative"
+    );
+    debug_assert!(
+        options.minweight.is_finite() && options.minweight >= 0.0,
+        "{context}: minweight must be finite and non-negative"
+    );
+    debug_assert!(
+        options.ridge_floor.is_finite() && options.ridge_floor >= 0.0,
+        "{context}: ridge_floor must be finite and non-negative"
+    );
+    if let Some(threshold) = options.early_exit_threshold {
+        debug_assert!(
+            threshold.is_finite(),
+            "{context}: early_exit_threshold must be finite"
+        );
+    }
+}
+
+fn debug_assert_hook_states_match_specs(
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    context: &str,
+) {
+    debug_assert_eq!(
+        states.len(),
+        specs.len(),
+        "{context}: state/spec block count mismatch"
+    );
+    for (block, (state, spec)) in states.iter().zip(specs).enumerate() {
+        debug_assert_eq!(
+            state.beta.len(),
+            spec.design.ncols(),
+            "{context}: beta length mismatch in block {block}"
+        );
+        debug_assert_eq!(
+            state.eta.len(),
+            spec.design.nrows(),
+            "{context}: eta length mismatch in block {block}"
+        );
+    }
+}
+
+fn debug_assert_hook_derivative_blocks_match_specs(
+    derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+    specs: &[ParameterBlockSpec],
+    context: &str,
+) {
+    debug_assert_eq!(
+        derivative_blocks.len(),
+        specs.len(),
+        "{context}: derivative/spec block count mismatch"
+    );
+}
+
+fn debug_assert_hook_rho_matches_specs(
+    rho: &Array1<f64>,
+    specs: &[ParameterBlockSpec],
+    context: &str,
+) {
+    let expected = specs
+        .iter()
+        .map(|spec| spec.penalties.len())
+        .sum::<usize>();
+    debug_assert_eq!(
+        rho.len(),
+        expected,
+        "{context}: rho length does not match penalty count"
+    );
+}
+
+fn debug_assert_hook_workspace_arc(
+    hessian_workspace: &Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+    context: &str,
+) {
+    if let Some(workspace) = hessian_workspace.as_ref() {
+        debug_assert!(
+            Arc::strong_count(workspace) > 0,
+            "{context}: workspace Arc invariant violated"
+        );
+    }
+}
+
+fn debug_assert_psi_axis_index(axis: usize, context: &str) {
+    debug_assert!(
+        axis.checked_add(1).is_some(),
+        "{context}: axis index overflow"
+    );
+}
+
 pub fn exact_outer_order_from_capability(
-    _specs: &[ParameterBlockSpec],
-    _coefficient_cost: u64,
+    specs: &[ParameterBlockSpec],
+    coefficient_cost: u64,
 ) -> ExactOuterDerivativeOrder {
-    ExactOuterDerivativeOrder::Second
+    debug_assert_hook_blockspecs(specs, "exact outer derivative order");
+    match coefficient_cost {
+        0 => ExactOuterDerivativeOrder::Second,
+        _ => ExactOuterDerivativeOrder::Second,
+    }
 }
 
 /// Capability-aware variant of [`exact_outer_order_from_capability`].
@@ -959,9 +1070,17 @@ pub fn exact_outer_order_from_capability(
 pub fn exact_outer_order_with_outer_hvp(
     specs: &[ParameterBlockSpec],
     coefficient_cost: u64,
-    _outer_hyper_hessian_hvp_available: bool,
+    outer_hyper_hessian_hvp_available: bool,
 ) -> ExactOuterDerivativeOrder {
-    exact_outer_order_from_capability(specs, coefficient_cost)
+    if outer_hyper_hessian_hvp_available {
+        debug_assert_hook_blockspecs(specs, "exact outer derivative order with HVP");
+        match coefficient_cost {
+            0 => ExactOuterDerivativeOrder::Second,
+            _ => ExactOuterDerivativeOrder::Second,
+        }
+    } else {
+        exact_outer_order_from_capability(specs, coefficient_cost)
+    }
 }
 
 /// Realized outer-derivative policy at the current problem size.
@@ -1293,9 +1412,11 @@ pub trait CustomFamily {
     /// independently through `BlockwiseFitOptions::cache_session`.
     fn persistent_warm_start_fingerprint(
         &self,
-        _specs: &[ParameterBlockSpec],
-        _options: &BlockwiseFitOptions,
+        specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
     ) -> Option<String> {
+        debug_assert_hook_blockspecs(specs, "persistent warm-start fingerprint");
+        debug_assert_hook_options(options, "persistent warm-start fingerprint");
         None
     }
 
@@ -1328,8 +1449,9 @@ pub trait CustomFamily {
     fn log_likelihood_only_with_options(
         &self,
         block_states: &[ParameterBlockState],
-        _options: &BlockwiseFitOptions,
+        options: &BlockwiseFitOptions,
     ) -> Result<f64, String> {
+        debug_assert_hook_options(options, "log_likelihood_only_with_options");
         self.log_likelihood_only(block_states)
     }
 
@@ -1798,8 +1920,9 @@ pub trait CustomFamily {
         &self,
         states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        _options: &BlockwiseFitOptions,
+        options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
+        debug_assert_hook_options(options, "exact Newton joint Hessian workspace");
         self.exact_newton_joint_hessian_workspace(states, specs)
     }
 
@@ -1812,10 +1935,13 @@ pub trait CustomFamily {
     /// log-likelihood was evaluated at the same coefficient state.
     fn joint_line_search_log_likelihood_workspace(
         &self,
-        _states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
-        _options: &BlockwiseFitOptions,
+        states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
     ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
+        debug_assert_hook_blockspecs(specs, "joint line-search workspace");
+        debug_assert_hook_states_match_specs(states, specs, "joint line-search workspace");
+        debug_assert_hook_options(options, "joint line-search workspace");
         Ok(None)
     }
 
@@ -1848,13 +1974,23 @@ pub trait CustomFamily {
     /// the generic path handle those cases.
     fn batched_outer_gradient_terms(
         &self,
-        _block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
-        _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        _rho: &Array1<f64>,
-        _options: &BlockwiseFitOptions,
-        _hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        rho: &Array1<f64>,
+        options: &BlockwiseFitOptions,
+        hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
+        debug_assert_hook_blockspecs(specs, "batched outer gradient terms");
+        debug_assert_hook_states_match_specs(block_states, specs, "batched outer gradient terms");
+        debug_assert_hook_derivative_blocks_match_specs(
+            derivative_blocks,
+            specs,
+            "batched outer gradient terms",
+        );
+        debug_assert_hook_rho_matches_specs(rho, specs, "batched outer gradient terms");
+        debug_assert_hook_options(options, "batched outer gradient terms");
+        debug_assert_hook_workspace_arc(&hessian_workspace, "batched outer gradient terms");
         Ok(None)
     }
 
@@ -1869,12 +2005,21 @@ pub trait CustomFamily {
     /// `None` leaves unsupported families on their existing exact path.
     fn batched_outer_hessian_terms(
         &self,
-        _block_states: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
-        _derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        _rho: &Array1<f64>,
-        _hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        rho: &Array1<f64>,
+        hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterHessianTerms>, String> {
+        debug_assert_hook_blockspecs(specs, "batched outer Hessian terms");
+        debug_assert_hook_states_match_specs(block_states, specs, "batched outer Hessian terms");
+        debug_assert_hook_derivative_blocks_match_specs(
+            derivative_blocks,
+            specs,
+            "batched outer Hessian terms",
+        );
+        debug_assert_hook_rho_matches_specs(rho, specs, "batched outer Hessian terms");
+        debug_assert_hook_workspace_arc(&hessian_workspace, "batched outer Hessian terms");
         Ok(self
             .outer_hyper_hessian_operator(specs)
             .map(|operator| BatchedOuterHessianTerms {
@@ -1886,24 +2031,28 @@ pub trait CustomFamily {
     ///
     /// Kept separate from outer hyper-Hessian capabilities so CTN/GAMLSS row
     /// operators do not accidentally advertise pairwise θθ calculus as cheap.
-    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        debug_assert_hook_blockspecs(specs, "inner coefficient Hessian HVP availability");
         false
     }
 
-    fn inner_joint_workspace_gradient_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        debug_assert_hook_blockspecs(specs, "inner joint workspace gradient availability");
         false
     }
 
     fn inner_joint_workspace_log_likelihood_available(
         &self,
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
     ) -> bool {
+        debug_assert_hook_blockspecs(specs, "inner joint workspace log-likelihood availability");
         false
     }
 
     /// True only when the family has a real profiled outer Hessian-vector
     /// product over θ = (ρ, ψ), without enumerating all θ_i θ_j pairs.
-    fn outer_hyper_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn outer_hyper_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        debug_assert_hook_blockspecs(specs, "outer hyper-Hessian HVP availability");
         false
     }
 
@@ -1911,7 +2060,8 @@ pub trait CustomFamily {
     /// Generic custom-family pairwise derivative paths default to dense
     /// availability; families with only inner HVP support should override this
     /// if dense θθ assembly is not a valid capability for their path.
-    fn outer_hyper_hessian_dense_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    fn outer_hyper_hessian_dense_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        debug_assert_hook_blockspecs(specs, "outer hyper-Hessian dense availability");
         true
     }
 
@@ -1934,8 +2084,9 @@ pub trait CustomFamily {
     /// outer-HVP operators into the same surface.
     fn outer_hyper_hessian_operator(
         &self,
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
     ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+        debug_assert_hook_blockspecs(specs, "outer hyper-Hessian operator");
         None
     }
 
@@ -2453,8 +2604,9 @@ pub trait CustomFamily {
         states: &[ParameterBlockState],
         specs: &[ParameterBlockSpec],
         derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
-        _options: &BlockwiseFitOptions,
+        options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
+        debug_assert_hook_options(options, "exact Newton joint psi workspace");
         self.exact_newton_joint_psi_workspace(states, specs, derivs)
     }
 
@@ -4819,11 +4971,7 @@ pub(crate) fn build_block_spatial_psi_derivatives(
             s_psi_psi_comp_rows[psi_idx] = penalty_indices
                 .iter()
                 .copied()
-                .zip(
-                    info.s_psi_psi_components_local
-                        .iter()
-                        .map(&embed_penalty),
-                )
+                .zip(info.s_psi_psi_components_local.iter().map(&embed_penalty))
                 .collect();
             if let (Some(gid), Some(cross_penalty_provider)) = (
                 info.aniso_group_id,
@@ -4890,14 +5038,16 @@ impl CustomFamilyPsiDesignAction {
             .into());
         }
         if let Some(op) = deriv.implicit_operator.as_ref()
-            && op.n_data() == total_rows && op.p_out() == p {
-                return Ok(Self {
-                    operator: Arc::clone(op),
-                    axis: deriv.implicit_axis,
-                    row_range,
-                    p,
-                });
-            }
+            && op.n_data() == total_rows
+            && op.p_out() == p
+        {
+            return Ok(Self {
+                operator: Arc::clone(op),
+                axis: deriv.implicit_axis,
+                row_range,
+                p,
+            });
+        }
         Err(CustomFamilyError::UnsupportedConfiguration { reason: format!(
             "{label} is missing an implicit x_psi operator with shape {}x{}; got dense payload {}x{} instead",
             total_rows,
@@ -5697,13 +5847,15 @@ pub(crate) fn resolve_custom_family_x_psi_map(
 
     // Prefer operator action when dimensions match.
     if let Some(op) = deriv.implicit_operator.as_ref()
-        && op.n_data() == n && op.p_out() == p {
-            return Ok(PsiDesignMap::First {
-                action: CustomFamilyPsiDesignAction::from_first_derivative(
-                    deriv, n, p, row_range, label,
-                )?,
-            });
-        }
+        && op.n_data() == n
+        && op.p_out() == p
+    {
+        return Ok(PsiDesignMap::First {
+            action: CustomFamilyPsiDesignAction::from_first_derivative(
+                deriv, n, p, row_range, label,
+            )?,
+        });
+    }
 
     // Dense fallback guarded by policy.
     if deriv.x_psi.nrows() == n && deriv.x_psi.ncols() == p {
@@ -5777,34 +5929,36 @@ pub(crate) fn resolve_custom_family_x_psi_psi_map(
 
     // Prefer operator action when dimensions match.
     if let Some(op) = deriv_i.implicit_operator.as_ref()
-        && op.n_data() == n && op.p_out() == p {
-            let same_group = deriv_i.implicit_group_id.is_some()
-                && deriv_i.implicit_group_id == deriv_j.implicit_group_id;
-            if !same_group {
+        && op.n_data() == n
+        && op.p_out() == p
+    {
+        let same_group = deriv_i.implicit_group_id.is_some()
+            && deriv_i.implicit_group_id == deriv_j.implicit_group_id;
+        if !same_group {
+            return Ok(PsiDesignMap::Zero {
+                nrows: row_range.end - row_range.start,
+                ncols: p,
+            });
+        }
+        match CustomFamilyPsiSecondDesignAction::from_second_derivative(
+            deriv_i,
+            deriv_j,
+            n,
+            p,
+            row_range.clone(),
+            label,
+        )? {
+            Some(action) => {
+                return Ok(PsiDesignMap::Second { action });
+            }
+            None => {
                 return Ok(PsiDesignMap::Zero {
                     nrows: row_range.end - row_range.start,
                     ncols: p,
                 });
             }
-            match CustomFamilyPsiSecondDesignAction::from_second_derivative(
-                deriv_i,
-                deriv_j,
-                n,
-                p,
-                row_range.clone(),
-                label,
-            )? {
-                Some(action) => {
-                    return Ok(PsiDesignMap::Second { action });
-                }
-                None => {
-                    return Ok(PsiDesignMap::Zero {
-                        nrows: row_range.end - row_range.start,
-                        ncols: p,
-                    });
-                }
-            }
         }
+    }
 
     // Dense fallback guarded by policy, reading from the per-second-derivative
     // slot `x_psi_psi[local_j]` if provided.
@@ -6860,9 +7014,10 @@ fn add_labeled_rho_prior_to_outer_eval(
         result.gradient += &gradient;
     }
     if eval_mode == EvalMode::ValueGradientHessian
-        && let Some(prior_hessian) = hessian {
-            result.outer_hessian.add_rho_block_dense(&prior_hessian)?;
-        }
+        && let Some(prior_hessian) = hessian
+    {
+        result.outer_hessian.add_rho_block_dense(&prior_hessian)?;
+    }
     Ok(result)
 }
 
@@ -8207,9 +8362,10 @@ fn try_cholesky_with_escalating_ridge<R>(
             }
         }
         if let Ok(chol) = candidate.cholesky(Side::Lower)
-            && let Some(r) = on_success(&chol, attempt, boost) {
-                return Some((r, boost, attempt));
-            }
+            && let Some(r) = on_success(&chol, attempt, boost)
+        {
+            return Some((r, boost, attempt));
+        }
         boost *= growth;
     }
     None
@@ -8279,8 +8435,7 @@ fn penalty_logdet_cholesky_fallback(
     .into())
 }
 
-fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, dim: usize) -> RidgeDeterminantMode {
-    std::hint::black_box(dim);
+fn resolved_ridge_determinant_mode(ridge_policy: RidgePolicy, _dim: usize) -> RidgeDeterminantMode {
     match ridge_policy.determinant_mode {
         RidgeDeterminantMode::Auto => RidgeDeterminantMode::Full,
         mode => mode,
@@ -8316,9 +8471,9 @@ fn inverse_spdwith_retry(
     if max_retry > 0
         && let Some((inv, _, _)) =
             try_cholesky_with_escalating_ridge(&sym, baseridge, max_retry, 10.0, invert_via_chol)
-        {
-            return Ok(inv);
-        }
+    {
+        return Ok(inv);
+    }
 
     Err(CustomFamilyError::BasisDecompositionFailed {
         reason: "failed to invert SPD system after Cholesky ridge retries".to_string(),
@@ -9419,12 +9574,13 @@ fn exact_newton_dh_closure<'a, F: CustomFamily + Sync>(
         }
 
         if let Some(workspace) = workspace.as_ref()
-            && let Some(operator) = workspace.directional_derivative_operator(v_k)? {
-                return Ok(Some(scale_drift_deriv_result(
-                    DriftDerivResult::Operator(operator),
-                    scale,
-                )));
-            }
+            && let Some(operator) = workspace.directional_derivative_operator(v_k)?
+        {
+            return Ok(Some(scale_drift_deriv_result(
+                DriftDerivResult::Operator(operator),
+                scale,
+            )));
+        }
 
         match family.exact_newton_joint_hessian_directional_derivative_with_specs(
             synced_states.as_ref(),
@@ -9511,12 +9667,13 @@ fn exact_newton_d2h_closure<'a, F: CustomFamily + Sync>(
         }
 
         if let Some(workspace) = workspace.as_ref()
-            && let Some(operator) = workspace.second_directional_derivative_operator(u, v)? {
-                return Ok(Some(scale_drift_deriv_result(
-                    DriftDerivResult::Operator(operator),
-                    scale,
-                )));
-            }
+            && let Some(operator) = workspace.second_directional_derivative_operator(u, v)?
+        {
+            return Ok(Some(scale_drift_deriv_result(
+                DriftDerivResult::Operator(operator),
+                scale,
+            )));
+        }
 
         match family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
             synced_states.as_ref(),
@@ -9574,12 +9731,13 @@ fn exact_newton_dh_closure_owned<F: CustomFamily + Clone + Send + Sync + 'static
         }
 
         if let Some(workspace) = workspace.as_ref()
-            && let Some(operator) = workspace.directional_derivative_operator(v_k)? {
-                return Ok(Some(scale_drift_deriv_result(
-                    DriftDerivResult::Operator(operator),
-                    scale,
-                )));
-            }
+            && let Some(operator) = workspace.directional_derivative_operator(v_k)?
+        {
+            return Ok(Some(scale_drift_deriv_result(
+                DriftDerivResult::Operator(operator),
+                scale,
+            )));
+        }
 
         match family.exact_newton_joint_hessian_directional_derivative_with_specs(
             synced_states.as_ref(),
@@ -9657,12 +9815,13 @@ fn exact_newton_d2h_closure_owned<F: CustomFamily + Clone + Send + Sync + 'stati
         }
 
         if let Some(workspace) = workspace.as_ref()
-            && let Some(operator) = workspace.second_directional_derivative_operator(u, v)? {
-                return Ok(Some(scale_drift_deriv_result(
-                    DriftDerivResult::Operator(operator),
-                    scale,
-                )));
-            }
+            && let Some(operator) = workspace.second_directional_derivative_operator(u, v)?
+        {
+            return Ok(Some(scale_drift_deriv_result(
+                DriftDerivResult::Operator(operator),
+                scale,
+            )));
+        }
 
         match family.exact_newton_joint_hessian_second_directional_derivative_with_specs(
             synced_states.as_ref(),
@@ -10759,9 +10918,10 @@ fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'sta
             specs,
             workspace_options,
         )?
-        && let Some(log_likelihood) = workspace.joint_log_likelihood_evaluation()? {
-            return Ok((log_likelihood, Some(workspace)));
-        }
+        && let Some(log_likelihood) = workspace.joint_log_likelihood_evaluation()?
+    {
+        return Ok((log_likelihood, Some(workspace)));
+    }
     family
         .log_likelihood_only_with_options(states, line_search_options)
         .map(|log_likelihood| (log_likelihood, None))
@@ -11942,14 +12102,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         cached_active_sets =
                             scatter_joint_active_set(joint_active_set, &block_constraints);
                     }
-                    // Record the Newton-model predicted decrease at this
-                    // `predicted_reduction` would be the natural quantity
-                    // for an end-of-cycle Conn-Gould-Toint Theorem 6.4.6
-                    // stopping test, but the existing convergence path
-                    // already consults the realized objective change and
-                    // gradient residual instead. Drop the value so its
-                    // computation is not silently wasted.
-                    std::hint::black_box(predicted_reduction);
                     accepted = true;
                     break;
                 }
@@ -16960,82 +17112,82 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                     total,
                     options,
                     inner.joint_workspace.clone(),
-                )? {
-                    let mut gradient = Array1::<f64>::zeros(expected);
-                    for j in 0..expected {
-                        let trace_term = if include_logdet_h {
-                            0.5 * batch.trace_h_inv_hdot[j]
-                        } else {
-                            0.0
-                        };
-                        let det_term = if include_logdet_s {
-                            0.5 * batch.trace_s_pinv_sdot[j]
-                        } else {
-                            0.0
-                        };
-                        gradient[j] = batch.objective_theta[j] + trace_term - det_term;
-                    }
-                    if eval_mode == EvalMode::ValueGradientHessian {
-                        batched_gradient_override = Some(gradient);
+                )?
+            {
+                let mut gradient = Array1::<f64>::zeros(expected);
+                for j in 0..expected {
+                    let trace_term = if include_logdet_h {
+                        0.5 * batch.trace_h_inv_hdot[j]
                     } else {
-                        let JointHessianBundle {
-                            source: h_joint_unpen,
-                            beta_flat,
-                            compute_dh,
-                            compute_dh_many,
-                            compute_d2h,
-                            compute_d2h_many,
-                            owned_compute_dh: _,
-                            owned_compute_dh_many: _,
-                            owned_compute_d2h: _,
-                            owned_compute_d2h_many: _,
-                            rho_curvature_scale,
-                            hessian_logdet_correction,
-                        } = joint_bundle_value_only;
-                        let value_only = joint_outer_evaluate(
-                            &inner,
-                            specs,
-                            &per_block,
-                            rho_current,
-                            &beta_flat,
-                            h_joint_unpen,
-                            &ranges,
-                            total,
-                            ridge,
-                            moderidge,
-                            extra_logdet_ridge,
-                            rho_curvature_scale,
-                            hessian_logdet_correction,
-                            include_logdet_h,
-                            include_logdet_s,
-                            strict_spd,
-                            family.exact_newton_joint_hessian_beta_dependent(),
-                            EvalMode::ValueOnly,
-                            options,
-                            crate::types::RhoPrior::Flat,
-                            family.pseudo_logdet_mode(),
-                            compute_dh.as_ref(),
-                            compute_dh_many.as_deref(),
-                            compute_d2h.as_ref(),
-                            compute_d2h_many.as_deref(),
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )?;
-                        return Ok(OuterObjectiveEvalResult {
-                            objective: value_only.objective,
-                            gradient,
-                            outer_hessian:
-                                crate::solver::outer_strategy::HessianResult::Unavailable,
-                            warm_start: value_only.warm_start,
-                            inner_converged: inner.converged,
-                        });
-                    }
+                        0.0
+                    };
+                    let det_term = if include_logdet_s {
+                        0.5 * batch.trace_s_pinv_sdot[j]
+                    } else {
+                        0.0
+                    };
+                    gradient[j] = batch.objective_theta[j] + trace_term - det_term;
                 }
+                if eval_mode == EvalMode::ValueGradientHessian {
+                    batched_gradient_override = Some(gradient);
+                } else {
+                    let JointHessianBundle {
+                        source: h_joint_unpen,
+                        beta_flat,
+                        compute_dh,
+                        compute_dh_many,
+                        compute_d2h,
+                        compute_d2h_many,
+                        owned_compute_dh: _,
+                        owned_compute_dh_many: _,
+                        owned_compute_d2h: _,
+                        owned_compute_d2h_many: _,
+                        rho_curvature_scale,
+                        hessian_logdet_correction,
+                    } = joint_bundle_value_only;
+                    let value_only = joint_outer_evaluate(
+                        &inner,
+                        specs,
+                        &per_block,
+                        rho_current,
+                        &beta_flat,
+                        h_joint_unpen,
+                        &ranges,
+                        total,
+                        ridge,
+                        moderidge,
+                        extra_logdet_ridge,
+                        rho_curvature_scale,
+                        hessian_logdet_correction,
+                        include_logdet_h,
+                        include_logdet_s,
+                        strict_spd,
+                        family.exact_newton_joint_hessian_beta_dependent(),
+                        EvalMode::ValueOnly,
+                        options,
+                        crate::types::RhoPrior::Flat,
+                        family.pseudo_logdet_mode(),
+                        compute_dh.as_ref(),
+                        compute_dh_many.as_deref(),
+                        compute_d2h.as_ref(),
+                        compute_d2h_many.as_deref(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )?;
+                    return Ok(OuterObjectiveEvalResult {
+                        objective: value_only.objective,
+                        gradient,
+                        outer_hessian: crate::solver::outer_strategy::HessianResult::Unavailable,
+                        warm_start: value_only.warm_start,
+                        inner_converged: inner.converged,
+                    });
+                }
+            }
         }
     }
 
@@ -17109,9 +17261,10 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
 
         let mut eval_result = eval_result;
         if let Some(batched_grad) = batched_gradient_override.take()
-            && batched_grad.len() == eval_result.gradient.len() {
-                eval_result.gradient = batched_grad;
-            }
+            && batched_grad.len() == eval_result.gradient.len()
+        {
+            eval_result.gradient = batched_grad;
+        }
         return Ok(eval_result);
     }
 
@@ -17158,13 +17311,15 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             hessian,
         } => {
             if hessian.nrows() != p || hessian.ncols() != p {
-                return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                    "block {b} exact-newton Hessian shape mismatch in outer gradient: got {}x{}, expected {}x{}",
-                    hessian.nrows(),
-                    hessian.ncols(),
-                    p,
-                    p
-                ) });
+                return Err(CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "block {b} exact-newton Hessian shape mismatch in outer gradient: got {}x{}, expected {}x{}",
+                        hessian.nrows(),
+                        hessian.ncols(),
+                        p,
+                        p
+                    ),
+                });
             }
             hessian.to_dense()
         }

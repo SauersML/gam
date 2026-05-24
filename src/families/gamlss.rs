@@ -376,9 +376,9 @@ fn dense_block_or_operator<'a>(
     if dense_bytes <= budget_bytes
         && let Ok(arc) = design
             .try_to_dense_with_policy(&policy.material_policy(), "gamlss dense_block_or_operator")
-        {
-            return DenseOrOperator::Owned(arc.as_ref().clone());
-        }
+    {
+        return DenseOrOperator::Owned(arc.as_ref().clone());
+    }
 
     DenseOrOperator::Operator(design.clone())
 }
@@ -4093,9 +4093,7 @@ fn binomial_neglog_q_derivatives_probit_closed_form(
     y: f64,
     weight: f64,
     q: f64,
-    mu: f64,
 ) -> (f64, f64, f64) {
-    std::hint::black_box(mu);
     // Closed-form derivatives for F_i(q) = -w_i[y log Phi(q) + (1-y) log(1-Phi(q))].
     // Uses stable Mills ratios instead of `phi / mu` divisions. In the
     // incompatible separated tail (for example y=0, q>>0), `phi(q)` underflows
@@ -4124,13 +4122,7 @@ fn binomial_neglog_q_derivatives_probit_closed_form(
 }
 
 #[inline]
-fn binomial_neglog_q_fourth_derivative_probit_closed_form(
-    y: f64,
-    weight: f64,
-    q: f64,
-    mu: f64,
-) -> f64 {
-    std::hint::black_box(mu);
+fn binomial_neglog_q_fourth_derivative_probit_closed_form(y: f64, weight: f64, q: f64) -> f64 {
     // Closed-form m4 for F_i(q) = -w_i[y log Phi(q) + (1-y) log(1-Phi(q))].
     // Stability (Issue 5): see binomial_neglog_q_derivatives_probit_closed_form.
     if weight == 0.0 || !q.is_finite() {
@@ -4435,7 +4427,7 @@ fn binomial_neglog_q_derivatives_dispatch(
     link_kind: &InverseLink,
 ) -> (f64, f64, f64) {
     if binomial_link_has_closed_form(link_kind) {
-        return binomial_neglog_q_derivatives_closed_form_dispatch(y, weight, q, mu, link_kind);
+        return binomial_neglog_q_derivatives_closed_form_dispatch(y, weight, q, link_kind);
     }
     binomial_neglog_q_derivatives_from_jet(y, weight, mu, d1, d2, d3)
 }
@@ -4453,7 +4445,7 @@ fn binomial_neglog_q_fourth_derivative_dispatch(
 ) -> Result<f64, String> {
     if binomial_link_has_closed_form(link_kind) {
         return Ok(binomial_neglog_q_fourth_derivative_closed_form_dispatch(
-            y, weight, q, mu, link_kind,
+            y, weight, q, link_kind,
         ));
     }
     let d4 = inverse_link_pdffourth_derivative_for_inverse_link(link_kind, q)
@@ -4468,12 +4460,11 @@ fn binomial_neglog_q_derivatives_closed_form_dispatch(
     y: f64,
     weight: f64,
     q: f64,
-    mu: f64,
     link_kind: &InverseLink,
 ) -> (f64, f64, f64) {
     match link_kind {
         InverseLink::Standard(LinkFunction::Probit) => {
-            binomial_neglog_q_derivatives_probit_closed_form(y, weight, q, mu)
+            binomial_neglog_q_derivatives_probit_closed_form(y, weight, q)
         }
         InverseLink::Standard(LinkFunction::Logit) => {
             binomial_neglog_q_derivatives_logit_closed_form(y, weight, q)
@@ -4494,12 +4485,11 @@ fn binomial_neglog_q_fourth_derivative_closed_form_dispatch(
     y: f64,
     weight: f64,
     q: f64,
-    mu: f64,
     link_kind: &InverseLink,
 ) -> f64 {
     match link_kind {
         InverseLink::Standard(LinkFunction::Probit) => {
-            binomial_neglog_q_fourth_derivative_probit_closed_form(y, weight, q, mu)
+            binomial_neglog_q_fourth_derivative_probit_closed_form(y, weight, q)
         }
         InverseLink::Standard(LinkFunction::Logit) => {
             binomial_neglog_q_fourth_derivative_logit_closed_form(y, weight, q)
@@ -5533,9 +5523,8 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         psi_b: &GaussianLocationScaleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-        subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
+        _subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
-        std::hint::black_box(subsample);
         // Wiggle ψ path: full-data exact (= trivially unbiased). The
         // wiggle-specific second-order from-parts function inlines 30+
         // per-row coefficient arrays (`coeff_mm{,_a,_b,_ab}`,
@@ -5572,9 +5561,8 @@ impl GaussianLocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         d_beta_flat: &Array1<f64>,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-        subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
+        _subsample: Option<&[crate::families::marginal_slope_shared::WeightedOuterRow]>,
     ) -> Result<Array2<f64>, String> {
-        std::hint::black_box(subsample);
         // Same rationale as `ws_psi_second_order_terms_from_parts` above:
         // the wiggle ψ-Hessian directional-derivative function also inlines
         // dozens of per-row arrays. Full-data is exact (= trivially
@@ -8212,8 +8200,7 @@ impl CustomFamily for GaussianLocationScaleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        std::hint::black_box(specs);
+    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // The Gaussian location-scale workspace is returned by
         // `exact_newton_joint_hessian_workspace` whenever
         // `exact_joint_dense_block_designs` succeeds, which itself depends on
@@ -11933,8 +11920,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         }
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        std::hint::black_box(specs);
+    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // Same gating as the workspace impl above: matrix-free fires when
         // `exact_joint_dense_block_designs` is satisfiable, which requires
         // both location and scale block designs to be present.  The wiggle
@@ -13030,8 +13016,7 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         Ok(Some(Arc::new(workspace)))
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        std::hint::black_box(specs);
+    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         true
     }
 
@@ -13753,9 +13738,8 @@ impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
 
     fn directional_derivative(
         &self,
-        d_beta_flat: &Array1<f64>,
+        _d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        std::hint::black_box(d_beta_flat);
         Ok(None)
     }
 
@@ -13770,11 +13754,9 @@ impl ExactNewtonJointHessianWorkspace for BinomialMeanWiggleHessianWorkspace {
 
     fn second_directional_derivative(
         &self,
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
+        _d_beta_u_flat: &Array1<f64>,
+        _d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        std::hint::black_box(d_beta_u_flat);
-        std::hint::black_box(d_beta_v_flat);
         Ok(None)
     }
 
@@ -14062,8 +14044,7 @@ impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
         Ok(())
     }
     #[inline]
-    fn row_kernel(&self, yi: f64, e_clamped: f64, m: f64, prior_w: f64) -> DiagonalIrlsRow {
-        std::hint::black_box(e_clamped);
+    fn row_kernel(&self, yi: f64, _e_clamped: f64, m: f64, prior_w: f64) -> DiagonalIrlsRow {
         // Gamma(shape=k, scale=mu/k), dropping eta-independent constants.
         let log_lik_increment = prior_w * (-self.shape * (yi / m + m.ln()));
         // Gamma with log mean is non-canonical. Use the exact observed
@@ -17072,11 +17053,9 @@ impl CustomFamily for BinomialLocationScaleFamily {
         specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         rho: &ndarray::Array1<f64>,
-        options: &BlockwiseFitOptions,
-        hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+        _options: &BlockwiseFitOptions,
+        _hessian_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     ) -> Result<Option<BatchedOuterGradientTerms>, String> {
-        std::hint::black_box(options);
-        drop(hessian_workspace);
         use crate::faer_ndarray::FaerCholesky;
         use faer::Side;
 
@@ -17825,9 +17804,8 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
 
     fn directional_derivative(
         &self,
-        d_beta_flat: &Array1<f64>,
+        _d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        std::hint::black_box(d_beta_flat);
         Ok(None)
     }
 
@@ -17863,11 +17841,9 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
 
     fn second_directional_derivative(
         &self,
-        d_beta_u_flat: &Array1<f64>,
-        d_beta_v_flat: &Array1<f64>,
+        _d_beta_u_flat: &Array1<f64>,
+        _d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        std::hint::black_box(d_beta_u_flat);
-        std::hint::black_box(d_beta_v_flat);
         Ok(None)
     }
 
@@ -21590,8 +21566,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         }
     }
 
-    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        std::hint::black_box(specs);
+    fn inner_coefficient_hessian_hvp_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
         // Same gating as the workspace impl: matrix-free path is available
         // when both threshold and log-σ block designs are present (the
         // wiggle block is folded into the per-row pieces inside
@@ -22857,8 +22832,8 @@ mod tests {
     #[test]
     fn probit_binomial_incompatible_tail_keeps_mills_score() {
         let q = 40.0;
-        let (m1, m2, m3) = binomial_neglog_q_derivatives_probit_closed_form(0.0, 1.0, q, 1.0);
-        let m4 = binomial_neglog_q_fourth_derivative_probit_closed_form(0.0, 1.0, q, 1.0);
+        let (m1, m2, m3) = binomial_neglog_q_derivatives_probit_closed_form(0.0, 1.0, q);
+        let m4 = binomial_neglog_q_fourth_derivative_probit_closed_form(0.0, 1.0, q);
 
         assert!(
             m1 > 39.0 && m1 < 41.0,
@@ -23265,10 +23240,12 @@ mod tests {
             );
         }
 
-        let directions = [Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+        let directions = [
+            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
             Array1::from_vec(vec![0.0, 0.0, 0.0, 1.0, 0.0]),
             Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
-            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05, -0.31])];
+            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05, -0.31]),
+        ];
         for (k, v) in directions.iter().enumerate() {
             assert_eq!(v.len(), p);
             let want = dense.dot(v);
@@ -23426,9 +23403,11 @@ mod tests {
             .expect("dH operator call")
             .expect("dH operator present");
 
-        let probes = [Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+        let probes = [
+            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
             Array1::from_vec(vec![0.0, 1.0, 0.0, 0.0, 0.0]),
-            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15])];
+            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
+        ];
         for (k, w) in probes.iter().enumerate() {
             assert_eq!(w.len(), p);
             let want = dense_dh.dot(w);
@@ -23478,10 +23457,12 @@ mod tests {
             );
         }
 
-        let directions = [Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+        let directions = [
+            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
             Array1::from_vec(vec![0.0, 0.0, 0.0, 1.0, 0.0]),
             Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
-            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05, -0.31])];
+            Array1::from_vec(vec![-0.42, 0.11, 0.93, 0.05, -0.31]),
+        ];
         for (k, v) in directions.iter().enumerate() {
             assert_eq!(v.len(), p);
             let want = dense.dot(v);
@@ -23704,9 +23685,11 @@ mod tests {
             .expect("dH operator call")
             .expect("dH operator present");
 
-        let probes = [Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+        let probes = [
+            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
             Array1::from_vec(vec![0.0, 1.0, 0.0, 0.0, 0.0]),
-            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15])];
+            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
+        ];
         for (k, w) in probes.iter().enumerate() {
             assert_eq!(w.len(), p);
             let want = dense_dh.dot(w);
@@ -23746,9 +23729,11 @@ mod tests {
             .expect("d2H operator call")
             .expect("d2H operator present");
 
-        let probes = [Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+        let probes = [
+            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
             Array1::from_vec(vec![0.0, 1.0, 0.0, 0.0, 0.0]),
-            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15])];
+            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
+        ];
         for (k, w) in probes.iter().enumerate() {
             let want = dense_d2h.dot(w);
             let got = d2h_op.mul_vec(w);
@@ -23993,9 +23978,11 @@ mod tests {
             .expect("d2H op call")
             .expect("d2H op present");
 
-        let probes = [Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
+        let probes = [
+            Array1::from_vec(vec![1.0, 0.0, 0.0, 0.0, 0.0]),
             Array1::from_vec(vec![0.0, 1.0, 0.0, 0.0, 0.0]),
-            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15])];
+            Array1::from_vec(vec![0.30, -0.70, 0.50, -0.20, 0.15]),
+        ];
         for (k, w) in probes.iter().enumerate() {
             let want = dense_d2h.dot(w);
             let got = d2h_op.mul_vec(w);
@@ -24284,7 +24271,8 @@ mod tests {
             .expect("dH op call")
             .expect("dH op present");
 
-        let probes = [Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
+        let probes = [
+            Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == states[0].beta.len() { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| {
                 if i == states[0].beta.len() + states[1].beta.len() {
@@ -24293,7 +24281,8 @@ mod tests {
                     0.0
                 }
             }),
-            Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).sin())];
+            Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).sin()),
+        ];
         for (k, w) in probes.iter().enumerate() {
             let want = dense_dh.dot(w);
             let got = dh_op.mul_vec(w);
@@ -24399,10 +24388,12 @@ mod tests {
 
         let pt = states[0].beta.len();
         let pls = states[1].beta.len();
-        let probes = [Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
+        let probes = [
+            Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == pt { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == pt + pls { 1.0 } else { 0.0 }),
-            Array1::from_shape_fn(p, |i| 0.07 * ((i + 3) as f64).cos())];
+            Array1::from_shape_fn(p, |i| 0.07 * ((i + 3) as f64).cos()),
+        ];
         for (k, w) in probes.iter().enumerate() {
             let want = dense_d2h.dot(w);
             let got = d2h_op.mul_vec(w);
@@ -24583,10 +24574,12 @@ mod tests {
             .expect("workspace build")
             .expect("workspace present");
 
-        let directions = [Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
+        let directions = [
+            Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == p_mu { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == p_mu + p_ls { 1.0 } else { 0.0 }),
-            Array1::from_shape_fn(p, |i| 0.1 * ((i + 1) as f64).sin())];
+            Array1::from_shape_fn(p, |i| 0.1 * ((i + 1) as f64).sin()),
+        ];
         for (k, v) in directions.iter().enumerate() {
             let want = dense.dot(v);
             let got = workspace
@@ -24733,10 +24726,12 @@ mod tests {
 
         let pmu = states[0].beta.len();
         let pls = states[1].beta.len();
-        let probes = [Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
+        let probes = [
+            Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == pmu { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == pmu + pls { 1.0 } else { 0.0 }),
-            Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).cos())];
+            Array1::from_shape_fn(p, |i| 0.07 * ((i + 2) as f64).cos()),
+        ];
         for (k, w) in probes.iter().enumerate() {
             let want = dense_dh.dot(w);
             let got = dh_op.mul_vec(w);
@@ -24842,10 +24837,12 @@ mod tests {
 
         let pmu = states[0].beta.len();
         let pls = states[1].beta.len();
-        let probes = [Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
+        let probes = [
+            Array1::from_shape_fn(p, |i| if i == 0 { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == pmu { 1.0 } else { 0.0 }),
             Array1::from_shape_fn(p, |i| if i == pmu + pls { 1.0 } else { 0.0 }),
-            Array1::from_shape_fn(p, |i| 0.07 * ((i + 3) as f64).cos())];
+            Array1::from_shape_fn(p, |i| 0.07 * ((i + 3) as f64).cos()),
+        ];
         for (k, w) in probes.iter().enumerate() {
             let want = dense_d2h.dot(w);
             let got = d2h_op.mul_vec(w);
@@ -25457,7 +25454,6 @@ mod tests {
     #[test]
     fn gaussian_location_scale_hotloop_optimized_matches_legacy_and_is_faster_locally() {
         let n = 4096usize;
-        let rounds = 250usize;
         let y = Array1::from_shape_fn(n, |i| ((i as f64) * 0.003).sin() + 0.1);
         let mu = Array1::from_shape_fn(n, |i| ((i as f64) * 0.001).cos() - 0.2);
         let eta_ls = Array1::from_shape_fn(n, |i| ((i as f64) * 0.002).sin() * 0.8 - 0.1);
@@ -25541,13 +25537,6 @@ mod tests {
         assert!((&wmu_legacy - &wmu_opt).iter().all(|v| v.abs() < 1e-12));
         assert!((&zls_legacy - &zls_opt).iter().all(|v| v.abs() < 1e-12));
         assert!((&wls_legacy - &wls_opt).iter().all(|v| v.abs() < 1e-12));
-
-        for _ in 0..rounds {
-            std::hint::black_box(legacy_eval());
-        }
-        for _ in 0..rounds {
-            std::hint::black_box(optimized_eval());
-        }
     }
 
     fn simple_matern_term_collection(
@@ -27431,8 +27420,7 @@ mod tests {
         let mut ad = Array2::<f64>::zeros((total, total));
         for i in 0..total {
             for j in i..total {
-                let (_, _, _, _, _, _, _, d3) =
-                    third_partial_derivative_vec(g, &vars, i, j, total);
+                let (_, _, _, _, _, _, _, d3) = third_partial_derivative_vec(g, &vars, i, j, total);
                 ad[[i, j]] = d3;
                 if i != j {
                     ad[[j, i]] = d3;
@@ -28905,23 +28893,25 @@ mod tests {
             beta: Array1::zeros(0),
             eta: extreme_eta,
         }]);
-        if let Ok(eval) = eval_result { match &eval.blockworking_sets[0] {
-            crate::families::custom_family::BlockWorkingSet::Diagonal {
-                working_response,
-                working_weights,
-            } => {
-                let all_finite = working_response.iter().all(|v| v.is_finite())
-                    && working_weights.iter().all(|v| v.is_finite())
-                    && eval.log_likelihood.is_finite();
-                assert!(
-                    all_finite,
-                    "Poisson evaluate should produce finite outputs for all eta, \
+        if let Ok(eval) = eval_result {
+            match &eval.blockworking_sets[0] {
+                crate::families::custom_family::BlockWorkingSet::Diagonal {
+                    working_response,
+                    working_weights,
+                } => {
+                    let all_finite = working_response.iter().all(|v| v.is_finite())
+                        && working_weights.iter().all(|v| v.is_finite())
+                        && eval.log_likelihood.is_finite();
+                    assert!(
+                        all_finite,
+                        "Poisson evaluate should produce finite outputs for all eta, \
                          but got non-finite values: ll={}, z={:?}, w={:?}",
-                    eval.log_likelihood, working_response, working_weights
-                );
+                        eval.log_likelihood, working_response, working_weights
+                    );
+                }
+                _ => panic!("expected Diagonal block"),
             }
-            _ => panic!("expected Diagonal block"),
-        } }
+        }
     }
 
     /// The batched outer-gradient override on `BinomialLocationScaleFamily`

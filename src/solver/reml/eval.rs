@@ -159,8 +159,12 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
-        std::hint::black_box(self.selecthessian_strategy_policy(rho, &bundle));
-        self.compute_lamlhessian_exact_from_bundle(rho, &bundle)
+        let decision = self.selecthessian_strategy_policy(&bundle);
+        match decision.strategy {
+            super::inner_strategy::HessianEvalStrategyKind::SpectralExact => {
+                self.compute_lamlhessian_exact_from_bundle(rho, &bundle)
+            }
+        }
     }
 
     pub(crate) fn compute_smoothing_correction_auto(

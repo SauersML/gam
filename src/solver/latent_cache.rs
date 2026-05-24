@@ -848,8 +848,7 @@ impl LatentDesignCache {
                 },
             }
         };
-        let basis_derivative_jets =
-            build_basis_derivative_jets(&latent, &basis_kind, &radial_distances)?;
+        let basis_derivative_jets = build_basis_derivative_jets(&basis_kind, &radial_distances)?;
         let id = self.next_entry_id;
         self.next_entry_id = self.next_entry_id.wrapping_add(1);
         let entry = Arc::new(CachedDesign {
@@ -1062,7 +1061,6 @@ fn build_radial_distances(
 }
 
 fn build_basis_derivative_jets(
-    latent: &LatentCoordValues,
     basis_kind: &LatentBasisKind,
     distances: &RadialDistanceMatrices,
 ) -> Result<BasisDerivativeJets, EstimationError> {
@@ -1074,8 +1072,6 @@ fn build_basis_derivative_jets(
             ..
         } => {
             if chunk_size.is_some() {
-                std::hint::black_box(latent);
-                std::hint::black_box(distances);
                 return Ok(BasisDerivativeJets {
                     operator_resident: true,
                     ..BasisDerivativeJets::empty()
@@ -1108,7 +1104,6 @@ fn build_basis_derivative_jets(
             })
         }
         LatentBasisKind::Duchon { .. } => {
-            std::hint::black_box(latent);
             Ok(BasisDerivativeJets {
                 operator_resident: true,
                 ..BasisDerivativeJets::empty()
@@ -1118,8 +1113,6 @@ fn build_basis_derivative_jets(
         | LatentBasisKind::PeriodicBspline { .. }
         | LatentBasisKind::Pca { .. }
         | LatentBasisKind::TensorBspline { .. } => {
-            std::hint::black_box(latent);
-            std::hint::black_box(distances);
             Ok(BasisDerivativeJets {
                 operator_resident: true,
                 ..BasisDerivativeJets::empty()
