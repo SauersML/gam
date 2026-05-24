@@ -5327,9 +5327,6 @@ impl SurvivalMarginalSlopeFamily {
         slot: Option<(usize, SurvivalInterceptSlotKind)>,
     ) -> Result<(f64, f64), String> {
         let eval = |a: f64| -> Result<(f64, f64, f64), String> {
-            // Always-on counter for instrumentation; the bump is a single
-            // thread-local increment, negligible vs the survival evaluation.
-            survival_intercept_test_counter::bump();
             self.evaluate_denested_survival_calibration(a, q, slope, beta_h, beta_w)
         };
         let probit_scale = self.probit_frailty_scale();
@@ -18132,27 +18129,6 @@ pub fn fit_survival_marginal_slope_terms(
         score_warp_runtime,
         link_dev_runtime,
     })
-}
-
-/// Thread-local invocation counter used by the warm-start unit test to
-/// assert that pre-populating the per-row intercept cache reduces the number
-/// of `evaluate_denested_survival_calibration` calls. Compiled into the
-/// `solve_row_survival_intercept_with_slot` evaluator only under `cfg(test)`,
-/// so the production hot path is byte-identical.
-mod survival_intercept_test_counter {
-    use std::cell::Cell;
-    thread_local! {
-        static COUNT: Cell<u64> = const { Cell::new(0) };
-    }
-    pub(super) fn bump() {
-        COUNT.with(|c| c.set(c.get() + 1));
-    }
-    pub(super) fn reset() {
-        COUNT.with(|c| c.set(0));
-    }
-    pub(super) fn get() -> u64 {
-        COUNT.with(|c| c.get())
-    }
 }
 
 #[cfg(test)]

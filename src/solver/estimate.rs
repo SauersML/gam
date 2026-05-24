@@ -2107,7 +2107,11 @@ pub(crate) struct ExternalJointHyperEvaluator<'a> {
     last_canonical_revision: Option<u64>,
 }
 
-impl<'a> ExternalJointHyperEvaluator<'a> {
+#[cfg(test)]
+mod tests_diagnostics {
+    use super::*;
+
+    impl<'a> ExternalJointHyperEvaluator<'a> {
     pub(crate) fn new(
         y: ArrayView1<'a, f64>,
         w: ArrayView1<'a, f64>,
@@ -2506,6 +2510,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         self.reml_state.compute_cost(&rho)
     }
 
+    }
 }
 
 impl<'a> ExternalJointHyperEvaluator<'a> {
