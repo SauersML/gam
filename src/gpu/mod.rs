@@ -6,13 +6,8 @@
 //! behind the `cuda` Cargo feature and does not leak into solver modules.
 
 pub mod blas;
-pub mod calibration;
 pub mod cpu_traits;
 pub mod device;
-pub mod diagnostics;
-pub mod dispatch;
-pub mod driver;
-pub mod error;
 pub mod graph;
 pub mod kernels;
 pub mod linalg;
@@ -21,7 +16,6 @@ pub mod policy;
 pub mod profile;
 pub mod rand;
 pub mod runtime;
-pub mod session;
 pub mod solver;
 pub mod sparse;
 pub mod stream;
@@ -75,7 +69,7 @@ impl GpuPolicy {
     }
 
     #[inline]
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
             Self::Off => "off",
@@ -100,7 +94,7 @@ pub enum GpuKernel {
 }
 
 impl GpuKernel {
-    pub fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::DenseMatvec => "dense-matvec",
             Self::DenseTransposeMatvec => "dense-transpose-matvec",

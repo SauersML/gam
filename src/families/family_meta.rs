@@ -49,7 +49,7 @@ fn inverse_link_diagnostic_name(link: &InverseLink) -> String {
 /// migrate first can call this constructor without depending on a separate
 /// `From<LikelihoodFamily>` bridge.
 #[inline]
-pub fn likelihood_spec(response: ResponseFamily, link: InverseLink) -> LikelihoodSpec {
+pub const fn likelihood_spec(response: ResponseFamily, link: InverseLink) -> LikelihoodSpec {
     LikelihoodSpec::new(response, link)
 }
 

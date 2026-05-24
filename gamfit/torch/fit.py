@@ -57,7 +57,7 @@ from ._reml import (
 # ---------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(slots=True)
 class FitResult:
     """Output of :func:`gamfit.torch.fit`.
 

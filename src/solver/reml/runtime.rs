@@ -1717,13 +1717,16 @@ impl<'a> RemlState<'a> {
         ))
     }
 
-    fn tk_shared_intermediates(
+    fn tk_shared_intermediates<S>(
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
         c_array: &Array1<f64>,
         context: &str,
-        h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
-    ) -> Result<TkSharedIntermediates, EstimationError> {
+        h_inv_solve: &S,
+    ) -> Result<TkSharedIntermediates, EstimationError>
+    where
+        S: Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
+    {
         let n = x_dense.nrows();
         let active_blocks = Self::tk_active_blocks(c_array);
         use rayon::prelude::*;
@@ -2357,7 +2360,7 @@ impl<'a> RemlState<'a> {
         Self::xt_diag_x_dense_into(x_dense, diag, &mut weighted)
     }
 
-    fn tk_hessian_rho_canonical_logit(
+    fn tk_hessian_rho_canonical_logit<S>(
         x_dense: &Array2<f64>,
         c_array: &Array1<f64>,
         d_array: &Array1<f64>,
@@ -2367,8 +2370,11 @@ impl<'a> RemlState<'a> {
         lambdas: &[f64],
         beta: &Array1<f64>,
         firth_op: Option<&super::FirthDenseOperator>,
-        h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
-    ) -> Result<Array2<f64>, EstimationError> {
+        h_inv_solve: &S,
+    ) -> Result<Array2<f64>, EstimationError>
+    where
+        S: Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
+    {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
         let k = tk_penalties.len();
@@ -2614,7 +2620,7 @@ impl<'a> RemlState<'a> {
         Ok(total.h)
     }
 
-    fn tierney_kadane_analytic_core(
+    fn tierney_kadane_analytic_core<S>(
         &self,
         x_dense: &Array2<f64>,
         z: &Array2<f64>,
@@ -2629,8 +2635,11 @@ impl<'a> RemlState<'a> {
         firth_op: Option<&super::FirthDenseOperator>,
         compute_gradient: bool,
         compute_hessian: bool,
-        h_inv_solve: &dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
-    ) -> Result<TkCorrectionTerms, EstimationError> {
+        h_inv_solve: &S,
+    ) -> Result<TkCorrectionTerms, EstimationError>
+    where
+        S: Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
+    {
         let p = x_dense.ncols();
         let k = tk_penalties.len();
 
@@ -4468,12 +4477,13 @@ impl<'a> RemlState<'a> {
                 .copied()
                 .unwrap_or(0);
             let mut beta_test = Array1::<f64>::zeros(max_idx + 1);
-            for (&idx, &lb) in config
+            for ((&idx, &rhs), &sign) in config
                 .constrained_indices
                 .iter()
                 .zip(config.lower_bounds.iter())
+                .zip(config.bound_signs.iter())
             {
-                beta_test[idx] = lb + 0.01; // slightly above constraint
+                beta_test[idx] = (rhs + 0.01) / sign; // slack is 0.01 inside the feasible side
             }
             let significant = config.barrier_curvature_is_significant(&beta_test, 1.0, 0.05);
             log::trace!(

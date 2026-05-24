@@ -42,7 +42,7 @@ _DEFAULT_TOPOLOGIES: tuple[TopologyName, ...] = (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TopologyAutoSelectorResult:
     """Ranked latent-topology selector result."""
 

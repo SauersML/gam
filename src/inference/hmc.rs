@@ -3009,25 +3009,59 @@ fn validate_nuts_target_accept(target_accept: f64) -> Result<(), HmcError> {
     }
 }
 
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+#[inline]
+fn chain_stream_seed(seed: u64, chain: usize, stream: u64) -> u64 {
+    splitmix64(seed ^ stream ^ ((chain as u64).wrapping_mul(0xD1B5_4A32_D192_ED03)))
+}
+
+#[inline]
+fn nuts_transition_seed(seed: u64, stream: u64) -> u64 {
+    splitmix64(seed ^ stream ^ 0xA24B_AED4_963E_E407)
+}
+
+#[inline]
+fn robust_target_accept(requested: f64, dim: usize) -> f64 {
+    let floor = if dim > 50 { 0.92 } else { 0.90 };
+    requested.max(floor).min(0.95)
+}
+
+fn jittered_initial_positions(
+    config: &NutsConfig,
+    dim: usize,
+    scale: f64,
+    stream: u64,
+) -> Vec<Array1<f64>> {
+    (0..config.n_chains)
+        .map(|chain| {
+            let mut rng = StdRng::seed_from_u64(chain_stream_seed(config.seed, chain, stream));
+            Array1::from_shape_fn(dim, |_| sample_standard_normal(&mut rng) * scale)
+        })
+        .collect()
+}
+
 fn robust_mass_matrix_config(dim: usize, nwarmup: usize) -> NUTSMassMatrixConfig {
     if nwarmup < 80 {
         return NUTSMassMatrixConfig::disabled();
     }
-    let start_buffer = (nwarmup / 10).clamp(25, 150);
-    let end_buffer = (nwarmup / 8).clamp(25, 150);
-    let initial_window = (nwarmup / 12).clamp(20, 120);
-    let dense_allowed = dim <= 50;
+    let start_buffer = (nwarmup / 8).clamp(35, 180);
+    let end_buffer = (nwarmup / 5).clamp(50, 250);
+    let initial_window = (nwarmup / 20).clamp(10, 60);
     NUTSMassMatrixConfig {
-        adaptation: if dense_allowed {
-            MassMatrixAdaptation::Dense
-        } else {
-            MassMatrixAdaptation::Diagonal
-        },
+        adaptation: MassMatrixAdaptation::Diagonal,
         start_buffer,
         end_buffer,
         initial_window,
-        regularize: if dense_allowed { 0.03 } else { 0.08 },
-        jitter: 1e-6,
+        regularize: if dim > 50 { 0.14 } else { 0.10 },
+        jitter: 1e-5,
         dense_max_dim: 75,
     }
 }
@@ -3038,16 +3072,16 @@ fn robust_survival_mass_matrix_config(dim: usize, nwarmup: usize) -> NUTSMassMat
     }
     // Survival posteriors with censoring/rare events are often skewed; this
     // configuration uses diagonal adaptation.
-    let start_buffer = (nwarmup / 8).clamp(30, 180);
-    let end_buffer = (nwarmup / 6).clamp(30, 180);
-    let initial_window = (nwarmup / 10).clamp(25, 140);
+    let start_buffer = (nwarmup / 7).clamp(40, 200);
+    let end_buffer = (nwarmup / 4).clamp(60, 280);
+    let initial_window = (nwarmup / 20).clamp(10, 60);
     NUTSMassMatrixConfig {
         adaptation: MassMatrixAdaptation::Diagonal,
         start_buffer,
         end_buffer,
         initial_window,
-        regularize: if dim > 50 { 0.12 } else { 0.08 },
-        jitter: 1e-6,
+        regularize: if dim > 50 { 0.18 } else { 0.12 },
+        jitter: 1e-5,
         dense_max_dim: 75,
     }
 }
@@ -3058,7 +3092,7 @@ impl Default for NutsConfig {
             n_samples: 1000,
             nwarmup: 500,
             n_chains: 4,
-            target_accept: 0.8,
+            target_accept: 0.9,
             seed: 42,
         }
     }
@@ -3095,7 +3129,7 @@ impl NutsConfig {
             n_samples,
             nwarmup,
             n_chains,
-            target_accept: 0.8,
+            target_accept: 0.9,
             seed: 42,
         }
     }

@@ -7,7 +7,7 @@ from typing import Any, cast
 SUPPORTED_OUTPUT_KINDS = {"dict", "numpy", "pandas", "polars", "pyarrow"}
 
 
-def _try_import(name: str) -> Any:
+def _try_import(name: str) -> Any | None:
     try:
         return importlib.import_module(name)
     except ImportError:
