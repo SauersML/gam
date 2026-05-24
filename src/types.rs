@@ -331,6 +331,42 @@ impl LikelihoodSpec {
         }
     }
 
+    /// Map this `LikelihoodSpec` back to the flat `LikelihoodFamily` enum
+    /// still consumed by the lower-level fit/sampling engines. The mapping is
+    /// total because every `(response, link)` combination corresponds to
+    /// exactly one legacy variant.
+    #[inline]
+    pub fn as_likelihood_family(&self) -> LikelihoodFamily {
+        match (&self.response, &self.link) {
+            (ResponseFamily::Gaussian, _) => LikelihoodFamily::GaussianIdentity,
+            (ResponseFamily::Poisson, _) => LikelihoodFamily::PoissonLog,
+            (ResponseFamily::Tweedie { p }, _) => LikelihoodFamily::Tweedie { p: *p },
+            (ResponseFamily::NegativeBinomial { theta }, _) => {
+                LikelihoodFamily::NegativeBinomial { theta: *theta }
+            }
+            (ResponseFamily::Beta { phi }, _) => LikelihoodFamily::BetaLogit { phi: *phi },
+            (ResponseFamily::Gamma, _) => LikelihoodFamily::GammaLog,
+            (ResponseFamily::RoystonParmar, _) => LikelihoodFamily::RoystonParmar,
+            (ResponseFamily::Binomial, link) => match link {
+                InverseLink::Standard(LinkFunction::Logit) => LikelihoodFamily::BinomialLogit,
+                InverseLink::Standard(LinkFunction::Probit) => LikelihoodFamily::BinomialProbit,
+                InverseLink::Standard(LinkFunction::CLogLog) => LikelihoodFamily::BinomialCLogLog,
+                InverseLink::Standard(_) => LikelihoodFamily::BinomialLogit,
+                InverseLink::LatentCLogLog(_) => LikelihoodFamily::BinomialLatentCLogLog,
+                InverseLink::Sas(_) => LikelihoodFamily::BinomialSas,
+                InverseLink::BetaLogistic(_) => LikelihoodFamily::BinomialBetaLogistic,
+                InverseLink::Mixture(_) => LikelihoodFamily::BinomialMixture,
+            },
+        }
+    }
+
+    /// Human-readable label mirroring `LikelihoodFamily::pretty_name`, but
+    /// derived directly from the `(response, link)` pair.
+    #[inline]
+    pub fn pretty_name(&self) -> &'static str {
+        self.as_likelihood_family().pretty_name()
+    }
+
     /// Build a `LikelihoodSpec` from a non-parameterized `LikelihoodFamily`
     /// variant. Returns `None` for the parameterized binomial variants
     /// (`Sas`, `BetaLogistic`, `Mixture`, `LatentCLogLog`) whose new

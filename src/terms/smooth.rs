@@ -11994,6 +11994,7 @@ fn fit_bounded_term_collection_with_design(
         )));
     }
 
+    let is_beta_logistic = family.is_binomial_beta_logistic();
     let family_adapter = BoundedLinearFamily {
         family,
         latent_cloglog_state: options.latent_cloglog,
@@ -12007,7 +12008,7 @@ fn fit_bounded_term_collection_with_design(
         sas_link_state: options
             .sas_link
             .map(|spec| {
-                if family.is_binomial_beta_logistic() {
+                if is_beta_logistic {
                     state_from_beta_logisticspec(spec)
                 } else {
                     state_from_sasspec(spec)
