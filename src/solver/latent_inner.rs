@@ -229,7 +229,11 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                 // conditioned at the very converged point), skip the
                 // cache; the predictor will then no-op.
                 let solve_options =
-                    latent_arrow_solve_options(&system, &opts, !self.latent.manifold().is_euclidean());
+                    latent_arrow_solve_options(
+                        &system,
+                        &opts,
+                        !self.latent.retraction_registry().is_all_euclidean(),
+                    );
                 if let Ok((_, _, cache)) = solve_arrow_newton_step_with_options(
                     &system,
                     ridge_t.max(1e-12),
@@ -245,7 +249,11 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
             // row PD violation or Schur PD violation), grow the ridge
             // and retry without consuming an outer iteration.
             let solve_options =
-                latent_arrow_solve_options(&system, &opts, !self.latent.manifold().is_euclidean());
+                latent_arrow_solve_options(
+                    &system,
+                    &opts,
+                    !self.latent.retraction_registry().is_all_euclidean(),
+                );
             let step_result =
                 solve_arrow_newton_step_with_options(&system, ridge_t, ridge_beta, &solve_options);
             match step_result {
@@ -383,7 +391,9 @@ fn limit_delta_to_riemannian_trust_region(
     if !enabled || !radius.is_finite() || radius <= 0.0 {
         return delta_t;
     }
-    let row_weights = latent.manifold().metric_weights();
+    let row_weights = latent
+        .retraction_registry()
+        .metric_weights(latent.latent_dim());
     assert_eq!(row_weights.len(), latent.latent_dim());
     let mut norm_sq = 0.0_f64;
     for n in 0..latent.n_obs() {
