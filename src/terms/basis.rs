@@ -4,7 +4,8 @@ use crate::faer_ndarray::{
 };
 use crate::linalg::utils::KahanSum;
 use crate::matrix::{
-    ChunkedKernelDesignOperator, CoefficientTransformOperator, DesignMatrix, LinearOperator,
+    ChunkedKernelDesignOperator, CoefficientTransformOperator, DenseDesignOperator, DesignMatrix,
+    LinearOperator, MatrixMaterializationError,
 };
 use crate::probability::{
     binomial_coefficient_f64 as binomial_f64,
@@ -23,6 +24,7 @@ use smallvec::SmallVec;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -2151,6 +2153,8 @@ pub struct MaternBasisSpec {
     /// When None, isotropic distance r = ‖x - c‖ is used.
     #[serde(default)]
     pub aniso_log_scales: Option<Vec<f64>>,
+    #[serde(default)]
+    pub streaming_chunk_size: Option<usize>,
 }
 
 /// Per-smooth identifiability policy for Matérn kernel coefficients.
@@ -2438,6 +2442,7 @@ pub enum BasisMetadata {
         /// Per-axis anisotropy log-scales η_a for geometric anisotropy.
         /// When Some, distance is r = √(Σ_a exp(2η_a) · (x_a - c_a)²).
         aniso_log_scales: Option<Vec<f64>>,
+        streaming_chunk_size: Option<usize>,
     },
     Duchon {
         centers: Array2<f64>,
