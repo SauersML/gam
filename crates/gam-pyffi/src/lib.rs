@@ -906,13 +906,17 @@ fn duchon_function_norm_penalty<'py>(
     }
     // Accept centers as either 1D (K,) or 2D (K, d). Promote 1D to (K, 1)
     // for backward compatibility.
-    let center_matrix: Array2<f64> = if let Ok(arr2) = centers.extract::<PyReadonlyArray2<f64>>() {
-        arr2.as_array().to_owned()
-    } else {
-        let arr1 = centers.extract::<PyReadonlyArray1<f64>>().map_err(|_| {
-            py_value_error("centers must be a 1D (K,) or 2D (K, d) float array".to_string())
-        })?;
-        column_array(arr1.as_array())
+    let center_matrix: Array2<f64> = match centers.extract::<PyReadonlyArray2<f64>>() {
+        Ok(arr2) => arr2.as_array().to_owned(),
+        Err(arr2_err) => {
+            let arr1 = centers.extract::<PyReadonlyArray1<f64>>().map_err(|arr1_err| {
+                py_value_error(format!(
+                    "centers must be a 1D (K,) or 2D (K, d) float array; \
+                     2D extraction failed: {arr2_err}; 1D extraction failed: {arr1_err}"
+                ))
+            })?;
+            column_array(arr1.as_array())
+        }
     };
     let d = center_matrix.ncols();
     // Resolve per-axis periodicity. `periodic_per_axis` (if given) takes
@@ -1154,24 +1158,30 @@ fn gaussian_reml_score<'py>(
     by: Option<PyReadonlyArray1<'py, f64>>,
     by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
-    let x_view = x.as_array();
-    let by_view = by.as_ref().map(|b| b.as_array());
-    let gated_x;
-    let fit_x = if let Some(by_values) = by_view {
-        gated_x = apply_by_gate(x_view, by_values, by_start_col).map_err(py_value_error)?;
-        gated_x.view()
-    } else {
-        x_view
-    };
-    let score = gaussian_reml_free_b_score(
-        fit_x,
-        y.as_array(),
-        coefficients.as_array(),
-        log_lambda,
-        penalty.as_array(),
-        weights.as_ref().map(|w| w.as_array()),
-    )
-    .map_err(|err| py_value_error(err.to_string()))?;
+    let x_values = x.as_array().to_owned();
+    let y_values = y.as_array().to_owned();
+    let coefficient_values = coefficients.as_array().to_owned();
+    let penalty_values = penalty.as_array().to_owned();
+    let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
+    let by_values = by.as_ref().map(|b| b.as_array().to_owned());
+    let score = detach_py_result(py, "gaussian_reml_score", move || {
+        let gated_x;
+        let fit_x = if let Some(by_arr) = by_values.as_ref() {
+            gated_x = apply_by_gate(x_values.view(), by_arr.view(), by_start_col)?;
+            gated_x.view()
+        } else {
+            x_values.view()
+        };
+        gaussian_reml_free_b_score(
+            fit_x,
+            y_values.view(),
+            coefficient_values.view(),
+            log_lambda,
+            penalty_values.view(),
+            weight_values.as_ref().map(|w| w.view()),
+        )
+        .map_err(|err| err.to_string())
+    })?;
     let out = PyDict::new(py);
     out.set_item("reml_score", score.reml_score)?;
     out.set_item(
@@ -1408,18 +1418,16 @@ fn gaussian_reml_fit_formula_table<'py>(
 ) -> PyResult<Py<PyDict>> {
     let y_values = y.as_array().to_owned();
     let fisher_values = fisher_rao_w.as_ref().map(|w| w.as_array().to_owned());
-    let result = py
-        .detach(move || {
-            gaussian_reml_fit_formula_table_impl(
-                headers,
-                rows,
-                formula,
-                y_values.view(),
-                config_json.as_deref(),
-                fisher_values.as_ref().map(|w| w.view()),
-            )
-        })
-        .map_err(py_value_error)?;
+    let result = detach_py_result(py, "gaussian_reml_fit_formula_table", move || {
+        gaussian_reml_fit_formula_table_impl(
+            headers,
+            rows,
+            formula,
+            y_values.view(),
+            config_json.as_deref(),
+            fisher_values.as_ref().map(|w| w.view()),
+        )
+    })?;
     gaussian_reml_result_to_pydict(py, result)
 }
 
@@ -1616,21 +1624,19 @@ fn gaussian_reml_fit_blocks_forward<'py>(
         kronecker_factored: None,
     };
     let joint_x_for_fit = joint_x.clone();
-    let fit = py
-        .detach(move || {
-            let heuristic_slice = heuristic_owned.as_ref().map(|values| values.as_slice());
-            gam::estimate::fit_gamwith_heuristic_lambdas(
-                joint_x_for_fit,
-                y_col.view(),
-                weights_owned.view(),
-                offset_zero.view(),
-                &s_list,
-                heuristic_slice,
-                gam::types::LikelihoodFamily::GaussianIdentity,
-                &opts,
-            )
-        })
-        .map_err(|e| py_value_error(e.to_string()))?;
+    let fit = detach_estimation_result(py, "gaussian_reml_fit_blocks_forward", move || {
+        let heuristic_slice = heuristic_owned.as_ref().map(|values| values.as_slice());
+        gam::estimate::fit_gamwith_heuristic_lambdas(
+            joint_x_for_fit,
+            y_col.view(),
+            weights_owned.view(),
+            offset_zero.view(),
+            &s_list,
+            heuristic_slice,
+            gam::types::LikelihoodFamily::GaussianIdentity,
+            &opts,
+        )
+    })?;
 
     let lambdas = fit.lambdas.clone();
     if let Some((block, value)) = lambdas
@@ -2765,11 +2771,6 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     drop(coefficients_at_optimum);
     drop(fitted_at_optimum);
 
-    let x_view = x.as_array();
-    let y_view = y.as_array();
-    let penalty_view = penalty.as_array();
-    let weight_view = weights.as_ref().map(|w| w.as_array());
-
     // Determine whether the active set is empty (interior cert).
     let active_empty = match active_indices.as_ref() {
         Some(a) => a.as_array().len() == 0,
@@ -2828,19 +2829,31 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
         }
     }
 
-    let backward = gaussian_reml_multi_closed_form_backward(
-        x_view,
-        y_view,
-        penalty_view,
-        weight_view,
-        init_lambda,
-        effective_grad_lambda,
-        grad_coefficients.as_ref().map(|g| g.as_array()),
-        grad_fitted.as_ref().map(|g| g.as_array()),
-        grad_reml_score,
-        grad_edf,
-    )
-    .map_err(|err| py_value_error(err.to_string()))?;
+    let x_values = x.as_array().to_owned();
+    let y_values = y.as_array().to_owned();
+    let penalty_values = penalty.as_array().to_owned();
+    let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
+    let grad_coefficients_values = grad_coefficients.as_ref().map(|g| g.as_array().to_owned());
+    let grad_fitted_values = grad_fitted.as_ref().map(|g| g.as_array().to_owned());
+    let backward = detach_py_result(
+        py,
+        "gaussian_reml_fit_with_constraints_backward",
+        move || {
+            gaussian_reml_multi_closed_form_backward(
+                x_values.view(),
+                y_values.view(),
+                penalty_values.view(),
+                weight_values.as_ref().map(|w| w.view()),
+                init_lambda,
+                effective_grad_lambda,
+                grad_coefficients_values.as_ref().map(|g| g.view()),
+                grad_fitted_values.as_ref().map(|g| g.view()),
+                grad_reml_score,
+                grad_edf,
+            )
+            .map_err(|err| err.to_string())
+        },
+    )?;
 
     let out = PyDict::new(py);
     out.set_item("grad_x", backward.grad_x.into_pyarray(py))?;
@@ -2871,25 +2884,29 @@ fn gaussian_reml_fit_batched<'py>(
     by: Option<PyReadonlyArray1<'py, f64>>,
     by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
-    let x_view = x.as_array();
-    let by_view = by.as_ref().map(|b| b.as_array());
-    let gated_x;
-    let fit_x = if let Some(by_values) = by_view {
-        gated_x = apply_by_gate(x_view, by_values, by_start_col).map_err(py_value_error)?;
-        gated_x.view()
-    } else {
-        x_view
-    };
-    let weight_view = weights.as_ref().map(|w| w.as_array());
-    let result = gaussian_reml_fit_batched_impl(
-        fit_x,
-        y.as_array(),
-        row_offsets.as_array(),
-        penalty.as_array(),
-        weight_view,
-        init_lambda,
-    )
-    .map_err(py_value_error)?;
+    let x_values = x.as_array().to_owned();
+    let y_values = y.as_array().to_owned();
+    let row_offset_values = row_offsets.as_array().to_owned();
+    let penalty_values = penalty.as_array().to_owned();
+    let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
+    let by_values = by.as_ref().map(|b| b.as_array().to_owned());
+    let result = detach_py_result(py, "gaussian_reml_fit_batched", move || {
+        let gated_x;
+        let fit_x = if let Some(by_arr) = by_values.as_ref() {
+            gated_x = apply_by_gate(x_values.view(), by_arr.view(), by_start_col)?;
+            gated_x.view()
+        } else {
+            x_values.view()
+        };
+        gaussian_reml_fit_batched_impl(
+            fit_x,
+            y_values.view(),
+            row_offset_values.view(),
+            penalty_values.view(),
+            weight_values.as_ref().map(|w| w.view()),
+            init_lambda,
+        )
+    })?;
     let out = PyDict::new(py);
     set_batched_gaussian_reml_dict_items(py, &out, result)?;
     Ok(out.unbind())
@@ -2987,51 +3004,71 @@ fn gaussian_reml_fit_batched_backward<'py>(
     by: Option<PyReadonlyArray1<'py, f64>>,
     by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
-    let x_view = x.as_array();
-    let y_view = y.as_array();
-    let weight_view = weights.as_ref().map(|w| w.as_array());
-    let by_view = by.as_ref().map(|b| b.as_array());
-    let gated_x;
-    let fit_x = if let Some(by_values) = by_view {
-        gated_x = apply_by_gate(x_view, by_values, by_start_col).map_err(py_value_error)?;
-        gated_x.view()
-    } else {
-        x_view
-    };
     let forward_fits = forward_state
         .map(|state| batched_gaussian_reml_fits_from_pydict(state, row_offsets.as_array()))
         .transpose()
         .map_err(py_value_error)?;
-    let backward = gaussian_reml_fit_batched_backward_impl(
-        fit_x,
-        y_view,
-        row_offsets.as_array(),
-        penalty.as_array(),
-        weight_view,
-        init_lambda,
-        grad_lambda.as_ref().map(|g| g.as_array()),
-        grad_coefficients.as_ref().map(|g| g.as_array()),
-        grad_fitted.as_ref().map(|g| g.as_array()),
-        grad_reml_score.as_ref().map(|g| g.as_array()),
-        grad_edf.as_ref().map(|g| g.as_array()),
-        forward_fits.as_deref(),
-    )
-    .map_err(py_value_error)?;
+    let x_values = x.as_array().to_owned();
+    let y_values = y.as_array().to_owned();
+    let row_offset_values = row_offsets.as_array().to_owned();
+    let penalty_values = penalty.as_array().to_owned();
+    let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
+    let grad_lambda_values = grad_lambda.as_ref().map(|g| g.as_array().to_owned());
+    let grad_coefficients_values = grad_coefficients.as_ref().map(|g| g.as_array().to_owned());
+    let grad_fitted_values = grad_fitted.as_ref().map(|g| g.as_array().to_owned());
+    let grad_reml_score_values = grad_reml_score.as_ref().map(|g| g.as_array().to_owned());
+    let grad_edf_values = grad_edf.as_ref().map(|g| g.as_array().to_owned());
+    let by_values = by.as_ref().map(|b| b.as_array().to_owned());
+    let (statuses, grad_x, grad_by, grad_y, grad_penalty, grad_weights) = detach_py_result(
+        py,
+        "gaussian_reml_fit_batched_backward",
+        move || {
+            let gated_x;
+            let fit_x = if let Some(by_arr) = by_values.as_ref() {
+                gated_x = apply_by_gate(x_values.view(), by_arr.view(), by_start_col)?;
+                gated_x.view()
+            } else {
+                x_values.view()
+            };
+            let backward = gaussian_reml_fit_batched_backward_impl(
+                fit_x,
+                y_values.view(),
+                row_offset_values.view(),
+                penalty_values.view(),
+                weight_values.as_ref().map(|w| w.view()),
+                init_lambda,
+                grad_lambda_values.as_ref().map(|g| g.view()),
+                grad_coefficients_values.as_ref().map(|g| g.view()),
+                grad_fitted_values.as_ref().map(|g| g.view()),
+                grad_reml_score_values.as_ref().map(|g| g.view()),
+                grad_edf_values.as_ref().map(|g| g.view()),
+                forward_fits.as_deref(),
+            )?;
+            let grad_x_raw = backward.grad_x;
+            let (grad_x, grad_by) = if let Some(by_arr) = by_values.as_ref() {
+                let (grad_x, grad_by) =
+                    apply_by_gate_backward(x_values.view(), by_arr.view(), by_start_col, grad_x_raw.view())?;
+                (grad_x, Some(grad_by))
+            } else {
+                (grad_x_raw, None)
+            };
+            Ok((
+                backward.statuses,
+                grad_x,
+                grad_by,
+                backward.grad_y,
+                backward.grad_penalty,
+                backward.grad_weights,
+            ))
+        },
+    )?;
 
     let out = PyDict::new(py);
-    let (grad_x, grad_by) = if let Some(by_values) = by_view {
-        let (grad_x, grad_by) =
-            apply_by_gate_backward(x_view, by_values, by_start_col, backward.grad_x.view())
-                .map_err(py_value_error)?;
-        (grad_x, Some(grad_by))
-    } else {
-        (backward.grad_x, None)
-    };
-    out.set_item("status", backward.statuses)?;
+    out.set_item("status", statuses)?;
     out.set_item("grad_x", grad_x.into_pyarray(py))?;
-    out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
-    out.set_item("grad_penalty", backward.grad_penalty.into_pyarray(py))?;
-    out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
+    out.set_item("grad_y", grad_y.into_pyarray(py))?;
+    out.set_item("grad_penalty", grad_penalty.into_pyarray(py))?;
+    out.set_item("grad_weights", grad_weights.into_pyarray(py))?;
     if let Some(grad_by) = grad_by {
         out.set_item("grad_by", grad_by.into_pyarray(py))?;
     } else {
@@ -3069,47 +3106,50 @@ fn gaussian_reml_fit_positions<'py>(
     by: Option<PyReadonlyArray1<'py, f64>>,
     by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
-    let x = position_basis_design(
-        t.as_array(),
-        knots_or_centers.as_array(),
-        &basis_kind,
-        basis_order,
-        periodic,
-        period,
-    )
-    .map_err(py_value_error)?;
-    let y_view = y.as_array();
-    let penalty_view = penalty.as_array();
-    let weight_view = weights.as_ref().map(|w| w.as_array());
-    let by_view = by.as_ref().map(|b| b.as_array());
-    let gated_x;
-    let fit_x = if let Some(by_values) = by_view {
-        gated_x = apply_by_gate(x.view(), by_values, by_start_col).map_err(py_value_error)?;
-        gated_x.view()
-    } else {
-        x.view()
-    };
-    let result = gaussian_reml_multi_closed_form_with_cache(
-        fit_x,
-        y_view,
-        penalty_view,
-        weight_view,
-        init_lambda,
-        None,
-    );
+    let t_values = t.as_array().to_owned();
+    let y_values = y.as_array().to_owned();
+    let knot_or_center_values = knots_or_centers.as_array().to_owned();
+    let penalty_values = penalty.as_array().to_owned();
+    let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
+    let by_values = by.as_ref().map(|b| b.as_array().to_owned());
+    let n_rows = t_values.len();
+    let n_outputs = y_values.ncols();
+    let n_coefficients = penalty_values.nrows();
+    let result = detach_py_result(py, "gaussian_reml_fit_positions", move || {
+        let x = position_basis_design(
+            t_values.view(),
+            knot_or_center_values.view(),
+            &basis_kind,
+            basis_order,
+            periodic,
+            period,
+        )?;
+        let gated_x;
+        let fit_x = if let Some(by_arr) = by_values.as_ref() {
+            gated_x = apply_by_gate(x.view(), by_arr.view(), by_start_col)?;
+            gated_x.view()
+        } else {
+            x.view()
+        };
+        match gaussian_reml_multi_closed_form_with_cache(
+            fit_x,
+            y_values.view(),
+            penalty_values.view(),
+            weight_values.as_ref().map(|w| w.view()),
+            init_lambda,
+            None,
+        ) {
+            Ok(fit) => Ok(Some(fit)),
+            Err(EstimationError::ModelIsIllConditioned { .. }) => Ok(None),
+            Err(err) => Err(err.to_string()),
+        }
+    })?;
     let out = PyDict::new(py);
     match result {
-        Ok(fit) => set_ok_gaussian_reml_items(py, &out, fit)?,
-        Err(EstimationError::ModelIsIllConditioned { .. }) => {
-            set_degenerate_gaussian_reml_items(
-                py,
-                &out,
-                x.nrows(),
-                y_view.ncols(),
-                penalty_view.nrows(),
-            )?;
+        Some(fit) => set_ok_gaussian_reml_items(py, &out, fit)?,
+        None => {
+            set_degenerate_gaussian_reml_items(py, &out, n_rows, n_outputs, n_coefficients)?;
         }
-        Err(err) => return Err(py_value_error(err.to_string())),
     }
     Ok(out.unbind())
 }
@@ -3159,27 +3199,36 @@ fn gaussian_reml_fit_positions_backward<'py>(
         .map(gaussian_reml_fit_state_from_pydict)
         .transpose()
         .map_err(py_value_error)?;
-    let backward = gaussian_reml_fit_positions_backward_impl(
-        t.as_array(),
-        y.as_array(),
-        knots_or_centers.as_array(),
-        &basis_kind,
-        basis_order,
-        periodic,
-        period,
-        penalty.as_array(),
-        weights.as_ref().map(|w| w.as_array()),
-        init_lambda,
-        grad_lambda,
-        grad_coefficients.as_ref().map(|g| g.as_array()),
-        grad_fitted.as_ref().map(|g| g.as_array()),
-        grad_reml_score,
-        grad_edf,
-        by.as_ref().map(|b| b.as_array()),
-        by_start_col,
-        forward_fit.as_ref(),
-    )
-    .map_err(py_value_error)?;
+    let t_values = t.as_array().to_owned();
+    let y_values = y.as_array().to_owned();
+    let knot_or_center_values = knots_or_centers.as_array().to_owned();
+    let penalty_values = penalty.as_array().to_owned();
+    let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
+    let grad_coefficients_values = grad_coefficients.as_ref().map(|g| g.as_array().to_owned());
+    let grad_fitted_values = grad_fitted.as_ref().map(|g| g.as_array().to_owned());
+    let by_values = by.as_ref().map(|b| b.as_array().to_owned());
+    let backward = detach_py_result(py, "gaussian_reml_fit_positions_backward", move || {
+        gaussian_reml_fit_positions_backward_impl(
+            t_values.view(),
+            y_values.view(),
+            knot_or_center_values.view(),
+            &basis_kind,
+            basis_order,
+            periodic,
+            period,
+            penalty_values.view(),
+            weight_values.as_ref().map(|w| w.view()),
+            init_lambda,
+            grad_lambda,
+            grad_coefficients_values.as_ref().map(|g| g.view()),
+            grad_fitted_values.as_ref().map(|g| g.view()),
+            grad_reml_score,
+            grad_edf,
+            by_values.as_ref().map(|b| b.view()),
+            by_start_col,
+            forward_fit.as_ref(),
+        )
+    })?;
 
     let out = PyDict::new(py);
     out.set_item("grad_t", backward.grad_t.into_pyarray(py))?;
@@ -3225,22 +3274,30 @@ fn gaussian_reml_fit_positions_batched<'py>(
     by: Option<PyReadonlyArray1<'py, f64>>,
     by_start_col: usize,
 ) -> PyResult<Py<PyDict>> {
-    let result = gaussian_reml_fit_positions_batched_impl(
-        t.as_array(),
-        y.as_array(),
-        row_offsets.as_array(),
-        knots_or_centers.as_array(),
-        &basis_kind,
-        basis_order,
-        periodic,
-        period,
-        penalty.as_array(),
-        weights.as_ref().map(|w| w.as_array()),
-        init_lambda,
-        by.as_ref().map(|b| b.as_array()),
-        by_start_col,
-    )
-    .map_err(py_value_error)?;
+    let t_values = t.as_array().to_owned();
+    let y_values = y.as_array().to_owned();
+    let row_offset_values = row_offsets.as_array().to_owned();
+    let knot_or_center_values = knots_or_centers.as_array().to_owned();
+    let penalty_values = penalty.as_array().to_owned();
+    let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
+    let by_values = by.as_ref().map(|b| b.as_array().to_owned());
+    let result = detach_py_result(py, "gaussian_reml_fit_positions_batched", move || {
+        gaussian_reml_fit_positions_batched_impl(
+            t_values.view(),
+            y_values.view(),
+            row_offset_values.view(),
+            knot_or_center_values.view(),
+            &basis_kind,
+            basis_order,
+            periodic,
+            period,
+            penalty_values.view(),
+            weight_values.as_ref().map(|w| w.view()),
+            init_lambda,
+            by_values.as_ref().map(|b| b.view()),
+            by_start_col,
+        )
+    })?;
     let out = PyDict::new(py);
     set_batched_gaussian_reml_dict_items(py, &out, result)?;
     Ok(out.unbind())
@@ -3293,28 +3350,45 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
         .map(|state| batched_gaussian_reml_fits_from_pydict(state, row_offsets.as_array()))
         .transpose()
         .map_err(py_value_error)?;
-    let backward = gaussian_reml_fit_positions_batched_backward_impl(
-        t.as_array(),
-        y.as_array(),
-        row_offsets.as_array(),
-        knots_or_centers.as_array(),
-        &basis_kind,
-        basis_order,
-        periodic,
-        period,
-        penalty.as_array(),
-        weights.as_ref().map(|w| w.as_array()),
-        init_lambda,
-        grad_lambda.as_ref().map(|g| g.as_array()),
-        grad_coefficients.as_ref().map(|g| g.as_array()),
-        grad_fitted.as_ref().map(|g| g.as_array()),
-        grad_reml_score.as_ref().map(|g| g.as_array()),
-        grad_edf.as_ref().map(|g| g.as_array()),
-        by.as_ref().map(|b_arr| b_arr.as_array()),
-        by_start_col,
-        forward_fits.as_deref(),
-    )
-    .map_err(py_value_error)?;
+    let t_values = t.as_array().to_owned();
+    let y_values = y.as_array().to_owned();
+    let row_offset_values = row_offsets.as_array().to_owned();
+    let knot_or_center_values = knots_or_centers.as_array().to_owned();
+    let penalty_values = penalty.as_array().to_owned();
+    let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
+    let grad_lambda_values = grad_lambda.as_ref().map(|g| g.as_array().to_owned());
+    let grad_coefficients_values = grad_coefficients.as_ref().map(|g| g.as_array().to_owned());
+    let grad_fitted_values = grad_fitted.as_ref().map(|g| g.as_array().to_owned());
+    let grad_reml_score_values = grad_reml_score.as_ref().map(|g| g.as_array().to_owned());
+    let grad_edf_values = grad_edf.as_ref().map(|g| g.as_array().to_owned());
+    let by_values = by.as_ref().map(|b_arr| b_arr.as_array().to_owned());
+    let backward = detach_py_result(
+        py,
+        "gaussian_reml_fit_positions_batched_backward",
+        move || {
+            gaussian_reml_fit_positions_batched_backward_impl(
+                t_values.view(),
+                y_values.view(),
+                row_offset_values.view(),
+                knot_or_center_values.view(),
+                &basis_kind,
+                basis_order,
+                periodic,
+                period,
+                penalty_values.view(),
+                weight_values.as_ref().map(|w| w.view()),
+                init_lambda,
+                grad_lambda_values.as_ref().map(|g| g.view()),
+                grad_coefficients_values.as_ref().map(|g| g.view()),
+                grad_fitted_values.as_ref().map(|g| g.view()),
+                grad_reml_score_values.as_ref().map(|g| g.view()),
+                grad_edf_values.as_ref().map(|g| g.view()),
+                by_values.as_ref().map(|b_arr| b_arr.view()),
+                by_start_col,
+                forward_fits.as_deref(),
+            )
+        },
+    )?;
 
     let out = PyDict::new(py);
     out.set_item("status", backward.statuses)?;
@@ -4886,8 +4960,14 @@ fn gaussian_reml_fit_latent<'py>(
             );
         }
     }
+    let analytic_penalties_for_thread = analytic_penalties.clone();
+    let latent_payload_for_thread = latent_payload.clone();
     let (fit, _design, aux_strength_state) =
         detach_py_result(py, "gaussian_reml_fit_latent", move || {
+            let registry = build_analytic_penalty_registry_from_json(
+                Some(&latent_payload_for_thread),
+                analytic_penalties_for_thread.as_ref(),
+            )?;
             let effective_weights = latent_scalar_weights_with_fisher(
                 n_obs,
                 weight_values.as_ref().map(|w| w.view()),
@@ -5784,38 +5864,48 @@ fn glm_reml_fit_latent<'py>(
             )));
         }
     };
-    if y.as_array().ncols() > 1
+    let t_values = t.as_array().to_owned();
+    let y_values = y.as_array().to_owned();
+    let centers_values = centers.as_array().to_owned();
+    let penalty_values = penalty.as_array().to_owned();
+    let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
+    let fisher_values = fisher_w.as_ref().map(|w| w.as_array().to_owned());
+    let aux_u_values = aux_u.as_ref().map(|a| a.as_array().to_owned());
+    let dim_selection_values = dim_selection_log_precision
+        .as_ref()
+        .map(|a| a.as_array().to_owned());
+    if y_values.ncols() > 1
         || matches!(
             family_normalized.as_str(),
             "multinomial" | "multinomial-logit" | "softmax" | "categorical-logit"
         )
     {
         let (design, t_mat) = build_latent_duchon_design(
-            t.as_array(),
+            t_values.view(),
             n_obs,
             latent_dim,
-            centers.as_array(),
+            centers_values.view(),
             m,
         )
         .map_err(py_value_error)?;
         let (prior_score, aux_strength_state) = latent_prior_score_and_aux_state_for_t(
             t_mat.view(),
-            aux_u.as_ref().map(|a| a.as_array()),
+            aux_u_values.as_ref().map(|a| a.view()),
             aux_family,
             aux_strength,
-            dim_selection_log_precision.as_ref().map(|a| a.as_array()),
+            dim_selection_values.as_ref().map(|a| a.view()),
         )
         .map_err(py_value_error)?;
         let analytic_score =
-            analytic_penalty_value_for_targets(&registry, t.as_array(), None)
+            analytic_penalty_value_for_targets(&registry, t_values.view(), None)
                 .map_err(py_value_error)?;
         return dense_fisher_glm_fit_to_pydict(
             py,
             design.view(),
-            y.as_array(),
-            penalty.as_array(),
-            weights.as_ref().map(|w| w.as_array()),
-            fisher_w.as_ref().map(|w| w.as_array()),
+            y_values.view(),
+            penalty_values.view(),
+            weight_values.as_ref().map(|w| w.view()),
+            fisher_values.as_ref().map(|w| w.view()),
             init_lambda,
             &family_name,
             prior_score + analytic_score,
@@ -5825,30 +5915,37 @@ fn glm_reml_fit_latent<'py>(
     let family =
         latent_glm_family_from_str(&family, tweedie_p, negbin_theta, beta_phi)
             .map_err(py_value_error)?;
-    let effective_weights = latent_scalar_weights_with_fisher(
-        n_obs,
-        weights.as_ref().map(|w| w.as_array()),
-        fisher_w.as_ref().map(|w| w.as_array()),
-    )
-    .map_err(py_value_error)?;
-    let (fit, design, _, aux_strength_state) = glm_reml_fit_latent_impl(
-        t.as_array(),
-        y.as_array(),
-        n_obs,
-        latent_dim,
-        centers.as_array(),
-        m,
-        penalty.as_array(),
-        effective_weights.as_ref().map(|w| w.view()),
-        init_lambda,
-        family,
-        aux_u.as_ref().map(|a| a.as_array()),
-        aux_family,
-        aux_strength,
-        dim_selection_log_precision.as_ref().map(|a| a.as_array()),
-        Some(&registry),
-    )
-    .map_err(py_value_error)?;
+    let analytic_penalties_for_thread = analytic_penalties.clone();
+    let latent_payload_for_thread = latent_payload.clone();
+    let (fit, design, _, aux_strength_state) =
+        detach_py_result(py, "glm_reml_fit_latent", move || {
+            let registry = build_analytic_penalty_registry_from_json(
+                Some(&latent_payload_for_thread),
+                analytic_penalties_for_thread.as_ref(),
+            )?;
+            let effective_weights = latent_scalar_weights_with_fisher(
+                n_obs,
+                weight_values.as_ref().map(|w| w.view()),
+                fisher_values.as_ref().map(|w| w.view()),
+            )?;
+            glm_reml_fit_latent_impl(
+                t_values.view(),
+                y_values.view(),
+                n_obs,
+                latent_dim,
+                centers_values.view(),
+                m,
+                penalty_values.view(),
+                effective_weights.as_ref().map(|w| w.view()),
+                init_lambda,
+                family,
+                aux_u_values.as_ref().map(|a| a.view()),
+                aux_family,
+                aux_strength,
+                dim_selection_values.as_ref().map(|a| a.view()),
+                Some(&registry),
+            )
+        })?;
     let out = PyDict::new(py);
     set_ok_glm_latent_items(py, &out, fit, n_obs, design.ncols(), aux_strength_state)?;
     Ok(out.unbind())
@@ -8259,22 +8356,21 @@ fn posterior_predict_table(
     n_draws: usize,
     n_coeffs: usize,
 ) -> PyResult<String> {
-    py.detach(move || {
+    detach_py_result(py, "posterior_predict_table", move || {
         posterior_predict_table_impl(&model_bytes, headers, rows, samples_flat, n_draws, n_coeffs)
     })
-    .map_err(py_value_error)
 }
 
 #[pyfunction]
 fn summary_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
-    py.detach(move || summary_json_impl(&model_bytes))
-        .map_err(py_value_error)
+    detach_py_result(py, "summary_json", move || summary_json_impl(&model_bytes))
 }
 
 #[pyfunction]
 fn coefficient_state_json(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
-    py.detach(move || coefficient_state_json_impl(&model_bytes))
-        .map_err(py_value_error)
+    detach_py_result(py, "coefficient_state_json", move || {
+        coefficient_state_json_impl(&model_bytes)
+    })
 }
 
 #[pyfunction]
@@ -8284,14 +8380,14 @@ fn check_json(
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
 ) -> PyResult<String> {
-    py.detach(move || check_json_impl(&model_bytes, headers, rows))
-        .map_err(py_value_error)
+    detach_py_result(py, "check_json", move || {
+        check_json_impl(&model_bytes, headers, rows)
+    })
 }
 
 #[pyfunction]
 fn report_html(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<String> {
-    py.detach(move || report_html_impl(&model_bytes))
-        .map_err(py_value_error)
+    detach_py_result(py, "report_html", move || report_html_impl(&model_bytes))
 }
 
 // =========================================================================

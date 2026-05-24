@@ -384,9 +384,6 @@ where
         &self.positions
     }
 
-    pub(crate) fn rng_clone(&self) -> SmallRng {
-        self.rng.clone()
-    }
 }
 
 #[cfg(test)]

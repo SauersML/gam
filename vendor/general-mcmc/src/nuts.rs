@@ -626,7 +626,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Benchmark test: run only when explicitly requested"]
     fn test_bench_noprogress_1() {
         let target = Rosenbrock2D {
             a: 1.0_f64,
@@ -664,7 +663,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Benchmark test: run only when explicitly requested"]
     fn test_bench_noprogress_2() {
         let target = Rosenbrock2D {
             a: 1.0_f64,

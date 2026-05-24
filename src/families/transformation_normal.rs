@@ -14395,9 +14395,14 @@ impl TransformationNormalPsiWorkspace {
             return Ok(Vec::new());
         }
 
-        let pairs: Vec<(usize, usize)> = (0..n_psi)
-            .flat_map(|i| (i..n_psi).map(move |j| (i, j)))
-            .collect();
+        let pair_count = n_psi * (n_psi + 1) / 2;
+        let pair_from_index = |pair_idx: usize| -> (usize, usize) {
+            let span = 2 * n_psi + 1;
+            let discriminant = span * span - 8 * pair_idx;
+            let row = ((span as f64 - (discriminant as f64).sqrt()) * 0.5) as usize;
+            let row_start = row * (2 * n_psi - row + 1) / 2;
+            (row, row + pair_idx - row_start)
+        };
         let trace_axes = Arc::new(axes.iter().map(|entry| entry.axis).collect::<Vec<_>>());
 
         let op = axes[0]
@@ -14446,8 +14451,7 @@ impl TransformationNormalPsiWorkspace {
             }
         }
 
-        let mut accum: Vec<PsiPairCacheAccum> = pairs
-            .iter()
+        let mut accum: Vec<PsiPairCacheAccum> = (0..pair_count)
             .map(|_| PsiPairCacheAccum::new(p_total))
             .collect();
         for start in (0..n).step_by(rows_per_chunk) {
@@ -14487,7 +14491,8 @@ impl TransformationNormalPsiWorkspace {
                 cov_psi_chunks.push(cov_psi);
             }
 
-            for (pair_idx, &(psi_i, psi_j)) in pairs.iter().enumerate() {
+            for pair_idx in 0..pair_count {
+                let (psi_i, psi_j) = pair_from_index(pair_idx);
                 let entry_i = &axes[psi_i];
                 let entry_j = &axes[psi_j];
                 let cov_ij = op
@@ -14531,7 +14536,8 @@ impl TransformationNormalPsiWorkspace {
         }
 
         let mut table = vec![vec![None; n_psi]; n_psi];
-        for ((i, j), acc) in pairs.into_iter().zip(accum.into_iter()) {
+        for (pair_idx, acc) in accum.into_iter().enumerate() {
+            let (i, j) = pair_from_index(pair_idx);
             if !acc.objective.is_finite() || !acc.score.iter().all(|v: &f64| v.is_finite()) {
                 return Err(TransformationNormalError::NonFinite { reason: format!(
                     "TransformationNormalPsiWorkspace psi-psi pair cache produced non-finite values at \

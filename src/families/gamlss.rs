@@ -23762,7 +23762,8 @@ mod tests {
         }
 
         let mut reused_factor = factor.clone();
-        let _ = dh_op.trace_projected_factor_cached(&reused_factor, &cache);
+        let cached_probe = dh_op.trace_projected_factor_cached(&reused_factor, &cache);
+        assert!(cached_probe.is_finite());
         reused_factor[[0, 0]] += 0.25;
         let dense = dh_op.to_dense();
         let dense_projected = dense.dot(&reused_factor);
@@ -23795,7 +23796,7 @@ mod tests {
             .expect("dH operator present");
         let bad_factor = Array2::<f64>::zeros((p + 1, 2));
         let cache = crate::solver::estimate::reml::unified::ProjectedFactorCache::default();
-        let _ = dh_op.trace_projected_factor_cached(&bad_factor, &cache);
+        dh_op.trace_projected_factor_cached(&bad_factor, &cache);
     }
 
     #[test]

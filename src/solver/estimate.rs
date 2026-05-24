@@ -120,7 +120,7 @@ impl std::fmt::Debug for CoefficientPriorMean {
 }
 
 impl CoefficientPriorMean {
-    pub fn scalar(value: f64) -> Self {
+    pub const fn scalar(value: f64) -> Self {
         Self::Scalar(value)
     }
 
@@ -3972,14 +3972,14 @@ pub enum Dispersion {
 
 impl Dispersion {
     #[inline]
-    pub fn phi(self) -> f64 {
+    pub const fn phi(self) -> f64 {
         match self {
             Self::Known(phi) | Self::Estimated(phi) => phi,
         }
     }
 
     #[inline]
-    pub fn is_estimated(self) -> bool {
+    pub const fn is_estimated(self) -> bool {
         matches!(self, Self::Estimated(_))
     }
 }
@@ -4148,7 +4148,7 @@ pub enum BlockRole {
 
 impl BlockRole {
     #[inline]
-    pub fn name(&self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Mean => "mean",
             Self::Location => "location",

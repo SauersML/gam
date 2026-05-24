@@ -203,7 +203,7 @@ pub struct BasisOptions {
 
 impl BasisOptions {
     /// Create options for evaluating basis functions (no derivative).
-    pub fn value() -> Self {
+    pub const fn value() -> Self {
         Self {
             derivative_order: 0,
             basis_family: BasisFamily::BSpline,
@@ -211,7 +211,7 @@ impl BasisOptions {
     }
 
     /// Create options for evaluating first derivatives of basis functions.
-    pub fn first_derivative() -> Self {
+    pub const fn first_derivative() -> Self {
         Self {
             derivative_order: 1,
             basis_family: BasisFamily::BSpline,
@@ -219,7 +219,7 @@ impl BasisOptions {
     }
 
     /// Create options for evaluating second derivatives of basis functions.
-    pub fn second_derivative() -> Self {
+    pub const fn second_derivative() -> Self {
         Self {
             derivative_order: 2,
             basis_family: BasisFamily::BSpline,
@@ -227,7 +227,7 @@ impl BasisOptions {
     }
 
     /// Create options for evaluating M-spline basis values.
-    pub fn m_spline() -> Self {
+    pub const fn m_spline() -> Self {
         Self {
             derivative_order: 0,
             basis_family: BasisFamily::MSpline,
@@ -235,7 +235,7 @@ impl BasisOptions {
     }
 
     /// Create options for evaluating I-spline basis values.
-    pub fn i_spline() -> Self {
+    pub const fn i_spline() -> Self {
         Self {
             derivative_order: 0,
             basis_family: BasisFamily::ISpline,
@@ -1614,7 +1614,7 @@ pub struct BSplineBoundaryConditions {
 }
 
 impl BSplineBoundaryConditions {
-    pub fn is_free(&self) -> bool {
+    pub const fn is_free(&self) -> bool {
         matches!(self.left, BSplineEndpointBoundaryCondition::Free)
             && matches!(self.right, BSplineEndpointBoundaryCondition::Free)
     }
@@ -1871,7 +1871,7 @@ pub fn plan_spatial_basis(
     })
 }
 
-pub fn default_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
+pub const fn default_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrategy {
     if d >= 4 {
         CenterStrategy::EqualMassCovarRepresentative { num_centers }
     } else {
@@ -1883,7 +1883,7 @@ pub fn auto_spatial_center_strategy(num_centers: usize, d: usize) -> CenterStrat
     CenterStrategy::Auto(Box::new(default_spatial_center_strategy(num_centers, d)))
 }
 
-pub fn center_strategy_is_auto(strategy: &CenterStrategy) -> bool {
+pub const fn center_strategy_is_auto(strategy: &CenterStrategy) -> bool {
     matches!(strategy, CenterStrategy::Auto(_))
 }
 
@@ -2453,6 +2453,8 @@ pub enum BasisMetadata {
         centered: bool,
         smooth_penalty: f64,
         center_mean: Option<Array1<f64>>,
+        pca_basis_path: Option<std::path::PathBuf>,
+        chunk_size: usize,
     },
     TensorBSpline {
         feature_cols: Vec<usize>,
