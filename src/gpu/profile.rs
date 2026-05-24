@@ -1,6 +1,7 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::fmt;
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
-/// Lightweight structured counter for accelerated-kernel candidates.
 #[derive(Clone, Debug)]
 pub struct KernelStat {
     pub name: &'static str,
@@ -8,31 +9,57 @@ pub struct KernelStat {
     pub p: usize,
     pub k: usize,
     pub nnz: Option<usize>,
-    pub flops_est: u128,
-    pub bytes_est: u128,
-    pub cpu_ms: Option<f64>,
-    pub gpu_ms: Option<f64>,
+    pub flops_est: f64,
+    pub bytes_est: f64,
+    pub cpu: Option<Duration>,
+    pub gpu: Option<Duration>,
 }
 
-static DISPATCH_CANDIDATES: AtomicU64 = AtomicU64::new(0);
-static GPU_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-
-#[inline]
-pub fn record_dispatch_candidate(_stat: KernelStat) {
-    DISPATCH_CANDIDATES.fetch_add(1, Ordering::Relaxed);
+impl fmt::Display for KernelStat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} n={} p={} k={} nnz={:?} flops={:.3e} bytes={:.3e} cpu_ms={:?} gpu_ms={:?}",
+            self.name,
+            self.n,
+            self.p,
+            self.k,
+            self.nnz,
+            self.flops_est,
+            self.bytes_est,
+            self.cpu.map(|d| d.as_secs_f64() * 1_000.0),
+            self.gpu.map(|d| d.as_secs_f64() * 1_000.0)
+        )
+    }
 }
 
-#[inline]
-pub fn record_gpu_fallback() {
-    GPU_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+static STATS: OnceLock<Mutex<Vec<KernelStat>>> = OnceLock::new();
+
+pub fn record(stat: KernelStat) {
+    if !profile_enabled() {
+        return;
+    }
+    let stats = STATS.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut guard) = stats.lock() {
+        guard.push(stat);
+    }
 }
 
-#[inline]
-pub fn dispatch_candidate_count() -> u64 {
-    DISPATCH_CANDIDATES.load(Ordering::Relaxed)
+#[must_use]
+pub fn take_stats() -> Vec<KernelStat> {
+    let stats = STATS.get_or_init(|| Mutex::new(Vec::new()));
+    stats
+        .lock()
+        .map_or_else(|_| Vec::new(), |mut guard| std::mem::take(&mut *guard))
 }
 
-#[inline]
-pub fn gpu_fallback_count() -> u64 {
-    GPU_FALLBACKS.load(Ordering::Relaxed)
+#[must_use]
+pub fn profile_enabled() -> bool {
+    matches!(
+        std::env::var("GAM_GPU_PROFILE")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }

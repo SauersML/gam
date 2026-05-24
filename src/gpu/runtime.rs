@@ -1,203 +1,152 @@
-use super::device::{GpuDeviceInfo, GpuSelection, classify_capability};
-use super::policy::{AccelPolicy, GpuDispatchPolicy, accel_policy_from_env};
-use libloading::Library;
-use std::ffi::c_char;
+use std::env;
+use std::process::Command;
 use std::sync::OnceLock;
 
-type CuResult = i32;
-type CuDevice = i32;
-type CuInit = unsafe extern "C" fn(u32) -> CuResult;
-type CuDeviceGetCount = unsafe extern "C" fn(*mut i32) -> CuResult;
-type CuDeviceGet = unsafe extern "C" fn(*mut CuDevice, i32) -> CuResult;
-type CuDeviceGetName = unsafe extern "C" fn(*mut c_char, i32, CuDevice) -> CuResult;
-type CuDeviceComputeCapability = unsafe extern "C" fn(*mut i32, *mut i32, CuDevice) -> CuResult;
-type CuDeviceTotalMem = unsafe extern "C" fn(*mut usize, CuDevice) -> CuResult;
+use super::device::GpuDeviceInfo;
+use super::policy::{GpuDispatchPolicy, Operation, OperationDecision};
 
-/// Cached runtime discovery result.
 #[derive(Clone, Debug)]
-pub struct GpuRuntime {
-    pub selection: GpuSelection,
+pub enum ExecutionTarget {
+    Cpu,
+    Cuda(GpuContext),
+}
+
+#[derive(Clone, Debug)]
+pub struct GpuContext {
+    pub device: GpuDeviceInfo,
     pub policy: GpuDispatchPolicy,
 }
 
+impl GpuContext {
+    #[must_use]
+    pub fn target_for(&self, op: Operation) -> OperationDecision {
+        self.policy.decide(op, true)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GpuRuntime {
+    devices: Vec<GpuDeviceInfo>,
+    selected: Option<GpuContext>,
+    cuda_feature_enabled: bool,
+    probe_message: String,
+}
+
 impl GpuRuntime {
-    #[inline]
-    pub fn get() -> &'static Self {
+    #[must_use]
+    pub fn probe() -> Self {
+        let cuda_feature_enabled = cfg!(feature = "cuda");
+        let devices = if env::var("GAM_GPU").map_or(false, |v| is_off(&v)) {
+            Vec::new()
+        } else {
+            probe_devices_with_nvidia_smi()
+        };
+        let selected_device = select_device(&devices);
+        let selected = selected_device.map(|device| {
+            let policy = GpuDispatchPolicy::from_env_and_device(Some(&device));
+            GpuContext { device, policy }
+        });
+        let probe_message = if let Some(ctx) = &selected {
+            format!(
+                "[GAM GPU] CUDA runtime probe selected {}; cargo cuda feature: {}",
+                ctx.device, cuda_feature_enabled
+            )
+        } else if cuda_feature_enabled {
+            "[GAM GPU] cuda feature enabled, but no usable CUDA device was detected; CPU fallback active".to_string()
+        } else {
+            "[GAM GPU] cuda feature disabled or no usable CUDA device detected; CPU fallback active"
+                .to_string()
+        };
+        Self {
+            devices,
+            selected,
+            cuda_feature_enabled,
+            probe_message,
+        }
+    }
+
+    #[must_use]
+    pub fn global() -> &'static Self {
         static RUNTIME: OnceLock<GpuRuntime> = OnceLock::new();
         RUNTIME.get_or_init(Self::probe)
     }
 
-    pub fn probe() -> Self {
-        let accel_policy = accel_policy_from_env();
-        if matches!(accel_policy, AccelPolicy::CpuOnly) {
-            return Self::cpu("GAM_GPU disabled acceleration".to_string(), accel_policy);
-        }
-        match probe_cuda_devices() {
-            Ok(mut devices) if !devices.is_empty() => {
-                devices.sort_by_key(|device| std::cmp::Reverse(device.score()));
-                let selected = select_device(devices);
-                let policy = GpuDispatchPolicy::for_device(accel_policy, Some(&selected));
-                Self {
-                    selection: GpuSelection::Cuda { device: selected },
-                    policy,
-                }
-            }
-            Ok(_) => Self::cpu(
-                "CUDA driver loaded but reported no devices".to_string(),
-                accel_policy,
-            ),
-            Err(err) => {
-                if matches!(accel_policy, AccelPolicy::GpuOnly) {
-                    log::warn!(
-                        "[GAM GPU] GAM_GPU=force but CUDA probing failed: {err}; falling back to CPU"
-                    );
-                }
-                Self::cpu(err, accel_policy)
-            }
-        }
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        self.selected.is_some()
     }
 
-    #[inline]
-    pub fn cuda_available(&self) -> bool {
-        matches!(self.selection, GpuSelection::Cuda { .. })
-    }
-
-    #[inline]
+    #[must_use]
     pub fn selected_device(&self) -> Option<&GpuDeviceInfo> {
-        match &self.selection {
-            GpuSelection::CpuOnly { .. } => None,
-            GpuSelection::Cuda { device } => Some(device),
-        }
+        self.selected.as_ref().map(|ctx| &ctx.device)
     }
 
-    fn cpu(reason: String, accel_policy: AccelPolicy) -> Self {
-        Self {
-            selection: GpuSelection::CpuOnly { reason },
-            policy: GpuDispatchPolicy::for_device(accel_policy, None),
-        }
+    #[must_use]
+    pub fn selected_context(&self) -> Option<&GpuContext> {
+        self.selected.as_ref()
+    }
+
+    #[must_use]
+    pub fn devices(&self) -> &[GpuDeviceInfo] {
+        &self.devices
+    }
+
+    #[must_use]
+    pub const fn cuda_feature_enabled(&self) -> bool {
+        self.cuda_feature_enabled
+    }
+
+    #[must_use]
+    pub fn probe_message(&self) -> &str {
+        &self.probe_message
     }
 }
 
-#[inline]
+#[must_use]
 pub fn gpu_available() -> bool {
-    GpuRuntime::get().cuda_available()
+    GpuRuntime::global().is_available()
 }
 
-#[inline]
+#[must_use]
 pub fn selected_gpu_info() -> Option<GpuDeviceInfo> {
-    GpuRuntime::get().selected_device().cloned()
+    GpuRuntime::global().selected_device().cloned()
 }
 
-fn select_device(devices: Vec<GpuDeviceInfo>) -> GpuDeviceInfo {
-    if let Ok(requested) = std::env::var("GAM_GPU_DEVICE") {
-        if let Ok(ordinal) = requested.parse::<usize>() {
-            if let Some(device) = devices.iter().find(|device| device.ordinal == ordinal) {
-                return device.clone();
-            }
-            log::warn!(
-                "[GAM GPU] requested GAM_GPU_DEVICE={ordinal} was not found; using best scored CUDA device"
-            );
+fn select_device(devices: &[GpuDeviceInfo]) -> Option<GpuDeviceInfo> {
+    if devices.is_empty() {
+        return None;
+    }
+    if let Ok(raw) = env::var("GAM_GPU_DEVICE") {
+        if let Ok(ordinal) = raw.parse::<usize>() {
+            return devices.iter().find(|d| d.ordinal == ordinal).cloned();
         }
     }
-    devices
-        .into_iter()
-        .next()
-        .expect("device list is non-empty")
+    devices.iter().max_by_key(|device| device.score()).cloned()
 }
 
-fn probe_cuda_devices() -> Result<Vec<GpuDeviceInfo>, String> {
-    let lib = load_cuda_driver()?;
-    let cu_init: libloading::Symbol<'_, CuInit> =
-        unsafe { lib.get(b"cuInit\0") }.map_err(|err| err.to_string())?;
-    let cu_device_get_count: libloading::Symbol<'_, CuDeviceGetCount> =
-        unsafe { lib.get(b"cuDeviceGetCount\0") }.map_err(|err| err.to_string())?;
-    let cu_device_get: libloading::Symbol<'_, CuDeviceGet> =
-        unsafe { lib.get(b"cuDeviceGet\0") }.map_err(|err| err.to_string())?;
-    let cu_device_get_name: libloading::Symbol<'_, CuDeviceGetName> =
-        unsafe { lib.get(b"cuDeviceGetName\0") }.map_err(|err| err.to_string())?;
-    let cu_device_compute_capability: libloading::Symbol<'_, CuDeviceComputeCapability> =
-        unsafe { lib.get(b"cuDeviceComputeCapability\0") }.map_err(|err| err.to_string())?;
-    let cu_device_total_mem = unsafe { lib.get::<CuDeviceTotalMem>(b"cuDeviceTotalMem_v2\0") }
-        .or_else(|_| unsafe { lib.get::<CuDeviceTotalMem>(b"cuDeviceTotalMem\0") })
-        .map_err(|err| err.to_string())?;
-
-    check_cuda(unsafe { cu_init(0) }, "cuInit")?;
-    let mut count = 0_i32;
-    check_cuda(
-        unsafe { cu_device_get_count(&mut count) },
-        "cuDeviceGetCount",
-    )?;
-    let mut devices = Vec::with_capacity(count.max(0) as usize);
-    for ordinal in 0..count.max(0) {
-        let mut raw_device = 0_i32;
-        check_cuda(
-            unsafe { cu_device_get(&mut raw_device, ordinal) },
-            "cuDeviceGet",
-        )?;
-        let mut name_bytes = [0_i8; 256];
-        check_cuda(
-            unsafe {
-                cu_device_get_name(name_bytes.as_mut_ptr(), name_bytes.len() as i32, raw_device)
-            },
-            "cuDeviceGetName",
-        )?;
-        let mut major = 0_i32;
-        let mut minor = 0_i32;
-        check_cuda(
-            unsafe { cu_device_compute_capability(&mut major, &mut minor, raw_device) },
-            "cuDeviceComputeCapability",
-        )?;
-        let mut total_memory_bytes = 0_usize;
-        check_cuda(
-            unsafe { cu_device_total_mem(&mut total_memory_bytes, raw_device) },
-            "cuDeviceTotalMem",
-        )?;
-        let name = c_name_to_string(&name_bytes);
-        devices.push(GpuDeviceInfo {
-            ordinal: ordinal as usize,
-            name,
-            compute_capability_major: major,
-            compute_capability_minor: minor,
-            total_memory_bytes,
-            free_memory_bytes: None,
-            capability: classify_capability(major, minor, total_memory_bytes),
-        });
-    }
-    Ok(devices)
-}
-
-fn load_cuda_driver() -> Result<Library, String> {
-    let candidates: &[&str] = if cfg!(target_os = "windows") {
-        &["nvcuda.dll"]
-    } else if cfg!(target_os = "macos") {
-        &["/usr/local/cuda/lib/libcuda.dylib", "libcuda.dylib"]
-    } else {
-        &["libcuda.so.1", "libcuda.so"]
+fn probe_devices_with_nvidia_smi() -> Vec<GpuDeviceInfo> {
+    let output = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=name,uuid,compute_cap,memory.total,memory.free",
+            "--format=csv,noheader,nounits",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
     };
-    let mut errors = Vec::new();
-    for candidate in candidates {
-        match unsafe { Library::new(candidate) } {
-            Ok(lib) => return Ok(lib),
-            Err(err) => errors.push(format!("{candidate}: {err}")),
-        }
+    if !output.status.success() {
+        return Vec::new();
     }
-    Err(format!(
-        "CUDA driver library not found ({})",
-        errors.join("; ")
-    ))
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .enumerate()
+        .filter_map(|(ordinal, line)| GpuDeviceInfo::from_nvidia_smi_csv(ordinal, line))
+        .collect()
 }
 
-#[inline]
-fn check_cuda(result: CuResult, call: &str) -> Result<(), String> {
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(format!("{call} failed with CUDA driver code {result}"))
-    }
-}
-
-fn c_name_to_string(bytes: &[i8]) -> String {
-    let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    let raw: Vec<u8> = bytes[..nul].iter().map(|&b| b as u8).collect();
-    String::from_utf8_lossy(&raw).trim().to_string()
+fn is_off(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "off" | "0" | "false" | "cpu" | "cpu-only"
+    )
 }
