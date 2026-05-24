@@ -24,12 +24,17 @@ fn main() {
     let mut todo_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_banned_marker(&manifest_dir, &manifest_dir, needle, &mut todo_offenders);
 
-    // `#[allow(unused_*)]` and `#[allow(dead_code)]` ban. Unused-* lints
-    // (unused_assignments, unused_variables, unused_imports, unused_mut,
-    // unused_must_use, unused_macros, unused_doc_comments, unused_attributes,
-    // unused_parens, unused_braces, ...) catch dead code or dead writes that
-    // signal a logic error. `dead_code` is the same story for unused items.
-    // Silencing them locally hides bugs — use or delete instead.
+    // `#[allow(unused_*/dead_code)]` and `#[expect(unused_*/dead_code)]`
+    // ban. Unused-* lints (unused_assignments, unused_variables,
+    // unused_imports, unused_mut, unused_must_use, unused_macros,
+    // unused_doc_comments, unused_attributes, unused_parens,
+    // unused_braces, ...) catch dead code or dead writes that signal a
+    // logic error. `dead_code` is the same story for unused items.
+    // `#[expect(...)]` is the promotion form of `#[allow(...)]` — it
+    // silences the lint exactly the same way (and additionally errors
+    // when the lint does NOT fire), so it has the same "hide the
+    // signal" failure mode and is banned identically. Use the item or
+    // delete it instead.
     let mut allow_offenders: Vec<(PathBuf, usize, String, String)> = Vec::new();
     scan_for_banned_allow(&manifest_dir, &manifest_dir, &mut allow_offenders);
 
@@ -151,10 +156,10 @@ fn main() {
 
     if !allow_offenders.is_empty() {
         sections.push(Section {
-            title: "#[allow(unused_* / dead_code)]".to_string(),
+            title: "#[allow(unused_* / dead_code)] / #[expect(unused_* / dead_code)]".to_string(),
             rows: allow_offenders
                 .iter()
-                .map(|(r, l, lint, s)| (r.clone(), *l, Some(format!("allow({lint})")), s.clone()))
+                .map(|(r, l, lint, s)| (r.clone(), *l, Some(lint.clone()), s.clone()))
                 .collect(),
         });
     }
@@ -1538,6 +1543,12 @@ fn scan_for_banned_allow(
     dir: &Path,
     offenders: &mut Vec<(PathBuf, usize, String, String)>,
 ) {
+    // Attribute prefixes that silence the unused-* / dead-code lints. Both
+    // `allow` and `expect` defeat the lint's signal — `expect` is the
+    // promotion form ("error if the lint does NOT fire") which is just
+    // as load-bearing as `allow` for hiding dead/unused code. Treat them
+    // identically.
+    const SILENCERS: &[&str] = &["allow(", "expect("];
     visit_files(root, dir, &mut |rel, content| {
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         if rel_str == "build.rs" {
@@ -1546,44 +1557,50 @@ fn scan_for_banned_allow(
         if rel.extension().and_then(OsStr::to_str) != Some("rs") {
             return;
         }
-        if !content.contains("allow(") {
+        if !SILENCERS.iter().any(|s| content.contains(s)) {
             return;
         }
         for (idx, line) in content.lines().enumerate() {
             // Strip line comments (`//`, `///`, `//!`) so that doc/comment
             // text mentioning the attribute syntax is not flagged. String
-            // literals containing `allow(` would still be matched, but the
-            // codebase does not embed such literals.
+            // literals containing `allow(`/`expect(` would still be
+            // matched, but the codebase does not embed such literals.
             let code = match line.find("//") {
                 Some(pos) => &line[..pos],
                 None => line,
             };
-            // Only match when `allow(` is part of an attribute on this
+            // Only match when the silencer is part of an attribute on this
             // line: preceded somewhere by `#[` or `#![`.
             if !code.contains("#[") && !code.contains("#![") {
                 continue;
             }
-            let mut search_from = 0usize;
-            while let Some(rel_idx) = code[search_from..].find("allow(") {
-                let start = search_from + rel_idx + "allow(".len();
-                let Some(end_rel) = code[start..].find(')') else {
-                    break;
-                };
-                let inside = &code[start..start + end_rel];
-                for tok in inside.split(',') {
-                    let t = tok.trim().trim_start_matches("clippy::");
-                    if t.starts_with("unused") || t == "dead_code" {
-                        offenders.push((
-                            rel.to_path_buf(),
-                            idx + 1,
-                            t.to_string(),
-                            line.to_string(),
-                        ));
+            for silencer in SILENCERS {
+                let mut search_from = 0usize;
+                while let Some(rel_idx) = code[search_from..].find(silencer) {
+                    let start = search_from + rel_idx + silencer.len();
+                    let Some(end_rel) = code[start..].find(')') else {
+                        break;
+                    };
+                    let inside = &code[start..start + end_rel];
+                    for tok in inside.split(',') {
+                        let t = tok.trim().trim_start_matches("clippy::");
+                        if t.starts_with("unused") || t == "dead_code" {
+                            // Label includes which attribute fired so the
+                            // report distinguishes `allow(...)` from
+                            // `expect(...)`.
+                            let attr = silencer.trim_end_matches('(');
+                            offenders.push((
+                                rel.to_path_buf(),
+                                idx + 1,
+                                format!("{attr}({t})"),
+                                line.to_string(),
+                            ));
+                        }
                     }
-                }
-                search_from = start + end_rel + 1;
-                if search_from >= code.len() {
-                    break;
+                    search_from = start + end_rel + 1;
+                    if search_from >= code.len() {
+                        break;
+                    }
                 }
             }
         }
