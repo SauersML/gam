@@ -53,10 +53,11 @@ use crate::terms::latent_coord::{
 };
 use crate::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, RowPrecisionPriorPenalty,
-    BlockSparsityPenalty, DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty,
-    NuclearNormPenalty, OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty,
-    PenaltyConcavity, PenaltyTier, PsiSlice, ScadMcpPenalty, SoftmaxAssignmentSparsityPenalty,
-    ScalarWeightSchedule, ScheduleKind, SparsityPenalty, TotalVariationPenalty,
+    BlockOrthogonalityPenalty, BlockSparsityPenalty, DifferenceOpKind, IBPAssignmentPenalty,
+    IsometryPenalty, NuclearNormPenalty, OrthogonalityPenalty,
+    ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice, ScadMcpPenalty,
+    SoftmaxAssignmentSparsityPenalty, ScalarWeightSchedule, ScheduleKind, SparsityPenalty,
+    TotalVariationPenalty,
 };
 use crate::survival::PenaltyBlock;
 use crate::types::{
@@ -3387,6 +3388,42 @@ fn build_standard_latent_analytic_penalty_registry(
                     None => penalty,
                 };
                 registry.push(AnalyticPenaltyKind::ScadMcp(Arc::new(penalty)));
+            }
+            "block_orthogonality" => {
+                let raw_groups = descriptor
+                    .get("groups")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| format!("{context}.groups is required"))?;
+                let mut groups = Vec::with_capacity(raw_groups.len());
+                for (group_idx, raw_group) in raw_groups.iter().enumerate() {
+                    let raw_axes = raw_group.as_array().ok_or_else(|| {
+                        format!("{context}.groups[{group_idx}] must be a list of latent axes")
+                    })?;
+                    let mut group = Vec::with_capacity(raw_axes.len());
+                    for (axis_idx, raw_axis) in raw_axes.iter().enumerate() {
+                        let axis = raw_axis.as_u64().ok_or_else(|| {
+                            format!(
+                                "{context}.groups[{group_idx}][{axis_idx}] must be a non-negative integer"
+                            )
+                        })? as usize;
+                        group.push(axis);
+                    }
+                    groups.push(group);
+                }
+                let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
+                let n_eff = analytic_descriptor_usize(descriptor, "n_eff", target.n)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                let penalty =
+                    BlockOrthogonalityPenalty::new(slice, groups, weight, n_eff, learnable)
+                        .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(AnalyticPenaltyKind::BlockOrthogonality(Arc::new(penalty)));
             }
             "ibp_assignment" | "ibp_assignment_penalty" => {
                 let k_max = analytic_descriptor_usize(descriptor, "k_max", target.d)?;

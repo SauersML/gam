@@ -1,4 +1,4 @@
-"""Analytic structured penalties: isometry, sparsity, SCAD/MCP, ARD, TV, nuclear norm, block sparsity, orthogonality.
+"""Analytic structured penalties: isometry, sparsity, SCAD/MCP, ARD, TV, nuclear norm, block sparsity, block orthogonality, orthogonality.
 
 Thin Python configuration wrappers around the analytic primitives
 implemented in `src/terms/analytic_penalties.rs`. Each wrapper is a
@@ -33,6 +33,9 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
 * `BlockSparsityPenalty` lives on t. Group-lasso smoothed L¹ on predefined
   latent-axis blocks, shrinking whole groups rather than individual entries
   or single ARD axes.
+* `BlockOrthogonalityPenalty` lives on t. Penalizes only between-block
+  cross-products, leaving each block internally free; this is the
+  auto_exp_38 supervised gauge-fix block plus free discovery block pattern.
 * `AuxConditionalPriorPenalty` lives on t. Fixed-precomputed iVAE-style
   row-conditional precision, the auxiliary-supervised sibling to ARD/Ortho
   from `proposals/composition_engine.md` §4(c).
@@ -65,6 +68,7 @@ __all__ = [
     "TotalVariationPenalty",
     "NuclearNormPenalty",
     "BlockSparsityPenalty",
+    "BlockOrthogonalityPenalty",
     "AuxConditionalPriorPenalty",
     "ParametricAuxConditionalPriorPenalty",
     "OrthogonalityPenalty",
@@ -187,7 +191,7 @@ def _inverse_softplus(x: np.ndarray) -> np.ndarray:
     return out
 
 
-@dataclass
+@dataclass(init=False)
 class IsometryPenalty:
     """Pull the decoder's pullback metric toward a reference metric on the
     latent manifold.
@@ -201,10 +205,9 @@ class IsometryPenalty:
         P_\\mathrm{iso}(t; \\rho) \\;=\\; \\tfrac12\\, e^{\\rho_\\mathrm{iso}}
             \\sum_n \\bigl\\| J_n^T J_n - g^\\mathrm{ref}_n \\bigr\\|_F^2
 
-    with ``g^\\mathrm{ref}`` either the identity (``reference="euclidean"``,
-    pulling toward a local isometry) or a per-row reference metric supplied
-    by the caller. ``e^{\\rho_\\mathrm{iso}}`` is REML-selectable like any
-    other smoothing weight.
+    with ``g^\\mathrm{ref}`` fixed to the identity, pulling toward a local
+    isometry. ``e^{\\rho_\\mathrm{iso}}`` is REML-selectable like any other
+    smoothing weight.
 
     **When to use.** Whenever a ``LatentCoord`` block is in play and there is
     no auxiliary prior to break the diffeomorphism gauge. The bare data-fit
@@ -219,25 +222,28 @@ class IsometryPenalty:
     target
         Either the name of a ``LatentCoord`` block (``"t"``) or the
         ``LatentCoord`` object itself.
-    reference
-        ``"euclidean"`` for the identity reference metric, or a callable /
-        array yielding per-row ``(d, d)`` reference metrics.
     weight
         ``"auto"`` (REML-selected; the default) or a fixed positive float.
     """
 
     target: TargetSpec
-    reference: Any = "euclidean"
     weight: WeightSpec = "auto"
     weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
 
+    def __init__(
+        self,
+        weight: WeightSpec = "auto",
+        *,
+        target: TargetSpec = "t",
+        weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None,
+    ) -> None:
+        self.target = target
+        self.weight = weight
+        self.weight_schedule = weight_schedule
+        self.__post_init__()
+
     def __post_init__(self) -> None:
         _validate_weight(self.weight, "IsometryPenalty")
-        if isinstance(self.reference, str) and self.reference != "euclidean":
-            raise ValueError(
-                "IsometryPenalty.reference: only 'euclidean' is supported as a string; "
-                "pass an (N, d, d) array or callable for user-supplied references."
-            )
 
     def _to_rust_payload(self) -> dict[str, Any]:
         """Spec for the Rust `AnalyticPenaltyRegistry::push` builder.
@@ -249,7 +255,6 @@ class IsometryPenalty:
         return _add_weight_schedule({
             "kind": "isometry",
             "target": _target_descriptor(self.target),
-            "reference": self.reference if isinstance(self.reference, str) else "user_supplied",
             "weight": self.weight,
         }, self)
 
@@ -257,7 +262,7 @@ class IsometryPenalty:
         return self._to_rust_payload()
 
 
-@dataclass
+@dataclass(init=False)
 class SparsityPenalty:
     """Smoothed-L¹ / Hoyer / Log sparsifier on a β or t slice.
 
@@ -305,6 +310,24 @@ class SparsityPenalty:
     eps: float = 1e-3
     eps_weight: Literal["auto", "fixed"] = "fixed"
     weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
+
+    def __init__(
+        self,
+        kind: Literal["smooth_l1", "hoyer", "log"] = "smooth_l1",
+        weight: WeightSpec = "auto",
+        eps: float = 1e-3,
+        eps_weight: Literal["auto", "fixed"] = "fixed",
+        *,
+        target: TargetSpec = "t",
+        weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None,
+    ) -> None:
+        self.target = target
+        self.kind = kind
+        self.weight = weight
+        self.eps = float(eps)
+        self.eps_weight = eps_weight
+        self.weight_schedule = weight_schedule
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         _validate_weight(self.weight, "SparsityPenalty")
@@ -420,7 +443,7 @@ class ScadMcpPenalty:
         return self._to_rust_payload()
 
 
-@dataclass
+@dataclass(init=False)
 class ARDPenalty:
     """Automatic Relevance Determination over latent axes.
 
@@ -445,38 +468,30 @@ class ARDPenalty:
     ----------
     target
         The ``LatentCoord`` block (or its name).
-    weight
-        ``"auto"`` (REML-selected per axis; the default) or a length-``d``
-        sequence of fixed positive floats.
+    weight_schedule
+        Optional scalar annealing schedule for the ARD base multiplier.
     """
 
     target: TargetSpec
-    weight: Any = "auto"
     weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
 
+    def __init__(
+        self,
+        *,
+        target: TargetSpec = "t",
+        weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None,
+    ) -> None:
+        self.target = target
+        self.weight_schedule = weight_schedule
+        self.__post_init__()
+
     def __post_init__(self) -> None:
-        if isinstance(self.weight, str):
-            if self.weight != "auto":
-                raise ValueError(
-                    "ARDPenalty.weight: only 'auto' is accepted as a string"
-                )
-        else:
-            try:
-                vals = [float(v) for v in self.weight]
-            except TypeError as exc:
-                raise TypeError(
-                    "ARDPenalty.weight must be 'auto' or a sequence of floats"
-                ) from exc
-            if not vals:
-                raise ValueError("ARDPenalty.weight must have at least one entry")
-            if any(v <= 0.0 for v in vals):
-                raise ValueError("ARDPenalty.weight entries must be > 0")
+        pass
 
     def _to_rust_payload(self) -> dict[str, Any]:
         return _add_weight_schedule({
             "kind": "ard",
             "target": _target_descriptor(self.target),
-            "weight": self.weight,
         }, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
@@ -781,6 +796,114 @@ class BlockSparsityPenalty:
             "weight": self.weight,
             "n_eff": self.n_eff,
             "smoothing_eps": self.smoothing_eps,
+            "learnable": self.learnable,
+        }, self)
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
+
+
+@dataclass(init=False)
+class BlockOrthogonalityPenalty:
+    """Between-block-only orthogonality over latent-axis groups.
+
+    Penalizes ``0.5 * weight * sum_{g<h} ||T[:, G_g].T @ T[:, G_h]||²_F``
+    while leaving each within-block Gram matrix unconstrained. This codifies
+    the ``auto_exp_38`` pattern: supervise one block via an auxiliary
+    conditional prior, leave a companion block free, and force the two blocks
+    to be orthogonal so the supervised gauge anchors the free axes.
+
+    Parameters
+    ----------
+    groups
+        Partition of latent column indices, e.g. ``[[0, 1, 2], [3, 4, 5]]``.
+    weight
+        Fixed base weight, or the base multiplier when ``learnable=True``.
+    n_eff
+        Number of rows in the row-major latent coefficient block.
+    learnable
+        If true, expose one REML-selectable log-weight ``ρ``.
+    target
+        The ``LatentCoord`` block name/object. Defaults to ``"t"``.
+    """
+
+    target: TargetSpec
+    groups: list[list[int]]
+    weight: float
+    n_eff: int
+    learnable: bool
+
+    def __init__(
+        self,
+        groups: Any,
+        weight: float,
+        n_eff: int,
+        learnable: bool = False,
+        *,
+        target: TargetSpec = "t",
+    ) -> None:
+        self.target = target
+        self.groups = self._coerce_groups(groups)
+        self.weight = float(weight)
+        self.n_eff = int(n_eff)
+        self.learnable = bool(learnable)
+        self.weight_schedule = None
+        self.__post_init__()
+
+    @staticmethod
+    def _coerce_groups(groups: Any) -> list[list[int]]:
+        try:
+            coerced = [[index(axis) for axis in group] for group in groups]
+        except TypeError as exc:
+            raise TypeError(
+                "BlockOrthogonalityPenalty.groups must be a sequence of integer sequences"
+            ) from exc
+        if len(coerced) < 2:
+            raise ValueError("BlockOrthogonalityPenalty.groups must contain at least two groups")
+        seen: set[int] = set()
+        for group_idx, group in enumerate(coerced):
+            if not group:
+                raise ValueError(
+                    f"BlockOrthogonalityPenalty.groups[{group_idx}] must not be empty"
+                )
+            for axis in group:
+                if axis < 0:
+                    raise ValueError(
+                        "BlockOrthogonalityPenalty.groups entries must be non-negative; "
+                        f"got {axis}"
+                    )
+                if axis in seen:
+                    raise ValueError(
+                        f"BlockOrthogonalityPenalty.groups axis {axis} appears more than once"
+                    )
+                seen.add(axis)
+        max_axis = max(seen)
+        missing = set(range(max_axis + 1)) - seen
+        if missing:
+            first = min(missing)
+            raise ValueError(
+                "BlockOrthogonalityPenalty.groups must partition contiguous axes from 0; "
+                f"missing axis {first}"
+            )
+        return coerced
+
+    def __post_init__(self) -> None:
+        if not self.weight > 0.0:
+            raise ValueError(
+                f"BlockOrthogonalityPenalty.weight must be > 0, got {self.weight}"
+            )
+        if self.n_eff <= 0:
+            raise ValueError(
+                f"BlockOrthogonalityPenalty.n_eff must be > 0, got {self.n_eff}"
+            )
+
+    def _to_rust_payload(self) -> dict[str, Any]:
+        return _add_weight_schedule({
+            "kind": "block_orthogonality",
+            "target": _target_descriptor(self.target),
+            "groups": self.groups,
+            "weight": self.weight,
+            "n_eff": self.n_eff,
             "learnable": self.learnable,
         }, self)
 
@@ -1102,14 +1225,32 @@ class OrthogonalityPenalty:
         return self._to_rust_payload()
 
 
-@dataclass
+@dataclass(init=False)
 class IBPAssignmentPenalty:
     target: TargetSpec
     k_max: int
     alpha: float = 1.0
     tau: float = 1.0
-    learnable_alpha: bool = False
+    learnable: bool = False
     weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
+
+    def __init__(
+        self,
+        k_max: int,
+        alpha: float = 1.0,
+        tau: float = 1.0,
+        learnable: bool = False,
+        *,
+        target: TargetSpec = "t",
+        weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None,
+    ) -> None:
+        self.target = target
+        self.k_max = int(k_max)
+        self.alpha = float(alpha)
+        self.tau = float(tau)
+        self.learnable = bool(learnable)
+        self.weight_schedule = weight_schedule
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if self.k_max <= 0:
@@ -1126,19 +1267,33 @@ class IBPAssignmentPenalty:
             "k_max": int(self.k_max),
             "alpha": float(self.alpha),
             "tau": float(self.tau),
-            "learnable_alpha": bool(self.learnable_alpha),
+            "learnable": bool(self.learnable),
         }, self)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
         return self._to_rust_payload()
 
 
-@dataclass
+@dataclass(init=False)
 class SoftmaxAssignmentSparsityPenalty:
     target: TargetSpec
     k_atoms: int
     temperature: float = 1.0
     weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None
+
+    def __init__(
+        self,
+        k_atoms: int,
+        temperature: float = 1.0,
+        *,
+        target: TargetSpec = "t",
+        weight_schedule: ScalarWeightSchedule | dict[str, Any] | None = None,
+    ) -> None:
+        self.target = target
+        self.k_atoms = int(k_atoms)
+        self.temperature = float(temperature)
+        self.weight_schedule = weight_schedule
+        self.__post_init__()
 
     def __post_init__(self) -> None:
         if self.k_atoms <= 0:
