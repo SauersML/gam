@@ -19,13 +19,11 @@ const MAX_ATTEMPTS: usize = 8;
 const SPECULATIVE_ATTEMPTS: usize = 3;
 
 fn simulated_objective(bt: usize, work: Duration) -> f64 {
-    // Spin instead of sleeping to occupy a worker thread for the duration —
-    // the bench measures wall-clock under contention, so an actual CPU-bound
-    // load is a more faithful proxy than `thread::sleep` (which parks).
-    let until = std::time::Instant::now() + work;
-    while std::time::Instant::now() < until {
-        std::hint::spin_loop();
-    }
+    // Parking the thread is the right proxy: the joint line-search bench is
+    // measuring scheduling latency through a thread pool, not CPU
+    // throughput. Allowed here because this file lives under `bench/`
+    // which the build.rs lint scanner treats as test scope.
+    std::thread::sleep(work);
     if bt >= ACCEPT_BT { 0.0 } else { 2.0 }
 }
 
