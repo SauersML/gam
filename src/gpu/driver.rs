@@ -18,10 +18,9 @@ use std::borrow::Cow;
 use super::error::GpuError;
 
 pub type CuResult = i32;
-// SAFETY: FFI fn-pointer alias for the libcuda driver entry of the same
-// name; `unsafe extern "C"` matches the C ABI we resolve via dlsym below
-// and propagates the call's obligation (live context, in-range pointers
-// and sizes) up to the invoker.
+// SAFETY: libcuda FFI fn-pointer alias matching the C ABI we dlsym
+// below; the `unsafe` qualifier propagates the call-site obligations
+// (live context, valid pointers/sizes) up to each invoker.
 type CuInit = unsafe extern "C" fn(u32) -> CuResult;
 // SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
 type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> CuResult;
