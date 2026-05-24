@@ -1364,6 +1364,78 @@ fn create_cyclic_bspline_basis_dense(
     Ok((cyclic, knots))
 }
 
+fn bspline_raw_column_count(
+    knots: &Array1<f64>,
+    degree: usize,
+    periodic: Option<(f64, f64, usize)>,
+) -> Result<usize, String> {
+    if let Some((_, _, num_basis)) = periodic {
+        if num_basis <= degree {
+            return Err(format!(
+                "streaming cyclic B-spline basis requires more basis functions ({num_basis}) than degree ({degree})"
+            ));
+        }
+        return Ok(num_basis);
+    }
+    knots
+        .len()
+        .checked_sub(degree + 1)
+        .filter(|&p| p > 0)
+        .ok_or_else(|| {
+            format!(
+                "streaming B-spline knots length {} is too short for degree {}",
+                knots.len(),
+                degree
+            )
+        })
+}
+
+fn bspline_raw_row_chunk(
+    data: ArrayView1<'_, f64>,
+    knots: ArrayView1<'_, f64>,
+    degree: usize,
+    periodic: Option<(f64, f64, usize)>,
+    start: usize,
+    end: usize,
+) -> Result<Array2<f64>, BasisError> {
+    if start > end || end > data.len() {
+        return Err(BasisError::DimensionMismatch(format!(
+            "B-spline row chunk [{start}, {end}) is out of bounds for {} rows",
+            data.len()
+        )));
+    }
+    let chunk = data.slice(s![start..end]);
+    if let Some((domain_start, period, num_basis)) = periodic {
+        if period <= 0.0 {
+            return Err(BasisError::InvalidInput(format!(
+                "periodic B-spline period must be positive, got {period}"
+            )));
+        }
+        let wrapped = chunk.mapv(|x| wrap_to_period(x, domain_start, period));
+        let (extended, _) = create_basis::<Dense>(
+            wrapped.view(),
+            KnotSource::Provided(knots),
+            degree,
+            BasisOptions::value(),
+        )?;
+        let mut cyclic = Array2::<f64>::zeros((chunk.len(), num_basis));
+        for i in 0..extended.nrows() {
+            for j in 0..extended.ncols() {
+                cyclic[[i, j % num_basis]] += extended[[i, j]];
+            }
+        }
+        Ok(cyclic)
+    } else {
+        let (basis, _) = create_basis::<Dense>(
+            chunk,
+            KnotSource::Provided(knots),
+            degree,
+            BasisOptions::value(),
+        )?;
+        Ok((*basis).clone())
+    }
+}
+
 fn is_effectively_uniform_knot_geometry(knot_vector: &Array1<f64>, degree: usize) -> bool {
     if knot_vector.len() <= degree + 2 {
         return true;
