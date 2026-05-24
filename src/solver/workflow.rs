@@ -3483,7 +3483,7 @@ fn build_standard_latent_analytic_penalty_registry(
                 };
                 registry.push(AnalyticPenaltyKind::BlockSparsity(Arc::new(penalty)));
             }
-            "row_precision_prior" => {
+            "row_precision_prior" | "aux_conditional_prior" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = analytic_descriptor_usize(descriptor, "n_eff", target.n)?;
                 let learnable = descriptor
@@ -3529,7 +3529,7 @@ fn build_standard_latent_analytic_penalty_registry(
                 };
                 registry.push(AnalyticPenaltyKind::IvaeRidgeMeanGauge(Arc::new(penalty)));
             }
-            "parametric_row_precision_prior" => {
+            "parametric_row_precision_prior" | "parametric_aux_conditional_prior" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = analytic_descriptor_usize(descriptor, "n_eff", target.n)?;
                 let learnable = descriptor
