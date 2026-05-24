@@ -93,7 +93,7 @@
 //! hook, please re-read the audit revisions in `proposals/latent_coord.md`
 //! §7 and `proposals/composition_engine.md` §7 first.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
+use ndarray::{Array1, Array2, ArrayView1};
 use std::sync::Arc;
 
 use crate::solver::persistent_warm_start::StableHasher;

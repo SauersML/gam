@@ -691,9 +691,9 @@ fn duchon_basis<'py>(
     } else {
         (None, duchon_nullspace_from_m(m), 0.0)
     };
-    // Multi-D periodic: route through the mixed-periodicity builder
-    // (cylinder/torus chord-distance polyharmonic).
-    if any_periodic && d > 1 {
+    // Any periodic axis (1D or multi-D) routes through the mixed-periodicity
+    // builder (cylinder/torus chord-distance polyharmonic).
+    if any_periodic {
         let spec = DuchonBasisSpec {
             center_strategy: CenterStrategy::UserProvided(ctrs.to_owned()),
             length_scale: spec_length_scale,
@@ -718,21 +718,7 @@ fn duchon_basis<'py>(
         aniso_log_scales: None,
         operator_penalties: Default::default(),
         periodic: None,
-        boundary: if any_periodic && d == 1 {
-            let left = ctrs[[0, 0]];
-            let right = ctrs[[ctrs.nrows() - 1, 0]];
-            if !(left.is_finite() && right.is_finite() && right > left) {
-                return Err(py_value_error(
-                    "periodic Duchon centers must define a finite ordered domain".to_string(),
-                ));
-            }
-            OneDimensionalBoundary::Cyclic {
-                start: left,
-                end: right,
-            }
-        } else {
-            OneDimensionalBoundary::Open
-        },
+        boundary: OneDimensionalBoundary::Open,
     };
     let built = build_duchon_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
     Ok(built.design.to_dense().into_pyarray(py).unbind())

@@ -12,8 +12,6 @@ pub mod cpu_traits;
 pub mod device;
 pub mod driver;
 pub mod error;
-pub mod graph;
-pub mod kernels;
 pub mod linalg;
 pub mod memory;
 pub mod policy;
@@ -22,8 +20,6 @@ pub mod rand;
 pub mod runtime;
 pub mod solver;
 pub mod sparse;
-pub mod stream;
-pub mod validate;
 
 pub use cpu_traits::{
     DeviceBlas, DeviceDesignOperator, DeviceSolver, ExecutionTarget, MatrixLocation,
