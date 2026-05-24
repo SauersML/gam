@@ -10164,34 +10164,6 @@ fn sample_table_impl(
     serialize_sample_payload(&model, &nuts, &cfg)
 }
 
-/// Stable lower-kebab-case name of a `LikelihoodSpec`, matching the strings
-/// the saved-model payload's `family` field used to carry under the legacy
-/// flat-family `name()` enum. Used in the `FittedModelPayload::new`
-/// third argument and in user-visible error messages.
-fn likelihood_spec_legacy_name(family: &LikelihoodSpec) -> &'static str {
-    match (&family.response, &family.link) {
-        (ResponseFamily::Gaussian, _) => "gaussian",
-        (ResponseFamily::Poisson, _) => "poisson-log",
-        (ResponseFamily::Tweedie { .. }, _) => "tweedie-log",
-        (ResponseFamily::NegativeBinomial { .. }, _) => "negative-binomial-log",
-        (ResponseFamily::Beta { .. }, _) => "beta-regression-logit",
-        (ResponseFamily::Gamma, _) => "gamma-log",
-        (ResponseFamily::RoystonParmar, _) => "royston-parmar",
-        (ResponseFamily::Binomial, link) => match link {
-            InverseLink::Standard(LinkFunction::Logit) => "binomial-logit",
-            InverseLink::Standard(LinkFunction::Probit) => "binomial-probit",
-            InverseLink::Standard(LinkFunction::CLogLog) => "binomial-cloglog",
-            InverseLink::Standard(LinkFunction::Sas) => "binomial-sas",
-            InverseLink::Standard(LinkFunction::BetaLogistic) => "binomial-beta-logistic",
-            InverseLink::Standard(_) => "binomial-logit",
-            InverseLink::LatentCLogLog(_) => "latent-cloglog-binomial",
-            InverseLink::Sas(_) => "binomial-sas",
-            InverseLink::BetaLogistic(_) => "binomial-beta-logistic",
-            InverseLink::Mixture(_) => "binomial-blended-inverse-link",
-        },
-    }
-}
-
 /// plain string on the Python side (the Rust `LikelihoodSpec` itself is
 /// Returns the inverse-link kind tag emitted to the Python wrapper.
 ///
@@ -13868,7 +13840,7 @@ fn build_standard_payload(
         saved_latent_cloglog_state_from_fit(&saved_fit)
     };
     let family_link = family.link_function();
-    let family_name = likelihood_spec_legacy_name(&family).to_string();
+    let family_name = family.name().to_string();
     let mut payload = FittedModelPayload::new(
         MODEL_VERSION,
         formula,
