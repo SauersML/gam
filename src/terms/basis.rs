@@ -2488,6 +2488,7 @@ pub enum BasisMetadata {
         knots: Array1<f64>,
         identifiability_transform: Option<Array2<f64>>,
         periodic: Option<(f64, f64, usize)>,
+        streaming_chunk_size: Option<usize>,
     },
     ThinPlate {
         centers: Array2<f64>,
@@ -7688,8 +7689,7 @@ pub fn build_bspline_basis_1d(
                 "periodic B-splines cannot also declare endpoint boundary conditions".to_string(),
             ));
         }
-        let (basis, knots) =
-            create_cyclic_bspline_basis_dense(data, start, end, spec.degree, num_basis)?;
+        let knots = cyclic_uniform_knot_vector(start, end, spec.degree, num_basis);
         let s_bend_raw = create_cyclic_difference_penalty_matrix(num_basis, spec.penalty_order)?;
         let mut penalties_raw = vec![PenaltyCandidate {
             matrix: s_bend_raw.clone(),
@@ -7715,30 +7715,58 @@ pub fn build_bspline_basis_1d(
             .iter()
             .map(|candidate| candidate.matrix.clone())
             .collect();
-        let (design_c, penalty_mats, identifiability_transform) =
-            apply_bspline_identifiability_policy(
-                basis,
-                penalties_raw_mats,
-                &knots,
-                spec.degree,
-                &spec.identifiability,
-            )?;
-        let transformed_candidates = penalty_mats
-            .into_iter()
-            .zip(penalties_raw.into_iter())
-            .map(|(matrix, candidate)| PenaltyCandidate {
-                nullspace_dim_hint: candidate.nullspace_dim_hint,
-                matrix,
-                source: candidate.source,
-                normalization_scale: candidate.normalization_scale,
-                kronecker_factors: None,
-                op: None,
-            })
-            .collect();
+        let (design, transformed_candidates, identifiability_transform) =
+            if spec.streaming_chunk_size.is_some() {
+                log::info!(
+                    "B-spline basis using explicit streaming evaluator: n={} p={} chunk_size={}",
+                    data.len(),
+                    num_basis,
+                    spec.streaming_chunk_size.unwrap_or(2048).max(1),
+                );
+                build_streaming_bspline_design_and_candidates(
+                    data,
+                    &knots,
+                    spec.degree,
+                    spec.boundary_conditions,
+                    Some((start, end - start, num_basis)),
+                    &spec.identifiability,
+                    penalties_raw,
+                    penalties_raw_mats,
+                    spec.streaming_chunk_size,
+                )?
+            } else {
+                let (basis, _) =
+                    create_cyclic_bspline_basis_dense(data, start, end, spec.degree, num_basis)?;
+                let (design_c, penalty_mats, identifiability_transform) =
+                    apply_bspline_identifiability_policy(
+                        basis,
+                        penalties_raw_mats,
+                        &knots,
+                        spec.degree,
+                        &spec.identifiability,
+                    )?;
+                let transformed_candidates = penalty_mats
+                    .into_iter()
+                    .zip(penalties_raw.into_iter())
+                    .map(|(matrix, candidate)| PenaltyCandidate {
+                        nullspace_dim_hint: candidate.nullspace_dim_hint,
+                        matrix,
+                        source: candidate.source,
+                        normalization_scale: candidate.normalization_scale,
+                        kronecker_factors: None,
+                        op: None,
+                    })
+                    .collect();
+                (
+                    DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design_c)),
+                    transformed_candidates,
+                    identifiability_transform,
+                )
+            };
         let (penalties, nullspace_dims, penaltyinfo, ops) =
             filter_active_penalty_candidates_with_ops(transformed_candidates)?;
         return Ok(BasisBuildResult {
-            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design_c)),
+            design,
             penalties,
             nullspace_dims,
             penaltyinfo,
@@ -7746,6 +7774,105 @@ pub fn build_bspline_basis_1d(
                 knots,
                 identifiability_transform,
                 periodic: Some((start, end - start, num_basis)),
+                streaming_chunk_size: spec.streaming_chunk_size,
+            },
+            kronecker_factored: None,
+            ops,
+        });
+    }
+    if spec.streaming_chunk_size.is_some() {
+        let knots = match &spec.knotspec {
+            BSplineKnotSpec::Generate {
+                data_range,
+                num_internal_knots,
+            } => internal::generate_full_knot_vector(*data_range, *num_internal_knots, spec.degree)?,
+            BSplineKnotSpec::Provided(knots) => knots.clone(),
+            BSplineKnotSpec::Automatic {
+                num_internal_knots,
+                placement,
+            } => {
+                let inferred = num_internal_knots.unwrap_or_else(|| {
+                    default_internal_knot_count_for_data(data.len(), spec.degree)
+                });
+                match placement {
+                    BSplineKnotPlacement::Uniform => {
+                        let range = finite_data_range(data)?;
+                        internal::generate_full_knot_vector(range, inferred, spec.degree)?
+                    }
+                    BSplineKnotPlacement::Quantile => {
+                        internal::generate_full_knot_vector_quantile(data, inferred, spec.degree)?
+                    }
+                }
+            }
+            BSplineKnotSpec::PeriodicUniform { .. } => {
+                return Err(BasisError::InvalidInput(
+                    "periodic B-spline must be handled before non-periodic streaming".to_string(),
+                ));
+            }
+        };
+        let p_raw = knots.len().checked_sub(spec.degree + 1).ok_or_else(|| {
+            BasisError::InvalidInput("invalid B-spline knot/degree combination".to_string())
+        })?;
+        let greville_for_penalty = penalty_greville_abscissae_for_knots(&knots, spec.degree)?;
+        let s_bend_raw = create_difference_penalty_matrix(
+            p_raw,
+            spec.penalty_order,
+            greville_for_penalty.as_ref().map(|g| g.view()),
+        )?;
+        let mut penalties_raw = vec![PenaltyCandidate {
+            matrix: s_bend_raw.clone(),
+            nullspace_dim_hint: 0,
+            source: PenaltySource::Primary,
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+            op: None,
+        }];
+        if spec.double_penalty {
+            penalties_raw.push(PenaltyCandidate {
+                matrix: build_nullspace_shrinkage_penalty(&s_bend_raw)?
+                    .map(|shrink| shrink.sym_penalty)
+                    .unwrap_or_else(|| Array2::<f64>::zeros(s_bend_raw.raw_dim())),
+                nullspace_dim_hint: 0,
+                source: PenaltySource::DoublePenaltyNullspace,
+                normalization_scale: 1.0,
+                kronecker_factors: None,
+                op: None,
+            });
+        }
+        let penalties_raw_mats = penalties_raw
+            .iter()
+            .map(|candidate| candidate.matrix.clone())
+            .collect();
+        log::info!(
+            "B-spline basis using explicit streaming evaluator: n={} p={} chunk_size={}",
+            data.len(),
+            p_raw,
+            spec.streaming_chunk_size.unwrap_or(2048).max(1),
+        );
+        let (design, transformed_candidates, identifiability_transform) =
+            build_streaming_bspline_design_and_candidates(
+                data,
+                &knots,
+                spec.degree,
+                spec.boundary_conditions,
+                None,
+                &spec.identifiability,
+                penalties_raw,
+                penalties_raw_mats,
+                spec.streaming_chunk_size,
+            )?;
+        let (penalties, nullspace_dims, penaltyinfo, ops) =
+            filter_active_penalty_candidates_with_ops(transformed_candidates)?;
+        return Ok(BasisBuildResult {
+            design,
+            penalties,
+            nullspace_dims,
+            penaltyinfo,
+            metadata: BasisMetadata::BSpline1D {
+                knots,
+                identifiability_transform,
+                periodic: None,
+                streaming_chunk_size: spec.streaming_chunk_size,
             },
             kronecker_factored: None,
             ops,
@@ -8035,6 +8162,7 @@ pub fn build_bspline_basis_1d(
             knots,
             identifiability_transform,
             periodic: None,
+            streaming_chunk_size: spec.streaming_chunk_size,
         },
         kronecker_factored: None,
         ops,
@@ -8176,6 +8304,302 @@ fn apply_bspline_boundary_conditions(
         })
         .collect();
     Ok((design_c, penalties_c, Some(z)))
+}
+
+fn bspline_boundary_transform(
+    knots: &Array1<f64>,
+    degree: usize,
+    boundary_conditions: BSplineBoundaryConditions,
+) -> Result<Option<Array2<f64>>, BasisError> {
+    if boundary_conditions.is_free() {
+        return Ok(None);
+    }
+    let c = bspline_boundary_constraint_rows(knots, degree, boundary_conditions)?;
+    if c.nrows() == 0 {
+        return Ok(None);
+    }
+    let (z, rank) =
+        rrqr_nullspace_basis(&c.t(), default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
+    if z.ncols() == 0 || rank >= c.ncols() {
+        return Err(BasisError::ConstraintNullspaceCollapsed {
+            site: "bspline_boundary_transform",
+            cross_rank: rank,
+            coeff_dim: c.ncols(),
+            cross_frobenius: c.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            constrained_gram_max_eigenvalue: f64::NAN,
+            constrained_gram_min_eigenvalue: f64::NAN,
+            spectral_tolerance: f64::NAN,
+        });
+    }
+    Ok(Some(z))
+}
+
+fn project_bspline_penalties(
+    penalties: Vec<Array2<f64>>,
+    transform: &Array2<f64>,
+) -> Vec<Array2<f64>> {
+    penalties
+        .into_iter()
+        .map(|s| {
+            let zt_s = fast_atb(transform, &s);
+            fast_ab(&zt_s, transform)
+        })
+        .collect()
+}
+
+fn compose_bspline_transform(
+    existing: Option<Array2<f64>>,
+    next: Array2<f64>,
+) -> Result<Array2<f64>, BasisError> {
+    match existing {
+        Some(prev) => {
+            if prev.ncols() != next.nrows() {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "B-spline streaming transform composition mismatch: previous is {}x{}, next is {}x{}",
+                    prev.nrows(),
+                    prev.ncols(),
+                    next.nrows(),
+                    next.ncols()
+                )));
+            }
+            Ok(fast_ab(&prev, &next))
+        }
+        None => Ok(next),
+    }
+}
+
+fn bspline_sum_to_zero_transform_from_cross(c: &Array1<f64>) -> Result<Array2<f64>, BasisError> {
+    let k = c.len();
+    if k < 2 {
+        return Err(BasisError::InsufficientColumnsForConstraint { found: k });
+    }
+    let pivot_abs = c.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    if pivot_abs <= 1e-12 {
+        return Ok(Array2::eye(k));
+    }
+    let mut c_mat = Array2::<f64>::zeros((k, 1));
+    c_mat.column_mut(0).assign(c);
+    let (z, rank) =
+        rrqr_nullspace_basis(&c_mat, default_rrqr_rank_alpha()).map_err(BasisError::LinalgError)?;
+    if rank >= k {
+        return Err(BasisError::ConstraintNullspaceCollapsed {
+            site: "bspline_sum_to_zero_transform_from_cross",
+            cross_rank: rank,
+            coeff_dim: k,
+            cross_frobenius: c.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            constrained_gram_max_eigenvalue: f64::NAN,
+            constrained_gram_min_eigenvalue: f64::NAN,
+            spectral_tolerance: f64::NAN,
+        });
+    }
+    Ok(z)
+}
+
+fn streaming_bspline_current_chunk(
+    data: ArrayView1<'_, f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+    periodic: Option<(f64, f64, usize)>,
+    transform: Option<&Array2<f64>>,
+    start: usize,
+    end: usize,
+) -> Result<Array2<f64>, BasisError> {
+    let raw = bspline_raw_row_chunk(data, knots.view(), degree, periodic, start, end)?;
+    Ok(match transform {
+        Some(z) => fast_ab(&raw, z),
+        None => raw,
+    })
+}
+
+fn streaming_bspline_sum_cross(
+    data: ArrayView1<'_, f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+    periodic: Option<(f64, f64, usize)>,
+    transform: Option<&Array2<f64>>,
+    weights: Option<ArrayView1<'_, f64>>,
+    chunk_size: usize,
+) -> Result<Array1<f64>, BasisError> {
+    if let Some(w) = weights.as_ref()
+        && w.len() != data.len()
+    {
+        return Err(BasisError::WeightsDimensionMismatch {
+            expected: data.len(),
+            found: w.len(),
+        });
+    }
+    let cols = transform
+        .map(Array2::ncols)
+        .unwrap_or(bspline_raw_column_count(knots, degree, periodic)
+            .map_err(BasisError::InvalidInput)?);
+    let mut out = Array1::<f64>::zeros(cols);
+    for start in (0..data.len()).step_by(chunk_size.max(1)) {
+        let end = (start + chunk_size.max(1)).min(data.len());
+        let current =
+            streaming_bspline_current_chunk(data, knots, degree, periodic, transform, start, end)?;
+        let w_chunk = match weights.as_ref() {
+            Some(w) => w.slice(s![start..end]).to_owned(),
+            None => Array1::<f64>::ones(end - start),
+        };
+        out += &current.t().dot(&w_chunk);
+    }
+    Ok(out)
+}
+
+fn streaming_bspline_orthogonality_transform(
+    data: ArrayView1<'_, f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+    periodic: Option<(f64, f64, usize)>,
+    transform: Option<&Array2<f64>>,
+    columns: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    chunk_size: usize,
+) -> Result<Array2<f64>, BasisError> {
+    if columns.nrows() != data.len() {
+        return Err(BasisError::ConstraintMatrixRowMismatch {
+            basisrows: data.len(),
+            constraintrows: columns.nrows(),
+        });
+    }
+    if let Some(w) = weights.as_ref()
+        && w.len() != data.len()
+    {
+        return Err(BasisError::WeightsDimensionMismatch {
+            expected: data.len(),
+            found: w.len(),
+        });
+    }
+    let cols = transform
+        .map(Array2::ncols)
+        .unwrap_or(bspline_raw_column_count(knots, degree, periodic)
+            .map_err(BasisError::InvalidInput)?);
+    if columns.ncols() == 0 {
+        return Ok(Array2::eye(cols));
+    }
+    let mut cross = Array2::<f64>::zeros((cols, columns.ncols()));
+    let mut gram = Array2::<f64>::zeros((cols, cols));
+    for start in (0..data.len()).step_by(chunk_size.max(1)) {
+        let end = (start + chunk_size.max(1)).min(data.len());
+        let current =
+            streaming_bspline_current_chunk(data, knots, degree, periodic, transform, start, end)?;
+        let mut weighted_constraints = columns.slice(s![start..end, ..]).to_owned();
+        if let Some(w) = weights.as_ref() {
+            for (mut row, &weight) in weighted_constraints
+                .axis_iter_mut(Axis(0))
+                .zip(w.slice(s![start..end]).iter())
+            {
+                row *= weight;
+            }
+        }
+        cross += &current.t().dot(&weighted_constraints);
+        gram += &fast_ata(&current);
+    }
+    orthogonality_transform_from_cross_and_gram(&cross, &gram)
+}
+
+fn build_streaming_bspline_design_and_candidates(
+    data: ArrayView1<'_, f64>,
+    knots: &Array1<f64>,
+    degree: usize,
+    boundary_conditions: BSplineBoundaryConditions,
+    periodic: Option<(f64, f64, usize)>,
+    identifiability: &BSplineIdentifiability,
+    penalties_raw: Vec<PenaltyCandidate>,
+    mut penalty_mats: Vec<Array2<f64>>,
+    chunk_size: Option<usize>,
+) -> Result<(DesignMatrix, Vec<PenaltyCandidate>, Option<Array2<f64>>), BasisError> {
+    let chunk = chunk_size.unwrap_or(2048).max(1);
+    let mut transform_opt = if periodic.is_none() {
+        bspline_boundary_transform(knots, degree, boundary_conditions)?
+    } else {
+        None
+    };
+    if let Some(z) = transform_opt.as_ref() {
+        penalty_mats = project_bspline_penalties(penalty_mats, z);
+    }
+
+    match identifiability {
+        BSplineIdentifiability::None => {}
+        BSplineIdentifiability::WeightedSumToZero { weights } => {
+            let cross = streaming_bspline_sum_cross(
+                data,
+                knots,
+                degree,
+                periodic,
+                transform_opt.as_ref(),
+                weights.as_ref().map(|w| w.view()),
+                chunk,
+            )?;
+            let z = bspline_sum_to_zero_transform_from_cross(&cross)?;
+            penalty_mats = project_bspline_penalties(penalty_mats, &z);
+            transform_opt = Some(compose_bspline_transform(transform_opt, z)?);
+        }
+        BSplineIdentifiability::RemoveLinearTrend => {
+            let (z, _) = compute_geometric_constraint_transform(knots, degree, 2)?;
+            penalty_mats = project_bspline_penalties(penalty_mats, &z);
+            transform_opt = Some(compose_bspline_transform(transform_opt, z)?);
+        }
+        BSplineIdentifiability::OrthogonalToDesignColumns { columns, weights } => {
+            let z = streaming_bspline_orthogonality_transform(
+                data,
+                knots,
+                degree,
+                periodic,
+                transform_opt.as_ref(),
+                columns.view(),
+                weights.as_ref().map(|w| w.view()),
+                chunk,
+            )?;
+            penalty_mats = project_bspline_penalties(penalty_mats, &z);
+            transform_opt = Some(compose_bspline_transform(transform_opt, z)?);
+        }
+        BSplineIdentifiability::FrozenTransform { transform } => {
+            let raw_cols = transform_opt
+                .as_ref()
+                .map(Array2::ncols)
+                .unwrap_or(bspline_raw_column_count(knots, degree, periodic)
+                    .map_err(BasisError::InvalidInput)?);
+            if raw_cols != transform.nrows() {
+                return Err(BasisError::DimensionMismatch(format!(
+                    "frozen identifiability transform mismatch: design has {} columns but transform has {} rows",
+                    raw_cols,
+                    transform.nrows()
+                )));
+            }
+            let z = transform.clone();
+            penalty_mats = project_bspline_penalties(penalty_mats, &z);
+            transform_opt = Some(compose_bspline_transform(transform_opt, z)?);
+        }
+    }
+
+    let transformed_candidates = penalty_mats
+        .into_iter()
+        .zip(penalties_raw.into_iter())
+        .map(|(matrix, candidate)| PenaltyCandidate {
+            nullspace_dim_hint: candidate.nullspace_dim_hint,
+            matrix,
+            source: candidate.source,
+            normalization_scale: candidate.normalization_scale,
+            kronecker_factors: None,
+            op: None,
+        })
+        .collect();
+    let op = StreamingBSplineEvaluator::new(
+        Arc::new(data.to_owned()),
+        Arc::new(knots.clone()),
+        degree,
+        boundary_conditions,
+        periodic,
+        transform_opt.as_ref().map(|z| Arc::new(z.clone())),
+        chunk_size,
+    )
+    .map_err(BasisError::InvalidInput)?;
+    Ok((
+        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Arc::new(op))),
+        transformed_candidates,
+        transform_opt,
+    ))
 }
 
 fn apply_bspline_identifiability_policy(
