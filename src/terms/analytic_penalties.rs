@@ -2103,7 +2103,7 @@ impl AnalyticPenalty for SparsityPenalty {
 /// REML-selectable log-precision per axis. Penalty contribution for axis `j`:
 ///
 /// ```text
-///   P_j(t; ρ) = ½ α_j · ‖t[:, j]‖² - (n_eff / 2) · log α_j
+///   P_j(t; ρ) = ½ α_j · ‖t[:, j]‖² - (n_eff / 2) · log α_j, α_j = weight · exp(ρ_j)
 /// ```
 ///
 /// summed over `j ∈ [0, d)`. Under REML, axis `j` whose data evidence is too
@@ -3128,6 +3128,9 @@ pub struct BlockSparsityPenalty {
     pub weight: f64,
     /// Number of rows in the row-major matrix-valued latent block.
     pub n_eff: usize,
+    /// Yuan-Lin group-size normalization uses the latent-axis group cardinality
+    /// `sqrt(|g|)`; `n_eff` repeats each group across rows inside its norm and
+    /// does not participate in this normalization.
     pub smoothing_eps: f64,
     pub learnable_weight: bool,
     pub rho_index: usize,
@@ -3256,6 +3259,10 @@ impl BlockSparsityPenalty {
         target.into_shape_with_order((self.n_eff, d)).ok()
     }
 
+    fn group_size_factor(group: &[usize]) -> f64 {
+        (group.len() as f64).sqrt()
+    }
+
     fn group_norm(&self, t: ArrayView2<'_, f64>, group: &[usize]) -> f64 {
         let mut norm2 = 0.0;
         for n in 0..t.nrows() {
@@ -3290,13 +3297,14 @@ impl BlockSparsityPenalty {
         let weight = self.resolved_weight(rho);
         let mut out = Array1::<f64>::zeros(target.len());
         for group in &self.groups {
+            let factor = weight * Self::group_size_factor(group);
             let s = self.group_norm(t.view(), group);
             let inv_s = 1.0 / s;
             let inv_s3 = inv_s * inv_s * inv_s;
             for n in 0..t.nrows() {
                 for &axis in group {
                     let x = t[[n, axis]];
-                    out[n * t.ncols() + axis] = weight * (inv_s - x * x * inv_s3);
+                    out[n * t.ncols() + axis] = factor * (inv_s - x * x * inv_s3);
                 }
             }
         }
@@ -3317,6 +3325,7 @@ impl BlockSparsityPenalty {
         let weight = self.resolved_weight(rho);
         let mut dense = Array2::<f64>::zeros((n, n));
         for group in &self.groups {
+            let factor = weight * Self::group_size_factor(group);
             let s = self.group_norm(t.view(), group);
             let inv_s = 1.0 / s;
             let inv_s3 = inv_s * inv_s * inv_s;
@@ -3331,7 +3340,7 @@ impl BlockSparsityPenalty {
                             if i == j {
                                 entry += inv_s;
                             }
-                            dense[[i, j]] = weight * entry;
+                            dense[[i, j]] = factor * entry;
                         }
                     }
                 }
@@ -3352,7 +3361,7 @@ impl AnalyticPenalty for BlockSparsityPenalty {
         };
         let mut acc = 0.0;
         for group in &self.groups {
-            acc += self.group_norm(t.view(), group);
+            acc += Self::group_size_factor(group) * self.group_norm(t.view(), group);
         }
         self.resolved_weight(rho) * acc
     }
@@ -3369,7 +3378,7 @@ impl AnalyticPenalty for BlockSparsityPenalty {
         let mut grad = Array2::<f64>::zeros(t.dim());
         for group in &self.groups {
             let s = self.group_norm(t.view(), group);
-            let factor = weight / s;
+            let factor = weight * Self::group_size_factor(group) / s;
             for n in 0..t.nrows() {
                 for &axis in group {
                     grad[[n, axis]] = factor * t[[n, axis]];
@@ -3398,6 +3407,7 @@ impl AnalyticPenalty for BlockSparsityPenalty {
         let weight = self.resolved_weight(rho);
         let mut out = Array2::<f64>::zeros(t.dim());
         for group in &self.groups {
+            let factor = weight * Self::group_size_factor(group);
             let s = self.group_norm(t.view(), group);
             let inv_s = 1.0 / s;
             let inv_s3 = inv_s * inv_s * inv_s;
@@ -3410,7 +3420,7 @@ impl AnalyticPenalty for BlockSparsityPenalty {
             for n in 0..t.nrows() {
                 for &axis in group {
                     out[[n, axis]] =
-                        weight * (v_mat[[n, axis]] * inv_s - t[[n, axis]] * inner * inv_s3);
+                        factor * (v_mat[[n, axis]] * inv_s - t[[n, axis]] * inner * inv_s3);
                 }
             }
         }
@@ -4711,10 +4721,18 @@ impl ScadMcpPenalty {
                 ));
             }
         }
-        if !(gamma.is_finite() && gamma > 1.0) {
-            return Err(format!(
-                "ScadMcpPenalty::new requires finite gamma > 1, got {gamma}"
-            ));
+        match variant {
+            PenaltyConcavity::Mcp if !(gamma.is_finite() && gamma > 1.0) => {
+                return Err(format!(
+                    "ScadMcpPenalty::new MCP requires finite gamma > 1, got {gamma}"
+                ));
+            }
+            PenaltyConcavity::Scad if !(gamma.is_finite() && gamma > 2.0) => {
+                return Err(format!(
+                    "ScadMcpPenalty::new SCAD requires finite gamma > 2, got {gamma}"
+                ));
+            }
+            PenaltyConcavity::Mcp | PenaltyConcavity::Scad => {}
         }
         if !(smoothing_eps.is_finite() && smoothing_eps > 0.0) {
             return Err(format!(
@@ -4782,30 +4800,20 @@ impl ScadMcpPenalty {
 
     fn grad_one(&self, t: f64, weight: f64) -> f64 {
         let r = self.smooth_abs(t);
-        let eps2 = self.smoothing_eps * self.smoothing_eps;
         match self.variant {
             PenaltyConcavity::Mcp => {
                 if r <= self.gamma * weight {
-                    let concavity_grad = if t * t > eps2 {
-                        t / self.gamma
-                    } else {
-                        0.0
-                    };
-                    weight * t / r - concavity_grad
+                    weight * t / r - t / self.gamma
                 } else {
                     0.0
                 }
             }
             PenaltyConcavity::Scad => {
+                let denom = self.gamma - 1.0;
                 if r <= weight {
                     weight * t / r
                 } else if r <= self.gamma * weight {
-                    let concavity_grad = if t * t > eps2 {
-                        t / (self.gamma - 1.0)
-                    } else {
-                        0.0
-                    };
-                    self.gamma * weight * t / ((self.gamma - 1.0) * r) - concavity_grad
+                    self.gamma * weight * t / (denom * r) - t / denom
                 } else {
                     0.0
                 }
@@ -4819,27 +4827,17 @@ impl ScadMcpPenalty {
         match self.variant {
             PenaltyConcavity::Mcp => {
                 if r <= self.gamma * weight {
-                    let concavity_hess = if t * t > eps2 {
-                        1.0 / self.gamma
-                    } else {
-                        0.0
-                    };
-                    weight * eps2 / (r * r * r) - concavity_hess
+                    weight * eps2 / (r * r * r) - 1.0 / self.gamma
                 } else {
                     0.0
                 }
             }
             PenaltyConcavity::Scad => {
+                let denom = self.gamma - 1.0;
                 if r <= weight {
                     weight * eps2 / (r * r * r)
                 } else if r <= self.gamma * weight {
-                    let concavity_hess = if t * t > eps2 {
-                        1.0 / (self.gamma - 1.0)
-                    } else {
-                        0.0
-                    };
-                    self.gamma * weight * eps2 / ((self.gamma - 1.0) * r * r * r)
-                        - concavity_hess
+                    self.gamma * weight * eps2 / (denom * r * r * r) - 1.0 / denom
                 } else {
                     0.0
                 }
