@@ -1,5 +1,0 @@
-[graph]
-all-features = true
-
-[advisories]
-unmaintained = "workspace"

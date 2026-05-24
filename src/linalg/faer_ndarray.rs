@@ -910,7 +910,6 @@ fn fast_joint_hessian_2x2_impl<
                 out[[i, j]] = out[[j, i]];
             }
         }
-        gpu_profile_finish(profile_op, profile_start);
         return out;
     }
 
@@ -1057,7 +1056,6 @@ fn fast_joint_hessian_2x2_impl<
             out[[i, j]] = out[[j, i]];
         }
     }
-    gpu_profile_finish(profile_op, profile_start);
     out
 }
 
@@ -1096,18 +1094,7 @@ pub fn fast_ab_into<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     b: &ArrayBase<S2, Ix2>,
     out: &mut Array2<f64>,
 ) {
-    let (n, p) = a.dim();
-    let q = b.ncols();
-    crate::gpu::profile::cpu_scope(
-        "fast_ab_into",
-        n,
-        q,
-        p,
-        n.saturating_mul(q).saturating_mul(8),
-        || {
-            fast_ab_into_impl(a, b, out);
-        },
-    );
+    fast_ab_into_impl(a, b, out);
 }
 
 #[inline]
@@ -1121,19 +1108,11 @@ fn fast_ab_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
 
     let (n, p) = a.dim();
     let (p_b, q) = b.dim();
-    let (profile_op, profile_start) =
-        gpu_profile_start(crate::gpu::GpuOperation::Gemm { m: n, n: q, k: p });
     debug_assert_eq!(p, p_b, "A and B must have compatible inner dimensions");
     debug_assert_eq!(out.dim(), (n, q), "output dimensions must match A*B result");
 
-    if let Some(result) = crate::gpu::try_fast_ab(a, b) {
-        out.assign(&result);
-        return;
-    }
-
     if !should_use_faer_matmul(n, q, p) {
         out.assign(&a.dot(b));
-        gpu_profile_finish(profile_op, profile_start);
         return;
     }
 
@@ -1145,7 +1124,6 @@ fn fast_ab_into_impl<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     let par = matmul_parallelism(n, q, p);
     let mut outview = array2_to_matmut(out);
     matmul(outview.as_mut(), Accum::Replace, a_ref, b_ref, 1.0, par);
-    gpu_profile_finish(profile_op, profile_start);
 }
 
 fn diag_to_array(diag: DiagRef<'_, f64>) -> Array1<f64> {
@@ -1678,15 +1656,6 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
                 context: "self-adjoint eigendecomposition input validation",
             });
         }
-        if matches!(side, Side::Lower) {
-            let mut gpu_owned = owned.clone();
-            if let Some(evals) = crate::gpu::try_syevd_inplace(&mut gpu_owned)
-                && evals.iter().all(|value| value.is_finite())
-                && gpu_owned.iter().all(|value| value.is_finite())
-            {
-                return Ok((evals, gpu_owned));
-            }
-        }
         if let Ok((evals, evecs)) = try_eigh(&owned, side)
             && evals.iter().all(|value| value.is_finite())
             && evecs.iter().all(|value| value.is_finite())
@@ -1732,7 +1701,9 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
                     }
                     return Ok((evals, evecs));
                 }
-                Ok(_) => {
+                Ok((evals, evecs)) => {
+                    drop(evals);
+                    drop(evecs);
                     last_error = FaerLinalgError::SelfAdjointEigenNonFiniteInput {
                         context: "self-adjoint eigendecomposition repaired output validation",
                     };

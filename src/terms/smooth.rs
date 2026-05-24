@@ -4984,230 +4984,6 @@ fn block_diag_repeat(base: &Array2<f64>, repeat: usize) -> Array2<f64> {
     out
 }
 
-fn build_by_smooth_basis(
-    data: ArrayView2<'_, f64>,
-    smooth: &SmoothBasisSpec,
-    by_kind: &ByVarKind,
-) -> Result<BasisBuildResult, BasisError> {
-    let dummy = SmoothTermSpec {
-        name: "by-inner".to_string(),
-        basis: smooth.clone(),
-        shape: ShapeConstraint::None,
-    };
-    let mut workspace = crate::basis::BasisWorkspace::default();
-    let inner = build_single_local_smooth_term(data, &dummy, &mut workspace)?;
-    let x = inner.design.to_dense();
-    let n = x.nrows();
-    let p = x.ncols();
-    match by_kind {
-        ByVarKind::Numeric { feature_col } => {
-            let z = data.column(*feature_col);
-            let mut design = x.clone();
-            for i in 0..n {
-                for j in 0..p {
-                    design[[i, j]] *= z[i];
-                }
-            }
-            Ok(BasisBuildResult {
-                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
-                penalties: inner.penalties,
-                nullspace_dims: inner.nullspaces,
-                penaltyinfo: inner.penaltyinfo,
-                ops: inner.ops,
-                metadata: BasisMetadata::BySmooth {
-                    inner: Box::new(inner.metadata),
-                    by_col: *feature_col,
-                    levels: None,
-                    ordered: false,
-                },
-                kronecker_factored: None,
-            })
-        }
-        ByVarKind::Factor {
-            feature_col,
-            ordered,
-            frozen_levels,
-        } => {
-            let mut levels =
-                sorted_levels_from_column(data.column(*feature_col), frozen_levels.as_ref())?;
-            if *ordered && levels.len() > 1 {
-                levels.remove(0);
-            }
-            let l = levels.len();
-            let mut design = Array2::<f64>::zeros((n, p * l));
-            for i in 0..n {
-                let bits = data[[i, *feature_col]].to_bits();
-                if let Ok(g) = levels.binary_search(&bits) {
-                    let start = g * p;
-                    for j in 0..p {
-                        design[[i, start + j]] = x[[i, j]];
-                    }
-                }
-            }
-            let mut candidates = Vec::new();
-            for (pi, pen) in inner.penalties.iter().enumerate() {
-                for g in 0..l {
-                    let mut m = Array2::<f64>::zeros((p * l, p * l));
-                    let start = g * p;
-                    m.slice_mut(s![start..start + p, start..start + p])
-                        .assign(pen);
-                    candidates.push(PenaltyCandidate {
-                        matrix: m,
-                        nullspace_dim_hint: 0,
-                        source: PenaltySource::Other(format!("by-factor-level-{g}-penalty-{pi}")),
-                        normalization_scale: 1.0,
-                        kronecker_factors: None,
-                        op: None,
-                    });
-                }
-            }
-            let (penalties, nullspace_dims, penaltyinfo, ops) =
-                filter_active_penalty_candidates_with_ops(candidates)?;
-            Ok(BasisBuildResult {
-                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
-                penalties,
-                nullspace_dims,
-                penaltyinfo,
-                ops,
-                metadata: BasisMetadata::BySmooth {
-                    inner: Box::new(inner.metadata),
-                    by_col: *feature_col,
-                    levels: Some(levels),
-                    ordered: *ordered,
-                },
-                kronecker_factored: None,
-            })
-        }
-    }
-}
-
-fn build_factor_smooth_basis(
-    data: ArrayView2<'_, f64>,
-    spec: &FactorSmoothSpec,
-) -> Result<BasisBuildResult, BasisError> {
-    if spec.continuous_cols.len() != 1 {
-        return Err(BasisError::InvalidInput(
-            "factor smooth currently requires exactly one continuous column".to_string(),
-        ));
-    }
-    let group_col = spec.group_col;
-    let levels =
-        sorted_levels_from_column(data.column(group_col), spec.group_frozen_levels.as_ref())?;
-    let n = data.nrows();
-    let l = levels.len();
-    let (base_x, base_penalties, knots, degree): (
-        Array2<f64>,
-        Vec<Array2<f64>>,
-        Array1<f64>,
-        usize,
-    ) = match spec.flavour {
-        FactorSmoothFlavour::Re => {
-            let xcol = data.column(spec.continuous_cols[0]);
-            let mut x = Array2::<f64>::zeros((n, 1));
-            for i in 0..n {
-                x[[i, 0]] = xcol[i];
-            }
-            (x, vec![Array2::<f64>::eye(1)], Array1::zeros(0), 1)
-        }
-        _ => {
-            let mut marginal = spec.marginal.clone();
-            marginal.identifiability = BSplineIdentifiability::None;
-            let built = build_bspline_basis_1d(data.column(spec.continuous_cols[0]), &marginal)?;
-            let knots = match &built.metadata {
-                BasisMetadata::BSpline1D { knots, .. } => knots.clone(),
-                _ => Array1::zeros(0),
-            };
-            (
-                built.design.to_dense(),
-                built.penalties,
-                knots,
-                marginal.degree,
-            )
-        }
-    };
-    let p = base_x.ncols();
-    let is_sz = matches!(spec.flavour, FactorSmoothFlavour::Sz);
-    let out_levels = if is_sz { l.saturating_sub(1) } else { l };
-    if out_levels == 0 {
-        return Err(BasisError::InvalidInput(
-            "factor smooth needs at least two levels for sz contrasts".to_string(),
-        ));
-    }
-    let mut design = Array2::<f64>::zeros((n, p * out_levels));
-    for i in 0..n {
-        let bits = data[[i, group_col]].to_bits();
-        if let Ok(g) = levels.binary_search(&bits) {
-            if is_sz {
-                for h in 0..out_levels {
-                    let c = if g == h {
-                        1.0
-                    } else if g == l - 1 {
-                        -1.0
-                    } else {
-                        0.0
-                    };
-                    if c != 0.0 {
-                        for j in 0..p {
-                            design[[i, h * p + j]] = c * base_x[[i, j]];
-                        }
-                    }
-                }
-            } else {
-                let start = g * p;
-                for j in 0..p {
-                    design[[i, start + j]] = base_x[[i, j]];
-                }
-            }
-        }
-    }
-    let penalties = match spec.flavour {
-        FactorSmoothFlavour::Fs { .. } | FactorSmoothFlavour::Re => {
-            vec![Array2::<f64>::eye(p * out_levels)]
-        }
-        FactorSmoothFlavour::Sz => base_penalties
-            .iter()
-            .map(|pen| block_diag_repeat(pen, out_levels))
-            .collect(),
-    };
-    let candidates = penalties
-        .into_iter()
-        .enumerate()
-        .map(|(i, matrix)| PenaltyCandidate {
-            matrix,
-            nullspace_dim_hint: 0,
-            source: PenaltySource::Other(format!("factor-smooth-penalty-{i}")),
-            normalization_scale: 1.0,
-            kronecker_factors: None,
-            op: None,
-        })
-        .collect();
-    let (penalties, nullspace_dims, penaltyinfo, ops) =
-        filter_active_penalty_candidates_with_ops(candidates)?;
-    let flavour = match spec.flavour {
-        FactorSmoothFlavour::Fs { .. } => "fs",
-        FactorSmoothFlavour::Sz => "sz",
-        FactorSmoothFlavour::Re => "re",
-    }
-    .to_string();
-    Ok(BasisBuildResult {
-        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
-        ops,
-        metadata: BasisMetadata::FactorSmooth {
-            continuous_cols: spec.continuous_cols.clone(),
-            group_col,
-            knots,
-            degree,
-            periodic: None,
-            group_levels: levels,
-            flavour,
-        },
-        kronecker_factored: None,
-    })
-}
-
 fn build_random_effect_block(
     data: ArrayView2<'_, f64>,
     spec: &RandomEffectTermSpec,
@@ -5356,253 +5132,6 @@ fn dense_by_factor_design(
         }
     }
     out
-}
-
-fn build_by_smooth_basis(
-    data: ArrayView2<'_, f64>,
-    term_name: &str,
-    smooth: &SmoothBasisSpec,
-    by_kind: &ByVarKind,
-    workspace: &mut crate::basis::BasisWorkspace,
-) -> Result<BasisBuildResult, BasisError> {
-    let inner_term = SmoothTermSpec {
-        name: format!("{term_name}:inner"),
-        basis: smooth.clone(),
-        shape: ShapeConstraint::None,
-    };
-    let inner = build_single_local_smooth_term(data, &inner_term, workspace)?;
-    let inner_dense = inner.design.to_dense();
-    match by_kind {
-        ByVarKind::Numeric { feature_col } => {
-            if *feature_col >= data.ncols() {
-                return Err(BasisError::DimensionMismatch(
-                    "numeric by column out of bounds".to_string(),
-                ));
-            }
-            let by = data.column(*feature_col);
-            let mut design = inner_dense.clone();
-            for i in 0..design.nrows() {
-                let z = by[i];
-                if !z.is_finite() {
-                    return Err(BasisError::InvalidInput(
-                        "numeric by smooth contains non-finite by values".to_string(),
-                    ));
-                }
-                for j in 0..design.ncols() {
-                    design[[i, j]] *= z;
-                }
-            }
-            Ok(BasisBuildResult {
-                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
-                penalties: inner.penalties,
-                nullspace_dims: inner.nullspaces,
-                penaltyinfo: inner.penaltyinfo,
-                metadata: inner.metadata,
-                kronecker_factored: None,
-                ops: vec![None; inner.ops.len()],
-            })
-        }
-        ByVarKind::Factor {
-            feature_col,
-            ordered,
-            frozen_levels,
-        } => {
-            let levels =
-                sorted_factor_levels(data, *feature_col, frozen_levels.as_ref(), *ordered)?;
-            let groups = data
-                .column(*feature_col)
-                .iter()
-                .map(|v| levels.binary_search(&v.to_bits()).ok())
-                .collect::<Vec<_>>();
-            let design = dense_by_factor_design(&inner_dense, &groups, levels.len());
-            let mut candidates = Vec::<PenaltyCandidate>::new();
-            for (pi, pen) in inner.penalties.iter().enumerate() {
-                for lev in 0..levels.len() {
-                    let p = inner_dense.ncols();
-                    let mut mat = Array2::<f64>::zeros((p * levels.len(), p * levels.len()));
-                    let off = lev * p;
-                    mat.slice_mut(s![off..off + p, off..off + p]).assign(pen);
-                    candidates.push(PenaltyCandidate {
-                        matrix: mat,
-                        nullspace_dim_hint: 0,
-                        source: PenaltySource::Other(format!("BySmoothLevel{lev}Penalty{pi}")),
-                        normalization_scale: 1.0,
-                        kronecker_factors: None,
-                        op: None,
-                    });
-                }
-            }
-            let (penalties, nullspace_dims, penaltyinfo, ops) =
-                filter_active_penalty_candidates_with_ops(candidates)?;
-            let metadata = match inner.metadata {
-                BasisMetadata::BSpline1D {
-                    knots, periodic, ..
-                } => BasisMetadata::FactorSmooth {
-                    continuous_cols: smooth_term_feature_cols(&SmoothTermSpec {
-                        name: term_name.to_string(),
-                        basis: smooth.clone(),
-                        shape: ShapeConstraint::None,
-                    }),
-                    group_col: *feature_col,
-                    knots,
-                    degree: inner_dense.ncols().saturating_sub(1),
-                    periodic,
-                    group_levels: levels.clone(),
-                    flavour: "by".to_string(),
-                },
-                other => other,
-            };
-            Ok(BasisBuildResult {
-                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
-                penalties,
-                nullspace_dims,
-                penaltyinfo,
-                metadata,
-                kronecker_factored: None,
-                ops,
-            })
-        }
-    }
-}
-
-fn build_factor_smooth_basis(
-    data: ArrayView2<'_, f64>,
-    spec: &FactorSmoothSpec,
-) -> Result<BasisBuildResult, BasisError> {
-    if spec.continuous_cols.len() != 1 {
-        return Err(BasisError::InvalidInput(
-            "factor smooth currently supports one continuous variable".to_string(),
-        ));
-    }
-    let c = spec.continuous_cols[0];
-    let mut marginal = spec.marginal.clone();
-    marginal.identifiability = BSplineIdentifiability::None;
-    let base = build_bspline_basis_1d(data.column(c), &marginal)?;
-    let mut x = base.design.to_dense();
-    let base_pen = base
-        .penalties
-        .first()
-        .cloned()
-        .unwrap_or_else(|| Array2::<f64>::eye(x.ncols()));
-    let (knots, periodic) = match base.metadata {
-        BasisMetadata::BSpline1D {
-            knots, periodic, ..
-        } => (knots, periodic),
-        other => {
-            return Err(BasisError::InvalidInput(format!(
-                "factor smooth marginal must produce BSpline1D metadata, got {:?}",
-                std::mem::discriminant(&other)
-            )));
-        }
-    };
-    if matches!(spec.flavour, FactorSmoothFlavour::Re) {
-        x = Array2::<f64>::zeros((data.nrows(), 2));
-        for i in 0..data.nrows() {
-            x[[i, 0]] = 1.0;
-            x[[i, 1]] = data[[i, c]];
-        }
-    }
-    let mut levels = sorted_factor_levels(
-        data,
-        spec.group_col,
-        spec.group_frozen_levels.as_ref(),
-        false,
-    )?;
-    let groups = data
-        .column(spec.group_col)
-        .iter()
-        .map(|v| levels.binary_search(&v.to_bits()).ok())
-        .collect::<Vec<_>>();
-    let mut design = dense_by_factor_design(&x, &groups, levels.len());
-    if matches!(spec.flavour, FactorSmoothFlavour::Sz) && levels.len() > 1 {
-        let n = design.nrows();
-        let p = x.ncols();
-        let l = levels.len();
-        let mut contrasted = Array2::<f64>::zeros((n, p * (l - 1)));
-        for i in 0..n {
-            if let Some(g) = groups[i] {
-                for j in 0..p {
-                    if g < l - 1 {
-                        contrasted[[i, g * p + j]] += x[[i, j]];
-                    } else {
-                        for h in 0..l - 1 {
-                            contrasted[[i, h * p + j]] -= x[[i, j]];
-                        }
-                    }
-                }
-            }
-        }
-        design = contrasted;
-        levels.pop();
-    }
-    let l = levels.len();
-    let p = x.ncols();
-    let mut candidates = Vec::<PenaltyCandidate>::new();
-    match spec.flavour {
-        FactorSmoothFlavour::Fs { .. } => {
-            candidates.push(PenaltyCandidate {
-                matrix: block_diag_penalty(&base_pen, l),
-                nullspace_dim_hint: 0,
-                source: PenaltySource::Other("FactorSmoothFsRange".to_string()),
-                normalization_scale: 1.0,
-                kronecker_factors: None,
-                op: None,
-            });
-            candidates.push(PenaltyCandidate {
-                matrix: Array2::<f64>::eye(p * l),
-                nullspace_dim_hint: 0,
-                source: PenaltySource::Other("FactorSmoothFsRidge".to_string()),
-                normalization_scale: 1.0,
-                kronecker_factors: None,
-                op: None,
-            });
-        }
-        FactorSmoothFlavour::Sz => {
-            candidates.push(PenaltyCandidate {
-                matrix: block_diag_penalty(&base_pen, l),
-                nullspace_dim_hint: 0,
-                source: PenaltySource::Other("FactorSmoothSz".to_string()),
-                normalization_scale: 1.0,
-                kronecker_factors: None,
-                op: None,
-            });
-        }
-        FactorSmoothFlavour::Re => {
-            candidates.push(PenaltyCandidate {
-                matrix: Array2::<f64>::eye(p * l),
-                nullspace_dim_hint: 0,
-                source: PenaltySource::Other("RandomSlopeRidge".to_string()),
-                normalization_scale: 1.0,
-                kronecker_factors: None,
-                op: None,
-            });
-        }
-    }
-    let (penalties, nullspace_dims, penaltyinfo, ops) =
-        filter_active_penalty_candidates_with_ops(candidates)?;
-    let flavour = match spec.flavour {
-        FactorSmoothFlavour::Fs { .. } => "fs",
-        FactorSmoothFlavour::Sz => "sz",
-        FactorSmoothFlavour::Re => "re",
-    }
-    .to_string();
-    Ok(BasisBuildResult {
-        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(design)),
-        penalties,
-        nullspace_dims,
-        penaltyinfo,
-        metadata: BasisMetadata::FactorSmooth {
-            continuous_cols: spec.continuous_cols.clone(),
-            group_col: spec.group_col,
-            knots,
-            degree: marginal.degree,
-            periodic,
-            group_levels: levels,
-            flavour,
-        },
-        kronecker_factored: None,
-        ops,
-    })
 }
 
 impl SmoothDesign {
@@ -5780,7 +5309,6 @@ struct LocalSmoothTermBuild {
 #[derive(Clone)]
 struct PcaScoresMemmapDesignOperator {
     mmap: Arc<memmap2::Mmap>,
-    path: PathBuf,
     data_offset: usize,
     nrows: usize,
     ncols: usize,
@@ -5795,6 +5323,11 @@ impl PcaScoresMemmapDesignOperator {
                 path.display()
             ))
         })?;
+        // The .npy scores file is read-only training-cache data; this
+        // module never mutates it. The error path below converts mmap
+        // failure to a typed `BasisError::InvalidInput`.
+        // SAFETY: `memmap2::Mmap::map` requires no concurrent writers; the
+        // contract is held by this module's read-only access pattern.
         let mmap = unsafe {
             memmap2::Mmap::map(&file).map_err(|err| {
                 BasisError::InvalidInput(format!(
@@ -5822,7 +5355,6 @@ impl PcaScoresMemmapDesignOperator {
         }
         Ok(Self {
             mmap: Arc::new(mmap),
-            path,
             data_offset,
             nrows,
             ncols,
@@ -7523,7 +7055,12 @@ fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
             spec.identifiability,
             SpatialIdentifiability::FrozenTransform { .. }
         ),
-        SmoothBasisSpec::Pca { centered, center_mean, .. } => !*centered || center_mean.is_some(),
+        SmoothBasisSpec::Pca {
+            centered,
+            center_mean,
+            pca_basis_path,
+            ..
+        } => !*centered || center_mean.is_some() || pca_basis_path.is_some(),
         SmoothBasisSpec::TensorBSpline { spec, .. } => matches!(
             spec.identifiability,
             TensorBSplineIdentifiability::FrozenTransform { .. }
@@ -15286,10 +14823,12 @@ impl SingleBlockLatentCoordDesignCache {
                     centered,
                     smooth_penalty,
                     center_mean,
+                    pca_basis_path,
+                    chunk_size,
                     ..
                 },
             ) => {
-                let center_mean_fingerprint = if *centered {
+                let center_mean_fingerprint = if *centered && pca_basis_path.is_none() {
                     let mean = center_mean.as_ref().ok_or_else(|| {
                         SmoothError::invalid_config(
                             "latent-coordinate Pca cache key requires center_mean when centered",
@@ -15306,6 +14845,8 @@ impl SingleBlockLatentCoordDesignCache {
                     centered: *centered,
                     center_mean_fingerprint,
                     smooth_penalty: *smooth_penalty,
+                    pca_basis_path: pca_basis_path.clone(),
+                    chunk_size: *chunk_size,
                 })
             }
             _ => Err(SmoothError::invalid_config(
