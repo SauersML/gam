@@ -85,38 +85,32 @@ mutually exclusive.
 
 ```
 y ~ x + group(site)
-y ~ x + re(site)                         # alias for random intercepts
-y ~ s(x, by=site) + site                 # separate smooth per factor level
-y ~ s(x, by=z)                           # numeric varying-coefficient smooth
-y ~ s(x, site, bs="fs")                  # partial-pooling random smooths
-y ~ fs(x, site)                          # alias for bs="fs"
-y ~ s(site, x, bs="sz") + s(x)           # sum-to-zero deviations from a main smooth
-y ~ sz(site, x)                          # alias for bs="sz"
-y ~ s(site, x, bs="re") + group(site)    # random intercepts plus random slopes
+y ~ x + re(site)                         # random-intercept alias
+y ~ s(time, by=treatment) + treatment    # separate smooth per factor level
+y ~ s(time, by=dose)                     # numeric varying-coefficient smooth
+y ~ s(time, subject, bs="fs")           # partial-pooling random smooths
+y ~ fs(time, subject)                    # alias for bs="fs"
+y ~ s(time) + s(subject, time, bs="sz") # sum-to-zero factor deviations
+y ~ sz(subject, time)                    # alias for bs="sz"
+y ~ group(subject) + s(subject, time, bs="re")  # random intercept + slope
 ```
 
-`group()`/`re()` adds a random intercept per level of a string- or
-integer-valued grouping column.
+`group()` / `re()` adds a random intercept per level of the grouping column.
+The column may be string- or integer-valued, and saved models freeze the observed
+level set so unseen prediction levels contribute zero.
 
-Factor and numeric `by=` smooths multiply an ordinary smooth basis by a
-numeric covariate or by per-level indicators. Factor `by=` smooths create a
-separate smooth for each kept level; include the factor main effect (for
-example `+ site` or `+ group(site)`) when level offsets should be identifiable.
-Ordered-factor style difference smooths can be requested with an ordered
-factor column name/convention and skip the reference level.
+`by=` smooths multiply an ordinary smooth by a numeric column or by factor-level
+indicators. Numeric `by=` terms are a single varying-coefficient smooth. Factor
+`by=` terms create one smooth block per retained level; include the factor main
+effect (for example `+ treatment` or `+ group(subject)`) when level means should
+be estimated separately.
 
-`bs="fs"` builds random smooths: each group gets its own curve, including
-penalized null-space components such as intercept and linear trend, so small
-groups shrink toward zero contribution while larger groups can retain distinct
-curves. New/unseen groups at prediction time contribute zero for the factor
-smooth term. `m=1` reduces the number of null-space shrinkage penalties;
-`m=2` is the default.
-
-`bs="sz"` builds sum-to-zero factor-smooth deviations intended to be used with
-a population smooth such as `s(x)`. Deviations are constrained to sum to zero
-across factor levels at each spline coefficient. `bs="re"` with one grouping
-and one numeric variable builds random slopes as a factor-by-linear basis with
-an identity ridge penalty.
+`bs="fs"` builds factor-smooth interactions for hierarchical trajectories: each
+level gets its own curve and the whole block is ridge-penalized, including the
+low-order/null-space components, so per-level intercepts and slopes shrink.
+`bs="sz"` builds sum-to-zero deviations that pair naturally with a population
+main-effect smooth. `bs="re"` on a factor/numeric pair is the random-slope
+special case.
 
 ## Univariate smooths
 
