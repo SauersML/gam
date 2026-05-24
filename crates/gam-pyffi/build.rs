@@ -1,5 +1,12 @@
 fn main() {
-    if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "linux" {
+    // Only Linux wheels need the `$ORIGIN`-relative rpath probes — that's
+    // ELF runtime-loader syntax. macOS uses `@loader_path` and Windows has
+    // no rpath, so emitting the directives elsewhere would either be
+    // harmless (macOS rejects unknown ld-args silently) or a build-time
+    // diagnostic noise source. Gate on the build-script *host* OS, which
+    // matches the per-platform wheel build model (each platform's wheel is
+    // produced on a matching host) — no env-var lookup required.
+    if !cfg!(target_os = "linux") {
         return;
     }
 
