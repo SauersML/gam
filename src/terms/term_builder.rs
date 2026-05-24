@@ -1095,6 +1095,14 @@ pub fn build_smooth_basis(
             let centered = option_bool(options, "centered")
                 .or_else(|| option_bool(options, "center"))
                 .unwrap_or(true);
+            let smooth_penalty =
+                option_f64_strict(options, "smooth_penalty")?.unwrap_or(1.0);
+            if !smooth_penalty.is_finite() || smooth_penalty <= 0.0 {
+                return Err(TermBuilderError::invalid_option(format!(
+                    "pca() smooth_penalty must be finite and positive; got {smooth_penalty}"
+                ))
+                .to_string());
+            }
             let x = ds.values.select(Axis(1), cols);
             let basis_matrix =
                 build_pca_basis_matrix(x.view(), k_pca, centered).map_err(|e| e.to_string())?;
@@ -1102,6 +1110,7 @@ pub fn build_smooth_basis(
                 feature_cols: cols.to_vec(),
                 basis_matrix,
                 centered,
+                smooth_penalty,
                 center_mean: None,
             })
         }
