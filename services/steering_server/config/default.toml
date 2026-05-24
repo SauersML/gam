@@ -1,0 +1,17 @@
+[database]
+url = "sqlite:///services/steering_server/steering_server.db"
+
+[auth]
+bootstrap_user = "local-admin"
+bootstrap_api_key = "dev-steering-key"
+
+[rate_limit]
+default_limit = "120/minute"
+steer_limit = "30/minute"
+
+[telemetry]
+service_name = "steering-server"
+otlp_endpoint = "http://otel-collector:4317"
+
+[queue]
+run_inline = true

@@ -35,9 +35,7 @@ use ndarray::{
     Array1, Array2, ArrayBase, ArrayView1, ArrayView2, ArrayView3, Data, Ix1, Ix2, ShapeBuilder,
     Zip, s,
 };
-use rayon::iter::{
-    IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
-};
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use statrs::function::gamma::{digamma, ln_gamma};
 
@@ -1689,7 +1687,10 @@ mod kron_apply_scratch {
             }
         }
 
-        pub(super) fn pair_with_capacity(&mut self, capacity: usize) -> (&mut Vec<f64>, &mut Vec<f64>) {
+        pub(super) fn pair_with_capacity(
+            &mut self,
+            capacity: usize,
+        ) -> (&mut Vec<f64>, &mut Vec<f64>) {
             if self.a.capacity() < capacity {
                 self.a.reserve(capacity - self.a.capacity());
             }
@@ -5000,6 +5001,9 @@ where
                                 );
                             if let Some(mode) = arrow_cfg.solver_mode {
                                 solve_options.mode = mode;
+                            } else if arrow_cfg.streaming_chunk_size.is_some() {
+                                solve_options.mode =
+                                    crate::solver::arrow_schur::ArrowSolverMode::Direct;
                             }
                             solve_options.streaming_chunk_size = arrow_cfg.streaming_chunk_size;
                             solve_options.trust_region.radius = arrow_cfg.trust_region_radius;
@@ -5728,7 +5732,10 @@ where
                             "[PIRLS] mid-iter Fisher fallback iter={} reason=candidate_err",
                             iter,
                         );
-                        restore_arrow_latent_if_needed(options, pending_arrow_latent_restore.take());
+                        restore_arrow_latent_if_needed(
+                            options,
+                            pending_arrow_latent_restore.take(),
+                        );
                         let fisher_err_start = std::time::Instant::now();
                         state = model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
                         curvature_total += fisher_err_start.elapsed();
@@ -5744,11 +5751,17 @@ where
                         continue;
                     }
                     if !is_lm_retriable_candidate_error(&err) {
-                        restore_arrow_latent_if_needed(options, pending_arrow_latent_restore.take());
+                        restore_arrow_latent_if_needed(
+                            options,
+                            pending_arrow_latent_restore.take(),
+                        );
                         return Err(err);
                     }
                     if lm_retry_exhausted(loop_lambda, attempts, lm_max_attempts) {
-                        restore_arrow_latent_if_needed(options, pending_arrow_latent_restore.take());
+                        restore_arrow_latent_if_needed(
+                            options,
+                            pending_arrow_latent_restore.take(),
+                        );
                         return Err(lm_nonconvergence_error(
                             options,
                             constrained_stationarity_norm(
@@ -8509,10 +8522,7 @@ fn trigamma(mut x: f64) -> f64 {
     }
     let inv = 1.0 / x;
     let inv2 = inv * inv;
-    acc + inv
-        + 0.5 * inv2
-        + inv2 * inv / 6.0
-        - inv2 * inv2 * inv / 30.0
+    acc + inv + 0.5 * inv2 + inv2 * inv / 6.0 - inv2 * inv2 * inv / 30.0
         + inv2 * inv2 * inv2 * inv / 42.0
         - inv2 * inv2 * inv2 * inv2 * inv / 30.0
 }
@@ -8530,8 +8540,7 @@ fn polygamma2(mut x: f64) -> f64 {
     let inv = 1.0 / x;
     let inv2 = inv * inv;
     let inv3 = inv2 * inv;
-    acc - inv2 - inv3 - 0.5 * inv2 * inv2 + inv3 * inv3 / 6.0
-        - inv2 * inv3 * inv3 / 6.0
+    acc - inv2 - inv3 - 0.5 * inv2 * inv2 + inv3 * inv3 / 6.0 - inv2 * inv3 * inv3 / 6.0
         + 0.3 * inv2 * inv2 * inv3 * inv3
         - 5.0 * inv2 * inv2 * inv2 * inv3 * inv3 / 6.0
 }
@@ -8550,8 +8559,7 @@ fn polygamma3(mut x: f64) -> f64 {
     let inv2 = inv * inv;
     let inv3 = inv2 * inv;
     let inv4 = inv2 * inv2;
-    acc + 2.0 * inv3 + 3.0 * inv4 + 2.0 * inv4 * inv - inv4 * inv3
-        + 4.0 * inv4 * inv3 * inv2 / 3.0
+    acc + 2.0 * inv3 + 3.0 * inv4 + 2.0 * inv4 * inv - inv4 * inv3 + 4.0 * inv4 * inv3 * inv2 / 3.0
         - 3.0 * inv4 * inv3 * inv4
         + 10.0 * inv4 * inv4 * inv4 * inv
 }
@@ -8572,9 +8580,7 @@ fn beta_logit_working_curvature_eta_derivatives(
     let psi3_sum = polygamma3(a) + polygamma3(b);
     let phi_sq = phi * phi;
     let q_sq = q * q;
-    let c = prior_weight
-        * phi_sq
-        * (2.0 * q * q_prime * trigamma_sum + q_sq * phi * q * psi2_diff);
+    let c = prior_weight * phi_sq * (2.0 * q * q_prime * trigamma_sum + q_sq * phi * q * psi2_diff);
     let d = prior_weight
         * phi_sq
         * (2.0 * (q_prime * q_prime + q * q_double_prime) * trigamma_sum
@@ -8872,8 +8878,7 @@ fn write_beta_logit_working_state(
                     let yi = y[i];
                     let a = (mu_i * phi).max(BETA_MU_EPS);
                     let b = ((1.0 - mu_i) * phi).max(BETA_MU_EPS);
-                    let score_mu =
-                        phi * (digamma(b) - digamma(a) + yi.ln() - (1.0 - yi).ln());
+                    let score_mu = phi * (digamma(b) - digamma(a) + yi.ln() - (1.0 - yi).ln());
                     let trigamma_sum = trigamma(a) + trigamma(b);
                     let info_mu = phi * phi * trigamma_sum;
                     let prior_weight = priorweights[i].max(0.0);
@@ -9631,9 +9636,8 @@ fn computeworkingweight_derivatives_from_eta(
                         let eta_used = eta_raw.clamp(-700.0, 700.0);
                         let clamp_active = eta_raw != eta_used;
                         let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                        let raw_weight = priorweights[i].max(0.0)
-                            * tweedie_log_weight_mu_power(jet.mu, p)
-                            / phi;
+                        let raw_weight =
+                            priorweights[i].max(0.0) * tweedie_log_weight_mu_power(jet.mu, p) / phi;
                         let floor_active = raw_weight > 0.0 && raw_weight <= MIN_WEIGHT;
                         if clamp_active || floor_active {
                             *c_o = 0.0;
@@ -10770,8 +10774,7 @@ fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
     } else if yi == 0.0 {
         mui_c.powf(2.0 - p) / (2.0 - p)
     } else {
-        yi.powf(2.0 - p) / ((1.0 - p) * (2.0 - p))
-            - yi * mui_c.powf(1.0 - p) / (1.0 - p)
+        yi.powf(2.0 - p) / ((1.0 - p) * (2.0 - p)) - yi * mui_c.powf(1.0 - p) / (1.0 - p)
             + mui_c.powf(2.0 - p) / (2.0 - p)
     }
 }
@@ -10794,9 +10797,7 @@ fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
     let mui_c = safe_beta_mu(mui);
     let a = (mui_c * phi).max(BETA_MU_EPS);
     let b = ((1.0 - mui_c) * phi).max(BETA_MU_EPS);
-    beta_log_normalizer(a, b, phi)
-        + phi * xlogy(mui_c, yi)
-        + phi * xlogy(1.0 - mui_c, 1.0 - yi)
+    beta_log_normalizer(a, b, phi) + phi * xlogy(mui_c, yi) + phi * xlogy(1.0 - mui_c, 1.0 - yi)
         - yi.ln()
         - (1.0 - yi).ln()
 }
@@ -11610,7 +11611,6 @@ mod low_rank_weight_pirls_tests {
             .sum();
         assert!(diff < 1e-12);
     }
-
 }
 
 #[cfg(test)]

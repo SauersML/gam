@@ -20,21 +20,13 @@ pub enum BackendStatus {
 }
 
 pub fn backend_status() -> BackendStatus {
-    #[cfg(feature = "cuda")]
-    {
-        if super::runtime::GpuRuntime::global().is_some() {
-            BackendStatus::CudaReady
-        } else {
-            BackendStatus::CudaUnavailable
-        }
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        BackendStatus::CpuFallback
+    if super::runtime::GpuRuntime::global().is_some() {
+        BackendStatus::CudaReady
+    } else {
+        BackendStatus::CudaUnavailable
     }
 }
 
-#[cfg(feature = "cuda")]
 mod cuda_impl {
     use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -101,7 +93,6 @@ mod cuda_impl {
     }
 }
 
-#[cfg(feature = "cuda")]
 pub(crate) use cuda_impl::{
     gemm_cuda, gemv_cuda, joint_hessian_2x2_cuda, xt_diag_x_cuda, xt_diag_y_cuda,
 };

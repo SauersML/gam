@@ -18,16 +18,9 @@ pub enum BackendStatus {
 
 #[inline]
 pub fn backend_status() -> BackendStatus {
-    #[cfg(feature = "cuda")]
-    {
-        match crate::gpu::runtime::GpuRuntime::global() {
-            Some(_) => BackendStatus::CudaReady,
-            None => BackendStatus::CudaUnavailable,
-        }
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        BackendStatus::CpuFallback
+    match crate::gpu::runtime::GpuRuntime::global() {
+        Some(_) => BackendStatus::CudaReady,
+        None => BackendStatus::CudaUnavailable,
     }
 }
 
@@ -44,21 +37,12 @@ pub fn try_dispatch(
     if x.nrows() != w.len() || x.nrows() == 0 || x.ncols() == 0 {
         return None;
     }
-    #[cfg(feature = "cuda")]
-    {
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
-            return None;
-        };
-        Some(cuda_xtwx(x, w))
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        drop((x, w));
-        None
-    }
+    let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+        return None;
+    };
+    Some(cuda_xtwx(x, w))
 }
 
-#[cfg(feature = "cuda")]
 fn cuda_xtwx(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Result<Array2<f64>, GpuError> {
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
     use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
@@ -168,7 +152,6 @@ extern "C" __global__ void row_scale_kernel(
     Ok(out)
 }
 
-#[cfg(feature = "cuda")]
 fn map_drv(e: cudarc::driver::DriverError) -> GpuError {
     GpuError::DriverCallFailed {
         reason: format!("xtwx cudarc driver error: {e}"),

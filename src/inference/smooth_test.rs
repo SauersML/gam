@@ -56,6 +56,16 @@ pub struct SmoothTestResult {
     pub p_value: f64,
 }
 
+/// Wood (2013) rank-truncated Wald smooth-component test.
+///
+/// Splits `beta[coeff_range]` into a leading `nullspace_dim` unpenalized
+/// block (tested at full rank) and a trailing penalized block (tested at
+/// rank `round(edf − nullspace_dim)` via the spectral truncated
+/// pseudo-inverse of the matching Σ̂ subblock). The combined statistic
+/// `T` is compared against `χ²_{ref_df}` when the scale is `Known`, or
+/// `F = T/(ref_df·φ̂)` against `F_{ref_df, residual_df}` when
+/// `Estimated`. Returns `None` on degenerate inputs (empty block,
+/// non-finite EDF, zero dispersion, non-finite stat).
 pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> {
     let start = input.coeff_range.start;
     let end = input.coeff_range.end;

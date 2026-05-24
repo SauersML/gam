@@ -26,14 +26,31 @@ use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 /// Rate-limited diagnostic counters for gradient calculations
 pub static GRAD_DIAG_BETA_COLLAPSE_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Count of outer-gradient evaluations where the proposed `δρ` was exactly
+/// zero (Newton step degenerated to no-op). Diagnostic only.
 pub static GRAD_DIAG_DELTA_ZERO_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Count of outer-gradient evaluations where the `log h(ρ)` quantity was
+/// clamped against the floor `log(eps)` to keep downstream divides
+/// well-defined.
 pub static GRAD_DIAG_LOGH_CLAMPED_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Count of outer-gradient evaluations that skipped the KKT envelope audit
+/// because no reference scale was available (β all zero or penalty
+/// reference vector all zero).
 pub static GRAD_DIAG_KKT_SKIP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Rate-limited diagnostic for Hessian minimum eigenvalue warnings
 pub static H_MIN_EIG_LOG_BUCKET: AtomicI32 = AtomicI32::new(i32::MIN);
+/// Count of `should_emit_h_min_eig_diag` invocations that have ever been
+/// considered for emission; used together with `H_MIN_EIG_LOG_BUCKET` to
+/// rate-limit one diagnostic per decade-magnitude bucket and per
+/// `MIN_EIG_DIAG_EVERY` repeats within the same bucket.
 pub static H_MIN_EIG_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Repeat period within a magnitude bucket for the Hessian-minimum-eigenvalue
+/// diagnostic: after the first emission for a bucket, every Nth subsequent
+/// invocation also emits.
 pub const MIN_EIG_DIAG_EVERY: usize = 200;
+/// Threshold below which a positive Hessian minimum eigenvalue is treated as
+/// nearly-singular and routed through the rate-limited diagnostic.
 pub const MIN_EIG_DIAG_THRESHOLD: f64 = 1e-4;
 
 /// Diagnostic formatter shared across the outer optimizer and the custom-family
