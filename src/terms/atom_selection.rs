@@ -107,11 +107,6 @@
 //!
 //! Fully implemented (closed-form, this module):
 //!
-//! * Reconstruction `Ẑ_n = Σ_k a_{n,k} · g_k(t_{n,k})` given external
-//!   decoder evaluations `g_k(t_{n,k})` ([`reconstruct_row`]).
-//! * `∂ℒ_data/∂a_{n,k}` for the row-local quadratic data-fit
-//!   ([`data_grad_assignment_row`]) — this is the `−(Z_n − Ẑ_n)ᵀ g_k(t_{n,k})`
-//!   formula from `sae_manifold.md` §3.3.
 //! * Softmax forward / Jacobian-vector product
 //!   ([`EntropicSoftmax::apply`], [`EntropicSoftmax::jvp_logits`]).
 //! * TopK projection with straight-through gradient
@@ -138,7 +133,7 @@
 //!   already-existing [`crate::terms::analytic_penalties`] `rho_index`
 //!   plumbing; no new outer-loop code is needed here.
 
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, ArrayView1};
 
 use crate::terms::analytic_penalties::{AnalyticPenalty, SparsityPenalty};
 use crate::terms::atom_codes::{BitVec, SparseAtomCode, SparseAtomCodes};
@@ -260,62 +255,6 @@ impl AtomLibrary {
     pub fn fresh_codes(&self) -> SparseAtomCodes {
         SparseAtomCodes::empty(self.n_obs, self.k_atoms())
     }
-}
-
-// ---------------------------------------------------------------------------
-// Row-local reconstruction & gradients (closed form)
-// ---------------------------------------------------------------------------
-
-/// Reconstruction at row `n`:
-/// `Ẑ_n = Σ_{k ∈ S_n} a_{n,k} · g_k(t_{n,k})`.
-///
-/// `decoder_outputs[k]` is `g_k(t_{n,k}) ∈ ℝ^p`. Inactive atoms are skipped;
-/// active atoms contribute their soft-weighted decoder output.
-pub fn reconstruct_row(
-    code: &SparseAtomCode,
-    decoder_outputs: &[ArrayView1<'_, f64>],
-) -> Array1<f64> {
-    assert_eq!(decoder_outputs.len(), code.k_atoms());
-    let p = decoder_outputs.first().map(|v| v.len()).unwrap_or(0);
-    let mut reconstruction = Array1::<f64>::zeros(p);
-    for k in code.active_mask.iter_ones() {
-        assert_eq!(decoder_outputs[k].len(), p);
-        let w = code.weights[k];
-        for i in 0..p {
-            reconstruction[i] += w * decoder_outputs[k][i];
-        }
-    }
-    reconstruction
-}
-
-/// Gradient of the row-`n` quadratic data fit `½ ‖Z_n − Ẑ_n‖²` with respect
-/// to the assignment vector `a_{n, ·}`.
-///
-/// From `sae_manifold.md` §3.3:
-/// ```text
-///   ∂ℒ_data / ∂a_{n,k}  =  −(Z_n − Ẑ_n)ᵀ  g_k(t_{n,k}).
-/// ```
-///
-/// The returned vector has length `K`. Inactive coordinates also get filled
-/// in (the *unconstrained* gradient), so that selection strategies such as
-/// [`TopK`] using the straight-through estimator can read the dense form.
-pub fn data_grad_assignment_row(
-    residual: ArrayView1<'_, f64>,
-    decoder_outputs: &[ArrayView1<'_, f64>],
-) -> Array1<f64> {
-    let k = decoder_outputs.len();
-    let mut g = Array1::<f64>::zeros(k);
-    let p = residual.len();
-    for kk in 0..k {
-        assert_eq!(decoder_outputs[kk].len(), p);
-        let mut acc = 0.0;
-        let g_k = &decoder_outputs[kk];
-        for i in 0..p {
-            acc += residual[i] * g_k[i];
-        }
-        g[kk] = -acc;
-    }
-    g
 }
 
 // ---------------------------------------------------------------------------
@@ -767,30 +706,6 @@ impl AssignmentSparsityCoupling for L1Relaxed {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Convenience: dense reconstruction over all rows (diagnostic).
-// ---------------------------------------------------------------------------
-
-/// Materialize `Ẑ ∈ ℝ^{N × p}` from current codes and externally-supplied
-/// per-row decoder outputs `decoder_outputs[n][k] = g_k(t_{n,k}) ∈ ℝ^p`.
-///
-/// Allocates; intended for diagnostic / post-fit pipelines.
-pub fn reconstruct_all(
-    codes: &SparseAtomCodes,
-    decoder_outputs: &[Vec<ArrayView1<'_, f64>>],
-    p_out: usize,
-) -> Array2<f64> {
-    let n = codes.n_obs();
-    let mut reconstruction = Array2::<f64>::zeros((n, p_out));
-    for nn in 0..n {
-        let row = reconstruct_row(codes.row(nn), &decoder_outputs[nn]);
-        for i in 0..p_out {
-            reconstruction[[nn, i]] = row[i];
-        }
-    }
-    reconstruction
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -862,22 +777,4 @@ mod tests {
         assert_eq!(code.weights[3], 0.7);
     }
 
-    #[test]
-    fn data_grad_assignment_matches_formula() {
-        let p = 3;
-        let z = array![1.0_f64, 0.0, 0.0];
-        let g0 = array![1.0_f64, 0.0, 0.0];
-        let g1 = array![0.0_f64, 1.0, 0.0];
-        let outs = [g0.view(), g1.view()];
-        let mut code = SparseAtomCode::empty(2);
-        code.assign(0, 0.5);
-        code.assign(1, 0.0);
-        let r = reconstruct_row(&code, &outs);
-        assert_eq!(r.len(), p);
-        let resid = &z - &r;
-        let g = data_grad_assignment_row(resid.view(), &outs);
-        // resid = (0.5, 0, 0); dot(resid, g0) = 0.5, dot(resid, g1) = 0
-        assert!((g[0] + 0.5).abs() < 1e-12);
-        assert!(g[1].abs() < 1e-12);
-    }
 }

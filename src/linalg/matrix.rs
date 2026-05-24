@@ -5410,9 +5410,6 @@ pub trait LinearOperator {
     fn matvec(&self, vector: &Array1<f64>) -> Array1<f64> {
         self.apply(vector)
     }
-    fn matvec_trans(&self, vector: &Array1<f64>) -> Array1<f64> {
-        self.apply_transpose(vector)
-    }
     fn compute_xtwx(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
         self.diag_xtw_x(weights)
     }
