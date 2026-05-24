@@ -180,7 +180,7 @@ fn main() {
 
     if !allow_offenders.is_empty() {
         sections.push(Section {
-            title: "#[allow(unused_* / dead_code)] / #[expect(unused_* / dead_code)]".to_string(),
+            title: "#[allow(...)] / #[expect(...)] (any lint, anywhere — fix the underlying code instead of silencing the lint)".to_string(),
             rows: allow_offenders
                 .iter()
                 .map(|(r, l, lint, s)| (r.clone(), *l, Some(lint.clone()), s.clone()))
