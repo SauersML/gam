@@ -7863,6 +7863,7 @@ mod tests {
 
     #[test]
     fn nested_prefix_mask_is_correct() {
+        assert!(file!().ends_with(".rs"));
         let (t, n_rows, f) = nested_prefix_test_target();
         let target = PsiSlice::full(t.len(), Some(f));
         let prefixes = vec![1_usize, 3, 4];
