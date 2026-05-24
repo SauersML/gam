@@ -10081,6 +10081,49 @@ fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         .map_err(|err| format!("failed to serialize coefficient state: {err}"))
 }
 
+#[derive(Serialize)]
+struct CoefficientStatePayload {
+    beta: Vec<f64>,
+    covariance_flat: Vec<f64>,
+    covariance_n: usize,
+    covariance_corrected: bool,
+    schema: Option<DataSchema>,
+    training_feature_ranges: Option<Vec<(f64, f64)>>,
+    random_column_ranges: Vec<(usize, usize)>,
+}
+
+fn coefficient_state_json_impl(model_bytes: &[u8]) -> Result<String, String> {
+    let model = load_model_impl(model_bytes)?;
+    let payload = model.payload();
+    let fit = fit_result_from_saved_model_for_prediction(&model)?;
+    let covariance = fit
+        .beta_covariance_corrected()
+        .map(|c| (c, true))
+        .or_else(|| fit.beta_covariance().map(|c| (c, false)))
+        .ok_or_else(|| "model does not contain coefficient covariance; refit with covariance-saving inference enabled".to_string())?;
+    let (cov, corrected) = covariance;
+    let mut random_ranges = Vec::<(usize, usize)>::new();
+    if let Some(spec) = payload.resolved_termspec.as_ref() {
+        let mut col = 1 + spec.linear_terms.len();
+        for re in &spec.random_effect_terms {
+            let n = re.frozen_levels.as_ref().map(|v| v.len()).unwrap_or(0);
+            random_ranges.push((col, col + n));
+            col += n;
+        }
+    }
+    let out = CoefficientStatePayload {
+        beta: fit.beta.to_vec(),
+        covariance_flat: cov.iter().copied().collect(),
+        covariance_n: cov.nrows(),
+        covariance_corrected: corrected,
+        schema: payload.data_schema.clone(),
+        training_feature_ranges: payload.training_feature_ranges.clone(),
+        random_column_ranges: random_ranges,
+    };
+    serde_json::to_string(&out)
+        .map_err(|err| format!("failed to serialize coefficient state: {err}"))
+}
+
 fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
     let model = load_model_impl(model_bytes)?;
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
@@ -12857,10 +12900,7 @@ fn build_standard_payload(
     payload.linkwiggle_knots = wiggle_knots;
     payload.linkwiggle_degree = wiggle_degree;
     payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
-    payload.resolved_termspec = Some(
-        freeze_term_collection_from_design(&resolved_termspec, design)
-            .map_err(|err| format!("failed to freeze standard term spec: {err}"))?,
-    );
+    payload.resolved_termspec = Some(resolved_termspec);
     payload.adaptive_regularization_diagnostics = adaptive_regularization_diagnostics;
     payload.offset_column = fit_config.offset_column.clone();
     payload.noise_offset_column = fit_config.noise_offset_column.clone();
