@@ -3911,7 +3911,6 @@ impl PenaltySubspaceCache {
         Self { entry: None }
     }
 
-    #[expect(dead_code)]
     fn get(&self, key: &PenaltySubspaceCacheKey) -> Option<Arc<runtime::PenaltySubspace>> {
         self.entry
             .as_ref()
@@ -3919,7 +3918,6 @@ impl PenaltySubspaceCache {
             .map(|(_, value)| value.clone())
     }
 
-    #[expect(dead_code)]
     fn insert(&mut self, key: PenaltySubspaceCacheKey, value: Arc<runtime::PenaltySubspace>) {
         self.entry = Some((key, value));
     }

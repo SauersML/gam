@@ -1386,8 +1386,7 @@ mod gram_inner_contraction_tests {
         fn n_coefficients(&self) -> usize {
             self.p
         }
-        fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
-            drop(row);
+        fn row_kernel(&self, _: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
             Ok((0.0, [0.0; 4], [[0.0; 4]; 4]))
         }
         fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 4] {

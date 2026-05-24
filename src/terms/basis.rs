@@ -3914,7 +3914,6 @@ pub(crate) struct StreamingBSplineEvaluator {
     data: Arc<Array1<f64>>,
     knots: Arc<Array1<f64>>,
     degree: usize,
-    #[expect(dead_code)]
     boundary_conditions: BSplineBoundaryConditions,
     periodic: Option<(f64, f64, usize)>,
     transform: Option<Arc<Array2<f64>>>,
@@ -28288,13 +28287,6 @@ mod tests {
     /// centers-extraction match arms.
     fn expected_duchon_metadata_for_centers() -> ! {
         panic!("expected Duchon metadata for centers extraction")
-    }
-
-    /// Helper for Matérn fixture closures that intentionally restrict
-    /// `nu` to `≥ 5/2`. Centralized so the panic! literal doesn't appear
-    /// inline.
-    fn matern_test_nu_out_of_range(nu: impl std::fmt::Debug) -> ! {
-        panic!("test only covers nu >= 5/2; got {nu:?}")
     }
 
     /// Cubic periodic B-spline basis spec for tests, with the standard

@@ -646,9 +646,7 @@ fn compute_test_mask(content: &str, rel: &Path) -> Vec<bool> {
         || rel_str.starts_with("benches/")
         || path_matches_crates_test(&rel_str);
     if file_is_test {
-        for m in &mut mask {
-            *m = true;
-        }
+        mask.fill(true);
         return mask;
     }
 
@@ -699,10 +697,10 @@ fn compute_test_mask(content: &str, rel: &Path) -> Vec<bool> {
                     pending_attr = false;
                 }
             } else if b == b'}' {
-                if let Some(&entry) = gate_stack.last() {
-                    if depth - 1 == entry {
-                        gate_stack.pop();
-                    }
+                if let Some(&entry) = gate_stack.last()
+                    && depth - 1 == entry
+                {
+                    gate_stack.pop();
                 }
                 depth -= 1;
             }
@@ -1208,10 +1206,10 @@ fn compute_trait_impl_mask(content: &str) -> Vec<bool> {
                     stack.push((opened_at_depth, false));
                 }
             } else if b == b'}' {
-                if let Some(&(entry, _)) = stack.last() {
-                    if depth - 1 == entry {
-                        stack.pop();
-                    }
+                if let Some(&(entry, _)) = stack.last()
+                    && depth - 1 == entry
+                {
+                    stack.pop();
                 }
                 depth -= 1;
             }
@@ -2143,11 +2141,12 @@ fn scan_for_useless_tests(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf,
                 continue;
             };
             let mut found = false;
-            for k in open..=close {
+            for (offset, raw_line) in lines[open..=close].iter().enumerate() {
+                let k = open + offset;
                 let line_s = stripped_lines
                     .get(k)
                     .map(String::as_str)
-                    .unwrap_or(lines[k]);
+                    .unwrap_or(raw_line);
                 if line_s.contains("assert!(")
                     || line_s.contains("assert_eq!(")
                     || line_s.contains("assert_ne!(")

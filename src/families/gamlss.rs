@@ -14498,7 +14498,6 @@ where
     }
 }
 
-#[expect(dead_code)]
 struct BinomialLocationScaleWiggleJointPsiDirection {
     block_idx: usize,
     local_idx: usize,

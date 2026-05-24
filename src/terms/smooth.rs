@@ -4272,7 +4272,6 @@ fn expand_penalty_by_levels(base_s: &Array2<f64>, levels: usize) -> Array2<f64> 
     dense_block_diag(&blocks)
 }
 
-#[expect(dead_code)]
 fn build_by_smooth_basis(
     data: ArrayView2<'_, f64>,
     smooth: &SmoothBasisSpec,
@@ -4379,7 +4378,6 @@ fn bspline_base_design_and_penalty(
     Ok((design, penalty, built.metadata))
 }
 
-#[expect(dead_code)]
 fn natural_reparameterize_design_penalty(
     x: &Array2<f64>,
     s: &Array2<f64>,
@@ -4415,7 +4413,6 @@ fn natural_reparameterize_design_penalty(
     Ok((x.dot(&transform), null_dim, rank))
 }
 
-#[expect(dead_code)]
 fn build_linear_margin(data: ArrayView2<'_, f64>, col: usize) -> Result<Array2<f64>, BasisError> {
     if col >= data.ncols() {
         return Err(BasisError::DimensionMismatch(
@@ -4437,7 +4434,6 @@ fn build_linear_margin(data: ArrayView2<'_, f64>, col: usize) -> Result<Array2<f
     Ok(x)
 }
 
-#[expect(dead_code)]
 fn build_factor_smooth_basis(
     data: ArrayView2<'_, f64>,
     spec: &FactorSmoothSpec,
@@ -21979,8 +21975,7 @@ mod tests {
                     + designs[0].penalties.len() as f64
                     + designs[1].penalties.len() as f64)
             },
-            |theta, specs, designs, eval_mode, row_set| {
-                drop(row_set);
+            |theta, specs, designs, eval_mode, _| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert!(!designs.is_empty());
@@ -23762,8 +23757,7 @@ mod tests {
                 assert_eq!(designs.len(), 2);
                 Ok(designs[0].design.ncols() as f64 + designs[1].design.ncols() as f64)
             },
-            |theta, specs, designs, eval_mode, row_set| {
-                drop(row_set);
+            |theta, specs, designs, eval_mode, _| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert_eq!(designs.len(), 2);
@@ -25859,8 +25853,7 @@ mod tests {
                     + designs[0].penalties.len() as f64
                     + designs[1].penalties.len() as f64)
             },
-            |theta, specs, designs, eval_mode, row_set| {
-                drop(row_set);
+            |theta, specs, designs, eval_mode, _| {
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert!(!designs.is_empty());
