@@ -4914,15 +4914,14 @@ where
         // Aggregating ρ accepted across iters tells us whether the LM
         // model is well-calibrated: ρ ≈ 1 throughout = healthy Newton;
         // ρ << 1 = model over-states predicted reduction. The
-        // initial `None` is the safety value if a future code path
-        // adds a different fall-through. The trajectory log is
-        // emitted only on iter-end fall-through (via `break;` from
+        // `unused_assignments` allow is justified: the trajectory log
+        // is emitted only on iter-end fall-through (via `break;` from
         // the LM loop), which always passes through the accept-step
-        // assignment. The `debug_assert` reads the initial value so
-        // the `unused_assignments` lint stays clean without an
-        // `#[allow]` (which is banned by build.rs).
+        // assignment. The initial `None` is the safety value if a
+        // future code path adds a different fall-through; defending
+        // that case is cheap.
+        #[allow(unused_assignments)]
         let mut lm_accept_rho: Option<f64> = None;
-        debug_assert!(lm_accept_rho.is_none());
         // Madsen-Nielsen-Tingleff stateful rejection factor (eq 3.16 in
         // "Methods for non-linear least squares problems", IMM Tech Univ
         // Denmark, 2nd ed 2004): v starts at 2 and doubles on every
@@ -5455,9 +5454,7 @@ where
                         // smooth Marquardt update. See `madsen_lm_accept_factor`
                         // for the textbook derivation and canonical values.
                         lambda = (loop_lambda * madsen_lm_accept_factor(rho)).max(1e-9);
-                        // The candidate succeeded; consume the captured arrow-latent
-                        // restore handle so it cannot be applied on a later miss.
-                        drop(pending_arrow_latent_restore.take());
+                        pending_arrow_latent_restore = None;
 
                         // Updates for next iteration. Recycle the previous beta
                         // allocation as the next candidate buffer instead of
@@ -6330,6 +6327,9 @@ pub struct PirlsResult {
     /// This carries 4th-order likelihood information used in exact d²H/dρ²
     /// terms for the outer LAML Hessian.
     pub solve_d_array: Array1<f64>,
+    /// True when `solve_c_array` / `solve_d_array` are placeholders rather
+    /// than supported likelihood derivatives.
+    pub derivatives_unsupported: bool,
 
     // Keep all other fields as they are
     pub status: PirlsStatus,
@@ -6440,6 +6440,7 @@ impl PirlsResult {
             solve_d3mu_deta3: Array1::zeros(0),
             solve_c_array: self.solve_c_array.clone(),
             solve_d_array: self.solve_d_array.clone(),
+            derivatives_unsupported: self.derivatives_unsupported,
             status: self.status,
             iteration: self.iteration,
             max_abs_eta: self.max_abs_eta,
@@ -6524,6 +6525,7 @@ impl PirlsResult {
             solve_d3mu_deta3,
             solve_c_array,
             solve_d_array,
+            derivatives_unsupported: self.derivatives_unsupported,
             status: self.status,
             iteration: self.iteration,
             max_abs_eta: self.max_abs_eta,
@@ -6598,6 +6600,7 @@ fn assemble_pirls_result(
         solve_d3mu_deta3: final_d3mu_deta3.clone(),
         solve_c_array: final_c.clone(),
         solve_d_array: final_d.clone(),
+        derivatives_unsupported: working_derivatives_unsupported(likelihood),
         status,
         iteration: working_summary.iterations,
         max_abs_eta: working_summary.max_abs_eta,
@@ -7455,6 +7458,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             solve_d3mu_deta3,
             solve_c_array,
             solve_d_array,
+            derivatives_unsupported: working_derivatives_unsupported(config.likelihood),
             status: PirlsStatus::Converged,
             iteration: 1,
             max_abs_eta,
@@ -8535,7 +8539,6 @@ fn write_gamma_log_working_state(
     }
 }
 
-pub const BETA_RESPONSE_EPS: f64 = 1.0e-12;
 pub const BETA_MU_EPS: f64 = 1.0e-12;
 
 #[inline]
@@ -8552,18 +8555,57 @@ fn valid_negbin_theta(theta: f64) -> bool {
 }
 
 #[inline]
+fn valid_count_response(y: f64) -> bool {
+    y.is_finite() && y >= 0.0 && (y - y.round()).abs() <= 1e-9
+}
+
+fn validate_count_responses(
+    y: &ArrayView1<'_, f64>,
+    priorweights: &ArrayView1<'_, f64>,
+    family: &str,
+) -> Result<(), EstimationError> {
+    for (i, (&yi, &wi)) in y.iter().zip(priorweights.iter()).enumerate() {
+        if wi > 0.0 && !valid_count_response(yi) {
+            return Err(EstimationError::InvalidInput(format!(
+                "{family} response must be a finite non-negative integer at positive-weight row {i}; got {yi}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[inline]
 fn valid_beta_phi(phi: f64) -> bool {
     phi.is_finite() && phi > 0.0
 }
 
 #[inline]
-fn safe_beta_response(y: f64) -> f64 {
-    y.clamp(BETA_RESPONSE_EPS, 1.0 - BETA_RESPONSE_EPS)
+fn valid_beta_response(y: f64) -> bool {
+    y.is_finite() && y > 0.0 && y < 1.0
+}
+
+fn validate_beta_responses(
+    y: &ArrayView1<'_, f64>,
+    priorweights: &ArrayView1<'_, f64>,
+) -> Result<(), EstimationError> {
+    for (i, (&yi, &wi)) in y.iter().zip(priorweights.iter()).enumerate() {
+        if wi > 0.0 && !valid_beta_response(yi) {
+            return Err(EstimationError::InvalidInput(format!(
+                "beta-regression response must be finite and strictly inside (0, 1) at positive-weight row {i}; got {yi}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[inline]
 fn safe_beta_mu(mu: f64) -> f64 {
     mu.clamp(BETA_MU_EPS, 1.0 - BETA_MU_EPS)
+}
+
+#[inline]
+fn working_derivatives_unsupported(likelihood: GlmLikelihoodSpec) -> bool {
+    matches!(likelihood.family, GlmLikelihoodFamily::BetaLogit { .. })
 }
 
 #[inline]
@@ -8729,6 +8771,7 @@ fn write_negative_binomial_log_working_state(
             "negative-binomial theta must be finite and > 0; got {theta}"
         )));
     }
+    validate_count_responses(&y, &priorweights, "negative-binomial")?;
     if let Some(derivs) = derivatives {
         let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
         let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
@@ -8825,6 +8868,7 @@ fn write_beta_logit_working_state(
             "beta-regression phi must be finite and > 0; got {phi}"
         )));
     }
+    validate_beta_responses(&y, &priorweights)?;
     if let Some(derivs) = derivatives {
         let mu_s = mu.as_slice_mut().expect("mu must be contiguous");
         let weights_s = weights.as_slice_mut().expect("weights must be contiguous");
@@ -8859,7 +8903,7 @@ fn write_beta_logit_working_state(
                     let jet = logit_inverse_link_jet5(eta_i);
                     let mu_i = safe_beta_mu(jet.mu);
                     let q = (mu_i * (1.0 - mu_i)).max(BETA_MU_EPS);
-                    let yi = safe_beta_response(y[i]);
+                    let yi = y[i];
                     let a = (mu_i * phi).max(BETA_MU_EPS);
                     let b = ((1.0 - mu_i) * phi).max(BETA_MU_EPS);
                     let score_mu =
@@ -8899,7 +8943,7 @@ fn write_beta_logit_working_state(
                 let jet = logit_inverse_link_jet5(eta_i);
                 let mu_i = safe_beta_mu(jet.mu);
                 let q = (mu_i * (1.0 - mu_i)).max(BETA_MU_EPS);
-                let yi = safe_beta_response(y[i]);
+                let yi = y[i];
                 let a = (mu_i * phi).max(BETA_MU_EPS);
                 let b = ((1.0 - mu_i) * phi).max(BETA_MU_EPS);
                 let score_mu = phi * (digamma(b) - digamma(a) + yi.ln() - (1.0 - yi).ln());
@@ -10702,7 +10746,7 @@ fn tweedie_unit_deviance(yi: f64, mui_c: f64, p: f64) -> f64 {
 
 #[inline]
 fn negative_binomial_unit_deviance(yi: f64, mui_c: f64, theta: f64) -> f64 {
-    if !valid_negbin_theta(theta) || yi < 0.0 {
+    if !valid_negbin_theta(theta) || !valid_count_response(yi) {
         return f64::NAN;
     }
     let y_term = xlogy(yi, (yi * (theta + mui_c)) / (mui_c * (theta + yi)));
@@ -10712,22 +10756,25 @@ fn negative_binomial_unit_deviance(yi: f64, mui_c: f64, theta: f64) -> f64 {
 
 #[inline]
 fn beta_loglikelihood_full_unit(yi: f64, mui: f64, phi: f64) -> f64 {
-    let yi_c = safe_beta_response(yi);
+    if !valid_beta_phi(phi) || !valid_beta_response(yi) {
+        return f64::NAN;
+    }
     let mui_c = safe_beta_mu(mui);
     let a = mui_c * phi;
     let b = (1.0 - mui_c) * phi;
     beta_log_normalizer(a, b, phi)
-        + phi * xlogy(mui_c, yi_c)
-        + phi * xlogy(1.0 - mui_c, 1.0 - yi_c)
-        - yi_c.ln()
-        - (1.0 - yi_c).ln()
+        + phi * xlogy(mui_c, yi)
+        + phi * xlogy(1.0 - mui_c, 1.0 - yi)
+        - yi.ln()
+        - (1.0 - yi).ln()
 }
 
 #[inline]
 fn beta_unit_deviance(yi: f64, mui: f64, phi: f64) -> f64 {
-    let yi_c = safe_beta_response(yi);
-    beta_loglikelihood_full_unit(yi_c, yi_c, phi)
-        - beta_loglikelihood_full_unit(yi_c, mui, phi)
+    if !valid_beta_response(yi) {
+        return f64::NAN;
+    }
+    beta_loglikelihood_full_unit(yi, yi, phi) - beta_loglikelihood_full_unit(yi, mui, phi)
 }
 
 #[inline]
@@ -10899,7 +10946,7 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                     return f64::NAN;
                 }
                 let yi = y[i];
-                if yi < 0.0 {
+                if !valid_count_response(yi) {
                     return f64::NAN;
                 }
                 let mui_c = mu[i].max(EPS);
