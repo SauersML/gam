@@ -198,42 +198,48 @@ fn render_report(sections: &[Section]) {
     eprintln!();
 }
 
-/// Build the table of banned substrings. Each entry is matched in the
-/// "stripped" portion of each line (string/char literal contents replaced by
-/// spaces, `//` line comments dropped). The label is shown in the error
-/// output so the offender knows which rule fired.
-fn banned_substrings() -> &'static [(&'static str, &'static str)] {
+/// Build the table of banned substrings. Each entry is `(needle, label,
+/// test_aware)` matched against the "stripped" portion of every line
+/// (string/char literal contents replaced by spaces, `//` line comments
+/// dropped). When `test_aware` is true the match is suppressed in test
+/// scope (test directories or inside `#[cfg(test)]` blocks).
+fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
     &[
-        // Debug residue.
-        ("dbg!(", "dbg!"),
-        // Runtime "not done yet" markers — same family as the TO-DO text ban.
-        ("todo!(", "todo!"),
-        ("unimplemented!(", "unimplemented!"),
-        // Direct panics. Tests should use `assert*!` macros which carry
-        // failure context; production code should propagate `Result`.
-        ("panic!(", "panic!"),
-        // Memory-leak primitives.
-        ("mem::forget(", "mem::forget"),
-        ("Box::leak(", "Box::leak"),
+        // Debug residue. Acceptable in test code.
+        ("dbg!(", "dbg!", true),
+        // Runtime "not done yet" markers — same family as the TO-DO text
+        // ban. Acceptable in test scaffolding.
+        ("todo!(", "todo!", true),
+        ("unimplemented!(", "unimplemented!", true),
+        // Direct panics. Tests use `panic!("expected variant X")` after
+        // destructuring matches, which is idiomatic; non-test code should
+        // propagate `Result`.
+        ("panic!(", "panic!", true),
+        // Memory-leak primitives. Tests sometimes leak intentionally.
+        ("mem::forget(", "mem::forget", true),
+        ("Box::leak(", "Box::leak", true),
         // Environment-variable reads (see feedback_no_env_vars memory).
-        ("env::var(", "env::var"),
-        ("env::var_os(", "env::var_os"),
+        // Strict everywhere.
+        ("env::var(", "env::var", false),
+        ("env::var_os(", "env::var_os", false),
         // `if let Ok/Some/Err(_) = …` — `.is_ok()` / `.is_some()` /
         // `.is_err()` are strictly cleaner. Match-arm forms `Ok(_) =>`
         // etc. are NOT banned: when the inner type is `()` (e.g.
         // `Result<(), E>` from `channel.send`), `Ok(_) =>` is the
         // idiomatic variant-only check and there is nothing to bind.
-        ("if let Ok(_)", "if let Ok(_)"),
-        ("if let Some(_)", "if let Some(_)"),
-        ("if let Err(_)", "if let Err(_)"),
-        // Redundant boolean comparisons.
-        ("== true", "== true"),
-        ("== false", "== false"),
-        ("!= true", "!= true"),
-        ("!= false", "!= false"),
-        // Sleep hides latency / introduces flakiness.
-        ("thread::sleep(", "thread::sleep"),
-        ("std::thread::sleep(", "std::thread::sleep"),
+        // Tripwire — strict everywhere.
+        ("if let Ok(_)", "if let Ok(_)", false),
+        ("if let Some(_)", "if let Some(_)", false),
+        ("if let Err(_)", "if let Err(_)", false),
+        // Redundant boolean comparisons — redundant everywhere.
+        ("== true", "== true", false),
+        ("== false", "== false", false),
+        ("!= true", "!= true", false),
+        ("!= false", "!= false", false),
+        // Sleep hides latency / introduces flakiness. Tests sometimes
+        // need a real sleep (e.g. timing scheduler races).
+        ("thread::sleep(", "thread::sleep", true),
+        ("std::thread::sleep(", "std::thread::sleep", true),
     ]
 }
 
@@ -251,15 +257,206 @@ fn scan_for_banned_substrings(
         if rel.extension().and_then(OsStr::to_str) != Some("rs") {
             return;
         }
+        let mask = compute_test_mask(content, rel);
         for (idx, line) in content.lines().enumerate() {
             let stripped = strip_strings_and_comments(line);
-            for (needle, label) in needles {
+            let in_test = mask.get(idx).copied().unwrap_or(false);
+            for (needle, label, test_aware) in needles {
+                if *test_aware && in_test {
+                    continue;
+                }
                 if stripped.contains(needle) {
                     offenders.push((rel.to_path_buf(), idx + 1, *label, line.to_string()));
                 }
             }
         }
     });
+}
+
+/// Compute a per-line bitmap of "is this line in test scope?". A line is in
+/// test scope if either the file is a test/bench file (under `tests/`,
+/// `bench/`, `benches/`, or `crates/*/tests|benches/`), or the line is
+/// inside a brace block annotated with `#[cfg(test)]` / `#[cfg(all(test,
+/// ...))]` / `#[cfg(any(test, ...))]`.
+///
+/// Brace tracking uses `strip_strings_and_comments` per line to ignore
+/// braces inside string literals and `//` comments. Block comments and
+/// raw strings are out of scope (same limitation as the other scanners).
+fn compute_test_mask(content: &str, rel: &Path) -> Vec<bool> {
+    let lines: Vec<&str> = content.lines().collect();
+    let n = lines.len();
+    let mut mask = vec![false; n];
+
+    // File-level test scope.
+    let rel_str = rel.to_string_lossy().replace('\\', "/");
+    let file_is_test = rel_str.starts_with("tests/")
+        || rel_str.starts_with("bench/")
+        || rel_str.starts_with("benches/")
+        || path_matches_crates_test(&rel_str);
+    if file_is_test {
+        for m in &mut mask {
+            *m = true;
+        }
+        return mask;
+    }
+
+    // Brace-tracked cfg(test) regions. We maintain a stack of entry brace
+    // depths: when a `#[cfg(test)]`-style attribute is seen, we wait for
+    // the next `{` to open the gated block, then pop when depth returns to
+    // the entry level.
+    let mut depth: i32 = 0;
+    // Pending attribute: when Some, the very next `{` (which may be on the
+    // same line as the attribute or several lines later) opens a gated
+    // block.
+    let mut pending_attr = false;
+    // Stack of entry depths (depth at which the gate opens; we exit when
+    // depth drops back to this value).
+    let mut gate_stack: Vec<i32> = Vec::new();
+
+    for (idx, raw) in lines.iter().enumerate() {
+        let stripped = strip_strings_and_comments(raw);
+
+        // Detect cfg-test attribute on this line. Attribute syntax is
+        // `#[cfg(test)]`, `#[cfg(all(test, ...))]`, `#[cfg(any(test,
+        // ...))]`. We accept the attribute anywhere on the line.
+        if is_cfg_test_attr_line(&stripped) {
+            pending_attr = true;
+        }
+
+        // Walk braces on this line.
+        let bytes = stripped.as_bytes();
+        // The line counts as "in test" if the line's starting depth is
+        // already inside a gate. Compute before brace walk so the
+        // attribute line itself and the brace-open line are not marked
+        // (they belong to enclosing scope), and the brace-close line that
+        // exits the gate is also not marked. Lines strictly inside the
+        // gate ARE marked.
+        let inside_at_line_start = !gate_stack.is_empty();
+        mask[idx] = inside_at_line_start;
+
+        for &b in bytes {
+            if b == b'{' {
+                depth += 1;
+                if pending_attr {
+                    // The brace that just opened belongs to the cfg(test)
+                    // attribute target. The gate's "entry depth" is the
+                    // outer depth, i.e. depth - 1: we exit when depth
+                    // drops back to that value.
+                    gate_stack.push(depth - 1);
+                    pending_attr = false;
+                }
+            } else if b == b'}' {
+                if let Some(&entry) = gate_stack.last() {
+                    if depth - 1 == entry {
+                        gate_stack.pop();
+                    }
+                }
+                depth -= 1;
+            }
+        }
+    }
+
+    mask
+}
+
+/// Match `crates/<name>/tests/...` or `crates/<name>/benches/...`.
+fn path_matches_crates_test(rel: &str) -> bool {
+    let Some(rest) = rel.strip_prefix("crates/") else {
+        return false;
+    };
+    // Skip the crate name segment.
+    let Some(slash) = rest.find('/') else {
+        return false;
+    };
+    let tail = &rest[slash + 1..];
+    tail.starts_with("tests/") || tail.starts_with("benches/")
+}
+
+/// Recognize `#[cfg(test)]`, `#[cfg(all(test, ...))]`, `#[cfg(any(test,
+/// ...))]` on a stripped line. We match by locating `cfg(` after a `#[`
+/// and inspecting the argument list for a bare `test` token (either
+/// directly, or inside an `all(...)`/`any(...)` whose token list contains
+/// `test`).
+fn is_cfg_test_attr_line(stripped: &str) -> bool {
+    let bytes = stripped.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'#' && bytes[i + 1] == b'[' {
+            // Find `cfg(` after this.
+            let rest = &stripped[i + 2..];
+            // Allow `cfg_attr` to NOT match — we want `cfg(...)`.
+            if let Some(pos) = rest.find("cfg(") {
+                // Ensure it's `cfg(` not e.g. `cfg_attr(` (`cfg_attr`
+                // would include the underscore before `(`, but `find`
+                // returns the first match; check the preceding byte to
+                // ensure the `c` of `cfg(` is not preceded by an
+                // identifier byte).
+                let abs = i + 2 + pos;
+                let before_ok = abs == 0 || !is_ident_byte(bytes[abs - 1]);
+                if before_ok {
+                    // Extract the parenthesized argument list (balance
+                    // parens).
+                    let args_start = abs + 4; // past `cfg(`
+                    if let Some(end) = find_matching_paren(&bytes[args_start..]) {
+                        let args = &stripped[args_start..args_start + end];
+                        if cfg_args_contain_test(args) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Given bytes starting just *after* an opening `(`, find the index of
+/// the matching closing `)`. Returns the position of the `)` relative to
+/// the slice start, or None if unbalanced on this line.
+fn find_matching_paren(bytes: &[u8]) -> Option<usize> {
+    let mut depth: i32 = 1;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// True if the argument list inside `cfg(...)` mentions `test` either as
+/// a bare token or inside an `all(...)` / `any(...)` whose own token
+/// list contains `test`. The check is recursive in spirit but
+/// implemented by scanning for a `test` whole-word token anywhere in the
+/// flattened argument string — `cfg(all(test, foo))`, `cfg(any(foo,
+/// test))`, and `cfg(test)` all reduce to "contains the bare word
+/// `test`", which is the desired behavior since any of these spellings
+/// gates the annotated item to the test build.
+fn cfg_args_contain_test(args: &str) -> bool {
+    let bytes = args.as_bytes();
+    let kw = b"test";
+    let mut i = 0usize;
+    while i + kw.len() <= bytes.len() {
+        if &bytes[i..i + kw.len()] == kw {
+            let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+            let after_ok =
+                i + kw.len() == bytes.len() || !is_ident_byte(bytes[i + kw.len()]);
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Walks `unsafe` keyword sites and requires a `// SAFETY:` comment within
@@ -514,7 +711,11 @@ fn scan_for_let_underscore(
         if !content.contains("let ") {
             return;
         }
+        let mask = compute_test_mask(content, rel);
         for (idx, line) in content.lines().enumerate() {
+            if mask.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
             if line_has_let_underscore(line) {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }

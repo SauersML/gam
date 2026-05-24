@@ -16910,10 +16910,11 @@ mod tests {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 producer_cache.get_or_insert_with(key, || {
                     started_tx.send(()).expect("send producer-start signal");
-                    // Block until the waiter has subscribed to the slot.
-                    release_rx
-                        .recv()
-                        .expect("waiter subscribe signal");
+                    // Block until the waiter has actually subscribed to the
+                    // in-progress slot. The release signal is fired only after
+                    // the cache reports a parked waiter, so the producer's
+                    // panic is guaranteed to wake at least one Wait branch.
+                    release_rx.recv().expect("waiter subscribe signal");
                     panic!("simulated projected-factor panic");
                 });
             }))
@@ -16926,15 +16927,24 @@ mod tests {
 
         let waiter_cache = Arc::clone(&cache);
         let waiter = std::thread::spawn(move || {
-            // Signal the producer to proceed (the slot is published before
-            // the producing closure runs, so by the time we call
-            // get_or_insert_with we are guaranteed to subscribe as a waiter).
-            release_tx.send(()).expect("release producer");
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 waiter_cache.get_or_insert_with(key, || Array2::from_elem((1, 1), 7.0));
             }))
             .is_err()
         });
+
+        // Spin until the waiter has parked inside the Wait branch, then
+        // release the producer to panic. `yield_now` keeps the wait bounded
+        // without burning a core.
+        let waited_at = std::time::Instant::now();
+        while cache.pending_waiters_for(key) == 0 {
+            assert!(
+                waited_at.elapsed() < std::time::Duration::from_secs(5),
+                "waiter never subscribed to the in-progress slot"
+            );
+            std::thread::yield_now();
+        }
+        release_tx.send(()).expect("release producer");
 
         assert!(producer.join().expect("producer thread joined"));
         assert!(waiter.join().expect("waiter thread joined"));
