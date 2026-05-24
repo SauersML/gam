@@ -18998,7 +18998,11 @@ pub fn create_duchon_basis_1d_derivative_dense(
                 0 => phi,
                 1 => phi_r * sign,
                 2 => phi_rr,
-                _ => unreachable!("order checked above"),
+                other => {
+                    return Err(BasisError::InvalidInput(format!(
+                        "Duchon basis derivative supports orders 0, 1, and 2; got order={other}"
+                    )));
+                }
             } * kernel_amp;
         }
     }
@@ -21825,7 +21829,11 @@ pub fn apply_sum_to_zero_constraint_sparse(
                     pivot_pos += 1;
                     (pivot_row, value)
                 }
-                (None, None) => unreachable!("merge loop guards ensure one side remains"),
+                // The `while` condition ensures at least one side still has
+                // elements; this arm is therefore inert. We `break` defensively
+                // rather than panicking so a future refactor that loosens the
+                // loop guard still terminates cleanly.
+                (None, None) => break,
             };
             if value.abs() > 1e-12 {
                 triplets.push(Triplet::new(row, out_col, value));

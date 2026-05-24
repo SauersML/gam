@@ -152,9 +152,14 @@ pub struct DeviceAllocation<'a> {
 impl<'a> DeviceAllocation<'a> {
     /// Allocate `bytes` of device memory. Caller is responsible for context
     /// `cuCtxSetCurrent` having been issued before this call.
+    // SAFETY: marked `unsafe fn` because the caller must guarantee that a
+    // CUDA context is current on this thread; without that precondition
+    // the inner cuMemAlloc call is undefined behavior.
     pub unsafe fn new(driver: &'a DriverApi, bytes: usize) -> Option<Self> {
         let mut ptr = 0_u64;
         check_cuda(
+            // SAFETY: &mut ptr is a valid u64 slot living to the end of
+            // this fn; `bytes` is the caller-requested allocation size.
             unsafe { (driver.cu_mem_alloc)(&mut ptr, bytes) },
             "cuMemAlloc",
         )
@@ -165,6 +170,9 @@ impl<'a> DeviceAllocation<'a> {
 
 impl Drop for DeviceAllocation<'_> {
     fn drop(&mut self) {
+        // SAFETY: self.ptr was produced by cuMemAlloc inside Self::new
+        // (precondition: a context is current on the freeing thread, as
+        // guaranteed by the caller of `unsafe fn new`) and is freed once.
         unsafe {
             drop((self.driver.cu_mem_free)(self.ptr));
         }
@@ -184,6 +192,10 @@ pub fn check_cuda(result: CuResult, name: &str) -> Result<(), GpuError> {
 
 fn load_library(candidates: &[&str]) -> Result<Library, GpuError> {
     for candidate in candidates {
+        // SAFETY: Library::new is `unsafe` because it may execute
+        // arbitrary code from the loaded library's initializer; we only
+        // ever load OS-provided libcuda by canonical names from
+        // cuda_library_candidates(), which has no init-time side effects.
         if let Ok(library) = unsafe { Library::new(*candidate) } {
             return Ok(library);
         }
