@@ -23,7 +23,9 @@
 //!     discovering intrinsic dimension only after a separate gauge fix
 //!     (`AuxPrior` or `Isometry`) pins rotations / reparameterisations.
 //!   * [`TotalVariationPenalty`] — smoothed L¹ on first differences of a
-//!     latent coefficient block. Promotes piecewise-constant atom maps.
+//!     latent coefficient block. This is coordinatewise/anisotropic TV: each
+//!     latent axis is penalized independently on every edge. Promotes
+//!     piecewise-constant atom maps.
 //!   * [`NuclearNormPenalty`] — smoothed L¹ on singular values of a matrix
 //!     latent block. Promotes low intrinsic rank without choosing a canonical
 //!     axis basis.
@@ -2109,13 +2111,15 @@ pub enum DifferenceOpKind {
     GraphEdges(Vec<(usize, usize)>),
 }
 
-/// Smoothed-L¹ total variation on a row-major `(n_eff, d)` latent block.
+/// Coordinatewise/anisotropic smoothed-L¹ total variation on a row-major
+/// `(n_eff, d)` latent block.
 ///
-/// Uses the differentiable Huber-style kernel `φ(x)=sqrt(x²+ε²)-ε`.
-/// The difference operator defines the prior shape: forward 1-D differences
-/// for ordered context windows, or graph edges for adjacency-structured atoms.
-/// Pair TV with Orthogonality when piecewise-constant atoms need a gauge-fixed,
-/// interpretable basis.
+/// Uses the differentiable Huber-style kernel `φ(x)=sqrt(x²+ε²)-ε` separately
+/// for each edge and latent axis. This is not vector-norm/isotropic edge TV:
+/// the Hessian intentionally has no cross-axis terms. The difference operator
+/// defines the prior shape: forward 1-D differences for ordered context
+/// windows, or graph edges for adjacency-structured atoms. Pair TV with
+/// Orthogonality when piecewise-constant atoms need a gauge-fixed basis.
 #[derive(Debug, Clone)]
 pub struct TotalVariationPenalty {
     /// Base strength. If `learnable_weight` is true, the resolved strength is
@@ -2666,7 +2670,7 @@ impl NuclearNormPenalty {
         &self,
         t: ArrayView2<'_, f64>,
         v: ArrayView2<'_, f64>,
-    ) -> (Array2<f64>, Array2<f64>) {
+    ) -> Result<(Array2<f64>, Array2<f64>), String> {
         // HVP for spectral matrix functions (matrix-derivative-with-singular-values):
         // G(T)=T(TᵀT+ε²I)^(-1/2), so dG[V]=V R + T dR[V].
         // The Fréchet derivative dR uses divided differences in the right
@@ -2692,6 +2696,18 @@ impl NuclearNormPenalty {
             .eigh(Side::Lower)
             .expect("NuclearNormPenalty Gram eigendecomposition failed");
         let active_start = d.saturating_sub(self.rank_limit(d));
+        if self.max_rank.is_some() && active_start > 0 && active_start < d {
+            let left = evals[active_start - 1];
+            let right = evals[active_start];
+            let scale = (left.abs() + right.abs()).max(1.0);
+            if (right - left).abs() <= 1.0e-12 * scale {
+                return Err(format!(
+                    "NuclearNormPenalty HVP is undefined: max_rank splits a tied \
+                     smoothed Gram eigenvalue at the active/inactive cutoff \
+                     ({left:.3e}, {right:.3e})"
+                ));
+            }
+        }
         let mut f = Array1::<f64>::zeros(d);
         let mut df = Array1::<f64>::zeros(d);
         for i in 0..d {
@@ -2763,7 +2779,7 @@ impl NuclearNormPenalty {
             }
         }
 
-        (right_filter, right_filter_derivative)
+        Ok((right_filter, right_filter_derivative))
     }
 
     fn flatten_matrix(m: &Array2<f64>) -> Array1<f64> {
@@ -2840,8 +2856,9 @@ impl AnalyticPenalty for NuclearNormPenalty {
         let Some(v_mat) = self.target_matrix(v) else {
             return Array1::<f64>::zeros(target.len());
         };
-        let (right_filter, right_filter_derivative) =
-            self.right_spectral_inverse_sqrt_derivative(t.view(), v_mat.view());
+        let (right_filter, right_filter_derivative) = self
+            .right_spectral_inverse_sqrt_derivative(t.view(), v_mat.view())
+            .unwrap_or_else(|message| panic!("{}", message));
         let weight = self.resolved_weight(rho);
         let mut out = Array2::<f64>::zeros(t.dim());
         for n in 0..t.nrows() {
@@ -4349,6 +4366,13 @@ impl OrthogonalityPenalty {
                 latent_dim
             ));
         }
+        let n_obs = target.len() / latent_dim;
+        if n_obs < latent_dim {
+            return Err(format!(
+                "OrthogonalityPenalty::new requires n_obs >= latent_dim for a feasible \
+                 Stiefel target, got n_obs {n_obs} and latent_dim {latent_dim}"
+            ));
+        }
         if !(weight.is_finite() && weight > 0.0) {
             return Err(format!(
                 "OrthogonalityPenalty::new requires finite weight > 0, got {weight}"
@@ -4356,6 +4380,12 @@ impl OrthogonalityPenalty {
         }
         if n_eff == 0 {
             return Err("OrthogonalityPenalty::new requires n_eff > 0".to_string());
+        }
+        if n_eff != n_obs {
+            return Err(format!(
+                "OrthogonalityPenalty::new requires n_eff to match target rows, got \
+                 n_eff {n_eff} and target rows {n_obs}"
+            ));
         }
         Ok(Self {
             target,
@@ -4901,33 +4931,16 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
     fn diag(&self) -> Array1<f64> {
         // Each diagonal penalty exposes `hessian_diag` directly (ARD,
         // smoothed-L¹, Log; Hoyer currently exposes its preconditioner
-        // diagonal). Dense HVP-only penalties keep exact probing only below
-        // the small-block threshold.
+        // diagonal). Penalties whose exact diagonal is cheap or contractually
+        // required use the analytic path even when the dense Hessian is large.
         match &self.penalty {
             AnalyticPenaltyKind::Ard(p) => p
                 .hessian_diag(self.target.view(), self.rho.view())
                 .expect("ARD diag"),
-            AnalyticPenaltyKind::TotalVariation(p) => match &p.difference_op {
-                DifferenceOpKind::GraphEdges(_)
-                    if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
-                {
-                    self.stochastic_diag_via_matvec()
-                }
-                DifferenceOpKind::GraphEdges(_) | DifferenceOpKind::ForwardDiff1D => {
-                    p.diag_target(self.target.view(), self.rho.view())
-                }
-            },
-            AnalyticPenaltyKind::Orthogonality(_)
-                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
-            {
-                self.stochastic_diag_via_matvec()
+            AnalyticPenaltyKind::TotalVariation(p) => {
+                p.diag_target(self.target.view(), self.rho.view())
             }
             AnalyticPenaltyKind::Orthogonality(_) => self.diag_via_matvec(),
-            AnalyticPenaltyKind::NuclearNorm(_)
-                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
-            {
-                self.stochastic_diag_via_matvec()
-            }
             AnalyticPenaltyKind::NuclearNorm(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::BlockSparsity(_)
                 if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
@@ -4976,10 +4989,10 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
         }
         // For the diagonal-Hessian penalties (ARD, smoothed-L¹ and Log) the
         // closed form is `Σ_i log(d_i + λ)`. Forward-difference TV uses the
-        // tridiagonal path-graph structure. Graph TV, NuclearNorm,
-        // BlockSparsity, and Orthogonality keep the exact dense eigensolve
-        // only below the small-block threshold; large blocks use SLQ against
-        // the analytic HVP.
+        // tridiagonal path-graph structure. Graph TV, NuclearNorm, and
+        // BlockSparsity keep the exact dense eigensolve only below the
+        // small-block threshold; large blocks use SLQ against the analytic HVP.
+        // Orthogonality is excluded because its exact Hessian is indefinite.
         match &self.penalty {
             AnalyticPenaltyKind::Ard(_)
             | AnalyticPenaltyKind::Sparsity(_)
@@ -5015,11 +5028,11 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                     <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
                 }
             },
-            AnalyticPenaltyKind::Orthogonality(_)
-                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
-            {
-                self.stochastic_log_det_plus_lambda_i(lambda)
-            }
+            AnalyticPenaltyKind::Orthogonality(_) => Err(
+                "FrozenAnalyticPenaltyOp::log_det_plus_lambda_i cannot treat \
+                 OrthogonalityPenalty as PSD; its exact Hessian is indefinite"
+                    .to_string(),
+            ),
             AnalyticPenaltyKind::NuclearNorm(_)
                 if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
             {
@@ -5039,7 +5052,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             {
                 self.stochastic_log_det_plus_lambda_i(lambda)
             }
-            AnalyticPenaltyKind::Isometry(_) | AnalyticPenaltyKind::Orthogonality(_) => {
+            AnalyticPenaltyKind::Isometry(_) => {
                 let dense = self.as_dense();
                 <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
             }
@@ -5123,17 +5136,22 @@ impl FrozenAnalyticPenaltyOp {
                 let latent_dim = t.ncols();
                 let gram = OrthogonalityPenalty::gram_minus_identity(t.view());
                 let scale = p.scale(self.rho.view());
-                let mut d = Array1::<f64>::zeros(n);
-                let mut v = Array2::<f64>::zeros(t.dim());
-                for i in 0..n {
-                    let row = i / latent_dim;
-                    let col = i % latent_dim;
-                    v[[row, col]] = 1.0;
-                    let h = p.hvp_with_precomputed_m(t.view(), gram.view(), v.view(), scale);
-                    d[i] = h[[row, col]];
-                    v[[row, col]] = 0.0;
+                let factor = 2.0 * scale;
+                let mut diag = Array1::<f64>::zeros(n);
+                for row in 0..t.nrows() {
+                    let mut row_norm_sq = 0.0;
+                    for col in 0..latent_dim {
+                        row_norm_sq += t[[row, col]] * t[[row, col]];
+                    }
+                    for col in 0..latent_dim {
+                        let i = row * latent_dim + col;
+                        diag[i] = factor
+                            * (gram[[col, col]]
+                                + t[[row, col]] * t[[row, col]]
+                                + row_norm_sq);
+                    }
                 }
-                return d;
+                return diag;
             }
             AnalyticPenaltyKind::Isometry(p) => {
                 let n = self.target.len();
