@@ -3,10 +3,17 @@ use gam::pirls::update_glmvectors_by_family;
 use gam::predict::predict_gam;
 use gam::probability::normal_cdf;
 use gam::smooth::BlockwisePenalty;
-use gam::types::{GlmLikelihoodFamily, GlmLikelihoodSpec, LikelihoodFamily};
+use gam::types::{
+    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
+    ResponseFamily,
+};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
+
+fn binomial_likelihood(link: LinkFunction) -> LikelihoodSpec {
+    LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Standard(link))
+}
 
 #[test]
 fn probit_fit_and_predict_fast_integration() {
@@ -36,7 +43,7 @@ fn probit_fit_and_predict_fast_integration() {
         weights.view(),
         offset.view(),
         &s_list,
-        LikelihoodFamily::BinomialProbit,
+        binomial_likelihood(LinkFunction::Probit),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -66,7 +73,7 @@ fn probit_fit_and_predict_fast_integration() {
         x.view(),
         fit.beta.view(),
         offset.view(),
-        LikelihoodFamily::BinomialProbit,
+        binomial_likelihood(LinkFunction::Probit),
     )
     .expect("probit predict should succeed");
 
@@ -245,7 +252,7 @@ fn cloglog_fit_and_predict_fast_integration() {
         weights.view(),
         offset.view(),
         &s_list,
-        LikelihoodFamily::BinomialCLogLog,
+        binomial_likelihood(LinkFunction::CLogLog),
         &FitOptions {
             latent_cloglog: None,
             mixture_link: None,
@@ -271,7 +278,7 @@ fn cloglog_fit_and_predict_fast_integration() {
         x.view(),
         fit.beta.view(),
         offset.view(),
-        LikelihoodFamily::BinomialCLogLog,
+        binomial_likelihood(LinkFunction::CLogLog),
     )
     .expect("cloglog predict should succeed");
 

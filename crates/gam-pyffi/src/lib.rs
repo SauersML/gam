@@ -10169,7 +10169,7 @@ fn sample_table_impl(
 /// The tag is intentionally lower-kebab-case so it can be matched as a
 /// Stable lower-kebab-case name of a `LikelihoodSpec`, matching the strings
 /// the saved-model payload's `family` field used to carry from the legacy
-/// `LikelihoodFamily::name()` enum. Used in the `FittedModelPayload::new`
+/// `LikelihoodSpec` name. Used in the `FittedModelPayload::new`
 /// third argument and in user-visible error messages.
 fn likelihood_spec_legacy_name(family: &LikelihoodSpec) -> &'static str {
     match (&family.response, &family.link) {
