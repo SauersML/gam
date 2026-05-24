@@ -9527,8 +9527,9 @@ mod tests {
     use clap::Parser;
     use csv::StringRecord;
     use gam::basis::{
-        BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisOptions, CenterStrategy,
-        Dense, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, KnotSource,
+        BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
+        BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
+        DuchonOperatorPenaltySpec, KnotSource,
         MaternBasisSpec, MaternNu, SpatialIdentifiability, ThinPlateBasisSpec, create_basis,
     };
     use gam::bernoulli_marginal_slope::LatentMeasureKind;

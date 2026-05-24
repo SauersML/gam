@@ -10,8 +10,9 @@
 //! a `FitRequest::SurvivalLocationScale` without going through the CLI.
 
 use crate::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, BasisMetadata, BasisOptions, Dense,
-    KnotSource, OneDimensionalBoundary, build_bspline_basis_1d, create_basis,
+    BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
+    BasisMetadata, BasisOptions, Dense, KnotSource, OneDimensionalBoundary, build_bspline_basis_1d,
+    create_basis,
     evaluate_bspline_derivative_scalar,
 };
 use crate::families::gamlss::{

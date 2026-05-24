@@ -19344,397 +19344,336 @@ impl BinomialLocationScaleWiggleFamily {
             r_a.fill(0.0);
             r_b.fill(0.0);
             r_ab.fill(0.0);
-            {
-                let tt = xtr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xtr.to_owned().insert_axis(Axis(0)))
-                    * q_tt;
-                let tl = xtr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                    * q_tl;
-                let ll = xlsr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                    * q_ll;
-                q_mat.slice_mut(s![0..pt, 0..pt]).assign(&tt);
-                q_mat.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl);
-                q_mat.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll);
-                let tw = xtr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&(drow.clone() * q0_geom.q_t).insert_axis(Axis(0)));
-                let lw = xlsr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&(drow.clone() * q0_geom.q_ls).insert_axis(Axis(0)));
-                q_mat.slice_mut(s![0..pt, pt + pls..]).assign(&tw);
-                q_mat.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw);
-                mirror_upper_to_lower(&mut q_mat);
+            scaled_outer_add(q_mat.slice_mut(s![0..pt, 0..pt]), q_tt, xtr, xtr);
+            scaled_outer_add(q_mat.slice_mut(s![0..pt, pt..pt + pls]), q_tl, xtr, xlsr);
+            scaled_outer_add(
+                q_mat.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll,
+                xlsr,
+                xlsr,
+            );
+            scaled_outer_add(
+                q_mat.slice_mut(s![0..pt, pt + pls..]),
+                q0_geom.q_t,
+                xtr,
+                drow,
+            );
+            scaled_outer_add(
+                q_mat.slice_mut(s![pt..pt + pls, pt + pls..]),
+                q0_geom.q_ls,
+                xlsr,
+                drow,
+            );
+            mirror_upper_to_lower(&mut q_mat);
 
-                let tt_a = xtr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xtr.to_owned().insert_axis(Axis(0)))
-                    * q_tt_a
-                    + xta
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xtr.to_owned().insert_axis(Axis(0)))
-                        * q_tt
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xta.to_owned().insert_axis(Axis(0)))
-                        * q_tt;
-                let tl_a = xtr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                    * q_tl_a
-                    + xta
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                        * q_tl
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
-                        * q_tl;
-                let ll_a = xlsr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                    * q_ll_a
-                    + xlsa
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                        * q_ll
-                    + xlsr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
-                        * q_ll;
-                r_a.slice_mut(s![0..pt, 0..pt]).assign(&tt_a);
-                r_a.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl_a);
-                r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll_a);
-                let tw_a = xta
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&(drow.clone() * q0_geom.q_t).insert_axis(Axis(0)))
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&q_tw_a.view().insert_axis(Axis(0)));
-                let lw_a = xlsa
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&(drow.clone() * q0_geom.q_ls).insert_axis(Axis(0)))
-                    + xlsr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&q_lw_a.view().insert_axis(Axis(0)));
-                r_a.slice_mut(s![0..pt, pt + pls..]).assign(&tw_a);
-                r_a.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw_a);
-                mirror_upper_to_lower(&mut r_a);
+            scaled_outer_add(r_a.slice_mut(s![0..pt, 0..pt]), q_tt_a, xtr, xtr);
+            scaled_outer_add(r_a.slice_mut(s![0..pt, 0..pt]), q_tt, xta.view(), xtr);
+            scaled_outer_add(r_a.slice_mut(s![0..pt, 0..pt]), q_tt, xtr, xta.view());
+            scaled_outer_add(r_a.slice_mut(s![0..pt, pt..pt + pls]), q_tl_a, xtr, xlsr);
+            scaled_outer_add(r_a.slice_mut(s![0..pt, pt..pt + pls]), q_tl, xta.view(), xlsr);
+            scaled_outer_add(r_a.slice_mut(s![0..pt, pt..pt + pls]), q_tl, xtr, xlsa.view());
+            scaled_outer_add(
+                r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll_a,
+                xlsr,
+                xlsr,
+            );
+            scaled_outer_add(
+                r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll,
+                xlsa.view(),
+                xlsr,
+            );
+            scaled_outer_add(
+                r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll,
+                xlsr,
+                xlsa.view(),
+            );
+            scaled_outer_add(
+                r_a.slice_mut(s![0..pt, pt + pls..]),
+                q0_geom.q_t,
+                xta.view(),
+                drow,
+            );
+            scaled_outer_add(
+                r_a.slice_mut(s![0..pt, pt + pls..]),
+                1.0,
+                xtr,
+                q_tw_a.view(),
+            );
+            scaled_outer_add(
+                r_a.slice_mut(s![pt..pt + pls, pt + pls..]),
+                q0_geom.q_ls,
+                xlsa.view(),
+                drow,
+            );
+            scaled_outer_add(
+                r_a.slice_mut(s![pt..pt + pls, pt + pls..]),
+                1.0,
+                xlsr,
+                q_lw_a.view(),
+            );
+            mirror_upper_to_lower(&mut r_a);
 
-                let tt_b = xtr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xtr.to_owned().insert_axis(Axis(0)))
-                    * q_tt_b
-                    + xtb
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xtr.to_owned().insert_axis(Axis(0)))
-                        * q_tt
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xtb.to_owned().insert_axis(Axis(0)))
-                        * q_tt;
-                let tl_b = xtr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                    * q_tl_b
-                    + xtb
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                        * q_tl
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsb.to_owned().insert_axis(Axis(0)))
-                        * q_tl;
-                let ll_b = xlsr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                    * q_ll_b
-                    + xlsb
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                        * q_ll
-                    + xlsr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsb.to_owned().insert_axis(Axis(0)))
-                        * q_ll;
-                r_b.slice_mut(s![0..pt, 0..pt]).assign(&tt_b);
-                r_b.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl_b);
-                r_b.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(&ll_b);
-                let tw_b = xtb
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&(drow.clone() * q0_geom.q_t).insert_axis(Axis(0)))
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&q_tw_b.view().insert_axis(Axis(0)));
-                let lw_b = xlsb
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&(drow.clone() * q0_geom.q_ls).insert_axis(Axis(0)))
-                    + xlsr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&q_lw_b.view().insert_axis(Axis(0)));
-                r_b.slice_mut(s![0..pt, pt + pls..]).assign(&tw_b);
-                r_b.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw_b);
-                mirror_upper_to_lower(&mut r_b);
+            scaled_outer_add(r_b.slice_mut(s![0..pt, 0..pt]), q_tt_b, xtr, xtr);
+            scaled_outer_add(r_b.slice_mut(s![0..pt, 0..pt]), q_tt, xtb.view(), xtr);
+            scaled_outer_add(r_b.slice_mut(s![0..pt, 0..pt]), q_tt, xtr, xtb.view());
+            scaled_outer_add(r_b.slice_mut(s![0..pt, pt..pt + pls]), q_tl_b, xtr, xlsr);
+            scaled_outer_add(r_b.slice_mut(s![0..pt, pt..pt + pls]), q_tl, xtb.view(), xlsr);
+            scaled_outer_add(r_b.slice_mut(s![0..pt, pt..pt + pls]), q_tl, xtr, xlsb.view());
+            scaled_outer_add(
+                r_b.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll_b,
+                xlsr,
+                xlsr,
+            );
+            scaled_outer_add(
+                r_b.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll,
+                xlsb.view(),
+                xlsr,
+            );
+            scaled_outer_add(
+                r_b.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll,
+                xlsr,
+                xlsb.view(),
+            );
+            scaled_outer_add(
+                r_b.slice_mut(s![0..pt, pt + pls..]),
+                q0_geom.q_t,
+                xtb.view(),
+                drow,
+            );
+            scaled_outer_add(
+                r_b.slice_mut(s![0..pt, pt + pls..]),
+                1.0,
+                xtr,
+                q_tw_b.view(),
+            );
+            scaled_outer_add(
+                r_b.slice_mut(s![pt..pt + pls, pt + pls..]),
+                q0_geom.q_ls,
+                xlsb.view(),
+                drow,
+            );
+            scaled_outer_add(
+                r_b.slice_mut(s![pt..pt + pls, pt + pls..]),
+                1.0,
+                xlsr,
+                q_lw_b.view(),
+            );
+            mirror_upper_to_lower(&mut r_b);
 
-                let tt_ab = xtr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xtr.to_owned().insert_axis(Axis(0)))
-                    * q_tt_ab
-                    + xta
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xtr.to_owned().insert_axis(Axis(0)))
-                        * q_tt_b
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xta.to_owned().insert_axis(Axis(0)))
-                        * q_tt_b
-                    + xtb
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xtr.to_owned().insert_axis(Axis(0)))
-                        * q_tt_a
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xtb.to_owned().insert_axis(Axis(0)))
-                        * q_tt_a
-                    + xtab
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xtr.to_owned().insert_axis(Axis(0)))
-                        * q_tt
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xtab.to_owned().insert_axis(Axis(0)))
-                        * q_tt
-                    + xta
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xtb.to_owned().insert_axis(Axis(0)))
-                        * q_tt
-                    + xtb
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xta.to_owned().insert_axis(Axis(0)))
-                        * q_tt;
-                let tl_ab = xtr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                    * q_tl_ab
-                    + xta
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                        * q_tl_b
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
-                        * q_tl_b
-                    + xtb
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                        * q_tl_a
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsb.to_owned().insert_axis(Axis(0)))
-                        * q_tl_a
-                    + xtab
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                        * q_tl
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsab.to_owned().insert_axis(Axis(0)))
-                        * q_tl
-                    + xta
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsb.to_owned().insert_axis(Axis(0)))
-                        * q_tl
-                    + xtb
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
-                        * q_tl;
-                let ll_ab = xlsr
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                    * q_ll_ab
-                    + xlsa
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                        * q_ll_b
-                    + xlsr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
-                        * q_ll_b
-                    + xlsb
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                        * q_ll_a
-                    + xlsr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsb.to_owned().insert_axis(Axis(0)))
-                        * q_ll_a
-                    + xlsab
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.to_owned().insert_axis(Axis(0)))
-                        * q_ll
-                    + xlsr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsab.to_owned().insert_axis(Axis(0)))
-                        * q_ll
-                    + xlsa
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsb.to_owned().insert_axis(Axis(0)))
-                        * q_ll
-                    + xlsb
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsa.to_owned().insert_axis(Axis(0)))
-                        * q_ll;
-                r_ab.slice_mut(s![0..pt, 0..pt]).assign(&tt_ab);
-                r_ab.slice_mut(s![0..pt, pt..pt + pls]).assign(&tl_ab);
-                r_ab.slice_mut(s![pt..pt + pls, pt..pt + pls])
-                    .assign(&ll_ab);
-                let tw_ab = xtab
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&(drow.clone() * q0_geom.q_t).insert_axis(Axis(0)))
-                    + xta
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&q_tw_b.view().insert_axis(Axis(0)))
-                    + xtb
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&q_tw_a.view().insert_axis(Axis(0)))
-                    + xtr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&q_tw_ab.view().insert_axis(Axis(0)));
-                let lw_ab = xlsab
-                    .to_owned()
-                    .insert_axis(Axis(1))
-                    .dot(&(drow.clone() * q0_geom.q_ls).insert_axis(Axis(0)))
-                    + xlsa
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&q_lw_b.view().insert_axis(Axis(0)))
-                    + xlsb
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&q_lw_a.view().insert_axis(Axis(0)))
-                    + xlsr
-                        .to_owned()
-                        .insert_axis(Axis(1))
-                        .dot(&q_lw_ab.view().insert_axis(Axis(0)));
-                r_ab.slice_mut(s![0..pt, pt + pls..]).assign(&tw_ab);
-                r_ab.slice_mut(s![pt..pt + pls, pt + pls..]).assign(&lw_ab);
-                mirror_upper_to_lower(&mut r_ab);
-            }
+            scaled_outer_add(r_ab.slice_mut(s![0..pt, 0..pt]), q_tt_ab, xtr, xtr);
+            scaled_outer_add(r_ab.slice_mut(s![0..pt, 0..pt]), q_tt_b, xta.view(), xtr);
+            scaled_outer_add(r_ab.slice_mut(s![0..pt, 0..pt]), q_tt_b, xtr, xta.view());
+            scaled_outer_add(r_ab.slice_mut(s![0..pt, 0..pt]), q_tt_a, xtb.view(), xtr);
+            scaled_outer_add(r_ab.slice_mut(s![0..pt, 0..pt]), q_tt_a, xtr, xtb.view());
+            scaled_outer_add(r_ab.slice_mut(s![0..pt, 0..pt]), q_tt, xtab.view(), xtr);
+            scaled_outer_add(r_ab.slice_mut(s![0..pt, 0..pt]), q_tt, xtr, xtab.view());
+            scaled_outer_add(r_ab.slice_mut(s![0..pt, 0..pt]), q_tt, xta.view(), xtb.view());
+            scaled_outer_add(r_ab.slice_mut(s![0..pt, 0..pt]), q_tt, xtb.view(), xta.view());
 
-            let bb = b
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&b.view().insert_axis(Axis(0)));
-            let cab_bt = c_ab
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&b.view().insert_axis(Axis(0)));
-            let b_cab_t = b
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&c_ab.view().insert_axis(Axis(0)));
-            let ca_cb_t = c_a
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&c_b.view().insert_axis(Axis(0)));
-            let cb_ca_t = c_b
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&c_a.view().insert_axis(Axis(0)));
-            let ca_bt = c_a
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&b.view().insert_axis(Axis(0)));
-            let b_cat = b
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&c_a.view().insert_axis(Axis(0)));
-            let cb_bt = c_b
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&b.view().insert_axis(Axis(0)));
-            let b_cbt = b
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&c_b.view().insert_axis(Axis(0)));
+            scaled_outer_add(
+                r_ab.slice_mut(s![0..pt, pt..pt + pls]),
+                q_tl_ab,
+                xtr,
+                xlsr,
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![0..pt, pt..pt + pls]),
+                q_tl_b,
+                xta.view(),
+                xlsr,
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![0..pt, pt..pt + pls]),
+                q_tl_b,
+                xtr,
+                xlsa.view(),
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![0..pt, pt..pt + pls]),
+                q_tl_a,
+                xtb.view(),
+                xlsr,
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![0..pt, pt..pt + pls]),
+                q_tl_a,
+                xtr,
+                xlsb.view(),
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![0..pt, pt..pt + pls]),
+                q_tl,
+                xtab.view(),
+                xlsr,
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![0..pt, pt..pt + pls]),
+                q_tl,
+                xtr,
+                xlsab.view(),
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![0..pt, pt..pt + pls]),
+                q_tl,
+                xta.view(),
+                xlsb.view(),
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![0..pt, pt..pt + pls]),
+                q_tl,
+                xtb.view(),
+                xlsa.view(),
+            );
 
-            hessian_psi_psi += &(loss_1 * r_ab
-                + loss_2
-                    * (q_b * r_a
-                        + q_a * r_b
-                        + cab_bt
-                        + b_cab_t
-                        + ca_cb_t
-                        + cb_ca_t
-                        + q_ab * &q_mat)
-                + loss_3 * (q_b * (ca_bt + b_cat) + q_a * (cb_bt + b_cbt) + q_a * q_b * &q_mat)
-                + (loss_4 * q_a * q_b + loss_3 * q_ab) * bb);
+            scaled_outer_add(
+                r_ab.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll_ab,
+                xlsr,
+                xlsr,
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll_b,
+                xlsa.view(),
+                xlsr,
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll_b,
+                xlsr,
+                xlsa.view(),
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll_a,
+                xlsb.view(),
+                xlsr,
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll_a,
+                xlsr,
+                xlsb.view(),
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll,
+                xlsab.view(),
+                xlsr,
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll,
+                xlsr,
+                xlsab.view(),
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll,
+                xlsa.view(),
+                xlsb.view(),
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll,
+                xlsb.view(),
+                xlsa.view(),
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![0..pt, pt + pls..]),
+                q0_geom.q_t,
+                xtab.view(),
+                drow,
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![0..pt, pt + pls..]),
+                1.0,
+                xta.view(),
+                q_tw_b.view(),
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![0..pt, pt + pls..]),
+                1.0,
+                xtb.view(),
+                q_tw_a.view(),
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![0..pt, pt + pls..]),
+                1.0,
+                xtr,
+                q_tw_ab.view(),
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![pt..pt + pls, pt + pls..]),
+                q0_geom.q_ls,
+                xlsab.view(),
+                drow,
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![pt..pt + pls, pt + pls..]),
+                1.0,
+                xlsa.view(),
+                q_lw_b.view(),
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![pt..pt + pls, pt + pls..]),
+                1.0,
+                xlsb.view(),
+                q_lw_a.view(),
+            );
+            scaled_outer_add(
+                r_ab.slice_mut(s![pt..pt + pls, pt + pls..]),
+                1.0,
+                xlsr,
+                q_lw_ab.view(),
+            );
+            mirror_upper_to_lower(&mut r_ab);
+
+            hessian_psi_psi.scaled_add(loss_1, &r_ab);
+            hessian_psi_psi.scaled_add(loss_2 * q_b, &r_a);
+            hessian_psi_psi.scaled_add(loss_2 * q_a, &r_b);
+            scaled_outer_add(hessian_psi_psi.view_mut(), loss_2, c_ab.view(), b.view());
+            scaled_outer_add(hessian_psi_psi.view_mut(), loss_2, b.view(), c_ab.view());
+            scaled_outer_add(hessian_psi_psi.view_mut(), loss_2, c_a.view(), c_b.view());
+            scaled_outer_add(hessian_psi_psi.view_mut(), loss_2, c_b.view(), c_a.view());
+            hessian_psi_psi.scaled_add(loss_2 * q_ab, &q_mat);
+            scaled_outer_add(
+                hessian_psi_psi.view_mut(),
+                loss_3 * q_b,
+                c_a.view(),
+                b.view(),
+            );
+            scaled_outer_add(
+                hessian_psi_psi.view_mut(),
+                loss_3 * q_b,
+                b.view(),
+                c_a.view(),
+            );
+            scaled_outer_add(
+                hessian_psi_psi.view_mut(),
+                loss_3 * q_a,
+                c_b.view(),
+                b.view(),
+            );
+            scaled_outer_add(
+                hessian_psi_psi.view_mut(),
+                loss_3 * q_a,
+                b.view(),
+                c_b.view(),
+            );
+            hessian_psi_psi.scaled_add(loss_3 * q_a * q_b, &q_mat);
+            scaled_outer_add(
+                hessian_psi_psi.view_mut(),
+                loss_4 * q_a * q_b + loss_3 * q_ab,
+                b.view(),
+                b.view(),
+            );
         }
 
         Ok(crate::custom_family::ExactNewtonJointPsiSecondOrderTerms {
@@ -19861,6 +19800,15 @@ impl BinomialLocationScaleWiggleFamily {
         let mut r_a = Array2::<f64>::zeros((total, total));
         let mut c_u = Array2::<f64>::zeros((total, total));
         let mut delta_a = Array2::<f64>::zeros((total, total));
+        let mut q_tw = Array1::<f64>::zeros(pw);
+        let mut q_lw = Array1::<f64>::zeros(pw);
+        let mut qw_a = Array1::<f64>::zeros(pw);
+        let mut q_tw_a = Array1::<f64>::zeros(pw);
+        let mut q_lw_a = Array1::<f64>::zeros(pw);
+        let mut dq_tw_u = Array1::<f64>::zeros(pw);
+        let mut dq_lw_u = Array1::<f64>::zeros(pw);
+        let mut dq_tw_a_u = Array1::<f64>::zeros(pw);
+        let mut dq_lw_a_u = Array1::<f64>::zeros(pw);
         for row in 0..n {
             let q = core.q0[row] + etaw[row];
             let (loss_1, loss_2, loss_3) = binomial_neglog_q_derivatives_dispatch(
@@ -19897,14 +19845,14 @@ impl BinomialLocationScaleWiggleFamily {
                     - 24.0 * ds[row] * ds[row] * ds[row] * ds[row] / s5;
             let q0_ll_ls_ls = eta_t[row] * q0_tl_ls_ls_ls;
 
-            let xtr = x_t.row(row).to_owned();
-            let xlsr = x_ls.row(row).to_owned();
+            let xtr = x_t.row(row);
+            let xlsr = x_ls.row(row);
             let xta = x_t_map.row_vector(row)?;
             let xlsa = x_ls_map.row_vector(row)?;
-            let br = b0.row(row).to_owned();
-            let dr = d0.row(row).to_owned();
-            let ddr = dd0.row(row).to_owned();
-            let d3r = d3_basis.row(row).to_owned();
+            let br = b0.row(row);
+            let dr = d0.row(row);
+            let ddr = dd0.row(row);
+            let d3r = d3_basis.row(row);
 
             let xi_t_i = xi_t[row];
             let xi_ls_i = xi_ls[row];
@@ -19938,8 +19886,10 @@ impl BinomialLocationScaleWiggleFamily {
             let q_tt = g2[row] * q0.q_t * q0.q_t;
             let q_tl = g2[row] * q0.q_t * q0.q_ls + m[row] * q0.q_tl;
             let q_ll = g2[row] * q0.q_ls * q0.q_ls + m[row] * q0.q_ll;
-            let q_tw = dr.clone() * q0.q_t;
-            let q_lw = dr.clone() * q0.q_ls;
+            q_tw.fill(0.0);
+            q_tw.scaled_add(q0.q_t, &dr);
+            q_lw.fill(0.0);
+            q_lw.scaled_add(q0.q_ls, &dr);
 
             let dm_u = g2[row] * dq0_u + d_dot_u;
             let dg2_u = g3[row] * dq0_u + dd_dot_u;
@@ -19955,9 +19905,14 @@ impl BinomialLocationScaleWiggleFamily {
             let q_ll_a = g3[row] * q0_a * q0.q_ls * q0.q_ls
                 + g2[row] * (2.0 * q0.q_ls * q0_ls_a + q0_a * q0.q_ll)
                 + m[row] * q0_ll_a;
-            let qw_a = dr.clone() * q0_a;
-            let q_tw_a = ddr.clone() * (q0_a * q0.q_t) + &(dr.clone() * q0_t_a);
-            let q_lw_a = ddr.clone() * (q0_a * q0.q_ls) + &(dr.clone() * q0_ls_a);
+            qw_a.fill(0.0);
+            qw_a.scaled_add(q0_a, &dr);
+            q_tw_a.fill(0.0);
+            q_tw_a.scaled_add(q0_a * q0.q_t, &ddr);
+            q_tw_a.scaled_add(q0_t_a, &dr);
+            q_lw_a.fill(0.0);
+            q_lw_a.scaled_add(q0_a * q0.q_ls, &ddr);
+            q_lw_a.scaled_add(q0_ls_a, &dr);
 
             let dq_tt_u = dg2_u * q0.q_t * q0.q_t + g2[row] * (2.0 * q0.q_t * dq0_t_u);
             let dq_tl_u = dg2_u * q0.q_t * q0.q_ls
@@ -19968,8 +19923,12 @@ impl BinomialLocationScaleWiggleFamily {
                 + g2[row] * (2.0 * q0.q_ls * dq0_ls_u)
                 + dm_u * q0.q_ll
                 + m[row] * dq0_ll_u;
-            let dq_tw_u = ddr.clone() * (dq0_u * q0.q_t) + &(dr.clone() * dq0_t_u);
-            let dq_lw_u = ddr.clone() * (dq0_u * q0.q_ls) + &(dr.clone() * dq0_ls_u);
+            dq_tw_u.fill(0.0);
+            dq_tw_u.scaled_add(dq0_u * q0.q_t, &ddr);
+            dq_tw_u.scaled_add(dq0_t_u, &dr);
+            dq_lw_u.fill(0.0);
+            dq_lw_u.scaled_add(dq0_u * q0.q_ls, &ddr);
+            dq_lw_u.scaled_add(dq0_ls_u, &dr);
 
             let dq_tt_a_u = dg3_u * q0_a * q0.q_t * q0.q_t
                 + g3[row] * (dq0_a_u * q0.q_t * q0.q_t + 2.0 * q0_a * q0.q_t * dq0_t_u)
@@ -20000,336 +19959,249 @@ impl BinomialLocationScaleWiggleFamily {
                         + q0_a * dq0_ll_u)
                 + dm_u * q0_ll_a
                 + m[row] * dq0_ll_a_u;
-            let dq_tw_a_u = d3r.clone() * (dq0_u * q0_a * q0.q_t)
-                + &(ddr.clone() * (dq0_a_u * q0.q_t + q0_a * dq0_t_u + dq0_u * q0_t_a))
-                + &(dr.clone() * dq0_t_a_u);
-            let dq_lw_a_u = d3r.clone() * (dq0_u * q0_a * q0.q_ls)
-                + &(ddr.clone() * (dq0_a_u * q0.q_ls + q0_a * dq0_ls_u + dq0_u * q0_ls_a))
-                + &(dr.clone() * dq0_ls_a_u);
+            dq_tw_a_u.fill(0.0);
+            dq_tw_a_u.scaled_add(dq0_u * q0_a * q0.q_t, &d3r);
+            dq_tw_a_u.scaled_add(dq0_a_u * q0.q_t + q0_a * dq0_t_u + dq0_u * q0_t_a, &ddr);
+            dq_tw_a_u.scaled_add(dq0_t_a_u, &dr);
+            dq_lw_a_u.fill(0.0);
+            dq_lw_a_u.scaled_add(dq0_u * q0_a * q0.q_ls, &d3r);
+            dq_lw_a_u.scaled_add(
+                dq0_a_u * q0.q_ls + q0_a * dq0_ls_u + dq0_u * q0_ls_a,
+                &ddr,
+            );
+            dq_lw_a_u.scaled_add(dq0_ls_a_u, &dr);
 
             b.fill(0.0);
-            b.slice_mut(s![0..pt]).assign(&(xtr.clone() * q_t));
-            b.slice_mut(s![pt..pt + pls]).assign(&(xlsr.clone() * q_ls));
+            b.slice_mut(s![0..pt]).scaled_add(q_t, &xtr);
+            b.slice_mut(s![pt..pt + pls]).scaled_add(q_ls, &xlsr);
             b.slice_mut(s![pt + pls..]).assign(&br);
 
             c_a.fill(0.0);
-            c_a.slice_mut(s![0..pt])
-                .assign(&(xtr.clone() * q_t_a + xta.clone() * q_t));
+            c_a.slice_mut(s![0..pt]).scaled_add(q_t_a, &xtr);
+            c_a.slice_mut(s![0..pt]).scaled_add(q_t, &xta.view());
+            c_a.slice_mut(s![pt..pt + pls]).scaled_add(q_ls_a, &xlsr);
             c_a.slice_mut(s![pt..pt + pls])
-                .assign(&(xlsr.clone() * q_ls_a + xlsa.clone() * q_ls));
+                .scaled_add(q_ls, &xlsa.view());
             c_a.slice_mut(s![pt + pls..]).assign(&qw_a);
 
             gamma.fill(0.0);
             gamma
                 .slice_mut(s![0..pt])
-                .assign(&(xtr.clone() * (q_tt * xi_t_i + q_tl * xi_ls_i + q0.q_t * d_dot_u)));
+                .scaled_add(q_tt * xi_t_i + q_tl * xi_ls_i + q0.q_t * d_dot_u, &xtr);
             gamma
                 .slice_mut(s![pt..pt + pls])
-                .assign(&(xlsr.clone() * (q_tl * xi_t_i + q_ll * xi_ls_i + q0.q_ls * d_dot_u)));
-            gamma
-                .slice_mut(s![pt + pls..])
-                .assign(&(dr.clone() * dq0_u));
+                .scaled_add(q_tl * xi_t_i + q_ll * xi_ls_i + q0.q_ls * d_dot_u, &xlsr);
+            gamma.slice_mut(s![pt + pls..]).scaled_add(dq0_u, &dr);
 
             let q_tw_a_dot_u = q_tw_a.dot(&uw);
             let q_lw_a_dot_u = q_lw_a.dot(&uw);
             gamma_a.fill(0.0);
-            gamma_a.slice_mut(s![0..pt]).assign(
-                &(xtr.clone()
-                    * (q_tt_a * xi_t_i
-                        + q_tt * xi_ta_i
-                        + q_tl_a * xi_ls_i
-                        + q_tl * xi_lsa_i
-                        + q_tw_a_dot_u)
-                    + xta.clone() * (q_tt * xi_t_i + q_tl * xi_ls_i + q0.q_t * d_dot_u)),
+            gamma_a.slice_mut(s![0..pt]).scaled_add(
+                q_tt_a * xi_t_i
+                    + q_tt * xi_ta_i
+                    + q_tl_a * xi_ls_i
+                    + q_tl * xi_lsa_i
+                    + q_tw_a_dot_u,
+                &xtr,
             );
-            gamma_a.slice_mut(s![pt..pt + pls]).assign(
-                &(xlsr.clone()
-                    * (q_tl_a * xi_t_i
-                        + q_tl * xi_ta_i
-                        + q_ll_a * xi_ls_i
-                        + q_ll * xi_lsa_i
-                        + q_lw_a_dot_u)
-                    + xlsa.clone() * (q_tl * xi_t_i + q_ll * xi_ls_i + q0.q_ls * d_dot_u)),
+            gamma_a
+                .slice_mut(s![0..pt])
+                .scaled_add(q_tt * xi_t_i + q_tl * xi_ls_i + q0.q_t * d_dot_u, &xta.view());
+            gamma_a.slice_mut(s![pt..pt + pls]).scaled_add(
+                q_tl_a * xi_t_i
+                    + q_tl * xi_ta_i
+                    + q_ll_a * xi_ls_i
+                    + q_ll * xi_lsa_i
+                    + q_lw_a_dot_u,
+                &xlsr,
             );
-            gamma_a.slice_mut(s![pt + pls..]).assign(
-                &(q_tw_a.clone() * xi_t_i
-                    + q_tw.clone() * xi_ta_i
-                    + q_lw_a.clone() * xi_ls_i
-                    + q_lw.clone() * xi_lsa_i),
-            );
+            gamma_a
+                .slice_mut(s![pt..pt + pls])
+                .scaled_add(q_tl * xi_t_i + q_ll * xi_ls_i + q0.q_ls * d_dot_u, &xlsa.view());
+            gamma_a
+                .slice_mut(s![pt + pls..])
+                .scaled_add(xi_t_i, &q_tw_a);
+            gamma_a
+                .slice_mut(s![pt + pls..])
+                .scaled_add(xi_ta_i, &q_tw);
+            gamma_a
+                .slice_mut(s![pt + pls..])
+                .scaled_add(xi_ls_i, &q_lw_a);
+            gamma_a
+                .slice_mut(s![pt + pls..])
+                .scaled_add(xi_lsa_i, &q_lw);
 
             let alpha = b.dot(d_beta_flat);
             let alpha_a = c_a.dot(d_beta_flat);
 
             q_mat.fill(0.0);
-            q_mat.slice_mut(s![0..pt, 0..pt]).assign(
-                &(xtr
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&xtr.view().insert_axis(Axis(0)))
-                    * q_tt),
+            scaled_outer_add(q_mat.slice_mut(s![0..pt, 0..pt]), q_tt, xtr, xtr);
+            scaled_outer_add(q_mat.slice_mut(s![0..pt, pt..pt + pls]), q_tl, xtr, xlsr);
+            scaled_outer_add(
+                q_mat.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll,
+                xlsr,
+                xlsr,
             );
-            q_mat.slice_mut(s![0..pt, pt..pt + pls]).assign(
-                &(xtr
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.view().insert_axis(Axis(0)))
-                    * q_tl),
-            );
-            q_mat.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(
-                &(xlsr
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.view().insert_axis(Axis(0)))
-                    * q_ll),
-            );
-            q_mat.slice_mut(s![0..pt, pt + pls..]).assign(
-                &xtr.view()
-                    .insert_axis(Axis(1))
-                    .dot(&q_tw.view().insert_axis(Axis(0))),
-            );
-            q_mat.slice_mut(s![pt..pt + pls, pt + pls..]).assign(
-                &xlsr
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&q_lw.view().insert_axis(Axis(0))),
+            scaled_outer_add(q_mat.slice_mut(s![0..pt, pt + pls..]), 1.0, xtr, q_tw.view());
+            scaled_outer_add(
+                q_mat.slice_mut(s![pt..pt + pls, pt + pls..]),
+                1.0,
+                xlsr,
+                q_lw.view(),
             );
             mirror_upper_to_lower(&mut q_mat);
 
             r_a.fill(0.0);
-            r_a.slice_mut(s![0..pt, 0..pt]).assign(
-                &(xtr
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&xtr.view().insert_axis(Axis(0)))
-                    * q_tt_a
-                    + xta
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&xtr.view().insert_axis(Axis(0)))
-                        * q_tt
-                    + xtr
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&xta.view().insert_axis(Axis(0)))
-                        * q_tt),
+            scaled_outer_add(r_a.slice_mut(s![0..pt, 0..pt]), q_tt_a, xtr, xtr);
+            scaled_outer_add(r_a.slice_mut(s![0..pt, 0..pt]), q_tt, xta.view(), xtr);
+            scaled_outer_add(r_a.slice_mut(s![0..pt, 0..pt]), q_tt, xtr, xta.view());
+            scaled_outer_add(r_a.slice_mut(s![0..pt, pt..pt + pls]), q_tl_a, xtr, xlsr);
+            scaled_outer_add(r_a.slice_mut(s![0..pt, pt..pt + pls]), q_tl, xta.view(), xlsr);
+            scaled_outer_add(r_a.slice_mut(s![0..pt, pt..pt + pls]), q_tl, xtr, xlsa.view());
+            scaled_outer_add(
+                r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll_a,
+                xlsr,
+                xlsr,
             );
-            r_a.slice_mut(s![0..pt, pt..pt + pls]).assign(
-                &(xtr
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.view().insert_axis(Axis(0)))
-                    * q_tl_a
-                    + xta
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.view().insert_axis(Axis(0)))
-                        * q_tl
-                    + xtr
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsa.view().insert_axis(Axis(0)))
-                        * q_tl),
+            scaled_outer_add(
+                r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll,
+                xlsa.view(),
+                xlsr,
             );
-            r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(
-                &(xlsr
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.view().insert_axis(Axis(0)))
-                    * q_ll_a
-                    + xlsa
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.view().insert_axis(Axis(0)))
-                        * q_ll
-                    + xlsr
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsa.view().insert_axis(Axis(0)))
-                        * q_ll),
+            scaled_outer_add(
+                r_a.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                q_ll,
+                xlsr,
+                xlsa.view(),
             );
-            r_a.slice_mut(s![0..pt, pt + pls..]).assign(
-                &(xta
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&q_tw.view().insert_axis(Axis(0)))
-                    + xtr
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&q_tw_a.view().insert_axis(Axis(0)))),
+            scaled_outer_add(r_a.slice_mut(s![0..pt, pt + pls..]), 1.0, xta.view(), q_tw.view());
+            scaled_outer_add(r_a.slice_mut(s![0..pt, pt + pls..]), 1.0, xtr, q_tw_a.view());
+            scaled_outer_add(
+                r_a.slice_mut(s![pt..pt + pls, pt + pls..]),
+                1.0,
+                xlsa.view(),
+                q_lw.view(),
             );
-            r_a.slice_mut(s![pt..pt + pls, pt + pls..]).assign(
-                &(xlsa
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&q_lw.view().insert_axis(Axis(0)))
-                    + xlsr
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&q_lw_a.view().insert_axis(Axis(0)))),
+            scaled_outer_add(
+                r_a.slice_mut(s![pt..pt + pls, pt + pls..]),
+                1.0,
+                xlsr,
+                q_lw_a.view(),
             );
             mirror_upper_to_lower(&mut r_a);
 
             c_u.fill(0.0);
-            c_u.slice_mut(s![0..pt, 0..pt]).assign(
-                &(xtr
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&xtr.view().insert_axis(Axis(0)))
-                    * dq_tt_u),
+            scaled_outer_add(c_u.slice_mut(s![0..pt, 0..pt]), dq_tt_u, xtr, xtr);
+            scaled_outer_add(c_u.slice_mut(s![0..pt, pt..pt + pls]), dq_tl_u, xtr, xlsr);
+            scaled_outer_add(
+                c_u.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                dq_ll_u,
+                xlsr,
+                xlsr,
             );
-            c_u.slice_mut(s![0..pt, pt..pt + pls]).assign(
-                &(xtr
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.view().insert_axis(Axis(0)))
-                    * dq_tl_u),
-            );
-            c_u.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(
-                &(xlsr
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.view().insert_axis(Axis(0)))
-                    * dq_ll_u),
-            );
-            c_u.slice_mut(s![0..pt, pt + pls..]).assign(
-                &xtr.view()
-                    .insert_axis(Axis(1))
-                    .dot(&dq_tw_u.view().insert_axis(Axis(0))),
-            );
-            c_u.slice_mut(s![pt..pt + pls, pt + pls..]).assign(
-                &xlsr
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&dq_lw_u.view().insert_axis(Axis(0))),
+            scaled_outer_add(c_u.slice_mut(s![0..pt, pt + pls..]), 1.0, xtr, dq_tw_u.view());
+            scaled_outer_add(
+                c_u.slice_mut(s![pt..pt + pls, pt + pls..]),
+                1.0,
+                xlsr,
+                dq_lw_u.view(),
             );
             mirror_upper_to_lower(&mut c_u);
 
             delta_a.fill(0.0);
-            delta_a.slice_mut(s![0..pt, 0..pt]).assign(
-                &(xtr
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&xtr.view().insert_axis(Axis(0)))
-                    * dq_tt_a_u
-                    + xta
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&xtr.view().insert_axis(Axis(0)))
-                        * dq_tt_u
-                    + xtr
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&xta.view().insert_axis(Axis(0)))
-                        * dq_tt_u),
+            scaled_outer_add(delta_a.slice_mut(s![0..pt, 0..pt]), dq_tt_a_u, xtr, xtr);
+            scaled_outer_add(delta_a.slice_mut(s![0..pt, 0..pt]), dq_tt_u, xta.view(), xtr);
+            scaled_outer_add(delta_a.slice_mut(s![0..pt, 0..pt]), dq_tt_u, xtr, xta.view());
+            scaled_outer_add(
+                delta_a.slice_mut(s![0..pt, pt..pt + pls]),
+                dq_tl_a_u,
+                xtr,
+                xlsr,
             );
-            delta_a.slice_mut(s![0..pt, pt..pt + pls]).assign(
-                &(xtr
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.view().insert_axis(Axis(0)))
-                    * dq_tl_a_u
-                    + xta
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.view().insert_axis(Axis(0)))
-                        * dq_tl_u
-                    + xtr
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsa.view().insert_axis(Axis(0)))
-                        * dq_tl_u),
+            scaled_outer_add(
+                delta_a.slice_mut(s![0..pt, pt..pt + pls]),
+                dq_tl_u,
+                xta.view(),
+                xlsr,
             );
-            delta_a.slice_mut(s![pt..pt + pls, pt..pt + pls]).assign(
-                &(xlsr
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&xlsr.view().insert_axis(Axis(0)))
-                    * dq_ll_a_u
-                    + xlsa
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsr.view().insert_axis(Axis(0)))
-                        * dq_ll_u
-                    + xlsr
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&xlsa.view().insert_axis(Axis(0)))
-                        * dq_ll_u),
+            scaled_outer_add(
+                delta_a.slice_mut(s![0..pt, pt..pt + pls]),
+                dq_tl_u,
+                xtr,
+                xlsa.view(),
             );
-            delta_a.slice_mut(s![0..pt, pt + pls..]).assign(
-                &(xta
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&dq_tw_u.view().insert_axis(Axis(0)))
-                    + xtr
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&dq_tw_a_u.view().insert_axis(Axis(0)))),
+            scaled_outer_add(
+                delta_a.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                dq_ll_a_u,
+                xlsr,
+                xlsr,
             );
-            delta_a.slice_mut(s![pt..pt + pls, pt + pls..]).assign(
-                &(xlsa
-                    .view()
-                    .insert_axis(Axis(1))
-                    .dot(&dq_lw_u.view().insert_axis(Axis(0)))
-                    + xlsr
-                        .view()
-                        .insert_axis(Axis(1))
-                        .dot(&dq_lw_a_u.view().insert_axis(Axis(0)))),
+            scaled_outer_add(
+                delta_a.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                dq_ll_u,
+                xlsa.view(),
+                xlsr,
+            );
+            scaled_outer_add(
+                delta_a.slice_mut(s![pt..pt + pls, pt..pt + pls]),
+                dq_ll_u,
+                xlsr,
+                xlsa.view(),
+            );
+            scaled_outer_add(
+                delta_a.slice_mut(s![0..pt, pt + pls..]),
+                1.0,
+                xta.view(),
+                dq_tw_u.view(),
+            );
+            scaled_outer_add(
+                delta_a.slice_mut(s![0..pt, pt + pls..]),
+                1.0,
+                xtr,
+                dq_tw_a_u.view(),
+            );
+            scaled_outer_add(
+                delta_a.slice_mut(s![pt..pt + pls, pt + pls..]),
+                1.0,
+                xlsa.view(),
+                dq_lw_u.view(),
+            );
+            scaled_outer_add(
+                delta_a.slice_mut(s![pt..pt + pls, pt + pls..]),
+                1.0,
+                xlsr,
+                dq_lw_a_u.view(),
             );
             mirror_upper_to_lower(&mut delta_a);
 
-            let bb = b
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&b.view().insert_axis(Axis(0)));
-            let cb = c_a
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&b.view().insert_axis(Axis(0)));
-            let bc = b
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&c_a.view().insert_axis(Axis(0)));
-            let gb = gamma
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&b.view().insert_axis(Axis(0)));
-            let bg = b
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&gamma.view().insert_axis(Axis(0)));
-            let gab = gamma_a
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&b.view().insert_axis(Axis(0)));
-            let bga = b
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&gamma_a.view().insert_axis(Axis(0)));
-            let gc = gamma
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&c_a.view().insert_axis(Axis(0)));
-            let cg = c_a
-                .view()
-                .insert_axis(Axis(1))
-                .dot(&gamma.view().insert_axis(Axis(0)));
-
-            out += &(loss_1 * &delta_a);
-            out += &(loss_2
-                * (&(alpha * &r_a)
-                    + &(q_a * &c_u)
-                    + &gab
-                    + &bga
-                    + &gc
-                    + &cg
-                    + &(alpha_a * &q_mat)));
-            out += &(loss_3
-                * (&((alpha * q_a) * &bb)
-                    + &(q_a * (&gb + &bg))
-                    + &(alpha * (&cb + &bc + &(q_a * &q_mat)))));
-            out += &((loss_4 * alpha * q_a + loss_3 * alpha_a) * &bb);
+            out.scaled_add(loss_1, &delta_a);
+            out.scaled_add(loss_2 * alpha, &r_a);
+            out.scaled_add(loss_2 * q_a, &c_u);
+            scaled_outer_add(out.view_mut(), loss_2, gamma_a.view(), b.view());
+            scaled_outer_add(out.view_mut(), loss_2, b.view(), gamma_a.view());
+            scaled_outer_add(out.view_mut(), loss_2, gamma.view(), c_a.view());
+            scaled_outer_add(out.view_mut(), loss_2, c_a.view(), gamma.view());
+            out.scaled_add(loss_2 * alpha_a, &q_mat);
+            scaled_outer_add(
+                out.view_mut(),
+                loss_3 * alpha * q_a,
+                b.view(),
+                b.view(),
+            );
+            scaled_outer_add(out.view_mut(), loss_3 * q_a, gamma.view(), b.view());
+            scaled_outer_add(out.view_mut(), loss_3 * q_a, b.view(), gamma.view());
+            scaled_outer_add(out.view_mut(), loss_3 * alpha, c_a.view(), b.view());
+            scaled_outer_add(out.view_mut(), loss_3 * alpha, b.view(), c_a.view());
+            out.scaled_add(loss_3 * alpha * q_a, &q_mat);
+            scaled_outer_add(
+                out.view_mut(),
+                loss_4 * alpha * q_a + loss_3 * alpha_a,
+                b.view(),
+                b.view(),
+            );
         }
         mirror_upper_to_lower(&mut out);
         Ok(out)

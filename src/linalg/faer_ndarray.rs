@@ -24,12 +24,12 @@ const RRQR_RANK_ALPHA: f64 = 100.0;
 
 #[derive(Debug, Error)]
 pub enum FaerLinalgError {
-    #[error("Factorization failed")]
-    FactorizationFailed,
-    #[error("SVD failed to converge")]
-    SvdNoConvergence,
-    #[error("Self-adjoint eigendecomposition input contains non-finite values")]
-    SelfAdjointEigenNonFiniteInput,
+    #[error("Factorization failed in {context}")]
+    FactorizationFailed { context: &'static str },
+    #[error("SVD failed to converge in {context}")]
+    SvdNoConvergence { context: &'static str },
+    #[error("Self-adjoint eigendecomposition input contains non-finite values in {context}")]
+    SelfAdjointEigenNonFiniteInput { context: &'static str },
     #[error("Self-adjoint eigendecomposition failed: {0:?}")]
     SelfAdjointEigen(solvers::EvdError),
     #[error("Cholesky factorization failed: {0:?}")]
@@ -1575,13 +1575,19 @@ pub fn ldlt_rook(
 > {
     let (nrows, ncols) = matrix.dim();
     if nrows != ncols {
-        return Err(FaerLinalgError::FactorizationFailed);
+        return Err(FaerLinalgError::FactorizationFailed {
+            context: "ldlt_rook non-square input",
+        });
     }
     if !matrix.iter().all(|v| v.is_finite()) {
-        return Err(FaerLinalgError::FactorizationFailed);
+        return Err(FaerLinalgError::FactorizationFailed {
+            context: "ldlt_rook finite-input validation",
+        });
     }
     if !is_symmetricwith_tolerance(matrix, SYMMETRY_REL_TOL, SYMMETRY_ABS_TOL) {
-        return Err(FaerLinalgError::FactorizationFailed);
+        return Err(FaerLinalgError::FactorizationFailed {
+            context: "ldlt_rook symmetry validation",
+        });
     }
     let n = nrows;
     // faer LBLT contract (bunch-kaufman::factor::cholesky_in_place):
@@ -1641,7 +1647,9 @@ pub fn ldlt_rook(
         &perm_fwd,
         &perm_inv,
     ) {
-        return Err(FaerLinalgError::FactorizationFailed);
+        return Err(FaerLinalgError::FactorizationFailed {
+            context: "ldlt_rook output validation",
+        });
     }
 
     let inertia = compute_bunch_kaufman_inertia(&d_diag, &d_subdiag);
@@ -1801,7 +1809,9 @@ impl<S: Data<Elem = f64>> FaerSvd for ArrayBase<S, Ix2> {
                 stack,
                 Default::default(),
             )
-            .map_err(|_| FaerLinalgError::SvdNoConvergence)?;
+            .map_err(|_| FaerLinalgError::SvdNoConvergence {
+                context: "faer SVD singular values only",
+            })?;
             let singularvalues = diag_to_array(singular.as_ref());
             return Ok((None, singularvalues, None));
         }
@@ -1843,7 +1853,9 @@ impl<S: Data<Elem = f64>> FaerSvd for ArrayBase<S, Ix2> {
             stack,
             Default::default(),
         )
-        .map_err(|_| FaerLinalgError::SvdNoConvergence)?;
+        .map_err(|_| FaerLinalgError::SvdNoConvergence {
+            context: "faer SVD with vectors",
+        })?;
 
         let singularvalues = diag_to_array(singular.as_ref());
         let u_opt = u_storage.map(|mat| mat_to_array(mat.as_ref()));
@@ -1876,7 +1888,9 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
             let eigen = catch_unwind(AssertUnwindSafe(|| {
                 faerview.as_ref().self_adjoint_eigen(side)
             }))
-            .map_err(|_| FaerLinalgError::FactorizationFailed)?
+            .map_err(|_| FaerLinalgError::FactorizationFailed {
+                context: "self-adjoint eigendecomposition panic boundary",
+            })?
             .map_err(FaerLinalgError::SelfAdjointEigen)?;
             let values = diag_to_array(eigen.S());
             let vectors = mat_to_array(eigen.U());
@@ -1885,13 +1899,17 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
 
         let owned = self.to_owned();
         if owned.nrows() != owned.ncols() {
-            return Err(FaerLinalgError::FactorizationFailed);
+            return Err(FaerLinalgError::FactorizationFailed {
+                context: "self-adjoint eigendecomposition non-square input",
+            });
         }
         if owned.nrows() == 0 {
             return Ok((Array1::zeros(0), Array2::zeros((0, 0))));
         }
         if owned.iter().any(|value| !value.is_finite()) {
-            return Err(FaerLinalgError::SelfAdjointEigenNonFiniteInput);
+            return Err(FaerLinalgError::SelfAdjointEigenNonFiniteInput {
+                context: "self-adjoint eigendecomposition input validation",
+            });
         }
         if matches!(side, Side::Lower) {
             let mut gpu_owned = owned.clone();
@@ -1925,7 +1943,9 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
             .max(1.0);
         let scaled = repaired.mapv(|value| value / scale);
         let jitter_schedule = [0.0_f64, 1e-12, 1e-10, 1e-8, 1e-6, 1e-4];
-        let mut last_error = FaerLinalgError::FactorizationFailed;
+        let mut last_error = FaerLinalgError::FactorizationFailed {
+            context: "self-adjoint eigendecomposition repair attempts",
+        };
 
         for &jitter in &jitter_schedule {
             let mut candidate = scaled.clone();
@@ -1946,7 +1966,9 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
                     return Ok((evals, evecs));
                 }
                 Ok(_) => {
-                    last_error = FaerLinalgError::SelfAdjointEigenNonFiniteInput;
+                    last_error = FaerLinalgError::SelfAdjointEigenNonFiniteInput {
+                        context: "self-adjoint eigendecomposition repaired output validation",
+                    };
                 }
                 Err(err) => {
                     last_error = err;
@@ -2146,7 +2168,7 @@ mod tests {
         let a = array![[1.0, f64::NAN], [f64::NAN, 2.0]];
         assert!(matches!(
             ldlt_rook(&a),
-            Err(FaerLinalgError::FactorizationFailed)
+            Err(FaerLinalgError::FactorizationFailed { .. })
         ));
     }
 
@@ -2155,7 +2177,7 @@ mod tests {
         let a = array![[1.0, 10.0], [0.0, 1.0]];
         assert!(matches!(
             ldlt_rook(&a),
-            Err(FaerLinalgError::FactorizationFailed)
+            Err(FaerLinalgError::FactorizationFailed { .. })
         ));
     }
 
@@ -2222,7 +2244,7 @@ mod tests {
             .expect_err("non-finite symmetric input must be rejected");
         assert!(matches!(
             err,
-            FaerLinalgError::SelfAdjointEigenNonFiniteInput
+            FaerLinalgError::SelfAdjointEigenNonFiniteInput { .. }
         ));
     }
 
