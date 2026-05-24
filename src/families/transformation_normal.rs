@@ -10159,12 +10159,11 @@ fn assert_no_rowwise_kronecker_materialization(n: usize, p_resp: usize, p_cov: u
         .saturating_mul(p_resp)
         .saturating_mul(p_cov)
         .saturating_mul(std::mem::size_of::<f64>());
-    // SAFETY: this helper exists specifically to enforce the biobank-scale
-    // invariant that CTN `KroneckerDesign` matrices never persist as
-    // dense `n × p_resp × p_cov` storage. The return type `!` makes the
-    // panic the only valid behavior — any caller that reached here
-    // bypassed the factored Kronecker dispatch and would otherwise
-    // silently allocate a matrix sized to crash the process.
+    // This helper enforces the biobank-scale invariant that CTN
+    // `KroneckerDesign` never persists as dense `n × p_resp × p_cov`.
+    // SAFETY: return type `!` makes the panic the only valid behavior;
+    // reaching here means a caller bypassed the factored-Kron dispatch
+    // and would otherwise silently allocate a process-killing buffer.
     panic!(
         "CTN KroneckerDesign must remain factored; refused persistent n x p_response x p_covariate materialization (n={n}, p_response={p_resp}, p_covariate={p_cov}, dense={:.1} MiB)",
         bytes as f64 / (1024.0 * 1024.0),

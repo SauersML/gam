@@ -1516,18 +1516,18 @@ impl HessianResult {
     pub fn unwrap_analytic(self) -> Array2<f64> {
         match self {
             HessianResult::Analytic(h) => h,
-            // SAFETY: `unwrap_analytic`'s doc-comment above pins its contract
-            // — caller must have an `OuterPlan` that guarantees
-            // `HessianSource::Analytic` (dense). Reaching the operator arm
-            // means the plan promised dense analytic but the family returned
-            // an operator-backed Hessian, which is a contract violation.
+            // `unwrap_analytic`'s doc-comment pins its contract: caller must
+            // hold an `OuterPlan` whose `HessianSource::Analytic` is dense.
             HessianResult::Operator(_) => {
+                // SAFETY: reaching this arm means the plan promised dense
+                // analytic but the family returned an operator — contract
+                // violation; fail-fast surfaces the upstream plan bug.
                 panic!("expected dense analytic Hessian but got HessianResult::Operator")
             }
-            // SAFETY: same contract as above — `Unavailable` here means the
-            // family failed to produce the analytic Hessian its `OuterPlan`
-            // promised.
             HessianResult::Unavailable => {
+                // SAFETY: same contract as Operator above — `Unavailable`
+                // means the family failed to produce the analytic Hessian
+                // its `OuterPlan` declared.
                 panic!("expected analytic Hessian but got HessianResult::Unavailable")
             }
         }
