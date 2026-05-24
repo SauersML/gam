@@ -2,8 +2,10 @@
 //!
 //! The module is intentionally callable from CPU-only builds: all public entry
 //! points are available without CUDA, and the runtime reports an unavailable
-//! backend instead of changing numerical results.  CUDA-specific code is kept
-//! behind the `cuda` Cargo feature and does not leak into solver modules.
+//! backend instead of changing numerical results.  CUDA-specific code compiles
+//! unconditionally (cudarc is always linked via `fallback-dynamic-loading`)
+//! and gates its execution on `GpuRuntime::global()` at runtime, so it does
+//! not leak into solver modules.
 
 pub mod blas;
 pub mod cpu_traits;

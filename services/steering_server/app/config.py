@@ -65,8 +65,15 @@ def _merge(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
 
 def load_settings() -> Settings:
     data = _merge(_read_toml(ROOT / "config" / "default.toml"), _read_toml(ROOT / "config" / "local.toml"))
+    database_data = data.get("database", {})
+    database_url = database_data.get("url")
+    if isinstance(database_url, str) and database_url.startswith("sqlite:///") and not database_url.startswith("sqlite:////"):
+        raw_path = database_url[len("sqlite:///") :]
+        if raw_path and not Path(raw_path).is_absolute():
+            database_data = dict(database_data)
+            database_data["url"] = f"sqlite:///{ROOT / raw_path}"
     return Settings(
-        database=DatabaseSettings(**data.get("database", {})),
+        database=DatabaseSettings(**database_data),
         auth=AuthSettings(**data.get("auth", {})),
         rate_limit=RateLimitSettings(**data.get("rate_limit", {})),
         telemetry=TelemetrySettings(**data.get("telemetry", {})),
