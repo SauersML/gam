@@ -1,4 +1,4 @@
-"""Analytic structured penalties: isometry, sparsity, ARD, TV, nuclear norm, block sparsity, orthogonality.
+"""Analytic structured penalties: isometry, sparsity, SCAD/MCP, ARD, TV, nuclear norm, block sparsity, orthogonality.
 
 Thin Python configuration wrappers around the analytic primitives
 implemented in `src/terms/analytic_penalties.rs`. Each wrapper is a
@@ -18,6 +18,8 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
 * `SparsityPenalty` lives on β (SAE codes) or t (soft atom
   assignments). Smoothed L¹ by default, with `ε` itself optionally
   REML-selected.
+* `ScadMcpPenalty` lives on t. Concave element-wise sparsity that shrinks
+  noise near zero while flattening the gradient for large true signals.
 * `ARDPenalty` lives on t. One weight per latent axis, all
   REML-selectable. The Occam factor in the marginal likelihood
   prunes unused axes only after an AuxPrior or Isometry-style gauge
@@ -58,6 +60,7 @@ import numpy as np
 __all__ = [
     "IsometryPenalty",
     "SparsityPenalty",
+    "ScadMcpPenalty",
     "ARDPenalty",
     "TotalVariationPenalty",
     "NuclearNormPenalty",
@@ -257,6 +260,78 @@ class SparsityPenalty:
             "weight": self.weight,
             "eps": float(self.eps),
             "eps_weight": self.eps_weight,
+        }
+
+    def to_rust_descriptor(self) -> dict[str, Any]:
+        return self._to_rust_payload()
+
+
+@dataclass(init=False)
+class ScadMcpPenalty:
+    """Concave SCAD/MCP sparsity on latent coordinates.
+
+    ``SparsityPenalty`` uses Huber-smoothed L¹, whose gradient keeps pulling
+    large coefficients toward zero. MCP (Zhang 2010) and SCAD (Fan-Li 2001)
+    flatten that gradient for large coefficients, giving less-biased true
+    signals while still shrinking near-zero noise. Fan-Li recommend
+    ``gamma=3.7`` for SCAD; larger ``gamma`` approaches L¹.
+    """
+
+    target: TargetSpec
+    weight: float
+    n_eff: int
+    gamma: float
+    variant: Literal["mcp", "scad"]
+    smoothing_eps: float
+    learnable: bool
+
+    def __init__(
+        self,
+        weight: float,
+        n_eff: int,
+        gamma: float = 3.7,
+        variant: Literal["mcp", "scad"] = "mcp",
+        smoothing_eps: float = 1e-6,
+        learnable: bool = False,
+        *,
+        target: TargetSpec = "t",
+    ) -> None:
+        self.target = target
+        self.weight = float(weight)
+        self.n_eff = int(n_eff)
+        self.gamma = float(gamma)
+        self.variant = variant
+        self.smoothing_eps = float(smoothing_eps)
+        self.learnable = bool(learnable)
+        self.__post_init__()
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.weight) or not self.weight > 0.0:
+            raise ValueError(f"ScadMcpPenalty.weight must be > 0, got {self.weight}")
+        if self.n_eff <= 0:
+            raise ValueError(f"ScadMcpPenalty.n_eff must be > 0, got {self.n_eff}")
+        if not np.isfinite(self.gamma) or not self.gamma > 1.0:
+            raise ValueError(f"ScadMcpPenalty.gamma must be > 1, got {self.gamma}")
+        if self.variant not in ("mcp", "scad"):
+            raise ValueError(
+                f"ScadMcpPenalty.variant must be 'mcp' or 'scad', got {self.variant!r}"
+            )
+        if not np.isfinite(self.smoothing_eps) or not self.smoothing_eps > 0.0:
+            raise ValueError(
+                "ScadMcpPenalty.smoothing_eps must be > 0, "
+                f"got {self.smoothing_eps}"
+            )
+
+    def _to_rust_payload(self) -> dict[str, Any]:
+        return {
+            "kind": "scad_mcp",
+            "target": _target_descriptor(self.target),
+            "weight": self.weight,
+            "n_eff": self.n_eff,
+            "gamma": self.gamma,
+            "variant": self.variant,
+            "smoothing_eps": self.smoothing_eps,
+            "learnable": self.learnable,
         }
 
     def to_rust_descriptor(self) -> dict[str, Any]:
@@ -1000,7 +1075,7 @@ class SoftmaxAssignmentSparsityPenalty:
 
 # Sum type for type hints on `gamfit.fit(..., penalties=...)` and similar.
 Penalty = (
-    "IsometryPenalty | SparsityPenalty | ARDPenalty | "
+    "IsometryPenalty | SparsityPenalty | ScadMcpPenalty | ARDPenalty | "
     "TotalVariationPenalty | NuclearNormPenalty | BlockSparsityPenalty | "
     "AuxConditionalPriorPenalty | ParametricAuxConditionalPriorPenalty | "
     "OrthogonalityPenalty | IBPAssignmentPenalty | SoftmaxAssignmentSparsityPenalty"
