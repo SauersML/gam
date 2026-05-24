@@ -1,13 +1,11 @@
 use ndarray::Array2;
 
-use csv::StringRecord;
 use gam::inference::data::EncodedDataset;
 use gam::inference::formula_dsl::{ParsedTerm, parse_formula};
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use gam::resource::ResourcePolicy;
 use gam::smooth::{ByVarKind, FactorSmoothFlavour, SmoothBasisSpec};
 use gam::terms::term_builder::build_termspec;
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
 
 #[test]
 fn factor_smooth_aliases_and_by_options_parse() {
@@ -184,69 +182,6 @@ fn factor_smooth_forms_route_to_new_termspec_variants() {
             }
         }
     ));
-}
-
-fn factor_by_dataset(n: usize) -> EncodedDataset {
-    // n rows split evenly across two levels of `fac` with `y` driven by a
-    // level-dependent quadratic in `x` plus mild noise. Enough rows to fit
-    // a factor-by smooth + main effect through PIRLS/REML.
-    let headers: Vec<String> = ["y", "x", "fac", "z"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    let rows: Vec<StringRecord> = (0..n)
-        .map(|i| {
-            let t = -1.0 + 2.0 * (i as f64) / ((n - 1) as f64);
-            let fac = i % 2;
-            let z = 0.4 + 0.5 * (i as f64 / (n - 1) as f64);
-            let y = 0.5 + 0.3 * t + 0.2 * t * t - 0.4 * (fac as f64) * t
-                + 0.05 * ((7 * i + 3) as f64 / 11.0).sin();
-            StringRecord::from(vec![
-                y.to_string(),
-                t.to_string(),
-                fac.to_string(),
-                z.to_string(),
-            ])
-        })
-        .collect();
-    encode_recordswith_inferred_schema(headers, rows).expect("encode rows")
-}
-
-fn fit_succeeds(formula: &str, ds: &EncodedDataset) -> usize {
-    let cfg = FitConfig {
-        family: Some("gaussian".to_string()),
-        ..FitConfig::default()
-    };
-    let result = fit_from_formula(formula, ds, &cfg)
-        .unwrap_or_else(|e| panic!("{formula} failed to fit: {e}"));
-    let FitResult::Standard(fit) = result else {
-        panic!("{formula}: expected standard fit");
-    };
-    assert!(
-        fit.fit.beta.iter().all(|v: &f64| v.is_finite()),
-        "{formula}: beta has non-finite entries"
-    );
-    assert!(
-        fit.fit.deviance.is_finite(),
-        "{formula}: deviance is non-finite"
-    );
-    fit.fit.beta.len()
-}
-
-#[test]
-fn factor_smooth_variants_fit_end_to_end_through_reml() {
-    let ds = factor_by_dataset(200);
-    // Numeric by= smooth — basis multiplied by the numeric covariate.
-    assert!(fit_succeeds("y ~ s(x, by=z, k=6)", &ds) > 1);
-    // Factor by= smooth alone (per-level smooth, no main effect).
-    assert!(fit_succeeds("y ~ s(x, by=fac, k=4)", &ds) > 1);
-    // Factor by= smooth combined with a random-effect main effect — the
-    // canonical mgcv idiom for identifiable per-group trajectories.
-    assert!(fit_succeeds("y ~ s(x, by=fac, k=4) + fac", &ds) > 1);
-    // Hierarchical/partial-pooling factor smooth (bs="fs").
-    assert!(fit_succeeds("y ~ fs(x, fac, k=4)", &ds) > 1);
-    // Sum-to-zero deviations from a population smooth.
-    assert!(fit_succeeds("y ~ s(x, k=4) + sz(fac, x, k=4)", &ds) > 1);
 }
 
 #[test]

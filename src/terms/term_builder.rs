@@ -282,35 +282,6 @@ pub fn build_termspec(
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut inner_options = options.clone();
                 let by_name = inner_options.remove("by");
-                // Pop shape= before passing options to build_smooth_basis so
-                // the per-type validate_known_options doesn't reject it. The
-                // formula DSL accepts `s(x, shape=<kind>)` where <kind> is one
-                // of monotone_increasing / monotone_decreasing / convex /
-                // concave (case-insensitive, hyphens or underscores accepted).
-                let shape = match inner_options.remove("shape") {
-                    None => ShapeConstraint::None,
-                    Some(raw) => {
-                        let norm = raw.trim().to_ascii_lowercase().replace('-', "_");
-                        match norm.as_str() {
-                            "none" | "" => ShapeConstraint::None,
-                            "monotone_increasing" | "increasing" | "mono_inc" | "mpi" => {
-                                ShapeConstraint::MonotoneIncreasing
-                            }
-                            "monotone_decreasing" | "decreasing" | "mono_dec" | "mpd" => {
-                                ShapeConstraint::MonotoneDecreasing
-                            }
-                            "convex" | "cvx" => ShapeConstraint::Convex,
-                            "concave" | "ccv" => ShapeConstraint::Concave,
-                            other => {
-                                return Err(TermBuilderError::invalid_option(format!(
-                                    "smooth option `shape={other}` is not recognized; expected one of \
-                                     monotone_increasing, monotone_decreasing, convex, concave, none"
-                                ))
-                                .to_string());
-                            }
-                        }
-                    }
-                };
                 let mut basis = build_smooth_basis(
                     *kind,
                     vars,
@@ -324,15 +295,11 @@ pub fn build_termspec(
                 if let Some(by_name) = by_name {
                     let by_col = resolve_col(col_map, &by_name)?;
                     let by_kind_tag = ds.column_kinds.get(by_col).copied().ok_or_else(|| {
-                        TermBuilderError::missing_column(format!(
-                            "internal column-kind lookup failed for by variable '{by_name}'"
-                        ))
-                        .to_string()
+                        format!("internal column-kind lookup failed for by variable '{by_name}'")
                     })?;
                     let by_kind = match by_kind_tag {
                         ColumnKindTag::Categorical => {
-                            let levels = sorted_levels_for_column(ds.values.column(by_col))
-                                .map_err(|e| e.to_string())?;
+                            let levels = sorted_levels_for_column(ds.values.column(by_col))?;
                             let ordered = inner_options
                                 .get("ordered")
                                 .map(|v| {
@@ -530,13 +497,11 @@ fn parse_bc_periods_option(
 // Smooth basis spec construction
 // ---------------------------------------------------------------------------
 
-fn sorted_levels_for_column(col: ArrayView1<'_, f64>) -> Result<Vec<u64>, TermBuilderError> {
+fn sorted_levels_for_column(col: ArrayView1<'_, f64>) -> Result<Vec<u64>, String> {
     let mut levels = std::collections::BTreeSet::<u64>::new();
     for &v in col.iter() {
         if !v.is_finite() {
-            return Err(TermBuilderError::degenerate_data(
-                "categorical column contains non-finite values",
-            ));
+            return Err("categorical column contains non-finite values".to_string());
         }
         levels.insert(v.to_bits());
     }
@@ -730,6 +695,107 @@ pub fn build_smooth_basis(
                 &[
                     "type",
                     "bs",
+                    "k",
+                    "basis_dim",
+                    "basis-dim",
+                    "basisdim",
+                    "knots",
+                    "degree",
+                    "penalty_order",
+                    "m",
+                    "double_penalty",
+                ],
+            )?;
+            if cols.len() != 2 {
+                return Err(format!(
+                    "{} smooth currently expects exactly two variables: one continuous and one categorical/group variable",
+                    type_opt
+                ));
+            }
+            let k0 = ds
+                .column_kinds
+                .get(cols[0])
+                .copied()
+                .ok_or_else(|| "column-kind lookup failed".to_string())?;
+            let k1 = ds
+                .column_kinds
+                .get(cols[1])
+                .copied()
+                .ok_or_else(|| "column-kind lookup failed".to_string())?;
+            let (group_idx, cont_idx) = match (k0, k1) {
+                (ColumnKindTag::Categorical, ColumnKindTag::Continuous | ColumnKindTag::Binary) => {
+                    (0usize, 1usize)
+                }
+                (ColumnKindTag::Continuous | ColumnKindTag::Binary, ColumnKindTag::Categorical) => {
+                    (1usize, 0usize)
+                }
+                _ => {
+                    return Err(format!(
+                        "{} smooth requires one categorical and one numeric variable",
+                        type_opt
+                    ));
+                }
+            };
+            let group_col = cols[group_idx];
+            let cont_col = cols[cont_idx];
+            let levels = sorted_levels_for_column(ds.values.column(group_col))?;
+            let degree = option_usize(options, "degree").unwrap_or(3);
+            let (minv, maxv) = col_minmax(ds.values.column(cont_col))?;
+            let default_internal = heuristic_knots_for_column(ds.values.column(cont_col));
+            let k = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"]);
+            let n_knots = if let Some(k) = k {
+                if k < degree + 1 {
+                    return Err(format!(
+                        "factor smooth: k={} too small for degree {}; expected k >= {}",
+                        k,
+                        degree,
+                        degree + 1
+                    ));
+                }
+                k - degree - 1
+            } else {
+                default_internal
+            };
+            let marginal = BSplineBasisSpec {
+                degree,
+                penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
+                knotspec: BSplineKnotSpec::Generate {
+                    data_range: (minv, maxv),
+                    num_internal_knots: n_knots,
+                },
+                double_penalty: true,
+                identifiability: BSplineIdentifiability::None,
+                boundary_conditions: Default::default(),
+            };
+            let flavour = match type_opt.as_str() {
+                "fs" | "factor-smooth" | "factor_smooth" => {
+                    let m = option_usize(options, "m").unwrap_or(2);
+                    FactorSmoothFlavour::Fs {
+                        m_null_penalty_orders: vec![m],
+                    }
+                }
+                "sz" => FactorSmoothFlavour::Sz,
+                "re" => FactorSmoothFlavour::Re,
+                _ => unreachable!(),
+            };
+            Ok(SmoothBasisSpec::FactorSmooth {
+                spec: FactorSmoothSpec {
+                    continuous_cols: vec![cont_col],
+                    group_col,
+                    marginal,
+                    flavour,
+                    group_frozen_levels: Some(levels),
+                },
+            })
+        }
+        "tensor" | "te" | "tensor-bspline" => {
+            validate_known_options(
+                type_opt.as_str(),
+                options,
+                &[
+                    "type",
+                    "bs",
+                    "by",
                     "k",
                     "basis_dim",
                     "basis-dim",
@@ -967,7 +1033,70 @@ pub fn build_smooth_basis(
                 feature_cols: cols.to_vec(),
                 spec: TensorBSplineSpec {
                     marginalspecs: specs,
-                    periods: parse_bc_periods_option(options, cols.len())?,
+                    double_penalty: tensor_double_penalty,
+                    identifiability: parse_tensor_identifiability(options)?,
+                },
+            })
+        }
+        "periodic" | "cyclic" | "periodic-bspline" | "cc" => {
+            validate_known_options(
+                "periodic",
+                options,
+                &[
+                    "type",
+                    "bs",
+                    "by",
+                    "k",
+                    "basis_dim",
+                    "basis-dim",
+                    "basisdim",
+                    "degree",
+                    "penalty_order",
+                    "period",
+                    "periods",
+                    "period_start",
+                    "period_end",
+                    "origin",
+                    "period_origin",
+                    "period-origin",
+                    "domain_origin",
+                    "double_penalty",
+                ],
+            )?;
+            if cols.len() != 1 {
+                return Err(format!(
+                    "periodic smooth expects one variable, got {}",
+                    cols.len()
+                ));
+            }
+            let c = cols[0];
+            let (minv, maxv) = col_minmax(ds.values.column(c))?;
+            let degree = option_usize(options, "degree").unwrap_or(3);
+            let mut default_internal = heuristic_knots_for_column(ds.values.column(c));
+            if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
+                default_internal = default_internal.min(1);
+            }
+            let default_basis = default_internal + degree + 1;
+            let num_basis = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
+                .unwrap_or(default_basis);
+            if num_basis < degree + 1 {
+                return Err(format!(
+                    "periodic smooth: k={} too small for degree {}; expected k >= {}",
+                    num_basis,
+                    degree,
+                    degree + 1
+                ));
+            }
+            let (domain_start, period) = parse_periodic_domain_1d(options, minv, maxv)?;
+            Ok(SmoothBasisSpec::BSpline1D {
+                feature_col: c,
+                spec: BSplineBasisSpec {
+                    degree,
+                    penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
+                    knotspec: BSplineKnotSpec::PeriodicUniform {
+                        data_range: (domain_start, domain_start + period),
+                        num_basis,
+                    },
                     double_penalty: smooth_double_penalty,
                     identifiability: BSplineIdentifiability::default(),
                     boundary_conditions: Default::default(),
