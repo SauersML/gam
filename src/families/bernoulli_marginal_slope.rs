@@ -4675,6 +4675,7 @@ struct EmpiricalFlexDirectionScratch {
 }
 
 impl EmpiricalFlexDirectionScratch {
+    #[expect(dead_code)]
     fn new(primary_dim: usize) -> Self {
         Self {
             basis_u: Array1::zeros(primary_dim),
