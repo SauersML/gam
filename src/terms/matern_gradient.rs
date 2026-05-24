@@ -280,7 +280,7 @@ mod tests {
         let analytic = eval
             .evaluate(data.view(), MaternBasisGradientTarget::LogKappa)
             .unwrap();
-        let h = 1.0e-5;
+        let h: f64 = 1.0e-5;
         for i in 0..data.nrows() {
             for j in 0..centers.nrows() {
                 let r = ((0..data.ncols())

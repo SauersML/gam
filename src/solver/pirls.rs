@@ -1122,6 +1122,7 @@ impl PirlsWorkspace {
     }
 
     #[inline]
+    #[expect(dead_code)]
     fn fill_sqrtweights<S>(&mut self, weights: &ArrayBase<S, Ix1>)
     where
         S: Data<Elem = f64>,

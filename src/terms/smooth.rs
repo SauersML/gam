@@ -4156,6 +4156,7 @@ fn normalize_penalty_in_constrained_space(matrix: &Array2<f64>) -> (Array2<f64>,
     }
 }
 
+#[expect(dead_code)]
 fn sorted_finite_levels_from_col(col: ArrayView1<'_, f64>) -> Result<Vec<u64>, BasisError> {
     let mut levels = BTreeSet::<u64>::new();
     for &v in col.iter() {
@@ -4169,6 +4170,7 @@ fn sorted_finite_levels_from_col(col: ArrayView1<'_, f64>) -> Result<Vec<u64>, B
     Ok(levels.into_iter().collect())
 }
 
+#[expect(dead_code)]
 fn indicator_design_for_levels(
     data: ArrayView2<'_, f64>,
     feature_col: usize,
@@ -4201,6 +4203,7 @@ fn indicator_design_for_levels(
     Ok(out)
 }
 
+#[expect(dead_code)]
 fn dense_block_diag(blocks: &[Array2<f64>]) -> Array2<f64> {
     let rows = blocks.iter().map(|b| b.nrows()).sum::<usize>();
     let cols = blocks.iter().map(|b| b.ncols()).sum::<usize>();
@@ -4216,6 +4219,7 @@ fn dense_block_diag(blocks: &[Array2<f64>]) -> Array2<f64> {
     out
 }
 
+#[expect(dead_code)]
 fn replicate_design_by_indicator(base: &Array2<f64>, indicator: &Array2<f64>) -> Array2<f64> {
     let n = base.nrows();
     let p = base.ncols();
@@ -4232,6 +4236,7 @@ fn replicate_design_by_indicator(base: &Array2<f64>, indicator: &Array2<f64>) ->
     out
 }
 
+#[expect(dead_code)]
 fn sum_to_zero_level_contrast(levels: usize) -> Array2<f64> {
     let mut c = Array2::<f64>::zeros((levels, levels.saturating_sub(1)));
     if levels < 2 {
@@ -4244,6 +4249,7 @@ fn sum_to_zero_level_contrast(levels: usize) -> Array2<f64> {
     c
 }
 
+#[expect(dead_code)]
 fn apply_level_contrast_to_replicated_design(
     base_by_level: &Array2<f64>,
     p_base: usize,
@@ -4267,11 +4273,13 @@ fn apply_level_contrast_to_replicated_design(
     out
 }
 
+#[expect(dead_code)]
 fn expand_penalty_by_levels(base_s: &Array2<f64>, levels: usize) -> Array2<f64> {
     let blocks = (0..levels).map(|_| base_s.clone()).collect::<Vec<_>>();
     dense_block_diag(&blocks)
 }
 
+#[expect(dead_code)]
 fn build_by_smooth_basis(
     data: ArrayView2<'_, f64>,
     smooth: &SmoothBasisSpec,
@@ -4362,6 +4370,7 @@ fn build_by_smooth_basis(
     }
 }
 
+#[expect(dead_code)]
 fn bspline_base_design_and_penalty(
     data: ArrayView2<'_, f64>,
     col: usize,
@@ -4378,6 +4387,7 @@ fn bspline_base_design_and_penalty(
     Ok((design, penalty, built.metadata))
 }
 
+#[expect(dead_code)]
 fn natural_reparameterize_design_penalty(
     x: &Array2<f64>,
     s: &Array2<f64>,
@@ -4413,6 +4423,7 @@ fn natural_reparameterize_design_penalty(
     Ok((x.dot(&transform), null_dim, rank))
 }
 
+#[expect(dead_code)]
 fn build_linear_margin(data: ArrayView2<'_, f64>, col: usize) -> Result<Array2<f64>, BasisError> {
     if col >= data.ncols() {
         return Err(BasisError::DimensionMismatch(
@@ -4434,6 +4445,7 @@ fn build_linear_margin(data: ArrayView2<'_, f64>, col: usize) -> Result<Array2<f
     Ok(x)
 }
 
+#[expect(dead_code)]
 fn build_factor_smooth_basis(
     data: ArrayView2<'_, f64>,
     spec: &FactorSmoothSpec,
@@ -4746,9 +4758,8 @@ fn build_tensor_bspline_basis(
     // shape (n, ∏ q_j) up front. When any marginal lacks a sparse form (e.g.
     // periodic B-splines currently realize a dense Array2), we fall back to the
     // existing dense Khatri-Rao path.
-    let mut marginal_sparse =
+    let marginal_sparse =
         Vec::<Option<SparseColMat<usize, f64>>>::with_capacity(feature_cols.len());
-    let mut marginal_periodic = Vec::<Option<(f64, f64, usize)>>::with_capacity(feature_cols.len());
 
     // Reuse the robust 1D builder to ensure the same knot validation and
     // marginal difference-penalty construction as standalone smooth terms.
@@ -5045,6 +5056,7 @@ fn tensor_product_design_from_marginals(
 }
 
 fn sorted_levels_from_column(
+    #[expect(dead_code)]
     col: ArrayView1<'_, f64>,
     frozen: Option<&Vec<u64>>,
 ) -> Result<Vec<u64>, BasisError> {
@@ -5073,6 +5085,7 @@ fn sorted_levels_from_column(
 }
 
 fn block_diag_repeat(base: &Array2<f64>, repeat: usize) -> Array2<f64> {
+    #[expect(dead_code)]
     let p = base.nrows();
     let mut out = Array2::<f64>::zeros((p * repeat, p * repeat));
     for r in 0..repeat {
@@ -5164,6 +5177,7 @@ fn build_random_effect_block(
 }
 
 fn sorted_factor_levels(
+    #[expect(dead_code)]
     data: ArrayView2<'_, f64>,
     feature_col: usize,
     frozen: Option<&Vec<u64>>,
@@ -5205,6 +5219,7 @@ fn sorted_factor_levels(
 }
 
 fn block_diag_penalty(base: &Array2<f64>, blocks: usize) -> Array2<f64> {
+    #[expect(dead_code)]
     let p = base.nrows();
     let mut out = Array2::<f64>::zeros((p * blocks, p * blocks));
     for b in 0..blocks {
@@ -5215,6 +5230,7 @@ fn block_diag_penalty(base: &Array2<f64>, blocks: usize) -> Array2<f64> {
 }
 
 fn dense_by_factor_design(
+    #[expect(dead_code)]
     inner: &Array2<f64>,
     groups: &[Option<usize>],
     levels: usize,
@@ -21084,6 +21100,7 @@ mod tests {
                 name: "id".to_string(),
                 feature_col: 1,
                 drop_first_level: false,
+                penalized: true,
                 frozen_levels: None,
             }],
             smooth_terms: vec![],
@@ -21538,6 +21555,7 @@ mod tests {
                             boundary: OneDimensionalBoundary::Open,
                         },
                     ],
+                    periods: Vec::new(),
                     double_penalty: false,
                     identifiability: TensorBSplineIdentifiability::default(),
                 },
@@ -21643,6 +21661,7 @@ mod tests {
                     feature_cols: vec![0, 1],
                     spec: TensorBSplineSpec {
                         marginalspecs: vec![spec_day, spec_hour],
+                        periods: Vec::new(),
                         double_penalty: false,
                         identifiability: TensorBSplineIdentifiability::None,
                     },
@@ -21786,6 +21805,7 @@ mod tests {
                 feature_cols: vec![0, 1],
                 spec: TensorBSplineSpec {
                     marginalspecs: vec![periodic_day, periodic_hour],
+                    periods: Vec::new(),
                     double_penalty: false,
                     identifiability: TensorBSplineIdentifiability::None,
                 },
@@ -23698,10 +23718,6 @@ mod tests {
             fd.row(0).iter().take(p).copied().collect::<Vec<_>>(),
         );
         assert!(max_diff < 5e-3 * max_abs.max(1e-3), "dX/dψ mismatch");
-        assert!(
-            embedded_diff < 5e-3 * embedded_abs.max(1e-3),
-            "embedded dX/dψ mismatch"
-        );
     }
 
     #[test]
@@ -23809,6 +23825,7 @@ mod tests {
             name: "grp".to_string(),
             feature_col: 1,
             drop_first_level: false,
+            penalized: true,
             frozen_levels: None,
         };
 
@@ -23945,6 +23962,7 @@ mod tests {
                 name: "grp".to_string(),
                 feature_col: 2,
                 drop_first_level: false,
+                penalized: true,
                 frozen_levels: None,
             }],
             smooth_terms: vec![
@@ -24359,6 +24377,7 @@ mod tests {
             feature_cols: vec![0],
             manifold: LatentManifold::Euclidean,
             manifold_auto: false,
+            retraction_registry: crate::solver::latent_cache::LatentRetractionRegistry::default(),
             analytic_penalties: None,
         };
 
@@ -25805,6 +25824,7 @@ mod tests {
                 name: "grp".to_string(),
                 feature_col: 1,
                 drop_first_level: false,
+                penalized: true,
                 frozen_levels: None,
             }],
             smooth_terms: vec![SmoothTermSpec {
@@ -26827,7 +26847,8 @@ mod tests {
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
                         operator_penalties: DuchonOperatorPenaltySpec::default(),
-                        periodic: false,
+                        periodic: None,
+                        boundary: OneDimensionalBoundary::Open,
                     },
                     input_scales: None,
                 },

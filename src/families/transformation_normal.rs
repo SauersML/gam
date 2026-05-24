@@ -244,6 +244,7 @@ pub(crate) struct CtnDenseHessianKey {
 }
 
 impl CtnDenseHessianKey {
+    #[expect(dead_code)]
     fn from(
         beta: &Array1<f64>,
         row_quantities: &TransformationNormalRowQuantityCache,
@@ -278,10 +279,12 @@ impl CtnDenseHessianKey {
 /// scale.
 #[derive(Default)]
 pub(crate) struct CtnPersistentDenseHessianCache {
+    #[expect(dead_code)]
     slot: Mutex<Option<(CtnDenseHessianKey, Arc<Array2<f64>>)>>,
 }
 
 impl CtnPersistentDenseHessianCache {
+    #[expect(dead_code)]
     fn get(&self, key: &CtnDenseHessianKey) -> Option<Arc<Array2<f64>>> {
         let slot = self
             .slot
@@ -296,6 +299,7 @@ impl CtnPersistentDenseHessianCache {
         })
     }
 
+    #[expect(dead_code)]
     fn install(&self, key: CtnDenseHessianKey, hessian: Arc<Array2<f64>>) {
         let mut slot = self
             .slot
@@ -387,6 +391,7 @@ pub struct TransformationNormalFamily {
     /// re-creation; keyed on the exact `(β bits, row_quantities version)`
     /// pair. See [`CtnPersistentDenseHessianCache`] for the access-pattern
     /// rationale (single-slot, not LRU).
+    #[expect(dead_code)]
     persistent_dense_hessian: Arc<CtnPersistentDenseHessianCache>,
     /// Optional outer-score Horvitz-Thompson per-row weights.
     ///
@@ -408,6 +413,7 @@ pub struct TransformationNormalFamily {
     /// for the full-data family; `Some(hash)` for subsampled clones. The hash
     /// is over the HT mask + per-row weight bits so that two subsamples with
     /// the same β never alias each other's caches.
+    #[expect(dead_code)]
     outer_subsample_hash: Option<u64>,
 }
 
@@ -423,6 +429,7 @@ struct TransformationNormalRowQuantityCache {
     log_likelihood: f64,
     /// Monotonic version tag set at construction time. Used by the
     /// persistent dense-Hessian cache key.
+    #[expect(dead_code)]
     version: u64,
 }
 
@@ -1342,6 +1349,7 @@ impl TransformationNormalFamily {
     /// Subsample-identity tag (`None` for full-data) used to key the
     /// row-quantity cache and `CtnDenseHessianKey`.
     #[inline]
+    #[expect(dead_code)]
     pub(crate) fn outer_subsample_tag(&self) -> Option<u64> {
         self.outer_subsample_hash
     }
