@@ -5456,7 +5456,7 @@ where
                         lambda = (loop_lambda * madsen_lm_accept_factor(rho)).max(1e-9);
                         // The candidate succeeded; consume the captured arrow-latent
                         // restore handle so it cannot be applied on a later miss.
-                        let _consumed = pending_arrow_latent_restore.take();
+                        drop(pending_arrow_latent_restore.take());
 
                         // Updates for next iteration. Recycle the previous beta
                         // allocation as the next candidate buffer instead of

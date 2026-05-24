@@ -472,6 +472,27 @@ pub fn ift_warm_start_latent(
             };
         }
     }
+    if cache.htt_factors_undamped.len() != n || cache.htbeta.len() != n {
+        return LatentIftOutcome::Noop {
+            reason: "cache block counts mismatch across damped, undamped, and H_tβ factors",
+        };
+    }
+    for factor in cache
+        .htt_factors
+        .iter()
+        .chain(cache.htt_factors_undamped.iter())
+    {
+        if factor.dim() != (d, d) {
+            return LatentIftOutcome::Noop {
+                reason: "cached H_tt factor shape mismatch",
+            };
+        }
+    }
+    if cache.htbeta.iter().any(|block| block.dim() != (d, k)) {
+        return LatentIftOutcome::Noop {
+            reason: "cached H_tβ block shape mismatch",
+        };
+    }
 
     // Sum the two contributions on the RHS, then per-row solve.
     let delta_t = cache.predict_delta_t_combined(delta_beta, delta_gt);
