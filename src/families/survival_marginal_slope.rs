@@ -186,7 +186,9 @@ fn survival_derivative_guard_tolerance(qd1: f64, derivative_guard: f64) -> f64 {
 
 #[inline]
 fn survival_derivative_guard_violated(qd1: f64, derivative_guard: f64) -> bool {
-    qd1 + survival_derivative_guard_tolerance(qd1, derivative_guard) < derivative_guard
+    !qd1.is_finite()
+        | !derivative_guard.is_finite()
+        | (qd1 + survival_derivative_guard_tolerance(qd1, derivative_guard) < derivative_guard)
 }
 
 pub struct SurvivalMarginalSlopeFitResult {

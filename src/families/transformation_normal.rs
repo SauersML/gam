@@ -1104,6 +1104,12 @@ impl TransformationNormalFamily {
         warm_start: Option<&TransformationWarmStart>,
     ) -> Result<Self, String> {
         let n = response_val_basis.nrows();
+        if n == 0 {
+            return Err(TransformationNormalError::InvalidInput {
+                reason: "response basis has zero rows".to_string(),
+            }
+            .into());
+        }
         if response.len() != n {
             return Err(TransformationNormalError::InvalidInput {
                 reason: format!(
