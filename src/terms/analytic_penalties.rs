@@ -4099,10 +4099,16 @@ impl ScadMcpPenalty {
 
     fn grad_one(&self, t: f64, weight: f64) -> f64 {
         let r = self.smooth_abs(t);
+        let eps2 = self.smoothing_eps * self.smoothing_eps;
         match self.variant {
             PenaltyConcavity::Mcp => {
                 if r <= self.gamma * weight {
-                    t * (weight / r - 1.0 / self.gamma)
+                    let concavity_grad = if t * t > eps2 {
+                        t / self.gamma
+                    } else {
+                        0.0
+                    };
+                    weight * t / r - concavity_grad
                 } else {
                     0.0
                 }
@@ -4111,7 +4117,12 @@ impl ScadMcpPenalty {
                 if r <= weight {
                     weight * t / r
                 } else if r <= self.gamma * weight {
-                    (self.gamma * weight - r) * t / ((self.gamma - 1.0) * r)
+                    let concavity_grad = if t * t > eps2 {
+                        t / (self.gamma - 1.0)
+                    } else {
+                        0.0
+                    };
+                    self.gamma * weight * t / ((self.gamma - 1.0) * r) - concavity_grad
                 } else {
                     0.0
                 }
@@ -4125,7 +4136,12 @@ impl ScadMcpPenalty {
         match self.variant {
             PenaltyConcavity::Mcp => {
                 if r <= self.gamma * weight {
-                    weight * eps2 / (r * r * r) - 1.0 / self.gamma
+                    let concavity_hess = if t * t > eps2 {
+                        1.0 / self.gamma
+                    } else {
+                        0.0
+                    };
+                    weight * eps2 / (r * r * r) - concavity_hess
                 } else {
                     0.0
                 }
@@ -4134,9 +4150,13 @@ impl ScadMcpPenalty {
                 if r <= weight {
                     weight * eps2 / (r * r * r)
                 } else if r <= self.gamma * weight {
-                    let p_prime = (self.gamma * weight - r) / (self.gamma - 1.0);
-                    p_prime * eps2 / (r * r * r)
-                        - t * t / ((self.gamma - 1.0) * r * r)
+                    let concavity_hess = if t * t > eps2 {
+                        1.0 / (self.gamma - 1.0)
+                    } else {
+                        0.0
+                    };
+                    self.gamma * weight * eps2 / ((self.gamma - 1.0) * r * r * r)
+                        - concavity_hess
                 } else {
                     0.0
                 }
