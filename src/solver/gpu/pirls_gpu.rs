@@ -127,7 +127,8 @@ mod cuda {
             .map_err(|e| format!("cublas dgemm XtWX: {e}"))?;
 
         let penalty = penalty_with_ridge(input.penalty_hessian, input.lm_ridge);
-        let penalty_col = to_col_major(&penalty.view());
+        let penalty_view = penalty.view();
+        let penalty_col = to_col_major(&penalty_view);
         let penalty_dev = pinned_htod(&ctx, &stream, &*penalty_col)?;
         let mut h_dev = stream
             .alloc_zeros::<f64>(p.checked_mul(p).ok_or("H size overflow")?)
@@ -351,24 +352,27 @@ mod cuda {
         let mut info = stream
             .alloc_zeros::<i32>(1)
             .map_err(|e| format!("cuda alloc potrf info: {e}"))?;
-        let (h_ptr, _h_record) = h.device_ptr_mut(stream);
-        let (work_ptr, _work_record) = workspace.device_ptr_mut(stream);
-        let (info_ptr, _info_record) = info.device_ptr_mut(stream);
-        // SAFETY: cuSOLVER potrf factorization; h is p*p, workspace was allocated with the lwork
-        // size reported by the buffer-size query above, info is a 1-element device i32 buffer.
-        let status = unsafe {
-            cusolver_sys::cusolverDnDpotrf(
-                solver.cu(),
-                uplo,
-                p_i,
-                h_ptr as *mut f64,
-                p_i,
-                work_ptr as *mut f64,
-                lwork,
-                info_ptr as *mut i32,
-            )
-        };
-        check_cusolver(status, "cusolverDnDpotrf")?;
+        {
+            let (h_ptr, _h_record) = h.device_ptr_mut(stream);
+            let (work_ptr, _work_record) = workspace.device_ptr_mut(stream);
+            let (info_ptr, _info_record) = info.device_ptr_mut(stream);
+            // SAFETY: cuSOLVER potrf factorization; h is p*p, workspace was allocated with the
+            // lwork size reported by the buffer-size query above, info is a 1-element device i32
+            // buffer.
+            let status = unsafe {
+                cusolver_sys::cusolverDnDpotrf(
+                    solver.cu(),
+                    uplo,
+                    p_i,
+                    h_ptr as *mut f64,
+                    p_i,
+                    work_ptr as *mut f64,
+                    lwork,
+                    info_ptr as *mut i32,
+                )
+            };
+            check_cusolver(status, "cusolverDnDpotrf")?;
+        }
         let info_host = stream
             .clone_dtoh(&info)
             .map_err(|e| format!("download potrf info: {e}"))?;
@@ -393,25 +397,27 @@ mod cuda {
         let mut info = stream
             .alloc_zeros::<i32>(1)
             .map_err(|e| format!("cuda alloc potrs info: {e}"))?;
-        let (h_ptr, _h_record) = h.device_ptr(stream);
-        let (rhs_ptr, _rhs_record) = rhs.device_ptr_mut(stream);
-        let (info_ptr, _info_record) = info.device_ptr_mut(stream);
-        // SAFETY: cuSOLVER potrs solve; h is a p*p Cholesky factor from potrf above, rhs is
-        // p*nrhs, info is a 1-element device i32 buffer, leading dims match column-major p_i.
-        let status = unsafe {
-            cusolver_sys::cusolverDnDpotrs(
-                solver.cu(),
-                uplo,
-                p_i,
-                nrhs_i,
-                h_ptr as *const f64,
-                p_i,
-                rhs_ptr as *mut f64,
-                p_i,
-                info_ptr as *mut i32,
-            )
-        };
-        check_cusolver(status, "cusolverDnDpotrs")?;
+        {
+            let (h_ptr, _h_record) = h.device_ptr(stream);
+            let (rhs_ptr, _rhs_record) = rhs.device_ptr_mut(stream);
+            let (info_ptr, _info_record) = info.device_ptr_mut(stream);
+            // SAFETY: cuSOLVER potrs solve; h is a p*p Cholesky factor from potrf above, rhs is
+            // p*nrhs, info is a 1-element device i32 buffer, leading dims match column-major p_i.
+            let status = unsafe {
+                cusolver_sys::cusolverDnDpotrs(
+                    solver.cu(),
+                    uplo,
+                    p_i,
+                    nrhs_i,
+                    h_ptr as *const f64,
+                    p_i,
+                    rhs_ptr as *mut f64,
+                    p_i,
+                    info_ptr as *mut i32,
+                )
+            };
+            check_cusolver(status, "cusolverDnDpotrs")?;
+        }
         let info_host = stream
             .clone_dtoh(&info)
             .map_err(|e| format!("download potrs info: {e}"))?;

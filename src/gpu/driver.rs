@@ -135,7 +135,7 @@ impl Drop for CudaWorkingState {
         // SAFETY: self.context was produced by cuCtxCreate in init() and
         // is destroyed exactly once here as part of Self::drop.
         unsafe {
-            drop((self.api.cu_ctx_destroy)(self.context));
+            (self.api.cu_ctx_destroy)(self.context);
         }
     }
 }
@@ -178,13 +178,13 @@ impl Drop for DeviceAllocation<'_> {
         // alive for at least the duration of this borrow; the driver fn
         // pointers were resolved against the same live libcuda handle.
         unsafe {
-            drop((self.state.api.cu_ctx_set_current)(self.state.context));
+            (self.state.api.cu_ctx_set_current)(self.state.context);
         }
         // SAFETY: self.ptr was produced by cuMemAlloc inside Self::new
         // while state.context was current; we have just re-bound that same
         // context (best-effort) and this RAII owner frees exactly once.
         unsafe {
-            drop((self.state.api.cu_mem_free)(self.ptr));
+            (self.state.api.cu_mem_free)(self.ptr);
         }
     }
 }
