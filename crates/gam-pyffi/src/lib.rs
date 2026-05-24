@@ -9883,6 +9883,7 @@ fn smooth_basis_kind_label(basis: &gam::smooth::SmoothBasisSpec) -> &'static str
         S::Sphere { .. } => "sphere",
         S::Matern { .. } => "matern",
         S::Duchon { .. } => "duchon",
+        S::Pca { .. } => "pca",
         S::FactorSmooth { .. } => "factor_smooth",
         S::BySmooth { .. } => "by_smooth",
     }

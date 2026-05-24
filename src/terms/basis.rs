@@ -4472,6 +4472,28 @@ impl LatentCoordDesignDerivative {
         Self::from_jet(latent, jet, ident_transform)
     }
 
+    pub(crate) fn new_pca(
+        latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+        basis_matrix: Arc<Array2<f64>>,
+    ) -> Result<Self, BasisError> {
+        if latent.latent_dim() != basis_matrix.nrows() {
+            return Err(BasisError::DimensionMismatch(format!(
+                "LatentCoordDesignDerivative Pca dimension mismatch: latent d={} basis rows={}",
+                latent.latent_dim(),
+                basis_matrix.nrows()
+            )));
+        }
+        let mut jet = Array3::<f64>::zeros((latent.n_obs(), basis_matrix.ncols(), basis_matrix.nrows()));
+        for row in 0..latent.n_obs() {
+            for axis in 0..basis_matrix.nrows() {
+                for col in 0..basis_matrix.ncols() {
+                    jet[[row, col, axis]] = basis_matrix[[axis, col]];
+                }
+            }
+        }
+        Self::from_jet(latent, jet, None)
+    }
+
     fn from_jet(
         latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
         jet: Array3<f64>,
