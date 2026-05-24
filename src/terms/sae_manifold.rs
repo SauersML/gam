@@ -1456,12 +1456,19 @@ impl SaeManifoldTerm {
                 temperature,
                 alpha,
                 learnable_alpha,
-            } => AnalyticPenaltyKind::IBPAssignment(Arc::new(IBPAssignmentPenalty::new(
-                self.k_atoms(),
-                alpha,
-                temperature,
-                learnable_alpha,
-            ))),
+            } => {
+                let penalty = IBPAssignmentPenalty::new(
+                    self.k_atoms(),
+                    alpha,
+                    temperature,
+                    learnable_alpha,
+                );
+                let penalty = match self.temperature_schedule.clone() {
+                    Some(schedule) => penalty.with_temperature_schedule(schedule),
+                    None => penalty,
+                };
+                AnalyticPenaltyKind::IBPAssignment(Arc::new(penalty))
+            }
         };
         let mut ard = Vec::with_capacity(self.k_atoms());
         for coord in &self.assignment.coords {

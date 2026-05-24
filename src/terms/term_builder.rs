@@ -634,7 +634,12 @@ fn parse_periodic_axes(
                     axes[axis] = true;
                 }
             }
-        } else if dim == 1 && matches!(boundary.first().map(String::as_str), Some("periodic" | "cyclic" | "cc")) {
+        } else if dim == 1
+            && matches!(
+                boundary.first().map(String::as_str),
+                Some("periodic" | "cyclic" | "cc")
+            )
+        {
             axes[0] = true;
         }
     }
@@ -676,7 +681,8 @@ fn parse_periods(
     options: &BTreeMap<String, String>,
     periodic_axes: &[bool],
 ) -> Result<Vec<Option<f64>>, String> {
-    let periods = parse_optional_numeric_list(options, &["period", "periods"], periodic_axes.len())?;
+    let periods =
+        parse_optional_numeric_list(options, &["period", "periods"], periodic_axes.len())?;
     for (axis, (periodic, period)) in periodic_axes.iter().zip(periods.iter()).enumerate() {
         if *periodic
             && let Some(value) = period
@@ -707,7 +713,7 @@ fn parse_period_origins(
     )
 }
 
-fn bspline_bc_declares_periodic_axis(options: &BTreeMap<String, String>) -> bool {
+fn bspline_boundary_declares_periodic_axis(options: &BTreeMap<String, String>) -> bool {
     options
         .get("boundary")
         .or_else(|| options.get("bc"))
@@ -719,12 +725,17 @@ fn bspline_bc_declares_periodic_axis(options: &BTreeMap<String, String>) -> bool
         .unwrap_or(false)
 }
 
-fn parse_f64_option_list(raw: &str) -> Result<Vec<f64>, String> {
+fn parse_f64_option_list(raw: &str) -> Result<Vec<Option<f64>>, String> {
     parse_option_list(raw)
         .into_iter()
         .map(|v| {
-            v.parse::<f64>()
-                .map_err(|err| format!("invalid numeric option list value '{v}': {err}"))
+            if v.eq_ignore_ascii_case("none") {
+                Ok(None)
+            } else {
+                parse_numeric_expr(&v)
+                    .map(Some)
+                    .map_err(|err| format!("invalid numeric option list value '{v}': {err}"))
+            }
         })
         .collect()
 }
@@ -735,10 +746,10 @@ fn tensor_margin_boundaries(
     ds: &Dataset,
 ) -> Result<Vec<OneDimensionalBoundary>, String> {
     let mut out = vec![OneDimensionalBoundary::Open; cols.len()];
-    let Some(raw_bc) = options.get("bc").or_else(|| options.get("boundary")) else {
+    let Some(raw_boundary) = options.get("boundary").or_else(|| options.get("bc")) else {
         return Ok(out);
     };
-    let boundaries = parse_option_list(raw_bc);
+    let boundaries = parse_option_list(raw_boundary);
     if boundaries.len() != cols.len() {
         return Err(format!(
             "te()/tensor() boundary must have one entry per margin: got {} for {} variables",
@@ -761,10 +772,10 @@ fn tensor_margin_boundaries(
     for (i, boundary) in boundaries.iter().enumerate() {
         match boundary.as_str() {
             "periodic" | "cyclic" | "cc" => {
-                let origin = origins.get(i).copied().map(Ok).unwrap_or_else(|| {
+                let origin = origins.get(i).copied().flatten().map(Ok).unwrap_or_else(|| {
                     col_minmax(ds.values.column(cols[i])).map(|(minv, _)| minv)
                 })?;
-                let period = periods.get(i).copied().ok_or_else(|| {
+                let period = periods.get(i).copied().flatten().ok_or_else(|| {
                     "te()/tensor() periodic margins require period=[...] with one positive period per margin".to_string()
                 })?;
                 if !period.is_finite() || period <= 0.0 {
@@ -866,10 +877,11 @@ pub fn build_smooth_basis(
     let has_periodic_option = options.contains_key("periodic")
         || options.contains_key("cyclic")
         || options
-            .get("bc")
-            .map(|bc| {
-                bc.to_ascii_lowercase().contains("periodic")
-                    || bc.to_ascii_lowercase().contains("cyclic")
+            .get("boundary")
+            .or_else(|| options.get("bc"))
+            .map(|boundary| {
+                boundary.to_ascii_lowercase().contains("periodic")
+                    || boundary.to_ascii_lowercase().contains("cyclic")
             })
             .unwrap_or(false);
     let type_opt = options
@@ -1208,7 +1220,7 @@ pub fn build_smooth_basis(
             }
             let periodic_axes = parse_periodic_axes(options, 1).map_err(|e| e.to_string())?;
             let boundary_conditions =
-                if periodic_axes[0] && bspline_bc_declares_periodic_axis(options) {
+                if periodic_axes[0] && bspline_boundary_declares_periodic_axis(options) {
                     BSplineBoundaryConditions::default()
                 } else {
                     parse_bspline_boundary_conditions(options).map_err(|e| e.to_string())?
@@ -1789,13 +1801,13 @@ fn parse_bspline_boundary_conditions(
     let fallback_anchor = option_f64(options, "anchor")
         .or_else(|| option_f64(options, "anchor_value"))
         .or_else(|| option_f64(options, "value"));
-    let global_bc = options
-        .get("bc")
-        .or_else(|| options.get("boundary_conditions"));
+    let global_boundary_conditions = options
+        .get("boundary_conditions")
+        .or_else(|| options.get("bc"));
     let mut boundary_conditions = BSplineBoundaryConditions::default();
 
-    if let Some(raw_bc) = global_bc {
-        let cond = parse_endpoint_side(raw_bc, "bc")?;
+    if let Some(raw_boundary_conditions) = global_boundary_conditions {
+        let cond = parse_endpoint_side(raw_boundary_conditions, "boundary_conditions")?;
         let side = options
             .get("side")
             .map(|s| s.trim().to_ascii_lowercase())
@@ -2240,14 +2252,18 @@ mod tests {
         assert!((periods[0].unwrap() - 2.0 * std::f64::consts::PI).abs() < 1e-12);
         assert_eq!(periods[1], None);
 
-        let mut bc_opts = BTreeMap::new();
-        bc_opts.insert("bc".to_string(), "['periodic', 'natural']".to_string());
-        bc_opts.insert("period".to_string(), "[2*pi, None]".to_string());
-        let bc_axes = parse_periodic_axes(&bc_opts, 2).expect("bc axes");
-        let bc_periods = parse_periods(&bc_opts, &bc_axes).expect("bc periods");
-        assert_eq!(bc_axes, vec![true, false]);
-        assert!((bc_periods[0].unwrap() - 2.0 * std::f64::consts::PI).abs() < 1e-12);
-        assert_eq!(bc_periods[1], None);
+        let mut boundary_opts = BTreeMap::new();
+        boundary_opts.insert(
+            "boundary".to_string(),
+            "['periodic', 'natural']".to_string(),
+        );
+        boundary_opts.insert("period".to_string(), "[2*pi, None]".to_string());
+        let boundary_axes = parse_periodic_axes(&boundary_opts, 2).expect("boundary axes");
+        let boundary_periods =
+            parse_periods(&boundary_opts, &boundary_axes).expect("boundary periods");
+        assert_eq!(boundary_axes, vec![true, false]);
+        assert!((boundary_periods[0].unwrap() - 2.0 * std::f64::consts::PI).abs() < 1e-12);
+        assert_eq!(boundary_periods[1], None);
 
         let mut unicode_opts = BTreeMap::new();
         unicode_opts.insert("periodic".to_string(), "[0,1]".to_string());
@@ -2274,7 +2290,7 @@ mod tests {
     }
 
     #[test]
-    fn one_dimensional_bspline_accepts_bc_periodic_alias() {
+    fn one_dimensional_bspline_accepts_boundary_periodic() {
         let ds = continuous_dataset(
             &["y", "theta"],
             (0..16)
@@ -2284,8 +2300,8 @@ mod tests {
                 })
                 .collect(),
         );
-        let parsed =
-            parse_formula("y ~ s(theta, bc=periodic, period=2*pi, origin=0, k=8)").expect("parse");
+        let parsed = parse_formula("y ~ s(theta, boundary=periodic, period=2*pi, origin=0, k=8)")
+            .expect("parse");
         let col_map = ds.column_map();
         let mut notes = Vec::new();
         let terms = build_termspec(
@@ -2295,7 +2311,7 @@ mod tests {
             &mut notes,
             &crate::resource::ResourcePolicy::default_library(),
         )
-        .expect("periodic bc alias should build");
+        .expect("periodic boundary should build");
         let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
             panic!("expected 1D B-spline");
         };
@@ -2463,7 +2479,7 @@ mod tests {
     #[test]
     fn parse_tensor_periods_and_origins_aliases() {
         let mut opts = BTreeMap::new();
-        opts.insert("bc".to_string(), "['periodic', 'periodic']".to_string());
+        opts.insert("boundary".to_string(), "['periodic', 'periodic']".to_string());
         opts.insert("periods".to_string(), "[7, 24]".to_string());
         opts.insert("origins".to_string(), "[0, -12]".to_string());
         let axes = parse_periodic_axes(&opts, 2).expect("axes");
@@ -2619,13 +2635,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_bspline_boundary_aliases_and_side_selector() {
+    fn parse_bspline_boundary_conditions_and_side_selector() {
         // Non-zero anchors are rejected at parse time; the diagnostic must
         // name the side and value, which doubles as a check that the
         // `side=left` filter routes the global `anchor=` value to the
         // left endpoint (not the right).
         let mut opts = BTreeMap::new();
-        opts.insert("bc".to_string(), "anchored".to_string());
+        opts.insert("boundary_conditions".to_string(), "anchored".to_string());
         opts.insert("side".to_string(), "left".to_string());
         opts.insert("anchor".to_string(), "2.5".to_string());
         let err = parse_bspline_boundary_conditions(&opts)
@@ -2657,7 +2673,7 @@ mod tests {
         let mut opts = BTreeMap::new();
         opts.insert("start_bc".to_string(), "clamped".to_string());
         opts.insert("end_bc".to_string(), "zero".to_string());
-        let parsed = parse_bspline_boundary_conditions(&opts).expect("boundary aliases");
+        let parsed = parse_bspline_boundary_conditions(&opts).expect("boundary conditions");
         assert!(matches!(
             parsed.left,
             BSplineEndpointBoundaryCondition::Clamped
@@ -2692,7 +2708,7 @@ mod tests {
     #[test]
     fn parses_global_clamped_with_side_selector() {
         let mut options = BTreeMap::new();
-        options.insert("bc".to_string(), "clamped".to_string());
+        options.insert("boundary_conditions".to_string(), "clamped".to_string());
         options.insert("side".to_string(), "right".to_string());
         let parsed = parse_bspline_boundary_conditions(&options).expect("boundary options");
         assert_eq!(

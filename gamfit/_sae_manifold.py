@@ -824,7 +824,10 @@ def _normalize_gumbel_schedule(
     if decay == "exponential":
         decay = "geometric"
     tau_start = float(_require_schedule_key(schedule, "tau_start"))
-    tau_min = float(schedule.get("tau_min", schedule.get("tau_end")))
+    raw_tau_min = schedule.get("tau_min", schedule.get("tau_end"))
+    if raw_tau_min is None:
+        raise ValueError("gumbel_schedule is missing required key 'tau_min'")
+    tau_min = float(raw_tau_min)
     if not np.isfinite(tau_start) or tau_start <= 0.0:
         raise ValueError("gumbel_schedule['tau_start'] must be finite and positive")
     if not np.isfinite(tau_min) or tau_min <= 0.0:
