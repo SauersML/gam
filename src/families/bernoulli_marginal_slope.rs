@@ -14063,6 +14063,18 @@ impl BernoulliMarginalSlopeFamily {
         })
     }
 
+    fn run_psi_row_pass_for_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        options: &BlockwiseFitOptions,
+        axes: &[PsiAxisSpec],
+    ) -> Result<Vec<ExactNewtonJointPsiTerms>, String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let n = self.y.len();
+        let k = axes.len();
+
         // Eager-prime the per-row uncontracted third-derivative cache *before*
         // entering the per-axis row `par_iter` so the build's own `par_iter`
         // does not nest inside an active rayon job. Subsequent ψ-axis sweeps
@@ -14074,12 +14086,12 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         // Block-local accumulator path: avoids O(n p^2) dense Hessian
-        let row_iter = outer_row_indices(options, n).to_vec();
-        let outer_scale = outer_score_scale(options, n);
-        let (mut objective_psi, mut score_psi, mut block_acc) = row_iter
-            .into_par_iter()
-            .try_fold(
-                || {
+        // materialization by keeping one accumulator per ψ axis in the
+        // rayon fold.
+        let weighted_rows = outer_weighted_rows(options, n);
+        let make_acc = || -> Vec<(f64, Array1<f64>, BernoulliBlockHessianAccumulator)> {
+            (0..k)
+                .map(|_| {
                     (
                         0.0f64,
                         Array1::<f64>::zeros(slices.total),
