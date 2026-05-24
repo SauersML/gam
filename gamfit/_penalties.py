@@ -273,8 +273,9 @@ class ScadMcpPenalty:
     ``SparsityPenalty`` uses Huber-smoothed L¹, whose gradient keeps pulling
     large coefficients toward zero. MCP (Zhang 2010) and SCAD (Fan-Li 2001)
     flatten that gradient for large coefficients, giving less-biased true
-    signals while still shrinking near-zero noise. Fan-Li recommend
-    ``gamma=3.7`` for SCAD; larger ``gamma`` approaches L¹.
+    signals while still shrinking near-zero noise.
+    Default ``gamma``: MCP uses 2.5 (Zhang 2010 §3);
+    SCAD uses 3.7 (Fan-Li 2001 §3.1).
     """
 
     target: TargetSpec
@@ -289,7 +290,7 @@ class ScadMcpPenalty:
         self,
         weight: float,
         n_eff: int,
-        gamma: float = 3.7,
+        gamma: float | None = None,
         variant: Literal["mcp", "scad"] = "mcp",
         smoothing_eps: float = 1e-6,
         learnable: bool = False,
@@ -299,8 +300,14 @@ class ScadMcpPenalty:
         self.target = target
         self.weight = float(weight)
         self.n_eff = int(n_eff)
-        self.gamma = float(gamma)
         self.variant = variant
+        if gamma is None:
+            if self.variant not in ("mcp", "scad"):
+                raise ValueError(
+                    f"ScadMcpPenalty.variant must be 'mcp' or 'scad', got {self.variant!r}"
+                )
+            gamma = {"mcp": 2.5, "scad": 3.7}[self.variant]
+        self.gamma = float(gamma)
         self.smoothing_eps = float(smoothing_eps)
         self.learnable = bool(learnable)
         self.__post_init__()

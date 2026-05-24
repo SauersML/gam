@@ -3231,24 +3231,24 @@ fn build_standard_latent_analytic_penalty_registry(
             "scad_mcp" => {
                 let weight = analytic_descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = analytic_descriptor_usize(descriptor, "n_eff", target.n)?;
-                let gamma = analytic_descriptor_f64(descriptor, "gamma", 3.7)?;
-                let smoothing_eps =
-                    analytic_descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
                 let variant = descriptor
                     .get("variant")
                     .and_then(JsonValue::as_str)
                     .unwrap_or("mcp")
                     .to_ascii_lowercase()
                     .replace('-', "_");
-                let variant = match variant.as_str() {
-                    "mcp" => PenaltyConcavity::Mcp,
-                    "scad" => PenaltyConcavity::Scad,
+                let (variant, gamma_default) = match variant.as_str() {
+                    "mcp" => (PenaltyConcavity::Mcp, 2.5),
+                    "scad" => (PenaltyConcavity::Scad, 3.7),
                     other => {
                         return Err(format!(
                             "{context}.variant must be 'mcp' or 'scad'; got {other:?}"
                         ));
                     }
                 };
+                let gamma = analytic_descriptor_f64(descriptor, "gamma", gamma_default)?;
+                let smoothing_eps =
+                    analytic_descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
                 let learnable = descriptor
                     .get("learnable")
                     .and_then(JsonValue::as_bool)
