@@ -420,7 +420,10 @@ struct ClenshawCurtisRule {
 }
 
 fn compute_clenshaw_curtis_n(n: usize) -> ClenshawCurtisRule {
-    assert!(n >= 2);
+    assert!(
+        n >= 2,
+        "Clenshaw-Curtis rule requires at least two nodes: n={n}"
+    );
     // Classic cosine-grid Clenshaw-Curtis rule on [-1, 1].
     //
     // The nodes are
@@ -2846,7 +2849,12 @@ pub fn integrated_family_moments_jetwith_state(
     sas_link_state: Option<&SasLinkState>,
 ) -> Result<IntegratedMomentsJet, EstimationError> {
     const PROB_EPS: f64 = 1e-12;
-    let e = eta.clamp(-700.0, 700.0);
+    if !(eta.is_finite() && (-700.0..=700.0).contains(&eta)) {
+        return Err(EstimationError::InvalidInput(format!(
+            "integrated moments eta must be finite and within [-700, 700]; got {eta}"
+        )));
+    }
+    let e = eta;
     let se = se_eta.max(0.0);
     match family {
         LikelihoodFamily::BinomialLogit => {

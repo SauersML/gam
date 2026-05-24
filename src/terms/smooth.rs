@@ -15212,8 +15212,19 @@ fn try_exact_joint_spatial_aniso_optimization(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
     // Use bounds and design metadata for validation.
-    assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
-    assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
+    assert!(
+        lower.len() == theta0.len() && upper.len() == theta0.len(),
+        "spatial hyperparameter bounds must match theta length: lower_len={}, upper_len={}, theta_len={}",
+        lower.len(),
+        upper.len(),
+        theta0.len()
+    );
+    assert!(
+        baseline_design.smooth.terms.len() >= spatial_terms.len(),
+        "baseline design must have at least one smooth term per spatial term: baseline_terms={}, spatial_terms={}",
+        baseline_design.smooth.terms.len(),
+        spatial_terms.len()
+    );
     use crate::solver::outer_strategy::{
         DeclaredHessianForm, Derivative, OuterEval, OuterEvalOrder,
     };
@@ -15560,8 +15571,19 @@ fn try_exact_joint_spatial_isotropic_optimization(
     rho_dim: usize,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<(Array1<f64>, f64), EstimationError> {
-    assert!(lower.len() == theta0.len() && upper.len() == theta0.len());
-    assert!(baseline_design.smooth.terms.len() >= spatial_terms.len());
+    assert!(
+        lower.len() == theta0.len() && upper.len() == theta0.len(),
+        "spatial hyperparameter bounds must match theta length: lower_len={}, upper_len={}, theta_len={}",
+        lower.len(),
+        upper.len(),
+        theta0.len()
+    );
+    assert!(
+        baseline_design.smooth.terms.len() >= spatial_terms.len(),
+        "baseline design must have at least one smooth term per spatial term: baseline_terms={}, spatial_terms={}",
+        baseline_design.smooth.terms.len(),
+        spatial_terms.len()
+    );
     use crate::solver::outer_strategy::{
         DeclaredHessianForm, Derivative, OuterEval, OuterEvalOrder,
     };

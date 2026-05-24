@@ -184,7 +184,7 @@ pub struct AtomRecord {
 
 impl AtomRecord {
     pub fn new(shape: ShapeRef, coords: LatentCoordValues) -> Self {
-        debug_assert_eq!(
+        assert_eq!(
             coords.latent_dim(),
             shape.intrinsic_dim,
             "AtomRecord: coord latent_dim {} != shape.intrinsic_dim {}",
@@ -400,7 +400,10 @@ pub struct EntropicSoftmax {
 
 impl EntropicSoftmax {
     pub fn new(temperature: f64) -> Self {
-        debug_assert!(temperature > 0.0);
+        assert!(
+            temperature.is_finite() && temperature > 0.0,
+            "EntropicSoftmax temperature must be finite and positive, got {temperature}"
+        );
         Self {
             temperature,
             mask_threshold: None,
@@ -408,6 +411,10 @@ impl EntropicSoftmax {
     }
 
     pub fn with_mask_threshold(mut self, thr: f64) -> Self {
+        assert!(
+            thr.is_finite(),
+            "EntropicSoftmax mask threshold must be finite, got {thr}"
+        );
         self.mask_threshold = Some(thr);
         self
     }
@@ -539,7 +546,7 @@ pub struct TopK {
 
 impl TopK {
     pub fn new(k: usize) -> Self {
-        debug_assert!(k > 0);
+        assert!(k > 0, "TopK requires k > 0");
         Self { k }
     }
 
