@@ -5055,47 +5055,6 @@ fn tensor_product_design_from_marginals(
     Ok(design)
 }
 
-fn sorted_levels_from_column(
-    #[expect(dead_code)]
-    col: ArrayView1<'_, f64>,
-    frozen: Option<&Vec<u64>>,
-) -> Result<Vec<u64>, BasisError> {
-    let mut levels: Vec<u64> = if let Some(v) = frozen {
-        v.clone()
-    } else {
-        let mut set = BTreeSet::new();
-        for &x in col {
-            if !x.is_finite() {
-                return Err(BasisError::InvalidInput(
-                    "factor smooth group column contains non-finite values".to_string(),
-                ));
-            }
-            set.insert(x.to_bits());
-        }
-        set.into_iter().collect()
-    };
-    levels.sort_unstable();
-    levels.dedup();
-    if levels.is_empty() {
-        return Err(BasisError::InvalidInput(
-            "factor smooth has no observed levels".to_string(),
-        ));
-    }
-    Ok(levels)
-}
-
-fn block_diag_repeat(base: &Array2<f64>, repeat: usize) -> Array2<f64> {
-    #[expect(dead_code)]
-    let p = base.nrows();
-    let mut out = Array2::<f64>::zeros((p * repeat, p * repeat));
-    for r in 0..repeat {
-        let start = r * p;
-        out.slice_mut(s![start..start + p, start..start + p])
-            .assign(base);
-    }
-    out
-}
-
 fn build_random_effect_block(
     data: ArrayView2<'_, f64>,
     spec: &RandomEffectTermSpec,
@@ -5174,79 +5133,6 @@ fn build_random_effect_block(
         num_groups: q,
         kept_levels,
     })
-}
-
-fn sorted_factor_levels(
-    #[expect(dead_code)]
-    data: ArrayView2<'_, f64>,
-    feature_col: usize,
-    frozen: Option<&Vec<u64>>,
-    drop_first: bool,
-) -> Result<Vec<u64>, BasisError> {
-    if feature_col >= data.ncols() {
-        return Err(BasisError::DimensionMismatch(format!(
-            "factor column {feature_col} out of bounds for {} columns",
-            data.ncols()
-        )));
-    }
-    let mut levels = if let Some(levels) = frozen {
-        levels.clone()
-    } else {
-        let mut set = BTreeSet::<u64>::new();
-        for &v in data.column(feature_col) {
-            if !v.is_finite() {
-                return Err(BasisError::InvalidInput(
-                    "factor smooth contains non-finite group values".to_string(),
-                ));
-            }
-            set.insert(v.to_bits());
-        }
-        let all: Vec<u64> = set.into_iter().collect();
-        if drop_first && all.len() > 1 {
-            all[1..].to_vec()
-        } else {
-            all
-        }
-    };
-    levels.sort_unstable();
-    levels.dedup();
-    if levels.is_empty() {
-        return Err(BasisError::InvalidInput(
-            "factor smooth has no retained levels".to_string(),
-        ));
-    }
-    Ok(levels)
-}
-
-fn block_diag_penalty(base: &Array2<f64>, blocks: usize) -> Array2<f64> {
-    #[expect(dead_code)]
-    let p = base.nrows();
-    let mut out = Array2::<f64>::zeros((p * blocks, p * blocks));
-    for b in 0..blocks {
-        let off = b * p;
-        out.slice_mut(s![off..off + p, off..off + p]).assign(base);
-    }
-    out
-}
-
-fn dense_by_factor_design(
-    #[expect(dead_code)]
-    inner: &Array2<f64>,
-    groups: &[Option<usize>],
-    levels: usize,
-) -> Array2<f64> {
-    let n = inner.nrows();
-    let p = inner.ncols();
-    let mut out = Array2::<f64>::zeros((n, p * levels));
-    for i in 0..n {
-        if let Some(g) = groups[i] {
-            let off = g * p;
-            for j in 0..p {
-                out[[i, off + j]] = inner[[i, j]];
-            }
-        }
-    }
-    out
 }
 
 impl SmoothDesign {

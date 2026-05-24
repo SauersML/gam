@@ -1145,7 +1145,6 @@ struct BernoulliMarginalSlopeFamily {
     /// joint β snapshot and the subsample Arc identity carried on the
     /// options — a change in either invalidates the entry and forces a
     /// fresh build on next access.
-    #[expect(dead_code)]
     shared_eval_cache: Arc<Mutex<Option<SharedEvalCacheEntry>>>,
 }
 
@@ -1155,16 +1154,13 @@ struct SharedEvalCacheFingerprint {
     /// cache build (row contexts + per-row jets + cell moments) is a pure
     /// function of β + design + options, so byte-equal β + matching
     /// subsample identity → identical cache.
-    #[expect(dead_code)]
     betas: Vec<Array1<f64>>,
     /// Pointer identity of the per-eval outer-score subsample Arc, if any.
     /// `None` is distinct from `Some(_)` and from a different `Some` Arc.
-    #[expect(dead_code)]
     subsample: Option<usize>,
 }
 
 impl SharedEvalCacheFingerprint {
-    #[expect(dead_code)]
     fn from_inputs(block_states: &[ParameterBlockState], options: &BlockwiseFitOptions) -> Self {
         let betas = block_states.iter().map(|s| s.beta.clone()).collect();
         let subsample = options
@@ -1174,7 +1170,6 @@ impl SharedEvalCacheFingerprint {
         Self { betas, subsample }
     }
 
-    #[expect(dead_code)]
     fn matches(&self, other: &Self) -> bool {
         if self.subsample != other.subsample {
             return false;
@@ -1198,14 +1193,11 @@ impl SharedEvalCacheFingerprint {
 }
 
 struct SharedEvalCacheEntry {
-    #[expect(dead_code)]
     fingerprint: SharedEvalCacheFingerprint,
-    #[expect(dead_code)]
     cache: Arc<BernoulliMarginalSlopeExactEvalCache>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[expect(dead_code)]
 struct CacheFingerprint {
     beta_hash: u64,
     block_count: usize,
@@ -4677,14 +4669,12 @@ struct BernoulliMarginalSlopeFlexRowScratch {
     zero_family: Vec<[f64; 4]>,
 }
 
-#[expect(dead_code)]
 struct EmpiricalFlexDirectionScratch {
     basis_u: Array1<f64>,
     basis_v: Array1<f64>,
 }
 
 impl EmpiricalFlexDirectionScratch {
-    #[expect(dead_code)]
     fn new(primary_dim: usize) -> Self {
         Self {
             basis_u: Array1::zeros(primary_dim),
@@ -5345,7 +5335,6 @@ struct BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     options: BlockwiseFitOptions,
 }
 
-#[expect(dead_code)]
 struct BernoulliMarginalSlopeLineSearchWorkspace {
     family: BernoulliMarginalSlopeFamily,
     block_states: Vec<ParameterBlockState>,
@@ -15932,7 +15921,6 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
 }
 
 impl BernoulliMarginalSlopeLineSearchWorkspace {
-    #[expect(dead_code)]
     fn materialized(
         &self,
     ) -> Result<&Arc<BernoulliMarginalSlopeExactNewtonJointHessianWorkspace>, String> {
