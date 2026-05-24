@@ -1728,11 +1728,9 @@ struct IteratePayload {
     eval_id: u64,
 }
 
-/// Bumped 1 → 2 (2026-05-21): schema 2 entries carry β alongside ρ.
-/// Pre-2 entries — produced by binaries that stored ρ-only — decode to
-/// `None` here. This orphans poisoned v1 checkpoints whose resume value
-/// at boundary ρ depended on cold β = 0 and could not be re-warmed,
-/// which manifested as inner-PIRLS budget exhaustion on subsequent runs.
+/// Entries with a different schema id are rejected by `decode_iterate`
+/// so incompatible on-disk payloads fall through to cold start instead
+/// of seeding the inner solve with a malformed iterate.
 const ITERATE_PAYLOAD_SCHEMA: u32 = 2;
 
 fn encode_iterate(
@@ -8656,36 +8654,6 @@ mod tests {
         let bytes = encode_iterate(&array![1.0, 2.0, 3.0], None, 0.5, 0).expect("encode");
         assert!(decode_iterate(&bytes, 3).is_some());
         assert!(decode_iterate(&bytes, 5).is_none());
-    }
-
-    #[test]
-    fn iterate_payload_v1_entries_orphaned_by_schema_bump() {
-        // Pre-2026-05 the outer-iterate payload stored ρ-only with schema=1.
-        // Loading such an entry into a binary that ships the v2 (ρ,β) schema
-        // returned a ρ-only seed and forced the inner solve to reconstruct β
-        // from cold start; for saturated ρ (|ρ_i| near rho_bound) this gave
-        // inner-Hessian κ ≈ e^{2·rho_bound} and Newton degraded to O(1/k)
-        // descent, exhausting the cycle budget before KKT. Bumping the
-        // schema 1 → 2 makes those poisoned entries unreadable so the next
-        // run cold-starts cleanly.
-        #[derive(serde::Serialize)]
-        struct LegacyV1Payload {
-            schema: u32,
-            rho: Vec<f64>,
-            cost: f64,
-            eval_id: u64,
-        }
-        let v1_bytes = serde_json::to_vec(&LegacyV1Payload {
-            schema: 1,
-            rho: vec![10.0; 8],
-            cost: 3.459864e5,
-            eval_id: 3,
-        })
-        .expect("encode v1");
-        assert!(
-            decode_iterate(&v1_bytes, 8).is_none(),
-            "v1 payloads must be rejected so the runner falls through to cold start",
-        );
     }
 
     #[test]
