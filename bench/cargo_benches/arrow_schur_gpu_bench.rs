@@ -64,9 +64,11 @@ fn bench_arrow_gpu(c: &mut Criterion) {
             configure_device(Device::Cuda);
             let start = Instant::now();
             for _ in 0..iters {
-                black_box(gam::solver::gpu::arrow_schur_gpu::solve_arrow_newton_step_gpu(
-                    &sys, 1e-8, 1e-8,
-                ));
+                black_box(
+                    gam::solver::gpu::arrow_schur_gpu::solve_arrow_newton_step_gpu(
+                        &sys, 1e-8, 1e-8,
+                    ),
+                );
             }
             start.elapsed()
         })

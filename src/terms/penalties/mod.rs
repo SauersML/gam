@@ -14,6 +14,7 @@ pub mod isometry;
 pub mod ivae_ridge_mean_gauge;
 pub mod jump_relu;
 pub mod mechanism_sparsity;
+pub mod nested_prefix;
 pub mod nuclear_norm;
 pub mod orthogonality;
 pub mod parametric_row_precision_prior;
@@ -49,6 +50,7 @@ macro_rules! analytic_penalty_registry {
             register!(NuclearNorm, NuclearNormPenalty);
             register!(BlockSparsity, BlockSparsityPenalty);
             register!(MechanismSparsity, MechanismSparsityPenalty);
+            register!(NestedPrefix, NestedPrefixPenalty);
             register!(RowPrecisionPrior, RowPrecisionPriorPenalty);
             register!(IvaeRidgeMeanGauge, IvaeRidgeMeanGauge);
             register!(ParametricRowPrecisionPrior, ParametricRowPrecisionPriorPenalty);

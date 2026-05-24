@@ -23,11 +23,20 @@ fn assert_arrays_close(a: &Array2<f64>, b: &Array2<f64>, tol: f64) {
 fn assert_vec_close(a: &Array1<f64>, b: &Array1<f64>, tol: f64) {
     assert_eq!(a.len(), b.len());
     for i in 0..a.len() {
-        assert!(close(a[i], b[i], tol), "vector mismatch at {i}: {} vs {}", a[i], b[i]);
+        assert!(
+            close(a[i], b[i], tol),
+            "vector mismatch at {i}: {} vs {}",
+            a[i],
+            b[i]
+        );
     }
 }
 
-fn synthetic_case(n: usize, p: usize, ridge: f64) -> (Array2<f64>, Array1<f64>, Array2<f64>, Array1<f64>) {
+fn synthetic_case(
+    n: usize,
+    p: usize,
+    ridge: f64,
+) -> (Array2<f64>, Array1<f64>, Array2<f64>, Array1<f64>) {
     let x = Array2::from_shape_fn((n, p), |(i, j)| {
         let phase = (i as f64 + 1.0) * 0.173 + (j as f64 + 1.0) * 0.379;
         phase.sin() * 0.4 + phase.cos() * 0.07
@@ -109,7 +118,9 @@ fn pirls_gpu_matches_cpu_across_stability_grid() {
             for ridge in [0.25_f64, 2.0] {
                 let (x, weights, penalty, gradient) = synthetic_case(n, p, ridge);
                 let xtwx_cpu = cpu_xtwx(&x, &weights);
-                let xtwx_gpu = gam::solver::gpu::pirls_gpu::weighted_crossprod_gpu(x.view(), weights.view()).unwrap();
+                let xtwx_gpu =
+                    gam::solver::gpu::pirls_gpu::weighted_crossprod_gpu(x.view(), weights.view())
+                        .unwrap();
                 assert_arrays_close(&xtwx_gpu, &xtwx_cpu, 1e-8);
 
                 let mut h_cpu = xtwx_cpu.clone();
@@ -151,7 +162,12 @@ fn reml_gpu_logdet_and_score_match_cpu() {
         let ht = h.t().to_owned();
         h = (&h + &ht) * 0.5;
         let derivatives: Vec<Array2<f64>> = (0..3)
-            .map(|a| Array2::from_shape_fn((p, p), |(i, j)| if i == j && i % 3 == a { 1.0 } else { 0.0 }))
+            .map(|a| {
+                Array2::from_shape_fn(
+                    (p, p),
+                    |(i, j)| if i == j && i % 3 == a { 1.0 } else { 0.0 },
+                )
+            })
             .collect();
         let rhs_views: Vec<_> = derivatives.iter().map(|m| m.view()).collect();
         let evidence = gam::solver::gpu::reml_gpu::evidence_derivatives_gpu(

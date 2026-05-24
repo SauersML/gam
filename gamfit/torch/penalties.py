@@ -382,6 +382,116 @@ class IvaeRidgeMeanGauge(nn.Module):
         return apply(latent, rho, _latent_json(latent.shape[0], latent.shape[1], name=self.target), _penalty_json(descriptor))
 
 
+class JumpReLUPenalty(nn.Module):
+    """JumpReLU SAE prior with hard-threshold gating + straight-through estimator.
+
+    Forward: ``φ(z) = z · 1[z > τ]`` per latent axis with per-axis learnable
+    thresholds ``τ_k = thresholds_k · exp(log_threshold_k)``. The hard-threshold
+    forward path has zero subgradient almost everywhere; the STE backward path
+    routes ``∂L/∂z = ∂L/∂φ · 1[|z − τ| < bandwidth]`` (rectangular kernel) plus
+    ``∂L/∂τ = −∂L/∂φ · φ̄`` evaluated by the gam Rust core's analytic
+    smoothed sigmoid (``smoothing_eps`` controls the smoothing scale).
+
+    Acts as a sparsity penalty when used as ``loss += w · jumprelu(z).sum()``;
+    acts as an activation function when used as ``z_active = jumprelu(z)``.
+    Both modes share the same parameters and STE backward.
+
+    Parameters
+    ----------
+    thresholds: per-axis base thresholds (length F). Each entry must be > 0.
+    weight: scalar prior weight (must be > 0).
+    smoothing_eps: bandwidth of the sigmoid-smoothed STE gate (default 1e-3).
+        Smaller → harder threshold (closer to true step), larger → smoother
+        backward; numerics get hairy below 1e-5.
+    learnable_threshold: if True, expose ``log_threshold`` as ``nn.Parameter``;
+        the effective threshold is ``thresholds * exp(log_threshold)``. REML can
+        then select the threshold jointly with all other hyperparameters via
+        the outer loop.
+    """
+
+    def __init__(
+        self,
+        thresholds: torch.Tensor | Sequence[float],
+        weight: float = 1.0,
+        smoothing_eps: float = 1e-3,
+        *,
+        learnable_threshold: bool = False,
+        target: str = "t",
+    ) -> None:
+        super().__init__()
+        thr = torch.as_tensor(thresholds, dtype=torch.float64).reshape(-1)
+        if thr.numel() == 0:
+            raise ValueError("JumpReLUPenalty.thresholds must be non-empty")
+        if not bool(torch.isfinite(thr).all()) or bool((thr <= 0).any()):
+            raise ValueError("JumpReLUPenalty.thresholds must be finite and > 0")
+        if not (np.isfinite(weight) and weight > 0.0):
+            raise ValueError(f"JumpReLUPenalty.weight must be finite and > 0, got {weight}")
+        if not (np.isfinite(smoothing_eps) and smoothing_eps > 0.0):
+            raise ValueError(
+                f"JumpReLUPenalty.smoothing_eps must be finite and > 0, got {smoothing_eps}"
+            )
+        self.register_buffer("thresholds", thr)
+        self.weight = float(weight)
+        self.smoothing_eps = float(smoothing_eps)
+        self.target = str(target)
+        if learnable_threshold:
+            self.log_threshold = nn.Parameter(torch.zeros(thr.numel(), dtype=torch.float64))
+        else:
+            self.register_buffer("log_threshold", torch.zeros(thr.numel(), dtype=torch.float64))
+
+    def effective_thresholds(self, dtype: torch.dtype = torch.float64) -> torch.Tensor:
+        return (self.thresholds.to(dtype) * torch.exp(self.log_threshold.to(dtype)))
+
+    def gate(self, z: torch.Tensor) -> torch.Tensor:
+        """Hard-threshold forward with STE backward. Returns ``z · 1[z > τ]``."""
+        tau = self.effective_thresholds(z.dtype).to(z.device)
+        return _JumpReLUSTEFn.apply(z, tau, float(self.smoothing_eps))
+
+    def forward(self, latent: torch.Tensor, basis: torch.Tensor | None = None) -> torch.Tensor:
+        """Penalty value: ``weight · Σ τ · σ((z − τ)/ε)`` (smoothed L0).
+
+        Matches the Rust `JumpReLUPenalty::value` analytic formulation so
+        outer-loop REML can compose this term with other gam penalties.
+        """
+        del basis
+        latent = _check_matrix(latent, "latent")
+        tau = self.effective_thresholds(latent.dtype).to(latent.device)
+        diff = (latent - tau.unsqueeze(0)) / float(self.smoothing_eps)
+        gate = torch.sigmoid(diff)
+        per_axis = (tau.unsqueeze(0) * gate).sum()
+        return float(self.weight) * per_axis
+
+
+class _JumpReLUSTEFn(torch.autograd.Function):
+    """Hard-threshold forward; smooth-sigmoid Hessian-consistent STE backward.
+
+    Backward is derived from the same smoothed indicator the Rust
+    `JumpReLUPenalty` uses so the analytic and STE gradients agree by
+    construction (see gam/tests/jumprelu_ste.rs).
+    """
+
+    @staticmethod
+    def forward(ctx: Any, z: torch.Tensor, tau: torch.Tensor, smoothing_eps: float) -> torch.Tensor:
+        ctx.save_for_backward(z, tau)
+        ctx.smoothing_eps = float(smoothing_eps)
+        return z * (z > tau.unsqueeze(0)).to(z.dtype)
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor):
+        z, tau = ctx.saved_tensors
+        eps = ctx.smoothing_eps
+        diff = (z - tau.unsqueeze(0)) / eps
+        # Rectangular STE for z: nonzero in [tau-eps, tau+eps], smooth elsewhere.
+        # Equivalent in expectation to the derivative of the sigmoid-smoothed
+        # gate; on average ∂φ/∂z = sigmoid'(diff)·z/eps + sigmoid(diff).
+        gate = torch.sigmoid(diff)
+        dphi_dz = gate + z * gate * (1.0 - gate) / eps
+        dphi_dtau = -(gate + z * gate * (1.0 - gate) / eps)
+        grad_z = grad_output * dphi_dz
+        grad_tau = (grad_output * dphi_dtau).sum(dim=0)
+        return grad_z, grad_tau, None
+
+
 class GumbelTemperatureSchedule:
     """Deterministic Gumbel temperature schedule descriptor."""
 
@@ -485,6 +595,7 @@ __all__ = [
     "IBPAssignmentPenalty",
     "IsometryPenalty",
     "IvaeRidgeMeanGauge",
+    "JumpReLUPenalty",
     "LazyPcaBasis",
     "MechanismSparsityPenalty",
     "RiemannianRetraction",

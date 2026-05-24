@@ -8,7 +8,7 @@
 
 use std::fmt;
 use std::sync::Once;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 pub mod arrow_schur_gpu;
@@ -42,15 +42,24 @@ impl fmt::Display for Device {
     }
 }
 
-static DEVICE: OnceLock<Device> = OnceLock::new();
+static DEVICE: AtomicU8 = AtomicU8::new(0);
 
 pub fn configure_device(device: Device) {
-    drop(DEVICE.set(device));
+    DEVICE.store(
+        match device {
+            Device::Cpu => 0,
+            Device::Cuda => 1,
+        },
+        Ordering::Relaxed,
+    );
 }
 
 #[must_use]
 pub fn selected_device() -> Device {
-    *DEVICE.get_or_init(Device::default)
+    match DEVICE.load(Ordering::Relaxed) {
+        1 => Device::Cuda,
+        _ => Device::Cpu,
+    }
 }
 
 #[inline]

@@ -10851,6 +10851,10 @@ pub fn calculate_deviance(
     priorweights: ArrayView1<f64>,
 ) -> f64 {
     const EPS: f64 = 1e-8;
+    // Match the μ floor used by PIRLS log-link working-state writers
+    // (`MIN_MU = 1e-10` in update_working_state_*_log) so deviance / weights
+    // stay self-consistent when the linear predictor saturates.
+    const MU_FLOOR: f64 = 1e-10;
     match likelihood.family {
         GlmLikelihoodFamily::BinomialLogit
         | GlmLikelihoodFamily::BinomialProbit
@@ -10896,7 +10900,7 @@ pub fn calculate_deviance(
                 .into_par_iter()
                 .map(|i| {
                     let yi = y[i];
-                    let mui_c = mu[i].max(EPS);
+                    let mui_c = mu[i].max(MU_FLOOR);
                     priorweights[i] * poisson_unit_deviance(yi, mui_c)
                 })
                 .sum();
@@ -10915,7 +10919,7 @@ pub fn calculate_deviance(
                 .into_par_iter()
                 .map(|i| {
                     let yi = y[i];
-                    let mui_c = mu[i].max(EPS);
+                    let mui_c = mu[i].max(MU_FLOOR);
                     priorweights[i] * tweedie_unit_deviance(yi, mui_c, p) / phi
                 })
                 .sum();
@@ -10927,7 +10931,7 @@ pub fn calculate_deviance(
                 .into_par_iter()
                 .map(|i| {
                     let yi = y[i];
-                    let mui_c = mu[i].max(EPS);
+                    let mui_c = mu[i].max(MU_FLOOR);
                     priorweights[i] * negative_binomial_unit_deviance(yi, mui_c, theta)
                 })
                 .sum();
@@ -10951,7 +10955,7 @@ pub fn calculate_deviance(
                 .into_par_iter()
                 .map(|i| {
                     let yi_c = y[i].max(EPS);
-                    let mui_c = mu[i].max(EPS);
+                    let mui_c = mu[i].max(MU_FLOOR);
                     priorweights[i] * shape * gamma_unit_deviance(yi_c, mui_c)
                 })
                 .sum();
@@ -10967,7 +10971,9 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
     likelihood: GlmLikelihoodSpec,
     priorweights: ArrayView1<f64>,
 ) -> f64 {
-    const EPS: f64 = 1e-8;
+    // Same μ floor as PIRLS log-link working-state writers; see note in
+    // `calculate_deviance` above.
+    const MU_FLOOR: f64 = 1e-10;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let n = y.len();
     match likelihood.family {
@@ -10996,7 +11002,7 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
         GlmLikelihoodFamily::PoissonLog => (0..n)
             .into_par_iter()
             .map(|i| {
-                let mui_c = mu[i].max(EPS);
+                let mui_c = mu[i].max(MU_FLOOR);
                 let log_term = if y[i] > 0.0 { y[i] * mui_c.ln() } else { 0.0 };
                 priorweights[i] * (log_term - mui_c)
             })
@@ -11018,7 +11024,7 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
                 if !valid_count_response(yi) {
                     return f64::NAN;
                 }
-                let mui_c = mu[i].max(EPS);
+                let mui_c = mu[i].max(MU_FLOOR);
                 priorweights[i]
                     * (ln_gamma(yi + theta) - ln_gamma(theta) - ln_gamma(yi + 1.0)
                         + theta * (theta.ln() - (theta + mui_c).ln())
