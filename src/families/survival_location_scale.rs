@@ -2390,7 +2390,16 @@ impl SurvivalLocationScaleFamily {
                 global += 1;
             }
         }
-        Ok(None)
+        let log_rescale = self.hessian_deriv_log_rescale(block_states);
+        let q = self.collect_joint_quantities_rescaled(block_states, log_rescale)?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        self.exact_newton_joint_hessiansecond_directional_derivative_from_parts(
+            block_states,
+            d_beta_u_flat,
+            d_beta_v_flat,
+            &q,
+            &dynamic,
+        )
     }
 
     /// Hazard-like survival ratio and its first derivative.
@@ -8222,13 +8231,9 @@ impl SurvivalLocationScaleFamily {
         // HT mask lookup: returns m[i] if mask is Some(m) else 1.0. For
         // f64 multiplication, `x * 1.0 == x` exactly (IEEE 754), so the
         // None path is byte-identical to the pre-refactor expression.
-<<<<<<< Updated upstream
-        let mask_at = |i: usize| -> f64 { row_mask.map_or(1.0, |m| m[i]) };
-=======
         let mask_at = |i: usize| -> f64 {
             row_mask.map_or(1.0, |m| m[i])
         };
->>>>>>> Stashed changes
         if n >= Self::EVALUATE_PARALLEL_ROW_THRESHOLD && rayon::current_num_threads() > 1 {
             const CHUNK: usize = 1024;
             let d1_q0_s = d1_q0
@@ -8406,9 +8411,6 @@ impl SurvivalLocationScaleFamily {
 
         Ok((ll, block_gradients))
     }
-<<<<<<< Updated upstream
-=======
-
     /// `_from_parts` variant of
     /// [`<Self as CustomFamily>::exact_newton_joint_hessiansecond_directional_derivative`]
     /// that receives the precomputed `q` and `dynamic` instead of recomputing
@@ -8450,7 +8452,16 @@ impl SurvivalLocationScaleFamily {
         dynamic: &SurvivalDynamicGeometry,
         row_mask: Option<&Array1<f64>>,
     ) -> Result<Option<Array2<f64>>, String> {
-        let _ = block_states;
+        if block_states.len() != self.expected_blocks() {
+            return Err(SurvivalLocationScaleError::DimensionMismatch {
+                reason: format!(
+                    "SurvivalLocationScaleFamily cached joint Hessian second derivative expects {} states, got {}",
+                    self.expected_blocks(),
+                    block_states.len()
+                ),
+            }
+            .into());
+        }
         let offsets = self.joint_block_offsets();
         let p_total = *offsets
             .last()
@@ -9055,83 +9066,6 @@ impl SurvivalLocationScaleFamily {
     }
 }
 
-impl SurvivalExactNewtonJointPsiWorkspace {
-    fn new(
-        family: SurvivalLocationScaleFamily,
-        block_states: Vec<ParameterBlockState>,
-        derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>>,
-    ) -> Result<Self, String> {
-        let joint_quantities = family.collect_joint_quantities(&block_states)?;
-        let psi_dim = derivative_blocks.iter().map(Vec::len).sum();
-        Ok(Self {
-            family,
-            block_states,
-            derivative_blocks,
-            joint_quantities,
-            psi_directions: ExactNewtonJointPsiDirectCache::new(psi_dim),
-        })
-    }
-
-    fn psi_direction(
-        &self,
-        psi_index: usize,
-    ) -> Result<Option<Arc<SurvivalJointPsiDirection>>, String> {
-        self.psi_directions.get_or_try_init(psi_index, || {
-            self.family.exact_newton_joint_psi_direction(
-                &self.block_states,
-                &self.derivative_blocks,
-                psi_index,
-            )
-        })
-    }
-}
-
-impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
-    fn second_order_terms(
-        &self,
-        psi_i: usize,
-        psi_j: usize,
-    ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        let Some(dir_i) = self.psi_direction(psi_i)? else {
-            return Ok(None);
-        };
-        let Some(dir_j) = self.psi_direction(psi_j)? else {
-            return Ok(None);
-        };
-        Ok(Some(
-            self.family
-                .exact_newton_joint_psisecond_order_terms_from_parts(
-                    &self.block_states,
-                    &self.derivative_blocks,
-                    &self.joint_quantities,
-                    dir_i.as_ref(),
-                    dir_j.as_ref(),
-                )?,
-        ))
-    }
-
-    fn hessian_directional_derivative(
-        &self,
-        psi_index: usize,
-        d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<crate::solver::estimate::reml::unified::DriftDerivResult>, String> {
-        let Some(dir) = self.psi_direction(psi_index)? else {
-            return Ok(None);
-        };
-        Ok(Some(
-            crate::solver::estimate::reml::unified::DriftDerivResult::Dense(
-                self.family
-                    .exact_newton_joint_psihessian_directional_derivative_from_parts(
-                        &self.joint_quantities,
-                        dir.as_ref(),
-                        d_beta_flat,
-                    )?,
-            ),
-        ))
-    }
->>>>>>> Stashed changes
-}
-
 /// Observed vs expected information: The survival location-scale family uses
 /// `BlockWorkingSet::ExactNewton` which provides the actual gradient and Hessian
 /// (-nabla^2 log L) from the survival likelihood. This is the **observed** Hessian
@@ -9475,7 +9409,16 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         if psi_i >= psi_dim || psi_j >= psi_dim {
             return Ok(None);
         }
-        Ok(None)
+        let block_states: Vec<ParameterBlockState> = Vec::new();
+        self.family
+            .exact_newton_joint_hessiansecond_directional_derivative_from_parts_masked(
+                &block_states,
+                d_beta_u_flat,
+                d_beta_v_flat,
+                &self.q,
+                &self.dynamic,
+                self.row_mask.as_deref(),
+            )
     }
 
     fn exact_newton_joint_psi_workspace(
@@ -10484,7 +10427,9 @@ impl ExactNewtonJointPsiWorkspace for SurvivalExactNewtonJointPsiWorkspace {
         if psi_index >= psi_dim {
             return Ok(None);
         }
-        Ok(None)
+        Ok(self
+            .second_directional_derivative(d_beta_u_flat, d_beta_v_flat)?
+            .map(|matrix| Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>))
     }
 }
 
