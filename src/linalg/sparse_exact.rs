@@ -1376,11 +1376,7 @@ impl TakahashiInverse {
 
     /// Diagonal of H⁻¹ in original ordering.
     pub fn diagonal(&self) -> Array1<f64> {
-        let mut diag = Array1::zeros(self.n);
-        for i in 0..self.n {
-            diag[i] = self.get(i, i);
-        }
-        diag
+        Array1::from_iter((0..self.n).map(|i| self.get(i, i)))
     }
 
     /// H⁻¹[start..end, start..end] block in original ordering.

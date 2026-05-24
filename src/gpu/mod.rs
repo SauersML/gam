@@ -10,6 +10,7 @@
 pub mod blas;
 pub mod cpu_traits;
 pub mod device;
+pub mod error;
 pub mod graph;
 pub mod kernels;
 pub mod linalg;

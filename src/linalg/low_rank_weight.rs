@@ -118,10 +118,7 @@ impl<'a> LowRankWeight<'a> {
             n
         );
         // diag(D) · x
-        let mut out = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            out[i] = self.diag[i] * x[i];
-        }
+        let mut out = Array1::<f64>::from_iter((0..n).map(|i| self.diag[i] * x[i]));
         if self.is_rank_zero() {
             return out;
         }
@@ -201,10 +198,7 @@ impl<'a> LowRankWeight<'a> {
             ));
         }
         // Xᵀ (D y)
-        let mut dy = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            dy[i] = self.diag[i] * y[i];
-        }
+        let dy = Array1::<f64>::from_iter((0..n).map(|i| self.diag[i] * y[i]));
         let mut out = design.transpose_vector_multiply(&dy);
 
         if !self.is_rank_zero() {

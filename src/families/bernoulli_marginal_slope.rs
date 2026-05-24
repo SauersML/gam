@@ -17203,7 +17203,7 @@ impl BernoulliMarginalSlopeExactNewtonJointPsiWorkspace {
             block_states,
             specs,
             derivative_blocks,
-            cache,
+            cache: std::sync::Arc::new(cache),
             options,
         })
     }
