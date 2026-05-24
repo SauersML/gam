@@ -4,6 +4,7 @@ pub mod atom_selection;
 pub mod basis;
 pub mod closed_form_operator;
 pub mod construction;
+pub mod gated_decoder;
 pub mod hull;
 pub mod input_loc_derivatives;
 pub mod latent_coord;
@@ -18,15 +19,16 @@ pub use analytic_penalties::{
     AnalyticPenaltyRegistry, RowPrecisionPriorPenalty, BlockOrthogonalityPenalty,
     BlockSparsityPenalty, DifferenceOpKind, FrozenAnalyticPenaltyOp, IBPAssignmentPenalty,
     IsometryPenalty, IsometryDuchonRadialSource, IsometryReference, IvaeRidgeMeanGauge,
-    MechanismSparsityPenalty, NuclearNormPenalty, OrthogonalityPenalty,
+    JumpReLUPenalty, MechanismSparsityPenalty, NuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     ScalarWeightSchedule, ScadMcpPenalty, SoftmaxAssignmentSparsityPenalty, SparsityKind,
-    SparsityPenalty, TotalVariationPenalty, WeightField,
+    SparsityPenalty, TopKActivationPenalty, TotalVariationPenalty, WeightField,
 };
 pub use atom_selection::{
     AssignmentSparsityCoupling, AtomLibrary, AtomRecord, AtomSelectionStrategy, EntropicSoftmax,
     L1Relaxed, ShapeRef, TopK,
 };
+pub use gated_decoder::GatedSAEDecoder;
 pub use latent_coord::{
     AuxPriorFamily, AuxPriorStrength, InputLocationDerivative, LatentCoordValues, LatentIdMode,
     LatentManifold,

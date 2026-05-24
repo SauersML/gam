@@ -129,6 +129,10 @@ extern "C" __global__ void row_scale_inplace_kernel(
     let pp = p as u64;
     let mut builder = stream.launch_builder(&func);
     builder.arg(&mut dx).arg(&dw).arg(&nn).arg(&pp);
+    // SAFETY: func loaded from a freshly NVRTC-compiled module on this
+    // context; dx is the n×p column-major device matrix being scaled
+    // in-place, dw is the length-n weight vector. cfg grid covers n*p
+    // threads with the kernel's own bounds check.
     unsafe { builder.launch(cfg) }.map_err(map_drv)?;
 
     let host_back = stream.memcpy_dtov(&dx).map_err(map_drv)?;

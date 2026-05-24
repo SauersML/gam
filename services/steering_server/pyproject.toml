@@ -1,0 +1,35 @@
+[project]
+name = "steering-server"
+version = "0.1.0"
+description = "FastAPI steering server for LLM concept manifold experiments"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "apscheduler>=3.10",
+  "fastapi>=0.115",
+  "opentelemetry-api>=1.28",
+  "opentelemetry-exporter-otlp>=1.28",
+  "opentelemetry-instrumentation-fastapi>=0.49b0",
+  "opentelemetry-sdk>=1.28",
+  "prometheus-client>=0.21",
+  "psycopg[binary]>=3.2",
+  "pydantic>=2.9",
+  "slowapi>=0.1.9",
+  "sqlalchemy>=2.0",
+  "uvicorn[standard]>=0.32",
+]
+
+[project.optional-dependencies]
+test = [
+  "httpx>=0.27",
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

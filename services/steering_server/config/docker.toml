@@ -1,0 +1,17 @@
+[database]
+url = "postgresql+psycopg://steering:steering@postgres:5432/steering"
+
+[auth]
+bootstrap_user = "service-admin"
+bootstrap_api_key = "compose-steering-key"
+
+[rate_limit]
+default_limit = "300/minute"
+steer_limit = "60/minute"
+
+[telemetry]
+service_name = "steering-server"
+otlp_endpoint = "http://otel-collector:4317"
+
+[queue]
+run_inline = false

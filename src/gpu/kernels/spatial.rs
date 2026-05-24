@@ -17,16 +17,10 @@ pub enum BackendStatus {
 
 #[inline]
 pub fn backend_status() -> BackendStatus {
-    #[cfg(feature = "cuda")]
-    {
-        match crate::gpu::runtime::GpuRuntime::global() {
-            Some(_) => BackendStatus::CudaReady,
-            None => BackendStatus::CudaUnavailable,
-        }
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        BackendStatus::CpuFallback
+    if crate::gpu::runtime::GpuRuntime::global().is_some() {
+        BackendStatus::CudaReady
+    } else {
+        BackendStatus::CudaUnavailable
     }
 }
 
@@ -125,21 +119,12 @@ pub fn try_dispatch(
     if points_a.nrows() == 0 || points_b.nrows() == 0 || points_a.ncols() != points_b.ncols() {
         return None;
     }
-    #[cfg(feature = "cuda")]
-    {
-        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
-            return None;
-        };
-        Some(cuda_spatial(kernel, points_a, points_b))
+    if crate::gpu::runtime::GpuRuntime::global().is_none() {
+        return None;
     }
-    #[cfg(not(feature = "cuda"))]
-    {
-        drop((kernel, points_a, points_b));
-        None
-    }
+    Some(cuda_spatial(kernel, points_a, points_b))
 }
 
-#[cfg(feature = "cuda")]
 fn cuda_spatial(
     kernel: SpatialKernel,
     points_a: ArrayView2<'_, f64>,
@@ -264,7 +249,6 @@ extern "C" __global__ void spatial_kernel(
     })
 }
 
-#[cfg(feature = "cuda")]
 fn map_drv(e: cudarc::driver::DriverError) -> GpuError {
     GpuError::DriverCallFailed {
         reason: format!("spatial cudarc driver error: {e}"),

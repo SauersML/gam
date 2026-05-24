@@ -77,6 +77,7 @@ from ._penalties import (
     IBPAssignmentPenalty,
     IsometryPenalty,
     IvaeRidgeMeanGauge,
+    JumpReLUPenalty,
     MechanismSparsityPenalty,
     NuclearNormPenalty,
     OrthogonalityPenalty,
@@ -86,6 +87,7 @@ from ._penalties import (
     ScadMcpPenalty,
     SoftmaxAssignmentSparsityPenalty,
     SparsityPenalty,
+    TopKActivationPenalty,
     TotalVariationPenalty,
 )
 from .topology import (
@@ -148,6 +150,7 @@ from ._sampling import (
 )
 from ._sae_manifold import (
     GumbelTemperatureSchedule,
+    ManifoldSAE,
     SaeManifoldAtomFit,
     SaeManifoldFitResult,
     gumbel_geometric_schedule,
@@ -196,6 +199,7 @@ __all__ = [
     "FormulaValidation",
     "GamError",
     "GumbelTemperatureSchedule",
+    "ManifoldSAE",
     "CompetingRisksCIF",
     "CompetingRisksPrediction",
     "Model",

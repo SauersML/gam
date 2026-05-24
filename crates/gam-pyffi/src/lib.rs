@@ -5,8 +5,9 @@ use gam::bernoulli_marginal_slope::{
     BernoulliMarginalSlopeFitResult, DeviationRuntime, LatentMeasureKind,
 };
 use gam::estimate::{
-    BlockRole, EstimationError, ExternalOptimOptions, optimize_external_designwith_heuristic_lambdas,
-    saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
+    BlockRole, EstimationError, ExternalOptimOptions,
+    optimize_external_designwith_heuristic_lambdas, saved_latent_cloglog_state_from_fit,
+    saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
 use gam::faer_ndarray::{
     FaerCholesky, FaerEigh, array2_to_matmut, factorize_symmetricwith_fallback, fast_xt_diag_x,
@@ -49,17 +50,15 @@ use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder, MaternBasisSpec,
     MaternIdentifiability, MaternNu, SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
-    SphericalSplineBasisSpec,
-    auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile, bspline_tensor_first_derivative,
-    build_duchon_basis, build_duchon_basis_mixed_periodicity_auto, build_matern_basis,
-    build_duchon_operator_penalty_matrices, build_spherical_spline_basis,
-    build_thin_plate_penalty_matrix, create_basis, create_cyclic_difference_penalty_matrix,
-    create_difference_penalty_matrix, create_periodic_bspline_basis_dense,
-    create_periodic_bspline_derivative_dense, duchon_polynomial_first_derivative_nd,
-    duchon_radial_first_derivative_nd, evaluate_bspline_basis_scalar,
-    matern_radial_first_derivative_nd,
+    SphericalSplineBasisSpec, SplineScratch, auto_centers_1d_equal_mass,
+    auto_knot_vector_1d_quantile, bspline_tensor_first_derivative, build_duchon_basis,
+    build_duchon_basis_mixed_periodicity_auto, build_duchon_operator_penalty_matrices,
+    build_matern_basis, build_spherical_spline_basis, build_thin_plate_penalty_matrix,
+    create_basis, create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
+    create_periodic_bspline_basis_dense, create_periodic_bspline_derivative_dense,
+    duchon_polynomial_first_derivative_nd, duchon_radial_first_derivative_nd,
+    evaluate_bspline_basis_scalar, matern_radial_first_derivative_nd,
     periodic_bspline_first_derivative_nd, resolve_duchon_orders, sphere_first_derivative_nd,
-    SplineScratch,
 };
 use gam::terms::latent_coord::{
     AuxPriorFamily, InputLocationDerivative, LatentCoordValues, LatentIdMode, aux_prior_targets,
@@ -68,16 +67,17 @@ use gam::terms::sae_manifold::{
     AssignmentMode, GumbelTemperatureSchedule, SaeAtomBasisKind, SaeManifoldRho, ScheduleKind,
     term_from_padded_blocks_with_mode,
 };
-use gam::transformation_normal::TransformationNormalFitResult;
+use gam::terms::smooth::BlockwisePenalty;
 use gam::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
-    DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty, MechanismSparsityPenalty,
-    NuclearNormPenalty,
-    OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier,
-    PsiSlice, RowPrecisionPriorPenalty, ScalarWeightSchedule, ScadMcpPenalty,
-    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TotalVariationPenalty,
+    DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty, JumpReLUPenalty,
+    MechanismSparsityPenalty, NuclearNormPenalty, OrthogonalityPenalty,
+    ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
+    RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
+    SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
+    TotalVariationPenalty,
 };
-use gam::terms::smooth::BlockwisePenalty;
+use gam::transformation_normal::TransformationNormalFitResult;
 use gam::types::{InverseLink, LikelihoodFamily, LinkFunction, RhoPrior};
 use gam::{FitConfig, FitRequest, FitResult, fit_model, materialize, resolve_offset_column};
 use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
@@ -91,6 +91,7 @@ use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 
 const MODEL_VERSION: u32 = MODEL_PAYLOAD_VERSION;
 
@@ -910,12 +911,14 @@ fn duchon_function_norm_penalty<'py>(
     let center_matrix: Array2<f64> = match centers.extract::<PyReadonlyArray2<f64>>() {
         Ok(arr2) => arr2.as_array().to_owned(),
         Err(arr2_err) => {
-            let arr1 = centers.extract::<PyReadonlyArray1<f64>>().map_err(|arr1_err| {
-                py_value_error(format!(
-                    "centers must be a 1D (K,) or 2D (K, d) float array; \
+            let arr1 = centers
+                .extract::<PyReadonlyArray1<f64>>()
+                .map_err(|arr1_err| {
+                    py_value_error(format!(
+                        "centers must be a 1D (K,) or 2D (K, d) float array; \
                      2D extraction failed: {arr2_err}; 1D extraction failed: {arr1_err}"
-                ))
-            })?;
+                    ))
+                })?;
             column_array(arr1.as_array())
         }
     };
@@ -1379,8 +1382,12 @@ fn gaussian_reml_fit_backward<'py>(
             .map_err(|err| err.to_string())?;
             let grad_x_raw = backward.grad_x;
             let (grad_x, grad_by) = if let Some(by_arr) = by_values.as_ref() {
-                let (grad_x, grad_by) =
-                    apply_by_gate_backward(x_values.view(), by_arr.view(), by_start_col, grad_x_raw.view())?;
+                let (grad_x, grad_by) = apply_by_gate_backward(
+                    x_values.view(),
+                    by_arr.view(),
+                    by_start_col,
+                    grad_x_raw.view(),
+                )?;
                 (grad_x, Some(grad_by))
             } else {
                 (grad_x_raw, None)
@@ -3020,10 +3027,8 @@ fn gaussian_reml_fit_batched_backward<'py>(
     let grad_reml_score_values = grad_reml_score.as_ref().map(|g| g.as_array().to_owned());
     let grad_edf_values = grad_edf.as_ref().map(|g| g.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
-    let (statuses, grad_x, grad_by, grad_y, grad_penalty, grad_weights) = detach_py_result(
-        py,
-        "gaussian_reml_fit_batched_backward",
-        move || {
+    let (statuses, grad_x, grad_by, grad_y, grad_penalty, grad_weights) =
+        detach_py_result(py, "gaussian_reml_fit_batched_backward", move || {
             let gated_x;
             let fit_x = if let Some(by_arr) = by_values.as_ref() {
                 gated_x = apply_by_gate(x_values.view(), by_arr.view(), by_start_col)?;
@@ -3047,8 +3052,12 @@ fn gaussian_reml_fit_batched_backward<'py>(
             )?;
             let grad_x_raw = backward.grad_x;
             let (grad_x, grad_by) = if let Some(by_arr) = by_values.as_ref() {
-                let (grad_x, grad_by) =
-                    apply_by_gate_backward(x_values.view(), by_arr.view(), by_start_col, grad_x_raw.view())?;
+                let (grad_x, grad_by) = apply_by_gate_backward(
+                    x_values.view(),
+                    by_arr.view(),
+                    by_start_col,
+                    grad_x_raw.view(),
+                )?;
                 (grad_x, Some(grad_by))
             } else {
                 (grad_x_raw, None)
@@ -3061,8 +3070,7 @@ fn gaussian_reml_fit_batched_backward<'py>(
                 backward.grad_penalty,
                 backward.grad_weights,
             ))
-        },
-    )?;
+        })?;
 
     let out = PyDict::new(py);
     out.set_item("status", statuses)?;
@@ -3573,8 +3581,7 @@ fn build_latent_tensor_bspline_design(
     }
 
     let mut design = Array2::<f64>::zeros((n_obs, total_cols));
-    let mut values_per_axis: Vec<Vec<f64>> =
-        k_per_axis.iter().map(|&k| vec![0.0; k]).collect();
+    let mut values_per_axis: Vec<Vec<f64>> = k_per_axis.iter().map(|&k| vec![0.0; k]).collect();
     let mut scratch: Vec<SplineScratch> = (0..latent_dim)
         .map(|axis| SplineScratch::new(degrees[axis]))
         .collect();
@@ -3608,9 +3615,7 @@ fn build_latent_tensor_bspline_design(
     Ok((design, t_mat))
 }
 
-fn latent_periodic_range_from_centers(
-    centers: ArrayView2<'_, f64>,
-) -> Result<(f64, f64), String> {
+fn latent_periodic_range_from_centers(centers: ArrayView2<'_, f64>) -> Result<(f64, f64), String> {
     if centers.ncols() != 1 || centers.nrows() == 0 {
         return Err("periodic B-spline latent design requires one-column centers".to_string());
     }
@@ -3749,15 +3754,14 @@ fn build_latent_forward_design(
             return Ok((design, t_mat, jet));
         }
         "bspline_tensor" => {
-            let knots = tensor_knots_concat.as_ref().ok_or_else(|| {
-                "tensor B-spline latent design requires knots_concat".to_string()
-            })?.clone();
-            let offsets = tensor_knot_offsets.ok_or_else(|| {
-                "tensor B-spline latent design requires knot_offsets".to_string()
-            })?;
-            let degrees = tensor_degrees.ok_or_else(|| {
-                "tensor B-spline latent design requires degrees".to_string()
-            })?;
+            let knots = tensor_knots_concat
+                .as_ref()
+                .ok_or_else(|| "tensor B-spline latent design requires knots_concat".to_string())?
+                .clone();
+            let offsets = tensor_knot_offsets
+                .ok_or_else(|| "tensor B-spline latent design requires knot_offsets".to_string())?;
+            let degrees = tensor_degrees
+                .ok_or_else(|| "tensor B-spline latent design requires degrees".to_string())?;
             build_latent_tensor_bspline_design(t_flat, n_obs, latent_dim, knots, offsets, degrees)?
         }
         "periodic_bspline" => {
@@ -3768,13 +3772,11 @@ fn build_latent_forward_design(
             }
             let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
             let range = latent_periodic_range_from_centers(centers)?;
-            let design = create_periodic_bspline_basis_dense(
-                t_mat.column(0),
-                range,
-                m,
-                centers.nrows(),
-            )
-            .map_err(|err| format!("failed to evaluate periodic B-spline latent basis: {err}"))?;
+            let design =
+                create_periodic_bspline_basis_dense(t_mat.column(0), range, m, centers.nrows())
+                    .map_err(|err| {
+                        format!("failed to evaluate periodic B-spline latent basis: {err}")
+                    })?;
             (design, t_mat)
         }
         other => {
@@ -3849,19 +3851,13 @@ fn latent_input_location_jet(
     match latent_basis_kind(basis_kind)? {
         "duchon" => {
             let nullspace_order = duchon_nullspace_from_m(m);
-            let phi_r = duchon_radial_first_derivative_nd(
-                t_mat,
-                centers,
-                None,
-                nullspace_order,
-            )
-            .map_err(|err| err.to_string())?;
-            let radial_jet = latent.design_gradient_wrt_t_dispatch(
-                InputLocationDerivative::Radial {
+            let phi_r = duchon_radial_first_derivative_nd(t_mat, centers, None, nullspace_order)
+                .map_err(|err| err.to_string())?;
+            let radial_jet =
+                latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Radial {
                     kernel_first_derivative: phi_r.view(),
                     centers,
-                },
-            );
+                });
             let poly_jet = duchon_polynomial_first_derivative_nd(t_mat, nullspace_order);
             let n_rows = radial_jet.shape()[0];
             let n_radial = radial_jet.shape()[1];
@@ -3897,23 +3893,22 @@ fn latent_input_location_jet(
         "matern" => {
             // Fixes audit-revised claim that non-Duchon latent input-location
             // derivatives must use the closed-form helper instead of stubbing.
-            let phi_r = matern_radial_first_derivative_nd(t_mat, centers, 1.0, MaternNu::ThreeHalves)
-                .map_err(|err| err.to_string())?;
-            Ok(latent.design_gradient_wrt_t_dispatch(
-                InputLocationDerivative::Radial {
+            let phi_r =
+                matern_radial_first_derivative_nd(t_mat, centers, 1.0, MaternNu::ThreeHalves)
+                    .map_err(|err| err.to_string())?;
+            Ok(
+                latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Radial {
                     kernel_first_derivative: phi_r.view(),
                     centers,
-                },
-            ))
+                }),
+            )
         }
         "sphere" => {
             // Fixes audit-revised claim that sphere latent derivatives are
             // analytic jets, not unsupported hooks.
-            let jet =
-                sphere_first_derivative_nd(t_mat, centers, m, true).map_err(|err| err.to_string())?;
-            Ok(latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Jet(
-                jet.view(),
-            )))
+            let jet = sphere_first_derivative_nd(t_mat, centers, m, true)
+                .map_err(|err| err.to_string())?;
+            Ok(latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Jet(jet.view())))
         }
         "bspline_tensor" => {
             let knots = tensor_knots_concat.ok_or_else(|| {
@@ -3922,9 +3917,8 @@ fn latent_input_location_jet(
             let offsets = tensor_knot_offsets.ok_or_else(|| {
                 "tensor B-spline latent derivative requires knot_offsets".to_string()
             })?;
-            let degrees = tensor_degrees.ok_or_else(|| {
-                "tensor B-spline latent derivative requires degrees".to_string()
-            })?;
+            let degrees = tensor_degrees
+                .ok_or_else(|| "tensor B-spline latent derivative requires degrees".to_string())?;
             let per_axis = split_tensor_knots_owned(knots, offsets, t_mat.ncols())?;
             let per_axis_views = per_axis
                 .iter()
@@ -3932,9 +3926,7 @@ fn latent_input_location_jet(
                 .collect::<Vec<_>>();
             let jet = bspline_tensor_first_derivative(t_mat, &per_axis_views, degrees)
                 .map_err(|err| err.to_string())?;
-            Ok(latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Jet(
-                jet.view(),
-            )))
+            Ok(latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Jet(jet.view())))
         }
         "periodic_bspline" => {
             // Fixes audit-revised claim that periodic latent derivatives are
@@ -3956,9 +3948,7 @@ fn latent_input_location_jet(
             }
             let jet = periodic_bspline_first_derivative_nd(t_mat, (lo, hi), m, centers.nrows())
                 .map_err(|err| err.to_string())?;
-            Ok(latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Jet(
-                jet.view(),
-            )))
+            Ok(latent.design_gradient_wrt_t_dispatch(InputLocationDerivative::Jet(jet.view())))
         }
         other => Err(format!(
             "latent_basis_kind returned an unknown normalized kind: {other}"
@@ -4017,7 +4007,10 @@ fn latent_scalar_weights_with_fisher(
     Ok(Some(out))
 }
 
-fn latent_row_weights(n_obs: usize, weights: Option<ArrayView1<'_, f64>>) -> Result<Array1<f64>, String> {
+fn latent_row_weights(
+    n_obs: usize,
+    weights: Option<ArrayView1<'_, f64>>,
+) -> Result<Array1<f64>, String> {
     match weights {
         Some(w) => gaussian_reml_weight_vector_local(n_obs, Some(w)),
         None => Ok(Array1::ones(n_obs)),
@@ -4151,7 +4144,9 @@ fn latent_aux_prior_stats(
     let (log_mu, mu, auto) = match aux_strength {
         Some(mu) => {
             if !(mu.is_finite() && mu > 0.0) {
-                return Err(format!("aux_strength must be finite and positive; got {mu}"));
+                return Err(format!(
+                    "aux_strength must be finite and positive; got {mu}"
+                ));
             }
             (mu.ln(), mu, false)
         }
@@ -4164,7 +4159,9 @@ fn latent_aux_prior_stats(
             }
             let mu = (n_obs as f64) / residual_sq;
             if !(mu.is_finite() && mu > 0.0) {
-                return Err(format!("auto aux_strength selected a non-finite precision: {mu}"));
+                return Err(format!(
+                    "auto aux_strength selected a non-finite precision: {mu}"
+                ));
             }
             (mu.ln(), mu, true)
         }
@@ -4187,7 +4184,10 @@ fn set_aux_strength_items<'py>(
         out.set_item("aux_strength", state.mu)?;
         out.set_item("aux_log_strength", state.log_mu)?;
         out.set_item("log_mu", state.log_mu)?;
-        out.set_item("aux_strength_mode", if state.auto { "auto" } else { "fixed" })?;
+        out.set_item(
+            "aux_strength_mode",
+            if state.auto { "auto" } else { "fixed" },
+        )?;
     } else {
         out.set_item("aux_strength", py.None())?;
         out.set_item("aux_log_strength", py.None())?;
@@ -4269,11 +4269,9 @@ fn dense_fisher_gaussian_fit_to_pydict<'py>(
             "init_lambda must be finite and positive for dense Fisher fit; got {lambda}"
         )));
     }
-    let mut hessian =
-        gam::pirls::dense_block_xtwx(design, fisher_w, Some(row_weights.view()))
-            .map_err(|err| py_value_error(err.to_string()))?;
-    add_block_diagonal_penalty(&mut hessian, penalty, lambda, n_outputs)
-        .map_err(py_value_error)?;
+    let mut hessian = gam::pirls::dense_block_xtwx(design, fisher_w, Some(row_weights.view()))
+        .map_err(|err| py_value_error(err.to_string()))?;
+    add_block_diagonal_penalty(&mut hessian, penalty, lambda, n_outputs).map_err(py_value_error)?;
     let rhs = gam::pirls::dense_block_xtwy(design, fisher_w, y, Some(row_weights.view()))
         .map_err(|err| py_value_error(err.to_string()))?;
     let beta_vec = solve_dense_block_system(&hessian, &rhs, "dense Fisher Gaussian")
@@ -4319,9 +4317,18 @@ fn dense_fisher_gaussian_fit_to_pydict<'py>(
     out.set_item("coefficients", coefficients.into_pyarray(py))?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
     out.set_item("sigma2", sigma2.into_pyarray(py))?;
-    out.set_item("cache_penalty_eigenvalues", Array1::<f64>::zeros(0).into_pyarray(py))?;
-    out.set_item("cache_eigenvectors", Array2::<f64>::zeros((0, 0)).into_pyarray(py))?;
-    out.set_item("cache_coefficient_basis", Array2::<f64>::zeros((0, 0)).into_pyarray(py))?;
+    out.set_item(
+        "cache_penalty_eigenvalues",
+        Array1::<f64>::zeros(0).into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_eigenvectors",
+        Array2::<f64>::zeros((0, 0)).into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_coefficient_basis",
+        Array2::<f64>::zeros((0, 0)).into_pyarray(py),
+    )?;
     out.set_item("cache_xtwx_fingerprint", 0_u64)?;
     out.set_item("cache_penalty_fingerprint", 0_u64)?;
     out.set_item("cache_logdet_xtwx", f64::NAN)?;
@@ -4417,7 +4424,11 @@ fn dense_fisher_glm_fit_to_pydict<'py>(
         )));
     }
 
-    let active_outputs = if multinomial { n_outputs - 1 } else { n_outputs };
+    let active_outputs = if multinomial {
+        n_outputs - 1
+    } else {
+        n_outputs
+    };
     let mut coefficients_active = Array2::<f64>::zeros((k, active_outputs));
     let mut fitted = Array2::<f64>::zeros((n_obs, n_outputs));
     let mut h_blocks = Array3::<f64>::zeros((n_obs, active_outputs, active_outputs));
@@ -4502,8 +4513,8 @@ fn dense_fisher_glm_fit_to_pydict<'py>(
             }
         }
         let rhs = gradient.mapv(|v| -v);
-        let delta = solve_dense_block_system(&hessian, &rhs, "dense Fisher GLM")
-            .map_err(py_value_error)?;
+        let delta =
+            solve_dense_block_system(&hessian, &rhs, "dense Fisher GLM").map_err(py_value_error)?;
         let mut step_norm = 0.0_f64;
         for a in 0..active_outputs {
             for col in 0..k {
@@ -4512,7 +4523,15 @@ fn dense_fisher_glm_fit_to_pydict<'py>(
                 step_norm += d * d;
             }
         }
-        if step_norm.sqrt() <= tol * (1.0 + coefficients_active.iter().map(|v| v * v).sum::<f64>().sqrt()) {
+        if step_norm.sqrt()
+            <= tol
+                * (1.0
+                    + coefficients_active
+                        .iter()
+                        .map(|v| v * v)
+                        .sum::<f64>()
+                        .sqrt())
+        {
             converged = true;
             break;
         }
@@ -4559,9 +4578,18 @@ fn dense_fisher_glm_fit_to_pydict<'py>(
     out.set_item("fitted", fitted.into_pyarray(py))?;
     out.set_item("sigma2", Array1::<f64>::ones(n_outputs).into_pyarray(py))?;
     out.set_item("iterations", iterations)?;
-    out.set_item("cache_penalty_eigenvalues", Array1::<f64>::zeros(0).into_pyarray(py))?;
-    out.set_item("cache_eigenvectors", Array2::<f64>::zeros((0, 0)).into_pyarray(py))?;
-    out.set_item("cache_coefficient_basis", Array2::<f64>::zeros((0, 0)).into_pyarray(py))?;
+    out.set_item(
+        "cache_penalty_eigenvalues",
+        Array1::<f64>::zeros(0).into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_eigenvectors",
+        Array2::<f64>::zeros((0, 0)).into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_coefficient_basis",
+        Array2::<f64>::zeros((0, 0)).into_pyarray(py),
+    )?;
     out.set_item("cache_xtwx_fingerprint", 0_u64)?;
     out.set_item("cache_penalty_fingerprint", 0_u64)?;
     out.set_item("cache_logdet_xtwx", f64::NAN)?;
@@ -4730,15 +4758,12 @@ fn analytic_penalty_value_for_targets(
 ) -> Result<f64, String> {
     let rho = Array1::<f64>::zeros(registry.total_rho_count());
     let mut value = 0.0_f64;
-    for (penalty, (rho_slice, tier, _name)) in
-        registry.penalties.iter().zip(registry.rho_layout())
+    for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())
     {
         let rho_local = rho.slice(s![rho_slice]);
         let target = match (tier, penalty) {
             (PenaltyTier::Psi, _)
-            | (PenaltyTier::Beta, AnalyticPenaltyKind::MechanismSparsity(_)) => {
-                target_t.view()
-            }
+            | (PenaltyTier::Beta, AnalyticPenaltyKind::MechanismSparsity(_)) => target_t.view(),
             (PenaltyTier::Beta, _) => {
                 let Some(target_beta) = target_beta.as_ref() else {
                     continue;
@@ -4772,11 +4797,14 @@ fn gaussian_reml_fit_latent_impl(
     aux_strength: Option<f64>,
     dim_selection_precision: Option<ArrayView1<'_, f64>>,
     analytic_penalties: Option<&AnalyticPenaltyRegistry>,
-) -> Result<(
-    gam::gaussian_reml::GaussianRemlMultiResult,
-    Array2<f64>,
-    Option<LatentAuxStrengthState>,
-), String> {
+) -> Result<
+    (
+        gam::gaussian_reml::GaussianRemlMultiResult,
+        Array2<f64>,
+        Option<LatentAuxStrengthState>,
+    ),
+    String,
+> {
     let (design, t_mat, _jet) = build_latent_forward_design(
         basis_kind,
         t_flat,
@@ -5052,10 +5080,7 @@ fn gumbel_temperature_schedule_from_pydict(
     };
     let decay = match decay_name.as_str() {
         "geometric" | "exponential" => {
-            let rate = match schedule
-                .get_item("rate")
-                .map_err(|err| err.to_string())?
-            {
+            let rate = match schedule.get_item("rate").map_err(|err| err.to_string())? {
                 Some(value) => value.extract::<f64>().map_err(|err| err.to_string())?,
                 None => 0.9,
             };
@@ -5228,13 +5253,9 @@ fn sae_manifold_fit_ibp<'py>(
             coords_shape
         )));
     }
-    let max_dim = coords_view
-        .shape()
-        .get(2)
-        .copied()
-        .ok_or_else(|| {
-            py_value_error("initial_coords must be a rank-3 (K, N, D_max) array".to_string())
-        })?;
+    let max_dim = coords_view.shape().get(2).copied().ok_or_else(|| {
+        py_value_error("initial_coords must be a rank-3 (K, N, D_max) array".to_string())
+    })?;
     let mut coord_blocks = Vec::with_capacity(k_atoms);
     for atom_idx in 0..k_atoms {
         let d = atom_dim[atom_idx];
@@ -5289,10 +5310,7 @@ fn sae_manifold_fit_ibp<'py>(
             .map_err(py_value_error)?;
     }
 
-    let log_ard = atom_dim
-        .iter()
-        .map(|&d| Array1::<f64>::zeros(d))
-        .collect();
+    let log_ard = atom_dim.iter().map(|&d| Array1::<f64>::zeros(d)).collect();
     let mut rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard);
     let loss = term
         .run_single_external_basis_refresh_step_arrow_schur(
@@ -5315,14 +5333,22 @@ fn sae_manifold_fit_ibp<'py>(
     for atom_idx in 0..k_atoms {
         let atom = &term.atoms[atom_idx];
         let atom_dict = PyDict::new(py);
-        atom_dict.set_item("decoder_B", atom.decoder_coefficients.clone().into_pyarray(py))?;
+        atom_dict.set_item(
+            "decoder_B",
+            atom.decoder_coefficients.clone().into_pyarray(py),
+        )?;
         atom_dict.set_item("basis_kind", atom_basis[atom_idx].clone())?;
         atom_dict.set_item("basis_centers", py.None())?;
         atom_dict.set_item(
             "on_atom_coords_t",
-            term.assignment.coords[atom_idx].as_matrix().into_pyarray(py),
+            term.assignment.coords[atom_idx]
+                .as_matrix()
+                .into_pyarray(py),
         )?;
-        atom_dict.set_item("assignments_z", assignments.column(atom_idx).to_owned().into_pyarray(py))?;
+        atom_dict.set_item(
+            "assignments_z",
+            assignments.column(atom_idx).to_owned().into_pyarray(py),
+        )?;
         atom_dict.set_item("active_dim", atom_dim[atom_idx])?;
         atoms_py.append(atom_dict)?;
     }
@@ -5337,7 +5363,15 @@ fn sae_manifold_fit_ibp<'py>(
     out.set_item("atom_active_mask", active_mask)?;
     out.set_item("fitted", fitted.into_pyarray(py))?;
     out.set_item("reml_score", loss.evidence_proxy())?;
-    out.set_item("log_alpha", alpha.ln() + if learnable_alpha { rho.log_lambda_sparse } else { 0.0 })?;
+    out.set_item(
+        "log_alpha",
+        alpha.ln()
+            + if learnable_alpha {
+                rho.log_lambda_sparse
+            } else {
+                0.0
+            },
+    )?;
     out.set_item("log_lambda_smooth", rho.log_lambda_smooth)?;
     out.set_item("log_ard", log_ard_py)?;
     out.set_item("assignment_prior", "ibp_map")?;
@@ -5525,8 +5559,8 @@ fn gaussian_reml_fit_latent_backward<'py>(
         let stats = latent_aux_prior_stats(t_mat.view(), u_view, family, aux_strength)
             .map_err(py_value_error)?;
         let residual = &t_mat - &stats.targets;
-        let projected_residual = aux_prior_targets(residual.view(), u_view, family)
-            .map_err(py_value_error)?;
+        let projected_residual =
+            aux_prior_targets(residual.view(), u_view, family).map_err(py_value_error)?;
         let grad_base = residual - projected_residual;
         for n in 0..n_obs {
             for a in 0..latent_dim {
@@ -5594,12 +5628,9 @@ fn gaussian_reml_fit_latent_backward<'py>(
         out.set_item("grad_log_mu", py.None())?;
     }
     if let Some(grad) = grad_dim_selection_log_precision {
-        out.set_item(
-            "grad_dim_selection_log_precision",
-            grad.into_pyarray(py),
-        )?;
+        out.set_item("grad_dim_selection_log_precision", grad.into_pyarray(py))?;
     } else {
-    out.set_item("grad_dim_selection_log_precision", py.None())?;
+        out.set_item("grad_dim_selection_log_precision", py.None())?;
     }
     Ok(out.unbind())
 }
@@ -5662,12 +5693,15 @@ fn glm_reml_fit_latent_impl(
     aux_strength: Option<f64>,
     dim_selection_precision: Option<ArrayView1<'_, f64>>,
     analytic_penalties: Option<&AnalyticPenaltyRegistry>,
-) -> Result<(
-    gam::estimate::ExternalOptimResult,
-    Array2<f64>,
-    Array2<f64>,
-    Option<LatentAuxStrengthState>,
-), String> {
+) -> Result<
+    (
+        gam::estimate::ExternalOptimResult,
+        Array2<f64>,
+        Array2<f64>,
+        Option<LatentAuxStrengthState>,
+    ),
+    String,
+> {
     if y.ncols() != 1 {
         return Err(format!(
             "glm_reml_fit_latent requires y with one column; got {}",
@@ -5780,7 +5814,14 @@ fn set_ok_glm_latent_items<'py>(
     for row in 0..n_obs.min(pirls.finalmu.len()) {
         fitted[[row, 0]] = pirls.finalmu[row];
     }
-    out.set_item("status", if fit.outer_converged { "ok" } else { "not_converged" })?;
+    out.set_item(
+        "status",
+        if fit.outer_converged {
+            "ok"
+        } else {
+            "not_converged"
+        },
+    )?;
     out.set_item("lambda", lambda)?;
     out.set_item("rho", rho)?;
     out.set_item("reml_score", fit.reml_score)?;
@@ -5795,9 +5836,18 @@ fn set_ok_glm_latent_items<'py>(
         "sigma2",
         Array1::from_vec(vec![fit.standard_deviation * fit.standard_deviation]).into_pyarray(py),
     )?;
-    out.set_item("cache_penalty_eigenvalues", Array1::<f64>::zeros(0).into_pyarray(py))?;
-    out.set_item("cache_eigenvectors", Array2::<f64>::zeros((0, 0)).into_pyarray(py))?;
-    out.set_item("cache_coefficient_basis", Array2::<f64>::zeros((0, 0)).into_pyarray(py))?;
+    out.set_item(
+        "cache_penalty_eigenvalues",
+        Array1::<f64>::zeros(0).into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_eigenvectors",
+        Array2::<f64>::zeros((0, 0)).into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_coefficient_basis",
+        Array2::<f64>::zeros((0, 0)).into_pyarray(py),
+    )?;
     out.set_item("cache_xtwx_fingerprint", 0_u64)?;
     out.set_item("cache_penalty_fingerprint", 0_u64)?;
     out.set_item("cache_logdet_xtwx", f64::NAN)?;
@@ -5905,9 +5955,8 @@ fn glm_reml_fit_latent<'py>(
             dim_selection_values.as_ref().map(|a| a.view()),
         )
         .map_err(py_value_error)?;
-        let analytic_score =
-            analytic_penalty_value_for_targets(&registry, t_values.view(), None)
-                .map_err(py_value_error)?;
+        let analytic_score = analytic_penalty_value_for_targets(&registry, t_values.view(), None)
+            .map_err(py_value_error)?;
         return dense_fisher_glm_fit_to_pydict(
             py,
             design.view(),
@@ -5921,9 +5970,8 @@ fn glm_reml_fit_latent<'py>(
             aux_strength_state,
         );
     }
-    let family =
-        latent_glm_family_from_str(&family, tweedie_p, negbin_theta, beta_phi)
-            .map_err(py_value_error)?;
+    let family = latent_glm_family_from_str(&family, tweedie_p, negbin_theta, beta_phi)
+        .map_err(py_value_error)?;
     let analytic_penalties_for_thread = analytic_penalties.clone();
     let latent_payload_for_thread = latent_payload.clone();
     let (fit, design, _, aux_strength_state) =
@@ -6006,9 +6054,8 @@ fn glm_reml_fit_latent_backward<'py>(
     beta_phi: f64,
     basis_kind: String,
 ) -> PyResult<Py<PyDict>> {
-    let family =
-        latent_glm_family_from_str(&family, tweedie_p, negbin_theta, beta_phi)
-            .map_err(py_value_error)?;
+    let family = latent_glm_family_from_str(&family, tweedie_p, negbin_theta, beta_phi)
+        .map_err(py_value_error)?;
     let aux_family = match aux_family.to_ascii_lowercase().as_str() {
         "ridge" => AuxPriorFamily::Ridge,
         "linear" => AuxPriorFamily::Linear,
@@ -6128,8 +6175,8 @@ fn glm_reml_fit_latent_backward<'py>(
         let stats = latent_aux_prior_stats(t_mat.view(), u_view, aux_family, aux_strength)
             .map_err(py_value_error)?;
         let residual = &t_mat - &stats.targets;
-        let projected_residual = aux_prior_targets(residual.view(), u_view, aux_family)
-            .map_err(py_value_error)?;
+        let projected_residual =
+            aux_prior_targets(residual.view(), u_view, aux_family).map_err(py_value_error)?;
         let grad_base = residual - projected_residual;
         for n in 0..n_obs {
             for a in 0..latent_dim {
@@ -6221,7 +6268,7 @@ fn arrow_schur_newton_step<'py>(
     ridge_beta: f64,
 ) -> PyResult<Py<PyDict>> {
     use gam::solver::arrow_schur::{
-        solve_arrow_newton_step_core, ArrowRowBlock, ArrowSchurSystem, ArrowSolveOptions,
+        ArrowRowBlock, ArrowSchurSystem, ArrowSolveOptions, solve_arrow_newton_step_core,
     };
     let htt = htt_blocks.as_array();
     let htb = htbeta_blocks.as_array();
@@ -6289,6 +6336,79 @@ fn arrow_schur_newton_step<'py>(
     let out = PyDict::new(py);
     out.set_item("delta_t", delta_t.into_pyarray(py))?;
     out.set_item("delta_beta", delta_beta.into_pyarray(py))?;
+    Ok(out.unbind())
+}
+
+#[pyfunction(signature = (
+    n_obs = 10_000,
+    n_atoms = 100_000,
+    latent_dim = 2,
+    beta_dim = 8,
+    chunk_size = 4096,
+))]
+fn streaming_arrow_schur_synthetic_demo<'py>(
+    py: Python<'py>,
+    n_obs: usize,
+    n_atoms: usize,
+    latent_dim: usize,
+    beta_dim: usize,
+    chunk_size: usize,
+) -> PyResult<Py<PyDict>> {
+    use gam::solver::arrow_schur::{
+        ArrowRowBlock, ArrowSolveOptions, ArrowSolverMode, StreamingArrowRowBuilder,
+        StreamingArrowSchur,
+    };
+    if n_obs == 0 || n_atoms == 0 || latent_dim == 0 || beta_dim == 0 || chunk_size == 0 {
+        return Err(py_value_error(
+            "streaming Arrow-Schur demo dimensions must be positive".to_string(),
+        ));
+    }
+    let hbb = Array2::<f64>::eye(beta_dim).mapv(|v| v * (n_obs as f64 + 10.0));
+    let mut gb = Array1::<f64>::zeros(beta_dim);
+    for j in 0..beta_dim {
+        gb[j] = ((j + 1) as f64).sin() * 0.01;
+    }
+    let row_builder: StreamingArrowRowBuilder = std::sync::Arc::new(move |atom| {
+        let mut row = ArrowRowBlock::new(latent_dim, beta_dim);
+        let scale = 1.0 + (atom % n_obs) as f64 / n_obs as f64;
+        for a in 0..latent_dim {
+            row.htt[[a, a]] = 2.0 + scale + 0.05 * a as f64;
+            row.gt[a] = ((atom + a + 1) as f64 * 0.001).sin() * 0.001;
+            for b in 0..a {
+                let v = 0.01 / ((a + b + 1) as f64);
+                row.htt[[a, b]] = v;
+                row.htt[[b, a]] = v;
+            }
+            for j in 0..beta_dim {
+                let phase = ((atom + 1) * (j + 3) + a + 5) as f64;
+                row.htbeta[[a, j]] = 0.002 * phase.sin();
+            }
+        }
+        Ok(row)
+    });
+    let mut streaming = StreamingArrowSchur::new(
+        n_atoms,
+        latent_dim,
+        beta_dim,
+        hbb,
+        gb,
+        row_builder,
+        chunk_size,
+    );
+    let mut options = ArrowSolveOptions::direct();
+    options.mode = ArrowSolverMode::Direct;
+    options.streaming_chunk_size = Some(chunk_size);
+    let (delta_t, delta_beta, _) = streaming
+        .solve(1.0e-6, 1.0e-6, &options)
+        .map_err(|e| py_value_error(format!("streaming Arrow-Schur demo: {e}")))?;
+    let out = PyDict::new(py);
+    out.set_item("n_obs", n_obs)?;
+    out.set_item("n_atoms", n_atoms)?;
+    out.set_item("latent_dim", latent_dim)?;
+    out.set_item("beta_dim", beta_dim)?;
+    out.set_item("chunk_size", chunk_size)?;
+    out.set_item("delta_t_norm", delta_t.dot(&delta_t).sqrt())?;
+    out.set_item("delta_beta_norm", delta_beta.dot(&delta_beta).sqrt())?;
     Ok(out.unbind())
 }
 
@@ -6738,7 +6858,13 @@ fn gaussian_reml_fit_formula_table_impl(
     }
     let penalty = global_penalty_from_block(x.ncols(), &design.penalties[0])?;
     if let Some(w) = fisher_rao_w {
-        return gaussian_reml_formula_table_dense_fisher(x.view(), y, penalty.view(), standard.weights.view(), w);
+        return gaussian_reml_formula_table_dense_fisher(
+            x.view(),
+            y,
+            penalty.view(),
+            standard.weights.view(),
+            w,
+        );
     }
     gam::gaussian_reml::gaussian_reml_multi_closed_form(
         x.view(),
@@ -8657,14 +8783,17 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_latent, module)?)?;
     module.add_function(wrap_pyfunction!(register_analytic_penalties, module)?)?;
+    module.add_function(wrap_pyfunction!(analytic_penalty_value_grad, module)?)?;
+    module.add_function(wrap_pyfunction!(riemannian_retract, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit_ibp, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        gaussian_reml_fit_latent_backward,
-        module
-    )?)?;
+    module.add_function(wrap_pyfunction!(gaussian_reml_fit_latent_backward, module)?)?;
     module.add_function(wrap_pyfunction!(glm_reml_fit_latent, module)?)?;
     module.add_function(wrap_pyfunction!(glm_reml_fit_latent_backward, module)?)?;
     module.add_function(wrap_pyfunction!(arrow_schur_newton_step, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        streaming_arrow_schur_synthetic_demo,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(summary_json, module)?)?;
     module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
@@ -8834,9 +8963,7 @@ fn inject_scalar_fisher_rao_weight(
     }
     let old_cols = dataset.values.ncols();
     let mut values = Array2::<f64>::zeros((n, old_cols + 1));
-    values
-        .slice_mut(s![.., ..old_cols])
-        .assign(&dataset.values);
+    values.slice_mut(s![.., ..old_cols]).assign(&dataset.values);
     values.column_mut(old_cols).assign(&combined);
     dataset.values = values;
     dataset.headers.push(weight_name.clone());
@@ -9447,9 +9574,12 @@ fn insert_coefficient_into_saved_fit(
         // Boundary adapter: `penalized_hessian` is the `UnscaledPrecision`
         // newtype; unwrap for the `insert_symmetric_array2` helper and wrap
         // the result back on assignment.
-        inference.penalized_hessian =
-            insert_symmetric_array2(inference.penalized_hessian.as_array(), index, precision_diag)?
-                .into();
+        inference.penalized_hessian = insert_symmetric_array2(
+            inference.penalized_hessian.as_array(),
+            index,
+            precision_diag,
+        )?
+        .into();
         if let Some(cov) = inference.beta_covariance.as_mut() {
             // `beta_covariance` is the `PhiScaledCovariance` newtype.
             *cov = insert_symmetric_array2(cov.as_array(), index, variance_diag)?.into();
@@ -10628,15 +10758,13 @@ fn latent_penalty_targets(
             .unwrap_or(key)
             .to_string();
         let n = json_positive_u64_to_usize(
-            obj
-                .get("n")
+            obj.get("n")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| format!("latents['{key}'].n is required"))?,
             &format!("latents['{key}'].n"),
         )?;
         let d = json_positive_u64_to_usize(
-            obj
-                .get("d")
+            obj.get("d")
                 .and_then(serde_json::Value::as_u64)
                 .ok_or_else(|| format!("latents['{key}'].d is required"))?,
             &format!("latents['{key}'].d"),
@@ -10678,7 +10806,9 @@ fn penalty_target_for_descriptor<'a>(
             )
         });
     }
-    Err(format!("{context}.target must be a latent block name or index"))
+    Err(format!(
+        "{context}.target must be a latent block name or index"
+    ))
 }
 
 fn descriptor_f64(
@@ -10714,7 +10844,9 @@ fn descriptor_no_unknown_keys(
 ) -> Result<(), String> {
     for key in descriptor.keys() {
         if !allowed.iter().any(|allowed_key| allowed_key == key) {
-            return Err(format!("{context}.{key} is not consumed by the {context} pyffi arm"));
+            return Err(format!(
+                "{context}.{key} is not consumed by the {context} pyffi arm"
+            ));
         }
     }
     Ok(())
@@ -10782,14 +10914,9 @@ fn descriptor_weight_schedule(
             let steps = schedule
                 .get("steps")
                 .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| {
-                    format!("{context}.weight_schedule.steps is required for linear")
-                })?;
+                .ok_or_else(|| format!("{context}.weight_schedule.steps is required for linear"))?;
             ScheduleKind::Linear {
-                steps: json_u64_to_usize(
-                    steps,
-                    &format!("{context}.weight_schedule.steps"),
-                )?,
+                steps: json_u64_to_usize(steps, &format!("{context}.weight_schedule.steps"))?,
             }
         }
         "reciprocal_iter" => ScheduleKind::ReciprocalIter,
@@ -10829,14 +10956,14 @@ fn descriptor_temperature_schedule(
     let tau_start = schedule
         .get("tau_start")
         .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| format!("{context}.temperature_schedule.tau_start must be a finite number"))?;
+        .ok_or_else(|| {
+            format!("{context}.temperature_schedule.tau_start must be a finite number")
+        })?;
     let tau_min = schedule
         .get("tau_min")
         .or_else(|| schedule.get("tau_end"))
         .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| {
-            format!("{context}.temperature_schedule.tau_min must be a finite number")
-        })?;
+        .ok_or_else(|| format!("{context}.temperature_schedule.tau_min must be a finite number"))?;
     let decay_name = schedule
         .get("decay")
         .and_then(serde_json::Value::as_str)
@@ -10859,10 +10986,7 @@ fn descriptor_temperature_schedule(
                     format!("{context}.temperature_schedule.steps is required for linear")
                 })?;
             ScheduleKind::Linear {
-                steps: json_u64_to_usize(
-                    steps,
-                    &format!("{context}.temperature_schedule.steps"),
-                )?,
+                steps: json_u64_to_usize(steps, &format!("{context}.temperature_schedule.steps"))?,
             }
         }
         "reciprocal_iter" => ScheduleKind::ReciprocalIter,
@@ -10908,9 +11032,9 @@ fn descriptor_difference_op(
                 .ok_or_else(|| format!("{context}.edges is required for graph_edges"))?;
             let mut edges = Vec::with_capacity(raw_edges.len());
             for (edge_idx, raw_edge) in raw_edges.iter().enumerate() {
-                let pair = raw_edge
-                    .as_array()
-                    .ok_or_else(|| format!("{context}.edges[{edge_idx}] must be a two-item list"))?;
+                let pair = raw_edge.as_array().ok_or_else(|| {
+                    format!("{context}.edges[{edge_idx}] must be a two-item list")
+                })?;
                 if pair.len() != 2 {
                     return Err(format!(
                         "{context}.edges[{edge_idx}] must contain exactly two row indices"
@@ -10952,13 +11076,10 @@ fn descriptor_array3_flat(
     }
     let mut shape = [0usize; 3];
     for (idx, raw_dim) in shape_values.iter().enumerate() {
-        let dim = raw_dim.as_u64().ok_or_else(|| {
-            format!("{context}.{shape_key}[{idx}] must be a positive integer")
-        })?;
-        shape[idx] = json_positive_u64_to_usize(
-            dim,
-            &format!("{context}.{shape_key}[{idx}]"),
-        )?;
+        let dim = raw_dim
+            .as_u64()
+            .ok_or_else(|| format!("{context}.{shape_key}[{idx}] must be a positive integer"))?;
+        shape[idx] = json_positive_u64_to_usize(dim, &format!("{context}.{shape_key}[{idx}]"))?;
     }
     let expected_len = shape[0]
         .checked_mul(shape[1])
@@ -11030,13 +11151,10 @@ fn descriptor_array2_flat(
     }
     let mut shape = [0usize; 2];
     for (idx, raw_dim) in shape_values.iter().enumerate() {
-        let dim = raw_dim.as_u64().ok_or_else(|| {
-            format!("{context}.{shape_key}[{idx}] must be a positive integer")
-        })?;
-        shape[idx] = json_positive_u64_to_usize(
-            dim,
-            &format!("{context}.{shape_key}[{idx}]"),
-        )?;
+        let dim = raw_dim
+            .as_u64()
+            .ok_or_else(|| format!("{context}.{shape_key}[{idx}] must be a positive integer"))?;
+        shape[idx] = json_positive_u64_to_usize(dim, &format!("{context}.{shape_key}[{idx}]"))?;
     }
     let expected_len = shape[0]
         .checked_mul(shape[1])
@@ -11103,18 +11221,19 @@ fn build_analytic_penalty_registry_from_json(
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,
-                    &["kind", "target", "weight", "weight_schedule"],
+                    &["kind", "target", "weight", "p_out", "weight_schedule"],
                 )?;
                 let weight = descriptor_weight_scalar(descriptor, &context)?;
-                let mut penalty = IsometryPenalty::new_euclidean(slice, target.d);
+                let p_out = descriptor_usize(descriptor, "p_out", target.d)?;
+                let mut penalty = IsometryPenalty::new_euclidean(slice, p_out);
                 penalty.scalar_weight = weight;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
                 };
-                registry.push(gam::terms::AnalyticPenaltyKind::Isometry(std::sync::Arc::new(
-                    penalty,
-                )));
+                registry.push(gam::terms::AnalyticPenaltyKind::Isometry(
+                    std::sync::Arc::new(penalty),
+                ));
             }
             "ard" => {
                 descriptor_no_unknown_keys(
@@ -11131,11 +11250,62 @@ fn build_analytic_penalty_registry_from_json(
                     penalty,
                 )));
             }
+            "topk" | "topk_activation" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &["kind", "target", "k", "weight", "weight_schedule"],
+                )?;
+                let k = descriptor_usize(descriptor, "k", 1)?;
+                let weight = descriptor_f64(descriptor, "weight", 1.0)?;
+                let penalty = TopKActivationPenalty::new(slice, k, weight)
+                    .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(gam::terms::AnalyticPenaltyKind::TopKActivation(
+                    std::sync::Arc::new(penalty),
+                ));
+            }
+            "jumprelu" | "jump_relu" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &[
+                        "kind",
+                        "target",
+                        "thresholds",
+                        "weight",
+                        "smoothing_eps",
+                        "weight_schedule",
+                    ],
+                )?;
+                let thresholds = descriptor_array1_flat(descriptor, "thresholds", &context)?;
+                let weight = descriptor_f64(descriptor, "weight", 1.0)?;
+                let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-3)?;
+                let penalty = JumpReLUPenalty::new(slice, thresholds, weight, smoothing_eps)
+                    .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(gam::terms::AnalyticPenaltyKind::JumpReLU(
+                    std::sync::Arc::new(penalty),
+                ));
+            }
             "orthogonality" => {
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,
-                    &["kind", "target", "weight", "n_eff", "learnable", "weight_schedule"],
+                    &[
+                        "kind",
+                        "target",
+                        "weight",
+                        "n_eff",
+                        "learnable",
+                        "weight_schedule",
+                    ],
                 )?;
                 let weight = descriptor_f64(descriptor, "weight", 1.0)?;
                 let n_eff = descriptor_usize(descriptor, "n_eff", target.n)?;
@@ -11210,9 +11380,9 @@ fn build_analytic_penalty_registry_from_json(
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
                 };
-                registry.push(gam::terms::AnalyticPenaltyKind::Sparsity(std::sync::Arc::new(
-                    penalty,
-                )));
+                registry.push(gam::terms::AnalyticPenaltyKind::Sparsity(
+                    std::sync::Arc::new(penalty),
+                ));
             }
             "scad_mcp" => {
                 descriptor_no_unknown_keys(
@@ -11275,14 +11445,7 @@ fn build_analytic_penalty_registry_from_json(
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,
-                    &[
-                        "kind",
-                        "target",
-                        "groups",
-                        "weight",
-                        "n_eff",
-                        "learnable",
-                    ],
+                    &["kind", "target", "groups", "weight", "n_eff", "learnable"],
                 )?;
                 let raw_groups = descriptor
                     .get("groups")
@@ -11363,7 +11526,13 @@ fn build_analytic_penalty_registry_from_json(
                 descriptor_no_unknown_keys(
                     descriptor,
                     &context,
-                    &["kind", "target", "k_atoms", "temperature", "weight_schedule"],
+                    &[
+                        "kind",
+                        "target",
+                        "k_atoms",
+                        "temperature",
+                        "weight_schedule",
+                    ],
                 )?;
                 let k_atoms = descriptor_usize(descriptor, "k_atoms", target.d)?;
                 let temperature = descriptor_f64(descriptor, "temperature", 1.0)?;
@@ -11450,9 +11619,15 @@ fn build_analytic_penalty_registry_from_json(
                     .get("learnable")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
-                let penalty =
-                    NuclearNormPenalty::new(slice, weight, n_eff, smoothing_eps, max_rank, learnable)
-                        .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = NuclearNormPenalty::new(
+                    slice,
+                    weight,
+                    n_eff,
+                    smoothing_eps,
+                    max_rank,
+                    learnable,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
@@ -11624,14 +11799,9 @@ fn build_analytic_penalty_registry_from_json(
                     "lambda_per_row_shape",
                     &context,
                 )?;
-                let penalty = RowPrecisionPriorPenalty::new(
-                    slice,
-                    lambda_per_row,
-                    weight,
-                    n_eff,
-                    learnable,
-                )
-                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty =
+                    RowPrecisionPriorPenalty::new(slice, lambda_per_row, weight, n_eff, learnable)
+                        .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
@@ -11670,25 +11840,24 @@ fn build_analytic_penalty_registry_from_json(
                 let raw_beta = descriptor_array1_flat(descriptor, "raw_beta", &context)?;
                 let mu = descriptor_array2_flat(descriptor, "mu", "mu_shape", &context)?;
                 let penalty = ParametricRowPrecisionPriorPenalty::new(
-                    slice,
-                    aux,
-                    log_alpha,
-                    raw_beta,
-                    mu,
-                    weight,
-                    n_eff,
-                    learnable,
+                    slice, aux, log_alpha, raw_beta, mu, weight, n_eff, learnable,
                 )
                 .map_err(|err| format!("{context}: {err}"))?;
                 let penalty = match weight_schedule {
                     Some(schedule) => penalty.with_weight_schedule(schedule),
                     None => penalty,
                 };
-                registry.push(gam::terms::AnalyticPenaltyKind::ParametricRowPrecisionPrior(
-                    std::sync::Arc::new(penalty),
+                registry.push(
+                    gam::terms::AnalyticPenaltyKind::ParametricRowPrecisionPrior(
+                        std::sync::Arc::new(penalty),
+                    ),
+                );
+            }
+            other => {
+                return Err(format!(
+                    "{context}.kind has unsupported analytic penalty {other:?}"
                 ));
             }
-            other => return Err(format!("{context}.kind has unsupported analytic penalty {other:?}")),
         }
     }
     Ok(registry)
@@ -11720,6 +11889,185 @@ fn register_analytic_penalties(latents_json: &str, penalties_json: &str) -> PyRe
         "layout": layout,
     }))
     .map_err(|err| py_value_error(err.to_string()))
+}
+
+#[pyfunction(signature = (
+    latents_json,
+    penalties_json,
+    target,
+    rho = None,
+    isometry_jacobian = None,
+    isometry_jacobian_second = None
+))]
+fn analytic_penalty_value_grad<'py>(
+    py: Python<'py>,
+    latents_json: &str,
+    penalties_json: &str,
+    target: PyReadonlyArray1<'py, f64>,
+    rho: Option<PyReadonlyArray1<'py, f64>>,
+    isometry_jacobian: Option<PyReadonlyArray2<'py, f64>>,
+    isometry_jacobian_second: Option<PyReadonlyArray2<'py, f64>>,
+) -> PyResult<(f64, Py<PyArray1<f64>>, Py<PyArray1<f64>>)> {
+    let latents: serde_json::Value = serde_json::from_str(latents_json)
+        .map_err(|err| py_value_error(format!("invalid latents json: {err}")))?;
+    let penalties: serde_json::Value = serde_json::from_str(penalties_json)
+        .map_err(|err| py_value_error(format!("invalid penalties json: {err}")))?;
+    let mut registry = build_analytic_penalty_registry_from_json(Some(&latents), Some(&penalties))
+        .map_err(py_value_error)?;
+
+    if let Some(j) = isometry_jacobian {
+        let j_cache = Arc::new(j.as_array().to_owned());
+        let h_cache = isometry_jacobian_second.map(|h| Arc::new(h.as_array().to_owned()));
+        for penalty in &mut registry.penalties {
+            if let AnalyticPenaltyKind::Isometry(inner) = penalty {
+                let mut cloned = (**inner).clone().with_jacobian_cache(j_cache.clone());
+                if let Some(h) = h_cache.as_ref() {
+                    cloned = cloned.with_jacobian_second_cache(h.clone());
+                }
+                *penalty = AnalyticPenaltyKind::Isometry(Arc::new(cloned));
+            }
+        }
+    }
+
+    let target_view = target.as_array();
+    let rho_owned = match rho {
+        Some(rho) => rho.as_array().to_owned(),
+        None => Array1::<f64>::zeros(registry.total_rho_count()),
+    };
+    if rho_owned.len() != registry.total_rho_count() {
+        return Err(py_value_error(format!(
+            "rho length {} does not match analytic penalty rho_count {}",
+            rho_owned.len(),
+            registry.total_rho_count()
+        )));
+    }
+
+    let mut value = 0.0_f64;
+    let mut grad = Array1::<f64>::zeros(target_view.len());
+    let mut grad_rho = Array1::<f64>::zeros(rho_owned.len());
+    for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())
+    {
+        if matches!(tier, PenaltyTier::Rho) {
+            continue;
+        }
+        let rho_local = rho_owned.slice(s![rho_slice.clone()]);
+        value += penalty.value(target_view.view(), rho_local);
+        grad += &penalty.grad_target(target_view.view(), rho_local);
+        let local_grad_rho = penalty.grad_rho(target_view.view(), rho_local);
+        for (local, global) in (rho_slice.start..rho_slice.end).enumerate() {
+            grad_rho[global] += local_grad_rho[local];
+        }
+    }
+    Ok((
+        value,
+        grad.into_pyarray(py).unbind(),
+        grad_rho.into_pyarray(py).unbind(),
+    ))
+}
+
+fn parse_manifold_kind(
+    value: &serde_json::Value,
+) -> Result<gam::solver::riemannian::ManifoldKind, String> {
+    if let Some(name) = value.as_str() {
+        return match name.to_ascii_lowercase().as_str() {
+            "circle" | "s1" => Ok(gam::solver::riemannian::ManifoldKind::Circle),
+            other => Err(format!("unknown manifold string {other:?}")),
+        };
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "manifold must be a string or object".to_string())?;
+    let kind = obj
+        .get("kind")
+        .or_else(|| obj.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "manifold.kind is required".to_string())?
+        .to_ascii_lowercase();
+    match kind.as_str() {
+        "euclidean" => {
+            let dim = obj
+                .get("dim")
+                .or_else(|| obj.get("d"))
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| "euclidean manifold requires dim".to_string())?;
+            Ok(gam::solver::riemannian::ManifoldKind::Euclidean(
+                json_positive_u64_to_usize(dim, "euclidean.dim")?,
+            ))
+        }
+        "circle" | "s1" => Ok(gam::solver::riemannian::ManifoldKind::Circle),
+        "sphere" => {
+            let n = obj
+                .get("n")
+                .or_else(|| obj.get("dim"))
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| "sphere manifold requires n or dim".to_string())?;
+            Ok(gam::solver::riemannian::ManifoldKind::Sphere(
+                json_positive_u64_to_usize(n, "sphere.n")?,
+            ))
+        }
+        "torus" => {
+            let d = obj
+                .get("d")
+                .or_else(|| obj.get("dim"))
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| "torus manifold requires d".to_string())?;
+            Ok(gam::solver::riemannian::ManifoldKind::Torus(
+                json_positive_u64_to_usize(d, "torus.d")?,
+            ))
+        }
+        "product" => {
+            let parts = obj
+                .get("components")
+                .or_else(|| obj.get("parts"))
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "product manifold requires components".to_string())?;
+            let mut parsed = Vec::with_capacity(parts.len());
+            for part in parts {
+                parsed.push(parse_manifold_kind(part)?);
+            }
+            Ok(gam::solver::riemannian::ManifoldKind::Product(parsed))
+        }
+        other => Err(format!("unknown manifold kind {other:?}")),
+    }
+}
+
+#[pyfunction(signature = (manifold_json, points, delta))]
+fn riemannian_retract<'py>(
+    py: Python<'py>,
+    manifold_json: &str,
+    points: PyReadonlyArray2<'py, f64>,
+    delta: PyReadonlyArray2<'py, f64>,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let value: serde_json::Value = serde_json::from_str(manifold_json)
+        .map_err(|err| py_value_error(format!("invalid manifold json: {err}")))?;
+    let kind = parse_manifold_kind(&value).map_err(py_value_error)?;
+    let manifold = kind.build();
+    let p = points.as_array();
+    let d = delta.as_array();
+    if p.dim() != d.dim() {
+        return Err(py_value_error(format!(
+            "points shape {:?} does not match delta shape {:?}",
+            p.dim(),
+            d.dim()
+        )));
+    }
+    if p.ncols() != manifold.ambient_dim() {
+        return Err(py_value_error(format!(
+            "points width {} does not match manifold ambient_dim {}",
+            p.ncols(),
+            manifold.ambient_dim()
+        )));
+    }
+    let mut out = Array2::<f64>::zeros(p.dim());
+    for row in 0..p.nrows() {
+        gam::solver::riemannian::retract_euclidean_delta(
+            manifold.as_ref(),
+            p.row(row),
+            d.row(row),
+            out.row_mut(row),
+        );
+    }
+    Ok(out.into_pyarray(py).unbind())
 }
 
 fn parse_fit_config(config_json: Option<&str>) -> Result<FitConfig, String> {
@@ -13570,8 +13918,7 @@ fn build_bernoulli_marginal_slope_ffi_payload(
         .clone()
         .ok_or_else(|| "bernoulli marginal-slope requires z_column".to_string())?;
 
-    let likelihood_spec =
-        inverse_link_to_binomial_spec(&base_link).map_err(|e| e.to_string())?;
+    let likelihood_spec = inverse_link_to_binomial_spec(&base_link).map_err(|e| e.to_string())?;
     let likelihood = LikelihoodFamily::try_from(likelihood_spec).map_err(|e| {
         format!(
             "failed to resolve LikelihoodFamily for bernoulli marginal-slope base link {:?}: {e}",

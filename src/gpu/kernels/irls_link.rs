@@ -18,9 +18,10 @@ pub enum BackendStatus {
 
 #[inline]
 pub fn backend_status() -> BackendStatus {
-    match crate::gpu::runtime::GpuRuntime::global() {
-        Some(_) => BackendStatus::CudaReady,
-        None => BackendStatus::CudaUnavailable,
+    if crate::gpu::runtime::GpuRuntime::global().is_some() {
+        BackendStatus::CudaReady
+    } else {
+        BackendStatus::CudaUnavailable
     }
 }
 
@@ -156,9 +157,9 @@ pub fn try_dispatch(
     if eta.is_empty() {
         return None;
     }
-    let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+    if crate::gpu::runtime::GpuRuntime::global().is_none() {
         return None;
-    };
+    }
     Some(cuda_irls_link(eta, link, derivative_order))
 }
 
@@ -265,6 +266,10 @@ extern "C" __global__ void irls_link_kernel(
         .arg(&nn)
         .arg(&cc)
         .arg(&link_code);
+    // SAFETY: func is loaded from a freshly NVRTC-compiled module bound to
+    // this context; all device args (deta, dout) point to live allocations of
+    // size n and n*cols respectively; nn/cc/link_code are pod scalars; the
+    // grid covers exactly the n threads the kernel guards against.
     unsafe { builder.launch(cfg) }.map_err(map_drv)?;
 
     let host = stream.memcpy_dtov(&dout).map_err(map_drv)?;

@@ -37,6 +37,8 @@ pub struct GenerativeSpec {
 }
 
 impl GenerativeSpec {
+    /// Number of observations `n` in the mean vector, matching the row
+    /// count of the design used to produce this generative specification.
     pub fn nobs(&self) -> usize {
         self.mean.len()
     }
