@@ -3960,6 +3960,7 @@ fn build_shape_constraint_design_1d(
                 knots,
                 identifiability_transform,
                 periodic,
+                ..
             },
         ) => {
             let evalspec = BSplineBasisSpec {
@@ -3982,6 +3983,7 @@ fn build_shape_constraint_design_1d(
                     .unwrap_or(BSplineIdentifiability::None),
                 boundary: spec.boundary.clone(),
                 boundary_conditions: BSplineBoundaryConditions::default(),
+                streaming_chunk_size: None,
             };
             build_bspline_basis_1d(x_grid.view(), &evalspec)?
                 .design
@@ -7745,9 +7747,11 @@ fn with_identifiability_transform(
             knots,
             identifiability_transform,
             periodic,
+            streaming_chunk_size,
         } => Ok(BasisMetadata::BSpline1D {
             knots: knots.clone(),
             periodic: *periodic,
+            streaming_chunk_size: *streaming_chunk_size,
             identifiability_transform: compose_identifiability_transforms(
                 identifiability_transform.as_ref(),
                 transform,
@@ -16244,6 +16248,7 @@ pub fn freeze_term_collection_from_design(
                     knots,
                     identifiability_transform,
                     periodic,
+                    streaming_chunk_size,
                 },
             ) => {
                 s.knotspec = periodic
@@ -16260,6 +16265,7 @@ pub fn freeze_term_collection_from_design(
                     },
                     None => BSplineIdentifiability::None,
                 };
+                s.streaming_chunk_size = *streaming_chunk_size;
                 // Boundary projections are folded into `identifiability_transform`
                 // by `build_bspline_basis_1d`. A frozen prediction spec must
                 // rebuild the same raw knot basis and apply the captured
