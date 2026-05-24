@@ -4698,6 +4698,17 @@ pub struct OuterResult {
     pub operator_stop_reason: Option<OperatorTrustRegionStopReason>,
 }
 
+impl OuterResult {
+    /// Human-readable rendering of `final_grad_norm` for diagnostics. Returns
+    /// `"n/a"` when no gradient was measured (gradient-free / cache-hit paths).
+    pub fn final_grad_norm_report(&self) -> String {
+        match self.final_grad_norm {
+            Some(g) => format!("{g:.3e}"),
+            None => "n/a".to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperatorTrustRegionStopReason {
     Converged,
