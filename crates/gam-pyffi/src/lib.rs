@@ -71,7 +71,8 @@ use gam::terms::sae_manifold::{
 use gam::transformation_normal::TransformationNormalFitResult;
 use gam::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
-    DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty, NuclearNormPenalty,
+    DifferenceOpKind, IBPAssignmentPenalty, IsometryPenalty, MechanismSparsityPenalty,
+    NuclearNormPenalty,
     OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier,
     PsiSlice, RowPrecisionPriorPenalty, ScalarWeightSchedule, ScadMcpPenalty,
     SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TotalVariationPenalty,
@@ -11512,6 +11513,79 @@ fn build_analytic_penalty_registry_from_json(
                     None => penalty,
                 };
                 registry.push(gam::terms::AnalyticPenaltyKind::BlockSparsity(
+                    std::sync::Arc::new(penalty),
+                ));
+            }
+            "mechanism_sparsity" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &[
+                        "kind",
+                        "target",
+                        "feature_groups",
+                        "weight",
+                        "smoothing_eps",
+                        "n_eff",
+                        "learnable",
+                        "weight_schedule",
+                    ],
+                )?;
+                let raw_groups = descriptor
+                    .get("feature_groups")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| format!("{context}.feature_groups is required"))?;
+                let mut feature_groups = Vec::with_capacity(raw_groups.len());
+                let mut max_feature = None::<usize>;
+                for (group_idx, raw_group) in raw_groups.iter().enumerate() {
+                    let raw_features = raw_group.as_array().ok_or_else(|| {
+                        format!("{context}.feature_groups[{group_idx}] must be a list of feature indices")
+                    })?;
+                    let mut group = Vec::with_capacity(raw_features.len());
+                    for (feature_idx, raw_feature) in raw_features.iter().enumerate() {
+                        let raw_feature = raw_feature.as_u64().ok_or_else(|| {
+                            format!(
+                                "{context}.feature_groups[{group_idx}][{feature_idx}] must be a non-negative integer"
+                            )
+                        })?;
+                        let feature = json_u64_to_usize(
+                            raw_feature,
+                            &format!("{context}.feature_groups[{group_idx}][{feature_idx}]"),
+                        )?;
+                        max_feature =
+                            Some(max_feature.map_or(feature, |current| current.max(feature)));
+                        group.push(feature);
+                    }
+                    feature_groups.push(group);
+                }
+                let feature_count = max_feature
+                    .and_then(|feature| feature.checked_add(1))
+                    .ok_or_else(|| format!("{context}.feature_groups must not be empty"))?;
+                let target_len = target.d.checked_mul(feature_count).ok_or_else(|| {
+                    format!("{context}.target latent_dim × feature_count overflows usize")
+                })?;
+                let mechanism_slice = PsiSlice::full(target_len, Some(target.d));
+                let weight = descriptor_f64(descriptor, "weight", 1.0)?;
+                let smoothing_eps = descriptor_f64(descriptor, "smoothing_eps", 1.0e-6)?;
+                let n_eff = descriptor_f64(descriptor, "n_eff", target.n as f64)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let penalty = MechanismSparsityPenalty::new(
+                    mechanism_slice,
+                    feature_groups,
+                    weight,
+                    smoothing_eps,
+                    n_eff,
+                    learnable,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(gam::terms::AnalyticPenaltyKind::MechanismSparsity(
                     std::sync::Arc::new(penalty),
                 ));
             }
