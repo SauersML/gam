@@ -4911,8 +4911,9 @@ impl SparseHessianSymbolic {
 /// with `O(nnz)` memory instead of `O(p²)`.
 pub struct SparseHessianAccumulator {
     sym: Arc<SparseHessianSymbolic>,
-    /// Values buffer, length `nnz`.
-    pub values: Vec<f64>,
+    /// Values buffer, length `sym.nnz`. Kept private so safe callers cannot
+    /// invalidate the length invariant required by unchecked accumulation.
+    values: Vec<f64>,
 }
 
 // Manual Clone: only the values buffer is duplicated; the symbolic pattern is
@@ -4961,10 +4962,17 @@ impl SparseHessianAccumulator {
         if s.contiguous {
             // O(1) direct-index path: rows within each column are contiguous
             // integers starting at first_row[c], so the offset is arithmetic.
-            let idx = s.col_ptrs[c] + (r - s.first_row[c]);
-            assert!(idx < s.col_ptrs[c + 1], "add_upper contiguous OOB");
-            // SAFETY: the assert! immediately above proves idx < col_ptrs[c+1]
-            // ≤ values.len(); get_unchecked_mut therefore stays in-bounds.
+            let start = s.col_ptrs[c];
+            let end = s.col_ptrs[c + 1];
+            let offset = r.wrapping_sub(s.first_row[c]);
+            assert!(
+                r >= s.first_row[c] && offset < end - start,
+                "add_upper contiguous OOB"
+            );
+            let idx = start + offset;
+            // SAFETY: the assert! immediately above proves idx is in
+            // start..end, and SparseHessianAccumulator keeps values.len() ==
+            // s.nnz with end <= s.nnz.
             unsafe {
                 *self.values.get_unchecked_mut(idx) += val;
             }
@@ -4975,9 +4983,8 @@ impl SparseHessianAccumulator {
             let slice = &s.row_indices[start..end];
             for (off, &ri) in slice.iter().enumerate() {
                 if ri == r {
-                    // SAFETY: off ∈ 0..(end-start) since it comes from
-                    // slice = row_indices[start..end], so start+off < end
-                    // ≤ values.len(); the indexed slot exists.
+                    // SAFETY: off comes from row_indices[start..end], so start+off < end.
+                    // The private values.len() == s.nnz invariant and end <= s.nnz make the slot valid.
                     unsafe {
                         *self.values.get_unchecked_mut(start + off) += val;
                     }
@@ -5026,10 +5033,12 @@ impl SparseHessianAccumulator {
                 shared.dim,
             ),
         };
-        // SAFETY: col_ptrs/row_indices came from a BTreeSet enumeration —
-        // sorted rows per column, no duplicates, every row index in [0, dim).
-        let symbolic =
-            unsafe { SymbolicSparseColMat::new_unchecked(dim, dim, col_ptrs, None, row_indices) };
+        // SAFETY: rows_by_col has dim buckets, so col_ptrs has dim+1 monotone entries
+        // starting at 0 and ending at row_indices.len(); ca/cb asserts prove every row < dim.
+        // BTreeSet iteration makes each column sorted and duplicate-free.
+        let symbolic = unsafe {
+            SymbolicSparseColMat::new_unchecked(dim, dim, col_ptrs, None, row_indices)
+        };
         SparseColMat::new(symbolic, self.values)
     }
 }
@@ -6216,6 +6225,9 @@ impl DesignMatrix {
                 }
             }
             Self::Sparse(matrix) => {
+                // SAFETY: `to_csr_arc` returns `None` only if csc→csr conversion
+                // fails, which is infallible for the well-formed sparse matrices
+                // that `SparseDesignMatrix` is contractually allowed to hold.
                 let csr = matrix.to_csr_arc().unwrap_or_else(|| {
                     panic!("DesignMatrix::squared_axpy_row_into: failed to obtain CSR view")
                 });
@@ -6274,6 +6286,10 @@ impl DesignMatrix {
                 }
             }
             (Self::Sparse(lhs), Self::Sparse(rhs)) => {
+                // SAFETY: both `to_csr_arc` calls only return `None` if csc→csr
+                // conversion fails on a well-formed sparse matrix, which is
+                // impossible — `SparseDesignMatrix`'s validation invariants
+                // upstream guarantee both inputs round-trip to CSR.
                 let lhs_csr = lhs.to_csr_arc().unwrap_or_else(|| {
                     panic!("crossdiag_axpy_row_into: failed to obtain lhs CSR view")
                 });
@@ -6314,6 +6330,9 @@ impl DesignMatrix {
                     (Self::Dense(d), Self::Sparse(s)) => (s, d),
                     _ => unreachable!(),
                 };
+                // SAFETY: same CSR conversion invariant as above — only fails
+                // on a malformed sparse matrix, which the SparseDesignMatrix
+                // invariants forbid.
                 let csr = sparse_mat.to_csr_arc().unwrap_or_else(|| {
                     panic!("crossdiag_axpy_row_into: failed to obtain CSR view")
                 });
@@ -6398,6 +6417,9 @@ impl DesignMatrix {
                 }
             }
             Self::Sparse(matrix) => {
+                // SAFETY: `to_csr_arc` returns `None` only on csc→csr conversion
+                // failure for a malformed sparse matrix; `SparseDesignMatrix`
+                // invariants forbid that case.
                 let csr = matrix.to_csr_arc().unwrap_or_else(|| {
                     panic!("DesignMatrix::syr_row_into: failed to obtain CSR view")
                 });
@@ -6484,6 +6506,9 @@ impl DesignMatrix {
                 }
             }
             (Self::Sparse(lhs), Self::Sparse(rhs)) => {
+                // SAFETY: both `to_csr_arc` calls only fail on csc→csr conversion
+                // of a malformed sparse matrix; `SparseDesignMatrix` invariants
+                // upstream guarantee both inputs round-trip to CSR.
                 let lhs_csr = lhs
                     .to_csr_arc()
                     .unwrap_or_else(|| panic!("row_outer_into: failed to obtain lhs CSR view"));
@@ -6558,6 +6583,12 @@ impl DesignMatrix {
                 }
             },
             Self::Sparse(sp) => {
+                // SAFETY: `DesignMatrix::get` is documented as an
+                // infallible scalar accessor; callers that take this path
+                // have already accepted dense materialization. A
+                // densification failure here means the sparse matrix exceeds
+                // the conservative byte budget, which `DesignMatrix::get`
+                // contractually forbids.
                 let dense = sp
                     .try_to_dense_arc("DesignMatrix::get")
                     .unwrap_or_else(|msg| panic!("{msg}"));
@@ -7252,10 +7283,9 @@ mod tests {
     fn sparse_to_dense_accumulates_duplicate_entries() {
         // Build a non-canonical CSC with duplicate row index in the same column.
         // This can happen if a caller bypasses canonical constructors.
-        // SAFETY: col_ptrs = [0,2,3] is sorted ascending and ends at nnz=3;
-        // row indices {1,1,0} all lie in [0, nrows=3). Per-column sortedness
-        // and duplicate-row tolerance is exactly what this test is exercising
-        // (the documented non-canonical bypass path); new_unchecked accepts it.
+        // SAFETY: col_ptrs has ncols+1 entries, starts at 0, is monotone, and ends
+        // at nnz=3; each column's row indices are sorted and all rows are < nrows=3.
+        // Duplicate row 1 is intentional non-canonical input accepted by new_unchecked.
         let symbolic = unsafe {
             SymbolicSparseColMat::new_unchecked(
                 3,

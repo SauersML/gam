@@ -987,9 +987,11 @@ fn factorize_simplicial_canonical_upper(
         })?;
     }
 
-    // SAFETY: perm_fwd and perm_inv were just populated by amd::order_maybe_unsorted
-    // above for a symmetric n×n matrix, so they form a valid mutually inverse
-    // permutation of 0..n required by PermRef::new_unchecked.
+    // perm_fwd and perm_inv have length n and were just populated by
+    // amd::order above for a valid symmetric n×n CSC matrix. On success,
+    // amd::order writes a valid permutation of 0..n into perm_fwd and its
+    // exact inverse into perm_inv.
+    // SAFETY: those are exactly the invariants required by PermRef::new_unchecked.
     let perm = unsafe { faer::perm::PermRef::new_unchecked(&perm_fwd, &perm_inv, n) };
 
     // 2. Permute to P A Pᵀ (upper-triangular, unsorted)
@@ -1011,9 +1013,14 @@ fn factorize_simplicial_canonical_upper(
             MemStack::new(&mut mem),
         );
         SparseColMat::<usize, f64>::new(
-            // SAFETY: col_ptrs/row_indices were just produced by
-            // permute_self_adjoint_to_unsorted from a valid n×n CSC, so
-            // they preserve its monotone col_ptrs and rows-in-0..n invariants.
+            // col_ptrs and row_indices were just produced into preallocated
+            // buffers by permute_self_adjoint_to_unsorted from a valid n×n
+            // symbolic CSC and a valid permutation. That routine writes an
+            // unsorted CSC with col_ptrs length n + 1, monotone column ranges
+            // within row_indices, and every row index in 0..n.
+            // SAFETY: those are the hard SymbolicSparseColMat invariants; the
+            // following faer symbolic Cholesky routines accept this unsorted
+            // self-adjoint permutation.
             unsafe { SymbolicSparseColMat::new_unchecked(n, n, col_ptrs, None, row_indices) },
             values,
         )
@@ -1028,7 +1035,7 @@ fn factorize_simplicial_canonical_upper(
         let stack = MemStack::new(&mut mem);
         let mut etree = vec![0isize; n];
         let mut col_counts = vec![0usize; n];
-        simplicial::prefactorize_symbolic_cholesky(
+        let etree_ref = simplicial::prefactorize_symbolic_cholesky(
             &mut etree,
             &mut col_counts,
             a_perm_upper.symbolic(),
@@ -1036,10 +1043,7 @@ fn factorize_simplicial_canonical_upper(
         );
         simplicial::factorize_simplicial_symbolic_cholesky(
             a_perm_upper.symbolic(),
-            // SAFETY: etree was just filled by prefactorize_symbolic_cholesky
-            // immediately above with length n and the parent-of-each-node
-            // sentinel layout that EliminationTreeRef::from_inner expects.
-            unsafe { simplicial::EliminationTreeRef::from_inner(&etree) },
+            etree_ref,
             &col_counts,
             stack,
         )
