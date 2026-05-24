@@ -323,8 +323,7 @@ pub(crate) fn firth_problem_scale_allows(n_obs: usize, p_coeff: usize) -> bool {
 mod tests {
     use super::{
         DirectionalHyperParam, EvalCacheManager, EvalShared, FirthDenseOperator,
-        GlmLikelihoodFamily, HyperDesignDerivative, HyperPenaltyDerivative, ImplicitDerivLevel,
-        RemlConfig, RemlState,
+        HyperDesignDerivative, HyperPenaltyDerivative, ImplicitDerivLevel, RemlConfig, RemlState,
     };
     use crate::estimate::EstimationError;
     use crate::faer_ndarray::{FaerCholesky, FaerEigh};
@@ -332,10 +331,94 @@ mod tests {
     use crate::pirls::PirlsCoordinateFrame;
     use crate::solver::outer_strategy::{HessianResult, OuterEval};
     use crate::terms::basis::{ImplicitDesignPsiDerivative, RadialScalarKind};
-    use crate::types::GlmLikelihoodSpec;
+    use crate::types::{
+        GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
+        ResponseFamily,
+    };
     use faer::Side;
     use ndarray::{Array1, Array2, array, s};
     use std::sync::Arc;
+
+    /// Project a `LikelihoodSpec` (the new `(response, link)` form) back onto a
+    /// `GlmLikelihoodSpec` so test fixtures can construct their likelihoods via
+    /// the migrated `LikelihoodSpec` constructor while `RemlConfig::external`
+    /// continues to accept `GlmLikelihoodSpec`.
+    ///
+    /// Mapping follows the migration spec:
+    ///   { Gaussian,         Standard(Identity) } -> GaussianIdentity
+    ///   { Binomial,         Standard(Logit)    } -> BinomialLogit
+    ///   { Binomial,         Standard(Probit)   } -> BinomialProbit
+    ///   { Binomial,         Standard(CLogLog)  } -> BinomialCLogLog
+    ///   { Binomial,         Sas(_)             } -> BinomialSas
+    ///   { Binomial,         BetaLogistic(_)    } -> BinomialBetaLogistic
+    ///   { Binomial,         Mixture(_)         } -> BinomialMixture
+    ///   { Poisson,          Standard(Log)      } -> PoissonLog
+    ///   { Tweedie { p },    Standard(Log)      } -> Tweedie { p }
+    ///   { NegativeBinomial { theta }, Standard(Log) } -> NegativeBinomial { theta }
+    ///   { Beta { phi },     Standard(Logit)    } -> BetaLogit { phi }
+    ///   { Gamma,            Standard(Log)      } -> GammaLog
+    fn glm_spec_from_likelihood_spec(spec: LikelihoodSpec) -> GlmLikelihoodSpec {
+        let family = match (&spec.response, &spec.link) {
+            (ResponseFamily::Gaussian, InverseLink::Standard(LinkFunction::Identity)) => {
+                GlmLikelihoodFamily::GaussianIdentity
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Logit)) => {
+                GlmLikelihoodFamily::BinomialLogit
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::Probit)) => {
+                GlmLikelihoodFamily::BinomialProbit
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(LinkFunction::CLogLog)) => {
+                GlmLikelihoodFamily::BinomialCLogLog
+            }
+            (ResponseFamily::Binomial, InverseLink::Sas(_)) => GlmLikelihoodFamily::BinomialSas,
+            (ResponseFamily::Binomial, InverseLink::BetaLogistic(_)) => {
+                GlmLikelihoodFamily::BinomialBetaLogistic
+            }
+            (ResponseFamily::Binomial, InverseLink::Mixture(_)) => {
+                GlmLikelihoodFamily::BinomialMixture
+            }
+            (ResponseFamily::Poisson, InverseLink::Standard(LinkFunction::Log)) => {
+                GlmLikelihoodFamily::PoissonLog
+            }
+            (ResponseFamily::Tweedie { p }, InverseLink::Standard(LinkFunction::Log)) => {
+                GlmLikelihoodFamily::Tweedie { p: *p }
+            }
+            (
+                ResponseFamily::NegativeBinomial { theta },
+                InverseLink::Standard(LinkFunction::Log),
+            ) => GlmLikelihoodFamily::NegativeBinomial { theta: *theta },
+            (ResponseFamily::Beta { phi }, InverseLink::Standard(LinkFunction::Logit)) => {
+                GlmLikelihoodFamily::BetaLogit { phi: *phi }
+            }
+            (ResponseFamily::Gamma, InverseLink::Standard(LinkFunction::Log)) => {
+                GlmLikelihoodFamily::GammaLog
+            }
+            (response, link) => panic!(
+                "no GlmLikelihoodFamily mapping for LikelihoodSpec {{ response: {:?}, link: {:?} }}",
+                response, link,
+            ),
+        };
+        GlmLikelihoodSpec::canonical(family)
+    }
+
+    /// Shorthand for the canonical Binomial-Logit `LikelihoodSpec` used by the
+    /// REML test fixtures.
+    fn binomial_logit_glm_spec() -> GlmLikelihoodSpec {
+        glm_spec_from_likelihood_spec(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(LinkFunction::Logit),
+        ))
+    }
+
+    /// Shorthand for the canonical Gaussian-Identity `LikelihoodSpec` used by
+    /// the REML test fixtures.
+    fn gaussian_identity_glm_spec() -> GlmLikelihoodSpec {
+        glm_spec_from_likelihood_spec(LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(LinkFunction::Identity),
+        ))
+    }
 
     impl DirectionalHyperParam {
         pub(super) fn new(
