@@ -90,7 +90,7 @@ WeightSpec: TypeAlias = str | float
 TargetSpec: TypeAlias = str | int | Any
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class ScalarWeightSchedule:
     """Temperature-style annealing schedule for analytic penalty weights."""
 
@@ -262,7 +262,7 @@ def _inverse_softplus(x: np.ndarray) -> np.ndarray:
     return out
 
 
-@dataclass(init=False)
+@dataclass(init=False, slots=True)
 class IsometryPenalty:
     """Pull the decoder's pullback metric toward a reference metric on the
     latent manifold.
@@ -333,7 +333,7 @@ class IsometryPenalty:
         return self._to_rust_payload()
 
 
-@dataclass(init=False)
+@dataclass(init=False, slots=True)
 class SparsityPenalty:
     """Smoothed-L¹ / Hoyer / Log sparsifier on a β or t slice.
 
@@ -434,7 +434,7 @@ class SparsityPenalty:
         return self._to_rust_payload()
 
 
-@dataclass(init=False)
+@dataclass(init=False, slots=True)
 class ScadMcpPenalty:
     """Concave SCAD/MCP sparsity on latent coordinates.
 
@@ -514,7 +514,7 @@ class ScadMcpPenalty:
         return self._to_rust_payload()
 
 
-@dataclass(init=False)
+@dataclass(init=False, slots=True)
 class ARDPenalty:
     """Automatic Relevance Determination over latent axes.
 
@@ -569,7 +569,7 @@ class ARDPenalty:
         return self._to_rust_payload()
 
 
-@dataclass(init=False)
+@dataclass(init=False, slots=True)
 class TotalVariationPenalty:
     """Smoothed-L¹ total variation on first differences of a latent block.
 
@@ -680,7 +680,7 @@ class TotalVariationPenalty:
         return self._to_rust_payload()
 
 
-@dataclass(init=False)
+@dataclass(init=False, slots=True)
 class NuclearNormPenalty:
     """Smoothed nuclear norm on a matrix-valued latent block.
 
@@ -759,7 +759,7 @@ class NuclearNormPenalty:
         return self._to_rust_payload()
 
 
-@dataclass(init=False)
+@dataclass(init=False, slots=True)
 class BlockSparsityPenalty:
     """Group-lasso sparsity over predefined latent-axis groups.
 
@@ -874,7 +874,7 @@ class BlockSparsityPenalty:
         return self._to_rust_payload()
 
 
-@dataclass(init=False)
+@dataclass(init=False, slots=True)
 class BlockOrthogonalityPenalty:
     """Between-block-only orthogonality over latent-axis groups.
 
@@ -982,7 +982,7 @@ class BlockOrthogonalityPenalty:
         return self._to_rust_payload()
 
 
-@dataclass(init=False)
+@dataclass(init=False, slots=True)
 class AuxConditionalPriorPenalty:
     """Fixed-precomputed iVAE-style auxiliary-conditional prior on t.
 
@@ -1082,7 +1082,7 @@ class AuxConditionalPriorPenalty:
         return self._to_rust_payload()
 
 
-@dataclass(init=False)
+@dataclass(init=False, slots=True)
 class IvaeRidgeMeanGauge:
     """iVAE conditional-mean gauge penalty on t.
 
@@ -1181,7 +1181,7 @@ class IvaeRidgeMeanGauge:
         return self._to_rust_payload()
 
 
-@dataclass(init=False)
+@dataclass(init=False, slots=True)
 class ParametricAuxConditionalPriorPenalty:
     """Parametric iVAE-style auxiliary-conditional prior on t.
 
@@ -1332,7 +1332,7 @@ class ParametricAuxConditionalPriorPenalty:
         return self._to_rust_payload()
 
 
-@dataclass(init=False)
+@dataclass(init=False, slots=True)
 class OrthogonalityPenalty:
     """Gauge-fixing penalty for latent-axis identifiability.
 
@@ -1395,7 +1395,7 @@ class OrthogonalityPenalty:
         return self._to_rust_payload()
 
 
-@dataclass(init=False)
+@dataclass(init=False, slots=True)
 class IBPAssignmentPenalty:
     target: TargetSpec
     k_max: int
@@ -1448,7 +1448,7 @@ class IBPAssignmentPenalty:
         return self._to_rust_payload()
 
 
-@dataclass(init=False)
+@dataclass(init=False, slots=True)
 class SoftmaxAssignmentSparsityPenalty:
     target: TargetSpec
     k_atoms: int

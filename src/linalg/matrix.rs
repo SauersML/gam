@@ -3027,6 +3027,20 @@ fn decode_multi_index(mut flat: usize, dims: &[usize], out: &mut [usize]) {
     }
 }
 
+fn upper_triangle_pair_from_index(pair_idx: usize, n: usize) -> (usize, usize) {
+    let span = 2 * n + 1;
+    let discriminant = span * span - 8 * pair_idx;
+    let row = ((span as f64 - (discriminant as f64).sqrt()) * 0.5) as usize;
+    let row_start = row * (2 * n - row + 1) / 2;
+    (row, row + pair_idx - row_start)
+}
+
+fn lower_triangle_pair_from_index(pair_idx: usize) -> (usize, usize) {
+    let row = (((8 * pair_idx + 1) as f64).sqrt() as usize - 1) / 2;
+    let row_start = row * (row + 1) / 2;
+    (row, pair_idx - row_start)
+}
+
 /// Each row is the Kronecker product of the corresponding marginal rows:
 /// `X[i, :] = B_1[i, :] ⊗ ... ⊗ B_d[i, :]`.
 ///
@@ -3296,12 +3310,11 @@ impl LinearOperator for TensorProductDesignOperator {
         // and the collected blocks are scattered sequentially in pair order so
         // reductions do not depend on worker scheduling.
         let tail_d = tail_dims.len();
-        let pairs: Vec<(usize, usize)> = (0..tail_total)
-            .flat_map(|a_flat| (a_flat..tail_total).map(move |b_flat| (a_flat, b_flat)))
-            .collect();
-        let blocks: Vec<(usize, usize, Array2<f64>)> = pairs
+        let pair_count = tail_total * (tail_total + 1) / 2;
+        let blocks: Vec<(usize, usize, Array2<f64>)> = (0..pair_count)
             .into_par_iter()
-            .map(|(a_flat, b_flat)| {
+            .map(|pair_idx| {
+                let (a_flat, b_flat) = upper_triangle_pair_from_index(pair_idx, tail_total);
                 let mut a_indices = vec![0usize; tail_d];
                 let mut b_indices = vec![0usize; tail_d];
                 decode_multi_index(a_flat, &tail_dims, &mut a_indices);
@@ -4105,12 +4118,11 @@ impl LinearOperator for RowwiseKroneckerOperator {
         // where γ[i] = w[i] * time[i,t1] * time[i,t2].  Blocks are computed
         // in rayon tasks with task-local gamma arrays, then scattered in
         // lexicographic pair order for deterministic reductions.
-        let pairs: Vec<(usize, usize)> = (0..p_time)
-            .flat_map(|t1| (0..=t1).map(move |t2| (t1, t2)))
-            .collect();
-        let blocks: Result<Vec<(usize, usize, Array2<f64>)>, String> = pairs
+        let pair_count = p_time * (p_time + 1) / 2;
+        let blocks: Result<Vec<(usize, usize, Array2<f64>)>, String> = (0..pair_count)
             .into_par_iter()
-            .map(|(t1, t2)| {
+            .map(|pair_idx| {
+                let (t1, t2) = lower_triangle_pair_from_index(pair_idx);
                 let time_t1 = time.column(t1);
                 let time_t2 = time.column(t2);
                 let mut gamma = Array1::<f64>::zeros(n);

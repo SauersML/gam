@@ -1453,7 +1453,7 @@ pub fn parse_formula(formula: &str) -> Result<ParsedFormula, FormulaDslError> {
             .into());
         }
         // Normalize whitespace so `smooth(x)` and `smooth( x )` match.
-        let key: String = t.split_whitespace().collect::<Vec<_>>().join("");
+        let key: String = t.split_whitespace().collect();
         if !seen_term_keys.insert(key.clone()) {
             return Err(FormulaDslError::IncompatibleTerm {
                 reason: format!(

@@ -5,7 +5,7 @@ from html import escape
 from typing import Any
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SchemaIssue:
     """A single schema-validation problem detected against the training schema.
 
@@ -27,7 +27,7 @@ class SchemaIssue:
     column: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class SchemaCheck:
     """Result of comparing serving data against a fitted model's training schema.
 

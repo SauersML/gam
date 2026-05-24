@@ -416,7 +416,7 @@ def geometry_exp_map(
     )
 
 
-@dataclass
+@dataclass(slots=True)
 class SharedGaussianRemlTangentFit:
     template_model: Any
     coefficients: Any
@@ -442,7 +442,7 @@ class SharedGaussianRemlTangentFit:
         }
 
 
-@dataclass
+@dataclass(slots=True)
 class ResponseGeometryModel:
     """A fitted response-geometry GAM with shared smoothing across tangent coordinates."""
 

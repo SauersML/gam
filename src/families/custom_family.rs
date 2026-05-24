@@ -927,11 +927,11 @@ pub enum ExactOuterDerivativeOrder {
 }
 
 impl ExactOuterDerivativeOrder {
-    pub fn has_gradient(self) -> bool {
+    pub const fn has_gradient(self) -> bool {
         !matches!(self, Self::Zeroth)
     }
 
-    pub fn has_hessian(self) -> bool {
+    pub const fn has_hessian(self) -> bool {
         matches!(self, Self::Second)
     }
 }
@@ -1217,7 +1217,7 @@ pub fn cost_gated_first_order_max_iter(
 /// validate. `5.0` allows up to `e^5 ≈ 148`-fold smoothing-parameter change
 /// per accepted outer iter, which matches the typical quasi-Newton direction
 /// magnitude while still bounding pathological probes.
-pub fn first_order_bfgs_loglambda_step_cap(has_outer_hessian: bool) -> Option<f64> {
+pub const fn first_order_bfgs_loglambda_step_cap(has_outer_hessian: bool) -> Option<f64> {
     if has_outer_hessian { None } else { Some(5.0) }
 }
 
@@ -3058,8 +3058,7 @@ pub fn blockwise_fit_from_parts(
 
     // Build unified blocks from the blockwise states.
     use crate::solver::estimate::{FittedBlock, FittedLinkState, UnifiedFitResultParts};
-    let penalty_counts: Vec<usize> = specs.iter().map(|s| s.penalties.len()).collect();
-    let expected_rho: usize = penalty_counts.iter().sum();
+    let expected_rho: usize = specs.iter().map(|s| s.penalties.len()).sum();
     if lambdas.len() != expected_rho {
         return Err(CustomFamilyError::DimensionMismatch { reason: format!(
             "blockwise_fit.lambdas length ({}) does not match sum of per-block penalty counts ({})",
@@ -3073,7 +3072,7 @@ pub fn blockwise_fit_from_parts(
         .enumerate()
         .map(|(i, bs)| {
             let role = custom_family_block_role(&specs[i].name, i, block_states.len());
-            let k = penalty_counts[i];
+            let k = specs[i].penalties.len();
             let block_lambdas = lambdas
                 .slice(s![lambda_offset..lambda_offset + k])
                 .to_owned();

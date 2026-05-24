@@ -5,7 +5,7 @@ from html import escape
 from typing import Any
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Summary:
     """Frozen view of a fitted-model summary payload.
 

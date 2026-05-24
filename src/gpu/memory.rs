@@ -9,22 +9,22 @@ pub struct DeviceBuffer<T> {
 }
 
 impl<T> DeviceBuffer<T> {
-    pub fn from_host_shadow(host_shadow: Vec<T>) -> Self {
+    pub const fn from_host_shadow(host_shadow: Vec<T>) -> Self {
         Self {
             host_shadow,
             location: MatrixLocation::Host,
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.host_shadow.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.host_shadow.is_empty()
+    pub const fn is_empty(&self) -> bool {
+        self.host_shadow.len() == 0
     }
 
-    pub fn location(&self) -> MatrixLocation {
+    pub const fn location(&self) -> MatrixLocation {
         self.location
     }
 
@@ -66,7 +66,7 @@ impl DeviceMatrix {
         }
     }
 
-    pub fn bytes(&self) -> usize {
+    pub const fn bytes(&self) -> usize {
         self.rows
             .saturating_mul(self.cols)
             .saturating_mul(std::mem::size_of::<f64>())
@@ -83,7 +83,7 @@ pub struct DeviceCsrMatrix {
 }
 
 impl DeviceCsrMatrix {
-    pub fn nnz(&self) -> usize {
+    pub const fn nnz(&self) -> usize {
         self.values.len()
     }
 }

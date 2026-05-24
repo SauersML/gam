@@ -42,7 +42,7 @@ pub enum LinkFunction {
 
 impl LinkFunction {
     #[inline]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Logit => "logit",
             Self::Probit => "probit",
@@ -67,7 +67,7 @@ pub enum LinkComponent {
 
 impl LinkComponent {
     #[inline]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Probit => "probit",
             Self::Logit => "logit",
@@ -145,7 +145,7 @@ pub enum InverseLink {
 
 impl InverseLink {
     #[inline]
-    pub fn link_function(&self) -> LinkFunction {
+    pub const fn link_function(&self) -> LinkFunction {
         match self {
             Self::Standard(link) => *link,
             Self::LatentCLogLog(_) => LinkFunction::CLogLog,
@@ -156,7 +156,7 @@ impl InverseLink {
     }
 
     #[inline]
-    pub fn mixture_state(&self) -> Option<&MixtureLinkState> {
+    pub const fn mixture_state(&self) -> Option<&MixtureLinkState> {
         match self {
             Self::Mixture(state) => Some(state),
             _ => None,
@@ -164,7 +164,7 @@ impl InverseLink {
     }
 
     #[inline]
-    pub fn sas_state(&self) -> Option<&SasLinkState> {
+    pub const fn sas_state(&self) -> Option<&SasLinkState> {
         match self {
             Self::Sas(state) | Self::BetaLogistic(state) => Some(state),
             _ => None,
@@ -172,7 +172,7 @@ impl InverseLink {
     }
 
     #[inline]
-    pub fn latent_cloglog_state(&self) -> Option<&LatentCLogLogState> {
+    pub const fn latent_cloglog_state(&self) -> Option<&LatentCLogLogState> {
         match self {
             Self::LatentCLogLog(state) => Some(state),
             _ => None,
@@ -297,7 +297,7 @@ pub enum ResponseFamily {
 
 impl ResponseFamily {
     #[inline]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::Gaussian => "gaussian",
             Self::Binomial => "binomial",
@@ -326,51 +326,51 @@ pub struct LikelihoodSpec {
 
 impl LikelihoodSpec {
     #[inline]
-    pub fn new(response: ResponseFamily, link: InverseLink) -> Self {
+    pub const fn new(response: ResponseFamily, link: InverseLink) -> Self {
         Self { response, link }
     }
 
     #[inline]
-    pub fn link_function(&self) -> LinkFunction {
+    pub const fn link_function(&self) -> LinkFunction {
         self.link.link_function()
     }
 
     #[inline]
-    pub fn is_binomial(&self) -> bool {
+    pub const fn is_binomial(&self) -> bool {
         matches!(self.response, ResponseFamily::Binomial)
     }
 
     #[inline]
-    pub fn is_gaussian_identity(&self) -> bool {
+    pub const fn is_gaussian_identity(&self) -> bool {
         matches!(self.response, ResponseFamily::Gaussian)
             && matches!(self.link, InverseLink::Standard(LinkFunction::Identity))
     }
 
     #[inline]
-    pub fn is_royston_parmar(&self) -> bool {
+    pub const fn is_royston_parmar(&self) -> bool {
         matches!(self.response, ResponseFamily::RoystonParmar)
     }
 
     #[inline]
-    pub fn is_latent_cloglog(&self) -> bool {
+    pub const fn is_latent_cloglog(&self) -> bool {
         matches!(self.response, ResponseFamily::Binomial)
             && matches!(self.link, InverseLink::LatentCLogLog(_))
     }
 
     #[inline]
-    pub fn is_binomial_mixture(&self) -> bool {
+    pub const fn is_binomial_mixture(&self) -> bool {
         matches!(self.response, ResponseFamily::Binomial)
             && matches!(self.link, InverseLink::Mixture(_))
     }
 
     #[inline]
-    pub fn is_binomial_sas(&self) -> bool {
+    pub const fn is_binomial_sas(&self) -> bool {
         matches!(self.response, ResponseFamily::Binomial)
             && matches!(self.link, InverseLink::Sas(_))
     }
 
     #[inline]
-    pub fn is_binomial_beta_logistic(&self) -> bool {
+    pub const fn is_binomial_beta_logistic(&self) -> bool {
         matches!(self.response, ResponseFamily::Binomial)
             && matches!(self.link, InverseLink::BetaLogistic(_))
     }
@@ -378,7 +378,7 @@ impl LikelihoodSpec {
     /// Default scale metadata for this (response, link). Mirrors
     /// `LikelihoodFamily::default_scale_metadata` for the response.
     #[inline]
-    pub fn default_scale_metadata(&self) -> LikelihoodScaleMetadata {
+    pub const fn default_scale_metadata(&self) -> LikelihoodScaleMetadata {
         match self.response {
             ResponseFamily::Gaussian => LikelihoodScaleMetadata::ProfiledGaussian,
             ResponseFamily::Gamma => LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 },
@@ -527,7 +527,7 @@ pub fn is_valid_tweedie_power(p: f64) -> bool {
 
 impl LikelihoodFamily {
     #[inline]
-    pub fn link_function(self) -> LinkFunction {
+    pub const fn link_function(self) -> LinkFunction {
         match self {
             Self::GaussianIdentity | Self::RoystonParmar => LinkFunction::Identity,
             Self::PoissonLog
@@ -544,7 +544,7 @@ impl LikelihoodFamily {
     }
 
     #[inline]
-    pub fn name(self) -> &'static str {
+    pub const fn name(self) -> &'static str {
         match self {
             Self::GaussianIdentity => "gaussian",
             Self::BinomialLogit => "binomial-logit",
@@ -564,7 +564,7 @@ impl LikelihoodFamily {
     }
 
     #[inline]
-    pub fn pretty_name(self) -> &'static str {
+    pub const fn pretty_name(self) -> &'static str {
         match self {
             Self::GaussianIdentity => "Gaussian Identity",
             Self::BinomialLogit => "Binomial Logit",
@@ -586,49 +586,49 @@ impl LikelihoodFamily {
     /// Whether the shared Jeffreys/Firth implementation is available for this
     /// likelihood family.
     #[inline]
-    pub fn supports_firth(self) -> bool {
+    pub const fn supports_firth(self) -> bool {
         matches!(self, Self::BinomialLogit)
     }
 
     /// `true` for the latent-cloglog binomial family — checked at many sites
     /// to short-circuit the latent-Gaussian quadrature path.
     #[inline]
-    pub fn is_latent_cloglog(self) -> bool {
+    pub const fn is_latent_cloglog(self) -> bool {
         matches!(self, Self::BinomialLatentCLogLog)
     }
 
     /// `true` for the Gaussian-identity family.
     #[inline]
-    pub fn is_gaussian_identity(self) -> bool {
+    pub const fn is_gaussian_identity(self) -> bool {
         matches!(self, Self::GaussianIdentity)
     }
 
     /// `true` for the Royston-Parmar (flexible parametric survival) family.
     #[inline]
-    pub fn is_royston_parmar(self) -> bool {
+    pub const fn is_royston_parmar(self) -> bool {
         matches!(self, Self::RoystonParmar)
     }
 
     /// `true` for the blended/mixture-of-inverse-links binomial family.
     #[inline]
-    pub fn is_binomial_mixture(self) -> bool {
+    pub const fn is_binomial_mixture(self) -> bool {
         matches!(self, Self::BinomialMixture)
     }
 
     /// `true` for the SAS sinh-arcsinh binomial family.
     #[inline]
-    pub fn is_binomial_sas(self) -> bool {
+    pub const fn is_binomial_sas(self) -> bool {
         matches!(self, Self::BinomialSas)
     }
 
     /// `true` for the beta-logistic binomial family.
     #[inline]
-    pub fn is_binomial_beta_logistic(self) -> bool {
+    pub const fn is_binomial_beta_logistic(self) -> bool {
         matches!(self, Self::BinomialBetaLogistic)
     }
 
     #[inline]
-    pub fn is_binomial(self) -> bool {
+    pub const fn is_binomial(self) -> bool {
         matches!(
             self,
             Self::BinomialLogit
@@ -642,7 +642,7 @@ impl LikelihoodFamily {
     }
 
     #[inline]
-    pub fn default_scale_metadata(self) -> LikelihoodScaleMetadata {
+    pub const fn default_scale_metadata(self) -> LikelihoodScaleMetadata {
         match self {
             Self::GaussianIdentity => LikelihoodScaleMetadata::ProfiledGaussian,
             Self::GammaLog => LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 },
@@ -681,18 +681,30 @@ pub enum GlmLikelihoodFamily {
 
 impl GlmLikelihoodFamily {
     #[inline]
-    pub fn link_function(self) -> LinkFunction {
-        LikelihoodFamily::from(self).link_function()
+    pub const fn link_function(self) -> LinkFunction {
+        match self {
+            Self::GaussianIdentity => LinkFunction::Identity,
+            Self::PoissonLog
+            | Self::Tweedie { .. }
+            | Self::NegativeBinomial { .. }
+            | Self::GammaLog => LinkFunction::Log,
+            Self::BetaLogit { .. } => LinkFunction::Logit,
+            Self::BinomialLogit | Self::BinomialMixture => LinkFunction::Logit,
+            Self::BinomialProbit => LinkFunction::Probit,
+            Self::BinomialCLogLog => LinkFunction::CLogLog,
+            Self::BinomialSas => LinkFunction::Sas,
+            Self::BinomialBetaLogistic => LinkFunction::BetaLogistic,
+        }
     }
 
     #[inline]
-    pub fn supports_firth(self) -> bool {
-        LikelihoodFamily::from(self).supports_firth()
+    pub const fn supports_firth(self) -> bool {
+        matches!(self, Self::BinomialLogit)
     }
 
     /// `true` for the Gaussian-identity GLM family.
     #[inline]
-    pub fn is_gaussian_identity(self) -> bool {
+    pub const fn is_gaussian_identity(self) -> bool {
         matches!(self, Self::GaussianIdentity)
     }
 }
@@ -714,7 +726,7 @@ pub enum LikelihoodScaleMetadata {
 
 impl LikelihoodScaleMetadata {
     #[inline]
-    pub fn fixed_phi(self) -> Option<f64> {
+    pub const fn fixed_phi(self) -> Option<f64> {
         match self {
             Self::FixedDispersion { phi } => Some(phi),
             Self::FixedGammaShape { shape } | Self::EstimatedGammaShape { shape } => {
@@ -725,7 +737,7 @@ impl LikelihoodScaleMetadata {
     }
 
     #[inline]
-    pub fn gamma_shape(self) -> Option<f64> {
+    pub const fn gamma_shape(self) -> Option<f64> {
         match self {
             Self::FixedGammaShape { shape } | Self::EstimatedGammaShape { shape } => Some(shape),
             _ => None,
@@ -733,7 +745,7 @@ impl LikelihoodScaleMetadata {
     }
 
     #[inline]
-    pub fn gamma_shape_is_estimated(self) -> bool {
+    pub const fn gamma_shape_is_estimated(self) -> bool {
         matches!(self, Self::EstimatedGammaShape { .. })
     }
 }
@@ -755,35 +767,65 @@ pub struct GlmLikelihoodSpec {
 
 impl GlmLikelihoodSpec {
     #[inline]
-    pub fn canonical(family: GlmLikelihoodFamily) -> Self {
-        // GLM families are a strict subset of LikelihoodFamily, so the
-        // canonical scale comes from the unified table to avoid drift.
-        let scale = LikelihoodFamily::from(family).default_scale_metadata();
+    pub const fn canonical(family: GlmLikelihoodFamily) -> Self {
+        let scale = match family {
+            GlmLikelihoodFamily::GaussianIdentity => LikelihoodScaleMetadata::ProfiledGaussian,
+            GlmLikelihoodFamily::GammaLog => {
+                LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 }
+            }
+            GlmLikelihoodFamily::BinomialLogit
+            | GlmLikelihoodFamily::BinomialProbit
+            | GlmLikelihoodFamily::BinomialCLogLog
+            | GlmLikelihoodFamily::BinomialSas
+            | GlmLikelihoodFamily::BinomialBetaLogistic
+            | GlmLikelihoodFamily::BinomialMixture
+            | GlmLikelihoodFamily::Tweedie { .. }
+            | GlmLikelihoodFamily::NegativeBinomial { .. }
+            | GlmLikelihoodFamily::BetaLogit { .. }
+            | GlmLikelihoodFamily::PoissonLog => LikelihoodScaleMetadata::FixedDispersion {
+                phi: 1.0,
+            },
+        };
         Self { family, scale }
     }
 
     #[inline]
-    pub fn link_function(self) -> LinkFunction {
+    pub const fn link_function(self) -> LinkFunction {
         self.family.link_function()
     }
 
     #[inline]
-    pub fn response_family(self) -> LikelihoodFamily {
-        self.family.into()
+    pub const fn response_family(self) -> LikelihoodFamily {
+        match self.family {
+            GlmLikelihoodFamily::GaussianIdentity => LikelihoodFamily::GaussianIdentity,
+            GlmLikelihoodFamily::BinomialLogit => LikelihoodFamily::BinomialLogit,
+            GlmLikelihoodFamily::BinomialProbit => LikelihoodFamily::BinomialProbit,
+            GlmLikelihoodFamily::BinomialCLogLog => LikelihoodFamily::BinomialCLogLog,
+            GlmLikelihoodFamily::BinomialSas => LikelihoodFamily::BinomialSas,
+            GlmLikelihoodFamily::BinomialBetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
+            GlmLikelihoodFamily::BinomialMixture => LikelihoodFamily::BinomialMixture,
+            GlmLikelihoodFamily::PoissonLog => LikelihoodFamily::PoissonLog,
+            GlmLikelihoodFamily::Tweedie { p } => LikelihoodFamily::Tweedie { p },
+            GlmLikelihoodFamily::NegativeBinomial { theta } => {
+                LikelihoodFamily::NegativeBinomial { theta }
+            }
+            GlmLikelihoodFamily::BetaLogit { phi } => LikelihoodFamily::BetaLogit { phi },
+            GlmLikelihoodFamily::GammaLog => LikelihoodFamily::GammaLog,
+        }
     }
 
     #[inline]
-    pub fn fixed_phi(self) -> Option<f64> {
+    pub const fn fixed_phi(self) -> Option<f64> {
         self.scale.fixed_phi()
     }
 
     #[inline]
-    pub fn gamma_shape(self) -> Option<f64> {
+    pub const fn gamma_shape(self) -> Option<f64> {
         self.scale.gamma_shape()
     }
 
     #[inline]
-    pub fn with_gamma_shape(mut self, shape: f64) -> Self {
+    pub const fn with_gamma_shape(mut self, shape: f64) -> Self {
         self.scale = match self.scale {
             LikelihoodScaleMetadata::FixedGammaShape { .. } => {
                 LikelihoodScaleMetadata::FixedGammaShape { shape }
@@ -791,10 +833,12 @@ impl GlmLikelihoodSpec {
             LikelihoodScaleMetadata::EstimatedGammaShape { .. } => {
                 LikelihoodScaleMetadata::EstimatedGammaShape { shape }
             }
-            _ if self.family == GlmLikelihoodFamily::GammaLog => {
-                LikelihoodScaleMetadata::EstimatedGammaShape { shape }
-            }
-            other => other,
+            other => match self.family {
+                GlmLikelihoodFamily::GammaLog => {
+                    LikelihoodScaleMetadata::EstimatedGammaShape { shape }
+                }
+                _ => other,
+            },
         };
         self
     }
@@ -887,7 +931,7 @@ impl RidgePolicy {
     /// Default policy used by PIRLS/REML path:
     /// treat stabilization ridge as an explicit `delta I` prior contribution
     /// with adaptive logdet evaluation.
-    pub fn explicit_stabilization_full() -> Self {
+    pub const fn explicit_stabilization_full() -> Self {
         Self {
             rho_independent: true,
             include_quadratic_penalty: true,
@@ -897,18 +941,24 @@ impl RidgePolicy {
         }
     }
 
-    pub fn explicit_stabilization_full_exact() -> Self {
+    pub const fn explicit_stabilization_full_exact() -> Self {
         Self {
+            rho_independent: true,
+            include_quadratic_penalty: true,
+            include_penalty_logdet: true,
+            include_laplacehessian: true,
             determinant_mode: RidgeDeterminantMode::Full,
-            ..Self::explicit_stabilization_full()
         }
     }
 
     /// Variant used when pseudo-determinants are required for indefinite matrices.
-    pub fn explicit_stabilization_pospart() -> Self {
+    pub const fn explicit_stabilization_pospart() -> Self {
         Self {
+            rho_independent: true,
+            include_quadratic_penalty: true,
+            include_penalty_logdet: true,
+            include_laplacehessian: true,
             determinant_mode: RidgeDeterminantMode::PositivePart,
-            ..Self::explicit_stabilization_full()
         }
     }
 }
@@ -923,7 +973,7 @@ pub struct RidgePassport {
 }
 
 impl RidgePassport {
-    pub fn scaled_identity(delta: f64, policy: RidgePolicy) -> Self {
+    pub const fn scaled_identity(delta: f64, policy: RidgePolicy) -> Self {
         Self {
             delta,
             matrix_form: RidgeMatrixForm::ScaledIdentity,
@@ -932,7 +982,7 @@ impl RidgePassport {
     }
 
     #[inline]
-    pub fn penalty_logdet_ridge(self) -> f64 {
+    pub const fn penalty_logdet_ridge(self) -> f64 {
         if self.policy.include_penalty_logdet {
             self.delta
         } else {
@@ -941,7 +991,7 @@ impl RidgePassport {
     }
 
     #[inline]
-    pub fn laplacehessianridge(self) -> f64 {
+    pub const fn laplacehessianridge(self) -> f64 {
         if self.policy.include_laplacehessian {
             self.delta
         } else {
@@ -1044,7 +1094,7 @@ pub struct StabilizationLedger {
 
 impl StabilizationLedger {
     /// "No stabilization applied at this site" sentinel.
-    pub fn none() -> Self {
+    pub const fn none() -> Self {
         Self {
             kind: StabilizationKind::None,
             delta: 0.0,
@@ -1061,7 +1111,7 @@ impl StabilizationLedger {
     /// LM/TR damping. δ is invisible to the objective, gradient, and any
     /// saved artifact. Asserting this invariant at every read site is the
     /// whole reason the ledger exists.
-    pub fn solver_damping(delta: f64, chosen_by: StabilizationRule) -> Self {
+    pub const fn solver_damping(delta: f64, chosen_by: StabilizationRule) -> Self {
         Self {
             kind: StabilizationKind::SolverDampingOnly,
             delta,
@@ -1078,7 +1128,7 @@ impl StabilizationLedger {
     /// Solver-only perturbation that leaves the objective unchanged. The
     /// caller may attach a backward-error bound when one is available
     /// (e.g. from iterative refinement / Wilkinson-style analysis).
-    pub fn numerical_perturbation(
+    pub const fn numerical_perturbation(
         delta: f64,
         chosen_by: StabilizationRule,
         backward_error_bound: Option<f64>,
@@ -1101,7 +1151,7 @@ impl StabilizationLedger {
     /// Model-level explicit prior. δ enters every accounting pass: the
     /// quadratic penalty, the Laplace Hessian, the penalty log-determinant,
     /// and serialization.
-    pub fn explicit_prior(delta: f64, matrix_form: RidgeMatrixForm) -> Self {
+    pub const fn explicit_prior(delta: f64, matrix_form: RidgeMatrixForm) -> Self {
         Self {
             kind: StabilizationKind::ExplicitPrior,
             delta,
@@ -1118,7 +1168,7 @@ impl StabilizationLedger {
     /// Bridge from the existing `RidgePassport` so PIRLS-side code (which
     /// already passes a `RidgePassport` through every call) can hand a
     /// ledger to anything that wants the new uniform view.
-    pub fn from_passport(passport: RidgePassport) -> Self {
+    pub const fn from_passport(passport: RidgePassport) -> Self {
         let any_included = passport.policy.include_quadratic_penalty
             || passport.policy.include_laplacehessian
             || passport.policy.include_penalty_logdet;
@@ -1148,7 +1198,7 @@ impl StabilizationLedger {
     /// δ value to fold into the quadratic penalty term, or 0.0 if this
     /// ledger entry is not part of the model.
     #[inline]
-    pub fn quadratic_delta(&self) -> f64 {
+    pub const fn quadratic_delta(&self) -> f64 {
         if self.included_in_quadratic {
             self.delta
         } else {
@@ -1158,7 +1208,7 @@ impl StabilizationLedger {
 
     /// δ value to add to the Laplace Hessian, or 0.0 if not included.
     #[inline]
-    pub fn laplace_hessian_delta(&self) -> f64 {
+    pub const fn laplace_hessian_delta(&self) -> f64 {
         if self.included_in_laplace_hessian {
             self.delta
         } else {
@@ -1168,7 +1218,7 @@ impl StabilizationLedger {
 
     /// δ value to add inside log|S + δ I|, or 0.0 if not included.
     #[inline]
-    pub fn penalty_logdet_delta(&self) -> f64 {
+    pub const fn penalty_logdet_delta(&self) -> f64 {
         if self.included_in_penalty_logdet {
             self.delta
         } else {
@@ -1178,7 +1228,7 @@ impl StabilizationLedger {
 
     /// Invariant check: kind must be consistent with the inclusion flags.
     /// Used by the ledger-invariants test in `tests/ridge_ledger_invariants.rs`.
-    pub fn invariants_hold(&self) -> bool {
+    pub const fn invariants_hold(&self) -> bool {
         match self.kind {
             StabilizationKind::None => {
                 self.delta == 0.0
