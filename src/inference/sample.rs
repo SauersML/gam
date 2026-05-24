@@ -51,10 +51,10 @@ use crate::types::LikelihoodFamily;
 /// exercise the spec independently of running NUTS.
 pub fn saved_baseline_timewiggle_spec(
     model: &SavedModel,
-) -> Result<Option<LinkWiggleFormulaSpec>, SampleError> {
+) -> Result<Option<LinkWiggleFormulaSpec>, String> {
     model
         .saved_baseline_time_wiggle()
-        .map_err(SampleError::from)
+        .map_err(|e| e.to_string())
         .map(|runtime| {
             runtime.map(|saved| LinkWiggleFormulaSpec {
                 degree: saved.degree,
@@ -68,34 +68,28 @@ pub fn saved_baseline_timewiggle_spec(
 fn weighted_penalty_matrix(
     penalties: &[Array2<f64>],
     lambdas: ArrayView1<'_, f64>,
-) -> Result<Array2<f64>, SampleError> {
+) -> Result<Array2<f64>, String> {
     if penalties.len() != lambdas.len() {
-        return Err(SampleError::SamplerSetupFailed {
-            reason: format!(
+        return Err(format!(
                 "penalty/lambda mismatch: {} penalties vs {} lambdas",
                 penalties.len(),
                 lambdas.len()
-            ),
-        });
+            ));
     }
     if penalties.is_empty() {
-        return Err(SampleError::InvalidConfig {
-            reason: "cannot sample without at least one penalty block".to_string(),
-        });
+        return Err("cannot sample without at least one penalty block".to_string());
     }
     let p = penalties[0].nrows();
     let mut out = Array2::<f64>::zeros((p, p));
     for (k, s) in penalties.iter().enumerate() {
         if s.nrows() != p || s.ncols() != p {
-            return Err(SampleError::SamplerSetupFailed {
-                reason: format!(
+            return Err(format!(
                     "penalty block {k} shape mismatch: got {}x{}, expected {}x{}",
                     s.nrows(),
                     s.ncols(),
                     p,
                     p
-                ),
-            });
+                ));
         }
         let lam = lambdas[k];
         out = out + &(s * lam);
@@ -106,17 +100,15 @@ fn weighted_penalty_matrix(
 fn validate_explicit_link_wiggle_joint_hessian(
     hessian: &Array2<f64>,
     expected_dim: usize,
-) -> Result<(), SampleError> {
+) -> Result<(), String> {
     if hessian.nrows() != expected_dim || hessian.ncols() != expected_dim {
-        return Err(SampleError::SamplerSetupFailed {
-            reason: format!(
+        return Err(format!(
                 "link-wiggle sample: explicit joint Hessian is {}x{} but expected {}x{}",
                 hessian.nrows(),
                 hessian.ncols(),
                 expected_dim,
                 expected_dim,
-            ),
-        });
+            ));
     }
     validate_all_finite(
         "link-wiggle explicit joint Hessian",
@@ -128,20 +120,15 @@ fn validate_explicit_link_wiggle_joint_hessian(
             max_abs = max_abs.max(hessian[[r, c]].abs());
             let scale = hessian[[r, c]].abs().max(hessian[[c, r]].abs()).max(1.0);
             if (hessian[[r, c]] - hessian[[c, r]]).abs() > 1e-9 * scale {
-                return Err(SampleError::SamplerSetupFailed {
-                    reason: format!(
+                return Err(format!(
                         "link-wiggle sample: explicit joint Hessian is not symmetric at ({r},{c})"
-                    ),
-                });
+                    ));
             }
         }
     }
     if max_abs == 0.0 {
-        return Err(SampleError::SamplerSetupFailed {
-            reason:
-                "link-wiggle sample: explicit joint Hessian is all zeros; refit with exact Hessian export"
-                    .to_string(),
-        });
+        return Err("link-wiggle sample: explicit joint Hessian is all zeros; refit with exact Hessian export"
+                    .to_string());
     }
     Ok(())
 }
@@ -187,7 +174,7 @@ pub fn sample_saved_model(
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
     cfg: &NutsConfig,
-) -> Result<NutsResult, SampleError> {
+) -> Result<NutsResult, String> {
     let family = model.likelihood();
     match model.predict_model_class() {
         PredictModelClass::Survival => {
@@ -252,24 +239,20 @@ pub fn laplace_gaussian_fallback(
     model: &SavedModel,
     cfg: &NutsConfig,
     rationale: &'static str,
-) -> Result<NutsResult, SampleError> {
+) -> Result<NutsResult, String> {
     use crate::inference::dispersion_cov::DispersionExt as _;
     let fit = fit_result_from_saved_model_for_prediction(model)?;
     let mode = fit.beta.clone();
     let p = mode.len();
     if p == 0 {
-        return Err(SampleError::SamplerSetupFailed {
-            reason: format!("{rationale}: cannot sample from an empty coefficient vector"),
-        });
+        return Err(format!("{rationale}: cannot sample from an empty coefficient vector"));
     }
     let h = fit
         .penalized_hessian()
-        .ok_or_else(|| SampleError::SamplerSetupFailed {
-            reason: format!(
+        .ok_or_else(|| format!(
                 "{rationale}: posterior fallback requires the explicit penalised Hessian; \
              refit with exact geometry export to enable posterior sampling for this class."
-            ),
-        })?;
+            ))?;
     // `penalized_hessian` is stored unscaled (no φ). To draw Laplace
     // approximations of `N(mode, φ·H⁻¹)` we solve `Lᵀ δ = ε` (so
     // `Var(δ) = H⁻¹`) and then rescale by √φ. For families with
@@ -279,15 +262,13 @@ pub fn laplace_gaussian_fallback(
     let dispersion = fit.dispersion().unwrap_or_default();
     let sqrt_phi = dispersion.sqrt_phi();
     if h.nrows() != p || h.ncols() != p {
-        return Err(SampleError::SamplerSetupFailed {
-            reason: format!(
+        return Err(format!(
                 "{rationale}: penalised Hessian is {}x{}, expected {}x{}",
                 h.nrows(),
                 h.ncols(),
                 p,
                 p
-            ),
-        });
+            ));
     }
     let chol = h.cholesky(Side::Lower).map_err(|err| {
         format!("{rationale}: Cholesky factorisation of the penalised Hessian failed: {err:?}")
@@ -363,7 +344,7 @@ fn sample_standard(
     training_headers: Option<&Vec<String>>,
     family: LikelihoodFamily,
     cfg: &NutsConfig,
-) -> Result<NutsResult, SampleError> {
+) -> Result<NutsResult, String> {
     if model.has_link_wiggle() {
         return sample_standard_link_wiggle(model, data, col_map, training_headers, family, cfg);
     }
@@ -438,9 +419,7 @@ fn sample_standard(
         }),
         cfg,
     )
-    .map_err(|e| SampleError::SamplerSetupFailed {
-        reason: format!("NUTS sampling failed: {e}"),
-    })
+    .map_err(|e| format!("NUTS sampling failed: {e}"))
 }
 
 fn sample_standard_link_wiggle(
@@ -450,7 +429,7 @@ fn sample_standard_link_wiggle(
     training_headers: Option<&Vec<String>>,
     family: LikelihoodFamily,
     cfg: &NutsConfig,
-) -> Result<NutsResult, SampleError> {
+) -> Result<NutsResult, String> {
     let parsed = parse_formula(&model.formula)?;
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let y = data.column(y_col).to_owned();
@@ -486,24 +465,20 @@ fn sample_standard_link_wiggle(
     let p_total = mode_beta.len() + p_wiggle;
 
     if mode_beta.len() != p_main {
-        return Err(SampleError::SamplerSetupFailed {
-            reason: format!(
+        return Err(format!(
                 "link-wiggle sample: saved mean block has {} coefficients but rebuilt design has {} columns",
                 mode_beta.len(),
                 p_main,
-            ),
-        });
+            ));
     }
     if fit.beta.len() != p_total {
-        return Err(SampleError::SamplerSetupFailed {
-            reason: format!(
+        return Err(format!(
                 "link-wiggle sample: saved beta has {} coefficients but design has {} main + {} wiggle = {} total",
                 fit.beta.len(),
                 p_main,
                 p_wiggle,
                 p_total,
-            ),
-        });
+            ));
     }
 
     let hessian = &fit
@@ -523,13 +498,11 @@ fn sample_standard_link_wiggle(
         .lambdas
         .view();
     if base_lambdas.len() != n_base_penalties {
-        return Err(SampleError::SamplerSetupFailed {
-            reason: format!(
+        return Err(format!(
                 "link-wiggle sample: mean block has {} lambdas but rebuilt design has {} base penalties",
                 base_lambdas.len(),
                 n_base_penalties,
-            ),
-        });
+            ));
     }
 
     let penalty_base =
@@ -587,12 +560,10 @@ fn sample_standard_link_wiggle(
         LikelihoodFamily::NegativeBinomial { .. } => NutsFamily::NegativeBinomialLog,
         LikelihoodFamily::GammaLog => NutsFamily::GammaLog,
         _ => {
-            return Err(SampleError::UnsupportedFamily {
-                reason: format!(
+            return Err(format!(
                     "NUTS sampling with link wiggle is not supported for family {}",
                     family.pretty_name()
-                ),
-            });
+                ));
         }
     };
 
@@ -614,9 +585,7 @@ fn sample_standard_link_wiggle(
         scale,
         cfg,
     )
-    .map_err(|e| SampleError::SamplerSetupFailed {
-        reason: format!("link-wiggle NUTS sampling failed: {e}"),
-    })
+    .map_err(|e| format!("link-wiggle NUTS sampling failed: {e}"))
 }
 
 fn sample_survival(
@@ -625,7 +594,7 @@ fn sample_survival(
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
     cfg: &NutsConfig,
-) -> Result<NutsResult, SampleError> {
+) -> Result<NutsResult, String> {
     let saved_likelihood_mode = require_saved_survival_likelihood_mode(model)?;
     if matches!(
         saved_likelihood_mode,
@@ -866,16 +835,11 @@ fn sample_survival(
     {
         "net" => SurvivalSpec::Net,
         "crude" => {
-            return Err(SampleError::UnsupportedFamily {
-                reason:
-                    "saved survival spec 'crude' is not supported by the one-hazard survival engine; refit or export a net survival model for this path"
-                        .to_string(),
-            });
+            return Err("saved survival spec 'crude' is not supported by the one-hazard survival engine; refit or export a net survival model for this path"
+                        .to_string());
         }
         other => {
-            return Err(SampleError::UnsupportedFamily {
-                reason: format!("unsupported saved survival spec '{other}'"),
-            });
+            return Err(format!("unsupported saved survival spec '{other}'"));
         }
     };
     let monotonicity = MonotonicityPenalty { tolerance: 0.0 };
@@ -933,7 +897,5 @@ fn sample_survival(
         hessian.view(),
         cfg,
     )
-    .map_err(|e| SampleError::SamplerSetupFailed {
-        reason: format!("survival NUTS sampling failed: {e}"),
-    })
+    .map_err(|e| format!("survival NUTS sampling failed: {e}"))
 }
