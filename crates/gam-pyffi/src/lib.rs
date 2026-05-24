@@ -59,8 +59,8 @@ use gam::terms::basis::{
     build_thin_plate_penalty_matrix, create_basis, create_cyclic_difference_penalty_matrix,
     create_difference_penalty_matrix, duchon_polynomial_first_derivative_nd,
     duchon_radial_first_derivative_nd, evaluate_bspline_basis_scalar,
-    matern_radial_first_derivative_nd, periodic_bspline_first_derivative_nd,
-    resolve_duchon_orders, sphere_first_derivative_nd,
+    matern_radial_first_derivative_nd, periodic_bspline_first_derivative_nd, resolve_duchon_orders,
+    sphere_first_derivative_nd,
 };
 use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
 use gam::terms::latent_coord::{
@@ -754,7 +754,10 @@ fn duchon_basis<'py>(
                     "periodic Duchon centers must define a finite ordered domain".to_string(),
                 ));
             }
-            OneDimensionalBoundary::Cyclic { start: left, end: right }
+            OneDimensionalBoundary::Cyclic {
+                start: left,
+                end: right,
+            }
         } else {
             OneDimensionalBoundary::Open
         },
@@ -982,7 +985,10 @@ fn duchon_function_norm_penalty<'py>(
                     "periodic Duchon centers must define a finite ordered domain".to_string(),
                 ));
             }
-            OneDimensionalBoundary::Cyclic { start: left, end: right }
+            OneDimensionalBoundary::Cyclic {
+                start: left,
+                end: right,
+            }
         } else {
             OneDimensionalBoundary::Open
         },
@@ -3769,12 +3775,8 @@ fn build_latent_forward_design(
             }
             let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
             let range = latent_periodic_range_from_centers(centers)?;
-            let design = periodic_bspline_basis_dense_via_spec(
-                t_mat.column(0),
-                range,
-                m,
-                centers.nrows(),
-            )?;
+            let design =
+                periodic_bspline_basis_dense_via_spec(t_mat.column(0), range, m, centers.nrows())?;
             (design, t_mat)
         }
         other => {
@@ -5567,8 +5569,8 @@ fn gaussian_reml_fit_latent_backward<'py>(
         backward.clone()
     };
     let grad_x = &backward_for_t.grad_x;
-    let mut grad_t =
-        contract_input_loc_gradient(grad_x.view(), &jet).map_err(|err| py_value_error(err.to_string()))?;
+    let mut grad_t = contract_input_loc_gradient(grad_x.view(), &jet)
+        .map_err(|err| py_value_error(err.to_string()))?;
     if grad_reml_score != 0.0 {
         add_latent_outer_reml_score_gradient(
             &mut grad_t,
@@ -13110,9 +13112,14 @@ fn duchon_basis_1d_impl(
             let left = centers[0];
             let right = centers[centers.len() - 1];
             if !(left.is_finite() && right.is_finite() && right > left) {
-                return Err("periodic Duchon centers must define a finite ordered domain".to_string());
+                return Err(
+                    "periodic Duchon centers must define a finite ordered domain".to_string(),
+                );
             }
-            OneDimensionalBoundary::Cyclic { start: left, end: right }
+            OneDimensionalBoundary::Cyclic {
+                start: left,
+                end: right,
+            }
         } else {
             OneDimensionalBoundary::Open
         },
@@ -13878,8 +13885,8 @@ fn build_standard_payload(
             likelihood: family,
             link: Some(family.link_function()),
             latent_cloglog_state,
-            mixture_state: saved_mixture_state_from_fit(saved_fit),
-            sas_state: saved_sas_state_from_fit(saved_fit),
+            mixture_state: saved_mixture_state_from_fit(&saved_fit),
+            sas_state: saved_sas_state_from_fit(&saved_fit),
         },
         family.name().to_string(),
     );
@@ -15092,7 +15099,6 @@ fn matrix_to_nested(matrix: &Array2<f64>) -> Vec<Vec<f64>> {
 fn matrices_to_nested(matrices: &[Array2<f64>]) -> Vec<Vec<Vec<f64>>> {
     matrices.iter().map(matrix_to_nested).collect()
 }
-
 
 #[cfg(test)]
 mod tests {
