@@ -3429,6 +3429,37 @@ impl HyperCoordDrift {
 /// Storage: the implicit operator holds O(n·k·D) radial jets, plus references
 /// to an active-basis X design operator and W (the working weights). The
 /// penalty matrix S_{ψ_d} is stored as a dense (p × p) matrix.
+/// Thread-local scratch buffers for `ImplicitHyperOperator::mul_vec_into`.
+/// Reused across PCG iterations and basis-column sweeps so each matvec
+/// avoids three fresh O(n)/O(p) allocations.
+mod implicit_matvec_scratch {
+    use std::cell::RefCell;
+
+    pub(super) struct Scratch {
+        pub x_v: Vec<f64>,
+        pub n_work: Vec<f64>,
+        pub p_work: Vec<f64>,
+    }
+
+    impl Scratch {
+        const fn new() -> Self {
+            Self {
+                x_v: Vec::new(),
+                n_work: Vec::new(),
+                p_work: Vec::new(),
+            }
+        }
+    }
+
+    thread_local! {
+        static SCRATCH: RefCell<Scratch> = const { RefCell::new(Scratch::new()) };
+    }
+
+    pub(super) fn with<R>(f: impl FnOnce(&mut Scratch) -> R) -> R {
+        SCRATCH.with(|cell| f(&mut cell.borrow_mut()))
+    }
+}
+
 pub struct ImplicitHyperOperator {
     /// The implicit design-derivative operator (shared across all axes).
     pub implicit_deriv: std::sync::Arc<crate::terms::basis::ImplicitDesignPsiDerivative>,
@@ -3476,11 +3507,31 @@ impl HyperOperator for ImplicitHyperOperator {
     fn mul_vec_into(&self, v: ArrayView1<'_, f64>, out: ArrayViewMut1<'_, f64>) {
         debug_assert_eq!(v.len(), self.p);
         let n_obs = self.w_diag.len();
-        let mut x_v = Array1::<f64>::zeros(n_obs);
-        let mut n_work = Array1::<f64>::zeros(n_obs);
-        let mut p_work = Array1::<f64>::zeros(self.p);
-        design_matrix_apply_view_into(&self.x_design, v, x_v.view_mut());
-        self.matvec_with_shared_xz_into(&x_v, v, out, n_work.view_mut(), p_work.view_mut());
+        // Reuse thread-local scratch across repeated matvec calls (e.g.
+        // PCG iterations, basis-column sweeps) instead of allocating
+        // (2 n_obs + p) f64s every time.
+        implicit_matvec_scratch::with(|s| {
+            s.x_v.clear();
+            s.x_v.resize(n_obs, 0.0);
+            s.n_work.clear();
+            s.n_work.resize(n_obs, 0.0);
+            s.p_work.clear();
+            s.p_work.resize(self.p, 0.0);
+            let mut x_v_view =
+                ndarray::ArrayViewMut1::from(s.x_v.as_mut_slice());
+            let n_work_view =
+                ndarray::ArrayViewMut1::from(s.n_work.as_mut_slice());
+            let p_work_view =
+                ndarray::ArrayViewMut1::from(s.p_work.as_mut_slice());
+            design_matrix_apply_view_into(&self.x_design, v, x_v_view.view_mut());
+            self.matvec_with_shared_xz_into(
+                x_v_view.view(),
+                v,
+                out,
+                n_work_view,
+                p_work_view,
+            );
+        });
     }
 
     fn mul_basis_columns_into(&self, start: usize, mut out: ArrayViewMut2<'_, f64>) {
@@ -3954,7 +4005,7 @@ impl ImplicitHyperOperator {
     /// which is the standard mul_vec but we can share x_vec across axes.
     pub fn matvec_with_shared_xz_into(
         &self,
-        x_vec: &Array1<f64>,
+        x_vec: ArrayView1<'_, f64>,
         z: ArrayView1<'_, f64>,
         mut out: ArrayViewMut1<'_, f64>,
         mut n_work: ArrayViewMut1<'_, f64>,
@@ -15987,7 +16038,7 @@ impl StochasticTraceEstimator {
                             let mut n_work = Array1::<f64>::zeros(n_obs);
                             let mut p_work = Array1::<f64>::zeros(p);
                             op.matvec_with_shared_xz_into(
-                                &x_vec,
+                                x_vec.view(),
                                 z.view(),
                                 q_col,
                                 n_work.view_mut(),
@@ -16242,7 +16293,7 @@ impl StochasticTraceEstimator {
             );
             design_matrix_apply_view_into(&op.x_design, z.view(), x_z.view_mut());
             op.matvec_with_shared_xz_into(
-                &x_z,
+                x_z.view(),
                 z.view(),
                 q.view_mut(),
                 n_work.view_mut(),

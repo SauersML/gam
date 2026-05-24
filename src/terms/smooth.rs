@@ -16451,7 +16451,6 @@ pub fn freeze_term_collection_from_design(
                     method,
                     max_degree,
                     wahba_kernel,
-                    streaming_chunk_size,
                     ..
                 },
             ) => {
@@ -16460,7 +16459,6 @@ pub fn freeze_term_collection_from_design(
                 s.method = *method;
                 s.max_degree = *max_degree;
                 s.wahba_kernel = *wahba_kernel;
-                s.streaming_chunk_size = *streaming_chunk_size;
             }
             (
                 SmoothBasisSpec::Matern {
@@ -16477,7 +16475,6 @@ pub fn freeze_term_collection_from_design(
                     identifiability_transform,
                     input_scales: meta_scales,
                     aniso_log_scales: meta_aniso,
-                    streaming_chunk_size: meta_streaming_chunk_size,
                 },
             ) => {
                 s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
@@ -16491,7 +16488,6 @@ pub fn freeze_term_collection_from_design(
                     None => MaternIdentifiability::None,
                 };
                 s.aniso_log_scales = meta_aniso.clone();
-                s.streaming_chunk_size = *meta_streaming_chunk_size;
                 s.periodic = meta_periodic.clone();
                 *input_scales = meta_scales.clone();
             }
@@ -22076,7 +22072,8 @@ mod tests {
                     + designs[0].penalties.len() as f64
                     + designs[1].penalties.len() as f64)
             },
-            |theta, specs, designs, eval_mode, _row_set| {
+            |theta, specs, designs, eval_mode, row_set| {
+                drop(row_set);
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert!(!designs.is_empty());
@@ -23859,7 +23856,8 @@ mod tests {
                 assert_eq!(designs.len(), 2);
                 Ok(designs[0].design.ncols() as f64 + designs[1].design.ncols() as f64)
             },
-            |theta, specs, designs, eval_mode, _row_set| {
+            |theta, specs, designs, eval_mode, row_set| {
+                drop(row_set);
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert_eq!(designs.len(), 2);
@@ -25954,7 +25952,8 @@ mod tests {
                     + designs[0].penalties.len() as f64
                     + designs[1].penalties.len() as f64)
             },
-            |theta, specs, designs, eval_mode, _row_set| {
+            |theta, specs, designs, eval_mode, row_set| {
+                drop(row_set);
                 assert_eq!(theta.len(), theta_dim);
                 assert_eq!(specs.len(), 2);
                 assert!(!designs.is_empty());

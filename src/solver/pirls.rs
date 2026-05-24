@@ -1417,7 +1417,7 @@ enum WorkingReparamTransform {
 impl WorkingReparamTransform {
     fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
         match self {
-            Self::Dense(qs) => qs.dot(vector),
+            Self::Dense(qs) => fast_av(qs.as_ref(), vector),
             Self::Kronecker(transform) => transform.apply(vector),
         }
     }
@@ -1612,7 +1612,7 @@ impl KroneckerQsTransform {
         let p = self.p;
         let mut right = Array2::<f64>::zeros((p, p));
         for j in 0..p {
-            let col = matrix.dot(&self.column(j));
+            let col = fast_av(matrix, &self.column(j));
             right.column_mut(j).assign(&col);
         }
         let mut out = Array2::<f64>::zeros((p, p));
@@ -3206,7 +3206,7 @@ where
             if *lambda == 0.0 {
                 continue;
             }
-            let sv = s.dot(v);
+            let sv = fast_av(s, v);
             hv.scaled_add(*lambda, &sv);
         }
         for (lambda, op) in op_penalties.iter() {
@@ -3978,7 +3978,7 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
             }
         }
         if free_idx.is_empty() {
-            let hd = hessian.dot(direction_out);
+            let hd = fast_av(hessian, direction_out);
             if let Some(idx) = select_active_set_release(gradient, &hd, &active_idx, use_blands) {
                 active[idx] = false;
                 continue;
@@ -4040,7 +4040,7 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
 
         // Dual feasibility on active constraints:
         // λ_i = g_i + (H d)_i must be >= 0 for all active lower bounds.
-        let hd = hessian.dot(direction_out);
+        let hd = fast_av(hessian, direction_out);
         if let Some(idx) = select_active_set_release(gradient, &hd, &active_idx, use_blands) {
             active[idx] = false;
             continue;
@@ -6633,7 +6633,7 @@ fn build_sparse_native_reparam_result(
         }
     }
     let u_original = if base.u_truncated.nrows() == p {
-        base.qs.dot(&base.u_truncated)
+        fast_ab(&base.qs, &base.u_truncated)
     } else {
         Array2::<f64>::eye(p)
     };
