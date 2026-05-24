@@ -5037,7 +5037,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
 
     fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
         let marginal_eta = self.block_states[0].eta[row];
-        let marginal = self.marginal_link_jet(row);
+        let marginal = self.family.marginal_link_map(marginal_eta)?;
         let g = self.block_states[1].eta[row];
         self.family
             .rigid_row_kernel_eval(row, marginal_eta, marginal, g)
