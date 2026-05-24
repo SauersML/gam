@@ -9996,8 +9996,11 @@ fn evaluate_standard_familyobservations(
                         }
                     })
                 };
-                let jet = strategy_for_family(spec_to_family(&family), inverse_link.as_ref())
-                    .inverse_link_jet(eta_i)?;
+                let strategy_spec = LikelihoodSpec {
+                    response: family.response.clone(),
+                    link: inverse_link.clone().unwrap_or_else(|| family.link.clone()),
+                };
+                let jet = strategy_for_spec(&strategy_spec).inverse_link_jet(eta_i)?;
                 let mu_i_raw = jet.mu;
                 let dmu_deta_raw = jet.d1;
                 let mu_i: f64 = mu_i_raw.clamp(PROB_EPS, 1.0 - PROB_EPS);
@@ -15135,7 +15138,7 @@ fn try_exact_joint_spatial_aniso_optimization(
             &baseline_design.design,
             offset,
             &baseline_design.penalties,
-            &external_opts_for_design(family, baseline_design, options),
+            &external_opts_for_design(&family, baseline_design, options),
             "spatial-aniso-joint",
         )?,
     };
@@ -15490,7 +15493,7 @@ fn try_exact_joint_spatial_isotropic_optimization(
             &baseline_design.design,
             offset,
             &baseline_design.penalties,
-            &external_opts_for_design(family, baseline_design, options),
+            &external_opts_for_design(&family, baseline_design, options),
             "spatial-iso-joint",
         )?,
     };
@@ -18372,7 +18375,7 @@ fn try_exact_joint_latent_coord_optimization(
             &best.design.design,
             offset,
             &best.design.penalties,
-            &external_opts_for_design(family, &best.design, options),
+            &external_opts_for_design(&family, &best.design, options),
             "latent-coordinate-joint",
         )?,
     };

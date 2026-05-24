@@ -145,7 +145,7 @@ pub fn strategy_for_spec(spec: &LikelihoodSpec) -> ResolvedFamilyStrategy {
 /// recorded link state and the supplied `family` are mutually
 /// inconsistent (propagated from `fit.fitted_link_state`).
 pub fn strategy_from_fit(
-    family: LikelihoodFamily,
+    family: &LikelihoodSpec,
     fit: &UnifiedFitResult,
 ) -> Result<ResolvedFamilyStrategy, EstimationError> {
     let inverse_link = match fit.fitted_link_state(family)? {
@@ -156,7 +156,12 @@ pub fn strategy_from_fit(
         FittedLinkState::BetaLogistic { state, .. } => Some(InverseLink::BetaLogistic(state)),
         FittedLinkState::Mixture { state, .. } => Some(InverseLink::Mixture(state)),
     };
-    Ok(strategy_for_family(family, inverse_link.as_ref()))
+    let spec = if let Some(link) = inverse_link {
+        LikelihoodSpec::new(family.response.clone(), link)
+    } else {
+        family.clone()
+    };
+    Ok(strategy_for_spec(&spec))
 }
 
 impl ResolvedFamilyStrategy {

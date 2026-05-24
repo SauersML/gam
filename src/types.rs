@@ -593,7 +593,7 @@ impl LikelihoodFamily {
 
 /// GLM-compatible likelihood families (survival families excluded by type).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum GlmLikelihoodFamily {
+pub enum GlmFamily {
     GaussianIdentity,
     BinomialLogit,
     BinomialProbit,
@@ -608,7 +608,7 @@ pub enum GlmLikelihoodFamily {
     GammaLog,
 }
 
-impl GlmLikelihoodFamily {
+impl GlmFamily {
     #[inline]
     pub const fn link_function(self) -> LinkFunction {
         match self {
@@ -690,28 +690,28 @@ pub enum LogLikelihoodNormalization {
 /// Explicit GLM likelihood specification: family plus scale semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GlmLikelihoodSpec {
-    pub family: GlmLikelihoodFamily,
+    pub family: GlmFamily,
     pub scale: LikelihoodScaleMetadata,
 }
 
 impl GlmLikelihoodSpec {
     #[inline]
-    pub const fn canonical(family: GlmLikelihoodFamily) -> Self {
+    pub const fn canonical(family: GlmFamily) -> Self {
         let scale = match family {
-            GlmLikelihoodFamily::GaussianIdentity => LikelihoodScaleMetadata::ProfiledGaussian,
-            GlmLikelihoodFamily::GammaLog => {
+            GlmFamily::GaussianIdentity => LikelihoodScaleMetadata::ProfiledGaussian,
+            GlmFamily::GammaLog => {
                 LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 }
             }
-            GlmLikelihoodFamily::BinomialLogit
-            | GlmLikelihoodFamily::BinomialProbit
-            | GlmLikelihoodFamily::BinomialCLogLog
-            | GlmLikelihoodFamily::BinomialSas
-            | GlmLikelihoodFamily::BinomialBetaLogistic
-            | GlmLikelihoodFamily::BinomialMixture
-            | GlmLikelihoodFamily::Tweedie { .. }
-            | GlmLikelihoodFamily::NegativeBinomial { .. }
-            | GlmLikelihoodFamily::BetaLogit { .. }
-            | GlmLikelihoodFamily::PoissonLog => {
+            GlmFamily::BinomialLogit
+            | GlmFamily::BinomialProbit
+            | GlmFamily::BinomialCLogLog
+            | GlmFamily::BinomialSas
+            | GlmFamily::BinomialBetaLogistic
+            | GlmFamily::BinomialMixture
+            | GlmFamily::Tweedie { .. }
+            | GlmFamily::NegativeBinomial { .. }
+            | GlmFamily::BetaLogit { .. }
+            | GlmFamily::PoissonLog => {
                 LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 }
             }
         };
@@ -726,20 +726,20 @@ impl GlmLikelihoodSpec {
     #[inline]
     pub const fn response_family(self) -> LikelihoodFamily {
         match self.family {
-            GlmLikelihoodFamily::GaussianIdentity => LikelihoodFamily::GaussianIdentity,
-            GlmLikelihoodFamily::BinomialLogit => LikelihoodFamily::BinomialLogit,
-            GlmLikelihoodFamily::BinomialProbit => LikelihoodFamily::BinomialProbit,
-            GlmLikelihoodFamily::BinomialCLogLog => LikelihoodFamily::BinomialCLogLog,
-            GlmLikelihoodFamily::BinomialSas => LikelihoodFamily::BinomialSas,
-            GlmLikelihoodFamily::BinomialBetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
-            GlmLikelihoodFamily::BinomialMixture => LikelihoodFamily::BinomialMixture,
-            GlmLikelihoodFamily::PoissonLog => LikelihoodFamily::PoissonLog,
-            GlmLikelihoodFamily::Tweedie { p } => LikelihoodFamily::Tweedie { p },
-            GlmLikelihoodFamily::NegativeBinomial { theta } => {
+            GlmFamily::GaussianIdentity => LikelihoodFamily::GaussianIdentity,
+            GlmFamily::BinomialLogit => LikelihoodFamily::BinomialLogit,
+            GlmFamily::BinomialProbit => LikelihoodFamily::BinomialProbit,
+            GlmFamily::BinomialCLogLog => LikelihoodFamily::BinomialCLogLog,
+            GlmFamily::BinomialSas => LikelihoodFamily::BinomialSas,
+            GlmFamily::BinomialBetaLogistic => LikelihoodFamily::BinomialBetaLogistic,
+            GlmFamily::BinomialMixture => LikelihoodFamily::BinomialMixture,
+            GlmFamily::PoissonLog => LikelihoodFamily::PoissonLog,
+            GlmFamily::Tweedie { p } => LikelihoodFamily::Tweedie { p },
+            GlmFamily::NegativeBinomial { theta } => {
                 LikelihoodFamily::NegativeBinomial { theta }
             }
-            GlmLikelihoodFamily::BetaLogit { phi } => LikelihoodFamily::BetaLogit { phi },
-            GlmLikelihoodFamily::GammaLog => LikelihoodFamily::GammaLog,
+            GlmFamily::BetaLogit { phi } => LikelihoodFamily::BetaLogit { phi },
+            GlmFamily::GammaLog => LikelihoodFamily::GammaLog,
         }
     }
 
@@ -763,7 +763,7 @@ impl GlmLikelihoodSpec {
                 LikelihoodScaleMetadata::EstimatedGammaShape { shape }
             }
             other => match self.family {
-                GlmLikelihoodFamily::GammaLog => {
+                GlmFamily::GammaLog => {
                     LikelihoodScaleMetadata::EstimatedGammaShape { shape }
                 }
                 _ => other,
@@ -773,7 +773,7 @@ impl GlmLikelihoodSpec {
     }
 }
 
-impl TryFrom<LikelihoodFamily> for GlmLikelihoodFamily {
+impl TryFrom<LikelihoodFamily> for GlmFamily {
     type Error = &'static str;
 
     fn try_from(value: LikelihoodFamily) -> Result<Self, Self::Error> {
@@ -802,21 +802,21 @@ impl TryFrom<LikelihoodFamily> for GlmLikelihoodFamily {
     }
 }
 
-impl From<GlmLikelihoodFamily> for LikelihoodFamily {
-    fn from(value: GlmLikelihoodFamily) -> Self {
+impl From<GlmFamily> for LikelihoodFamily {
+    fn from(value: GlmFamily) -> Self {
         match value {
-            GlmLikelihoodFamily::GaussianIdentity => Self::GaussianIdentity,
-            GlmLikelihoodFamily::BinomialLogit => Self::BinomialLogit,
-            GlmLikelihoodFamily::BinomialProbit => Self::BinomialProbit,
-            GlmLikelihoodFamily::BinomialCLogLog => Self::BinomialCLogLog,
-            GlmLikelihoodFamily::BinomialSas => Self::BinomialSas,
-            GlmLikelihoodFamily::BinomialBetaLogistic => Self::BinomialBetaLogistic,
-            GlmLikelihoodFamily::BinomialMixture => Self::BinomialMixture,
-            GlmLikelihoodFamily::PoissonLog => Self::PoissonLog,
-            GlmLikelihoodFamily::Tweedie { p } => Self::Tweedie { p },
-            GlmLikelihoodFamily::NegativeBinomial { theta } => Self::NegativeBinomial { theta },
-            GlmLikelihoodFamily::BetaLogit { phi } => Self::BetaLogit { phi },
-            GlmLikelihoodFamily::GammaLog => Self::GammaLog,
+            GlmFamily::GaussianIdentity => Self::GaussianIdentity,
+            GlmFamily::BinomialLogit => Self::BinomialLogit,
+            GlmFamily::BinomialProbit => Self::BinomialProbit,
+            GlmFamily::BinomialCLogLog => Self::BinomialCLogLog,
+            GlmFamily::BinomialSas => Self::BinomialSas,
+            GlmFamily::BinomialBetaLogistic => Self::BinomialBetaLogistic,
+            GlmFamily::BinomialMixture => Self::BinomialMixture,
+            GlmFamily::PoissonLog => Self::PoissonLog,
+            GlmFamily::Tweedie { p } => Self::Tweedie { p },
+            GlmFamily::NegativeBinomial { theta } => Self::NegativeBinomial { theta },
+            GlmFamily::BetaLogit { phi } => Self::BetaLogit { phi },
+            GlmFamily::GammaLog => Self::GammaLog,
         }
     }
 }

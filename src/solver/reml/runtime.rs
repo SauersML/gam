@@ -13,7 +13,7 @@ use crate::solver::persistent_warm_start::{
     PersistentWarmStartRecord, StableHasher, load_record, store_record,
 };
 use crate::types::{
-    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
+    GlmFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
     MixtureLinkState, ResponseFamily, RhoPrior, SasLinkState,
 };
 use std::collections::{HashMap, VecDeque};
@@ -1267,30 +1267,30 @@ fn reml_likelihood_spec(likelihood: GlmLikelihoodSpec) -> LikelihoodSpec {
         delta: 1.0,
     };
     match likelihood.family {
-        GlmLikelihoodFamily::GaussianIdentity => LikelihoodSpec::new(
+        GlmFamily::GaussianIdentity => LikelihoodSpec::new(
             ResponseFamily::Gaussian,
             InverseLink::Standard(LinkFunction::Identity),
         ),
-        GlmLikelihoodFamily::BinomialLogit => LikelihoodSpec::new(
+        GlmFamily::BinomialLogit => LikelihoodSpec::new(
             ResponseFamily::Binomial,
             InverseLink::Standard(LinkFunction::Logit),
         ),
-        GlmLikelihoodFamily::BinomialProbit => LikelihoodSpec::new(
+        GlmFamily::BinomialProbit => LikelihoodSpec::new(
             ResponseFamily::Binomial,
             InverseLink::Standard(LinkFunction::Probit),
         ),
-        GlmLikelihoodFamily::BinomialCLogLog => LikelihoodSpec::new(
+        GlmFamily::BinomialCLogLog => LikelihoodSpec::new(
             ResponseFamily::Binomial,
             InverseLink::Standard(LinkFunction::CLogLog),
         ),
-        GlmLikelihoodFamily::BinomialSas => {
+        GlmFamily::BinomialSas => {
             LikelihoodSpec::new(ResponseFamily::Binomial, InverseLink::Sas(placeholder_sas))
         }
-        GlmLikelihoodFamily::BinomialBetaLogistic => LikelihoodSpec::new(
+        GlmFamily::BinomialBetaLogistic => LikelihoodSpec::new(
             ResponseFamily::Binomial,
             InverseLink::BetaLogistic(placeholder_sas),
         ),
-        GlmLikelihoodFamily::BinomialMixture => LikelihoodSpec::new(
+        GlmFamily::BinomialMixture => LikelihoodSpec::new(
             ResponseFamily::Binomial,
             InverseLink::Mixture(MixtureLinkState {
                 components: Vec::new(),
@@ -1298,23 +1298,23 @@ fn reml_likelihood_spec(likelihood: GlmLikelihoodSpec) -> LikelihoodSpec {
                 pi: ndarray::Array1::<f64>::zeros(0),
             }),
         ),
-        GlmLikelihoodFamily::PoissonLog => LikelihoodSpec::new(
+        GlmFamily::PoissonLog => LikelihoodSpec::new(
             ResponseFamily::Poisson,
             InverseLink::Standard(LinkFunction::Log),
         ),
-        GlmLikelihoodFamily::Tweedie { p } => LikelihoodSpec::new(
+        GlmFamily::Tweedie { p } => LikelihoodSpec::new(
             ResponseFamily::Tweedie { p },
             InverseLink::Standard(LinkFunction::Log),
         ),
-        GlmLikelihoodFamily::NegativeBinomial { theta } => LikelihoodSpec::new(
+        GlmFamily::NegativeBinomial { theta } => LikelihoodSpec::new(
             ResponseFamily::NegativeBinomial { theta },
             InverseLink::Standard(LinkFunction::Log),
         ),
-        GlmLikelihoodFamily::BetaLogit { phi } => LikelihoodSpec::new(
+        GlmFamily::BetaLogit { phi } => LikelihoodSpec::new(
             ResponseFamily::Beta { phi },
             InverseLink::Standard(LinkFunction::Logit),
         ),
-        GlmLikelihoodFamily::GammaLog => LikelihoodSpec::new(
+        GlmFamily::GammaLog => LikelihoodSpec::new(
             ResponseFamily::Gamma,
             InverseLink::Standard(LinkFunction::Log),
         ),
@@ -1356,7 +1356,7 @@ fn reml_fixed_glm_dispersion(likelihood: GlmLikelihoodSpec) -> f64 {
             _,
         ) => likelihood.fixed_phi().unwrap_or(1.0),
         // RoystonParmar is survival-specific and not produced by
-        // `reml_likelihood_spec` from any `GlmLikelihoodFamily` variant.
+        // `reml_likelihood_spec` from any `GlmFamily` variant.
         (ResponseFamily::RoystonParmar, _) => likelihood.fixed_phi().unwrap_or(1.0),
     }
 }

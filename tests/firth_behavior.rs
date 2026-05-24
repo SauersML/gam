@@ -3,7 +3,7 @@ use gam::estimate::{ExternalOptimOptions, PenaltySpec, evaluate_externalcost_and
 use gam::pirls::{PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho};
 use gam::smooth::BlockwisePenalty;
 use gam::types::{
-    GlmLikelihoodFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
+    GlmFamily, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
     LogSmoothingParamsView, ResponseFamily,
 };
 use ndarray::{Array1, Array2, array};
@@ -77,7 +77,7 @@ fn fit_beta_norm(
 ) -> f64 {
     let p = x.ncols();
     let cfg = PirlsConfig {
-        likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+        likelihood: GlmLikelihoodSpec::canonical(GlmFamily::BinomialLogit),
         link_kind: InverseLink::Standard(LinkFunction::Logit),
         max_iterations: 500,
         convergence_tolerance: 1e-10,
@@ -126,7 +126,7 @@ fn proxycostwith_pirls(
     firth: bool,
 ) -> f64 {
     let cfg = PirlsConfig {
-        likelihood: GlmLikelihoodSpec::canonical(GlmLikelihoodFamily::BinomialLogit),
+        likelihood: GlmLikelihoodSpec::canonical(GlmFamily::BinomialLogit),
         link_kind: InverseLink::Standard(LinkFunction::Logit),
         max_iterations: 500,
         convergence_tolerance: 1e-10,
