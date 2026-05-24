@@ -762,7 +762,7 @@ impl PredictableModel for StandardPredictor {
         &self,
         predict_input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        debug_assert!(std::mem::size_of_val(predict_input) > 0);
+        assert!(std::mem::size_of_val(predict_input) > 0);
         Ok(None)
     }
 
@@ -2929,7 +2929,7 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
         &self,
         predict_input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        debug_assert!(std::mem::size_of_val(predict_input) > 0);
+        assert!(std::mem::size_of_val(predict_input) > 0);
         Ok(None)
     }
 
@@ -3451,7 +3451,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
         &self,
         predict_input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        debug_assert!(std::mem::size_of_val(predict_input) > 0);
+        assert!(std::mem::size_of_val(predict_input) > 0);
         Ok(None)
     }
 
@@ -3461,7 +3461,7 @@ impl PredictableModel for BinomialLocationScalePredictor {
         fit_result: &UnifiedFitResult,
         options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
-        debug_assert!(std::mem::size_of_val(fit_result) > 0);
+        assert!(std::mem::size_of_val(fit_result) > 0);
         let pred = self.predict_with_uncertainty(input)?;
         let z = standard_normal_quantile(0.5 + options.confidence_level * 0.5)
             .map_err(EstimationError::InvalidInput)?;
@@ -3998,7 +3998,7 @@ impl PredictableModel for SurvivalPredictor {
         &self,
         predict_input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        debug_assert!(std::mem::size_of_val(predict_input) > 0);
+        assert!(std::mem::size_of_val(predict_input) > 0);
         Ok(None)
     }
 
@@ -4008,7 +4008,7 @@ impl PredictableModel for SurvivalPredictor {
         fit_result: &UnifiedFitResult,
         options: &PredictUncertaintyOptions,
     ) -> Result<PredictUncertaintyResult, EstimationError> {
-        debug_assert!(std::mem::size_of_val(fit_result) > 0);
+        assert!(std::mem::size_of_val(fit_result) > 0);
         let pred = self.predict_with_uncertainty(input)?;
         let z = crate::probability::standard_normal_quantile(0.5 + options.confidence_level * 0.5)
             .map_err(EstimationError::InvalidInput)?;
@@ -4190,7 +4190,7 @@ impl PredictableModel for TransformationNormalPredictor {
         &self,
         predict_input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        debug_assert!(std::mem::size_of_val(predict_input) > 0);
+        assert!(std::mem::size_of_val(predict_input) > 0);
         Ok(None)
     }
 

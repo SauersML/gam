@@ -9559,7 +9559,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_idx: usize,
         spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        debug_assert!(block_states.len() <= isize::MAX as usize);
+        assert!(block_states.len() <= isize::MAX as usize);
         if block_idx == Self::BLOCK_LINK_WIGGLE {
             return Ok(monotone_wiggle_nonnegative_constraints(spec.design.ncols()));
         }
@@ -9595,8 +9595,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_spec: &ParameterBlockSpec,
         mut beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
-        debug_assert!(block_states.len() <= isize::MAX as usize);
-        debug_assert!(!block_spec.name.is_empty());
+        assert!(block_states.len() <= isize::MAX as usize);
+        assert!(!block_spec.name.is_empty());
         if block_idx == Self::BLOCK_TIME
             && let Some(lower_bounds) = self.time_coefficient_lower_bounds.as_ref()
         {

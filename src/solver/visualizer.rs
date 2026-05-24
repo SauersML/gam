@@ -487,16 +487,12 @@ struct DumbVisualizer {
 
 impl InteractiveVisualizer {
     fn new() -> io::Result<Self> {
-        // Never claim the alt-screen during the test binary: shared
-        // global terminal state racing with parallel tests is a recipe
-        // for hangs, and the existing "use Dumb when not attached to
-        // TTY" tests rely on this short-circuit to assert their
-        // invariants without needing to fake a tty.
-        if cfg!(test) {
-            return Err(io::Error::other(
-                "interactive visualizer disabled under cfg(test)",
-            ));
-        }
+        // `live_visualization_enabled()` is hard-wired to `false`, so
+        // every production code path routes through the Dumb renderer
+        // and this method never runs. The alt-screen takeover below
+        // stays for the day the live renderer flag is wired up again;
+        // until then the open_dev_tty() / panic-hook plumbing is
+        // intentionally unexercised.
         {
             // Route the chart to /dev/tty rather than stdout, so it
             // works even when the parent shell pipes stdout/stderr
