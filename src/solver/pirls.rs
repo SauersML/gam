@@ -1382,17 +1382,13 @@ pub struct ArrowSchurInnerConfig {
     /// driver's `LatentCoordValues` via that latent's update rule
     /// (`retract_flat_delta` for manifold latents). `delta_t` is the flat
     /// row-major increment of length `n_rows * latent_dim`.
-    ///
-    /// **Driver-side caveat:** the current PIRLS LM gain test may reject
-    /// the β step via step halving; in that case the latent should be
-    /// reverted symmetrically. The recommended pattern is for the driver
-    /// to snapshot its `LatentCoordValues` before each PIRLS call and to
-    /// manage revert/commit via the dedicated `LatentInnerSolver`
-    /// (`crate::solver::latent_inner`), which owns the joint gain-test
-    /// bookkeeping. The hook here is the back-compat path for PIRLS-driven
-    /// inner loops; the cleanest production path moves the LM control
-    /// into `LatentInnerSolver` and bypasses PIRLS's β-only LM scaffolding.
     pub apply_delta_t: std::sync::Arc<dyn Fn(&Array1<f64>) + Send + Sync>,
+    /// Snapshot the driver's latent field before an LM trial step mutates it.
+    pub snapshot_t: std::sync::Arc<dyn Fn() -> Array1<f64> + Send + Sync>,
+    /// Restore a snapshot produced by [`Self::snapshot_t`] after any rejected
+    /// LM trial. Accepted trials deliberately do not call this hook: β and t
+    /// commit together.
+    pub restore_t: std::sync::Arc<dyn Fn(&Array1<f64>) + Send + Sync>,
 }
 
 impl std::fmt::Debug for ArrowSchurInnerConfig {
@@ -1404,6 +1400,15 @@ impl std::fmt::Debug for ArrowSchurInnerConfig {
             .field("solver_mode", &self.solver_mode)
             .field("trust_region_radius", &self.trust_region_radius)
             .finish_non_exhaustive()
+    }
+}
+
+fn restore_arrow_latent_if_needed(
+    options: &WorkingModelPirlsOptions,
+    snapshot: Option<Array1<f64>>,
+) {
+    if let (Some(arrow_cfg), Some(snapshot)) = (options.arrow_schur.as_ref(), snapshot) {
+        arrow_cfg.restore_t.as_ref()(&snapshot);
     }
 }
 
@@ -2905,12 +2910,16 @@ impl SparseSpGemmState {
         debug_assert_eq!(weights.len(), n);
         debug_assert_eq!(self.sqrt_weights.len(), n);
 
-        // Cache √max(0, w) once per row so the inner loops can multiply
+        assert!(
+            weights.iter().all(|&w| w.is_finite() && w >= 0.0),
+            "SparseSpGemmState::compute requires finite nonnegative PIRLS weights"
+        );
+        // Cache √w once per row so the inner loops can multiply
         // without repeated sqrt calls. Single owning slice avoids ndarray
         // bounds checks in the hot loops below.
         let sqrt_w = self.sqrt_weights.as_mut_slice();
         for (dst, &w) in sqrt_w.iter_mut().zip(weights.iter()) {
-            *dst = w.max(0.0).sqrt();
+            *dst = w.sqrt();
         }
         let sqrt_w: &[f64] = sqrt_w;
 
@@ -4925,6 +4934,7 @@ where
         // ceiling — well past `lm_max_attempts`. Resets to 2.0 on
         // Fisher-fallback (different problem, restart the LM trajectory).
         let mut madsen_reject_factor = 2.0_f64;
+        let mut pending_arrow_latent_restore: Option<Array1<f64>> = None;
 
         // Copy the hessian into the reusable buffer (avoids allocation after first iteration).
         let mut regularized =
@@ -4938,6 +4948,7 @@ where
         // rather than rebuilding the regularized matrix each attempt.
         let mut sparse_applied_lambda = 0.0_f64;
         loop {
+            restore_arrow_latent_if_needed(options, pending_arrow_latent_restore.take());
             attempts += 1;
             lm_attempts_done += 1;
             let attempt_solve_start = std::time::Instant::now();
@@ -5025,11 +5036,12 @@ where
                     // current latent t; we solve via per-row d×d
                     // Cholesky + one K×K Schur factor, write the
                     // β-direction into `newton_direction` so the
-                    // existing LM gain test / line search proceeds
-                    // unchanged for β, and push the latent increment
-                    // back into the driver via the `apply_delta_t`
-                    // callback so the next gradient evaluation sees the
-                    // updated t.
+                    // existing LM gain test / line search evaluates the
+                    // same joint candidate `(t + Δt, β + Δβ)`, and push
+                    // the latent increment back into the driver via the
+                    // `apply_delta_t` callback. Rejected trials are
+                    // restored through the driver-owned snapshot/restore
+                    // callbacks before the next LM attempt.
                     //
                     // NOTE: this branch exploits the inner-GN
                     // block-diagonality of `H_tt`. The REML outer
@@ -5056,13 +5068,16 @@ where
                                 solve_options.mode = mode;
                             }
                             solve_options.trust_region.radius = arrow_cfg.trust_region_radius;
+                            let latent_snapshot = arrow_cfg.snapshot_t.as_ref()();
                             match arrow_system.solve_with_options(0.0, loop_lambda, &solve_options)
                             {
                                 Ok((delta_t, delta_beta)) => {
-                                    // Apply latent increment immediately;
-                                    // subsequent `model.update(&beta)`
-                                    // will rebuild Φ at the new t.
+                                    // Apply the latent half of the joint
+                                    // trial before screening β + Δβ so the
+                                    // merit test evaluates the same pair
+                                    // that will be committed on acceptance.
                                     arrow_cfg.apply_delta_t.as_ref()(&delta_t);
+                                    pending_arrow_latent_restore = Some(latent_snapshot);
                                     // Write β-step into the existing
                                     // direction buffer so the rest of
                                     // the LM loop proceeds unchanged.
@@ -5118,6 +5133,7 @@ where
                 } else {
                     "PIRLS produced non-finite step direction"
                 };
+                restore_arrow_latent_if_needed(options, pending_arrow_latent_restore.take());
                 return Err(EstimationError::InvalidInput(format!(
                     "{detail} at iteration {iter} with damping λ={loop_lambda:.3e}"
                 )));
@@ -5307,9 +5323,17 @@ where
                                 Ok(state) => state,
                                 Err(err) => {
                                     if !is_lm_retriable_candidate_error(&err) {
+                                        restore_arrow_latent_if_needed(
+                                            options,
+                                            pending_arrow_latent_restore.take(),
+                                        );
                                         return Err(err);
                                     }
                                     if lm_retry_exhausted(loop_lambda, attempts, lm_max_attempts) {
+                                        restore_arrow_latent_if_needed(
+                                            options,
+                                            pending_arrow_latent_restore.take(),
+                                        );
                                         return Err(lm_nonconvergence_error(
                                             options,
                                             constrained_stationarity_norm(
@@ -5345,6 +5369,10 @@ where
                                         Ok(state) => state,
                                         Err(err) => {
                                             if !is_lm_retriable_candidate_error(&err) {
+                                                restore_arrow_latent_if_needed(
+                                                    options,
+                                                    pending_arrow_latent_restore.take(),
+                                                );
                                                 return Err(err);
                                             }
                                             if lm_retry_exhausted(
@@ -5352,6 +5380,10 @@ where
                                                 attempts,
                                                 lm_max_attempts,
                                             ) {
+                                                restore_arrow_latent_if_needed(
+                                                    options,
+                                                    pending_arrow_latent_restore.take(),
+                                                );
                                                 return Err(lm_nonconvergence_error(
                                                     options,
                                                     constrained_stationarity_norm(
@@ -5422,6 +5454,7 @@ where
                         // smooth Marquardt update. See `madsen_lm_accept_factor`
                         // for the textbook derivation and canonical values.
                         lambda = (loop_lambda * madsen_lm_accept_factor(rho)).max(1e-9);
+                        pending_arrow_latent_restore = None;
 
                         // Updates for next iteration. Recycle the previous beta
                         // allocation as the next candidate buffer instead of
@@ -5641,6 +5674,10 @@ where
                                 "[PIRLS] mid-iter Fisher fallback iter={} reason=gain_rejection",
                                 iter,
                             );
+                            restore_arrow_latent_if_needed(
+                                options,
+                                pending_arrow_latent_restore.take(),
+                            );
                             let fisher_fallback_start = std::time::Instant::now();
                             state =
                                 model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
@@ -5704,6 +5741,10 @@ where
                             max_abs_eta = inf_norm(state.eta.iter().copied());
                             // `state` is unused after `break 'pirls_loop` — move it
                             // instead of cloning to avoid an n+p² full-state copy.
+                            restore_arrow_latent_if_needed(
+                                options,
+                                pending_arrow_latent_restore.take(),
+                            );
                             final_state = Some(state);
                             status = PirlsStatus::StalledAtValidMinimum;
                             break 'pirls_loop;
@@ -5753,6 +5794,10 @@ where
                             // Preserve the structural ridge from the model state.
                             // `state` is unused after `break 'pirls_loop` — move it
                             // instead of cloning to avoid an n+p² full-state copy.
+                            restore_arrow_latent_if_needed(
+                                options,
+                                pending_arrow_latent_restore.take(),
+                            );
                             final_state = Some(state);
                             break 'pirls_loop;
                         }
@@ -5787,6 +5832,7 @@ where
                             "[PIRLS] mid-iter Fisher fallback iter={} reason=candidate_err",
                             iter,
                         );
+                        restore_arrow_latent_if_needed(options, pending_arrow_latent_restore.take());
                         let fisher_err_start = std::time::Instant::now();
                         state = model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
                         curvature_total += fisher_err_start.elapsed();
@@ -5802,9 +5848,11 @@ where
                         continue;
                     }
                     if !is_lm_retriable_candidate_error(&err) {
+                        restore_arrow_latent_if_needed(options, pending_arrow_latent_restore.take());
                         return Err(err);
                     }
                     if lm_retry_exhausted(loop_lambda, attempts, lm_max_attempts) {
+                        restore_arrow_latent_if_needed(options, pending_arrow_latent_restore.take());
                         return Err(lm_nonconvergence_error(
                             options,
                             constrained_stationarity_norm(
@@ -9633,37 +9681,12 @@ fn computeworkingweight_derivatives_from_eta(
                     "beta-regression phi must be finite and > 0; got {phi}"
                 )));
             }
-            let c_s = c.as_slice_mut().expect("c must be contiguous");
-            let d_s = d.as_slice_mut().expect("d must be contiguous");
-            let dmu_s = dmu_deta
-                .as_slice_mut()
-                .expect("dmu_deta must be contiguous");
-            let d2_s = d2mu_deta2
-                .as_slice_mut()
-                .expect("d2mu_deta2 must be contiguous");
-            let d3_s = d3mu_deta3
-                .as_slice_mut()
-                .expect("d3mu_deta3 must be contiguous");
-            c_s.par_iter_mut()
-                .zip(d_s.par_iter_mut())
-                .zip(dmu_s.par_iter_mut())
-                .zip(d2_s.par_iter_mut())
-                .zip(d3_s.par_iter_mut())
-                .enumerate()
-                .try_for_each(
-                    |(i, ((((c_o, d_o), dmu_o), d2_o), d3_o))| -> Result<(), EstimationError> {
-                        let eta_used = eta[i].clamp(-700.0, 700.0);
-                        let jet = standard_inverse_link_jet(inverse_link, eta_used)?;
-                        let mu_i = safe_beta_mu(jet.mu);
-                        let q = (mu_i * (1.0 - mu_i)).max(BETA_MU_EPS);
-                        *c_o = 0.0;
-                        *d_o = 0.0;
-                        *dmu_o = q;
-                        *d2_o = q * (1.0 - 2.0 * mu_i);
-                        *d3_o = q * (1.0 - 6.0 * q);
-                        Ok(())
-                    },
-                )?;
+            return Err(EstimationError::InvalidInput(
+                "exact outer derivatives for beta-logit are unsupported: the PIRLS weight \
+                 depends on eta through trigamma(mu * phi) and trigamma((1 - mu) * phi), \
+                 so c/d require polygamma derivatives that are not implemented"
+                    .to_string(),
+            ));
         }
         GlmLikelihoodFamily::GammaLog => {
             let dmu_s = dmu_deta
