@@ -159,6 +159,5 @@ fn diagnose_sparse_dense_imbalance() {
     let _ = run("y ~ s(x, bc=anchored, k=20, penalty_order=1)");
     let _ = run("y ~ s(x, bc_left=anchored, k=20, penalty_order=1)");
     // Higher-order penalty
-    let _ = run("y ~ s(x, bc=anchored, k=20, penalty_order=3)");
-    assert!(true);
+    drop(run("y ~ s(x, bc=anchored, k=20, penalty_order=3)"));
 }
